@@ -4385,6 +4385,12 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         clobber_data_confirmed,
         fresh_block_size,
     );
+    // BOT classification reads at least the bootstrap block and may probe past
+    // it for data. Rewind again so a fresh init overwrites the bootstrap at
+    // block 0 rather than appending a new bootstrap after the probe reads.
+    drive
+        .rewind()
+        .map_err(|error| format!("rewind before bootstrap write: {error}"))?;
     let action = {
         let mut sink = DriveHandleSink(&mut drive);
         remanence_api::maybe_write_tape_init_bootstrap(
