@@ -196,5 +196,16 @@
     "handoff_to": null,
     "round": 0,
     "summary": "Brainstorm with owner on handling non-compliant file metadata (non-UTF-8 names, Mac xattrs, device nodes) and mixed restore intent (curated FCP projects with deliverable .movs alongside .fcpcache junk and bundle folders; C-drive-style dumps). Design in docs/ingest-policy-design-v0.1.md. Key moves: (1) wrap granularity = restore granularity, declared not inferred — ordered first-match-wins path rulesets (gitignore globs) with verbs granular/blob/exclude, named+versioned, bound per source type by sutradhara, accepted by rem archive build --rules; (2) the wrapper is plain TAR (.remwrap.tar suffix), NOT RAO-in-RAO — self-explanatory to a tar-only future; dialect pinned by a non-UTF-8-name + xattr + AppleDouble round-trip test at impl time; uncompressed; (3) alignment economics make blobbing mandatory for small-file swarms (million 10KB files as RAO entries waste ~240GB padding at 256KiB chunks); (4) never-silent: conformance scan before tape writes, per-rule hit counts, exclusions counted+recorded, tool suggests but never auto-switches; (5) non-compliance fallback inside granular regions wraps at wrap-unit=file default (dir option; hardlinks force dir); (6) optional catalog-side blob member index (derived, delete-and-rebuild) gives ranged single-file restore out of blobs with zero format changes; (7) in-manifest wrap annotation deferred to a deliberate RAO 1.1 minor-version note (reserved containers must stay empty in 1.0); suffix+catalog carry it meanwhile; (8) blob rules consume subtrees whole — no carve-outs in v0.1. No wire-format changes anywhere. Implementation deferred until amber-merge residuals settle; rem-side handoff to codex comes later; sutradhara-side ruleset work is its own repo."
+  },
+  {
+    "uuid": "61dc1bcc-c18d-4aae-8278-743c05603abd",
+    "datetime": "2026-06-12T17:20:54+02:00",
+    "author": "codex",
+    "subject": "Published specs moved to root specs directory",
+    "idref": null,
+    "status": "complete",
+    "handoff_to": null,
+    "round": 44,
+    "summary": "Moved the two finalized public specifications out of docs/ into a new root specs/ directory: specs/rao-1.0-specification.md and specs/rem-parity-1.0-specification.md. Added specs/README.md, updated docs/INDEX.md, docs/README.md, the repository README layout, cross-spec references, and current live docs/code comments that pointed at the old docs paths. Historical journal/archive references were left unchanged. Verification passed: jq empty journal/2026-06-12.json; git diff --check; cargo test; cargo fmt --check; cargo clippy -- -D warnings; cargo build --release."
   }
 ]
