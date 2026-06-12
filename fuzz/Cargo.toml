@@ -1,0 +1,53 @@
+[package]
+name = "remanence-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+rust-version = "1.85"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+remanence-aead = { path = "../crates/remanence-aead" }
+remanence-format = { path = "../crates/remanence-format", features = ["fuzzing"] }
+remanence-library = { path = "../crates/remanence-library" }
+
+[[bin]]
+name = "rao_envelope_header"
+path = "fuzz_targets/rao_envelope_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rao_envelope_metadata_cbor"
+path = "fuzz_targets/rao_envelope_metadata_cbor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rao_manifest_cbor"
+path = "fuzz_targets/rao_manifest_cbor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rao_plaintext_tar_loop"
+path = "fuzz_targets/rao_plaintext_tar_loop.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rao_whole_object_open_verify"
+path = "fuzz_targets/rao_whole_object_open_verify.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

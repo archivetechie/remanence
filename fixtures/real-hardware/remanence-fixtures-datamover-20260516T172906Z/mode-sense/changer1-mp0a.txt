@@ -1,0 +1,8 @@
+    inquiry cdb: [12 00 00 00 24 00]
+    mode sense(10) cdb: [5a 00 0a 00 00 00 00 10 00 00]
+mode sense(10):
+Fixed format, current; Sense key: Illegal Request
+Additional sense: Invalid field in cdb
+  Sense Key Specific: Error in Data parameters: byte 0 bit 0
+invalid field in cdb (perhaps page 0xa not supported)
+    HPE       MSL3040           3350   peripheral_type: medium changer [0x8]

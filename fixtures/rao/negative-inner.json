@@ -1,0 +1,29 @@
+{
+  "vector_set": "RAO-NEG-INNER-1",
+  "spec_section": "13.5",
+  "status": "complete",
+  "scope": "encrypted inner RAO cross-check defective-sealer vectors executable through remanence-format read_encrypted_rao_object",
+  "base": {
+    "chunk_size": 4096,
+    "inner_object_id": "99999999-9999-4999-8999-999999999999",
+    "root_key": "3333333333333333333333333333333333333333333333333333333333333333",
+    "key_id": "44444444444444444444444444444444"
+  },
+  "cases": [
+    {
+      "id": "inner-object-id-differs",
+      "fault": "authenticated envelope header object_id differs from inner REMANENCE.object_id",
+      "expected_error": "InnerObjectMismatch"
+    },
+    {
+      "id": "inner-chunk-size-differs",
+      "fault": "authenticated inner REMANENCE.chunk_size differs from the envelope header chunk_size",
+      "expected_error": "InnerObjectMismatch"
+    },
+    {
+      "id": "inner-encryption-not-none",
+      "fault": "authenticated inner REMANENCE.encryption is aes-256-gcm",
+      "expected_error": "InnerObjectMismatch"
+    }
+  ]
+}

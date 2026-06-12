@@ -1,0 +1,13 @@
+    cdb to send: [b8 10 00 00 01 00 12 01 00 00 00 00]
+SCSI Status: Check Condition 
+
+Sense Information:
+Fixed format, current; Sense key: Illegal Request
+Additional sense: Invalid field in cdb
+  Sense Key Specific: Error in Command: byte 6 bit 4
+ Raw sense data (in hex), sb_len=18, calculated_len=18
+        70 00 05 00 00 00 00 0a  00 00 00 00 24 00 00 cc
+        00 06
+
+Error 5 occurred, no data received
+Illegal request

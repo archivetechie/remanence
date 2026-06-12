@@ -1,0 +1,16 @@
+    inquiry cdb: [12 00 00 00 24 00]
+    inquiry cdb: [12 00 00 00 4a 00]
+    inquiry cdb: [12 01 00 00 fc 00]
+    inquiry cdb: [12 01 80 00 fc 00]
+standard INQUIRY:
+  PQual=0  PDT=8  RMB=1  LU_CONG=0  hot_pluggable=0  version=0x05  [SPC-3]
+  [AERC=0]  [TrmTsk=0]  NormACA=0  HiSUP=0  Resp_data_format=2
+  SCCS=0  ACC=0  TPGS=0  3PC=0  Protect=0  [BQue=0]
+  EncServ=0  MultiP=1 (VS=0)  [MChngr=0]  [ACKREQQ=0]  Addr16=1
+  [RelAdr=0]  WBus16=0  Sync=0  [Linked=0]  [TranDis=0]  CmdQue=1
+  [SPI: Clocking=0x0  QAS=0  IUS=0]
+    length=74 (0x4a)   Peripheral device type: medium changer
+ Vendor identification: HPE     
+ Product identification: MSL3040         
+ Product revision level: 3350
+ Unit serial number: DEC418146K_LL03

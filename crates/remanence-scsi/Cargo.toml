@@ -1,0 +1,29 @@
+[package]
+name        = "remanence-scsi"
+description = "Layer 1: SCSI command construction, SG_IO transport, and response parsing for Remanence."
+version     .workspace = true
+edition     .workspace = true
+rust-version.workspace = true
+authors     .workspace = true
+license     .workspace = true
+repository  .workspace = true
+
+[dependencies]
+bytes     = { workspace = true }
+thiserror = { workspace = true }
+# nix is Linux-only; gate it so the parser half of the crate stays portable
+# (and testable in CI on macOS / non-Linux hosts).
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true }
+
+[[example]]
+name = "inquiry"
+path = "examples/inquiry.rs"
+
+[[example]]
+name = "topology"
+path = "examples/topology.rs"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"

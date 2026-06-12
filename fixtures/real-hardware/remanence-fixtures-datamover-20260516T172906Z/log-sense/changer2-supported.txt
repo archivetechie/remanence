@@ -1,0 +1,3 @@
+log_sense: field in cdb illegal
+sg_logs failed: Illegal request
+    HPE       MSL3040           3350

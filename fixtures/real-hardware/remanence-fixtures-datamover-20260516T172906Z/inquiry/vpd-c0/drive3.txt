@@ -1,0 +1,4 @@
+    inquiry cdb: [12 01 00 00 fc 00]
+    inquiry cdb: [12 01 c0 00 fc 00]
+Unsupported page revision 82, decoding not possible.
+VPD INQUIRY: Unit Path Report Page (EMC)

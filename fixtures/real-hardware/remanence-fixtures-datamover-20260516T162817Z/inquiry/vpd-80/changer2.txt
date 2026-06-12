@@ -1,0 +1,4 @@
+    inquiry cdb: [12 01 00 00 fc 00]
+    inquiry cdb: [12 01 80 00 fc 00]
+VPD INQUIRY: Unit serial number page
+  Unit serial number: DEC418146K_LL03

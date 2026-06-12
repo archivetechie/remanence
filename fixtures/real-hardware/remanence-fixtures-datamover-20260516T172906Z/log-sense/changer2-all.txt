@@ -1,0 +1,58 @@
+    HPE       MSL3040           3350
+
+Supported log pages  [0x0]:
+    0x00        Supported log pages [sp]
+    0x07        Last n error [lne]
+    0x0d        Temperature [temp]
+    0x2e        
+    0x30        
+    0x34        
+    0x36        
+    0x38        
+    0x3a        
+    0x3b        
+    0x3e        
+
+No error events logged
+
+Temperature page  [0xd]
+  Current temperature = 47 C
+  Reference temperature = 95 C
+
+Unable to decode page = 0x2e, here is hex:
+ 00     2e 00 01 40 00 01 40 01  00 00 02 40 01 00 00 03
+ 10     40 01 00 00 04 40 01 00  00 05 40 01 00 00 06 40
+ 20     01 00 00 07 40 01 00 00  08 40 01 00 00 09 40 01
+ 30     00 00 0a 40 01 00 00 0b  40 01 00 00 0c 40 01 00
+ .....  [truncated after 64 of 324 bytes (use '-H' to see the rest)]
+
+Unable to decode page = 0x30, here is hex:
+ 00     30 00 00 20 00 01 40 04  00 0a 57 86 00 02 40 04
+ 10     00 00 00 21 00 03 40 04  00 00 00 01 00 04 40 04
+ 20     00 00 53 34
+
+Unable to decode page = 0x34, here is hex:
+ 00     34 00 00 00
+
+Unable to decode page = 0x36, here is hex:
+ 00     36 00 03 08 02 02 f8 00  01 48 00 00 01 00 6a 08
+ 10     a9 93 00 00 0f af 02 00  00 69 c6 22 89 0e 7e f0
+ 20     02 ea 00 00 06 00 02 e4  3c 4d 45 53 53 41 47 45
+ 30     20 74 79 70 65 3d 22 53  54 41 54 55 53 22 20 6e
+ .....  [truncated after 64 of 780 bytes (use '-H' to see the rest)]
+
+Unable to decode page = 0x38, here is hex:
+ 00     38 00 00 00
+
+Unable to decode page = 0x3a, here is hex:
+ 00     3a 00 00 00
+
+Unable to decode page = 0x3b, here is hex:
+ 00     3b 00 00 00
+
+Unable to decode page = 0x3e, here is hex:
+ 00     3e 00 00 8c 00 00 40 04  00 00 00 00 00 01 40 04
+ 10     00 06 00 00 00 02 40 04  00 00 53 34 00 03 00 04
+ 20     00 00 00 00 00 04 40 08  00 60 b0 00 00 10 80 90
+ 30     10 00 40 04 02 6c 83 95  10 01 40 04 00 6b 59 11
+ .....  [truncated after 64 of 144 bytes (use '-H' to see the rest)]

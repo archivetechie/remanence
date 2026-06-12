@@ -1,0 +1,261 @@
+//! RAO 1.0 128-byte plaintext envelope header.
+
+use sha2::{Digest, Sha256};
+
+use crate::error::{RaoAeadError, Result};
+
+/// Length in bytes of a RAO encrypted-envelope header.
+pub const RAO_HEADER_LEN: usize = 128;
+/// Maximum encrypted metadata frame length, including the AEAD tag.
+pub const RAO_MAX_METADATA_FRAME_LEN: u64 = 16 * 1024 * 1024;
+/// Minimum encrypted metadata frame length, including the AEAD tag.
+pub const RAO_METADATA_FRAME_MIN_LEN: u64 = 17;
+/// Completion footer for a successfully sealed encrypted RAO object.
+pub const RAO_FOOTER: &[u8; 16] = b"RAO1_STREAM_END.";
+
+const MAGIC: &[u8; 4] = b"RAO1";
+const FORMAT_VERSION: u8 = 1;
+const SUITE_ID_HKDF_SHA256_CHACHA20POLY1305: u8 = 0x01;
+const ZERO_16: [u8; 16] = [0; 16];
+
+/// Parsed RAO encrypted-envelope header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaoHeader {
+    /// Object body block size and AEAD plaintext chunk size.
+    pub chunk_size: u32,
+    /// Opaque archive key identifier.
+    pub key_id: [u8; 16],
+    /// Deterministically derived per-object HKDF salt.
+    pub hkdf_salt: [u8; 16],
+    /// Encrypted metadata frame length, including its 16-byte AEAD tag.
+    pub metadata_frame_len: u64,
+    /// Inner canonical RAO object id.
+    pub object_id: String,
+}
+
+impl RaoHeader {
+    /// Construct and validate a RAO header.
+    pub fn new(
+        chunk_size: u32,
+        key_id: [u8; 16],
+        hkdf_salt: [u8; 16],
+        metadata_frame_len: u64,
+        object_id: impl Into<String>,
+    ) -> Result<Self> {
+        let header = Self {
+            chunk_size,
+            key_id,
+            hkdf_salt,
+            metadata_frame_len,
+            object_id: object_id.into(),
+        };
+        header.validate()?;
+        Ok(header)
+    }
+
+    /// Parse a serialized 128-byte header.
+    pub fn parse(bytes: &[u8; RAO_HEADER_LEN]) -> Result<Self> {
+        if &bytes[0..4] != MAGIC {
+            return Err(RaoAeadError::InvalidMagicBytes);
+        }
+        let header_len = u16::from_be_bytes([bytes[4], bytes[5]]);
+        if header_len != RAO_HEADER_LEN as u16 {
+            return Err(RaoAeadError::InvalidHeaderLength);
+        }
+        if bytes[6] != FORMAT_VERSION {
+            return Err(RaoAeadError::UnsupportedFormatVersion);
+        }
+        if bytes[7] != SUITE_ID_HKDF_SHA256_CHACHA20POLY1305 {
+            return Err(RaoAeadError::InvalidSuite);
+        }
+
+        let chunk_size = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        let flags = u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+        if flags != 0 {
+            return Err(RaoAeadError::ReservedBytesNotZero);
+        }
+
+        let mut key_id = [0u8; 16];
+        key_id.copy_from_slice(&bytes[0x10..0x20]);
+        let mut hkdf_salt = [0u8; 16];
+        hkdf_salt.copy_from_slice(&bytes[0x20..0x30]);
+        let metadata_frame_len = u64::from_be_bytes([
+            bytes[0x30],
+            bytes[0x31],
+            bytes[0x32],
+            bytes[0x33],
+            bytes[0x34],
+            bytes[0x35],
+            bytes[0x36],
+            bytes[0x37],
+        ]);
+        if bytes[0x38..0x40].iter().any(|byte| *byte != 0) {
+            return Err(RaoAeadError::ReservedBytesNotZero);
+        }
+
+        let object_id = decode_object_id_field(&bytes[0x40..0x80])?;
+        let header = Self {
+            chunk_size,
+            key_id,
+            hkdf_salt,
+            metadata_frame_len,
+            object_id,
+        };
+        header.validate()?;
+        Ok(header)
+    }
+
+    /// Serialize this header in canonical big-endian RAO wire form.
+    pub fn serialize(&self) -> Result<[u8; RAO_HEADER_LEN]> {
+        self.validate()?;
+
+        let mut bytes = [0u8; RAO_HEADER_LEN];
+        bytes[0..4].copy_from_slice(MAGIC);
+        bytes[4..6].copy_from_slice(&(RAO_HEADER_LEN as u16).to_be_bytes());
+        bytes[6] = FORMAT_VERSION;
+        bytes[7] = SUITE_ID_HKDF_SHA256_CHACHA20POLY1305;
+        bytes[8..12].copy_from_slice(&self.chunk_size.to_be_bytes());
+        bytes[12..16].copy_from_slice(&0u32.to_be_bytes());
+        bytes[0x10..0x20].copy_from_slice(&self.key_id);
+        bytes[0x20..0x30].copy_from_slice(&self.hkdf_salt);
+        bytes[0x30..0x38].copy_from_slice(&self.metadata_frame_len.to_be_bytes());
+        bytes[0x40..0x80].copy_from_slice(&object_id_field(&self.object_id)?);
+        Ok(bytes)
+    }
+
+    /// SHA-256 of the exact serialized header bytes.
+    pub fn header_hash(&self) -> Result<[u8; 32]> {
+        let bytes = self.serialize()?;
+        let digest = Sha256::digest(bytes);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest);
+        Ok(out)
+    }
+
+    /// Return the exact 64-byte object-id field used by salt derivation.
+    pub fn object_id_field(&self) -> Result<[u8; 64]> {
+        object_id_field(&self.object_id)
+    }
+
+    /// Validate this header under the RAO 1.0 frozen-field rules.
+    pub fn validate(&self) -> Result<()> {
+        validate_chunk_size(self.chunk_size)?;
+        if self.key_id == ZERO_16 {
+            return Err(RaoAeadError::InvalidKeyIdentifier);
+        }
+        if self.hkdf_salt == ZERO_16 {
+            return Err(RaoAeadError::InvalidSalt);
+        }
+        validate_metadata_frame_len(self.metadata_frame_len)?;
+        object_id_field(&self.object_id)?;
+        Ok(())
+    }
+}
+
+/// Validate a RAO body block / AEAD chunk size.
+pub fn validate_chunk_size(chunk_size: u32) -> Result<()> {
+    if chunk_size == 0 || chunk_size % 512 != 0 {
+        return Err(RaoAeadError::InvalidChunkSize);
+    }
+    Ok(())
+}
+
+/// Validate an encrypted metadata frame length.
+pub fn validate_metadata_frame_len(metadata_frame_len: u64) -> Result<()> {
+    if !(RAO_METADATA_FRAME_MIN_LEN..=RAO_MAX_METADATA_FRAME_LEN).contains(&metadata_frame_len) {
+        return Err(RaoAeadError::MetadataFrameLengthInvalid);
+    }
+    Ok(())
+}
+
+/// Encode an object id into the exact 64-byte NUL-padded header field.
+pub fn object_id_field(object_id: &str) -> Result<[u8; 64]> {
+    let bytes = object_id.as_bytes();
+    if bytes.is_empty() || bytes.len() > 64 || bytes.contains(&0) {
+        return Err(RaoAeadError::InvalidObjectIdField);
+    }
+    let mut field = [0u8; 64];
+    field[..bytes.len()].copy_from_slice(bytes);
+    Ok(field)
+}
+
+fn decode_object_id_field(field: &[u8]) -> Result<String> {
+    debug_assert_eq!(field.len(), 64);
+    let end = field
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(field.len());
+    if end == 0 || field[end..].iter().any(|byte| *byte != 0) {
+        return Err(RaoAeadError::InvalidObjectIdField);
+    }
+    std::str::from_utf8(&field[..end])
+        .map(|value| value.to_string())
+        .map_err(|_| RaoAeadError::InvalidObjectIdField)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_header() -> RaoHeader {
+        RaoHeader::new(262_144, [1; 16], [2; 16], 64, "object-1").unwrap()
+    }
+
+    #[test]
+    fn header_round_trips_and_matches_offsets() {
+        let header = valid_header();
+        let bytes = header.serialize().unwrap();
+        assert_eq!(&bytes[0x00..0x04], b"RAO1");
+        assert_eq!(u16::from_be_bytes([bytes[0x04], bytes[0x05]]), 128);
+        assert_eq!(bytes[0x06], 1);
+        assert_eq!(bytes[0x07], 1);
+        assert_eq!(
+            u32::from_be_bytes(bytes[0x08..0x0c].try_into().unwrap()),
+            262_144
+        );
+        assert_eq!(&bytes[0x10..0x20], &[1; 16]);
+        assert_eq!(&bytes[0x20..0x30], &[2; 16]);
+        assert_eq!(
+            u64::from_be_bytes(bytes[0x30..0x38].try_into().unwrap()),
+            64
+        );
+        assert_eq!(&bytes[0x40..0x48], b"object-1");
+
+        let parsed = RaoHeader::parse(&bytes).unwrap();
+        assert_eq!(parsed, header);
+        assert_ne!(header.header_hash().unwrap(), [0; 32]);
+    }
+
+    #[test]
+    fn object_id_rejects_empty_long_and_interior_nul() {
+        assert!(matches!(
+            object_id_field(""),
+            Err(RaoAeadError::InvalidObjectIdField)
+        ));
+        assert!(matches!(
+            object_id_field(&"x".repeat(65)),
+            Err(RaoAeadError::InvalidObjectIdField)
+        ));
+        assert!(matches!(
+            object_id_field("x\0y"),
+            Err(RaoAeadError::InvalidObjectIdField)
+        ));
+    }
+
+    #[test]
+    fn header_rejects_reserved_and_bad_magic() {
+        let mut bytes = valid_header().serialize().unwrap();
+        bytes[0] = b'A';
+        assert!(matches!(
+            RaoHeader::parse(&bytes),
+            Err(RaoAeadError::InvalidMagicBytes)
+        ));
+
+        let mut bytes = valid_header().serialize().unwrap();
+        bytes[0x38] = 1;
+        assert!(matches!(
+            RaoHeader::parse(&bytes),
+            Err(RaoAeadError::ReservedBytesNotZero)
+        ));
+    }
+}

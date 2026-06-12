@@ -1,0 +1,918 @@
+// Remanence Layer 5 — gRPC API surface (DRAFT v0.1).
+//
+// Status: design draft. Generated into remanence-api; no wire-stability promise.
+// Authoritative reference for terminology and contracts: docs/spec-v0.4.md.
+//
+// Transport: HTTPS/2 with mTLS authentication (mutual cert auth at the channel
+// layer; per-request authorization is enforced server-side per audit policy).
+//
+// Conventions:
+//   - All bytes-typed identity fields carry binary hashes (SHA-256 = 32 bytes,
+//     CRC-64 = 8 bytes). Hex/base64 conversion is a client concern.
+//   - All timestamps are RFC3339 UTC, transported as google.protobuf.Timestamp.
+//   - "Tape" identity is by tape UUID (assigned by Remanence the first time a
+//     cartridge is seen); the operator-facing label is `voltag` and is non-
+//     authoritative.
+//   - "Object" identity is by Remanence-assigned object UUID. The orchestrator's
+//     own identifier rides as `caller_object_id` (an opaque string) and is
+//     stored on tape alongside the data per docs/spec-v0.4.md §4.2.
+//   - Idempotency: fields are reserved on state-changing RPCs. Until per-RPC
+//     replay is implemented, non-empty keys fail fast with UNIMPLEMENTED rather
+//     than being silently accepted.
+//   - Pagination: list RPCs return a `next_page_token`; opaque to clients.
+//   - Cancellation: long-running operations return an `operation_id`; cancel
+//     via Daemon.CancelOperation.
+//
+// What this draft does NOT yet pin:
+//   - Concrete enum values for error codes beyond the canonical gRPC status.
+//   - Detailed write-format-specific options (rem-tar-v1 vs future formats).
+//   - Multi-library naming and routing details.
+//   - Subscription/notification streams (operation updates, library events).
+//   - Per-RPC authorization is enforced by the server using the role model in
+//     docs/spec-v0.4.md §11.6; certificate subject encoding is deployment policy.
+
+syntax = "proto3";
+
+package remanence.api.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+
+// =============================================================================
+// COMMON MESSAGES
+// =============================================================================
+
+// Opaque identifier the caller supplies to deduplicate retries of a state-
+// changing RPC. Per layer4 addendum §6.1: persisted with actor fingerprint.
+message IdempotencyKey {
+  // Caller-provided UUID. 16 bytes. Must be unique per (actor, request).
+  bytes value = 1;
+}
+
+// Server-assigned identifier for a long-running operation. Returned by
+// asynchronous RPCs; used to query status, cancel, or correlate audit events.
+message OperationRef {
+  bytes operation_id = 1; // 16-byte UUID assigned by daemon.
+}
+
+// State of a long-running operation.
+enum OperationState {
+  OPERATION_STATE_UNSPECIFIED = 0;
+  OPERATION_STATE_QUEUED      = 1;
+  OPERATION_STATE_RUNNING     = 2;
+  OPERATION_STATE_SUCCEEDED   = 3;
+  OPERATION_STATE_FAILED      = 4;
+  OPERATION_STATE_CANCELLED   = 5;
+  OPERATION_STATE_UNKNOWN     = 6; // CompletionUnknown per audit semantics
+}
+
+message OperationStatus {
+  bytes operation_id           = 1;
+  string operation_kind        = 2;
+  OperationState state         = 3;
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp updated_at = 5;
+  // Free-form progress payload (e.g., bytes_written, current_lba, etc.).
+  // Keys are operation-kind-specific.
+  map<string, string> progress = 6;
+  // On failure, a human-readable summary; structured detail in audit log.
+  string error_summary         = 7;
+}
+
+// Pagination — opaque tokens, server-controlled page sizes.
+message PageToken {
+  bytes value = 1;
+}
+
+// =============================================================================
+// DAEMON SERVICE — process-level introspection and operation control.
+// =============================================================================
+
+service Daemon {
+  rpc Health  (google.protobuf.Empty) returns (HealthResponse);
+  rpc Version (google.protobuf.Empty) returns (VersionResponse);
+
+  // Operation lifecycle, applicable across all services that return OperationRef.
+  rpc GetOperation    (GetOperationRequest)    returns (OperationStatus);
+  rpc ListOperations  (ListOperationsRequest)  returns (ListOperationsResponse);
+  rpc CancelOperation (CancelOperationRequest) returns (CancelOperationResponse);
+
+  // Server-streaming progress for an operation (alternative to polling
+  // GetOperation). The stream closes when the operation reaches a terminal
+  // state.
+  rpc WatchOperation  (GetOperationRequest)    returns (stream OperationStatus);
+}
+
+message HealthResponse {
+  enum Status {
+    STATUS_UNSPECIFIED   = 0;
+    STATUS_HEALTHY       = 1;
+    STATUS_READ_ONLY     = 2; // degraded — write path disabled, reads OK
+    STATUS_DEGRADED      = 3; // some libraries unreachable, etc.
+    STATUS_FAILED        = 4;
+  }
+  Status status            = 1;
+  // Per-component summary (e.g., "library:7CBAD9CF74" → "healthy").
+  map<string, string> components = 2;
+  string detail            = 3;
+}
+
+message VersionResponse {
+  string daemon_version    = 1; // e.g., "0.4.1+abc1234"
+  string api_version       = 2; // e.g., "v1"
+  string rust_target       = 3; // e.g., "x86_64-unknown-linux-gnu"
+}
+
+message GetOperationRequest    { bytes operation_id = 1; }
+
+message ListOperationsRequest {
+  // Filter: empty = all. Examples: "kind=write_session",
+  // "state=running", "since=2026-05-25T00:00:00Z".
+  map<string, string> filter = 1;
+  PageToken page_token       = 2;
+  uint32 page_size           = 3;
+}
+
+message ListOperationsResponse {
+  repeated OperationStatus operations = 1;
+  PageToken next_page_token           = 2;
+}
+
+message CancelOperationRequest {
+  bytes operation_id      = 1;
+  IdempotencyKey idempotency_key = 2;
+  // True: best-effort interrupt (CDB completion may still arrive).
+  // False: only cancel if not yet dispatched.
+  bool force              = 3;
+}
+
+message CancelOperationResponse {
+  OperationState resulting_state = 1; // CANCELLED, RUNNING (rejected), etc.
+  string detail                  = 2;
+}
+
+// =============================================================================
+// LIBRARY SERVICE — Layer 2 surface: inventory and state-changing ops.
+// =============================================================================
+
+service LibraryService {
+  rpc ListLibraries     (google.protobuf.Empty)       returns (ListLibrariesResponse);
+  rpc GetLibrary        (GetLibraryRequest)           returns (LibraryState);
+  rpc RefreshInventory  (RefreshInventoryRequest)     returns (OperationRef);
+
+  // State-changing ops. All return OperationRef; observe via Daemon.GetOperation
+  // or Daemon.WatchOperation.
+  rpc MoveMedium        (MoveMediumRequest)           returns (OperationRef);
+  rpc LoadDrive         (LoadDriveRequest)            returns (OperationRef);
+  rpc UnloadDrive       (UnloadDriveRequest)          returns (OperationRef);
+  rpc ImportElement     (ImportElementRequest)        returns (OperationRef);
+  rpc ExportElement     (ExportElementRequest)        returns (OperationRef);
+
+  // Server-streaming hot-plug / library state events (Layer 2c). Each event
+  // is a delta against the last observed LibraryState.
+  rpc StreamLibraryEvents (StreamLibraryEventsRequest) returns (stream LibraryEvent);
+}
+
+message Library {
+  string library_serial   = 1;  // SCSI VPD page 0x80 unit serial.
+  string vendor           = 2;
+  string product          = 3;
+  string product_revision = 4;
+  // Stable serial assigned at first discovery (UUID), independent of SCSI
+  // serial which can change with firmware re-flash on some vendors.
+  bytes  library_uuid     = 5;
+}
+
+message LibraryState {
+  Library library          = 1;
+  repeated Drive drives    = 2;
+  repeated Slot  slots     = 3;
+  repeated PortalSlot import_export_ports = 4;
+  google.protobuf.Timestamp last_inventory_at = 5;
+}
+
+message Drive {
+  uint32 element_address  = 1;  // library-reported drive bay
+  string drive_serial     = 2;  // joined from host-side INQUIRY
+  string host_device_path = 3;  // e.g., /dev/sg7
+  string vendor           = 4;
+  string product          = 5;
+  // Loaded tape (UUID); empty if drive is idle.
+  bytes  loaded_tape_uuid = 6;
+  enum Status {
+    DRIVE_STATUS_UNSPECIFIED   = 0;
+    DRIVE_STATUS_IDLE          = 1;
+    DRIVE_STATUS_LOADED        = 2;
+    DRIVE_STATUS_BUSY          = 3;
+    DRIVE_STATUS_UNREACHABLE   = 4;
+  }
+  Status status           = 7;
+}
+
+message Slot {
+  uint32 element_address  = 1;
+  // Voltag (operator-visible cartridge label). Empty if slot is empty.
+  string voltag           = 2;
+  // Remanence UUID for the cartridge in this slot. Empty if slot is empty.
+  bytes  tape_uuid        = 3;
+}
+
+message PortalSlot {
+  uint32 element_address  = 1;
+  string voltag           = 2;
+  bytes  tape_uuid        = 3;
+  enum Direction {
+    PORTAL_DIRECTION_UNSPECIFIED = 0;
+    PORTAL_DIRECTION_IMPORT      = 1;
+    PORTAL_DIRECTION_EXPORT      = 2;
+  }
+  Direction last_direction = 4;
+}
+
+message ListLibrariesResponse {
+  repeated Library libraries = 1;
+}
+
+message GetLibraryRequest {
+  bytes library_uuid = 1;
+}
+
+message RefreshInventoryRequest {
+  bytes library_uuid              = 1;
+  IdempotencyKey idempotency_key  = 2;
+}
+
+message MoveMediumRequest {
+  bytes library_uuid              = 1;
+  uint32 source_element_address   = 2;
+  uint32 destination_element_address = 3;
+  IdempotencyKey idempotency_key  = 4;
+}
+
+message LoadDriveRequest {
+  bytes library_uuid              = 1;
+  uint32 slot_element_address     = 2;
+  uint32 drive_element_address    = 3;
+  IdempotencyKey idempotency_key  = 4;
+}
+
+message UnloadDriveRequest {
+  bytes library_uuid              = 1;
+  uint32 drive_element_address    = 2;
+  // Destination slot. If unspecified, daemon picks a free slot.
+  uint32 destination_slot_address = 3;
+  IdempotencyKey idempotency_key  = 4;
+}
+
+message ImportElementRequest {
+  bytes library_uuid              = 1;
+  uint32 portal_element_address   = 2;
+  uint32 destination_slot_address = 3;
+  IdempotencyKey idempotency_key  = 4;
+}
+
+message ExportElementRequest {
+  bytes library_uuid              = 1;
+  uint32 source_slot_address      = 2;
+  uint32 portal_element_address   = 3;
+  IdempotencyKey idempotency_key  = 4;
+}
+
+message StreamLibraryEventsRequest {
+  bytes library_uuid = 1;
+  // If set, server replays events since this watermark; else live-only.
+  google.protobuf.Timestamp since = 2;
+}
+
+message LibraryEvent {
+  google.protobuf.Timestamp at = 1;
+  enum Kind {
+    LIBRARY_EVENT_UNSPECIFIED      = 0;
+    LIBRARY_EVENT_INVENTORY_DELTA  = 1; // slots / drive contents changed
+    LIBRARY_EVENT_HOTPLUG          = 2; // udev notification observed
+    LIBRARY_EVENT_DRIVE_STATE      = 3; // drive transitioned IDLE/LOADED/BUSY
+    LIBRARY_EVENT_HARDWARE_WARNING = 4; // tape-alert page, drive logs
+    LIBRARY_EVENT_UNREACHABLE      = 5; // library or drive lost
+  }
+  Kind kind                       = 2;
+  // Free-form structured detail, kind-specific.
+  map<string, string> detail      = 3;
+}
+
+// =============================================================================
+// CATALOG SERVICE — Layer 4 query surface over committed tape contents.
+//
+// This is the orchestrator's primary read surface. It powers the rebuildable-
+// index discipline: every query here can be answered from on-tape state alone
+// (the SQLite index is a cache; see layer4 addendum §6).
+// =============================================================================
+
+service Catalog {
+  rpc ListTapes        (ListTapesRequest)        returns (ListTapesResponse);
+  rpc GetTape          (GetTapeRequest)          returns (Tape);
+  rpc ListTapeFiles    (ListTapeFilesRequest)    returns (ListTapeFilesResponse);
+  rpc ListTapePools    (ListTapePoolsRequest)    returns (ListTapePoolsResponse);
+  rpc GetTapePool      (GetTapePoolRequest)      returns (TapePool);
+
+  // Stream every object on a tape, in order. This is the core enumeration RPC
+  // the orchestrator calls to (re)build its catalog. Each item carries the
+  // logical identity (content_sha256) plus the on-tape locator (tape + file +
+  // BodyLba per rem-tar-v1 §2.1).
+  rpc EnumerateObjects (EnumerateObjectsRequest) returns (stream ObjectRecord);
+
+  // Single-object lookup.
+  rpc GetObject        (GetObjectRequest)        returns (ObjectRecord);
+
+  // "Where are all the copies of this object?" — the multi-copy answer
+  // for one logical object across every known tape on this daemon.
+  rpc FindObjectCopies (FindObjectCopiesRequest) returns (FindObjectCopiesResponse);
+
+  // Reconciliation: ask the daemon to (re-)read a tape's catalog and emit
+  // a fresh enumeration that bypasses the SQLite cache. Slow; intended for
+  // periodic scrub or after suspected drift.
+  rpc ReconcileTape    (ReconcileTapeRequest)    returns (OperationRef);
+
+  // Body-format-aware queries. The daemon delegates to the registered
+  // format adapter (rem-tar-v1, rem-tar-legacy, rem-bru, future).
+  rpc ListFilesInObject (ListFilesInObjectRequest) returns (ListFilesInObjectResponse);
+  rpc GetFile           (GetFileRequest)           returns (FileRecord);
+
+  // Cross-source catalog view for native Remanence objects and foreign
+  // read-only archives such as BRU or legacy tar. This is additive: native
+  // object APIs above remain the orchestrator hot path.
+  rpc EnumerateUnits    (EnumerateUnitsRequest)    returns (stream CatalogUnit);
+  rpc GetCatalogUnit    (GetCatalogUnitRequest)    returns (CatalogUnit);
+  rpc ListEntriesInUnit (ListEntriesInUnitRequest) returns (ListEntriesInUnitResponse);
+}
+
+message Tape {
+  bytes tape_uuid              = 1;
+  string voltag                = 2;
+  string body_format           = 3; // "rem-tar-v1", "tar-legacy", "bru", ...
+  uint64 block_size_bytes      = 4;
+  // Parity scheme summary (per layer4 addendum tapes table).
+  uint32 data_blocks_per_stripe   = 5;
+  uint32 parity_blocks_per_stripe = 6;
+  uint32 stripes_per_neighborhood = 7;
+  uint64 last_committed_tape_file = 8;
+  enum State {
+    TAPE_STATE_UNSPECIFIED = 0;
+    TAPE_STATE_INVENTORIED = 1; // known but not yet catalog-scanned
+    TAPE_STATE_READY       = 2;
+    TAPE_STATE_DEGRADED    = 3;
+    TAPE_STATE_FAILED      = 4;
+    TAPE_STATE_SEALED      = 5;
+  }
+  State state                  = 9;
+  google.protobuf.Timestamp updated_at = 10;
+  // Current operator/orchestrator pool assignment. Empty means unassigned.
+  string pool_id               = 11;
+}
+
+// A daemon-local tape eligibility group. Sutradhara decides the policy that maps
+// content and copy numbers to pool ids; Remanence enforces that a write session
+// only uses tapes from the requested pool and reports pool membership in the
+// catalog. Pools may encode copy-wise segregation, content-wise segregation, or
+// both (for example "copy-a", "camera", or "camera.copy-a").
+message TapePool {
+  string pool_id       = 1;
+  string display_name  = 2;
+  // Optional opaque, fleet-coordinated policy-axis hints for clients.
+  // Remanence does not interpret them; enforcement still keys on pool_id.
+  string copy_class    = 3;
+  string content_class = 4;
+}
+
+message TapeFile {
+  bytes tape_uuid              = 1;
+  uint64 tape_file_number      = 2;
+  // "object" | "parity_sidecar" | "parity_map" | "bootstrap" | "catalog"
+  string kind                  = 3;
+  uint64 block_count           = 4;
+  // Set for kind="object".
+  bytes object_id              = 5;
+}
+
+// One object's catalog-level record. Body-format-agnostic.
+message ObjectRecord {
+  bytes object_id              = 1;  // Remanence-assigned UUID
+  string caller_object_id      = 2;  // opaque string from orchestrator (§4.2)
+  // The logical-asset identity Sutradhara keys on. For rem-tar-v1 this is the
+  // canonical manifest_sha256 / content hash of the object's contents.
+  bytes content_sha256         = 3;
+  uint64 logical_size_bytes    = 4;
+  string body_format           = 5;
+  // Caller-supplied opaque metadata (per §4.2). Free-form key/value.
+  map<string, string> caller_metadata = 6;
+  google.protobuf.Timestamp created_at = 7;
+  repeated ObjectCopy copies   = 8;
+}
+
+message ObjectCopy {
+  bytes  tape_uuid             = 1;
+  uint64 tape_file_number      = 2;
+  // Within the object, the first BodyLba block of the first file's data.
+  // Per rem-tar-v1 §2.1 BodyLba is per-object and starts at 0.
+  uint64 first_body_lba        = 3;
+  // Catalog-recorded freshness: when did scrub last confirm this copy?
+  google.protobuf.Timestamp last_verified_at = 4;
+  enum Health {
+    OBJECT_COPY_HEALTH_UNSPECIFIED = 0;
+    OBJECT_COPY_HEALTH_OK          = 1;
+    OBJECT_COPY_HEALTH_SUSPECT     = 2;
+    OBJECT_COPY_HEALTH_DEGRADED    = 3; // parity recoverable
+    OBJECT_COPY_HEALTH_LOST        = 4;
+  }
+  Health health                = 5;
+  // Pool of the tape when this copy was committed. Empty means unassigned.
+  string pool_id               = 6;
+}
+
+// A single payload file inside an object (rem-tar-v1: one pax entry).
+message FileRecord {
+  bytes object_id              = 1;
+  // file_id is per-object; UUID assigned by the writer and recorded in pax.
+  bytes file_id                = 2;
+  string path                  = 3;
+  uint64 size_bytes            = 4;
+  bytes  file_sha256           = 5;
+  // BodyLba within the object where this file's data starts (rem-tar-v1
+  // chunk-aligned start).
+  uint64 first_chunk_body_lba  = 6;
+  uint32 chunk_count           = 7;
+}
+
+message ListTapesRequest {
+  bytes library_uuid = 1; // empty = all libraries known to daemon
+  PageToken page_token = 2;
+  uint32 page_size     = 3;
+  string pool_id       = 4; // empty = all pools and unassigned tapes
+}
+message ListTapesResponse { repeated Tape tapes = 1; PageToken next_page_token = 2; }
+
+message GetTapeRequest      { bytes tape_uuid = 1; }
+message ListTapeFilesRequest {
+  bytes tape_uuid     = 1;
+  PageToken page_token = 2;
+  uint32 page_size     = 3;
+}
+message ListTapeFilesResponse {
+  repeated TapeFile tape_files = 1;
+  PageToken next_page_token    = 2;
+}
+
+message ListTapePoolsRequest {
+  PageToken page_token = 1;
+  uint32 page_size     = 2;
+}
+message ListTapePoolsResponse {
+  repeated TapePool pools = 1;
+  PageToken next_page_token = 2;
+}
+
+message GetTapePoolRequest { string pool_id = 1; }
+
+message EnumerateObjectsRequest {
+  // Scope: one tape, one library (all tapes in it), or all known tapes.
+  oneof scope {
+    bytes tape_uuid       = 1;
+    bytes library_uuid    = 2;
+    google.protobuf.Empty all = 3;
+  }
+  // If true, bypass SQLite index and read catalog from each tape directly.
+  // Slow; intended for full reconciliation.
+  bool reconcile_from_tape = 4;
+}
+
+message GetObjectRequest {
+  oneof key {
+    bytes  object_id        = 1; // Remanence UUID
+    bytes  content_sha256   = 2; // by content hash
+    string caller_object_id = 3; // by orchestrator-supplied id
+  }
+}
+
+message FindObjectCopiesRequest {
+  oneof key {
+    bytes  object_id        = 1;
+    bytes  content_sha256   = 2;
+    string caller_object_id = 3;
+  }
+}
+message FindObjectCopiesResponse {
+  ObjectRecord object        = 1;
+  repeated ObjectCopy copies = 2;
+}
+
+message ReconcileTapeRequest {
+  bytes tape_uuid              = 1;
+  IdempotencyKey idempotency_key = 2;
+}
+
+message ListFilesInObjectRequest {
+  bytes object_id     = 1;
+  PageToken page_token = 2;
+  uint32 page_size     = 3;
+}
+message ListFilesInObjectResponse {
+  repeated FileRecord files   = 1;
+  PageToken next_page_token   = 2;
+}
+
+message GetFileRequest {
+  bytes object_id  = 1;
+  // Either file_id OR path within the object.
+  oneof key {
+    bytes  file_id = 2;
+    string path    = 3;
+  }
+}
+
+// A source-neutral archive container. Native Remanence objects appear here by
+// reference to ObjectRecord. Foreign archives appear as derived scan units and
+// expose only normalized fields; driver-private restore state stays internal to
+// the daemon/catalog cache.
+message CatalogUnit {
+  bytes unit_id                    = 1;
+  bytes tape_uuid                  = 2;
+  string format_id                 = 3; // "rem-tar-v1", "bru", "tar-legacy", ...
+  CatalogUnitOriginKind origin_kind = 4;
+  google.protobuf.Timestamp discovered_at = 5;
+
+  oneof origin {
+    NativeUnitSummary native       = 10;
+    ForeignArchiveSummary foreign  = 11;
+  }
+}
+
+enum CatalogUnitOriginKind {
+  CATALOG_UNIT_ORIGIN_KIND_UNSPECIFIED = 0;
+  CATALOG_UNIT_ORIGIN_KIND_NATIVE_OBJECT = 1;
+  CATALOG_UNIT_ORIGIN_KIND_FOREIGN_ARCHIVE = 2;
+}
+
+// Native unit summary deliberately references ObjectRecord rather than
+// duplicating object/copy fields. ObjectRecord remains authoritative for native
+// Remanence object semantics.
+message NativeUnitSummary {
+  bytes object_id = 1;
+}
+
+message ForeignArchiveSummary {
+  bytes scan_id = 1;
+  string source_kind = 2; // "physical_tape_records" | "byte_stream_dump"
+  // Trusted daemon-local source identifier or dump path token. This is not a
+  // client-supplied filesystem path; future ingestion RPCs must validate it
+  // against configured foreign-source roots before storing it.
+  string source_id = 3;
+  CatalogScanConfidence confidence = 4;
+  google.protobuf.Timestamp last_scan_at = 5;
+  uint64 entry_count = 6;
+  uint64 damage_event_count = 7;
+}
+
+enum CatalogScanConfidence {
+  CATALOG_SCAN_CONFIDENCE_UNSPECIFIED = 0;
+  CATALOG_SCAN_CONFIDENCE_LOW = 1;
+  CATALOG_SCAN_CONFIDENCE_MEDIUM = 2;
+  CATALOG_SCAN_CONFIDENCE_HIGH = 3;
+}
+
+enum CatalogUnitOriginFilter {
+  CATALOG_UNIT_ORIGIN_FILTER_UNSPECIFIED = 0; // all units
+  CATALOG_UNIT_ORIGIN_FILTER_NATIVE_OBJECTS = 1;
+  CATALOG_UNIT_ORIGIN_FILTER_FOREIGN_ARCHIVES = 2;
+}
+
+message EnumerateUnitsRequest {
+  oneof scope {
+    bytes tape_uuid       = 1;
+    bytes library_uuid    = 2;
+    google.protobuf.Empty all = 3;
+  }
+  CatalogUnitOriginFilter origin_filter = 4;
+  // If true, foreign units may be re-probed/re-scanned by their driver instead
+  // of using the derived cache. Native objects follow EnumerateObjects rules.
+  bool refresh_from_source = 5;
+}
+
+message GetCatalogUnitRequest {
+  bytes unit_id = 1;
+}
+
+message CatalogEntry {
+  bytes unit_id = 1;
+  bytes entry_id = 2; // stable within this unit/scan, driver assigned for foreign units
+  string path = 3;
+  CatalogEntryKind kind = 4;
+  optional uint64 size_bytes = 5;
+  google.protobuf.Timestamp mtime = 6;
+  CatalogEntryState state = 7;
+  IntegrityBasis integrity_basis = 8;
+}
+
+enum CatalogEntryKind {
+  CATALOG_ENTRY_KIND_UNSPECIFIED = 0;
+  CATALOG_ENTRY_KIND_REGULAR_FILE = 1;
+  CATALOG_ENTRY_KIND_DIRECTORY = 2;
+  CATALOG_ENTRY_KIND_SYMLINK = 3;
+  CATALOG_ENTRY_KIND_HARDLINK = 4;
+  CATALOG_ENTRY_KIND_SPECIAL = 5;
+}
+
+enum CatalogEntryState {
+  CATALOG_ENTRY_STATE_UNSPECIFIED = 0;
+  CATALOG_ENTRY_STATE_COMPLETE = 1;
+  CATALOG_ENTRY_STATE_PARTIAL = 2;
+  CATALOG_ENTRY_STATE_DAMAGED = 3;
+  CATALOG_ENTRY_STATE_UNSUPPORTED = 4;
+  CATALOG_ENTRY_STATE_UNKNOWN = 5;
+}
+
+enum IntegrityBasis {
+  INTEGRITY_BASIS_UNSPECIFIED = 0;
+  INTEGRITY_BASIS_UNKNOWN = 1;
+  INTEGRITY_BASIS_CONTENT_HASH = 2;
+  INTEGRITY_BASIS_FORMAT_CHECKSUM = 3;
+  INTEGRITY_BASIS_PARITY_CONSISTENCY = 4;
+}
+
+message ListEntriesInUnitRequest {
+  bytes unit_id = 1;
+  PageToken page_token = 2;
+  uint32 page_size = 3;
+  // For foreign units the daemon may re-run ArchiveReader.scan instead of
+  // returning a cached derived entry list.
+  bool refresh_from_source = 4;
+}
+
+message ListEntriesInUnitResponse {
+  repeated CatalogEntry entries = 1;
+  PageToken next_page_token = 2;
+  repeated ArchiveGap archive_gaps = 3;
+}
+
+message ArchiveGap {
+  bytes unit_id = 1;
+  uint64 source_start = 2;
+  uint64 source_end = 3;
+  ArchiveGapCause cause = 4;
+}
+
+enum ArchiveGapCause {
+  ARCHIVE_GAP_CAUSE_UNSPECIFIED = 0;
+  ARCHIVE_GAP_CAUSE_UNRECOGNIZED_DATA = 1;
+  ARCHIVE_GAP_CAUSE_READ_ERROR = 2;
+  ARCHIVE_GAP_CAUSE_MISSING = 3;
+  ARCHIVE_GAP_CAUSE_RESYNC = 4;
+  ARCHIVE_GAP_CAUSE_UNSUPPORTED = 5;
+}
+
+// =============================================================================
+// WRITE SESSION SERVICE — write objects to tape.
+//
+// A write session is a server-side resource bound to one drive, one loaded
+// tape, and one body format. The orchestrator opens a session, streams one
+// or more objects into it, then closes. Sessions are durable across daemon
+// restarts up to the last checkpoint; LostByRestart sessions return their
+// last known state at OpenWriteSession-recover time.
+// =============================================================================
+
+service WriteSessionService {
+  rpc OpenWriteSession   (OpenWriteSessionRequest)   returns (WriteSession);
+
+  // Stream one object into the session. The first message in each call must
+  // be an AppendObjectStart; subsequent messages are AppendObjectChunk; the
+  // last is AppendObjectFinish. Returns one ObjectRecord describing the
+  // committed object.
+  rpc AppendObject       (stream AppendObjectMessage) returns (ObjectRecord);
+
+  rpc CheckpointSession  (CheckpointSessionRequest)  returns (WriteSession);
+  rpc CloseWriteSession  (CloseWriteSessionRequest)  returns (WriteSession);
+  rpc AbortWriteSession  (AbortWriteSessionRequest)  returns (WriteSession);
+  rpc GetWriteSession    (GetWriteSessionRequest)    returns (WriteSession);
+}
+
+message WriteSession {
+  bytes session_id           = 1; // UUID
+  bytes tape_uuid            = 2;
+  uint32 drive_element_address = 3;
+  string body_format         = 4;
+  enum State {
+    WRITE_SESSION_STATE_UNSPECIFIED = 0;
+    WRITE_SESSION_STATE_OPEN        = 1;
+    WRITE_SESSION_STATE_CHECKPOINTED = 2;
+    WRITE_SESSION_STATE_CLOSED      = 3;
+    WRITE_SESSION_STATE_ABORTED     = 4;
+    WRITE_SESSION_STATE_ORPHANED    = 5; // dropped by daemon restart, recoverable
+    WRITE_SESSION_STATE_LOST        = 6; // unrecoverable
+  }
+  State state                = 5;
+  uint64 objects_committed   = 6;
+  uint64 bytes_committed     = 7;
+  google.protobuf.Timestamp opened_at = 8;
+  google.protobuf.Timestamp last_checkpoint_at = 9;
+  enum TargetKind {
+    WRITE_SESSION_TARGET_KIND_UNSPECIFIED = 0;
+    WRITE_SESSION_TARGET_KIND_PINNED_TAPE = 1;
+    WRITE_SESSION_TARGET_KIND_POOL        = 2;
+  }
+  TargetKind target_kind      = 10;
+  repeated bytes tape_sequence = 11;
+  uint32 current_tape_index   = 12;
+}
+
+message OpenWriteSessionRequest {
+  // Pick a target. Either (library_uuid + drive) with current tape, or
+  // ask the daemon to load a specific tape into any free drive.
+  oneof target {
+    DriveTarget   drive_target = 1;
+    TapeTarget    tape_target  = 2;
+    TapePoolTarget pool_target  = 6;
+  }
+  string body_format             = 3; // "rem-tar-v1" by default
+  IdempotencyKey idempotency_key = 4;
+  // Recover an existing orphaned session by id (no new session created).
+  bytes recover_session_id       = 5;
+}
+
+message DriveTarget {
+  bytes library_uuid           = 1;
+  uint32 drive_element_address = 2;
+  // Optional guard: if set, the currently loaded tape must be in this pool.
+  string required_pool_id      = 3;
+}
+
+message TapeTarget {
+  bytes tape_uuid              = 1;
+  // If true and no drive currently holds this tape, daemon mounts it.
+  bool mount_if_needed         = 2;
+  // Optional guard: if set, the tape must currently be assigned to this pool.
+  string required_pool_id      = 3;
+}
+
+message TapePoolTarget {
+  string pool_id               = 1;
+  bytes library_uuid           = 2; // optional library constraint
+  bool mount_if_needed         = 3;
+}
+
+message AppendObjectMessage {
+  oneof payload {
+    AppendObjectStart  start  = 1;
+    AppendObjectChunk  chunk  = 2;
+    AppendObjectFinish finish = 3;
+  }
+}
+
+message AppendObjectStart {
+  bytes session_id                    = 1;
+  string caller_object_id             = 2; // §4.2 orchestrator opaque id
+  map<string, string> caller_metadata = 3; // §4.2 opaque metadata
+  // Optional: declared size_bytes for capacity-reserve planning (rem-tar-v1
+  // §9.1 P1 projected_size_blocks). If unknown, daemon estimates.
+  uint64 declared_size_bytes          = 4;
+  // For rem-tar-v1: pre-supplied per-file manifest (paths, sizes, hashes,
+  // optional pre-computed file_sha256). The writer validates and writes
+  // accordingly. The exact shape is body-format-specific; this draft leaves
+  // it as a serialized blob owned by the format adapter.
+  bytes body_format_manifest          = 5;
+}
+
+message AppendObjectChunk {
+  bytes session_id = 1;
+  bytes data       = 2; // file data, in body-format-defined order
+}
+
+message AppendObjectFinish {
+  bytes session_id = 1;
+  // If client pre-computed the object's content_sha256, daemon validates
+  // before committing.
+  bytes expected_content_sha256 = 2;
+}
+
+message CheckpointSessionRequest {
+  bytes session_id               = 1;
+  IdempotencyKey idempotency_key = 2;
+}
+
+message CloseWriteSessionRequest {
+  bytes session_id               = 1;
+  IdempotencyKey idempotency_key = 2;
+}
+
+message AbortWriteSessionRequest {
+  bytes session_id               = 1;
+  IdempotencyKey idempotency_key = 2;
+  string reason                  = 3;
+}
+
+message GetWriteSessionRequest { bytes session_id = 1; }
+
+// =============================================================================
+// READ SESSION SERVICE — read objects / byte ranges from tape.
+//
+// A read session pins a drive + loaded tape and lets the caller issue many
+// read RPCs at low overhead. For one-off reads, OpenReadSession + a single
+// ReadObjectRange + CloseReadSession is fine.
+// =============================================================================
+
+service ReadSessionService {
+  rpc OpenReadSession  (OpenReadSessionRequest)  returns (ReadSession);
+  rpc CloseReadSession (CloseReadSessionRequest) returns (ReadSession);
+  rpc GetReadSession   (GetReadSessionRequest)   returns (ReadSession);
+
+  // Read a whole object or a byte range within a single file in the object.
+  // The reader resolves (object_id + file_id + byte_range) to BodyLba ranges
+  // via the catalog and issues LOCATE + read.
+  rpc ReadObjectRange  (ReadObjectRangeRequest)  returns (stream BytesChunk);
+
+  // Read an entire file from an object.
+  rpc ReadFile         (ReadFileRequest)         returns (stream BytesChunk);
+}
+
+message ReadSession {
+  bytes session_id           = 1;
+  bytes tape_uuid            = 2;
+  uint32 drive_element_address = 3;
+  enum State {
+    READ_SESSION_STATE_UNSPECIFIED = 0;
+    READ_SESSION_STATE_OPEN        = 1;
+    READ_SESSION_STATE_CLOSED      = 2;
+    READ_SESSION_STATE_LOST        = 3;
+  }
+  State state                = 4;
+  google.protobuf.Timestamp opened_at = 5;
+}
+
+message OpenReadSessionRequest {
+  oneof target {
+    DriveTarget drive_target = 1;
+    TapeTarget  tape_target  = 2;
+  }
+  IdempotencyKey idempotency_key = 3;
+}
+
+message CloseReadSessionRequest {
+  bytes session_id               = 1;
+  IdempotencyKey idempotency_key = 2;
+}
+
+message GetReadSessionRequest { bytes session_id = 1; }
+
+message ReadObjectRangeRequest {
+  bytes session_id   = 1;
+  bytes object_id    = 2;
+  bytes file_id      = 3;
+  // Half-open byte range within the file: [start_byte, end_byte).
+  // If both zero, reads the whole file.
+  uint64 start_byte  = 4;
+  uint64 end_byte    = 5;
+  // Suggested chunk size for stream framing (server may use a different
+  // size). 0 = server default.
+  uint32 stream_chunk_bytes = 6;
+}
+
+message ReadFileRequest {
+  bytes session_id    = 1;
+  bytes object_id     = 2;
+  bytes file_id       = 3;
+  uint32 stream_chunk_bytes = 4;
+}
+
+message BytesChunk {
+  bytes data    = 1;
+  bool  is_last = 2;
+}
+
+// =============================================================================
+// AUDIT SERVICE — read-only audit log queries.
+//
+// The append-only audit log is daemon-authoritative (layer4 addendum §5).
+// Layer 5 exposes query-only surface; mutations only happen through the
+// other services.
+// =============================================================================
+
+service Audit {
+  rpc QueryAudit (QueryAuditRequest) returns (stream AuditEntry);
+}
+
+message QueryAuditRequest {
+  google.protobuf.Timestamp since = 1;
+  google.protobuf.Timestamp until = 2;
+  // Filter by operation_id, session_id, subject, event kind, actor, etc.
+  map<string, string> filter      = 3;
+}
+
+message AuditEntry {
+  uint64 sequence              = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  string actor                 = 3;
+  string source_layer          = 4; // "layer2", "layer3a", "layer3c", "layer5"
+  bytes  operation_id          = 5;
+  bytes  session_id            = 6;
+  string event_kind            = 7; // see layer4 addendum §5.2
+  // Free-form structured detail; CBOR-encoded in the on-disk log, JSON-ified
+  // here for client convenience.
+  string detail_json           = 8;
+}

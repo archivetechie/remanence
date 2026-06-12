@@ -1,0 +1,50 @@
+    HPE       Ultrium 9-SCSI    R3G3
+Volume statistics page (ssc-4), subpage=0
+  Page valid: 1
+  Thread count: 13
+  Total data sets written: 798177
+  Total write retries: 5
+  Total unrecovered write errors: 0
+  Total suspended writes: 49
+  Total fatal suspended writes: 0
+  Total data sets read: 112
+  Total read retries: 1
+  Total unrecovered read errors: 0
+  Last mount unrecovered write errors: 0
+  Last mount unrecovered read errors: 0
+  Last mount megabytes written: 296147
+  Last mount megabytes read: 88
+  Lifetime megabytes written: 7826055
+  Lifetime megabytes read: 1098
+  Last load write compression ratio: 100
+  Last load read compression ratio: 101
+  Medium mount time: 23273653
+  Medium ready time: 23273652
+  Total native capacity [MB]: 18000000
+  Total used native capacity [MB]: 7826016
+  Reserved parameter code (0x18), payload in hex
+ 00     01 09 80 c0                                         ....
+  Reserved parameter code (0x19), payload in hex
+ 00     62                                                  b
+  Volume serial number: 1923B16291                      
+  Tape lot identifier: *2209192
+  Volume barcode: S30002L9                        
+  Volume manufacturer: HPE     
+  Volume license code: 0909
+  Volume personality: LTOL9G9  
+  Write protect: 0
+  WORM: 0
+  Maximum recommended tape path temperature exceeded: 0
+  Beginning of medium passes: 252
+  Middle of medium passes: 248
+  Logical position of first encrypted logical object:
+    partition number: 0, partition record data counter: 0xffffffffffff
+  Logical position of first unencrypted logical object after first
+  encrypted logical object:
+    partition number: 0, partition record data counter: 0xffffffffffff
+  Native capacity partition(s) [MB]:
+    partition number: 0, partition record data counter: 18000000
+  Used native capacity partition(s) [MB]:
+    partition number: 0, partition record data counter: 7826016
+  Remaining native capacity partition(s) [MB]:
+    partition number: 0, partition record data counter: 10193984

@@ -1,0 +1,13 @@
+    HPE       Ultrium 9-SCSI    R3G3
+Tape usage page  (LTO-5 and LTO-6 specific) [0x30]
+  Thread count: 13
+  Total data sets written: 798177
+  Total write retries: 5
+  Total unrecovered write errors: 0
+  Total suspended writes: 49
+  Total fatal suspended writes: 0
+  Total data sets read: 112
+  Total read retries: 1
+  Total unrecovered read errors: 0
+  Total suspended reads: 0
+  Total fatal suspended reads: 0

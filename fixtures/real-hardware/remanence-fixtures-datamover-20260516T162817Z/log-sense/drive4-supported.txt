@@ -1,0 +1,38 @@
+    HP        Ultrium 7-SCSI    S2T1
+Supported log pages and subpages  [0x0, 0xff]:
+    0x00        Supported log pages [sp]
+    0x00,0xff   Supported log pages and subpages [ssp]
+    0x02        Write error [we]
+    0x03        Read error [re]
+    0x06        Non medium [nm]
+    0x0c        Sequential access device [sad]
+    0x11        DT Device status [dtds]
+    0x12        Tape alert response [tar]
+    0x14        Device statistics [ds]
+    0x16        Tape diagnostic data [tdd]
+    0x17        Volume statistics [vs]
+    0x17,0x01   Volume statistics [vs]
+    0x17,0x02   Volume statistics [vs]
+    0x18        Protocol specific port [psp]
+    0x1a        Power condition transitions [pct]
+    0x1b        Data compression [dc]
+    0x2e        Tape alert [ta]
+    0x30        Tape usage (lto-5, 6) [tu_]
+    0x31        Tape capacity (lto-5, 6) [tc_]
+    0x32        Data compression (lto-5) [dc_]
+    0x33        Write errors (lto-5) [we_]
+    0x34        Read forward errors (lto-5) [rfe_]
+    0x37        Performance characteristics (lto-5) [pc_]
+    0x37,0x10   
+    0x37,0x20   
+    0x37,0x40   
+    0x37,0x50   
+    0x37,0x60   
+    0x37,0x80   
+    0x37,0x90   
+    0x37,0xa0   
+    0x38        Blocks/bytes transferred (lto-5) [bbt_]
+    0x39        Host port 0 interface errors (lto-5) [hp0_]
+    0x3b        Host port 1 interface errors (lto-5) [hp1_]
+    0x3c        Drive usage information (lto-5) [dui_]
+    0x3d        Subsystem statistics (lto-5) [ss_]

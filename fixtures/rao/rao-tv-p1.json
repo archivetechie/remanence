@@ -1,0 +1,60 @@
+{
+  "vector_id": "RAO-TV-P1",
+  "spec_section": "13.2",
+  "status": "pinned-at-generation",
+  "independent_rederivation": "verified by tools/verify_rao_vectors_independent.py",
+  "inputs": {
+    "chunk_size": 4096,
+    "object_id": "00000000-0000-4000-8000-000000000001",
+    "caller_object_id": "rao-tv-1",
+    "write_timestamp": "2026-01-01T00:00:00Z",
+    "metadata_preservation": "minimal",
+    "manifest_file_id": "00000000-0000-4000-8000-0000000000ff"
+  },
+  "expected": {
+    "stored_size_bytes": 20480,
+    "stored_size_blocks": 5,
+    "stored_digest": "3e050429cd151a772c60aa0f7ca29809b296f47484ffd7f8150f23b12a3d2c49",
+    "first_block_sha256": "97f9098d1b02c85d171595b750b58a0eee9db4cae22a3afc7f11ff5bb3efd2f5",
+    "manifest_cbor_len": 548,
+    "manifest_cbor_hex": "a7696f626a6563745f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303030316a6368756e6b5f73697a651910006c66696c655f656e747269657382a864706174686b612f68656c6c6f2e7478746766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303031306a65786563757461626c65f66a73697a655f6279746573181a6b6368756e6b5f636f756e74016b66696c655f73686132353658200ea7e9ec3396345c15ef4edf44e91d8cf184feb303ba992b38d65f71dcac37e26f66697273745f6368756e6b5f6c626101781a6d657461646174615f707265736572766174696f6e5f64617461a0a864706174686d622f7061747465726e2e62696e6766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303031316a65786563757461626c65f66a73697a655f62797465731913886b6368756e6b5f636f756e74026b66696c655f73686132353658208026e5c96cf1e502c8deb3e89f8b8bc342f5039b871911a92eb10edf9c6542d36f66697273745f6368756e6b5f6c626102781a6d657461646174615f707265736572766174696f6e5f64617461a06e736368656d615f76657273696f6e016f6f626a6563745f6d65746164617461a07063616c6c65725f6f626a6563745f69646872616f2d74762d317365787465726e616c5f7265666572656e63657380",
+    "manifest_sha256": "818e539362d640134a444e31a1c8460b6b48dc07669def61e2f166b7f419d03b",
+    "file_payloads": [
+      {
+        "path": "a/hello.txt",
+        "size_bytes": 26,
+        "sha256": "0ea7e9ec3396345c15ef4edf44e91d8cf184feb303ba992b38d65f71dcac37e2"
+      },
+      {
+        "path": "b/pattern.bin",
+        "size_bytes": 5000,
+        "sha256": "8026e5c96cf1e502c8deb3e89f8b8bc342f5039b871911a92eb10edf9c6542d3"
+      }
+    ],
+    "file_layouts": [
+      {
+        "path": "a/hello.txt",
+        "pax_header_offset": 1024,
+        "data_offset": 4096,
+        "first_chunk_lba": 1,
+        "chunk_count": 1,
+        "pad_spaces": 1792
+      },
+      {
+        "path": "b/pattern.bin",
+        "pax_header_offset": 4608,
+        "data_offset": 8192,
+        "first_chunk_lba": 2,
+        "chunk_count": 2,
+        "pad_spaces": 2300
+      }
+    ],
+    "manifest_layout": {
+      "pax_header_offset": 13312,
+      "data_offset": 16384,
+      "first_chunk_lba": 4,
+      "chunk_count": 1,
+      "pad_spaces": 1718
+    }
+  }
+}

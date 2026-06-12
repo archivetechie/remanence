@@ -1,0 +1,29 @@
+  $ lsscsi -gvv
+list_ndevices: scandir: /sys/class/nvme/: No such file or directory
+ sysfsroot: /sys
+[0:1:124:0]  enclosu BROADCOM VirtualSES       03    -          /dev/sg0 
+  dir: /sys/bus/scsi/devices/0:1:124:0  [/sys/devices/pci0000:60/0000:60:03.2/0000:64:00.0/host0/target0:1:124/0:1:124:0]
+[0:3:111:0]  disk    HPE      MR416i-a Gen10+  5.32  /dev/sda   /dev/sg1 
+  dir: /sys/bus/scsi/devices/0:3:111:0  [/sys/devices/pci0000:60/0000:60:03.2/0000:64:00.0/host0/target0:3:111/0:3:111:0]
+[1:0:3:0]    enclosu HPE      Smart Adapter    7.81  -          /dev/sg5 
+  dir: /sys/bus/scsi/devices/1:0:3:0  [/sys/devices/pci0000:20/0000:20:03.1/0000:27:00.0/host1/scsi_host/host1/port-1:4/end_device-1:4/target1:0:3/1:0:3:0]
+[1:0:8:0]    tape    HPE      Ultrium 9-SCSI   S2S1  /dev/st0   /dev/sg2 
+  dir: /sys/bus/scsi/devices/1:0:8:0  [/sys/devices/pci0000:20/0000:20:03.1/0000:27:00.0/host1/scsi_host/host1/port-1:9/end_device-1:9/target1:0:8/1:0:8:0]
+[1:0:9:0]    tape    HP       Ultrium 7-SCSI   S2T1  /dev/st3   /dev/sg8 
+  dir: /sys/bus/scsi/devices/1:0:9:0  [/sys/devices/pci0000:20/0000:20:03.1/0000:27:00.0/host1/scsi_host/host1/port-1:10/end_device-1:10/target1:0:9/1:0:9:0]
+[1:0:10:0]   mediumx HPE      MSL3040          3350  -          /dev/sg11
+  dir: /sys/bus/scsi/devices/1:0:10:0  [/sys/devices/pci0000:20/0000:20:03.1/0000:27:00.0/host1/scsi_host/host1/port-1:11/end_device-1:11/target1:0:10/1:0:10:0]
+[1:2:0:0]    storage HPE      P408e-p SR Gen10 7.81  -          /dev/sg6 
+  dir: /sys/bus/scsi/devices/1:2:0:0  [/sys/devices/pci0000:20/0000:20:03.1/0000:27:00.0/host1/target1:2:0/1:2:0:0]
+[2:0:3:0]    enclosu HPE      Smart Adapter    7.81  -          /dev/sg9 
+  dir: /sys/bus/scsi/devices/2:0:3:0  [/sys/devices/pci0000:00/0000:00:01.2/0000:04:00.0/host2/scsi_host/host2/port-2:4/end_device-2:4/target2:0:3/2:0:3:0]
+[2:0:11:0]   tape    HP       Ultrium 7-SCSI   Q387  /dev/st1   /dev/sg3 
+  dir: /sys/bus/scsi/devices/2:0:11:0  [/sys/devices/pci0000:00/0000:00:01.2/0000:04:00.0/host2/scsi_host/host2/port-2:12/end_device-2:12/target2:0:11/2:0:11:0]
+[2:0:12:0]   tape    HPE      Ultrium 9-SCSI   R3G3  /dev/st2   /dev/sg4 
+  dir: /sys/bus/scsi/devices/2:0:12:0  [/sys/devices/pci0000:00/0000:00:01.2/0000:04:00.0/host2/scsi_host/host2/port-2:13/end_device-2:13/target2:0:12/2:0:12:0]
+[2:0:13:0]   mediumx HPE      MSL3040          3350  -          /dev/sg7 
+  dir: /sys/bus/scsi/devices/2:0:13:0  [/sys/devices/pci0000:00/0000:00:01.2/0000:04:00.0/host2/scsi_host/host2/port-2:14/end_device-2:14/target2:0:13/2:0:13:0]
+[2:2:0:0]    storage HPE      E208e-p SR Gen10 7.81  -          /dev/sg10
+  dir: /sys/bus/scsi/devices/2:2:0:0  [/sys/devices/pci0000:00/0000:00:01.2/0000:04:00.0/host2/target2:2:0/2:2:0:0]
+NVMe module may not be loaded
+    (rc=0)

@@ -1,0 +1,15 @@
+    HPE       Ultrium 9-SCSI    S2S1
+Sequential access device page (ssc-3)
+  Data bytes received with WRITE commands: 57 GB
+  Data bytes written to media by WRITE commands: 56 GB
+  Data bytes read from media by READ commands: 0 GB
+  Data bytes transferred by READ commands: 0 GB
+  Native capacity from BOP to EOD: 7141142 MB
+  Native capacity from BOP to EW of current partition: 18000000 MB
+  Minimum native capacity from EW to EOP of current partition: 49 MB
+  Maximum native capacity in device object buffer: 647 MB
+  Cleaning action not required (or completed)
+  Vendor specific parameter [0x8000] value: 81642845
+  Vendor specific parameter [0x8001] value: 722
+  Vendor specific parameter [0x8002] value: 4
+  Vendor specific parameter [0x8003] value: 29309629

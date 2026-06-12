@@ -1,0 +1,13 @@
+    HPE       MSL3040           3350
+Supported log pages  [0x0]:
+    0x00        Supported log pages [sp]
+    0x07        Last n error [lne]
+    0x0d        Temperature [temp]
+    0x2e        
+    0x30        
+    0x34        
+    0x36        
+    0x38        
+    0x3a        
+    0x3b        
+    0x3e        

@@ -1,0 +1,33 @@
+    inquiry cdb: [12 01 00 00 fc 00]
+    inquiry cdb: [12 01 83 00 fc 00]
+VPD INQUIRY: Device Identification page
+  Designation descriptor number 1, descriptor length: 38
+    designator_type: T10 vendor identification,  code_set: ASCII
+    associated with the Addressed logical unit
+      vendor id: HP      
+      vendor specific: Ultrium 7-SCSI  8031BDC7EF
+  Designation descriptor number 2, descriptor length: 12
+    designator_type: NAA,  code_set: Binary
+    associated with the Addressed logical unit
+      NAA 5, IEEE Company_id: 0x1438
+      Vendor Specific Identifier: 0x31bdc7ef
+      [0x5001438031bdc7ef]
+  Designation descriptor number 3, descriptor length: 8
+    transport: Serial Attached SCSI Protocol (SPL-4)
+    designator_type: Relative target port,  code_set: Binary
+    associated with the Target port
+      Relative target port: 0x1
+  Designation descriptor number 4, descriptor length: 12
+    transport: Serial Attached SCSI Protocol (SPL-4)
+    designator_type: NAA,  code_set: Binary
+    associated with the Target port
+      NAA 5, IEEE Company_id: 0x1438
+      Vendor Specific Identifier: 0x31bdc7f0
+      [0x5001438031bdc7f0]
+  Designation descriptor number 5, descriptor length: 12
+    transport: Serial Attached SCSI Protocol (SPL-4)
+    designator_type: NAA,  code_set: Binary
+    associated with the Target device that contains addressed lu
+      NAA 5, IEEE Company_id: 0x1438
+      Vendor Specific Identifier: 0x31bdc7ef
+      [0x5001438031bdc7ef]

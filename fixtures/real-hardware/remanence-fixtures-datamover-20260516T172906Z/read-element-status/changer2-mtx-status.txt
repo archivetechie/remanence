@@ -1,0 +1,43 @@
+  Storage Changer /dev/sg11:2 Drives, 40 Slots ( 0 Import/Export )
+Data Transfer Element 0:Full (Storage Element 33 Loaded):VolumeTag = E10046L7                            
+Data Transfer Element 1:Empty
+      Storage Element 1:Full :VolumeTag=R10114L7                            
+      Storage Element 2:Full :VolumeTag=R10108L7                            
+      Storage Element 3:Full :VolumeTag=C16439L6                            
+      Storage Element 4:Full :VolumeTag=R10201L7                            
+      Storage Element 5:Full :VolumeTag=C16129L6                            
+      Storage Element 6:Full :VolumeTag=E10079L7                            
+      Storage Element 7:Full :VolumeTag=R10190L7                            
+      Storage Element 8:Full :VolumeTag=C16009L6                            
+      Storage Element 9:Full :VolumeTag=R10198L7                            
+      Storage Element 10:Full :VolumeTag=R10203L7                            
+      Storage Element 11:Full :VolumeTag=C16985L6                            
+      Storage Element 12:Full :VolumeTag=E10011L7                            
+      Storage Element 13:Full :VolumeTag=R10097L7                            
+      Storage Element 14:Full :VolumeTag=C16007L6                            
+      Storage Element 15:Full :VolumeTag=R10100L7                            
+      Storage Element 16:Full :VolumeTag=E10035L7                            
+      Storage Element 17:Full :VolumeTag=E10034L7                            
+      Storage Element 18:Full :VolumeTag=E10040L7                            
+      Storage Element 19:Empty
+      Storage Element 20:Full :VolumeTag=E10037L7                            
+      Storage Element 21:Empty
+      Storage Element 22:Empty
+      Storage Element 23:Empty
+      Storage Element 24:Empty
+      Storage Element 25:Empty
+      Storage Element 26:Empty
+      Storage Element 27:Empty
+      Storage Element 28:Empty
+      Storage Element 29:Empty
+      Storage Element 30:Empty
+      Storage Element 31:Empty
+      Storage Element 32:Empty
+      Storage Element 33:Empty
+      Storage Element 34:Empty
+      Storage Element 35:Empty
+      Storage Element 36:Empty
+      Storage Element 37:Empty
+      Storage Element 38:Empty
+      Storage Element 39:Empty
+      Storage Element 40:Empty

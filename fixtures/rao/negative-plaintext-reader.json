@@ -1,0 +1,133 @@
+{
+  "vector_set": "RAO-NEG-PLAINTEXT-READER-1",
+  "spec_section": "13.5",
+  "status": "complete",
+  "scope": "plaintext reader-side byte vectors executable against materializing, streaming, or restore-mode RAO readers",
+  "base": {
+    "chunk_size": 4096,
+    "object_id": "99999999-9999-4999-8999-999999999999",
+    "caller_object_id": "negative-vector"
+  },
+  "cases": [
+    {
+      "id": "wrong-format-id",
+      "operation": "read",
+      "fault": "global REMANENCE.format_id is rao-v2",
+      "expected_error": "UnsupportedFeature"
+    },
+    {
+      "id": "schema-major-2",
+      "operation": "read",
+      "fault": "global REMANENCE.schema_version has major version 2",
+      "expected_error": "UnsupportedFeature"
+    },
+    {
+      "id": "missing-compression",
+      "operation": "read",
+      "fault": "payload entry pax header omits REMANENCE.compression",
+      "expected_error": "Parse"
+    },
+    {
+      "id": "compression-gzip",
+      "operation": "stream",
+      "fault": "payload entry pax header advertises REMANENCE.compression=gzip",
+      "expected_error": "UnsupportedFeature"
+    },
+    {
+      "id": "encryption-aes-256-gcm",
+      "operation": "read",
+      "fault": "global REMANENCE.encryption is aes-256-gcm",
+      "expected_error": "UnsupportedFeature"
+    },
+    {
+      "id": "chunk-size-mismatch",
+      "operation": "read",
+      "fault": "global REMANENCE.chunk_size is 8192 while supplied geometry is 4096",
+      "expected_error": "ChunkSizeMismatch"
+    },
+    {
+      "id": "corrupted-header-checksum",
+      "operation": "read",
+      "fault": "first ustar header checksum no longer matches the header bytes",
+      "expected_error": "UstarChecksumMismatch"
+    },
+    {
+      "id": "single-zero-eof-record",
+      "operation": "read",
+      "fault": "tar EOF has one zero record followed by a nonzero record",
+      "expected_error": "Parse"
+    },
+    {
+      "id": "unknown-typeflag",
+      "operation": "read",
+      "fault": "payload ustar entry typeflag is 7",
+      "expected_error": "UnsupportedTarTypeflag"
+    },
+    {
+      "id": "misaligned-nonzero-payload",
+      "operation": "read",
+      "fault": "payload pax padding is shortened so a nonzero payload starts off the chunk grid",
+      "expected_error": "ChunkAlignmentViolation"
+    },
+    {
+      "id": "traversal-shaped-effective-path",
+      "operation": "read",
+      "fault": "payload pax path is a/../b",
+      "expected_error": "InvalidPath"
+    },
+    {
+      "id": "entry-after-manifest",
+      "operation": "read",
+      "fault": "a valid payload entry appears after _remanence/manifest.cbor",
+      "expected_error": "Parse"
+    },
+    {
+      "id": "flipped-payload-bit",
+      "operation": "restore",
+      "fault": "one payload byte is flipped after the pax REMANENCE.file_sha256 was written",
+      "expected_error": "FileDigestMismatch"
+    },
+    {
+      "id": "truncated-payload",
+      "operation": "read",
+      "fault": "payload pax size declares more bytes than exist in the object",
+      "expected_error": "TruncatedPayload"
+    },
+    {
+      "id": "truncated-pax-body",
+      "operation": "read",
+      "fault": "global pax header size extends beyond the object",
+      "expected_error": "TruncatedPayload"
+    },
+    {
+      "id": "pax-record-length-out-of-bounds",
+      "operation": "read",
+      "fault": "payload pax record length exceeds the pax body",
+      "expected_error": "PaxRecordMalformed"
+    },
+    {
+      "id": "pax-record-missing-equals",
+      "operation": "read",
+      "fault": "payload pax record has no equals sign",
+      "expected_error": "PaxRecordMalformed"
+    },
+    {
+      "id": "pax-record-missing-trailing-newline",
+      "operation": "read",
+      "fault": "payload pax record does not end with newline",
+      "expected_error": "PaxRecordMalformed"
+    },
+    {
+      "id": "pax-value-control-character",
+      "operation": "read",
+      "fault": "payload pax path value contains an ASCII control character",
+      "expected_error": "PaxRecordMalformed"
+    },
+    {
+      "id": "pax-value-non-utf8",
+      "operation": "read",
+      "fault": "payload pax path value is not UTF-8",
+      "expected_error": "PaxRecordMalformed"
+    }
+  ]
+}

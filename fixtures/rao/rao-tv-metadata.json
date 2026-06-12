@@ -1,0 +1,109 @@
+{
+  "vector_id": "RAO-TV-METADATA",
+  "spec_section": "13.1",
+  "status": "pinned-at-generation",
+  "independent_rederivation": "verified by tools/verify_rao_vectors_independent.py",
+  "inputs": {
+    "chunk_size": 4096,
+    "object_id": "00000000-0000-4000-8000-000000000106",
+    "caller_object_id": "rao-tv-metadata",
+    "write_timestamp": "2026-01-01T00:00:00Z",
+    "metadata_preservation": "minimal",
+    "manifest_file_id": "00000000-0000-4000-8000-000000000106",
+    "entries": [
+      {
+        "entry_type": "regular",
+        "path": "meta/mtime.txt",
+        "file_id": "00000000-0000-4000-8000-000000000161",
+        "size_bytes": 6,
+        "link_target": null,
+        "mtime": "1700000000.123456789",
+        "executable": null
+      },
+      {
+        "entry_type": "regular",
+        "path": "meta/exec.sh",
+        "file_id": "00000000-0000-4000-8000-000000000162",
+        "size_bytes": 17,
+        "link_target": null,
+        "mtime": null,
+        "executable": true
+      },
+      {
+        "entry_type": "regular",
+        "path": "meta/null-exec.txt",
+        "file_id": "00000000-0000-4000-8000-000000000163",
+        "size_bytes": 16,
+        "link_target": null,
+        "mtime": null,
+        "executable": null
+      }
+    ]
+  },
+  "expected": {
+    "stored_size_bytes": 20480,
+    "stored_size_blocks": 5,
+    "stored_digest": "f1414218e8608b8dba005162d831adea1ee4aac524fb21f024f800127499a96a",
+    "first_block_sha256": "30895c8df89beb2451d7c048fb4f6e80440c549a8cfa9c5bbd15d634c326df13",
+    "manifest_cbor_len": 754,
+    "manifest_cbor_hex": "a7696f626a6563745f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303130366a6368756e6b5f73697a651910006c66696c655f656e747269657383a864706174686e6d6574612f6d74696d652e7478746766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303136316a65786563757461626c65f66a73697a655f6279746573066b6368756e6b5f636f756e74016b66696c655f736861323536582073ac996d5d24926b7afba8c293427be0e6ab6e51698d8591c2b7dbf7bf269f706f66697273745f6368756e6b5f6c626101781a6d657461646174615f707265736572766174696f6e5f64617461a0a864706174686c6d6574612f657865632e73686766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303136326a65786563757461626c65f56a73697a655f6279746573116b6368756e6b5f636f756e74016b66696c655f7368613235365820306c6ca7407560340797866e077e053627ad409277d1b9da58106fce4cf717cb6f66697273745f6368756e6b5f6c626102781a6d657461646174615f707265736572766174696f6e5f64617461a0a86470617468726d6574612f6e756c6c2d657865632e7478746766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303136336a65786563757461626c65f66a73697a655f6279746573106b6368756e6b5f636f756e74016b66696c655f7368613235365820dde1a5019bb6cf6202ab3eb2c9b5948a7973f8f6ae723645fbf0fc1a4a66bc016f66697273745f6368756e6b5f6c626103781a6d657461646174615f707265736572766174696f6e5f64617461a06e736368656d615f76657273696f6e016f6f626a6563745f6d65746164617461a07063616c6c65725f6f626a6563745f69646f72616f2d74762d6d657461646174617365787465726e616c5f7265666572656e63657380",
+    "manifest_sha256": "ce6cb11d0371ad429d40bd8d055aeca8e313c1df595417c8cb9c1401a41231f9",
+    "file_payloads": [
+      {
+        "path": "meta/mtime.txt",
+        "size_bytes": 6,
+        "sha256": "73ac996d5d24926b7afba8c293427be0e6ab6e51698d8591c2b7dbf7bf269f70"
+      },
+      {
+        "path": "meta/exec.sh",
+        "size_bytes": 17,
+        "sha256": "306c6ca7407560340797866e077e053627ad409277d1b9da58106fce4cf717cb"
+      },
+      {
+        "path": "meta/null-exec.txt",
+        "size_bytes": 16,
+        "sha256": "dde1a5019bb6cf6202ab3eb2c9b5948a7973f8f6ae723645fbf0fc1a4a66bc01"
+      }
+    ],
+    "symlinks": [],
+    "directories": [],
+    "file_layouts": [
+      {
+        "entry_type": "regular",
+        "path": "meta/mtime.txt",
+        "pax_header_offset": 1024,
+        "data_offset": 4096,
+        "first_chunk_lba": 1,
+        "chunk_count": 1,
+        "pad_spaces": 1761
+      },
+      {
+        "entry_type": "regular",
+        "path": "meta/exec.sh",
+        "pax_header_offset": 4608,
+        "data_offset": 8192,
+        "first_chunk_lba": 2,
+        "chunk_count": 1,
+        "pad_spaces": 2274
+      },
+      {
+        "entry_type": "regular",
+        "path": "meta/null-exec.txt",
+        "pax_header_offset": 8704,
+        "data_offset": 12288,
+        "first_chunk_lba": 3,
+        "chunk_count": 1,
+        "pad_spaces": 2297
+      }
+    ],
+    "manifest_layout": {
+      "entry_type": "regular",
+      "path": "_remanence/manifest.cbor",
+      "pax_header_offset": 12800,
+      "data_offset": 16384,
+      "first_chunk_lba": 4,
+      "chunk_count": 1,
+      "pad_spaces": 2230
+    }
+  }
+}

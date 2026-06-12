@@ -1,0 +1,35 @@
+[package]
+name        = "remanence-parity"
+description = "Layer 3c — Reed-Solomon parity protection for on-tape data in Remanence."
+version     .workspace = true
+edition     .workspace = true
+rust-version.workspace = true
+authors     .workspace = true
+license     .workspace = true
+repository  .workspace = true
+
+[dependencies]
+# Sibling layer (not stacked) — see docs/layer3c-design-v0.2.md §3.
+# remanence-format is NOT a dep; the BlockSink / BlockSource
+# traits live in remanence-library::block_io so 3b and 3c can
+# both depend on the library crate as true siblings.
+remanence-library = { path = "../remanence-library" }
+
+# Retained for the `ParityError::ReedSolomon` compatibility surface
+# and as a possible future accelerator. The active codec implements
+# Layer 3c v0.4.4 Appendix A's Cauchy GF(2^8)/0x11D math directly.
+reed-solomon-erasure = { workspace = true }
+
+# Catalog / bootstrap framing: CBOR for bootstrap payloads and HMAC-SHA256
+# for per-tape sidecar magic derivation.
+ciborium  = { workspace = true }
+hmac      = { workspace = true }
+sha2      = { workspace = true }
+nix       = { workspace = true }
+
+# Error enum.
+thiserror = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"

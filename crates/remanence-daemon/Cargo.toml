@@ -1,0 +1,31 @@
+[package]
+name = "remanence-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rem-daemon"
+path = "src/main.rs"
+
+[dependencies]
+remanence-api = { path = "../remanence-api" }
+remanence-library = { path = "../remanence-library" }
+remanence-state = { path = "../remanence-state" }
+base64 = { workspace = true }
+clap = { workspace = true }
+libc = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
+tonic = { workspace = true, features = ["tls-ring"] }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
