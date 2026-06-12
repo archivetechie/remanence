@@ -1,0 +1,43 @@
+[package]
+name = "remanence-api"
+description = "Layer 5 gRPC services and orchestration for Remanence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+prost.workspace = true
+prost-derive.workspace = true
+prost-types.workspace = true
+remanence-aead = { path = "../remanence-aead" }
+remanence-bru = { path = "../remanence-bru" }
+remanence-format = { path = "../remanence-format" }
+remanence-library = { path = "../remanence-library" }
+remanence-parity = { path = "../remanence-parity" }
+remanence-state = { path = "../remanence-state" }
+remanence-stream = { path = "../remanence-stream" }
+ciborium.workspace = true
+hyper-util.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic = { workspace = true, features = ["tls-ring"] }
+tonic-prost.workspace = true
+tower.workspace = true
+tracing.workspace = true
+uuid = { workspace = true, features = ["v5"] }
+x509-parser.workspace = true
+
+[build-dependencies]
+prost-build = "=0.14.1"
+tonic-build.workspace = true
+tonic-prost-build.workspace = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

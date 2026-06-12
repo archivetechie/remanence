@@ -1,0 +1,7 @@
+    HPE       Ultrium 9-SCSI    R3G3
+Unable to decode page = 0x3a, here is hex:
+ 00     3a 00 06 0a 00 00 40 01  00 00 01 40 01 0e 00 0a
+ 10     40 04 00 00 00 00 00 0b  40 04 00 00 00 35 00 0c
+ 20     40 04 00 00 00 00 00 0d  40 04 00 00 00 00 00 0e
+ 30     40 04 00 00 00 00 00 0f  40 04 00 00 00 00 00 10
+ .....  [truncated after 64 of 1550 bytes (use '-H' to see the rest)]

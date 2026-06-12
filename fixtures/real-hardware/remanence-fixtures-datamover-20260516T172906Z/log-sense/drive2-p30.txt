@@ -1,0 +1,13 @@
+    HP        Ultrium 7-SCSI    Q387
+Tape usage page  (LTO-5 and LTO-6 specific) [0x30]
+  Thread count: 121
+  Total data sets written: 1176769
+  Total write retries: 3
+  Total unrecovered write errors: 0
+  Total suspended writes: 3
+  Total fatal suspended writes: 0
+  Total data sets read: 3541126
+  Total read retries: 39
+  Total unrecovered read errors: 1
+  Total suspended reads: 0
+  Total fatal suspended reads: 0

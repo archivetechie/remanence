@@ -1,0 +1,73 @@
+{
+  "vector_set": "RAO-NEG-MANIFEST-1",
+  "spec_section": "13.5",
+  "status": "complete",
+  "scope": "manifest-profile CBOR, manifest schema, anchor digest, and accepted unknown-key extension vectors",
+  "base": {
+    "chunk_size": 512,
+    "object_id": "object-1",
+    "caller_object_id": "caller-1"
+  },
+  "cases": [
+    {
+      "id": "non-canonical-key-order",
+      "fault": "top-level map keys are not in deterministic encoded order",
+      "expected_error": "Cbor"
+    },
+    {
+      "id": "non-shortest-integer",
+      "fault": "schema_version uses non-shortest integer encoding",
+      "expected_error": "Cbor"
+    },
+    {
+      "id": "indefinite-length-item",
+      "fault": "unknown extension key contains an indefinite-length byte string",
+      "expected_error": "Cbor"
+    },
+    {
+      "id": "float-item",
+      "fault": "unknown extension key contains a floating-point value",
+      "expected_error": "Cbor"
+    },
+    {
+      "id": "tag-item",
+      "fault": "unknown extension key contains a CBOR tag",
+      "expected_error": "Cbor"
+    },
+    {
+      "id": "duplicate-map-key",
+      "fault": "top-level map repeats object_id",
+      "expected_error": "Cbor"
+    },
+    {
+      "id": "schema-version-2",
+      "fault": "manifest schema_version is 2",
+      "expected_error": "ManifestInvalid"
+    },
+    {
+      "id": "file-sha256-wrong-length",
+      "fault": "file_entries[0].file_sha256 is 31 bytes",
+      "expected_error": "ManifestInvalid"
+    },
+    {
+      "id": "nesting-depth-over-max",
+      "fault": "unknown extension key contains a nested array deeper than MANIFEST_MAX_DEPTH",
+      "expected_error": "Cbor"
+    },
+    {
+      "id": "manifest-digest-mismatch",
+      "fault": "manifest bytes do not hash to the anchor digest",
+      "expected_error": "ManifestDigestMismatch"
+    },
+    {
+      "id": "manifest-chunk-size-mismatch",
+      "fault": "manifest chunk_size differs from the supplied/global chunk_size",
+      "expected_error": "ManifestInvalid"
+    },
+    {
+      "id": "unknown-extra-key-accepted",
+      "fault": "unknown top-level extension key with valid manifest-profile CBOR is present",
+      "expected_outcome": "accepted"
+    }
+  ]
+}

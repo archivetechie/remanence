@@ -1,0 +1,404 @@
+//! Shared tape-object read core for CLI break-glass reads and Layer 5 read sessions.
+//!
+//! The CLI still owns the hardware orchestration for `rem-debug archive read`
+//! and `verify`, while the daemon session owner owns the mounted drive for
+//! `ReadSessionService`. Both paths use this module to position to a native
+//! object tape file and stream the single RAO payload entry without
+//! materializing the object in memory.
+
+use std::io::Write;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use remanence_format::{
+    model::MANIFEST_PATH, stream_rem_tar_object_with_manifest_anchor, FormatError, RemTarEntrySink,
+    RemTarStreamEntry,
+};
+use remanence_library::{BlockSource, SpaceKind};
+use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
+use tonic::Status;
+
+use crate::pb;
+
+const DEFAULT_READ_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+const READ_SEND_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+/// Position to `tape_file_number` and stream the object's payload blocks into `sink`.
+///
+/// The caller is responsible for mounting the tape, setting the drive block
+/// size, and positioning the source at the point from which tape-file spacing
+/// is defined. Current hardware callers verify the BOT bootstrap immediately
+/// before this helper, matching the established CLI archive-read path.
+pub fn read_object_payload(
+    source: &mut dyn BlockSource,
+    block_size: usize,
+    block_count: u64,
+    tape_file_number: u32,
+    manifest_sha256: Option<[u8; 32]>,
+    sink: &mut dyn RemTarEntrySink,
+) -> Result<(), FormatError> {
+    source.space(i64::from(tape_file_number), SpaceKind::Filemarks)?;
+    stream_rem_tar_object_with_manifest_anchor(
+        source,
+        block_size,
+        block_count,
+        sink,
+        manifest_sha256,
+    )?;
+    Ok(())
+}
+
+/// Streaming sink that captures the single non-manifest payload entry.
+///
+/// The RAO object contains a generated manifest plus one payload file for
+/// the S5a restore surface. This sink skips the manifest, writes payload bytes
+/// to `out`, and hashes the bytes as they pass through.
+pub struct CapturePayloadSink<W: Write> {
+    out: W,
+    hasher: Sha256,
+    bytes_written: u64,
+    capturing: bool,
+    payload_entries: u32,
+}
+
+impl<W: Write> CapturePayloadSink<W> {
+    /// Create a payload-capturing sink around an arbitrary `Write`.
+    pub fn new(out: W) -> Self {
+        Self {
+            out,
+            hasher: Sha256::new(),
+            bytes_written: 0,
+            capturing: false,
+            payload_entries: 0,
+        }
+    }
+
+    /// Finalize, requiring exactly one payload entry.
+    pub fn finish(self) -> Result<(u64, [u8; 32]), String> {
+        let (_out, bytes_written, digest) = self.finish_with_writer()?;
+        Ok((bytes_written, digest))
+    }
+
+    /// Finalize and return the inner writer after flushing it.
+    pub fn finish_with_writer(mut self) -> Result<(W, u64, [u8; 32]), String> {
+        if self.payload_entries == 0 {
+            return Err("object contains no payload entry".to_string());
+        }
+        if self.payload_entries > 1 {
+            return Err(format!(
+                "object contains {} payload entries; single-file restore only (no --path in v1)",
+                self.payload_entries
+            ));
+        }
+        self.out.flush().map_err(|e| format!("flush --out: {e}"))?;
+        let digest: [u8; 32] = self.hasher.finalize().into();
+        Ok((self.out, self.bytes_written, digest))
+    }
+}
+
+impl<W: Write> RemTarEntrySink for CapturePayloadSink<W> {
+    fn begin_file(&mut self, entry: &RemTarStreamEntry) -> Result<(), FormatError> {
+        if entry.path == MANIFEST_PATH {
+            self.capturing = false;
+            return Ok(());
+        }
+        self.payload_entries += 1;
+        self.capturing = true;
+        Ok(())
+    }
+
+    fn write_file_data(&mut self, bytes: &[u8]) -> Result<(), FormatError> {
+        if !self.capturing {
+            return Ok(());
+        }
+        self.hasher.update(bytes);
+        self.bytes_written += bytes.len() as u64;
+        self.out
+            .write_all(bytes)
+            .map_err(|source| FormatError::SourceIo {
+                context: "write payload".to_string(),
+                source,
+            })?;
+        Ok(())
+    }
+
+    fn end_file(&mut self, _entry: &RemTarStreamEntry) -> Result<(), FormatError> {
+        self.capturing = false;
+        Ok(())
+    }
+}
+
+/// Synchronous writer that frames payload bytes into `ReadSessionService` chunks.
+pub(crate) struct ChannelWriter {
+    tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
+    max_chunk_bytes: usize,
+    send_timeout: Duration,
+}
+
+impl ChannelWriter {
+    pub(crate) fn new(tx: mpsc::Sender<Result<pb::BytesChunk, Status>>) -> Self {
+        Self::with_chunk_size(tx, 0)
+    }
+
+    pub(crate) fn with_chunk_size(
+        tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
+        chunk_bytes: usize,
+    ) -> Self {
+        Self {
+            tx,
+            max_chunk_bytes: if chunk_bytes == 0 {
+                64 * 1024
+            } else {
+                chunk_bytes
+            },
+            send_timeout: DEFAULT_READ_SEND_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_chunk_size_and_timeout(
+        tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
+        chunk_bytes: usize,
+        send_timeout: Duration,
+    ) -> Self {
+        let mut writer = Self::with_chunk_size(tx, chunk_bytes);
+        writer.send_timeout = send_timeout;
+        writer
+    }
+
+    /// Send the terminal `is_last=true` frame.
+    pub(crate) fn finish(self) -> std::io::Result<()> {
+        self.send_chunk(pb::BytesChunk {
+            data: Vec::new(),
+            is_last: true,
+        })
+    }
+
+    fn send_chunk(&self, chunk: pb::BytesChunk) -> std::io::Result<()> {
+        let mut item = Ok(chunk);
+        let deadline = Instant::now()
+            .checked_add(self.send_timeout)
+            .unwrap_or_else(Instant::now);
+        loop {
+            match self.tx.try_send(item) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "read stream closed",
+                    ));
+                }
+                Err(mpsc::error::TrySendError::Full(returned)) => {
+                    item = returned;
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "read stream receiver stalled",
+                        ));
+                    }
+                    thread::sleep(remaining.min(READ_SEND_RETRY_DELAY));
+                }
+            }
+        }
+    }
+}
+
+impl Write for ChannelWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            self.send_chunk(pb::BytesChunk {
+                data: Vec::new(),
+                is_last: false,
+            })?;
+            return Ok(0);
+        }
+        for chunk in buf.chunks(self.max_chunk_bytes) {
+            self.send_chunk(pb::BytesChunk {
+                data: chunk.to_vec(),
+                is_last: false,
+            })?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use remanence_format::{
+        write_rem_tar_object, RemTarEntrySink, RemTarEntryType, RemTarFile, RemTarObjectOptions,
+        RemTarStreamEntry,
+    };
+    use remanence_library::{VecBlockSink, VecBlockSource};
+    use sha2::{Digest, Sha256};
+
+    use super::*;
+
+    fn stream_entry(path: &str) -> RemTarStreamEntry {
+        RemTarStreamEntry {
+            entry_type: RemTarEntryType::Regular,
+            path: path.to_string(),
+            size_bytes: 0,
+            link_target: None,
+            first_chunk_lba: None,
+            chunk_count: 0,
+            data_offset: 0,
+            pax_records: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn options(chunk_size: usize) -> RemTarObjectOptions {
+        let mut opts = RemTarObjectOptions::new(
+            "55555555-5555-5555-5555-555555555555",
+            "caller-reader",
+            "2026-05-27T22:10:00+05:30",
+            "66666666-6666-6666-6666-666666666666",
+        );
+        opts.chunk_size = chunk_size;
+        opts
+    }
+
+    #[test]
+    fn capture_payload_sink_extracts_single_entry_and_hashes() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut sink = CapturePayloadSink::new(&mut buf);
+
+        let manifest = stream_entry(MANIFEST_PATH);
+        sink.begin_file(&manifest).unwrap();
+        sink.write_file_data(b"CBORCBOR").unwrap();
+        sink.end_file(&manifest).unwrap();
+
+        let file = stream_entry("hello.txt");
+        sink.begin_file(&file).unwrap();
+        sink.write_file_data(b"hel").unwrap();
+        sink.write_file_data(b"lo").unwrap();
+        sink.end_file(&file).unwrap();
+
+        let (bytes_written, digest) = sink.finish().expect("finish");
+        assert_eq!(bytes_written, 5);
+        assert_eq!(buf, b"hello");
+        let expected: [u8; 32] = Sha256::digest(b"hello").into();
+        assert_eq!(digest, expected);
+    }
+
+    #[test]
+    fn capture_payload_sink_rejects_zero_and_multiple_entries() {
+        let mut buf0: Vec<u8> = Vec::new();
+        let mut sink0 = CapturePayloadSink::new(&mut buf0);
+        let manifest = stream_entry(MANIFEST_PATH);
+        sink0.begin_file(&manifest).unwrap();
+        sink0.end_file(&manifest).unwrap();
+        assert!(sink0.finish().is_err());
+
+        let mut buf2: Vec<u8> = Vec::new();
+        let mut sink2 = CapturePayloadSink::new(&mut buf2);
+        for name in ["a.txt", "b.txt"] {
+            let e = stream_entry(name);
+            sink2.begin_file(&e).unwrap();
+            sink2.write_file_data(b"x").unwrap();
+            sink2.end_file(&e).unwrap();
+        }
+        assert!(sink2.finish().is_err());
+    }
+
+    #[tokio::test]
+    async fn channel_writer_frames_and_streams() {
+        let (tx, mut rx) = mpsc::channel::<Result<pb::BytesChunk, Status>>(8);
+        let handle = tokio::task::spawn_blocking(move || {
+            use std::io::Write as _;
+            let mut writer = ChannelWriter::new(tx);
+            writer.write_all(b"hello").unwrap();
+            writer.finish().unwrap();
+        });
+
+        let mut got = Vec::new();
+        let mut saw_last = false;
+        while let Some(item) = rx.recv().await {
+            let chunk = item.unwrap();
+            got.extend_from_slice(&chunk.data);
+            saw_last |= chunk.is_last;
+        }
+        handle.await.unwrap();
+        assert_eq!(got, b"hello");
+        assert!(saw_last, "stream must end with an is_last chunk");
+    }
+
+    #[tokio::test]
+    async fn channel_writer_honors_requested_chunk_size() {
+        let (tx, mut rx) = mpsc::channel::<Result<pb::BytesChunk, Status>>(8);
+        let handle = tokio::task::spawn_blocking(move || {
+            use std::io::Write as _;
+            let mut writer = ChannelWriter::with_chunk_size(tx, 3);
+            writer.write_all(b"abcdefg").unwrap();
+            writer.finish().unwrap();
+        });
+
+        let mut chunk_lengths = Vec::new();
+        while let Some(item) = rx.recv().await {
+            let chunk = item.unwrap();
+            if !chunk.is_last {
+                chunk_lengths.push(chunk.data.len());
+            }
+        }
+        handle.await.unwrap();
+        assert_eq!(chunk_lengths, [3, 3, 1]);
+    }
+
+    #[test]
+    fn channel_writer_times_out_when_receiver_stalls() {
+        use std::io::Write as _;
+
+        let (tx, _rx) = mpsc::channel::<Result<pb::BytesChunk, Status>>(1);
+        tx.try_send(Ok(pb::BytesChunk {
+            data: b"held".to_vec(),
+            is_last: false,
+        }))
+        .expect("fill channel");
+        let mut writer =
+            ChannelWriter::with_chunk_size_and_timeout(tx, 3, Duration::from_millis(1));
+
+        let err = writer
+            .write_all(b"abc")
+            .expect_err("stalled receiver times out");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn read_object_payload_streams_rem_tar_payload_from_block_source() {
+        let opts = options(4096);
+        let files = [RemTarFile {
+            path: "hello.txt",
+            file_id: "file-a",
+            data: b"hello from tape",
+            mtime: Some("0"),
+            executable: Some(false),
+        }];
+        let mut block_sink = VecBlockSink::new();
+        let layout = write_rem_tar_object(&mut block_sink, &opts, &files).unwrap();
+        let mut source = VecBlockSource::new(block_sink.blocks);
+        let mut payload = Vec::new();
+        let mut sink = CapturePayloadSink::new(&mut payload);
+
+        read_object_payload(
+            &mut source,
+            opts.chunk_size,
+            layout.projected_size_blocks,
+            0,
+            None,
+            &mut sink,
+        )
+        .unwrap();
+
+        let (bytes_written, digest) = sink.finish().unwrap();
+        assert_eq!(bytes_written, b"hello from tape".len() as u64);
+        assert_eq!(payload, b"hello from tape");
+        let expected: [u8; 32] = Sha256::digest(b"hello from tape").into();
+        assert_eq!(digest, expected);
+    }
+}

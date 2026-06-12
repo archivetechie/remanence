@@ -1,0 +1,14 @@
+    inquiry cdb: [12 01 00 00 fc 00]
+    inquiry cdb: [12 01 83 00 fc 00]
+VPD INQUIRY: Device Identification page
+  Designation descriptor number 1, descriptor length: 12
+    designator_type: NAA,  code_set: Binary
+    associated with the Addressed logical unit
+      NAA 5, IEEE Company_id: 0x1438
+      Vendor Specific Identifier: 0x31bdc7d4
+      [0x5001438031bdc7d4]
+  Designation descriptor number 2, descriptor length: 43
+    designator_type: T10 vendor identification,  code_set: ASCII
+    associated with the Addressed logical unit
+      vendor id: HPE     
+      vendor specific: MSL3040         DEC418146K_LL02

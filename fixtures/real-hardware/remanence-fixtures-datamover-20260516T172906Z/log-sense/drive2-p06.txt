@@ -1,0 +1,3 @@
+    HP        Ultrium 7-SCSI    Q387
+Non-medium error page  [0x6]
+  Non-medium error count = 0

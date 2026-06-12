@@ -1,0 +1,38 @@
+[package]
+name        = "remanence-library"
+description = "Layer 2 — logical-library discovery and policy-gated handles for Remanence."
+version     .workspace = true
+edition     .workspace = true
+rust-version.workspace = true
+authors     .workspace = true
+license     .workspace = true
+repository  .workspace = true
+
+[dependencies]
+remanence-scsi = { path = "../remanence-scsi" }
+thiserror      = { workspace = true }
+tokio          = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-udev   = { version = "0.9", optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[features]
+# Default: no native deps. The cross-platform layer-2c scaffolding
+# (event types, trait, coalescer, mock) builds and tests everywhere.
+default = []
+
+# `linux-udev` pulls in tokio-udev + futures-util and enables the
+# LinuxUdevSource backend. Requires `pkg-config` and `libudev-dev`
+# system packages at build time (Debian/Ubuntu:
+# `apt install pkg-config libudev-dev`). Linux-only — the cfg in
+# `watch/mod.rs` makes the feature a no-op on other targets.
+linux-udev = ["dep:tokio-udev", "dep:futures-util"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+toml     = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"

@@ -1,0 +1,53 @@
+[package]
+name        = "remanence-cli"
+description = "rem — the operator-facing CLI for Remanence (discovery, inspection)."
+version     .workspace = true
+edition     .workspace = true
+rust-version.workspace = true
+authors     .workspace = true
+license     .workspace = true
+repository  .workspace = true
+
+[[bin]]
+name = "rem"
+path = "src/main.rs"
+
+[[bin]]
+name = "rem-debug"
+path = "src/rem_debug.rs"
+
+[dependencies]
+remanence-bru     = { path = "../remanence-bru" }
+remanence-aead    = { path = "../remanence-aead" }
+remanence-format  = { path = "../remanence-format" }
+remanence-library = { path = "../remanence-library" }
+remanence-state   = { path = "../remanence-state" }
+remanence-stream  = { path = "../remanence-stream" }
+remanence-api     = { path = "../remanence-api" }
+ciborium          = { workspace = true }
+clap              = { workspace = true }
+prost-types       = { workspace = true }
+serde             = { workspace = true }
+serde_json        = { workspace = true }
+sha2              = { workspace = true }
+time              = { workspace = true }
+tokio             = { workspace = true }
+tonic             = { workspace = true }
+uuid              = { workspace = true }
+zeroize           = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
+
+[features]
+default = []
+
+# Enables the `rem watch` subcommand by pulling in the
+# `linux-udev` backend from `remanence-library` and a tokio runtime.
+# Linux-only at build time; requires `pkg-config` + `libudev-dev`
+# system packages.
+linux-udev = ["remanence-library/linux-udev"]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

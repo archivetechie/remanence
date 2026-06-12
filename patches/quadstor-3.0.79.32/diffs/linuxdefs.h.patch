@@ -1,0 +1,11 @@
+--- /home/user/remanence/patches/quadstor-3.0.79.32/originals/linuxdefs.h	2026-05-16 16:42:17.780414770 +0200
++++ /quadstorvtl/src/export/linuxdefs.h	2026-05-16 16:43:26.886762386 +0200
+@@ -153,6 +153,8 @@
+ 
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,10,0)) || (defined(RHEL_MAJOR) && RHEL_MAJOR == 9 && RHEL_MINOR >= 5)
+ typedef struct file iodev_t;
++#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(6,5,0)) || (defined(RHEL_MAJOR) && RHEL_MAJOR == 9 && RHEL_MINOR == 4) || (defined(CONFIG_SUSE_KERNEL) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
++typedef struct bdev_handle iodev_t;
+ #else
+ typedef struct block_device iodev_t;
+ #endif

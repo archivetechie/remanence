@@ -1,0 +1,7 @@
+hostname:    datamover
+kernel:      Linux datamover 5.14.0-570.42.2.el9_6.x86_64 #1 SMP PREEMPT_DYNAMIC Mon Sep 8 12:15:13 EDT 2025 x86_64 x86_64 x86_64 GNU/Linux
+lsb:         NAME="Red Hat Enterprise Linux"
+VERSION="9.6 (Plow)"
+ID="rhel"
+date_utc:    Saturday 16 May 2026 04:28:17 PM UTC
+sg3-utils:   Version string: 2.13 20210803

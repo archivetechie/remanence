@@ -1,0 +1,68 @@
+{
+  "vector_id": "RAO-TV-D1",
+  "spec_section": "13.4",
+  "status": "pinned-at-generation",
+  "independent_rederivation": "verified by tools/verify_rao_vectors_independent.py",
+  "inputs": {
+    "chunk_size": 262144,
+    "object_id": "00000000-0000-4000-8000-000000000002",
+    "caller_object_id": "rao-tv-d1",
+    "write_timestamp": "2026-01-01T00:00:00Z",
+    "metadata_preservation": "minimal",
+    "manifest_file_id": "00000000-0000-4000-8000-0000000000fe",
+    "encrypted_root_key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "encrypted_key_id": "4b49443a72616f2d74762d65312e3031"
+  },
+  "expected": {
+    "plaintext": {
+      "chunk_size": 262144,
+      "stored_size_bytes": 1048576,
+      "stored_size_blocks": 4,
+      "stored_digest": "44c77b10e2961d1d73fc719235419e76ccaab24c8a4bcce745e4650ffb3a6d5c",
+      "first_block_sha256": "697380a4844c9d2d6680b0c92dce2396467a4549759e105012d0a0a59b787cff",
+      "manifest_cbor_len": 351,
+      "manifest_cbor_hex": "a7696f626a6563745f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303030326a6368756e6b5f73697a651a000400006c66696c655f656e747269657381a8647061746865762e62696e6766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303031326a65786563757461626c65f66a73697a655f62797465731a000400016b6368756e6b5f636f756e74026b66696c655f7368613235365820c35991ad254f48ff8b02becb9f0cc56581e86a0b477b13e5ebb0030a3b91c8486f66697273745f6368756e6b5f6c626101781a6d657461646174615f707265736572766174696f6e5f64617461a06e736368656d615f76657273696f6e016f6f626a6563745f6d65746164617461a07063616c6c65725f6f626a6563745f69646972616f2d74762d64317365787465726e616c5f7265666572656e63657380",
+      "manifest_sha256": "e683e1e140452ed0e53b90c3464bd687b83f308a756effcfadd529620e489529",
+      "file_payload": {
+        "path": "v.bin",
+        "size_bytes": 262145,
+        "sha256": "c35991ad254f48ff8b02becb9f0cc56581e86a0b477b13e5ebb0030a3b91c848"
+      },
+      "file_layout": {
+        "path": "v.bin",
+        "pax_header_offset": 1024,
+        "data_offset": 262144,
+        "first_chunk_lba": 1,
+        "chunk_count": 2,
+        "pad_spaces": 259840
+      },
+      "manifest_layout": {
+        "pax_header_offset": 524800,
+        "data_offset": 786432,
+        "first_chunk_lba": 3,
+        "chunk_count": 1,
+        "pad_spaces": 260276
+      }
+    },
+    "encrypted": {
+      "plaintext_size": 1048576,
+      "chunk_count": 4,
+      "metadata_plaintext_len": 52,
+      "metadata_frame_len": 68,
+      "payload_frame_start": 196,
+      "payload_frame_end_inclusive": 1048835,
+      "footer_offset": 1048836,
+      "stored_size_bytes": 1310720,
+      "stored_size_blocks": 5,
+      "hkdf_salt": "eb55e651e2cd87b5838526546888cc8e",
+      "header_hex": "52414f310080010100040000000000004b49443a72616f2d74762d65312e3031eb55e651e2cd87b5838526546888cc8e0000000000000044000000000000000030303030303030302d303030302d343030302d383030302d30303030303030303030303200000000000000000000000000000000000000000000000000000000",
+      "header_hash": "98349440c22c2158d18cd7f1426d3548352746221a6997289153405f45e8ed2c",
+      "metadata_key": "5ff2cbd027952b37bb42419d5251cb7e923aa426eaeef36c037a519fde9c0e51",
+      "payload_key": "12d2697f97dfcb9e77b40677c3466671146f73651ad2399456ac30f4a063157a",
+      "metadata_frame_hex": "befb339385b70da735128249a00c628a42970d1a75e4560a9105887887e5cb1f0d3ec8834b3d2a626a747814cad20ff9ab0f3e419292f9836508370e5b644a45e2fb36d0",
+      "payload_frame_sha256": "aa5bbc834a0e4646c5405567dde47a802e4b1e00cf7dffac43ca7bb1f41d99b3",
+      "stored_digest": "99176f528a02d56732ee1ba3ce775df2ba8848005c0e6025563113887b01bbc9",
+      "plaintext_digest": "44c77b10e2961d1d73fc719235419e76ccaab24c8a4bcce745e4650ffb3a6d5c"
+    }
+  }
+}

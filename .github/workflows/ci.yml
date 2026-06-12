@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libarchive-tools
+
+      - name: Install Python verifier dependencies
+        run: python3 -m pip install cryptography
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --exclude remanence-chaos --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --exclude remanence-chaos
+
+      - name: Verify RAO vectors and plaintext interop
+        run: python3 tools/verify_rao_vectors_independent.py --check-plaintext-interop
+
+  fuzz-corpus-replay:
+    name: scheduled fuzz corpus replay
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Replay committed fuzz corpora
+        run: |
+          for target in \
+            rao_envelope_header \
+            rao_envelope_metadata_cbor \
+            rao_manifest_cbor \
+            rao_plaintext_tar_loop \
+            rao_whole_object_open_verify
+          do
+            cargo fuzz run "$target" -- -runs=0
+          done

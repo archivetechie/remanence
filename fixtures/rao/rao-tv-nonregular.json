@@ -1,0 +1,150 @@
+{
+  "vector_id": "RAO-TV-NONREGULAR",
+  "spec_section": "13.1",
+  "status": "pinned-at-generation",
+  "independent_rederivation": "verified by tools/verify_rao_vectors_independent.py",
+  "inputs": {
+    "chunk_size": 4096,
+    "object_id": "00000000-0000-4000-8000-000000000109",
+    "caller_object_id": "rao-tv-nonregular",
+    "write_timestamp": "2026-01-01T00:00:00Z",
+    "metadata_preservation": "minimal",
+    "manifest_file_id": "00000000-0000-4000-8000-000000000109",
+    "entries": [
+      {
+        "entry_type": "directory",
+        "path": "empty/",
+        "file_id": "00000000-0000-4000-8000-000000000191",
+        "size_bytes": 0,
+        "link_target": null,
+        "mtime": null,
+        "executable": null
+      },
+      {
+        "entry_type": "symlink",
+        "path": "links/latest",
+        "file_id": "00000000-0000-4000-8000-000000000192",
+        "size_bytes": 0,
+        "link_target": "target.txt",
+        "mtime": null,
+        "executable": null
+      },
+      {
+        "entry_type": "symlink",
+        "path": "links/long-target",
+        "file_id": "00000000-0000-4000-8000-000000000193",
+        "size_bytes": 0,
+        "link_target": "targets/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "mtime": null,
+        "executable": null
+      },
+      {
+        "entry_type": "symlink",
+        "path": "links/dangling",
+        "file_id": "00000000-0000-4000-8000-000000000194",
+        "size_bytes": 0,
+        "link_target": "missing.txt",
+        "mtime": null,
+        "executable": null
+      },
+      {
+        "entry_type": "regular",
+        "path": "target.txt",
+        "file_id": "00000000-0000-4000-8000-000000000195",
+        "size_bytes": 7,
+        "link_target": null,
+        "mtime": null,
+        "executable": null
+      }
+    ]
+  },
+  "expected": {
+    "stored_size_bytes": 20480,
+    "stored_size_blocks": 5,
+    "stored_digest": "3a275eacd5cfdefd32a6a3e8a80214fe57cb5dc73e214ecef65c6fbf2876a049",
+    "first_block_sha256": "5b2070515b01fa035ce9b89ccc51e1f457c7124413a1e991b5d5fb6654083f47",
+    "manifest_cbor_len": 1218,
+    "manifest_cbor_hex": "a7696f626a6563745f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303130396a6368756e6b5f73697a651910006c66696c655f656e747269657385a8647061746866656d7074792f6766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303139316a656e7472795f74797065696469726563746f72796a65786563757461626c65f66a73697a655f6279746573006b6368756e6b5f636f756e74006f66697273745f6368756e6b5f6c6261f6781a6d657461646174615f707265736572766174696f6e5f64617461a0a964706174686c6c696e6b732f6c61746573746766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303139326a656e7472795f747970656773796d6c696e6b6a65786563757461626c65f66a73697a655f6279746573006b6368756e6b5f636f756e74006b6c696e6b5f7461726765746a7461726765742e7478746f66697273745f6368756e6b5f6c6261f6781a6d657461646174615f707265736572766174696f6e5f64617461a0a96470617468716c696e6b732f6c6f6e672d7461726765746766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303139336a656e7472795f747970656773796d6c696e6b6a65786563757461626c65f66a73697a655f6279746573006b6368756e6b5f636f756e74006b6c696e6b5f7461726765747880746172676574732f7878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878786f66697273745f6368756e6b5f6c6261f6781a6d657461646174615f707265736572766174696f6e5f64617461a0a964706174686e6c696e6b732f64616e676c696e676766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303139346a656e7472795f747970656773796d6c696e6b6a65786563757461626c65f66a73697a655f6279746573006b6368756e6b5f636f756e74006b6c696e6b5f7461726765746b6d697373696e672e7478746f66697273745f6368756e6b5f6c6261f6781a6d657461646174615f707265736572766174696f6e5f64617461a0a864706174686a7461726765742e7478746766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303139356a65786563757461626c65f66a73697a655f6279746573076b6368756e6b5f636f756e74016b66696c655f7368613235365820c97ecfda4d205190b973232dcfdb0c29748521c2534dd866bcc782f30b0867386f66697273745f6368756e6b5f6c626103781a6d657461646174615f707265736572766174696f6e5f64617461a06e736368656d615f76657273696f6e016f6f626a6563745f6d65746164617461a07063616c6c65725f6f626a6563745f69647172616f2d74762d6e6f6e726567756c61727365787465726e616c5f7265666572656e63657380",
+    "manifest_sha256": "080770c0702010ebf2dd6da7952d0ba2f319ca108e7ba70754eeb3e579c43bd7",
+    "file_payloads": [
+      {
+        "path": "target.txt",
+        "size_bytes": 7,
+        "sha256": "c97ecfda4d205190b973232dcfdb0c29748521c2534dd866bcc782f30b086738"
+      }
+    ],
+    "symlinks": [
+      {
+        "path": "links/latest",
+        "target": "target.txt"
+      },
+      {
+        "path": "links/long-target",
+        "target": "targets/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      },
+      {
+        "path": "links/dangling",
+        "target": "missing.txt"
+      }
+    ],
+    "directories": [
+      "empty/"
+    ],
+    "file_layouts": [
+      {
+        "entry_type": "directory",
+        "path": "empty/",
+        "pax_header_offset": 1024,
+        "data_offset": 2560,
+        "first_chunk_lba": null,
+        "chunk_count": 0,
+        "pad_spaces": 0
+      },
+      {
+        "entry_type": "symlink",
+        "path": "links/latest",
+        "pax_header_offset": 2560,
+        "data_offset": 4096,
+        "first_chunk_lba": null,
+        "chunk_count": 0,
+        "pad_spaces": 0
+      },
+      {
+        "entry_type": "symlink",
+        "path": "links/long-target",
+        "pax_header_offset": 4096,
+        "data_offset": 5632,
+        "first_chunk_lba": null,
+        "chunk_count": 0,
+        "pad_spaces": 0
+      },
+      {
+        "entry_type": "symlink",
+        "path": "links/dangling",
+        "pax_header_offset": 5632,
+        "data_offset": 7168,
+        "first_chunk_lba": null,
+        "chunk_count": 0,
+        "pad_spaces": 0
+      },
+      {
+        "entry_type": "regular",
+        "path": "target.txt",
+        "pax_header_offset": 7168,
+        "data_offset": 12288,
+        "first_chunk_lba": 3,
+        "chunk_count": 1,
+        "pad_spaces": 3843
+      }
+    ],
+    "manifest_layout": {
+      "entry_type": "regular",
+      "path": "_remanence/manifest.cbor",
+      "pax_header_offset": 12800,
+      "data_offset": 16384,
+      "first_chunk_lba": 4,
+      "chunk_count": 1,
+      "pad_spaces": 2229
+    }
+  }
+}

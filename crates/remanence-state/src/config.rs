@@ -1,0 +1,1124 @@
+//! Operator configuration loading and validation.
+
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use serde::{de, Deserialize, Deserializer};
+
+use crate::error::StateError;
+
+/// Default fixed tape block size for newly initialized tapes.
+pub const DEFAULT_TAPE_BLOCK_SIZE_BYTES: u64 = 256 * 1024;
+
+const MAX_TAPE_BLOCK_SIZE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Top-level Remanence daemon configuration.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RemConfig {
+    /// Daemon-wide settings.
+    pub daemon: DaemonConfig,
+    /// Allowed tape libraries.
+    #[serde(default)]
+    pub libraries: Vec<LibraryConfig>,
+    /// Operator-defined tape eligibility pools.
+    #[serde(default)]
+    pub tape_pools: Vec<TapePoolConfig>,
+    /// Barcode-prefix rules that derive tape pool membership from voltags.
+    #[serde(default)]
+    pub tape_pool_rules: Vec<TapePoolRuleConfig>,
+    /// Layer 3c journal settings.
+    pub journal: JournalConfig,
+    /// Layer 4 audit-log settings.
+    pub audit: AuditConfig,
+    /// Rebuildable SQLite index settings.
+    pub index: IndexConfig,
+    /// Rebuildable tape-catalog cache settings.
+    pub cache: CacheConfig,
+}
+
+/// Daemon-wide settings.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonConfig {
+    /// Root directory for mutable daemon state.
+    pub state_dir: PathBuf,
+    /// Default idle timeout for sessions.
+    pub default_idle_timeout_seconds: u64,
+    /// Whether state-changing operations must be rejected.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Unix-domain socket the daemon listens on (dev transport). Absent →
+    /// `<state_dir>/rem.sock`.
+    #[serde(default)]
+    pub socket_path: Option<PathBuf>,
+    /// TCP listen address for the mTLS endpoint, e.g. "0.0.0.0:8443".
+    /// Requires `tls`. Absent means Unix socket only.
+    #[serde(default)]
+    pub listen: Option<String>,
+    /// Mutual-TLS material for the TCP listener. Requires `listen`.
+    #[serde(default)]
+    pub tls: Option<DaemonTlsConfig>,
+}
+
+impl DaemonConfig {
+    /// Resolve the listen socket: explicit `socket_path`, else `<state_dir>/rem.sock`.
+    pub fn socket_path_or_default(&self) -> PathBuf {
+        self.socket_path
+            .clone()
+            .unwrap_or_else(|| self.state_dir.join("rem.sock"))
+    }
+}
+
+/// Server-side mutual-TLS material for the daemon's TCP listener.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonTlsConfig {
+    /// Server identity certificate PEM.
+    pub cert: PathBuf,
+    /// Server private key PEM.
+    pub key: PathBuf,
+    /// CA PEM whose signature a client certificate must carry.
+    pub client_ca: PathBuf,
+}
+
+/// Per-library operator allowlist entry.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LibraryConfig {
+    /// Library serial number.
+    pub serial: String,
+    /// Whether derived drive identity is allowed for this explicit library.
+    #[serde(default)]
+    pub allow_derived_drive_identity: bool,
+}
+
+/// Operator-defined pool for tape eligibility and Sutradhara placement.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TapePoolConfig {
+    /// Stable daemon-local pool id.
+    pub id: String,
+    /// Optional human-readable label.
+    pub display_name: Option<String>,
+    /// Optional copy segregation axis, such as `copy-a`.
+    pub copy_class: Option<String>,
+    /// Optional content segregation axis, such as `camera`.
+    pub content_class: Option<String>,
+    /// Within-pool tape-selection policy.
+    #[serde(default)]
+    pub selection_policy: PoolSelectionPolicyName,
+    /// Fill target. Tapes are sealed when actual used bytes reach this fraction.
+    #[serde(default = "default_watermark_low")]
+    pub watermark_low: f64,
+    /// Usable capacity cap, below physical end-of-media.
+    #[serde(default = "default_watermark_high")]
+    pub watermark_high: f64,
+    /// Fixed tape block size to record when initializing fresh tapes in this pool.
+    #[serde(
+        default = "default_tape_block_size",
+        rename = "block_size",
+        deserialize_with = "deserialize_byte_size"
+    )]
+    pub block_size_bytes: u64,
+    /// Sutradhara's declared minimum object/bundle floor in bytes.
+    #[serde(
+        default,
+        rename = "min_object_size",
+        deserialize_with = "deserialize_byte_size"
+    )]
+    pub min_object_size_bytes: u64,
+}
+
+/// Configured within-pool tape-selection policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PoolSelectionPolicyName {
+    /// Default two-tier complete-or-fill policy.
+    #[default]
+    CompleteOrFill,
+    /// Compatibility first-fit-by-barcode policy.
+    FillOldest,
+}
+
+impl PoolSelectionPolicyName {
+    /// Return the stable config spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CompleteOrFill => "complete-or-fill",
+            Self::FillOldest => "fill-oldest",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PoolSelectionPolicyName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.trim() {
+            "complete-or-fill" => Ok(Self::CompleteOrFill),
+            "fill-oldest" => Ok(Self::FillOldest),
+            other => Err(de::Error::custom(format!(
+                "unknown selection_policy {other:?}; expected complete-or-fill or fill-oldest"
+            ))),
+        }
+    }
+}
+
+/// Barcode-prefix rule that derives one tape's pool from its voltag.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TapePoolRuleConfig {
+    /// Barcode prefix to match. Longest matching prefix wins.
+    pub prefix: String,
+    /// Pool id from `[[tape_pools]]`.
+    pub pool_id: String,
+}
+
+/// Layer 3c journal configuration.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct JournalConfig {
+    /// Directory containing one `.remjournal` file per tape.
+    pub dir: PathBuf,
+    /// Whether startup rejects untrusted flush volumes.
+    #[serde(default = "default_require_trusted_volume")]
+    pub require_trusted_volume: bool,
+}
+
+/// Audit-log configuration.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuditConfig {
+    /// Directory containing daily `.remaudit` segments.
+    pub dir: PathBuf,
+    /// Whether appends are fsynced before returning.
+    #[serde(default = "default_true")]
+    pub fsync: bool,
+    /// Wall-clock forward jump tolerance before an audit warning is emitted.
+    #[serde(default = "default_clock_forward_tolerance_seconds")]
+    pub clock_forward_tolerance_seconds: u64,
+}
+
+/// SQLite projection configuration.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IndexConfig {
+    /// Path to the rebuildable SQLite index file.
+    pub sqlite_path: PathBuf,
+}
+
+/// Rebuildable cache configuration.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CacheConfig {
+    /// Directory containing per-tape catalog cache files.
+    pub tape_catalog_dir: PathBuf,
+}
+
+fn default_require_trusted_volume() -> bool {
+    true
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_clock_forward_tolerance_seconds() -> u64 {
+    300
+}
+
+fn default_watermark_low() -> f64 {
+    0.92
+}
+
+fn default_watermark_high() -> f64 {
+    0.97
+}
+
+fn default_tape_block_size() -> u64 {
+    DEFAULT_TAPE_BLOCK_SIZE_BYTES
+}
+
+/// Load and validate a TOML configuration file.
+pub fn load_config(path: impl AsRef<Path>) -> Result<RemConfig, StateError> {
+    let path = path.as_ref();
+    let text =
+        fs::read_to_string(path).map_err(|err| StateError::io_at("read config", path, err))?;
+    parse_config_toml(&text)
+}
+
+/// Parse and validate a TOML configuration string.
+pub fn parse_config_toml(text: &str) -> Result<RemConfig, StateError> {
+    let config: RemConfig =
+        toml::from_str(text).map_err(|err| StateError::ConfigInvalid(err.to_string()))?;
+    validate_config(&config)?;
+    Ok(config)
+}
+
+/// Validate a parsed configuration.
+pub fn validate_config(config: &RemConfig) -> Result<(), StateError> {
+    require_absolute("daemon.state_dir", &config.daemon.state_dir)?;
+    if let Some(socket_path) = &config.daemon.socket_path {
+        require_absolute("daemon.socket_path", socket_path)?;
+    }
+    match (&config.daemon.listen, &config.daemon.tls) {
+        (Some(listen), Some(tls)) => {
+            listen.parse::<std::net::SocketAddr>().map_err(|_| {
+                StateError::ConfigInvalid(format!(
+                    "daemon.listen {listen:?} must be a valid socket address (e.g. 0.0.0.0:8443)"
+                ))
+            })?;
+            require_absolute("daemon.tls.cert", &tls.cert)?;
+            require_absolute("daemon.tls.key", &tls.key)?;
+            require_absolute("daemon.tls.client_ca", &tls.client_ca)?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(StateError::ConfigInvalid(
+                "daemon.listen and daemon.tls must be set together".to_string(),
+            ));
+        }
+    }
+    require_absolute("journal.dir", &config.journal.dir)?;
+    require_absolute("audit.dir", &config.audit.dir)?;
+    require_absolute("index.sqlite_path", &config.index.sqlite_path)?;
+    require_absolute("cache.tape_catalog_dir", &config.cache.tape_catalog_dir)?;
+
+    if config.daemon.default_idle_timeout_seconds == 0 {
+        return Err(StateError::ConfigInvalid(
+            "daemon.default_idle_timeout_seconds must be non-zero".to_string(),
+        ));
+    }
+    if config.audit.clock_forward_tolerance_seconds > i64::MAX as u64 {
+        return Err(StateError::ConfigInvalid(
+            "audit.clock_forward_tolerance_seconds is too large".to_string(),
+        ));
+    }
+
+    let mut serials = HashSet::new();
+    for library in &config.libraries {
+        let serial = library.serial.trim();
+        if serial.is_empty() {
+            return Err(StateError::ConfigInvalid(
+                "library serial must not be empty".to_string(),
+            ));
+        }
+        if !serials.insert(serial.to_string()) {
+            return Err(StateError::ConfigInvalid(format!(
+                "duplicate library serial {serial}"
+            )));
+        }
+    }
+
+    let mut pool_ids = HashSet::new();
+    for pool in &config.tape_pools {
+        let pool_id = validate_pool_id(pool.id.as_str())?;
+        validate_block_size(pool.block_size_bytes)
+            .map_err(|error| StateError::ConfigInvalid(format!("tape pool {pool_id} {error}")))?;
+        validate_tape_pool_selection_config(pool)?;
+        if !pool_ids.insert(pool_id.to_string()) {
+            return Err(StateError::ConfigInvalid(format!(
+                "duplicate tape pool id {pool_id}"
+            )));
+        }
+    }
+    validate_tape_pool_rules(&config.tape_pool_rules, &pool_ids)?;
+
+    validate_trusted_volume_paths(config)?;
+
+    Ok(())
+}
+
+/// Derive a tape pool from a barcode using longest-prefix matching.
+///
+/// Prefix and voltag matching is ASCII case-insensitive. Validation rejects
+/// duplicate normalized prefixes, so ties are not meaningful for valid config.
+pub fn derive_tape_pool_from_voltag<'a>(
+    voltag: &str,
+    rules: &'a [TapePoolRuleConfig],
+) -> Option<&'a str> {
+    let voltag = normalize_rule_match_text(voltag)?;
+    rules
+        .iter()
+        .filter_map(|rule| {
+            let prefix = normalize_rule_match_text(&rule.prefix)?;
+            voltag
+                .starts_with(prefix.as_str())
+                .then_some((prefix.len(), rule.pool_id.as_str()))
+        })
+        .max_by_key(|(prefix_len, _)| *prefix_len)
+        .map(|(_, pool_id)| pool_id)
+}
+
+/// Validate a configured fixed tape block size.
+pub fn validate_block_size(block_size_bytes: u64) -> Result<(), String> {
+    if block_size_bytes == 0 {
+        return Err("block_size must be greater than zero".to_string());
+    }
+    if block_size_bytes % 512 != 0 {
+        return Err("block_size must be a multiple of 512 bytes".to_string());
+    }
+    if block_size_bytes > MAX_TAPE_BLOCK_SIZE_BYTES {
+        return Err(format!(
+            "block_size must be no larger than {MAX_TAPE_BLOCK_SIZE_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the static, capacity-independent selection settings for one pool.
+pub fn validate_tape_pool_selection_config(pool: &TapePoolConfig) -> Result<(), StateError> {
+    validate_watermark("watermark_low", pool.watermark_low)?;
+    validate_watermark("watermark_high", pool.watermark_high)?;
+    if pool.watermark_low.partial_cmp(&pool.watermark_high) != Some(std::cmp::Ordering::Less) {
+        return Err(StateError::ConfigInvalid(format!(
+            "tape pool {} requires 0 < watermark_low < watermark_high <= 1",
+            pool.id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_tape_pool_rules(
+    rules: &[TapePoolRuleConfig],
+    pool_ids: &HashSet<String>,
+) -> Result<(), StateError> {
+    let mut prefixes = HashMap::new();
+    for rule in rules {
+        let prefix = validate_tape_pool_rule_prefix(&rule.prefix)?;
+        let pool_id = validate_pool_id(rule.pool_id.as_str())?;
+        if !pool_ids.contains(pool_id) {
+            return Err(StateError::ConfigInvalid(format!(
+                "tape pool rule prefix {prefix:?} references unknown pool id {pool_id}"
+            )));
+        }
+        if let Some(existing_pool) = prefixes.insert(prefix.to_string(), pool_id.to_string()) {
+            return Err(StateError::ConfigInvalid(format!(
+                "ambiguous tape pool rule prefix {prefix:?}: maps to both {existing_pool} and {pool_id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_tape_pool_rule_prefix(value: &str) -> Result<String, StateError> {
+    let prefix = normalize_rule_match_text(value).ok_or_else(|| {
+        StateError::ConfigInvalid("tape pool rule prefix must be non-empty ASCII".to_string())
+    })?;
+    if !prefix.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err(StateError::ConfigInvalid(format!(
+            "tape pool rule prefix {value:?} must use only ASCII letters and digits"
+        )));
+    }
+    Ok(prefix)
+}
+
+fn normalize_rule_match_text(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || !trimmed.is_ascii() {
+        return None;
+    }
+    Some(trimmed.to_ascii_uppercase())
+}
+
+/// Validate the watermark-band invariant once the pool's tape capacity is known.
+pub fn validate_tape_pool_capacity_invariant(
+    pool: &TapePoolConfig,
+    capacity_bytes: u64,
+) -> Result<(), StateError> {
+    let low_bytes = watermark_floor_bytes(capacity_bytes, pool.watermark_low)?;
+    let high_bytes = watermark_floor_bytes(capacity_bytes, pool.watermark_high)?;
+    let band_bytes = high_bytes.saturating_sub(low_bytes);
+    if band_bytes < pool.min_object_size_bytes {
+        return Err(StateError::ConfigInvalid(format!(
+            "tape pool {} watermark band {band_bytes} bytes is smaller than min_object_size {} bytes for capacity {capacity_bytes}",
+            pool.id, pool.min_object_size_bytes
+        )));
+    }
+    Ok(())
+}
+
+/// Convert a capacity fraction into the byte threshold used by selection.
+pub fn watermark_floor_bytes(capacity_bytes: u64, watermark: f64) -> Result<u64, StateError> {
+    validate_watermark("watermark", watermark)?;
+    Ok(((capacity_bytes as f64) * watermark).floor() as u64)
+}
+
+/// Validate configured journal and audit volumes when trust checks are enabled.
+pub fn validate_trusted_volume_paths(config: &RemConfig) -> Result<(), StateError> {
+    if config.journal.require_trusted_volume {
+        for path in trusted_volume_paths(config) {
+            validate_trusted_path(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn trusted_volume_paths(config: &RemConfig) -> Vec<&Path> {
+    let mut paths = vec![
+        config.daemon.state_dir.as_path(),
+        config.journal.dir.as_path(),
+        config.audit.dir.as_path(),
+        config.index.sqlite_path.as_path(),
+        config.cache.tape_catalog_dir.as_path(),
+    ];
+    if let Some(socket_path) = &config.daemon.socket_path {
+        paths.push(socket_path.as_path());
+    }
+    paths
+}
+
+fn require_absolute(name: &str, path: &Path) -> Result<(), StateError> {
+    if !path.is_absolute() {
+        return Err(StateError::ConfigInvalid(format!(
+            "{name} must be an absolute path: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_pool_id(value: &str) -> Result<&str, StateError> {
+    let pool_id = value.trim();
+    if pool_id.is_empty() {
+        return Err(StateError::ConfigInvalid(
+            "tape pool id must not be empty".to_string(),
+        ));
+    }
+    if !pool_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+    {
+        return Err(StateError::ConfigInvalid(format!(
+            "tape pool id {pool_id:?} must use only ASCII letters, digits, '.', '_', '-', or ':'"
+        )));
+    }
+    Ok(pool_id)
+}
+
+fn validate_watermark(field: &str, value: f64) -> Result<(), StateError> {
+    if value.is_finite() && value > 0.0 && value <= 1.0 {
+        Ok(())
+    } else {
+        Err(StateError::ConfigInvalid(format!(
+            "{field} must be finite and satisfy 0 < {field} <= 1"
+        )))
+    }
+}
+
+fn deserialize_byte_size<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ByteSizeVisitor;
+
+    impl de::Visitor<'_> for ByteSizeVisitor {
+        type Value = u64;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a byte count integer or a string like \"2GiB\"")
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(value)
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            u64::try_from(value).map_err(|_| E::custom("byte size must not be negative"))
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            parse_byte_size(value).map_err(E::custom)
+        }
+    }
+
+    deserializer.deserialize_any(ByteSizeVisitor)
+}
+
+fn parse_byte_size(value: &str) -> Result<u64, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("byte size must not be empty".to_string());
+    }
+    let split_at = value
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (digits, unit) = value.split_at(split_at);
+    if digits.is_empty() {
+        return Err(format!("byte size {value:?} must start with digits"));
+    }
+    let amount = digits
+        .parse::<u64>()
+        .map_err(|err| format!("byte size {value:?} has invalid number: {err}"))?;
+    let multiplier = match unit.trim() {
+        "" | "B" | "b" => 1u64,
+        "KiB" | "K" | "KB" => 1024,
+        "MiB" | "M" | "MB" => 1024u64.pow(2),
+        "GiB" | "G" | "GB" => 1024u64.pow(3),
+        "TiB" | "T" | "TB" => 1024u64.pow(4),
+        "PiB" | "P" | "PB" => 1024u64.pow(5),
+        other => return Err(format!("unsupported byte-size unit {other:?}")),
+    };
+    amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("byte size {value:?} overflows u64"))
+}
+
+fn validate_trusted_path(path: &Path) -> Result<(), StateError> {
+    let probe = nearest_existing_ancestor(path)?;
+    reject_untrusted_volume(path, &probe)
+}
+
+fn nearest_existing_ancestor(path: &Path) -> Result<PathBuf, StateError> {
+    let mut current = path;
+    loop {
+        if current.exists() {
+            return Ok(current.to_path_buf());
+        }
+        current = current.parent().ok_or_else(|| {
+            StateError::ConfigInvalid(format!(
+                "no existing ancestor for trusted-volume check: {}",
+                path.display()
+            ))
+        })?;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reject_untrusted_volume(configured: &Path, probe: &Path) -> Result<(), StateError> {
+    use nix::libc;
+
+    let stats = nix::sys::statfs::statfs(probe).map_err(|err| {
+        StateError::io_at(
+            "statfs trusted-volume probe",
+            probe,
+            std::io::Error::from(err),
+        )
+    })?;
+    let fs_type = stats.filesystem_type().0;
+    const TMPFS_MAGIC: libc::c_long = 0x0102_1994;
+    const NFS_SUPER_MAGIC: libc::c_long = 0x6969;
+    const SMB_SUPER_MAGIC: libc::c_long = 0x517B;
+    const CIFS_MAGIC_NUMBER: libc::c_long = 0xFF53_4D42;
+    const OVERLAYFS_SUPER_MAGIC: libc::c_long = 0x794C_7630;
+    const RAMFS_MAGIC: libc::c_long = 0x8584_58F6u64 as libc::c_long;
+
+    let kind = match fs_type {
+        TMPFS_MAGIC => Some("tmpfs"),
+        NFS_SUPER_MAGIC => Some("nfs"),
+        SMB_SUPER_MAGIC => Some("smb"),
+        CIFS_MAGIC_NUMBER => Some("cifs"),
+        OVERLAYFS_SUPER_MAGIC => Some("overlayfs"),
+        RAMFS_MAGIC => Some("ramfs"),
+        _ => None,
+    };
+
+    if let Some(kind) = kind {
+        return Err(StateError::UntrustedStateVolume(format!(
+            "{} is on {kind} via {}",
+            configured.display(),
+            probe.display()
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reject_untrusted_volume(_configured: &Path, _probe: &Path) -> Result<(), StateError> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_config() -> String {
+        let root = std::env::temp_dir().join("remanence-state-config-test");
+        format!(
+            r#"
+[daemon]
+state_dir = "{0}"
+default_idle_timeout_seconds = 1800
+read_only = false
+
+[[libraries]]
+serial = "LIB001"
+allow_derived_drive_identity = false
+
+[journal]
+dir = "{0}/journals"
+require_trusted_volume = false
+
+[audit]
+dir = "{0}/audit"
+fsync = true
+
+[index]
+sqlite_path = "{0}/index/rem-state.sqlite"
+
+[cache]
+tape_catalog_dir = "{0}/cache/tapes"
+"#,
+            root.display()
+        )
+    }
+
+    fn with_daemon_lines(extra: &str) -> String {
+        valid_config().replace(
+            "read_only = false\n",
+            &format!("read_only = false\n{extra}"),
+        )
+    }
+
+    #[test]
+    fn rejects_duplicate_library_serials() {
+        let mut text = valid_config();
+        text.push_str(
+            r#"
+[[libraries]]
+serial = "LIB001"
+"#,
+        );
+
+        let err = parse_config_toml(&text).expect_err("duplicate serial must fail");
+        assert!(err.to_string().contains("duplicate library serial"));
+    }
+
+    #[test]
+    fn rejects_duplicate_tape_pool_ids() {
+        let mut text = valid_config();
+        text.push_str(
+            r#"
+[[tape_pools]]
+id = "camera.copy-a"
+
+[[tape_pools]]
+id = "camera.copy-a"
+"#,
+        );
+
+        let err = parse_config_toml(&text).expect_err("duplicate pool must fail");
+        assert!(err.to_string().contains("duplicate tape pool id"));
+    }
+
+    #[test]
+    fn rejects_invalid_tape_pool_ids() {
+        let mut text = valid_config();
+        text.push_str(
+            r#"
+[[tape_pools]]
+id = "camera copy a"
+"#,
+        );
+
+        let err = parse_config_toml(&text).expect_err("invalid pool must fail");
+        assert!(err.to_string().contains("tape pool id"));
+    }
+
+    #[test]
+    fn rejects_unknown_keys() {
+        let text = valid_config().replace("[daemon]\n", "[daemon]\nunsupported_setting = true\n");
+
+        let err = parse_config_toml(&text).expect_err("unknown key must fail");
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn daemon_socket_path_defaults_and_parses() {
+        let config = parse_config_toml(&valid_config()).expect("valid config");
+        assert_eq!(config.daemon.socket_path, None);
+        assert_eq!(
+            config.daemon.socket_path_or_default(),
+            config.daemon.state_dir.join("rem.sock")
+        );
+
+        let text = valid_config().replace(
+            "default_idle_timeout_seconds = 1800",
+            "default_idle_timeout_seconds = 1800\nsocket_path = \"/run/rem/rem.sock\"",
+        );
+        let config = parse_config_toml(&text).expect("valid config with socket_path");
+        assert_eq!(
+            config.daemon.socket_path_or_default(),
+            std::path::PathBuf::from("/run/rem/rem.sock")
+        );
+    }
+
+    #[test]
+    fn daemon_listen_and_tls_parse_together() {
+        let text = with_daemon_lines(
+            r#"listen = "0.0.0.0:8443"
+
+[daemon.tls]
+cert = "/etc/rem/s.crt"
+key = "/etc/rem/s.key"
+client_ca = "/etc/rem/ca.crt"
+"#,
+        );
+        let config = parse_config_toml(&text).expect("valid config with listen+tls");
+        assert_eq!(config.daemon.listen.as_deref(), Some("0.0.0.0:8443"));
+        assert_eq!(
+            config.daemon.tls.as_ref().unwrap().client_ca,
+            std::path::PathBuf::from("/etc/rem/ca.crt")
+        );
+    }
+
+    #[test]
+    fn daemon_listen_without_tls_is_rejected() {
+        let text = with_daemon_lines(
+            r#"listen = "0.0.0.0:8443"
+"#,
+        );
+        let err = parse_config_toml(&text).expect_err("listen without tls");
+        assert!(err.to_string().contains("must be set together"), "{err}");
+    }
+
+    #[test]
+    fn daemon_tls_without_listen_is_rejected() {
+        let text = with_daemon_lines(
+            r#"
+[daemon.tls]
+cert = "/c"
+key = "/k"
+client_ca = "/ca"
+"#,
+        );
+        let err = parse_config_toml(&text).expect_err("tls without listen");
+        assert!(err.to_string().contains("must be set together"), "{err}");
+    }
+
+    #[test]
+    fn daemon_unparseable_listen_is_rejected() {
+        let text = with_daemon_lines(
+            r#"listen = "not-an-addr"
+
+[daemon.tls]
+cert = "/c"
+key = "/k"
+client_ca = "/ca"
+"#,
+        );
+        let err = parse_config_toml(&text).expect_err("bad listen");
+        assert!(err.to_string().contains("daemon.listen"), "{err}");
+    }
+
+    #[test]
+    fn daemon_relative_tls_path_is_rejected() {
+        let text = with_daemon_lines(
+            r#"listen = "0.0.0.0:8443"
+
+[daemon.tls]
+cert = "rel/s.crt"
+key = "/k"
+client_ca = "/ca"
+"#,
+        );
+        let err = parse_config_toml(&text).expect_err("relative cert");
+        assert!(err.to_string().contains("daemon.tls.cert"), "{err}");
+    }
+
+    #[test]
+    fn rejects_relative_paths() {
+        let text = valid_config().replace("state_dir = \"/", "state_dir = \"relative/");
+
+        let err = parse_config_toml(&text).expect_err("relative path must fail");
+        assert!(err.to_string().contains("daemon.state_dir"));
+    }
+
+    #[test]
+    fn parses_minimum_config() {
+        let config = parse_config_toml(&valid_config()).expect("valid config");
+        assert_eq!(config.libraries[0].serial, "LIB001");
+        assert!(config.audit.fsync);
+        assert!(config.tape_pools.is_empty());
+        assert!(config.tape_pool_rules.is_empty());
+    }
+
+    #[test]
+    fn parses_tape_pool_config() {
+        let mut text = valid_config();
+        text.push_str(
+            r#"
+[[tape_pools]]
+id = "camera.copy-a"
+display_name = "Camera copy A"
+copy_class = "copy-a"
+content_class = "camera"
+selection_policy = "fill-oldest"
+watermark_low = 0.90
+watermark_high = 0.95
+block_size = "512KiB"
+min_object_size = "2GiB"
+
+[[tape_pool_rules]]
+prefix = "ACM"
+pool_id = "camera.copy-a"
+"#,
+        );
+
+        let config = parse_config_toml(&text).expect("valid pool config");
+        assert_eq!(config.tape_pools.len(), 1);
+        assert_eq!(config.tape_pool_rules.len(), 1);
+        assert_eq!(config.tape_pools[0].id, "camera.copy-a");
+        assert_eq!(
+            config.tape_pools[0].display_name.as_deref(),
+            Some("Camera copy A")
+        );
+        assert_eq!(config.tape_pools[0].copy_class.as_deref(), Some("copy-a"));
+        assert_eq!(
+            config.tape_pools[0].content_class.as_deref(),
+            Some("camera")
+        );
+        assert_eq!(
+            config.tape_pools[0].selection_policy,
+            PoolSelectionPolicyName::FillOldest
+        );
+        assert_eq!(config.tape_pools[0].watermark_low, 0.90);
+        assert_eq!(config.tape_pools[0].watermark_high, 0.95);
+        assert_eq!(config.tape_pools[0].block_size_bytes, 512 * 1024);
+        assert_eq!(
+            config.tape_pools[0].min_object_size_bytes,
+            2 * 1024 * 1024 * 1024
+        );
+        assert_eq!(config.tape_pool_rules[0].prefix, "ACM");
+        assert_eq!(config.tape_pool_rules[0].pool_id, "camera.copy-a");
+        assert_eq!(
+            derive_tape_pool_from_voltag("acm001l9", &config.tape_pool_rules),
+            Some("camera.copy-a")
+        );
+    }
+
+    #[test]
+    fn tape_pool_rules_use_longest_prefix() {
+        let mut text = valid_config();
+        text.push_str(
+            r#"
+[[tape_pools]]
+id = "camera.default"
+
+[[tape_pools]]
+id = "camera.copy-a"
+
+[[tape_pool_rules]]
+prefix = "AC"
+pool_id = "camera.default"
+
+[[tape_pool_rules]]
+prefix = "ACM"
+pool_id = "camera.copy-a"
+"#,
+        );
+
+        let config = parse_config_toml(&text).expect("valid pool rules");
+        assert_eq!(
+            derive_tape_pool_from_voltag("ACM001L9", &config.tape_pool_rules),
+            Some("camera.copy-a")
+        );
+        assert_eq!(
+            derive_tape_pool_from_voltag("ACX001L9", &config.tape_pool_rules),
+            Some("camera.default")
+        );
+        assert_eq!(
+            derive_tape_pool_from_voltag("BCM001L9", &config.tape_pool_rules),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_tape_pool_rule_for_unknown_pool() {
+        let mut text = valid_config();
+        text.push_str(
+            r#"
+[[tape_pool_rules]]
+prefix = "ACM"
+pool_id = "camera.copy-a"
+"#,
+        );
+
+        let err = parse_config_toml(&text).expect_err("unknown rule pool must fail");
+        assert!(err.to_string().contains("unknown pool id"));
+    }
+
+    #[test]
+    fn rejects_ambiguous_equal_length_tape_pool_rule_prefixes() {
+        let mut text = valid_config();
+        text.push_str(
+            r#"
+[[tape_pools]]
+id = "camera.copy-a"
+
+[[tape_pools]]
+id = "camera.copy-b"
+
+[[tape_pool_rules]]
+prefix = "ACM"
+pool_id = "camera.copy-a"
+
+[[tape_pool_rules]]
+prefix = "acm"
+pool_id = "camera.copy-b"
+"#,
+        );
+
+        let err = parse_config_toml(&text).expect_err("duplicate normalized prefix must fail");
+        assert!(err.to_string().contains("ambiguous tape pool rule prefix"));
+    }
+
+    #[test]
+    fn rejects_invalid_tape_pool_rule_prefix() {
+        let mut text = valid_config();
+        text.push_str(
+            r#"
+[[tape_pools]]
+id = "camera.copy-a"
+
+[[tape_pool_rules]]
+prefix = "AC M"
+pool_id = "camera.copy-a"
+"#,
+        );
+
+        let err = parse_config_toml(&text).expect_err("invalid prefix must fail");
+        assert!(err.to_string().contains("tape pool rule prefix"));
+    }
+
+    #[test]
+    fn tape_pool_selection_config_defaults() {
+        let mut text = valid_config();
+        text.push_str(
+            r#"
+[[tape_pools]]
+id = "camera.copy-a"
+"#,
+        );
+
+        let config = parse_config_toml(&text).expect("valid pool defaults");
+        let pool = &config.tape_pools[0];
+        assert_eq!(
+            pool.selection_policy,
+            PoolSelectionPolicyName::CompleteOrFill
+        );
+        assert_eq!(pool.watermark_low, default_watermark_low());
+        assert_eq!(pool.watermark_high, default_watermark_high());
+        assert_eq!(pool.block_size_bytes, DEFAULT_TAPE_BLOCK_SIZE_BYTES);
+        assert_eq!(pool.min_object_size_bytes, 0);
+    }
+
+    #[test]
+    fn rejects_invalid_watermark_ordering() {
+        let mut text = valid_config();
+        text.push_str(
+            r#"
+[[tape_pools]]
+id = "camera.copy-a"
+watermark_low = 0.97
+watermark_high = 0.92
+"#,
+        );
+
+        let err = parse_config_toml(&text).expect_err("invalid watermarks must fail");
+        assert!(err.to_string().contains("watermark_low"));
+    }
+
+    #[test]
+    fn rejects_unknown_pool_selection_policy() {
+        let mut text = valid_config();
+        text.push_str(
+            r#"
+[[tape_pools]]
+id = "camera.copy-a"
+selection_policy = "most-free"
+"#,
+        );
+
+        let err = parse_config_toml(&text).expect_err("unknown policy must fail");
+        assert!(err.to_string().contains("unknown selection_policy"));
+    }
+
+    #[test]
+    fn rejects_invalid_min_object_size_string() {
+        let mut text = valid_config();
+        text.push_str(
+            r#"
+[[tape_pools]]
+id = "camera.copy-a"
+min_object_size = "2XB"
+"#,
+        );
+
+        let err = parse_config_toml(&text).expect_err("invalid byte size must fail");
+        assert!(err.to_string().contains("unsupported byte-size unit"));
+    }
+
+    #[test]
+    fn rejects_invalid_tape_pool_block_sizes() {
+        for (block_size, expected) in [
+            ("0", "greater than zero"),
+            ("1000", "multiple of 512"),
+            ("17MiB", "no larger than"),
+        ] {
+            let mut text = valid_config();
+            text.push_str(&format!(
+                r#"
+[[tape_pools]]
+id = "camera.copy-a"
+block_size = {block_size:?}
+"#
+            ));
+
+            let err = parse_config_toml(&text).expect_err("invalid block size must fail");
+            assert!(err.to_string().contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn trusted_volume_policy_covers_all_local_state_paths() {
+        let text = with_daemon_lines("socket_path = \"/var/lib/rem/rem.sock\"\n");
+        let config = parse_config_toml(&text).expect("valid config");
+        let paths = trusted_volume_paths(&config)
+            .into_iter()
+            .map(|path| path.to_path_buf())
+            .collect::<Vec<_>>();
+
+        assert!(paths.contains(&config.daemon.state_dir));
+        assert!(paths.contains(&config.daemon.socket_path.clone().unwrap()));
+        assert!(paths.contains(&config.journal.dir));
+        assert!(paths.contains(&config.audit.dir));
+        assert!(paths.contains(&config.index.sqlite_path));
+        assert!(paths.contains(&config.cache.tape_catalog_dir));
+    }
+
+    #[test]
+    fn validates_watermark_band_invariant_boundary() {
+        let mut text = valid_config();
+        text.push_str(
+            r#"
+[[tape_pools]]
+id = "camera.copy-a"
+watermark_low = 0.80
+watermark_high = 0.90
+min_object_size = 100
+"#,
+        );
+        let config = parse_config_toml(&text).expect("boundary config parses");
+        let pool = &config.tape_pools[0];
+
+        validate_tape_pool_capacity_invariant(pool, 1000)
+            .expect("band equal to min_object_size is valid");
+
+        let mut too_large = pool.clone();
+        too_large.min_object_size_bytes = 101;
+        let err = validate_tape_pool_capacity_invariant(&too_large, 1000)
+            .expect_err("narrow band must fail");
+        assert!(err.to_string().contains("watermark band 100 bytes"));
+    }
+}

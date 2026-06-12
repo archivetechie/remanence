@@ -1,0 +1,29 @@
+[package]
+name        = "remanence-stream"
+description = "Layer 5-adjacent streaming orchestration primitives for Remanence."
+version     .workspace = true
+edition     .workspace = true
+rust-version.workspace = true
+authors     .workspace = true
+license     .workspace = true
+repository  .workspace = true
+
+[dependencies]
+remanence-format = { path = "../remanence-format" }
+remanence-library = { path = "../remanence-library" }
+remanence-parity = { path = "../remanence-parity" }
+
+nix        = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+sha2       = { workspace = true }
+thiserror  = { workspace = true }
+time       = { workspace = true }
+uuid       = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"

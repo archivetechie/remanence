@@ -1,0 +1,66 @@
+    HPE       Ultrium 9-SCSI    R3G3
+Tape alert page (ssc-3) [0x2e]
+  Read warning: 0
+  Write warning: 0
+  Hard error: 0
+  Media: 0
+  Read failure: 0
+  Write failure: 0
+  Media life: 0
+  Not data grade: 0
+  Write protect: 0
+  No removal: 0
+  Cleaning media: 0
+  Unsupported format: 0
+  Recoverable mechanical cartridge failure: 0
+  Unrecoverable mechanical cartridge failure: 0
+  Memory chip in cartridge failure: 0
+  Forced eject: 0
+  Read only format: 0
+  Tape directory corrupted on load: 0
+  Nearing media life: 0
+  Cleaning required: 0
+  Cleaning requested: 0
+  Expired cleaning media: 0
+  Invalid cleaning tape: 0
+  Retension requested: 0
+  Dual port interface error: 0
+  Cooling fan failing: 0
+  Power supply failure: 0
+  Power consumption: 0
+  Drive maintenance: 0
+  Hardware A: 0
+  Hardware B: 0
+  Interface: 0
+  Eject media: 0
+  Microcode update fail: 0
+  Drive humidity: 0
+  Drive temperature: 0
+  Drive voltage: 0
+  Predictive failure: 0
+  Diagnostics required: 0
+  Obsolete (28h): 0
+  Obsolete (29h): 0
+  Obsolete (2Ah): 0
+  Obsolete (2Bh): 0
+  Obsolete (2Ch): 0
+  Obsolete (2Dh): 0
+  Obsolete (2Eh): 0
+  Reserved (2Fh): 0
+  Reserved (30h): 0
+  Reserved (31h): 0
+  Lost statistics: 0
+  Tape directory invalid at unload: 0
+  Tape system area write failure: 0
+  Tape system area read failure: 0
+  No start of data: 0
+  Loading failure: 0
+  Unrecoverable unload failure: 0
+  Automation interface failure: 0
+  Firmware failure: 0
+  WORM medium - integrity check failed: 0
+  WORM medium - overwrite attempted: 0
+  Reserved parameter code 0x3d, flag: 0
+  Reserved parameter code 0x3e, flag: 0
+  Reserved parameter code 0x3f, flag: 0
+  Reserved parameter code 0x40, flag: 0

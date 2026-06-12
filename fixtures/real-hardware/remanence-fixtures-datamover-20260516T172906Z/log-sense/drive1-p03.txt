@@ -1,0 +1,10 @@
+    HPE       Ultrium 9-SCSI    S2S1
+Read error counter page  [0x3]
+  Errors corrected without substantial delay = 0
+  Errors corrected with possible delays = 0
+  Total rewrites or rereads = 0
+  Total errors corrected = 0
+  Total times correction algorithm processed = 0
+  Total bytes processed = 256
+  Total uncorrected errors = 0
+  Reserved or vendor specific [0x8000] = 0

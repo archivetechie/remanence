@@ -1,0 +1,17 @@
+[package]
+name        = "remanence-bru"
+description = "Read-only BRU/BRU-PE legacy format driver for Remanence."
+version     .workspace = true
+edition     .workspace = true
+rust-version.workspace = true
+authors     .workspace = true
+license     .workspace = true
+repository  .workspace = true
+
+[dependencies]
+remanence-format = { path = "../remanence-format" }
+remanence-library = { path = "../remanence-library" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"

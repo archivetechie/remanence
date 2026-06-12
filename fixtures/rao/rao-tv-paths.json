@@ -1,0 +1,109 @@
+{
+  "vector_id": "RAO-TV-PATHS",
+  "spec_section": "13.1",
+  "status": "pinned-at-generation",
+  "independent_rederivation": "verified by tools/verify_rao_vectors_independent.py",
+  "inputs": {
+    "chunk_size": 4096,
+    "object_id": "00000000-0000-4000-8000-000000000105",
+    "caller_object_id": "rao-tv-paths",
+    "write_timestamp": "2026-01-01T00:00:00Z",
+    "metadata_preservation": "minimal",
+    "manifest_file_id": "00000000-0000-4000-8000-000000000105",
+    "entries": [
+      {
+        "entry_type": "regular",
+        "path": "unicode/vidéo.txt",
+        "file_id": "00000000-0000-4000-8000-000000000151",
+        "size_bytes": 10,
+        "link_target": null,
+        "mtime": null,
+        "executable": null
+      },
+      {
+        "entry_type": "regular",
+        "path": "long/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bin",
+        "file_id": "00000000-0000-4000-8000-000000000152",
+        "size_bytes": 10,
+        "link_target": null,
+        "mtime": null,
+        "executable": null
+      },
+      {
+        "entry_type": "regular",
+        "path": "inline-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "file_id": "00000000-0000-4000-8000-000000000153",
+        "size_bytes": 12,
+        "link_target": null,
+        "mtime": null,
+        "executable": null
+      }
+    ]
+  },
+  "expected": {
+    "stored_size_bytes": 20480,
+    "stored_size_blocks": 5,
+    "stored_digest": "4ac79125942a54af849cc91704e74337d2c909e2a1ee055a0edb7d9848f4fa05",
+    "first_block_sha256": "d0d8e8525905b80cc11008341b6bd2993f089035e7ed0ece0bca9298ee299714",
+    "manifest_cbor_len": 938,
+    "manifest_cbor_hex": "a7696f626a6563745f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303130356a6368756e6b5f73697a651910006c66696c655f656e747269657383a8647061746872756e69636f64652f766964c3a96f2e7478746766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303135316a65786563757461626c65f66a73697a655f62797465730a6b6368756e6b5f636f756e74016b66696c655f7368613235365820625e8272257b97141028022723d22f77b29daa8ba1b1d302e80a0e2b47d648036f66697273745f6368756e6b5f6c626101781a6d657461646174615f707265736572766174696f6e5f64617461a0a86470617468786f6c6f6e672f6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161612e62696e6766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303135326a65786563757461626c65f66a73697a655f62797465730a6b6368756e6b5f636f756e74016b66696c655f7368613235365820c93f1e4d27896b82b0037047ef729b334aebde599ff77d6eb75728505b6625976f66697273745f6368756e6b5f6c626102781a6d657461646174615f707265736572766174696f6e5f64617461a0a864706174687864696e6c696e652d6262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303135336a65786563757461626c65f66a73697a655f62797465730c6b6368756e6b5f636f756e74016b66696c655f73686132353658208377dc1d6ff7729305f8f64261a90a19f8d51346f2797928cb5e50c6b16571ed6f66697273745f6368756e6b5f6c626103781a6d657461646174615f707265736572766174696f6e5f64617461a06e736368656d615f76657273696f6e016f6f626a6563745f6d65746164617461a07063616c6c65725f6f626a6563745f69646c72616f2d74762d70617468737365787465726e616c5f7265666572656e63657380",
+    "manifest_sha256": "9e5d68ce039924581919ee5465806ae8c9a3d110b4ea390f16a0dd513ea226cf",
+    "file_payloads": [
+      {
+        "path": "unicode/vidéo.txt",
+        "size_bytes": 10,
+        "sha256": "625e8272257b97141028022723d22f77b29daa8ba1b1d302e80a0e2b47d64803"
+      },
+      {
+        "path": "long/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bin",
+        "size_bytes": 10,
+        "sha256": "c93f1e4d27896b82b0037047ef729b334aebde599ff77d6eb75728505b662597"
+      },
+      {
+        "path": "inline-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "size_bytes": 12,
+        "sha256": "8377dc1d6ff7729305f8f64261a90a19f8d51346f2797928cb5e50c6b16571ed"
+      }
+    ],
+    "symlinks": [],
+    "directories": [],
+    "file_layouts": [
+      {
+        "entry_type": "regular",
+        "path": "unicode/vidéo.txt",
+        "pax_header_offset": 1024,
+        "data_offset": 4096,
+        "first_chunk_lba": 1,
+        "chunk_count": 1,
+        "pad_spaces": 1785
+      },
+      {
+        "entry_type": "regular",
+        "path": "long/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bin",
+        "pax_header_offset": 4608,
+        "data_offset": 8192,
+        "first_chunk_lba": 2,
+        "chunk_count": 1,
+        "pad_spaces": 2203
+      },
+      {
+        "entry_type": "regular",
+        "path": "inline-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pax_header_offset": 8704,
+        "data_offset": 12288,
+        "first_chunk_lba": 3,
+        "chunk_count": 1,
+        "pad_spaces": 2214
+      }
+    ],
+    "manifest_layout": {
+      "entry_type": "regular",
+      "path": "_remanence/manifest.cbor",
+      "pax_header_offset": 12800,
+      "data_offset": 16384,
+      "first_chunk_lba": 4,
+      "chunk_count": 1,
+      "pad_spaces": 2230
+    }
+  }
+}

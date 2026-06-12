@@ -1,0 +1,13 @@
+    inquiry cdb: [12 00 00 00 24 00]
+    mode sense(10) cdb: [5a 00 1f 00 00 00 00 10 00 00]
+    HPE       MSL3040           3350   peripheral_type: medium changer [0x8]
+Mode parameter header from MODE SENSE(10):
+  Mode data length=36, medium type=0x00, specific param=0x00, longlba=0
+  Block descriptor length=8
+> General mode parameter block descriptors:
+   Density code=0x0
+ 00     00 00 00 00 00 00 00 00
+
+>> Device capabilities, page_control: current
+ 00     1f 12 0a 07 0a 0a 00 0a  00 00 00 00 00 0a 00 0a
+ 10     00 00 00 00

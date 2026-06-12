@@ -1,0 +1,109 @@
+{
+  "vector_id": "RAO-TV-ORDER",
+  "spec_section": "13.1",
+  "status": "pinned-at-generation",
+  "independent_rederivation": "verified by tools/verify_rao_vectors_independent.py",
+  "inputs": {
+    "chunk_size": 4096,
+    "object_id": "00000000-0000-4000-8000-000000000107",
+    "caller_object_id": "rao-tv-order",
+    "write_timestamp": "2026-01-01T00:00:00Z",
+    "metadata_preservation": "minimal",
+    "manifest_file_id": "00000000-0000-4000-8000-000000000107",
+    "entries": [
+      {
+        "entry_type": "regular",
+        "path": "z-last.txt",
+        "file_id": "00000000-0000-4000-8000-000000000171",
+        "size_bytes": 22,
+        "link_target": null,
+        "mtime": null,
+        "executable": null
+      },
+      {
+        "entry_type": "regular",
+        "path": "a-first.txt",
+        "file_id": "00000000-0000-4000-8000-000000000172",
+        "size_bytes": 23,
+        "link_target": null,
+        "mtime": null,
+        "executable": null
+      },
+      {
+        "entry_type": "regular",
+        "path": "m-middle.txt",
+        "file_id": "00000000-0000-4000-8000-000000000173",
+        "size_bytes": 22,
+        "link_target": null,
+        "mtime": null,
+        "executable": null
+      }
+    ]
+  },
+  "expected": {
+    "stored_size_bytes": 20480,
+    "stored_size_blocks": 5,
+    "stored_digest": "e26ea543be10da68bf64bc0e21820c8515da08c4a17f241c4bd2a62ee5254fb1",
+    "first_block_sha256": "2b412755a7503d9f18838d603e9ef901bc5a113303dac0f0aeaf98d1f7758c1c",
+    "manifest_cbor_len": 740,
+    "manifest_cbor_hex": "a7696f626a6563745f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303130376a6368756e6b5f73697a651910006c66696c655f656e747269657383a864706174686a7a2d6c6173742e7478746766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303137316a65786563757461626c65f66a73697a655f6279746573166b6368756e6b5f636f756e74016b66696c655f7368613235365820e340cc19a347c01c3a44a45d12cb0ec958153738fc70a619b1f26858ba9275bf6f66697273745f6368756e6b5f6c626101781a6d657461646174615f707265736572766174696f6e5f64617461a0a864706174686b612d66697273742e7478746766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303137326a65786563757461626c65f66a73697a655f6279746573176b6368756e6b5f636f756e74016b66696c655f736861323536582080c8e9a8167f1218032b2fc2d5d137d48652e4175750030b1e040b258cdf798a6f66697273745f6368756e6b5f6c626102781a6d657461646174615f707265736572766174696f6e5f64617461a0a864706174686c6d2d6d6964646c652e7478746766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303137336a65786563757461626c65f66a73697a655f6279746573166b6368756e6b5f636f756e74016b66696c655f7368613235365820ea55f55ca3bc50697c9c40424833d4dad7c48cade434a2fe2366ea9507d6c4676f66697273745f6368756e6b5f6c626103781a6d657461646174615f707265736572766174696f6e5f64617461a06e736368656d615f76657273696f6e016f6f626a6563745f6d65746164617461a07063616c6c65725f6f626a6563745f69646c72616f2d74762d6f726465727365787465726e616c5f7265666572656e63657380",
+    "manifest_sha256": "27553ae5cbba055ec5705b542336f6f316693d485f814e2fa9f47631c61c5ebd",
+    "file_payloads": [
+      {
+        "path": "z-last.txt",
+        "size_bytes": 22,
+        "sha256": "e340cc19a347c01c3a44a45d12cb0ec958153738fc70a619b1f26858ba9275bf"
+      },
+      {
+        "path": "a-first.txt",
+        "size_bytes": 23,
+        "sha256": "80c8e9a8167f1218032b2fc2d5d137d48652e4175750030b1e040b258cdf798a"
+      },
+      {
+        "path": "m-middle.txt",
+        "size_bytes": 22,
+        "sha256": "ea55f55ca3bc50697c9c40424833d4dad7c48cade434a2fe2366ea9507d6c467"
+      }
+    ],
+    "symlinks": [],
+    "directories": [],
+    "file_layouts": [
+      {
+        "entry_type": "regular",
+        "path": "z-last.txt",
+        "pax_header_offset": 1024,
+        "data_offset": 4096,
+        "first_chunk_lba": 1,
+        "chunk_count": 1,
+        "pad_spaces": 1793
+      },
+      {
+        "entry_type": "regular",
+        "path": "a-first.txt",
+        "pax_header_offset": 4608,
+        "data_offset": 8192,
+        "first_chunk_lba": 2,
+        "chunk_count": 1,
+        "pad_spaces": 2304
+      },
+      {
+        "entry_type": "regular",
+        "path": "m-middle.txt",
+        "pax_header_offset": 8704,
+        "data_offset": 12288,
+        "first_chunk_lba": 3,
+        "chunk_count": 1,
+        "pad_spaces": 2303
+      }
+    ],
+    "manifest_layout": {
+      "entry_type": "regular",
+      "path": "_remanence/manifest.cbor",
+      "pax_header_offset": 12800,
+      "data_offset": 16384,
+      "first_chunk_lba": 4,
+      "chunk_count": 1,
+      "pad_spaces": 2230
+    }
+  }
+}

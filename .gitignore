@@ -1,0 +1,37 @@
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Editor swap/backup files
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+
+# Local-only secrets / state
+.env
+.envrc.local
+.claude/scheduled_tasks.lock
+
+# Devloop dispatcher runtime state (locks + per-entry dispatch markers).
+# The journal/*.json files ARE the tracked handoff channel; .dispatch is transient.
+journal/.dispatch/
+
+# Locally downloaded standards references. Keep source URLs/checksums in docs.
+docs/reference/posix/*.html
+
+# Local SCSI dump captured during hardware work; keep curated references under docs/.
+lto.txt
+
+# QuadStor patch artifacts (the live tree under /quadstorvtl is not in this repo)
+patches/**/originals/
+
+# Fixtures: keep .bin / .txt; ignore any captured personal traces
+fixtures/**/*.log
+
+# Raw real-hardware capture bundles live alongside their extracted form.
+# Keep the extracted directory tracked (it's how the parsers consume them);
+# the tarball is redundant and large.
+fixtures/real-hardware/*.tar.gz
