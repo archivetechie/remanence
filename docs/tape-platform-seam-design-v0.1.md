@@ -4,7 +4,7 @@
 decision** (2026-06-11, owner). This note records the design so it is not
 re-derived — or re-proposed at full scope — later.
 
-**Context:** REM-PARITY 1.0 (`rem-parity-1.0-specification.md`) reframed the
+**Context:** REM-PARITY 1.0 (`specs/rem-parity-1.0-specification.md`) reframed the
 native on-tape layout as *a* format with an identifier, payload-agnostic by
 its own Section 4. That raised the question this note answers: can remanence
 serve as a format-agnostic tape library/drive management platform — the way

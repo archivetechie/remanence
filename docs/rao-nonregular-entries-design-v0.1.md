@@ -2,7 +2,7 @@
 
 **Status:** decision approved (2026-06-11, owner); spec edit + implementation
 **deferred**. This note is the driving record for a later update to
-`rao-1.0-specification.md`, the RAO work order
+`specs/rao-1.0-specification.md`, the RAO work order
 (`design-rem-archive-object-format.md`), and `remanence-format`.
 
 ## 1. Decision
@@ -172,7 +172,7 @@ plus `entry_type`/`link_target` where applicable."
 5. **`entry_type` encoding** (text vs small unsigned) and resulting CBOR key
    sort order.
 
-## 10. Change checklist — `rao-1.0-specification.md`
+## 10. Change checklist — `specs/rao-1.0-specification.md`
 
 - §1.5 — drop "regular files only"; state symlinks + directories are encoded;
   hardlinks remain reserved.

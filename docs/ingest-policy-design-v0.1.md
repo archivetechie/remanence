@@ -179,7 +179,7 @@ not to be slipped into a wire commit.
 | Piece | Home |
 | --- | --- |
 | Ruleset grammar + evaluation, conformance scan, wrapper creation, ingest report | sutradhara (orchestrator) + shared by `rem archive build --rules` |
-| Wrap suffix convention (informative spec section) | `rao-1.0-specification.md`, pre-freeze |
+| Wrap suffix convention (informative spec section) | `specs/rao-1.0-specification.md`, pre-freeze |
 | Catalog ingest records (ruleset id, wrap rows, exclusion counts, blob member index) | sutradhara catalog (Layer 5 surfaces stay unchanged) |
 | Restore unwrap (default) / `--no-unwrap` | rem restore path + sutradhara restore orchestration |
 | RAO 1.1 manifest annotation | future spec minor-version note |

@@ -2,7 +2,7 @@
 //!
 //! This crate absorbs Amber's useful cryptographic construction into
 //! Remanence as the isolated `remanence-aead` boundary. It implements the RAO
-//! encrypted representation from `docs/rao-1.0-specification.md`: the 128-byte
+//! encrypted representation from `specs/rao-1.0-specification.md`: the 128-byte
 //! `RAO1` header, deterministic salt derivation, HKDF key split, metadata
 //! frame, age-style ChaCha20-Poly1305 STREAM payload, footer/fill validation,
 //! and keyless inspection geometry. It intentionally contains no legacy AOF1

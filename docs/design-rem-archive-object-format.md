@@ -33,7 +33,7 @@
 > **Amendment 2 (2026-06-11, claude — approved by owner):** §10 adds the
 > code-merge plan for absorbing `amber_core` — module-by-module merge map,
 > the crate decision (`remanence-aead`), vector/fuzz migration, licensing.
-> The published implementation target is `docs/rao-1.0-specification.md`;
+> The published implementation target is `specs/rao-1.0-specification.md`;
 > §9 decisions are now all resolved.
 
 ---
@@ -309,7 +309,7 @@ plaintext on-tape format byte-stable (existing rem-tar tests stay green).
 
 ## 9. Decisions to confirm before/while implementing
 1. **Format name** — RAO vs `rem-tar-v2` vs other. It may become a public spec; name
-   deliberately. *(Resolved: RAO; published as `rao-1.0-specification.md`.)*
+   deliberately. *(Resolved: RAO; published as `specs/rao-1.0-specification.md`.)*
 2. **Encrypted manifest = confidential** (recommended: encrypt the index too) vs
    plaintext index for self-description without the key. *Recommend confidential.*
    *(Resolved by spec: confidential — §5.1, B.5.)*
@@ -330,7 +330,7 @@ plaintext on-tape format byte-stable (existing rem-tar tests stay green).
 
 Tasks B–F above stand; this section adds the code-level map for executing
 task B as a clean merge. **The normative implementation target is the
-published `docs/rao-1.0-specification.md`** (cited as "spec §" below;
+published `specs/rao-1.0-specification.md`** (cited as "spec §" below;
 `rao-v1-specification.md` remains the internal audit-trail copy). Where
 amber's code and the spec disagree, the spec wins — the divergences are
 deliberate spec decisions, not porting slack.

@@ -68,7 +68,8 @@ crates/remanence-api       Layer 5 gRPC service implementations
 crates/remanence-daemon    rem-daemon binary/service host
 crates/remanence-cli       rem and rem-debug command surfaces
 crates/remanence-chaos     Chaos/fault-injection scaffolding
-docs/                      Specs, design notes, review notes, roadmap
+specs/                     Published format specifications
+docs/                      Design notes, review notes, roadmap
 proto/                     Layer 5 protobuf contract
 fixtures/                  Captured hardware/SCSI fixtures
 journal/                   Dated JSON work journal

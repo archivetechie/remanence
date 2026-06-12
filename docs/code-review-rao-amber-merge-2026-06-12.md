@@ -4,8 +4,8 @@
 `remanence-aead` crate, `remanence-format` RAO integration,
 `remanence-parity` bootstrap object rows, `remanence-state` catalog rows,
 stream/api/cli plumbing, `fixtures/rao/`, `fuzz/`, and the in-commit spec
-amendments. Reviewed against `rao-1.0-specification.md` ("RAO §") and
-`rem-parity-1.0-specification.md` ("PAR §") as normative, plus the
+amendments. Reviewed against `specs/rao-1.0-specification.md` ("RAO §") and
+`specs/rem-parity-1.0-specification.md` ("PAR §") as normative, plus the
 Amendment 2 merge map and Rust/security/robustness criteria.
 
 **Reviewers:** claude (crypto core line-by-line + synthesis) with three
@@ -170,7 +170,7 @@ recompute).
 currently accepted. **Fix:** validate after extracting `key`.
 
 ### M5 — PAR §16.4 now contradicts §8.2.1; leakage analysis missing; stale Appendix C cross-reference
-`docs/rem-parity-1.0-specification.md` §16.4 still says the format "defines
+`specs/rem-parity-1.0-specification.md` §16.4 still says the format "defines
 no per-object descriptive fields" and cites "Appendix C item 2" which now
 points at the wrong item after renumbering. The leakage paragraph the old
 item promised was never written.
