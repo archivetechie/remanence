@@ -1,0 +1,12 @@
+    HP        Ultrium 7-SCSI    Q387
+Sequential access device page (ssc-3)
+  Data bytes received with WRITE commands: 0 GB
+  Data bytes written to media by WRITE commands: 0 GB
+  Data bytes read from media by READ commands: 1182 GB
+  Data bytes transferred by READ commands: 1196 GB
+  Maximum native capacity in device object buffer: 598 MB
+  Cleaning action required
+  Vendor specific parameter [0x8000] value: 162589269
+  Vendor specific parameter [0x8001] value: 1599
+  Vendor specific parameter [0x8002] value: 0
+  Vendor specific parameter [0x8003] value: 11729862

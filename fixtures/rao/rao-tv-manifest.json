@@ -1,0 +1,86 @@
+{
+  "vector_id": "RAO-TV-MANIFEST",
+  "spec_section": "13.1",
+  "status": "pinned-at-generation",
+  "independent_rederivation": "verified by tools/verify_rao_vectors_independent.py",
+  "inputs": {
+    "chunk_size": 4096,
+    "object_id": "00000000-0000-4000-8000-000000000108",
+    "caller_object_id": "rao-tv-manifest",
+    "write_timestamp": "2026-01-01T00:00:00Z",
+    "metadata_preservation": "minimal",
+    "manifest_file_id": "00000000-0000-4000-8000-000000000108",
+    "entries": [
+      {
+        "entry_type": "regular",
+        "path": "manifest/alpha.bin",
+        "file_id": "00000000-0000-4000-8000-000000000181",
+        "size_bytes": 17,
+        "link_target": null,
+        "mtime": null,
+        "executable": null
+      },
+      {
+        "entry_type": "regular",
+        "path": "manifest/beta.bin",
+        "file_id": "00000000-0000-4000-8000-000000000182",
+        "size_bytes": 513,
+        "link_target": null,
+        "mtime": null,
+        "executable": null
+      }
+    ]
+  },
+  "expected": {
+    "stored_size_bytes": 16384,
+    "stored_size_blocks": 4,
+    "stored_digest": "f22acf854102ef7161768604de74903a42e12c974ea4f37f6e68bcb7ed65d91b",
+    "first_block_sha256": "5fbf041d2f6b58a648c89d8bc8477acd544582aab9aa3991d22c48069183e6f2",
+    "manifest_cbor_len": 565,
+    "manifest_cbor_hex": "a7696f626a6563745f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303130386a6368756e6b5f73697a651910006c66696c655f656e747269657382a86470617468726d616e69666573742f616c7068612e62696e6766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303138316a65786563757461626c65f66a73697a655f6279746573116b6368756e6b5f636f756e74016b66696c655f7368613235365820c8b994385c6930e2379c81410b098be51ce679bf6d1b938ee1d4844d0b74bf7e6f66697273745f6368756e6b5f6c626101781a6d657461646174615f707265736572766174696f6e5f64617461a0a86470617468716d616e69666573742f626574612e62696e6766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303138326a65786563757461626c65f66a73697a655f62797465731902016b6368756e6b5f636f756e74016b66696c655f73686132353658205eb23cb7d034e3450eb5784e08b0916f1cf2330bdc385e8051e04dd69a69b4836f66697273745f6368756e6b5f6c626102781a6d657461646174615f707265736572766174696f6e5f64617461a06e736368656d615f76657273696f6e016f6f626a6563745f6d65746164617461a07063616c6c65725f6f626a6563745f69646f72616f2d74762d6d616e69666573747365787465726e616c5f7265666572656e63657380",
+    "manifest_sha256": "b139fd8cc506b970c7a2782852cf1ce116806560620aedb86718536eb763e61e",
+    "file_payloads": [
+      {
+        "path": "manifest/alpha.bin",
+        "size_bytes": 17,
+        "sha256": "c8b994385c6930e2379c81410b098be51ce679bf6d1b938ee1d4844d0b74bf7e"
+      },
+      {
+        "path": "manifest/beta.bin",
+        "size_bytes": 513,
+        "sha256": "5eb23cb7d034e3450eb5784e08b0916f1cf2330bdc385e8051e04dd69a69b483"
+      }
+    ],
+    "symlinks": [],
+    "directories": [],
+    "file_layouts": [
+      {
+        "entry_type": "regular",
+        "path": "manifest/alpha.bin",
+        "pax_header_offset": 1024,
+        "data_offset": 4096,
+        "first_chunk_lba": 1,
+        "chunk_count": 1,
+        "pad_spaces": 1785
+      },
+      {
+        "entry_type": "regular",
+        "path": "manifest/beta.bin",
+        "pax_header_offset": 4608,
+        "data_offset": 8192,
+        "first_chunk_lba": 2,
+        "chunk_count": 1,
+        "pad_spaces": 2297
+      }
+    ],
+    "manifest_layout": {
+      "entry_type": "regular",
+      "path": "_remanence/manifest.cbor",
+      "pax_header_offset": 9216,
+      "data_offset": 12288,
+      "first_chunk_lba": 3,
+      "chunk_count": 1,
+      "pad_spaces": 1718
+    }
+  }
+}

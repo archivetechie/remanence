@@ -1,0 +1,200 @@
+[
+  {
+    "uuid": "d5353852-8e90-40d1-a384-4945e4e5da77",
+    "datetime": "2026-06-12T00:15:36+02:00",
+    "author": "codex",
+    "subject": "Amber merge: RAO live plaintext tar evidence",
+    "idref": "a21e0433-e99a-4691-a5d1-dd42e5767256",
+    "status": "complete",
+    "handoff_to": null,
+    "round": 29,
+    "summary": "Closed the QuadStor live-tape standard-tar evidence gap left by round 28. Remanence now exposes rem-debug archive export-object, a content-blind stored-object export path that mounts by locator, verifies the BOT identity, sets the catalogued fixed block size, spaces to the object tape file, copies exactly the catalogued fixed blocks to --out, and reports the stored-object SHA-256 plus block geometry. The existing payload read/verify path now shares the same mount/configure helper. The system harness now binds rem.tape.export_object to that CLI command, and RAO-LIVE RAOL.3 exports each plaintext live tape object at 4 KiB and 256 KiB block sizes and verifies it independently with standard tar -b using blocking factors 8 and 512 before proceeding to the encrypted round trips. Final clean QuadStor evidence is system report reports/2026-06-12-001429-rao-live-quadstor-tape-rao-acceptance.json with RAOL.0 through RAOL.4 all ok and no freshness warnings. Pushed Remanence commit e835575 and system commit c3e7cdc. Physical MSL3040 coverage remains a separate open item because no physical MSL3040 target was visible in this environment. Verification passed: cargo fmt --check; cargo test; cargo clippy -- -D warnings; cargo build --release; cargo build --release --workspace --bins; cargo clean -p remanence-daemon --release && cargo build --release -p remanence-daemon --bin rem-daemon; target/release/rem-debug archive export-object --help; make reset; make up; make scenario-rao-live; uv run pytest -q; jq empty reports/2026-06-12-001429-rao-live-quadstor-tape-rao-acceptance.json; git diff --check."
+  },
+  {
+    "uuid": "78fc2bb3-7954-4fe1-a5d6-d1c67d1e559f",
+    "datetime": "2026-06-12T00:22:30+02:00",
+    "author": "codex",
+    "subject": "RAO freeze: plaintext interop gate",
+    "idref": "a21e0433-e99a-4691-a5d1-dd42e5767256",
+    "status": "complete",
+    "handoff_to": null,
+    "round": 30,
+    "summary": "Added an executable Section 14 plaintext-interop gate to tools/verify_rao_vectors_independent.py. The independent Python verifier now optionally writes the regenerated RAO-TV-P1 and plaintext RAO-TV-D1 streams to temporary archives and checks extraction equality with GNU tar, bsdtar, and Python tarfile, including the manifest file. The gate requires bsdtar by default for freeze use and has an explicit --allow-missing-bsdtar degraded mode for hosts where only GNU tar and Python tarfile are installed. fixtures/rao/README.md now records the exact command. Full local gate passed by extracting Ubuntu's libarchive-tools package under /tmp and prepending its bsdtar to PATH, without installing system packages. The physical MSL3040 live round-trip remains open because no physical MSL3040 target is visible in this environment. Verification passed: python3 tools/verify_rao_vectors_independent.py; python3 tools/verify_rao_vectors_independent.py --check-plaintext-interop --allow-missing-bsdtar; python3 tools/verify_rao_vectors_independent.py --check-plaintext-interop (expected failure before temporary bsdtar: bsdtar not found on PATH); apt-get download libarchive-tools under /tmp, PATH=/tmp/.../usr/bin:$PATH python3 tools/verify_rao_vectors_independent.py --check-plaintext-interop; python3 -m py_compile tools/verify_rao_vectors_independent.py; cargo fmt --check; cargo test; cargo clippy -- -D warnings; cargo build --release; cargo build --release --workspace --bins; git diff --check."
+  },
+  {
+    "uuid": "e4638930-15bc-4a60-a0de-1f9bf3ba61d9",
+    "datetime": "2026-06-12T00:29:04+02:00",
+    "author": "codex",
+    "subject": "RAO freeze: salt derivation conformance",
+    "idref": "a21e0433-e99a-4691-a5d1-dd42e5767256",
+    "status": "complete",
+    "handoff_to": null,
+    "round": 31,
+    "summary": "Added an explicit remanence-aead test for RAO Section 14 criterion 11. The test demonstrates that resealing the same canonical object under the same root key is byte-identical with stable salts and derived keys; changing only the content changes salts, derived keys, ciphertext, and stored digest; changing only object_id does the same; and an otherwise self-consistent envelope sealed under a non-derived salt fails keyed open with SaltDerivationMismatch rather than a generic authentication failure. This is test evidence only; production code already enforced the same salt recomputation in open and range-open. Physical MSL3040 live round-trip coverage remains open because no physical MSL3040 target is visible in this environment. Verification passed: cargo test -p remanence-aead salt_derivation_conformance_covers_epoch_content_and_object_id -- --nocapture; cargo test -p remanence-aead; cargo fmt --check; git diff --check; cargo test; cargo clippy -- -D warnings; cargo build --release; cargo build --release --workspace --bins."
+  },
+  {
+    "uuid": "c6f6d7ac-1ad2-4567-94cc-72168ce89c69",
+    "datetime": "2026-06-12T00:33:43+02:00",
+    "author": "codex",
+    "subject": "RAO freeze: failed-seal no-footer evidence",
+    "idref": "a21e0433-e99a-4691-a5d1-dd42e5767256",
+    "status": "complete",
+    "handoff_to": null,
+    "round": 32,
+    "summary": "Added remanence-aead test coverage for the no-footer half of RAO Section 14 criterion 7. The test retains partial sealer outputs and proves that digest mismatch, size mismatch via trailing plaintext, and an injected output I/O failure before the completion marker all fail without reaching the derived footer offset or writing RAO1_STREAM_END. This is envelope-layer evidence only; the durable-catalog-reference half of criterion 7 remains separate API/state evidence. Physical MSL3040 live round-trip coverage remains open because no physical MSL3040 target is visible in this environment. Verification passed: cargo test -p remanence-aead failed_seal_paths_do_not_write_completion_footer -- --nocapture; cargo test -p remanence-aead; cargo fmt --check; git diff --check; cargo test; cargo clippy -- -D warnings; cargo build --release; cargo build --release --workspace --bins."
+  },
+  {
+    "uuid": "348e529a-7611-42a3-b839-1f35f4f201dc",
+    "datetime": "2026-06-12T00:40:47+02:00",
+    "author": "codex",
+    "subject": "RAO freeze: failed-write catalog reference evidence",
+    "idref": "a21e0433-e99a-4691-a5d1-dd42e5767256",
+    "status": "complete",
+    "handoff_to": null,
+    "round": 33,
+    "summary": "Added remanence-api test coverage for the durable-catalog-reference half of RAO Section 14 criterion 7. encrypted_write_transfer_failure_leaves_no_durable_catalog_reference injects a deterministic BlockSink write_block failure after the no-parity bootstrap boundary during an encrypted selected-tape write, then proves only the bootstrap framing reached the in-memory tape and no object row, native-object listing entry, or committed tape-file row was durably projected. The non-regular-source failed-build test now provisions a real pool/tape fixture and asserts the failed build leaves no tape I/O and no durable object or tape-file reference. Together with round 32's no-footer evidence, criterion 7 is covered for local envelope/API failure modes. Physical MSL3040 live round-trip coverage remains open because no physical MSL3040 target is visible in this environment. Verification passed: cargo test -p remanence-api encrypted_write_transfer_failure_leaves_no_durable_catalog_reference -- --nocapture; cargo test -p remanence-api write_object_to_pool_rejects_non_regular_source_as_invalid_argument -- --nocapture; cargo test -p remanence-api; cargo fmt --check; git diff --check; cargo test; cargo clippy -- -D warnings; cargo build --release; cargo build --release --workspace --bins."
+  },
+  {
+    "uuid": "2076d397-7db0-480f-a5a6-e9fe4c51b323",
+    "datetime": "2026-06-12T00:49:18+02:00",
+    "author": "codex",
+    "subject": "RAO freeze: complete negative-vector fixture gate",
+    "idref": "a21e0433-e99a-4691-a5d1-dd42e5767256",
+    "status": "complete",
+    "handoff_to": null,
+    "round": 34,
+    "summary": "Closed the stale negative-vector metadata gap. The five Section 13.5 negative-vector manifests now carry status=complete instead of partial, and the Rust fixture gates assert both that status and the exact expected case-id lists for plaintext writer failures, plaintext reader byte failures, manifest-profile/schema failures, encrypted inner cross-check failures, and encrypted envelope failures. This turns omission of a required negative vector into a test failure instead of a silently missing manifest row. fixtures/rao/README.md now reflects the complete executable negative suite. Physical MSL3040 live round-trip coverage remains open because no physical MSL3040 target is visible in this environment. Verification passed: cargo test -p remanence-format --test rao_negative_vectors -- --nocapture; cargo test -p remanence-format manifest_negative_vectors_match_manifest_errors -- --nocapture; cargo test -p remanence-format; jq empty fixtures/rao/negative-envelope.json fixtures/rao/negative-inner.json fixtures/rao/negative-manifest.json fixtures/rao/negative-plaintext-reader.json fixtures/rao/negative-writer.json; cargo fmt --check; git diff --check; cargo test; cargo clippy -- -D warnings; cargo build --release; cargo build --release --workspace --bins."
+  },
+  {
+    "uuid": "0aef8712-a4fc-4e64-b1b7-877138ecf0c1",
+    "datetime": "2026-06-12T00:53:55+02:00",
+    "author": "codex",
+    "subject": "RAO freeze: encrypted PFR ciphertext-range evidence",
+    "idref": "a21e0433-e99a-4691-a5d1-dd42e5767256",
+    "status": "complete",
+    "handoff_to": null,
+    "round": 35,
+    "summary": "Added explicit remanence-format coverage for RAO Section 14 criterion 5. encrypted_file_pfr_fetches_boundary_and_final_chunk_ciphertext_ranges drives the public encrypted file PFR helper, compares returned bytes to the source payload, and pins the derived ciphertext stored_range_start and stored_range_len using the RAO Section 6.3 cipher_offset formula. The fixture covers both a request spanning a chunk boundary and a request in the member file's final payload chunk. Physical MSL3040 live round-trip coverage remains open because no physical MSL3040 target is visible in this environment. Verification passed: cargo test -p remanence-format encrypted_file_pfr_fetches_boundary_and_final_chunk_ciphertext_ranges -- --nocapture; cargo test -p remanence-format; jq empty journal/2026-06-12.json; cargo fmt --check; git diff --check; cargo test; cargo clippy -- -D warnings; cargo build --release; cargo build --release --workspace --bins."
+  },
+  {
+    "uuid": "2e8be953-3c5e-425f-9ee1-8c9239457d23",
+    "datetime": "2026-06-12T01:06:57+02:00",
+    "author": "codex",
+    "subject": "RAO freeze: tape block-size equals chunk-size guard",
+    "idref": "a21e0433-e99a-4691-a5d1-dd42e5767256",
+    "status": "complete",
+    "handoff_to": null,
+    "round": 36,
+    "summary": "Closed the RAO Appendix C block-size invariant gap for pool writes. Pool tape selection now rejects any tape whose catalogued fixed block size differs from the configured pool block_size, and the selected-tape write entrypoint revalidates the catalogued tape block size against both the selected geometry and the pool config before preparing bytes or touching the tape sink. Added negative remanence-api coverage proving both pool selection and direct selected-tape writes reject the mismatch with no block writes or filemarks, plus positive non-default 8192-byte plaintext and encrypted write evidence proving the selected tape block size becomes the RAO chunk size in the write report, BOT bootstrap, catalog tape row, global pax metadata, and encrypted envelope header. Physical MSL3040 live round-trip coverage remains open because no physical MSL3040 target is visible in this environment. Verification passed: cargo test -p remanence-api block_size -- --nocapture; cargo test -p remanence-api; jq empty journal/2026-06-12.json; cargo fmt --check; git diff --check; cargo test; cargo clippy -- -D warnings; cargo build --release; cargo build --release --workspace --bins."
+  },
+  {
+    "uuid": "a8de6660-fbbe-4f59-b626-9d47020d2e24",
+    "datetime": "2026-06-12T01:16:45+02:00",
+    "author": "codex",
+    "subject": "RAO freeze: encrypted object_id envelope cap guard",
+    "idref": "a21e0433-e99a-4691-a5d1-dd42e5767256",
+    "status": "complete",
+    "handoff_to": null,
+    "round": 37,
+    "summary": "Closed the executable half of RAO Appendix C item 2 for encrypted portable builds. The shared encrypted RAO writer now validates the fixed RAO1 envelope preconditions for chunk_size, key_id, and the 64-byte object_id header field before materializing plaintext bytes, reading streaming sources, or writing stored blocks. The CLI build path validates encrypted --object-id before source collection or output creation, while API pool writes continue to mint UUID object IDs that fit the envelope field by construction. Added remanence-format coverage proving overlong encrypted object_id rejects both materialized and streaming encrypted writers before stored writes, with a panic reader proving no source read occurs, plus remanence-cli coverage proving encrypted build rejects a 65-byte object_id without creating the requested output file. Physical MSL3040 live round-trip coverage remains open because no physical MSL3040 target is visible in this environment. Verification passed: cargo test -p remanence-format encrypted_writer_rejects_overlong_object_id_before_plaintext_work -- --nocapture; cargo test -p remanence-cli archive_build_encrypted_rejects_overlong_object_id_before_output -- --nocapture; jq empty journal/2026-06-12.json; cargo fmt --check; git diff --check; cargo test; cargo clippy -- -D warnings; cargo build --release; cargo build --release --workspace --bins."
+  },
+  {
+    "uuid": "5227c4c0-acf1-4052-b2dc-0008b2130a68",
+    "datetime": "2026-06-12T01:26:39+02:00",
+    "author": "codex",
+    "subject": "RAO freeze: long-term recovery drill",
+    "idref": "a21e0433-e99a-4691-a5d1-dd42e5767256",
+    "status": "complete",
+    "handoff_to": null,
+    "round": 38,
+    "summary": "Closed the local RAO Section 14 criterion 10 evidence gap. tools/verify_rao_vectors_independent.py now has --long-term-recovery-drill, which treats the regenerated objects as stored bytes: standard tar extracts the RAO-TV-P1 payload and _remanence/manifest.cbor, a standalone deterministic-CBOR decoder verifies schema_version, object_id, chunk_size, payload size, chunk_count, and file_sha256, then a generic HKDF/ChaCha20-Poly1305 opener parses and decrypts the RAO-TV-E1 envelope, recomputes the derived salt, verifies footer/fill and plaintext digest, and repeats the same tar/CBOR payload verification on the recovered plaintext. fixtures/rao/README.md records the command. Physical MSL3040 live round-trip coverage remains open because no physical MSL3040 target is visible in this environment. Verification passed: python3 tools/verify_rao_vectors_independent.py; python3 tools/verify_rao_vectors_independent.py --check-plaintext-interop --allow-missing-bsdtar --long-term-recovery-drill; python3 -m py_compile tools/verify_rao_vectors_independent.py; jq empty journal/2026-06-12.json; cargo fmt --check; git diff --check; cargo test; cargo clippy -- -D warnings; cargo build --release; cargo build --release --workspace --bins."
+  },
+  {
+    "uuid": "5c4a1536-1856-49de-8a46-dbe5ac5b85cb",
+    "datetime": "2026-06-12T01:33:56+02:00",
+    "author": "codex",
+    "subject": "RAO freeze: physical MSL3040 harness lane",
+    "idref": "a21e0433-e99a-4691-a5d1-dd42e5767256",
+    "status": "complete",
+    "handoff_to": null,
+    "round": 39,
+    "summary": "Made the remaining RAO Section 14 criterion 9 physical-hardware evidence executable in the system harness. System commit 07443d7 adds scenario_rao_live_msl3040 and contract id rao_live_msl3040, reusing the same RAO live acceptance logic as the green QuadStor RAOL scenario while giving the physical run its own scenario name, RAOM step prefix, and distinct pool ids rao-live-msl3040-4k and rao-live-msl3040-256k. The suite skips this lane by default with an explicit operator-provisioned physical MSL3040 pools/media reason; a manual run can be launched as make scenario-rao-live-msl3040 with REM_CONFIG/REM_LIBRARY pointed at the physical library. This does not close criterion 9 because no physical MSL3040 target is visible in this environment; it removes the harness implementation gap so the remaining work is the external media run and report capture. Verification passed in system: uv run pytest -q tests/test_scenario_rao_live.py tests/test_scenario_rao.py; uv run python contract/module import smoke; git diff --check; uv run pytest -q. Remanence verification for this journal-only update: jq empty journal/2026-06-12.json; cargo fmt --check; git diff --check; cargo test; cargo clippy -- -D warnings; cargo build --release; cargo build --release --workspace --bins."
+  },
+  {
+    "uuid": "a47c14fd-9a13-40f3-a7c1-fcf102d59344",
+    "datetime": "2026-06-12T04:35:55+02:00",
+    "author": "claude",
+    "subject": "Review of RAO encryption merge (amber absorption): 5 High / 12 Medium / 17 Low; report handed to codex",
+    "idref": null,
+    "status": "approved",
+    "handoff_to": "codex",
+    "round": 0,
+    "summary": "Full conformance + quality review of 8118512..HEAD (~13k insertions) against rao-1.0 and rem-parity-1.0 specs: claude line-by-line on remanence-aead, three parallel lanes (format integration, parity/state, tests/vectors/fuzz), all High findings spot-verified in code before publishing. Report: docs/code-review-rao-amber-merge-2026-06-12.md. Verdict: core crypto crate is byte-exact conformant (no RNG dep at all, salt re-derivation on every keyed open, structural DoS defense via allocation-after-authentication); encrypted bootstrap rows structurally CANNOT carry manifest anchors (type-level, decoder-rejected, SQL-revalidated) — the critical confidentiality gate passes; test discipline unusually strong (byte-exact fixtures + genuinely independent Python re-derivation, single-fault negative vectors with completeness gates). Codex amended both published specs in-commit (PAR key-30 object rows §8.2.1; RAO symlink/dir entries per the approved design note) — process-legal pre-freeze, but the amendments dropped two halves of old PAR App C item 2 (overflow path, leakage analysis). Highs: H1 format readers never verify per-file digests (restore mode not default; salvage unimplemented; the FileDigestMismatch vector passes only via a test-only sink); H2 bootstrap object rows unbounded -> tape unfinishable past ~3.5-5.9k objects, no overflow path (spec gap); H3 resume drops pre-resume rows from the authoritative bootstrap (journal key 11 has them, no constructor consumes); H4 archive build violates RAO 8.3 (no fsync before rename, no dir fsync); H5 13.1 positive vector suite missing (blocks freeze criterion 2). Freeze criteria: 4/5/6/11 done; 2 blocked by H5; 3/8/9 partial (bsdtar leg, corpus durability, MSL3040 lane pending). Suggested work order in report. CODEX TASK: work the report top-down (H1 first, H2 spec-first with owner/claude review of the overflow sentence); spec-side decisions (M5, L9, L12, L17) batched as one errata commit for review before code."
+  },
+  {
+    "uuid": "c7a8ff2e-4c78-4d7c-9a2a-a0bcaadcb5d1",
+    "datetime": "2026-06-12T05:27:55+02:00",
+    "author": "codex",
+    "subject": "RAO review follow-up: bsdtar gate made local and CI-reproducible",
+    "idref": "a47c14fd-9a13-40f3-a7c1-fcf102d59344",
+    "status": "complete",
+    "handoff_to": null,
+    "round": 40,
+    "summary": "Addressed the RAO review's M12 reproducibility gap for plaintext interop. Installed Ubuntu libarchive-tools locally with sudo apt-get so /usr/bin/bsdtar is present for the strict Section 14 gate; apt emitted a pending-kernel-upgrade debconf notice, but the package installation completed. CI now installs libarchive-tools and Python cryptography, then runs python3 tools/verify_rao_vectors_independent.py --check-plaintext-interop without the degraded --allow-missing-bsdtar flag, making GNU tar, bsdtar, and Python tarfile interop a normal push/PR gate."
+  },
+  {
+    "uuid": "687fa586-57f2-41ac-a793-56080f6fc3fe",
+    "datetime": "2026-06-12T05:34:20+02:00",
+    "author": "codex",
+    "subject": "RAO review follow-up: vector suite, catalog digests, and parser hardening",
+    "idref": "a47c14fd-9a13-40f3-a7c1-fcf102d59344",
+    "status": "complete",
+    "handoff_to": null,
+    "round": 41,
+    "summary": "Addressed Claude's remaining High and clear Medium RAO review findings after the first H1-H4 commit. H5 now has additional positive plaintext fixtures for empty, empty-file, one-byte, boundary, path, metadata, order, manifest, and nonregular-entry cases, all regenerated and independently checked by Python, Rust, GNU tar, bsdtar, and Python tarfile. M1-M4 harden optional global pax fields, leading-space octal parsing, manifest entry schema validation, and pax keyword grammar. M5/M9/M10/L9/H2-H3 received spec or fixture follow-through. M6 persists plaintext and stored digests in native object-copy catalog rows for direct Layer-5 writes. M7 removes the nonregular catalog-projection panic path. M8 rejects duplicate bootstrap object-row keys. M11 preserves the fuzz corpus. M12 is now a CI gate. Additional low fixes closed L2 key-file zeroization/DerivedKeys cloning, L3 reader-side reserved-path overreject, L5 writer/profile MAX_FILE_ENTRIES enforcement, L6 chunk_count cross-checking, L10 hostile-byte classification, and the metadata_frame_len half of L11. Remaining review items are low/backlog: L4 structured inner gate identifiers, L7 optional external manifest anchor API, L8 full verifier/salvage profile, the unknown-representation half of L11, L13 key-30 scanner/tooling, L14 openat/O_NOFOLLOW restore discipline, L16 plaintext failed-build durability test, L17 overlong-object-id error taxonomy, plus the report's nits."
+  },
+  {
+    "uuid": "03b3b0d0-dbcd-4a47-bbf9-7cce38df58da",
+    "datetime": "2026-06-12T05:58:32+02:00",
+    "author": "codex",
+    "subject": "RAO review follow-up: remaining low findings and backlog split",
+    "idref": "a47c14fd-9a13-40f3-a7c1-fcf102d59344",
+    "status": "complete",
+    "handoff_to": null,
+    "round": 42,
+    "summary": "Closed the remaining bounded Claude review items from round 41. L4 now has structured FormatGate identifiers for inner RAO mismatch classification, with encrypted inner format-gate errors mapped without display-string matching. L7 now has optional manifest_sha256 anchor entry points for materializing, streaming, encrypted reads, CLI mounted reads, and API read-core/write-owner streaming. The unknown-representation half of L11 now projects journal entries with no bootstrap object row as representation=unknown, validates unknown rows as envelope-field-free, and prevents unknown journal replay from downgrading known plaintext/encrypted catalog rows. L16 now has plaintext failed-transfer catalog-durability coverage matching the encrypted test. L17 is resolved spec-side by making the Section 11.2 error table include overlong object_id fields. Nits closed: strict decimal parser rejects leading '+', pax alignment bound is measured from the original rounded minimum, ignored ustar names are not UTF-8-validated when a pax path override exists, encrypted header chunk-size mismatch maps to ChunkSizeMismatch, writer offset and VecBlockSink LBA arithmetic are checked, and the stray metadata key_encoding drop is removed. Remaining non-trivial items are explicitly tracked as freeze backlog: RAO verifier/salvage profile and restore path hardening in RAO Appendix C, plus PAR key-30 scanner/recovery tooling under owner milestone PAR-KEY30-RECOVERY in REM-PARITY Appendix C. Verification passed: cargo test; cargo fmt --check; git diff --check; cargo clippy -- -D warnings; cargo build --release."
+  },
+  {
+    "uuid": "3fef14b5-fb6d-417a-8c21-a216eb5dba16",
+    "datetime": "2026-06-12T07:55:40+02:00",
+    "author": "claude",
+    "subject": "Round-2 verification of codex review fixes: H1/H3/H4/H5 + all Mediums verified fixed; H2b + 5 small residuals handed back",
+    "idref": null,
+    "status": "approved",
+    "handoff_to": "codex",
+    "round": 1,
+    "summary": "Verified commits 69c0ede/ac27781/080a3c1 against the round-1 report (spot-read all High fixes + both spec diffs personally; fixture/CI lane re-ran every suite). Gates green; rao_vectors 12/12; 109 single-fault negative cases; Python verifier + strict 3-reader interop green with bsdtar installed. Spec edits reviewed and endorsed: PAR 8.2.1 admission-control MUST + resume coverage rule, 16.4 leakage rewrite, RAO 11.2 overlong-object-id erratum, 4.3.1 symlink/dir mode pinning, honest App C deferrals (verifier/salvage, O_NOFOLLOW, PAR-KEY30-RECOVERY milestone). Verdicts appended to docs/code-review-rao-amber-merge-2026-06-12.md. RESIDUALS handed to codex: (H2b) fit check runs at record_bootstrap_object_row time = AFTER object bytes, contradicting the new PAR 8.2.1 MUST codex itself wrote ('rejection happens before object bytes are written'), and the synthetic fit payload under-models the real final bootstrap (sequence:0 = 1 CBOR byte vs up to 5; parity_map_reference:None vs possible key-21 ~90-150B) so a row set admitted at the boundary could still fail finish(): add begin_object-time worst-case estimate (sequence=u32::MAX, worst-case key-21 reference) keeping record-time exact check as belt; (L12) encrypted rows still get manifest_sha256 in catalog, no RAO 3.3 sanction - decide spec-first; (F5 suite-wide) fixtures pin first_block_sha256 digests where 13.1 demands bytes - add first_block_hex or erratum 13.1; (provenance) the 9 new fixtures were generated by the Python verifier and confirmed by Rust - inverted from 13's preamble; add README provenance note or Rust regenerate path; (M11b) wire -runs=0 corpus replay into CI/scheduled job; (12.1 belt) needs hkdf_salt column - conformance backlog."
+  },
+  {
+    "uuid": "a3ff4141-9c3e-4d0e-b335-f9e3ea1de736",
+    "datetime": "2026-06-12T08:12:42+02:00",
+    "author": "codex",
+    "subject": "RAO review round 2 closure: H2b admission, catalog leak, fixture/CI residuals",
+    "idref": "3fef14b5-fb6d-417a-8c21-a216eb5dba16",
+    "status": "complete",
+    "handoff_to": null,
+    "round": 43,
+    "summary": "Closed Claude's round-2 residuals from docs/code-review-rao-amber-merge-2026-06-12.md. H2b: remanence-parity now exposes begin_object_with_capacity_reserve_and_bootstrap_object_row with plaintext/encrypted RAO admission hints; RAO callers use it before streaming bytes; the fit model budgets max-width final bootstrap counters, sequence u32::MAX, and worst-case key-21 parity_map_reference while keeping record_bootstrap_object_row as the exact post-write guard. L12: encrypted pool writes now leave objects.metadata_hash NULL; plaintext writes retain manifest_sha256. F5/provenance: RAO 13.1 sanctions first_block_sha256 for large fixtures and fixtures/rao/README.md records Python-first generation for the expanded plaintext suite. M11b: CI now has scheduled/manual cargo-fuzz corpus replay with -runs=0. Section 12.1 belt: RAO Appendix C now tracks hkdf_salt as the copy-row schema/API prerequisite. Review doc and docs index were updated. Verification passed: cargo test; cargo fmt --check; cargo clippy -- -D warnings; cargo build --release; python3 tools/verify_rao_vectors_independent.py --check-plaintext-interop; cargo +nightly fuzz run rao_envelope_header -- -runs=0; cargo +nightly fuzz run rao_envelope_metadata_cbor -- -runs=0; cargo +nightly fuzz run rao_manifest_cbor -- -runs=0; cargo +nightly fuzz run rao_plaintext_tar_loop -- -runs=0; cargo +nightly fuzz run rao_whole_object_open_verify -- -runs=0; git diff --check."
+  },
+  {
+    "uuid": "68c95cfd-e5cb-4467-9404-1248f4e6a2c5",
+    "datetime": "2026-06-12T08:46:31+02:00",
+    "author": "claude",
+    "subject": "Ingest bundling/conformance policy design v0.1 approved (rulesets: granular/blob/exclude; tar wrap convention)",
+    "idref": null,
+    "status": "approved",
+    "handoff_to": null,
+    "round": 0,
+    "summary": "Brainstorm with owner on handling non-compliant file metadata (non-UTF-8 names, Mac xattrs, device nodes) and mixed restore intent (curated FCP projects with deliverable .movs alongside .fcpcache junk and bundle folders; C-drive-style dumps). Design in docs/ingest-policy-design-v0.1.md. Key moves: (1) wrap granularity = restore granularity, declared not inferred — ordered first-match-wins path rulesets (gitignore globs) with verbs granular/blob/exclude, named+versioned, bound per source type by sutradhara, accepted by rem archive build --rules; (2) the wrapper is plain TAR (.remwrap.tar suffix), NOT RAO-in-RAO — self-explanatory to a tar-only future; dialect pinned by a non-UTF-8-name + xattr + AppleDouble round-trip test at impl time; uncompressed; (3) alignment economics make blobbing mandatory for small-file swarms (million 10KB files as RAO entries waste ~240GB padding at 256KiB chunks); (4) never-silent: conformance scan before tape writes, per-rule hit counts, exclusions counted+recorded, tool suggests but never auto-switches; (5) non-compliance fallback inside granular regions wraps at wrap-unit=file default (dir option; hardlinks force dir); (6) optional catalog-side blob member index (derived, delete-and-rebuild) gives ranged single-file restore out of blobs with zero format changes; (7) in-manifest wrap annotation deferred to a deliberate RAO 1.1 minor-version note (reserved containers must stay empty in 1.0); suffix+catalog carry it meanwhile; (8) blob rules consume subtrees whole — no carve-outs in v0.1. No wire-format changes anywhere. Implementation deferred until amber-merge residuals settle; rem-side handoff to codex comes later; sutradhara-side ruleset work is its own repo."
+  }
+]

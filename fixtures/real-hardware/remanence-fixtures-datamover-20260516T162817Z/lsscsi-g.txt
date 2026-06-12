@@ -1,0 +1,14 @@
+  $ lsscsi -g
+[0:1:124:0]  enclosu BROADCOM VirtualSES       03    -          /dev/sg0 
+[0:3:111:0]  disk    HPE      MR416i-a Gen10+  5.32  /dev/sda   /dev/sg1 
+[1:0:3:0]    enclosu HPE      Smart Adapter    7.81  -          /dev/sg5 
+[1:0:8:0]    tape    HPE      Ultrium 9-SCSI   S2S1  /dev/st0   /dev/sg2 
+[1:0:9:0]    tape    HP       Ultrium 7-SCSI   S2T1  /dev/st3   /dev/sg8 
+[1:0:10:0]   mediumx HPE      MSL3040          3350  -          /dev/sg11
+[1:2:0:0]    storage HPE      P408e-p SR Gen10 7.81  -          /dev/sg6 
+[2:0:3:0]    enclosu HPE      Smart Adapter    7.81  -          /dev/sg9 
+[2:0:11:0]   tape    HP       Ultrium 7-SCSI   Q387  /dev/st1   /dev/sg3 
+[2:0:12:0]   tape    HPE      Ultrium 9-SCSI   R3G3  /dev/st2   /dev/sg4 
+[2:0:13:0]   mediumx HPE      MSL3040          3350  -          /dev/sg7 
+[2:2:0:0]    storage HPE      E208e-p SR Gen10 7.81  -          /dev/sg10
+    (rc=0)

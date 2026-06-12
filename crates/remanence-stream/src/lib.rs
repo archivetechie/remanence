@@ -1,0 +1,2001 @@
+//! Streaming orchestration primitives above Layers 3b and 3c.
+//!
+//! This crate is intentionally small: it does not own the daemon API, library
+//! robotics, or persistent SQLite schema. It composes the lower layers into the
+//! first real write/restore surface:
+//!
+//! - prepass regular files into [`remanence_format::RemTarFileSpec`] values;
+//! - stream those files through `rao-v1` and [`remanence_parity::ParitySink`];
+//! - return catalog/audit projection rows for Layer 4/5 to commit atomically;
+//! - stream an object-local block source back to a filesystem destination.
+
+mod recovery;
+
+use std::fs::{self, File, OpenOptions};
+use std::io::ErrorKind;
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Component, Path, PathBuf};
+use std::time::UNIX_EPOCH;
+
+use remanence_format::{
+    plan_rem_tar_object, stream_rem_tar_object, write_rem_tar_object_from_readers,
+    ArchiveEventSink, ArchiveGapRange, ArchiveReader, BodyLba, DamageRange, DamageStatus,
+    EntryCatalogSink, EntryKind, FormatError, NormalizedEntry, RemTarEntrySink, RemTarEntryType,
+    RemTarFileLayout, RemTarFileSpec, RemTarFileStream, RemTarObjectLayout, RemTarObjectOptions,
+    RemTarStreamEntry, RemTarStreamReport, ScanReport, StreamReport, FORMAT_ID, MANIFEST_PATH,
+};
+use remanence_library::{
+    BlockSink, BlockSource, TapeIoError, TapePosition, WriteFilemarksOutcome, WriteOutcome,
+};
+use remanence_parity::{
+    BootstrapObjectRow, BootstrapObjectRowAdmission, CapacityReserveInput, CommittedBundle,
+    ObjectParityState, ObjectWriteSummary, ParityError, ParitySink, TapeFileKind,
+};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+
+pub use recovery::{
+    recover_archive_reader_to_directory, ArchiveRecoveryReport, RecoveryArchiveGapRecord,
+    RecoveryByteRange, RecoveryDamageRecord, RecoveryFileRecord, RecoveryManifestRecord,
+    RecoveryOptions, RecoveryStatus, RECOVERY_MANIFEST_RELATIVE_PATH,
+};
+
+const HASH_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// Errors returned by streaming orchestration helpers.
+#[derive(Debug, Error)]
+pub enum StreamingError {
+    /// Caller input was invalid before lower layers were invoked.
+    #[error("invalid streaming input: {0}")]
+    InvalidInput(String),
+
+    /// Filesystem I/O failed at the named path.
+    #[error("{context} at {}: {source}", path.display())]
+    Io {
+        /// Operation being performed.
+        context: String,
+        /// Path involved in the operation.
+        path: PathBuf,
+        /// Underlying I/O error.
+        source: io::Error,
+    },
+
+    /// Layer 3b format error.
+    #[error(transparent)]
+    Format(#[from] FormatError),
+
+    /// Layer 3c parity error.
+    #[error(transparent)]
+    Parity(#[from] ParityError),
+}
+
+/// One regular file prepared for a streaming `rao-v1` write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedFile {
+    /// Source path that will be opened again for the write pass.
+    pub source_path: PathBuf,
+    /// Archive metadata and precomputed content hash.
+    pub spec: RemTarFileSpec,
+}
+
+/// Planned streaming object before tape admission.
+#[derive(Debug, Clone)]
+pub struct StreamingObjectPlan {
+    /// File specs in write order.
+    pub file_specs: Vec<RemTarFileSpec>,
+    /// Exact `rao-v1` layout projected by Layer 3b.
+    pub layout: RemTarObjectLayout,
+}
+
+/// Catalog-facing object row derived from a streaming write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectCatalogProjection {
+    /// Remanence object UUID.
+    pub object_id: String,
+    /// Opaque caller/orchestrator object identifier.
+    pub caller_object_id: String,
+    /// Body format identifier.
+    pub body_format: String,
+    /// Sum of payload file sizes, excluding the generated manifest.
+    pub logical_size_bytes: u64,
+    /// SHA-256 of the generated `rao-v1` manifest CBOR bytes.
+    pub manifest_sha256: [u8; 32],
+}
+
+/// Catalog-facing file row derived from a streaming write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileCatalogProjection {
+    /// Remanence object UUID containing this file.
+    pub object_id: String,
+    /// Stable file identifier inside the object.
+    pub file_id: String,
+    /// UTF-8 path inside the object.
+    pub path: String,
+    /// Exact file payload size.
+    pub size_bytes: u64,
+    /// SHA-256 of the exact file payload bytes.
+    pub file_sha256: [u8; 32],
+    /// First object-local body LBA containing file data.
+    pub first_chunk_lba: Option<BodyLba>,
+    /// Number of body chunks containing file data.
+    pub chunk_count: u64,
+    /// Optional mtime pax value.
+    pub mtime: Option<String>,
+    /// Optional executable flag.
+    pub executable: Option<bool>,
+}
+
+/// Catalog-facing object-copy row derived from a streaming write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectCopyProjection {
+    /// Remanence object UUID.
+    pub object_id: String,
+    /// Tape UUID that received the object copy.
+    pub tape_uuid: [u8; 16],
+    /// Filemark-delimited tape-file number of the object.
+    pub tape_file_number: u32,
+    /// First parity data ordinal assigned by Layer 3c, absent for no-parity copies.
+    pub first_parity_data_ordinal: Option<u64>,
+    /// Number of object-data ordinals in the copy.
+    pub data_block_count: u64,
+    /// Highest protected ordinal after this object-close bundle, absent for no-parity copies.
+    pub protected_until_ordinal: Option<u64>,
+    /// Object-level parity state at that watermark, absent for no-parity copies.
+    pub parity_state: Option<ObjectParityState>,
+    /// SHA-256 of the canonical plaintext RAO object bytes.
+    pub plaintext_digest: [u8; 32],
+    /// SHA-256 of the stored representation bytes for this copy.
+    pub stored_digest: [u8; 32],
+}
+
+/// Projection bundle Layer 5 can commit with the 3c journal bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamingCatalogProjection {
+    /// Object row.
+    pub object: ObjectCatalogProjection,
+    /// Per-file rows.
+    pub files: Vec<FileCatalogProjection>,
+    /// Object-copy row for this tape.
+    pub object_copy: ObjectCopyProjection,
+    /// 3c tape-file rows for the object-close commit bundle.
+    pub tape_file_bundle: CommittedBundle,
+}
+
+/// Minimal audit event emitted by this orchestration surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamingAuditEvent {
+    /// Stable event kind.
+    pub kind: &'static str,
+    /// Remanence object UUID.
+    pub object_id: String,
+    /// Human-readable summary.
+    pub summary: String,
+}
+
+/// Result of a complete streaming object write.
+#[derive(Debug, Clone)]
+pub struct StreamingObjectWriteReport {
+    /// Planned and emitted Layer 3b layout.
+    pub layout: RemTarObjectLayout,
+    /// Layer 3c object-close summary.
+    pub object_close: ObjectWriteSummary,
+    /// Catalog projection rows ready for an atomic Layer 5 commit.
+    pub catalog: StreamingCatalogProjection,
+    /// Audit events ready for the Layer 4 audit log.
+    pub audit_events: Vec<StreamingAuditEvent>,
+}
+
+/// Filesystem restore policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FilesystemRestoreOptions {
+    /// Replace an existing destination file.
+    pub overwrite: bool,
+    /// Also restore Remanence's generated manifest file.
+    pub include_manifest: bool,
+}
+
+/// Report from streaming an object to a filesystem directory.
+#[derive(Debug, Clone)]
+pub struct FilesystemRestoreReport {
+    /// Layer 3b streaming parse report.
+    pub stream: RemTarStreamReport,
+    /// User-visible files written.
+    pub files_written: u64,
+    /// Directory entries materialized or confirmed.
+    pub directories_seen: u64,
+    /// Symbolic-link entries created.
+    pub symlinks_written: u64,
+    /// User-visible payload bytes written.
+    pub bytes_written: u64,
+}
+
+/// Report from scanning a normalized archive reader.
+#[derive(Debug, Clone)]
+pub struct ArchiveScanReport {
+    /// Format-driver scan summary.
+    pub scan: ScanReport,
+    /// Entries returned in archive order.
+    pub entries: Vec<NormalizedEntry>,
+    /// Non-fatal damage events discovered while scanning.
+    pub damages: Vec<DamageRange>,
+    /// Source gaps discovered while scanning that are not tied to one file.
+    pub archive_gaps: Vec<ArchiveGapRange>,
+}
+
+/// Report from restoring a normalized archive reader to a directory.
+#[derive(Debug, Clone)]
+pub struct ArchiveFilesystemRestoreReport {
+    /// Format-driver streaming summary.
+    pub stream: StreamReport,
+    /// Regular files written.
+    pub files_written: u64,
+    /// Directory entries materialized or confirmed.
+    pub directories_seen: u64,
+    /// File payload bytes written.
+    pub bytes_written: u64,
+    /// Non-fatal damage events reported by the format driver.
+    pub damages: Vec<DamageRange>,
+    /// Source gaps reported by the format driver that are not tied to one file.
+    pub archive_gaps: Vec<ArchiveGapRange>,
+}
+
+/// Prepass one regular file and produce a streaming write spec.
+///
+/// `archive_path` is the relative UTF-8 path that will be recorded inside the
+/// object. This function rejects absolute paths, `..`, non-UTF-8 components,
+/// and non-regular sources.
+pub fn prepare_regular_file(
+    source_path: impl AsRef<Path>,
+    archive_path: impl AsRef<Path>,
+    file_id: impl Into<String>,
+) -> Result<PreparedFile, StreamingError> {
+    let source_path = source_path.as_ref().to_path_buf();
+    let archive_path = normalize_archive_path(archive_path.as_ref())?;
+    let metadata = fs::metadata(&source_path)
+        .map_err(|err| io_error("stat source file", &source_path, err))?;
+    if !metadata.file_type().is_file() {
+        return Err(StreamingError::InvalidInput(format!(
+            "source path is not a regular file: {}",
+            source_path.display()
+        )));
+    }
+
+    let mut spec = RemTarFileSpec::new(
+        archive_path,
+        file_id.into(),
+        metadata.len(),
+        sha256_file(&source_path)?,
+    );
+    spec.mtime = metadata_mtime(&metadata);
+    spec.executable = Some(is_executable(&metadata));
+    Ok(PreparedFile { source_path, spec })
+}
+
+/// Plan a prepared object without touching tape.
+pub fn plan_prepared_object(
+    options: &RemTarObjectOptions,
+    files: &[PreparedFile],
+) -> Result<StreamingObjectPlan, StreamingError> {
+    for file in files {
+        if file.spec.entry_type != RemTarEntryType::Regular {
+            return Err(StreamingError::InvalidInput(format!(
+                "catalog projection supports regular files only, got {:?} for {}",
+                file.spec.entry_type, file.spec.path
+            )));
+        }
+    }
+    let file_specs: Vec<RemTarFileSpec> = files.iter().map(|file| file.spec.clone()).collect();
+    let layout = plan_rem_tar_object(options, &file_specs)?;
+    Ok(StreamingObjectPlan { file_specs, layout })
+}
+
+/// Write prepared files as one `rao-v1` object through a parity sink.
+///
+/// The caller supplies `reserve` after applying its current tape-capacity
+/// model. This function verifies that the reserve's projected object block
+/// count matches the Layer 3b layout before opening the object. If a lower
+/// layer fails after object admission, the parity session may need normal
+/// abort/recovery handling by the caller. This initial surface assumes the
+/// prepared files are stable between the hash prepass and write pass; mutable
+/// source spooling is a separate policy layer.
+pub fn write_prepared_object_to_parity(
+    parity: &mut ParitySink<'_>,
+    tape_uuid: [u8; 16],
+    options: &RemTarObjectOptions,
+    files: &[PreparedFile],
+    reserve: CapacityReserveInput,
+) -> Result<StreamingObjectWriteReport, StreamingError> {
+    let plan = plan_prepared_object(options, files)?;
+    validate_reserve(options, &plan.layout, reserve)?;
+
+    let mut readers = open_prepared_readers(files)?;
+    let mut streams = Vec::with_capacity(files.len());
+    for (file, reader) in files.iter().zip(readers.iter_mut()) {
+        streams.push(RemTarFileStream::new(file.spec.clone(), reader));
+    }
+
+    let opened = parity.begin_object_with_capacity_reserve_and_bootstrap_object_row(
+        reserve,
+        BootstrapObjectRowAdmission::PlaintextRao,
+    )?;
+    let mut object_sink = ObjectDigestBlockSink::new(parity);
+    let layout = write_rem_tar_object_from_readers(&mut object_sink, options, &mut streams)?;
+    let object_digest = object_sink.finish_digest();
+    let manifest_first_chunk_lba = layout.manifest.first_chunk_lba.ok_or_else(|| {
+        StreamingError::InvalidInput("generated RAO manifest has no body LBA".to_string())
+    })?;
+    parity.record_bootstrap_object_row(BootstrapObjectRow::plaintext(
+        opened.0,
+        layout.projected_size_blocks,
+        manifest_first_chunk_lba.0,
+        layout.manifest.size_bytes,
+        layout.manifest.chunk_count,
+        layout.manifest_sha256,
+    ))?;
+    let object_close = parity.finish_object()?;
+    if opened.0 != object_close.tape_file_number {
+        return Err(StreamingError::InvalidInput(
+            "parity object tape-file number changed during write".to_string(),
+        ));
+    }
+    if layout.projected_size_blocks != plan.layout.projected_size_blocks {
+        return Err(StreamingError::InvalidInput(
+            "emitted layout differs from pre-admission plan".to_string(),
+        ));
+    }
+
+    let catalog = build_catalog_projection(
+        tape_uuid,
+        options,
+        files,
+        &layout,
+        &object_close,
+        object_digest,
+    )?;
+    let audit_events = vec![StreamingAuditEvent {
+        kind: "streaming_object_committed",
+        object_id: options.object_id.clone(),
+        summary: format!(
+            "committed object {} to tape file {} ({} payload files, {} object blocks)",
+            options.object_id,
+            object_close.tape_file_number,
+            layout.files.len(),
+            object_close.data_block_count
+        ),
+    }];
+    Ok(StreamingObjectWriteReport {
+        layout,
+        object_close,
+        catalog,
+        audit_events,
+    })
+}
+
+/// Restore one object-local block stream into a destination directory.
+pub fn restore_object_to_directory<S: BlockSource + ?Sized>(
+    source: &mut S,
+    chunk_size: usize,
+    block_count: u64,
+    destination_root: impl AsRef<Path>,
+    options: FilesystemRestoreOptions,
+) -> Result<FilesystemRestoreReport, StreamingError> {
+    let mut sink = FilesystemRestoreSink::new(destination_root.as_ref(), options)?;
+    let stream = stream_rem_tar_object(source, chunk_size, block_count, &mut sink)?;
+    Ok(FilesystemRestoreReport {
+        stream,
+        files_written: sink.files_written,
+        directories_seen: sink.directories_seen,
+        symlinks_written: sink.symlinks_written,
+        bytes_written: sink.bytes_written,
+    })
+}
+
+/// Scan any normalized archive reader and collect its catalog entries.
+pub fn scan_archive_reader(
+    reader: &mut dyn ArchiveReader,
+) -> Result<ArchiveScanReport, StreamingError> {
+    let mut sink = CollectingCatalogSink::default();
+    let scan = reader.scan(&mut sink)?;
+    Ok(ArchiveScanReport {
+        scan,
+        entries: sink.entries,
+        damages: sink.damages,
+        archive_gaps: sink.archive_gaps,
+    })
+}
+
+/// Restore any normalized archive reader into a destination directory.
+pub fn restore_archive_reader_to_directory(
+    reader: &mut dyn ArchiveReader,
+    destination_root: impl AsRef<Path>,
+    options: FilesystemRestoreOptions,
+) -> Result<ArchiveFilesystemRestoreReport, StreamingError> {
+    let mut sink = NormalizedFilesystemRestoreSink::new(destination_root.as_ref(), options)?;
+    let stream = reader.stream_all(&mut sink)?;
+    Ok(ArchiveFilesystemRestoreReport {
+        stream,
+        files_written: sink.files_written,
+        directories_seen: sink.directories_seen,
+        bytes_written: sink.bytes_written,
+        damages: sink.damages,
+        archive_gaps: sink.archive_gaps,
+    })
+}
+
+fn validate_reserve(
+    options: &RemTarObjectOptions,
+    layout: &RemTarObjectLayout,
+    reserve: CapacityReserveInput,
+) -> Result<(), StreamingError> {
+    if reserve.projected_object_blocks != layout.projected_size_blocks {
+        return Err(StreamingError::InvalidInput(format!(
+            "capacity reserve projected {} object blocks, but layout projected {}",
+            reserve.projected_object_blocks, layout.projected_size_blocks
+        )));
+    }
+    if reserve.block_size_bytes != options.chunk_size as u64 {
+        return Err(StreamingError::InvalidInput(format!(
+            "capacity reserve block size {} does not match RAO chunk size {}",
+            reserve.block_size_bytes, options.chunk_size
+        )));
+    }
+    Ok(())
+}
+
+fn open_prepared_readers(files: &[PreparedFile]) -> Result<Vec<File>, StreamingError> {
+    files
+        .iter()
+        .map(|file| {
+            File::open(&file.source_path)
+                .map_err(|err| io_error("open source file for streaming", &file.source_path, err))
+        })
+        .collect()
+}
+
+struct ObjectDigestBlockSink<'a, S: BlockSink + ?Sized> {
+    inner: &'a mut S,
+    hasher: Sha256,
+}
+
+impl<'a, S: BlockSink + ?Sized> ObjectDigestBlockSink<'a, S> {
+    fn new(inner: &'a mut S) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+        }
+    }
+
+    fn finish_digest(self) -> [u8; 32] {
+        let digest = self.hasher.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest);
+        out
+    }
+}
+
+impl<S: BlockSink + ?Sized> BlockSink for ObjectDigestBlockSink<'_, S> {
+    fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
+        let outcome = self.inner.write_block(buf)?;
+        self.hasher.update(buf);
+        Ok(outcome)
+    }
+
+    fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
+        self.inner.write_filemarks(count)
+    }
+
+    fn position(&mut self) -> Result<TapePosition, TapeIoError> {
+        self.inner.position()
+    }
+}
+
+fn build_catalog_projection(
+    tape_uuid: [u8; 16],
+    options: &RemTarObjectOptions,
+    prepared_files: &[PreparedFile],
+    layout: &RemTarObjectLayout,
+    object_close: &ObjectWriteSummary,
+    object_digest: [u8; 32],
+) -> Result<StreamingCatalogProjection, StreamingError> {
+    if prepared_files.len() != layout.files.len() {
+        return Err(StreamingError::InvalidInput(
+            "prepared file count does not match emitted layout".to_string(),
+        ));
+    }
+    let logical_size_bytes = layout.files.iter().try_fold(0u64, |acc, file| {
+        acc.checked_add(file.size_bytes)
+            .ok_or_else(|| StreamingError::InvalidInput("logical size overflow".to_string()))
+    })?;
+    let object = ObjectCatalogProjection {
+        object_id: options.object_id.clone(),
+        caller_object_id: options.caller_object_id.clone(),
+        body_format: FORMAT_ID.to_string(),
+        logical_size_bytes,
+        manifest_sha256: layout.manifest_sha256,
+    };
+    let files = layout
+        .files
+        .iter()
+        .zip(prepared_files.iter())
+        .map(|(file, prepared)| file_catalog_projection(&options.object_id, file, &prepared.spec))
+        .collect::<Result<Vec<_>, _>>()?;
+    let parity_state = ObjectParityState::from_ordinals(
+        object_close.first_parity_data_ordinal,
+        object_close.data_block_count,
+        object_close.highest_protected_ordinal,
+    )?;
+    let object_copy = ObjectCopyProjection {
+        object_id: options.object_id.clone(),
+        tape_uuid,
+        tape_file_number: object_close.tape_file_number,
+        first_parity_data_ordinal: Some(object_close.first_parity_data_ordinal),
+        data_block_count: object_close.data_block_count,
+        protected_until_ordinal: Some(object_close.highest_protected_ordinal),
+        parity_state: Some(parity_state),
+        plaintext_digest: object_digest,
+        stored_digest: object_digest,
+    };
+    let mut tape_file_bundle = object_close.committed_bundle()?;
+    attach_object_id_to_bundle(
+        &mut tape_file_bundle,
+        object_close.tape_file_number,
+        options,
+    );
+    Ok(StreamingCatalogProjection {
+        object,
+        files,
+        object_copy,
+        tape_file_bundle,
+    })
+}
+
+fn file_catalog_projection(
+    object_id: &str,
+    file: &RemTarFileLayout,
+    spec: &RemTarFileSpec,
+) -> Result<FileCatalogProjection, StreamingError> {
+    let file_sha256 = file.file_sha256.ok_or_else(|| {
+        StreamingError::InvalidInput(format!(
+            "catalog projection supports regular files only, got {:?} for {}",
+            file.entry_type, file.path
+        ))
+    })?;
+    Ok(FileCatalogProjection {
+        object_id: object_id.to_string(),
+        file_id: file.file_id.clone(),
+        path: file.path.clone(),
+        size_bytes: file.size_bytes,
+        file_sha256,
+        first_chunk_lba: file.first_chunk_lba,
+        chunk_count: file.chunk_count,
+        mtime: spec.mtime.clone(),
+        executable: file.executable,
+    })
+}
+
+fn attach_object_id_to_bundle(
+    bundle: &mut CommittedBundle,
+    object_tape_file_number: u32,
+    options: &RemTarObjectOptions,
+) {
+    for entry in &mut bundle.entries {
+        if entry.kind == TapeFileKind::Object && entry.tape_file_number == object_tape_file_number {
+            entry.object_id = Some(options.object_id.clone());
+        }
+    }
+}
+
+fn sha256_file(path: &Path) -> Result<[u8; 32], StreamingError> {
+    let file =
+        File::open(path).map_err(|err| io_error("open source file for hashing", path, err))?;
+    let mut reader = BufReader::with_capacity(HASH_BUFFER_BYTES, file);
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; HASH_BUFFER_BYTES];
+    loop {
+        let read = reader
+            .read(&mut buf)
+            .map_err(|err| io_error("read source file for hashing", path, err))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Ok(out)
+}
+
+fn normalize_archive_path(path: &Path) -> Result<String, StreamingError> {
+    if path.as_os_str().is_empty() {
+        return Err(StreamingError::InvalidInput(
+            "archive path must not be empty".to_string(),
+        ));
+    }
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => {
+                let text = part.to_str().ok_or_else(|| {
+                    StreamingError::InvalidInput("archive path must be UTF-8".to_string())
+                })?;
+                if text.is_empty() {
+                    return Err(StreamingError::InvalidInput(
+                        "archive path component must not be empty".to_string(),
+                    ));
+                }
+                parts.push(text.to_string());
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(StreamingError::InvalidInput(format!(
+                    "archive path must be relative and stay inside the object: {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(StreamingError::InvalidInput(
+            "archive path must contain a file name".to_string(),
+        ));
+    }
+    Ok(parts.join("/"))
+}
+
+fn metadata_mtime(metadata: &fs::Metadata) -> Option<String> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs().to_string())
+}
+
+#[cfg(unix)]
+fn is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+fn io_error(context: impl Into<String>, path: &Path, source: io::Error) -> StreamingError {
+    StreamingError::Io {
+        context: context.into(),
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+fn format_sink_io(context: impl Into<String>, path: &Path, source: io::Error) -> FormatError {
+    FormatError::SourceIo {
+        context: format!("{} at {}", context.into(), path.display()),
+        source,
+    }
+}
+
+fn restore_path_error(path: &Path, message: impl Into<String>) -> FormatError {
+    FormatError::Parse(format!(
+        "restore path {} {}",
+        path.display(),
+        message.into()
+    ))
+}
+
+fn ensure_restore_root(root: &Path) -> Result<(), StreamingError> {
+    fs::create_dir_all(root).map_err(|err| io_error("create restore root", root, err))?;
+    let metadata =
+        fs::symlink_metadata(root).map_err(|err| io_error("inspect restore root", root, err))?;
+    if metadata.file_type().is_symlink() {
+        return Err(StreamingError::InvalidInput(format!(
+            "restore root must not be a symlink: {}",
+            root.display()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Err(StreamingError::InvalidInput(format!(
+            "restore root must be a directory: {}",
+            root.display()
+        )));
+    }
+    Ok(())
+}
+
+fn normalized_relative_components(relative: &str) -> Result<Vec<PathBuf>, FormatError> {
+    let mut parts = Vec::new();
+    for component in Path::new(relative).components() {
+        match component {
+            Component::Normal(part) => parts.push(PathBuf::from(part)),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(FormatError::Parse(format!(
+                    "restore path {relative} is not a normalized relative path"
+                )));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(FormatError::Parse(
+            "restore path must contain a file name".to_string(),
+        ));
+    }
+    Ok(parts)
+}
+
+fn ensure_restore_directory(path: &Path) -> Result<(), FormatError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(restore_path_error(
+            path,
+            "escapes destination through a symlink",
+        )),
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(restore_path_error(path, "exists but is not a directory")),
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            fs::create_dir(path)
+                .map_err(|err| format_sink_io("create restore directory", path, err))?;
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|err| format_sink_io("inspect restore directory", path, err))?;
+            if metadata.file_type().is_symlink() {
+                return Err(restore_path_error(
+                    path,
+                    "escapes destination through a symlink",
+                ));
+            }
+            Ok(())
+        }
+        Err(err) => Err(format_sink_io("inspect restore directory", path, err)),
+    }
+}
+
+fn create_restore_dirs_secure(root: &Path, relative: &str) -> Result<PathBuf, FormatError> {
+    let parts = normalized_relative_components(relative)?;
+    let mut current = root.to_path_buf();
+    for part in parts {
+        current.push(part);
+        ensure_restore_directory(&current)?;
+    }
+    Ok(current)
+}
+
+fn create_restore_parent_dirs_secure(root: &Path, relative: &str) -> Result<PathBuf, FormatError> {
+    let parts = normalized_relative_components(relative)?;
+    let mut destination = root.to_path_buf();
+    for part in &parts[..parts.len().saturating_sub(1)] {
+        destination.push(part);
+        ensure_restore_directory(&destination)?;
+    }
+    destination.push(parts.last().expect("parts is not empty"));
+    reject_existing_restore_symlink(&destination)?;
+    Ok(destination)
+}
+
+fn reject_existing_restore_symlink(path: &Path) -> Result<(), FormatError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(restore_path_error(
+            path,
+            "escapes destination through a symlink",
+        )),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format_sink_io("inspect restore path", path, err)),
+    }
+}
+
+fn prepare_restore_symlink_destination(path: &Path, overwrite: bool) -> Result<(), FormatError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(restore_path_error(
+            path,
+            "escapes destination through a symlink",
+        )),
+        Ok(metadata) if overwrite && metadata.is_file() => {
+            fs::remove_file(path)
+                .map_err(|err| format_sink_io("remove existing restore file", path, err))?;
+            Ok(())
+        }
+        Ok(_) => Err(restore_path_error(path, "already exists")),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format_sink_io("inspect restore path", path, err)),
+    }
+}
+
+#[cfg(unix)]
+fn create_restore_symlink(target: &str, destination: &Path) -> Result<(), FormatError> {
+    std::os::unix::fs::symlink(target, destination)
+        .map_err(|err| format_sink_io("create restore symlink", destination, err))
+}
+
+#[cfg(not(unix))]
+fn create_restore_symlink(_target: &str, destination: &Path) -> Result<(), FormatError> {
+    Err(restore_path_error(
+        destination,
+        "cannot restore symlink entries on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn apply_restore_open_flags(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    options.custom_flags(nix::libc::O_NOFOLLOW);
+}
+
+#[cfg(not(unix))]
+fn apply_restore_open_flags(_options: &mut OpenOptions) {}
+
+#[derive(Default)]
+struct CollectingCatalogSink {
+    entries: Vec<NormalizedEntry>,
+    damages: Vec<DamageRange>,
+    archive_gaps: Vec<ArchiveGapRange>,
+}
+
+impl EntryCatalogSink for CollectingCatalogSink {
+    fn entry(&mut self, entry: &NormalizedEntry) -> Result<(), FormatError> {
+        self.entries.push(entry.clone());
+        Ok(())
+    }
+
+    fn damage(&mut self, range: &DamageRange) -> Result<(), FormatError> {
+        self.damages.push(range.clone());
+        Ok(())
+    }
+
+    fn archive_gap(&mut self, range: &ArchiveGapRange) -> Result<(), FormatError> {
+        self.archive_gaps.push(range.clone());
+        Ok(())
+    }
+}
+
+struct FilesystemRestoreSink {
+    root: PathBuf,
+    options: FilesystemRestoreOptions,
+    current: RestoreTarget,
+    files_written: u64,
+    directories_seen: u64,
+    symlinks_written: u64,
+    bytes_written: u64,
+}
+
+impl FilesystemRestoreSink {
+    fn new(root: &Path, options: FilesystemRestoreOptions) -> Result<Self, StreamingError> {
+        ensure_restore_root(root)?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            options,
+            current: RestoreTarget::None,
+            files_written: 0,
+            directories_seen: 0,
+            symlinks_written: 0,
+            bytes_written: 0,
+        })
+    }
+}
+
+impl RemTarEntrySink for FilesystemRestoreSink {
+    fn begin_file(&mut self, entry: &RemTarStreamEntry) -> Result<(), FormatError> {
+        if entry.path == MANIFEST_PATH && !self.options.include_manifest {
+            self.current = RestoreTarget::Skip;
+            return Ok(());
+        }
+        let relative = normalize_archive_path(Path::new(&entry.path)).map_err(|err| {
+            FormatError::Parse(format!("invalid restore path {}: {err}", entry.path))
+        })?;
+        match entry.entry_type {
+            RemTarEntryType::Regular => {
+                let expected_sha256 = expected_file_sha256(entry)?;
+                let destination = create_restore_parent_dirs_secure(&self.root, relative.as_str())?;
+                let mut options = OpenOptions::new();
+                options.write(true);
+                if self.options.overwrite {
+                    options.create(true).truncate(true);
+                } else {
+                    options.create_new(true);
+                }
+                apply_restore_open_flags(&mut options);
+                let file = options
+                    .open(&destination)
+                    .map_err(|err| format_sink_io("open restore file", &destination, err))?;
+                self.current = RestoreTarget::File {
+                    destination,
+                    file,
+                    bytes_written: 0,
+                    hasher: Sha256::new(),
+                    expected_sha256,
+                };
+            }
+            RemTarEntryType::Directory => {
+                create_restore_dirs_secure(&self.root, relative.as_str())?;
+                self.directories_seen += 1;
+                self.current = RestoreTarget::Directory;
+            }
+            RemTarEntryType::Symlink => {
+                let target = entry.link_target.as_deref().ok_or_else(|| {
+                    FormatError::Parse(format!("restore symlink {} is missing target", entry.path))
+                })?;
+                let destination = create_restore_parent_dirs_secure(&self.root, relative.as_str())?;
+                prepare_restore_symlink_destination(&destination, self.options.overwrite)?;
+                create_restore_symlink(target, &destination)?;
+                self.symlinks_written += 1;
+                self.current = RestoreTarget::Symlink;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_file_data(&mut self, bytes: &[u8]) -> Result<(), FormatError> {
+        match &mut self.current {
+            RestoreTarget::None => Err(FormatError::Parse(
+                "restore data arrived without an active file".to_string(),
+            )),
+            RestoreTarget::Skip => Ok(()),
+            RestoreTarget::Directory | RestoreTarget::Symlink => Err(FormatError::Parse(
+                "restore data arrived for a zero-payload entry".to_string(),
+            )),
+            RestoreTarget::File {
+                destination,
+                file,
+                bytes_written,
+                hasher,
+                ..
+            } => {
+                file.write_all(bytes)
+                    .map_err(|err| format_sink_io("write restore file", destination, err))?;
+                hasher.update(bytes);
+                *bytes_written += bytes.len() as u64;
+                self.bytes_written += bytes.len() as u64;
+                Ok(())
+            }
+        }
+    }
+
+    fn end_file(&mut self, entry: &RemTarStreamEntry) -> Result<(), FormatError> {
+        match std::mem::replace(&mut self.current, RestoreTarget::None) {
+            RestoreTarget::None => Err(FormatError::Parse(
+                "restore file ended without an active file".to_string(),
+            )),
+            RestoreTarget::Directory | RestoreTarget::Symlink | RestoreTarget::Skip => Ok(()),
+            RestoreTarget::File {
+                destination,
+                mut file,
+                bytes_written,
+                hasher,
+                expected_sha256,
+            } => {
+                if bytes_written != entry.size_bytes {
+                    return Err(FormatError::Parse(format!(
+                        "restore file {} wrote {} bytes, expected {}",
+                        entry.path, bytes_written, entry.size_bytes
+                    )));
+                }
+                let actual = hasher.finalize();
+                if actual.as_slice() != expected_sha256.as_slice() {
+                    return Err(FormatError::file_digest_mismatch(
+                        entry.path.clone(),
+                        &expected_sha256,
+                        &actual,
+                    ));
+                }
+                file.flush()
+                    .map_err(|err| format_sink_io("flush restore file", &destination, err))?;
+                self.files_written += 1;
+                Ok(())
+            }
+        }
+    }
+}
+
+struct NormalizedFilesystemRestoreSink {
+    root: PathBuf,
+    options: FilesystemRestoreOptions,
+    current: NormalizedRestoreTarget,
+    files_written: u64,
+    directories_seen: u64,
+    bytes_written: u64,
+    damages: Vec<DamageRange>,
+    archive_gaps: Vec<ArchiveGapRange>,
+}
+
+impl NormalizedFilesystemRestoreSink {
+    fn new(root: &Path, options: FilesystemRestoreOptions) -> Result<Self, StreamingError> {
+        ensure_restore_root(root)?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            options,
+            current: NormalizedRestoreTarget::None,
+            files_written: 0,
+            directories_seen: 0,
+            bytes_written: 0,
+            damages: Vec::new(),
+            archive_gaps: Vec::new(),
+        })
+    }
+}
+
+impl ArchiveEventSink for NormalizedFilesystemRestoreSink {
+    fn begin_entry(&mut self, entry: &NormalizedEntry) -> Result<(), FormatError> {
+        let relative = normalize_archive_path(Path::new(&entry.path)).map_err(|err| {
+            FormatError::Parse(format!("invalid restore path {}: {err}", entry.path))
+        })?;
+        match entry.kind {
+            EntryKind::Directory => {
+                create_restore_dirs_secure(&self.root, relative.as_str())?;
+                self.directories_seen += 1;
+                self.current = NormalizedRestoreTarget::Directory;
+            }
+            EntryKind::RegularFile => {
+                let destination = create_restore_parent_dirs_secure(&self.root, relative.as_str())?;
+                let mut options = OpenOptions::new();
+                options.write(true);
+                if self.options.overwrite {
+                    options.create(true).truncate(true);
+                } else {
+                    options.create_new(true);
+                }
+                apply_restore_open_flags(&mut options);
+                let file = options
+                    .open(&destination)
+                    .map_err(|err| format_sink_io("open restore file", &destination, err))?;
+                self.current = NormalizedRestoreTarget::File {
+                    file_id: entry.file_id.clone(),
+                    destination,
+                    file,
+                    expected_size: entry.size_bytes,
+                    bytes_written: 0,
+                    covered_ranges: Vec::new(),
+                };
+            }
+            EntryKind::Symlink | EntryKind::Hardlink | EntryKind::Special => {
+                self.current = NormalizedRestoreTarget::Skip;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_file_data(&mut self, file_offset: u64, bytes: &[u8]) -> Result<(), FormatError> {
+        match &mut self.current {
+            NormalizedRestoreTarget::None => Err(FormatError::Parse(
+                "restore data arrived without an active entry".to_string(),
+            )),
+            NormalizedRestoreTarget::Directory => Err(FormatError::Parse(
+                "restore data arrived for a directory entry".to_string(),
+            )),
+            NormalizedRestoreTarget::Skip => Ok(()),
+            NormalizedRestoreTarget::File {
+                destination,
+                file,
+                expected_size,
+                bytes_written,
+                covered_ranges,
+                ..
+            } => {
+                let end_offset = file_offset.checked_add(bytes.len() as u64).ok_or_else(|| {
+                    FormatError::Parse("restore file offset overflow".to_string())
+                })?;
+                if expected_size.is_some_and(|expected| end_offset > expected) {
+                    return Err(FormatError::Parse(format!(
+                        "restore data for {} extends beyond declared size",
+                        destination.display()
+                    )));
+                }
+                file.seek(SeekFrom::Start(file_offset))
+                    .map_err(|err| format_sink_io("seek restore file", destination, err))?;
+                file.write_all(bytes)
+                    .map_err(|err| format_sink_io("write restore file", destination, err))?;
+                covered_ranges.push((file_offset, end_offset));
+                *bytes_written += bytes.len() as u64;
+                self.bytes_written += bytes.len() as u64;
+                Ok(())
+            }
+        }
+    }
+
+    fn report_damage(&mut self, range: &DamageRange) -> Result<(), FormatError> {
+        if let NormalizedRestoreTarget::File {
+            file_id,
+            covered_ranges,
+            ..
+        } = &mut self.current
+        {
+            if *file_id == range.file_id
+                && matches!(
+                    range.status,
+                    DamageStatus::Missing | DamageStatus::ReadError | DamageStatus::Unsupported
+                )
+            {
+                covered_ranges.push((range.start, range.end));
+            }
+        }
+        self.damages.push(range.clone());
+        Ok(())
+    }
+
+    fn report_archive_gap(&mut self, range: &ArchiveGapRange) -> Result<(), FormatError> {
+        self.archive_gaps.push(range.clone());
+        Ok(())
+    }
+
+    fn end_entry(&mut self, entry: &NormalizedEntry) -> Result<(), FormatError> {
+        match std::mem::replace(&mut self.current, NormalizedRestoreTarget::None) {
+            NormalizedRestoreTarget::None => Err(FormatError::Parse(
+                "restore entry ended without an active entry".to_string(),
+            )),
+            NormalizedRestoreTarget::Directory | NormalizedRestoreTarget::Skip => Ok(()),
+            NormalizedRestoreTarget::File {
+                destination,
+                mut file,
+                mut covered_ranges,
+                ..
+            } => {
+                if let Some(expected) = entry.size_bytes {
+                    normalize_ranges(&mut covered_ranges);
+                    if !ranges_cover(&covered_ranges, expected) {
+                        return Err(FormatError::Parse(format!(
+                            "restore file {} did not cover declared size {}",
+                            entry.path, expected
+                        )));
+                    }
+                }
+                file.flush()
+                    .map_err(|err| format_sink_io("flush restore file", &destination, err))?;
+                self.files_written += 1;
+                Ok(())
+            }
+        }
+    }
+}
+
+enum NormalizedRestoreTarget {
+    None,
+    Directory,
+    Skip,
+    File {
+        file_id: remanence_format::FileId,
+        destination: PathBuf,
+        file: File,
+        expected_size: Option<u64>,
+        bytes_written: u64,
+        covered_ranges: Vec<(u64, u64)>,
+    },
+}
+
+fn normalize_ranges(ranges: &mut Vec<(u64, u64)>) {
+    ranges.retain(|(start, end)| start < end);
+    ranges.sort_unstable_by_key(|(start, end)| (*start, *end));
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges.drain(..) {
+        if let Some((_, last_end)) = merged.last_mut() {
+            if start <= *last_end {
+                *last_end = (*last_end).max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    *ranges = merged;
+}
+
+fn ranges_cover(ranges: &[(u64, u64)], expected_end: u64) -> bool {
+    if expected_end == 0 {
+        return true;
+    }
+    let mut covered_until = 0u64;
+    for &(start, end) in ranges {
+        if start > covered_until {
+            return false;
+        }
+        covered_until = covered_until.max(end);
+        if covered_until >= expected_end {
+            return true;
+        }
+    }
+    false
+}
+
+enum RestoreTarget {
+    None,
+    Skip,
+    Directory,
+    Symlink,
+    File {
+        destination: PathBuf,
+        file: File,
+        bytes_written: u64,
+        hasher: Sha256,
+        expected_sha256: [u8; 32],
+    },
+}
+
+fn expected_file_sha256(entry: &RemTarStreamEntry) -> Result<[u8; 32], FormatError> {
+    let value = entry
+        .pax_records
+        .get("REMANENCE.file_sha256")
+        .ok_or_else(|| {
+            FormatError::Parse(format!(
+                "restore file {} is missing REMANENCE.file_sha256",
+                entry.path
+            ))
+        })?;
+    parse_sha256_hex(value).map_err(|err| {
+        FormatError::Parse(format!(
+            "restore file {} has invalid REMANENCE.file_sha256: {err}",
+            entry.path
+        ))
+    })
+}
+
+fn parse_sha256_hex(value: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64 {
+        return Err(format!("expected 64 hex characters, got {}", value.len()));
+    }
+    let mut out = [0u8; 32];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble(chunk[0]).ok_or_else(|| "contains non-hex characters".to_string())?;
+        let low = hex_nibble(chunk[1]).ok_or_else(|| "contains non-hex characters".to_string())?;
+        out[index] = (high << 4) | low;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, HashMap};
+
+    use remanence_format::{RemTarEntryType, RemTarObjectOptions};
+    use remanence_library::{TapeIoError, VecBlockSink, VecBlockSource};
+    use remanence_parity::{
+        BlockSinkRawTapeSink, BootstrapObjectRepresentation, FilemarkMap, ObjectParitySource,
+        OpenTrust, ParityScheme, PhysicalPositionHint, RawReadOutcome, RawTapeSource, SchemeId,
+        ScopedFilemarkMap, SpaceFilemarksOutcome, TapeFileMapEntry,
+    };
+
+    use super::*;
+
+    const BLOCK_SIZE: u32 = 4096;
+    const TAPE_UUID: [u8; 16] = [0x51; 16];
+
+    #[test]
+    fn plan_rejects_nonregular_catalog_projection_entries() {
+        let file = PreparedFile {
+            source_path: PathBuf::from("/dev/null"),
+            spec: RemTarFileSpec::directory("empty/", "00000000-0000-4000-8000-000000000001"),
+        };
+
+        let err = plan_prepared_object(&options(), &[file]).unwrap_err();
+
+        assert!(err.to_string().contains("regular files only"), "{err}");
+    }
+
+    #[test]
+    fn writes_catalog_projection_and_restores_to_filesystem() {
+        let source_dir = tempfile::Builder::new()
+            .prefix("remanence-stream-src")
+            .tempdir()
+            .unwrap();
+        let restore_dir = tempfile::Builder::new()
+            .prefix("remanence-stream-restore")
+            .tempdir()
+            .unwrap();
+        let first_path = source_dir.path().join("camera.txt");
+        let second_path = source_dir.path().join("clip.bin");
+        fs::write(&first_path, b"camera payload").unwrap();
+        fs::write(&second_path, vec![0xB4; 8193]).unwrap();
+        let files = vec![
+            prepare_regular_file(&first_path, "camera/a.txt", "file-a").unwrap(),
+            prepare_regular_file(&second_path, "video/clip.bin", "file-b").unwrap(),
+        ];
+        let opts = options();
+        let plan = plan_prepared_object(&opts, &files).unwrap();
+        let mut tape = VecBlockSink::new();
+        let report;
+        {
+            let mut raw = BlockSinkRawTapeSink::new(&mut tape);
+            let mut parity =
+                ParitySink::new_sidecar_only(&mut raw, scheme(), TAPE_UUID, BLOCK_SIZE).unwrap();
+            assert_eq!(parity.write_bootstrap().unwrap(), 0);
+            report = write_prepared_object_to_parity(
+                &mut parity,
+                TAPE_UUID,
+                &opts,
+                &files,
+                capacity_input(plan.layout.projected_size_blocks),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(report.catalog.object.object_id, opts.object_id);
+        assert_eq!(report.catalog.files.len(), 2);
+        assert_eq!(report.catalog.object_copy.tape_file_number, 1);
+        let object_entry = report
+            .catalog
+            .tape_file_bundle
+            .entries
+            .iter()
+            .find(|entry| entry.kind == TapeFileKind::Object)
+            .unwrap();
+        assert_eq!(
+            object_entry.object_id.as_deref(),
+            Some(opts.object_id.as_str())
+        );
+        let bootstrap_object_row = object_entry
+            .bootstrap_object_row
+            .as_ref()
+            .expect("object entry carries bootstrap row");
+        assert_eq!(
+            bootstrap_object_row.tape_file_number,
+            report.object_close.tape_file_number
+        );
+        assert_eq!(
+            bootstrap_object_row.stored_block_count,
+            report.layout.projected_size_blocks
+        );
+        match &bootstrap_object_row.representation {
+            BootstrapObjectRepresentation::Plaintext {
+                manifest_first_chunk_lba,
+                manifest_size_bytes,
+                manifest_chunk_count,
+                manifest_sha256,
+            } => {
+                assert_eq!(
+                    Some(BodyLba(*manifest_first_chunk_lba)),
+                    report.layout.manifest.first_chunk_lba
+                );
+                assert_eq!(*manifest_size_bytes, report.layout.manifest.size_bytes);
+                assert_eq!(*manifest_chunk_count, report.layout.manifest.chunk_count);
+                assert_eq!(*manifest_sha256, report.layout.manifest_sha256);
+            }
+            BootstrapObjectRepresentation::Encrypted { .. } => {
+                panic!("plaintext streaming write emitted encrypted bootstrap row")
+            }
+        }
+        assert_eq!(report.audit_events[0].kind, "streaming_object_committed");
+
+        let scoped = scoped_map_from_close(&report.object_close);
+        let mut physical = PhysicalVecTapeSource::from_sink(&tape);
+        let mut object_source = ObjectParitySource::open(
+            &mut physical,
+            scheme(),
+            TAPE_UUID,
+            scoped,
+            BLOCK_SIZE,
+            report.object_close.tape_file_number,
+            OpenTrust::RequireValidated,
+        )
+        .unwrap();
+        let restore = restore_object_to_directory(
+            &mut object_source,
+            opts.chunk_size,
+            report.layout.projected_size_blocks,
+            restore_dir.path(),
+            FilesystemRestoreOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(restore.files_written, 2);
+        assert_eq!(
+            fs::read(restore_dir.path().join("camera/a.txt")).unwrap(),
+            b"camera payload"
+        );
+        assert_eq!(
+            fs::read(restore_dir.path().join("video/clip.bin")).unwrap(),
+            vec![0xB4; 8193]
+        );
+        assert!(!restore_dir.path().join(MANIFEST_PATH).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_object_to_directory_preserves_symlink_and_empty_directory() {
+        let mut opts = options();
+        opts.chunk_size = 4096;
+        let specs = vec![
+            RemTarFileSpec::new("target.txt", "file-target", 6, sha256_array(b"target")),
+            RemTarFileSpec::directory("empty/", "dir-empty"),
+            RemTarFileSpec::symlink("links/latest", "link-latest", "../target.txt"),
+        ];
+        let mut readers: Vec<Box<dyn Read>> = vec![
+            Box::new(&b"target"[..]),
+            Box::new(io::empty()),
+            Box::new(io::empty()),
+        ];
+        let mut streams: Vec<RemTarFileStream<'_>> = specs
+            .into_iter()
+            .zip(readers.iter_mut())
+            .map(|(spec, reader)| RemTarFileStream::new(spec, reader.as_mut()))
+            .collect();
+        let mut sink = VecBlockSink::new();
+        let layout = write_rem_tar_object_from_readers(&mut sink, &opts, &mut streams).unwrap();
+        let mut source = VecBlockSource::new(sink.blocks);
+        let restore_dir = tempfile::Builder::new()
+            .prefix("remanence-stream-restore-nonregular")
+            .tempdir()
+            .unwrap();
+
+        let restore = restore_object_to_directory(
+            &mut source,
+            opts.chunk_size,
+            layout.projected_size_blocks,
+            restore_dir.path(),
+            FilesystemRestoreOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(restore.files_written, 1);
+        assert_eq!(restore.directories_seen, 1);
+        assert_eq!(restore.symlinks_written, 1);
+        assert_eq!(restore.bytes_written, 6);
+        assert_eq!(
+            fs::read(restore_dir.path().join("target.txt")).unwrap(),
+            b"target"
+        );
+        assert!(restore_dir.path().join("empty").is_dir());
+        let link_path = restore_dir.path().join("links/latest");
+        assert!(fs::symlink_metadata(&link_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_link(link_path).unwrap(),
+            PathBuf::from("../target.txt")
+        );
+    }
+
+    #[test]
+    fn restore_rejects_paths_that_escape_destination() {
+        let root = tempfile::Builder::new()
+            .prefix("remanence-stream-escape")
+            .tempdir()
+            .unwrap();
+        let mut sink =
+            FilesystemRestoreSink::new(root.path(), FilesystemRestoreOptions::default()).unwrap();
+        let entry = RemTarStreamEntry {
+            entry_type: RemTarEntryType::Regular,
+            path: "../escape.txt".to_string(),
+            size_bytes: 0,
+            link_target: None,
+            first_chunk_lba: None,
+            chunk_count: 0,
+            data_offset: 0,
+            pax_records: Default::default(),
+        };
+
+        let err = sink.begin_file(&entry).unwrap_err();
+
+        assert!(err.to_string().contains("invalid restore path"));
+    }
+
+    #[test]
+    fn restore_rejects_missing_file_sha256_metadata() {
+        let root = tempfile::Builder::new()
+            .prefix("remanence-stream-missing-sha")
+            .tempdir()
+            .unwrap();
+        let mut sink =
+            FilesystemRestoreSink::new(root.path(), FilesystemRestoreOptions::default()).unwrap();
+        let entry = RemTarStreamEntry {
+            entry_type: RemTarEntryType::Regular,
+            path: "payload.bin".to_string(),
+            size_bytes: 0,
+            link_target: None,
+            first_chunk_lba: None,
+            chunk_count: 0,
+            data_offset: 0,
+            pax_records: BTreeMap::new(),
+        };
+
+        let err = sink.begin_file(&entry).unwrap_err();
+
+        assert!(err.to_string().contains("REMANENCE.file_sha256"), "{err}");
+        assert!(!root.path().join("payload.bin").exists());
+    }
+
+    #[test]
+    fn restore_rejects_file_sha256_mismatch() {
+        let root = tempfile::Builder::new()
+            .prefix("remanence-stream-sha-mismatch")
+            .tempdir()
+            .unwrap();
+        let mut sink =
+            FilesystemRestoreSink::new(root.path(), FilesystemRestoreOptions::default()).unwrap();
+        let mut pax_records = BTreeMap::new();
+        pax_records.insert("REMANENCE.file_sha256".to_string(), "00".repeat(32));
+        let entry = RemTarStreamEntry {
+            entry_type: RemTarEntryType::Regular,
+            path: "payload.bin".to_string(),
+            size_bytes: 7,
+            link_target: None,
+            first_chunk_lba: Some(BodyLba(0)),
+            chunk_count: 1,
+            data_offset: 0,
+            pax_records,
+        };
+
+        sink.begin_file(&entry).unwrap();
+        sink.write_file_data(b"payload").unwrap();
+        let err = sink.end_file(&entry).unwrap_err();
+
+        assert!(
+            matches!(err, FormatError::FileDigestMismatch { .. }),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_rejects_symlink_parent_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::Builder::new()
+            .prefix("remanence-stream-symlink-root")
+            .tempdir()
+            .unwrap();
+        let outside = tempfile::Builder::new()
+            .prefix("remanence-stream-symlink-outside")
+            .tempdir()
+            .unwrap();
+        symlink(outside.path(), root.path().join("escape")).unwrap();
+        let mut sink = FilesystemRestoreSink::new(
+            root.path(),
+            FilesystemRestoreOptions {
+                overwrite: true,
+                include_manifest: true,
+            },
+        )
+        .unwrap();
+        let mut pax_records = BTreeMap::new();
+        pax_records.insert(
+            "REMANENCE.file_sha256".to_string(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+        );
+        let entry = RemTarStreamEntry {
+            entry_type: RemTarEntryType::Regular,
+            path: "escape/file.txt".to_string(),
+            size_bytes: 0,
+            link_target: None,
+            first_chunk_lba: None,
+            chunk_count: 0,
+            data_offset: 0,
+            pax_records,
+        };
+
+        let err = sink.begin_file(&entry).unwrap_err();
+
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(!outside.path().join("file.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_archive_reader_rejects_symlink_parent_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::Builder::new()
+            .prefix("remanence-archive-symlink-root")
+            .tempdir()
+            .unwrap();
+        let outside = tempfile::Builder::new()
+            .prefix("remanence-archive-symlink-outside")
+            .tempdir()
+            .unwrap();
+        symlink(outside.path(), root.path().join("escape")).unwrap();
+        let entry = normalized_entry("file-a", "escape/file.txt", EntryKind::RegularFile, Some(0));
+        let mut reader = ScriptedArchiveReader {
+            entries: vec![entry],
+            damages: vec![],
+            data: vec![],
+        };
+
+        let err = restore_archive_reader_to_directory(
+            &mut reader,
+            root.path(),
+            FilesystemRestoreOptions {
+                overwrite: true,
+                include_manifest: true,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(!outside.path().join("file.txt").exists());
+    }
+
+    #[test]
+    fn scan_archive_reader_collects_normalized_entries_and_damage() {
+        let entry = normalized_entry("file-a", "camera/a.txt", EntryKind::RegularFile, Some(5));
+        let damage = damage_range("file-a", 2, 5, DamageStatus::Missing);
+        let mut reader = ScriptedArchiveReader {
+            entries: vec![entry.clone()],
+            damages: vec![damage.clone()],
+            data: vec![],
+        };
+
+        let report = scan_archive_reader(&mut reader).unwrap();
+
+        assert_eq!(report.scan.entries, 1);
+        assert_eq!(report.scan.damage_events, 1);
+        assert_eq!(report.entries, vec![entry]);
+        assert_eq!(report.damages, vec![damage]);
+    }
+
+    #[test]
+    fn restore_archive_reader_writes_normalized_entries() {
+        let root = tempfile::Builder::new()
+            .prefix("remanence-archive-restore")
+            .tempdir()
+            .unwrap();
+        let entries = vec![
+            normalized_entry("dir", "camera", EntryKind::Directory, Some(0)),
+            normalized_entry("file-a", "camera/a.txt", EntryKind::RegularFile, Some(7)),
+        ];
+        let mut reader = ScriptedArchiveReader {
+            entries,
+            damages: vec![],
+            data: vec![("file-a".into(), 0, b"payload".to_vec())],
+        };
+
+        let report = restore_archive_reader_to_directory(
+            &mut reader,
+            root.path(),
+            FilesystemRestoreOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.stream.entries, 2);
+        assert_eq!(report.files_written, 1);
+        assert_eq!(report.directories_seen, 1);
+        assert_eq!(report.bytes_written, 7);
+        assert_eq!(
+            fs::read(root.path().join("camera/a.txt")).unwrap(),
+            b"payload"
+        );
+    }
+
+    #[test]
+    fn restore_archive_reader_allows_missing_damage_partial_file() {
+        let root = tempfile::Builder::new()
+            .prefix("remanence-archive-restore-missing")
+            .tempdir()
+            .unwrap();
+        let entry = normalized_entry("file-a", "camera/a.txt", EntryKind::RegularFile, Some(5));
+        let damage = damage_range("file-a", 2, 5, DamageStatus::Missing);
+        let mut reader = ScriptedArchiveReader {
+            entries: vec![entry],
+            damages: vec![damage.clone()],
+            data: vec![("file-a".into(), 0, b"ab".to_vec())],
+        };
+
+        let report = restore_archive_reader_to_directory(
+            &mut reader,
+            root.path(),
+            FilesystemRestoreOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.stream.damage_events, 1);
+        assert_eq!(report.damages, vec![damage]);
+        assert_eq!(report.bytes_written, 2);
+        assert_eq!(fs::read(root.path().join("camera/a.txt")).unwrap(), b"ab");
+    }
+
+    #[test]
+    fn restore_archive_reader_writes_sparse_offsets() {
+        let root = tempfile::Builder::new()
+            .prefix("remanence-archive-restore-sparse")
+            .tempdir()
+            .unwrap();
+        let entry = normalized_entry("file-a", "camera/a.txt", EntryKind::RegularFile, Some(5));
+        let damage = damage_range("file-a", 2, 4, DamageStatus::Missing);
+        let mut reader = ScriptedArchiveReader {
+            entries: vec![entry],
+            damages: vec![damage.clone()],
+            data: vec![
+                ("file-a".into(), 0, b"ab".to_vec()),
+                ("file-a".into(), 4, b"e".to_vec()),
+            ],
+        };
+
+        let report = restore_archive_reader_to_directory(
+            &mut reader,
+            root.path(),
+            FilesystemRestoreOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.damages, vec![damage]);
+        assert_eq!(report.bytes_written, 3);
+        assert_eq!(
+            fs::read(root.path().join("camera/a.txt")).unwrap(),
+            b"ab\0\0e"
+        );
+    }
+
+    #[test]
+    fn restore_archive_reader_rejects_short_file_without_tail_damage() {
+        let root = tempfile::Builder::new()
+            .prefix("remanence-archive-restore-short")
+            .tempdir()
+            .unwrap();
+        let entry = normalized_entry("file-a", "camera/a.txt", EntryKind::RegularFile, Some(5));
+        let damage = damage_range("file-a", 0, 1, DamageStatus::Missing);
+        let mut reader = ScriptedArchiveReader {
+            entries: vec![entry],
+            damages: vec![damage],
+            data: vec![("file-a".into(), 0, b"ab".to_vec())],
+        };
+
+        let err = restore_archive_reader_to_directory(
+            &mut reader,
+            root.path(),
+            FilesystemRestoreOptions::default(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("did not cover declared size 5"));
+    }
+
+    fn options() -> RemTarObjectOptions {
+        let mut opts = RemTarObjectOptions::new(
+            "99999999-9999-9999-9999-999999999999",
+            "caller-stream",
+            "2026-05-28T11:30:00+05:30",
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        );
+        opts.chunk_size = BLOCK_SIZE as usize;
+        opts
+    }
+
+    fn sha256_array(bytes: &[u8]) -> [u8; 32] {
+        let digest = Sha256::digest(bytes);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest);
+        out
+    }
+
+    fn scheme() -> ParityScheme {
+        ParityScheme {
+            id: SchemeId::new_static("stream-orchestration-test"),
+            data_blocks_per_stripe: 2,
+            parity_blocks_per_stripe: 1,
+            stripes_per_neighborhood: 2,
+        }
+    }
+
+    fn capacity_input(projected_object_blocks: u64) -> CapacityReserveInput {
+        CapacityReserveInput {
+            projected_object_blocks,
+            block_size_bytes: BLOCK_SIZE as u64,
+            current_epoch_fill_blocks: 0,
+            data_shards_per_epoch: 4,
+            parity_shards_per_epoch: 2,
+            sidecar_index_block_count: 1,
+            object_filemark_blocks: 1,
+            sidecar_filemark_blocks: 1,
+            bootstrap_filemark_blocks: 1,
+            pending_completed_sidecars: 0,
+            remaining_bootstrap_count: 1,
+            safety_margin_blocks: 4,
+            remaining_tape_blocks: 10_000,
+            empty_tape_usable_blocks: 10_000,
+            pending_completed_epoch_parity_bytes: 0,
+            remaining_spool_bytes: 10_000_000,
+        }
+    }
+
+    fn scoped_map_from_close(close: &ObjectWriteSummary) -> ScopedFilemarkMap {
+        let mut entries = vec![
+            TapeFileMapEntry::bootstrap(0, 1),
+            TapeFileMapEntry::object(
+                close.tape_file_number,
+                close.data_block_count,
+                close.first_parity_data_ordinal,
+            ),
+        ];
+        entries.extend(
+            close
+                .sidecars_emitted
+                .iter()
+                .map(|sidecar| sidecar.tape_file_entry().to_map_entry()),
+        );
+        entries.extend(
+            close
+                .control_tape_files_emitted
+                .iter()
+                .map(|entry| entry.to_map_entry()),
+        );
+        let map = FilemarkMap::new(entries).unwrap();
+        ScopedFilemarkMap::from_catalog(map, close.highest_protected_ordinal)
+    }
+
+    fn normalized_entry(
+        file_id: &str,
+        path: &str,
+        kind: EntryKind,
+        size_bytes: Option<u64>,
+    ) -> NormalizedEntry {
+        NormalizedEntry {
+            file_id: file_id.into(),
+            path: path.to_string(),
+            kind,
+            link_target: None,
+            size_bytes,
+            adapter_state: Vec::new(),
+        }
+    }
+
+    fn damage_range(file_id: &str, start: u64, end: u64, status: DamageStatus) -> DamageRange {
+        DamageRange {
+            file_id: file_id.into(),
+            start,
+            end,
+            status,
+            adapter_state: Vec::new(),
+        }
+    }
+
+    struct ScriptedArchiveReader {
+        entries: Vec<NormalizedEntry>,
+        damages: Vec<DamageRange>,
+        data: Vec<(remanence_format::FileId, u64, Vec<u8>)>,
+    }
+
+    impl ArchiveReader for ScriptedArchiveReader {
+        fn scan(&mut self, sink: &mut dyn EntryCatalogSink) -> Result<ScanReport, FormatError> {
+            for entry in &self.entries {
+                sink.entry(entry)?;
+            }
+            for damage in &self.damages {
+                sink.damage(damage)?;
+            }
+            Ok(ScanReport {
+                entries: self.entries.len() as u64,
+                damage_events: self.damages.len() as u64,
+                archive_gaps: 0,
+            })
+        }
+
+        fn stream_all(
+            &mut self,
+            sink: &mut dyn ArchiveEventSink,
+        ) -> Result<StreamReport, FormatError> {
+            let mut bytes = 0u64;
+            for entry in &self.entries {
+                sink.begin_entry(entry)?;
+                if entry.kind == EntryKind::RegularFile {
+                    for (_, file_offset, data) in self
+                        .data
+                        .iter()
+                        .filter(|(file_id, _, _)| *file_id == entry.file_id)
+                    {
+                        sink.write_file_data(*file_offset, data)?;
+                        bytes += data.len() as u64;
+                    }
+                }
+                for damage in self
+                    .damages
+                    .iter()
+                    .filter(|damage| damage.file_id == entry.file_id)
+                {
+                    sink.report_damage(damage)?;
+                }
+                sink.end_entry(entry)?;
+            }
+            Ok(StreamReport {
+                entries: self.entries.len() as u64,
+                bytes,
+                damage_events: self.damages.len() as u64,
+                archive_gaps: 0,
+            })
+        }
+
+        fn stream_file(
+            &mut self,
+            _file_id: &remanence_format::FileId,
+            _sink: &mut dyn remanence_format::FileDataSink,
+        ) -> Result<remanence_format::FileStreamReport, FormatError> {
+            Err(FormatError::unsupported(
+                "scripted archive reader does not implement stream_file",
+            ))
+        }
+    }
+
+    struct PhysicalVecTapeSource {
+        blocks_by_lba: HashMap<u64, Vec<u8>>,
+        cursor_lba: u64,
+        end_lba: u64,
+        configured_block_size: Option<u32>,
+    }
+
+    impl PhysicalVecTapeSource {
+        fn from_sink(sink: &VecBlockSink) -> Self {
+            Self {
+                blocks_by_lba: sink
+                    .block_lbas
+                    .iter()
+                    .copied()
+                    .zip(sink.blocks.iter().cloned())
+                    .collect(),
+                cursor_lba: 0,
+                end_lba: sink.next_lba(),
+                configured_block_size: None,
+            }
+        }
+    }
+
+    impl RawTapeSource for PhysicalVecTapeSource {
+        fn configure_fixed_block_size(&mut self, block_size: u32) -> Result<(), ParityError> {
+            if block_size == 0 {
+                return Err(ParityError::Invariant("fixed block size is zero"));
+            }
+            self.configured_block_size = Some(block_size);
+            Ok(())
+        }
+
+        fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
+            self.cursor_lba = hint.lba;
+            Ok(())
+        }
+
+        fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
+            if count < 0 {
+                return Err(ParityError::TapeIo(TapeIoError::OperationFailed(
+                    "backward filemark spacing is not implemented in this fixture".to_string(),
+                )));
+            }
+            let mut remaining = count;
+            while remaining > 0 && self.cursor_lba < self.end_lba {
+                if self.blocks_by_lba.contains_key(&self.cursor_lba) {
+                    self.cursor_lba += 1;
+                    continue;
+                }
+                self.cursor_lba += 1;
+                remaining -= 1;
+            }
+            Ok(SpaceFilemarksOutcome {
+                filemarks_spaced: count - remaining,
+                position_after: PhysicalPositionHint::new(self.cursor_lba),
+                hit_end_of_data: remaining > 0,
+            })
+        }
+
+        fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
+            if let Some(block) = self.blocks_by_lba.get(&self.cursor_lba) {
+                if buf.len() < block.len() {
+                    return Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall {
+                        actual: block.len() as u32,
+                        provided: buf.len() as u32,
+                    }));
+                }
+                buf[..block.len()].copy_from_slice(block);
+                self.cursor_lba += 1;
+                return Ok(RawReadOutcome::Block {
+                    bytes: block.len(),
+                    position_after: PhysicalPositionHint::new(self.cursor_lba),
+                });
+            }
+            if self.cursor_lba < self.end_lba {
+                self.cursor_lba += 1;
+                return Ok(RawReadOutcome::Filemark {
+                    position_after: PhysicalPositionHint::new(self.cursor_lba),
+                });
+            }
+            Ok(RawReadOutcome::EndOfData {
+                position_after: PhysicalPositionHint::new(self.cursor_lba),
+            })
+        }
+
+        fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+            Ok(PhysicalPositionHint::new(self.cursor_lba))
+        }
+    }
+}

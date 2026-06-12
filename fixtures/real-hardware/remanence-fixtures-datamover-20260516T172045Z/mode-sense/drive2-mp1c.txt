@@ -1,0 +1,12 @@
+    inquiry cdb: [12 00 00 00 24 00]
+    mode sense(10) cdb: [5a 00 1c 00 00 00 00 10 00 00]
+    HP        Ultrium 7-SCSI    Q387   peripheral_type: tape [0x1]
+Mode parameter header from MODE SENSE(10):
+  Mode data length=28, medium type=0x00, specific param=0x10, longlba=0
+  Block descriptor length=8
+> General mode parameter block descriptors:
+   Density code=0x0
+ 00     00 00 00 00 00 00 00 00
+
+>> Informational exceptions control (tape version), page_control: current
+ 00     1c 0a 08 04 00 00 00 00  00 00 00 00

@@ -1,0 +1,4 @@
+    HPE       MSL3040           3350
+Temperature page  [0xd]
+  Current temperature = 47 C
+  Reference temperature = 95 C

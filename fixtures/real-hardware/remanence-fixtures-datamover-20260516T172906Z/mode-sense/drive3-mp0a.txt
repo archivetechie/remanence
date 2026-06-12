@@ -1,0 +1,12 @@
+    inquiry cdb: [12 00 00 00 24 00]
+    mode sense(10) cdb: [5a 00 0a 00 00 00 00 10 00 00]
+    HPE       Ultrium 9-SCSI    R3G3   peripheral_type: tape [0x1]
+Mode parameter header from MODE SENSE(10):
+  Mode data length=28, medium type=0x98, specific param=0x10, longlba=0
+  Block descriptor length=8
+> General mode parameter block descriptors:
+   Density code=0x60
+ 00     60 00 00 00 00 00 00 00
+
+>> Control, page_control: current
+ 00     0a 0a 00 01 00 00 00 00  ff ff 00 00

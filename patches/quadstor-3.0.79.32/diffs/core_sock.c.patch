@@ -1,0 +1,11 @@
+--- /home/user/remanence/patches/quadstor-3.0.79.32/originals/core_sock.c	2026-05-16 16:42:17.782414781 +0200
++++ /quadstorvtl/src/export/core_sock.c	2026-05-16 16:43:45.528844041 +0200
+@@ -665,6 +665,8 @@
+ 
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,10,0)) || (defined(RHEL_MAJOR) && RHEL_MAJOR == 9 && RHEL_MINOR >= 5)
+ 	if (file_bdev(b_dev)->bd_dev == lookup)
++#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(6,5,0)) || (defined(RHEL_MAJOR) && RHEL_MAJOR == 9 && RHEL_MINOR == 4) || (defined(CONFIG_SUSE_KERNEL) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
++	if (b_dev->bdev->bd_dev == lookup)
+ #else
+ 	if (b_dev->bd_dev == lookup)
+ #endif

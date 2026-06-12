@@ -1,0 +1,13 @@
+    HP        Ultrium 7-SCSI    S2T1
+Tape usage page  (LTO-5 and LTO-6 specific) [0x30]
+  Thread count: 93
+  Total data sets written: 1113142
+  Total write retries: 19
+  Total unrecovered write errors: 0
+  Total suspended writes: 0
+  Total fatal suspended writes: 0
+  Total data sets read: 4554990
+  Total read retries: 31
+  Total unrecovered read errors: 0
+  Total suspended reads: 0
+  Total fatal suspended reads: 0

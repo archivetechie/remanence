@@ -1,0 +1,98 @@
+{
+  "vector_set": "RAO-NEG-WRITER-1",
+  "spec_section": "13.5",
+  "status": "complete",
+  "scope": "plaintext writer-side vectors executable through public RAO writer APIs",
+  "cases": [
+    {
+      "id": "duplicate-path",
+      "fault": "two payload entries share the same path",
+      "expected_error": "InvalidInput"
+    },
+    {
+      "id": "duplicate-file-id",
+      "fault": "two payload entries share the same REMANENCE.file_id",
+      "expected_error": "InvalidInput"
+    },
+    {
+      "id": "manifest-file-id-collision",
+      "fault": "manifest file_id collides with a payload file_id",
+      "expected_error": "InvalidInput"
+    },
+    {
+      "id": "reserved-remanence-path",
+      "fault": "payload path uses the reserved _remanence namespace",
+      "expected_error": "InvalidInput"
+    },
+    {
+      "id": "control-character-path",
+      "fault": "payload path contains an ASCII control character",
+      "expected_error": "InvalidInput"
+    },
+    {
+      "id": "absolute-path",
+      "fault": "payload path is absolute",
+      "expected_error": "InvalidInput"
+    },
+    {
+      "id": "parent-component-path",
+      "fault": "payload path contains a parent-directory component",
+      "expected_error": "InvalidInput"
+    },
+    {
+      "id": "dot-component-path",
+      "fault": "payload path contains a dot component",
+      "expected_error": "InvalidInput"
+    },
+    {
+      "id": "empty-component-path",
+      "fault": "payload path contains an empty component",
+      "expected_error": "InvalidInput"
+    },
+    {
+      "id": "trailing-slash-file-path",
+      "fault": "regular-file path ends in slash",
+      "expected_error": "InvalidInput"
+    },
+    {
+      "id": "malformed-mtime",
+      "fault": "mtime is not POSIX pax decimal seconds",
+      "expected_error": "InvalidInput"
+    },
+    {
+      "id": "streamed-wrong-hash",
+      "fault": "streamed payload bytes do not match declared file_sha256",
+      "expected_error": "InvalidInput"
+    },
+    {
+      "id": "streamed-wrong-size",
+      "fault": "streamed payload ends before declared size_bytes",
+      "expected_error": "InvalidInput"
+    },
+    {
+      "id": "chunk-size-not-multiple-of-512",
+      "fault": "chunk_size is not a positive multiple of 512",
+      "expected_error": "InvalidInput"
+    },
+    {
+      "id": "symlink-nonzero-size",
+      "fault": "symlink entry declares a nonzero payload size",
+      "expected_error": "InvalidInput"
+    },
+    {
+      "id": "directory-nonzero-size",
+      "fault": "directory entry declares a nonzero payload size",
+      "expected_error": "InvalidInput"
+    },
+    {
+      "id": "symlink-missing-target",
+      "fault": "symlink entry omits link_target",
+      "expected_error": "InvalidInput"
+    },
+    {
+      "id": "directory-missing-trailing-slash",
+      "fault": "directory entry path does not end in slash",
+      "expected_error": "InvalidInput"
+    }
+  ]
+}

@@ -1,0 +1,181 @@
+[
+  {
+    "uuid": "14df0795-43ad-4706-a0a0-cbb725d0a986",
+    "datetime": "2026-06-03T14:23:54+02:00",
+    "author": "claude",
+    "subject": "Layer 5 S5a: whole-object read session over rem-daemon (ReadSessionService)",
+    "idref": null,
+    "status": "approved",
+    "handoff_to": "codex",
+    "round": 0,
+    "scope": "Implement docs/superpowers/plans/2026-06-03-layer5-s5a-read-session.md (design docs/layer5-s5a-read-session-design-v0.1.md): Layer 5 S5a — whole-object read session over rem-daemon. Builds on committed S1 (3e9ea08) + S4a (c1539d6). Follow the plan's TDD tasks. IN: (1) Relocate CapturePayloadSink + a factored read_object_payload(source, block_size, block_count, tape_file_number, sink) from remanence-cli/pool_ops into a new remanence-api read_core module; re-point A.9 run_archive_read + B.7 verify (their tests must stay green). (2) ChannelWriter in read_core: impl std::io::Write that blocking_sends pb::BytesChunk{data, is_last:false} over a tokio::mpsc::Sender<Result<BytesChunk,Status>>, plus finish() sending the terminal is_last=true chunk. (3) Generalize the drive owner: rename WriteCommand→SessionCommand (+ OpenRead/ReadFile/CloseRead/GetRead arms), spawn_writer→spawn_session_owner, writer_loop→session_loop; add handle_open_read (mount via load_tape_by_uuid + a read inner loop holding the DriveHandle as a stack local) + stream_one_object (resolve the object's copy on the pinned tape via find_native_object_copies + list_tape_files + get_tape, rewind, read_object_payload into CapturePayloadSink<ChannelWriter>, send the terminal chunk). A second Open* while active → FAILED_PRECONDITION; object not on the pinned tape → FAILED_PRECONDITION; unknown object → NOT_FOUND. (4) ApiState: rename write_tx→session_tx + with_write_owner→with_session_owner; rewrite ReadSessionApi handlers — open_read_session/close/get dispatch oneshot commands to the owner; read_file + read_object_range with a whole-file range (start_byte==0 && end_byte==0) dispatch ReadFile with an mpsc chunk channel and return ReceiverStream; any other range → Status::unimplemented (S5b); drop the in-memory read mock (read_session_object_bytes/frame_object_bytes path). (5) remanence-daemon serve(): register ReadSessionServiceServer. Single active session (read OR write) at a time (Layer-2-bounded); blocking_send/blocking_recv only on the owner std::thread, never the async handler. Gates: cargo fmt --all, cargo clippy --workspace --all-targets -- -D warnings, cargo test. ChannelWriter + the read inner-loop borrow + channel Send/Sync were cargo-check + clippy verified 2026-06-03. OUT: ranged/partial reads (S5b); multi-drive parallelism (gated by the Layer 2 one-DriveHandle-per-library constraint — needs a Layer 2 redesign → per-drive owners, tracked in docs/layer5-roadmap.md); drive_target; idempotency-key dedup; multi-file file_id selection; and the manual hardware harness e2e (Plan Task 6 Step 3, human-run).",
+    "summary": "S5a is the read-bytes counterpart to S4a, completing the data plane: stream an object off tape over the daemon (OpenReadSession → ReadFile → CloseReadSession), the production sequel to the A.9/B.7 rem-debug break-glass read. It generalizes S4a's single writer thread into a drive-session owner serving read OR write (one active session — correct AND currently forced by Layer 2's one-open-DriveHandle-per-library rule). It reuses A.9's read core: relocate CapturePayloadSink + factor read_object_payload into remanence-api, then stream BytesChunk via a ChannelWriter (sync std::io::Write → tokio blocking_send) reusing CapturePayloadSink<ChannelWriter>; the async handler returns a ReceiverStream (the EnumerateObjects pattern). Bytes and locators agree across CLI and daemon by construction (shared core), preserving the cross-transport parity the read path proved. The multi-drive parallelism the operator wants is gated by a Layer 2 constraint and tracked as a separate cross-layer workstream. Verified per rust-design-verification: ChannelWriter, the DriveHandle-held-across-read-loop borrow, and the channel Send/Sync all cargo-check + clippy clean. Plan is 5 automatable TDD tasks + a manual hardware task.",
+    "files_modified": [],
+    "verification": "cargo fmt --all clean; cargo clippy --workspace --all-targets -- -D warnings clean; cargo test passes including new tests channel_writer_frames_and_streams, session_command_bounds_hold, and a read_object_payload-over-VecBlockSource payload-extraction test; the A.9/B.7 CLI regression suite stays green after relocating the read core. (Manual, human-run, OUT of Codex scope: rem-daemon --config --allow <serial> on the akash QuadStor fixture; write an object then OpenReadSession{tape_target} → ReadFile → collect BytesChunk; bytes bit-equal to the source file and to rem-debug archive read; a concurrent second Open* → FAILED_PRECONDITION.)"
+  },
+  {
+    "uuid": "5e738c9d-9e79-433a-8050-cdcfb60f9a63",
+    "datetime": "2026-06-03T14:41:14+02:00",
+    "author": "codex",
+    "subject": "Implement Layer 5 S5a whole-object read session",
+    "idref": "14df0795-43ad-4706-a0a0-cbb725d0a986",
+    "status": "complete",
+    "handoff_to": "gemini",
+    "round": 0,
+    "summary": "Implemented S5a within the approved scope. Added remanence-api::read_core with the relocated CapturePayloadSink, read_object_payload, and ChannelWriter; repointed the CLI A.9/B.7 read/verify path to the shared helper. Generalized the S4a write owner into a single drive-session owner using SessionCommand, preserving write behavior while adding OpenRead, ReadFile, CloseRead, and GetRead. OpenRead mounts the pinned tape through load_tape_by_uuid and verifies tape identity before returning OPEN; ReadFile validates the active read session, resolves the object copy on the pinned tape through the catalog, sets the drive block size, streams through CapturePayloadSink<ChannelWriter>, honors stream_chunk_bytes, and sends the terminal is_last chunk. ApiState now uses session_tx/with_session_owner, ReadSessionApi dispatches to the owner and rejects S5b ranges and multi-file file_id reads, and rem-daemon registers ReadSessionServiceServer. The manual hardware e2e remains out of Codex scope per the approved entry.",
+    "files_modified": [
+      "crates/remanence-api/src/lib.rs",
+      "crates/remanence-api/src/read_core.rs",
+      "crates/remanence-api/src/write_owner.rs",
+      "crates/remanence-cli/src/pool_ops.rs",
+      "crates/remanence-daemon/src/lib.rs",
+      "crates/remanence-daemon/src/main.rs",
+      "journal/2026-06-03.json"
+    ],
+    "verification": [
+      "cargo check -p remanence-api -p remanence-cli -p remanence-daemon (passed)",
+      "cargo test -p remanence-api && cargo test -p remanence-cli (passed)",
+      "cargo fmt --all (passed)",
+      "cargo clippy --workspace --all-targets -- -D warnings (passed)",
+      "cargo test --workspace (passed)",
+      "git diff --check (passed)"
+    ]
+  },
+  {
+    "uuid": "508e92bf-3573-452e-bdbd-e34f7fc4c0c0",
+    "datetime": "2026-06-03T14:44:43+02:00",
+    "author": "gemini",
+    "subject": "review: Layer 5 S5a whole-object read session — PASS",
+    "idref": "5e738c9d-9e79-433a-8050-cdcfb60f9a63",
+    "status": "done",
+    "verdict": "PASS",
+    "handoff_to": null,
+    "round": 0,
+    "blocking_issues": [],
+    "non_blocking_notes": [],
+    "summary": "Implementation correctly realizes the Layer 5 S5a design scope. The `read_core` module correctly centralizes logic for payload captures and chunk streams. The generalization of `write_owner` to a generic drive-session owner ensures that hardware access remains isolated to a single thread while servicing both read and write workflows transparently. Reads properly reject disjoint operations (e.g. ranged multi-file reads mapped to S5b) and return appropriate error codes. Tests and clippy execute successfully with zero regressions."
+  },
+  {
+    "uuid": "3b66a481-dec7-45e9-a4e0-f4a9d554b4bb",
+    "datetime": "2026-06-03T15:13:34+02:00",
+    "author": "claude",
+    "subject": "Layer 5 S3a: operations + cancellation async backbone (+ Catalog.ReconcileTape producer)",
+    "idref": null,
+    "status": "approved",
+    "handoff_to": "codex",
+    "round": 0,
+    "scope": "Implement docs/superpowers/plans/2026-06-03-layer5-s3a-operations.md (design docs/layer5-s3a-operations-design-v0.1.md): Layer 5 S3a — the async operation backbone + Catalog.ReconcileTape as its first producer. Builds on S1/S4a/S5a. Follow the plan's TDD tasks. IN: (1) New remanence-api `operations` module: OperationRegistry (Arc<Mutex<HashMap<Uuid,OpEntry>>>, Clone+Default, Send+Sync) — per-op progress ring buffer + tokio::broadcast::Sender<OperationStatus> + Arc<AtomicBool> cancel token; OperationHandle (Send) producer handle (publish + is_cancelled); build_watch_stream (broadcast→mpsc→ReceiverStream: replay the ring then live updates, close on terminal). Add ApiState.operations, default-initialized in every constructor. (2) DaemonService.list_operations: implement the filter map (kind=/state=/since=) via a pure matches_filter (ignore unknown keys), retaining matching projected operations. (3) watch_operation (registry.watch → OperationStatusStream) + cancel_operation (registry.request_cancel + record a CancelRequested audit event, mirroring the existing OperationStarted/RequestReceived emit path). (4) write_owner: SessionCommand::Reconcile{tape_uuid, handle} + handle_reconcile — mount via load_tape_by_uuid, run scan_reconstruct_filemark_map, reconcile the tape_files projection for the tape (v1: scan + tape_files only), publish per-tape-file progress via the handle, check handle.is_cancelled() at tape-file boundaries → Succeeded/Cancelled/Failed. (5) Catalog.reconcile_tape: record RequestReceived (QUEUED) → operations.register → try_send Reconcile to session_tx (busy owner → FAILED_PRECONDITION) → return OperationRef IMMEDIATELY (fire-and-track — the first async RPC). Single active drive session (reconcile vs read vs write); blocking_recv/blocking work only on the owner std::thread. Gates: cargo fmt --all, cargo clippy --workspace --all-targets -- -D warnings, cargo test. The registry Send+Sync, the watch stream, and Reconcile-on-owner were cargo-check + clippy verified 2026-06-03. OUT: richer reconcile (damage recovery, parity-aware, cross-tape); operation resume-after-restart; idempotency-key dedup; pagination beyond unpaged; the S6 robotics producers (they reuse this backbone); and the manual hardware harness e2e (Plan Task 6 Step 2, human-run).",
+    "summary": "S3a is the async backbone — fire a long op, get an OperationRef, then poll/watch/cancel — and wires Catalog.ReconcileTape as its first real producer. Two representations of an operation: the existing durable audit→operations projection (GetOperation/ListOperations, survives restart) plus a NEW live in-memory registry (progress ring buffer + tokio broadcast + Arc<AtomicBool> cancel token) for WatchOperation streaming + CancelOperation signaling. Cancellation is cooperative per spec §11.3: CancelOperation sets the token + records CancelRequested; the running op honors it at safe points (tape-file boundaries for reconcile) → CANCELLED. ReconcileTape returns OperationRef immediately and dispatches a Reconcile command to the drive-session owner (a third session kind beside read/write, single-session), which scans the tape via scan_reconstruct_filemark_map and reconciles the tape_files projection, publishing progress. This unblocks S6 (whose OperationRef RPCs reuse the backbone). Verified per rust-design-verification: the registry is Send+Sync (shared across async handlers + the owner thread), the watch stream is broadcast→mpsc→ReceiverStream (no BroadcastStream feature), and the Reconcile-on-owner command is Send. Plan is 5 automatable TDD tasks + a manual hardware task.",
+    "files_modified": [],
+    "verification": "cargo fmt --all clean; cargo clippy --workspace --all-targets -- -D warnings clean; cargo test passes including new tests registry_publishes_replays_and_cancels, operation_filter_matches_kind_state_since, watch_streams_until_terminal_and_cancel_flips_token; the S1/S4a/S5a regression suite stays green. (Manual, human-run, OUT of Codex scope: with rem-daemon on the akash QuadStor fixture, Catalog.ReconcileTape{tape_uuid} → OperationRef; Daemon.WatchOperation streams progress → SUCCEEDED; CancelOperation mid-scan → CANCELLED; a concurrent Open* during reconcile → FAILED_PRECONDITION; ListOperations{state=succeeded} shows it.)"
+  },
+  {
+    "uuid": "7d63061d-1848-4a9a-85bb-c3c7d3dbfcc5",
+    "datetime": "2026-06-03T15:42:49+02:00",
+    "author": "codex",
+    "subject": "Layer 5 S3a operations backbone and ReconcileTape implementation",
+    "idref": "3b66a481-dec7-45e9-a4e0-f4a9d554b4bb",
+    "status": "complete",
+    "handoff_to": "gemini",
+    "round": 0,
+    "summary": "Implemented the S3a async operation backbone: a live OperationRegistry with replayable watch streams, cancellation tokens, Daemon.ListOperations filtering, WatchOperation, and CancelOperation audit recording. Wired Catalog.ReconcileTape as the first fire-and-track producer with RequestReceived audit, single-session reservation, immediate OperationRef dispatch, and failed-dispatch durable failure handling. Added write-owner Reconcile handling that loads the tape, scans with scan_reconstruct_filemark_map, reconciles only the tape_files projection, publishes progress, and honors cancellation at safe boundaries. Added a state projection helper that preserves native object/object_copy projections, plus tests for registry streaming/cancel, filters, terminal cancel durability, session reservation, and tape_files-only reconciliation.",
+    "files_modified": [
+      "crates/remanence-api/Cargo.toml",
+      "crates/remanence-api/src/lib.rs",
+      "crates/remanence-api/src/operations.rs",
+      "crates/remanence-api/src/write_owner.rs",
+      "crates/remanence-state/src/index.rs"
+    ],
+    "verification": [
+      "cargo fmt --all: passed",
+      "cargo clippy --workspace --all-targets -- -D warnings: passed",
+      "cargo test: passed",
+      "git diff --check: passed"
+    ]
+  },
+  {
+    "uuid": "d6354919-5d5b-4614-8002-b9f2dcbf33a8",
+    "datetime": "2026-06-03T15:44:48+02:00",
+    "author": "gemini",
+    "subject": "review: Layer 5 S3a operations backbone and ReconcileTape — PASS",
+    "idref": "7d63061d-1848-4a9a-85bb-c3c7d3dbfcc5",
+    "status": "done",
+    "verdict": "PASS",
+    "handoff_to": null,
+    "round": 0,
+    "blocking_issues": [],
+    "non_blocking_notes": [],
+    "summary": "Implementation fully realizes the Layer 5 S3a scope. The async operations backbone `OperationRegistry` is functionally complete and correctly provides live watch streams (`WatchOperation`) and cancellation signals. `Catalog.ReconcileTape` correctly dispatches the new `SessionCommand::Reconcile` to the unified drive-session owner thread, avoiding multi-drive concurrency races. The reconciliation logic successfully extracts metadata via `scan_reconstruct_filemark_map` and pushes bounded updates securely to the `tape_files` projection without destroying existing object copy links. Cancellation boundaries are observed and honored cleanly. Workspace tests compile and pass, and code is cleanly formatted."
+  },
+  {
+    "uuid": "b573b434-3e75-4732-abda-5e8ac2d7aa92",
+    "datetime": "2026-06-03T16:31:34+02:00",
+    "author": "claude",
+    "subject": "Layer 5 S6a: LibraryService read inspection (ListLibraries + GetLibrary)",
+    "idref": null,
+    "status": "approved",
+    "handoff_to": "codex",
+    "round": 0,
+    "scope": "Implement docs/superpowers/plans/2026-06-03-layer5-s6a-library-read.md (design docs/layer5-s6a-library-read-design-v0.1.md): Layer 5 S6a — LibraryService read inspection. Builds on S1/S4a/S5a/S3a. Follow the plan's 5 TDD tasks. IN: (1) Enable the uuid `v5` feature in remanence-api/Cargo.toml. (2) New remanence-api `library` module of PURE projection helpers: library_uuid(serial)=UUIDv5(REMANENCE_LIBRARY_NS, serial) where REMANENCE_LIBRARY_NS is a fixed never-change namespace const; project_library from changer_inquiry.{vendor,product,revision}_str + the derived library_uuid; drive_status → LOADED/IDLE/UNREACHABLE from the static snapshot (installed.is_none()|sg_path.is_none()→UNREACHABLE; loaded→LOADED; else IDLE); project_slot/project_portal/project_drive (element_address u16→u32, voltag→tape_uuid join, last_direction=UNSPECIFIED); project_library_state (last_inventory_at from capture time); voltag_uuid_map(&CatalogIndex) built from list_tapes(None). (3) ApiState: pub(crate) LibrarySnapshot{report, captured_at} + library_snapshot: Option<Arc<LibrarySnapshot>> field (None in the inner ctor; in with_session_owner clone `report` BEFORE it moves into the owner config and capture OffsetDateTime::now_utc()); library_service() accessor; pub use library::LibraryServiceApi. (4) LibraryServiceApi impl pb::library_service_server::LibraryService: list_libraries (project the snapshot; empty Vec when None) + get_library (decode_uuid_bytes → match a library by UUIDv5(serial) → not_found when snapshot None / no match → project_library_state with the voltag join via self.state.index()); the other SEVEN methods stubbed Err(Status::unimplemented): refresh_inventory/move_medium/load_drive/unload_drive/import_element/export_element = \"S6b\", stream_library_events (+ the StreamLibraryEventsStream = Pin<Box<dyn Stream<...>+Send>> assoc type) = \"S6c\". (5) Register pb::library_service_server::LibraryServiceServer::new(state.library_service()) in remanence-daemon serve(). Reads use the ApiState snapshot + a read-only catalog connection (ApiState::index()) ONLY — they never dispatch a SessionCommand to the drive-session owner, so ListLibraries/GetLibrary succeed even while a write/read/reconcile session is busy (no FAILED_PRECONDITION). Verified per rust-design-verification: cargo check + clippy -D warnings clean 2026-06-03 (Arc<DiscoveryReport> Send+Sync, the LibraryService trait + stream assoc type, uuid v5). Gates: cargo fmt --all, cargo clippy --workspace --all-targets -- -D warnings, cargo test. OUT: RefreshInventory and ALL state-changing robotics (MoveMedium, Load/Unload, Import/Export) + DRIVE_STATUS_BUSY / live drive state → S6b; the StreamLibraryEvents body → S6c; durable assigned-at-first-discovery library identity (a libraries table / re-association across a firmware-reflash serial change) → follow-up; PortalSlot.last_direction history; multi-library snapshot refresh and read-only-daemon discovery-for-inventory; pagination; and the manual hardware harness e2e (human-run on the akash QuadStor fixture).",
+    "summary": "S6a is the read half of LibraryService — see the discovered hardware over gRPC without SSH+rem-debug. It adds an Arc<LibrarySnapshot> (the startup DiscoveryReport + capture time) to ApiState and a `library` module that projects it into the proto LibraryState, joining cartridge voltags to catalog tape_uuids via a fresh read-only catalog connection. Two deliberate properties: (a) STATIC-AT-STARTUP — RefreshInventory (S6b) is what refreshes it; last_inventory_at dates the view so staleness is visible; (b) ALWAYS-AVAILABLE — the handlers read the ApiState snapshot + ApiState::index() only, never the drive-session owner, so inventory inspection works even while a session holds the drive. library_uuid = UUIDv5(serial): a deterministic bootstrap that round-trips ListLibraries↔GetLibrary within/across daemon runs while the serial is stable; it is NOT the durable assigned-at-first-discovery identity the proto comment envisions (that survives a serial change on re-flash) — deferred, documented. Drive status is LOADED/IDLE/UNREACHABLE from the snapshot; BUSY needs per-drive live state → S6b. The remaining seven RPCs are stubbed unimplemented so LibraryService registers in full now and S6b/S6c only swap bodies. Verified per rust-design-verification (cargo check + clippy clean). Plan is 5 automatable TDD tasks.",
+    "files_modified": [],
+    "verification": "cargo fmt --all clean; cargo clippy --workspace --all-targets -- -D warnings clean; cargo test passes including new library::tests — library_uuid_is_deterministic_and_serial_specific, project_library_maps_inquiry_and_uuid, drive_status_covers_each_case, joined_tape_uuid_hits_and_misses, project_library_state_projects_and_joins, list_libraries_projects_snapshot, list_libraries_empty_without_snapshot, get_library_returns_state_for_known_uuid, get_library_unknown_uuid_is_not_found, get_library_bad_uuid_is_invalid_argument, get_library_missing_snapshot_is_not_found, get_library_succeeds_while_owner_busy; the S1/S4a/S5a/S3a regression suite stays green. (Manual, human-run, OUT of Codex scope: with rem-daemon on the akash QuadStor fixture, LibraryService.ListLibraries shows the library; GetLibrary{library_uuid} shows drives+slots with tape_uuid populated for catalogued voltags; GetLibrary issued while a write session is open still returns OK.)"
+  },
+  {
+    "uuid": "68ce1026-7c35-4c5b-8acb-f6f880d553f1",
+    "datetime": "2026-06-03T17:22:12+02:00",
+    "author": "codex",
+    "subject": "Layer 5 S6a LibraryService read inspection implementation",
+    "idref": "b573b434-3e75-4732-abda-5e8ac2d7aa92",
+    "status": "complete",
+    "handoff_to": "gemini",
+    "round": 0,
+    "summary": "Implemented the S6a LibraryService read surface. Added UUIDv5 support in remanence-api and the new library projection module, including deterministic library_uuid derivation, DiscoveryReport-to-proto projection helpers, drive status mapping, static last_inventory_at timestamps, voltag-to-tape_uuid catalog joins, and LibraryServiceApi with ListLibraries/GetLibrary live plus S6b/S6c stubs for the remaining methods. ApiState now keeps an Arc LibrarySnapshot captured from the startup DiscoveryReport before the report moves into the session owner, while read-only ApiState instances return an empty library list/not_found. Registered LibraryService on the daemon and extended the Unix-socket integration smoke test to call ListLibraries.",
+    "files_modified": [
+      "Cargo.lock",
+      "crates/remanence-api/Cargo.toml",
+      "crates/remanence-api/src/lib.rs",
+      "crates/remanence-api/src/library.rs",
+      "crates/remanence-daemon/src/lib.rs",
+      "crates/remanence-daemon/tests/serve_catalog.rs"
+    ],
+    "verification": [
+      "cargo fmt --all: passed",
+      "cargo test -p remanence-api library::tests --no-fail-fast: passed",
+      "cargo check -p remanence-api: passed",
+      "cargo build -p remanence-daemon: passed",
+      "cargo test -p remanence-daemon --test serve_catalog --no-fail-fast: passed",
+      "cargo clippy --workspace --all-targets -- -D warnings: passed",
+      "cargo test --workspace: passed",
+      "git diff --check: passed"
+    ]
+  },
+  {
+    "uuid": "78ac9296-63cf-450e-bd1e-10ff64a360a0",
+    "datetime": "2026-06-03T17:24:37+02:00",
+    "author": "gemini",
+    "subject": "review: Layer 5 S6a LibraryService read inspection — PASS",
+    "idref": "68ce1026-7c35-4c5b-8acb-f6f880d553f1",
+    "status": "done",
+    "verdict": "PASS",
+    "handoff_to": null,
+    "round": 0,
+    "blocking_issues": [],
+    "non_blocking_notes": [],
+    "summary": "Implementation fully realizes the Layer 5 S6a scope. The UUIDv5 deterministic library identities are correctly derived and the DiscoveryReport is elegantly projected to the proto surface. Utilizing `Arc<LibrarySnapshot>` captured at startup ensures read inspections like `ListLibraries` and `GetLibrary` remain non-blocking during active hardware sessions. Proper S6b/S6c stubs are wired. All workspace tests and clippy checks pass."
+  },
+  {
+    "uuid": "69806261-ccf3-4d8c-a616-adc91abb7230",
+    "datetime": "2026-06-03T18:39:03+02:00",
+    "author": "claude",
+    "subject": "Layer 5 S6b: LibraryService mutations (RefreshInventory + MoveMedium/LoadDrive/UnloadDrive)",
+    "idref": null,
+    "status": "approved",
+    "handoff_to": "codex",
+    "round": 0,
+    "scope": "Implement docs/superpowers/plans/2026-06-03-layer5-s6b-library-mutations.md (design docs/layer5-s6b-library-mutations-design-v0.1.md): Layer 5 S6b — LibraryService mutations. Builds on S6a + the S3a operations backbone. Follow the plan's 4 tasks. IN: (1) Make ApiState.library_snapshot a mutable cell Option<Arc<RwLock<Arc<LibrarySnapshot>>>>; add ApiState::current_library_snapshot() (recovers a poisoned lock via into_inner); with_session_owner builds the RwLock cell + passes a clone to WriteOwnerConfig; switch the S6a list_libraries/get_library read handlers AND the S6a test helper to read through the cell. (2) Owner (write_owner.rs): WriteOwnerConfig.library_snapshot field; a RoboticsAction enum {Refresh, Move{src,dst}, Load{slot,bay}, Unload{bay,destination:Option<u16>}}; ONE SessionCommand::Robotics{library_serial, action, handle}; handle_robotics = open (cfg.report.library(serial)+lib.open(&cfg.policy)) -> library.refresh() -> act (move_medium/load/unload; nothing for Refresh) -> publish_library_snapshot(cell, library.library().clone()) -> terminal audit/status. publish_library_snapshot replaces the matching library entry by serial and bumps captured_at. record_library_event / fail_library_operation / cancel_library_operation mirror the reconcile helpers (subject_kind=\"library\"; terminal success event = AuditEvent::OperationFinished — there is no OperationSucceeded). Route Robotics in session_loop and reject it in the two in-session loops as owner-busy. (3) gRPC LibraryServiceApi: replace the refresh_inventory/move_medium/load_drive/unload_drive unimplemented stubs with handlers that resolve library_uuid->serial (empty->default_library_serial; else match UUIDv5(serial) in the current snapshot; no match / no snapshot -> not_found), narrow u32->u16 element addresses (overflow -> invalid_argument), map UnloadDrive destination_slot_address==0 -> None, then dispatch_robotics (reserve owner [busy -> FAILED_PRECONDITION], register op, record RequestReceived via new ApiState::record_library_request_received, try_send Robotics, return OperationRef IMMEDIATELY) — mirroring Catalog.reconcile_tape. Keep import_element/export_element + stream_library_events as unimplemented stubs. Single active drive op (a robotics op vs an open read/write/reconcile session -> FAILED_PRECONDITION); cancellation is before-dispatch only (is_cancelled() before the CDB); owner-side execution errors surface as a terminal FAILED OperationStatus carrying the library error's Display message. Verified per rust-design-verification: cargo check + clippy -D warnings clean 2026-06-03 (the RwLock cell keeps ApiState Send+Sync; the Robotics command is Send; LibraryHandle is owned with no lifetime; refresh/move_medium/load/unload/library signatures match). Gates: cargo fmt --all, cargo clippy --workspace --all-targets -- -D warnings, cargo test. OUT: ImportElement/ExportElement (IE-port park-vs-vault vendor semantics + the resulting dirty-state handling) and live DRIVE_STATUS_BUSY / per-drive state -> S6b follow-up; StreamLibraryEvents -> S6c; richer Layer-2 CDB-level audit_hook wiring through the daemon; mid-MOVE cancellation; idempotency-key dedup; rescan()-as-an-RPC; concurrent multi-drive robotics (Layer 2 dependency); and the manual hardware harness e2e (human-run, akash QuadStor fixture).",
+    "summary": "S6b is the write half of LibraryService for same-library robotics. It makes the S6a inventory snapshot a shared mutable cell (Arc<RwLock<Arc<LibrarySnapshot>>>) so post-op state reaches GetLibrary, then wires RefreshInventory + MoveMedium/LoadDrive/UnloadDrive as fire-and-track operations on the S3a backbone: each gRPC handler reserves the single drive-session owner, registers an operation, and returns an OperationRef immediately. The owner runs one SessionCommand::Robotics handler with a uniform open -> refresh() -> act -> publish sequence, calling the EXISTING audited, policy-gated LibraryHandle methods (refresh/move_medium/load/unload) — so the heavy lifting (snapshot preflight, derived-identity gate, MOVE MEDIUM CDB, dirty-state tracking) already exists. refresh() before acting syncs cartridge positions to current hardware so moves compose correctly regardless of drift since startup; RefreshInventory is just the no-action case. Single-session (a robotics op vs a read/write/reconcile session -> FAILED_PRECONDITION); cancellation is before-dispatch only (a robot arm mid-MOVE can't be interrupted). Import/Export (IE-port vendor semantics) and live DRIVE_STATUS_BUSY are a deferred follow-up; StreamLibraryEvents is S6c. Verified per rust-design-verification (LibraryHandle is owned/no-lifetime, so the owner holds it as a plain stack local). Plan is 3 automatable tasks + a gates task.",
+    "files_modified": [],
+    "verification": "cargo fmt --all clean; cargo clippy --workspace --all-targets -- -D warnings clean; cargo test passes including new library::tests (narrow_element_accepts_u16_and_rejects_overflow, refresh_inventory_without_owner_is_unavailable, move_medium_rejects_overflow_element_before_dispatch, move_medium_unknown_library_is_not_found, unload_drive_zero_destination_resolves_without_owner_error_path) and the updated S6a library::tests reading through the RwLock cell; the write_owner channel_and_command_bounds_hold test still asserts SessionCommand: Send; the S1/S4a/S5a/S3a/S6a regression suite + the daemon serve_catalog e2e stay green. (Manual, human-run, OUT of Codex scope: with rem-daemon on the akash QuadStor fixture, LoadDrive slot->drive -> WatchOperation -> SUCCEEDED -> GetLibrary shows the drive LOADED; UnloadDrive (default home) repopulates the slot; MoveMedium slot->slot reflected after SUCCEEDED; RefreshInventory after a manual mtx move shows the change; a robotics op during an open write session -> FAILED_PRECONDITION.)"
+  }
+]

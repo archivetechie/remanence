@@ -1,0 +1,10 @@
+    HP        Ultrium 7-SCSI    S2T1
+Read error counter page  [0x3]
+  Errors corrected without substantial delay = 0
+  Errors corrected with possible delays = 0
+  Total rewrites or rereads = 0
+  Total errors corrected = 0
+  Total times correction algorithm processed = 0
+  Total bytes processed = 49646080
+  Total uncorrected errors = 0
+  Reserved or vendor specific [0x8000] = 0

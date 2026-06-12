@@ -1,0 +1,352 @@
+{
+  "vector_set": "RAO-NEG-ENVELOPE-1",
+  "spec_section": "13.5",
+  "status": "complete",
+  "scope": "encrypted envelope header, metadata-profile, framing, cryptographic-tamper, defective-sealer, and writer-side vectors executable through public RAO AEAD APIs",
+  "base": {
+    "chunk_size": 512,
+    "plaintext_size": 1024,
+    "plaintext_byte": "5a",
+    "root_key": "1111111111111111111111111111111111111111111111111111111111111111",
+    "key_id": "10101010101010101010101010101010",
+    "object_id": "object-1"
+  },
+  "cases": [
+    {
+      "id": "wrong-magic",
+      "operation": "inspect",
+      "fault": "header magic is not RAO1",
+      "expected_error": "InvalidMagicBytes"
+    },
+    {
+      "id": "header-len-not-128",
+      "operation": "inspect",
+      "fault": "header_len field is not 128",
+      "expected_error": "InvalidHeaderLength"
+    },
+    {
+      "id": "format-version-2",
+      "operation": "inspect",
+      "fault": "format_version field is 2",
+      "expected_error": "UnsupportedFormatVersion"
+    },
+    {
+      "id": "unknown-suite-id",
+      "operation": "inspect",
+      "fault": "suite_id field is unknown",
+      "expected_error": "InvalidSuite"
+    },
+    {
+      "id": "chunk-size-zero",
+      "operation": "inspect",
+      "fault": "chunk_size field is zero",
+      "expected_error": "InvalidChunkSize"
+    },
+    {
+      "id": "chunk-size-not-multiple-of-512",
+      "operation": "inspect",
+      "fault": "chunk_size field is not a multiple of 512",
+      "expected_error": "InvalidChunkSize"
+    },
+    {
+      "id": "flags-nonzero",
+      "operation": "inspect",
+      "fault": "flags field is nonzero",
+      "expected_error": "ReservedBytesNotZero"
+    },
+    {
+      "id": "reserved-bytes-nonzero",
+      "operation": "inspect",
+      "fault": "reserved bytes are nonzero",
+      "expected_error": "ReservedBytesNotZero"
+    },
+    {
+      "id": "all-zero-key-id",
+      "operation": "inspect",
+      "fault": "key_id is all zero",
+      "expected_error": "InvalidKeyIdentifier"
+    },
+    {
+      "id": "all-zero-hkdf-salt",
+      "operation": "inspect",
+      "fault": "hkdf_salt is all zero",
+      "expected_error": "InvalidSalt"
+    },
+    {
+      "id": "object-id-all-nul",
+      "operation": "inspect",
+      "fault": "object_id field is all NUL",
+      "expected_error": "InvalidObjectIdField"
+    },
+    {
+      "id": "object-id-interior-nul",
+      "operation": "inspect",
+      "fault": "object_id field contains an interior NUL",
+      "expected_error": "InvalidObjectIdField"
+    },
+    {
+      "id": "object-id-non-utf8",
+      "operation": "inspect",
+      "fault": "object_id field is not UTF-8",
+      "expected_error": "InvalidObjectIdField"
+    },
+    {
+      "id": "metadata-frame-len-16",
+      "operation": "inspect",
+      "fault": "metadata_frame_len is below the minimum",
+      "expected_error": "MetadataFrameLengthInvalid"
+    },
+    {
+      "id": "metadata-frame-len-over-max",
+      "operation": "inspect",
+      "fault": "metadata_frame_len exceeds 16 MiB",
+      "expected_error": "MetadataFrameLengthInvalid"
+    },
+    {
+      "id": "salt-bit-flipped",
+      "operation": "open",
+      "fault": "one hkdf_salt bit is flipped in an otherwise structurally valid object",
+      "expected_error": "AeadAuthenticationFailed"
+    },
+    {
+      "id": "key-id-swapped",
+      "operation": "open",
+      "fault": "key_id is changed after sealing",
+      "expected_error": "AeadAuthenticationFailed"
+    },
+    {
+      "id": "ciphertext-bit-flipped",
+      "operation": "open",
+      "fault": "one payload ciphertext bit is flipped",
+      "expected_error": "AeadAuthenticationFailed"
+    },
+    {
+      "id": "payload-chunks-transposed",
+      "operation": "open",
+      "fault": "payload chunks 1 and 2 are transposed",
+      "expected_error": "AeadAuthenticationFailed"
+    },
+    {
+      "id": "payload-final-flag-wrong",
+      "operation": "open",
+      "fault": "the final payload chunk is authenticated with the non-final STREAM nonce",
+      "expected_error": "AeadAuthenticationFailed"
+    },
+    {
+      "id": "payload-extra-chunk-appended",
+      "operation": "open",
+      "fault": "an extra authenticated payload chunk is inserted before the footer while metadata still declares the shorter plaintext",
+      "expected_error": "AeadAuthenticationFailed"
+    },
+    {
+      "id": "sealed-metadata-wrong-plaintext-digest",
+      "operation": "open",
+      "fault": "metadata is authenticated and salt-consistent but deliberately misstates plaintext_digest",
+      "expected_error": "PlaintextDigestMismatch"
+    },
+    {
+      "id": "sealed-under-non-derived-salt",
+      "operation": "open",
+      "fault": "metadata and payload authenticate under a header salt that was not derived by Section 5.4.1",
+      "expected_error": "SaltDerivationMismatch"
+    },
+    {
+      "id": "metadata-float",
+      "operation": "open",
+      "fault": "metadata profile contains a floating-point value under an unknown extension key",
+      "expected_error": "InvalidCborEncoding"
+    },
+    {
+      "id": "metadata-top-level-array",
+      "operation": "open",
+      "fault": "metadata plaintext top-level item is an array instead of a map",
+      "expected_error": "InvalidCborEncoding"
+    },
+    {
+      "id": "metadata-key-text",
+      "operation": "open",
+      "fault": "metadata top-level map key is text instead of unsigned integer",
+      "expected_error": "InvalidCborEncoding"
+    },
+    {
+      "id": "metadata-tag",
+      "operation": "open",
+      "fault": "metadata profile contains a CBOR tag under an unknown extension key",
+      "expected_error": "InvalidCborEncoding"
+    },
+    {
+      "id": "metadata-indefinite-length",
+      "operation": "open",
+      "fault": "metadata profile contains an indefinite-length item under an unknown extension key",
+      "expected_error": "InvalidCborEncoding"
+    },
+    {
+      "id": "metadata-simple-undefined",
+      "operation": "open",
+      "fault": "metadata profile contains the forbidden CBOR simple value undefined",
+      "expected_error": "InvalidCborEncoding"
+    },
+    {
+      "id": "metadata-duplicate-key",
+      "operation": "open",
+      "fault": "metadata map contains duplicate key 1",
+      "expected_error": "InvalidCborEncoding"
+    },
+    {
+      "id": "metadata-non-shortest-integer",
+      "operation": "open",
+      "fault": "metadata key 0 uses non-shortest integer encoding",
+      "expected_error": "InvalidCborEncoding"
+    },
+    {
+      "id": "metadata-missing-plaintext-size",
+      "operation": "open",
+      "fault": "required metadata key 1 plaintext_size is absent",
+      "expected_error": "MissingRequiredMetadataField"
+    },
+    {
+      "id": "metadata-missing-version",
+      "operation": "open",
+      "fault": "required metadata key 0 metadata_version is absent",
+      "expected_error": "MissingRequiredMetadataField"
+    },
+    {
+      "id": "metadata-missing-digest-alg",
+      "operation": "open",
+      "fault": "required metadata key 2 plaintext_digest_alg is absent",
+      "expected_error": "MissingRequiredMetadataField"
+    },
+    {
+      "id": "metadata-missing-digest",
+      "operation": "open",
+      "fault": "required metadata key 3 plaintext_digest is absent",
+      "expected_error": "MissingRequiredMetadataField"
+    },
+    {
+      "id": "metadata-version-text",
+      "operation": "open",
+      "fault": "metadata_version has text type instead of unsigned integer",
+      "expected_error": "InvalidMetadataField"
+    },
+    {
+      "id": "metadata-version-2",
+      "operation": "open",
+      "fault": "metadata_version is 2",
+      "expected_error": "InvalidMetadataField"
+    },
+    {
+      "id": "metadata-plaintext-size-text",
+      "operation": "open",
+      "fault": "plaintext_size has text type instead of unsigned integer",
+      "expected_error": "InvalidMetadataField"
+    },
+    {
+      "id": "metadata-plaintext-size-not-multiple",
+      "operation": "open",
+      "fault": "metadata plaintext_size is not a multiple of chunk_size",
+      "expected_error": "InvalidMetadataField"
+    },
+    {
+      "id": "metadata-plaintext-size-zero",
+      "operation": "open",
+      "fault": "metadata plaintext_size is zero",
+      "expected_error": "InvalidMetadataField"
+    },
+    {
+      "id": "metadata-plaintext-size-overflow",
+      "operation": "open",
+      "fault": "metadata plaintext_size implies payload-frame arithmetic overflow",
+      "expected_error": "InvalidMetadataField"
+    },
+    {
+      "id": "metadata-digest-alg-not-sha256",
+      "operation": "open",
+      "fault": "plaintext_digest_alg is a text value other than sha256",
+      "expected_error": "InvalidMetadataField"
+    },
+    {
+      "id": "metadata-digest-alg-bytes",
+      "operation": "open",
+      "fault": "plaintext_digest_alg has bytes type instead of text",
+      "expected_error": "InvalidMetadataField"
+    },
+    {
+      "id": "metadata-digest-short",
+      "operation": "open",
+      "fault": "plaintext_digest is 31 bytes instead of 32",
+      "expected_error": "InvalidMetadataField"
+    },
+    {
+      "id": "metadata-digest-text",
+      "operation": "open",
+      "fault": "plaintext_digest has text type instead of bytes",
+      "expected_error": "InvalidMetadataField"
+    },
+    {
+      "id": "metadata-trailing-byte",
+      "operation": "open",
+      "fault": "metadata plaintext has trailing bytes after the top-level item",
+      "expected_error": "InvalidCborEncoding"
+    },
+    {
+      "id": "eof-inside-metadata-frame",
+      "operation": "open",
+      "fault": "input ends inside the encrypted metadata frame",
+      "expected_error": "UnexpectedEof"
+    },
+    {
+      "id": "eof-mid-chunk",
+      "operation": "open",
+      "fault": "input ends inside a payload chunk frame",
+      "expected_error": "MissingFinalChunk"
+    },
+    {
+      "id": "payload-absent-after-metadata",
+      "operation": "open",
+      "fault": "payload frame is absent after metadata",
+      "expected_error": "MissingFinalChunk"
+    },
+    {
+      "id": "footer-bytes-wrong",
+      "operation": "inspect",
+      "fault": "footer bytes are wrong at the correct offset",
+      "expected_error": "InvalidFooter"
+    },
+    {
+      "id": "fill-byte-nonzero",
+      "operation": "inspect",
+      "fault": "one post-footer fill byte is nonzero",
+      "expected_error": "FillNotZero"
+    },
+    {
+      "id": "trailing-byte",
+      "operation": "inspect",
+      "fault": "one byte is appended after stored_size_bytes",
+      "expected_error": "TrailingData"
+    },
+    {
+      "id": "trailing-byte-keyed",
+      "operation": "open",
+      "fault": "one byte is appended after stored_size_bytes and detected by keyed open",
+      "expected_error": "TrailingData"
+    },
+    {
+      "id": "seal-plaintext-size-not-multiple",
+      "operation": "seal",
+      "fault": "sealing plaintext size is not a multiple of chunk_size",
+      "expected_error": "InvalidInput"
+    },
+    {
+      "id": "seal-object-id-too-long",
+      "operation": "seal",
+      "fault": "sealing object_id exceeds the 64-byte header field",
+      "expected_error": "InvalidObjectIdField"
+    },
+    {
+      "id": "root-key-too-short",
+      "operation": "root-key",
+      "fault": "root key has only 16 bytes",
+      "expected_error": "InvalidRootKey"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+--- /home/user/remanence/patches/quadstor-3.0.79.32/originals/Makefile	2026-05-16 16:42:17.791414832 +0200
++++ /quadstorvtl/src/export/Makefile	2026-05-16 16:44:43.109074093 +0200
+@@ -22,6 +22,8 @@
+ EXTRA_CFLAGS += -I. -DLINUX -DEXPORT_SYMTAB -I$(KDIR)/drivers/scsi -I$(QUADSTOR_ROOT)/common -I$(QUADSTOR_ROOT)/export -DLZ4_FREESTANDING
+ 
+ EXTRA_CFLAGS += -g
++EXTRA_CFLAGS += -Wno-error=attribute-warning
++ccflags-y += -Wno-attribute-warning -Wno-error=attribute-warning
+ #EXTRA_CFLAGS += -O2
+ 
+ #EXTRA_CFLAGS += -DENABLE_STATS

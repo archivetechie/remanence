@@ -1,0 +1,13 @@
+    HPE       Ultrium 9-SCSI    S2S1
+Tape usage page  (LTO-5 and LTO-6 specific) [0x30]
+  Thread count: 79
+  Total data sets written: 777469
+  Total write retries: 18
+  Total unrecovered write errors: 0
+  Total suspended writes: 63
+  Total fatal suspended writes: 0
+  Total data sets read: 832
+  Total read retries: 0
+  Total unrecovered read errors: 0
+  Total suspended reads: 0
+  Total fatal suspended reads: 0

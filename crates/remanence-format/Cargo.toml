@@ -1,0 +1,30 @@
+[package]
+name        = "remanence-format"
+description = "Layer 3b — Remanence body formats, including rao-v1."
+version     .workspace = true
+edition     .workspace = true
+rust-version.workspace = true
+authors     .workspace = true
+license     .workspace = true
+repository  .workspace = true
+
+[dependencies]
+remanence-aead = { path = "../remanence-aead" }
+remanence-library = { path = "../remanence-library" }
+
+ciborium = { workspace = true }
+serde    = { workspace = true }
+sha2     = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+default = []
+fuzzing = []
+
+[dev-dependencies]
+remanence-parity = { path = "../remanence-parity" }
+serde_json       = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"

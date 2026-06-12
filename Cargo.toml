@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/remanence-scsi",
+    "crates/remanence-library",
+    "crates/remanence-aead",
+    "crates/remanence-chaos",
+    "crates/remanence-format",
+    "crates/remanence-bru",
+    "crates/remanence-parity",
+    "crates/remanence-state",
+    "crates/remanence-stream",
+    "crates/remanence-api",
+    "crates/remanence-cli",
+    "crates/remanence-daemon",
+]
+
+# Shared metadata so each crate's Cargo.toml stays minimal.
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85"
+authors = ["Ada Operator <operator@the operating institution.org>"]
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/archivetechie/remanence"
+readme = "README.md"
+
+# Shared dependency versions. Each crate opts in by referencing
+# `dep.workspace = true` in its own Cargo.toml.
+[workspace.dependencies]
+base64             = "0.22"
+bytes               = "1"
+chacha20poly1305   = "0.10"
+ciborium            = "0.2"
+clap                = { version = "4",   features = ["derive"] }
+hkdf                = "0.12"
+hmac                = "0.12"
+hyper-util          = "0.1"
+libc                = "0.2"
+nix                 = { version = "0.29", features = ["ioctl", "fs"] }
+reed-solomon-erasure = { version = "6", features = ["simd-accel"] }
+rusqlite            = { version = "0.32", features = ["bundled"] }
+serde               = { version = "1",   features = ["derive"] }
+serde_json          = "1"
+sha2                = "0.10"
+tempfile            = "3"
+thiserror           = "1"
+time                = { version = "0.3", features = ["formatting", "parsing"] }
+tokio               = { version = "1",   features = ["full"] }
+tokio-stream        = "0.1"
+toml                = "0.8"
+tower               = "0.5"
+tracing             = "0.1"
+tracing-subscriber  = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid                = { version = "1", features = ["serde", "v4"] }
+x509-parser         = "0.18.1"
+zeroize             = "1"
+prost               = "=0.14.1"
+prost-derive        = "=0.14.1"
+prost-types         = "=0.14.1"
+tonic               = "=0.14.5"
+tonic-build         = "=0.14.5"
+tonic-prost         = "=0.14.5"
+tonic-prost-build   = "=0.14.5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

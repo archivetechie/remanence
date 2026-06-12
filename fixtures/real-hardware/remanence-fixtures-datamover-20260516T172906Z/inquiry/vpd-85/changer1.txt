@@ -1,0 +1,5 @@
+    inquiry cdb: [12 01 00 00 fc 00]
+    inquiry cdb: [12 01 85 00 fc 00]
+VPD INQUIRY: Management network addresses page
+  addressed logical unit, Service type: status
+    http://192.168.90.27

@@ -1,0 +1,8 @@
+    inquiry cdb: [12 01 00 00 fc 00]
+ Only hex output supported. The sg_vpd and sdparm utilities decode more VPD pages.
+    inquiry cdb: [12 01 cc 00 fc 00]
+VPD INQUIRY, page code=0xcc:
+   [PQual=0  Peripheral device type: medium changer]
+08 cc 00 20 00 00 00 00  48 50 45 20 20 20 20 20
+4d 53 4c 33 30 34 30 20  20 20 20 20 20 20 20 20
+33 33 35 30

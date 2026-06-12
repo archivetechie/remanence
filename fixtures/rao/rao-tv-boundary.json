@@ -1,0 +1,132 @@
+{
+  "vector_id": "RAO-TV-BOUNDARY",
+  "spec_section": "13.1",
+  "status": "pinned-at-generation",
+  "independent_rederivation": "verified by tools/verify_rao_vectors_independent.py",
+  "inputs": {
+    "chunk_size": 4096,
+    "object_id": "00000000-0000-4000-8000-000000000104",
+    "caller_object_id": "rao-tv-boundary",
+    "write_timestamp": "2026-01-01T00:00:00Z",
+    "metadata_preservation": "minimal",
+    "manifest_file_id": "00000000-0000-4000-8000-000000000104",
+    "entries": [
+      {
+        "entry_type": "regular",
+        "path": "boundary/c-minus-1.bin",
+        "file_id": "00000000-0000-4000-8000-000000000141",
+        "size_bytes": 4095,
+        "link_target": null,
+        "mtime": null,
+        "executable": null
+      },
+      {
+        "entry_type": "regular",
+        "path": "boundary/c.bin",
+        "file_id": "00000000-0000-4000-8000-000000000142",
+        "size_bytes": 4096,
+        "link_target": null,
+        "mtime": null,
+        "executable": null
+      },
+      {
+        "entry_type": "regular",
+        "path": "boundary/c-plus-1.bin",
+        "file_id": "00000000-0000-4000-8000-000000000143",
+        "size_bytes": 4097,
+        "link_target": null,
+        "mtime": null,
+        "executable": null
+      },
+      {
+        "entry_type": "regular",
+        "path": "boundary/multi.bin",
+        "file_id": "00000000-0000-4000-8000-000000000144",
+        "size_bytes": 9000,
+        "link_target": null,
+        "mtime": null,
+        "executable": null
+      }
+    ]
+  },
+  "expected": {
+    "stored_size_bytes": 45056,
+    "stored_size_blocks": 11,
+    "stored_digest": "ec438bc47f82d32e5a12d47d3affe1997aeb28a6f48610e032f903f0b47f2fa9",
+    "first_block_sha256": "17cbbfd15aa9d391e441b9ef888913d4b86bafa67130e7d71baf12cfdc4a3ad4",
+    "manifest_cbor_len": 975,
+    "manifest_cbor_hex": "a7696f626a6563745f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303130346a6368756e6b5f73697a651910006c66696c655f656e747269657384a8647061746876626f756e646172792f632d6d696e75732d312e62696e6766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303134316a65786563757461626c65f66a73697a655f6279746573190fff6b6368756e6b5f636f756e74016b66696c655f7368613235365820e5d879eac2e6b4dd4bef5144c9c24b5f944d61ef541e4d0808b135b48d74c3296f66697273745f6368756e6b5f6c626101781a6d657461646174615f707265736572766174696f6e5f64617461a0a864706174686e626f756e646172792f632e62696e6766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303134326a65786563757461626c65f66a73697a655f62797465731910006b6368756e6b5f636f756e74016b66696c655f7368613235365820d63320acd81e8ea9e08c7932552f04ca8bd45a673c40003ff4f7b6143d91081d6f66697273745f6368756e6b5f6c626103781a6d657461646174615f707265736572766174696f6e5f64617461a0a8647061746875626f756e646172792f632d706c75732d312e62696e6766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303134336a65786563757461626c65f66a73697a655f62797465731910016b6368756e6b5f636f756e74026b66696c655f736861323536582043b1e47f01ebf3911475612b18891382cb031f3d9d856659e60c520a73a3528f6f66697273745f6368756e6b5f6c626105781a6d657461646174615f707265736572766174696f6e5f64617461a0a8647061746872626f756e646172792f6d756c74692e62696e6766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303134346a65786563757461626c65f66a73697a655f62797465731923286b6368756e6b5f636f756e74036b66696c655f7368613235365820cfd7dc0714837b0df150d6779e28f022e0ac0592e387f7e1d6f1f5008cf80a516f66697273745f6368756e6b5f6c626107781a6d657461646174615f707265736572766174696f6e5f64617461a06e736368656d615f76657273696f6e016f6f626a6563745f6d65746164617461a07063616c6c65725f6f626a6563745f69646f72616f2d74762d626f756e646172797365787465726e616c5f7265666572656e63657380",
+    "manifest_sha256": "d9e4707d63ceb401693b310d8ecd7c643684a7fa77912f91fd5e688bd03c14d7",
+    "file_payloads": [
+      {
+        "path": "boundary/c-minus-1.bin",
+        "size_bytes": 4095,
+        "sha256": "e5d879eac2e6b4dd4bef5144c9c24b5f944d61ef541e4d0808b135b48d74c329"
+      },
+      {
+        "path": "boundary/c.bin",
+        "size_bytes": 4096,
+        "sha256": "d63320acd81e8ea9e08c7932552f04ca8bd45a673c40003ff4f7b6143d91081d"
+      },
+      {
+        "path": "boundary/c-plus-1.bin",
+        "size_bytes": 4097,
+        "sha256": "43b1e47f01ebf3911475612b18891382cb031f3d9d856659e60c520a73a3528f"
+      },
+      {
+        "path": "boundary/multi.bin",
+        "size_bytes": 9000,
+        "sha256": "cfd7dc0714837b0df150d6779e28f022e0ac0592e387f7e1d6f1f5008cf80a51"
+      }
+    ],
+    "symlinks": [],
+    "directories": [],
+    "file_layouts": [
+      {
+        "entry_type": "regular",
+        "path": "boundary/c-minus-1.bin",
+        "pax_header_offset": 1024,
+        "data_offset": 4096,
+        "first_chunk_lba": 1,
+        "chunk_count": 1,
+        "pad_spaces": 1779
+      },
+      {
+        "entry_type": "regular",
+        "path": "boundary/c.bin",
+        "pax_header_offset": 8192,
+        "data_offset": 12288,
+        "first_chunk_lba": 3,
+        "chunk_count": 1,
+        "pad_spaces": 2811
+      },
+      {
+        "entry_type": "regular",
+        "path": "boundary/c-plus-1.bin",
+        "pax_header_offset": 16384,
+        "data_offset": 20480,
+        "first_chunk_lba": 5,
+        "chunk_count": 2,
+        "pad_spaces": 2804
+      },
+      {
+        "entry_type": "regular",
+        "path": "boundary/multi.bin",
+        "pax_header_offset": 25088,
+        "data_offset": 28672,
+        "first_chunk_lba": 7,
+        "chunk_count": 3,
+        "pad_spaces": 2295
+      }
+    ],
+    "manifest_layout": {
+      "entry_type": "regular",
+      "path": "_remanence/manifest.cbor",
+      "pax_header_offset": 37888,
+      "data_offset": 40960,
+      "first_chunk_lba": 10,
+      "chunk_count": 1,
+      "pad_spaces": 1718
+    }
+  }
+}

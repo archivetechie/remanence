@@ -1,0 +1,79 @@
+--- /home/user/remanence/patches/quadstor-3.0.79.32/originals/core_itf.c	2026-05-16 16:42:17.781414776 +0200
++++ /quadstorvtl/src/export/core_itf.c	2026-05-16 16:46:14.093392635 +0200
+@@ -1863,7 +1863,7 @@
+ core_itf_iodev_close(iodev_t *b_dev)
+ {
+ 	if (b_dev)
+-		blkdev_put(b_dev, THIS_MODULE);
++		bdev_release(b_dev);
+ }
+ #else
+ static void
+@@ -2242,6 +2242,8 @@
+ 
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,10,0)) || (defined(RHEL_MAJOR) && RHEL_MAJOR == 9 && RHEL_MINOR >= 5)
+ 	return blkdev_issue_flush(file_bdev(iodev));
++#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(6,5,0)) || (defined(RHEL_MAJOR) && RHEL_MAJOR == 9 && RHEL_MINOR == 4) || (defined(CONFIG_SUSE_KERNEL) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
++	return blkdev_issue_flush(iodev->bdev);
+ #elif (defined(CONFIG_SUSE_KERNEL) && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 3, 18) && LINUX_VERSION_CODE <= KERNEL_VERSION(5, 4, 0))
+ 	{
+ 		struct request_queue *q;
+@@ -2455,7 +2457,7 @@
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,10,0)) || (defined(RHEL_MAJOR) && RHEL_MAJOR == 9 && RHEL_MINOR >= 5)
+ 	b_dev = bdev_file_open_by_path(spec->name, BLK_OPEN_READ | BLK_OPEN_WRITE, THIS_MODULE, NULL);
+ #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(6,5,0)) || (defined(RHEL_MAJOR) && RHEL_MAJOR == 9 && RHEL_MINOR == 4) || (defined(CONFIG_SUSE_KERNEL) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
+-	b_dev = blkdev_get_by_path(spec->name, FMODE_READ | FMODE_WRITE, THIS_MODULE, NULL);
++	b_dev = bdev_open_by_path(spec->name, BLK_OPEN_READ | BLK_OPEN_WRITE, THIS_MODULE, NULL);
+ #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(3,0,0))
+ 	b_dev = blkdev_get_by_path(spec->name, FMODE_READ | FMODE_WRITE, THIS_MODULE);
+ #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,29))
+@@ -2474,6 +2476,9 @@
+ #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(6,10,0)) || (defined(RHEL_MAJOR) && RHEL_MAJOR == 9 && RHEL_MINOR >= 5)
+ 	spec->sector_size = bdev_logical_block_size(file_bdev(b_dev));
+ 	spec->size = file_bdev(b_dev)->bd_inode->i_size;
++#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(6,5,0)) || (defined(RHEL_MAJOR) && RHEL_MAJOR == 9 && RHEL_MINOR == 4) || (defined(CONFIG_SUSE_KERNEL) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
++	spec->sector_size = bdev_logical_block_size(b_dev->bdev);
++	spec->size = b_dev->bdev->bd_inode->i_size;
+ #elif (LINUX_VERSION_CODE < KERNEL_VERSION(2,6,24))
+ 	spec->sector_size = bdev_hardsect_size(b_dev);
+ 	spec->size = b_dev->bd_inode->i_size;
+@@ -2579,6 +2584,8 @@
+ 
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,10,0)) || (defined(RHEL_MAJOR) && RHEL_MAJOR == 9 && RHEL_MINOR >= 5)
+ 	bio = bio_alloc(file_bdev(iodev), bio_vec_count, opf, M_NOWAIT);
++#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(6,5,0)) || (defined(RHEL_MAJOR) && RHEL_MAJOR == 9 && RHEL_MINOR == 4) || (defined(CONFIG_SUSE_KERNEL) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
++	bio = bio_alloc(iodev->bdev, bio_vec_count, opf, M_NOWAIT);
+ #else
+ 	bio = bio_alloc(iodev, bio_vec_count, opf, M_NOWAIT);
+ #endif
+@@ -2661,7 +2668,11 @@
+ 	bio->bi_sector = bi_sector;
+ #endif
+ #if ((defined(CONFIG_SUSE_KERNEL) && (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0))) || (LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)))
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,10,0)) || (defined(RHEL_MAJOR) && RHEL_MAJOR == 9 && RHEL_MINOR >= 5)
++	bio_set_dev(bio, file_bdev(iodev));
++#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(6,5,0)) || (defined(RHEL_MAJOR) && RHEL_MAJOR == 9 && RHEL_MINOR == 4) || (defined(CONFIG_SUSE_KERNEL) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
++	bio_set_dev(bio, iodev->bdev);
++#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)
+ 	bio_set_dev(bio, iodev);
+ #else
+ 	bio->bi_disk = iodev->bd_disk;
+@@ -2843,6 +2854,8 @@
+ {
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,10,0)) || (defined(RHEL_MAJOR) && RHEL_MAJOR == 9 && RHEL_MINOR >= 5)
+ 	if (bdev_max_discard_sectors(file_bdev(iodev)))
++#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(6,5,0)) || (defined(RHEL_MAJOR) && RHEL_MAJOR == 9 && RHEL_MINOR == 4) || (defined(CONFIG_SUSE_KERNEL) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
++	if (bdev_max_discard_sectors(iodev->bdev))
+ #else
+ 	if (bdev_max_discard_sectors(iodev))
+ #endif
+@@ -2895,6 +2908,8 @@
+ //	DEBUG_INFO_NEW("spec b_start %llu length %u\n", (unsigned long long)spec->b_start, spec->length);
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,10,0)) || (defined(RHEL_MAJOR) && RHEL_MAJOR == 9 && RHEL_MINOR >= 5)
+ 	retval = blkdev_issue_discard(file_bdev(iodev), spec->b_start, spec->length, GFP_NOIO);
++#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(6,5,0)) || (defined(RHEL_MAJOR) && RHEL_MAJOR == 9 && RHEL_MINOR == 4) || (defined(CONFIG_SUSE_KERNEL) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
++	retval = blkdev_issue_discard(iodev->bdev, spec->b_start, spec->length, GFP_NOIO);
+ #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(6,0,0)) || (defined(RHEL_MAJOR) && RHEL_MAJOR == 9) || (defined(CONFIG_SUSE_KERNEL) && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 21))
+ 	retval = blkdev_issue_discard(iodev, spec->b_start, spec->length, GFP_NOIO);
+ #else

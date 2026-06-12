@@ -1,0 +1,200 @@
+[
+  {
+    "uuid": "1fa7b909-96d3-4e04-9e02-7b15e1d62acd",
+    "datetime": "2026-06-10T04:49:04+02:00",
+    "author": "claude",
+    "subject": "Whole-project code review (all crates except remanence-chaos)",
+    "idref": null,
+    "status": "review-complete",
+    "handoff_to": null,
+    "round": 0,
+    "summary": "Ran an 11-pass parallel review of the whole workspace at the current working tree (including uncommitted api/state/cli changes): one pass per crate (remanence-library and remanence-parity split in half), plus dedicated passes for test-suite depth and cross-cutting architecture/security/documentation. Full consolidated report with ~120 verified findings written to docs/code-review-2026-06-10.md. Headlines: 1 Critical (parity-tape appends rewrite the tape from BOT — second write session on a partially-written parity tape clobbers it while the catalog still lists old objects as committed; the no-parity path has a guard, parity has none); 15 High including a verified DVCID/CurData bit swap in the READ ELEMENT STATUS CDB (checked against the HPE reference PDF; the 'empirical firmware' lore comment and a unit test both pin the bug, and the discovery ladder's DVCID gap-fill rung is dead code as a result), catalog rebuild silently destroying tape provisioning state (voltag/pool_id/ready/sealed live only in SQLite and are neither audited nor journaled — after rebuild-catalog-from-journals every tape is unwritable), two parity degraded-mode gaps that contradict the design doc (scan aborts on one unreadable head block; sidecar footer is a SPOF despite intact header copies), resume losing pre-crash sidecar directory entries, bitwise GF(2^8)+CRC-64 on the encode hot path (~15-40 MB/s/core vs LTO-9's ~300 MB/s — shoe-shine guarantee), cancellation-unsafe RPCs leaking drive-bay reservations, client-controlled spool cap, non-canonical manifest CBOR (permanent on-tape format decision needed), restores never checking file SHA-256, the unauthenticated UDS serving the full mutating API, no authz/client identity in the audit log, and a missing/false README. Test suite: 1046 pass, clippy/fmt clean, hermetic; parity fault-injection depth is exemplary but mount.rs has 0 tests, the drive-actor loops are untested, there are no concurrency tests, and the captured changer2/LTO-7 (dwara2) fixtures are never consumed by any test. The report ends with a recommended priority order (s8) sequenced around hardware windows, recovery promises, network enablement, a throughput program, and a mechanical hygiene wave suitable for codex handoff once owner triages.",
+    "files_modified": [
+      "docs/code-review-2026-06-10.md",
+      "journal/2026-06-10.json"
+    ],
+    "verification": [
+      "cargo test --workspace --exclude remanence-chaos: 1046 passed, 0 failed, 13 ignored (hardware/memory-gated)",
+      "cargo clippy --workspace --exclude remanence-chaos --all-targets -- -D warnings: clean",
+      "cargo fmt --all --check: clean",
+      "SCSI CDB findings verified against docs/hpe-tape-library-scsi-reference.pdf and the IBM LTO SCSI reference"
+    ]
+  },
+  {
+    "uuid": "eda8f7ea-8471-4a30-a03a-36433d0ff8b2",
+    "datetime": "2026-06-10T07:07:47+02:00",
+    "author": "claude",
+    "subject": "Draft REM-TAR-1: rem-tar-v1 candidate specification (AOF1-style normative format spec)",
+    "idref": null,
+    "status": "draft-for-review",
+    "handoff_to": null,
+    "round": 0,
+    "summary": "Drafted docs/rem-tar-v1-candidate-specification.md: an RFC-style normative specification of the rem-tar-v1 on-tape format, modelled on amber's AOF1 candidate spec (BCP-14 language, conformance targets, byte-layout tables, normative error taxonomy, test-vector requirements, freeze criteria). Written byte-accurate against the 2026-06-10 working tree of crates/remanence-format, which already includes the post-review fixes (RFC 8949 encoded-form manifest key order = review finding H10, reader format gates = H11, duplicate-path/file_id and reserved-prefix validation, IncompleteBlockWrite detection) — note those fixes are NOT yet committed to main; the spec's Appendix B item 6 tracks that. Key decisions recorded in Appendix A so refactoring cannot silently reverse them: (A.1) the text-keyed manifest schema is normative and rem-tar-v1-design.md v0.9.3 sect 8.1's never-implemented integer-keyed schema (ManifestHeader, per-chunk CRC-64s, mtime, compression field) is formally superseded, with per-chunk CRCs recorded as deliberately dropped in favour of 3c sidecar CRCs + whole-file SHA-256; (A.2) canonical CBOR resolved as RFC 8949 sect 4.2 encoded-form key order (length-first, NOT alphabetical), aligning REM-CBOR with AOF1-CBOR; (A.3) alignment invariant applies uniformly to every entry including zero-length and the manifest; (A.4) v1.0 wire format is regular-files-only, with sect 8.7.7 symlink/dir design deferred to the reserved manifest surfaces in a 1.x minor revision; (A.5) REMANENCE.encryption is a refusal gate, never a feature of this layer. New normative content beyond current code: deterministic pad-selection rule (smallest conforming target R, largest pad fitting it) so independent writers are byte-identical; reader/writer conformance split (tolerate representational variance, reject uninterpretable content); manifest Consumer validation rules with unknown-key forward-compat. Appendix B lists 6 implementation gaps to close before freeze (encryption gate unchecked, manifest file_id uniqueness, no manifest schema validator, no static test vectors in fixtures/rem-tar-v1/, no fuzz targets, uncommitted baseline). Next step: owner reviews the draft; after approval the Appendix B gaps + sect 16 test-vector suite become codex implementation handoffs, and the GNU tar/bsdtar interop gates (testing-plan sect 6.3) get wired to the vectors.",
+    "files_modified": [
+      "docs/rem-tar-v1-candidate-specification.md",
+      "journal/2026-06-10.json"
+    ],
+    "verification": [
+      "All byte-level claims read directly from crates/remanence-format/src/{model,tar,pax,layout,writer,reader,error,lib}.rs at working-tree state 2026-06-10",
+      "Manifest key order cross-checked against layout.rs manifest_map_keys_use_rfc8949_encoded_order test",
+      "Appendix C alignment arithmetic recomputed by hand (pad record fixed point, residue equation)"
+    ]
+  },
+  {
+    "uuid": "49e49e85-5254-45ce-8408-7d86063b6322",
+    "datetime": "2026-06-10T07:22:41+02:00",
+    "author": "claude",
+    "subject": "REM-TAR-1 spec: rework from describe-the-implementation to normative fixed point (owner direction)",
+    "idref": "eda8f7ea-8471-4a30-a03a-36433d0ff8b2",
+    "status": "draft-for-review",
+    "handoff_to": null,
+    "round": 1,
+    "summary": "the owner's correction: the spec must be a GOOD spec for the problem, not a description of the (possibly buggy) implementation — it is the fixed point we build/validate the implementation against. Reworked docs/rem-tar-v1-candidate-specification.md accordingly. The wire-format description stays grounded in what the reference implementation emits, but behavioral requirements now specify the right thing with implementation shortfalls tracked in Appendix B (now a 15-item conformance backlog organized by role). Strengthened requirements: (1) restore-time per-file SHA-256 verification is a Reader MUST, with an explicit restore/salvage mode split that forbids silent fallback — this was review finding H12, which revision 1 had wrongly codified as optional; (2) REMANENCE.encryption and REMANENCE.chunk_size become reader refusal gates (new ChunkSizeMismatch error); (3) native objects MUST carry canonical relative paths (no absolute, no dot/dot-dot/empty components, no trailing slash) and readers reject violations with new InvalidPath — traversal becomes unrepresentable in conformant objects, with verbatim-legacy-path faithfulness explicitly reassigned to the BRU foreign reader (Appendix A.6); (4) new Verifier conformance target with a five-obligation verification profile (sect 11.4: all digests + manifest anchor digest + manifest-vs-archive correspondence + zero-fill check + report-all-nonconformities) giving rem-debug archive verify a normative contract; (5) Consumer MUST verify manifest bytes against an anchor digest before interpreting (new ManifestDigestMismatch/ManifestInvalid errors); (6) manifest structural limits as format rules (MAX_FILE_ENTRIES 10M, MANIFEST_MAX_DEPTH 8, allocation bounded by declared size); (7) pax mtime constrained to POSIX decimal form; (8) readers reject entries after the manifest; (9) sect 12.2 versioning consistency fix: since 1.0 readers now reject non-none compression/encryption, introducing a real value for either is by definition a new-format_id change, never a 1.x minor. Error taxonomy grew 5 names; sect 16 negative vectors extended to cover every new gate (incl. flipped-payload-bit -> FileDigestMismatch). New Appendix A.6/A.7 record the path-rule and mandatory-verification decisions with rationale. Next: owner reviews; Appendix B items then become codex handoffs.",
+    "files_modified": [
+      "docs/rem-tar-v1-candidate-specification.md",
+      "journal/2026-06-10.json"
+    ],
+    "verification": [
+      "Post-edit consistency grep: no leftover 'descriptive-only'/'verbatim-paths'/'not-required-to-verify' phrasing contradicting the strengthened requirements",
+      "Cross-references checked: sect 6.2 gates vs A.5, sect 7.6 vs 14.4 vs A.6, sect 11.2 step 5 vs 11.4 vs A.7, sect 12.2 vs 12.3 refusal-gate consistency"
+    ]
+  },
+  {
+    "uuid": "47d436f7-37b8-49ac-82c0-f792ff3cbbad",
+    "datetime": "2026-06-10T09:23:13+02:00",
+    "author": "claude",
+    "subject": "Design: tape identity lifecycle (retire/rebind) v0.1 + owner-facing explainer",
+    "idref": null,
+    "status": "draft-for-review",
+    "handoff_to": null,
+    "round": 0,
+    "summary": "Designed the fix for docs/tape-recycle-identity-reconciliation-concern.md (recycled/VTL-rebuilt tapes leave catalog barcode->uuid bindings stale; write sessions fail identity mismatch; tape init's Anomaly arm has no override; only escape is catalog reset which destroys audit history + journals). Two documents: docs/tape-identity-lifecycle-design-v0.1.md (normative, implementation-ready) and docs/tape-identity-lifecycle-explainer.md (owner-facing why-doc with worked scenarios A-D incl. the mislabeled-cartridge case that justifies keeping the fail-closed default). Design core: (1) new terminal tapes.state 'retired' (provision_tape refuses retired rows even with force; writability rejects automatically); (2) object_copies.status gains 'missing' with the invariant that copy status is DERIVED from tape state (single thing to preserve, re-derived after rebuild); (3) CatalogIndex::retire_tape + StateHandle::retire_tape (one transaction: state='retired', voltag detached per the partial unique index, committed copies -> missing; idempotent re-runs); (4) additive AuditEvent::TapeRetired + TapeProvisioned (compile-verified inert to replay projections; closes 'tape init emits no audit' gap); (5) four precise rebuild-preservation changes closing the resurrection trap (preserved-rows predicate + merge + two journal-ingest CASEs + post-merge copy re-derivation) — integrates with codex's in-flight H2 preserved-rows mechanism; (6) tape-init decision change: ours-BOT resolving to a retired row + available barcode -> FreshInit with the data-clobber probe skipped (retire WAS the ceremony); all other anomaly/foreign arms unchanged; (7) rem tape retire CLI (voltag-or-uuid target, --reason, required --i-understand-copies-become-unreadable ack, dry-run, rem.tape.retire.v1 envelope); (8) recycle scripts use retire+init and never catalog reset; (9) list_objects_with_no_committed_copies query as the Scenario-Q self-heal hook. OUT: barcode decommissioning, un-retire (deliberately impossible), daemon retire RPC, proto health additions, self-heal itself. Verified per rust-design-verification: skeleton (state/api/cli types incl. clap derive + audit enum arms) compiled clean — cargo check --workspace --all-features + clippy -D warnings on the three crates, 2026-06-10; skeleton deleted (design-only). Skeleton findings: get_tape_by_voltag already exists (index.rs:1238, reuse); AuditEvent additions only touch the two audit.rs serialization matches. Grounded in a code fact-sheet pass (states, decision enum, replay machinery, ReconcileTape semantics — naming deliberately avoids 'reconcile'). Next: owner reviews both docs (open questions sect 12: --reason free text vs enum; warn-vs-gate on last-copy retire; TapeProvisioned only on WroteBootstrap); after approval, hand to codex.",
+    "files_modified": [
+      "docs/tape-identity-lifecycle-design-v0.1.md",
+      "docs/tape-identity-lifecycle-explainer.md",
+      "journal/2026-06-10.json"
+    ],
+    "verification": [
+      "cargo check --workspace --all-features: clean with design skeleton in place (2026-06-10)",
+      "cargo clippy -p remanence-state -p remanence-api -p remanence-cli --all-targets -- -D warnings: clean with skeleton",
+      "Skeleton fully reverted; cargo check -p state/api/cli clean post-revert; git status shows only the pre-existing codex wave",
+      "Design facts cross-checked against a dedicated code fact-sheet pass (tapes schema, InitDecision/TapeInitError variants, preserved-rows rebuild machinery, ReconcileTape body, CLI gating)"
+    ]
+  },
+  {
+    "uuid": "61cb9fc0-17cc-4ec4-9250-061c2e21ce89",
+    "datetime": "2026-06-10T10:28:33+02:00",
+    "author": "claude",
+    "subject": "Draft REM-PARITY-1: Layer 3c on-tape parity format family candidate specification",
+    "idref": null,
+    "status": "draft-for-review",
+    "handoff_to": null,
+    "round": 0,
+    "summary": "Drafted docs/rem-parity-1-candidate-specification.md — the second formal spec (companion to rem-tar-v1), covering the full Layer 3c on-tape family: bootstrap block, parity sidecar tape files, parity_map tape files, sidecar epoch directory, filemark-map canonical digest, the rs-cauchy-gf256-v1 scheme (GF(2^8) poly 0x11D, Cauchy X_j=k+j/Y_i=i, full reconstruction math + pinned Appendix-A vectors), and normative Writer/Scanner/Recoverer/Resumer/Verifier obligations (commit discipline, classification ladder, erasure taxonomy, recovery-usable fallback ladder, resume invariants). Grounded in three parallel byte-exact fact-sheet passes over bootstrap/codec, sidecar/parity_map/filemark-map, and scan/recovery/resume. Key finding from fact-gathering: the codex fix wave has ALREADY landed H3 (scan classifies unreadable-head files by elimination, with regression test), H4's headline case (sidecar footer->primary fallback), the sink substring-dispatch (now a typed BootstrapPayloadTooLarge match), and H6 (resume carries committed-prefix sidecar directory entries via a validated ResumeWriterSeed field) — the spec describes the fixed behavior and lists only residual gaps. Spec-as-fixed-point adjudications recorded in Appendix A (11 decisions): implemented sidecar/parity_map byte layouts win wholesale over the never-realized v0.7.2 design tables (schema_version 1 not 2, u16 copy_kind 1/2, CRC at 0xB0, no per-block parity_map CRCs — A.2/A.3); design semantics win where stronger — recovery-usable rule gets a three-step fallback ladder (footer -> primary -> directory-assisted tail rescue using the epoch directory's header_block_count+hash, resolving the design's implicit footer dependence, A.7); distinct PMAPFOOT footer magic required (design wins, pre-production breaking change, A.4); drive_compression CBOR key 5 added to the normative schema (code wins over design omission, A.5); reader bootstrap discovery re-layered as BOT-mandatory/hints/MAY-fractional/bounded-scan/SHOULD-full-walk reconciling the v0.4.4 reader vs v0.7.2 writer split (A.6); epoch replaces neighborhood as spec vocabulary (A.9). Appendix B conformance backlog (10 items): footer-vs-map-mismatch fallback, directory-assisted tail rescue, parity_map footer SPOF in the public parser, scan parity_map tail probe, PMAPFOOT, candidate-size error-retention asymmetry, descriptor-format filemark sense classification, opt-in full filemark-walk scan, static vectors + fuzz targets (fixtures/rem-parity-1/), and the H5 throughput program gated byte-identical via vectors before freeze. Test-vector section defines a single-block damage matrix over a byte-pinned minimal tape image (object head / sidecar primary / footer / footer+primary / parity_map primary / bootstrap copy) asserting per-case outcomes, never whole-tape failure. No skeleton pass needed (rust-design-verification): the spec proposes no new Rust types — it normatively describes existing wire structures and behavior; conformance gaps are behavioral, to be implemented by codex against existing types. Next: owner reviews; Appendix B + sect 16 vectors become codex handoffs after approval.",
+    "files_modified": [
+      "docs/rem-parity-1-candidate-specification.md",
+      "journal/2026-06-10.json"
+    ],
+    "verification": [
+      "Byte layouts, constants, CRC/HMAC parameters, RS vectors, and digest vector all extracted directly from crates/remanence-parity source by three dedicated fact-sheet passes (bootstrap/codec; sidecar/parity_map/filemark_map; scan/recovery/resume) with file:line citations, including the bootstrap offset table pinned by test header_offsets_and_crc64_ranges_match_v044_table",
+      "All code-vs-design-v0.7.2 divergences enumerated by the fact passes and individually adjudicated in Appendix A",
+      "H3/H4/H6 status re-verified against the working tree (fixed; residuals listed in Appendix B items 1-2)"
+    ]
+  },
+  {
+    "uuid": "a94a1302-6d67-4721-9e07-22f93c6868f9",
+    "datetime": "2026-06-10T11:07:32+02:00",
+    "author": "claude",
+    "subject": "review: codex fix wave for code-review-2026-06-10 findings — PASS WITH BLOCKING FOLLOW-UPS",
+    "idref": "1fa7b909-96d3-4e04-9e02-7b15e1d62acd",
+    "status": "done",
+    "verdict": "PASS_WITH_BLOCKING_FOLLOWUPS",
+    "handoff_to": "codex",
+    "round": 0,
+    "blocking_issues": [
+      "B1 [M] Device-controlled panic in discovery: learn_byte_count (remanence-library/src/discovery.rs:314-317,357-360) returns (bc+8).max(64) unclamped from the target-supplied 24-bit RES byte count; values >= 0xFFFFF8 now trip the new hard assert at remanence-scsi/src/read_element_status.rs:193 and panic the daemon where pre-fix code degraded to a parse warning. Fix: clamp with .min(res::MAX_ALLOC_LEN) in learn_byte_count (one line) + a hostile-byte-count regression test.",
+      "B2 [M] C1 residual — failed AppendFinish does not poison the session: write_owner.rs:786-800 replies the error and keeps the session alive with total_committed_ordinals still 0, so a client retry passes the new parity-append guard and writes a fresh BOT-relative bootstrap at the current mid-tape head position, committing locators that space(tape_file_number) will mis-resolve. Reachable on hardware via any transient write/catalog-commit failure. Fix: poison the session (refuse further appends, force abort/close) on AppendFinish error, or enforce one-object-per-session; add a retry-after-failed-append test asserting refusal before tape IO.",
+      "B3 [L-security] Role inferred from any certificate subject attribute without prefix: api/src/lib.rs:1623-1650 role_from_certificate_subject scans every RDN and parse_client_role accepts bare 'admin'/'operator' values, so a cert whose CN happens to be 'operator' silently receives the operator role. Default-Readonly limits blast radius but this is an accidental-privilege hazard. Fix: require the remanence-role= prefixed attribute exclusively; add a CN='operator' negative test."
+    ],
+    "non_blocking_notes": [
+      "H9 PARTIAL: compensate_open_mount now unloads via the drive actor (mount.rs:597-602) but both compensation errors are still swallowed with let _ = and no tracing — surface them (at minimum tracing::warn!, ideally snapshot/operation state).",
+      "Orphaned successful sessions on disconnect [M-availability]: the disconnect-proof spawned open completes after the client is gone; no session reaper/idle-timeout/list-sessions exists, so tape+bay are held until daemon restart. Better than the pre-fix wedge; schedule a reaper as a fast-follow (interacts with idempotency design).",
+      "tape_init bootstrap-filemark probe (review 5.8 item l) had zero movement even though the enabling TapeIoError::FilemarkEncountered variant now exists — tape_init.rs:713-720 still RefuseClobbers a perfectly initialized tape on hardware; consume the new variant.",
+      "BlockTooLarge mapping is unconditional once the limit is cached (tape_io/mod.rs:754-764,837-847): any 5/24/00 on WRITE maps to BlockTooLarge even when requested <= limit; guard with len_u32 > limit.",
+      "Position-unknown latch is per-handle (handle/mod.rs:888): drop + re-open_drive of the same bay bypasses the write gate; seed from shared dirty state or document.",
+      "StateConfigWarning is produced but consumed by nobody (state.rs:382-404) — the pools-without-rules condition is now invisible; plumb into CLI/daemon output.",
+      "Audit rollback swallows truncate failure (audit.rs:501-504 let _ = set_len) — add the fatal-latch fallback and a rollback test, else the mid-log-corruption brick can recur on a failing disk.",
+      "Preserved-rows restore can resurrect a tape row with stale written-counters when its journal is absent from rebuild inputs (counters say written, child tables empty).",
+      "H2 residual (accepted): total SQLite loss still destroys provisioning — provisioning remains unaudited/unjournaled; the tape-identity-lifecycle design's TapeProvisioned audit events are the eventual closure. The wipe-equivalence test still uses an unprovisioned fixture.",
+      "Scan unreadable-head arm catches ALL errors (scan.rs:148) rather than sense-gating medium errors like the bootstrap path; consider gating to avoid transport-fault misclassification.",
+      "H6 resume directory entries have no production producer — Layer 5 must derive real entries (hash/flags currently unvalidated placeholders in tests) when wiring resume.",
+      "tape_state('ingested') -> TAPE_STATE_READY overstates (ingested tapes fail the write gate); intersects with rebuild behavior — consider a distinct proto state.",
+      "Still open with no recorded deferral: erasure-policy duplication [M, recovery.rs single vs bulk], resume whole-epoch RAM bound [M, partial], pool_ops dirty-hint bypass + tape-left-loaded [M], CLI signal-handling story [M], region-recovery atomicity doc, reserve pending-sidecar cross-check, legacy pool-membership migration fixture test, ID newtypes, prepare_cached, host_id/hex dedup, SenseInfo dead surface, sticky timeout protocol, audit-vocab-in-error.rs, stringly reconcile errors, zero-drive ladder, RemovalLockGuard shape, CLI polish tier (exit codes, i32 tables, envelope coverage, command-surface dedup, libraries --json envelope), changer2/LTO-7 fixture tests (the dwara2 safety requirement still has no automated guard), DrivePool concurrency tests, actor session-loop tests (chaos seam still unused in remanence-api), daemon TCP+TLS accept test, GNU tar/bsdtar gates, fuzz targets, SPOOL_MAX_BYTES contract documentation, actor catch_unwind self-healing, systemd unit + DR runbook, journal/2026-06-07.json array-envelope schema fix, plan.txt cleanup, locate.rs CP/IMMED doc correction, strict RES equality dependency comment, spec Appendix B item 10 text now stale (calls GF/CRC bitwise after tables landed).",
+      "Spool orphan window remains (finish_append_spool keep=true -> actor consume) and state_dir/spool is never swept at daemon startup; orphans accumulate across restarts.",
+      "Daemon-path state-dir hardening order: CatalogIndex::open create_dir_all runs with umask perms before ensure_socket_parent's 0700; pre-existing state_dir never re-chmodded.",
+      "H5 throughput is table-driven (est ~10x) but UNMEASURED — the review asked for a recorded ceiling and the spec freeze-gates on a measured, vector-pinned program; record numbers in codec.rs when measured."
+    ],
+    "summary": "Verified the uncommitted codex fix wave (96 files, +8145/-13745) against all ~120 findings of docs/code-review-2026-06-10.md via seven parallel verification passes plus the gates. GATES: cargo fmt clean; clippy -D warnings clean; 1163 tests pass, 0 fail (was 1046; +117 net incl. 29 new api tests, 5 handle, 9 tape_io, 4 sink, 8 state). CRITICAL/HIGH SCOREBOARD (16 items): C1 FIXED via the recommended interim guard (parity tapes with committed ordinals refused at selection AND per-AppendFinish, tests assert refusal before any tape IO) but with the B2 retry residual; H1 FIXED end-to-end (encoding, isolated-bit tests, truthful lore rewrite, layer2-design doc corrected, discovery ladder rung now live); H2 FIXED via preserve/merge with a genuinely provisioned-tape rebuild test (residual: total-SQLite-loss case, accepted); H3 FIXED (elimination classification + regression test); H4 FIXED (footer->primary fallback + footer-only-damage test; residuals already in REM-PARITY-1 Appendix B); H5 FIXED via const GF mul tables + table-driven CRC with Appendix-A/check-value pinning (unmeasured); H6 FIXED via validated ResumeWriterSeed entries (no production producer yet); H7 FIXED (RAII DriveReservation + disarm-after-record, open/close in spawned critical sections, actor unloads on dropped reply); H8 FIXED (declared.min(cap) + aggregate semaphore budget); H9 PARTIAL (unload added, failures still silent); H10/H11/H12 FIXED (H12 stronger than asked: hard digest failure pre-creation); H13 FIXED beyond ask (chmod 0660 + SO_PEERCRED + 0700 state subdirs); H14 FIXED beyond ask (full 5-role x 5-permission cert-subject authz on every RPC, default-Readonly, actor identity in audit) modulo B3; H15 FIXED (accurate root README, spec sect 0/3.2 sync, proto README; per-file supersede banners partial). Hygiene wave landed: lossless test-module extractions (handle 89->94 tests, tape_io 50->59, sink 71->75 — verified by per-test name/body diff), remanence-scsi/src/sense.rs consolidating sense decode (fixed+descriptor key/asc/ascq; descriptor FILEMARK/INFORMATION still unparsed — spec Appendix B item 7), audit/dirty epilogue dedup (45 fire_audit sites -> 4), eprintln->tracing with daemon subscriber, tempdir->tempfile, bytes_to_hex dedup, .github CI (fmt+clippy+test, pinned 1.80), configurable tape block size rode along. M-TIER: roughly 70% fixed with tests; the misses cluster in CLI polish, doc-comment nits, and the items listed in non_blocking_notes. NEW ISSUES from the fixes themselves: B1-B3 blocking; the rest recorded as non-blocking. VERDICT: PASS WITH BLOCKING FOLLOW-UPS — B1/B2/B3 are all small, surgical fixes that should land in this same wave before it is committed to main; everything else can follow as scheduled slices. Recommended commit shape: codex applies B1-B3 + reruns gates, then commits the wave (it is large; consider logical commit grouping per crate), then the non-blocking list becomes the next triage backlog alongside REM-TAR-1/REM-PARITY-1 Appendix B and the tape-identity-lifecycle implementation.",
+    "files_modified": [
+      "journal/2026-06-10.json"
+    ],
+    "verification": [
+      "cargo fmt --all --check: clean",
+      "cargo clippy --workspace --exclude remanence-chaos --all-targets -- -D warnings: clean (0 diagnostics)",
+      "cargo test --workspace --exclude remanence-chaos: 1163 passed, 0 failed, 13 ignored (hardware/memory-gated)",
+      "Seven parallel verification passes with per-finding verdicts and file:line evidence; test-module extractions verified lossless by per-test name and body comparison against HEAD; C1/H7/H8 fixes traced through the actual hardware paths"
+    ]
+  },
+  {
+    "uuid": "38521852-0a1b-45a1-8c7b-4ac10ba53485",
+    "datetime": "2026-06-10T11:39:17+02:00",
+    "author": "claude",
+    "subject": "Fix review blockers B1-B3 (implemented directly per owner's request)",
+    "idref": "a94a1302-6d67-4721-9e07-22f93c6868f9",
+    "status": "complete",
+    "handoff_to": null,
+    "round": 1,
+    "summary": "Implemented the three blocking issues from the fix-wave review, at owner's explicit request (exception to the design-only devloop role). B1: learn_byte_count (remanence-library/src/discovery.rs) now clamps the device-supplied RES byte count with (bc + 8).clamp(64, res::MAX_ALLOC_LEN), with a why-comment; a hostile byte count degrades to a truncated-parse probe warning instead of tripping res::build_cdb's allocation assert and panicking. Regression test hostile_res_byte_count_degrades_to_error_not_panic seeds a FixtureTransport probe response reporting 0xFFFFFF and asserts no panic plus the clamped allocation bytes in the logged CDB. B2: new SessionAppendGate in write_owner.rs — the first failed AppendFinish permanently poisons the write session; subsequent AppendFinish commands are refused with failed_precondition ('write session poisoned by a failed append; abort the session and open a new one') before any catalog or tape work, and the spool file is removed. Close/Abort remain allowed. Rationale documented on the struct: the parity-append guard keys on total_committed_ordinals > 0, which is still 0 after a failed first append, so a retry would write a fresh BOT-relative bootstrap mid-tape. Unit test append_gate_poisons_session_after_failed_append pins the gate; the loop wiring itself remains harness-less like the rest of the actor loop (pre-existing gap, on the backlog). B3: certificate role parsing split — role_from_certificate_subject now uses parse_certificate_role_attribute, which grants a role ONLY for remanence-role=/remanence-role: prefixed subject values; bare role words and generic role=/role: prefixes no longer grant from certificates (doc comment records why; the x-remanence-role metadata path keeps accepting bare words). The existing mtls-subject test's baked cert (CN 'role:orchestrator') was repurposed as the negative test auth_role_certificate_ignores_unprefixed_subject_values; a freshly generated cert with CN 'remanence-role=orchestrator' carries the positive test; certificate_role_requires_remanence_prefix unit-tests the parser including CN='operator'/'admin' rejection. DEPLOYMENT NOTE: any existing client cert relying on bare/role:-prefixed subject values must be reissued with the remanence-role= form (nothing is deployed yet). Gates after fixes: cargo fmt applied; clippy -D warnings clean on remanence-library + remanence-api; full workspace suite 1167 passed, 0 failed (+4 tests). The fix wave plus these blockers is now ready to commit to main.",
+    "files_modified": [
+      "crates/remanence-library/src/discovery.rs",
+      "crates/remanence-api/src/lib.rs",
+      "crates/remanence-api/src/write_owner.rs",
+      "journal/2026-06-10.json"
+    ],
+    "verification": [
+      "cargo fmt --all: applied, clean",
+      "cargo clippy -p remanence-library -p remanence-api --all-targets -- -D warnings: clean",
+      "cargo test --workspace --exclude remanence-chaos: 1167 passed, 0 failed",
+      "New tests: hostile_res_byte_count_degrades_to_error_not_panic, append_gate_poisons_session_after_failed_append, certificate_role_requires_remanence_prefix, auth_role_certificate_ignores_unprefixed_subject_values"
+    ]
+  },
+  {
+    "uuid": "b2460304-faa5-4853-b1a8-3fc5b7c14e74",
+    "datetime": "2026-06-10T12:20:55+02:00",
+    "author": "claude",
+    "subject": "Implement tape identity lifecycle (retire/rebind) per design v0.1",
+    "idref": "47d436f7-37b8-49ac-82c0-f792ff3cbbad",
+    "status": "complete",
+    "handoff_to": null,
+    "round": 0,
+    "summary": "Implemented docs/tape-identity-lifecycle-design-v0.1.md sections 3-8 with all section-10 acceptance tests, at owner's request (delegated to an implementation agent against the design as binding spec, then independently verified). remanence-state: terminal 'retired' tape state with CatalogIndex::retire_tape (one transaction beside seal_tape: state flip, voltag detach, committed copies -> 'missing', idempotent rerun, unknown-uuid error), provision_tape refuses retired rows BEFORE the force/reprovision escape hatch with the design's message, list_objects_with_no_committed_copies (Scenario-Q hook), all four section-6 rebuild-preservation changes (preserve predicate, merge re-apply, both ingest CASEs, post-merge copy re-derivation) pinned by a regression test the agent revert-verified against each change individually, StateHandle::retire_tape appending TapeRetired after commit with the ordering rationale in code, AuditEvent::TapeRetired/TapeProvisioned + serialization arms, AuditActor::local_user(). remanence-api: CatalogRowDisposition plumbed through project_tape_init_catalog_inputs; the section-7 decision arm — ours-BOT on a retired row with free barcode -> FreshInit with the data-past-bootstrap probe skipped (double-ceremony rationale commented); retired+foreign-barcode stays Anomaly; integration test runs the concern doc's full repro (init -> write+commit -> retire -> re-init same barcode with physical data present, no CLOBBER -> write+commit; first object's copies 'missing', second 'committed', zero catalog resets). remanence-cli: rem tape retire with required --reason and --i-understand-copies-become-unreadable (exit 1 without), --dry-run preview incl. would-be-degraded objects, voltag-then-32hex-uuid target resolution, rem.tape.retire.v1 JSON envelope, degraded-count warning in the one-liner; TapeProvisioned emitted from provision_initialized_tape only on WroteBootstrap. Section-12 open questions implemented as proposed (free-text reason; warn-only on last-copy retire; provision event only on actual write). D7 script changes skipped: recycle-scenario-*-tapes.sh live in the external system harness, not this repo — the harness owner should add 'rem tape retire $BARCODE --reason recycled --i-understand-copies-become-unreadable' before each rem tape init and drop the reset+up workaround. One recorded interpretation: idempotent retire reruns append no audit event (nothing changed; the original TapeRetired is the record). Gates independently re-verified: fmt clean, clippy -D warnings clean, 1186 passed / 0 failed (+19 tests).",
+    "files_modified": [
+      "crates/remanence-state/src/audit.rs",
+      "crates/remanence-state/src/index.rs",
+      "crates/remanence-state/src/state.rs",
+      "crates/remanence-state/src/lib.rs",
+      "crates/remanence-api/src/tape_init.rs",
+      "crates/remanence-api/src/lib.rs",
+      "crates/remanence-cli/src/lib.rs",
+      "crates/remanence-cli/Cargo.toml",
+      "journal/2026-06-10.json"
+    ],
+    "verification": [
+      "cargo fmt --all --check: clean (verified independently after the implementation agent finished)",
+      "cargo clippy --workspace --exclude remanence-chaos --all-targets -- -D warnings: clean",
+      "cargo test --workspace --exclude remanence-chaos: 1186 passed, 0 failed, 13 ignored",
+      "Section-10.2 resurrection-trap regression test revert-verified against each of the four section-6 changes individually",
+      "Spot-checked: retired gate precedes reprovision escape hatch (index.rs:2036), audit-after-commit ordering comment present (state.rs:182-185), section-10.6 integration test exercises the full concern-doc repro"
+    ]
+  }
+]

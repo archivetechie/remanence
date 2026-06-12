@@ -1,0 +1,6 @@
+    HPE       Ultrium 9-SCSI    R3G3
+Tape capacity page  (LTO-5 and LTO-6 specific) [0x31]
+  Main partition remaining capacity (in MiB): 9721740
+  Alternate partition remaining capacity (in MiB): 0
+  Main partition maximum capacity (in MiB): 17166137
+  Alternate partition maximum capacity (in MiB): 0

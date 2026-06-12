@@ -1,0 +1,37 @@
+{
+  "vector_id": "RAO-TV-EMPTY",
+  "spec_section": "13.1",
+  "status": "pinned-at-generation",
+  "independent_rederivation": "verified by tools/verify_rao_vectors_independent.py",
+  "inputs": {
+    "chunk_size": 4096,
+    "object_id": "00000000-0000-4000-8000-000000000101",
+    "caller_object_id": "rao-tv-empty",
+    "write_timestamp": "2026-01-01T00:00:00Z",
+    "metadata_preservation": "minimal",
+    "manifest_file_id": "00000000-0000-4000-8000-000000000101",
+    "entries": []
+  },
+  "expected": {
+    "stored_size_bytes": 8192,
+    "stored_size_blocks": 2,
+    "stored_digest": "6163b86341c2be3423a1be612f3cabe6ae66465640cee82ae89484406030180e",
+    "first_block_sha256": "06fc9fb2ade2e4f0aa9fa0868ca7efe516fab53bfee62f46746ebb23e8dc644f",
+    "manifest_cbor_len": 161,
+    "manifest_cbor_hex": "a7696f626a6563745f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303130316a6368756e6b5f73697a651910006c66696c655f656e7472696573806e736368656d615f76657273696f6e016f6f626a6563745f6d65746164617461a07063616c6c65725f6f626a6563745f69646c72616f2d74762d656d7074797365787465726e616c5f7265666572656e63657380",
+    "manifest_sha256": "60e602934c59a02f25ad9f97ee462c7555fd356fd6ff6dcb906bbfcd7fcd3d2e",
+    "file_payloads": [],
+    "symlinks": [],
+    "directories": [],
+    "file_layouts": [],
+    "manifest_layout": {
+      "entry_type": "regular",
+      "path": "_remanence/manifest.cbor",
+      "pax_header_offset": 1024,
+      "data_offset": 4096,
+      "first_chunk_lba": 1,
+      "chunk_count": 1,
+      "pad_spaces": 1718
+    }
+  }
+}

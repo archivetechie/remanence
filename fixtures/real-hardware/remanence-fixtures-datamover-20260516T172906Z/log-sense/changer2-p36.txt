@@ -1,0 +1,7 @@
+    HPE       MSL3040           3350
+Unable to decode page = 0x36, here is hex:
+ 00     36 00 03 08 02 02 f8 00  01 48 00 00 01 00 6a 08
+ 10     a9 a1 00 00 0f af 02 00  00 69 c6 22 89 0e 7e f0
+ 20     02 ea 00 00 06 00 02 e4  3c 4d 45 53 53 41 47 45
+ 30     20 74 79 70 65 3d 22 53  54 41 54 55 53 22 20 6e
+ .....  [truncated after 64 of 780 bytes (use '-H' to see the rest)]

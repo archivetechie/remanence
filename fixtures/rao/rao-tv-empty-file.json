@@ -1,0 +1,63 @@
+{
+  "vector_id": "RAO-TV-EMPTY-FILE",
+  "spec_section": "13.1",
+  "status": "pinned-at-generation",
+  "independent_rederivation": "verified by tools/verify_rao_vectors_independent.py",
+  "inputs": {
+    "chunk_size": 4096,
+    "object_id": "00000000-0000-4000-8000-000000000102",
+    "caller_object_id": "rao-tv-empty-file",
+    "write_timestamp": "2026-01-01T00:00:00Z",
+    "metadata_preservation": "minimal",
+    "manifest_file_id": "00000000-0000-4000-8000-000000000102",
+    "entries": [
+      {
+        "entry_type": "regular",
+        "path": "empty.bin",
+        "file_id": "00000000-0000-4000-8000-000000000120",
+        "size_bytes": 0,
+        "link_target": null,
+        "mtime": null,
+        "executable": null
+      }
+    ]
+  },
+  "expected": {
+    "stored_size_bytes": 8192,
+    "stored_size_blocks": 2,
+    "stored_digest": "b929da4890c783f55ba22f55f8a99598ed215c992acbbfdb01d4bdafd71b511b",
+    "first_block_sha256": "8a75b789bded5aac3ed57dfe89a8d223ed44e0fac6fc8ab6e7e0d304bf257ab6",
+    "manifest_cbor_len": 357,
+    "manifest_cbor_hex": "a7696f626a6563745f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303130326a6368756e6b5f73697a651910006c66696c655f656e747269657381a8647061746869656d7074792e62696e6766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303132306a65786563757461626c65f66a73697a655f6279746573006b6368756e6b5f636f756e74006b66696c655f7368613235365820e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b8556f66697273745f6368756e6b5f6c6261f6781a6d657461646174615f707265736572766174696f6e5f64617461a06e736368656d615f76657273696f6e016f6f626a6563745f6d65746164617461a07063616c6c65725f6f626a6563745f69647172616f2d74762d656d7074792d66696c657365787465726e616c5f7265666572656e63657380",
+    "manifest_sha256": "00043e6834fe6a57950db9cf29b04c18cd9d0f91a80474df3641bd6c63091b02",
+    "file_payloads": [
+      {
+        "path": "empty.bin",
+        "size_bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ],
+    "symlinks": [],
+    "directories": [],
+    "file_layouts": [
+      {
+        "entry_type": "regular",
+        "path": "empty.bin",
+        "pax_header_offset": 1024,
+        "data_offset": 2560,
+        "first_chunk_lba": null,
+        "chunk_count": 0,
+        "pad_spaces": 0
+      }
+    ],
+    "manifest_layout": {
+      "entry_type": "regular",
+      "path": "_remanence/manifest.cbor",
+      "pax_header_offset": 2560,
+      "data_offset": 4096,
+      "first_chunk_lba": 1,
+      "chunk_count": 1,
+      "pad_spaces": 183
+    }
+  }
+}

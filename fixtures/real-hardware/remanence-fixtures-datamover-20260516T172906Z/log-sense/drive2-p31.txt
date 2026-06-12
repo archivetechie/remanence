@@ -1,0 +1,6 @@
+    HP        Ultrium 7-SCSI    Q387
+Tape capacity page  (LTO-5 and LTO-6 specific) [0x31]
+  Main partition remaining capacity (in MiB): 265719
+  Alternate partition remaining capacity (in MiB): 0
+  Main partition maximum capacity (in MiB): 5722045
+  Alternate partition maximum capacity (in MiB): 0
