@@ -1,8 +1,9 @@
 # Remanence Documentation
 
-This directory holds the implementation specs, design notes, review artifacts,
-and operator notes for Remanence. The root [README.md](../README.md) is the
-project entry point; this file is the documentation map.
+This directory holds design notes, review artifacts, and operator notes for
+Remanence. The published format specifications live in [../specs](../specs).
+The root [README.md](../README.md) is the project entry point; this file is the
+documentation map.
 
 ## Current Implementation Status
 
@@ -30,6 +31,10 @@ part of the portable file object.
 
 ## Authoritative References
 
+- [../specs/rao-1.0-specification.md](../specs/rao-1.0-specification.md):
+  published RAO Format v1.0.
+- [../specs/rem-parity-1.0-specification.md](../specs/rem-parity-1.0-specification.md):
+  published Rem Tape Parity (REM-PARITY) Format v1.0.
 - [spec-v0.4.md](spec-v0.4.md): consolidated architecture, layer contracts,
   on-tape formats, persistence model, security model, roadmap, and glossary.
 - [layer5-roadmap.md](layer5-roadmap.md): current Layer 5 daemon/API status.

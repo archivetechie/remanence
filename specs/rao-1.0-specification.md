@@ -2386,7 +2386,7 @@ of valid objects (anything else is RAO version 2):
 - [AGE] — "The age format specification", C2SP: the payload STREAM
   construction reference.
 - [REMPARITY] — Rem Tape Parity (REM-PARITY) Format, Version 1.0
-  (`docs/rem-parity-1.0-specification.md`): the parity layer of
+  (`specs/rem-parity-1.0-specification.md`): the parity layer of
   Sections 8.2 and 9.
 - [PART-ORACLE] — Len, Grubbs, Ristenpart, "Partitioning Oracle Attacks",
   USENIX Security 2021.

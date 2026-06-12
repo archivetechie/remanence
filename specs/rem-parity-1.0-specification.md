@@ -1559,7 +1559,7 @@ required to implement it.
 ### 19.2. Informative
 
 - [RAO] — Rem Archive Object (RAO) Format, Version 1.0
-  (`docs/rao-1.0-specification.md`): the reference payload format of
+  (`specs/rao-1.0-specification.md`): the reference payload format of
   Section 4.4.
 - [LTO-SCSI] — IBM LTO SCSI Reference (GA32-0928): fixed-block I/O, sense
   data formats, and boundary classification for the Section 3.5 I/O layer.
