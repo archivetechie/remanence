@@ -39,8 +39,9 @@
 //! Exit codes: 0 on success, 1 on a discovery / op error, 2 when the
 //! caller asked for a library that wasn't found.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, ErrorKind, Read, Write};
+use std::io::{self, BufReader, Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -5448,11 +5449,8 @@ fn extract_plaintext_archive_object_file(args: &ArchiveExtractArgs) -> Result<Va
         if range.is_some() || range_path.is_some() {
             return Err("--blob-member cannot be combined with --path/--range".to_string());
         }
-        let object = read_rem_tar_object(&mut source, chunk_size, block_count)
-            .map_err(|error| format!("read plaintext RAO: {error}"))?;
-        return extract_blob_member_file(
+        return extract_plaintext_blob_member_file(
             args,
-            &object,
             BlobMemberExtractContext {
                 representation: "plaintext",
                 encryption: "none",
@@ -5601,17 +5599,24 @@ fn extract_encrypted_blob_member_file(args: &ArchiveExtractArgs) -> Result<Value
     let root_key = read_root_key_file(key_path)?;
     let (plaintext, envelope) = open_to_vec(&encrypted, &root_key)
         .map_err(|error| format!("open encrypted RAO: {error}"))?;
+    if envelope.header != inspected.header {
+        return Err("encrypted header changed between inspect and open".to_string());
+    }
     let chunk_size = usize::try_from(inspected.header.chunk_size)
         .map_err(|_| "encrypted header chunk_size is too large for this host".to_string())?;
-    let blocks = plaintext_blocks_from_bytes(&plaintext, chunk_size)?;
-    let block_count =
-        u64::try_from(blocks.len()).map_err(|_| "plaintext block count overflow".to_string())?;
-    let mut parse_source = VecBlockSource::new(blocks);
-    let object = read_rem_tar_object(&mut parse_source, chunk_size, block_count)
-        .map_err(|error| format!("parse decrypted RAO: {error}"))?;
-    extract_blob_member_file(
+    let scan = scan_rao_entry_locators_from_bytes(&plaintext, chunk_size)?;
+    let inner_object_id = scan
+        .global_pax
+        .get("REMANENCE.object_id")
+        .ok_or_else(|| "decrypted RAO is missing REMANENCE.object_id".to_string())?;
+    if inner_object_id != &envelope.header.object_id {
+        return Err("decrypted inner object_id does not match encrypted header".to_string());
+    }
+    extract_encrypted_blob_member_range_file(
         args,
-        &object,
+        &encrypted,
+        &root_key,
+        &scan,
         BlobMemberExtractContext {
             representation: "encrypted",
             encryption: "RAO1",
@@ -5635,9 +5640,64 @@ struct BlobMemberExtractContext {
     stored_digest: [u8; 32],
 }
 
-fn extract_blob_member_file(
+struct BlobMemberExtractReportContext<'a> {
+    base: BlobMemberExtractContext,
+    object: &'a Path,
+    dest: &'a Path,
+    output: &'a Path,
+    blob_entry: &'a str,
+    idx_entry: &'a str,
+    blob_member: &'a str,
+    blob_size_bytes: u64,
+    idx_size_bytes: u64,
+    blob_first_chunk_lba: Option<u64>,
+    idx_first_chunk_lba: Option<u64>,
+    blob_range_start: u64,
+    blob_range_len: u64,
+    idx_authenticated_chunks: Option<u64>,
+    blob_authenticated_chunks: Option<u64>,
+    idx_stored_range_start: Option<u64>,
+    idx_stored_range_len: Option<u64>,
+    blob_stored_range_start: Option<u64>,
+    blob_stored_range_len: Option<u64>,
+    bytes_written: u64,
+}
+
+fn blob_member_extract_report_json(context: &BlobMemberExtractReportContext<'_>) -> Value {
+    json!({
+        "mode": "blob-member",
+        "range_method": "rao-entry-range",
+        "object": context.object,
+        "dest": context.dest,
+        "output": context.output,
+        "blob_entry": context.blob_entry,
+        "idx_entry": context.idx_entry,
+        "blob_member": context.blob_member,
+        "representation": context.base.representation,
+        "encryption": context.base.encryption,
+        "key_id": context.base.key_id.map(|key_id| bytes_to_hex(&key_id)),
+        "chunk_size": context.base.chunk_size,
+        "stored_size_bytes": context.base.stored_size_bytes,
+        "stored_size_blocks": context.base.stored_size_blocks,
+        "stored_digest": bytes_to_hex(&context.base.stored_digest),
+        "blob_size_bytes": context.blob_size_bytes,
+        "idx_size_bytes": context.idx_size_bytes,
+        "blob_first_chunk_lba": context.blob_first_chunk_lba,
+        "idx_first_chunk_lba": context.idx_first_chunk_lba,
+        "blob_range_start": context.blob_range_start,
+        "blob_range_len": context.blob_range_len,
+        "idx_authenticated_chunks": context.idx_authenticated_chunks,
+        "blob_authenticated_chunks": context.blob_authenticated_chunks,
+        "idx_stored_range_start": context.idx_stored_range_start,
+        "idx_stored_range_len": context.idx_stored_range_len,
+        "blob_stored_range_start": context.blob_stored_range_start,
+        "blob_stored_range_len": context.blob_stored_range_len,
+        "bytes_written": context.bytes_written,
+    })
+}
+
+fn extract_plaintext_blob_member_file(
     args: &ArchiveExtractArgs,
-    object: &RemTarReadObject,
     context: BlobMemberExtractContext,
 ) -> Result<Value, String> {
     let blob_entry = args
@@ -5648,24 +5708,417 @@ fn extract_blob_member_file(
         .blob_member
         .as_deref()
         .ok_or_else(|| "--blob-entry requires --blob-member".to_string())?;
-    let bytes = archive_ingest::extract_blob_member_from_object(object, blob_entry, member_path)?;
+    let scan = scan_plaintext_rao_entry_locators(&args.object, context.chunk_size)?;
+    let idx_path = archive_ingest::remwrap_index_path(blob_entry)?;
+    let idx_entry = require_regular_locator(&scan, &idx_path)?;
+    let blob = require_regular_locator(&scan, blob_entry)?;
+    let idx_bytes =
+        read_plaintext_rao_entry_range(&args.object, idx_entry, 0, idx_entry.size_bytes)?;
+    verify_locator_sha256(idx_entry, &idx_bytes, &idx_path)?;
+    let member =
+        archive_ingest::resolve_blob_member_from_index(&idx_bytes, &idx_path, member_path)?;
+    let bytes = read_plaintext_rao_entry_range(&args.object, blob, member.offset, member.length)?;
+    archive_ingest::verify_blob_member_bytes(member_path, member.sha256.as_deref(), &bytes)?;
     let output = write_archive_range_output(&args.dest, member_path, &bytes, args.overwrite)?;
-    Ok(json!({
-        "mode": "blob-member",
-        "object": args.object,
-        "dest": args.dest,
-        "output": output,
-        "blob_entry": blob_entry,
-        "blob_member": member_path,
-        "representation": context.representation,
-        "encryption": context.encryption,
-        "key_id": context.key_id.map(|key_id| bytes_to_hex(&key_id)),
-        "chunk_size": context.chunk_size,
-        "stored_size_bytes": context.stored_size_bytes,
-        "stored_size_blocks": context.stored_size_blocks,
-        "stored_digest": bytes_to_hex(&context.stored_digest),
-        "bytes_written": bytes.len(),
-    }))
+    Ok(blob_member_extract_report_json(
+        &BlobMemberExtractReportContext {
+            base: context,
+            object: &args.object,
+            dest: &args.dest,
+            output: &output,
+            blob_entry,
+            idx_entry: &idx_path,
+            blob_member: member_path,
+            blob_size_bytes: blob.size_bytes,
+            idx_size_bytes: idx_entry.size_bytes,
+            blob_first_chunk_lba: blob.first_chunk_lba.map(|lba| lba.0),
+            idx_first_chunk_lba: idx_entry.first_chunk_lba.map(|lba| lba.0),
+            blob_range_start: member.offset,
+            blob_range_len: member.length,
+            idx_authenticated_chunks: None,
+            blob_authenticated_chunks: None,
+            idx_stored_range_start: Some(idx_entry.data_offset),
+            idx_stored_range_len: Some(idx_entry.size_bytes),
+            blob_stored_range_start: Some(
+                blob.data_offset
+                    .checked_add(member.offset)
+                    .ok_or_else(|| "blob member plaintext offset overflows".to_string())?,
+            ),
+            blob_stored_range_len: Some(member.length),
+            bytes_written: bytes.len() as u64,
+        },
+    ))
+}
+
+fn extract_encrypted_blob_member_range_file(
+    args: &ArchiveExtractArgs,
+    encrypted: &[u8],
+    root_key: &RootKey,
+    scan: &RaoLocatorScan,
+    context: BlobMemberExtractContext,
+) -> Result<Value, String> {
+    let blob_entry = args
+        .blob_entry
+        .as_deref()
+        .ok_or_else(|| "--blob-member requires --blob-entry".to_string())?;
+    let member_path = args
+        .blob_member
+        .as_deref()
+        .ok_or_else(|| "--blob-entry requires --blob-member".to_string())?;
+    let idx_path = archive_ingest::remwrap_index_path(blob_entry)?;
+    let idx_entry = require_regular_locator(scan, &idx_path)?;
+    let blob = require_regular_locator(scan, blob_entry)?;
+
+    let idx_range = read_encrypted_rao_file_range_to_vec(
+        encrypted,
+        root_key,
+        idx_entry.first_chunk_lba,
+        idx_entry.size_bytes,
+        0,
+        idx_entry.size_bytes,
+    )
+    .map_err(|error| format!("extract encrypted RAO blob index range: {error}"))?;
+    verify_locator_sha256(idx_entry, &idx_range.bytes, &idx_path)?;
+    let member =
+        archive_ingest::resolve_blob_member_from_index(&idx_range.bytes, &idx_path, member_path)?;
+    let blob_range = read_encrypted_rao_file_range_to_vec(
+        encrypted,
+        root_key,
+        blob.first_chunk_lba,
+        blob.size_bytes,
+        member.offset,
+        member.length,
+    )
+    .map_err(|error| format!("extract encrypted RAO blob member range: {error}"))?;
+    archive_ingest::verify_blob_member_bytes(
+        member_path,
+        member.sha256.as_deref(),
+        &blob_range.bytes,
+    )?;
+    let output =
+        write_archive_range_output(&args.dest, member_path, &blob_range.bytes, args.overwrite)?;
+    Ok(blob_member_extract_report_json(
+        &BlobMemberExtractReportContext {
+            base: context,
+            object: &args.object,
+            dest: &args.dest,
+            output: &output,
+            blob_entry,
+            idx_entry: &idx_path,
+            blob_member: member_path,
+            blob_size_bytes: blob.size_bytes,
+            idx_size_bytes: idx_entry.size_bytes,
+            blob_first_chunk_lba: blob.first_chunk_lba.map(|lba| lba.0),
+            idx_first_chunk_lba: idx_entry.first_chunk_lba.map(|lba| lba.0),
+            blob_range_start: member.offset,
+            blob_range_len: member.length,
+            idx_authenticated_chunks: Some(idx_range.envelope.chunk_count),
+            blob_authenticated_chunks: Some(blob_range.envelope.chunk_count),
+            idx_stored_range_start: idx_range.envelope.stored_range_start,
+            idx_stored_range_len: Some(idx_range.envelope.stored_range_len),
+            blob_stored_range_start: blob_range.envelope.stored_range_start,
+            blob_stored_range_len: Some(blob_range.envelope.stored_range_len),
+            bytes_written: blob_range.bytes.len() as u64,
+        },
+    ))
+}
+
+#[derive(Debug, Clone)]
+struct RaoLocatorScan {
+    global_pax: BTreeMap<String, String>,
+    entries: Vec<RaoEntryLocator>,
+}
+
+#[derive(Debug, Clone)]
+struct RaoEntryLocator {
+    path: String,
+    entry_type: RemTarEntryType,
+    size_bytes: u64,
+    first_chunk_lba: Option<BodyLba>,
+    data_offset: u64,
+    file_sha256: Option<String>,
+}
+
+fn scan_plaintext_rao_entry_locators(
+    object: &Path,
+    chunk_size: usize,
+) -> Result<RaoLocatorScan, String> {
+    let mut file =
+        File::open(object).map_err(|error| format!("open {}: {error}", object.display()))?;
+    scan_rao_entry_locators(&mut file, chunk_size)
+}
+
+fn scan_rao_entry_locators_from_bytes(
+    bytes: &[u8],
+    chunk_size: usize,
+) -> Result<RaoLocatorScan, String> {
+    let mut cursor = Cursor::new(bytes);
+    scan_rao_entry_locators(&mut cursor, chunk_size)
+}
+
+fn scan_rao_entry_locators<R: Read + Seek>(
+    reader: &mut R,
+    chunk_size: usize,
+) -> Result<RaoLocatorScan, String> {
+    if chunk_size == 0 {
+        return Err("RAO chunk size must be nonzero".to_string());
+    }
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("seek RAO object start: {error}"))?;
+    let mut offset = 0u64;
+    let mut global_pax = BTreeMap::new();
+    let mut pending_pax = BTreeMap::new();
+    let mut entries = Vec::new();
+    loop {
+        let mut header = [0u8; 512];
+        reader
+            .read_exact(&mut header)
+            .map_err(|error| format!("read RAO tar header at byte {offset}: {error}"))?;
+        offset = offset
+            .checked_add(512)
+            .ok_or_else(|| "RAO tar offset overflow".to_string())?;
+        if header.iter().all(|byte| *byte == 0) {
+            break;
+        }
+        let header_size = parse_tar_header_size(&header)?;
+        match header[156] {
+            b'g' | b'x' => {
+                let data = read_tar_payload(reader, header_size)?;
+                let records = parse_local_pax_records(&data)?;
+                if header[156] == b'g' {
+                    global_pax.extend(records);
+                } else {
+                    pending_pax = records;
+                }
+                let padding = tar_padding_len_local(header_size)?;
+                seek_forward(reader, padding)?;
+                offset = offset
+                    .checked_add(round_up_512_local(header_size)?)
+                    .ok_or_else(|| "RAO tar offset overflow".to_string())?;
+            }
+            b'0' | 0 | b'2' | b'5' => {
+                let entry_type = match header[156] {
+                    b'0' | 0 => RemTarEntryType::Regular,
+                    b'2' => RemTarEntryType::Symlink,
+                    b'5' => RemTarEntryType::Directory,
+                    other => {
+                        return Err(format!("unsupported RAO tar typeflag {other}"));
+                    }
+                };
+                let path = pending_pax
+                    .get("path")
+                    .cloned()
+                    .unwrap_or_else(|| local_tar_header_path(&header));
+                let size = match pending_pax.get("size") {
+                    Some(size) => size
+                        .parse::<u64>()
+                        .map_err(|error| format!("parse pax size for {path:?}: {error}"))?,
+                    None => header_size,
+                };
+                if entry_type != RemTarEntryType::Regular && size != 0 {
+                    return Err(format!("non-regular RAO entry {path:?} has size {size}"));
+                }
+                if size > 0 && offset % chunk_size as u64 != 0 {
+                    return Err(format!(
+                        "RAO entry {path:?} payload starts at unaligned offset {offset}"
+                    ));
+                }
+                let file_sha256 = pending_pax.get("REMANENCE.file_sha256").cloned();
+                entries.push(RaoEntryLocator {
+                    path,
+                    entry_type,
+                    size_bytes: size,
+                    first_chunk_lba: (size > 0).then_some(BodyLba(offset / chunk_size as u64)),
+                    data_offset: offset,
+                    file_sha256,
+                });
+                let skip = round_up_512_local(size)?;
+                seek_forward(reader, skip)?;
+                offset = offset
+                    .checked_add(skip)
+                    .ok_or_else(|| "RAO tar offset overflow".to_string())?;
+                pending_pax.clear();
+            }
+            other => {
+                return Err(format!("unsupported RAO tar typeflag {other}"));
+            }
+        }
+    }
+    Ok(RaoLocatorScan {
+        global_pax,
+        entries,
+    })
+}
+
+fn require_regular_locator<'a>(
+    scan: &'a RaoLocatorScan,
+    path: &str,
+) -> Result<&'a RaoEntryLocator, String> {
+    let entry = scan
+        .entries
+        .iter()
+        .find(|entry| entry.path == path)
+        .ok_or_else(|| format!("RAO entry {path:?} not found"))?;
+    if entry.entry_type != RemTarEntryType::Regular {
+        return Err(format!(
+            "RAO entry {path:?} is {}, not regular",
+            archive_entry_type_name(entry.entry_type)
+        ));
+    }
+    Ok(entry)
+}
+
+fn read_plaintext_rao_entry_range(
+    object: &Path,
+    entry: &RaoEntryLocator,
+    range_start: u64,
+    range_len: u64,
+) -> Result<Vec<u8>, String> {
+    validate_blob_entry_range(entry, range_start, range_len)?;
+    let byte_offset = entry
+        .data_offset
+        .checked_add(range_start)
+        .ok_or_else(|| format!("RAO range for {:?} overflows", entry.path))?;
+    let len = usize::try_from(range_len)
+        .map_err(|_| format!("RAO range for {:?} is too large", entry.path))?;
+    let mut file =
+        File::open(object).map_err(|error| format!("open {}: {error}", object.display()))?;
+    file.seek(SeekFrom::Start(byte_offset))
+        .map_err(|error| format!("seek {} to byte {byte_offset}: {error}", object.display()))?;
+    let mut bytes = vec![0u8; len];
+    file.read_exact(&mut bytes)
+        .map_err(|error| format!("read RAO range for {:?}: {error}", entry.path))?;
+    Ok(bytes)
+}
+
+fn validate_blob_entry_range(
+    entry: &RaoEntryLocator,
+    range_start: u64,
+    range_len: u64,
+) -> Result<(), String> {
+    let range_end = range_start
+        .checked_add(range_len)
+        .ok_or_else(|| format!("RAO range for {:?} overflows", entry.path))?;
+    if range_len == 0 {
+        if range_start > entry.size_bytes {
+            return Err(format!("empty RAO range starts past {:?}", entry.path));
+        }
+    } else if range_end > entry.size_bytes {
+        return Err(format!("RAO range extends past {:?}", entry.path));
+    }
+    Ok(())
+}
+
+fn verify_locator_sha256(entry: &RaoEntryLocator, bytes: &[u8], label: &str) -> Result<(), String> {
+    if let Some(expected) = &entry.file_sha256 {
+        let actual = bytes_to_hex(&sha256_bytes(bytes));
+        if &actual != expected {
+            return Err(format!(
+                "RAO entry {label:?} digest mismatch: expected {expected}, got {actual}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_tar_header_size(header: &[u8; 512]) -> Result<u64, String> {
+    let field = &header[124..136];
+    if field[0] & 0x80 != 0 {
+        let mut value = 0u64;
+        for byte in &field[1..] {
+            value = value
+                .checked_mul(256)
+                .and_then(|value| value.checked_add(u64::from(*byte)))
+                .ok_or_else(|| "tar binary size overflows u64".to_string())?;
+        }
+        return Ok(value);
+    }
+    let text = field
+        .iter()
+        .copied()
+        .take_while(|byte| *byte != 0 && *byte != b' ')
+        .collect::<Vec<_>>();
+    let text = String::from_utf8_lossy(&text);
+    u64::from_str_radix(text.trim(), 8).map_err(|error| format!("parse tar size {text:?}: {error}"))
+}
+
+fn read_tar_payload<R: Read>(reader: &mut R, size: u64) -> Result<Vec<u8>, String> {
+    let len = usize::try_from(size).map_err(|_| "tar payload too large for this host")?;
+    let mut data = vec![0u8; len];
+    reader
+        .read_exact(&mut data)
+        .map_err(|error| format!("read tar payload: {error}"))?;
+    Ok(data)
+}
+
+fn parse_local_pax_records(data: &[u8]) -> Result<BTreeMap<String, String>, String> {
+    let mut records = BTreeMap::new();
+    let mut cursor = 0usize;
+    while cursor < data.len() {
+        let space = data[cursor..]
+            .iter()
+            .position(|byte| *byte == b' ')
+            .ok_or_else(|| "pax record is missing length separator".to_string())?;
+        let len_text = String::from_utf8_lossy(&data[cursor..cursor + space]);
+        let len = len_text
+            .parse::<usize>()
+            .map_err(|error| format!("parse pax record length {len_text:?}: {error}"))?;
+        if len == 0 || cursor + len > data.len() || cursor + space + 1 >= cursor + len {
+            return Err("pax record length is invalid".to_string());
+        }
+        let record = &data[cursor + space + 1..cursor + len - 1];
+        let eq = record
+            .iter()
+            .position(|byte| *byte == b'=')
+            .ok_or_else(|| "pax record is missing '='".to_string())?;
+        let key = String::from_utf8(record[..eq].to_vec())
+            .map_err(|error| format!("pax key is not UTF-8: {error}"))?;
+        let value = String::from_utf8(record[eq + 1..].to_vec())
+            .map_err(|error| format!("pax value for {key:?} is not UTF-8: {error}"))?;
+        records.insert(key, value);
+        cursor += len;
+    }
+    Ok(records)
+}
+
+fn local_tar_header_path(header: &[u8; 512]) -> String {
+    let name = local_nul_trim(&header[0..100]);
+    let prefix = local_nul_trim(&header[345..500]);
+    if prefix.is_empty() {
+        name
+    } else {
+        format!("{prefix}/{name}")
+    }
+}
+
+fn local_nul_trim(bytes: &[u8]) -> String {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).to_string()
+}
+
+fn tar_padding_len_local(size: u64) -> Result<u64, String> {
+    round_up_512_local(size)?
+        .checked_sub(size)
+        .ok_or_else(|| "tar padding underflow".to_string())
+}
+
+fn round_up_512_local(value: u64) -> Result<u64, String> {
+    value
+        .checked_add(511)
+        .map(|value| value / 512 * 512)
+        .ok_or_else(|| "tar size overflows".to_string())
+}
+
+fn seek_forward<R: Seek>(reader: &mut R, bytes: u64) -> Result<(), String> {
+    let delta = i64::try_from(bytes).map_err(|_| "tar seek distance is too large")?;
+    reader
+        .seek(SeekFrom::Current(delta))
+        .map_err(|error| format!("seek tar payload: {error}"))?;
+    Ok(())
 }
 
 fn archive_extract_range_request(
@@ -9565,6 +10018,13 @@ blob Project/Render Files/
         assert!(stderr.is_empty(), "{stderr}");
         let member: serde_json::Value = serde_json::from_str(&stdout).expect("member json");
         assert_eq!(member["mode"], "blob-member");
+        assert_eq!(member["range_method"], "rao-entry-range");
+        assert_eq!(member["idx_entry"], "Project/Render Files.remwrap.idx");
+        assert_eq!(member["blob_range_len"], 12);
+        assert!(member["blob_first_chunk_lba"].is_number());
+        assert!(member["idx_first_chunk_lba"].is_number());
+        assert!(member["idx_stored_range_start"].is_number());
+        assert!(member["blob_stored_range_start"].is_number());
         assert_eq!(member["bytes_written"], 12);
         assert_eq!(
             fs::read(member_dir.join("Project/Render Files/frame.dat")).unwrap(),
@@ -9814,6 +10274,89 @@ blob Project/Render Files/
         assert_eq!(
             fs::read(restore_dir.join("secret.txt")).unwrap(),
             b"classified payload"
+        );
+    }
+
+    #[test]
+    fn archive_build_encrypted_rules_blob_member_uses_ranged_pfr() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-encrypted-blob")
+            .tempdir()
+            .unwrap();
+        let input_dir = temp.path().join("inputs");
+        fs::create_dir_all(input_dir.join("Blob")).unwrap();
+        fs::write(input_dir.join("Blob/member.bin"), b"encrypted blob member").unwrap();
+        let rules = temp.path().join("encrypted.rules");
+        fs::write(&rules, "blob Blob/\n").unwrap();
+        let key_path = temp.path().join("root.key");
+        fs::write(&key_path, [0x24u8; 32]).unwrap();
+        let out_path = temp.path().join("encrypted-blob.rao");
+
+        let (code, _stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            input_dir.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+            "--encrypt",
+            "--key-file",
+            key_path.to_str().unwrap(),
+            "--key-id",
+            "55555555555555555555555555555555",
+            "--chunk-size",
+            "4KiB",
+            "--object-id",
+            "object-encrypted-blob",
+            "--caller-object-id",
+            "caller-encrypted-blob",
+            "--manifest-file-id",
+            "manifest-encrypted-blob",
+            "--timestamp",
+            "2026-01-01T00:00:00Z",
+        ]);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+
+        let member_dir = temp.path().join("encrypted-member-restore");
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "extract",
+            "--object",
+            out_path.to_str().unwrap(),
+            "--dest",
+            member_dir.to_str().unwrap(),
+            "--key-file",
+            key_path.to_str().unwrap(),
+            "--blob-entry",
+            "Blob.remwrap.tar",
+            "--blob-member",
+            "Blob/member.bin",
+        ]);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let member: serde_json::Value =
+            serde_json::from_str(&stdout).expect("encrypted member json");
+        assert_eq!(member["mode"], "blob-member");
+        assert_eq!(member["range_method"], "rao-entry-range");
+        assert_eq!(member["representation"], "encrypted");
+        assert_eq!(member["encryption"], "RAO1");
+        assert_eq!(member["idx_entry"], "Blob.remwrap.idx");
+        assert_eq!(
+            member["blob_range_len"],
+            b"encrypted blob member".len() as u64
+        );
+        assert!(member["idx_authenticated_chunks"].as_u64().unwrap() >= 1);
+        assert!(member["blob_authenticated_chunks"].as_u64().unwrap() >= 1);
+        assert!(member["idx_stored_range_start"].is_number());
+        assert!(member["blob_stored_range_start"].is_number());
+        assert_eq!(
+            fs::read(member_dir.join("Blob/member.bin")).unwrap(),
+            b"encrypted blob member"
         );
     }
 
