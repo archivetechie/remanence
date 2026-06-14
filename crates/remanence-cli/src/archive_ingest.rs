@@ -1889,6 +1889,8 @@ blob **
 exclude **/Cache/
 blob Project/Render Files/
 blob Project/Render Files/
+exclude Literal/
+blob Literal/Sub/
 ",
         )
         .unwrap();
@@ -1907,6 +1909,10 @@ blob Project/Render Files/
             .lints
             .iter()
             .any(|lint| lint.kind == "duplicate-rule"));
+        assert!(ruleset
+            .lints
+            .iter()
+            .any(|lint| lint.kind == "literal-subpath-unreachable"));
     }
 
     #[test]
