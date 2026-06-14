@@ -9605,6 +9605,85 @@ blob Project/Render Files/
         assert!(!temp.path().join("archive.rao").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn archive_build_rules_wraps_hardlink_common_ancestor() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-hardlink")
+            .tempdir()
+            .unwrap();
+        let input_dir = temp.path().join("inputs");
+        fs::create_dir_all(input_dir.join("links")).unwrap();
+        fs::write(input_dir.join("links/original.bin"), b"same-inode").unwrap();
+        fs::hard_link(
+            input_dir.join("links/original.bin"),
+            input_dir.join("links/alias.bin"),
+        )
+        .unwrap();
+        let rules = temp.path().join("empty.rules");
+        fs::write(&rules, "").unwrap();
+        let out_path = temp.path().join("hardlinks.rao");
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            input_dir.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+            "--object-id",
+            "object-hardlinks",
+            "--caller-object-id",
+            "caller-hardlinks",
+            "--manifest-file-id",
+            "manifest-hardlinks",
+            "--timestamp",
+            "2026-01-01T00:00:00Z",
+        ]);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
+        assert_eq!(report["ingest"]["scan"]["totals"]["blob_entries"], 1);
+        assert!(report["ingest"]["scan"]["clusters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cluster| cluster["reason"] == "hardlink" && cluster["samples"][0] == "links"));
+        let files = report["files"].as_array().expect("files array");
+        assert!(files.iter().any(|file| file["path"] == "links.remwrap.tar"));
+        assert!(files.iter().any(|file| file["path"] == "links.remwrap.idx"));
+        assert!(!files
+            .iter()
+            .any(|file| file["path"] == "links/original.bin"));
+
+        let restore_dir = temp.path().join("restore");
+        let (code, _stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "extract",
+            "--object",
+            out_path.to_str().unwrap(),
+            "--dest",
+            restore_dir.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+        ]);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let original = fs::metadata(restore_dir.join("links/original.bin")).unwrap();
+        let alias = fs::metadata(restore_dir.join("links/alias.bin")).unwrap();
+        assert_eq!(original.ino(), alias.ino());
+        assert_eq!(original.nlink(), 2);
+    }
+
     #[test]
     fn archive_build_encrypted_bypasses_discovery_and_round_trips() {
         let temp = tempfile::Builder::new()
