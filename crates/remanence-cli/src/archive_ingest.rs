@@ -17,7 +17,6 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
-use remanence_format::RemTarEntryType;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -237,6 +236,13 @@ struct WrapIndexEntry {
     sha256: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlobMemberRange {
+    pub(crate) offset: u64,
+    pub(crate) length: u64,
+    pub(crate) sha256: Option<String>,
+}
+
 pub(crate) fn materialize_inputs(
     input_paths: &[PathBuf],
     rules_path: Option<&Path>,
@@ -368,25 +374,19 @@ pub(crate) struct UnwrapReport {
     pub(crate) tar_engine: TarEngineReport,
 }
 
-pub(crate) fn extract_blob_member_from_object(
-    object: &remanence_format::RemTarReadObject,
-    blob_entry_path: &str,
+pub(crate) fn resolve_blob_member_from_index(
+    index_bytes: &[u8],
+    idx_path: &str,
     member_path: &str,
-) -> Result<Vec<u8>, String> {
-    let blob_entry = object
-        .entry(blob_entry_path)
-        .ok_or_else(|| format!("RAO blob entry {blob_entry_path:?} not found"))?;
-    if blob_entry.entry_type != RemTarEntryType::Regular {
+) -> Result<BlobMemberRange, String> {
+    let index: WrapIndex = serde_json::from_slice(index_bytes)
+        .map_err(|error| format!("parse blob index {idx_path:?}: {error}"))?;
+    if index.format != "remanence-remwrap-idx-v1" {
         return Err(format!(
-            "RAO blob entry {blob_entry_path:?} is not a regular file"
+            "blob index {idx_path:?} has unsupported format {:?}",
+            index.format
         ));
     }
-    let idx_path = remwrap_index_path(blob_entry_path)?;
-    let idx_entry = object
-        .entry(&idx_path)
-        .ok_or_else(|| format!("RAO blob index {idx_path:?} not found"))?;
-    let index: WrapIndex = serde_json::from_slice(&idx_entry.data)
-        .map_err(|error| format!("parse blob index {idx_path:?}: {error}"))?;
     let member = index
         .entries
         .iter()
@@ -398,27 +398,35 @@ pub(crate) fn extract_blob_member_from_object(
             member.kind
         ));
     }
-    let start = usize::try_from(member.offset)
-        .map_err(|_| format!("blob member {member_path:?} offset is too large"))?;
-    let end_u64 = member
+    member
         .offset
         .checked_add(member.length)
         .ok_or_else(|| format!("blob member {member_path:?} offset/length overflows"))?;
-    let end = usize::try_from(end_u64)
-        .map_err(|_| format!("blob member {member_path:?} end offset is too large"))?;
-    let bytes = blob_entry
-        .data
-        .get(start..end)
-        .ok_or_else(|| format!("blob member {member_path:?} range exceeds wrapper bytes"))?;
-    if let Some(expected) = &member.sha256 {
+    let sha256 = member
+        .sha256
+        .clone()
+        .ok_or_else(|| format!("blob member {member_path:?} is missing sha256 in {idx_path:?}"))?;
+    Ok(BlobMemberRange {
+        offset: member.offset,
+        length: member.length,
+        sha256: Some(sha256),
+    })
+}
+
+pub(crate) fn verify_blob_member_bytes(
+    member_path: &str,
+    expected_sha256: Option<&str>,
+    bytes: &[u8],
+) -> Result<(), String> {
+    if let Some(expected) = expected_sha256 {
         let actual = bytes_to_hex(&sha256_bytes_local(bytes));
-        if &actual != expected {
+        if actual != expected {
             return Err(format!(
                 "blob member {member_path:?} digest mismatch: expected {expected}, got {actual}"
             ));
         }
     }
-    Ok(bytes.to_vec())
+    Ok(())
 }
 
 fn process_input(
@@ -1834,7 +1842,7 @@ fn trim_dir_slash(value: &str) -> &str {
     value.trim_end_matches('/')
 }
 
-fn remwrap_index_path(wrapper_path: &str) -> Result<String, String> {
+pub(crate) fn remwrap_index_path(wrapper_path: &str) -> Result<String, String> {
     wrapper_path
         .strip_suffix(WRAP_TAR_SUFFIX)
         .map(|stem| format!("{stem}{WRAP_INDEX_SUFFIX}"))
