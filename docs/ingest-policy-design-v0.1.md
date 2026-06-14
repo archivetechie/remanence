@@ -1,8 +1,9 @@
 # Ingest bundling and conformance policy — v0.1
 
-**Status:** design approved (2026-06-12, owner); implementation deferred —
-to be sequenced after the amber-merge residuals. Rem-side pieces hand to
-codex via a later journal entry; ruleset authoring/profile binding is
+**Status:** design approved (2026-06-12, owner); **refined 2026-06-14**
+(brainstorm with Claude — see "Refinements" below). The amber-merge residuals
+that gated sequencing are now done (the RAO sealing migration landed). Rem-side
+pieces hand to codex via a later prompt; ruleset authoring/profile binding is
 sutradhara-side work in its own repo.
 
 **Context:** RAO 1.0 deliberately constrains entries (canonical UTF-8
@@ -14,6 +15,49 @@ safekeeping. This note defines how the ingest layer decides what becomes a
 first-class RAO entry, what gets wrapped, what gets excluded, and how every
 decision is recorded. It supersedes the ad-hoc "wrap non-compliant files"
 guidance from the 2026-06-12 discussion.
+
+## Refinements (2026-06-14, brainstorm)
+
+Decisions locked while re-cutting ingest-v2 Phase S onto this model. They edit
+§2/§3/§7 below; recorded here as the changelog.
+
+1. **Verbs are `blob` and `exclude` only; `granular` is the implicit default
+   *state*, not a verb.** Any path not matched by a `blob`/`exclude` rule is
+   granular (a first-class RAO entry). Drops the redundant trailing
+   `granular **` from rulesets and removes `granular` from the grammar.
+   (§2.1, §2.2)
+2. **Unmatched path → granular by default; the conformance-scan review is a
+   mandatory gate.** No catch-all is required for totality — granular is the
+   floor. "Never silent" (§1.2) is satisfied by the scan surfacing what the
+   floor and fallbacks will do (incl. alignment-bloat swarms, §1.4), not by
+   forcing a catch-all. An explicit `blob **` / `exclude **` last line only
+   sets a *different* floor. (§2.1, §4)
+3. **Re-include deferred.** The one thing `blob`+`exclude` can't express is
+   re-including a file from under a broader `exclude` (rsync's
+   include-before-exclude idiom). Deferred like blob carve-outs (§8.5); add an
+   explicit re-include verb only on concrete demand — purely additive.
+4. **First-match-wins retained, deliberately.** Kept over gitignore's
+   last-match-wins: it matches the closest domain peers (rsync and borg are
+   both first-match; restic is the gitignore-style outlier) and reads as an
+   ordered policy for these expert-authored, versioned, scan-gated rulesets.
+   Documented as the deliberate deviation from gitignore. The conformance scan
+   lints **unreachable rules** (a rule whose match-set is subsumed by an
+   earlier broader one — the characteristic first-match-wins footgun; cheap
+   cases to detect: a catch-all that isn't last, exact duplicates, a literal
+   sub-path of an earlier directory/blob pattern). (§2.1, §8.2)
+5. **Wrapping is mechanism, owned by remanence; sutradhara is policy.** The
+   ruleset engine + wrap/unwrap is the canonical `rem archive build --rules` /
+   `rem restore`, so `rem` is a complete standalone archive tool. The RAO
+   *format* crate stays oblivious (a `.remwrap.tar` is an opaque regular-file
+   entry). sutradhara contributes only the source-type→ruleset binding,
+   copy/lifecycle policy, and catalog records — it *calls* `rem --rules`, never
+   reimplements wrapping. (§3, §7)
+6. **The wrapper writer is a pinned mainstream tar engine, never a bespoke
+   codec.** The "future reader holds only POSIX tar" guarantee (§1.3) is only
+   trustworthy if the bytes are what GNU tar / bsdtar (libarchive) actually
+   write, so `rem` shells out to / FFI-links a pinned engine; the specific
+   engine is pinned by the §3.5 round-trip test (lean: bsdtar/libarchive for
+   xattr + AppleDouble fidelity and Mac/Linux parity — still open). (§3, §8.1)
 
 ## 1. Principles
 
@@ -42,13 +86,19 @@ Per-ingest policy is an ordered list of path rules, rsync-filter style.
 <verb>  <pattern>            # comment
 ```
 
-- **Verbs:** `granular`, `blob`, `exclude` (Section 2.2).
+- **Verbs:** `blob`, `exclude` (Section 2.2). `granular` is the implicit
+  default *state* for any unmatched path, not a verb.
 - **Patterns:** gitignore-style globs (`*`, `**`, `?`, character classes),
   matched against ingest-relative paths. A trailing `/` matches directories
   only. `blob` patterns MUST be directory patterns.
-- **First match wins**, top to bottom. Rulesets read as policy statements:
-  specific before general, and the last line is conventionally the
-  catch-all default (`granular **` or `blob **`).
+- **First match wins**, top to bottom (deliberate — matches rsync/borg, the
+  closest domain peers; the documented deviation from gitignore's
+  last-match-wins). Rulesets read as ordered policy statements: specific
+  before general. No catch-all is required — an unmatched path is granular by
+  default (§2.2); an explicit `blob **` / `exclude **` last line only sets a
+  *different* floor. The conformance scan lints **unreachable rules** (one
+  whose match-set is subsumed by an earlier broader rule — the first-match
+  footgun).
 - A ruleset MAY declare `option case-insensitive` at the top (macOS
   sources). Default is case-sensitive.
 - Rulesets are named, versioned files. sutradhara binds source type →
@@ -59,9 +109,10 @@ Per-ingest policy is an ordered list of path rules, rsync-filter style.
 
 ### 2.2. Verbs
 
-- **`granular`** — matched files become first-class RAO entries (per-file
-  sha256, manifest row, PFR). Within granular regions the non-compliance
-  fallback of Section 4 applies.
+- **Default state — `granular`** (not a verb): any path not matched by a
+  `blob`/`exclude` rule becomes a first-class RAO entry (per-file sha256,
+  manifest row, PFR). The non-compliance fallback of Section 4 applies to
+  these default (granular) regions.
 - **`blob <dir-pattern>`** — the matched directory becomes **one** wrapped
   entry `<path>.remwrap.tar` (Section 3). One manifest row; contents may be
   arbitrarily non-compliant; no alignment bloat. Canonical targets: macOS
@@ -90,9 +141,8 @@ exclude    **/.fcpcache/
 exclude    **/Autosave Vault/
 blob       **/*.fcpbundle/
 blob       **/Render Files/
-granular   Final/**/*.mov
-granular   **/*.fcpxml
-granular   **
+# no catch-all needed — everything else (the deliverable .movs, .fcpxml, …)
+# is granular by default
 ```
 
 The deliverable `.mov`s and project XML stay first-class (PFR, per-file
@@ -124,14 +174,17 @@ granular, with Section 4 handling stragglers.
    the chosen invocation MUST round-trip: a non-UTF-8 filename, an xattr'd
    file, a `._` AppleDouble sidecar, a dangling symlink, and an empty
    directory — byte- and metadata-exact. The winning invocation is
-   recorded here and in the implementation.
+   recorded here and in the implementation. The writer is a **pinned
+   mainstream tar engine** (GNU tar or bsdtar/libarchive), invoked or
+   FFI-linked by `rem` — never a bespoke Rust pax codec, so the §1.3
+   longevity guarantee holds against the actual mainstream reader.
 6. **Restore:** `rem restore` unwraps by default — the destination tree is
    byte- and structure-identical to what was ingested (minus exclusions).
    `--no-unwrap` restores the literal stored entries. Wrap entries carry
    their own sha256 like any payload entry, so wrapped subtrees keep
    end-to-end integrity.
 
-## 4. Non-compliance fallback inside granular regions
+## 4. Non-compliance fallback in default (granular) regions
 
 When a granular-matched file cannot be a native RAO entry (non-UTF-8 or
 non-canonical path, unsupported type such as a device node or hardlink,
@@ -148,7 +201,10 @@ The pre-ingest conformance scan classifies every entry
 shows counts and clustering ("214,000 of 1.1M non-compliant, concentrated
 under `Users/`") so an operator can switch rulesets *before* committing.
 The tool MAY suggest (e.g. "consider `blob **`") past thresholds; it MUST
-NOT auto-switch.
+NOT auto-switch. This scan-and-review is a **mandatory gate**, not advisory:
+it is how "never silent" (§1.2) is satisfied under the granular-by-default
+floor — the operator sees what the floor and fallbacks will do (including the
+§1.4 alignment-bloat swarms) before any commit.
 
 ## 5. Blob inner index (v1, optional per rule)
 
@@ -178,7 +234,8 @@ not to be slipped into a wire commit.
 
 | Piece | Home |
 | --- | --- |
-| Ruleset grammar + evaluation, conformance scan, wrapper creation, ingest report | sutradhara (orchestrator) + shared by `rem archive build --rules` |
+| Ruleset eval, conformance scan, wrap/unwrap creation — the **mechanism** | **remanence**: canonical `rem archive build --rules` / `rem restore` (a higher rem crate; the RAO *format* crate stays oblivious). `rem` is a complete standalone archive tool. |
+| Source-type → ruleset binding, copy/lifecycle policy, ingest-report presentation — the **policy** | sutradhara: calls `rem --rules`, never reimplements wrapping |
 | Wrap suffix convention (informative spec section) | `specs/rao-1.0-specification.md`, pre-freeze |
 | Catalog ingest records (ruleset id, wrap rows, exclusion counts, blob member index) | sutradhara catalog (Layer 5 surfaces stay unchanged) |
 | Restore unwrap (default) / `--no-unwrap` | rem restore path + sutradhara restore orchestration |
@@ -188,11 +245,15 @@ Nothing in this design changes the RAO or REM-PARITY wire formats.
 
 ## 8. Open sub-decisions
 
+(Verb set, granular-as-default, ordering, unmatched-path semantics, and the
+mechanism/policy split are now resolved — see Refinements. Remaining:)
+
 1. **Wrapper tar dialect** — pinned by the Section 3.5 round-trip test at
-   implementation time.
-2. **Glob dialect details** — anchoring, escaping, `**` semantics: adopt
-   one existing well-specified dialect (gitignore's) wholesale rather than
-   inventing; document the single deviation (first-match-wins).
+   implementation time (lean: bsdtar/libarchive; see Refinements #6).
+2. **Glob *matching* dialect** — anchoring, escaping, `**` semantics: adopt
+   gitignore's glob matching wholesale, but with first-match-wins precedence
+   (locked — Refinements #4) as the documented deviation, plus the
+   unreachable-rule lint described there.
 3. **Sanitized wrapper names for non-UTF-8 originals** (Section 4): the
    mangling scheme (percent-encoding vs lossy + uniquifier) needs one
    deliberate choice, recorded in the spec's informative section.
