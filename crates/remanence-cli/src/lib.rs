@@ -73,6 +73,7 @@ use tonic::transport::Channel;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
+mod archive_ingest;
 mod pool_ops;
 
 const DEFAULT_DAEMON_ENDPOINT: &str = "unix:/var/lib/rem/rem.sock";
@@ -1179,8 +1180,36 @@ struct RemArchiveBuildArgs {
     inputs: Vec<PathBuf>,
 
     /// Output RAO object file.
+    #[arg(long, value_name = "PATH", required_unless_present = "scan_only")]
+    out: Option<PathBuf>,
+
+    /// Ordered ingest ruleset for blob/exclude policy.
     #[arg(long, value_name = "PATH")]
-    out: PathBuf,
+    rules: Option<PathBuf>,
+
+    /// Classify inputs and emit the clustered ingest report without writing RAO.
+    #[arg(long)]
+    scan_only: bool,
+
+    /// Write the customer-facing member manifest JSON.
+    #[arg(long, value_name = "PATH")]
+    manifest_out: Option<PathBuf>,
+
+    /// Disable generated `.remwrap.idx` siblings for blob wrappers.
+    #[arg(long)]
+    no_index: bool,
+
+    /// Dense-subtree ratio threshold for blob suggestions.
+    #[arg(long, value_name = "RATIO", default_value = "0.9")]
+    blob_suggest_ratio: f64,
+
+    /// Minimum non-compliant entries before suggesting a blob.
+    #[arg(long, value_name = "COUNT", default_value = "100")]
+    blob_suggest_count: u64,
+
+    /// Non-compliant count above which scan reports a sanity-ceiling verdict.
+    #[arg(long, value_name = "COUNT", default_value = "10000")]
+    sanity_ceiling_count: u64,
 
     /// Build an encrypted RAO1 object instead of plaintext rao-v1.
     #[arg(long)]
@@ -1269,6 +1298,18 @@ struct RemArchiveExtractArgs {
     /// Replace existing destination files.
     #[arg(long)]
     overwrite: bool,
+
+    /// Keep `.remwrap.tar` and `.remwrap.idx` entries literal instead of unwrapping.
+    #[arg(long)]
+    no_unwrap: bool,
+
+    /// RAO blob wrapper entry to use for single-member restore.
+    #[arg(long = "blob-entry", value_name = "RAO_PATH")]
+    blob_entry: Option<String>,
+
+    /// Member path inside --blob-entry to restore.
+    #[arg(long = "blob-member", value_name = "TAR_PATH", requires = "blob_entry")]
+    blob_member: Option<String>,
 }
 
 /// Arguments for `rem archive write`.
@@ -1483,6 +1524,13 @@ impl From<RemArchiveBuildArgs> for ArchiveBuildArgs {
         Self {
             inputs: value.inputs,
             out: value.out,
+            rules: value.rules,
+            scan_only: value.scan_only,
+            manifest_out: value.manifest_out,
+            no_index: value.no_index,
+            blob_suggest_ratio: value.blob_suggest_ratio,
+            blob_suggest_count: value.blob_suggest_count,
+            sanity_ceiling_count: value.sanity_ceiling_count,
             encrypt: value.encrypt,
             key_file: value.key_file,
             key_id: value.key_id,
@@ -1517,6 +1565,9 @@ impl From<RemArchiveExtractArgs> for ArchiveExtractArgs {
             file_size_bytes: value.file_size_bytes,
             range: value.range,
             overwrite: value.overwrite,
+            no_unwrap: value.no_unwrap,
+            blob_entry: value.blob_entry,
+            blob_member: value.blob_member,
         }
     }
 }
@@ -1670,8 +1721,36 @@ struct ArchiveBuildArgs {
     inputs: Vec<PathBuf>,
 
     /// Output RAO object file.
+    #[arg(long, value_name = "PATH", required_unless_present = "scan_only")]
+    out: Option<PathBuf>,
+
+    /// Ordered ingest ruleset for blob/exclude policy.
     #[arg(long, value_name = "PATH")]
-    out: PathBuf,
+    rules: Option<PathBuf>,
+
+    /// Classify inputs and emit the clustered ingest report without writing RAO.
+    #[arg(long)]
+    scan_only: bool,
+
+    /// Write the customer-facing member manifest JSON.
+    #[arg(long, value_name = "PATH")]
+    manifest_out: Option<PathBuf>,
+
+    /// Disable generated `.remwrap.idx` siblings for blob wrappers.
+    #[arg(long)]
+    no_index: bool,
+
+    /// Dense-subtree ratio threshold for blob suggestions.
+    #[arg(long, value_name = "RATIO", default_value = "0.9")]
+    blob_suggest_ratio: f64,
+
+    /// Minimum non-compliant entries before suggesting a blob.
+    #[arg(long, value_name = "COUNT", default_value = "100")]
+    blob_suggest_count: u64,
+
+    /// Non-compliant count above which scan reports a sanity-ceiling verdict.
+    #[arg(long, value_name = "COUNT", default_value = "10000")]
+    sanity_ceiling_count: u64,
 
     /// Build an encrypted RAO1 object instead of plaintext rao-v1.
     #[arg(long)]
@@ -1760,6 +1839,18 @@ struct ArchiveExtractArgs {
     /// Replace existing destination files.
     #[arg(long)]
     overwrite: bool,
+
+    /// Keep `.remwrap.tar` and `.remwrap.idx` entries literal instead of unwrapping.
+    #[arg(long)]
+    no_unwrap: bool,
+
+    /// RAO blob wrapper entry to use for single-member restore.
+    #[arg(long = "blob-entry", value_name = "RAO_PATH")]
+    blob_entry: Option<String>,
+
+    /// Member path inside --blob-entry to restore.
+    #[arg(long = "blob-member", value_name = "TAR_PATH", requires = "blob_entry")]
+    blob_member: Option<String>,
 }
 
 /// Arguments for the shared `archive write` command (post-From transform).
@@ -5051,7 +5142,7 @@ fn run_archive_extract(
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ArchiveBuildInputFile {
     source_path: PathBuf,
     entry_type: RemTarEntryType,
@@ -5063,8 +5154,45 @@ struct ArchiveBuildInputFile {
 }
 
 fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
-    if args.out.exists() {
-        return Err(format!("--out {} already exists", args.out.display()));
+    let tuning = archive_scan_tuning(args)?;
+    if args.manifest_out.is_some() && args.rules.is_none() {
+        return Err(
+            "--manifest-out requires --rules so exclusions and wrapper members are recorded"
+                .to_string(),
+        );
+    }
+    if args.scan_only {
+        if args.encrypt || args.key_file.is_some() || args.key_id.is_some() {
+            return Err("--scan-only cannot be combined with encryption options".to_string());
+        }
+        if args.manifest_out.is_some() {
+            return Err(
+                "--manifest-out requires a real archive build, not --scan-only".to_string(),
+            );
+        }
+        let report = archive_ingest::scan_only_report(
+            &args.inputs,
+            args.rules.as_deref(),
+            args.no_index,
+            tuning,
+        )?;
+        return serde_json::to_value(report)
+            .map_err(|error| format!("serialize scan report: {error}"));
+    }
+    let out_path = args
+        .out
+        .as_ref()
+        .ok_or_else(|| "--out is required unless --scan-only is set".to_string())?;
+    if out_path.exists() {
+        return Err(format!("--out {} already exists", out_path.display()));
+    }
+    if let Some(manifest_out) = &args.manifest_out {
+        if manifest_out.exists() {
+            return Err(format!(
+                "--manifest-out {} already exists",
+                manifest_out.display()
+            ));
+        }
     }
     let object_id = args
         .object_id
@@ -5083,7 +5211,20 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
             .map_err(|error| format!("--object-id is invalid for encrypted RAO: {error}"))?;
     }
 
-    let inputs = collect_archive_build_inputs(&args.inputs)?;
+    let materialized = if args.rules.is_some() {
+        Some(archive_ingest::materialize_inputs(
+            &args.inputs,
+            args.rules.as_deref(),
+            args.no_index,
+            tuning,
+        )?)
+    } else {
+        None
+    };
+    let inputs = match &materialized {
+        Some(plan) => plan.inputs.clone(),
+        None => collect_archive_build_inputs(&args.inputs)?,
+    };
     if inputs.is_empty() {
         return Err("--inputs did not contain any archivable entries".to_string());
     }
@@ -5107,7 +5248,7 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
     );
     options.chunk_size = args.chunk_size;
 
-    let temp_path = temporary_archive_output_path(&args.out);
+    let temp_path = temporary_archive_output_path(out_path);
     if temp_path.exists() {
         return Err(format!(
             "temporary output path {} already exists",
@@ -5178,17 +5319,37 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
             return Err(error);
         }
     };
-    std::fs::rename(&temp_path, &args.out).map_err(|error| {
+    std::fs::rename(&temp_path, out_path).map_err(|error| {
         let _ = std::fs::remove_file(&temp_path);
         format!(
             "rename {} to {}: {error}",
             temp_path.display(),
-            args.out.display()
+            out_path.display()
         )
     })?;
-    sync_parent_directory(&args.out)?;
+    sync_parent_directory(out_path)?;
 
-    Ok(archive_build_report_json(args, &inputs, &build))
+    if let (Some(manifest_out), Some(plan)) = (&args.manifest_out, &materialized) {
+        archive_ingest::write_customer_manifest(manifest_out, &plan.manifest)?;
+    }
+
+    Ok(archive_build_report_json(
+        args,
+        &inputs,
+        &build,
+        materialized.as_ref(),
+    ))
+}
+
+fn archive_scan_tuning(args: &ArchiveBuildArgs) -> Result<archive_ingest::ScanTuning, String> {
+    if !(0.0..=1.0).contains(&args.blob_suggest_ratio) || args.blob_suggest_ratio == 0.0 {
+        return Err("--blob-suggest-ratio must be > 0 and <= 1".to_string());
+    }
+    Ok(archive_ingest::ScanTuning {
+        blob_ratio: args.blob_suggest_ratio,
+        blob_count: args.blob_suggest_count,
+        sanity_ceiling: args.sanity_ceiling_count,
+    })
 }
 
 fn sync_parent_directory(path: &Path) -> Result<(), String> {
@@ -5283,6 +5444,26 @@ fn extract_plaintext_archive_object_file(args: &ArchiveExtractArgs) -> Result<Va
     let block_count = source.block_count();
     let stored_size_bytes = source.len_bytes();
     let stored_digest = sha256_file(path)?;
+    if args.blob_member.is_some() {
+        if range.is_some() || range_path.is_some() {
+            return Err("--blob-member cannot be combined with --path/--range".to_string());
+        }
+        let object = read_rem_tar_object(&mut source, chunk_size, block_count)
+            .map_err(|error| format!("read plaintext RAO: {error}"))?;
+        return extract_blob_member_file(
+            args,
+            &object,
+            BlobMemberExtractContext {
+                representation: "plaintext",
+                encryption: "none",
+                key_id: None,
+                chunk_size,
+                stored_size_bytes,
+                stored_size_blocks: block_count,
+                stored_digest,
+            },
+        );
+    }
     if let Some(range) = range {
         let object = read_rem_tar_object(&mut source, chunk_size, block_count)
             .map_err(|error| format!("read plaintext RAO: {error}"))?;
@@ -5319,11 +5500,19 @@ fn extract_plaintext_archive_object_file(args: &ArchiveExtractArgs) -> Result<Va
         stored_size_blocks: block_count,
         stored_digest,
     };
-    Ok(archive_extract_report_json(&context, &report))
+    let mut value = archive_extract_report_json(&context, &report);
+    attach_unwrap_report(&mut value, &args.dest, args.overwrite, args.no_unwrap)?;
+    Ok(value)
 }
 
 fn extract_encrypted_archive_object_file(args: &ArchiveExtractArgs) -> Result<Value, String> {
     let (range_path, range) = archive_extract_range_request(args)?;
+    if args.blob_member.is_some() {
+        if range.is_some() || range_path.is_some() {
+            return Err("--blob-member cannot be combined with --path/--range".to_string());
+        }
+        return extract_encrypted_blob_member_file(args);
+    }
     if let Some(range) = range {
         return extract_encrypted_archive_range_file(
             args,
@@ -5379,7 +5568,104 @@ fn extract_encrypted_archive_object_file(args: &ArchiveExtractArgs) -> Result<Va
         stored_size_blocks: inspected.stored_size_bytes / u64::from(inspected.header.chunk_size),
         stored_digest: inspected.stored_digest,
     };
-    Ok(archive_extract_report_json(&context, &report))
+    let mut value = archive_extract_report_json(&context, &report);
+    attach_unwrap_report(&mut value, &args.dest, args.overwrite, args.no_unwrap)?;
+    Ok(value)
+}
+
+fn attach_unwrap_report(
+    value: &mut Value,
+    dest: &Path,
+    overwrite: bool,
+    no_unwrap: bool,
+) -> Result<(), String> {
+    if no_unwrap {
+        value["unwrap"] = json!({ "enabled": false });
+        return Ok(());
+    }
+    let report = archive_ingest::unwrap_remwraps(dest, overwrite)?;
+    value["unwrap"] = serde_json::to_value(report)
+        .map_err(|error| format!("serialize unwrap report: {error}"))?;
+    value["unwrap"]["enabled"] = json!(true);
+    Ok(())
+}
+
+fn extract_encrypted_blob_member_file(args: &ArchiveExtractArgs) -> Result<Value, String> {
+    let key_path = args
+        .key_file
+        .as_deref()
+        .ok_or_else(|| "encrypted RAO blob-member extract requires --key-file".to_string())?;
+    let encrypted = read_archive_object_bytes(&args.object)?;
+    let inspected =
+        inspect_bytes(&encrypted).map_err(|error| format!("inspect encrypted RAO: {error}"))?;
+    let root_key = read_root_key_file(key_path)?;
+    let (plaintext, envelope) = open_to_vec(&encrypted, &root_key)
+        .map_err(|error| format!("open encrypted RAO: {error}"))?;
+    let chunk_size = usize::try_from(inspected.header.chunk_size)
+        .map_err(|_| "encrypted header chunk_size is too large for this host".to_string())?;
+    let blocks = plaintext_blocks_from_bytes(&plaintext, chunk_size)?;
+    let block_count =
+        u64::try_from(blocks.len()).map_err(|_| "plaintext block count overflow".to_string())?;
+    let mut parse_source = VecBlockSource::new(blocks);
+    let object = read_rem_tar_object(&mut parse_source, chunk_size, block_count)
+        .map_err(|error| format!("parse decrypted RAO: {error}"))?;
+    extract_blob_member_file(
+        args,
+        &object,
+        BlobMemberExtractContext {
+            representation: "encrypted",
+            encryption: "RAO1",
+            key_id: Some(envelope.header.key_id),
+            chunk_size,
+            stored_size_bytes: inspected.stored_size_bytes,
+            stored_size_blocks: inspected.stored_size_bytes
+                / u64::from(inspected.header.chunk_size),
+            stored_digest: inspected.stored_digest,
+        },
+    )
+}
+
+struct BlobMemberExtractContext {
+    representation: &'static str,
+    encryption: &'static str,
+    key_id: Option<[u8; 16]>,
+    chunk_size: usize,
+    stored_size_bytes: u64,
+    stored_size_blocks: u64,
+    stored_digest: [u8; 32],
+}
+
+fn extract_blob_member_file(
+    args: &ArchiveExtractArgs,
+    object: &RemTarReadObject,
+    context: BlobMemberExtractContext,
+) -> Result<Value, String> {
+    let blob_entry = args
+        .blob_entry
+        .as_deref()
+        .ok_or_else(|| "--blob-member requires --blob-entry".to_string())?;
+    let member_path = args
+        .blob_member
+        .as_deref()
+        .ok_or_else(|| "--blob-entry requires --blob-member".to_string())?;
+    let bytes = archive_ingest::extract_blob_member_from_object(object, blob_entry, member_path)?;
+    let output = write_archive_range_output(&args.dest, member_path, &bytes, args.overwrite)?;
+    Ok(json!({
+        "mode": "blob-member",
+        "object": args.object,
+        "dest": args.dest,
+        "output": output,
+        "blob_entry": blob_entry,
+        "blob_member": member_path,
+        "representation": context.representation,
+        "encryption": context.encryption,
+        "key_id": context.key_id.map(|key_id| bytes_to_hex(&key_id)),
+        "chunk_size": context.chunk_size,
+        "stored_size_bytes": context.stored_size_bytes,
+        "stored_size_blocks": context.stored_size_blocks,
+        "stored_digest": bytes_to_hex(&context.stored_digest),
+        "bytes_written": bytes.len(),
+    }))
 }
 
 fn archive_extract_range_request(
@@ -5858,6 +6144,7 @@ fn archive_build_report_json(
     args: &ArchiveBuildArgs,
     inputs: &[ArchiveBuildInputFile],
     build: &ArchiveBuildResult,
+    ingest: Option<&archive_ingest::MaterializedArchiveInputs>,
 ) -> Value {
     let files: Vec<Value> = build
         .layout
@@ -5867,7 +6154,7 @@ fn archive_build_report_json(
         .map(|(layout, input)| archive_file_report_json(layout, input))
         .collect();
 
-    json!({
+    let mut report = json!({
         "object_id": build.layout.object_id,
         "caller_object_id": build.layout.caller_object_id,
         "body_format": FORMAT_ID,
@@ -5882,7 +6169,15 @@ fn archive_build_report_json(
         "manifest_sha256": bytes_to_hex(&build.layout.manifest_sha256),
         "out": args.out,
         "files": files,
-    })
+    });
+    if let Some(ingest) = ingest {
+        report["ingest"] = serde_json::to_value(&ingest.report)
+            .unwrap_or_else(|error| json!({ "error": error.to_string() }));
+        if let Some(path) = &args.manifest_out {
+            report["manifest_out"] = json!(path);
+        }
+    }
+    report
 }
 
 fn archive_file_report_json(layout: &RemTarFileLayout, input: &ArchiveBuildInputFile) -> Value {
@@ -7736,8 +8031,12 @@ mod tests {
                     args.inputs,
                     vec![PathBuf::from("/tmp/input-a"), PathBuf::from("/tmp/input-b")]
                 );
-                assert_eq!(args.out, PathBuf::from("/tmp/object.rao"));
+                assert_eq!(args.out, Some(PathBuf::from("/tmp/object.rao")));
                 assert_eq!(args.chunk_size, 4096);
+                assert!(args.rules.is_none());
+                assert!(!args.scan_only);
+                assert!(args.manifest_out.is_none());
+                assert!(!args.no_index);
                 assert!(!args.encrypt);
             }
             other => panic!("unexpected command: {other:?}"),
@@ -9099,6 +9398,211 @@ tape_catalog_dir = "{0}/cache/tapes"
             fs::read_link(restore_dir.join("dangling")).unwrap(),
             PathBuf::from("missing.txt")
         );
+    }
+
+    #[test]
+    fn archive_build_with_rules_blobs_indexes_manifests_and_unwraps() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-build-rules")
+            .tempdir()
+            .unwrap();
+        let input_dir = temp.path().join("inputs");
+        fs::create_dir_all(input_dir.join("Project/Render Files")).unwrap();
+        fs::create_dir_all(input_dir.join("Cache")).unwrap();
+        fs::write(input_dir.join("keep.mov"), b"deliverable").unwrap();
+        fs::write(
+            input_dir.join("Project/Render Files/frame.dat"),
+            b"render-frame",
+        )
+        .unwrap();
+        fs::write(input_dir.join("Cache/drop.tmp"), b"cache").unwrap();
+        let rules = temp.path().join("fcp.rules");
+        fs::write(
+            &rules,
+            "\
+exclude Cache/
+blob Project/Render Files/
+",
+        )
+        .unwrap();
+        let out_path = temp.path().join("rules.rao");
+        let manifest_path = temp.path().join("customer-manifest.json");
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            input_dir.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+            "--manifest-out",
+            manifest_path.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+            "--object-id",
+            "object-rules",
+            "--caller-object-id",
+            "caller-rules",
+            "--manifest-file-id",
+            "manifest-rules",
+            "--timestamp",
+            "2026-01-01T00:00:00Z",
+        ]);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
+        assert_eq!(report["object_id"], "object-rules");
+        assert_eq!(report["ingest"]["scan"]["totals"]["blob_entries"], 1);
+        assert_eq!(report["ingest"]["scan"]["totals"]["excluded_entries"], 2);
+        let files = report["files"].as_array().expect("files array");
+        assert!(files
+            .iter()
+            .any(|file| file["path"] == "Project/Render Files.remwrap.tar"));
+        assert!(files
+            .iter()
+            .any(|file| file["path"] == "Project/Render Files.remwrap.idx"));
+        assert!(files.iter().any(|file| file["path"] == "keep.mov"));
+        assert!(!files.iter().any(|file| file["path"] == "Cache/drop.tmp"));
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["format"], "remanence-customer-manifest-v1");
+        assert!(manifest["entries"].as_array().unwrap().iter().any(|entry| {
+            entry["path"] == "Project/Render Files/frame.dat"
+                && entry["sha256"] == bytes_to_hex(&sha256_bytes(b"render-frame"))
+        }));
+        assert_eq!(manifest["exclusions"][0]["reason"], "exclude-rule");
+
+        let mut source = remanence_library::FileBlockSource::open(&out_path, 4096).unwrap();
+        let block_count = source.block_count();
+        let read = remanence_format::read_rem_tar_object(&mut source, 4096, block_count).unwrap();
+        let idx = read.entry("Project/Render Files.remwrap.idx").unwrap();
+        let index: serde_json::Value = serde_json::from_slice(&idx.data).unwrap();
+        assert_eq!(index["format"], "remanence-remwrap-idx-v1");
+        assert!(index["entries"].as_array().unwrap().iter().any(|entry| {
+            entry["path"] == "Project/Render Files/frame.dat"
+                && entry["sha256"] == bytes_to_hex(&sha256_bytes(b"render-frame"))
+        }));
+
+        let restore_dir = temp.path().join("restore");
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "extract",
+            "--object",
+            out_path.to_str().unwrap(),
+            "--dest",
+            restore_dir.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+        ]);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let extract: serde_json::Value = serde_json::from_str(&stdout).expect("extract json");
+        assert_eq!(extract["unwrap"]["enabled"], true);
+        assert_eq!(extract["unwrap"]["wrappers_unwrapped"], 1);
+        assert_eq!(
+            fs::read(restore_dir.join("keep.mov")).unwrap(),
+            b"deliverable"
+        );
+        assert_eq!(
+            fs::read(restore_dir.join("Project/Render Files/frame.dat")).unwrap(),
+            b"render-frame"
+        );
+        assert!(!restore_dir
+            .join("Project/Render Files.remwrap.tar")
+            .exists());
+        assert!(!restore_dir
+            .join("Project/Render Files.remwrap.idx")
+            .exists());
+
+        let literal_dir = temp.path().join("literal-restore");
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "extract",
+            "--object",
+            out_path.to_str().unwrap(),
+            "--dest",
+            literal_dir.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+            "--no-unwrap",
+        ]);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let literal: serde_json::Value = serde_json::from_str(&stdout).expect("literal json");
+        assert_eq!(literal["unwrap"]["enabled"], false);
+        assert!(literal_dir
+            .join("Project/Render Files.remwrap.tar")
+            .exists());
+        assert!(literal_dir
+            .join("Project/Render Files.remwrap.idx")
+            .exists());
+        assert!(!literal_dir.join("Project/Render Files/frame.dat").exists());
+
+        let member_dir = temp.path().join("member-restore");
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "extract",
+            "--object",
+            out_path.to_str().unwrap(),
+            "--dest",
+            member_dir.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+            "--blob-entry",
+            "Project/Render Files.remwrap.tar",
+            "--blob-member",
+            "Project/Render Files/frame.dat",
+        ]);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let member: serde_json::Value = serde_json::from_str(&stdout).expect("member json");
+        assert_eq!(member["mode"], "blob-member");
+        assert_eq!(member["bytes_written"], 12);
+        assert_eq!(
+            fs::read(member_dir.join("Project/Render Files/frame.dat")).unwrap(),
+            b"render-frame"
+        );
+    }
+
+    #[test]
+    fn archive_build_rules_scan_only_does_not_require_out() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-scan-only")
+            .tempdir()
+            .unwrap();
+        let input_dir = temp.path().join("inputs");
+        fs::create_dir_all(input_dir.join("messy")).unwrap();
+        fs::write(input_dir.join("messy/a.bin"), b"a").unwrap();
+        let rules = temp.path().join("scan.rules");
+        fs::write(&rules, "blob messy/\n").unwrap();
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            input_dir.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+            "--scan-only",
+            "--blob-suggest-count",
+            "1",
+        ]);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let report: serde_json::Value = serde_json::from_str(&stdout).expect("scan json");
+        assert_eq!(report["ruleset"]["name"], "scan");
+        assert_eq!(report["scan"]["totals"]["blob_entries"], 1);
+        assert!(!temp.path().join("archive.rao").exists());
     }
 
     #[test]
