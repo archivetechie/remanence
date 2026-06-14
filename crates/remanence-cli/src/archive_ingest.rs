@@ -6,7 +6,7 @@
 //! mainstream tar engine, and deriving sibling `.remwrap.idx` entries for blobs.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -211,6 +211,7 @@ struct ProcessContext<'a> {
     ruleset: Option<&'a Ruleset>,
     tar_engine: &'a TarEngineReport,
     tempdir: &'a Path,
+    hardlink_roots: &'a BTreeSet<PathBuf>,
     no_index: bool,
 }
 
@@ -252,14 +253,15 @@ pub(crate) fn materialize_inputs(
         .tempdir()
         .map_err(|error| format!("create wrapper tempdir: {error}"))?;
     let mut state = PlannerState::default();
-    let context = ProcessContext {
-        ruleset: ruleset.as_ref(),
-        tar_engine: &tar_engine,
-        tempdir: tempdir.path(),
-        no_index,
-    };
-
     for input in input_paths {
+        let hardlink_roots = collect_hardlink_roots(input)?;
+        let context = ProcessContext {
+            ruleset: ruleset.as_ref(),
+            tar_engine: &tar_engine,
+            tempdir: tempdir.path(),
+            hardlink_roots: &hardlink_roots,
+            no_index,
+        };
         process_input(input, context, &mut state)?;
     }
     state
@@ -487,6 +489,7 @@ fn process_dir(
                 dir,
                 relative,
                 context.with_no_index(context.no_index || rule_no_index),
+                "blob-rule",
                 state,
             )?;
             return Ok(true);
@@ -504,11 +507,30 @@ fn process_dir(
                 dir,
                 name,
                 context.with_no_index(context.no_index || rule_no_index),
+                "blob-rule",
                 state,
             )?;
             return Ok(true);
         }
         Decision::Granular => {}
+    }
+    if context.hardlink_roots.contains(relative) {
+        if relative.as_os_str().is_empty() {
+            let name = dir.file_name().ok_or_else(|| {
+                format!(
+                    "hardlink blob root {} does not have a file name",
+                    dir.display()
+                )
+            })?;
+            materialize_root_blob(dir, name, context, "hardlink", state)?;
+        } else {
+            materialize_blob(root, dir, relative, context, "hardlink", state)?;
+        }
+        return Ok(true);
+    }
+    if !relative.as_os_str().is_empty() && has_xattrs(dir) {
+        materialize_blob(root, dir, relative, context, "xattr", state)?;
+        return Ok(true);
     }
 
     let mut entries = fs::read_dir(dir)
@@ -668,6 +690,7 @@ fn materialize_blob(
     dir: &Path,
     relative: &Path,
     context: ProcessContext<'_>,
+    reason: &'static str,
     state: &mut PlannerState,
 ) -> Result<(), String> {
     let rel_text = relative_match_text(relative);
@@ -682,9 +705,8 @@ fn materialize_blob(
         &rel_text,
         &wrapper_archive_path,
         &tar_path,
-        context.tar_engine,
-        context.tempdir,
-        context.no_index,
+        context,
+        reason,
         state,
     )?;
     let _ = dir;
@@ -695,6 +717,7 @@ fn materialize_root_blob(
     dir: &Path,
     name: &OsStr,
     context: ProcessContext<'_>,
+    reason: &'static str,
     state: &mut PlannerState,
 ) -> Result<(), String> {
     let rel_text = name.to_string_lossy().into_owned();
@@ -710,9 +733,8 @@ fn materialize_root_blob(
         &rel_text,
         &wrapper_archive_path,
         &tar_path,
-        context.tar_engine,
-        context.tempdir,
-        context.no_index,
+        context,
+        reason,
         state,
     )
 }
@@ -721,14 +743,13 @@ fn add_blob_outputs(
     rel_text: &str,
     wrapper_archive_path: &str,
     tar_path: &Path,
-    tar_engine: &TarEngineReport,
-    tempdir: &Path,
-    no_index: bool,
+    context: ProcessContext<'_>,
+    reason: &'static str,
     state: &mut PlannerState,
 ) -> Result<(), String> {
     let (tar_size, tar_hash) = hash_for_manifest(tar_path)?;
-    let index = build_wrap_index(tar_path, tar_engine)?;
-    state.record_blob(rel_text, tar_size);
+    let index = build_wrap_index(tar_path, context.tar_engine)?;
+    state.record_blob(rel_text, tar_size, reason);
     state.files.push(read_archive_build_file(
         tar_path,
         wrapper_archive_path.to_string(),
@@ -749,8 +770,8 @@ fn add_blob_outputs(
             wrapper: Some(wrapper_archive_path.to_string()),
         });
     }
-    if !no_index {
-        let idx_path = next_temp_path(tempdir, &mut state.wrapper_counter, "blob.idx");
+    if !context.no_index {
+        let idx_path = next_temp_path(context.tempdir, &mut state.wrapper_counter, "blob.idx");
         write_wrap_index(&idx_path, &index)?;
         let idx_archive_path = remwrap_index_path(wrapper_archive_path)?;
         state
@@ -1120,6 +1141,92 @@ fn native_status(path: &Path, relative: &Path, metadata: &fs::Metadata) -> Nativ
     } else {
         NativeStatus::WrapFallback("unsupported-file-type")
     }
+}
+
+#[cfg(unix)]
+fn collect_hardlink_roots(input: &Path) -> Result<BTreeSet<PathBuf>, String> {
+    let metadata = fs::symlink_metadata(input)
+        .map_err(|error| format!("stat input {}: {error}", input.display()))?;
+    let mut groups = BTreeMap::<(u64, u64), Vec<PathBuf>>::new();
+    if metadata.is_dir() {
+        collect_hardlink_groups(input, input, Path::new(""), &mut groups)?;
+    } else if metadata.is_file() && metadata.nlink() > 1 {
+        if let Some(name) = input.file_name() {
+            groups
+                .entry((metadata.dev(), metadata.ino()))
+                .or_default()
+                .push(PathBuf::from(name));
+        }
+    }
+    Ok(groups
+        .into_values()
+        .filter(|paths| paths.len() > 1)
+        .map(|paths| common_parent_path(&paths))
+        .collect())
+}
+
+#[cfg(not(unix))]
+fn collect_hardlink_roots(_input: &Path) -> Result<BTreeSet<PathBuf>, String> {
+    Ok(BTreeSet::new())
+}
+
+#[cfg(unix)]
+fn collect_hardlink_groups(
+    root: &Path,
+    dir: &Path,
+    relative: &Path,
+    groups: &mut BTreeMap<(u64, u64), Vec<PathBuf>>,
+) -> Result<(), String> {
+    let mut entries = fs::read_dir(dir)
+        .map_err(|error| format!("read directory {}: {error}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("read directory {}: {error}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let child_relative = relative.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("stat input {}: {error}", path.display()))?;
+        if metadata.is_dir() {
+            collect_hardlink_groups(root, &path, &child_relative, groups)?;
+        } else if metadata.is_file() && metadata.nlink() > 1 {
+            let normalized = path
+                .strip_prefix(root)
+                .map(PathBuf::from)
+                .unwrap_or(child_relative);
+            groups
+                .entry((metadata.dev(), metadata.ino()))
+                .or_default()
+                .push(normalized);
+        }
+    }
+    Ok(())
+}
+
+fn common_parent_path(paths: &[PathBuf]) -> PathBuf {
+    let Some(first) = paths.first() else {
+        return PathBuf::new();
+    };
+    let mut common = path_components(first.parent().unwrap_or_else(|| Path::new("")));
+    for path in &paths[1..] {
+        let components = path_components(path.parent().unwrap_or_else(|| Path::new("")));
+        let keep = common
+            .iter()
+            .zip(components.iter())
+            .take_while(|(left, right)| left == right)
+            .count();
+        common.truncate(keep);
+    }
+    common.into_iter().collect()
+}
+
+fn path_components(path: &Path) -> Vec<OsString> {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_os_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -1512,10 +1619,10 @@ impl PlannerState {
         self.record_cluster(rel_text, reason, 1, bytes);
     }
 
-    fn record_blob(&mut self, rel_text: &str, bytes: u64) {
+    fn record_blob(&mut self, rel_text: &str, bytes: u64, reason: &'static str) {
         self.totals.blob_entries += 1;
         self.record_dir_stats(rel_text, false);
-        self.record_cluster(rel_text, "blob-rule", 1, bytes);
+        self.record_cluster(rel_text, reason, 1, bytes);
     }
 
     fn record_dir_stats(&mut self, rel_text: &str, noncompliant: bool) {
