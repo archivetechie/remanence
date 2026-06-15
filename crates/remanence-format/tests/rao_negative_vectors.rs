@@ -346,6 +346,43 @@ fn base_plaintext_archive() -> PlaintextArchive {
     }
 }
 
+fn hardlink_plaintext_archive() -> PlaintextArchive {
+    let options = base_options();
+    let early = b"early payload".to_vec();
+    let later = b"later payload".to_vec();
+    let mut early_reader = Cursor::new(early.as_slice());
+    let mut symlink_reader = Cursor::new(Vec::<u8>::new());
+    let mut hardlink_reader = Cursor::new(Vec::<u8>::new());
+    let mut later_reader = Cursor::new(later.as_slice());
+    let mut sink = VecBlockSink::new();
+    let mut files = [
+        RemTarFileStream::new(
+            regular_spec("early.bin", "file-early", &early),
+            &mut early_reader,
+        ),
+        RemTarFileStream::new(
+            RemTarFileSpec::symlink("slink.bin", "symlink-a", "elsewhere.bin"),
+            &mut symlink_reader,
+        ),
+        RemTarFileStream::new(
+            RemTarFileSpec::hardlink("copy.bin", "hardlink-a", "early.bin"),
+            &mut hardlink_reader,
+        ),
+        RemTarFileStream::new(
+            regular_spec("later.bin", "file-later", &later),
+            &mut later_reader,
+        ),
+    ];
+    let layout = write_rem_tar_object_from_readers(&mut sink, &options, &mut files)
+        .expect("base hardlink RAO writes");
+    let bytes = sink.blocks.into_iter().flatten().collect();
+    PlaintextArchive {
+        bytes,
+        layout,
+        chunk_size: options.chunk_size,
+    }
+}
+
 fn assert_plaintext_reader_case(case: &Value) {
     let id = str_field(case, "id");
     let operation = str_field(case, "operation");
@@ -355,7 +392,14 @@ fn assert_plaintext_reader_case(case: &Value) {
 }
 
 fn run_plaintext_reader_case(id: &str, operation: &str) -> Result<(), FormatError> {
-    let mut archive = base_plaintext_archive();
+    let mut archive = if matches!(
+        id,
+        "hardlink-missing-target" | "hardlink-forward-target" | "hardlink-nonregular-target"
+    ) {
+        hardlink_plaintext_archive()
+    } else {
+        base_plaintext_archive()
+    };
     mutate_plaintext_archive(id, &mut archive);
     match operation {
         "read" => read_archive_bytes(&archive.bytes, archive.chunk_size).map(|_| ()),
@@ -497,8 +541,29 @@ fn mutate_plaintext_archive(id: &str, archive: &mut PlaintextArchive) {
                 &record,
             );
         }
+        "hardlink-missing-target" => mutate_hardlink_target(archive, b"ghost.bin"),
+        "hardlink-forward-target" => mutate_hardlink_target(archive, b"later.bin"),
+        "hardlink-nonregular-target" => mutate_hardlink_target(archive, b"slink.bin"),
         other => panic!("unhandled plaintext reader vector {other:?}"),
     }
+}
+
+fn mutate_hardlink_target(archive: &mut PlaintextArchive, target: &[u8]) {
+    assert!(
+        target.len() < 100,
+        "hardlink target test value fits linkname"
+    );
+    let hardlink = archive
+        .layout
+        .files
+        .iter()
+        .find(|file| file.path == "copy.bin")
+        .expect("hardlink fixture has copy.bin");
+    let header_offset = entry_header_offset(hardlink);
+    let linkname = &mut archive.bytes[header_offset + 157..header_offset + 257];
+    linkname.fill(0);
+    linkname[..target.len()].copy_from_slice(target);
+    rewrite_tar_checksum(&mut archive.bytes[header_offset..header_offset + TAR_RECORD_SIZE]);
 }
 
 fn read_archive_bytes(bytes: &[u8], chunk_size: usize) -> Result<(), FormatError> {
@@ -1543,6 +1608,9 @@ fn plaintext_reader_negative_vectors_match_manifest_errors() {
             "pax-record-missing-trailing-newline",
             "pax-value-control-character",
             "pax-value-non-utf8",
+            "hardlink-missing-target",
+            "hardlink-forward-target",
+            "hardlink-nonregular-target",
         ],
     );
     let base = fixture.get("base").expect("plaintext reader base exists");
