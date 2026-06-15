@@ -79,11 +79,13 @@ The hardlink entry's `file_entries` element:
   `rao-nonregular-entries`; add `hardlink` as a permitted value).
 - `link_target` = the primary's in-object path (the field already exists for
   symlinks; for hardlinks it names an in-object entry, not an arbitrary string).
-- `size_bytes`, `chunk_count`, `first_chunk_lba`, `file_sha256`: **carry the
-  primary's values** (so PFR on a hardlinked name reads the primary's blocks
-  directly with no link resolution, and the catalog sees identical content —
-  same `file_sha256`). This is the one deviation from symlinks (which are
-  zero/`null`); a hardlink *has* content, it just shares it.
+- `size_bytes`, `chunk_count`, `first_chunk_lba`, `file_sha256`: **zero/absent,
+  exactly like a symlink** — a hardlink entry carries no content fields of its
+  own. A hardlinked name's content, hash, and PFR coordinates are its primary's,
+  **resolved at read time through `link_target`** (the tar-faithful model: a tar
+  hardlink record likewise stores no content). This keeps the entry internally
+  consistent (no `size = 0` vs carries-the-primary's-size contradiction) and
+  avoids duplicating drift-prone coordinates.
 
 ### 3.4 Byte-stability
 
@@ -139,8 +141,8 @@ output:
 - §4.6 — hardlink entry frame (zero payload; target in linkname/linkpath).
 - §4.6.6 — hardlink target is an in-object path that MUST resolve to a primary
   (distinct from symlink targets); referential-integrity rule.
-- §4.7.2 — `entry_type = hardlink`; `link_target` semantics for hardlinks;
-  the "carry the primary's content coords" rule.
+- §4.7.2 — `entry_type = hardlink`; `link_target` = primary's in-object path;
+  content fields zero/absent (resolve via `link_target`, like a symlink).
 - §4.9 — reader dispatch + the precede-the-link ordering requirement.
 - §11.1 — `InvalidHardlinkTarget`.
 - §13 — vectors (below).
@@ -148,7 +150,7 @@ output:
 ## 8. Test vectors
 
 - Two names → one inode: primary (typeflag 0 + bytes) + link (typeflag 1, no
-  bytes), byte-pinned; manifest shows shared `file_sha256`/coords.
+  bytes, zero content fields, `link_target` → primary), byte-pinned.
 - Long target → pax `linkpath`.
 - Restore round-trip: restored tree has the two names sharing one inode
   (`st_ino` equal, `st_nlink == 2`).
@@ -161,7 +163,7 @@ output:
 
 - `tar.rs` — emit/parse typeflag `1`; reuse the symlink linkname/linkpath path.
 - `model.rs` / `layout.rs` / `writer.rs` — hardlink entry kind; primary/link
-  emission; carry the primary's content coords onto link entries.
+  emission (link entries are zero-payload, like symlinks; no coord copy).
 - `manifest.rs` — `entry_type=hardlink`, `link_target`, validation +
   referential integrity.
 - `reader.rs` — dispatch + restore ordering + `link(2)` creation + verify.

@@ -125,8 +125,8 @@ Implements the ingest half of `rao-hardlinks-design-v0.1.md`.
    if excluded by a ruleset, the first non-excluded member; if only one
    survives, a plain regular entry.
 3. **Emit** the primary as a normal native regular entry and each other name as
-   a native hardlink entry (typeflag 1, `link_target` = primary's in-object
-   path, carrying the primary's content coords — handed to the format writer).
+   a native hardlink entry (typeflag 1, zero-payload, `link_target` = primary's
+   in-object path; no content-coord copy — content resolves via `link_target`).
 4. **Edge:** a group split across a blob boundary (one name in a blobbed dir,
    one granular) can't link across it → the affected member falls back to an
    independent copy, recorded.
