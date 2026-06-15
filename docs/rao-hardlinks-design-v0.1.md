@@ -114,14 +114,15 @@ output:
 
 ## 5. Reader / restore
 
-- Reader dispatches typeflag `1` → emit a hardlink entry (target + the shared
-  content coordinates).
+- Reader dispatches typeflag `1` → emit a hardlink entry (zero-payload; its
+  `link_target` names the primary, through which content/hash/PFR resolve).
 - Restore: materialize the **primary first**, then create each link
   (`link(2)`) from the link path to the already-restored primary, with the same
   traversal-safety discipline as symlinks (no following symlinks in the
   destination tree; the target is an in-tree path by construction).
-- Verifier: check referential integrity (§3.2) and that a link's shared
-  `file_sha256` equals its primary's.
+- Verifier: check referential integrity (§3.2) — the `link_target` resolves to
+  a regular-file primary appearing before the link. (The hardlink carries no
+  `file_sha256` of its own; the primary's digest covers the shared bytes.)
 
 ## 6. Ingest edges (handled in the ingest layer; see the ingest design doc)
 
