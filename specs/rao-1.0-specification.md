@@ -156,9 +156,12 @@ and whole-stream compression destroys closed-form range addressing (a later
 member's offset would depend on decompressing earlier bytes). It defines no
 catalog format, no key registry, no network protocol, and no multi-object
 container: one object is one archive is one stored byte string. Version 1.0
-encodes regular files, symbolic links, and empty directories. Hardlinks,
-device nodes, FIFOs, sockets, and ownership tiers remain reserved extension
-surfaces (Section 10).
+encodes a faithful tree of files — regular files, hardlinks, symbolic links,
+and (empty) directories. Device nodes, FIFOs, and sockets are excluded on
+principle: they carry no content (they are kernel/runtime handles) and
+materializing them on restore is a hazard, so a conformant reader rejects
+their typeflags (Section 4.3.4). Ownership is deliberately not preserved
+(Section 4.3.1); extended attributes are a 1.x extension surface (Section 10).
 Re-keying an encrypted object without rewriting its payload bytes is not
 supported (Section 12.8).
 
@@ -421,14 +424,14 @@ Every header is one 512-byte record:
 | Offset | Length | Field | Writer-normative value |
 | ---: | ---: | --- | --- |
 | 0 | 100 | `name` | Entry-dependent (Section 4.3.2); NUL-padded |
-| 100 | 8 | `mode` | Regular entries: `0000644\0`, or `0000755\0` when `REMANENCE.executable` is `true`; symlinks: `0000777\0`; directories: `0000755\0` |
+| 100 | 8 | `mode` | Regular entries: `0000644\0`, or `0000755\0` when `REMANENCE.executable` is `true`; hardlinks: `0000644\0`; symlinks: `0000777\0`; directories: `0000755\0` |
 | 108 | 8 | `uid` | `0000000\0` |
 | 116 | 8 | `gid` | `0000000\0` |
 | 124 | 12 | `size` | 11 octal digits + NUL (Section 4.3.2) |
 | 136 | 12 | `mtime` | `00000000000\0` (mtime lives in pax only, Section 4.4.4) |
 | 148 | 8 | `chksum` | Section 4.3.3 |
-| 156 | 1 | `typeflag` | `g`, `x`, `0`, `2`, or `5` (Section 4.5, Section 4.6) |
-| 157 | 100 | `linkname` | Symlink target when it fits in ustar `linkname`; otherwise all NUL or the pax-backed placeholder (Section 4.6.1); all NUL for other entries |
+| 156 | 1 | `typeflag` | `g`, `x`, `0`, `1`, `2`, or `5` (Section 4.5, Section 4.6) |
+| 157 | 100 | `linkname` | Symlink or hardlink target when it fits in ustar `linkname`; otherwise all NUL or the pax-backed placeholder (Section 4.6.1); all NUL for other entries |
 | 257 | 6 | `magic` | `ustar\0` |
 | 263 | 2 | `version` | `00` |
 | 265 | 32 | `uname` | `remanence`, NUL-padded |
@@ -484,14 +487,17 @@ Readers MUST verify the unsigned checksum and reject a mismatch with
 | `g` (0x67) | Global pax header (Section 4.5) |
 | `x` (0x78) | Per-entry pax extended header (Section 4.4) |
 | `0` (0x30) | Regular file |
+| `1` (0x31) | Hardlink (Section 4.6) |
 | `2` (0x32) | Symbolic link |
 | `5` (0x35) | Directory |
 | NUL (0x00) | Accepted by Readers as a regular file (pre-POSIX compatibility); writers MUST NOT emit it |
 
 Readers MUST reject any other typeflag with `UnsupportedTarTypeflag`. This is
-deliberate: version 1.0 has no hardlink, device, FIFO, socket, or other
-special entries (Section 1.5), and accepting them silently would misrepresent
-an unsupported archive as fully restored.
+deliberate: version 1.0's entry set is regular files, hardlinks, symbolic
+links, and directories — a faithful tree of files — and excludes device,
+FIFO, socket, and other special entries (Section 1.5); accepting an
+unsupported typeflag silently would misrepresent an unsupported archive as
+fully restored.
 
 ### 4.4. Pax Extended Records
 
@@ -543,14 +549,15 @@ payload framing or interpretation.
 | --- | --- | --- |
 | `path` | REQUIRED on every entry | Effective UTF-8 entry path; overrides the ustar `name` |
 | `size` | REQUIRED on every entry | Effective payload byte length (decimal); overrides the ustar `size` |
-| `linkpath` | Symlink entries when needed | Effective symlink target; overrides the ustar `linkname` |
+| `linkpath` | Symlink/hardlink entries when needed | Effective symlink target (an opaque string), or hardlink target (an in-object path, Section 4.6); overrides the ustar `linkname` |
 | `mtime` | OPTIONAL | Modification time in POSIX pax decimal form: non-negative decimal seconds since the epoch, optionally followed by `.` and fractional digits. Writers MUST validate this shape |
 
 Writers MUST always emit `path` and `size` even when the ustar header could
 carry them, so every entry is self-describing under pax rules alone. Readers
 MUST use the pax values when present and fall back to the ustar fields
-otherwise (foreign-archive tolerance). For symbolic links, Readers MUST use
-`linkpath` when present and fall back to the ustar `linkname` field.
+otherwise (foreign-archive tolerance). For symbolic links and hardlinks,
+Readers MUST use `linkpath` when present and fall back to the ustar `linkname`
+field.
 
 The object-level metadata-preservation tier
 (`REMANENCE.metadata_preservation`, Section 4.5.1) declares intent: `minimal`
@@ -617,17 +624,30 @@ Each entry is, in order:
 1. A pax extended header: ustar record (typeflag `x`) whose `size` is the pax
    payload length; the pax payload; zero padding to the next 512-byte
    boundary.
-2. An entry ustar header (typeflag `0`, `2`, or `5`, Section 4.3).
+2. An entry ustar header (typeflag `0`, `1`, `2`, or `5`, Section 4.3).
 3. For regular files only, the payload: exactly `size` bytes (the effective
-   size). Symlink and directory entries MUST have `size = 0` and no payload.
+   size). Hardlink, symlink, and directory entries MUST have `size = 0` and no
+   payload.
 4. Zero padding to the next 512-byte boundary (none if `size mod 512 = 0`).
 
 For symbolic links, Writers MUST store the target in ustar `linkname` when it
 fits in 100 bytes; otherwise they MUST store it in pax `linkpath` and put a
-placeholder in `linkname`. A link target is an opaque UTF-8 OS string, not an
-RAO path: it MAY be absolute, contain `..`, or be dangling. For directories,
+placeholder in `linkname`. A symlink target is an opaque UTF-8 OS string, not
+an RAO path: it MAY be absolute, contain `..`, or be dangling. For directories,
 Writers SHOULD emit entries only for directories that cannot be inferred from
 child paths, i.e. empty directories; directory paths MUST end in `/`.
+
+**Hardlinks.** A hardlink entry records that its path is a second name for the
+bytes of another entry — the **primary** — in the same object. Its target is
+stored exactly as a symlink target is (`linkname`, or pax `linkpath` with a
+placeholder in `linkname`), but unlike a symlink target it is **not** an
+arbitrary string: it MUST be a canonical relative path (Section 4.6.6) that
+resolves, within the same object, to a **regular-file primary entry appearing
+before** the hardlink entry. Of a set of names sharing one underlying file the
+**primary** is one regular entry that holds the bytes; each other name is a
+hardlink entry. Primary selection MUST be deterministic: the first such name in
+archive order, or — if that one is omitted — the first surviving name; if only
+one name survives it is a plain regular entry (no hardlink entry).
 
 #### 4.6.2. Per-Entry Keywords
 
@@ -726,7 +746,9 @@ writer receives payload bytes as a stream, it MUST recompute the SHA-256 of
 the bytes actually consumed and MUST fail the object (refusing to complete it)
 if the recomputed digest or byte count differs from the declared spec. This
 proves the writer archived the payload it was given, not the payload the
-metadata describes. Symlink and directory entries have no payload hash.
+metadata describes. Symlink and directory entries have no payload hash; a
+hardlink entry shares its primary's `file_sha256` and content coordinates
+(Section 4.7.2).
 
 #### 4.6.6. Path and Identity Rules
 
@@ -844,12 +866,12 @@ regular-only objects.
 | `path` | text | Effective entry path |
 | `file_id` | text | Entry `REMANENCE.file_id` |
 | `executable` | `true`/`false`/`null` | `null` when the writer was given no value |
-| `size_bytes` | unsigned | Effective payload length |
-| `chunk_count` | unsigned | Section 4.6.4 value |
-| `entry_type` | text | OPTIONAL; absent means `regular`; otherwise `symlink` or `directory` |
-| `file_sha256` | bytes | Regular entries only: exactly 32 bytes; binary SHA-256 (hex in pax, binary here) |
-| `first_chunk_lba` | unsigned/`null` | Inner `BodyLba`; `null` iff `size_bytes` = 0 |
-| `link_target` | text | Symlink entries only; the effective target string |
+| `size_bytes` | unsigned | Effective payload length; a hardlink carries its primary's |
+| `chunk_count` | unsigned | Section 4.6.4 value; a hardlink carries its primary's |
+| `entry_type` | text | OPTIONAL; absent means `regular`; otherwise `hardlink`, `symlink`, or `directory` |
+| `file_sha256` | bytes | Regular and hardlink entries: exactly 32 bytes; binary SHA-256 (hex in pax, binary here). A hardlink carries its primary's value |
+| `first_chunk_lba` | unsigned/`null` | Inner `BodyLba`; `null` iff `size_bytes` = 0; a hardlink carries its primary's |
+| `link_target` | text | Symlink entries: the effective target string. Hardlink entries: the primary's in-object path (Section 4.6) |
 | `metadata_preservation_data` | map | Reserved; MUST be empty (`{}`) in 1.0 writers |
 
 Consumer obligations:
@@ -959,9 +981,13 @@ Procedure:
    for the current global set, compute effective path and size, verify
    `REMANENCE.compression`, verify chunk alignment if `size > 0`, deliver
    exactly `size` payload bytes, then skip the record padding (EOF inside a
-   declared payload or its padding is `TruncatedPayload`); `2` → a symlink:
-   require `size = 0`, compute effective path and target (`linkpath` or
-   `linkname`), and deliver a symlink entry with no payload; `5` → a
+   declared payload or its padding is `TruncatedPayload`); `1` → a hardlink:
+   require `size = 0`, compute the effective path and in-object target
+   (`linkpath` or `linkname`), verify the target resolves to a regular-file
+   primary already delivered (`InvalidHardlinkTarget` otherwise), and deliver a
+   hardlink entry carrying the primary's content coordinates, no payload; `2` →
+   a symlink: require `size = 0`, compute effective path and target (`linkpath`
+   or `linkname`), and deliver a symlink entry with no payload; `5` → a
    directory: require `size = 0` and deliver a directory entry with no
    payload; anything else → `UnsupportedTarTypeflag`.
 5. **Integrity (restore mode).** For every regular entry delivered in full,
@@ -1899,6 +1925,7 @@ Parse                     malformed archive structure (octal fields, EOF sequenc
                           truncated/overflowing offsets)
 UstarChecksumMismatch     Section 4.3.3 failure
 UnsupportedTarTypeflag    Section 4.3.4 rejection
+InvalidHardlinkTarget     hardlink target absent, not a regular-file primary, or not preceding the link (4.6)
 ChunkAlignmentViolation   Section 4.6.3 reader rejection
 ChunkSizeMismatch         stream REMANENCE.chunk_size disagrees with supplied geometry (4.5.2)
 InvalidPath               effective path violates Section 4.6.6 rules 1-2 (reader-side)
@@ -2143,9 +2170,11 @@ Restore implementations MUST therefore keep their own sanitization. They
 MUST NOT follow symlinks already present in the destination tree while
 materializing any entry; they SHOULD use `openat`/`O_NOFOLLOW` or equivalent
 component-by-component discipline and re-check each component. They MUST
-create symlink entries as symlinks, without dereferencing their targets. They
-MUST also prevent the classic archive attack where an earlier symlink entry
-creates `dir -> /outside` and a later regular entry writes through `dir/file`.
+create symlink entries as symlinks, without dereferencing their targets, and
+MUST materialize a hardlink's primary before creating the hardlink (`link(2)`)
+to the already-restored primary. They MUST also prevent the classic archive
+attack where an earlier symlink entry creates `dir -> /outside` and a later
+regular entry writes through `dir/file`.
 Framing-layer acceptance of a path is a necessary check, not a sufficient
 safety claim. Decrypting an envelope grants no exemption: the inner stream is
 parsed and restored under the same rules. Stock tar extraction has its own
@@ -2280,7 +2309,10 @@ reserved `_remanence/` path; control character in path; each non-canonical
 path shape (`/abs`, `a/../b`, `./a`, `a//b`, `a/`); malformed `mtime`;
 streamed payload with wrong hash; streamed payload with wrong size;
 non-multiple-of-512 `chunk_size`; symlink/directory with nonzero size;
-symlink missing target; directory path without trailing slash. Reader-side (byte vectors): wrong
+symlink missing target; directory path without trailing slash; a hardlink
+(primary + link) round-tripping to one shared inode, and a hardlink whose
+target is absent or not a regular-file primary (`InvalidHardlinkTarget`).
+Reader-side (byte vectors): wrong
 `REMANENCE.format_id`; schema major 2; missing `REMANENCE.compression`;
 `REMANENCE.compression=gzip`; `REMANENCE.encryption=aes-256-gcm`; declared
 `REMANENCE.chunk_size` disagreeing with the supplied geometry; corrupted
