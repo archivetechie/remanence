@@ -164,8 +164,18 @@ summarized here for the format's obligations.)
 - **Customer manifest** — may surface preserved-metadata presence; coordinate
   when finalized.
 
-## 11. Open sub-decision
+## 11. xattr policy (RESOLVED)
 
-Denylist (preserve every non-junk xattr) vs. allowlist (keep only
-known-meaningful, drop the rest). Lean **denylist** (don't-lose-data), drop
-list tunable. Final call before the spec edit.
+Which xattrs get preserved is **ruleset-configurable**, with a fail-safe
+default (full design in `ingest-archive-deferred-items-design-v0.1.md` and the
+ingest work order):
+
+- A built-in **universal junk baseline** (macOS ephemerals) is always dropped.
+- The ruleset declares the stance: `option xattr-mode denylist` (default —
+  keep all but baseline + `xattr-drop` additions) or `option xattr-mode
+  allowlist` (keep only `xattr-keep` entries).
+- Absent any directive → fail-safe default (denylist stance, baseline only).
+
+The format side (this doc) is mode-agnostic: it stores whatever surviving
+xattrs the ingest layer hands it, small ones in the annotation and oversized
+ones via a wrap. All drops are recorded (never silent).

@@ -12,9 +12,11 @@ ustar typeflags** (`2` = symbolic link, `5` = directory), rather than the
 manifest-annotation alternative. This expands the current "regular files
 only" scope (spec §1.5) **before freeze**.
 
-Hardlinks remain out of scope (they need inode-identity/refcount semantics);
-this note covers symlinks and directories only. "Non-regular entries" is the
-collective term so the surface can extend later.
+Hardlinks were initially out of scope here. **Superseded (2026-06-15):**
+hardlinks are now in scope, handled natively via ustar typeflag `1` — see
+`rao-hardlinks-design-v0.1.md`, which completes the entry set
+(regular/symlink/dir/hardlink) and states the entry-type scope principle.
+This note covers symlinks and directories; the hardlink doc covers the rest.
 
 ## 2. Why, and why now
 
