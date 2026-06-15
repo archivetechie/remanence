@@ -19,8 +19,9 @@ On Mac sources that over-wraps massively (macOS sprinkles xattrs like
 `com.apple.quarantine` on nearly everything) and, under `expect=compliant`,
 spuriously halts bundles. 1.1 gives native entries a metadata slot, so a
 meaningful xattr rides on a clean native entry and wrapping is reserved for
-things that genuinely can't be native (non-UTF-8 names, device nodes,
-hardlinks, oversized metadata).
+things that genuinely can't be native (non-UTF-8 paths, device nodes,
+oversized metadata). (Hardlinks are native 1.0 entries — `rao-1.0` §4.6 /
+`rao-hardlinks-design` — not a wrap case.)
 
 **Now is the right time:** RAO 1.0 is not frozen; the manifest already
 *reserves* `metadata_preservation_data` (per-entry) and `object_metadata`

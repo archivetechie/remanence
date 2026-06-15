@@ -50,8 +50,11 @@ RAO 1.0 §4.7.1) containing:
 "xattrs" : { <name> : <value>, ... }
 ```
 
-- `<name>` — text key. xattr names are ASCII/UTF-8 in practice; a non-UTF-8
-  name uses the reversible escaping defined for ingest member names.
+- `<name>` — text key (the manifest profile requires text-string keys, RAO 1.0
+  §4.7.1). xattr names are ASCII/UTF-8 by namespace convention. A name that is
+  not valid UTF-8 is **out of scope** for native preservation: the ingest layer
+  drops-and-records it, or wraps the file. (No bespoke name escaping is defined
+  or relied on here.)
 - `<value>` — a CBOR **byte string** holding the raw attribute bytes. The
   manifest is CBOR (not JSON), so raw bytes are stored directly — **no base64**.
 - **Deterministic encoding** (RAO 1.0 §4.7.1): the `xattrs` map's keys MUST be
