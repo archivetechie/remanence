@@ -17,9 +17,9 @@ use crate::model::{
 };
 use crate::pax::{encode_pax_records, round_up_usize, tar_padding_len, with_alignment_pad};
 use crate::tar::{
-    encode_header, encode_pax_backed_directory_header, encode_pax_backed_regular_header,
-    encode_pax_backed_symlink_header, is_portable_ustar_linkname, TYPE_PAX_EXTENDED,
-    TYPE_PAX_GLOBAL,
+    encode_header, encode_pax_backed_directory_header, encode_pax_backed_hardlink_header,
+    encode_pax_backed_regular_header, encode_pax_backed_symlink_header, is_portable_ustar_linkname,
+    TYPE_PAX_EXTENDED, TYPE_PAX_GLOBAL,
 };
 
 /// Report for writing an encrypted RAO object.
@@ -515,6 +515,17 @@ fn write_pax_and_regular_header<S: BlockSink + ?Sized>(
                 0o644
             },
         )?,
+        RemTarEntryType::Hardlink => {
+            let target = spec
+                .link_target
+                .as_deref()
+                .ok_or_else(|| FormatError::invalid("hardlink entry missing link target"))?;
+            encode_pax_backed_hardlink_header(
+                &spec.path,
+                target,
+                !is_portable_ustar_linkname(target),
+            )?
+        }
         RemTarEntryType::Symlink => {
             let target = spec
                 .link_target
@@ -586,7 +597,7 @@ fn file_to_spec(file: &RemTarFile<'_>) -> RemTarFileSpec {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::{self, Read};
+    use std::io::{self, Cursor, Read};
     use std::process::Command;
 
     use remanence_library::{
@@ -817,10 +828,27 @@ mod tests {
     fn streaming_writer_round_trips_symlinks_and_empty_directories() {
         let opts = options(4096);
         let long_target = format!("../{}", "nested-target/".repeat(10));
+        let primary_data = b"primary hardlink bytes".to_vec();
+        let mut primary_reader = Cursor::new(primary_data.as_slice());
+        let mut hardlink_reader = io::empty();
         let mut short_reader = io::empty();
         let mut long_reader = io::empty();
         let mut dir_reader = io::empty();
         let mut streams = [
+            RemTarFileStream::new(
+                file_spec(
+                    "target.mov",
+                    "file-target",
+                    &primary_data,
+                    None,
+                    Some(false),
+                ),
+                &mut primary_reader,
+            ),
+            RemTarFileStream::new(
+                RemTarFileSpec::hardlink("links/copy.mov", "hardlink-copy", "target.mov"),
+                &mut hardlink_reader,
+            ),
             RemTarFileStream::new(
                 RemTarFileSpec::symlink("links/latest", "link-short", "../target.mov"),
                 &mut short_reader,
@@ -841,6 +869,17 @@ mod tests {
         let read =
             crate::read_rem_tar_object(&mut source, opts.chunk_size, layout.projected_size_blocks)
                 .unwrap();
+
+        let primary = read.entry("target.mov").unwrap();
+        assert_eq!(primary.entry_type, RemTarEntryType::Regular);
+        assert_eq!(primary.data, primary_data);
+
+        let hardlink = read.entry("links/copy.mov").unwrap();
+        assert_eq!(hardlink.entry_type, RemTarEntryType::Hardlink);
+        assert_eq!(hardlink.link_target.as_deref(), Some("target.mov"));
+        assert_eq!(hardlink.size_bytes, 0);
+        assert!(hardlink.data.is_empty());
+        assert_eq!(hardlink.first_chunk_lba, None);
 
         let short = read.entry("links/latest").unwrap();
         assert_eq!(short.entry_type, RemTarEntryType::Symlink);

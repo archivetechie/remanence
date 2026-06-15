@@ -90,6 +90,21 @@
       "expected_error": "InvalidInput"
     },
     {
+      "id": "hardlink-missing-target",
+      "fault": "hardlink entry omits link_target",
+      "expected_error": "InvalidHardlinkTarget"
+    },
+    {
+      "id": "hardlink-nonregular-target",
+      "fault": "hardlink target names a directory entry, not a regular primary",
+      "expected_error": "InvalidHardlinkTarget"
+    },
+    {
+      "id": "hardlink-forward-target",
+      "fault": "hardlink target appears after the hardlink entry",
+      "expected_error": "InvalidHardlinkTarget"
+    },
+    {
       "id": "directory-missing-trailing-slash",
       "fault": "directory entry path does not end in slash",
       "expected_error": "InvalidInput"

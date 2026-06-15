@@ -98,7 +98,7 @@ pub struct RemTarFileSpec {
     pub size_bytes: u64,
     /// SHA-256 of the exact file payload bytes. Absent for non-regular entries.
     pub file_sha256: Option<[u8; 32]>,
-    /// Symlink target. Present only for symbolic-link entries.
+    /// Link target. Present only for symbolic-link and hardlink entries.
     pub link_target: Option<String>,
     /// Optional mtime value recorded in pax when supplied.
     pub mtime: Option<String>,
@@ -144,6 +144,24 @@ impl RemTarFileSpec {
         }
     }
 
+    /// Construct a hardlink entry spec.
+    pub fn hardlink(
+        path: impl Into<String>,
+        file_id: impl Into<String>,
+        target: impl Into<String>,
+    ) -> Self {
+        Self {
+            entry_type: RemTarEntryType::Hardlink,
+            path: path.into(),
+            file_id: file_id.into(),
+            size_bytes: 0,
+            file_sha256: None,
+            link_target: Some(target.into()),
+            mtime: None,
+            executable: None,
+        }
+    }
+
     /// Construct an empty-directory entry spec.
     pub fn directory(path: impl Into<String>, file_id: impl Into<String>) -> Self {
         Self {
@@ -164,6 +182,8 @@ impl RemTarFileSpec {
 pub enum RemTarEntryType {
     /// Regular file with byte payload.
     Regular,
+    /// Hardlink to a preceding regular-file primary, with no payload.
+    Hardlink,
     /// Symbolic link with a target string and no payload.
     Symlink,
     /// Directory entry with no payload. RAO writers emit these for empty dirs.
@@ -175,6 +195,7 @@ impl RemTarEntryType {
     pub fn manifest_value(self) -> Option<&'static str> {
         match self {
             Self::Regular => None,
+            Self::Hardlink => Some("hardlink"),
             Self::Symlink => Some("symlink"),
             Self::Directory => Some("directory"),
         }
@@ -229,7 +250,7 @@ pub struct RemTarFileLayout {
     pub size_bytes: u64,
     /// SHA-256 of the exact file payload bytes. Absent for non-regular entries.
     pub file_sha256: Option<[u8; 32]>,
-    /// Symlink target. Present only for symbolic-link entries.
+    /// Link target. Present only for symbolic-link and hardlink entries.
     pub link_target: Option<String>,
     /// Optional executable flag recorded in Remanence pax metadata.
     pub executable: Option<bool>,

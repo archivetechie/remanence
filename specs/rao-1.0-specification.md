@@ -263,10 +263,10 @@ wrap silently (Section 11).
 | `USTAR_SIZE_MAX` | 0o77777777777 (8 GiB − 1) | Largest size representable in the ustar size field |
 | `PAX_PATH_PLACEHOLDER` | `remanence/pax-path` | ustar name placeholder for pax-backed paths (Section 4.3) |
 | `GLOBAL_HEADER_NAME` | `GlobalHead.0/PaxHeaders/remanence` | ustar name of the global pax header |
-| `PAX_HEADER_NAME` | `PaxHeaders.0/remanence_file` | ustar name of payload-file pax headers |
+| `PAX_HEADER_NAME` | `PaxHeaders.0/remanence_file` | ustar name of member-entry pax headers |
 | `MANIFEST_PAX_HEADER_NAME` | `PaxHeaders.0/_remanence_manifest` | ustar name of the manifest's pax header |
 | `MANIFEST_SCHEMA_VERSION` | 1 | Manifest CBOR `schema_version` integer (Section 4.7) |
-| `MAX_FILE_ENTRIES` | 10000000 | Maximum payload entries per object (Section 4.7) |
+| `MAX_FILE_ENTRIES` | 10000000 | Maximum member entries per object (Section 4.7) |
 | `MANIFEST_MAX_DEPTH` | 8 | Maximum manifest CBOR nesting depth (Section 4.7) |
 | `RAO_MAGIC` | `RAO1` (`0x52 0x41 0x4F 0x31`) | Envelope magic |
 | `RAO_HEADER_LEN` | 128 | Envelope plaintext header length in bytes |
@@ -381,7 +381,7 @@ frame boundary falls on a 512-byte record boundary:
 +--------------------------------------------------+
 | ...                                              |
 +--------------------------------------------------+
-| Entry N-1 (last payload entry)                   |
+| Entry N-1 (last member entry)                    |
 +--------------------------------------------------+
 | Manifest entry ('x' + '0' + CBOR data)           |  Section 4.7
 +--------------------------------------------------+
@@ -391,8 +391,8 @@ frame boundary falls on a 512-byte record boundary:
 +--------------------------------------------------+
 ```
 
-The manifest entry MUST be the final entry before tar EOF. Payload entries
-appear in caller-supplied order. An object with zero payload files is valid:
+The manifest entry MUST be the final entry before tar EOF. Member entries
+appear in caller-supplied order. An object with zero member entries is valid:
 it contains the global header, the manifest entry, and the EOF sequence.
 
 ### 4.2. Body Blocks and `chunk_size`
@@ -662,7 +662,7 @@ entry's pax header carries:
 | `REMANENCE.executable` | OPTIONAL | `true` or `false` |
 | `REMANENCE.file_id` | REQUIRED | Non-empty opaque UTF-8 stable identifier, unique within the object |
 | `REMANENCE.file_sha256` | Regular entries only | Exactly 64 lowercase hex digits: SHA-256 of the exact payload bytes |
-| `REMANENCE.is_manifest` | Manifest entry only | MUST be `true`; MUST be absent on payload entries |
+| `REMANENCE.is_manifest` | Manifest entry only | MUST be `true`; MUST be absent on member entries |
 | `REMANENCE.pad` | As needed | Alignment filler (Section 4.6.3); value MUST consist solely of ASCII spaces |
 
 Readers MUST verify `REMANENCE.compression` is present and equals `none` on
@@ -753,7 +753,7 @@ coordinates are its primary's, reached through `link_target` (Section 4.7.2).
 
 #### 4.6.6. Path and Identity Rules
 
-For every payload entry, writers MUST enforce:
+For every member entry, writers MUST enforce:
 
 1. `path` is non-empty UTF-8, contains no NUL and no byte < 0x20.
 2. `path` is a **canonical relative path**: it does not begin with `/`, does
@@ -838,7 +838,7 @@ appear; decoders MUST reject them with `Cbor`.
 
 Canonical form MUST be validated over the original encoded bytes, not by
 decode-and-re-encode. **Structural limits**: an object MUST NOT contain more
-than `MAX_FILE_ENTRIES` (10,000,000) payload entries; manifest nesting depth
+than `MAX_FILE_ENTRIES` (10,000,000) member entries; manifest nesting depth
 MUST NOT exceed `MANIFEST_MAX_DEPTH` (8), counting the top-level map as
 depth 1. Decoders MUST enforce both incrementally and MUST bound allocations
 by the manifest's declared size, never by counts read from the CBOR stream.
@@ -950,9 +950,9 @@ alone (path, file_id, size, hash, optional mtime/executable), without payload
 bytes; Planner and Writer MUST share the same sizing rules such that the
 planned layout is byte-exact. The writer's workflow: validate options
 (`chunk_size`; non-empty `object_id`, `caller_object_id`, `write_timestamp`,
-`manifest_file_id`); validate every payload spec (Section 4.6.6); plan the
+`manifest_file_id`); validate every member spec (Section 4.6.6); plan the
 layout (which serializes the manifest and computes `manifest_sha256`); emit
-the global header, each payload entry, and the manifest entry, streaming
+the global header, each member entry, and the manifest entry, streaming
 payload bytes through the running SHA-256 check of Section 4.6.5; emit tar EOF
 and the final zero fill; verify the emitted block count equals the plan;
 report the layout (`projected_size_blocks`, per-file `first_chunk_lba`,
@@ -1773,7 +1773,7 @@ A Verifier validates one stored copy end to end without extracting it:
 
 - **Plaintext copy**: the full restore-mode read of Section 4.9 with every
   regular entry's digest checked, manifest anchor-digest and schema validation
-  (Section 4.7.2), manifest-vs-archive correspondence (every payload entry
+  (Section 4.7.2), manifest-vs-archive correspondence (every member entry
   appears in `file_entries` with matching `path` and `entry_type`; **regular
   entries** match `size_bytes`, `file_sha256`, `first_chunk_lba`, and
   `chunk_count`; **hardlink entries** match `link_target`, carry zero/`null`
@@ -1925,7 +1925,7 @@ together:
 A future plaintext-stream break and a future envelope break each produce RAO
 version 2; this document's successor would then specify the new pair.
 
-Native symbolic links and empty directories are included in version 1 as a
+Native symbolic links, hardlinks, and empty directories are included in version 1 as a
 pre-freeze scope expansion: no RAO 1.0 implementation had been published or
 deployed when they were added. After freeze, adding new entry kinds with
 payload semantics or changing zero-payload alignment requires a new

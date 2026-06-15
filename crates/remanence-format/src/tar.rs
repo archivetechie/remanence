@@ -5,6 +5,8 @@ use crate::model::TAR_RECORD_SIZE;
 
 /// Tar typeflag for a regular file.
 pub const TYPE_REGULAR: u8 = b'0';
+/// Tar typeflag for a hardlink.
+pub const TYPE_HARDLINK: u8 = b'1';
 /// Tar typeflag for a symbolic link.
 pub const TYPE_SYMLINK: u8 = b'2';
 /// Tar typeflag for a directory.
@@ -102,6 +104,25 @@ pub fn encode_pax_backed_symlink_header(
         target
     };
     encode_header_with_link(header_path, 0, TYPE_SYMLINK, 0o777, linkname)
+}
+
+/// Encode a pax-backed hardlink header.
+pub fn encode_pax_backed_hardlink_header(
+    path: &str,
+    target: &str,
+    target_in_pax: bool,
+) -> Result<[u8; 512], FormatError> {
+    let header_path = if is_portable_ustar_name(path) {
+        path
+    } else {
+        PAX_BACKED_PATH_PLACEHOLDER
+    };
+    let linkname = if target_in_pax {
+        PAX_BACKED_LINK_PLACEHOLDER
+    } else {
+        target
+    };
+    encode_header_with_link(header_path, 0, TYPE_HARDLINK, 0o644, linkname)
 }
 
 /// Encode a pax-backed directory header.
