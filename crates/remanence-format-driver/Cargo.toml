@@ -1,6 +1,6 @@
 [package]
-name        = "remanence-bru"
-description = "Read-only BRU/BRU-PE legacy format driver for Remanence."
+name        = "remanence-format-driver"
+description = "Published format-driver boundary for Remanence native and foreign archive formats."
 version     .workspace = true
 edition     .workspace = true
 rust-version.workspace = true
@@ -9,8 +9,10 @@ license     .workspace = true
 repository  .workspace = true
 
 [dependencies]
-remanence-format-driver = { path = "../remanence-format-driver" }
+remanence-aead    = { path = "../remanence-aead" }
 remanence-library = { path = "../remanence-library" }
+
+thiserror = { workspace = true }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
