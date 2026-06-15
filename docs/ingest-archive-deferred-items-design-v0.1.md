@@ -9,8 +9,9 @@ than a corrective patch. Implementation hands to codex once an item is marked
 
 | # | Item | Status |
 | --- | --- | --- |
-| 1 | Non-UTF-8 member-name encoding in `.remwrap.idx` (+ customer manifest + restore request) | **Resolved** (below) |
-| 2 | Cheap classification-only `--scan-only` | discussing |
+| 1 | Non-UTF-8 member-name encoding in `.remwrap.idx` (+ customer manifest + restore request) | **Resolved** |
+| 2 | Cheap classification-only `--scan-only` | **Resolved** |
+| 2b | xattr handling policy (pulled RAO 1.1 forward) | **Resolved** (own doc) |
 | 3 | `rem restore` naming / alias | pending |
 | 4 | Cross-tree hardlink policy edge | pending |
 
@@ -128,9 +129,85 @@ is finalized.
 
 ---
 
-## Item 2 — Cheap classification-only `--scan-only`
+## Item 2 — Cheap classification-only `--scan-only` (RESOLVED)
 
-*(discussing — to be filled in)*
+### Problem
+
+`--scan-only` calls the same `materialize_inputs` a real build calls, so the
+"dry run" actually: SHA-256-hashes **every** native file (full content reads),
+shells to bsdtar and **writes a `.tar`** for every blob and fallback wrap (then
+hashes each and builds its `.idx`), and holds one record per entry in RAM
+(`files` + `manifest_entries`). On a 1 TB messy tree that's hours of I/O and a
+pile of temp disk — a full build minus the object write, not a pre-flight.
+
+### Decision
+
+A **classification-only walk** for `--scan-only`: per entry run `decide`
+(ruleset) + `native_status` (metadata-level checks), update only the rollups
+(`dir_stats` for density, `clusters`, `totals`), and emit the report. **No
+content hashing, no tar creation, no `.idx`, no `files`/`manifest_entries`
+population.** Cost is one `stat` per entry (no content I/O); memory drops to
+O(number of directories).
+
+Two supporting requirements:
+
+1. **Shared classifier.** The per-entry classification (`decide` +
+   `native_status` → verdict) MUST be a single function both the scan and the
+   build call, so a dry run provably predicts the build. They diverge only in
+   the tail: scan records the verdict; build records *and* materializes (hash,
+   wrap, push).
+2. **xattr detection via the `xattr` syscall crate**, not a `getfattr`
+   subprocess per file (a million forks would dominate the scan). This also
+   removes the external `attr` dependency and supersedes the H4 "fail loudly if
+   getfattr missing" guard — there's no external tool left to be missing. See
+   the xattr policy section and the 1.1 doc.
+
+### Implementation pointers (rem)
+
+- `crates/remanence-cli/src/archive_ingest.rs`: split the walk so
+  `process_leaf`/`process_dir` compute the classification once via a shared
+  function; `materialize_inputs` keeps the materializing tail, a new
+  `scan_inputs` (used by `scan_only_report`) keeps only the recording tail.
+- Replace `has_xattrs`' `getfattr` shell-out with `xattr::list()`.
+
+## xattr handling policy (RESOLVED — pulls RAO 1.1 forward)
+
+xattrs no longer force a wrap. The model:
+
+- **Junk denylist** (`com.apple.quarantine`, `…WhereFroms`,
+  `…lastuseddate#PS`, Spotlight/FinderInfo noise — tunable) → dropped
+  silently, never affects classification. These are the inadvertent ones macOS
+  sprinkles (Gatekeeper etc.); treating them as significant would mass-wrap or
+  spuriously halt `expect=compliant` bundles.
+- **Meaningful xattrs** (everything not denylisted — e.g. Finder color tags
+  `com.apple.metadata:_kMDItemUserTags`) → **preserved on a clean native entry
+  via the RAO 1.1 `metadata_preservation_data` annotation** when small, or via
+  a **wrap** when large (> threshold; the resource fork is the only routinely
+  large case and is near-absent in modern media). Detection via the `xattr`
+  syscall crate.
+
+This pulls **RAO 1.1 forward** (1.0 isn't frozen; the manifest already
+reserves the container; 1.0 readers already tolerate it; doing it now exercises
+the additive 1.x mechanism for real before freeze). Full design:
+**`rao-1.1-metadata-preservation-design-v0.1.md`**.
+
+**AppleDouble (`._` sidecars):** rem does **not** transcode `._` ↔ xattr — it
+stays a faithful byte engine (a `._foo` arriving as a file is archived as a
+file and restored as a file; macOS re-merges sidecars on its own end). The
+*optional* normalization — merging `._` sidecars into native xattrs so the
+annotation captures them uniformly regardless of transport — belongs in
+**sutradhara** as a recorded, opt-in, staging-time transform on the staged
+copy (before `rem archive build`). Because rem only ever sees native xattrs,
+its contract is unchanged whether they arrived natively or via sutradhara's
+merge. Cross-repo: specify in the sutradhara design (tooling: Netatalk-style
+AppleDouble handling on Linux; `dot_clean` is macOS-only). Caveat: merging a
+big resource fork makes a big xattr → the file then wraps (lossless); and an
+`exclude **/._*` rule must never run on un-merged Case-B data or it silently
+drops the metadata.
+
+**Open sub-decision (small):** denylist (preserve every non-junk xattr) vs.
+allowlist (keep only known-meaningful, e.g. color tags, drop the rest). Lean
+**denylist** — the don't-lose-data ethic — with the drop list tunable.
 
 ## Item 3 — `rem restore` naming / alias
 
