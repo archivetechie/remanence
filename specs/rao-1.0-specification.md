@@ -903,7 +903,8 @@ bootstrap/catalog anchor (manifest location + manifest_sha256; plaintext copies 
 manifest.cbor  ── byte-verified by manifest_sha256
         │
         ▼
-per-entry  type, target, file_sha256, size_bytes, first_chunk_lba, chunk_count
+per-entry  type, path, target; regular entries add file_sha256, size_bytes,
+           first_chunk_lba, chunk_count (a hardlink resolves via target to its primary)
         │
         ▼
 regular payload bytes ── byte-verified by file_sha256
@@ -1608,6 +1609,13 @@ per copy. PFR indexes MUST treat plaintext offsets (inner `BodyLba`, file byte
 ranges) as the source of truth and MUST NOT make ciphertext offsets canonical;
 stored offsets are derived, reproducible from this section.
 
+**Hardlinks.** A hardlink entry has `size_bytes = 0` and `first_chunk_lba`
+`null` (Section 4.7.2); it stores none of its own content. PFR on a hardlinked
+name MUST first resolve its `link_target` to the primary entry and then use the
+**primary's** `first_chunk_lba` and `size_bytes` for all arithmetic below. A
+PFR implementation MUST NOT treat a hardlinked name as an empty or invalid
+range. (Symlinks and directories carry no payload and are not PFR targets.)
+
 ### 6.1. Range Validation
 
 Given a file with size `Z` and a requested range `[s, s + n)`: if `n = 0` the
@@ -1699,7 +1707,8 @@ canonical plaintext object ── byte-verified by plaintext_digest
 manifest.cbor ── byte-verified by manifest_sha256
         │
         ▼
-per-file  file_sha256, size_bytes, first_chunk_lba, chunk_count
+per-file  file_sha256, size_bytes, first_chunk_lba, chunk_count (regular entries;
+          a hardlink resolves via link_target to its primary's fields)
         │
         ▼
 payload bytes ── byte-verified by file_sha256
@@ -1751,11 +1760,15 @@ it.
 A Verifier validates one stored copy end to end without extracting it:
 
 - **Plaintext copy**: the full restore-mode read of Section 4.9 with every
-  entry digest checked, manifest anchor-digest and schema validation
+  regular entry's digest checked, manifest anchor-digest and schema validation
   (Section 4.7.2), manifest-vs-archive correspondence (every payload entry
-  appears in `file_entries` with matching `path`, `size_bytes`, `file_sha256`,
-  `first_chunk_lba`, and `chunk_count`, and `file_entries` lists nothing
-  absent from the archive), final-fill zero check (Section 4.8), and
+  appears in `file_entries` with matching `path` and `entry_type`; **regular
+  entries** match `size_bytes`, `file_sha256`, `first_chunk_lba`, and
+  `chunk_count`; **hardlink entries** match `link_target`, carry zero/`null`
+  content fields and no `file_sha256`, and resolve to a valid regular-file
+  primary (Section 4.6); **symlink/directory entries** carry zero/`null`
+  content fields; and `file_entries` lists nothing absent from the archive),
+  final-fill zero check (Section 4.8), and
   report-all-nonconformities (not first-error-only), plus a `stored_digest`
   comparison against the catalog value when available.
 - **Encrypted copy (keyed)**: Section 5.9 in full (header, metadata, salt
