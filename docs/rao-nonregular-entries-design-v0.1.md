@@ -176,8 +176,9 @@ plus `entry_type`/`link_target` where applicable."
 
 ## 10. Change checklist — `specs/rao-1.0-specification.md`
 
-- §1.5 — drop "regular files only"; state symlinks + directories are encoded;
-  hardlinks remain reserved.
+- §1.5 — drop "regular files only"; state symlinks + directories are encoded.
+  (Superseded 2026-06-15: hardlinks are now native too, not reserved — see
+  `rao-hardlinks-design-v0.1.md`.)
 - §2.3 — extend the "Entry" definition.
 - §4.3.4 — add typeflags `2`, `5`.
 - §4.4.4 — add the `linkpath` standard keyword.

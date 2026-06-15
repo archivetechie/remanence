@@ -26,9 +26,12 @@ top — none of it changes the RAO/REM-PARITY wire formats.
    earlier dir/blob pattern). Put the engine in a higher crate; **the RAO format
    crate stays oblivious** to rulesets.
 2. **Wrapping (§A3–A4).** `blob <dir>` → one `<path>.remwrap.tar` entry; a
-   granular file that can't be a native entry (non-UTF-8 / device node / hardlink
-   / xattr) → a one-member `.remwrap.tar` (`wrap-unit=file` default; `dir` per
-   ruleset; hardlink pairs force `dir`). Writer = a **pinned mainstream tar
+   granular file that can't be a native entry (non-UTF-8 / device node) → a
+   one-member `.remwrap.tar` (`wrap-unit=file` default; `dir` per ruleset).
+   **Superseded (2026-06-15): hardlinks are now native RAO 1.0 entries
+   (typeflag 1) and xattrs are preserved via RAO 1.1 — neither is a wrap
+   trigger. See `rao-hardlinks-design-v0.1.md` and
+   `ingest-layer-implementation-design-v0.1.md`.** Writer = a **pinned mainstream tar
    engine** (GNU tar or bsdtar/libarchive — shelled-out or FFI-linked), **never a
    bespoke Rust pax codec**. **Gating deliverable:** the §A3.5 round-trip test —
    the chosen invocation MUST byte/metadata-round-trip a non-UTF-8 name, an

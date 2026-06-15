@@ -217,8 +217,9 @@ A single implementation may fill several roles.
   representations of that object.
 - **Record**: a 512-byte tar record. All tar structures are sequences of
   records.
-- **Entry**: one pax extended header + one regular-file ustar header +
-  payload + record padding, describing one file (Section 4.6).
+- **Entry**: one pax extended header + one ustar header (typeflag `0`, `1`,
+  `2`, or `5`) + record padding, describing one member; only a regular entry
+  (`0`) has a payload (Section 4.6).
 - **Inner `BodyLba`**: zero-based index of a body block *within the canonical
   plaintext object*. This is the address space of the manifest and of all
   catalog per-file rows, and it is identical across both representations of
@@ -376,11 +377,11 @@ frame boundary falls on a 512-byte record boundary:
 +--------------------------------------------------+
 | Global pax header (typeflag 'g')                 |  Section 4.5
 +--------------------------------------------------+
-| Entry 0:  pax header ('x') + ustar ('0') + data  |  Section 4.6
+| Entry 0:  pax header ('x') + ustar ('0'/'1'/'2'/'5') [+ data for '0']  |  Section 4.6
 +--------------------------------------------------+
 | ...                                              |
 +--------------------------------------------------+
-| Entry N-1 (last payload file)                    |
+| Entry N-1 (last payload entry)                   |
 +--------------------------------------------------+
 | Manifest entry ('x' + '0' + CBOR data)           |  Section 4.7
 +--------------------------------------------------+
@@ -686,8 +687,8 @@ header) satisfies
 D ≡ 0   (mod chunk_size)
 ```
 
-Zero-payload entries — empty regular files, symbolic links, and directories —
-are exempt and use plain 512-byte tar-record alignment. Readers MUST reject
+Zero-payload entries — empty regular files, hardlinks, symbolic links, and
+directories — are exempt and use plain 512-byte tar-record alignment. Readers MUST reject
 an entry whose effective size is greater than zero and whose payload offset is
 not chunk-aligned with `ChunkAlignmentViolation`.
 
@@ -996,8 +997,10 @@ Procedure:
    compute SHA-256 over the delivered payload bytes while streaming and
    compare against `REMANENCE.file_sha256`; on mismatch, fail the entry with
    `FileDigestMismatch` before reporting it restored (in salvage mode:
-   deliver, but report the mismatch). Symlink and directory metadata is
-   verified through the manifest/object digest chain, not a payload hash.
+   deliver, but report the mismatch). Hardlink, symlink, and directory entries
+   have no payload hash of their own; they are verified through the
+   manifest/object digest chain (and, for a hardlink, its referential
+   integrity — Section 4.6).
    Partial-range reads cannot verify a whole-file hash; their integrity comes
    from the parity layer's block CRCs, and range-read implementations MUST say
    so rather than imply hash-verified content.
@@ -1020,8 +1023,8 @@ mt -f /dev/nst0 fsf <n>                 # position to the object's tape file
 tar -b <chunk_size/512> -xf /dev/nst0   # e.g. -b 512 for 256 KiB blocks
 ```
 
-extracts every payload file byte-correct, recreates symlinks and directories,
-and also writes one extra file `_remanence/manifest.cbor`. Unknown
+extracts every payload file byte-correct, recreates hardlinks, symlinks, and
+directories, and also writes one extra file `_remanence/manifest.cbor`. Unknown
 `REMANENCE.*` keywords are ignored by POSIX rule; `REMANENCE.pad` inflates
 only header size, never content; the manifest decodes with any generic CBOR
 tool into self-describingly-named text fields. Stock tar faithfully restores
@@ -1616,6 +1619,13 @@ name MUST first resolve its `link_target` to the primary entry and then use the
 PFR implementation MUST NOT treat a hardlinked name as an empty or invalid
 range. (Symlinks and directories carry no payload and are not PFR targets.)
 
+A **catalog-backed** PFR index (per-file rows, not the full manifest) MUST
+preserve the ability to resolve a hardlink: a hardlink's row MUST carry
+`entry_type` + `link_target` (resolve at restore time), **or** a denormalized
+pointer to the primary's `first_chunk_lba`/`size_bytes`. A catalog that stores
+only the literal `first_chunk_lba`/`size_bytes` of a hardlink row (`null`/`0`)
+cannot restore it and is nonconformant.
+
 ### 6.1. Range Validation
 
 Given a file with size `Z` and a requested range `[s, s + n)`: if `n = 0` the
@@ -1747,8 +1757,9 @@ writer — the chain costs hash arithmetic, never an additional read pass:
 
 After each copy is written, and before that copy is recorded durable, the
 deployment MUST re-read the copy via the object read path and re-verify it —
-for a full verification, every member `file_sha256` (which transitively
-exercises the envelope on encrypted copies); at minimum, the copy's
+for a full verification, every **regular** member's `file_sha256` plus the
+Section 7.4 non-regular correspondence and hardlink referential checks (which
+transitively exercise the envelope on encrypted copies); at minimum, the copy's
 `stored_digest`. This is a media/transmission guard, deliberately distinct
 from the Section 7.2 build checks: it is the one intentional extra read in the
 pipeline, and it is a *deployment* (workflow) obligation rather than a property

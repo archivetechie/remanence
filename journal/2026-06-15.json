@@ -119,5 +119,16 @@
     "handoff_to": null,
     "round": 4,
     "summary": "GPT round-3 found six residual spots where the spec/docs still assumed every entry has direct content fields (consequences of the option-B hardlink model I'd only propagated to the manifest/reader). All real; all fixed. #1 (HIGH): RAO 1.0 §6 PFR now has an explicit Hardlinks rule — a hardlinked name resolves link_target to the primary and uses the PRIMARY's first_chunk_lba/size_bytes; MUST NOT treat it as empty/invalid. #2 (MED): §7.4 verifier profile now distinguishes regular entries (match size_bytes/file_sha256/first_chunk_lba/chunk_count) from hardlinks (match link_target, zero/null content fields, valid primary) and symlink/dir (zero/null). #3 (MED): rao-hardlinks-design §5 reader/restore + verifier lines de-coord-carried (was 'target + shared content coordinates' / 'link's shared file_sha256'). #4 (MED): rao-1.1-metadata-preservation design doc xattr-name line aligned to the spec (non-UTF-8 names out of scope, not item-1 escaping). #5 (LOW): INDEX deferred-items row updated pending→current/all-resolved. #6 (LOW): both chain-of-trust diagrams (§4.7.3, §7.1) qualified — content fields are direct for regular entries; a hardlink resolves via link_target to its primary. Final grep clean. The option-B model is now consistent across the entire spec (manifest, reader, PFR, verifier, diagrams, vectors, errors) and all design docs."
+  },
+  {
+    "uuid": "26a82809-ac01-4993-907d-b6f84226dac1",
+    "datetime": "2026-06-15T12:08:57+02:00",
+    "author": "claude",
+    "subject": "GPT round-4: propagated hardlink model into the last prose spots (catalog PFR, §7.3, frame/glossary, alignment/hash/tar-extract prose) + superseded stale prompt/checklist",
+    "idref": null,
+    "status": "complete",
+    "handoff_to": null,
+    "round": 5,
+    "summary": "GPT round-4 (six findings, all real residual prose). Fixed: #1 §6 now requires a catalog-backed PFR index to carry entry_type+link_target OR a denormalized primary pointer for hardlinks (a catalog storing only the literal null/0 row is nonconformant). #2 §7.3 post-write re-verification now says 'every REGULAR member's file_sha256 plus the §7.4 non-regular/referential checks' (was 'every member file_sha256'). #4 §2.3 Entry glossary def + §4.1 frame diagram generalized to typeflags 0/1/2/5 with payload only for '0'. #5 three nearby-prose omissions: §4.6.3 zero-payload-alignment list now includes hardlinks; §4.9 restore-integrity prose now 'hardlink, symlink, directory have no payload hash'; §4.10 stock-tar 'recreates hardlinks, symlinks, and directories'. #3 the active ingest prompt (prompt-rao-archive-rem) wrapping clause superseded inline (hardlinks native typeflag 1, xattrs via 1.1 — neither a wrap trigger) + INDEX row notes the supersession. #6 nonregular-entries checklist line 'hardlinks remain reserved' superseded. Final grep clean. Hardlink option-B model now consistent across EVERY location in the spec + all docs/prompts. (This is round 5 of hardlink-model propagation; the model is now fully settled.)"
   }
 ]
