@@ -28,7 +28,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libarchive-tools
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libarchive-tools attr
 
       - name: Install Python verifier dependencies
         run: python3 -m pip install cryptography

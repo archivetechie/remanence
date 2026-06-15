@@ -11,6 +11,7 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -20,6 +21,8 @@ use std::os::unix::fs::MetadataExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 use crate::{
     archive_path_from_relative, bytes_to_hex, path_component_to_string,
@@ -137,6 +140,7 @@ pub(crate) struct CustomerManifestEntry {
     pub(crate) kind: &'static str,
     pub(crate) size_bytes: u64,
     pub(crate) sha256: Option<String>,
+    pub(crate) mtime: Option<String>,
     pub(crate) wrapper: Option<String>,
 }
 
@@ -234,6 +238,7 @@ struct WrapIndexEntry {
     offset: u64,
     length: u64,
     sha256: Option<String>,
+    mtime: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -469,7 +474,14 @@ fn process_input(
         )
     } else {
         let relative = PathBuf::from(input.file_name().unwrap_or_else(|| OsStr::new("input")));
-        wrap_leaf(input, &relative, "unsupported-file-type", context, state)
+        wrap_leaf(
+            input,
+            &relative,
+            &metadata,
+            "unsupported-file-type",
+            context,
+            state,
+        )
     }
 }
 
@@ -485,8 +497,8 @@ fn process_dir(
         Decision::Exclude => {
             let (count, bytes) = subtree_count_bytes(dir)?;
             state.record_cluster(&rel_text, "exclude-rule", count, bytes);
-            state.totals.excluded_entries += count;
-            state.totals.excluded_bytes += bytes;
+            state.totals.excluded_entries = state.totals.excluded_entries.saturating_add(count);
+            state.totals.excluded_bytes = state.totals.excluded_bytes.saturating_add(bytes);
             return Ok(true);
         }
         Decision::Blob {
@@ -536,7 +548,7 @@ fn process_dir(
         }
         return Ok(true);
     }
-    if !relative.as_os_str().is_empty() && has_xattrs(dir) {
+    if !relative.as_os_str().is_empty() && has_xattrs(dir)? {
         materialize_blob(root, dir, relative, context, "xattr", state)?;
         return Ok(true);
     }
@@ -553,11 +565,14 @@ fn process_dir(
             state
                 .files
                 .push(read_archive_build_directory(dir, archive_path)?);
+            let metadata = fs::symlink_metadata(dir)
+                .map_err(|error| format!("stat input {}: {error}", dir.display()))?;
             state.manifest_entries.push(CustomerManifestEntry {
                 path: rel_text,
                 kind: "directory",
                 size_bytes: 0,
                 sha256: None,
+                mtime: metadata_mtime(dir, &metadata)?,
                 wrapper: None,
             });
             return Ok(true);
@@ -602,8 +617,8 @@ fn process_leaf(
         Decision::Exclude => {
             let bytes = metadata.len();
             state.record_cluster(&rel_text, "exclude-rule", 1, bytes);
-            state.totals.excluded_entries += 1;
-            state.totals.excluded_bytes += bytes;
+            state.totals.excluded_entries = state.totals.excluded_entries.saturating_add(1);
+            state.totals.excluded_bytes = state.totals.excluded_bytes.saturating_add(bytes);
             return Ok(());
         }
         Decision::Blob { .. } => {
@@ -614,7 +629,7 @@ fn process_leaf(
         Decision::Granular => {}
     }
 
-    match native_status(path, relative, metadata) {
+    match native_status(path, relative, metadata)? {
         NativeStatus::Native if metadata.file_type().is_symlink() => {
             state.record_native(&rel_text, 0);
             state
@@ -625,6 +640,7 @@ fn process_leaf(
                 kind: "symlink",
                 size_bytes: 0,
                 sha256: None,
+                mtime: metadata_mtime(path, metadata)?,
                 wrapper: None,
             });
         }
@@ -639,6 +655,7 @@ fn process_leaf(
                 kind: "regular",
                 size_bytes: size,
                 sha256: Some(bytes_to_hex(&hash)),
+                mtime: metadata_mtime(path, metadata)?,
                 wrapper: None,
             });
         }
@@ -649,7 +666,7 @@ fn process_leaf(
             ))
         }
         NativeStatus::WrapFallback(reason) => {
-            wrap_leaf(path, relative, reason, context, state)?;
+            wrap_leaf(path, relative, metadata, reason, context, state)?;
         }
     }
     Ok(())
@@ -658,6 +675,7 @@ fn process_leaf(
 fn wrap_leaf(
     path: &Path,
     relative: &Path,
+    metadata: &fs::Metadata,
     reason: &'static str,
     context: ProcessContext<'_>,
     state: &mut PlannerState,
@@ -688,6 +706,7 @@ fn wrap_leaf(
         kind: "wrapped",
         size_bytes: size,
         sha256: Some(bytes_to_hex(&hash)),
+        mtime: metadata_mtime(path, metadata)?,
         wrapper: Some(wrapper_archive_path),
     });
     Ok(())
@@ -709,15 +728,18 @@ fn materialize_blob(
     );
     let tar_path = next_temp_path(context.tempdir, &mut state.wrapper_counter, "blob.tar");
     create_wrapper_tar(context.tar_engine, root, relative.as_os_str(), &tar_path)?;
+    let source_metadata = fs::symlink_metadata(dir)
+        .map_err(|error| format!("stat input {}: {error}", dir.display()))?;
+    let source_mtime = metadata_mtime(dir, &source_metadata)?;
     add_blob_outputs(
         &rel_text,
         &wrapper_archive_path,
         &tar_path,
+        source_mtime,
         context,
         reason,
         state,
     )?;
-    let _ = dir;
     Ok(())
 }
 
@@ -737,10 +759,14 @@ fn materialize_root_blob(
         name,
         &tar_path,
     )?;
+    let source_metadata = fs::symlink_metadata(dir)
+        .map_err(|error| format!("stat input {}: {error}", dir.display()))?;
+    let source_mtime = metadata_mtime(dir, &source_metadata)?;
     add_blob_outputs(
         &rel_text,
         &wrapper_archive_path,
         &tar_path,
+        source_mtime,
         context,
         reason,
         state,
@@ -751,6 +777,7 @@ fn add_blob_outputs(
     rel_text: &str,
     wrapper_archive_path: &str,
     tar_path: &Path,
+    source_mtime: Option<String>,
     context: ProcessContext<'_>,
     reason: &'static str,
     state: &mut PlannerState,
@@ -767,6 +794,7 @@ fn add_blob_outputs(
         kind: "blob",
         size_bytes: tar_size,
         sha256: Some(bytes_to_hex(&tar_hash)),
+        mtime: source_mtime,
         wrapper: Some(wrapper_archive_path.to_string()),
     });
     for entry in &index.entries {
@@ -775,6 +803,7 @@ fn add_blob_outputs(
             kind: manifest_kind(entry.kind.as_str()),
             size_bytes: entry.length,
             sha256: entry.sha256.clone(),
+            mtime: entry.mtime.clone(),
             wrapper: Some(wrapper_archive_path.to_string()),
         });
     }
@@ -1126,11 +1155,15 @@ fn match_class(pattern: &[u8], text: &[u8], pi: usize, ti: usize) -> Option<(usi
     }
 }
 
-fn native_status(path: &Path, relative: &Path, metadata: &fs::Metadata) -> NativeStatus {
+fn native_status(
+    path: &Path,
+    relative: &Path,
+    metadata: &fs::Metadata,
+) -> Result<NativeStatus, String> {
     if archive_path_from_relative(relative).is_err() {
-        return NativeStatus::WrapFallback("non-utf8-path");
+        return Ok(NativeStatus::WrapFallback("non-utf8-path"));
     }
-    if metadata.file_type().is_symlink() {
+    let status = if metadata.file_type().is_symlink() {
         match fs::read_link(path)
             .ok()
             .and_then(|target| target.to_str().map(str::to_string))
@@ -1139,16 +1172,17 @@ fn native_status(path: &Path, relative: &Path, metadata: &fs::Metadata) -> Nativ
             None => NativeStatus::WrapFallback("non-utf8-symlink-target"),
         }
     } else if metadata.is_file() {
-        if has_xattrs(path) {
-            return NativeStatus::WrapFallback("xattr");
+        if has_xattrs(path)? {
+            NativeStatus::WrapFallback("xattr")
+        } else if has_multiple_hardlinks(metadata) {
+            NativeStatus::WrapFallback("hardlink")
+        } else {
+            NativeStatus::Native
         }
-        if has_multiple_hardlinks(metadata) {
-            return NativeStatus::WrapFallback("hardlink");
-        }
-        NativeStatus::Native
     } else {
         NativeStatus::WrapFallback("unsupported-file-type")
-    }
+    };
+    Ok(status)
 }
 
 #[cfg(unix)]
@@ -1247,16 +1281,30 @@ fn has_multiple_hardlinks(_metadata: &fs::Metadata) -> bool {
     false
 }
 
-fn has_xattrs(path: &Path) -> bool {
-    let Ok(output) = Command::new("getfattr")
+fn has_xattrs(path: &Path) -> Result<bool, String> {
+    if !command_available("getfattr") {
+        return Err(
+            "getfattr is required for xattr-aware RAO ingest; install the attr package".to_string(),
+        );
+    }
+    let output = Command::new("getfattr")
         .arg("--absolute-names")
         .arg("--dump")
+        .arg("-m")
+        .arg("-")
         .arg(path)
         .output()
-    else {
-        return false;
-    };
-    output.status.success() && output.stdout.windows(5).any(|bytes| bytes == b"user.")
+        .map_err(|error| format!("run getfattr for {}: {error}", path.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "getfattr failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| !line.starts_with('#') && line.contains('=')))
 }
 
 fn create_wrapper_tar(
@@ -1274,6 +1322,7 @@ fn create_wrapper_tar(
         .arg(output)
         .arg("-C")
         .arg(base_dir)
+        .arg("--")
         .arg(member)
         .output()
         .map_err(|error| format!("run {} to create wrapper: {error}", tar_engine.program))?;
@@ -1322,15 +1371,47 @@ fn extract_wrapper_tar(
     Ok(())
 }
 
-fn validate_wrap_tar_paths(wrapper: &Path, tar_engine: &TarEngineReport) -> Result<(), String> {
-    let index = build_wrap_index(wrapper, tar_engine)?;
-    for entry in index.entries {
-        validate_tar_member_path(&entry.path).map_err(|error| {
+fn validate_wrap_tar_paths(wrapper: &Path, _tar_engine: &TarEngineReport) -> Result<(), String> {
+    let mut file = File::open(wrapper)
+        .map_err(|error| format!("open wrapper {}: {error}", wrapper.display()))?;
+    let mut offset = 0u64;
+    let mut pending_pax = BTreeMap::<String, String>::new();
+    loop {
+        let mut header = [0u8; 512];
+        file.read_exact(&mut header)
+            .map_err(|error| format!("read wrapper header {}: {error}", wrapper.display()))?;
+        if header.iter().all(|byte| *byte == 0) {
+            break;
+        }
+        let size = parse_tar_size(&header)?;
+        let typeflag = header[156];
+        let data_offset = offset
+            .checked_add(512)
+            .ok_or_else(|| "tar data offset overflows".to_string())?;
+        if typeflag == b'x' {
+            let mut data = vec![0u8; usize::try_from(size).map_err(|_| "pax header too large")?];
+            file.read_exact(&mut data)
+                .map_err(|error| format!("read pax data {}: {error}", wrapper.display()))?;
+            pending_pax = parse_pax_records(&data)?;
+            skip_tar_padding(&mut file, size)?;
+            offset = next_tar_header_offset(data_offset, size)?;
+            continue;
+        }
+        let name = pending_pax
+            .get("path")
+            .cloned()
+            .unwrap_or_else(|| tar_header_path(&header));
+        validate_tar_member_path(&name).map_err(|error| {
             format!(
                 "wrapper {} has unsafe member path: {error}",
                 wrapper.display()
             )
         })?;
+        file.seek(SeekFrom::Start(data_offset))
+            .map_err(|error| format!("seek wrapper {}: {error}", wrapper.display()))?;
+        skip_tar_payload(&mut file, size)?;
+        offset = next_tar_header_offset(data_offset, size)?;
+        pending_pax.clear();
     }
     Ok(())
 }
@@ -1352,13 +1433,10 @@ fn validate_tar_member_path(path: &str) -> Result<(), String> {
 }
 
 fn detect_tar_engine() -> Result<TarEngineReport, String> {
-    let program = if command_available("bsdtar") {
-        "bsdtar"
-    } else if command_available("tar") {
-        "tar"
-    } else {
-        return Err("no supported tar engine found; need bsdtar or tar".to_string());
-    };
+    let program = "bsdtar";
+    if !command_available(program) {
+        return Err("bsdtar/libarchive is required for pinned .remwrap.tar fidelity".to_string());
+    }
     let version_output = Command::new(program)
         .arg("--version")
         .output()
@@ -1381,6 +1459,7 @@ fn detect_tar_engine() -> Result<TarEngineReport, String> {
             "<output>".to_string(),
             "-C".to_string(),
             "<base-dir>".to_string(),
+            "--".to_string(),
             "<member>".to_string(),
         ],
         extract_invocation: vec![
@@ -1419,19 +1498,23 @@ fn build_wrap_index(tar_path: &Path, tar_engine: &TarEngineReport) -> Result<Wra
         }
         let size = parse_tar_size(&header)?;
         let typeflag = header[156];
-        let data_offset = offset + 512;
+        let data_offset = offset
+            .checked_add(512)
+            .ok_or_else(|| "tar data offset overflows".to_string())?;
         if typeflag == b'x' {
             let mut data = vec![0u8; usize::try_from(size).map_err(|_| "pax header too large")?];
             file.read_exact(&mut data)
                 .map_err(|error| format!("read pax data {}: {error}", tar_path.display()))?;
-            pending_pax = parse_pax_records(&data);
+            pending_pax = parse_pax_records(&data)?;
             skip_tar_padding(&mut file, size)?;
             offset = next_tar_header_offset(data_offset, size)?;
             continue;
         }
         let name = pending_pax
-            .remove("path")
+            .get("path")
+            .cloned()
             .unwrap_or_else(|| tar_header_path(&header));
+        let mtime = tar_entry_mtime(&header, &pending_pax)?;
         let kind = match typeflag {
             b'0' | 0 => "regular",
             b'2' => "symlink",
@@ -1449,6 +1532,7 @@ fn build_wrap_index(tar_path: &Path, tar_engine: &TarEngineReport) -> Result<Wra
             offset: data_offset,
             length: if kind == "regular" { size } else { 0 },
             sha256,
+            mtime,
         });
         file.seek(SeekFrom::Start(data_offset))
             .map_err(|error| format!("seek wrapper {}: {error}", tar_path.display()))?;
@@ -1503,19 +1587,24 @@ fn parse_tar_size(header: &[u8; 512]) -> Result<u64, String> {
     u64::from_str_radix(text.trim(), 8).map_err(|error| format!("parse tar size {text:?}: {error}"))
 }
 
-fn parse_pax_records(data: &[u8]) -> BTreeMap<String, String> {
+fn parse_pax_records(data: &[u8]) -> Result<BTreeMap<String, String>, String> {
     let mut records = BTreeMap::new();
     let mut cursor = 0usize;
     while cursor < data.len() {
-        let Some(space) = data[cursor..].iter().position(|byte| *byte == b' ') else {
-            break;
-        };
+        let space = data[cursor..]
+            .iter()
+            .position(|byte| *byte == b' ')
+            .ok_or_else(|| "pax record is missing length separator".to_string())?;
         let len_text = String::from_utf8_lossy(&data[cursor..cursor + space]);
-        let Ok(len) = len_text.parse::<usize>() else {
-            break;
-        };
-        if len == 0 || cursor + len > data.len() {
-            break;
+        let len = len_text
+            .parse::<usize>()
+            .map_err(|error| format!("parse pax record length {len_text:?}: {error}"))?;
+        if len == 0
+            || len <= space + 1
+            || cursor + len > data.len()
+            || data[cursor + len - 1] != b'\n'
+        {
+            return Err("pax record length is invalid".to_string());
         }
         let record = &data[cursor + space + 1..cursor + len - 1];
         if let Some(eq) = record.iter().position(|byte| *byte == b'=') {
@@ -1525,7 +1614,7 @@ fn parse_pax_records(data: &[u8]) -> BTreeMap<String, String> {
         }
         cursor += len;
     }
-    records
+    Ok(records)
 }
 
 fn tar_header_path(header: &[u8; 512]) -> String {
@@ -1536,6 +1625,104 @@ fn tar_header_path(header: &[u8; 512]) -> String {
     } else {
         format!("{prefix}/{name}")
     }
+}
+
+fn tar_entry_mtime(
+    header: &[u8; 512],
+    pax_records: &BTreeMap<String, String>,
+) -> Result<Option<String>, String> {
+    if let Some(value) = pax_records.get("mtime") {
+        return unix_nanos_rfc3339(parse_pax_mtime_nanos(value)?).map(Some);
+    }
+    let Some(seconds) = parse_tar_octal_field(&header[136..148], "tar mtime")? else {
+        return Ok(None);
+    };
+    let nanos = i128::from(seconds)
+        .checked_mul(1_000_000_000)
+        .ok_or_else(|| "tar mtime overflows nanoseconds".to_string())?;
+    unix_nanos_rfc3339(nanos).map(Some)
+}
+
+fn parse_tar_octal_field(field: &[u8], label: &str) -> Result<Option<u64>, String> {
+    if field.first().is_some_and(|byte| byte & 0x80 != 0) {
+        return Ok(None);
+    }
+    let end = field
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(field.len());
+    let text = String::from_utf8_lossy(&field[..end]);
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    u64::from_str_radix(text, 8)
+        .map(Some)
+        .map_err(|error| format!("parse {label} {text:?}: {error}"))
+}
+
+fn parse_pax_mtime_nanos(value: &str) -> Result<i128, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("pax mtime is empty".to_string());
+    }
+    let (negative, magnitude) = value
+        .strip_prefix('-')
+        .map(|rest| (true, rest))
+        .unwrap_or((false, value));
+    let (whole, fraction) = magnitude.split_once('.').unwrap_or((magnitude, ""));
+    if whole.is_empty() && fraction.is_empty() {
+        return Err(format!("pax mtime {value:?} is invalid"));
+    }
+    if !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(format!("pax mtime {value:?} is invalid"));
+    }
+    let whole_seconds = if whole.is_empty() {
+        0
+    } else {
+        whole
+            .parse::<i128>()
+            .map_err(|error| format!("parse pax mtime seconds {whole:?}: {error}"))?
+    };
+    let whole_nanos = whole_seconds
+        .checked_mul(1_000_000_000)
+        .ok_or_else(|| format!("pax mtime {value:?} overflows nanoseconds"))?;
+    let mut fraction_nanos = 0i128;
+    let mut scale = 100_000_000i128;
+    for digit in fraction.bytes().take(9) {
+        fraction_nanos += i128::from(digit - b'0') * scale;
+        scale /= 10;
+    }
+    let total = whole_nanos
+        .checked_add(fraction_nanos)
+        .ok_or_else(|| format!("pax mtime {value:?} overflows nanoseconds"))?;
+    Ok(if negative { -total } else { total })
+}
+
+fn metadata_mtime(path: &Path, metadata: &fs::Metadata) -> Result<Option<String>, String> {
+    let modified = metadata
+        .modified()
+        .map_err(|error| format!("read mtime for {}: {error}", path.display()))?;
+    system_time_rfc3339(modified).map(Some)
+}
+
+fn system_time_rfc3339(value: SystemTime) -> Result<String, String> {
+    let nanos = match value.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i128::try_from(duration.as_nanos())
+            .map_err(|_| "mtime after epoch overflows nanoseconds".to_string())?,
+        Err(error) => -i128::try_from(error.duration().as_nanos())
+            .map_err(|_| "mtime before epoch overflows nanoseconds".to_string())?,
+    };
+    unix_nanos_rfc3339(nanos)
+}
+
+fn unix_nanos_rfc3339(nanos: i128) -> Result<String, String> {
+    OffsetDateTime::from_unix_timestamp_nanos(nanos)
+        .map_err(|error| format!("format mtime: {error}"))?
+        .format(&Rfc3339)
+        .map_err(|error| format!("format mtime: {error}"))
 }
 
 fn nul_trim(bytes: &[u8]) -> String {
@@ -1564,7 +1751,7 @@ fn hash_tar_range(file: &mut File, offset: u64, size: u64) -> Result<String, Str
 }
 
 fn skip_tar_payload(file: &mut File, size: u64) -> Result<(), String> {
-    let skip = round_up_512(size);
+    let skip = round_up_512(size)?;
     file.seek(SeekFrom::Current(
         i64::try_from(skip).map_err(|_| "tar payload too large to seek")?,
     ))
@@ -1573,7 +1760,7 @@ fn skip_tar_payload(file: &mut File, size: u64) -> Result<(), String> {
 }
 
 fn skip_tar_padding(file: &mut File, size: u64) -> Result<(), String> {
-    let padding = round_up_512(size)
+    let padding = round_up_512(size)?
         .checked_sub(size)
         .ok_or_else(|| "tar padding underflow".to_string())?;
     file.seek(SeekFrom::Current(
@@ -1585,12 +1772,15 @@ fn skip_tar_padding(file: &mut File, size: u64) -> Result<(), String> {
 
 fn next_tar_header_offset(data_offset: u64, size: u64) -> Result<u64, String> {
     data_offset
-        .checked_add(round_up_512(size))
+        .checked_add(round_up_512(size)?)
         .ok_or_else(|| "tar offset overflows".to_string())
 }
 
-fn round_up_512(value: u64) -> u64 {
-    value.div_ceil(512) * 512
+fn round_up_512(value: u64) -> Result<u64, String> {
+    value
+        .checked_add(511)
+        .map(|value| value / 512 * 512)
+        .ok_or_else(|| "tar size overflows while rounding to 512 bytes".to_string())
 }
 
 fn collect_remwrap_files(root: &Path, wrappers: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -1616,19 +1806,19 @@ fn collect_remwrap_files(root: &Path, wrappers: &mut Vec<PathBuf>) -> Result<(),
 
 impl PlannerState {
     fn record_native(&mut self, rel_text: &str, bytes: u64) {
-        self.totals.native_entries += 1;
+        self.totals.native_entries = self.totals.native_entries.saturating_add(1);
         self.record_dir_stats(rel_text, false);
         self.record_cluster(rel_text, "native", 1, bytes);
     }
 
     fn record_wrapped(&mut self, rel_text: &str, reason: &str, bytes: u64) {
-        self.totals.wrapped_entries += 1;
+        self.totals.wrapped_entries = self.totals.wrapped_entries.saturating_add(1);
         self.record_dir_stats(rel_text, true);
         self.record_cluster(rel_text, reason, 1, bytes);
     }
 
     fn record_blob(&mut self, rel_text: &str, bytes: u64, reason: &'static str) {
-        self.totals.blob_entries += 1;
+        self.totals.blob_entries = self.totals.blob_entries.saturating_add(1);
         self.record_dir_stats(rel_text, false);
         self.record_cluster(rel_text, reason, 1, bytes);
     }
@@ -1636,7 +1826,12 @@ impl PlannerState {
     fn record_dir_stats(&mut self, rel_text: &str, noncompliant: bool) {
         let mut current = String::new();
         self.bump_dir_stat(".", noncompliant);
-        for component in rel_text.split('/').filter(|part| !part.is_empty()) {
+        let mut components = rel_text
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        components.pop();
+        for component in components {
             if !current.is_empty() {
                 current.push('/');
             }
@@ -1647,9 +1842,9 @@ impl PlannerState {
 
     fn bump_dir_stat(&mut self, prefix: &str, noncompliant: bool) {
         let stats = self.dir_stats.entry(prefix.to_string()).or_default();
-        stats.total += 1;
+        stats.total = stats.total.saturating_add(1);
         if noncompliant {
-            stats.noncompliant += 1;
+            stats.noncompliant = stats.noncompliant.saturating_add(1);
         }
     }
 
@@ -1659,8 +1854,8 @@ impl PlannerState {
             .clusters
             .entry((prefix, reason.to_string()))
             .or_default();
-        cluster.count += count;
-        cluster.bytes += bytes;
+        cluster.count = cluster.count.saturating_add(count);
+        cluster.bytes = cluster.bytes.saturating_add(bytes);
         if cluster.samples.len() < DEFAULT_SAMPLES_PER_CLUSTER {
             cluster.samples.push(rel_text.to_string());
         }
@@ -1678,7 +1873,7 @@ impl PlannerState {
                 samples: cluster.samples.clone(),
             })
             .collect::<Vec<_>>();
-        let mut suggestions = self
+        let mut dense = self
             .dir_stats
             .iter()
             .filter_map(|(prefix, stats)| {
@@ -1686,15 +1881,7 @@ impl PlannerState {
                     return None;
                 }
                 let ratio = stats.noncompliant as f64 / stats.total as f64;
-                if stats.noncompliant >= tuning.sanity_ceiling {
-                    Some(BlobSuggestion {
-                        prefix: prefix.clone(),
-                        noncompliant: stats.noncompliant,
-                        total: stats.total,
-                        ratio,
-                        verdict: "sanity-ceiling",
-                    })
-                } else if ratio >= tuning.blob_ratio && stats.noncompliant >= tuning.blob_count {
+                if ratio >= tuning.blob_ratio && stats.noncompliant >= tuning.blob_count {
                     Some(BlobSuggestion {
                         prefix: prefix.clone(),
                         noncompliant: stats.noncompliant,
@@ -1707,19 +1894,115 @@ impl PlannerState {
                 }
             })
             .collect::<Vec<_>>();
-        suggestions.sort_by(|a, b| {
+        dense.sort_by(|a, b| {
             a.prefix
                 .matches('/')
                 .count()
                 .cmp(&b.prefix.matches('/').count())
                 .then_with(|| a.prefix.cmp(&b.prefix))
         });
+        let mut suggestions = Vec::new();
+        for candidate in dense {
+            if suggestions.iter().any(|accepted: &BlobSuggestion| {
+                prefix_contains(&accepted.prefix, &candidate.prefix)
+            }) {
+                continue;
+            }
+            if self.has_substantial_compliant_descendant(&candidate.prefix, tuning) {
+                continue;
+            }
+            suggestions.push(candidate);
+        }
+
+        let covered_noncompliant = suggestions
+            .iter()
+            .filter(|suggestion| suggestion.verdict == "blob-suggest")
+            .fold(0u64, |acc, suggestion| {
+                acc.saturating_add(suggestion.noncompliant)
+            });
+        let total_noncompliant = self
+            .dir_stats
+            .get(".")
+            .map(|stats| stats.noncompliant)
+            .unwrap_or_default();
+        let residual_noncompliant = total_noncompliant.saturating_sub(covered_noncompliant);
+        for cluster in &clusters {
+            if !is_noncompliant_reason(&cluster.reason)
+                || suggestions
+                    .iter()
+                    .any(|suggestion| prefix_contains(&suggestion.prefix, &cluster.prefix))
+            {
+                continue;
+            }
+            let Some(stats) = self.dir_stats.get(&cluster.prefix) else {
+                continue;
+            };
+            if stats.noncompliant == 0 {
+                continue;
+            }
+            let total = stats.total;
+            suggestions.push(BlobSuggestion {
+                prefix: cluster.prefix.clone(),
+                noncompliant: cluster.count,
+                total,
+                ratio: if total == 0 {
+                    0.0
+                } else {
+                    cluster.count as f64 / total as f64
+                },
+                verdict: "straggler",
+            });
+        }
+        if residual_noncompliant >= tuning.sanity_ceiling {
+            let total = self
+                .dir_stats
+                .get(".")
+                .map(|stats| stats.total)
+                .unwrap_or_default();
+            suggestions.push(BlobSuggestion {
+                prefix: ".".to_string(),
+                noncompliant: residual_noncompliant,
+                total,
+                ratio: if total == 0 {
+                    0.0
+                } else {
+                    residual_noncompliant as f64 / total as f64
+                },
+                verdict: "sanity-ceiling",
+            });
+        }
         ScanReport {
             totals: self.totals.clone(),
             clusters,
             blob_suggestions: suggestions,
         }
     }
+
+    fn has_substantial_compliant_descendant(&self, prefix: &str, tuning: ScanTuning) -> bool {
+        let threshold = substantial_compliant_threshold(tuning);
+        self.dir_stats.iter().any(|(child, stats)| {
+            child != prefix
+                && prefix_contains(prefix, child)
+                && stats.total.saturating_sub(stats.noncompliant) >= threshold
+                && (stats.noncompliant as f64 / stats.total.max(1) as f64) < tuning.blob_ratio
+        })
+    }
+}
+
+fn substantial_compliant_threshold(tuning: ScanTuning) -> u64 {
+    (tuning.blob_count / 2).max(1)
+}
+
+fn prefix_contains(parent: &str, child: &str) -> bool {
+    parent == "."
+        || parent == child
+        || child
+            .strip_prefix(parent)
+            .is_some_and(|remainder| remainder.starts_with('/'))
+}
+
+fn is_noncompliant_reason(reason: &str) -> bool {
+    !matches!(reason, "native" | "exclude-rule" | "blob-rule")
 }
 
 fn subtree_count_bytes(path: &Path) -> Result<(u64, u64), String> {
@@ -1728,13 +2011,13 @@ fn subtree_count_bytes(path: &Path) -> Result<(u64, u64), String> {
     if !metadata.is_dir() {
         return Ok((1, metadata.len()));
     }
-    let mut count = 1;
-    let mut bytes = 0;
+    let mut count = 1u64;
+    let mut bytes = 0u64;
     for entry in fs::read_dir(path).map_err(|error| format!("read {}: {error}", path.display()))? {
         let entry = entry.map_err(|error| format!("read {}: {error}", path.display()))?;
         let (child_count, child_bytes) = subtree_count_bytes(&entry.path())?;
-        count += child_count;
-        bytes += child_bytes;
+        count = count.saturating_add(child_count);
+        bytes = bytes.saturating_add(child_bytes);
     }
     Ok((count, bytes))
 }
@@ -1926,16 +2209,122 @@ blob Literal/Sub/
         assert!(!p.matches("Cut/Show.fcpxml", false, false));
     }
 
+    #[test]
+    fn malformed_pax_record_is_error_not_panic() {
+        assert!(parse_pax_records(b"01 x\n").is_err());
+        assert!(parse_pax_records(b"5 x=1").is_err());
+    }
+
+    #[test]
+    fn scan_suggests_dense_subtree_without_swallowing_clean_sibling() {
+        let mut state = PlannerState::default();
+        for index in 0..1_000 {
+            state.record_wrapped(&format!("Users/bob/AppData/bad-{index}.bin"), "xattr", 1);
+        }
+        for index in 0..50 {
+            state.record_native(&format!("Users/bob/Documents/good-{index}.mov"), 1);
+        }
+        let report = state.scan_report(ScanTuning {
+            blob_ratio: 0.9,
+            blob_count: 100,
+            sanity_ceiling: 10_000,
+        });
+        let blob_prefixes = report
+            .blob_suggestions
+            .iter()
+            .filter(|suggestion| suggestion.verdict == "blob-suggest")
+            .map(|suggestion| suggestion.prefix.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(blob_prefixes, vec!["Users/bob/AppData"]);
+    }
+
+    #[test]
+    fn scan_reports_sparse_noncompliance_as_straggler() {
+        let mut state = PlannerState::default();
+        state.record_wrapped("Media/bad-name.mov", "non-utf8-path", 1);
+        for index in 0..100 {
+            state.record_native(&format!("Media/good-{index}.mov"), 1);
+        }
+        let report = state.scan_report(ScanTuning {
+            blob_ratio: 0.9,
+            blob_count: 10,
+            sanity_ceiling: 1_000,
+        });
+        assert!(report.blob_suggestions.iter().any(|suggestion| {
+            suggestion.verdict == "straggler" && suggestion.prefix == "Media"
+        }));
+        assert!(!report
+            .blob_suggestions
+            .iter()
+            .any(|suggestion| suggestion.verdict == "blob-suggest"));
+    }
+
+    #[test]
+    fn scan_reports_sanity_ceiling_from_unabsorbed_residual() {
+        let mut state = PlannerState::default();
+        for index in 0..20 {
+            state.record_wrapped(&format!("Spread/dir-{index}/bad.bin"), "xattr", 1);
+            state.record_native(&format!("Spread/dir-{index}/good.bin"), 1);
+        }
+        let report = state.scan_report(ScanTuning {
+            blob_ratio: 0.9,
+            blob_count: 5,
+            sanity_ceiling: 10,
+        });
+        assert!(report.blob_suggestions.iter().any(|suggestion| {
+            suggestion.verdict == "sanity-ceiling" && suggestion.prefix == "."
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_tar_treats_dash_prefixed_members_as_operands() {
+        assert!(
+            command_available("bsdtar"),
+            "bsdtar/libarchive is required for wrapper fidelity tests"
+        );
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-remwrap-dash-member")
+            .tempdir()
+            .unwrap();
+        let base = temp.path().join("base");
+        fs::create_dir_all(base.join("--dash-dir")).unwrap();
+        fs::write(base.join("--dash-dir/member.txt"), b"dir").unwrap();
+        fs::write(base.join("--dash-file.txt"), b"file").unwrap();
+        let tar_engine = detect_tar_engine().unwrap();
+
+        let dir_tar = temp.path().join("dir.remwrap.tar");
+        create_wrapper_tar(&tar_engine, &base, OsStr::new("--dash-dir"), &dir_tar).unwrap();
+        let dir_index = build_wrap_index(&dir_tar, &tar_engine).unwrap();
+        assert!(dir_index
+            .entries
+            .iter()
+            .any(|entry| entry.path == "--dash-dir/member.txt"));
+
+        let file_tar = temp.path().join("file.remwrap.tar");
+        create_wrapper_tar(&tar_engine, &base, OsStr::new("--dash-file.txt"), &file_tar).unwrap();
+        let file_index = build_wrap_index(&file_tar, &tar_engine).unwrap();
+        assert!(file_index
+            .entries
+            .iter()
+            .any(|entry| entry.path == "--dash-file.txt"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn bsdtar_wrapper_round_trips_required_fidelity_cases() {
-        if !command_available("bsdtar")
-            || !command_available("setfattr")
-            || !command_available("getfattr")
-        {
-            eprintln!("skipping wrapper fidelity test; bsdtar/setfattr/getfattr unavailable");
-            return;
-        }
+        assert!(
+            command_available("bsdtar"),
+            "bsdtar/libarchive is required for wrapper fidelity tests"
+        );
+        assert!(
+            command_available("setfattr"),
+            "setfattr is required for wrapper fidelity tests"
+        );
+        assert!(
+            command_available("getfattr"),
+            "getfattr is required for wrapper fidelity tests"
+        );
         let temp = tempfile::Builder::new()
             .prefix("remanence-remwrap-fidelity")
             .tempdir()
