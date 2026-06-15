@@ -13,7 +13,7 @@ than a corrective patch. Implementation hands to codex once an item is marked
 | 2 | Cheap classification-only `--scan-only` | **Resolved** |
 | 2b | xattr handling policy (pulled RAO 1.1 forward) | **Resolved** (own doc) |
 | 3 | `rem restore` naming → foreign formats become plugins (BRU out of core) | **Resolved** (direction; own design doc to follow) |
-| 4 | Cross-tree hardlink edge → flatten hardlinks | **Resolved** |
+| 4 | Hardlinks → native typeflag 1; + entry-type scope principle; + sparse → upstream compression | **Resolved** |
 
 ---
 
@@ -245,34 +245,113 @@ out-of-process subprocess plugin; (b) where the driver-trait crate lives
 (new `remanence-format-driver` vs platform/library layer); (c) incremental
 (feature-flag BRU out now, separate repo later) vs big-bang.
 
-## Item 4 — Hardlinks: flatten, don't preserve-via-wrap (RESOLVED)
+## Item 4 — Hardlinks: native typeflag 1 (RESOLVED)
 
-The "cross-tree collapse" (one hardlink pair spanning two subtrees blobs the
-whole input) is a self-inflicted edge: it exists *only* because the design
-preserves hardlinks by wrapping their **common-ancestor directory** (to borrow
-tar's hardlink record). For cross-subtree links the common ancestor is the
-root → the whole archive becomes one blob. The mechanism is fighting RAO 1.0's
-own scope, which **deliberately has no hardlink entry type**.
+> Supersedes an interim "flatten" lean and the `rao-nonregular-entries`
+> design's deferral of hardlinks — hardlinks are now **in scope**, handled
+> natively.
 
-**Decision: flatten hardlinks.** Each hardlinked name becomes an ordinary
-**native RAO entry** with its own copy of the bytes. `nlink > 1` is no longer a
-wrap-fallback trigger. Rationale:
+The cross-tree-collapse edge (one hardlink pair spanning two subtrees blobs the
+whole input) was self-inflicted: it existed only because the design preserved
+hardlinks by **wrapping their common-ancestor directory**. Handle hardlinks the
+way tar does and the edge — and the whole common-ancestor concept — disappears.
 
-- **No data is lost** — every byte is archived (stored once per name). What's
-  dropped is the *inode link*, a source-filesystem storage property, not
-  archival data. The archive's contract ("files back, byte-correct") is met.
-- **"Same content" is still captured** — RAO records each file's sha256 and the
-  catalog keys assets by it, so two hardlinked names appear as two paths with
-  one identical hash. Content-addressing already says what the hardlink said.
-- **Never silent** — record "N hardlink sets flattened to independent copies"
-  in the scan/report.
+**Decision: native hardlink entries.** typeflag `1`, zero payload, the target
+(the primary entry's **in-object path**) in `linkname` / pax `linkpath`,
+manifest `entry_type = hardlink` + `link_target` — reusing the symlink
+machinery wholesale. First/primary occurrence of an inode stores the bytes;
+later names are link entries.
 
-**Tradeoff:** a hardlinked set is stored once per name (duplication). Negligible
-for rare media hardlinks. If it ever matters: dedup by sha256 at bundle build
-(sutradhara), or add a real RAO hardlink entry-type as a deliberate future
-minor — never the directory-blob hack.
+**Why native over flatten:** completes the file-tree entry set
+(regular/symlink/dir/hardlink); **dissolves the cross-tree edge** (tar
+hardlinks are in-archive *path references* — no common-ancestor concept, so
+where the names sit is irrelevant); stores the bytes **once** (no duplication);
+**preserves the link**; **stock-tar-faithful** (a plain `tar` recreates it);
+pre-freeze window, consistent with the native-typeflag decision for
+symlinks/dirs.
 
-**Removes:** `collect_hardlink_roots` + its second tree-walk, the
-common-ancestor computation, the cross-tree-collapse edge, and the
-climb-capping band-aids. `native_status` drops the
-`has_multiple_hardlinks → WrapFallback("hardlink")` branch. Net simplification.
+**Delta over symlinks** (why it was deferred as "harder" — modest, all
+well-trodden in tar): (1) **referential integrity** — the target MUST resolve
+to a real primary entry in the same object (writer guarantees; reader/verifier
+checks); (2) **deterministic primary selection** within a group (pin a rule,
+e.g. first in caller order; the first *non-excluded* name if the natural
+primary is excluded); (3) **detection** — inode grouping by `(dev, ino)`, a
+stat per file the classifier already does; (4) **restore ordering** (primary
+before links) and PFR resolving to the primary (the link entry can carry the
+primary's `first_chunk_lba`/`size`/`sha256`, so PFR reads directly and the
+catalog sees identical content).
+
+**Edges with clean fallbacks:** a hardlink group split across a blob boundary,
+or whose primary is excluded by a ruleset → the affected member falls back to
+an independent copy.
+
+**Removes** the `collect_hardlink_roots` second tree-walk, the common-ancestor
+computation, the cross-tree-collapse edge, and the climb-capping band-aids;
+`nlink > 1` is no longer a wrap trigger.
+
+## Entry-type scope principle — content, not kernel handles (RESOLVED — stated principle)
+
+RAO's native entry set is exactly **{regular, symlink, directory, hardlink}** —
+"a faithful tree of files": content and the structure of content. The boundary
+is **content vs OS-runtime handle**, not "how much of tar":
+
+- **In** (content / file-tree structure): regular (data), directory
+  (container), symlink (a stored path string), hardlink (a second name for
+  existing data). Meaningful on any filesystem, any backend, in 30 years.
+- **Out, on principle:** character/block devices, FIFOs, sockets. Zero content
+  — they're handles into a running kernel (`mknod` major/minor, IPC), only
+  meaningful on a live OS, and a **restore-time hazard** (device-node/setuid
+  extraction is a classic attack surface — RAO already deliberately drops
+  ownership/setuid). Excluding them is *safer*, not just leaner.
+
+The narrowness is a feature: a constrained subset is what buys RAO determinism,
+hostile-input safety, and re-implementability from a short spec; "full tar"
+would inherit its vendor extensions, obsolete types, ambiguity, and attack
+surface and forfeit those guarantees.
+
+**Non-content types when encountered:** skip-and-record (default for media), or
+blob-the-subtree if round-trip is explicitly wanted (tar-in-blob preserves
+them, the operator's recorded choice). Via existing machinery — no native
+typeflag. **→ fold this principle into the published RAO spec's scope/rationale
+(the "why don't you support X" FAQ).**
+
+## Sparse / large compressible objects — upstream compression, not a RAO sparse profile (RESOLVED)
+
+Need: the dept-backup side-job archives **VM images** (sparse, growing). Naive
+archiving inflates — it stores the holes' zeros.
+
+**Rejected: a RAO sparse profile** (chunk-level zero-elision). It would forfeit
+RAO's defining **stock-tar extractability** (sparse objects would be
+rem-only); it changes the body layout, so it can't be a silently-ignorable
+extension (needs a hard detect-and-refuse gate); and it adds a VM-motivated
+feature to a spec being **published for media** (the purity concern). tar's own
+sparse formats are a vendor minefield (no POSIX standard; GNU 0.0/0.1/1.0 +
+oldgnu + star, mutually incompatible; filesystem-dependent, non-deterministic
+hole maps) — adopting them would break the dual-reader longevity guarantee.
+
+**Decision: large-image efficiency = optional, selective, per-artifactclass
+upstream compression in sutradhara** — compress-before-archive, the same
+staging-transform pattern as the AppleDouble merge. zstd crushes the holes'
+zeros *and* compresses the real data (beats elision on space); rem then
+archives a normal dense file, so **RAO stays pure — no sparse profile, nothing
+added to the published spec.**
+
+Conditions:
+- **Selective by policy** — compress compressible classes (VM images, dept
+  backups), never media (already compressed).
+- **Pin compressor + level and record them** — byte-stable fanout,
+  reproducibility; compress *before* encrypt.
+- **Record the original logical sha256** (asset identity preserved) and
+  **verify-after-decompress** on restore; sutradhara owns the symmetric
+  decompress (recorded in the catalog).
+
+Tradeoffs land where they don't hurt: PFR dies for a compressed object — but VM
+images restore whole, so it isn't needed; identity indirection is handled by
+recording the logical hash.
+
+**Boundary:** if partial access *into* a large image without full restore is
+ever needed, revisit seekable compression (zstd seekable) or RAO elision — not
+the dept-backup pattern.
+
+Cross-repo: sutradhara compression policy, alongside the AppleDouble
+normalization.
