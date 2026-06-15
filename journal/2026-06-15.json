@@ -141,5 +141,16 @@
     "handoff_to": null,
     "round": 6,
     "summary": "Two findings, both real. #1 the prompt fix had over-corrected ('xattrs preserved via 1.1 - neither is a wrap trigger'); reworded to the accurate policy: hardlinks native (not a wrap trigger); small/native-preservable xattrs use 1.1 annotation while oversized/out-of-scope xattrs still wrap or drop per ingest policy (matches rao-1.1 spec §2.2 + ingest-layer-impl unit C). #2 §4.7.2 'payload files'/'one file-entry map per payload file' wording could make an implementer omit zero-payload entries (hardlink/symlink/dir) from file_entries; generalized to 'every member entry (regular/hardlink/symlink/directory)'. rao-v1-specification.md left stale by design (audit-trail copy, specs/ wins) per GPT's own note, same as the rem-tar-v1 predecessor candidate. Live rao-1.0 spec now clean of 'payload file' framing. This is the last of the multi-round hardlink/xattr propagation."
+  },
+  {
+    "uuid": "ee7fd2eb-4742-4513-afdb-0d75a08b66b6",
+    "datetime": "2026-06-15T12:18:49+02:00",
+    "author": "claude",
+    "subject": "Codex implementation prompt for the full ingest-v2 + format-completion work (3 phases, ordered)",
+    "idref": null,
+    "status": "approved",
+    "handoff_to": "codex",
+    "round": 0,
+    "summary": "Wrote docs/prompt-rao-ingest-v2-impl.md — a single sequenced codex work order over the four design docs + two specs. Phase 1 (remanence-format): 1a native hardlinks (typeflag 1, option-B zero-content-field/resolve-via-link_target model — explicitly told codex NOT to copy primary coords), 1b RAO 1.1 xattr metadata preservation (metadata_preservation_data.xattrs, CBOR byte-string values, schema_version 1.1 only when non-empty, non-UTF-8 names out of scope). Phase 2 (remanence-cli, units A->B->C->D): A member-name reversible \\xHH escaping; B cheap classification-only --scan-only (shared classifier so scan==build classification; xattr detection via the `xattr` syscall crate, dropping the getfattr subprocess); C xattr ingest policy (universal junk baseline + ruleset option xattr-mode denylist|allowlist, fail-safe default, small->1.1 annotation/large->wrap, never-silent; depends on 1b); D hardlink ingest (detect dev,ino groups; emit native primary+typeflag-1 links; remove collect_hardlink_roots/common-ancestor; nlink>1 no longer a wrap trigger; depends on 1a). Phase 3 (independent): foreign-format plugin architecture (BRU out of core, published driver trait, --format dispatch, native restore verb, CI guard). Cross-cutting DoD baked in: fmt/clippy/test green, byte-stability of regular-only objects, new vectors, INDEX updates, rebuild release before harness, flag-don't-weaken spec gaps. Out-of-scope (sutradhara) cross-referenced to prompt-ingest-v2-sutra-followups. INDEX row added (pending). HANDOFF: ready for codex. All committed + pushed (keychain agent sourced)."
   }
 ]
