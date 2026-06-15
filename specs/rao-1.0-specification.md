@@ -801,8 +801,9 @@ The manifest is a generated regular-file entry, last in the archive, with:
   (`manifest_sha256`)
 - the standard alignment, hashing, and chunk-geometry rules of Section 4.6.
 
-The manifest **excludes itself**: its `file_entries` array lists payload files
-only. Its own identity lives in its pax header and, externally, in the
+The manifest **excludes itself**: its `file_entries` array lists every member
+entry — regular files, hardlinks, symlinks, and directories — except the
+manifest entry itself. Its own identity lives in its pax header and, externally, in the
 parity-layer bootstrap row (plaintext copies, Section 8.2), which enables
 direct LOCATE-to-manifest reading without scanning the archive.
 
@@ -851,7 +852,7 @@ encoded sort order):
 | --- | --- | --- |
 | `object_id` | text | MUST equal the global `REMANENCE.object_id` |
 | `chunk_size` | unsigned | MUST equal the global `REMANENCE.chunk_size` |
-| `file_entries` | array | One file-entry map per payload file, in archive order |
+| `file_entries` | array | One file-entry map per member entry (regular/hardlink/symlink/directory), in archive order |
 | `schema_version` | unsigned | MUST be 1 (`MANIFEST_SCHEMA_VERSION`) |
 | `object_metadata` | map | Reserved; MUST be empty (`{}`) in 1.0 writers |
 | `caller_object_id` | text | MUST equal the global `REMANENCE.caller_object_id` |
