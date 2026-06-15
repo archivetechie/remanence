@@ -174,3 +174,28 @@ edit from adding a non-optional `remanence-bru` dep to core.
 
 No spec changes required — the implementation conforms to the specs as written;
 these are implementation-fidelity (M1) and test-coverage/hygiene items.
+
+---
+
+# Round 2 — fix verification (2026-06-15, commit a28df12)
+
+All findings addressed. Gates: fmt + `clippy --workspace --all-targets
+-D warnings` clean; **1,335 tests pass / 0 fail** (up from 1,330 — the new
+parity, excluded-primary, reader-negative, and guard tests).
+
+| Finding | Verdict | Evidence |
+| --- | --- | --- |
+| M1 — second tree-walk | **Fixed** | `collect_hardlink_groups_for_*` removed; detection is now inline in the single walk (`note_native_hardlink` during `classify_leaf`, `file_key` on `nlink>1`); blob-boundary split-recording deferred to a post-pass over the walk-collected `hardlink_native_counts`/`link_counts`/`paths` maps. The cheap-scan no longer double-walks. |
+| L1 — one shared classifier | **Fixed** | `classify_leaf` (`archive_ingest.rs:880`) is the single verdict function; both the build path (810) and scan path (780) call it. |
+| L2 — scan-vs-build parity test | **Fixed** | `archive_build_rules_scan_only_matches_build_verdicts` (`lib.rs:10462`) asserts `cluster_verdicts(scan) == cluster_verdicts(build)`. (The verdict-parity assertion is the substantive guarantee; the design's optional "panic-hash" mechanism wasn't used — acceptable.) |
+| L3 — reader-side hardlink negatives | **Fixed** | `negative-plaintext-reader.json` adds `hardlink-missing-target`, `hardlink-forward-target`, `hardlink-nonregular-target`, exercised via `read_*` in `rao_negative_vectors.rs`. |
+| L4 — excluded-primary edge test | **Fixed** | `lib.rs:10955` hardlink-excluded-primary test. |
+| L5 — dependency guard | **Fixed** | new `remanence-format-driver/tests/foreign_dependency_guard.rs`: a manifest-parse test asserting `remanence-format-driver`/`remanence-format`/`remanence-stream` depend on no foreign-format crate, plus one asserting `remanence-api`'s `remanence-bru` dep stays optional and off by default; CI updated. |
+
+**Round-2 verdict:** clean. The one substantive finding (M1) was fixed exactly
+as prescribed — inline detection in the single walk, split-recording as a
+post-pass — restoring the cheap-scan cost profile, and the dependency-guard
+invariant is now enforced by a manifest-parse test rather than a narrow CI
+grep. Remaining are the two optional Nits (the `chunk_count` formula triplicate
+in the format layer; not load-bearing). The implementation is conformance-clean
+against both specs and ready.
