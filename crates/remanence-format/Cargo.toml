@@ -10,6 +10,7 @@ repository  .workspace = true
 
 [dependencies]
 remanence-aead = { path = "../remanence-aead" }
+remanence-format-driver = { path = "../remanence-format-driver" }
 remanence-library = { path = "../remanence-library" }
 
 ciborium = { workspace = true }

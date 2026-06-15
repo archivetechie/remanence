@@ -39,6 +39,14 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --exclude remanence-chaos --all-targets -- -D warnings
 
+      - name: Guard core dependency graph
+        run: |
+          if cargo tree -p remanence-cli -e normal --no-default-features | grep -q 'remanence-bru '; then
+            echo "remanence-cli default core graph must not depend on remanence-bru" >&2
+            cargo tree -p remanence-cli -e normal --no-default-features >&2
+            exit 1
+          fi
+
       - name: Run tests
         run: cargo test --workspace --exclude remanence-chaos
 

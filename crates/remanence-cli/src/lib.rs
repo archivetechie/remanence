@@ -40,6 +40,8 @@
 //! caller asked for a library that wasn't found.
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -48,16 +50,17 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use remanence_aead::{header::object_id_field, inspect_bytes, open_to_vec, RootKey};
 use remanence_api::pb;
+#[cfg(feature = "foreign-bru")]
 use remanence_bru::{BruFormat, BRU_BLOCK_SIZE};
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "foreign-bru"))]
 use remanence_format::ForeignTapeFormat;
 use remanence_format::{
     read_encrypted_rao_file_range_to_vec, read_rem_tar_object,
     write_encrypted_rao_object_from_readers, write_rem_tar_object_from_readers, ArchiveGapCause,
-    ArchiveGapRange, ArchiveReader, BodyLba, DamageRange, DamageStatus, EntryKind,
-    FormatDescriptor, FormatError, ProbeConfidence, ProbeResult, RemTarEntryType, RemTarFileLayout,
-    RemTarFileSpec, RemTarFileStream, RemTarObjectLayout, RemTarObjectOptions, RemTarReadObject,
-    SourceRequirement, FORMAT_ID, MANIFEST_PATH,
+    ArchiveGapRange, ArchiveReader, BodyLba, DamageRange, DamageStatus, EntryKind, FormatError,
+    ProbeConfidence, ProbeResult, RemTarEntryType, RemTarFileLayout, RemTarFileSpec,
+    RemTarFileStream, RemTarObjectLayout, RemTarObjectOptions, RemTarReadObject, SourceRequirement,
+    FORMAT_ID, MANIFEST_PATH,
 };
 #[cfg(target_os = "linux")]
 use remanence_library::DriveHandlePhysicalSource;
@@ -80,6 +83,8 @@ mod pool_ops;
 const DEFAULT_DAEMON_ENDPOINT: &str = "unix:/var/lib/rem/rem.sock";
 const DEFAULT_DEV_TAPE_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_SCSI_VARIABLE_WRITE_BYTES: usize = 0x00FF_FFFF;
+#[cfg(not(feature = "foreign-bru"))]
+const BRU_BLOCK_SIZE: usize = 2048;
 
 #[derive(Parser, Debug)]
 #[command(name = "rem", version, about = "Remanence — tape library operator CLI")]
@@ -395,6 +400,9 @@ enum RemCommand {
         command: RemArchiveCommand,
     },
 
+    /// Restore a native RAO object into a directory.
+    Restore(RemArchiveExtractArgs),
+
     /// Development-only hardware helpers.
     #[command(hide = true)]
     Dev {
@@ -453,6 +461,9 @@ impl From<RemCommand> for Command {
             },
             RemCommand::Archive { command } => Self::Archive {
                 command: command.into(),
+            },
+            RemCommand::Restore(args) => Self::Archive {
+                command: ArchiveCommand::Extract(args.into()),
             },
             RemCommand::Dev { command } => Self::Dev { command },
         }
@@ -2170,7 +2181,7 @@ impl ArchiveFormat {
 
     fn driver_id(self) -> &'static str {
         match self {
-            Self::Bru => BruFormat.id(),
+            Self::Bru => "remanence-bru",
         }
     }
 }
@@ -4948,7 +4959,13 @@ fn run_archive_dump_command(
                 Ok(reader) => reader,
                 Err(code) => return code,
             };
-            let mut archive = open_dump_archive(format, reader);
+            let mut archive = match open_dump_archive(format, reader) {
+                Ok(archive) => archive,
+                Err(error) => {
+                    let _ = writeln!(err, "error: {error}");
+                    return ExitCode::from(1);
+                }
+            };
             match remanence_stream::scan_archive_reader(archive.as_mut()) {
                 Ok(report) => {
                     print_archive_scan(&report, out);
@@ -4969,7 +4986,13 @@ fn run_archive_dump_command(
                 Ok(reader) => reader,
                 Err(code) => return code,
             };
-            let mut archive = open_dump_archive(format, reader);
+            let mut archive = match open_dump_archive(format, reader) {
+                Ok(archive) => archive,
+                Err(error) => {
+                    let _ = writeln!(err, "error: {error}");
+                    return ExitCode::from(1);
+                }
+            };
             match remanence_stream::restore_archive_reader_to_directory(
                 archive.as_mut(),
                 &args.dest,
@@ -4999,7 +5022,13 @@ fn run_archive_dump_command(
                 Ok(reader) => reader,
                 Err(code) => return code,
             };
-            let mut archive = open_dump_archive(format, reader);
+            let mut archive = match open_dump_archive(format, reader) {
+                Ok(archive) => archive,
+                Err(error) => {
+                    let _ = writeln!(err, "error: {error}");
+                    return ExitCode::from(1);
+                }
+            };
             let source = format!("dump:{}", path.display());
             match remanence_stream::recover_archive_reader_to_directory(
                 archive.as_mut(),
@@ -5080,14 +5109,38 @@ fn probe_dump_archive(
     reader: &mut BufReader<File>,
 ) -> Result<ProbeResult, FormatError> {
     match format {
+        #[cfg(feature = "foreign-bru")]
         ArchiveFormat::Bru => BruFormat.probe_dump(reader),
+        #[cfg(not(feature = "foreign-bru"))]
+        ArchiveFormat::Bru => {
+            let _ = reader;
+            Err(format_unavailable_error(format))
+        }
     }
 }
 
-fn open_dump_archive(format: ArchiveFormat, reader: BufReader<File>) -> Box<dyn ArchiveReader> {
+fn open_dump_archive(
+    format: ArchiveFormat,
+    reader: BufReader<File>,
+) -> Result<Box<dyn ArchiveReader>, FormatError> {
     match format {
-        ArchiveFormat::Bru => Box::new(BruFormat.open_dump_reader(reader)),
+        #[cfg(feature = "foreign-bru")]
+        ArchiveFormat::Bru => Ok(Box::new(BruFormat.open_dump_reader(reader))),
+        #[cfg(not(feature = "foreign-bru"))]
+        ArchiveFormat::Bru => {
+            drop(reader);
+            Err(format_unavailable_error(format))
+        }
     }
+}
+
+#[cfg(not(feature = "foreign-bru"))]
+fn format_unavailable_error(format: ArchiveFormat) -> FormatError {
+    FormatError::unsupported(format!(
+        "format {} ({}) is not available in this build",
+        format.cli_name(),
+        format.driver_id()
+    ))
 }
 
 /// Build a portable RAO object file from local filesystem inputs.
@@ -5162,6 +5215,7 @@ struct ArchiveBuildInputFile {
     size_bytes: u64,
     file_sha256: Option<[u8; 32]>,
     link_target: Option<String>,
+    xattrs: BTreeMap<String, Vec<u8>>,
 }
 
 fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
@@ -5729,7 +5783,7 @@ fn extract_plaintext_blob_member_file(
         archive_ingest::resolve_blob_member_from_index(&idx_bytes, &idx_path, member_path)?;
     let bytes = read_plaintext_rao_entry_range(&args.object, blob, member.offset, member.length)?;
     archive_ingest::verify_blob_member_bytes(member_path, member.sha256.as_deref(), &bytes)?;
-    let output = write_archive_range_output(&args.dest, member_path, &bytes, args.overwrite)?;
+    let output = write_blob_member_output(&args.dest, member_path, &bytes, args.overwrite)?;
     Ok(blob_member_extract_report_json(
         &BlobMemberExtractReportContext {
             base: context,
@@ -5806,7 +5860,7 @@ fn extract_encrypted_blob_member_range_file(
         &blob_range.bytes,
     )?;
     let output =
-        write_archive_range_output(&args.dest, member_path, &blob_range.bytes, args.overwrite)?;
+        write_blob_member_output(&args.dest, member_path, &blob_range.bytes, args.overwrite)?;
     Ok(blob_member_extract_report_json(
         &BlobMemberExtractReportContext {
             base: context,
@@ -6545,6 +6599,26 @@ fn write_archive_range_output(
     overwrite: bool,
 ) -> Result<PathBuf, String> {
     let destination = archive_range_destination(root, member_path)?;
+    write_bytes_to_archive_output(&destination, bytes, overwrite)?;
+    Ok(destination)
+}
+
+fn write_blob_member_output(
+    root: &Path,
+    member_path: &str,
+    bytes: &[u8],
+    overwrite: bool,
+) -> Result<PathBuf, String> {
+    let destination = blob_member_destination(root, member_path)?;
+    write_bytes_to_archive_output(&destination, bytes, overwrite)?;
+    Ok(destination)
+}
+
+fn write_bytes_to_archive_output(
+    destination: &Path,
+    bytes: &[u8],
+    overwrite: bool,
+) -> Result<(), String> {
     let mut options = OpenOptions::new();
     options.write(true);
     if overwrite {
@@ -6553,11 +6627,10 @@ fn write_archive_range_output(
         options.create_new(true);
     }
     let mut file = options
-        .open(&destination)
+        .open(destination)
         .map_err(|error| format!("open range output {}: {error}", destination.display()))?;
     file.write_all(bytes)
-        .map_err(|error| format!("write range output {}: {error}", destination.display()))?;
-    Ok(destination)
+        .map_err(|error| format!("write range output {}: {error}", destination.display()))
 }
 
 fn archive_range_destination(root: &Path, member_path: &str) -> Result<PathBuf, String> {
@@ -6571,6 +6644,63 @@ fn archive_range_destination(root: &Path, member_path: &str) -> Result<PathBuf, 
     destination.push(parts.last().expect("member path has at least one part"));
     reject_archive_extract_symlink(&destination)?;
     Ok(destination)
+}
+
+fn blob_member_destination(root: &Path, member_path: &str) -> Result<PathBuf, String> {
+    ensure_archive_extract_root(root)?;
+    let decoded = archive_ingest::decode_member_name(member_path)
+        .map_err(|error| format!("decode blob member path {member_path:?}: {error}"))?;
+    let parts = archive_member_path_byte_parts(member_path, &decoded)?;
+    let mut destination = root.to_path_buf();
+    for part in &parts[..parts.len().saturating_sub(1)] {
+        push_raw_path_component(&mut destination, part)?;
+        ensure_archive_extract_directory(&destination)?;
+    }
+    push_raw_path_component(
+        &mut destination,
+        parts.last().expect("member path has at least one part"),
+    )?;
+    reject_archive_extract_symlink(&destination)?;
+    Ok(destination)
+}
+
+fn archive_member_path_byte_parts<'a>(
+    member_path: &str,
+    decoded: &'a [u8],
+) -> Result<Vec<&'a [u8]>, String> {
+    if decoded.is_empty() || decoded.ends_with(b"/") {
+        return Err("blob-member extraction requires a regular archive file path".to_string());
+    }
+    let mut parts = Vec::new();
+    for part in decoded.split(|byte| *byte == b'/') {
+        if part.is_empty() || part == b"." || part == b".." || part.contains(&0) {
+            return Err(format!(
+                "blob-member path {member_path:?} is not a normalized relative path"
+            ));
+        }
+        parts.push(part);
+    }
+    Ok(parts)
+}
+
+#[cfg(unix)]
+fn push_raw_path_component(path: &mut PathBuf, part: &[u8]) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if part.contains(&0) {
+        return Err("blob-member path component contains NUL".to_string());
+    }
+    path.push(OsStr::from_bytes(part));
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn push_raw_path_component(path: &mut PathBuf, part: &[u8]) -> Result<(), String> {
+    let text = std::str::from_utf8(part).map_err(|error| {
+        format!("blob-member path is not representable on this platform: {error}")
+    })?;
+    path.push(text);
+    Ok(())
 }
 
 fn archive_member_path_parts(member_path: &str) -> Result<Vec<&str>, String> {
@@ -6866,6 +6996,14 @@ fn read_archive_build_file(
     source_path: &Path,
     archive_path: String,
 ) -> Result<ArchiveBuildInputFile, String> {
+    read_archive_build_file_with_xattrs(source_path, archive_path, BTreeMap::new())
+}
+
+fn read_archive_build_file_with_xattrs(
+    source_path: &Path,
+    archive_path: String,
+    xattrs: BTreeMap<String, Vec<u8>>,
+) -> Result<ArchiveBuildInputFile, String> {
     let (size_bytes, file_sha256) = hash_archive_build_file(source_path)?;
     let file_id = deterministic_archive_entry_file_id(
         RemTarEntryType::Regular,
@@ -6881,6 +7019,30 @@ fn read_archive_build_file(
         size_bytes,
         file_sha256: Some(file_sha256),
         link_target: None,
+        xattrs,
+    })
+}
+
+fn read_archive_build_hardlink(
+    source_path: &Path,
+    archive_path: String,
+    link_target: String,
+) -> Result<ArchiveBuildInputFile, String> {
+    let file_id = deterministic_archive_entry_file_id(
+        RemTarEntryType::Hardlink,
+        &archive_path,
+        None,
+        Some(&link_target),
+    );
+    Ok(ArchiveBuildInputFile {
+        source_path: source_path.to_path_buf(),
+        entry_type: RemTarEntryType::Hardlink,
+        archive_path,
+        file_id,
+        size_bytes: 0,
+        file_sha256: None,
+        link_target: Some(link_target),
+        xattrs: BTreeMap::new(),
     })
 }
 
@@ -6908,6 +7070,7 @@ fn read_archive_build_symlink(
         size_bytes: 0,
         file_sha256: None,
         link_target: Some(target),
+        xattrs: BTreeMap::new(),
     })
 }
 
@@ -6925,6 +7088,7 @@ fn read_archive_build_directory(
         size_bytes: 0,
         file_sha256: None,
         link_target: None,
+        xattrs: BTreeMap::new(),
     })
 }
 
@@ -6938,6 +7102,7 @@ fn archive_build_file_spec(input: &ArchiveBuildInputFile) -> RemTarFileSpec {
                 input.file_sha256.expect("regular input has sha256"),
             );
             spec.executable = Some(false);
+            spec.xattrs = input.xattrs.clone();
             spec
         }
         RemTarEntryType::Hardlink => RemTarFileSpec::hardlink(
@@ -7350,7 +7515,13 @@ fn probe_tape_archive(
     source: &mut dyn remanence_library::PhysicalTapeSource,
 ) -> Result<ProbeResult, FormatError> {
     match format {
+        #[cfg(feature = "foreign-bru")]
         ArchiveFormat::Bru => BruFormat.probe(source),
+        #[cfg(not(feature = "foreign-bru"))]
+        ArchiveFormat::Bru => {
+            let _ = source;
+            Err(format_unavailable_error(format))
+        }
     }
 }
 
@@ -7361,7 +7532,14 @@ fn open_tape_archive<'a>(
     probe: &ProbeResult,
 ) -> Result<Box<dyn ArchiveReader + 'a>, FormatError> {
     match format {
+        #[cfg(feature = "foreign-bru")]
         ArchiveFormat::Bru => BruFormat.open_tape_reader(source, probe),
+        #[cfg(not(feature = "foreign-bru"))]
+        ArchiveFormat::Bru => {
+            let _ = source;
+            let _ = probe;
+            Err(format_unavailable_error(format))
+        }
     }
 }
 
@@ -9709,6 +9887,7 @@ tape_catalog_dir = "{0}/cache/tapes"
         );
     }
 
+    #[cfg(feature = "foreign-bru")]
     #[test]
     fn archive_probe_dump_bypasses_discovery() {
         let temp = tempfile::Builder::new()
@@ -9744,6 +9923,30 @@ tape_catalog_dir = "{0}/cache/tapes"
         assert!(stdout.contains("confidence: certain"));
         assert!(stdout.contains("source: byte-stream-dump"));
         assert!(err.is_empty());
+    }
+
+    #[cfg(not(feature = "foreign-bru"))]
+    #[test]
+    fn archive_probe_dump_reports_unavailable_without_bru_plugin() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-bru-unavailable")
+            .tempdir()
+            .unwrap();
+        let dump = temp.path().join("fixture.bru");
+        fs::write(&dump, archive_block()).unwrap();
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "probe",
+            "--format",
+            "bru",
+            "--dump",
+            dump.to_str().unwrap(),
+        ]);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("format bru (remanence-bru) is not available in this build"));
     }
 
     #[test]
@@ -9963,6 +10166,27 @@ tape_catalog_dir = "{0}/cache/tapes"
         assert_eq!(
             fs::read_link(restore_dir.join("dangling")).unwrap(),
             PathBuf::from("missing.txt")
+        );
+
+        let top_level_restore_dir = temp.path().join("top-level-restore");
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "restore",
+            "--object",
+            out_path.to_str().unwrap(),
+            "--dest",
+            top_level_restore_dir.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+        ]);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let restore: serde_json::Value = serde_json::from_str(&stdout).expect("restore json");
+        assert_eq!(restore["representation"], "plaintext");
+        assert_eq!(restore["files_written"], 1);
+        assert_eq!(
+            fs::read(top_level_restore_dir.join("target.txt")).unwrap(),
+            b"target"
         );
     }
 
@@ -10236,24 +10460,19 @@ blob Project/Render Files/
 
     #[cfg(unix)]
     #[test]
-    fn archive_build_rules_wraps_xattr_file_fallback() {
+    fn archive_build_rules_preserves_small_xattr_natively() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-xattr-fallback")
+            .prefix("remanence-cli-rao-xattr-native")
             .tempdir()
             .unwrap();
         let input_dir = temp.path().join("inputs");
         fs::create_dir_all(&input_dir).unwrap();
         let xattr_file = input_dir.join("--xattr.txt");
         fs::write(&xattr_file, b"xattr payload").unwrap();
-        let status = std::process::Command::new("setfattr")
-            .arg("-n")
-            .arg("user.remanence_test")
-            .arg("-v")
-            .arg("kept")
-            .arg(&xattr_file)
-            .status()
-            .expect("setfattr must be installed for xattr fallback test");
-        assert!(status.success());
+        let xattr_name = "user.remanence_test";
+        if xattr::set(&xattr_file, xattr_name, b"kept").is_err() {
+            return;
+        }
         let rules = temp.path().join("empty.rules");
         fs::write(&rules, "").unwrap();
         let out_path = temp.path().join("xattr.rao");
@@ -10283,17 +10502,14 @@ blob Project/Render Files/
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
         assert!(stderr.is_empty(), "{stderr}");
         let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
-        assert_eq!(report["ingest"]["scan"]["totals"]["wrapped_entries"], 1);
-        assert!(report["ingest"]["scan"]["clusters"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|cluster| cluster["reason"] == "xattr" && cluster["samples"][0] == "--xattr.txt"));
+        assert_eq!(report["ingest"]["scan"]["totals"]["wrapped_entries"], 0);
+        assert_eq!(report["ingest"]["scan"]["totals"]["native_entries"], 1);
         let files = report["files"].as_array().expect("files array");
-        assert!(files
+        let xattr_entry = files
             .iter()
-            .any(|file| file["path"] == "--xattr.txt.remwrap.tar"));
-        assert!(!files.iter().any(|file| file["path"] == "--xattr.txt"));
+            .find(|file| file["path"] == "--xattr.txt")
+            .expect("native xattr file");
+        assert_eq!(xattr_entry["xattrs"][xattr_name], bytes_to_hex(b"kept"));
 
         let restore_dir = temp.path().join("restore");
         let (code, _stdout, stderr) = invoke_without_discovery(&[
@@ -10313,22 +10529,220 @@ blob Project/Render Files/
             fs::read(restore_dir.join("--xattr.txt")).unwrap(),
             b"xattr payload"
         );
-        let output = std::process::Command::new("getfattr")
-            .arg("--absolute-names")
-            .arg("--dump")
-            .arg("-m")
-            .arg("-")
-            .arg(restore_dir.join("--xattr.txt"))
-            .output()
-            .expect("getfattr must be installed for xattr fallback test");
-        assert!(output.status.success());
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("user.remanence_test=\"kept\""), "{stdout}");
+        assert_eq!(
+            xattr::get(restore_dir.join("--xattr.txt"), xattr_name).unwrap(),
+            Some(b"kept".to_vec())
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn archive_build_rules_wraps_hardlink_common_ancestor() {
+    fn archive_build_rules_drop_xattrs_without_schema_bump() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-xattr-drop")
+            .tempdir()
+            .unwrap();
+        let input_dir = temp.path().join("inputs");
+        fs::create_dir_all(&input_dir).unwrap();
+        let file = input_dir.join("drop.txt");
+        fs::write(&file, b"drop payload").unwrap();
+        let xattr_name = "user.remanence_drop";
+        if xattr::set(&file, xattr_name, b"noise").is_err() {
+            return;
+        }
+        let rules = temp.path().join("drop.rules");
+        fs::write(&rules, format!("xattr-drop {xattr_name}\n")).unwrap();
+        let out_path = temp.path().join("drop.rao");
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            input_dir.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+            "--object-id",
+            "object-xattr-drop",
+            "--caller-object-id",
+            "caller-xattr-drop",
+            "--manifest-file-id",
+            "manifest-xattr-drop",
+            "--timestamp",
+            "2026-01-01T00:00:00Z",
+        ]);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
+        assert_eq!(report["ingest"]["scan"]["totals"]["dropped_xattrs"], 1);
+        assert!(report["ingest"]["scan"]["xattr_drops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cluster| cluster["name"] == xattr_name && cluster["reason"] == "policy"));
+        let scan = scan_plaintext_rao_entry_locators(&out_path, 4096).unwrap();
+        assert_eq!(
+            scan.global_pax
+                .get("REMANENCE.schema_version")
+                .map(String::as_str),
+            Some("1.0")
+        );
+        let files = report["files"].as_array().expect("files array");
+        let entry = files
+            .iter()
+            .find(|file| file["path"] == "drop.txt")
+            .expect("native file");
+        assert!(entry.get("xattrs").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_build_rules_allowlist_drops_unlisted_xattr() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-xattr-allowlist")
+            .tempdir()
+            .unwrap();
+        let input_dir = temp.path().join("inputs");
+        fs::create_dir_all(&input_dir).unwrap();
+        let file = input_dir.join("allow.txt");
+        fs::write(&file, b"allowlist payload").unwrap();
+        if xattr::set(&file, "user.unlisted", b"drop").is_err() {
+            return;
+        }
+        let rules = temp.path().join("allow.rules");
+        fs::write(
+            &rules,
+            "option xattr-mode allowlist\nxattr-keep user.kept\n",
+        )
+        .unwrap();
+        let out_path = temp.path().join("allow.rao");
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            input_dir.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+            "--object-id",
+            "object-xattr-allow",
+            "--caller-object-id",
+            "caller-xattr-allow",
+            "--manifest-file-id",
+            "manifest-xattr-allow",
+            "--timestamp",
+            "2026-01-01T00:00:00Z",
+        ]);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
+        assert_eq!(report["ingest"]["scan"]["totals"]["dropped_xattrs"], 1);
+        assert!(report["ingest"]["scan"]["xattr_drops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cluster| cluster["name"] == "user.unlisted" && cluster["reason"] == "policy"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_build_rules_wraps_oversized_xattr() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-xattr-large")
+            .tempdir()
+            .unwrap();
+        let input_dir = temp.path().join("inputs");
+        fs::create_dir_all(&input_dir).unwrap();
+        let file = input_dir.join("large-xattr.txt");
+        fs::write(&file, b"large xattr payload").unwrap();
+        let large_xattr = vec![0x55; 4097];
+        if xattr::set(&file, "user.large", &large_xattr).is_err() {
+            return;
+        }
+        let rules = temp.path().join("large.rules");
+        fs::write(&rules, "").unwrap();
+        let out_path = temp.path().join("large.rao");
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            input_dir.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+            "--object-id",
+            "object-xattr-large",
+            "--caller-object-id",
+            "caller-xattr-large",
+            "--manifest-file-id",
+            "manifest-xattr-large",
+            "--timestamp",
+            "2026-01-01T00:00:00Z",
+        ]);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
+        assert_eq!(report["ingest"]["scan"]["totals"]["wrapped_entries"], 1);
+        assert!(report["ingest"]["scan"]["clusters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cluster| cluster["reason"] == "xattr-large"));
+        let files = report["files"].as_array().expect("files array");
+        assert!(files
+            .iter()
+            .any(|file| file["path"] == "large-xattr.txt.remwrap.tar"));
+    }
+
+    #[test]
+    fn xattr_ruleset_rejects_mismatched_directive_mode() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-xattr-rules")
+            .tempdir()
+            .unwrap();
+        let deny = temp.path().join("deny.rules");
+        fs::write(&deny, "xattr-keep user.foo\n").unwrap();
+        assert!(archive_ingest::scan_only_report(
+            &[temp.path().to_path_buf()],
+            Some(&deny),
+            false,
+            archive_ingest::ScanTuning::default()
+        )
+        .unwrap_err()
+        .contains("xattr-keep requires"));
+
+        let allow = temp.path().join("allow.rules");
+        fs::write(&allow, "option xattr-mode allowlist\nxattr-drop user.foo\n").unwrap();
+        assert!(archive_ingest::scan_only_report(
+            &[temp.path().to_path_buf()],
+            Some(&allow),
+            false,
+            archive_ingest::ScanTuning::default()
+        )
+        .unwrap_err()
+        .contains("xattr-drop requires"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_build_rules_emits_native_hardlinks() {
         use std::os::unix::fs::MetadataExt;
 
         let temp = tempfile::Builder::new()
@@ -10337,10 +10751,10 @@ blob Project/Render Files/
             .unwrap();
         let input_dir = temp.path().join("inputs");
         fs::create_dir_all(input_dir.join("links")).unwrap();
-        fs::write(input_dir.join("links/original.bin"), b"same-inode").unwrap();
+        fs::write(input_dir.join("links/a-original.bin"), b"same-inode").unwrap();
         fs::hard_link(
-            input_dir.join("links/original.bin"),
-            input_dir.join("links/alias.bin"),
+            input_dir.join("links/a-original.bin"),
+            input_dir.join("links/b-alias.bin"),
         )
         .unwrap();
         let rules = temp.path().join("empty.rules");
@@ -10372,18 +10786,15 @@ blob Project/Render Files/
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
         assert!(stderr.is_empty(), "{stderr}");
         let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
-        assert_eq!(report["ingest"]["scan"]["totals"]["blob_entries"], 1);
-        assert!(report["ingest"]["scan"]["clusters"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|cluster| cluster["reason"] == "hardlink" && cluster["samples"][0] == "links"));
+        assert_eq!(report["ingest"]["scan"]["totals"]["blob_entries"], 0);
+        assert_eq!(report["ingest"]["scan"]["totals"]["native_entries"], 2);
         let files = report["files"].as_array().expect("files array");
-        assert!(files.iter().any(|file| file["path"] == "links.remwrap.tar"));
-        assert!(files.iter().any(|file| file["path"] == "links.remwrap.idx"));
-        assert!(!files
+        assert!(files
             .iter()
-            .any(|file| file["path"] == "links/original.bin"));
+            .any(|file| file["path"] == "links/a-original.bin" && file["entry_type"] == "regular"));
+        assert!(files.iter().any(|file| file["path"] == "links/b-alias.bin"
+            && file["entry_type"] == "hardlink"
+            && file["link_target"] == "links/a-original.bin"));
 
         let restore_dir = temp.path().join("restore");
         let (code, _stdout, stderr) = invoke_without_discovery(&[
@@ -10399,8 +10810,8 @@ blob Project/Render Files/
         ]);
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
         assert!(stderr.is_empty(), "{stderr}");
-        let original = fs::metadata(restore_dir.join("links/original.bin")).unwrap();
-        let alias = fs::metadata(restore_dir.join("links/alias.bin")).unwrap();
+        let original = fs::metadata(restore_dir.join("links/a-original.bin")).unwrap();
+        let alias = fs::metadata(restore_dir.join("links/b-alias.bin")).unwrap();
         assert_eq!(original.ino(), alias.ino());
         assert_eq!(original.nlink(), 2);
     }
@@ -10781,6 +11192,7 @@ blob Project/Render Files/
         );
     }
 
+    #[cfg(feature = "foreign-bru")]
     #[test]
     fn archive_scan_dump_prints_catalog_entries() {
         let temp = tempfile::Builder::new()
@@ -10823,6 +11235,7 @@ blob Project/Render Files/
         assert!(err.is_empty());
     }
 
+    #[cfg(feature = "foreign-bru")]
     #[test]
     fn archive_restore_dump_writes_filesystem_output() {
         let temp = tempfile::Builder::new()
@@ -10868,6 +11281,7 @@ blob Project/Render Files/
         assert!(err.is_empty());
     }
 
+    #[cfg(feature = "foreign-bru")]
     #[test]
     fn archive_recover_dump_writes_sparse_output_and_manifest() {
         let temp = tempfile::Builder::new()
@@ -11317,6 +11731,7 @@ blob Project/Render Files/
     const MAGIC_OFFSET: usize = 0x0B0;
     const MAGIC_SIZE: usize = 4;
     const MAGIC_ARCHIVE_HEADER: u64 = 0x1234;
+    #[cfg(feature = "foreign-bru")]
     const MAGIC_FILE_HEADER: u64 = 0x2345;
     const ARTIME_OFFSET: usize = 0x098;
     const BUFSIZE_OFFSET: usize = 0x0A0;
@@ -11325,11 +11740,17 @@ blob Project/Render Files/
     const VARIANT_OFFSET: usize = 0x0C0;
     const ARCHIVE_ID_LOW_OFFSET: usize = 0x0D8;
     const LABEL_OFFSET: usize = 0x1D0;
+    #[cfg(feature = "foreign-bru")]
     const FILE_PATH_OFFSET: usize = 0x000;
+    #[cfg(feature = "foreign-bru")]
     const INLINE_DATA_LEN_OFFSET: usize = 0x0DC;
+    #[cfg(feature = "foreign-bru")]
     const INLINE_DATA_OFFSET: usize = 0x400;
+    #[cfg(feature = "foreign-bru")]
     const ST_MODE_OFFSET: usize = 0x180;
+    #[cfg(feature = "foreign-bru")]
     const ST_SIZE_OFFSET: usize = 0x1B8;
+    #[cfg(feature = "foreign-bru")]
     const S_IFREG: u64 = 0x8000;
 
     fn put_ascii(block: &mut [u8; BRU_BLOCK_SIZE], offset: usize, text: &str) {
@@ -11375,6 +11796,7 @@ blob Project/Render Files/
         finalize_block(block)
     }
 
+    #[cfg(feature = "foreign-bru")]
     fn file_header_block(path: &str, size: u64, inline: &[u8]) -> [u8; BRU_BLOCK_SIZE] {
         let mut block = [0; BRU_BLOCK_SIZE];
         put_ascii(&mut block, FILE_PATH_OFFSET, path);

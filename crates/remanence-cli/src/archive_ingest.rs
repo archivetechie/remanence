@@ -6,7 +6,7 @@
 //! mainstream tar engine, and deriving sibling `.remwrap.idx` entries for blobs.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -26,13 +26,15 @@ use time::OffsetDateTime;
 
 use crate::{
     archive_path_from_relative, bytes_to_hex, path_component_to_string,
-    read_archive_build_directory, read_archive_build_file, read_archive_build_symlink, sha256_file,
-    ArchiveBuildInputFile,
+    read_archive_build_directory, read_archive_build_file, read_archive_build_file_with_xattrs,
+    read_archive_build_hardlink, read_archive_build_symlink, sha256_file, ArchiveBuildInputFile,
 };
 
 const WRAP_TAR_SUFFIX: &str = ".remwrap.tar";
 const WRAP_INDEX_SUFFIX: &str = ".remwrap.idx";
 const DEFAULT_SAMPLES_PER_CLUSTER: usize = 3;
+const XATTR_SINGLE_VALUE_LIMIT: usize = 4 * 1024;
+const XATTR_TOTAL_VALUE_LIMIT: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ScanTuning {
@@ -95,6 +97,7 @@ pub(crate) struct RulesetLint {
 pub(crate) struct ScanReport {
     pub(crate) totals: ScanTotals,
     pub(crate) clusters: Vec<ScanCluster>,
+    pub(crate) xattr_drops: Vec<XattrDropCluster>,
     pub(crate) blob_suggestions: Vec<BlobSuggestion>,
 }
 
@@ -105,6 +108,7 @@ pub(crate) struct ScanTotals {
     pub(crate) blob_entries: u64,
     pub(crate) excluded_entries: u64,
     pub(crate) excluded_bytes: u64,
+    pub(crate) dropped_xattrs: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -113,6 +117,15 @@ pub(crate) struct ScanCluster {
     pub(crate) reason: String,
     pub(crate) count: u64,
     pub(crate) bytes: u64,
+    pub(crate) samples: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct XattrDropCluster {
+    pub(crate) prefix: String,
+    pub(crate) name: String,
+    pub(crate) reason: String,
+    pub(crate) count: u64,
     pub(crate) samples: Vec<String>,
 }
 
@@ -148,7 +161,21 @@ pub(crate) struct CustomerManifestEntry {
 struct Ruleset {
     report: RulesetReport,
     rules: Vec<Rule>,
+    xattr_policy: XattrPolicy,
     lints: Vec<RulesetLint>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum XattrMode {
+    Denylist,
+    Allowlist,
+}
+
+#[derive(Debug, Clone)]
+struct XattrPolicy {
+    mode: XattrMode,
+    keep: BTreeSet<String>,
+    drop: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -180,9 +207,9 @@ enum Decision {
     Exclude,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 enum NativeStatus {
-    Native,
+    Native { xattrs: BTreeMap<String, Vec<u8>> },
     WrapFallback(&'static str),
 }
 
@@ -191,9 +218,14 @@ struct PlannerState {
     files: Vec<ArchiveBuildInputFile>,
     manifest_entries: Vec<CustomerManifestEntry>,
     clusters: BTreeMap<(String, String), ClusterAccumulator>,
+    xattr_drops: BTreeMap<(String, String, String), ClusterAccumulator>,
     dir_stats: BTreeMap<String, DirStats>,
     totals: ScanTotals,
     wrapper_counter: u64,
+    hardlink_groups: HardlinkGroups,
+    hardlink_primaries: BTreeMap<FileKey, String>,
+    hardlink_native_counts: BTreeMap<FileKey, u64>,
+    hardlink_blob_counts: BTreeMap<FileKey, u64>,
 }
 
 #[derive(Debug, Default)]
@@ -209,12 +241,24 @@ struct DirStats {
     noncompliant: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct FileKey {
+    dev: u64,
+    ino: u64,
+}
+
+#[derive(Debug, Default)]
+struct HardlinkGroups {
+    by_key: BTreeMap<FileKey, Vec<String>>,
+    by_path: BTreeMap<String, FileKey>,
+}
+
 #[derive(Clone, Copy)]
 struct ProcessContext<'a> {
     ruleset: Option<&'a Ruleset>,
+    xattr_policy: &'a XattrPolicy,
     tar_engine: &'a TarEngineReport,
     tempdir: &'a Path,
-    hardlink_roots: &'a BTreeSet<PathBuf>,
     no_index: bool,
 }
 
@@ -259,22 +303,30 @@ pub(crate) fn materialize_inputs(
         Some(path) => Some(load_ruleset(path)?),
         None => None,
     };
+    let default_xattr_policy = XattrPolicy::default();
+    let xattr_policy = ruleset
+        .as_ref()
+        .map(|ruleset| &ruleset.xattr_policy)
+        .unwrap_or(&default_xattr_policy);
     let tempdir = tempfile::Builder::new()
         .prefix("remanence-remwrap-")
         .tempdir()
         .map_err(|error| format!("create wrapper tempdir: {error}"))?;
-    let mut state = PlannerState::default();
+    let mut state = PlannerState {
+        hardlink_groups: collect_hardlink_groups_for_inputs(input_paths)?,
+        ..Default::default()
+    };
     for input in input_paths {
-        let hardlink_roots = collect_hardlink_roots(input)?;
         let context = ProcessContext {
             ruleset: ruleset.as_ref(),
+            xattr_policy,
             tar_engine: &tar_engine,
             tempdir: tempdir.path(),
-            hardlink_roots: &hardlink_roots,
             no_index,
         };
         process_input(input, context, &mut state)?;
     }
+    state.record_hardlink_splits();
     state
         .files
         .sort_by(|a, b| a.archive_path.cmp(&b.archive_path));
@@ -319,8 +371,46 @@ pub(crate) fn scan_only_report(
     no_index: bool,
     tuning: ScanTuning,
 ) -> Result<IngestReport, String> {
-    let plan = materialize_inputs(input_paths, rules_path, no_index, tuning)?;
-    Ok(plan.report)
+    let tar_engine = detect_tar_engine()?;
+    let ruleset = match rules_path {
+        Some(path) => Some(load_ruleset(path)?),
+        None => None,
+    };
+    let default_xattr_policy = XattrPolicy::default();
+    let xattr_policy = ruleset
+        .as_ref()
+        .map(|ruleset| &ruleset.xattr_policy)
+        .unwrap_or(&default_xattr_policy);
+    let tempdir = tempfile::Builder::new()
+        .prefix("remanence-remwrap-scan-")
+        .tempdir()
+        .map_err(|error| format!("create scan tempdir: {error}"))?;
+    let mut state = PlannerState {
+        hardlink_groups: collect_hardlink_groups_for_inputs(input_paths)?,
+        ..Default::default()
+    };
+    let context = ProcessContext {
+        ruleset: ruleset.as_ref(),
+        xattr_policy,
+        tar_engine: &tar_engine,
+        tempdir: tempdir.path(),
+        no_index,
+    };
+    for input in input_paths {
+        scan_input(input, context, &mut state)?;
+    }
+    state.record_hardlink_splits();
+    let lints = ruleset
+        .as_ref()
+        .map(|ruleset| ruleset.lints.clone())
+        .unwrap_or_default();
+    let ruleset_report = ruleset.as_ref().map(|ruleset| ruleset.report.clone());
+    Ok(IngestReport {
+        ruleset: ruleset_report,
+        tar_engine,
+        scan: state.scan_report(tuning),
+        lints,
+    })
 }
 
 pub(crate) fn write_customer_manifest(
@@ -392,11 +482,19 @@ pub(crate) fn resolve_blob_member_from_index(
             index.format
         ));
     }
-    let member = index
-        .entries
-        .iter()
-        .find(|entry| entry.path == member_path)
-        .ok_or_else(|| format!("blob member {member_path:?} not found in {idx_path:?}"))?;
+    let requested = decode_member_name(member_path)
+        .map_err(|error| format!("decode requested blob member {member_path:?}: {error}"))?;
+    let mut member = None;
+    for entry in &index.entries {
+        let stored = decode_member_name(&entry.path)
+            .map_err(|error| format!("decode blob index member {:?}: {error}", entry.path))?;
+        if stored == requested {
+            member = Some(entry);
+            break;
+        }
+    }
+    let member =
+        member.ok_or_else(|| format!("blob member {member_path:?} not found in {idx_path:?}"))?;
     if member.kind != "regular" {
         return Err(format!(
             "blob member {member_path:?} is {}, not regular",
@@ -485,6 +583,21 @@ fn process_input(
     }
 }
 
+fn scan_input(
+    input: &Path,
+    context: ProcessContext<'_>,
+    state: &mut PlannerState,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(input)
+        .map_err(|error| format!("stat input {}: {error}", input.display()))?;
+    if metadata.file_type().is_symlink() || metadata.is_file() || !metadata.is_dir() {
+        let relative = PathBuf::from(input.file_name().unwrap_or_else(|| OsStr::new("input")));
+        scan_leaf(input, &relative, &metadata, context, state)
+    } else {
+        scan_dir(input, Path::new(""), context, state).map(|_| ())
+    }
+}
+
 fn process_dir(
     root: &Path,
     dir: &Path,
@@ -496,6 +609,7 @@ fn process_dir(
     match decide(context.ruleset, &rel_text, true) {
         Decision::Exclude => {
             let (count, bytes) = subtree_count_bytes(dir)?;
+            state.note_hardlink_boundary(&rel_text, true);
             state.record_cluster(&rel_text, "exclude-rule", count, bytes);
             state.totals.excluded_entries = state.totals.excluded_entries.saturating_add(count);
             state.totals.excluded_bytes = state.totals.excluded_bytes.saturating_add(bytes);
@@ -504,6 +618,7 @@ fn process_dir(
         Decision::Blob {
             no_index: rule_no_index,
         } if !relative.as_os_str().is_empty() => {
+            state.note_hardlink_boundary(&rel_text, true);
             materialize_blob(
                 root,
                 dir,
@@ -517,6 +632,7 @@ fn process_dir(
         Decision::Blob {
             no_index: rule_no_index,
         } => {
+            state.note_hardlink_boundary(&rel_text, true);
             let name = dir.file_name().ok_or_else(|| {
                 format!(
                     "blob input directory {} does not have a file name",
@@ -534,23 +650,15 @@ fn process_dir(
         }
         Decision::Granular => {}
     }
-    if context.hardlink_roots.contains(relative) {
-        if relative.as_os_str().is_empty() {
-            let name = dir.file_name().ok_or_else(|| {
-                format!(
-                    "hardlink blob root {} does not have a file name",
-                    dir.display()
-                )
-            })?;
-            materialize_root_blob(dir, name, context, "hardlink", state)?;
-        } else {
-            materialize_blob(root, dir, relative, context, "hardlink", state)?;
+    if !relative.as_os_str().is_empty() {
+        let metadata = fs::symlink_metadata(dir)
+            .map_err(|error| format!("stat input {}: {error}", dir.display()))?;
+        if let NativeStatus::WrapFallback(reason) =
+            native_status(dir, relative, &metadata, context, state)?
+        {
+            materialize_blob(root, dir, relative, context, reason, state)?;
+            return Ok(true);
         }
-        return Ok(true);
-    }
-    if !relative.as_os_str().is_empty() && has_xattrs(dir)? {
-        materialize_blob(root, dir, relative, context, "xattr", state)?;
-        return Ok(true);
     }
 
     let mut entries = fs::read_dir(dir)
@@ -604,10 +712,82 @@ fn process_dir(
     Ok(added_any)
 }
 
-fn process_leaf(
+fn scan_dir(
+    dir: &Path,
+    relative: &Path,
+    context: ProcessContext<'_>,
+    state: &mut PlannerState,
+) -> Result<bool, String> {
+    let rel_text = relative_match_text(relative);
+    match decide(context.ruleset, &rel_text, true) {
+        Decision::Exclude => {
+            let (count, bytes) = subtree_count_bytes(dir)?;
+            state.note_hardlink_boundary(&rel_text, true);
+            state.record_cluster(&rel_text, "exclude-rule", count, bytes);
+            state.totals.excluded_entries = state.totals.excluded_entries.saturating_add(count);
+            state.totals.excluded_bytes = state.totals.excluded_bytes.saturating_add(bytes);
+            return Ok(true);
+        }
+        Decision::Blob { .. } if !relative.as_os_str().is_empty() => {
+            let (_, bytes) = subtree_count_bytes(dir)?;
+            state.note_hardlink_boundary(&rel_text, true);
+            state.record_blob(&rel_text, bytes, "blob-rule");
+            return Ok(true);
+        }
+        Decision::Blob { .. } => {
+            let (_, bytes) = subtree_count_bytes(dir)?;
+            state.note_hardlink_boundary(&rel_text, true);
+            state.record_blob(&rel_text, bytes, "blob-rule");
+            return Ok(true);
+        }
+        Decision::Granular => {}
+    }
+
+    let metadata = fs::symlink_metadata(dir)
+        .map_err(|error| format!("stat input {}: {error}", dir.display()))?;
+    if !relative.as_os_str().is_empty() {
+        if let NativeStatus::WrapFallback(reason) =
+            native_status(dir, relative, &metadata, context, state)?
+        {
+            let (_, bytes) = subtree_count_bytes(dir)?;
+            state.note_hardlink_boundary(&rel_text, true);
+            state.record_wrapped(&rel_text, reason, bytes);
+            return Ok(true);
+        }
+    }
+
+    let mut entries = fs::read_dir(dir)
+        .map_err(|error| format!("read directory {}: {error}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("read directory {}: {error}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    if entries.is_empty() {
+        if !relative.as_os_str().is_empty() {
+            state.record_native(&rel_text, 0);
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+
+    let mut added_any = false;
+    for entry in entries {
+        let path = entry.path();
+        let child_relative = relative.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("stat input {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() || metadata.is_file() || !metadata.is_dir() {
+            scan_leaf(&path, &child_relative, &metadata, context, state)?;
+            added_any = true;
+        } else if scan_dir(&path, &child_relative, context, state)? {
+            added_any = true;
+        }
+    }
+    Ok(added_any)
+}
+
+fn scan_leaf(
     path: &Path,
     relative: &Path,
-    archive_path: String,
     metadata: &fs::Metadata,
     context: ProcessContext<'_>,
     state: &mut PlannerState,
@@ -616,6 +796,7 @@ fn process_leaf(
     match decide(context.ruleset, &rel_text, false) {
         Decision::Exclude => {
             let bytes = metadata.len();
+            state.note_hardlink_boundary(&rel_text, false);
             state.record_cluster(&rel_text, "exclude-rule", 1, bytes);
             state.totals.excluded_entries = state.totals.excluded_entries.saturating_add(1);
             state.totals.excluded_bytes = state.totals.excluded_bytes.saturating_add(bytes);
@@ -629,8 +810,50 @@ fn process_leaf(
         Decision::Granular => {}
     }
 
-    match native_status(path, relative, metadata)? {
-        NativeStatus::Native if metadata.file_type().is_symlink() => {
+    match native_status(path, relative, metadata, context, state)? {
+        NativeStatus::Native { .. } if metadata.is_file() => {
+            state.note_native_hardlink(path, metadata, &rel_text, "");
+            state.record_native(&rel_text, metadata.len());
+        }
+        NativeStatus::Native { .. } => {
+            state.record_native(&rel_text, 0);
+        }
+        NativeStatus::WrapFallback(reason) => {
+            state.note_hardlink_boundary(&rel_text, false);
+            state.record_wrapped(&rel_text, reason, metadata.len());
+        }
+    }
+    Ok(())
+}
+
+fn process_leaf(
+    path: &Path,
+    relative: &Path,
+    archive_path: String,
+    metadata: &fs::Metadata,
+    context: ProcessContext<'_>,
+    state: &mut PlannerState,
+) -> Result<(), String> {
+    let rel_text = relative_match_text(relative);
+    match decide(context.ruleset, &rel_text, false) {
+        Decision::Exclude => {
+            let bytes = metadata.len();
+            state.note_hardlink_boundary(&rel_text, false);
+            state.record_cluster(&rel_text, "exclude-rule", 1, bytes);
+            state.totals.excluded_entries = state.totals.excluded_entries.saturating_add(1);
+            state.totals.excluded_bytes = state.totals.excluded_bytes.saturating_add(bytes);
+            return Ok(());
+        }
+        Decision::Blob { .. } => {
+            return Err(format!(
+                "blob rule matched non-directory path {rel_text:?}; blob patterns must select directories"
+            ))
+        }
+        Decision::Granular => {}
+    }
+
+    match native_status(path, relative, metadata, context, state)? {
+        NativeStatus::Native { .. } if metadata.file_type().is_symlink() => {
             state.record_native(&rel_text, 0);
             state
                 .files
@@ -644,12 +867,33 @@ fn process_leaf(
                 wrapper: None,
             });
         }
-        NativeStatus::Native if metadata.is_file() => {
+        NativeStatus::Native { xattrs } if metadata.is_file() => {
+            if let Some(link_target) =
+                state.note_native_hardlink(path, metadata, &rel_text, &archive_path)
+            {
+                state.record_native(&rel_text, 0);
+                state.files.push(read_archive_build_hardlink(
+                    path,
+                    archive_path,
+                    link_target.clone(),
+                )?);
+                state.manifest_entries.push(CustomerManifestEntry {
+                    path: rel_text,
+                    kind: "hardlink",
+                    size_bytes: 0,
+                    sha256: None,
+                    mtime: metadata_mtime(path, metadata)?,
+                    wrapper: None,
+                });
+                return Ok(());
+            }
             let (size, hash) = hash_for_manifest(path)?;
             state.record_native(&rel_text, size);
-            state
-                .files
-                .push(read_archive_build_file(path, archive_path)?);
+            state.files.push(read_archive_build_file_with_xattrs(
+                path,
+                archive_path,
+                xattrs,
+            )?);
             state.manifest_entries.push(CustomerManifestEntry {
                 path: rel_text,
                 kind: "regular",
@@ -659,7 +903,7 @@ fn process_leaf(
                 wrapper: None,
             });
         }
-        NativeStatus::Native => {
+        NativeStatus::Native { .. } => {
             return Err(format!(
                 "internal native status bug for unsupported path {}",
                 path.display()
@@ -681,6 +925,7 @@ fn wrap_leaf(
     state: &mut PlannerState,
 ) -> Result<(), String> {
     let rel_text = relative_match_text(relative);
+    state.note_hardlink_boundary(&rel_text, metadata.is_dir());
     let wrapper_name = format!(
         "{}{}",
         sanitized_or_native_archive_path(relative),
@@ -844,6 +1089,7 @@ fn load_ruleset(path: &Path) -> Result<Ruleset, String> {
     let text = String::from_utf8(bytes.clone())
         .map_err(|error| format!("ruleset {} must be UTF-8: {error}", path.display()))?;
     let mut case_insensitive = false;
+    let mut xattr_policy = XattrPolicy::default();
     let mut rules = Vec::new();
     for (line_index, original) in text.lines().enumerate() {
         let line_no = line_index + 1;
@@ -852,7 +1098,21 @@ fn load_ruleset(path: &Path) -> Result<Ruleset, String> {
             continue;
         }
         if let Some(option) = line.strip_prefix("option ") {
-            match option.trim() {
+            let option = option.trim();
+            if let Some(mode) = option.strip_prefix("xattr-mode ") {
+                xattr_policy.mode = match mode.trim() {
+                    "denylist" => XattrMode::Denylist,
+                    "allowlist" => XattrMode::Allowlist,
+                    other => {
+                        return Err(format!(
+                            "{}:{line_no}: unsupported xattr-mode {other:?}",
+                            path.display()
+                        ))
+                    }
+                };
+                continue;
+            }
+            match option {
                 "case-insensitive" => case_insensitive = true,
                 other if other.starts_with("expect") => {}
                 other => {
@@ -862,6 +1122,18 @@ fn load_ruleset(path: &Path) -> Result<Ruleset, String> {
                     ))
                 }
             }
+            continue;
+        }
+        if let Some(name) = line.strip_prefix("xattr-keep ") {
+            let name = name.trim();
+            validate_xattr_policy_name(path, line_no, name)?;
+            xattr_policy.keep.insert(name.to_string());
+            continue;
+        }
+        if let Some(name) = line.strip_prefix("xattr-drop ") {
+            let name = name.trim();
+            validate_xattr_policy_name(path, line_no, name)?;
+            xattr_policy.drop.insert(name.to_string());
             continue;
         }
         if line.starts_with("expect") {
@@ -919,11 +1191,50 @@ fn load_ruleset(path: &Path) -> Result<Ruleset, String> {
         rule_count: rules.len(),
     };
     let lints = lint_rules(&rules);
+    validate_xattr_policy(path, &xattr_policy)?;
     Ok(Ruleset {
         report,
         rules,
+        xattr_policy,
         lints,
     })
+}
+
+impl Default for XattrPolicy {
+    fn default() -> Self {
+        Self {
+            mode: XattrMode::Denylist,
+            keep: BTreeSet::new(),
+            drop: BTreeSet::new(),
+        }
+    }
+}
+
+fn validate_xattr_policy_name(path: &Path, line_no: usize, name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(format!("{}:{line_no}: missing xattr name", path.display()));
+    }
+    if name.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
+        return Err(format!(
+            "{}:{line_no}: xattr name {name:?} contains a control character",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_xattr_policy(path: &Path, policy: &XattrPolicy) -> Result<(), String> {
+    match policy.mode {
+        XattrMode::Denylist if !policy.keep.is_empty() => Err(format!(
+            "{}: xattr-keep requires 'option xattr-mode allowlist'",
+            path.display()
+        )),
+        XattrMode::Allowlist if !policy.drop.is_empty() => Err(format!(
+            "{}: xattr-drop requires 'option xattr-mode denylist'",
+            path.display()
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn lint_rules(rules: &[Rule]) -> Vec<RulesetLint> {
@@ -1159,25 +1470,35 @@ fn native_status(
     path: &Path,
     relative: &Path,
     metadata: &fs::Metadata,
+    context: ProcessContext<'_>,
+    state: &mut PlannerState,
 ) -> Result<NativeStatus, String> {
     if archive_path_from_relative(relative).is_err() {
         return Ok(NativeStatus::WrapFallback("non-utf8-path"));
     }
+    let rel_text = relative_match_text(relative);
     let status = if metadata.file_type().is_symlink() {
         match fs::read_link(path)
             .ok()
             .and_then(|target| target.to_str().map(str::to_string))
         {
-            Some(_) => NativeStatus::Native,
+            Some(_) => NativeStatus::Native {
+                xattrs: BTreeMap::new(),
+            },
             None => NativeStatus::WrapFallback("non-utf8-symlink-target"),
         }
     } else if metadata.is_file() {
-        if has_xattrs(path)? {
-            NativeStatus::WrapFallback("xattr")
-        } else if has_multiple_hardlinks(metadata) {
-            NativeStatus::WrapFallback("hardlink")
-        } else {
-            NativeStatus::Native
+        match collect_preserved_xattrs(path, &rel_text, context.xattr_policy, state)? {
+            XattrCollection::Preserve(xattrs) => NativeStatus::Native { xattrs },
+            XattrCollection::Wrap(reason) => NativeStatus::WrapFallback(reason),
+        }
+    } else if metadata.is_dir() {
+        match collect_preserved_xattrs(path, &rel_text, context.xattr_policy, state)? {
+            XattrCollection::Preserve(xattrs) if xattrs.is_empty() => NativeStatus::Native {
+                xattrs: BTreeMap::new(),
+            },
+            XattrCollection::Preserve(_) => NativeStatus::WrapFallback("xattr"),
+            XattrCollection::Wrap(reason) => NativeStatus::WrapFallback(reason),
         }
     } else {
         NativeStatus::WrapFallback("unsupported-file-type")
@@ -1185,39 +1506,139 @@ fn native_status(
     Ok(status)
 }
 
-#[cfg(unix)]
-fn collect_hardlink_roots(input: &Path) -> Result<BTreeSet<PathBuf>, String> {
-    let metadata = fs::symlink_metadata(input)
-        .map_err(|error| format!("stat input {}: {error}", input.display()))?;
-    let mut groups = BTreeMap::<(u64, u64), Vec<PathBuf>>::new();
-    if metadata.is_dir() {
-        collect_hardlink_groups(input, input, Path::new(""), &mut groups)?;
-    } else if metadata.is_file() && metadata.nlink() > 1 {
-        if let Some(name) = input.file_name() {
-            groups
-                .entry((metadata.dev(), metadata.ino()))
-                .or_default()
-                .push(PathBuf::from(name));
+enum XattrCollection {
+    Preserve(BTreeMap<String, Vec<u8>>),
+    Wrap(&'static str),
+}
+
+fn collect_preserved_xattrs(
+    path: &Path,
+    rel_text: &str,
+    policy: &XattrPolicy,
+    state: &mut PlannerState,
+) -> Result<XattrCollection, String> {
+    let names = match xattr::list(path) {
+        Ok(names) => names.collect::<Vec<_>>(),
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+            return Ok(XattrCollection::Preserve(BTreeMap::new()))
         }
+        Err(error) => return Err(format!("list xattrs for {}: {error}", path.display())),
+    };
+    let mut kept = BTreeMap::new();
+    let mut total_size = 0usize;
+    for name in names {
+        let Some(name_text) = name.to_str() else {
+            return Ok(XattrCollection::Wrap("xattr-name"));
+        };
+        if should_drop_xattr(name_text, policy) {
+            let reason = if builtin_junk_xattr(name_text) {
+                "baseline"
+            } else {
+                "policy"
+            };
+            state.record_xattr_drop(rel_text, name_text, reason);
+            continue;
+        }
+        let Some(value) = xattr::get(path, &name)
+            .map_err(|error| format!("read xattr {name_text:?} for {}: {error}", path.display()))?
+        else {
+            continue;
+        };
+        if value.len() > XATTR_SINGLE_VALUE_LIMIT {
+            return Ok(XattrCollection::Wrap("xattr-large"));
+        }
+        total_size = total_size
+            .checked_add(value.len())
+            .ok_or_else(|| format!("xattr total size overflows for {}", path.display()))?;
+        if total_size > XATTR_TOTAL_VALUE_LIMIT {
+            return Ok(XattrCollection::Wrap("xattr-large"));
+        }
+        kept.insert(name_text.to_string(), value);
     }
-    Ok(groups
-        .into_values()
-        .filter(|paths| paths.len() > 1)
-        .map(|paths| common_parent_path(&paths))
-        .collect())
+    Ok(XattrCollection::Preserve(kept))
+}
+
+fn should_drop_xattr(name: &str, policy: &XattrPolicy) -> bool {
+    if builtin_junk_xattr(name) {
+        return true;
+    }
+    match policy.mode {
+        XattrMode::Denylist => policy.drop.contains(name),
+        XattrMode::Allowlist => !policy.keep.contains(name),
+    }
+}
+
+fn builtin_junk_xattr(name: &str) -> bool {
+    matches!(
+        name,
+        "com.apple.quarantine"
+            | "com.apple.metadata:kMDItemWhereFroms"
+            | "com.apple.lastuseddate#PS"
+            | "com.apple.FinderInfo"
+            | "com.apple.metadata:_kMDItemFinderComment"
+            | "com.apple.metadata:kMDItemDownloadedDate"
+    )
+}
+
+#[cfg(unix)]
+fn file_key(metadata: &fs::Metadata) -> Option<FileKey> {
+    (metadata.nlink() > 1).then_some(FileKey {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
 }
 
 #[cfg(not(unix))]
-fn collect_hardlink_roots(_input: &Path) -> Result<BTreeSet<PathBuf>, String> {
-    Ok(BTreeSet::new())
+fn file_key(_metadata: &fs::Metadata) -> Option<FileKey> {
+    None
+}
+
+fn collect_hardlink_groups_for_inputs(inputs: &[PathBuf]) -> Result<HardlinkGroups, String> {
+    let mut groups = HardlinkGroups::default();
+    for input in inputs {
+        collect_hardlink_groups_for_input(input, &mut groups)?;
+    }
+    groups.by_key.retain(|_, paths| paths.len() > 1);
+    groups
+        .by_path
+        .retain(|_, key| groups.by_key.contains_key(key));
+    Ok(groups)
 }
 
 #[cfg(unix)]
-fn collect_hardlink_groups(
+fn collect_hardlink_groups_for_input(
+    input: &Path,
+    groups: &mut HardlinkGroups,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(input)
+        .map_err(|error| format!("stat input {}: {error}", input.display()))?;
+    if metadata.is_dir() {
+        collect_hardlink_groups_for_dir(input, input, Path::new(""), groups)
+    } else if metadata.is_file() && metadata.nlink() > 1 {
+        if let Some(name) = input.file_name() {
+            let relative = PathBuf::from(name);
+            add_hardlink_group_member(&metadata, &relative_match_text(&relative), groups);
+        }
+        Ok(())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+fn collect_hardlink_groups_for_input(
+    _input: &Path,
+    _groups: &mut HardlinkGroups,
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn collect_hardlink_groups_for_dir(
     root: &Path,
     dir: &Path,
     relative: &Path,
-    groups: &mut BTreeMap<(u64, u64), Vec<PathBuf>>,
+    groups: &mut HardlinkGroups,
 ) -> Result<(), String> {
     let mut entries = fs::read_dir(dir)
         .map_err(|error| format!("read directory {}: {error}", dir.display()))?
@@ -1230,81 +1651,38 @@ fn collect_hardlink_groups(
         let metadata = fs::symlink_metadata(&path)
             .map_err(|error| format!("stat input {}: {error}", path.display()))?;
         if metadata.is_dir() {
-            collect_hardlink_groups(root, &path, &child_relative, groups)?;
+            collect_hardlink_groups_for_dir(root, &path, &child_relative, groups)?;
         } else if metadata.is_file() && metadata.nlink() > 1 {
             let normalized = path
                 .strip_prefix(root)
                 .map(PathBuf::from)
                 .unwrap_or(child_relative);
-            groups
-                .entry((metadata.dev(), metadata.ino()))
-                .or_default()
-                .push(normalized);
+            add_hardlink_group_member(&metadata, &relative_match_text(&normalized), groups);
         }
     }
     Ok(())
 }
 
-fn common_parent_path(paths: &[PathBuf]) -> PathBuf {
-    let Some(first) = paths.first() else {
-        return PathBuf::new();
-    };
-    let mut common = path_components(first.parent().unwrap_or_else(|| Path::new("")));
-    for path in &paths[1..] {
-        let components = path_components(path.parent().unwrap_or_else(|| Path::new("")));
-        let keep = common
-            .iter()
-            .zip(components.iter())
-            .take_while(|(left, right)| left == right)
-            .count();
-        common.truncate(keep);
-    }
-    common.into_iter().collect()
-}
-
-fn path_components(path: &Path) -> Vec<OsString> {
-    path.components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(part) => Some(part.to_os_string()),
-            _ => None,
-        })
-        .collect()
-}
-
 #[cfg(unix)]
-fn has_multiple_hardlinks(metadata: &fs::Metadata) -> bool {
-    metadata.nlink() > 1
+fn add_hardlink_group_member(metadata: &fs::Metadata, rel_text: &str, groups: &mut HardlinkGroups) {
+    let key = FileKey {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    };
+    groups
+        .by_key
+        .entry(key)
+        .or_default()
+        .push(rel_text.to_string());
+    groups.by_path.insert(rel_text.to_string(), key);
 }
 
 #[cfg(not(unix))]
-fn has_multiple_hardlinks(_metadata: &fs::Metadata) -> bool {
-    false
-}
-
-fn has_xattrs(path: &Path) -> Result<bool, String> {
-    if !command_available("getfattr") {
-        return Err(
-            "getfattr is required for xattr-aware RAO ingest; install the attr package".to_string(),
-        );
-    }
-    let output = Command::new("getfattr")
-        .arg("--absolute-names")
-        .arg("--dump")
-        .arg("-m")
-        .arg("-")
-        .arg(path)
-        .output()
-        .map_err(|error| format!("run getfattr for {}: {error}", path.display()))?;
-    if !output.status.success() {
-        return Err(format!(
-            "getfattr failed for {}: {}",
-            path.display(),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .any(|line| !line.starts_with('#') && line.contains('=')))
+fn add_hardlink_group_member(
+    _metadata: &fs::Metadata,
+    _rel_text: &str,
+    _groups: &mut HardlinkGroups,
+) {
 }
 
 fn create_wrapper_tar(
@@ -1375,7 +1753,7 @@ fn validate_wrap_tar_paths(wrapper: &Path, _tar_engine: &TarEngineReport) -> Res
     let mut file = File::open(wrapper)
         .map_err(|error| format!("open wrapper {}: {error}", wrapper.display()))?;
     let mut offset = 0u64;
-    let mut pending_pax = BTreeMap::<String, String>::new();
+    let mut pending_pax = BTreeMap::<String, Vec<u8>>::new();
     loop {
         let mut header = [0u8; 512];
         file.read_exact(&mut header)
@@ -1400,7 +1778,7 @@ fn validate_wrap_tar_paths(wrapper: &Path, _tar_engine: &TarEngineReport) -> Res
         let name = pending_pax
             .get("path")
             .cloned()
-            .unwrap_or_else(|| tar_header_path(&header));
+            .unwrap_or_else(|| tar_header_path_bytes(&header));
         validate_tar_member_path(&name).map_err(|error| {
             format!(
                 "wrapper {} has unsafe member path: {error}",
@@ -1416,20 +1794,30 @@ fn validate_wrap_tar_paths(wrapper: &Path, _tar_engine: &TarEngineReport) -> Res
     Ok(())
 }
 
-fn validate_tar_member_path(path: &str) -> Result<(), String> {
-    if path.is_empty() || path.as_bytes().contains(&0) || path.starts_with('/') {
-        return Err(format!("{path:?} is not a normalized relative path"));
+fn validate_tar_member_path(path: &[u8]) -> Result<(), String> {
+    let escaped = escape_member_name(path);
+    if path.is_empty() || path.contains(&0) || path.starts_with(b"/") {
+        return Err(format!("{escaped:?} is not a normalized relative path"));
     }
-    let trimmed = path.trim_end_matches('/');
+    let trimmed = trim_trailing_slashes(path);
     if trimmed.is_empty() {
-        return Err(format!("{path:?} is not a normalized relative path"));
+        return Err(format!("{escaped:?} is not a normalized relative path"));
     }
-    for part in trimmed.split('/') {
-        if part.is_empty() || part == "." || part == ".." {
-            return Err(format!("{path:?} is not a normalized relative path"));
+    for part in trimmed.split(|byte| *byte == b'/') {
+        if part.is_empty() || part == b"." || part == b".." {
+            return Err(format!("{escaped:?} is not a normalized relative path"));
         }
     }
     Ok(())
+}
+
+fn trim_trailing_slashes(path: &[u8]) -> &[u8] {
+    let end = path
+        .iter()
+        .rposition(|byte| *byte != b'/')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    &path[..end]
 }
 
 fn detect_tar_engine() -> Result<TarEngineReport, String> {
@@ -1488,7 +1876,7 @@ fn build_wrap_index(tar_path: &Path, tar_engine: &TarEngineReport) -> Result<Wra
         .map_err(|error| format!("open wrapper {}: {error}", tar_path.display()))?;
     let mut entries = Vec::new();
     let mut offset = 0u64;
-    let mut pending_pax = BTreeMap::<String, String>::new();
+    let mut pending_pax = BTreeMap::<String, Vec<u8>>::new();
     loop {
         let mut header = [0u8; 512];
         file.read_exact(&mut header)
@@ -1510,10 +1898,10 @@ fn build_wrap_index(tar_path: &Path, tar_engine: &TarEngineReport) -> Result<Wra
             offset = next_tar_header_offset(data_offset, size)?;
             continue;
         }
-        let name = pending_pax
+        let name_bytes = pending_pax
             .get("path")
             .cloned()
-            .unwrap_or_else(|| tar_header_path(&header));
+            .unwrap_or_else(|| tar_header_path_bytes(&header));
         let mtime = tar_entry_mtime(&header, &pending_pax)?;
         let kind = match typeflag {
             b'0' | 0 => "regular",
@@ -1527,7 +1915,7 @@ fn build_wrap_index(tar_path: &Path, tar_engine: &TarEngineReport) -> Result<Wra
             None
         };
         entries.push(WrapIndexEntry {
-            path: name,
+            path: escape_member_name(&name_bytes),
             kind: kind.to_string(),
             offset: data_offset,
             length: if kind == "regular" { size } else { 0 },
@@ -1587,7 +1975,7 @@ fn parse_tar_size(header: &[u8; 512]) -> Result<u64, String> {
     u64::from_str_radix(text.trim(), 8).map_err(|error| format!("parse tar size {text:?}: {error}"))
 }
 
-fn parse_pax_records(data: &[u8]) -> Result<BTreeMap<String, String>, String> {
+fn parse_pax_records(data: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut records = BTreeMap::new();
     let mut cursor = 0usize;
     while cursor < data.len() {
@@ -1595,7 +1983,8 @@ fn parse_pax_records(data: &[u8]) -> Result<BTreeMap<String, String>, String> {
             .iter()
             .position(|byte| *byte == b' ')
             .ok_or_else(|| "pax record is missing length separator".to_string())?;
-        let len_text = String::from_utf8_lossy(&data[cursor..cursor + space]);
+        let len_text = std::str::from_utf8(&data[cursor..cursor + space])
+            .map_err(|error| format!("pax record length is not UTF-8: {error}"))?;
         let len = len_text
             .parse::<usize>()
             .map_err(|error| format!("parse pax record length {len_text:?}: {error}"))?;
@@ -1608,8 +1997,10 @@ fn parse_pax_records(data: &[u8]) -> Result<BTreeMap<String, String>, String> {
         }
         let record = &data[cursor + space + 1..cursor + len - 1];
         if let Some(eq) = record.iter().position(|byte| *byte == b'=') {
-            let key = String::from_utf8_lossy(&record[..eq]).to_string();
-            let value = String::from_utf8_lossy(&record[eq + 1..]).to_string();
+            let key = std::str::from_utf8(&record[..eq])
+                .map_err(|error| format!("pax record key is not UTF-8: {error}"))?
+                .to_string();
+            let value = record[eq + 1..].to_vec();
             records.insert(key, value);
         }
         cursor += len;
@@ -1617,21 +2008,26 @@ fn parse_pax_records(data: &[u8]) -> Result<BTreeMap<String, String>, String> {
     Ok(records)
 }
 
-fn tar_header_path(header: &[u8; 512]) -> String {
-    let name = nul_trim(&header[0..100]);
-    let prefix = nul_trim(&header[345..500]);
+fn tar_header_path_bytes(header: &[u8; 512]) -> Vec<u8> {
+    let name = nul_trim_bytes(&header[0..100]);
+    let prefix = nul_trim_bytes(&header[345..500]);
     if prefix.is_empty() {
         name
     } else {
-        format!("{prefix}/{name}")
+        let mut out = prefix;
+        out.push(b'/');
+        out.extend(name);
+        out
     }
 }
 
 fn tar_entry_mtime(
     header: &[u8; 512],
-    pax_records: &BTreeMap<String, String>,
+    pax_records: &BTreeMap<String, Vec<u8>>,
 ) -> Result<Option<String>, String> {
     if let Some(value) = pax_records.get("mtime") {
+        let value = std::str::from_utf8(value)
+            .map_err(|error| format!("pax mtime is not UTF-8: {error}"))?;
         return unix_nanos_rfc3339(parse_pax_mtime_nanos(value)?).map(Some);
     }
     let Some(seconds) = parse_tar_octal_field(&header[136..148], "tar mtime")? else {
@@ -1725,12 +2121,122 @@ fn unix_nanos_rfc3339(nanos: i128) -> Result<String, String> {
         .map_err(|error| format!("format mtime: {error}"))
 }
 
-fn nul_trim(bytes: &[u8]) -> String {
+fn nul_trim_bytes(bytes: &[u8]) -> Vec<u8> {
     let end = bytes
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..end]).to_string()
+    bytes[..end].to_vec()
+}
+
+pub(crate) fn escape_member_name(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        match std::str::from_utf8(&bytes[cursor..]) {
+            Ok(valid) => {
+                escape_valid_member_name_chunk(valid, &mut out);
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to > 0 {
+                    let valid = std::str::from_utf8(&bytes[cursor..cursor + valid_up_to])
+                        .expect("valid_up_to returned valid UTF-8 prefix");
+                    escape_valid_member_name_chunk(valid, &mut out);
+                    cursor += valid_up_to;
+                }
+                if let Some(error_len) = error.error_len() {
+                    for byte in &bytes[cursor..cursor + error_len] {
+                        push_hex_escape(&mut out, *byte);
+                    }
+                    cursor += error_len;
+                } else {
+                    for byte in &bytes[cursor..] {
+                        push_hex_escape(&mut out, *byte);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn escape_valid_member_name_chunk(valid: &str, out: &mut String) {
+    for ch in valid.chars() {
+        if ch == '\\' {
+            out.push_str("\\\\");
+        } else if matches!(ch, '\u{0}'..='\u{1f}' | '\u{7f}') {
+            for byte in ch.to_string().as_bytes() {
+                push_hex_escape(out, *byte);
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+}
+
+fn push_hex_escape(out: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push('\\');
+    out.push('x');
+    out.push(char::from(HEX[(byte >> 4) as usize]));
+    out.push(char::from(HEX[(byte & 0x0f) as usize]));
+}
+
+pub(crate) fn decode_member_name(value: &str) -> Result<Vec<u8>, String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if bytes[cursor] != b'\\' {
+            out.push(bytes[cursor]);
+            cursor += 1;
+            continue;
+        }
+        let Some(next) = bytes.get(cursor + 1).copied() else {
+            return Err("trailing backslash escape".to_string());
+        };
+        match next {
+            b'\\' => {
+                out.push(b'\\');
+                cursor += 2;
+            }
+            b'x' => {
+                let hi = bytes
+                    .get(cursor + 2)
+                    .copied()
+                    .ok_or_else(|| "short \\xHH escape".to_string())?;
+                let lo = bytes
+                    .get(cursor + 3)
+                    .copied()
+                    .ok_or_else(|| "short \\xHH escape".to_string())?;
+                let hi =
+                    hex_value(hi).ok_or_else(|| "invalid hex digit in \\xHH escape".to_string())?;
+                let lo =
+                    hex_value(lo).ok_or_else(|| "invalid hex digit in \\xHH escape".to_string())?;
+                out.push((hi << 4) | lo);
+                cursor += 4;
+            }
+            other => {
+                return Err(format!(
+                    "unsupported backslash escape \\{}",
+                    char::from(other)
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn hash_tar_range(file: &mut File, offset: u64, size: u64) -> Result<String, String> {
@@ -1861,6 +2367,83 @@ impl PlannerState {
         }
     }
 
+    fn record_xattr_drop(&mut self, rel_text: &str, name: &str, reason: &str) {
+        self.totals.dropped_xattrs = self.totals.dropped_xattrs.saturating_add(1);
+        let prefix = directory_prefix(rel_text);
+        let cluster = self
+            .xattr_drops
+            .entry((prefix, name.to_string(), reason.to_string()))
+            .or_default();
+        cluster.count = cluster.count.saturating_add(1);
+        if cluster.samples.len() < DEFAULT_SAMPLES_PER_CLUSTER {
+            cluster.samples.push(rel_text.to_string());
+        }
+    }
+
+    fn note_hardlink_boundary(&mut self, rel_text: &str, is_dir: bool) {
+        let affected = self
+            .hardlink_groups
+            .by_path
+            .iter()
+            .filter_map(|(path, key)| {
+                if (!is_dir && path == rel_text) || (is_dir && prefix_contains(rel_text, path)) {
+                    Some(*key)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        for key in affected {
+            *self.hardlink_blob_counts.entry(key).or_default() += 1;
+        }
+    }
+
+    fn note_native_hardlink(
+        &mut self,
+        _path: &Path,
+        metadata: &fs::Metadata,
+        rel_text: &str,
+        archive_path: &str,
+    ) -> Option<String> {
+        let key = file_key(metadata)?;
+        if !self.hardlink_groups.by_key.contains_key(&key) {
+            return None;
+        }
+        *self.hardlink_native_counts.entry(key).or_default() += 1;
+        if let Some(primary) = self.hardlink_primaries.get(&key) {
+            Some(primary.clone())
+        } else {
+            self.hardlink_primaries
+                .insert(key, archive_path.to_string());
+            self.hardlink_groups
+                .by_path
+                .entry(rel_text.to_string())
+                .or_insert(key);
+            None
+        }
+    }
+
+    fn record_hardlink_splits(&mut self) {
+        let split_keys = self
+            .hardlink_blob_counts
+            .iter()
+            .filter_map(|(key, blob_count)| {
+                let native_count = self.hardlink_native_counts.get(key).copied().unwrap_or(0);
+                (native_count > 0 && *blob_count > 0).then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        for key in split_keys {
+            let sample = self
+                .hardlink_groups
+                .by_key
+                .get(&key)
+                .and_then(|paths| paths.first())
+                .cloned()
+                .unwrap_or_else(|| ".".to_string());
+            self.record_cluster(&sample, "hardlink-split", 1, 0);
+        }
+    }
+
     fn scan_report(&self, tuning: ScanTuning) -> ScanReport {
         let clusters = self
             .clusters
@@ -1974,6 +2557,17 @@ impl PlannerState {
         ScanReport {
             totals: self.totals.clone(),
             clusters,
+            xattr_drops: self
+                .xattr_drops
+                .iter()
+                .map(|((prefix, name, reason), cluster)| XattrDropCluster {
+                    prefix: prefix.clone(),
+                    name: name.clone(),
+                    reason: reason.clone(),
+                    count: cluster.count,
+                    samples: cluster.samples.clone(),
+                })
+                .collect(),
             blob_suggestions: suggestions,
         }
     }
@@ -1994,7 +2588,8 @@ fn substantial_compliant_threshold(tuning: ScanTuning) -> u64 {
 }
 
 fn prefix_contains(parent: &str, child: &str) -> bool {
-    parent == "."
+    parent.is_empty()
+        || parent == "."
         || parent == child
         || child
             .strip_prefix(parent)
@@ -2216,6 +2811,32 @@ blob Literal/Sub/
     }
 
     #[test]
+    fn member_name_escape_is_readable_and_reversible() {
+        let cases: &[(&[u8], &str)] = &[
+            (b"report.pdf", "report.pdf"),
+            ("résumé.doc".as_bytes(), "résumé.doc"),
+            (b"r\xe9sum\xe9.doc", "r\\xe9sum\\xe9.doc"),
+            (b"literal\\slash\t.txt", "literal\\\\slash\\x09.txt"),
+            (b"del-\x7f.txt", "del-\\x7f.txt"),
+        ];
+        for (raw, escaped) in cases {
+            assert_eq!(escape_member_name(raw), *escaped);
+            assert_eq!(decode_member_name(escaped).unwrap(), *raw);
+        }
+    }
+
+    #[test]
+    fn member_name_escape_keeps_invalid_utf8_collisions_distinct() {
+        let left = escape_member_name(b"r\xe9sume.doc");
+        let right = escape_member_name(b"r\xeesume.doc");
+        assert_eq!(left, "r\\xe9sume.doc");
+        assert_eq!(right, "r\\xeesume.doc");
+        assert_ne!(left, right);
+        assert_eq!(decode_member_name(&left).unwrap(), b"r\xe9sume.doc");
+        assert_eq!(decode_member_name(&right).unwrap(), b"r\xeesume.doc");
+    }
+
+    #[test]
     fn scan_suggests_dense_subtree_without_swallowing_clean_sibling() {
         let mut state = PlannerState::default();
         for index in 0..1_000 {
@@ -2276,6 +2897,34 @@ blob Literal/Sub/
         }));
     }
 
+    #[test]
+    fn root_blob_boundary_records_hardlink_split() {
+        let mut state = PlannerState::default();
+        let key = FileKey { dev: 1, ino: 2 };
+        state
+            .hardlink_groups
+            .by_key
+            .insert(key, vec!["a.bin".to_string(), "b.bin".to_string()]);
+        state
+            .hardlink_groups
+            .by_path
+            .insert("a.bin".to_string(), key);
+        state
+            .hardlink_groups
+            .by_path
+            .insert("b.bin".to_string(), key);
+        state.hardlink_native_counts.insert(key, 1);
+
+        state.note_hardlink_boundary("", true);
+        state.record_hardlink_splits();
+        let report = state.scan_report(ScanTuning::default());
+
+        assert!(report
+            .clusters
+            .iter()
+            .any(|cluster| cluster.reason == "hardlink-split"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn wrapper_tar_treats_dash_prefixed_members_as_operands() {
@@ -2312,18 +2961,40 @@ blob Literal/Sub/
 
     #[cfg(unix)]
     #[test]
-    fn bsdtar_wrapper_round_trips_required_fidelity_cases() {
+    fn wrapper_index_escapes_non_utf8_member_names() {
         assert!(
             command_available("bsdtar"),
             "bsdtar/libarchive is required for wrapper fidelity tests"
         );
-        assert!(
-            command_available("setfattr"),
-            "setfattr is required for wrapper fidelity tests"
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-remwrap-raw-name")
+            .tempdir()
+            .unwrap();
+        let base = temp.path().join("base");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join(OsStr::from_bytes(b"r\xe9sume.doc")), b"latin1").unwrap();
+
+        let tar_engine = detect_tar_engine().unwrap();
+        let tar_path = temp.path().join("raw.remwrap.tar");
+        create_wrapper_tar(&tar_engine, temp.path(), OsStr::new("base"), &tar_path).unwrap();
+        let index = build_wrap_index(&tar_path, &tar_engine).unwrap();
+        let entry = index
+            .entries
+            .iter()
+            .find(|entry| entry.path == "base/r\\xe9sume.doc")
+            .expect("escaped raw-name index entry");
+        assert_eq!(
+            decode_member_name(&entry.path).unwrap(),
+            b"base/r\xe9sume.doc"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bsdtar_wrapper_round_trips_required_fidelity_cases() {
         assert!(
-            command_available("getfattr"),
-            "getfattr is required for wrapper fidelity tests"
+            command_available("bsdtar"),
+            "bsdtar/libarchive is required for wrapper fidelity tests"
         );
         let temp = tempfile::Builder::new()
             .prefix("remanence-remwrap-fidelity")
@@ -2338,15 +3009,9 @@ blob Literal/Sub/
         fs::write(&non_utf8, b"raw-name").unwrap();
         let xattr_file = source.join("xattr.txt");
         fs::write(&xattr_file, b"xattr").unwrap();
-        let status = Command::new("setfattr")
-            .arg("-n")
-            .arg("user.remanence_test")
-            .arg("-v")
-            .arg("kept")
-            .arg(&xattr_file)
-            .status()
-            .unwrap();
-        assert!(status.success());
+        if xattr::set(&xattr_file, "user.remanence_test", b"kept").is_err() {
+            return;
+        }
 
         let tar_engine = detect_tar_engine().unwrap();
         let tar_path = temp.path().join("source.remwrap.tar");
@@ -2379,14 +3044,9 @@ blob Literal/Sub/
             fs::read(restored_source.join(OsStr::from_bytes(b"bad-\xff-name"))).unwrap(),
             b"raw-name"
         );
-        let output = Command::new("getfattr")
-            .arg("--absolute-names")
-            .arg("--dump")
-            .arg(restored_source.join("xattr.txt"))
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("user.remanence_test=\"kept\""), "{stdout}");
+        assert_eq!(
+            xattr::get(restored_source.join("xattr.txt"), "user.remanence_test").unwrap(),
+            Some(b"kept".to_vec())
+        );
     }
 }

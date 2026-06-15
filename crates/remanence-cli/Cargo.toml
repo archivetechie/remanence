@@ -17,7 +17,7 @@ name = "rem-debug"
 path = "src/rem_debug.rs"
 
 [dependencies]
-remanence-bru     = { path = "../remanence-bru" }
+remanence-bru     = { path = "../remanence-bru", optional = true }
 remanence-aead    = { path = "../remanence-aead" }
 remanence-format  = { path = "../remanence-format" }
 remanence-library = { path = "../remanence-library" }
@@ -35,6 +35,7 @@ time              = { workspace = true }
 tokio             = { workspace = true }
 tonic             = { workspace = true }
 uuid              = { workspace = true }
+xattr             = { workspace = true }
 zeroize           = { workspace = true }
 
 [dev-dependencies]
@@ -43,6 +44,7 @@ tokio-stream = { workspace = true, features = ["net"] }
 
 [features]
 default = []
+foreign-bru = ["dep:remanence-bru", "remanence-api/foreign-bru"]
 
 # Enables the `rem watch` subcommand by pulling in the
 # `linux-udev` backend from `remanence-library` and a tokio runtime.

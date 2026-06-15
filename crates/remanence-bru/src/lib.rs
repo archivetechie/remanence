@@ -8,7 +8,7 @@
 
 use std::io::{self, Read, Seek, SeekFrom};
 
-use remanence_format::{
+use remanence_format_driver::{
     ArchiveEventSink, ArchiveGapCause, ArchiveGapRange, ArchiveReader, DamageRange, DamageStatus,
     EntryCatalogSink, EntryKind, FileDataSink, FileId, FileStreamReport, ForeignTapeFormat,
     FormatCapabilities, FormatDescriptor, FormatError, NormalizedEntry, ProbeConfidence,
