@@ -383,6 +383,7 @@ pub fn restore_object_to_directory<S: BlockSource + ?Sized>(
 ) -> Result<FilesystemRestoreReport, StreamingError> {
     let mut sink = FilesystemRestoreSink::new(destination_root.as_ref(), options)?;
     let stream = stream_rem_tar_object(source, chunk_size, block_count, &mut sink)?;
+    apply_restored_xattrs(&sink.root, &stream.entries)?;
     Ok(FilesystemRestoreReport {
         stream,
         files_written: sink.files_written,
@@ -574,6 +575,59 @@ fn file_catalog_projection(
         mtime: spec.mtime.clone(),
         executable: file.executable,
     })
+}
+
+fn apply_restored_xattrs(root: &Path, entries: &[RemTarStreamEntry]) -> Result<(), StreamingError> {
+    for entry in entries {
+        if entry.xattrs.is_empty() || entry.path == MANIFEST_PATH {
+            continue;
+        }
+        let relative = normalize_archive_path(Path::new(&entry.path))?;
+        let destination = resolve_restored_entry_path_for_xattrs(root, relative.as_str(), entry)?;
+        for (name, value) in &entry.xattrs {
+            xattr::set(&destination, name, value)
+                .map_err(|err| io_error("set restore xattr", &destination, err))?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_restored_entry_path_for_xattrs(
+    root: &Path,
+    relative: &str,
+    entry: &RemTarStreamEntry,
+) -> Result<PathBuf, StreamingError> {
+    let parts = normalized_relative_components(relative)?;
+    let mut path = root.to_path_buf();
+    for part in &parts[..parts.len().saturating_sub(1)] {
+        path.push(part);
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|err| io_error("stat restore xattr parent", &path, err))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(StreamingError::InvalidInput(format!(
+                "restore xattr parent is not a real directory: {}",
+                path.display()
+            )));
+        }
+    }
+    if let Some(last) = parts.last() {
+        path.push(last);
+    }
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|err| io_error("stat restore xattr path", &path, err))?;
+    let valid = match entry.entry_type {
+        RemTarEntryType::Regular | RemTarEntryType::Hardlink => metadata.file_type().is_file(),
+        RemTarEntryType::Directory => metadata.file_type().is_dir(),
+        RemTarEntryType::Symlink => metadata.file_type().is_symlink(),
+    };
+    if !valid {
+        return Err(StreamingError::InvalidInput(format!(
+            "restore xattr path has wrong type for {}: {}",
+            entry.path,
+            path.display()
+        )));
+    }
+    Ok(path)
 }
 
 fn attach_object_id_to_bundle(
@@ -1518,6 +1572,53 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn restore_object_to_directory_reapplies_xattrs() {
+        let name = "user.remanence.test";
+        let restore_dir = tempfile::Builder::new()
+            .prefix("remanence-stream-restore-xattr")
+            .tempdir()
+            .unwrap();
+        let probe = restore_dir.path().join("probe");
+        fs::write(&probe, b"").unwrap();
+        if xattr::set(&probe, name, b"probe").is_err() {
+            return;
+        }
+        fs::remove_file(&probe).unwrap();
+
+        let mut opts = options();
+        opts.chunk_size = 4096;
+        let payload = b"xattr payload".to_vec();
+        let mut spec = RemTarFileSpec::new(
+            "tagged.txt",
+            "file-tagged",
+            payload.len() as u64,
+            sha256_array(&payload),
+        );
+        spec.xattrs.insert(name.to_string(), b"tagged".to_vec());
+        let mut reader = io::Cursor::new(payload);
+        let mut streams = [RemTarFileStream::new(spec, &mut reader)];
+        let mut sink = VecBlockSink::new();
+        let layout = write_rem_tar_object_from_readers(&mut sink, &opts, &mut streams).unwrap();
+        let mut source = VecBlockSource::new(sink.blocks);
+
+        let restore = restore_object_to_directory(
+            &mut source,
+            opts.chunk_size,
+            layout.projected_size_blocks,
+            restore_dir.path(),
+            FilesystemRestoreOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(restore.files_written, 1);
+        assert_eq!(
+            xattr::get(restore_dir.path().join("tagged.txt"), name).unwrap(),
+            Some(b"tagged".to_vec())
+        );
+    }
+
     #[test]
     fn restore_rejects_paths_that_escape_destination() {
         let root = tempfile::Builder::new()
@@ -1535,6 +1636,7 @@ mod tests {
             chunk_count: 0,
             data_offset: 0,
             pax_records: Default::default(),
+            xattrs: Default::default(),
         };
 
         let err = sink.begin_file(&entry).unwrap_err();
@@ -1559,6 +1661,7 @@ mod tests {
             chunk_count: 0,
             data_offset: 0,
             pax_records: BTreeMap::new(),
+            xattrs: Default::default(),
         };
 
         let err = sink.begin_file(&entry).unwrap_err();
@@ -1586,6 +1689,7 @@ mod tests {
             chunk_count: 1,
             data_offset: 0,
             pax_records,
+            xattrs: Default::default(),
         };
 
         sink.begin_file(&entry).unwrap();
@@ -1634,6 +1738,7 @@ mod tests {
             chunk_count: 0,
             data_offset: 0,
             pax_records,
+            xattrs: Default::default(),
         };
 
         let err = sink.begin_file(&entry).unwrap_err();
