@@ -746,9 +746,9 @@ writer receives payload bytes as a stream, it MUST recompute the SHA-256 of
 the bytes actually consumed and MUST fail the object (refusing to complete it)
 if the recomputed digest or byte count differs from the declared spec. This
 proves the writer archived the payload it was given, not the payload the
-metadata describes. Symlink and directory entries have no payload hash; a
-hardlink entry shares its primary's `file_sha256` and content coordinates
-(Section 4.7.2).
+metadata describes. Symlink, directory, and hardlink entries carry no payload
+and no payload hash of their own; a hardlinked name's content, hash, and PFR
+coordinates are its primary's, reached through `link_target` (Section 4.7.2).
 
 #### 4.6.6. Path and Identity Rules
 
@@ -866,11 +866,11 @@ regular-only objects.
 | `path` | text | Effective entry path |
 | `file_id` | text | Entry `REMANENCE.file_id` |
 | `executable` | `true`/`false`/`null` | `null` when the writer was given no value |
-| `size_bytes` | unsigned | Effective payload length; a hardlink carries its primary's |
-| `chunk_count` | unsigned | Section 4.6.4 value; a hardlink carries its primary's |
+| `size_bytes` | unsigned | Effective payload length (0 for hardlink/symlink/directory/empty entries) |
+| `chunk_count` | unsigned | Section 4.6.4 value (0 for zero-payload entries, hardlinks included) |
 | `entry_type` | text | OPTIONAL; absent means `regular`; otherwise `hardlink`, `symlink`, or `directory` |
-| `file_sha256` | bytes | Regular and hardlink entries: exactly 32 bytes; binary SHA-256 (hex in pax, binary here). A hardlink carries its primary's value |
-| `first_chunk_lba` | unsigned/`null` | Inner `BodyLba`; `null` iff `size_bytes` = 0; a hardlink carries its primary's |
+| `file_sha256` | bytes | Regular entries only: exactly 32 bytes; binary SHA-256 (hex in pax, binary here). A hardlinked name's hash is its primary's, reached via `link_target` |
+| `first_chunk_lba` | unsigned/`null` | Inner `BodyLba`; `null` iff `size_bytes` = 0 (so `null` for hardlinks) |
 | `link_target` | text | Symlink entries: the effective target string. Hardlink entries: the primary's in-object path (Section 4.6) |
 | `metadata_preservation_data` | map | Reserved; MUST be empty (`{}`) in 1.0 writers |
 
@@ -985,7 +985,8 @@ Procedure:
    require `size = 0`, compute the effective path and in-object target
    (`linkpath` or `linkname`), verify the target resolves to a regular-file
    primary already delivered (`InvalidHardlinkTarget` otherwise), and deliver a
-   hardlink entry carrying the primary's content coordinates, no payload; `2` →
+   hardlink entry with no payload (its content/PFR resolve through `link_target`
+   to that primary); `2` →
    a symlink: require `size = 0`, compute effective path and target (`linkpath`
    or `linkname`), and deliver a symlink entry with no payload; `5` → a
    directory: require `size = 0` and deliver a directory entry with no
@@ -1876,8 +1877,9 @@ together:
   `REMANENCE.*` pax keywords (global or per-entry), new top-level or per-entry
   manifest keys, and content inside the reserved `object_metadata`,
   `external_references`, and `metadata_preservation_data` containers (the
-  designated landing zone for xattrs, ownership tiers, and future hardlink
-  identity metadata) — and MUST NOT change any rule a 1.0 Reader enforces. A 1.0
+  designated landing zone for xattrs and ownership tiers; hardlinks are already
+  native 1.0 entries, Section 4.6) — and MUST NOT change any rule a 1.0 Reader
+  enforces. A 1.0
   Reader gates on the major version and tolerates all of the above
   (Sections 4.4.3, 4.7.2). Any change that could make a 1.0 Reader
   misinterpret bytes (new entry kinds with payload semantics, alignment
@@ -2207,7 +2209,9 @@ non-ASCII path and a > 100-byte path, both exercising `PAX_PATH_PLACEHOLDER`,
 and a 100-byte portable path stored inline); **full metadata** (entries with
 `mtime`, `executable=true` at mode 0755, and `executable` unsupplied →
 `null`); a **multi-file object** ordering entries non-alphabetically (pinning
-caller-order preservation); and a **canonical-manifest byte-identity vector**
+caller-order preservation); **non-regular entries** (a symlink with its
+target, an empty directory, and a hardlink — primary + link — restoring to one
+shared inode); and a **canonical-manifest byte-identity vector**
 pinning the exact manifest CBOR bytes and `manifest_sha256` for a fixed input
 set (the cross-implementation determinism gate, Section 4.7.1). For each, the
 manifest pins the exact full object byte stream, or for large vectors
@@ -2310,8 +2314,7 @@ path shape (`/abs`, `a/../b`, `./a`, `a//b`, `a/`); malformed `mtime`;
 streamed payload with wrong hash; streamed payload with wrong size;
 non-multiple-of-512 `chunk_size`; symlink/directory with nonzero size;
 symlink missing target; directory path without trailing slash; a hardlink
-(primary + link) round-tripping to one shared inode, and a hardlink whose
-target is absent or not a regular-file primary (`InvalidHardlinkTarget`).
+whose target is absent or not a regular-file primary (`InvalidHardlinkTarget`).
 Reader-side (byte vectors): wrong
 `REMANENCE.format_id`; schema major 2; missing `REMANENCE.compression`;
 `REMANENCE.compression=gzip`; `REMANENCE.encryption=aes-256-gcm`; declared
