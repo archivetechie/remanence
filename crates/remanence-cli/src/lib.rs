@@ -1181,7 +1181,12 @@ struct RemArchiveBuildArgs {
     inputs: Vec<PathBuf>,
 
     /// Output RAO object file.
-    #[arg(long, value_name = "PATH", required_unless_present = "scan_only")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        required_unless_present = "scan_only",
+        conflicts_with = "scan_only"
+    )]
     out: Option<PathBuf>,
 
     /// Ordered ingest ruleset for blob/exclude policy.
@@ -1305,7 +1310,7 @@ struct RemArchiveExtractArgs {
     no_unwrap: bool,
 
     /// RAO blob wrapper entry to use for single-member restore.
-    #[arg(long = "blob-entry", value_name = "RAO_PATH")]
+    #[arg(long = "blob-entry", value_name = "RAO_PATH", requires = "blob_member")]
     blob_entry: Option<String>,
 
     /// Member path inside --blob-entry to restore.
@@ -1722,7 +1727,12 @@ struct ArchiveBuildArgs {
     inputs: Vec<PathBuf>,
 
     /// Output RAO object file.
-    #[arg(long, value_name = "PATH", required_unless_present = "scan_only")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        required_unless_present = "scan_only",
+        conflicts_with = "scan_only"
+    )]
     out: Option<PathBuf>,
 
     /// Ordered ingest ruleset for blob/exclude policy.
@@ -1846,7 +1856,7 @@ struct ArchiveExtractArgs {
     no_unwrap: bool,
 
     /// RAO blob wrapper entry to use for single-member restore.
-    #[arg(long = "blob-entry", value_name = "RAO_PATH")]
+    #[arg(long = "blob-entry", value_name = "RAO_PATH", requires = "blob_member")]
     blob_entry: Option<String>,
 
     /// Member path inside --blob-entry to restore.
@@ -9927,6 +9937,7 @@ blob Project/Render Files/
         assert!(manifest["entries"].as_array().unwrap().iter().any(|entry| {
             entry["path"] == "Project/Render Files/frame.dat"
                 && entry["sha256"] == bytes_to_hex(&sha256_bytes(b"render-frame"))
+                && entry["mtime"].as_str().is_some()
         }));
         assert_eq!(manifest["exclusions"][0]["reason"], "exclude-rule");
 
@@ -9939,6 +9950,7 @@ blob Project/Render Files/
         assert!(index["entries"].as_array().unwrap().iter().any(|entry| {
             entry["path"] == "Project/Render Files/frame.dat"
                 && entry["sha256"] == bytes_to_hex(&sha256_bytes(b"render-frame"))
+                && entry["mtime"].as_str().is_some()
         }));
 
         let restore_dir = temp.path().join("restore");
@@ -10063,6 +10075,98 @@ blob Project/Render Files/
         assert_eq!(report["ruleset"]["name"], "scan");
         assert_eq!(report["scan"]["totals"]["blob_entries"], 1);
         assert!(!temp.path().join("archive.rao").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_build_rules_wraps_xattr_file_fallback() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-xattr-fallback")
+            .tempdir()
+            .unwrap();
+        let input_dir = temp.path().join("inputs");
+        fs::create_dir_all(&input_dir).unwrap();
+        let xattr_file = input_dir.join("--xattr.txt");
+        fs::write(&xattr_file, b"xattr payload").unwrap();
+        let status = std::process::Command::new("setfattr")
+            .arg("-n")
+            .arg("user.remanence_test")
+            .arg("-v")
+            .arg("kept")
+            .arg(&xattr_file)
+            .status()
+            .expect("setfattr must be installed for xattr fallback test");
+        assert!(status.success());
+        let rules = temp.path().join("empty.rules");
+        fs::write(&rules, "").unwrap();
+        let out_path = temp.path().join("xattr.rao");
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            input_dir.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+            "--object-id",
+            "object-xattr",
+            "--caller-object-id",
+            "caller-xattr",
+            "--manifest-file-id",
+            "manifest-xattr",
+            "--timestamp",
+            "2026-01-01T00:00:00Z",
+        ]);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
+        assert_eq!(report["ingest"]["scan"]["totals"]["wrapped_entries"], 1);
+        assert!(report["ingest"]["scan"]["clusters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cluster| cluster["reason"] == "xattr" && cluster["samples"][0] == "--xattr.txt"));
+        let files = report["files"].as_array().expect("files array");
+        assert!(files
+            .iter()
+            .any(|file| file["path"] == "--xattr.txt.remwrap.tar"));
+        assert!(!files.iter().any(|file| file["path"] == "--xattr.txt"));
+
+        let restore_dir = temp.path().join("restore");
+        let (code, _stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "extract",
+            "--object",
+            out_path.to_str().unwrap(),
+            "--dest",
+            restore_dir.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+        ]);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        assert_eq!(
+            fs::read(restore_dir.join("--xattr.txt")).unwrap(),
+            b"xattr payload"
+        );
+        let output = std::process::Command::new("getfattr")
+            .arg("--absolute-names")
+            .arg("--dump")
+            .arg("-m")
+            .arg("-")
+            .arg(restore_dir.join("--xattr.txt"))
+            .output()
+            .expect("getfattr must be installed for xattr fallback test");
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("user.remanence_test=\"kept\""), "{stdout}");
     }
 
     #[cfg(unix)]
