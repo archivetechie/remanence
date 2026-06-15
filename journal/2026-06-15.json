@@ -97,5 +97,16 @@
     "handoff_to": null,
     "round": 2,
     "summary": "GPT reviewed my hardlinks-into-1.0 edits; per owner, ignored finding #1 (reference impl doesn't match — tracked in the codex work orders) and fixed the six spec-internal findings, all verified as real bugs I introduced. #2 (HIGH, the substantive one): hardlink size/hash/coordinate semantics were internally inconsistent (tar size=0 + 'no payload' vs manifest 'carries the primary's size_bytes/chunk_count/file_sha256/first_chunk_lba' vs file_sha256 'regular-only'). Rather than GPT's suggested split-the-fields patch, chose the tar-faithful model: a hardlink entry carries NO content fields of its own (size_bytes 0, chunk_count 0, first_chunk_lba null, no file_sha256 — exactly like a symlink), and a hardlinked name's content/hash/PFR resolve through link_target to the primary. Removes the inconsistency by construction (no cross-check carve-outs); reverted the 'carry the primary's coords' manifest rows, the no-payload-hash line, and the reader-dispatch line accordingly. #3 (MED): moved the positive 'hardlink primary+link → shared inode' round-trip out of the negative-vector list into §13.1 positives (and added symlink + empty-dir positives, which weren't enumerated); kept absent/non-regular-target as the negative. #4 (MED): RAO 1.1 §2.1 referenced an 'ingest member-name escaping' that isn't a normative RAO primitive — declared non-UTF-8 xattr NAMES out of scope (drop-and-record or wrap) instead, removing the dangling ref (names are ASCII by namespace convention anyway). #5 (LOW): INDEX 1.1 row now points hardlinks→rao-hardlinks-design, xattrs→rao-1.1-metadata-preservation. #6 (LOW): rao-1.1-metadata-preservation design doc no longer lists hardlinks as a can't-be-native wrap case. #7 (LOW): §10 'future hardlink identity metadata' landing-zone phrase reworded (hardlinks are native 1.0 now). Coherence grepped clean. NOTE: the rao-hardlinks-design doc and ingest-layer-impl doc still describe option-A 'carry the primary's coords' — need a follow-up edit to align them to the resolve-via-link_target model before codex implements (flagged to owner)."
+  },
+  {
+    "uuid": "95a2250b-de21-4e78-9e5f-0155cbaddc55",
+    "datetime": "2026-06-15T11:51:54+02:00",
+    "author": "claude",
+    "subject": "Aligned hardlink design docs + decision record to the option-B (resolve-via-link_target) model",
+    "idref": null,
+    "status": "complete",
+    "handoff_to": null,
+    "round": 3,
+    "summary": "After switching the RAO 1.0 spec to the tar-faithful hardlink model (option B: hardlink entry carries no content fields; content/hash/PFR resolve via link_target to the primary), aligned the three docs that still described option A ('carry the primary's coords'): rao-hardlinks-design-v0.1.md (manifest §3.2, spec-edit checklist §7, vectors §8, impl pointers §9), ingest-layer-implementation-design-v0.1.md (unit D emit step), and ingest-archive-deferred-items-design-v0.1.md (item-4 delta list). Final grep across specs/ and docs/ confirms no residual coord-carrying language. Spec + all work orders + decision record now consistent on the one hardlink model. Codex can implement from a coherent set."
   }
 ]

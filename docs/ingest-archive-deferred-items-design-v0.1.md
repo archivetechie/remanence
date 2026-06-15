@@ -297,9 +297,9 @@ checks); (2) **deterministic primary selection** within a group (pin a rule,
 e.g. first in caller order; the first *non-excluded* name if the natural
 primary is excluded); (3) **detection** — inode grouping by `(dev, ino)`, a
 stat per file the classifier already does; (4) **restore ordering** (primary
-before links) and PFR resolving to the primary (the link entry can carry the
-primary's `first_chunk_lba`/`size`/`sha256`, so PFR reads directly and the
-catalog sees identical content).
+before links) and PFR resolving to the primary — the link entry is zero-payload
+(like a symlink) and its content/hash/coords are resolved through `link_target`
+to the primary at read time (the tar-faithful model; no coord duplication).
 
 **Edges with clean fallbacks:** a hardlink group split across a blob boundary,
 or whose primary is excluded by a ruleset → the affected member falls back to
