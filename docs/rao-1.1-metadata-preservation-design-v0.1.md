@@ -64,9 +64,11 @@ metadata_preservation_data = {
 
 - The manifest is **CBOR** (manifest profile), which has native byte strings —
   so xattr **values** are stored as raw bytes directly; **no base64** (the
-  item-1 JSON constraint does not recur here). xattr **names** are text keys.
-  Should a name ever not be valid UTF-8, encode it with the item-1 reversible
-  escaping; in practice xattr names are ASCII.
+  item-1 JSON constraint does not recur here). xattr **names** are text keys
+  (the manifest profile requires text-string keys). A name that is **not valid
+  UTF-8** is out of scope for native preservation — the ingest layer
+  drops-and-records it or wraps the file (per the 1.1 spec §2.1); in practice
+  xattr names are ASCII by namespace convention.
 - **Deterministic encoding** as everywhere in the manifest: the `xattrs` map's
   keys sorted by the §4.7.1 canonical rule, shortest-form integers/lengths,
   no duplicate names. Required so the manifest stays a reproducible projection.
