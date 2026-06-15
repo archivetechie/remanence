@@ -45,6 +45,7 @@ FORMAT_ID = "rao-v1"
 SCHEMA_VERSION = "1.0"
 MANIFEST_PATH = "_remanence/manifest.cbor"
 TYPE_REGULAR = b"0"[0]
+TYPE_HARDLINK = b"1"[0]
 TYPE_SYMLINK = b"2"[0]
 TYPE_DIRECTORY = b"5"[0]
 TYPE_PAX_EXTENDED = b"x"[0]
@@ -67,6 +68,7 @@ class PlaintextVector:
     plaintext: bytes
     expected_files: dict[str, bytes]
     expected_symlinks: dict[str, str]
+    expected_hardlinks: dict[str, str]
     expected_directories: set[str]
 
 
@@ -290,6 +292,12 @@ def encode_pax_backed_symlink_header(path: str, target: str, target_in_pax: bool
     return encode_header_with_link(header_path, 0, TYPE_SYMLINK, 0o777, linkname)
 
 
+def encode_pax_backed_hardlink_header(path: str, target: str, target_in_pax: bool) -> bytes:
+    header_path = path if is_portable_ustar_name(path) else "remanence/pax-path"
+    linkname = "remanence/pax-linkpath" if target_in_pax else target
+    return encode_header_with_link(header_path, 0, TYPE_HARDLINK, 0o644, linkname)
+
+
 def encode_pax_backed_directory_header(path: str) -> bytes:
     header_path = path if is_portable_ustar_name(path) else "remanence/pax-path"
     return encode_header(header_path, 0, TYPE_DIRECTORY, 0o755)
@@ -466,9 +474,9 @@ def file_pax_records(spec: FileSpec, chunk_size: int, is_manifest: bool) -> dict
         records["mtime"] = spec.mtime
     if is_manifest:
         records["REMANENCE.is_manifest"] = "true"
-    if spec.entry_type == "symlink":
+    if spec.entry_type in {"hardlink", "symlink"}:
         if spec.link_target is None:
-            raise AssertionError("symlink vector entry missing link target")
+            raise AssertionError(f"{spec.entry_type} vector entry missing link target")
         if not is_portable_ustar_linkname(spec.link_target):
             records["linkpath"] = spec.link_target
     return records
@@ -542,6 +550,16 @@ def append_file_entry(out: bytearray, spec: FileSpec, records: dict[str, str], i
         out.extend(encode_pax_backed_regular_header(spec.path, spec.size_bytes, mode))
         out.extend(spec.data)
         out.extend(b"\0" * ((TAR_RECORD_SIZE - spec.size_bytes % TAR_RECORD_SIZE) % TAR_RECORD_SIZE))
+    elif spec.entry_type == "hardlink":
+        if spec.link_target is None:
+            raise AssertionError("hardlink vector entry missing link target")
+        out.extend(
+            encode_pax_backed_hardlink_header(
+                spec.path,
+                spec.link_target,
+                "linkpath" in records,
+            )
+        )
     elif spec.entry_type == "symlink":
         if spec.link_target is None:
             raise AssertionError("symlink vector entry missing link target")
@@ -763,6 +781,7 @@ def positive_plaintext_vector_definitions() -> list[tuple[str, str, dict[str, An
     long_path = "long/" + "a" * 102 + ".bin"
     inline_100 = "inline-" + "b" * 93
     long_target = "targets/" + "x" * 120
+    long_hardlink_target = "hardlink-targets/" + "p" * 110 + ".bin"
     return [
         (
             "rao-tv-empty.json",
@@ -888,6 +907,37 @@ def positive_plaintext_vector_definitions() -> list[tuple[str, str, dict[str, An
                 FileSpec("target.txt", "00000000-0000-4000-8000-000000000195", b"target\n"),
             ],
         ),
+        (
+            "rao-tv-hardlinks.json",
+            "RAO-TV-HARDLINKS",
+            vector_options(110, "rao-tv-hardlinks", "000000000110"),
+            [
+                FileSpec(
+                    "primary.txt",
+                    "00000000-0000-4000-8000-000000000201",
+                    b"shared hardlink payload\n",
+                ),
+                FileSpec(
+                    "links/copy.txt",
+                    "00000000-0000-4000-8000-000000000202",
+                    b"",
+                    entry_type="hardlink",
+                    link_target="primary.txt",
+                ),
+                FileSpec(
+                    long_hardlink_target,
+                    "00000000-0000-4000-8000-000000000203",
+                    b"long target hardlink payload\n",
+                ),
+                FileSpec(
+                    "links/long-target-copy.bin",
+                    "00000000-0000-4000-8000-000000000204",
+                    b"",
+                    entry_type="hardlink",
+                    link_target=long_hardlink_target,
+                ),
+            ],
+        ),
     ]
 
 
@@ -947,6 +997,11 @@ def fixture_json(vector_id: str, options: dict[str, Any], files: list[FileSpec])
                 for spec in files
                 if spec.entry_type == "symlink"
             ],
+            "hardlinks": [
+                {"path": spec.path, "target": spec.link_target}
+                for spec in files
+                if spec.entry_type == "hardlink"
+            ],
             "directories": [spec.path for spec in files if spec.entry_type == "directory"],
             "file_layouts": [layout_json(file_layout) for file_layout in layout["files"]],
             "manifest_layout": layout_json(layout["manifest"]),
@@ -955,9 +1010,19 @@ def fixture_json(vector_id: str, options: dict[str, Any], files: list[FileSpec])
 
 
 def expected_regular_files(files: list[FileSpec], manifest_cbor: bytes) -> dict[str, bytes]:
-    return {spec.path: spec.data for spec in files if spec.entry_type == "regular"} | {
-        MANIFEST_PATH: manifest_cbor
-    }
+    expected = {spec.path: spec.data for spec in files if spec.entry_type == "regular"}
+    for spec in files:
+        if spec.entry_type != "hardlink":
+            continue
+        if spec.link_target is None:
+            raise AssertionError(f"hardlink {spec.path!r} is missing a target")
+        if spec.link_target not in expected:
+            raise AssertionError(
+                f"hardlink {spec.path!r} target {spec.link_target!r} is not a preceding regular file"
+            )
+        expected[spec.path] = expected[spec.link_target]
+    expected[MANIFEST_PATH] = manifest_cbor
+    return expected
 
 
 def expected_symlinks(files: list[FileSpec]) -> dict[str, str]:
@@ -965,6 +1030,14 @@ def expected_symlinks(files: list[FileSpec]) -> dict[str, str]:
         spec.path: spec.link_target
         for spec in files
         if spec.entry_type == "symlink" and spec.link_target is not None
+    }
+
+
+def expected_hardlinks(files: list[FileSpec]) -> dict[str, str]:
+    return {
+        spec.path: spec.link_target
+        for spec in files
+        if spec.entry_type == "hardlink" and spec.link_target is not None
     }
 
 
@@ -978,6 +1051,7 @@ def assert_extracted_tree(
     root: pathlib.Path,
     expected: dict[str, bytes],
     expected_links: dict[str, str],
+    expected_hardlink_targets: dict[str, str],
     expected_dirs: set[str],
 ) -> None:
     actual_paths: set[str] = set()
@@ -1010,6 +1084,15 @@ def assert_extracted_tree(
         if rel not in actual_links:
             raise AssertionError(f"{vector_id} {reader}: missing symlink {rel!r}")
         assert_eq(actual_links[rel], target, f"{vector_id} {reader} symlink {rel}")
+    for rel, target in expected_hardlink_targets.items():
+        if rel not in actual_paths:
+            raise AssertionError(f"{vector_id} {reader}: missing hardlink file {rel!r}")
+        if target not in actual_paths:
+            raise AssertionError(f"{vector_id} {reader}: missing hardlink target {target!r}")
+        if not (root / rel).samefile(root / target):
+            raise AssertionError(
+                f"{vector_id} {reader}: {rel!r} is not a hardlink to {target!r}"
+            )
     missing_dirs = sorted(expected_dirs - actual_dirs)
     if missing_dirs:
         raise AssertionError(f"{vector_id} {reader}: missing directories {missing_dirs!r}")
@@ -1018,6 +1101,7 @@ def assert_extracted_tree(
 def assert_python_tarfile(vector: PlaintextVector, archive: pathlib.Path) -> None:
     actual: dict[str, bytes] = {}
     actual_links: dict[str, str] = {}
+    actual_hardlinks: dict[str, str] = {}
     actual_dirs: set[str] = set()
     with tarfile.open(archive, "r:") as handle:
         for member in handle.getmembers():
@@ -1026,6 +1110,14 @@ def assert_python_tarfile(vector: PlaintextVector, archive: pathlib.Path) -> Non
                 if extracted is None:
                     raise AssertionError(
                         f"{vector.vector_id} python tarfile: {member.name!r} has no data handle"
+                    )
+                actual[member.name] = extracted.read()
+            elif member.islnk():
+                actual_hardlinks[member.name] = member.linkname
+                extracted = handle.extractfile(member)
+                if extracted is None:
+                    raise AssertionError(
+                        f"{vector.vector_id} python tarfile: hardlink {member.name!r} has no data handle"
                     )
                 actual[member.name] = extracted.read()
             elif member.issym():
@@ -1047,6 +1139,11 @@ def assert_python_tarfile(vector: PlaintextVector, archive: pathlib.Path) -> Non
     for path, expected in vector.expected_files.items():
         assert_eq(actual[path], expected, f"{vector.vector_id} python tarfile {path}")
     assert_eq(actual_links, vector.expected_symlinks, f"{vector.vector_id} python tarfile symlinks")
+    assert_eq(
+        actual_hardlinks,
+        vector.expected_hardlinks,
+        f"{vector.vector_id} python tarfile hardlinks",
+    )
     missing_dirs = sorted(vector.expected_directories - actual_dirs)
     if missing_dirs:
         raise AssertionError(f"{vector.vector_id} python tarfile: missing directories {missing_dirs!r}")
@@ -1113,6 +1210,7 @@ def run_tar_reader(
         out_dir,
         vector.expected_files,
         vector.expected_symlinks,
+        vector.expected_hardlinks,
         vector.expected_directories,
     )
 
@@ -1423,6 +1521,11 @@ def check_positive_plaintext_fixture(
         [{"path": path, "target": target} for path, target in expected_symlinks(files).items()],
         f"{vector_id} symlinks",
     )
+    assert_eq(
+        expected.get("hardlinks", []),
+        [{"path": path, "target": target} for path, target in expected_hardlinks(files).items()],
+        f"{vector_id} hardlinks",
+    )
     assert_eq(expected.get("directories", []), [spec.path for spec in files if spec.entry_type == "directory"], f"{vector_id} directories")
     return PlaintextVector(
         vector_id=vector_id,
@@ -1430,6 +1533,7 @@ def check_positive_plaintext_fixture(
         plaintext=plaintext,
         expected_files=expected_regular_files(files, layout["manifest_cbor"]),
         expected_symlinks=expected_symlinks(files),
+        expected_hardlinks=expected_hardlinks(files),
         expected_directories=expected_directories(files),
     )
 
@@ -1516,6 +1620,7 @@ def main(argv: list[str] | None = None) -> int:
         plaintext=p1_plaintext,
         expected_files=expected_regular_files(p1_files, p1_layout["manifest_cbor"]),
         expected_symlinks=expected_symlinks(p1_files),
+        expected_hardlinks=expected_hardlinks(p1_files),
         expected_directories=expected_directories(p1_files),
     )
     d1_vector = PlaintextVector(
@@ -1524,6 +1629,7 @@ def main(argv: list[str] | None = None) -> int:
         plaintext=d1_plaintext,
         expected_files=expected_regular_files([d1_file], d1_layout["manifest_cbor"]),
         expected_symlinks=expected_symlinks([d1_file]),
+        expected_hardlinks=expected_hardlinks([d1_file]),
         expected_directories=expected_directories([d1_file]),
     )
     extra_plaintext_vectors = [

@@ -301,9 +301,11 @@ before links) and PFR resolving to the primary — the link entry is zero-payloa
 (like a symlink) and its content/hash/coords are resolved through `link_target`
 to the primary at read time (the tar-faithful model; no coord duplication).
 
-**Edges with clean fallbacks:** a hardlink group split across a blob boundary,
-or whose primary is excluded by a ruleset → the affected member falls back to
-an independent copy.
+**Edges with clean fallbacks:** a hardlink group split across a blob boundary
+cannot link across that boundary, so the affected member falls back to an
+independent copy. If the natural primary is excluded by a ruleset, the first
+surviving group member becomes the primary; if only one member survives, it is a
+plain regular entry.
 
 **Removes** the `collect_hardlink_roots` second tree-walk, the common-ancestor
 computation, the cross-tree-collapse edge, and the climb-capping band-aids;

@@ -60,6 +60,7 @@ fn format_error_name(error: &FormatError) -> &'static str {
         FormatError::Parse(_) => "Parse",
         FormatError::UstarChecksumMismatch { .. } => "UstarChecksumMismatch",
         FormatError::UnsupportedTarTypeflag { .. } => "UnsupportedTarTypeflag",
+        FormatError::InvalidHardlinkTarget { .. } => "InvalidHardlinkTarget",
         FormatError::ChunkAlignmentViolation { .. } => "ChunkAlignmentViolation",
         FormatError::ChunkSizeMismatch { .. } => "ChunkSizeMismatch",
         FormatError::InvalidPath(_) => "InvalidPath",
@@ -275,6 +276,37 @@ fn run_writer_case(id: &str) -> Result<(), FormatError> {
                 executable: None,
             };
             plan_rem_tar_object(&options, &[spec])?;
+        }
+        "hardlink-missing-target" => {
+            let spec = RemTarFileSpec {
+                entry_type: RemTarEntryType::Hardlink,
+                path: "copy.bin".to_string(),
+                file_id: "hardlink-a".to_string(),
+                size_bytes: 0,
+                file_sha256: None,
+                link_target: None,
+                mtime: None,
+                executable: None,
+            };
+            plan_rem_tar_object(&options, &[spec])?;
+        }
+        "hardlink-nonregular-target" => {
+            plan_rem_tar_object(
+                &options,
+                &[
+                    RemTarFileSpec::directory("target-dir/", "dir-a"),
+                    RemTarFileSpec::hardlink("copy.bin", "hardlink-a", "target-dir"),
+                ],
+            )?;
+        }
+        "hardlink-forward-target" => {
+            plan_rem_tar_object(
+                &options,
+                &[
+                    RemTarFileSpec::hardlink("copy.bin", "hardlink-a", "target.bin"),
+                    regular_spec("target.bin", "file-a", data),
+                ],
+            )?;
         }
         "directory-missing-trailing-slash" => {
             plan_rem_tar_object(&options, &[RemTarFileSpec::directory("empty", "dir-a")])?;
@@ -1467,6 +1499,9 @@ fn plaintext_writer_negative_vectors_match_manifest_errors() {
             "symlink-nonzero-size",
             "directory-nonzero-size",
             "symlink-missing-target",
+            "hardlink-missing-target",
+            "hardlink-nonregular-target",
+            "hardlink-forward-target",
             "directory-missing-trailing-slash",
         ],
     );

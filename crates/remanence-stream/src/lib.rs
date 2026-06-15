@@ -205,6 +205,8 @@ pub struct FilesystemRestoreReport {
     pub directories_seen: u64,
     /// Symbolic-link entries created.
     pub symlinks_written: u64,
+    /// Hardlink entries created.
+    pub hardlinks_written: u64,
     /// User-visible payload bytes written.
     pub bytes_written: u64,
 }
@@ -386,6 +388,7 @@ pub fn restore_object_to_directory<S: BlockSource + ?Sized>(
         files_written: sink.files_written,
         directories_seen: sink.directories_seen,
         symlinks_written: sink.symlinks_written,
+        hardlinks_written: sink.hardlinks_written,
         bytes_written: sink.bytes_written,
     })
 }
@@ -772,6 +775,35 @@ fn create_restore_parent_dirs_secure(root: &Path, relative: &str) -> Result<Path
     Ok(destination)
 }
 
+fn resolve_existing_restore_file_secure(
+    root: &Path,
+    relative: &str,
+) -> Result<PathBuf, FormatError> {
+    let parts = normalized_relative_components(relative)?;
+    let mut target = root.to_path_buf();
+    for part in &parts[..parts.len().saturating_sub(1)] {
+        target.push(part);
+        ensure_restore_directory(&target)?;
+    }
+    target.push(parts.last().expect("parts is not empty"));
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(restore_path_error(
+            &target,
+            "escapes destination through a symlink",
+        )),
+        Ok(metadata) if metadata.is_file() => Ok(target),
+        Ok(_) => Err(restore_path_error(&target, "is not a regular file")),
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            Err(restore_path_error(&target, "does not exist"))
+        }
+        Err(err) => Err(format_sink_io(
+            "inspect restore hardlink target",
+            &target,
+            err,
+        )),
+    }
+}
+
 fn reject_existing_restore_symlink(path: &Path) -> Result<(), FormatError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(restore_path_error(
@@ -815,6 +847,11 @@ fn create_restore_symlink(_target: &str, destination: &Path) -> Result<(), Forma
     ))
 }
 
+fn create_restore_hardlink(target: &Path, destination: &Path) -> Result<(), FormatError> {
+    fs::hard_link(target, destination)
+        .map_err(|err| format_sink_io("create restore hardlink", destination, err))
+}
+
 #[cfg(unix)]
 fn apply_restore_open_flags(options: &mut OpenOptions) {
     use std::os::unix::fs::OpenOptionsExt;
@@ -856,6 +893,7 @@ struct FilesystemRestoreSink {
     files_written: u64,
     directories_seen: u64,
     symlinks_written: u64,
+    hardlinks_written: u64,
     bytes_written: u64,
 }
 
@@ -869,6 +907,7 @@ impl FilesystemRestoreSink {
             files_written: 0,
             directories_seen: 0,
             symlinks_written: 0,
+            hardlinks_written: 0,
             bytes_written: 0,
         })
     }
@@ -911,6 +950,21 @@ impl RemTarEntrySink for FilesystemRestoreSink {
                 self.directories_seen += 1;
                 self.current = RestoreTarget::Directory;
             }
+            RemTarEntryType::Hardlink => {
+                let target = entry.link_target.as_deref().ok_or_else(|| {
+                    FormatError::Parse(format!("restore hardlink {} is missing target", entry.path))
+                })?;
+                let target_relative = normalize_archive_path(Path::new(target)).map_err(|err| {
+                    FormatError::Parse(format!("invalid restore hardlink target {}: {err}", target))
+                })?;
+                let source =
+                    resolve_existing_restore_file_secure(&self.root, target_relative.as_str())?;
+                let destination = create_restore_parent_dirs_secure(&self.root, relative.as_str())?;
+                prepare_restore_symlink_destination(&destination, self.options.overwrite)?;
+                create_restore_hardlink(&source, &destination)?;
+                self.hardlinks_written += 1;
+                self.current = RestoreTarget::Hardlink;
+            }
             RemTarEntryType::Symlink => {
                 let target = entry.link_target.as_deref().ok_or_else(|| {
                     FormatError::Parse(format!("restore symlink {} is missing target", entry.path))
@@ -931,9 +985,9 @@ impl RemTarEntrySink for FilesystemRestoreSink {
                 "restore data arrived without an active file".to_string(),
             )),
             RestoreTarget::Skip => Ok(()),
-            RestoreTarget::Directory | RestoreTarget::Symlink => Err(FormatError::Parse(
-                "restore data arrived for a zero-payload entry".to_string(),
-            )),
+            RestoreTarget::Directory | RestoreTarget::Hardlink | RestoreTarget::Symlink => Err(
+                FormatError::Parse("restore data arrived for a zero-payload entry".to_string()),
+            ),
             RestoreTarget::File {
                 destination,
                 file,
@@ -956,7 +1010,10 @@ impl RemTarEntrySink for FilesystemRestoreSink {
             RestoreTarget::None => Err(FormatError::Parse(
                 "restore file ended without an active file".to_string(),
             )),
-            RestoreTarget::Directory | RestoreTarget::Symlink | RestoreTarget::Skip => Ok(()),
+            RestoreTarget::Directory
+            | RestoreTarget::Hardlink
+            | RestoreTarget::Symlink
+            | RestoreTarget::Skip => Ok(()),
             RestoreTarget::File {
                 destination,
                 mut file,
@@ -1198,6 +1255,7 @@ enum RestoreTarget {
     None,
     Skip,
     Directory,
+    Hardlink,
     Symlink,
     File {
         destination: PathBuf,
@@ -1401,11 +1459,13 @@ mod tests {
         opts.chunk_size = 4096;
         let specs = vec![
             RemTarFileSpec::new("target.txt", "file-target", 6, sha256_array(b"target")),
+            RemTarFileSpec::hardlink("links/copy.txt", "hardlink-copy", "target.txt"),
             RemTarFileSpec::directory("empty/", "dir-empty"),
             RemTarFileSpec::symlink("links/latest", "link-latest", "../target.txt"),
         ];
         let mut readers: Vec<Box<dyn Read>> = vec![
             Box::new(&b"target"[..]),
+            Box::new(io::empty()),
             Box::new(io::empty()),
             Box::new(io::empty()),
         ];
@@ -1434,10 +1494,17 @@ mod tests {
         assert_eq!(restore.files_written, 1);
         assert_eq!(restore.directories_seen, 1);
         assert_eq!(restore.symlinks_written, 1);
+        assert_eq!(restore.hardlinks_written, 1);
         assert_eq!(restore.bytes_written, 6);
+        let target_path = restore_dir.path().join("target.txt");
+        let hardlink_path = restore_dir.path().join("links/copy.txt");
+        assert_eq!(fs::read(&target_path).unwrap(), b"target");
+        assert_eq!(fs::read(&hardlink_path).unwrap(), b"target");
+        let target_metadata = fs::metadata(&target_path).unwrap();
+        let hardlink_metadata = fs::metadata(&hardlink_path).unwrap();
         assert_eq!(
-            fs::read(restore_dir.path().join("target.txt")).unwrap(),
-            b"target"
+            std::os::unix::fs::MetadataExt::ino(&target_metadata),
+            std::os::unix::fs::MetadataExt::ino(&hardlink_metadata)
         );
         assert!(restore_dir.path().join("empty").is_dir());
         let link_path = restore_dir.path().join("links/latest");

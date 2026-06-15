@@ -1,6 +1,6 @@
 //! RAO manifest-profile CBOR validation and schema checks.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ciborium::value::Value as CborValue;
 use sha2::{Digest, Sha256};
@@ -104,8 +104,11 @@ fn validate_manifest_schema(
             "manifest file_entries exceeds MAX_FILE_ENTRIES",
         ));
     }
+    let mut seen_regular_paths = BTreeSet::new();
     for entry in file_entries {
-        validate_file_entry(entry, reader_chunk_size)?;
+        if let Some(path) = validate_file_entry(entry, reader_chunk_size, &seen_regular_paths)? {
+            seen_regular_paths.insert(path);
+        }
     }
 
     let _ = required_map(map, "object_metadata")?;
@@ -113,11 +116,15 @@ fn validate_manifest_schema(
     Ok(())
 }
 
-fn validate_file_entry(value: &CborValue, reader_chunk_size: usize) -> Result<(), FormatError> {
+fn validate_file_entry(
+    value: &CborValue,
+    reader_chunk_size: usize,
+    seen_regular_paths: &BTreeSet<String>,
+) -> Result<Option<String>, FormatError> {
     let map = value
         .as_map()
         .ok_or_else(|| FormatError::manifest_invalid("file_entries item must be a map"))?;
-    let _ = required_text(map, "path")?;
+    let path = required_text(map, "path")?;
     let _ = required_text(map, "file_id")?;
     let size_bytes = required_u64(map, "size_bytes")?;
     let chunk_count = required_u64(map, "chunk_count")?;
@@ -161,6 +168,33 @@ fn validate_file_entry(value: &CborValue, reader_chunk_size: usize) -> Result<()
                 return Err(FormatError::manifest_invalid(
                     "file_sha256 must be exactly 32 bytes",
                 ));
+            }
+            return Ok(Some(path.to_string()));
+        }
+        Some("hardlink") => {
+            if size_bytes != 0 {
+                return Err(FormatError::manifest_invalid(
+                    "hardlink entry size_bytes must be zero",
+                ));
+            }
+            if optional_bytes(map, "file_sha256")?.is_some() {
+                return Err(FormatError::manifest_invalid(
+                    "hardlink entry must not have file_sha256",
+                ));
+            }
+            let target = link_target.ok_or_else(|| {
+                FormatError::manifest_invalid("hardlink entry missing link_target")
+            })?;
+            if target.is_empty() {
+                return Err(FormatError::manifest_invalid(
+                    "hardlink entry link_target must not be empty",
+                ));
+            }
+            if !seen_regular_paths.contains(target) {
+                return Err(FormatError::InvalidHardlinkTarget {
+                    path: path.to_string(),
+                    target: target.to_string(),
+                });
             }
         }
         Some("symlink") => {
@@ -206,7 +240,7 @@ fn validate_file_entry(value: &CborValue, reader_chunk_size: usize) -> Result<()
             )));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn find_key<'a>(map: &'a [(CborValue, CborValue)], key: &str) -> Option<&'a CborValue> {

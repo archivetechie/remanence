@@ -1,6 +1,6 @@
 //! Reader and forward-scan parser for `rao-v1` objects.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use remanence_aead::{open_to_vec, OpenReport, RootKey};
 use remanence_library::BlockSource;
@@ -12,7 +12,9 @@ use crate::model::{
     BodyLba, RemTarEntryType, FORMAT_ID, MANIFEST_PATH, SCHEMA_VERSION, TAR_RECORD_SIZE,
 };
 use crate::pax::{tar_padding_len, validate_chunk_size};
-use crate::tar::{TYPE_DIRECTORY, TYPE_PAX_EXTENDED, TYPE_PAX_GLOBAL, TYPE_REGULAR, TYPE_SYMLINK};
+use crate::tar::{
+    TYPE_DIRECTORY, TYPE_HARDLINK, TYPE_PAX_EXTENDED, TYPE_PAX_GLOBAL, TYPE_REGULAR, TYPE_SYMLINK,
+};
 
 /// Reader integrity mode for `rao-v1` objects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -52,7 +54,7 @@ pub struct RemTarReadEntry {
     pub data_offset: u64,
     /// Per-file pax records attached to this entry.
     pub pax_records: BTreeMap<String, String>,
-    /// Symlink target. Present only for symbolic-link entries.
+    /// Link target. Present only for symbolic-link and hardlink entries.
     pub link_target: Option<String>,
     /// File payload bytes.
     pub data: Vec<u8>,
@@ -75,7 +77,7 @@ pub struct RemTarStreamEntry {
     pub data_offset: u64,
     /// Per-file pax records attached to this entry.
     pub pax_records: BTreeMap<String, String>,
-    /// Symlink target. Present only for symbolic-link entries.
+    /// Link target. Present only for symbolic-link and hardlink entries.
     pub link_target: Option<String>,
 }
 
@@ -439,6 +441,7 @@ where
     let mut manifest_cbor = None;
     let mut global_contract_validated = false;
     let mut seen_manifest = false;
+    let mut seen_regular_paths = BTreeSet::new();
 
     loop {
         let header = reader.read_record()?;
@@ -466,7 +469,7 @@ where
                 }
                 reader.skip_padding(header_size)?;
             }
-            TYPE_REGULAR | 0 | TYPE_SYMLINK | TYPE_DIRECTORY => {
+            TYPE_REGULAR | 0 | TYPE_HARDLINK | TYPE_SYMLINK | TYPE_DIRECTORY => {
                 if seen_manifest {
                     return Err(FormatError::parse("entry after the manifest"));
                 }
@@ -492,6 +495,12 @@ where
                 }
                 validate_entry_contract(&path, entry_type, &pending_pax)?;
                 let link_target = entry_link_target(entry_type, &pending_pax, &header)?;
+                validate_hardlink_reference(
+                    entry_type,
+                    &path,
+                    link_target.as_deref(),
+                    &seen_regular_paths,
+                )?;
                 let entry_chunk_count =
                     validate_declared_chunk_count(&path, &pending_pax, size, chunk_size)?;
                 let data_offset = reader.offset();
@@ -546,6 +555,9 @@ where
                     manifest_cbor = Some(data);
                     seen_manifest = true;
                 }
+                if entry.entry_type == RemTarEntryType::Regular && entry.path != MANIFEST_PATH {
+                    seen_regular_paths.insert(entry.path.clone());
+                }
                 entries.push(entry);
             }
             other => {
@@ -585,6 +597,7 @@ fn parse_rem_tar_bytes_with_mode_and_manifest_anchor(
     let mut digest_mismatches = Vec::new();
     let mut global_contract_validated = false;
     let mut seen_manifest = false;
+    let mut seen_regular_paths = BTreeSet::new();
 
     loop {
         let header = read_record(bytes, offset)?;
@@ -619,7 +632,7 @@ fn parse_rem_tar_bytes_with_mode_and_manifest_anchor(
                 }
                 offset = skip_payload(offset, header_size)?;
             }
-            TYPE_REGULAR | 0 | TYPE_SYMLINK | TYPE_DIRECTORY => {
+            TYPE_REGULAR | 0 | TYPE_HARDLINK | TYPE_SYMLINK | TYPE_DIRECTORY => {
                 if seen_manifest {
                     return Err(FormatError::parse("entry after the manifest"));
                 }
@@ -642,6 +655,12 @@ fn parse_rem_tar_bytes_with_mode_and_manifest_anchor(
                 let path = pending_pax.get("path").cloned().unwrap_or(header_name);
                 validate_entry_contract(&path, entry_type, &pending_pax)?;
                 let link_target = entry_link_target(entry_type, &pending_pax, header)?;
+                validate_hardlink_reference(
+                    entry_type,
+                    &path,
+                    link_target.as_deref(),
+                    &seen_regular_paths,
+                )?;
                 let data_offset = offset as u64;
                 if size > 0 && data_offset % chunk_size as u64 != 0 {
                     return Err(FormatError::ChunkAlignmentViolation { path, data_offset });
@@ -663,7 +682,7 @@ fn parse_rem_tar_bytes_with_mode_and_manifest_anchor(
                     )?;
                 }
                 let is_manifest = path == MANIFEST_PATH;
-                entries.push(RemTarReadEntry {
+                let entry = RemTarReadEntry {
                     entry_type,
                     path,
                     size_bytes: size,
@@ -677,7 +696,11 @@ fn parse_rem_tar_bytes_with_mode_and_manifest_anchor(
                     pax_records: std::mem::take(&mut pending_pax),
                     link_target,
                     data,
-                });
+                };
+                if entry.entry_type == RemTarEntryType::Regular && entry.path != MANIFEST_PATH {
+                    seen_regular_paths.insert(entry.path.clone());
+                }
+                entries.push(entry);
                 if is_manifest {
                     seen_manifest = true;
                 }
@@ -937,6 +960,7 @@ fn header_linkname(header: &[u8]) -> Result<String, FormatError> {
 fn entry_type_from_typeflag(typeflag: u8) -> Result<RemTarEntryType, FormatError> {
     match typeflag {
         TYPE_REGULAR | 0 => Ok(RemTarEntryType::Regular),
+        TYPE_HARDLINK => Ok(RemTarEntryType::Hardlink),
         TYPE_SYMLINK => Ok(RemTarEntryType::Symlink),
         TYPE_DIRECTORY => Ok(RemTarEntryType::Directory),
         other => Err(FormatError::UnsupportedTarTypeflag { typeflag: other }),
@@ -948,7 +972,10 @@ fn entry_link_target(
     pax: &BTreeMap<String, String>,
     header: &[u8],
 ) -> Result<Option<String>, FormatError> {
-    if entry_type != RemTarEntryType::Symlink {
+    if !matches!(
+        entry_type,
+        RemTarEntryType::Hardlink | RemTarEntryType::Symlink
+    ) {
         return Ok(None);
     }
     let target = pax
@@ -957,9 +984,29 @@ fn entry_link_target(
         .map(Ok)
         .unwrap_or_else(|| header_linkname(header))?;
     if target.is_empty() {
-        return Err(FormatError::parse("symlink entry missing link target"));
+        return Err(FormatError::parse("link entry missing link target"));
     }
     Ok(Some(target))
+}
+
+fn validate_hardlink_reference(
+    entry_type: RemTarEntryType,
+    path: &str,
+    target: Option<&str>,
+    seen_regular_paths: &BTreeSet<String>,
+) -> Result<(), FormatError> {
+    if entry_type != RemTarEntryType::Hardlink {
+        return Ok(());
+    }
+    let target = target.ok_or_else(|| FormatError::parse("hardlink entry missing link target"))?;
+    validate_canonical_entry_path(target, RemTarEntryType::Regular)?;
+    if !seen_regular_paths.contains(target) {
+        return Err(FormatError::InvalidHardlinkTarget {
+            path: path.to_string(),
+            target: target.to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn verify_checksum(header: &[u8]) -> Result<(), FormatError> {

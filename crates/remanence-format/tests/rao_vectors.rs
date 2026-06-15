@@ -123,6 +123,32 @@ fn bytes_mod(length: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
+fn hardlink_vector_entries() -> Vec<TestEntry> {
+    let long_target = format!("hardlink-targets/{}.bin", "p".repeat(110));
+    vec![
+        TestEntry::regular(
+            "primary.txt",
+            "00000000-0000-4000-8000-000000000201",
+            b"shared hardlink payload\n".to_vec(),
+        ),
+        TestEntry::hardlink(
+            "links/copy.txt",
+            "00000000-0000-4000-8000-000000000202",
+            "primary.txt",
+        ),
+        TestEntry::regular(
+            long_target.clone(),
+            "00000000-0000-4000-8000-000000000203",
+            b"long target hardlink payload\n".to_vec(),
+        ),
+        TestEntry::hardlink(
+            "links/long-target-copy.bin",
+            "00000000-0000-4000-8000-000000000204",
+            long_target,
+        ),
+    ]
+}
+
 #[derive(Debug, Clone)]
 struct TestEntry {
     entry_type: RemTarEntryType,
@@ -167,6 +193,22 @@ impl TestEntry {
         }
     }
 
+    fn hardlink(
+        path: impl Into<String>,
+        file_id: impl Into<String>,
+        target: impl Into<String>,
+    ) -> Self {
+        Self {
+            entry_type: RemTarEntryType::Hardlink,
+            path: path.into(),
+            file_id: file_id.into(),
+            data: Vec::new(),
+            link_target: Some(target.into()),
+            mtime: None,
+            executable: None,
+        }
+    }
+
     fn directory(path: impl Into<String>, file_id: impl Into<String>) -> Self {
         Self {
             entry_type: RemTarEntryType::Directory,
@@ -196,6 +238,13 @@ impl TestEntry {
                 &self.file_id,
                 self.data.len() as u64,
                 Sha256::digest(&self.data).into(),
+            ),
+            RemTarEntryType::Hardlink => RemTarFileSpec::hardlink(
+                &self.path,
+                &self.file_id,
+                self.link_target
+                    .as_deref()
+                    .expect("hardlink test entry has a target"),
             ),
             RemTarEntryType::Symlink => RemTarFileSpec::symlink(
                 &self.path,
@@ -249,6 +298,7 @@ fn assert_layout(actual: &remanence_format::RemTarFileLayout, expected: &Value) 
 fn entry_type_name(entry_type: RemTarEntryType) -> &'static str {
     match entry_type {
         RemTarEntryType::Regular => "regular",
+        RemTarEntryType::Hardlink => "hardlink",
         RemTarEntryType::Symlink => "symlink",
         RemTarEntryType::Directory => "directory",
     }
@@ -257,6 +307,7 @@ fn entry_type_name(entry_type: RemTarEntryType) -> &'static str {
 fn entry_type_from_fixture(value: &Value) -> RemTarEntryType {
     match value.as_str().expect("entry type is a string") {
         "regular" => RemTarEntryType::Regular,
+        "hardlink" => RemTarEntryType::Hardlink,
         "symlink" => RemTarEntryType::Symlink,
         "directory" => RemTarEntryType::Directory,
         other => panic!("unexpected fixture entry type {other:?}"),
@@ -461,6 +512,24 @@ fn assert_plaintext_vector_fixture(
             entry.link_target.as_deref(),
             Some(str_field(symlink, "target").as_str())
         );
+    }
+
+    let hardlink_entries: Vec<&TestEntry> = entries
+        .iter()
+        .filter(|entry| entry.entry_type == RemTarEntryType::Hardlink)
+        .collect();
+    if let Some(hardlinks) = expected.get("hardlinks") {
+        let hardlinks = hardlinks.as_array().expect("hardlinks are an array");
+        assert_eq!(hardlink_entries.len(), hardlinks.len());
+        for (entry, hardlink) in hardlink_entries.iter().zip(hardlinks) {
+            assert_eq!(entry.path, str_field(hardlink, "path"));
+            assert_eq!(
+                entry.link_target.as_deref(),
+                Some(str_field(hardlink, "target").as_str())
+            );
+        }
+    } else {
+        assert!(hardlink_entries.is_empty());
     }
 
     let directory_entries: Vec<&TestEntry> = entries
@@ -968,6 +1037,16 @@ fn rao_tv_manifest_matches_fixture_manifest() {
                 bytes_mod(513, 10),
             ),
         ],
+    );
+}
+
+#[test]
+fn rao_tv_hardlinks_matches_fixture_manifest() {
+    assert_plaintext_vector_fixture(
+        include_str!("../../../fixtures/rao/rao-tv-hardlinks.json"),
+        "RAO-TV-HARDLINKS",
+        vector_options(110, "rao-tv-hardlinks", "000000000110"),
+        hardlink_vector_entries(),
     );
 }
 

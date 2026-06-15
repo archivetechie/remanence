@@ -71,6 +71,15 @@ pub enum FormatError {
     #[error("invalid RAO path: {0}")]
     InvalidPath(String),
 
+    /// A hardlink target is absent, not a regular primary, or appears later.
+    #[error("invalid hardlink target for {path}: {target}")]
+    InvalidHardlinkTarget {
+        /// Hardlink entry path after pax processing.
+        path: String,
+        /// Hardlink target path.
+        target: String,
+    },
+
     /// A tar payload or header was truncated.
     #[error("truncated tar payload")]
     TruncatedPayload,

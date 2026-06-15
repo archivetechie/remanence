@@ -5844,6 +5844,7 @@ struct RaoEntryLocator {
     path: String,
     entry_type: RemTarEntryType,
     size_bytes: u64,
+    link_target: Option<String>,
     first_chunk_lba: Option<BodyLba>,
     data_offset: u64,
     file_sha256: Option<String>,
@@ -5907,9 +5908,10 @@ fn scan_rao_entry_locators<R: Read + Seek>(
                     .checked_add(round_up_512_local(header_size)?)
                     .ok_or_else(|| "RAO tar offset overflow".to_string())?;
             }
-            b'0' | 0 | b'2' | b'5' => {
+            b'0' | 0 | b'1' | b'2' | b'5' => {
                 let entry_type = match header[156] {
                     b'0' | 0 => RemTarEntryType::Regular,
+                    b'1' => RemTarEntryType::Hardlink,
                     b'2' => RemTarEntryType::Symlink,
                     b'5' => RemTarEntryType::Directory,
                     other => {
@@ -5934,11 +5936,38 @@ fn scan_rao_entry_locators<R: Read + Seek>(
                         "RAO entry {path:?} payload starts at unaligned offset {offset}"
                     ));
                 }
+                let link_target = if matches!(
+                    entry_type,
+                    RemTarEntryType::Hardlink | RemTarEntryType::Symlink
+                ) {
+                    let target = pending_pax
+                        .get("linkpath")
+                        .cloned()
+                        .unwrap_or_else(|| local_tar_header_linkname(&header));
+                    if target.is_empty() {
+                        return Err(format!("RAO link entry {path:?} is missing target"));
+                    }
+                    Some(target)
+                } else {
+                    None
+                };
+                if entry_type == RemTarEntryType::Hardlink {
+                    let target = link_target.as_deref().expect("hardlink target was set");
+                    let target_is_primary = entries.iter().any(|entry: &RaoEntryLocator| {
+                        entry.entry_type == RemTarEntryType::Regular && entry.path == target
+                    });
+                    if !target_is_primary {
+                        return Err(format!(
+                            "RAO hardlink {path:?} target {target:?} is not a preceding regular entry"
+                        ));
+                    }
+                }
                 let file_sha256 = pending_pax.get("REMANENCE.file_sha256").cloned();
                 entries.push(RaoEntryLocator {
                     path,
                     entry_type,
                     size_bytes: size,
+                    link_target,
                     first_chunk_lba: (size > 0).then_some(BodyLba(offset / chunk_size as u64)),
                     data_offset: offset,
                     file_sha256,
@@ -5970,13 +5999,29 @@ fn require_regular_locator<'a>(
         .iter()
         .find(|entry| entry.path == path)
         .ok_or_else(|| format!("RAO entry {path:?} not found"))?;
-    if entry.entry_type != RemTarEntryType::Regular {
-        return Err(format!(
+    match entry.entry_type {
+        RemTarEntryType::Regular => Ok(entry),
+        RemTarEntryType::Hardlink => {
+            let target = entry
+                .link_target
+                .as_deref()
+                .ok_or_else(|| format!("RAO hardlink {path:?} is missing link_target"))?;
+            let primary = scan
+                .entries
+                .iter()
+                .find(|candidate| {
+                    candidate.path == target && candidate.entry_type == RemTarEntryType::Regular
+                })
+                .ok_or_else(|| {
+                    format!("RAO hardlink {path:?} target {target:?} is not a regular primary")
+                })?;
+            Ok(primary)
+        }
+        _ => Err(format!(
             "RAO entry {path:?} is {}, not regular",
             archive_entry_type_name(entry.entry_type)
-        ));
+        )),
     }
-    Ok(entry)
 }
 
 fn read_plaintext_rao_entry_range(
@@ -6102,6 +6147,10 @@ fn local_tar_header_path(header: &[u8; 512]) -> String {
     }
 }
 
+fn local_tar_header_linkname(header: &[u8; 512]) -> String {
+    local_nul_trim(&header[157..257])
+}
+
 fn local_nul_trim(bytes: &[u8]) -> String {
     let end = bytes
         .iter()
@@ -6161,12 +6210,29 @@ fn extract_plaintext_archive_range_file(
     let entry = object
         .entry(member_path)
         .ok_or_else(|| format!("plaintext RAO member {member_path:?} not found"))?;
-    if entry.entry_type != RemTarEntryType::Regular {
-        return Err(format!(
-            "range extraction requires a regular file, got {} for {member_path:?}",
-            archive_entry_type_name(entry.entry_type)
-        ));
-    }
+    let entry = match entry.entry_type {
+        RemTarEntryType::Regular => entry,
+        RemTarEntryType::Hardlink => {
+            let target = entry
+                .link_target
+                .as_deref()
+                .ok_or_else(|| format!("hardlink member {member_path:?} is missing target"))?;
+            object
+                .entry(target)
+                .filter(|target_entry| target_entry.entry_type == RemTarEntryType::Regular)
+                .ok_or_else(|| {
+                    format!(
+                        "hardlink member {member_path:?} target {target:?} is not a regular primary"
+                    )
+                })?
+        }
+        _ => {
+            return Err(format!(
+                "range extraction requires a regular file, got {} for {member_path:?}",
+                archive_entry_type_name(entry.entry_type)
+            ));
+        }
+    };
     let range_end = validate_member_range(entry.size_bytes, range)?;
     let start = usize::try_from(range.start)
         .map_err(|_| "range start is too large for this host".to_string())?;
@@ -6412,6 +6478,7 @@ fn archive_extract_report_json(
         "files_written": report.files_written,
         "directories_seen": report.directories_seen,
         "symlinks_written": report.symlinks_written,
+        "hardlinks_written": report.hardlinks_written,
         "bytes_written": report.bytes_written,
     })
 }
@@ -6663,6 +6730,7 @@ fn archive_file_report_json(layout: &RemTarFileLayout, input: &ArchiveBuildInput
 fn archive_entry_type_name(entry_type: RemTarEntryType) -> &'static str {
     match entry_type {
         RemTarEntryType::Regular => "regular",
+        RemTarEntryType::Hardlink => "hardlink",
         RemTarEntryType::Symlink => "symlink",
         RemTarEntryType::Directory => "directory",
     }
@@ -6846,6 +6914,14 @@ fn archive_build_file_spec(input: &ArchiveBuildInputFile) -> RemTarFileSpec {
             spec.executable = Some(false);
             spec
         }
+        RemTarEntryType::Hardlink => RemTarFileSpec::hardlink(
+            input.archive_path.clone(),
+            input.file_id.clone(),
+            input
+                .link_target
+                .clone()
+                .expect("hardlink input has link target"),
+        ),
         RemTarEntryType::Symlink => RemTarFileSpec::symlink(
             input.archive_path.clone(),
             input.file_id.clone(),
@@ -9846,6 +9922,7 @@ tape_catalog_dir = "{0}/cache/tapes"
         assert_eq!(extract["files_written"], 1);
         assert_eq!(extract["directories_seen"], 1);
         assert_eq!(extract["symlinks_written"], 2);
+        assert_eq!(extract["hardlinks_written"], 0);
         assert_eq!(extract["bytes_written"], 6);
         assert_eq!(fs::read(restore_dir.join("target.txt")).unwrap(), b"target");
         assert!(restore_dir.join("empty").is_dir());
@@ -9861,6 +9938,60 @@ tape_catalog_dir = "{0}/cache/tapes"
             fs::read_link(restore_dir.join("dangling")).unwrap(),
             PathBuf::from("missing.txt")
         );
+    }
+
+    #[test]
+    fn plaintext_locator_scan_resolves_hardlink_pfr_rows() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-hardlink-pfr")
+            .tempdir()
+            .unwrap();
+        let object_path = temp.path().join("hardlinks.rao");
+        let primary = b"shared hardlink payload".to_vec();
+        let mut primary_reader = Cursor::new(primary.as_slice());
+        let mut hardlink_reader = io::empty();
+        let mut streams = [
+            RemTarFileStream::new(
+                RemTarFileSpec::new(
+                    "primary.txt",
+                    "file-primary",
+                    primary.len() as u64,
+                    sha256_bytes(&primary),
+                ),
+                &mut primary_reader,
+            ),
+            RemTarFileStream::new(
+                RemTarFileSpec::hardlink("links/copy.txt", "hardlink-copy", "primary.txt"),
+                &mut hardlink_reader,
+            ),
+        ];
+        let mut sink = remanence_library::VecBlockSink::new();
+        let mut options = RemTarObjectOptions::new(
+            "object-hardlinks",
+            "caller-hardlinks",
+            "2026-01-01T00:00:00Z",
+            "manifest-hardlinks",
+        );
+        options.chunk_size = 4096;
+        write_rem_tar_object_from_readers(&mut sink, &options, &mut streams).unwrap();
+        let bytes = sink.blocks.iter().flatten().copied().collect::<Vec<_>>();
+        fs::write(&object_path, &bytes).unwrap();
+
+        let scan = scan_rao_entry_locators_from_bytes(&bytes, 4096).unwrap();
+        let hardlink = scan
+            .entries
+            .iter()
+            .find(|entry| entry.path == "links/copy.txt")
+            .unwrap();
+        assert_eq!(hardlink.entry_type, RemTarEntryType::Hardlink);
+        assert_eq!(hardlink.link_target.as_deref(), Some("primary.txt"));
+        assert_eq!(hardlink.first_chunk_lba, None);
+
+        let resolved = require_regular_locator(&scan, "links/copy.txt").unwrap();
+        assert_eq!(resolved.path, "primary.txt");
+        assert_eq!(resolved.size_bytes, primary.len() as u64);
+        let bytes = read_plaintext_rao_entry_range(&object_path, resolved, 7, 8).unwrap();
+        assert_eq!(bytes, b"hardlink");
     }
 
     #[test]
