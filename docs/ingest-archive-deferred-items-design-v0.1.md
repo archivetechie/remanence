@@ -11,7 +11,7 @@ than a corrective patch. Implementation hands to codex once an item is marked
 | --- | --- | --- |
 | 1 | Non-UTF-8 member-name encoding in `.remwrap.idx` (+ customer manifest + restore request) | **Resolved** |
 | 2 | Cheap classification-only `--scan-only` | **Resolved** |
-| 2b | xattr handling policy (pulled RAO 1.1 forward) | **Resolved** (own doc) |
+| 2b | xattr handling policy (pulled RAO 1.1 forward; denylist/allowlist ruleset-configurable) | **Resolved** (own doc) |
 | 3 | `rem restore` naming → foreign formats become plugins (BRU out of core) | **Resolved** (direction; own design doc to follow) |
 | 4 | Hardlinks → native typeflag 1; + entry-type scope principle; + sparse → upstream compression | **Resolved** |
 
@@ -205,9 +205,29 @@ big resource fork makes a big xattr → the file then wraps (lossless); and an
 `exclude **/._*` rule must never run on un-merged Case-B data or it silently
 drops the metadata.
 
-**Open sub-decision (small):** denylist (preserve every non-junk xattr) vs.
-allowlist (keep only known-meaningful, e.g. color tags, drop the rest). Lean
-**denylist** — the don't-lose-data ethic — with the drop list tunable.
+**Denylist vs allowlist — RESOLVED: ruleset-configurable, with a fail-safe
+default.** Not a single global choice — it's per-source policy declared in the
+ruleset (where `blob`/`exclude`/`expect`/case-insensitivity already live):
+
+- **Universal junk baseline** — the known macOS ephemerals
+  (`com.apple.quarantine`, `…WhereFroms`, `…lastuseddate#PS`, Spotlight/
+  FinderInfo noise) are **always dropped**, shipped built into rem and updated
+  as OSes evolve. Rulesets never re-type these.
+- **Per-ruleset stance**, as `option`-style directives (name-based and
+  ruleset-global — *not* per-path; per-path xattr policy is unneeded
+  complexity):
+  - `option xattr-mode denylist` (default) — keep every xattr except the
+    universal baseline plus any `xattr-drop <name>` the ruleset adds.
+  - `option xattr-mode allowlist` — keep only the xattrs listed via
+    `xattr-keep <name>`; drop all others.
+- **Absent any xattr directive → the fail-safe default** (denylist stance,
+  universal baseline only). An archive tool's out-of-box behavior must be
+  "don't silently drop metadata"; a class that wants clean archives opts into
+  allowlist.
+
+Configurability *strengthens* never-silent: the safe default protects the
+unaware, and an allowlist is an explicit, recorded, per-source choice. All
+drops are counted in the scan/report regardless of mode.
 
 ## Item 3 — Foreign formats become plugins; native restore gets the clean verb (RESOLVED — direction)
 
