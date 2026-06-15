@@ -12,8 +12,8 @@ than a corrective patch. Implementation hands to codex once an item is marked
 | 1 | Non-UTF-8 member-name encoding in `.remwrap.idx` (+ customer manifest + restore request) | **Resolved** |
 | 2 | Cheap classification-only `--scan-only` | **Resolved** |
 | 2b | xattr handling policy (pulled RAO 1.1 forward) | **Resolved** (own doc) |
-| 3 | `rem restore` naming / alias | pending |
-| 4 | Cross-tree hardlink policy edge | pending |
+| 3 | `rem restore` naming → foreign formats become plugins (BRU out of core) | **Resolved** (direction; own design doc to follow) |
+| 4 | Cross-tree hardlink edge → flatten hardlinks | **Resolved** |
 
 ---
 
@@ -209,10 +209,70 @@ drops the metadata.
 allowlist (keep only known-meaningful, e.g. color tags, drop the rest). Lean
 **denylist** — the don't-lose-data ethic — with the drop list tunable.
 
-## Item 3 — `rem restore` naming / alias
+## Item 3 — Foreign formats become plugins; native restore gets the clean verb (RESOLVED — direction)
 
-*(pending)*
+The naming collision (`rem archive restore` = legacy BRU dump vs. `archive
+extract` = RAO, with the design wanting `rem restore`) is a symptom. The real
+issue: **BRU shouldn't be in rem core at all.** There are two format
+categories — **native** (RAO plain/aead; rem *writes* these; core) and
+**foreign/legacy** (BRU, old tar, …; rem only *reads* them to migrate off old
+tapes; reverse-engineered; inherently per-deployment — archive has BRU, another
+site has something else). Baking one organization's legacy into the core tool
+is wrong.
 
-## Item 4 — Cross-tree hardlink policy edge
+**Decision:** foreign formats are **plugins**. BRU becomes its own project
+implementing rem's published foreign-format-driver trait (sketched in
+`format-driver-streaming-boundary.md`); rem core ships with **zero** foreign
+formats; a deployment assembles its `rem` binary from core + the plugins it
+needs (**compile-time** — distribution crate / feature flags — *not* dynamic
+loading, per the note and to avoid Rust's no-stable-ABI pain).
 
-*(pending)*
+This dissolves the naming collision at the root: with the BRU-specific
+`archive restore` command gone from core, `rem restore` (or `archive extract`)
+cleanly owns native RAO restore, and foreign restore is the generic
+`rem archive <op> --format <plugin>` dispatch (already designed in the note),
+present only when a plugin is compiled in.
+
+**Scope:** its own architecture work item — promote the driver trait to a
+published extension point; move `remanence-bru` out of the core workspace;
+plugin-gate the `--format` dispatch; assemble the binary from core + plugins.
+Bigger than naming; pairs with `tape-platform-seam-design-v0.1.md` (foreign
+read-formats are the format-layer complement to the platform seam's
+layout/catalog reuse). **To be written up as its own design doc.**
+
+**Sub-decisions for that write-up:** (a) linked-in crate (lean) vs
+out-of-process subprocess plugin; (b) where the driver-trait crate lives
+(new `remanence-format-driver` vs platform/library layer); (c) incremental
+(feature-flag BRU out now, separate repo later) vs big-bang.
+
+## Item 4 — Hardlinks: flatten, don't preserve-via-wrap (RESOLVED)
+
+The "cross-tree collapse" (one hardlink pair spanning two subtrees blobs the
+whole input) is a self-inflicted edge: it exists *only* because the design
+preserves hardlinks by wrapping their **common-ancestor directory** (to borrow
+tar's hardlink record). For cross-subtree links the common ancestor is the
+root → the whole archive becomes one blob. The mechanism is fighting RAO 1.0's
+own scope, which **deliberately has no hardlink entry type**.
+
+**Decision: flatten hardlinks.** Each hardlinked name becomes an ordinary
+**native RAO entry** with its own copy of the bytes. `nlink > 1` is no longer a
+wrap-fallback trigger. Rationale:
+
+- **No data is lost** — every byte is archived (stored once per name). What's
+  dropped is the *inode link*, a source-filesystem storage property, not
+  archival data. The archive's contract ("files back, byte-correct") is met.
+- **"Same content" is still captured** — RAO records each file's sha256 and the
+  catalog keys assets by it, so two hardlinked names appear as two paths with
+  one identical hash. Content-addressing already says what the hardlink said.
+- **Never silent** — record "N hardlink sets flattened to independent copies"
+  in the scan/report.
+
+**Tradeoff:** a hardlinked set is stored once per name (duplication). Negligible
+for rare media hardlinks. If it ever matters: dedup by sha256 at bundle build
+(sutradhara), or add a real RAO hardlink entry-type as a deliberate future
+minor — never the directory-blob hack.
+
+**Removes:** `collect_hardlink_roots` + its second tree-walk, the
+common-ancestor computation, the cross-tree-collapse edge, and the
+climb-capping band-aids. `native_status` drops the
+`has_multiple_hardlinks → WrapFallback("hardlink")` branch. Net simplification.
