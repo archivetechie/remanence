@@ -43,8 +43,8 @@ backward-compatible**:
 
 ### 2.1 Wire format
 
-An entry's `metadata_preservation_data` MAY be a CBOR map (manifest profile,
-RAO 1.0 §4.7.1) containing:
+An entry's `metadata_preservation_data` is a CBOR map (manifest profile,
+RAO 1.0 §4.7.1) that MAY contain:
 
 ```text
 "xattrs" : { <name> : <value>, ... }
@@ -65,6 +65,9 @@ RAO 1.0 §4.7.1) containing:
 - An entry with no preserved xattrs MUST emit an **empty**
   `metadata_preservation_data` (preserving 1.0 byte-stability). A non-empty
   container is what marks a 1.1 object.
+- Hardlink entries MUST emit an empty `metadata_preservation_data`. They carry
+  no independent metadata fields; the shared inode's restored xattrs come from
+  the regular-file primary named by `link_target`.
 
 **Scope is xattrs only.** Ownership stays unpreserved (RAO 1.0 §4.3.1), `mtime`
 is already covered (RAO 1.0 pax `mtime`, fractional seconds), and

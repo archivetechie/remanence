@@ -8,9 +8,7 @@ use remanence_library::{BlockSink, VecBlockSink};
 use sha2::{Digest, Sha256};
 
 use crate::error::FormatError;
-use crate::layout::{
-    file_pax_records, global_pax_records, plan_one_file, plan_rem_tar_object, RemTarObjectLayout,
-};
+use crate::layout::{file_pax_records, plan_one_file, plan_rem_tar_object, RemTarObjectLayout};
 use crate::model::{
     RemTarEntryType, RemTarFile, RemTarFileSpec, RemTarFileStream, RemTarObjectOptions,
     MANIFEST_PATH, TAR_RECORD_SIZE,
@@ -126,7 +124,7 @@ pub fn write_rem_tar_object<S: BlockSink + ?Sized>(
     let layout = plan_rem_tar_object(options, &specs)?;
     let mut writer = BodyBlockWriter::new(sink, options.chunk_size)?;
 
-    write_global_header(&mut writer, options)?;
+    write_global_header(&mut writer, options, &layout.schema_version)?;
     for (file, spec) in files.iter().zip(specs.iter()) {
         write_file_entry_from_bytes(&mut writer, options.chunk_size, spec, file.data, false)?;
     }
@@ -138,6 +136,7 @@ pub fn write_rem_tar_object<S: BlockSink + ?Sized>(
         size_bytes: layout.manifest_cbor.len() as u64,
         file_sha256: Some(layout.manifest_sha256),
         link_target: None,
+        xattrs: Default::default(),
         mtime: None,
         executable: Some(false),
     };
@@ -177,7 +176,7 @@ pub fn write_rem_tar_object_from_readers<S: BlockSink + ?Sized>(
     let layout = plan_rem_tar_object(options, &specs)?;
     let mut writer = BodyBlockWriter::new(sink, options.chunk_size)?;
 
-    write_global_header(&mut writer, options)?;
+    write_global_header(&mut writer, options, &layout.schema_version)?;
     for file in files.iter_mut() {
         write_file_entry_from_reader(
             &mut writer,
@@ -195,6 +194,7 @@ pub fn write_rem_tar_object_from_readers<S: BlockSink + ?Sized>(
         size_bytes: layout.manifest_cbor.len() as u64,
         file_sha256: Some(layout.manifest_sha256),
         link_target: None,
+        xattrs: Default::default(),
         mtime: None,
         executable: Some(false),
     };
@@ -328,8 +328,9 @@ fn validate_encrypted_envelope_preconditions(
 fn write_global_header<S: BlockSink + ?Sized>(
     writer: &mut BodyBlockWriter<'_, S>,
     options: &RemTarObjectOptions,
+    schema_version: &str,
 ) -> Result<(), FormatError> {
-    let body = encode_pax_records(&global_pax_records(options))?;
+    let body = encode_pax_records(&crate::layout::global_pax_records(options, schema_version))?;
     writer.write_all(&encode_header(
         "GlobalHead.0/PaxHeaders/remanence",
         body.len() as u64,
@@ -589,6 +590,7 @@ fn file_to_spec(file: &RemTarFile<'_>) -> RemTarFileSpec {
         size_bytes: file.data.len() as u64,
         file_sha256: Some(file_sha256),
         link_target: None,
+        xattrs: Default::default(),
         mtime: file.mtime.map(str::to_string),
         executable: file.executable,
     }
@@ -901,6 +903,44 @@ mod tests {
     }
 
     #[test]
+    fn streaming_writer_round_trips_xattrs_and_bumps_schema_version() {
+        let opts = options(4096);
+        let data = b"xattr payload".to_vec();
+        let mut spec = file_spec("tagged.txt", "file-tagged", &data, None, Some(false));
+        spec.xattrs
+            .insert("user.comment".to_string(), b"blue".to_vec());
+        spec.xattrs
+            .insert("user.remanence.color".to_string(), vec![0x01, 0x02, 0xff]);
+        let mut reader = Cursor::new(data.as_slice());
+        let mut streams = [RemTarFileStream::new(spec, &mut reader)];
+        let mut sink = VecBlockSink::new();
+
+        let layout = write_rem_tar_object_from_readers(&mut sink, &opts, &mut streams).unwrap();
+        assert_eq!(layout.schema_version, crate::model::SCHEMA_VERSION_XATTRS);
+
+        let mut source = VecBlockSource::new(sink.blocks);
+        let read =
+            crate::read_rem_tar_object(&mut source, opts.chunk_size, layout.projected_size_blocks)
+                .unwrap();
+
+        assert_eq!(
+            read.global_pax
+                .get("REMANENCE.schema_version")
+                .map(String::as_str),
+            Some(crate::model::SCHEMA_VERSION_XATTRS)
+        );
+        let entry = read.entry("tagged.txt").unwrap();
+        assert_eq!(
+            entry.xattrs.get("user.comment").map(Vec::as_slice),
+            Some(&b"blue"[..])
+        );
+        assert_eq!(
+            entry.xattrs.get("user.remanence.color").map(Vec::as_slice),
+            Some(&[0x01, 0x02, 0xff][..])
+        );
+    }
+
+    #[test]
     fn streaming_writer_rejects_short_source() {
         let opts = options(4096);
         let expected = b"abcdefghij".to_vec();
@@ -1074,6 +1114,7 @@ with tarfile.open(sys.argv[1], "r:*") as tf:
             size_bytes: data.len() as u64,
             file_sha256: Some(hash),
             link_target: None,
+            xattrs: Default::default(),
             mtime: mtime.map(str::to_string),
             executable,
         }

@@ -1,5 +1,7 @@
 //! Public value types for `rao-v1`.
 
+use std::collections::BTreeMap;
+
 /// POSIX tar records are always 512 bytes.
 pub const TAR_RECORD_SIZE: usize = 512;
 
@@ -12,11 +14,17 @@ pub const FORMAT_ID: &str = "rao-v1";
 /// Schema version recorded in global pax headers.
 pub const SCHEMA_VERSION: &str = "1.0";
 
+/// Schema version recorded when a v1.1 additive feature is used.
+pub const SCHEMA_VERSION_XATTRS: &str = "1.1";
+
 /// The manifest path inside every `rao-v1` object.
 pub const MANIFEST_PATH: &str = "_remanence/manifest.cbor";
 
 /// Maximum manifest `file_entries` array length accepted by the RAO profile.
 pub(crate) const MAX_FILE_ENTRIES: usize = 10_000_000;
+
+/// Preserved extended attributes keyed by xattr name.
+pub type RemTarXattrs = BTreeMap<String, Vec<u8>>;
 
 /// Per-object logical block address. Starts at zero for each object archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -100,6 +108,8 @@ pub struct RemTarFileSpec {
     pub file_sha256: Option<[u8; 32]>,
     /// Link target. Present only for symbolic-link and hardlink entries.
     pub link_target: Option<String>,
+    /// Preserved extended attributes for RAO 1.1 objects.
+    pub xattrs: RemTarXattrs,
     /// Optional mtime value recorded in pax when supplied.
     pub mtime: Option<String>,
     /// Optional executable flag recorded in Remanence pax metadata.
@@ -121,6 +131,7 @@ impl RemTarFileSpec {
             size_bytes,
             file_sha256: Some(file_sha256),
             link_target: None,
+            xattrs: BTreeMap::new(),
             mtime: None,
             executable: None,
         }
@@ -139,6 +150,7 @@ impl RemTarFileSpec {
             size_bytes: 0,
             file_sha256: None,
             link_target: Some(target.into()),
+            xattrs: BTreeMap::new(),
             mtime: None,
             executable: None,
         }
@@ -157,6 +169,7 @@ impl RemTarFileSpec {
             size_bytes: 0,
             file_sha256: None,
             link_target: Some(target.into()),
+            xattrs: BTreeMap::new(),
             mtime: None,
             executable: None,
         }
@@ -171,6 +184,7 @@ impl RemTarFileSpec {
             size_bytes: 0,
             file_sha256: None,
             link_target: None,
+            xattrs: BTreeMap::new(),
             mtime: None,
             executable: None,
         }
@@ -252,6 +266,8 @@ pub struct RemTarFileLayout {
     pub file_sha256: Option<[u8; 32]>,
     /// Link target. Present only for symbolic-link and hardlink entries.
     pub link_target: Option<String>,
+    /// Preserved extended attributes for RAO 1.1 objects.
+    pub xattrs: RemTarXattrs,
     /// Optional executable flag recorded in Remanence pax metadata.
     pub executable: Option<bool>,
     /// First data chunk LBA. Absent for zero-length files.

@@ -32,7 +32,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
@@ -43,6 +43,7 @@ FIXTURES = ROOT / "fixtures" / "rao"
 TAR_RECORD_SIZE = 512
 FORMAT_ID = "rao-v1"
 SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION_XATTRS = "1.1"
 MANIFEST_PATH = "_remanence/manifest.cbor"
 TYPE_REGULAR = b"0"[0]
 TYPE_HARDLINK = b"1"[0]
@@ -81,6 +82,7 @@ class FileSpec:
     link_target: str | None = None
     executable: bool | None = None
     mtime: str | None = None
+    xattrs: dict[str, bytes] = field(default_factory=dict)
 
     @property
     def size_bytes(self) -> int:
@@ -103,6 +105,7 @@ class FileLayout:
     file_sha256: bytes | None
     entry_type: str
     link_target: str | None
+    xattrs: dict[str, bytes]
     executable: bool | None
     first_chunk_lba: int | None
     chunk_count: int
@@ -445,7 +448,11 @@ def decode_cbor_exact(data: bytes) -> Any:
     return value
 
 
-def global_pax_records(options: dict[str, Any]) -> dict[str, str]:
+def stream_schema_version(files: list[FileSpec]) -> str:
+    return SCHEMA_VERSION_XATTRS if any(spec.xattrs for spec in files) else SCHEMA_VERSION
+
+
+def global_pax_records(options: dict[str, Any], schema_version: str) -> dict[str, str]:
     return {
         "REMANENCE.caller_object_id": options["caller_object_id"],
         "REMANENCE.chunk_size": str(options["chunk_size"]),
@@ -453,7 +460,7 @@ def global_pax_records(options: dict[str, Any]) -> dict[str, str]:
         "REMANENCE.format_id": FORMAT_ID,
         "REMANENCE.metadata_preservation": options["metadata_preservation"],
         "REMANENCE.object_id": options["object_id"],
-        "REMANENCE.schema_version": SCHEMA_VERSION,
+        "REMANENCE.schema_version": schema_version,
         "REMANENCE.write_timestamp": options["write_timestamp"],
     }
 
@@ -496,6 +503,7 @@ def plan_one_file(chunk_size: int, offset: int, spec: FileSpec, is_manifest: boo
         file_sha256=spec.file_sha256,
         entry_type=spec.entry_type,
         link_target=spec.link_target,
+        xattrs=dict(spec.xattrs),
         executable=spec.executable,
         first_chunk_lba=None if spec.size_bytes == 0 else data_offset // chunk_size,
         chunk_count=chunk_count(spec.size_bytes, chunk_size),
@@ -507,12 +515,15 @@ def plan_one_file(chunk_size: int, offset: int, spec: FileSpec, is_manifest: boo
 
 
 def manifest_entry(layout: FileLayout) -> dict[str, Any]:
+    metadata_preservation_data: dict[str, Any] = {}
+    if layout.xattrs:
+        metadata_preservation_data["xattrs"] = dict(layout.xattrs)
     entry = {
         "chunk_count": layout.chunk_count,
         "executable": layout.executable,
         "file_id": layout.file_id,
         "first_chunk_lba": layout.first_chunk_lba,
-        "metadata_preservation_data": {},
+        "metadata_preservation_data": metadata_preservation_data,
         "path": layout.path,
         "size_bytes": layout.size_bytes,
     }
@@ -579,7 +590,7 @@ def append_file_entry(out: bytearray, spec: FileSpec, records: dict[str, str], i
 def build_plaintext(options: dict[str, Any], files: list[FileSpec]) -> tuple[bytes, dict[str, Any]]:
     chunk_size = options["chunk_size"]
     out = bytearray()
-    global_body = encode_pax_records(global_pax_records(options))
+    global_body = encode_pax_records(global_pax_records(options, stream_schema_version(files)))
     out.extend(encode_header("GlobalHead.0/PaxHeaders/remanence", len(global_body), TYPE_PAX_GLOBAL, 0o644))
     out.extend(global_body)
     out.extend(b"\0" * (round_up(len(global_body), TAR_RECORD_SIZE) - len(global_body)))
@@ -938,6 +949,27 @@ def positive_plaintext_vector_definitions() -> list[tuple[str, str, dict[str, An
                 ),
             ],
         ),
+        (
+            "rao-tv-xattrs.json",
+            "RAO-TV-XATTRS",
+            vector_options(111, "rao-tv-xattrs", "000000000111"),
+            [
+                FileSpec(
+                    "tagged.txt",
+                    "00000000-0000-4000-8000-000000000211",
+                    b"xattr payload\n",
+                    xattrs={
+                        "user.comment": b"blue",
+                        "user.remanence.color": bytes([0x01, 0x02, 0xff]),
+                    },
+                ),
+                FileSpec(
+                    "plain.txt",
+                    "00000000-0000-4000-8000-000000000212",
+                    b"plain payload\n",
+                ),
+            ],
+        ),
     ]
 
 
@@ -953,6 +985,32 @@ def layout_json(layout: FileLayout) -> dict[str, Any]:
     }
 
 
+def input_entry_json(spec: FileSpec) -> dict[str, Any]:
+    entry = {
+        "entry_type": spec.entry_type,
+        "path": spec.path,
+        "file_id": spec.file_id,
+        "size_bytes": spec.size_bytes,
+        "link_target": spec.link_target,
+        "mtime": spec.mtime,
+        "executable": spec.executable,
+    }
+    if spec.xattrs:
+        entry["xattrs"] = {name: hx(value) for name, value in spec.xattrs.items()}
+    return entry
+
+
+def expected_xattrs(files: list[FileSpec]) -> list[dict[str, Any]]:
+    return [
+        {
+            "path": spec.path,
+            "xattrs": {name: hx(value) for name, value in spec.xattrs.items()},
+        }
+        for spec in files
+        if spec.xattrs
+    ]
+
+
 def fixture_json(vector_id: str, options: dict[str, Any], files: list[FileSpec]) -> dict[str, Any]:
     plaintext, layout = build_plaintext(options, files)
     return {
@@ -962,20 +1020,10 @@ def fixture_json(vector_id: str, options: dict[str, Any], files: list[FileSpec])
         "independent_rederivation": "verified by tools/verify_rao_vectors_independent.py",
         "inputs": {
             **options,
-            "entries": [
-                {
-                    "entry_type": spec.entry_type,
-                    "path": spec.path,
-                    "file_id": spec.file_id,
-                    "size_bytes": spec.size_bytes,
-                    "link_target": spec.link_target,
-                    "mtime": spec.mtime,
-                    "executable": spec.executable,
-                }
-                for spec in files
-            ],
+            "entries": [input_entry_json(spec) for spec in files],
         },
         "expected": {
+            "schema_version": stream_schema_version(files),
             "stored_size_bytes": len(plaintext),
             "stored_size_blocks": len(plaintext) // options["chunk_size"],
             "stored_digest": hx(sha256(plaintext)),
@@ -1003,6 +1051,7 @@ def fixture_json(vector_id: str, options: dict[str, Any], files: list[FileSpec])
                 if spec.entry_type == "hardlink"
             ],
             "directories": [spec.path for spec in files if spec.entry_type == "directory"],
+            "xattrs": expected_xattrs(files),
             "file_layouts": [layout_json(file_layout) for file_layout in layout["files"]],
             "manifest_layout": layout_json(layout["manifest"]),
         },
@@ -1527,6 +1576,7 @@ def check_positive_plaintext_fixture(
         f"{vector_id} hardlinks",
     )
     assert_eq(expected.get("directories", []), [spec.path for spec in files if spec.entry_type == "directory"], f"{vector_id} directories")
+    assert_eq(expected.get("xattrs", []), expected_xattrs(files), f"{vector_id} xattrs")
     return PlaintextVector(
         vector_id=vector_id,
         chunk_size=options["chunk_size"],

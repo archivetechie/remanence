@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::error::FormatError;
 use crate::model::{
     BodyLba, RemTarEntryType, RemTarFileLayout, RemTarFileSpec, RemTarObjectOptions, FORMAT_ID,
-    MANIFEST_PATH, MAX_FILE_ENTRIES, SCHEMA_VERSION, TAR_RECORD_SIZE,
+    MANIFEST_PATH, MAX_FILE_ENTRIES, SCHEMA_VERSION, SCHEMA_VERSION_XATTRS, TAR_RECORD_SIZE,
 };
 use crate::pax::{
     encode_pax_records, round_up_usize, tar_padding_len, validate_chunk_size, with_alignment_pad,
@@ -24,6 +24,8 @@ pub struct RemTarObjectLayout {
     pub caller_object_id: String,
     /// Body block size in bytes.
     pub chunk_size: usize,
+    /// Effective RAO stream schema version written in the global pax header.
+    pub schema_version: String,
     /// Total archive byte length after the final fixed-block zero fill.
     pub total_size_bytes: u64,
     /// Exact block count to pass as `projected_size_blocks`.
@@ -54,7 +56,8 @@ pub fn plan_rem_tar_object(
     }
 
     let mut offset = 0u64;
-    let global_records = global_pax_records(options);
+    let schema_version = stream_schema_version(files);
+    let global_records = global_pax_records(options, schema_version);
     let global_body = encode_pax_records(&global_records)?;
     let global_padded = round_up_usize(global_body.len(), TAR_RECORD_SIZE)?;
     offset = checked_add(offset, TAR_RECORD_SIZE as u64 + global_padded as u64)?;
@@ -117,6 +120,7 @@ pub fn plan_rem_tar_object(
         size_bytes: manifest_cbor.len() as u64,
         file_sha256: Some(manifest_hash),
         link_target: None,
+        xattrs: BTreeMap::new(),
         mtime: None,
         executable: Some(false),
     };
@@ -132,6 +136,7 @@ pub fn plan_rem_tar_object(
         object_id: options.object_id.clone(),
         caller_object_id: options.caller_object_id.clone(),
         chunk_size: options.chunk_size,
+        schema_version: schema_version.to_string(),
         total_size_bytes: total_size,
         projected_size_blocks,
         files: file_layouts,
@@ -142,12 +147,15 @@ pub fn plan_rem_tar_object(
     })
 }
 
-pub(crate) fn global_pax_records(options: &RemTarObjectOptions) -> BTreeMap<String, String> {
+pub(crate) fn global_pax_records(
+    options: &RemTarObjectOptions,
+    schema_version: &str,
+) -> BTreeMap<String, String> {
     let mut records = BTreeMap::new();
     records.insert("REMANENCE.format_id".to_string(), FORMAT_ID.to_string());
     records.insert(
         "REMANENCE.schema_version".to_string(),
-        SCHEMA_VERSION.to_string(),
+        schema_version.to_string(),
     );
     records.insert("REMANENCE.object_id".to_string(), options.object_id.clone());
     records.insert(
@@ -171,6 +179,14 @@ pub(crate) fn global_pax_records(options: &RemTarObjectOptions) -> BTreeMap<Stri
         options.write_timestamp.clone(),
     );
     records
+}
+
+pub(crate) fn stream_schema_version(files: &[RemTarFileSpec]) -> &'static str {
+    if files.iter().any(|file| !file.xattrs.is_empty()) {
+        SCHEMA_VERSION_XATTRS
+    } else {
+        SCHEMA_VERSION
+    }
 }
 
 pub(crate) fn file_pax_records(
@@ -253,6 +269,7 @@ pub(crate) fn plan_one_file(
             size_bytes: spec.size_bytes,
             file_sha256: spec.file_sha256,
             link_target: spec.link_target.clone(),
+            xattrs: spec.xattrs.clone(),
             executable: spec.executable,
             first_chunk_lba: if spec.size_bytes == 0 {
                 None
@@ -343,7 +360,10 @@ fn file_manifest_entry(layout: &RemTarFileLayout) -> CborValue {
                 .map(|lba| CborValue::Integer(lba.0.into()))
                 .unwrap_or(CborValue::Null),
         ),
-        ("metadata_preservation_data", CborValue::Map(Vec::new())),
+        (
+            "metadata_preservation_data",
+            metadata_preservation_data(layout),
+        ),
         ("path", CborValue::Text(layout.path.clone())),
         ("size_bytes", CborValue::Integer(layout.size_bytes.into())),
     ];
@@ -356,6 +376,33 @@ fn file_manifest_entry(layout: &RemTarFileLayout) -> CborValue {
     if let Some(link_target) = &layout.link_target {
         map.push(("link_target", CborValue::Text(link_target.clone())));
     }
+    map.sort_by_key(|entry| canonical_text_key(entry.0));
+    CborValue::Map(
+        map.into_iter()
+            .map(|(key, value)| (CborValue::Text(key.to_string()), value))
+            .collect(),
+    )
+}
+
+fn metadata_preservation_data(layout: &RemTarFileLayout) -> CborValue {
+    if layout.xattrs.is_empty() {
+        return CborValue::Map(Vec::new());
+    }
+
+    let mut xattr_entries: Vec<(&String, CborValue)> = layout
+        .xattrs
+        .iter()
+        .map(|(name, value)| (name, CborValue::Bytes(value.clone())))
+        .collect();
+    xattr_entries.sort_by_key(|(name, _)| canonical_text_key(name));
+    let xattrs = CborValue::Map(
+        xattr_entries
+            .into_iter()
+            .map(|(name, value)| (CborValue::Text(name.clone()), value))
+            .collect(),
+    );
+
+    let mut map = vec![("xattrs", xattrs)];
     map.sort_by_key(|entry| canonical_text_key(entry.0));
     CborValue::Map(
         map.into_iter()
@@ -408,6 +455,10 @@ fn encode_cbor_major_len(major: u8, len: u64, out: &mut Vec<u8>) {
 fn validate_file_spec(spec: &RemTarFileSpec) -> Result<(), FormatError> {
     validate_non_empty("path", &spec.path)?;
     validate_non_empty("file_id", &spec.file_id)?;
+    for name in spec.xattrs.keys() {
+        validate_non_empty("xattr name", name)?;
+        validate_pax_value("xattr name", name)?;
+    }
     match spec.entry_type {
         RemTarEntryType::Regular => {
             if spec.file_sha256.is_none() {
@@ -420,6 +471,11 @@ fn validate_file_spec(spec: &RemTarFileSpec) -> Result<(), FormatError> {
             }
         }
         RemTarEntryType::Hardlink => {
+            if !spec.xattrs.is_empty() {
+                return Err(FormatError::invalid(
+                    "hardlink entry must not have xattrs; metadata resolves through link_target",
+                ));
+            }
             if spec.size_bytes != 0 {
                 return Err(FormatError::invalid("hardlink entry size must be zero"));
             }

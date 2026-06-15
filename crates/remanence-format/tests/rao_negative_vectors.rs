@@ -153,6 +153,7 @@ fn regular_spec(path: &str, file_id: &str, bytes: &[u8]) -> RemTarFileSpec {
         size_bytes: bytes.len() as u64,
         file_sha256: Some(file_sha256),
         link_target: None,
+        xattrs: Default::default(),
         mtime: None,
         executable: None,
     }
@@ -246,6 +247,7 @@ fn run_writer_case(id: &str) -> Result<(), FormatError> {
                 size_bytes: 1,
                 file_sha256: None,
                 link_target: Some("target".to_string()),
+                xattrs: Default::default(),
                 mtime: None,
                 executable: None,
             };
@@ -259,6 +261,7 @@ fn run_writer_case(id: &str) -> Result<(), FormatError> {
                 size_bytes: 1,
                 file_sha256: None,
                 link_target: None,
+                xattrs: Default::default(),
                 mtime: None,
                 executable: None,
             };
@@ -272,6 +275,7 @@ fn run_writer_case(id: &str) -> Result<(), FormatError> {
                 size_bytes: 0,
                 file_sha256: None,
                 link_target: None,
+                xattrs: Default::default(),
                 mtime: None,
                 executable: None,
             };
@@ -285,6 +289,7 @@ fn run_writer_case(id: &str) -> Result<(), FormatError> {
                 size_bytes: 0,
                 file_sha256: None,
                 link_target: None,
+                xattrs: Default::default(),
                 mtime: None,
                 executable: None,
             };

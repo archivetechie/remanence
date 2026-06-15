@@ -9,6 +9,7 @@ use remanence_format::{
 use remanence_library::VecBlockSink;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::io::Cursor;
 
 const KEY_ID: [u8; 16] = *b"KID:rao-tv-e1.01";
@@ -55,6 +56,35 @@ fn opt_u64_field(value: &Value, key: &str) -> Option<u64> {
                 .unwrap_or_else(|| panic!("fixture field {key:?} is null or unsigned integer")),
         )
     }
+}
+
+fn fixture_xattrs(value: Option<&Value>) -> BTreeMap<String, Vec<u8>> {
+    let Some(value) = value else {
+        return BTreeMap::new();
+    };
+    let object = value
+        .as_object()
+        .expect("xattrs fixture value is an object");
+    object
+        .iter()
+        .map(|(name, value)| {
+            let hex = value
+                .as_str()
+                .unwrap_or_else(|| panic!("xattr {name:?} value is hex text"));
+            (name.clone(), hex_to_bytes(hex))
+        })
+        .collect()
+}
+
+fn hex_to_bytes(hex: &str) -> Vec<u8> {
+    assert_eq!(hex.len() % 2, 0, "hex string length is even");
+    hex.as_bytes()
+        .chunks_exact(2)
+        .map(|chunk| {
+            let text = std::str::from_utf8(chunk).expect("hex chunk is UTF-8");
+            u8::from_str_radix(text, 16).expect("hex chunk parses")
+        })
+        .collect()
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -149,6 +179,23 @@ fn hardlink_vector_entries() -> Vec<TestEntry> {
     ]
 }
 
+fn xattr_vector_entries() -> Vec<TestEntry> {
+    vec![
+        TestEntry::regular(
+            "tagged.txt",
+            "00000000-0000-4000-8000-000000000211",
+            b"xattr payload\n".to_vec(),
+        )
+        .with_xattr("user.comment", b"blue".to_vec())
+        .with_xattr("user.remanence.color", vec![0x01, 0x02, 0xff]),
+        TestEntry::regular(
+            "plain.txt",
+            "00000000-0000-4000-8000-000000000212",
+            b"plain payload\n".to_vec(),
+        ),
+    ]
+}
+
 #[derive(Debug, Clone)]
 struct TestEntry {
     entry_type: RemTarEntryType,
@@ -156,6 +203,7 @@ struct TestEntry {
     file_id: String,
     data: Vec<u8>,
     link_target: Option<String>,
+    xattrs: BTreeMap<String, Vec<u8>>,
     mtime: Option<String>,
     executable: Option<bool>,
 }
@@ -172,6 +220,7 @@ impl TestEntry {
             file_id: file_id.into(),
             data: data.into(),
             link_target: None,
+            xattrs: BTreeMap::new(),
             mtime: None,
             executable: None,
         }
@@ -188,6 +237,7 @@ impl TestEntry {
             file_id: file_id.into(),
             data: Vec::new(),
             link_target: Some(target.into()),
+            xattrs: BTreeMap::new(),
             mtime: None,
             executable: None,
         }
@@ -204,6 +254,7 @@ impl TestEntry {
             file_id: file_id.into(),
             data: Vec::new(),
             link_target: Some(target.into()),
+            xattrs: BTreeMap::new(),
             mtime: None,
             executable: None,
         }
@@ -216,9 +267,15 @@ impl TestEntry {
             file_id: file_id.into(),
             data: Vec::new(),
             link_target: None,
+            xattrs: BTreeMap::new(),
             mtime: None,
             executable: None,
         }
+    }
+
+    fn with_xattr(mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
+        self.xattrs.insert(name.into(), value.into());
+        self
     }
 
     fn with_mtime(mut self, mtime: impl Into<String>) -> Self {
@@ -255,6 +312,7 @@ impl TestEntry {
             ),
             RemTarEntryType::Directory => RemTarFileSpec::directory(&self.path, &self.file_id),
         };
+        spec.xattrs.clone_from(&self.xattrs);
         spec.mtime.clone_from(&self.mtime);
         spec.executable = self.executable;
         spec
@@ -445,6 +503,12 @@ fn assert_plaintext_vector_fixture(
             field(expected_entry, "link_target"),
             "link_target",
         );
+        assert_eq!(
+            entry.xattrs,
+            fixture_xattrs(expected_entry.get("xattrs")),
+            "input xattrs for {}",
+            entry.path
+        );
         assert_json_opt_string(
             entry.mtime.as_deref(),
             field(expected_entry, "mtime"),
@@ -466,6 +530,14 @@ fn assert_plaintext_vector_fixture(
         layout.projected_size_blocks,
         u64_field(expected, "stored_size_blocks")
     );
+    if let Some(schema_version) = expected.get("schema_version") {
+        assert_eq!(
+            layout.schema_version,
+            schema_version
+                .as_str()
+                .expect("schema_version fixture value is text")
+        );
+    }
     assert_eq!(sha256_hex(&bytes), str_field(expected, "stored_digest"));
     assert_eq!(
         sha256_hex(&bytes[..options.chunk_size]),
@@ -557,6 +629,22 @@ fn assert_plaintext_vector_fixture(
         assert_layout_any(actual, expected_layout);
     }
     assert_manifest_layout(&layout.manifest, field(expected, "manifest_layout"));
+
+    let xattrs = expected.get("xattrs").map_or(&[][..], |value| {
+        value.as_array().expect("xattrs are an array").as_slice()
+    });
+    let xattr_entries: Vec<&TestEntry> = entries
+        .iter()
+        .filter(|entry| !entry.xattrs.is_empty())
+        .collect();
+    assert_eq!(xattr_entries.len(), xattrs.len());
+    for (entry, expected_xattrs) in xattr_entries.iter().zip(xattrs) {
+        assert_eq!(entry.path, str_field(expected_xattrs, "path"));
+        assert_eq!(
+            entry.xattrs,
+            fixture_xattrs(Some(field(expected_xattrs, "xattrs")))
+        );
+    }
 }
 
 #[test]
@@ -1047,6 +1135,16 @@ fn rao_tv_hardlinks_matches_fixture_manifest() {
         "RAO-TV-HARDLINKS",
         vector_options(110, "rao-tv-hardlinks", "000000000110"),
         hardlink_vector_entries(),
+    );
+}
+
+#[test]
+fn rao_tv_xattrs_matches_fixture_manifest() {
+    assert_plaintext_vector_fixture(
+        include_str!("../../../fixtures/rao/rao-tv-xattrs.json"),
+        "RAO-TV-XATTRS",
+        vector_options(111, "rao-tv-xattrs", "000000000111"),
+        xattr_vector_entries(),
     );
 }
 
