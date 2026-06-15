@@ -1420,7 +1420,7 @@ dependencies = [
 name = "remanence-bru"
 version = "0.0.1"
 dependencies = [
- "remanence-format",
+ "remanence-format-driver",
  "remanence-library",
 ]
 
@@ -1462,6 +1462,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "uuid",
+ "xattr",
  "zeroize",
 ]
 
@@ -1489,11 +1490,21 @@ version = "0.0.1"
 dependencies = [
  "ciborium",
  "remanence-aead",
+ "remanence-format-driver",
  "remanence-library",
  "remanence-parity",
  "serde",
  "serde_json",
  "sha2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "remanence-format-driver"
+version = "0.0.1"
+dependencies = [
+ "remanence-aead",
+ "remanence-library",
  "thiserror 1.0.69",
 ]
 

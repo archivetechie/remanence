@@ -14,7 +14,7 @@ prost.workspace = true
 prost-derive.workspace = true
 prost-types.workspace = true
 remanence-aead = { path = "../remanence-aead" }
-remanence-bru = { path = "../remanence-bru" }
+remanence-bru = { path = "../remanence-bru", optional = true }
 remanence-format = { path = "../remanence-format" }
 remanence-library = { path = "../remanence-library" }
 remanence-parity = { path = "../remanence-parity" }
@@ -38,6 +38,10 @@ x509-parser.workspace = true
 prost-build = "=0.14.1"
 tonic-build.workspace = true
 tonic-prost-build.workspace = true
+
+[features]
+default = []
+foreign-bru = ["dep:remanence-bru"]
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

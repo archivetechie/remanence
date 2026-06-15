@@ -5,6 +5,7 @@ members = [
     "crates/remanence-library",
     "crates/remanence-aead",
     "crates/remanence-chaos",
+    "crates/remanence-format-driver",
     "crates/remanence-format",
     "crates/remanence-bru",
     "crates/remanence-parity",

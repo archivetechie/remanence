@@ -1,0 +1,19 @@
+[package]
+name        = "remanence-format-driver"
+description = "Published format-driver boundary for Remanence native and foreign archive formats."
+version     .workspace = true
+edition     .workspace = true
+rust-version.workspace = true
+authors     .workspace = true
+license     .workspace = true
+repository  .workspace = true
+
+[dependencies]
+remanence-aead    = { path = "../remanence-aead" }
+remanence-library = { path = "../remanence-library" }
+
+thiserror = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"

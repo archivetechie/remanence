@@ -10,8 +10,11 @@
 #![warn(missing_docs)]
 #![warn(unsafe_op_in_unsafe_fn)]
 
-pub mod driver;
-pub mod error;
+/// Backward-compatible error module for callers that import
+/// `remanence_format::error::FormatError`.
+pub mod error {
+    pub use remanence_format_driver::{FormatError, FormatGate};
+}
 pub mod layout;
 mod manifest;
 pub mod model;
@@ -21,13 +24,6 @@ pub mod reader;
 pub mod tar;
 pub mod writer;
 
-pub use driver::{
-    ArchiveEventSink, ArchiveGapCause, ArchiveGapRange, ArchiveReader, ArchiveWriter, DamageRange,
-    DamageStatus, EntryCatalogSink, EntryKind, FileDataSink, FileId, FileStreamReport,
-    ForeignTapeFormat, FormatCapabilities, FormatDescriptor, FormatManifest, NativeBodyFormat,
-    NormalizedEntry, ObjectFormatMetadata, ProbeConfidence, ProbeResult, ScanReport,
-    SourceRequirement, StreamReport,
-};
 pub use error::{FormatError, FormatGate};
 pub use layout::{plan_rem_tar_object, RemTarObjectLayout};
 #[cfg(feature = "fuzzing")]
@@ -47,6 +43,13 @@ pub use reader::{
     stream_rem_tar_object_with_mode_and_manifest_anchor, EncryptedRaoReadObject, ReadMode,
     RemTarDigestMismatch, RemTarEntrySink, RemTarReadEntry, RemTarReadObject, RemTarStreamEntry,
     RemTarStreamReport,
+};
+pub use remanence_format_driver::{
+    ArchiveEventSink, ArchiveGapCause, ArchiveGapRange, ArchiveReader, ArchiveWriter, DamageRange,
+    DamageStatus, EntryCatalogSink, EntryKind, FileDataSink, FileId, FileStreamReport,
+    ForeignTapeFormat, FormatCapabilities, FormatDescriptor, FormatManifest, NativeBodyFormat,
+    NormalizedEntry, ObjectFormatMetadata, ProbeConfidence, ProbeResult, ScanReport,
+    SourceRequirement, StreamReport,
 };
 pub use writer::{
     write_encrypted_rao_object, write_encrypted_rao_object_from_readers, write_rem_tar_object,
