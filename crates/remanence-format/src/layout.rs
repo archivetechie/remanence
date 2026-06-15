@@ -61,9 +61,25 @@ pub fn plan_rem_tar_object(
 
     let mut seen_paths = BTreeSet::new();
     let mut seen_file_ids = BTreeSet::new();
+    let mut seen_regular_paths = BTreeSet::new();
     let mut file_layouts = Vec::with_capacity(files.len());
     for spec in files {
         validate_file_spec(spec)?;
+        if spec.entry_type == RemTarEntryType::Hardlink {
+            let target =
+                spec.link_target
+                    .as_deref()
+                    .ok_or_else(|| FormatError::InvalidHardlinkTarget {
+                        path: spec.path.clone(),
+                        target: String::new(),
+                    })?;
+            if !seen_regular_paths.contains(target) {
+                return Err(FormatError::InvalidHardlinkTarget {
+                    path: spec.path.clone(),
+                    target: target.to_string(),
+                });
+            }
+        }
         if !seen_paths.insert(spec.path.clone()) {
             return Err(FormatError::invalid(format!(
                 "duplicate payload path {:?}",
@@ -78,6 +94,9 @@ pub fn plan_rem_tar_object(
         }
         let (layout, next_offset) = plan_one_file(options.chunk_size, offset, spec, false, None)?;
         offset = next_offset;
+        if spec.entry_type == RemTarEntryType::Regular {
+            seen_regular_paths.insert(spec.path.clone());
+        }
         file_layouts.push(layout);
     }
     if seen_file_ids.contains(&options.manifest_file_id) {
@@ -180,11 +199,14 @@ pub(crate) fn file_pax_records(
     if is_manifest {
         records.insert("REMANENCE.is_manifest".to_string(), "true".to_string());
     }
-    if spec.entry_type == RemTarEntryType::Symlink {
+    if matches!(
+        spec.entry_type,
+        RemTarEntryType::Hardlink | RemTarEntryType::Symlink
+    ) {
         let target = spec
             .link_target
             .as_deref()
-            .ok_or_else(|| FormatError::invalid("symlink entry missing link target"))?;
+            .ok_or_else(|| FormatError::invalid("link entry missing link target"))?;
         if !is_portable_ustar_linkname(target) {
             records.insert("linkpath".to_string(), target.to_string());
         }
@@ -397,6 +419,31 @@ fn validate_file_spec(spec: &RemTarFileSpec) -> Result<(), FormatError> {
                 ));
             }
         }
+        RemTarEntryType::Hardlink => {
+            if spec.size_bytes != 0 {
+                return Err(FormatError::invalid("hardlink entry size must be zero"));
+            }
+            if spec.file_sha256.is_some() {
+                return Err(FormatError::invalid(
+                    "hardlink entry must not have file_sha256",
+                ));
+            }
+            let target =
+                spec.link_target
+                    .as_deref()
+                    .ok_or_else(|| FormatError::InvalidHardlinkTarget {
+                        path: spec.path.clone(),
+                        target: String::new(),
+                    })?;
+            if target.is_empty() {
+                return Err(FormatError::InvalidHardlinkTarget {
+                    path: spec.path.clone(),
+                    target: String::new(),
+                });
+            }
+            validate_pax_value("link_target", target)?;
+            validate_canonical_relative_path(target, false)?;
+        }
         RemTarEntryType::Symlink => {
             if spec.size_bytes != 0 {
                 return Err(FormatError::invalid("symlink entry size must be zero"));
@@ -599,33 +646,81 @@ mod tests {
     #[test]
     fn nonregular_entries_are_zero_payload_manifest_entries() {
         let opts = options(4096);
+        let primary = file("target.mov", 17);
+        let hardlink = RemTarFileSpec::hardlink("links/copy.mov", "hardlink-1", "target.mov");
         let symlink = RemTarFileSpec::symlink("links/latest", "link-1", "../target.mov");
         let directory = RemTarFileSpec::directory("empty/", "dir-1");
 
-        let layout = plan_rem_tar_object(&opts, &[symlink, directory]).unwrap();
+        let layout = plan_rem_tar_object(&opts, &[primary, hardlink, symlink, directory]).unwrap();
 
-        assert_eq!(layout.files[0].entry_type, RemTarEntryType::Symlink);
-        assert_eq!(layout.files[0].size_bytes, 0);
-        assert_eq!(layout.files[0].file_sha256, None);
+        assert_eq!(layout.files[1].entry_type, RemTarEntryType::Hardlink);
+        assert_eq!(layout.files[1].size_bytes, 0);
+        assert_eq!(layout.files[1].file_sha256, None);
+        assert_eq!(layout.files[1].link_target.as_deref(), Some("target.mov"));
+        assert_eq!(layout.files[1].first_chunk_lba, None);
+        assert_eq!(layout.files[1].chunk_count, 0);
+        assert_eq!(layout.files[1].pad_spaces, 0);
+
+        assert_eq!(layout.files[2].entry_type, RemTarEntryType::Symlink);
+        assert_eq!(layout.files[2].size_bytes, 0);
+        assert_eq!(layout.files[2].file_sha256, None);
         assert_eq!(
-            layout.files[0].link_target.as_deref(),
+            layout.files[2].link_target.as_deref(),
             Some("../target.mov")
         );
-        assert_eq!(layout.files[0].first_chunk_lba, None);
-        assert_eq!(layout.files[0].chunk_count, 0);
-        assert_eq!(layout.files[0].pad_spaces, 0);
+        assert_eq!(layout.files[2].first_chunk_lba, None);
+        assert_eq!(layout.files[2].chunk_count, 0);
+        assert_eq!(layout.files[2].pad_spaces, 0);
 
-        assert_eq!(layout.files[1].entry_type, RemTarEntryType::Directory);
-        assert_eq!(layout.files[1].path, "empty/");
-        assert_eq!(layout.files[1].file_sha256, None);
-        assert_eq!(layout.files[1].link_target, None);
+        assert_eq!(layout.files[3].entry_type, RemTarEntryType::Directory);
+        assert_eq!(layout.files[3].path, "empty/");
+        assert_eq!(layout.files[3].file_sha256, None);
+        assert_eq!(layout.files[3].link_target, None);
 
         let manifest = String::from_utf8_lossy(&layout.manifest_cbor);
         assert!(manifest.contains("entry_type"));
+        assert!(manifest.contains("hardlink"));
         assert!(manifest.contains("symlink"));
         assert!(manifest.contains("directory"));
         assert!(manifest.contains("link_target"));
+        assert!(manifest.contains("target.mov"));
         assert!(manifest.contains("../target.mov"));
+    }
+
+    #[test]
+    fn planner_rejects_invalid_hardlink_targets() {
+        let opts = options(4096);
+
+        let err = plan_rem_tar_object(
+            &opts,
+            &[RemTarFileSpec::hardlink(
+                "copy.bin",
+                "hardlink-1",
+                "missing.bin",
+            )],
+        )
+        .expect_err("missing hardlink target should fail");
+        assert!(matches!(err, FormatError::InvalidHardlinkTarget { .. }));
+
+        let err = plan_rem_tar_object(
+            &opts,
+            &[
+                RemTarFileSpec::directory("target-dir/", "dir-1"),
+                RemTarFileSpec::hardlink("copy.bin", "hardlink-1", "target-dir"),
+            ],
+        )
+        .expect_err("hardlink to a nonregular target should fail");
+        assert!(matches!(err, FormatError::InvalidHardlinkTarget { .. }));
+
+        let err = plan_rem_tar_object(
+            &opts,
+            &[
+                RemTarFileSpec::hardlink("copy.bin", "hardlink-1", "target.bin"),
+                file("target.bin", 17),
+            ],
+        )
+        .expect_err("forward hardlink target should fail");
+        assert!(matches!(err, FormatError::InvalidHardlinkTarget { .. }));
     }
 
     #[test]

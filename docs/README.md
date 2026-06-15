@@ -33,6 +33,8 @@ part of the portable file object.
 
 - [../specs/rao-1.0-specification.md](../specs/rao-1.0-specification.md):
   published RAO Format v1.0.
+- [../specs/rao-1.1-specification.md](../specs/rao-1.1-specification.md):
+  RAO Format v1.1 additive metadata-preservation minor.
 - [../specs/rem-parity-1.0-specification.md](../specs/rem-parity-1.0-specification.md):
   published Rem Tape Parity (REM-PARITY) Format v1.0.
 - [spec-v0.4.md](spec-v0.4.md): consolidated architecture, layer contracts,

@@ -1,0 +1,132 @@
+{
+  "vector_id": "RAO-TV-HARDLINKS",
+  "spec_section": "13.1",
+  "status": "pinned-at-generation",
+  "independent_rederivation": "verified by tools/verify_rao_vectors_independent.py",
+  "inputs": {
+    "chunk_size": 4096,
+    "object_id": "00000000-0000-4000-8000-000000000110",
+    "caller_object_id": "rao-tv-hardlinks",
+    "write_timestamp": "2026-01-01T00:00:00Z",
+    "metadata_preservation": "minimal",
+    "manifest_file_id": "00000000-0000-4000-8000-000000000110",
+    "entries": [
+      {
+        "entry_type": "regular",
+        "path": "primary.txt",
+        "file_id": "00000000-0000-4000-8000-000000000201",
+        "size_bytes": 24,
+        "link_target": null,
+        "mtime": null,
+        "executable": null
+      },
+      {
+        "entry_type": "hardlink",
+        "path": "links/copy.txt",
+        "file_id": "00000000-0000-4000-8000-000000000202",
+        "size_bytes": 0,
+        "link_target": "primary.txt",
+        "mtime": null,
+        "executable": null
+      },
+      {
+        "entry_type": "regular",
+        "path": "hardlink-targets/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.bin",
+        "file_id": "00000000-0000-4000-8000-000000000203",
+        "size_bytes": 29,
+        "link_target": null,
+        "mtime": null,
+        "executable": null
+      },
+      {
+        "entry_type": "hardlink",
+        "path": "links/long-target-copy.bin",
+        "file_id": "00000000-0000-4000-8000-000000000204",
+        "size_bytes": 0,
+        "link_target": "hardlink-targets/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.bin",
+        "mtime": null,
+        "executable": null
+      }
+    ]
+  },
+  "expected": {
+    "stored_size_bytes": 16384,
+    "stored_size_blocks": 4,
+    "stored_digest": "afcf4cf107619511b156a86911aedaca233f84d2cedad881378c0a012c234c04",
+    "first_block_sha256": "caf63515a29985581bf1c4d582cf44aadcf0882d0d1dfa845d1a5ec7542c4528",
+    "manifest_cbor_len": 1196,
+    "manifest_cbor_hex": "a7696f626a6563745f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303131306a6368756e6b5f73697a651910006c66696c655f656e747269657384a864706174686b7072696d6172792e7478746766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303230316a65786563757461626c65f66a73697a655f627974657318186b6368756e6b5f636f756e74016b66696c655f7368613235365820e1c607d6d777c60d2cbe63739c534dd161cc05574a0a2fe0a82bf416ce46818a6f66697273745f6368756e6b5f6c626101781a6d657461646174615f707265736572766174696f6e5f64617461a0a964706174686e6c696e6b732f636f70792e7478746766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303230326a656e7472795f7479706568686172646c696e6b6a65786563757461626c65f66a73697a655f6279746573006b6368756e6b5f636f756e74006b6c696e6b5f7461726765746b7072696d6172792e7478746f66697273745f6368756e6b5f6c6261f6781a6d657461646174615f707265736572766174696f6e5f64617461a0a864706174687883686172646c696e6b2d746172676574732f70707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070702e62696e6766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303230336a65786563757461626c65f66a73697a655f6279746573181d6b6368756e6b5f636f756e74016b66696c655f73686132353658209c279d818a9e0c4e282b179d9fede982bf0c427944a50c2100fc790b89d51dbe6f66697273745f6368756e6b5f6c626102781a6d657461646174615f707265736572766174696f6e5f64617461a0a96470617468781a6c696e6b732f6c6f6e672d7461726765742d636f70792e62696e6766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303230346a656e7472795f7479706568686172646c696e6b6a65786563757461626c65f66a73697a655f6279746573006b6368756e6b5f636f756e74006b6c696e6b5f7461726765747883686172646c696e6b2d746172676574732f70707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070702e62696e6f66697273745f6368756e6b5f6c6261f6781a6d657461646174615f707265736572766174696f6e5f64617461a06e736368656d615f76657273696f6e016f6f626a6563745f6d65746164617461a07063616c6c65725f6f626a6563745f69647072616f2d74762d686172646c696e6b737365787465726e616c5f7265666572656e63657380",
+    "manifest_sha256": "c11b20a6ffc5c922d7a5a95eb5a4b7e7d992eb28a24cd7e06f4c261936cbc8af",
+    "file_payloads": [
+      {
+        "path": "primary.txt",
+        "size_bytes": 24,
+        "sha256": "e1c607d6d777c60d2cbe63739c534dd161cc05574a0a2fe0a82bf416ce46818a"
+      },
+      {
+        "path": "hardlink-targets/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.bin",
+        "size_bytes": 29,
+        "sha256": "9c279d818a9e0c4e282b179d9fede982bf0c427944a50c2100fc790b89d51dbe"
+      }
+    ],
+    "hardlinks": [
+      {
+        "path": "links/copy.txt",
+        "target": "primary.txt"
+      },
+      {
+        "path": "links/long-target-copy.bin",
+        "target": "hardlink-targets/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.bin"
+      }
+    ],
+    "symlinks": [],
+    "directories": [],
+    "file_layouts": [
+      {
+        "entry_type": "regular",
+        "path": "primary.txt",
+        "pax_header_offset": 1024,
+        "data_offset": 4096,
+        "first_chunk_lba": 1,
+        "chunk_count": 1,
+        "pad_spaces": 1792
+      },
+      {
+        "entry_type": "hardlink",
+        "path": "links/copy.txt",
+        "pax_header_offset": 4608,
+        "data_offset": 6144,
+        "first_chunk_lba": null,
+        "chunk_count": 0,
+        "pad_spaces": 0
+      },
+      {
+        "entry_type": "regular",
+        "path": "hardlink-targets/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.bin",
+        "pax_header_offset": 6144,
+        "data_offset": 8192,
+        "first_chunk_lba": 2,
+        "chunk_count": 1,
+        "pad_spaces": 648
+      },
+      {
+        "entry_type": "hardlink",
+        "path": "links/long-target-copy.bin",
+        "pax_header_offset": 8704,
+        "data_offset": 10240,
+        "first_chunk_lba": null,
+        "chunk_count": 0,
+        "pad_spaces": 0
+      }
+    ],
+    "manifest_layout": {
+      "entry_type": "regular",
+      "path": "_remanence/manifest.cbor",
+      "pax_header_offset": 10240,
+      "data_offset": 12288,
+      "first_chunk_lba": 3,
+      "chunk_count": 1,
+      "pad_spaces": 694
+    }
+  }
+}
