@@ -130,5 +130,16 @@
     "handoff_to": null,
     "round": 5,
     "summary": "GPT round-4 (six findings, all real residual prose). Fixed: #1 §6 now requires a catalog-backed PFR index to carry entry_type+link_target OR a denormalized primary pointer for hardlinks (a catalog storing only the literal null/0 row is nonconformant). #2 §7.3 post-write re-verification now says 'every REGULAR member's file_sha256 plus the §7.4 non-regular/referential checks' (was 'every member file_sha256'). #4 §2.3 Entry glossary def + §4.1 frame diagram generalized to typeflags 0/1/2/5 with payload only for '0'. #5 three nearby-prose omissions: §4.6.3 zero-payload-alignment list now includes hardlinks; §4.9 restore-integrity prose now 'hardlink, symlink, directory have no payload hash'; §4.10 stock-tar 'recreates hardlinks, symlinks, and directories'. #3 the active ingest prompt (prompt-rao-archive-rem) wrapping clause superseded inline (hardlinks native typeflag 1, xattrs via 1.1 — neither a wrap trigger) + INDEX row notes the supersession. #6 nonregular-entries checklist line 'hardlinks remain reserved' superseded. Final grep clean. Hardlink option-B model now consistent across EVERY location in the spec + all docs/prompts. (This is round 5 of hardlink-model propagation; the model is now fully settled.)"
+  },
+  {
+    "uuid": "74643389-f61f-4a46-89d7-0399245d0a50",
+    "datetime": "2026-06-15T12:15:19+02:00",
+    "author": "claude",
+    "subject": "GPT round-5: fix xattr over-correction in prompt + 'payload file' manifest wording",
+    "idref": null,
+    "status": "complete",
+    "handoff_to": null,
+    "round": 6,
+    "summary": "Two findings, both real. #1 the prompt fix had over-corrected ('xattrs preserved via 1.1 - neither is a wrap trigger'); reworded to the accurate policy: hardlinks native (not a wrap trigger); small/native-preservable xattrs use 1.1 annotation while oversized/out-of-scope xattrs still wrap or drop per ingest policy (matches rao-1.1 spec §2.2 + ingest-layer-impl unit C). #2 §4.7.2 'payload files'/'one file-entry map per payload file' wording could make an implementer omit zero-payload entries (hardlink/symlink/dir) from file_entries; generalized to 'every member entry (regular/hardlink/symlink/directory)'. rao-v1-specification.md left stale by design (audit-trail copy, specs/ wins) per GPT's own note, same as the rem-tar-v1 predecessor candidate. Live rao-1.0 spec now clean of 'payload file' framing. This is the last of the multi-round hardlink/xattr propagation."
   }
 ]

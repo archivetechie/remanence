@@ -29,8 +29,10 @@ top — none of it changes the RAO/REM-PARITY wire formats.
    granular file that can't be a native entry (non-UTF-8 / device node) → a
    one-member `.remwrap.tar` (`wrap-unit=file` default; `dir` per ruleset).
    **Superseded (2026-06-15): hardlinks are now native RAO 1.0 entries
-   (typeflag 1) and xattrs are preserved via RAO 1.1 — neither is a wrap
-   trigger. See `rao-hardlinks-design-v0.1.md` and
+   (typeflag 1) — not a wrap trigger. Small/native-preservable xattrs use RAO
+   1.1 annotation, while oversized or out-of-scope xattrs still wrap or drop
+   per the ingest policy. See `rao-hardlinks-design-v0.1.md`,
+   `rao-1.1-metadata-preservation-design-v0.1.md`, and
    `ingest-layer-implementation-design-v0.1.md`.** Writer = a **pinned mainstream tar
    engine** (GNU tar or bsdtar/libarchive — shelled-out or FFI-linked), **never a
    bespoke Rust pax codec**. **Gating deliverable:** the §A3.5 round-trip test —
