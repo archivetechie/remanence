@@ -10458,6 +10458,138 @@ blob Project/Render Files/
         assert!(!temp.path().join("archive.rao").exists());
     }
 
+    #[test]
+    fn archive_build_rules_scan_only_matches_build_verdicts() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-scan-parity")
+            .tempdir()
+            .unwrap();
+        let input_dir = temp.path().join("inputs");
+        fs::create_dir_all(input_dir.join("messy")).unwrap();
+        fs::write(input_dir.join("native.txt"), b"native").unwrap();
+        fs::write(input_dir.join("messy/blobbed.bin"), b"blobbed").unwrap();
+        let rules = temp.path().join("scan.rules");
+        fs::write(&rules, "blob messy/\n").unwrap();
+
+        let (scan_code, scan_stdout, scan_stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            input_dir.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+            "--scan-only",
+        ]);
+        assert_eq!(format!("{scan_code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(scan_stderr.is_empty(), "{scan_stderr}");
+
+        let out_path = temp.path().join("scan-parity.rao");
+        let (build_code, build_stdout, build_stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            input_dir.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+            "--object-id",
+            "object-scan-parity",
+            "--caller-object-id",
+            "caller-scan-parity",
+            "--manifest-file-id",
+            "manifest-scan-parity",
+            "--timestamp",
+            "2026-01-01T00:00:00Z",
+        ]);
+        assert_eq!(
+            format!("{build_code:?}"),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
+        assert!(build_stderr.is_empty(), "{build_stderr}");
+
+        let scan: serde_json::Value = serde_json::from_str(&scan_stdout).expect("scan json");
+        let build: serde_json::Value = serde_json::from_str(&build_stdout).expect("build json");
+        let scan_report = &scan["scan"];
+        let build_report = &build["ingest"]["scan"];
+        for key in [
+            "native_entries",
+            "wrapped_entries",
+            "blob_entries",
+            "excluded_entries",
+            "dropped_xattrs",
+        ] {
+            assert_eq!(
+                scan_report["totals"][key], build_report["totals"][key],
+                "scan/build total mismatch for {key}"
+            );
+        }
+        assert_eq!(
+            cluster_verdicts(scan_report),
+            cluster_verdicts(build_report),
+            "scan/build classification clusters differ"
+        );
+    }
+
+    fn cluster_verdicts(scan_report: &serde_json::Value) -> Vec<(String, String, u64)> {
+        let mut verdicts = scan_report["clusters"]
+            .as_array()
+            .expect("clusters array")
+            .iter()
+            .map(|cluster| {
+                (
+                    cluster["prefix"].as_str().unwrap().to_string(),
+                    cluster["reason"].as_str().unwrap().to_string(),
+                    cluster["count"].as_u64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        verdicts.sort();
+        verdicts
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_build_rules_scan_only_does_not_read_file_contents() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-scan-nohash")
+            .tempdir()
+            .unwrap();
+        let input_dir = temp.path().join("inputs");
+        fs::create_dir_all(&input_dir).unwrap();
+        let file = input_dir.join("unreadable.bin");
+        fs::write(&file, b"scan must not hash this payload").unwrap();
+        let mut permissions = fs::metadata(&file).unwrap().permissions();
+        permissions.set_mode(0o000);
+        fs::set_permissions(&file, permissions).unwrap();
+        if fs::File::open(&file).is_ok() {
+            let mut permissions = fs::metadata(&file).unwrap().permissions();
+            permissions.set_mode(0o600);
+            fs::set_permissions(&file, permissions).unwrap();
+            return;
+        }
+
+        let report = archive_ingest::scan_only_report(
+            std::slice::from_ref(&input_dir),
+            None,
+            false,
+            archive_ingest::ScanTuning::default(),
+        )
+        .expect("scan-only does not open regular-file payloads");
+        let mut permissions = fs::metadata(&file).unwrap().permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&file, permissions).unwrap();
+
+        assert_eq!(report.scan.totals.native_entries, 1);
+        assert_eq!(report.scan.totals.wrapped_entries, 0);
+    }
+
     #[cfg(unix)]
     #[test]
     fn archive_build_rules_preserves_small_xattr_natively() {
@@ -10814,6 +10946,59 @@ blob Project/Render Files/
         let alias = fs::metadata(restore_dir.join("links/b-alias.bin")).unwrap();
         assert_eq!(original.ino(), alias.ino());
         assert_eq!(original.nlink(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_build_rules_hardlink_primary_falls_back_after_exclusion() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-hardlink-excluded-primary")
+            .tempdir()
+            .unwrap();
+        let input_dir = temp.path().join("inputs");
+        fs::create_dir_all(input_dir.join("links")).unwrap();
+        fs::write(input_dir.join("links/a-primary.bin"), b"same-inode").unwrap();
+        fs::hard_link(
+            input_dir.join("links/a-primary.bin"),
+            input_dir.join("links/b-survivor.bin"),
+        )
+        .unwrap();
+        let rules = temp.path().join("exclude.rules");
+        fs::write(&rules, "exclude links/a-primary.bin\n").unwrap();
+        let out_path = temp.path().join("hardlink-excluded-primary.rao");
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            input_dir.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+            "--object-id",
+            "object-hardlink-excluded",
+            "--caller-object-id",
+            "caller-hardlink-excluded",
+            "--manifest-file-id",
+            "manifest-hardlink-excluded",
+            "--timestamp",
+            "2026-01-01T00:00:00Z",
+        ]);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
+        assert_eq!(report["ingest"]["scan"]["totals"]["native_entries"], 1);
+        assert_eq!(report["ingest"]["scan"]["totals"]["excluded_entries"], 1);
+        let files = report["files"].as_array().expect("files array");
+        assert!(files.iter().any(|file| {
+            file["path"] == "links/b-survivor.bin" && file["entry_type"] == "regular"
+        }));
+        assert!(!files.iter().any(|file| file["entry_type"] == "hardlink"));
     }
 
     #[test]

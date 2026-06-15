@@ -128,6 +128,24 @@
       "operation": "read",
       "fault": "payload pax path value is not UTF-8",
       "expected_error": "PaxRecordMalformed"
+    },
+    {
+      "id": "hardlink-missing-target",
+      "operation": "read",
+      "fault": "hardlink entry points at an absent regular-file primary",
+      "expected_error": "InvalidHardlinkTarget"
+    },
+    {
+      "id": "hardlink-forward-target",
+      "operation": "stream",
+      "fault": "hardlink entry points at a regular entry that appears later in archive order",
+      "expected_error": "InvalidHardlinkTarget"
+    },
+    {
+      "id": "hardlink-nonregular-target",
+      "operation": "read",
+      "fault": "hardlink entry points at a preceding symlink rather than a regular-file primary",
+      "expected_error": "InvalidHardlinkTarget"
     }
   ]
 }

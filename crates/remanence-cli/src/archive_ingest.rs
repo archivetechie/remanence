@@ -213,6 +213,13 @@ enum NativeStatus {
     WrapFallback(&'static str),
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum LeafClassification {
+    Exclude,
+    Native { xattrs: BTreeMap<String, Vec<u8>> },
+    WrapFallback(&'static str),
+}
+
 #[derive(Debug, Default)]
 struct PlannerState {
     files: Vec<ArchiveBuildInputFile>,
@@ -222,10 +229,10 @@ struct PlannerState {
     dir_stats: BTreeMap<String, DirStats>,
     totals: ScanTotals,
     wrapper_counter: u64,
-    hardlink_groups: HardlinkGroups,
     hardlink_primaries: BTreeMap<FileKey, String>,
     hardlink_native_counts: BTreeMap<FileKey, u64>,
-    hardlink_blob_counts: BTreeMap<FileKey, u64>,
+    hardlink_link_counts: BTreeMap<FileKey, u64>,
+    hardlink_paths: BTreeMap<FileKey, Vec<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -245,12 +252,6 @@ struct DirStats {
 struct FileKey {
     dev: u64,
     ino: u64,
-}
-
-#[derive(Debug, Default)]
-struct HardlinkGroups {
-    by_key: BTreeMap<FileKey, Vec<String>>,
-    by_path: BTreeMap<String, FileKey>,
 }
 
 #[derive(Clone, Copy)]
@@ -312,10 +313,7 @@ pub(crate) fn materialize_inputs(
         .prefix("remanence-remwrap-")
         .tempdir()
         .map_err(|error| format!("create wrapper tempdir: {error}"))?;
-    let mut state = PlannerState {
-        hardlink_groups: collect_hardlink_groups_for_inputs(input_paths)?,
-        ..Default::default()
-    };
+    let mut state = PlannerState::default();
     for input in input_paths {
         let context = ProcessContext {
             ruleset: ruleset.as_ref(),
@@ -381,19 +379,12 @@ pub(crate) fn scan_only_report(
         .as_ref()
         .map(|ruleset| &ruleset.xattr_policy)
         .unwrap_or(&default_xattr_policy);
-    let tempdir = tempfile::Builder::new()
-        .prefix("remanence-remwrap-scan-")
-        .tempdir()
-        .map_err(|error| format!("create scan tempdir: {error}"))?;
-    let mut state = PlannerState {
-        hardlink_groups: collect_hardlink_groups_for_inputs(input_paths)?,
-        ..Default::default()
-    };
+    let mut state = PlannerState::default();
     let context = ProcessContext {
         ruleset: ruleset.as_ref(),
         xattr_policy,
         tar_engine: &tar_engine,
-        tempdir: tempdir.path(),
+        tempdir: Path::new(""),
         no_index,
     };
     for input in input_paths {
@@ -609,7 +600,6 @@ fn process_dir(
     match decide(context.ruleset, &rel_text, true) {
         Decision::Exclude => {
             let (count, bytes) = subtree_count_bytes(dir)?;
-            state.note_hardlink_boundary(&rel_text, true);
             state.record_cluster(&rel_text, "exclude-rule", count, bytes);
             state.totals.excluded_entries = state.totals.excluded_entries.saturating_add(count);
             state.totals.excluded_bytes = state.totals.excluded_bytes.saturating_add(bytes);
@@ -618,7 +608,6 @@ fn process_dir(
         Decision::Blob {
             no_index: rule_no_index,
         } if !relative.as_os_str().is_empty() => {
-            state.note_hardlink_boundary(&rel_text, true);
             materialize_blob(
                 root,
                 dir,
@@ -632,7 +621,6 @@ fn process_dir(
         Decision::Blob {
             no_index: rule_no_index,
         } => {
-            state.note_hardlink_boundary(&rel_text, true);
             let name = dir.file_name().ok_or_else(|| {
                 format!(
                     "blob input directory {} does not have a file name",
@@ -722,7 +710,6 @@ fn scan_dir(
     match decide(context.ruleset, &rel_text, true) {
         Decision::Exclude => {
             let (count, bytes) = subtree_count_bytes(dir)?;
-            state.note_hardlink_boundary(&rel_text, true);
             state.record_cluster(&rel_text, "exclude-rule", count, bytes);
             state.totals.excluded_entries = state.totals.excluded_entries.saturating_add(count);
             state.totals.excluded_bytes = state.totals.excluded_bytes.saturating_add(bytes);
@@ -730,13 +717,11 @@ fn scan_dir(
         }
         Decision::Blob { .. } if !relative.as_os_str().is_empty() => {
             let (_, bytes) = subtree_count_bytes(dir)?;
-            state.note_hardlink_boundary(&rel_text, true);
             state.record_blob(&rel_text, bytes, "blob-rule");
             return Ok(true);
         }
         Decision::Blob { .. } => {
             let (_, bytes) = subtree_count_bytes(dir)?;
-            state.note_hardlink_boundary(&rel_text, true);
             state.record_blob(&rel_text, bytes, "blob-rule");
             return Ok(true);
         }
@@ -750,7 +735,6 @@ fn scan_dir(
             native_status(dir, relative, &metadata, context, state)?
         {
             let (_, bytes) = subtree_count_bytes(dir)?;
-            state.note_hardlink_boundary(&rel_text, true);
             state.record_wrapped(&rel_text, reason, bytes);
             return Ok(true);
         }
@@ -793,33 +777,21 @@ fn scan_leaf(
     state: &mut PlannerState,
 ) -> Result<(), String> {
     let rel_text = relative_match_text(relative);
-    match decide(context.ruleset, &rel_text, false) {
-        Decision::Exclude => {
+    match classify_leaf(path, relative, metadata, context, state)? {
+        LeafClassification::Exclude => {
             let bytes = metadata.len();
-            state.note_hardlink_boundary(&rel_text, false);
             state.record_cluster(&rel_text, "exclude-rule", 1, bytes);
             state.totals.excluded_entries = state.totals.excluded_entries.saturating_add(1);
             state.totals.excluded_bytes = state.totals.excluded_bytes.saturating_add(bytes);
-            return Ok(());
         }
-        Decision::Blob { .. } => {
-            return Err(format!(
-                "blob rule matched non-directory path {rel_text:?}; blob patterns must select directories"
-            ))
-        }
-        Decision::Granular => {}
-    }
-
-    match native_status(path, relative, metadata, context, state)? {
-        NativeStatus::Native { .. } if metadata.is_file() => {
+        LeafClassification::Native { .. } if metadata.is_file() => {
             state.note_native_hardlink(path, metadata, &rel_text, "");
             state.record_native(&rel_text, metadata.len());
         }
-        NativeStatus::Native { .. } => {
+        LeafClassification::Native { .. } => {
             state.record_native(&rel_text, 0);
         }
-        NativeStatus::WrapFallback(reason) => {
-            state.note_hardlink_boundary(&rel_text, false);
+        LeafClassification::WrapFallback(reason) => {
             state.record_wrapped(&rel_text, reason, metadata.len());
         }
     }
@@ -835,25 +807,15 @@ fn process_leaf(
     state: &mut PlannerState,
 ) -> Result<(), String> {
     let rel_text = relative_match_text(relative);
-    match decide(context.ruleset, &rel_text, false) {
-        Decision::Exclude => {
+    match classify_leaf(path, relative, metadata, context, state)? {
+        LeafClassification::Exclude => {
             let bytes = metadata.len();
-            state.note_hardlink_boundary(&rel_text, false);
             state.record_cluster(&rel_text, "exclude-rule", 1, bytes);
             state.totals.excluded_entries = state.totals.excluded_entries.saturating_add(1);
             state.totals.excluded_bytes = state.totals.excluded_bytes.saturating_add(bytes);
-            return Ok(());
+            Ok(())
         }
-        Decision::Blob { .. } => {
-            return Err(format!(
-                "blob rule matched non-directory path {rel_text:?}; blob patterns must select directories"
-            ))
-        }
-        Decision::Granular => {}
-    }
-
-    match native_status(path, relative, metadata, context, state)? {
-        NativeStatus::Native { .. } if metadata.file_type().is_symlink() => {
+        LeafClassification::Native { .. } if metadata.file_type().is_symlink() => {
             state.record_native(&rel_text, 0);
             state
                 .files
@@ -866,8 +828,9 @@ fn process_leaf(
                 mtime: metadata_mtime(path, metadata)?,
                 wrapper: None,
             });
+            Ok(())
         }
-        NativeStatus::Native { xattrs } if metadata.is_file() => {
+        LeafClassification::Native { xattrs } if metadata.is_file() => {
             if let Some(link_target) =
                 state.note_native_hardlink(path, metadata, &rel_text, &archive_path)
             {
@@ -902,18 +865,36 @@ fn process_leaf(
                 mtime: metadata_mtime(path, metadata)?,
                 wrapper: None,
             });
+            Ok(())
         }
-        NativeStatus::Native { .. } => {
-            return Err(format!(
-                "internal native status bug for unsupported path {}",
-                path.display()
-            ))
-        }
-        NativeStatus::WrapFallback(reason) => {
-            wrap_leaf(path, relative, metadata, reason, context, state)?;
+        LeafClassification::Native { .. } => Err(format!(
+            "internal native status bug for unsupported path {}",
+            path.display()
+        )),
+        LeafClassification::WrapFallback(reason) => {
+            wrap_leaf(path, relative, metadata, reason, context, state)
         }
     }
-    Ok(())
+}
+
+fn classify_leaf(
+    path: &Path,
+    relative: &Path,
+    metadata: &fs::Metadata,
+    context: ProcessContext<'_>,
+    state: &mut PlannerState,
+) -> Result<LeafClassification, String> {
+    let rel_text = relative_match_text(relative);
+    match decide(context.ruleset, &rel_text, false) {
+        Decision::Exclude => Ok(LeafClassification::Exclude),
+        Decision::Blob { .. } => Err(format!(
+            "blob rule matched non-directory path {rel_text:?}; blob patterns must select directories"
+        )),
+        Decision::Granular => match native_status(path, relative, metadata, context, state)? {
+            NativeStatus::Native { xattrs } => Ok(LeafClassification::Native { xattrs }),
+            NativeStatus::WrapFallback(reason) => Ok(LeafClassification::WrapFallback(reason)),
+        },
+    }
 }
 
 fn wrap_leaf(
@@ -925,7 +906,6 @@ fn wrap_leaf(
     state: &mut PlannerState,
 ) -> Result<(), String> {
     let rel_text = relative_match_text(relative);
-    state.note_hardlink_boundary(&rel_text, metadata.is_dir());
     let wrapper_name = format!(
         "{}{}",
         sanitized_or_native_archive_path(relative),
@@ -1593,96 +1573,14 @@ fn file_key(_metadata: &fs::Metadata) -> Option<FileKey> {
     None
 }
 
-fn collect_hardlink_groups_for_inputs(inputs: &[PathBuf]) -> Result<HardlinkGroups, String> {
-    let mut groups = HardlinkGroups::default();
-    for input in inputs {
-        collect_hardlink_groups_for_input(input, &mut groups)?;
-    }
-    groups.by_key.retain(|_, paths| paths.len() > 1);
-    groups
-        .by_path
-        .retain(|_, key| groups.by_key.contains_key(key));
-    Ok(groups)
-}
-
 #[cfg(unix)]
-fn collect_hardlink_groups_for_input(
-    input: &Path,
-    groups: &mut HardlinkGroups,
-) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(input)
-        .map_err(|error| format!("stat input {}: {error}", input.display()))?;
-    if metadata.is_dir() {
-        collect_hardlink_groups_for_dir(input, input, Path::new(""), groups)
-    } else if metadata.is_file() && metadata.nlink() > 1 {
-        if let Some(name) = input.file_name() {
-            let relative = PathBuf::from(name);
-            add_hardlink_group_member(&metadata, &relative_match_text(&relative), groups);
-        }
-        Ok(())
-    } else {
-        Ok(())
-    }
+fn hardlink_count(metadata: &fs::Metadata) -> u64 {
+    metadata.nlink()
 }
 
 #[cfg(not(unix))]
-fn collect_hardlink_groups_for_input(
-    _input: &Path,
-    _groups: &mut HardlinkGroups,
-) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn collect_hardlink_groups_for_dir(
-    root: &Path,
-    dir: &Path,
-    relative: &Path,
-    groups: &mut HardlinkGroups,
-) -> Result<(), String> {
-    let mut entries = fs::read_dir(dir)
-        .map_err(|error| format!("read directory {}: {error}", dir.display()))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("read directory {}: {error}", dir.display()))?;
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let path = entry.path();
-        let child_relative = relative.join(entry.file_name());
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| format!("stat input {}: {error}", path.display()))?;
-        if metadata.is_dir() {
-            collect_hardlink_groups_for_dir(root, &path, &child_relative, groups)?;
-        } else if metadata.is_file() && metadata.nlink() > 1 {
-            let normalized = path
-                .strip_prefix(root)
-                .map(PathBuf::from)
-                .unwrap_or(child_relative);
-            add_hardlink_group_member(&metadata, &relative_match_text(&normalized), groups);
-        }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn add_hardlink_group_member(metadata: &fs::Metadata, rel_text: &str, groups: &mut HardlinkGroups) {
-    let key = FileKey {
-        dev: metadata.dev(),
-        ino: metadata.ino(),
-    };
-    groups
-        .by_key
-        .entry(key)
-        .or_default()
-        .push(rel_text.to_string());
-    groups.by_path.insert(rel_text.to_string(), key);
-}
-
-#[cfg(not(unix))]
-fn add_hardlink_group_member(
-    _metadata: &fs::Metadata,
-    _rel_text: &str,
-    _groups: &mut HardlinkGroups,
-) {
+fn hardlink_count(_metadata: &fs::Metadata) -> u64 {
+    1
 }
 
 fn create_wrapper_tar(
@@ -2380,24 +2278,6 @@ impl PlannerState {
         }
     }
 
-    fn note_hardlink_boundary(&mut self, rel_text: &str, is_dir: bool) {
-        let affected = self
-            .hardlink_groups
-            .by_path
-            .iter()
-            .filter_map(|(path, key)| {
-                if (!is_dir && path == rel_text) || (is_dir && prefix_contains(rel_text, path)) {
-                    Some(*key)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        for key in affected {
-            *self.hardlink_blob_counts.entry(key).or_default() += 1;
-        }
-    }
-
     fn note_native_hardlink(
         &mut self,
         _path: &Path,
@@ -2406,36 +2286,35 @@ impl PlannerState {
         archive_path: &str,
     ) -> Option<String> {
         let key = file_key(metadata)?;
-        if !self.hardlink_groups.by_key.contains_key(&key) {
-            return None;
-        }
+        self.hardlink_paths
+            .entry(key)
+            .or_default()
+            .push(rel_text.to_string());
+        self.hardlink_link_counts
+            .entry(key)
+            .or_insert_with(|| hardlink_count(metadata));
         *self.hardlink_native_counts.entry(key).or_default() += 1;
         if let Some(primary) = self.hardlink_primaries.get(&key) {
             Some(primary.clone())
         } else {
             self.hardlink_primaries
                 .insert(key, archive_path.to_string());
-            self.hardlink_groups
-                .by_path
-                .entry(rel_text.to_string())
-                .or_insert(key);
             None
         }
     }
 
     fn record_hardlink_splits(&mut self) {
         let split_keys = self
-            .hardlink_blob_counts
+            .hardlink_native_counts
             .iter()
-            .filter_map(|(key, blob_count)| {
-                let native_count = self.hardlink_native_counts.get(key).copied().unwrap_or(0);
-                (native_count > 0 && *blob_count > 0).then_some(*key)
+            .filter_map(|(key, native_count)| {
+                let link_count = self.hardlink_link_counts.get(key).copied().unwrap_or(0);
+                (*native_count > 0 && link_count > *native_count).then_some(*key)
             })
             .collect::<Vec<_>>();
         for key in split_keys {
             let sample = self
-                .hardlink_groups
-                .by_key
+                .hardlink_paths
                 .get(&key)
                 .and_then(|paths| paths.first())
                 .cloned()
@@ -2898,24 +2777,13 @@ blob Literal/Sub/
     }
 
     #[test]
-    fn root_blob_boundary_records_hardlink_split() {
+    fn partial_native_hardlink_coverage_records_split() {
         let mut state = PlannerState::default();
         let key = FileKey { dev: 1, ino: 2 };
-        state
-            .hardlink_groups
-            .by_key
-            .insert(key, vec!["a.bin".to_string(), "b.bin".to_string()]);
-        state
-            .hardlink_groups
-            .by_path
-            .insert("a.bin".to_string(), key);
-        state
-            .hardlink_groups
-            .by_path
-            .insert("b.bin".to_string(), key);
+        state.hardlink_paths.insert(key, vec!["a.bin".to_string()]);
         state.hardlink_native_counts.insert(key, 1);
+        state.hardlink_link_counts.insert(key, 2);
 
-        state.note_hardlink_boundary("", true);
         state.record_hardlink_splits();
         let report = state.scan_report(ScanTuning::default());
 
