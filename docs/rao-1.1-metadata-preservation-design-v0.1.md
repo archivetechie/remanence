@@ -74,6 +74,8 @@ metadata_preservation_data = {
   no duplicate names. Required so the manifest stays a reproducible projection.
 - Unknown keys inside `metadata_preservation_data` (e.g. a future `"acl"`) are
   ignored by a 1.1 reader, same 1.x tolerance.
+- Hardlink entries carry no preservation data of their own; their restored
+  inode metadata comes from the regular-file primary named by `link_target`.
 
 ### 3.2 schema_version
 

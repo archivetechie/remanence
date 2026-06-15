@@ -6,7 +6,7 @@ use ciborium::value::Value as CborValue;
 use sha2::{Digest, Sha256};
 
 use crate::error::FormatError;
-use crate::model::MAX_FILE_ENTRIES;
+use crate::model::{RemTarXattrs, MAX_FILE_ENTRIES};
 
 const MANIFEST_MAX_DEPTH: usize = 8;
 
@@ -27,6 +27,31 @@ pub(crate) fn validate_manifest(
     let value: CborValue =
         ciborium::from_reader(bytes).map_err(|err| FormatError::cbor(err.to_string()))?;
     validate_manifest_schema(&value, global_pax, reader_chunk_size)
+}
+
+pub(crate) fn manifest_xattrs_by_path(
+    bytes: &[u8],
+) -> Result<BTreeMap<String, RemTarXattrs>, FormatError> {
+    validate_manifest_profile(bytes)?;
+    let value: CborValue =
+        ciborium::from_reader(bytes).map_err(|err| FormatError::cbor(err.to_string()))?;
+    let map = value
+        .as_map()
+        .ok_or_else(|| FormatError::manifest_invalid("top-level manifest item must be a map"))?;
+    let file_entries = required_array(map, "file_entries")?;
+    let mut out = BTreeMap::new();
+    for entry in file_entries {
+        let entry = entry
+            .as_map()
+            .ok_or_else(|| FormatError::manifest_invalid("file_entries item must be a map"))?;
+        let path = required_text(entry, "path")?;
+        let metadata = required_map(entry, "metadata_preservation_data")?;
+        let xattrs = xattrs_from_metadata_preservation_data(metadata)?;
+        if !xattrs.is_empty() {
+            out.insert(path.to_string(), xattrs);
+        }
+    }
+    Ok(out)
 }
 
 fn validate_manifest_profile(bytes: &[u8]) -> Result<(), FormatError> {
@@ -151,7 +176,8 @@ fn validate_file_entry(
         ));
     }
     let _ = required_bool_or_null(map, "executable")?;
-    let _ = required_map(map, "metadata_preservation_data")?;
+    let metadata = required_map(map, "metadata_preservation_data")?;
+    let xattrs = xattrs_from_metadata_preservation_data(metadata)?;
     let entry_type = optional_text(map, "entry_type")?;
     let link_target = optional_text(map, "link_target")?;
     match entry_type {
@@ -172,6 +198,11 @@ fn validate_file_entry(
             return Ok(Some(path.to_string()));
         }
         Some("hardlink") => {
+            if !xattrs.is_empty() {
+                return Err(FormatError::manifest_invalid(
+                    "hardlink entry must not have xattrs",
+                ));
+            }
             if size_bytes != 0 {
                 return Err(FormatError::manifest_invalid(
                     "hardlink entry size_bytes must be zero",
@@ -324,6 +355,40 @@ fn required_map<'a>(
         CborValue::Map(value) => Ok(value),
         _ => Err(FormatError::manifest_invalid(format!("{key} must be map"))),
     }
+}
+
+fn xattrs_from_metadata_preservation_data(
+    map: &[(CborValue, CborValue)],
+) -> Result<RemTarXattrs, FormatError> {
+    let Some(value) = find_key(map, "xattrs") else {
+        return Ok(BTreeMap::new());
+    };
+    let entries = value
+        .as_map()
+        .ok_or_else(|| FormatError::manifest_invalid("xattrs must be a map"))?;
+    let mut xattrs = BTreeMap::new();
+    for (key, value) in entries {
+        let name = match key {
+            CborValue::Text(name) => name,
+            _ => return Err(FormatError::manifest_invalid("xattr names must be text")),
+        };
+        if name.is_empty() {
+            return Err(FormatError::manifest_invalid(
+                "xattr names must not be empty",
+            ));
+        }
+        if name.bytes().any(|byte| byte < 0x20) {
+            return Err(FormatError::manifest_invalid(
+                "xattr names must not contain ASCII control characters",
+            ));
+        }
+        let value = match value {
+            CborValue::Bytes(bytes) => bytes,
+            _ => return Err(FormatError::manifest_invalid("xattr values must be bytes")),
+        };
+        xattrs.insert(name.clone(), value.clone());
+    }
+    Ok(xattrs)
 }
 
 fn optional_bytes<'a>(
@@ -678,7 +743,16 @@ mod tests {
         if let Some(target) = link_target {
             fields.push(("link_target", cbor_text(target)));
         }
-        fields.extend(extra);
+        for (key, value) in extra {
+            if let Some((_, existing)) = fields
+                .iter_mut()
+                .find(|(existing_key, _)| *existing_key == key)
+            {
+                *existing = value;
+            } else {
+                fields.push((key, value));
+            }
+        }
         cbor_map(fields)
     }
 
@@ -878,5 +952,23 @@ mod tests {
             vec![("link_target", cbor_text("target"))],
         ));
         assert_file_entry_manifest_invalid(nonregular_file_entry("device", None, Vec::new()));
+        assert_file_entry_manifest_invalid(regular_file_entry_with(vec![(
+            "metadata_preservation_data",
+            cbor_map(vec![(
+                "xattrs",
+                cbor_map(vec![("bad\nname", cbor_bytes(b"value"))]),
+            )]),
+        )]));
+        assert_file_entry_manifest_invalid(nonregular_file_entry(
+            "hardlink",
+            Some("a.bin"),
+            vec![(
+                "metadata_preservation_data",
+                cbor_map(vec![(
+                    "xattrs",
+                    cbor_map(vec![("user.note", cbor_bytes(b"value"))]),
+                )]),
+            )],
+        ));
     }
 }

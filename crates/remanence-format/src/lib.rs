@@ -34,8 +34,8 @@ pub use layout::{plan_rem_tar_object, RemTarObjectLayout};
 pub use manifest::validate_manifest_cbor_for_fuzz;
 pub use model::{
     BodyLba, MetadataPreservation, RemTarEntryType, RemTarFile, RemTarFileLayout, RemTarFileSpec,
-    RemTarFileStream, RemTarObjectOptions, DEFAULT_CHUNK_SIZE, FORMAT_ID, MANIFEST_PATH,
-    SCHEMA_VERSION, TAR_RECORD_SIZE,
+    RemTarFileStream, RemTarObjectOptions, RemTarXattrs, DEFAULT_CHUNK_SIZE, FORMAT_ID,
+    MANIFEST_PATH, SCHEMA_VERSION, SCHEMA_VERSION_XATTRS, TAR_RECORD_SIZE,
 };
 pub use pfr::{read_encrypted_rao_file_range_to_vec, EncryptedRaoFileRange};
 pub use reader::{

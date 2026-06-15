@@ -217,14 +217,11 @@ plus `entry_type`/`link_target` where applicable."
 
 ## 12. Still open / separate threads
 
-- **Mac extended-attribute metadata** (Finder color tags =
-  `com.apple.metadata:_kMDItemUserTags` / legacy `com.apple.FinderInfo`
-  xattrs; surfacing as `._` AppleDouble sidecars off Mac-native filesystems)
-  is a **separate decision**, not folded in here. It is an xattr-capture
-  problem, not an entry-type one. Decide next: capture xattrs into the
-  reserved `metadata_preservation_data` manifest container, treat incoming
-  `._`/`.DS_Store` files as ordinary payload (and don't let an ingest filter
-  delete them), or rely on the wrap-then-store fallback.
+- **Mac extended-attribute metadata** is superseded by RAO 1.1
+  (`specs/rao-1.1-specification.md`) and
+  `rao-1.1-metadata-preservation-design-v0.1.md`: small preserved xattrs live
+  in `metadata_preservation_data.xattrs`; out-of-scope or oversized metadata
+  is dropped-and-recorded or wrapped by ingest policy.
 - **Wrap-then-store** remains the zero-format-work, zero-loss fallback for
   *any* non-conforming subtree: a faithful inner `tar --xattrs` stored as one
   RAO payload captures dirs, symlinks, and xattrs together, trading away

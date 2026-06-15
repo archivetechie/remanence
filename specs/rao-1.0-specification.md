@@ -317,7 +317,7 @@ Section 3.3 hold.
 
 | Digest | Computed over | Stored where | Verifiable without keys? |
 | --- | --- | --- | --- |
-| `file_sha256` | One member file's exact payload bytes | Entry pax header + manifest | Plaintext copies: yes. Encrypted copies: no |
+| `file_sha256` | One regular member file's exact payload bytes | Entry pax header + manifest | Plaintext copies: yes. Encrypted copies: no |
 | `manifest_sha256` | The manifest entry's CBOR bytes | Manifest pax header; for plaintext copies also the parity-layer bootstrap and catalog (Section 8.2) | Plaintext copies: yes. Encrypted copies: no |
 | `plaintext_digest` | The **complete canonical plaintext object** bytes | Encrypted copies: inside the authenticated metadata frame (Section 5.5). All copies: catalog | No (for encrypted copies) |
 | `stored_digest` | The **complete stored bytes** of one copy, byte 0 through the final fill byte | External only: catalog / master index (never in-band) | **Yes** — the keyless scrub anchor |
@@ -946,7 +946,8 @@ MUST fail the object rather than complete it.
 
 **Writer / Planner.** The Planner computes the entire layout — every offset,
 pad size, manifest byte, and the final block count — from the file *specs*
-alone (path, file_id, size, hash, optional mtime/executable), without payload
+alone (path, file_id, entry type, link target where present, size, hash,
+optional mtime/executable, and 1.x preservation metadata), without payload
 bytes; Planner and Writer MUST share the same sizing rules such that the
 planned layout is byte-exact. The writer's workflow: validate options
 (`chunk_size`; non-empty `object_id`, `caller_object_id`, `write_timestamp`,
@@ -1032,8 +1033,8 @@ tool into self-describingly-named text fields. Stock tar faithfully restores
 absolute or dangling symlinks too; that fidelity is correct but not a safety
 claim (Section 12.10). With all Remanence metadata lost, a Scanner can still
 walk the archive using only tar rules — header, `size`, `roundup512(size)`,
-repeat — recovering payload bytes, symlink targets, directory entries, and
-names; it loses only chunk addressing (irrelevant when scanning) and
+repeat — recovering payload bytes, hardlink relationships, symlink targets,
+directory entries, and names; it loses only chunk addressing (irrelevant when scanning) and
 verification (recoverable from the manifest if its blocks survive).
 Conformance requires demonstrated extraction equality by GNU tar, bsdtar, and
 Python `tarfile` (Section 14).

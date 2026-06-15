@@ -6435,7 +6435,7 @@ fn encrypted_archive_keyless_json(path: &Path, report: &remanence_aead::InspectR
 }
 
 fn read_entry_report_json(entry: &remanence_format::RemTarReadEntry) -> Value {
-    json!({
+    let mut report = json!({
         "entry_type": archive_entry_type_name(entry.entry_type),
         "path": entry.path,
         "size_bytes": entry.size_bytes,
@@ -6445,7 +6445,14 @@ fn read_entry_report_json(entry: &remanence_format::RemTarReadEntry) -> Value {
         "first_chunk_lba": entry.first_chunk_lba.map(|lba| lba.0),
         "chunk_count": entry.chunk_count,
         "data_offset": entry.data_offset,
-    })
+    });
+    if let Some(xattrs) = xattrs_report_json(&entry.xattrs) {
+        report
+            .as_object_mut()
+            .expect("entry report is a JSON object")
+            .insert("xattrs".to_string(), json!(xattrs));
+    }
+    report
 }
 
 struct ArchiveExtractReportContext<'a> {
@@ -6711,7 +6718,7 @@ fn archive_build_report_json(
 }
 
 fn archive_file_report_json(layout: &RemTarFileLayout, input: &ArchiveBuildInputFile) -> Value {
-    json!({
+    let mut report = json!({
         "entry_type": archive_entry_type_name(layout.entry_type),
         "path": layout.path,
         "source_path": input.source_path,
@@ -6724,7 +6731,26 @@ fn archive_file_report_json(layout: &RemTarFileLayout, input: &ArchiveBuildInput
         "first_chunk_lba": layout.first_chunk_lba.map(|lba| lba.0),
         "chunk_count": layout.chunk_count,
         "pad_spaces": layout.pad_spaces,
-    })
+    });
+    if let Some(xattrs) = xattrs_report_json(&layout.xattrs) {
+        report
+            .as_object_mut()
+            .expect("archive file report is a JSON object")
+            .insert("xattrs".to_string(), json!(xattrs));
+    }
+    report
+}
+
+fn xattrs_report_json(xattrs: &BTreeMap<String, Vec<u8>>) -> Option<BTreeMap<String, String>> {
+    if xattrs.is_empty() {
+        return None;
+    }
+    Some(
+        xattrs
+            .iter()
+            .map(|(name, value)| (name.clone(), bytes_to_hex(value)))
+            .collect(),
+    )
 }
 
 fn archive_entry_type_name(entry_type: RemTarEntryType) -> &'static str {

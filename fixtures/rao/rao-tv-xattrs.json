@@ -1,0 +1,101 @@
+{
+  "vector_id": "RAO-TV-XATTRS",
+  "spec_section": "13.1",
+  "status": "pinned-at-generation",
+  "independent_rederivation": "verified by tools/verify_rao_vectors_independent.py",
+  "inputs": {
+    "chunk_size": 4096,
+    "object_id": "00000000-0000-4000-8000-000000000111",
+    "caller_object_id": "rao-tv-xattrs",
+    "write_timestamp": "2026-01-01T00:00:00Z",
+    "metadata_preservation": "minimal",
+    "manifest_file_id": "00000000-0000-4000-8000-000000000111",
+    "entries": [
+      {
+        "entry_type": "regular",
+        "path": "tagged.txt",
+        "file_id": "00000000-0000-4000-8000-000000000211",
+        "size_bytes": 14,
+        "link_target": null,
+        "mtime": null,
+        "executable": null,
+        "xattrs": {
+          "user.comment": "626c7565",
+          "user.remanence.color": "0102ff"
+        }
+      },
+      {
+        "entry_type": "regular",
+        "path": "plain.txt",
+        "file_id": "00000000-0000-4000-8000-000000000212",
+        "size_bytes": 14,
+        "link_target": null,
+        "mtime": null,
+        "executable": null
+      }
+    ]
+  },
+  "expected": {
+    "schema_version": "1.1",
+    "stored_size_bytes": 16384,
+    "stored_size_blocks": 4,
+    "stored_digest": "f65ac1b82b2aa4838d983eddd7ee274e80063a57fad24d917b58aa14da3240c6",
+    "first_block_sha256": "c746a74fc87ce9e20d0819fa6bccf93f350bf3366501ec8438ede56999b230da",
+    "manifest_cbor_len": 596,
+    "manifest_cbor_hex": "a7696f626a6563745f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303131316a6368756e6b5f73697a651910006c66696c655f656e747269657382a864706174686a7461676765642e7478746766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303231316a65786563757461626c65f66a73697a655f62797465730e6b6368756e6b5f636f756e74016b66696c655f7368613235365820f5c6b73538dc902f42900a74464f7f32f517fb8368a4b3b1fa2ab429bd2f4b616f66697273745f6368756e6b5f6c626101781a6d657461646174615f707265736572766174696f6e5f64617461a166786174747273a26c757365722e636f6d6d656e7444626c756574757365722e72656d616e656e63652e636f6c6f72430102ffa8647061746869706c61696e2e7478746766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303231326a65786563757461626c65f66a73697a655f62797465730e6b6368756e6b5f636f756e74016b66696c655f7368613235365820b5644604c95fea908b07d84db25cb1ec56ede7e9bb88bd88f17434b80835eb406f66697273745f6368756e6b5f6c626102781a6d657461646174615f707265736572766174696f6e5f64617461a06e736368656d615f76657273696f6e016f6f626a6563745f6d65746164617461a07063616c6c65725f6f626a6563745f69646d72616f2d74762d7861747472737365787465726e616c5f7265666572656e63657380",
+    "manifest_sha256": "6d471b4009fef334e529fb21fa7fb4b3306cc515bcd5e9c1ddb4fa320dd2a786",
+    "file_payloads": [
+      {
+        "path": "tagged.txt",
+        "size_bytes": 14,
+        "sha256": "f5c6b73538dc902f42900a74464f7f32f517fb8368a4b3b1fa2ab429bd2f4b61"
+      },
+      {
+        "path": "plain.txt",
+        "size_bytes": 14,
+        "sha256": "b5644604c95fea908b07d84db25cb1ec56ede7e9bb88bd88f17434b80835eb40"
+      }
+    ],
+    "symlinks": [],
+    "hardlinks": [],
+    "directories": [],
+    "xattrs": [
+      {
+        "path": "tagged.txt",
+        "xattrs": {
+          "user.comment": "626c7565",
+          "user.remanence.color": "0102ff"
+        }
+      }
+    ],
+    "file_layouts": [
+      {
+        "entry_type": "regular",
+        "path": "tagged.txt",
+        "pax_header_offset": 1024,
+        "data_offset": 4096,
+        "first_chunk_lba": 1,
+        "chunk_count": 1,
+        "pad_spaces": 1793
+      },
+      {
+        "entry_type": "regular",
+        "path": "plain.txt",
+        "pax_header_offset": 4608,
+        "data_offset": 8192,
+        "first_chunk_lba": 2,
+        "chunk_count": 1,
+        "pad_spaces": 2306
+      }
+    ],
+    "manifest_layout": {
+      "entry_type": "regular",
+      "path": "_remanence/manifest.cbor",
+      "pax_header_offset": 8704,
+      "data_offset": 12288,
+      "first_chunk_lba": 3,
+      "chunk_count": 1,
+      "pad_spaces": 2230
+    }
+  }
+}
