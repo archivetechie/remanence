@@ -1,5 +1,31 @@
 # Code review — RAO ingest archive (rem side), 2026-06-15
 
+> **STATUS 2026-06-16 — all 5 High findings CLOSED in current `main`.** Verified
+> against `crates/remanence-cli/src/archive_ingest.rs` at HEAD (line numbers in
+> the findings below are from the review-time revision and have since shifted):
+> - **H1** (tar option injection) — fixed: `create_wrapper_tar` now passes `--`
+>   before the member operand (`.arg("-C").arg(base_dir).arg("--").arg(member)`);
+>   regression test `wrapper_tar_treats_dash_prefixed_members_as_operands`.
+> - **H2** (pax panic on malformed `.remwrap.tar`) — fixed: `parse_pax_records`
+>   guards `len <= space + 1`, `cursor + len > data.len()`, and the trailing-`\n`
+>   before slicing (the bug was a slice-inversion `data[start..end]` with
+>   `start > end`).
+> - **H3** (§A3.5 fidelity test silently skipped in CI) — fixed: the fidelity
+>   tests now **hard-`assert!(command_available("bsdtar"), …)`** instead of
+>   eprintln-and-return, CI installs `attr`, and `detect_tar_engine` pins the
+>   engine to bsdtar (errors if absent) — which also closes **M1** (dialect not
+>   pinned).
+> - **H4** (silent xattr data loss via shelled `getfattr`) — moot: xattrs use the
+>   Rust `xattr` crate (`xattr::list`/`get`/`set`); no `getfattr` anywhere.
+>   Oversized xattr sets route to `XattrCollection::Wrap`, not silent drop.
+> - **H5** (density heuristic not implemented) — fixed: `scan_report` collects
+>   dense candidates (ratio ≥ blob_ratio AND noncompliant ≥ blob_count), keeps
+>   only the **topmost** per cluster, skips a parent with a substantial compliant
+>   descendant, and emits `straggler` + whole-scan `sanity-ceiling` verdicts.
+> Plus **M2** (non-UTF-8 index escaping) — fixed; test
+> `wrapper_index_escapes_non_utf8_member_names`. The body below is the original
+> review, preserved for provenance.
+
 **Scope:** the implementation of `docs/prompt-rao-archive-rem.md` (Part A of
 `~/system/docs/design-ingest-v2-rao-archive.md`) — commits `e7b9e5f..4ca69c3`:
 the new `crates/remanence-cli/src/archive_ingest.rs` (~2,000 lines) and the
