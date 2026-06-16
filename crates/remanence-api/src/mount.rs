@@ -559,6 +559,37 @@ pub(crate) async fn read_file(
         .map_err(|_| Status::internal("drive actor unavailable"))
 }
 
+pub(crate) struct ReadObjectRangeDispatch {
+    pub(crate) session_id: Uuid,
+    pub(crate) object_id: String,
+    pub(crate) file_id: String,
+    pub(crate) start_byte: u64,
+    pub(crate) end_byte: u64,
+    pub(crate) stream_chunk_bytes: u32,
+}
+
+pub(crate) async fn read_object_range(
+    state: &ApiState,
+    request: ReadObjectRangeDispatch,
+    chunk_tx: tokio::sync::mpsc::Sender<Result<pb::BytesChunk, Status>>,
+) -> Result<(), Status> {
+    let pool = state.drive_pool()?.clone();
+    let mounted = pool.session(request.session_id)?;
+    let drive = pool.drive_tx(mounted.bay)?;
+    drive
+        .send(crate::write_owner::DriveCommand::ReadObjectRange {
+            session_id: request.session_id,
+            object_id: request.object_id,
+            file_id: request.file_id,
+            start_byte: request.start_byte,
+            end_byte: request.end_byte,
+            stream_chunk_bytes: request.stream_chunk_bytes,
+            chunk_tx,
+        })
+        .await
+        .map_err(|_| Status::internal("drive actor unavailable"))
+}
+
 async fn finish_mounted_session(
     pool: &crate::write_owner::DrivePool,
     session_id: Uuid,

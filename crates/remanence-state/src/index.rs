@@ -316,6 +316,29 @@ pub struct NativeObjectCopyRecord {
     pub stored_digest: Option<Vec<u8>>,
 }
 
+/// Native object member-file row for catalog-backed partial-file restore.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeObjectFileRecord {
+    /// Remanence object UUID.
+    pub object_id: String,
+    /// Stable file identifier inside the object.
+    pub file_id: String,
+    /// UTF-8 path inside the object.
+    pub path: String,
+    /// Exact file payload size.
+    pub size_bytes: u64,
+    /// SHA-256 of the exact file payload bytes.
+    pub file_sha256: Vec<u8>,
+    /// First object-local body LBA containing file data.
+    pub first_chunk_lba: Option<u64>,
+    /// Number of body chunks containing file data.
+    pub chunk_count: u64,
+    /// Optional mtime pax value.
+    pub mtime: Option<String>,
+    /// Optional executable flag.
+    pub executable: Option<bool>,
+}
+
 /// Object row supplied by Layer 5 after a native object commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeObjectProjectionInput {
@@ -362,6 +385,29 @@ pub struct NativeObjectCopyProjectionInput {
     pub plaintext_digest: Option<Vec<u8>>,
     /// SHA-256 of the stored representation bytes for this copy.
     pub stored_digest: Option<Vec<u8>>,
+}
+
+/// Member-file row supplied by Layer 5 after a native object commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeObjectFileProjectionInput {
+    /// Remanence object UUID.
+    pub object_id: String,
+    /// Stable file identifier inside the object.
+    pub file_id: String,
+    /// UTF-8 path inside the object.
+    pub path: String,
+    /// Exact file payload size.
+    pub size_bytes: u64,
+    /// SHA-256 of the exact file payload bytes.
+    pub file_sha256: Vec<u8>,
+    /// First object-local body LBA containing file data.
+    pub first_chunk_lba: Option<u64>,
+    /// Number of body chunks containing file data.
+    pub chunk_count: u64,
+    /// Optional mtime pax value.
+    pub mtime: Option<String>,
+    /// Optional executable flag.
+    pub executable: Option<bool>,
 }
 
 /// Foreign archive scan summary supplied by a registered read-only driver.
@@ -768,6 +814,7 @@ impl CatalogIndex {
     pub fn project_native_object_and_committed_tape_file_bundle(
         &mut self,
         object: NativeObjectProjectionInput,
+        files: &[NativeObjectFileProjectionInput],
         copies: &[NativeObjectCopyProjectionInput],
         tape_input: TapeJournalIndexInput,
         bundle: &CommittedBundle,
@@ -780,7 +827,13 @@ impl CatalogIndex {
         let tx = self.conn.transaction().map_err(|err| {
             sqlite_error("begin native object and tape-file bundle projection", err)
         })?;
-        upsert_native_object_projection_tx(&tx, &object, copies, created_at_utc.as_str())?;
+        upsert_native_object_projection_tx(
+            &tx,
+            &object,
+            Some(files),
+            copies,
+            created_at_utc.as_str(),
+        )?;
         let report =
             project_committed_tape_file_bundle_tx(&tx, &tape_input, bundle, updated_at.as_str())?;
         tx.commit().map_err(|err| {
@@ -1153,7 +1206,7 @@ impl CatalogIndex {
             .conn
             .transaction()
             .map_err(|err| sqlite_error("begin native object projection", err))?;
-        upsert_native_object_projection_tx(&tx, &object, copies, created_at_utc.as_str())?;
+        upsert_native_object_projection_tx(&tx, &object, None, copies, created_at_utc.as_str())?;
         tx.commit()
             .map_err(|err| sqlite_error("commit native object projection", err))?;
         Ok(())
@@ -1622,6 +1675,61 @@ impl CatalogIndex {
             return Ok(None);
         };
         self.attach_native_object_copies(object).map(Some)
+    }
+
+    /// Fetch one native object member-file row by object id and file id.
+    pub fn get_native_object_file(
+        &self,
+        object_id: &str,
+        file_id: &str,
+    ) -> Result<Option<NativeObjectFileRecord>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select object_id, file_id, path, size_bytes, file_sha256,
+                        first_chunk_lba, chunk_count, mtime, executable
+                 from object_files
+                 where object_id = ?1 and file_id = ?2",
+            )
+            .map_err(|err| sqlite_error("prepare native object file lookup", err))?;
+        let mut rows = stmt
+            .query(params![object_id, file_id])
+            .map_err(|err| sqlite_error("query native object file lookup", err))?;
+        match rows
+            .next()
+            .map_err(|err| sqlite_error("iterate native object file lookup", err))?
+        {
+            Some(row) => native_object_file_from_row(row).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// List native object member-file rows.
+    pub fn list_native_object_files(
+        &self,
+        object_id: &str,
+    ) -> Result<Vec<NativeObjectFileRecord>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select object_id, file_id, path, size_bytes, file_sha256,
+                        first_chunk_lba, chunk_count, mtime, executable
+                 from object_files
+                 where object_id = ?1
+                 order by path, file_id",
+            )
+            .map_err(|err| sqlite_error("prepare native object file query", err))?;
+        let mut rows = stmt
+            .query(params![object_id])
+            .map_err(|err| sqlite_error("query native object files", err))?;
+        let mut files = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|err| sqlite_error("iterate native object files", err))?
+        {
+            files.push(native_object_file_from_row(row)?);
+        }
+        Ok(files)
     }
 
     /// Fetch a native object and its copies by content hash.
@@ -2531,6 +2639,7 @@ fn index_committed_tape_journal_tx(
 fn upsert_native_object_projection_tx(
     tx: &rusqlite::Transaction<'_>,
     object: &NativeObjectProjectionInput,
+    files: Option<&[NativeObjectFileProjectionInput]>,
     copies: &[NativeObjectCopyProjectionInput],
     created_at_utc: &str,
 ) -> Result<(), StateError> {
@@ -2566,6 +2675,10 @@ fn upsert_native_object_projection_tx(
     )
     .map_err(|err| sqlite_error("refresh native catalog unit format", err))?;
 
+    if let Some(files) = files {
+        replace_native_object_files_tx(tx, object.object_id.as_str(), files)?;
+    }
+
     for copy in copies {
         if copy.object_id != object.object_id {
             return Err(StateError::IndexMigrationFailed(format!(
@@ -2600,6 +2713,82 @@ fn upsert_native_object_projection_tx(
         )?;
     }
 
+    Ok(())
+}
+
+fn replace_native_object_files_tx(
+    tx: &rusqlite::Transaction<'_>,
+    object_id: &str,
+    files: &[NativeObjectFileProjectionInput],
+) -> Result<(), StateError> {
+    tx.execute(
+        "delete from object_files where object_id = ?1",
+        params![object_id],
+    )
+    .map_err(|err| sqlite_error("clear native object file projection", err))?;
+    for file in files {
+        if file.object_id != object_id {
+            return Err(StateError::IndexMigrationFailed(format!(
+                "object file {} does not match projected object {object_id}",
+                file.object_id
+            )));
+        }
+        insert_native_object_file_projection_tx(tx, file)?;
+    }
+    Ok(())
+}
+
+fn insert_native_object_file_projection_tx(
+    tx: &rusqlite::Transaction<'_>,
+    file: &NativeObjectFileProjectionInput,
+) -> Result<(), StateError> {
+    if file.file_id.is_empty() {
+        return Err(StateError::IndexMigrationFailed(
+            "object file_id must not be empty".to_string(),
+        ));
+    }
+    if file.path.is_empty() {
+        return Err(StateError::IndexMigrationFailed(
+            "object file path must not be empty".to_string(),
+        ));
+    }
+    validate_optional_sha256(
+        Some(file.file_sha256.as_slice()),
+        "object_files.file_sha256",
+    )?;
+    if file.size_bytes == 0 {
+        if file.first_chunk_lba.is_some() || file.chunk_count != 0 {
+            return Err(StateError::IndexMigrationFailed(
+                "empty object file rows must not carry data coordinates".to_string(),
+            ));
+        }
+    } else if file.first_chunk_lba.is_none() || file.chunk_count == 0 {
+        return Err(StateError::IndexMigrationFailed(
+            "non-empty object file rows require first_chunk_lba and chunk_count".to_string(),
+        ));
+    }
+    let executable = file
+        .executable
+        .map(|value| if value { 1_i64 } else { 0_i64 });
+    tx.execute(
+        "insert into object_files(
+           object_id, file_id, path, size_bytes, file_sha256,
+           first_chunk_lba, chunk_count, mtime, executable
+         )
+         values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            file.object_id.as_str(),
+            file.file_id.as_str(),
+            file.path.as_str(),
+            u64_to_i64(file.size_bytes, "object_files.size_bytes")?,
+            file.file_sha256.as_slice(),
+            opt_u64_to_i64(file.first_chunk_lba, "object_files.first_chunk_lba")?,
+            u64_to_i64(file.chunk_count, "object_files.chunk_count")?,
+            file.mtime.as_deref(),
+            executable,
+        ],
+    )
+    .map_err(|err| sqlite_error("insert native object file projection", err))?;
     Ok(())
 }
 
@@ -3634,6 +3823,34 @@ fn native_object_copy_from_row(
     })
 }
 
+fn native_object_file_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<NativeObjectFileRecord, StateError> {
+    let executable = row_get::<Option<i64>>(row, 8, "object_files.executable")?
+        .map(|value| match value {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(StateError::IndexCorrupt(
+                "object_files.executable is not boolean".to_string(),
+            )),
+        })
+        .transpose()?;
+    Ok(NativeObjectFileRecord {
+        object_id: row_get(row, 0, "object_files.object_id")?,
+        file_id: row_get(row, 1, "object_files.file_id")?,
+        path: row_get(row, 2, "object_files.path")?,
+        size_bytes: i64_to_u64(row_get(row, 3, "object_files.size_bytes")?, "size_bytes")?,
+        file_sha256: row_get(row, 4, "object_files.file_sha256")?,
+        first_chunk_lba: opt_i64_to_u64(
+            row_get(row, 5, "object_files.first_chunk_lba")?,
+            "first_chunk_lba",
+        )?,
+        chunk_count: i64_to_u64(row_get(row, 6, "object_files.chunk_count")?, "chunk_count")?,
+        mtime: row_get(row, 7, "object_files.mtime")?,
+        executable,
+    })
+}
+
 fn native_object_copy_from_join_row(
     row: &rusqlite::Row<'_>,
     offset: usize,
@@ -4046,6 +4263,22 @@ create table if not exists object_copies(
   pool_id text,
   primary key(object_id, tape_uuid, tape_file_number)
 );
+
+create table if not exists object_files(
+  object_id text not null,
+  file_id text not null,
+  path text not null,
+  size_bytes integer not null,
+  file_sha256 blob not null,
+  first_chunk_lba integer,
+  chunk_count integer not null,
+  mtime text,
+  executable integer,
+  primary key(object_id, file_id)
+);
+
+create index if not exists object_files_path_idx
+  on object_files(object_id, path);
 
 create table if not exists catalog_units(
   unit_id text primary key,
@@ -4577,6 +4810,7 @@ mod tests {
                     metadata_hash: Some(vec![2u8; 32]),
                     created_at_utc: Some("2026-05-30T10:00:00Z".to_string()),
                 },
+                &[],
                 &[NativeObjectCopyProjectionInput {
                     object_id: "object-foreign-pool".to_string(),
                     tape_uuid,
@@ -5881,6 +6115,7 @@ mod tests {
                     metadata_hash: Some(vec![2u8; 32]),
                     created_at_utc: Some("2026-05-28T10:00:00Z".to_string()),
                 },
+                &[],
                 &[NativeObjectCopyProjectionInput {
                     object_id: object_id.to_string(),
                     tape_uuid,
@@ -6105,6 +6340,7 @@ mod tests {
                     metadata_hash: None,
                     created_at_utc: Some("2026-06-11T19:00:00Z".to_string()),
                 },
+                &[],
                 &[NativeObjectCopyProjectionInput {
                     object_id: object_id.to_string(),
                     tape_uuid,

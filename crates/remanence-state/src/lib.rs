@@ -36,10 +36,11 @@ pub use error::StateError;
 pub use index::{
     AuditReplayReport, CatalogIndex, CatalogUnitFilter, CatalogUnitRecord,
     ForeignArchiveProjectionInput, NativeObjectCopyProjectionInput, NativeObjectCopyRecord,
-    NativeObjectProjectionInput, NativeObjectRecord, OperationRecord, ProvisionTapeInput,
-    RebuildReport, RebuildTapeJournalInput, RestartOperation, RestartSession, RetireTapeInput,
-    RetireTapeOutcome, TapeFileRecord, TapeJournalIndexInput, TapeJournalIndexReport,
-    TapePoolProjectionInput, TapePoolRecord, TapeRecord, OBJECT_COPY_REPRESENTATION_ENCRYPTED,
+    NativeObjectFileProjectionInput, NativeObjectFileRecord, NativeObjectProjectionInput,
+    NativeObjectRecord, OperationRecord, ProvisionTapeInput, RebuildReport,
+    RebuildTapeJournalInput, RestartOperation, RestartSession, RetireTapeInput, RetireTapeOutcome,
+    TapeFileRecord, TapeJournalIndexInput, TapeJournalIndexReport, TapePoolProjectionInput,
+    TapePoolRecord, TapeRecord, OBJECT_COPY_REPRESENTATION_ENCRYPTED,
     OBJECT_COPY_REPRESENTATION_PLAINTEXT, OBJECT_COPY_REPRESENTATION_UNKNOWN, SCHEMA_VERSION,
 };
 pub use lock::StateLockGuard;
