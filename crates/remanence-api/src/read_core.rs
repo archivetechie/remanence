@@ -11,8 +11,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use remanence_format::{
-    model::MANIFEST_PATH, stream_rem_tar_object_with_manifest_anchor, FormatError, RemTarEntrySink,
-    RemTarStreamEntry,
+    model::{BodyLba, MANIFEST_PATH},
+    plan_plaintext_rao_file_range, stream_rem_tar_object_with_manifest_anchor, FormatError,
+    RemTarEntrySink, RemTarStreamEntry,
 };
 use remanence_library::{BlockSource, SpaceKind};
 use sha2::{Digest, Sha256};
@@ -46,6 +47,93 @@ pub fn read_object_payload(
         sink,
         manifest_sha256,
     )?;
+    Ok(())
+}
+
+/// Position to one plaintext member-file range and stream only covering blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaintextFileRangeReadRequest {
+    /// Fixed tape block size in bytes.
+    pub block_size: usize,
+    /// Filemark-delimited tape-file number containing the object.
+    pub tape_file_number: u32,
+    /// First object-local body block containing the member-file data.
+    pub first_chunk_lba: Option<BodyLba>,
+    /// Exact size of the member file.
+    pub file_size_bytes: u64,
+    /// Requested byte offset within the member file.
+    pub range_start: u64,
+    /// Requested byte count.
+    pub range_len: u64,
+}
+
+/// Position to one plaintext member-file range and stream only covering blocks.
+pub fn read_plaintext_file_range(
+    source: &mut dyn BlockSource,
+    request: PlaintextFileRangeReadRequest,
+    out: &mut dyn Write,
+) -> Result<(), FormatError> {
+    let chunk_size_bytes = u64::try_from(request.block_size)
+        .map_err(|_| FormatError::invalid("block size does not fit u64"))?;
+    let plan = plan_plaintext_rao_file_range(
+        request.first_chunk_lba,
+        request.file_size_bytes,
+        chunk_size_bytes,
+        request.range_start,
+        request.range_len,
+    )?;
+    let Some(plan) = plan else {
+        return Ok(());
+    };
+    source.space(i64::from(request.tape_file_number), SpaceKind::Filemarks)?;
+    let skip_blocks = i64::try_from(plan.first_body_lba.0)
+        .map_err(|_| FormatError::invalid("range first_body_lba exceeds SPACE range"))?;
+    if skip_blocks != 0 {
+        source.space(skip_blocks, SpaceKind::Blocks)?;
+    }
+
+    let mut block = vec![0u8; request.block_size];
+    let first_block_offset = usize::try_from(plan.first_block_offset)
+        .map_err(|_| FormatError::invalid("range first block offset does not fit usize"))?;
+    let mut remaining = plan.range_len;
+    for block_index in 0..plan.block_count {
+        let read = source.read_block(&mut block)?;
+        if read != request.block_size {
+            return Err(FormatError::parse(format!(
+                "short range object block: expected {}, got {read}",
+                request.block_size
+            )));
+        }
+        let start = if block_index == 0 {
+            first_block_offset
+        } else {
+            0
+        };
+        let available = request
+            .block_size
+            .checked_sub(start)
+            .ok_or_else(|| FormatError::invalid("range first block offset exceeds block size"))?;
+        let available_u64 = u64::try_from(available)
+            .map_err(|_| FormatError::invalid("range block length does not fit u64"))?;
+        let to_write = usize::try_from(remaining.min(available_u64))
+            .map_err(|_| FormatError::invalid("range chunk length does not fit usize"))?;
+        out.write_all(&block[start..start + to_write])
+            .map_err(|source| FormatError::SourceIo {
+                context: "write range".to_string(),
+                source,
+            })?;
+        remaining -= u64::try_from(to_write)
+            .map_err(|_| FormatError::invalid("range chunk length does not fit u64"))?;
+    }
+    if remaining != 0 {
+        return Err(FormatError::parse(
+            "range read ended before requested bytes were produced",
+        ));
+    }
+    out.flush().map_err(|source| FormatError::SourceIo {
+        context: "flush range".to_string(),
+        source,
+    })?;
     Ok(())
 }
 
@@ -401,5 +489,40 @@ mod tests {
         assert_eq!(payload, b"hello from tape");
         let expected: [u8; 32] = Sha256::digest(b"hello from tape").into();
         assert_eq!(digest, expected);
+    }
+
+    #[test]
+    fn read_plaintext_file_range_streams_only_requested_bytes() {
+        let opts = options(512);
+        let payload = (0..1600)
+            .map(|value| u8::try_from(value % 251).unwrap())
+            .collect::<Vec<_>>();
+        let files = [RemTarFile {
+            path: "camera.raw",
+            file_id: "file-camera",
+            data: payload.as_slice(),
+            mtime: Some("0"),
+            executable: Some(false),
+        }];
+        let mut block_sink = VecBlockSink::new();
+        let layout = write_rem_tar_object(&mut block_sink, &opts, &files).unwrap();
+        let mut source = VecBlockSource::new(block_sink.blocks);
+        let mut range = Vec::new();
+
+        read_plaintext_file_range(
+            &mut source,
+            PlaintextFileRangeReadRequest {
+                block_size: opts.chunk_size,
+                tape_file_number: 0,
+                first_chunk_lba: layout.files[0].first_chunk_lba,
+                file_size_bytes: u64::try_from(payload.len()).unwrap(),
+                range_start: 400,
+                range_len: 700,
+            },
+            &mut range,
+        )
+        .unwrap();
+
+        assert_eq!(range, payload[400..1100]);
     }
 }
