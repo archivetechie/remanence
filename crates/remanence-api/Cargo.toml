@@ -43,5 +43,8 @@ tonic-prost-build.workspace = true
 default = []
 foreign-bru = ["dep:remanence-bru"]
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

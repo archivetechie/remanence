@@ -822,9 +822,12 @@ service ReadSessionService {
   rpc CloseReadSession (CloseReadSessionRequest) returns (ReadSession);
   rpc GetReadSession   (GetReadSessionRequest)   returns (ReadSession);
 
-  // Read a whole object or a byte range within a single file in the object.
-  // The reader resolves (object_id + file_id + byte_range) to BodyLba ranges
-  // via the catalog and issues LOCATE + read.
+  // Read a whole object payload or a byte range from it.
+  // Empty file_id resolves the object's sole payload member and treats
+  // [start_byte, end_byte) as object/payload-relative offsets over opaque
+  // stored bytes. Non-empty file_id resolves that catalog member and treats the
+  // range as member-relative. The daemon does not decrypt or interpret payload
+  // bytes; both-zero range reads the whole payload/member.
   rpc ReadObjectRange  (ReadObjectRangeRequest)  returns (stream BytesChunk);
 
   // Read an entire file from an object.
@@ -863,9 +866,11 @@ message GetReadSessionRequest { bytes session_id = 1; }
 message ReadObjectRangeRequest {
   bytes session_id   = 1;
   bytes object_id    = 2;
+  // Empty = object/payload-relative range over the sole payload member.
+  // Non-empty = member-relative range resolved via the object file catalog.
   bytes file_id      = 3;
-  // Half-open byte range within the file: [start_byte, end_byte).
-  // If both zero, reads the whole file.
+  // Half-open byte range [start_byte, end_byte). If both zero, reads the whole
+  // payload/member. Bytes are opaque; clients perform any decryption.
   uint64 start_byte  = 4;
   uint64 end_byte    = 5;
   // Suggested chunk size for stream framing (server may use a different
