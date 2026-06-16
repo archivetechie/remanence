@@ -1,9 +1,9 @@
-//! Partial-file restore helpers for `rao-v1` encrypted copies.
+//! Partial-file restore helpers for `rao-v1` copies.
 //!
 //! This module bridges catalog file rows (`first_chunk_lba`, `size_bytes`) to
-//! the RAO encrypted-envelope range opener. It keeps file-range validation in
-//! the body-format layer while delegating authentication and decryption to
-//! `remanence-aead`.
+//! the plaintext block planner or RAO encrypted-envelope range opener. It
+//! keeps file-range validation in the body-format layer while delegating
+//! authentication and decryption to `remanence-aead`.
 
 use remanence_aead::{open_inner_range_to_vec, RangeOpenReport, RootKey};
 
@@ -17,6 +17,64 @@ pub struct EncryptedRaoFileRange {
     pub bytes: Vec<u8>,
     /// Authenticated envelope range report.
     pub envelope: RangeOpenReport,
+}
+
+/// Object-local block plan for plaintext RAO file PFR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaintextRaoFileRangePlan {
+    /// First object-local body block to read.
+    pub first_body_lba: BodyLba,
+    /// Number of object blocks that cover the requested range.
+    pub block_count: u64,
+    /// Byte offset inside the first returned block.
+    pub first_block_offset: u64,
+    /// Number of caller-requested file bytes to return.
+    pub range_len: u64,
+}
+
+/// Plan the object-local blocks covering a plaintext RAO member-file byte range.
+///
+/// `first_chunk_lba` and `file_size_bytes` are the per-file manifest/catalog
+/// values. `range_start` and `range_len` address bytes within that member file.
+/// Empty-but-valid ranges return `Ok(None)` because no object blocks need to be
+/// read.
+pub fn plan_plaintext_rao_file_range(
+    first_chunk_lba: Option<BodyLba>,
+    file_size_bytes: u64,
+    chunk_size_bytes: u64,
+    range_start: u64,
+    range_len: u64,
+) -> Result<Option<PlaintextRaoFileRangePlan>, FormatError> {
+    if chunk_size_bytes == 0 {
+        return Err(FormatError::invalid("chunk_size_bytes must be nonzero"));
+    }
+    validate_file_range(file_size_bytes, range_start, range_len)?;
+    if range_len == 0 {
+        return Ok(None);
+    }
+    let first_chunk_lba = first_chunk_lba.ok_or_else(|| {
+        FormatError::invalid("non-empty plaintext file range requires first_chunk_lba")
+    })?;
+    let first_relative_block = range_start / chunk_size_bytes;
+    let range_end = range_start
+        .checked_add(range_len)
+        .ok_or_else(|| FormatError::invalid("file range arithmetic overflow"))?;
+    let last_relative_block = (range_end - 1) / chunk_size_bytes;
+    let block_count = last_relative_block
+        .checked_sub(first_relative_block)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| FormatError::invalid("file range block arithmetic overflow"))?;
+    let first_body_lba = first_chunk_lba
+        .0
+        .checked_add(first_relative_block)
+        .map(BodyLba)
+        .ok_or_else(|| FormatError::invalid("file range body LBA overflow"))?;
+    Ok(Some(PlaintextRaoFileRangePlan {
+        first_body_lba,
+        block_count,
+        first_block_offset: range_start % chunk_size_bytes,
+        range_len,
+    }))
 }
 
 /// Read and authenticate a member-file byte range from an encrypted RAO object.
@@ -54,7 +112,8 @@ pub fn read_encrypted_rao_file_range_to_vec(
     Ok(EncryptedRaoFileRange { bytes, envelope })
 }
 
-fn validate_file_range(
+/// Validate a member-file byte range.
+pub fn validate_file_range(
     file_size_bytes: u64,
     range_start: u64,
     range_len: u64,
@@ -292,5 +351,51 @@ mod tests {
         );
         assert_eq!(range.envelope.plaintext_len, 0);
         assert_eq!(range.envelope.first_chunk, None);
+    }
+
+    #[test]
+    fn plaintext_file_range_plan_maps_span_to_body_blocks() {
+        let plan = plan_plaintext_rao_file_range(Some(BodyLba(8)), 1400, 512, 400, 500).unwrap();
+
+        assert_eq!(
+            plan,
+            Some(PlaintextRaoFileRangePlan {
+                first_body_lba: BodyLba(8),
+                block_count: 2,
+                first_block_offset: 400,
+                range_len: 500,
+            })
+        );
+    }
+
+    #[test]
+    fn plaintext_file_range_plan_skips_blocks_before_range() {
+        let plan = plan_plaintext_rao_file_range(Some(BodyLba(8)), 1400, 512, 800, 300).unwrap();
+
+        assert_eq!(
+            plan,
+            Some(PlaintextRaoFileRangePlan {
+                first_body_lba: BodyLba(9),
+                block_count: 2,
+                first_block_offset: 288,
+                range_len: 300,
+            })
+        );
+    }
+
+    #[test]
+    fn plaintext_file_range_plan_accepts_empty_range_without_lba() {
+        assert_eq!(
+            plan_plaintext_rao_file_range(None, 0, 512, 0, 0).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn plaintext_file_range_plan_rejects_past_eof_range() {
+        let err =
+            plan_plaintext_rao_file_range(Some(BodyLba(8)), 1400, 512, 1300, 101).unwrap_err();
+
+        assert!(matches!(err, FormatError::InvalidInput(_)));
     }
 }

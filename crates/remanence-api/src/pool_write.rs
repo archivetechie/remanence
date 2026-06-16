@@ -30,9 +30,9 @@ use remanence_parity::{
 };
 use remanence_state::{
     validate_tape_pool_capacity_invariant, watermark_floor_bytes, CatalogIndex,
-    NativeObjectCopyProjectionInput, NativeObjectProjectionInput, StateError,
-    TapeJournalIndexInput, TapePoolConfig, TapeRecord, OBJECT_COPY_REPRESENTATION_ENCRYPTED,
-    OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+    NativeObjectCopyProjectionInput, NativeObjectFileProjectionInput, NativeObjectProjectionInput,
+    StateError, TapeJournalIndexInput, TapePoolConfig, TapeRecord,
+    OBJECT_COPY_REPRESENTATION_ENCRYPTED, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
 };
 use remanence_stream::{
     plan_prepared_object, prepare_regular_file, write_prepared_object_to_parity,
@@ -1339,6 +1339,12 @@ fn commit_pool_write(
         } else {
             None
         };
+    let file_projections = write_report
+        .catalog
+        .files
+        .iter()
+        .map(native_object_file_projection)
+        .collect::<Vec<_>>();
     state.project_native_object_and_committed_tape_file_bundle(
         NativeObjectProjectionInput {
             object_id: write_report.catalog.object.object_id.clone(),
@@ -1349,6 +1355,7 @@ fn commit_pool_write(
             metadata_hash,
             created_at_utc: Some(prepared.write_timestamp.clone()),
         },
+        &file_projections,
         &[NativeObjectCopyProjectionInput {
             object_id: write_report.catalog.object_copy.object_id.clone(),
             tape_uuid: selected.tape_uuid,
@@ -1376,6 +1383,20 @@ fn commit_pool_write(
     )?;
     seal_selected_tape_if_needed(state, selected, pool_cfg, hardware_early_warning)?;
     Ok(())
+}
+
+fn native_object_file_projection(file: &FileCatalogProjection) -> NativeObjectFileProjectionInput {
+    NativeObjectFileProjectionInput {
+        object_id: file.object_id.clone(),
+        file_id: file.file_id.clone(),
+        path: file.path.clone(),
+        size_bytes: file.size_bytes,
+        file_sha256: file.file_sha256.to_vec(),
+        first_chunk_lba: file.first_chunk_lba.map(|lba| lba.0),
+        chunk_count: file.chunk_count,
+        mtime: file.mtime.clone(),
+        executable: file.executable,
+    }
 }
 
 fn pool_write_result(

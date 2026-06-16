@@ -33,7 +33,10 @@ pub use model::{
     RemTarFileStream, RemTarObjectOptions, RemTarXattrs, DEFAULT_CHUNK_SIZE, FORMAT_ID,
     MANIFEST_PATH, SCHEMA_VERSION, SCHEMA_VERSION_XATTRS, TAR_RECORD_SIZE,
 };
-pub use pfr::{read_encrypted_rao_file_range_to_vec, EncryptedRaoFileRange};
+pub use pfr::{
+    plan_plaintext_rao_file_range, read_encrypted_rao_file_range_to_vec, validate_file_range,
+    EncryptedRaoFileRange, PlaintextRaoFileRangePlan,
+};
 pub use reader::{
     read_encrypted_rao_object, read_encrypted_rao_object_with_manifest_anchor,
     read_encrypted_rao_object_with_mode, read_encrypted_rao_object_with_mode_and_manifest_anchor,

@@ -27,8 +27,9 @@ use remanence_format::{
 };
 use remanence_state::{
     AuditActor, AuditEvent, AuditEventRecord, AuditSubject, CatalogIndex, CatalogUnitFilter,
-    CatalogUnitRecord, FileAuditLog, NativeObjectCopyRecord, NativeObjectRecord, OperationRecord,
-    RemConfig, SourceLayer, StateError, TapeFileRecord, TapePoolConfig, TapePoolRecord, TapeRecord,
+    CatalogUnitRecord, FileAuditLog, NativeObjectCopyRecord, NativeObjectFileRecord,
+    NativeObjectRecord, OperationRecord, RemConfig, SourceLayer, StateError, TapeFileRecord,
+    TapePoolConfig, TapePoolRecord, TapeRecord,
 };
 use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
@@ -929,9 +930,24 @@ impl pb::catalog_server::Catalog for CatalogService {
         request: Request<pb::ListFilesInObjectRequest>,
     ) -> Result<Response<pb::ListFilesInObjectResponse>, Status> {
         authorize_request(&request, AuthPermission::Read)?;
-        Err(Status::unimplemented(
-            "body-format file listing is not wired in this slice",
-        ))
+        let request = request.into_inner();
+        ensure_unpaged(request.page_token.as_ref(), request.page_size)?;
+        let object_id = decode_object_id(request.object_id.as_slice())?;
+        let index = self.state.index()?;
+        index
+            .get_native_object(object_id.as_str())
+            .map_err(status_from_state_error)?
+            .ok_or_else(|| Status::not_found("object not found"))?;
+        let files = index
+            .list_native_object_files(object_id.as_str())
+            .map_err(status_from_state_error)?
+            .into_iter()
+            .map(native_object_file_to_proto)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Response::new(pb::ListFilesInObjectResponse {
+            files,
+            next_page_token: None,
+        }))
     }
 
     async fn get_file(
@@ -939,9 +955,36 @@ impl pb::catalog_server::Catalog for CatalogService {
         request: Request<pb::GetFileRequest>,
     ) -> Result<Response<pb::FileRecord>, Status> {
         authorize_request(&request, AuthPermission::Read)?;
-        Err(Status::unimplemented(
-            "body-format file lookup is not wired in this slice",
-        ))
+        let request = request.into_inner();
+        let object_id = decode_object_id(request.object_id.as_slice())?;
+        let index = self.state.index()?;
+        index
+            .get_native_object(object_id.as_str())
+            .map_err(status_from_state_error)?
+            .ok_or_else(|| Status::not_found("object not found"))?;
+        let file = match request
+            .key
+            .ok_or_else(|| Status::invalid_argument("missing file lookup key"))?
+        {
+            pb::get_file_request::Key::FileId(file_id) => {
+                let file_id = decode_text_id(file_id.as_slice(), "file_id")?;
+                index
+                    .get_native_object_file(object_id.as_str(), file_id.as_str())
+                    .map_err(status_from_state_error)?
+            }
+            pb::get_file_request::Key::Path(path) => {
+                if path.is_empty() {
+                    return Err(Status::invalid_argument("path must not be empty"));
+                }
+                index
+                    .list_native_object_files(object_id.as_str())
+                    .map_err(status_from_state_error)?
+                    .into_iter()
+                    .find(|file| file.path == path)
+            }
+        }
+        .ok_or_else(|| Status::not_found("object file not found"))?;
+        Ok(Response::new(native_object_file_to_proto(file)?))
     }
 
     type EnumerateUnitsStream =
@@ -1322,18 +1365,30 @@ impl pb::read_session_service_server::ReadSessionService for ReadSessionApi {
     ) -> Result<Response<Self::ReadObjectRangeStream>, Status> {
         authorize_request(&request, AuthPermission::ReadTape)?;
         let request = request.into_inner();
-        reject_file_scoped_read(request.file_id.as_slice())?;
-        if request.start_byte != 0 || request.end_byte != 0 {
-            return Err(Status::unimplemented("ranged reads are S5b"));
-        }
-        let stream = self
-            .dispatch_read_file(
+        let stream = if request.file_id.is_empty() {
+            if request.start_byte != 0 || request.end_byte != 0 {
+                return Err(Status::invalid_argument(
+                    "file_id is required for ranged reads",
+                ));
+            }
+            self.dispatch_read_file(
                 request.session_id,
                 request.object_id,
                 request.file_id,
                 request.stream_chunk_bytes,
             )
-            .await?;
+            .await?
+        } else {
+            self.dispatch_read_object_range(
+                request.session_id,
+                request.object_id,
+                request.file_id,
+                request.start_byte,
+                request.end_byte,
+                request.stream_chunk_bytes,
+            )
+            .await?
+        };
         Ok(Response::new(stream))
     }
 
@@ -1345,15 +1400,25 @@ impl pb::read_session_service_server::ReadSessionService for ReadSessionApi {
     ) -> Result<Response<Self::ReadFileStream>, Status> {
         authorize_request(&request, AuthPermission::ReadTape)?;
         let request = request.into_inner();
-        reject_file_scoped_read(request.file_id.as_slice())?;
-        let stream = self
-            .dispatch_read_file(
+        let stream = if request.file_id.is_empty() {
+            self.dispatch_read_file(
                 request.session_id,
                 request.object_id,
                 request.file_id,
                 request.stream_chunk_bytes,
             )
-            .await?;
+            .await?
+        } else {
+            self.dispatch_read_object_range(
+                request.session_id,
+                request.object_id,
+                request.file_id,
+                0,
+                0,
+                request.stream_chunk_bytes,
+            )
+            .await?
+        };
         Ok(Response::new(stream))
     }
 }
@@ -1376,6 +1441,36 @@ impl ReadSessionApi {
             object_id,
             file_id,
             stream_chunk_bytes,
+            chunk_tx,
+        )
+        .await?;
+        Ok(Box::pin(ReceiverStream::new(chunk_rx)))
+    }
+
+    async fn dispatch_read_object_range(
+        &self,
+        session_id: Vec<u8>,
+        object_id: Vec<u8>,
+        file_id: Vec<u8>,
+        start_byte: u64,
+        end_byte: u64,
+        stream_chunk_bytes: u32,
+    ) -> Result<BytesChunkStream, Status> {
+        let session_id = decode_uuid_bytes(&session_id, "session_id")?;
+        let session_id = Uuid::from_bytes(session_id);
+        let object_id = decode_object_id(&object_id)?;
+        let file_id = decode_text_id(&file_id, "file_id")?;
+        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Result<pb::BytesChunk, Status>>(16);
+        crate::mount::read_object_range(
+            &self.state,
+            crate::mount::ReadObjectRangeDispatch {
+                session_id,
+                object_id,
+                file_id,
+                start_byte,
+                end_byte,
+                stream_chunk_bytes,
+            },
             chunk_tx,
         )
         .await?;
@@ -1471,16 +1566,6 @@ fn archive_path_from_start(start: &pb::AppendObjectStart) -> PathBuf {
                 PathBuf::from(start.caller_object_id.clone())
             }
         })
-}
-
-fn reject_file_scoped_read(file_id: &[u8]) -> Result<(), Status> {
-    if file_id.is_empty() {
-        Ok(())
-    } else {
-        Err(Status::unimplemented(
-            "file_id-scoped reads are not wired in this one-file vertical slice",
-        ))
-    }
 }
 
 fn ensure_enumerate_objects_scope_is_all(
@@ -1950,6 +2035,19 @@ fn tape_file_to_proto(record: TapeFileRecord) -> Result<pb::TapeFile, Status> {
     })
 }
 
+fn native_object_file_to_proto(record: NativeObjectFileRecord) -> Result<pb::FileRecord, Status> {
+    Ok(pb::FileRecord {
+        object_id: encode_uuid_text(record.object_id.as_str())?,
+        file_id: record.file_id.into_bytes(),
+        path: record.path,
+        size_bytes: record.size_bytes,
+        file_sha256: record.file_sha256,
+        first_chunk_body_lba: record.first_chunk_lba.unwrap_or_default(),
+        chunk_count: u32::try_from(record.chunk_count)
+            .map_err(|_| Status::internal("object file chunk_count does not fit u32"))?,
+    })
+}
+
 fn tape_pool_to_proto(record: TapePoolRecord) -> pb::TapePool {
     pb::TapePool {
         pool_id: record.pool_id,
@@ -2299,9 +2397,9 @@ mod tests {
     use remanence_state::{
         watermark_floor_bytes, AuditActor, AuditEvent, AuditRecord, AuditSubject,
         ForeignArchiveProjectionInput, NativeObjectCopyProjectionInput,
-        NativeObjectProjectionInput, PoolSelectionPolicyName, ProvisionTapeInput, SourceLayer,
-        TapeJournalIndexInput, TapePoolProjectionInput, OBJECT_COPY_REPRESENTATION_ENCRYPTED,
-        OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+        NativeObjectFileProjectionInput, NativeObjectProjectionInput, PoolSelectionPolicyName,
+        ProvisionTapeInput, SourceLayer, TapeJournalIndexInput, TapePoolProjectionInput,
+        OBJECT_COPY_REPRESENTATION_ENCRYPTED, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
     };
     use remanence_stream::{restore_object_to_directory, FilesystemRestoreOptions};
     use sha2::{Digest, Sha256};
@@ -3149,6 +3247,80 @@ BCw3Wyv2UWY=
         ApiState::new(index)
     }
 
+    fn populated_state_with_file_catalog() -> ApiState {
+        let state = populated_state();
+        let scheme = ParityScheme {
+            id: SchemeId::new_static("rs-test"),
+            data_blocks_per_stripe: 2,
+            parity_blocks_per_stripe: 1,
+            stripes_per_neighborhood: 3,
+        };
+        let mut index = CatalogIndex::open(state.index_path.as_ref()).expect("open test index");
+        index
+            .project_native_object_and_committed_tape_file_bundle(
+                NativeObjectProjectionInput {
+                    object_id: OBJECT_ID_TEXT.to_string(),
+                    caller_object_id: Some("caller-1".to_string()),
+                    body_format: "rao-v1".to_string(),
+                    logical_size_bytes: Some(17),
+                    content_hash: Some(vec![7u8; 32]),
+                    metadata_hash: None,
+                    created_at_utc: Some("2026-05-28T12:00:00Z".to_string()),
+                },
+                &[NativeObjectFileProjectionInput {
+                    object_id: OBJECT_ID_TEXT.to_string(),
+                    file_id: "file-camera".to_string(),
+                    path: "payload.bin".to_string(),
+                    size_bytes: 17,
+                    file_sha256: vec![7u8; 32],
+                    first_chunk_lba: Some(2),
+                    chunk_count: 1,
+                    mtime: Some("0".to_string()),
+                    executable: Some(false),
+                }],
+                &[NativeObjectCopyProjectionInput {
+                    object_id: OBJECT_ID_TEXT.to_string(),
+                    tape_uuid: TAPE_UUID,
+                    tape_file_number: 4,
+                    first_body_lba: 0,
+                    first_parity_data_ordinal: Some(0),
+                    protected_until_ordinal: Some(8),
+                    status: "committed".to_string(),
+                    representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+                    key_id: None,
+                    metadata_frame_len: None,
+                    plaintext_digest: Some(vec![0x51; 32]),
+                    stored_digest: Some(vec![0x51; 32]),
+                }],
+                TapeJournalIndexInput {
+                    tape_uuid: TAPE_UUID,
+                    block_size: 4096,
+                    scheme: Some(scheme),
+                    journal_offset_bytes: 99,
+                },
+                &CommittedBundle {
+                    kind: CommittedBundleKind::Object,
+                    entries: vec![TapeFileEntry {
+                        tape_file_number: 4,
+                        kind: TapeFileKind::Object,
+                        block_count: 5,
+                        physical_start_hint: Some(0),
+                        object_id: Some(OBJECT_ID_TEXT.to_string()),
+                        first_parity_data_ordinal: Some(0),
+                        epoch_id: None,
+                        protected_ordinal_start: None,
+                        protected_ordinal_end_exclusive: None,
+                        canonical_metadata_hash: None,
+                        bootstrap_object_row: None,
+                    }],
+                    highest_protected_ordinal: 5,
+                    total_committed_ordinals: 5,
+                },
+            )
+            .expect("populate object file rows");
+        state
+    }
+
     fn empty_pool_state() -> ApiState {
         pool_state_with_tapes(&[TAPE_UUID])
     }
@@ -3834,6 +4006,25 @@ BCw3Wyv2UWY=
             Some(copy.pool_id.as_str())
         );
         assert_eq!(committed.copies[0].first_body_lba, copy.first_body_lba);
+        let projected_file = &result.write_report.catalog.files[0];
+        let committed_file = index
+            .get_native_object_file(
+                result.object.object_id_text().as_str(),
+                projected_file.file_id.as_str(),
+            )
+            .expect("query committed object file")
+            .expect("committed object file exists");
+        assert_eq!(committed_file.path, "payload.bin");
+        assert_eq!(
+            committed_file.size_bytes,
+            u64::try_from(payload.len()).expect("payload length fits u64")
+        );
+        assert_eq!(committed_file.file_sha256, expected_hash);
+        assert_eq!(
+            committed_file.first_chunk_lba,
+            projected_file.first_chunk_lba.map(|lba| lba.0)
+        );
+        assert_eq!(committed_file.chunk_count, projected_file.chunk_count);
 
         let object_block_start = 1usize;
         let object_block_count = usize::try_from(result.write_report.object_close.data_block_count)
@@ -5211,6 +5402,56 @@ BCw3Wyv2UWY=
     }
 
     #[tokio::test]
+    async fn catalog_lists_and_fetches_files_in_native_object() {
+        let service = populated_state_with_file_catalog().catalog_service();
+
+        let files = pb::catalog_server::Catalog::list_files_in_object(
+            &service,
+            Request::new(pb::ListFilesInObjectRequest {
+                object_id: object_uuid().as_bytes().to_vec(),
+                page_token: None,
+                page_size: 0,
+            }),
+        )
+        .await
+        .expect("list object files")
+        .into_inner();
+        assert_eq!(files.files.len(), 1);
+        let file = &files.files[0];
+        assert_eq!(file.object_id, object_uuid().as_bytes().to_vec());
+        assert_eq!(file.file_id, b"file-camera");
+        assert_eq!(file.path, "payload.bin");
+        assert_eq!(file.size_bytes, 17);
+        assert_eq!(file.file_sha256, vec![7u8; 32]);
+        assert_eq!(file.first_chunk_body_lba, 2);
+        assert_eq!(file.chunk_count, 1);
+
+        let by_path = pb::catalog_server::Catalog::get_file(
+            &service,
+            Request::new(pb::GetFileRequest {
+                object_id: object_uuid().as_bytes().to_vec(),
+                key: Some(pb::get_file_request::Key::Path("payload.bin".to_string())),
+            }),
+        )
+        .await
+        .expect("get file by path")
+        .into_inner();
+        assert_eq!(by_path, *file);
+
+        let by_id = pb::catalog_server::Catalog::get_file(
+            &service,
+            Request::new(pb::GetFileRequest {
+                object_id: object_uuid().as_bytes().to_vec(),
+                key: Some(pb::get_file_request::Key::FileId(b"file-camera".to_vec())),
+            }),
+        )
+        .await
+        .expect("get file by id")
+        .into_inner();
+        assert_eq!(by_id, *file);
+    }
+
+    #[tokio::test]
     async fn catalog_enumerates_and_fetches_native_objects() {
         let service = populated_state().catalog_service();
         let mut stream = pb::catalog_server::Catalog::enumerate_objects(
@@ -5382,41 +5623,7 @@ BCw3Wyv2UWY=
     }
 
     #[tokio::test]
-    async fn read_session_rejects_file_id_until_file_lookup_is_wired() {
-        let service = populated_state().read_session_service();
-        let err = pb::read_session_service_server::ReadSessionService::read_object_range(
-            &service,
-            Request::new(pb::ReadObjectRangeRequest {
-                session_id: Uuid::new_v4().as_bytes().to_vec(),
-                object_id: object_uuid().as_bytes().to_vec(),
-                file_id: vec![1],
-                start_byte: 0,
-                end_byte: 0,
-                stream_chunk_bytes: 0,
-            }),
-        )
-        .await
-        .err()
-        .expect("file scoped range read must be rejected");
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
-
-        let err = pb::read_session_service_server::ReadSessionService::read_file(
-            &service,
-            Request::new(pb::ReadFileRequest {
-                session_id: Uuid::new_v4().as_bytes().to_vec(),
-                object_id: object_uuid().as_bytes().to_vec(),
-                file_id: vec![1],
-                stream_chunk_bytes: 0,
-            }),
-        )
-        .await
-        .err()
-        .expect("file read must be rejected");
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
-    }
-
-    #[tokio::test]
-    async fn read_object_range_rejects_partial_range_in_s5a() {
+    async fn read_object_range_requires_file_id_for_partial_range() {
         let service = populated_state().read_session_service();
         let err = pb::read_session_service_server::ReadSessionService::read_object_range(
             &service,
@@ -5431,8 +5638,159 @@ BCw3Wyv2UWY=
         )
         .await
         .err()
-        .expect("partial range read must be rejected");
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        .expect("partial range read without file_id must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn read_object_range_dispatches_file_scoped_range_to_drive_actor() {
+        let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
+        let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
+        let reservations = Arc::new(HashMap::from([(0x0101, AtomicBool::new(true))]));
+        let pool = crate::write_owner::DrivePool::new(
+            changer_tx,
+            HashMap::from([(0x0101, drive_tx)]),
+            reservations,
+        );
+        let session_id = Uuid::new_v4();
+        pool.record_session(
+            session_id,
+            crate::write_owner::MountedSession {
+                bay: 0x0101,
+                home_slot: None,
+                tape_uuid: TAPE_UUID,
+            },
+        );
+        let mut state = populated_state();
+        state.drive_pool = Some(pool);
+        let service = state.read_session_service();
+
+        let drive_task = tokio::spawn(async move {
+            let command = drive_rx.recv().await.expect("drive command");
+            let crate::write_owner::DriveCommand::ReadObjectRange {
+                session_id: got_session_id,
+                object_id,
+                file_id,
+                start_byte,
+                end_byte,
+                stream_chunk_bytes,
+                chunk_tx,
+            } = command
+            else {
+                panic!("expected ReadObjectRange command");
+            };
+            assert_eq!(got_session_id, session_id);
+            assert_eq!(object_id, OBJECT_ID_TEXT);
+            assert_eq!(file_id, "file-camera");
+            assert_eq!(start_byte, 5);
+            assert_eq!(end_byte, 9);
+            assert_eq!(stream_chunk_bytes, 3);
+            chunk_tx
+                .send(Ok(pb::BytesChunk {
+                    data: b"nge".to_vec(),
+                    is_last: false,
+                }))
+                .await
+                .expect("send data chunk");
+            chunk_tx
+                .send(Ok(pb::BytesChunk {
+                    data: Vec::new(),
+                    is_last: true,
+                }))
+                .await
+                .expect("send last chunk");
+        });
+
+        let mut stream = pb::read_session_service_server::ReadSessionService::read_object_range(
+            &service,
+            Request::new(pb::ReadObjectRangeRequest {
+                session_id: session_id.as_bytes().to_vec(),
+                object_id: object_uuid().as_bytes().to_vec(),
+                file_id: b"file-camera".to_vec(),
+                start_byte: 5,
+                end_byte: 9,
+                stream_chunk_bytes: 3,
+            }),
+        )
+        .await
+        .expect("range stream")
+        .into_inner();
+
+        let mut got = Vec::new();
+        let mut saw_last = false;
+        while let Some(item) = stream.next().await {
+            let chunk = item.expect("chunk");
+            got.extend_from_slice(&chunk.data);
+            saw_last |= chunk.is_last;
+        }
+        drive_task.await.expect("drive task");
+        assert_eq!(got, b"nge");
+        assert!(saw_last);
+    }
+
+    #[tokio::test]
+    async fn read_file_dispatches_file_id_as_whole_file_range() {
+        let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
+        let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
+        let reservations = Arc::new(HashMap::from([(0x0101, AtomicBool::new(true))]));
+        let pool = crate::write_owner::DrivePool::new(
+            changer_tx,
+            HashMap::from([(0x0101, drive_tx)]),
+            reservations,
+        );
+        let session_id = Uuid::new_v4();
+        pool.record_session(
+            session_id,
+            crate::write_owner::MountedSession {
+                bay: 0x0101,
+                home_slot: None,
+                tape_uuid: TAPE_UUID,
+            },
+        );
+        let mut state = populated_state();
+        state.drive_pool = Some(pool);
+        let service = state.read_session_service();
+
+        let drive_task = tokio::spawn(async move {
+            let command = drive_rx.recv().await.expect("drive command");
+            let crate::write_owner::DriveCommand::ReadObjectRange {
+                file_id,
+                start_byte,
+                end_byte,
+                chunk_tx,
+                ..
+            } = command
+            else {
+                panic!("expected ReadObjectRange command");
+            };
+            assert_eq!(file_id, "file-camera");
+            assert_eq!(start_byte, 0);
+            assert_eq!(end_byte, 0);
+            chunk_tx
+                .send(Ok(pb::BytesChunk {
+                    data: Vec::new(),
+                    is_last: true,
+                }))
+                .await
+                .expect("send last chunk");
+        });
+
+        let mut stream = pb::read_session_service_server::ReadSessionService::read_file(
+            &service,
+            Request::new(pb::ReadFileRequest {
+                session_id: session_id.as_bytes().to_vec(),
+                object_id: object_uuid().as_bytes().to_vec(),
+                file_id: b"file-camera".to_vec(),
+                stream_chunk_bytes: 0,
+            }),
+        )
+        .await
+        .expect("read file stream")
+        .into_inner();
+
+        assert!(stream.next().await.expect("last").expect("chunk").is_last);
+        assert!(stream.next().await.is_none());
+        drive_task.await.expect("drive task");
     }
 
     #[tokio::test]

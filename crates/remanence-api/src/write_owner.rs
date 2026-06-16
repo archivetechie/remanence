@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use ciborium::value::Value as CborValue;
 use remanence_format::error::FormatError;
+use remanence_format::model::BodyLba;
 use remanence_library::{
     BlockSize, ChangerHandle, DiscoveryReport, DriveHandle, DriveHandleSink, DriveHandleSource,
     StaticAllowlist, TapeConfig,
@@ -20,7 +21,10 @@ use remanence_parity::{
     scan_reconstruct_filemark_map, DriveHandleRawSource, FilemarkMap, ParityError, TapeFileEntry,
     TapeFileKind,
 };
-use remanence_state::{AuditActor, AuditEvent, CatalogIndex, TapePoolConfig};
+use remanence_state::{
+    AuditActor, AuditEvent, CatalogIndex, TapePoolConfig, OBJECT_COPY_REPRESENTATION_ENCRYPTED,
+    OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+};
 use remanence_stream::StreamingError;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -106,6 +110,15 @@ pub(crate) enum DriveCommand {
         session_id: Uuid,
         object_id: String,
         file_id: Vec<u8>,
+        stream_chunk_bytes: u32,
+        chunk_tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
+    },
+    ReadObjectRange {
+        session_id: Uuid,
+        object_id: String,
+        file_id: String,
+        start_byte: u64,
+        end_byte: u64,
         stream_chunk_bytes: u32,
         chunk_tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
     },
@@ -614,7 +627,8 @@ fn drive_loop(
             DriveCommand::Close { reply, .. } | DriveCommand::Abort { reply, .. } => {
                 let _ = reply.send(Err(Status::not_found("no active write session")));
             }
-            DriveCommand::ReadFile { chunk_tx, .. } => {
+            DriveCommand::ReadFile { chunk_tx, .. }
+            | DriveCommand::ReadObjectRange { chunk_tx, .. } => {
                 let _ = chunk_tx.blocking_send(Err(Status::not_found("no active read session")));
             }
             DriveCommand::CloseRead { reply, .. } | DriveCommand::GetRead { reply, .. } => {
@@ -650,7 +664,8 @@ fn drain_failed_drive_commands(mut rx: mpsc::Receiver<DriveCommand>, message: St
             DriveCommand::CloseRead { reply, .. } | DriveCommand::GetRead { reply, .. } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
-            DriveCommand::ReadFile { chunk_tx, .. } => {
+            DriveCommand::ReadFile { chunk_tx, .. }
+            | DriveCommand::ReadObjectRange { chunk_tx, .. } => {
                 let _ = chunk_tx.blocking_send(Err(Status::internal(message.clone())));
             }
         }
@@ -937,7 +952,8 @@ fn handle_drive_open_write(
                     "write session already active",
                 )));
             }
-            DriveCommand::ReadFile { chunk_tx, .. } => {
+            DriveCommand::ReadFile { chunk_tx, .. }
+            | DriveCommand::ReadObjectRange { chunk_tx, .. } => {
                 let _ = chunk_tx.blocking_send(Err(Status::failed_precondition(
                     "active session is a write session",
                 )));
@@ -1067,17 +1083,60 @@ fn handle_drive_open_read(
                         chunk_tx.blocking_send(Err(Status::not_found("read session not found")));
                     continue;
                 }
-                if !file_id.is_empty() {
-                    let _ = chunk_tx.blocking_send(Err(Status::unimplemented(
-                        "file_id-scoped reads are not wired in this one-file vertical slice",
-                    )));
+                let result = if file_id.is_empty() {
+                    stream_one_object(
+                        index,
+                        drive,
+                        &tape_uuid,
+                        object_id.as_str(),
+                        stream_chunk_bytes,
+                        chunk_tx.clone(),
+                    )
+                } else {
+                    String::from_utf8(file_id)
+                        .map_err(|err| {
+                            Status::invalid_argument(format!("file_id is not utf-8: {err}"))
+                        })
+                        .and_then(|file_id| {
+                            stream_one_file_range(
+                                index,
+                                drive,
+                                &tape_uuid,
+                                object_id.as_str(),
+                                file_id.as_str(),
+                                0,
+                                0,
+                                stream_chunk_bytes,
+                                chunk_tx.clone(),
+                            )
+                        })
+                };
+                if let Err(status) = result {
+                    let _ = chunk_tx.blocking_send(Err(status));
+                }
+            }
+            DriveCommand::ReadObjectRange {
+                session_id: requested,
+                object_id,
+                file_id,
+                start_byte,
+                end_byte,
+                stream_chunk_bytes,
+                chunk_tx,
+            } => {
+                if requested != session_id {
+                    let _ =
+                        chunk_tx.blocking_send(Err(Status::not_found("read session not found")));
                     continue;
                 }
-                if let Err(status) = stream_one_object(
+                if let Err(status) = stream_one_file_range(
                     index,
                     drive,
                     &tape_uuid,
                     object_id.as_str(),
+                    file_id.as_str(),
+                    start_byte,
+                    end_byte,
                     stream_chunk_bytes,
                     chunk_tx.clone(),
                 ) {
@@ -1900,6 +1959,123 @@ fn stream_one_object(
         .finish()
         .map_err(|err| Status::internal(format!("finish read stream: {err}")))?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_one_file_range(
+    index: &mut CatalogIndex,
+    drive: &mut DriveHandle,
+    tape_uuid: &[u8; 16],
+    object_id: &str,
+    file_id: &str,
+    start_byte: u64,
+    end_byte: u64,
+    stream_chunk_bytes: u32,
+    chunk_tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
+) -> Result<(), Status> {
+    let object = index
+        .get_native_object(object_id)
+        .map_err(status_from_state_error)?;
+    let object = object.ok_or_else(|| Status::not_found("object not found"))?;
+    let file = index
+        .get_native_object_file(object_id, file_id)
+        .map_err(status_from_state_error)?;
+    let file = file.ok_or_else(|| Status::not_found("object file not found"))?;
+    let copy = object
+        .copies
+        .iter()
+        .find(|copy| copy.tape_uuid.as_slice() == tape_uuid)
+        .ok_or_else(|| {
+            Status::failed_precondition("object is not on the tape pinned by this read session")
+        })?;
+    let (range_start, range_len) = requested_file_range(file.size_bytes, start_byte, end_byte)?;
+    if copy.representation == OBJECT_COPY_REPRESENTATION_ENCRYPTED {
+        return Err(Status::failed_precondition(
+            "encrypted ranged reads require daemon key material; no key resolver is configured",
+        ));
+    }
+    if copy.representation != OBJECT_COPY_REPRESENTATION_PLAINTEXT {
+        return Err(Status::failed_precondition(format!(
+            "unsupported object copy representation {}",
+            copy.representation
+        )));
+    }
+
+    let tape_files = index
+        .list_tape_files(tape_uuid)
+        .map_err(status_from_state_error)?;
+    let tape_file = tape_files
+        .iter()
+        .find(|tape_file| {
+            tape_file.tape_file_number == copy.tape_file_number
+                && tape_file.kind == "object"
+                && tape_file.object_id.as_deref() == Some(object_id)
+        })
+        .ok_or_else(|| Status::not_found("object tape file not in catalog"))?;
+    let tape = index
+        .get_tape(tape_uuid)
+        .map_err(status_from_state_error)?
+        .ok_or_else(|| Status::not_found("tape not found"))?;
+    let block_size = tape
+        .block_size
+        .ok_or_else(|| Status::internal("tape block size unknown"))?;
+    let block_size_usize = usize::try_from(block_size)
+        .map_err(|_| Status::internal("tape block size does not fit usize"))?;
+
+    verify_loaded_tape_identity(drive, tape_uuid)?;
+    let current_cfg = drive
+        .read_config()
+        .map_err(|err| Status::internal(format!("read drive config: {err}")))?;
+    let block_size_u32 = u32::try_from(block_size)
+        .map_err(|_| Status::internal("tape block size does not fit u32"))?;
+    drive
+        .write_config(fixed_no_compression_config(current_cfg, block_size_u32))
+        .map_err(|err| Status::internal(format!("set fixed-block config: {err}")))?;
+
+    let mut source = DriveHandleSource(drive);
+    let mut writer = if stream_chunk_bytes == 0 {
+        crate::read_core::ChannelWriter::new(chunk_tx)
+    } else {
+        crate::read_core::ChannelWriter::with_chunk_size(chunk_tx, stream_chunk_bytes as usize)
+    };
+    crate::read_core::read_plaintext_file_range(
+        &mut source,
+        crate::read_core::PlaintextFileRangeReadRequest {
+            block_size: block_size_usize,
+            tape_file_number: tape_file.tape_file_number,
+            first_chunk_lba: file.first_chunk_lba.map(BodyLba),
+            file_size_bytes: file.size_bytes,
+            range_start,
+            range_len,
+        },
+        &mut writer,
+    )
+    .map_err(status_from_file_range_error)?;
+    writer
+        .finish()
+        .map_err(|err| Status::internal(format!("finish read stream: {err}")))?;
+    Ok(())
+}
+
+fn requested_file_range(
+    file_size_bytes: u64,
+    start_byte: u64,
+    end_byte: u64,
+) -> Result<(u64, u64), Status> {
+    if start_byte == 0 && end_byte == 0 {
+        return Ok((0, file_size_bytes));
+    }
+    let range_len = end_byte.checked_sub(start_byte).ok_or_else(|| {
+        Status::invalid_argument("end_byte must be greater than or equal to start_byte")
+    })?;
+    Ok((start_byte, range_len))
+}
+
+fn status_from_file_range_error(err: FormatError) -> Status {
+    match err {
+        FormatError::InvalidInput(message) => Status::invalid_argument(message),
+        other => Status::internal(format!("read object range: {other}")),
+    }
 }
 
 fn verify_loaded_tape_identity(
