@@ -14,16 +14,15 @@ use ciborium::value::Value as CborValue;
 use remanence_format::error::FormatError;
 use remanence_format::model::BodyLba;
 use remanence_library::{
-    BlockSize, ChangerHandle, DiscoveryReport, DriveHandle, DriveHandleSink, DriveHandleSource,
-    StaticAllowlist, TapeConfig,
+    BlockSize, BlockSource, ChangerHandle, DiscoveryReport, DriveHandle, DriveHandleSink,
+    DriveHandleSource, StaticAllowlist, TapeConfig,
 };
 use remanence_parity::{
     scan_reconstruct_filemark_map, DriveHandleRawSource, FilemarkMap, ParityError, TapeFileEntry,
     TapeFileKind,
 };
 use remanence_state::{
-    AuditActor, AuditEvent, CatalogIndex, TapePoolConfig, OBJECT_COPY_REPRESENTATION_ENCRYPTED,
-    OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+    AuditActor, AuditEvent, CatalogIndex, NativeObjectFileRecord, TapePoolConfig,
 };
 use remanence_stream::StreamingError;
 use time::format_description::well_known::Rfc3339;
@@ -1973,14 +1972,38 @@ fn stream_one_file_range(
     stream_chunk_bytes: u32,
     chunk_tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
 ) -> Result<(), Status> {
+    let request =
+        file_range_read_request(index, tape_uuid, object_id, file_id, start_byte, end_byte)?;
+    let block_size_u32 = u32::try_from(request.block_size)
+        .map_err(|_| Status::internal("tape block size does not fit u32"))?;
+
+    verify_loaded_tape_identity(drive, tape_uuid)?;
+    let current_cfg = drive
+        .read_config()
+        .map_err(|err| Status::internal(format!("read drive config: {err}")))?;
+    drive
+        .write_config(fixed_no_compression_config(current_cfg, block_size_u32))
+        .map_err(|err| Status::internal(format!("set fixed-block config: {err}")))?;
+
+    let mut source = DriveHandleSource(drive);
+    stream_file_range_from_source(&mut source, request, stream_chunk_bytes, chunk_tx)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn file_range_read_request(
+    index: &CatalogIndex,
+    tape_uuid: &[u8; 16],
+    object_id: &str,
+    file_id: &str,
+    start_byte: u64,
+    end_byte: u64,
+) -> Result<crate::read_core::PlaintextFileRangeReadRequest, Status> {
     let object = index
         .get_native_object(object_id)
         .map_err(status_from_state_error)?;
     let object = object.ok_or_else(|| Status::not_found("object not found"))?;
-    let file = index
-        .get_native_object_file(object_id, file_id)
-        .map_err(status_from_state_error)?;
-    let file = file.ok_or_else(|| Status::not_found("object file not found"))?;
+    let file = resolve_object_file_for_range(index, object_id, file_id)?;
     let copy = object
         .copies
         .iter()
@@ -1989,17 +2012,6 @@ fn stream_one_file_range(
             Status::failed_precondition("object is not on the tape pinned by this read session")
         })?;
     let (range_start, range_len) = requested_file_range(file.size_bytes, start_byte, end_byte)?;
-    if copy.representation == OBJECT_COPY_REPRESENTATION_ENCRYPTED {
-        return Err(Status::failed_precondition(
-            "encrypted ranged reads require daemon key material; no key resolver is configured",
-        ));
-    }
-    if copy.representation != OBJECT_COPY_REPRESENTATION_PLAINTEXT {
-        return Err(Status::failed_precondition(format!(
-            "unsupported object copy representation {}",
-            copy.representation
-        )));
-    }
 
     let tape_files = index
         .list_tape_files(tape_uuid)
@@ -2021,36 +2033,58 @@ fn stream_one_file_range(
         .ok_or_else(|| Status::internal("tape block size unknown"))?;
     let block_size_usize = usize::try_from(block_size)
         .map_err(|_| Status::internal("tape block size does not fit usize"))?;
+    Ok(crate::read_core::PlaintextFileRangeReadRequest {
+        block_size: block_size_usize,
+        tape_file_number: tape_file.tape_file_number,
+        first_chunk_lba: file.first_chunk_lba.map(BodyLba),
+        file_size_bytes: file.size_bytes,
+        range_start,
+        range_len,
+    })
+}
 
-    verify_loaded_tape_identity(drive, tape_uuid)?;
-    let current_cfg = drive
-        .read_config()
-        .map_err(|err| Status::internal(format!("read drive config: {err}")))?;
-    let block_size_u32 = u32::try_from(block_size)
-        .map_err(|_| Status::internal("tape block size does not fit u32"))?;
-    drive
-        .write_config(fixed_no_compression_config(current_cfg, block_size_u32))
-        .map_err(|err| Status::internal(format!("set fixed-block config: {err}")))?;
+fn resolve_object_file_for_range(
+    index: &CatalogIndex,
+    object_id: &str,
+    file_id: &str,
+) -> Result<NativeObjectFileRecord, Status> {
+    if file_id.is_empty() {
+        let files = index
+            .list_native_object_files(object_id)
+            .map_err(status_from_state_error)?;
+        return match files.as_slice() {
+            [file] => Ok(file.clone()),
+            [] => Err(Status::failed_precondition(
+                "empty file_id ranged reads require exactly one object file row; found 0",
+            )),
+            _ => Err(Status::failed_precondition(format!(
+                "empty file_id ranged reads require exactly one object file row; found {}",
+                files.len()
+            ))),
+        };
+    }
 
-    let mut source = DriveHandleSource(drive);
+    let file = index
+        .get_native_object_file(object_id, file_id)
+        .map_err(status_from_state_error)?;
+    file.ok_or_else(|| Status::not_found("object file not found"))
+}
+
+fn stream_file_range_from_source(
+    source: &mut dyn BlockSource,
+    request: crate::read_core::PlaintextFileRangeReadRequest,
+    stream_chunk_bytes: u32,
+    chunk_tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
+) -> Result<(), Status> {
+    // Ranged reads are opaque stored-payload reads. The daemon does not decrypt
+    // or hold key material; clients interpret or decrypt the returned bytes.
     let mut writer = if stream_chunk_bytes == 0 {
         crate::read_core::ChannelWriter::new(chunk_tx)
     } else {
         crate::read_core::ChannelWriter::with_chunk_size(chunk_tx, stream_chunk_bytes as usize)
     };
-    crate::read_core::read_plaintext_file_range(
-        &mut source,
-        crate::read_core::PlaintextFileRangeReadRequest {
-            block_size: block_size_usize,
-            tape_file_number: tape_file.tape_file_number,
-            first_chunk_lba: file.first_chunk_lba.map(BodyLba),
-            file_size_bytes: file.size_bytes,
-            range_start,
-            range_len,
-        },
-        &mut writer,
-    )
-    .map_err(status_from_file_range_error)?;
+    crate::read_core::read_plaintext_file_range(source, request, &mut writer)
+        .map_err(status_from_file_range_error)?;
     writer
         .finish()
         .map_err(|err| Status::internal(format!("finish read stream: {err}")))?;
@@ -2203,7 +2237,179 @@ fn now_rfc3339() -> Result<String, time::error::Format> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use remanence_aead::RootKey;
+    use remanence_format::{
+        read_encrypted_rao_file_range_to_vec, write_encrypted_rao_object, write_rem_tar_object,
+        RemTarFile, RemTarObjectLayout, RemTarObjectOptions,
+    };
     use remanence_library::WormMediaState;
+    use remanence_library::{VecBlockSink, VecBlockSource};
+    use remanence_parity::{
+        CommittedBundle, CommittedBundleKind, ParityConfig, TapeFileEntry, TapeFileKind,
+    };
+    use remanence_state::{
+        NativeObjectCopyProjectionInput, NativeObjectFileProjectionInput,
+        NativeObjectProjectionInput, ProvisionTapeInput, TapeJournalIndexInput,
+        OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+    };
+
+    const RANGE_OBJECT_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    const RANGE_TAPE_UUID: [u8; 16] = [0xAB; 16];
+
+    struct RangeCatalogFixture {
+        index: CatalogIndex,
+        _temp: tempfile::TempDir,
+        blocks: Vec<Vec<u8>>,
+        layout: RemTarObjectLayout,
+    }
+
+    fn range_options(block_size: usize) -> RemTarObjectOptions {
+        let mut opts = RemTarObjectOptions::new(
+            RANGE_OBJECT_ID,
+            "caller-range",
+            "2026-06-16T12:00:00Z",
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        );
+        opts.chunk_size = block_size;
+        opts
+    }
+
+    fn cataloged_payload_fixture(payload: &[u8]) -> RangeCatalogFixture {
+        let opts = range_options(512);
+        let files = [RemTarFile {
+            path: "payload.rao",
+            file_id: "payload-file",
+            data: payload,
+            mtime: Some("0"),
+            executable: Some(false),
+        }];
+        let mut sink = VecBlockSink::new();
+        let layout = write_rem_tar_object(&mut sink, &opts, &files).expect("write wrapped payload");
+        let payload_layout = &layout.files[0];
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-api-range-test-")
+            .tempdir()
+            .expect("tempdir");
+        let mut index =
+            CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open test index");
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: RANGE_TAPE_UUID,
+                voltag: "RANGE01".to_string(),
+                block_size: opts.chunk_size as u32,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        index
+            .project_native_object_and_committed_tape_file_bundle(
+                NativeObjectProjectionInput {
+                    object_id: RANGE_OBJECT_ID.to_string(),
+                    caller_object_id: Some("caller-range".to_string()),
+                    body_format: "rao-v1".to_string(),
+                    logical_size_bytes: Some(payload.len() as u64),
+                    content_hash: payload_layout.file_sha256.map(|hash| hash.to_vec()),
+                    metadata_hash: None,
+                    created_at_utc: Some("2026-06-16T12:00:00Z".to_string()),
+                },
+                &[NativeObjectFileProjectionInput {
+                    object_id: RANGE_OBJECT_ID.to_string(),
+                    file_id: "payload-file".to_string(),
+                    path: "payload.rao".to_string(),
+                    size_bytes: payload.len() as u64,
+                    file_sha256: payload_layout
+                        .file_sha256
+                        .expect("regular payload hash")
+                        .to_vec(),
+                    first_chunk_lba: payload_layout.first_chunk_lba.map(|lba| lba.0),
+                    chunk_count: payload_layout.chunk_count,
+                    mtime: Some("0".to_string()),
+                    executable: Some(false),
+                }],
+                &[NativeObjectCopyProjectionInput {
+                    object_id: RANGE_OBJECT_ID.to_string(),
+                    tape_uuid: RANGE_TAPE_UUID,
+                    tape_file_number: 0,
+                    first_body_lba: 0,
+                    first_parity_data_ordinal: None,
+                    protected_until_ordinal: None,
+                    status: "committed".to_string(),
+                    representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+                    key_id: None,
+                    metadata_frame_len: None,
+                    plaintext_digest: None,
+                    stored_digest: None,
+                }],
+                TapeJournalIndexInput {
+                    tape_uuid: RANGE_TAPE_UUID,
+                    block_size: opts.chunk_size as u32,
+                    scheme: None,
+                    journal_offset_bytes: 0,
+                },
+                &CommittedBundle {
+                    kind: CommittedBundleKind::Object,
+                    entries: vec![TapeFileEntry {
+                        tape_file_number: 0,
+                        kind: TapeFileKind::Object,
+                        block_count: layout.projected_size_blocks,
+                        physical_start_hint: Some(0),
+                        object_id: Some(RANGE_OBJECT_ID.to_string()),
+                        first_parity_data_ordinal: None,
+                        epoch_id: None,
+                        protected_ordinal_start: None,
+                        protected_ordinal_end_exclusive: None,
+                        canonical_metadata_hash: None,
+                        bootstrap_object_row: None,
+                    }],
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals: 0,
+                },
+            )
+            .expect("project range fixture");
+        RangeCatalogFixture {
+            index,
+            _temp: temp,
+            blocks: sink.blocks,
+            layout,
+        }
+    }
+
+    async fn collect_stream_chunks(
+        mut rx: mpsc::Receiver<Result<pb::BytesChunk, Status>>,
+    ) -> Result<Vec<u8>, Status> {
+        let mut bytes = Vec::new();
+        let mut saw_last = false;
+        while let Some(item) = rx.recv().await {
+            let chunk = item?;
+            bytes.extend_from_slice(&chunk.data);
+            saw_last |= chunk.is_last;
+            if chunk.is_last {
+                break;
+            }
+        }
+        assert!(saw_last, "range stream must send terminal frame");
+        Ok(bytes)
+    }
+
+    async fn stream_fixture_range(
+        fixture: &RangeCatalogFixture,
+        file_id: &str,
+        start_byte: u64,
+        end_byte: u64,
+    ) -> Result<Vec<u8>, Status> {
+        let request = file_range_read_request(
+            &fixture.index,
+            &RANGE_TAPE_UUID,
+            RANGE_OBJECT_ID,
+            file_id,
+            start_byte,
+            end_byte,
+        )?;
+        let mut source = VecBlockSource::new(fixture.blocks.clone());
+        let (tx, rx) = mpsc::channel(256);
+        stream_file_range_from_source(&mut source, request, 0, tx)?;
+        collect_stream_chunks(rx).await
+    }
 
     #[test]
     fn append_gate_poisons_session_after_failed_append() {
@@ -2320,5 +2526,132 @@ mod tests {
         assert_eq!(prepared.max_block_size_bytes, current.max_block_size_bytes);
         assert_eq!(prepared.write_protected, current.write_protected);
         assert_eq!(prepared.worm, current.worm);
+    }
+
+    #[tokio::test]
+    async fn empty_file_id_ranges_are_payload_relative_real_bytes() {
+        let payload: Vec<u8> = (0..1600)
+            .map(|value| u8::try_from(value % 251).unwrap())
+            .collect();
+        let fixture = cataloged_payload_fixture(&payload);
+        assert!(fixture.layout.files[0].first_chunk_lba.is_some());
+
+        let mid = stream_fixture_range(&fixture, "", 400, 900)
+            .await
+            .expect("mid range");
+        assert_eq!(mid, payload[400..900]);
+
+        let to_eof = stream_fixture_range(&fixture, "", 1200, payload.len() as u64)
+            .await
+            .expect("range to eof");
+        assert_eq!(to_eof, payload[1200..]);
+
+        let empty = stream_fixture_range(&fixture, "", 777, 777)
+            .await
+            .expect("empty range");
+        assert!(empty.is_empty());
+
+        let whole = stream_fixture_range(&fixture, "", 0, 0)
+            .await
+            .expect("whole payload range");
+        assert_eq!(whole, payload);
+    }
+
+    #[tokio::test]
+    async fn member_scoped_ranges_still_resolve_file_id() {
+        let payload = b"member scoped range bytes".to_vec();
+        let fixture = cataloged_payload_fixture(&payload);
+
+        let got = stream_fixture_range(&fixture, "payload-file", 7, 13)
+            .await
+            .expect("member range");
+
+        assert_eq!(got, b"scoped");
+    }
+
+    #[tokio::test]
+    async fn encrypted_payload_is_served_opaque_and_decrypted_client_side() {
+        let mut encrypted_opts = RemTarObjectOptions::new(
+            "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            "caller-encrypted",
+            "2026-06-16T12:00:00Z",
+            "dddddddd-dddd-dddd-dddd-dddddddddddd",
+        );
+        encrypted_opts.chunk_size = 512;
+        let secret: Vec<u8> = (0..1800)
+            .map(|value| u8::try_from((value * 7) % 251).unwrap())
+            .collect();
+        let encrypted_files = [RemTarFile {
+            path: "secret.bin",
+            file_id: "secret-file",
+            data: secret.as_slice(),
+            mtime: Some("0"),
+            executable: Some(false),
+        }];
+        let root_key = RootKey::new([0x42; 32]).expect("test key");
+        let mut encrypted_sink = VecBlockSink::new();
+        let encrypted_report = write_encrypted_rao_object(
+            &mut encrypted_sink,
+            &encrypted_opts,
+            &encrypted_files,
+            &root_key,
+            [0x24; 16],
+        )
+        .expect("write encrypted payload");
+        let encrypted_payload: Vec<u8> = encrypted_sink.blocks.iter().flatten().copied().collect();
+        assert_eq!(&encrypted_payload[0..4], b"RAO1");
+
+        let fixture = cataloged_payload_fixture(&encrypted_payload);
+        let header = stream_fixture_range(&fixture, "", 0, 64)
+            .await
+            .expect("opaque header range");
+        assert_eq!(header, encrypted_payload[0..64]);
+
+        let opaque = stream_fixture_range(&fixture, "", 0, encrypted_payload.len() as u64)
+            .await
+            .expect("opaque encrypted payload");
+        assert_eq!(opaque, encrypted_payload);
+
+        let opened = read_encrypted_rao_file_range_to_vec(
+            &opaque,
+            &root_key,
+            encrypted_report.plaintext_layout.files[0].first_chunk_lba,
+            secret.len() as u64,
+            300,
+            333,
+        )
+        .expect("client-side decrypt range");
+        assert_eq!(opened.bytes, secret[300..633]);
+    }
+
+    #[tokio::test]
+    async fn invalid_payload_ranges_return_typed_status() {
+        let payload = b"short payload".to_vec();
+        let fixture = cataloged_payload_fixture(&payload);
+
+        let past_eof = stream_fixture_range(&fixture, "", 99, 100)
+            .await
+            .expect_err("past EOF must fail");
+        assert_eq!(past_eof.code(), tonic::Code::InvalidArgument);
+
+        let overflow_request = file_range_read_request(
+            &fixture.index,
+            &RANGE_TAPE_UUID,
+            RANGE_OBJECT_ID,
+            "",
+            u64::MAX - 1,
+            u64::MAX,
+        )
+        .expect("request builder allows planner to catch arithmetic overflow");
+        let mut source = VecBlockSource::new(fixture.blocks.clone());
+        let (tx, _rx) = mpsc::channel(8);
+        let overflow = stream_file_range_from_source(&mut source, overflow_request, 0, tx)
+            .expect_err("overflow must fail");
+        assert_eq!(overflow.code(), tonic::Code::InvalidArgument);
+
+        let reversed =
+            file_range_read_request(&fixture.index, &RANGE_TAPE_UUID, RANGE_OBJECT_ID, "", 5, 4)
+                .expect_err("end before start must fail");
+        assert_eq!(reversed.code(), tonic::Code::InvalidArgument);
     }
 }

@@ -1366,18 +1366,25 @@ impl pb::read_session_service_server::ReadSessionService for ReadSessionApi {
         authorize_request(&request, AuthPermission::ReadTape)?;
         let request = request.into_inner();
         let stream = if request.file_id.is_empty() {
-            if request.start_byte != 0 || request.end_byte != 0 {
-                return Err(Status::invalid_argument(
-                    "file_id is required for ranged reads",
-                ));
+            if request.start_byte == 0 && request.end_byte == 0 {
+                self.dispatch_read_file(
+                    request.session_id,
+                    request.object_id,
+                    request.file_id,
+                    request.stream_chunk_bytes,
+                )
+                .await?
+            } else {
+                self.dispatch_read_object_range(
+                    request.session_id,
+                    request.object_id,
+                    request.file_id,
+                    request.start_byte,
+                    request.end_byte,
+                    request.stream_chunk_bytes,
+                )
+                .await?
             }
-            self.dispatch_read_file(
-                request.session_id,
-                request.object_id,
-                request.file_id,
-                request.stream_chunk_bytes,
-            )
-            .await?
         } else {
             self.dispatch_read_object_range(
                 request.session_id,
@@ -5623,23 +5630,171 @@ BCw3Wyv2UWY=
     }
 
     #[tokio::test]
-    async fn read_object_range_requires_file_id_for_partial_range() {
-        let service = populated_state().read_session_service();
-        let err = pb::read_session_service_server::ReadSessionService::read_object_range(
+    async fn read_object_range_dispatches_empty_file_id_range_to_drive_actor() {
+        let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
+        let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
+        let reservations = Arc::new(HashMap::from([(0x0101, AtomicBool::new(true))]));
+        let pool = crate::write_owner::DrivePool::new(
+            changer_tx,
+            HashMap::from([(0x0101, drive_tx)]),
+            reservations,
+        );
+        let session_id = Uuid::new_v4();
+        pool.record_session(
+            session_id,
+            crate::write_owner::MountedSession {
+                bay: 0x0101,
+                home_slot: None,
+                tape_uuid: TAPE_UUID,
+            },
+        );
+        let mut state = populated_state();
+        state.drive_pool = Some(pool);
+        let service = state.read_session_service();
+
+        let drive_task = tokio::spawn(async move {
+            let command = drive_rx.recv().await.expect("drive command");
+            let crate::write_owner::DriveCommand::ReadObjectRange {
+                session_id: got_session_id,
+                object_id,
+                file_id,
+                start_byte,
+                end_byte,
+                stream_chunk_bytes,
+                chunk_tx,
+            } = command
+            else {
+                panic!("expected ReadObjectRange command");
+            };
+            assert_eq!(got_session_id, session_id);
+            assert_eq!(object_id, OBJECT_ID_TEXT);
+            assert_eq!(file_id, "");
+            assert_eq!(start_byte, 1);
+            assert_eq!(end_byte, 5);
+            assert_eq!(stream_chunk_bytes, 4);
+            chunk_tx
+                .send(Ok(pb::BytesChunk {
+                    data: b"ANGE".to_vec(),
+                    is_last: false,
+                }))
+                .await
+                .expect("send data chunk");
+            chunk_tx
+                .send(Ok(pb::BytesChunk {
+                    data: Vec::new(),
+                    is_last: true,
+                }))
+                .await
+                .expect("send last chunk");
+        });
+
+        let mut stream = pb::read_session_service_server::ReadSessionService::read_object_range(
             &service,
             Request::new(pb::ReadObjectRangeRequest {
-                session_id: Uuid::new_v4().as_bytes().to_vec(),
+                session_id: session_id.as_bytes().to_vec(),
                 object_id: object_uuid().as_bytes().to_vec(),
                 file_id: Vec::new(),
                 start_byte: 1,
                 end_byte: 5,
-                stream_chunk_bytes: 0,
+                stream_chunk_bytes: 4,
             }),
         )
         .await
-        .err()
-        .expect("partial range read without file_id must be rejected");
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        .expect("range stream")
+        .into_inner();
+
+        let mut got = Vec::new();
+        let mut saw_last = false;
+        while let Some(item) = stream.next().await {
+            let chunk = item.expect("chunk");
+            got.extend_from_slice(&chunk.data);
+            saw_last |= chunk.is_last;
+        }
+        drive_task.await.expect("drive task");
+        assert_eq!(got, b"ANGE");
+        assert!(saw_last);
+    }
+
+    #[tokio::test]
+    async fn read_object_range_empty_file_id_zero_zero_uses_whole_payload_path() {
+        let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
+        let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
+        let reservations = Arc::new(HashMap::from([(0x0101, AtomicBool::new(true))]));
+        let pool = crate::write_owner::DrivePool::new(
+            changer_tx,
+            HashMap::from([(0x0101, drive_tx)]),
+            reservations,
+        );
+        let session_id = Uuid::new_v4();
+        pool.record_session(
+            session_id,
+            crate::write_owner::MountedSession {
+                bay: 0x0101,
+                home_slot: None,
+                tape_uuid: TAPE_UUID,
+            },
+        );
+        let mut state = populated_state();
+        state.drive_pool = Some(pool);
+        let service = state.read_session_service();
+
+        let drive_task = tokio::spawn(async move {
+            let command = drive_rx.recv().await.expect("drive command");
+            let crate::write_owner::DriveCommand::ReadFile {
+                session_id: got_session_id,
+                object_id,
+                file_id,
+                stream_chunk_bytes,
+                chunk_tx,
+            } = command
+            else {
+                panic!("expected ReadFile command");
+            };
+            assert_eq!(got_session_id, session_id);
+            assert_eq!(object_id, OBJECT_ID_TEXT);
+            assert!(file_id.is_empty());
+            assert_eq!(stream_chunk_bytes, 6);
+            chunk_tx
+                .send(Ok(pb::BytesChunk {
+                    data: b"whole payload".to_vec(),
+                    is_last: false,
+                }))
+                .await
+                .expect("send data chunk");
+            chunk_tx
+                .send(Ok(pb::BytesChunk {
+                    data: Vec::new(),
+                    is_last: true,
+                }))
+                .await
+                .expect("send last chunk");
+        });
+
+        let mut stream = pb::read_session_service_server::ReadSessionService::read_object_range(
+            &service,
+            Request::new(pb::ReadObjectRangeRequest {
+                session_id: session_id.as_bytes().to_vec(),
+                object_id: object_uuid().as_bytes().to_vec(),
+                file_id: Vec::new(),
+                start_byte: 0,
+                end_byte: 0,
+                stream_chunk_bytes: 6,
+            }),
+        )
+        .await
+        .expect("whole payload stream")
+        .into_inner();
+
+        let mut got = Vec::new();
+        let mut saw_last = false;
+        while let Some(item) = stream.next().await {
+            let chunk = item.expect("chunk");
+            got.extend_from_slice(&chunk.data);
+            saw_last |= chunk.is_last;
+        }
+        drive_task.await.expect("drive task");
+        assert_eq!(got, b"whole payload");
+        assert!(saw_last);
     }
 
     #[tokio::test]
