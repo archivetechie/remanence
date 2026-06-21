@@ -1908,7 +1908,9 @@ mod l1b_tests {
         }
     }
 
-    fn capture_finished_sense(handle: &mut LibraryHandle) -> Arc<Mutex<Vec<(u8, u8, u8, bool)>>> {
+    type CapturedSense = Arc<Mutex<Vec<(u8, u8, u8, bool)>>>;
+
+    fn capture_finished_sense(handle: &mut LibraryHandle) -> CapturedSense {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let captured_for_hook = Arc::clone(&captured);
         handle.set_audit_hook(move |event| {
