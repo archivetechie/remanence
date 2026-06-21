@@ -3372,6 +3372,7 @@ BCw3Wyv2UWY=
             },
             drive_bays: vec![DriveBay {
                 element_address: 1,
+                accessible: true,
                 installed: Some(InstalledDrive {
                     serial: "8031BDC7D1".to_string(),
                     identity_source: IdentitySource::DvcidInline,
@@ -3387,11 +3388,13 @@ BCw3Wyv2UWY=
             }],
             slots: vec![Slot {
                 element_address: 0x03e9,
+                accessible: true,
                 full: true,
                 cartridge: Some("S30002L9".to_string()),
             }],
             ie_ports: vec![IePort {
                 element_address: 0x10,
+                accessible: true,
                 full: false,
                 cartridge: None,
                 import_enabled: true,

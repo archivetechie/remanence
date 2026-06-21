@@ -53,5 +53,16 @@
     "handoff_to": null,
     "round": 2,
     "summary": "Addressed the single Low from Claude's Phase D review. ChaosTransport now has merge_tape_alert_flags return both returned_bytes and the subset of injected TapeAlert flags actually represented in the response bytes. For sub-canonical LOG SENSE allocations, malformed-inner synthesis writes any visible requested flag bytes but the JSONL tape_alert field reports only flags whose canonical value byte is inside the returned payload; parse-valid short pages report only flags that set_tape_alert_flag could actually mutate. Full 324-byte production behavior is unchanged. Added two regression tests: malformed short allocation reports only visible flag 7 from [7,19], and parse-valid short page reports only settable flag 7. Verification after the fix: cargo test passed (chaos now 31 tests), cargo fmt --check clean, cargo clippy -- -D warnings clean, cargo build --release passed."
+  },
+  {
+    "uuid": "63cae375-fca6-4c45-bd74-3b61c7d977ea",
+    "datetime": "2026-06-21T18:00:51+02:00",
+    "author": "codex",
+    "subject": "Implemented chaos Phase E changer/library faults (LIB-01..11)",
+    "idref": "docs/prompt-chaos-phase-e.md",
+    "status": "complete",
+    "handoff_to": null,
+    "round": 0,
+    "summary": "Implemented Phase E from docs/prompt-chaos-phase-e.md / docs/chaos-phase-e-changer-faults-design-v0.1.md. Added accessible state to DriveBay/Slot/IePort from RES ACCESS && !EXCEPT without changing protobuf/CLI projection surfaces; added DeviceCtx.library_id and target.library matching; added LIB sense defaults/operation gates for LIB-01/02/04/06/07/08/10/11; added defensive remanence-scsi RES mutators blank_element_voltag and set_element_exception; added ChaosTransport READ ELEMENT STATUS post-call mutation for LIB-05 blank voltag and LIB-09 inaccessible with JSONL element_status; added LIB-03 pending UA after successful MOVE MEDIUM; and extended ModelTransport slot state with full/access/except plus seeders for inaccessible and full-without-voltag slots. Added L1b coverage over real LibraryHandle + ChaosTransport<ModelTransport> for honest refresh/move, LIB-01, LIB-03, LIB-05, LIB-08 move and refresh, LIB-09, and LIB-11. Report: docs/report-chaos-phase-e-changer-faults-2026-06-21.md. Deferred per design: LIB-07 offline state, LIB-10 latency/time_scale, changer-LUN TapeAlert, and nonexistent LIB-12."
   }
 ]
