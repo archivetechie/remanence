@@ -106,6 +106,9 @@ pub struct ElementLayout {
 pub struct DriveBay {
     /// SCSI element address for this bay.
     pub element_address: u16,
+    /// True when the changer reports this element as accessible and
+    /// exception-free in READ ELEMENT STATUS.
+    pub accessible: bool,
     /// Drive currently installed, with what we know about it. `None`
     /// if the changer reports the bay but no drive identity could be
     /// resolved (DVCID unavailable + no safe topology mapping, etc.).
@@ -167,6 +170,9 @@ pub enum IdentitySource {
 pub struct Slot {
     /// SCSI element address.
     pub element_address: u16,
+    /// True when the changer reports this element as accessible and
+    /// exception-free in READ ELEMENT STATUS.
+    pub accessible: bool,
     /// True if the slot has a cartridge present (RES `FULL` flag).
     /// Distinguishes "empty slot" from "full slot with no voltag" —
     /// `cartridge.is_none()` alone does not.
@@ -183,6 +189,9 @@ pub struct Slot {
 pub struct IePort {
     /// SCSI element address.
     pub element_address: u16,
+    /// True when the changer reports this element as accessible and
+    /// exception-free in READ ELEMENT STATUS.
+    pub accessible: bool,
     /// True if the IE port currently holds a cartridge (RES `FULL`).
     pub full: bool,
     /// Trimmed volume tag, when one was read. See [`Slot::cartridge`]
@@ -392,6 +401,7 @@ impl Library {
                     layout.drive_count += 1;
                     drive_bays.push(DriveBay {
                         element_address: el.address,
+                        accessible: el.access && !el.except,
                         installed: el.drive_serial.as_ref().map(|s| InstalledDrive {
                             serial: s.clone(),
                             identity_source: IdentitySource::DvcidInline,
@@ -413,6 +423,7 @@ impl Library {
                     layout.slot_count += 1;
                     slots.push(Slot {
                         element_address: el.address,
+                        accessible: el.access && !el.except,
                         full: el.full,
                         cartridge: el.primary_voltag.clone(),
                     });
@@ -424,6 +435,7 @@ impl Library {
                     layout.ie_count += 1;
                     ie_ports.push(IePort {
                         element_address: el.address,
+                        accessible: el.access && !el.except,
                         full: el.full,
                         cartridge: el.primary_voltag.clone(),
                         import_enabled: el.import_enabled,
@@ -500,6 +512,7 @@ mod tests {
     fn drive_bay(element_address: u16, loaded: bool, loaded_tape: Option<&str>) -> DriveBay {
         DriveBay {
             element_address,
+            accessible: true,
             installed: Some(InstalledDrive {
                 serial: format!("DRV-{element_address:04X}"),
                 identity_source: IdentitySource::DvcidAndInquiry,
@@ -522,6 +535,7 @@ mod tests {
     ) -> DriveBay {
         DriveBay {
             element_address,
+            accessible: true,
             installed: None,
             loaded,
             loaded_tape: loaded_tape.map(str::to_string),
@@ -536,6 +550,7 @@ mod tests {
     ) -> DriveBay {
         DriveBay {
             element_address,
+            accessible: true,
             installed: Some(InstalledDrive {
                 serial: format!("DRV-{element_address:04X}"),
                 identity_source: IdentitySource::DvcidInline,
@@ -554,6 +569,7 @@ mod tests {
     fn slot(element_address: u16, full: bool, cartridge: Option<&str>) -> Slot {
         Slot {
             element_address,
+            accessible: true,
             full,
             cartridge: cartridge.map(str::to_string),
         }

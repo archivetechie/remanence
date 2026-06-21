@@ -882,6 +882,7 @@ mod tests {
     fn drive_bay(element_address: u16, loaded: bool, loaded_tape: Option<&str>) -> DriveBay {
         DriveBay {
             element_address,
+            accessible: true,
             installed: Some(InstalledDrive {
                 serial: format!("DRV{element_address:04x}"),
                 identity_source: IdentitySource::DvcidInline,
@@ -900,6 +901,7 @@ mod tests {
     fn slot(element_address: u16, cartridge: &str) -> Slot {
         Slot {
             element_address,
+            accessible: true,
             full: true,
             cartridge: Some(cartridge.to_string()),
         }
