@@ -997,6 +997,14 @@ impl<'a> BlockSource for ObjectParitySource<'a> {
     }
 
     fn space(&mut self, count: i64, kind: SpaceKind) -> Result<SpaceResult, TapeIoError> {
+        if count == 0 {
+            return Ok(SpaceResult {
+                units_traversed: 0,
+                stopped_at_boundary: self.cursor_body_lba == 0
+                    || self.cursor_body_lba == self.object_block_count,
+                position_after: body_position(self.cursor_body_lba, self.object_block_count),
+            });
+        }
         if kind != SpaceKind::Blocks {
             return Err(TapeIoError::OperationFailed(
                 "ObjectParitySource supports only object-local block spacing".to_string(),

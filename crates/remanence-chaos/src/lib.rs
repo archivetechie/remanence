@@ -24,6 +24,9 @@ use thiserror::Error;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+/// Stateful virtual tape/changer transport for Phase C L1b tests.
+pub mod model;
+
 /// Environment variable that enables chaos wrapping when set to a truthy value.
 pub const ENV_CHAOS_ENABLED: &str = "REM_CHAOS_ENABLED";
 
@@ -913,7 +916,7 @@ struct SenseSpec {
 
 impl SenseSpec {
     fn to_fixed_sense(&self) -> Vec<u8> {
-        let mut sense = vec![0u8; 18];
+        let mut sense = vec![0u8; 32];
         sense[0] = self.response_code & 0x7f;
         if let Some(info) = self.information {
             sense[0] |= 0x80;
@@ -930,7 +933,7 @@ impl SenseSpec {
         if self.ili {
             sense[2] |= 0x20;
         }
-        sense[7] = 0x0a;
+        sense[7] = 24;
         sense[12] = self.asc;
         sense[13] = self.ascq;
         sense
