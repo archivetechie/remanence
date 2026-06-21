@@ -5,7 +5,7 @@
 Phase C is implemented in `remanence-chaos`: `ModelTransport` provides a
 stateful in-memory virtual tape drive and medium changer, and the L1b tests run
 the real Remanence write/read stack through `LibraryHandle`/`DriveHandle`,
-`ChaosTransport`, `ParitySink`, `ObjectParitySource`, and the RAO reader.
+`ChaosTransport`, `ParitySink`, `ObjectParitySource`, and the RAO streamer.
 
 No `remanence-library` production hook was added. The model uses the existing
 public `Library::open_with` and `LibraryHandle::open_drive` factory seam.
@@ -22,12 +22,14 @@ public `Library::open_with` and `LibraryHandle::open_drive` factory seam.
 - L1b tests for clean round trip, MED-05 digest-layer detection, EOM
   early-warning sense mapping, MED-01 recovery and unrecoverability, MED-05 peer
   rejection during reconstruction, and changer loaded-barcode coupling.
-- `ObjectParitySource::space(0, ...)` now accepts a no-op. This lets
-  `read_object_payload(..., tape_file_number = 0, ...)` compose with the
-  object-local parity source without changing object-local positioning
-  semantics.
+- The L1b read helper opens an object-local `ObjectParitySource` and streams it
+  directly with `stream_rem_tar_object_with_manifest_anchor`, leaving
+  `remanence-parity` source semantics unchanged.
 - Chaos fixed-format sense synthesis now returns a 32-byte sense buffer with
   additional length 24, matching the Phase C sense-shape requirement.
+- The write path recomputes `written_bytes` from surviving block records after
+  overwrite truncation, so rewind-plus-overwrite does not inherit stale bytes
+  for EOM decisions.
 
 ## Design Notes
 
@@ -51,7 +53,11 @@ cargo test
 test result: ok across workspace unit and doc tests
 
 cargo test -p remanence-chaos
-test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+cargo test -p remanence-parity
+test result: ok. 405 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 cargo fmt --check
 ok

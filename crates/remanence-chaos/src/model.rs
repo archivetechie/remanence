@@ -67,6 +67,20 @@ impl VirtualTape {
     }
 }
 
+fn record_data_bytes(records: &[Record]) -> u64 {
+    records
+        .iter()
+        .map(|record| match record {
+            Record::Block(block) => block.len() as u64,
+            Record::Filemark => 0,
+        })
+        .sum()
+}
+
+fn recompute_written_bytes(tape: &mut VirtualTape) {
+    tape.written_bytes = record_data_bytes(&tape.records);
+}
+
 impl Default for VirtualTape {
     fn default() -> Self {
         Self::empty(DEFAULT_CAPACITY_BYTES, DEFAULT_BLOCK_SIZE)
@@ -423,6 +437,7 @@ impl ModelTransport {
             }
             if position < tape.records.len() {
                 tape.records.truncate(position);
+                recompute_written_bytes(tape);
             }
             tape.records.push(Record::Block(buf.to_vec()));
             tape.written_bytes = tape.written_bytes.saturating_add(buf.len() as u64);
@@ -445,6 +460,7 @@ impl ModelTransport {
         self.with_loaded_tape(&mut world, |tape| {
             if position < tape.records.len() {
                 tape.records.truncate(position);
+                recompute_written_bytes(tape);
             }
             for _ in 0..count {
                 tape.records.push(Record::Filemark);
@@ -1075,6 +1091,74 @@ mod tests {
     }
 
     #[test]
+    fn overwrite_recomputes_written_bytes_for_eom() {
+        let mut world = VirtualWorld::single_drive("LIB-MODEL", 0x0100, "DRV-MODEL", 0x0400, 1);
+        world.put_tape_in_drive(
+            0x0100,
+            "TAPE001",
+            Some(0x0400),
+            VirtualTape::empty(12, DEFAULT_BLOCK_SIZE),
+        );
+        let world = Arc::new(Mutex::new(world));
+        let mut drive = ModelTransport::new(Arc::clone(&world), DeviceRole::Drive { bay: 0x0100 });
+        let block = [0xa5; 8];
+
+        drive
+            .execute_out(
+                &read_write::build_write_variable_cdb(block.len() as u32),
+                &block,
+            )
+            .expect("first write below EOM threshold");
+        drive
+            .execute_out(
+                &read_write::build_write_variable_cdb(block.len() as u32),
+                &block,
+            )
+            .expect_err("second append crosses EOM threshold");
+
+        drive.rewind();
+        drive
+            .execute_out(
+                &read_write::build_write_variable_cdb(block.len() as u32),
+                &block,
+            )
+            .expect("overwrite after rewind truncates stale bytes before EOM check");
+
+        let guard = world.lock().expect("virtual world lock");
+        let tape = guard.tapes.get("TAPE001").expect("tape exists");
+        assert_eq!(tape.records.len(), 1);
+        assert_eq!(tape.written_bytes, block.len() as u64);
+    }
+
+    #[test]
+    fn filemark_overwrite_recomputes_written_bytes() {
+        let mut world = VirtualWorld::single_drive("LIB-MODEL", 0x0100, "DRV-MODEL", 0x0400, 1);
+        world.put_tape_in_drive(0x0100, "TAPE001", Some(0x0400), VirtualTape::default());
+        let world = Arc::new(Mutex::new(world));
+        let mut drive = ModelTransport::new(Arc::clone(&world), DeviceRole::Drive { bay: 0x0100 });
+        let block = [0x5a; 8];
+
+        for _ in 0..2 {
+            drive
+                .execute_out(
+                    &read_write::build_write_variable_cdb(block.len() as u32),
+                    &block,
+                )
+                .expect("write block");
+        }
+
+        drive.rewind();
+        drive
+            .execute_none(&write_filemarks::build_cdb_6(1))
+            .expect("filemark overwrite");
+
+        let guard = world.lock().expect("virtual world lock");
+        let tape = guard.tapes.get("TAPE001").expect("tape exists");
+        assert_eq!(tape.records, vec![Record::Filemark]);
+        assert_eq!(tape.written_bytes, 0);
+    }
+
+    #[test]
     fn read_element_status_response_parses_after_move() {
         let world = world();
         {
@@ -1114,8 +1198,11 @@ mod l1b_tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use remanence_api::read_core::{read_object_payload, CapturePayloadSink};
-    use remanence_format::{write_rem_tar_object, FormatError, RemTarFile, RemTarObjectOptions};
+    use remanence_api::read_core::CapturePayloadSink;
+    use remanence_format::{
+        stream_rem_tar_object_with_manifest_anchor, write_rem_tar_object, FormatError, RemTarFile,
+        RemTarObjectOptions,
+    };
     use remanence_library::{
         BlockSource, DriveHandle, IoErrorKind, LibraryHandle, StaticAllowlist,
     };
@@ -1381,20 +1468,19 @@ mod l1b_tests {
         let mut captured = Vec::new();
         let result = {
             let mut sink = CapturePayloadSink::new(&mut captured);
-            let result = read_object_payload(
+            let result = stream_rem_tar_object_with_manifest_anchor(
                 &mut source,
                 BLOCK_SIZE as usize,
                 written.block_count,
-                0,
-                Some(written.manifest_sha256),
                 &mut sink,
+                Some(written.manifest_sha256),
             );
             if result.is_ok() {
                 sink.finish().expect("captured payload finalizes");
             }
             result
         };
-        result.map(|()| captured)
+        result.map(|_| captured)
     }
 
     fn chaos_state(prefix: &str, scenario_id: &str, seed: &str) -> (TempDir, PathBuf) {

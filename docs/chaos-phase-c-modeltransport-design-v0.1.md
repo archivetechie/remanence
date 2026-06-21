@@ -154,7 +154,7 @@ SPACE / WRITE FILEMARKS.
 | READ BLOCK LIMITS | `05…` | 6-byte reply; bytes 1-3 BE = max block (use a large value), 4-5 = min. |
 | MODE SENSE(6) p0x0F | `1A 00 0F…` | 28-byte reply; Block Descriptor Length = 8, block length (bytes 9-11) = tape block_size, page 0x0F with DCE bit per compression state. |
 | MODE SELECT(6) | `15 10…` | Parse compression param list; record block_size if the descriptor sets it. |
-| WRITE(6) variable | `0A 00 LLL 00` | Append `Record::Block(buf[..len])` at position; advance; `written_bytes += len`; if `written_bytes > capacity_bytes` return EOM (see §4.3). Then answer the inline READ POSITION. |
+| WRITE(6) variable | `0A 00 LLL 00` | If writing before EOD, truncate later records, append `Record::Block(buf[..len])`, advance, recompute `written_bytes` from retained data records, and return EOM if `written_bytes > capacity_bytes` (see §4.3). Then answer the inline READ POSITION. |
 | READ(6) variable | `08 00 LLL 00` | Return the record at position into `buf`. If it is a `Filemark` → FILEMARK sense (fixed-format, byte2 bit7, key 0, ASC/ASCQ `00/01`). If past EOD → BLANK CHECK / no-data. Advance on data. |
 | WRITE FILEMARKS(6) | `10 00 CCC 00` | Append N `Record::Filemark`; advance; inline READ POSITION. |
 | SPACE(6/16) | `11 0X ccc…` / `91…` | Move position by `count` of `code` (filemarks/records, signed two's-complement). On early stop at BOT/EOD return the SPACE residual sense (`space_residual_if_early_stop` shape). Inline READ POSITION. |
@@ -211,8 +211,8 @@ build a `DriveHandle` over `ChaosTransport<ModelTransport>`, then drives the rea
 parity/format path: write via `DriveHandleRawSink` → `ParitySink::new_sidecar_only`
 → `write_bootstrap` → `begin_object…` → `write_block×N` → `finish_object` →
 `finish`; read via `DriveHandleRawSource` → `ObjectParitySource::open(…,
-OpenTrust::RequireValidated)` (+ `read_object_payload` with the manifest anchor
-for digest detection, and a `ParityAuditHook` for recovery events).
+OpenTrust::RequireValidated)` → `stream_rem_tar_object_with_manifest_anchor`
+for digest detection, with a `ParityAuditHook` for recovery events.
 
 1. **Faithful-device round trip (chaos disabled).** Write an object, read it
    back; bytes identical; CDB-level sanity (position advances, filemarks land).
