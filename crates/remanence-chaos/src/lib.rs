@@ -242,12 +242,12 @@ impl FaultEngine {
             .find_map(|fault| {
                 tape_alert_spec_for_fault(fault).map(|flags| (fault.clone(), flags))
             })?;
-        let returned_bytes = merge_tape_alert_flags(cdb, buf, returned_bytes, &flags);
+        let merge = merge_tape_alert_flags(cdb, buf, returned_bytes, &flags);
         Some(TapeAlertDecision {
             scenario,
             fault,
-            flags,
-            returned_bytes,
+            flags: merge.applied_flags,
+            returned_bytes: merge.returned_bytes,
         })
     }
 
@@ -782,6 +782,12 @@ struct TapeAlertDecision {
     fault: Fault,
     flags: Vec<u8>,
     returned_bytes: u32,
+}
+
+#[derive(Debug, Clone)]
+struct TapeAlertMerge {
+    returned_bytes: u32,
+    applied_flags: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1547,14 +1553,22 @@ fn parse_tape_alert_flag(value: &Value) -> Option<u8> {
         .filter(|flag| (1..=log_sense::TAPE_ALERT_FLAG_COUNT).contains(flag))
 }
 
-fn merge_tape_alert_flags(cdb: &[u8], buf: &mut [u8], returned_bytes: usize, flags: &[u8]) -> u32 {
+fn merge_tape_alert_flags(
+    cdb: &[u8],
+    buf: &mut [u8],
+    returned_bytes: usize,
+    flags: &[u8],
+) -> TapeAlertMerge {
     let alloc_len = log_sense_alloc_len(cdb);
     let limit = buf
         .len()
         .min(alloc_len)
         .min(log_sense::TAPE_ALERT_RESPONSE_LEN as usize);
     if limit == 0 {
-        return 0;
+        return TapeAlertMerge {
+            returned_bytes: 0,
+            applied_flags: Vec::new(),
+        };
     }
 
     let mut visible_len = returned_bytes.min(buf.len()).min(alloc_len);
@@ -1563,23 +1577,42 @@ fn merge_tape_alert_flags(cdb: &[u8], buf: &mut [u8], returned_bytes: usize, fla
     match log_sense::parse_response(&buf[..visible_len]) {
         Ok(alerts) => existing_flags.extend(alerts.active().iter().copied()),
         Err(_) => {
+            existing_flags.extend(flags.iter().copied());
             visible_len = synthesize_tape_alert_page(buf, limit, &existing_flags);
             synthesized = true;
         }
     }
 
-    let mut all_flags_set = true;
-    for flag in flags {
-        all_flags_set &= log_sense::set_tape_alert_flag(&mut buf[..visible_len], *flag);
-    }
-    if !all_flags_set && !synthesized && limit >= log_sense::TAPE_ALERT_RESPONSE_LEN as usize {
-        existing_flags.extend(flags.iter().copied());
-        visible_len = synthesize_tape_alert_page(buf, limit, &existing_flags);
+    let applied_flags = if synthesized {
+        flags
+            .iter()
+            .copied()
+            .filter(|flag| {
+                canonical_tape_alert_value_offset(*flag).is_some_and(|offset| offset < visible_len)
+            })
+            .collect()
+    } else {
+        let mut applied_flags = Vec::new();
+        let mut missed_flag = false;
         for flag in flags {
-            log_sense::set_tape_alert_flag(&mut buf[..visible_len], *flag);
+            if log_sense::set_tape_alert_flag(&mut buf[..visible_len], *flag) {
+                applied_flags.push(*flag);
+            } else {
+                missed_flag = true;
+            }
         }
+        if missed_flag && limit >= log_sense::TAPE_ALERT_RESPONSE_LEN as usize {
+            existing_flags.extend(flags.iter().copied());
+            visible_len = synthesize_tape_alert_page(buf, limit, &existing_flags);
+            flags.to_vec()
+        } else {
+            applied_flags
+        }
+    };
+    TapeAlertMerge {
+        returned_bytes: visible_len as u32,
+        applied_flags,
     }
-    visible_len as u32
 }
 
 fn synthesize_tape_alert_page(buf: &mut [u8], limit: usize, flags: &BTreeSet<u8>) -> usize {
@@ -1587,6 +1620,12 @@ fn synthesize_tape_alert_page(buf: &mut [u8], limit: usize, flags: &BTreeSet<u8>
     let visible_len = limit.min(clean.len());
     buf[..visible_len].copy_from_slice(&clean[..visible_len]);
     visible_len
+}
+
+fn canonical_tape_alert_value_offset(flag: u8) -> Option<usize> {
+    (1..=log_sense::TAPE_ALERT_FLAG_COUNT)
+        .contains(&flag)
+        .then(|| 8usize + usize::from(flag - 1) * 5)
 }
 
 fn log_sense_alloc_len(cdb: &[u8]) -> usize {
@@ -1906,6 +1945,99 @@ mod tests {
             event["returned_bytes"],
             u64::from(log_sense::TAPE_ALERT_RESPONSE_LEN)
         );
+    }
+
+    #[test]
+    fn tape_alert_short_alloc_reports_only_flags_written_to_response() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-chaos-alert-short")
+            .tempdir()
+            .unwrap();
+        let state_path = temp.path().join("state.db");
+        let conn = create_state(&state_path, "med07-alert-short", "seed-alert-short");
+        insert_fault(
+            &conn,
+            "med07-alert-short",
+            "MED-07",
+            json!({"drive":"drive1"}),
+            json!({"op":"log_sense"}),
+            json!({"tape_alert":[7,19]}),
+            "drive",
+        );
+        drop(conn);
+
+        let flag7_offset = canonical_tape_alert_value_offset(7).unwrap();
+        let flag19_offset = canonical_tape_alert_value_offset(19).unwrap();
+        let alloc_len = u16::try_from(flag7_offset + 1).unwrap();
+        let inner = FixtureTransport::new().with_responses([vec![0xde]]);
+        let ctx = DeviceCtx::new()
+            .with_drive_id("drive1")
+            .with_tape_id("RMN002L9")
+            .with_backend("fixture");
+        let mut transport = ChaosTransport::from_state_path(inner, &state_path, ctx).unwrap();
+        let cdb = log_sense::build_tape_alert_cdb(alloc_len);
+        let mut buf = vec![0u8; alloc_len as usize];
+
+        let outcome = transport.execute_in(&cdb, &mut buf).unwrap();
+
+        assert_eq!(outcome.bytes_transferred, u32::from(alloc_len));
+        assert_eq!(buf[flag7_offset], 1);
+        assert!(flag19_offset >= buf.len());
+
+        let events = read_jsonl(&event_log_path(&state_path));
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event["catalogue_id"], "MED-07");
+        assert_eq!(event["tape_alert"], json!([7]));
+        assert_eq!(event["returned_bytes"], u64::from(alloc_len));
+    }
+
+    #[test]
+    fn tape_alert_short_valid_page_reports_only_settable_flags() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-chaos-alert-short-valid")
+            .tempdir()
+            .unwrap();
+        let state_path = temp.path().join("state.db");
+        let conn = create_state(
+            &state_path,
+            "med07-alert-short-valid",
+            "seed-alert-short-valid",
+        );
+        insert_fault(
+            &conn,
+            "med07-alert-short-valid",
+            "MED-07",
+            json!({"drive":"drive1"}),
+            json!({"op":"log_sense"}),
+            json!({"tape_alert":[7,19]}),
+            "drive",
+        );
+        drop(conn);
+
+        let short_page = vec![0x2e, 0x00, 0x00, 0x05, 0x00, 0x07, 0x00, 0x01, 0x00];
+        let alloc_len = u16::try_from(short_page.len()).unwrap();
+        let inner = FixtureTransport::new().with_responses([short_page]);
+        let ctx = DeviceCtx::new()
+            .with_drive_id("drive1")
+            .with_tape_id("RMN002L9")
+            .with_backend("fixture");
+        let mut transport = ChaosTransport::from_state_path(inner, &state_path, ctx).unwrap();
+        let cdb = log_sense::build_tape_alert_cdb(alloc_len);
+        let mut buf = vec![0u8; alloc_len as usize];
+
+        let outcome = transport.execute_in(&cdb, &mut buf).unwrap();
+
+        assert_eq!(outcome.bytes_transferred, u32::from(alloc_len));
+        let alerts = log_sense::parse_response(&buf[..outcome.bytes_transferred as usize]).unwrap();
+        assert_eq!(alerts.active(), &BTreeSet::from([7]));
+
+        let events = read_jsonl(&event_log_path(&state_path));
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event["catalogue_id"], "MED-07");
+        assert_eq!(event["tape_alert"], json!([7]));
+        assert_eq!(event["returned_bytes"], u64::from(alloc_len));
     }
 
     #[test]
