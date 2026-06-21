@@ -79,6 +79,8 @@ pub enum Layer2AuditOpTag {
     TapeRewind,
     /// SSC READ POSITION.
     TapeReadPosition,
+    /// SSC LOG SENSE TapeAlert page read.
+    TapeReadAlerts,
     /// SSC LOCATE.
     TapeLocate,
     /// SSC SPACE.
@@ -111,6 +113,7 @@ impl Layer2AuditOpTag {
             Self::DriveLoad => "drive_load",
             Self::TapeRewind => "tape_rewind",
             Self::TapeReadPosition => "tape_read_position",
+            Self::TapeReadAlerts => "tape_read_alerts",
             Self::TapeLocate => "tape_locate",
             Self::TapeSpace => "tape_space",
             Self::TapeRead => "tape_read",
@@ -136,6 +139,7 @@ impl Layer2AuditOpTag {
             LibraryAuditOp::DriveLoad { .. } => Self::DriveLoad,
             LibraryAuditOp::TapeRewind { .. } => Self::TapeRewind,
             LibraryAuditOp::TapeReadPosition { .. } => Self::TapeReadPosition,
+            LibraryAuditOp::TapeReadAlerts { .. } => Self::TapeReadAlerts,
             LibraryAuditOp::TapeLocate { .. } => Self::TapeLocate,
             LibraryAuditOp::TapeSpace { .. } => Self::TapeSpace,
             LibraryAuditOp::TapeRead { .. } => Self::TapeRead,
@@ -689,6 +693,7 @@ fn add_library_operation_detail(
         | LibraryAuditOp::DriveLoad { bay }
         | LibraryAuditOp::TapeRewind { bay }
         | LibraryAuditOp::TapeReadPosition { bay }
+        | LibraryAuditOp::TapeReadAlerts { bay }
         | LibraryAuditOp::TapeReadConfig { bay }
         | LibraryAuditOp::TapeWriteConfig { bay } => {
             uint(detail, "bay_element", u64::from(bay));

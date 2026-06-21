@@ -6,7 +6,7 @@
 //! becomes one tape record, filemarks are records of their own, and READ
 //! POSITION reports the current record index.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -50,6 +50,8 @@ pub struct VirtualTape {
     pub block_size: u32,
     /// Hardware compression flag reported by MODE SENSE.
     pub compression: bool,
+    /// TapeAlert flags currently reported for this cartridge.
+    pub tape_alert_flags: BTreeSet<u8>,
 }
 
 impl VirtualTape {
@@ -63,6 +65,7 @@ impl VirtualTape {
             worm: false,
             block_size,
             compression: false,
+            tape_alert_flags: BTreeSet::new(),
         }
     }
 }
@@ -111,6 +114,8 @@ pub struct VirtualWorld {
     pub changer_serial: String,
     /// Drive bay element address to drive serial returned by VPD 0x80.
     pub drive_serials: HashMap<u16, String>,
+    /// Drive bay element address to drive-level TapeAlert flags.
+    pub drive_alert_flags: HashMap<u16, BTreeSet<u8>>,
     /// Changer element layout.
     pub element_layout: ElementLayout,
 }
@@ -136,6 +141,8 @@ impl VirtualWorld {
         drive_bays.insert(bay, None);
         let mut drive_source_slots = HashMap::new();
         drive_source_slots.insert(bay, None);
+        let mut drive_alert_flags = HashMap::new();
+        drive_alert_flags.insert(bay, BTreeSet::new());
         Self {
             tapes: HashMap::new(),
             slots,
@@ -143,6 +150,7 @@ impl VirtualWorld {
             drive_source_slots,
             changer_serial: changer_serial.into(),
             drive_serials,
+            drive_alert_flags,
             element_layout: ElementLayout {
                 robot_address: 0,
                 drive_start: bay,
@@ -202,6 +210,25 @@ impl VirtualWorld {
     /// Loaded barcode in `bay`, if any.
     pub fn loaded_barcode(&self, bay: u16) -> Option<&str> {
         self.drive_bays.get(&bay)?.as_deref()
+    }
+
+    /// Set one TapeAlert flag on a virtual cartridge.
+    pub fn set_tape_alert(&mut self, barcode: impl AsRef<str>, flag: u8) -> bool {
+        if !(1..=remanence_scsi::log_sense::TAPE_ALERT_FLAG_COUNT).contains(&flag) {
+            return false;
+        }
+        let Some(tape) = self.tapes.get_mut(barcode.as_ref()) else {
+            return false;
+        };
+        tape.tape_alert_flags.insert(flag)
+    }
+
+    /// Set one drive-level TapeAlert flag on a virtual bay.
+    pub fn set_drive_alert(&mut self, bay: u16, flag: u8) -> bool {
+        if !(1..=remanence_scsi::log_sense::TAPE_ALERT_FLAG_COUNT).contains(&flag) {
+            return false;
+        }
+        self.drive_alert_flags.entry(bay).or_default().insert(flag)
     }
 
     /// Build a public `Library` snapshot consistent with this virtual world.
@@ -397,6 +424,31 @@ impl ModelTransport {
         self.drive_bay()?;
         let flags = if self.position == 0 { 0x80 } else { 0x00 };
         copy_response(buf, &rp_long_response(flags, 0, self.position))
+    }
+
+    fn log_sense(&self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+        let bay = self.drive_bay()?;
+        let page_code = cdb.get(2).copied().unwrap_or(0) & 0x3f;
+        if page_code != remanence_scsi::log_sense::PAGE_TAPE_ALERT {
+            return Err(ScsiError::InvalidInput("unsupported LOG SENSE page"));
+        }
+
+        let world = self.world.lock().expect("virtual world lock");
+        let mut flags = world
+            .drive_alert_flags
+            .get(&bay)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(barcode) = world.loaded_barcode(bay) {
+            if let Some(tape) = world.tapes.get(barcode) {
+                flags.extend(tape.tape_alert_flags.iter().copied());
+            }
+        }
+
+        let page = remanence_scsi::log_sense::synthesize_tape_alert_page(&flags);
+        let n = page.len().min(buf.len()).min(log_sense_alloc_len(cdb));
+        buf[..n].copy_from_slice(&page[..n]);
+        Ok(TransferOutcome::clean(n as u32))
     }
 
     fn read_6(&mut self, buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
@@ -679,6 +731,7 @@ impl SgTransport for ModelTransport {
             ),
             Some(0x1a) => self.mode_sense(buf),
             Some(0x34) => self.read_position(buf),
+            Some(0x4d) => self.log_sense(cdb, buf),
             Some(0xb8) => {
                 self.ensure_changer()?;
                 let world = self.world.lock().expect("virtual world lock");
@@ -723,6 +776,14 @@ fn copy_response(buf: &mut [u8], response: &[u8]) -> Result<TransferOutcome, Scs
     let n = buf.len().min(response.len());
     buf[..n].copy_from_slice(&response[..n]);
     Ok(TransferOutcome::clean(n as u32))
+}
+
+fn log_sense_alloc_len(cdb: &[u8]) -> usize {
+    if cdb.len() >= 9 {
+        u16::from_be_bytes([cdb[7], cdb[8]]) as usize
+    } else {
+        usize::MAX
+    }
 }
 
 fn drive_path(bay: u16) -> PathBuf {
@@ -1651,6 +1712,159 @@ mod l1b_tests {
         );
         drop(conn);
         FaultEngine::from_state_path(state_path).expect("load fault engine")
+    }
+
+    fn arm_tape_alert(
+        state_path: &Path,
+        scenario_id: &str,
+        catalogue_id: &str,
+        target: Value,
+        flags: &[u8],
+        scope: &str,
+    ) -> FaultEngine {
+        let conn = Connection::open(state_path).expect("open state");
+        insert_fault(
+            &conn,
+            scenario_id,
+            catalogue_id,
+            target,
+            json!({"op": "log_sense"}),
+            json!({"tape_alert": flags}),
+            scope,
+        );
+        drop(conn);
+        FaultEngine::from_state_path(state_path).expect("load fault engine")
+    }
+
+    fn assert_alert_flags(alerts: &remanence_library::TapeAlerts, expected: &[u8]) {
+        let actual = alerts.active().iter().copied().collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    fn event_for<'a>(events: &'a [Value], catalogue_id: &str) -> &'a Value {
+        events
+            .iter()
+            .find(|event| event["catalogue_id"] == catalogue_id)
+            .unwrap_or_else(|| panic!("{catalogue_id} event missing from {events:#?}"))
+    }
+
+    #[test]
+    fn tape_alert_honest_device_reports_seeded_tape_flags() {
+        let world = loaded_world(64 * 1024 * 1024);
+        let mut drive = open_drive(Arc::clone(&world), None);
+
+        let clean = drive.read_tape_alerts().expect("read clean alerts");
+        assert_alert_flags(&clean, &[]);
+
+        {
+            let mut world = world.lock().expect("world lock");
+            assert!(world.set_tape_alert(BARCODE, 7));
+            assert!(world.set_tape_alert(BARCODE, 19));
+        }
+        let seeded = drive.read_tape_alerts().expect("read seeded alerts");
+        assert_alert_flags(&seeded, &[7, 19]);
+    }
+
+    #[test]
+    fn tape_alert_med07_tape_scope_sets_flags_and_jsonl() {
+        let world = loaded_world(64 * 1024 * 1024);
+        let (_temp, state_path) =
+            chaos_state("remanence-chaos-l1b-med07", "l1b-med07", "seed-med07");
+        let engine = arm_tape_alert(
+            &state_path,
+            "l1b-med07",
+            "MED-07",
+            json!({"tape": BARCODE}),
+            &[7, 19],
+            "tape",
+        );
+        let mut drive = open_drive(Arc::clone(&world), Some(engine));
+
+        let alerts = drive.read_tape_alerts().expect("read MED-07 alerts");
+
+        assert_alert_flags(&alerts, &[7, 19]);
+        let events = read_jsonl(&event_log_path(&state_path));
+        let event = event_for(&events, "MED-07");
+        assert_eq!(event["operation"], "log_sense");
+        assert_eq!(event["seed"], "seed-med07");
+        assert_eq!(event["tape_alert"], json!([7, 19]));
+    }
+
+    #[test]
+    fn tape_alert_cln01_drive_scope_sets_drive_flag() {
+        let world = loaded_world(64 * 1024 * 1024);
+        let (_temp, state_path) =
+            chaos_state("remanence-chaos-l1b-cln01", "l1b-cln01", "seed-cln01");
+        let engine = arm_tape_alert(
+            &state_path,
+            "l1b-cln01",
+            "CLN-01",
+            json!({"drive": format!("bay-{BAY:04x}")}),
+            &[20],
+            "drive",
+        );
+        let mut drive = open_drive(Arc::clone(&world), Some(engine));
+
+        let alerts = drive.read_tape_alerts().expect("read CLN-01 alerts");
+
+        assert_alert_flags(&alerts, &[20]);
+        let events = read_jsonl(&event_log_path(&state_path));
+        let event = event_for(&events, "CLN-01");
+        assert_eq!(event["operation"], "log_sense");
+        assert_eq!(event["tape_alert"], json!([20]));
+    }
+
+    #[test]
+    fn tape_alert_hw04_reports_multiple_drive_flags() {
+        let world = loaded_world(64 * 1024 * 1024);
+        let (_temp, state_path) = chaos_state("remanence-chaos-l1b-hw04", "l1b-hw04", "seed-hw04");
+        let engine = arm_tape_alert(
+            &state_path,
+            "l1b-hw04",
+            "HW-04",
+            json!({"drive": format!("bay-{BAY:04x}")}),
+            &[58, 16],
+            "drive",
+        );
+        let mut drive = open_drive(Arc::clone(&world), Some(engine));
+
+        let alerts = drive.read_tape_alerts().expect("read HW-04 alerts");
+
+        assert_alert_flags(&alerts, &[16, 58]);
+        let events = read_jsonl(&event_log_path(&state_path));
+        let event = event_for(&events, "HW-04");
+        assert_eq!(event["tape_alert"], json!([58, 16]));
+    }
+
+    #[test]
+    fn tape_alert_fault_persists_across_repeated_reads() {
+        let world = loaded_world(64 * 1024 * 1024);
+        let (_temp, state_path) = chaos_state(
+            "remanence-chaos-l1b-alert-persist",
+            "l1b-alert-persist",
+            "seed-persist",
+        );
+        let engine = arm_tape_alert(
+            &state_path,
+            "l1b-alert-persist",
+            "MED-07",
+            json!({"tape": BARCODE}),
+            &[7, 19],
+            "tape",
+        );
+        let mut drive = open_drive(Arc::clone(&world), Some(engine));
+
+        let first = drive.read_tape_alerts().expect("first TapeAlert read");
+        let second = drive.read_tape_alerts().expect("second TapeAlert read");
+
+        assert_alert_flags(&first, &[7, 19]);
+        assert_alert_flags(&second, &[7, 19]);
+        let events = read_jsonl(&event_log_path(&state_path));
+        let count = events
+            .iter()
+            .filter(|event| event["catalogue_id"] == "MED-07")
+            .count();
+        assert_eq!(count, 2, "persistent alert should emit on both reads");
     }
 
     #[test]

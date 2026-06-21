@@ -54,6 +54,7 @@ pub use physical_io::{
     DriveHandlePhysicalSource, PhysicalFilemarkSpace, PhysicalReadOutcome, PhysicalTapePosition,
     PhysicalTapeSource,
 };
+pub use remanence_scsi::log_sense::{flag_name as tape_alert_flag_name, TapeAlerts};
 pub use sysfs::DeviceAttachment;
 #[cfg(target_os = "linux")]
 pub use transport::LinuxSgTransport;
