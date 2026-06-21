@@ -1429,7 +1429,10 @@ dependencies = [
 name = "remanence-chaos"
 version = "0.0.1"
 dependencies = [
+ "remanence-api",
+ "remanence-format",
  "remanence-library",
+ "remanence-parity",
  "remanence-scsi",
  "rusqlite",
  "serde",
