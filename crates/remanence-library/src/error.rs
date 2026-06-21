@@ -692,6 +692,11 @@ pub enum AuditOp {
         /// Drive bay address whose drive received READ POSITION.
         bay: u16,
     },
+    /// Layer 3a: SSC LOG SENSE TapeAlert page on a tape drive.
+    TapeReadAlerts {
+        /// Drive bay address whose drive received LOG SENSE.
+        bay: u16,
+    },
     /// Layer 3a: SSC LOCATE(16) on a tape drive — seek to LBA.
     TapeLocate {
         /// Drive bay address whose drive received LOCATE(16).

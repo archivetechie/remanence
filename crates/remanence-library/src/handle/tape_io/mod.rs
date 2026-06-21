@@ -20,7 +20,7 @@ pub mod model;
 
 use std::time::{Duration, Instant, SystemTime};
 
-use remanence_scsi::{decode_sense, ScsiError};
+use remanence_scsi::{decode_sense, log_sense::TapeAlerts, ScsiError};
 use thiserror::Error;
 
 use super::{fire_audit, lock_drive_shared, DirtyCause};
@@ -374,6 +374,47 @@ impl super::DriveHandle {
                 Ok(pos)
             }
             Err(mapped) => {
+                self.finish_tape_error(op, &mapped);
+                Err(mapped)
+            }
+        }
+    }
+
+    /// Query the drive's current TapeAlert flags via LOG SENSE page 0x2E.
+    ///
+    /// This is a read-only status command. Malformed LOG SENSE payloads surface
+    /// as [`TapeIoError::MalformedResponse`] so callers can distinguish a
+    /// successful CDB with unusable medium-sourced bytes from CHECK CONDITION or
+    /// transport failure.
+    pub fn read_tape_alerts(&mut self) -> Result<TapeAlerts, TapeIoError> {
+        let op = AuditOp::TapeReadAlerts {
+            bay: self.bay_address,
+        };
+        let cdb = remanence_scsi::log_sense::build_tape_alert_cdb(
+            remanence_scsi::log_sense::TAPE_ALERT_RESPONSE_LEN,
+        );
+        self.fire_tape_started(op, &cdb);
+
+        let started = Instant::now();
+        self.transport.set_timeout_for(TimeoutClass::TapeStatus);
+        let mut buf = [0u8; remanence_scsi::log_sense::TAPE_ALERT_RESPONSE_LEN as usize];
+        match self.transport.execute_in(&cdb, &mut buf) {
+            Ok(outcome) => {
+                let bytes = (outcome.bytes_transferred as usize).min(buf.len());
+                match remanence_scsi::log_sense::parse_response(&buf[..bytes]) {
+                    Ok(alerts) => {
+                        self.finish_tape_success(op, started.elapsed());
+                        Ok(alerts)
+                    }
+                    Err(err) => {
+                        let err = TapeIoError::MalformedResponse(err);
+                        self.finish_tape_error(op, &err);
+                        Err(err)
+                    }
+                }
+            }
+            Err(e) => {
+                let mapped = map_scsi(e);
                 self.finish_tape_error(op, &mapped);
                 Err(mapped)
             }
