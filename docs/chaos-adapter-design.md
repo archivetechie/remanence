@@ -5,6 +5,24 @@ and L1a/L1b split; de-risked `ModelTransport` via existing discovery fixtures +
 proven injection seam; bounded its scope)
 Date: 2026-06-09
 
+> **Erratum (2026-06-21) — MED-05 is caught by the SHA-256 digest, not the
+> parity layer.** Code review during Phase C design found that a MED-05 silent
+> flip returned under **GOOD status with no sense** is *not* seen by the
+> Reed-Solomon layer: the object block read (`remanence-parity/src/source.rs`,
+> `BlockSource::read_block`) is a length-checked passthrough, and RS
+> reconstruction + the sidecar CRC-64 run **only** on an *erasure* (sense key
+> `0x03` MEDIUM ERROR, or a transport error — `is_erasure`, `source.rs:1127`).
+> A silent flip carries no erasure signal, so by coding theory RS cannot locate
+> it; it is caught downstream by the end-to-end SHA-256 (rem-tar manifest anchor
+> `FormatError::ManifestDigestMismatch`, or per-entry `file_sha256`). This is
+> correct design (GOOD status is trusted; integrity is an end-to-end digest
+> property), but it means the L1b acceptance bullet below that says to assert
+> MED-05 detection at the *parity* layer is wrong. **Correct framing:** assert
+> MED-05 at the **digest layer**, and exercise Reed-Solomon separately with
+> **erasure** faults (MED-01). Superseded by
+> `docs/chaos-phase-c-modeltransport-design-v0.1.md` §2 (the per-fault detection
+> table). The acceptance bullet is corrected inline below.
+
 ## What changed in this revision (review summary)
 
 The first draft put the single fault seam at Remanence's **parity-layer
@@ -767,11 +785,17 @@ First hermetic end-to-end cut (L1b, `ModelTransport`):
 - Remanence writes fixed-block data to `ModelTransport`, reads it back, and gets
   the original bytes when chaos is disabled.
 - MED-05 mutates bytes inside a later `execute_in` READ while returning GOOD.
-  Assert the corruption was **detected** (parity-mismatch counter / event-log
-  entry), not merely that recovery succeeded — otherwise a parity layer that
-  silently reconstructs is indistinguishable from one that never saw the flip.
-- Corrupt **beyond** the parity tolerance and confirm the read fails loudly
-  rather than returning bad data as good.
+  Assert the corruption is **detected at the digest layer** —
+  `FormatError::ManifestDigestMismatch` (or a per-entry `file_sha256` mismatch) —
+  **not** at the parity layer (see the 2026-06-21 erratum: a GOOD-status flip is
+  invisible to Reed-Solomon, which verifies only on erasures). The point stands:
+  prove the flip was *caught*, not silently passed through.
+- Exercise Reed-Solomon with **erasure** faults (MED-01, sense key `0x03`):
+  within tolerance ⇒ assert a `RecoveryEvent{Recovered}` (the system noticed and
+  reconstructed, not silently); **beyond** tolerance ⇒ confirm the read fails
+  loudly with `ParityError::Unrecoverable{lost_count, limit}` rather than
+  returning bad data as good. A combined MED-01-erasure + MED-05-on-a-peer-shard
+  case proves the sidecar CRC-64 guards reconstruction integrity.
 - A virtual-capacity EOM scenario reaches the same fixed-format CHECK CONDITION
   path Remanence uses with real drives.
 - MOVE MEDIUM updates the drive→barcode association used by per-tape drive-path
