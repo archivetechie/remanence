@@ -18,6 +18,7 @@ pub mod initialize_element_status;
 pub mod inquiry;
 pub mod load_unload;
 pub mod locate;
+pub mod log_sense;
 pub mod mode;
 pub mod move_medium;
 pub mod prevent_allow;

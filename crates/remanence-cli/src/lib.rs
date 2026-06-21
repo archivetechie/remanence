@@ -65,9 +65,9 @@ use remanence_format::{
 #[cfg(target_os = "linux")]
 use remanence_library::DriveHandlePhysicalSource;
 use remanence_library::{
-    BlockSize, DirtyCause, DiscoveryError, DiscoveryReport, DiscoveryWarning, DriveBay,
-    DriveHandleSink, DriveHandleSource, FileBlockSink, FileBlockSource, IePort, Library, Slot,
-    StaticAllowlist, TapeConfig, VecBlockSource, WormMediaState,
+    tape_alert_flag_name, BlockSize, DirtyCause, DiscoveryError, DiscoveryReport, DiscoveryWarning,
+    DriveBay, DriveHandleSink, DriveHandleSource, FileBlockSink, FileBlockSource, IePort, Library,
+    Slot, StaticAllowlist, TapeAlerts, TapeConfig, VecBlockSource, WormMediaState,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -952,6 +952,9 @@ enum CatalogUnitOriginFilterArg {
 
 #[derive(Subcommand, Debug)]
 enum RemTapeCommand {
+    /// Read the loaded drive's TapeAlert LOG SENSE page.
+    Alerts(TapeAlertsArgs),
+
     /// Initialize one tape or a slot range.
     Init(TapeInitArgs),
 
@@ -962,6 +965,7 @@ enum RemTapeCommand {
 impl From<RemTapeCommand> for TapeCommand {
     fn from(value: RemTapeCommand) -> Self {
         match value {
+            RemTapeCommand::Alerts(args) => Self::Alerts(args),
             RemTapeCommand::Init(args) => Self::Init(args),
             RemTapeCommand::Retire(args) => Self::Retire(args),
         }
@@ -970,6 +974,9 @@ impl From<RemTapeCommand> for TapeCommand {
 
 #[derive(Subcommand, Debug)]
 enum TapeCommand {
+    /// Read the loaded drive's TapeAlert LOG SENSE page.
+    Alerts(TapeAlertsArgs),
+
     /// Initialize one tape or a slot range.
     Init(TapeInitArgs),
 
@@ -980,9 +987,38 @@ enum TapeCommand {
 impl TapeCommand {
     fn validate_before_discovery(&self) -> Result<(), String> {
         match self {
+            Self::Alerts(args) => args.validate_before_discovery(),
             Self::Init(args) => args.validate_before_discovery(),
             Self::Retire(args) => args.validate_before_discovery(),
         }
+    }
+}
+
+#[derive(Args, Debug)]
+struct TapeAlertsArgs {
+    /// Drive bay element address to query.
+    #[arg(long, value_parser = parse_element_addr)]
+    bay: u16,
+
+    /// Path to `/etc/rem/config.toml`.
+    #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
+    config: PathBuf,
+
+    /// Select a configured library when more than one is present.
+    #[arg(long, value_name = "SERIAL")]
+    library: Option<String>,
+}
+
+impl TapeAlertsArgs {
+    fn validate_before_discovery(&self) -> Result<(), String> {
+        if self
+            .library
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err("tape alerts --library cannot be empty".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -4021,8 +4057,94 @@ fn run_tape_command(
     err: &mut dyn Write,
 ) -> ExitCode {
     match command {
+        TapeCommand::Alerts(args) => run_tape_alerts(report, args, out, err),
         TapeCommand::Init(args) => run_tape_init(report, args, out, err),
         TapeCommand::Retire(_) => unreachable!("tape retire dispatched pre-discovery"),
+    }
+}
+
+fn run_tape_alerts(
+    report: &DiscoveryReport,
+    args: &TapeAlertsArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let config = match remanence_state::load_config(&args.config) {
+        Ok(config) => config,
+        Err(error) => {
+            let _ = writeln!(err, "error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let library = match unique_configured_library(report, &config, args.library.as_deref()) {
+        Ok(library) => library,
+        Err(error) => {
+            let _ = writeln!(err, "error: {error}");
+            print_warnings(report, err);
+            return ExitCode::from(1);
+        }
+    };
+    let policy = configured_library_policy(&config);
+    match run_tape_alerts_hardware(library, &policy, args) {
+        Ok(alerts) => {
+            print_tape_alerts(library.serial.as_str(), args.bay, &alerts, out);
+            print_warnings(report, err);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            let _ = writeln!(err, "error: {error}");
+            print_setcap_hint_if_error_text_matches(&error, err);
+            print_warnings(report, err);
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_tape_alerts_hardware(
+    library: &Library,
+    policy: &StaticAllowlist,
+    args: &TapeAlertsArgs,
+) -> Result<TapeAlerts, String> {
+    let mut handle = library
+        .open(policy)
+        .map_err(|error| format!("opening library: {error}"))?;
+    let mut drive = handle
+        .open_drive(args.bay, policy)
+        .map_err(|error| format!("open drive 0x{:04x}: {error}", args.bay))?;
+    drive
+        .read_tape_alerts()
+        .map_err(|error| format!("read TapeAlert page: {error}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_tape_alerts_hardware(
+    _library: &Library,
+    _policy: &StaticAllowlist,
+    _args: &TapeAlertsArgs,
+) -> Result<TapeAlerts, String> {
+    Err("tape alerts requires Linux SG_IO drive access in v0.1".to_string())
+}
+
+fn print_tape_alerts(library_serial: &str, bay: u16, alerts: &TapeAlerts, out: &mut dyn Write) {
+    let active = alerts
+        .active()
+        .iter()
+        .map(|flag| {
+            json!({
+                "flag": flag,
+                "name": tape_alert_flag_name(*flag),
+            })
+        })
+        .collect::<Vec<_>>();
+    let envelope = json!({
+        "schema": "rem.tape.alerts.v1",
+        "library_serial": library_serial,
+        "bay_element": bay,
+        "active": active,
+    });
+    if let Ok(line) = serde_json::to_string(&envelope) {
+        let _ = writeln!(out, "{line}");
     }
 }
 
@@ -4056,14 +4178,7 @@ fn run_tape_init(
                 return ExitCode::from(1);
             }
         };
-    let mut policy = StaticAllowlist::new(config.libraries.iter().map(|lib| lib.serial.clone()));
-    for library in config
-        .libraries
-        .iter()
-        .filter(|library| library.allow_derived_drive_identity)
-    {
-        policy = policy.with_derived_allowed(library.serial.clone());
-    }
+    let policy = configured_library_policy(&config);
 
     if args.dry_run {
         let mut catalog = match remanence_state::CatalogIndex::open_read_only(&paths.sqlite_path) {
@@ -4250,6 +4365,33 @@ fn configured_report_libraries<'a>(
         .iter()
         .filter(|library| configured.contains(library.serial.as_str()))
         .collect())
+}
+
+fn configured_library_policy(config: &remanence_state::RemConfig) -> StaticAllowlist {
+    let mut policy = StaticAllowlist::new(config.libraries.iter().map(|lib| lib.serial.clone()));
+    for library in config
+        .libraries
+        .iter()
+        .filter(|library| library.allow_derived_drive_identity)
+    {
+        policy = policy.with_derived_allowed(library.serial.clone());
+    }
+    policy
+}
+
+fn unique_configured_library<'a>(
+    report: &'a DiscoveryReport,
+    config: &remanence_state::RemConfig,
+    requested_library: Option<&str>,
+) -> Result<&'a Library, String> {
+    let libraries = configured_report_libraries(report, config, requested_library)?;
+    match libraries.as_slice() {
+        [library] => Ok(*library),
+        [] => Err("no configured libraries were discovered".to_string()),
+        _ => {
+            Err("multiple configured libraries were discovered; pass --library SERIAL".to_string())
+        }
+    }
 }
 
 fn unique_range_library<'a>(
@@ -9634,6 +9776,48 @@ tape_catalog_dir = "{0}/cache/tapes"
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn tape_alerts_parses_library_config_and_bay() {
+        let cli = Cli::parse_from([
+            "rem",
+            "tape",
+            "alerts",
+            "--bay",
+            "0x0100",
+            "--config",
+            "/tmp/rem.toml",
+            "--library",
+            "LIB123",
+        ]);
+
+        match cli.command {
+            RemCommand::Tape {
+                command: RemTapeCommand::Alerts(args),
+            } => {
+                assert_eq!(args.bay, 0x0100);
+                assert_eq!(args.config, PathBuf::from("/tmp/rem.toml"));
+                assert_eq!(args.library.as_deref(), Some("LIB123"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tape_alerts_json_includes_flag_numbers_and_names() {
+        let alerts = TapeAlerts::from_flags([20, 58]);
+        let mut out = Vec::new();
+        print_tape_alerts("LIB123", 0x0100, &alerts, &mut out);
+
+        let value: serde_json::Value = serde_json::from_slice(&out).expect("alerts json");
+        assert_eq!(value["schema"], "rem.tape.alerts.v1");
+        assert_eq!(value["library_serial"], "LIB123");
+        assert_eq!(value["bay_element"], 0x0100);
+        assert_eq!(value["active"][0]["flag"], 20);
+        assert_eq!(value["active"][0]["name"], "clean now");
+        assert_eq!(value["active"][1]["flag"], 58);
+        assert_eq!(value["active"][1]["name"], "microcode panic");
     }
 
     #[test]

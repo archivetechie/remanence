@@ -7,7 +7,7 @@
 //! does not talk to QuadStor or `/dev/sg*`; Phase B tests run over
 //! `FixtureTransport`.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::env;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use remanence_library::transport::{SgTransport, TimeoutClass, TransferOutcome};
-use remanence_scsi::ScsiError;
+use remanence_scsi::{log_sense, ScsiError};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -173,6 +173,7 @@ impl FaultEngine {
                 !inner.fired_once.contains(&fault.id)
                     && fault_matches(fault, ctx, command)
                     && !is_mutation_fault(fault)
+                    && !is_tape_alert_fault(fault)
             })
             .find_map(|fault| {
                 sense_for_fault(fault, command, requested_bytes).map(|sense| (fault.clone(), sense))
@@ -216,6 +217,37 @@ impl FaultEngine {
             fault,
             summary,
             corrupt_range_inserted: inserted,
+        })
+    }
+
+    fn post_log_sense_tape_alert(
+        &self,
+        ctx: &DeviceCtx,
+        command: &CommandInfo,
+        cdb: &[u8],
+        buf: &mut [u8],
+        returned_bytes: usize,
+    ) -> Option<TapeAlertDecision> {
+        if log_sense_page_code(cdb) != Some(log_sense::PAGE_TAPE_ALERT) {
+            return None;
+        }
+        let inner = self.inner.lock().expect("chaos engine lock");
+        let scenario = inner.scenario.clone()?;
+        drop(inner);
+
+        let (fault, flags) = scenario
+            .faults
+            .iter()
+            .filter(|fault| fault_matches(fault, ctx, command) && is_tape_alert_fault(fault))
+            .find_map(|fault| {
+                tape_alert_spec_for_fault(fault).map(|flags| (fault.clone(), flags))
+            })?;
+        let returned_bytes = merge_tape_alert_flags(cdb, buf, returned_bytes, &flags);
+        Some(TapeAlertDecision {
+            scenario,
+            fault,
+            flags,
+            returned_bytes,
         })
     }
 
@@ -423,6 +455,7 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
                     returned_bytes: decision.sense.bytes_transferred as u64,
                     sense: Some(&decision.sense),
                     mutation: None,
+                    tape_alert: None,
                     state_delta: Value::Null,
                 });
                 engine.log_event(event);
@@ -435,8 +468,8 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
 
         let result = self.inner.execute_in(cdb, buf);
         match result {
-            Ok(outcome) => {
-                let returned_bytes = outcome.bytes_transferred as usize;
+            Ok(mut outcome) => {
+                let mut returned_bytes = outcome.bytes_transferred as usize;
                 let mutation = if command.operation == "read" {
                     let cap = returned_bytes.min(buf.len());
                     self.engine.as_ref().and_then(|engine| {
@@ -445,20 +478,43 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
                 } else {
                     None
                 };
+                let tape_alert = if command.operation == "log_sense" {
+                    let decision = self.engine.as_ref().and_then(|engine| {
+                        engine.post_log_sense_tape_alert(
+                            &self.ctx,
+                            &command,
+                            cdb,
+                            buf,
+                            returned_bytes,
+                        )
+                    });
+                    if let Some(decision) = decision.as_ref() {
+                        outcome.bytes_transferred = decision.returned_bytes;
+                        returned_bytes = decision.returned_bytes as usize;
+                    }
+                    decision
+                } else {
+                    None
+                };
                 self.update_position_after_in_success(&command, buf, returned_bytes);
                 if let Some(engine) = &self.engine {
-                    let (scenario, fault, state_delta) = mutation.as_ref().map_or(
-                        (None, None, Value::Null),
-                        |mutation| {
-                            (
-                                Some(&mutation.scenario),
-                                Some(&mutation.fault),
-                                json!({
-                                    "corrupt_ranges_inserted": mutation.corrupt_range_inserted as u8
-                                }),
-                            )
-                        },
-                    );
+                    let (scenario, fault, state_delta) = if let Some(mutation) = mutation.as_ref() {
+                        (
+                            Some(&mutation.scenario),
+                            Some(&mutation.fault),
+                            json!({
+                                "corrupt_ranges_inserted": mutation.corrupt_range_inserted as u8
+                            }),
+                        )
+                    } else if let Some(tape_alert) = tape_alert.as_ref() {
+                        (
+                            Some(&tape_alert.scenario),
+                            Some(&tape_alert.fault),
+                            Value::Null,
+                        )
+                    } else {
+                        (None, None, Value::Null)
+                    };
                     let active = if scenario.is_none() {
                         active_scenario(engine)
                     } else {
@@ -474,6 +530,9 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
                         returned_bytes: outcome.bytes_transferred as u64,
                         sense: None,
                         mutation: mutation.as_ref().map(|mutation| &mutation.summary),
+                        tape_alert: tape_alert
+                            .as_ref()
+                            .map(|decision| decision.flags.as_slice()),
                         state_delta,
                     });
                     engine.log_event(event);
@@ -493,6 +552,7 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
                         returned_bytes,
                         sense: sense.as_ref(),
                         mutation: None,
+                        tape_alert: None,
                         state_delta: Value::Null,
                     });
                     engine.log_event(event);
@@ -516,6 +576,7 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
                     returned_bytes: 0,
                     sense: Some(&decision.sense),
                     mutation: None,
+                    tape_alert: None,
                     state_delta: Value::Null,
                 });
                 engine.log_event(event);
@@ -541,6 +602,7 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
                         returned_bytes: 0,
                         sense: None,
                         mutation: None,
+                        tape_alert: None,
                         state_delta: Value::Null,
                     });
                     engine.log_event(event);
@@ -560,6 +622,7 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
                         returned_bytes,
                         sense: sense.as_ref(),
                         mutation: None,
+                        tape_alert: None,
                         state_delta: Value::Null,
                     });
                     engine.log_event(event);
@@ -584,6 +647,7 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
                     returned_bytes: decision.sense.bytes_transferred as u64,
                     sense: Some(&decision.sense),
                     mutation: None,
+                    tape_alert: None,
                     state_delta: Value::Null,
                 });
                 engine.log_event(event);
@@ -609,6 +673,7 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
                         returned_bytes: outcome.bytes_transferred as u64,
                         sense: None,
                         mutation: None,
+                        tape_alert: None,
                         state_delta: Value::Null,
                     });
                     engine.log_event(event);
@@ -628,6 +693,7 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
                         returned_bytes,
                         sense: sense.as_ref(),
                         mutation: None,
+                        tape_alert: None,
                         state_delta: Value::Null,
                     });
                     engine.log_event(event);
@@ -708,6 +774,14 @@ struct MutationDecision {
     fault: Fault,
     summary: MutationSummary,
     corrupt_range_inserted: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TapeAlertDecision {
+    scenario: Scenario,
+    fault: Fault,
+    flags: Vec<u8>,
+    returned_bytes: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1017,6 +1091,7 @@ struct CommandEvent<'a> {
     returned_bytes: u64,
     sense: Option<&'a SenseSpec>,
     mutation: Option<&'a MutationSummary>,
+    tape_alert: Option<&'a [u8]>,
     state_delta: Value,
 }
 
@@ -1132,7 +1207,13 @@ fn command_event(input: CommandEvent<'_>) -> Value {
             .map(SenseSpec::event_json)
             .unwrap_or(Value::Null),
     );
-    row.insert("tape_alert".to_string(), Value::Null);
+    row.insert(
+        "tape_alert".to_string(),
+        input
+            .tape_alert
+            .map(|flags| json!(flags))
+            .unwrap_or(Value::Null),
+    );
     row.insert(
         "mutation_summary".to_string(),
         input
@@ -1272,6 +1353,10 @@ fn operation_matches(trigger_op: &str, command: &CommandInfo) -> bool {
 
 fn is_mutation_fault(fault: &Fault) -> bool {
     fault.catalogue_id == "MED-05" || fault.action.get("mutate").is_some()
+}
+
+fn is_tape_alert_fault(fault: &Fault) -> bool {
+    fault.action.get("tape_alert").is_some()
 }
 
 fn is_one_shot_fault(fault: &Fault) -> bool {
@@ -1443,6 +1528,77 @@ fn mutation_spec_for_fault(fault: &Fault) -> Option<MutationSpec> {
         offset,
         length,
     })
+}
+
+fn tape_alert_spec_for_fault(fault: &Fault) -> Option<Vec<u8>> {
+    let flags = fault
+        .action
+        .get("tape_alert")?
+        .as_array()?
+        .iter()
+        .filter_map(parse_tape_alert_flag)
+        .collect::<Vec<_>>();
+    (!flags.is_empty()).then_some(flags)
+}
+
+fn parse_tape_alert_flag(value: &Value) -> Option<u8> {
+    json_u64(Some(value))
+        .and_then(|value| u8::try_from(value).ok())
+        .filter(|flag| (1..=log_sense::TAPE_ALERT_FLAG_COUNT).contains(flag))
+}
+
+fn merge_tape_alert_flags(cdb: &[u8], buf: &mut [u8], returned_bytes: usize, flags: &[u8]) -> u32 {
+    let alloc_len = log_sense_alloc_len(cdb);
+    let limit = buf
+        .len()
+        .min(alloc_len)
+        .min(log_sense::TAPE_ALERT_RESPONSE_LEN as usize);
+    if limit == 0 {
+        return 0;
+    }
+
+    let mut visible_len = returned_bytes.min(buf.len()).min(alloc_len);
+    let mut synthesized = false;
+    let mut existing_flags = BTreeSet::new();
+    match log_sense::parse_response(&buf[..visible_len]) {
+        Ok(alerts) => existing_flags.extend(alerts.active().iter().copied()),
+        Err(_) => {
+            visible_len = synthesize_tape_alert_page(buf, limit, &existing_flags);
+            synthesized = true;
+        }
+    }
+
+    let mut all_flags_set = true;
+    for flag in flags {
+        all_flags_set &= log_sense::set_tape_alert_flag(&mut buf[..visible_len], *flag);
+    }
+    if !all_flags_set && !synthesized && limit >= log_sense::TAPE_ALERT_RESPONSE_LEN as usize {
+        existing_flags.extend(flags.iter().copied());
+        visible_len = synthesize_tape_alert_page(buf, limit, &existing_flags);
+        for flag in flags {
+            log_sense::set_tape_alert_flag(&mut buf[..visible_len], *flag);
+        }
+    }
+    visible_len as u32
+}
+
+fn synthesize_tape_alert_page(buf: &mut [u8], limit: usize, flags: &BTreeSet<u8>) -> usize {
+    let clean = log_sense::synthesize_tape_alert_page(flags);
+    let visible_len = limit.min(clean.len());
+    buf[..visible_len].copy_from_slice(&clean[..visible_len]);
+    visible_len
+}
+
+fn log_sense_alloc_len(cdb: &[u8]) -> usize {
+    if cdb.len() >= 9 {
+        u16::from_be_bytes([cdb[7], cdb[8]]) as usize
+    } else {
+        usize::MAX
+    }
+}
+
+fn log_sense_page_code(cdb: &[u8]) -> Option<u8> {
+    cdb.get(2).copied().map(|byte| byte & 0x3f)
 }
 
 fn apply_mutation(
@@ -1699,6 +1855,135 @@ mod tests {
 
         env::remove_var(ENV_CHAOS_ENABLED);
         env::remove_var(ENV_CHAOS_STATE);
+    }
+
+    #[test]
+    fn tape_alert_action_synthesizes_page_for_malformed_inner_response() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-chaos-alert")
+            .tempdir()
+            .unwrap();
+        let state_path = temp.path().join("state.db");
+        let conn = create_state(&state_path, "med07-alert", "seed-alert");
+        insert_fault(
+            &conn,
+            "med07-alert",
+            "MED-07",
+            json!({"drive":"drive1"}),
+            json!({"op":"log_sense"}),
+            json!({"tape_alert":[7,19]}),
+            "drive",
+        );
+        drop(conn);
+
+        let inner = FixtureTransport::new().with_responses([vec![0xde]]);
+        let ctx = DeviceCtx::new()
+            .with_drive_id("drive1")
+            .with_tape_id("RMN002L9")
+            .with_backend("fixture");
+        let mut transport = ChaosTransport::from_state_path(inner, &state_path, ctx).unwrap();
+        let cdb = log_sense::build_tape_alert_cdb(log_sense::TAPE_ALERT_RESPONSE_LEN);
+        let mut buf = vec![0u8; log_sense::TAPE_ALERT_RESPONSE_LEN as usize];
+
+        let outcome = transport.execute_in(&cdb, &mut buf).unwrap();
+
+        assert_eq!(
+            outcome.bytes_transferred,
+            u32::from(log_sense::TAPE_ALERT_RESPONSE_LEN)
+        );
+        let alerts = log_sense::parse_response(&buf[..outcome.bytes_transferred as usize]).unwrap();
+        assert!(alerts.is_set(7));
+        assert!(alerts.is_set(19));
+        assert_eq!(alerts.active().len(), 2);
+
+        let events = read_jsonl(&event_log_path(&state_path));
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event["catalogue_id"], "MED-07");
+        assert_eq!(event["operation"], "log_sense");
+        assert_eq!(event["tape_alert"], json!([7, 19]));
+        assert_eq!(
+            event["returned_bytes"],
+            u64::from(log_sense::TAPE_ALERT_RESPONSE_LEN)
+        );
+    }
+
+    #[test]
+    fn tape_alert_action_expands_valid_page_missing_flag_parameters() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-chaos-alert-empty")
+            .tempdir()
+            .unwrap();
+        let state_path = temp.path().join("state.db");
+        let conn = create_state(&state_path, "cln01-alert", "seed-alert-empty");
+        insert_fault(
+            &conn,
+            "cln01-alert",
+            "CLN-01",
+            json!({"drive":"drive1"}),
+            json!({"op":"log_sense"}),
+            json!({"tape_alert":[20]}),
+            "drive",
+        );
+        drop(conn);
+
+        let inner = FixtureTransport::new().with_responses([vec![0x2e, 0x00, 0x00, 0x00]]);
+        let ctx = DeviceCtx::new()
+            .with_drive_id("drive1")
+            .with_backend("fixture");
+        let mut transport = ChaosTransport::from_state_path(inner, &state_path, ctx).unwrap();
+        let cdb = log_sense::build_tape_alert_cdb(log_sense::TAPE_ALERT_RESPONSE_LEN);
+        let mut buf = vec![0u8; log_sense::TAPE_ALERT_RESPONSE_LEN as usize];
+
+        let outcome = transport.execute_in(&cdb, &mut buf).unwrap();
+
+        assert_eq!(
+            outcome.bytes_transferred,
+            u32::from(log_sense::TAPE_ALERT_RESPONSE_LEN)
+        );
+        let alerts = log_sense::parse_response(&buf[..outcome.bytes_transferred as usize]).unwrap();
+        assert!(alerts.is_set(20));
+        assert_eq!(alerts.active().len(), 1);
+    }
+
+    #[test]
+    fn tape_alert_expansion_preserves_existing_valid_flags() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-chaos-alert-preserve")
+            .tempdir()
+            .unwrap();
+        let state_path = temp.path().join("state.db");
+        let conn = create_state(&state_path, "cln01-preserve", "seed-alert-preserve");
+        insert_fault(
+            &conn,
+            "cln01-preserve",
+            "CLN-01",
+            json!({"drive":"drive1"}),
+            json!({"op":"log_sense"}),
+            json!({"tape_alert":[20]}),
+            "drive",
+        );
+        drop(conn);
+
+        let inner = FixtureTransport::new()
+            .with_responses([vec![0x2e, 0x00, 0x00, 0x05, 0x00, 0x07, 0x00, 0x01, 0x01]]);
+        let ctx = DeviceCtx::new()
+            .with_drive_id("drive1")
+            .with_backend("fixture");
+        let mut transport = ChaosTransport::from_state_path(inner, &state_path, ctx).unwrap();
+        let cdb = log_sense::build_tape_alert_cdb(log_sense::TAPE_ALERT_RESPONSE_LEN);
+        let mut buf = vec![0u8; log_sense::TAPE_ALERT_RESPONSE_LEN as usize];
+
+        let outcome = transport.execute_in(&cdb, &mut buf).unwrap();
+
+        assert_eq!(
+            outcome.bytes_transferred,
+            u32::from(log_sense::TAPE_ALERT_RESPONSE_LEN)
+        );
+        let alerts = log_sense::parse_response(&buf[..outcome.bytes_transferred as usize]).unwrap();
+        assert!(alerts.is_set(7));
+        assert!(alerts.is_set(20));
+        assert_eq!(alerts.active().len(), 2);
     }
 
     #[test]

@@ -3,6 +3,7 @@ use crate::error::{AuditOp, AuditOutcome, RescanError};
 use crate::model::{DriveBay, ElementLayout, IePort, InstalledDrive, Slot};
 use crate::transport::{FixtureTransport, RecordingLog, RecordingTransport, TransferOutcome};
 use crate::StaticAllowlist;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -3419,6 +3420,67 @@ fn drive_handle_read_config_surfaces_malformed_mode_response() {
         TapeIoError::MalformedModeResponse(_) => {}
         other => panic!("expected MalformedModeResponse, got {other:?}"),
     }
+    assert!(!handle.is_dirty(), "parse failure is not a transport error");
+}
+
+#[test]
+fn drive_handle_read_tape_alerts_parses_log_sense() {
+    let lib = open_drive_test_lib("LIB_TA01");
+    let policy = StaticAllowlist::new(["LIB_TA01"]);
+    let flags = BTreeSet::from([7, 19]);
+    let page = remanence_scsi::log_sense::synthesize_tape_alert_page(&flags);
+    let (factory, log) = multi_recording_factory(vec![
+        (
+            PathBuf::from("/dev/sg-mock"),
+            vec![changer_inquiry_response(), vpd80_response("LIB_TA01")],
+        ),
+        (
+            PathBuf::from("/dev/sg-drive-mock"),
+            vec![lto9_inquiry(), vpd80_response("DRV_A"), page],
+        ),
+    ]);
+    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+
+    let alerts = {
+        let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+        drive.read_tape_alerts().expect("read TapeAlert page")
+    };
+
+    assert_eq!(alerts.active(), &flags);
+    assert!(alerts.is_set(7));
+    assert!(!handle.is_dirty());
+    let log = log.borrow();
+    let cdb = log.iter().find(|cdb| cdb[0] == 0x4d).expect("LOG SENSE");
+    assert_eq!(cdb[2], 0x6e);
+    assert_eq!(&cdb[7..9], &[0x01, 0x44]);
+}
+
+#[test]
+fn drive_handle_read_tape_alerts_rejects_short_successful_transfer() {
+    let lib = open_drive_test_lib("LIB_TA02");
+    let policy = StaticAllowlist::new(["LIB_TA02"]);
+    let short_page =
+        remanence_scsi::log_sense::synthesize_tape_alert_page(&BTreeSet::from([20]))[..8].to_vec();
+    let (factory, _log) = multi_recording_factory(vec![
+        (
+            PathBuf::from("/dev/sg-mock"),
+            vec![changer_inquiry_response(), vpd80_response("LIB_TA02")],
+        ),
+        (
+            PathBuf::from("/dev/sg-drive-mock"),
+            vec![lto9_inquiry(), vpd80_response("DRV_A"), short_page],
+        ),
+    ]);
+    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+
+    let err = {
+        let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+        drive
+            .read_tape_alerts()
+            .expect_err("short TapeAlert page is malformed")
+    };
+
+    assert!(matches!(err, TapeIoError::MalformedResponse(_)));
     assert!(!handle.is_dirty(), "parse failure is not a transport error");
 }
 
