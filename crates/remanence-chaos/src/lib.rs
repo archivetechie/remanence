@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use remanence_library::transport::{SgTransport, TimeoutClass, TransferOutcome};
-use remanence_scsi::{log_sense, ScsiError};
+use remanence_scsi::{log_sense, read_element_status, ScsiError};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -63,6 +63,8 @@ pub enum ChaosError {
 /// library state, and changer drive-to-barcode coupling.
 #[derive(Debug, Clone, Default)]
 pub struct DeviceCtx {
+    /// Logical library/changer id when this context serves a changer.
+    pub library_id: Option<String>,
     /// Logical drive id, such as `drive1`.
     pub drive_id: Option<String>,
     /// Logical tape id when known.
@@ -82,6 +84,12 @@ impl DeviceCtx {
     /// Return a copy with `drive_id` set.
     pub fn with_drive_id(mut self, drive_id: impl Into<String>) -> Self {
         self.drive_id = Some(drive_id.into());
+        self
+    }
+
+    /// Return a copy with `library_id` set.
+    pub fn with_library_id(mut self, library_id: impl Into<String>) -> Self {
+        self.library_id = Some(library_id.into());
         self
     }
 
@@ -138,6 +146,7 @@ impl FaultEngine {
                 log_file,
                 scenario,
                 fired_once: HashSet::new(),
+                pending_ua: None,
             })),
         })
     }
@@ -186,6 +195,54 @@ impl FaultEngine {
             fault,
             sense,
         })
+    }
+
+    fn take_pending_ua(
+        &self,
+        ctx: &DeviceCtx,
+        command: &CommandInfo,
+    ) -> Option<CheckConditionDecision> {
+        if !is_changer_command(ctx, command) {
+            return None;
+        }
+        let mut inner = self.inner.lock().expect("chaos engine lock");
+        let pending = inner.pending_ua.take()?;
+        inner.fired_once.insert(pending.fault.id);
+        Some(CheckConditionDecision {
+            scenario: pending.scenario,
+            fault: pending.fault,
+            sense: pending.sense,
+        })
+    }
+
+    fn queue_pending_ua_after_move(&self, ctx: &DeviceCtx, command: &CommandInfo) {
+        if command.operation != "move_medium" || ctx.library_id.is_none() {
+            return;
+        }
+        let mut inner = self.inner.lock().expect("chaos engine lock");
+        let Some(scenario) = inner.scenario.clone() else {
+            return;
+        };
+        if inner.pending_ua.is_some() {
+            return;
+        }
+        let Some(fault) = scenario
+            .faults
+            .iter()
+            .find(|fault| {
+                !inner.fired_once.contains(&fault.id)
+                    && fault.catalogue_id == "LIB-03"
+                    && fault_matches(fault, ctx, command)
+            })
+            .cloned()
+        else {
+            return;
+        };
+        inner.pending_ua = Some(PendingUa {
+            scenario,
+            fault,
+            sense: lib03_pending_ua_sense(),
+        });
     }
 
     fn post_read_mutation(
@@ -248,6 +305,55 @@ impl FaultEngine {
             fault,
             flags: merge.applied_flags,
             returned_bytes: merge.returned_bytes,
+        })
+    }
+
+    fn post_read_element_status(
+        &self,
+        ctx: &DeviceCtx,
+        command: &CommandInfo,
+        buf: &mut [u8],
+        returned_bytes: usize,
+    ) -> Option<ElementStatusDecision> {
+        let inner = self.inner.lock().expect("chaos engine lock");
+        let scenario = inner.scenario.clone()?;
+        drop(inner);
+
+        let (fault, action) = scenario
+            .faults
+            .iter()
+            .filter(|fault| fault_matches(fault, ctx, command) && is_element_status_fault(fault))
+            .find_map(|fault| element_status_action(fault).map(|action| (fault.clone(), action)))?;
+        let cap = returned_bytes.min(buf.len());
+        let targets = element_status_targets(&fault, &buf[..cap]);
+        if targets.is_empty() {
+            return None;
+        }
+        let mut applied = Vec::new();
+        for target in &targets {
+            let changed = match action {
+                ElementStatusAction::BlankVoltag => {
+                    read_element_status::blank_element_voltag(&mut buf[..cap], *target)
+                }
+                ElementStatusAction::SetException => {
+                    read_element_status::set_element_exception(&mut buf[..cap], *target)
+                }
+            };
+            if changed {
+                applied.push(*target);
+            }
+        }
+        if applied.is_empty() {
+            return None;
+        }
+        Some(ElementStatusDecision {
+            scenario,
+            fault,
+            summary: ElementStatusSummary {
+                action: action.as_str(),
+                requested: targets,
+                applied,
+            },
         })
     }
 
@@ -443,6 +549,27 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
     fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
         let command = self.command_info(cdb, DataDirection::In, buf.len() as u64);
         if let Some(engine) = &self.engine {
+            if let Some(decision) = engine.take_pending_ua(&self.ctx, &command) {
+                let event = command_event(CommandEvent {
+                    scenario: Some(&decision.scenario),
+                    fault: Some(&decision.fault),
+                    ctx: &self.ctx,
+                    command: &command,
+                    inner_called: false,
+                    status: "check_condition",
+                    returned_bytes: decision.sense.bytes_transferred as u64,
+                    sense: Some(&decision.sense),
+                    mutation: None,
+                    tape_alert: None,
+                    element_status: None,
+                    state_delta: Value::Null,
+                });
+                engine.log_event(event);
+                return Err(ScsiError::CheckCondition {
+                    sense: decision.sense.to_fixed_sense(),
+                    bytes_transferred: decision.sense.bytes_transferred,
+                });
+            }
             if let Some(decision) = engine.pre_call_decision(&self.ctx, &command, buf.len() as u64)
             {
                 let event = command_event(CommandEvent {
@@ -456,6 +583,7 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
                     sense: Some(&decision.sense),
                     mutation: None,
                     tape_alert: None,
+                    element_status: None,
                     state_delta: Value::Null,
                 });
                 engine.log_event(event);
@@ -496,6 +624,13 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
                 } else {
                     None
                 };
+                let element_status = if command.operation == "read_element_status" {
+                    self.engine.as_ref().and_then(|engine| {
+                        engine.post_read_element_status(&self.ctx, &command, buf, returned_bytes)
+                    })
+                } else {
+                    None
+                };
                 self.update_position_after_in_success(&command, buf, returned_bytes);
                 if let Some(engine) = &self.engine {
                     let (scenario, fault, state_delta) = if let Some(mutation) = mutation.as_ref() {
@@ -510,6 +645,12 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
                         (
                             Some(&tape_alert.scenario),
                             Some(&tape_alert.fault),
+                            Value::Null,
+                        )
+                    } else if let Some(element_status) = element_status.as_ref() {
+                        (
+                            Some(&element_status.scenario),
+                            Some(&element_status.fault),
                             Value::Null,
                         )
                     } else {
@@ -533,6 +674,7 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
                         tape_alert: tape_alert
                             .as_ref()
                             .map(|decision| decision.flags.as_slice()),
+                        element_status: element_status.as_ref().map(|decision| &decision.summary),
                         state_delta,
                     });
                     engine.log_event(event);
@@ -553,6 +695,7 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
                         sense: sense.as_ref(),
                         mutation: None,
                         tape_alert: None,
+                        element_status: None,
                         state_delta: Value::Null,
                     });
                     engine.log_event(event);
@@ -565,6 +708,27 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
     fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
         let command = self.command_info(cdb, DataDirection::None, 0);
         if let Some(engine) = &self.engine {
+            if let Some(decision) = engine.take_pending_ua(&self.ctx, &command) {
+                let event = command_event(CommandEvent {
+                    scenario: Some(&decision.scenario),
+                    fault: Some(&decision.fault),
+                    ctx: &self.ctx,
+                    command: &command,
+                    inner_called: false,
+                    status: "check_condition",
+                    returned_bytes: 0,
+                    sense: Some(&decision.sense),
+                    mutation: None,
+                    tape_alert: None,
+                    element_status: None,
+                    state_delta: Value::Null,
+                });
+                engine.log_event(event);
+                return Err(ScsiError::CheckCondition {
+                    sense: decision.sense.to_fixed_sense(),
+                    bytes_transferred: 0,
+                });
+            }
             if let Some(decision) = engine.pre_call_decision(&self.ctx, &command, 0) {
                 let event = command_event(CommandEvent {
                     scenario: Some(&decision.scenario),
@@ -577,6 +741,7 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
                     sense: Some(&decision.sense),
                     mutation: None,
                     tape_alert: None,
+                    element_status: None,
                     state_delta: Value::Null,
                 });
                 engine.log_event(event);
@@ -592,6 +757,7 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
             Ok(()) => {
                 self.update_position_after_success(&command);
                 if let Some(engine) = &self.engine {
+                    engine.queue_pending_ua_after_move(&self.ctx, &command);
                     let event = command_event(CommandEvent {
                         scenario: active_scenario(engine).as_ref(),
                         fault: None,
@@ -603,6 +769,7 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
                         sense: None,
                         mutation: None,
                         tape_alert: None,
+                        element_status: None,
                         state_delta: Value::Null,
                     });
                     engine.log_event(event);
@@ -623,6 +790,7 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
                         sense: sense.as_ref(),
                         mutation: None,
                         tape_alert: None,
+                        element_status: None,
                         state_delta: Value::Null,
                     });
                     engine.log_event(event);
@@ -648,6 +816,7 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
                     sense: Some(&decision.sense),
                     mutation: None,
                     tape_alert: None,
+                    element_status: None,
                     state_delta: Value::Null,
                 });
                 engine.log_event(event);
@@ -674,6 +843,7 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
                         sense: None,
                         mutation: None,
                         tape_alert: None,
+                        element_status: None,
                         state_delta: Value::Null,
                     });
                     engine.log_event(event);
@@ -694,6 +864,7 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
                         sense: sense.as_ref(),
                         mutation: None,
                         tape_alert: None,
+                        element_status: None,
                         state_delta: Value::Null,
                     });
                     engine.log_event(event);
@@ -742,6 +913,7 @@ struct FaultEngineInner {
     log_file: Option<BufWriter<File>>,
     scenario: Option<Scenario>,
     fired_once: HashSet<i64>,
+    pending_ua: Option<PendingUa>,
 }
 
 #[derive(Debug, Clone)]
@@ -769,6 +941,13 @@ struct CheckConditionDecision {
 }
 
 #[derive(Debug, Clone)]
+struct PendingUa {
+    scenario: Scenario,
+    fault: Fault,
+    sense: SenseSpec,
+}
+
+#[derive(Debug, Clone)]
 struct MutationDecision {
     scenario: Scenario,
     fault: Fault,
@@ -788,6 +967,30 @@ struct TapeAlertDecision {
 struct TapeAlertMerge {
     returned_bytes: u32,
     applied_flags: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct ElementStatusDecision {
+    scenario: Scenario,
+    fault: Fault,
+    summary: ElementStatusSummary,
+}
+
+#[derive(Debug, Clone)]
+struct ElementStatusSummary {
+    action: &'static str,
+    requested: Vec<u16>,
+    applied: Vec<u16>,
+}
+
+impl ElementStatusSummary {
+    fn event_json(&self) -> Value {
+        json!({
+            "action": self.action,
+            "requested": self.requested,
+            "applied": self.applied,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1098,6 +1301,7 @@ struct CommandEvent<'a> {
     sense: Option<&'a SenseSpec>,
     mutation: Option<&'a MutationSummary>,
     tape_alert: Option<&'a [u8]>,
+    element_status: Option<&'a ElementStatusSummary>,
     state_delta: Value,
 }
 
@@ -1136,6 +1340,15 @@ fn command_event(input: CommandEvent<'_>) -> Value {
     row.insert(
         "cdb_opcode".to_string(),
         Value::String(hex_byte(input.command.opcode)),
+    );
+    row.insert(
+        "library_id".to_string(),
+        input
+            .ctx
+            .library_id
+            .as_ref()
+            .map(|value| Value::String(value.clone()))
+            .unwrap_or(Value::Null),
     );
     row.insert(
         "tape_id".to_string(),
@@ -1218,6 +1431,13 @@ fn command_event(input: CommandEvent<'_>) -> Value {
         input
             .tape_alert
             .map(|flags| json!(flags))
+            .unwrap_or(Value::Null),
+    );
+    row.insert(
+        "element_status".to_string(),
+        input
+            .element_status
+            .map(ElementStatusSummary::event_json)
             .unwrap_or(Value::Null),
     );
     row.insert(
@@ -1312,6 +1532,11 @@ fn fault_matches(fault: &Fault, ctx: &DeviceCtx, command: &CommandInfo) -> bool 
 }
 
 fn target_matches(target: &Value, ctx: &DeviceCtx) -> bool {
+    if let Some(library) = target.get("library").and_then(Value::as_str) {
+        if ctx.library_id.as_deref() != Some(library) {
+            return false;
+        }
+    }
     if let Some(drive) = target.get("drive").and_then(Value::as_str) {
         if ctx.drive_id.as_deref() != Some(drive) {
             return false;
@@ -1363,6 +1588,44 @@ fn is_mutation_fault(fault: &Fault) -> bool {
 
 fn is_tape_alert_fault(fault: &Fault) -> bool {
     fault.action.get("tape_alert").is_some()
+}
+
+fn is_element_status_fault(fault: &Fault) -> bool {
+    element_status_action(fault).is_some()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ElementStatusAction {
+    BlankVoltag,
+    SetException,
+}
+
+impl ElementStatusAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BlankVoltag => "blank_voltag",
+            Self::SetException => "set_exception",
+        }
+    }
+}
+
+fn element_status_action(fault: &Fault) -> Option<ElementStatusAction> {
+    if let Some(action) = fault.action.get("element_status").and_then(Value::as_str) {
+        return match action {
+            "blank_voltag" | "blank-volume-tag" | "blank_volume_tag" => {
+                Some(ElementStatusAction::BlankVoltag)
+            }
+            "set_exception" | "exception" | "inaccessible" => {
+                Some(ElementStatusAction::SetException)
+            }
+            _ => None,
+        };
+    }
+    match fault.catalogue_id.as_str() {
+        "LIB-05" => Some(ElementStatusAction::BlankVoltag),
+        "LIB-09" => Some(ElementStatusAction::SetException),
+        _ => None,
+    }
 }
 
 fn is_one_shot_fault(fault: &Fault) -> bool {
@@ -1440,6 +1703,14 @@ fn default_sense_for_catalogue(catalogue_id: &str) -> Option<SenseSpec> {
         "RDY-02" => (0x70, 0x02, 0x04, 0x00, false),
         "BUS-01" => (0x70, 0x06, 0x29, 0x00, false),
         "HOST-01" => (0x71, 0x03, 0x0c, 0x00, false),
+        "LIB-01" => (0x70, 0x05, 0x3b, 0x0e, false),
+        "LIB-02" => (0x70, 0x05, 0x3b, 0x0d, false),
+        "LIB-04" => (0x70, 0x06, 0x29, 0x02, false),
+        "LIB-06" => (0x70, 0x04, 0x15, 0x01, false),
+        "LIB-07" => (0x70, 0x04, 0x44, 0x00, false),
+        "LIB-08" => (0x70, 0x02, 0x04, 0x18, false),
+        "LIB-10" => (0x70, 0x02, 0x04, 0x00, false),
+        "LIB-11" => (0x70, 0x02, 0x3a, 0x00, false),
         _ => return None,
     };
     Some(SenseSpec {
@@ -1465,7 +1736,26 @@ fn sense_operation_allowed(catalogue_id: &str, command: &CommandInfo) -> bool {
         ),
         "BUS-01" => true,
         "HOST-01" => matches!(command.operation, "write" | "write_filemarks"),
+        "LIB-01" | "LIB-02" | "LIB-04" | "LIB-06" | "LIB-07" => command.operation == "move_medium",
+        "LIB-08" | "LIB-10" => {
+            matches!(command.operation, "move_medium" | "read_element_status")
+        }
+        "LIB-11" => matches!(command.operation, "read" | "space"),
         _ => false,
+    }
+}
+
+fn lib03_pending_ua_sense() -> SenseSpec {
+    SenseSpec {
+        response_code: 0x70,
+        key: 0x06,
+        asc: 0x28,
+        ascq: 0x00,
+        filemark: false,
+        eom: false,
+        ili: false,
+        information: None,
+        bytes_transferred: 0,
     }
 }
 
@@ -1553,6 +1843,24 @@ fn parse_tape_alert_flag(value: &Value) -> Option<u8> {
         .filter(|flag| (1..=log_sense::TAPE_ALERT_FLAG_COUNT).contains(flag))
 }
 
+fn element_status_targets(fault: &Fault, page: &[u8]) -> Vec<u16> {
+    if let Some(slot) =
+        json_u64(fault.target.get("slot")).and_then(|value| u16::try_from(value).ok())
+    {
+        return vec![slot];
+    }
+    read_element_status::parse(page)
+        .map(|status| {
+            status
+                .elements
+                .into_iter()
+                .filter(|element| element.element_type == read_element_status::ElementType::Storage)
+                .map(|element| element.address)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn merge_tape_alert_flags(
     cdb: &[u8],
     buf: &mut [u8],
@@ -1638,6 +1946,10 @@ fn log_sense_alloc_len(cdb: &[u8]) -> usize {
 
 fn log_sense_page_code(cdb: &[u8]) -> Option<u8> {
     cdb.get(2).copied().map(|byte| byte & 0x3f)
+}
+
+fn is_changer_command(ctx: &DeviceCtx, command: &CommandInfo) -> bool {
+    ctx.library_id.is_some() && matches!(command.direction, DataDirection::In | DataDirection::None)
 }
 
 fn apply_mutation(
@@ -2116,6 +2428,44 @@ mod tests {
         assert!(alerts.is_set(7));
         assert!(alerts.is_set(20));
         assert_eq!(alerts.active().len(), 2);
+    }
+
+    #[test]
+    fn lib_fault_sense_defaults_cover_catalogue_rows() {
+        let move_command = CommandInfo::decode(
+            &remanence_scsi::move_medium::build_cdb(0, 0x0400, 0x0100, false),
+            DataDirection::None,
+            0,
+        );
+        let res_command = CommandInfo::decode(
+            &read_element_status::build_cdb(0, 0, 16, true, true, true, 4096),
+            DataDirection::In,
+            4096,
+        );
+        let read_command = CommandInfo::decode(&read6(4), DataDirection::In, 4);
+        let space_command = CommandInfo::decode(&space6_blocks(1), DataDirection::None, 0);
+
+        for (catalogue_id, command, expected) in [
+            ("LIB-01", &move_command, (0x05, 0x3b, 0x0e)),
+            ("LIB-02", &move_command, (0x05, 0x3b, 0x0d)),
+            ("LIB-04", &move_command, (0x06, 0x29, 0x02)),
+            ("LIB-06", &move_command, (0x04, 0x15, 0x01)),
+            ("LIB-07", &move_command, (0x04, 0x44, 0x00)),
+            ("LIB-08", &move_command, (0x02, 0x04, 0x18)),
+            ("LIB-08", &res_command, (0x02, 0x04, 0x18)),
+            ("LIB-10", &move_command, (0x02, 0x04, 0x00)),
+            ("LIB-10", &res_command, (0x02, 0x04, 0x00)),
+            ("LIB-11", &read_command, (0x02, 0x3a, 0x00)),
+            ("LIB-11", &space_command, (0x02, 0x3a, 0x00)),
+        ] {
+            let sense = default_sense_for_catalogue(catalogue_id).expect("default sense");
+            assert_eq!((sense.key, sense.asc, sense.ascq), expected);
+            assert!(
+                sense_operation_allowed(catalogue_id, command),
+                "{catalogue_id} should allow {}",
+                command.operation
+            );
+        }
     }
 
     #[test]

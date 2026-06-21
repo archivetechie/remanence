@@ -95,8 +95,14 @@ impl Default for VirtualTape {
 pub struct SlotState {
     /// SCSI element address of this storage slot.
     pub address: u16,
+    /// Whether the model reports a cartridge present in this slot.
+    pub full: bool,
     /// Barcode currently in the slot.
     pub barcode: Option<String>,
+    /// Whether the accessor can reach this slot.
+    pub access: bool,
+    /// Whether the slot reports an element exception.
+    pub except: bool,
 }
 
 /// Shared virtual changer/tape state.
@@ -132,7 +138,10 @@ impl VirtualWorld {
         let slots = (0..slot_count)
             .map(|offset| SlotState {
                 address: slot_start.saturating_add(offset),
+                full: false,
                 barcode: None,
+                access: true,
+                except: false,
             })
             .collect::<Vec<_>>();
         let mut drive_serials = HashMap::new();
@@ -190,6 +199,7 @@ impl VirtualWorld {
             .iter_mut()
             .find(|slot| slot.address == slot_address)
             .expect("slot address belongs to virtual world");
+        slot.full = true;
         slot.barcode = Some(barcode);
     }
 
@@ -229,6 +239,26 @@ impl VirtualWorld {
             return false;
         }
         self.drive_alert_flags.entry(bay).or_default().insert(flag)
+    }
+
+    /// Mark one storage slot inaccessible in the honest model state.
+    pub fn set_slot_inaccessible(&mut self, address: u16) -> bool {
+        let Some(slot) = self.slots.iter_mut().find(|slot| slot.address == address) else {
+            return false;
+        };
+        slot.access = false;
+        slot.except = true;
+        true
+    }
+
+    /// Mark one storage slot full while leaving its barcode unreadable.
+    pub fn set_slot_full_without_voltag(&mut self, address: u16) -> bool {
+        let Some(slot) = self.slots.iter_mut().find(|slot| slot.address == address) else {
+            return false;
+        };
+        slot.full = true;
+        slot.barcode = None;
+        true
     }
 
     /// Build a public `Library` snapshot consistent with this virtual world.
@@ -278,7 +308,15 @@ impl VirtualWorld {
             .slots
             .iter()
             .map(|slot| {
-                descriptor_with_voltag(slot.address, slot.barcode.as_deref(), None, None, false)
+                descriptor_with_voltag(
+                    slot.address,
+                    slot.full,
+                    slot.barcode.as_deref(),
+                    None,
+                    None,
+                    slot.access,
+                    slot.except,
+                )
             })
             .collect::<Vec<_>>();
         append_element_page(&mut pages, 2, DESC_WITH_VOLTAG_LEN, slot_descs, true);
@@ -289,7 +327,15 @@ impl VirtualWorld {
             .map(|(&bay, serial)| {
                 let barcode = self.drive_bays.get(&bay).and_then(Option::as_deref);
                 let source = self.drive_source_slots.get(&bay).copied().flatten();
-                descriptor_with_voltag(bay, barcode, source, Some(serial.as_str()), true)
+                descriptor_with_voltag(
+                    bay,
+                    barcode.is_some(),
+                    barcode,
+                    source,
+                    Some(serial.as_str()),
+                    true,
+                    false,
+                )
             })
             .collect::<Vec<_>>();
         append_element_page(
@@ -899,14 +945,19 @@ fn common_descriptor(
 
 fn descriptor_with_voltag(
     address: u16,
+    full: bool,
     barcode: Option<&str>,
     source: Option<u16>,
     serial: Option<&str>,
     access: bool,
+    except: bool,
 ) -> Vec<u8> {
-    let mut desc = common_descriptor(address, barcode.is_some(), source, None);
+    let mut desc = common_descriptor(address, full, source, None);
     if access {
         desc[2] |= 0x08;
+    }
+    if except {
+        desc[2] |= 0x04;
     }
     let mut voltag = [b' '; VOLTAG_BLOCK_LEN];
     if let Some(barcode) = barcode {
@@ -932,10 +983,16 @@ fn append_dvcid_descriptor(out: &mut Vec<u8>, serial: &str) {
 
 fn take_from_element(world: &mut VirtualWorld, element: u16) -> Result<String, ScsiError> {
     if let Some(slot) = world.slots.iter_mut().find(|slot| slot.address == element) {
-        return slot
-            .barcode
-            .take()
-            .ok_or(ScsiError::InvalidInput("source slot is empty"));
+        if !slot.full {
+            return Err(ScsiError::InvalidInput("source slot is empty"));
+        }
+        let Some(barcode) = slot.barcode.take() else {
+            return Err(ScsiError::InvalidInput(
+                "source slot has no readable barcode",
+            ));
+        };
+        slot.full = false;
+        return Ok(barcode);
     }
     if let Some(entry) = world.drive_bays.get_mut(&element) {
         world.drive_source_slots.insert(element, None);
@@ -953,9 +1010,10 @@ fn put_into_element(
     source: Option<u16>,
 ) -> Result<(), ScsiError> {
     if let Some(slot) = world.slots.iter_mut().find(|slot| slot.address == element) {
-        if slot.barcode.is_some() {
+        if slot.full {
             return Err(ScsiError::InvalidInput("destination slot is occupied"));
         }
+        slot.full = true;
         slot.barcode = Some(barcode);
         return Ok(());
     }
@@ -1250,6 +1308,31 @@ mod tests {
         assert_eq!(drive.source_address, Some(0x0400));
         assert_eq!(drive.drive_serial.as_deref(), Some("DRV-MODEL"));
     }
+
+    #[test]
+    fn slot_seeders_round_trip_access_and_blank_voltag() {
+        let mut world = VirtualWorld::single_drive("LIB-MODEL", 0x0100, "DRV-MODEL", 0x0400, 2);
+
+        assert!(world.set_slot_inaccessible(0x0400));
+        assert!(world.set_slot_full_without_voltag(0x0401));
+
+        let library = world.library_snapshot();
+        let inaccessible = library
+            .slots
+            .iter()
+            .find(|slot| slot.element_address == 0x0400)
+            .expect("inaccessible slot");
+        let blank = library
+            .slots
+            .iter()
+            .find(|slot| slot.element_address == 0x0401)
+            .expect("blank-voltag slot");
+        assert!(!inaccessible.accessible);
+        assert!(!inaccessible.full);
+        assert!(blank.accessible);
+        assert!(blank.full);
+        assert_eq!(blank.cartridge, None);
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -1265,7 +1348,8 @@ mod l1b_tests {
         RemTarObjectOptions,
     };
     use remanence_library::{
-        BlockSource, DriveHandle, IoErrorKind, LibraryHandle, StaticAllowlist,
+        AuditEvent, AuditOutcome, BlockSource, DriveHandle, IoErrorKind, LibraryHandle, MoveError,
+        StaticAllowlist, TapeIoError,
     };
     use remanence_parity::{
         scan_reconstruct_filemark_map, CapacityReserveInput, DriveHandleRawSink,
@@ -1278,6 +1362,7 @@ mod l1b_tests {
     use tempfile::TempDir;
 
     use crate::{ChaosTransport, DeviceCtx, FaultEngine};
+    use remanence_scsi::ScsiError;
 
     const LIB_SERIAL: &str = "LIB-L1B";
     const DRIVE_SERIAL: &str = "DRV-L1B";
@@ -1382,15 +1467,21 @@ mod l1b_tests {
 
     fn device_ctx(world: &SharedVirtualWorld, role: DeviceRole) -> DeviceCtx {
         let mut ctx = DeviceCtx::new().with_backend("model");
-        if let DeviceRole::Drive { bay } = role {
-            ctx = ctx.with_drive_id(format!("bay-{bay:04x}"));
-            if let Some(barcode) = world
-                .lock()
-                .expect("world lock")
-                .loaded_barcode(bay)
-                .map(str::to_string)
-            {
-                ctx = ctx.with_tape_id(barcode.clone()).with_barcode(barcode);
+        match role {
+            DeviceRole::Changer => {
+                let library_id = world.lock().expect("world lock").changer_serial.clone();
+                ctx = ctx.with_library_id(library_id);
+            }
+            DeviceRole::Drive { bay } => {
+                ctx = ctx.with_drive_id(format!("bay-{bay:04x}"));
+                if let Some(barcode) = world
+                    .lock()
+                    .expect("world lock")
+                    .loaded_barcode(bay)
+                    .map(str::to_string)
+                {
+                    ctx = ctx.with_tape_id(barcode.clone()).with_barcode(barcode);
+                }
             }
         }
         ctx
@@ -1736,6 +1827,63 @@ mod l1b_tests {
         FaultEngine::from_state_path(state_path).expect("load fault engine")
     }
 
+    fn arm_library_fault(
+        state_path: &Path,
+        scenario_id: &str,
+        catalogue_id: &str,
+        op: &str,
+        action: Value,
+        scope: &str,
+    ) -> FaultEngine {
+        let conn = Connection::open(state_path).expect("open state");
+        insert_fault(
+            &conn,
+            scenario_id,
+            catalogue_id,
+            json!({"library": LIB_SERIAL}),
+            json!({"op": op}),
+            action,
+            scope,
+        );
+        drop(conn);
+        FaultEngine::from_state_path(state_path).expect("load fault engine")
+    }
+
+    fn arm_element_status_fault(
+        state_path: &Path,
+        scenario_id: &str,
+        catalogue_id: &str,
+        slot: u16,
+    ) -> FaultEngine {
+        let conn = Connection::open(state_path).expect("open state");
+        insert_fault(
+            &conn,
+            scenario_id,
+            catalogue_id,
+            json!({"library": LIB_SERIAL, "slot": slot}),
+            json!({"op": "read_element_status"}),
+            json!({}),
+            "library",
+        );
+        drop(conn);
+        FaultEngine::from_state_path(state_path).expect("load fault engine")
+    }
+
+    fn arm_lib11_no_medium(state_path: &Path, scenario_id: &str) -> FaultEngine {
+        let conn = Connection::open(state_path).expect("open state");
+        insert_fault(
+            &conn,
+            scenario_id,
+            "LIB-11",
+            json!({"drive": format!("bay-{BAY:04x}")}),
+            json!({"op": "read"}),
+            json!({}),
+            "drive",
+        );
+        drop(conn);
+        FaultEngine::from_state_path(state_path).expect("load fault engine")
+    }
+
     fn assert_alert_flags(alerts: &remanence_library::TapeAlerts, expected: &[u8]) {
         let actual = alerts.active().iter().copied().collect::<Vec<_>>();
         assert_eq!(actual, expected);
@@ -1746,6 +1894,260 @@ mod l1b_tests {
             .iter()
             .find(|event| event["catalogue_id"] == catalogue_id)
             .unwrap_or_else(|| panic!("{catalogue_id} event missing from {events:#?}"))
+    }
+
+    fn sense_tuple(sense: &[u8]) -> (u8, u8, u8) {
+        let decoded = remanence_scsi::decode_sense(sense).expect("decode fixed sense");
+        (decoded.key, decoded.asc, decoded.ascq)
+    }
+
+    fn scsi_error_tuple(err: &ScsiError) -> (u8, u8, u8) {
+        match err {
+            ScsiError::CheckCondition { sense, .. } => sense_tuple(sense),
+            other => panic!("expected CHECK CONDITION, got {other:?}"),
+        }
+    }
+
+    fn capture_finished_sense(handle: &mut LibraryHandle) -> Arc<Mutex<Vec<(u8, u8, u8, bool)>>> {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_hook = Arc::clone(&captured);
+        handle.set_audit_hook(move |event| {
+            if let AuditEvent::Finished {
+                outcome:
+                    AuditOutcome::ScsiError {
+                        sense: Some(sense),
+                        dirty,
+                        ..
+                    },
+                ..
+            } = event
+            {
+                let (key, asc, ascq) = sense_tuple(sense);
+                captured_for_hook
+                    .lock()
+                    .expect("capture lock")
+                    .push((key, asc, ascq, *dirty));
+            }
+        });
+        captured
+    }
+
+    #[test]
+    fn changer_honest_refresh_and_move_succeed() {
+        let world = slotted_world(64 * 1024 * 1024);
+        let mut handle = open_handle(Arc::clone(&world), None);
+
+        handle.refresh().expect("honest refresh");
+        let slot = handle
+            .library()
+            .slots
+            .iter()
+            .find(|slot| slot.element_address == SLOT)
+            .expect("slot");
+        assert!(slot.full);
+        assert!(slot.accessible);
+        assert_eq!(slot.cartridge.as_deref(), Some(BARCODE));
+
+        handle
+            .move_medium(SLOT, BAY, &policy())
+            .expect("honest move");
+
+        let bay = handle
+            .library()
+            .drive_bays
+            .iter()
+            .find(|bay| bay.element_address == BAY)
+            .expect("bay");
+        assert!(bay.loaded);
+        assert_eq!(bay.loaded_tape.as_deref(), Some(BARCODE));
+        assert!(!handle.is_dirty());
+    }
+
+    #[test]
+    fn lib01_move_medium_returns_source_empty_sense_without_dirtying_snapshot() {
+        let world = slotted_world(64 * 1024 * 1024);
+        let (_temp, state_path) =
+            chaos_state("remanence-chaos-l1b-lib01", "l1b-lib01", "seed-lib01");
+        let engine = arm_library_fault(
+            &state_path,
+            "l1b-lib01",
+            "LIB-01",
+            "move_medium",
+            json!({}),
+            "library",
+        );
+        let mut handle = open_handle(Arc::clone(&world), Some(engine));
+        let captured = capture_finished_sense(&mut handle);
+
+        let err = handle
+            .move_medium(SLOT, BAY, &policy())
+            .expect_err("LIB-01 fails move");
+
+        match err {
+            MoveError::ScsiError(err) => assert_eq!(scsi_error_tuple(&err), (0x05, 0x3b, 0x0e)),
+            other => panic!("expected ScsiError, got {other:?}"),
+        }
+        assert!(!handle.is_dirty());
+        assert_eq!(
+            captured.lock().expect("capture lock").as_slice(),
+            &[(0x05, 0x3b, 0x0e, false)]
+        );
+    }
+
+    #[test]
+    fn lib08_move_medium_returns_door_open_sense() {
+        let world = slotted_world(64 * 1024 * 1024);
+        let (_temp, state_path) =
+            chaos_state("remanence-chaos-l1b-lib08", "l1b-lib08", "seed-lib08");
+        let engine = arm_library_fault(
+            &state_path,
+            "l1b-lib08",
+            "LIB-08",
+            "move_medium",
+            json!({}),
+            "library",
+        );
+        let mut handle = open_handle(Arc::clone(&world), Some(engine));
+        let captured = capture_finished_sense(&mut handle);
+
+        let err = handle
+            .move_medium(SLOT, BAY, &policy())
+            .expect_err("LIB-08 fails move");
+
+        match err {
+            MoveError::ScsiError(err) => assert_eq!(scsi_error_tuple(&err), (0x02, 0x04, 0x18)),
+            other => panic!("expected ScsiError, got {other:?}"),
+        }
+        assert_eq!(
+            captured.lock().expect("capture lock").as_slice(),
+            &[(0x02, 0x04, 0x18, false)]
+        );
+    }
+
+    #[test]
+    fn lib08_refresh_returns_door_open_sense() {
+        let world = slotted_world(64 * 1024 * 1024);
+        let (_temp, state_path) = chaos_state(
+            "remanence-chaos-l1b-lib08-refresh",
+            "l1b-lib08-refresh",
+            "seed-lib08-refresh",
+        );
+        let engine = arm_library_fault(
+            &state_path,
+            "l1b-lib08-refresh",
+            "LIB-08",
+            "read_element_status",
+            json!({}),
+            "library",
+        );
+        let mut handle = open_handle(Arc::clone(&world), Some(engine));
+
+        let err = handle.refresh().expect_err("LIB-08 fails refresh");
+
+        assert_eq!(scsi_error_tuple(&err), (0x02, 0x04, 0x18));
+    }
+
+    #[test]
+    fn lib05_refresh_reports_full_slot_without_readable_barcode() {
+        let world = slotted_world(64 * 1024 * 1024);
+        let (_temp, state_path) =
+            chaos_state("remanence-chaos-l1b-lib05", "l1b-lib05", "seed-lib05");
+        let engine = arm_element_status_fault(&state_path, "l1b-lib05", "LIB-05", SLOT);
+        let mut handle = open_handle(Arc::clone(&world), Some(engine));
+
+        handle.refresh().expect("LIB-05 refresh");
+
+        let slot = handle
+            .library()
+            .slots
+            .iter()
+            .find(|slot| slot.element_address == SLOT)
+            .expect("slot");
+        assert!(slot.full);
+        assert_eq!(slot.cartridge, None);
+        assert!(slot.accessible);
+        let events = read_jsonl(&event_log_path(&state_path));
+        let event = event_for(&events, "LIB-05");
+        assert_eq!(event["operation"], "read_element_status");
+        assert_eq!(event["element_status"]["action"], "blank_voltag");
+        assert_eq!(event["element_status"]["applied"], json!([SLOT]));
+    }
+
+    #[test]
+    fn lib09_refresh_reports_inaccessible_slot() {
+        let world = slotted_world(64 * 1024 * 1024);
+        let (_temp, state_path) =
+            chaos_state("remanence-chaos-l1b-lib09", "l1b-lib09", "seed-lib09");
+        let engine = arm_element_status_fault(&state_path, "l1b-lib09", "LIB-09", SLOT);
+        let mut handle = open_handle(Arc::clone(&world), Some(engine));
+
+        handle.refresh().expect("LIB-09 refresh");
+
+        let slot = handle
+            .library()
+            .slots
+            .iter()
+            .find(|slot| slot.element_address == SLOT)
+            .expect("slot");
+        assert!(slot.full);
+        assert!(!slot.accessible);
+        assert_eq!(slot.cartridge.as_deref(), Some(BARCODE));
+        let events = read_jsonl(&event_log_path(&state_path));
+        let event = event_for(&events, "LIB-09");
+        assert_eq!(event["operation"], "read_element_status");
+        assert_eq!(event["element_status"]["action"], "set_exception");
+        assert_eq!(event["element_status"]["applied"], json!([SLOT]));
+    }
+
+    #[test]
+    fn lib03_successful_move_queues_one_unit_attention_on_next_changer_command() {
+        let world = slotted_world(64 * 1024 * 1024);
+        let (_temp, state_path) =
+            chaos_state("remanence-chaos-l1b-lib03", "l1b-lib03", "seed-lib03");
+        let engine = arm_library_fault(
+            &state_path,
+            "l1b-lib03",
+            "LIB-03",
+            "move_medium",
+            json!({}),
+            "library",
+        );
+        let mut handle = open_handle(Arc::clone(&world), Some(engine));
+
+        handle
+            .move_medium(SLOT, BAY, &policy())
+            .expect("move succeeds before UA");
+
+        let err = handle
+            .move_medium(BAY, SLOT, &policy())
+            .expect_err("next changer command gets UA");
+        match err {
+            MoveError::ScsiError(err) => assert_eq!(scsi_error_tuple(&err), (0x06, 0x28, 0x00)),
+            other => panic!("expected ScsiError, got {other:?}"),
+        }
+        handle
+            .move_medium(BAY, SLOT, &policy())
+            .expect("UA is one-shot");
+    }
+
+    #[test]
+    fn lib11_drive_read_without_medium_maps_to_no_medium() {
+        let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+            LIB_SERIAL,
+            BAY,
+            DRIVE_SERIAL,
+            SLOT,
+            1,
+        )));
+        let (_temp, state_path) =
+            chaos_state("remanence-chaos-l1b-lib11", "l1b-lib11", "seed-lib11");
+        let engine = arm_lib11_no_medium(&state_path, "l1b-lib11");
+        let mut drive = open_drive(Arc::clone(&world), Some(engine));
+        let mut buf = vec![0u8; BLOCK_SIZE as usize];
+
+        let err = drive.read_block(&mut buf).expect_err("LIB-11 read fails");
+
+        assert!(matches!(err, TapeIoError::NoMedium));
     }
 
     #[test]

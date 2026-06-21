@@ -11787,6 +11787,7 @@ blob Project/Render Files/
         let mut lib = fake_library("LIB001");
         lib.drive_bays = vec![DriveBay {
             element_address: 1,
+            accessible: true,
             installed: None,
             loaded: false,
             loaded_tape: None,
@@ -11795,11 +11796,13 @@ blob Project/Render Files/
         lib.slots = vec![
             Slot {
                 element_address: 1000,
+                accessible: true,
                 full: true,
                 cartridge: Some("L00001".into()),
             },
             Slot {
                 element_address: 1001,
+                accessible: true,
                 full: false,
                 cartridge: None,
             },
@@ -11821,6 +11824,7 @@ blob Project/Render Files/
         let mut lib = fake_library("LIBJSON");
         lib.drive_bays = vec![DriveBay {
             element_address: 1,
+            accessible: true,
             installed: None,
             loaded: false,
             loaded_tape: None,
@@ -11828,6 +11832,7 @@ blob Project/Render Files/
         }];
         lib.slots = vec![Slot {
             element_address: 1000,
+            accessible: true,
             full: true,
             cartridge: Some("L00001".into()),
         }];
@@ -11868,6 +11873,7 @@ blob Project/Render Files/
         lib.drive_bays = vec![
             DriveBay {
                 element_address: 1,
+                accessible: true,
                 installed: Some(InstalledDrive {
                     serial: "DRIVE_AAA".into(),
                     identity_source: IdentitySource::DvcidInline,
@@ -11883,6 +11889,7 @@ blob Project/Render Files/
             },
             DriveBay {
                 element_address: 2,
+                accessible: true,
                 installed: None,
                 loaded: false,
                 loaded_tape: None,
@@ -11925,16 +11932,19 @@ blob Project/Render Files/
         lib.slots = vec![
             Slot {
                 element_address: 0x03e9,
+                accessible: true,
                 full: true,
                 cartridge: Some("CLNU01L9".into()),
             },
             Slot {
                 element_address: 0x03ea,
+                accessible: true,
                 full: true,
                 cartridge: Some("S20001L9".into()),
             },
             Slot {
                 element_address: 0x03eb,
+                accessible: true,
                 full: false,
                 cartridge: None,
             },

@@ -398,6 +398,103 @@ pub fn parse(buf: &[u8]) -> Result<ElementStatusData, ScsiError> {
     })
 }
 
+/// Space-fill the primary volume tag for one element descriptor.
+///
+/// This walks the READ ELEMENT STATUS response framing defensively and returns
+/// `false` for malformed, truncated, non-PVOLTAG, or missing descriptors. It
+/// never panics on medium-sourced bytes.
+pub fn blank_element_voltag(page: &mut [u8], element_address: u16) -> bool {
+    mutate_element_descriptor(page, element_address, |descriptor, pvoltag| {
+        if !pvoltag || descriptor.len() < COMMON_DESC_LEN + VOLTAG_BLOCK_LEN {
+            return false;
+        }
+        let start = COMMON_DESC_LEN;
+        descriptor[start..start + VOLTAG_ID_LEN].fill(b' ');
+        true
+    })
+}
+
+/// Mark one element descriptor as inaccessible with an exception.
+///
+/// The helper sets EXCEPT (`0x04`) and clears ACCESS (`0x08`) in the targeted
+/// descriptor's common flags byte. It returns `false` rather than panicking on
+/// malformed READ ELEMENT STATUS framing or an absent descriptor.
+pub fn set_element_exception(page: &mut [u8], element_address: u16) -> bool {
+    mutate_element_descriptor(page, element_address, |descriptor, _pvoltag| {
+        if descriptor.len() < COMMON_DESC_LEN {
+            return false;
+        }
+        descriptor[2] |= 0x04;
+        descriptor[2] &= !0x08;
+        true
+    })
+}
+
+fn mutate_element_descriptor(
+    page: &mut [u8],
+    element_address: u16,
+    mut mutate: impl FnMut(&mut [u8], bool) -> bool,
+) -> bool {
+    if page.len() < HEADER_LEN {
+        return false;
+    }
+    let byte_count = ((page[5] as usize) << 16) | ((page[6] as usize) << 8) | (page[7] as usize);
+    let Some(end) = HEADER_LEN.checked_add(byte_count) else {
+        return false;
+    };
+    if page.len() < end {
+        return false;
+    }
+
+    let mut cursor = HEADER_LEN;
+    while cursor < end {
+        let Some(page_header_end) = cursor.checked_add(PAGE_HEADER_LEN) else {
+            return false;
+        };
+        if page_header_end > end {
+            return false;
+        }
+
+        let pvoltag = (page[cursor + 1] & 0x80) != 0;
+        let desc_len = u16::from_be_bytes([page[cursor + 2], page[cursor + 3]]) as usize;
+        let page_bytes = ((page[cursor + 5] as usize) << 16)
+            | ((page[cursor + 6] as usize) << 8)
+            | page[cursor + 7] as usize;
+        if desc_len < COMMON_DESC_LEN || page_bytes % desc_len != 0 {
+            return false;
+        }
+        let Some(desc_start) = cursor.checked_add(PAGE_HEADER_LEN) else {
+            return false;
+        };
+        let Some(desc_end) = desc_start.checked_add(page_bytes) else {
+            return false;
+        };
+        if desc_end > end {
+            return false;
+        }
+
+        let mut descriptor_offset = desc_start;
+        while descriptor_offset < desc_end {
+            let Some(next_descriptor) = descriptor_offset.checked_add(desc_len) else {
+                return false;
+            };
+            if next_descriptor > desc_end {
+                return false;
+            }
+            let address =
+                u16::from_be_bytes([page[descriptor_offset], page[descriptor_offset + 1]]);
+            if address == element_address {
+                return mutate(&mut page[descriptor_offset..next_descriptor], pvoltag);
+            }
+            descriptor_offset = next_descriptor;
+        }
+
+        cursor = desc_end;
+    }
+
+    false
+}
+
 /// Trim trailing ASCII spaces and NULs from a fixed-width text field.
 fn trim_fixed_width_text(buf: &[u8]) -> Option<&str> {
     let end = buf
@@ -511,6 +608,97 @@ mod tests {
 
         assert_eq!(dvcid_only[6], 0x01, "byte 6 bit 0 is DVCID");
         assert_eq!(curdata_only[6], 0x02, "byte 6 bit 1 is CurData");
+    }
+
+    fn two_slot_response() -> Vec<u8> {
+        fn descriptor(address: u16, barcode: &str) -> Vec<u8> {
+            let mut desc = vec![0u8; COMMON_DESC_LEN + VOLTAG_BLOCK_LEN];
+            desc[0..2].copy_from_slice(&address.to_be_bytes());
+            desc[2] = 0x09; // FULL + ACCESS
+            desc[COMMON_DESC_LEN..COMMON_DESC_LEN + VOLTAG_ID_LEN].fill(b' ');
+            for (dst, src) in desc[COMMON_DESC_LEN..COMMON_DESC_LEN + VOLTAG_ID_LEN]
+                .iter_mut()
+                .zip(barcode.as_bytes())
+            {
+                *dst = *src;
+            }
+            desc
+        }
+
+        let desc_len = COMMON_DESC_LEN + VOLTAG_BLOCK_LEN;
+        let descs = [descriptor(0x0400, "TAPE001"), descriptor(0x0401, "TAPE002")].concat();
+        let page_bytes = descs.len();
+        let report_bytes = PAGE_HEADER_LEN + page_bytes;
+        let mut response = vec![0u8; HEADER_LEN + report_bytes];
+        response[0..2].copy_from_slice(&0x0400u16.to_be_bytes());
+        response[2..4].copy_from_slice(&2u16.to_be_bytes());
+        response[5] = ((report_bytes >> 16) & 0xff) as u8;
+        response[6] = ((report_bytes >> 8) & 0xff) as u8;
+        response[7] = (report_bytes & 0xff) as u8;
+
+        let page = HEADER_LEN;
+        response[page] = 2;
+        response[page + 1] = 0x80; // PVOLTAG
+        response[page + 2..page + 4].copy_from_slice(&(desc_len as u16).to_be_bytes());
+        response[page + 5] = ((page_bytes >> 16) & 0xff) as u8;
+        response[page + 6] = ((page_bytes >> 8) & 0xff) as u8;
+        response[page + 7] = (page_bytes & 0xff) as u8;
+        response[HEADER_LEN + PAGE_HEADER_LEN..].copy_from_slice(&descs);
+        response
+    }
+
+    #[test]
+    fn blank_element_voltag_mutates_target_only() {
+        let mut response = two_slot_response();
+
+        assert!(blank_element_voltag(&mut response, 0x0400));
+
+        let parsed = parse(&response).expect("mutated RES still parses");
+        let first = parsed
+            .elements
+            .iter()
+            .find(|element| element.address == 0x0400)
+            .expect("first slot");
+        let second = parsed
+            .elements
+            .iter()
+            .find(|element| element.address == 0x0401)
+            .expect("second slot");
+        assert!(first.full);
+        assert_eq!(first.primary_voltag, None);
+        assert_eq!(second.primary_voltag.as_deref(), Some("TAPE002"));
+    }
+
+    #[test]
+    fn set_element_exception_mutates_target_only() {
+        let mut response = two_slot_response();
+
+        assert!(set_element_exception(&mut response, 0x0401));
+
+        let parsed = parse(&response).expect("mutated RES still parses");
+        let first = parsed
+            .elements
+            .iter()
+            .find(|element| element.address == 0x0400)
+            .expect("first slot");
+        let second = parsed
+            .elements
+            .iter()
+            .find(|element| element.address == 0x0401)
+            .expect("second slot");
+        assert!(first.access);
+        assert!(!first.except);
+        assert!(!second.access);
+        assert!(second.except);
+    }
+
+    #[test]
+    fn element_mutators_fail_closed_on_truncation() {
+        let mut response = two_slot_response();
+        response.truncate(response.len() - 1);
+
+        assert!(!blank_element_voltag(&mut response, 0x0400));
+        assert!(!set_element_exception(&mut response, 0x0400));
     }
 
     #[test]

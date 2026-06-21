@@ -1596,6 +1596,7 @@ mod tests {
     fn make_empty_bay(addr: u16) -> DriveBay {
         DriveBay {
             element_address: addr,
+            accessible: true,
             installed: Some(InstalledDrive {
                 serial: "DRV_UNIT".to_string(),
                 identity_source: IdentitySource::DvcidAndInquiry,
@@ -1614,6 +1615,7 @@ mod tests {
     fn make_loaded_bay(addr: u16, voltag: &str) -> DriveBay {
         DriveBay {
             element_address: addr,
+            accessible: true,
             installed: Some(InstalledDrive {
                 serial: "DRV_UNIT".to_string(),
                 identity_source: IdentitySource::DvcidInline,
@@ -1635,6 +1637,7 @@ mod tests {
             vec![make_empty_bay(0x0100)],
             vec![remanence_library::Slot {
                 element_address: 0x0400,
+                accessible: true,
                 full: true,
                 cartridge: Some("RMN001L9".to_string()),
             }],
@@ -1662,6 +1665,7 @@ mod tests {
             vec![make_empty_bay(0x0100)],
             vec![remanence_library::Slot {
                 element_address: 0x0400,
+                accessible: true,
                 full: true,
                 cartridge: Some("OTHER001L9".to_string()),
             }],
@@ -1676,6 +1680,7 @@ mod tests {
             vec![make_loaded_bay(0x0100, "OTHER001L9")],
             vec![remanence_library::Slot {
                 element_address: 0x0400,
+                accessible: true,
                 full: true,
                 cartridge: Some("RMN001L9".to_string()),
             }],

@@ -580,6 +580,7 @@ mod tests {
                 .iter()
                 .map(|(element_address, drive_serial)| DriveBay {
                     element_address: *element_address,
+                    accessible: true,
                     installed: Some(InstalledDrive {
                         serial: (*drive_serial).to_string(),
                         identity_source: IdentitySource::DvcidInline,
