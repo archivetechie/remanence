@@ -21,7 +21,10 @@ thiserror = { workspace = true }
 time      = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+remanence-api    = { path = "../remanence-api" }
+remanence-format = { path = "../remanence-format" }
+remanence-parity = { path = "../remanence-parity" }
+tempfile         = { workspace = true }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

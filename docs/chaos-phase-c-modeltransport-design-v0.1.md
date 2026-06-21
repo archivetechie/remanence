@@ -1,9 +1,9 @@
 # Chaos Adapter Phase C — `ModelTransport` + L1b hermetic tests — design v0.1
 
-**Status:** design approved in discussion (2026-06-21, owner + claude); codex
-implementation pending. Devloop: this doc + `prompt-chaos-phase-c.md` hand off to
-codex. Refines `docs/chaos-adapter-design.md` (Components 2, Phase C, Fidelity
-ladder L1b) with code-verified seams. Companion to the landed Phase B
+**Status:** implemented in `crates/remanence-chaos` (2026-06-21). Devloop:
+this doc + `prompt-chaos-phase-c.md` handed off to codex. Refines
+`docs/chaos-adapter-design.md` (Components 2, Phase C, Fidelity ladder L1b)
+with code-verified seams. Companion to the landed Phase B
 (`crates/remanence-chaos`, `ChaosTransport` + `FaultEngine` + L1a tests).
 
 ## 1. Scope
