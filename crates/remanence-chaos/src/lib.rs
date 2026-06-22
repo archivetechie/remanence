@@ -30,6 +30,13 @@ pub mod model;
 /// Environment variable that enables chaos wrapping when set to a truthy value.
 pub const ENV_CHAOS_ENABLED: &str = "REM_CHAOS_ENABLED";
 
+/// Environment variable that permits chaos wrapping over real host SG devices.
+///
+/// L1 tests can wrap in-memory transports with only [`ENV_CHAOS_ENABLED`].
+/// The CLI's L2 path must also require this guard before installing
+/// `ChaosTransport<LinuxSgTransport>` on shared hardware.
+pub const ENV_CHAOS_ALLOW_REAL: &str = "REM_CHAOS_ALLOW_REAL";
+
 /// Environment variable containing the Phase A SQLite state path.
 pub const ENV_CHAOS_STATE: &str = "REM_CHAOS_STATE";
 
@@ -898,14 +905,25 @@ where
 
 /// Return true when `REM_CHAOS_ENABLED` has a truthy value.
 pub fn chaos_enabled_from_env() -> bool {
-    env::var(ENV_CHAOS_ENABLED)
-        .map(|value| {
-            matches!(
-                value.as_str(),
-                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-            )
-        })
+    env_truthy(ENV_CHAOS_ENABLED)
+}
+
+/// Return true only when chaos and real-hardware guardrail env vars are truthy.
+///
+/// This is intentionally stricter than [`chaos_enabled_from_env`]. It is the
+/// switch the `rem-debug` CLI uses before wrapping real Linux SG transports.
+pub fn chaos_real_enabled_from_env() -> bool {
+    env_truthy(ENV_CHAOS_ENABLED) && env_truthy(ENV_CHAOS_ALLOW_REAL)
+}
+
+fn env_truthy(name: &str) -> bool {
+    env::var(name)
+        .map(|value| is_truthy(&value))
         .unwrap_or(false)
+}
+
+fn is_truthy(value: &str) -> bool {
+    matches!(value, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
 }
 
 struct FaultEngineInner {
@@ -2209,6 +2227,25 @@ mod tests {
     }
 
     #[test]
+    fn real_hardware_gate_requires_enabled_and_allow_real() {
+        let _guard = env_guard();
+        let _snapshot = EnvSnapshot::capture();
+        env::remove_var(ENV_CHAOS_ENABLED);
+        env::remove_var(ENV_CHAOS_ALLOW_REAL);
+        env::remove_var(ENV_CHAOS_STATE);
+        assert!(!chaos_real_enabled_from_env());
+
+        env::set_var(ENV_CHAOS_ENABLED, "1");
+        assert!(!chaos_real_enabled_from_env());
+
+        env::set_var(ENV_CHAOS_ALLOW_REAL, "yes");
+        assert!(chaos_real_enabled_from_env());
+
+        env::set_var(ENV_CHAOS_ENABLED, "0");
+        assert!(!chaos_real_enabled_from_env());
+    }
+
+    #[test]
     fn tape_alert_action_synthesizes_page_for_malformed_inner_response() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-chaos-alert")
@@ -2855,6 +2892,38 @@ mod tests {
             .get_or_init(|| StdMutex::new(()))
             .lock()
             .expect("env lock")
+    }
+
+    struct EnvSnapshot {
+        enabled: Option<std::ffi::OsString>,
+        allow_real: Option<std::ffi::OsString>,
+        state: Option<std::ffi::OsString>,
+    }
+
+    impl EnvSnapshot {
+        fn capture() -> Self {
+            Self {
+                enabled: env::var_os(ENV_CHAOS_ENABLED),
+                allow_real: env::var_os(ENV_CHAOS_ALLOW_REAL),
+                state: env::var_os(ENV_CHAOS_STATE),
+            }
+        }
+    }
+
+    impl Drop for EnvSnapshot {
+        fn drop(&mut self) {
+            restore_env(ENV_CHAOS_ENABLED, self.enabled.take());
+            restore_env(ENV_CHAOS_ALLOW_REAL, self.allow_real.take());
+            restore_env(ENV_CHAOS_STATE, self.state.take());
+        }
+    }
+
+    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
+        if let Some(value) = value {
+            env::set_var(name, value);
+        } else {
+            env::remove_var(name);
+        }
     }
 
     #[derive(Debug, Default)]

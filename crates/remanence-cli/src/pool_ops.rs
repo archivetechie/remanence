@@ -176,7 +176,7 @@ pub fn run_archive_write(
         policy = policy.with_derived_allowed(s.clone());
     }
 
-    let mut library_handle = match lib.open(&policy) {
+    let mut library_handle = match crate::open_library_handle(lib, &policy) {
         Ok(h) => h,
         Err(e) => {
             let _ = writeln!(err, "error: opening library: {e}");
@@ -776,7 +776,7 @@ fn mount_tape_object(
     for s in allow_derived {
         policy = policy.with_derived_allowed(s.clone());
     }
-    let mut library_handle = lib.open(&policy).map_err(|e| {
+    let mut library_handle = crate::open_library_handle(lib, &policy).map_err(|e| {
         let _ = writeln!(err, "error: opening library: {e}");
         ExitCode::from(1)
     })?;

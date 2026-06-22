@@ -19,6 +19,7 @@ path = "src/rem_debug.rs"
 [dependencies]
 remanence-bru     = { path = "../remanence-bru", optional = true }
 remanence-aead    = { path = "../remanence-aead" }
+remanence-chaos   = { path = "../remanence-chaos" }
 remanence-format  = { path = "../remanence-format" }
 remanence-library = { path = "../remanence-library" }
 remanence-state   = { path = "../remanence-state" }
