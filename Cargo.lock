@@ -1453,6 +1453,7 @@ dependencies = [
  "remanence-aead",
  "remanence-api",
  "remanence-bru",
+ "remanence-chaos",
  "remanence-format",
  "remanence-library",
  "remanence-state",

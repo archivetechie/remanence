@@ -66,8 +66,9 @@ use remanence_format::{
 use remanence_library::DriveHandlePhysicalSource;
 use remanence_library::{
     tape_alert_flag_name, BlockSize, DirtyCause, DiscoveryError, DiscoveryReport, DiscoveryWarning,
-    DriveBay, DriveHandleSink, DriveHandleSource, FileBlockSink, FileBlockSource, IePort, Library,
-    Slot, StaticAllowlist, TapeAlerts, TapeConfig, VecBlockSource, WormMediaState,
+    DriveBay, DriveHandleSink, DriveHandleSource, FileBlockSink, FileBlockSource, IePort,
+    IoErrorKind, Library, OpenError, Slot, StaticAllowlist, TapeAlerts, TapeConfig, VecBlockSource,
+    WormMediaState,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -85,6 +86,17 @@ const DEFAULT_DEV_TAPE_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_SCSI_VARIABLE_WRITE_BYTES: usize = 0x00FF_FFFF;
 #[cfg(not(feature = "foreign-bru"))]
 const BRU_BLOCK_SIZE: usize = 2048;
+
+#[cfg(target_os = "linux")]
+type CliTransportFactory =
+    Box<dyn FnMut(&Path) -> Result<Box<dyn remanence_library::SgTransport>, IoErrorKind>>;
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum CliTransportAccess {
+    ReadOnly,
+    ReadWrite,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "rem", version, about = "Remanence — tape library operator CLI")]
@@ -2232,9 +2244,106 @@ pub fn debug_main_entry() -> ExitCode {
     run_cli(cli.into(), CliMode::Debug)
 }
 
+#[cfg(target_os = "linux")]
+fn cli_discover() -> Result<DiscoveryReport, DiscoveryError> {
+    let factory = cli_transport_factory(CliTransportAccess::ReadOnly)
+        .map_err(|cause| DiscoveryError::EnumerationDenied { cause })?;
+    let devices = remanence_library::sysfs::enumerate_sg_devices()
+        .map_err(|cause| DiscoveryError::EnumerationDenied { cause })?;
+    remanence_library::discover_with(devices, factory)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn open_library_handle(
+    library: &Library,
+    policy: &dyn remanence_library::AccessPolicy,
+) -> Result<remanence_library::LibraryHandle, OpenError> {
+    let factory = cli_transport_factory(CliTransportAccess::ReadWrite).map_err(|cause| {
+        OpenError::DeviceUnavailable {
+            path: library.changer_sg.clone(),
+            cause,
+        }
+    })?;
+    library.open_with(policy, factory)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn open_library_handle(
+    library: &Library,
+    _policy: &dyn remanence_library::AccessPolicy,
+) -> Result<remanence_library::LibraryHandle, OpenError> {
+    Err(OpenError::DeviceUnavailable {
+        path: library.changer_sg.clone(),
+        cause: IoErrorKind {
+            kind: "Unsupported",
+            message: "library hardware access is only implemented on Linux".to_string(),
+            raw_os_error: None,
+        },
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn cli_transport_factory(access: CliTransportAccess) -> Result<CliTransportFactory, IoErrorKind> {
+    let engine = if remanence_chaos::chaos_real_enabled_from_env() {
+        Some(remanence_chaos::FaultEngine::from_env().map_err(chaos_io_error)?)
+    } else {
+        None
+    };
+
+    Ok(Box::new(move |path| {
+        let inner = match access {
+            CliTransportAccess::ReadOnly => remanence_library::LinuxSgTransport::open(path),
+            CliTransportAccess::ReadWrite => remanence_library::LinuxSgTransport::open_rw(path),
+        }
+        .map_err(|error| IoErrorKind::from(&error))?;
+
+        if let Some(engine) = engine.clone() {
+            Ok(Box::new(remanence_chaos::ChaosTransport::new(
+                inner,
+                engine,
+                chaos_device_ctx(path),
+            )) as Box<dyn remanence_library::SgTransport>)
+        } else {
+            Ok(Box::new(inner) as Box<dyn remanence_library::SgTransport>)
+        }
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn chaos_device_ctx(path: &Path) -> remanence_chaos::DeviceCtx {
+    let label = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| path.display().to_string());
+    let drive_id = label
+        .strip_prefix("sg")
+        .and_then(|suffix| suffix.parse::<u16>().ok())
+        .map(|index| format!("drive{}", u32::from(index) + 1))
+        .unwrap_or(label);
+    remanence_chaos::DeviceCtx::new()
+        .with_backend("linux")
+        .with_drive_id(drive_id)
+}
+
+#[cfg(target_os = "linux")]
+fn chaos_io_error(error: remanence_chaos::ChaosError) -> IoErrorKind {
+    IoErrorKind {
+        kind: "Other",
+        message: format!("chaos runtime: {error}"),
+        raw_os_error: None,
+    }
+}
+
 fn run_cli(cli: ParsedCli, mode: CliMode) -> ExitCode {
     #[cfg(target_os = "linux")]
-    let discover_fn = remanence_library::discover;
+    let discover_fn = move || {
+        if mode == CliMode::Debug {
+            cli_discover()
+        } else {
+            remanence_library::discover()
+        }
+    };
     #[cfg(not(target_os = "linux"))]
     let discover_fn: fn() -> Result<DiscoveryReport, DiscoveryError> = || {
         Err(DiscoveryError::EnumerationDenied {
@@ -4106,8 +4215,7 @@ fn run_tape_alerts_hardware(
     policy: &StaticAllowlist,
     args: &TapeAlertsArgs,
 ) -> Result<TapeAlerts, String> {
-    let mut handle = library
-        .open(policy)
+    let mut handle = open_library_handle(library, policy)
         .map_err(|error| format!("opening library: {error}"))?;
     let mut drive = handle
         .open_drive(args.bay, policy)
@@ -4579,8 +4687,7 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         fresh_block_size,
         drive_element,
     } = plan;
-    let mut handle = library
-        .open(policy)
+    let mut handle = open_library_handle(library, policy)
         .map_err(|error| format!("opening library: {error}"))?;
     if candidate.location == TapeInitLocation::Slot {
         handle
@@ -7512,7 +7619,7 @@ fn open_and_run_archive_tape(
     err: &mut dyn Write,
     report: &DiscoveryReport,
 ) -> ExitCode {
-    let mut handle = match lib.open(policy) {
+    let mut handle = match open_library_handle(lib, policy) {
         Ok(h) => h,
         Err(e) => {
             let s = e.to_string();
@@ -7922,7 +8029,7 @@ where
         &dyn remanence_library::AccessPolicy,
     ) -> Result<String, String>,
 {
-    let mut handle = match lib.open(policy) {
+    let mut handle = match open_library_handle(lib, policy) {
         Ok(h) => h,
         Err(e) => {
             let s = e.to_string();
@@ -8717,6 +8824,118 @@ mod tests {
     };
     use std::fs;
     use std::path::PathBuf;
+
+    #[cfg(target_os = "linux")]
+    fn chaos_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex as StdMutex, OnceLock};
+
+        static ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .expect("chaos env lock")
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ChaosEnvSnapshot {
+        enabled: Option<std::ffi::OsString>,
+        allow_real: Option<std::ffi::OsString>,
+        state: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ChaosEnvSnapshot {
+        fn capture() -> Self {
+            Self {
+                enabled: std::env::var_os(remanence_chaos::ENV_CHAOS_ENABLED),
+                allow_real: std::env::var_os(remanence_chaos::ENV_CHAOS_ALLOW_REAL),
+                state: std::env::var_os(remanence_chaos::ENV_CHAOS_STATE),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ChaosEnvSnapshot {
+        fn drop(&mut self) {
+            restore_env(remanence_chaos::ENV_CHAOS_ENABLED, self.enabled.take());
+            restore_env(
+                remanence_chaos::ENV_CHAOS_ALLOW_REAL,
+                self.allow_real.take(),
+            );
+            restore_env(remanence_chaos::ENV_CHAOS_STATE, self.state.take());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
+        if let Some(value) = value {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn clear_chaos_env() {
+        std::env::remove_var(remanence_chaos::ENV_CHAOS_ENABLED);
+        std::env::remove_var(remanence_chaos::ENV_CHAOS_ALLOW_REAL);
+        std::env::remove_var(remanence_chaos::ENV_CHAOS_STATE);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn chaos_real_gate_requires_enabled_and_allow_real() {
+        let _guard = chaos_env_guard();
+        let _snapshot = ChaosEnvSnapshot::capture();
+        clear_chaos_env();
+
+        assert!(!remanence_chaos::chaos_real_enabled_from_env());
+        std::env::set_var(remanence_chaos::ENV_CHAOS_ENABLED, "1");
+        assert!(!remanence_chaos::chaos_real_enabled_from_env());
+        std::env::remove_var(remanence_chaos::ENV_CHAOS_ENABLED);
+        std::env::set_var(remanence_chaos::ENV_CHAOS_ALLOW_REAL, "1");
+        assert!(!remanence_chaos::chaos_real_enabled_from_env());
+        std::env::set_var(remanence_chaos::ENV_CHAOS_ENABLED, "yes");
+        assert!(remanence_chaos::chaos_real_enabled_from_env());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disabled_chaos_factory_builds_without_state_or_device_access() {
+        let _guard = chaos_env_guard();
+        let _snapshot = ChaosEnvSnapshot::capture();
+        clear_chaos_env();
+
+        let _factory = cli_transport_factory(CliTransportAccess::ReadOnly)
+            .expect("disabled chaos does not require REM_CHAOS_STATE");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enabled_chaos_factory_requires_state_before_device_access() {
+        let _guard = chaos_env_guard();
+        let _snapshot = ChaosEnvSnapshot::capture();
+        clear_chaos_env();
+        std::env::set_var(remanence_chaos::ENV_CHAOS_ENABLED, "1");
+        std::env::set_var(remanence_chaos::ENV_CHAOS_ALLOW_REAL, "1");
+
+        match cli_transport_factory(CliTransportAccess::ReadOnly) {
+            Ok(_) => panic!("enabled real-hardware chaos must require REM_CHAOS_STATE"),
+            Err(error) => {
+                assert_eq!(error.kind, "Other");
+                assert!(error.message.contains(remanence_chaos::ENV_CHAOS_STATE));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn chaos_device_context_uses_linux_backend_and_drive_alias() {
+        let ctx = chaos_device_ctx(Path::new("/dev/sg0"));
+
+        assert_eq!(ctx.backend.as_deref(), Some("linux"));
+        assert_eq!(ctx.drive_id.as_deref(), Some("drive1"));
+    }
 
     /// Build a minimal `Library` value from fixture INQUIRY bytes.
     /// Caller can mutate the returned struct to add drives, slots, etc.
