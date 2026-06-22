@@ -1,0 +1,13 @@
+[
+  {
+    "uuid": "73e5c211-e6e2-4604-ae19-d1ea75e2f0ab",
+    "datetime": "2026-06-22T08:10:40+02:00",
+    "author": "claude",
+    "subject": "Designed chaos Phase F (harness + L2); rem-side CLI hook prompt handed to codex",
+    "idref": "docs/prompt-chaos-phase-f-rem-hook.md",
+    "status": "approved",
+    "handoff_to": "codex",
+    "round": 1,
+    "summary": "Designed Phase F of the chaos adapter (caps the A-E arc). Cross-repo: design doc lives in ~/system/docs/design-chaos-harness-l2.md (it's primarily a harness thing, per owner); the rem-side piece is docs/prompt-chaos-phase-f-rem-hook.md (this repo). Two decisions taken with owner (both recommended): (1) rem hook = CLI-LAYER factory wrap only (switch rem-debug's open/discover to the public open_with/discover_with with a chaos-gated factory; open_drive inherits via the stored factory) - NO remanence-library/api/daemon change, no back-dependency; daemon-path chaos deferred. (2) L3 (real transport bounce) deferred. KEY FINDING (3 parallel Explore agents): the clean rem wiring is option-b (wrap at daemon/CLI layer) because remanence-library does NOT depend on remanence-chaos but remanence-chaos DOES depend on remanence-library (a direct library->chaos call would cycle); and remanence-api is a DEV-dep of remanence-chaos so api shouldn't normal-dep chaos. The public Library::open_with/discover_with factory seam (already used by L1b tests) lets remanence-cli (which can dep chaos freely) inject ChaosTransport<LinuxSgTransport> with zero library change. The rem hook gates on REM_CHAOS_ENABLED **and** REM_CHAOS_ALLOW_REAL (the guardrail so chaos over real hardware never engages by accident; the L1b ModelTransport path needs no such gate). DeviceCtx for L2 is minimal (backend=linux, drive_id from sg path); drive-scoped MED-05 is the marquee, tape-scoped (loaded barcode) a noted follow-up. Also caught: qschaos ships only scenario {validate,arm,clear,status}+log tail (the design's library-snapshot/transport-bounce are aspirational -> deferred with L3); MED-05 detection is digest-layer (FileDigestMismatch/ManifestDigestMismatch), not parity (Phase C/D erratum carried forward). I used --all-targets in the clippy line of the prompt (the gap that let Phase E's lint through). Docs were auto-committed by the gardener (e5423db) + B/C/D/E prompts archived by the daily housekeeper (a0beac5); this entry is the handoff record. Next: codex implements the rem-hook prompt here + the harness prompt in ~/system; the L2 green needs real mainlib on akash under guardrails (hardware-e2e debt). Chaos arc after F: only D2 (RDY-01/counters/time_scale) + deferred bits (daemon-path chaos, L3, changer-LUN TapeAlert) remain."
+  }
+]
