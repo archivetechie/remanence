@@ -29,6 +29,12 @@
 > **both** build-arg structs (`RemArchiveBuildArgs` `lib.rs:1281` + `ArchiveBuildArgs` `lib.rs:1827`) and
 > the `From` conversion (`lib.rs:1631`); (4) `--inputs`' `required_unless_present` is **extended** to
 > `["scan_only", "map"]` (it's already `"scan_only"`, not replaced).
+>
+> **Reviewed 2026-06-26 (codex round 3), 3 more folded in:** (1) use the **multi-arg clap methods** —
+> `conflicts_with_all` / `required_unless_present_any` (the list forms; `conflicts_with`/
+> `required_unless_present` are single-arg); (2) fixed the stale §1 shorthand that still said `--inputs`
+> becomes `required_unless_present = "map"` (would reintroduce the round-2 scan-only regression); (3) DoD
+> now tests `--map-sha256` mismatch-fails-before-build + matching-succeeds.
 
 ## 0. What this is
 The Remanence side of the arrangement arc. sutradhara freezes an arrangement into a **source-map**
@@ -56,9 +62,10 @@ is a CLI map-parser that builds the `Vec<ArchiveBuildInputFile>` from the TSV in
 ## 1. The load-bearing decisions (review focus)
 1. **`--map` is an input *front-end*, not a new command.** It feeds the existing
    `build_archive_object_file` core a `Vec<ArchiveBuildInputFile>` built from the TSV. Mutually
-   exclusive with `--inputs`/`--rules` (which walk a tree + apply ingest rules); `--inputs` becomes
-   `required_unless_present = "map"`. `--out`, `--encrypt`/`--key-file`/`--key-id`, `--chunk-size`,
-   `--object-id`, `--timestamp` all still compose (an encrypted RAO from a map = the offsite AEAD copy).
+   exclusive with `--inputs`/`--rules`/`--scan-only`; `--inputs`' existing `scan_only` exception is
+   **extended** to `required_unless_present_any = ["scan_only", "map"]` (not replaced — see §3 for the
+   exact clap attrs). `--out`, `--encrypt`/`--key-file`/`--key-id`, `--chunk-size`, `--object-id`,
+   `--timestamp` all still compose (an encrypted RAO from a map = the offsite AEAD copy).
 2. **The TSV sha256 is the value to *verify against*, never to trust-and-skip — and this is free.** The
    writer already recomputes each member's SHA-256 over the streamed source bytes and **errors if it ≠
    the spec's `file_sha256`** (`writer.rs:433-440`); it is an assertion today, not a trusted
@@ -139,16 +146,25 @@ whitespace-delimited field**, not read the whole file. (Producer: `arrangement.p
 `RemArchiveBuildArgs` (`lib.rs:1281`) **and** the direct/debug `ArchiveBuildArgs` (`lib.rs:1827`) — and
 carry them through the `From<RemArchiveBuildArgs> for ArchiveBuildArgs` conversion (`lib.rs:1631`).
 Adding them to only the shared struct would leave `rem archive build --map` unparsed.
-- `--map <PATH>` — the source-map TSV. **`conflicts_with = ["inputs", "rules", "scan_only"]`**
-  (a tree-walk scan makes no sense over a map) and **`requires = "source_root"`** — note the direction:
-  the security invariant is *`--map` requires `--source-root`*, so the `requires` goes on `--map`, **not**
-  on `--source-root` (clap's `requires` is one-directional). **Belt-and-braces:** also runtime-reject
-  `map.is_some() && source_root.is_none()` before reading the TSV — never let a security guard rest on a
-  clap attribute alone.
-- `--source-root <DIR>` — the anchor root; only meaningful with `--map`.
-- extend `--inputs`' existing `required_unless_present = "scan_only"` to
-  `required_unless_present = ["scan_only", "map"]` (keep `scan_only`); `--out` stays required for `--map`
-  (it produces an object file).
+- `--map <PATH>` — the source-map TSV. Use the **multi-arg** clap methods (the list forms of
+  `conflicts_with`/`required_unless_present` are `conflicts_with_all`/`required_unless_present_any`):
+  ```rust
+  #[arg(long, value_name = "PATH",
+        conflicts_with_all = ["inputs", "rules", "scan_only"],  // tree-walk/scan makes no sense over a map
+        requires = "source_root")]                              // map REQUIRES source-root (direction matters)
+  map: Option<PathBuf>,
+
+  #[arg(long, value_name = "PATH",
+        required_unless_present_any = ["scan_only", "map"],     // extend the existing scan_only exception
+        conflicts_with = "scan_only")]
+  inputs: Vec<PathBuf>,
+  ```
+  Note the `requires` direction: the security invariant is *`--map` requires `--source-root`*, so it
+  goes on `--map`, **not** on `--source-root` (clap's `requires` is one-directional). **Belt-and-braces:**
+  also runtime-reject `map.is_some() && source_root.is_none()` before reading the TSV — never let a
+  security guard rest on a clap attribute alone.
+- `--source-root <DIR>` — the anchor root; only meaningful with `--map`. `--out` stays required for
+  `--map` (it produces an object file).
 - (optional) `--map-sha256 <HEX>` — if given, rem verifies the TSV's SHA-256 equals it *before*
   building (catches a corrupted/truncated map in transit). Nice-to-have; see §7.
 
@@ -232,6 +248,8 @@ ends at the verified object file + report.
   validator, not `Path::components()`).
 - **`--map` without `--source-root`** ⇒ rejected (clap `requires` + runtime guard) before any TSV read.
 - **`--map --scan-only`** ⇒ rejected (conflicts), never reaches the scan branch.
+- **`--map-sha256` mismatch** ⇒ a wrong hex ⇒ build fails **before** building (transit-integrity guard);
+  **matching `--map-sha256`** (= the TSV's actual digest) ⇒ build proceeds normally.
 - **duplicate archive_path** ⇒ rejected.
 - **malformed TSV** — wrong column count / control char / bad hex / non-decimal size ⇒ rejected, clear error.
 - **encrypted map build** — `--encrypt --key-file … --map …` → AEAD RAO → extract round-trips (the
