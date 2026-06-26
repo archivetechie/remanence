@@ -7178,15 +7178,12 @@ fn archive_build_report_json(
     if let Some(ingest) = ingest {
         report["ingest"] = serde_json::to_value(&ingest.report)
             .unwrap_or_else(|error| json!({ "error": error.to_string() }));
-        if let Some(path) = &args.manifest_out {
-            report["manifest_out"] = json!(path);
-        }
     }
     if let Some(map_sha256) = map_sha256 {
         report["map_sha256"] = json!(bytes_to_hex(&map_sha256));
-        if let Some(path) = &args.manifest_out {
-            report["manifest_out"] = json!(path);
-        }
+    }
+    if let Some(path) = &args.manifest_out {
+        report["manifest_out"] = json!(path);
     }
     report
 }
@@ -11716,6 +11713,34 @@ blob Project/Render Files/
         assert_eq!(report["ruleset"]["name"], "scan");
         assert_eq!(report["scan"]["totals"]["blob_entries"], 1);
         assert!(!temp.path().join("archive.rao").exists());
+    }
+
+    #[test]
+    fn archive_build_scan_only_accepts_inputs_without_rules() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-scan-only-no-rules")
+            .tempdir()
+            .unwrap();
+        let input_dir = temp.path().join("inputs");
+        fs::create_dir_all(input_dir.join("native")).unwrap();
+        fs::write(input_dir.join("native/payload.bin"), b"native").unwrap();
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            input_dir.to_str().unwrap(),
+            "--scan-only",
+        ]);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let report: serde_json::Value = serde_json::from_str(&stdout).expect("scan json");
+        assert!(report["ruleset"].is_null());
+        assert_eq!(report["scan"]["totals"]["native_entries"], 1);
+        assert_eq!(report["scan"]["totals"]["blob_entries"], 0);
+        assert_eq!(report["scan"]["totals"]["wrapped_entries"], 0);
     }
 
     #[test]
