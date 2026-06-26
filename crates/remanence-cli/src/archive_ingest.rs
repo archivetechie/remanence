@@ -2496,7 +2496,7 @@ fn subtree_count_bytes(path: &Path) -> Result<(u64, u64), String> {
     Ok((count, bytes))
 }
 
-fn ensure_unique_archive_paths(files: &[ArchiveBuildInputFile]) -> Result<(), String> {
+pub(crate) fn ensure_unique_archive_paths(files: &[ArchiveBuildInputFile]) -> Result<(), String> {
     let mut seen = BTreeSet::new();
     for file in files {
         if !seen.insert(file.archive_path.clone()) {
