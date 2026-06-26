@@ -62,6 +62,13 @@ Added CLI-level tests for:
 Existing scan-only tests were kept green; the design snippet was corrected so
 `--inputs` remains valid with `--scan-only` while `--map` conflicts with both.
 
+Post-review follow-up:
+
+- Hoisted `manifest_out` report emission to one common block for rules-ingest
+  and map builds.
+- Added explicit CLI coverage for `rem archive build --inputs <dir>
+  --scan-only` with no rules file.
+
 ## Verification
 
 Focused checks already run:
