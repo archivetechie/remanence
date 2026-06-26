@@ -155,14 +155,16 @@ Adding them to only the shared struct would leave `rem archive build --map` unpa
   map: Option<PathBuf>,
 
   #[arg(long, value_name = "PATH",
-        required_unless_present_any = ["scan_only", "map"],     // extend the existing scan_only exception
-        conflicts_with = "scan_only")]
+        required_unless_present_any = ["scan_only", "map"])]    // extend the existing scan_only exception
   inputs: Vec<PathBuf>,
   ```
   Note the `requires` direction: the security invariant is *`--map` requires `--source-root`*, so it
   goes on `--map`, **not** on `--source-root` (clap's `requires` is one-directional). **Belt-and-braces:**
   also runtime-reject `map.is_some() && source_root.is_none()` before reading the TSV — never let a
   security guard rest on a clap attribute alone.
+  Do **not** put `conflicts_with = "scan_only"` on `inputs`: scan-only mode scans inputs and existing
+  `archive build --inputs ... --scan-only` behavior must remain valid. `--map` carries the `inputs`
+  conflict.
 - `--source-root <DIR>` — the anchor root; only meaningful with `--map`. `--out` stays required for
   `--map` (it produces an object file).
 - (optional) `--map-sha256 <HEX>` — if given, rem verifies the TSV's SHA-256 equals it *before*
