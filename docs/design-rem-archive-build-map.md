@@ -21,6 +21,14 @@
 > `archive_path_from_relative`/`Path::components()` (which silently normalize `a//b`/`a/./b`/`a/`); (3)
 > **`source_path` must be `is_absolute()`** before canonicalize (no CWD dependence); (4) **`ingest_item_id`
 > is reported as an opaque JSON *string***, echoed verbatim (P2.5 keys on a string).
+>
+> **Reviewed 2026-06-26 (codex round 2), 4 more folded in (all CLI-wiring):** (1) the `--source-root`
+> security requirement must go on **`--map` as `requires = "source_root"`** (clap `requires` is
+> one-directional) + a runtime `map && !source_root` reject; (2) **`--map` conflicts with `--scan-only`**
+> (the `if args.scan_only` branch at `lib.rs:5527` runs before input selection); (3) the new flags go in
+> **both** build-arg structs (`RemArchiveBuildArgs` `lib.rs:1281` + `ArchiveBuildArgs` `lib.rs:1827`) and
+> the `From` conversion (`lib.rs:1631`); (4) `--inputs`' `required_unless_present` is **extended** to
+> `["scan_only", "map"]` (it's already `"scan_only"`, not replaced).
 
 ## 0. What this is
 The Remanence side of the arrangement arc. sutradhara freezes an arrangement into a **source-map**
@@ -127,12 +135,26 @@ whitespace-delimited field**, not read the whole file. (Producer: `arrangement.p
 `f"{digest}  {SOURCE_MAP_NAME}\n"`.)
 
 ## 3. The `--map` flag (over existing machinery)
-**New `ArchiveBuildArgs` fields** (`crates/remanence-cli/src/lib.rs`):
-- `--map <PATH>` — the source-map TSV. `conflicts_with = ["inputs", "rules"]`.
-- `--source-root <DIR>` — the anchor root. `requires = "map"`; **required when `--map` is present**.
-- change `--inputs` to `required_unless_present = "map"`.
+**Add the three new fields to BOTH build-arg structs** — the user-facing `rem archive build` parser
+`RemArchiveBuildArgs` (`lib.rs:1281`) **and** the direct/debug `ArchiveBuildArgs` (`lib.rs:1827`) — and
+carry them through the `From<RemArchiveBuildArgs> for ArchiveBuildArgs` conversion (`lib.rs:1631`).
+Adding them to only the shared struct would leave `rem archive build --map` unparsed.
+- `--map <PATH>` — the source-map TSV. **`conflicts_with = ["inputs", "rules", "scan_only"]`**
+  (a tree-walk scan makes no sense over a map) and **`requires = "source_root"`** — note the direction:
+  the security invariant is *`--map` requires `--source-root`*, so the `requires` goes on `--map`, **not**
+  on `--source-root` (clap's `requires` is one-directional). **Belt-and-braces:** also runtime-reject
+  `map.is_some() && source_root.is_none()` before reading the TSV — never let a security guard rest on a
+  clap attribute alone.
+- `--source-root <DIR>` — the anchor root; only meaningful with `--map`.
+- extend `--inputs`' existing `required_unless_present = "scan_only"` to
+  `required_unless_present = ["scan_only", "map"]` (keep `scan_only`); `--out` stays required for `--map`
+  (it produces an object file).
 - (optional) `--map-sha256 <HEX>` — if given, rem verifies the TSV's SHA-256 equals it *before*
   building (catches a corrupted/truncated map in transit). Nice-to-have; see §7.
+
+**Guard `--map` against the `--scan-only` branch:** the build fn checks `if args.scan_only` (`lib.rs:5527`)
+*before* input selection and calls `scan_only_report(&args.inputs, …)` — so beyond the clap
+`conflicts_with`, the runtime must also reject `--map` reaching that branch (defence in depth).
 
 **Parse → `Vec<ArchiveBuildInputFile>`** (a new `archive_map.rs`, sibling to `archive_ingest.rs`):
 for each row, after the §2 validations, emit
@@ -208,6 +230,8 @@ ends at the verified object file + report.
 - **bad archive_path (raw)** — absolute / `..` / empty component / leading/trailing slash / non-UTF-8 ⇒
   rejected; and **`a//b` / `a/./b` / `a/` are rejected, not silently normalized** (proves the raw
   validator, not `Path::components()`).
+- **`--map` without `--source-root`** ⇒ rejected (clap `requires` + runtime guard) before any TSV read.
+- **`--map --scan-only`** ⇒ rejected (conflicts), never reaches the scan branch.
 - **duplicate archive_path** ⇒ rejected.
 - **malformed TSV** — wrong column count / control char / bad hex / non-decimal size ⇒ rejected, clear error.
 - **encrypted map build** — `--encrypt --key-file … --map …` → AEAD RAO → extract round-trips (the
