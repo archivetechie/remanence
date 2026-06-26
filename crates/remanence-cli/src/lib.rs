@@ -79,6 +79,7 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 mod archive_ingest;
+mod archive_map;
 mod pool_ops;
 
 const DEFAULT_DAEMON_ENDPOINT: &str = "unix:/var/lib/rem/rem.sock";
@@ -472,10 +473,10 @@ impl From<RemCommand> for Command {
                 command: command.into(),
             },
             RemCommand::Archive { command } => Self::Archive {
-                command: command.into(),
+                command: Box::new(command.into()),
             },
             RemCommand::Restore(args) => Self::Archive {
-                command: ArchiveCommand::Extract(args.into()),
+                command: Box::new(ArchiveCommand::Extract(args.into())),
             },
             RemCommand::Dev { command } => Self::Dev { command },
         }
@@ -856,7 +857,7 @@ enum Command {
     Archive {
         /// Archive operation to run.
         #[command(subcommand)]
-        command: ArchiveCommand,
+        command: Box<ArchiveCommand>,
     },
 
     /// Development-only hardware helpers.
@@ -1236,8 +1237,30 @@ enum RemArchiveCommand {
 #[derive(Args, Debug)]
 struct RemArchiveBuildArgs {
     /// Input files or directories. Directories are expanded recursively.
-    #[arg(long = "inputs", value_name = "PATH", num_args = 1.., required = true)]
+    #[arg(
+        long = "inputs",
+        value_name = "PATH",
+        num_args = 1..,
+        required_unless_present_any = ["scan_only", "map"]
+    )]
     inputs: Vec<PathBuf>,
+
+    /// Source-map TSV emitted by a trusted upstream planner.
+    #[arg(
+        long = "map",
+        value_name = "PATH",
+        conflicts_with_all = ["inputs", "rules", "scan_only"],
+        requires = "source_root"
+    )]
+    map: Option<PathBuf>,
+
+    /// Canonical source-root anchor for --map source paths.
+    #[arg(long = "source-root", value_name = "DIR")]
+    source_root: Option<PathBuf>,
+
+    /// Expected SHA-256 of the source-map TSV.
+    #[arg(long = "map-sha256", value_name = "HEX", requires = "map")]
+    map_sha256: Option<String>,
 
     /// Output RAO object file.
     #[arg(
@@ -1588,6 +1611,9 @@ impl From<RemArchiveBuildArgs> for ArchiveBuildArgs {
     fn from(value: RemArchiveBuildArgs) -> Self {
         Self {
             inputs: value.inputs,
+            map: value.map,
+            source_root: value.source_root,
+            map_sha256: value.map_sha256,
             out: value.out,
             rules: value.rules,
             scan_only: value.scan_only,
@@ -1782,8 +1808,30 @@ enum ArchiveCommand {
 #[derive(Args, Debug)]
 struct ArchiveBuildArgs {
     /// Input files or directories. Directories are expanded recursively.
-    #[arg(long = "inputs", value_name = "PATH", num_args = 1.., required = true)]
+    #[arg(
+        long = "inputs",
+        value_name = "PATH",
+        num_args = 1..,
+        required_unless_present_any = ["scan_only", "map"]
+    )]
     inputs: Vec<PathBuf>,
+
+    /// Source-map TSV emitted by a trusted upstream planner.
+    #[arg(
+        long = "map",
+        value_name = "PATH",
+        conflicts_with_all = ["inputs", "rules", "scan_only"],
+        requires = "source_root"
+    )]
+    map: Option<PathBuf>,
+
+    /// Canonical source-root anchor for --map source paths.
+    #[arg(long = "source-root", value_name = "DIR")]
+    source_root: Option<PathBuf>,
+
+    /// Expected SHA-256 of the source-map TSV.
+    #[arg(long = "map-sha256", value_name = "HEX", requires = "map")]
+    map_sha256: Option<String>,
 
     /// Output RAO object file.
     #[arg(
@@ -2497,6 +2545,7 @@ where
         return run_local_catalog_command(command, out, err);
     }
     if let Command::Archive { command } = &cli.command {
+        let command = command.as_ref();
         if let ArchiveCommand::Build(args) = command {
             return run_archive_build(args, out, err);
         }
@@ -2737,8 +2786,9 @@ where
             return run_tape_command(&report, &command, out, err);
         }
         Command::Archive { command } => {
+            let command = command.as_ref();
             if command.is_pool_write_command() {
-                if let ArchiveCommand::Write(args) = &command {
+                if let ArchiveCommand::Write(args) = command {
                     return pool_ops::run_archive_write(
                         &report,
                         &pool_ops::ArchiveWriteArgs {
@@ -2760,7 +2810,7 @@ where
                     );
                 }
             }
-            if let ArchiveCommand::Read(args) = &command {
+            if let ArchiveCommand::Read(args) = command {
                 return pool_ops::run_archive_read(
                     &report,
                     &pool_ops::ArchiveReadArgs {
@@ -2776,7 +2826,7 @@ where
                     err,
                 );
             }
-            if let ArchiveCommand::ExportObject(args) = &command {
+            if let ArchiveCommand::ExportObject(args) = command {
                 return pool_ops::run_archive_export_object(
                     &report,
                     &pool_ops::ArchiveExportObjectArgs {
@@ -2791,7 +2841,7 @@ where
                     err,
                 );
             }
-            if let ArchiveCommand::Verify(args) = &command {
+            if let ArchiveCommand::Verify(args) = command {
                 return pool_ops::run_archive_verify(
                     &report,
                     &pool_ops::ArchiveVerifyArgs {
@@ -2807,7 +2857,7 @@ where
                     err,
                 );
             }
-            return run_archive_tape_command(&report, &command, &allow, &allow_derived, out, err);
+            return run_archive_tape_command(&report, command, &allow, &allow_derived, out, err);
         }
         Command::Dev { command } => {
             return run_dev_command(&report, &command, &allow, &allow_derived, out, err);
@@ -5465,11 +5515,33 @@ struct ArchiveBuildInputFile {
     file_sha256: Option<[u8; 32]>,
     link_target: Option<String>,
     xattrs: BTreeMap<String, Vec<u8>>,
+    ingest_item_id: Option<String>,
 }
 
 fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
-    let tuning = archive_scan_tuning(args)?;
-    if args.manifest_out.is_some() && args.rules.is_none() {
+    if args.map.is_some() {
+        if args.scan_only {
+            return Err("--map cannot be combined with --scan-only".to_string());
+        }
+        if args.rules.is_some() {
+            return Err("--map cannot be combined with --rules".to_string());
+        }
+        if !args.inputs.is_empty() {
+            return Err("--map cannot be combined with --inputs".to_string());
+        }
+        if args.source_root.is_none() {
+            return Err("--map requires --source-root".to_string());
+        }
+    } else if args.map_sha256.is_some() {
+        return Err("--map-sha256 requires --map".to_string());
+    }
+
+    let tuning = if args.map.is_some() {
+        None
+    } else {
+        Some(archive_scan_tuning(args)?)
+    };
+    if args.manifest_out.is_some() && args.rules.is_none() && args.map.is_none() {
         return Err(
             "--manifest-out requires --rules so exclusions and wrapper members are recorded"
                 .to_string(),
@@ -5488,7 +5560,7 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
             &args.inputs,
             args.rules.as_deref(),
             args.no_index,
-            tuning,
+            tuning.expect("non-map archive build has scan tuning"),
         )?;
         return serde_json::to_value(report)
             .map_err(|error| format!("serialize scan report: {error}"));
@@ -5525,22 +5597,35 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
             .map_err(|error| format!("--object-id is invalid for encrypted RAO: {error}"))?;
     }
 
+    let map_plan = match (&args.map, &args.source_root) {
+        (Some(map), Some(source_root)) => Some(archive_map::load_source_map(
+            map,
+            source_root,
+            args.map_sha256.as_deref(),
+        )?),
+        _ => None,
+    };
     let materialized = if args.rules.is_some() {
         Some(archive_ingest::materialize_inputs(
             &args.inputs,
             args.rules.as_deref(),
             args.no_index,
-            tuning,
+            tuning.expect("rules archive build has scan tuning"),
         )?)
     } else {
         None
     };
-    let inputs = match &materialized {
-        Some(plan) => plan.inputs.clone(),
-        None => collect_archive_build_inputs(&args.inputs)?,
+    let inputs = match (&map_plan, &materialized) {
+        (Some(plan), _) => plan.inputs.clone(),
+        (None, Some(plan)) => plan.inputs.clone(),
+        (None, None) => collect_archive_build_inputs(&args.inputs)?,
     };
     if inputs.is_empty() {
-        return Err("--inputs did not contain any archivable entries".to_string());
+        return Err(if args.map.is_some() {
+            "--map did not contain any member rows".to_string()
+        } else {
+            "--inputs did not contain any archivable entries".to_string()
+        });
     }
 
     let timestamp = match &args.timestamp {
@@ -5645,6 +5730,8 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
 
     if let (Some(manifest_out), Some(plan)) = (&args.manifest_out, &materialized) {
         archive_ingest::write_customer_manifest(manifest_out, &plan.manifest)?;
+    } else if let (Some(manifest_out), Some(plan)) = (&args.manifest_out, &map_plan) {
+        archive_ingest::write_customer_manifest(manifest_out, &plan.manifest)?;
     }
 
     Ok(archive_build_report_json(
@@ -5652,6 +5739,7 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
         &inputs,
         &build,
         materialized.as_ref(),
+        map_plan.as_ref().map(|plan| plan.map_sha256),
     ))
 }
 
@@ -7061,6 +7149,7 @@ fn archive_build_report_json(
     inputs: &[ArchiveBuildInputFile],
     build: &ArchiveBuildResult,
     ingest: Option<&archive_ingest::MaterializedArchiveInputs>,
+    map_sha256: Option<[u8; 32]>,
 ) -> Value {
     let files: Vec<Value> = build
         .layout
@@ -7093,6 +7182,12 @@ fn archive_build_report_json(
             report["manifest_out"] = json!(path);
         }
     }
+    if let Some(map_sha256) = map_sha256 {
+        report["map_sha256"] = json!(bytes_to_hex(&map_sha256));
+        if let Some(path) = &args.manifest_out {
+            report["manifest_out"] = json!(path);
+        }
+    }
     report
 }
 
@@ -7116,6 +7211,12 @@ fn archive_file_report_json(layout: &RemTarFileLayout, input: &ArchiveBuildInput
             .as_object_mut()
             .expect("archive file report is a JSON object")
             .insert("xattrs".to_string(), json!(xattrs));
+    }
+    if let Some(ingest_item_id) = &input.ingest_item_id {
+        report
+            .as_object_mut()
+            .expect("archive file report is a JSON object")
+            .insert("ingest_item_id".to_string(), json!(ingest_item_id));
     }
     report
 }
@@ -7269,6 +7370,7 @@ fn read_archive_build_file_with_xattrs(
         file_sha256: Some(file_sha256),
         link_target: None,
         xattrs,
+        ingest_item_id: None,
     })
 }
 
@@ -7292,6 +7394,7 @@ fn read_archive_build_hardlink(
         file_sha256: None,
         link_target: Some(link_target),
         xattrs: BTreeMap::new(),
+        ingest_item_id: None,
     })
 }
 
@@ -7320,6 +7423,7 @@ fn read_archive_build_symlink(
         file_sha256: None,
         link_target: Some(target),
         xattrs: BTreeMap::new(),
+        ingest_item_id: None,
     })
 }
 
@@ -7338,6 +7442,7 @@ fn read_archive_build_directory(
         file_sha256: None,
         link_target: None,
         xattrs: BTreeMap::new(),
+        ingest_item_id: None,
     })
 }
 
@@ -9327,9 +9432,7 @@ mod tests {
         ]);
         assert!(matches!(
             cli.command,
-            Command::Archive {
-                command: ArchiveCommand::Read(_)
-            }
+            Command::Archive { command } if matches!(*command, ArchiveCommand::Read(_))
         ));
     }
 
@@ -9352,9 +9455,7 @@ mod tests {
         ]);
         assert!(matches!(
             cli.command,
-            Command::Archive {
-                command: ArchiveCommand::ExportObject(_)
-            }
+            Command::Archive { command } if matches!(*command, ArchiveCommand::ExportObject(_))
         ));
     }
 
@@ -9377,9 +9478,7 @@ mod tests {
         ]);
         assert!(matches!(
             cli.command,
-            Command::Archive {
-                command: ArchiveCommand::Verify(_)
-            }
+            Command::Archive { command } if matches!(*command, ArchiveCommand::Verify(_))
         ));
     }
 
@@ -9394,9 +9493,7 @@ mod tests {
         ]);
         assert!(matches!(
             cli.command,
-            Command::Archive {
-                command: ArchiveCommand::List(_)
-            }
+            Command::Archive { command } if matches!(*command, ArchiveCommand::List(_))
         ));
     }
 
@@ -9908,6 +10005,56 @@ mod tests {
             && haystack
                 .windows(needle.len())
                 .any(|window| window == needle)
+    }
+
+    fn source_map_tsv(rows: &[(&str, &Path, &[u8], &str)]) -> String {
+        let mut text = "archive_path\tsource_path\tsha256\tsize\tingest_item_id\n".to_string();
+        for (archive_path, source_path, payload, ingest_item_id) in rows {
+            text.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\n",
+                archive_path,
+                source_path.to_str().expect("test path is UTF-8"),
+                bytes_to_hex(&sha256_bytes(payload)),
+                payload.len(),
+                ingest_item_id
+            ));
+        }
+        text
+    }
+
+    fn write_source_map(path: &Path, rows: &[(&str, &Path, &[u8], &str)]) -> String {
+        let text = source_map_tsv(rows);
+        fs::write(path, &text).expect("write source map");
+        bytes_to_hex(&sha256_bytes(text.as_bytes()))
+    }
+
+    fn default_map_archive_args(
+        map: PathBuf,
+        source_root: Option<PathBuf>,
+        out: PathBuf,
+    ) -> ArchiveBuildArgs {
+        ArchiveBuildArgs {
+            inputs: Vec::new(),
+            map: Some(map),
+            source_root,
+            map_sha256: None,
+            out: Some(out),
+            rules: None,
+            scan_only: false,
+            manifest_out: None,
+            no_index: false,
+            blob_suggest_ratio: 0.9,
+            blob_suggest_count: 100,
+            sanity_ceiling_count: 10_000,
+            encrypt: false,
+            key_file: None,
+            key_id: None,
+            object_id: Some("object-map-direct".to_string()),
+            caller_object_id: Some("caller-map-direct".to_string()),
+            manifest_file_id: Some("manifest-map-direct".to_string()),
+            timestamp: Some("2026-01-01T00:00:00Z".to_string()),
+            chunk_size: 4096,
+        }
     }
 
     fn write_retire_test_config(root: &Path) -> PathBuf {
@@ -10438,6 +10585,716 @@ tape_catalog_dir = "{0}/cache/tapes"
         assert_eq!(
             fs::read(&out_path).unwrap(),
             fs::read(&second_out_path).unwrap()
+        );
+    }
+
+    #[test]
+    fn archive_build_map_round_trips_preserves_order_and_reports_ids() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-build-map")
+            .tempdir()
+            .unwrap();
+        let source_root = temp.path().join("source");
+        fs::create_dir_all(source_root.join("camera")).unwrap();
+        fs::create_dir_all(source_root.join("docs")).unwrap();
+        let zeta_path = source_root.join("camera/zeta.bin");
+        let alpha_path = source_root.join("alpha.txt");
+        let beta_path = source_root.join("docs/beta.txt");
+        let zeta_payload = b"zeta payload\n";
+        let alpha_payload = b"alpha payload\n";
+        let beta_payload = b"beta payload\n";
+        fs::write(&zeta_path, zeta_payload).unwrap();
+        fs::write(&alpha_path, alpha_payload).unwrap();
+        fs::write(&beta_path, beta_payload).unwrap();
+        let map_path = temp.path().join("source-map.tsv");
+        let rows: Vec<(&str, &Path, &[u8], &str)> = vec![
+            (
+                "z/zeta.bin",
+                zeta_path.as_path(),
+                &zeta_payload[..],
+                "ingest-z",
+            ),
+            (
+                "a.txt",
+                alpha_path.as_path(),
+                &alpha_payload[..],
+                "ingest-a",
+            ),
+            (
+                "nested/beta.txt",
+                beta_path.as_path(),
+                &beta_payload[..],
+                "ingest-beta",
+            ),
+        ];
+        let map_hash = write_source_map(&map_path, &rows);
+        let map_hash_arg = format!("{map_hash}  source-map.tsv");
+        let out_path = temp.path().join("map.rao");
+        let manifest_path = temp.path().join("map-manifest.json");
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--map",
+            map_path.to_str().unwrap(),
+            "--source-root",
+            source_root.to_str().unwrap(),
+            "--map-sha256",
+            map_hash_arg.as_str(),
+            "--manifest-out",
+            manifest_path.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+            "--object-id",
+            "object-map",
+            "--caller-object-id",
+            "caller-map",
+            "--manifest-file-id",
+            "manifest-map",
+            "--timestamp",
+            "2026-01-01T00:00:00Z",
+        ]);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        assert!(out_path.exists());
+        let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
+        assert_eq!(report["map_sha256"], map_hash);
+        assert!(report.get("ingest").is_none());
+        assert_eq!(
+            report["manifest_out"].as_str(),
+            Some(manifest_path.to_str().unwrap())
+        );
+        let files = report["files"].as_array().expect("files array");
+        let paths = files
+            .iter()
+            .map(|file| file["path"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["z/zeta.bin", "a.txt", "nested/beta.txt"]);
+        let ingest_ids = files
+            .iter()
+            .map(|file| file["ingest_item_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ingest_ids, vec!["ingest-z", "ingest-a", "ingest-beta"]);
+        let lbas = files
+            .iter()
+            .map(|file| file["first_chunk_lba"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            lbas.windows(2).all(|window| window[0] < window[1]),
+            "{lbas:?}"
+        );
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["format"], "remanence-customer-manifest-v1");
+        assert_eq!(manifest["tar_engine"]["program"], "source-map");
+        let manifest_paths = manifest["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["path"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(manifest_paths, paths);
+
+        let mut source = remanence_library::FileBlockSource::open(&out_path, 4096).unwrap();
+        let block_count = source.block_count();
+        let read = remanence_format::read_rem_tar_object(&mut source, 4096, block_count).unwrap();
+        assert_eq!(read.entry("z/zeta.bin").unwrap().data, zeta_payload);
+        assert_eq!(read.entry("a.txt").unwrap().data, alpha_payload);
+        assert_eq!(read.entry("nested/beta.txt").unwrap().data, beta_payload);
+        assert!(files
+            .iter()
+            .all(|file| !file["path"].as_str().unwrap().contains(".remwrap.")));
+    }
+
+    #[test]
+    fn archive_build_map_rejects_malformed_rows_and_duplicate_paths() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-map-malformed")
+            .tempdir()
+            .unwrap();
+        let source_root = temp.path().join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let source_path = source_root.join("good.txt");
+        let payload = b"good payload";
+        fs::write(&source_path, payload).unwrap();
+        let source = source_path.to_str().unwrap();
+        let good_hash = bytes_to_hex(&sha256_bytes(payload));
+        let good_size = payload.len();
+        let header = "archive_path\tsource_path\tsha256\tsize\tingest_item_id\n";
+        let valid_row = format!("good.txt\t{source}\t{good_hash}\t{good_size}\tid\n");
+        let cases = [
+            (
+                "wrong-columns",
+                format!("{header}only\tfour\tcolumns\tbad\n"),
+                "must have 5 TAB-separated columns",
+            ),
+            (
+                "control",
+                format!("{header}bad.txt\t{source}\t{good_hash}\t{good_size}\tid\u{1F}\n"),
+                "control character",
+            ),
+            (
+                "bad-hex",
+                format!(
+                    "{header}bad-hex.txt\t{source}\t{}\t{good_size}\tid\n",
+                    "A".repeat(64)
+                ),
+                "sha256 must use lowercase hex",
+            ),
+            (
+                "bad-size",
+                format!("{header}bad-size.txt\t{source}\t{good_hash}\tnope\tid\n"),
+                "size",
+            ),
+            (
+                "duplicate",
+                format!("{header}{valid_row}{valid_row}"),
+                "duplicate archive path",
+            ),
+        ];
+
+        for (name, map_text, expected) in cases {
+            let map_path = temp.path().join(format!("{name}.tsv"));
+            let out_path = temp.path().join(format!("{name}.rao"));
+            fs::write(&map_path, map_text).unwrap();
+
+            let (code, stdout, stderr) = invoke_without_discovery(&[
+                "rem",
+                "archive",
+                "build",
+                "--map",
+                map_path.to_str().unwrap(),
+                "--source-root",
+                source_root.to_str().unwrap(),
+                "--out",
+                out_path.to_str().unwrap(),
+                "--chunk-size",
+                "4KiB",
+                "--object-id",
+                "object-map-malformed",
+                "--caller-object-id",
+                "caller-map-malformed",
+                "--manifest-file-id",
+                "manifest-map-malformed",
+                "--timestamp",
+                "2026-01-01T00:00:00Z",
+            ]);
+
+            assert_eq!(
+                format!("{code:?}"),
+                format!("{:?}", ExitCode::from(1)),
+                "{name}: {stdout} {stderr}"
+            );
+            assert!(stdout.is_empty(), "{name}: {stdout}");
+            assert!(stderr.contains(expected), "{name}: {stderr}");
+            assert!(!out_path.exists(), "{name} must not leave an object");
+        }
+
+        let mut non_utf8 = header.as_bytes().to_vec();
+        non_utf8.extend_from_slice(b"\xff\t");
+        non_utf8.extend_from_slice(source.as_bytes());
+        non_utf8.extend_from_slice(b"\t");
+        non_utf8.extend_from_slice(good_hash.as_bytes());
+        non_utf8.extend_from_slice(format!("\t{good_size}\tid\n").as_bytes());
+        let byte_cases = [
+            (
+                "bad-header",
+                format!("archive_path\tsource_path\tsha256\tsize\twrong\n{valid_row}").into_bytes(),
+                "header must be exactly",
+            ),
+            (
+                "missing-newline",
+                format!("{header}{}", valid_row.trim_end_matches('\n')).into_bytes(),
+                "trailing LF newline",
+            ),
+            ("non-utf8", non_utf8, "not UTF-8"),
+        ];
+        for (name, map_bytes, expected) in byte_cases {
+            let map_path = temp.path().join(format!("{name}.tsv"));
+            let out_path = temp.path().join(format!("{name}.rao"));
+            fs::write(&map_path, map_bytes).unwrap();
+
+            let (code, stdout, stderr) = invoke_without_discovery(&[
+                "rem",
+                "archive",
+                "build",
+                "--map",
+                map_path.to_str().unwrap(),
+                "--source-root",
+                source_root.to_str().unwrap(),
+                "--out",
+                out_path.to_str().unwrap(),
+                "--chunk-size",
+                "4KiB",
+            ]);
+
+            assert_eq!(
+                format!("{code:?}"),
+                format!("{:?}", ExitCode::from(1)),
+                "{name}: {stdout} {stderr}"
+            );
+            assert!(stdout.is_empty(), "{name}: {stdout}");
+            assert!(stderr.contains(expected), "{name}: {stderr}");
+            assert!(!out_path.exists(), "{name} must not leave an object");
+        }
+    }
+
+    #[test]
+    fn archive_build_map_rejects_raw_archive_paths_without_normalizing() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-map-paths")
+            .tempdir()
+            .unwrap();
+        let source_root = temp.path().join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let source_path = source_root.join("good.txt");
+        let payload = b"path payload";
+        fs::write(&source_path, payload).unwrap();
+        let source = source_path.to_str().unwrap();
+        let hash = bytes_to_hex(&sha256_bytes(payload));
+        let size = payload.len();
+        let bad_paths = ["/abs", "a//b", "a/./b", "a/../b", "a/"];
+
+        for (index, archive_path) in bad_paths.iter().enumerate() {
+            let map_path = temp.path().join(format!("bad-path-{index}.tsv"));
+            let out_path = temp.path().join(format!("bad-path-{index}.rao"));
+            fs::write(
+                &map_path,
+                format!(
+                    "archive_path\tsource_path\tsha256\tsize\tingest_item_id\n{archive_path}\t{source}\t{hash}\t{size}\tid\n"
+                ),
+            )
+            .unwrap();
+
+            let (code, stdout, stderr) = invoke_without_discovery(&[
+                "rem",
+                "archive",
+                "build",
+                "--map",
+                map_path.to_str().unwrap(),
+                "--source-root",
+                source_root.to_str().unwrap(),
+                "--out",
+                out_path.to_str().unwrap(),
+                "--chunk-size",
+                "4KiB",
+            ]);
+
+            assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+            assert!(stdout.is_empty());
+            assert!(stderr.contains("archive_path"), "{archive_path}: {stderr}");
+            assert!(!out_path.exists());
+        }
+    }
+
+    #[test]
+    fn archive_build_map_rejects_source_escape_and_relative_source() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-map-source")
+            .tempdir()
+            .unwrap();
+        let source_root = temp.path().join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let inside = source_root.join("inside.txt");
+        let outside = temp.path().join("outside.txt");
+        let payload = b"escape payload";
+        fs::write(&inside, payload).unwrap();
+        fs::write(&outside, payload).unwrap();
+        let hash = bytes_to_hex(&sha256_bytes(payload));
+        let size = payload.len();
+
+        let cases = [
+            (
+                "outside",
+                format!(
+                    "archive_path\tsource_path\tsha256\tsize\tingest_item_id\noutside.txt\t{}\t{hash}\t{size}\tid\n",
+                    outside.to_str().unwrap()
+                ),
+                "escapes --source-root",
+            ),
+            (
+                "relative",
+                format!(
+                    "archive_path\tsource_path\tsha256\tsize\tingest_item_id\nrelative.txt\tinside.txt\t{hash}\t{size}\tid\n"
+                ),
+                "must be absolute",
+            ),
+        ];
+        for (name, map_text, expected) in cases {
+            let map_path = temp.path().join(format!("{name}.tsv"));
+            let out_path = temp.path().join(format!("{name}.rao"));
+            fs::write(&map_path, map_text).unwrap();
+            let (code, stdout, stderr) = invoke_without_discovery(&[
+                "rem",
+                "archive",
+                "build",
+                "--map",
+                map_path.to_str().unwrap(),
+                "--source-root",
+                source_root.to_str().unwrap(),
+                "--out",
+                out_path.to_str().unwrap(),
+                "--chunk-size",
+                "4KiB",
+            ]);
+            assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+            assert!(stdout.is_empty());
+            assert!(stderr.contains(expected), "{name}: {stderr}");
+            assert!(!out_path.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_build_map_rejects_symlink_escape_before_reading() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-map-symlink")
+            .tempdir()
+            .unwrap();
+        let source_root = temp.path().join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let outside = temp.path().join("outside.txt");
+        let link = source_root.join("link.txt");
+        let payload = b"outside payload";
+        fs::write(&outside, payload).unwrap();
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let map_path = temp.path().join("symlink.tsv");
+        fs::write(
+            &map_path,
+            format!(
+                "archive_path\tsource_path\tsha256\tsize\tingest_item_id\nlink.txt\t{}\t{}\t{}\tid\n",
+                link.to_str().unwrap(),
+                bytes_to_hex(&sha256_bytes(payload)),
+                payload.len()
+            ),
+        )
+        .unwrap();
+        let out_path = temp.path().join("symlink.rao");
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--map",
+            map_path.to_str().unwrap(),
+            "--source-root",
+            source_root.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+        ]);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("escapes --source-root"), "{stderr}");
+        assert!(!out_path.exists());
+    }
+
+    #[test]
+    fn archive_build_map_rejects_guard_errors_before_tsv_read() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-map-guards")
+            .tempdir()
+            .unwrap();
+        let missing_map = temp.path().join("missing.tsv");
+        let out_path = temp.path().join("missing.rao");
+
+        let args = default_map_archive_args(missing_map.clone(), None, out_path.clone());
+        let error = build_archive_object_file(&args).unwrap_err();
+        assert!(error.contains("--map requires --source-root"), "{error}");
+        assert!(!out_path.exists());
+
+        let mut scan_args = default_map_archive_args(
+            missing_map.clone(),
+            Some(temp.path().to_path_buf()),
+            out_path.clone(),
+        );
+        scan_args.scan_only = true;
+        let error = build_archive_object_file(&scan_args).unwrap_err();
+        assert!(error.contains("--scan-only"), "{error}");
+        assert!(!out_path.exists());
+
+        let parse_error = Cli::try_parse_from([
+            "rem",
+            "archive",
+            "build",
+            "--map",
+            missing_map.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(parse_error.contains("--source-root"), "{parse_error}");
+
+        let conflict_error = Cli::try_parse_from([
+            "rem",
+            "archive",
+            "build",
+            "--map",
+            missing_map.to_str().unwrap(),
+            "--source-root",
+            temp.path().to_str().unwrap(),
+            "--scan-only",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(conflict_error.contains("--map"), "{conflict_error}");
+        assert!(conflict_error.contains("--scan-only"), "{conflict_error}");
+    }
+
+    #[test]
+    fn archive_build_map_sha256_mismatch_fails_before_source_validation() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-map-mapsha")
+            .tempdir()
+            .unwrap();
+        let source_root = temp.path().join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let missing_source = source_root.join("missing.txt");
+        let map_path = temp.path().join("source-map.tsv");
+        fs::write(
+            &map_path,
+            format!(
+                "archive_path\tsource_path\tsha256\tsize\tingest_item_id\nmissing.txt\t{}\t{}\t1\tid\n",
+                missing_source.to_str().unwrap(),
+                "0".repeat(64)
+            ),
+        )
+        .unwrap();
+        let out_path = temp.path().join("mapsha.rao");
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--map",
+            map_path.to_str().unwrap(),
+            "--source-root",
+            source_root.to_str().unwrap(),
+            "--map-sha256",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "--out",
+            out_path.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+        ]);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("--map-sha256 mismatch"), "{stderr}");
+        assert!(!stderr.contains("canonicalize source_path"), "{stderr}");
+        assert!(!out_path.exists());
+    }
+
+    #[test]
+    fn archive_build_map_rejects_size_and_payload_hash_mismatches_closed() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-map-mismatch")
+            .tempdir()
+            .unwrap();
+        let source_root = temp.path().join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let source_path = source_root.join("payload.txt");
+        let payload = b"actual payload";
+        fs::write(&source_path, payload).unwrap();
+        let source = source_path.to_str().unwrap();
+        let hash = bytes_to_hex(&sha256_bytes(payload));
+
+        let size_map = temp.path().join("size.tsv");
+        let size_out = temp.path().join("size.rao");
+        fs::write(
+            &size_map,
+            format!(
+                "archive_path\tsource_path\tsha256\tsize\tingest_item_id\npayload.txt\t{source}\t{hash}\t{}\tid\n",
+                payload.len() + 1
+            ),
+        )
+        .unwrap();
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--map",
+            size_map.to_str().unwrap(),
+            "--source-root",
+            source_root.to_str().unwrap(),
+            "--out",
+            size_out.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+        ]);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("size mismatch"), "{stderr}");
+        assert!(!size_out.exists());
+
+        let hash_map = temp.path().join("hash.tsv");
+        let hash_out = temp.path().join("hash.rao");
+        fs::write(
+            &hash_map,
+            format!(
+                "archive_path\tsource_path\tsha256\tsize\tingest_item_id\npayload.txt\t{source}\t{}\t{}\tid\n",
+                "0".repeat(64),
+                payload.len()
+            ),
+        )
+        .unwrap();
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--map",
+            hash_map.to_str().unwrap(),
+            "--source-root",
+            source_root.to_str().unwrap(),
+            "--out",
+            hash_out.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+        ]);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("streamed data hash"), "{stderr}");
+        assert!(!hash_out.exists());
+    }
+
+    #[test]
+    fn archive_build_map_encrypted_round_trips() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-map-encrypted")
+            .tempdir()
+            .unwrap();
+        let source_root = temp.path().join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let source_path = source_root.join("secret.txt");
+        let payload = b"map encrypted payload";
+        fs::write(&source_path, payload).unwrap();
+        let map_path = temp.path().join("source-map.tsv");
+        let rows: Vec<(&str, &Path, &[u8], &str)> = vec![(
+            "secret.txt",
+            source_path.as_path(),
+            &payload[..],
+            "secret-id",
+        )];
+        write_source_map(&map_path, &rows);
+        let key_path = temp.path().join("root.key");
+        fs::write(&key_path, [0x5Au8; 32]).unwrap();
+        let out_path = temp.path().join("map-encrypted.rao");
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--map",
+            map_path.to_str().unwrap(),
+            "--source-root",
+            source_root.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+            "--encrypt",
+            "--key-file",
+            key_path.to_str().unwrap(),
+            "--key-id",
+            "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+            "--chunk-size",
+            "4KiB",
+            "--object-id",
+            "object-map-encrypted",
+            "--caller-object-id",
+            "caller-map-encrypted",
+            "--manifest-file-id",
+            "manifest-map-encrypted",
+            "--timestamp",
+            "2026-01-01T00:00:00Z",
+        ]);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
+        assert_eq!(report["representation"], "encrypted");
+        assert_eq!(report["files"][0]["ingest_item_id"], "secret-id");
+
+        let root_key = RootKey::new([0x5A; 32]).unwrap();
+        let mut source = remanence_library::FileBlockSource::open(&out_path, 4096).unwrap();
+        let block_count = source.block_count();
+        let read =
+            remanence_format::read_encrypted_rao_object(&mut source, 4096, block_count, &root_key)
+                .unwrap();
+        assert_eq!(read.object.entry("secret.txt").unwrap().data, payload);
+
+        let restore_dir = temp.path().join("restore");
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "extract",
+            "--object",
+            out_path.to_str().unwrap(),
+            "--dest",
+            restore_dir.to_str().unwrap(),
+            "--key-file",
+            key_path.to_str().unwrap(),
+        ]);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let extract: serde_json::Value = serde_json::from_str(&stdout).expect("extract json");
+        assert_eq!(extract["representation"], "encrypted");
+        assert_eq!(fs::read(restore_dir.join("secret.txt")).unwrap(), payload);
+    }
+
+    #[test]
+    fn archive_build_map_is_byte_reproducible_with_pinned_ids() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-map-repro")
+            .tempdir()
+            .unwrap();
+        let source_root = temp.path().join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let source_path = source_root.join("asset.bin");
+        let payload = b"repro payload";
+        fs::write(&source_path, payload).unwrap();
+        let map_path = temp.path().join("source-map.tsv");
+        let rows: Vec<(&str, &Path, &[u8], &str)> =
+            vec![("asset.bin", source_path.as_path(), &payload[..], "asset-id")];
+        write_source_map(&map_path, &rows);
+        let first_out = temp.path().join("first.rao");
+        let second_out = temp.path().join("second.rao");
+
+        for out_path in [&first_out, &second_out] {
+            let (code, _stdout, stderr) = invoke_without_discovery(&[
+                "rem",
+                "archive",
+                "build",
+                "--map",
+                map_path.to_str().unwrap(),
+                "--source-root",
+                source_root.to_str().unwrap(),
+                "--out",
+                out_path.to_str().unwrap(),
+                "--chunk-size",
+                "4KiB",
+                "--object-id",
+                "object-map-repro",
+                "--caller-object-id",
+                "caller-map-repro",
+                "--manifest-file-id",
+                "manifest-map-repro",
+                "--timestamp",
+                "2026-01-01T00:00:00Z",
+            ]);
+            assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+            assert!(stderr.is_empty(), "{stderr}");
+        }
+
+        assert_eq!(
+            fs::read(&first_out).unwrap(),
+            fs::read(&second_out).unwrap()
         );
     }
 
