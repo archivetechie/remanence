@@ -36,15 +36,15 @@ pub use config::{
 pub use error::StateError;
 pub use index::{
     AlarmRecord, AuditReplayReport, CatalogIndex, CatalogUnitFilter, CatalogUnitRecord,
-    DriveAnnotationInput, DriveEventRecord, DriveHealthSnapshotInput, DriveHealthSnapshotRecord,
-    DriveObservationInput, DriveObservationOutcome, DriveRecord, ForeignArchiveProjectionInput,
-    NativeObjectCopyProjectionInput, NativeObjectCopyRecord, NativeObjectFileProjectionInput,
-    NativeObjectFileRecord, NativeObjectProjectionInput, NativeObjectRecord, OperationRecord,
-    ProvisionTapeInput, RebuildReport, RebuildTapeJournalInput, RestartOperation, RestartSession,
-    RetireDriveOutcome, RetireTapeInput, RetireTapeOutcome, TapeFileRecord, TapeJournalIndexInput,
-    TapeJournalIndexReport, TapePoolProjectionInput, TapePoolRecord, TapeRecord,
-    OBJECT_COPY_REPRESENTATION_ENCRYPTED, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
-    OBJECT_COPY_REPRESENTATION_UNKNOWN, SCHEMA_VERSION,
+    DriveAnnotationInput, DriveCorrelationRollupRecord, DriveEventRecord, DriveHealthSnapshotInput,
+    DriveHealthSnapshotRecord, DriveObservationInput, DriveObservationOutcome, DriveRecord,
+    ForeignArchiveProjectionInput, NativeObjectCopyProjectionInput, NativeObjectCopyRecord,
+    NativeObjectFileProjectionInput, NativeObjectFileRecord, NativeObjectProjectionInput,
+    NativeObjectRecord, OperationRecord, ProvisionTapeInput, RebuildReport,
+    RebuildTapeJournalInput, RestartOperation, RestartSession, RetireDriveOutcome, RetireTapeInput,
+    RetireTapeOutcome, TapeFileRecord, TapeJournalIndexInput, TapeJournalIndexReport,
+    TapePoolProjectionInput, TapePoolRecord, TapeRecord, OBJECT_COPY_REPRESENTATION_ENCRYPTED,
+    OBJECT_COPY_REPRESENTATION_PLAINTEXT, OBJECT_COPY_REPRESENTATION_UNKNOWN, SCHEMA_VERSION,
 };
 pub use lock::StateLockGuard;
 pub use paths::StatePaths;

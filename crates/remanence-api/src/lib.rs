@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ciborium::value::Value as CborValue;
 #[cfg(feature = "foreign-bru")]
@@ -27,9 +27,9 @@ use remanence_format::{
 };
 use remanence_state::{
     AuditActor, AuditEvent, AuditEventRecord, AuditSubject, CatalogIndex, CatalogUnitFilter,
-    CatalogUnitRecord, FileAuditLog, NativeObjectCopyRecord, NativeObjectFileRecord,
-    NativeObjectRecord, OperationRecord, RemConfig, SourceLayer, StateError, TapeFileRecord,
-    TapePoolConfig, TapePoolRecord, TapeRecord,
+    CatalogUnitRecord, DriveCorrelationRollupRecord, DriveHealthSnapshotInput, FileAuditLog,
+    NativeObjectCopyRecord, NativeObjectFileRecord, NativeObjectRecord, OperationRecord, RemConfig,
+    SourceLayer, StateError, TapeFileRecord, TapePoolConfig, TapePoolRecord, TapeRecord,
 };
 use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
@@ -264,6 +264,7 @@ impl ApiState {
                 .as_ref()
                 .map(|serial| serial.as_str().to_string()),
             library_snapshot: library_snapshot.clone(),
+            snapshot_miss_alarm: config.drives.snapshot_miss_alarm,
         };
         let mut drive_txs = HashMap::new();
         for (bay_addr, drive) in opened_drives {
@@ -275,13 +276,13 @@ impl ApiState {
         let drive_pool =
             crate::write_owner::DrivePool::new(changer_tx, drive_txs, reservations.clone());
         let mut state = Self::new_with_pool_configs_inner(
-            index_path,
+            index_path.clone(),
             pool_configs,
             config.audit.dir.clone(),
             config.audit.fsync,
             audit_append_lock,
         );
-        state.drive_pool = Some(drive_pool);
+        state.drive_pool = Some(drive_pool.clone());
         state.spool_dir = Some(Arc::new(spool_dir));
         state.spool_budget = Some(Arc::new(Semaphore::new(spool_budget_permits(
             crate::write_owner::SPOOL_MAX_BYTES,
@@ -289,6 +290,7 @@ impl ApiState {
         state.default_library_serial = default_library_serial;
         state.library_snapshot = Some(library_snapshot);
         state.reconcile_drive_catalog_from_report(config, &report)?;
+        spawn_drive_collection_workers(index_path, report, config, drive_pool);
         Ok(state)
     }
 
@@ -615,6 +617,344 @@ impl ApiState {
     }
 }
 
+fn spawn_drive_collection_workers(
+    index_path: PathBuf,
+    report: remanence_library::DiscoveryReport,
+    config: &RemConfig,
+    drive_pool: crate::write_owner::DrivePool,
+) {
+    let heartbeat = parse_duration_or(&config.drives.heartbeat, Duration::from_secs(60 * 60));
+    let heartbeat_index_path = index_path.clone();
+    let heartbeat_pool = drive_pool.clone();
+    std::thread::Builder::new()
+        .name("rem-drive-heartbeat".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(heartbeat);
+            if let Err(err) = touch_managed_drive_heartbeats(&heartbeat_index_path, &heartbeat_pool)
+            {
+                tracing::warn!("managed drive heartbeat failed: {err}");
+            }
+        })
+        .expect("spawn managed drive heartbeat worker");
+
+    let foreign_poll = parse_duration_or(
+        &config.drives.foreign_counter_poll,
+        Duration::from_secs(60 * 60),
+    );
+    let drives_cfg = config.drives.clone();
+    let daemon_libraries = config
+        .libraries
+        .iter()
+        .map(|library| library.serial.trim().to_string())
+        .filter(|serial| !serial.is_empty())
+        .collect::<std::collections::HashSet<_>>();
+    std::thread::Builder::new()
+        .name("rem-foreign-drive-poll".to_string())
+        .spawn(move || {
+            foreign_drive_poll_loop(
+                index_path,
+                report,
+                drives_cfg,
+                daemon_libraries,
+                foreign_poll,
+            )
+        })
+        .expect("spawn foreign drive poll worker");
+}
+
+fn touch_managed_drive_heartbeats(
+    index_path: &Path,
+    drive_pool: &crate::write_owner::DrivePool,
+) -> Result<(), StateError> {
+    let index = CatalogIndex::open(index_path)?;
+    for drive in index.list_drives(false, false)? {
+        if drive.managed == "rem" && drive.state == "active" {
+            let Some(bay) = drive
+                .last_element_address
+                .and_then(|address| u16::try_from(address).ok())
+            else {
+                continue;
+            };
+            if let Err(err) = drive_pool.heartbeat_drive(bay, drive.drive_uuid.clone()) {
+                tracing::warn!(
+                    "managed drive heartbeat skipped for {}: {err}",
+                    drive.serial
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn foreign_drive_poll_loop(
+    index_path: PathBuf,
+    report: remanence_library::DiscoveryReport,
+    drives_cfg: remanence_state::DrivesConfig,
+    daemon_libraries: std::collections::HashSet<String>,
+    base_cadence: Duration,
+) {
+    let mut backoff = Duration::from_secs(0);
+    loop {
+        let delay = if backoff.is_zero() {
+            base_cadence
+        } else {
+            backoff
+        };
+        std::thread::sleep(delay);
+        match poll_foreign_drive_counters_once(&index_path, &report, &drives_cfg, &daemon_libraries)
+        {
+            Ok(()) => backoff = Duration::from_secs(0),
+            Err(ForeignPollError::Retryable(message)) => {
+                tracing::warn!("foreign drive counter poll retryable failure: {message}");
+                backoff = next_backoff(backoff, base_cadence);
+            }
+            Err(ForeignPollError::Permanent(message)) => {
+                tracing::warn!("foreign drive counter poll failed: {message}");
+                backoff = Duration::from_secs(0);
+            }
+        }
+    }
+}
+
+fn poll_foreign_drive_counters_once(
+    index_path: &Path,
+    report: &remanence_library::DiscoveryReport,
+    drives_cfg: &remanence_state::DrivesConfig,
+    daemon_libraries: &std::collections::HashSet<String>,
+) -> Result<(), ForeignPollError> {
+    let mut index = CatalogIndex::open(index_path)
+        .map_err(|err| ForeignPollError::Permanent(err.to_string()))?;
+    for library in &report.libraries {
+        if library_is_managed(library.serial.as_str(), drives_cfg, daemon_libraries) {
+            continue;
+        }
+        for bay in &library.drive_bays {
+            let Some(installed) = bay.installed.as_ref() else {
+                continue;
+            };
+            let Some(sg_path) = installed.sg_path.as_ref() else {
+                continue;
+            };
+            if installed.serial.trim().is_empty() {
+                continue;
+            }
+            let snapshot = read_foreign_drive_snapshot(sg_path, drives_cfg.foreign_tapealert)?;
+            let Some(drive) = index
+                .get_drive_by_selector(installed.serial.as_str())
+                .map_err(|err| ForeignPollError::Permanent(err.to_string()))?
+            else {
+                continue;
+            };
+            if drive.managed != "foreign" || drive.state != "active" {
+                continue;
+            }
+            index
+                .record_drive_health_snapshot(DriveHealthSnapshotInput {
+                    drive_uuid: drive.drive_uuid.clone(),
+                    trigger: "foreign-counter".to_string(),
+                    session_id: None,
+                    tape_alert_flags: snapshot.tape_alert_flags,
+                    write_errors_corrected: snapshot.write_errors_corrected.and_then(u64_to_i64),
+                    write_errors_uncorrected: snapshot
+                        .write_errors_uncorrected
+                        .and_then(u64_to_i64),
+                    read_errors_corrected: snapshot.read_errors_corrected.and_then(u64_to_i64),
+                    read_errors_uncorrected: snapshot.read_errors_uncorrected.and_then(u64_to_i64),
+                    raw_pages: Some(
+                        "{\"write_error_counter\":true,\"read_error_counter\":true}".to_string(),
+                    ),
+                    at_utc: None,
+                })
+                .map_err(|err| ForeignPollError::Permanent(err.to_string()))?;
+            index
+                .touch_drive_last_seen(&drive.drive_uuid)
+                .map_err(|err| ForeignPollError::Permanent(err.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+fn library_is_managed(
+    serial: &str,
+    drives_cfg: &remanence_state::DrivesConfig,
+    daemon_libraries: &std::collections::HashSet<String>,
+) -> bool {
+    let configured = drives_cfg
+        .managed_libraries
+        .iter()
+        .map(|serial| serial.trim())
+        .filter(|serial| !serial.is_empty())
+        .collect::<std::collections::HashSet<_>>();
+    if configured.is_empty() {
+        daemon_libraries.contains(serial)
+    } else {
+        configured.contains(serial)
+    }
+}
+
+#[derive(Debug)]
+enum ForeignPollError {
+    Retryable(String),
+    Permanent(String),
+}
+
+struct ForeignDriveSnapshot {
+    tape_alert_flags: Option<String>,
+    write_errors_corrected: Option<u64>,
+    write_errors_uncorrected: Option<u64>,
+    read_errors_corrected: Option<u64>,
+    read_errors_uncorrected: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+fn read_foreign_drive_snapshot(
+    sg_path: &Path,
+    foreign_tapealert: bool,
+) -> Result<ForeignDriveSnapshot, ForeignPollError> {
+    let inner = remanence_library::LinuxSgTransport::open(sg_path)
+        .map_err(|err| ForeignPollError::Permanent(format!("open {}: {err}", sg_path.display())))?;
+    let mut transport =
+        remanence_library::ForeignDriveTransport::with_tapealert(inner, foreign_tapealert);
+    let write = read_error_counter_page_from_transport(
+        &mut transport,
+        remanence_library::drive_log_sense::PAGE_WRITE_ERROR_COUNTER,
+        remanence_library::drive_log_sense::build_write_error_counter_cdb,
+    )?;
+    let read = read_error_counter_page_from_transport(
+        &mut transport,
+        remanence_library::drive_log_sense::PAGE_READ_ERROR_COUNTER,
+        remanence_library::drive_log_sense::build_read_error_counter_cdb,
+    )?;
+    let tape_alert_flags = if foreign_tapealert {
+        Some(read_tape_alert_flags_from_transport(&mut transport)?)
+    } else {
+        None
+    };
+    Ok(ForeignDriveSnapshot {
+        tape_alert_flags,
+        write_errors_corrected: write.errors_corrected,
+        write_errors_uncorrected: write.errors_uncorrected,
+        read_errors_corrected: read.errors_corrected,
+        read_errors_uncorrected: read.errors_uncorrected,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_foreign_drive_snapshot(
+    _sg_path: &Path,
+    _foreign_tapealert: bool,
+) -> Result<ForeignDriveSnapshot, ForeignPollError> {
+    Err(ForeignPollError::Permanent(
+        "foreign drive polling requires Linux SG_IO".to_string(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn read_error_counter_page_from_transport<T: remanence_library::SgTransport>(
+    transport: &mut T,
+    page_code: u8,
+    build_cdb: fn(u16) -> [u8; 10],
+) -> Result<remanence_library::drive_log_sense::ErrorCounterPage, ForeignPollError> {
+    let cdb = build_cdb(remanence_library::drive_log_sense::ERROR_COUNTER_RESPONSE_LEN);
+    let mut buf = [0u8; remanence_library::drive_log_sense::ERROR_COUNTER_RESPONSE_LEN as usize];
+    transport.set_timeout_for(remanence_library::TimeoutClass::TapeStatus);
+    let outcome = transport
+        .execute_in(&cdb, &mut buf)
+        .map_err(foreign_poll_error_from_scsi)?;
+    let bytes = (outcome.bytes_transferred as usize).min(buf.len());
+    remanence_library::drive_log_sense::parse_error_counter_response(&buf[..bytes], page_code)
+        .map_err(foreign_poll_error_from_scsi)
+}
+
+#[cfg(target_os = "linux")]
+fn read_tape_alert_flags_from_transport<T: remanence_library::SgTransport>(
+    transport: &mut T,
+) -> Result<String, ForeignPollError> {
+    let cdb = remanence_library::drive_log_sense::build_tape_alert_cdb(
+        remanence_library::drive_log_sense::TAPE_ALERT_RESPONSE_LEN,
+    );
+    let mut buf = [0u8; remanence_library::drive_log_sense::TAPE_ALERT_RESPONSE_LEN as usize];
+    transport.set_timeout_for(remanence_library::TimeoutClass::TapeStatus);
+    let outcome = transport
+        .execute_in(&cdb, &mut buf)
+        .map_err(foreign_poll_error_from_scsi)?;
+    let bytes = (outcome.bytes_transferred as usize).min(buf.len());
+    let alerts = remanence_library::drive_log_sense::parse_response(&buf[..bytes])
+        .map_err(foreign_poll_error_from_scsi)?;
+    Ok(tape_alert_flags_json(alerts.active()))
+}
+
+#[cfg(target_os = "linux")]
+fn foreign_poll_error_from_scsi(err: remanence_library::ScsiError) -> ForeignPollError {
+    if is_retryable_foreign_scsi_error(&err) {
+        ForeignPollError::Retryable(err.to_string())
+    } else {
+        ForeignPollError::Permanent(err.to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_retryable_foreign_scsi_error(err: &remanence_library::ScsiError) -> bool {
+    match err {
+        remanence_library::ScsiError::UnexpectedStatus { status } => {
+            matches!(*status, 0x08 | 0x18)
+        }
+        remanence_library::ScsiError::CheckCondition { sense, .. }
+        | remanence_library::ScsiError::TransportError { sense, .. } => {
+            remanence_scsi_unit_attention(sense)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn remanence_scsi_unit_attention(sense: &[u8]) -> bool {
+    remanence_library::decode_scsi_sense(sense).is_some_and(|sense| sense.key == 0x06)
+}
+
+fn next_backoff(current: Duration, max: Duration) -> Duration {
+    let next = if current.is_zero() {
+        Duration::from_secs(5)
+    } else {
+        current.saturating_mul(2)
+    };
+    next.min(max)
+}
+
+fn parse_duration_or(value: &str, default: Duration) -> Duration {
+    parse_simple_duration(value).unwrap_or(default)
+}
+
+fn parse_simple_duration(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let split = value.find(|ch: char| !ch.is_ascii_digit())?;
+    let (digits, unit) = value.split_at(split);
+    let count = digits.parse::<u64>().ok()?;
+    match unit {
+        "ms" => Some(Duration::from_millis(count)),
+        "s" => Some(Duration::from_secs(count)),
+        "m" => Some(Duration::from_secs(count.saturating_mul(60))),
+        "h" => Some(Duration::from_secs(count.saturating_mul(60 * 60))),
+        _ => None,
+    }
+}
+
+fn tape_alert_flags_json(flags: &std::collections::BTreeSet<u8>) -> String {
+    let body = flags
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{body}]")
+}
+
+fn u64_to_i64(value: u64) -> Option<i64> {
+    i64::try_from(value).ok()
+}
+
 pub(crate) struct OperationAuditInput<'a> {
     pub(crate) actor: AuditActor,
     pub(crate) operation_id: Uuid,
@@ -899,13 +1239,15 @@ impl pb::catalog_server::Catalog for CatalogService {
         authorize_request(&request, AuthPermission::Read)?;
         let request = request.into_inner();
         let tape_uuid = decode_uuid_bytes(request.tape_uuid.as_slice(), "tape_uuid")?;
-        let tape = self
-            .state
-            .index()?
+        let index = self.state.index()?;
+        let tape = index
             .get_tape(&tape_uuid)
             .map_err(|err| Status::internal(err.to_string()))?
             .ok_or_else(|| Status::not_found("tape not found"))?;
-        Ok(Response::new(tape_to_proto(tape)))
+        let rollups = index
+            .tape_drive_correlation_rollups(&tape_uuid)
+            .map_err(status_from_state_error)?;
+        Ok(Response::new(tape_to_proto_with_rollups(tape, rollups)))
     }
 
     async fn list_tape_files(
@@ -2130,6 +2472,43 @@ fn tape_to_proto(record: TapeRecord) -> pb::Tape {
         state: tape_state(record.state.as_str()) as i32,
         updated_at: timestamp_from_rfc3339(record.updated_at_utc.as_str()),
         pool_id: record.pool_id.unwrap_or_default(),
+        correlation_rollups: Vec::new(),
+    }
+}
+
+fn tape_to_proto_with_rollups(
+    record: TapeRecord,
+    rollups: Vec<DriveCorrelationRollupRecord>,
+) -> pb::Tape {
+    let mut tape = tape_to_proto(record);
+    tape.correlation_rollups = rollups
+        .into_iter()
+        .map(correlation_rollup_to_proto)
+        .collect();
+    tape
+}
+
+fn correlation_rollup_to_proto(record: DriveCorrelationRollupRecord) -> pb::DriveCorrelationRollup {
+    pb::DriveCorrelationRollup {
+        tape_uuid: record.tape_uuid.unwrap_or_default(),
+        voltag: record.voltag.unwrap_or_default(),
+        drive_uuid: record.drive_uuid.unwrap_or_default(),
+        drive_serial: record.drive_serial.unwrap_or_default(),
+        session_count: u64::try_from(record.session_count).unwrap_or_default(),
+        snapshot_count: u64::try_from(record.snapshot_count).unwrap_or_default(),
+        write_errors_corrected: u64::try_from(record.write_errors_corrected).unwrap_or_default(),
+        write_errors_uncorrected: u64::try_from(record.write_errors_uncorrected)
+            .unwrap_or_default(),
+        read_errors_corrected: u64::try_from(record.read_errors_corrected).unwrap_or_default(),
+        read_errors_uncorrected: u64::try_from(record.read_errors_uncorrected).unwrap_or_default(),
+        first_session_utc: record
+            .first_session_utc
+            .as_deref()
+            .and_then(timestamp_from_rfc3339),
+        last_session_utc: record
+            .last_session_utc
+            .as_deref()
+            .and_then(timestamp_from_rfc3339),
     }
 }
 

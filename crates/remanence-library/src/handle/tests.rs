@@ -3489,6 +3489,77 @@ fn drive_handle_read_tape_alerts_rejects_short_successful_transfer() {
 }
 
 #[test]
+fn drive_handle_read_error_counters_reads_pages_02_and_03() {
+    let lib = open_drive_test_lib("LIB_EC01");
+    let policy = StaticAllowlist::new(["LIB_EC01"]);
+    let write_page = remanence_scsi::log_sense::synthesize_error_counter_page(0x02, 11, 1);
+    let read_page = remanence_scsi::log_sense::synthesize_error_counter_page(0x03, 22, 2);
+    let (factory, log) = multi_recording_factory(vec![
+        (
+            PathBuf::from("/dev/sg-mock"),
+            vec![changer_inquiry_response(), vpd80_response("LIB_EC01")],
+        ),
+        (
+            PathBuf::from("/dev/sg-drive-mock"),
+            vec![
+                lto9_inquiry(),
+                vpd80_response("DRV_A"),
+                write_page,
+                read_page,
+            ],
+        ),
+    ]);
+    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+
+    let counters = {
+        let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+        drive.read_error_counters().expect("read error counters")
+    };
+
+    assert_eq!(counters.write_errors_corrected, Some(11));
+    assert_eq!(counters.write_errors_uncorrected, Some(1));
+    assert_eq!(counters.read_errors_corrected, Some(22));
+    assert_eq!(counters.read_errors_uncorrected, Some(2));
+    assert!(!handle.is_dirty());
+    let log = log.borrow();
+    let log_sense_pages = log
+        .iter()
+        .filter(|cdb| cdb[0] == 0x4d)
+        .map(|cdb| cdb[2] & 0x3f)
+        .collect::<Vec<_>>();
+    assert_eq!(log_sense_pages, vec![0x02, 0x03]);
+}
+
+#[test]
+fn drive_handle_test_unit_ready_issues_tur() {
+    let lib = open_drive_test_lib("LIB_TUR01");
+    let policy = StaticAllowlist::new(["LIB_TUR01"]);
+    let (factory, log) = multi_recording_factory(vec![
+        (
+            PathBuf::from("/dev/sg-mock"),
+            vec![changer_inquiry_response(), vpd80_response("LIB_TUR01")],
+        ),
+        (
+            PathBuf::from("/dev/sg-drive-mock"),
+            vec![lto9_inquiry(), vpd80_response("DRV_A")],
+        ),
+    ]);
+    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+
+    {
+        let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+        drive.test_unit_ready().expect("test unit ready");
+    }
+
+    assert!(!handle.is_dirty());
+    let log = log.borrow();
+    assert!(
+        log.iter().any(|cdb| cdb.as_slice() == [0, 0, 0, 0, 0, 0]),
+        "TEST UNIT READY CDB was not issued"
+    );
+}
+
+#[test]
 fn drive_handle_write_config_rejects_fixed_block_size_zero() {
     // Codex 20:22 (idref=01cf3e76 Medium): BlockSize::Fixed
     // { size_bytes: 0 } is invalid per model.rs §4.2 and must

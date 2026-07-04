@@ -54,6 +54,9 @@ text must name drive history in its blast radius.
 - `clean_runs.phase`: `fencing` | `selecting` | `moving-in` |
   `cleaning` | `moving-back` | `verifying` | terminal: `done` |
   `failed` | `needs-operator`
+- `drive_health_snapshots.trigger`: `session-close` | `alert` |
+  `manual` | `foreign-counter` (additive, DS-M1 impl: background
+  foreign error-counter rows need a durable trigger value)
 - `clean_runs.trigger`: `auto-now` | `auto-periodic` | `manual`
 - `alarms.condition_key` kinds: `no-cln-cart`,
   `cleaning-needs-operator`, `cln-cart-expired`,
