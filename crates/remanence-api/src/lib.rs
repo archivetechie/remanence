@@ -267,6 +267,7 @@ impl ApiState {
             library_snapshot: library_snapshot.clone(),
             snapshot_miss_alarm: config.drives.snapshot_miss_alarm,
             managed_library_serials: Arc::new(managed_library_serials),
+            cleaning: config.cleaning.clone(),
         };
         let mut drive_txs = HashMap::new();
         for (bay_addr, drive) in opened_drives {
@@ -292,6 +293,7 @@ impl ApiState {
         state.default_library_serial = default_library_serial;
         state.library_snapshot = Some(library_snapshot);
         state.reconcile_drive_catalog_from_report(config, &report)?;
+        state.reconcile_clean_runs_from_report(&report)?;
         spawn_drive_collection_workers(index_path, report, config, drive_pool);
         Ok(state)
     }
@@ -404,6 +406,25 @@ impl ApiState {
             report.libraries.iter(),
             &drive_managed_library_serials(config),
         )
+    }
+
+    fn reconcile_clean_runs_from_report(
+        &self,
+        report: &remanence_library::DiscoveryReport,
+    ) -> Result<(), Status> {
+        let mut index = self.index_write()?;
+        let mut reconciled = 0u64;
+        for library in &report.libraries {
+            reconciled = reconciled.saturating_add(
+                index
+                    .reconcile_clean_runs_against_library(library)
+                    .map_err(status_from_state_error)?,
+            );
+        }
+        if reconciled > 0 {
+            tracing::info!("reconciled {reconciled} clean run(s) during startup");
+        }
+        Ok(())
     }
 
     fn record_request_received(

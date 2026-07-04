@@ -52,6 +52,12 @@ pub struct VirtualTape {
     pub compression: bool,
     /// TapeAlert flags currently reported for this cartridge.
     pub tape_alert_flags: BTreeSet<u8>,
+    /// Whether this cartridge is a cleaning cartridge.
+    pub cleaning_cart: bool,
+    /// If set, the cartridge is considered expired and fast-ejects when loaded.
+    pub cleaning_cart_expired: bool,
+    /// If set, the cartridge clears the drive's dirty state after this many ops.
+    pub cleaning_cycle_ops: Option<u64>,
 }
 
 impl VirtualTape {
@@ -66,6 +72,9 @@ impl VirtualTape {
             block_size,
             compression: false,
             tape_alert_flags: BTreeSet::new(),
+            cleaning_cart: false,
+            cleaning_cart_expired: false,
+            cleaning_cycle_ops: None,
         }
     }
 }
@@ -122,8 +131,23 @@ pub struct VirtualWorld {
     pub drive_serials: HashMap<u16, String>,
     /// Drive bay element address to drive-level TapeAlert flags.
     pub drive_alert_flags: HashMap<u16, BTreeSet<u8>>,
+    /// Per-bay cleaning simulation state.
+    pub drive_states: HashMap<u16, VirtualDriveState>,
     /// Changer element layout.
     pub element_layout: ElementLayout,
+}
+
+/// Per-drive cleaning simulation state.
+#[derive(Clone, Debug, Default)]
+pub struct VirtualDriveState {
+    /// After how many drive ops the drive becomes dirty.
+    pub dirty_after_ops: Option<u64>,
+    /// Number of drive ops since the last clean-cycle reset.
+    pub op_count: u64,
+    /// Remaining ops before a cleaning cartridge auto-ejects.
+    pub cleaning_cycle_ops_remaining: Option<u64>,
+    /// Whether the drive has already reported flag 20 for the current dirty cycle.
+    pub dirty_alert_reported: bool,
 }
 
 impl VirtualWorld {
@@ -152,6 +176,8 @@ impl VirtualWorld {
         drive_source_slots.insert(bay, None);
         let mut drive_alert_flags = HashMap::new();
         drive_alert_flags.insert(bay, BTreeSet::new());
+        let mut drive_states = HashMap::new();
+        drive_states.insert(bay, VirtualDriveState::default());
         Self {
             tapes: HashMap::new(),
             slots,
@@ -160,6 +186,7 @@ impl VirtualWorld {
             changer_serial: changer_serial.into(),
             drive_serials,
             drive_alert_flags,
+            drive_states,
             element_layout: ElementLayout {
                 robot_address: 0,
                 drive_start: bay,
@@ -239,6 +266,17 @@ impl VirtualWorld {
             return false;
         }
         self.drive_alert_flags.entry(bay).or_default().insert(flag)
+    }
+
+    /// Arm one bay to become dirty after `dirty_after_ops` drive commands.
+    pub fn arm_drive_dirty_after_ops(&mut self, bay: u16, dirty_after_ops: u64) -> bool {
+        let Some(state) = self.drive_states.get_mut(&bay) else {
+            return false;
+        };
+        state.dirty_after_ops = Some(dirty_after_ops);
+        state.op_count = 0;
+        state.dirty_alert_reported = false;
+        true
     }
 
     /// Mark one storage slot inaccessible in the honest model state.
@@ -409,6 +447,58 @@ impl ModelTransport {
         }
     }
 
+    fn advance_drive_cleaning_state(&self, world: &mut VirtualWorld) -> Result<bool, ScsiError> {
+        let bay = self.drive_bay()?;
+        let Some(barcode) = world.loaded_barcode(bay).map(str::to_string) else {
+            return Ok(false);
+        };
+        let Some(tape) = world.tapes.get(&barcode) else {
+            return Ok(false);
+        };
+        if tape.cleaning_cart {
+            let mut auto_eject = false;
+            {
+                let state = world.drive_states.entry(bay).or_default();
+                if let Some(remaining) = state.cleaning_cycle_ops_remaining.as_mut() {
+                    if *remaining > 0 {
+                        *remaining -= 1;
+                    }
+                    if *remaining == 0 {
+                        auto_eject = true;
+                        state.cleaning_cycle_ops_remaining = None;
+                    }
+                }
+            }
+            if auto_eject {
+                let source_slot = world.drive_source_slots.get(&bay).copied().flatten();
+                if let Some(source_slot) = source_slot {
+                    let barcode = world
+                        .drive_bays
+                        .get_mut(&bay)
+                        .and_then(Option::take)
+                        .ok_or(ScsiError::InvalidInput("cleaning cart vanished"))?;
+                    put_into_element(&mut *world, source_slot, barcode, Some(source_slot))?;
+                    world.drive_source_slots.insert(bay, None);
+                }
+            }
+            return Ok(auto_eject);
+        }
+
+        let dirty_reached = {
+            let state = world.drive_states.entry(bay).or_default();
+            state.op_count = state.op_count.saturating_add(1);
+            if let Some(dirty_after_ops) = state.dirty_after_ops {
+                state.op_count >= dirty_after_ops
+            } else {
+                false
+            }
+        };
+        if dirty_reached {
+            world.drive_alert_flags.entry(bay).or_default().insert(20);
+        }
+        Ok(false)
+    }
+
     fn with_loaded_tape<R>(
         &self,
         world: &mut VirtualWorld,
@@ -501,7 +591,7 @@ impl ModelTransport {
         let mut world = self.world.lock().expect("virtual world lock");
         let position = usize::try_from(self.position)
             .map_err(|_| ScsiError::InvalidInput("model position exceeds usize"))?;
-        self.with_loaded_tape(&mut world, |tape| {
+        let outcome = self.with_loaded_tape(&mut world, |tape| {
             let Some(record) = tape.records.get(position).cloned() else {
                 return Err(check_condition(blank_check_eod_sense(), 0));
             };
@@ -513,15 +603,20 @@ impl ModelTransport {
                 }
                 Record::Filemark => Err(check_condition(filemark_sense(), 0)),
             }
-        })
-        .inspect(|_| {
-            self.position = self.position.saturating_add(1);
-        })
-        .inspect_err(|err| {
-            if is_filemark_check_condition(err) {
+        });
+        let outcome = outcome
+            .inspect(|_| {
                 self.position = self.position.saturating_add(1);
-            }
-        })
+            })
+            .inspect_err(|err| {
+                if is_filemark_check_condition(err) {
+                    self.position = self.position.saturating_add(1);
+                }
+            })?;
+        if self.advance_drive_cleaning_state(&mut world)? {
+            self.position = 0;
+        }
+        Ok(outcome)
     }
 
     fn write_6(&mut self, buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
@@ -543,6 +638,9 @@ impl ModelTransport {
             Ok(())
         })?;
         self.position = self.position.saturating_add(1);
+        if self.advance_drive_cleaning_state(&mut world)? {
+            self.position = 0;
+        }
         if crossed_eom {
             Err(check_condition(eom_sense(0x00, 0), buf.len() as u32))
         } else {
@@ -566,6 +664,9 @@ impl ModelTransport {
             Ok(())
         })?;
         self.position = self.position.saturating_add(u64::from(count));
+        if self.advance_drive_cleaning_state(&mut world)? {
+            self.position = 0;
+        }
         Ok(())
     }
 
@@ -593,15 +694,49 @@ impl ModelTransport {
     fn load_unload(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
         let load = cdb.get(4).copied().unwrap_or(0) & 0x01 != 0;
         if load {
-            let world = self.world.lock().expect("virtual world lock");
+            let mut world = self.world.lock().expect("virtual world lock");
             let bay = self.drive_bay()?;
             if !world.drive_bays.contains_key(&bay) {
                 return Err(ScsiError::InvalidInput("unknown drive bay"));
             }
-            if world.drive_bays[&bay].is_none() {
+            let Some(barcode) = world.drive_bays[&bay].clone() else {
                 return Err(ScsiError::InvalidInput("load requested with empty bay"));
-            }
+            };
+            let expired = world
+                .tapes
+                .get(&barcode)
+                .is_some_and(|tape| tape.cleaning_cart_expired);
+            let cleaning_cycle_ops = world
+                .tapes
+                .get(&barcode)
+                .and_then(|tape| tape.cleaning_cycle_ops);
             self.position = 0;
+            if expired {
+                world.drive_alert_flags.entry(bay).or_default().insert(22);
+                let source_slot = world.drive_source_slots.get(&bay).copied().flatten();
+                if let Some(source_slot) = source_slot {
+                    let barcode = world
+                        .drive_bays
+                        .get_mut(&bay)
+                        .and_then(Option::take)
+                        .ok_or(ScsiError::InvalidInput("expired cleaning cart vanished"))?;
+                    put_into_element(&mut world, source_slot, barcode, Some(source_slot))?;
+                    world.drive_source_slots.insert(bay, None);
+                }
+                world
+                    .drive_states
+                    .entry(bay)
+                    .or_default()
+                    .cleaning_cycle_ops_remaining = None;
+                return Ok(());
+            }
+            let state = world.drive_states.entry(bay).or_default();
+            state.op_count = 0;
+            state.dirty_alert_reported = false;
+            state.cleaning_cycle_ops_remaining = cleaning_cycle_ops;
+            if let Some(flags) = world.drive_alert_flags.get_mut(&bay) {
+                flags.remove(&20);
+            }
             Ok(())
         } else {
             self.position = 0;
@@ -1332,6 +1467,105 @@ mod tests {
         assert!(blank.accessible);
         assert!(blank.full);
         assert_eq!(blank.cartridge, None);
+    }
+
+    #[test]
+    fn dirty_drive_sets_flag_20_after_configured_ops() {
+        let mut world = VirtualWorld::single_drive("LIB-MODEL", 0x0100, "DRV-MODEL", 0x0400, 1);
+        world.put_tape_in_drive(0x0100, "TAPE001", Some(0x0400), VirtualTape::default());
+        assert!(world.arm_drive_dirty_after_ops(0x0100, 2));
+        let world = Arc::new(Mutex::new(world));
+        let mut drive = ModelTransport::new(Arc::clone(&world), DeviceRole::Drive { bay: 0x0100 });
+        let block = b"dirty";
+
+        drive
+            .execute_out(
+                &read_write::build_write_variable_cdb(block.len() as u32),
+                block,
+            )
+            .expect("first write");
+        drive
+            .execute_out(
+                &read_write::build_write_variable_cdb(block.len() as u32),
+                block,
+            )
+            .expect("second write");
+
+        let guard = world.lock().expect("virtual world lock");
+        assert!(guard
+            .drive_alert_flags
+            .get(&0x0100)
+            .is_some_and(|flags| flags.contains(&20)));
+    }
+
+    #[test]
+    fn cleaning_cart_clears_dirty_and_auto_ejects_after_cycle() {
+        let mut world = VirtualWorld::single_drive("LIB-MODEL", 0x0100, "DRV-MODEL", 0x0400, 1);
+        let cleaning = VirtualTape {
+            cleaning_cart: true,
+            cleaning_cycle_ops: Some(1),
+            ..VirtualTape::default()
+        };
+        world.put_tape_in_slot(0x0400, "CLN001L9", VirtualTape::default());
+        world.put_tape_in_drive(0x0100, "CLN001L9", Some(0x0400), cleaning);
+        if let Some(slot) = world.slots.iter_mut().find(|slot| slot.address == 0x0400) {
+            slot.full = false;
+            slot.barcode = None;
+        }
+        world.arm_drive_dirty_after_ops(0x0100, 1);
+        let world = Arc::new(Mutex::new(world));
+        let mut drive = ModelTransport::new(Arc::clone(&world), DeviceRole::Drive { bay: 0x0100 });
+
+        drive
+            .execute_none(&remanence_scsi::load_unload::build_cdb(true))
+            .expect("load cleaning cart");
+        drive
+            .execute_out(&read_write::build_write_variable_cdb(5), b"clean")
+            .expect("cleaning cycle op");
+
+        let guard = world.lock().expect("virtual world lock");
+        assert_eq!(guard.loaded_barcode(0x0100), None);
+        let slot = guard
+            .slots
+            .iter()
+            .find(|slot| slot.address == 0x0400)
+            .expect("source slot");
+        assert_eq!(slot.barcode.as_deref(), Some("CLN001L9"));
+    }
+
+    #[test]
+    fn expired_cleaning_cart_fast_ejects_with_flag_22() {
+        let mut world = VirtualWorld::single_drive("LIB-MODEL", 0x0100, "DRV-MODEL", 0x0400, 1);
+        let cleaning = VirtualTape {
+            cleaning_cart: true,
+            cleaning_cart_expired: true,
+            ..VirtualTape::default()
+        };
+        world.put_tape_in_slot(0x0400, "CLN002L9", VirtualTape::default());
+        world.put_tape_in_drive(0x0100, "CLN002L9", Some(0x0400), cleaning);
+        if let Some(slot) = world.slots.iter_mut().find(|slot| slot.address == 0x0400) {
+            slot.full = false;
+            slot.barcode = None;
+        }
+        let world = Arc::new(Mutex::new(world));
+        let mut drive = ModelTransport::new(Arc::clone(&world), DeviceRole::Drive { bay: 0x0100 });
+
+        drive
+            .execute_none(&remanence_scsi::load_unload::build_cdb(true))
+            .expect("load expired cleaning cart");
+
+        let guard = world.lock().expect("virtual world lock");
+        assert!(guard
+            .drive_alert_flags
+            .get(&0x0100)
+            .is_some_and(|flags| flags.contains(&22)));
+        assert_eq!(guard.loaded_barcode(0x0100), None);
+        let slot = guard
+            .slots
+            .iter()
+            .find(|slot| slot.address == 0x0400)
+            .expect("source slot");
+        assert_eq!(slot.barcode.as_deref(), Some("CLN002L9"));
     }
 }
 
