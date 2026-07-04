@@ -371,6 +371,11 @@ pub(crate) async fn append_finish(
     reply_rx
         .await
         .map_err(|_| Status::internal("drive actor dropped reply"))?
+        .inspect(|record| {
+            if let Ok(Some(drive_uuid)) = state.drive_uuid_for_bay(mounted.bay) {
+                state.record_drive_write_bytes(drive_uuid.as_slice(), record.logical_size_bytes);
+            }
+        })
 }
 
 pub(crate) async fn get_write_session(
