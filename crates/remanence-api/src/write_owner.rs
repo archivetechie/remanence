@@ -546,9 +546,19 @@ fn changer_loop(
             ChangerCommand::Move { src, dst, reply } => {
                 let result = changer
                     .move_medium(src, dst, &cfg.policy)
-                    .map_err(|err| Status::internal(format!("move medium: {err}")))
-                    .and_then(|()| observe_refreshed_library(&mut index, &cfg, changer.library()));
+                    .map_err(|err| Status::internal(format!("move medium: {err}")));
                 if result.is_ok() {
+                    match observe_refreshed_library(&mut index, &cfg, changer.library()) {
+                        Ok(()) => clear_library_snapshot_persist_alarm(
+                            &mut index,
+                            changer.library().serial.as_str(),
+                        ),
+                        Err(err) => record_library_observation_failure(
+                            &mut index,
+                            changer.library(),
+                            err.message(),
+                        ),
+                    }
                     publish_library_snapshot(&cfg.library_snapshot, changer.library().clone());
                 }
                 let _ = reply.send(result);
@@ -1880,6 +1890,51 @@ fn observe_refreshed_library(
     )
 }
 
+fn library_snapshot_persist_alarm_key(library_serial: &str) -> String {
+    format!("snapshot-persist-failing:library:{library_serial}")
+}
+
+fn record_library_observation_failure(
+    index: &mut CatalogIndex,
+    library: &remanence_library::Library,
+    error: &str,
+) {
+    tracing::warn!(
+        "failed to observe refreshed drive catalog library_serial={} error={}",
+        library.serial,
+        error
+    );
+    let condition_key = library_snapshot_persist_alarm_key(library.serial.as_str());
+    let detail = format!(
+        "{{\"library_serial\":\"{}\",\"error\":\"{}\"}}",
+        library.serial.replace('"', "'"),
+        error.replace('"', "'")
+    );
+    if let Err(err) = index.raise_alarm(
+        condition_key.as_str(),
+        "snapshot-persist-failing",
+        "warning",
+        Some(detail.as_str()),
+    ) {
+        tracing::warn!(
+            "failed to raise library snapshot alarm condition_key={} error={}",
+            condition_key,
+            err
+        );
+    }
+}
+
+fn clear_library_snapshot_persist_alarm(index: &mut CatalogIndex, library_serial: &str) {
+    let condition_key = library_snapshot_persist_alarm_key(library_serial);
+    if let Err(err) = index.clear_alarm(condition_key.as_str()) {
+        tracing::warn!(
+            "failed to clear library snapshot alarm condition_key={} error={}",
+            condition_key,
+            err
+        );
+    }
+}
+
 fn publish_library_snapshot(
     cell: &RwLock<Arc<crate::LibrarySnapshot>>,
     updated: remanence_library::Library,
@@ -2771,8 +2826,10 @@ mod tests {
         read_encrypted_rao_file_range_to_vec, write_encrypted_rao_object, write_rem_tar_object,
         RemTarFile, RemTarObjectLayout, RemTarObjectOptions,
     };
-    use remanence_library::WormMediaState;
-    use remanence_library::{VecBlockSink, VecBlockSource};
+    use remanence_library::{
+        DriveBay, ElementLayout, FixtureTransport, IdentitySource, InstalledDrive, Library, Slot,
+        VecBlockSink, VecBlockSource, WormMediaState,
+    };
     use remanence_parity::{
         CommittedBundle, CommittedBundleKind, ParityConfig, TapeFileEntry, TapeFileKind,
     };
@@ -2784,6 +2841,90 @@ mod tests {
 
     const RANGE_OBJECT_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     const RANGE_TAPE_UUID: [u8; 16] = [0xAB; 16];
+
+    fn changer_inquiry_response() -> Vec<u8> {
+        include_bytes!("../../../fixtures/inquiry/changer-msl-g3.bin").to_vec()
+    }
+
+    fn vpd80_response(serial: &str) -> Vec<u8> {
+        let bytes = serial.as_bytes();
+        let mut response = vec![0x08u8, 0x80, 0x00, bytes.len() as u8];
+        response.extend_from_slice(bytes);
+        response
+    }
+
+    fn test_changer_library(serial: &str) -> Library {
+        Library {
+            serial: serial.to_string(),
+            changer_sg: PathBuf::from("/dev/sg-mock"),
+            changer_sysfs: PathBuf::from("/sys/class/scsi_device/mock"),
+            changer_inquiry: remanence_library::scsi::Inquiry::parse(include_bytes!(
+                "../../../fixtures/inquiry/changer-msl-g3.bin"
+            ))
+            .expect("parse changer inquiry fixture"),
+            chassis_designator: None,
+            layout: ElementLayout {
+                robot_address: 0,
+                drive_start: 0x0100,
+                drive_count: 1,
+                slot_start: 0x0400,
+                slot_count: 1,
+                ie_start: 0,
+                ie_count: 0,
+            },
+            drive_bays: vec![DriveBay {
+                element_address: 0x0100,
+                accessible: true,
+                installed: Some(InstalledDrive {
+                    serial: "DRV_MOVE_OBS".to_string(),
+                    identity_source: IdentitySource::DvcidAndInquiry,
+                    vendor: Some("IBM".to_string()),
+                    product: Some("ULT3580".to_string()),
+                    revision: Some("A1".to_string()),
+                    sg_path: Some(PathBuf::from("/dev/sg-drive-mock")),
+                    sysfs_path: None,
+                }),
+                loaded: false,
+                loaded_tape: None,
+                source_slot: None,
+            }],
+            slots: vec![Slot {
+                element_address: 0x0400,
+                accessible: true,
+                full: true,
+                cartridge: Some("TAPE_MOVE".to_string()),
+            }],
+            ie_ports: Vec::new(),
+        }
+    }
+
+    fn open_test_changer(library: &Library) -> ChangerHandle {
+        let policy = remanence_library::StaticAllowlist::new([library.serial.as_str()]);
+        let serial = library.serial.clone();
+        let mut responses = Some(vec![changer_inquiry_response(), vpd80_response(&serial)]);
+        library
+            .open_with(&policy, move |_| {
+                let responses = responses
+                    .take()
+                    .expect("test changer transport opened once");
+                Ok::<_, remanence_library::IoErrorKind>(Box::new(
+                    FixtureTransport::new().with_responses(responses),
+                )
+                    as Box<dyn remanence_library::SgTransport>)
+            })
+            .expect("open test changer")
+            .into_changer()
+    }
+
+    fn library_snapshot_cell(library: Library) -> Arc<RwLock<Arc<crate::LibrarySnapshot>>> {
+        Arc::new(RwLock::new(Arc::new(crate::LibrarySnapshot {
+            report: DiscoveryReport {
+                libraries: vec![library],
+                warnings: Vec::new(),
+            },
+            captured_at: OffsetDateTime::UNIX_EPOCH,
+        })))
+    }
 
     struct RangeCatalogFixture {
         index: CatalogIndex,
@@ -2963,6 +3104,96 @@ mod tests {
         assert_send_sync::<mpsc::Sender<DriveCommand>>();
         assert_send::<DriveCommand>();
         assert_send_sync::<mpsc::Sender<Result<pb::BytesChunk, Status>>>();
+    }
+
+    #[tokio::test]
+    async fn changer_move_succeeds_and_publishes_snapshot_when_catalog_observation_fails() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-api-move-observe-failure")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        CatalogIndex::open(&index_path).expect("create catalog");
+        let sqlite = rusqlite::Connection::open(&index_path).expect("open raw sqlite");
+        sqlite
+            .execute_batch(
+                "create trigger fail_drive_observation
+                 before insert on drives
+                 begin
+                   select raise(fail, 'injected drive catalog observation failure');
+                 end;",
+            )
+            .expect("install observation failure trigger");
+        drop(sqlite);
+
+        let library = test_changer_library("LIB_MOVE_OBS_FAIL");
+        let snapshot_cell = library_snapshot_cell(library.clone());
+        let changer = open_test_changer(&library);
+        let policy = remanence_library::StaticAllowlist::new([library.serial.as_str()]);
+        let cfg = WriteOwnerConfig {
+            index_path: index_path.clone(),
+            report: DiscoveryReport {
+                libraries: vec![library.clone()],
+                warnings: Vec::new(),
+            },
+            policy,
+            audit_dir: temp.path().join("audit"),
+            audit_fsync: false,
+            audit_append_lock: Arc::new(std::sync::Mutex::new(())),
+            reservations: Arc::new(HashMap::new()),
+            default_library_serial: Some(library.serial.clone()),
+            library_snapshot: Arc::clone(&snapshot_cell),
+            snapshot_miss_alarm: 1,
+            managed_library_serials: Arc::new(HashSet::from([library.serial.clone()])),
+        };
+        let actor = spawn_changer_actor(changer, cfg);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+
+        actor
+            .send(ChangerCommand::Move {
+                src: 0x0400,
+                dst: 0x0100,
+                reply: reply_tx,
+            })
+            .await
+            .expect("send move command");
+        let result = reply_rx.await.expect("move reply");
+
+        assert!(
+            result.is_ok(),
+            "physical move success must not be converted to failure by catalog observation: {result:?}"
+        );
+        let published = snapshot_cell
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        let published_library = published
+            .report
+            .libraries
+            .iter()
+            .find(|candidate| candidate.serial == library.serial)
+            .expect("published library");
+        let bay = &published_library.drive_bays[0];
+        assert!(bay.loaded, "published snapshot must include the moved tape");
+        assert_eq!(bay.loaded_tape.as_deref(), Some("TAPE_MOVE"));
+        assert_eq!(bay.source_slot, Some(0x0400));
+        assert!(!published_library.slots[0].full);
+
+        let alarm_key = library_snapshot_persist_alarm_key(library.serial.as_str());
+        let alarm = CatalogIndex::open(&index_path)
+            .expect("reopen catalog")
+            .get_alarm(alarm_key.as_str())
+            .expect("lookup alarm")
+            .expect("observation failure alarm");
+        assert_eq!(alarm.kind, "snapshot-persist-failing");
+        assert_eq!(alarm.state, "open");
+        assert!(
+            alarm
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("injected drive catalog observation failure")),
+            "alarm detail must surface the observation failure: {alarm:?}"
+        );
     }
 
     #[test]

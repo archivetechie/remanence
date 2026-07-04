@@ -689,6 +689,22 @@ fn poll_foreign_drive_counters_once(
     drives_cfg: &remanence_state::DrivesConfig,
     daemon_libraries: &std::collections::HashSet<String>,
 ) -> Result<(), ForeignPollError> {
+    poll_foreign_drive_counters_once_with_reader(
+        index_path,
+        report,
+        drives_cfg,
+        daemon_libraries,
+        read_foreign_drive_snapshot,
+    )
+}
+
+fn poll_foreign_drive_counters_once_with_reader(
+    index_path: &Path,
+    report: &remanence_library::DiscoveryReport,
+    drives_cfg: &remanence_state::DrivesConfig,
+    daemon_libraries: &std::collections::HashSet<String>,
+    mut read_snapshot: impl FnMut(&Path, bool) -> Result<ForeignDriveSnapshot, ForeignPollError>,
+) -> Result<(), ForeignPollError> {
     let mut index = CatalogIndex::open(index_path)
         .map_err(|err| ForeignPollError::Permanent(err.to_string()))?;
     for library in &report.libraries {
@@ -702,19 +718,36 @@ fn poll_foreign_drive_counters_once(
             let Some(sg_path) = installed.sg_path.as_ref() else {
                 continue;
             };
-            if installed.serial.trim().is_empty() {
+            let installed_serial = installed.serial.trim();
+            if installed_serial.is_empty() {
                 continue;
             }
-            let snapshot = read_foreign_drive_snapshot(sg_path, drives_cfg.foreign_tapealert)?;
             let Some(drive) = index
-                .get_drive_by_selector(installed.serial.as_str())
+                .get_actionable_drive_at(library.serial.as_str(), i64::from(bay.element_address))
                 .map_err(|err| ForeignPollError::Permanent(err.to_string()))?
             else {
+                tracing::warn!(
+                    "skipping foreign drive counter attribution for unresolved or ambiguous bay library_serial={} element_address={} serial={}",
+                    library.serial,
+                    bay.element_address,
+                    installed_serial
+                );
                 continue;
             };
+            if drive.serial.as_str() != installed_serial {
+                tracing::warn!(
+                    "skipping foreign drive counter attribution for bay serial mismatch library_serial={} element_address={} observed_serial={} catalog_serial={}",
+                    library.serial,
+                    bay.element_address,
+                    installed_serial,
+                    drive.serial
+                );
+                continue;
+            }
             if drive.managed != "foreign" || drive.state != "active" {
                 continue;
             }
+            let snapshot = read_snapshot(sg_path, drives_cfg.foreign_tapealert)?;
             let tape_alert_flags = snapshot.tape_alert_flags.clone();
             index
                 .record_drive_health_snapshot(DriveHealthSnapshotInput {
@@ -3953,6 +3986,191 @@ BCw3Wyv2UWY=
                 export_enabled: true,
             }],
         }
+    }
+
+    fn foreign_drive_library(serial: &str, bays: &[(u16, &str, Option<&str>)]) -> Library {
+        let mut library = test_library(serial);
+        library.layout.drive_start = bays
+            .iter()
+            .map(|(element_address, _, _)| *element_address)
+            .min()
+            .unwrap_or(0);
+        library.layout.drive_count = u16::try_from(bays.len()).expect("test bay count fits u16");
+        library.drive_bays = bays
+            .iter()
+            .map(|(element_address, drive_serial, sg_path)| DriveBay {
+                element_address: *element_address,
+                accessible: true,
+                installed: Some(InstalledDrive {
+                    serial: (*drive_serial).to_string(),
+                    identity_source: IdentitySource::DvcidAndInquiry,
+                    vendor: Some("IBM".to_string()),
+                    product: Some("ULT3580".to_string()),
+                    revision: Some("A1".to_string()),
+                    sg_path: sg_path.map(PathBuf::from),
+                    sysfs_path: None,
+                }),
+                loaded: false,
+                loaded_tape: None,
+                source_slot: None,
+            })
+            .collect();
+        library
+    }
+
+    fn foreign_counter_snapshot(tape_alert_flags: Option<&str>) -> ForeignDriveSnapshot {
+        ForeignDriveSnapshot {
+            tape_alert_flags: tape_alert_flags.map(str::to_string),
+            write_errors_corrected: Some(11),
+            write_errors_uncorrected: Some(1),
+            read_errors_corrected: Some(7),
+            read_errors_uncorrected: Some(0),
+        }
+    }
+
+    #[test]
+    fn foreign_poll_skips_same_serial_collision_rows_without_attribution() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-api-foreign-collision")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        let report = DiscoveryReport {
+            libraries: vec![foreign_drive_library(
+                "d2lib",
+                &[
+                    (0x0100, "DUPSER", Some("/dev/sg10")),
+                    (0x0101, "DUPSER", Some("/dev/sg11")),
+                ],
+            )],
+            warnings: Vec::new(),
+        };
+        let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+        observe_drive_catalog_from_libraries(&mut index, report.libraries.iter(), &HashSet::new())
+            .expect("observe duplicate serial foreign rows");
+        let collision_rows = index.list_drives(true, false).expect("list drives");
+        assert_eq!(collision_rows.len(), 2);
+        assert!(
+            collision_rows.iter().all(|drive| !drive.actionable),
+            "duplicate serial rows must be non-actionable: {collision_rows:?}"
+        );
+        drop(index);
+
+        let drives_cfg = remanence_state::DrivesConfig {
+            foreign_tapealert: true,
+            ..remanence_state::DrivesConfig::default()
+        };
+        let mut reads = Vec::new();
+        poll_foreign_drive_counters_once_with_reader(
+            &index_path,
+            &report,
+            &drives_cfg,
+            &HashSet::new(),
+            |path, _foreign_tapealert| {
+                reads.push(path.to_path_buf());
+                Ok(foreign_counter_snapshot(Some("[20]")))
+            },
+        )
+        .expect("poll foreign counters");
+
+        assert!(
+            reads.is_empty(),
+            "ambiguous duplicate serial bays must not be polled or attributed: {reads:?}"
+        );
+        let index = CatalogIndex::open(&index_path).expect("reopen catalog");
+        for drive in collision_rows {
+            assert!(
+                index
+                    .list_drive_health_snapshots(&drive.drive_uuid)
+                    .expect("list snapshots")
+                    .is_empty(),
+                "collision row received a snapshot: {drive:?}"
+            );
+        }
+        let active_alarms = index.list_alarms(false).expect("list active alarms");
+        assert!(
+            active_alarms
+                .iter()
+                .all(|alarm| alarm.kind != "foreign-drive-wants-cleaning"),
+            "collision rows must not receive foreign cleaning advisories: {active_alarms:?}"
+        );
+    }
+
+    #[test]
+    fn foreign_poll_attributes_unambiguous_row_by_library_and_element_address() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-api-foreign-unambiguous")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        let report = DiscoveryReport {
+            libraries: vec![foreign_drive_library(
+                "d2lib",
+                &[
+                    (0x0100, "FOREIGN_A", None),
+                    (0x0101, "FOREIGN_B", Some("/dev/sg-target")),
+                ],
+            )],
+            warnings: Vec::new(),
+        };
+        let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+        observe_drive_catalog_from_libraries(&mut index, report.libraries.iter(), &HashSet::new())
+            .expect("observe foreign rows");
+        let other_drive = index
+            .get_actionable_drive_at("d2lib", 0x0100)
+            .expect("lookup other bay")
+            .expect("other bay drive");
+        let target_drive = index
+            .get_actionable_drive_at("d2lib", 0x0101)
+            .expect("lookup target bay")
+            .expect("target bay drive");
+        assert_eq!(other_drive.serial, "FOREIGN_A");
+        assert_eq!(target_drive.serial, "FOREIGN_B");
+        drop(index);
+
+        let drives_cfg = remanence_state::DrivesConfig {
+            foreign_tapealert: true,
+            ..remanence_state::DrivesConfig::default()
+        };
+        let mut reads = Vec::new();
+        poll_foreign_drive_counters_once_with_reader(
+            &index_path,
+            &report,
+            &drives_cfg,
+            &HashSet::new(),
+            |path, foreign_tapealert| {
+                assert!(foreign_tapealert, "test config must request TapeAlert");
+                reads.push(path.to_path_buf());
+                Ok(foreign_counter_snapshot(Some("[20]")))
+            },
+        )
+        .expect("poll foreign counters");
+
+        assert_eq!(reads, vec![PathBuf::from("/dev/sg-target")]);
+        let index = CatalogIndex::open(&index_path).expect("reopen catalog");
+        assert!(
+            index
+                .list_drive_health_snapshots(&other_drive.drive_uuid)
+                .expect("other snapshots")
+                .is_empty(),
+            "non-polled bay must not receive target snapshot"
+        );
+        let target_snapshots = index
+            .list_drive_health_snapshots(&target_drive.drive_uuid)
+            .expect("target snapshots");
+        assert_eq!(target_snapshots.len(), 1);
+        assert_eq!(target_snapshots[0].trigger, "foreign-counter");
+        assert_eq!(target_snapshots[0].write_errors_corrected, Some(11));
+        let advisory = index
+            .list_alarms(false)
+            .expect("list active alarms")
+            .into_iter()
+            .find(|alarm| alarm.kind == "foreign-drive-wants-cleaning")
+            .expect("foreign advisory alarm");
+        assert!(advisory
+            .detail
+            .as_deref()
+            .is_some_and(|detail| { detail.contains("d2lib") && detail.contains("FOREIGN_B") }));
     }
 
     fn pool_state_with_tapes(tape_uuids: &[[u8; 16]]) -> ApiState {

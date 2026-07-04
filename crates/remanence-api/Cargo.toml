@@ -44,6 +44,7 @@ default = []
 foreign-bru = ["dep:remanence-bru"]
 
 [dev-dependencies]
+rusqlite = { workspace = true }
 tempfile = { workspace = true }
 
 [lints.rust]
