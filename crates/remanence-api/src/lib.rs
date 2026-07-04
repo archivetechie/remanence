@@ -11,7 +11,7 @@ use std::io;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -95,11 +95,106 @@ const CATALOG_STREAM_BUFFER: usize = 32;
 type BytesChunkStream =
     Pin<Box<dyn Stream<Item = Result<pb::BytesChunk, Status>> + Send + 'static>>;
 
+struct CountingBytesStream {
+    inner: BytesChunkStream,
+    state: ApiState,
+    drive_uuid: Vec<u8>,
+}
+
+impl Stream for CountingBytesStream {
+    type Item = Result<pb::BytesChunk, Status>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(chunk))) => {
+                self.state
+                    .record_drive_read_bytes(&self.drive_uuid, chunk.data.len() as u64);
+                std::task::Poll::Ready(Some(Ok(chunk)))
+            }
+            other => other,
+        }
+    }
+}
+
 /// Inventory snapshot captured once at daemon startup (S6a). Static until
 /// RefreshInventory (S6b); LibraryState.last_inventory_at surfaces capture time.
 pub(crate) struct LibrarySnapshot {
     pub(crate) report: remanence_library::DiscoveryReport,
     pub(crate) captured_at: OffsetDateTime,
+}
+
+#[derive(Debug)]
+struct DriveByteCounters {
+    read_bytes: AtomicU64,
+    write_bytes: AtomicU64,
+    counter_epoch: u64,
+}
+
+impl DriveByteCounters {
+    fn new(counter_epoch: u64) -> Self {
+        Self {
+            read_bytes: AtomicU64::new(0),
+            write_bytes: AtomicU64::new(0),
+            counter_epoch,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LiveStatusState {
+    min_poll_interval: Duration,
+    cache: RwLock<Option<(OffsetDateTime, pb::GetLiveStatusResponse)>>,
+    drive_counters: RwLock<HashMap<Vec<u8>, Arc<DriveByteCounters>>>,
+}
+
+impl LiveStatusState {
+    fn new(min_poll_interval: Duration) -> Self {
+        Self {
+            min_poll_interval,
+            cache: RwLock::new(None),
+            drive_counters: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn counter_epoch(daemon_epoch: u64, drive_uuid: &[u8]) -> u64 {
+        let mut hasher = Sha256::new();
+        hasher.update(daemon_epoch.to_le_bytes());
+        hasher.update(drive_uuid);
+        let digest = hasher.finalize();
+        u64::from_le_bytes(digest[..8].try_into().expect("sha256 prefix is 8 bytes"))
+    }
+
+    fn get_or_create_counters(
+        &self,
+        daemon_epoch: u64,
+        drive_uuid: &[u8],
+    ) -> Arc<DriveByteCounters> {
+        if let Some(existing) = self
+            .drive_counters
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(drive_uuid)
+            .cloned()
+        {
+            return existing;
+        }
+        let mut counters = self
+            .drive_counters
+            .write()
+            .unwrap_or_else(|err| err.into_inner());
+        counters
+            .entry(drive_uuid.to_vec())
+            .or_insert_with(|| {
+                Arc::new(DriveByteCounters::new(Self::counter_epoch(
+                    daemon_epoch,
+                    drive_uuid,
+                )))
+            })
+            .clone()
+    }
 }
 
 /// Shared state for the initial Layer 5 service implementations.
@@ -111,11 +206,14 @@ pub struct ApiState {
     audit_append_lock: Arc<std::sync::Mutex<()>>,
     operations: crate::operations::OperationRegistry,
     pool_configs: Arc<HashMap<String, TapePoolConfig>>,
+    managed_library_serials: Arc<HashSet<String>>,
     drive_pool: Option<crate::write_owner::DrivePool>,
     spool_dir: Option<Arc<PathBuf>>,
     spool_budget: Option<Arc<Semaphore>>,
     default_library_serial: Option<Arc<String>>,
     library_snapshot: Option<Arc<RwLock<Arc<LibrarySnapshot>>>>,
+    live_status: Arc<LiveStatusState>,
+    daemon_epoch: u64,
     daemon_version: String,
     api_version: String,
     rust_target: String,
@@ -139,9 +237,16 @@ impl ApiState {
         Self::new_with_pool_configs_inner(
             index_path,
             pool_configs,
+            config
+                .drives
+                .managed_libraries
+                .iter()
+                .map(|serial| serial.trim().to_string())
+                .collect(),
             config.audit.dir.clone(),
             config.audit.fsync,
             Arc::new(std::sync::Mutex::new(())),
+            live_status_config_from(&config.livestatus),
         )
     }
 
@@ -159,19 +264,24 @@ impl ApiState {
         Self::new_with_pool_configs_inner(
             index_path,
             pool_configs,
+            HashSet::new(),
             audit_dir,
             false,
             Arc::new(std::sync::Mutex::new(())),
+            live_status_config_from(&remanence_state::LiveStatusConfig::default()),
         )
     }
 
     fn new_with_pool_configs_inner(
         index_path: PathBuf,
         pool_configs: HashMap<String, TapePoolConfig>,
+        managed_library_serials: HashSet<String>,
         audit_dir: PathBuf,
         audit_fsync: bool,
         audit_append_lock: Arc<std::sync::Mutex<()>>,
+        live_status_interval: Duration,
     ) -> Self {
+        let daemon_epoch = Uuid::new_v4().as_u128() as u64;
         Self {
             index_path: Arc::new(index_path),
             audit_dir: Arc::new(audit_dir),
@@ -179,11 +289,14 @@ impl ApiState {
             audit_append_lock,
             operations: crate::operations::OperationRegistry::default(),
             pool_configs: Arc::new(pool_configs),
+            managed_library_serials: Arc::new(managed_library_serials),
             drive_pool: None,
             spool_dir: None,
             spool_budget: None,
             default_library_serial: None,
             library_snapshot: None,
+            live_status: Arc::new(LiveStatusState::new(live_status_interval)),
+            daemon_epoch,
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             api_version: "v1-draft".to_string(),
             rust_target: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
@@ -281,9 +394,16 @@ impl ApiState {
         let mut state = Self::new_with_pool_configs_inner(
             index_path.clone(),
             pool_configs,
+            config
+                .drives
+                .managed_libraries
+                .iter()
+                .map(|serial| serial.trim().to_string())
+                .collect(),
             config.audit.dir.clone(),
             config.audit.fsync,
             audit_append_lock,
+            live_status_config_from(&config.livestatus),
         );
         state.drive_pool = Some(drive_pool.clone());
         state.spool_dir = Some(Arc::new(spool_dir));
@@ -355,6 +475,226 @@ impl ApiState {
             .as_ref()
             .map(crate::write_owner::DrivePool::busy_bays)
             .unwrap_or_default()
+    }
+
+    pub(crate) fn drive_uuid_for_bay(&self, bay: u16) -> Result<Option<Vec<u8>>, Status> {
+        let library_serial = if let Some(serial) = self.default_library_serial.as_deref() {
+            serial.to_string()
+        } else if let Some(snapshot) = self.current_library_snapshot() {
+            match snapshot.report.libraries.as_slice() {
+                [library] => library.serial.clone(),
+                _ => return Ok(None),
+            }
+        } else {
+            let index = self.index()?;
+            let mut serials = index
+                .list_drives(true, false)
+                .map_err(status_from_state_error)?
+                .into_iter()
+                .filter_map(|drive| {
+                    drive
+                        .last_library_serial
+                        .map(|serial| serial.trim().to_string())
+                        .filter(|serial| !serial.is_empty())
+                })
+                .collect::<std::collections::HashSet<_>>();
+            match serials.len() {
+                1 => serials
+                    .drain()
+                    .next()
+                    .expect("single drive library serial must exist"),
+                _ => return Ok(None),
+            }
+        };
+        let index = self.index()?;
+        let drive = index
+            .get_actionable_drive_at(library_serial.as_str(), i64::from(bay))
+            .map_err(status_from_state_error)?;
+        Ok(drive.map(|drive| drive.drive_uuid))
+    }
+
+    fn drive_record_at_bay(
+        &self,
+        library_serial: &str,
+        bay: u16,
+    ) -> Result<Option<remanence_state::DriveRecord>, Status> {
+        let index = self.index()?;
+        let drive = index
+            .list_drives(true, false)
+            .map_err(status_from_state_error)?
+            .into_iter()
+            .find(|drive| {
+                drive.last_library_serial.as_deref() == Some(library_serial)
+                    && drive.last_element_address == Some(i64::from(bay))
+            });
+        Ok(drive)
+    }
+
+    fn library_is_managed(&self, library_serial: &str) -> bool {
+        self.managed_library_serials.is_empty()
+            || self.managed_library_serials.contains(library_serial.trim())
+    }
+
+    fn drive_counters(&self, drive_uuid: &[u8]) -> Arc<DriveByteCounters> {
+        self.live_status
+            .get_or_create_counters(self.daemon_epoch, drive_uuid)
+    }
+
+    pub(crate) fn record_drive_read_bytes(&self, drive_uuid: &[u8], bytes: u64) {
+        let counters = self.drive_counters(drive_uuid);
+        counters.read_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_drive_write_bytes(&self, drive_uuid: &[u8], bytes: u64) {
+        let counters = self.drive_counters(drive_uuid);
+        counters.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    async fn live_status_response(&self) -> Result<pb::GetLiveStatusResponse, Status> {
+        let snapshot_at = OffsetDateTime::now_utc();
+        if let Some(cached) = self
+            .live_status
+            .cache
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+        {
+            if snapshot_at - cached.0 < self.live_status.min_poll_interval {
+                return Ok(cached.1);
+            }
+        }
+
+        let snapshot = self
+            .current_library_snapshot()
+            .ok_or_else(|| Status::not_found("library not found"))?;
+        let index = self.index()?;
+        let voltags = crate::library::voltag_uuid_map(&index)?;
+        let busy_bays = self.busy_drive_bays();
+        let active_clean_run_drive_uuids = index
+            .list_clean_runs(false)
+            .map_err(status_from_state_error)?
+            .into_iter()
+            .filter(|run| !matches!(run.phase.as_str(), "done" | "failed" | "needs-operator"))
+            .map(|run| run.drive_uuid)
+            .collect::<HashSet<_>>();
+
+        let mut libraries = Vec::new();
+        for library in &snapshot.report.libraries {
+            let mut state = crate::library::project_library_state(
+                library,
+                &snapshot.captured_at,
+                &voltags,
+                &busy_bays,
+                &HashSet::new(),
+            );
+            state.managed = if self.library_is_managed(library.serial.as_str()) {
+                "rem".to_string()
+            } else {
+                "foreign".to_string()
+            };
+
+            for drive in state.drives.iter_mut() {
+                let bay = u16::try_from(drive.element_address)
+                    .map_err(|_| Status::invalid_argument("drive element address overflows u16"))?;
+                let record = self.drive_record_at_bay(library.serial.as_str(), bay)?;
+                if let Some(record) = record {
+                    self.enrich_live_drive(
+                        drive,
+                        &record,
+                        active_clean_run_drive_uuids.contains(&record.drive_uuid),
+                    );
+                }
+            }
+            libraries.push(state);
+        }
+
+        let operations = index
+            .list_operations()
+            .map_err(status_from_state_error)?
+            .into_iter()
+            .filter_map(|operation| {
+                Uuid::parse_str(operation.operation_id.as_str())
+                    .ok()
+                    .map(|operation_id| pb::OperationRef {
+                        operation_id: operation_id.as_bytes().to_vec(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        let alarms = index
+            .list_alarms(false)
+            .map_err(status_from_state_error)?
+            .into_iter()
+            .map(alarm_record_to_proto)
+            .collect::<Vec<_>>();
+        let snapshot_at_utc = snapshot_at
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+        let response = pb::GetLiveStatusResponse {
+            libraries,
+            operations,
+            alarms,
+            snapshot_at_utc,
+            daemon_epoch: self.daemon_epoch,
+        };
+        *self
+            .live_status
+            .cache
+            .write()
+            .unwrap_or_else(|err| err.into_inner()) = Some((snapshot_at, response.clone()));
+        Ok(response)
+    }
+
+    fn enrich_live_drive(
+        &self,
+        drive: &mut pb::Drive,
+        record: &remanence_state::DriveRecord,
+        cleaning_active: bool,
+    ) {
+        let drive_uuid = record.drive_uuid.clone();
+        drive.drive_uuid = drive_uuid.clone();
+        drive.cleaning_due = if record.managed == "foreign" {
+            "none".to_string()
+        } else {
+            record.cleaning_due.clone()
+        };
+        drive.fenced = record.fenced;
+        drive.lifetime_read_bytes = self
+            .live_status
+            .drive_counters
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(&drive_uuid)
+            .map(|counters| counters.read_bytes.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        drive.lifetime_write_bytes = self
+            .live_status
+            .drive_counters
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(&drive_uuid)
+            .map(|counters| counters.write_bytes.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        drive.counter_epoch = self
+            .live_status
+            .drive_counters
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(&drive_uuid)
+            .map(|counters| counters.counter_epoch)
+            .unwrap_or_else(|| {
+                LiveStatusState::counter_epoch(self.daemon_epoch, drive_uuid.as_slice())
+            });
+        drive.session_id = Vec::new();
+        drive.active_alert_names = if cleaning_active {
+            vec!["cleaning".to_string()]
+        } else {
+            Vec::new()
+        };
+        if cleaning_active {
+            drive.status = pb::drive::Status::DriveStatusCleaning as i32;
+        } else if drive.fenced || record.fenced {
+            drive.status = pb::drive::Status::DriveStatusFenced as i32;
+        }
     }
 
     fn index_path(&self) -> PathBuf {
@@ -1048,6 +1388,11 @@ fn default_audit_dir_for_index(index_path: &Path) -> PathBuf {
             .unwrap_or_else(|| parent.join("audit"));
     }
     parent.join("audit")
+}
+
+fn live_status_config_from(config: &remanence_state::LiveStatusConfig) -> Duration {
+    parse_simple_duration(config.min_poll_interval.as_str())
+        .unwrap_or_else(|| Duration::from_millis(250))
 }
 
 /// Implementation of the process-level Daemon service.
@@ -1937,7 +2282,17 @@ impl ReadSessionApi {
             chunk_tx,
         )
         .await?;
-        Ok(Box::pin(ReceiverStream::new(chunk_rx)))
+        let state = self.state.clone();
+        let drive_uuid = {
+            let pool = state.drive_pool()?.clone();
+            let mounted = pool.session(session_id)?;
+            state.drive_uuid_for_bay(mounted.bay)?.unwrap_or_default()
+        };
+        Ok(Box::pin(CountingBytesStream {
+            inner: Box::pin(ReceiverStream::new(chunk_rx)),
+            state,
+            drive_uuid,
+        }))
     }
 
     async fn dispatch_read_object_range(
@@ -1967,7 +2322,17 @@ impl ReadSessionApi {
             chunk_tx,
         )
         .await?;
-        Ok(Box::pin(ReceiverStream::new(chunk_rx)))
+        let state = self.state.clone();
+        let drive_uuid = {
+            let pool = state.drive_pool()?.clone();
+            let mounted = pool.session(session_id)?;
+            state.drive_uuid_for_bay(mounted.bay)?.unwrap_or_default()
+        };
+        Ok(Box::pin(CountingBytesStream {
+            inner: Box::pin(ReceiverStream::new(chunk_rx)),
+            state,
+            drive_uuid,
+        }))
     }
 }
 
@@ -2965,6 +3330,24 @@ pub(crate) fn timestamp_from_rfc3339(value: &str) -> Option<prost_types::Timesta
         seconds: parsed.unix_timestamp(),
         nanos: parsed.nanosecond() as i32,
     })
+}
+
+fn alarm_record_to_proto(record: remanence_state::AlarmRecord) -> pb::Alarm {
+    pb::Alarm {
+        alarm_id: u64::try_from(record.alarm_id).unwrap_or_default(),
+        condition_key: record.condition_key,
+        kind: record.kind,
+        severity: record.severity,
+        state: record.state,
+        first_seen_utc: timestamp_from_rfc3339(record.first_seen_utc.as_str()),
+        last_seen_utc: timestamp_from_rfc3339(record.last_seen_utc.as_str()),
+        acked_by: record.acked_by.unwrap_or_default(),
+        acked_at_utc: record
+            .acked_at_utc
+            .as_deref()
+            .and_then(timestamp_from_rfc3339),
+        detail: record.detail.unwrap_or_default(),
+    }
 }
 
 #[cfg(test)]
