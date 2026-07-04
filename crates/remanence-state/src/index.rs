@@ -348,6 +348,24 @@ pub struct DriveHealthSnapshotInput {
     pub at_utc: Option<String>,
 }
 
+/// Aggregated session and snapshot evidence for "tape or drive?" views.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct DriveCorrelationRollupRecord {
+    pub tape_uuid: Option<Vec<u8>>,
+    pub voltag: Option<String>,
+    pub drive_uuid: Option<Vec<u8>>,
+    pub drive_serial: Option<String>,
+    pub session_count: i64,
+    pub snapshot_count: i64,
+    pub write_errors_corrected: i64,
+    pub write_errors_uncorrected: i64,
+    pub read_errors_corrected: i64,
+    pub read_errors_uncorrected: i64,
+    pub first_session_utc: Option<String>,
+    pub last_session_utc: Option<String>,
+}
+
 /// One standing alarm row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(missing_docs)]
@@ -1205,6 +1223,76 @@ impl CatalogIndex {
             .map_err(|err| sqlite_error("read drive snapshots", err))
     }
 
+    /// Return per-tape session/error rollups for one drive.
+    pub fn drive_tape_correlation_rollups(
+        &self,
+        drive_uuid: &[u8],
+    ) -> Result<Vec<DriveCorrelationRollupRecord>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select s.tape_uuid, tapes.voltag, s.drive_uuid, drives.serial,
+                        count(distinct s.session_id),
+                        count(h.snapshot_id),
+                        coalesce(sum(h.write_errors_corrected), 0),
+                        coalesce(sum(h.write_errors_uncorrected), 0),
+                        coalesce(sum(h.read_errors_corrected), 0),
+                        coalesce(sum(h.read_errors_uncorrected), 0),
+                        min(s.opened_at_utc), max(s.updated_at_utc)
+                 from sessions s
+                 left join tapes on tapes.tape_uuid = s.tape_uuid
+                 left join drives on drives.drive_uuid = s.drive_uuid
+                 left join drive_health_snapshots h
+                   on h.session_id = s.session_id
+                  and h.drive_uuid = s.drive_uuid
+                 where s.drive_uuid = ?1
+                   and s.tape_uuid is not null
+                 group by s.tape_uuid, tapes.voltag, s.drive_uuid, drives.serial
+                 order by max(s.updated_at_utc) desc, tapes.voltag",
+            )
+            .map_err(|err| sqlite_error("prepare drive tape rollup query", err))?;
+        let rows = stmt
+            .query_map(params![drive_uuid], drive_correlation_rollup_from_row)
+            .map_err(|err| sqlite_error("query drive tape rollups", err))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| sqlite_error("read drive tape rollups", err))
+    }
+
+    /// Return per-drive session/error rollups for one tape.
+    pub fn tape_drive_correlation_rollups(
+        &self,
+        tape_uuid: &[u8],
+    ) -> Result<Vec<DriveCorrelationRollupRecord>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select s.tape_uuid, tapes.voltag, s.drive_uuid, drives.serial,
+                        count(distinct s.session_id),
+                        count(h.snapshot_id),
+                        coalesce(sum(h.write_errors_corrected), 0),
+                        coalesce(sum(h.write_errors_uncorrected), 0),
+                        coalesce(sum(h.read_errors_corrected), 0),
+                        coalesce(sum(h.read_errors_uncorrected), 0),
+                        min(s.opened_at_utc), max(s.updated_at_utc)
+                 from sessions s
+                 left join tapes on tapes.tape_uuid = s.tape_uuid
+                 left join drives on drives.drive_uuid = s.drive_uuid
+                 left join drive_health_snapshots h
+                   on h.session_id = s.session_id
+                  and h.drive_uuid = s.drive_uuid
+                 where s.tape_uuid = ?1
+                   and s.drive_uuid is not null
+                 group by s.tape_uuid, tapes.voltag, s.drive_uuid, drives.serial
+                 order by max(s.updated_at_utc) desc, drives.serial",
+            )
+            .map_err(|err| sqlite_error("prepare tape drive rollup query", err))?;
+        let rows = stmt
+            .query_map(params![tape_uuid], drive_correlation_rollup_from_row)
+            .map_err(|err| sqlite_error("query tape drive rollups", err))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| sqlite_error("read tape drive rollups", err))
+    }
+
     /// Insert a health snapshot idempotently by `(session_id, trigger)`.
     pub fn record_drive_health_snapshot(
         &mut self,
@@ -1213,29 +1301,54 @@ impl CatalogIndex {
         let at_utc = input.at_utc.unwrap_or(now_utc()?);
         let session_id = input.session_id.clone();
         let trigger = input.trigger.clone();
-        self.conn
-            .execute(
-                "insert or ignore into drive_health_snapshots(
+        if session_id.is_some() {
+            self.conn
+                .execute(
+                    "insert or ignore into drive_health_snapshots(
                    drive_uuid, at_utc, trigger, session_id, tape_alert_flags,
                    write_errors_corrected, write_errors_uncorrected,
                    read_errors_corrected, read_errors_uncorrected, raw_pages
                  )
                  values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    input.drive_uuid,
-                    at_utc,
-                    trigger,
-                    session_id,
-                    input.tape_alert_flags,
-                    input.write_errors_corrected,
-                    input.write_errors_uncorrected,
-                    input.read_errors_corrected,
-                    input.read_errors_uncorrected,
-                    input.raw_pages,
-                ],
-            )
-            .map_err(|err| sqlite_error("insert drive health snapshot", err))?;
-        self.get_drive_health_snapshot(session_id.as_deref(), trigger.as_str())
+                    params![
+                        input.drive_uuid,
+                        at_utc,
+                        trigger,
+                        session_id,
+                        input.tape_alert_flags,
+                        input.write_errors_corrected,
+                        input.write_errors_uncorrected,
+                        input.read_errors_corrected,
+                        input.read_errors_uncorrected,
+                        input.raw_pages,
+                    ],
+                )
+                .map_err(|err| sqlite_error("insert drive health snapshot", err))?;
+            self.get_drive_health_snapshot(session_id.as_deref(), trigger.as_str())
+        } else {
+            self.conn
+                .execute(
+                    "insert into drive_health_snapshots(
+                   drive_uuid, at_utc, trigger, session_id, tape_alert_flags,
+                   write_errors_corrected, write_errors_uncorrected,
+                   read_errors_corrected, read_errors_uncorrected, raw_pages
+                 )
+                 values(?1, ?2, ?3, null, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        input.drive_uuid,
+                        at_utc,
+                        trigger,
+                        input.tape_alert_flags,
+                        input.write_errors_corrected,
+                        input.write_errors_uncorrected,
+                        input.read_errors_corrected,
+                        input.read_errors_uncorrected,
+                        input.raw_pages,
+                    ],
+                )
+                .map_err(|err| sqlite_error("insert drive health snapshot", err))?;
+            self.get_drive_health_snapshot_by_id(self.conn.last_insert_rowid())
+        }
     }
 
     fn get_drive_health_snapshot(
@@ -1262,6 +1375,74 @@ impl CatalogIndex {
             .map_err(|err| sqlite_error("prepare drive snapshot lookup", err))?;
         stmt.query_row(params![trigger, session_id], drive_snapshot_from_row)
             .map_err(|err| sqlite_error("query drive snapshot lookup", err))
+    }
+
+    fn get_drive_health_snapshot_by_id(
+        &self,
+        snapshot_id: i64,
+    ) -> Result<DriveHealthSnapshotRecord, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select snapshot_id, drive_uuid, at_utc, trigger, session_id,
+                        tape_alert_flags, write_errors_corrected,
+                        write_errors_uncorrected, read_errors_corrected,
+                        read_errors_uncorrected, raw_pages
+                 from drive_health_snapshots
+                 where snapshot_id = ?1",
+            )
+            .map_err(|err| sqlite_error("prepare drive snapshot id lookup", err))?;
+        stmt.query_row(params![snapshot_id], drive_snapshot_from_row)
+            .map_err(|err| sqlite_error("query drive snapshot id lookup", err))
+    }
+
+    /// Touch `last_seen_utc` for one active drive without recording a snapshot.
+    pub fn touch_drive_last_seen(
+        &mut self,
+        drive_uuid: &[u8],
+    ) -> Result<Option<DriveRecord>, StateError> {
+        let now = now_utc()?;
+        self.conn
+            .execute(
+                "update drives
+                 set last_seen_utc = ?2
+                 where drive_uuid = ?1
+                   and state = 'active'",
+                params![drive_uuid, now],
+            )
+            .map_err(|err| sqlite_error("touch drive last_seen", err))?;
+        self.get_drive_by_uuid(drive_uuid)
+    }
+
+    /// Persist a managed drive cleaning-due observation monotonically.
+    pub fn observe_managed_drive_cleaning_due(
+        &mut self,
+        drive_uuid: &[u8],
+        cleaning_due: &str,
+    ) -> Result<Option<DriveRecord>, StateError> {
+        let due = cleaning_due.trim();
+        if !matches!(due, "periodic" | "now") {
+            return Err(StateError::ConfigInvalid(format!(
+                "cleaning_due observation {due:?} must be periodic or now"
+            )));
+        }
+        let now = now_utc()?;
+        self.conn
+            .execute(
+                "update drives
+                 set cleaning_due = case
+                       when managed != 'rem' then cleaning_due
+                       when cleaning_due = 'now' then 'now'
+                       when ?2 = 'now' then 'now'
+                       else 'periodic'
+                     end,
+                     last_seen_utc = ?3
+                 where drive_uuid = ?1
+                   and state = 'active'",
+                params![drive_uuid, due, now],
+            )
+            .map_err(|err| sqlite_error("observe drive cleaning_due", err))?;
+        self.get_drive_by_uuid(drive_uuid)
     }
 
     /// Upsert a standing alarm as open or refreshed.
@@ -4754,6 +4935,25 @@ fn drive_snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DriveHea
     })
 }
 
+fn drive_correlation_rollup_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<DriveCorrelationRollupRecord> {
+    Ok(DriveCorrelationRollupRecord {
+        tape_uuid: row.get(0)?,
+        voltag: row.get(1)?,
+        drive_uuid: row.get(2)?,
+        drive_serial: row.get(3)?,
+        session_count: row.get(4)?,
+        snapshot_count: row.get(5)?,
+        write_errors_corrected: row.get(6)?,
+        write_errors_uncorrected: row.get(7)?,
+        read_errors_corrected: row.get(8)?,
+        read_errors_uncorrected: row.get(9)?,
+        first_session_utc: row.get(10)?,
+        last_session_utc: row.get(11)?,
+    })
+}
+
 fn alarm_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlarmRecord> {
     Ok(AlarmRecord {
         alarm_id: row.get(0)?,
@@ -6832,6 +7032,218 @@ mod tests {
         assert_eq!(first.snapshot_id, second.snapshot_id);
         assert_eq!(second.tape_alert_flags.as_deref(), Some("[20]"));
         assert_eq!(second.write_errors_corrected, Some(1));
+    }
+
+    #[test]
+    fn manual_drive_health_snapshots_with_null_session_do_not_collapse() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let drive_uuid = index
+            .observe_drive(DriveObservationInput {
+                serial: "MANUAL123".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: None,
+                product: None,
+                firmware_rev: None,
+                managed: "rem".to_string(),
+                library_serial: Some("mainlib".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-04T00:00:00Z".to_string()),
+            })
+            .expect("observe drive")
+            .drive_uuid;
+
+        let first = index
+            .record_drive_health_snapshot(DriveHealthSnapshotInput {
+                drive_uuid: drive_uuid.clone(),
+                trigger: "manual".to_string(),
+                session_id: None,
+                tape_alert_flags: Some("[20]".to_string()),
+                write_errors_corrected: Some(1),
+                write_errors_uncorrected: Some(0),
+                read_errors_corrected: None,
+                read_errors_uncorrected: None,
+                raw_pages: None,
+                at_utc: Some("2026-07-04T00:01:00Z".to_string()),
+            })
+            .expect("first manual snapshot");
+        let second = index
+            .record_drive_health_snapshot(DriveHealthSnapshotInput {
+                drive_uuid: drive_uuid.clone(),
+                trigger: "manual".to_string(),
+                session_id: None,
+                tape_alert_flags: Some("[21]".to_string()),
+                write_errors_corrected: Some(2),
+                write_errors_uncorrected: Some(0),
+                read_errors_corrected: None,
+                read_errors_uncorrected: None,
+                raw_pages: None,
+                at_utc: Some("2026-07-04T00:02:00Z".to_string()),
+            })
+            .expect("second manual snapshot");
+
+        assert_ne!(first.snapshot_id, second.snapshot_id);
+        let snapshots = index
+            .list_drive_health_snapshots(&drive_uuid)
+            .expect("manual snapshots");
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[1].tape_alert_flags.as_deref(), Some("[21]"));
+    }
+
+    #[test]
+    fn drive_cleaning_due_observation_is_managed_only_and_monotonic() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let managed = index
+            .observe_drive(DriveObservationInput {
+                serial: "CLEAN-M".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: None,
+                product: None,
+                firmware_rev: None,
+                managed: "rem".to_string(),
+                library_serial: Some("mainlib".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-04T00:00:00Z".to_string()),
+            })
+            .expect("observe managed")
+            .drive_uuid;
+        let foreign = index
+            .observe_drive(DriveObservationInput {
+                serial: "CLEAN-F".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: None,
+                product: None,
+                firmware_rev: None,
+                managed: "foreign".to_string(),
+                library_serial: Some("d2lib".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-04T00:00:00Z".to_string()),
+            })
+            .expect("observe foreign")
+            .drive_uuid;
+
+        let managed_row = index
+            .observe_managed_drive_cleaning_due(&managed, "periodic")
+            .expect("periodic")
+            .expect("managed row");
+        assert_eq!(managed_row.cleaning_due, "periodic");
+        let managed_row = index
+            .observe_managed_drive_cleaning_due(&managed, "now")
+            .expect("now")
+            .expect("managed row");
+        assert_eq!(managed_row.cleaning_due, "now");
+        let managed_row = index
+            .observe_managed_drive_cleaning_due(&managed, "periodic")
+            .expect("periodic does not downgrade")
+            .expect("managed row");
+        assert_eq!(managed_row.cleaning_due, "now");
+
+        let foreign_row = index
+            .observe_managed_drive_cleaning_due(&foreign, "now")
+            .expect("foreign ignored")
+            .expect("foreign row");
+        assert_eq!(foreign_row.cleaning_due, "none");
+    }
+
+    #[test]
+    fn correlation_rollups_use_sessions_snapshots_and_voltags() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [0x44; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "RMJ042L9".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        let drive_uuid = index
+            .observe_drive(DriveObservationInput {
+                serial: "DRV-ROLL".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: None,
+                product: None,
+                firmware_rev: None,
+                managed: "rem".to_string(),
+                library_serial: Some("mainlib".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-04T00:00:00Z".to_string()),
+            })
+            .expect("observe drive")
+            .drive_uuid;
+        let session_id = Uuid::from_u128(0x4242);
+        let opened = audit_record(
+            1,
+            AuditEvent::SessionOpened,
+            None,
+            Some(session_id),
+            None,
+            "write",
+            detail(&[
+                ("session_kind", CborValue::Text("write".to_string())),
+                ("tape_uuid", CborValue::Bytes(tape_uuid.to_vec())),
+                ("library_serial", CborValue::Text("mainlib".to_string())),
+                ("drive_bay", CborValue::Integer(0x0100.into())),
+                ("drive_uuid", CborValue::Bytes(drive_uuid.clone())),
+            ]),
+        );
+        let closed = audit_record(
+            2,
+            AuditEvent::SessionClosed,
+            None,
+            Some(session_id),
+            None,
+            "write",
+            detail(&[("session_kind", CborValue::Text("write".to_string()))]),
+        );
+        index
+            .project_audit_record(&opened)
+            .expect("project opened session");
+        index
+            .project_audit_record(&closed)
+            .expect("project closed session");
+        index
+            .record_drive_health_snapshot(DriveHealthSnapshotInput {
+                drive_uuid: drive_uuid.clone(),
+                trigger: "session-close".to_string(),
+                session_id: Some(session_id.to_string()),
+                tape_alert_flags: Some("[]".to_string()),
+                write_errors_corrected: Some(7),
+                write_errors_uncorrected: Some(1),
+                read_errors_corrected: Some(11),
+                read_errors_uncorrected: Some(2),
+                raw_pages: None,
+                at_utc: Some("2026-07-04T00:03:00Z".to_string()),
+            })
+            .expect("snapshot");
+
+        let by_drive = index
+            .drive_tape_correlation_rollups(&drive_uuid)
+            .expect("drive rollups");
+        assert_eq!(by_drive.len(), 1);
+        assert_eq!(by_drive[0].voltag.as_deref(), Some("RMJ042L9"));
+        assert_eq!(by_drive[0].session_count, 1);
+        assert_eq!(by_drive[0].write_errors_uncorrected, 1);
+        assert_eq!(by_drive[0].read_errors_uncorrected, 2);
+
+        let by_tape = index
+            .tape_drive_correlation_rollups(&tape_uuid)
+            .expect("tape rollups");
+        assert_eq!(by_tape.len(), 1);
+        assert_eq!(by_tape[0].drive_serial.as_deref(), Some("DRV-ROLL"));
+        assert_eq!(by_tape[0].snapshot_count, 1);
     }
 
     #[test]

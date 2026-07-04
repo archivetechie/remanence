@@ -22,8 +22,8 @@ use remanence_parity::{
     TapeFileKind,
 };
 use remanence_state::{
-    AuditActor, AuditEvent, AuditEventRecord, AuditSubject, CatalogIndex, FileAuditLog,
-    NativeObjectFileRecord, SourceLayer, TapePoolConfig,
+    AuditActor, AuditEvent, AuditEventRecord, AuditSubject, CatalogIndex, DriveHealthSnapshotInput,
+    DriveHealthSnapshotRecord, FileAuditLog, NativeObjectFileRecord, SourceLayer, TapePoolConfig,
 };
 use remanence_stream::StreamingError;
 use time::format_description::well_known::Rfc3339;
@@ -88,6 +88,17 @@ pub(crate) enum DriveCommand {
         reply: oneshot::Sender<Result<pb::ReadSession, Status>>,
     },
     Unload {
+        reply: oneshot::Sender<Result<(), Status>>,
+    },
+    PollHealth {
+        drive_uuid: Vec<u8>,
+        trigger: &'static str,
+        session_id: Option<Uuid>,
+        tape_uuid: Option<[u8; 16]>,
+        reply: oneshot::Sender<Result<DriveHealthSnapshotRecord, Status>>,
+    },
+    Heartbeat {
+        drive_uuid: Vec<u8>,
         reply: oneshot::Sender<Result<(), Status>>,
     },
     AppendFinish {
@@ -328,6 +339,35 @@ impl DrivePool {
             .unwrap_or_else(|err| err.into_inner())
             .remove(&session_id);
     }
+
+    pub(crate) async fn poll_drive_health(
+        &self,
+        bay: u16,
+        drive_uuid: Vec<u8>,
+    ) -> Result<DriveHealthSnapshotRecord, Status> {
+        let tx = self.drive_tx(bay)?;
+        let (reply, rx) = oneshot::channel();
+        tx.send(DriveCommand::PollHealth {
+            drive_uuid,
+            trigger: "manual",
+            session_id: None,
+            tape_uuid: None,
+            reply,
+        })
+        .await
+        .map_err(|_| Status::unavailable("drive actor is unavailable"))?;
+        rx.await
+            .map_err(|_| Status::unavailable("drive actor stopped"))?
+    }
+
+    pub(crate) fn heartbeat_drive(&self, bay: u16, drive_uuid: Vec<u8>) -> Result<(), Status> {
+        let tx = self.drive_tx(bay)?;
+        let (reply, rx) = oneshot::channel();
+        tx.blocking_send(DriveCommand::Heartbeat { drive_uuid, reply })
+            .map_err(|_| Status::unavailable("drive actor is unavailable"))?;
+        rx.blocking_recv()
+            .map_err(|_| Status::unavailable("drive actor stopped"))?
+    }
 }
 
 #[derive(Debug)]
@@ -379,6 +419,7 @@ pub(crate) struct WriteOwnerConfig {
     pub reservations: Arc<HashMap<u16, AtomicBool>>,
     pub default_library_serial: Option<String>,
     pub library_snapshot: Arc<RwLock<Arc<crate::LibrarySnapshot>>>,
+    pub snapshot_miss_alarm: u32,
 }
 
 pub(crate) struct ExclusiveGuard {
@@ -583,6 +624,7 @@ fn drive_loop(
             return;
         }
     };
+    let mut snapshot_misses = 0u32;
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
             DriveCommand::OpenWrite {
@@ -599,6 +641,7 @@ fn drive_loop(
                 &cfg,
                 &mut rx,
                 drive,
+                &mut snapshot_misses,
                 OpenWriteActorRequest {
                     pool_cfg,
                     selected,
@@ -622,6 +665,7 @@ fn drive_loop(
                 &cfg,
                 &mut rx,
                 drive,
+                &mut snapshot_misses,
                 OpenReadActorRequest {
                     tape_uuid,
                     needs_drive_load,
@@ -635,6 +679,38 @@ fn drive_loop(
                 let result = drive
                     .unload()
                     .map_err(|err| Status::internal(format!("unload drive: {err}")));
+                let _ = reply.send(result);
+            }
+            DriveCommand::PollHealth {
+                drive_uuid,
+                trigger,
+                session_id,
+                tape_uuid,
+                reply,
+            } => {
+                let result = collect_drive_health_snapshot(
+                    &mut index,
+                    &cfg,
+                    drive,
+                    DriveSnapshotRequest {
+                        drive_uuid,
+                        trigger,
+                        session_id,
+                        tape_uuid,
+                    },
+                );
+                let _ = reply.send(result);
+            }
+            DriveCommand::Heartbeat { drive_uuid, reply } => {
+                let result = drive
+                    .test_unit_ready()
+                    .map_err(|err| Status::unavailable(format!("drive heartbeat: {err}")))
+                    .and_then(|_| {
+                        index
+                            .touch_drive_last_seen(&drive_uuid)
+                            .map(|_| ())
+                            .map_err(status_from_state_error)
+                    });
                 let _ = reply.send(result);
             }
             DriveCommand::AppendFinish {
@@ -670,6 +746,12 @@ fn drain_failed_drive_commands(mut rx: mpsc::Receiver<DriveCommand>, message: St
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
             DriveCommand::Unload { reply } => {
+                let _ = reply.send(Err(Status::internal(message.clone())));
+            }
+            DriveCommand::PollHealth { reply, .. } => {
+                let _ = reply.send(Err(Status::internal(message.clone())));
+            }
+            DriveCommand::Heartbeat { reply, .. } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
             DriveCommand::AppendFinish {
@@ -790,6 +872,136 @@ fn record_session_event(
         .map_err(crate::status_from_state_error)
 }
 
+struct DriveSnapshotRequest {
+    drive_uuid: Vec<u8>,
+    trigger: &'static str,
+    session_id: Option<Uuid>,
+    tape_uuid: Option<[u8; 16]>,
+}
+
+fn collect_drive_health_snapshot(
+    index: &mut CatalogIndex,
+    _cfg: &WriteOwnerConfig,
+    drive: &mut DriveHandle,
+    request: DriveSnapshotRequest,
+) -> Result<DriveHealthSnapshotRecord, Status> {
+    let alerts = drive
+        .read_tape_alerts()
+        .map_err(|err| Status::unavailable(format!("read TapeAlert page: {err}")))?;
+    let counters = drive
+        .read_error_counters()
+        .map_err(|err| Status::unavailable(format!("read error counter pages: {err}")))?;
+    let tape_uuid_text = request
+        .tape_uuid
+        .map(|uuid| Uuid::from_bytes(uuid).to_string())
+        .unwrap_or_default();
+    let raw_pages = format!(
+        "{{\"tape_uuid\":\"{}\",\"tape_alert\":true,\"write_error_counter\":true,\"read_error_counter\":true}}",
+        tape_uuid_text
+    );
+    let snapshot = index
+        .record_drive_health_snapshot(DriveHealthSnapshotInput {
+            drive_uuid: request.drive_uuid.clone(),
+            trigger: request.trigger.to_string(),
+            session_id: request.session_id.map(|uuid| uuid.to_string()),
+            tape_alert_flags: Some(tape_alert_flags_json(alerts.active())),
+            write_errors_corrected: counters.write_errors_corrected.and_then(u64_to_i64),
+            write_errors_uncorrected: counters.write_errors_uncorrected.and_then(u64_to_i64),
+            read_errors_corrected: counters.read_errors_corrected.and_then(u64_to_i64),
+            read_errors_uncorrected: counters.read_errors_uncorrected.and_then(u64_to_i64),
+            raw_pages: Some(raw_pages),
+            at_utc: None,
+        })
+        .map_err(crate::status_from_state_error)?;
+    if alerts.is_set(20) || alerts.is_set(21) {
+        let due = if alerts.is_set(20) { "now" } else { "periodic" };
+        index
+            .observe_managed_drive_cleaning_due(&request.drive_uuid, due)
+            .map_err(crate::status_from_state_error)?;
+    } else {
+        index
+            .touch_drive_last_seen(&request.drive_uuid)
+            .map_err(crate::status_from_state_error)?;
+    }
+    Ok(snapshot)
+}
+
+fn record_session_close_snapshot(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    drive: &mut DriveHandle,
+    drive_uuid: Option<Vec<u8>>,
+    session_id: Uuid,
+    tape_uuid: [u8; 16],
+    consecutive_misses: &mut u32,
+) {
+    let Some(drive_uuid) = drive_uuid else {
+        return;
+    };
+    match collect_drive_health_snapshot(
+        index,
+        cfg,
+        drive,
+        DriveSnapshotRequest {
+            drive_uuid: drive_uuid.clone(),
+            trigger: "session-close",
+            session_id: Some(session_id),
+            tape_uuid: Some(tape_uuid),
+        },
+    ) {
+        Ok(_) => *consecutive_misses = 0,
+        Err(err) => {
+            *consecutive_misses = consecutive_misses.saturating_add(1);
+            tracing::warn!(
+                "drive health snapshot missed session_id={} drive_uuid={} misses={} error={}",
+                session_id,
+                Uuid::from_slice(&drive_uuid)
+                    .map(|uuid| uuid.to_string())
+                    .unwrap_or_else(|_| crate::bytes_to_hex(&drive_uuid)),
+                *consecutive_misses,
+                err
+            );
+            if cfg.snapshot_miss_alarm > 0 && *consecutive_misses >= cfg.snapshot_miss_alarm {
+                let condition_key = format!(
+                    "snapshot-persist-failing:{}",
+                    crate::bytes_to_hex(&drive_uuid)
+                );
+                let detail = format!(
+                    "{{\"session_id\":\"{}\",\"misses\":{},\"error\":\"{}\"}}",
+                    session_id,
+                    *consecutive_misses,
+                    err.to_string().replace('"', "'")
+                );
+                if let Err(alarm_err) = index.raise_alarm(
+                    condition_key.as_str(),
+                    "snapshot-persist-failing",
+                    "warning",
+                    Some(detail.as_str()),
+                ) {
+                    tracing::warn!(
+                        "failed to raise snapshot miss alarm condition_key={} error={}",
+                        condition_key,
+                        alarm_err
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn tape_alert_flags_json(flags: &std::collections::BTreeSet<u8>) -> String {
+    let body = flags
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{body}]")
+}
+
+fn u64_to_i64(value: u64) -> Option<i64> {
+    i64::try_from(value).ok()
+}
+
 /// Append gate for one write session: the first failed append poisons
 /// the session for all further appends.
 ///
@@ -830,6 +1042,7 @@ fn handle_drive_open_write(
     cfg: &WriteOwnerConfig,
     rx: &mut mpsc::Receiver<DriveCommand>,
     drive: &mut DriveHandle,
+    snapshot_misses: &mut u32,
     request: OpenWriteActorRequest,
 ) {
     let OpenWriteActorRequest {
@@ -993,6 +1206,15 @@ fn handle_drive_open_write(
                 reply,
             } => {
                 let status = if requested == session_id {
+                    record_session_close_snapshot(
+                        index,
+                        cfg,
+                        drive,
+                        drive_uuid.clone(),
+                        session_id,
+                        tape_uuid,
+                        snapshot_misses,
+                    );
                     if unload_before_close {
                         if let Err(err) = drive.unload() {
                             let _ =
@@ -1043,6 +1265,15 @@ fn handle_drive_open_write(
                 reply,
             } => {
                 let status = if requested == session_id {
+                    record_session_close_snapshot(
+                        index,
+                        cfg,
+                        drive,
+                        drive_uuid.clone(),
+                        session_id,
+                        tape_uuid,
+                        snapshot_misses,
+                    );
                     if unload_before_close {
                         if let Err(err) = drive.unload() {
                             let _ =
@@ -1118,6 +1349,16 @@ fn handle_drive_open_write(
                 )));
             }
             DriveCommand::Unload { reply } => {
+                let _ = reply.send(Err(Status::failed_precondition(
+                    "write session already active",
+                )));
+            }
+            DriveCommand::PollHealth { reply, .. } => {
+                let _ = reply.send(Err(Status::failed_precondition(
+                    "write session already active",
+                )));
+            }
+            DriveCommand::Heartbeat { reply, .. } => {
                 let _ = reply.send(Err(Status::failed_precondition(
                     "write session already active",
                 )));
@@ -1209,6 +1450,7 @@ fn handle_drive_open_read(
     cfg: &WriteOwnerConfig,
     rx: &mut mpsc::Receiver<DriveCommand>,
     drive: &mut DriveHandle,
+    snapshot_misses: &mut u32,
     request: OpenReadActorRequest,
 ) {
     let OpenReadActorRequest {
@@ -1344,6 +1586,15 @@ fn handle_drive_open_read(
                 reply,
             } => {
                 let status = if requested == session_id {
+                    record_session_close_snapshot(
+                        index,
+                        cfg,
+                        drive,
+                        drive_uuid.clone(),
+                        session_id,
+                        tape_uuid,
+                        snapshot_misses,
+                    );
                     if unload_before_close {
                         if let Err(err) = drive.unload() {
                             let _ =
@@ -1413,6 +1664,16 @@ fn handle_drive_open_read(
                 )));
             }
             DriveCommand::Unload { reply } => {
+                let _ = reply.send(Err(Status::failed_precondition(
+                    "read session already active",
+                )));
+            }
+            DriveCommand::PollHealth { reply, .. } => {
+                let _ = reply.send(Err(Status::failed_precondition(
+                    "read session already active",
+                )));
+            }
+            DriveCommand::Heartbeat { reply, .. } => {
                 let _ = reply.send(Err(Status::failed_precondition(
                     "read session already active",
                 )));
