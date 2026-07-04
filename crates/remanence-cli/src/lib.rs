@@ -3972,7 +3972,11 @@ fn print_drive_line(drive: &pb::DriveCatalogEntry, out: &mut dyn Write) {
         drive.serial.as_str()
     };
     let label = if drive.managed == "foreign" {
-        format!("[foreign] {serial}")
+        if drive.last_library_serial.is_empty() {
+            format!("[foreign] {serial}")
+        } else {
+            format!("[foreign: {}] {serial}", drive.last_library_serial)
+        }
     } else {
         serial.to_string()
     };
