@@ -2171,6 +2171,19 @@ fn run_cleaning_sequence(
     if trigger == "periodic" && !cleaning_drive_is_idle(library, drive_bay)? {
         return Ok(());
     }
+    // Join-check FIRST: a trigger while a run is already active is a join
+    // (no-op), never a frequency refusal (diff-gate re-check finding).
+    if let Some(active_run) = index
+        .get_active_clean_run_by_drive(drive_uuid)
+        .map_err(status_from_state_error)?
+    {
+        if active_run.phase != "done"
+            && active_run.phase != "failed"
+            && active_run.phase != "needs-operator"
+        {
+            return Ok(());
+        }
+    }
     let min_interval = parse_duration_or(&clean_cfg.min_interval, Duration::hours(12));
     let weekly_cap = clean_cfg.weekly_cap as usize;
     if cleaning_too_soon(index, drive_uuid, min_interval, weekly_cap)? {
@@ -2191,17 +2204,6 @@ fn run_cleaning_sequence(
         return Err(Status::failed_precondition(
             "drive-cleaning-abnormal-frequency",
         ));
-    }
-    if let Some(active_run) = index
-        .get_active_clean_run_by_drive(drive_uuid)
-        .map_err(status_from_state_error)?
-    {
-        if active_run.phase != "done"
-            && active_run.phase != "failed"
-            && active_run.phase != "needs-operator"
-        {
-            return Ok(());
-        }
     }
     if drive.fenced {
         return Err(Status::failed_precondition("drive is already fenced"));
