@@ -254,7 +254,7 @@ impl ApiState {
         );
         let base_cfg = crate::write_owner::WriteOwnerConfig {
             index_path: index_path.clone(),
-            report,
+            report: report.clone(),
             policy,
             audit_dir: config.audit.dir.clone(),
             audit_fsync: config.audit.fsync,
@@ -288,6 +288,7 @@ impl ApiState {
         ) as usize)));
         state.default_library_serial = default_library_serial;
         state.library_snapshot = Some(library_snapshot);
+        state.reconcile_drive_catalog_from_report(config, &report)?;
         Ok(state)
     }
 
@@ -328,6 +329,11 @@ impl ApiState {
 
     fn index(&self) -> Result<CatalogIndex, Status> {
         CatalogIndex::open_read_only(self.index_path.as_ref())
+            .map_err(|err| Status::internal(err.to_string()))
+    }
+
+    pub(crate) fn index_write(&self) -> Result<CatalogIndex, Status> {
+        CatalogIndex::open(self.index_path.as_ref())
             .map_err(|err| Status::internal(err.to_string()))
     }
 
@@ -381,6 +387,54 @@ impl ApiState {
             .get(pool_id)
             .cloned()
             .ok_or_else(|| Status::invalid_argument(format!("unknown tape pool {pool_id}")))
+    }
+
+    fn reconcile_drive_catalog_from_report(
+        &self,
+        config: &RemConfig,
+        report: &remanence_library::DiscoveryReport,
+    ) -> Result<(), Status> {
+        let configured_managed = config
+            .drives
+            .managed_libraries
+            .iter()
+            .map(|serial| serial.trim().to_string())
+            .filter(|serial| !serial.is_empty())
+            .collect::<std::collections::HashSet<_>>();
+        let daemon_libraries = config
+            .libraries
+            .iter()
+            .map(|library| library.serial.trim().to_string())
+            .filter(|serial| !serial.is_empty())
+            .collect::<std::collections::HashSet<_>>();
+        let mut index = self.index_write()?;
+        for library in &report.libraries {
+            let managed = if configured_managed.is_empty() {
+                daemon_libraries.contains(&library.serial)
+            } else {
+                configured_managed.contains(&library.serial)
+            };
+            for bay in &library.drive_bays {
+                let Some(installed) = bay.installed.as_ref() else {
+                    continue;
+                };
+                index
+                    .observe_drive(remanence_state::DriveObservationInput {
+                        serial: installed.serial.clone(),
+                        identity_source: identity_source_name(installed.identity_source)
+                            .to_string(),
+                        vendor: installed.vendor.clone(),
+                        product: installed.product.clone(),
+                        firmware_rev: installed.revision.clone(),
+                        managed: if managed { "rem" } else { "foreign" }.to_string(),
+                        library_serial: Some(library.serial.clone()),
+                        element_address: Some(i64::from(bay.element_address)),
+                        observed_at_utc: None,
+                    })
+                    .map_err(status_from_state_error)?;
+            }
+        }
+        Ok(())
     }
 
     fn record_request_received(
@@ -502,6 +556,58 @@ impl ApiState {
                 event: AuditEvent::OperationFailed,
                 subject_kind: "operation",
                 subject_id: Some(operation_id.to_string()),
+                idempotency_key: None,
+                detail,
+            },
+        )
+    }
+
+    pub(crate) fn record_alarm_acked(
+        &self,
+        actor: AuditActor,
+        condition_key: &str,
+    ) -> Result<(), Status> {
+        let mut index = CatalogIndex::open(self.index_path.as_ref())
+            .map_err(|err| Status::internal(err.to_string()))?;
+        append_operation_audit(
+            &mut index,
+            self.audit_dir.as_ref(),
+            self.audit_fsync,
+            &self.audit_append_lock,
+            OperationAuditInput {
+                actor,
+                operation_id: Uuid::new_v4(),
+                operation_kind: "ack_alarm",
+                event: AuditEvent::AlarmAcked,
+                subject_kind: "alarm",
+                subject_id: Some(condition_key.to_string()),
+                idempotency_key: None,
+                detail: BTreeMap::new(),
+            },
+        )
+    }
+
+    pub(crate) fn record_drive_audit(
+        &self,
+        actor: AuditActor,
+        event: AuditEvent,
+        drive_uuid: &[u8],
+        detail: BTreeMap<String, CborValue>,
+    ) -> Result<(), Status> {
+        let mut index = CatalogIndex::open(self.index_path.as_ref())
+            .map_err(|err| Status::internal(err.to_string()))?;
+        append_operation_audit(
+            &mut index,
+            self.audit_dir.as_ref(),
+            self.audit_fsync,
+            &self.audit_append_lock,
+            OperationAuditInput {
+                actor,
+                operation_id: Uuid::new_v4(),
+                operation_kind: "drive_stewardship",
+                event,
+                subject_kind: "drive",
+                subject_id: Some(bytes_to_hex(drive_uuid)),
                 idempotency_key: None,
                 detail,
             },
@@ -1625,6 +1731,7 @@ pub(crate) enum AuthPermission {
     ReadTape,
     Write,
     Robotics,
+    Lifecycle,
     OperationControl,
 }
 
@@ -1635,6 +1742,7 @@ impl AuthPermission {
             Self::ReadTape => "read-session RPCs",
             Self::Write => "write-session RPCs",
             Self::Robotics => "library robotics RPCs",
+            Self::Lifecycle => "lifecycle RPCs",
             Self::OperationControl => "operation-control RPCs",
         }
     }
@@ -1662,8 +1770,12 @@ impl ClientRole {
 
     fn allows(self, permission: AuthPermission) -> bool {
         match self {
-            Self::System | Self::Orchestrator | Self::Admin => true,
-            Self::Operator => !matches!(permission, AuthPermission::Write),
+            Self::System => true,
+            Self::Admin | Self::Orchestrator => !matches!(permission, AuthPermission::Lifecycle),
+            Self::Operator => !matches!(
+                permission,
+                AuthPermission::Write | AuthPermission::Lifecycle
+            ),
             Self::Readonly => matches!(permission, AuthPermission::Read | AuthPermission::ReadTape),
         }
     }
@@ -1757,6 +1869,7 @@ fn parse_client_role(value: &str) -> Option<ClientRole> {
 
 fn parse_role_word(value: &str) -> Option<ClientRole> {
     match value {
+        "system" => Some(ClientRole::System),
         "readonly" | "read-only" | "read_only" => Some(ClientRole::Readonly),
         "operator" => Some(ClientRole::Operator),
         "orchestrator" => Some(ClientRole::Orchestrator),
@@ -1797,6 +1910,14 @@ fn status_from_append_spool_write_error(err: io::Error) -> Status {
         Status::resource_exhausted("object exceeds append spool size cap")
     } else {
         Status::internal(format!("write append spool: {err}"))
+    }
+}
+
+fn identity_source_name(source: remanence_library::IdentitySource) -> &'static str {
+    match source {
+        remanence_library::IdentitySource::DvcidInline => "DvcidInline",
+        remanence_library::IdentitySource::DvcidAndInquiry => "DvcidAndInquiry",
+        remanence_library::IdentitySource::Derived => "Derived",
     }
 }
 
@@ -2548,7 +2669,7 @@ mod tests {
             Some(ClientRole::Operator)
         );
         assert_eq!(parse_client_role("admin"), Some(ClientRole::Admin));
-        assert_eq!(parse_client_role("system"), None);
+        assert_eq!(parse_client_role("system"), Some(ClientRole::System));
         assert_eq!(parse_client_role("writer"), None);
     }
 
@@ -2653,6 +2774,34 @@ BCw3Wyv2UWY=
                 .code(),
             tonic::Code::PermissionDenied
         );
+    }
+
+    #[test]
+    fn authorization_matrix_covers_drive_stewardship_mutations() {
+        let cases = [
+            (ClientRole::System, true, true, true),
+            (ClientRole::Admin, true, true, false),
+            (ClientRole::Orchestrator, true, true, false),
+            (ClientRole::Operator, false, true, false),
+            (ClientRole::Readonly, false, false, false),
+        ];
+        for (role, annotate, robotics, lifecycle) in cases {
+            assert_eq!(
+                role.allows(AuthPermission::Write),
+                annotate,
+                "{role:?} AnnotateDrive/Write"
+            );
+            assert_eq!(
+                role.allows(AuthPermission::Robotics),
+                robotics,
+                "{role:?} CleanDrive/AckAlarm/Robotics"
+            );
+            assert_eq!(
+                role.allows(AuthPermission::Lifecycle),
+                lifecycle,
+                "{role:?} RetireDrive/Lifecycle"
+            );
+        }
     }
 
     #[tokio::test]

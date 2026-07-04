@@ -210,6 +210,9 @@ async fn open_write_session_reserved(
                 pool_cfg,
                 selected,
                 needs_drive_load: mount.needs_drive_load,
+                library_serial: mount.library_serial.clone(),
+                drive_uuid: mount.drive_uuid.clone(),
+                drive_serial: mount.drive_serial.clone(),
                 reply: reply_tx,
             })
             .await
@@ -310,6 +313,9 @@ async fn open_read_session_reserved(
             .send(crate::write_owner::DriveCommand::OpenRead {
                 tape_uuid,
                 needs_drive_load: mount.needs_drive_load,
+                library_serial: mount.library_serial.clone(),
+                drive_uuid: mount.drive_uuid.clone(),
+                drive_serial: mount.drive_serial.clone(),
                 reply: reply_tx,
             })
             .await
@@ -650,6 +656,9 @@ struct ActorMount {
     source_slot: Option<u16>,
     home_slot: Option<u16>,
     needs_drive_load: bool,
+    library_serial: String,
+    drive_uuid: Option<Vec<u8>>,
+    drive_serial: Option<String>,
 }
 
 fn resolve_and_reserve_actor_mount(
@@ -703,7 +712,30 @@ fn resolve_actor_mount(
         .iter()
         .find(|library| library.serial == library_serial)
         .ok_or_else(|| Status::not_found(format!("library {library_serial} not found")))?;
-    resolve_actor_mount_from_library(library, voltag.as_str(), busy_bays)
+    let mut mount = resolve_actor_mount_from_library(library, voltag.as_str(), busy_bays)?;
+    mount.library_serial = library_serial.to_string();
+    if index
+        .list_drives(true, true)
+        .map_err(status_from_state_error)?
+        .into_iter()
+        .any(|drive| {
+            drive.last_library_serial.as_deref() == Some(library_serial)
+                && drive.last_element_address == Some(i64::from(mount.bay))
+                && drive.state == "retired"
+        })
+    {
+        return Err(Status::failed_precondition(
+            "resolved drive is retired and excluded from mount resolution",
+        ));
+    }
+    if let Some(drive) = index
+        .get_actionable_drive_at(library_serial, i64::from(mount.bay))
+        .map_err(status_from_state_error)?
+    {
+        mount.drive_uuid = Some(drive.drive_uuid);
+        mount.drive_serial = Some(drive.serial);
+    }
+    Ok(mount)
 }
 
 fn resolve_actor_mount_from_library(
@@ -746,6 +778,9 @@ fn resolve_actor_mount_from_library(
                 source_slot: None,
                 home_slot,
                 needs_drive_load: false,
+                library_serial: String::new(),
+                drive_uuid: None,
+                drive_serial: None,
             })
         }
         Ok(LoadPlan::Load { slot, bay }) => {
@@ -755,6 +790,9 @@ fn resolve_actor_mount_from_library(
                 source_slot: Some(slot),
                 home_slot: Some(slot),
                 needs_drive_load: true,
+                library_serial: String::new(),
+                drive_uuid: None,
+                drive_serial: None,
             })
         }
         Err(LoadError::NotInLibrary) => Err(Status::not_found(format!(

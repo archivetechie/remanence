@@ -254,6 +254,99 @@ impl SgTransport for Box<dyn SgTransport> {
 }
 
 // ====================================================================
+//  ForeignDriveTransport — CDB allowlist for non-rem drives
+// ====================================================================
+
+/// Read-only CDB gate for drives owned by another library/application.
+///
+/// The wrapper enforces the DS-M1 foreign-drive contract at the transport
+/// boundary. Default mode permits identity/status reads and cumulative error
+/// counter LOG SENSE pages only; TapeAlert page 0x2e is admitted only with the
+/// explicit opt-in constructor because many drives clear those bits on read.
+pub struct ForeignDriveTransport<T> {
+    inner: T,
+    foreign_tapealert: bool,
+}
+
+impl<T> ForeignDriveTransport<T> {
+    /// Wrap `inner` with the default foreign-drive allowlist.
+    pub fn new(inner: T) -> Self {
+        Self {
+            inner,
+            foreign_tapealert: false,
+        }
+    }
+
+    /// Wrap `inner`, optionally allowing TapeAlert LOG SENSE page 0x2e.
+    pub fn with_tapealert(inner: T, foreign_tapealert: bool) -> Self {
+        Self {
+            inner,
+            foreign_tapealert,
+        }
+    }
+
+    /// Borrow the wrapped transport.
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+
+    /// Mutably borrow the wrapped transport.
+    pub fn inner_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+
+    /// Return the wrapped transport.
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+}
+
+impl<T: SgTransport> SgTransport for ForeignDriveTransport<T> {
+    fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+        if !foreign_drive_allows_execute_in(cdb, self.foreign_tapealert) {
+            return Err(ScsiError::InvalidInput(
+                "foreign drive transport blocked non-allowlisted data-in CDB",
+            ));
+        }
+        self.inner.execute_in(cdb, buf)
+    }
+
+    fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
+        if !matches!(cdb.first(), Some(0x00)) {
+            return Err(ScsiError::InvalidInput(
+                "foreign drive transport blocked non-allowlisted no-data CDB",
+            ));
+        }
+        self.inner.execute_none(cdb)
+    }
+
+    fn execute_out(&mut self, _cdb: &[u8], _buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
+        Err(ScsiError::InvalidInput(
+            "foreign drive transport blocked data-out CDB",
+        ))
+    }
+
+    fn set_timeout_for(&mut self, class: TimeoutClass) {
+        self.inner.set_timeout_for(class)
+    }
+}
+
+fn foreign_drive_allows_execute_in(cdb: &[u8], foreign_tapealert: bool) -> bool {
+    match cdb.first() {
+        Some(0x12) => true, // INQUIRY, including VPD pages.
+        Some(0xb8) => true, // READ ELEMENT STATUS.
+        Some(0x4d) => {
+            let Some(byte_2) = cdb.get(2) else {
+                return false;
+            };
+            let page_code = byte_2 & 0x3f;
+            matches!(page_code, 0x02 | 0x03) || (foreign_tapealert && page_code == 0x2e)
+        }
+        _ => false,
+    }
+}
+
+// ====================================================================
 //  LinuxSgTransport — the production transport
 // ====================================================================
 
@@ -639,6 +732,63 @@ mod tests {
         assert!(outcome.sense.is_none(), "no sense on the happy path");
         assert_eq!(t.cdb_log.len(), 1);
         assert_eq!(t.cdb_log[0], &cdb[..]);
+    }
+
+    #[test]
+    fn foreign_drive_transport_allows_read_only_identity_and_counter_cdbs() {
+        let inner = FixtureTransport::new().with_responses([
+            vec![0x00; 96],
+            vec![0x00; 32],
+            vec![0x00; 32],
+        ]);
+        let mut transport = ForeignDriveTransport::new(inner);
+        let mut buf = [0u8; 96];
+
+        transport
+            .execute_in(&[0x12, 0x00, 0x00, 0x00, 0x60, 0x00], &mut buf)
+            .expect("standard inquiry is allowed");
+        transport
+            .execute_in(&[0x4d, 0x00, 0x02, 0x00, 0x00, 0x00], &mut buf)
+            .expect("write error counter page is allowed");
+        transport
+            .execute_in(&[0x4d, 0x00, 0x03, 0x00, 0x00, 0x00], &mut buf)
+            .expect("read error counter page is allowed");
+        transport
+            .execute_none(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+            .expect("test unit ready is allowed");
+
+        let inner = transport.into_inner();
+        assert_eq!(inner.cdb_log.len(), 4);
+        assert_eq!(inner.cdb_log[0][0], 0x12);
+        assert_eq!(inner.cdb_log[3][0], 0x00);
+    }
+
+    #[test]
+    fn foreign_drive_transport_rejects_mutating_or_clear_on_read_cdbs() {
+        let inner = FixtureTransport::new().with_responses([vec![0x00; 96]]);
+        let mut transport = ForeignDriveTransport::new(inner);
+        let mut buf = [0u8; 96];
+
+        assert!(matches!(
+            transport.execute_in(&[0x4d, 0x00, 0x2e, 0x00, 0x00, 0x00], &mut buf),
+            Err(ScsiError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            transport.execute_none(&[0x1b, 0x00, 0x00, 0x00, 0x01, 0x00]),
+            Err(ScsiError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            transport.execute_out(&[0x0a, 0x00, 0x00, 0x00, 0x01, 0x00], &[0]),
+            Err(ScsiError::InvalidInput(_))
+        ));
+
+        let mut transport = ForeignDriveTransport::with_tapealert(
+            FixtureTransport::new().with_responses([vec![0x00; 96]]),
+            true,
+        );
+        transport
+            .execute_in(&[0x4d, 0x00, 0x2e, 0x00, 0x00, 0x00], &mut buf)
+            .expect("TapeAlert page is allowed only with opt-in");
     }
 
     #[test]

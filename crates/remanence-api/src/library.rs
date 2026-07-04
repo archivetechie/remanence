@@ -12,7 +12,10 @@ use std::pin::Pin;
 
 use ciborium::value::Value as CborValue;
 use remanence_library::{DriveBay, IePort, Library, Slot};
-use remanence_state::CatalogIndex;
+use remanence_state::{
+    AlarmRecord, CatalogIndex, DriveAnnotationInput, DriveEventRecord, DriveHealthSnapshotRecord,
+    DriveRecord,
+};
 use time::OffsetDateTime;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
@@ -86,6 +89,14 @@ pub(crate) fn project_drive(
             .unwrap_or_default(),
         loaded_tape_uuid: joined_tape_uuid(&bay.loaded_tape, voltags),
         status: drive_status(bay, busy) as i32,
+        drive_uuid: Vec::new(),
+        cleaning_due: String::new(),
+        fenced: false,
+        lifetime_read_bytes: 0,
+        lifetime_write_bytes: 0,
+        counter_epoch: 0,
+        session_id: Vec::new(),
+        active_alert_names: Vec::new(),
     }
 }
 
@@ -133,6 +144,7 @@ pub(crate) fn project_library_state(
             seconds: captured_at.unix_timestamp(),
             nanos: captured_at.nanosecond() as i32,
         }),
+        managed: "rem".to_string(),
     }
 }
 
@@ -150,6 +162,140 @@ pub(crate) fn voltag_uuid_map(index: &CatalogIndex) -> Result<HashMap<String, Ve
         }
     }
     Ok(map)
+}
+
+fn drive_record_to_proto(record: DriveRecord) -> pb::DriveCatalogEntry {
+    pb::DriveCatalogEntry {
+        drive_uuid: record.drive_uuid,
+        serial: record.serial,
+        identity_source: record.identity_source,
+        actionable: record.actionable,
+        vendor: record.vendor.unwrap_or_default(),
+        product: record.product.unwrap_or_default(),
+        firmware_rev: record.firmware_rev.unwrap_or_default(),
+        managed: record.managed,
+        state: record.state,
+        cleaning_due: record.cleaning_due,
+        fenced: record.fenced,
+        first_seen_utc: crate::timestamp_from_rfc3339(record.first_seen_utc.as_str()),
+        last_seen_utc: crate::timestamp_from_rfc3339(record.last_seen_utc.as_str()),
+        last_library_serial: record.last_library_serial.unwrap_or_default(),
+        last_element_address: record
+            .last_element_address
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or_default(),
+        purchase_date: record.purchase_date.unwrap_or_default(),
+        warranty_until: record.warranty_until.unwrap_or_default(),
+        cost: record.cost.unwrap_or_default(),
+        notes: record.notes.unwrap_or_default(),
+        retired_at_utc: record
+            .retired_at_utc
+            .as_deref()
+            .and_then(crate::timestamp_from_rfc3339),
+        retire_reason: record.retire_reason.unwrap_or_default(),
+    }
+}
+
+fn drive_event_to_proto(record: DriveEventRecord) -> pb::DriveHistoryEvent {
+    pb::DriveHistoryEvent {
+        event_id: u64::try_from(record.event_id).unwrap_or_default(),
+        drive_uuid: record.drive_uuid,
+        event_kind: record.event_kind,
+        at_utc: crate::timestamp_from_rfc3339(record.at_utc.as_str()),
+        library_serial: record.library_serial.unwrap_or_default(),
+        element_address: record
+            .element_address
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or_default(),
+        tape_uuid: record.tape_uuid.unwrap_or_default(),
+        detail: record.detail.unwrap_or_default(),
+    }
+}
+
+fn drive_snapshot_to_proto(record: DriveHealthSnapshotRecord) -> pb::DriveHealthSnapshot {
+    pb::DriveHealthSnapshot {
+        snapshot_id: u64::try_from(record.snapshot_id).unwrap_or_default(),
+        drive_uuid: record.drive_uuid,
+        at_utc: crate::timestamp_from_rfc3339(record.at_utc.as_str()),
+        trigger: record.trigger,
+        session_id: record.session_id.unwrap_or_default(),
+        tape_alert_flags: record.tape_alert_flags.unwrap_or_default(),
+        write_errors_corrected: record
+            .write_errors_corrected
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or_default(),
+        write_errors_uncorrected: record
+            .write_errors_uncorrected
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or_default(),
+        read_errors_corrected: record
+            .read_errors_corrected
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or_default(),
+        read_errors_uncorrected: record
+            .read_errors_uncorrected
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or_default(),
+        raw_pages: record.raw_pages.unwrap_or_default(),
+    }
+}
+
+fn alarm_to_proto(record: AlarmRecord) -> pb::Alarm {
+    pb::Alarm {
+        alarm_id: u64::try_from(record.alarm_id).unwrap_or_default(),
+        condition_key: record.condition_key,
+        kind: record.kind,
+        severity: record.severity,
+        state: record.state,
+        first_seen_utc: crate::timestamp_from_rfc3339(record.first_seen_utc.as_str()),
+        last_seen_utc: crate::timestamp_from_rfc3339(record.last_seen_utc.as_str()),
+        acked_by: record.acked_by.unwrap_or_default(),
+        acked_at_utc: record
+            .acked_at_utc
+            .as_deref()
+            .and_then(crate::timestamp_from_rfc3339),
+        detail: record.detail.unwrap_or_default(),
+    }
+}
+
+fn actor_label(actor: &remanence_state::AuditActor) -> String {
+    match actor {
+        remanence_state::AuditActor::System => "system".to_string(),
+        remanence_state::AuditActor::User(value) | remanence_state::AuditActor::Service(value) => {
+            value.clone()
+        }
+    }
+}
+
+fn validate_iso_date(value: &str, field: &str) -> Result<(), Status> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    time::Date::parse(
+        value,
+        &time::format_description::well_known::Iso8601::DEFAULT,
+    )
+    .map(|_| ())
+    .map_err(|_| Status::invalid_argument(format!("{field} must be YYYY-MM-DD")))
+}
+
+fn ensure_mutable_drive(record: &DriveRecord, allow_derived_identity: bool) -> Result<(), Status> {
+    if record.identity_source == "Derived" && !allow_derived_identity {
+        return Err(Status::failed_precondition(
+            "drive identity is Derived; retry with allow_derived_identity",
+        ));
+    }
+    if !record.actionable {
+        return Err(Status::failed_precondition(
+            "drive is non-actionable because its serial identity is blank or collided",
+        ));
+    }
+    if record.managed == "foreign" {
+        return Err(Status::failed_precondition(
+            "foreign drives are read-only to Remanence",
+        ));
+    }
+    Ok(())
 }
 
 /// LibraryService read inspection implementation. State-changing and streaming
@@ -329,6 +475,234 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         .await
     }
 
+    async fn list_drives(
+        &self,
+        request: Request<pb::ListDrivesRequest>,
+    ) -> Result<Response<pb::ListDrivesResponse>, Status> {
+        crate::authorize_request(&request, crate::AuthPermission::Read)?;
+        let request = request.into_inner();
+        crate::ensure_unpaged(request.page_token.as_ref(), request.page_size)?;
+        let drives = self
+            .state
+            .index()?
+            .list_drives(request.include_foreign, request.include_retired)
+            .map_err(crate::status_from_state_error)?
+            .into_iter()
+            .map(drive_record_to_proto)
+            .collect();
+        Ok(Response::new(pb::ListDrivesResponse {
+            drives,
+            next_page_token: None,
+        }))
+    }
+
+    async fn get_drive(
+        &self,
+        request: Request<pb::GetDriveRequest>,
+    ) -> Result<Response<pb::DriveCatalogEntry>, Status> {
+        crate::authorize_request(&request, crate::AuthPermission::Read)?;
+        let selector = request.into_inner().drive;
+        let drive = self
+            .state
+            .index()?
+            .get_drive_by_selector(selector.as_str())
+            .map_err(crate::status_from_state_error)?
+            .ok_or_else(|| Status::not_found("drive not found"))?;
+        Ok(Response::new(drive_record_to_proto(drive)))
+    }
+
+    async fn get_drive_history(
+        &self,
+        request: Request<pb::GetDriveHistoryRequest>,
+    ) -> Result<Response<pb::GetDriveHistoryResponse>, Status> {
+        crate::authorize_request(&request, crate::AuthPermission::Read)?;
+        let request = request.into_inner();
+        crate::ensure_unpaged(request.page_token.as_ref(), request.page_size)?;
+        let index = self.state.index()?;
+        let drive = index
+            .get_drive_by_selector(request.drive.as_str())
+            .map_err(crate::status_from_state_error)?
+            .ok_or_else(|| Status::not_found("drive not found"))?;
+        let events = if request.include_events || !request.include_snapshots {
+            index
+                .list_drive_events(&drive.drive_uuid)
+                .map_err(crate::status_from_state_error)?
+                .into_iter()
+                .map(drive_event_to_proto)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let snapshots = if request.include_snapshots {
+            index
+                .list_drive_health_snapshots(&drive.drive_uuid)
+                .map_err(crate::status_from_state_error)?
+                .into_iter()
+                .map(drive_snapshot_to_proto)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(Response::new(pb::GetDriveHistoryResponse {
+            drive: Some(drive_record_to_proto(drive)),
+            events,
+            snapshots,
+            next_page_token: None,
+        }))
+    }
+
+    async fn annotate_drive(
+        &self,
+        request: Request<pb::AnnotateDriveRequest>,
+    ) -> Result<Response<pb::DriveCatalogEntry>, Status> {
+        let actor = crate::authorize_request(&request, crate::AuthPermission::Write)?;
+        let request = request.into_inner();
+        crate::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
+        validate_iso_date(request.purchase_date.as_str(), "purchase_date")?;
+        validate_iso_date(request.warranty_until.as_str(), "warranty_until")?;
+        let mut index = self.state.index_write()?;
+        let drive = index
+            .get_drive_by_uuid(&request.drive_uuid)
+            .map_err(crate::status_from_state_error)?
+            .ok_or_else(|| Status::not_found("drive not found"))?;
+        ensure_mutable_drive(&drive, request.allow_derived_identity)?;
+        let drive_uuid = request.drive_uuid.clone();
+        let stored = index
+            .annotate_drive(DriveAnnotationInput {
+                drive_uuid: request.drive_uuid,
+                purchase_date: (!request.purchase_date.is_empty()).then_some(request.purchase_date),
+                warranty_until: (!request.warranty_until.is_empty())
+                    .then_some(request.warranty_until),
+                cost: (!request.cost.is_empty()).then_some(request.cost),
+                note: (!request.note.is_empty()).then_some(request.note),
+                notes_set: (!request.notes_set.is_empty()).then_some(request.notes_set),
+                annotated_at_utc: None,
+            })
+            .map_err(crate::status_from_state_error)?
+            .ok_or_else(|| Status::not_found("drive not found"))?;
+        let mut detail = BTreeMap::new();
+        detail.insert(
+            "drive_uuid".to_string(),
+            CborValue::Bytes(drive_uuid.clone()),
+        );
+        self.state.record_drive_audit(
+            actor,
+            remanence_state::AuditEvent::DriveAnnotated,
+            drive_uuid.as_slice(),
+            detail,
+        )?;
+        Ok(Response::new(drive_record_to_proto(stored)))
+    }
+
+    async fn retire_drive(
+        &self,
+        request: Request<pb::RetireDriveRequest>,
+    ) -> Result<Response<pb::RetireDriveResponse>, Status> {
+        let actor = crate::authorize_request(&request, crate::AuthPermission::Lifecycle)?;
+        let request = request.into_inner();
+        crate::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
+        if !request.i_understand_fleet_removal_is_permanent {
+            return Err(Status::failed_precondition(
+                "RetireDrive requires i_understand_fleet_removal_is_permanent=true",
+            ));
+        }
+        if request.reason.trim().is_empty() {
+            return Err(Status::invalid_argument("reason must not be empty"));
+        }
+        let mut index = self.state.index_write()?;
+        let drive = index
+            .get_drive_by_uuid(&request.drive_uuid)
+            .map_err(crate::status_from_state_error)?
+            .ok_or_else(|| Status::not_found("drive not found"))?;
+        ensure_mutable_drive(&drive, request.allow_derived_identity)?;
+        if let Some(element) = drive
+            .last_element_address
+            .and_then(|value| u16::try_from(value).ok())
+        {
+            if self.state.busy_drive_bays().contains(&element) {
+                return Err(Status::failed_precondition(
+                    "drive has an active session or reserved operation",
+                ));
+            }
+        }
+        let outcome = index
+            .retire_drive(&request.drive_uuid, request.reason.as_str())
+            .map_err(crate::status_from_state_error)?
+            .ok_or_else(|| Status::not_found("drive not found"))?;
+        if outcome.newly_retired {
+            let mut detail = BTreeMap::new();
+            detail.insert(
+                "drive_uuid".to_string(),
+                CborValue::Bytes(request.drive_uuid.clone()),
+            );
+            detail.insert("reason".to_string(), CborValue::Text(request.reason));
+            self.state.record_drive_audit(
+                actor,
+                remanence_state::AuditEvent::DriveRetired,
+                request.drive_uuid.as_slice(),
+                detail,
+            )?;
+        }
+        Ok(Response::new(pb::RetireDriveResponse {
+            drive: Some(drive_record_to_proto(outcome.drive)),
+            newly_retired: outcome.newly_retired,
+        }))
+    }
+
+    async fn clean_drive(
+        &self,
+        request: Request<pb::CleanDriveRequest>,
+    ) -> Result<Response<pb::OperationRef>, Status> {
+        crate::authorize_request(&request, crate::AuthPermission::Robotics)?;
+        Err(Status::unimplemented("CleanDrive is DS-M2"))
+    }
+
+    async fn list_alarms(
+        &self,
+        request: Request<pb::ListAlarmsRequest>,
+    ) -> Result<Response<pb::ListAlarmsResponse>, Status> {
+        crate::authorize_request(&request, crate::AuthPermission::Read)?;
+        let request = request.into_inner();
+        crate::ensure_unpaged(request.page_token.as_ref(), request.page_size)?;
+        let alarms = self
+            .state
+            .index()?
+            .list_alarms(request.include_cleared)
+            .map_err(crate::status_from_state_error)?
+            .into_iter()
+            .map(alarm_to_proto)
+            .collect();
+        Ok(Response::new(pb::ListAlarmsResponse {
+            alarms,
+            next_page_token: None,
+        }))
+    }
+
+    async fn ack_alarm(
+        &self,
+        request: Request<pb::AckAlarmRequest>,
+    ) -> Result<Response<pb::Alarm>, Status> {
+        let actor = crate::authorize_request(&request, crate::AuthPermission::Robotics)?;
+        let request = request.into_inner();
+        crate::reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "AckAlarm")?;
+        let mut index = self.state.index_write()?;
+        let alarm = index
+            .ack_alarm(request.condition_key.as_str(), actor_label(&actor).as_str())
+            .map_err(crate::status_from_state_error)?
+            .ok_or_else(|| Status::not_found("alarm not found or already cleared"))?;
+        self.state
+            .record_alarm_acked(actor, request.condition_key.as_str())?;
+        Ok(Response::new(alarm_to_proto(alarm)))
+    }
+
+    async fn get_live_status(
+        &self,
+        request: Request<pb::GetLiveStatusRequest>,
+    ) -> Result<Response<pb::GetLiveStatusResponse>, Status> {
+        crate::authorize_request(&request, crate::AuthPermission::Read)?;
+        Err(Status::unimplemented("GetLiveStatus is DS-M3"))
+    }
+
     async fn move_medium(
         &self,
         request: Request<pb::MoveMediumRequest>,
@@ -450,6 +824,7 @@ mod tests {
         DiscoveryReport, DriveBay, ElementLayout, IdentitySource, IePort, InstalledDrive, Library,
         Slot,
     };
+    use remanence_state::DriveObservationInput;
 
     use super::*;
     use crate::pb::library_service_server::LibraryService as _;
@@ -534,6 +909,28 @@ mod tests {
             },
         ))));
         state
+    }
+
+    fn observe_test_drive(
+        index: &mut CatalogIndex,
+        serial: &str,
+        identity_source: &str,
+        bay: i64,
+    ) -> Vec<u8> {
+        index
+            .observe_drive(DriveObservationInput {
+                serial: serial.to_string(),
+                identity_source: identity_source.to_string(),
+                vendor: Some("HPE".to_string()),
+                product: Some("Ultrium 9-SCSI".to_string()),
+                firmware_rev: Some("R1.0".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("DEC418146K_LL02".to_string()),
+                element_address: Some(bay),
+                observed_at_utc: Some("2026-07-04T00:00:00Z".to_string()),
+            })
+            .expect("observe test drive")
+            .drive_uuid
     }
 
     #[test]
@@ -843,6 +1240,67 @@ mod tests {
             .await
             .expect_err("no owner");
         assert_eq!(err.code(), tonic::Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn retire_drive_rejects_missing_ack_before_lookup() {
+        let err = ApiState::new(test_index())
+            .library_service()
+            .retire_drive(Request::new(pb::RetireDriveRequest {
+                drive_uuid: Uuid::new_v4().as_bytes().to_vec(),
+                reason: "removed from fleet".to_string(),
+                i_understand_fleet_removal_is_permanent: false,
+                allow_derived_identity: false,
+            }))
+            .await
+            .expect_err("missing ack must reject");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("i_understand"));
+    }
+
+    #[tokio::test]
+    async fn retire_drive_rejects_derived_identity_without_opt_in() {
+        let mut index = test_index();
+        let drive_uuid = observe_test_drive(&mut index, "DRV-DERIVED", "Derived", 0x0100);
+        let err = ApiState::new(index)
+            .library_service()
+            .retire_drive(Request::new(pb::RetireDriveRequest {
+                drive_uuid,
+                reason: "removed from fleet".to_string(),
+                i_understand_fleet_removal_is_permanent: true,
+                allow_derived_identity: false,
+            }))
+            .await
+            .expect_err("derived identity must reject without opt-in");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("Derived"));
+    }
+
+    #[tokio::test]
+    async fn retire_drive_rejects_busy_drive_bay() {
+        let mut index = test_index();
+        let drive_uuid = observe_test_drive(&mut index, "DRV-BUSY", "DvcidAndInquiry", 0x0101);
+        let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
+        let reservations = Arc::new(HashMap::from([(0x0101, AtomicBool::new(true))]));
+        let mut state = ApiState::new(index);
+        state.drive_pool = Some(crate::write_owner::DrivePool::new(
+            changer_tx,
+            HashMap::new(),
+            reservations,
+        ));
+
+        let err = state
+            .library_service()
+            .retire_drive(Request::new(pb::RetireDriveRequest {
+                drive_uuid,
+                reason: "removed from fleet".to_string(),
+                i_understand_fleet_removal_is_permanent: true,
+                allow_derived_identity: false,
+            }))
+            .await
+            .expect_err("busy bay must reject retire");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("active session"));
     }
 
     #[tokio::test]

@@ -59,5 +59,6 @@ pub use sysfs::DeviceAttachment;
 #[cfg(target_os = "linux")]
 pub use transport::LinuxSgTransport;
 pub use transport::{
-    FixtureTransport, RecordingLog, RecordingTransport, SgTransport, TimeoutClass,
+    FixtureTransport, ForeignDriveTransport, RecordingLog, RecordingTransport, SgTransport,
+    TimeoutClass,
 };

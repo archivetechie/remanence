@@ -201,6 +201,8 @@ fn rem_debug_only_reason(cmd: &Command) -> Option<&'static str> {
         | Command::DaemonClient { .. }
         | Command::OperationClient { .. }
         | Command::CatalogClient { .. }
+        | Command::DriveClient { .. }
+        | Command::AlarmsClient { .. }
         | Command::Tape { .. } => None,
     }
 }
@@ -209,7 +211,9 @@ fn rem_only_reason(cmd: &Command) -> Option<&'static str> {
     match cmd {
         Command::DaemonClient { .. }
         | Command::OperationClient { .. }
-        | Command::CatalogClient { .. } => Some("daemon client commands"),
+        | Command::CatalogClient { .. }
+        | Command::DriveClient { .. }
+        | Command::AlarmsClient { .. } => Some("daemon client commands"),
         Command::Libraries { .. }
         | Command::Library { .. }
         | Command::Move { .. }
@@ -399,6 +403,45 @@ enum RemCommand {
         command: CatalogClientCommand,
     },
 
+    /// Query and mutate daemon drive stewardship state.
+    Drive {
+        /// Daemon gRPC endpoint URI.
+        #[arg(
+            long,
+            value_name = "URI",
+            default_value = DEFAULT_DAEMON_ENDPOINT,
+            global = true
+        )]
+        endpoint: String,
+        /// Emit stable CLI-shaped JSON.
+        #[arg(long, global = true)]
+        json: bool,
+        /// Drive command to run.
+        #[command(subcommand)]
+        command: DriveClientCommand,
+    },
+
+    /// List or acknowledge standing daemon alarms.
+    Alarms {
+        /// Daemon gRPC endpoint URI.
+        #[arg(
+            long,
+            value_name = "URI",
+            default_value = DEFAULT_DAEMON_ENDPOINT,
+            global = true
+        )]
+        endpoint: String,
+        /// Emit stable CLI-shaped JSON.
+        #[arg(long, global = true)]
+        json: bool,
+        /// Include cleared alarms.
+        #[arg(long = "all")]
+        all: bool,
+        /// Alarm command to run. Omitted means list alarms.
+        #[command(subcommand)]
+        command: Option<AlarmsClientCommand>,
+    },
+
     /// Initialize tapes after the destructive-safety gauntlet.
     Tape {
         /// Tape operation to run.
@@ -469,6 +512,26 @@ impl From<RemCommand> for Command {
                 json,
                 command,
             },
+            RemCommand::Drive {
+                endpoint,
+                json,
+                command,
+            } => Self::DriveClient {
+                endpoint,
+                json,
+                command,
+            },
+            RemCommand::Alarms {
+                endpoint,
+                json,
+                all,
+                command,
+            } => Self::AlarmsClient {
+                endpoint,
+                json,
+                all,
+                command,
+            },
             RemCommand::Tape { command } => Self::Tape {
                 command: command.into(),
             },
@@ -508,6 +571,8 @@ fn state_changing_target(cmd: &Command) -> Option<&str> {
         | Command::DaemonClient { .. }
         | Command::OperationClient { .. }
         | Command::CatalogClient { .. }
+        | Command::DriveClient { .. }
+        | Command::AlarmsClient { .. }
         | Command::Tape { .. } => None,
     }
 }
@@ -846,6 +911,47 @@ enum Command {
         command: CatalogClientCommand,
     },
 
+    /// Query and mutate daemon drive stewardship state.
+    #[command(name = "drive")]
+    DriveClient {
+        /// Daemon gRPC endpoint URI.
+        #[arg(
+            long,
+            value_name = "URI",
+            default_value = DEFAULT_DAEMON_ENDPOINT,
+            global = true
+        )]
+        endpoint: String,
+        /// Emit stable CLI-shaped JSON.
+        #[arg(long, global = true)]
+        json: bool,
+        /// Drive command to run.
+        #[command(subcommand)]
+        command: DriveClientCommand,
+    },
+
+    /// List or acknowledge standing daemon alarms.
+    #[command(name = "alarms")]
+    AlarmsClient {
+        /// Daemon gRPC endpoint URI.
+        #[arg(
+            long,
+            value_name = "URI",
+            default_value = DEFAULT_DAEMON_ENDPOINT,
+            global = true
+        )]
+        endpoint: String,
+        /// Emit stable CLI-shaped JSON.
+        #[arg(long, global = true)]
+        json: bool,
+        /// Include cleared alarms.
+        #[arg(long = "all")]
+        all: bool,
+        /// Alarm command to run. Omitted means list alarms.
+        #[command(subcommand)]
+        command: Option<AlarmsClientCommand>,
+    },
+
     /// Initialize tapes after the destructive-safety gauntlet.
     Tape {
         /// Tape operation to run.
@@ -953,6 +1059,103 @@ enum CatalogClientCommand {
     Entries {
         /// Catalog unit id.
         unit_id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DriveClientCommand {
+    /// List cataloged drives.
+    List {
+        /// Include foreign drives.
+        #[arg(long)]
+        foreign: bool,
+        /// Include retired drives.
+        #[arg(long)]
+        retired: bool,
+    },
+
+    /// Show one drive by serial or UUID.
+    Show {
+        /// Drive serial or UUID.
+        drive: String,
+    },
+
+    /// Show one drive's history.
+    History {
+        /// Drive serial or UUID.
+        drive: String,
+        /// Include observational events.
+        #[arg(long)]
+        events: bool,
+        /// Include health snapshots.
+        #[arg(long)]
+        snapshots: bool,
+    },
+
+    /// Show one drive's active alerts.
+    Alerts {
+        /// Drive serial or UUID.
+        drive: String,
+    },
+
+    /// Annotate one drive.
+    Annotate(DriveAnnotateArgs),
+
+    /// Permanently remove one drive from the managed fleet.
+    Retire(DriveRetireArgs),
+
+    /// Poll one drive now.
+    Poll {
+        /// Drive serial or UUID.
+        drive: String,
+    },
+}
+
+#[derive(Args, Debug)]
+struct DriveAnnotateArgs {
+    /// Drive UUID.
+    drive_uuid: String,
+    /// Purchase date, YYYY-MM-DD.
+    #[arg(long)]
+    purchase_date: Option<String>,
+    /// Warranty end date, YYYY-MM-DD.
+    #[arg(long)]
+    warranty_until: Option<String>,
+    /// Display-only cost string.
+    #[arg(long)]
+    cost: Option<String>,
+    /// Append a timestamped note.
+    #[arg(long)]
+    note: Option<String>,
+    /// Replace notes.
+    #[arg(long)]
+    notes_set: Option<String>,
+    /// Permit mutation of a Derived-identity row.
+    #[arg(long)]
+    allow_derived_identity: bool,
+}
+
+#[derive(Args, Debug)]
+struct DriveRetireArgs {
+    /// Drive UUID.
+    drive_uuid: String,
+    /// Operator-supplied reason.
+    #[arg(long)]
+    reason: String,
+    /// Required server-side acknowledgement.
+    #[arg(long = "i-understand-fleet-removal-is-permanent")]
+    i_understand_fleet_removal_is_permanent: bool,
+    /// Permit mutation of a Derived-identity row.
+    #[arg(long)]
+    allow_derived_identity: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum AlarmsClientCommand {
+    /// Acknowledge one alarm condition key.
+    Ack {
+        /// Alarm condition key.
+        condition_key: String,
     },
 }
 
@@ -2476,6 +2679,17 @@ where
             json,
             command,
         } => return run_catalog_client_command(endpoint, *json, command, out, err),
+        Command::DriveClient {
+            endpoint,
+            json,
+            command,
+        } => return run_drive_client_command(endpoint, *json, command, out, err),
+        Command::AlarmsClient {
+            endpoint,
+            json,
+            all,
+            command,
+        } => return run_alarms_client_command(endpoint, *json, *all, command, out, err),
         Command::Libraries { .. }
         | Command::Library { .. }
         | Command::Move { .. }
@@ -2779,7 +2993,9 @@ where
         Command::Catalog { .. } => unreachable!("catalog maintenance dispatched pre-discovery"),
         Command::DaemonClient { .. }
         | Command::OperationClient { .. }
-        | Command::CatalogClient { .. } => {
+        | Command::CatalogClient { .. }
+        | Command::DriveClient { .. }
+        | Command::AlarmsClient { .. } => {
             unreachable!("daemon client command dispatched pre-discovery")
         }
         Command::Tape { command } => {
@@ -2968,8 +3184,7 @@ fn run_catalog_client_command(
                     print_tape_list(tapes, json_output, out).map_err(DaemonClientError::from)
                 }
                 CatalogClientCommand::Tape { tape_uuid } => {
-                    let tape_uuid = parse_uuid_bytes(tape_uuid, "tape_uuid")
-                        .map_err(DaemonClientError::from)?;
+                    let tape_uuid = resolve_tape_uuid_arg(&mut client, tape_uuid).await?;
                     let tape = client
                         .get_tape(pb::GetTapeRequest { tape_uuid })
                         .await
@@ -3055,6 +3270,191 @@ fn run_catalog_client_command(
                         .into_inner();
                     print_catalog_entry_list(response.entries, json_output, out)
                         .map_err(DaemonClientError::from)
+                }
+            }
+        })
+    });
+    finish_daemon_client_result(result, json_output, err)
+}
+
+async fn resolve_tape_uuid_arg(
+    client: &mut pb::catalog_client::CatalogClient<Channel>,
+    arg: &str,
+) -> Result<Vec<u8>, DaemonClientError> {
+    if let Ok(uuid) = parse_uuid_bytes(arg, "tape_uuid") {
+        return Ok(uuid);
+    }
+    let tapes = client
+        .list_tapes(pb::ListTapesRequest {
+            library_uuid: Vec::new(),
+            page_token: None,
+            page_size: 0,
+            pool_id: String::new(),
+        })
+        .await
+        .map_err(status_error)?
+        .into_inner()
+        .tapes;
+    tapes
+        .into_iter()
+        .find(|tape| tape.voltag == arg)
+        .map(|tape| tape.tape_uuid)
+        .ok_or_else(|| {
+            DaemonClientError::client(format!("tape {arg:?} not found by UUID or voltag"))
+        })
+}
+
+fn run_drive_client_command(
+    endpoint: &str,
+    json_output: bool,
+    command: &DriveClientCommand,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let result = daemon_runtime().and_then(|runtime| {
+        runtime.block_on(async {
+            let channel = connect_daemon(endpoint)
+                .await
+                .map_err(DaemonClientError::from)?;
+            let mut client = pb::library_service_client::LibraryServiceClient::new(channel);
+            match command {
+                DriveClientCommand::List { foreign, retired } => {
+                    let drives = client
+                        .list_drives(pb::ListDrivesRequest {
+                            include_foreign: *foreign,
+                            include_retired: *retired,
+                            page_token: None,
+                            page_size: 0,
+                        })
+                        .await
+                        .map_err(status_error)?
+                        .into_inner()
+                        .drives;
+                    print_drive_list(drives, json_output, out).map_err(DaemonClientError::from)
+                }
+                DriveClientCommand::Show { drive } => {
+                    let drive = client
+                        .get_drive(pb::GetDriveRequest {
+                            drive: drive.clone(),
+                        })
+                        .await
+                        .map_err(status_error)?
+                        .into_inner();
+                    print_drive(drive, json_output, out).map_err(DaemonClientError::from)
+                }
+                DriveClientCommand::History {
+                    drive,
+                    events,
+                    snapshots,
+                } => {
+                    let history = client
+                        .get_drive_history(pb::GetDriveHistoryRequest {
+                            drive: drive.clone(),
+                            include_events: *events,
+                            include_snapshots: *snapshots,
+                            page_token: None,
+                            page_size: 0,
+                        })
+                        .await
+                        .map_err(status_error)?
+                        .into_inner();
+                    print_drive_history(history, json_output, out).map_err(DaemonClientError::from)
+                }
+                DriveClientCommand::Alerts { drive } => {
+                    let history = client
+                        .get_drive_history(pb::GetDriveHistoryRequest {
+                            drive: drive.clone(),
+                            include_events: true,
+                            include_snapshots: true,
+                            page_token: None,
+                            page_size: 0,
+                        })
+                        .await
+                        .map_err(status_error)?
+                        .into_inner();
+                    print_drive_history(history, json_output, out).map_err(DaemonClientError::from)
+                }
+                DriveClientCommand::Annotate(args) => {
+                    let drive_uuid = parse_uuid_bytes(&args.drive_uuid, "drive_uuid")
+                        .map_err(DaemonClientError::from)?;
+                    let drive = client
+                        .annotate_drive(pb::AnnotateDriveRequest {
+                            drive_uuid,
+                            purchase_date: args.purchase_date.clone().unwrap_or_default(),
+                            warranty_until: args.warranty_until.clone().unwrap_or_default(),
+                            cost: args.cost.clone().unwrap_or_default(),
+                            note: args.note.clone().unwrap_or_default(),
+                            notes_set: args.notes_set.clone().unwrap_or_default(),
+                            allow_derived_identity: args.allow_derived_identity,
+                        })
+                        .await
+                        .map_err(status_error)?
+                        .into_inner();
+                    print_drive(drive, json_output, out).map_err(DaemonClientError::from)
+                }
+                DriveClientCommand::Retire(args) => {
+                    let drive_uuid = parse_uuid_bytes(&args.drive_uuid, "drive_uuid")
+                        .map_err(DaemonClientError::from)?;
+                    let response = client
+                        .retire_drive(pb::RetireDriveRequest {
+                            drive_uuid,
+                            reason: args.reason.clone(),
+                            i_understand_fleet_removal_is_permanent: args
+                                .i_understand_fleet_removal_is_permanent,
+                            allow_derived_identity: args.allow_derived_identity,
+                        })
+                        .await
+                        .map_err(status_error)?
+                        .into_inner();
+                    print_drive_retire(response, json_output, out).map_err(DaemonClientError::from)
+                }
+                DriveClientCommand::Poll { .. } => Err(DaemonClientError::client(
+                    "rem drive poll is not wired in the DS-M1 skeleton",
+                )),
+            }
+        })
+    });
+    finish_daemon_client_result(result, json_output, err)
+}
+
+fn run_alarms_client_command(
+    endpoint: &str,
+    json_output: bool,
+    all: bool,
+    command: &Option<AlarmsClientCommand>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let result = daemon_runtime().and_then(|runtime| {
+        runtime.block_on(async {
+            let channel = connect_daemon(endpoint)
+                .await
+                .map_err(DaemonClientError::from)?;
+            let mut client = pb::library_service_client::LibraryServiceClient::new(channel);
+            match command {
+                None => {
+                    let alarms = client
+                        .list_alarms(pb::ListAlarmsRequest {
+                            include_cleared: all,
+                            page_token: None,
+                            page_size: 0,
+                        })
+                        .await
+                        .map_err(status_error)?
+                        .into_inner()
+                        .alarms;
+                    print_alarm_list(alarms, json_output, out).map_err(DaemonClientError::from)
+                }
+                Some(AlarmsClientCommand::Ack { condition_key }) => {
+                    let alarm = client
+                        .ack_alarm(pb::AckAlarmRequest {
+                            condition_key: condition_key.clone(),
+                            idempotency_key: None,
+                        })
+                        .await
+                        .map_err(status_error)?
+                        .into_inner();
+                    print_alarm(alarm, json_output, out).map_err(DaemonClientError::from)
                 }
             }
         })
@@ -3314,6 +3714,154 @@ fn print_tape_line(tape: &pb::Tape, out: &mut dyn Write) {
     );
 }
 
+fn print_drive(
+    drive: pb::DriveCatalogEntry,
+    json_output: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    if json_output {
+        return print_json_envelope("rem.drive.show.v1", "item", drive_json(&drive), out);
+    }
+    print_drive_line(&drive, out);
+    Ok(())
+}
+
+fn print_drive_list(
+    drives: Vec<pb::DriveCatalogEntry>,
+    json_output: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    if json_output {
+        return print_json_envelope(
+            "rem.drive.list.v1",
+            "list",
+            json!({ "drives": drives.iter().map(drive_json).collect::<Vec<_>>() }),
+            out,
+        );
+    }
+    if drives.is_empty() {
+        let _ = writeln!(out, "(no drives)");
+    } else {
+        for drive in drives {
+            print_drive_line(&drive, out);
+        }
+    }
+    Ok(())
+}
+
+fn print_drive_history(
+    history: pb::GetDriveHistoryResponse,
+    json_output: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    if json_output {
+        return print_json_envelope(
+            "rem.drive.history.v1",
+            "item",
+            json!({
+                "drive": history.drive.as_ref().map(drive_json),
+                "events": history.events.iter().map(drive_event_json).collect::<Vec<_>>(),
+                "snapshots": history.snapshots.iter().map(drive_snapshot_json).collect::<Vec<_>>()
+            }),
+            out,
+        );
+    }
+    if let Some(drive) = history.drive.as_ref() {
+        print_drive_line(drive, out);
+    }
+    for event in history.events {
+        let at = timestamp_text(event.at_utc.as_ref()).unwrap_or_else(|| "-".into());
+        let _ = writeln!(out, "  event {at} {}", event.event_kind);
+    }
+    for snapshot in history.snapshots {
+        let at = timestamp_text(snapshot.at_utc.as_ref()).unwrap_or_else(|| "-".into());
+        let _ = writeln!(out, "  snapshot {at} trigger={}", snapshot.trigger);
+    }
+    Ok(())
+}
+
+fn print_drive_retire(
+    response: pb::RetireDriveResponse,
+    json_output: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    if json_output {
+        return print_json_envelope(
+            "rem.drive.retire.v1",
+            "item",
+            json!({
+                "drive": response.drive.as_ref().map(drive_json),
+                "newly_retired": response.newly_retired
+            }),
+            out,
+        );
+    }
+    if let Some(drive) = response.drive.as_ref() {
+        print_drive_line(drive, out);
+    }
+    let _ = writeln!(out, "newly_retired: {}", response.newly_retired);
+    Ok(())
+}
+
+fn print_alarm(alarm: pb::Alarm, json_output: bool, out: &mut dyn Write) -> Result<(), String> {
+    if json_output {
+        return print_json_envelope("rem.alarms.v1", "item", alarm_json(&alarm), out);
+    }
+    print_alarm_line(&alarm, out);
+    Ok(())
+}
+
+fn print_alarm_list(
+    alarms: Vec<pb::Alarm>,
+    json_output: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    if json_output {
+        return print_json_envelope(
+            "rem.alarms.v1",
+            "list",
+            json!({ "alarms": alarms.iter().map(alarm_json).collect::<Vec<_>>() }),
+            out,
+        );
+    }
+    if alarms.is_empty() {
+        let _ = writeln!(out, "(no alarms)");
+    } else {
+        for alarm in alarms {
+            print_alarm_line(&alarm, out);
+        }
+    }
+    Ok(())
+}
+
+fn print_drive_line(drive: &pb::DriveCatalogEntry, out: &mut dyn Write) {
+    let uuid = bytes_to_uuid_text(&drive.drive_uuid);
+    let serial = if drive.serial.is_empty() {
+        "unattributed (pre-stewardship)"
+    } else {
+        drive.serial.as_str()
+    };
+    let label = if drive.managed == "foreign" {
+        format!("[foreign] {serial}")
+    } else {
+        serial.to_string()
+    };
+    let _ = writeln!(
+        out,
+        "{uuid}  {label}  state={}  cleaning_due={}  fenced={}",
+        drive.state, drive.cleaning_due, drive.fenced
+    );
+}
+
+fn print_alarm_line(alarm: &pb::Alarm, out: &mut dyn Write) {
+    let last_seen = timestamp_text(alarm.last_seen_utc.as_ref()).unwrap_or_else(|| "-".into());
+    let _ = writeln!(
+        out,
+        "{}  {}  severity={}  state={}  last_seen={last_seen}",
+        alarm.condition_key, alarm.kind, alarm.severity, alarm.state
+    );
+}
+
 fn print_tape_file_list(
     tape_files: Vec<pb::TapeFile>,
     json_output: bool,
@@ -3549,6 +4097,76 @@ fn tape_json(tape: &pb::Tape) -> Value {
     })
 }
 
+fn drive_json(drive: &pb::DriveCatalogEntry) -> Value {
+    json!({
+        "drive_uuid": bytes_to_uuid_text(&drive.drive_uuid),
+        "serial": drive.serial,
+        "identity_source": drive.identity_source,
+        "actionable": drive.actionable,
+        "vendor": drive.vendor,
+        "product": drive.product,
+        "firmware_rev": drive.firmware_rev,
+        "managed": drive.managed,
+        "state": drive.state,
+        "cleaning_due": drive.cleaning_due,
+        "fenced": drive.fenced,
+        "first_seen_utc": timestamp_value(drive.first_seen_utc.as_ref()),
+        "last_seen_utc": timestamp_value(drive.last_seen_utc.as_ref()),
+        "last_library_serial": drive.last_library_serial,
+        "last_element_address": drive.last_element_address,
+        "purchase_date": drive.purchase_date,
+        "warranty_until": drive.warranty_until,
+        "cost": drive.cost,
+        "notes": drive.notes,
+        "retired_at_utc": timestamp_value(drive.retired_at_utc.as_ref()),
+        "retire_reason": drive.retire_reason,
+    })
+}
+
+fn drive_event_json(event: &pb::DriveHistoryEvent) -> Value {
+    json!({
+        "event_id": event.event_id,
+        "drive_uuid": bytes_to_uuid_text(&event.drive_uuid),
+        "event_kind": event.event_kind,
+        "at_utc": timestamp_value(event.at_utc.as_ref()),
+        "library_serial": event.library_serial,
+        "element_address": event.element_address,
+        "tape_uuid": bytes_to_uuid_text(&event.tape_uuid),
+        "detail": event.detail,
+    })
+}
+
+fn drive_snapshot_json(snapshot: &pb::DriveHealthSnapshot) -> Value {
+    json!({
+        "snapshot_id": snapshot.snapshot_id,
+        "drive_uuid": bytes_to_uuid_text(&snapshot.drive_uuid),
+        "at_utc": timestamp_value(snapshot.at_utc.as_ref()),
+        "trigger": snapshot.trigger,
+        "session_id": snapshot.session_id,
+        "tape_alert_flags": snapshot.tape_alert_flags,
+        "write_errors_corrected": snapshot.write_errors_corrected,
+        "write_errors_uncorrected": snapshot.write_errors_uncorrected,
+        "read_errors_corrected": snapshot.read_errors_corrected,
+        "read_errors_uncorrected": snapshot.read_errors_uncorrected,
+        "raw_pages": snapshot.raw_pages,
+    })
+}
+
+fn alarm_json(alarm: &pb::Alarm) -> Value {
+    json!({
+        "alarm_id": alarm.alarm_id,
+        "condition_key": alarm.condition_key,
+        "kind": alarm.kind,
+        "severity": alarm.severity,
+        "state": alarm.state,
+        "first_seen_utc": timestamp_value(alarm.first_seen_utc.as_ref()),
+        "last_seen_utc": timestamp_value(alarm.last_seen_utc.as_ref()),
+        "acked_by": alarm.acked_by,
+        "acked_at_utc": timestamp_value(alarm.acked_at_utc.as_ref()),
+        "detail": alarm.detail,
+    })
+}
+
 fn tape_file_json(file: &pb::TapeFile) -> Value {
     json!({
         "tape_uuid": bytes_to_uuid_text(&file.tape_uuid),
@@ -3754,7 +4372,7 @@ fn run_catalog_reset(
     if !args.i_understand_this_erases_the_catalog {
         let _ = writeln!(
             err,
-            "error: catalog reset requires --i-understand-this-erases-the-catalog"
+            "error: catalog reset erases the catalog, audit history, drive history, drive health snapshots, cleaning runs, and alarms; pass --i-understand-this-erases-the-catalog"
         );
         return ExitCode::from(2);
     }
@@ -9114,6 +9732,9 @@ mod tests {
                 min_object_size_bytes: 0,
             }],
             tape_pool_rules: Vec::new(),
+            drives: remanence_state::DrivesConfig::default(),
+            cleaning: remanence_state::CleaningConfig::default(),
+            livestatus: remanence_state::LiveStatusConfig::default(),
             journal: remanence_state::JournalConfig {
                 dir: root.join("journals"),
                 require_trusted_volume: false,
@@ -9603,6 +10224,7 @@ mod tests {
             .unwrap();
         let index = remanence_state::CatalogIndex::open(temp.path().join("state.sqlite")).unwrap();
         let state = remanence_api::ApiState::new(index);
+        let socket_path = temp.path().join("daemon.sock");
         let (addr_tx, addr_rx) = std::sync::mpsc::channel();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -9612,13 +10234,12 @@ mod tests {
                 .build()
                 .unwrap();
             runtime.block_on(async move {
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let addr = listener.local_addr().unwrap();
-                addr_tx.send(addr).unwrap();
+                let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+                addr_tx.send(socket_path).unwrap();
                 tonic::transport::Server::builder()
                     .add_service(pb::daemon_server::DaemonServer::new(state.daemon_service()))
                     .serve_with_incoming_shutdown(
-                        tokio_stream::wrappers::TcpListenerStream::new(listener),
+                        tokio_stream::wrappers::UnixListenerStream::new(listener),
                         async {
                             let _ = shutdown_rx.await;
                         },
@@ -9628,7 +10249,7 @@ mod tests {
             });
         });
 
-        let endpoint = format!("http://{}", addr_rx.recv().unwrap());
+        let endpoint = format!("unix:{}", addr_rx.recv().unwrap().display());
         let cli = Cli::parse_from(["rem", "daemon", "--endpoint", &endpoint, "health"]);
         let mut out = Vec::<u8>::new();
         let mut err = Vec::<u8>::new();

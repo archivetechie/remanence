@@ -22,7 +22,8 @@ use remanence_parity::{
     TapeFileKind,
 };
 use remanence_state::{
-    AuditActor, AuditEvent, CatalogIndex, NativeObjectFileRecord, TapePoolConfig,
+    AuditActor, AuditEvent, AuditEventRecord, AuditSubject, CatalogIndex, FileAuditLog,
+    NativeObjectFileRecord, SourceLayer, TapePoolConfig,
 };
 use remanence_stream::StreamingError;
 use time::format_description::well_known::Rfc3339;
@@ -73,11 +74,17 @@ pub(crate) enum DriveCommand {
         pool_cfg: TapePoolConfig,
         selected: SelectedTape,
         needs_drive_load: bool,
+        library_serial: String,
+        drive_uuid: Option<Vec<u8>>,
+        drive_serial: Option<String>,
         reply: oneshot::Sender<Result<pb::WriteSession, Status>>,
     },
     OpenRead {
         tape_uuid: [u8; 16],
         needs_drive_load: bool,
+        library_serial: String,
+        drive_uuid: Option<Vec<u8>>,
+        drive_serial: Option<String>,
         reply: oneshot::Sender<Result<pb::ReadSession, Status>>,
     },
     Unload {
@@ -582,31 +589,47 @@ fn drive_loop(
                 pool_cfg,
                 selected,
                 needs_drive_load,
+                library_serial,
+                drive_uuid,
+                drive_serial,
                 reply,
             } => handle_drive_open_write(
                 bay,
                 &mut index,
+                &cfg,
                 &mut rx,
                 drive,
                 OpenWriteActorRequest {
                     pool_cfg,
                     selected,
                     needs_drive_load,
+                    library_serial,
+                    drive_uuid,
+                    drive_serial,
                     reply,
                 },
             ),
             DriveCommand::OpenRead {
                 tape_uuid,
                 needs_drive_load,
+                library_serial,
+                drive_uuid,
+                drive_serial,
                 reply,
             } => handle_drive_open_read(
                 bay,
                 &mut index,
+                &cfg,
                 &mut rx,
                 drive,
-                tape_uuid,
-                needs_drive_load,
-                reply,
+                OpenReadActorRequest {
+                    tape_uuid,
+                    needs_drive_load,
+                    library_serial,
+                    drive_uuid,
+                    drive_serial,
+                    reply,
+                },
             ),
             DriveCommand::Unload { reply } => {
                 let result = drive
@@ -675,7 +698,96 @@ struct OpenWriteActorRequest {
     pool_cfg: TapePoolConfig,
     selected: SelectedTape,
     needs_drive_load: bool,
+    library_serial: String,
+    drive_uuid: Option<Vec<u8>>,
+    drive_serial: Option<String>,
     reply: oneshot::Sender<Result<pb::WriteSession, Status>>,
+}
+
+struct OpenReadActorRequest {
+    tape_uuid: [u8; 16],
+    needs_drive_load: bool,
+    library_serial: String,
+    drive_uuid: Option<Vec<u8>>,
+    drive_serial: Option<String>,
+    reply: oneshot::Sender<Result<pb::ReadSession, Status>>,
+}
+
+struct SessionAuditInput {
+    session_id: Uuid,
+    session_kind: &'static str,
+    event: AuditEvent,
+    tape_uuid: Option<[u8; 16]>,
+    library_serial: Option<String>,
+    drive_bay: Option<u16>,
+    drive_uuid: Option<Vec<u8>>,
+    drive_serial: Option<String>,
+}
+
+fn record_session_event(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    input: SessionAuditInput,
+) -> Result<(), Status> {
+    let _guard = cfg
+        .audit_append_lock
+        .lock()
+        .map_err(|_| Status::internal("session audit append lock poisoned"))?;
+    std::fs::create_dir_all(cfg.audit_dir.as_path()).map_err(|err| {
+        Status::internal(format!(
+            "create session audit directory {}: {err}",
+            cfg.audit_dir.display()
+        ))
+    })?;
+    let mut detail = BTreeMap::new();
+    detail.insert(
+        "session_kind".to_string(),
+        CborValue::Text(input.session_kind.to_string()),
+    );
+    if let Some(tape_uuid) = input.tape_uuid {
+        detail.insert(
+            "tape_uuid".to_string(),
+            CborValue::Bytes(tape_uuid.to_vec()),
+        );
+    }
+    if let Some(library_serial) = input.library_serial {
+        detail.insert(
+            "library_serial".to_string(),
+            CborValue::Text(library_serial),
+        );
+    }
+    if let Some(drive_bay) = input.drive_bay {
+        detail.insert(
+            "drive_bay".to_string(),
+            CborValue::Integer(u64::from(drive_bay).into()),
+        );
+    }
+    if let Some(drive_uuid) = input.drive_uuid {
+        detail.insert("drive_uuid".to_string(), CborValue::Bytes(drive_uuid));
+    }
+    if let Some(drive_serial) = input.drive_serial {
+        detail.insert("drive_serial".to_string(), CborValue::Text(drive_serial));
+    }
+    let mut audit = FileAuditLog::open(cfg.audit_dir.as_path(), cfg.audit_fsync)
+        .map_err(crate::status_from_state_error)?;
+    let (_, record) = audit
+        .append_and_return_record(AuditEventRecord {
+            actor: AuditActor::System,
+            source_layer: SourceLayer::Layer5,
+            operation_id: None,
+            session_id: Some(input.session_id),
+            idempotency_key: None,
+            event: input.event,
+            subject: AuditSubject {
+                kind: input.session_kind.to_string(),
+                id: Some(input.session_id.to_string()),
+            },
+            detail,
+        })
+        .map_err(crate::status_from_state_error)?;
+    index
+        .project_audit_record(&record)
+        .map_err(crate::status_from_state_error)
 }
 
 /// Append gate for one write session: the first failed append poisons
@@ -715,6 +827,7 @@ impl SessionAppendGate {
 fn handle_drive_open_write(
     bay: u16,
     index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
     rx: &mut mpsc::Receiver<DriveCommand>,
     drive: &mut DriveHandle,
     request: OpenWriteActorRequest,
@@ -723,6 +836,9 @@ fn handle_drive_open_write(
         pool_cfg,
         selected,
         needs_drive_load,
+        library_serial,
+        drive_uuid,
+        drive_serial,
         reply,
     } = request;
     let actor_open_started = Instant::now();
@@ -763,6 +879,23 @@ fn handle_drive_open_write(
     let mut objects_committed = 0u64;
     let mut bytes_committed = 0u64;
     let mut last_checkpoint_at_utc = None;
+    if let Err(status) = record_session_event(
+        index,
+        cfg,
+        SessionAuditInput {
+            session_id,
+            session_kind: "write",
+            event: AuditEvent::SessionOpened,
+            tape_uuid: Some(tape_uuid),
+            library_serial: Some(library_serial.clone()),
+            drive_bay: Some(bay),
+            drive_uuid: drive_uuid.clone(),
+            drive_serial: drive_serial.clone(),
+        },
+    ) {
+        let _ = reply.send(Err(status));
+        return;
+    }
     let open_reply = session_proto(WriteSessionProtoInput {
         session_id,
         tape_uuid: &tape_uuid,
@@ -880,6 +1013,25 @@ fn handle_drive_open_write(
                 } else {
                     Err(Status::not_found("write session not found"))
                 };
+                if status.is_ok() {
+                    if let Err(err) = record_session_event(
+                        index,
+                        cfg,
+                        SessionAuditInput {
+                            session_id,
+                            session_kind: "write",
+                            event: AuditEvent::SessionClosed,
+                            tape_uuid: Some(tape_uuid),
+                            library_serial: Some(library_serial.clone()),
+                            drive_bay: Some(bay),
+                            drive_uuid: drive_uuid.clone(),
+                            drive_serial: drive_serial.clone(),
+                        },
+                    ) {
+                        let _ = reply.send(Err(err));
+                        continue;
+                    }
+                }
                 let _ = reply.send(status);
                 if requested == session_id {
                     break;
@@ -911,6 +1063,25 @@ fn handle_drive_open_write(
                 } else {
                     Err(Status::not_found("write session not found"))
                 };
+                if status.is_ok() {
+                    if let Err(err) = record_session_event(
+                        index,
+                        cfg,
+                        SessionAuditInput {
+                            session_id,
+                            session_kind: "write",
+                            event: AuditEvent::SessionClosed,
+                            tape_uuid: Some(tape_uuid),
+                            library_serial: Some(library_serial.clone()),
+                            drive_bay: Some(bay),
+                            drive_uuid: drive_uuid.clone(),
+                            drive_serial: drive_serial.clone(),
+                        },
+                    ) {
+                        let _ = reply.send(Err(err));
+                        continue;
+                    }
+                }
                 let _ = reply.send(status);
                 if requested == session_id {
                     break;
@@ -1035,12 +1206,20 @@ fn fixed_no_compression_config(current_cfg: TapeConfig, block_size: u32) -> Tape
 fn handle_drive_open_read(
     bay: u16,
     index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
     rx: &mut mpsc::Receiver<DriveCommand>,
     drive: &mut DriveHandle,
-    tape_uuid: [u8; 16],
-    needs_drive_load: bool,
-    reply: oneshot::Sender<Result<pb::ReadSession, Status>>,
+    request: OpenReadActorRequest,
 ) {
+    let OpenReadActorRequest {
+        tape_uuid,
+        needs_drive_load,
+        library_serial,
+        drive_uuid,
+        drive_serial,
+        reply,
+    } = request;
+
     if needs_drive_load {
         if let Err(err) = drive.load() {
             let _ = reply.send(Err(Status::internal(format!("load drive: {err}"))));
@@ -1054,6 +1233,23 @@ fn handle_drive_open_read(
 
     let session_id = Uuid::new_v4();
     let opened_at_utc = now_rfc3339().unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+    if let Err(status) = record_session_event(
+        index,
+        cfg,
+        SessionAuditInput {
+            session_id,
+            session_kind: "read",
+            event: AuditEvent::SessionOpened,
+            tape_uuid: Some(tape_uuid),
+            library_serial: Some(library_serial.clone()),
+            drive_bay: Some(bay),
+            drive_uuid: drive_uuid.clone(),
+            drive_serial: drive_serial.clone(),
+        },
+    ) {
+        let _ = reply.send(Err(status));
+        return;
+    }
     let open_reply = read_session_proto(
         session_id,
         &tape_uuid,
@@ -1165,6 +1361,25 @@ fn handle_drive_open_read(
                 } else {
                     Err(Status::not_found("read session not found"))
                 };
+                if status.is_ok() {
+                    if let Err(err) = record_session_event(
+                        index,
+                        cfg,
+                        SessionAuditInput {
+                            session_id,
+                            session_kind: "read",
+                            event: AuditEvent::SessionClosed,
+                            tape_uuid: Some(tape_uuid),
+                            library_serial: Some(library_serial.clone()),
+                            drive_bay: Some(bay),
+                            drive_uuid: drive_uuid.clone(),
+                            drive_serial: drive_serial.clone(),
+                        },
+                    ) {
+                        let _ = reply.send(Err(err));
+                        continue;
+                    }
+                }
                 let _ = reply.send(status);
                 if requested == session_id {
                     break;
