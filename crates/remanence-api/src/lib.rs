@@ -5,7 +5,7 @@
 //! `remanence-state::CatalogIndex`; read and write sessions dispatch to a
 //! hardware-backed changer/drive actor pool when the daemon enables writes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::ops::ControlFlow;
@@ -252,6 +252,7 @@ impl ApiState {
                 .map(|(bay, _)| (*bay, AtomicBool::new(false)))
                 .collect::<HashMap<_, _>>(),
         );
+        let managed_library_serials = drive_managed_library_serials(config);
         let base_cfg = crate::write_owner::WriteOwnerConfig {
             index_path: index_path.clone(),
             report: report.clone(),
@@ -265,6 +266,7 @@ impl ApiState {
                 .map(|serial| serial.as_str().to_string()),
             library_snapshot: library_snapshot.clone(),
             snapshot_miss_alarm: config.drives.snapshot_miss_alarm,
+            managed_library_serials: Arc::new(managed_library_serials),
         };
         let mut drive_txs = HashMap::new();
         for (bay_addr, drive) in opened_drives {
@@ -396,47 +398,12 @@ impl ApiState {
         config: &RemConfig,
         report: &remanence_library::DiscoveryReport,
     ) -> Result<(), Status> {
-        let configured_managed = config
-            .drives
-            .managed_libraries
-            .iter()
-            .map(|serial| serial.trim().to_string())
-            .filter(|serial| !serial.is_empty())
-            .collect::<std::collections::HashSet<_>>();
-        let daemon_libraries = config
-            .libraries
-            .iter()
-            .map(|library| library.serial.trim().to_string())
-            .filter(|serial| !serial.is_empty())
-            .collect::<std::collections::HashSet<_>>();
         let mut index = self.index_write()?;
-        for library in &report.libraries {
-            let managed = if configured_managed.is_empty() {
-                daemon_libraries.contains(&library.serial)
-            } else {
-                configured_managed.contains(&library.serial)
-            };
-            for bay in &library.drive_bays {
-                let Some(installed) = bay.installed.as_ref() else {
-                    continue;
-                };
-                index
-                    .observe_drive(remanence_state::DriveObservationInput {
-                        serial: installed.serial.clone(),
-                        identity_source: identity_source_name(installed.identity_source)
-                            .to_string(),
-                        vendor: installed.vendor.clone(),
-                        product: installed.product.clone(),
-                        firmware_rev: installed.revision.clone(),
-                        managed: if managed { "rem" } else { "foreign" }.to_string(),
-                        library_serial: Some(library.serial.clone()),
-                        element_address: Some(i64::from(bay.element_address)),
-                        observed_at_utc: None,
-                    })
-                    .map_err(status_from_state_error)?;
-            }
-        }
-        Ok(())
+        observe_drive_catalog_from_libraries(
+            &mut index,
+            report.libraries.iter(),
+            &drive_managed_library_serials(config),
+        )
     }
 
     fn record_request_received(
@@ -748,12 +715,13 @@ fn poll_foreign_drive_counters_once(
             if drive.managed != "foreign" || drive.state != "active" {
                 continue;
             }
+            let tape_alert_flags = snapshot.tape_alert_flags.clone();
             index
                 .record_drive_health_snapshot(DriveHealthSnapshotInput {
                     drive_uuid: drive.drive_uuid.clone(),
                     trigger: "foreign-counter".to_string(),
                     session_id: None,
-                    tape_alert_flags: snapshot.tape_alert_flags,
+                    tape_alert_flags,
                     write_errors_corrected: snapshot.write_errors_corrected.and_then(u64_to_i64),
                     write_errors_uncorrected: snapshot
                         .write_errors_uncorrected
@@ -765,6 +733,12 @@ fn poll_foreign_drive_counters_once(
                     ),
                     at_utc: None,
                 })
+                .map_err(|err| ForeignPollError::Permanent(err.to_string()))?;
+            index
+                .observe_foreign_drive_tapealert_advisory(
+                    &drive.drive_uuid,
+                    snapshot.tape_alert_flags.as_deref(),
+                )
                 .map_err(|err| ForeignPollError::Permanent(err.to_string()))?;
             index
                 .touch_drive_last_seen(&drive.drive_uuid)
@@ -2263,6 +2237,56 @@ fn identity_source_name(source: remanence_library::IdentitySource) -> &'static s
     }
 }
 
+pub(crate) fn drive_managed_library_serials(config: &RemConfig) -> HashSet<String> {
+    let configured = config
+        .drives
+        .managed_libraries
+        .iter()
+        .map(|serial| serial.trim().to_string())
+        .filter(|serial| !serial.is_empty())
+        .collect::<HashSet<_>>();
+    if !configured.is_empty() {
+        return configured;
+    }
+    config
+        .libraries
+        .iter()
+        .map(|library| library.serial.trim().to_string())
+        .filter(|serial| !serial.is_empty())
+        .collect()
+}
+
+pub(crate) fn observe_drive_catalog_from_libraries<'a>(
+    index: &mut CatalogIndex,
+    libraries: impl IntoIterator<Item = &'a remanence_library::Library>,
+    managed_library_serials: &HashSet<String>,
+) -> Result<(), Status> {
+    let observations = libraries
+        .into_iter()
+        .flat_map(|library| {
+            let managed = managed_library_serials.contains(library.serial.as_str());
+            library.drive_bays.iter().filter_map(move |bay| {
+                let installed = bay.installed.as_ref()?;
+                Some(remanence_state::DriveObservationInput {
+                    serial: installed.serial.clone(),
+                    identity_source: identity_source_name(installed.identity_source).to_string(),
+                    vendor: installed.vendor.clone(),
+                    product: installed.product.clone(),
+                    firmware_rev: installed.revision.clone(),
+                    managed: if managed { "rem" } else { "foreign" }.to_string(),
+                    library_serial: Some(library.serial.clone()),
+                    element_address: Some(i64::from(bay.element_address)),
+                    observed_at_utc: None,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    index
+        .observe_drive_inventory_snapshot(observations)
+        .map(|_| ())
+        .map_err(status_from_state_error)
+}
+
 pub(crate) fn actor_from_request<T>(request: &Request<T>) -> AuditActor {
     if let Some(certs) = request.peer_certs() {
         if let Some(cert) = certs.first() {
@@ -3173,7 +3197,7 @@ BCw3Wyv2UWY=
             assert_eq!(
                 role.allows(AuthPermission::Robotics),
                 robotics,
-                "{role:?} CleanDrive/AckAlarm/Robotics"
+                "{role:?} PollDrive/CleanDrive/AckAlarm/Robotics"
             );
             assert_eq!(
                 role.allows(AuthPermission::Lifecycle),
