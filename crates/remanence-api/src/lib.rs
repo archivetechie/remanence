@@ -589,6 +589,15 @@ impl ApiState {
             .filter(|run| !matches!(run.phase.as_str(), "done" | "failed" | "needs-operator"))
             .map(|run| run.drive_uuid)
             .collect::<HashSet<_>>();
+        let open_session_by_drive = index
+            .non_terminal_sessions()
+            .map_err(status_from_state_error)?
+            .into_iter()
+            .filter_map(|session| {
+                let drive_uuid = session.drive_uuid?;
+                Some((drive_uuid, session.session_id.as_bytes().to_vec()))
+            })
+            .collect::<HashMap<Vec<u8>, Vec<u8>>>();
 
         let mut libraries = Vec::new();
         for library in &snapshot.report.libraries {
@@ -614,6 +623,7 @@ impl ApiState {
                         drive,
                         &record,
                         active_clean_run_drive_uuids.contains(&record.drive_uuid),
+                        open_session_by_drive.get(&record.drive_uuid),
                     );
                 }
             }
@@ -661,6 +671,7 @@ impl ApiState {
         drive: &mut pb::Drive,
         record: &remanence_state::DriveRecord,
         cleaning_active: bool,
+        open_session_id: Option<&Vec<u8>>,
     ) {
         let drive_uuid = record.drive_uuid.clone();
         drive.drive_uuid = drive_uuid.clone();
@@ -696,7 +707,7 @@ impl ApiState {
             .unwrap_or_else(|| {
                 LiveStatusState::counter_epoch(self.daemon_epoch, drive_uuid.as_slice())
             });
-        drive.session_id = Vec::new();
+        drive.session_id = open_session_id.cloned().unwrap_or_default();
         drive.active_alert_names = if cleaning_active {
             vec!["cleaning".to_string()]
         } else {
