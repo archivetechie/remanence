@@ -43,8 +43,9 @@ pub use index::{
     NativeObjectRecord, OperationRecord, ProvisionTapeInput, RebuildReport,
     RebuildTapeJournalInput, RestartOperation, RestartSession, RetireDriveOutcome, RetireTapeInput,
     RetireTapeOutcome, TapeFileRecord, TapeJournalIndexInput, TapeJournalIndexReport,
-    TapePoolProjectionInput, TapePoolRecord, TapeRecord, OBJECT_COPY_REPRESENTATION_ENCRYPTED,
-    OBJECT_COPY_REPRESENTATION_PLAINTEXT, OBJECT_COPY_REPRESENTATION_UNKNOWN, SCHEMA_VERSION,
+    TapeKindFilter, TapePoolProjectionInput, TapePoolRecord, TapeRecord,
+    OBJECT_COPY_REPRESENTATION_ENCRYPTED, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+    OBJECT_COPY_REPRESENTATION_UNKNOWN, SCHEMA_VERSION,
 };
 pub use lock::StateLockGuard;
 pub use paths::StatePaths;

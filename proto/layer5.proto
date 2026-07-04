@@ -637,6 +637,7 @@ message ListTapesRequest {
   PageToken page_token = 2;
   uint32 page_size     = 3;
   string pool_id       = 4; // empty = all pools and unassigned tapes
+  string kind          = 5; // empty = all; explicit callers use "data" or "cleaning"
 }
 message ListTapesResponse { repeated Tape tapes = 1; PageToken next_page_token = 2; }
 
