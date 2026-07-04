@@ -28,20 +28,23 @@ pub use audit::{
 pub use config::{
     derive_tape_pool_from_voltag, load_config, parse_config_toml, validate_block_size,
     validate_config, validate_tape_pool_capacity_invariant, validate_trusted_volume_paths,
-    watermark_floor_bytes, AuditConfig, CacheConfig, DaemonConfig, DaemonTlsConfig, IndexConfig,
-    JournalConfig, LibraryConfig, PoolSelectionPolicyName, RemConfig, TapePoolConfig,
-    TapePoolRuleConfig, DEFAULT_TAPE_BLOCK_SIZE_BYTES,
+    watermark_floor_bytes, AuditConfig, CacheConfig, CleaningConfig, DaemonConfig, DaemonTlsConfig,
+    DrivesConfig, IndexConfig, JournalConfig, LibraryConfig, LiveStatusConfig,
+    PoolSelectionPolicyName, RemConfig, TapePoolConfig, TapePoolRuleConfig,
+    DEFAULT_TAPE_BLOCK_SIZE_BYTES,
 };
 pub use error::StateError;
 pub use index::{
-    AuditReplayReport, CatalogIndex, CatalogUnitFilter, CatalogUnitRecord,
-    ForeignArchiveProjectionInput, NativeObjectCopyProjectionInput, NativeObjectCopyRecord,
-    NativeObjectFileProjectionInput, NativeObjectFileRecord, NativeObjectProjectionInput,
-    NativeObjectRecord, OperationRecord, ProvisionTapeInput, RebuildReport,
-    RebuildTapeJournalInput, RestartOperation, RestartSession, RetireTapeInput, RetireTapeOutcome,
-    TapeFileRecord, TapeJournalIndexInput, TapeJournalIndexReport, TapePoolProjectionInput,
-    TapePoolRecord, TapeRecord, OBJECT_COPY_REPRESENTATION_ENCRYPTED,
-    OBJECT_COPY_REPRESENTATION_PLAINTEXT, OBJECT_COPY_REPRESENTATION_UNKNOWN, SCHEMA_VERSION,
+    AlarmRecord, AuditReplayReport, CatalogIndex, CatalogUnitFilter, CatalogUnitRecord,
+    DriveAnnotationInput, DriveEventRecord, DriveHealthSnapshotInput, DriveHealthSnapshotRecord,
+    DriveObservationInput, DriveObservationOutcome, DriveRecord, ForeignArchiveProjectionInput,
+    NativeObjectCopyProjectionInput, NativeObjectCopyRecord, NativeObjectFileProjectionInput,
+    NativeObjectFileRecord, NativeObjectProjectionInput, NativeObjectRecord, OperationRecord,
+    ProvisionTapeInput, RebuildReport, RebuildTapeJournalInput, RestartOperation, RestartSession,
+    RetireDriveOutcome, RetireTapeInput, RetireTapeOutcome, TapeFileRecord, TapeJournalIndexInput,
+    TapeJournalIndexReport, TapePoolProjectionInput, TapePoolRecord, TapeRecord,
+    OBJECT_COPY_REPRESENTATION_ENCRYPTED, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+    OBJECT_COPY_REPRESENTATION_UNKNOWN, SCHEMA_VERSION,
 };
 pub use lock::StateLockGuard;
 pub use paths::StatePaths;

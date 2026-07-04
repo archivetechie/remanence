@@ -159,6 +159,15 @@ service LibraryService {
   rpc ListLibraries     (google.protobuf.Empty)       returns (ListLibrariesResponse);
   rpc GetLibrary        (GetLibraryRequest)           returns (LibraryState);
   rpc RefreshInventory  (RefreshInventoryRequest)     returns (OperationRef);
+  rpc ListDrives        (ListDrivesRequest)           returns (ListDrivesResponse);
+  rpc GetDrive          (GetDriveRequest)             returns (DriveCatalogEntry);
+  rpc GetDriveHistory   (GetDriveHistoryRequest)      returns (GetDriveHistoryResponse);
+  rpc AnnotateDrive     (AnnotateDriveRequest)        returns (DriveCatalogEntry);
+  rpc RetireDrive       (RetireDriveRequest)          returns (RetireDriveResponse);
+  rpc CleanDrive        (CleanDriveRequest)           returns (OperationRef);
+  rpc ListAlarms        (ListAlarmsRequest)           returns (ListAlarmsResponse);
+  rpc AckAlarm          (AckAlarmRequest)             returns (Alarm);
+  rpc GetLiveStatus     (GetLiveStatusRequest)        returns (GetLiveStatusResponse);
 
   // State-changing ops. All return OperationRef; observe via Daemon.GetOperation
   // or Daemon.WatchOperation.
@@ -189,6 +198,7 @@ message LibraryState {
   repeated Slot  slots     = 3;
   repeated PortalSlot import_export_ports = 4;
   google.protobuf.Timestamp last_inventory_at = 5;
+  string managed           = 6; // "rem" or "foreign" for drive-stewardship views.
 }
 
 message Drive {
@@ -205,8 +215,165 @@ message Drive {
     DRIVE_STATUS_LOADED        = 2;
     DRIVE_STATUS_BUSY          = 3;
     DRIVE_STATUS_UNREACHABLE   = 4;
+    DRIVE_STATUS_CLEANING      = 5;
+    DRIVE_STATUS_FENCED        = 6;
   }
   Status status           = 7;
+  bytes  drive_uuid       = 8;
+  string cleaning_due     = 9;
+  bool   fenced           = 10;
+  uint64 lifetime_read_bytes = 11;
+  uint64 lifetime_write_bytes = 12;
+  uint64 counter_epoch    = 13;
+  bytes  session_id       = 14;
+  repeated string active_alert_names = 15;
+}
+
+message DriveCatalogEntry {
+  bytes drive_uuid = 1;
+  string serial = 2;
+  string identity_source = 3;
+  bool actionable = 4;
+  string vendor = 5;
+  string product = 6;
+  string firmware_rev = 7;
+  string managed = 8;
+  string state = 9;
+  string cleaning_due = 10;
+  bool fenced = 11;
+  google.protobuf.Timestamp first_seen_utc = 12;
+  google.protobuf.Timestamp last_seen_utc = 13;
+  string last_library_serial = 14;
+  uint32 last_element_address = 15;
+  string purchase_date = 16;
+  string warranty_until = 17;
+  string cost = 18;
+  string notes = 19;
+  google.protobuf.Timestamp retired_at_utc = 20;
+  string retire_reason = 21;
+}
+
+message DriveHistoryEvent {
+  uint64 event_id = 1;
+  bytes drive_uuid = 2;
+  string event_kind = 3;
+  google.protobuf.Timestamp at_utc = 4;
+  string library_serial = 5;
+  uint32 element_address = 6;
+  bytes tape_uuid = 7;
+  string detail = 8;
+}
+
+message DriveHealthSnapshot {
+  uint64 snapshot_id = 1;
+  bytes drive_uuid = 2;
+  google.protobuf.Timestamp at_utc = 3;
+  string trigger = 4;
+  string session_id = 5;
+  string tape_alert_flags = 6;
+  uint64 write_errors_corrected = 7;
+  uint64 write_errors_uncorrected = 8;
+  uint64 read_errors_corrected = 9;
+  uint64 read_errors_uncorrected = 10;
+  string raw_pages = 11;
+}
+
+message Alarm {
+  uint64 alarm_id = 1;
+  string condition_key = 2;
+  string kind = 3;
+  string severity = 4;
+  string state = 5;
+  google.protobuf.Timestamp first_seen_utc = 6;
+  google.protobuf.Timestamp last_seen_utc = 7;
+  string acked_by = 8;
+  google.protobuf.Timestamp acked_at_utc = 9;
+  string detail = 10;
+}
+
+message ListDrivesRequest {
+  bool include_foreign = 1;
+  bool include_retired = 2;
+  PageToken page_token = 3;
+  uint32 page_size = 4;
+}
+
+message ListDrivesResponse {
+  repeated DriveCatalogEntry drives = 1;
+  PageToken next_page_token = 2;
+}
+
+message GetDriveRequest {
+  string drive = 1; // drive UUID text or device-reported serial.
+}
+
+message GetDriveHistoryRequest {
+  string drive = 1; // drive UUID text or device-reported serial.
+  bool include_events = 2;
+  bool include_snapshots = 3;
+  PageToken page_token = 4;
+  uint32 page_size = 5;
+}
+
+message GetDriveHistoryResponse {
+  DriveCatalogEntry drive = 1;
+  repeated DriveHistoryEvent events = 2;
+  repeated DriveHealthSnapshot snapshots = 3;
+  PageToken next_page_token = 4;
+}
+
+message AnnotateDriveRequest {
+  bytes drive_uuid = 1;
+  string purchase_date = 2;
+  string warranty_until = 3;
+  string cost = 4;
+  string note = 5;
+  string notes_set = 6;
+  bool allow_derived_identity = 7;
+}
+
+message RetireDriveRequest {
+  bytes drive_uuid = 1;
+  string reason = 2;
+  bool i_understand_fleet_removal_is_permanent = 3;
+  bool allow_derived_identity = 4;
+}
+
+message RetireDriveResponse {
+  DriveCatalogEntry drive = 1;
+  bool newly_retired = 2;
+}
+
+message CleanDriveRequest {
+  bytes drive_uuid = 1;
+  bool allow_derived_identity = 2;
+  IdempotencyKey idempotency_key = 3;
+}
+
+message ListAlarmsRequest {
+  bool include_cleared = 1;
+  PageToken page_token = 2;
+  uint32 page_size = 3;
+}
+
+message ListAlarmsResponse {
+  repeated Alarm alarms = 1;
+  PageToken next_page_token = 2;
+}
+
+message AckAlarmRequest {
+  string condition_key = 1;
+  IdempotencyKey idempotency_key = 2;
+}
+
+message GetLiveStatusRequest {}
+
+message GetLiveStatusResponse {
+  repeated LibraryState libraries = 1;
+  repeated OperationRef operations = 2;
+  repeated Alarm alarms = 3;
+  string snapshot_at_utc = 4;
+  uint64 daemon_epoch = 5;
 }
 
 message Slot {
