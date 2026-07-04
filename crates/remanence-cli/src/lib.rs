@@ -1130,6 +1130,12 @@ enum DriveClientCommand {
         /// Drive serial or UUID.
         drive: String,
     },
+
+    /// Clean one drive now.
+    Clean {
+        /// Drive serial or UUID.
+        drive: String,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -3507,6 +3513,20 @@ fn run_drive_client_command(
                     print_drive_snapshot(snapshot, json_output, out)
                         .map_err(DaemonClientError::from)
                 }
+                DriveClientCommand::Clean { drive } => {
+                    let drive_uuid = resolve_drive_uuid_arg(&mut client, drive).await?;
+                    let operation = client
+                        .clean_drive(pb::CleanDriveRequest {
+                            drive_uuid,
+                            allow_derived_identity: false,
+                            idempotency_key: None,
+                        })
+                        .await
+                        .map_err(status_error)?
+                        .into_inner();
+                    print_operation_ref(operation, json_output, out)
+                        .map_err(DaemonClientError::from)
+                }
             }
         })
     });
@@ -3737,6 +3757,27 @@ fn print_operation(
         let _ = writeln!(out, "  error: {}", operation.error_summary);
     }
     Ok(())
+}
+
+fn print_operation_ref(
+    operation: pb::OperationRef,
+    json_output: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    if json_output {
+        let json = json!({
+            "operation_id": bytes_to_uuid_text(&operation.operation_id),
+        });
+        serde_json::to_writer(&mut *out, &json).map_err(|err| err.to_string())?;
+        writeln!(out).map_err(|err| err.to_string())?;
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "operation {}",
+        bytes_to_uuid_text(&operation.operation_id)
+    )
+    .map_err(|err| err.to_string())
 }
 
 fn print_operation_list(
