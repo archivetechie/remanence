@@ -253,6 +253,7 @@ async fn open_write_session_reserved(
             bay: mount.bay,
             home_slot: mount.home_slot,
             tape_uuid,
+            drive_uuid: mount.drive_uuid.clone(),
         },
     );
     drive_reservation.disarm();
@@ -339,6 +340,7 @@ async fn open_read_session_reserved(
             bay: mount.bay,
             home_slot: mount.home_slot,
             tape_uuid,
+            drive_uuid: mount.drive_uuid.clone(),
         },
     );
     drive_reservation.disarm();
@@ -372,9 +374,8 @@ pub(crate) async fn append_finish(
         .await
         .map_err(|_| Status::internal("drive actor dropped reply"))?
         .inspect(|record| {
-            if let Ok(Some(drive_uuid)) = state.drive_uuid_for_bay(mounted.bay) {
-                state.record_drive_write_bytes(drive_uuid.as_slice(), record.logical_size_bytes);
-            }
+            state
+                .record_drive_write_bytes(mounted.drive_uuid.as_deref(), record.logical_size_bytes);
         })
 }
 
