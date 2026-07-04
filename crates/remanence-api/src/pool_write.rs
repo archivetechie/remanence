@@ -11,6 +11,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use remanence_aead::{seal_to_vec, RaoMetadata, RootKey, SealOptions, SealReport};
@@ -652,6 +653,33 @@ pub fn write_to_selected_tape(
     request: WriteObjectToPoolRequest,
     selected: SelectedTape,
 ) -> Result<PoolWriteResult, PoolWriteError> {
+    write_to_selected_tape_with_live_counter(state, sink, pool_cfg, request, selected, None)
+}
+
+pub(crate) fn write_to_selected_tape_with_live_counter(
+    state: &mut CatalogIndex,
+    sink: &mut dyn BlockSink,
+    pool_cfg: &TapePoolConfig,
+    request: WriteObjectToPoolRequest,
+    selected: SelectedTape,
+    live_write_counter: Option<Arc<crate::DriveByteCounters>>,
+) -> Result<PoolWriteResult, PoolWriteError> {
+    match live_write_counter {
+        Some(counter) => {
+            let mut live_counted_sink = LiveCounterBlockSink::new(sink, counter);
+            write_to_selected_tape_inner(state, &mut live_counted_sink, pool_cfg, request, selected)
+        }
+        None => write_to_selected_tape_inner(state, sink, pool_cfg, request, selected),
+    }
+}
+
+fn write_to_selected_tape_inner<S: BlockSink + ?Sized>(
+    state: &mut CatalogIndex,
+    sink: &mut S,
+    pool_cfg: &TapePoolConfig,
+    request: WriteObjectToPoolRequest,
+    selected: SelectedTape,
+) -> Result<PoolWriteResult, PoolWriteError> {
     ensure_selected_tape_accepts_write(state, pool_cfg, &selected)?;
     let block_size = selected.block_size;
     let prepare_started = Instant::now();
@@ -685,6 +713,9 @@ pub fn write_to_selected_tape(
         crate::diagnostics::mib_per_s(payload_bytes, prepare_elapsed),
     );
 
+    // Only the hardware-backed tape transfer below is counted live. The spool
+    // write already finished in mount.rs, and parity/object replay only reads
+    // the prepared in-memory object.
     let mut counted_sink = CountingBlockSink::new(sink);
     let prepared_write = PreparedPoolWrite { prepared, stored };
     match selected.parity_config.clone() {
@@ -996,8 +1027,13 @@ impl BlockSinkStats {
     }
 }
 
-struct CountingBlockSink<'a> {
+pub(crate) struct LiveCounterBlockSink<'a> {
     inner: &'a mut dyn BlockSink,
+    live_write_counter: Arc<crate::DriveByteCounters>,
+}
+
+struct CountingBlockSink<'a, S: BlockSink + ?Sized> {
+    inner: &'a mut S,
     stats: BlockSinkStats,
 }
 
@@ -1038,8 +1074,20 @@ impl<S: BlockSink + ?Sized> BlockSink for ObjectDigestBlockSink<'_, S> {
     }
 }
 
-impl<'a> CountingBlockSink<'a> {
-    fn new(inner: &'a mut dyn BlockSink) -> Self {
+impl<'a> LiveCounterBlockSink<'a> {
+    pub(crate) fn new(
+        inner: &'a mut dyn BlockSink,
+        live_write_counter: Arc<crate::DriveByteCounters>,
+    ) -> Self {
+        Self {
+            inner,
+            live_write_counter,
+        }
+    }
+}
+
+impl<'a, S: BlockSink + ?Sized> CountingBlockSink<'a, S> {
+    fn new(inner: &'a mut S) -> Self {
         Self {
             inner,
             stats: BlockSinkStats::default(),
@@ -1051,7 +1099,24 @@ impl<'a> CountingBlockSink<'a> {
     }
 }
 
-impl BlockSink for CountingBlockSink<'_> {
+impl<'a> BlockSink for LiveCounterBlockSink<'a> {
+    fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
+        let outcome = self.inner.write_block(buf)?;
+        self.live_write_counter
+            .record_write_bytes(u64::from(outcome.bytes_written));
+        Ok(outcome)
+    }
+
+    fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
+        self.inner.write_filemarks(count)
+    }
+
+    fn position(&mut self) -> Result<TapePosition, TapeIoError> {
+        self.inner.position()
+    }
+}
+
+impl<'a, S: BlockSink + ?Sized> BlockSink for CountingBlockSink<'a, S> {
     fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
         let outcome = self.inner.write_block(buf)?;
         self.stats
@@ -1072,9 +1137,9 @@ impl BlockSink for CountingBlockSink<'_> {
     }
 }
 
-fn write_parity_object_to_selected_tape(
+fn write_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
     state: &mut CatalogIndex,
-    sink: &mut CountingBlockSink<'_>,
+    sink: &mut CountingBlockSink<'_, S>,
     pool_cfg: &TapePoolConfig,
     request: WriteObjectToPoolRequest,
     selected: SelectedTape,
@@ -1191,9 +1256,9 @@ fn write_parity_object_to_selected_tape(
     ))
 }
 
-fn write_no_parity_object_to_selected_tape(
+fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
     state: &mut CatalogIndex,
-    sink: &mut CountingBlockSink<'_>,
+    sink: &mut CountingBlockSink<'_, S>,
     pool_cfg: &TapePoolConfig,
     request: WriteObjectToPoolRequest,
     selected: SelectedTape,
@@ -2560,6 +2625,102 @@ mod tests {
         let mut stats = BlockSinkStats::default();
         stats.record_position(tape_position_with_warning(true));
         assert!(stats.early_warning);
+    }
+
+    #[test]
+    fn live_write_counter_advances_during_transfer() {
+        let counter = Arc::new(crate::DriveByteCounters::new(0));
+        let mut sink = VecBlockSink::new();
+        let mut live_sink = LiveCounterBlockSink::new(&mut sink, Arc::clone(&counter));
+
+        let first = live_sink.write_block(b"abc").expect("first write");
+        assert_eq!(first.bytes_written, 3);
+        assert_eq!(counter.write_bytes(), 3);
+        assert!(counter.write_bytes() > 0);
+        assert!(counter.write_bytes() < 8);
+
+        live_sink.write_filemarks(1).expect("filemark write");
+        assert_eq!(counter.write_bytes(), 3);
+
+        let second = live_sink.write_block(b"defgh").expect("second write");
+        assert_eq!(second.bytes_written, 5);
+        assert_eq!(counter.write_bytes(), 8);
+    }
+
+    #[test]
+    fn append_finish_does_not_double_count() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-pool-write-live-counter")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        let mut index = CatalogIndex::open(&index_path).expect("open test index");
+        let pool_id = "camera.copy-a";
+        let tape_uuid = [4u8; 16];
+        index
+            .upsert_tape_pool_projection(remanence_state::TapePoolProjectionInput {
+                pool_id: pool_id.to_string(),
+                display_name: None,
+                copy_class: Some("copy-a".to_string()),
+                content_class: Some("camera".to_string()),
+                created_at_utc: None,
+            })
+            .expect("project pool");
+        index
+            .provision_tape(remanence_state::ProvisionTapeInput {
+                tape_uuid,
+                voltag: "RMN001L1".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        index
+            .project_tape_pool_membership(tape_uuid, pool_id)
+            .expect("project tape membership");
+        let cfg = TapePoolConfig {
+            id: pool_id.to_string(),
+            display_name: None,
+            copy_class: Some("copy-a".to_string()),
+            content_class: Some("camera".to_string()),
+            selection_policy: Default::default(),
+            watermark_low: 0.0001,
+            watermark_high: 1.0,
+            block_size_bytes: 4096,
+            min_object_size_bytes: 0,
+        };
+        let selected = select_tape_in_pool(&index, &cfg, 6, &HashSet::new()).expect("select tape");
+
+        let payload_path = temp.path().join("payload.bin");
+        std::fs::write(&payload_path, b"abcdef").expect("write payload");
+        let request = WriteObjectToPoolRequest {
+            pool_id: pool_id.to_string(),
+            source_path: payload_path.clone(),
+            archive_path: PathBuf::from("payload.bin"),
+            caller_object_id: "caller-object".to_string(),
+            expected_content_sha256: None,
+            representation: PoolWriteRepresentation::Plaintext,
+        };
+        let counter = Arc::new(crate::DriveByteCounters::new(0));
+        let mut sink = VecBlockSink::new();
+        let result = write_to_selected_tape_with_live_counter(
+            &mut index,
+            &mut sink,
+            &cfg,
+            request,
+            selected,
+            Some(counter.clone()),
+        )
+        .expect("write object");
+
+        let physical_bytes = sink
+            .blocks
+            .iter()
+            .map(|block| block.len() as u64)
+            .sum::<u64>();
+        assert!(physical_bytes > 0);
+        assert_eq!(counter.write_bytes(), physical_bytes);
+        assert_eq!(result.object.logical_size_bytes, 6);
     }
 
     #[test]

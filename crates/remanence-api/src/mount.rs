@@ -358,6 +358,10 @@ pub(crate) async fn append_finish(
     let pool = state.drive_pool()?.clone();
     let mounted = pool.session(session_id)?;
     let drive = pool.drive_tx(mounted.bay)?;
+    let live_write_counter = mounted
+        .drive_uuid
+        .as_deref()
+        .map(|drive_uuid| state.drive_counters(drive_uuid));
     let (reply_tx, reply_rx) = oneshot::channel();
     drive
         .send(crate::write_owner::DriveCommand::AppendFinish {
@@ -366,6 +370,7 @@ pub(crate) async fn append_finish(
             archive_path,
             caller_object_id,
             expected_content_sha256,
+            live_write_counter,
             reply: reply_tx,
         })
         .await
@@ -373,10 +378,6 @@ pub(crate) async fn append_finish(
     reply_rx
         .await
         .map_err(|_| Status::internal("drive actor dropped reply"))?
-        .inspect(|record| {
-            state
-                .record_drive_write_bytes(mounted.drive_uuid.as_deref(), record.logical_size_bytes);
-        })
 }
 
 pub(crate) async fn get_write_session(
