@@ -33,7 +33,8 @@ in the M1 prompt.
    event ticker, poll-rate keys.
 4. **`rem top --once --json`:** emits `rem.top.v1` (contract §7);
    daemon-unreachable prints the banner pointing at `rem library` and
-   exits 2.
+   exits 1 (correction: 2 is reserved for library-not-found per the CLI
+   exit convention; uniform op-error = 1).
 
 ## Out of scope
 
