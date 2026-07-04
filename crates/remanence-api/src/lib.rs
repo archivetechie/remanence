@@ -98,7 +98,7 @@ type BytesChunkStream =
 struct CountingBytesStream {
     inner: BytesChunkStream,
     state: ApiState,
-    drive_uuid: Vec<u8>,
+    drive_uuid: Option<Vec<u8>>,
 }
 
 impl Stream for CountingBytesStream {
@@ -111,7 +111,7 @@ impl Stream for CountingBytesStream {
         match self.inner.as_mut().poll_next(cx) {
             std::task::Poll::Ready(Some(Ok(chunk))) => {
                 self.state
-                    .record_drive_read_bytes(&self.drive_uuid, chunk.data.len() as u64);
+                    .record_drive_read_bytes(self.drive_uuid.as_deref(), chunk.data.len() as u64);
                 std::task::Poll::Ready(Some(Ok(chunk)))
             }
             other => other,
@@ -477,6 +477,7 @@ impl ApiState {
             .unwrap_or_default()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn drive_uuid_for_bay(&self, bay: u16) -> Result<Option<Vec<u8>>, Status> {
         let library_serial = if let Some(serial) = self.default_library_serial.as_deref() {
             serial.to_string()
@@ -540,14 +541,29 @@ impl ApiState {
             .get_or_create_counters(self.daemon_epoch, drive_uuid)
     }
 
-    pub(crate) fn record_drive_read_bytes(&self, drive_uuid: &[u8], bytes: u64) {
+    fn record_drive_bytes(&self, drive_uuid: Option<&[u8]>, bytes: u64, kind: &'static str) {
+        let Some(drive_uuid) = drive_uuid.filter(|drive_uuid| !drive_uuid.is_empty()) else {
+            tracing::warn!(kind, bytes, "skipping byte accounting for unresolved drive");
+            return;
+        };
         let counters = self.drive_counters(drive_uuid);
-        counters.read_bytes.fetch_add(bytes, Ordering::Relaxed);
+        match kind {
+            "read" => {
+                counters.read_bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
+            "write" => {
+                counters.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
+            _ => unreachable!("byte-accounting kind must be read or write"),
+        }
     }
 
-    pub(crate) fn record_drive_write_bytes(&self, drive_uuid: &[u8], bytes: u64) {
-        let counters = self.drive_counters(drive_uuid);
-        counters.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+    pub(crate) fn record_drive_read_bytes(&self, drive_uuid: Option<&[u8]>, bytes: u64) {
+        self.record_drive_bytes(drive_uuid, bytes, "read");
+    }
+
+    pub(crate) fn record_drive_write_bytes(&self, drive_uuid: Option<&[u8]>, bytes: u64) {
+        self.record_drive_bytes(drive_uuid, bytes, "write");
     }
 
     async fn live_status_response(&self) -> Result<pb::GetLiveStatusResponse, Status> {
@@ -2286,7 +2302,7 @@ impl ReadSessionApi {
         let drive_uuid = {
             let pool = state.drive_pool()?.clone();
             let mounted = pool.session(session_id)?;
-            state.drive_uuid_for_bay(mounted.bay)?.unwrap_or_default()
+            mounted.drive_uuid.clone()
         };
         Ok(Box::pin(CountingBytesStream {
             inner: Box::pin(ReceiverStream::new(chunk_rx)),
@@ -2326,7 +2342,7 @@ impl ReadSessionApi {
         let drive_uuid = {
             let pool = state.drive_pool()?.clone();
             let mounted = pool.session(session_id)?;
-            state.drive_uuid_for_bay(mounted.bay)?.unwrap_or_default()
+            mounted.drive_uuid.clone()
         };
         Ok(Box::pin(CountingBytesStream {
             inner: Box::pin(ReceiverStream::new(chunk_rx)),
@@ -3353,6 +3369,9 @@ fn alarm_record_to_proto(record: remanence_state::AlarmRecord) -> pb::Alarm {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashSet};
+    use std::fmt;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::sync::{Arc, Mutex};
 
     use ciborium::value::Value as CborValue;
     use remanence_aead::RootKey;
@@ -3382,6 +3401,11 @@ mod tests {
     use remanence_stream::{restore_object_to_directory, FilesystemRestoreOptions};
     use sha2::{Digest, Sha256};
     use tokio_stream::StreamExt;
+    use tracing::dispatcher::Dispatch;
+    use tracing::field::{Field, Visit};
+    use tracing::metadata::LevelFilter;
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Subscriber};
 
     use super::*;
 
@@ -3427,6 +3451,104 @@ mod tests {
     const ST_SIZE_OFFSET: usize = 0x1B8;
     #[cfg(feature = "foreign-bru")]
     const S_IFREG: u64 = 0x8000;
+
+    struct WarningCaptureSubscriber {
+        messages: Arc<Mutex<Vec<String>>>,
+        next_span_id: AtomicU64,
+    }
+
+    impl WarningCaptureSubscriber {
+        fn new(messages: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                messages,
+                next_span_id: AtomicU64::new(1),
+            }
+        }
+    }
+
+    struct WarningMessageVisitor {
+        message: Option<String>,
+    }
+
+    impl WarningMessageVisitor {
+        fn new() -> Self {
+            Self { message: None }
+        }
+    }
+
+    impl Visit for WarningMessageVisitor {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "message" {
+                self.message = Some(value.to_string());
+            }
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            if field.name() == "message" {
+                self.message = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl Subscriber for WarningCaptureSubscriber {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _attrs: &Attributes<'_>) -> Id {
+            Id::from_u64(self.next_span_id.fetch_add(1, AtomicOrdering::Relaxed))
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            if *event.metadata().level() > tracing::Level::WARN {
+                return;
+            }
+            let mut visitor = WarningMessageVisitor::new();
+            event.record(&mut visitor);
+            if let Some(message) = visitor.message {
+                self.messages
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .push(message);
+            }
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+
+        fn register_callsite(
+            &self,
+            metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            if *metadata.level() <= tracing::Level::WARN {
+                tracing::subscriber::Interest::always()
+            } else {
+                tracing::subscriber::Interest::never()
+            }
+        }
+
+        fn max_level_hint(&self) -> Option<LevelFilter> {
+            Some(LevelFilter::WARN)
+        }
+    }
+
+    fn capture_warnings<F>(f: F) -> Vec<String>
+    where
+        F: FnOnce(),
+    {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = WarningCaptureSubscriber::new(Arc::clone(&messages));
+        tracing::dispatcher::with_default(&Dispatch::new(subscriber), f);
+        Arc::try_unwrap(messages)
+            .expect("warning capture has one owner")
+            .into_inner()
+            .expect("warning capture mutex not poisoned")
+    }
 
     fn test_index() -> CatalogIndex {
         let dir = std::env::temp_dir().join(format!("remanence-api-{}", Uuid::new_v4()));
@@ -6456,6 +6578,7 @@ BCw3Wyv2UWY=
                 bay: 0x0101,
                 home_slot: Some(0x1001),
                 tape_uuid: TAPE_UUID,
+                drive_uuid: Some(Uuid::new_v4().as_bytes().to_vec()),
             },
         );
 
@@ -6463,6 +6586,92 @@ BCw3Wyv2UWY=
         assert!(pool.mounted_tape_uuids().contains(&TAPE_UUID));
         pool.forget_session(session_id);
         assert!(!pool.is_tape_mounted(&TAPE_UUID));
+    }
+
+    #[tokio::test]
+    async fn drive_byte_accounting_uses_session_drive_uuid_for_shared_bay() {
+        let state = ApiState::new(test_index());
+        let shared_bay = 0x0101;
+        let session_a = crate::write_owner::MountedSession {
+            bay: shared_bay,
+            home_slot: None,
+            tape_uuid: TAPE_UUID,
+            drive_uuid: Some(Uuid::from_u128(0x1111).as_bytes().to_vec()),
+        };
+        let session_b = crate::write_owner::MountedSession {
+            bay: shared_bay,
+            home_slot: None,
+            tape_uuid: TAPE_UUID,
+            drive_uuid: Some(Uuid::from_u128(0x2222).as_bytes().to_vec()),
+        };
+        let mut read_a = CountingBytesStream {
+            inner: Box::pin(tokio_stream::iter(vec![Ok(pb::BytesChunk {
+                data: b"abc".to_vec(),
+                is_last: true,
+            })])),
+            state: state.clone(),
+            drive_uuid: session_a.drive_uuid.clone(),
+        };
+        let mut read_b = CountingBytesStream {
+            inner: Box::pin(tokio_stream::iter(vec![Ok(pb::BytesChunk {
+                data: b"defgh".to_vec(),
+                is_last: true,
+            })])),
+            state: state.clone(),
+            drive_uuid: session_b.drive_uuid.clone(),
+        };
+
+        assert_eq!(session_a.bay, session_b.bay);
+        assert!(read_a.next().await.is_some());
+        assert!(read_b.next().await.is_some());
+        state.record_drive_write_bytes(session_b.drive_uuid.as_deref(), 7);
+
+        let counters = state
+            .live_status
+            .drive_counters
+            .read()
+            .unwrap_or_else(|err| err.into_inner());
+        assert_eq!(counters.len(), 2);
+        let a = counters
+            .get(
+                session_a
+                    .drive_uuid
+                    .as_deref()
+                    .expect("session A drive uuid"),
+            )
+            .expect("session A counter");
+        let b = counters
+            .get(
+                session_b
+                    .drive_uuid
+                    .as_deref()
+                    .expect("session B drive uuid"),
+            )
+            .expect("session B counter");
+        assert_eq!(a.read_bytes.load(AtomicOrdering::Relaxed), 3);
+        assert_eq!(a.write_bytes.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(b.read_bytes.load(AtomicOrdering::Relaxed), 5);
+        assert_eq!(b.write_bytes.load(AtomicOrdering::Relaxed), 7);
+    }
+
+    #[test]
+    fn drive_byte_accounting_skips_unresolvable_drive_and_warns() {
+        let state = ApiState::new(test_index());
+        let warnings = capture_warnings(|| {
+            state.record_drive_read_bytes(None, 512);
+            state.record_drive_write_bytes(Some(&[]), 1024);
+        });
+
+        let counters = state
+            .live_status
+            .drive_counters
+            .read()
+            .unwrap_or_else(|err| err.into_inner());
+        assert!(counters.is_empty());
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings
+            .iter()
+            .all(|message| message.contains("skipping byte accounting for unresolved drive")));
     }
 
     #[test]
@@ -6837,6 +7046,7 @@ BCw3Wyv2UWY=
                 bay: 0x0101,
                 home_slot: None,
                 tape_uuid: TAPE_UUID,
+                drive_uuid: Some(Uuid::new_v4().as_bytes().to_vec()),
             },
         );
         let mut state = populated_state();
@@ -6923,6 +7133,7 @@ BCw3Wyv2UWY=
                 bay: 0x0101,
                 home_slot: None,
                 tape_uuid: TAPE_UUID,
+                drive_uuid: Some(Uuid::new_v4().as_bytes().to_vec()),
             },
         );
         let mut state = populated_state();
@@ -7005,6 +7216,7 @@ BCw3Wyv2UWY=
                 bay: 0x0101,
                 home_slot: None,
                 tape_uuid: TAPE_UUID,
+                drive_uuid: Some(Uuid::new_v4().as_bytes().to_vec()),
             },
         );
         let mut state = populated_state();
@@ -7091,6 +7303,7 @@ BCw3Wyv2UWY=
                 bay: 0x0101,
                 home_slot: None,
                 tape_uuid: TAPE_UUID,
+                drive_uuid: Some(Uuid::new_v4().as_bytes().to_vec()),
             },
         );
         let mut state = populated_state();

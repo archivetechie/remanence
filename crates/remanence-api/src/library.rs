@@ -1532,8 +1532,8 @@ mod tests {
             .expect("raise alarm");
         let mut state = state_with_snapshot();
         state.index_path = Arc::new(index.path().to_path_buf());
-        state.record_drive_read_bytes(drive_uuid.as_slice(), 1_024);
-        state.record_drive_write_bytes(drive_uuid.as_slice(), 2_048);
+        state.record_drive_read_bytes(Some(drive_uuid.as_slice()), 1_024);
+        state.record_drive_write_bytes(Some(drive_uuid.as_slice()), 2_048);
 
         let response = state
             .library_service()
@@ -1586,7 +1586,7 @@ mod tests {
 
         let mut first = state_with_snapshot();
         first.index_path = Arc::new(index.path().to_path_buf());
-        first.record_drive_read_bytes(drive_uuid.as_slice(), 1);
+        first.record_drive_read_bytes(Some(drive_uuid.as_slice()), 1);
         let first_epoch = first
             .library_service()
             .get_live_status(Request::new(pb::GetLiveStatusRequest {}))

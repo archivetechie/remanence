@@ -54,6 +54,45 @@ struct TopState {
 }
 
 #[cfg(feature = "tui")]
+#[derive(Debug, Default)]
+struct TerminalCleanupGuard {
+    raw_mode_enabled: bool,
+    alternate_screen_entered: bool,
+}
+
+#[cfg(feature = "tui")]
+impl TerminalCleanupGuard {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn mark_raw_mode_enabled(&mut self) {
+        self.raw_mode_enabled = true;
+    }
+
+    fn mark_alternate_screen_entered(&mut self) {
+        self.alternate_screen_entered = true;
+    }
+
+    #[cfg(test)]
+    fn needs_cleanup(&self) -> bool {
+        self.raw_mode_enabled || self.alternate_screen_entered
+    }
+}
+
+#[cfg(feature = "tui")]
+impl Drop for TerminalCleanupGuard {
+    fn drop(&mut self) {
+        if self.alternate_screen_entered {
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        }
+        if self.raw_mode_enabled {
+            let _ = disable_raw_mode();
+        }
+    }
+}
+
+#[cfg(feature = "tui")]
 pub(crate) fn run_top_tui(
     endpoint: &str,
     _out: &mut dyn Write,
@@ -73,22 +112,20 @@ pub(crate) fn run_top_tui(
                 ..Default::default()
             };
 
+            let mut cleanup_guard = TerminalCleanupGuard::new();
             enable_raw_mode().map_err(|error| {
                 crate::DaemonClientError::client(format!("enable raw mode: {error}"))
             })?;
+            cleanup_guard.mark_raw_mode_enabled();
             let mut stdout = io::stdout();
             execute!(stdout, EnterAlternateScreen).map_err(|error| {
                 crate::DaemonClientError::client(format!("enter alternate screen: {error}"))
             })?;
+            cleanup_guard.mark_alternate_screen_entered();
             let backend = CrosstermBackend::new(stdout);
             let mut terminal = Terminal::new(backend).map_err(|error| {
                 crate::DaemonClientError::client(format!("create terminal: {error}"))
             })?;
-
-            let cleanup = || {
-                let _ = disable_raw_mode();
-                let _ = execute!(io::stdout(), LeaveAlternateScreen);
-            };
 
             let loop_result = async {
                 loop {
@@ -137,8 +174,6 @@ pub(crate) fn run_top_tui(
                 Ok::<(), crate::DaemonClientError>(())
             }
             .await;
-
-            cleanup();
             loop_result
         })
     });
@@ -164,17 +199,14 @@ async fn refresh_top_state(
             page_token: None,
             page_size: 0,
             pool_id: String::new(),
-            kind: String::new(),
+            kind: "all".to_string(),
         })
         .await
         .map_err(status_error)?
         .into_inner()
         .tapes;
 
-    let mut tape_voltags = HashMap::new();
-    for tape in tapes {
-        tape_voltags.insert(tape.tape_uuid, tape.voltag);
-    }
+    let tape_voltags = tape_voltags_from_tapes(tapes);
     update_drive_rates(state, &live);
     if state.selected_library >= live.libraries.len() {
         state.selected_library = 0;
@@ -182,6 +214,14 @@ async fn refresh_top_state(
     state.tape_voltags = tape_voltags;
     state.live = Some(live);
     Ok(())
+}
+
+#[cfg(feature = "tui")]
+fn tape_voltags_from_tapes(tapes: impl IntoIterator<Item = pb::Tape>) -> HashMap<Vec<u8>, String> {
+    tapes
+        .into_iter()
+        .map(|tape| (tape.tape_uuid, tape.voltag))
+        .collect()
 }
 
 #[cfg(feature = "tui")]
@@ -543,7 +583,20 @@ mod tests {
         };
         state
             .tape_voltags
-            .insert(Uuid::from_u128(2).as_bytes().to_vec(), "CLN001".to_string());
+            .extend(tape_voltags_from_tapes(vec![pb::Tape {
+                tape_uuid: Uuid::from_u128(2).as_bytes().to_vec(),
+                voltag: "CLN001".to_string(),
+                body_format: String::new(),
+                block_size_bytes: 0,
+                data_blocks_per_stripe: 0,
+                parity_blocks_per_stripe: 0,
+                stripes_per_neighborhood: 0,
+                last_committed_tape_file: 0,
+                state: 0,
+                updated_at: None,
+                pool_id: String::new(),
+                correlation_rollups: Vec::new(),
+            }]));
         terminal
             .draw(|frame| render_top(frame, &state))
             .expect("draw");
@@ -557,6 +610,39 @@ mod tests {
         assert!(text.contains("tape voltag"));
         assert!(text.contains("DRV-01"));
         assert!(text.contains("CLN001"));
+    }
+
+    #[test]
+    fn cleaning_tape_voltags_are_kept_for_label_lookup() {
+        let map = tape_voltags_from_tapes(vec![pb::Tape {
+            tape_uuid: Uuid::from_u128(2).as_bytes().to_vec(),
+            voltag: "CLN001".to_string(),
+            body_format: String::new(),
+            block_size_bytes: 0,
+            data_blocks_per_stripe: 0,
+            parity_blocks_per_stripe: 0,
+            stripes_per_neighborhood: 0,
+            last_committed_tape_file: 0,
+            state: 0,
+            updated_at: None,
+            pool_id: String::new(),
+            correlation_rollups: Vec::new(),
+        }]);
+
+        assert_eq!(
+            map.get(Uuid::from_u128(2).as_bytes().as_slice()),
+            Some(&"CLN001".to_string())
+        );
+    }
+
+    #[test]
+    fn terminal_cleanup_guard_tracks_entered_modes() {
+        let mut guard = TerminalCleanupGuard::new();
+        assert!(!guard.needs_cleanup());
+        guard.mark_raw_mode_enabled();
+        assert!(guard.needs_cleanup());
+        guard.mark_alternate_screen_entered();
+        assert!(guard.needs_cleanup());
     }
 
     #[test]
