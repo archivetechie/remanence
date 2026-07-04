@@ -1,0 +1,23 @@
+[package]
+name = "remfield-io"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Field-test daemon I/O helper for Remanence"
+license = "AGPL-3.0-or-later"
+
+[workspace]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+remanence-api = { path = "../../../crates/remanence-api" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tonic = "=0.14.5"
+uuid = { version = "1", features = ["v4"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
