@@ -670,14 +670,15 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::PollDriveRequest>,
     ) -> Result<Response<pb::DriveHealthSnapshot>, Status> {
-        crate::authorize_request(&request, crate::AuthPermission::Read)?;
-        let selector = request.into_inner().drive;
+        crate::authorize_request(&request, crate::AuthPermission::Robotics)?;
+        let request = request.into_inner();
         let drive = self
             .state
             .index()?
-            .get_drive_by_selector(selector.as_str())
+            .get_drive_by_selector(request.drive.as_str())
             .map_err(crate::status_from_state_error)?
             .ok_or_else(|| Status::not_found("drive not found"))?;
+        ensure_mutable_drive(&drive, request.allow_derived_identity)?;
         if drive.managed != "rem" {
             return Err(Status::failed_precondition(
                 "manual drive poll is only available for managed drives",
@@ -873,7 +874,7 @@ mod tests {
         DiscoveryReport, DriveBay, ElementLayout, IdentitySource, IePort, InstalledDrive, Library,
         Slot,
     };
-    use remanence_state::DriveObservationInput;
+    use remanence_state::{DriveObservationInput, FileAuditLog};
 
     use super::*;
     use crate::pb::library_service_server::LibraryService as _;
@@ -1292,6 +1293,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_drive_requires_robotics_permission_before_drive_pool_lookup() {
+        let mut index = test_index();
+        observe_test_drive(&mut index, "DRV-POLL", "DvcidAndInquiry", 0x0100);
+        let mut request = Request::new(pb::PollDriveRequest {
+            drive: "DRV-POLL".to_string(),
+            allow_derived_identity: false,
+        });
+        request
+            .metadata_mut()
+            .insert("x-remanence-role", "readonly".parse().unwrap());
+
+        let err = ApiState::new(index)
+            .library_service()
+            .poll_drive(request)
+            .await
+            .expect_err("readonly role must not poll drive health");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn poll_drive_rejects_derived_identity_without_opt_in() {
+        let mut index = test_index();
+        observe_test_drive(&mut index, "DRV-POLL-DERIVED", "Derived", 0x0100);
+
+        let err = ApiState::new(index)
+            .library_service()
+            .poll_drive(Request::new(pb::PollDriveRequest {
+                drive: "DRV-POLL-DERIVED".to_string(),
+                allow_derived_identity: false,
+            }))
+            .await
+            .expect_err("derived identity must reject before drive pool lookup");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("Derived"));
+    }
+
+    #[tokio::test]
     async fn retire_drive_rejects_missing_ack_before_lookup() {
         let err = ApiState::new(test_index())
             .library_service()
@@ -1350,6 +1388,40 @@ mod tests {
             .expect_err("busy bay must reject retire");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("active session"));
+    }
+
+    #[tokio::test]
+    async fn ack_alarm_rejects_cleared_alarm_without_audit_event() {
+        let mut index = test_index();
+        index
+            .raise_alarm("no-cln-cart:mainlib", "no-cln-cart", "critical", Some("{}"))
+            .expect("raise alarm");
+        index
+            .clear_alarm("no-cln-cart:mainlib")
+            .expect("clear alarm")
+            .expect("cleared row");
+        let state = ApiState::new(index);
+
+        let err = state
+            .library_service()
+            .ack_alarm(Request::new(pb::AckAlarmRequest {
+                condition_key: "no-cln-cart:mainlib".to_string(),
+                idempotency_key: None,
+            }))
+            .await
+            .expect_err("cleared alarm must not ack");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        let audit_records = if state.audit_dir.exists() {
+            FileAuditLog::replay(state.audit_dir.as_ref()).expect("replay audit")
+        } else {
+            Vec::new()
+        };
+        assert!(
+            audit_records
+                .iter()
+                .all(|record| record.event != remanence_state::AuditEvent::AlarmAcked),
+            "cleared alarm ack must not append AlarmAcked audit: {audit_records:?}"
+        );
     }
 
     #[tokio::test]

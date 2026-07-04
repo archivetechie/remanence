@@ -363,6 +363,7 @@ message RetireDriveResponse {
 
 message PollDriveRequest {
   string drive = 1; // drive UUID text or device-reported serial.
+  bool allow_derived_identity = 2;
 }
 
 message CleanDriveRequest {

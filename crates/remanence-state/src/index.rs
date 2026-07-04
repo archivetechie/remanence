@@ -907,166 +907,76 @@ impl CatalogIndex {
         &mut self,
         input: DriveObservationInput,
     ) -> Result<DriveObservationOutcome, StateError> {
-        let serial = input.serial.trim().to_string();
-        let vendor = input.vendor.map(|value| value.trim().to_string());
-        let product = input.product.map(|value| value.trim().to_string());
-        let firmware_rev = input.firmware_rev.map(|value| value.trim().to_string());
-        let identity_source = input.identity_source.trim().to_string();
-        let managed = input.managed.trim().to_string();
-        if !matches!(managed.as_str(), "rem" | "foreign") {
-            return Err(StateError::ConfigInvalid(format!(
-                "drive managed value {managed:?} must be rem or foreign"
-            )));
-        }
-        let observed_at = input.observed_at_utc.unwrap_or(now_utc()?);
         let tx = self
             .conn
             .transaction()
             .map_err(|err| sqlite_error("begin drive observation transaction", err))?;
-        let existing = find_drive_for_observation(
-            &tx,
-            serial.as_str(),
-            vendor.as_deref(),
-            product.as_deref(),
-            input.library_serial.as_deref(),
-            input.element_address,
-        )?;
-        let (drive_uuid, newly_seen) = match existing {
-            Some(row) => {
-                tx.execute(
-                    "update drives
-                     set identity_source = ?2,
-                         vendor = ?3,
-                         product = ?4,
-                         firmware_rev = ?5,
-                         managed = ?6,
-                         last_seen_utc = ?7,
-                         last_library_serial = ?8,
-                         last_element_address = ?9
-                     where drive_uuid = ?1",
-                    params![
-                        row.drive_uuid,
-                        identity_source,
-                        vendor,
-                        product,
-                        firmware_rev,
-                        managed,
-                        observed_at,
-                        input.library_serial,
-                        input.element_address,
-                    ],
-                )
-                .map_err(|err| sqlite_error("update observed drive", err))?;
-                if row.state == "retired" {
-                    insert_drive_event_tx(
-                        &tx,
-                        DriveEventInsert {
-                            drive_uuid: row.drive_uuid.as_slice(),
-                            event_kind: "reappeared",
-                            at_utc: observed_at.as_str(),
-                            library_serial: input.library_serial.as_deref(),
-                            element_address: input.element_address,
-                            tape_uuid: None,
-                            detail: Some("{\"state\":\"retired\"}"),
-                        },
-                    )?;
-                    raise_alarm_tx(
-                        &tx,
-                        format!(
-                            "retired-drive-reappeared:{}",
-                            hex_uuid_from_slice(&row.drive_uuid)
-                        )
-                        .as_str(),
-                        "retired-drive-reappeared",
-                        "warning",
-                        Some("{\"state\":\"retired\"}"),
-                        observed_at.as_str(),
-                    )?;
-                } else {
-                    if row.firmware_rev != firmware_rev {
-                        insert_drive_event_tx(
-                            &tx,
-                            DriveEventInsert {
-                                drive_uuid: row.drive_uuid.as_slice(),
-                                event_kind: "firmware-changed",
-                                at_utc: observed_at.as_str(),
-                                library_serial: input.library_serial.as_deref(),
-                                element_address: input.element_address,
-                                tape_uuid: None,
-                                detail: None,
-                            },
-                        )?;
-                    }
-                    if row.last_library_serial != input.library_serial
-                        || row.last_element_address != input.element_address
-                    {
-                        insert_drive_event_tx(
-                            &tx,
-                            DriveEventInsert {
-                                drive_uuid: row.drive_uuid.as_slice(),
-                                event_kind: "bay-moved",
-                                at_utc: observed_at.as_str(),
-                                library_serial: input.library_serial.as_deref(),
-                                element_address: input.element_address,
-                                tape_uuid: None,
-                                detail: None,
-                            },
-                        )?;
-                    }
-                }
-                (row.drive_uuid, false)
-            }
-            None => {
-                let drive_uuid = Uuid::new_v4().as_bytes().to_vec();
-                let actionable = if serial.is_empty() { 0 } else { 1 };
-                tx.execute(
-                    "insert into drives(
-                       drive_uuid, serial, identity_source, actionable,
-                       vendor, product, firmware_rev, managed, state,
-                       cleaning_due, fenced, first_seen_utc, last_seen_utc,
-                       last_library_serial, last_element_address
-                     )
-                     values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active',
-                            'none', 0, ?9, ?9, ?10, ?11)",
-                    params![
-                        drive_uuid,
-                        serial,
-                        identity_source,
-                        actionable,
-                        vendor,
-                        product,
-                        firmware_rev,
-                        managed,
-                        observed_at,
-                        input.library_serial,
-                        input.element_address,
-                    ],
-                )
-                .map_err(|err| sqlite_error("insert observed drive", err))?;
-                insert_drive_event_tx(
-                    &tx,
-                    DriveEventInsert {
-                        drive_uuid: drive_uuid.as_slice(),
-                        event_kind: "first-seen",
-                        at_utc: observed_at.as_str(),
-                        library_serial: input.library_serial.as_deref(),
-                        element_address: input.element_address,
-                        tape_uuid: None,
-                        detail: None,
-                    },
-                )?;
-                (drive_uuid, true)
-            }
-        };
+        let observed = observe_drive_tx(&tx, input, false)?;
         let serial_collision =
-            reconcile_drive_serial_actionability_tx(&tx, serial.as_str(), observed_at.as_str())?;
+            reconcile_drive_serial_actionability_tx(&tx, &observed.serial, &observed.observed_at)?;
         tx.commit()
             .map_err(|err| sqlite_error("commit drive observation transaction", err))?;
         Ok(DriveObservationOutcome {
-            drive_uuid,
-            newly_seen,
+            drive_uuid: observed.drive_uuid,
+            newly_seen: observed.newly_seen,
             serial_collision,
         })
+    }
+
+    /// Reconcile a whole inventory snapshot so duplicate serial claims seen in
+    /// separate bays are kept as separate non-actionable drive rows.
+    pub fn observe_drive_inventory_snapshot(
+        &mut self,
+        inputs: Vec<DriveObservationInput>,
+    ) -> Result<Vec<DriveObservationOutcome>, StateError> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut serial_counts = std::collections::BTreeMap::<String, usize>::new();
+        for input in &inputs {
+            let serial = input.serial.trim();
+            if !serial.is_empty() {
+                *serial_counts.entry(serial.to_string()).or_default() += 1;
+            }
+        }
+        let collided_serials = serial_counts
+            .into_iter()
+            .filter_map(|(serial, count)| (count > 1).then_some(serial))
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|err| sqlite_error("begin drive inventory transaction", err))?;
+        let mut observed_rows = Vec::new();
+        let mut touched_serials = std::collections::BTreeMap::<String, String>::new();
+        for input in inputs {
+            let serial = input.serial.trim().to_string();
+            let match_collided_by_bay =
+                !serial.is_empty() && collided_serials.contains(serial.as_str());
+            let observed = observe_drive_tx(&tx, input, match_collided_by_bay)?;
+            touched_serials.insert(observed.serial.clone(), observed.observed_at.clone());
+            observed_rows.push(observed);
+        }
+        let mut collisions = std::collections::BTreeMap::<String, bool>::new();
+        for (serial, observed_at) in touched_serials {
+            let serial_collision =
+                reconcile_drive_serial_actionability_tx(&tx, &serial, &observed_at)?;
+            collisions.insert(serial, serial_collision);
+        }
+        tx.commit()
+            .map_err(|err| sqlite_error("commit drive inventory transaction", err))?;
+        Ok(observed_rows
+            .into_iter()
+            .map(|observed| DriveObservationOutcome {
+                serial_collision: collisions
+                    .get(observed.serial.as_str())
+                    .copied()
+                    .unwrap_or(false),
+                drive_uuid: observed.drive_uuid,
+                newly_seen: observed.newly_seen,
+            })
+            .collect())
     }
 
     /// List authoritative drive rows.
@@ -1445,6 +1355,62 @@ impl CatalogIndex {
         self.get_drive_by_uuid(drive_uuid)
     }
 
+    /// Raise, refresh, or clear the advisory for opted-in foreign TapeAlert reads.
+    pub fn observe_foreign_drive_tapealert_advisory(
+        &mut self,
+        drive_uuid: &[u8],
+        tape_alert_flags: Option<&str>,
+    ) -> Result<Option<AlarmRecord>, StateError> {
+        let condition_key = format!(
+            "foreign-drive-wants-cleaning:{}",
+            hex_uuid_from_slice(drive_uuid)
+        );
+        let Some(drive) = self.get_drive_by_uuid(drive_uuid)? else {
+            return self.clear_alarm(condition_key.as_str());
+        };
+        if drive.managed != "foreign" || drive.state != "active" {
+            return self.clear_alarm(condition_key.as_str());
+        }
+        let Some(flags) = tape_alert_flags else {
+            return Ok(None);
+        };
+        if !tape_alert_flags_include_cleaning_request(flags) {
+            return self.clear_alarm(condition_key.as_str());
+        }
+
+        let drive_label = if drive.serial.trim().is_empty() {
+            hex_uuid_from_slice(drive_uuid)
+        } else {
+            drive.serial.clone()
+        };
+        let library = drive
+            .last_library_serial
+            .as_deref()
+            .unwrap_or("unknown-library");
+        let message =
+            format!("rem will NOT clean this drive; clean {library} drive {drive_label} manually");
+        let flags_json = if flags.trim_start().starts_with('[') {
+            flags.trim()
+        } else {
+            "[]"
+        };
+        let detail = format!(
+            "{{\"drive_uuid\":\"{}\",\"serial\":\"{}\",\"library_serial\":\"{}\",\"flags\":{},\"message\":\"{}\"}}",
+            json_escape_text(&hex_uuid_from_slice(drive_uuid)),
+            json_escape_text(&drive.serial),
+            json_escape_text(library),
+            flags_json,
+            json_escape_text(&message)
+        );
+        self.raise_alarm(
+            condition_key.as_str(),
+            "foreign-drive-wants-cleaning",
+            "warning",
+            Some(detail.as_str()),
+        )
+        .map(Some)
+    }
+
     /// Upsert a standing alarm as open or refreshed.
     pub fn raise_alarm(
         &mut self,
@@ -1473,7 +1439,8 @@ impl CatalogIndex {
         acked_by: &str,
     ) -> Result<Option<AlarmRecord>, StateError> {
         let now = now_utc()?;
-        self.conn
+        let changed = self
+            .conn
             .execute(
                 "update alarms
                  set state = 'acked',
@@ -1485,6 +1452,9 @@ impl CatalogIndex {
                 params![condition_key, acked_by, now],
             )
             .map_err(|err| sqlite_error("ack alarm", err))?;
+        if changed == 0 {
+            return Ok(None);
+        }
         self.get_alarm(condition_key)
     }
 
@@ -4969,6 +4939,187 @@ fn alarm_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlarmRecord> {
     })
 }
 
+struct ObservedDriveTx {
+    drive_uuid: Vec<u8>,
+    newly_seen: bool,
+    serial: String,
+    observed_at: String,
+}
+
+fn observe_drive_tx(
+    conn: &Connection,
+    input: DriveObservationInput,
+    match_collided_serial_by_bay: bool,
+) -> Result<ObservedDriveTx, StateError> {
+    let serial = input.serial.trim().to_string();
+    let vendor = input.vendor.map(|value| value.trim().to_string());
+    let product = input.product.map(|value| value.trim().to_string());
+    let firmware_rev = input.firmware_rev.map(|value| value.trim().to_string());
+    let identity_source = input.identity_source.trim().to_string();
+    let managed = input.managed.trim().to_string();
+    let library_serial = input
+        .library_serial
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let element_address = input.element_address;
+    if !matches!(managed.as_str(), "rem" | "foreign") {
+        return Err(StateError::ConfigInvalid(format!(
+            "drive managed value {managed:?} must be rem or foreign"
+        )));
+    }
+    let observed_at = input.observed_at_utc.unwrap_or(now_utc()?);
+    let existing = if match_collided_serial_by_bay && !serial.is_empty() {
+        find_collided_snapshot_drive_for_observation(
+            conn,
+            serial.as_str(),
+            library_serial.as_deref(),
+            element_address,
+        )?
+    } else {
+        find_drive_for_observation(
+            conn,
+            serial.as_str(),
+            vendor.as_deref(),
+            product.as_deref(),
+            library_serial.as_deref(),
+            element_address,
+        )?
+    };
+    let (drive_uuid, newly_seen) = match existing {
+        Some(row) => {
+            conn.execute(
+                "update drives
+                 set identity_source = ?2,
+                     vendor = ?3,
+                     product = ?4,
+                     firmware_rev = ?5,
+                     managed = ?6,
+                     last_seen_utc = ?7,
+                     last_library_serial = ?8,
+                     last_element_address = ?9
+                 where drive_uuid = ?1",
+                params![
+                    row.drive_uuid.as_slice(),
+                    identity_source,
+                    vendor.as_deref(),
+                    product.as_deref(),
+                    firmware_rev.as_deref(),
+                    managed,
+                    observed_at,
+                    library_serial.as_deref(),
+                    element_address,
+                ],
+            )
+            .map_err(|err| sqlite_error("update observed drive", err))?;
+            if row.state == "retired" {
+                insert_drive_event_tx(
+                    conn,
+                    DriveEventInsert {
+                        drive_uuid: row.drive_uuid.as_slice(),
+                        event_kind: "reappeared",
+                        at_utc: observed_at.as_str(),
+                        library_serial: library_serial.as_deref(),
+                        element_address,
+                        tape_uuid: None,
+                        detail: Some("{\"state\":\"retired\"}"),
+                    },
+                )?;
+                raise_alarm_tx(
+                    conn,
+                    format!(
+                        "retired-drive-reappeared:{}",
+                        hex_uuid_from_slice(&row.drive_uuid)
+                    )
+                    .as_str(),
+                    "retired-drive-reappeared",
+                    "warning",
+                    Some("{\"state\":\"retired\"}"),
+                    observed_at.as_str(),
+                )?;
+            } else {
+                if row.firmware_rev != firmware_rev {
+                    insert_drive_event_tx(
+                        conn,
+                        DriveEventInsert {
+                            drive_uuid: row.drive_uuid.as_slice(),
+                            event_kind: "firmware-changed",
+                            at_utc: observed_at.as_str(),
+                            library_serial: library_serial.as_deref(),
+                            element_address,
+                            tape_uuid: None,
+                            detail: None,
+                        },
+                    )?;
+                }
+                if row.last_library_serial != library_serial
+                    || row.last_element_address != element_address
+                {
+                    insert_drive_event_tx(
+                        conn,
+                        DriveEventInsert {
+                            drive_uuid: row.drive_uuid.as_slice(),
+                            event_kind: "bay-moved",
+                            at_utc: observed_at.as_str(),
+                            library_serial: library_serial.as_deref(),
+                            element_address,
+                            tape_uuid: None,
+                            detail: None,
+                        },
+                    )?;
+                }
+            }
+            (row.drive_uuid, false)
+        }
+        None => {
+            let drive_uuid = Uuid::new_v4().as_bytes().to_vec();
+            let actionable = if serial.is_empty() { 0 } else { 1 };
+            conn.execute(
+                "insert into drives(
+                   drive_uuid, serial, identity_source, actionable,
+                   vendor, product, firmware_rev, managed, state,
+                   cleaning_due, fenced, first_seen_utc, last_seen_utc,
+                   last_library_serial, last_element_address
+                 )
+                 values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active',
+                        'none', 0, ?9, ?9, ?10, ?11)",
+                params![
+                    drive_uuid.as_slice(),
+                    serial,
+                    identity_source,
+                    actionable,
+                    vendor.as_deref(),
+                    product.as_deref(),
+                    firmware_rev.as_deref(),
+                    managed,
+                    observed_at,
+                    library_serial.as_deref(),
+                    element_address,
+                ],
+            )
+            .map_err(|err| sqlite_error("insert observed drive", err))?;
+            insert_drive_event_tx(
+                conn,
+                DriveEventInsert {
+                    drive_uuid: drive_uuid.as_slice(),
+                    event_kind: "first-seen",
+                    at_utc: observed_at.as_str(),
+                    library_serial: library_serial.as_deref(),
+                    element_address,
+                    tape_uuid: None,
+                    detail: None,
+                },
+            )?;
+            (drive_uuid, true)
+        }
+    };
+    Ok(ObservedDriveTx {
+        drive_uuid,
+        newly_seen,
+        serial,
+        observed_at,
+    })
+}
+
 fn find_drive_for_observation(
     conn: &Connection,
     serial: &str,
@@ -5021,6 +5172,40 @@ fn find_drive_for_observation(
     stmt.query_row(params![library_serial, element_address], drive_from_row)
         .optional()
         .map_err(|err| sqlite_error("query blank-serial drive lookup", err))
+}
+
+fn find_collided_snapshot_drive_for_observation(
+    conn: &Connection,
+    serial: &str,
+    library_serial: Option<&str>,
+    element_address: Option<i64>,
+) -> Result<Option<DriveRecord>, StateError> {
+    let (Some(library_serial), Some(element_address)) = (library_serial, element_address) else {
+        return Ok(None);
+    };
+    let mut stmt = conn
+        .prepare(
+            "select drive_uuid, serial, identity_source, actionable,
+                    vendor, product, firmware_rev, managed, state,
+                    cleaning_due, fenced, first_seen_utc, last_seen_utc,
+                    last_library_serial, last_element_address,
+                    purchase_date, warranty_until, cost, notes,
+                    retired_at_utc, retire_reason
+             from drives
+             where serial = ?1
+               and state = 'active'
+               and last_library_serial = ?2
+               and last_element_address = ?3
+             order by last_seen_utc desc, hex(drive_uuid)
+             limit 1",
+        )
+        .map_err(|err| sqlite_error("prepare collided drive bay lookup", err))?;
+    stmt.query_row(
+        params![serial, library_serial, element_address],
+        drive_from_row,
+    )
+    .optional()
+    .map_err(|err| sqlite_error("query collided drive bay lookup", err))
 }
 
 struct DriveEventInsert<'a> {
@@ -5223,6 +5408,29 @@ fn hex_bytes(bytes: &[u8]) -> String {
     for byte in bytes {
         use std::fmt::Write as _;
         write!(&mut out, "{byte:02x}").expect("write to string");
+    }
+    out
+}
+
+fn tape_alert_flags_include_cleaning_request(flags: &str) -> bool {
+    flags
+        .split(|byte: char| !byte.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u8>().ok())
+        .any(|flag| matches!(flag, 20 | 21))
+}
+
+fn json_escape_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
     }
     out
 }
@@ -6979,6 +7187,120 @@ mod tests {
     }
 
     #[test]
+    fn drive_inventory_snapshot_keeps_two_bay_same_serial_collision_rows_non_actionable() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+
+        let outcomes = index
+            .observe_drive_inventory_snapshot(vec![
+                DriveObservationInput {
+                    serial: "DUPSER".to_string(),
+                    identity_source: "DvcidAndInquiry".to_string(),
+                    vendor: Some("IBM".to_string()),
+                    product: Some("ULT3580".to_string()),
+                    firmware_rev: Some("A1".to_string()),
+                    managed: "rem".to_string(),
+                    library_serial: Some("mainlib".to_string()),
+                    element_address: Some(0x0100),
+                    observed_at_utc: Some("2026-07-04T01:00:00Z".to_string()),
+                },
+                DriveObservationInput {
+                    serial: "DUPSER".to_string(),
+                    identity_source: "DvcidAndInquiry".to_string(),
+                    vendor: Some("IBM".to_string()),
+                    product: Some("ULT3580".to_string()),
+                    firmware_rev: Some("A1".to_string()),
+                    managed: "rem".to_string(),
+                    library_serial: Some("mainlib".to_string()),
+                    element_address: Some(0x0101),
+                    observed_at_utc: Some("2026-07-04T01:00:00Z".to_string()),
+                },
+            ])
+            .expect("observe inventory");
+
+        assert_eq!(outcomes.len(), 2);
+        assert_ne!(outcomes[0].drive_uuid, outcomes[1].drive_uuid);
+        assert!(outcomes.iter().all(|outcome| outcome.serial_collision));
+        let rows = index
+            .conn
+            .prepare(
+                "select actionable, last_element_address
+                 from drives
+                 where serial = 'DUPSER'
+                 order by last_element_address",
+            )
+            .expect("prepare duplicate row query")
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .expect("query duplicate rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read duplicate rows");
+        assert_eq!(rows, vec![(0, 0x0100), (0, 0x0101)]);
+        assert_eq!(
+            index
+                .get_alarm("drive-serial-collision:DUPSER")
+                .expect("collision alarm")
+                .expect("collision alarm present")
+                .state,
+            "open"
+        );
+    }
+
+    #[test]
+    fn drive_inventory_snapshot_bay_swap_between_refreshes_emits_bay_moved() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+
+        let first = index
+            .observe_drive_inventory_snapshot(vec![DriveObservationInput {
+                serial: "MOVE123".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("mainlib".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-04T01:00:00Z".to_string()),
+            }])
+            .expect("observe first refresh")
+            .pop()
+            .expect("first outcome");
+        let second = index
+            .observe_drive_inventory_snapshot(vec![DriveObservationInput {
+                serial: "MOVE123".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("mainlib".to_string()),
+                element_address: Some(0x0101),
+                observed_at_utc: Some("2026-07-04T01:05:00Z".to_string()),
+            }])
+            .expect("observe second refresh")
+            .pop()
+            .expect("second outcome");
+
+        assert_eq!(first.drive_uuid, second.drive_uuid);
+        let events = index
+            .list_drive_events(&first.drive_uuid)
+            .expect("drive events");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_kind == "bay-moved"
+                    && event.element_address == Some(0x0101)),
+            "bay move event missing: {events:?}"
+        );
+    }
+
+    #[test]
     fn drive_health_snapshots_are_idempotent_by_session_and_trigger() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-index")
@@ -7290,6 +7612,101 @@ mod tests {
                 .state,
             "open"
         );
+    }
+
+    #[test]
+    fn ack_alarm_rejects_cleared_or_missing_alarm_rows() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+
+        index
+            .raise_alarm("no-cln-cart:mainlib", "no-cln-cart", "critical", Some("{}"))
+            .expect("raise alarm");
+        index
+            .clear_alarm("no-cln-cart:mainlib")
+            .expect("clear alarm")
+            .expect("cleared row");
+
+        assert_eq!(
+            index
+                .ack_alarm("no-cln-cart:mainlib", "operator-a")
+                .expect("ack cleared alarm"),
+            None
+        );
+        assert_eq!(
+            index
+                .ack_alarm("no-such-alarm", "operator-a")
+                .expect("ack missing alarm"),
+            None
+        );
+    }
+
+    #[test]
+    fn foreign_tapealert_cleaning_flags_raise_ackable_advisory_without_cleaning_due() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let drive_uuid = index
+            .observe_drive(DriveObservationInput {
+                serial: "D2DRV01".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "foreign".to_string(),
+                library_serial: Some("d2lib".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-04T02:00:00Z".to_string()),
+            })
+            .expect("observe foreign drive")
+            .drive_uuid;
+
+        let alarm = index
+            .observe_foreign_drive_tapealert_advisory(&drive_uuid, Some("[20]"))
+            .expect("observe foreign advisory")
+            .expect("advisory alarm");
+        assert_eq!(alarm.kind, "foreign-drive-wants-cleaning");
+        assert_eq!(alarm.state, "open");
+        assert!(alarm.detail.as_deref().is_some_and(|detail| detail
+            .contains("rem will NOT clean this drive; clean d2lib drive D2DRV01 manually")));
+        assert_eq!(
+            index
+                .get_drive_by_uuid(&drive_uuid)
+                .expect("drive lookup")
+                .expect("drive row")
+                .cleaning_due,
+            "none"
+        );
+
+        let acked = index
+            .ack_alarm(&alarm.condition_key, "operator-a")
+            .expect("ack advisory")
+            .expect("acked advisory");
+        assert_eq!(acked.state, "acked");
+        let refreshed = index
+            .observe_foreign_drive_tapealert_advisory(&drive_uuid, Some("[21]"))
+            .expect("refresh advisory")
+            .expect("refreshed advisory");
+        assert_eq!(refreshed.state, "acked");
+        assert_eq!(
+            index
+                .get_drive_by_uuid(&drive_uuid)
+                .expect("drive lookup")
+                .expect("drive row")
+                .cleaning_due,
+            "none"
+        );
+
+        let cleared = index
+            .observe_foreign_drive_tapealert_advisory(&drive_uuid, Some("[]"))
+            .expect("clear advisory")
+            .expect("cleared advisory row");
+        assert_eq!(cleared.state, "cleared");
     }
 
     #[test]

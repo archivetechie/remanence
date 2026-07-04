@@ -420,6 +420,7 @@ pub(crate) struct WriteOwnerConfig {
     pub default_library_serial: Option<String>,
     pub library_snapshot: Arc<RwLock<Arc<crate::LibrarySnapshot>>>,
     pub snapshot_miss_alarm: u32,
+    pub managed_library_serials: Arc<HashSet<String>>,
 }
 
 pub(crate) struct ExclusiveGuard {
@@ -545,7 +546,8 @@ fn changer_loop(
             ChangerCommand::Move { src, dst, reply } => {
                 let result = changer
                     .move_medium(src, dst, &cfg.policy)
-                    .map_err(|err| Status::internal(format!("move medium: {err}")));
+                    .map_err(|err| Status::internal(format!("move medium: {err}")))
+                    .and_then(|()| observe_refreshed_library(&mut index, &cfg, changer.library()));
                 if result.is_ok() {
                     publish_library_snapshot(&cfg.library_snapshot, changer.library().clone());
                 }
@@ -554,7 +556,8 @@ fn changer_loop(
             ChangerCommand::Refresh { reply } => {
                 let result = changer
                     .refresh()
-                    .map_err(|err| Status::internal(format!("refresh inventory: {err}")));
+                    .map_err(|err| Status::internal(format!("refresh inventory: {err}")))
+                    .and_then(|()| observe_refreshed_library(&mut index, &cfg, changer.library()));
                 if result.is_ok() {
                     publish_library_snapshot(&cfg.library_snapshot, changer.library().clone());
                 }
@@ -580,6 +583,14 @@ fn changer_loop(
 
 fn refresh_actor_changer(changer: &mut ChangerHandle, cfg: &WriteOwnerConfig) {
     if changer.refresh().is_ok() {
+        match CatalogIndex::open(cfg.index_path.as_path()) {
+            Ok(mut index) => {
+                if let Err(err) = observe_refreshed_library(&mut index, cfg, changer.library()) {
+                    tracing::warn!("failed to observe refreshed drive catalog: {err}");
+                }
+            }
+            Err(err) => tracing::warn!("failed to open catalog for refreshed drive catalog: {err}"),
+        }
         publish_library_snapshot(&cfg.library_snapshot, changer.library().clone());
     }
 }
@@ -949,7 +960,10 @@ fn record_session_close_snapshot(
             tape_uuid: Some(tape_uuid),
         },
     ) {
-        Ok(_) => *consecutive_misses = 0,
+        Ok(_) => {
+            clear_snapshot_persist_alarm(index, drive_uuid.as_slice());
+            *consecutive_misses = 0;
+        }
         Err(err) => {
             *consecutive_misses = consecutive_misses.saturating_add(1);
             tracing::warn!(
@@ -962,10 +976,7 @@ fn record_session_close_snapshot(
                 err
             );
             if cfg.snapshot_miss_alarm > 0 && *consecutive_misses >= cfg.snapshot_miss_alarm {
-                let condition_key = format!(
-                    "snapshot-persist-failing:{}",
-                    crate::bytes_to_hex(&drive_uuid)
-                );
+                let condition_key = snapshot_persist_alarm_key(&drive_uuid);
                 let detail = format!(
                     "{{\"session_id\":\"{}\",\"misses\":{},\"error\":\"{}\"}}",
                     session_id,
@@ -986,6 +997,24 @@ fn record_session_close_snapshot(
                 }
             }
         }
+    }
+}
+
+fn snapshot_persist_alarm_key(drive_uuid: &[u8]) -> String {
+    format!(
+        "snapshot-persist-failing:{}",
+        crate::bytes_to_hex(drive_uuid)
+    )
+}
+
+fn clear_snapshot_persist_alarm(index: &mut CatalogIndex, drive_uuid: &[u8]) {
+    let condition_key = snapshot_persist_alarm_key(drive_uuid);
+    if let Err(err) = index.clear_alarm(condition_key.as_str()) {
+        tracing::warn!(
+            "failed to clear snapshot miss alarm condition_key={} error={}",
+            condition_key,
+            err
+        );
     }
 }
 
@@ -1790,10 +1819,12 @@ fn handle_robotics(
             .map_err(|err| err.to_string()),
     };
 
+    let observe_result = observe_refreshed_library(index, cfg, library.library())
+        .map_err(|err| err.message().to_string());
     publish_library_snapshot(&cfg.library_snapshot, library.library().clone());
 
-    match action_result {
-        Ok(()) => {
+    match (action_result, observe_result) {
+        (Ok(()), Ok(())) => {
             if let Err(err) = record_library_event(
                 index,
                 cfg,
@@ -1814,7 +1845,17 @@ fn handle_robotics(
             }
             handle.publish_state(pb::OperationState::Succeeded, &[("phase", "done")]);
         }
-        Err(message) => {
+        (Ok(()), Err(message)) => {
+            fail_library_operation(
+                index,
+                cfg,
+                &handle,
+                &library_serial,
+                &format!("observe refreshed drive catalog: {message}"),
+                &[("phase", "catalog")],
+            );
+        }
+        (Err(message), _) => {
             fail_library_operation(
                 index,
                 cfg,
@@ -1825,6 +1866,18 @@ fn handle_robotics(
             );
         }
     }
+}
+
+fn observe_refreshed_library(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    library: &remanence_library::Library,
+) -> Result<(), Status> {
+    crate::observe_drive_catalog_from_libraries(
+        index,
+        std::iter::once(library),
+        &cfg.managed_library_serials,
+    )
 }
 
 fn publish_library_snapshot(
@@ -2983,6 +3036,37 @@ mod tests {
             },
         ));
         assert_eq!(exhausted.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[test]
+    fn session_close_snapshot_success_clears_snapshot_persist_alarm() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-api-snapshot-alarm")
+            .tempdir()
+            .expect("tempdir");
+        let mut index =
+            CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open test index");
+        let drive_uuid = Uuid::new_v4().as_bytes().to_vec();
+        let condition_key = snapshot_persist_alarm_key(&drive_uuid);
+        index
+            .raise_alarm(
+                condition_key.as_str(),
+                "snapshot-persist-failing",
+                "warning",
+                Some("{\"misses\":3}"),
+            )
+            .expect("raise snapshot alarm");
+
+        clear_snapshot_persist_alarm(&mut index, &drive_uuid);
+
+        assert_eq!(
+            index
+                .get_alarm(condition_key.as_str())
+                .expect("alarm lookup")
+                .expect("alarm row")
+                .state,
+            "cleared"
+        );
     }
 
     #[test]

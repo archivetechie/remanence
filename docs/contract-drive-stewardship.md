@@ -107,8 +107,10 @@ On **LibraryService** (NOT Catalog — Catalog's invariant is
 New `AuthPermission::Lifecycle`. Mapping (tests required for every
 role × mutating RPC): `RetireDrive` = Lifecycle (unix `System` role
 ONLY; `Operator`/`Orchestrator`/`Readonly` denied; future `Admin` may
-join); `AnnotateDrive` = Write; `CleanDrive`, `AckAlarm` = Robotics;
-all reads = Readonly. Mutations on `identity_source='Derived'` rows
+join); `AnnotateDrive` = Write; `CleanDrive`, `AckAlarm`, `PollDrive`
+= Robotics (diff-gate amendment: PollDrive issues LOG SENSE and
+persists snapshots — it is a mutating collection RPC, and requires
+`allow_derived_identity` on Derived rows); all pure reads = Readonly. Mutations on `identity_source='Derived'` rows
 refuse without `allow_derived_identity: true`.
 
 ## 6. Safety invariants (enforced, not conventions)
