@@ -151,7 +151,7 @@ pub(crate) fn project_library_state(
 pub(crate) fn voltag_uuid_map(index: &CatalogIndex) -> Result<HashMap<String, Vec<u8>>, Status> {
     let mut map = HashMap::new();
     for tape in index
-        .list_tapes(None)
+        .list_tapes(None, remanence_state::TapeKindFilter::Data)
         .map_err(crate::status_from_state_error)?
     {
         if let Some(voltag) = tape.voltag {

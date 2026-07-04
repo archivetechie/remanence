@@ -3224,6 +3224,7 @@ fn run_catalog_client_command(
                             page_token: None,
                             page_size: 0,
                             pool_id: pool.clone().unwrap_or_default(),
+                            kind: "data".to_string(),
                         })
                         .await
                         .map_err(drive_status_error)?
@@ -3338,6 +3339,7 @@ async fn resolve_tape_uuid_arg(
             page_token: None,
             page_size: 0,
             pool_id: String::new(),
+            kind: "data".to_string(),
         })
         .await
         .map_err(status_error)?

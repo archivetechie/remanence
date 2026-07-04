@@ -612,6 +612,8 @@ pub struct TapeRecord {
     pub tape_uuid: Vec<u8>,
     /// Operator-facing voltag when known.
     pub voltag: Option<String>,
+    /// Tape classification.
+    pub kind: String,
     /// Current tape-pool assignment, if any.
     pub pool_id: Option<String>,
     /// Dominant native body format derived from cataloged objects on this tape.
@@ -634,6 +636,27 @@ pub struct TapeRecord {
     pub state: String,
     /// Last projection update timestamp.
     pub updated_at_utc: String,
+}
+
+/// Tape-kind filter for list queries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TapeKindFilter {
+    /// Return only data tapes.
+    Data,
+    /// Return only cleaning cartridges.
+    Cleaning,
+    /// Return all tape kinds.
+    All,
+}
+
+impl TapeKindFilter {
+    fn as_sql_filter(self) -> Option<&'static str> {
+        match self {
+            Self::Data => Some("data"),
+            Self::Cleaning => Some("cleaning"),
+            Self::All => None,
+        }
+    }
 }
 
 /// One tape-file row from the rebuildable catalog projection.
@@ -2247,18 +2270,24 @@ impl CatalogIndex {
     }
 
     /// List known tapes from the rebuildable projection.
-    pub fn list_tapes(&self, pool_id: Option<&str>) -> Result<Vec<TapeRecord>, StateError> {
+    pub fn list_tapes(
+        &self,
+        pool_id: Option<&str>,
+        kind_filter: TapeKindFilter,
+    ) -> Result<Vec<TapeRecord>, StateError> {
         let pool_id = pool_id
             .map(normalize_pool_id)
             .transpose()?
             .filter(|value| !value.is_empty());
-        let where_clause = if pool_id.is_some() {
-            " where tapes.pool_id = ?1"
-        } else {
-            ""
+        let kind = kind_filter.as_sql_filter();
+        let where_clause = match (pool_id.is_some(), kind.is_some()) {
+            (false, false) => String::new(),
+            (true, false) => " where tapes.pool_id = ?1".to_string(),
+            (false, true) => " where tapes.kind = ?1".to_string(),
+            (true, true) => " where tapes.pool_id = ?1 and tapes.kind = ?2".to_string(),
         };
         let sql = format!(
-            "select tapes.tape_uuid, tapes.voltag, tapes.pool_id,
+            "select tapes.tape_uuid, tapes.voltag, tapes.kind, tapes.pool_id,
                     (
                       select objects.body_format
                       from catalog_units
@@ -2281,10 +2310,11 @@ impl CatalogIndex {
             .conn
             .prepare(&sql)
             .map_err(|err| sqlite_error("prepare tape query", err))?;
-        let mut rows = if let Some(pool_id) = pool_id.as_deref() {
-            stmt.query(params![pool_id])
-        } else {
-            stmt.query([])
+        let mut rows = match (pool_id.as_deref(), kind) {
+            (Some(pool_id), Some(kind)) => stmt.query(params![pool_id, kind]),
+            (Some(pool_id), None) => stmt.query(params![pool_id]),
+            (None, Some(kind)) => stmt.query(params![kind]),
+            (None, None) => stmt.query([]),
         }
         .map_err(|err| sqlite_error("query tapes", err))?;
         let mut tapes = Vec::new();
@@ -2297,12 +2327,73 @@ impl CatalogIndex {
         Ok(tapes)
     }
 
+    /// Update a tape kind with the kind-flip guard.
+    pub fn set_tape_kind(
+        &mut self,
+        tape_uuid: &[u8],
+        kind: &str,
+    ) -> Result<Option<TapeRecord>, StateError> {
+        let kind = kind.trim();
+        if !matches!(kind, "data" | "cleaning") {
+            return Err(StateError::ConfigInvalid(format!(
+                "tape kind {kind:?} must be data or cleaning"
+            )));
+        }
+        let Some(current) = self.get_tape(tape_uuid)? else {
+            return Ok(None);
+        };
+        if current.kind == kind {
+            return Ok(Some(current));
+        }
+        let committed_copy_exists: bool = self
+            .conn
+            .query_row(
+                "select exists(
+                   select 1 from object_copies
+                   where object_copies.tape_uuid = ?1
+                     and object_copies.status = 'committed'
+                 )",
+                params![tape_uuid],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|err| sqlite_error("check kind flip guard", err))?
+            != 0;
+        if committed_copy_exists {
+            let detail = format!(
+                "{{\"tape_uuid\":\"{}\",\"from\":\"{}\",\"to\":\"{}\"}}",
+                hex_uuid_from_slice(tape_uuid),
+                current.kind,
+                kind
+            );
+            self.raise_alarm(
+                &format!("kind-flip-refused:{}", hex_uuid_from_slice(tape_uuid)),
+                "kind-flip-refused",
+                "critical",
+                Some(detail.as_str()),
+            )?;
+            return Err(StateError::TapeProvisionConflict(
+                "kind flip refused because the tape has committed object copies".to_string(),
+            ));
+        }
+        self.conn
+            .execute(
+                "update tapes
+                 set kind = ?2,
+                     cleaning_uses = case when ?2 = 'cleaning' then coalesce(cleaning_uses, 0) else cleaning_uses end,
+                     cleaning_state = case when ?2 = 'cleaning' then coalesce(cleaning_state, 'unverified') else cleaning_state end
+                 where tape_uuid = ?1",
+                params![tape_uuid, kind],
+            )
+            .map_err(|err| sqlite_error("set tape kind", err))?;
+        self.get_tape(tape_uuid)
+    }
+
     /// Fetch one known tape by UUID.
     pub fn get_tape(&self, tape_uuid: &[u8]) -> Result<Option<TapeRecord>, StateError> {
         let mut stmt = self
             .conn
             .prepare(
-                "select tapes.tape_uuid, tapes.voltag, tapes.pool_id,
+                "select tapes.tape_uuid, tapes.voltag, tapes.kind, tapes.pool_id,
                         (
                           select objects.body_format
                           from catalog_units
@@ -2343,7 +2434,7 @@ impl CatalogIndex {
         let mut stmt = self
             .conn
             .prepare(
-                "select tapes.tape_uuid, tapes.voltag, tapes.pool_id,
+                "select tapes.tape_uuid, tapes.voltag, tapes.kind, tapes.pool_id,
                         (
                           select objects.body_format
                           from catalog_units
@@ -4811,32 +4902,33 @@ fn tape_from_row(row: &rusqlite::Row<'_>) -> Result<TapeRecord, StateError> {
     Ok(TapeRecord {
         tape_uuid: row_get(row, 0, "tapes.tape_uuid")?,
         voltag: row_get(row, 1, "tapes.voltag")?,
-        pool_id: row_get(row, 2, "tapes.pool_id")?,
-        body_format: row_get(row, 3, "tapes.body_format")?,
-        block_size: opt_i64_to_u64(row_get(row, 4, "tapes.block_size")?, "block_size")?,
-        scheme_id: row_get(row, 5, "tapes.scheme_id")?,
+        kind: row_get(row, 2, "tapes.kind")?,
+        pool_id: row_get(row, 3, "tapes.pool_id")?,
+        body_format: row_get(row, 4, "tapes.body_format")?,
+        block_size: opt_i64_to_u64(row_get(row, 5, "tapes.block_size")?, "block_size")?,
+        scheme_id: row_get(row, 6, "tapes.scheme_id")?,
         data_blocks_per_stripe: opt_i64_to_u32(
-            row_get(row, 6, "tapes.data_blocks_per_stripe")?,
+            row_get(row, 7, "tapes.data_blocks_per_stripe")?,
             "data_blocks_per_stripe",
         )?,
         parity_blocks_per_stripe: opt_i64_to_u32(
-            row_get(row, 7, "tapes.parity_blocks_per_stripe")?,
+            row_get(row, 8, "tapes.parity_blocks_per_stripe")?,
             "parity_blocks_per_stripe",
         )?,
         stripes_per_neighborhood: opt_i64_to_u32(
-            row_get(row, 8, "tapes.stripes_per_neighborhood")?,
+            row_get(row, 9, "tapes.stripes_per_neighborhood")?,
             "stripes_per_neighborhood",
         )?,
         last_committed_tape_file: opt_i64_to_u64(
-            row_get(row, 9, "tapes.last_committed_tape_file")?,
+            row_get(row, 10, "tapes.last_committed_tape_file")?,
             "last_committed_tape_file",
         )?,
         total_committed_ordinals: i64_to_u64(
-            row_get(row, 10, "tapes.total_committed_ordinals")?,
+            row_get(row, 11, "tapes.total_committed_ordinals")?,
             "total_committed_ordinals",
         )?,
-        state: row_get(row, 11, "tapes.state")?,
-        updated_at_utc: row_get(row, 12, "tapes.updated_at_utc")?,
+        state: row_get(row, 12, "tapes.state")?,
+        updated_at_utc: row_get(row, 13, "tapes.updated_at_utc")?,
     })
 }
 
@@ -6255,12 +6347,104 @@ mod tests {
             .project_tape_pool_membership(uuid, "scenario-a")
             .expect("assign");
 
-        let in_pool = index.list_tapes(Some("scenario-a")).expect("list in pool");
+        let in_pool = index
+            .list_tapes(Some("scenario-a"), TapeKindFilter::Data)
+            .expect("list in pool");
         assert_eq!(in_pool.len(), 1);
         assert_eq!(in_pool[0].pool_id.as_deref(), Some("scenario-a"));
 
-        let other = index.list_tapes(Some("nope")).expect("list other pool");
+        let other = index
+            .list_tapes(Some("nope"), TapeKindFilter::Data)
+            .expect("list other pool");
         assert!(other.is_empty());
+    }
+
+    #[test]
+    fn list_tapes_filters_by_kind() {
+        let dir = tempfile::Builder::new()
+            .prefix("rem-kind-list")
+            .tempdir()
+            .expect("tempdir");
+        let mut index = CatalogIndex::open(dir.path().join("s.sqlite")).expect("open");
+        let data_uuid = [10u8; 16];
+        let cleaning_uuid = [11u8; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: data_uuid,
+                voltag: "RMN050L9".to_string(),
+                block_size: 65536,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision data");
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: cleaning_uuid,
+                voltag: "CLN050L9".to_string(),
+                block_size: 65536,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision cleaning");
+        index
+            .set_tape_kind(&cleaning_uuid, "cleaning")
+            .expect("mark cleaning cart")
+            .expect("cleaning tape row");
+
+        let data = index
+            .list_tapes(None, TapeKindFilter::Data)
+            .expect("list data");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].kind, "data");
+        let cleaning = index
+            .list_tapes(None, TapeKindFilter::Cleaning)
+            .expect("list cleaning");
+        assert_eq!(cleaning.len(), 1);
+        assert_eq!(cleaning[0].kind, "cleaning");
+        let all = index
+            .list_tapes(None, TapeKindFilter::All)
+            .expect("list all");
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn kind_flip_guard_refuses_tapes_with_committed_object_copies() {
+        let dir = tempfile::Builder::new()
+            .prefix("rem-kind-guard")
+            .tempdir()
+            .expect("tempdir");
+        let mut index = CatalogIndex::open(dir.path().join("s.sqlite")).expect("open");
+        let tape_uuid = [12u8; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "RMN060L9".to_string(),
+                block_size: 65536,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        index
+            .conn
+            .execute(
+                "insert into object_copies(object_id, tape_uuid, tape_file_number, status)
+                 values('obj-guard', ?1, 1, 'committed')",
+                params![tape_uuid.to_vec()],
+            )
+            .expect("seed committed copy");
+
+        let err = index
+            .set_tape_kind(&tape_uuid, "cleaning")
+            .expect_err("kind flip must refuse");
+        assert!(matches!(err, StateError::TapeProvisionConflict(_)));
+        let alarm = index
+            .get_alarm(&format!(
+                "kind-flip-refused:{}",
+                hex_uuid_from_slice(&tape_uuid)
+            ))
+            .expect("get alarm")
+            .expect("alarm row");
+        assert_eq!(alarm.kind, "kind-flip-refused");
     }
 
     #[test]
@@ -7934,7 +8118,9 @@ mod tests {
             pools[0]
         );
 
-        let tapes = index.list_tapes(None).expect("list tapes");
+        let tapes = index
+            .list_tapes(None, TapeKindFilter::Data)
+            .expect("list tapes");
         assert_eq!(tapes.len(), 1);
         assert_eq!(tapes[0].tape_uuid, tape_uuid.to_vec());
         assert_eq!(tapes[0].pool_id.as_deref(), Some("camera.copy-a"));
@@ -7945,12 +8131,12 @@ mod tests {
         assert_eq!(tapes[0].total_committed_ordinals, 3);
         assert_eq!(
             index
-                .list_tapes(Some("camera.copy-a"))
+                .list_tapes(Some("camera.copy-a"), TapeKindFilter::Data)
                 .expect("list pool tapes"),
             tapes
         );
         assert!(index
-            .list_tapes(Some("camera.copy-b"))
+            .list_tapes(Some("camera.copy-b"), TapeKindFilter::Data)
             .expect("list empty pool")
             .is_empty());
         assert_eq!(
