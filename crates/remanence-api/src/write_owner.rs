@@ -164,11 +164,12 @@ pub(crate) enum DriveCommand {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MountedSession {
     pub bay: u16,
     pub home_slot: Option<u16>,
     pub tape_uuid: TapeUuid,
+    pub drive_uuid: Option<Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -343,7 +344,7 @@ impl DrivePool {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .get(&session_id)
-            .copied()
+            .cloned()
             .ok_or_else(|| Status::not_found("session not found"))
     }
 
