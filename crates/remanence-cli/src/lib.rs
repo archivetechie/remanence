@@ -1134,8 +1134,8 @@ enum DriveClientCommand {
 
 #[derive(Args, Debug)]
 struct DriveAnnotateArgs {
-    /// Drive UUID.
-    drive_uuid: String,
+    /// Drive serial or UUID.
+    drive: String,
     /// Purchase date, YYYY-MM-DD.
     #[arg(long)]
     purchase_date: Option<String>,
@@ -1158,8 +1158,8 @@ struct DriveAnnotateArgs {
 
 #[derive(Args, Debug)]
 struct DriveRetireArgs {
-    /// Drive UUID.
-    drive_uuid: String,
+    /// Drive serial or UUID.
+    drive: String,
     /// Operator-supplied reason.
     #[arg(long)]
     reason: String,
@@ -3352,6 +3352,53 @@ async fn resolve_tape_uuid_arg(
         })
 }
 
+async fn resolve_drive_uuid_arg(
+    client: &mut pb::library_service_client::LibraryServiceClient<Channel>,
+    arg: &str,
+) -> Result<Vec<u8>, DaemonClientError> {
+    if let Ok(uuid) = parse_uuid_bytes(arg, "drive_uuid") {
+        return Ok(uuid);
+    }
+    let drive = client
+        .get_drive(pb::GetDriveRequest {
+            drive: arg.to_string(),
+        })
+        .await
+        .map_err(drive_status_error)?
+        .into_inner();
+    drive_uuid_from_selector(arg, Some(drive)).map_err(DaemonClientError::client)
+}
+
+fn drive_uuid_from_selector(
+    selector: &str,
+    drive: Option<pb::DriveCatalogEntry>,
+) -> Result<Vec<u8>, String> {
+    if let Ok(uuid) = parse_uuid_bytes(selector, "drive_uuid") {
+        return Ok(uuid);
+    }
+    let drive = drive.ok_or_else(|| {
+        format!("drive {selector:?} was not found by UUID or device-reported serial")
+    })?;
+    if !drive.actionable {
+        return Err(format!(
+            "drive serial {selector:?} is ambiguous or non-actionable; resolve the collision and retry with a drive UUID"
+        ));
+    }
+    if drive.drive_uuid.is_empty() {
+        return Err(format!(
+            "drive serial {selector:?} resolved without a drive UUID"
+        ));
+    }
+    Ok(drive.drive_uuid)
+}
+
+fn poll_drive_request(drive: &str) -> pb::PollDriveRequest {
+    pb::PollDriveRequest {
+        drive: drive.to_string(),
+        allow_derived_identity: false,
+    }
+}
+
 fn run_drive_client_command(
     endpoint: &str,
     json_output: bool,
@@ -3409,22 +3456,16 @@ fn run_drive_client_command(
                     print_drive_history(history, json_output, out).map_err(DaemonClientError::from)
                 }
                 DriveClientCommand::Alerts { drive } => {
-                    let history = client
-                        .get_drive_history(pb::GetDriveHistoryRequest {
-                            drive: drive.clone(),
-                            include_events: true,
-                            include_snapshots: true,
-                            page_token: None,
-                            page_size: 0,
-                        })
+                    let snapshot = client
+                        .poll_drive(poll_drive_request(drive))
                         .await
-                        .map_err(status_error)?
+                        .map_err(drive_status_error)?
                         .into_inner();
-                    print_drive_history(history, json_output, out).map_err(DaemonClientError::from)
+                    print_drive_snapshot(snapshot, json_output, out)
+                        .map_err(DaemonClientError::from)
                 }
                 DriveClientCommand::Annotate(args) => {
-                    let drive_uuid = parse_uuid_bytes(&args.drive_uuid, "drive_uuid")
-                        .map_err(DaemonClientError::from)?;
+                    let drive_uuid = resolve_drive_uuid_arg(&mut client, &args.drive).await?;
                     let drive = client
                         .annotate_drive(pb::AnnotateDriveRequest {
                             drive_uuid,
@@ -3441,8 +3482,7 @@ fn run_drive_client_command(
                     print_drive(drive, json_output, out).map_err(DaemonClientError::from)
                 }
                 DriveClientCommand::Retire(args) => {
-                    let drive_uuid = parse_uuid_bytes(&args.drive_uuid, "drive_uuid")
-                        .map_err(DaemonClientError::from)?;
+                    let drive_uuid = resolve_drive_uuid_arg(&mut client, &args.drive).await?;
                     let response = client
                         .retire_drive(pb::RetireDriveRequest {
                             drive_uuid,
@@ -3458,9 +3498,7 @@ fn run_drive_client_command(
                 }
                 DriveClientCommand::Poll { drive } => {
                     let snapshot = client
-                        .poll_drive(pb::PollDriveRequest {
-                            drive: drive.clone(),
-                        })
+                        .poll_drive(poll_drive_request(drive))
                         .await
                         .map_err(drive_status_error)?
                         .into_inner();
@@ -10369,6 +10407,50 @@ mod tests {
         assert_eq!(drive_status_name(1), "idle");
         assert_eq!(drive_status_name(5), "cleaning");
         assert_eq!(drive_status_name(99), "unknown(99)");
+    }
+
+    #[test]
+    fn drive_mutation_selector_accepts_uuid_or_serial_and_refuses_ambiguous_serial() {
+        let uuid = Uuid::new_v4();
+        assert_eq!(
+            drive_uuid_from_selector(&uuid.to_string(), None).unwrap(),
+            uuid.as_bytes().to_vec()
+        );
+
+        let resolved = Uuid::new_v4().as_bytes().to_vec();
+        assert_eq!(
+            drive_uuid_from_selector(
+                "DRV123",
+                Some(pb::DriveCatalogEntry {
+                    drive_uuid: resolved.clone(),
+                    serial: "DRV123".to_string(),
+                    actionable: true,
+                    ..Default::default()
+                }),
+            )
+            .unwrap(),
+            resolved
+        );
+
+        let err = drive_uuid_from_selector(
+            "DUPSER",
+            Some(pb::DriveCatalogEntry {
+                drive_uuid: Uuid::new_v4().as_bytes().to_vec(),
+                serial: "DUPSER".to_string(),
+                actionable: false,
+                ..Default::default()
+            }),
+        )
+        .expect_err("ambiguous serial must refuse");
+        assert!(err.contains("ambiguous"), "{err}");
+    }
+
+    #[test]
+    fn drive_alerts_uses_live_poll_drive_request() {
+        let request = poll_drive_request("DRV123");
+
+        assert_eq!(request.drive, "DRV123");
+        assert!(!request.allow_derived_identity);
     }
 
     #[test]
