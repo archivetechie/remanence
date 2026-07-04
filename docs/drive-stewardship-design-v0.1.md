@@ -1,10 +1,14 @@
-# Drive stewardship — catalog, auto-cleaning, live console — Design v0.2
+# Drive stewardship — catalog, auto-cleaning, live console — Design v0.3
 
-**Status:** panel folded (2026-07-04), awaiting verify round.
+**Status:** panel folded + verify-r1 fixes applied (2026-07-04);
+re-verify pending.
 **Panel 2026-07-04:** 68 findings (11 security / 17 failure-modes[codex] /
 13 contract / 15 UX / 12 cost), 8 blockers; deduped to ~35 folds; folded
-in one pass (this revision). Fold decisions recorded inline as **[fold]**
+in one pass (v0.2). Fold decisions recorded inline as **[fold]**
 notes where the rationale isn't obvious.
+**Verify r1 (codex, 2026-07-04):** 14/18 folds confirmed; 4 precision
+gaps + 5 majors + 7 minors — all fold-introduced specification gaps,
+no design-level objections; all fixed in this revision (v0.3).
 **Problem source:** operator request 2026-07-04 — three gaps: no drive
 history (the D2-era `devices` table never answered "tape fault or drive
 fault?"), no automatic cleaning, no live combined library+drive view.
@@ -165,14 +169,21 @@ create table if not exists drive_health_snapshots(
 create table if not exists clean_runs(     -- §4.3 durable state machine
   run_id text primary key,
   drive_uuid blob not null, library_serial text not null,
-  cart_tape_uuid blob not null, cart_home_slot integer not null,
+  cart_tape_uuid blob, cart_home_slot integer,  -- null until selection
   phase text not null, -- 'fencing'|'selecting'|'moving-in'|'cleaning'|
-                       -- 'moving-back'|'verifying'|'done'|
-                       -- 'failed-retryable'|'needs-operator'
+                       -- 'moving-back'|'verifying'|
+                       -- terminal: 'done'|'failed'|'needs-operator'
   trigger text not null,        -- 'auto-now'|'auto-periodic'|'manual'
   started_at_utc text not null, updated_at_utc text not null,
   detail text
 );
+create unique index if not exists clean_runs_one_active_per_drive
+  on clean_runs(drive_uuid)
+  where phase not in ('done','failed','needs-operator');
+create unique index if not exists clean_runs_one_active_per_cart
+  on clean_runs(cart_tape_uuid)
+  where phase not in ('done','failed','needs-operator')
+    and cart_tape_uuid is not null;
 create table if not exists alarms(         -- §4.4 subsystem
   alarm_id integer primary key,
   condition_key text not null unique, -- e.g. 'no-cln-cart:mainlib'
@@ -185,7 +196,7 @@ create table if not exists alarms(         -- §4.4 subsystem
 -- ensure_column additions:
 --   tapes.kind text not null default 'data'   ('data'|'cleaning')
 --   tapes.cleaning_uses integer                (null for data tapes)
---   tapes.cleaning_state text                  (null|'ok'|'expired')  §4.1
+--   tapes.cleaning_state text  (null | 'unverified'|'ok'|'expired'|'rejected')  §4.1
 --   sessions.drive_uuid blob                   (correlation join)
 ```
 
@@ -204,19 +215,23 @@ create table if not exists alarms(         -- §4.4 subsystem
   `drive_uuid`; correlation output labels these "unattributed
   (pre-stewardship)" rather than dropping them silently.
 - `tapes.kind` backfill: `migrate()` gains a one-time
-  `update tapes set kind='cleaning' where voltag glob 'CLN*'` (per
-  configured prefixes) guarded by "no committed object_copies",
-  mirroring the pool_id backfill (index.rs:4070-4087) — existing
-  inventoried CLN carts must not stay `data`.
+  `update tapes set kind='cleaning' where voltag glob 'CLN*'` guarded
+  by "no committed object_copies", mirroring the pool_id backfill
+  (index.rs:4070-4087). `migrate()` is config-free (verify-r1), so the
+  migration rule is the fixed `CLN` prefix only; additional configured
+  prefixes are applied by a config-aware post-open reconciliation pass
+  with the same guard — existing inventoried CLN carts must not stay
+  `data`.
 
 ### 3.4 Events vs audit (single timeline, no double-write)
 
 Lifecycle facts are **audit events** (additive `AuditEvent` variants):
 `DriveRetired`, `DriveAnnotated`, `DriveCleaned`,
-`CleaningCartridgeExpired`, `DriveFenced`, `DriveUnfenced` — the
-cleaning actor writes them with a distinct actor component
-(`System{component:"cleaning"}`) so autonomous robotics is forensically
-attributable. `drive_events` holds only **observational** facts
+`CleaningCartridgeExpired`, `DriveFenced`, `DriveUnfenced`,
+`AlarmAcked`, `CleaningCartridgeRegistered` — the existing unit
+`AuditActor::System` is kept unchanged (verify-r1: no actor-shape
+change); autonomous-cleaning events are forensically attributable via
+`component: "cleaning"` in their event detail payload. `drive_events` holds only **observational** facts
 (first-seen, bay-moved, firmware-changed, alert-observed, reappeared,
 serial-collision). `rem drive history` merges both streams at read
 time. **[fold]** Avoids double-writing the same fact to two stores
@@ -230,8 +245,8 @@ state-changing (security lens).
   the actor still owns the device, tagged with `session_id`,
   `tape_uuid`, `drive_uuid`; the DB insert is idempotent
   (`unique(session_id, trigger)`) and may complete asynchronously.
-  Snapshot failure is logged and alarmed after N consecutive misses,
-  never blocks session close.
+  Snapshot failure is logged and alarmed after `snapshot_miss_alarm`
+  (default 3) consecutive misses, never blocks session close.
 - **On alert** and **manual** (`rem drive poll <serial>`).
 - **Hourly liveness heartbeat:** `last_seen_utc` update only (TUR), no
   snapshot row. **[fold]** The drafted 15-min idle poll was the
@@ -265,8 +280,10 @@ proto:304-308; drives are not on-tape state): `ListDrives`, `GetDrive`,
 **AuthZ (new permission tier):** a new `AuthPermission::Lifecycle`
 gates `RetireDrive` (and future destructive lifecycle RPCs). Mapping:
 `AnnotateDrive` = Write; `CleanDrive`, `AckAlarm` = Robotics; reads =
-Readonly. The unix-socket `System` role retains all; the mTLS default
-`Readonly` role gets none of the mutations. `RetireDrive` additionally
+Readonly. `Lifecycle` is granted to the unix-socket `System` role
+ONLY — explicitly denied to `Operator`, `Orchestrator`, and `Readonly`
+(a future mTLS `Admin` role may join it) — and the mapping ships with
+permission tests covering every role × mutating-RPC pair. `RetireDrive` additionally
 requires an in-request acknowledgment field the server rejects without
 (the CLI ack-flag moved server-side), plus `allow_derived_identity`
 when applicable (§3.1).
@@ -313,12 +330,14 @@ rem alarms [--all] | rem alarms ack <condition-key>
 
 ### 4.1 Cleaning cartridges — classification hardened
 
-- `tapes.kind='cleaning'` assigned at registration by voltag prefix,
-  **corroborated** before the cart is ever auto-moved: the first clean
-  using a cart confirms it behaves as a cleaning cart (drive accepts +
-  runs cycle); until corroborated a cart is selectable but a
-  non-cleaning behavior (drive treats it as data media) aborts the run,
-  flips nothing, and raises an alarm.
+- `tapes.kind='cleaning'` assigned at registration by voltag prefix;
+  `cleaning_state` starts `'unverified'` and is promoted to `'ok'` by
+  the verify phase of the cart's first completed clean. An
+  `'unverified'` cart IS selectable; non-cleaning behavior during its
+  first run (the drive treats it as data media) terminates the run,
+  flips nothing, sets `cleaning_state='rejected'` (permanently excluded
+  from selection until an operator intervenes), and raises
+  `cart-not-cleaning-behavior`.
 - **Kind is one-way-guarded:** any kind flip on a tape with committed
   `object_copies` refuses and alarms — a misclassified data tape must
   never silently leave the durability floor NOR become an auto-move
@@ -351,8 +370,9 @@ rem alarms [--all] | rem alarms ack <condition-key>
 Any observation of flag 20/21 on a **managed** drive persists
 `drives.cleaning_due` (monotonic: `periodic` never downgrades `now`),
 cleared only by a verified clean. Detection points: session close,
-on-alert, manual poll. Foreign drives: §3.2 (no `cleaning_due` unless
-opt-in, and then advisory-alarm-only, ackable).
+on-alert, manual poll. Foreign drives NEVER get `cleaning_due`, even
+with `foreign_tapealert` opt-in — opt-in raises ackable advisory
+alarms only (§3.2).
 **Frequency cap [fold]:** per-drive minimum interval between auto-
 cleans (default 12 h) and a weekly cap (default 4); exceeding the cap
 raises `drive-cleaning-abnormal-frequency` **instead of** cleaning — a
@@ -376,8 +396,9 @@ reserved (its tape_uuid held by the run) before MOVE MEDIUM; a manual
 trigger while a run is active joins it (no-op with a message).
 
 **Robotics choke-point gate (security fold):** the envelope — source
-slot holds a confirmed `kind='cleaning'`, non-expired cart; destination
-is a drive in the same managed library — is verified in ONE place, a
+slot holds a `kind='cleaning'` cart with `cleaning_state` in
+`('unverified','ok')`; destination is a drive in the same managed
+library — is verified in ONE place, a
 pre-move guard where the cleaning actor submits to the changer actor,
 not smeared across selection code. The guard refuses anything else;
 both auto moves are audited.
@@ -399,16 +420,18 @@ done.
 **Verification before credit (codex fold):** eject alone is NOT
 success (expired media, operator removal, failed unload all look like
 "cart left the drive"). `verifying` requires: cart back in home slot,
-AND cycle duration ≥ a floor (expired carts eject in seconds), AND no
-flag 22 observed, AND a post-clean TapeAlert read on the managed drive
+AND cycle duration ≥ `cleaning.min_cycle_duration` (default 60 s —
+expired carts eject in seconds), AND no flag 22 observed, AND a post-clean TapeAlert read on the managed drive
 shows 20/21 no longer asserted (safe: rem is the only reader of managed
 drives). Only then: clear `cleaning_due`, increment `cleaning_uses`,
 `DriveCleaned` audit, unfence. Fast-eject or flag 22 →
 `cleaning_state='expired'` on the cart, try the next cart, else alarm.
 
-**Failure protocol (codex fold):** explicit terminal states.
-`failed-retryable` (move failure with cart safely in a slot): one
-retry, then alarm. `needs-operator` (cart stuck in drive, return move
+**Failure protocol (codex fold):** explicit terminal states (`done`,
+`failed`, `needs-operator`). A move failure with the cart safely in a
+slot is retried once WITHIN the run (attempt recorded in `detail`); a
+second failure terminates the run as `failed` + alarm.
+`needs-operator` (cart stuck in drive, return move
 failed, timeout at default 10 min): bay STAYS fenced, standing alarm
 names the run, the cart, and the recovery step; no auto-retry loops.
 The bay is never left fenced without an open alarm saying why.
@@ -424,9 +447,10 @@ acked alarms stop re-alarming until cleared-then-reraised. Surfaces:
 `rem alarms` (CLI, works headless — alarms must not live only inside
 the TUI), `GetLiveStatus` (top's pinned band), daemon log. Conditions
 in this design: `no-cln-cart`, `cleaning-needs-operator`,
-`cln-cart-expired`, `drive-cleaning-abnormal-frequency`,
-`retired-drive-reappeared`, `drive-serial-collision`,
-`foreign-drive-wants-cleaning` (opt-in only), `snapshot-persist-failing`.
+`cln-cart-expired`, `cart-not-cleaning-behavior`, `kind-flip-refused`,
+`drive-cleaning-abnormal-frequency`, `retired-drive-reappeared`,
+`drive-serial-collision`, `foreign-drive-wants-cleaning` (opt-in
+only), `snapshot-persist-failing`.
 
 *(Panel P2 resolved: auto-clean default stays ON for managed libraries
 — no lens objected; the frequency cap bounds the failure mode.)*
@@ -444,9 +468,11 @@ drive/slot state would drift; contract + cost lenses):
 `active_alert_names`; `Drive.Status` gains additive values `CLEANING`,
 `FENCED` (proto3 open enums: old consumers decode unknown ints and
 must render them pass-through — renderer catch-all arm required;
-one-line compat note in the proto). The response adds active
-operations (existing `OperationRef`s), open alarms, and a snapshot
-timestamp. Active-session bytes come from the existing
+one-line compat note in the proto). The response is one new wrapper
+message — `GetLiveStatusResponse { repeated LibraryState libraries,
+repeated OperationRef operations, repeated Alarm alarms,
+snapshot_at_utc, daemon_epoch }` — a composition of existing shapes
+that defines no parallel drive/slot messages. Active-session bytes come from the existing
 `WriteSession.bytes_committed` field — not re-counted.
 
 **Counters (codex fold):** lifetime byte counters are keyed by
@@ -459,10 +485,12 @@ the epoch changes or a counter decreases. Implementation: per-actor
 **Serving cost:** the snapshot is served from daemon memory + cached
 inventory — zero SCSI per poll; a server-side minimum poll interval
 (250 ms) bounds abusive clients. **Foreign changer polling is lazy
-[fold]:** READ ELEMENT STATUS against d2lib runs only while at least
-one `GetLiveStatus` consumer is connected (60 s cadence), with UA/
-conflict backoff; otherwise last-known inventory is served with its
-age. *(Panel P3 resolved: lazy + backoff, not continuous.)*
+[fold]:** READ ELEMENT STATUS against d2lib runs only while a
+live-status consumer is active — defined as any client whose last
+`GetLiveStatus` call was within `livestatus.foreign_poll_lease`
+(default 5 m; the RPC is polled, so "connected" is a recency lease,
+not a socket) — at 60 s cadence, with UA/conflict backoff; otherwise
+last-known inventory is served with its age. *(Panel P3 resolved: lazy + backoff, not continuous.)*
 
 ### 5.2 TUI — minimum glanceable v1, deps confined
 
@@ -494,18 +522,21 @@ managed_libraries = []        # default: daemon-operated set
 foreign_counter_poll = "60m"
 foreign_tapealert  = false    # operator decision 2026-07-04
 heartbeat          = "1h"
+snapshot_miss_alarm = 3       # consecutive misses before alarm
 
 [cleaning]
 auto               = true     # P2: default on, managed libraries only
-voltag_prefixes    = ["CLN"]
+voltag_prefixes    = ["CLN"]  # extra prefixes: post-open reconcile (§3.3)
 use_warn           = 45
 complete_timeout   = "10m"
+min_cycle_duration = "60s"    # verify floor; fast-eject = not a clean
 min_interval       = "12h"    # per drive
 weekly_cap         = 4        # per drive; exceed → alarm, not clean
 
 [livestatus]
 min_poll_interval  = "250ms"
-foreign_changer_poll = "60s"  # only while a consumer is connected
+foreign_changer_poll = "60s"  # only within the consumer lease below
+foreign_poll_lease = "5m"     # recency window defining an active consumer
 ```
 
 ## 7. Rollout matrix (codex fold)
@@ -532,8 +563,11 @@ foreign_changer_poll = "60s"  # only while a consumer is connected
   refusal; proto compat tests; harness scenario **DRV**: archive +
   restore, then assert drives registered, sessions carry `drive_uuid`,
   both correlation views (`rem drive show` rollup, `rem catalog tape`
-  rollup) answer, foreign d2lib drive present, labeled, and
-  non-actionable.
+  rollup) answer, foreign d2lib drive present and labeled `[foreign]`
+  with the read-only boundary asserted by a refused `clean`
+  (`actionable=0` is a different mechanism — §3.1 blank/collided
+  identity — asserted separately in a blank-serial fixture, not on the
+  d2lib drive).
 - **DS-M2:** chaos extension — `VirtualDrive` dirty state (scenario-
   armed flag 20 after N ops; cleaning-cart load clears + auto-ejects
   after a realistic cycle time; armed-expired cart fast-ejects with
