@@ -81,6 +81,8 @@ use zeroize::Zeroize;
 mod archive_ingest;
 mod archive_map;
 mod pool_ops;
+#[cfg(feature = "tui")]
+mod top;
 
 const DEFAULT_DAEMON_ENDPOINT: &str = "unix:/var/lib/rem/rem.sock";
 const DEFAULT_DEV_TAPE_RECORD_BYTES: usize = 1024 * 1024;
@@ -203,6 +205,7 @@ fn rem_debug_only_reason(cmd: &Command) -> Option<&'static str> {
         | Command::CatalogClient { .. }
         | Command::DriveClient { .. }
         | Command::AlarmsClient { .. }
+        | Command::Top { .. }
         | Command::TapeAlertsAlias { .. }
         | Command::Tape { .. } => None,
     }
@@ -215,6 +218,7 @@ fn rem_only_reason(cmd: &Command) -> Option<&'static str> {
         | Command::CatalogClient { .. }
         | Command::DriveClient { .. }
         | Command::AlarmsClient { .. }
+        | Command::Top { .. }
         | Command::TapeAlertsAlias { .. } => Some("daemon client commands"),
         Command::Libraries { .. }
         | Command::Library { .. }
@@ -444,6 +448,24 @@ enum RemCommand {
         command: Option<AlarmsClientCommand>,
     },
 
+    /// Live top view over daemon state.
+    Top {
+        /// Daemon gRPC endpoint URI.
+        #[arg(
+            long,
+            value_name = "URI",
+            default_value = DEFAULT_DAEMON_ENDPOINT,
+            global = true
+        )]
+        endpoint: String,
+        /// Emit stable JSON instead of the TUI.
+        #[arg(long, global = true)]
+        json: bool,
+        /// Fetch one live-status snapshot and exit.
+        #[arg(long, global = true)]
+        once: bool,
+    },
+
     /// Initialize tapes after the destructive-safety gauntlet.
     Tape {
         /// Tape operation to run.
@@ -534,6 +556,15 @@ impl From<RemCommand> for Command {
                 all,
                 command,
             },
+            RemCommand::Top {
+                endpoint,
+                json,
+                once,
+            } => Self::Top {
+                endpoint,
+                json,
+                once,
+            },
             RemCommand::Tape { command } => match command {
                 RemTapeCommand::Alerts(args) => Self::TapeAlertsAlias {
                     endpoint: args.endpoint,
@@ -582,6 +613,7 @@ fn state_changing_target(cmd: &Command) -> Option<&str> {
         | Command::CatalogClient { .. }
         | Command::DriveClient { .. }
         | Command::AlarmsClient { .. }
+        | Command::Top { .. }
         | Command::TapeAlertsAlias { .. }
         | Command::Tape { .. } => None,
     }
@@ -960,6 +992,24 @@ enum Command {
         /// Alarm command to run. Omitted means list alarms.
         #[command(subcommand)]
         command: Option<AlarmsClientCommand>,
+    },
+
+    /// Live top view over daemon state.
+    Top {
+        /// Daemon gRPC endpoint URI.
+        #[arg(
+            long,
+            value_name = "URI",
+            default_value = DEFAULT_DAEMON_ENDPOINT,
+            global = true
+        )]
+        endpoint: String,
+        /// Emit stable JSON instead of the TUI.
+        #[arg(long, global = true)]
+        json: bool,
+        /// Fetch one live-status snapshot and exit.
+        #[arg(long, global = true)]
+        once: bool,
     },
 
     /// Deprecated alias for `rem drive alerts`.
@@ -2733,6 +2783,11 @@ where
             all,
             command,
         } => return run_alarms_client_command(endpoint, *json, *all, command, out, err),
+        Command::Top {
+            endpoint,
+            json,
+            once,
+        } => return run_top_command(endpoint, *json, *once, out, err),
         Command::TapeAlertsAlias {
             endpoint,
             json,
@@ -3132,6 +3187,7 @@ where
         Command::Dev { command } => {
             return run_dev_command(&report, &command, &allow, &allow_derived, out, err);
         }
+        Command::Top { .. } => unreachable!("top command returns before discovery"),
     }
     print_warnings(&report, err);
     ExitCode::SUCCESS
@@ -3578,6 +3634,53 @@ fn run_alarms_client_command(
     finish_daemon_client_result(result, json_output, err)
 }
 
+fn run_top_command(
+    endpoint: &str,
+    json_output: bool,
+    once: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    if !json_output && !once {
+        #[cfg(feature = "tui")]
+        {
+            return top::run_top_tui(endpoint, out, err);
+        }
+        #[cfg(not(feature = "tui"))]
+        {
+            let _ = writeln!(
+                err,
+                "error: `rem top` interactive mode requires the `tui` feature"
+            );
+            let _ = writeln!(
+                err,
+                "       rebuild with default features or use `rem top --once --json`"
+            );
+            return ExitCode::from(1);
+        }
+    }
+
+    let result = daemon_runtime().and_then(|runtime| {
+        runtime.block_on(async {
+            let channel = connect_daemon(endpoint)
+                .await
+                .map_err(DaemonClientError::from)?;
+            let mut client = pb::library_service_client::LibraryServiceClient::new(channel);
+            let response = client
+                .get_live_status(pb::GetLiveStatusRequest {})
+                .await
+                .map_err(drive_status_error)?
+                .into_inner();
+            if json_output {
+                print_live_status_json(&response, out).map_err(DaemonClientError::from)
+            } else {
+                print_live_status_text(&response, out).map_err(DaemonClientError::from)
+            }
+        })
+    });
+    finish_top_client_result(result, json_output, err)
+}
+
 impl CatalogUnitOriginFilterArg {
     fn to_proto(self) -> pb::CatalogUnitOriginFilter {
         match self {
@@ -3649,6 +3752,30 @@ fn finish_daemon_client_result(
                 let _ = print_json_error(error.code, &error.message, err);
             } else {
                 let _ = writeln!(err, "error: {}", error.message);
+            }
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn finish_top_client_result(
+    result: Result<(), DaemonClientError>,
+    json_output: bool,
+    err: &mut dyn Write,
+) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            if json_output {
+                let _ = print_json_error(error.code, &error.message, err);
+            } else {
+                let _ = writeln!(err, "error: {}", error.message);
+            }
+            if error.message.starts_with("connect daemon at ") {
+                let _ = writeln!(
+                    err,
+                    "       use `rem library <serial> --slots` to inspect the current library state"
+                );
             }
             ExitCode::from(1)
         }
@@ -4385,6 +4512,127 @@ fn alarm_json(alarm: &pb::Alarm) -> Value {
         "acked_at_utc": timestamp_value(alarm.acked_at_utc.as_ref()),
         "detail": alarm.detail,
     })
+}
+
+fn drive_live_json(drive: &pb::Drive) -> Value {
+    json!({
+        "element_address": drive.element_address,
+        "drive_serial": drive.drive_serial,
+        "host_device_path": drive.host_device_path,
+        "vendor": drive.vendor,
+        "product": drive.product,
+        "loaded_tape_uuid": if drive.loaded_tape_uuid.is_empty() {
+            Value::Null
+        } else {
+            Value::String(bytes_to_uuid_text(&drive.loaded_tape_uuid))
+        },
+        "status": drive_status_name(drive.status),
+        "drive_uuid": bytes_to_uuid_text(&drive.drive_uuid),
+        "cleaning_due": drive.cleaning_due,
+        "fenced": drive.fenced,
+        "lifetime_read_bytes": drive.lifetime_read_bytes,
+        "lifetime_write_bytes": drive.lifetime_write_bytes,
+        "counter_epoch": drive.counter_epoch,
+        "session_id": if drive.session_id.is_empty() {
+            Value::Null
+        } else {
+            Value::String(bytes_to_uuid_text(&drive.session_id))
+        },
+        "active_alert_names": drive.active_alert_names,
+    })
+}
+
+fn library_state_json(state: &pb::LibraryState) -> Value {
+    json!({
+        "library": state.library.as_ref().map(|library| json!({
+            "library_serial": library.library_serial,
+            "vendor": library.vendor,
+            "product": library.product,
+            "product_revision": library.product_revision,
+            "library_uuid": bytes_to_uuid_text(&library.library_uuid),
+        })),
+        "drives": state.drives.iter().map(drive_live_json).collect::<Vec<_>>(),
+        "slots": state.slots.iter().map(|slot| {
+            json!({
+                "element_address": slot.element_address,
+                "voltag": slot.voltag,
+                "tape_uuid": if slot.tape_uuid.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String(bytes_to_uuid_text(&slot.tape_uuid))
+                },
+            })
+        }).collect::<Vec<_>>(),
+        "import_export_ports": state.import_export_ports.iter().map(|port| {
+            json!({
+                "element_address": port.element_address,
+                "voltag": port.voltag,
+                "tape_uuid": if port.tape_uuid.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String(bytes_to_uuid_text(&port.tape_uuid))
+                },
+            })
+        }).collect::<Vec<_>>(),
+        "last_inventory_at": timestamp_value(state.last_inventory_at.as_ref()),
+        "managed": state.managed,
+    })
+}
+
+fn print_live_status_json(
+    response: &pb::GetLiveStatusResponse,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let data = json!({
+        "libraries": response.libraries.iter().map(library_state_json).collect::<Vec<_>>(),
+        "operations": response.operations.iter().map(|operation| {
+            json!({
+                "operation_id": bytes_to_uuid_text(&operation.operation_id),
+            })
+        }).collect::<Vec<_>>(),
+        "alarms": response.alarms.iter().map(alarm_json).collect::<Vec<_>>(),
+        "snapshot_at_utc": response.snapshot_at_utc,
+        "daemon_epoch": response.daemon_epoch,
+    });
+    print_json_envelope("rem.top.v1", "item", data, out)
+}
+
+fn print_live_status_text(
+    response: &pb::GetLiveStatusResponse,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let _ = writeln!(
+        out,
+        "snapshot_at_utc: {}  daemon_epoch: {}",
+        response.snapshot_at_utc, response.daemon_epoch
+    );
+    for library in &response.libraries {
+        let serial = library
+            .library
+            .as_ref()
+            .map(|value| value.library_serial.as_str())
+            .unwrap_or("<unknown>");
+        let managed = library.managed.as_str();
+        let _ = writeln!(out, "library {serial} [{managed}]");
+        for drive in &library.drives {
+            let tape = if drive.loaded_tape_uuid.is_empty() {
+                "-"
+            } else {
+                "loaded"
+            };
+            let _ = writeln!(
+                out,
+                "  bay {bay:04x} serial={serial} tape={tape} state={state} read={read} write={write} epoch={epoch}",
+                bay = drive.element_address,
+                serial = drive.drive_serial,
+                state = drive_status_name(drive.status),
+                read = drive.lifetime_read_bytes,
+                write = drive.lifetime_write_bytes,
+                epoch = drive.counter_epoch,
+            );
+        }
+    }
+    Ok(())
 }
 
 fn tape_file_json(file: &pb::TapeFile) -> Value {
@@ -10449,6 +10697,110 @@ mod tests {
         );
     }
 
+    fn sample_live_status_response() -> pb::GetLiveStatusResponse {
+        pb::GetLiveStatusResponse {
+            libraries: vec![pb::LibraryState {
+                library: Some(pb::Library {
+                    library_serial: "MAINLIB".to_string(),
+                    vendor: "HPE".to_string(),
+                    product: "MSL".to_string(),
+                    product_revision: "6.40".to_string(),
+                    library_uuid: Uuid::from_u128(1).as_bytes().to_vec(),
+                }),
+                drives: vec![pb::Drive {
+                    element_address: 0x0100,
+                    drive_serial: "DRV-01".to_string(),
+                    host_device_path: "/dev/sg1".to_string(),
+                    vendor: "HPE".to_string(),
+                    product: "LTO".to_string(),
+                    loaded_tape_uuid: Uuid::from_u128(2).as_bytes().to_vec(),
+                    status: pb::drive::Status::DriveStatusCleaning as i32,
+                    drive_uuid: Uuid::from_u128(3).as_bytes().to_vec(),
+                    cleaning_due: "now".to_string(),
+                    fenced: true,
+                    lifetime_read_bytes: 1_048_576,
+                    lifetime_write_bytes: 2_097_152,
+                    counter_epoch: 42,
+                    session_id: Uuid::from_u128(4).as_bytes().to_vec(),
+                    active_alert_names: vec!["cleaning".to_string()],
+                }],
+                slots: vec![pb::Slot {
+                    element_address: 0x0200,
+                    voltag: "CLN001".to_string(),
+                    tape_uuid: Uuid::from_u128(2).as_bytes().to_vec(),
+                }],
+                import_export_ports: Vec::new(),
+                last_inventory_at: Some(prost_types::Timestamp {
+                    seconds: 1,
+                    nanos: 0,
+                }),
+                managed: "rem".to_string(),
+            }],
+            operations: vec![pb::OperationRef {
+                operation_id: Uuid::from_u128(5).as_bytes().to_vec(),
+            }],
+            alarms: vec![pb::Alarm {
+                alarm_id: 1,
+                condition_key: "kind:scope".to_string(),
+                kind: "kind".to_string(),
+                severity: "warning".to_string(),
+                state: "open".to_string(),
+                first_seen_utc: Some(prost_types::Timestamp {
+                    seconds: 1,
+                    nanos: 0,
+                }),
+                last_seen_utc: Some(prost_types::Timestamp {
+                    seconds: 1,
+                    nanos: 0,
+                }),
+                acked_by: String::new(),
+                acked_at_utc: None,
+                detail: String::new(),
+            }],
+            snapshot_at_utc: "2026-07-04T00:00:00Z".to_string(),
+            daemon_epoch: 17,
+        }
+    }
+
+    #[test]
+    fn top_json_uses_cli_envelope() {
+        let mut out = Vec::<u8>::new();
+        print_live_status_json(&sample_live_status_response(), &mut out).unwrap();
+
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["schema"], "rem.top.v1");
+        assert_eq!(value["kind"], "item");
+        assert_eq!(value["data"]["daemon_epoch"], 17);
+        assert_eq!(value["data"]["libraries"][0]["managed"], "rem");
+        assert_eq!(
+            value["data"]["libraries"][0]["drives"][0]["status"],
+            "cleaning"
+        );
+        assert!(value["operation"].is_null());
+    }
+
+    #[test]
+    fn top_unreachable_banner_points_to_library_command() {
+        let mut out = Vec::<u8>::new();
+        let mut err = Vec::<u8>::new();
+        let code = run_top_command(
+            "unix:/tmp/rem-top-missing.sock",
+            true,
+            true,
+            &mut out,
+            &mut err,
+        );
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(
+            out.is_empty(),
+            "unexpected stdout: {}",
+            String::from_utf8_lossy(&out)
+        );
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(stderr.contains("rem library"), "{stderr}");
+    }
+
     #[test]
     fn drive_status_renderer_passes_unknown_proto_enum_ints_through() {
         assert_eq!(drive_status_name(1), "idle");
@@ -10519,55 +10871,30 @@ mod tests {
             .unwrap();
         let index = remanence_state::CatalogIndex::open(temp.path().join("state.sqlite")).unwrap();
         let state = remanence_api::ApiState::new(index);
-        let socket_path = temp.path().join("daemon.sock");
-        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-        let server = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.block_on(async move {
-                let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
-                addr_tx.send(socket_path).unwrap();
-                tonic::transport::Server::builder()
-                    .add_service(pb::daemon_server::DaemonServer::new(state.daemon_service()))
-                    .serve_with_incoming_shutdown(
-                        tokio_stream::wrappers::UnixListenerStream::new(listener),
-                        async {
-                            let _ = shutdown_rx.await;
-                        },
-                    )
-                    .await
-                    .unwrap();
-            });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let response = runtime.block_on(async move {
+            let mut request = tonic::Request::new(());
+            request
+                .metadata_mut()
+                .insert("x-remanence-role", "readonly".parse().unwrap());
+            pb::daemon_server::Daemon::health(&state.daemon_service(), request)
+                .await
+                .expect("health should succeed")
+                .into_inner()
         });
 
-        let endpoint = format!("unix:{}", addr_rx.recv().unwrap().display());
-        let cli = Cli::parse_from(["rem", "daemon", "--endpoint", &endpoint, "health"]);
-        let mut out = Vec::<u8>::new();
-        let mut err = Vec::<u8>::new();
-        let code = run(
-            cli,
-            move || -> Result<DiscoveryReport, DiscoveryError> {
-                panic!("discover_fn must not be called for daemon client command")
-            },
-            &mut out,
-            &mut err,
+        assert_eq!(response.status, pb::health_response::Status::Healthy as i32);
+        assert_eq!(
+            response.components.get("sqlite_index").map(String::as_str),
+            Some("ok")
         );
-        let _ = shutdown_tx.send(());
-        server.join().unwrap();
-
-        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
         assert!(
-            err.is_empty(),
-            "stderr should be empty: {}",
-            String::from_utf8_lossy(&err)
+            response.detail.contains("sqlite quick_check=ok"),
+            "{response:?}"
         );
-        let stdout = String::from_utf8(out).unwrap();
-        assert!(stdout.contains("status: healthy"), "{stdout}");
-        assert!(stdout.contains("sqlite_index: ok"), "{stdout}");
     }
 
     #[tokio::test]

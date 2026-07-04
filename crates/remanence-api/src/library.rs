@@ -282,7 +282,7 @@ fn drive_snapshot_to_proto(record: DriveHealthSnapshotRecord) -> pb::DriveHealth
     }
 }
 
-fn alarm_to_proto(record: AlarmRecord) -> pb::Alarm {
+pub(crate) fn alarm_to_proto(record: AlarmRecord) -> pb::Alarm {
     pb::Alarm {
         alarm_id: u64::try_from(record.alarm_id).unwrap_or_default(),
         condition_key: record.condition_key,
@@ -821,7 +821,8 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         request: Request<pb::GetLiveStatusRequest>,
     ) -> Result<Response<pb::GetLiveStatusResponse>, Status> {
         crate::authorize_request(&request, crate::AuthPermission::Read)?;
-        Err(Status::unimplemented("GetLiveStatus is DS-M3"))
+        let response = self.state.live_status_response().await?;
+        Ok(Response::new(response))
     }
 
     async fn move_medium(
@@ -1512,6 +1513,105 @@ mod tests {
                 .all(|record| record.event != remanence_state::AuditEvent::AlarmAcked),
             "cleared alarm ack must not append AlarmAcked audit: {audit_records:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn get_live_status_projects_drive_states_counters_and_alarms() {
+        let mut index = test_index();
+        let drive_uuid = observe_test_drive(&mut index, "DRV-LIVE", "DvcidAndInquiry", 1);
+        index
+            .begin_clean_run(&drive_uuid, "DEC418146K_LL02", "manual", None)
+            .expect("begin clean run");
+        index
+            .raise_alarm(
+                "drive-cleaning-abnormal-frequency:DEC418146K_LL02",
+                "drive-cleaning-abnormal-frequency",
+                "warning",
+                Some("{}"),
+            )
+            .expect("raise alarm");
+        let mut state = state_with_snapshot();
+        state.index_path = Arc::new(index.path().to_path_buf());
+        state.record_drive_read_bytes(drive_uuid.as_slice(), 1_024);
+        state.record_drive_write_bytes(drive_uuid.as_slice(), 2_048);
+
+        let response = state
+            .library_service()
+            .get_live_status(Request::new(pb::GetLiveStatusRequest {}))
+            .await
+            .expect("live status")
+            .into_inner();
+
+        assert_eq!(response.daemon_epoch, state.daemon_epoch);
+        assert_eq!(response.libraries.len(), 1);
+        assert_eq!(response.alarms.len(), 1);
+        let library = &response.libraries[0];
+        assert_eq!(library.managed, "rem");
+        assert_eq!(library.drives.len(), 1);
+        let drive = &library.drives[0];
+        assert_eq!(drive.drive_uuid, drive_uuid);
+        assert_eq!(drive.lifetime_read_bytes, 1_024);
+        assert_eq!(drive.lifetime_write_bytes, 2_048);
+        assert_eq!(drive.status, pb::drive::Status::DriveStatusCleaning as i32);
+        assert_eq!(drive.active_alert_names, vec!["cleaning".to_string()]);
+        assert_ne!(drive.counter_epoch, 0);
+    }
+
+    #[tokio::test]
+    async fn get_live_status_marks_fenced_drives() {
+        let mut index = test_index();
+        let drive_uuid = observe_test_drive(&mut index, "DRV-FENCED", "DvcidAndInquiry", 1);
+        index
+            .set_drive_fenced(drive_uuid.as_slice(), true)
+            .expect("fence drive");
+        let mut state = state_with_snapshot();
+        state.index_path = Arc::new(index.path().to_path_buf());
+
+        let response = state
+            .library_service()
+            .get_live_status(Request::new(pb::GetLiveStatusRequest {}))
+            .await
+            .expect("live status")
+            .into_inner();
+
+        let drive = &response.libraries[0].drives[0];
+        assert_eq!(drive.status, pb::drive::Status::DriveStatusFenced as i32);
+        assert!(drive.fenced);
+    }
+
+    #[tokio::test]
+    async fn live_status_counter_epoch_changes_across_state_restarts() {
+        let mut index = test_index();
+        let drive_uuid = observe_test_drive(&mut index, "DRV-EPOCH", "DvcidAndInquiry", 1);
+
+        let mut first = state_with_snapshot();
+        first.index_path = Arc::new(index.path().to_path_buf());
+        first.record_drive_read_bytes(drive_uuid.as_slice(), 1);
+        let first_epoch = first
+            .library_service()
+            .get_live_status(Request::new(pb::GetLiveStatusRequest {}))
+            .await
+            .expect("live status")
+            .into_inner()
+            .libraries[0]
+            .drives[0]
+            .counter_epoch;
+
+        let mut second = state_with_snapshot();
+        second.index_path = Arc::new(index.path().to_path_buf());
+        let second_epoch = second
+            .library_service()
+            .get_live_status(Request::new(pb::GetLiveStatusRequest {}))
+            .await
+            .expect("live status")
+            .into_inner()
+            .libraries[0]
+            .drives[0]
+            .counter_epoch;
+
+        assert_ne!(first_epoch, 0);
+        assert_ne!(second_epoch, 0);
+        assert_ne!(first_epoch, second_epoch);
     }
 
     #[tokio::test]

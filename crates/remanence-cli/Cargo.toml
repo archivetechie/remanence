@@ -25,6 +25,7 @@ remanence-library = { path = "../remanence-library" }
 remanence-state   = { path = "../remanence-state" }
 remanence-stream  = { path = "../remanence-stream" }
 remanence-api     = { path = "../remanence-api" }
+crossterm         = { version = "0.28", optional = true }
 ciborium          = { workspace = true }
 clap              = { workspace = true }
 prost-types       = { workspace = true }
@@ -38,14 +39,16 @@ tonic             = { workspace = true }
 uuid              = { workspace = true }
 xattr             = { workspace = true }
 zeroize           = { workspace = true }
+ratatui           = { version = "0.29", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
 
 [features]
-default = []
+default = ["tui"]
 foreign-bru = ["dep:remanence-bru", "remanence-api/foreign-bru"]
+tui = ["dep:ratatui", "dep:crossterm"]
 
 # Enables the `rem watch` subcommand by pulling in the
 # `linux-udev` backend from `remanence-library` and a tokio runtime.
