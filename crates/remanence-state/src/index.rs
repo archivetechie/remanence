@@ -1384,13 +1384,16 @@ impl CatalogIndex {
                     json_escape_text(&run.run_id),
                     json_escape_text(&hex_uuid_from_slice(&run.drive_uuid)),
                 );
-                self.mark_clean_run_needs_operator(run.run_id.as_str(), Some(detail.as_str()))?;
-                let _ = self.raise_alarm(
+                // Alarm FIRST, then terminalize: if the alarm write fails the
+                // run stays non-terminal and the next reconcile retries both
+                // (same atomicity invariant as fence+alarm; re-check finding).
+                self.raise_alarm(
                     format!("cleaning-needs-operator:{}", run.run_id).as_str(),
                     "cleaning-needs-operator",
                     "warning",
                     Some(detail.as_str()),
                 )?;
+                self.mark_clean_run_needs_operator(run.run_id.as_str(), Some(detail.as_str()))?;
                 reconciled = reconciled.saturating_add(1);
                 continue;
             };
