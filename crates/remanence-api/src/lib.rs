@@ -392,12 +392,10 @@ impl ApiState {
         let mut state = Self::new_with_pool_configs_inner(
             index_path.clone(),
             pool_configs,
-            config
-                .drives
-                .managed_libraries
-                .iter()
-                .map(|serial| serial.trim().to_string())
-                .collect(),
+            // Same rule as the write_owner cfg above: configured-or-daemon-
+            // operated, never the raw (default-empty) config list — empty
+            // trips library_is_managed's empty⇒all fallback.
+            drive_managed_library_serials(config),
             config.audit.dir.clone(),
             config.audit.fsync,
             audit_append_lock,
