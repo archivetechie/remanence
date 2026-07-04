@@ -69,9 +69,11 @@ pub(crate) fn project_drive(
     bay: &DriveBay,
     voltags: &HashMap<String, Vec<u8>>,
     busy_bays: &HashSet<u16>,
+    fenced_bays: &HashSet<u16>,
 ) -> pb::Drive {
     let installed = bay.installed.as_ref();
     let busy = busy_bays.contains(&bay.element_address);
+    let fenced = fenced_bays.contains(&bay.element_address);
     pb::Drive {
         element_address: u32::from(bay.element_address),
         drive_serial: installed
@@ -88,10 +90,14 @@ pub(crate) fn project_drive(
             .and_then(|drive| drive.product.clone())
             .unwrap_or_default(),
         loaded_tape_uuid: joined_tape_uuid(&bay.loaded_tape, voltags),
-        status: drive_status(bay, busy) as i32,
+        status: if fenced {
+            pb::drive::Status::DriveStatusFenced
+        } else {
+            drive_status(bay, busy)
+        } as i32,
         drive_uuid: Vec::new(),
         cleaning_due: String::new(),
-        fenced: false,
+        fenced,
         lifetime_read_bytes: 0,
         lifetime_write_bytes: 0,
         counter_epoch: 0,
@@ -122,13 +128,14 @@ pub(crate) fn project_library_state(
     captured_at: &OffsetDateTime,
     voltags: &HashMap<String, Vec<u8>>,
     busy_bays: &HashSet<u16>,
+    fenced_bays: &HashSet<u16>,
 ) -> pb::LibraryState {
     pb::LibraryState {
         library: Some(project_library(library)),
         drives: library
             .drive_bays
             .iter()
-            .map(|bay| project_drive(bay, voltags, busy_bays))
+            .map(|bay| project_drive(bay, voltags, busy_bays, fenced_bays))
             .collect(),
         slots: library
             .slots
@@ -162,6 +169,28 @@ pub(crate) fn voltag_uuid_map(index: &CatalogIndex) -> Result<HashMap<String, Ve
         }
     }
     Ok(map)
+}
+
+fn fenced_drive_bays(index: &CatalogIndex, library_serial: &str) -> Result<HashSet<u16>, Status> {
+    let mut bays = HashSet::new();
+    for drive in index
+        .list_drives(true, true)
+        .map_err(crate::status_from_state_error)?
+    {
+        if !drive.fenced {
+            continue;
+        }
+        if drive.last_library_serial.as_deref() != Some(library_serial) {
+            continue;
+        }
+        if let Some(bay) = drive
+            .last_element_address
+            .and_then(|value| u16::try_from(value).ok())
+        {
+            bays.insert(bay);
+        }
+    }
+    Ok(bays)
 }
 
 fn drive_record_to_proto(record: DriveRecord) -> pb::DriveCatalogEntry {
@@ -460,11 +489,13 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         let index = self.state.index()?;
         let voltags = voltag_uuid_map(&index)?;
         let busy_bays = self.state.busy_drive_bays();
+        let fenced_bays = fenced_drive_bays(&index, library.serial.as_str())?;
         Ok(Response::new(project_library_state(
             library,
             &snapshot.captured_at,
             &voltags,
             &busy_bays,
+            &fenced_bays,
         )))
     }
 
@@ -703,8 +734,47 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::CleanDriveRequest>,
     ) -> Result<Response<pb::OperationRef>, Status> {
-        crate::authorize_request(&request, crate::AuthPermission::Robotics)?;
-        Err(Status::unimplemented("CleanDrive is DS-M2"))
+        let actor = crate::authorize_request(&request, crate::AuthPermission::Robotics)?;
+        let request = request.into_inner();
+        crate::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
+        let index = self.state.index_write()?;
+        let drive = index
+            .get_drive_by_uuid(&request.drive_uuid)
+            .map_err(crate::status_from_state_error)?
+            .ok_or_else(|| Status::not_found("drive not found"))?;
+        ensure_mutable_drive(&drive, request.allow_derived_identity)?;
+        if drive.managed != "rem" {
+            return Err(Status::failed_precondition(
+                "cleaning is only available for managed drives",
+            ));
+        }
+        if drive.state != "active" {
+            return Err(Status::failed_precondition("cannot clean a retired drive"));
+        }
+        let library_serial = drive.last_library_serial.clone().ok_or_else(|| {
+            Status::failed_precondition("drive has no current library assignment")
+        })?;
+        let mut detail = BTreeMap::new();
+        detail.insert(
+            "drive_uuid".to_string(),
+            CborValue::Bytes(request.drive_uuid.clone()),
+        );
+        detail.insert(
+            "component".to_string(),
+            CborValue::Text("cleaning".to_string()),
+        );
+        let action = crate::write_owner::RoboticsAction::Clean {
+            drive_uuid: request.drive_uuid.clone(),
+            trigger: "manual".to_string(),
+        };
+        self.dispatch_robotics(
+            actor,
+            &library_uuid(library_serial.as_str()),
+            "clean_drive",
+            action,
+            detail,
+        )
+        .await
     }
 
     async fn list_alarms(
@@ -1077,6 +1147,7 @@ mod tests {
             &OffsetDateTime::UNIX_EPOCH,
             &voltags,
             &HashSet::new(),
+            &HashSet::new(),
         );
         assert_eq!(
             state.library.expect("library").library_serial,
@@ -1109,12 +1180,30 @@ mod tests {
             &OffsetDateTime::UNIX_EPOCH,
             &voltags,
             &HashSet::from([1]),
+            &HashSet::new(),
         );
 
         assert_eq!(
             state.drives[0].status,
             pb::drive::Status::DriveStatusBusy as i32
         );
+    }
+
+    #[test]
+    fn project_library_state_marks_fenced_drive() {
+        let state = project_library_state(
+            &mk_library(),
+            &OffsetDateTime::UNIX_EPOCH,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::from([1]),
+        );
+
+        assert_eq!(
+            state.drives[0].status,
+            pb::drive::Status::DriveStatusFenced as i32
+        );
+        assert!(state.drives[0].fenced);
     }
 
     #[tokio::test]

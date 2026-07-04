@@ -253,6 +253,22 @@ pub struct DriveRecord {
     pub retire_reason: Option<String>,
 }
 
+/// Durable cleaning-run row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct CleanRunRecord {
+    pub run_id: String,
+    pub drive_uuid: Vec<u8>,
+    pub library_serial: String,
+    pub cart_tape_uuid: Option<Vec<u8>>,
+    pub cart_home_slot: Option<i64>,
+    pub phase: String,
+    pub trigger: String,
+    pub started_at_utc: String,
+    pub updated_at_utc: String,
+    pub detail: Option<String>,
+}
+
 /// Input for inserting or updating a drive observation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(missing_docs)]
@@ -1101,6 +1117,7 @@ impl CatalogIndex {
                    and last_element_address = ?2
                    and state = 'active'
                    and actionable = 1
+                   and fenced = 0
                  order by last_seen_utc desc, hex(drive_uuid)
                  limit 1",
             )
@@ -1108,6 +1125,377 @@ impl CatalogIndex {
         stmt.query_row(params![library_serial, element_address], drive_from_row)
             .optional()
             .map_err(|err| sqlite_error("query drive bay lookup", err))
+    }
+
+    /// List clean runs, including terminal rows when requested.
+    pub fn list_clean_runs(
+        &self,
+        include_terminal: bool,
+    ) -> Result<Vec<CleanRunRecord>, StateError> {
+        let where_clause = if include_terminal {
+            ""
+        } else {
+            " where phase not in ('done','failed','needs-operator')"
+        };
+        let sql = format!(
+            "select run_id, drive_uuid, library_serial, cart_tape_uuid,
+                    cart_home_slot, phase, trigger, started_at_utc,
+                    updated_at_utc, detail
+             from clean_runs{where_clause}
+             order by started_at_utc, run_id"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|err| sqlite_error("prepare clean run list", err))?;
+        let rows = stmt
+            .query_map([], clean_run_from_row)
+            .map_err(|err| sqlite_error("query clean run list", err))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| sqlite_error("read clean run list", err))
+    }
+
+    /// Fetch the active clean run for one drive.
+    pub fn get_active_clean_run_by_drive(
+        &self,
+        drive_uuid: &[u8],
+    ) -> Result<Option<CleanRunRecord>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select run_id, drive_uuid, library_serial, cart_tape_uuid,
+                        cart_home_slot, phase, trigger, started_at_utc,
+                        updated_at_utc, detail
+                 from clean_runs
+                 where drive_uuid = ?1
+                   and phase not in ('done','failed','needs-operator')
+                 order by updated_at_utc desc, run_id
+                 limit 1",
+            )
+            .map_err(|err| sqlite_error("prepare clean run drive lookup", err))?;
+        stmt.query_row(params![drive_uuid], clean_run_from_row)
+            .optional()
+            .map_err(|err| sqlite_error("query clean run drive lookup", err))
+    }
+
+    /// Fetch the active clean run for one cleaning cartridge.
+    pub fn get_active_clean_run_by_cart(
+        &self,
+        cart_tape_uuid: &[u8],
+    ) -> Result<Option<CleanRunRecord>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select run_id, drive_uuid, library_serial, cart_tape_uuid,
+                        cart_home_slot, phase, trigger, started_at_utc,
+                        updated_at_utc, detail
+                 from clean_runs
+                 where cart_tape_uuid = ?1
+                   and phase not in ('done','failed','needs-operator')
+                 order by updated_at_utc desc, run_id
+                 limit 1",
+            )
+            .map_err(|err| sqlite_error("prepare clean run cart lookup", err))?;
+        stmt.query_row(params![cart_tape_uuid], clean_run_from_row)
+            .optional()
+            .map_err(|err| sqlite_error("query clean run cart lookup", err))
+    }
+
+    /// Fence or unfence one drive in the durable catalog.
+    pub fn set_drive_fenced(
+        &mut self,
+        drive_uuid: &[u8],
+        fenced: bool,
+    ) -> Result<Option<DriveRecord>, StateError> {
+        self.conn
+            .execute(
+                "update drives set fenced = ?2 where drive_uuid = ?1",
+                params![drive_uuid, if fenced { 1 } else { 0 }],
+            )
+            .map_err(|err| sqlite_error("set drive fenced", err))?;
+        self.get_drive_by_uuid(drive_uuid)
+    }
+
+    /// Create or join the active clean run for one drive.
+    pub fn begin_clean_run(
+        &mut self,
+        drive_uuid: &[u8],
+        library_serial: &str,
+        trigger: &str,
+        detail: Option<&str>,
+    ) -> Result<CleanRunRecord, StateError> {
+        if let Some(existing) = self.get_active_clean_run_by_drive(drive_uuid)? {
+            return Ok(existing);
+        }
+        let run_id = Uuid::new_v4().to_string();
+        let now = now_utc()?;
+        self.conn
+            .execute(
+                "insert into clean_runs(
+                   run_id, drive_uuid, library_serial, cart_tape_uuid,
+                   cart_home_slot, phase, trigger, started_at_utc,
+                   updated_at_utc, detail
+                 )
+                 values(?1, ?2, ?3, null, null, 'fencing', ?4, ?5, ?5, ?6)",
+                params![run_id, drive_uuid, library_serial, trigger, now, detail],
+            )
+            .map_err(|err| sqlite_error("insert clean run", err))?;
+        self.get_active_clean_run_by_drive(drive_uuid)?
+            .ok_or_else(|| StateError::IndexCorrupt("inserted clean run is missing".to_string()))
+    }
+
+    /// Update the active clean run's selected cart and phase.
+    pub fn select_clean_run_cart(
+        &mut self,
+        run_id: &str,
+        cart_tape_uuid: &[u8],
+        cart_home_slot: i64,
+        detail: Option<&str>,
+    ) -> Result<Option<CleanRunRecord>, StateError> {
+        let now = now_utc()?;
+        self.conn
+            .execute(
+                "update clean_runs
+                 set cart_tape_uuid = ?2,
+                     cart_home_slot = ?3,
+                     phase = 'selecting',
+                     updated_at_utc = ?4,
+                     detail = ?5
+                 where run_id = ?1",
+                params![run_id, cart_tape_uuid, cart_home_slot, now, detail],
+            )
+            .map_err(|err| sqlite_error("select clean run cart", err))?;
+        self.get_clean_run(run_id)
+    }
+
+    /// Advance one clean run to a new phase.
+    pub fn advance_clean_run(
+        &mut self,
+        run_id: &str,
+        phase: &str,
+        detail: Option<&str>,
+    ) -> Result<Option<CleanRunRecord>, StateError> {
+        let now = now_utc()?;
+        self.conn
+            .execute(
+                "update clean_runs
+                 set phase = ?2,
+                     updated_at_utc = ?3,
+                     detail = ?4
+                 where run_id = ?1",
+                params![run_id, phase, now, detail],
+            )
+            .map_err(|err| sqlite_error("advance clean run", err))?;
+        self.get_clean_run(run_id)
+    }
+
+    /// Mark one clean run terminal with a failure-like phase.
+    pub fn terminalize_clean_run(
+        &mut self,
+        run_id: &str,
+        phase: &str,
+        detail: Option<&str>,
+    ) -> Result<Option<CleanRunRecord>, StateError> {
+        self.advance_clean_run(run_id, phase, detail)
+    }
+
+    /// Finish a clean run and apply verified credit.
+    pub fn finalize_verified_clean_run(
+        &mut self,
+        run_id: &str,
+        drive_uuid: &[u8],
+        cart_tape_uuid: Option<&[u8]>,
+        detail: Option<&str>,
+    ) -> Result<Option<DriveRecord>, StateError> {
+        let now = now_utc()?;
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|err| sqlite_error("begin verified clean run transaction", err))?;
+        if let Some(cart_tape_uuid) = cart_tape_uuid {
+            tx.execute(
+                "update tapes
+                 set cleaning_uses = coalesce(cleaning_uses, 0) + 1,
+                     cleaning_state = case
+                       when cleaning_state = 'unverified' then 'ok'
+                       else cleaning_state
+                     end
+                 where tape_uuid = ?1
+                   and kind = 'cleaning'",
+                params![cart_tape_uuid],
+            )
+            .map_err(|err| sqlite_error("credit cleaned cartridge", err))?;
+        }
+        tx.execute(
+            "update drives
+             set cleaning_due = 'none',
+                 fenced = 0,
+                 last_seen_utc = ?2
+             where drive_uuid = ?1",
+            params![drive_uuid, now.as_str()],
+        )
+        .map_err(|err| sqlite_error("clear drive cleaning due", err))?;
+        tx.execute(
+            "update clean_runs
+             set phase = 'done',
+                 updated_at_utc = ?2,
+                 detail = ?3
+             where run_id = ?1",
+            params![run_id, now.as_str(), detail],
+        )
+        .map_err(|err| sqlite_error("finish clean run", err))?;
+        tx.commit()
+            .map_err(|err| sqlite_error("commit verified clean run transaction", err))?;
+        self.get_drive_by_uuid(drive_uuid)
+    }
+
+    /// Mark one clean run needing operator intervention.
+    pub fn mark_clean_run_needs_operator(
+        &mut self,
+        run_id: &str,
+        detail: Option<&str>,
+    ) -> Result<Option<CleanRunRecord>, StateError> {
+        self.advance_clean_run(run_id, "needs-operator", detail)
+    }
+
+    /// Mark one clean run failed.
+    pub fn mark_clean_run_failed(
+        &mut self,
+        run_id: &str,
+        detail: Option<&str>,
+    ) -> Result<Option<CleanRunRecord>, StateError> {
+        self.advance_clean_run(run_id, "failed", detail)
+    }
+
+    /// Reconcile active clean runs against one library snapshot.
+    pub fn reconcile_clean_runs_against_library(
+        &mut self,
+        library: &remanence_library::Library,
+    ) -> Result<u64, StateError> {
+        let active_runs = self.list_clean_runs(false)?;
+        let mut reconciled = 0u64;
+        for run in active_runs {
+            if run.library_serial != library.serial {
+                continue;
+            }
+            let Some(drive_row) = self.get_drive_by_uuid(&run.drive_uuid)? else {
+                continue;
+            };
+            let cart_voltag = run
+                .cart_tape_uuid
+                .as_deref()
+                .and_then(|cart| self.get_tape(cart).ok().flatten())
+                .and_then(|tape| tape.voltag)
+                .unwrap_or_default();
+            let drive_is_loaded_with_cart = library.drive_bays.iter().any(|bay| {
+                bay.element_address
+                    == drive_row
+                        .last_element_address
+                        .and_then(|value| u16::try_from(value).ok())
+                        .unwrap_or(u16::MAX)
+                    && bay.loaded
+                    && bay.loaded_tape.as_deref() == Some(cart_voltag.as_str())
+            });
+            let cart_is_back_in_home_slot = run
+                .cart_home_slot
+                .and_then(|slot| u16::try_from(slot).ok())
+                .and_then(|slot| {
+                    library
+                        .slots
+                        .iter()
+                        .find(|candidate| candidate.element_address == slot)
+                })
+                .is_some_and(|slot| slot.cartridge.as_deref() == Some(cart_voltag.as_str()));
+            let alarm_key = format!("cleaning-needs-operator:{}", run.run_id);
+            if cart_is_back_in_home_slot {
+                let detail = format!(
+                    "{{\"run_id\":\"{}\",\"drive_uuid\":\"{}\",\"cart\":\"{}\",\"recovery_step\":\"close\"}}",
+                    json_escape_text(&run.run_id),
+                    json_escape_text(&hex_uuid_from_slice(&run.drive_uuid)),
+                    json_escape_text(&cart_voltag),
+                );
+                self.finalize_verified_clean_run(
+                    run.run_id.as_str(),
+                    run.drive_uuid.as_slice(),
+                    run.cart_tape_uuid.as_deref(),
+                    Some(detail.as_str()),
+                )?;
+                let _ = self.clear_alarm(alarm_key.as_str())?;
+                reconciled = reconciled.saturating_add(1);
+                continue;
+            }
+            if drive_is_loaded_with_cart {
+                if run.phase != "moving-back" {
+                    let detail = format!(
+                        "{{\"run_id\":\"{}\",\"drive_uuid\":\"{}\",\"cart\":\"{}\",\"recovery_step\":\"moving-back\"}}",
+                        json_escape_text(&run.run_id),
+                        json_escape_text(&hex_uuid_from_slice(&run.drive_uuid)),
+                        json_escape_text(&cart_voltag),
+                    );
+                    self.advance_clean_run(
+                        run.run_id.as_str(),
+                        "moving-back",
+                        Some(detail.as_str()),
+                    )?;
+                }
+                let detail = format!(
+                    "{{\"run_id\":\"{}\",\"drive_uuid\":\"{}\",\"cart\":\"{}\",\"recovery_step\":\"moving-back\"}}",
+                    json_escape_text(&run.run_id),
+                    json_escape_text(&hex_uuid_from_slice(&run.drive_uuid)),
+                    json_escape_text(&cart_voltag),
+                );
+                let _ = self.raise_alarm(
+                    alarm_key.as_str(),
+                    "cleaning-needs-operator",
+                    "warning",
+                    Some(detail.as_str()),
+                )?;
+                let _ = self.set_drive_fenced(run.drive_uuid.as_slice(), true)?;
+                reconciled = reconciled.saturating_add(1);
+                continue;
+            }
+            let detail = format!(
+                "{{\"run_id\":\"{}\",\"drive_uuid\":\"{}\",\"cart\":\"{}\",\"recovery_step\":\"needs-operator\"}}",
+                json_escape_text(&run.run_id),
+                json_escape_text(&hex_uuid_from_slice(&run.drive_uuid)),
+                json_escape_text(&cart_voltag),
+            );
+            self.mark_clean_run_needs_operator(run.run_id.as_str(), Some(detail.as_str()))?;
+            let _ = self.raise_alarm(
+                alarm_key.as_str(),
+                "cleaning-needs-operator",
+                "warning",
+                Some(detail.as_str()),
+            )?;
+            let _ = self.set_drive_fenced(run.drive_uuid.as_slice(), true)?;
+            reconciled = reconciled.saturating_add(1);
+        }
+        Ok(reconciled)
+    }
+
+    /// Return the active clean run for one library/drive combination.
+    pub fn get_active_clean_run_for_drive(
+        &self,
+        drive_uuid: &[u8],
+    ) -> Result<Option<CleanRunRecord>, StateError> {
+        self.get_active_clean_run_by_drive(drive_uuid)
+    }
+
+    /// Fetch one clean run by id.
+    pub fn get_clean_run(&self, run_id: &str) -> Result<Option<CleanRunRecord>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select run_id, drive_uuid, library_serial, cart_tape_uuid,
+                        cart_home_slot, phase, trigger, started_at_utc,
+                        updated_at_utc, detail
+                 from clean_runs
+                 where run_id = ?1",
+            )
+            .map_err(|err| sqlite_error("prepare clean run lookup", err))?;
+        stmt.query_row(params![run_id], clean_run_from_row)
+            .optional()
+            .map_err(|err| sqlite_error("query clean run lookup", err))
     }
 
     /// Return observational drive history events.
@@ -2386,6 +2774,45 @@ impl CatalogIndex {
             )
             .map_err(|err| sqlite_error("set tape kind", err))?;
         self.get_tape(tape_uuid)
+    }
+
+    /// Update a cleaning cartridge lifecycle state.
+    pub fn set_tape_cleaning_state(
+        &mut self,
+        tape_uuid: &[u8],
+        state: &str,
+    ) -> Result<Option<TapeRecord>, StateError> {
+        let state = state.trim();
+        if !matches!(state, "unverified" | "ok" | "expired" | "rejected") {
+            return Err(StateError::ConfigInvalid(format!(
+                "cleaning state {state:?} must be unverified, ok, expired, or rejected"
+            )));
+        }
+        self.conn
+            .execute(
+                "update tapes
+                 set cleaning_state = ?2
+                 where tape_uuid = ?1
+                   and kind = 'cleaning'",
+                params![tape_uuid, state],
+            )
+            .map_err(|err| sqlite_error("set tape cleaning state", err))?;
+        self.get_tape(tape_uuid)
+    }
+
+    /// Fetch one tape's cleaning state directly.
+    pub fn get_tape_cleaning_state(
+        &self,
+        tape_uuid: &[u8],
+    ) -> Result<Option<Option<String>>, StateError> {
+        self.conn
+            .query_row(
+                "select cleaning_state from tapes where tape_uuid = ?1",
+                params![tape_uuid],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| sqlite_error("query tape cleaning state", err))
     }
 
     /// Fetch one known tape by UUID.
@@ -4981,6 +5408,21 @@ fn drive_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DriveEventR
     })
 }
 
+fn clean_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CleanRunRecord> {
+    Ok(CleanRunRecord {
+        run_id: row.get(0)?,
+        drive_uuid: row.get(1)?,
+        library_serial: row.get(2)?,
+        cart_tape_uuid: row.get(3)?,
+        cart_home_slot: row.get(4)?,
+        phase: row.get(5)?,
+        trigger: row.get(6)?,
+        started_at_utc: row.get(7)?,
+        updated_at_utc: row.get(8)?,
+        detail: row.get(9)?,
+    })
+}
+
 fn drive_snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DriveHealthSnapshotRecord> {
     Ok(DriveHealthSnapshotRecord {
         snapshot_id: row.get(0)?,
@@ -5990,6 +6432,10 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use ciborium::value::Value as CborValue;
+    use remanence_library::scsi::Inquiry;
+    use remanence_library::{
+        DriveBay, ElementLayout, IdentitySource, InstalledDrive, Library, Slot,
+    };
     use remanence_parity::{
         BootstrapObjectRow, CommittedBundleKind, CommittedState, SchemeId, TapeFileEntry,
     };
@@ -6014,6 +6460,63 @@ mod tests {
         "clean_runs",
         "alarms",
     ];
+
+    fn test_changer_inquiry() -> Inquiry {
+        Inquiry::parse(include_bytes!(
+            "../../../fixtures/inquiry/changer-msl-g3.bin"
+        ))
+        .expect("parse changer inquiry fixture")
+    }
+
+    fn test_library_with_drive_and_slot(
+        serial: &str,
+        drive_loaded_tape: Option<&str>,
+        slot_barcode: Option<&str>,
+    ) -> Library {
+        Library {
+            serial: serial.to_string(),
+            changer_sg: PathBuf::from("/dev/sg-test-changer"),
+            changer_sysfs: PathBuf::from("/sys/test/changer"),
+            changer_inquiry: test_changer_inquiry(),
+            chassis_designator: None,
+            layout: ElementLayout {
+                robot_address: 0,
+                drive_start: 0x0100,
+                drive_count: 1,
+                slot_start: 0x0400,
+                slot_count: 1,
+                ie_start: 0,
+                ie_count: 0,
+            },
+            drive_bays: vec![DriveBay {
+                element_address: 0x0100,
+                accessible: true,
+                installed: Some(InstalledDrive {
+                    serial: "DRV-TEST".to_string(),
+                    identity_source: IdentitySource::DvcidAndInquiry,
+                    vendor: Some("IBM".to_string()),
+                    product: Some("ULT3580".to_string()),
+                    revision: Some("A1".to_string()),
+                    sg_path: Some(PathBuf::from("/dev/sg-test-drive")),
+                    sysfs_path: Some(PathBuf::from("/sys/test/drive")),
+                }),
+                loaded: drive_loaded_tape.is_some(),
+                loaded_tape: drive_loaded_tape.map(str::to_string),
+                source_slot: if drive_loaded_tape.is_some() {
+                    Some(0x0400)
+                } else {
+                    None
+                },
+            }],
+            slots: vec![Slot {
+                element_address: 0x0400,
+                accessible: true,
+                full: slot_barcode.is_some(),
+                cartridge: slot_barcode.map(str::to_string),
+            }],
+            ie_ports: Vec::new(),
+        }
+    }
 
     fn audit_record(
         sequence: u64,
@@ -7891,6 +8394,370 @@ mod tests {
             .expect("clear advisory")
             .expect("cleared advisory row");
         assert_eq!(cleared.state, "cleared");
+    }
+
+    #[test]
+    fn detect_fence_clean_verify_record_green_path() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let drive_uuid = index
+            .observe_drive(DriveObservationInput {
+                serial: "DRV-CLEAN".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("mainlib".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-04T03:00:00Z".to_string()),
+            })
+            .expect("observe drive")
+            .drive_uuid;
+        let tape_uuid = [0x44; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "CLN100L9".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision cleaning tape");
+        index
+            .conn
+            .execute(
+                "update tapes
+                 set kind = 'cleaning', cleaning_uses = 0, cleaning_state = 'ok'
+                 where tape_uuid = ?1",
+                params![tape_uuid.to_vec()],
+            )
+            .expect("mark cleaning cartridge");
+
+        let run = index
+            .begin_clean_run(
+                &drive_uuid,
+                "mainlib",
+                "manual",
+                Some("{\"stage\":\"fence\"}"),
+            )
+            .expect("begin run");
+        assert_eq!(run.phase, "fencing");
+        index
+            .set_drive_fenced(&drive_uuid, true)
+            .expect("fence drive");
+        let run = index
+            .select_clean_run_cart(
+                run.run_id.as_str(),
+                tape_uuid.as_slice(),
+                0x0400,
+                Some("{\"stage\":\"selecting\"}"),
+            )
+            .expect("select cart")
+            .expect("selected run");
+        assert_eq!(run.phase, "selecting");
+        index
+            .advance_clean_run(
+                run.run_id.as_str(),
+                "moving-in",
+                Some("{\"stage\":\"moving-in\"}"),
+            )
+            .expect("moving in");
+        index
+            .advance_clean_run(
+                run.run_id.as_str(),
+                "cleaning",
+                Some("{\"stage\":\"cleaning\"}"),
+            )
+            .expect("cleaning");
+        index
+            .advance_clean_run(
+                run.run_id.as_str(),
+                "moving-back",
+                Some("{\"stage\":\"moving-back\"}"),
+            )
+            .expect("moving back");
+        index
+            .conn
+            .execute(
+                "update drives set cleaning_due = 'now' where drive_uuid = ?1",
+                params![drive_uuid.to_vec()],
+            )
+            .expect("seed cleaning due");
+        let drive = index
+            .get_drive_by_uuid(&drive_uuid)
+            .expect("drive lookup")
+            .expect("drive row");
+        assert!(drive.fenced);
+        let drive = index
+            .finalize_verified_clean_run(
+                run.run_id.as_str(),
+                &drive_uuid,
+                Some(tape_uuid.as_slice()),
+                Some("{\"stage\":\"verify\"}"),
+            )
+            .expect("finalize")
+            .expect("drive row");
+        assert_eq!(drive.cleaning_due, "none");
+        assert!(!drive.fenced);
+        let tape: (String, i64, Option<String>) = index
+            .conn
+            .query_row(
+                "select kind, cleaning_uses, cleaning_state from tapes where tape_uuid = ?1",
+                params![tape_uuid.to_vec()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("cleaning cartridge row");
+        assert_eq!(tape, ("cleaning".to_string(), 1, Some("ok".to_string())));
+        assert!(!index
+            .list_clean_runs(false)
+            .expect("active runs")
+            .iter()
+            .any(|candidate| candidate.run_id == run.run_id));
+    }
+
+    #[test]
+    fn crash_resume_reconciles_clean_run_against_library() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let drive_uuid = index
+            .observe_drive(DriveObservationInput {
+                serial: "DRV-RESUME".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("mainlib".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-04T03:10:00Z".to_string()),
+            })
+            .expect("observe drive")
+            .drive_uuid;
+        let tape_uuid = [0x45; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "CLN101L9".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision cleaning tape");
+        index
+            .conn
+            .execute(
+                "update tapes
+                 set kind = 'cleaning', cleaning_uses = 0, cleaning_state = 'ok'
+                 where tape_uuid = ?1",
+                params![tape_uuid.to_vec()],
+            )
+            .expect("mark cleaning cartridge");
+
+        let run = index
+            .begin_clean_run(&drive_uuid, "mainlib", "periodic", None)
+            .expect("begin run");
+        index
+            .set_drive_fenced(&drive_uuid, true)
+            .expect("fence drive");
+        index
+            .select_clean_run_cart(run.run_id.as_str(), tape_uuid.as_slice(), 0x0400, None)
+            .expect("select cart");
+        index
+            .advance_clean_run(run.run_id.as_str(), "cleaning", None)
+            .expect("advance to cleaning");
+
+        let loading_library = test_library_with_drive_and_slot("mainlib", Some("CLN101L9"), None);
+        let reconciled = index
+            .reconcile_clean_runs_against_library(&loading_library)
+            .expect("reconcile loaded cart");
+        assert_eq!(reconciled, 1);
+        let resumed = index
+            .get_clean_run(run.run_id.as_str())
+            .expect("run lookup")
+            .expect("reconciled run");
+        assert_eq!(resumed.phase, "moving-back");
+        assert!(
+            index
+                .get_alarm(format!("cleaning-needs-operator:{}", run.run_id).as_str())
+                .expect("alarm lookup")
+                .expect("alarm row")
+                .state
+                == "open"
+        );
+
+        let parked_library = test_library_with_drive_and_slot("mainlib", None, Some("CLN101L9"));
+        let reconciled = index
+            .reconcile_clean_runs_against_library(&parked_library)
+            .expect("reconcile parked cart");
+        assert_eq!(reconciled, 1);
+        let finished = index
+            .get_clean_run(run.run_id.as_str())
+            .expect("run lookup")
+            .expect("finished run");
+        assert_eq!(finished.phase, "done");
+        assert!(index
+            .get_alarm(format!("cleaning-needs-operator:{}", run.run_id).as_str())
+            .expect("alarm lookup")
+            .is_some_and(|alarm| alarm.state == "cleared"));
+    }
+
+    #[test]
+    fn fence_vs_session_open_race_keeps_drive_unactionable() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let drive_uuid = index
+            .observe_drive(DriveObservationInput {
+                serial: "DRV-FENCE".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("mainlib".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-04T03:20:00Z".to_string()),
+            })
+            .expect("observe drive")
+            .drive_uuid;
+        index
+            .set_drive_fenced(&drive_uuid, true)
+            .expect("fence drive");
+
+        assert!(index
+            .get_actionable_drive_at("mainlib", 0x0100)
+            .expect("drive lookup")
+            .is_none());
+    }
+
+    #[test]
+    fn manual_and_auto_join_same_active_run() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let drive_uuid = index
+            .observe_drive(DriveObservationInput {
+                serial: "DRV-JOIN".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("mainlib".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-04T03:30:00Z".to_string()),
+            })
+            .expect("observe drive")
+            .drive_uuid;
+        let first = index
+            .begin_clean_run(&drive_uuid, "mainlib", "manual", None)
+            .expect("first run");
+        let second = index
+            .begin_clean_run(&drive_uuid, "mainlib", "periodic", None)
+            .expect("joined run");
+        assert_eq!(first.run_id, second.run_id);
+        assert_eq!(first.trigger, "manual");
+        let run_by_drive = index
+            .get_active_clean_run_by_drive(&drive_uuid)
+            .expect("drive lookup")
+            .expect("active run");
+        assert_eq!(run_by_drive.run_id, first.run_id);
+    }
+
+    #[test]
+    fn expired_cleaning_cart_stays_bound_and_preserves_uses() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [0x46; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "CLN102L9".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision cleaning tape");
+        index
+            .conn
+            .execute(
+                "update tapes
+                 set kind = 'cleaning', cleaning_uses = 7, cleaning_state = 'expired'
+                 where tape_uuid = ?1",
+                params![tape_uuid.to_vec()],
+            )
+            .expect("mark expired cleaning cartridge");
+
+        let state = index
+            .get_tape_cleaning_state(tape_uuid.as_slice())
+            .expect("state lookup")
+            .expect("state row");
+        assert_eq!(state, Some("expired".to_string()));
+        let tape: (String, i64, Option<String>) = index
+            .conn
+            .query_row(
+                "select kind, cleaning_uses, cleaning_state from tapes where tape_uuid = ?1",
+                params![tape_uuid.to_vec()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("expired cleaning cartridge row");
+        assert_eq!(tape.0, "cleaning");
+        assert_eq!(tape.1, 7);
+        assert_eq!(tape.2.as_deref(), Some("expired"));
+    }
+
+    #[test]
+    fn corroboration_reject_marks_cart_rejected() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [0x47; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "CLN103L9".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision cleaning tape");
+        index
+            .conn
+            .execute(
+                "update tapes
+                 set kind = 'cleaning', cleaning_uses = 2, cleaning_state = 'rejected'
+                 where tape_uuid = ?1",
+                params![tape_uuid.to_vec()],
+            )
+            .expect("mark rejected cleaning cartridge");
+        let tape: (String, i64, Option<String>) = index
+            .conn
+            .query_row(
+                "select kind, cleaning_uses, cleaning_state from tapes where tape_uuid = ?1",
+                params![tape_uuid.to_vec()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("rejected cleaning cartridge row");
+        assert_eq!(
+            tape,
+            ("cleaning".to_string(), 2, Some("rejected".to_string()))
+        );
     }
 
     #[test]
