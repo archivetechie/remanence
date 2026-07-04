@@ -333,9 +333,10 @@ fn ensure_mutable_drive(record: &DriveRecord, allow_derived_identity: bool) -> R
         ));
     }
     if record.managed == "foreign" {
-        return Err(Status::failed_precondition(
-            "foreign drives are read-only to Remanence",
-        ));
+        let owner = record.last_library_serial.as_deref().unwrap_or("unknown");
+        return Err(Status::failed_precondition(format!(
+            "foreign drives are read-only to Remanence; drive belongs to library {owner} — clean it via that library's own tooling"
+        )));
     }
     Ok(())
 }
