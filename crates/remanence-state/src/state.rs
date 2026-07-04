@@ -620,6 +620,7 @@ mod tests {
 
     use super::*;
     use crate::config::parse_config_toml;
+    use crate::index::TapeKindFilter;
 
     fn config_text(root: &Path) -> String {
         format!(
@@ -808,7 +809,7 @@ pool_id = "camera.copy-a"
         let mut handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
         assert!(handle
             .catalog_index()
-            .list_tapes(None)
+            .list_tapes(None, TapeKindFilter::Data)
             .expect("list tapes")
             .is_empty());
         assert_eq!(
@@ -857,7 +858,7 @@ pool_id = "camera.copy-a"
             assert_eq!(
                 handle
                     .catalog_index()
-                    .list_tapes(Some("camera.copy-a"))
+                    .list_tapes(Some("camera.copy-a"), TapeKindFilter::Data)
                     .expect("pool tapes")
                     .len(),
                 1
@@ -872,12 +873,15 @@ pool_id = "camera.copy-a"
             .get_tape_pool("camera.copy-a")
             .expect("pool lookup")
             .is_none());
-        let tapes = handle.catalog_index().list_tapes(None).expect("list tapes");
+        let tapes = handle
+            .catalog_index()
+            .list_tapes(None, TapeKindFilter::Data)
+            .expect("list tapes");
         assert_eq!(tapes.len(), 1);
         assert_eq!(tapes[0].pool_id, None);
         assert!(handle
             .catalog_index()
-            .list_tapes(Some("camera.copy-a"))
+            .list_tapes(Some("camera.copy-a"), TapeKindFilter::Data)
             .expect("pool tapes after removal")
             .is_empty());
     }
@@ -911,7 +915,10 @@ pool_id = "camera.copy-a"
 
         let config = parse_config_toml(&config_with_pool_b(temp.path())).expect("config");
         let mut handle = StateHandle::open_with_config(paths, config).expect("reopen with pool b");
-        let tapes = handle.catalog_index().list_tapes(None).expect("list tapes");
+        let tapes = handle
+            .catalog_index()
+            .list_tapes(None, TapeKindFilter::Data)
+            .expect("list tapes");
         assert_eq!(tapes.len(), 1);
         assert_eq!(tapes[0].pool_id.as_deref(), Some("camera.copy-b"));
         assert!(handle

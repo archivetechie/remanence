@@ -1185,10 +1185,20 @@ impl pb::catalog_server::Catalog for CatalogService {
         } else {
             Some(pool_id)
         };
+        let kind = match request.kind.trim() {
+            "" | "data" => remanence_state::TapeKindFilter::Data,
+            "cleaning" => remanence_state::TapeKindFilter::Cleaning,
+            "all" => remanence_state::TapeKindFilter::All,
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "ListTapes kind must be empty, data, cleaning, or all, got {other:?}"
+                )));
+            }
+        };
         let tapes = self
             .state
             .index()?
-            .list_tapes(pool_id)
+            .list_tapes(pool_id, kind)
             .map_err(status_from_state_error)?
             .into_iter()
             .map(tape_to_proto)
@@ -3553,6 +3563,7 @@ BCw3Wyv2UWY=
         TapeRecord {
             tape_uuid: POOL_WRITE_TAPE_UUID.to_vec(),
             voltag: Some("RMN001L9".to_string()),
+            kind: "data".to_string(),
             pool_id: Some("camera.copy-a".to_string()),
             body_format: None,
             block_size: Some(API_SESSION_BLOCK_SIZE as u64),
@@ -6081,6 +6092,7 @@ BCw3Wyv2UWY=
                 page_token: None,
                 page_size: 0,
                 pool_id: String::new(),
+                kind: "data".to_string(),
             }),
         )
         .await
@@ -6101,6 +6113,7 @@ BCw3Wyv2UWY=
                 page_token: None,
                 page_size: 0,
                 pool_id: "camera.copy-a".to_string(),
+                kind: "data".to_string(),
             }),
         )
         .await
@@ -6142,6 +6155,7 @@ BCw3Wyv2UWY=
                 page_token: None,
                 page_size: 0,
                 pool_id: "camera copy a".to_string(),
+                kind: "data".to_string(),
             }),
         )
         .await

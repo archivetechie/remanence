@@ -551,7 +551,10 @@ pub fn select_tape_in_pool_with_policy(
             })?;
     let pool_id = pool.pool_id;
 
-    let tapes = state.list_tapes(Some(pool_id.as_str()))?;
+    let tapes = state.list_tapes(
+        Some(pool_id.as_str()),
+        remanence_state::TapeKindFilter::Data,
+    )?;
     if tapes.is_empty() {
         return Err(SelectTapeError::EmptyPool { pool_id });
     }
