@@ -28,6 +28,15 @@ pub struct RemConfig {
     /// Barcode-prefix rules that derive tape pool membership from voltags.
     #[serde(default)]
     pub tape_pool_rules: Vec<TapePoolRuleConfig>,
+    /// Drive stewardship collection settings.
+    #[serde(default)]
+    pub drives: DrivesConfig,
+    /// Cleaning policy settings.
+    #[serde(default)]
+    pub cleaning: CleaningConfig,
+    /// Live-status serving settings.
+    #[serde(default)]
+    pub livestatus: LiveStatusConfig,
     /// Layer 3c journal settings.
     pub journal: JournalConfig,
     /// Layer 4 audit-log settings.
@@ -175,6 +184,90 @@ pub struct TapePoolRuleConfig {
     pub prefix: String,
     /// Pool id from `[[tape_pools]]`.
     pub pool_id: String,
+}
+
+/// Drive stewardship collection settings.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DrivesConfig {
+    /// Library serials Remanence may actively manage. Empty means daemon-operated libraries.
+    pub managed_libraries: Vec<String>,
+    /// Cadence for foreign-drive error-counter polling.
+    pub foreign_counter_poll: String,
+    /// Opt-in to foreign TapeAlert page reads.
+    pub foreign_tapealert: bool,
+    /// Managed-drive liveness heartbeat cadence.
+    pub heartbeat: String,
+    /// Consecutive missed snapshots before raising an alarm.
+    pub snapshot_miss_alarm: u32,
+}
+
+impl Default for DrivesConfig {
+    fn default() -> Self {
+        Self {
+            managed_libraries: Vec::new(),
+            foreign_counter_poll: "60m".to_string(),
+            foreign_tapealert: false,
+            heartbeat: "1h".to_string(),
+            snapshot_miss_alarm: 3,
+        }
+    }
+}
+
+/// Cleaning policy settings.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CleaningConfig {
+    /// Whether automatic cleaning is enabled.
+    pub auto: bool,
+    /// Voltag prefixes considered cleaning cartridges.
+    pub voltag_prefixes: Vec<String>,
+    /// Warning threshold for cartridge use count.
+    pub use_warn: u32,
+    /// Maximum cleaning run duration.
+    pub complete_timeout: String,
+    /// Minimum plausible completed cleaning-cycle duration.
+    pub min_cycle_duration: String,
+    /// Minimum interval between automatic cleans for one drive.
+    pub min_interval: String,
+    /// Weekly automatic-cleaning cap per drive.
+    pub weekly_cap: u32,
+}
+
+impl Default for CleaningConfig {
+    fn default() -> Self {
+        Self {
+            auto: true,
+            voltag_prefixes: vec!["CLN".to_string()],
+            use_warn: 45,
+            complete_timeout: "10m".to_string(),
+            min_cycle_duration: "60s".to_string(),
+            min_interval: "12h".to_string(),
+            weekly_cap: 4,
+        }
+    }
+}
+
+/// Live-status serving settings.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LiveStatusConfig {
+    /// Minimum poll interval enforced by the daemon.
+    pub min_poll_interval: String,
+    /// Foreign changer inventory poll cadence while live-status clients are active.
+    pub foreign_changer_poll: String,
+    /// Recency lease defining an active live-status consumer.
+    pub foreign_poll_lease: String,
+}
+
+impl Default for LiveStatusConfig {
+    fn default() -> Self {
+        Self {
+            min_poll_interval: "250ms".to_string(),
+            foreign_changer_poll: "60s".to_string(),
+            foreign_poll_lease: "5m".to_string(),
+        }
+    }
 }
 
 /// Layer 3c journal configuration.

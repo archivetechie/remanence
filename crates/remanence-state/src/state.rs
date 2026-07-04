@@ -99,6 +99,7 @@ impl StateHandle {
         )?;
         let mut index = CatalogIndex::open(&paths.sqlite_path)?;
         let config_warnings = project_configured_tape_pools(&mut index, &config)?;
+        index.reconcile_cleaning_prefixes(&config.cleaning.voltag_prefixes)?;
         Ok(Self {
             paths,
             config,
@@ -123,6 +124,7 @@ impl StateHandle {
         ensure_state_directories(&paths)?;
         let mut index = CatalogIndex::open(&paths.sqlite_path)?;
         let _config_warnings = project_configured_tape_pools(&mut index, &config)?;
+        index.reconcile_cleaning_prefixes(&config.cleaning.voltag_prefixes)?;
         Ok(())
     }
 
@@ -404,6 +406,12 @@ impl StateHandle {
                 detail.insert(
                     "drive_bay".to_string(),
                     CborValue::Integer(drive_bay.into()),
+                );
+            }
+            if let Some(drive_uuid) = session.drive_uuid.as_ref() {
+                detail.insert(
+                    "drive_uuid".to_string(),
+                    CborValue::Bytes(drive_uuid.clone()),
                 );
             }
             let (_, record) = self.audit.append_and_return_record(AuditEventRecord {

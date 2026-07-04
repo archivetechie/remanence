@@ -20,7 +20,7 @@ use crate::config::{derive_tape_pool_from_voltag, TapePoolRuleConfig};
 use crate::error::StateError;
 
 /// Current Layer 4 SQLite schema version.
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 const LEGACY_TAPE_POOL_MEMBERSHIPS_TABLE: &str = concat!("tape_pool_", "memberships");
 /// Catalog value for an unencrypted RAO copy row.
 pub const OBJECT_COPY_REPRESENTATION_PLAINTEXT: &str = "plaintext";
@@ -215,6 +215,153 @@ pub struct RestartSession {
     pub library_serial: Option<String>,
     /// Drive bay attached to the session, if any.
     pub drive_bay: Option<i64>,
+    /// Drive UUID attached to the session, if any.
+    pub drive_uuid: Option<Vec<u8>>,
+}
+
+/// One row from the authoritative drive catalog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct DriveRecord {
+    /// Daemon-assigned surrogate identity.
+    pub drive_uuid: Vec<u8>,
+    /// Device-reported serial claim. May be empty.
+    pub serial: String,
+    /// Exact discovery identity source string.
+    pub identity_source: String,
+    /// Whether this row may participate in attribution and mutation.
+    pub actionable: bool,
+    pub vendor: Option<String>,
+    pub product: Option<String>,
+    pub firmware_rev: Option<String>,
+    /// `rem` or `foreign`.
+    pub managed: String,
+    /// `active` or `retired`.
+    pub state: String,
+    /// `none`, `periodic`, or `now`.
+    pub cleaning_due: String,
+    pub fenced: bool,
+    pub first_seen_utc: String,
+    pub last_seen_utc: String,
+    pub last_library_serial: Option<String>,
+    pub last_element_address: Option<i64>,
+    pub purchase_date: Option<String>,
+    pub warranty_until: Option<String>,
+    pub cost: Option<String>,
+    pub notes: Option<String>,
+    pub retired_at_utc: Option<String>,
+    pub retire_reason: Option<String>,
+}
+
+/// Input for inserting or updating a drive observation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct DriveObservationInput {
+    pub serial: String,
+    pub identity_source: String,
+    pub vendor: Option<String>,
+    pub product: Option<String>,
+    pub firmware_rev: Option<String>,
+    pub managed: String,
+    pub library_serial: Option<String>,
+    pub element_address: Option<i64>,
+    pub observed_at_utc: Option<String>,
+}
+
+/// Result of recording one drive observation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DriveObservationOutcome {
+    /// The matched or newly assigned drive UUID.
+    pub drive_uuid: Vec<u8>,
+    /// Whether this observation inserted the drive row.
+    pub newly_seen: bool,
+    /// Whether the observation produced a serial-collision condition.
+    pub serial_collision: bool,
+}
+
+/// Partial operator annotation for one drive.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[allow(missing_docs)]
+pub struct DriveAnnotationInput {
+    pub drive_uuid: Vec<u8>,
+    pub purchase_date: Option<String>,
+    pub warranty_until: Option<String>,
+    pub cost: Option<String>,
+    pub note: Option<String>,
+    pub notes_set: Option<String>,
+    pub annotated_at_utc: Option<String>,
+}
+
+/// Result of retiring one drive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetireDriveOutcome {
+    /// False when the drive was already retired.
+    pub newly_retired: bool,
+    /// Stored row after applying the request.
+    pub drive: DriveRecord,
+}
+
+/// One observational drive-history event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct DriveEventRecord {
+    pub event_id: i64,
+    pub drive_uuid: Vec<u8>,
+    pub event_kind: String,
+    pub at_utc: String,
+    pub library_serial: Option<String>,
+    pub element_address: Option<i64>,
+    pub tape_uuid: Option<Vec<u8>>,
+    pub detail: Option<String>,
+}
+
+/// One durable LOG SENSE/error counter snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct DriveHealthSnapshotRecord {
+    pub snapshot_id: i64,
+    pub drive_uuid: Vec<u8>,
+    pub at_utc: String,
+    pub trigger: String,
+    pub session_id: Option<String>,
+    pub tape_alert_flags: Option<String>,
+    pub write_errors_corrected: Option<i64>,
+    pub write_errors_uncorrected: Option<i64>,
+    pub read_errors_corrected: Option<i64>,
+    pub read_errors_uncorrected: Option<i64>,
+    pub raw_pages: Option<String>,
+}
+
+/// Input for a durable LOG SENSE/error counter snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct DriveHealthSnapshotInput {
+    pub drive_uuid: Vec<u8>,
+    pub trigger: String,
+    pub session_id: Option<String>,
+    pub tape_alert_flags: Option<String>,
+    pub write_errors_corrected: Option<i64>,
+    pub write_errors_uncorrected: Option<i64>,
+    pub read_errors_corrected: Option<i64>,
+    pub read_errors_uncorrected: Option<i64>,
+    pub raw_pages: Option<String>,
+    pub at_utc: Option<String>,
+}
+
+/// One standing alarm row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct AlarmRecord {
+    pub alarm_id: i64,
+    pub condition_key: String,
+    pub kind: String,
+    pub severity: String,
+    pub state: String,
+    pub first_seen_utc: String,
+    pub last_seen_utc: String,
+    pub acked_by: Option<String>,
+    pub acked_at_utc: Option<String>,
+    pub detail: Option<String>,
 }
 
 /// Origin selector for the cross-source catalog unit query surface.
@@ -704,6 +851,596 @@ impl CatalogIndex {
             )));
         }
         Ok(())
+    }
+
+    /// Reconcile configured cleaning-cartridge barcode prefixes after config load.
+    pub fn reconcile_cleaning_prefixes(&mut self, prefixes: &[String]) -> Result<u64, StateError> {
+        let mut changed = 0_u64;
+        for prefix in prefixes {
+            let prefix = prefix.trim();
+            if prefix.is_empty() {
+                continue;
+            }
+            let pattern = format!("{prefix}*");
+            let count = self
+                .conn
+                .execute(
+                    "update tapes
+                     set kind = 'cleaning',
+                         cleaning_uses = coalesce(cleaning_uses, 0),
+                         cleaning_state = coalesce(cleaning_state, 'unverified')
+                     where kind = 'data'
+                       and voltag glob ?1
+                       and not exists (
+                         select 1 from object_copies
+                         where object_copies.tape_uuid = tapes.tape_uuid
+                           and object_copies.status = 'committed'
+                       )",
+                    params![pattern],
+                )
+                .map_err(|err| sqlite_error("reconcile cleaning tape prefixes", err))?;
+            changed = changed.saturating_add(count as u64);
+        }
+        Ok(changed)
+    }
+
+    /// Record one drive inventory observation and assign or refresh its surrogate UUID.
+    pub fn observe_drive(
+        &mut self,
+        input: DriveObservationInput,
+    ) -> Result<DriveObservationOutcome, StateError> {
+        let serial = input.serial.trim().to_string();
+        let vendor = input.vendor.map(|value| value.trim().to_string());
+        let product = input.product.map(|value| value.trim().to_string());
+        let firmware_rev = input.firmware_rev.map(|value| value.trim().to_string());
+        let identity_source = input.identity_source.trim().to_string();
+        let managed = input.managed.trim().to_string();
+        if !matches!(managed.as_str(), "rem" | "foreign") {
+            return Err(StateError::ConfigInvalid(format!(
+                "drive managed value {managed:?} must be rem or foreign"
+            )));
+        }
+        let observed_at = input.observed_at_utc.unwrap_or(now_utc()?);
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|err| sqlite_error("begin drive observation transaction", err))?;
+        let existing = find_drive_for_observation(
+            &tx,
+            serial.as_str(),
+            vendor.as_deref(),
+            product.as_deref(),
+            input.library_serial.as_deref(),
+            input.element_address,
+        )?;
+        let (drive_uuid, newly_seen) = match existing {
+            Some(row) => {
+                tx.execute(
+                    "update drives
+                     set identity_source = ?2,
+                         vendor = ?3,
+                         product = ?4,
+                         firmware_rev = ?5,
+                         managed = ?6,
+                         last_seen_utc = ?7,
+                         last_library_serial = ?8,
+                         last_element_address = ?9
+                     where drive_uuid = ?1",
+                    params![
+                        row.drive_uuid,
+                        identity_source,
+                        vendor,
+                        product,
+                        firmware_rev,
+                        managed,
+                        observed_at,
+                        input.library_serial,
+                        input.element_address,
+                    ],
+                )
+                .map_err(|err| sqlite_error("update observed drive", err))?;
+                if row.state == "retired" {
+                    insert_drive_event_tx(
+                        &tx,
+                        DriveEventInsert {
+                            drive_uuid: row.drive_uuid.as_slice(),
+                            event_kind: "reappeared",
+                            at_utc: observed_at.as_str(),
+                            library_serial: input.library_serial.as_deref(),
+                            element_address: input.element_address,
+                            tape_uuid: None,
+                            detail: Some("{\"state\":\"retired\"}"),
+                        },
+                    )?;
+                    raise_alarm_tx(
+                        &tx,
+                        format!(
+                            "retired-drive-reappeared:{}",
+                            hex_uuid_from_slice(&row.drive_uuid)
+                        )
+                        .as_str(),
+                        "retired-drive-reappeared",
+                        "warning",
+                        Some("{\"state\":\"retired\"}"),
+                        observed_at.as_str(),
+                    )?;
+                } else {
+                    if row.firmware_rev != firmware_rev {
+                        insert_drive_event_tx(
+                            &tx,
+                            DriveEventInsert {
+                                drive_uuid: row.drive_uuid.as_slice(),
+                                event_kind: "firmware-changed",
+                                at_utc: observed_at.as_str(),
+                                library_serial: input.library_serial.as_deref(),
+                                element_address: input.element_address,
+                                tape_uuid: None,
+                                detail: None,
+                            },
+                        )?;
+                    }
+                    if row.last_library_serial != input.library_serial
+                        || row.last_element_address != input.element_address
+                    {
+                        insert_drive_event_tx(
+                            &tx,
+                            DriveEventInsert {
+                                drive_uuid: row.drive_uuid.as_slice(),
+                                event_kind: "bay-moved",
+                                at_utc: observed_at.as_str(),
+                                library_serial: input.library_serial.as_deref(),
+                                element_address: input.element_address,
+                                tape_uuid: None,
+                                detail: None,
+                            },
+                        )?;
+                    }
+                }
+                (row.drive_uuid, false)
+            }
+            None => {
+                let drive_uuid = Uuid::new_v4().as_bytes().to_vec();
+                let actionable = if serial.is_empty() { 0 } else { 1 };
+                tx.execute(
+                    "insert into drives(
+                       drive_uuid, serial, identity_source, actionable,
+                       vendor, product, firmware_rev, managed, state,
+                       cleaning_due, fenced, first_seen_utc, last_seen_utc,
+                       last_library_serial, last_element_address
+                     )
+                     values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active',
+                            'none', 0, ?9, ?9, ?10, ?11)",
+                    params![
+                        drive_uuid,
+                        serial,
+                        identity_source,
+                        actionable,
+                        vendor,
+                        product,
+                        firmware_rev,
+                        managed,
+                        observed_at,
+                        input.library_serial,
+                        input.element_address,
+                    ],
+                )
+                .map_err(|err| sqlite_error("insert observed drive", err))?;
+                insert_drive_event_tx(
+                    &tx,
+                    DriveEventInsert {
+                        drive_uuid: drive_uuid.as_slice(),
+                        event_kind: "first-seen",
+                        at_utc: observed_at.as_str(),
+                        library_serial: input.library_serial.as_deref(),
+                        element_address: input.element_address,
+                        tape_uuid: None,
+                        detail: None,
+                    },
+                )?;
+                (drive_uuid, true)
+            }
+        };
+        let serial_collision =
+            reconcile_drive_serial_actionability_tx(&tx, serial.as_str(), observed_at.as_str())?;
+        tx.commit()
+            .map_err(|err| sqlite_error("commit drive observation transaction", err))?;
+        Ok(DriveObservationOutcome {
+            drive_uuid,
+            newly_seen,
+            serial_collision,
+        })
+    }
+
+    /// List authoritative drive rows.
+    pub fn list_drives(
+        &self,
+        include_foreign: bool,
+        include_retired: bool,
+    ) -> Result<Vec<DriveRecord>, StateError> {
+        let mut filters = Vec::new();
+        if !include_foreign {
+            filters.push("managed = 'rem'");
+        }
+        if !include_retired {
+            filters.push("state = 'active'");
+        }
+        let where_clause = if filters.is_empty() {
+            String::new()
+        } else {
+            format!(" where {}", filters.join(" and "))
+        };
+        let sql = format!(
+            "select drive_uuid, serial, identity_source, actionable,
+                    vendor, product, firmware_rev, managed, state,
+                    cleaning_due, fenced, first_seen_utc, last_seen_utc,
+                    last_library_serial, last_element_address,
+                    purchase_date, warranty_until, cost, notes,
+                    retired_at_utc, retire_reason
+             from drives{where_clause}
+             order by managed, state, serial, hex(drive_uuid)"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|err| sqlite_error("prepare drive list", err))?;
+        let rows = stmt
+            .query_map([], drive_from_row)
+            .map_err(|err| sqlite_error("query drive list", err))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| sqlite_error("read drive list", err))
+    }
+
+    /// Fetch one drive by UUID bytes.
+    pub fn get_drive_by_uuid(&self, drive_uuid: &[u8]) -> Result<Option<DriveRecord>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(DRIVE_SELECT_SQL_WITH_WHERE_UUID)
+            .map_err(|err| sqlite_error("prepare drive lookup", err))?;
+        stmt.query_row(params![drive_uuid], drive_from_row)
+            .optional()
+            .map_err(|err| sqlite_error("query drive lookup", err))
+    }
+
+    /// Fetch one drive by UUID text or exact serial.
+    pub fn get_drive_by_selector(&self, selector: &str) -> Result<Option<DriveRecord>, StateError> {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return Ok(None);
+        }
+        if let Ok(uuid) = Uuid::parse_str(selector) {
+            return self.get_drive_by_uuid(uuid.as_bytes());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select drive_uuid, serial, identity_source, actionable,
+                        vendor, product, firmware_rev, managed, state,
+                        cleaning_due, fenced, first_seen_utc, last_seen_utc,
+                        last_library_serial, last_element_address,
+                        purchase_date, warranty_until, cost, notes,
+                        retired_at_utc, retire_reason
+                 from drives
+                 where serial = ?1
+                 order by state = 'active' desc, last_seen_utc desc, hex(drive_uuid)
+                 limit 1",
+            )
+            .map_err(|err| sqlite_error("prepare drive serial lookup", err))?;
+        stmt.query_row(params![selector], drive_from_row)
+            .optional()
+            .map_err(|err| sqlite_error("query drive serial lookup", err))
+    }
+
+    /// Fetch the active actionable drive currently observed at one library bay.
+    pub fn get_actionable_drive_at(
+        &self,
+        library_serial: &str,
+        element_address: i64,
+    ) -> Result<Option<DriveRecord>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select drive_uuid, serial, identity_source, actionable,
+                        vendor, product, firmware_rev, managed, state,
+                        cleaning_due, fenced, first_seen_utc, last_seen_utc,
+                        last_library_serial, last_element_address,
+                        purchase_date, warranty_until, cost, notes,
+                        retired_at_utc, retire_reason
+                 from drives
+                 where last_library_serial = ?1
+                   and last_element_address = ?2
+                   and state = 'active'
+                   and actionable = 1
+                 order by last_seen_utc desc, hex(drive_uuid)
+                 limit 1",
+            )
+            .map_err(|err| sqlite_error("prepare drive bay lookup", err))?;
+        stmt.query_row(params![library_serial, element_address], drive_from_row)
+            .optional()
+            .map_err(|err| sqlite_error("query drive bay lookup", err))
+    }
+
+    /// Return observational drive history events.
+    pub fn list_drive_events(
+        &self,
+        drive_uuid: &[u8],
+    ) -> Result<Vec<DriveEventRecord>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select event_id, drive_uuid, event_kind, at_utc, library_serial,
+                        element_address, tape_uuid, detail
+                 from drive_events
+                 where drive_uuid = ?1
+                 order by at_utc, event_id",
+            )
+            .map_err(|err| sqlite_error("prepare drive events query", err))?;
+        let rows = stmt
+            .query_map(params![drive_uuid], drive_event_from_row)
+            .map_err(|err| sqlite_error("query drive events", err))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| sqlite_error("read drive events", err))
+    }
+
+    /// Return durable drive health snapshots.
+    pub fn list_drive_health_snapshots(
+        &self,
+        drive_uuid: &[u8],
+    ) -> Result<Vec<DriveHealthSnapshotRecord>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select snapshot_id, drive_uuid, at_utc, trigger, session_id,
+                        tape_alert_flags, write_errors_corrected,
+                        write_errors_uncorrected, read_errors_corrected,
+                        read_errors_uncorrected, raw_pages
+                 from drive_health_snapshots
+                 where drive_uuid = ?1
+                 order by at_utc, snapshot_id",
+            )
+            .map_err(|err| sqlite_error("prepare drive snapshots query", err))?;
+        let rows = stmt
+            .query_map(params![drive_uuid], drive_snapshot_from_row)
+            .map_err(|err| sqlite_error("query drive snapshots", err))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| sqlite_error("read drive snapshots", err))
+    }
+
+    /// Insert a health snapshot idempotently by `(session_id, trigger)`.
+    pub fn record_drive_health_snapshot(
+        &mut self,
+        input: DriveHealthSnapshotInput,
+    ) -> Result<DriveHealthSnapshotRecord, StateError> {
+        let at_utc = input.at_utc.unwrap_or(now_utc()?);
+        let session_id = input.session_id.clone();
+        let trigger = input.trigger.clone();
+        self.conn
+            .execute(
+                "insert or ignore into drive_health_snapshots(
+                   drive_uuid, at_utc, trigger, session_id, tape_alert_flags,
+                   write_errors_corrected, write_errors_uncorrected,
+                   read_errors_corrected, read_errors_uncorrected, raw_pages
+                 )
+                 values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    input.drive_uuid,
+                    at_utc,
+                    trigger,
+                    session_id,
+                    input.tape_alert_flags,
+                    input.write_errors_corrected,
+                    input.write_errors_uncorrected,
+                    input.read_errors_corrected,
+                    input.read_errors_uncorrected,
+                    input.raw_pages,
+                ],
+            )
+            .map_err(|err| sqlite_error("insert drive health snapshot", err))?;
+        self.get_drive_health_snapshot(session_id.as_deref(), trigger.as_str())
+    }
+
+    fn get_drive_health_snapshot(
+        &self,
+        session_id: Option<&str>,
+        trigger: &str,
+    ) -> Result<DriveHealthSnapshotRecord, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select snapshot_id, drive_uuid, at_utc, trigger, session_id,
+                        tape_alert_flags, write_errors_corrected,
+                        write_errors_uncorrected, read_errors_corrected,
+                        read_errors_uncorrected, raw_pages
+                 from drive_health_snapshots
+                 where trigger = ?1
+                   and (
+                     (?2 is null and session_id is null)
+                     or session_id = ?2
+                   )
+                 order by snapshot_id
+                 limit 1",
+            )
+            .map_err(|err| sqlite_error("prepare drive snapshot lookup", err))?;
+        stmt.query_row(params![trigger, session_id], drive_snapshot_from_row)
+            .map_err(|err| sqlite_error("query drive snapshot lookup", err))
+    }
+
+    /// Upsert a standing alarm as open or refreshed.
+    pub fn raise_alarm(
+        &mut self,
+        condition_key: &str,
+        kind: &str,
+        severity: &str,
+        detail: Option<&str>,
+    ) -> Result<AlarmRecord, StateError> {
+        let now = now_utc()?;
+        raise_alarm_tx(
+            &self.conn,
+            condition_key,
+            kind,
+            severity,
+            detail,
+            now.as_str(),
+        )?;
+        self.get_alarm(condition_key)?
+            .ok_or_else(|| StateError::IndexCorrupt("raised alarm is missing".to_string()))
+    }
+
+    /// Mark a standing alarm acknowledged.
+    pub fn ack_alarm(
+        &mut self,
+        condition_key: &str,
+        acked_by: &str,
+    ) -> Result<Option<AlarmRecord>, StateError> {
+        let now = now_utc()?;
+        self.conn
+            .execute(
+                "update alarms
+                 set state = 'acked',
+                     acked_by = ?2,
+                     acked_at_utc = ?3,
+                     last_seen_utc = ?3
+                 where condition_key = ?1
+                   and state in ('open','acked')",
+                params![condition_key, acked_by, now],
+            )
+            .map_err(|err| sqlite_error("ack alarm", err))?;
+        self.get_alarm(condition_key)
+    }
+
+    /// Mark a standing alarm cleared.
+    pub fn clear_alarm(&mut self, condition_key: &str) -> Result<Option<AlarmRecord>, StateError> {
+        let now = now_utc()?;
+        self.conn
+            .execute(
+                "update alarms
+                 set state = 'cleared',
+                     last_seen_utc = ?2
+                 where condition_key = ?1
+                   and state != 'cleared'",
+                params![condition_key, now],
+            )
+            .map_err(|err| sqlite_error("clear alarm", err))?;
+        self.get_alarm(condition_key)
+    }
+
+    /// List standing alarms.
+    pub fn list_alarms(&self, include_cleared: bool) -> Result<Vec<AlarmRecord>, StateError> {
+        let where_clause = if include_cleared {
+            ""
+        } else {
+            " where state != 'cleared'"
+        };
+        let sql = format!(
+            "select alarm_id, condition_key, kind, severity, state,
+                    first_seen_utc, last_seen_utc, acked_by, acked_at_utc, detail
+             from alarms{where_clause}
+             order by state, severity, last_seen_utc desc, condition_key"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|err| sqlite_error("prepare alarm list", err))?;
+        let rows = stmt
+            .query_map([], alarm_from_row)
+            .map_err(|err| sqlite_error("query alarm list", err))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| sqlite_error("read alarm list", err))
+    }
+
+    /// Fetch one alarm by condition key.
+    pub fn get_alarm(&self, condition_key: &str) -> Result<Option<AlarmRecord>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select alarm_id, condition_key, kind, severity, state,
+                        first_seen_utc, last_seen_utc, acked_by, acked_at_utc, detail
+                 from alarms
+                 where condition_key = ?1",
+            )
+            .map_err(|err| sqlite_error("prepare alarm lookup", err))?;
+        stmt.query_row(params![condition_key], alarm_from_row)
+            .optional()
+            .map_err(|err| sqlite_error("query alarm lookup", err))
+    }
+
+    /// Apply a partial operator annotation to one drive.
+    pub fn annotate_drive(
+        &mut self,
+        input: DriveAnnotationInput,
+    ) -> Result<Option<DriveRecord>, StateError> {
+        let now = input.annotated_at_utc.unwrap_or(now_utc()?);
+        let existing = self.get_drive_by_uuid(&input.drive_uuid)?;
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        let notes = if let Some(notes_set) = input.notes_set {
+            Some(notes_set)
+        } else if let Some(note) = input.note {
+            let mut notes = existing.notes.unwrap_or_default();
+            if !notes.is_empty() && !notes.ends_with('\n') {
+                notes.push('\n');
+            }
+            notes.push_str(now.as_str());
+            notes.push(' ');
+            notes.push_str(note.trim());
+            Some(notes)
+        } else {
+            existing.notes
+        };
+        self.conn
+            .execute(
+                "update drives
+                 set purchase_date = coalesce(?2, purchase_date),
+                     warranty_until = coalesce(?3, warranty_until),
+                     cost = coalesce(?4, cost),
+                     notes = ?5
+                 where drive_uuid = ?1",
+                params![
+                    input.drive_uuid,
+                    input.purchase_date,
+                    input.warranty_until,
+                    input.cost,
+                    notes,
+                ],
+            )
+            .map_err(|err| sqlite_error("annotate drive", err))?;
+        self.get_drive_by_uuid(&input.drive_uuid)
+    }
+
+    /// Retire one drive identity while preserving its history.
+    pub fn retire_drive(
+        &mut self,
+        drive_uuid: &[u8],
+        reason: &str,
+    ) -> Result<Option<RetireDriveOutcome>, StateError> {
+        let Some(before) = self.get_drive_by_uuid(drive_uuid)? else {
+            return Ok(None);
+        };
+        if before.state == "retired" {
+            return Ok(Some(RetireDriveOutcome {
+                newly_retired: false,
+                drive: before,
+            }));
+        }
+        let now = now_utc()?;
+        self.conn
+            .execute(
+                "update drives
+                 set state = 'retired',
+                     retired_at_utc = ?2,
+                     retire_reason = ?3,
+                     last_seen_utc = ?2
+                 where drive_uuid = ?1",
+                params![drive_uuid, now, reason.trim()],
+            )
+            .map_err(|err| sqlite_error("retire drive", err))?;
+        let drive = self
+            .get_drive_by_uuid(drive_uuid)?
+            .ok_or_else(|| StateError::IndexCorrupt("retired drive is missing".to_string()))?;
+        Ok(Some(RetireDriveOutcome {
+            newly_retired: true,
+            drive,
+        }))
     }
 
     /// Permanently retire one tape identity and mark its copies missing.
@@ -2011,7 +2748,8 @@ impl CatalogIndex {
         let mut stmt = self
             .conn
             .prepare(
-                "select session_id, session_kind, tape_uuid, library_serial, drive_bay
+                "select session_id, session_kind, tape_uuid, library_serial, drive_bay,
+                        drive_uuid
                  from sessions
                  where state = 'open'
                  order by opened_at_utc, session_id",
@@ -2026,12 +2764,13 @@ impl CatalogIndex {
                     row.get::<_, Option<Vec<u8>>>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
                 ))
             })
             .map_err(|err| sqlite_error("query non-terminal sessions", err))?;
         let mut out = Vec::new();
         for row in rows {
-            let (session_id, session_kind, tape_uuid, library_serial, drive_bay) =
+            let (session_id, session_kind, tape_uuid, library_serial, drive_bay, drive_uuid) =
                 row.map_err(|err| sqlite_error("read non-terminal session row", err))?;
             out.push(RestartSession {
                 session_id: parse_uuid_for_index(&session_id, "session_id")?,
@@ -2039,6 +2778,7 @@ impl CatalogIndex {
                 tape_uuid,
                 library_serial,
                 drive_bay,
+                drive_uuid,
             });
         }
         Ok(out)
@@ -2141,6 +2881,9 @@ struct PreservedTapeRow {
     tape_uuid: Vec<u8>,
     voltag: Option<String>,
     pool_id: Option<String>,
+    kind: String,
+    cleaning_uses: Option<i64>,
+    cleaning_state: Option<String>,
     block_size: Option<i64>,
     scheme_id: Option<String>,
     data_blocks_per_stripe: Option<i64>,
@@ -2395,7 +3138,8 @@ fn query_preserved_tape_rows_tx(
 ) -> Result<Vec<PreservedTapeRow>, StateError> {
     let mut stmt = tx
         .prepare(
-            "select tape_uuid, voltag, pool_id, block_size, scheme_id,
+            "select tape_uuid, voltag, pool_id, kind, cleaning_uses, cleaning_state,
+                    block_size, scheme_id,
                     data_blocks_per_stripe, parity_blocks_per_stripe,
                     stripes_per_neighborhood, highest_protected_ordinal,
                     total_committed_ordinals, last_committed_tape_file,
@@ -2403,6 +3147,9 @@ fn query_preserved_tape_rows_tx(
              from tapes
              where voltag is not null
                 or pool_id is not null
+                or kind != 'data'
+                or cleaning_uses is not null
+                or cleaning_state is not null
                 or state in ('ready', 'sealed', 'retired')",
         )
         .map_err(|err| sqlite_error("prepare preserved tape query", err))?;
@@ -2418,16 +3165,19 @@ fn query_preserved_tape_rows_tx(
             tape_uuid: row_get(row, 0, "tapes.tape_uuid")?,
             voltag: row_get(row, 1, "tapes.voltag")?,
             pool_id: row_get(row, 2, "tapes.pool_id")?,
-            block_size: row_get(row, 3, "tapes.block_size")?,
-            scheme_id: row_get(row, 4, "tapes.scheme_id")?,
-            data_blocks_per_stripe: row_get(row, 5, "tapes.data_blocks_per_stripe")?,
-            parity_blocks_per_stripe: row_get(row, 6, "tapes.parity_blocks_per_stripe")?,
-            stripes_per_neighborhood: row_get(row, 7, "tapes.stripes_per_neighborhood")?,
-            highest_protected_ordinal: row_get(row, 8, "tapes.highest_protected_ordinal")?,
-            total_committed_ordinals: row_get(row, 9, "tapes.total_committed_ordinals")?,
-            last_committed_tape_file: row_get(row, 10, "tapes.last_committed_tape_file")?,
-            state: row_get(row, 11, "tapes.state")?,
-            updated_at_utc: row_get(row, 12, "tapes.updated_at_utc")?,
+            kind: row_get(row, 3, "tapes.kind")?,
+            cleaning_uses: row_get(row, 4, "tapes.cleaning_uses")?,
+            cleaning_state: row_get(row, 5, "tapes.cleaning_state")?,
+            block_size: row_get(row, 6, "tapes.block_size")?,
+            scheme_id: row_get(row, 7, "tapes.scheme_id")?,
+            data_blocks_per_stripe: row_get(row, 8, "tapes.data_blocks_per_stripe")?,
+            parity_blocks_per_stripe: row_get(row, 9, "tapes.parity_blocks_per_stripe")?,
+            stripes_per_neighborhood: row_get(row, 10, "tapes.stripes_per_neighborhood")?,
+            highest_protected_ordinal: row_get(row, 11, "tapes.highest_protected_ordinal")?,
+            total_committed_ordinals: row_get(row, 12, "tapes.total_committed_ordinals")?,
+            last_committed_tape_file: row_get(row, 13, "tapes.last_committed_tape_file")?,
+            state: row_get(row, 14, "tapes.state")?,
+            updated_at_utc: row_get(row, 15, "tapes.updated_at_utc")?,
         });
     }
     Ok(preserved)
@@ -2440,17 +3190,20 @@ fn restore_preserved_tape_rows_tx(
     for row in rows {
         tx.execute(
             "insert into tapes(
-               tape_uuid, voltag, pool_id, block_size, scheme_id,
-               data_blocks_per_stripe, parity_blocks_per_stripe,
-               stripes_per_neighborhood, highest_protected_ordinal,
-               total_committed_ordinals, last_committed_tape_file,
-               state, updated_at_utc
+               tape_uuid, voltag, pool_id, kind, cleaning_uses,
+               cleaning_state, block_size, scheme_id, data_blocks_per_stripe,
+               parity_blocks_per_stripe, stripes_per_neighborhood,
+               highest_protected_ordinal, total_committed_ordinals,
+               last_committed_tape_file, state, updated_at_utc
             )
-             values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 row.tape_uuid.as_slice(),
                 row.voltag.as_deref(),
                 row.pool_id.as_deref(),
+                row.kind.as_str(),
+                row.cleaning_uses,
+                row.cleaning_state.as_deref(),
                 row.block_size,
                 row.scheme_id.as_deref(),
                 row.data_blocks_per_stripe,
@@ -2480,6 +3233,9 @@ fn merge_preserved_tape_operator_columns_tx(
         // retired identity as `ingested`.
         if row.voltag.is_none()
             && row.pool_id.is_none()
+            && row.kind == "data"
+            && row.cleaning_uses.is_none()
+            && row.cleaning_state.is_none()
             && !matches!(row.state.as_str(), "ready" | "sealed" | "retired")
         {
             continue;
@@ -2488,9 +3244,12 @@ fn merge_preserved_tape_operator_columns_tx(
             "update tapes
              set voltag = coalesce(?2, voltag),
                  pool_id = coalesce(?3, pool_id),
+                 kind = ?4,
+                 cleaning_uses = ?5,
+                 cleaning_state = ?6,
                  state =
                    case
-                     when ?4 in ('ready', 'sealed', 'retired') then ?4
+                     when ?7 in ('ready', 'sealed', 'retired') then ?7
                      else state
                    end
              where tape_uuid = ?1",
@@ -2498,6 +3257,9 @@ fn merge_preserved_tape_operator_columns_tx(
                 row.tape_uuid.as_slice(),
                 row.voltag.as_deref(),
                 row.pool_id.as_deref(),
+                row.kind.as_str(),
+                row.cleaning_uses,
+                row.cleaning_state.as_deref(),
                 row.state.as_str(),
             ],
         )
@@ -2994,9 +3756,10 @@ fn project_session_record(
     tx.execute(
         "insert into sessions(
            session_id, session_kind, tape_uuid, library_serial, drive_bay,
+           drive_uuid,
            state, opened_at_utc, updated_at_utc
          )
-         values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+         values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
          on conflict(session_id) do update set
            session_kind = case
              when excluded.session_kind != 'unknown' then excluded.session_kind
@@ -3005,6 +3768,7 @@ fn project_session_record(
            tape_uuid = coalesce(excluded.tape_uuid, sessions.tape_uuid),
            library_serial = coalesce(excluded.library_serial, sessions.library_serial),
            drive_bay = coalesce(excluded.drive_bay, sessions.drive_bay),
+           drive_uuid = coalesce(excluded.drive_uuid, sessions.drive_uuid),
            state = excluded.state,
            updated_at_utc = excluded.updated_at_utc",
         params![
@@ -3013,6 +3777,7 @@ fn project_session_record(
             detail_tape_uuid(record, "tape_uuid"),
             detail_text(record, "library_serial"),
             detail_i64(record, "drive_bay"),
+            detail_bytes(record, "drive_uuid"),
             state,
             record.timestamp_utc.as_str(),
         ],
@@ -3924,6 +4689,280 @@ fn tape_from_row(row: &rusqlite::Row<'_>) -> Result<TapeRecord, StateError> {
     })
 }
 
+const DRIVE_SELECT_SQL_WITH_WHERE_UUID: &str = concat!(
+    "select drive_uuid, serial, identity_source, actionable, ",
+    "vendor, product, firmware_rev, managed, state, ",
+    "cleaning_due, fenced, first_seen_utc, last_seen_utc, ",
+    "last_library_serial, last_element_address, ",
+    "purchase_date, warranty_until, cost, notes, ",
+    "retired_at_utc, retire_reason ",
+    "from drives where drive_uuid = ?1"
+);
+
+fn drive_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DriveRecord> {
+    Ok(DriveRecord {
+        drive_uuid: row.get(0)?,
+        serial: row.get(1)?,
+        identity_source: row.get(2)?,
+        actionable: row.get::<_, i64>(3)? != 0,
+        vendor: row.get(4)?,
+        product: row.get(5)?,
+        firmware_rev: row.get(6)?,
+        managed: row.get(7)?,
+        state: row.get(8)?,
+        cleaning_due: row.get(9)?,
+        fenced: row.get::<_, i64>(10)? != 0,
+        first_seen_utc: row.get(11)?,
+        last_seen_utc: row.get(12)?,
+        last_library_serial: row.get(13)?,
+        last_element_address: row.get(14)?,
+        purchase_date: row.get(15)?,
+        warranty_until: row.get(16)?,
+        cost: row.get(17)?,
+        notes: row.get(18)?,
+        retired_at_utc: row.get(19)?,
+        retire_reason: row.get(20)?,
+    })
+}
+
+fn drive_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DriveEventRecord> {
+    Ok(DriveEventRecord {
+        event_id: row.get(0)?,
+        drive_uuid: row.get(1)?,
+        event_kind: row.get(2)?,
+        at_utc: row.get(3)?,
+        library_serial: row.get(4)?,
+        element_address: row.get(5)?,
+        tape_uuid: row.get(6)?,
+        detail: row.get(7)?,
+    })
+}
+
+fn drive_snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DriveHealthSnapshotRecord> {
+    Ok(DriveHealthSnapshotRecord {
+        snapshot_id: row.get(0)?,
+        drive_uuid: row.get(1)?,
+        at_utc: row.get(2)?,
+        trigger: row.get(3)?,
+        session_id: row.get(4)?,
+        tape_alert_flags: row.get(5)?,
+        write_errors_corrected: row.get(6)?,
+        write_errors_uncorrected: row.get(7)?,
+        read_errors_corrected: row.get(8)?,
+        read_errors_uncorrected: row.get(9)?,
+        raw_pages: row.get(10)?,
+    })
+}
+
+fn alarm_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlarmRecord> {
+    Ok(AlarmRecord {
+        alarm_id: row.get(0)?,
+        condition_key: row.get(1)?,
+        kind: row.get(2)?,
+        severity: row.get(3)?,
+        state: row.get(4)?,
+        first_seen_utc: row.get(5)?,
+        last_seen_utc: row.get(6)?,
+        acked_by: row.get(7)?,
+        acked_at_utc: row.get(8)?,
+        detail: row.get(9)?,
+    })
+}
+
+fn find_drive_for_observation(
+    conn: &Connection,
+    serial: &str,
+    vendor: Option<&str>,
+    product: Option<&str>,
+    library_serial: Option<&str>,
+    element_address: Option<i64>,
+) -> Result<Option<DriveRecord>, StateError> {
+    if !serial.is_empty() {
+        let mut stmt = conn
+            .prepare(
+                "select drive_uuid, serial, identity_source, actionable,
+                        vendor, product, firmware_rev, managed, state,
+                        cleaning_due, fenced, first_seen_utc, last_seen_utc,
+                        last_library_serial, last_element_address,
+                        purchase_date, warranty_until, cost, notes,
+                        retired_at_utc, retire_reason
+                 from drives
+                 where serial = ?1
+                   and coalesce(vendor, '') = coalesce(?2, '')
+                   and coalesce(product, '') = coalesce(?3, '')
+                 order by state = 'active' desc, first_seen_utc, hex(drive_uuid)
+                 limit 1",
+            )
+            .map_err(|err| sqlite_error("prepare drive observation lookup", err))?;
+        return stmt
+            .query_row(params![serial, vendor, product], drive_from_row)
+            .optional()
+            .map_err(|err| sqlite_error("query drive observation lookup", err));
+    }
+    let (Some(library_serial), Some(element_address)) = (library_serial, element_address) else {
+        return Ok(None);
+    };
+    let mut stmt = conn
+        .prepare(
+            "select drive_uuid, serial, identity_source, actionable,
+                    vendor, product, firmware_rev, managed, state,
+                    cleaning_due, fenced, first_seen_utc, last_seen_utc,
+                    last_library_serial, last_element_address,
+                    purchase_date, warranty_until, cost, notes,
+                    retired_at_utc, retire_reason
+             from drives
+             where serial = ''
+               and last_library_serial = ?1
+               and last_element_address = ?2
+             order by state = 'active' desc, last_seen_utc desc, hex(drive_uuid)
+             limit 1",
+        )
+        .map_err(|err| sqlite_error("prepare blank-serial drive lookup", err))?;
+    stmt.query_row(params![library_serial, element_address], drive_from_row)
+        .optional()
+        .map_err(|err| sqlite_error("query blank-serial drive lookup", err))
+}
+
+struct DriveEventInsert<'a> {
+    drive_uuid: &'a [u8],
+    event_kind: &'a str,
+    at_utc: &'a str,
+    library_serial: Option<&'a str>,
+    element_address: Option<i64>,
+    tape_uuid: Option<&'a [u8]>,
+    detail: Option<&'a str>,
+}
+
+fn insert_drive_event_tx(conn: &Connection, event: DriveEventInsert<'_>) -> Result<(), StateError> {
+    conn.execute(
+        "insert into drive_events(
+           drive_uuid, event_kind, at_utc, library_serial,
+           element_address, tape_uuid, detail
+         )
+         values(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            event.drive_uuid,
+            event.event_kind,
+            event.at_utc,
+            event.library_serial,
+            event.element_address,
+            event.tape_uuid,
+            event.detail,
+        ],
+    )
+    .map(|_| ())
+    .map_err(|err| sqlite_error("insert drive event", err))
+}
+
+fn reconcile_drive_serial_actionability_tx(
+    conn: &Connection,
+    serial: &str,
+    observed_at: &str,
+) -> Result<bool, StateError> {
+    if serial.is_empty() {
+        conn.execute(
+            "update drives set actionable = 0 where serial = '' and state = 'active'",
+            [],
+        )
+        .map_err(|err| sqlite_error("mark blank-serial drives non-actionable", err))?;
+        raise_alarm_tx(
+            conn,
+            "drive-serial-collision:<blank>",
+            "drive-serial-collision",
+            "warning",
+            Some("{\"serial\":\"\"}"),
+            observed_at,
+        )?;
+        return Ok(true);
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "select drive_uuid
+             from drives
+             where serial = ?1 and state = 'active'
+             order by hex(drive_uuid)",
+        )
+        .map_err(|err| sqlite_error("prepare drive serial collision query", err))?;
+    let rows = stmt
+        .query_map(params![serial], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(|err| sqlite_error("query drive serial collisions", err))?;
+    let drive_uuids = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| sqlite_error("read drive serial collisions", err))?;
+    if drive_uuids.len() <= 1 {
+        conn.execute(
+            "update drives set actionable = 1 where serial = ?1 and state = 'active'",
+            params![serial],
+        )
+        .map_err(|err| sqlite_error("mark unique-serial drive actionable", err))?;
+        return Ok(false);
+    }
+    conn.execute(
+        "update drives set actionable = 0 where serial = ?1 and state = 'active'",
+        params![serial],
+    )
+    .map_err(|err| sqlite_error("mark collided-serial drives non-actionable", err))?;
+    for drive_uuid in drive_uuids {
+        insert_drive_event_tx(
+            conn,
+            DriveEventInsert {
+                drive_uuid: drive_uuid.as_slice(),
+                event_kind: "serial-collision",
+                at_utc: observed_at,
+                library_serial: None,
+                element_address: None,
+                tape_uuid: None,
+                detail: None,
+            },
+        )?;
+    }
+    let key = format!("drive-serial-collision:{serial}");
+    let detail = format!("{{\"serial\":\"{serial}\"}}");
+    raise_alarm_tx(
+        conn,
+        key.as_str(),
+        "drive-serial-collision",
+        "warning",
+        Some(detail.as_str()),
+        observed_at,
+    )?;
+    Ok(true)
+}
+
+fn raise_alarm_tx(
+    conn: &Connection,
+    condition_key: &str,
+    kind: &str,
+    severity: &str,
+    detail: Option<&str>,
+    now: &str,
+) -> Result<(), StateError> {
+    conn.execute(
+        "insert into alarms(
+           condition_key, kind, severity, state,
+           first_seen_utc, last_seen_utc, detail
+         )
+         values(?1, ?2, ?3, 'open', ?5, ?5, ?4)
+         on conflict(condition_key) do update set
+           kind = excluded.kind,
+           severity = excluded.severity,
+           state = case
+             when alarms.state = 'cleared' then 'open'
+             else alarms.state
+           end,
+           first_seen_utc = case
+             when alarms.state = 'cleared' then excluded.first_seen_utc
+             else alarms.first_seen_utc
+           end,
+           last_seen_utc = excluded.last_seen_utc,
+           detail = coalesce(excluded.detail, alarms.detail)",
+        params![condition_key, kind, severity, detail, now],
+    )
+    .map(|_| ())
+    .map_err(|err| sqlite_error("raise alarm", err))
+}
+
 fn tape_file_from_row(row: &rusqlite::Row<'_>) -> Result<TapeFileRecord, StateError> {
     Ok(TapeFileRecord {
         tape_uuid: row_get(row, 0, "tape_files.tape_uuid")?,
@@ -4067,6 +5106,27 @@ fn migrate(conn: &Connection) -> Result<(), StateError> {
     ensure_column(conn, "catalog_units", "source_kind", "source_kind text")?;
     ensure_column(conn, "catalog_units", "source_id", "source_id text")?;
     ensure_column(conn, "tapes", "pool_id", "pool_id text")?;
+    ensure_column(conn, "tapes", "kind", "kind text not null default 'data'")?;
+    ensure_column(conn, "tapes", "cleaning_uses", "cleaning_uses integer")?;
+    ensure_column(conn, "tapes", "cleaning_state", "cleaning_state text")?;
+    ensure_column(conn, "sessions", "drive_uuid", "drive_uuid blob")?;
+    if current < 9 {
+        conn.execute(
+            "update tapes
+             set kind = 'cleaning',
+                 cleaning_uses = coalesce(cleaning_uses, 0),
+                 cleaning_state = coalesce(cleaning_state, 'unverified')
+             where kind = 'data'
+               and voltag glob 'CLN*'
+               and not exists (
+                 select 1 from object_copies
+                 where object_copies.tape_uuid = tapes.tape_uuid
+                   and object_copies.status = 'committed'
+               )",
+            [],
+        )
+        .map_err(|err| sqlite_error("backfill CLN cleaning tape kind", err))?;
+    }
     if table_exists(conn, LEGACY_TAPE_POOL_MEMBERSHIPS_TABLE)? {
         let backfill_sql = format!(
             "update tapes set pool_id = (
@@ -4188,6 +5248,9 @@ create table if not exists tapes(
   tape_uuid blob primary key,
   voltag text,
   pool_id text,
+  kind text not null default 'data',
+  cleaning_uses integer,
+  cleaning_state text,
   block_size integer,
   scheme_id text,
   data_blocks_per_stripe integer,
@@ -4330,9 +5393,79 @@ create table if not exists sessions(
   tape_uuid blob,
   library_serial text,
   drive_bay integer,
+  drive_uuid blob,
   state text not null,
   opened_at_utc text not null,
   updated_at_utc text not null
+);
+
+create table if not exists drives(
+  drive_uuid blob primary key,
+  serial text,
+  identity_source text not null,
+  actionable integer not null default 1,
+  vendor text, product text, firmware_rev text,
+  managed text not null,
+  state text not null default 'active',
+  cleaning_due text not null default 'none',
+  fenced integer not null default 0,
+  first_seen_utc text not null, last_seen_utc text not null,
+  last_library_serial text, last_element_address integer,
+  purchase_date text, warranty_until text,
+  cost text,
+  notes text,
+  retired_at_utc text, retire_reason text
+);
+
+create table if not exists drive_events(
+  event_id integer primary key,
+  drive_uuid blob not null references drives(drive_uuid),
+  event_kind text not null,
+  at_utc text not null,
+  library_serial text, element_address integer,
+  tape_uuid blob, detail text
+);
+
+create table if not exists drive_health_snapshots(
+  snapshot_id integer primary key,
+  drive_uuid blob not null references drives(drive_uuid),
+  at_utc text not null,
+  trigger text not null,
+  session_id text,
+  tape_alert_flags text,
+  write_errors_corrected integer, write_errors_uncorrected integer,
+  read_errors_corrected integer, read_errors_uncorrected integer,
+  raw_pages text,
+  unique(session_id, trigger)
+);
+
+create table if not exists clean_runs(
+  run_id text primary key,
+  drive_uuid blob not null, library_serial text not null,
+  cart_tape_uuid blob, cart_home_slot integer,
+  phase text not null,
+  trigger text not null,
+  started_at_utc text not null, updated_at_utc text not null,
+  detail text
+);
+
+create unique index if not exists clean_runs_one_active_per_drive
+  on clean_runs(drive_uuid)
+  where phase not in ('done','failed','needs-operator');
+
+create unique index if not exists clean_runs_one_active_per_cart
+  on clean_runs(cart_tape_uuid)
+  where phase not in ('done','failed','needs-operator')
+    and cart_tape_uuid is not null;
+
+create table if not exists alarms(
+  alarm_id integer primary key,
+  condition_key text not null unique,
+  kind text not null, severity text not null,
+  state text not null,
+  first_seen_utc text not null, last_seen_utc text not null,
+  acked_by text, acked_at_utc text,
+  detail text
 );
 "#;
 
@@ -4375,6 +5508,11 @@ mod tests {
         "idempotency_keys",
         "operations",
         "sessions",
+        "drives",
+        "drive_events",
+        "drive_health_snapshots",
+        "clean_runs",
+        "alarms",
     ];
 
     fn audit_record(
@@ -5330,6 +6468,419 @@ mod tests {
     }
 
     #[test]
+    fn ds_m1_migration_adds_drive_schema_and_backfills_unwritten_cln_tapes() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let path = temp.path().join("rem-state.sqlite");
+        let conn = Connection::open(&path).expect("open raw sqlite");
+        conn.execute_batch(MINIMUM_SCHEMA)
+            .expect("seed pre-migration schema shape");
+        let cleaning_tape = vec![0x11_u8; 16];
+        let written_cln_tape = vec![0x22_u8; 16];
+        conn.execute(
+            "insert into tapes(tape_uuid, voltag, state, updated_at_utc)
+             values(?1, 'CLN001L9', 'ready', '2026-07-04T00:00:00Z')",
+            params![cleaning_tape.as_slice()],
+        )
+        .expect("seed unwritten CLN tape");
+        conn.execute(
+            "insert into tapes(tape_uuid, voltag, state, updated_at_utc)
+             values(?1, 'CLN999L9', 'ready', '2026-07-04T00:00:00Z')",
+            params![written_cln_tape.as_slice()],
+        )
+        .expect("seed written CLN tape");
+        conn.execute(
+            "insert into object_copies(object_id, tape_uuid, tape_file_number, status)
+             values('obj-written', ?1, 1, 'committed')",
+            params![written_cln_tape.as_slice()],
+        )
+        .expect("seed committed copy guard");
+        conn.pragma_update(None, "user_version", 8_u32)
+            .expect("mark pre-DS-M1 version");
+        drop(conn);
+
+        let index = CatalogIndex::open(&path).expect("migrate DS-M1 schema");
+        for table in [
+            "drives",
+            "drive_events",
+            "drive_health_snapshots",
+            "clean_runs",
+            "alarms",
+        ] {
+            assert!(index.table_exists(table).expect("table exists"), "{table}");
+        }
+        assert!(table_column_exists(&index.conn, "sessions", "drive_uuid")
+            .expect("sessions.drive_uuid exists"));
+        assert!(table_column_exists(&index.conn, "tapes", "kind").expect("tapes.kind exists"));
+
+        let unwritten: (String, Option<i64>, Option<String>) = index
+            .conn
+            .query_row(
+                "select kind, cleaning_uses, cleaning_state from tapes where voltag = 'CLN001L9'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("unwritten CLN tape row");
+        assert_eq!(
+            unwritten,
+            (
+                "cleaning".to_string(),
+                Some(0),
+                Some("unverified".to_string())
+            )
+        );
+
+        let written: (String, Option<i64>, Option<String>) = index
+            .conn
+            .query_row(
+                "select kind, cleaning_uses, cleaning_state from tapes where voltag = 'CLN999L9'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("written CLN tape row");
+        assert_eq!(written, ("data".to_string(), None, None));
+    }
+
+    #[test]
+    fn rebuild_preserves_ds_m1_authoritative_tables_and_drive_session_projection() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let path = temp.path().join("rem-state.sqlite");
+        let mut index = CatalogIndex::open(&path).expect("open");
+        let tape_uuid = [0x33; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "CLN002L9".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision CLN tape");
+        index
+            .conn
+            .execute(
+                "update tapes
+                 set kind = 'cleaning', cleaning_uses = 7, cleaning_state = 'ok'
+                 where tape_uuid = ?1",
+                params![tape_uuid.to_vec()],
+            )
+            .expect("mark cleaning cart fields");
+
+        let observed = index
+            .observe_drive(DriveObservationInput {
+                serial: "DRV-REBUILD".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("mainlib".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-04T00:01:00Z".to_string()),
+            })
+            .expect("observe drive");
+        index
+            .record_drive_health_snapshot(DriveHealthSnapshotInput {
+                drive_uuid: observed.drive_uuid.clone(),
+                trigger: "session-close".to_string(),
+                session_id: Some("session-1".to_string()),
+                tape_alert_flags: Some("[20]".to_string()),
+                write_errors_corrected: Some(1),
+                write_errors_uncorrected: Some(0),
+                read_errors_corrected: Some(2),
+                read_errors_uncorrected: Some(0),
+                raw_pages: Some("{}".to_string()),
+                at_utc: Some("2026-07-04T00:02:00Z".to_string()),
+            })
+            .expect("record snapshot");
+        index
+            .raise_alarm(
+                "snapshot-persist-failing:mainlib:0100",
+                "snapshot-persist-failing",
+                "warning",
+                Some("{}"),
+            )
+            .expect("raise alarm");
+
+        let session_id = Uuid::from_u128(0x1234);
+        let session_record = audit_record(
+            1,
+            AuditEvent::SessionOpened,
+            None,
+            Some(session_id),
+            None,
+            "write",
+            detail(&[
+                ("session_kind", CborValue::Text("write".to_string())),
+                ("tape_uuid", CborValue::Bytes(tape_uuid.to_vec())),
+                ("library_serial", CborValue::Text("mainlib".to_string())),
+                ("drive_bay", CborValue::Integer(0x0100.into())),
+                ("drive_uuid", CborValue::Bytes(observed.drive_uuid.clone())),
+                ("drive_serial", CborValue::Text("DRV-REBUILD".to_string())),
+            ]),
+        );
+        index
+            .rebuild_from_authoritative_sources(&[session_record], &[])
+            .expect("rebuild projections");
+
+        let tape_fields: (String, Option<i64>, Option<String>) = index
+            .conn
+            .query_row(
+                "select kind, cleaning_uses, cleaning_state from tapes where tape_uuid = ?1",
+                params![tape_uuid.to_vec()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("preserved tape fields");
+        assert_eq!(
+            tape_fields,
+            ("cleaning".to_string(), Some(7), Some("ok".to_string()))
+        );
+        assert_eq!(index.list_drives(false, false).expect("drives").len(), 1);
+        assert_eq!(
+            index
+                .list_drive_events(&observed.drive_uuid)
+                .expect("drive events")
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .list_drive_health_snapshots(&observed.drive_uuid)
+                .expect("drive snapshots")
+                .len(),
+            1
+        );
+        assert_eq!(index.list_alarms(false).expect("alarms").len(), 1);
+        let projected_drive_uuid: Vec<u8> = index
+            .conn
+            .query_row(
+                "select drive_uuid from sessions where session_id = ?1",
+                params![session_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("session drive_uuid");
+        assert_eq!(
+            projected_drive_uuid.as_slice(),
+            observed.drive_uuid.as_slice()
+        );
+
+        drop(index);
+        let reopened = CatalogIndex::open(&path).expect("reopen after rebuild");
+        assert_eq!(reopened.list_drives(false, false).expect("drives").len(), 1);
+        assert_eq!(
+            reopened
+                .list_drive_health_snapshots(&observed.drive_uuid)
+                .expect("snapshots")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn drive_identity_marks_blank_and_collided_serials_non_actionable() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+
+        let first = index
+            .observe_drive(DriveObservationInput {
+                serial: "SER123".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("mainlib".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-04T00:00:00Z".to_string()),
+            })
+            .expect("observe first drive");
+        let same = index
+            .observe_drive(DriveObservationInput {
+                serial: "SER123".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("mainlib".to_string()),
+                element_address: Some(0x0101),
+                observed_at_utc: Some("2026-07-04T00:01:00Z".to_string()),
+            })
+            .expect("observe same physical drive");
+        assert_eq!(first.drive_uuid, same.drive_uuid);
+
+        let blank = index
+            .observe_drive(DriveObservationInput {
+                serial: String::new(),
+                identity_source: "Derived".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: None,
+                managed: "rem".to_string(),
+                library_serial: Some("mainlib".to_string()),
+                element_address: Some(0x0102),
+                observed_at_utc: Some("2026-07-04T00:02:00Z".to_string()),
+            })
+            .expect("observe blank serial drive");
+        assert!(blank.serial_collision);
+        let blank_row = index
+            .get_drive_by_uuid(&blank.drive_uuid)
+            .expect("blank lookup")
+            .expect("blank drive row");
+        assert!(!blank_row.actionable);
+        assert_eq!(
+            index
+                .get_alarm("drive-serial-collision:<blank>")
+                .expect("blank alarm")
+                .expect("blank alarm present")
+                .state,
+            "open"
+        );
+
+        let collided = index
+            .observe_drive(DriveObservationInput {
+                serial: "SER123".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("HP".to_string()),
+                product: Some("Ultrium".to_string()),
+                firmware_rev: Some("B1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("mainlib".to_string()),
+                element_address: Some(0x0103),
+                observed_at_utc: Some("2026-07-04T00:03:00Z".to_string()),
+            })
+            .expect("observe collided serial");
+        assert!(collided.serial_collision);
+        let rows = index
+            .conn
+            .prepare("select actionable from drives where serial = 'SER123'")
+            .expect("prepare collision query")
+            .query_map([], |row| row.get::<_, i64>(0))
+            .expect("query collision rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read collision rows");
+        assert_eq!(rows, vec![0, 0]);
+        assert_eq!(
+            index
+                .get_alarm("drive-serial-collision:SER123")
+                .expect("collision alarm")
+                .expect("collision alarm present")
+                .state,
+            "open"
+        );
+    }
+
+    #[test]
+    fn drive_health_snapshots_are_idempotent_by_session_and_trigger() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let drive_uuid = index
+            .observe_drive(DriveObservationInput {
+                serial: "SNAP123".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: None,
+                product: None,
+                firmware_rev: None,
+                managed: "rem".to_string(),
+                library_serial: Some("mainlib".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-04T00:00:00Z".to_string()),
+            })
+            .expect("observe drive")
+            .drive_uuid;
+
+        let first = index
+            .record_drive_health_snapshot(DriveHealthSnapshotInput {
+                drive_uuid: drive_uuid.clone(),
+                trigger: "session-close".to_string(),
+                session_id: Some("session-42".to_string()),
+                tape_alert_flags: Some("[20]".to_string()),
+                write_errors_corrected: Some(1),
+                write_errors_uncorrected: Some(0),
+                read_errors_corrected: None,
+                read_errors_uncorrected: None,
+                raw_pages: None,
+                at_utc: Some("2026-07-04T00:01:00Z".to_string()),
+            })
+            .expect("first snapshot");
+        let second = index
+            .record_drive_health_snapshot(DriveHealthSnapshotInput {
+                drive_uuid,
+                trigger: "session-close".to_string(),
+                session_id: Some("session-42".to_string()),
+                tape_alert_flags: Some("[21]".to_string()),
+                write_errors_corrected: Some(99),
+                write_errors_uncorrected: Some(0),
+                read_errors_corrected: None,
+                read_errors_uncorrected: None,
+                raw_pages: None,
+                at_utc: Some("2026-07-04T00:02:00Z".to_string()),
+            })
+            .expect("idempotent duplicate snapshot");
+
+        assert_eq!(first.snapshot_id, second.snapshot_id);
+        assert_eq!(second.tape_alert_flags.as_deref(), Some("[20]"));
+        assert_eq!(second.write_errors_corrected, Some(1));
+    }
+
+    #[test]
+    fn alarm_lifecycle_ack_clear_and_reraise_is_persistent() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let path = temp.path().join("rem-state.sqlite");
+        let mut index = CatalogIndex::open(&path).expect("open");
+
+        let opened = index
+            .raise_alarm("no-cln-cart:mainlib", "no-cln-cart", "critical", Some("{}"))
+            .expect("raise alarm");
+        assert_eq!(opened.state, "open");
+        let acked = index
+            .ack_alarm("no-cln-cart:mainlib", "operator-a")
+            .expect("ack alarm")
+            .expect("acked row");
+        assert_eq!(acked.state, "acked");
+        assert_eq!(acked.acked_by.as_deref(), Some("operator-a"));
+        let cleared = index
+            .clear_alarm("no-cln-cart:mainlib")
+            .expect("clear alarm")
+            .expect("cleared row");
+        assert_eq!(cleared.state, "cleared");
+        let reraised = index
+            .raise_alarm("no-cln-cart:mainlib", "no-cln-cart", "critical", Some("{}"))
+            .expect("re-raise alarm");
+        assert_eq!(reraised.state, "open");
+        assert_eq!(
+            index.list_alarms(false).expect("active alarms").len(),
+            1,
+            "re-raise must not duplicate condition_key"
+        );
+
+        drop(index);
+        let reopened = CatalogIndex::open(&path).expect("reopen");
+        assert_eq!(
+            reopened
+                .get_alarm("no-cln-cart:mainlib")
+                .expect("alarm lookup")
+                .expect("alarm row")
+                .state,
+            "open"
+        );
+    }
+
+    #[test]
     fn future_schema_version_is_rejected() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-index")
@@ -5960,6 +7511,9 @@ mod tests {
             tape_uuid: input.tape_uuid.to_vec(),
             voltag: None,
             pool_id: None,
+            kind: "data".to_string(),
+            cleaning_uses: None,
+            cleaning_state: None,
             block_size: Some(i64::from(input.block_size)),
             scheme_id: None,
             data_blocks_per_stripe: None,

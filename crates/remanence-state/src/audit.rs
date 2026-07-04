@@ -125,6 +125,22 @@ pub enum AuditEvent {
     TapeRetired,
     /// A tape was provisioned after a bootstrap write.
     TapeProvisioned,
+    /// A drive was permanently removed from the managed fleet.
+    DriveRetired,
+    /// Operator metadata was attached to a drive.
+    DriveAnnotated,
+    /// A drive completed a verified cleaning cycle.
+    DriveCleaned,
+    /// A cleaning cartridge reached terminal expiry.
+    CleaningCartridgeExpired,
+    /// A cleaning cartridge was registered for use.
+    CleaningCartridgeRegistered,
+    /// A drive was fenced from session admission.
+    DriveFenced,
+    /// A drive fence was released.
+    DriveUnfenced,
+    /// A standing alarm was acknowledged.
+    AlarmAcked,
 }
 
 /// Subject of an audit event.
@@ -1153,6 +1169,14 @@ impl AuditEvent {
             AuditEvent::AuditWriteFailed => "AuditWriteFailed",
             AuditEvent::TapeRetired => "TapeRetired",
             AuditEvent::TapeProvisioned => "TapeProvisioned",
+            AuditEvent::DriveRetired => "DriveRetired",
+            AuditEvent::DriveAnnotated => "DriveAnnotated",
+            AuditEvent::DriveCleaned => "DriveCleaned",
+            AuditEvent::CleaningCartridgeExpired => "CleaningCartridgeExpired",
+            AuditEvent::CleaningCartridgeRegistered => "CleaningCartridgeRegistered",
+            AuditEvent::DriveFenced => "DriveFenced",
+            AuditEvent::DriveUnfenced => "DriveUnfenced",
+            AuditEvent::AlarmAcked => "AlarmAcked",
         }
     }
 
@@ -1185,6 +1209,14 @@ impl AuditEvent {
             "AuditWriteFailed" => Ok(Self::AuditWriteFailed),
             "TapeRetired" => Ok(Self::TapeRetired),
             "TapeProvisioned" => Ok(Self::TapeProvisioned),
+            "DriveRetired" => Ok(Self::DriveRetired),
+            "DriveAnnotated" => Ok(Self::DriveAnnotated),
+            "DriveCleaned" => Ok(Self::DriveCleaned),
+            "CleaningCartridgeExpired" => Ok(Self::CleaningCartridgeExpired),
+            "CleaningCartridgeRegistered" => Ok(Self::CleaningCartridgeRegistered),
+            "DriveFenced" => Ok(Self::DriveFenced),
+            "DriveUnfenced" => Ok(Self::DriveUnfenced),
+            "AlarmAcked" => Ok(Self::AlarmAcked),
             _ => Err(StateError::AuditCorrupt(format!(
                 "unknown audit event {value}"
             ))),
