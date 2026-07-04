@@ -1396,6 +1396,7 @@ dependencies = [
  "prost-types",
  "remanence-aead",
  "remanence-bru",
+ "remanence-chaos",
  "remanence-format",
  "remanence-library",
  "remanence-parity",
