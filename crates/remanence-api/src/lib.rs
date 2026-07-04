@@ -237,12 +237,10 @@ impl ApiState {
         Self::new_with_pool_configs_inner(
             index_path,
             pool_configs,
-            config
-                .drives
-                .managed_libraries
-                .iter()
-                .map(|serial| serial.trim().to_string())
-                .collect(),
+            // Configured-or-daemon-operated set (never raw config.drives —
+            // its empty default would trip library_is_managed's empty⇒all
+            // fallback and mark foreign libraries managed).
+            drive_managed_library_serials(config),
             config.audit.dir.clone(),
             config.audit.fsync,
             Arc::new(std::sync::Mutex::new(())),
