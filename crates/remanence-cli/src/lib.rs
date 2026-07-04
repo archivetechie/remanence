@@ -203,6 +203,7 @@ fn rem_debug_only_reason(cmd: &Command) -> Option<&'static str> {
         | Command::CatalogClient { .. }
         | Command::DriveClient { .. }
         | Command::AlarmsClient { .. }
+        | Command::TapeAlertsAlias { .. }
         | Command::Tape { .. } => None,
     }
 }
@@ -213,7 +214,8 @@ fn rem_only_reason(cmd: &Command) -> Option<&'static str> {
         | Command::OperationClient { .. }
         | Command::CatalogClient { .. }
         | Command::DriveClient { .. }
-        | Command::AlarmsClient { .. } => Some("daemon client commands"),
+        | Command::AlarmsClient { .. }
+        | Command::TapeAlertsAlias { .. } => Some("daemon client commands"),
         Command::Libraries { .. }
         | Command::Library { .. }
         | Command::Move { .. }
@@ -532,8 +534,15 @@ impl From<RemCommand> for Command {
                 all,
                 command,
             },
-            RemCommand::Tape { command } => Self::Tape {
-                command: command.into(),
+            RemCommand::Tape { command } => match command {
+                RemTapeCommand::Alerts(args) => Self::TapeAlertsAlias {
+                    endpoint: args.endpoint,
+                    json: args.json,
+                    drive: args.drive,
+                },
+                other => Self::Tape {
+                    command: other.into(),
+                },
             },
             RemCommand::Archive { command } => Self::Archive {
                 command: Box::new(command.into()),
@@ -573,6 +582,7 @@ fn state_changing_target(cmd: &Command) -> Option<&str> {
         | Command::CatalogClient { .. }
         | Command::DriveClient { .. }
         | Command::AlarmsClient { .. }
+        | Command::TapeAlertsAlias { .. }
         | Command::Tape { .. } => None,
     }
 }
@@ -952,6 +962,17 @@ enum Command {
         command: Option<AlarmsClientCommand>,
     },
 
+    /// Deprecated alias for `rem drive alerts`.
+    #[command(name = "tape-alerts-alias", hide = true)]
+    TapeAlertsAlias {
+        /// Daemon gRPC endpoint URI.
+        endpoint: String,
+        /// Emit stable CLI-shaped JSON.
+        json: bool,
+        /// Drive serial or UUID.
+        drive: String,
+    },
+
     /// Initialize tapes after the destructive-safety gauntlet.
     Tape {
         /// Tape operation to run.
@@ -1092,7 +1113,7 @@ enum DriveClientCommand {
         snapshots: bool,
     },
 
-    /// Show one drive's active alerts.
+    /// Show one drive's active alerts. `rem tape alerts` is a deprecated alias.
     Alerts {
         /// Drive serial or UUID.
         drive: String,
@@ -1168,8 +1189,8 @@ enum CatalogUnitOriginFilterArg {
 
 #[derive(Subcommand, Debug)]
 enum RemTapeCommand {
-    /// Read the loaded drive's TapeAlert LOG SENSE page.
-    Alerts(TapeAlertsArgs),
+    /// Deprecated alias; use `rem drive alerts <serial|uuid>`.
+    Alerts(TapeAlertsAliasArgs),
 
     /// Initialize one tape or a slot range.
     Init(TapeInitArgs),
@@ -1181,7 +1202,9 @@ enum RemTapeCommand {
 impl From<RemTapeCommand> for TapeCommand {
     fn from(value: RemTapeCommand) -> Self {
         match value {
-            RemTapeCommand::Alerts(args) => Self::Alerts(args),
+            RemTapeCommand::Alerts(_) => {
+                unreachable!("rem tape alerts is dispatched as a daemon drive-alerts alias")
+            }
             RemTapeCommand::Init(args) => Self::Init(args),
             RemTapeCommand::Retire(args) => Self::Retire(args),
         }
@@ -1223,6 +1246,20 @@ struct TapeAlertsArgs {
     /// Select a configured library when more than one is present.
     #[arg(long, value_name = "SERIAL")]
     library: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct TapeAlertsAliasArgs {
+    /// Drive serial or UUID. Deprecated: use `rem drive alerts <serial|uuid>`.
+    drive: String,
+
+    /// Daemon gRPC endpoint URI.
+    #[arg(long, value_name = "URI", default_value = DEFAULT_DAEMON_ENDPOINT)]
+    endpoint: String,
+
+    /// Emit stable CLI-shaped JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 impl TapeAlertsArgs {
@@ -2690,6 +2727,16 @@ where
             all,
             command,
         } => return run_alarms_client_command(endpoint, *json, *all, command, out, err),
+        Command::TapeAlertsAlias {
+            endpoint,
+            json,
+            drive,
+        } => {
+            let command = DriveClientCommand::Alerts {
+                drive: drive.clone(),
+            };
+            return run_drive_client_command(endpoint, *json, &command, out, err);
+        }
         Command::Libraries { .. }
         | Command::Library { .. }
         | Command::Move { .. }
@@ -2826,6 +2873,7 @@ where
                 return ExitCode::from(2);
             }
         },
+        Command::TapeAlertsAlias { .. } => unreachable!("daemon alias dispatched pre-discovery"),
         Command::Move { serial, src, dst } => {
             return run_state_change(
                 &report,
@@ -3131,7 +3179,7 @@ fn run_operation_client_command(
                     let status = client
                         .get_operation(pb::GetOperationRequest { operation_id })
                         .await
-                        .map_err(status_error)?
+                        .map_err(drive_status_error)?
                         .into_inner();
                     print_operation(status, json_output, out).map_err(DaemonClientError::from)
                 }
@@ -3143,7 +3191,7 @@ fn run_operation_client_command(
                             page_size: 0,
                         })
                         .await
-                        .map_err(status_error)?
+                        .map_err(drive_status_error)?
                         .into_inner()
                         .operations;
                     print_operation_list(operations, json_output, out)
@@ -3178,7 +3226,7 @@ fn run_catalog_client_command(
                             pool_id: pool.clone().unwrap_or_default(),
                         })
                         .await
-                        .map_err(status_error)?
+                        .map_err(drive_status_error)?
                         .into_inner()
                         .tapes;
                     print_tape_list(tapes, json_output, out).map_err(DaemonClientError::from)
@@ -3188,7 +3236,7 @@ fn run_catalog_client_command(
                     let tape = client
                         .get_tape(pb::GetTapeRequest { tape_uuid })
                         .await
-                        .map_err(status_error)?
+                        .map_err(drive_status_error)?
                         .into_inner();
                     print_tape(tape, json_output, out).map_err(DaemonClientError::from)
                 }
@@ -3202,7 +3250,7 @@ fn run_catalog_client_command(
                             page_size: 0,
                         })
                         .await
-                        .map_err(status_error)?
+                        .map_err(drive_status_error)?
                         .into_inner()
                         .tape_files;
                     print_tape_file_list(tape_files, json_output, out)
@@ -3215,7 +3263,7 @@ fn run_catalog_client_command(
                             page_size: 0,
                         })
                         .await
-                        .map_err(status_error)?
+                        .map_err(drive_status_error)?
                         .into_inner()
                         .pools;
                     print_tape_pool_list(pools, json_output, out).map_err(DaemonClientError::from)
@@ -3226,7 +3274,7 @@ fn run_catalog_client_command(
                             pool_id: pool_id.clone(),
                         })
                         .await
-                        .map_err(status_error)?
+                        .map_err(drive_status_error)?
                         .into_inner();
                     print_tape_pool(pool, json_output, out).map_err(DaemonClientError::from)
                 }
@@ -3238,7 +3286,7 @@ fn run_catalog_client_command(
                             refresh_from_source: false,
                         })
                         .await
-                        .map_err(status_error)?
+                        .map_err(drive_status_error)?
                         .into_inner();
                     let mut units = Vec::new();
                     while let Some(unit) = stream.message().await.map_err(status_error)? {
@@ -3253,7 +3301,7 @@ fn run_catalog_client_command(
                             unit_id: unit_id.as_bytes().to_vec(),
                         })
                         .await
-                        .map_err(status_error)?
+                        .map_err(drive_status_error)?
                         .into_inner();
                     print_catalog_unit(unit, json_output, out).map_err(DaemonClientError::from)
                 }
@@ -3266,7 +3314,7 @@ fn run_catalog_client_command(
                             refresh_from_source: false,
                         })
                         .await
-                        .map_err(status_error)?
+                        .map_err(drive_status_error)?
                         .into_inner();
                     print_catalog_entry_list(response.entries, json_output, out)
                         .map_err(DaemonClientError::from)
@@ -3327,7 +3375,7 @@ fn run_drive_client_command(
                             page_size: 0,
                         })
                         .await
-                        .map_err(status_error)?
+                        .map_err(drive_status_error)?
                         .into_inner()
                         .drives;
                     print_drive_list(drives, json_output, out).map_err(DaemonClientError::from)
@@ -3338,7 +3386,7 @@ fn run_drive_client_command(
                             drive: drive.clone(),
                         })
                         .await
-                        .map_err(status_error)?
+                        .map_err(drive_status_error)?
                         .into_inner();
                     print_drive(drive, json_output, out).map_err(DaemonClientError::from)
                 }
@@ -3408,9 +3456,17 @@ fn run_drive_client_command(
                         .into_inner();
                     print_drive_retire(response, json_output, out).map_err(DaemonClientError::from)
                 }
-                DriveClientCommand::Poll { .. } => Err(DaemonClientError::client(
-                    "rem drive poll is not wired in the DS-M1 skeleton",
-                )),
+                DriveClientCommand::Poll { drive } => {
+                    let snapshot = client
+                        .poll_drive(pb::PollDriveRequest {
+                            drive: drive.clone(),
+                        })
+                        .await
+                        .map_err(drive_status_error)?
+                        .into_inner();
+                    print_drive_snapshot(snapshot, json_output, out)
+                        .map_err(DaemonClientError::from)
+                }
             }
         })
     });
@@ -3540,6 +3596,13 @@ fn finish_daemon_client_result(
 }
 
 fn status_error(error: tonic::Status) -> DaemonClientError {
+    DaemonClientError::status(error)
+}
+
+fn drive_status_error(error: tonic::Status) -> DaemonClientError {
+    if error.code() == tonic::Code::Unimplemented {
+        return DaemonClientError::client("daemon predates drive stewardship; upgrade rem-daemon");
+    }
     DaemonClientError::status(error)
 }
 
@@ -3675,6 +3738,9 @@ fn print_tape(tape: pb::Tape, json_output: bool, out: &mut dyn Write) -> Result<
         return print_json_envelope("rem.catalog.tape.v1", "item", tape_json(&tape), out);
     }
     print_tape_line(&tape, out);
+    for rollup in &tape.correlation_rollups {
+        print_rollup_line("  drive", rollup, out);
+    }
     Ok(())
 }
 
@@ -3780,6 +3846,32 @@ fn print_drive_history(
     Ok(())
 }
 
+fn print_drive_snapshot(
+    snapshot: pb::DriveHealthSnapshot,
+    json_output: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    if json_output {
+        return print_json_envelope(
+            "rem.drive.snapshot.v1",
+            "item",
+            drive_snapshot_json(&snapshot),
+            out,
+        );
+    }
+    let at = timestamp_text(snapshot.at_utc.as_ref()).unwrap_or_else(|| "-".into());
+    let _ = writeln!(
+        out,
+        "snapshot {}  trigger={}  flags={}  write_uncorrected={}  read_uncorrected={}",
+        at,
+        snapshot.trigger,
+        snapshot.tape_alert_flags,
+        snapshot.write_errors_uncorrected,
+        snapshot.read_errors_uncorrected
+    );
+    Ok(())
+}
+
 fn print_drive_retire(
     response: pb::RetireDriveResponse,
     json_output: bool,
@@ -3850,6 +3942,30 @@ fn print_drive_line(drive: &pb::DriveCatalogEntry, out: &mut dyn Write) {
         out,
         "{uuid}  {label}  state={}  cleaning_due={}  fenced={}",
         drive.state, drive.cleaning_due, drive.fenced
+    );
+    for rollup in &drive.correlation_rollups {
+        print_rollup_line("  tape", rollup, out);
+    }
+}
+
+fn print_rollup_line(prefix: &str, rollup: &pb::DriveCorrelationRollup, out: &mut dyn Write) {
+    let voltag = if rollup.voltag.is_empty() {
+        "(unknown-voltag)"
+    } else {
+        rollup.voltag.as_str()
+    };
+    let drive = if rollup.drive_serial.is_empty() {
+        "unattributed (pre-stewardship)"
+    } else {
+        rollup.drive_serial.as_str()
+    };
+    let _ = writeln!(
+        out,
+        "{prefix} {voltag}  drive={drive}  sessions={}  snapshots={}  write_uncorrected={}  read_uncorrected={}",
+        rollup.session_count,
+        rollup.snapshot_count,
+        rollup.write_errors_uncorrected,
+        rollup.read_errors_uncorrected
     );
 }
 
@@ -4094,6 +4210,7 @@ fn tape_json(tape: &pb::Tape) -> Value {
         "state": tape_state_name(tape.state),
         "updated_at": timestamp_value(tape.updated_at.as_ref()),
         "pool_id": tape.pool_id,
+        "correlation_rollups": tape.correlation_rollups.iter().map(correlation_rollup_json).collect::<Vec<_>>(),
     })
 }
 
@@ -4120,6 +4237,24 @@ fn drive_json(drive: &pb::DriveCatalogEntry) -> Value {
         "notes": drive.notes,
         "retired_at_utc": timestamp_value(drive.retired_at_utc.as_ref()),
         "retire_reason": drive.retire_reason,
+        "correlation_rollups": drive.correlation_rollups.iter().map(correlation_rollup_json).collect::<Vec<_>>(),
+    })
+}
+
+fn correlation_rollup_json(rollup: &pb::DriveCorrelationRollup) -> Value {
+    json!({
+        "tape_uuid": bytes_to_uuid_text(&rollup.tape_uuid),
+        "voltag": rollup.voltag,
+        "drive_uuid": bytes_to_uuid_text(&rollup.drive_uuid),
+        "drive_serial": rollup.drive_serial,
+        "session_count": rollup.session_count,
+        "snapshot_count": rollup.snapshot_count,
+        "write_errors_corrected": rollup.write_errors_corrected,
+        "write_errors_uncorrected": rollup.write_errors_uncorrected,
+        "read_errors_corrected": rollup.read_errors_corrected,
+        "read_errors_uncorrected": rollup.read_errors_uncorrected,
+        "first_session_utc": timestamp_value(rollup.first_session_utc.as_ref()),
+        "last_session_utc": timestamp_value(rollup.last_session_utc.as_ref()),
     })
 }
 
@@ -4282,6 +4417,19 @@ fn tape_state_name(value: i32) -> &'static str {
         3 => "degraded",
         4 => "failed",
         _ => "unspecified",
+    }
+}
+
+pub fn drive_status_name(value: i32) -> String {
+    match value {
+        1 => "idle".to_string(),
+        2 => "loaded".to_string(),
+        3 => "busy".to_string(),
+        4 => "unreachable".to_string(),
+        5 => "cleaning".to_string(),
+        6 => "fenced".to_string(),
+        0 => "unspecified".to_string(),
+        other => format!("unknown({other})"),
     }
 }
 
@@ -10217,6 +10365,24 @@ mod tests {
     }
 
     #[test]
+    fn drive_status_renderer_passes_unknown_proto_enum_ints_through() {
+        assert_eq!(drive_status_name(1), "idle");
+        assert_eq!(drive_status_name(5), "cleaning");
+        assert_eq!(drive_status_name(99), "unknown(99)");
+    }
+
+    #[test]
+    fn drive_commands_map_unimplemented_to_upgrade_message() {
+        let error = drive_status_error(tonic::Status::unimplemented("unknown method PollDrive"));
+
+        assert_eq!(error.code, "daemon_client_error");
+        assert_eq!(
+            error.message,
+            "daemon predates drive stewardship; upgrade rem-daemon"
+        );
+    }
+
+    #[test]
     fn rem_daemon_health_roundtrips_against_in_process_api_service() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-cli-daemon-health")
@@ -10763,26 +10929,24 @@ tape_catalog_dir = "{0}/cache/tapes"
     }
 
     #[test]
-    fn tape_alerts_parses_library_config_and_bay() {
+    fn tape_alerts_parses_deprecated_drive_alerts_alias() {
         let cli = Cli::parse_from([
             "rem",
             "tape",
             "alerts",
-            "--bay",
-            "0x0100",
-            "--config",
-            "/tmp/rem.toml",
-            "--library",
-            "LIB123",
+            "DRV123",
+            "--endpoint",
+            "http://127.0.0.1:50051",
+            "--json",
         ]);
 
         match cli.command {
             RemCommand::Tape {
                 command: RemTapeCommand::Alerts(args),
             } => {
-                assert_eq!(args.bay, 0x0100);
-                assert_eq!(args.config, PathBuf::from("/tmp/rem.toml"));
-                assert_eq!(args.library.as_deref(), Some("LIB123"));
+                assert_eq!(args.drive, "DRV123");
+                assert_eq!(args.endpoint, "http://127.0.0.1:50051");
+                assert!(args.json);
             }
             other => panic!("unexpected command: {other:?}"),
         }

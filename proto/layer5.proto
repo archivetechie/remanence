@@ -164,6 +164,7 @@ service LibraryService {
   rpc GetDriveHistory   (GetDriveHistoryRequest)      returns (GetDriveHistoryResponse);
   rpc AnnotateDrive     (AnnotateDriveRequest)        returns (DriveCatalogEntry);
   rpc RetireDrive       (RetireDriveRequest)          returns (RetireDriveResponse);
+  rpc PollDrive         (PollDriveRequest)            returns (DriveHealthSnapshot);
   rpc CleanDrive        (CleanDriveRequest)           returns (OperationRef);
   rpc ListAlarms        (ListAlarmsRequest)           returns (ListAlarmsResponse);
   rpc AckAlarm          (AckAlarmRequest)             returns (Alarm);
@@ -251,6 +252,22 @@ message DriveCatalogEntry {
   string notes = 19;
   google.protobuf.Timestamp retired_at_utc = 20;
   string retire_reason = 21;
+  repeated DriveCorrelationRollup correlation_rollups = 22;
+}
+
+message DriveCorrelationRollup {
+  bytes tape_uuid = 1;
+  string voltag = 2;
+  bytes drive_uuid = 3;
+  string drive_serial = 4;
+  uint64 session_count = 5;
+  uint64 snapshot_count = 6;
+  uint64 write_errors_corrected = 7;
+  uint64 write_errors_uncorrected = 8;
+  uint64 read_errors_corrected = 9;
+  uint64 read_errors_uncorrected = 10;
+  google.protobuf.Timestamp first_session_utc = 11;
+  google.protobuf.Timestamp last_session_utc = 12;
 }
 
 message DriveHistoryEvent {
@@ -342,6 +359,10 @@ message RetireDriveRequest {
 message RetireDriveResponse {
   DriveCatalogEntry drive = 1;
   bool newly_retired = 2;
+}
+
+message PollDriveRequest {
+  string drive = 1; // drive UUID text or device-reported serial.
 }
 
 message CleanDriveRequest {
@@ -534,6 +555,7 @@ message Tape {
   google.protobuf.Timestamp updated_at = 10;
   // Current operator/orchestrator pool assignment. Empty means unassigned.
   string pool_id               = 11;
+  repeated DriveCorrelationRollup correlation_rollups = 12;
 }
 
 // A daemon-local tape eligibility group. Sutradhara decides the policy that maps

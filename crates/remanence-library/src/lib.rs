@@ -41,8 +41,8 @@ pub use error::{
     LoadError, MoveError, OpenError, RescanError, RescanWarning, UnloadError,
 };
 pub use handle::tape_io::{
-    BlockSize, SpaceKind, SpaceResult, TapeConfig, TapeIoError, TapePosition, WormMediaState,
-    WriteFilemarksOutcome, WriteOutcome, WriteUnpositionedOutcome,
+    BlockSize, DriveErrorCounters, SpaceKind, SpaceResult, TapeConfig, TapeIoError, TapePosition,
+    WormMediaState, WriteFilemarksOutcome, WriteOutcome, WriteUnpositionedOutcome,
 };
 pub use handle::{ChangerHandle, DirtyCause, DriveHandle, LibraryHandle, RemovalLockGuard};
 pub use model::{
@@ -54,7 +54,10 @@ pub use physical_io::{
     DriveHandlePhysicalSource, PhysicalFilemarkSpace, PhysicalReadOutcome, PhysicalTapePosition,
     PhysicalTapeSource,
 };
+pub use remanence_scsi::decode_sense as decode_scsi_sense;
+pub use remanence_scsi::log_sense as drive_log_sense;
 pub use remanence_scsi::log_sense::{flag_name as tape_alert_flag_name, TapeAlerts};
+pub use remanence_scsi::ScsiError;
 pub use sysfs::DeviceAttachment;
 #[cfg(target_os = "linux")]
 pub use transport::LinuxSgTransport;

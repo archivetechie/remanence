@@ -13,8 +13,8 @@ use std::pin::Pin;
 use ciborium::value::Value as CborValue;
 use remanence_library::{DriveBay, IePort, Library, Slot};
 use remanence_state::{
-    AlarmRecord, CatalogIndex, DriveAnnotationInput, DriveEventRecord, DriveHealthSnapshotRecord,
-    DriveRecord,
+    AlarmRecord, CatalogIndex, DriveAnnotationInput, DriveCorrelationRollupRecord,
+    DriveEventRecord, DriveHealthSnapshotRecord, DriveRecord,
 };
 use time::OffsetDateTime;
 use tokio_stream::Stream;
@@ -193,7 +193,20 @@ fn drive_record_to_proto(record: DriveRecord) -> pb::DriveCatalogEntry {
             .as_deref()
             .and_then(crate::timestamp_from_rfc3339),
         retire_reason: record.retire_reason.unwrap_or_default(),
+        correlation_rollups: Vec::new(),
     }
+}
+
+fn drive_record_to_proto_with_rollups(
+    record: DriveRecord,
+    rollups: Vec<DriveCorrelationRollupRecord>,
+) -> pb::DriveCatalogEntry {
+    let mut drive = drive_record_to_proto(record);
+    drive.correlation_rollups = rollups
+        .into_iter()
+        .map(crate::correlation_rollup_to_proto)
+        .collect();
+    drive
 }
 
 fn drive_event_to_proto(record: DriveEventRecord) -> pb::DriveHistoryEvent {
@@ -502,13 +515,17 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
     ) -> Result<Response<pb::DriveCatalogEntry>, Status> {
         crate::authorize_request(&request, crate::AuthPermission::Read)?;
         let selector = request.into_inner().drive;
-        let drive = self
-            .state
-            .index()?
+        let index = self.state.index()?;
+        let drive = index
             .get_drive_by_selector(selector.as_str())
             .map_err(crate::status_from_state_error)?
             .ok_or_else(|| Status::not_found("drive not found"))?;
-        Ok(Response::new(drive_record_to_proto(drive)))
+        let rollups = index
+            .drive_tape_correlation_rollups(&drive.drive_uuid)
+            .map_err(crate::status_from_state_error)?;
+        Ok(Response::new(drive_record_to_proto_with_rollups(
+            drive, rollups,
+        )))
     }
 
     async fn get_drive_history(
@@ -647,6 +664,38 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
             drive: Some(drive_record_to_proto(outcome.drive)),
             newly_retired: outcome.newly_retired,
         }))
+    }
+
+    async fn poll_drive(
+        &self,
+        request: Request<pb::PollDriveRequest>,
+    ) -> Result<Response<pb::DriveHealthSnapshot>, Status> {
+        crate::authorize_request(&request, crate::AuthPermission::Read)?;
+        let selector = request.into_inner().drive;
+        let drive = self
+            .state
+            .index()?
+            .get_drive_by_selector(selector.as_str())
+            .map_err(crate::status_from_state_error)?
+            .ok_or_else(|| Status::not_found("drive not found"))?;
+        if drive.managed != "rem" {
+            return Err(Status::failed_precondition(
+                "manual drive poll is only available for managed drives",
+            ));
+        }
+        if drive.state != "active" {
+            return Err(Status::failed_precondition("cannot poll a retired drive"));
+        }
+        let bay = drive
+            .last_element_address
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or_else(|| Status::failed_precondition("drive has no current bay"))?;
+        let snapshot = self
+            .state
+            .drive_pool()?
+            .poll_drive_health(bay, drive.drive_uuid)
+            .await?;
+        Ok(Response::new(drive_snapshot_to_proto(snapshot)))
     }
 
     async fn clean_drive(

@@ -1,7 +1,8 @@
-//! LOG SENSE (CDB `0x4D`) helpers for TapeAlert page `0x2E`.
+//! LOG SENSE (CDB `0x4D`) helpers for TapeAlert and error-counter pages.
 //!
 //! Remanence currently uses this module for the current-cumulative TapeAlert
-//! log page. The parser is deliberately length-driven: each log parameter's
+//! log page and cumulative read/write error counters. The parsers are
+//! deliberately length-driven: each log parameter's
 //! length byte controls how far the parser advances, so short or vendor-shaped
 //! pages fail closed instead of assuming the canonical five-byte TapeAlert
 //! parameter stride.
@@ -14,6 +15,10 @@ use crate::error::ScsiError;
 pub const OPCODE: u8 = 0x4D;
 /// LOG SENSE page code for the TapeAlert page.
 pub const PAGE_TAPE_ALERT: u8 = 0x2E;
+/// LOG SENSE page code for write error counters.
+pub const PAGE_WRITE_ERROR_COUNTER: u8 = 0x02;
+/// LOG SENSE page code for read error counters.
+pub const PAGE_READ_ERROR_COUNTER: u8 = 0x03;
 /// LOG SENSE page-control value for current cumulative values.
 pub const PAGE_CONTROL_CURRENT_CUMULATIVE: u8 = 0x01;
 /// Canonical TapeAlert flag count.
@@ -22,6 +27,8 @@ pub const TAPE_ALERT_FLAG_COUNT: u8 = 64;
 pub const TAPE_ALERT_PARAMETER_BYTES: u16 = 320;
 /// Canonical TapeAlert LOG SENSE page response length.
 pub const TAPE_ALERT_RESPONSE_LEN: u16 = 4 + TAPE_ALERT_PARAMETER_BYTES;
+/// Allocation length used for cumulative error-counter pages.
+pub const ERROR_COUNTER_RESPONSE_LEN: u16 = 252;
 
 /// Build a LOG SENSE(10) CDB for `page_code`.
 ///
@@ -48,10 +55,31 @@ pub fn build_tape_alert_cdb(alloc_len: u16) -> [u8; 10] {
     build_cdb(PAGE_TAPE_ALERT, alloc_len)
 }
 
+/// Build a LOG SENSE(10) CDB for the write error-counter page.
+pub fn build_write_error_counter_cdb(alloc_len: u16) -> [u8; 10] {
+    build_cdb(PAGE_WRITE_ERROR_COUNTER, alloc_len)
+}
+
+/// Build a LOG SENSE(10) CDB for the read error-counter page.
+pub fn build_read_error_counter_cdb(alloc_len: u16) -> [u8; 10] {
+    build_cdb(PAGE_READ_ERROR_COUNTER, alloc_len)
+}
+
 /// Decoded active TapeAlert flags.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TapeAlerts {
     active: BTreeSet<u8>,
+}
+
+/// Decoded SCSI error-counter LOG SENSE page.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ErrorCounterPage {
+    /// LOG SENSE page code that was decoded.
+    pub page_code: u8,
+    /// Parameter 0x0003, "total errors corrected".
+    pub errors_corrected: Option<u64>,
+    /// Parameter 0x0006, "total uncorrected errors".
+    pub errors_uncorrected: Option<u64>,
 }
 
 impl TapeAlerts {
@@ -173,6 +201,96 @@ pub fn parse_response(buf: &[u8]) -> Result<TapeAlerts, ScsiError> {
     Ok(TapeAlerts { active })
 }
 
+/// Parse a SCSI error-counter LOG SENSE page.
+pub fn parse_error_counter_response(
+    buf: &[u8],
+    expected_page: u8,
+) -> Result<ErrorCounterPage, ScsiError> {
+    if buf.len() < 4 {
+        return Err(ScsiError::Truncated {
+            got: buf.len(),
+            need: 4,
+        });
+    }
+    let page_code = buf[0] & 0x3f;
+    if page_code != (expected_page & 0x3f) {
+        return Err(ScsiError::InvalidResponse {
+            offset: 0,
+            detail: "LOG SENSE page code did not match expected error counter page",
+        });
+    }
+    let page_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    let total = 4usize
+        .checked_add(page_len)
+        .ok_or(ScsiError::InvalidResponse {
+            offset: 2,
+            detail: "LOG SENSE page length overflow",
+        })?;
+    if buf.len() < total {
+        return Err(ScsiError::Truncated {
+            got: buf.len(),
+            need: total,
+        });
+    }
+
+    let mut page = ErrorCounterPage {
+        page_code,
+        ..ErrorCounterPage::default()
+    };
+    let mut offset = 4usize;
+    while offset < total {
+        let header_end = offset.checked_add(4).ok_or(ScsiError::InvalidResponse {
+            offset,
+            detail: "LOG parameter offset overflow",
+        })?;
+        if header_end > total {
+            return Err(ScsiError::Truncated {
+                got: total.saturating_sub(offset),
+                need: 4,
+            });
+        }
+        let code = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
+        let len = buf[offset + 3] as usize;
+        let value_end = header_end
+            .checked_add(len)
+            .ok_or(ScsiError::InvalidResponse {
+                offset: offset + 3,
+                detail: "LOG parameter length overflow",
+            })?;
+        if value_end > total {
+            return Err(ScsiError::Truncated {
+                got: total.saturating_sub(header_end),
+                need: len,
+            });
+        }
+        match code {
+            0x0003 => {
+                page.errors_corrected = Some(decode_counter_value(&buf[header_end..value_end])?)
+            }
+            0x0006 => {
+                page.errors_uncorrected = Some(decode_counter_value(&buf[header_end..value_end])?)
+            }
+            _ => {}
+        }
+        offset = value_end;
+    }
+    Ok(page)
+}
+
+fn decode_counter_value(bytes: &[u8]) -> Result<u64, ScsiError> {
+    if bytes.is_empty() || bytes.len() > 8 {
+        return Err(ScsiError::InvalidResponse {
+            offset: 0,
+            detail: "LOG counter value length must be 1..=8 bytes",
+        });
+    }
+    let mut value = 0u64;
+    for byte in bytes {
+        value = (value << 8) | u64::from(*byte);
+    }
+    Ok(value)
+}
+
 /// Synthesize the canonical 324-byte TapeAlert page.
 pub fn synthesize_tape_alert_page(flags: &BTreeSet<u8>) -> Vec<u8> {
     let mut page = Vec::with_capacity(TAPE_ALERT_RESPONSE_LEN as usize);
@@ -187,6 +305,26 @@ pub fn synthesize_tape_alert_page(flags: &BTreeSet<u8>) -> Vec<u8> {
         page.push(u8::from(flags.contains(&flag)));
     }
     page
+}
+
+/// Synthesize a small error-counter LOG SENSE page for tests.
+pub fn synthesize_error_counter_page(page_code: u8, corrected: u64, uncorrected: u64) -> Vec<u8> {
+    let mut params = Vec::new();
+    append_counter_param(&mut params, 0x0003, corrected);
+    append_counter_param(&mut params, 0x0006, uncorrected);
+    let mut page = Vec::with_capacity(4 + params.len());
+    page.push(page_code & 0x3f);
+    page.push(0);
+    page.extend_from_slice(&(params.len() as u16).to_be_bytes());
+    page.extend_from_slice(&params);
+    page
+}
+
+fn append_counter_param(out: &mut Vec<u8>, code: u16, value: u64) {
+    out.extend_from_slice(&code.to_be_bytes());
+    out.push(0);
+    out.push(8);
+    out.extend_from_slice(&value.to_be_bytes());
 }
 
 /// Set one flag in a mutable canonical TapeAlert page.
@@ -248,6 +386,22 @@ mod tests {
         assert_eq!(parsed.active(), &flags);
         assert!(parsed.is_set(7));
         assert_eq!(flag_name(20), Some("clean now"));
+    }
+
+    #[test]
+    fn synthetic_error_counter_pages_round_trip() {
+        let write = synthesize_error_counter_page(PAGE_WRITE_ERROR_COUNTER, 17, 2);
+        let read = synthesize_error_counter_page(PAGE_READ_ERROR_COUNTER, 19, 3);
+
+        let write = parse_error_counter_response(&write, PAGE_WRITE_ERROR_COUNTER)
+            .expect("parse write counters");
+        let read = parse_error_counter_response(&read, PAGE_READ_ERROR_COUNTER)
+            .expect("parse read counters");
+
+        assert_eq!(write.errors_corrected, Some(17));
+        assert_eq!(write.errors_uncorrected, Some(2));
+        assert_eq!(read.errors_corrected, Some(19));
+        assert_eq!(read.errors_uncorrected, Some(3));
     }
 
     #[test]

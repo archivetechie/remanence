@@ -20,7 +20,11 @@ pub mod model;
 
 use std::time::{Duration, Instant, SystemTime};
 
-use remanence_scsi::{decode_sense, log_sense::TapeAlerts, ScsiError};
+use remanence_scsi::{
+    decode_sense,
+    log_sense::{ErrorCounterPage, TapeAlerts},
+    ScsiError,
+};
 use thiserror::Error;
 
 use super::{fire_audit, lock_drive_shared, DirtyCause};
@@ -145,6 +149,19 @@ pub enum TapeIoError {
     /// violation, etc.). Caller reads sense for specifics.
     #[error("data protect: {0}")]
     DataProtect(ScsiError),
+}
+
+/// Cumulative drive error counters from LOG SENSE pages 02h and 03h.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DriveErrorCounters {
+    /// Write page parameter 0x0003.
+    pub write_errors_corrected: Option<u64>,
+    /// Write page parameter 0x0006.
+    pub write_errors_uncorrected: Option<u64>,
+    /// Read page parameter 0x0003.
+    pub read_errors_corrected: Option<u64>,
+    /// Read page parameter 0x0006.
+    pub read_errors_uncorrected: Option<u64>,
 }
 
 impl TapeIoError {
@@ -415,6 +432,71 @@ impl super::DriveHandle {
             }
             Err(e) => {
                 let mapped = map_scsi(e);
+                self.finish_tape_error(op, &mapped);
+                Err(mapped)
+            }
+        }
+    }
+
+    /// Query cumulative write/read error counters via LOG SENSE pages 02h/03h.
+    pub fn read_error_counters(&mut self) -> Result<DriveErrorCounters, TapeIoError> {
+        let write = self.read_error_counter_page(
+            remanence_scsi::log_sense::PAGE_WRITE_ERROR_COUNTER,
+            remanence_scsi::log_sense::build_write_error_counter_cdb,
+        )?;
+        let read = self.read_error_counter_page(
+            remanence_scsi::log_sense::PAGE_READ_ERROR_COUNTER,
+            remanence_scsi::log_sense::build_read_error_counter_cdb,
+        )?;
+        Ok(DriveErrorCounters {
+            write_errors_corrected: write.errors_corrected,
+            write_errors_uncorrected: write.errors_uncorrected,
+            read_errors_corrected: read.errors_corrected,
+            read_errors_uncorrected: read.errors_uncorrected,
+        })
+    }
+
+    /// Issue TEST UNIT READY as a read-only liveness probe.
+    pub fn test_unit_ready(&mut self) -> Result<(), TapeIoError> {
+        let cdb = [0u8; 6];
+        self.transport.set_timeout_for(TimeoutClass::TapeStatus);
+        self.transport.execute_none(&cdb).map_err(map_scsi)
+    }
+
+    fn read_error_counter_page(
+        &mut self,
+        page_code: u8,
+        build_cdb: fn(u16) -> [u8; 10],
+    ) -> Result<ErrorCounterPage, TapeIoError> {
+        let op = AuditOp::TapeReadAlerts {
+            bay: self.bay_address,
+        };
+        let cdb = build_cdb(remanence_scsi::log_sense::ERROR_COUNTER_RESPONSE_LEN);
+        self.fire_tape_started(op, &cdb);
+
+        let started = Instant::now();
+        self.transport.set_timeout_for(TimeoutClass::TapeStatus);
+        let mut buf = [0u8; remanence_scsi::log_sense::ERROR_COUNTER_RESPONSE_LEN as usize];
+        match self.transport.execute_in(&cdb, &mut buf) {
+            Ok(outcome) => {
+                let bytes = (outcome.bytes_transferred as usize).min(buf.len());
+                match remanence_scsi::log_sense::parse_error_counter_response(
+                    &buf[..bytes],
+                    page_code,
+                ) {
+                    Ok(page) => {
+                        self.finish_tape_success(op, started.elapsed());
+                        Ok(page)
+                    }
+                    Err(err) => {
+                        let err = TapeIoError::MalformedResponse(err);
+                        self.finish_tape_error(op, &err);
+                        Err(err)
+                    }
+                }
+            }
+            Err(err) => {
+                let mapped = map_scsi(err);
                 self.finish_tape_error(op, &mapped);
                 Err(mapped)
             }
