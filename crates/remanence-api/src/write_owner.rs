@@ -2164,6 +2164,34 @@ fn run_cleaning_sequence(
             "drive has no current library assignment",
         ));
     };
+    let drive_bay = drive
+        .last_element_address
+        .and_then(|value| u16::try_from(value).ok())
+        .ok_or_else(|| Status::failed_precondition("drive has no current bay"))?;
+    if trigger == "periodic" && !cleaning_drive_is_idle(library, drive_bay)? {
+        return Ok(());
+    }
+    let min_interval = parse_duration_or(&clean_cfg.min_interval, Duration::hours(12));
+    let weekly_cap = clean_cfg.weekly_cap as usize;
+    if cleaning_too_soon(index, drive_uuid, min_interval, weekly_cap)? {
+        let detail = format!(
+            "{{\"drive_uuid\":\"{}\",\"recovery_step\":\"frequency-cap\"}}",
+            json_escape_text(&crate::bytes_to_hex(drive_uuid)),
+        );
+        let _ = index.raise_alarm(
+            format!(
+                "drive-cleaning-abnormal-frequency:{}",
+                crate::bytes_to_hex(drive_uuid)
+            )
+            .as_str(),
+            "drive-cleaning-abnormal-frequency",
+            "warning",
+            Some(detail.as_str()),
+        );
+        return Err(Status::failed_precondition(
+            "drive-cleaning-abnormal-frequency",
+        ));
+    }
     if let Some(active_run) = index
         .get_active_clean_run_by_drive(drive_uuid)
         .map_err(status_from_state_error)?
@@ -2181,9 +2209,6 @@ fn run_cleaning_sequence(
     let run = index
         .begin_clean_run(drive_uuid, library_serial.as_str(), trigger, None)
         .map_err(status_from_state_error)?;
-    index
-        .set_drive_fenced(drive_uuid, true)
-        .map_err(status_from_state_error)?;
     let fence_detail = format!(
         "{{\"run_id\":\"{}\",\"drive_uuid\":\"{}\",\"recovery_step\":\"fence\"}}",
         json_escape_text(&run.run_id),
@@ -2195,8 +2220,13 @@ fn run_cleaning_sequence(
         "warning",
         Some(fence_detail.as_str()),
     ) {
+        let _ =
+            index.terminalize_clean_run(run.run_id.as_str(), "failed", Some(fence_detail.as_str()));
         return Err(status_from_state_error(err));
     }
+    index
+        .set_drive_fenced(drive_uuid, true)
+        .map_err(status_from_state_error)?;
     if let Err(err) = record_library_event(
         index,
         cfg,
@@ -2248,6 +2278,25 @@ fn run_cleaning_sequence(
         })
         .collect::<Vec<_>>();
     if eligible_carts.is_empty() {
+        let _ = index.clear_alarm(format!("cleaning-needs-operator:{}", run.run_id).as_str());
+        let _ = index.set_drive_fenced(drive_uuid, false);
+        let _ = record_library_event(
+            index,
+            cfg,
+            handle,
+            library_serial.as_str(),
+            AuditEvent::DriveUnfenced,
+            BTreeMap::from([
+                (
+                    "drive_uuid".to_string(),
+                    CborValue::Bytes(drive_uuid.to_vec()),
+                ),
+                (
+                    "component".to_string(),
+                    CborValue::Text("cleaning".to_string()),
+                ),
+            ]),
+        );
         let _ = index.raise_alarm(
             format!("no-cln-cart:{library_serial}").as_str(),
             "no-cln-cart",
@@ -2275,41 +2324,18 @@ fn run_cleaning_sequence(
         .map_err(status_from_state_error)?;
     let selected = selected.ok_or_else(|| Status::internal("selected clean run disappeared"))?;
     let run_id = selected.run_id.clone();
-    let min_interval = parse_duration_or(&clean_cfg.min_interval, Duration::hours(12));
     let complete_timeout = parse_duration_or(&clean_cfg.complete_timeout, Duration::minutes(10));
-    let weekly_cap = clean_cfg.weekly_cap as usize;
-    if cleaning_too_soon(index, drive_uuid, min_interval, weekly_cap)? {
-        let detail = format!(
-            "{{\"run_id\":\"{}\",\"drive_uuid\":\"{}\",\"recovery_step\":\"frequency-cap\"}}",
-            json_escape_text(&run_id),
-            json_escape_text(&crate::bytes_to_hex(drive_uuid)),
-        );
-        let _ = index.raise_alarm(
-            format!(
-                "drive-cleaning-abnormal-frequency:{}",
-                crate::bytes_to_hex(drive_uuid)
-            )
-            .as_str(),
-            "drive-cleaning-abnormal-frequency",
-            "warning",
-            Some(detail.as_str()),
-        );
-        let _ = index.terminalize_clean_run(run_id.as_str(), "failed", Some(detail.as_str()));
-        return Err(Status::failed_precondition(
-            "drive-cleaning-abnormal-frequency",
-        ));
-    }
     let drive_bay = drive
         .last_element_address
         .and_then(|value| u16::try_from(value).ok())
         .ok_or_else(|| Status::failed_precondition("drive has no current bay"))?;
-    let load_started = std::time::Instant::now();
     retry_cleaning_move(index, run_id.as_str(), drive_uuid, "moving-in", || {
         library
             .load(slot_address, drive_bay, &cfg.policy)
             .map_err(|err| format!("load cleaning cartridge: {err}"))?;
         Ok(())
     })?;
+    let load_completed = std::time::Instant::now();
     let _ = index
         .advance_clean_run(
             run_id.as_str(),
@@ -2324,14 +2350,8 @@ fn run_cleaning_sequence(
             Some("{\"phase\":\"cleaning\"}"),
         )
         .map_err(status_from_state_error)?;
-    let elapsed = load_started.elapsed();
     let min_cycle = parse_duration_or(&clean_cfg.min_cycle_duration, Duration::minutes(1));
-    if elapsed < std::time::Duration::from_millis(min_cycle.whole_milliseconds() as u64) {
-        std::thread::sleep(std::time::Duration::from_millis(
-            (min_cycle.whole_milliseconds() as u64).saturating_sub(elapsed.as_millis() as u64),
-        ));
-    }
-    if load_started.elapsed()
+    if load_completed.elapsed()
         > std::time::Duration::from_millis(complete_timeout.whole_milliseconds().max(0) as u64)
     {
         let detail = format!(
@@ -2348,6 +2368,34 @@ fn run_cleaning_sequence(
             Some(detail.as_str()),
         );
         return Err(Status::deadline_exceeded("cleaning timeout exceeded"));
+    }
+    if cleaning_drive_is_idle(library, drive_bay)? {
+        let _ = index
+            .set_tape_cleaning_state(tape_row.tape_uuid.as_slice(), "expired")
+            .map_err(status_from_state_error)?;
+        let _ = index
+            .advance_clean_run(
+                run_id.as_str(),
+                "failed",
+                Some("{\"reason\":\"fast-eject\"}"),
+            )
+            .map_err(status_from_state_error)?;
+        let _ = index.raise_alarm(
+            format!("cln-cart-expired:{}", voltag).as_str(),
+            "cln-cart-expired",
+            "warning",
+            Some("{\"reason\":\"fast-eject\"}"),
+        );
+        return Err(Status::failed_precondition(
+            "cleaning cartridge fast-ejected during cleaning",
+        ));
+    }
+    let elapsed = load_completed.elapsed();
+    let min_cycle_millis = min_cycle.whole_milliseconds().max(0) as u64;
+    if elapsed < std::time::Duration::from_millis(min_cycle_millis) {
+        std::thread::sleep(std::time::Duration::from_millis(
+            min_cycle_millis.saturating_sub(elapsed.as_millis() as u64),
+        ));
     }
     let mut drive_handle = library
         .open_drive(drive_bay, &cfg.policy)
@@ -2412,6 +2460,30 @@ fn run_cleaning_sequence(
             .map_err(|err| format!("unload cleaning cartridge: {err}"))?;
         Ok(())
     })?;
+    let eject_observed = std::time::Instant::now();
+    if eject_observed.duration_since(load_completed)
+        < std::time::Duration::from_millis(min_cycle_millis)
+    {
+        let _ = index
+            .set_tape_cleaning_state(tape_row.tape_uuid.as_slice(), "expired")
+            .map_err(status_from_state_error)?;
+        let _ = index
+            .advance_clean_run(
+                run_id.as_str(),
+                "failed",
+                Some("{\"reason\":\"fast-eject\"}"),
+            )
+            .map_err(status_from_state_error)?;
+        let _ = index.raise_alarm(
+            format!("cln-cart-expired:{}", voltag).as_str(),
+            "cln-cart-expired",
+            "warning",
+            Some("{\"reason\":\"fast-eject\"}"),
+        );
+        return Err(Status::failed_precondition(
+            "cleaning cartridge fast-ejected during cleaning",
+        ));
+    }
     let detail = format!(
         "{{\"run_id\":\"{}\",\"drive_uuid\":\"{}\",\"cart\":\"{}\",\"recovery_step\":\"verify\"}}",
         json_escape_text(&run_id),
@@ -2556,6 +2628,22 @@ fn json_escape_text(value: &str) -> String {
         }
     }
     out
+}
+
+fn cleaning_drive_is_idle(
+    library: &mut remanence_library::LibraryHandle,
+    drive_bay: u16,
+) -> Result<bool, Status> {
+    library
+        .refresh()
+        .map_err(|err| Status::unavailable(format!("refresh library during cleaning: {err}")))?;
+    Ok(library
+        .library()
+        .drive_bays
+        .iter()
+        .find(|bay| bay.element_address == drive_bay)
+        .map(|bay| !bay.loaded)
+        .unwrap_or(true))
 }
 
 fn retry_cleaning_move(
@@ -3330,6 +3418,7 @@ fn now_rfc3339() -> Result<String, time::error::Format> {
 mod tests {
     use super::*;
     use remanence_aead::RootKey;
+    use remanence_chaos::model::{ModelTransport, VirtualTape, VirtualWorld};
     use remanence_format::{
         read_encrypted_rao_file_range_to_vec, write_encrypted_rao_object, write_rem_tar_object,
         RemTarFile, RemTarObjectLayout, RemTarObjectOptions,
@@ -3422,6 +3511,52 @@ mod tests {
             })
             .expect("open test changer")
             .into_changer()
+    }
+
+    fn open_model_library(
+        world: std::sync::Arc<std::sync::Mutex<VirtualWorld>>,
+    ) -> remanence_library::LibraryHandle {
+        let library = world.lock().expect("world lock").library_snapshot();
+        let policy = remanence_library::StaticAllowlist::new([library.serial.as_str()]);
+        library
+            .open_with(&policy, move |path| {
+                let role = world
+                    .lock()
+                    .expect("world lock")
+                    .role_for_path(path)
+                    .expect("known model path");
+                Ok(Box::new(ModelTransport::new(
+                    std::sync::Arc::clone(&world),
+                    role,
+                )))
+            })
+            .expect("open model library")
+    }
+
+    fn test_write_owner_config(
+        index_path: PathBuf,
+        audit_dir: PathBuf,
+        library: &remanence_library::LibraryHandle,
+        library_snapshot: Arc<RwLock<Arc<crate::LibrarySnapshot>>>,
+    ) -> WriteOwnerConfig {
+        let serial = library.library().serial.clone();
+        WriteOwnerConfig {
+            index_path,
+            report: DiscoveryReport {
+                libraries: vec![library.library().clone()],
+                warnings: Vec::new(),
+            },
+            policy: remanence_library::StaticAllowlist::new([serial.as_str()]),
+            audit_dir,
+            audit_fsync: false,
+            audit_append_lock: Arc::new(std::sync::Mutex::new(())),
+            reservations: Arc::new(HashMap::new()),
+            default_library_serial: Some(serial.clone()),
+            library_snapshot,
+            snapshot_miss_alarm: 1,
+            managed_library_serials: Arc::new(HashSet::from([serial])),
+            cleaning: remanence_state::CleaningConfig::default(),
+        }
     }
 
     fn library_snapshot_cell(library: Library) -> Arc<RwLock<Arc<crate::LibrarySnapshot>>> {
@@ -3902,6 +4037,511 @@ mod tests {
             cleaning_too_soon(&index, &drive_uuid, Duration::seconds(0), 1)
                 .expect("frequency check"),
             "one completed run in the current week must hit the weekly cap"
+        );
+    }
+
+    #[test]
+    fn cleaning_alarm_failure_rolls_back_fence_before_error() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cleaning-alarm-fail")
+            .tempdir()
+            .expect("temp dir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        let mut index = CatalogIndex::open(&index_path).expect("open");
+        let db = rusqlite::Connection::open(&index_path).expect("open sqlite");
+        db.execute_batch(
+            "create trigger fail_alarm_insert
+             before insert on alarms
+             begin
+               select raise(fail, 'injected alarm failure');
+             end;",
+        )
+        .expect("install alarm failure trigger");
+        drop(db);
+
+        let drive_uuid = index
+            .observe_drive(DriveObservationInput {
+                serial: "DRV-ALARM".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("LIB-ALARM".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-04T05:00:00Z".to_string()),
+            })
+            .expect("observe drive")
+            .drive_uuid;
+
+        let world = std::sync::Arc::new(std::sync::Mutex::new(VirtualWorld::single_drive(
+            "LIB-ALARM",
+            0x0100,
+            "DRV-ALARM",
+            0x0400,
+            1,
+        )));
+        let library = open_model_library(std::sync::Arc::clone(&world));
+        let snapshot_cell = library_snapshot_cell(library.library().clone());
+        let audit_dir = temp.path().join("audit");
+        std::fs::create_dir_all(&audit_dir).expect("create audit dir");
+        let cfg = test_write_owner_config(index_path, audit_dir, &library, snapshot_cell);
+        let registry = crate::operations::OperationRegistry::default();
+        let handle = registry.register(Uuid::new_v4(), "cleaning");
+        let mut library = library;
+        let err =
+            run_cleaning_sequence(&mut index, &cfg, &handle, &mut library, &drive_uuid, "now")
+                .expect_err("alarm failure must fail cleaning");
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(
+            !index
+                .get_drive_by_uuid(&drive_uuid)
+                .expect("drive lookup")
+                .expect("drive row")
+                .fenced,
+            "fence must be rolled back when alarm insertion fails"
+        );
+    }
+
+    #[test]
+    fn periodic_cleaning_defers_on_busy_drive_and_now_fences_after_session_end() {
+        let busy_world = std::sync::Arc::new(std::sync::Mutex::new(VirtualWorld::single_drive(
+            "LIB-POLICY",
+            0x0100,
+            "DRV-POLICY",
+            0x0400,
+            1,
+        )));
+        {
+            let mut world = busy_world.lock().expect("world lock");
+            world.put_tape_in_drive(0x0100, "DATA-BUSY", None, VirtualTape::default());
+            world.put_tape_in_slot(
+                0x0400,
+                "CLN-POLICY",
+                VirtualTape {
+                    cleaning_cart: true,
+                    ..VirtualTape::default()
+                },
+            );
+        }
+        let busy_library = open_model_library(std::sync::Arc::clone(&busy_world));
+        let busy_snapshot = library_snapshot_cell(busy_library.library().clone());
+        let busy_temp = tempfile::Builder::new()
+            .prefix("remanence-cleaning-periodic")
+            .tempdir()
+            .expect("temp dir");
+        let busy_index_path = busy_temp.path().join("rem-state.sqlite");
+        let mut busy_index = CatalogIndex::open(&busy_index_path).expect("open");
+        let busy_drive_uuid = busy_index
+            .observe_drive(DriveObservationInput {
+                serial: "DRV-POLICY".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("LIB-POLICY".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-04T05:10:00Z".to_string()),
+            })
+            .expect("observe busy drive")
+            .drive_uuid;
+        let cln_uuid = [0x91; 16];
+        busy_index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: cln_uuid,
+                voltag: "CLN-POLICY".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision cleaning tape");
+        busy_index
+            .set_tape_kind(&cln_uuid, "cleaning")
+            .expect("mark cleaning cart")
+            .expect("cleaning tape row");
+        busy_index
+            .set_tape_cleaning_state(&cln_uuid, "ok")
+            .expect("mark cleaning cart state")
+            .expect("cleaning tape row");
+        let busy_cfg = test_write_owner_config(
+            busy_index_path.clone(),
+            busy_temp.path().join("audit"),
+            &busy_library,
+            busy_snapshot,
+        );
+        std::fs::create_dir_all(&busy_cfg.audit_dir).expect("create audit dir");
+
+        let registry = crate::operations::OperationRegistry::default();
+        let handle = registry.register(Uuid::new_v4(), "cleaning");
+        let mut library = busy_library;
+        assert!(
+            run_cleaning_sequence(
+                &mut busy_index,
+                &busy_cfg,
+                &handle,
+                &mut library,
+                &busy_drive_uuid,
+                "periodic",
+            )
+            .is_ok(),
+            "periodic cleaning must defer while the drive is busy"
+        );
+        assert!(
+            !busy_index
+                .get_drive_by_uuid(&busy_drive_uuid)
+                .expect("drive lookup")
+                .expect("drive row")
+                .fenced,
+            "periodic defer must not fence the drive"
+        );
+        assert!(
+            busy_index
+                .get_active_clean_run_by_drive(&busy_drive_uuid)
+                .expect("active run lookup")
+                .is_none(),
+            "periodic defer must not create a clean run"
+        );
+
+        let now_world = std::sync::Arc::new(std::sync::Mutex::new(VirtualWorld::single_drive(
+            "LIB-NOW", 0x0100, "DRV-NOW", 0x0400, 1,
+        )));
+        {
+            let mut world = now_world.lock().expect("world lock");
+            world.put_tape_in_drive(0x0100, "DATA-NOW", None, VirtualTape::default());
+            world.put_tape_in_slot(
+                0x0400,
+                "CLN-NOW",
+                VirtualTape {
+                    cleaning_cart: true,
+                    ..VirtualTape::default()
+                },
+            );
+        }
+        let now_library = open_model_library(std::sync::Arc::clone(&now_world));
+        let now_snapshot = library_snapshot_cell(now_library.library().clone());
+        let now_temp = tempfile::Builder::new()
+            .prefix("remanence-cleaning-now")
+            .tempdir()
+            .expect("temp dir");
+        let now_index_path = now_temp.path().join("rem-state.sqlite");
+        let mut now_index = CatalogIndex::open(&now_index_path).expect("open");
+        let now_drive_uuid = now_index
+            .observe_drive(DriveObservationInput {
+                serial: "DRV-NOW".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("LIB-NOW".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-04T05:11:00Z".to_string()),
+            })
+            .expect("observe now drive")
+            .drive_uuid;
+        let now_uuid = [0x92; 16];
+        now_index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: now_uuid,
+                voltag: "CLN-NOW".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision cleaning tape");
+        now_index
+            .set_tape_kind(&now_uuid, "cleaning")
+            .expect("mark cleaning cart")
+            .expect("cleaning tape row");
+        now_index
+            .set_tape_cleaning_state(&now_uuid, "ok")
+            .expect("mark cleaning cart state")
+            .expect("cleaning tape row");
+        let now_cfg = test_write_owner_config(
+            now_index_path.clone(),
+            now_temp.path().join("audit"),
+            &now_library,
+            now_snapshot,
+        );
+        std::fs::create_dir_all(&now_cfg.audit_dir).expect("create audit dir");
+
+        let registry = crate::operations::OperationRegistry::default();
+        let handle = registry.register(Uuid::new_v4(), "cleaning");
+        let mut library = now_library;
+        let err = run_cleaning_sequence(
+            &mut now_index,
+            &now_cfg,
+            &handle,
+            &mut library,
+            &now_drive_uuid,
+            "now",
+        )
+        .expect_err("now cleaning should fence and then hit the busy-drive path");
+        assert_ne!(err.code(), tonic::Code::Ok);
+        assert!(
+            now_index
+                .get_drive_by_uuid(&now_drive_uuid)
+                .expect("drive lookup")
+                .expect("drive row")
+                .fenced,
+            "now cleaning must fence the drive"
+        );
+    }
+
+    #[test]
+    fn no_cln_cart_branch_unfences_drive_and_raises_alarm() {
+        let world = std::sync::Arc::new(std::sync::Mutex::new(VirtualWorld::single_drive(
+            "LIB-NOCART",
+            0x0100,
+            "DRV-NOCART",
+            0x0400,
+            1,
+        )));
+        let library = open_model_library(std::sync::Arc::clone(&world));
+        let snapshot = library_snapshot_cell(library.library().clone());
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cleaning-no-cart")
+            .tempdir()
+            .expect("temp dir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        let mut index = CatalogIndex::open(&index_path).expect("open");
+        let drive_uuid = index
+            .observe_drive(DriveObservationInput {
+                serial: "DRV-NOCART".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("LIB-NOCART".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-04T05:20:00Z".to_string()),
+            })
+            .expect("observe drive")
+            .drive_uuid;
+        let cfg = test_write_owner_config(
+            index_path.clone(),
+            temp.path().join("audit"),
+            &library,
+            snapshot,
+        );
+        std::fs::create_dir_all(&cfg.audit_dir).expect("create audit dir");
+        let registry = crate::operations::OperationRegistry::default();
+        let handle = registry.register(Uuid::new_v4(), "cleaning");
+        let mut library = library;
+        let err =
+            run_cleaning_sequence(&mut index, &cfg, &handle, &mut library, &drive_uuid, "now")
+                .expect_err("no-cart branch must stop cleaning");
+        assert_ne!(err.code(), tonic::Code::Ok);
+        assert!(
+            !index
+                .get_drive_by_uuid(&drive_uuid)
+                .expect("drive lookup")
+                .expect("drive row")
+                .fenced,
+            "no-cart branch must leave the drive unfenced"
+        );
+        assert!(
+            index
+                .get_alarm(format!("no-cln-cart:{}", library.library().serial).as_str())
+                .expect("alarm lookup")
+                .is_some_and(|alarm| alarm.state == "open"),
+            "no-cart branch must raise the standing alarm"
+        );
+        assert!(
+            index
+                .get_active_clean_run_by_drive(&drive_uuid)
+                .expect("active run lookup")
+                .is_none(),
+            "no-cart branch must not leave an active clean run"
+        );
+    }
+
+    #[test]
+    fn cleaning_frequency_cap_refuses_before_fence_or_run() {
+        let world = std::sync::Arc::new(std::sync::Mutex::new(VirtualWorld::single_drive(
+            "LIB-CAP", 0x0100, "DRV-CAP", 0x0400, 1,
+        )));
+        {
+            let mut world = world.lock().expect("world lock");
+            world.put_tape_in_slot(
+                0x0400,
+                "CLN-CAP",
+                VirtualTape {
+                    cleaning_cart: true,
+                    ..VirtualTape::default()
+                },
+            );
+        }
+        let library = open_model_library(std::sync::Arc::clone(&world));
+        let snapshot = library_snapshot_cell(library.library().clone());
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cleaning-frequency-cap")
+            .tempdir()
+            .expect("temp dir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        let mut index = CatalogIndex::open(&index_path).expect("open");
+        let drive_uuid = index
+            .observe_drive(DriveObservationInput {
+                serial: "DRV-CAP".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("LIB-CAP".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-04T05:30:00Z".to_string()),
+            })
+            .expect("observe drive")
+            .drive_uuid;
+        let completed = index
+            .begin_clean_run(&drive_uuid, "LIB-CAP", "now", None)
+            .expect("begin prior run");
+        index
+            .terminalize_clean_run(
+                completed.run_id.as_str(),
+                "done",
+                Some("{\"stage\":\"done\"}"),
+            )
+            .expect("finish prior run");
+        let cfg = WriteOwnerConfig {
+            cleaning: remanence_state::CleaningConfig {
+                weekly_cap: 1,
+                min_interval: "0s".to_string(),
+                ..remanence_state::CleaningConfig::default()
+            },
+            ..test_write_owner_config(
+                index_path.clone(),
+                temp.path().join("audit"),
+                &library,
+                snapshot,
+            )
+        };
+        std::fs::create_dir_all(&cfg.audit_dir).expect("create audit dir");
+        let registry = crate::operations::OperationRegistry::default();
+        let handle = registry.register(Uuid::new_v4(), "cleaning");
+        let mut library = library;
+        let err =
+            run_cleaning_sequence(&mut index, &cfg, &handle, &mut library, &drive_uuid, "now")
+                .expect_err("frequency cap must reject");
+        assert_ne!(err.code(), tonic::Code::Ok);
+        assert!(
+            !index
+                .get_drive_by_uuid(&drive_uuid)
+                .expect("drive lookup")
+                .expect("drive row")
+                .fenced,
+            "frequency cap must not fence the drive"
+        );
+        assert!(
+            index
+                .get_active_clean_run_by_drive(&drive_uuid)
+                .expect("active run lookup")
+                .is_none(),
+            "frequency cap must not leave an active clean run"
+        );
+        assert!(
+            index
+                .get_alarm(
+                    format!(
+                        "drive-cleaning-abnormal-frequency:{}",
+                        crate::bytes_to_hex(&drive_uuid)
+                    )
+                    .as_str()
+                )
+                .expect("alarm lookup")
+                .is_some_and(|alarm| alarm.state == "open"),
+            "frequency cap must raise the abnormal-frequency alarm"
+        );
+    }
+
+    #[test]
+    fn fast_eject_cleaning_cart_is_not_credited() {
+        let world = std::sync::Arc::new(std::sync::Mutex::new(VirtualWorld::single_drive(
+            "LIB-FAST", 0x0100, "DRV-FAST", 0x0400, 1,
+        )));
+        {
+            let mut world = world.lock().expect("world lock");
+            world.put_tape_in_slot(
+                0x0400,
+                "CLN-FAST",
+                VirtualTape {
+                    cleaning_cart: true,
+                    cleaning_cart_expired: true,
+                    ..VirtualTape::default()
+                },
+            );
+        }
+        let library = open_model_library(std::sync::Arc::clone(&world));
+        let snapshot = library_snapshot_cell(library.library().clone());
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cleaning-fast-eject")
+            .tempdir()
+            .expect("temp dir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        let mut index = CatalogIndex::open(&index_path).expect("open");
+        let drive_uuid = index
+            .observe_drive(DriveObservationInput {
+                serial: "DRV-FAST".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("LIB-FAST".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-04T05:40:00Z".to_string()),
+            })
+            .expect("observe drive")
+            .drive_uuid;
+        let cln_uuid = [0x93; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: cln_uuid,
+                voltag: "CLN-FAST".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision cleaning tape");
+        index
+            .set_tape_kind(&cln_uuid, "cleaning")
+            .expect("mark cleaning cart")
+            .expect("cleaning tape row");
+        index
+            .set_tape_cleaning_state(&cln_uuid, "ok")
+            .expect("mark cleaning cart state")
+            .expect("cleaning tape row");
+        let cfg = test_write_owner_config(
+            index_path.clone(),
+            temp.path().join("audit"),
+            &library,
+            snapshot,
+        );
+        std::fs::create_dir_all(&cfg.audit_dir).expect("create audit dir");
+        let registry = crate::operations::OperationRegistry::default();
+        let handle = registry.register(Uuid::new_v4(), "cleaning");
+        let mut library = library;
+        let err =
+            run_cleaning_sequence(&mut index, &cfg, &handle, &mut library, &drive_uuid, "now")
+                .expect_err("fast-eject cart must be rejected");
+        assert_ne!(err.code(), tonic::Code::Ok);
+        assert_eq!(
+            index
+                .get_tape_cleaning_state(cln_uuid.as_slice())
+                .expect("cleaning state lookup")
+                .flatten()
+                .as_deref(),
+            Some("expired")
+        );
+        assert!(
+            index
+                .get_active_clean_run_by_drive(&drive_uuid)
+                .expect("active run lookup")
+                .is_none(),
+            "fast-eject path should not leave the selected clean run active"
         );
     }
 

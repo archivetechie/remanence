@@ -1379,6 +1379,19 @@ impl CatalogIndex {
                 continue;
             }
             let Some(drive_row) = self.get_drive_by_uuid(&run.drive_uuid)? else {
+                let detail = format!(
+                    "{{\"run_id\":\"{}\",\"drive_uuid\":\"{}\",\"recovery_step\":\"drive-missing\"}}",
+                    json_escape_text(&run.run_id),
+                    json_escape_text(&hex_uuid_from_slice(&run.drive_uuid)),
+                );
+                self.mark_clean_run_needs_operator(run.run_id.as_str(), Some(detail.as_str()))?;
+                let _ = self.raise_alarm(
+                    format!("cleaning-needs-operator:{}", run.run_id).as_str(),
+                    "cleaning-needs-operator",
+                    "warning",
+                    Some(detail.as_str()),
+                )?;
+                reconciled = reconciled.saturating_add(1);
                 continue;
             };
             let cart_voltag = run
@@ -8606,6 +8619,54 @@ mod tests {
             .get_alarm(format!("cleaning-needs-operator:{}", run.run_id).as_str())
             .expect("alarm lookup")
             .is_some_and(|alarm| alarm.state == "cleared"));
+    }
+
+    #[test]
+    fn reconcile_terminalizes_missing_drive_clean_run_and_raises_alarm() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let run_id = Uuid::new_v4().to_string();
+        let drive_uuid = [0x5Au8; 16];
+        index
+            .conn
+            .execute(
+                "insert into clean_runs(
+                   run_id, drive_uuid, library_serial, cart_tape_uuid,
+                   cart_home_slot, phase, trigger, started_at_utc,
+                   updated_at_utc, detail
+                 )
+                 values(?1, ?2, 'mainlib', null, null, 'fencing', 'manual', ?3, ?3, null)",
+                params![run_id, drive_uuid.to_vec(), "2026-07-04T03:40:00Z"],
+            )
+            .expect("insert orphan clean run");
+
+        let library = test_library_with_drive_and_slot("mainlib", None, None);
+        let reconciled = index
+            .reconcile_clean_runs_against_library(&library)
+            .expect("reconcile orphan run");
+        assert_eq!(reconciled, 1);
+        let run = index
+            .get_clean_run(run_id.as_str())
+            .expect("run lookup")
+            .expect("orphan run");
+        assert_eq!(run.phase, "needs-operator");
+        assert!(
+            index
+                .get_alarm(format!("cleaning-needs-operator:{}", run_id).as_str())
+                .expect("alarm lookup")
+                .is_some_and(|alarm| alarm.state == "open"),
+            "missing-drive reconcile must open a run-scoped alarm"
+        );
+        assert!(
+            index
+                .get_active_clean_run_by_drive(&drive_uuid)
+                .expect("active run lookup")
+                .is_none(),
+            "missing-drive reconcile must clear the active-run uniqueness slot"
+        );
     }
 
     #[test]
