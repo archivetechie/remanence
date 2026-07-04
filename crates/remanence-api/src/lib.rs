@@ -127,19 +127,32 @@ pub(crate) struct LibrarySnapshot {
 }
 
 #[derive(Debug)]
-struct DriveByteCounters {
+pub(crate) struct DriveByteCounters {
     read_bytes: AtomicU64,
     write_bytes: AtomicU64,
     counter_epoch: u64,
 }
 
 impl DriveByteCounters {
-    fn new(counter_epoch: u64) -> Self {
+    pub(crate) fn new(counter_epoch: u64) -> Self {
         Self {
             read_bytes: AtomicU64::new(0),
             write_bytes: AtomicU64::new(0),
             counter_epoch,
         }
+    }
+
+    pub(crate) fn record_read_bytes(&self, bytes: u64) {
+        self.read_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_write_bytes(&self, bytes: u64) {
+        self.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_bytes(&self) -> u64 {
+        self.write_bytes.load(Ordering::Relaxed)
     }
 }
 
@@ -532,7 +545,7 @@ impl ApiState {
             || self.managed_library_serials.contains(library_serial.trim())
     }
 
-    fn drive_counters(&self, drive_uuid: &[u8]) -> Arc<DriveByteCounters> {
+    pub(crate) fn drive_counters(&self, drive_uuid: &[u8]) -> Arc<DriveByteCounters> {
         self.live_status
             .get_or_create_counters(self.daemon_epoch, drive_uuid)
     }
@@ -545,10 +558,10 @@ impl ApiState {
         let counters = self.drive_counters(drive_uuid);
         match kind {
             "read" => {
-                counters.read_bytes.fetch_add(bytes, Ordering::Relaxed);
+                counters.record_read_bytes(bytes);
             }
             "write" => {
-                counters.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+                counters.record_write_bytes(bytes);
             }
             _ => unreachable!("byte-accounting kind must be read or write"),
         }
@@ -558,6 +571,7 @@ impl ApiState {
         self.record_drive_bytes(drive_uuid, bytes, "read");
     }
 
+    #[cfg(test)]
     pub(crate) fn record_drive_write_bytes(&self, drive_uuid: Option<&[u8]>, bytes: u64) {
         self.record_drive_bytes(drive_uuid, bytes, "write");
     }
@@ -6659,6 +6673,91 @@ BCw3Wyv2UWY=
         assert_eq!(a.write_bytes.load(AtomicOrdering::Relaxed), 0);
         assert_eq!(b.read_bytes.load(AtomicOrdering::Relaxed), 5);
         assert_eq!(b.write_bytes.load(AtomicOrdering::Relaxed), 7);
+    }
+
+    #[tokio::test]
+    async fn append_finish_does_not_double_count() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-append-finish-live-counter")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        let index = CatalogIndex::open(&index_path).expect("open catalog");
+        let mut state = ApiState::new(index);
+        let session_id = Uuid::new_v4();
+        let bay = 0x0101;
+        let drive_uuid = Uuid::new_v4().as_bytes().to_vec();
+        let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
+        let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
+        let reservations = Arc::new(std::collections::HashMap::from([(
+            bay,
+            std::sync::atomic::AtomicBool::new(false),
+        )]));
+        let pool = crate::write_owner::DrivePool::new(
+            changer_tx,
+            std::collections::HashMap::from([(bay, drive_tx)]),
+            reservations,
+        );
+        pool.record_session(
+            session_id,
+            crate::write_owner::MountedSession {
+                bay,
+                home_slot: Some(0x0400),
+                tape_uuid: [0xAB; 16],
+                drive_uuid: Some(drive_uuid.clone()),
+            },
+        );
+        state.drive_pool = Some(pool);
+
+        let actor = tokio::spawn(async move {
+            while let Some(cmd) = drive_rx.recv().await {
+                match cmd {
+                    crate::write_owner::DriveCommand::AppendFinish {
+                        spool_path,
+                        live_write_counter,
+                        reply,
+                        ..
+                    } => {
+                        let counter = live_write_counter.expect("live write counter");
+                        counter.record_write_bytes(3);
+                        counter.record_write_bytes(5);
+                        let _ = std::fs::remove_file(spool_path);
+                        let _ = reply.send(Ok(pb::ObjectRecord {
+                            object_id: Uuid::nil().to_string().into_bytes(),
+                            caller_object_id: "caller-object".to_string(),
+                            content_sha256: vec![0x11; 32],
+                            logical_size_bytes: 8,
+                            body_format: "rao-v1".to_string(),
+                            caller_metadata: Default::default(),
+                            created_at: None,
+                            copies: Vec::new(),
+                        }));
+                    }
+                    _ => panic!("unexpected drive command"),
+                }
+            }
+        });
+
+        let spool_path = temp.path().join("spool.bin");
+        std::fs::write(&spool_path, b"spool").expect("write spool");
+        let archive_path = temp.path().join("archive.rao");
+
+        let record = crate::mount::append_finish(
+            &state,
+            session_id,
+            spool_path,
+            archive_path,
+            "caller-object".to_string(),
+            None,
+        )
+        .await
+        .expect("append finish");
+
+        assert_eq!(record.logical_size_bytes, 8);
+        let counter = state.drive_counters(&drive_uuid);
+        assert_eq!(counter.write_bytes(), 8);
+
+        actor.abort();
     }
 
     #[test]

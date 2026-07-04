@@ -33,7 +33,7 @@ use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
 use uuid::Uuid;
 
-use crate::pool_write::{write_to_selected_tape, SelectedTape, WriteObjectToPoolRequest};
+use crate::pool_write::{SelectedTape, WriteObjectToPoolRequest};
 use crate::{
     load_tape_by_uuid, pb, status_from_state_error, timestamp_from_rfc3339, verify_tape_identity,
     PoolWriteError, SelectTapeError, TapeUuid,
@@ -121,6 +121,7 @@ pub(crate) enum DriveCommand {
         archive_path: PathBuf,
         caller_object_id: String,
         expected_content_sha256: Option<[u8; 32]>,
+        live_write_counter: Option<Arc<crate::DriveByteCounters>>,
         reply: oneshot::Sender<Result<pb::ObjectRecord, Status>>,
     },
     Close {
@@ -1190,6 +1191,7 @@ fn handle_drive_open_write(
                 archive_path,
                 caller_object_id,
                 expected_content_sha256,
+                live_write_counter,
                 reply,
             } => {
                 if requested != session_id {
@@ -1215,8 +1217,14 @@ fn handle_drive_open_write(
                 };
                 let mut sink = DriveHandleSink(drive);
                 let append_started = Instant::now();
-                let result =
-                    write_to_selected_tape(index, &mut sink, &pool_cfg, request, selected.clone());
+                let result = crate::pool_write::write_to_selected_tape_with_live_counter(
+                    index,
+                    &mut sink,
+                    &pool_cfg,
+                    request,
+                    selected.clone(),
+                    live_write_counter,
+                );
                 let append_elapsed = append_started.elapsed();
                 let _ = std::fs::remove_file(&spool_path);
                 match result {
