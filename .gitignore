@@ -36,3 +36,6 @@ fixtures/**/*.log
 # the tarball is redundant and large.
 fixtures/real-hardware/*.tar.gz
 verif/**/target/
+verif/**/*.llbc
+verif/**/lean/.lake/
+verif/**/.leanstral/
