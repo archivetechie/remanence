@@ -419,4 +419,184 @@ theorem compute_tape_reserve_success (input : CapacityReserveInput)
         simp [finalPartialSidecarNeededSpec, hNatRemNotZero]
       rw [hLeft, hRight]
 
+/-- Invariant guard: zero block size is rejected before any reserve arithmetic. -/
+theorem compute_tape_reserve_rejects_zero_block_size
+    (input : CapacityReserveInput) (h : input.block_size_bytes = 0#u64) :
+    compute_tape_reserve input = ok (.Err CapacityError.BlockSizeZero) := by
+  unfold compute_tape_reserve
+  simp [h]
+
+/-- Invariant guard: zero epoch size is rejected after the block-size check. -/
+theorem compute_tape_reserve_rejects_zero_data_shards
+    (input : CapacityReserveInput)
+    (hBlock : input.block_size_bytes ≠ 0#u64)
+    (hData : input.data_shards_per_epoch = 0#u64) :
+    compute_tape_reserve input = ok (.Err CapacityError.DataShardsPerEpochZero) := by
+  unfold compute_tape_reserve
+  simp [hBlock, hData]
+
+/-- Invariant guard: an already-full open epoch is rejected before arithmetic. -/
+theorem compute_tape_reserve_rejects_epoch_fill_outside_open_epoch
+    (input : CapacityReserveInput)
+    (hBlock : input.block_size_bytes ≠ 0#u64)
+    (hData : input.data_shards_per_epoch ≠ 0#u64)
+    (hFill : input.current_epoch_fill_blocks.val ≥ input.data_shards_per_epoch.val) :
+    compute_tape_reserve input =
+      ok (.Err CapacityError.CurrentEpochFillOutsideOpenEpoch) := by
+  have hGe : input.current_epoch_fill_blocks >= input.data_shards_per_epoch := by
+    scalar_tac
+  unfold compute_tape_reserve
+  simp [hBlock, hData, hGe]
+
+/-- C1-C5 success path: when all reserve arithmetic fits and all capacity gates
+    have enough space, `evaluate` returns a report matching the spec formulas. -/
+theorem evaluate_success_spec (input : CapacityReserveInput)
+    (hBlock : 0 < input.block_size_bytes.val)
+    (hData : 0 < input.data_shards_per_epoch.val)
+    (hFill : input.current_epoch_fill_blocks.val < input.data_shards_per_epoch.val)
+    (hTapeNo : TapeReserveNoOverflow input)
+    (hSpoolNo : SpoolReserveNoOverflow input)
+    (hEmptyFits : requiredTapeBlocksSpec input ≤ input.empty_tape_usable_blocks.val)
+    (hCurrentFits : requiredTapeBlocksSpec input ≤ input.remaining_tape_blocks.val)
+    (hSpoolFits : requiredSpoolBytesSpec input ≤ input.remaining_spool_bytes.val) :
+    ∃ report,
+      evaluate input = ok (.Ok report) ∧
+      report.epochs_completed_by_object.val = epochsCompletedByObjectSpec input ∧
+      report.final_partial_sidecar_needed = finalPartialSidecarNeededSpec input ∧
+      report.sidecar_tape_file_blocks.val = sidecarTapeFileBlocksSpec input ∧
+      report.bootstrap_tape_file_blocks.val = bootstrapTapeFileBlocksSpec input ∧
+      report.reserve_after_object_blocks.val = reserveAfterObjectBlocksSpec input ∧
+      report.required_tape_blocks.val = requiredTapeBlocksSpec input ∧
+      report.required_spool_bytes.val = requiredSpoolBytesSpec input := by
+  rcases compute_tape_reserve_success input hBlock hData hFill hTapeNo with
+    ⟨tape, hTapeEval, hEpochs, hFinal, hSidecar, hBootstrap, hReserve,
+      hRequiredTape⟩
+  have hEmptyNotLtNat :
+      ¬ input.empty_tape_usable_blocks.val < tape.required_tape_blocks.val := by
+    omega
+  have hCurrentNotLtNat :
+      ¬ input.remaining_tape_blocks.val < tape.required_tape_blocks.val := by
+    omega
+  have hSpoolFrom : SpoolReserveNoOverflowFrom input
+      tape.epochs_completed_by_object tape.sidecar_tape_file_blocks := by
+    rcases hSpoolNo with ⟨hBytes, hCompleted, hRequired⟩
+    refine ⟨?_, ?_, ?_⟩
+    · rw [sidecarTapeFileBytesFrom, hSidecar]
+      exact hBytes
+    · rw [completedByObjectSpoolBytesFrom, sidecarTapeFileBytesFrom,
+        hEpochs, hSidecar]
+      exact hCompleted
+    · rw [requiredSpoolBytesFrom, completedByObjectSpoolBytesFrom,
+        sidecarTapeFileBytesFrom, hEpochs, hSidecar]
+      exact hRequired
+  rcases compute_spool_reserve_success input tape.epochs_completed_by_object
+      tape.sidecar_tape_file_blocks hSpoolFrom with
+    ⟨requiredSpool, hSpoolEval, hRequiredSpool⟩
+  have hRequiredSpoolSpec : requiredSpool.val = requiredSpoolBytesSpec input := by
+    rw [hRequiredSpool, requiredSpoolBytesFrom, completedByObjectSpoolBytesFrom,
+      sidecarTapeFileBytesFrom, hEpochs, hSidecar]
+    rfl
+  have hSpoolNotLtNat :
+      ¬ input.remaining_spool_bytes.val < requiredSpool.val := by
+    omega
+  refine ⟨{
+    epochs_completed_by_object := tape.epochs_completed_by_object,
+    final_partial_sidecar_needed := tape.final_partial_sidecar_needed,
+    sidecar_tape_file_blocks := tape.sidecar_tape_file_blocks,
+    bootstrap_tape_file_blocks := tape.bootstrap_tape_file_blocks,
+    reserve_after_object_blocks := tape.reserve_after_object_blocks,
+    required_tape_blocks := tape.required_tape_blocks,
+    required_spool_bytes := requiredSpool
+  }, ?_, hEpochs, hFinal, hSidecar, hBootstrap, hReserve, hRequiredTape,
+     hRequiredSpoolSpec⟩
+  unfold evaluate
+  simp [hTapeEval, core.result.Result.Insts.CoreOpsTry.branch, hEmptyNotLtNat,
+    hCurrentNotLtNat, hSpoolEval, hSpoolNotLtNat]
+
+/-- C5a -- the empty-tape object-size gate fires before the current-tape gate. -/
+theorem evaluate_object_too_large_gate (input : CapacityReserveInput)
+    (hBlock : 0 < input.block_size_bytes.val)
+    (hData : 0 < input.data_shards_per_epoch.val)
+    (hFill : input.current_epoch_fill_blocks.val < input.data_shards_per_epoch.val)
+    (hTapeNo : TapeReserveNoOverflow input)
+    (hEmptyShort : input.empty_tape_usable_blocks.val < requiredTapeBlocksSpec input) :
+    evaluate input = ok (.Err CapacityError.ObjectTooLargeForEmptyTape) := by
+  rcases compute_tape_reserve_success input hBlock hData hFill hTapeNo with
+    ⟨tape, hTapeEval, _hEpochs, _hFinal, _hSidecar, _hBootstrap, _hReserve,
+      hRequiredTape⟩
+  have hEmptyLtNat :
+      input.empty_tape_usable_blocks.val < tape.required_tape_blocks.val := by
+    omega
+  unfold evaluate
+  simp [hTapeEval, core.result.Result.Insts.CoreOpsTry.branch, hEmptyLtNat]
+
+/-- C5b -- current-tape capacity is checked after the empty-tape feasibility
+    gate and before any local spool check. -/
+theorem evaluate_tape_capacity_gate (input : CapacityReserveInput)
+    (hBlock : 0 < input.block_size_bytes.val)
+    (hData : 0 < input.data_shards_per_epoch.val)
+    (hFill : input.current_epoch_fill_blocks.val < input.data_shards_per_epoch.val)
+    (hTapeNo : TapeReserveNoOverflow input)
+    (hEmptyFits : requiredTapeBlocksSpec input ≤ input.empty_tape_usable_blocks.val)
+    (hCurrentShort : input.remaining_tape_blocks.val < requiredTapeBlocksSpec input) :
+    evaluate input = ok (.Err CapacityError.CapacityReserveExceededTape) := by
+  rcases compute_tape_reserve_success input hBlock hData hFill hTapeNo with
+    ⟨tape, hTapeEval, _hEpochs, _hFinal, _hSidecar, _hBootstrap, _hReserve,
+      hRequiredTape⟩
+  have hEmptyNotLtNat :
+      ¬ input.empty_tape_usable_blocks.val < tape.required_tape_blocks.val := by
+    omega
+  have hCurrentLtNat :
+      input.remaining_tape_blocks.val < tape.required_tape_blocks.val := by
+    omega
+  unfold evaluate
+  simp [hTapeEval, core.result.Result.Insts.CoreOpsTry.branch, hEmptyNotLtNat,
+    hCurrentLtNat]
+
+/-- C5c -- after both tape gates pass, local spool capacity is the binding gate
+    exactly when the remaining spool is below the required spool formula. -/
+theorem evaluate_spool_capacity_gate (input : CapacityReserveInput)
+    (hBlock : 0 < input.block_size_bytes.val)
+    (hData : 0 < input.data_shards_per_epoch.val)
+    (hFill : input.current_epoch_fill_blocks.val < input.data_shards_per_epoch.val)
+    (hTapeNo : TapeReserveNoOverflow input)
+    (hSpoolNo : SpoolReserveNoOverflow input)
+    (hEmptyFits : requiredTapeBlocksSpec input ≤ input.empty_tape_usable_blocks.val)
+    (hCurrentFits : requiredTapeBlocksSpec input ≤ input.remaining_tape_blocks.val)
+    (hSpoolShort : input.remaining_spool_bytes.val < requiredSpoolBytesSpec input) :
+    evaluate input = ok (.Err CapacityError.CapacityReserveExceededSpool) := by
+  rcases compute_tape_reserve_success input hBlock hData hFill hTapeNo with
+    ⟨tape, hTapeEval, hEpochs, _hFinal, hSidecar, _hBootstrap, _hReserve,
+      hRequiredTape⟩
+  have hEmptyNotLtNat :
+      ¬ input.empty_tape_usable_blocks.val < tape.required_tape_blocks.val := by
+    omega
+  have hCurrentNotLtNat :
+      ¬ input.remaining_tape_blocks.val < tape.required_tape_blocks.val := by
+    omega
+  have hSpoolFrom : SpoolReserveNoOverflowFrom input
+      tape.epochs_completed_by_object tape.sidecar_tape_file_blocks := by
+    rcases hSpoolNo with ⟨hBytes, hCompleted, hRequired⟩
+    refine ⟨?_, ?_, ?_⟩
+    · rw [sidecarTapeFileBytesFrom, hSidecar]
+      exact hBytes
+    · rw [completedByObjectSpoolBytesFrom, sidecarTapeFileBytesFrom,
+        hEpochs, hSidecar]
+      exact hCompleted
+    · rw [requiredSpoolBytesFrom, completedByObjectSpoolBytesFrom,
+        sidecarTapeFileBytesFrom, hEpochs, hSidecar]
+      exact hRequired
+  rcases compute_spool_reserve_success input tape.epochs_completed_by_object
+      tape.sidecar_tape_file_blocks hSpoolFrom with
+    ⟨requiredSpool, hSpoolEval, hRequiredSpool⟩
+  have hRequiredSpoolSpec : requiredSpool.val = requiredSpoolBytesSpec input := by
+    rw [hRequiredSpool, requiredSpoolBytesFrom, completedByObjectSpoolBytesFrom,
+      sidecarTapeFileBytesFrom, hEpochs, hSidecar]
+    rfl
+  have hSpoolLtNat : input.remaining_spool_bytes.val < requiredSpool.val := by
+    omega
+  unfold evaluate
+  simp [hTapeEval, core.result.Result.Insts.CoreOpsTry.branch, hEmptyNotLtNat,
+    hCurrentNotLtNat, hSpoolEval, hSpoolLtNat]
+
 end parity_capacity_verif
