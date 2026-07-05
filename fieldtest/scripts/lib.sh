@@ -598,6 +598,40 @@ PY
   fi
 }
 
+fieldtest_require_pool_appendable_tapes() {
+  local pool="$1" required="$2" context="${3:-field test step}"
+  local script="${SCRIPT_NAME:-fieldtest}"
+  local inventory have
+  inventory="$(fieldtest_artifact_path "$script" "appendable-media-${pool}" "$(fieldtest_timestamp_id)")"
+  if ! fieldtest_capture_json "$inventory" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" list --pool "$pool"; then
+    fieldtest_evidence_record "$script" media-budget FAIL "could not inspect pool $pool before $context; is the field daemon running?" "$inventory"
+    return 1
+  fi
+  if ! have="$(
+    python3 - "$inventory" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text())
+ready = 0
+for tape in payload.get("tapes", []):
+    state = "".join(ch for ch in str(tape.get("state") or "").lower() if ch.isalnum())
+    if state in {"ready", "tapestateready"}:
+        ready += 1
+print(ready)
+PY
+  )"; then
+    fieldtest_evidence_record "$script" media-budget FAIL "could not parse pool inventory for $pool before $context" "$inventory"
+    return 1
+  fi
+  if (( have < required )); then
+    fieldtest_evidence_record "$script" media-budget FAIL "need ${required} ready tape(s) in $pool for $context; found $have. Run 10-init-pools with allowlisted scratch media, bring the daemon back up, or skip this phase." "$inventory"
+    return 1
+  fi
+  fieldtest_evidence_record "$script" media-budget PASS "found $have ready tape(s) in $pool for $context" "$inventory"
+}
+
 fieldtest_run_with_lock() {
   local lockfile
   lockfile="$(fieldtest_work_lock)"

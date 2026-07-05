@@ -1,9 +1,9 @@
 # Remanence field test — HPE MSL3040 + 2× LTO-9 — one-day runbook
 
 **Target:** RHEL 9 HPE server, SAS-attached MSL3040, 2× LTO-9 drives,
-6+ scratch LTO-9 cartridges for the core benchmark pitch, 10+ for the full
-default Phase 1/2 flow, plus 1 CLN cleaning cartridge. Four scratch cartridges
-are enough for smoke/correctness and stewardship only.
+2+ scratch LTO-9 cartridges for append/correctness smoke, 6+ for the core
+benchmark pitch, 10+ for the full default Phase 1/2 flow, plus 1 CLN cleaning
+cartridge.
 **Duration:** 12 hours, phased, with GO/NO-GO gates and skip pointers.
 **Prime directive:** every result lands in `evidence/` automatically —
 the day produces a management-ready test record, not just a feeling.
@@ -60,15 +60,18 @@ source anywhere else.
 
 ### Scratch media budget
 
-Each write-oriented script needs at least one unused ready cartridge in its
-target pool. `10-init-pools.sh` splits allowlisted data barcodes between
-`fieldtest-a` and `fieldtest-b`; the scripts now fail early with a
-`media-budget` record if the target pool has no unused ready tape.
+Most write-oriented scripts need at least one unused ready cartridge in their
+target pool. `13-append-loop.sh` deliberately reuses one ready appendable tape
+after committed objects exist, and fails only if the pool has no ready
+appendable tape. `10-init-pools.sh` splits allowlisted data barcodes between
+`fieldtest-a` and `fieldtest-b`; scripts fail early with a `media-budget`
+record if their target pool cannot satisfy the relevant media condition.
 
 | Scratch data tapes | Practical plan |
 |---:|---|
-| 4 | Phase 0, `11-happy-path`, stewardship, cleaning, robotics. Run only one extra write-heavy step if a pool still has unused media. |
-| 6 | Phase 0, `11-happy-path`, `20-bench-write`, `22-bench-dual`, then collect evidence. |
+| 2 | Phase 0 with `10-init-pools.sh --count 2`, `11-happy-path`, `13-append-loop`, stewardship, cleaning, robotics. |
+| 4 | Phase 0, `11-happy-path`, `13-append-loop`, `20-bench-write`, stewardship, cleaning, collect evidence. |
+| 6 | Phase 0, `11-happy-path`, `13-append-loop`, `20-bench-write`, `22-bench-dual`, then collect evidence. |
 | 8 | Core pitch plus exactly one of `12-multiobject`, `21-bench-read`, or one write-heavy fault test. |
 | 10+ | Full default Phase 1 and Phase 2 with the default pool split. Bring more for all fault tests and soak writes. |
 
@@ -112,6 +115,7 @@ past a red gate.
 |---|---|---|
 | 1.1 | `11-happy-path.sh` | archive build → write → catalog → read → **SHA-256 fidelity** → restore, plaintext AND encrypted object |
 | 1.2 | `12-multiobject.sh` | many-object archive, manifests, ranged reads (partial restore without reading the whole object) |
+| 1.3 | `13-append-loop.sh` | repeated independent object writes to one pool; same tape UUID, dense tape-file numbers, read-back SHA-256 for every object |
 
 **GO gate:** happy-path reports `fidelity: PASS` for both objects.
 **If blocked:** a single drive failing → continue on the other, note in
@@ -205,8 +209,9 @@ on. A refused unsafe operation is a PASS.
 
 ## Priorities if the day compresses
 
-**Must (the pitch survives with 6+ scratch tapes):** Phase 0, 1.1, 2.1+2.3.
-With only 4 scratch tapes, do Phase 0, 1.1, 3.1, 3.3, 3.4, then collect.
+**Must (the pitch survives with 6+ scratch tapes):** Phase 0, 1.1, 1.3,
+2.1+2.3. With only 2 scratch tapes, do Phase 0, 1.1, 1.3, 3.1, 3.3,
+3.4, then collect.
 **Should:** 4.1, 4.2 (the two recovery stories), 3.3 (real cleaning).
 **Nice:** everything else. The soak runs itself regardless.
 
