@@ -1,7 +1,11 @@
 # Layer 5 multi-object tape append -- Design v0.2
 
 **Status:** panel folded + verify-r1 fixes applied (2026-07-05);
-implementation prompts not cut.
+MTA-1 implementation started. The first code slice enables core no-parity
+pool-write/catalog append for sequential objects on the same tape session.
+Durable append records, explicit device reposition/position proof, API append
+evidence, idempotency, system scenario coverage, fieldtest append loops, and
+MTA-2 parity append remain pending gates.
 **Problem source:** physical MSL3040 field-test preparation exposed that the
 current pool writer treats a committed cartridge as unavailable for further
 pool writes. That was acceptable for S4a "write one object", but it is not
@@ -68,7 +72,7 @@ later slice. The current code follows that narrower contract.
 
 ### 2.2 Pool selection rejects used tapes
 
-`crates/remanence-api/src/pool_write.rs` filters every candidate through
+The S4a baseline in `crates/remanence-api/src/pool_write.rs` filtered every candidate through
 `check_writability_preconditions`. That function returns
 `NoParityAppendUnsupported` or `ParityAppendUnsupported` when
 `tape.total_committed_ordinals > 0`. The selector therefore treats a tape with
@@ -79,7 +83,7 @@ manual selection cannot bypass the one-object policy.
 
 ### 2.3 No-parity writer always starts a fresh tape layout
 
-`write_no_parity_object_to_selected_tape` always calls
+The S4a baseline `write_no_parity_object_to_selected_tape` always called
 `write_no_parity_bootstrap` before writing the object. The resulting report
 hard-codes:
 

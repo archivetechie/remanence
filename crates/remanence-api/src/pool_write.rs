@@ -284,14 +284,6 @@ pub enum WritabilityError {
         /// Fixed block size configured for the pool.
         pool_block_size: u64,
     },
-    /// The current no-parity writer is single-object only until true append is implemented.
-    #[error(
-        "no-parity tape already has committed contents; true append is not implemented: total_committed_ordinals={total_committed_ordinals}"
-    )]
-    NoParityAppendUnsupported {
-        /// Catalog-accounted committed ordinals already present on the tape.
-        total_committed_ordinals: u64,
-    },
     /// The current parity writer opens at BOT; true append is not implemented yet.
     #[error(
         "parity tape already has committed contents; true append is not implemented: total_committed_ordinals={total_committed_ordinals}"
@@ -423,16 +415,6 @@ pub enum PoolWriteError {
     /// The selected tape is missing required write geometry.
     #[error("selected tape is missing write geometry: {0}")]
     MissingTapeGeometry(String),
-    /// The selected no-parity tape already contains a committed object.
-    #[error(
-        "selected no-parity tape {tape_uuid} already has committed contents; true append is not implemented: total_committed_ordinals={total_committed_ordinals}"
-    )]
-    NoParityAppendUnsupported {
-        /// Selected tape UUID as canonical text.
-        tape_uuid: String,
-        /// Catalog-accounted committed ordinals already present on the tape.
-        total_committed_ordinals: u64,
-    },
     /// The selected parity tape already contains committed contents.
     #[error(
         "selected parity tape {tape_uuid} already has committed contents; true append is not implemented: total_committed_ordinals={total_committed_ordinals}"
@@ -485,6 +467,23 @@ pub enum PoolWriteError {
     /// Timestamp formatting failed.
     #[error("format timestamp: {0}")]
     TimeFormat(#[from] time::error::Format),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NoParityAppendContext {
+    tape_file_number: u32,
+    previous_total_committed_ordinals: u64,
+    fresh_tape: bool,
+}
+
+impl NoParityAppendContext {
+    fn object_total_committed_ordinals(self, object_blocks: u64) -> Result<u64, PoolWriteError> {
+        self.previous_total_committed_ordinals
+            .checked_add(object_blocks)
+            .ok_or_else(|| {
+                PoolWriteError::InvalidInput("no-parity committed ordinal overflow".to_string())
+            })
+    }
 }
 
 /// Errors returned when verifying a physical tape identity at BOT.
@@ -942,16 +941,10 @@ pub fn check_writability_preconditions(
         return Err(missing_geometry("block_size is zero"));
     }
     validate_scheme_columns(tape)?;
-    if tape.total_committed_ordinals > 0 {
-        return if tape.scheme_id.is_some() {
-            Err(WritabilityError::ParityAppendUnsupported {
-                total_committed_ordinals: tape.total_committed_ordinals,
-            })
-        } else {
-            Err(WritabilityError::NoParityAppendUnsupported {
-                total_committed_ordinals: tape.total_committed_ordinals,
-            })
-        };
+    if tape.total_committed_ordinals > 0 && tape.scheme_id.is_some() {
+        return Err(WritabilityError::ParityAppendUnsupported {
+            total_committed_ordinals: tape.total_committed_ordinals,
+        });
     }
     let voltag = tape
         .voltag
@@ -1266,14 +1259,17 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
 ) -> Result<PoolWriteResult, PoolWriteError> {
     let PreparedPoolWrite { prepared, stored } = prepared_write;
     let tape_uuid = selected.tape_uuid;
+    let append = no_parity_append_context(state, &selected)?;
     let transfer_started = Instant::now();
     let write_report: Result<StreamingObjectWriteReport, PoolWriteError> = (|| {
-        write_no_parity_bootstrap(
-            sink,
-            tape_uuid,
-            selected.block_size,
-            &prepared.write_timestamp,
-        )?;
+        if append.fresh_tape {
+            write_no_parity_bootstrap(
+                sink,
+                tape_uuid,
+                selected.block_size,
+                &prepared.write_timestamp,
+            )?;
+        }
         match &stored {
             PreparedStoredObject::Plaintext => {
                 let mut readers = open_prepared_readers(&prepared.files)?;
@@ -1296,12 +1292,19 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
                     layout,
                     object_digest,
                     filemark_outcome,
+                    append,
                 )
             }
             PreparedStoredObject::Encrypted(encrypted) => {
                 write_fixed_blocks(sink, prepared.options.chunk_size, &encrypted.sealed)?;
                 let filemark_outcome = sink.write_filemarks(1)?;
-                no_parity_encrypted_write_report(tape_uuid, &prepared, encrypted, filemark_outcome)
+                no_parity_encrypted_write_report(
+                    tape_uuid,
+                    &prepared,
+                    encrypted,
+                    filemark_outcome,
+                    append,
+                )
             }
         }
     })();
@@ -1869,6 +1872,7 @@ fn no_parity_write_report(
     layout: remanence_format::RemTarObjectLayout,
     object_digest: [u8; 32],
     filemark_outcome: remanence_library::WriteFilemarksOutcome,
+    append: NoParityAppendContext,
 ) -> Result<StreamingObjectWriteReport, PoolWriteError> {
     if layout.projected_size_blocks != prepared.plan.layout.projected_size_blocks {
         return Err(PoolWriteError::InvalidInput(
@@ -1893,7 +1897,7 @@ fn no_parity_write_report(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let object_close = ObjectWriteSummary {
-        tape_file_number: 1,
+        tape_file_number: append.tape_file_number,
         first_parity_data_ordinal: 0,
         projected_size_blocks: prepared.plan.layout.projected_size_blocks,
         data_block_count: layout.projected_size_blocks,
@@ -1921,23 +1925,41 @@ fn no_parity_write_report(
         plaintext_digest: object_digest,
         stored_digest: object_digest,
     };
-    let tape_file_bundle = CommittedBundle {
-        kind: CommittedBundleKind::Object,
-        entries: vec![TapeFileEntry {
-            tape_file_number: object_close.tape_file_number,
-            kind: TapeFileKind::Object,
-            block_count: layout.projected_size_blocks,
+    let mut tape_file_entries = Vec::with_capacity(if append.fresh_tape { 2 } else { 1 });
+    if append.fresh_tape {
+        tape_file_entries.push(TapeFileEntry {
+            tape_file_number: 0,
+            kind: TapeFileKind::Bootstrap,
+            block_count: 1,
             physical_start_hint: None,
-            object_id: Some(prepared.options.object_id.clone()),
+            object_id: None,
             first_parity_data_ordinal: None,
             epoch_id: None,
             protected_ordinal_start: None,
             protected_ordinal_end_exclusive: None,
             canonical_metadata_hash: None,
             bootstrap_object_row: None,
-        }],
+        });
+    }
+    tape_file_entries.push(TapeFileEntry {
+        tape_file_number: object_close.tape_file_number,
+        kind: TapeFileKind::Object,
+        block_count: layout.projected_size_blocks,
+        physical_start_hint: None,
+        object_id: Some(prepared.options.object_id.clone()),
+        first_parity_data_ordinal: None,
+        epoch_id: None,
+        protected_ordinal_start: None,
+        protected_ordinal_end_exclusive: None,
+        canonical_metadata_hash: None,
+        bootstrap_object_row: None,
+    });
+    let tape_file_bundle = CommittedBundle {
+        kind: CommittedBundleKind::Object,
+        entries: tape_file_entries,
         highest_protected_ordinal: 0,
-        total_committed_ordinals: layout.projected_size_blocks,
+        total_committed_ordinals: append
+            .object_total_committed_ordinals(layout.projected_size_blocks)?,
     };
     let catalog = StreamingCatalogProjection {
         object,
@@ -2005,6 +2027,7 @@ fn write_encrypted_object_to_parity(
         object_close,
         "streaming_encrypted_object_committed",
         "committed encrypted object",
+        None,
     )
 }
 
@@ -2013,9 +2036,12 @@ fn no_parity_encrypted_write_report(
     prepared: &PreparedPoolObject,
     encrypted: &PreparedEncryptedPoolObject,
     filemark_outcome: remanence_library::WriteFilemarksOutcome,
+    append: NoParityAppendContext,
 ) -> Result<StreamingObjectWriteReport, PoolWriteError> {
+    let total_committed_ordinals =
+        append.object_total_committed_ordinals(encrypted.envelope.stored_size_blocks)?;
     let object_close = ObjectWriteSummary {
-        tape_file_number: 1,
+        tape_file_number: append.tape_file_number,
         first_parity_data_ordinal: 0,
         projected_size_blocks: encrypted.envelope.stored_size_blocks,
         data_block_count: encrypted.envelope.stored_size_blocks,
@@ -2024,7 +2050,7 @@ fn no_parity_encrypted_write_report(
         highest_protected_ordinal: 0,
         control_tape_files_emitted: Vec::new(),
         bootstrap_object_row: Some(BootstrapObjectRow::encrypted(
-            1,
+            append.tape_file_number,
             encrypted.envelope.stored_size_blocks,
             encrypted.envelope.header.key_id,
             encrypted.envelope.metadata_frame_len,
@@ -2037,7 +2063,17 @@ fn no_parity_encrypted_write_report(
         object_close,
         "streaming_encrypted_object_committed_no_parity",
         "committed no-parity encrypted object",
+        Some(UnprotectedObjectBundleContext {
+            fresh_tape: append.fresh_tape,
+            total_committed_ordinals,
+        }),
     )
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UnprotectedObjectBundleContext {
+    fresh_tape: bool,
+    total_committed_ordinals: u64,
 }
 
 fn encrypted_write_report(
@@ -2047,6 +2083,7 @@ fn encrypted_write_report(
     object_close: ObjectWriteSummary,
     audit_kind: &'static str,
     audit_prefix: &'static str,
+    unprotected_context: Option<UnprotectedObjectBundleContext>,
 ) -> Result<StreamingObjectWriteReport, PoolWriteError> {
     if prepared.files.len() != encrypted.plaintext_layout.files.len() {
         return Err(PoolWriteError::InvalidInput(
@@ -2117,23 +2154,45 @@ fn encrypted_write_report(
         }
         bundle
     } else {
-        CommittedBundle {
-            kind: CommittedBundleKind::Object,
-            entries: vec![TapeFileEntry {
-                tape_file_number: object_close.tape_file_number,
-                kind: TapeFileKind::Object,
-                block_count: encrypted.envelope.stored_size_blocks,
+        let unprotected_context = unprotected_context.ok_or_else(|| {
+            PoolWriteError::InvalidInput(
+                "unprotected encrypted object is missing commit context".to_string(),
+            )
+        })?;
+        let mut entries = Vec::with_capacity(if unprotected_context.fresh_tape { 2 } else { 1 });
+        if unprotected_context.fresh_tape {
+            entries.push(TapeFileEntry {
+                tape_file_number: 0,
+                kind: TapeFileKind::Bootstrap,
+                block_count: 1,
                 physical_start_hint: None,
-                object_id: Some(prepared.options.object_id.clone()),
+                object_id: None,
                 first_parity_data_ordinal: None,
                 epoch_id: None,
                 protected_ordinal_start: None,
                 protected_ordinal_end_exclusive: None,
                 canonical_metadata_hash: None,
-                bootstrap_object_row: object_close.bootstrap_object_row.clone(),
-            }],
+                bootstrap_object_row: None,
+            });
+        }
+        entries.push(TapeFileEntry {
+            tape_file_number: object_close.tape_file_number,
+            kind: TapeFileKind::Object,
+            block_count: encrypted.envelope.stored_size_blocks,
+            physical_start_hint: None,
+            object_id: Some(prepared.options.object_id.clone()),
+            first_parity_data_ordinal: None,
+            epoch_id: None,
+            protected_ordinal_start: None,
+            protected_ordinal_end_exclusive: None,
+            canonical_metadata_hash: None,
+            bootstrap_object_row: object_close.bootstrap_object_row.clone(),
+        });
+        CommittedBundle {
+            kind: CommittedBundleKind::Object,
+            entries,
             highest_protected_ordinal: 0,
-            total_committed_ordinals: encrypted.envelope.stored_size_blocks,
+            total_committed_ordinals: unprotected_context.total_committed_ordinals,
         }
     };
     let catalog = StreamingCatalogProjection {
@@ -2348,10 +2407,7 @@ fn ensure_selected_tape_accepts_write(
     }
     if tape.total_committed_ordinals > 0 {
         return match selected.parity_config {
-            ParityConfig::None => Err(PoolWriteError::NoParityAppendUnsupported {
-                tape_uuid: uuid_text(selected.tape_uuid),
-                total_committed_ordinals: tape.total_committed_ordinals,
-            }),
+            ParityConfig::None => Ok(()),
             ParityConfig::Scheme(_) => Err(PoolWriteError::ParityAppendUnsupported {
                 tape_uuid: uuid_text(selected.tape_uuid),
                 total_committed_ordinals: tape.total_committed_ordinals,
@@ -2359,6 +2415,47 @@ fn ensure_selected_tape_accepts_write(
         };
     }
     Ok(())
+}
+
+fn no_parity_append_context(
+    state: &CatalogIndex,
+    selected: &SelectedTape,
+) -> Result<NoParityAppendContext, PoolWriteError> {
+    let tape = state.get_tape(&selected.tape_uuid)?.ok_or_else(|| {
+        PoolWriteError::MissingTapeGeometry("selected tape row is missing".into())
+    })?;
+    if tape.scheme_id.is_some() {
+        return Err(PoolWriteError::InvalidInput(
+            "no-parity append context requested for parity tape".to_string(),
+        ));
+    }
+    let previous_total_committed_ordinals = tape.total_committed_ordinals;
+    if previous_total_committed_ordinals > 0 && tape.last_committed_tape_file.is_none() {
+        return Err(PoolWriteError::MissingTapeGeometry(
+            "no-parity tape has committed ordinals but no last_committed_tape_file".to_string(),
+        ));
+    }
+    let tape_file_number = match tape.last_committed_tape_file {
+        Some(last) => u32::try_from(last)
+            .map_err(|_| {
+                PoolWriteError::MissingTapeGeometry(
+                    "last_committed_tape_file overflows u32".to_string(),
+                )
+            })?
+            .checked_add(1)
+            .ok_or_else(|| {
+                PoolWriteError::MissingTapeGeometry(
+                    "next no-parity tape file overflows u32".to_string(),
+                )
+            })?,
+        None => 1,
+    };
+    Ok(NoParityAppendContext {
+        tape_file_number,
+        previous_total_committed_ordinals,
+        fresh_tape: previous_total_committed_ordinals == 0
+            && tape.last_committed_tape_file.is_none(),
+    })
 }
 
 fn ensure_selected_tape_has_capacity(
