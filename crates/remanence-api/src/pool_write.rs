@@ -50,7 +50,7 @@ use uuid::Uuid;
 use crate::pool_selection::{
     CompleteOrFill, FillOldest, PoolSelectionContext, PoolSelectionPolicy, Selection, TapeFitState,
 };
-use crate::{bytes_to_hex, pb, timestamp_from_rfc3339};
+use crate::{append_mode_for_tape_file_number, bytes_to_hex, pb, timestamp_from_rfc3339};
 
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 const VERIFY_BOOTSTRAP_READ_BYTES: usize = 1024 * 1024;
@@ -111,6 +111,7 @@ pub struct PoolWriteObjectRecord {
 impl PoolWriteObjectRecord {
     /// Convert to the generated Layer 5 protobuf `ObjectRecord`.
     pub fn to_proto(&self) -> pb::ObjectRecord {
+        let append_commit_info = self.copies.first().map(append_commit_info_from_pool_copy);
         pb::ObjectRecord {
             object_id: self.object_id.to_vec(),
             caller_object_id: self.caller_object_id.clone(),
@@ -124,6 +125,7 @@ impl PoolWriteObjectRecord {
                 .iter()
                 .map(PoolWriteObjectCopyRecord::to_proto)
                 .collect(),
+            append_commit_info,
         }
     }
 
@@ -162,6 +164,21 @@ impl PoolWriteObjectCopyRecord {
             health: pb::object_copy::Health::ObjectCopyHealthOk as i32,
             pool_id: self.pool_id.clone(),
         }
+    }
+}
+
+fn append_commit_info_from_pool_copy(copy: &PoolWriteObjectCopyRecord) -> pb::AppendCommitInfo {
+    pb::AppendCommitInfo {
+        append_mode: append_mode_for_tape_file_number(copy.tape_file_number) as i32,
+        tape_uuid: copy.tape_uuid.to_vec(),
+        voltag: None,
+        tape_file_number: copy.tape_file_number,
+        first_body_lba: copy.first_body_lba,
+        position_before_lba: None,
+        position_after_lba: None,
+        journal_record_ordinal: None,
+        estimated_remaining_bytes: None,
+        sealed_after_write: None,
     }
 }
 
@@ -2755,6 +2772,56 @@ mod tests {
         let second = live_sink.write_block(b"defgh").expect("second write");
         assert_eq!(second.bytes_written, 5);
         assert_eq!(counter.write_bytes(), 8);
+    }
+
+    #[test]
+    fn pool_write_record_to_proto_carries_append_commit_info() {
+        let object = PoolWriteObjectRecord {
+            object_id: [0x11; 16],
+            caller_object_id: "caller-object".to_string(),
+            content_sha256: [0x22; 32],
+            logical_size_bytes: 123,
+            body_format: FORMAT_ID.to_string(),
+            created_at_utc: "2026-07-05T00:00:00Z".to_string(),
+            copies: vec![PoolWriteObjectCopyRecord {
+                tape_uuid: [0x44; 16],
+                tape_file_number: 3,
+                first_body_lba: 9,
+                pool_id: "camera.copy-a".to_string(),
+                representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+                key_id: None,
+                metadata_frame_len: None,
+            }],
+        };
+
+        let proto = object.to_proto();
+        let info = proto
+            .append_commit_info
+            .expect("append commit info from first copy");
+        assert_eq!(info.append_mode, pb::AppendMode::Append as i32);
+        assert_eq!(info.tape_uuid, vec![0x44; 16]);
+        assert_eq!(info.tape_file_number, 3);
+        assert_eq!(info.first_body_lba, 9);
+        assert_eq!(info.position_before_lba, None);
+        assert_eq!(info.position_after_lba, None);
+        assert_eq!(info.journal_record_ordinal, None);
+    }
+
+    #[test]
+    fn pool_write_record_to_proto_leaves_append_info_absent_without_copies() {
+        let object = PoolWriteObjectRecord {
+            object_id: [0x11; 16],
+            caller_object_id: "caller-object".to_string(),
+            content_sha256: [0x22; 32],
+            logical_size_bytes: 123,
+            body_format: FORMAT_ID.to_string(),
+            created_at_utc: "2026-07-05T00:00:00Z".to_string(),
+            copies: Vec::new(),
+        };
+
+        let proto = object.to_proto();
+        assert!(proto.copies.is_empty());
+        assert!(proto.append_commit_info.is_none());
     }
 
     #[test]
