@@ -23,6 +23,37 @@ record_artifact() {
   cp -f -- "$path" "$(latest_artifact "$name")"
 }
 
+has_preselected_library() {
+  [[ -n "${FIELDTEST_LIBRARY_SERIAL:-}" ]] && return 0
+  fieldtest_selected_library_serial >/dev/null 2>&1
+}
+
+preselected_library_serial() {
+  local json_file="$1" selected source
+  if [[ -n "${FIELDTEST_LIBRARY_SERIAL:-}" ]]; then
+    selected="$FIELDTEST_LIBRARY_SERIAL"
+    source="FIELDTEST_LIBRARY_SERIAL"
+  else
+    selected="$(fieldtest_selected_library_serial)"
+    source="$(fieldtest_state_dir)/selected-library"
+  fi
+
+  python3 - "$json_file" "$selected" "$source" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text())
+selected = sys.argv[2].strip()
+source = sys.argv[3]
+serials = {str(lib.get("serial", "")).strip() for lib in payload.get("libraries", [])}
+if selected not in serials:
+    found = ", ".join(sorted(serials)) or "(none)"
+    raise SystemExit(f"{source} selects {selected!r}, but discovered libraries are: {found}")
+print(selected)
+PY
+}
+
 main() {
   if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     usage
@@ -32,7 +63,7 @@ main() {
   fieldtest_init_layout
   fieldtest_detect_env || true
 
-  local stamp bin rem_json rem_json_path rem_help_path rem_err_path
+  local stamp bin rem_help_path
   stamp="$(fieldtest_timestamp_id)"
   bin="$(fieldtest_rem_bin)"
 
@@ -64,8 +95,8 @@ main() {
   if ! fieldtest_capture_json "$rem_libraries_json" "$bin" libraries --json; then
     local stderr_text
     stderr_text="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["stderr"])' "$rem_libraries_json")"
-    if [[ "$stderr_text" == *EPERM* || "$stderr_text" == *"Operation not permitted"* ]]; then
-      fieldtest_evidence_record "$SCRIPT_NAME" sg-permissions FAIL "rem libraries hit EPERM; SCSI passthrough is not enabled" "$rem_libraries_json"
+    if [[ "$stderr_text" == *EPERM* || "$stderr_text" == *"Operation not permitted"* || "$stderr_text" == *"Permission denied"* || "$stderr_text" == *"os error 13"* ]]; then
+      fieldtest_evidence_record "$SCRIPT_NAME" sg-permissions FAIL "rem libraries hit a SCSI permission denial" "$rem_libraries_json"
       fieldtest_sudo_surface_lines >&2
     else
       fieldtest_evidence_record "$SCRIPT_NAME" sg-enumeration FAIL "rem libraries failed before discovery" "$rem_libraries_json"
@@ -83,8 +114,17 @@ main() {
     exit 1
   fi
 
-  local selected_serial selected_library_json selected_drive_count
-  selected_serial="$(fieldtest_choose_library_serial "$rem_libraries_json" || true)"
+  local selected_serial selected_library_json
+  selected_serial=""
+  if has_preselected_library; then
+    if ! selected_serial="$(preselected_library_serial "$rem_libraries_json")"; then
+      fieldtest_evidence_record "$SCRIPT_NAME" library-selection FAIL "preselected library is not currently discoverable" "$rem_libraries_json"
+      exit 1
+    fi
+  fi
+  if [[ -z "$selected_serial" ]]; then
+    selected_serial="$(fieldtest_choose_library_serial "$rem_libraries_json" || true)"
+  fi
   if [[ -z "$selected_serial" ]]; then
     if [[ -t 0 ]]; then
       local choice_file
@@ -188,7 +228,7 @@ PY
   record_artifact disk-read-speed "$disk_speed_json"
   if python3 - "$read_mbps" <<'PY'
 import sys
-print("1" if float(sys.argv[1]) >= 300.0 else "0")
+raise SystemExit(0 if float(sys.argv[1]) >= 300.0 else 1)
 PY
   then
     fieldtest_evidence_record "$SCRIPT_NAME" spool-speed PASS "spool read speed ${read_mbps} MB/s" "$disk_speed_json"
