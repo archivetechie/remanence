@@ -1,9 +1,9 @@
 /- Specification theorems for the parity-state extraction (SPEC.md T1–T5).
 
    Targets the Aeneas-generated definitions in `ParityState.Funs`. The Lean
-   checker accepting this file with zero `sorry` is the pilot's success
-   criterion; proofs are searched by Leanstral but trusted only via `lake
-   build`. -/
+   checker accepting this file with no remaining placeholders is the pilot's
+   success criterion; proofs are searched by Leanstral but trusted only via
+   `lake build`. -/
 import ParityState.Funs
 
 open Aeneas Aeneas.Std Result
