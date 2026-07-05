@@ -82,7 +82,7 @@ bench_write_case() {
   out_path="$(fieldtest_artifact_path "$SCRIPT_NAME" "$label" "$stamp")"
   top_stop="$out_path.stop"
   mkdir -p "$(dirname -- "$out_path")"
-  : >"$top_stop"
+  rm -f -- "$top_stop"
   sample_top "$top_stop" 9>&- &
   local sampler_pid=$!
   start="$(python3 -c 'import time; print(f"{time.monotonic():.9f}")')"
@@ -132,6 +132,8 @@ main() {
     echo "error: no selected library; run bringup first" >&2
     exit 1
   fi
+  fieldtest_require_pool_writable_tapes fieldtest-a 1 "incompressible write benchmark"
+  fieldtest_require_pool_writable_tapes fieldtest-b 1 "compressible write benchmark"
 
   local stamp workdir payload_bytes random_file zeros_file
   stamp="$(fieldtest_timestamp_id)"

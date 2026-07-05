@@ -73,6 +73,7 @@ main() {
     echo "error: no selected library; run bringup first" >&2
     exit 1
   fi
+  fieldtest_require_pool_writable_tapes fieldtest-a 1 "read benchmark fixture write"
 
   local size_bytes workdir stamp source object locator restored
   size_bytes="$(default_bench_bytes)"

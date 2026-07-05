@@ -82,6 +82,8 @@ main() {
     echo "error: no selected library; run bringup first" >&2
     exit 1
   fi
+  fieldtest_require_pool_writable_tapes fieldtest-a 1 "dual write fieldtest-a leg"
+  fieldtest_require_pool_writable_tapes fieldtest-b 1 "dual write fieldtest-b leg"
 
   local stamp workdir bytes random_file zeros_file top_stop
   stamp="$(fieldtest_timestamp_id)"
@@ -93,7 +95,7 @@ main() {
   make_payload "$zeros_file" "$bytes" zero
 
   top_stop="$workdir/top.stop"
-  : >"$top_stop"
+  rm -f -- "$top_stop"
   (while [[ ! -f "$top_stop" ]]; do
       fieldtest_capture_json "$(fieldtest_artifact_path "$SCRIPT_NAME" top "$(fieldtest_timestamp_id)")" "$(fieldtest_rem_bin)" top --endpoint "$(fieldtest_rem_endpoint)" --once --json || true
       sleep 5
@@ -101,17 +103,22 @@ main() {
   local sampler_pid=$!
 
   local out_a="$workdir/a.json" out_b="$workdir/b.json"
-  local start end seconds_a seconds_b total_mb total_bytes
+  local start end seconds_a seconds_b mb_a bytes_b mb_b total_mb total_bytes
   start="$(python3 -c 'import time; print(f"{time.monotonic():.9f}")')"
   bench_one "$serial" "$random_file" fieldtest-a "$out_a" >"$workdir/a.metrics" 9>&- &
   local pid_a=$!
   bench_one "$serial" "$zeros_file" fieldtest-b "$out_b" >"$workdir/b.metrics" 9>&- &
   local pid_b=$!
-  wait "$pid_a" || true
-  wait "$pid_b" || true
+  local rc_a=0 rc_b=0
+  wait "$pid_a" || rc_a=$?
+  wait "$pid_b" || rc_b=$?
   end="$(python3 -c 'import time; print(f"{time.monotonic():.9f}")')"
   touch "$top_stop"
   wait "$sampler_pid" || true
+  if (( rc_a != 0 || rc_b != 0 )); then
+    fieldtest_evidence_record "$SCRIPT_NAME" summary FAIL "dual write failed (fieldtest-a rc=$rc_a, fieldtest-b rc=$rc_b)" "$workdir"
+    return 1
+  fi
 
   read -r total_bytes seconds_a mb_a <"$workdir/a.metrics" || true
   read -r bytes_b seconds_b mb_b <"$workdir/b.metrics" || true
