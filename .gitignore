@@ -35,3 +35,4 @@ fixtures/**/*.log
 # Keep the extracted directory tracked (it's how the parsers consume them);
 # the tarball is redundant and large.
 fixtures/real-hardware/*.tar.gz
+verif/**/target/
