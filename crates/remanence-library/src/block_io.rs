@@ -68,6 +68,15 @@ pub trait BlockSink {
     /// returns only after the marks are committed to media.
     fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError>;
 
+    /// Position the sink at logical end-of-data before appending another
+    /// tape file. Real drives use SSC SPACE(EOD); fixtures may model the
+    /// same motion with their captured end position.
+    fn space_to_end_of_data(&mut self) -> Result<TapePosition, TapeIoError> {
+        Err(TapeIoError::OperationFailed(
+            "block sink does not support space to end-of-data".to_string(),
+        ))
+    }
+
     /// Current tape position via READ POSITION long-form.
     fn position(&mut self) -> Result<TapePosition, TapeIoError>;
 }
@@ -118,6 +127,9 @@ impl BlockSink for DriveHandleSink<'_> {
     }
     fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
         self.0.write_filemarks(count)
+    }
+    fn space_to_end_of_data(&mut self) -> Result<TapePosition, TapeIoError> {
+        Ok(self.0.space(0, SpaceKind::EndOfData)?.position_after)
     }
     fn position(&mut self) -> Result<TapePosition, TapeIoError> {
         self.0.position()
@@ -496,7 +508,10 @@ pub struct VecBlockSink {
     pub filemarks: Vec<u32>,
     /// Captures the LBA at which each block was written.
     pub block_lbas: Vec<u64>,
+    /// Number of modeled SPACE(EOD) calls.
+    pub space_to_eod_calls: u64,
     next_lba: u64,
+    eod_lba: u64,
 }
 
 impl VecBlockSink {
@@ -510,6 +525,16 @@ impl VecBlockSink {
     pub fn next_lba(&self) -> u64 {
         self.next_lba
     }
+
+    /// Test helper that models external positioning before the next write.
+    pub fn set_next_lba_for_test(&mut self, next_lba: u64) {
+        self.next_lba = next_lba;
+    }
+
+    /// Captured logical end-of-data LBA.
+    pub fn eod_lba(&self) -> u64 {
+        self.eod_lba
+    }
 }
 
 impl BlockSink for VecBlockSink {
@@ -522,6 +547,7 @@ impl BlockSink for VecBlockSink {
         self.block_lbas.push(lba);
         self.blocks.push(buf.to_vec());
         self.next_lba = next_lba;
+        self.eod_lba = self.eod_lba.max(self.next_lba);
         Ok(WriteOutcome {
             bytes_written: buf.len() as u32,
             early_warning: false,
@@ -542,6 +568,7 @@ impl BlockSink for VecBlockSink {
             .next_lba
             .checked_add(count as u64)
             .expect("VecBlockSink LBA overflow on filemark");
+        self.eod_lba = self.eod_lba.max(self.next_lba);
         Ok(WriteFilemarksOutcome {
             early_warning: false,
             end_of_medium: false,
@@ -552,6 +579,18 @@ impl BlockSink for VecBlockSink {
                 end_of_partition: false,
                 block_position_end_of_warning: false,
             },
+        })
+    }
+
+    fn space_to_end_of_data(&mut self) -> Result<TapePosition, TapeIoError> {
+        self.space_to_eod_calls = self.space_to_eod_calls.saturating_add(1);
+        self.next_lba = self.eod_lba;
+        Ok(TapePosition {
+            lba: self.next_lba,
+            partition: 0,
+            beginning_of_partition: self.next_lba == 0,
+            end_of_partition: false,
+            block_position_end_of_warning: false,
         })
     }
 
