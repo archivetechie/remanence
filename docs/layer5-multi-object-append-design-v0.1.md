@@ -6,10 +6,13 @@ pool-write/catalog append for sequential objects on the same tape session.
 The second code slice adds a strict no-parity live append projection path that
 rejects non-contiguous tape-file extension, overlapping tape-file rows,
 geometry/protection mismatch, non-ready tape state, and object/copy identity
-conflicts before object rows become visible. Durable append records, explicit
-device reposition/position proof, API append evidence, idempotency, system
-scenario coverage, fieldtest append loops, and MTA-2 parity append remain
-pending gates.
+conflicts before object rows become visible. The third code slice exposes
+locator-derived `AppendCommitInfo` through gRPC `ObjectRecord`, CLI locator
+JSON, and `remfield-io` write evidence; journal ordinal, position proof, voltag,
+sealed-after-write, and remaining-capacity fields are omitted/null until durable
+append records land. Durable append records, explicit device reposition/position proof,
+idempotency, system scenario coverage, fieldtest append loops, and MTA-2 parity
+append remain pending gates.
 **Problem source:** physical MSL3040 field-test preparation exposed that the
 current pool writer treats a committed cartridge as unavailable for further
 pool writes. That was acceptable for S4a "write one object", but it is not
@@ -608,14 +611,14 @@ enum AppendMode {
 message AppendCommitInfo {
   AppendMode append_mode = 1;
   bytes tape_uuid = 2;
-  string voltag = 3;
+  optional string voltag = 3;
   uint64 tape_file_number = 4;
   uint64 first_body_lba = 5;
-  uint64 position_before_lba = 6;
-  uint64 position_after_lba = 7;
-  uint64 journal_record_ordinal = 8;
-  uint64 estimated_remaining_bytes = 9;
-  bool sealed_after_write = 10;
+  optional uint64 position_before_lba = 6;
+  optional uint64 position_after_lba = 7;
+  optional uint64 journal_record_ordinal = 8;
+  optional uint64 estimated_remaining_bytes = 9;
+  optional bool sealed_after_write = 10;
 }
 ```
 

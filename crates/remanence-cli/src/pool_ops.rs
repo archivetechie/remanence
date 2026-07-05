@@ -373,10 +373,11 @@ pub(crate) fn print_locator_json(
         "none"
     };
     let key_id = copy.key_id.map(|value| bytes_to_hex(&value));
+    let append_mode = append_mode_name_for_tape_file_number(copy.tape_file_number);
 
     // §4: single compact line on stdout — no pretty-printing.
     let json = serde_json::json!({
-        "tape_uuid": tape_uuid_hex,
+        "tape_uuid": tape_uuid_hex.as_str(),
         "tape_file_number": copy.tape_file_number,
         "first_body_lba": copy.first_body_lba,
         "object_id": object_id,
@@ -388,9 +389,29 @@ pub(crate) fn print_locator_json(
         "encryption": encryption,
         "key_id": key_id,
         "metadata_frame_len": copy.metadata_frame_len,
+        "append_commit_info": {
+            "append_mode": append_mode,
+            "tape_uuid": tape_uuid_hex.as_str(),
+            "voltag": serde_json::Value::Null,
+            "tape_file_number": copy.tape_file_number,
+            "first_body_lba": copy.first_body_lba,
+            "position_before_lba": serde_json::Value::Null,
+            "position_after_lba": serde_json::Value::Null,
+            "journal_record_ordinal": serde_json::Value::Null,
+            "estimated_remaining_bytes": serde_json::Value::Null,
+            "sealed_after_write": serde_json::Value::Null,
+        },
     });
     let line = serde_json::to_string(&json).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"));
     let _ = writeln!(out, "{line}");
+}
+
+fn append_mode_name_for_tape_file_number(tape_file_number: u64) -> &'static str {
+    match tape_file_number {
+        0 => "unspecified",
+        1 => "fresh",
+        _ => "append",
+    }
 }
 
 /// Print the locator in human-readable form.
@@ -413,6 +434,11 @@ fn print_locator_human(object: &PoolWriteObjectRecord, pool_id: &str, out: &mut 
     let _ = writeln!(out, "  tape_uuid:      {tape_uuid_hex}");
     let _ = writeln!(out, "  tape_file_num:  {}", copy.tape_file_number);
     let _ = writeln!(out, "  first_body_lba: {}", copy.first_body_lba);
+    let _ = writeln!(
+        out,
+        "  append_mode:    {}",
+        append_mode_name_for_tape_file_number(copy.tape_file_number)
+    );
     let _ = writeln!(out, "  object_id:      {object_id}");
     let _ = writeln!(out, "  caller_obj_id:  {}", object.caller_object_id);
     let _ = writeln!(out, "  content_sha256: {content_sha256_hex}");
@@ -1739,6 +1765,7 @@ mod tests {
             "encryption",
             "key_id",
             "metadata_frame_len",
+            "append_commit_info",
         ] {
             assert!(parsed.get(field).is_some(), "missing field: {field}");
         }
@@ -1753,6 +1780,15 @@ mod tests {
         assert_eq!(parsed["encryption"].as_str().unwrap(), "none");
         assert!(parsed["key_id"].is_null());
         assert!(parsed["metadata_frame_len"].is_null());
+        let append_info = parsed["append_commit_info"].as_object().unwrap();
+        assert_eq!(append_info["append_mode"].as_str().unwrap(), "fresh");
+        assert_eq!(append_info["tape_file_number"].as_u64().unwrap(), 1);
+        assert_eq!(append_info["first_body_lba"].as_u64().unwrap(), 2);
+        assert!(append_info["position_before_lba"].is_null());
+        assert!(append_info["position_after_lba"].is_null());
+        assert!(append_info["journal_record_ordinal"].is_null());
+        assert!(append_info["estimated_remaining_bytes"].is_null());
+        assert!(append_info["sealed_after_write"].is_null());
 
         // tape_uuid must be 32 lowercase hex chars.
         let tape_uuid_str = parsed["tape_uuid"].as_str().unwrap();
