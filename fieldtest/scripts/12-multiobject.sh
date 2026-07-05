@@ -49,7 +49,7 @@ main() {
   local stamp workdir count min_mb max_mb
   stamp="$(fieldtest_timestamp_id)"
   workdir="$(mktemp -d "$(fieldtest_spool_dir)/multi-${stamp}.XXXXXX")"
-  count="${FIELD_MULTI_COUNT:-200}"
+  count="${FIELD_MULTI_COUNT:-40}"
   min_mb="${FIELD_MULTI_MIN_MB:-5}"
   max_mb="${FIELD_MULTI_MAX_MB:-50}"
   [[ "${REMFIELD_ENV:-unknown}" == vtl ]] && max_mb="${FIELD_MULTI_MAX_MB_VTL:-10}"

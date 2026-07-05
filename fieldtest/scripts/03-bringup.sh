@@ -62,15 +62,31 @@ main() {
       ;;
     --stop)
       fieldtest_init_layout
-      local session
+      local session pid
       session="remfield"
       if tmux has-session -t "$session" 2>/dev/null; then
-        tmux send-keys -t "$session":rem C-c || true
-        sleep 1
         tmux kill-session -t "$session" || true
       fi
+      # tmux kill only HUPs; the daemon survives as an orphan holding the
+      # devices (root cause of wedged writes). Kill by process match on OUR
+      # config path and verify it is gone.
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        pid="$(pgrep -f "rem-daemon --config $(fieldtest_config_path)" | head -1 || true)"
+        [[ -n "$pid" ]] || break
+        kill "$pid" 2>/dev/null || true
+        sleep 1
+      done
+      pid="$(pgrep -f "rem-daemon --config $(fieldtest_config_path)" | head -1 || true)"
+      if [[ -n "$pid" ]]; then
+        kill -9 "$pid" 2>/dev/null || true
+        sleep 1
+      fi
+      if pgrep -f "rem-daemon --config $(fieldtest_config_path)" >/dev/null 2>&1; then
+        fieldtest_evidence_record "$SCRIPT_NAME" stop FAIL "rem-daemon would not die; investigate manually"
+        exit 1
+      fi
       rm -f -- "$(fieldtest_socket_path)"
-      fieldtest_evidence_record "$SCRIPT_NAME" stop PASS "tmux session stopped"
+      fieldtest_evidence_record "$SCRIPT_NAME" stop PASS "daemon stopped and verified gone"
       exit 0
       ;;
     --status)
@@ -110,6 +126,11 @@ main() {
   if [[ -S "/var/lib/replica/rem.sock" ]] && is_socket_live "unix:/var/lib/replica/rem.sock"; then
     fieldtest_evidence_record "$SCRIPT_NAME" foreign-daemon FAIL "refusing to start because the shared /var/lib/replica rem-daemon is still running"
     printf '%s\n' "refusing to start: /var/lib/replica/rem.sock is live. Stop the existing harness daemon first, then rerun 03-bringup.sh." >&2
+    exit 1
+  fi
+  if pgrep -f "rem-daemon --config $(fieldtest_config_path)" >/dev/null 2>&1; then
+    fieldtest_evidence_record "$SCRIPT_NAME" orphan-daemon FAIL "a rem-daemon with this config is already running; run 03-bringup.sh --stop first"
+    printf '%s\n' "refusing to start: an existing rem-daemon (possibly orphaned) holds this config; run 03-bringup.sh --stop" >&2
     exit 1
   fi
   if [[ -S "$(fieldtest_socket_path)" ]] && is_socket_live "$endpoint"; then
