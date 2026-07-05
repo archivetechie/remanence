@@ -26,25 +26,31 @@ hardware window closes.
 
 ## Media budget
 
-Most write-oriented scripts still need at least one unused ready tape in their
-target pool. The append-loop script is different: it needs one ready appendable
-tape and deliberately reuses it after committed objects exist. `10-init-pools.sh`
+Daemon write scripts now need at least one appendable ready tape in their
+target pool. A used ready tape is acceptable and expected because each daemon
+write appends a new independent object after the committed prefix. `10-init-pools.sh`
 splits allowlisted data barcodes into `fieldtest-a` and `fieldtest-b`; bring
 this many scratch LTO-9 tapes:
 
 | Scratch data tapes | Recommended use today |
 |---:|---|
-| 2 | Append smoke: run `10-init-pools.sh --count 2`, then Phase 0, `11-happy-path`, `13-append-loop`, stewardship, cleaning, robotics. |
-| 4 | Core single-drive pitch: Phase 0, `11-happy-path`, `13-append-loop`, `20-bench-write`, stewardship, cleaning, collect evidence. |
-| 6 | Core management pitch: add `22-bench-dual`, then collect evidence. |
-| 8 | Core pitch plus exactly one of `12-multiobject`, `21-bench-read`, or one write-heavy fault test. |
-| 10+ | Full default Phase 1 and Phase 2 flow with the default pool split. Bring more if you want all fault tests and soak writes. |
+| 2 | Core append/correctness/benchmark path: run `10-init-pools.sh --count 2`, all Phase 1 scripts, `20-bench-write`, `21-bench-read`, `22-bench-dual`, stewardship, cleaning, robotics, collect evidence. |
+| 4 | The 2-tape path plus spare media for a fenced tape, one fresh-media comparison pass, and `kill-mid-write`, `rebuild`, `wrong-tape`. |
+| 6 | The 4-tape path plus retire/rebind at the end, longer soak, and reruns without pausing for media. |
+| 10+ | Exhaustive run with destructive tests, repeated benchmark passes, and extra margin for hardware or operator problems. |
 
-If a script says `need ... unused ready tape(s)`, do not override it. If
-`13-append-loop.sh` says it needs an appendable ready tape, a used ready tape is
-acceptable by design. Add allowlisted scratch cartridges and run
-`10-init-pools.sh` before bringing the daemon back up, or skip to a
-lower-priority phase.
+If a script says `need ... appendable ready tape(s)`, a used ready tape is
+acceptable by design. If a script specifically says `unused ready tape(s)`, do
+not override it. Add allowlisted scratch cartridges and run `10-init-pools.sh`
+before bringing the daemon back up, or skip to a lower-priority phase. The
+2-tape path has no spare-media margin: if either pool's only tape gets fenced,
+stop and add media. `10-init-pools.sh --count 1` is not supported for the core
+path because `11-happy-path.sh` needs both `fieldtest-a` and `fieldtest-b`.
+
+Dry-run note: the previous `/home/user/remfield-dryrun` run stopped at
+`20-bench-write` with "pool fieldtest-a has no writable tapes" because the
+pre-append suite required a fresh cartridge. The current suite should append
+the benchmark object to a ready used tape instead.
 
 ## Fast run order
 
@@ -66,49 +72,14 @@ green. Then physically load the scratch data tapes plus the CLN cartridge.
 ./scripts/02-discovery.sh
 ```
 
-For a two-data-tape append smoke run, use `./scripts/10-init-pools.sh --count 2`.
+For a two-data-tape core run, use `./scripts/10-init-pools.sh --count 2`.
 
 At this point the daemon owns the robotics. Do not let another backup job,
 admin tool, or second Remanence daemon touch the library.
 
 ## Priority plan for today
 
-With 2 scratch data tapes:
-
-```bash
-./scripts/11-happy-path.sh
-./scripts/13-append-loop.sh
-./scripts/30-stewardship.sh
-./scripts/31-cleaning.sh
-./scripts/32-robotics.sh
-./scripts/90-collect-evidence.sh
-```
-
-With 4 scratch data tapes, add the single-drive write benchmark:
-
-```bash
-./scripts/11-happy-path.sh
-./scripts/13-append-loop.sh
-./scripts/20-bench-write.sh
-./scripts/30-stewardship.sh
-./scripts/31-cleaning.sh
-./scripts/90-collect-evidence.sh
-```
-
-With 6 scratch data tapes, run the management-pitch path:
-
-```bash
-./scripts/11-happy-path.sh
-./scripts/13-append-loop.sh
-./scripts/20-bench-write.sh
-./scripts/22-bench-dual.sh
-./scripts/30-stewardship.sh
-./scripts/31-cleaning.sh
-./scripts/90-collect-evidence.sh
-```
-
-With 10 or more scratch data tapes, run the full correctness and benchmark
-path:
+With 2 scratch data tapes, run the core path:
 
 ```bash
 ./scripts/11-happy-path.sh
@@ -120,16 +91,48 @@ path:
 ./scripts/30-stewardship.sh
 ./scripts/31-cleaning.sh
 ./scripts/32-robotics.sh
+./scripts/90-collect-evidence.sh
 ```
 
-Then add recovery tests while unused ready media remains:
+With 4 or more scratch data tapes, add the highest-value recovery tests before
+collection:
 
 ```bash
+./scripts/11-happy-path.sh
+./scripts/13-append-loop.sh
+./scripts/12-multiobject.sh
+./scripts/20-bench-write.sh
+./scripts/21-bench-read.sh
+./scripts/22-bench-dual.sh
+./scripts/40-faults.sh kill-mid-write
+./scripts/40-faults.sh rebuild
+./scripts/40-faults.sh wrong-tape
+./scripts/30-stewardship.sh
+./scripts/31-cleaning.sh
+./scripts/90-collect-evidence.sh
+```
+
+With 6 or more scratch data tapes, start soak after correctness and run the
+destructive media lifecycle test at the end:
+
+```bash
+./scripts/11-happy-path.sh
+./scripts/13-append-loop.sh
+./scripts/12-multiobject.sh
+./scripts/50-soak.sh start
+./scripts/20-bench-write.sh
+./scripts/21-bench-read.sh
+./scripts/22-bench-dual.sh
+./scripts/30-stewardship.sh
+./scripts/31-cleaning.sh
+./scripts/32-robotics.sh
 ./scripts/40-faults.sh kill-mid-write
 ./scripts/40-faults.sh rebuild
 ./scripts/40-faults.sh wrong-tape
 ./scripts/40-faults.sh retire-rebind
 ./scripts/40-faults.sh crash-clean
+./scripts/50-soak.sh report
+./scripts/90-collect-evidence.sh
 ```
 
 `crash-clean` is real-iron only and needs the CLN cartridge path to be usable.
@@ -159,8 +162,9 @@ Bring back `~/remfield/evidence-pack-YYYYMMDD.tar.gz` and the whole
 
 - A script refuses because media is not allowlisted: fix the allowlist or skip.
   Never use a production barcode.
-- A script refuses because no writable tapes remain: add scratch media or stop
-  write-heavy testing. This is a run-plan limit, not a data-path failure.
+- A script refuses because no appendable ready tapes remain: add scratch media
+  or stop write-heavy testing. This is a run-plan limit, not a data-path
+  failure. On a 2-tape run, this usually means one pool lost its only tape.
 - The daemon hangs for more than five minutes: run `./scripts/03-bringup.sh
   --stop`, then `./scripts/03-bringup.sh`, and keep the daemon log as evidence.
 - Discovery does not show the MSL3040 changer and both drives: stop and fix the

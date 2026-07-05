@@ -59,22 +59,25 @@ default_fault_bytes() {
 }
 
 write_fixture_object() {
-  local workdir="$1" size_bytes="$2"
+  local workdir="$1" size_bytes="$2" pool="${3:-fieldtest-a}"
   local source="$workdir/source.bin" object="$workdir/object.rao" locator="$workdir/locator.json"
+  mkdir -p "$workdir"
   make_payload "$source" "$size_bytes"
   fieldtest_capture_json "$workdir/build.json" "$(fieldtest_rem_bin)" archive build --inputs "$source" --out "$object"
-  fieldtest_capture_json "$locator" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$(fieldtest_selected_library_serial)" --file "$object" --pool fieldtest-a
+  fieldtest_capture_json "$locator" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$(fieldtest_selected_library_serial)" --file "$object" --pool "$pool"
   printf '%s\n' "$source|$object|$locator"
 }
 
 kill_mid_write() {
-  local serial workdir source object locator daemon_pid writer_pid payload_bytes
+  local serial workdir source object locator b_source b_object b_locator daemon_pid writer_pid payload_bytes prefix_bytes
   serial="$(fieldtest_selected_library_serial)"
   payload_bytes="$(default_fault_bytes)"
-  fieldtest_require_pool_writable_tapes fieldtest-a 1 "kill-mid-write fixture write"
-  fieldtest_require_pool_writable_tapes fieldtest-b 1 "kill-mid-write interrupted write"
+  prefix_bytes="${FIELD_FAULT_PREFIX_BYTES:-268435456}"
+  fieldtest_require_pool_appendable_tapes fieldtest-a 1 "kill-mid-write fixture write"
+  fieldtest_require_pool_appendable_tapes fieldtest-b 1 "kill-mid-write committed-prefix and interrupted writes"
   workdir="$(mktemp -d "$(fieldtest_spool_dir)/fault-kill-${RANDOM}.XXXXXX")"
-  IFS='|' read -r source object locator < <(write_fixture_object "$workdir" "$payload_bytes")
+  IFS='|' read -r source object locator < <(write_fixture_object "$workdir/fieldtest-a-prefix" "$payload_bytes" fieldtest-a)
+  IFS='|' read -r b_source b_object b_locator < <(write_fixture_object "$workdir/fieldtest-b-prefix" "$prefix_bytes" fieldtest-b)
   (fieldtest_capture_json "$workdir/write.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$object" --pool fieldtest-b; echo $? >"$workdir/write.rc") &
   writer_pid=$!
   sleep 5
@@ -87,16 +90,27 @@ kill_mid_write() {
   wait "$writer_pid" || true
   "$(fieldtest_script_dir)/03-bringup.sh" >/dev/null 2>&1 || true
   fieldtest_capture_json "$workdir/write-result.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator")" --out "$workdir/write-result.rao" || true
+  local b_restored b_read_json
+  b_restored="$workdir/fieldtest-b-prefix-restored.rao"
+  b_read_json="$workdir/fieldtest-b-prefix-read.json"
+  if ! fieldtest_capture_json "$b_read_json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$b_locator")" --out "$b_restored"; then
+    fieldtest_evidence_record "$SCRIPT_NAME" kill-mid-write FAIL "committed fieldtest-b prefix object was not readable after killed append" "$b_read_json"
+    exit 1
+  fi
+  if [[ "$(sha256_file "$b_restored")" != "$(sha256_file "$b_object")" ]]; then
+    fieldtest_evidence_record "$SCRIPT_NAME" kill-mid-write FAIL "committed fieldtest-b prefix object SHA changed after killed append" "$b_read_json"
+    exit 1
+  fi
   fieldtest_capture_json "$workdir/post.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$object" --pool fieldtest-a
   fieldtest_capture_json "$workdir/catalog.json" "$(fieldtest_rem_bin)" catalog --endpoint "$(fieldtest_rem_endpoint)" tapes --json
-  fieldtest_evidence_record "$SCRIPT_NAME" kill-mid-write PASS "daemon was killed mid-write, restarted, and a follow-up write succeeded" "$workdir/catalog.json"
+  fieldtest_evidence_record "$SCRIPT_NAME" kill-mid-write PASS "daemon was killed mid-append, pre-existing fieldtest-b object read back, and a follow-up write succeeded" "$workdir/catalog.json"
   rm -rf -- "$workdir"
 }
 
 rebuild_catalog() {
   local serial workdir
   serial="$(fieldtest_selected_library_serial)"
-  fieldtest_require_pool_writable_tapes fieldtest-a 1 "rebuild fault fixture write"
+  fieldtest_require_pool_appendable_tapes fieldtest-a 1 "rebuild fault fixture write"
   workdir="$(mktemp -d "$(fieldtest_spool_dir)/fault-rebuild-${RANDOM}.XXXXXX")"
   IFS='|' read -r _ fixture locator < <(write_fixture_object "$workdir" "${FIELD_FAULT_REBUILD_BYTES:-268435456}")
   "$(fieldtest_script_dir)/03-bringup.sh" --stop >/dev/null 2>&1 || true

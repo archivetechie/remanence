@@ -626,10 +626,10 @@ PY
     return 1
   fi
   if (( have < required )); then
-    fieldtest_evidence_record "$script" media-budget FAIL "need ${required} ready tape(s) in $pool for $context; found $have. Run 10-init-pools with allowlisted scratch media, bring the daemon back up, or skip this phase." "$inventory"
+    fieldtest_evidence_record "$script" media-budget FAIL "need ${required} appendable ready tape(s) in $pool for $context; found $have. Run 10-init-pools with allowlisted scratch media, bring the daemon back up, or skip this phase." "$inventory"
     return 1
   fi
-  fieldtest_evidence_record "$script" media-budget PASS "found $have ready tape(s) in $pool for $context" "$inventory"
+  fieldtest_evidence_record "$script" media-budget PASS "found $have appendable ready tape(s) in $pool for $context" "$inventory"
 }
 
 fieldtest_run_with_lock() {

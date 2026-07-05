@@ -1,9 +1,9 @@
 # Remanence field test — HPE MSL3040 + 2× LTO-9 — one-day runbook
 
 **Target:** RHEL 9 HPE server, SAS-attached MSL3040, 2× LTO-9 drives,
-2+ scratch LTO-9 cartridges for append/correctness smoke, 6+ for the core
-benchmark pitch, 10+ for the full default Phase 1/2 flow, plus 1 CLN cleaning
-cartridge.
+2 scratch LTO-9 cartridges for the core append/correctness/benchmark path,
+4+ if you want spare media for destructive recovery and fresh-media comparison,
+plus 1 CLN cleaning cartridge.
 **Duration:** 12 hours, phased, with GO/NO-GO gates and skip pointers.
 **Prime directive:** every result lands in `evidence/` automatically —
 the day produces a management-ready test record, not just a feeling.
@@ -60,23 +60,30 @@ source anywhere else.
 
 ### Scratch media budget
 
-Most write-oriented scripts need at least one unused ready cartridge in their
-target pool. `13-append-loop.sh` deliberately reuses one ready appendable tape
-after committed objects exist, and fails only if the pool has no ready
-appendable tape. `10-init-pools.sh` splits allowlisted data barcodes between
-`fieldtest-a` and `fieldtest-b`; scripts fail early with a `media-budget`
-record if their target pool cannot satisfy the relevant media condition.
+Daemon write scripts need at least one appendable ready cartridge in their
+target pool. A cartridge that already holds committed Remanence objects is
+valid and expected; the suite now appends independent objects instead of
+burning a fresh cartridge per object. `10-init-pools.sh` splits allowlisted
+data barcodes between `fieldtest-a` and `fieldtest-b`; scripts fail early with
+a `media-budget` record if their target pool cannot satisfy the relevant media
+condition. Unused ready media is still needed for explicit fresh-media
+experiments and for destructive flows such as retire/rebind.
 
 | Scratch data tapes | Practical plan |
 |---:|---|
-| 2 | Phase 0 with `10-init-pools.sh --count 2`, `11-happy-path`, `13-append-loop`, stewardship, cleaning, robotics. |
-| 4 | Phase 0, `11-happy-path`, `13-append-loop`, `20-bench-write`, stewardship, cleaning, collect evidence. |
-| 6 | Phase 0, `11-happy-path`, `13-append-loop`, `20-bench-write`, `22-bench-dual`, then collect evidence. |
-| 8 | Core pitch plus exactly one of `12-multiobject`, `21-bench-read`, or one write-heavy fault test. |
-| 10+ | Full default Phase 1 and Phase 2 with the default pool split. Bring more for all fault tests and soak writes. |
+| 2 | Phase 0 with `10-init-pools.sh --count 2`, all Phase 1 correctness scripts, `20-bench-write`, `21-bench-read`, `22-bench-dual`, stewardship, cleaning, robotics, then collect evidence. |
+| 4 | The 2-tape path plus spare media if a cartridge gets fenced, one fresh-media comparison pass, and the `kill-mid-write`, `rebuild`, and `wrong-tape` recovery tests. |
+| 6 | The 4-tape path plus retire/rebind at the end of the day, longer soak, and reruns without stopping for media. |
+| 10+ | Exhaustive run with destructive tests, repeated benchmark passes, and extra margin for operator mistakes or hardware faults. |
 
-If media runs out, add allowlisted scratch tapes and rerun `10-init-pools.sh`
-before restarting the daemon, or skip lower-priority write-heavy phases.
+If appendable media runs out, add allowlisted scratch tapes and rerun
+`10-init-pools.sh` before restarting the daemon, or skip lower-priority
+write-heavy phases. The 2-tape path has no spare-media margin: if either pool's
+only tape gets fenced, stop and add media. `10-init-pools.sh --count 1` is not
+supported for the core path because `11-happy-path.sh` needs both
+`fieldtest-a` and `fieldtest-b`. Do not try to fill an 18 TB cartridge today
+by brute force; the default payload sizes prove append, positioning, catalog,
+readback, and throughput without spending the whole window writing capacity.
 
 ---
 
@@ -141,7 +148,7 @@ land far below, the script's diagnostics section distinguishes
 source-disk starvation vs tape-path problems (it records both disk and
 tape rates).
 
-**If short on time and you have 6+ scratch tapes:** run 2.1 and 2.3 only — one-drive write + dual
+**If short on time and you have 2+ scratch tapes:** run 2.1 and 2.3 only — one-drive write + dual
 aggregate are the two numbers management will remember.
 
 ---
@@ -209,9 +216,8 @@ on. A refused unsafe operation is a PASS.
 
 ## Priorities if the day compresses
 
-**Must (the pitch survives with 6+ scratch tapes):** Phase 0, 1.1, 1.3,
-2.1+2.3. With only 2 scratch tapes, do Phase 0, 1.1, 1.3, 3.1, 3.3,
-3.4, then collect.
+**Must (the pitch survives with 2 scratch tapes):** Phase 0, 1.1, 1.3,
+1.2, 2.1+2.2+2.3, 3.1, 3.3, 3.4, then collect.
 **Should:** 4.1, 4.2 (the two recovery stories), 3.3 (real cleaning).
 **Nice:** everything else. The soak runs itself regardless.
 

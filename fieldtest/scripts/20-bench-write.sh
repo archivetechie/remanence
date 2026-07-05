@@ -132,8 +132,8 @@ main() {
     echo "error: no selected library; run bringup first" >&2
     exit 1
   fi
-  fieldtest_require_pool_writable_tapes fieldtest-a 1 "incompressible write benchmark"
-  fieldtest_require_pool_writable_tapes fieldtest-b 1 "compressible write benchmark"
+  fieldtest_require_pool_appendable_tapes fieldtest-a 1 "incompressible write benchmark"
+  fieldtest_require_pool_appendable_tapes fieldtest-b 1 "compressible write benchmark"
 
   local stamp workdir payload_bytes random_file zeros_file
   stamp="$(fieldtest_timestamp_id)"

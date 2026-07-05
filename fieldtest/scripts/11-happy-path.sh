@@ -89,6 +89,8 @@ main() {
     exit 1
   fi
   fieldtest_require_allowlisted "$(fieldtest_allowlist_barcodes | head -n 1)"
+  fieldtest_require_pool_appendable_tapes fieldtest-a 1 "plaintext happy-path write"
+  fieldtest_require_pool_appendable_tapes fieldtest-b 1 "encrypted happy-path write"
 
   local stamp workdir object_plain manifest_plain restored_plain locator_plain read_plain range_dir
   local size_gb="${FIELD_HAPPY_GB:-2}"

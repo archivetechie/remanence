@@ -45,7 +45,7 @@ main() {
     echo "error: no selected library; run bringup first" >&2
     exit 1
   fi
-  fieldtest_require_pool_writable_tapes fieldtest-a 1 "multiobject write"
+  fieldtest_require_pool_appendable_tapes fieldtest-a 1 "multiobject write"
 
   local stamp workdir count min_mb max_mb
   stamp="$(fieldtest_timestamp_id)"
@@ -82,10 +82,11 @@ for idx in range(count):
             remaining -= n
 PY
 
-  local object="$workdir/multi.rao" manifest="$workdir/multi-manifest.json"
+  local object="$workdir/multi.rao" build_report
+  build_report="$(fieldtest_artifact_path "$SCRIPT_NAME" build "$stamp")"
   mapfile -t inputs < <(find "$workdir/inputs" -maxdepth 1 -type f | sort)
-  if ! "$(fieldtest_rem_bin)" archive build --inputs "${inputs[@]}" --out "$object"; then
-    fieldtest_evidence_record "$SCRIPT_NAME" build FAIL "multiobject archive build failed" "$manifest"
+  if ! fieldtest_capture_json "$build_report" "$(fieldtest_rem_bin)" archive build --inputs "${inputs[@]}" --out "$object"; then
+    fieldtest_evidence_record "$SCRIPT_NAME" build FAIL "multiobject archive build failed" "$build_report"
     exit 1
   fi
 
@@ -107,20 +108,18 @@ PY
     exit 1
   fi
 
-  python3 - "$manifest" "$workdir/sample.txt" "$workdir/range.txt" <<'PY'
-import json
+  python3 - "$workdir/sample.txt" "$workdir/range.txt" "${inputs[@]}" <<'PY'
 import random
 import sys
 from pathlib import Path
 
-manifest = json.loads(Path(sys.argv[1]).read_text())
-entries = manifest.get("members", []) or manifest.get("files", [])
+entries = [Path(arg).name for arg in sys.argv[3:]]
 if len(entries) < 5:
-    raise SystemExit("manifest has too few members")
+    raise SystemExit("multiobject input set has too few members")
 rng = random.Random(0xBEEF)
 samples = rng.sample(entries, 5)
-Path(sys.argv[2]).write_text("\n".join(e["path"] for e in samples[:3]) + "\n")
-Path(sys.argv[3]).write_text("\n".join(e["path"] for e in samples[3:]) + "\n")
+Path(sys.argv[1]).write_text("\n".join(samples[:3]) + "\n")
+Path(sys.argv[2]).write_text("\n".join(samples[3:]) + "\n")
 PY
 
   local restore_dir="$workdir/restore"
@@ -128,12 +127,14 @@ PY
   local sample
   while IFS= read -r sample; do
     [[ -n "$sample" ]] || continue
-    if ! fieldtest_capture_json "$workdir/restore-$sample.json" "$(fieldtest_rem_bin)" archive extract --object "$object" --dest "$restore_dir" --path "$sample" --overwrite; then
-      fieldtest_evidence_record "$SCRIPT_NAME" restore FAIL "failed to restore $sample from multiobject archive" "$workdir/restore-$sample.json"
+    local restore_json
+    restore_json="$(fieldtest_artifact_path "$SCRIPT_NAME" "restore-$sample" "$stamp")"
+    if ! fieldtest_capture_json "$restore_json" "$(fieldtest_rem_bin)" archive extract --object "$object" --dest "$restore_dir" --path "$sample" --overwrite; then
+      fieldtest_evidence_record "$SCRIPT_NAME" restore FAIL "failed to restore $sample from multiobject archive" "$restore_json"
       exit 1
     fi
     if [[ "$(sha256_file "$restore_dir/$sample")" != "$(sha256_file "$workdir/inputs/$sample")" ]]; then
-      fieldtest_evidence_record "$SCRIPT_NAME" restore FAIL "restored bytes mismatch for $sample" "$workdir/restore-$sample.json"
+      fieldtest_evidence_record "$SCRIPT_NAME" restore FAIL "restored bytes mismatch for $sample" "$restore_json"
       exit 1
     fi
   done <"$workdir/sample.txt"
@@ -142,15 +143,17 @@ PY
   i=0
   while IFS= read -r sample; do
     [[ -n "$sample" ]] || continue
-    if ! fieldtest_capture_json "$workdir/range-$i.json" "$(fieldtest_rem_bin)" archive extract --object "$object" --dest "$workdir/range-$i" --path "$sample" --range 1048576:1048576 --overwrite; then
-      fieldtest_evidence_record "$SCRIPT_NAME" range FAIL "range extract failed for $sample" "$workdir/range-$i.json"
+    local range_json
+    range_json="$(fieldtest_artifact_path "$SCRIPT_NAME" "range-$i" "$stamp")"
+    if ! fieldtest_capture_json "$range_json" "$(fieldtest_rem_bin)" archive extract --object "$object" --dest "$workdir/range-$i" --path "$sample" --range 1048576:1048576 --overwrite; then
+      fieldtest_evidence_record "$SCRIPT_NAME" range FAIL "range extract failed for $sample" "$range_json"
       exit 1
     fi
-    fieldtest_evidence_record "$SCRIPT_NAME" range PASS "range extract succeeded for $sample" "$workdir/range-$i.json"
+    fieldtest_evidence_record "$SCRIPT_NAME" range PASS "range extract succeeded for $sample" "$range_json"
     i=$((i + 1))
   done <"$workdir/range.txt"
 
-  fieldtest_evidence_record "$SCRIPT_NAME" manifest PASS "multiobject archive with $count members built and sampled" "$manifest"
+  fieldtest_evidence_record "$SCRIPT_NAME" manifest PASS "multiobject archive with $count members built and sampled" "$build_report"
   rm -rf -- "$workdir"
 }
 
