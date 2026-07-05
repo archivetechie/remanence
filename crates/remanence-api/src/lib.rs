@@ -3992,41 +3992,6 @@ BCw3Wyv2UWY=
             .expect("assign tape to pool");
     }
 
-    fn project_ready_tape_usage(
-        index: &mut CatalogIndex,
-        tape_uuid: [u8; 16],
-        total_committed_ordinals: u64,
-    ) {
-        index
-            .project_committed_tape_file_bundle(
-                TapeJournalIndexInput {
-                    tape_uuid,
-                    block_size: API_SESSION_BLOCK_SIZE,
-                    scheme: Some(test_scheme()),
-                    journal_offset_bytes: 0,
-                },
-                &CommittedBundle {
-                    kind: CommittedBundleKind::Object,
-                    entries: vec![TapeFileEntry {
-                        tape_file_number: 1,
-                        kind: TapeFileKind::Object,
-                        block_count: total_committed_ordinals,
-                        physical_start_hint: Some(0),
-                        object_id: None,
-                        first_parity_data_ordinal: Some(0),
-                        epoch_id: None,
-                        protected_ordinal_start: None,
-                        protected_ordinal_end_exclusive: None,
-                        canonical_metadata_hash: None,
-                        bootstrap_object_row: None,
-                    }],
-                    highest_protected_ordinal: 0,
-                    total_committed_ordinals,
-                },
-            )
-            .expect("project ready tape usage");
-    }
-
     fn project_no_parity_tape_usage(
         index: &mut CatalogIndex,
         tape_uuid: [u8; 16],
@@ -4216,17 +4181,8 @@ BCw3Wyv2UWY=
 
         let mut written_no_parity = writable_tape_record();
         written_no_parity.total_committed_ordinals = 7;
-        let err = check_writability_preconditions(&written_no_parity, 1)
-            .expect_err("written no-parity tape must not be reused");
-        assert!(
-            matches!(
-                err,
-                WritabilityError::NoParityAppendUnsupported {
-                    total_committed_ordinals: 7
-                }
-            ),
-            "{err}"
-        );
+        check_writability_preconditions(&written_no_parity, 1)
+            .expect("written no-parity tape is appendable");
 
         let mut written_parity = writable_tape_record();
         let scheme = test_scheme();
@@ -5034,7 +4990,7 @@ BCw3Wyv2UWY=
     }
 
     #[test]
-    fn select_tape_in_pool_skips_written_no_parity_tape() {
+    fn select_tape_in_pool_prefers_appendable_written_no_parity_tape() {
         let mut index = test_index();
         project_pool(&mut index, "camera.copy-a");
         project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
@@ -5043,10 +4999,10 @@ BCw3Wyv2UWY=
 
         let cfg = pool_config("camera.copy-a");
         let selected =
-            select_tape_in_pool(&index, &cfg, 123, &HashSet::new()).expect("select empty tape");
+            select_tape_in_pool(&index, &cfg, 123, &HashSet::new()).expect("select append tape");
 
         assert_eq!(selected.pool_id, "camera.copy-a");
-        assert_eq!(selected.tape_uuid, SECOND_POOL_WRITE_TAPE_UUID);
+        assert_eq!(selected.tape_uuid, POOL_WRITE_TAPE_UUID);
         assert_eq!(selected.block_size, API_SESSION_BLOCK_SIZE);
         assert!(matches!(selected.parity_config, ParityConfig::None));
     }
@@ -5131,65 +5087,65 @@ BCw3Wyv2UWY=
     }
 
     #[test]
-    fn select_tape_in_pool_skips_partially_written_tape_until_append_resume_exists() {
+    fn select_tape_in_pool_uses_partially_written_no_parity_tape_to_complete() {
         let mut index = test_index();
         project_pool(&mut index, "camera.copy-a");
-        project_eligible_tape_with_voltag(
+        project_no_parity_tape_with_block_size(
             &mut index,
             "camera.copy-a",
             POOL_WRITE_TAPE_UUID,
-            "RMN004L1",
+            API_SESSION_BLOCK_SIZE,
         );
-        project_eligible_tape_with_voltag(
+        project_no_parity_tape_with_block_size(
             &mut index,
             "camera.copy-a",
             SECOND_POOL_WRITE_TAPE_UUID,
-            "RMN005L1",
+            API_SESSION_BLOCK_SIZE,
         );
         let cfg = pool_config_with_watermarks("camera.copy-a", 0.0001, 0.0002, 0);
-        let low_bytes = watermark_floor_bytes(raw_capacity_bytes(LtoGen::Lto1), cfg.watermark_low)
+        let low_bytes = watermark_floor_bytes(raw_capacity_bytes(LtoGen::Lto9), cfg.watermark_low)
             .expect("low watermark");
         let object_size = u64::from(API_SESSION_BLOCK_SIZE) * 2;
         let ordinals_before_low = low_bytes / u64::from(API_SESSION_BLOCK_SIZE);
-        project_ready_tape_usage(
+        project_no_parity_tape_usage(
             &mut index,
             SECOND_POOL_WRITE_TAPE_UUID,
             ordinals_before_low - 1,
         );
 
         let selected = select_tape_in_pool(&index, &cfg, object_size, &HashSet::new())
-            .expect("select fresh tape");
+            .expect("select completing append tape");
 
-        assert_eq!(selected.tape_uuid, POOL_WRITE_TAPE_UUID);
+        assert_eq!(selected.tape_uuid, SECOND_POOL_WRITE_TAPE_UUID);
     }
 
     #[test]
-    fn select_tape_in_pool_does_not_complete_fresh_empty_tape() {
+    fn select_tape_in_pool_reuses_appendable_no_parity_tape_before_fresh_empty_tape() {
         let mut index = test_index();
         project_pool(&mut index, "camera.copy-a");
-        project_eligible_tape_with_voltag(
+        project_no_parity_tape_with_block_size(
             &mut index,
             "camera.copy-a",
             POOL_WRITE_TAPE_UUID,
-            "RMN004L1",
+            API_SESSION_BLOCK_SIZE,
         );
-        project_eligible_tape_with_voltag(
+        project_no_parity_tape_with_block_size(
             &mut index,
             "camera.copy-a",
             SECOND_POOL_WRITE_TAPE_UUID,
-            "RMN005L1",
+            API_SESSION_BLOCK_SIZE,
         );
         let cfg = pool_config_with_watermarks("camera.copy-a", 0.0001, 0.0002, 0);
-        let low_bytes = watermark_floor_bytes(raw_capacity_bytes(LtoGen::Lto1), cfg.watermark_low)
+        let low_bytes = watermark_floor_bytes(raw_capacity_bytes(LtoGen::Lto9), cfg.watermark_low)
             .expect("low watermark");
         let object_size = u64::from(API_SESSION_BLOCK_SIZE) * 2;
         let ordinals_before_low = low_bytes / u64::from(API_SESSION_BLOCK_SIZE);
-        project_ready_tape_usage(&mut index, POOL_WRITE_TAPE_UUID, ordinals_before_low - 3);
+        project_no_parity_tape_usage(&mut index, POOL_WRITE_TAPE_UUID, ordinals_before_low - 3);
 
         let selected = select_tape_in_pool(&index, &cfg, object_size, &HashSet::new())
-            .expect("select empty tape while append resume is unwired");
+            .expect("select appendable tape");
 
-        assert_eq!(selected.tape_uuid, SECOND_POOL_WRITE_TAPE_UUID);
+        assert_eq!(selected.tape_uuid, POOL_WRITE_TAPE_UUID);
     }
 
     #[test]
@@ -6072,23 +6028,23 @@ BCw3Wyv2UWY=
     }
 
     #[test]
-    fn write_to_selected_tape_rejects_second_no_parity_object_before_tape_io() {
+    fn no_parity_pool_write_appends_second_object_to_same_tape() {
         let mut index = test_index();
         project_pool(&mut index, "scenario-a");
         project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
         let source_dir = temp_dir("remanence-api-no-parity-reuse-src");
         let first_path = source_dir.join("first.bin");
         let second_path = source_dir.join("second.bin");
-        std::fs::write(&first_path, b"first no parity payload").expect("write first payload");
-        std::fs::write(&second_path, b"second no parity payload").expect("write second payload");
+        let first_payload = b"first no parity payload".to_vec();
+        let second_payload = b"second no parity payload".to_vec();
+        std::fs::write(&first_path, &first_payload).expect("write first payload");
+        std::fs::write(&second_path, &second_payload).expect("write second payload");
         let cfg = pool_config("scenario-a");
-        let selected =
-            select_tape_in_pool(&index, &cfg, 123, &HashSet::new()).expect("select no-parity tape");
-        let mut first_sink = VecBlockSink::new();
+        let mut tape_sink = VecBlockSink::new();
 
-        let first = write_to_selected_tape(
+        let first = write_object_to_pool(
             &mut index,
-            &mut first_sink,
+            &mut tape_sink,
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
@@ -6098,14 +6054,14 @@ BCw3Wyv2UWY=
                 expected_content_sha256: None,
                 representation: PoolWriteRepresentation::Plaintext,
             },
-            selected.clone(),
         )
         .expect("first no-parity write succeeds");
-        let mut second_sink = VecBlockSink::new();
+        assert_eq!(first.object.copies[0].tape_uuid, POOL_WRITE_TAPE_UUID);
+        assert_eq!(first.object.copies[0].tape_file_number, 1);
 
-        let err = write_to_selected_tape(
+        let second = write_object_to_pool(
             &mut index,
-            &mut second_sink,
+            &mut tape_sink,
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
@@ -6115,23 +6071,61 @@ BCw3Wyv2UWY=
                 expected_content_sha256: None,
                 representation: PoolWriteRepresentation::Plaintext,
             },
-            selected,
         )
-        .expect_err("second no-parity write must reject");
+        .expect("second no-parity append succeeds");
 
-        assert!(
-            matches!(
-                err,
-                PoolWriteError::NoParityAppendUnsupported {
-                    ref tape_uuid,
-                    total_committed_ordinals
-                } if tape_uuid == &Uuid::from_bytes(POOL_WRITE_TAPE_UUID).to_string()
-                    && total_committed_ordinals == first.write_report.layout.projected_size_blocks
-            ),
-            "{err}"
+        assert_eq!(second.object.copies[0].tape_uuid, POOL_WRITE_TAPE_UUID);
+        assert_eq!(second.object.copies[0].tape_file_number, 2);
+        assert_eq!(
+            second.write_report.object_close.tape_file_number, 2,
+            "append report must carry the real tape file number"
         );
-        assert!(second_sink.blocks.is_empty());
-        assert!(second_sink.filemarks.is_empty());
+        assert_eq!(
+            tape_sink.filemarks,
+            vec![1, 1, 1],
+            "append must not write a second file-0 bootstrap"
+        );
+
+        let tape_files = index
+            .list_tape_files(&POOL_WRITE_TAPE_UUID)
+            .expect("list committed tape files");
+        assert_eq!(tape_files.len(), 3);
+        assert_eq!(tape_files[0].tape_file_number, 0);
+        assert_eq!(tape_files[0].kind, "bootstrap");
+        assert_eq!(tape_files[1].tape_file_number, 1);
+        assert_eq!(tape_files[1].kind, "object");
+        assert_eq!(tape_files[2].tape_file_number, 2);
+        assert_eq!(tape_files[2].kind, "object");
+
+        let tape = index
+            .get_tape(&POOL_WRITE_TAPE_UUID)
+            .expect("query tape")
+            .expect("tape row");
+        assert_eq!(tape.last_committed_tape_file, Some(2));
+        assert_eq!(
+            tape.total_committed_ordinals,
+            first.write_report.object_close.data_block_count
+                + second.write_report.object_close.data_block_count
+        );
+
+        let first_blocks = usize::try_from(first.write_report.object_close.data_block_count)
+            .expect("first block count fits usize");
+        let second_blocks = usize::try_from(second.write_report.object_close.data_block_count)
+            .expect("second block count fits usize");
+        let second_start = 1 + first_blocks;
+        let mut second_source = VecBlockSource::new(
+            tape_sink.blocks[second_start..second_start + second_blocks].to_vec(),
+        );
+        let read = read_rem_tar_object(
+            &mut second_source,
+            API_SESSION_BLOCK_SIZE as usize,
+            second.write_report.layout.projected_size_blocks,
+        )
+        .expect("read appended no-parity RAO object");
+        assert_eq!(
+            read.entry("second.bin").expect("second entry").data,
+            second_payload
+        );
     }
 
     #[test]
