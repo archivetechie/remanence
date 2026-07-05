@@ -2052,17 +2052,16 @@ impl pb::write_session_service_server::WriteSessionService for WriteSessionApi {
         let spool_elapsed = spool_started.elapsed();
         tracing::info!(
             target: "remanence_write_diag",
-            "remanence_write_diag phase=spool session_id={} caller_object_id={:?} payload_bytes={} chunks={} declared_size_bytes={} elapsed_ms={:.3} throughput_mib_s={:.3}",
-            session_id,
-            start.caller_object_id,
-            spool_bytes,
-            spool_chunks,
-            start.declared_size_bytes,
-            crate::diagnostics::duration_ms(spool_elapsed),
-            crate::diagnostics::mib_per_s(spool_bytes, spool_elapsed),
+            phase = "spool",
+            session_id = %session_id,
+            payload_bytes = spool_bytes,
+            chunks = spool_chunks,
+            declared_size_bytes = start.declared_size_bytes,
+            elapsed_ms = crate::diagnostics::duration_ms(spool_elapsed),
+            throughput_mib_s = crate::diagnostics::mib_per_s(spool_bytes, spool_elapsed),
+            "remanence_write_diag",
         );
         let caller_object_id = start.caller_object_id;
-        let caller_object_id_for_diag = caller_object_id.clone();
         let append_finish_started = Instant::now();
         let record = match crate::mount::append_finish(
             &self.state,
@@ -2083,12 +2082,12 @@ impl pb::write_session_service_server::WriteSessionService for WriteSessionApi {
         let append_finish_elapsed = append_finish_started.elapsed();
         tracing::info!(
             target: "remanence_write_diag",
-            "remanence_write_diag phase=append_finish session_id={} caller_object_id={:?} payload_bytes={} elapsed_ms={:.3} throughput_mib_s={:.3}",
-            session_id,
-            caller_object_id_for_diag,
-            spool_bytes,
-            crate::diagnostics::duration_ms(append_finish_elapsed),
-            crate::diagnostics::mib_per_s(spool_bytes, append_finish_elapsed),
+            phase = "append_finish",
+            session_id = %session_id,
+            payload_bytes = spool_bytes,
+            elapsed_ms = crate::diagnostics::duration_ms(append_finish_elapsed),
+            throughput_mib_s = crate::diagnostics::mib_per_s(spool_bytes, append_finish_elapsed),
+            "remanence_write_diag",
         );
         Ok(Response::new(record))
     }
