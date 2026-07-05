@@ -507,9 +507,10 @@ from pathlib import Path
 payload = json.loads(Path(sys.argv[1]).read_text())
 libraries = payload.get("libraries", [])
 for lib in libraries:
+    vendor = (lib.get("vendor") or "").strip()
     product = (lib.get("product") or "").strip()
     revision = (lib.get("revision") or "").strip()
-    if product == "MSL G3 Series" and revision == "D.00":
+    if vendor == "QuadStor" and product == "MSL G3 Series" and revision == "D.00":
         print("vtl")
         raise SystemExit(0)
 print("real")
