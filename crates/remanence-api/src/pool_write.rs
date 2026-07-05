@@ -1183,6 +1183,10 @@ impl<S: BlockSink + ?Sized> BlockSink for ObjectDigestBlockSink<'_, S> {
         self.inner.write_filemarks(count)
     }
 
+    fn space_to_end_of_data(&mut self) -> Result<TapePosition, TapeIoError> {
+        self.inner.space_to_end_of_data()
+    }
+
     fn position(&mut self) -> Result<TapePosition, TapeIoError> {
         self.inner.position()
     }
@@ -1225,6 +1229,10 @@ impl<'a> BlockSink for LiveCounterBlockSink<'a> {
         self.inner.write_filemarks(count)
     }
 
+    fn space_to_end_of_data(&mut self) -> Result<TapePosition, TapeIoError> {
+        self.inner.space_to_end_of_data()
+    }
+
     fn position(&mut self) -> Result<TapePosition, TapeIoError> {
         self.inner.position()
     }
@@ -1242,6 +1250,12 @@ impl<'a, S: BlockSink + ?Sized> BlockSink for CountingBlockSink<'a, S> {
         let outcome = self.inner.write_filemarks(count)?;
         self.stats.record_filemarks(count, outcome.early_warning);
         Ok(outcome)
+    }
+
+    fn space_to_end_of_data(&mut self) -> Result<TapePosition, TapeIoError> {
+        let position = self.inner.space_to_end_of_data()?;
+        self.stats.record_position(position);
+        Ok(position)
     }
 
     fn position(&mut self) -> Result<TapePosition, TapeIoError> {
@@ -1390,6 +1404,8 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
                 selected.block_size,
                 &prepared.write_timestamp,
             )?;
+        } else {
+            position_no_parity_append(sink)?;
         }
         match &stored {
             PreparedStoredObject::Plaintext => {
@@ -2090,6 +2106,10 @@ fn write_fixed_blocks(
             .ok_or_else(|| PoolWriteError::InvalidInput("block count overflow".to_string()))?;
     }
     Ok(blocks)
+}
+
+fn position_no_parity_append(sink: &mut dyn BlockSink) -> Result<TapePosition, PoolWriteError> {
+    sink.space_to_end_of_data().map_err(PoolWriteError::from)
 }
 
 fn write_no_parity_bootstrap(

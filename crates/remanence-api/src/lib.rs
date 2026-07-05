@@ -6175,6 +6175,8 @@ BCw3Wyv2UWY=
         .expect("first no-parity write succeeds");
         assert_eq!(first.object.copies[0].tape_uuid, POOL_WRITE_TAPE_UUID);
         assert_eq!(first.object.copies[0].tape_file_number, 1);
+        let eod_after_first = tape_sink.eod_lba();
+        tape_sink.set_next_lba_for_test(0);
 
         let second = write_object_to_pool(
             &mut index,
@@ -6202,6 +6204,10 @@ BCw3Wyv2UWY=
             tape_sink.filemarks,
             vec![1, 1, 1],
             "append must not write a second file-0 bootstrap"
+        );
+        assert_eq!(
+            tape_sink.space_to_eod_calls, 1,
+            "append from a BOT-positioned session must space to EOD before writing"
         );
 
         let tape_files = index
@@ -6233,6 +6239,10 @@ BCw3Wyv2UWY=
             usize::try_from(second.expect_write_report().object_close.data_block_count)
                 .expect("second block count fits usize");
         let second_start = 1 + first_blocks;
+        assert_eq!(
+            tape_sink.block_lbas[second_start], eod_after_first,
+            "second object must be written at the captured EOD, not over BOT"
+        );
         let mut second_source = VecBlockSource::new(
             tape_sink.blocks[second_start..second_start + second_blocks].to_vec(),
         );
