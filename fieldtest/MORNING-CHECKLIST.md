@@ -2,8 +2,11 @@
 
 ## Bring
 - [ ] `remanence-fieldtest.tar.gz` (scp it to the HPE server, or USB)
-- [ ] 4+ scratch LTO-9 cartridges (they WILL be destroyed) + the CLN cartridge
-- [ ] This checklist; the full story is `RUNBOOK.md` inside the kit
+- [ ] Scratch LTO-9 cartridges (they WILL be destroyed): 4 for smoke, 6 for
+      the core benchmark pitch, 10+ for the full default Phase 1/2 flow
+- [ ] The CLN cartridge
+- [ ] This checklist; the full story is `RUNBOOK.md`, and the quick same-day
+      plan is `TODAY-MSL3040-GUIDE.md`
 
 ## First 15 minutes on the server
 ```bash
@@ -46,8 +49,10 @@ read its message — it says exactly what to run first. Sequence:
    skip already-done tapes, evidence appends.
 
 ## If time collapses, run in this order
-Phase 0 + 11-happy-path + 20-bench-write + 22-bench-dual → those four
-carry the management pitch. Then 40-faults kill-mid-write + rebuild.
+With 6+ scratch data tapes: Phase 0 + 11-happy-path + 20-bench-write +
+22-bench-dual carry the management pitch. With only 4 scratch data tapes:
+Phase 0 + 11-happy-path + 30-stewardship + 31-cleaning + 32-robotics. Then
+add 40-faults kill-mid-write + rebuild only if unused ready media remains.
 
 ## Before you leave the site
 ```bash

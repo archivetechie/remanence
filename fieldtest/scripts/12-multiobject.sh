@@ -45,6 +45,7 @@ main() {
     echo "error: no selected library; run bringup first" >&2
     exit 1
   fi
+  fieldtest_require_pool_writable_tapes fieldtest-a 1 "multiobject write"
 
   local stamp workdir count min_mb max_mb
   stamp="$(fieldtest_timestamp_id)"
