@@ -97,15 +97,15 @@ main() {
   (while [[ ! -f "$top_stop" ]]; do
       fieldtest_capture_json "$(fieldtest_artifact_path "$SCRIPT_NAME" top "$(fieldtest_timestamp_id)")" "$(fieldtest_rem_bin)" top --endpoint "$(fieldtest_rem_endpoint)" --once --json || true
       sleep 5
-    done) &
+    done) 9>&- &
   local sampler_pid=$!
 
   local out_a="$workdir/a.json" out_b="$workdir/b.json"
   local start end seconds_a seconds_b total_mb total_bytes
   start="$(python3 -c 'import time; print(f"{time.monotonic():.9f}")')"
-  bench_one "$serial" "$random_file" fieldtest-a "$out_a" >"$workdir/a.metrics" &
+  bench_one "$serial" "$random_file" fieldtest-a "$out_a" >"$workdir/a.metrics" 9>&- &
   local pid_a=$!
-  bench_one "$serial" "$zeros_file" fieldtest-b "$out_b" >"$workdir/b.metrics" &
+  bench_one "$serial" "$zeros_file" fieldtest-b "$out_b" >"$workdir/b.metrics" 9>&- &
   local pid_b=$!
   wait "$pid_a" || true
   wait "$pid_b" || true
