@@ -12,10 +12,11 @@ JSON, and `remfield-io` write evidence; journal ordinal, position proof, voltag,
 sealed-after-write, and remaining-capacity fields are omitted/null until durable
 append records land. The fourth code slice adds the physical fieldtest
 `13-append-loop.sh` and updates the same-day runbooks to prove repeated
-same-tape no-parity appends without requiring many fresh cartridges. Durable
-append records, explicit device reposition/position proof, system scenario
-coverage, append-specific rebuild/kill evidence, and MTA-2 parity append remain
-pending gates. The fifth code slice implements MTA-1 `(pool_id,
+same-tape no-parity appends without requiring many fresh cartridges; the field
+media guards now accept used ready tapes as appendable for ordinary daemon
+writes. Durable append records, explicit device reposition/position proof,
+system scenario coverage, append-specific rebuild/kill evidence, and MTA-2
+parity append remain pending gates. The fifth code slice implements MTA-1 `(pool_id,
 caller_object_id)` replay semantics for non-empty caller ids and keeps empty
 caller ids accepted but non-idempotent.
 **Problem source:** physical MSL3040 field-test preparation exposed that the
@@ -726,18 +727,18 @@ This scenario carries coverage for the new append capability.
 MTA-1 is not complete until the field harness proves same-tape append on the
 physical kit. Required changes:
 
-- make fieldtest media guards append-aware; a used appendable tape must not be
-  rejected solely because it has committed objects;
-- add `13-append-loop.sh`: write N independent RAO objects to one pool, assert
-  one `tape_uuid`, dense `tape_file_number` values, read all objects, and record
-  SHA results;
+- implemented: make fieldtest media guards append-aware; a used appendable tape
+  must not be rejected solely because it has committed objects;
+- implemented: add `13-append-loop.sh`: write N independent RAO objects to one
+  pool, assert one `tape_uuid`, dense `tape_file_number` values, read all
+  objects, and record SHA results;
 - add append-specific rebuild evidence after 3+ objects on one tape;
 - add kill-during-append evidence on an already-used tape, then restart and
-  verify committed objects are not lost or renumbered; if the killed write left
-  an uncommitted tail, assert the tape is fenced and the next write selects the
-  second data tape;
-- update runbooks around "2 scratch data tapes plus CLN" as the normal
-  post-append field path;
+  verify committed objects are not lost or renumbered; current field harness
+  reads back a committed object from the killed-write pool after restart, but
+  still needs the explicit uncommitted-tail/fenced-tape assertion;
+- implemented: update runbooks around "2 scratch data tapes plus CLN" as the
+  normal post-append field path;
 - split benchmarks into "streaming" mode with fewer large objects and
   "append-stress" mode with many smaller objects, reporting first-write and
   append-write rates separately.

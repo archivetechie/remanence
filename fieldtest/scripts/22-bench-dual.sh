@@ -82,8 +82,8 @@ main() {
     echo "error: no selected library; run bringup first" >&2
     exit 1
   fi
-  fieldtest_require_pool_writable_tapes fieldtest-a 1 "dual write fieldtest-a leg"
-  fieldtest_require_pool_writable_tapes fieldtest-b 1 "dual write fieldtest-b leg"
+  fieldtest_require_pool_appendable_tapes fieldtest-a 1 "dual write fieldtest-a leg"
+  fieldtest_require_pool_appendable_tapes fieldtest-b 1 "dual write fieldtest-b leg"
 
   local stamp workdir bytes random_file zeros_file top_stop
   stamp="$(fieldtest_timestamp_id)"
