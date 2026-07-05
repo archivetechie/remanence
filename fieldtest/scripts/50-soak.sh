@@ -65,6 +65,9 @@ start_soak() {
     fieldtest_evidence_record "$SCRIPT_NAME" start INFO "soak loop already running"
     exit 0
   fi
+  fieldtest_init_layout
+  fieldtest_detect_env || true
+  fieldtest_require_pool_appendable_tapes fieldtest-a 1 "soak loop"
   nohup bash "$(fieldtest_script_dir)/50-soak.sh" --loop >/dev/null 2>&1 9>&- &
   echo $! >"$pidfile"
   fieldtest_evidence_record "$SCRIPT_NAME" start PASS "soak loop started" "$pidfile"

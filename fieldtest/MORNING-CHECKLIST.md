@@ -2,8 +2,9 @@
 
 ## Bring
 - [ ] `remanence-fieldtest.tar.gz` (scp it to the HPE server, or USB)
-- [ ] Scratch LTO-9 cartridges (they WILL be destroyed): 2 for append smoke,
-      6 for the core benchmark pitch, 10+ for the full default Phase 1/2 flow
+- [ ] Scratch LTO-9 cartridges (they WILL be destroyed): 2 for the core
+      append/correctness/benchmark path, 4+ for recovery spares, 6+ for
+      destructive lifecycle tests and longer soak
 - [ ] The CLN cartridge
 - [ ] This checklist; the full story is `RUNBOOK.md`, and the quick same-day
       plan is `TODAY-MSL3040-GUIDE.md`
@@ -49,11 +50,13 @@ read its message — it says exactly what to run first. Sequence:
    skip already-done tapes, evidence appends.
 
 ## If time collapses, run in this order
-With 6+ scratch data tapes: Phase 0 + 11-happy-path + 13-append-loop +
-20-bench-write + 22-bench-dual carry the management pitch. With only 2 scratch
-data tapes: Phase 0 + 11-happy-path + 13-append-loop + 30-stewardship +
-31-cleaning + 32-robotics. Then add 40-faults kill-mid-write + rebuild only if
-unused ready media remains.
+With 2 scratch data tapes: Phase 0 + 11-happy-path + 13-append-loop +
+12-multiobject + 20-bench-write + 21-bench-read + 22-bench-dual carry the
+management pitch. Add 30-stewardship + 31-cleaning + 32-robotics before
+collection. A 2-tape run has no spare-media margin; if one pool's only tape is
+fenced, add media. With 4+ tapes, add 40-faults kill-mid-write + rebuild +
+wrong-tape. Keep retire-rebind for the end because it intentionally recycles a
+cartridge.
 
 ## Before you leave the site
 ```bash
