@@ -10,8 +10,11 @@ conflicts before object rows become visible. The third code slice exposes
 locator-derived `AppendCommitInfo` through gRPC `ObjectRecord`, CLI locator
 JSON, and `remfield-io` write evidence; journal ordinal, position proof, voltag,
 sealed-after-write, and remaining-capacity fields are omitted/null until durable
-append records land. Durable append records, explicit device reposition/position proof,
-idempotency, system scenario coverage, fieldtest append loops, and MTA-2 parity
+append records land. The fourth code slice adds the physical fieldtest
+`13-append-loop.sh` and updates the same-day runbooks to prove repeated
+same-tape no-parity appends without requiring many fresh cartridges. Durable
+append records, explicit device reposition/position proof, idempotency, system
+scenario coverage, append-specific rebuild/kill evidence, and MTA-2 parity
 append remain pending gates.
 **Problem source:** physical MSL3040 field-test preparation exposed that the
 current pool writer treats a committed cartridge as unavailable for further
@@ -762,7 +765,8 @@ EOM.
   `caller_object_id`.
 - Add `ObjectRecord.append_commit_info` to daemon/CLI/field JSON.
 - Add unit tests, `scenario-append`, and fieldtest `13-append-loop.sh` plus
-  append-specific rebuild/kill evidence.
+  append-specific rebuild/kill evidence. The fieldtest append loop is present;
+  `scenario-append` and append-specific rebuild/kill evidence remain pending.
 
 ### MTA-2 -- parity append/resume
 
