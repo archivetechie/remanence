@@ -70,8 +70,10 @@ write_fixture_object() {
 kill_mid_write() {
   local serial workdir source object locator daemon_pid writer_pid payload_bytes
   serial="$(fieldtest_selected_library_serial)"
-  workdir="$(mktemp -d "$(fieldtest_spool_dir)/fault-kill-${RANDOM}.XXXXXX")"
   payload_bytes="$(default_fault_bytes)"
+  fieldtest_require_pool_writable_tapes fieldtest-a 1 "kill-mid-write fixture write"
+  fieldtest_require_pool_writable_tapes fieldtest-b 1 "kill-mid-write interrupted write"
+  workdir="$(mktemp -d "$(fieldtest_spool_dir)/fault-kill-${RANDOM}.XXXXXX")"
   IFS='|' read -r source object locator < <(write_fixture_object "$workdir" "$payload_bytes")
   (fieldtest_capture_json "$workdir/write.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$object" --pool fieldtest-b; echo $? >"$workdir/write.rc") &
   writer_pid=$!
@@ -94,6 +96,7 @@ kill_mid_write() {
 rebuild_catalog() {
   local serial workdir
   serial="$(fieldtest_selected_library_serial)"
+  fieldtest_require_pool_writable_tapes fieldtest-a 1 "rebuild fault fixture write"
   workdir="$(mktemp -d "$(fieldtest_spool_dir)/fault-rebuild-${RANDOM}.XXXXXX")"
   IFS='|' read -r _ fixture locator < <(write_fixture_object "$workdir" "${FIELD_FAULT_REBUILD_BYTES:-268435456}")
   "$(fieldtest_script_dir)/03-bringup.sh" --stop >/dev/null 2>&1 || true

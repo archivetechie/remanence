@@ -1,7 +1,9 @@
 # Remanence field test — HPE MSL3040 + 2× LTO-9 — one-day runbook
 
 **Target:** RHEL 9 HPE server, SAS-attached MSL3040, 2× LTO-9 drives,
-4+ scratch LTO-9 cartridges + 1 CLN cleaning cartridge.
+6+ scratch LTO-9 cartridges for the core benchmark pitch, 10+ for the full
+default Phase 1/2 flow, plus 1 CLN cleaning cartridge. Four scratch cartridges
+are enough for smoke/correctness and stewardship only.
 **Duration:** 12 hours, phased, with GO/NO-GO gates and skip pointers.
 **Prime directive:** every result lands in `evidence/` automatically —
 the day produces a management-ready test record, not just a feeling.
@@ -55,6 +57,23 @@ per the tier plan below.
 
 The slow ZFS-over-QSAN mount is deliberately NOT used as a benchmark
 source anywhere else.
+
+### Scratch media budget
+
+Each write-oriented script needs at least one unused ready cartridge in its
+target pool. `10-init-pools.sh` splits allowlisted data barcodes between
+`fieldtest-a` and `fieldtest-b`; the scripts now fail early with a
+`media-budget` record if the target pool has no unused ready tape.
+
+| Scratch data tapes | Practical plan |
+|---:|---|
+| 4 | Phase 0, `11-happy-path`, stewardship, cleaning, robotics. Run only one extra write-heavy step if a pool still has unused media. |
+| 6 | Phase 0, `11-happy-path`, `20-bench-write`, `22-bench-dual`, then collect evidence. |
+| 8 | Core pitch plus exactly one of `12-multiobject`, `21-bench-read`, or one write-heavy fault test. |
+| 10+ | Full default Phase 1 and Phase 2 with the default pool split. Bring more for all fault tests and soak writes. |
+
+If media runs out, add allowlisted scratch tapes and rerun `10-init-pools.sh`
+before restarting the daemon, or skip lower-priority write-heavy phases.
 
 ---
 
@@ -118,7 +137,7 @@ land far below, the script's diagnostics section distinguishes
 source-disk starvation vs tape-path problems (it records both disk and
 tape rates).
 
-**If short on time:** run 2.1 and 2.3 only — one-drive write + dual
+**If short on time and you have 6+ scratch tapes:** run 2.1 and 2.3 only — one-drive write + dual
 aggregate are the two numbers management will remember.
 
 ---
@@ -186,7 +205,8 @@ on. A refused unsafe operation is a PASS.
 
 ## Priorities if the day compresses
 
-**Must (the pitch survives):** Phase 0, 1, 2.1+2.3.
+**Must (the pitch survives with 6+ scratch tapes):** Phase 0, 1.1, 2.1+2.3.
+With only 4 scratch tapes, do Phase 0, 1.1, 3.1, 3.3, 3.4, then collect.
 **Should:** 4.1, 4.2 (the two recovery stories), 3.3 (real cleaning).
 **Nice:** everything else. The soak runs itself regardless.
 
