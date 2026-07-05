@@ -10,6 +10,12 @@ open Aeneas Aeneas.Std Result
 
 namespace parity_state_verif
 
+/- Formal-proof scope:
+   the theorems below certify the extracted pure parity-state decision core
+   against SPEC.md T1-T5. They do not prove the whole tape/catalog subsystem.
+   If the mirrored Rust logic changes, update the extraction and rerun
+   `lake build`; the Rust drift_guard is intended to catch stale proofs. -/
+
 lemma checked_add_some_of_sum_lt (s c : Std.U64)
     (h : s.val + c.val < 2 ^ 64) :
     ∃ end1, U64.checked_add s c = some end1 ∧ end1.val = s.val + c.val := by
