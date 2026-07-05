@@ -3369,7 +3369,6 @@ pub(crate) fn status_from_pool_write_error(err: PoolWriteError) -> Status {
         PoolWriteError::State(state) => status_from_state_error(state),
         PoolWriteError::InvalidInput(_) => Status::invalid_argument(message),
         PoolWriteError::MissingTapeGeometry(_) => Status::failed_precondition(message),
-        PoolWriteError::NoParityAppendUnsupported { .. } => Status::failed_precondition(message),
         PoolWriteError::ParityAppendUnsupported { .. } => Status::failed_precondition(message),
         PoolWriteError::SelectedTapeInsufficientCapacity { .. } => {
             Status::failed_precondition(message)
