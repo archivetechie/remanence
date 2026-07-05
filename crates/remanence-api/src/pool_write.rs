@@ -1416,42 +1416,55 @@ fn commit_pool_write(
         .iter()
         .map(native_object_file_projection)
         .collect::<Vec<_>>();
-    state.project_native_object_and_committed_tape_file_bundle(
-        NativeObjectProjectionInput {
-            object_id: write_report.catalog.object.object_id.clone(),
-            caller_object_id: Some(write_report.catalog.object.caller_object_id.clone()),
-            body_format: write_report.catalog.object.body_format.clone(),
-            logical_size_bytes: Some(write_report.catalog.object.logical_size_bytes),
-            content_hash: Some(prepared.content_sha256.to_vec()),
-            metadata_hash,
-            created_at_utc: Some(prepared.write_timestamp.clone()),
-        },
-        &file_projections,
-        &[NativeObjectCopyProjectionInput {
-            object_id: write_report.catalog.object_copy.object_id.clone(),
-            tape_uuid: selected.tape_uuid,
-            tape_file_number: write_report.catalog.object_copy.tape_file_number,
-            first_body_lba,
-            first_parity_data_ordinal: projection.first_parity_data_ordinal,
-            protected_until_ordinal: projection.protected_until_ordinal,
-            status: "committed".to_string(),
-            representation: projection.copy_representation.representation.to_string(),
-            key_id: projection
-                .copy_representation
-                .key_id
-                .map(|key_id| key_id.to_vec()),
-            metadata_frame_len: projection.copy_representation.metadata_frame_len,
-            plaintext_digest: Some(write_report.catalog.object_copy.plaintext_digest.to_vec()),
-            stored_digest: Some(write_report.catalog.object_copy.stored_digest.to_vec()),
-        }],
-        TapeJournalIndexInput {
-            tape_uuid: selected.tape_uuid,
-            block_size: selected.block_size,
-            scheme: projection.scheme,
-            journal_offset_bytes: 0,
-        },
-        &write_report.catalog.tape_file_bundle,
-    )?;
+    let object_projection = NativeObjectProjectionInput {
+        object_id: write_report.catalog.object.object_id.clone(),
+        caller_object_id: Some(write_report.catalog.object.caller_object_id.clone()),
+        body_format: write_report.catalog.object.body_format.clone(),
+        logical_size_bytes: Some(write_report.catalog.object.logical_size_bytes),
+        content_hash: Some(prepared.content_sha256.to_vec()),
+        metadata_hash,
+        created_at_utc: Some(prepared.write_timestamp.clone()),
+    };
+    let copy_projection = NativeObjectCopyProjectionInput {
+        object_id: write_report.catalog.object_copy.object_id.clone(),
+        tape_uuid: selected.tape_uuid,
+        tape_file_number: write_report.catalog.object_copy.tape_file_number,
+        first_body_lba,
+        first_parity_data_ordinal: projection.first_parity_data_ordinal,
+        protected_until_ordinal: projection.protected_until_ordinal,
+        status: "committed".to_string(),
+        representation: projection.copy_representation.representation.to_string(),
+        key_id: projection
+            .copy_representation
+            .key_id
+            .map(|key_id| key_id.to_vec()),
+        metadata_frame_len: projection.copy_representation.metadata_frame_len,
+        plaintext_digest: Some(write_report.catalog.object_copy.plaintext_digest.to_vec()),
+        stored_digest: Some(write_report.catalog.object_copy.stored_digest.to_vec()),
+    };
+    let tape_input = TapeJournalIndexInput {
+        tape_uuid: selected.tape_uuid,
+        block_size: selected.block_size,
+        scheme: projection.scheme,
+        journal_offset_bytes: 0,
+    };
+    if tape_input.scheme.is_none() {
+        state.project_native_object_append_commit(
+            object_projection,
+            &file_projections,
+            &[copy_projection],
+            tape_input,
+            &write_report.catalog.tape_file_bundle,
+        )?;
+    } else {
+        state.project_native_object_and_committed_tape_file_bundle(
+            object_projection,
+            &file_projections,
+            &[copy_projection],
+            tape_input,
+            &write_report.catalog.tape_file_bundle,
+        )?;
+    }
     seal_selected_tape_if_needed(state, selected, pool_cfg, hardware_early_warning)?;
     Ok(())
 }

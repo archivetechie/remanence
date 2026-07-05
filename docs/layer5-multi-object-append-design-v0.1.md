@@ -3,9 +3,13 @@
 **Status:** panel folded + verify-r1 fixes applied (2026-07-05);
 MTA-1 implementation started. The first code slice enables core no-parity
 pool-write/catalog append for sequential objects on the same tape session.
-Durable append records, explicit device reposition/position proof, API append
-evidence, idempotency, system scenario coverage, fieldtest append loops, and
-MTA-2 parity append remain pending gates.
+The second code slice adds a strict no-parity live append projection path that
+rejects non-contiguous tape-file extension, overlapping tape-file rows,
+geometry/protection mismatch, non-ready tape state, and object/copy identity
+conflicts before object rows become visible. Durable append records, explicit
+device reposition/position proof, API append evidence, idempotency, system
+scenario coverage, fieldtest append loops, and MTA-2 parity append remain
+pending gates.
 **Problem source:** physical MSL3040 field-test preparation exposed that the
 current pool writer treats a committed cartridge as unavailable for further
 pool writes. That was acceptable for S4a "write one object", but it is not
