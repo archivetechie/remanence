@@ -820,17 +820,17 @@ fn write_to_selected_tape_inner<S: BlockSink + ?Sized>(
     let payload_bytes = prepared_payload_bytes(&prepared);
     tracing::info!(
         target: "remanence_write_diag",
-        "remanence_write_diag phase=prepare caller_object_id={:?} pool_id={:?} tape_uuid={} parity={} representation={} payload_bytes={} selected_block_size_bytes={} projected_object_blocks={} elapsed_ms={:.3} throughput_mib_s={:.3}",
-        request.caller_object_id,
-        selected.pool_id,
-        uuid_text(selected.tape_uuid),
-        parity_label(&selected.parity_config),
-        stored.representation_label(),
+        phase = "prepare",
+        pool_id = %selected.pool_id,
+        tape_uuid = %uuid_text(selected.tape_uuid),
+        parity = parity_label(&selected.parity_config),
+        representation = stored.representation_label(),
         payload_bytes,
-        selected.block_size,
-        stored_projected_blocks,
-        crate::diagnostics::duration_ms(prepare_elapsed),
-        crate::diagnostics::mib_per_s(payload_bytes, prepare_elapsed),
+        selected_block_size_bytes = selected.block_size,
+        projected_object_blocks = stored_projected_blocks,
+        elapsed_ms = crate::diagnostics::duration_ms(prepare_elapsed),
+        throughput_mib_s = crate::diagnostics::mib_per_s(payload_bytes, prepare_elapsed),
+        "remanence_write_diag",
     );
 
     // Only the hardware-backed tape transfer below is counted live. The spool
@@ -1881,7 +1881,7 @@ fn parity_label(parity: &ParityConfig) -> &'static str {
 }
 
 fn log_transfer_diagnostics(
-    request: &WriteObjectToPoolRequest,
+    _request: &WriteObjectToPoolRequest,
     selected: &SelectedTape,
     prepared: &PreparedPoolObject,
     stored_projected_blocks: u64,
@@ -1890,27 +1890,30 @@ fn log_transfer_diagnostics(
     let payload_bytes = prepared_payload_bytes(prepared);
     tracing::info!(
         target: "remanence_write_diag",
-        "remanence_write_diag phase=transfer caller_object_id={:?} pool_id={:?} tape_uuid={} parity={} status={} error={:?} payload_bytes={} selected_block_size_bytes={} format_chunk_size_bytes={} projected_object_blocks={} sink_write_bytes={} block_write_calls={} min_block_bytes={} max_block_bytes={} filemark_calls={} filemarks={} position_calls={} early_warning={} scsi_write_cdb=WRITE6_VARIABLE drive_write_per_block_read_position=true write_filemarks_immed=false elapsed_ms={:.3} throughput_mib_s={:.3}",
-        request.caller_object_id,
-        selected.pool_id,
-        uuid_text(selected.tape_uuid),
-        parity_label(&selected.parity_config),
-        outcome.status,
-        outcome.error.unwrap_or(""),
+        phase = "transfer",
+        pool_id = %selected.pool_id,
+        tape_uuid = %uuid_text(selected.tape_uuid),
+        parity = parity_label(&selected.parity_config),
+        status = outcome.status,
+        error = outcome.error.unwrap_or(""),
         payload_bytes,
-        selected.block_size,
-        prepared.options.chunk_size,
-        stored_projected_blocks,
-        outcome.stats.block_write_bytes,
-        outcome.stats.block_write_calls,
-        outcome.stats.min_block_bytes.unwrap_or(0),
-        outcome.stats.max_block_bytes.unwrap_or(0),
-        outcome.stats.filemark_calls,
-        outcome.stats.filemarks,
-        outcome.stats.position_calls,
-        outcome.stats.early_warning,
-        crate::diagnostics::duration_ms(outcome.elapsed),
-        crate::diagnostics::mib_per_s(payload_bytes, outcome.elapsed),
+        selected_block_size_bytes = selected.block_size,
+        format_chunk_size_bytes = prepared.options.chunk_size,
+        projected_object_blocks = stored_projected_blocks,
+        sink_write_bytes = outcome.stats.block_write_bytes,
+        block_write_calls = outcome.stats.block_write_calls,
+        min_block_bytes = outcome.stats.min_block_bytes.unwrap_or(0),
+        max_block_bytes = outcome.stats.max_block_bytes.unwrap_or(0),
+        filemark_calls = outcome.stats.filemark_calls,
+        filemarks = outcome.stats.filemarks,
+        position_calls = outcome.stats.position_calls,
+        early_warning = outcome.stats.early_warning,
+        scsi_write_cdb = "WRITE6_VARIABLE",
+        drive_write_per_block_read_position = true,
+        write_filemarks_immed = false,
+        elapsed_ms = crate::diagnostics::duration_ms(outcome.elapsed),
+        throughput_mib_s = crate::diagnostics::mib_per_s(payload_bytes, outcome.elapsed),
+        "remanence_write_diag",
     );
 }
 
@@ -1922,7 +1925,7 @@ struct TransferDiagnosticOutcome<'a> {
 }
 
 fn log_commit_diagnostics(
-    request: &WriteObjectToPoolRequest,
+    _request: &WriteObjectToPoolRequest,
     selected: &SelectedTape,
     prepared: &PreparedPoolObject,
     elapsed: Duration,
@@ -1932,16 +1935,16 @@ fn log_commit_diagnostics(
     let payload_bytes = prepared_payload_bytes(prepared);
     tracing::info!(
         target: "remanence_write_diag",
-        "remanence_write_diag phase=commit caller_object_id={:?} pool_id={:?} tape_uuid={} parity={} status={} error={:?} payload_bytes={} elapsed_ms={:.3} throughput_mib_s={:.3}",
-        request.caller_object_id,
-        selected.pool_id,
-        uuid_text(selected.tape_uuid),
-        parity_label(&selected.parity_config),
+        phase = "commit",
+        pool_id = %selected.pool_id,
+        tape_uuid = %uuid_text(selected.tape_uuid),
+        parity = parity_label(&selected.parity_config),
         status,
-        error.unwrap_or(""),
+        error = error.unwrap_or(""),
         payload_bytes,
-        crate::diagnostics::duration_ms(elapsed),
-        crate::diagnostics::mib_per_s(payload_bytes, elapsed),
+        elapsed_ms = crate::diagnostics::duration_ms(elapsed),
+        throughput_mib_s = crate::diagnostics::mib_per_s(payload_bytes, elapsed),
+        "remanence_write_diag",
     );
 }
 

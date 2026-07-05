@@ -52,7 +52,7 @@ tokio-stream        = "0.1"
 toml                = "0.8"
 tower               = "0.5"
 tracing             = "0.1"
-tracing-subscriber  = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber  = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 uuid                = { version = "1", features = ["serde", "v4"] }
 xattr               = "1.6.1"
 x509-parser         = "0.18.1"
