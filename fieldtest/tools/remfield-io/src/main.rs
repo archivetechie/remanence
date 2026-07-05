@@ -667,7 +667,36 @@ fn write_result_json(record: &pb::ObjectRecord, pool_id: &str, bytes: u64, secon
         "bytes": bytes,
         "seconds": seconds,
         "mb_s": mb_s(bytes, seconds),
+        "append_commit_info": append_commit_info_json(record.append_commit_info.as_ref()),
     })
+}
+
+fn append_commit_info_json(info: Option<&pb::AppendCommitInfo>) -> Value {
+    match info {
+        Some(info) => json!({
+            "append_mode": append_mode_name(info.append_mode),
+            "tape_uuid": bytes_to_hex(&info.tape_uuid),
+            "voltag": info.voltag.as_deref(),
+            "tape_file_number": info.tape_file_number,
+            "first_body_lba": info.first_body_lba,
+            "position_before_lba": info.position_before_lba,
+            "position_after_lba": info.position_after_lba,
+            "journal_record_ordinal": info.journal_record_ordinal,
+            "estimated_remaining_bytes": info.estimated_remaining_bytes,
+            "sealed_after_write": info.sealed_after_write,
+        }),
+        None => Value::Null,
+    }
+}
+
+fn append_mode_name(value: i32) -> &'static str {
+    match pb::AppendMode::try_from(value).unwrap_or(pb::AppendMode::Unspecified) {
+        pb::AppendMode::Fresh => "fresh",
+        pb::AppendMode::Append => "append",
+        pb::AppendMode::ResumeControl => "resume_control",
+        pb::AppendMode::Seal => "seal",
+        pb::AppendMode::Unspecified => "unspecified",
+    }
 }
 
 fn parse_uuid_or_hex(value: &str) -> AppResult<[u8; 16]> {
@@ -776,4 +805,74 @@ fn print_json_error(message: String) {
     let line = serde_json::to_string(&json!({ "error": message }))
         .unwrap_or_else(|_| "{\"error\":\"failed to serialize error\"}".to_string());
     eprintln!("{line}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_result_json_surfaces_append_commit_info() {
+        let record = pb::ObjectRecord {
+            object_id: Uuid::nil().as_bytes().to_vec(),
+            caller_object_id: "caller-object".to_string(),
+            content_sha256: vec![0x22; 32],
+            logical_size_bytes: 64,
+            body_format: "rao-v1".to_string(),
+            caller_metadata: Default::default(),
+            created_at: None,
+            copies: vec![pb::ObjectCopy {
+                tape_uuid: vec![0x44; 16],
+                tape_file_number: 3,
+                first_body_lba: 9,
+                last_verified_at: None,
+                health: pb::object_copy::Health::ObjectCopyHealthOk as i32,
+                pool_id: "camera.copy-a".to_string(),
+            }],
+            append_commit_info: Some(pb::AppendCommitInfo {
+                append_mode: pb::AppendMode::Append as i32,
+                tape_uuid: vec![0x44; 16],
+                voltag: None,
+                tape_file_number: 3,
+                first_body_lba: 9,
+                position_before_lba: None,
+                position_after_lba: None,
+                journal_record_ordinal: None,
+                estimated_remaining_bytes: None,
+                sealed_after_write: None,
+            }),
+        };
+
+        let value = write_result_json(&record, "camera.copy-a", 64, 2.0);
+        let info = &value["append_commit_info"];
+        assert_eq!(info["append_mode"].as_str().unwrap(), "append");
+        assert_eq!(
+            info["tape_uuid"].as_str().unwrap(),
+            "44444444444444444444444444444444"
+        );
+        assert!(info["voltag"].is_null());
+        assert_eq!(info["tape_file_number"].as_u64().unwrap(), 3);
+        assert_eq!(info["first_body_lba"].as_u64().unwrap(), 9);
+        assert!(info["position_before_lba"].is_null());
+        assert!(info["position_after_lba"].is_null());
+        assert!(info["journal_record_ordinal"].is_null());
+        assert!(info["estimated_remaining_bytes"].is_null());
+        assert!(info["sealed_after_write"].is_null());
+    }
+
+    #[test]
+    fn append_mode_name_maps_all_known_values() {
+        assert_eq!(
+            append_mode_name(pb::AppendMode::Unspecified as i32),
+            "unspecified"
+        );
+        assert_eq!(append_mode_name(pb::AppendMode::Fresh as i32), "fresh");
+        assert_eq!(append_mode_name(pb::AppendMode::Append as i32), "append");
+        assert_eq!(
+            append_mode_name(pb::AppendMode::ResumeControl as i32),
+            "resume_control"
+        );
+        assert_eq!(append_mode_name(pb::AppendMode::Seal as i32), "seal");
+        assert_eq!(append_mode_name(i32::MAX), "unspecified");
+    }
 }

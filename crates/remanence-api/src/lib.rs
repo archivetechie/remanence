@@ -3055,6 +3055,10 @@ fn tape_pool_to_proto(record: TapePoolRecord) -> pb::TapePool {
 }
 
 fn object_record_to_proto(record: NativeObjectRecord) -> Result<pb::ObjectRecord, Status> {
+    let append_commit_info = record
+        .copies
+        .first()
+        .map(append_commit_info_from_native_copy);
     Ok(pb::ObjectRecord {
         object_id: encode_uuid_text(record.object_id.as_str())?,
         caller_object_id: record.caller_object_id.unwrap_or_default(),
@@ -3064,6 +3068,7 @@ fn object_record_to_proto(record: NativeObjectRecord) -> Result<pb::ObjectRecord
         caller_metadata: std::collections::HashMap::new(),
         created_at: timestamp_from_rfc3339(record.created_at_utc.as_str()),
         copies: record.copies.iter().map(object_copy_to_proto).collect(),
+        append_commit_info,
     })
 }
 
@@ -3080,6 +3085,30 @@ fn object_copy_to_proto(copy: &NativeObjectCopyRecord) -> pb::ObjectCopy {
         last_verified_at: None,
         health: health as i32,
         pool_id: copy.pool_id.clone().unwrap_or_default(),
+    }
+}
+
+pub(crate) fn append_mode_for_tape_file_number(tape_file_number: u64) -> pb::AppendMode {
+    match tape_file_number {
+        0 => pb::AppendMode::Unspecified,
+        1 => pb::AppendMode::Fresh,
+        _ => pb::AppendMode::Append,
+    }
+}
+
+fn append_commit_info_from_native_copy(copy: &NativeObjectCopyRecord) -> pb::AppendCommitInfo {
+    let tape_file_number = u64::from(copy.tape_file_number);
+    pb::AppendCommitInfo {
+        append_mode: append_mode_for_tape_file_number(tape_file_number) as i32,
+        tape_uuid: copy.tape_uuid.clone(),
+        voltag: None,
+        tape_file_number,
+        first_body_lba: copy.first_body_lba,
+        position_before_lba: None,
+        position_after_lba: None,
+        journal_record_ordinal: None,
+        estimated_remaining_bytes: None,
+        sealed_after_write: None,
     }
 }
 
@@ -3580,6 +3609,78 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    #[test]
+    fn object_record_to_proto_carries_append_commit_info() {
+        let record = NativeObjectRecord {
+            object_id: OBJECT_ID_TEXT.to_string(),
+            caller_object_id: Some("caller-object".to_string()),
+            body_format: "rao-v1".to_string(),
+            logical_size_bytes: Some(456),
+            content_hash: Some(vec![0x33; 32]),
+            metadata_hash: None,
+            created_at_utc: "2026-07-05T00:00:00Z".to_string(),
+            copies: vec![NativeObjectCopyRecord {
+                object_id: OBJECT_ID_TEXT.to_string(),
+                tape_uuid: TAPE_UUID.to_vec(),
+                tape_file_number: 2,
+                first_body_lba: 7,
+                first_parity_data_ordinal: None,
+                protected_until_ordinal: None,
+                status: "committed".to_string(),
+                pool_id: Some("camera.copy-a".to_string()),
+                representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+                key_id: None,
+                metadata_frame_len: None,
+                plaintext_digest: Some(vec![0x33; 32]),
+                stored_digest: Some(vec![0x33; 32]),
+            }],
+        };
+
+        let proto = object_record_to_proto(record).expect("object record to proto");
+        let info = proto
+            .append_commit_info
+            .expect("append commit info from first copy");
+        assert_eq!(info.append_mode, pb::AppendMode::Append as i32);
+        assert_eq!(info.tape_uuid, TAPE_UUID.to_vec());
+        assert_eq!(info.tape_file_number, 2);
+        assert_eq!(info.first_body_lba, 7);
+        assert_eq!(info.position_before_lba, None);
+        assert_eq!(info.position_after_lba, None);
+        assert_eq!(info.journal_record_ordinal, None);
+    }
+
+    #[test]
+    fn append_mode_for_tape_file_number_handles_unset_and_append_files() {
+        assert_eq!(
+            append_mode_for_tape_file_number(0),
+            pb::AppendMode::Unspecified
+        );
+        assert_eq!(append_mode_for_tape_file_number(1), pb::AppendMode::Fresh);
+        assert_eq!(append_mode_for_tape_file_number(2), pb::AppendMode::Append);
+    }
+
+    #[test]
+    fn object_record_without_append_info_decodes_as_absent() {
+        use prost::Message as _;
+
+        let record = pb::ObjectRecord {
+            object_id: Uuid::nil().as_bytes().to_vec(),
+            caller_object_id: String::new(),
+            content_sha256: vec![0x11; 32],
+            logical_size_bytes: 10,
+            body_format: "rao-v1".to_string(),
+            caller_metadata: Default::default(),
+            created_at: None,
+            copies: Vec::new(),
+            append_commit_info: None,
+        };
+        let mut encoded = Vec::new();
+        record.encode(&mut encoded).expect("encode object record");
+
+        let decoded = pb::ObjectRecord::decode(encoded.as_slice()).expect("decode object record");
+        assert!(decoded.append_commit_info.is_none());
     }
 
     #[tokio::test]
@@ -6725,6 +6826,7 @@ BCw3Wyv2UWY=
                             caller_metadata: Default::default(),
                             created_at: None,
                             copies: Vec::new(),
+                            append_commit_info: None,
                         }));
                     }
                     _ => panic!("unexpected drive command"),

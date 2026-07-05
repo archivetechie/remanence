@@ -583,6 +583,27 @@ message TapeFile {
   bytes object_id              = 5;
 }
 
+enum AppendMode {
+  APPEND_MODE_UNSPECIFIED    = 0;
+  APPEND_MODE_FRESH          = 1;
+  APPEND_MODE_APPEND         = 2;
+  APPEND_MODE_RESUME_CONTROL = 3;
+  APPEND_MODE_SEAL           = 4;
+}
+
+message AppendCommitInfo {
+  AppendMode append_mode              = 1;
+  bytes tape_uuid                     = 2;
+  optional string voltag              = 3;
+  uint64 tape_file_number             = 4;
+  uint64 first_body_lba               = 5;
+  optional uint64 position_before_lba = 6;
+  optional uint64 position_after_lba  = 7;
+  optional uint64 journal_record_ordinal = 8;
+  optional uint64 estimated_remaining_bytes = 9;
+  optional bool sealed_after_write    = 10;
+}
+
 // One object's catalog-level record. Body-format-agnostic.
 message ObjectRecord {
   bytes object_id              = 1;  // Remanence-assigned UUID
@@ -596,6 +617,7 @@ message ObjectRecord {
   map<string, string> caller_metadata = 6;
   google.protobuf.Timestamp created_at = 7;
   repeated ObjectCopy copies   = 8;
+  AppendCommitInfo append_commit_info = 9;
 }
 
 message ObjectCopy {
