@@ -3,28 +3,33 @@
 //! This crate is a standalone, dependency-free copy of
 //! `remanence-parity/src/model.rs`'s `ObjectParityState` /
 //! `ObjectParityStateUpdateRange` decision logic, kept in the exact shape the
-//! Charon → Aeneas → Lean pipeline can translate. Only the error type differs
-//! from the original (`ParityError` here carries just the `Invariant` variant,
-//! the only one these functions construct).
+//! Charon → Aeneas → Lean pipeline can translate. Control flow is identical
+//! to the original; three mechanical deviations keep the Lean output free of
+//! unprovable axioms:
+//! 1. `ParityError::Invariant(&'static str)` becomes payload-free named
+//!    variants (`str` is outside the Aeneas subset).
+//! 2. `.checked_add(..).ok_or(..)?` and `.map(Some)` become explicit matches
+//!    (Aeneas axiomatizes `Option::ok_or`/`Result::map` instead of defining
+//!    them, which would make theorems about these functions unprovable).
+//! 3. `as_catalog_str` and the `Debug`/`Display` trait impls are test-only.
 //!
 //! The `drift_guard` test asserts the decision-logic snippets in this file are
 //! byte-identical to the ones in `crates/remanence-parity/src/model.rs`; if
 //! that test fails, the original moved and this extraction (and its Lean
 //! proofs) must be re-synced.
 
-/// Invariant-violation error, mirroring `ParityError::Invariant` — the only
-/// variant the extracted functions can produce.
+/// Invariant-violation error. The original `ParityError::Invariant` carries a
+/// `&'static str` message; `str` values are outside the Aeneas-translatable
+/// subset, so the extraction names each message as a payload-free variant.
+/// Control flow is identical to the original.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParityError {
-    Invariant(&'static str),
-}
-
-impl core::fmt::Display for ParityError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Invariant(msg) => write!(f, "parity invariant violated: {msg}"),
-        }
-    }
+    /// "… requires at least one data block"
+    ZeroDataBlocks,
+    /// "object ordinal range overflows"
+    OrdinalRangeOverflow,
+    /// "protection watermark cannot move backwards"
+    WatermarkMovedBackwards,
 }
 
 /// Catalog-facing parity protection summary for one object.
@@ -56,9 +61,7 @@ impl ObjectParityStateUpdateRange {
         new_highest_protected_ordinal: u64,
     ) -> Result<Option<Self>, ParityError> {
         if new_highest_protected_ordinal < old_highest_protected_ordinal {
-            return Err(ParityError::Invariant(
-                "protection watermark cannot move backwards",
-            ));
+            return Err(ParityError::WatermarkMovedBackwards);
         }
         if new_highest_protected_ordinal == old_highest_protected_ordinal {
             return Ok(None);
@@ -87,13 +90,13 @@ impl ObjectParityStateUpdateRange {
         data_block_count: u64,
     ) -> Result<bool, ParityError> {
         if data_block_count == 0 {
-            return Err(ParityError::Invariant(
-                "object parity state update range requires at least one data block",
-            ));
+            return Err(ParityError::ZeroDataBlocks);
         }
-        let ordinal_end_exclusive = first_parity_data_ordinal
-            .checked_add(data_block_count)
-            .ok_or(ParityError::Invariant("object ordinal range overflows"))?;
+        let ordinal_end_exclusive = match first_parity_data_ordinal.checked_add(data_block_count)
+        {
+            Some(end) => end,
+            None => return Err(ParityError::OrdinalRangeOverflow),
+        };
 
         Ok(
             first_parity_data_ordinal < self.first_parity_data_ordinal_upper_exclusive()
@@ -111,12 +114,14 @@ impl ObjectParityStateUpdateRange {
         if !self.includes_object(first_parity_data_ordinal, data_block_count)? {
             return Ok(None);
         }
-        ObjectParityState::from_ordinals(
+        match ObjectParityState::from_ordinals(
             first_parity_data_ordinal,
             data_block_count,
             self.new_highest_protected_ordinal,
-        )
-        .map(Some)
+        ) {
+            Ok(state) => Ok(Some(state)),
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -129,14 +134,14 @@ impl ObjectParityState {
         highest_protected_ordinal: u64,
     ) -> Result<Self, ParityError> {
         if data_block_count == 0 {
-            return Err(ParityError::Invariant(
-                "object parity state requires at least one data block",
-            ));
+            return Err(ParityError::ZeroDataBlocks);
         }
 
-        let ordinal_end_exclusive = first_parity_data_ordinal
-            .checked_add(data_block_count)
-            .ok_or(ParityError::Invariant("object ordinal range overflows"))?;
+        let ordinal_end_exclusive = match first_parity_data_ordinal.checked_add(data_block_count)
+        {
+            Some(end) => end,
+            None => return Err(ParityError::OrdinalRangeOverflow),
+        };
 
         if ordinal_end_exclusive <= highest_protected_ordinal {
             Ok(Self::Protected)
@@ -147,6 +152,12 @@ impl ObjectParityState {
         }
     }
 
+}
+
+/// Test-only: `str`-returning helpers are outside the Aeneas subset and not
+/// part of the verified surface.
+#[cfg(test)]
+impl ObjectParityState {
     /// Stable catalog string for `catalog_objects.parity_state`.
     pub fn as_catalog_str(self) -> &'static str {
         match self {
@@ -181,8 +192,9 @@ mod tests {
             // watermark-advance guards
             "        if new_highest_protected_ordinal < old_highest_protected_ordinal {",
             "        if new_highest_protected_ordinal == old_highest_protected_ordinal {\n            return Ok(None);\n        }",
-            // recompute_object delegation
-            "        if !self.includes_object(first_parity_data_ordinal, data_block_count)? {\n            return Ok(None);\n        }\n        ObjectParityState::from_ordinals(\n            first_parity_data_ordinal,\n            data_block_count,\n            self.new_highest_protected_ordinal,\n        )\n        .map(Some)",
+            // recompute_object delegation (guard only; the extraction expands
+            // `.map(Some)` to a match — see the module doc)
+            "        if !self.includes_object(first_parity_data_ordinal, data_block_count)? {\n            return Ok(None);\n        }",
         ];
         for (i, snippet) in snippets.iter().enumerate() {
             assert!(
@@ -226,10 +238,10 @@ mod tests {
     #[test]
     fn object_parity_state_rejects_invalid_catalog_ranges() {
         let zero = ObjectParityState::from_ordinals(10, 0, 10).unwrap_err();
-        assert!(format!("{zero}").contains("at least one data block"));
+        assert_eq!(zero, ParityError::ZeroDataBlocks);
 
         let overflow = ObjectParityState::from_ordinals(u64::MAX, 1, u64::MAX).unwrap_err();
-        assert!(format!("{overflow}").contains("ordinal range overflows"));
+        assert_eq!(overflow, ParityError::OrdinalRangeOverflow);
     }
 
     #[test]
@@ -273,15 +285,12 @@ mod tests {
         );
 
         let backwards = ObjectParityStateUpdateRange::from_watermark_advance(8, 4).unwrap_err();
-        assert!(
-            format!("{backwards}").contains("cannot move backwards"),
-            "{backwards}"
-        );
+        assert_eq!(backwards, ParityError::WatermarkMovedBackwards);
 
         let range = ObjectParityStateUpdateRange::from_watermark_advance(4, 8)
             .unwrap()
             .unwrap();
         let zero = range.includes_object(4, 0).unwrap_err();
-        assert!(format!("{zero}").contains("at least one data block"));
+        assert_eq!(zero, ParityError::ZeroDataBlocks);
     }
 }

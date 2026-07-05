@@ -1,0 +1,12 @@
+name = "parity_state"
+version = "0.1.0"
+defaultTargets = ["ParityState"]
+
+# Local Aeneas checkout (see ~/toolchains/TOOLCHAIN.md). Machine-specific for
+# the pilot; pin to a GitHub rev if this outlives the pilot.
+[[require]]
+name = "aeneas"
+path = "/home/user/toolchains/aeneas/backends/lean"
+
+[[lean_lib]]
+name = "ParityState"
