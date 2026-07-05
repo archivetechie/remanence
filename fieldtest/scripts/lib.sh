@@ -672,7 +672,7 @@ EOF
   cat >"$config" <<'EOF'
 [daemon]
 state_dir = "/tmp/remfield-selftest/state"
-default_idle_timeout_seconds = 1800
+default_idle_timeout_seconds = 120
 read_only = false
 socket_path = "/tmp/remfield-selftest/rem.sock"
 
@@ -830,7 +830,7 @@ def rule_block(barcode, pool):
 parts = [
     "[daemon]",
     f'state_dir = "{home / "state"}"',
-    "default_idle_timeout_seconds = 1800",
+    "default_idle_timeout_seconds = 120",
     "read_only = false",
     f'socket_path = "{home / "rem.sock"}"',
     "",

@@ -83,7 +83,7 @@ bench_write_case() {
   top_stop="$out_path.stop"
   mkdir -p "$(dirname -- "$out_path")"
   : >"$top_stop"
-  sample_top "$top_stop" &
+  sample_top "$top_stop" 9>&- &
   local sampler_pid=$!
   start="$(python3 -c 'import time; print(f"{time.monotonic():.9f}")')"
   if ! fieldtest_capture_json "$out_path" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$source" --pool "$pool"; then
