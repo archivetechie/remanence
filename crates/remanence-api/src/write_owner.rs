@@ -1120,11 +1120,12 @@ fn handle_drive_open_write(
         }
         tracing::info!(
             target: "remanence_write_diag",
-            "remanence_write_diag phase=drive_load session_id={} tape_uuid={} block_size_bytes={} elapsed_ms={:.3}",
-            session_id,
-            Uuid::from_bytes(selected.tape_uuid),
-            selected.block_size,
-            crate::diagnostics::duration_ms(load_started.elapsed()),
+            phase = "drive_load",
+            session_id = %session_id,
+            tape_uuid = %Uuid::from_bytes(selected.tape_uuid),
+            block_size_bytes = selected.block_size,
+            elapsed_ms = crate::diagnostics::duration_ms(load_started.elapsed()),
+            "remanence_write_diag",
         );
     }
 
@@ -1136,12 +1137,13 @@ fn handle_drive_open_write(
     }
     tracing::info!(
         target: "remanence_write_diag",
-        "remanence_write_diag phase=drive_open_actor session_id={} tape_uuid={} needs_drive_load={} block_size_bytes={} elapsed_ms={:.3}",
-        session_id,
-        Uuid::from_bytes(tape_uuid),
+        phase = "drive_open_actor",
+        session_id = %session_id,
+        tape_uuid = %Uuid::from_bytes(tape_uuid),
         needs_drive_load,
-        selected.block_size,
-        crate::diagnostics::duration_ms(actor_open_started.elapsed()),
+        block_size_bytes = selected.block_size,
+        elapsed_ms = crate::diagnostics::duration_ms(actor_open_started.elapsed()),
+        "remanence_write_diag",
     );
 
     let opened_at_utc = now_rfc3339().unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
@@ -1246,19 +1248,19 @@ fn handle_drive_open_write(
                         }
                         tracing::info!(
                             target: "remanence_write_diag",
-                            "remanence_write_diag phase=drive_append_total session_id={} caller_object_id={:?} tape_uuid={} payload_bytes={} block_size_bytes={} replay={} elapsed_ms={:.3} throughput_mib_s={:.3}",
-                            session_id,
-                            result.object.caller_object_id,
-                            Uuid::from_bytes(tape_uuid),
-                            logical_size,
-                            selected.block_size,
+                            phase = "drive_append_total",
+                            session_id = %session_id,
+                            tape_uuid = %Uuid::from_bytes(tape_uuid),
+                            payload_bytes = logical_size,
+                            block_size_bytes = selected.block_size,
                             replay,
-                            crate::diagnostics::duration_ms(append_elapsed),
-                            if replay {
+                            elapsed_ms = crate::diagnostics::duration_ms(append_elapsed),
+                            throughput_mib_s = if replay {
                                 0.0
                             } else {
                                 crate::diagnostics::mib_per_s(logical_size, append_elapsed)
                             },
+                            "remanence_write_diag",
                         );
                         let _ = reply.send(Ok(result.object.to_proto()));
                     }
@@ -1266,14 +1268,16 @@ fn handle_drive_open_write(
                         append_gate.record_failure();
                         tracing::info!(
                             target: "remanence_write_diag",
-                            "remanence_write_diag phase=drive_append_total session_id={} tape_uuid={} payload_bytes={} block_size_bytes={} status=error error={:?} elapsed_ms={:.3} throughput_mib_s={:.3}",
-                            session_id,
-                            Uuid::from_bytes(tape_uuid),
-                            logical_size,
-                            selected.block_size,
-                            err.to_string(),
-                            crate::diagnostics::duration_ms(append_elapsed),
-                            crate::diagnostics::mib_per_s(logical_size, append_elapsed),
+                            phase = "drive_append_total",
+                            session_id = %session_id,
+                            tape_uuid = %Uuid::from_bytes(tape_uuid),
+                            payload_bytes = logical_size,
+                            block_size_bytes = selected.block_size,
+                            status = "error",
+                            error = %err,
+                            elapsed_ms = crate::diagnostics::duration_ms(append_elapsed),
+                            throughput_mib_s = crate::diagnostics::mib_per_s(logical_size, append_elapsed),
+                            "remanence_write_diag",
                         );
                         let _ = reply.send(Err(status_from_pool_write_error(err)));
                     }
@@ -1493,20 +1497,21 @@ fn prepare_drive_for_write(
         .map_err(|err| Status::internal(format!("set fixed-block config: {err}")))?;
     tracing::info!(
         target: "remanence_write_diag",
-        "remanence_write_diag phase=drive_prepare session_id={} tape_uuid={} selected_block_size_bytes={} prior_block_size={:?} prior_compression={} target_block_size={:?} target_compression={} rewind_verify_ms={:.3} verify_bootstrap_ms={:.3} rewind_write_ms={:.3} read_config_ms={:.3} write_config_ms={:.3} elapsed_ms={:.3}",
-        session_id,
-        Uuid::from_bytes(*tape_uuid),
-        block_size,
-        current_cfg.block_size,
-        current_cfg.compression,
-        target_cfg.block_size,
-        target_cfg.compression,
-        crate::diagnostics::duration_ms(rewind_verify_elapsed),
-        crate::diagnostics::duration_ms(verify_elapsed),
-        crate::diagnostics::duration_ms(rewind_write_elapsed),
-        crate::diagnostics::duration_ms(read_config_elapsed),
-        crate::diagnostics::duration_ms(write_config_started.elapsed()),
-        crate::diagnostics::duration_ms(prepare_started.elapsed()),
+        phase = "drive_prepare",
+        session_id = %session_id,
+        tape_uuid = %Uuid::from_bytes(*tape_uuid),
+        selected_block_size_bytes = block_size,
+        prior_block_size = ?current_cfg.block_size,
+        prior_compression = current_cfg.compression,
+        target_block_size = ?target_cfg.block_size,
+        target_compression = target_cfg.compression,
+        rewind_verify_ms = crate::diagnostics::duration_ms(rewind_verify_elapsed),
+        verify_bootstrap_ms = crate::diagnostics::duration_ms(verify_elapsed),
+        rewind_write_ms = crate::diagnostics::duration_ms(rewind_write_elapsed),
+        read_config_ms = crate::diagnostics::duration_ms(read_config_elapsed),
+        write_config_ms = crate::diagnostics::duration_ms(write_config_started.elapsed()),
+        elapsed_ms = crate::diagnostics::duration_ms(prepare_started.elapsed()),
+        "remanence_write_diag",
     );
     Ok(())
 }

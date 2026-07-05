@@ -234,18 +234,19 @@ async fn open_write_session_reserved(
     let session_id = uuid_from_proto(&session.session_id, "session_id")?;
     tracing::info!(
         target: "remanence_write_diag",
-        "remanence_write_diag phase=mount_open session_id={} pool_id={:?} tape_uuid={} bay={} needs_drive_load={} selection_attempts={} selection_ms={:.3} resolve_ms={:.3} changer_move_ms={:.3} actor_open_ms={:.3} elapsed_ms={:.3}",
-        session_id,
-        pool_id_for_diag,
-        Uuid::from_bytes(tape_uuid),
-        mount.bay,
-        mount.needs_drive_load,
-        select_attempts,
-        crate::diagnostics::duration_ms(select_elapsed),
-        crate::diagnostics::duration_ms(resolve_elapsed),
+        phase = "mount_open",
+        session_id = %session_id,
+        pool_id = %pool_id_for_diag,
+        tape_uuid = %Uuid::from_bytes(tape_uuid),
+        bay = mount.bay,
+        needs_drive_load = mount.needs_drive_load,
+        selection_attempts = select_attempts,
+        selection_ms = crate::diagnostics::duration_ms(select_elapsed),
+        resolve_ms = crate::diagnostics::duration_ms(resolve_elapsed),
         changer_move_ms,
-        crate::diagnostics::duration_ms(actor_open_elapsed),
-        crate::diagnostics::duration_ms(open_elapsed),
+        actor_open_ms = crate::diagnostics::duration_ms(actor_open_elapsed),
+        elapsed_ms = crate::diagnostics::duration_ms(open_elapsed),
+        "remanence_write_diag",
     );
     pool.record_session(
         session_id,
@@ -469,14 +470,15 @@ async fn close_write_like_critical(
     let close_elapsed = close_started.elapsed();
     tracing::info!(
         target: "remanence_write_diag",
-        "remanence_write_diag phase=close_unmount session_id={} abort={} unload_before_close={} move_home={} actor_close_ms={:.3} finish_mount_ms={:.3} elapsed_ms={:.3}",
-        session_id,
+        phase = "close_unmount",
+        session_id = %session_id,
         abort,
         unload_before_close,
         move_home,
-        crate::diagnostics::duration_ms(actor_close_elapsed),
-        crate::diagnostics::duration_ms(finish_elapsed),
-        crate::diagnostics::duration_ms(close_elapsed),
+        actor_close_ms = crate::diagnostics::duration_ms(actor_close_elapsed),
+        finish_mount_ms = crate::diagnostics::duration_ms(finish_elapsed),
+        elapsed_ms = crate::diagnostics::duration_ms(close_elapsed),
+        "remanence_write_diag",
     );
     Ok(session)
 }
