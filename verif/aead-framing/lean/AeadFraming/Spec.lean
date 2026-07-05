@@ -13,8 +13,9 @@ set_option linter.unusedSimpArgs false
 
 namespace AeadFraming
 
-/- Formal-proof scope:
-   these theorems certify the extracted pure RAO AEAD framing arithmetic:
+/- Formal-proof scope for this extraction:
+   this is the verification claim attached to the AEAD framing proof. These
+   theorems certify the extracted pure RAO AEAD framing arithmetic:
    chunk-count validation, payload-frame length, stored-size rounding,
    ciphertext offsets, plaintext range validation, non-empty range planning,
    and keyless inspect geometry. They do not prove ChaCha20-Poly1305 security,
