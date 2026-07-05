@@ -2,8 +2,8 @@
 
 ## Bring
 - [ ] `remanence-fieldtest.tar.gz` (scp it to the HPE server, or USB)
-- [ ] Scratch LTO-9 cartridges (they WILL be destroyed): 4 for smoke, 6 for
-      the core benchmark pitch, 10+ for the full default Phase 1/2 flow
+- [ ] Scratch LTO-9 cartridges (they WILL be destroyed): 2 for append smoke,
+      6 for the core benchmark pitch, 10+ for the full default Phase 1/2 flow
 - [ ] The CLN cartridge
 - [ ] This checklist; the full story is `RUNBOOK.md`, and the quick same-day
       plan is `TODAY-MSL3040-GUIDE.md`
@@ -24,7 +24,7 @@ read its message — it says exactly what to run first. Sequence:
 
 ```
 00-preflight → 01-allowlist → 10-init-pools → 03-bringup → 02-discovery
-→ 11-happy-path → 12-multiobject → 50-soak start
+→ 11-happy-path → 13-append-loop → 12-multiobject → 50-soak start
 → 20/21/22 benchmarks → 30-stewardship (+ --tapealert-probe)
 → 31-cleaning → 32-robotics → 40-faults (each subcommand)
 → 50-soak report → 90-collect-evidence → 91-cleanup
@@ -49,10 +49,11 @@ read its message — it says exactly what to run first. Sequence:
    skip already-done tapes, evidence appends.
 
 ## If time collapses, run in this order
-With 6+ scratch data tapes: Phase 0 + 11-happy-path + 20-bench-write +
-22-bench-dual carry the management pitch. With only 4 scratch data tapes:
-Phase 0 + 11-happy-path + 30-stewardship + 31-cleaning + 32-robotics. Then
-add 40-faults kill-mid-write + rebuild only if unused ready media remains.
+With 6+ scratch data tapes: Phase 0 + 11-happy-path + 13-append-loop +
+20-bench-write + 22-bench-dual carry the management pitch. With only 2 scratch
+data tapes: Phase 0 + 11-happy-path + 13-append-loop + 30-stewardship +
+31-cleaning + 32-robotics. Then add 40-faults kill-mid-write + rebuild only if
+unused ready media remains.
 
 ## Before you leave the site
 ```bash

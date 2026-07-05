@@ -12,6 +12,8 @@ hardware window closes.
   tape identity checks.
 - Data path: archive build, tape write, catalog lookup, tape read, SHA-256
   fidelity, range restore, encrypted object write/read/verify.
+- Same-tape append: repeated independent object writes to one pool, dense
+  tape-file numbers, read-back SHA-256 verification for every appended object.
 - Capacity and speed: incompressible writes, compressible writes, read timing,
   range-read timing, and dual-drive aggregate write.
 - Operations: drive catalog, health snapshots, TapeAlert probe, cleaning
@@ -24,20 +26,25 @@ hardware window closes.
 
 ## Media budget
 
-Each write-oriented script needs at least one unused ready tape in its target
-pool. `10-init-pools.sh` splits allowlisted data barcodes into `fieldtest-a`
-and `fieldtest-b`; with the default split, bring this many scratch LTO-9 tapes:
+Most write-oriented scripts still need at least one unused ready tape in their
+target pool. The append-loop script is different: it needs one ready appendable
+tape and deliberately reuses it after committed objects exist. `10-init-pools.sh`
+splits allowlisted data barcodes into `fieldtest-a` and `fieldtest-b`; bring
+this many scratch LTO-9 tapes:
 
 | Scratch data tapes | Recommended use today |
 |---:|---|
-| 4 | Smoke/correctness only: Phase 0, `11-happy-path`, stewardship, cleaning, robotics. You can run one extra write-heavy test only if a pool still has an unused tape. |
-| 6 | Core management pitch: Phase 0, `11-happy-path`, `20-bench-write`, `22-bench-dual`, then collect evidence. |
+| 2 | Append smoke: run `10-init-pools.sh --count 2`, then Phase 0, `11-happy-path`, `13-append-loop`, stewardship, cleaning, robotics. |
+| 4 | Core single-drive pitch: Phase 0, `11-happy-path`, `13-append-loop`, `20-bench-write`, stewardship, cleaning, collect evidence. |
+| 6 | Core management pitch: add `22-bench-dual`, then collect evidence. |
 | 8 | Core pitch plus exactly one of `12-multiobject`, `21-bench-read`, or one write-heavy fault test. |
 | 10+ | Full default Phase 1 and Phase 2 flow with the default pool split. Bring more if you want all fault tests and soak writes. |
 
-If a script says `need ... unused ready tape(s)`, do not override it. Add
-allowlisted scratch cartridges and run `10-init-pools.sh` before bringing the
-daemon back up, or skip to a lower-priority phase.
+If a script says `need ... unused ready tape(s)`, do not override it. If
+`13-append-loop.sh` says it needs an appendable ready tape, a used ready tape is
+acceptable by design. Add allowlisted scratch cartridges and run
+`10-init-pools.sh` before bringing the daemon back up, or skip to a
+lower-priority phase.
 
 ## Fast run order
 
@@ -54,23 +61,37 @@ green. Then physically load the scratch data tapes plus the CLN cartridge.
 
 ```bash
 ./scripts/01-allowlist.sh
-./scripts/10-init-pools.sh
+./scripts/10-init-pools.sh        # use --count 2 if you brought two data tapes
 ./scripts/03-bringup.sh
 ./scripts/02-discovery.sh
 ```
+
+For a two-data-tape append smoke run, use `./scripts/10-init-pools.sh --count 2`.
 
 At this point the daemon owns the robotics. Do not let another backup job,
 admin tool, or second Remanence daemon touch the library.
 
 ## Priority plan for today
 
-With 4 scratch data tapes:
+With 2 scratch data tapes:
 
 ```bash
 ./scripts/11-happy-path.sh
+./scripts/13-append-loop.sh
 ./scripts/30-stewardship.sh
 ./scripts/31-cleaning.sh
 ./scripts/32-robotics.sh
+./scripts/90-collect-evidence.sh
+```
+
+With 4 scratch data tapes, add the single-drive write benchmark:
+
+```bash
+./scripts/11-happy-path.sh
+./scripts/13-append-loop.sh
+./scripts/20-bench-write.sh
+./scripts/30-stewardship.sh
+./scripts/31-cleaning.sh
 ./scripts/90-collect-evidence.sh
 ```
 
@@ -78,6 +99,7 @@ With 6 scratch data tapes, run the management-pitch path:
 
 ```bash
 ./scripts/11-happy-path.sh
+./scripts/13-append-loop.sh
 ./scripts/20-bench-write.sh
 ./scripts/22-bench-dual.sh
 ./scripts/30-stewardship.sh
@@ -90,6 +112,7 @@ path:
 
 ```bash
 ./scripts/11-happy-path.sh
+./scripts/13-append-loop.sh
 ./scripts/12-multiobject.sh
 ./scripts/20-bench-write.sh
 ./scripts/21-bench-read.sh
