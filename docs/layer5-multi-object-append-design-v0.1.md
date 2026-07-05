@@ -13,9 +13,11 @@ sealed-after-write, and remaining-capacity fields are omitted/null until durable
 append records land. The fourth code slice adds the physical fieldtest
 `13-append-loop.sh` and updates the same-day runbooks to prove repeated
 same-tape no-parity appends without requiring many fresh cartridges. Durable
-append records, explicit device reposition/position proof, idempotency, system
-scenario coverage, append-specific rebuild/kill evidence, and MTA-2 parity
-append remain pending gates.
+append records, explicit device reposition/position proof, system scenario
+coverage, append-specific rebuild/kill evidence, and MTA-2 parity append remain
+pending gates. The fifth code slice implements MTA-1 `(pool_id,
+caller_object_id)` replay semantics for non-empty caller ids and keeps empty
+caller ids accepted but non-idempotent.
 **Problem source:** physical MSL3040 field-test preparation exposed that the
 current pool writer treats a committed cartridge as unavailable for further
 pool writes. That was acceptable for S4a "write one object", but it is not
@@ -762,7 +764,10 @@ EOM.
   journal.
 - Add fail-closed append projection rules.
 - Add `(pool_id, caller_object_id)` replay behavior for non-empty
-  `caller_object_id`.
+  `caller_object_id`. Implemented in the pool write core: same pool/caller and
+  same content returns the committed object/copy without tape I/O; same
+  pool/caller with different content returns conflict; empty caller ids remain
+  accepted but non-idempotent.
 - Add `ObjectRecord.append_commit_info` to daemon/CLI/field JSON.
 - Add unit tests, `scenario-append`, and fieldtest `13-append-loop.sh` plus
   append-specific rebuild/kill evidence. The fieldtest append loop is present;
@@ -797,8 +802,9 @@ EOM.
    special unjournaled bootstrap prefix.
 3. **Journal payload:** must be full Layer 5 `AppendCommitRecord`, not only
    `CommittedBundle`.
-4. **Idempotency:** `(pool_id, caller_object_id)` replay behavior moves to
-   MTA-1 for non-empty caller IDs.
+4. **Idempotency:** `(pool_id, caller_object_id)` replay behavior is in MTA-1
+   for non-empty caller IDs; empty caller IDs remain accepted but explicitly
+   non-idempotent.
 5. **Fieldtest updates:** move to MTA-1 acceptance criteria.
 6. **Parity checkpoint/final:** appendable tapes checkpoint; sealed tapes
    `finish()` and become non-appendable.

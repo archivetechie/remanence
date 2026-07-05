@@ -5373,11 +5373,11 @@ BCw3Wyv2UWY=
         assert_eq!(copy.pool_id, "camera.copy-a");
         assert_eq!(
             copy.tape_file_number,
-            u64::from(result.write_report.object_close.tape_file_number)
+            u64::from(result.expect_write_report().object_close.tape_file_number)
         );
         assert_eq!(
             copy.first_body_lba,
-            result.write_report.catalog.files[0]
+            result.expect_write_report().catalog.files[0]
                 .first_chunk_lba
                 .expect("payload lba")
                 .0
@@ -5401,7 +5401,7 @@ BCw3Wyv2UWY=
             Some(copy.pool_id.as_str())
         );
         assert_eq!(committed.copies[0].first_body_lba, copy.first_body_lba);
-        let projected_file = &result.write_report.catalog.files[0];
+        let projected_file = &result.expect_write_report().catalog.files[0];
         let committed_file = index
             .get_native_object_file(
                 result.object.object_id_text().as_str(),
@@ -5422,15 +5422,16 @@ BCw3Wyv2UWY=
         assert_eq!(committed_file.chunk_count, projected_file.chunk_count);
 
         let object_block_start = 1usize;
-        let object_block_count = usize::try_from(result.write_report.object_close.data_block_count)
-            .expect("object block count fits usize");
+        let object_block_count =
+            usize::try_from(result.expect_write_report().object_close.data_block_count)
+                .expect("object block count fits usize");
         let object_blocks =
             tape_sink.blocks[object_block_start..object_block_start + object_block_count].to_vec();
         let mut object_source = VecBlockSource::new(object_blocks);
         let restore = restore_object_to_directory(
             &mut object_source,
             API_SESSION_BLOCK_SIZE as usize,
-            result.write_report.layout.projected_size_blocks,
+            result.expect_write_report().layout.projected_size_blocks,
             &restore_dir,
             FilesystemRestoreOptions::default(),
         )
@@ -5473,7 +5474,7 @@ BCw3Wyv2UWY=
         assert_eq!(tape_sink.filemarks, vec![1, 1]);
         assert_eq!(
             result
-                .write_report
+                .expect_write_report()
                 .catalog
                 .object_copy
                 .first_parity_data_ordinal,
@@ -5481,7 +5482,7 @@ BCw3Wyv2UWY=
         );
         assert_eq!(
             result
-                .write_report
+                .expect_write_report()
                 .catalog
                 .object_copy
                 .protected_until_ordinal,
@@ -5499,7 +5500,7 @@ BCw3Wyv2UWY=
         let read = read_rem_tar_object(
             &mut source,
             API_SESSION_BLOCK_SIZE as usize,
-            result.write_report.layout.projected_size_blocks,
+            result.expect_write_report().layout.projected_size_blocks,
         )
         .expect("read no-parity RAO object");
         assert_eq!(
@@ -5522,7 +5523,7 @@ BCw3Wyv2UWY=
             .expect("committed no-parity object exists");
         assert_eq!(
             committed.metadata_hash.as_deref(),
-            Some(&result.write_report.catalog.object.manifest_sha256[..])
+            Some(&result.expect_write_report().catalog.object.manifest_sha256[..])
         );
         assert_eq!(committed.copies.len(), 1);
         assert_eq!(committed.copies[0].first_parity_data_ordinal, None);
@@ -5571,7 +5572,7 @@ BCw3Wyv2UWY=
             .metadata_frame_len
             .expect("metadata frame length");
         let bootstrap_row = result
-            .write_report
+            .expect_write_report()
             .object_close
             .bootstrap_object_row
             .as_ref()
@@ -5603,13 +5604,14 @@ BCw3Wyv2UWY=
             Some(metadata_frame_len)
         );
 
-        let stored_block_count = usize::try_from(result.write_report.object_close.data_block_count)
-            .expect("stored block count fits usize");
+        let stored_block_count =
+            usize::try_from(result.expect_write_report().object_close.data_block_count)
+                .expect("stored block count fits usize");
         let mut source = VecBlockSource::new(tape_sink.blocks[1..1 + stored_block_count].to_vec());
         let opened = read_encrypted_rao_object(
             &mut source,
             API_SESSION_BLOCK_SIZE as usize,
-            result.write_report.object_close.data_block_count,
+            result.expect_write_report().object_close.data_block_count,
             &root_key,
         )
         .expect("decrypt encrypted RAO object");
@@ -5743,7 +5745,7 @@ BCw3Wyv2UWY=
         .expect("write plaintext custom-block object");
 
         assert_eq!(
-            plaintext.write_report.layout.chunk_size,
+            plaintext.expect_write_report().layout.chunk_size,
             CUSTOM_BLOCK_SIZE as usize
         );
         assert_eq!(
@@ -5760,15 +5762,22 @@ BCw3Wyv2UWY=
                 .block_size,
             Some(u64::from(CUSTOM_BLOCK_SIZE))
         );
-        let plaintext_block_count =
-            usize::try_from(plaintext.write_report.object_close.data_block_count)
-                .expect("plaintext object block count fits usize");
+        let plaintext_block_count = usize::try_from(
+            plaintext
+                .expect_write_report()
+                .object_close
+                .data_block_count,
+        )
+        .expect("plaintext object block count fits usize");
         let mut plaintext_source =
             VecBlockSource::new(plaintext_sink.blocks[1..1 + plaintext_block_count].to_vec());
         let plaintext_read = read_rem_tar_object(
             &mut plaintext_source,
             CUSTOM_BLOCK_SIZE as usize,
-            plaintext.write_report.object_close.data_block_count,
+            plaintext
+                .expect_write_report()
+                .object_close
+                .data_block_count,
         )
         .expect("read plaintext custom-block RAO object");
         assert_eq!(
@@ -5819,7 +5828,7 @@ BCw3Wyv2UWY=
         .expect("write encrypted custom-block object");
 
         assert_eq!(
-            encrypted.write_report.layout.chunk_size,
+            encrypted.expect_write_report().layout.chunk_size,
             CUSTOM_BLOCK_SIZE as usize
         );
         assert_eq!(
@@ -5836,15 +5845,22 @@ BCw3Wyv2UWY=
                 .block_size,
             Some(u64::from(CUSTOM_BLOCK_SIZE))
         );
-        let encrypted_block_count =
-            usize::try_from(encrypted.write_report.object_close.data_block_count)
-                .expect("encrypted object block count fits usize");
+        let encrypted_block_count = usize::try_from(
+            encrypted
+                .expect_write_report()
+                .object_close
+                .data_block_count,
+        )
+        .expect("encrypted object block count fits usize");
         let mut encrypted_source =
             VecBlockSource::new(encrypted_sink.blocks[1..1 + encrypted_block_count].to_vec());
         let opened = read_encrypted_rao_object(
             &mut encrypted_source,
             CUSTOM_BLOCK_SIZE as usize,
-            encrypted.write_report.object_close.data_block_count,
+            encrypted
+                .expect_write_report()
+                .object_close
+                .data_block_count,
             &root_key,
         )
         .expect("decrypt encrypted custom-block RAO object");
@@ -6178,7 +6194,8 @@ BCw3Wyv2UWY=
         assert_eq!(second.object.copies[0].tape_uuid, POOL_WRITE_TAPE_UUID);
         assert_eq!(second.object.copies[0].tape_file_number, 2);
         assert_eq!(
-            second.write_report.object_close.tape_file_number, 2,
+            second.expect_write_report().object_close.tape_file_number,
+            2,
             "append report must carry the real tape file number"
         );
         assert_eq!(
@@ -6205,14 +6222,16 @@ BCw3Wyv2UWY=
         assert_eq!(tape.last_committed_tape_file, Some(2));
         assert_eq!(
             tape.total_committed_ordinals,
-            first.write_report.object_close.data_block_count
-                + second.write_report.object_close.data_block_count
+            first.expect_write_report().object_close.data_block_count
+                + second.expect_write_report().object_close.data_block_count
         );
 
-        let first_blocks = usize::try_from(first.write_report.object_close.data_block_count)
-            .expect("first block count fits usize");
-        let second_blocks = usize::try_from(second.write_report.object_close.data_block_count)
-            .expect("second block count fits usize");
+        let first_blocks =
+            usize::try_from(first.expect_write_report().object_close.data_block_count)
+                .expect("first block count fits usize");
+        let second_blocks =
+            usize::try_from(second.expect_write_report().object_close.data_block_count)
+                .expect("second block count fits usize");
         let second_start = 1 + first_blocks;
         let mut second_source = VecBlockSource::new(
             tape_sink.blocks[second_start..second_start + second_blocks].to_vec(),
@@ -6220,12 +6239,212 @@ BCw3Wyv2UWY=
         let read = read_rem_tar_object(
             &mut second_source,
             API_SESSION_BLOCK_SIZE as usize,
-            second.write_report.layout.projected_size_blocks,
+            second.expect_write_report().layout.projected_size_blocks,
         )
         .expect("read appended no-parity RAO object");
         assert_eq!(
             read.entry("second.bin").expect("second entry").data,
             second_payload
+        );
+    }
+
+    #[test]
+    fn pool_write_replays_same_pool_caller_object_id_without_tape_io() {
+        let mut index = test_index();
+        project_pool(&mut index, "scenario-a");
+        project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
+        let source_dir = temp_dir("remanence-api-caller-replay-src");
+        let source_path = source_dir.join("payload.bin");
+        let payload = b"same caller id replay payload".to_vec();
+        std::fs::write(&source_path, &payload).expect("write source payload");
+        let cfg = pool_config("scenario-a");
+        let mut tape_sink = VecBlockSink::new();
+
+        let first = write_object_to_pool(
+            &mut index,
+            &mut tape_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source_path: source_path.clone(),
+                archive_path: "payload.bin".into(),
+                caller_object_id: "caller-replay".to_string(),
+                expected_content_sha256: None,
+                representation: PoolWriteRepresentation::Plaintext,
+            },
+        )
+        .expect("first write succeeds");
+        assert!(!first.is_replay());
+        let blocks_after_first = tape_sink.blocks.len();
+        let filemarks_after_first = tape_sink.filemarks.clone();
+
+        let replay = write_object_to_pool(
+            &mut index,
+            &mut tape_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source_path,
+                archive_path: "payload.bin".into(),
+                caller_object_id: "caller-replay".to_string(),
+                expected_content_sha256: None,
+                representation: PoolWriteRepresentation::Plaintext,
+            },
+        )
+        .expect("same caller/content replay succeeds");
+
+        assert!(replay.is_replay());
+        assert!(replay.write_report().is_none());
+        assert_eq!(replay.object, first.object);
+        assert_eq!(tape_sink.blocks.len(), blocks_after_first);
+        assert_eq!(tape_sink.filemarks, filemarks_after_first);
+        assert_eq!(
+            index
+                .list_native_objects()
+                .expect("list native objects")
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .list_tape_files(&POOL_WRITE_TAPE_UUID)
+                .expect("list tape files")
+                .len(),
+            2,
+            "replay must not append another object tape file"
+        );
+    }
+
+    #[test]
+    fn pool_write_conflicts_same_pool_caller_object_id_with_different_content() {
+        let mut index = test_index();
+        project_pool(&mut index, "scenario-a");
+        project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
+        let source_dir = temp_dir("remanence-api-caller-conflict-src");
+        let first_path = source_dir.join("first.bin");
+        let second_path = source_dir.join("second.bin");
+        let first_payload = b"first caller id payload".to_vec();
+        let second_payload = b"second caller id payload".to_vec();
+        std::fs::write(&first_path, &first_payload).expect("write first payload");
+        std::fs::write(&second_path, &second_payload).expect("write second payload");
+        let cfg = pool_config("scenario-a");
+        let mut tape_sink = VecBlockSink::new();
+
+        let first = write_object_to_pool(
+            &mut index,
+            &mut tape_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source_path: first_path,
+                archive_path: "payload.bin".into(),
+                caller_object_id: "caller-conflict".to_string(),
+                expected_content_sha256: None,
+                representation: PoolWriteRepresentation::Plaintext,
+            },
+        )
+        .expect("first write succeeds");
+        let blocks_after_first = tape_sink.blocks.len();
+        let filemarks_after_first = tape_sink.filemarks.clone();
+
+        let err = write_object_to_pool(
+            &mut index,
+            &mut tape_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source_path: second_path,
+                archive_path: "payload.bin".into(),
+                caller_object_id: "caller-conflict".to_string(),
+                expected_content_sha256: None,
+                representation: PoolWriteRepresentation::Plaintext,
+            },
+        )
+        .expect_err("same caller with different content must conflict");
+
+        match err {
+            PoolWriteError::CallerObjectIdConflict {
+                pool_id,
+                caller_object_id,
+                existing_content_sha256,
+                requested_content_sha256,
+            } => {
+                assert_eq!(pool_id, "scenario-a");
+                assert_eq!(caller_object_id, "caller-conflict");
+                assert_eq!(
+                    existing_content_sha256,
+                    bytes_to_hex(&sha256_bytes(&first_payload))
+                );
+                assert_eq!(
+                    requested_content_sha256,
+                    bytes_to_hex(&sha256_bytes(&second_payload))
+                );
+            }
+            other => panic!("unexpected pool write error: {other}"),
+        }
+        assert_eq!(first.object.caller_object_id, "caller-conflict");
+        assert_eq!(tape_sink.blocks.len(), blocks_after_first);
+        assert_eq!(tape_sink.filemarks, filemarks_after_first);
+        assert_eq!(
+            index
+                .list_native_objects()
+                .expect("list native objects")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn pool_write_empty_caller_object_id_remains_non_idempotent() {
+        let mut index = test_index();
+        project_pool(&mut index, "scenario-a");
+        project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
+        let source_dir = temp_dir("remanence-api-empty-caller-src");
+        let source_path = source_dir.join("payload.bin");
+        std::fs::write(&source_path, b"empty caller may duplicate").expect("write payload");
+        let cfg = pool_config("scenario-a");
+        let mut tape_sink = VecBlockSink::new();
+
+        let first = write_object_to_pool(
+            &mut index,
+            &mut tape_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source_path: source_path.clone(),
+                archive_path: "payload.bin".into(),
+                caller_object_id: String::new(),
+                expected_content_sha256: None,
+                representation: PoolWriteRepresentation::Plaintext,
+            },
+        )
+        .expect("first empty-caller write succeeds");
+        let second = write_object_to_pool(
+            &mut index,
+            &mut tape_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source_path,
+                archive_path: "payload.bin".into(),
+                caller_object_id: String::new(),
+                expected_content_sha256: None,
+                representation: PoolWriteRepresentation::Plaintext,
+            },
+        )
+        .expect("second empty-caller write succeeds");
+
+        assert!(!first.is_replay());
+        assert!(!second.is_replay());
+        assert_ne!(first.object.object_id, second.object.object_id);
+        assert_eq!(first.object.copies[0].tape_file_number, 1);
+        assert_eq!(second.object.copies[0].tape_file_number, 2);
+        assert_eq!(
+            index
+                .list_native_objects()
+                .expect("list native objects")
+                .len(),
+            2
         );
     }
 
@@ -6285,7 +6504,7 @@ BCw3Wyv2UWY=
                     total_committed_ordinals
                 } if tape_uuid == &Uuid::from_bytes(POOL_WRITE_TAPE_UUID).to_string()
                     && total_committed_ordinals
-                        == first.write_report.catalog.tape_file_bundle.total_committed_ordinals
+                        == first.expect_write_report().catalog.tape_file_bundle.total_committed_ordinals
             ),
             "{err}"
         );

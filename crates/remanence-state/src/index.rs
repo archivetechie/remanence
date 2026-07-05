@@ -3258,6 +3258,50 @@ impl CatalogIndex {
         Ok(Some(object))
     }
 
+    /// Fetch a native object by caller id only when it has a committed copy in
+    /// the requested pool.
+    pub fn get_native_object_by_pool_and_caller_object_id(
+        &self,
+        pool_id: &str,
+        caller_object_id: &str,
+    ) -> Result<Option<NativeObjectRecord>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select object_id, caller_object_id, body_format, logical_size_bytes,
+                        content_hash, metadata_hash, created_at_utc
+                 from objects
+                 where caller_object_id = ?1
+                   and exists (
+                     select 1
+                     from object_copies
+                     where object_copies.object_id = objects.object_id
+                       and object_copies.pool_id = ?2
+                       and object_copies.status = 'committed'
+                   )
+                 order by created_at_utc, object_id
+                 limit 1",
+            )
+            .map_err(|err| sqlite_error("prepare native object pool/caller-id lookup", err))?;
+        let mut rows = stmt
+            .query(params![caller_object_id, pool_id])
+            .map_err(|err| sqlite_error("query native object pool/caller-id lookup", err))?;
+        let Some(row) = rows
+            .next()
+            .map_err(|err| sqlite_error("iterate native object pool/caller-id lookup", err))?
+        else {
+            return Ok(None);
+        };
+        let mut object = native_object_from_row(row)?;
+        drop(rows);
+        drop(stmt);
+        object = self.attach_native_object_copies(object)?;
+        object
+            .copies
+            .retain(|copy| copy.pool_id.as_deref() == Some(pool_id) && copy.status == "committed");
+        Ok(Some(object))
+    }
+
     /// Return concrete tape copies for a native object.
     pub fn find_native_object_copies(
         &self,
@@ -10703,6 +10747,119 @@ mod tests {
             index.get_catalog_unit(&unit_id).expect("get catalog unit"),
             Some(units[0].clone())
         );
+    }
+
+    #[test]
+    fn native_object_pool_caller_lookup_scopes_to_committed_pool_copy() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_a = [0xA1; 16];
+        let tape_b = [0xB2; 16];
+        let tape_missing = [0xC3; 16];
+        for pool_id in ["pool-a", "pool-b", "pool-missing"] {
+            index
+                .upsert_tape_pool_projection(TapePoolProjectionInput {
+                    pool_id: pool_id.to_string(),
+                    display_name: None,
+                    copy_class: None,
+                    content_class: None,
+                    created_at_utc: None,
+                })
+                .expect("project pool");
+        }
+        for (tape_uuid, voltag, pool_id) in [
+            (tape_a, "PAA001L9", "pool-a"),
+            (tape_b, "PBB001L9", "pool-b"),
+            (tape_missing, "PMC001L9", "pool-missing"),
+        ] {
+            index
+                .provision_tape(ProvisionTapeInput {
+                    tape_uuid,
+                    voltag: voltag.to_string(),
+                    block_size: 4096,
+                    parity: ParityConfig::None,
+                    force: false,
+                })
+                .expect("provision tape");
+            index
+                .project_tape_pool_membership(tape_uuid, pool_id)
+                .expect("assign tape to pool");
+        }
+        for (object_id, tape_uuid, hash_byte, status) in [
+            (
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                tape_a,
+                0x11,
+                "committed",
+            ),
+            (
+                "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                tape_b,
+                0x22,
+                "committed",
+            ),
+            (
+                "cccccccc-cccc-cccc-cccc-cccccccccccc",
+                tape_missing,
+                0x33,
+                "missing",
+            ),
+        ] {
+            index
+                .upsert_native_object_projection(
+                    NativeObjectProjectionInput {
+                        object_id: object_id.to_string(),
+                        caller_object_id: Some("shared-caller".to_string()),
+                        body_format: "rao-v1".to_string(),
+                        logical_size_bytes: Some(42),
+                        content_hash: Some(vec![hash_byte; 32]),
+                        metadata_hash: Some(vec![0x44; 32]),
+                        created_at_utc: Some("2026-07-05T12:00:00Z".to_string()),
+                    },
+                    &[NativeObjectCopyProjectionInput {
+                        object_id: object_id.to_string(),
+                        tape_uuid,
+                        tape_file_number: 1,
+                        first_body_lba: 0,
+                        first_parity_data_ordinal: None,
+                        protected_until_ordinal: None,
+                        status: status.to_string(),
+                        representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+                        key_id: None,
+                        metadata_frame_len: None,
+                        plaintext_digest: Some(vec![0x55; 32]),
+                        stored_digest: Some(vec![0x55; 32]),
+                    }],
+                )
+                .expect("project native object");
+        }
+
+        let pool_a = index
+            .get_native_object_by_pool_and_caller_object_id("pool-a", "shared-caller")
+            .expect("query pool-a caller")
+            .expect("pool-a object");
+        assert_eq!(pool_a.object_id, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        assert_eq!(pool_a.content_hash.as_deref(), Some(&[0x11; 32][..]));
+        assert_eq!(pool_a.copies.len(), 1);
+        assert_eq!(pool_a.copies[0].pool_id.as_deref(), Some("pool-a"));
+        assert_eq!(pool_a.copies[0].status, "committed");
+
+        let pool_b = index
+            .get_native_object_by_pool_and_caller_object_id("pool-b", "shared-caller")
+            .expect("query pool-b caller")
+            .expect("pool-b object");
+        assert_eq!(pool_b.object_id, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+        assert_eq!(pool_b.content_hash.as_deref(), Some(&[0x22; 32][..]));
+        assert_eq!(pool_b.copies.len(), 1);
+        assert_eq!(pool_b.copies[0].pool_id.as_deref(), Some("pool-b"));
+
+        assert!(index
+            .get_native_object_by_pool_and_caller_object_id("pool-missing", "shared-caller")
+            .expect("query missing-only pool")
+            .is_none());
     }
 
     #[test]

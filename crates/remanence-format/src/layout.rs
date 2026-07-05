@@ -414,7 +414,6 @@ fn metadata_preservation_data(layout: &RemTarFileLayout) -> CborValue {
 fn validate_options(options: &RemTarObjectOptions) -> Result<(), FormatError> {
     validate_chunk_size(options.chunk_size)?;
     validate_non_empty("object_id", &options.object_id)?;
-    validate_non_empty("caller_object_id", &options.caller_object_id)?;
     validate_non_empty("write_timestamp", &options.write_timestamp)?;
     validate_non_empty("manifest_file_id", &options.manifest_file_id)?;
     if options.encryption != "none" {
@@ -675,6 +674,16 @@ mod tests {
             layout.total_size_bytes,
             layout.projected_size_blocks * opts.chunk_size as u64
         );
+    }
+
+    #[test]
+    fn empty_caller_object_id_is_allowed_for_non_idempotent_writes() {
+        let mut opts = options(4096);
+        opts.caller_object_id.clear();
+        let layout = plan_rem_tar_object(&opts, &[file("a.bin", 1)])
+            .expect("empty caller_object_id should be accepted");
+
+        assert_eq!(layout.caller_object_id, "");
     }
 
     #[test]
