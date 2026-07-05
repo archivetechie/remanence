@@ -688,8 +688,6 @@ fn nearest_existing_ancestor(path: &Path) -> Result<PathBuf, StateError> {
 
 #[cfg(target_os = "linux")]
 fn reject_untrusted_volume(configured: &Path, probe: &Path) -> Result<(), StateError> {
-    use nix::libc;
-
     let stats = nix::sys::statfs::statfs(probe).map_err(|err| {
         StateError::io_at(
             "statfs trusted-volume probe",
@@ -697,13 +695,13 @@ fn reject_untrusted_volume(configured: &Path, probe: &Path) -> Result<(), StateE
             std::io::Error::from(err),
         )
     })?;
-    let fs_type = stats.filesystem_type().0;
-    const TMPFS_MAGIC: libc::c_long = 0x0102_1994;
-    const NFS_SUPER_MAGIC: libc::c_long = 0x6969;
-    const SMB_SUPER_MAGIC: libc::c_long = 0x517B;
-    const CIFS_MAGIC_NUMBER: libc::c_long = 0xFF53_4D42;
-    const OVERLAYFS_SUPER_MAGIC: libc::c_long = 0x794C_7630;
-    const RAMFS_MAGIC: libc::c_long = 0x8584_58F6u64 as libc::c_long;
+    let fs_type = stats.filesystem_type().0 as u64;
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    const NFS_SUPER_MAGIC: u64 = 0x6969;
+    const SMB_SUPER_MAGIC: u64 = 0x517B;
+    const CIFS_MAGIC_NUMBER: u64 = 0xFF53_4D42;
+    const OVERLAYFS_SUPER_MAGIC: u64 = 0x794C_7630;
+    const RAMFS_MAGIC: u64 = 0x8584_58F6;
 
     let kind = match fs_type {
         TMPFS_MAGIC => Some("tmpfs"),
