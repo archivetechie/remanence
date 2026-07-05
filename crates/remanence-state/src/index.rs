@@ -6,8 +6,8 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 use remanence_parity::{
-    BootstrapObjectRepresentation, CommittedBundle, CommittedState, ParityConfig, ParityScheme,
-    TapeFileEntry, TapeFileKind,
+    BootstrapObjectRepresentation, CommittedBundle, CommittedBundleKind, CommittedState,
+    ParityConfig, ParityScheme, TapeFileEntry, TapeFileKind,
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use sha2::{Digest, Sha256};
@@ -2154,6 +2154,46 @@ impl CatalogIndex {
         tx.commit().map_err(|err| {
             sqlite_error("commit native object and tape-file bundle projection", err)
         })?;
+        Ok(report)
+    }
+
+    /// Project one live append commit as a strict prefix extension.
+    ///
+    /// This is the MTA-1 append path for live pool writes. Unlike the legacy
+    /// bundle projection used for rebuild and older parity commits, this method
+    /// rejects skipped tape-file numbers, overlapping tape-file rows, geometry
+    /// changes, watermark regressions, and non-writable tape states before any
+    /// object rows become visible.
+    pub fn project_native_object_append_commit(
+        &mut self,
+        object: NativeObjectProjectionInput,
+        files: &[NativeObjectFileProjectionInput],
+        copies: &[NativeObjectCopyProjectionInput],
+        tape_input: TapeJournalIndexInput,
+        bundle: &CommittedBundle,
+    ) -> Result<TapeJournalIndexReport, StateError> {
+        let created_at_utc = match object.created_at_utc.as_deref() {
+            Some(value) => value.to_string(),
+            None => now_utc()?,
+        };
+        let updated_at = now_utc()?;
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|err| sqlite_error("begin native object append projection", err))?;
+        validate_append_bundle_extension_tx(&tx, &tape_input, bundle)?;
+        validate_append_object_conflicts_tx(&tx, &tape_input, bundle, &object, copies)?;
+        upsert_native_object_projection_tx(
+            &tx,
+            &object,
+            Some(files),
+            copies,
+            created_at_utc.as_str(),
+        )?;
+        let report =
+            project_committed_tape_file_bundle_tx(&tx, &tape_input, bundle, updated_at.as_str())?;
+        tx.commit()
+            .map_err(|err| sqlite_error("commit native object append projection", err))?;
         Ok(report)
     }
 
@@ -4357,6 +4397,359 @@ fn project_committed_tape_file_bundle_tx(
         tape_files_rebuilt: bundle.entries.len() as u64,
         object_copies_rebuilt: object_copies,
     })
+}
+
+fn validate_append_bundle_extension_tx(
+    tx: &rusqlite::Transaction<'_>,
+    input: &TapeJournalIndexInput,
+    bundle: &CommittedBundle,
+) -> Result<(), StateError> {
+    if bundle.kind != CommittedBundleKind::Object {
+        return Err(StateError::IndexCorrupt(format!(
+            "native object append projection for tape {} requires an Object bundle, got {:?}",
+            hex_uuid(input.tape_uuid),
+            bundle.kind
+        )));
+    }
+    let first_entry = bundle.entries.first().ok_or_else(|| {
+        StateError::IndexMigrationFailed(
+            "append commit bundle must contain at least one tape-file entry".to_string(),
+        )
+    })?;
+    let last_entry = validate_dense_bundle_entries(&bundle.entries, input.tape_uuid)?;
+    let prefix = load_append_projection_prefix_tx(tx, input)?;
+    validate_append_geometry(input, &prefix)?;
+    if prefix.state != "ready" {
+        return Err(StateError::IndexCorrupt(format!(
+            "append projection refused for tape {} in state {}",
+            hex_uuid(input.tape_uuid),
+            prefix.state
+        )));
+    }
+    let expected_first = match prefix.last_committed_tape_file {
+        Some(last) => last.checked_add(1).ok_or_else(|| {
+            StateError::IndexCorrupt(format!(
+                "append projection tape {} next tape-file number overflows",
+                hex_uuid(input.tape_uuid)
+            ))
+        })?,
+        None => 0,
+    };
+    if first_entry.tape_file_number != expected_first {
+        return Err(StateError::IndexCorrupt(format!(
+            "append projection for tape {} is non-contiguous: expected first new tape file {}, got {}",
+            hex_uuid(input.tape_uuid),
+            expected_first,
+            first_entry.tape_file_number
+        )));
+    }
+    if bundle.highest_protected_ordinal < prefix.highest_protected_ordinal {
+        return Err(StateError::IndexCorrupt(format!(
+            "append projection for tape {} regressed highest_protected_ordinal from {} to {}",
+            hex_uuid(input.tape_uuid),
+            prefix.highest_protected_ordinal,
+            bundle.highest_protected_ordinal
+        )));
+    }
+    if bundle.total_committed_ordinals < prefix.total_committed_ordinals {
+        return Err(StateError::IndexCorrupt(format!(
+            "append projection for tape {} regressed total_committed_ordinals from {} to {}",
+            hex_uuid(input.tape_uuid),
+            prefix.total_committed_ordinals,
+            bundle.total_committed_ordinals
+        )));
+    }
+    let appended_object_ordinals = bundle_object_ordinals(bundle, input.tape_uuid)?;
+    if appended_object_ordinals == 0 {
+        return Err(StateError::IndexCorrupt(format!(
+            "native object append projection for tape {} has no object tape-file entry",
+            hex_uuid(input.tape_uuid)
+        )));
+    }
+    let expected_total_committed_ordinals = prefix
+        .total_committed_ordinals
+        .checked_add(appended_object_ordinals)
+        .ok_or_else(|| {
+            StateError::IndexMigrationFailed(
+                "append projection total_committed_ordinals overflows u64".to_string(),
+            )
+        })?;
+    if bundle.total_committed_ordinals != expected_total_committed_ordinals {
+        return Err(StateError::IndexCorrupt(format!(
+            "append projection for tape {} has total_committed_ordinals {}, expected {}",
+            hex_uuid(input.tape_uuid),
+            bundle.total_committed_ordinals,
+            expected_total_committed_ordinals
+        )));
+    }
+    let overlapping = tx
+        .query_row(
+            "select tape_file_number
+             from tape_files
+             where tape_uuid = ?1 and tape_file_number between ?2 and ?3
+             order by tape_file_number
+             limit 1",
+            params![
+                input.tape_uuid.to_vec(),
+                i64::from(first_entry.tape_file_number),
+                i64::from(last_entry.tape_file_number),
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|err| sqlite_error("query append tape-file overlap", err))?;
+    if let Some(existing) = overlapping {
+        return Err(StateError::IndexCorrupt(format!(
+            "append projection for tape {} overlaps existing tape file {}",
+            hex_uuid(input.tape_uuid),
+            existing
+        )));
+    }
+    Ok(())
+}
+
+fn bundle_object_ordinals(
+    bundle: &CommittedBundle,
+    tape_uuid: [u8; 16],
+) -> Result<u64, StateError> {
+    bundle
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == TapeFileKind::Object)
+        .try_fold(0u64, |acc, entry| {
+            acc.checked_add(entry.block_count).ok_or_else(|| {
+                StateError::IndexMigrationFailed(format!(
+                    "append projection object ordinals overflow for tape {}",
+                    hex_uuid(tape_uuid)
+                ))
+            })
+        })
+}
+
+fn validate_dense_bundle_entries(
+    entries: &[TapeFileEntry],
+    tape_uuid: [u8; 16],
+) -> Result<&TapeFileEntry, StateError> {
+    let Some(first) = entries.first() else {
+        return Err(StateError::IndexMigrationFailed(
+            "append commit bundle must contain at least one tape-file entry".to_string(),
+        ));
+    };
+    for (offset, entry) in entries.iter().enumerate() {
+        let offset = u32::try_from(offset).map_err(|_| {
+            StateError::IndexMigrationFailed(
+                "append commit bundle entry count exceeds u32 tape-file space".to_string(),
+            )
+        })?;
+        let expected = first.tape_file_number.checked_add(offset).ok_or_else(|| {
+            StateError::IndexMigrationFailed(
+                "append commit bundle tape-file number overflows u32".to_string(),
+            )
+        })?;
+        if entry.tape_file_number != expected {
+            return Err(StateError::IndexCorrupt(format!(
+                "append projection for tape {} has non-dense bundle entries: expected tape file {}, got {}",
+                hex_uuid(tape_uuid),
+                expected,
+                entry.tape_file_number
+            )));
+        }
+    }
+    entries.last().ok_or_else(|| {
+        StateError::IndexMigrationFailed(
+            "append commit bundle must contain at least one tape-file entry".to_string(),
+        )
+    })
+}
+
+#[derive(Debug)]
+struct AppendProjectionPrefix {
+    block_size: Option<u64>,
+    scheme_id: Option<String>,
+    highest_protected_ordinal: u64,
+    total_committed_ordinals: u64,
+    last_committed_tape_file: Option<u32>,
+    state: String,
+}
+
+fn load_append_projection_prefix_tx(
+    tx: &rusqlite::Transaction<'_>,
+    input: &TapeJournalIndexInput,
+) -> Result<AppendProjectionPrefix, StateError> {
+    tx.query_row(
+        "select block_size, scheme_id, highest_protected_ordinal,
+                total_committed_ordinals, last_committed_tape_file, state
+         from tapes
+         where tape_uuid = ?1",
+        params![input.tape_uuid.to_vec()],
+        |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        },
+    )
+    .optional()
+    .map_err(|err| sqlite_error("query append projection prefix", err))?
+    .ok_or_else(|| {
+        StateError::IndexCorrupt(format!(
+            "append projection requires existing tape row {}",
+            hex_uuid(input.tape_uuid)
+        ))
+    })
+    .and_then(
+        |(
+            block_size,
+            scheme_id,
+            highest_protected_ordinal,
+            total_committed_ordinals,
+            last_committed_tape_file,
+            state,
+        )| {
+            Ok(AppendProjectionPrefix {
+                block_size: opt_i64_to_u64(block_size, "tapes.block_size")?,
+                scheme_id,
+                highest_protected_ordinal: i64_to_u64(
+                    highest_protected_ordinal,
+                    "tapes.highest_protected_ordinal",
+                )?,
+                total_committed_ordinals: i64_to_u64(
+                    total_committed_ordinals,
+                    "tapes.total_committed_ordinals",
+                )?,
+                last_committed_tape_file: opt_i64_to_u32(
+                    last_committed_tape_file,
+                    "tapes.last_committed_tape_file",
+                )?,
+                state,
+            })
+        },
+    )
+}
+
+fn validate_append_geometry(
+    input: &TapeJournalIndexInput,
+    prefix: &AppendProjectionPrefix,
+) -> Result<(), StateError> {
+    if prefix.block_size != Some(u64::from(input.block_size)) {
+        return Err(StateError::IndexCorrupt(format!(
+            "append projection block-size mismatch for tape {}: catalog {:?}, commit {}",
+            hex_uuid(input.tape_uuid),
+            prefix.block_size,
+            input.block_size
+        )));
+    }
+    let input_scheme_id = input.scheme.as_ref().map(|scheme| scheme.id.as_str());
+    if prefix.scheme_id.as_deref() != input_scheme_id {
+        return Err(StateError::IndexCorrupt(format!(
+            "append projection protection mismatch for tape {}: catalog {:?}, commit {:?}",
+            hex_uuid(input.tape_uuid),
+            prefix.scheme_id,
+            input_scheme_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_append_object_conflicts_tx(
+    tx: &rusqlite::Transaction<'_>,
+    input: &TapeJournalIndexInput,
+    bundle: &CommittedBundle,
+    object: &NativeObjectProjectionInput,
+    copies: &[NativeObjectCopyProjectionInput],
+) -> Result<(), StateError> {
+    let object_entries = bundle
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == TapeFileKind::Object)
+        .collect::<Vec<_>>();
+    if object_entries.len() != 1 {
+        return Err(StateError::IndexCorrupt(format!(
+            "native object append projection for tape {} requires exactly one object tape-file entry, got {}",
+            hex_uuid(input.tape_uuid),
+            object_entries.len()
+        )));
+    }
+    let object_entry = object_entries[0];
+    if object_entry.object_id.as_deref() != Some(object.object_id.as_str()) {
+        return Err(StateError::IndexCorrupt(format!(
+            "native object append projection for tape {} has object entry {:?}, expected {}",
+            hex_uuid(input.tape_uuid),
+            object_entry.object_id,
+            object.object_id
+        )));
+    }
+    if copies.len() != 1 {
+        return Err(StateError::IndexCorrupt(format!(
+            "native object append projection for tape {} requires exactly one object copy, got {}",
+            hex_uuid(input.tape_uuid),
+            copies.len()
+        )));
+    }
+    let object_exists = tx
+        .query_row(
+            "select 1 from objects where object_id = ?1",
+            params![object.object_id.as_str()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|err| sqlite_error("query append object conflict", err))?
+        .is_some();
+    if object_exists {
+        return Err(StateError::IndexCorrupt(format!(
+            "append projection object id {} already exists",
+            object.object_id
+        )));
+    }
+    for copy in copies {
+        if copy.object_id != object.object_id {
+            return Err(StateError::IndexCorrupt(format!(
+                "append projection copy object id {} does not match object {}",
+                copy.object_id, object.object_id
+            )));
+        }
+        if copy.tape_uuid != input.tape_uuid {
+            return Err(StateError::IndexCorrupt(format!(
+                "append projection copy tape {} does not match commit tape {}",
+                hex_uuid(copy.tape_uuid),
+                hex_uuid(input.tape_uuid)
+            )));
+        }
+        if copy.tape_file_number != object_entry.tape_file_number {
+            return Err(StateError::IndexCorrupt(format!(
+                "append projection copy tape file {} does not match object entry tape file {}",
+                copy.tape_file_number, object_entry.tape_file_number
+            )));
+        }
+        let copy_exists = tx
+            .query_row(
+                "select 1
+                 from object_copies
+                 where object_id = ?1 and tape_uuid = ?2 and tape_file_number = ?3",
+                params![
+                    copy.object_id.as_str(),
+                    copy.tape_uuid.to_vec(),
+                    i64::from(copy.tape_file_number),
+                ],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|err| sqlite_error("query append object-copy conflict", err))?
+            .is_some();
+        if copy_exists {
+            return Err(StateError::IndexCorrupt(format!(
+                "append projection object copy {} on tape {} file {} already exists",
+                copy.object_id,
+                hex_uuid(copy.tape_uuid),
+                copy.tape_file_number
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn project_operation_record(
@@ -6645,6 +7038,84 @@ mod tests {
             },
             state,
         )
+    }
+
+    fn no_parity_append_input(tape_uuid: [u8; 16]) -> TapeJournalIndexInput {
+        TapeJournalIndexInput {
+            tape_uuid,
+            block_size: 4096,
+            scheme: None,
+            journal_offset_bytes: 0,
+        }
+    }
+
+    fn append_object_projection(object_id: &str) -> NativeObjectProjectionInput {
+        NativeObjectProjectionInput {
+            object_id: object_id.to_string(),
+            caller_object_id: Some(format!("caller-{object_id}")),
+            body_format: "rao-v1".to_string(),
+            logical_size_bytes: Some(42),
+            content_hash: Some(vec![0x41; 32]),
+            metadata_hash: Some(vec![0x42; 32]),
+            created_at_utc: Some("2026-07-05T12:00:00Z".to_string()),
+        }
+    }
+
+    fn append_copy_projection(
+        object_id: &str,
+        tape_uuid: [u8; 16],
+        tape_file_number: u32,
+    ) -> NativeObjectCopyProjectionInput {
+        NativeObjectCopyProjectionInput {
+            object_id: object_id.to_string(),
+            tape_uuid,
+            tape_file_number,
+            first_body_lba: 0,
+            first_parity_data_ordinal: None,
+            protected_until_ordinal: None,
+            status: "committed".to_string(),
+            representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+            key_id: None,
+            metadata_frame_len: None,
+            plaintext_digest: Some(vec![0x43; 32]),
+            stored_digest: Some(vec![0x43; 32]),
+        }
+    }
+
+    fn append_object_entry(
+        object_id: &str,
+        tape_file_number: u32,
+        block_count: u64,
+    ) -> TapeFileEntry {
+        TapeFileEntry {
+            tape_file_number,
+            kind: TapeFileKind::Object,
+            block_count,
+            physical_start_hint: None,
+            object_id: Some(object_id.to_string()),
+            first_parity_data_ordinal: None,
+            epoch_id: None,
+            protected_ordinal_start: None,
+            protected_ordinal_end_exclusive: None,
+            canonical_metadata_hash: None,
+            bootstrap_object_row: None,
+        }
+    }
+
+    fn append_bootstrap_entry() -> TapeFileEntry {
+        TapeFileEntry {
+            tape_file_number: 0,
+            kind: TapeFileKind::Bootstrap,
+            block_count: 1,
+            physical_start_hint: None,
+            object_id: None,
+            first_parity_data_ordinal: None,
+            epoch_id: None,
+            protected_ordinal_start: None,
+            protected_ordinal_end_exclusive: None,
+            canonical_metadata_hash: None,
+            bootstrap_object_row: None,
+        }
     }
 
     fn catalog_snapshot(index: &CatalogIndex) -> Vec<String> {
@@ -9586,6 +10057,423 @@ mod tests {
                 })
                 .expect("object copy pool"),
             "pool.at.commit"
+        );
+    }
+
+    #[test]
+    fn strict_append_projection_extends_no_parity_prefix() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [21u8; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "APP001L9".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision no-parity append tape");
+        let input = no_parity_append_input(tape_uuid);
+
+        let first_report = index
+            .project_native_object_append_commit(
+                append_object_projection("append-object-1"),
+                &[],
+                &[append_copy_projection("append-object-1", tape_uuid, 1)],
+                input.clone(),
+                &CommittedBundle {
+                    kind: CommittedBundleKind::Object,
+                    entries: vec![
+                        append_bootstrap_entry(),
+                        append_object_entry("append-object-1", 1, 3),
+                    ],
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals: 3,
+                },
+            )
+            .expect("project fresh no-parity append commit");
+        assert_eq!(first_report.tape_files_rebuilt, 2);
+
+        index
+            .project_native_object_append_commit(
+                append_object_projection("append-object-2"),
+                &[],
+                &[append_copy_projection("append-object-2", tape_uuid, 2)],
+                input,
+                &CommittedBundle {
+                    kind: CommittedBundleKind::Object,
+                    entries: vec![append_object_entry("append-object-2", 2, 2)],
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals: 5,
+                },
+            )
+            .expect("project second no-parity append commit");
+
+        let tape = index
+            .get_tape(&tape_uuid)
+            .expect("query tape")
+            .expect("tape");
+        assert_eq!(tape.last_committed_tape_file, Some(2));
+        assert_eq!(tape.total_committed_ordinals, 5);
+        let tape_files = index.list_tape_files(&tape_uuid).expect("list tape files");
+        assert_eq!(tape_files.len(), 3);
+        assert_eq!(tape_files[0].tape_file_number, 0);
+        assert_eq!(tape_files[0].kind, "bootstrap");
+        assert_eq!(tape_files[1].tape_file_number, 1);
+        assert_eq!(tape_files[2].tape_file_number, 2);
+        assert_eq!(
+            index
+                .conn
+                .query_row("select count(*) from objects", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .expect("object count"),
+            2
+        );
+    }
+
+    #[test]
+    fn strict_append_projection_rejects_non_contiguous_bundle_before_object_rows() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [22u8; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "APP002L9".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision no-parity append tape");
+        let input = no_parity_append_input(tape_uuid);
+        index
+            .project_native_object_append_commit(
+                append_object_projection("append-seed"),
+                &[],
+                &[append_copy_projection("append-seed", tape_uuid, 1)],
+                input.clone(),
+                &CommittedBundle {
+                    kind: CommittedBundleKind::Object,
+                    entries: vec![
+                        append_bootstrap_entry(),
+                        append_object_entry("append-seed", 1, 3),
+                    ],
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals: 3,
+                },
+            )
+            .expect("seed append prefix");
+
+        let err = index
+            .project_native_object_append_commit(
+                append_object_projection("append-gap"),
+                &[],
+                &[append_copy_projection("append-gap", tape_uuid, 3)],
+                input,
+                &CommittedBundle {
+                    kind: CommittedBundleKind::Object,
+                    entries: vec![append_object_entry("append-gap", 3, 2)],
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals: 5,
+                },
+            )
+            .expect_err("append projection must reject skipped tape file");
+
+        assert!(
+            matches!(err, StateError::IndexCorrupt(ref message)
+                if message.contains("non-contiguous")
+                    && message.contains("expected first new tape file 2")),
+            "{err}"
+        );
+        assert!(index
+            .get_native_object("append-gap")
+            .expect("query rejected object")
+            .is_none());
+    }
+
+    #[test]
+    fn strict_append_projection_rejects_overlapping_tape_file_before_object_rows() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [23u8; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "APP003L9".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision no-parity append tape");
+        index
+            .conn
+            .execute(
+                "insert into tape_files(tape_uuid, tape_file_number, kind, block_count)
+                 values(?1, 0, 'bootstrap', 1)",
+                params![tape_uuid.to_vec()],
+            )
+            .expect("seed stale overlapping tape-file row");
+
+        let err = index
+            .project_native_object_append_commit(
+                append_object_projection("append-overlap"),
+                &[],
+                &[append_copy_projection("append-overlap", tape_uuid, 1)],
+                no_parity_append_input(tape_uuid),
+                &CommittedBundle {
+                    kind: CommittedBundleKind::Object,
+                    entries: vec![
+                        append_bootstrap_entry(),
+                        append_object_entry("append-overlap", 1, 3),
+                    ],
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals: 3,
+                },
+            )
+            .expect_err("append projection must reject overlapping tape file");
+
+        assert!(
+            matches!(err, StateError::IndexCorrupt(ref message)
+                if message.contains("overlaps existing tape file 0")),
+            "{err}"
+        );
+        assert!(index
+            .get_native_object("append-overlap")
+            .expect("query rejected object")
+            .is_none());
+    }
+
+    #[test]
+    fn strict_append_projection_rejects_non_ready_tape_before_object_rows() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [24u8; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "APP004L9".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision no-parity append tape");
+        index
+            .conn
+            .execute(
+                "update tapes set state = 'ingested' where tape_uuid = ?1",
+                params![tape_uuid.to_vec()],
+            )
+            .expect("mark tape ingested");
+
+        let err = index
+            .project_native_object_append_commit(
+                append_object_projection("append-ingested"),
+                &[],
+                &[append_copy_projection("append-ingested", tape_uuid, 1)],
+                no_parity_append_input(tape_uuid),
+                &CommittedBundle {
+                    kind: CommittedBundleKind::Object,
+                    entries: vec![
+                        append_bootstrap_entry(),
+                        append_object_entry("append-ingested", 1, 3),
+                    ],
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals: 3,
+                },
+            )
+            .expect_err("append projection must reject non-ready tape state");
+
+        assert!(
+            matches!(err, StateError::IndexCorrupt(ref message)
+                if message.contains("state ingested")),
+            "{err}"
+        );
+        assert!(index
+            .get_native_object("append-ingested")
+            .expect("query rejected object")
+            .is_none());
+    }
+
+    #[test]
+    fn strict_append_projection_rejects_existing_object_before_tape_file_rows() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [25u8; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "APP005L9".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision no-parity append tape");
+        index
+            .conn
+            .execute(
+                "insert into objects(
+                   object_id, caller_object_id, body_format, logical_size_bytes,
+                   content_hash, metadata_hash, created_at_utc
+                 )
+                 values('append-duplicate', 'caller-old', 'rao-v1', 1, null, null,
+                        '2026-07-05T11:00:00Z')",
+                [],
+            )
+            .expect("seed existing object id");
+
+        let err = index
+            .project_native_object_append_commit(
+                append_object_projection("append-duplicate"),
+                &[],
+                &[append_copy_projection("append-duplicate", tape_uuid, 1)],
+                no_parity_append_input(tape_uuid),
+                &CommittedBundle {
+                    kind: CommittedBundleKind::Object,
+                    entries: vec![
+                        append_bootstrap_entry(),
+                        append_object_entry("append-duplicate", 1, 3),
+                    ],
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals: 3,
+                },
+            )
+            .expect_err("append projection must reject duplicate object id");
+
+        assert!(
+            matches!(err, StateError::IndexCorrupt(ref message)
+                if message.contains("object id append-duplicate already exists")),
+            "{err}"
+        );
+        assert_eq!(
+            index
+                .conn
+                .query_row("select count(*) from tape_files", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .expect("tape file count"),
+            0
+        );
+    }
+
+    #[test]
+    fn strict_append_projection_rejects_wrong_total_before_tape_file_rows() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [26u8; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "APP006L9".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision no-parity append tape");
+
+        let err = index
+            .project_native_object_append_commit(
+                append_object_projection("append-bad-total"),
+                &[],
+                &[append_copy_projection("append-bad-total", tape_uuid, 1)],
+                no_parity_append_input(tape_uuid),
+                &CommittedBundle {
+                    kind: CommittedBundleKind::Object,
+                    entries: vec![
+                        append_bootstrap_entry(),
+                        append_object_entry("append-bad-total", 1, 3),
+                    ],
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals: 99,
+                },
+            )
+            .expect_err("append projection must reject wrong total");
+
+        assert!(
+            matches!(err, StateError::IndexCorrupt(ref message)
+                if message.contains("total_committed_ordinals 99, expected 3")),
+            "{err}"
+        );
+        assert_eq!(
+            index
+                .conn
+                .query_row("select count(*) from tape_files", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .expect("tape file count"),
+            0
+        );
+    }
+
+    #[test]
+    fn strict_append_projection_rejects_copy_tape_file_mismatch_before_rows() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [27u8; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "APP007L9".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision no-parity append tape");
+
+        let err = index
+            .project_native_object_append_commit(
+                append_object_projection("append-copy-mismatch"),
+                &[],
+                &[append_copy_projection("append-copy-mismatch", tape_uuid, 9)],
+                no_parity_append_input(tape_uuid),
+                &CommittedBundle {
+                    kind: CommittedBundleKind::Object,
+                    entries: vec![
+                        append_bootstrap_entry(),
+                        append_object_entry("append-copy-mismatch", 1, 3),
+                    ],
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals: 3,
+                },
+            )
+            .expect_err("append projection must reject copy/bundle mismatch");
+
+        assert!(
+            matches!(err, StateError::IndexCorrupt(ref message)
+                if message.contains("copy tape file 9")
+                    && message.contains("object entry tape file 1")),
+            "{err}"
+        );
+        assert_eq!(
+            index
+                .conn
+                .query_row("select count(*) from tape_files", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .expect("tape file count"),
+            0
         );
     }
 
