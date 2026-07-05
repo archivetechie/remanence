@@ -1215,34 +1215,50 @@ fn handle_drive_open_write(
                     expected_content_sha256,
                     representation: crate::PoolWriteRepresentation::Plaintext,
                 };
-                let mut sink = DriveHandleSink(drive);
                 let append_started = Instant::now();
-                let result = crate::pool_write::write_to_selected_tape_with_live_counter(
-                    index,
-                    &mut sink,
-                    &pool_cfg,
-                    request,
-                    selected.clone(),
-                    live_write_counter,
-                );
+                let result = match crate::pool_write::maybe_replay_pool_write(
+                    index, &pool_cfg, &request,
+                ) {
+                    Ok(Some(result)) => Ok(result),
+                    Ok(None) => {
+                        let mut sink = DriveHandleSink(drive);
+                        crate::pool_write::write_to_selected_tape_with_live_counter_after_replay_check(
+                                index,
+                                &mut sink,
+                                &pool_cfg,
+                                request,
+                                selected.clone(),
+                                live_write_counter,
+                            )
+                    }
+                    Err(err) => Err(err),
+                };
                 let append_elapsed = append_started.elapsed();
                 let _ = std::fs::remove_file(&spool_path);
                 match result {
                     Ok(result) => {
-                        objects_committed = objects_committed.saturating_add(1);
-                        bytes_committed = bytes_committed.saturating_add(logical_size);
-                        last_checkpoint_at_utc =
-                            Some(now_rfc3339().unwrap_or_else(|_| opened_at_utc.clone()));
+                        let replay = result.is_replay();
+                        if !replay {
+                            objects_committed = objects_committed.saturating_add(1);
+                            bytes_committed = bytes_committed.saturating_add(logical_size);
+                            last_checkpoint_at_utc =
+                                Some(now_rfc3339().unwrap_or_else(|_| opened_at_utc.clone()));
+                        }
                         tracing::info!(
                             target: "remanence_write_diag",
-                            "remanence_write_diag phase=drive_append_total session_id={} caller_object_id={:?} tape_uuid={} payload_bytes={} block_size_bytes={} elapsed_ms={:.3} throughput_mib_s={:.3}",
+                            "remanence_write_diag phase=drive_append_total session_id={} caller_object_id={:?} tape_uuid={} payload_bytes={} block_size_bytes={} replay={} elapsed_ms={:.3} throughput_mib_s={:.3}",
                             session_id,
                             result.object.caller_object_id,
                             Uuid::from_bytes(tape_uuid),
                             logical_size,
                             selected.block_size,
+                            replay,
                             crate::diagnostics::duration_ms(append_elapsed),
-                            crate::diagnostics::mib_per_s(logical_size, append_elapsed),
+                            if replay {
+                                0.0
+                            } else {
+                                crate::diagnostics::mib_per_s(logical_size, append_elapsed)
+                            },
                         );
                         let _ = reply.send(Ok(result.object.to_proto()));
                     }
@@ -3374,6 +3390,8 @@ pub(crate) fn status_from_pool_write_error(err: PoolWriteError) -> Status {
             Status::failed_precondition(message)
         }
         PoolWriteError::ContentHashMismatch { .. } => Status::failed_precondition(message),
+        PoolWriteError::CallerObjectIdConflict { .. } => Status::already_exists(message),
+        PoolWriteError::ReplayObjectInvalid { .. } => Status::internal(message),
         PoolWriteError::Streaming(streaming) => status_from_streaming_error(&streaming, message),
         PoolWriteError::Parity(parity) => status_from_parity_error(&parity, message),
         PoolWriteError::Io { .. } | PoolWriteError::TapeIo(_) | PoolWriteError::TimeFormat(_) => {

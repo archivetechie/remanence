@@ -31,9 +31,10 @@ use remanence_parity::{
 };
 use remanence_state::{
     validate_tape_pool_capacity_invariant, watermark_floor_bytes, CatalogIndex,
-    NativeObjectCopyProjectionInput, NativeObjectFileProjectionInput, NativeObjectProjectionInput,
-    StateError, TapeJournalIndexInput, TapePoolConfig, TapeRecord,
-    OBJECT_COPY_REPRESENTATION_ENCRYPTED, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+    NativeObjectCopyProjectionInput, NativeObjectCopyRecord, NativeObjectFileProjectionInput,
+    NativeObjectProjectionInput, NativeObjectRecord, StateError, TapeJournalIndexInput,
+    TapePoolConfig, TapeRecord, OBJECT_COPY_REPRESENTATION_ENCRYPTED,
+    OBJECT_COPY_REPRESENTATION_PLAINTEXT,
 };
 use remanence_stream::{
     plan_prepared_object, prepare_regular_file, write_prepared_object_to_parity,
@@ -187,8 +188,31 @@ fn append_commit_info_from_pool_copy(copy: &PoolWriteObjectCopyRecord) -> pb::Ap
 pub struct PoolWriteResult {
     /// Locator/object record for the caller.
     pub object: PoolWriteObjectRecord,
-    /// Lower-layer streaming write report for tests and future audit wiring.
-    pub write_report: StreamingObjectWriteReport,
+    /// Lower-layer streaming write report when this call performed a new tape write.
+    ///
+    /// A caller-object replay returns the already committed object and leaves
+    /// this empty because no tape transfer happened in that call.
+    pub write_report: Option<StreamingObjectWriteReport>,
+}
+
+impl PoolWriteResult {
+    /// True when this result was returned from the catalog replay path.
+    pub fn is_replay(&self) -> bool {
+        self.write_report.is_none()
+    }
+
+    /// Borrow the streaming report for callers that require proof of a new write.
+    pub fn write_report(&self) -> Option<&StreamingObjectWriteReport> {
+        self.write_report.as_ref()
+    }
+
+    /// Borrow the streaming report and panic if the result was a replay.
+    #[cfg(test)]
+    pub fn expect_write_report(&self) -> &StreamingObjectWriteReport {
+        self.write_report
+            .as_ref()
+            .expect("pool write result should include a new write report")
+    }
 }
 
 /// Canonical pool selection returned by the Phase 1 tape selector.
@@ -462,6 +486,28 @@ pub enum PoolWriteError {
         /// Actual prepared payload SHA-256 as lowercase hex.
         actual: String,
     },
+    /// A caller-object replay found the key bound to different content.
+    #[error(
+        "caller_object_id replay conflict in pool {pool_id}: caller_object_id={caller_object_id:?}, existing content_sha256={existing_content_sha256}, requested content_sha256={requested_content_sha256}"
+    )]
+    CallerObjectIdConflict {
+        /// Pool that scopes the idempotency key.
+        pool_id: String,
+        /// Opaque caller/orchestrator object id.
+        caller_object_id: String,
+        /// Existing committed content SHA-256 as lowercase hex.
+        existing_content_sha256: String,
+        /// Requested source content SHA-256 as lowercase hex.
+        requested_content_sha256: String,
+    },
+    /// A replay candidate was found but lacks fields required for a response.
+    #[error("catalog replay object {object_id} is incomplete: {reason}")]
+    ReplayObjectInvalid {
+        /// Existing object id.
+        object_id: String,
+        /// Missing or malformed field description.
+        reason: String,
+    },
     /// Filesystem I/O failed at the named path.
     #[error("{context} at {}: {source}", path.display())]
     Io {
@@ -649,10 +695,13 @@ pub fn write_object_to_pool(
     request: WriteObjectToPoolRequest,
 ) -> Result<PoolWriteResult, PoolWriteError> {
     ensure_request_pool_matches_config(&request, pool_cfg)?;
+    if let Some(result) = maybe_replay_pool_write(state, pool_cfg, &request)? {
+        return Ok(result);
+    }
     let source_size = source_file_size(&request.source_path)?;
     let reserved_tape_uuids = HashSet::new();
     let selected = select_tape_in_pool(state, pool_cfg, source_size, &reserved_tape_uuids)?;
-    write_to_selected_tape(state, sink, pool_cfg, request, selected)
+    write_to_selected_tape_inner(state, sink, pool_cfg, request, selected, false)
 }
 
 /// Write one regular file to a previously selected tape without re-running
@@ -680,12 +729,60 @@ pub(crate) fn write_to_selected_tape_with_live_counter(
     selected: SelectedTape,
     live_write_counter: Option<Arc<crate::DriveByteCounters>>,
 ) -> Result<PoolWriteResult, PoolWriteError> {
+    write_to_selected_tape_with_live_counter_impl(
+        state,
+        sink,
+        pool_cfg,
+        request,
+        selected,
+        live_write_counter,
+        true,
+    )
+}
+
+pub(crate) fn write_to_selected_tape_with_live_counter_after_replay_check(
+    state: &mut CatalogIndex,
+    sink: &mut dyn BlockSink,
+    pool_cfg: &TapePoolConfig,
+    request: WriteObjectToPoolRequest,
+    selected: SelectedTape,
+    live_write_counter: Option<Arc<crate::DriveByteCounters>>,
+) -> Result<PoolWriteResult, PoolWriteError> {
+    write_to_selected_tape_with_live_counter_impl(
+        state,
+        sink,
+        pool_cfg,
+        request,
+        selected,
+        live_write_counter,
+        false,
+    )
+}
+
+fn write_to_selected_tape_with_live_counter_impl(
+    state: &mut CatalogIndex,
+    sink: &mut dyn BlockSink,
+    pool_cfg: &TapePoolConfig,
+    request: WriteObjectToPoolRequest,
+    selected: SelectedTape,
+    live_write_counter: Option<Arc<crate::DriveByteCounters>>,
+    check_replay: bool,
+) -> Result<PoolWriteResult, PoolWriteError> {
     match live_write_counter {
         Some(counter) => {
             let mut live_counted_sink = LiveCounterBlockSink::new(sink, counter);
-            write_to_selected_tape_inner(state, &mut live_counted_sink, pool_cfg, request, selected)
+            write_to_selected_tape_inner(
+                state,
+                &mut live_counted_sink,
+                pool_cfg,
+                request,
+                selected,
+                check_replay,
+            )
         }
-        None => write_to_selected_tape_inner(state, sink, pool_cfg, request, selected),
+        None => {
+            write_to_selected_tape_inner(state, sink, pool_cfg, request, selected, check_replay)
+        }
     }
 }
 
@@ -695,7 +792,14 @@ fn write_to_selected_tape_inner<S: BlockSink + ?Sized>(
     pool_cfg: &TapePoolConfig,
     request: WriteObjectToPoolRequest,
     selected: SelectedTape,
+    check_replay: bool,
 ) -> Result<PoolWriteResult, PoolWriteError> {
+    ensure_request_pool_matches_config(&request, pool_cfg)?;
+    if check_replay {
+        if let Some(result) = maybe_replay_pool_write(state, pool_cfg, &request)? {
+            return Ok(result);
+        }
+    }
     ensure_selected_tape_accepts_write(state, pool_cfg, &selected)?;
     let block_size = selected.block_size;
     let prepare_started = Instant::now();
@@ -1528,7 +1632,128 @@ fn pool_write_result(
 
     PoolWriteResult {
         object,
-        write_report,
+        write_report: Some(write_report),
+    }
+}
+
+pub(crate) fn maybe_replay_pool_write(
+    state: &CatalogIndex,
+    pool_cfg: &TapePoolConfig,
+    request: &WriteObjectToPoolRequest,
+) -> Result<Option<PoolWriteResult>, PoolWriteError> {
+    if request.caller_object_id.trim().is_empty() {
+        return Ok(None);
+    }
+    let Some(existing) = state.get_native_object_by_pool_and_caller_object_id(
+        pool_cfg.id.as_str(),
+        request.caller_object_id.as_str(),
+    )?
+    else {
+        return Ok(None);
+    };
+    source_file_size(&request.source_path)?;
+    let requested_hash = sha256_file(&request.source_path)?;
+    if let Some(expected) = request.expected_content_sha256 {
+        if requested_hash != expected {
+            return Err(PoolWriteError::ContentHashMismatch {
+                expected: bytes_to_hex(&expected),
+                actual: bytes_to_hex(&requested_hash),
+            });
+        }
+    }
+    let existing_hash = native_object_content_sha256(&existing)?;
+    if existing_hash != requested_hash {
+        return Err(PoolWriteError::CallerObjectIdConflict {
+            pool_id: pool_cfg.id.clone(),
+            caller_object_id: request.caller_object_id.clone(),
+            existing_content_sha256: bytes_to_hex(&existing_hash),
+            requested_content_sha256: bytes_to_hex(&requested_hash),
+        });
+    }
+    Ok(Some(PoolWriteResult {
+        object: pool_write_object_record_from_native(existing, pool_cfg.id.as_str())?,
+        write_report: None,
+    }))
+}
+
+fn pool_write_object_record_from_native(
+    object: NativeObjectRecord,
+    pool_id: &str,
+) -> Result<PoolWriteObjectRecord, PoolWriteError> {
+    let object_uuid = Uuid::parse_str(object.object_id.as_str()).map_err(|err| {
+        replay_object_invalid(&object.object_id, format!("object_id is not a UUID: {err}"))
+    })?;
+    let content_sha256 = native_object_content_sha256(&object)?;
+    let logical_size_bytes = object
+        .logical_size_bytes
+        .ok_or_else(|| replay_object_invalid(&object.object_id, "logical_size_bytes is missing"))?;
+    let copies = object
+        .copies
+        .iter()
+        .filter(|copy| copy.pool_id.as_deref() == Some(pool_id) && copy.status == "committed")
+        .map(|copy| pool_write_copy_record_from_native(copy, pool_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    if copies.is_empty() {
+        return Err(replay_object_invalid(
+            &object.object_id,
+            format!("no committed copy in pool {pool_id}"),
+        ));
+    }
+    Ok(PoolWriteObjectRecord {
+        object_id: *object_uuid.as_bytes(),
+        caller_object_id: object.caller_object_id.unwrap_or_default(),
+        content_sha256,
+        logical_size_bytes,
+        body_format: object.body_format,
+        created_at_utc: object.created_at_utc,
+        copies,
+    })
+}
+
+fn pool_write_copy_record_from_native(
+    copy: &NativeObjectCopyRecord,
+    pool_id: &str,
+) -> Result<PoolWriteObjectCopyRecord, PoolWriteError> {
+    let tape_uuid =
+        copy.tape_uuid.as_slice().try_into().map_err(|_| {
+            replay_object_invalid(&copy.object_id, "copy tape_uuid is not 16 bytes")
+        })?;
+    let key_id = copy
+        .key_id
+        .as_deref()
+        .map(|value| {
+            value
+                .try_into()
+                .map_err(|_| replay_object_invalid(&copy.object_id, "copy key_id is not 16 bytes"))
+        })
+        .transpose()?;
+    Ok(PoolWriteObjectCopyRecord {
+        tape_uuid,
+        tape_file_number: u64::from(copy.tape_file_number),
+        first_body_lba: copy.first_body_lba,
+        pool_id: pool_id.to_string(),
+        representation: copy.representation.clone(),
+        key_id,
+        metadata_frame_len: copy.metadata_frame_len,
+    })
+}
+
+fn native_object_content_sha256(object: &NativeObjectRecord) -> Result<[u8; 32], PoolWriteError> {
+    let Some(content_hash) = object.content_hash.as_deref() else {
+        return Err(replay_object_invalid(
+            &object.object_id,
+            "content_hash is missing",
+        ));
+    };
+    content_hash
+        .try_into()
+        .map_err(|_| replay_object_invalid(&object.object_id, "content_hash is not 32 bytes"))
+}
+
+fn replay_object_invalid(object_id: &str, reason: impl Into<String>) -> PoolWriteError {
+    PoolWriteError::ReplayObjectInvalid {
+        object_id: object_id.to_string(),
+        reason: reason.into(),
     }
 }
 
