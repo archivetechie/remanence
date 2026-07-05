@@ -1,0 +1,12 @@
+[package]
+name = "parity-state-verif"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone extraction of ObjectParityState / ObjectParityStateUpdateRange for Aeneas → Lean formal verification (pilot). Core decision logic is verbatim from remanence-parity; the drift-guard test enforces it."
+
+# Deliberately NOT a member of the remanence workspace: this crate is consumed by
+# the Charon/Aeneas verification pipeline, which needs its own toolchain pin and
+# must never affect the main build.
+[workspace]
+
+[dependencies]
