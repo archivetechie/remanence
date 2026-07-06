@@ -1,24 +1,28 @@
 # rao-manifest formal specification
 
-Target: `verif/rao-manifest/src/lib.rs`, a proof-facing extraction of the RAO
-manifest regular-file writer schema and validation arithmetic in
+Target: `verif/rao-manifest/src/lib.rs`, a proof-facing extraction of RAO
+manifest writer-schema and validation arithmetic in
 `crates/remanence-format/src/layout.rs` and
 `crates/remanence-format/src/manifest.rs`.
 
 The production codec writes deterministic CBOR bytes, validates the manifest
 profile, validates global-pax anchors, supports arbitrary file arrays,
 nonregular entries, xattrs, and full text/byte values. This extraction models a
-small but central writer-schema core: one regular payload file, the required
-seven-key root map in canonical writer order, the required regular-file fields,
-empty `object_metadata`, empty `external_references`, empty
-`metadata_preservation_data`, `schema_version = 1`, `file_sha256` length 32,
-and the chunk-count arithmetic used by both writer and reader.
+small but central writer-schema cores:
+
+- the original one-regular-payload-file manifest, with the required seven-key
+  root map, required regular-file fields, empty `object_metadata`, empty
+  `external_references`, empty `metadata_preservation_data`,
+  `schema_version = 1`, `file_sha256` length 32, and chunk-count arithmetic
+- a bounded five-entry manifest containing a nonempty regular file with one
+  xattr, an empty regular file, a hardlink, a symlink, and a directory
 
 Text values are represented by opaque scalar ids and SHA-256 bytes by four
-opaque `u64` words. This preserves identity for the proof without proving
-`String`, `Vec`, exact CBOR bytes, UTF-8 decoding, tar/pax layout, hashing,
-xattrs, nonregular entries, global-pax cross-checking, or arbitrary-length
-manifest arrays.
+opaque `u64` words. Xattr names and values are represented by scalar ids and a
+value length. This preserves identity for the proof without proving `String`,
+`Vec`, exact CBOR bytes, UTF-8 decoding, tar/pax layout, hashing, arbitrary
+xattr maps, global-pax cross-checking, duplicate path/file-id detection, or
+arbitrary-length manifest arrays.
 
 ## M1 — chunk-count arithmetic (`chunk_count_core_success`)
 
@@ -84,6 +88,32 @@ version, reader chunk-size mismatch, wrong file-entry count, non-empty
 object/external metadata containers, missing/wrong regular-file map shape, wrong
 `file_sha256` byte length, wrong `chunk_count`, and invalid
 `first_chunk_lba` nullability.
+
+## M6 — bounded multi-entry manifest round trip (`decode_encode_manifest_entries_core_round_trip`)
+
+For every valid bounded five-entry manifest core:
+
+```text
+decode_manifest_entries_core(
+  encode_manifest_entries_core(manifest),
+  manifest.chunk_size
+) = manifest
+```
+
+The bounded core covers these production-sensitive entry branches:
+
+- a nonempty regular file with one modeled xattr
+- an empty regular file with null first-chunk LBA
+- a hardlink whose target path id must be the preceding regular file path id
+- a symlink with a nonempty modeled target id
+- a directory entry with no file hash and no link target
+
+The proof also includes validation success for the fixed entry forms and
+fail-closed rejection of a bad hardlink target after the local entry checks
+pass. This is still a scalar writer-schema theorem: it does not prove arbitrary
+manifest array traversal, exact CBOR bytes, duplicate detection, production
+`BTreeMap` xattr ordering, path syntax validation, or full production
+`validate_manifest(encode_manifest(x))` over `Vec`/`String` values.
 
 ## Trust anchor
 
