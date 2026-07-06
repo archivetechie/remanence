@@ -11,12 +11,14 @@
 //!
 //! The second core broadens that surface to a bounded five-entry manifest:
 //! nonempty regular file with one xattr, empty regular file, hardlink, symlink,
-//! and directory. This is still not the production `Vec`/CBOR parser; text,
-//! xattr bytes, and SHA-256 bytes are modeled as opaque scalar words so the
-//! proof can preserve identity without extracting `String`, `Vec`, CBOR bytes,
-//! tar/pax layout, or hashing. The `drift_guard` test pins the production
-//! snippets this extraction mirrors; if it fails, the extraction and Lean
-//! proofs must be re-synced.
+//! and directory. The array core adds fixed-capacity fold checks for duplicate
+//! path/file ids and hardlink target membership in the accumulated regular-file
+//! prefix. This is still not the production `Vec`/CBOR parser; text, xattr
+//! bytes, and SHA-256 bytes are modeled as opaque scalar words so the proof can
+//! preserve identity without extracting `String`, `Vec`, CBOR bytes, tar/pax
+//! layout, or hashing. The `drift_guard` test pins the production snippets this
+//! extraction mirrors; if it fails, the extraction and Lean proofs must be
+//! re-synced.
 
 #![allow(clippy::manual_is_multiple_of)]
 // Keep explicit modulo tests: the extraction mirrors production code and the
@@ -1000,6 +1002,185 @@ pub fn decode_manifest_entries_core(
     Ok(manifest)
 }
 
+pub fn distinct5_core(
+    first: u64,
+    second: u64,
+    third: u64,
+    fourth: u64,
+    fifth: u64,
+) -> Result<(), RaoManifestError> {
+    if first == second {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    if first == third {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    if first == fourth {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    if first == fifth {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    if second == third {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    if second == fourth {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    if second == fifth {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    if third == fourth {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    if third == fifth {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    if fourth == fifth {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    Ok(())
+}
+
+pub fn hardlink_target_seen_regular_prefix_two_core(
+    target: u64,
+    first_regular_path: u64,
+    second_regular_path: u64,
+) -> Result<(), RaoManifestError> {
+    if target == first_regular_path {
+        return Ok(());
+    }
+    if target == second_regular_path {
+        return Ok(());
+    }
+    Err(RaoManifestError::InvalidManifestField)
+}
+
+pub fn validate_manifest_array_core(manifest: ManifestEntriesCore) -> Result<(), RaoManifestError> {
+    validate_chunk_size(manifest.chunk_size)?;
+    if manifest.object_id == 0 {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    if manifest.nonempty_regular.size_bytes == 0 {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    if manifest.empty_regular.size_bytes != 0 {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    validate_rich_regular_file_core(manifest.nonempty_regular, manifest.chunk_size)?;
+    validate_rich_regular_file_core(manifest.empty_regular, manifest.chunk_size)?;
+    validate_hardlink_entry_core(manifest.hardlink)?;
+    validate_symlink_entry_core(manifest.symlink)?;
+    validate_directory_entry_core(manifest.directory)?;
+    distinct5_core(
+        manifest.nonempty_regular.path_id,
+        manifest.empty_regular.path_id,
+        manifest.hardlink.path_id,
+        manifest.symlink.path_id,
+        manifest.directory.path_id,
+    )?;
+    distinct5_core(
+        manifest.nonempty_regular.file_id,
+        manifest.empty_regular.file_id,
+        manifest.hardlink.file_id,
+        manifest.symlink.file_id,
+        manifest.directory.file_id,
+    )?;
+    hardlink_target_seen_regular_prefix_two_core(
+        manifest.hardlink.link_target_path_id,
+        manifest.nonempty_regular.path_id,
+        manifest.empty_regular.path_id,
+    )?;
+    Ok(())
+}
+
+pub fn encode_manifest_array_core(
+    manifest: ManifestEntriesCore,
+) -> Result<ManifestEntriesWireCore, RaoManifestError> {
+    validate_manifest_array_core(manifest)?;
+    let nonempty_regular =
+        encode_rich_regular_file_core(manifest.nonempty_regular, manifest.chunk_size)?;
+    let empty_regular = encode_rich_regular_file_core(manifest.empty_regular, manifest.chunk_size)?;
+    let hardlink = encode_hardlink_entry_core(manifest.hardlink)?;
+    let symlink = encode_symlink_entry_core(manifest.symlink)?;
+    let directory = encode_directory_entry_core(manifest.directory)?;
+    Ok(ManifestEntriesWireCore {
+        root_map_len: ROOT_MAP_LEN,
+        key_object_id: ROOT_KEY_OBJECT_ID,
+        object_id: manifest.object_id,
+        key_chunk_size: ROOT_KEY_CHUNK_SIZE,
+        chunk_size: manifest.chunk_size,
+        key_file_entries: ROOT_KEY_FILE_ENTRIES,
+        file_entries_len: FILE_ENTRIES_LEN_BOUNDED,
+        nonempty_regular,
+        empty_regular,
+        hardlink,
+        symlink,
+        directory,
+        key_schema_version: ROOT_KEY_SCHEMA_VERSION,
+        schema_version: SCHEMA_VERSION,
+        key_object_metadata: ROOT_KEY_OBJECT_METADATA,
+        object_metadata_empty: true,
+        key_caller_object_id: ROOT_KEY_CALLER_OBJECT_ID,
+        caller_object_id: manifest.caller_object_id,
+        key_external_references: ROOT_KEY_EXTERNAL_REFERENCES,
+        external_references_empty: true,
+        trailing_data: false,
+    })
+}
+
+pub fn decode_manifest_array_core(
+    wire: ManifestEntriesWireCore,
+    reader_chunk_size: u64,
+) -> Result<ManifestEntriesCore, RaoManifestError> {
+    if wire.trailing_data {
+        return Err(RaoManifestError::InvalidCborEncoding);
+    }
+    if wire.root_map_len != ROOT_MAP_LEN {
+        return Err(RaoManifestError::MissingRequiredManifestField);
+    }
+    if wire.key_object_id != ROOT_KEY_OBJECT_ID
+        || wire.key_chunk_size != ROOT_KEY_CHUNK_SIZE
+        || wire.key_file_entries != ROOT_KEY_FILE_ENTRIES
+        || wire.key_schema_version != ROOT_KEY_SCHEMA_VERSION
+        || wire.key_object_metadata != ROOT_KEY_OBJECT_METADATA
+        || wire.key_caller_object_id != ROOT_KEY_CALLER_OBJECT_ID
+        || wire.key_external_references != ROOT_KEY_EXTERNAL_REFERENCES
+    {
+        return Err(RaoManifestError::InvalidCborEncoding);
+    }
+    if wire.schema_version != SCHEMA_VERSION {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    if wire.chunk_size != reader_chunk_size {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    if wire.file_entries_len != FILE_ENTRIES_LEN_BOUNDED {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    if !wire.object_metadata_empty || !wire.external_references_empty {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+
+    let nonempty_regular = decode_rich_regular_file_core(wire.nonempty_regular, reader_chunk_size)?;
+    let empty_regular = decode_rich_regular_file_core(wire.empty_regular, reader_chunk_size)?;
+    let hardlink = decode_hardlink_entry_core(wire.hardlink)?;
+    let symlink = decode_symlink_entry_core(wire.symlink)?;
+    let directory = decode_directory_entry_core(wire.directory)?;
+    let manifest = ManifestEntriesCore {
+        object_id: wire.object_id,
+        caller_object_id: wire.caller_object_id,
+        chunk_size: wire.chunk_size,
+        nonempty_regular,
+        empty_regular,
+        hardlink,
+        symlink,
+        directory,
+    };
+    validate_manifest_array_core(manifest)?;
+    Ok(manifest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1121,6 +1302,14 @@ mod tests {
             "fn metadata_preservation_data(layout: &RemTarFileLayout) -> CborValue",
             "if layout.xattrs.is_empty()",
             "let xattrs = CborValue::Map(",
+            "let mut seen_paths = BTreeSet::new();",
+            "let mut seen_file_ids = BTreeSet::new();",
+            "let mut seen_regular_paths = BTreeSet::new();",
+            "if !seen_paths.insert(spec.path.clone())",
+            "duplicate payload path",
+            "if !seen_file_ids.insert(spec.file_id.clone())",
+            "duplicate file_id",
+            "seen_regular_paths.insert(spec.path.clone());",
             "pub(crate) fn chunk_count(size_bytes: u64, chunk_size: usize)",
             "if size_bytes == 0 {\n        return Ok(0);\n    }",
             "Ok((size_bytes - 1) / chunk + 1)",
@@ -1140,6 +1329,9 @@ mod tests {
             "if manifest_chunk_size != reader_chunk_size as u64",
             "let file_entries = required_array(map, \"file_entries\")?;",
             "if file_entries.len() > MAX_FILE_ENTRIES",
+            "let mut seen_regular_paths = BTreeSet::new();",
+            "if let Some(path) = validate_file_entry(entry, reader_chunk_size, &seen_regular_paths)?",
+            "seen_regular_paths.insert(path);",
             "let expected_chunk_count = if size_bytes == 0 {\n        0\n    } else {\n        (size_bytes - 1) / reader_chunk_size as u64 + 1\n    };",
             "if chunk_count != expected_chunk_count",
             "first_chunk_lba must be null when size_bytes is zero",
@@ -1171,6 +1363,11 @@ mod tests {
             "pub fn decode_manifest_core(",
             "pub fn encode_manifest_entries_core(",
             "pub fn decode_manifest_entries_core(",
+            "pub fn distinct5_core(",
+            "pub fn hardlink_target_seen_regular_prefix_two_core(",
+            "pub fn validate_manifest_array_core(",
+            "pub fn encode_manifest_array_core(",
+            "pub fn decode_manifest_array_core(",
             "pub fn validate_hardlink_entry_core(",
             "pub fn validate_symlink_entry_core(",
             "pub fn validate_directory_entry_core(",
@@ -1313,6 +1510,53 @@ mod tests {
         wire.hardlink.file_sha256_present = true;
         assert_eq!(
             decode_manifest_entries_core(wire, manifest.chunk_size),
+            Err(RaoManifestError::InvalidManifestField)
+        );
+    }
+
+    #[test]
+    fn manifest_array_core_round_trips_with_accumulated_hardlink_target() {
+        let mut manifest = manifest_entries();
+        manifest.hardlink.link_target_path_id = manifest.empty_regular.path_id;
+        let wire = encode_manifest_array_core(manifest).unwrap();
+        assert_eq!(wire.file_entries_len, FILE_ENTRIES_LEN_BOUNDED);
+        assert_eq!(
+            decode_manifest_array_core(wire, manifest.chunk_size).unwrap(),
+            manifest
+        );
+    }
+
+    #[test]
+    fn manifest_array_rejects_duplicate_path_and_file_ids() {
+        let mut manifest = manifest_entries();
+        manifest.directory.path_id = manifest.symlink.path_id;
+        assert_eq!(
+            validate_manifest_array_core(manifest),
+            Err(RaoManifestError::InvalidManifestField)
+        );
+
+        let mut manifest = manifest_entries();
+        manifest.directory.file_id = manifest.symlink.file_id;
+        assert_eq!(
+            validate_manifest_array_core(manifest),
+            Err(RaoManifestError::InvalidManifestField)
+        );
+    }
+
+    #[test]
+    fn manifest_array_rejects_unseen_hardlink_target() {
+        let mut manifest = manifest_entries();
+        manifest.hardlink.link_target_path_id = manifest.symlink.path_id;
+        assert_eq!(
+            validate_manifest_array_core(manifest),
+            Err(RaoManifestError::InvalidManifestField)
+        );
+
+        let manifest = manifest_entries();
+        let mut wire = encode_manifest_array_core(manifest).unwrap();
+        wire.hardlink.link_target_id = manifest.directory.path_id;
+        assert_eq!(
+            decode_manifest_array_core(wire, manifest.chunk_size),
             Err(RaoManifestError::InvalidManifestField)
         );
     }
