@@ -55,6 +55,20 @@ total block count:         H + P + H + 1
 This is the scalar contract behind the production identity
 `block_count == 2 * H + P + 1`.
 
+## S6 -- production buffer-bound bridge
+
+For every valid header, footer, and spill block size, every fixed byte range
+returned by the extracted layout is contained in the checked block/buffer
+length. This covers the scalar bounds behind the drift-guarded production
+`copy_from_slice`, `read_*_le`, and CRC slice ranges for fixed header/footer
+fields.
+
+## S7 -- sidecar block-index bound bridge
+
+For every valid sidecar tape-file block layout, the primary header copy, raw
+parity block range, tail header copy, and footer locator index are contained in
+the proved total block count, with `footer_block_index + 1 == total`.
+
 ## Trust anchor
 
 The Lean type checker (`lake build` with zero local placeholders) is the trust
