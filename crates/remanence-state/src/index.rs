@@ -7485,6 +7485,7 @@ mod tests {
             drive_bays: vec![DriveBay {
                 element_address: 0x0100,
                 accessible: true,
+                exception: None,
                 installed: Some(InstalledDrive {
                     serial: "DRV-TEST".to_string(),
                     identity_source: IdentitySource::DvcidAndInquiry,
@@ -7505,6 +7506,7 @@ mod tests {
             slots: vec![Slot {
                 element_address: 0x0400,
                 accessible: true,
+                exception: None,
                 full: slot_barcode.is_some(),
                 cartridge: slot_barcode.map(str::to_string),
             }],

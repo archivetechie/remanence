@@ -99,6 +99,26 @@ pub struct ElementLayout {
     pub ie_count: u16,
 }
 
+/// READ ELEMENT STATUS exception evidence for one changer element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElementException {
+    /// Additional Sense Code from the element descriptor.
+    pub asc: u8,
+    /// Additional Sense Code Qualifier from the element descriptor.
+    pub ascq: u8,
+}
+
+impl ElementException {
+    fn from_res_element(el: &remanence_scsi::read_element_status::Element) -> Option<Self> {
+        // Descriptor ASC/ASCQ is operator evidence only when the changer sets
+        // EXCEPT; otherwise vendor/stale bytes stay at the low-level parser.
+        el.except.then_some(Self {
+            asc: el.asc,
+            ascq: el.ascq,
+        })
+    }
+}
+
 /// One drive bay in a library. The bay is a structural slot in the
 /// changer; the (replaceable) drive currently in the bay is described
 /// by [`installed`](Self::installed) when known.
@@ -109,6 +129,8 @@ pub struct DriveBay {
     /// True when the changer reports this element as accessible and
     /// exception-free in READ ELEMENT STATUS.
     pub accessible: bool,
+    /// Optional READ ELEMENT STATUS exception ASC/ASCQ for this bay.
+    pub exception: Option<ElementException>,
     /// Drive currently installed, with what we know about it. `None`
     /// if the changer reports the bay but no drive identity could be
     /// resolved (DVCID unavailable + no safe topology mapping, etc.).
@@ -173,6 +195,8 @@ pub struct Slot {
     /// True when the changer reports this element as accessible and
     /// exception-free in READ ELEMENT STATUS.
     pub accessible: bool,
+    /// Optional READ ELEMENT STATUS exception ASC/ASCQ for this slot.
+    pub exception: Option<ElementException>,
     /// True if the slot has a cartridge present (RES `FULL` flag).
     /// Distinguishes "empty slot" from "full slot with no voltag" —
     /// `cartridge.is_none()` alone does not.
@@ -192,6 +216,8 @@ pub struct IePort {
     /// True when the changer reports this element as accessible and
     /// exception-free in READ ELEMENT STATUS.
     pub accessible: bool,
+    /// Optional READ ELEMENT STATUS exception ASC/ASCQ for this port.
+    pub exception: Option<ElementException>,
     /// True if the IE port currently holds a cartridge (RES `FULL`).
     pub full: bool,
     /// Trimmed volume tag, when one was read. See [`Slot::cartridge`]
@@ -402,6 +428,7 @@ impl Library {
                     drive_bays.push(DriveBay {
                         element_address: el.address,
                         accessible: el.access && !el.except,
+                        exception: ElementException::from_res_element(el),
                         installed: el.drive_serial.as_ref().map(|s| InstalledDrive {
                             serial: s.clone(),
                             identity_source: IdentitySource::DvcidInline,
@@ -424,6 +451,7 @@ impl Library {
                     slots.push(Slot {
                         element_address: el.address,
                         accessible: el.access && !el.except,
+                        exception: ElementException::from_res_element(el),
                         full: el.full,
                         cartridge: el.primary_voltag.clone(),
                     });
@@ -436,6 +464,7 @@ impl Library {
                     ie_ports.push(IePort {
                         element_address: el.address,
                         accessible: el.access && !el.except,
+                        exception: ElementException::from_res_element(el),
                         full: el.full,
                         cartridge: el.primary_voltag.clone(),
                         import_enabled: el.import_enabled,
@@ -513,6 +542,7 @@ mod tests {
         DriveBay {
             element_address,
             accessible: true,
+            exception: None,
             installed: Some(InstalledDrive {
                 serial: format!("DRV-{element_address:04X}"),
                 identity_source: IdentitySource::DvcidAndInquiry,
@@ -536,6 +566,7 @@ mod tests {
         DriveBay {
             element_address,
             accessible: true,
+            exception: None,
             installed: None,
             loaded,
             loaded_tape: loaded_tape.map(str::to_string),
@@ -551,6 +582,7 @@ mod tests {
         DriveBay {
             element_address,
             accessible: true,
+            exception: None,
             installed: Some(InstalledDrive {
                 serial: format!("DRV-{element_address:04X}"),
                 identity_source: IdentitySource::DvcidInline,
@@ -570,9 +602,139 @@ mod tests {
         Slot {
             element_address,
             accessible: true,
+            exception: None,
             full,
             cartridge: cartridge.map(str::to_string),
         }
+    }
+
+    fn res_element(
+        element_type: remanence_scsi::read_element_status::ElementType,
+        address: u16,
+        except: bool,
+        asc: u8,
+        ascq: u8,
+    ) -> remanence_scsi::read_element_status::Element {
+        remanence_scsi::read_element_status::Element {
+            element_type,
+            address,
+            full: true,
+            impexp: false,
+            except,
+            asc,
+            ascq,
+            access: true,
+            export_enabled: matches!(
+                element_type,
+                remanence_scsi::read_element_status::ElementType::ImportExport
+            ),
+            import_enabled: matches!(
+                element_type,
+                remanence_scsi::read_element_status::ElementType::ImportExport
+            ),
+            source_address: None,
+            primary_voltag: Some(format!("TAPE{address:04X}")),
+            drive_serial: matches!(
+                element_type,
+                remanence_scsi::read_element_status::ElementType::DataTransfer
+            )
+            .then(|| format!("DRV{address:04X}")),
+        }
+    }
+
+    fn captures_from_elements(
+        elements: Vec<remanence_scsi::read_element_status::Element>,
+    ) -> DeviceCaptures {
+        DeviceCaptures {
+            changer_inquiry: test_inquiry(),
+            unit_serial: "LIB-TEST".to_string(),
+            device_id: None,
+            element_status: remanence_scsi::read_element_status::ElementStatusData {
+                first_element_address: elements
+                    .iter()
+                    .map(|element| element.address)
+                    .min()
+                    .unwrap_or(0),
+                num_elements: elements.len() as u16,
+                elements,
+            },
+            changer_sg: PathBuf::from("/dev/sg-test"),
+            changer_sysfs: PathBuf::from("/sys/test"),
+        }
+    }
+
+    #[test]
+    fn from_captures_retains_exception_evidence_for_each_element_class() {
+        use remanence_scsi::read_element_status::ElementType;
+
+        let lib = Library::from_captures(captures_from_elements(vec![
+            res_element(ElementType::DataTransfer, 0x0001, true, 0x04, 0x01),
+            res_element(ElementType::Storage, 0x03e9, true, 0x3b, 0x12),
+            res_element(ElementType::ImportExport, 0x0010, true, 0x28, 0x00),
+        ]));
+
+        assert_eq!(
+            lib.drive_bays[0].exception,
+            Some(ElementException {
+                asc: 0x04,
+                ascq: 0x01
+            })
+        );
+        assert!(!lib.drive_bays[0].accessible);
+        assert_eq!(
+            lib.slots[0].exception,
+            Some(ElementException {
+                asc: 0x3b,
+                ascq: 0x12
+            })
+        );
+        assert!(!lib.slots[0].accessible);
+        assert_eq!(
+            lib.ie_ports[0].exception,
+            Some(ElementException {
+                asc: 0x28,
+                ascq: 0x00
+            })
+        );
+        assert!(!lib.ie_ports[0].accessible);
+    }
+
+    #[test]
+    fn from_captures_drops_descriptor_sense_when_except_is_clear() {
+        use remanence_scsi::read_element_status::ElementType;
+
+        let lib = Library::from_captures(captures_from_elements(vec![res_element(
+            ElementType::Storage,
+            0x03e9,
+            false,
+            0x3b,
+            0x12,
+        )]));
+
+        assert_eq!(lib.slots[0].exception, None);
+        assert!(lib.slots[0].accessible);
+    }
+
+    #[test]
+    fn from_captures_retains_zero_zero_exception_when_except_is_set() {
+        use remanence_scsi::read_element_status::ElementType;
+
+        let lib = Library::from_captures(captures_from_elements(vec![res_element(
+            ElementType::Storage,
+            0x03e9,
+            true,
+            0x00,
+            0x00,
+        )]));
+
+        assert_eq!(
+            lib.slots[0].exception,
+            Some(ElementException {
+                asc: 0x00,
+                ascq: 0x00
+            })
+        );
+        assert!(!lib.slots[0].accessible);
     }
 
     #[test]

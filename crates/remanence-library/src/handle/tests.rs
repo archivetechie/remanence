@@ -32,6 +32,7 @@ fn fake_library(serial: &str) -> Library {
         drive_bays: vec![DriveBay {
             element_address: 1,
             accessible: true,
+            exception: None,
             installed: Some(InstalledDrive {
                 serial: "DRIVE12345".into(),
                 identity_source: IdentitySource::DvcidInline,
@@ -258,6 +259,7 @@ fn move_medium_test_lib(serial: &str) -> Library {
         drive_bays: vec![DriveBay {
             element_address: 0x0100,
             accessible: true,
+            exception: None,
             installed: Some(InstalledDrive {
                 serial: "DRV_A".into(),
                 identity_source: IdentitySource::DvcidAndInquiry,
@@ -274,6 +276,7 @@ fn move_medium_test_lib(serial: &str) -> Library {
         slots: vec![Slot {
             element_address: 0x0400,
             accessible: true,
+            exception: None,
             full: true,
             cartridge: Some("TAPE_A".into()),
         }],
@@ -1254,6 +1257,7 @@ fn two_drives_open_simultaneously() {
     lib.drive_bays.push(DriveBay {
         element_address: 0x0101,
         accessible: true,
+        exception: None,
         installed: Some(InstalledDrive {
             serial: "DRV_B".into(),
             identity_source: IdentitySource::DvcidAndInquiry,
@@ -3938,6 +3942,7 @@ fn composed_test_lib(serial: &str) -> Library {
         IePort {
             element_address: 0x0300,
             accessible: true,
+            exception: None,
             full: false,
             cartridge: None,
             import_enabled: true,
@@ -3946,6 +3951,7 @@ fn composed_test_lib(serial: &str) -> Library {
         IePort {
             element_address: 0x0301,
             accessible: true,
+            exception: None,
             full: false,
             cartridge: None,
             import_enabled: true,
