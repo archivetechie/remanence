@@ -110,3 +110,38 @@ software gates:
 Remaining evidence gap: a `~/system` harness scenario or explicit coverage
 contract tying these local regressions into the scenario ledger, plus physical
 MSL3040 capture when a new LTO-9 cartridge is available.
+
+## Follow-up Fable Pass
+
+After the coverage fold, Claude Fable 5 was run again through OpenRouter
+(`anthropic/claude-fable-5`, routed as
+`anthropic/claude-5-fable-20260609`; OpenRouter ID
+`gen-1783352129-O30CHOfVDQr0r59eX1mX`).
+
+Verdict: **go for a controlled escalation-disabled physical run, no-go for
+unattended/destructive escalation.**
+
+New findings:
+
+- **High:** the readiness poll loop treated any second Unit Attention in a
+  load epoch as `RepeatedUnitAttention`. That can falsely terminalize the
+  expected LTO-9 sequence `06/29/00 -> 02/04/01 -> 06/28/00 -> GOOD`.
+- **Medium:** unclassified non-policy `rem` exit codes in
+  `fieldtest/scripts/10-init-pools.sh` could still fall through to the
+  escalation ladder if they lacked readiness metadata.
+- **Medium:** fieldtest selftest coverage covered the dry-run readiness stop
+  path but not unclassified non-policy failures.
+
+Second follow-up fold:
+
+- the readiness epoch now tracks Unit Attention by exact `(ASC, ASCQ)` and
+  terminalizes only an identical repeated UA in the same epoch;
+- a regression now proves `06/29/00 -> 02/04/01 -> 06/28/00 -> GOOD`
+  reaches `Ready`, while identical repeated `06/29/00` remains terminal;
+- `10-init-pools.sh` now fails closed on unclassified non-policy exit codes
+  before `--force` or `--clobber-data`;
+- `10-init-pools.sh --selftest` now covers the unclassified-exit refusal path.
+
+Remaining evidence gap: a `~/system` harness scenario or explicit coverage
+contract tying these local regressions into the scenario ledger, plus physical
+MSL3040 capture when a new LTO-9 cartridge is available.
