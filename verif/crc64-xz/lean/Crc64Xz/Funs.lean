@@ -16,19 +16,19 @@ set_option maxRecDepth 2048
 namespace Crc64Xz
 
 /-- [crc64_xz_verif::CRC64_XZ_CHECK_VALUE]
-    Source: 'src/lib.rs', lines 10:0-10:60
+    Source: 'src/lib.rs', lines 11:0-11:60
     Visibility: public -/
 @[global_simps, irreducible]
 def CRC64_XZ_CHECK_VALUE : Std.U64 := 11051210869376104954#u64
 
 /-- [crc64_xz_verif::CRC64_XZ_REFLECTED_POLY]
-    Source: 'src/lib.rs', lines 11:0-11:63
+    Source: 'src/lib.rs', lines 12:0-12:63
     Visibility: public -/
 @[global_simps, irreducible]
 def CRC64_XZ_REFLECTED_POLY : Std.U64 := 14514072000185962306#u64
 
 /-- [crc64_xz_verif::crc64_xz_bit_step]:
-    Source: 'src/lib.rs', lines 13:0-19:1
+    Source: 'src/lib.rs', lines 14:0-20:1
     Visibility: public -/
 def crc64_xz_bit_step (crc : Std.U64) : Result Std.U64 := do
   let i ← lift (crc &&& 1#u64)
@@ -38,7 +38,7 @@ def crc64_xz_bit_step (crc : Std.U64) : Result Std.U64 := do
   else crc >>> 1#i32
 
 /-- [crc64_xz_verif::crc64_xz_table_entry]:
-    Source: 'src/lib.rs', lines 21:0-31:1
+    Source: 'src/lib.rs', lines 22:0-32:1
     Visibility: public -/
 def crc64_xz_table_entry (byte : Std.U8) : Result Std.U64 := do
   let crc ← lift (UScalar.cast .U64 byte)
@@ -52,7 +52,7 @@ def crc64_xz_table_entry (byte : Std.U8) : Result Std.U64 := do
   crc64_xz_bit_step crc7
 
 /-- [crc64_xz_verif::crc64_xz_update]:
-    Source: 'src/lib.rs', lines 33:0-36:1
+    Source: 'src/lib.rs', lines 34:0-37:1
     Visibility: public -/
 def crc64_xz_update (crc : Std.U64) (byte : Std.U8) : Result Std.U64 := do
   let i ← lift (core.convert.num.FromU64U8.from byte)
@@ -64,14 +64,14 @@ def crc64_xz_update (crc : Std.U64) (byte : Std.U8) : Result Std.U64 := do
   ok (i3 ^^^ i4)
 
 /-- [crc64_xz_verif::crc64_xz_one]:
-    Source: 'src/lib.rs', lines 38:0-40:1
+    Source: 'src/lib.rs', lines 39:0-41:1
     Visibility: public -/
 def crc64_xz_one (byte : Std.U8) : Result Std.U64 := do
   let i ← crc64_xz_update core.num.U64.MAX byte
   ok (i ^^^ core.num.U64.MAX)
 
 /-- [crc64_xz_verif::crc64_xz_two]:
-    Source: 'src/lib.rs', lines 42:0-45:1
+    Source: 'src/lib.rs', lines 43:0-46:1
     Visibility: public -/
 def crc64_xz_two (first : Std.U8) (second : Std.U8) : Result Std.U64 := do
   let crc ← crc64_xz_update core.num.U64.MAX first
@@ -79,7 +79,7 @@ def crc64_xz_two (first : Std.U8) (second : Std.U8) : Result Std.U64 := do
   ok (i ^^^ core.num.U64.MAX)
 
 /-- [crc64_xz_verif::crc64_xz_nine]:
-    Source: 'src/lib.rs', lines 47:0-67:1
+    Source: 'src/lib.rs', lines 49:0-69:1
     Visibility: public -/
 def crc64_xz_nine
   (b0 : Std.U8) (b1 : Std.U8) (b2 : Std.U8) (b3 : Std.U8) (b4 : Std.U8)
@@ -96,5 +96,39 @@ def crc64_xz_nine
   let crc7 ← crc64_xz_update crc6 b7
   let i ← crc64_xz_update crc7 b8
   ok (i ^^^ core.num.U64.MAX)
+
+/-- [crc64_xz_verif::crc64_xz]: loop body 0:
+    Source: 'src/lib.rs', lines 73:4-75:5
+    Visibility: public -/
+@[rust_loop_body]
+def crc64_xz_loop.body
+  (iter : core.slice.iter.Iter Std.U8) (crc : Std.U64) :
+  Result (ControlFlow ((core.slice.iter.Iter Std.U8) × Std.U64) Std.U64)
+  := do
+  let (o, iter1) ← core.slice.iter.IteratorSliceIter.next iter
+  match o with
+  | none => ok (done crc)
+  | some byte => let crc1 ← crc64_xz_update crc byte
+                 ok (cont (iter1, crc1))
+
+/-- [crc64_xz_verif::crc64_xz]: loop 0:
+    Source: 'src/lib.rs', lines 73:4-75:5
+    Visibility: public -/
+@[rust_loop]
+def crc64_xz_loop
+  (iter : core.slice.iter.Iter Std.U8) (crc : Std.U64) : Result Std.U64 := do
+  loop
+    (fun (iter1, crc1) => crc64_xz_loop.body iter1 crc1)
+    (iter, crc)
+
+/-- [crc64_xz_verif::crc64_xz]:
+    Source: 'src/lib.rs', lines 71:0-77:1
+    Visibility: public -/
+def crc64_xz (bytes : Slice Std.U8) : Result Std.U64 := do
+  let iter ←
+    SharedSlice.Insts.CoreIterTraitsCollectIntoIteratorSharedIter.into_iter
+      bytes
+  let crc ← crc64_xz_loop iter core.num.U64.MAX
+  ok (crc ^^^ core.num.U64.MAX)
 
 end Crc64Xz
