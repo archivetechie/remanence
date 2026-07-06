@@ -94,6 +94,10 @@ theorem extracted_reflected_poly_constant :
   unfold CRC64_XZ_REFLECTED_POLY
   rfl
 
+theorem core_num_u64_max_bv :
+    core.num.U64.MAX.bv = 0xffffffffffffffff#64 := by
+  native_decide
+
 theorem u64_shr_one_ok (x : Std.U64) :
     x >>> 1#i32 = ok (⟨x.bv >>> 1⟩ : Std.U64) := by
   change UScalar.shiftRight_IScalar x 1#i32 = ok (⟨x.bv >>> 1⟩ : Std.U64)
@@ -108,6 +112,31 @@ def tableEntryStd (byte : Std.U8) : Std.U64 :=
 
 def updateStd (crc : Std.U64) (byte : Std.U8) : Std.U64 :=
   ⟨update crc.bv byte.bv⟩
+
+def byteBvs (bytes : List Std.U8) : List U8 :=
+  bytes.map (fun byte => byte.bv)
+
+def foldStateStd (bytes : List Std.U8) (crc : Std.U64) : Std.U64 :=
+  ⟨foldState (byteBvs bytes) crc.bv⟩
+
+def crc64xzStd (bytes : Slice Std.U8) : Std.U64 :=
+  ⟨crc64xz (byteBvs bytes.val)⟩
+
+theorem foldStateStd_nil (crc : Std.U64) :
+    foldStateStd [] crc = crc := by
+  unfold foldStateStd byteBvs foldState
+  rfl
+
+theorem foldStateStd_cons (byte : Std.U8) (bytes : List Std.U8) (crc : Std.U64) :
+    foldStateStd (byte :: bytes) crc = foldStateStd bytes (updateStd crc byte) := by
+  apply U64.bv_eq_imp_eq
+  simp only [foldStateStd, byteBvs, updateStd, List.map_cons, foldState]
+
+theorem foldStateStd_drop_step (bytes : List Std.U8) (i : Nat) (h : i < bytes.length)
+    (crc : Std.U64) :
+    foldStateStd (bytes.drop (i + 1)) (updateStd crc bytes[i]) =
+      foldStateStd (bytes.drop i) crc := by
+  rw [List.drop_eq_getElem_cons h, foldStateStd_cons]
 
 theorem generated_bit_step_matches_spec (crc : Std.U64) :
     crc64_xz_bit_step crc = ok (bitStepStd crc) := by
@@ -143,6 +172,63 @@ theorem generated_update_matches_spec (crc : Std.U64) (byte : Std.U8) :
   simp [lift, u64_shr_eight_ok, generated_table_entry_matches_spec]
   apply U64.bv_eq_imp_eq
   simp [tableEntryStd, core.convert.num.FromU64U8.from]
+
+theorem generated_crc64_xz_loop_matches_fold
+    (iter : core.slice.iter.Iter Std.U8) (crc : Std.U64)
+    (hidx : iter.i ≤ iter.slice.val.length) :
+    crc64_xz_loop iter crc = ok (foldStateStd (iter.slice.val.drop iter.i) crc) := by
+  let target := foldStateStd (iter.slice.val.drop iter.i) crc
+  have hspec : crc64_xz_loop iter crc ⦃ fun out => out = target ⦄ := by
+    unfold crc64_xz_loop
+    apply loop.spec_decr_nat
+      (measure := fun state : core.slice.iter.Iter Std.U8 × Std.U64 =>
+        state.1.slice.val.length - state.1.i)
+      (inv := fun state =>
+        state.1.slice = iter.slice ∧
+        state.1.i ≤ state.1.slice.val.length ∧
+        foldStateStd (state.1.slice.val.drop state.1.i) state.2 = target)
+      (post := fun out => out = target)
+    · intro state hinv
+      rcases state with ⟨it, acc⟩
+      rcases hinv with ⟨hslice, hle, hfold⟩
+      have hslice' : it.slice = iter.slice := by
+        simpa using hslice
+      have hle' : it.i ≤ it.slice.val.length := by
+        simpa using hle
+      unfold crc64_xz_loop.body core.slice.iter.IteratorSliceIter.next
+      by_cases hlt : it.i < it.slice.val.length
+      · have hstep :
+            foldStateStd (it.slice.val.drop (it.i + 1)) (updateStd acc it.slice[it.i]) =
+              target := by
+          have hdrop :=
+            foldStateStd_drop_step it.slice.val it.i hlt acc
+          rw [← hfold]
+          simpa [Slice.getElem_Nat_eq] using hdrop
+        have hnew_le : it.i + 1 ≤ it.slice.val.length := by
+          omega
+        have hmeasure : it.slice.val.length - (it.i + 1) < it.slice.val.length - it.i := by
+          omega
+        simpa [hlt, generated_update_matches_spec, hnew_le, hmeasure] using
+          And.intro hslice' hstep
+      · have hi_eq : it.i = it.slice.val.length := by
+          have hnot_lt : it.slice.val.length ≤ it.i := Nat.le_of_not_gt hlt
+          omega
+        have hdone : acc = target := by
+          rw [hi_eq, List.drop_length, foldStateStd_nil] at hfold
+          exact hfold
+        simp [hlt, hdone]
+    · exact ⟨rfl, hidx, rfl⟩
+  obtain ⟨out, hout, hpost⟩ := WP.spec_imp_exists hspec
+  simpa [hpost] using hout
+
+theorem generated_crc64_xz_matches_spec (bytes : Slice Std.U8) :
+    crc64_xz bytes = ok (crc64xzStd bytes) := by
+  unfold crc64_xz
+  simp [SharedSlice.Insts.CoreIterTraitsCollectIntoIteratorSharedIter.into_iter,
+    generated_crc64_xz_loop_matches_fold]
+  apply U64.bv_eq_imp_eq
+  simp only [foldStateStd, crc64xzStd, crc64xz, byteBvs, core_num_u64_max_bv,
+    UScalar.bv_xor]
 
 def resultU64Eq (result : Result Std.U64) (expected : Std.U64) : Bool :=
   match result with

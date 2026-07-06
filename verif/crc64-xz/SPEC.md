@@ -44,6 +44,9 @@ bit-vector specification result for every input.
 `crc64_xz(bytes)` folds X3 from the initial all-ones state and applies the
 final all-ones XOR.
 
+The Lean proof now proves the Aeneas-extracted public `crc64_xz(bytes: &[u8])`
+slice loop returns exactly this fold for every input slice.
+
 ## X5 -- normative vectors
 
 The Rust tests assert the repository's normative vectors:
