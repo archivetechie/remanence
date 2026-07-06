@@ -1,5 +1,5 @@
 /- Specification theorems for RAO manifest writer-schema core extractions
-   (SPEC.md M1-M8).
+   (SPEC.md M1-M9).
 
    This file targets the Aeneas-generated definitions in `RaoManifest.Funs`.
    It proves that a valid one-regular-file manifest validates, encodes to the
@@ -10,10 +10,11 @@
    proof-facing scalar extraction back to production
    `crates/remanence-format/src/{layout,manifest}.rs`.
 
-   Scope: this proof models writer-schema and planner-fold cores, not
+   Scope: this proof models writer-schema, planner-fold, and membership-bridge
+   cores, not
    production CBOR bytes, `Vec`/`String`, UTF-8 decoding, tar/pax layout,
    hashing, arbitrary xattr maps, global-pax cross-checking, real Rust `Vec`
-   iteration, or production `BTreeSet` internals. -/
+   iteration, or standard-library `BTreeSet` internals. -/
 import RaoManifest.Funs
 
 open Aeneas Aeneas.Std Result
@@ -150,6 +151,43 @@ def PlannerEntryCoreValid (entry : PlannerEntryCore) : Prop :=
       entry.link_target_path_id.val = 0)
   )
 
+def PlannerEntryOfSourceFacts
+    (source : PlannerSourceEntryCore)
+    (facts : PlannerMembershipFactsCore) : PlannerEntryCore :=
+  {
+    entry_type := source.entry_type,
+    path_id := source.path_id,
+    file_id := source.file_id,
+    link_target_path_id := source.link_target_path_id,
+    local_entry_valid := source.local_entry_valid,
+    path_seen_before := facts.path_seen_before,
+    file_id_seen_before := facts.file_id_seen_before,
+    hardlink_target_seen_regular_before :=
+      facts.hardlink_target_seen_regular_before
+  }
+
+def PlannerSourceEntryCoreValid
+    (source : PlannerSourceEntryCore)
+    (facts : PlannerMembershipFactsCore) : Prop :=
+  PlannerEntryCoreValid (PlannerEntryOfSourceFacts source facts)
+
+def InsertMembershipCoreValid (seenBefore inserted : Bool) : Prop :=
+  (seenBefore = false ∧ inserted = true) ∨
+  (seenBefore = true ∧ inserted = false)
+
+def PlannerMembershipFactsCoreValid
+    (source : PlannerSourceEntryCore)
+    (facts : PlannerMembershipFactsCore) : Prop :=
+  InsertMembershipCoreValid facts.path_seen_before facts.path_inserted ∧
+  InsertMembershipCoreValid facts.file_id_seen_before facts.file_id_inserted ∧
+  (
+    (source.entry_type = PLANNER_ENTRY_REGULAR ∧
+      facts.regular_path_seen_before = false ∧
+      facts.regular_path_inserted = true) ∨
+    (source.entry_type ≠ PLANNER_ENTRY_REGULAR ∧
+      facts.regular_path_inserted = false)
+  )
+
 def PlannerStepCoreValid
     (state : PlannerFoldStateCore) (entry : PlannerEntryCore) : Prop :=
   PlannerEntryCoreValid entry ∧
@@ -175,6 +213,43 @@ def PlannerFoldTraceValid :
     ∀ next,
       planner_fold_step_core state entry = ok (.Ok next) →
         PlannerFoldTraceValid next tail
+
+def PlannerMembershipStepCoreValid
+    (state : PlannerFoldStateCore)
+    (source : PlannerSourceEntryCore)
+    (facts : PlannerMembershipFactsCore) : Prop :=
+  PlannerSourceEntryCoreValid source facts ∧
+  PlannerMembershipFactsCoreValid source facts ∧
+  facts.path_seen_before = false ∧
+  facts.file_id_seen_before = false ∧
+  state.accepted_count.val + 1 < 2 ^ 64 ∧
+  (source.entry_type = PLANNER_ENTRY_REGULAR →
+    state.regular_seen_count.val + 1 < 2 ^ 64)
+
+structure PlannerMembershipTraceEntry where
+  source : PlannerSourceEntryCore
+  facts : PlannerMembershipFactsCore
+
+def plannerMembershipFoldCore :
+    PlannerFoldStateCore →
+    List PlannerMembershipTraceEntry →
+    Option PlannerFoldStateCore
+| state, [] => some state
+| state, entry :: tail =>
+    match planner_fold_step_from_membership_core
+        state entry.source entry.facts with
+    | ok (.Ok next) => plannerMembershipFoldCore next tail
+    | _ => none
+
+def PlannerMembershipFoldTraceValid :
+    PlannerFoldStateCore → List PlannerMembershipTraceEntry → Prop
+| _, [] => True
+| state, entry :: tail =>
+    PlannerMembershipStepCoreValid state entry.source entry.facts ∧
+    ∀ next,
+      planner_fold_step_from_membership_core state entry.source entry.facts =
+        ok (.Ok next) →
+        PlannerMembershipFoldTraceValid next tail
 
 def RichRegularFileWireOfCore (file : RichRegularFileCore)
     (count : Std.U64) : RichRegularFileWireCore :=
@@ -1518,6 +1593,97 @@ theorem planner_fold_step_core_success
     · intro _
       rfl
 
+/-- `BTreeSet::insert` returns true exactly when the value was not already
+    present. This proof-facing scalar contract is the membership bridge used by
+    the planner extraction. -/
+theorem validate_insert_membership_core_success
+    (seenBefore inserted : Bool)
+    (hvalid : InsertMembershipCoreValid seenBefore inserted) :
+    validate_insert_membership_core seenBefore inserted = ok (.Ok ()) := by
+  rcases hvalid with hNew | hDuplicate
+  · rcases hNew with ⟨hSeen, hInserted⟩
+    unfold validate_insert_membership_core
+    simp [hSeen, hInserted]
+  · rcases hDuplicate with ⟨hSeen, hInserted⟩
+    unfold validate_insert_membership_core
+    simp [hSeen, hInserted]
+
+theorem validate_planner_membership_facts_core_success
+    (source : PlannerSourceEntryCore)
+    (facts : PlannerMembershipFactsCore)
+    (hvalid : PlannerMembershipFactsCoreValid source facts) :
+    validate_planner_membership_facts_core source facts = ok (.Ok ()) := by
+  rcases hvalid with ⟨hPath, hFile, hRegularFacts⟩
+  have hPathValidate :=
+    validate_insert_membership_core_success
+      facts.path_seen_before facts.path_inserted hPath
+  have hFileValidate :=
+    validate_insert_membership_core_success
+      facts.file_id_seen_before facts.file_id_inserted hFile
+  unfold validate_planner_membership_facts_core
+  by_cases hRegular : source.entry_type = PLANNER_ENTRY_REGULAR
+  · rcases hRegularFacts with hRegularCase | hNonRegularCase
+    · rcases hRegularCase with
+        ⟨_, hRegularSeen, hRegularInserted⟩
+      have hRegularValidateClean :
+          validate_insert_membership_core false true = ok (.Ok ()) := by
+        unfold validate_insert_membership_core
+        simp
+      simp [hPathValidate, hFileValidate, hRegular,
+        hRegularSeen, hRegularInserted, hRegularValidateClean,
+        core.result.Result.Insts.CoreOpsTry.branch]
+    · rcases hNonRegularCase with ⟨hNotRegular, _⟩
+      contradiction
+  · rcases hRegularFacts with hRegularCase | hNonRegularCase
+    · rcases hRegularCase with ⟨hIsRegular, _⟩
+      contradiction
+    · rcases hNonRegularCase with ⟨_, hRegularInserted⟩
+      simp [hPathValidate, hFileValidate, hRegular, hRegularInserted,
+        core.result.Result.Insts.CoreOpsTry.branch]
+
+theorem planner_entry_from_membership_core_success
+    (source : PlannerSourceEntryCore)
+    (facts : PlannerMembershipFactsCore)
+    (hvalid : PlannerMembershipFactsCoreValid source facts) :
+    planner_entry_from_membership_core source facts =
+      ok (.Ok (PlannerEntryOfSourceFacts source facts)) := by
+  have hFactsValidate :=
+    validate_planner_membership_facts_core_success source facts hvalid
+  unfold planner_entry_from_membership_core PlannerEntryOfSourceFacts
+  simp [hFactsValidate, core.result.Result.Insts.CoreOpsTry.branch]
+
+theorem planner_fold_step_from_membership_core_success
+    (state : PlannerFoldStateCore)
+    (source : PlannerSourceEntryCore)
+    (facts : PlannerMembershipFactsCore)
+    (hvalid : PlannerMembershipStepCoreValid state source facts) :
+    ∃ next,
+      planner_fold_step_from_membership_core state source facts =
+        ok (.Ok next) ∧
+      next.accepted_count.val = state.accepted_count.val + 1 ∧
+      (source.entry_type = PLANNER_ENTRY_REGULAR →
+        next.regular_seen_count.val = state.regular_seen_count.val + 1) ∧
+      (source.entry_type ≠ PLANNER_ENTRY_REGULAR →
+        next.regular_seen_count = state.regular_seen_count) := by
+  rcases hvalid with
+    ⟨hSource, hFacts, hPathSeen, hFileSeen, hAcceptedLt, hRegularLt⟩
+  have hEntryFrom :=
+    planner_entry_from_membership_core_success source facts hFacts
+  have hStep :
+      PlannerStepCoreValid state (PlannerEntryOfSourceFacts source facts) := by
+    unfold PlannerStepCoreValid PlannerEntryOfSourceFacts
+    exact ⟨hSource, hPathSeen, hFileSeen, hAcceptedLt, hRegularLt⟩
+  rcases planner_fold_step_core_success
+      state (PlannerEntryOfSourceFacts source facts) hStep with
+    ⟨next, hNext, hAccepted, hRegular, hNonRegular⟩
+  refine ⟨next, ?_, hAccepted, ?_, ?_⟩
+  · unfold planner_fold_step_from_membership_core
+    simp [hEntryFrom, hNext, core.result.Result.Insts.CoreOpsTry.branch]
+  · intro hReg
+    exact hRegular hReg
+  · intro hNotReg
+    exact hNonRegular hNotReg
+
 /-- Arbitrary manifest-planner fold theorem.
 
     The Rust extraction exposes the production loop as a generated fold step.
@@ -1541,6 +1707,31 @@ theorem planner_fold_core_success_arbitrary
       rcases ih next (hTail next hNext) with ⟨final, hFinal⟩
       refine ⟨final, ?_⟩
       unfold plannerFoldCore
+      simp [hNext, hFinal]
+
+/-- Arbitrary manifest-planner membership bridge theorem.
+
+    Each element carries a production-source entry plus the scalar membership
+    facts corresponding to the planner's `BTreeSet` contains/insert results.
+    If every generated step satisfies that membership contract and the planner
+    validity checks, the membership bridge reaches a final fold state for an
+    arbitrary list of entries. -/
+theorem planner_membership_fold_core_success_arbitrary
+    (state : PlannerFoldStateCore)
+    (entries : List PlannerMembershipTraceEntry)
+    (hvalid : PlannerMembershipFoldTraceValid state entries) :
+    ∃ final, plannerMembershipFoldCore state entries = some final := by
+  induction entries generalizing state with
+  | nil =>
+      exact ⟨state, rfl⟩
+  | cons entry tail ih =>
+      rcases hvalid with ⟨hStep, hTail⟩
+      rcases planner_fold_step_from_membership_core_success
+          state entry.source entry.facts hStep with
+        ⟨next, hNext, _, _, _⟩
+      rcases ih next (hTail next hNext) with ⟨final, hFinal⟩
+      refine ⟨final, ?_⟩
+      unfold plannerMembershipFoldCore
       simp [hNext, hFinal]
 
 theorem validate_manifest_array_core_success
