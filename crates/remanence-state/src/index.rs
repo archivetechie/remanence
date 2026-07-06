@@ -1097,6 +1097,35 @@ impl CatalogIndex {
         Ok(operations)
     }
 
+    /// Return active media-readiness fences that block a new operation.
+    ///
+    /// `library_robotics` should be true for operations that may issue
+    /// changer moves or otherwise depend on the selected logical-library
+    /// snapshot remaining settled. Specific drive/tape operations should also
+    /// pass the resolved drive element and/or barcode.
+    pub fn media_readiness_admission_conflicts(
+        &self,
+        library_serial: &str,
+        drive_element: Option<u16>,
+        barcode: Option<&str>,
+        library_robotics: bool,
+    ) -> Result<Vec<MediaReadinessOperationRecord>, StateError> {
+        let barcode = barcode.map(str::trim).filter(|value| !value.is_empty());
+        let drive_element = drive_element.map(i64::from);
+        Ok(self
+            .list_active_media_readiness_operations(Some(library_serial))?
+            .into_iter()
+            .filter(|record| {
+                media_readiness_record_conflicts_with_admission(
+                    record,
+                    drive_element,
+                    barcode,
+                    library_robotics,
+                )
+            })
+            .collect())
+    }
+
     /// Run SQLite quick_check and return the result text.
     pub fn quick_check(&self) -> Result<String, StateError> {
         self.conn
@@ -7332,6 +7361,50 @@ fn media_readiness_operation_from_row(
     })
 }
 
+fn media_readiness_record_conflicts_with_admission(
+    record: &MediaReadinessOperationRecord,
+    drive_element: Option<i64>,
+    barcode: Option<&str>,
+    library_robotics: bool,
+) -> bool {
+    if media_readiness_scope_blocks_whole_library(record.dirty_scope.as_deref()) {
+        return true;
+    }
+    if library_robotics {
+        return true;
+    }
+    if drive_element.is_some_and(|drive| record.drive_element == drive) {
+        return true;
+    }
+    barcode.is_some_and(|barcode| {
+        record
+            .barcode
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some_and(|record_barcode| record_barcode.eq_ignore_ascii_case(barcode))
+    })
+}
+
+fn media_readiness_scope_blocks_whole_library(dirty_scope: Option<&str>) -> bool {
+    let Some(scope) = dirty_scope.map(str::trim).filter(|scope| !scope.is_empty()) else {
+        return true;
+    };
+    let mut recognized = true;
+    for token in scope
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+    {
+        match token.as_str() {
+            "drive" | "tape" | "none" => {}
+            "library" | "snapshot" => return true,
+            _ => recognized = false,
+        }
+    }
+    !recognized
+}
+
 fn sqlite_open_error(path: &Path, err: rusqlite::Error) -> StateError {
     StateError::Index {
         context: format!("open sqlite {}", path.display()),
@@ -8667,6 +8740,205 @@ mod tests {
             .expect("lookup")
             .expect("readiness operation must survive rebuild clear");
         assert_eq!(record.barcode.as_deref(), Some("AOX031L9"));
+    }
+
+    #[test]
+    fn media_readiness_admission_conflicts_are_scoped_and_robotics_safe() {
+        let temp = tempfile::Builder::new()
+            .prefix("rem-readiness-admission")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let operation_id = Uuid::from_u128(0x9012);
+
+        index
+            .record_media_readiness_operation(MediaReadinessOperationInput {
+                operation_id,
+                run_id: None,
+                library_serial: "LIB-A".to_string(),
+                changer_sg: Some("/dev/sg8".to_string()),
+                drive_element: 0x0002,
+                drive_sg: Some("/dev/sg11".to_string()),
+                drive_serial: Some("DRV2".to_string()),
+                barcode: Some("AOX032L9".to_string()),
+                source_slot: Some(0x03ed),
+                media_generation: Some(9),
+                phase: "readiness_poll".to_string(),
+                state: "media_initializing".to_string(),
+                dirty_scope: Some("drive+tape".to_string()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .expect("record readiness");
+
+        assert_eq!(
+            index
+                .media_readiness_admission_conflicts("LIB-A", Some(0x0002), Some("OTHERL9"), false,)
+                .expect("drive conflict")
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .media_readiness_admission_conflicts("LIB-A", Some(0x0001), Some("AOX032L9"), false)
+                .expect("barcode conflict")
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .media_readiness_admission_conflicts(
+                    "LIB-A",
+                    Some(0x0001),
+                    Some(" aox032l9 "),
+                    false
+                )
+                .expect("normalized barcode conflict")
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .media_readiness_admission_conflicts("LIB-A", Some(0x0001), Some("OTHERL9"), true)
+                .expect("robotics conflict")
+                .len(),
+            1
+        );
+        assert!(index
+            .media_readiness_admission_conflicts("LIB-B", Some(0x0002), Some("AOX032L9"), true)
+            .expect("different library")
+            .is_empty());
+        assert!(index
+            .media_readiness_admission_conflicts("LIB-A", Some(0x0001), Some("OTHERL9"), false)
+            .expect("unrelated target")
+            .is_empty());
+
+        let library_scope_operation = Uuid::from_u128(0x9013);
+        index
+            .record_media_readiness_operation(MediaReadinessOperationInput {
+                operation_id: library_scope_operation,
+                run_id: None,
+                library_serial: "LIB-A".to_string(),
+                changer_sg: Some("/dev/sg8".to_string()),
+                drive_element: 0x0002,
+                drive_sg: Some("/dev/sg11".to_string()),
+                drive_serial: Some("DRV2".to_string()),
+                barcode: Some("AOX033L9".to_string()),
+                source_slot: Some(0x03ee),
+                media_generation: Some(9),
+                phase: "readiness_poll".to_string(),
+                state: "transport_unknown".to_string(),
+                dirty_scope: Some("selected-library-snapshot".to_string()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .expect("record library readiness");
+        assert_eq!(
+            index
+                .media_readiness_admission_conflicts("LIB-A", Some(0x0001), Some("OTHERL9"), false)
+                .expect("library-scope conflict")
+                .len(),
+            1
+        );
+        index
+            .record_media_readiness_transition(MediaReadinessTransitionInput {
+                operation_id: library_scope_operation,
+                phase: Some("released".to_string()),
+                state: "released".to_string(),
+                dirty_scope: Some("none".to_string()),
+                last_cdb_opcode: None,
+                last_sense_raw: None,
+                last_sense_key: None,
+                last_asc: None,
+                last_ascq: None,
+                last_host_status: None,
+                last_driver_status: None,
+                target_status: None,
+                transport_class: None,
+                cancel_source: None,
+                signal: None,
+                evidence_path: None,
+                last_error_json: None,
+                quarantine_id: Some("mrq-test".to_string()),
+            })
+            .expect("release library readiness");
+
+        let missing_scope_operation = Uuid::from_u128(0x9014);
+        index
+            .record_media_readiness_operation(MediaReadinessOperationInput {
+                operation_id: missing_scope_operation,
+                run_id: None,
+                library_serial: "LIB-A".to_string(),
+                changer_sg: Some("/dev/sg8".to_string()),
+                drive_element: 0x0002,
+                drive_sg: Some("/dev/sg11".to_string()),
+                drive_serial: Some("DRV2".to_string()),
+                barcode: Some("AOX034L9".to_string()),
+                source_slot: Some(0x03ef),
+                media_generation: Some(9),
+                phase: "readiness_poll".to_string(),
+                state: "transport_unknown".to_string(),
+                dirty_scope: None,
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .expect("record missing-scope readiness");
+        assert_eq!(
+            index
+                .media_readiness_admission_conflicts("LIB-A", Some(0x0001), Some("OTHERL9"), false)
+                .expect("missing scope fails closed")
+                .len(),
+            1
+        );
+        index
+            .record_media_readiness_transition(MediaReadinessTransitionInput {
+                operation_id: missing_scope_operation,
+                phase: Some("released".to_string()),
+                state: "released".to_string(),
+                dirty_scope: Some("none".to_string()),
+                last_cdb_opcode: None,
+                last_sense_raw: None,
+                last_sense_key: None,
+                last_asc: None,
+                last_ascq: None,
+                last_host_status: None,
+                last_driver_status: None,
+                target_status: None,
+                transport_class: None,
+                cancel_source: None,
+                signal: None,
+                evidence_path: None,
+                last_error_json: None,
+                quarantine_id: Some("mrq-test".to_string()),
+            })
+            .expect("release missing-scope readiness");
+
+        index
+            .record_media_readiness_transition(MediaReadinessTransitionInput {
+                operation_id,
+                phase: Some("ready".to_string()),
+                state: "ready".to_string(),
+                dirty_scope: Some("none".to_string()),
+                last_cdb_opcode: Some(0x00),
+                last_sense_raw: None,
+                last_sense_key: None,
+                last_asc: None,
+                last_ascq: None,
+                last_host_status: None,
+                last_driver_status: None,
+                target_status: None,
+                transport_class: None,
+                cancel_source: None,
+                signal: None,
+                evidence_path: None,
+                last_error_json: None,
+                quarantine_id: None,
+            })
+            .expect("ready transition");
+        assert!(index
+            .media_readiness_admission_conflicts("LIB-A", Some(0x0002), Some("AOX032L9"), true)
+            .expect("ready no conflict")
+            .is_empty());
     }
 
     #[test]

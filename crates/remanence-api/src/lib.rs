@@ -28,8 +28,9 @@ use remanence_format::{
 use remanence_state::{
     AuditActor, AuditEvent, AuditEventRecord, AuditSubject, CatalogIndex, CatalogUnitFilter,
     CatalogUnitRecord, DriveCorrelationRollupRecord, DriveHealthSnapshotInput, FileAuditLog,
-    NativeObjectCopyRecord, NativeObjectFileRecord, NativeObjectRecord, OperationRecord, RemConfig,
-    SourceLayer, StateError, TapeFileRecord, TapePoolConfig, TapePoolRecord, TapeRecord,
+    MediaReadinessOperationRecord, NativeObjectCopyRecord, NativeObjectFileRecord,
+    NativeObjectRecord, OperationRecord, RemConfig, SourceLayer, StateError, TapeFileRecord,
+    TapePoolConfig, TapePoolRecord, TapeRecord,
 };
 use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
@@ -2793,6 +2794,50 @@ pub(crate) fn status_from_state_error(err: StateError) -> Status {
     }
 }
 
+pub(crate) fn media_readiness_conflict_status(
+    action: &str,
+    conflicts: &[MediaReadinessOperationRecord],
+) -> Status {
+    let Some(first) = conflicts.first() else {
+        return Status::internal("media-readiness admission conflict called without conflicts");
+    };
+    Status::failed_precondition(format!(
+        "{action} is blocked by active media-readiness fence {} operation={} library={} drive=0x{:04x} barcode={} state={}",
+        first
+            .quarantine_id
+            .as_deref()
+            .unwrap_or("(no-quarantine-id)"),
+        first.operation_id,
+        first.library_serial,
+        first.drive_element,
+        first.barcode.as_deref().unwrap_or("(unknown)"),
+        first.state
+    ))
+}
+
+pub(crate) fn ensure_media_readiness_admitted(
+    index: &CatalogIndex,
+    action: &str,
+    library_serial: &str,
+    drive_element: Option<u16>,
+    barcode: Option<&str>,
+    library_robotics: bool,
+) -> Result<(), Status> {
+    let conflicts = index
+        .media_readiness_admission_conflicts(
+            library_serial,
+            drive_element,
+            barcode,
+            library_robotics,
+        )
+        .map_err(status_from_state_error)?;
+    if conflicts.is_empty() {
+        Ok(())
+    } else {
+        Err(media_readiness_conflict_status(action, &conflicts))
+    }
+}
+
 fn find_object_for_key(
     state: &ApiState,
     key: Option<pb::get_object_request::Key>,
@@ -3464,6 +3509,82 @@ mod tests {
     const POOL_WRITE_TAPE_UUID: [u8; 16] = [4u8; 16];
     const SECOND_POOL_WRITE_TAPE_UUID: [u8; 16] = [5u8; 16];
     const API_SESSION_BLOCK_SIZE: u32 = 4096;
+
+    #[test]
+    fn media_readiness_admission_helper_blocks_active_fence() {
+        let temp = tempfile::Builder::new()
+            .prefix("rem-api-readiness-admission")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let operation_id = Uuid::from_u128(0xabc);
+        index
+            .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+                operation_id,
+                run_id: None,
+                library_serial: "LIB-A".to_string(),
+                changer_sg: None,
+                drive_element: 0x0002,
+                drive_sg: None,
+                drive_serial: Some("DRV2".to_string()),
+                barcode: Some("AOX032L9".to_string()),
+                source_slot: Some(0x03ed),
+                media_generation: Some(9),
+                phase: "readiness_poll".to_string(),
+                state: "media_initializing".to_string(),
+                dirty_scope: Some("drive+tape".to_string()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .expect("record readiness operation");
+        index
+            .record_media_readiness_transition(remanence_state::MediaReadinessTransitionInput {
+                operation_id,
+                phase: Some("readiness_poll".to_string()),
+                state: "media_initializing".to_string(),
+                dirty_scope: Some("drive+tape".to_string()),
+                last_cdb_opcode: Some(0x00),
+                last_sense_raw: None,
+                last_sense_key: Some(0x02),
+                last_asc: Some(0x04),
+                last_ascq: Some(0x01),
+                last_host_status: None,
+                last_driver_status: None,
+                target_status: None,
+                transport_class: None,
+                cancel_source: None,
+                signal: None,
+                evidence_path: None,
+                last_error_json: None,
+                quarantine_id: Some("mrq-test".to_string()),
+            })
+            .expect("record readiness transition");
+
+        let err = ensure_media_readiness_admitted(
+            &index,
+            "open session",
+            "LIB-A",
+            Some(0x0002),
+            Some("AOX032L9"),
+            false,
+        )
+        .expect_err("active same-drive/barcode fence must block admission");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("mrq-test"), "{err}");
+        assert!(err.message().contains("AOX032L9"), "{err}");
+        assert!(err.message().contains("media_initializing"), "{err}");
+
+        ensure_media_readiness_admitted(
+            &index,
+            "open session",
+            "LIB-B",
+            Some(0x0002),
+            Some("AOX032L9"),
+            true,
+        )
+        .expect("different selected library is not blocked");
+    }
+
     #[cfg(feature = "foreign-bru")]
     const CHKSUM_OFFSET: usize = 0x080;
     #[cfg(feature = "foreign-bru")]
@@ -6920,6 +7041,8 @@ BCw3Wyv2UWY=
             session_id,
             crate::write_owner::MountedSession {
                 bay: 0x0101,
+                library_serial: "LIB-A".to_string(),
+                barcode: Some("AOX001L9".to_string()),
                 home_slot: Some(0x1001),
                 tape_uuid: TAPE_UUID,
                 drive_uuid: Some(Uuid::new_v4().as_bytes().to_vec()),
@@ -6938,12 +7061,16 @@ BCw3Wyv2UWY=
         let shared_bay = 0x0101;
         let session_a = crate::write_owner::MountedSession {
             bay: shared_bay,
+            library_serial: "LIB-A".to_string(),
+            barcode: Some("AOX001L9".to_string()),
             home_slot: None,
             tape_uuid: TAPE_UUID,
             drive_uuid: Some(Uuid::from_u128(0x1111).as_bytes().to_vec()),
         };
         let session_b = crate::write_owner::MountedSession {
             bay: shared_bay,
+            library_serial: "LIB-A".to_string(),
+            barcode: Some("AOX002L9".to_string()),
             home_slot: None,
             tape_uuid: TAPE_UUID,
             drive_uuid: Some(Uuid::from_u128(0x2222).as_bytes().to_vec()),
@@ -7025,6 +7152,8 @@ BCw3Wyv2UWY=
             session_id,
             crate::write_owner::MountedSession {
                 bay,
+                library_serial: "LIB-A".to_string(),
+                barcode: Some("AOX001L9".to_string()),
                 home_slot: Some(0x0400),
                 tape_uuid: [0xAB; 16],
                 drive_uuid: Some(drive_uuid.clone()),
@@ -7474,6 +7603,8 @@ BCw3Wyv2UWY=
             session_id,
             crate::write_owner::MountedSession {
                 bay: 0x0101,
+                library_serial: "LIB-A".to_string(),
+                barcode: Some("AOX001L9".to_string()),
                 home_slot: None,
                 tape_uuid: TAPE_UUID,
                 drive_uuid: Some(Uuid::new_v4().as_bytes().to_vec()),
@@ -7561,6 +7692,8 @@ BCw3Wyv2UWY=
             session_id,
             crate::write_owner::MountedSession {
                 bay: 0x0101,
+                library_serial: "LIB-A".to_string(),
+                barcode: Some("AOX001L9".to_string()),
                 home_slot: None,
                 tape_uuid: TAPE_UUID,
                 drive_uuid: Some(Uuid::new_v4().as_bytes().to_vec()),
@@ -7644,6 +7777,8 @@ BCw3Wyv2UWY=
             session_id,
             crate::write_owner::MountedSession {
                 bay: 0x0101,
+                library_serial: "LIB-A".to_string(),
+                barcode: Some("AOX001L9".to_string()),
                 home_slot: None,
                 tape_uuid: TAPE_UUID,
                 drive_uuid: Some(Uuid::new_v4().as_bytes().to_vec()),
@@ -7731,6 +7866,8 @@ BCw3Wyv2UWY=
             session_id,
             crate::write_owner::MountedSession {
                 bay: 0x0101,
+                library_serial: "LIB-A".to_string(),
+                barcode: Some("AOX001L9".to_string()),
                 home_slot: None,
                 tape_uuid: TAPE_UUID,
                 drive_uuid: Some(Uuid::new_v4().as_bytes().to_vec()),
