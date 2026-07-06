@@ -43,6 +43,21 @@ init_media_not_ready() {
   grep -qiE 'media not ready for tape init|media initializing/calibrating|logical unit becoming ready|target busy during readiness probe|transport completion unknown during readiness probe' "$path"
 }
 
+init_transport_unknown() {
+  local path="$1"
+  grep -qiE 'transport error|completion unknown|DID_TIME_OUT|host_status=0x|task aborted|resetting scsi|SG_IO transport error' "$path"
+}
+
+record_init_readiness_stop() {
+  local barcode="$1" path="$2"
+  fieldtest_evidence_record "$SCRIPT_NAME" "init-${barcode}" INFO "media not ready/calibrating for ${barcode}; leave the tape in the drive, run 09-media-ready.sh, and do not rerun init until readiness is ready" "$path"
+}
+
+record_init_transport_stop() {
+  local barcode="$1" path="$2"
+  fieldtest_evidence_record "$SCRIPT_NAME" "init-${barcode}" FAIL "transport/completion-unknown while initializing ${barcode}; stop destructive escalation and collect RCA evidence" "$path"
+}
+
 main() {
   if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     usage
@@ -111,25 +126,41 @@ main() {
       fi
     else
       if init_media_not_ready "$init_out"; then
-        fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" FAIL "media not ready/calibrating for ${data_barcodes[$idx]}; wait for the library UI to leave Calib/initializing, then rerun 10-init-pools" "$init_out"
+        record_init_readiness_stop "${data_barcodes[$idx]}" "$init_out"
+        exit 10
+      fi
+      if init_transport_unknown "$init_out"; then
+        record_init_transport_stop "${data_barcodes[$idx]}" "$init_out"
         exit 1
       fi
     fi
     if ! fieldtest_capture_text "$init_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial"; then
       if init_media_not_ready "$init_out"; then
-        fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" FAIL "media not ready/calibrating for ${data_barcodes[$idx]}; wait for the library UI to leave Calib/initializing, then rerun 10-init-pools" "$init_out"
+        record_init_readiness_stop "${data_barcodes[$idx]}" "$init_out"
+        exit 10
+      fi
+      if init_transport_unknown "$init_out"; then
+        record_init_transport_stop "${data_barcodes[$idx]}" "$init_out"
         exit 1
       fi
       init_level="force"
       if ! fieldtest_capture_text "$init_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --force; then
         if init_media_not_ready "$init_out"; then
-          fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" FAIL "media not ready/calibrating for ${data_barcodes[$idx]}; wait for the library UI to leave Calib/initializing, then rerun 10-init-pools" "$init_out"
+          record_init_readiness_stop "${data_barcodes[$idx]}" "$init_out"
+          exit 10
+        fi
+        if init_transport_unknown "$init_out"; then
+          record_init_transport_stop "${data_barcodes[$idx]}" "$init_out"
           exit 1
         fi
         init_level="clobber-data"
         if ! fieldtest_capture_text "$init_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --clobber-data; then
           if init_media_not_ready "$init_out"; then
-            fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" FAIL "media not ready/calibrating for ${data_barcodes[$idx]}; wait for the library UI to leave Calib/initializing, then rerun 10-init-pools" "$init_out"
+            record_init_readiness_stop "${data_barcodes[$idx]}" "$init_out"
+            exit 10
+          fi
+          if init_transport_unknown "$init_out"; then
+            record_init_transport_stop "${data_barcodes[$idx]}" "$init_out"
             exit 1
           fi
           if grep -q "needs-explicit-rebuild" "$init_out"; then

@@ -20,7 +20,7 @@ use crate::config::{derive_tape_pool_from_voltag, TapePoolRuleConfig};
 use crate::error::StateError;
 
 /// Current Layer 4 SQLite schema version.
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 11;
 const LEGACY_TAPE_POOL_MEMBERSHIPS_TABLE: &str = concat!("tape_pool_", "memberships");
 /// Catalog value for an unencrypted RAO copy row.
 pub const OBJECT_COPY_REPRESENTATION_PLAINTEXT: &str = "plaintext";
@@ -200,6 +200,147 @@ pub struct OperationRecord {
     pub started_at_utc: String,
     /// Last projected update timestamp.
     pub updated_at_utc: String,
+}
+
+/// Input for starting or refreshing a durable media-readiness operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaReadinessOperationInput {
+    /// Operation UUID as canonical id.
+    pub operation_id: Uuid,
+    /// Optional caller/run id that groups fieldtest attempts.
+    pub run_id: Option<String>,
+    /// Selected library serial. This is the durable ownership boundary.
+    pub library_serial: String,
+    /// Changer sg path observed when the operation was recorded.
+    pub changer_sg: Option<String>,
+    /// Changer drive element address.
+    pub drive_element: u16,
+    /// Drive sg path observed when the operation was recorded.
+    pub drive_sg: Option<String>,
+    /// Drive serial observed through selected-library discovery.
+    pub drive_serial: Option<String>,
+    /// Cartridge barcode, when known.
+    pub barcode: Option<String>,
+    /// Source storage slot element, when the operation moved media from a slot.
+    pub source_slot: Option<u16>,
+    /// LTO generation hint, when known.
+    pub media_generation: Option<u8>,
+    /// Current coarse operation phase.
+    pub phase: String,
+    /// Current durable readiness state.
+    pub state: String,
+    /// Scope that must be fenced while the state is non-terminal.
+    pub dirty_scope: Option<String>,
+    /// Optional readiness deadline timestamp.
+    pub deadline_at_utc: Option<String>,
+    /// Evidence artifact path for the operation.
+    pub evidence_path: Option<String>,
+}
+
+/// Input for recording one durable media-readiness transition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaReadinessTransitionInput {
+    /// Operation UUID to update.
+    pub operation_id: Uuid,
+    /// New phase, when it changed.
+    pub phase: Option<String>,
+    /// New durable readiness state.
+    pub state: String,
+    /// New dirty/fence scope, when known.
+    pub dirty_scope: Option<String>,
+    /// Last CDB opcode associated with this transition.
+    pub last_cdb_opcode: Option<u8>,
+    /// Raw sense bytes as hex or another stable diagnostic string.
+    pub last_sense_raw: Option<String>,
+    /// Decoded sense key.
+    pub last_sense_key: Option<u8>,
+    /// Decoded Additional Sense Code.
+    pub last_asc: Option<u8>,
+    /// Decoded Additional Sense Code Qualifier.
+    pub last_ascq: Option<u8>,
+    /// SG_IO host status, if available.
+    pub last_host_status: Option<i64>,
+    /// SG_IO driver status, if available.
+    pub last_driver_status: Option<i64>,
+    /// SCSI target status, if available.
+    pub target_status: Option<u8>,
+    /// Transport classification, such as `unknown`.
+    pub transport_class: Option<String>,
+    /// Cancellation source, if any.
+    pub cancel_source: Option<String>,
+    /// Signal name/number involved in cancellation, if any.
+    pub signal: Option<String>,
+    /// Evidence artifact path for this transition.
+    pub evidence_path: Option<String>,
+    /// Structured error detail.
+    pub last_error_json: Option<String>,
+    /// Quarantine id associated with this operation.
+    pub quarantine_id: Option<String>,
+}
+
+/// Durable media-readiness operation row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaReadinessOperationRecord {
+    /// Operation UUID as canonical text.
+    pub operation_id: String,
+    /// Optional caller/run id that groups fieldtest attempts.
+    pub run_id: Option<String>,
+    /// Selected library serial.
+    pub library_serial: String,
+    /// Changer sg path observed when recorded.
+    pub changer_sg: Option<String>,
+    /// Changer drive element address.
+    pub drive_element: i64,
+    /// Drive sg path observed when recorded.
+    pub drive_sg: Option<String>,
+    /// Drive serial observed through selected-library discovery.
+    pub drive_serial: Option<String>,
+    /// Cartridge barcode, when known.
+    pub barcode: Option<String>,
+    /// Source storage slot element, when known.
+    pub source_slot: Option<i64>,
+    /// LTO generation hint, when known.
+    pub media_generation: Option<i64>,
+    /// Current coarse phase.
+    pub phase: String,
+    /// Current durable readiness state.
+    pub state: String,
+    /// Scope that remains fenced while non-terminal.
+    pub dirty_scope: Option<String>,
+    /// Operation start timestamp.
+    pub started_at_utc: String,
+    /// Last update timestamp.
+    pub updated_at_utc: String,
+    /// Optional readiness deadline timestamp.
+    pub deadline_at_utc: Option<String>,
+    /// Last CDB opcode associated with this row.
+    pub last_cdb_opcode: Option<i64>,
+    /// Raw sense bytes as diagnostic text.
+    pub last_sense_raw: Option<String>,
+    /// Decoded sense key.
+    pub last_sense_key: Option<i64>,
+    /// Decoded ASC.
+    pub last_asc: Option<i64>,
+    /// Decoded ASCQ.
+    pub last_ascq: Option<i64>,
+    /// SG_IO host status.
+    pub last_host_status: Option<i64>,
+    /// SG_IO driver status.
+    pub last_driver_status: Option<i64>,
+    /// SCSI target status.
+    pub target_status: Option<i64>,
+    /// Transport classification.
+    pub transport_class: Option<String>,
+    /// Cancellation source.
+    pub cancel_source: Option<String>,
+    /// Signal name/number involved in cancellation.
+    pub signal: Option<String>,
+    /// Evidence artifact path.
+    pub evidence_path: Option<String>,
+    /// Structured error detail.
+    pub last_error_json: Option<String>,
+    /// Quarantine id associated with this row.
+    pub quarantine_id: Option<String>,
 }
 
 /// Non-terminal session found during startup replay.
@@ -741,6 +882,219 @@ impl CatalogIndex {
             .optional()
             .map(|row| row.is_some())
             .map_err(|err| sqlite_error("check sqlite table existence", err))
+    }
+
+    /// Start or refresh a durable media-readiness operation.
+    pub fn record_media_readiness_operation(
+        &mut self,
+        input: MediaReadinessOperationInput,
+    ) -> Result<MediaReadinessOperationRecord, StateError> {
+        let now = now_utc()?;
+        self.conn
+            .execute(
+                "insert into media_readiness_ops(
+                     operation_id, run_id, library_serial, changer_sg,
+                     drive_element, drive_sg, drive_serial, barcode,
+                     source_slot, media_generation, phase, state, dirty_scope,
+                     started_at_utc, updated_at_utc, deadline_at_utc,
+                     evidence_path
+                 )
+                 values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                        ?14, ?14, ?15, ?16)
+                 on conflict(operation_id) do update set
+                     run_id = excluded.run_id,
+                     library_serial = excluded.library_serial,
+                     changer_sg = excluded.changer_sg,
+                     drive_element = excluded.drive_element,
+                     drive_sg = excluded.drive_sg,
+                     drive_serial = excluded.drive_serial,
+                     barcode = excluded.barcode,
+                     source_slot = excluded.source_slot,
+                     media_generation = excluded.media_generation,
+                     phase = excluded.phase,
+                     state = excluded.state,
+                     dirty_scope = excluded.dirty_scope,
+                     updated_at_utc = excluded.updated_at_utc,
+                     deadline_at_utc = excluded.deadline_at_utc,
+                     evidence_path = excluded.evidence_path",
+                params![
+                    input.operation_id.to_string(),
+                    input.run_id,
+                    input.library_serial,
+                    input.changer_sg,
+                    i64::from(input.drive_element),
+                    input.drive_sg,
+                    input.drive_serial,
+                    input.barcode,
+                    input.source_slot.map(i64::from),
+                    input.media_generation.map(i64::from),
+                    input.phase,
+                    input.state,
+                    input.dirty_scope,
+                    now,
+                    input.deadline_at_utc,
+                    input.evidence_path,
+                ],
+            )
+            .map_err(|err| sqlite_error("record media readiness operation", err))?;
+        self.media_readiness_operation(input.operation_id)?
+            .ok_or_else(|| StateError::IndexCorrupt("media readiness operation vanished".into()))
+    }
+
+    /// Record a durable transition for an existing media-readiness operation.
+    pub fn record_media_readiness_transition(
+        &mut self,
+        input: MediaReadinessTransitionInput,
+    ) -> Result<MediaReadinessOperationRecord, StateError> {
+        let now = now_utc()?;
+        let operation_id = input.operation_id.to_string();
+        let last_cdb_opcode = input.last_cdb_opcode.map(i64::from);
+        let last_sense_key = input.last_sense_key.map(i64::from);
+        let last_asc = input.last_asc.map(i64::from);
+        let last_ascq = input.last_ascq.map(i64::from);
+        let target_status = input.target_status.map(i64::from);
+        let changed = self
+            .conn
+            .execute(
+                "update media_readiness_ops
+                 set phase = coalesce(?2, phase),
+                     state = ?3,
+                     dirty_scope = coalesce(?4, dirty_scope),
+                     updated_at_utc = ?5,
+                     last_cdb_opcode = ?6,
+                     last_sense_raw = ?7,
+                     last_sense_key = ?8,
+                     last_asc = ?9,
+                     last_ascq = ?10,
+                     last_host_status = ?11,
+                     last_driver_status = ?12,
+                     target_status = ?13,
+                     transport_class = ?14,
+                     cancel_source = ?15,
+                     signal = ?16,
+                     evidence_path = coalesce(?17, evidence_path),
+                     last_error_json = ?18,
+	                     quarantine_id = coalesce(?19, quarantine_id)
+	                 where operation_id = ?1",
+                params![
+                    operation_id.as_str(),
+                    input.phase.as_deref(),
+                    input.state.as_str(),
+                    input.dirty_scope.as_deref(),
+                    now.as_str(),
+                    last_cdb_opcode,
+                    input.last_sense_raw.as_deref(),
+                    last_sense_key,
+                    last_asc,
+                    last_ascq,
+                    input.last_host_status,
+                    input.last_driver_status,
+                    target_status,
+                    input.transport_class.as_deref(),
+                    input.cancel_source.as_deref(),
+                    input.signal.as_deref(),
+                    input.evidence_path.as_deref(),
+                    input.last_error_json.as_deref(),
+                    input.quarantine_id.as_deref(),
+                ],
+            )
+            .map_err(|err| sqlite_error("record media readiness transition", err))?;
+        if changed == 0 {
+            return Err(StateError::IndexCorrupt(format!(
+                "unknown media readiness operation {}",
+                input.operation_id
+            )));
+        }
+        self.conn
+            .execute(
+                "insert into media_readiness_transitions(
+                     operation_id, phase, state, dirty_scope, at_utc,
+                     last_cdb_opcode, last_sense_raw, last_sense_key, last_asc,
+                     last_ascq, last_host_status, last_driver_status,
+                     target_status, transport_class, cancel_source, signal,
+                     evidence_path, last_error_json, quarantine_id
+                 )
+                 values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                        ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                params![
+                    operation_id.as_str(),
+                    input.phase.as_deref(),
+                    input.state.as_str(),
+                    input.dirty_scope.as_deref(),
+                    now.as_str(),
+                    last_cdb_opcode,
+                    input.last_sense_raw.as_deref(),
+                    last_sense_key,
+                    last_asc,
+                    last_ascq,
+                    input.last_host_status,
+                    input.last_driver_status,
+                    target_status,
+                    input.transport_class.as_deref(),
+                    input.cancel_source.as_deref(),
+                    input.signal.as_deref(),
+                    input.evidence_path.as_deref(),
+                    input.last_error_json.as_deref(),
+                    input.quarantine_id.as_deref(),
+                ],
+            )
+            .map_err(|err| sqlite_error("record media readiness transition history", err))?;
+        self.media_readiness_operation(input.operation_id)?
+            .ok_or_else(|| StateError::IndexCorrupt("media readiness operation vanished".into()))
+    }
+
+    /// Fetch a durable media-readiness operation by id.
+    pub fn media_readiness_operation(
+        &self,
+        operation_id: Uuid,
+    ) -> Result<Option<MediaReadinessOperationRecord>, StateError> {
+        let mut sql = MEDIA_READINESS_OPERATION_SELECT.to_string();
+        sql.push_str(" where operation_id = ?1");
+        self.conn
+            .query_row(
+                sql.as_str(),
+                params![operation_id.to_string()],
+                media_readiness_operation_from_row,
+            )
+            .optional()
+            .map_err(|err| sqlite_error("lookup media readiness operation", err))
+    }
+
+    /// List active media-readiness fences, optionally scoped to one library.
+    pub fn list_active_media_readiness_operations(
+        &self,
+        library_serial: Option<&str>,
+    ) -> Result<Vec<MediaReadinessOperationRecord>, StateError> {
+        let mut sql = MEDIA_READINESS_OPERATION_SELECT.to_string();
+        sql.push_str(
+            " where state not in ('ready', 'released')
+                and coalesce(dirty_scope, 'drive+tape') <> 'none'",
+        );
+        if library_serial.is_some() {
+            sql.push_str(" and library_serial = ?1");
+        }
+        sql.push_str(" order by updated_at_utc desc, operation_id");
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|err| sqlite_error("prepare active media readiness listing", err))?;
+        let mut rows = if let Some(serial) = library_serial {
+            stmt.query(params![serial])
+        } else {
+            stmt.query([])
+        }
+        .map_err(|err| sqlite_error("query active media readiness listing", err))?;
+        let mut operations = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|err| sqlite_error("iterate active media readiness listing", err))?
+        {
+            operations.push(
+                media_readiness_operation_from_row(row)
+                    .map_err(|err| sqlite_error("read active media readiness row", err))?,
+            );
+        }
+        Ok(operations)
     }
 
     /// Run SQLite quick_check and return the result text.
@@ -6782,6 +7136,74 @@ create table if not exists operations(
   updated_at_utc text not null
 );
 
+create table if not exists media_readiness_ops(
+  operation_id text primary key,
+  run_id text,
+  library_serial text not null,
+  changer_sg text,
+  drive_element integer not null,
+  drive_sg text,
+  drive_serial text,
+  barcode text,
+  source_slot integer,
+  media_generation integer,
+  phase text not null,
+  state text not null,
+  dirty_scope text,
+  started_at_utc text not null,
+  updated_at_utc text not null,
+  deadline_at_utc text,
+  last_cdb_opcode integer,
+  last_sense_raw text,
+  last_sense_key integer,
+  last_asc integer,
+  last_ascq integer,
+  last_host_status integer,
+  last_driver_status integer,
+  target_status integer,
+  transport_class text,
+  cancel_source text,
+  signal text,
+  evidence_path text,
+  last_error_json text,
+  quarantine_id text
+);
+
+create index if not exists media_readiness_ops_active_idx
+  on media_readiness_ops(library_serial, drive_element, state, updated_at_utc)
+  where state not in ('ready', 'released')
+    and coalesce(dirty_scope, 'drive+tape') <> 'none';
+
+create index if not exists media_readiness_ops_barcode_idx
+  on media_readiness_ops(library_serial, barcode)
+  where barcode is not null;
+
+create table if not exists media_readiness_transitions(
+  transition_id integer primary key,
+  operation_id text not null references media_readiness_ops(operation_id),
+  phase text,
+  state text not null,
+  dirty_scope text,
+  at_utc text not null,
+  last_cdb_opcode integer,
+  last_sense_raw text,
+  last_sense_key integer,
+  last_asc integer,
+  last_ascq integer,
+  last_host_status integer,
+  last_driver_status integer,
+  target_status integer,
+  transport_class text,
+  cancel_source text,
+  signal text,
+  evidence_path text,
+  last_error_json text,
+  quarantine_id text
+);
+
+create index if not exists media_readiness_transitions_op_idx
+  on media_readiness_transitions(operation_id, transition_id);
+
 create table if not exists sessions(
   session_id text primary key,
   session_kind text not null,
@@ -6863,6 +7285,52 @@ create table if not exists alarms(
   detail text
 );
 "#;
+
+const MEDIA_READINESS_OPERATION_SELECT: &str = "select
+  operation_id, run_id, library_serial, changer_sg, drive_element, drive_sg,
+  drive_serial, barcode, source_slot, media_generation, phase, state,
+  dirty_scope, started_at_utc, updated_at_utc, deadline_at_utc,
+  last_cdb_opcode, last_sense_raw, last_sense_key, last_asc, last_ascq,
+  last_host_status, last_driver_status, target_status, transport_class,
+  cancel_source, signal, evidence_path, last_error_json, quarantine_id
+from media_readiness_ops";
+
+fn media_readiness_operation_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<MediaReadinessOperationRecord> {
+    Ok(MediaReadinessOperationRecord {
+        operation_id: row.get(0)?,
+        run_id: row.get(1)?,
+        library_serial: row.get(2)?,
+        changer_sg: row.get(3)?,
+        drive_element: row.get(4)?,
+        drive_sg: row.get(5)?,
+        drive_serial: row.get(6)?,
+        barcode: row.get(7)?,
+        source_slot: row.get(8)?,
+        media_generation: row.get(9)?,
+        phase: row.get(10)?,
+        state: row.get(11)?,
+        dirty_scope: row.get(12)?,
+        started_at_utc: row.get(13)?,
+        updated_at_utc: row.get(14)?,
+        deadline_at_utc: row.get(15)?,
+        last_cdb_opcode: row.get(16)?,
+        last_sense_raw: row.get(17)?,
+        last_sense_key: row.get(18)?,
+        last_asc: row.get(19)?,
+        last_ascq: row.get(20)?,
+        last_host_status: row.get(21)?,
+        last_driver_status: row.get(22)?,
+        target_status: row.get(23)?,
+        transport_class: row.get(24)?,
+        cancel_source: row.get(25)?,
+        signal: row.get(26)?,
+        evidence_path: row.get(27)?,
+        last_error_json: row.get(28)?,
+        quarantine_id: row.get(29)?,
+    })
+}
 
 fn sqlite_open_error(path: &Path, err: rusqlite::Error) -> StateError {
     StateError::Index {
@@ -8007,6 +8475,198 @@ mod tests {
                 .expect("synchronous"),
             2
         );
+    }
+
+    #[test]
+    fn media_readiness_operations_are_durable_and_list_active_fences() {
+        let temp = tempfile::Builder::new()
+            .prefix("rem-readiness")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let operation_id = Uuid::from_u128(0x1234);
+
+        let planned = index
+            .record_media_readiness_operation(MediaReadinessOperationInput {
+                operation_id,
+                run_id: Some("fieldtest-run".to_string()),
+                library_serial: "LIB-A".to_string(),
+                changer_sg: Some("/dev/sg8".to_string()),
+                drive_element: 0x0001,
+                drive_sg: Some("/dev/sg7".to_string()),
+                drive_serial: Some("DRV1".to_string()),
+                barcode: Some("AOX030L9".to_string()),
+                source_slot: Some(0x03eb),
+                media_generation: Some(9),
+                phase: "planned".to_string(),
+                state: "planned".to_string(),
+                dirty_scope: Some("drive+tape".to_string()),
+                deadline_at_utc: Some("2026-07-06T12:00:00Z".to_string()),
+                evidence_path: Some("evidence/readiness.json".to_string()),
+            })
+            .expect("record planned");
+        assert_eq!(planned.operation_id, operation_id.to_string());
+        assert_eq!(planned.library_serial, "LIB-A");
+        assert_eq!(planned.drive_element, 1);
+        assert_eq!(planned.barcode.as_deref(), Some("AOX030L9"));
+
+        let active = index
+            .list_active_media_readiness_operations(Some("LIB-A"))
+            .expect("active readiness");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].state, "planned");
+
+        let becoming = index
+            .record_media_readiness_transition(MediaReadinessTransitionInput {
+                operation_id,
+                phase: Some("readiness_poll".to_string()),
+                state: "media_initializing".to_string(),
+                dirty_scope: Some("drive+tape".to_string()),
+                last_cdb_opcode: Some(0x00),
+                last_sense_raw: Some("7000020000000058000000000401".to_string()),
+                last_sense_key: Some(0x02),
+                last_asc: Some(0x04),
+                last_ascq: Some(0x01),
+                last_host_status: None,
+                last_driver_status: None,
+                target_status: None,
+                transport_class: None,
+                cancel_source: None,
+                signal: None,
+                evidence_path: None,
+                last_error_json: None,
+                quarantine_id: Some("q-1".to_string()),
+            })
+            .expect("record transition");
+        assert_eq!(becoming.phase, "readiness_poll");
+        assert_eq!(becoming.state, "media_initializing");
+        assert_eq!(becoming.last_asc, Some(0x04));
+        assert_eq!(becoming.last_ascq, Some(0x01));
+        assert_eq!(becoming.quarantine_id.as_deref(), Some("q-1"));
+        assert_eq!(
+            index
+                .conn
+                .query_row(
+                    "select count(*) from media_readiness_transitions where operation_id = ?1",
+                    params![operation_id.to_string()],
+                    |row| row.get::<_, u32>(0),
+                )
+                .expect("transition count"),
+            1
+        );
+        assert_eq!(
+            index
+                .list_active_media_readiness_operations(None)
+                .expect("active all")
+                .len(),
+            1
+        );
+
+        index
+            .record_media_readiness_transition(MediaReadinessTransitionInput {
+                operation_id,
+                phase: Some("readiness_poll".to_string()),
+                state: "timeout_unknown".to_string(),
+                dirty_scope: Some("drive+tape".to_string()),
+                last_cdb_opcode: Some(0x00),
+                last_sense_raw: None,
+                last_sense_key: Some(0x02),
+                last_asc: Some(0x04),
+                last_ascq: Some(0x01),
+                last_host_status: None,
+                last_driver_status: None,
+                target_status: None,
+                transport_class: None,
+                cancel_source: None,
+                signal: None,
+                evidence_path: None,
+                last_error_json: Some("{\"detail\":\"timed out\"}".to_string()),
+                quarantine_id: Some("q-1".to_string()),
+            })
+            .expect("record timeout");
+        let active_timeout = index
+            .list_active_media_readiness_operations(Some("LIB-A"))
+            .expect("active timeout");
+        assert_eq!(active_timeout.len(), 1);
+        assert_eq!(active_timeout[0].state, "timeout_unknown");
+
+        index
+            .record_media_readiness_transition(MediaReadinessTransitionInput {
+                operation_id,
+                phase: Some("ready".to_string()),
+                state: "ready".to_string(),
+                dirty_scope: Some("none".to_string()),
+                last_cdb_opcode: Some(0x00),
+                last_sense_raw: None,
+                last_sense_key: None,
+                last_asc: None,
+                last_ascq: None,
+                last_host_status: None,
+                last_driver_status: None,
+                target_status: None,
+                transport_class: None,
+                cancel_source: None,
+                signal: None,
+                evidence_path: None,
+                last_error_json: None,
+                quarantine_id: None,
+            })
+            .expect("record ready");
+        assert!(index
+            .list_active_media_readiness_operations(Some("LIB-A"))
+            .expect("active after ready")
+            .is_empty());
+        assert_eq!(
+            index
+                .conn
+                .query_row(
+                    "select count(*) from media_readiness_transitions where operation_id = ?1",
+                    params![operation_id.to_string()],
+                    |row| row.get::<_, u32>(0),
+                )
+                .expect("transition count after ready"),
+            3
+        );
+    }
+
+    #[test]
+    fn media_readiness_operations_survive_rebuildable_projection_clear() {
+        let temp = tempfile::Builder::new()
+            .prefix("rem-readiness-nonrebuildable")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let operation_id = Uuid::from_u128(0x5678);
+
+        index
+            .record_media_readiness_operation(MediaReadinessOperationInput {
+                operation_id,
+                run_id: None,
+                library_serial: "LIB-A".to_string(),
+                changer_sg: None,
+                drive_element: 0x0001,
+                drive_sg: None,
+                drive_serial: None,
+                barcode: Some("AOX031L9".to_string()),
+                source_slot: None,
+                media_generation: Some(9),
+                phase: "planned".to_string(),
+                state: "planned".to_string(),
+                dirty_scope: Some("drive+tape".to_string()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .expect("record readiness");
+
+        let tx = index.conn.transaction().expect("transaction");
+        clear_rebuildable_tables(&tx).expect("clear rebuildable");
+        tx.commit().expect("commit");
+
+        let record = index
+            .media_readiness_operation(operation_id)
+            .expect("lookup")
+            .expect("readiness operation must survive rebuild clear");
+        assert_eq!(record.barcode.as_deref(), Some("AOX031L9"));
     }
 
     #[test]
