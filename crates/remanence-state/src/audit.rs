@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
 
 use ciborium::value::Value as CborValue;
+use remanence_crc::crc64_xz;
 use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
@@ -23,7 +24,6 @@ const RECORD_HASH_LEN: usize = 32;
 const RECORD_CRC_LEN: usize = 8;
 const RECORD_TRAILER_LEN: usize = RECORD_HASH_LEN + RECORD_CRC_LEN;
 const MAX_RECORD_LEN: u32 = 64 * 1024 * 1024;
-const CRC64_XZ_REFLECTED_POLY: u64 = 0xC96C_5795_D787_0F42;
 const DEFAULT_CLOCK_FORWARD_TOLERANCE_SECONDS: i64 = 300;
 
 /// Actor responsible for an audit event.
@@ -1398,21 +1398,6 @@ fn sync_directory(path: &Path) -> Result<(), StateError> {
     let dir = File::open(path).map_err(|err| StateError::io_at("open audit dir", path, err))?;
     dir.sync_all()
         .map_err(|err| StateError::io_at("fsync audit dir", path, err))
-}
-
-fn crc64_xz(bytes: &[u8]) -> u64 {
-    let mut crc = u64::MAX;
-    for &byte in bytes {
-        crc ^= u64::from(byte);
-        for _ in 0..8 {
-            if crc & 1 == 1 {
-                crc = (crc >> 1) ^ CRC64_XZ_REFLECTED_POLY;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    crc ^ u64::MAX
 }
 
 #[cfg(test)]

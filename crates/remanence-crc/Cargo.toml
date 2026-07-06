@@ -1,0 +1,15 @@
+[package]
+name        = "remanence-crc"
+description = "Shared CRC routines for Remanence on-tape and audit integrity checks."
+version     .workspace = true
+edition     .workspace = true
+rust-version.workspace = true
+authors     .workspace = true
+license     .workspace = true
+repository  .workspace = true
+
+[dependencies]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"

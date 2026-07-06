@@ -11,6 +11,7 @@ repository  .workspace = true
 [dependencies]
 remanence-library = { path = "../remanence-library" }
 remanence-parity = { path = "../remanence-parity" }
+remanence-crc    = { path = "../remanence-crc" }
 
 ciborium  = { workspace = true }
 nix       = { workspace = true }

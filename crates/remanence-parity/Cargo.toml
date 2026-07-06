@@ -14,6 +14,7 @@ repository  .workspace = true
 # traits live in remanence-library::block_io so 3b and 3c can
 # both depend on the library crate as true siblings.
 remanence-library = { path = "../remanence-library" }
+remanence-crc     = { path = "../remanence-crc" }
 
 # Retained for the `ParityError::ReedSolomon` compatibility surface
 # and as a possible future accelerator. The active codec implements
