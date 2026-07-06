@@ -1,7 +1,7 @@
-# LTO-9 media readiness and calibration-aware orchestration -- Design v0.3
+# LTO-9 media readiness and calibration-aware orchestration -- Design v0.4
 
-**Status:** panel folded + Opus review folded (2026-07-06); verify round
-pending.
+**Status:** panel folded + Opus + Fable 5 reviews folded (2026-07-06);
+verify round pending.
 **Panel 2026-07-06:** 34 raw findings across SCSI correctness,
 failure-modes/ops, fieldtest/operator UX, cost/efficiency, and GLM 5.2 via
 OpenRouter (`z-ai/glm-5.2`). Raw findings: 4 blockers, 20 majors, 8 minors,
@@ -10,6 +10,9 @@ OpenRouter (`z-ai/glm-5.2`). Raw findings: 4 blockers, 20 majors, 8 minors,
 **Opus addendum 2026-07-06:** local Claude Code Opus review found 10 findings
 (1 blocker, 3 majors, 4 minors, 2 nits); all accepted findings are folded in
 this revision.
+**Fable 5 addendum 2026-07-06:** Claude Fable 5 via OpenRouter found no
+blockers and 12 findings (4 majors, 5 minors, 3 nits); all accepted findings
+are folded in this revision.
 **Problem source:** the July 2026 physical MSL3040 field test exposed that
 `rem tape init` and `fieldtest/scripts/10-init-pools.sh` are not aware of
 LTO-9 first-load media optimization. `AOX034L9` initialized successfully, but
@@ -58,13 +61,16 @@ The core detector is `TEST UNIT READY`:
 - exact ASCQ is preserved in evidence. `04/01` is the documented expected
   signal; `04/00` and `04/07` remain non-terminal becoming-ready states during
   a media-conditioning epoch; `04/02` routes to the conditional explicit-load
-  branch.
+  branch. Known operator-intervention/reset-required ASCQs override this
+  family rule and become terminal immediately; the initial table includes
+  `04/03` manual intervention required and `04/20..22` logical-unit reset,
+  hard reset, or power cycle required.
 
 This gate is not an `mtx` problem and not an HPE UI scrape. Remanence uses raw
 SCSI already, so it can see the same TUR sense and SG_IO transport failures
 directly. Vendor UI state such as `Calib` is corroborating evidence only.
 
-The fold changes the initial draft in three important ways:
+The fold changes the initial draft in four important ways:
 
 1. The readiness operation is **durable**. A 2-hour wait cannot live only in a
    foreground shell process or tmux pane.
@@ -220,8 +226,11 @@ Durable rules:
 2. Write `pre_ready_loading` before each mechanical pre-ready phase.
 3. Write every readiness transition (`becoming_ready`, `ready`,
    `timeout_unknown`, `transport_unknown`, `terminal_error`).
-4. On Ctrl-C/SIGTERM after pre-ready loading began, mark
-   `aborted_unknown`; do not issue cleanup CDBs from the signal path.
+4. Write `pre_ready_loading` before the mechanical CDB so an interrupted
+   process can be recognized later. A signal handler may only set an in-process
+   cancellation flag; it must not attempt a SQLite write from the async signal
+   path. The main loop records `aborted_unknown` when possible, and startup
+   reconciliation infers it from an open record with no terminal transition.
 5. On daemon/CLI startup, reconcile open records before admitting new load,
    init, unload, move, write, or read-session operations for the same scope.
 
@@ -257,8 +266,12 @@ Required phases:
    If TUR returns GOOD or a becoming-ready `02/04/xx` sense, skip explicit
    drive `LOAD` and enter readiness polling. Issue drive `LOAD` (`0x1b`) only
    when TUR indicates no medium or an initializing-command-required state
-   such as `02/04/02` after a short settle. The drive `LOAD` exception is
-   therefore conditional and evidence-backed, not automatic.
+   such as `02/04/02` after a short settle. The conditional readiness-path
+   `LOAD` must use `IMMED=1` and then rely on TUR polling for completion.
+   If the target rejects immediate LOAD, fail into operator recovery unless a
+   later hardware-specific override provides a justified non-immediate timeout.
+   The drive `LOAD` exception is therefore conditional and evidence-backed,
+   not automatic.
 3. **Readiness polling.** After the pre-ready phase, issue only allowed
    readiness-state commands until the drive reaches `Ready` or a terminal
    state.
@@ -287,6 +300,10 @@ enum MediaReadiness {
         asc: u8,
         ascq: u8,
     },
+    TargetStatus {
+        status: u8,
+        retryable: bool,
+    },
     TransportUnknown {
         opcode: u8,
         status: u8,
@@ -305,6 +322,19 @@ and allowlist metadata (`L9`/`LZ`), not MODE SENSE. The host does not need to
 prove first-load; the sense family says the drive is not ready, and the LTO-9
 context explains the likely cause.
 
+The becoming-ready family is not an excuse to wait on every `04/xx` forever.
+Known operator-action ASCQs are terminal. The initial terminal table is:
+
+| Sense | Classification | Operator action |
+|---|---|---|
+| `02/04/03` | `TerminalNotReady` | manual intervention required |
+| `02/04/20` | `TerminalNotReady` | logical unit reset required |
+| `02/04/21` | `TerminalNotReady` | hard reset required |
+| `02/04/22` | `TerminalNotReady` | power cycle required |
+
+Unknown `02/04/xx` values during media conditioning remain
+`BecomingReady` until physical MSL3040 capture narrows the table.
+
 ## 8. Command policy while initializing
 
 Use a per-state allowlist, not a partial deny list.
@@ -317,6 +347,11 @@ Allowed against the affected drive while `becoming_ready/media_initializing`:
 - `INQUIRY`/VPD identity probes only before the wait starts or after `Ready`,
   unless an implementation needs one read-only identity check to bind the
   durable record to a drive serial.
+
+TUR and REQUEST SENSE are read-only at the medium level but not harmless on a
+foreign device: they can consume Unit Attention or sense state for the initiator.
+For non-selected libraries and D2/LTO-7 devices, readiness code may use only
+INQUIRY/VPD identity discovery and must not issue TUR or REQUEST SENSE.
 
 Denied against the affected drive until `Ready`:
 
@@ -339,6 +374,12 @@ completion-unknown signal has occurred for the changer/logical library. It must
 use bounded timeout/backoff and the selected library serial. If inventory itself
 times out or triggers a transport reset, the logical library snapshot becomes
 dirty and must not be used as harmless corroboration.
+
+Physical MSL3040 timeouts are explicit: `MOVE MEDIUM` uses a configurable
+physical-library timeout with a 10-minute default, and readiness-loop TUR uses
+a 30-second per-poll timeout. A TUR timeout maps to `transport_unknown` with
+drive/tape dirty scope. READ ELEMENT STATUS uses the bounded inventory timeout
+profile and backoff; timeout/reset marks the selected library snapshot dirty.
 
 Robot moves (`MOVE MEDIUM`) within the same logical library are blocked while
 there is an active `media_initializing` fence, unless an explicit
@@ -397,6 +438,16 @@ Dirty scope defaults:
 `host_status=0x0003` is recorded as `DID_TIME_OUT`; Remanence still treats the
 operation result as completion-unknown for media-position safety.
 
+Target statuses are not transport failures and must not be collapsed into
+completion-unknown:
+
+| Status | Meaning | Readiness behavior |
+|---:|---|---|
+| `0x08` | BUSY | bounded retry with backoff, then terminal busy evidence |
+| `0x28` | TASK SET FULL | bounded retry with backoff, then terminal busy evidence |
+| `0x18` | RESERVATION CONFLICT | terminal/refused with ownership evidence; never force/retry |
+| `0x40` | TASK ABORTED | terminal dirty evidence unless a later transport-specific rule proves safe |
+
 ## 10. Wait profiles
 
 There are two wait profiles:
@@ -430,6 +481,9 @@ Add:
 rem tape wait-ready --library <serial> --barcode <barcode> [--wait] [--timeout 2.5h] [--json]
 rem tape wait-ready --library <serial> --drive-element <0xNNNN> --already-loaded --json
 rem tape wait-ready --resume <operation_id> [--json]
+rem tape quarantine list [--library <serial>] [--json]
+rem tape quarantine show <quarantine_id> [--json]
+rem tape quarantine release <quarantine_id> --after-settled-inventory --ack <text> [--json]
 ```
 
 Barcode mode is the normal mode. It resolves only inside the selected library
@@ -457,6 +511,13 @@ Exit codes:
 
 With `--json`, stdout is one JSON object. Human progress goes to stderr.
 Script-facing JSON includes `recommended_next_command` and `operator_action`.
+Human stderr must also include `operator_action` and `recommended_next_command`
+for exits 20, 30, 40, and 50.
+
+Quarantine commands are the only supported release path for fences created by
+timeout, transport unknown, target-status refusal, or operator interruption.
+They emit the same evidence fields as readiness commands and are named in
+`recommended_next_command` for exit codes 20 and 40.
 
 `rem tape init` calls the same helper in `media_conditioning` mode for physical
 LTO-9/LZ. If the helper exits 10/20/40, init stops before `read_config`,
@@ -482,7 +543,9 @@ Default behavior:
 5. On `ready`, record a readiness ledger entry consumed by `10-init-pools.sh`.
 6. On `transport_unknown` or `timeout_unknown`, stop and request RCA.
 
-`10-init-pools.sh` then consumes `state/media-readiness.jsonl`:
+`10-init-pools.sh` then queries readiness through a `rem tape` CLI surface
+backed by the SQLite readiness store. `state/media-readiness.jsonl` is evidence
+only and must not be the source of admission decisions.
 
 - if a barcode is already `ready`, proceed with init;
 - if a barcode is `media_initializing`, record `INFO` with
@@ -534,9 +597,10 @@ Remanence already parses adjacent `EXCEPT` and `ACCESS` bits.
 
 For this milestone:
 
-- parse and retain descriptor ASC/ASCQ in the low-level SCSI `Element` type if
-  implementation cost is small;
-- expose it in direct CLI JSON/evidence when `except` is set;
+- parse and retain descriptor ASC/ASCQ in the low-level SCSI `Element` type in
+  MR-1;
+- expose it in direct CLI JSON/evidence when `except` is set after the physical
+  MSL3040 capture proves the field is useful;
 - do not add daemon proto/API fields until a physical MSL3040 capture proves
   this changes an operator decision.
 
@@ -602,8 +666,11 @@ interrupts, and selected-library topology.
 Unit coverage:
 
 - sense classifier tests for fixed and descriptor sense:
-  `02/04/00`, `02/04/01`, `02/04/02`, `02/04/07`, `06/29/00`, `02/3A/00`,
-  `06/28/00`, representative terminal errors;
+  `02/04/00`, `02/04/01`, `02/04/02`, `02/04/03`, `02/04/07`, `02/04/20`,
+  `02/04/21`, `02/04/22`, `06/29/00`, `02/3A/00`, `06/28/00`,
+  representative terminal errors;
+- target-status classifier tests for BUSY `0x08`, RESERVATION CONFLICT
+  `0x18`, TASK SET FULL `0x28`, and TASK ABORTED `0x40`;
 - `host_status=0x0003` is labeled `DID_TIME_OUT` and still maps to
   completion-unknown for media-position safety;
 - wait algorithm with fake clock: N `02/04/xx` polls then GOOD, timeout,
@@ -612,7 +679,9 @@ Unit coverage:
 - pre-ready load path does not call the old hidden composed `LibraryHandle::load`
   without phase evidence;
 - after `MOVE MEDIUM`, TUR `02/04/01` skips explicit drive `LOAD`; TUR
-  `02/04/02` may issue one fenced conditional drive `LOAD`;
+  `02/04/02` may issue one fenced conditional drive `LOAD` with `IMMED=1`;
+- physical timeout tests assert MOVE MEDIUM and TUR use explicit bounded
+  timeout classes and map timeout outcomes to the right dirty scope;
 - generation/display mapping uses barcode suffix/allowlist metadata before
   readiness, including `LZ` handling;
 - READ ELEMENT STATUS parser tests retain descriptor ASC/ASCQ if MR includes
@@ -629,7 +698,8 @@ Chaos/harness coverage:
 - add a scenario or `covers` entry proving `rem tape init` stops before
   destructive escalation on `media_initializing`;
 - add a two-logical-library fixture proving an allowlisted-looking barcode
-  outside the selected library is refused without load/move/TUR to that library;
+  outside the selected library is refused without load/move/TUR/REQUEST SENSE
+  to that library;
 - add fieldtest dry-run coverage for `records.jsonl.status` plus
   `media_readiness_state`.
 
@@ -654,8 +724,8 @@ Physical coverage:
    block destructive escalation on readiness states.
 5. **MR-5 chaos and scenario coverage.** Implement RDY-01 and command-allowlist
    assertions.
-6. **MR-6 fieldtest integration.** Add `09-media-ready.sh`, ledger consumption
-   in `10-init-pools.sh`, and evidence summaries.
+6. **MR-6 fieldtest integration.** Add `09-media-ready.sh`, SQLite-backed
+   readiness queries in `10-init-pools.sh`, and evidence summaries.
 7. **MR-7 daemon/session integration.** Short-probe profile for physical
    write/read opens; long wait only by explicit operator/media-conditioning
    policy.
