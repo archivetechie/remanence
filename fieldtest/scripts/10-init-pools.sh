@@ -169,9 +169,65 @@ JSON
   rm -rf "$tmpdir"
 }
 
+init_pools_escalation_selftest() {
+  local tmpdir child_rc rem_log records
+  tmpdir="$(mktemp -d)"
+  mkdir -p "$tmpdir/home/bin" "$tmpdir/home/evidence" "$tmpdir/home/state" "$tmpdir/home/log" "$tmpdir/home/spool"
+  cat >"$tmpdir/home/allowlist.txt" <<'EOF'
+AOX030L9
+EOF
+  cat >"$tmpdir/home/bin/rem" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+home="${REMFIELD_HOME:?}"
+printf '%s\n' "$*" >>"$home/rem-invocations.log"
+if [[ "${1:-}" == libraries && "${2:-}" == --json ]]; then
+  cat <<'JSON'
+{"libraries":[{"serial":"LIBMAIN","product":"MSL G3 Series","revision":"D.00","vendor":"HPE","drive_count":1,"slot_count":1,"loaded_slot_count":1,"ie_port_count":0}]}
+JSON
+  exit 0
+fi
+if [[ "${1:-}" == library && "${3:-}" == --json && "${4:-}" == --slots ]]; then
+  cat <<'JSON'
+{"serial":"LIBMAIN","drives":[],"slots":[{"element_address":"0x03eb","full":true,"cartridge":"AOX030L9"}]}
+JSON
+  exit 0
+fi
+if [[ "${1:-}" == --allow && "${3:-}" == tape && "${4:-}" == init ]]; then
+  if [[ " $* " == *" --dry-run "* ]]; then
+    echo "media not ready for tape init on AOX030L9 in drive 0x0001 media_readiness_state=media_initializing media_readiness_exit_code=10: media initializing/calibrating" >&2
+    exit 10
+  fi
+  echo "destructive escalation should not run: $*" >&2
+  exit 99
+fi
+echo "unexpected mock rem invocation: $*" >&2
+exit 98
+EOF
+  chmod +x "$tmpdir/home/bin/rem"
+  REMFIELD_HOME="$tmpdir/home" bash "$0" --count 1 >/dev/null 2>"$tmpdir/selftest.stderr" || child_rc=$?
+  child_rc="${child_rc:-0}"
+  rem_log="$tmpdir/home/rem-invocations.log"
+  records="$tmpdir/home/evidence/records.jsonl"
+  if [[ "$child_rc" -ne 10 ]]; then
+    echo "selftest: expected readiness exit 10, got $child_rc" >&2
+    cat "$tmpdir/selftest.stderr" >&2 || true
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  grep -q -- '--dry-run' "$rem_log"
+  ! grep -q -- '--force' "$rem_log"
+  ! grep -q -- '--clobber-data' "$rem_log"
+  grep -q '"status":"INFO"' "$records"
+  grep -q '"media_readiness_state":"media_initializing"' "$records"
+  grep -q '"rem_exit_code":10' "$records"
+  rm -rf "$tmpdir"
+}
+
 main() {
   if [[ "${1:-}" == --selftest ]]; then
     init_pools_selftest
+    init_pools_escalation_selftest
     exit 0
   fi
   if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
