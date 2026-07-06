@@ -5,8 +5,8 @@ The detailed theorem statements live in each `verif/*/SPEC.md`; this page says
 what is proved, what is only tied by drift guards, and what remains normal Rust
 test coverage.
 
-Status reflects the proof-bearing state after commit `a6a7ea1`
-(`verif: prove RAO header core round trip`) plus the RAO metadata proof added
+Status reflects the proof-bearing state after commit `0f70dce`
+(`verif: prove RAO metadata core round trip`) plus the RAO manifest proof added
 after that inventory.
 
 ## Trust model
@@ -41,6 +41,7 @@ listed below are expected to have no local placeholders.
 | `verif/aead-framing` | Pure arithmetic from `crates/remanence-aead/src/{stream,range,inspect}.rs` | Chunk-count validation, payload-frame length, stored-size rounding, ciphertext offsets, plaintext range validation, non-empty range planning, keyless inspect geometry, wrapper equivalence for `expected_stored_size`, and selected fail-closed edges. | Does not prove ChaCha20-Poly1305 security, HKDF, SHA-256, CBOR canonicalization, byte IO, allocation behavior, or full parser/open workflow. |
 | `verif/rao-header` | Scalar layout extraction from `crates/remanence-aead/src/header.rs` | RAO AEAD header-core validation, frozen-field emission, parse/serialize round trip for valid header cores, and rejection of bad magic/header length/version/suite/flags/reserved fields. | Models key id, salt, and object id as validity facts. Does not prove the exact 128-byte array, object-id UTF-8 reconstruction, SHA-256 header hashing, allocation, encryption, CBOR, or full `RaoHeader::parse(RaoHeader::serialize(x)) = x` over strings and byte arrays. |
 | `verif/rao-metadata` | Writer-schema extraction from `crates/remanence-aead/src/metadata.rs` | RAO metadata validation arithmetic, deterministic four-key writer-schema emission, decode/encode round trip for valid metadata cores, fail-closed checked arithmetic, and rejection of bad required writer-shape fields. | Models the SHA-256 digest as four opaque scalar words. Does not prove production `Vec<u8>` construction, UTF-8 decoding, exact digest byte copying, recursive CBOR extension skipping, encryption, hashing, or the full byte-level `RaoMetadata::from_cbor_bytes(RaoMetadata::to_cbor_bytes(x)) = x`. |
+| `verif/rao-manifest` | Regular-file writer-schema extraction from `crates/remanence-format/src/{layout,manifest}.rs` | RAO manifest chunk-count arithmetic, seven-key root writer shape, one-entry regular-file writer shape, `file_sha256` length, decode/encode round trip for a valid one-regular-file manifest core, and fail-closed rejection of bad root/file writer-shape fields. | Models text values as scalar ids and SHA-256 as four opaque scalar words. Does not prove production CBOR bytes, `String`, `Vec`, UTF-8, tar/pax layout, hashing, global-pax cross-checking, xattrs, nonregular entries, arbitrary-length file arrays, or full `validate_manifest(encode_manifest(x))` over production values. |
 | `verif/tape-init` | `crates/remanence-api/src/tape_init.rs::decide_tape_init` branch core | Committed-pool conflict dominance, fail-closed BOT decisions, blank BOT rules, clean bootstrap no-op, and ordered Remanence bootstrap hazards. | UUIDs, pool strings, and error payloads are compact proof-facing categories. The proof excludes BOT reading, catalog projection, bootstrap writes, and hardware orchestration. |
 | `verif/pool-selection` | `crates/remanence-api/src/pool_selection.rs` ranking kernel | Fit predicate, completion predicate, leftover arithmetic, and pairwise ranking/tie-break order for `CompleteOrFill` and `FillOldest`. | Proves the stable ranking kernel, not Rust iterator internals, `Vec`, trait-object dispatch, catalog projection, drive occupancy projection, or caller footprint projection. |
 
@@ -51,8 +52,8 @@ These are intentionally outside the current formal proof surface:
 - SCSI/changer/drive behavior and all physical tape interactions.
 - Layer-5 daemon session orchestration, cancellation, concurrency, and gRPC.
 - SQLite catalog persistence and rebuild paths.
-- RAO archive encode/decode round trips beyond the header and metadata core
-  scalar theorems.
+- RAO archive encode/decode round trips beyond the header, metadata, and
+  one-regular-file manifest core scalar theorems.
 - Sidecar/footer binary layout beyond the pure arithmetic already listed.
 - AEAD cryptographic security and keyed authentication.
 - End-to-end write/read/verify scenarios in `~/system`.
@@ -80,6 +81,7 @@ parity-mapping
 parity-state
 pool-selection
 rao-header
+rao-manifest
 rao-metadata
 tape-init
 ```
@@ -113,14 +115,14 @@ they prove specific kernels under specific extraction and scope boundaries.
 
 ## Recommended next target
 
-The next formal proof should move from the AEAD envelope cores to the archive
-object model:
+The next formal proof should broaden the RAO manifest proof before attempting a
+larger archive theorem:
 
 ```text
-decode_manifest_core(encode_manifest_core(x)) = x
+decode_manifest_entries_core(encode_manifest_entries_core(x)) = x
 ```
 
-for a small manifest core under valid file-count, size, and digest-field bounds.
-The RAO header and metadata proofs establish the encrypted envelope's scalar
-layout and required metadata writer schema; manifest correctness is the next
-step toward the larger archive `decode(encode(x)) = x` claim.
+for a bounded multi-entry manifest core covering empty files, nonregular
+entries, hardlink target ordering, and xattrs. The current manifest proof covers
+the one-regular-file writer schema; broadening entry coverage is the next
+useful step toward the larger archive `decode(encode(x)) = x` claim.
