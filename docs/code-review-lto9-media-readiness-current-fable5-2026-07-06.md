@@ -89,3 +89,24 @@ implementation slice:
 Remaining gates after that fold: full scenario or `covers` evidence for
 destructive-escalation refusal, the two-logical-library fixture, and broader
 wait/repeated-UA scenario coverage.
+
+## Coverage Fold
+
+The next implementation slice added local regression coverage for the remaining
+software gates:
+
+- `fieldtest/scripts/10-init-pools.sh --selftest` now runs the actual init
+  ladder against a fake `rem` that returns readiness exit code 10 on the
+  dry-run call, then asserts no `--force` or `--clobber-data` invocation
+  occurred and that `records.jsonl` carries `INFO`,
+  `media_readiness_state`, and `rem_exit_code`.
+- `remanence-cli` now has a two-logical-library resolver fixture proving a
+  barcode visible only in a non-selected partition is reported absent from the
+  selected library before hardware execution.
+- `remanence-cli` now drives the real readiness poll loop through a synthetic
+  `DriveHandle` and proves the second reset-class Unit Attention in one epoch
+  terminalizes as `RepeatedUnitAttention` with design exit code 30.
+
+Remaining evidence gap: a `~/system` harness scenario or explicit coverage
+contract tying these local regressions into the scenario ledger, plus physical
+MSL3040 capture when a new LTO-9 cartridge is available.

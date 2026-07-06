@@ -12296,10 +12296,12 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
     use remanence_library::{
-        scsi, DriveBay, ElementLayout, IdentitySource, InstalledDrive, Library, Slot,
+        scsi, DriveBay, ElementLayout, FixtureTransport, IdentitySource, InstalledDrive, Library,
+        RecordingLog, RecordingTransport, ScsiError, SgTransport, Slot, TimeoutClass,
     };
+    use std::collections::VecDeque;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[cfg(target_os = "linux")]
     fn chaos_env_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -12506,6 +12508,74 @@ mod tests {
             cache: remanence_state::CacheConfig {
                 tape_catalog_dir: root.join("cache/tapes"),
             },
+        }
+    }
+
+    fn vpd80_response(serial: &str) -> Vec<u8> {
+        let bytes = serial.as_bytes();
+        let mut v = vec![0x08u8, 0x80, 0x00, bytes.len() as u8];
+        v.extend_from_slice(bytes);
+        v
+    }
+
+    fn changer_inquiry_response() -> Vec<u8> {
+        include_bytes!("../../../fixtures/inquiry/changer-msl-g3.bin").to_vec()
+    }
+
+    fn lto9_inquiry_response() -> Vec<u8> {
+        include_bytes!("../../../fixtures/inquiry/drive1-lto9.bin").to_vec()
+    }
+
+    fn readiness_fixed_sense(key: u8, asc: u8, ascq: u8) -> Vec<u8> {
+        let mut sense = vec![0u8; 32];
+        sense[0] = 0x70;
+        sense[2] = key & 0x0f;
+        sense[7] = 24;
+        sense[12] = asc;
+        sense[13] = ascq;
+        sense
+    }
+
+    fn readiness_check_condition(key: u8, asc: u8, ascq: u8) -> ScsiError {
+        ScsiError::CheckCondition {
+            sense: readiness_fixed_sense(key, asc, ascq),
+            bytes_transferred: 0,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct TurSequenceTransport<T> {
+        inner: T,
+        tur_results: VecDeque<Result<(), ScsiError>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl<T: SgTransport> SgTransport for TurSequenceTransport<T> {
+        fn execute_in(
+            &mut self,
+            cdb: &[u8],
+            buf: &mut [u8],
+        ) -> Result<remanence_library::transport::TransferOutcome, ScsiError> {
+            self.inner.execute_in(cdb, buf)
+        }
+
+        fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
+            if cdb.first().copied() == Some(0x00) {
+                return self.tur_results.pop_front().unwrap_or(Ok(()));
+            }
+            self.inner.execute_none(cdb)
+        }
+
+        fn execute_out(
+            &mut self,
+            cdb: &[u8],
+            buf: &[u8],
+        ) -> Result<remanence_library::transport::TransferOutcome, ScsiError> {
+            self.inner.execute_out(cdb, buf)
+        }
+
+        fn set_timeout_for(&mut self, class: TimeoutClass) {
+            self.inner.set_timeout_for(class);
         }
     }
 
@@ -13534,6 +13604,202 @@ mod tests {
         assert!(error.contains("media_readiness_exit_code=10"));
         assert_eq!(tape_init_failure_exit_code(&error), Some(10));
         assert_eq!(tape_init_failure_exit_code("ordinary init failure"), None);
+    }
+
+    #[test]
+    fn tape_init_selected_library_refuses_barcode_only_seen_elsewhere() {
+        let mut config = tape_init_config_with_pool(262_144);
+        config.libraries = vec![
+            remanence_state::LibraryConfig {
+                serial: "LIB-REM".to_string(),
+                allow_derived_drive_identity: false,
+            },
+            remanence_state::LibraryConfig {
+                serial: "LIB-D2".to_string(),
+                allow_derived_drive_identity: false,
+            },
+        ];
+
+        let mut rem_lib = fake_library("LIB-REM");
+        rem_lib.drive_bays = vec![DriveBay {
+            element_address: 0x0001,
+            accessible: true,
+            exception: None,
+            installed: Some(InstalledDrive {
+                serial: "REM-DRV".to_string(),
+                identity_source: IdentitySource::DvcidInline,
+                vendor: Some("HPE".to_string()),
+                product: Some("Ultrium 9-SCSI".to_string()),
+                revision: Some("R3G3".to_string()),
+                sg_path: Some(PathBuf::from("/dev/sg-rem-drive")),
+                sysfs_path: None,
+            }),
+            loaded: false,
+            loaded_tape: None,
+            source_slot: None,
+        }];
+        let mut d2_lib = fake_library("LIB-D2");
+        d2_lib.slots = vec![Slot {
+            element_address: 0x03eb,
+            accessible: true,
+            exception: None,
+            full: true,
+            cartridge: Some("AOX030L9".to_string()),
+        }];
+        let report = DiscoveryReport {
+            libraries: vec![rem_lib, d2_lib],
+            warnings: Vec::new(),
+        };
+        let target = TapeInitTarget::Voltag("AOX030L9".to_string());
+
+        let err = resolve_tape_init_candidates(&report, &config, Some("LIB-REM"), &target)
+            .expect_err("selected library must not search foreign partitions");
+        assert!(
+            err.contains("was not found in configured discovered libraries"),
+            "{err}"
+        );
+
+        let candidates = resolve_tape_init_candidates(&report, &config, Some("LIB-D2"), &target)
+            .expect("barcode is resolvable only when that library is selected");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].library_serial, "LIB-D2");
+        assert_eq!(candidates[0].location, TapeInitLocation::Slot);
+        assert_eq!(candidates[0].element_address, 0x03eb);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn media_readiness_poll_terminalizes_repeated_unit_attention() {
+        let mut lib = fake_library("LIB-UA");
+        lib.drive_bays = vec![DriveBay {
+            element_address: 0x0100,
+            accessible: true,
+            exception: None,
+            installed: Some(InstalledDrive {
+                serial: "DRV-UA".to_string(),
+                identity_source: IdentitySource::DvcidInline,
+                vendor: Some("HPE".to_string()),
+                product: Some("Ultrium 9-SCSI".to_string()),
+                revision: Some("R3G3".to_string()),
+                sg_path: Some(PathBuf::from("/dev/sg-drive-ua")),
+                sysfs_path: None,
+            }),
+            loaded: true,
+            loaded_tape: Some("AOX030L9".to_string()),
+            source_slot: Some(0x03eb),
+        }];
+        let policy = StaticAllowlist::new(["LIB-UA"]);
+        let log = RecordingLog::new();
+        let log_cl = log.clone();
+        let mut changer_slot = Some(vec![changer_inquiry_response(), vpd80_response("LIB-UA")]);
+        let mut drive_slot = Some(vec![lto9_inquiry_response(), vpd80_response("DRV-UA")]);
+        let factory: CliTransportFactory = Box::new(move |path| {
+            if path == Path::new("/dev/sg-mock") {
+                let inner = FixtureTransport::new().with_responses(
+                    changer_slot.take().ok_or_else(|| IoErrorKind {
+                        kind: "Other",
+                        message: "changer transport opened twice".to_string(),
+                        raw_os_error: None,
+                    })?,
+                );
+                Ok(
+                    Box::new(RecordingTransport::with_log(inner, log_cl.clone()))
+                        as Box<dyn SgTransport>,
+                )
+            } else if path == Path::new("/dev/sg-drive-ua") {
+                let inner =
+                    FixtureTransport::new().with_responses(drive_slot.take().ok_or_else(|| {
+                        IoErrorKind {
+                            kind: "Other",
+                            message: "drive transport opened twice".to_string(),
+                            raw_os_error: None,
+                        }
+                    })?);
+                let tur = TurSequenceTransport {
+                    inner,
+                    tur_results: VecDeque::from([
+                        Err(readiness_check_condition(0x06, 0x29, 0x00)),
+                        Err(readiness_check_condition(0x06, 0x29, 0x00)),
+                        Ok(()),
+                    ]),
+                };
+                Ok(Box::new(RecordingTransport::with_log(tur, log_cl.clone()))
+                    as Box<dyn SgTransport>)
+            } else {
+                Err(IoErrorKind {
+                    kind: "NotFound",
+                    message: format!("unexpected transport path {path:?}"),
+                    raw_os_error: None,
+                })
+            }
+        });
+        let mut handle = lib.open_with(&policy, factory).expect("library opens");
+
+        let mut polls = Vec::new();
+        let result = {
+            let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+            poll_drive_media_readiness(
+                &mut drive,
+                MediaFamily::Lto9OrLater,
+                true,
+                StdDuration::from_secs(1),
+                StdDuration::ZERO,
+                || None,
+                |event| {
+                    if let MediaReadinessPollEvent::Poll(poll) = event {
+                        polls.push((poll.attempts, poll.timed_out, poll.readiness.clone()));
+                    }
+                    Ok(())
+                },
+            )
+            .expect("poll loop completes")
+        };
+
+        assert_eq!(result.attempts, 2);
+        assert_eq!(
+            result.readiness,
+            MediaReadiness::RepeatedUnitAttention {
+                asc: 0x29,
+                ascq: 0x00
+            }
+        );
+        assert_eq!(result.readiness.design_exit_code(), 30);
+        assert_eq!(
+            media_readiness_durable_state(&result.readiness, false),
+            "terminal_error"
+        );
+        assert_eq!(polls.len(), 2);
+        assert_eq!(polls[0].0, 1);
+        assert!(!polls[0].1);
+        assert!(matches!(
+            polls[0].2,
+            MediaReadiness::UnitAttention {
+                asc: 0x29,
+                ascq: 0x00
+            }
+        ));
+        assert_eq!(polls[1].0, 2);
+        assert!(!polls[1].1);
+        assert!(matches!(
+            polls[1].2,
+            MediaReadiness::RepeatedUnitAttention {
+                asc: 0x29,
+                ascq: 0x00
+            }
+        ));
+        let log = log.borrow();
+        let tur_count = log
+            .iter()
+            .filter(|cdb| cdb.as_slice() == [0, 0, 0, 0, 0, 0])
+            .count();
+        assert_eq!(
+            tur_count, 2,
+            "poll loop must stop at repeated UA: {log:02x?}"
+        );
+        assert!(
+            !handle.is_dirty(),
+            "TUR CHECK CONDITION is classified, not dirty"
+        );
     }
 
     #[test]
