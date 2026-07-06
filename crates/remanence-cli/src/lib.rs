@@ -94,6 +94,10 @@ const MEDIA_CONDITIONING_TIMEOUT: StdDuration = StdDuration::from_secs(9_000);
 const MEDIA_CONDITIONING_INITIAL_POLL: StdDuration = StdDuration::from_secs(15);
 const MEDIA_CONDITIONING_STEADY_POLL: StdDuration = StdDuration::from_secs(60);
 const MEDIA_CONDITIONING_INITIAL_WINDOW: StdDuration = StdDuration::from_secs(60);
+#[cfg(test)]
+const CONDITIONAL_LOAD_SETTLE: StdDuration = StdDuration::from_millis(0);
+#[cfg(not(test))]
+const CONDITIONAL_LOAD_SETTLE: StdDuration = StdDuration::from_secs(1);
 #[cfg(not(feature = "foreign-bru"))]
 const BRU_BLOCK_SIZE: usize = 2048;
 
@@ -6359,6 +6363,7 @@ fn run_tape_wait_ready_hardware(
             wait: args.wait,
             timeout: args.timeout,
             poll_interval: args.poll,
+            conditional_load_on_no_medium: false,
         },
         || signal_guard.requested_signal_name(),
     )
@@ -6444,6 +6449,17 @@ fn resolve_wait_ready_operation(
     }
 
     let (drive_element, barcode) = resolve_wait_ready_drive(library, args)?;
+    let conflicts = catalog
+        .media_readiness_admission_conflicts(
+            library.serial.as_str(),
+            Some(drive_element),
+            barcode.as_deref(),
+            false,
+        )
+        .map_err(|error| format!("check media readiness admission: {error}"))?;
+    if !conflicts.is_empty() {
+        return Err(wait_ready_active_conflict_error(&conflicts));
+    }
     let operation_id = Uuid::new_v4();
     let drive_bay = library
         .drive_bays
@@ -6477,6 +6493,32 @@ fn resolve_wait_ready_operation(
         })
         .map_err(|error| format!("record media readiness operation: {error}"))?;
     Ok((operation_id, drive_element, barcode))
+}
+
+fn wait_ready_active_conflict_error(
+    conflicts: &[remanence_state::MediaReadinessOperationRecord],
+) -> String {
+    let first = conflicts
+        .first()
+        .map(|record| record.operation_id.as_str())
+        .unwrap_or("(unknown)");
+    let details = conflicts
+        .iter()
+        .map(|record| {
+            format!(
+                "operation={} state={} drive=0x{:04x} barcode={} quarantine={}",
+                record.operation_id,
+                record.state,
+                record.drive_element,
+                record.barcode.as_deref().unwrap_or("(unknown)"),
+                record.quarantine_id.as_deref().unwrap_or("(none)")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "active media-readiness operation already fences this target: {details}; use --resume {first} instead of starting a new wait-ready operation"
+    )
 }
 
 fn validate_wait_ready_resume_binding(
@@ -6643,6 +6685,7 @@ struct MediaReadinessInitialProbeInput {
     wait: bool,
     timeout: StdDuration,
     poll_interval: StdDuration,
+    conditional_load_on_no_medium: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -6656,11 +6699,21 @@ fn poll_media_readiness_after_initial_probe<S: TapeInitStateOps>(
     mut signal: impl FnMut() -> Option<&'static str>,
 ) -> Result<MediaReadinessPoll, String> {
     const SIGNAL_SLEEP_SLICE: StdDuration = StdDuration::from_millis(250);
+    let MediaReadinessInitialProbeInput {
+        initial_poll,
+        wait,
+        timeout,
+        poll_interval,
+        conditional_load_on_no_medium,
+    } = input;
 
     let started = StdInstant::now();
-    let mut attempts = input.initial_poll.attempts;
-    let mut current = Some(input.initial_poll);
+    let mut attempts = initial_poll.attempts;
     let mut unit_attention_seen = BTreeSet::<(u8, u8)>::new();
+    if let MediaReadiness::UnitAttention { asc, ascq } = &initial_poll.readiness {
+        unit_attention_seen.insert((*asc, *ascq));
+    }
+    let mut current = Some(initial_poll);
     let mut conditional_load_sent = false;
 
     loop {
@@ -6681,14 +6734,14 @@ fn poll_media_readiness_after_initial_probe<S: TapeInitStateOps>(
             attempts = attempts.saturating_add(1);
             let mut readiness = drive.probe_media_readiness(family);
             terminalize_repeated_unit_attention(&mut readiness, &mut unit_attention_seen);
-            let can_conditionally_load = input.wait
+            let can_conditionally_load = wait
                 && !conditional_load_sent
-                && readiness_requires_conditional_load(&readiness);
+                && readiness_requires_conditional_load(&readiness, conditional_load_on_no_medium);
             let terminal = readiness.is_ready()
-                || !input.wait
+                || !wait
                 || !(readiness.is_retryable_wait() || can_conditionally_load);
             let elapsed = started.elapsed();
-            let timed_out = !terminal && elapsed >= input.timeout;
+            let timed_out = !terminal && elapsed >= timeout;
             let poll = MediaReadinessPoll {
                 readiness,
                 attempts,
@@ -6714,9 +6767,9 @@ fn poll_media_readiness_after_initial_probe<S: TapeInitStateOps>(
             ));
         }
 
-        if input.wait
+        if wait
             && !conditional_load_sent
-            && readiness_requires_conditional_load(&poll.readiness)
+            && readiness_requires_conditional_load(&poll.readiness, conditional_load_on_no_medium)
         {
             conditional_load_sent = true;
             record_media_readiness_signal_if_requested(
@@ -6732,6 +6785,7 @@ fn poll_media_readiness_after_initial_probe<S: TapeInitStateOps>(
                 Some(0x1b),
                 None,
             ))?;
+            std::thread::sleep(CONDITIONAL_LOAD_SETTLE);
             if let Err(error) = drive.load_immediate() {
                 if let Some(signal_name) = record_media_readiness_signal_or_mechanical_failure(
                     state,
@@ -6745,9 +6799,10 @@ fn poll_media_readiness_after_initial_probe<S: TapeInitStateOps>(
                     return Err(signal_name);
                 }
                 return Err(format!(
-                    "immediate drive load 0x{drive_element:04x}: {error}"
+                    "media_readiness_state=transport_unknown media_readiness_exit_code=40: immediate drive load 0x{drive_element:04x}: {error}"
                 ));
             }
+            unit_attention_seen.clear();
             record_media_readiness_signal_if_requested(
                 state,
                 operation_id,
@@ -6758,7 +6813,7 @@ fn poll_media_readiness_after_initial_probe<S: TapeInitStateOps>(
         }
 
         let terminal = poll.readiness.is_ready()
-            || !input.wait
+            || !wait
             || !poll.readiness.is_retryable_wait()
             || poll.timed_out;
         if terminal {
@@ -6766,12 +6821,12 @@ fn poll_media_readiness_after_initial_probe<S: TapeInitStateOps>(
         }
 
         let elapsed = started.elapsed();
-        let sleep_for = if input.poll_interval == MEDIA_CONDITIONING_STEADY_POLL {
+        let sleep_for = if poll_interval == MEDIA_CONDITIONING_STEADY_POLL {
             media_conditioning_poll_interval(elapsed)
         } else {
-            input.poll_interval
+            poll_interval
         };
-        let mut remaining = std::cmp::min(sleep_for, input.timeout.saturating_sub(elapsed));
+        let mut remaining = std::cmp::min(sleep_for, timeout.saturating_sub(elapsed));
         while remaining > StdDuration::ZERO {
             if let Some(signal_name) = signal() {
                 record_media_readiness_signal_transition(
@@ -6798,7 +6853,7 @@ fn poll_tape_init_readiness_after_initial_probe<S: TapeInitStateOps>(
     operation_id: Uuid,
     state: &mut S,
     drive_element: u16,
-    initial_poll: MediaReadinessPoll,
+    input: MediaReadinessInitialProbeInput,
     signal: impl FnMut() -> Option<&'static str>,
 ) -> Result<MediaReadinessPoll, String> {
     poll_media_readiness_after_initial_probe(
@@ -6807,12 +6862,7 @@ fn poll_tape_init_readiness_after_initial_probe<S: TapeInitStateOps>(
         operation_id,
         state,
         drive_element,
-        MediaReadinessInitialProbeInput {
-            initial_poll,
-            wait: true,
-            timeout: MEDIA_CONDITIONING_TIMEOUT,
-            poll_interval: MEDIA_CONDITIONING_STEADY_POLL,
-        },
+        input,
         signal,
     )
 }
@@ -6963,7 +7013,9 @@ fn media_readiness_error_is_signal_abort(message: &str) -> bool {
 }
 
 fn tape_wait_ready_failure_from_poll_error(message: String) -> TapeWaitReadyFailure {
-    let exit_code = if media_readiness_error_is_signal_abort(&message) {
+    let exit_code = if let Some(code) = media_readiness_failure_exit_code(&message) {
+        code
+    } else if media_readiness_error_is_signal_abort(&message) {
         130
     } else {
         1
@@ -7188,11 +7240,12 @@ fn media_readiness_durable_state(readiness: &MediaReadiness, timed_out: bool) ->
     }
 }
 
-fn readiness_requires_conditional_load(readiness: &MediaReadiness) -> bool {
-    matches!(
-        readiness,
-        MediaReadiness::NoMedium { .. } | MediaReadiness::BecomingReady { ascq: 0x02, .. }
-    )
+fn readiness_requires_conditional_load(
+    readiness: &MediaReadiness,
+    conditional_load_on_no_medium: bool,
+) -> bool {
+    matches!(readiness, MediaReadiness::BecomingReady { ascq: 0x02, .. })
+        || (conditional_load_on_no_medium && matches!(readiness, MediaReadiness::NoMedium { .. }))
 }
 
 fn tape_init_readiness_exit_code(poll: &MediaReadinessPoll) -> u8 {
@@ -7203,7 +7256,7 @@ fn tape_init_readiness_exit_code(poll: &MediaReadinessPoll) -> u8 {
     }
 }
 
-fn tape_init_failure_exit_code(error: &str) -> Option<u8> {
+fn media_readiness_failure_exit_code(error: &str) -> Option<u8> {
     const MARKER: &str = "media_readiness_exit_code=";
     let marker_at = error.find(MARKER)?;
     let value_start = marker_at + MARKER.len();
@@ -7212,6 +7265,10 @@ fn tape_init_failure_exit_code(error: &str) -> Option<u8> {
         .take_while(|ch| ch.is_ascii_digit())
         .collect::<String>();
     value.parse().ok()
+}
+
+fn tape_init_failure_exit_code(error: &str) -> Option<u8> {
+    media_readiness_failure_exit_code(error)
 }
 
 fn print_tape_wait_ready_result(
@@ -8087,7 +8144,13 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
             operation_id,
             state,
             drive_element,
-            initial_poll,
+            MediaReadinessInitialProbeInput {
+                initial_poll,
+                wait: true,
+                timeout: MEDIA_CONDITIONING_TIMEOUT,
+                poll_interval: MEDIA_CONDITIONING_STEADY_POLL,
+                conditional_load_on_no_medium: candidate.location == TapeInitLocation::Slot,
+            },
             || signal_guard.requested_signal_name(),
         )?
     };
@@ -12864,37 +12927,69 @@ mod tests {
         let lib_serial = format!("LIB-UA-{suffix}");
         let drive_serial = format!("DRV-UA-{suffix}");
         let drive_path = PathBuf::from(format!("/dev/sg-drive-ua-{suffix}"));
+        let (handle, mut drive, log) = open_lto9_test_drive_with_tur_sequence(
+            &lib_serial,
+            &drive_serial,
+            &drive_path,
+            tur_results,
+        );
+        let mut polls = Vec::new();
+        let result = poll_drive_media_readiness(
+            &mut drive,
+            MediaFamily::Lto9OrLater,
+            true,
+            StdDuration::from_secs(1),
+            StdDuration::ZERO,
+            || None,
+            |event| {
+                if let MediaReadinessPollEvent::Poll(poll) = event {
+                    polls.push((poll.attempts, poll.timed_out, poll.readiness.clone()));
+                }
+                Ok(())
+            },
+        )
+        .expect("poll loop completes");
+        let dirty = handle.is_dirty();
+        let log = log.borrow();
+        let tur_count = log
+            .iter()
+            .filter(|cdb| cdb.as_slice() == [0, 0, 0, 0, 0, 0])
+            .count();
+        (result, polls, tur_count, dirty)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_lto9_test_drive_with_tur_sequence(
+        lib_serial: &str,
+        drive_serial: &str,
+        drive_path: &Path,
+        tur_results: Vec<Result<(), ScsiError>>,
+    ) -> (remanence_library::LibraryHandle, DriveHandle, RecordingLog) {
         let mut lib = fake_library(&lib_serial);
         lib.drive_bays = vec![DriveBay {
             element_address: 0x0100,
             accessible: true,
             exception: None,
             installed: Some(InstalledDrive {
-                serial: drive_serial.clone(),
+                serial: drive_serial.to_string(),
                 identity_source: IdentitySource::DvcidInline,
                 vendor: Some("HPE".to_string()),
                 product: Some("Ultrium 9-SCSI".to_string()),
                 revision: Some("R3G3".to_string()),
-                sg_path: Some(drive_path.clone()),
+                sg_path: Some(drive_path.to_path_buf()),
                 sysfs_path: None,
             }),
             loaded: true,
             loaded_tape: Some("AOX030L9".to_string()),
             source_slot: Some(0x03eb),
         }];
-        let policy = StaticAllowlist::new([lib_serial.as_str()]);
+        let policy = StaticAllowlist::new([lib_serial]);
         let log = RecordingLog::new();
         let log_cl = log.clone();
-        let mut changer_slot = Some(vec![
-            changer_inquiry_response(),
-            vpd80_response(lib_serial.as_str()),
-        ]);
-        let mut drive_slot = Some(vec![
-            lto9_inquiry_response(),
-            vpd80_response(drive_serial.as_str()),
-        ]);
+        let mut changer_slot = Some(vec![changer_inquiry_response(), vpd80_response(lib_serial)]);
+        let mut drive_slot = Some(vec![lto9_inquiry_response(), vpd80_response(drive_serial)]);
         let mut tur_results = Some(VecDeque::from(tur_results));
-        let drive_path_cl = drive_path.clone();
+        let drive_path_cl = drive_path.to_path_buf();
         let factory: CliTransportFactory = Box::new(move |path| {
             if path == Path::new("/dev/sg-mock") {
                 let inner = FixtureTransport::new().with_responses(
@@ -12936,33 +13031,60 @@ mod tests {
             }
         });
         let mut handle = lib.open_with(&policy, factory).expect("library opens");
+        let drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+        (handle, drive, log)
+    }
 
-        let mut polls = Vec::new();
-        let result = {
-            let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
-            poll_drive_media_readiness(
-                &mut drive,
-                MediaFamily::Lto9OrLater,
-                true,
-                StdDuration::from_secs(1),
-                StdDuration::ZERO,
-                || None,
-                |event| {
-                    if let MediaReadinessPollEvent::Poll(poll) = event {
-                        polls.push((poll.attempts, poll.timed_out, poll.readiness.clone()));
-                    }
-                    Ok(())
-                },
-            )
-            .expect("poll loop completes")
-        };
-        let dirty = handle.is_dirty();
-        let log = log.borrow();
-        let tur_count = log
-            .iter()
-            .filter(|cdb| cdb.as_slice() == [0, 0, 0, 0, 0, 0])
-            .count();
-        (result, polls, tur_count, dirty)
+    fn record_test_media_readiness_operation(
+        index: &mut remanence_state::CatalogIndex,
+        operation_id: Uuid,
+        library_serial: &str,
+        drive_element: u16,
+        barcode: &str,
+        state: &str,
+        dirty_scope: Option<&str>,
+    ) {
+        index
+            .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+                operation_id,
+                run_id: None,
+                library_serial: library_serial.to_string(),
+                changer_sg: Some("/dev/sg8".to_string()),
+                drive_element,
+                drive_sg: Some("/dev/sg7".to_string()),
+                drive_serial: Some("DRV-UA-test".to_string()),
+                barcode: Some(barcode.to_string()),
+                source_slot: Some(0x03eb),
+                media_generation: Some(9),
+                phase: "readiness_poll".to_string(),
+                state: state.to_string(),
+                dirty_scope: dirty_scope.map(ToOwned::to_owned),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .expect("record media-readiness operation");
+    }
+
+    fn lto9_loaded_test_library(serial: &str, barcode: &str) -> Library {
+        let mut lib = fake_library(serial);
+        lib.drive_bays = vec![DriveBay {
+            element_address: 0x0100,
+            accessible: true,
+            exception: None,
+            installed: Some(InstalledDrive {
+                serial: "DRV-UA-test".to_string(),
+                identity_source: IdentitySource::DvcidInline,
+                vendor: Some("HPE".to_string()),
+                product: Some("Ultrium 9-SCSI".to_string()),
+                revision: Some("R3G3".to_string()),
+                sg_path: Some(PathBuf::from("/dev/sg7")),
+                sysfs_path: None,
+            }),
+            loaded: true,
+            loaded_tape: Some(barcode.to_string()),
+            source_slot: Some(0x03eb),
+        }];
+        lib
     }
 
     #[test]
@@ -13634,6 +13756,53 @@ mod tests {
     }
 
     #[test]
+    fn tape_wait_ready_new_barcode_refuses_active_media_readiness_fence() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-wait-ready-admission")
+            .tempdir()
+            .expect("temp dir");
+        let mut index =
+            remanence_state::CatalogIndex::open(temp.path().join("state.sqlite")).expect("open");
+        let operation_id = Uuid::from_u128(0x9001);
+        record_test_media_readiness_operation(
+            &mut index,
+            operation_id,
+            "LIB-A",
+            0x0100,
+            "AOX030L9",
+            "media_initializing",
+            Some("drive+tape"),
+        );
+        let library = lto9_loaded_test_library("LIB-A", "AOX030L9");
+        let args = TapeWaitReadyArgs {
+            resume: None,
+            barcode: Some("AOX030L9".to_string()),
+            drive_element: None,
+            already_loaded: false,
+            wait: true,
+            timeout: StdDuration::from_secs(1),
+            poll: StdDuration::ZERO,
+            config: PathBuf::from("/tmp/rem-config.toml"),
+            library: Some("LIB-A".to_string()),
+            json: false,
+        };
+
+        let err = resolve_wait_ready_operation(&library, &args, &mut index)
+            .expect_err("new wait-ready must refuse an active fence");
+
+        assert!(err.contains("active media-readiness operation"), "{err}");
+        assert!(err.contains(&operation_id.to_string()), "{err}");
+        assert_eq!(
+            index
+                .list_active_media_readiness_operations(Some("LIB-A"))
+                .expect("active fences")
+                .len(),
+            1,
+            "refused wait-ready must not create a duplicate operation"
+        );
+    }
+
+    #[test]
     fn library_command_accepts_json_slots_snapshot() {
         let cli = Cli::parse_from(["rem", "library", "LIB-A", "--json", "--slots"]);
         match cli.command {
@@ -13864,6 +14033,11 @@ mod tests {
             "record media readiness transition: sqlite busy".to_string(),
         );
         assert_eq!(failure.exit_code, 1);
+
+        let failure = tape_wait_ready_failure_from_poll_error(
+            "media_readiness_state=transport_unknown media_readiness_exit_code=40: immediate drive load 0x0100: SG_IO transport error".to_string(),
+        );
+        assert_eq!(failure.exit_code, 40);
     }
 
     #[test]
@@ -14047,16 +14221,23 @@ mod tests {
             &MediaReadiness::BecomingReady {
                 ascq: 0x01,
                 media_initializing: true,
-            }
+            },
+            true,
         ));
         assert!(readiness_requires_conditional_load(
             &MediaReadiness::BecomingReady {
                 ascq: 0x02,
                 media_initializing: true,
-            }
+            },
+            false,
         ));
         assert!(readiness_requires_conditional_load(
-            &MediaReadiness::NoMedium { ascq: 0x00 }
+            &MediaReadiness::NoMedium { ascq: 0x00 },
+            true,
+        ));
+        assert!(!readiness_requires_conditional_load(
+            &MediaReadiness::NoMedium { ascq: 0x00 },
+            false,
         ));
     }
 
@@ -14233,6 +14414,137 @@ mod tests {
         assert_eq!(polls[3].2, MediaReadiness::Ready);
         assert_eq!(tur_count, 4);
         assert!(!dirty, "TUR CHECK CONDITION is classified, not dirty");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn media_readiness_poll_already_loaded_no_medium_does_not_issue_conditional_load() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-wait-ready-no-medium")
+            .tempdir()
+            .expect("temp dir");
+        let mut index =
+            remanence_state::CatalogIndex::open(temp.path().join("state.sqlite")).expect("open");
+        let operation_id = Uuid::from_u128(0x9002);
+        record_test_media_readiness_operation(
+            &mut index,
+            operation_id,
+            "LIB-UA-no-medium",
+            0x0100,
+            "AOX030L9",
+            "planned",
+            Some("drive+tape"),
+        );
+        let (_, mut drive, log) = open_lto9_test_drive_with_tur_sequence(
+            "LIB-UA-no-medium",
+            "DRV-UA-no-medium",
+            Path::new("/dev/sg-drive-ua-no-medium"),
+            Vec::new(),
+        );
+
+        let result = poll_media_readiness_after_initial_probe(
+            &mut drive,
+            MediaFamily::Lto9OrLater,
+            operation_id,
+            &mut index,
+            0x0100,
+            MediaReadinessInitialProbeInput {
+                initial_poll: MediaReadinessPoll {
+                    readiness: MediaReadiness::NoMedium { ascq: 0x00 },
+                    attempts: 1,
+                    timed_out: false,
+                },
+                wait: true,
+                timeout: StdDuration::from_secs(1),
+                poll_interval: StdDuration::ZERO,
+                conditional_load_on_no_medium: false,
+            },
+            || None,
+        )
+        .expect("already-loaded no-medium should terminalize without LOAD");
+
+        assert_eq!(result.readiness, MediaReadiness::NoMedium { ascq: 0x00 });
+        assert_eq!(
+            log.borrow()
+                .iter()
+                .filter(|cdb| cdb.first().copied() == Some(0x1b))
+                .count(),
+            0,
+            "wait-ready on already-loaded media must not issue blind LOAD IMMED"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn media_readiness_poll_clears_unit_attention_epoch_after_conditional_load() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-wait-ready-ua-epoch")
+            .tempdir()
+            .expect("temp dir");
+        let mut index =
+            remanence_state::CatalogIndex::open(temp.path().join("state.sqlite")).expect("open");
+        let operation_id = Uuid::from_u128(0x9003);
+        record_test_media_readiness_operation(
+            &mut index,
+            operation_id,
+            "LIB-UA-epoch",
+            0x0100,
+            "AOX030L9",
+            "planned",
+            Some("drive+tape"),
+        );
+        let (_, mut drive, log) = open_lto9_test_drive_with_tur_sequence(
+            "LIB-UA-epoch",
+            "DRV-UA-epoch",
+            Path::new("/dev/sg-drive-ua-epoch"),
+            vec![
+                Err(readiness_check_condition(0x02, 0x04, 0x02)),
+                Err(readiness_check_condition(0x06, 0x29, 0x00)),
+                Ok(()),
+            ],
+        );
+
+        let result = poll_media_readiness_after_initial_probe(
+            &mut drive,
+            MediaFamily::Lto9OrLater,
+            operation_id,
+            &mut index,
+            0x0100,
+            MediaReadinessInitialProbeInput {
+                initial_poll: MediaReadinessPoll {
+                    readiness: MediaReadiness::UnitAttention {
+                        asc: 0x29,
+                        ascq: 0x00,
+                    },
+                    attempts: 1,
+                    timed_out: false,
+                },
+                wait: true,
+                timeout: StdDuration::from_secs(1),
+                poll_interval: StdDuration::ZERO,
+                conditional_load_on_no_medium: true,
+            },
+            || None,
+        )
+        .expect("post-load UA should start a fresh epoch and reach ready");
+
+        assert_eq!(result.readiness, MediaReadiness::Ready);
+        assert_eq!(result.attempts, 4);
+        let control_cdbs = log
+            .borrow()
+            .iter()
+            .filter(|cdb| matches!(cdb.first(), Some(0x00 | 0x1b)))
+            .map(|cdb| (cdb[0], cdb[1], cdb[4]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            control_cdbs,
+            vec![
+                (0x00, 0x00, 0x00),
+                (0x1b, 0x01, 0x01),
+                (0x00, 0x00, 0x00),
+                (0x00, 0x00, 0x00)
+            ]
+        );
     }
 
     #[test]

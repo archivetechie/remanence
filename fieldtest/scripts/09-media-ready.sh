@@ -98,6 +98,26 @@ print(json.dumps(extra, separators=(",", ":")))
 PY
 }
 
+readiness_result_barcode() {
+  local path="$1"
+  python3 - "$path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text())
+try:
+    stdout = json.loads(payload.get("stdout") or "{}")
+except json.JSONDecodeError:
+    raise SystemExit(1)
+barcode = stdout.get("barcode") if isinstance(stdout, dict) else None
+if barcode:
+    print(barcode)
+else:
+    raise SystemExit(1)
+PY
+}
+
 append_readiness_ledger() {
   local serial="$1" target_kind="$2" target="$3" detail_path="$4" code="$5" state_override="${6:-}"
   local ledger
@@ -343,6 +363,30 @@ run_wait_ready() {
   fieldtest_capture_text "$out" "${cmd[@]}"
   rc=$?
   set -e
+  if [[ "$target_kind" == resume ]]; then
+    local resume_barcode
+    resume_barcode="$(readiness_result_barcode "$out" || true)"
+    if [[ -n "$resume_barcode" ]] && ! fieldtest_require_allowlisted "$resume_barcode"; then
+      extra="$(
+        python3 - "$serial" "$target" "$resume_barcode" <<'PY'
+import json
+import sys
+
+serial, operation_id, barcode = sys.argv[1:]
+print(json.dumps({
+    "media_readiness_state": "ownership_refused",
+    "library_serial": serial,
+    "operation_id": operation_id,
+    "barcode": barcode,
+    "rem_exit_code": 50,
+}, separators=(",", ":")))
+PY
+      )"
+      append_readiness_ledger "$serial" "$target_kind" "$target" "$out" 50 "ownership_refused"
+      fieldtest_evidence_record "$SCRIPT_NAME" "wait-ready-${token}" FAIL "resume operation $target is bound to non-allowlisted barcode $resume_barcode" "$out" "$extra"
+      return 50
+    fi
+  fi
   extra="$(readiness_result_extra_json "$out" "$rc")"
   append_readiness_ledger "$serial" "$target_kind" "$target" "$out" "$rc"
   case "$rc" in
@@ -422,6 +466,12 @@ JSON
 JSON
     exit 10
   fi
+  if [[ " $* " == *" --resume 00000000-0000-0000-0000-0000000000aa "* ]]; then
+    cat <<'JSON'
+{"schema":"rem.tape.wait_ready.v1","operation_id":"00000000-0000-0000-0000-0000000000aa","library_serial":"LIBMAIN","drive_element":"0x0002","barcode":"S20003L9","state":"ready","ready":true,"retryable":false,"timed_out":false,"attempts":1,"exit_code":0,"summary":"ready"}
+JSON
+    exit 0
+  fi
 fi
 echo "unexpected mock rem invocation: $*" >&2
 exit 98
@@ -450,6 +500,17 @@ EOF
     return 1
   fi
   grep -q 'do not move/unload/retry' "$tmpdir/selftest.stderr"
+  child_rc=0
+  REMFIELD_HOME="$tmpdir/home" bash "$0" --resume 00000000-0000-0000-0000-0000000000aa --no-wait >"$tmpdir/resume.stdout" 2>"$tmpdir/resume.stderr" || child_rc=$?
+  if [[ "$child_rc" -ne 50 ]]; then
+    echo "selftest: expected non-allowlisted resume refusal exit 50, got $child_rc" >&2
+    cat "$tmpdir/resume.stderr" >&2 || true
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  grep -q '"status":"FAIL"' "$records"
+  grep -q '"media_readiness_state":"ownership_refused"' "$records"
+  grep -q '"state":"ownership_refused"' "$ledger"
   rm -rf "$tmpdir"
 
   tmpdir="$(mktemp -d)"
