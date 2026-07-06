@@ -5995,6 +5995,57 @@ impl TapeInitStateOps for remanence_state::CatalogIndex {
     }
 }
 
+struct DryRunTapeInitState {
+    catalog: remanence_state::CatalogIndex,
+}
+
+impl DryRunTapeInitState {
+    fn new(catalog: remanence_state::CatalogIndex) -> Self {
+        Self { catalog }
+    }
+}
+
+impl TapeInitStateOps for DryRunTapeInitState {
+    fn project_catalog_inputs(
+        &mut self,
+        voltag: &str,
+        bot: &remanence_api::BotClassification,
+        pool_id: &str,
+    ) -> Result<remanence_api::TapeInitCatalogProjection, String> {
+        remanence_api::project_tape_init_catalog_inputs(&self.catalog, voltag, bot, pool_id)
+            .map_err(|error| format!("project catalog init inputs: {error}"))
+    }
+
+    fn provision_initialized_tape(
+        &mut self,
+        _config: &remanence_state::RemConfig,
+        _tape_uuid: remanence_api::TapeUuid,
+        _voltag: String,
+        _block_size: u32,
+        _parity: remanence_api::ParityConfig,
+        _force: bool,
+    ) -> Result<(), String> {
+        Err("internal error: dry-run attempted to provision catalog state".to_string())
+    }
+
+    fn media_readiness_admission_conflicts(
+        &mut self,
+        library_serial: &str,
+        drive_element: Option<u16>,
+        barcode: Option<&str>,
+        library_robotics: bool,
+    ) -> Result<Vec<remanence_state::MediaReadinessOperationRecord>, String> {
+        self.catalog
+            .media_readiness_admission_conflicts(
+                library_serial,
+                drive_element,
+                barcode,
+                library_robotics,
+            )
+            .map_err(|error| format!("check media readiness admission: {error}"))
+    }
+}
+
 fn run_tape_command(
     report: &DiscoveryReport,
     command: &TapeCommand,
@@ -7572,7 +7623,7 @@ fn run_tape_init(
     let policy = configured_library_policy(&config);
 
     if args.dry_run {
-        let mut catalog = match remanence_state::CatalogIndex::open_read_only(&paths.sqlite_path) {
+        let catalog = match remanence_state::CatalogIndex::open_read_only(&paths.sqlite_path) {
             Ok(catalog) => catalog,
             Err(error) => {
                 let _ = writeln!(err, "error: {error}");
@@ -7580,13 +7631,14 @@ fn run_tape_init(
                 return ExitCode::from(1);
             }
         };
+        let mut state = DryRunTapeInitState::new(catalog);
         let ctx = TapeInitRunContext {
             report,
             config: &config,
             policy: &policy,
             args,
         };
-        return run_tape_init_candidates(&mut catalog, candidates, &ctx, out, err);
+        return run_tape_init_candidates(&mut state, candidates, &ctx, out, err);
     }
 
     let mut state = match remanence_state::StateHandle::open_with_config(paths, config.clone()) {
@@ -15356,6 +15408,84 @@ tape_catalog_dir = "{0}/cache/tapes"
         assert_eq!(
             record.detail.get("forced"),
             Some(&ciborium::value::Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn tape_init_dry_run_state_suppresses_readiness_writes_but_checks_fences() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-init-dry-run-state")
+            .tempdir()
+            .expect("temp dir");
+        let db_path = temp.path().join("state.sqlite");
+        let active_operation_id = Uuid::from_u128(0x7001);
+        {
+            let mut index =
+                remanence_state::CatalogIndex::open(&db_path).expect("open writable catalog");
+            record_test_media_readiness_operation(
+                &mut index,
+                active_operation_id,
+                "LIB-A",
+                0x0100,
+                "AOX030L9",
+                "media_initializing",
+                Some("drive+tape"),
+            );
+        }
+        let catalog = remanence_state::CatalogIndex::open_read_only(&db_path)
+            .expect("open read-only catalog");
+        let mut state = DryRunTapeInitState::new(catalog);
+
+        let conflicts = state
+            .media_readiness_admission_conflicts("LIB-A", Some(0x0100), Some("AOX030L9"), true)
+            .expect("dry-run still checks active fences");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].operation_id, active_operation_id.to_string());
+
+        let dry_run_operation_id = Uuid::from_u128(0x7002);
+        TapeInitStateOps::record_media_readiness_operation(
+            &mut state,
+            remanence_state::MediaReadinessOperationInput {
+                operation_id: dry_run_operation_id,
+                run_id: None,
+                library_serial: "LIB-A".to_string(),
+                changer_sg: Some("/dev/sg8".to_string()),
+                drive_element: 0x0100,
+                drive_sg: Some("/dev/sg7".to_string()),
+                drive_serial: Some("DRV-UA-test".to_string()),
+                barcode: Some("AOX031L9".to_string()),
+                source_slot: Some(0x03ec),
+                media_generation: Some(9),
+                phase: "planned".to_string(),
+                state: "planned".to_string(),
+                dirty_scope: Some("drive+tape".to_string()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            },
+        )
+        .expect("dry-run readiness operation record is a no-op");
+        TapeInitStateOps::record_media_readiness_transition(
+            &mut state,
+            media_readiness_signal_transition(dry_run_operation_id, "readiness_poll", "SIGINT"),
+        )
+        .expect("dry-run readiness transition record is a no-op");
+        drop(state);
+
+        let catalog = remanence_state::CatalogIndex::open_read_only(&db_path)
+            .expect("reopen read-only catalog");
+        assert!(
+            catalog
+                .media_readiness_operation(dry_run_operation_id)
+                .expect("lookup dry-run operation")
+                .is_none(),
+            "dry-run readiness records must not persist"
+        );
+        assert!(
+            catalog
+                .media_readiness_operation(active_operation_id)
+                .expect("lookup active operation")
+                .is_some(),
+            "the pre-existing active fence must remain visible"
         );
     }
 
