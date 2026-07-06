@@ -1,7 +1,7 @@
 # LTO-9 media readiness and calibration-aware orchestration -- Design v0.4
 
 **Status:** panel folded + Opus + Fable 5 reviews folded (2026-07-06);
-verify round pending.
+follow-up Fable gate folded, verify round pending.
 **Panel 2026-07-06:** 34 raw findings across SCSI correctness,
 failure-modes/ops, fieldtest/operator UX, cost/efficiency, and GLM 5.2 via
 OpenRouter (`z-ai/glm-5.2`). Raw findings: 4 blockers, 20 majors, 8 minors,
@@ -13,6 +13,9 @@ this revision.
 **Fable 5 addendum 2026-07-06:** Claude Fable 5 via OpenRouter found no
 blockers and 12 findings (4 majors, 5 minors, 3 nits); all accepted findings
 are folded in this revision.
+**Fable 5 follow-up 2026-07-06:** a second OpenRouter pass found one
+controlled-run blocker around Unit Attention epoch handling and two fieldtest
+escalation hardening findings; all accepted findings are folded.
 **Problem source:** the July 2026 physical MSL3040 field test exposed that
 `rem tape init` and `fieldtest/scripts/10-init-pools.sh` are not aware of
 LTO-9 first-load media optimization. `AOX034L9` initialized successfully, but
@@ -704,10 +707,13 @@ Chaos/harness coverage:
   `media_readiness_state`.
 
 Local regression status as of 2026-07-06: `remanence-cli` covers selected
-library/two-partition barcode scoping and repeated-UA terminalization through
-the real poll loop; `fieldtest/scripts/10-init-pools.sh --selftest` covers
-dry-run readiness exit 10 stopping before `--force`/`--clobber-data` and
-records `INFO`, `media_readiness_state`, and `rem_exit_code`. A `~/system`
+library/two-partition barcode scoping, identical repeated-UA
+terminalization, and the expected `06/29/00 -> 02/04/01 -> 06/28/00 -> GOOD`
+readiness progression through the real poll loop;
+`fieldtest/scripts/10-init-pools.sh --selftest` covers dry-run readiness exit
+10 stopping before `--force`/`--clobber-data`, unclassified non-policy exit
+codes failing closed before escalation, and records `INFO`/`FAIL`,
+`media_readiness_state` where present, and `rem_exit_code`. A `~/system`
 scenario or `covers` ledger entry is still needed to tie these local
 regressions into the scenario registry.
 

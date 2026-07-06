@@ -39,7 +39,7 @@
 //! Exit codes: 0 on success, 1 on a discovery / op error, 2 when the
 //! caller asked for a library that wasn't found.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -6521,7 +6521,7 @@ fn poll_drive_media_readiness(
     const SIGNAL_SLEEP_SLICE: StdDuration = StdDuration::from_millis(250);
     let started = StdInstant::now();
     let mut attempts = 0_u64;
-    let mut unit_attention_seen: Option<(u8, u8)> = None;
+    let mut unit_attention_seen = BTreeSet::<(u8, u8)>::new();
     loop {
         if let Some(signal) = signal() {
             record(MediaReadinessPollEvent::Signal(signal))?;
@@ -6531,11 +6531,7 @@ fn poll_drive_media_readiness(
         }
         attempts = attempts.saturating_add(1);
         let mut readiness = drive.probe_media_readiness(family);
-        if let MediaReadiness::UnitAttention { asc, ascq } = readiness {
-            if unit_attention_seen.replace((asc, ascq)).is_some() {
-                readiness = MediaReadiness::RepeatedUnitAttention { asc, ascq };
-            }
-        }
+        terminalize_repeated_unit_attention(&mut readiness, &mut unit_attention_seen);
         let terminal = readiness.is_ready() || !wait || !readiness.is_retryable_wait();
         let elapsed = started.elapsed();
         let timed_out = !terminal && elapsed >= timeout;
@@ -6571,6 +6567,23 @@ fn poll_drive_media_readiness(
             std::thread::sleep(chunk);
             remaining = remaining.saturating_sub(chunk);
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn terminalize_repeated_unit_attention(
+    readiness: &mut MediaReadiness,
+    seen: &mut BTreeSet<(u8, u8)>,
+) {
+    let repeated = match readiness {
+        MediaReadiness::UnitAttention { asc, ascq } => {
+            let key = (*asc, *ascq);
+            (!seen.insert(key)).then_some(key)
+        }
+        _ => None,
+    };
+    if let Some((asc, ascq)) = repeated {
+        *readiness = MediaReadiness::RepeatedUnitAttention { asc, ascq };
     }
 }
 
@@ -12579,6 +12592,120 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn poll_lto9_tur_sequence(
+        suffix: &str,
+        tur_results: Vec<Result<(), ScsiError>>,
+    ) -> (
+        MediaReadinessPoll,
+        Vec<(u64, bool, MediaReadiness)>,
+        usize,
+        bool,
+    ) {
+        let lib_serial = format!("LIB-UA-{suffix}");
+        let drive_serial = format!("DRV-UA-{suffix}");
+        let drive_path = PathBuf::from(format!("/dev/sg-drive-ua-{suffix}"));
+        let mut lib = fake_library(&lib_serial);
+        lib.drive_bays = vec![DriveBay {
+            element_address: 0x0100,
+            accessible: true,
+            exception: None,
+            installed: Some(InstalledDrive {
+                serial: drive_serial.clone(),
+                identity_source: IdentitySource::DvcidInline,
+                vendor: Some("HPE".to_string()),
+                product: Some("Ultrium 9-SCSI".to_string()),
+                revision: Some("R3G3".to_string()),
+                sg_path: Some(drive_path.clone()),
+                sysfs_path: None,
+            }),
+            loaded: true,
+            loaded_tape: Some("AOX030L9".to_string()),
+            source_slot: Some(0x03eb),
+        }];
+        let policy = StaticAllowlist::new([lib_serial.as_str()]);
+        let log = RecordingLog::new();
+        let log_cl = log.clone();
+        let mut changer_slot = Some(vec![
+            changer_inquiry_response(),
+            vpd80_response(lib_serial.as_str()),
+        ]);
+        let mut drive_slot = Some(vec![
+            lto9_inquiry_response(),
+            vpd80_response(drive_serial.as_str()),
+        ]);
+        let mut tur_results = Some(VecDeque::from(tur_results));
+        let drive_path_cl = drive_path.clone();
+        let factory: CliTransportFactory = Box::new(move |path| {
+            if path == Path::new("/dev/sg-mock") {
+                let inner = FixtureTransport::new().with_responses(
+                    changer_slot.take().ok_or_else(|| IoErrorKind {
+                        kind: "Other",
+                        message: "changer transport opened twice".to_string(),
+                        raw_os_error: None,
+                    })?,
+                );
+                Ok(
+                    Box::new(RecordingTransport::with_log(inner, log_cl.clone()))
+                        as Box<dyn SgTransport>,
+                )
+            } else if path == drive_path_cl.as_path() {
+                let inner =
+                    FixtureTransport::new().with_responses(drive_slot.take().ok_or_else(|| {
+                        IoErrorKind {
+                            kind: "Other",
+                            message: "drive transport opened twice".to_string(),
+                            raw_os_error: None,
+                        }
+                    })?);
+                let tur = TurSequenceTransport {
+                    inner,
+                    tur_results: tur_results.take().ok_or_else(|| IoErrorKind {
+                        kind: "Other",
+                        message: "drive TUR sequence opened twice".to_string(),
+                        raw_os_error: None,
+                    })?,
+                };
+                Ok(Box::new(RecordingTransport::with_log(tur, log_cl.clone()))
+                    as Box<dyn SgTransport>)
+            } else {
+                Err(IoErrorKind {
+                    kind: "NotFound",
+                    message: format!("unexpected transport path {path:?}"),
+                    raw_os_error: None,
+                })
+            }
+        });
+        let mut handle = lib.open_with(&policy, factory).expect("library opens");
+
+        let mut polls = Vec::new();
+        let result = {
+            let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+            poll_drive_media_readiness(
+                &mut drive,
+                MediaFamily::Lto9OrLater,
+                true,
+                StdDuration::from_secs(1),
+                StdDuration::ZERO,
+                || None,
+                |event| {
+                    if let MediaReadinessPollEvent::Poll(poll) = event {
+                        polls.push((poll.attempts, poll.timed_out, poll.readiness.clone()));
+                    }
+                    Ok(())
+                },
+            )
+            .expect("poll loop completes")
+        };
+        let dirty = handle.is_dirty();
+        let log = log.borrow();
+        let tur_count = log
+            .iter()
+            .filter(|cdb| cdb.as_slice() == [0, 0, 0, 0, 0, 0])
+            .count();
+        (result, polls, tur_count, dirty)
+    }
+
     #[test]
     fn rem_help_hides_direct_hardware_commands() {
         let help = command_help(Cli::command());
@@ -13670,90 +13797,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn media_readiness_poll_terminalizes_repeated_unit_attention() {
-        let mut lib = fake_library("LIB-UA");
-        lib.drive_bays = vec![DriveBay {
-            element_address: 0x0100,
-            accessible: true,
-            exception: None,
-            installed: Some(InstalledDrive {
-                serial: "DRV-UA".to_string(),
-                identity_source: IdentitySource::DvcidInline,
-                vendor: Some("HPE".to_string()),
-                product: Some("Ultrium 9-SCSI".to_string()),
-                revision: Some("R3G3".to_string()),
-                sg_path: Some(PathBuf::from("/dev/sg-drive-ua")),
-                sysfs_path: None,
-            }),
-            loaded: true,
-            loaded_tape: Some("AOX030L9".to_string()),
-            source_slot: Some(0x03eb),
-        }];
-        let policy = StaticAllowlist::new(["LIB-UA"]);
-        let log = RecordingLog::new();
-        let log_cl = log.clone();
-        let mut changer_slot = Some(vec![changer_inquiry_response(), vpd80_response("LIB-UA")]);
-        let mut drive_slot = Some(vec![lto9_inquiry_response(), vpd80_response("DRV-UA")]);
-        let factory: CliTransportFactory = Box::new(move |path| {
-            if path == Path::new("/dev/sg-mock") {
-                let inner = FixtureTransport::new().with_responses(
-                    changer_slot.take().ok_or_else(|| IoErrorKind {
-                        kind: "Other",
-                        message: "changer transport opened twice".to_string(),
-                        raw_os_error: None,
-                    })?,
-                );
-                Ok(
-                    Box::new(RecordingTransport::with_log(inner, log_cl.clone()))
-                        as Box<dyn SgTransport>,
-                )
-            } else if path == Path::new("/dev/sg-drive-ua") {
-                let inner =
-                    FixtureTransport::new().with_responses(drive_slot.take().ok_or_else(|| {
-                        IoErrorKind {
-                            kind: "Other",
-                            message: "drive transport opened twice".to_string(),
-                            raw_os_error: None,
-                        }
-                    })?);
-                let tur = TurSequenceTransport {
-                    inner,
-                    tur_results: VecDeque::from([
-                        Err(readiness_check_condition(0x06, 0x29, 0x00)),
-                        Err(readiness_check_condition(0x06, 0x29, 0x00)),
-                        Ok(()),
-                    ]),
-                };
-                Ok(Box::new(RecordingTransport::with_log(tur, log_cl.clone()))
-                    as Box<dyn SgTransport>)
-            } else {
-                Err(IoErrorKind {
-                    kind: "NotFound",
-                    message: format!("unexpected transport path {path:?}"),
-                    raw_os_error: None,
-                })
-            }
-        });
-        let mut handle = lib.open_with(&policy, factory).expect("library opens");
-
-        let mut polls = Vec::new();
-        let result = {
-            let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
-            poll_drive_media_readiness(
-                &mut drive,
-                MediaFamily::Lto9OrLater,
-                true,
-                StdDuration::from_secs(1),
-                StdDuration::ZERO,
-                || None,
-                |event| {
-                    if let MediaReadinessPollEvent::Poll(poll) = event {
-                        polls.push((poll.attempts, poll.timed_out, poll.readiness.clone()));
-                    }
-                    Ok(())
-                },
-            )
-            .expect("poll loop completes")
-        };
+        let (result, polls, tur_count, dirty) = poll_lto9_tur_sequence(
+            "repeat-reset",
+            vec![
+                Err(readiness_check_condition(0x06, 0x29, 0x00)),
+                Err(readiness_check_condition(0x06, 0x29, 0x00)),
+                Ok(()),
+            ],
+        );
 
         assert_eq!(result.attempts, 2);
         assert_eq!(
@@ -13787,19 +13838,55 @@ mod tests {
                 ascq: 0x00
             }
         ));
-        let log = log.borrow();
-        let tur_count = log
-            .iter()
-            .filter(|cdb| cdb.as_slice() == [0, 0, 0, 0, 0, 0])
-            .count();
+        assert_eq!(tur_count, 2, "poll loop must stop at repeated identical UA");
+        assert!(!dirty, "TUR CHECK CONDITION is classified, not dirty");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn media_readiness_poll_allows_reset_then_not_ready_to_ready_unit_attention() {
+        let (result, polls, tur_count, dirty) = poll_lto9_tur_sequence(
+            "reset-then-ready",
+            vec![
+                Err(readiness_check_condition(0x06, 0x29, 0x00)),
+                Err(readiness_check_condition(0x02, 0x04, 0x01)),
+                Err(readiness_check_condition(0x06, 0x28, 0x00)),
+                Ok(()),
+            ],
+        );
+
+        assert_eq!(result.attempts, 4);
+        assert_eq!(result.readiness, MediaReadiness::Ready);
+        assert_eq!(result.readiness.design_exit_code(), 0);
         assert_eq!(
-            tur_count, 2,
-            "poll loop must stop at repeated UA: {log:02x?}"
+            media_readiness_durable_state(&result.readiness, false),
+            "ready"
         );
-        assert!(
-            !handle.is_dirty(),
-            "TUR CHECK CONDITION is classified, not dirty"
-        );
+        assert_eq!(polls.len(), 4);
+        assert!(matches!(
+            polls[0].2,
+            MediaReadiness::UnitAttention {
+                asc: 0x29,
+                ascq: 0x00
+            }
+        ));
+        assert!(matches!(
+            polls[1].2,
+            MediaReadiness::BecomingReady {
+                ascq: 0x01,
+                media_initializing: true
+            }
+        ));
+        assert!(matches!(
+            polls[2].2,
+            MediaReadiness::UnitAttention {
+                asc: 0x28,
+                ascq: 0x00
+            }
+        ));
+        assert_eq!(polls[3].2, MediaReadiness::Ready);
+        assert_eq!(tur_count, 4);
+        assert!(!dirty, "TUR CHECK CONDITION is classified, not dirty");
     }
 
     #[test]
