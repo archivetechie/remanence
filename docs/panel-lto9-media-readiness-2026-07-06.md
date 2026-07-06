@@ -2,9 +2,11 @@
 
 **Date:** 2026-07-06
 **Design:** `docs/lto9-media-readiness-design-v0.1.md`
-**Status:** folded into design v0.2; verify round pending.
+**Status:** folded into design v0.3; verify round pending.
 **Panel:** SCSI correctness, failure-modes/ops, fieldtest/operator UX,
 cost/efficiency, and GLM 5.2 via OpenRouter (`z-ai/glm-5.2`).
+**Opus addendum:** local Claude Code Opus review run 2026-07-06; 10 findings
+folded after the original panel.
 
 ## Verdict
 
@@ -22,7 +24,7 @@ Raw findings: 34 total.
 - 8 minors
 - 2 nits
 
-All blockers and accepted majors were folded into design v0.2.
+All blockers and accepted majors were folded into design v0.3.
 
 ## Blockers Folded
 
@@ -104,6 +106,36 @@ GLM independently flagged three useful issues:
   Fold: the design now records the Linux host status while preserving the
   operation-level completion-unknown safety model.
 
+## Opus Addendum
+
+Opus did not participate in the original committed panel. A local Claude Code
+Opus review was run afterward at the owner's request. It found one remaining
+blocker and several major/minor precision gaps; all accepted findings were
+folded into design v0.3.
+
+Key folds:
+
+- **TUR before explicit drive LOAD.** The v0.2 design still allowed
+  unconditional pre-ready drive `LOAD` (`0x1b`) after `MOVE MEDIUM`, but the
+  July incident included task aborts on opcode `0x1b`. v0.3 now probes TUR
+  after `MOVE MEDIUM` and skips explicit `LOAD` if the drive is already
+  becoming ready. `LOAD` is conditional, fenced, and used only for states such
+  as `02/04/02`.
+- **Broader becoming-ready classifier.** v0.2 matched only `02/04/01`. v0.3
+  treats the `02/04/xx` becoming-ready family as non-terminal during an
+  LTO-9/LZ media-conditioning epoch, preserving exact ASCQ in evidence.
+- **Volatile sg paths.** v0.3 requires startup reconciliation to re-resolve
+  changer/drive sg paths from `library_serial` and `drive_serial` before any
+  TUR. Stored `/dev/sg*` paths are hints, never authority.
+- **`06/28/00` inside readiness.** v0.2 treated `28/00` as requiring inventory
+  and session restart. v0.3 treats one `28/00` inside the same
+  media-conditioning epoch as the expected not-ready-to-ready transition, then
+  confirms with TUR GOOD.
+- **Timeout and resume.** The long-wait default is now 2.5h rather than 2h, and
+  `rem tape wait-ready --resume <operation_id>` is part of the CLI contract.
+- **SQLite authority.** The durable fence is now SQLite from MR-1; JSONL is
+  evidence/export only.
+
 ## Verify-Round Focus
 
 The verify review should focus on:
@@ -112,8 +144,8 @@ The verify review should focus on:
   existing Layer 2 semantics;
 - whether the robot-move block during active calibration is too conservative or
   correctly cautious for MSL3040 production coexistence;
-- whether the durable fence can start as fieldtest-local JSONL or must be
-  SQLite from MR-1;
+- whether the SQLite MR-1 fence is minimal enough while still being a real
+  admission-control store;
 - whether every current drive CDB is covered by the readiness allowlist tests;
 - whether the CLI exit-code contract is sufficient for copy-paste-free field
   operation.

@@ -1,11 +1,15 @@
-# LTO-9 media readiness and calibration-aware orchestration -- Design v0.2
+# LTO-9 media readiness and calibration-aware orchestration -- Design v0.3
 
-**Status:** panel folded (2026-07-06); verify round pending.
+**Status:** panel folded + Opus review folded (2026-07-06); verify round
+pending.
 **Panel 2026-07-06:** 34 raw findings across SCSI correctness,
 failure-modes/ops, fieldtest/operator UX, cost/efficiency, and GLM 5.2 via
 OpenRouter (`z-ai/glm-5.2`). Raw findings: 4 blockers, 20 majors, 8 minors,
 2 nits. Folded decisions are recorded in
 `docs/panel-lto9-media-readiness-2026-07-06.md`.
+**Opus addendum 2026-07-06:** local Claude Code Opus review found 10 findings
+(1 blocker, 3 majors, 4 minors, 2 nits); all accepted findings are folded in
+this revision.
 **Problem source:** the July 2026 physical MSL3040 field test exposed that
 `rem tape init` and `fieldtest/scripts/10-init-pools.sh` are not aware of
 LTO-9 first-load media optimization. `AOX034L9` initialized successfully, but
@@ -45,12 +49,16 @@ escalation."
 The core detector is `TEST UNIT READY`:
 
 - `GOOD` means the drive is ready for normal Remanence commands.
-- sense key `0x02`, ASC `0x04`, ASCQ `0x01` means the logical unit is
-  becoming ready. In an LTO-9/LZ context, Remanence displays this as
-  `media_initializing` and treats it as the expected first-load optimization
-  window.
-- the same `02/04/01` outside LTO-9 context stays generic
+- sense key `0x02`, ASC `0x04`, ASCQ in the becoming-ready family means the
+  logical unit is becoming ready. In an LTO-9/LZ context, Remanence displays
+  this as `media_initializing` and treats it as the expected first-load
+  optimization window.
+- the same `02/04/xx` family outside LTO-9 context stays generic
   `becoming_ready`; it is not globally labeled "calibration."
+- exact ASCQ is preserved in evidence. `04/01` is the documented expected
+  signal; `04/00` and `04/07` remain non-terminal becoming-ready states during
+  a media-conditioning epoch; `04/02` routes to the conditional explicit-load
+  branch.
 
 This gate is not an `mtx` problem and not an HPE UI scrape. Remanence uses raw
 SCSI already, so it can see the same TUR sense and SG_IO transport failures
@@ -66,6 +74,9 @@ The fold changes the initial draft in three important ways:
 3. The load path is **phase-split**. The existing `LibraryHandle::load()` is a
    composed `MOVE MEDIUM` + drive `LOAD`. The readiness path must not hide that
    composition behind a function named "load after which we wait."
+4. Explicit drive `LOAD` (`0x1b`) is **conditional**, not automatic. After
+   `MOVE MEDIUM`, Remanence probes TUR first and skips drive `LOAD` if the
+   drive is already loading/threading or becoming ready.
 
 ## 2. Field facts
 
@@ -200,8 +211,8 @@ media_readiness_ops
   evidence_path
 ```
 
-The backing store can be SQLite or a fieldtest-local JSONL ledger for the first
-CLI slice, but the daemon-integrated version must be authoritative at startup.
+The backing store is SQLite from MR-1. JSONL remains an evidence/export format
+for fieldtest and Drishti, not the authoritative admission-control store.
 
 Durable rules:
 
@@ -213,6 +224,19 @@ Durable rules:
    `aborted_unknown`; do not issue cleanup CDBs from the signal path.
 5. On daemon/CLI startup, reconcile open records before admitting new load,
    init, unload, move, write, or read-session operations for the same scope.
+
+Startup reconciliation never trusts stored `/dev/sg*` paths by themselves.
+They are volatile after reboot, rescan, or recabling. Reconciliation first
+re-resolves the selected library and drive from durable identity:
+
+- `library_serial` -> current changer sg path via discovery/INQUIRY identity;
+- `drive_serial` + `library_serial` + `drive_element` -> current drive sg path;
+- barcode -> current selected-library inventory binding.
+
+Only after serial identity is reverified may the reconciler issue a read-only
+TUR. It must never issue MOVE or LOAD as part of startup reconciliation. If the
+serial binding is missing, ambiguous, or points outside the selected rem
+library, the record remains fenced and operator/RCA recovery is required.
 
 This is the main safety fold from the panel. A long physical operation must
 remain visible after the shell that started it disappears.
@@ -227,13 +251,14 @@ Required phases:
 1. **Resolve in selected library.** Find the barcode only within the selected
    `library_serial`, with `--allow <serial>` applied. If the barcode is absent
    or ambiguous, fail before issuing any CDB.
-2. **Pre-ready mechanical placement.** If the tape is in a slot, issue the
-   minimum mechanical work needed to put it into the target drive and start the
-   drive's load/threading behavior. In today's implementation this may require
-   splitting the current composed load into:
-   `move_medium(slot, bay)` and `drive_load(bay)`.
-   These commands are the only allowed pre-classification mechanical exception,
-   and each one is fenced durably before it is issued.
+2. **Pre-ready mechanical placement.** If the tape is in a slot, first issue
+   only `move_medium(slot, bay)` and durably record completion or
+   completion-unknown. Then open the drive by verified serial and issue TUR.
+   If TUR returns GOOD or a becoming-ready `02/04/xx` sense, skip explicit
+   drive `LOAD` and enter readiness polling. Issue drive `LOAD` (`0x1b`) only
+   when TUR indicates no medium or an initializing-command-required state
+   such as `02/04/02` after a short settle. The drive `LOAD` exception is
+   therefore conditional and evidence-backed, not automatic.
 3. **Readiness polling.** After the pre-ready phase, issue only allowed
    readiness-state commands until the drive reaches `Ready` or a terminal
    state.
@@ -248,7 +273,7 @@ enum MediaReadiness {
     BecomingReady {
         sense_key: u8, // 0x02
         asc: u8,       // 0x04
-        ascq: u8,      // 0x01
+        ascq: u8,      // exact ASCQ: 0x00/0x01/0x02/0x07/etc.
         display: BecomingReadyDisplay, // MediaInitializing for LTO-9/LZ
         observed_for: Duration,
     },
@@ -274,9 +299,11 @@ enum MediaReadiness {
 ```
 
 `BecomingReadyDisplay::MediaInitializing` is used when the cartridge is LTO-9
-or LZ and the state follows a load/already-loaded LTO-9 context. The host does
-not need to prove first-load; the sense tuple says the drive is not ready, and
-the LTO-9 context explains the likely cause.
+or LZ and the state follows a load/already-loaded LTO-9 context. Before the
+drive is ready, the generation source is the selected-library barcode suffix
+and allowlist metadata (`L9`/`LZ`), not MODE SENSE. The host does not need to
+prove first-load; the sense family says the drive is not ready, and the LTO-9
+context explains the likely cause.
 
 ## 8. Command policy while initializing
 
@@ -334,10 +361,18 @@ After that single reset-class UA, wait a short HBA/library settle delay and
 issue another TUR. The re-probe clears the UA; the delay is for practical
 transport recovery, not for SCSI UA clearing itself.
 
+UA handling differs inside and outside the active media-conditioning epoch.
+
+Inside an active media-conditioning epoch for the same drive/barcode,
+`06/28/00` is treated as an expected not-ready-to-ready transition: consume it
+once, wait a short settle delay, and confirm with TUR GOOD. Do not immediately
+turn that positive transition into a changer inventory operation.
+
 Do not swallow these as harmless readiness:
 
-- `06/28/00` not-ready-to-ready transition / medium may have changed: requires
-  fresh selected-library inventory and session restart.
+- `06/28/00` outside the active readiness epoch, or when barcode/drive binding
+  no longer holds: requires fresh selected-library inventory and session
+  restart.
 - mode-parameter changed UAs: require a fresh `read_config()` after `Ready`.
 - repeated reset UAs within the same load epoch: become terminal dirty evidence.
 
@@ -369,10 +404,13 @@ There are two wait profiles:
 | Profile | Default use | Timeout | Behavior |
 |---|---|---:|---|
 | `short_probe` | daemon write/read/session opens, normal already-optimized media | 30-60s | fail fast with `becoming_ready`/`media_initializing` and recommend explicit wait |
-| `media_conditioning` | `rem tape init`, `rem tape wait-ready --wait`, fieldtest readiness phase | 2h | durable long wait; no destructive escalation; operator-visible evidence |
+| `media_conditioning` | `rem tape init`, `rem tape wait-ready --wait`, fieldtest readiness phase | 2.5h | durable long wait; no destructive escalation; operator-visible evidence |
 
 This prevents normal daemon operations from silently occupying a physical drive
-for two hours. Long waits are explicit physical-media conditioning operations.
+for hours. Long waits are explicit physical-media conditioning operations. The
+2.5-hour default is intentionally above the documented "up to 2 hours" media
+optimization window so a normally completing cartridge is not fenced exactly at
+the boundary.
 
 Default physical LTO-9 `media_conditioning` polling:
 
@@ -389,8 +427,9 @@ inventory and operator/RCA acknowledgment.
 Add:
 
 ```text
-rem tape wait-ready --library <serial> --barcode <barcode> [--wait] [--timeout 2h] [--json]
+rem tape wait-ready --library <serial> --barcode <barcode> [--wait] [--timeout 2.5h] [--json]
 rem tape wait-ready --library <serial> --drive-element <0xNNNN> --already-loaded --json
+rem tape wait-ready --resume <operation_id> [--json]
 ```
 
 Barcode mode is the normal mode. It resolves only inside the selected library
@@ -401,6 +440,10 @@ Drive-element mode is operator-only/readiness-only. It never searches other
 libraries and is disallowed in fieldtest scripts unless the element is tied to
 an allowlisted barcode in the selected-library snapshot.
 
+`--resume` attaches to the existing durable readiness operation instead of
+re-planning the load. Resume-by-barcode is allowed only when the selected
+library and barcode still bind to exactly one fenced operation.
+
 Exit codes:
 
 | Code | Meaning |
@@ -408,7 +451,7 @@ Exit codes:
 | 0 | ready |
 | 10 | still initializing/becoming ready; wait can be resumed |
 | 20 | timeout_unknown; fenced |
-| 30 | terminal_error; fenced or refused depending on sense |
+| 30 | terminal_error; JSON `operator_action` is required to distinguish fenced hardware/media error from policy refusal |
 | 40 | transport_unknown; fenced, RCA required |
 | 50 | ownership/refused: wrong library, absent barcode, ambiguous barcode, or allowlist failure |
 
@@ -486,8 +529,8 @@ Release criteria:
 
 ## 14. READ ELEMENT STATUS secondary signal
 
-READ ELEMENT STATUS descriptor bytes 4 and 5 contain ASC/ASCQ. Remanence
-already parses adjacent `EXCEPT` and `ACCESS` bits.
+READ ELEMENT STATUS element descriptor bytes 4 and 5 contain ASC/ASCQ.
+Remanence already parses adjacent `EXCEPT` and `ACCESS` bits.
 
 For this milestone:
 
@@ -559,15 +602,19 @@ interrupts, and selected-library topology.
 Unit coverage:
 
 - sense classifier tests for fixed and descriptor sense:
-  `02/04/01`, `06/29/00`, `02/3A/00`, `06/28/00`, representative terminal
-  errors;
+  `02/04/00`, `02/04/01`, `02/04/02`, `02/04/07`, `06/29/00`, `02/3A/00`,
+  `06/28/00`, representative terminal errors;
 - `host_status=0x0003` is labeled `DID_TIME_OUT` and still maps to
   completion-unknown for media-position safety;
-- wait algorithm with fake clock: N `02/04/01` polls then GOOD, timeout,
+- wait algorithm with fake clock: N `02/04/xx` polls then GOOD, timeout,
   one allowed reset UA then GOOD, repeated reset UA dirty, transport unknown
   fail-closed;
 - pre-ready load path does not call the old hidden composed `LibraryHandle::load`
   without phase evidence;
+- after `MOVE MEDIUM`, TUR `02/04/01` skips explicit drive `LOAD`; TUR
+  `02/04/02` may issue one fenced conditional drive `LOAD`;
+- generation/display mapping uses barcode suffix/allowlist metadata before
+  readiness, including `LZ` handling;
 - READ ELEMENT STATUS parser tests retain descriptor ASC/ASCQ if MR includes
   that low-level addition.
 
@@ -596,9 +643,11 @@ Physical coverage:
 ## 17. Rollout
 
 1. **MR-1 classifier + durable operation record.** Add media-readiness
-   classifier, dirty-scope model, and ledger/store.
+   classifier, dirty-scope model, and SQLite-backed authoritative store
+   (JSONL export only).
 2. **MR-2 phase-split load primitive.** Expose or implement pre-ready load
-   phases without using the hidden composed `LibraryHandle::load()` path.
+   phases without using the hidden composed `LibraryHandle::load()` path;
+   after `MOVE MEDIUM`, TUR before any conditional drive `LOAD`.
 3. **MR-3 `rem tape wait-ready`.** Operator-visible CLI, JSON, exit codes,
    selected-library ownership checks.
 4. **MR-4 init integration.** Gate `rem tape init` before `read_config()`;
@@ -615,11 +664,11 @@ Physical coverage:
 
 ## 18. Verify-round questions
 
-1. Does the phase-split load model match what HPE MSL3040 actually requires to
-   start LTO-9 media optimization, or does the drive require explicit SSC LOAD
-   after the changer move?
-2. Is the default robot-move block during active calibration too conservative
+1. Is the default robot-move block during active calibration too conservative
    for two-drive MSL3040 conditioning, or should parallel conditioning remain a
    future explicit mode?
-3. Should READ ELEMENT STATUS ASC/ASCQ be included in MR-1 as low-level CLI
+2. Should READ ELEMENT STATUS ASC/ASCQ be included in MR-1 as low-level CLI
    evidence, or deferred entirely until after the TUR gate ships?
+3. Does physical MSL3040 capture show `02/04/01`, `02/04/07`, another
+   `02/04/xx`, or only Unit Attention/timeout during LTO-9 media
+   initialization? Keep the classifier broad until that capture is known.
