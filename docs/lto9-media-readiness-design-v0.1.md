@@ -1,7 +1,8 @@
 # LTO-9 media readiness and calibration-aware orchestration -- Design v0.4
 
 **Status:** panel folded + Opus + Fable 5 reviews folded (2026-07-06);
-follow-up Fable gate folded, verify round pending.
+follow-up Fable gates and fieldtest-wrapper fold complete, physical verify
+pending.
 **Panel 2026-07-06:** 34 raw findings across SCSI correctness,
 failure-modes/ops, fieldtest/operator UX, cost/efficiency, and GLM 5.2 via
 OpenRouter (`z-ai/glm-5.2`). Raw findings: 4 blockers, 20 majors, 8 minors,
@@ -16,6 +17,10 @@ are folded in this revision.
 **Fable 5 follow-up 2026-07-06:** a second OpenRouter pass found one
 controlled-run blocker around Unit Attention epoch handling and two fieldtest
 escalation hardening findings; all accepted findings are folded.
+**Fable 5 fieldtest-wrapper follow-up 2026-07-06:** a third OpenRouter pass
+found the `09-media-ready.sh` contract mismatch as the remaining no-go item;
+the count-mode, no-move evidence ledger, exit-code propagation, and allowlist
+visibility checks are folded.
 **Problem source:** the July 2026 physical MSL3040 field test exposed that
 `rem tape init` and `fieldtest/scripts/10-init-pools.sh` are not aware of
 LTO-9 first-load media optimization. `AOX034L9` initialized successfully, but
@@ -531,7 +536,8 @@ LTO-9/LZ. If the helper exits 10/20/40, init stops before `read_config`,
 Add a fieldtest readiness phase:
 
 ```text
-09-media-ready.sh --count N [--condition-all] [--resume]
+09-media-ready.sh --count N [--condition-all]
+09-media-ready.sh --resume UUID
 ```
 
 Default behavior:
@@ -540,10 +546,12 @@ Default behavior:
    `FIELDTEST_LIBRARY_SERIAL`.
 2. Use only allowlisted scratch data barcodes visible in that exact library.
 3. Process only the tapes required by `--count`, unless `--condition-all` is
-   explicitly passed.
+   explicitly passed. The safe default does not load slot-only media; it records
+   those tapes as `SKIP`/`not_loaded` evidence for the later init phase.
 4. On `media_initializing`, leave the tape in place, record a durable
    wait/quarantine record, print "do not move/unload/retry", and exit 10.
-5. On `ready`, record a readiness ledger entry consumed by `10-init-pools.sh`.
+5. On `ready`, record a readiness ledger evidence entry and rely on the
+   SQLite-backed `rem tape wait-ready` state for admission decisions.
 6. On `transport_unknown` or `timeout_unknown`, stop and request RCA.
 
 `10-init-pools.sh` then queries readiness through a `rem tape` CLI surface
@@ -713,9 +721,13 @@ readiness progression through the real poll loop;
 `fieldtest/scripts/10-init-pools.sh --selftest` covers dry-run readiness exit
 10 stopping before `--force`/`--clobber-data`, unclassified non-policy exit
 codes failing closed before escalation, and records `INFO`/`FAIL`,
-`media_readiness_state` where present, and `rem_exit_code`. A `~/system`
-scenario or `covers` ledger entry is still needed to tie these local
-regressions into the scenario registry.
+`media_readiness_state` where present, and `rem_exit_code`.
+- `fieldtest/scripts/09-media-ready.sh --selftest` covers count-mode
+  allowlist/visibility selection, no-move slot skips, readiness ledger output,
+  and exit 10 on media initialization.
+- `~/system` scenario `lto9-readiness` ties the direct init escalation,
+  selected-library, repeated-UA, and unclassified-exit regressions into the
+  scenario registry.
 
 Physical coverage:
 
@@ -738,8 +750,9 @@ Physical coverage:
    block destructive escalation on readiness states.
 5. **MR-5 chaos and scenario coverage.** Implement RDY-01 and command-allowlist
    assertions.
-6. **MR-6 fieldtest integration.** Add `09-media-ready.sh`, SQLite-backed
-   readiness queries in `10-init-pools.sh`, and evidence summaries.
+6. **MR-6 fieldtest integration.** Add count-aware `09-media-ready.sh`,
+   SQLite-backed readiness queries in `10-init-pools.sh`, and evidence
+   summaries.
 7. **MR-7 daemon/session integration.** Short-probe profile for physical
    write/read opens; long wait only by explicit operator/media-conditioning
    policy.

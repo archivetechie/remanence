@@ -107,9 +107,44 @@ software gates:
   `DriveHandle` and proves the second reset-class Unit Attention in one epoch
   terminalizes as `RepeatedUnitAttention` with design exit code 30.
 
-Remaining evidence gap: a `~/system` harness scenario or explicit coverage
-contract tying these local regressions into the scenario ledger, plus physical
-MSL3040 capture when a new LTO-9 cartridge is available.
+Remaining evidence gap: physical MSL3040 capture when a new LTO-9 cartridge is
+available.
+
+## Fieldtest Wrapper Fable Pass
+
+Claude Fable 5 was run again through OpenRouter on the fieldtest wrapper
+contract (`anthropic/claude-fable-5`, routed as
+`anthropic/claude-5-fable-20260609`; OpenRouter IDs
+`gen-1783353138-yJF5kKSK5qMECCXfr5tb` and
+`gen-1783353213-z4c3biBrENOlOlmOndHu`).
+
+Verdict: **no-go for physical fieldtest until `09-media-ready.sh` matches the
+contract.**
+
+Accepted findings:
+
+- `09-media-ready.sh` returned 0 for `media_initializing` exit code 10 and
+  invited retry instead of saying not to move/unload/retry.
+- The contracted `--count N [--condition-all]` fieldtest surface was absent.
+- Single-barcode and drive-element paths did not enforce allowlist and selected
+  library visibility before polling.
+- The wrapper did not honor `FIELDTEST_LIBRARY_SERIAL` when state selection was
+  absent.
+- The runbook made 09 only a reactive fallback, and 09 could not bootstrap its
+  config.
+- `10-init-pools.sh` fallback transport detection matched `host_status=0x00`.
+
+Fold:
+
+- `09-media-ready.sh` now supports count mode, `--condition-all`, env-or-state
+  library selection, config bootstrap, allowlist/visibility checks, slot-only
+  `SKIP/not_loaded` records, `state/media-readiness.jsonl` evidence, and
+  explicit exit-code propagation for 10/20/30/40/50/130.
+- `09-media-ready.sh --selftest` covers ready media, media-initializing exit 10,
+  ledger output, no move/unload/load invocations, and slot-only skip behavior.
+- `10-init-pools.sh` transport fallback now parses `host_status` and only
+  treats nonzero values as transport unknown; selftest covers both 0x00 and
+  nonzero host status.
 
 ## Follow-up Fable Pass
 
@@ -142,6 +177,5 @@ Second follow-up fold:
   before `--force` or `--clobber-data`;
 - `10-init-pools.sh --selftest` now covers the unclassified-exit refusal path.
 
-Remaining evidence gap: a `~/system` harness scenario or explicit coverage
-contract tying these local regressions into the scenario ledger, plus physical
-MSL3040 capture when a new LTO-9 cartridge is available.
+Remaining evidence gap after the system scenario fold: physical MSL3040 capture
+when a new LTO-9 cartridge is available.
