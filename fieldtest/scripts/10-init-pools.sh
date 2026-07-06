@@ -68,6 +68,20 @@ if exit_code in (10, 20, 30, 40, 50, 130):
 PY
 }
 
+init_raw_exit_code() {
+  local path="$1"
+  python3 - "$path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text())
+exit_code = payload.get("exit_code")
+if isinstance(exit_code, int):
+    print(exit_code)
+PY
+}
+
 init_readiness_extra_json() {
   local path="$1" code="${2:-}"
   python3 - "$path" "$code" <<'PY'
@@ -114,8 +128,13 @@ record_init_terminal_stop() {
   fieldtest_evidence_record "$SCRIPT_NAME" "init-${barcode}" FAIL "media readiness stopped init for ${barcode} with rem exit code ${code}; do not escalate to force or clobber until RCA/recovery is complete" "$path" "$(init_readiness_extra_json "$path" "$code")"
 }
 
+record_init_unclassified_stop() {
+  local barcode="$1" path="$2" code="$3"
+  fieldtest_evidence_record "$SCRIPT_NAME" "init-${barcode}" FAIL "unclassified rem exit code ${code} while initializing ${barcode}; stop destructive escalation and inspect the captured stderr/stdout before retrying" "$path" "$(init_readiness_extra_json "$path" "$code")"
+}
+
 stop_init_escalation_if_readiness_blocked() {
-  local barcode="$1" path="$2" code
+  local barcode="$1" path="$2" code raw_code
   code="$(init_readiness_code "$path" || true)"
   case "$code" in
     10)
@@ -131,6 +150,11 @@ stop_init_escalation_if_readiness_blocked() {
       exit 40
       ;;
   esac
+  raw_code="$(init_raw_exit_code "$path" || true)"
+  if [[ -n "$raw_code" && "$raw_code" != 0 && "$raw_code" != 1 ]]; then
+    record_init_unclassified_stop "$barcode" "$path" "$raw_code"
+    exit "$raw_code"
+  fi
   if init_media_not_ready "$path"; then
     record_init_readiness_stop "$barcode" "$path" 10
     exit 10
@@ -224,10 +248,65 @@ EOF
   rm -rf "$tmpdir"
 }
 
+init_pools_unclassified_exit_selftest() {
+  local tmpdir child_rc rem_log records
+  tmpdir="$(mktemp -d)"
+  mkdir -p "$tmpdir/home/bin" "$tmpdir/home/evidence" "$tmpdir/home/state" "$tmpdir/home/log" "$tmpdir/home/spool"
+  cat >"$tmpdir/home/allowlist.txt" <<'EOF'
+AOX030L9
+EOF
+  cat >"$tmpdir/home/bin/rem" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+home="${REMFIELD_HOME:?}"
+printf '%s\n' "$*" >>"$home/rem-invocations.log"
+if [[ "${1:-}" == libraries && "${2:-}" == --json ]]; then
+  cat <<'JSON'
+{"libraries":[{"serial":"LIBMAIN","product":"MSL G3 Series","revision":"D.00","vendor":"HPE","drive_count":1,"slot_count":1,"loaded_slot_count":1,"ie_port_count":0}]}
+JSON
+  exit 0
+fi
+if [[ "${1:-}" == library && "${3:-}" == --json && "${4:-}" == --slots ]]; then
+  cat <<'JSON'
+{"serial":"LIBMAIN","drives":[],"slots":[{"element_address":"0x03eb","full":true,"cartridge":"AOX030L9"}]}
+JSON
+  exit 0
+fi
+if [[ "${1:-}" == --allow && "${3:-}" == tape && "${4:-}" == init ]]; then
+  if [[ " $* " == *" --dry-run "* ]]; then
+    echo "synthetic usage/config failure without readiness marker" >&2
+    exit 2
+  fi
+  echo "destructive escalation should not run: $*" >&2
+  exit 99
+fi
+echo "unexpected mock rem invocation: $*" >&2
+exit 98
+EOF
+  chmod +x "$tmpdir/home/bin/rem"
+  REMFIELD_HOME="$tmpdir/home" bash "$0" --count 1 >/dev/null 2>"$tmpdir/selftest.stderr" || child_rc=$?
+  child_rc="${child_rc:-0}"
+  rem_log="$tmpdir/home/rem-invocations.log"
+  records="$tmpdir/home/evidence/records.jsonl"
+  if [[ "$child_rc" -ne 2 ]]; then
+    echo "selftest: expected unclassified exit 2, got $child_rc" >&2
+    cat "$tmpdir/selftest.stderr" >&2 || true
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  grep -q -- '--dry-run' "$rem_log"
+  ! grep -q -- '--force' "$rem_log"
+  ! grep -q -- '--clobber-data' "$rem_log"
+  grep -q '"status":"FAIL"' "$records"
+  grep -q '"rem_exit_code":2' "$records"
+  rm -rf "$tmpdir"
+}
+
 main() {
   if [[ "${1:-}" == --selftest ]]; then
     init_pools_selftest
     init_pools_escalation_selftest
+    init_pools_unclassified_exit_selftest
     exit 0
   fi
   if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
