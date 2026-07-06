@@ -337,6 +337,12 @@ theorem validate_chunk_size_success (chunkSize : Std.U64)
   unfold validate_chunk_size
   simp [hChunkNe, hrem, hremZero]
 
+theorem validate_chunk_size_rejects_zero :
+    validate_chunk_size 0#u64 =
+      ok (.Err AeadFrameError.InvalidChunkSize) := by
+  unfold validate_chunk_size
+  simp
+
 theorem chunk_count_success (plaintextSize chunkSize : Std.U64)
     (hChunk : chunkSize.val ≠ 0)
     (hPlain : plaintextSize.val ≠ 0)
@@ -443,6 +449,11 @@ theorem round_up_success (value multiple : Std.U64)
       unfold roundUpSpec
       simp [hAligned]
 
+theorem round_up_rejects_zero_multiple (value : Std.U64) :
+    round_up value 0#u64 = ok (.Err AeadFrameError.SizeOverflow) := by
+  unfold round_up
+  simp
+
 theorem cipher_offset_success
     (metadataFrameLen chunkSize blockIndex : Std.U64)
     (hno : CipherOffsetNoOverflow metadataFrameLen chunkSize blockIndex) :
@@ -477,6 +488,25 @@ theorem cipher_offset_success
   · rw [hoffsetVal, hbaseVal, hpayloadOffsetVal, hstrideVal, header_len_val,
       tag_len_val]
     rfl
+
+theorem cipher_offset_zero_block_is_payload_base
+    (metadataFrameLen chunkSize : Std.U64)
+    (hStride : strideSpec chunkSize < 2 ^ 64)
+    (hHeaderMeta : HeaderLen + metadataFrameLen.val < 2 ^ 64) :
+    ∃ offset,
+      cipher_offset metadataFrameLen chunkSize 0#u64 = ok (.Ok offset) ∧
+      offset.val = HeaderLen + metadataFrameLen.val := by
+  have hno : CipherOffsetNoOverflow metadataFrameLen chunkSize 0#u64 := by
+    refine ⟨hStride, hHeaderMeta, ?_, ?_⟩
+    · simp
+    · unfold cipherOffsetSpec cipherOffsetNatSpec
+      simpa using hHeaderMeta
+  rcases cipher_offset_success metadataFrameLen chunkSize 0#u64 hno with
+    ⟨offset, hoffset, hoffsetVal⟩
+  refine ⟨offset, hoffset, ?_⟩
+  rw [hoffsetVal]
+  unfold cipherOffsetSpec cipherOffsetNatSpec
+  simp
 
 theorem validate_range_success (start len plaintextSize : Std.U64)
     (hEnd : rangeEndSpec start len < 2 ^ 64)
@@ -600,6 +630,48 @@ theorem stored_size_from_parts_success
     simp [hpayloadLen, core.result.Result.Insts.CoreOpsTry.branch, hheaderMeta,
       hheaderPayload, hfooterEnd, hstoredSize]
   · rw [hstoredSizeVal, hRoundSpec]
+
+theorem expected_stored_size_success
+    (chunkSize metadataFrameLen plaintextSize : Std.U64)
+    (hChunk : chunkSize.val ≠ 0)
+    (hPlain : plaintextSize.val ≠ 0)
+    (hAligned : plaintextSize.val % chunkSize.val = 0)
+    (hno : StoredSizeNoOverflow chunkSize metadataFrameLen plaintextSize) :
+    ∃ storedSize,
+      expected_stored_size chunkSize metadataFrameLen plaintextSize =
+        ok (.Ok storedSize) ∧
+      storedSize.val = storedSizeSpec chunkSize metadataFrameLen plaintextSize := by
+  rcases stored_size_from_parts_success chunkSize metadataFrameLen plaintextSize
+      hChunk hPlain hAligned hno with ⟨storedSize, hstoredSize, hstoredSizeVal⟩
+  refine ⟨storedSize, ?_, hstoredSizeVal⟩
+  unfold expected_stored_size
+  exact hstoredSize
+
+theorem nonempty_range_plan_rejects_zero_chunk
+    (metadataFrameLen plaintextSize start len : Std.U64) :
+    nonempty_range_plan metadataFrameLen 0#u64 plaintextSize start len =
+      ok (.Err AeadFrameError.InvalidChunkSize) := by
+  unfold nonempty_range_plan
+  simp
+
+theorem nonempty_range_plan_rejects_empty_len
+    (metadataFrameLen chunkSize plaintextSize start : Std.U64)
+    (hChunk : chunkSize.val ≠ 0)
+    (hStart : start.val ≤ plaintextSize.val) :
+    nonempty_range_plan metadataFrameLen chunkSize plaintextSize start 0#u64 =
+      ok (.Err AeadFrameError.InvalidMetadataField) := by
+  have hChunkNe := u64_ne_zero_of_val_ne_zero chunkSize hChunk
+  have hEnd : rangeEndSpec start 0#u64 < 2 ^ 64 := by
+    have hlt := U64.lt_succ_max start
+    simpa [rangeEndSpec] using hlt
+  have hValid :
+      if (0#u64 : Std.U64).val = 0 then start.val ≤ plaintextSize.val
+      else rangeEndSpec start 0#u64 ≤ plaintextSize.val := by
+    simp [hStart]
+  rcases validate_range_success start 0#u64 plaintextSize hEnd hValid with
+    ⟨endValue, hvalidate, _⟩
+  unfold nonempty_range_plan
+  simp [hChunkNe, hvalidate, core.result.Result.Insts.CoreOpsTry.branch]
 
 theorem nonempty_range_plan_success
     (metadataFrameLen chunkSize plaintextSize start len : Std.U64)

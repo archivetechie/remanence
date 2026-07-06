@@ -103,6 +103,12 @@ theorem u64_shr_one_ok (x : Std.U64) :
 def bitStepStd (crc : Std.U64) : Std.U64 :=
   ⟨bitStep crc.bv⟩
 
+def tableEntryStd (byte : Std.U8) : Std.U64 :=
+  ⟨tableEntry byte.bv⟩
+
+def updateStd (crc : Std.U64) (byte : Std.U8) : Std.U64 :=
+  ⟨update crc.bv byte.bv⟩
+
 theorem generated_bit_step_matches_spec (crc : Std.U64) :
     crc64_xz_bit_step crc = ok (bitStepStd crc) := by
   unfold crc64_xz_bit_step bitStepStd bitStep CRC64_XZ_REFLECTED_POLY ReflectedPoly
@@ -119,6 +125,24 @@ theorem generated_bit_step_matches_spec (crc : Std.U64) :
     apply h
     apply U64.bv_eq_imp_eq
     exact hbv
+
+theorem generated_table_entry_matches_spec (byte : Std.U8) :
+    crc64_xz_table_entry byte = ok (tableEntryStd byte) := by
+  unfold crc64_xz_table_entry tableEntryStd tableEntry byteRemainderFromState
+  simp [lift, UScalar.cast, generated_bit_step_matches_spec, bitStepStd]
+
+theorem u64_shr_eight_ok (x : Std.U64) :
+    x >>> 8#i32 = ok (⟨x.bv >>> 8⟩ : Std.U64) := by
+  change UScalar.shiftRight_IScalar x 8#i32 = ok (⟨x.bv >>> 8⟩ : Std.U64)
+  unfold UScalar.shiftRight_IScalar UScalar.shiftRight IScalar.toNat IScalar.val
+  simp
+
+theorem generated_update_matches_spec (crc : Std.U64) (byte : Std.U8) :
+    crc64_xz_update crc byte = ok (updateStd crc byte) := by
+  unfold crc64_xz_update updateStd update tableIndex
+  simp [lift, u64_shr_eight_ok, generated_table_entry_matches_spec]
+  apply U64.bv_eq_imp_eq
+  simp [tableEntryStd, core.convert.num.FromU64U8.from]
 
 def resultU64Eq (result : Result Std.U64) (expected : Std.U64) : Bool :=
   match result with

@@ -62,6 +62,16 @@ For a geometrically valid stored size, `inspect_geometry` derives the same
 chunk count, plaintext size, footer offset, and expected rounded stored size
 as `inspect_bytes`.
 
+## A8 -- wrapper and fail-closed edges
+
+The Lean proof also covers small but important edge contracts:
+
+- `expected_stored_size` returns the same value as `stored_size_from_parts`
+- `cipher_offset(M, C, 0)` starts payload ciphertext at `H + M`
+- zero chunk size is rejected by chunk-size validation and non-empty range
+  planning
+- empty ranges are rejected by `nonempty_range_plan` after range validation
+
 ## Trust anchor
 
 The Lean type checker (`lake build` with zero local placeholders) is the trust
