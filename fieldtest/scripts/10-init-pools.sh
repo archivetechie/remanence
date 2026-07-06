@@ -237,6 +237,23 @@ require_init_policy_refusal_before_escalation() {
   exit 1
 }
 
+init_output_bay() {
+  local path="$1"
+  grep -oE 'drive: 0x[0-9a-fA-F]+' "$path" | head -1 | awk '{print $2}' || true
+}
+
+unload_dry_run_bay_or_stop() {
+  local barcode="$1" path="$2" serial="$3" bay
+  bay="$(init_output_bay "$path")"
+  if [[ -z "$bay" ]]; then
+    return 0
+  fi
+  if ! "$(fieldtest_rem_debug_bin)" --allow "$serial" unload --bay "$bay" "$serial" >/dev/null 2>&1; then
+    fieldtest_evidence_record "$SCRIPT_NAME" "init-${barcode}" FAIL "dry-run loaded ${barcode} into bay ${bay} but unload failed; stopping before real init to avoid stale slot/source state" "$path"
+    exit 1
+  fi
+}
+
 init_pools_selftest() {
   local tmpdir detail code extra records
   tmpdir="$(mktemp -d)"
@@ -448,7 +465,7 @@ EOF
     return 1
   fi
   grep -q '"status":"FAIL"' "$records"
-  grep -q 'expected require-force policy-refusal marker' "$records"
+  grep -q 'expected require-force-or-refuse-clobber policy-refusal marker' "$records"
   rm -rf "$tmpdir"
 }
 
@@ -479,6 +496,7 @@ fi
 if [[ "${1:-}" == --allow && "${3:-}" == tape && "${4:-}" == init ]]; then
   if [[ " $* " == *" --dry-run "* ]]; then
     echo "tape init AOX030L9: dry-run-would-write"
+    echo "  source: 0x03eb; drive: 0x0001"
     exit 0
   fi
   if [[ " $* " == *" --force "* ]]; then
@@ -525,6 +543,87 @@ EOF
   rm -rf "$tmpdir"
 }
 
+init_pools_policy_clobber_direct_selftest() {
+  local tmpdir child_rc rem_log records
+  tmpdir="$(mktemp -d)"
+  mkdir -p "$tmpdir/home/bin" "$tmpdir/home/evidence" "$tmpdir/home/state" "$tmpdir/home/log" "$tmpdir/home/spool"
+  cat >"$tmpdir/home/allowlist.txt" <<'EOF'
+AOX030L9
+EOF
+  cat >"$tmpdir/home/bin/rem" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+home="${REMFIELD_HOME:?}"
+printf '%s\n' "$*" >>"$home/rem-invocations.log"
+if [[ "${1:-}" == libraries && "${2:-}" == --json ]]; then
+  cat <<'JSON'
+{"libraries":[{"serial":"LIBMAIN","product":"MSL G3 Series","revision":"D.00","vendor":"HPE","drive_count":1,"slot_count":1,"loaded_slot_count":1,"ie_port_count":0}]}
+JSON
+  exit 0
+fi
+if [[ "${1:-}" == library && "${3:-}" == --json && "${4:-}" == --slots ]]; then
+  cat <<'JSON'
+{"serial":"LIBMAIN","drives":[],"slots":[{"element_address":"0x03eb","full":true,"cartridge":"AOX030L9"}]}
+JSON
+  exit 0
+fi
+if [[ "${1:-}" == --allow && "${3:-}" == tape && "${4:-}" == init ]]; then
+  if [[ " $* " == *" --dry-run "* ]]; then
+    echo "tape init AOX030L9: dry-run-would-write"
+    echo "  source: 0x03eb; drive: 0x0001"
+    exit 0
+  fi
+  if [[ " $* " == *" --force "* ]]; then
+    echo "force should not run after direct refuse-clobber marker" >&2
+    exit 97
+  fi
+  if [[ " $* " == *" --clobber-data "* ]]; then
+    echo "tape init AOX030L9: wrote-bootstrap"
+    echo "  source: 0x03eb; drive: 0x0001"
+    exit 0
+  fi
+  echo "tape init AOX030L9: refused-no-write"
+  echo "  decision: refuse-clobber: physical data past bootstrap"
+  exit 1
+fi
+echo "unexpected mock rem invocation: $*" >&2
+exit 98
+EOF
+  chmod +x "$tmpdir/home/bin/rem"
+  cat >"$tmpdir/home/bin/rem-debug" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+home="${REMFIELD_HOME:?}"
+printf 'rem-debug %s\n' "$*" >>"$home/rem-invocations.log"
+exit 0
+EOF
+  chmod +x "$tmpdir/home/bin/rem-debug"
+  REMFIELD_HOME="$tmpdir/home" bash "$0" --count 1 >/dev/null 2>"$tmpdir/selftest.stderr" || child_rc=$?
+  child_rc="${child_rc:-0}"
+  rem_log="$tmpdir/home/rem-invocations.log"
+  records="$tmpdir/home/evidence/records.jsonl"
+  if [[ "$child_rc" -ne 0 ]]; then
+    echo "selftest: expected direct refuse-clobber path to pass, got $child_rc" >&2
+    cat "$tmpdir/selftest.stderr" >&2 || true
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  if [[ "$(grep -c -- 'rem-debug --allow LIBMAIN unload --bay 0x0001 LIBMAIN' "$rem_log")" -ne 2 ]]; then
+    echo "selftest: expected dry-run and final init unloads for bay 0x0001" >&2
+    cat "$rem_log" >&2 || true
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  grep -q -- '--clobber-data' "$rem_log"
+  if grep -q -- '--force' "$rem_log"; then
+    echo "selftest: --force should not run after direct refuse-clobber marker" >&2
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  grep -q '"status":"PASS"' "$records"
+  rm -rf "$tmpdir"
+}
+
 init_pools_transport_regex_selftest() {
   local tmpdir zero_path nonzero_path
   tmpdir="$(mktemp -d)"
@@ -562,6 +661,7 @@ main() {
     init_pools_unclassified_exit_selftest
     init_pools_exit_one_fail_closed_selftest
     init_pools_policy_force_selftest
+    init_pools_policy_clobber_direct_selftest
     init_pools_transport_regex_selftest
     exit 0
   fi
@@ -635,6 +735,7 @@ main() {
         continue
       fi
       stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$dry_run_out"
+      unload_dry_run_bay_or_stop "${data_barcodes[$idx]}" "$dry_run_out" "$serial"
     else
       stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$dry_run_out"
       record_init_non_policy_stop "${data_barcodes[$idx]}" "$dry_run_out" "dry-run-success"
@@ -643,12 +744,26 @@ main() {
     init_out="$plain_out"
     if ! fieldtest_capture_text "$plain_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial"; then
       stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$plain_out"
-      require_init_policy_refusal_before_escalation "${data_barcodes[$idx]}" "$plain_out" "require-force"
-      init_level="force"
-      init_out="$force_out"
-      if ! fieldtest_capture_text "$force_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --force; then
-        stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$force_out"
-        require_init_policy_refusal_before_escalation "${data_barcodes[$idx]}" "$force_out" "refuse-clobber"
+      if init_requires_force_refusal "$plain_out"; then
+        init_level="force"
+        init_out="$force_out"
+        if ! fieldtest_capture_text "$force_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --force; then
+          stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$force_out"
+          require_init_policy_refusal_before_escalation "${data_barcodes[$idx]}" "$force_out" "refuse-clobber"
+          init_level="clobber-data"
+          init_out="$clobber_out"
+          if ! fieldtest_capture_text "$clobber_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --clobber-data; then
+            stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$clobber_out"
+            if grep -q "needs-explicit-rebuild" "$clobber_out"; then
+              fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" FAIL \
+                "${data_barcodes[$idx]} carries a FOREIGN remanence identity (initialized by another rem instance); no init flag overrides this by design — use a different scratch cartridge, or physically relabel/erase this one" "$clobber_out"
+            else
+              fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" FAIL "tape init failed for ${data_barcodes[$idx]} at every escalation level" "$clobber_out"
+            fi
+            exit 1
+          fi
+        fi
+      elif init_requires_clobber_refusal "$plain_out"; then
         init_level="clobber-data"
         init_out="$clobber_out"
         if ! fieldtest_capture_text "$clobber_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --clobber-data; then
@@ -661,12 +776,15 @@ main() {
           fi
           exit 1
         fi
+      else
+        record_init_non_policy_stop "${data_barcodes[$idx]}" "$plain_out" "require-force-or-refuse-clobber"
+        exit 1
       fi
     fi
     cp -f -- "$init_out" "$(fieldtest_latest_artifact_path "$SCRIPT_NAME" "init-${data_barcodes[$idx]}")"
     # tape init leaves the cartridge in the drive; unload it back home or a
     # 2-drive library runs out of free drives by the 3rd init.
-    init_bay="$(grep -oE 'drive: 0x[0-9a-fA-F]+' "$init_out" | head -1 | awk '{print $2}' || true)"
+    init_bay="$(init_output_bay "$init_out")"
     if [[ -n "$init_bay" ]]; then
       "$(fieldtest_rem_debug_bin)" --allow "$serial" unload --bay "$init_bay" "$serial" >/dev/null 2>&1 || \
         echo "warn: could not unload bay $init_bay after init (continuing)" >&2
