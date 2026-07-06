@@ -48,6 +48,15 @@ pub enum MediaReadiness {
         /// Additional Sense Code Qualifier.
         ascq: u8,
     },
+    /// Unit Attention repeated inside one readiness polling epoch. The first UA
+    /// can be a normal post-load/reset notification; repetition means the
+    /// caller no longer has a settled media-readiness signal.
+    RepeatedUnitAttention {
+        /// Additional Sense Code.
+        asc: u8,
+        /// Additional Sense Code Qualifier.
+        ascq: u8,
+    },
     /// A terminal `02/04/xx` variant requiring operator or reset action.
     TerminalNotReady {
         /// Additional Sense Code Qualifier.
@@ -124,6 +133,7 @@ impl MediaReadiness {
             Self::ReservationConflict => 50,
             Self::TerminalNotReady { .. }
             | Self::NoMedium { .. }
+            | Self::RepeatedUnitAttention { .. }
             | Self::CheckCondition { .. }
             | Self::UndecodedCheckCondition { .. }
             | Self::TaskAborted
@@ -287,6 +297,17 @@ mod tests {
 
         assert_eq!(readiness, MediaReadiness::ReservationConflict);
         assert_eq!(readiness.design_exit_code(), 50);
+    }
+
+    #[test]
+    fn repeated_unit_attention_is_terminal_for_readiness_epoch() {
+        let readiness = MediaReadiness::RepeatedUnitAttention {
+            asc: 0x29,
+            ascq: 0x00,
+        };
+
+        assert!(!readiness.is_retryable_wait());
+        assert_eq!(readiness.design_exit_code(), 30);
     }
 
     #[cfg(target_os = "linux")]

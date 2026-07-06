@@ -7,7 +7,7 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 usage() {
   cat <<'EOF'
-Usage: 09-media-ready.sh [--barcode BARCODE | --drive-element 0xNNNN] [--timeout 2.5h] [--poll 30s] [--no-wait]
+Usage: 09-media-ready.sh [--resume UUID | --barcode BARCODE | --drive-element 0xNNNN] [--timeout 2.5h] [--poll 30s] [--no-wait]
 
 Polls TEST UNIT READY for media that is already loaded in a drive. This script
 does not move cartridges. Use it after the library UI shows Calib/initializing,
@@ -16,9 +16,13 @@ EOF
 }
 
 main() {
-  local barcode="" drive_element="" timeout="2.5h" poll="30s" wait_flag="--wait"
+  local resume="" barcode="" drive_element="" timeout="2.5h" poll="30s" wait_flag="--wait"
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --resume)
+        resume="${2:?missing operation id}"
+        shift 2
+        ;;
       --barcode)
         barcode="${2:?missing barcode}"
         shift 2
@@ -51,12 +55,16 @@ main() {
     esac
   done
 
-  if [[ -n "$barcode" && -n "$drive_element" ]]; then
-    echo "error: use either --barcode or --drive-element, not both" >&2
+  local target_count=0
+  [[ -n "$resume" ]] && target_count=$((target_count + 1))
+  [[ -n "$barcode" ]] && target_count=$((target_count + 1))
+  [[ -n "$drive_element" ]] && target_count=$((target_count + 1))
+  if [[ "$target_count" -gt 1 ]]; then
+    echo "error: use only one of --resume, --barcode, or --drive-element" >&2
     exit 2
   fi
-  if [[ -z "$barcode" && -z "$drive_element" ]]; then
-    echo "error: provide --barcode or --drive-element" >&2
+  if [[ "$target_count" -eq 0 ]]; then
+    echo "error: provide --resume, --barcode, or --drive-element" >&2
     exit 2
   fi
 
@@ -75,11 +83,14 @@ main() {
   fi
 
   stamp="$(fieldtest_timestamp_id)"
-  target_label="${barcode:-$drive_element}"
+  target_label="${resume:-${barcode:-$drive_element}}"
   out="$(fieldtest_artifact_path "$SCRIPT_NAME" "wait-ready-${target_label//\//_}" "$stamp")"
 
   set +e
-  if [[ -n "$barcode" ]]; then
+  if [[ -n "$resume" ]]; then
+    fieldtest_capture_text "$out" "$(fieldtest_rem_bin)" tape wait-ready --config "$(fieldtest_config_path)" --library "$serial" --resume "$resume" $wait_flag --timeout "$timeout" --poll "$poll" --json
+    rc=$?
+  elif [[ -n "$barcode" ]]; then
     fieldtest_capture_text "$out" "$(fieldtest_rem_bin)" tape wait-ready --config "$(fieldtest_config_path)" --library "$serial" --barcode "$barcode" $wait_flag --timeout "$timeout" --poll "$poll" --json
     rc=$?
   else

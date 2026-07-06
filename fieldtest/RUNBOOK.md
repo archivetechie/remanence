@@ -94,8 +94,8 @@ readback, and throughput without spending the whole window writing capacity.
 | 0.1 | `./scripts/00-preflight.sh` | fix whatever it flags |
 | 0.2 | 🖐 load scratch tapes + CLN cart into magazine slots; note barcodes | physical |
 | 0.3 | `./scripts/01-allowlist.sh` | type the barcodes |
-| 0.4 | `./scripts/10-init-pools.sh` — drains drives, initializes scratch into 2 pools. **Runs BEFORE the daemon** (direct-SCSI; the script refuses if a daemon is up — one owner of the robotics at a time) | |
-| 0.4a | `./scripts/09-media-ready.sh --barcode AOX030L9` — only if init reports media not ready or the library UI shows Calib/initializing for an already-loaded tape | |
+| 0.4 | `./scripts/10-init-pools.sh` — readiness-aware drive drains, initializes scratch into 2 pools. **Runs BEFORE the daemon** (direct-SCSI; the script refuses if a daemon is up — one owner of the robotics at a time) | |
+| 0.4a | `./scripts/09-media-ready.sh --barcode AOX030L9` — only if init exits 10 / reports media not ready, or the library UI shows Calib/initializing for an already-loaded tape. The JSON includes `operation_id`; subsequent checks can use `./scripts/09-media-ready.sh --resume <operation_id>`. | |
 | 0.5 | `./scripts/03-bringup.sh` — config, daemon start (tmux window `rem`), verifies initialized tapes visible in the daemon catalog | |
 | 0.6 | `./scripts/02-discovery.sh` — libraries, slots, drive identity via the daemon | |
 

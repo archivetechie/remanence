@@ -72,13 +72,19 @@ green. Then physically load the scratch data tapes plus the CLN cartridge.
 ./scripts/02-discovery.sh
 ```
 
-If `10-init-pools.sh` stops with media not ready, or the MSL3040 UI shows
-Calib/initializing for a loaded tape, wait on that cartridge before daemon
-bringup:
+If `10-init-pools.sh` exits 10 with media not ready, or the MSL3040 UI shows
+Calib/initializing for a loaded tape, leave that cartridge in the drive and
+wait on it before daemon bringup. The command writes JSON with an
+`operation_id`; use that id for later resume checks.
 
 ```bash
 ./scripts/09-media-ready.sh --barcode AOX030L9
+./scripts/09-media-ready.sh --resume <operation_id-from-json>
 ```
+
+Drive drains are readiness-aware: they unload only drives whose TUR probe is
+ready. Non-ready or unknown drives are left alone and an evidence artifact is
+written under `evidence/drive-drain/`.
 
 For a two-data-tape core run, use `./scripts/10-init-pools.sh --count 2`.
 
