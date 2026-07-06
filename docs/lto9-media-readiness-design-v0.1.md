@@ -21,6 +21,11 @@ escalation hardening findings; all accepted findings are folded.
 found the `09-media-ready.sh` contract mismatch as the remaining no-go item;
 the count-mode, no-move evidence ledger, exit-code propagation, and allowlist
 visibility checks are folded.
+**Fable 5 operator-guidance follow-up 2026-07-06:** a fourth OpenRouter pass
+found missing `wait-ready` guidance fields and non-positive init escalation
+classification as no-go items; structured operator guidance, ownership-refused
+vocabulary, fail-closed policy-refusal gates, per-level init evidence, and
+system coverage for `09-media-ready.sh` are folded.
 **Problem source:** the July 2026 physical MSL3040 field test exposed that
 `rem tape init` and `fieldtest/scripts/10-init-pools.sh` are not aware of
 LTO-9 first-load media optimization. `AOX034L9` initialized successfully, but
