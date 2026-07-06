@@ -1,0 +1,11 @@
+[package]
+name = "rao-manifest-verif"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone extraction of the RAO manifest regular-file writer core for Aeneas -> Lean verification."
+
+# Deliberately NOT a member of the remanence workspace: this crate is consumed by
+# the Charon/Aeneas verification pipeline and must not affect the main build.
+[workspace]
+
+[dependencies]
