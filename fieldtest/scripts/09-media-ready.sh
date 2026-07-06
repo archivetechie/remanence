@@ -74,7 +74,7 @@ if not state:
         20: "timeout_unknown",
         30: "terminal_error",
         40: "transport_unknown",
-        50: "reservation_conflict",
+        50: "ownership_refused",
         130: "aborted_unknown",
     }.get(code, "terminal_error")
 extra = {
@@ -157,7 +157,7 @@ if "state" not in record:
         20: "timeout_unknown",
         30: "terminal_error",
         40: "transport_unknown",
-        50: "reservation_conflict",
+        50: "ownership_refused",
         130: "aborted_unknown",
     }.get(code, "terminal_error")
 if "ready" not in record:
@@ -368,7 +368,7 @@ run_wait_ready() {
       return 40
       ;;
     50)
-      fieldtest_evidence_record "$SCRIPT_NAME" "wait-ready-${token}" FAIL "reservation conflict while waiting for $target; stop and identify the other owner" "$out" "$extra"
+      fieldtest_evidence_record "$SCRIPT_NAME" "wait-ready-${token}" FAIL "ownership/refusal while waiting for $target; verify selected library, allowlist, loaded barcode, and other owners before retrying" "$out" "$extra"
       return 50
       ;;
     130)

@@ -6084,6 +6084,11 @@ struct TapeWaitReadyFailure {
     exit_code: u8,
 }
 
+struct TapeWaitReadyGuidance {
+    operator_action: String,
+    recommended_next_command: String,
+}
+
 struct MediaReadinessPoll {
     readiness: MediaReadiness,
     attempts: u64,
@@ -6205,13 +6210,12 @@ fn run_tape_wait_ready(
     let result = match run_tape_wait_ready_hardware(library, &policy, args, state.catalog_index()) {
         Ok(result) => result,
         Err(failure) => {
-            let _ = writeln!(err, "error: {}", failure.message);
-            print_setcap_hint_if_error_text_matches(&failure.message, err);
+            print_tape_wait_ready_failure(library.serial.as_str(), &failure, args.json, out, err);
             print_warnings(report, err);
             return ExitCode::from(failure.exit_code);
         }
     };
-    print_tape_wait_ready_result(library.serial.as_str(), &result, args.json, out);
+    print_tape_wait_ready_result(library.serial.as_str(), &result, args.json, out, err);
     print_warnings(report, err);
     tape_wait_ready_exit_code(&result)
 }
@@ -7116,6 +7120,7 @@ fn print_tape_wait_ready_result(
     result: &TapeWaitReadyResult,
     json_output: bool,
     out: &mut dyn Write,
+    err: &mut dyn Write,
 ) {
     let summary = if result.timed_out {
         format!(
@@ -7125,6 +7130,7 @@ fn print_tape_wait_ready_result(
     } else {
         describe_media_readiness(&result.readiness)
     };
+    let guidance = tape_wait_ready_result_guidance(library_serial, result);
     if json_output {
         let payload = json!({
             "schema": "rem.tape.wait_ready.v1",
@@ -7139,6 +7145,8 @@ fn print_tape_wait_ready_result(
             "attempts": result.attempts,
             "exit_code": tape_wait_ready_exit_code_u8(result),
             "summary": summary,
+            "operator_action": guidance.operator_action,
+            "recommended_next_command": guidance.recommended_next_command,
         });
         let _ = serde_json::to_writer_pretty(&mut *out, &payload);
         let _ = writeln!(out);
@@ -7161,6 +7169,158 @@ fn print_tape_wait_ready_result(
         "{status} operation_id={} library={library_serial} drive=0x{:04x}{barcode} attempts={} {summary}",
         result.operation_id, result.drive_element, result.attempts
     );
+    if tape_wait_ready_exit_code_u8(result) != 0 {
+        let _ = writeln!(err, "operator_action: {}", guidance.operator_action);
+        let _ = writeln!(
+            err,
+            "recommended_next_command: {}",
+            guidance.recommended_next_command
+        );
+    }
+}
+
+fn print_tape_wait_ready_failure(
+    library_serial: &str,
+    failure: &TapeWaitReadyFailure,
+    json_output: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) {
+    let guidance = tape_wait_ready_failure_guidance(library_serial, failure);
+    if json_output {
+        let payload = json!({
+            "schema": "rem.tape.wait_ready.v1",
+            "library_serial": library_serial,
+            "state": tape_wait_ready_failure_state(failure.exit_code),
+            "ready": false,
+            "retryable": false,
+            "timed_out": failure.exit_code == 20,
+            "exit_code": failure.exit_code,
+            "summary": failure.message.as_str(),
+            "operator_action": guidance.operator_action,
+            "recommended_next_command": guidance.recommended_next_command,
+        });
+        let _ = serde_json::to_writer_pretty(&mut *out, &payload);
+        let _ = writeln!(out);
+        return;
+    }
+    let _ = writeln!(err, "error: {}", failure.message);
+    print_setcap_hint_if_error_text_matches(&failure.message, err);
+    if matches!(failure.exit_code, 20 | 30 | 40 | 50 | 130) {
+        let _ = writeln!(err, "operator_action: {}", guidance.operator_action);
+        let _ = writeln!(
+            err,
+            "recommended_next_command: {}",
+            guidance.recommended_next_command
+        );
+    }
+}
+
+fn tape_wait_ready_result_guidance(
+    library_serial: &str,
+    result: &TapeWaitReadyResult,
+) -> TapeWaitReadyGuidance {
+    let operation_id = result.operation_id;
+    let quarantine_id = media_readiness_quarantine_id_for_operation(operation_id);
+    match tape_wait_ready_exit_code_u8(result) {
+        0 => TapeWaitReadyGuidance {
+            operator_action: "media is ready; normal rem commands may proceed".to_string(),
+            recommended_next_command: "none".to_string(),
+        },
+        10 => TapeWaitReadyGuidance {
+            operator_action: "leave the cartridge in the drive; do not move, unload, force, or clobber; resume the readiness wait later".to_string(),
+            recommended_next_command: format!(
+                "rem tape wait-ready --library {library_serial} --resume {operation_id} --wait --json"
+            ),
+        },
+        20 => TapeWaitReadyGuidance {
+            operator_action: "timeout_unknown: keep the drive and tape fenced; collect RCA evidence and release only after settled inventory".to_string(),
+            recommended_next_command: format!(
+                "rem tape quarantine show {quarantine_id} --json"
+            ),
+        },
+        30 => TapeWaitReadyGuidance {
+            operator_action: "terminal_error: stop; inspect the readiness quarantine and hardware/media evidence before any retry".to_string(),
+            recommended_next_command: format!(
+                "rem tape quarantine show {quarantine_id} --json"
+            ),
+        },
+        40 => TapeWaitReadyGuidance {
+            operator_action: "transport_unknown: stop; keep media fenced, capture kernel/SCSI evidence, and reconcile inventory before retrying".to_string(),
+            recommended_next_command: format!(
+                "rem tape quarantine show {quarantine_id} --json"
+            ),
+        },
+        50 => TapeWaitReadyGuidance {
+            operator_action: "ownership/refused: verify selected library, barcode binding, allowlist, and other owners before retrying".to_string(),
+            recommended_next_command: format!(
+                "rem tape quarantine show {quarantine_id} --json"
+            ),
+        },
+        130 => TapeWaitReadyGuidance {
+            operator_action: "aborted_unknown: leave the cartridge in place; inspect or resume the fenced readiness operation before any move/unload".to_string(),
+            recommended_next_command: format!(
+                "rem tape quarantine show {quarantine_id} --json"
+            ),
+        },
+        _ => TapeWaitReadyGuidance {
+            operator_action: "stop and inspect the captured wait-ready error before retrying".to_string(),
+            recommended_next_command: format!(
+                "rem tape quarantine list --library {library_serial} --json"
+            ),
+        },
+    }
+}
+
+fn tape_wait_ready_failure_guidance(
+    library_serial: &str,
+    failure: &TapeWaitReadyFailure,
+) -> TapeWaitReadyGuidance {
+    match failure.exit_code {
+        20 => TapeWaitReadyGuidance {
+            operator_action: "timeout_unknown: keep the drive and tape fenced; collect RCA evidence and release only after settled inventory".to_string(),
+            recommended_next_command: format!(
+                "rem tape quarantine list --library {library_serial} --json"
+            ),
+        },
+        30 => TapeWaitReadyGuidance {
+            operator_action: "terminal_error: stop; inspect readiness and hardware/media evidence before any retry".to_string(),
+            recommended_next_command: format!(
+                "rem tape quarantine list --library {library_serial} --json"
+            ),
+        },
+        40 => TapeWaitReadyGuidance {
+            operator_action: "transport_unknown: stop; keep media fenced, capture kernel/SCSI evidence, and reconcile inventory before retrying".to_string(),
+            recommended_next_command: format!(
+                "rem tape quarantine list --library {library_serial} --json"
+            ),
+        },
+        50 => TapeWaitReadyGuidance {
+            operator_action: "ownership/refused: verify selected library, loaded barcode, allowlist, and active owner; do not search or move media from another library".to_string(),
+            recommended_next_command: format!("rem library {library_serial} --slots"),
+        },
+        130 => TapeWaitReadyGuidance {
+            operator_action: "aborted_unknown: leave the cartridge in place; inspect the fenced readiness operation before any move/unload".to_string(),
+            recommended_next_command: format!(
+                "rem tape quarantine list --library {library_serial} --json"
+            ),
+        },
+        _ => TapeWaitReadyGuidance {
+            operator_action: "stop and inspect the captured wait-ready error before retrying".to_string(),
+            recommended_next_command: format!("rem library {library_serial} --slots"),
+        },
+    }
+}
+
+fn tape_wait_ready_failure_state(exit_code: u8) -> &'static str {
+    match exit_code {
+        20 => "timeout_unknown",
+        30 => "terminal_error",
+        40 => "transport_unknown",
+        50 => "ownership_refused",
+        130 => "aborted_unknown",
+        _ => "command_error",
+    }
 }
 
 fn media_readiness_state_name(readiness: &MediaReadiness, timed_out: bool) -> &'static str {
@@ -13693,6 +13853,93 @@ mod tests {
             media_readiness_state_name(&MediaReadiness::Ready, true),
             "timeout_unknown"
         );
+    }
+
+    #[test]
+    fn tape_wait_ready_json_includes_operator_guidance() {
+        let operation_id = Uuid::from_u128(0x30);
+        let result = TapeWaitReadyResult {
+            operation_id,
+            drive_element: 0x0001,
+            barcode: Some("AOX030L9".to_string()),
+            readiness: MediaReadiness::BecomingReady {
+                ascq: 0x01,
+                media_initializing: true,
+            },
+            attempts: 1,
+            timed_out: false,
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        print_tape_wait_ready_result("LIBMAIN", &result, true, &mut out, &mut err);
+
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["schema"], "rem.tape.wait_ready.v1");
+        assert_eq!(value["state"], "media_initializing");
+        assert_eq!(value["exit_code"], 10);
+        assert!(value["operator_action"]
+            .as_str()
+            .unwrap()
+            .contains("do not move"));
+        assert!(value["recommended_next_command"]
+            .as_str()
+            .unwrap()
+            .contains(&operation_id.to_string()));
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn tape_wait_ready_human_timeout_includes_operator_guidance_on_stderr() {
+        let operation_id = Uuid::from_u128(0x31);
+        let result = TapeWaitReadyResult {
+            operation_id,
+            drive_element: 0x0001,
+            barcode: Some("AOX031L9".to_string()),
+            readiness: MediaReadiness::BecomingReady {
+                ascq: 0x01,
+                media_initializing: true,
+            },
+            attempts: 2,
+            timed_out: true,
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        print_tape_wait_ready_result("LIBMAIN", &result, false, &mut out, &mut err);
+
+        let stdout = String::from_utf8(out).unwrap();
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(stdout.contains("timeout operation_id="));
+        assert!(stderr.contains("operator_action: timeout_unknown"));
+        assert!(stderr.contains("recommended_next_command: rem tape quarantine show"));
+        assert!(stderr.contains(&operation_id.to_string()));
+    }
+
+    #[test]
+    fn tape_wait_ready_failure_json_classifies_ownership_refusal() {
+        let failure = TapeWaitReadyFailure {
+            message: "barcode AOX030L9 is in slot 0x03eb; wait-ready does not move media"
+                .to_string(),
+            exit_code: 50,
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        print_tape_wait_ready_failure("LIBMAIN", &failure, true, &mut out, &mut err);
+
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["state"], "ownership_refused");
+        assert_eq!(value["exit_code"], 50);
+        assert!(value["operator_action"]
+            .as_str()
+            .unwrap()
+            .contains("selected library"));
+        assert_eq!(
+            value["recommended_next_command"],
+            "rem library LIBMAIN --slots"
+        );
+        assert!(err.is_empty());
     }
 
     #[test]
