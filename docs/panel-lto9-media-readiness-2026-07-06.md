@@ -2,17 +2,21 @@
 
 **Date:** 2026-07-06
 **Design:** `docs/lto9-media-readiness-design-v0.1.md`
-**Status:** folded into design v0.3; verify round pending.
+**Status:** folded into design v0.4; verify round pending.
 **Panel:** SCSI correctness, failure-modes/ops, fieldtest/operator UX,
 cost/efficiency, and GLM 5.2 via OpenRouter (`z-ai/glm-5.2`).
 **Opus addendum:** local Claude Code Opus review run 2026-07-06; 10 findings
 folded after the original panel.
+**Fable 5 addendum:** Claude Fable 5 via OpenRouter run 2026-07-06; no
+blockers, 12 findings folded after Opus.
 
 ## Verdict
 
-The panel agrees with the core detector: `TEST UNIT READY` returning
-`02/04/01` is the portable drive-path signal for "becoming ready", and in an
-LTO-9 context it should be treated as media initialization/calibration. The
+The panel agrees with the core detector: `TEST UNIT READY` returning the
+`02/04/xx` becoming-ready family is the portable drive-path signal, with
+`02/04/01` as the documented expected case. In an LTO-9 context it should be
+treated as media initialization/calibration unless a known terminal ASCQ
+overrides that classification. The
 initial draft was not ready to implement because it treated readiness as a
 simple wait loop. Physical LTO-9 handling needs durable fences, selected-library
 ownership, phase-split loading, and enforceable quarantine.
@@ -24,7 +28,7 @@ Raw findings: 34 total.
 - 8 minors
 - 2 nits
 
-All blockers and accepted majors were folded into design v0.3.
+All blockers and accepted majors were folded into design v0.4.
 
 ## Blockers Folded
 
@@ -136,6 +140,34 @@ Key folds:
 - **SQLite authority.** The durable fence is now SQLite from MR-1; JSONL is
   evidence/export only.
 
+## Fable 5 Addendum
+
+Claude Fable 5 was run through OpenRouter after the Opus fold. It found no
+remaining blockers, but it did find four majors and several smaller precision
+issues. Accepted findings were folded into design v0.4.
+
+Key folds:
+
+- **Immediate conditional LOAD.** If readiness handling ever issues conditional
+  drive `LOAD` (`0x1b`), it must use `IMMED=1` and then rely on TUR polling.
+  Non-immediate LOAD is too likely to recreate the July `DID_TIME_OUT` /
+  `smartpqi` abort pattern.
+- **Terminal `02/04/xx` exceptions.** The design now treats known
+  operator-intervention/reset-required ASCQs, starting with `04/03` and
+  `04/20..22`, as terminal immediately rather than waiting 2.5h under a
+  misleading `media_initializing` label.
+- **Target-status classification.** BUSY, RESERVATION CONFLICT, TASK SET FULL,
+  and TASK ABORTED are not transport failures. The design now classifies them
+  separately, with bounded retry only for BUSY/TASK SET FULL and terminal
+  ownership refusal for RESERVATION CONFLICT.
+- **Quarantine release CLI.** The design now specifies
+  `rem tape quarantine list/show/release`; fences are no longer enforceable but
+  unreleasable.
+- **TUR/REQUEST SENSE are UA-consuming.** Non-selected libraries and D2/LTO-7
+  devices may be probed only with INQUIRY/VPD from readiness code.
+- **Authoritative state for scripts.** Fieldtest scripts must query the
+  SQLite-backed CLI surface; JSONL remains evidence only.
+
 ## Verify-Round Focus
 
 The verify review should focus on:
@@ -147,5 +179,5 @@ The verify review should focus on:
 - whether the SQLite MR-1 fence is minimal enough while still being a real
   admission-control store;
 - whether every current drive CDB is covered by the readiness allowlist tests;
-- whether the CLI exit-code contract is sufficient for copy-paste-free field
-  operation.
+- whether the CLI exit-code and quarantine-release contracts are sufficient for
+  copy-paste-free field operation.
