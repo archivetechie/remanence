@@ -28,6 +28,7 @@ remanence-api     = { path = "../remanence-api" }
 crossterm         = { version = "0.28", optional = true }
 ciborium          = { workspace = true }
 clap              = { workspace = true }
+libc              = { workspace = true }
 prost-types       = { workspace = true }
 serde             = { workspace = true }
 serde_json        = { workspace = true }
