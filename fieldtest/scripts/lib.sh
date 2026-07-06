@@ -361,7 +361,7 @@ fieldtest_human_line() {
 }
 
 fieldtest_evidence_record() {
-  local script="$1" test_id="$2" status="$3" summary="$4" detail_path="${5:-}"
+  local script="$1" test_id="$2" status="$3" summary="$4" detail_path="${5:-}" extra_json="${6:-}"
   local records host env ts line
   records="$(fieldtest_records_path)"
   host="$(fieldtest_host)"
@@ -369,12 +369,12 @@ fieldtest_evidence_record() {
   ts="$(fieldtest_now_utc)"
   mkdir -p "$(dirname -- "$records")"
   line="$(
-    python3 - "$ts" "$host" "$env" "$script" "$test_id" "$status" "$summary" "$detail_path" <<'PY'
+    python3 - "$ts" "$host" "$env" "$script" "$test_id" "$status" "$summary" "$detail_path" "$extra_json" <<'PY'
 import json
 import sys
 
-ts, host, env, script, test_id, status, summary, detail = sys.argv[1:]
-print(json.dumps({
+ts, host, env, script, test_id, status, summary, detail, extra_json = sys.argv[1:]
+payload = {
     "ts": ts,
     "host": host,
     "env": env,
@@ -383,7 +383,13 @@ print(json.dumps({
     "status": status,
     "summary": summary,
     "detail_path": detail or None,
-}, separators=(",", ":")))
+}
+if extra_json:
+    extra = json.loads(extra_json)
+    if not isinstance(extra, dict):
+        raise SystemExit("fieldtest_evidence_record extra_json must be an object")
+    payload.update(extra)
+print(json.dumps(payload, separators=(",", ":")))
 PY
   )"
   printf '%s\n' "$line" >>"$records"
@@ -820,7 +826,10 @@ EOF
   local record_path bench_path
   record_path="$(fieldtest_records_path)"
   fieldtest_evidence_record selftest t1 PASS "ok"
+  fieldtest_evidence_record selftest t2 INFO "ready metadata" "" '{"media_readiness_state":"media_initializing","rem_exit_code":10}'
   [[ -f "$record_path" ]]
+  grep -q '"media_readiness_state":"media_initializing"' "$record_path"
+  grep -q '"rem_exit_code":10' "$record_path"
   bench_path="$(fieldtest_bench_csv_path)"
   fieldtest_bench_record write drive1 262144 compressible 123.4 1.25 1024
   [[ -f "$bench_path" ]]

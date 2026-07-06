@@ -6632,6 +6632,60 @@ fn poll_drive_media_readiness_for_init<S: TapeInitStateOps>(
     )
 }
 
+#[cfg(target_os = "linux")]
+fn poll_tape_init_readiness_after_initial_probe<S: TapeInitStateOps>(
+    drive: &mut DriveHandle,
+    family: MediaFamily,
+    operation_id: Uuid,
+    state: &mut S,
+    drive_element: u16,
+    initial_poll: MediaReadinessPoll,
+    mut signal: impl FnMut() -> Option<&'static str>,
+) -> Result<MediaReadinessPoll, String> {
+    if readiness_requires_conditional_load(&initial_poll.readiness) {
+        record_media_readiness_signal_if_requested(
+            state,
+            operation_id,
+            "before_conditional_immediate_load",
+            &mut signal,
+        )?;
+        state.record_media_readiness_transition(media_readiness_mechanical_transition(
+            operation_id,
+            "conditional_immediate_load",
+            "pre_ready_loading",
+            Some(0x1b),
+            None,
+        ))?;
+        if let Err(error) = drive.load_immediate() {
+            if let Some(signal_name) = record_media_readiness_signal_or_mechanical_failure(
+                state,
+                operation_id,
+                "conditional_immediate_load",
+                "transport_unknown",
+                Some(0x1b),
+                &error.to_string(),
+                signal(),
+            )? {
+                return Err(signal_name);
+            }
+            return Err(format!(
+                "immediate drive load 0x{drive_element:04x}: {error}"
+            ));
+        }
+        record_media_readiness_signal_if_requested(
+            state,
+            operation_id,
+            "after_conditional_immediate_load",
+            &mut signal,
+        )?;
+        poll_drive_media_readiness_for_init(drive, family, operation_id, state, signal)
+    } else if initial_poll.readiness.is_ready() || !initial_poll.readiness.is_retryable_wait() {
+        Ok(initial_poll)
+    } else {
+        poll_drive_media_readiness_for_init(drive, family, operation_id, state, signal)
+    }
+}
+
 fn deadline_after(timeout: StdDuration) -> Option<String> {
     let seconds = i64::try_from(timeout.as_secs()).ok()?;
     OffsetDateTime::now_utc()
@@ -7025,6 +7079,25 @@ fn readiness_requires_conditional_load(readiness: &MediaReadiness) -> bool {
     )
 }
 
+fn tape_init_readiness_exit_code(poll: &MediaReadinessPoll) -> u8 {
+    if poll.timed_out {
+        20
+    } else {
+        u8::try_from(poll.readiness.design_exit_code()).unwrap_or(1)
+    }
+}
+
+fn tape_init_failure_exit_code(error: &str) -> Option<u8> {
+    const MARKER: &str = "media_readiness_exit_code=";
+    let marker_at = error.find(MARKER)?;
+    let value_start = marker_at + MARKER.len();
+    let value = error[value_start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    value.parse().ok()
+}
+
 fn print_tape_wait_ready_result(
     library_serial: &str,
     result: &TapeWaitReadyResult,
@@ -7220,6 +7293,8 @@ fn run_tape_init_candidates<S: TapeInitStateOps>(
 ) -> ExitCode {
     let mut successes = 0usize;
     let mut failures = 0usize;
+    let mut readiness_failure_exit_code: Option<u8> = None;
+    let mut non_readiness_failures = 0usize;
     let count = candidates.len();
     for candidate in candidates {
         match run_one_tape_init(state, ctx, candidate.clone(), err) {
@@ -7229,11 +7304,17 @@ fn run_tape_init_candidates<S: TapeInitStateOps>(
                     successes += 1;
                 } else {
                     failures += 1;
+                    non_readiness_failures += 1;
                 }
             }
             Err(error) => {
                 let _ = writeln!(err, "tape init {}: {error}", candidate.label());
                 failures += 1;
+                if let Some(exit_code) = tape_init_failure_exit_code(&error) {
+                    readiness_failure_exit_code.get_or_insert(exit_code);
+                } else {
+                    non_readiness_failures += 1;
+                }
             }
         }
     }
@@ -7241,7 +7322,11 @@ fn run_tape_init_candidates<S: TapeInitStateOps>(
         let _ = writeln!(out, "summary: {successes} ok, {failures} failed");
     }
     print_warnings(ctx.report, err);
-    if failures == 0 || ctx.args.dry_run {
+    if failures == 0 {
+        ExitCode::SUCCESS
+    } else if non_readiness_failures == 0 {
+        ExitCode::from(readiness_failure_exit_code.unwrap_or(1))
+    } else if ctx.args.dry_run {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
@@ -7701,72 +7786,38 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         signal_guard.requested_signal_name()
     })?;
     let family = media_family_for_init_generation(generation);
-    let readiness = if candidate.location == TapeInitLocation::Slot {
+    let readiness = {
+        let initial_phase = if candidate.location == TapeInitLocation::Slot {
+            "pre_load_tur"
+        } else {
+            "already_loaded_tur"
+        };
+        let before_initial_phase = format!("before_{initial_phase}");
         record_media_readiness_signal_if_requested(
             state,
             operation_id,
-            "before_pre_load_tur",
+            before_initial_phase.as_str(),
             || signal_guard.requested_signal_name(),
         )?;
         let initial = drive.probe_media_readiness(family);
         let initial_poll =
-            poll_already_observed_media_readiness(initial, "pre_load_tur", operation_id, state)?;
+            poll_already_observed_media_readiness(initial, initial_phase, operation_id, state)?;
+        let after_initial_phase = format!("after_{initial_phase}");
         record_media_readiness_signal_if_requested(
             state,
             operation_id,
-            "after_pre_load_tur",
+            after_initial_phase.as_str(),
             || signal_guard.requested_signal_name(),
         )?;
-        if readiness_requires_conditional_load(&initial_poll.readiness) {
-            record_media_readiness_signal_if_requested(
-                state,
-                operation_id,
-                "before_conditional_immediate_load",
-                || signal_guard.requested_signal_name(),
-            )?;
-            state.record_media_readiness_transition(media_readiness_mechanical_transition(
-                operation_id,
-                "conditional_immediate_load",
-                "pre_ready_loading",
-                Some(0x1b),
-                None,
-            ))?;
-            if let Err(error) = drive.load_immediate() {
-                if let Some(signal) = record_media_readiness_signal_or_mechanical_failure(
-                    state,
-                    operation_id,
-                    "conditional_immediate_load",
-                    "transport_unknown",
-                    Some(0x1b),
-                    &error.to_string(),
-                    signal_guard.requested_signal_name(),
-                )? {
-                    return Err(signal);
-                }
-                return Err(format!(
-                    "immediate drive load 0x{drive_element:04x}: {error}"
-                ));
-            }
-            record_media_readiness_signal_if_requested(
-                state,
-                operation_id,
-                "after_conditional_immediate_load",
-                || signal_guard.requested_signal_name(),
-            )?;
-            poll_drive_media_readiness_for_init(&mut drive, family, operation_id, state, || {
-                signal_guard.requested_signal_name()
-            })?
-        } else if initial_poll.readiness.is_ready() || !initial_poll.readiness.is_retryable_wait() {
-            initial_poll
-        } else {
-            poll_drive_media_readiness_for_init(&mut drive, family, operation_id, state, || {
-                signal_guard.requested_signal_name()
-            })?
-        }
-    } else {
-        poll_drive_media_readiness_for_init(&mut drive, family, operation_id, state, || {
-            signal_guard.requested_signal_name()
-        })?
+        poll_tape_init_readiness_after_initial_probe(
+            &mut drive,
+            family,
+            operation_id,
+            state,
+            drive_element,
+            initial_poll,
+            || signal_guard.requested_signal_name(),
+        )?
     };
     if !readiness.readiness.is_ready() {
         return Err(tape_init_readiness_error(
@@ -8008,8 +8059,10 @@ fn tape_init_readiness_error(
     } else {
         String::new()
     };
+    let state = media_readiness_state_name(&poll.readiness, poll.timed_out);
+    let exit_code = tape_init_readiness_exit_code(poll);
     format!(
-        "media not ready for tape init on {voltag} in drive 0x{drive_element:04x}{timeout}: {}; leave the tape in the drive and run `rem tape wait-ready` or fieldtest/scripts/09-media-ready.sh before retrying init",
+        "media not ready for tape init on {voltag} in drive 0x{drive_element:04x}{timeout} media_readiness_state={state} media_readiness_exit_code={exit_code}: {}; leave the tape in the drive and run `rem tape wait-ready` or fieldtest/scripts/09-media-ready.sh before retrying init",
         describe_media_readiness(&poll.readiness)
     )
 }
@@ -13443,6 +13496,44 @@ mod tests {
             media_readiness_state_name(&MediaReadiness::Ready, true),
             "timeout_unknown"
         );
+    }
+
+    #[test]
+    fn tape_init_conditional_load_only_for_explicit_load_readiness() {
+        assert!(!readiness_requires_conditional_load(
+            &MediaReadiness::BecomingReady {
+                ascq: 0x01,
+                media_initializing: true,
+            }
+        ));
+        assert!(readiness_requires_conditional_load(
+            &MediaReadiness::BecomingReady {
+                ascq: 0x02,
+                media_initializing: true,
+            }
+        ));
+        assert!(readiness_requires_conditional_load(
+            &MediaReadiness::NoMedium { ascq: 0x00 }
+        ));
+    }
+
+    #[test]
+    fn tape_init_readiness_error_carries_stable_exit_metadata() {
+        let poll = MediaReadinessPoll {
+            readiness: MediaReadiness::BecomingReady {
+                ascq: 0x01,
+                media_initializing: true,
+            },
+            attempts: 1,
+            timed_out: false,
+        };
+
+        let error = tape_init_readiness_error("AOX030L9", 0x0001, &poll);
+
+        assert!(error.contains("media_readiness_state=media_initializing"));
+        assert!(error.contains("media_readiness_exit_code=10"));
+        assert_eq!(tape_init_failure_exit_code(&error), Some(10));
+        assert_eq!(tape_init_failure_exit_code("ordinary init failure"), None);
     }
 
     #[test]
