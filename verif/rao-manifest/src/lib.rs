@@ -13,12 +13,14 @@
 //! nonempty regular file with one xattr, empty regular file, hardlink, symlink,
 //! and directory. The array core adds fixed-capacity fold checks for duplicate
 //! path/file ids and hardlink target membership in the accumulated regular-file
-//! prefix. This is still not the production `Vec`/CBOR parser; text, xattr
-//! bytes, and SHA-256 bytes are modeled as opaque scalar words so the proof can
+//! prefix. The planner bridge then models the production `BTreeSet` membership
+//! contract as scalar contains/insert facts before feeding the arbitrary fold
+//! step. This is still not the production `Vec`/CBOR parser; text, xattr bytes,
+//! and SHA-256 bytes are modeled as opaque scalar words so the proof can
 //! preserve identity without extracting `String`, `Vec`, CBOR bytes, tar/pax
-//! layout, or hashing. The `drift_guard` test pins the production snippets this
-//! extraction mirrors; if it fails, the extraction and Lean proofs must be
-//! re-synced.
+//! layout, hashing, or the standard-library `BTreeSet` internals. The
+//! `drift_guard` test pins the production snippets this extraction mirrors; if
+//! it fails, the extraction and Lean proofs must be re-synced.
 
 #![allow(clippy::manual_is_multiple_of)]
 // Keep explicit modulo tests: the extraction mirrors production code and the
@@ -332,6 +334,26 @@ pub struct PlannerEntryCore {
     pub local_entry_valid: bool,
     pub path_seen_before: bool,
     pub file_id_seen_before: bool,
+    pub hardlink_target_seen_regular_before: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlannerSourceEntryCore {
+    pub entry_type: u8,
+    pub path_id: u64,
+    pub file_id: u64,
+    pub link_target_path_id: u64,
+    pub local_entry_valid: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlannerMembershipFactsCore {
+    pub path_seen_before: bool,
+    pub path_inserted: bool,
+    pub file_id_seen_before: bool,
+    pub file_id_inserted: bool,
+    pub regular_path_seen_before: bool,
+    pub regular_path_inserted: bool,
     pub hardlink_target_seen_regular_before: bool,
 }
 
@@ -1263,6 +1285,68 @@ pub fn planner_fold_step_core(
     })
 }
 
+pub fn validate_insert_membership_core(
+    seen_before: bool,
+    inserted: bool,
+) -> Result<(), RaoManifestError> {
+    if seen_before {
+        if inserted {
+            return Err(RaoManifestError::InvalidManifestField);
+        }
+        return Ok(());
+    }
+    if !inserted {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    Ok(())
+}
+
+pub fn validate_planner_membership_facts_core(
+    source: PlannerSourceEntryCore,
+    facts: PlannerMembershipFactsCore,
+) -> Result<(), RaoManifestError> {
+    validate_insert_membership_core(facts.path_seen_before, facts.path_inserted)?;
+    validate_insert_membership_core(facts.file_id_seen_before, facts.file_id_inserted)?;
+    if source.entry_type == PLANNER_ENTRY_REGULAR {
+        validate_insert_membership_core(
+            facts.regular_path_seen_before,
+            facts.regular_path_inserted,
+        )?;
+        if facts.regular_path_seen_before {
+            return Err(RaoManifestError::InvalidManifestField);
+        }
+    } else if facts.regular_path_inserted {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    Ok(())
+}
+
+pub fn planner_entry_from_membership_core(
+    source: PlannerSourceEntryCore,
+    facts: PlannerMembershipFactsCore,
+) -> Result<PlannerEntryCore, RaoManifestError> {
+    validate_planner_membership_facts_core(source, facts)?;
+    Ok(PlannerEntryCore {
+        entry_type: source.entry_type,
+        path_id: source.path_id,
+        file_id: source.file_id,
+        link_target_path_id: source.link_target_path_id,
+        local_entry_valid: source.local_entry_valid,
+        path_seen_before: facts.path_seen_before,
+        file_id_seen_before: facts.file_id_seen_before,
+        hardlink_target_seen_regular_before: facts.hardlink_target_seen_regular_before,
+    })
+}
+
+pub fn planner_fold_step_from_membership_core(
+    state: PlannerFoldStateCore,
+    source: PlannerSourceEntryCore,
+    facts: PlannerMembershipFactsCore,
+) -> Result<PlannerFoldStateCore, RaoManifestError> {
+    let entry = planner_entry_from_membership_core(source, facts)?;
+    planner_fold_step_core(state, entry)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1363,6 +1447,28 @@ mod tests {
         }
     }
 
+    fn planner_source_entry(entry_type: u8, path_id: u64, file_id: u64) -> PlannerSourceEntryCore {
+        PlannerSourceEntryCore {
+            entry_type,
+            path_id,
+            file_id,
+            link_target_path_id: 0,
+            local_entry_valid: true,
+        }
+    }
+
+    fn clean_membership_facts() -> PlannerMembershipFactsCore {
+        PlannerMembershipFactsCore {
+            path_seen_before: false,
+            path_inserted: true,
+            file_id_seen_before: false,
+            file_id_inserted: true,
+            regular_path_seen_before: false,
+            regular_path_inserted: true,
+            hardlink_target_seen_regular_before: false,
+        }
+    }
+
     #[test]
     fn drift_guard() {
         let this_file = include_str!("lib.rs");
@@ -1413,6 +1519,7 @@ mod tests {
             "duplicate file_id",
             "if !seen_regular_paths.contains(target)",
             "seen_regular_paths.insert(spec.path.clone());",
+            "seen_file_ids.contains(&options.manifest_file_id)",
             "pub(crate) fn chunk_count(size_bytes: u64, chunk_size: usize)",
             "if size_bytes == 0 {\n        return Ok(0);\n    }",
             "Ok((size_bytes - 1) / chunk + 1)",
@@ -1471,6 +1578,10 @@ mod tests {
             "pub fn validate_manifest_array_core(",
             "pub fn encode_manifest_array_core(",
             "pub fn decode_manifest_array_core(",
+            "pub fn validate_insert_membership_core(",
+            "pub fn validate_planner_membership_facts_core(",
+            "pub fn planner_entry_from_membership_core(",
+            "pub fn planner_fold_step_from_membership_core(",
             "pub fn validate_planner_entry_core(",
             "pub fn planner_fold_step_core(",
             "pub fn validate_hardlink_entry_core(",
@@ -1705,6 +1816,55 @@ mod tests {
         hardlink.hardlink_target_seen_regular_before = false;
         assert_eq!(
             planner_fold_step_core(state, hardlink),
+            Err(RaoManifestError::InvalidManifestField)
+        );
+    }
+
+    #[test]
+    fn planner_membership_step_accepts_btreeset_style_facts() {
+        let state = planner_state();
+        let regular = planner_source_entry(PLANNER_ENTRY_REGULAR, 11, 21);
+        let state =
+            planner_fold_step_from_membership_core(state, regular, clean_membership_facts())
+                .expect("clean regular membership facts should plan");
+        assert_eq!(state.accepted_count, 1);
+        assert_eq!(state.regular_seen_count, 1);
+
+        let mut hardlink = planner_source_entry(PLANNER_ENTRY_HARDLINK, 12, 22);
+        hardlink.link_target_path_id = 11;
+        let mut facts = clean_membership_facts();
+        facts.regular_path_seen_before = false;
+        facts.regular_path_inserted = false;
+        facts.hardlink_target_seen_regular_before = true;
+        let state = planner_fold_step_from_membership_core(state, hardlink, facts)
+            .expect("clean hardlink membership facts should plan");
+        assert_eq!(state.accepted_count, 2);
+        assert_eq!(state.regular_seen_count, 1);
+    }
+
+    #[test]
+    fn planner_membership_step_rejects_bad_set_contracts() {
+        let state = planner_state();
+        let regular = planner_source_entry(PLANNER_ENTRY_REGULAR, 11, 21);
+        let mut facts = clean_membership_facts();
+        facts.path_inserted = false;
+        assert_eq!(
+            planner_fold_step_from_membership_core(state, regular, facts),
+            Err(RaoManifestError::InvalidManifestField)
+        );
+        let mut facts = clean_membership_facts();
+        facts.regular_path_seen_before = true;
+        facts.regular_path_inserted = false;
+        assert_eq!(
+            planner_fold_step_from_membership_core(state, regular, facts),
+            Err(RaoManifestError::InvalidManifestField)
+        );
+
+        let hardlink = planner_source_entry(PLANNER_ENTRY_HARDLINK, 12, 22);
+        let mut facts = clean_membership_facts();
+        facts.regular_path_inserted = true;
+        assert_eq!(
+            planner_fold_step_from_membership_core(state, hardlink, facts),
             Err(RaoManifestError::InvalidManifestField)
         );
     }
