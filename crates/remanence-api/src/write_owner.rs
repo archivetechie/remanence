@@ -168,6 +168,8 @@ pub(crate) enum DriveCommand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MountedSession {
     pub bay: u16,
+    pub library_serial: String,
+    pub barcode: Option<String>,
     pub home_slot: Option<u16>,
     pub tape_uuid: TapeUuid,
     pub drive_uuid: Option<Vec<u8>>,

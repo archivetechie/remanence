@@ -252,6 +252,8 @@ async fn open_write_session_reserved(
         session_id,
         crate::write_owner::MountedSession {
             bay: mount.bay,
+            library_serial: mount.library_serial.clone(),
+            barcode: mount.barcode.clone(),
             home_slot: mount.home_slot,
             tape_uuid,
             drive_uuid: mount.drive_uuid.clone(),
@@ -339,6 +341,8 @@ async fn open_read_session_reserved(
         session_id,
         crate::write_owner::MountedSession {
             bay: mount.bay,
+            library_serial: mount.library_serial.clone(),
+            barcode: mount.barcode.clone(),
             home_slot: mount.home_slot,
             tape_uuid,
             drive_uuid: mount.drive_uuid.clone(),
@@ -440,6 +444,7 @@ async fn close_write_like_critical(
     let close_started = Instant::now();
     let actor_close_started = Instant::now();
     let unload_before_close = mounted.home_slot.is_some();
+    ensure_mounted_session_media_readiness_admitted(&state, "close session", &mounted)?;
     if abort {
         drive
             .send(crate::write_owner::DriveCommand::Abort {
@@ -523,6 +528,7 @@ async fn close_read_session_critical(
     let mounted = pool.session(session_id)?;
     let drive = pool.drive_tx(mounted.bay)?;
     let (reply_tx, reply_rx) = oneshot::channel();
+    ensure_mounted_session_media_readiness_admitted(&state, "close read session", &mounted)?;
     drive
         .send(crate::write_owner::DriveCommand::CloseRead {
             session_id,
@@ -662,6 +668,7 @@ async fn drive_unload(pool: &crate::write_owner::DrivePool, bay: u16) -> Result<
 #[derive(Debug)]
 struct ActorMount {
     bay: u16,
+    barcode: Option<String>,
     source_slot: Option<u16>,
     home_slot: Option<u16>,
     needs_drive_load: bool,
@@ -681,7 +688,10 @@ fn resolve_and_reserve_actor_mount(
         let busy_bays = pool.busy_bays();
         let mount = resolve_actor_mount(state, library_serial, tape_uuid, &busy_bays)?;
         match pool.reserve_drive(mount.bay) {
-            Ok(reservation) => return Ok((mount, reservation)),
+            Ok(reservation) => {
+                ensure_actor_mount_media_readiness_admitted(state, library_serial, &mount)?;
+                return Ok((mount, reservation));
+            }
             Err(err) if err.code() == tonic::Code::FailedPrecondition && attempt + 1 < ATTEMPTS => {
                 continue;
             }
@@ -708,10 +718,8 @@ fn resolve_actor_mount(
                 bytes_to_hex(tape_uuid)
             ))
         })?;
-    let voltag = tape
-        .voltag
-        .clone()
-        .unwrap_or_else(|| "<no-voltag>".to_string());
+    let barcode = tape.voltag.clone();
+    let voltag = barcode.clone().unwrap_or_else(|| "<no-voltag>".to_string());
     let snapshot = state
         .current_library_snapshot()
         .ok_or_else(|| Status::not_found("library not found"))?;
@@ -723,6 +731,7 @@ fn resolve_actor_mount(
         .ok_or_else(|| Status::not_found(format!("library {library_serial} not found")))?;
     let mut mount = resolve_actor_mount_from_library(library, voltag.as_str(), busy_bays)?;
     mount.library_serial = library_serial.to_string();
+    mount.barcode = barcode;
     if index
         .list_drives(true, true)
         .map_err(status_from_state_error)?
@@ -745,6 +754,44 @@ fn resolve_actor_mount(
         mount.drive_serial = Some(drive.serial);
     }
     Ok(mount)
+}
+
+fn ensure_actor_mount_media_readiness_admitted(
+    state: &ApiState,
+    library_serial: &str,
+    mount: &ActorMount,
+) -> Result<(), Status> {
+    let index = CatalogIndex::open_read_only(state.index_path.as_ref())
+        .map_err(|err| Status::internal(err.to_string()))?;
+    crate::ensure_media_readiness_admitted(
+        &index,
+        "open session",
+        library_serial,
+        Some(mount.bay),
+        mount.barcode.as_deref(),
+        actor_mount_may_use_library_robotics(mount),
+    )
+}
+
+fn actor_mount_may_use_library_robotics(mount: &ActorMount) -> bool {
+    mount.source_slot.is_some() || mount.home_slot.is_some()
+}
+
+fn ensure_mounted_session_media_readiness_admitted(
+    state: &ApiState,
+    action: &str,
+    mounted: &crate::write_owner::MountedSession,
+) -> Result<(), Status> {
+    let index = CatalogIndex::open_read_only(state.index_path.as_ref())
+        .map_err(|err| Status::internal(err.to_string()))?;
+    crate::ensure_media_readiness_admitted(
+        &index,
+        action,
+        mounted.library_serial.as_str(),
+        Some(mounted.bay),
+        mounted.barcode.as_deref(),
+        mounted.home_slot.is_some(),
+    )
 }
 
 fn resolve_actor_mount_from_library(
@@ -784,6 +831,7 @@ fn resolve_actor_mount_from_library(
                 .and_then(|drive| drive.source_slot);
             Ok(ActorMount {
                 bay,
+                barcode: Some(voltag.to_string()),
                 source_slot: None,
                 home_slot,
                 needs_drive_load: false,
@@ -796,6 +844,7 @@ fn resolve_actor_mount_from_library(
             ensure_target_bay_can_receive(library, bay)?;
             Ok(ActorMount {
                 bay,
+                barcode: Some(voltag.to_string()),
                 source_slot: Some(slot),
                 home_slot: Some(slot),
                 needs_drive_load: true,
@@ -874,7 +923,24 @@ mod tests {
         assert_eq!(mount.bay, 0x0102);
         assert_eq!(mount.source_slot, Some(0x0401));
         assert_eq!(mount.home_slot, Some(0x0401));
+        assert!(actor_mount_may_use_library_robotics(&mount));
         assert!(mount.needs_drive_load);
+    }
+
+    #[test]
+    fn already_loaded_actor_mount_with_home_slot_may_use_robotics_on_close() {
+        let library = test_library(
+            vec![drive_bay(0x0101, true, Some("RMN001L9"))],
+            vec![slot(0x0401, "OTHERL9")],
+        );
+        let mount = resolve_actor_mount_from_library(&library, "RMN001L9", &HashSet::new())
+            .expect("resolve loaded mount");
+
+        assert_eq!(mount.bay, 0x0101);
+        assert_eq!(mount.source_slot, None);
+        assert_eq!(mount.home_slot, Some(0x0401));
+        assert!(actor_mount_may_use_library_robotics(&mount));
+        assert!(!mount.needs_drive_load);
     }
 
     #[test]

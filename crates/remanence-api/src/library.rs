@@ -388,6 +388,24 @@ impl LibraryServiceApi {
         let library_serial = self.resolve_library_serial(library_uuid)?;
         let pool = self.state.drive_pool()?.clone();
         pool.reserve_all_exclusive()?;
+        let index = match self.state.index() {
+            Ok(index) => index,
+            Err(err) => {
+                pool.release_all();
+                return Err(err);
+            }
+        };
+        if let Err(err) = crate::ensure_media_readiness_admitted(
+            &index,
+            operation_kind,
+            &library_serial,
+            None,
+            None,
+            true,
+        ) {
+            pool.release_all();
+            return Err(err);
+        }
         let operation_id = Uuid::new_v4();
         if let Err(err) = self.state.record_library_request_received(
             actor,
