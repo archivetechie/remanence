@@ -16,12 +16,15 @@ small but central writer-schema cores:
   `schema_version = 1`, `file_sha256` length 32, and chunk-count arithmetic
 - a bounded five-entry manifest containing a nonempty regular file with one
   xattr, an empty regular file, a hardlink, a symlink, and a directory
+- a fixed-capacity array/fold validator over that five-entry shape, adding
+  duplicate path/file-id rejection and hardlink target accumulation across the
+  preceding regular entries
 
 Text values are represented by opaque scalar ids and SHA-256 bytes by four
 opaque `u64` words. Xattr names and values are represented by scalar ids and a
 value length. This preserves identity for the proof without proving `String`,
 `Vec`, exact CBOR bytes, UTF-8 decoding, tar/pax layout, hashing, arbitrary
-xattr maps, global-pax cross-checking, duplicate path/file-id detection, or
+xattr maps, global-pax cross-checking, production `BTreeSet` internals, or
 arbitrary-length manifest arrays.
 
 ## M1 — chunk-count arithmetic (`chunk_count_core_success`)
@@ -114,6 +117,33 @@ pass. This is still a scalar writer-schema theorem: it does not prove arbitrary
 manifest array traversal, exact CBOR bytes, duplicate detection, production
 `BTreeMap` xattr ordering, path syntax validation, or full production
 `validate_manifest(encode_manifest(x))` over `Vec`/`String` values.
+
+## M7 — fixed-capacity array/fold round trip (`decode_encode_manifest_array_core_round_trip`)
+
+For every valid fixed five-entry manifest array core:
+
+```text
+decode_manifest_array_core(
+  encode_manifest_array_core(manifest),
+  manifest.chunk_size
+) = manifest
+```
+
+This strengthens M6 with array-level state:
+
+- all five modeled payload path ids are pairwise distinct
+- all five modeled file ids are pairwise distinct
+- the hardlink target must be one of the two regular path ids accumulated
+  before the hardlink entry
+
+The proof includes helper theorems for `distinct5_core` success, duplicate-pair
+rejection, hardlink-target success when the target is in the regular prefix,
+and fail-closed rejection when the target is unseen. This models the production
+planner's duplicate sets and the manifest reader's `seen_regular_paths` fold at
+fixed capacity. It still does not prove arbitrary `Vec` traversal,
+production `BTreeSet` internals, exact CBOR bytes, path syntax validation,
+or full production `validate_manifest(encode_manifest(x))` over `Vec`/`String`
+values.
 
 ## Trust anchor
 
