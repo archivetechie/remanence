@@ -1,0 +1,10 @@
+name = "pool_selection"
+version = "0.1.0"
+defaultTargets = ["PoolSelection"]
+
+[[require]]
+name = "aeneas"
+path = "/home/user/toolchains/aeneas/backends/lean"
+
+[[lean_lib]]
+name = "PoolSelection"
