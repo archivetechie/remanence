@@ -962,7 +962,7 @@ pub fn lto_generation_from_voltag(voltag: &str) -> Option<LtoGen> {
         "L7" => Some(LtoGen::Lto7),
         "M8" => Some(LtoGen::M8),
         "L8" => Some(LtoGen::Lto8),
-        "L9" => Some(LtoGen::Lto9),
+        "L9" | "LZ" => Some(LtoGen::Lto9),
         _ => None,
     }
 }
@@ -3153,6 +3153,13 @@ mod tests {
         assert_eq!(lto_generation_from_voltag("RMN001M8"), Some(LtoGen::M8));
         assert_eq!(lto_generation_from_voltag("rmn001m8"), Some(LtoGen::M8));
         assert_eq!(raw_capacity_bytes(LtoGen::M8), 9_000_000_000_000);
+    }
+
+    #[test]
+    fn lto_generation_treats_lz_as_lto9_media_class() {
+        assert_eq!(lto_generation_from_voltag("RMN001LZ"), Some(LtoGen::Lto9));
+        assert_eq!(lto_generation_from_voltag("rmn001lz"), Some(LtoGen::Lto9));
+        assert_eq!(raw_capacity_bytes(LtoGen::Lto9), 18_000_000_000_000);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration as StdDuration, Instant};
 
 use ciborium::value::Value as CborValue;
 use remanence_format::error::FormatError;
@@ -1120,26 +1120,30 @@ struct SessionOpenReadinessContext<'a> {
     needs_drive_load: bool,
 }
 
+#[cfg(test)]
+const SESSION_OPEN_CONDITIONAL_LOAD_SETTLE: StdDuration = StdDuration::from_millis(0);
+#[cfg(not(test))]
+const SESSION_OPEN_CONDITIONAL_LOAD_SETTLE: StdDuration = StdDuration::from_secs(1);
+
 fn session_open_short_probe_or_load(
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
     ctx: SessionOpenReadinessContext<'_>,
 ) -> Result<(), Status> {
+    session_open_reject_admission_conflicts(index, &ctx)?;
     let family = session_open_media_family(ctx.barcode);
     let first = drive.probe_media_readiness(family);
     if first.is_ready() {
         return Ok(());
     }
     if session_open_readiness_requires_immediate_load(&ctx, &first) {
-        drive.load_immediate().map_err(|err| {
-            record_session_open_command_fence(
-                index,
-                &ctx,
-                Some(0x1b),
-                format!("drive LOAD IMMED: {err}"),
-            )
-        })?;
-        return session_open_short_probe_after_load(index, drive, ctx, family);
+        return session_open_immediate_load_then_probe(
+            index,
+            drive,
+            ctx,
+            family,
+            "drive LOAD IMMED",
+        );
     }
     if session_open_readiness_should_retry_once(&first) {
         let second = drive.probe_media_readiness(family);
@@ -1147,15 +1151,13 @@ fn session_open_short_probe_or_load(
             return Ok(());
         }
         if session_open_readiness_requires_immediate_load(&ctx, &second) {
-            drive.load_immediate().map_err(|err| {
-                record_session_open_command_fence(
-                    index,
-                    &ctx,
-                    Some(0x1b),
-                    format!("drive LOAD IMMED after retry: {err}"),
-                )
-            })?;
-            return session_open_short_probe_after_load(index, drive, ctx, family);
+            return session_open_immediate_load_then_probe(
+                index,
+                drive,
+                ctx,
+                family,
+                "drive LOAD IMMED after retry",
+            );
         }
         return Err(record_session_open_readiness_fence(
             index,
@@ -1172,30 +1174,140 @@ fn session_open_short_probe_or_load(
     ))
 }
 
+fn session_open_reject_admission_conflicts(
+    index: &mut CatalogIndex,
+    ctx: &SessionOpenReadinessContext<'_>,
+) -> Result<(), Status> {
+    let conflicts = index
+        .media_readiness_admission_conflicts(ctx.library_serial, Some(ctx.bay), ctx.barcode, false)
+        .map_err(status_from_state_error)?;
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+    Err(Status::failed_precondition(
+        session_open_admission_error_message(ctx, &conflicts),
+    ))
+}
+
+fn session_open_admission_error_message(
+    ctx: &SessionOpenReadinessContext<'_>,
+    conflicts: &[remanence_state::MediaReadinessOperationRecord],
+) -> String {
+    let conflict_summary = conflicts
+        .iter()
+        .map(|record| {
+            format!(
+                "operation={} state={} drive=0x{:04x} barcode={} quarantine={}",
+                record.operation_id,
+                record.state,
+                record.drive_element,
+                record.barcode.as_deref().unwrap_or("(unknown)"),
+                record.quarantine_id.as_deref().unwrap_or("(none)")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let first_operation = conflicts
+        .first()
+        .map(|record| record.operation_id.as_str())
+        .unwrap_or("(unknown)");
+    format!(
+        "{} blocked by active media-readiness fence library={} drive=0x{:04x} barcode={}: {}; run `rem tape wait-ready --library {} --resume {} --wait --json` or inspect quarantine before opening a session",
+        ctx.action,
+        ctx.library_serial,
+        ctx.bay,
+        ctx.barcode.unwrap_or("(unknown)"),
+        conflict_summary,
+        ctx.library_serial,
+        first_operation,
+    )
+}
+
+fn session_open_immediate_load_then_probe(
+    index: &mut CatalogIndex,
+    drive: &mut DriveHandle,
+    ctx: SessionOpenReadinessContext<'_>,
+    family: MediaFamily,
+    detail_prefix: &str,
+) -> Result<(), Status> {
+    let operation_id = Uuid::new_v4();
+    if let Err(err) = record_session_open_readiness_operation(index, operation_id, &ctx) {
+        return Err(session_open_recording_failure_status(
+            &ctx,
+            None,
+            "record_media_readiness_operation",
+            &err,
+        ));
+    }
+    if let Err(err) = record_session_open_mechanical_transition(
+        index,
+        operation_id,
+        "session_open_immediate_load",
+        "pre_ready_loading",
+        Some(0x1b),
+        None,
+    ) {
+        return Err(session_open_recording_failure_status(
+            &ctx,
+            Some(operation_id),
+            "record_media_readiness_transition",
+            &err,
+        ));
+    }
+    std::thread::sleep(SESSION_OPEN_CONDITIONAL_LOAD_SETTLE);
+    if let Err(err) = drive.load_immediate() {
+        return Err(record_session_open_command_fence_on_operation(
+            index,
+            operation_id,
+            &ctx,
+            Some(0x1b),
+            format!("{detail_prefix}: {err}"),
+        ));
+    }
+    session_open_short_probe_after_load(index, drive, ctx, family, operation_id)
+}
+
 fn session_open_short_probe_after_load(
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
     ctx: SessionOpenReadinessContext<'_>,
     family: MediaFamily,
+    operation_id: Uuid,
 ) -> Result<(), Status> {
     let first = drive.probe_media_readiness(family);
     if first.is_ready() {
+        record_session_open_readiness_transition_on_operation(
+            index,
+            operation_id,
+            &ctx,
+            "session_open_after_immediate_load",
+            &first,
+        )?;
         return Ok(());
     }
     if session_open_readiness_should_retry_once(&first) {
         let second = drive.probe_media_readiness(family);
         if second.is_ready() {
+            record_session_open_readiness_transition_on_operation(
+                index,
+                operation_id,
+                &ctx,
+                "session_open_after_immediate_load",
+                &second,
+            )?;
             return Ok(());
         }
-        return Err(record_session_open_readiness_fence(
+        return Err(record_session_open_readiness_fence_on_operation(
             index,
+            operation_id,
             &ctx,
             "session_open_after_immediate_load",
             &second,
         ));
     }
-    Err(record_session_open_readiness_fence(
+    Err(record_session_open_readiness_fence_on_operation(
         index,
+        operation_id,
         &ctx,
         "session_open_after_immediate_load",
         &first,
@@ -1231,42 +1343,21 @@ fn session_open_readiness_should_retry_once(readiness: &MediaReadiness) -> bool 
     )
 }
 
-fn record_session_open_command_fence(
+fn record_session_open_command_fence_on_operation(
     index: &mut CatalogIndex,
+    operation_id: Uuid,
     ctx: &SessionOpenReadinessContext<'_>,
     opcode: Option<u8>,
     detail: String,
 ) -> Status {
-    let operation_id = Uuid::new_v4();
-    if let Err(err) = record_session_open_readiness_operation(index, operation_id, ctx) {
-        return session_open_recording_failure_status(
-            ctx,
-            None,
-            "record_media_readiness_operation",
-            &err,
-        );
-    }
-    let transition = remanence_state::MediaReadinessTransitionInput {
+    if let Err(err) = record_session_open_mechanical_transition(
+        index,
         operation_id,
-        phase: Some("session_open_immediate_load".to_string()),
-        state: "transport_unknown".to_string(),
-        dirty_scope: Some("drive+tape".to_string()),
-        last_cdb_opcode: opcode,
-        last_sense_raw: None,
-        last_sense_key: None,
-        last_asc: None,
-        last_ascq: None,
-        last_host_status: None,
-        last_driver_status: None,
-        target_status: None,
-        transport_class: Some("unknown".to_string()),
-        cancel_source: None,
-        signal: None,
-        evidence_path: None,
-        last_error_json: Some(session_open_json_detail("detail", detail.as_str())),
-        quarantine_id: Some(session_open_quarantine_id(operation_id)),
-    };
-    if let Err(err) = index.record_media_readiness_transition(transition) {
+        "session_open_immediate_load",
+        "transport_unknown",
+        opcode,
+        Some(detail.clone()),
+    ) {
         return session_open_recording_failure_status(
             ctx,
             Some(operation_id),
@@ -1280,6 +1371,39 @@ fn record_session_open_command_fence(
         "transport_unknown",
         detail.as_str(),
     ))
+}
+
+fn record_session_open_mechanical_transition(
+    index: &mut CatalogIndex,
+    operation_id: Uuid,
+    phase: &str,
+    state: &str,
+    opcode: Option<u8>,
+    detail: Option<String>,
+) -> Result<(), remanence_state::StateError> {
+    index
+        .record_media_readiness_transition(remanence_state::MediaReadinessTransitionInput {
+            operation_id,
+            phase: Some(phase.to_string()),
+            state: state.to_string(),
+            dirty_scope: Some("drive+tape".to_string()),
+            last_cdb_opcode: opcode,
+            last_sense_raw: None,
+            last_sense_key: None,
+            last_asc: None,
+            last_ascq: None,
+            last_host_status: None,
+            last_driver_status: None,
+            target_status: None,
+            transport_class: (state == "transport_unknown").then(|| "unknown".to_string()),
+            cancel_source: None,
+            signal: None,
+            evidence_path: None,
+            last_error_json: detail.map(|value| session_open_json_detail("detail", value.as_str())),
+            quarantine_id: session_open_state_requires_release(state)
+                .then(|| session_open_quarantine_id(operation_id)),
+        })
+        .map(|_| ())
 }
 
 fn record_session_open_readiness_fence(
@@ -1297,31 +1421,19 @@ fn record_session_open_readiness_fence(
             &err,
         );
     }
-    let state = session_open_readiness_state(readiness);
-    let (sense_key, asc, ascq, target_status, transport_class, last_error_json, sense_raw) =
-        session_open_readiness_evidence(readiness);
-    let transition = remanence_state::MediaReadinessTransitionInput {
-        operation_id,
-        phase: Some(phase.to_string()),
-        state: state.to_string(),
-        dirty_scope: Some("drive+tape".to_string()),
-        last_cdb_opcode: Some(0x00),
-        last_sense_raw: sense_raw,
-        last_sense_key: sense_key,
-        last_asc: asc,
-        last_ascq: ascq,
-        last_host_status: None,
-        last_driver_status: None,
-        target_status,
-        transport_class,
-        cancel_source: None,
-        signal: None,
-        evidence_path: None,
-        last_error_json,
-        quarantine_id: session_open_state_requires_release(state)
-            .then(|| session_open_quarantine_id(operation_id)),
-    };
-    if let Err(err) = index.record_media_readiness_transition(transition) {
+    record_session_open_readiness_fence_on_operation(index, operation_id, ctx, phase, readiness)
+}
+
+fn record_session_open_readiness_fence_on_operation(
+    index: &mut CatalogIndex,
+    operation_id: Uuid,
+    ctx: &SessionOpenReadinessContext<'_>,
+    phase: &str,
+    readiness: &MediaReadiness,
+) -> Status {
+    if let Err(err) =
+        record_session_open_readiness_transition(index, operation_id, phase, readiness)
+    {
         return session_open_recording_failure_status(
             ctx,
             Some(operation_id),
@@ -1329,12 +1441,68 @@ fn record_session_open_readiness_fence(
             &err,
         );
     }
+    let state = session_open_readiness_state(readiness);
     Status::failed_precondition(session_open_readiness_error_message(
         ctx,
         operation_id,
         state,
         session_open_readiness_summary(readiness).as_str(),
     ))
+}
+
+fn record_session_open_readiness_transition_on_operation(
+    index: &mut CatalogIndex,
+    operation_id: Uuid,
+    ctx: &SessionOpenReadinessContext<'_>,
+    phase: &str,
+    readiness: &MediaReadiness,
+) -> Result<(), Status> {
+    record_session_open_readiness_transition(index, operation_id, phase, readiness).map_err(|err| {
+        session_open_recording_failure_status(
+            ctx,
+            Some(operation_id),
+            "record_media_readiness_transition",
+            &err,
+        )
+    })
+}
+
+fn record_session_open_readiness_transition(
+    index: &mut CatalogIndex,
+    operation_id: Uuid,
+    phase: &str,
+    readiness: &MediaReadiness,
+) -> Result<(), remanence_state::StateError> {
+    let state = session_open_readiness_state(readiness);
+    let (sense_key, asc, ascq, target_status, transport_class, last_error_json, sense_raw) =
+        session_open_readiness_evidence(readiness);
+    index
+        .record_media_readiness_transition(remanence_state::MediaReadinessTransitionInput {
+            operation_id,
+            phase: Some(phase.to_string()),
+            state: state.to_string(),
+            dirty_scope: Some(if readiness.is_ready() {
+                "none".to_string()
+            } else {
+                "drive+tape".to_string()
+            }),
+            last_cdb_opcode: Some(0x00),
+            last_sense_raw: sense_raw,
+            last_sense_key: sense_key,
+            last_asc: asc,
+            last_ascq: ascq,
+            last_host_status: None,
+            last_driver_status: None,
+            target_status,
+            transport_class,
+            cancel_source: None,
+            signal: None,
+            evidence_path: None,
+            last_error_json,
+            quarantine_id: session_open_state_requires_release(state)
+                .then(|| session_open_quarantine_id(operation_id)),
+        })
+        .map(|_| ())
 }
 
 fn record_session_open_readiness_operation(
@@ -3993,6 +4161,10 @@ mod tests {
             MediaFamily::Lto9OrLater
         ));
         assert!(matches!(
+            session_open_media_family(Some("AOX030LZ")),
+            MediaFamily::Lto9OrLater
+        ));
+        assert!(matches!(
             session_open_media_family(Some("AOX030L8")),
             MediaFamily::Unknown
         ));
@@ -4054,6 +4226,68 @@ mod tests {
         assert_eq!(active[0].last_asc, Some(0x04));
         assert_eq!(active[0].last_ascq, Some(0x01));
         assert!(active[0].quarantine_id.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn session_open_refuses_active_media_readiness_fence_before_drive_probe() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-session-open-admission-")
+            .tempdir()
+            .expect("tempdir");
+        let mut index =
+            CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open test index");
+        let active_operation_id = Uuid::from_u128(0x9100);
+        index
+            .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+                operation_id: active_operation_id,
+                run_id: None,
+                library_serial: "DEC418146K_LL02".to_string(),
+                changer_sg: Some("/dev/sg8".to_string()),
+                drive_element: 0x0100,
+                drive_sg: Some("/dev/sg7".to_string()),
+                drive_serial: Some("DRV_MOVE_OBS".to_string()),
+                barcode: Some("AOX030L9".to_string()),
+                source_slot: Some(0x03eb),
+                media_generation: Some(9),
+                phase: "readiness_poll".to_string(),
+                state: "media_initializing".to_string(),
+                dirty_scope: Some("drive+tape".to_string()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .expect("record active readiness operation");
+        let (mut drive, log) = open_test_drive_with_tur_script("DEC418146K_LL02", vec![None]);
+        let before = log
+            .borrow()
+            .iter()
+            .filter(|cdb| matches!(cdb.first(), Some(0x00 | 0x1b)))
+            .count();
+        let ctx = SessionOpenReadinessContext {
+            action: "open write session",
+            bay: 0x0100,
+            library_serial: "DEC418146K_LL02",
+            barcode: Some("AOX030L9"),
+            source_slot: Some(0x03eb),
+            drive_serial: Some("DRV_MOVE_OBS"),
+            needs_drive_load: true,
+        };
+
+        let status = session_open_short_probe_or_load(&mut index, &mut drive, ctx)
+            .expect_err("active readiness fence must block session-open admission");
+
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("active media-readiness fence"));
+        assert!(status.message().contains(&active_operation_id.to_string()));
+        let after = log
+            .borrow()
+            .iter()
+            .filter(|cdb| matches!(cdb.first(), Some(0x00 | 0x1b)))
+            .count();
+        assert_eq!(
+            after, before,
+            "session-open admission must refuse before TUR or LOAD"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -4145,6 +4379,13 @@ mod tests {
         assert_eq!(
             control_cdbs,
             vec![(0x00, 0x00, 0x00), (0x1b, 0x01, 0x01), (0x00, 0x00, 0x00)]
+        );
+        assert!(
+            index
+                .list_active_media_readiness_operations(Some("DEC418146K_LL02"))
+                .expect("active fences")
+                .is_empty(),
+            "ready session-open probe must not leave an active fence"
         );
     }
 
