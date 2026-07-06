@@ -707,6 +707,7 @@ mod compat_tests {
             drive_bays: vec![DriveBay {
                 element_address: 0x0100,
                 accessible: true,
+                exception: None,
                 installed: Some(InstalledDrive {
                     serial: "DRV_A".into(),
                     identity_source: IdentitySource::DvcidAndInquiry,
@@ -723,6 +724,7 @@ mod compat_tests {
             slots: vec![Slot {
                 element_address: 0x0400,
                 accessible: true,
+                exception: None,
                 full: true,
                 cartridge: Some("TAPE_A".into()),
             }],

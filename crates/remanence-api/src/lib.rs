@@ -5386,6 +5386,7 @@ BCw3Wyv2UWY=
             drive_bays: vec![DriveBay {
                 element_address: 1,
                 accessible: true,
+                exception: None,
                 installed: Some(InstalledDrive {
                     serial: "8031BDC7D1".to_string(),
                     identity_source: IdentitySource::DvcidInline,
@@ -5402,12 +5403,14 @@ BCw3Wyv2UWY=
             slots: vec![Slot {
                 element_address: 0x03e9,
                 accessible: true,
+                exception: None,
                 full: true,
                 cartridge: Some("S30002L9".to_string()),
             }],
             ie_ports: vec![IePort {
                 element_address: 0x10,
                 accessible: true,
+                exception: None,
                 full: false,
                 cartridge: None,
                 import_enabled: true,
@@ -5429,6 +5432,7 @@ BCw3Wyv2UWY=
             .map(|(element_address, drive_serial, sg_path)| DriveBay {
                 element_address: *element_address,
                 accessible: true,
+                exception: None,
                 installed: Some(InstalledDrive {
                     serial: (*drive_serial).to_string(),
                     identity_source: IdentitySource::DvcidAndInquiry,

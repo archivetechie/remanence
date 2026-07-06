@@ -69,9 +69,9 @@ use remanence_format::{
 use remanence_library::DriveHandlePhysicalSource;
 use remanence_library::{
     tape_alert_flag_name, BlockSize, DirtyCause, DiscoveryError, DiscoveryReport, DiscoveryWarning,
-    DriveBay, DriveHandle, DriveHandleSink, DriveHandleSource, FileBlockSink, FileBlockSource,
-    IePort, IoErrorKind, Library, MediaFamily, MediaReadiness, OpenError, Slot, StaticAllowlist,
-    TapeAlerts, TapeConfig, VecBlockSource, WormMediaState,
+    DriveBay, DriveHandle, DriveHandleSink, DriveHandleSource, ElementException, FileBlockSink,
+    FileBlockSource, IePort, IoErrorKind, Library, MediaFamily, MediaReadiness, OpenError, Slot,
+    StaticAllowlist, TapeAlerts, TapeConfig, VecBlockSource, WormMediaState,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -11869,6 +11869,7 @@ fn print_library_json(lib: &Library, include_slots: bool, out: &mut dyn Write) {
                 "element_address": format!("0x{:04x}", bay.element_address),
                 "element_address_raw": bay.element_address,
                 "accessible": bay.accessible,
+                "exception": element_exception_json(bay.exception),
                 "loaded": bay.loaded,
                 "loaded_tape": bay.loaded_tape.as_deref(),
                 "source_slot": bay.source_slot.map(|slot| format!("0x{slot:04x}")),
@@ -11893,6 +11894,7 @@ fn print_library_json(lib: &Library, include_slots: bool, out: &mut dyn Write) {
                     "element_address": format!("0x{:04x}", slot.element_address),
                     "element_address_raw": slot.element_address,
                     "accessible": slot.accessible,
+                    "exception": element_exception_json(slot.exception),
                     "full": slot.full,
                     "cartridge": slot.cartridge.as_deref(),
                     "cleaning": slot.cartridge.as_deref().is_some_and(|tag| tag.starts_with("CLN")),
@@ -11908,6 +11910,7 @@ fn print_library_json(lib: &Library, include_slots: bool, out: &mut dyn Write) {
                 "element_address": format!("0x{:04x}", ie.element_address),
                 "element_address_raw": ie.element_address,
                 "accessible": ie.accessible,
+                "exception": element_exception_json(ie.exception),
                 "full": ie.full,
                 "cartridge": ie.cartridge.as_deref(),
                 "import_enabled": ie.import_enabled,
@@ -11933,6 +11936,28 @@ fn print_library_json(lib: &Library, include_slots: bool, out: &mut dyn Write) {
     });
     let _ = serde_json::to_writer_pretty(&mut *out, &payload);
     let _ = writeln!(out);
+}
+
+fn element_exception_json(exception: Option<ElementException>) -> Option<Value> {
+    exception.map(|exception| {
+        json!({
+            "asc": format!("0x{:02x}", exception.asc),
+            "asc_raw": exception.asc,
+            "ascq": format!("0x{:02x}", exception.ascq),
+            "ascq_raw": exception.ascq,
+        })
+    })
+}
+
+fn element_exception_suffix(exception: Option<ElementException>) -> String {
+    exception
+        .map(|exception| {
+            format!(
+                "   exception ASC/ASCQ=0x{:02x}/0x{:02x}",
+                exception.asc, exception.ascq
+            )
+        })
+        .unwrap_or_default()
 }
 
 fn print_library(lib: &Library, report: &DiscoveryReport, out: &mut dyn Write) {
@@ -11997,17 +12022,19 @@ fn print_library(lib: &Library, report: &DiscoveryReport, out: &mut dyn Write) {
                         .as_ref()
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|| "(no /dev/sgN)".to_string());
+                    let exception = element_exception_suffix(bay.exception);
                     let _ = writeln!(
                         out,
-                        "    [0x{addr:04x}] {dv} {dp} {dr}  {dsg}  serial {serial}",
+                        "    [0x{addr:04x}] {dv} {dp} {dr}  {dsg}  serial {serial}{exception}",
                         addr = bay.element_address,
                         serial = installed.serial,
                     );
                 }
                 None => {
+                    let exception = element_exception_suffix(bay.exception);
                     let _ = writeln!(
                         out,
-                        "    [0x{addr:04x}] (no identity — see warnings)",
+                        "    [0x{addr:04x}] (no identity — see warnings){exception}",
                         addr = bay.element_address,
                     );
                 }
@@ -12044,6 +12071,7 @@ fn print_slots(lib: &Library, out: &mut dyn Write) {
 }
 
 fn print_slot(slot: &Slot, out: &mut dyn Write) {
+    let exception = element_exception_suffix(slot.exception);
     if slot.full {
         let tag = slot.cartridge.as_deref().unwrap_or("(no voltag)");
         let suffix = if tag.starts_with("CLN") {
@@ -12053,15 +12081,16 @@ fn print_slot(slot: &Slot, out: &mut dyn Write) {
         };
         let _ = writeln!(
             out,
-            "  [0x{:04x}] full   {tag}{suffix}",
+            "  [0x{:04x}] full   {tag}{suffix}{exception}",
             slot.element_address
         );
     } else {
-        let _ = writeln!(out, "  [0x{:04x}] empty", slot.element_address);
+        let _ = writeln!(out, "  [0x{:04x}] empty{exception}", slot.element_address);
     }
 }
 
 fn print_ie(ie: &IePort, out: &mut dyn Write) {
+    let exception = element_exception_suffix(ie.exception);
     let state = if ie.full {
         format!(
             "full   {}",
@@ -12074,7 +12103,7 @@ fn print_ie(ie: &IePort, out: &mut dyn Write) {
     let out_ = if ie.export_enabled { "out" } else { "—" };
     let _ = writeln!(
         out,
-        "    [0x{:04x}] {state}   (import:{in_} export:{out_})",
+        "    [0x{:04x}] {state}   (import:{in_} export:{out_}){exception}",
         ie.element_address
     );
 }
@@ -16683,6 +16712,7 @@ blob Project/Render Files/
         lib.drive_bays = vec![DriveBay {
             element_address: 1,
             accessible: true,
+            exception: None,
             installed: None,
             loaded: false,
             loaded_tape: None,
@@ -16692,12 +16722,14 @@ blob Project/Render Files/
             Slot {
                 element_address: 1000,
                 accessible: true,
+                exception: None,
                 full: true,
                 cartridge: Some("L00001".into()),
             },
             Slot {
                 element_address: 1001,
                 accessible: true,
+                exception: None,
                 full: false,
                 cartridge: None,
             },
@@ -16720,6 +16752,7 @@ blob Project/Render Files/
         lib.drive_bays = vec![DriveBay {
             element_address: 1,
             accessible: true,
+            exception: None,
             installed: None,
             loaded: false,
             loaded_tape: None,
@@ -16728,6 +16761,7 @@ blob Project/Render Files/
         lib.slots = vec![Slot {
             element_address: 1000,
             accessible: true,
+            exception: None,
             full: true,
             cartridge: Some("L00001".into()),
         }];
@@ -16769,6 +16803,7 @@ blob Project/Render Files/
             DriveBay {
                 element_address: 1,
                 accessible: true,
+                exception: None,
                 installed: Some(InstalledDrive {
                     serial: "DRIVE_AAA".into(),
                     identity_source: IdentitySource::DvcidInline,
@@ -16785,6 +16820,7 @@ blob Project/Render Files/
             DriveBay {
                 element_address: 2,
                 accessible: true,
+                exception: None,
                 installed: None,
                 loaded: false,
                 loaded_tape: None,
@@ -16828,18 +16864,21 @@ blob Project/Render Files/
             Slot {
                 element_address: 0x03e9,
                 accessible: true,
+                exception: None,
                 full: true,
                 cartridge: Some("CLNU01L9".into()),
             },
             Slot {
                 element_address: 0x03ea,
                 accessible: true,
+                exception: None,
                 full: true,
                 cartridge: Some("S20001L9".into()),
             },
             Slot {
                 element_address: 0x03eb,
                 accessible: true,
+                exception: None,
                 full: false,
                 cartridge: None,
             },
@@ -16855,6 +16894,196 @@ blob Project/Render Files/
         assert!(out.contains("[0x03ea] full   S20001L9"));
         assert!(!out.contains("[0x03ea] full   S20001L9   (cleaning)"));
         assert!(out.contains("[0x03eb] empty"));
+    }
+
+    #[test]
+    fn library_json_exposes_element_exception_evidence() {
+        let mut lib = fake_library("LIB_EXCEPTION_JSON");
+        lib.drive_bays = vec![
+            DriveBay {
+                element_address: 1,
+                accessible: false,
+                exception: Some(ElementException {
+                    asc: 0x04,
+                    ascq: 0x01,
+                }),
+                installed: Some(InstalledDrive {
+                    serial: "DRIVE_AAA".into(),
+                    identity_source: IdentitySource::DvcidInline,
+                    vendor: Some("HPE".into()),
+                    product: Some("Ultrium 9-SCSI".into()),
+                    revision: Some("HH90".into()),
+                    sg_path: Some(PathBuf::from("/dev/sg0")),
+                    sysfs_path: None,
+                }),
+                loaded: true,
+                loaded_tape: Some("AOX030L9".into()),
+                source_slot: Some(0x03eb),
+            },
+            DriveBay {
+                element_address: 2,
+                accessible: true,
+                exception: None,
+                installed: None,
+                loaded: false,
+                loaded_tape: None,
+                source_slot: None,
+            },
+        ];
+        lib.slots = vec![
+            Slot {
+                element_address: 0x03e9,
+                accessible: false,
+                exception: Some(ElementException {
+                    asc: 0x3b,
+                    ascq: 0x12,
+                }),
+                full: true,
+                cartridge: Some("AOX031L9".into()),
+            },
+            Slot {
+                element_address: 0x03ea,
+                accessible: true,
+                exception: None,
+                full: false,
+                cartridge: None,
+            },
+        ];
+        lib.ie_ports = vec![IePort {
+            element_address: 0x0010,
+            accessible: false,
+            exception: Some(ElementException {
+                asc: 0x00,
+                ascq: 0x00,
+            }),
+            full: false,
+            cartridge: None,
+            import_enabled: true,
+            export_enabled: true,
+        }];
+        let report = DiscoveryReport {
+            libraries: vec![lib],
+            warnings: vec![],
+        };
+
+        let (code, out, err) = invoke(
+            &["rem", "library", "LIB_EXCEPTION_JSON", "--json", "--slots"],
+            Ok(report),
+        );
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert_eq!(err, "");
+        let payload: Value = serde_json::from_str(out.trim()).expect("json");
+        assert_eq!(payload["drives"][0]["exception"]["asc"], "0x04");
+        assert_eq!(payload["drives"][0]["exception"]["asc_raw"], 0x04);
+        assert_eq!(payload["drives"][0]["exception"]["ascq"], "0x01");
+        assert_eq!(payload["drives"][0]["exception"]["ascq_raw"], 0x01);
+        assert!(payload["drives"][1]["exception"].is_null());
+        assert_eq!(payload["slots"][0]["exception"]["asc"], "0x3b");
+        assert_eq!(payload["slots"][0]["exception"]["asc_raw"], 0x3b);
+        assert_eq!(payload["slots"][0]["exception"]["ascq"], "0x12");
+        assert_eq!(payload["slots"][0]["exception"]["ascq_raw"], 0x12);
+        assert!(payload["slots"][1]["exception"].is_null());
+        assert_eq!(payload["ie_ports"][0]["exception"]["asc"], "0x00");
+        assert_eq!(payload["ie_ports"][0]["exception"]["asc_raw"], 0x00);
+        assert_eq!(payload["ie_ports"][0]["exception"]["ascq"], "0x00");
+        assert_eq!(payload["ie_ports"][0]["exception"]["ascq_raw"], 0x00);
+    }
+
+    #[test]
+    fn library_human_output_prints_element_exception_evidence() {
+        let mut lib = fake_library("LIB_EXCEPTION_TEXT");
+        lib.drive_bays = vec![
+            DriveBay {
+                element_address: 1,
+                accessible: false,
+                exception: Some(ElementException {
+                    asc: 0x04,
+                    ascq: 0x01,
+                }),
+                installed: Some(InstalledDrive {
+                    serial: "DRIVE_AAA".into(),
+                    identity_source: IdentitySource::DvcidInline,
+                    vendor: Some("HPE".into()),
+                    product: Some("Ultrium 9-SCSI".into()),
+                    revision: Some("HH90".into()),
+                    sg_path: Some(PathBuf::from("/dev/sg0")),
+                    sysfs_path: None,
+                }),
+                loaded: true,
+                loaded_tape: Some("AOX030L9".into()),
+                source_slot: Some(0x03eb),
+            },
+            DriveBay {
+                element_address: 2,
+                accessible: false,
+                exception: Some(ElementException {
+                    asc: 0x3b,
+                    ascq: 0x12,
+                }),
+                installed: None,
+                loaded: false,
+                loaded_tape: None,
+                source_slot: None,
+            },
+        ];
+        lib.slots = vec![
+            Slot {
+                element_address: 0x03e9,
+                accessible: false,
+                exception: Some(ElementException {
+                    asc: 0x28,
+                    ascq: 0x00,
+                }),
+                full: true,
+                cartridge: Some("AOX031L9".into()),
+            },
+            Slot {
+                element_address: 0x03ea,
+                accessible: false,
+                exception: Some(ElementException {
+                    asc: 0x00,
+                    ascq: 0x00,
+                }),
+                full: false,
+                cartridge: None,
+            },
+        ];
+        lib.ie_ports = vec![IePort {
+            element_address: 0x0010,
+            accessible: false,
+            exception: Some(ElementException {
+                asc: 0x04,
+                ascq: 0x07,
+            }),
+            full: false,
+            cartridge: None,
+            import_enabled: true,
+            export_enabled: true,
+        }];
+        let report = DiscoveryReport {
+            libraries: vec![lib],
+            warnings: vec![],
+        };
+
+        let (code, out, err) = invoke(
+            &["rem", "library", "LIB_EXCEPTION_TEXT", "--slots"],
+            Ok(report),
+        );
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert_eq!(err, "");
+        assert!(out.contains(
+            "[0x0001] HPE Ultrium 9-SCSI (HH90)  /dev/sg0  serial DRIVE_AAA   exception ASC/ASCQ=0x04/0x01"
+        ));
+        assert!(
+            out.contains("[0x0002] (no identity — see warnings)   exception ASC/ASCQ=0x3b/0x12")
+        );
+        assert!(out.contains("[0x03e9] full   AOX031L9   exception ASC/ASCQ=0x28/0x00"));
+        assert!(out.contains("[0x03ea] empty   exception ASC/ASCQ=0x00/0x00"));
+        assert!(
+            out.contains("[0x0010] empty   (import:in export:out)   exception ASC/ASCQ=0x04/0x07")
+        );
     }
 
     #[test]

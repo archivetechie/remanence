@@ -502,6 +502,7 @@ mod tests {
                 DriveBay {
                     element_address: 0x0100,
                     accessible: true,
+                    exception: None,
                     installed: Some(InstalledDrive {
                         serial: "DRV_A".into(),
                         identity_source: IdentitySource::DvcidAndInquiry,
@@ -518,6 +519,7 @@ mod tests {
                 DriveBay {
                     element_address: 0x0101,
                     accessible: true,
+                    exception: None,
                     installed: Some(InstalledDrive {
                         serial: "DRV_B".into(),
                         identity_source: IdentitySource::DvcidAndInquiry,
@@ -536,12 +538,14 @@ mod tests {
                 Slot {
                     element_address: 0x0400,
                     accessible: true,
+                    exception: None,
                     full: true,
                     cartridge: Some("TAPE_A".into()),
                 },
                 Slot {
                     element_address: 0x0401,
                     accessible: true,
+                    exception: None,
                     full: false,
                     cartridge: None,
                 },
@@ -549,6 +553,7 @@ mod tests {
             ie_ports: vec![IePort {
                 element_address: 0x0300,
                 accessible: true,
+                exception: None,
                 full: false,
                 cartridge: None,
                 import_enabled: true,

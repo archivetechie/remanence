@@ -1623,6 +1623,7 @@ mod tests {
         DriveBay {
             element_address: addr,
             accessible: true,
+            exception: None,
             installed: Some(InstalledDrive {
                 serial: "DRV_UNIT".to_string(),
                 identity_source: IdentitySource::DvcidAndInquiry,
@@ -1642,6 +1643,7 @@ mod tests {
         DriveBay {
             element_address: addr,
             accessible: true,
+            exception: None,
             installed: Some(InstalledDrive {
                 serial: "DRV_UNIT".to_string(),
                 identity_source: IdentitySource::DvcidInline,
@@ -1664,6 +1666,7 @@ mod tests {
             vec![remanence_library::Slot {
                 element_address: 0x0400,
                 accessible: true,
+                exception: None,
                 full: true,
                 cartridge: Some("RMN001L9".to_string()),
             }],
@@ -1692,6 +1695,7 @@ mod tests {
             vec![remanence_library::Slot {
                 element_address: 0x0400,
                 accessible: true,
+                exception: None,
                 full: true,
                 cartridge: Some("OTHER001L9".to_string()),
             }],
@@ -1707,6 +1711,7 @@ mod tests {
             vec![remanence_library::Slot {
                 element_address: 0x0400,
                 accessible: true,
+                exception: None,
                 full: true,
                 cartridge: Some("RMN001L9".to_string()),
             }],

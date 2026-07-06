@@ -961,8 +961,8 @@ mod tests {
 
     use remanence_library::scsi::{DeviceType, Inquiry};
     use remanence_library::{
-        DiscoveryReport, DriveBay, ElementLayout, IdentitySource, IePort, InstalledDrive, Library,
-        Slot,
+        DiscoveryReport, DriveBay, ElementException, ElementLayout, IdentitySource, IePort,
+        InstalledDrive, Library, Slot,
     };
     use remanence_state::{DriveObservationInput, FileAuditLog};
 
@@ -1002,6 +1002,7 @@ mod tests {
             drive_bays: vec![DriveBay {
                 element_address: 1,
                 accessible: true,
+                exception: None,
                 installed: Some(InstalledDrive {
                     serial: "8031BDC7D1".to_string(),
                     identity_source: IdentitySource::DvcidInline,
@@ -1018,12 +1019,14 @@ mod tests {
             slots: vec![Slot {
                 element_address: 0x03e9,
                 accessible: true,
+                exception: None,
                 full: true,
                 cartridge: Some("CLNU01L9".to_string()),
             }],
             ie_ports: vec![IePort {
                 element_address: 0x10,
                 accessible: true,
+                exception: None,
                 full: false,
                 cartridge: None,
                 import_enabled: true,
@@ -1109,6 +1112,7 @@ mod tests {
         let bay = |installed: Option<InstalledDrive>, loaded: bool| DriveBay {
             element_address: 1,
             accessible: true,
+            exception: None,
             installed,
             loaded,
             loaded_tape: None,
@@ -1224,6 +1228,40 @@ mod tests {
             pb::drive::Status::DriveStatusFenced as i32
         );
         assert!(state.drives[0].fenced);
+    }
+
+    #[test]
+    fn project_library_state_does_not_publish_element_exception_fields() {
+        let mut library = mk_library();
+        library.drive_bays[0].exception = Some(ElementException {
+            asc: 0x04,
+            ascq: 0x01,
+        });
+        library.slots[0].exception = Some(ElementException {
+            asc: 0x3b,
+            ascq: 0x12,
+        });
+        library.ie_ports[0].exception = Some(ElementException {
+            asc: 0x00,
+            ascq: 0x00,
+        });
+
+        let state = project_library_state(
+            &library,
+            &OffsetDateTime::UNIX_EPOCH,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+
+        let debug = format!("{state:?}");
+        assert!(
+            !debug.to_ascii_lowercase().contains("exception"),
+            "daemon proto state must not expose RES exception evidence: {debug}"
+        );
+        assert_eq!(state.drives[0].element_address, 1);
+        assert_eq!(state.slots[0].element_address, 0x03e9);
+        assert_eq!(state.import_export_ports[0].element_address, 0x10);
     }
 
     #[tokio::test]
