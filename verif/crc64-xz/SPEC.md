@@ -21,6 +21,8 @@ Section 5.1:
 - otherwise return `crc >> 1`
 
 The Lean proof also proves the equivalent branch-free mask form of this step.
+It additionally proves the Aeneas-extracted `crc64_xz_bit_step` function
+returns exactly this bit-vector recurrence for every `u64` input.
 
 ## X2 -- byte table entry
 

@@ -2,9 +2,11 @@
 
    This Lean file proves the arithmetic kernel used by the shared
    `remanence-crc` implementation: the reflected bit step, byte table entry,
-   update fold, and selected normative vectors. The Rust `drift_guard` test ties
-   this proof-facing model back to production `crates/remanence-crc/src/lib.rs`.
-   It does not prove every sidecar/audit call site that consumes the CRC. -/
+   update fold, selected normative vectors, and the extracted Aeneas bit-step
+   function's equivalence to the bit-vector spec. The Rust `drift_guard` test
+   ties this proof-facing model back to production
+   `crates/remanence-crc/src/lib.rs`. It does not prove every sidecar/audit call
+   site that consumes the CRC. -/
 import Std.Tactic.BVDecide
 import Crc64Xz.Funs
 
@@ -91,6 +93,32 @@ theorem extracted_reflected_poly_constant :
     CRC64_XZ_REFLECTED_POLY = 0xC96C5795D7870F42#u64 := by
   unfold CRC64_XZ_REFLECTED_POLY
   rfl
+
+theorem u64_shr_one_ok (x : Std.U64) :
+    x >>> 1#i32 = ok (⟨x.bv >>> 1⟩ : Std.U64) := by
+  change UScalar.shiftRight_IScalar x 1#i32 = ok (⟨x.bv >>> 1⟩ : Std.U64)
+  unfold UScalar.shiftRight_IScalar UScalar.shiftRight IScalar.toNat IScalar.val
+  simp
+
+def bitStepStd (crc : Std.U64) : Std.U64 :=
+  ⟨bitStep crc.bv⟩
+
+theorem generated_bit_step_matches_spec (crc : Std.U64) :
+    crc64_xz_bit_step crc = ok (bitStepStd crc) := by
+  unfold crc64_xz_bit_step bitStepStd bitStep CRC64_XZ_REFLECTED_POLY ReflectedPoly
+  by_cases h : crc &&& 1#u64 = 1#u64
+  · simp [h, u64_shr_one_ok, lift]
+    have hbv : crc.bv &&& 1#64 = 1#64 := by
+      exact congrArg UScalar.bv h
+    simp [hbv]
+    apply U64.bv_eq_imp_eq
+    simp
+  · simp [h, u64_shr_one_ok, lift]
+    intro hbv
+    exfalso
+    apply h
+    apply U64.bv_eq_imp_eq
+    exact hbv
 
 def resultU64Eq (result : Result Std.U64) (expected : Std.U64) : Bool :=
   match result with
