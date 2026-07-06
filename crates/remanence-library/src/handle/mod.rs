@@ -1451,6 +1451,7 @@ impl DriveHandle {
     pub fn unload(&mut self) -> Result<(), DriveOpError> {
         self.issue_load_unload(
             /* load */ false,
+            /* immed */ false,
             AuditOp::DriveUnload {
                 bay: self.bay_address,
             },
@@ -1464,6 +1465,20 @@ impl DriveHandle {
     pub fn load(&mut self) -> Result<(), DriveOpError> {
         self.issue_load_unload(
             /* load */ true,
+            /* immed */ false,
+            AuditOp::DriveLoad {
+                bay: self.bay_address,
+            },
+        )
+    }
+
+    /// Issue SSC `LOAD` with `IMMED=1`. Readiness-aware workflows use this
+    /// after a changer MOVE and then poll TEST UNIT READY, instead of blocking
+    /// inside the drive LOAD while LTO-9 media calibrates.
+    pub fn load_immediate(&mut self) -> Result<(), DriveOpError> {
+        self.issue_load_unload(
+            /* load */ true,
+            /* immed */ true,
             AuditOp::DriveLoad {
                 bay: self.bay_address,
             },
@@ -1474,19 +1489,24 @@ impl DriveHandle {
     /// `LibraryHandle::unload` tag the audit events with the outer
     /// op context (`AuditOp::Unload { bay, dst }`).
     pub(crate) fn unload_as(&mut self, op: AuditOp) -> Result<(), DriveOpError> {
-        self.issue_load_unload(/* load */ false, op)
+        self.issue_load_unload(/* load */ false, /* immed */ false, op)
     }
 
     /// Internal: same as [`Self::load`] but lets composed
     /// `LibraryHandle::load` tag the audit events with the outer op
     /// context (`AuditOp::Load { slot, bay }`).
     pub(crate) fn load_as(&mut self, op: AuditOp) -> Result<(), DriveOpError> {
-        self.issue_load_unload(/* load */ true, op)
+        self.issue_load_unload(/* load */ true, /* immed */ false, op)
     }
 
-    fn issue_load_unload(&mut self, load: bool, op: AuditOp) -> Result<(), DriveOpError> {
+    fn issue_load_unload(
+        &mut self,
+        load: bool,
+        immed: bool,
+        op: AuditOp,
+    ) -> Result<(), DriveOpError> {
         use remanence_scsi::load_unload as lu;
-        let cdb = lu::build_cdb(load);
+        let cdb = lu::build_cdb_with_immed(load, immed);
 
         fire_audit(
             &mut lock_drive_shared(&self.shared).audit_hook,
