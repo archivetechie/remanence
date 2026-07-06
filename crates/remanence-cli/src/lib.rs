@@ -6095,6 +6095,8 @@ struct MediaReadinessPoll {
     timed_out: bool,
 }
 
+#[cfg(all(test, target_os = "linux"))]
+#[allow(dead_code)]
 enum MediaReadinessPollEvent<'a> {
     Poll(&'a MediaReadinessPoll),
     Signal(&'a str),
@@ -6322,28 +6324,43 @@ fn run_tape_wait_ready_hardware(
         message,
         exit_code: 130,
     })?;
-    let poll = poll_drive_media_readiness(
+    record_media_readiness_signal_if_requested(
+        catalog,
+        operation_id,
+        "before_wait_ready_tur",
+        || signal_guard.requested_signal_name(),
+    )
+    .map_err(|message| TapeWaitReadyFailure {
+        message,
+        exit_code: 130,
+    })?;
+    let initial = drive.probe_media_readiness(family);
+    let initial_poll =
+        poll_already_observed_media_readiness(initial, "wait_ready_tur", operation_id, catalog)
+            .map_err(tape_wait_ready_failure_from_poll_error)?;
+    record_media_readiness_signal_if_requested(
+        catalog,
+        operation_id,
+        "after_wait_ready_tur",
+        || signal_guard.requested_signal_name(),
+    )
+    .map_err(|message| TapeWaitReadyFailure {
+        message,
+        exit_code: 130,
+    })?;
+    let poll = poll_media_readiness_after_initial_probe(
         &mut drive,
         family,
-        args.wait,
-        args.timeout,
-        args.poll,
-        || signal_guard.requested_signal_name(),
-        |event| match event {
-            MediaReadinessPollEvent::Poll(poll) => record_media_readiness_poll_transition(
-                catalog,
-                operation_id,
-                "readiness_poll",
-                poll,
-            )
-            .map_err(|error| format!("record media readiness transition: {error}")),
-            MediaReadinessPollEvent::Signal(signal) => record_media_readiness_signal_transition(
-                catalog,
-                operation_id,
-                "readiness_poll",
-                signal,
-            ),
+        operation_id,
+        catalog,
+        drive_element,
+        MediaReadinessInitialProbeInput {
+            initial_poll,
+            wait: args.wait,
+            timeout: args.timeout,
+            poll_interval: args.poll,
         },
+        || signal_guard.requested_signal_name(),
     )
     .map_err(tape_wait_ready_failure_from_poll_error)?;
     Ok(TapeWaitReadyResult {
@@ -6512,7 +6529,7 @@ fn validate_wait_ready_resume_binding(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn poll_drive_media_readiness(
     drive: &mut DriveHandle,
     family: MediaFamily,
@@ -6621,32 +6638,157 @@ fn poll_already_observed_media_readiness(
 }
 
 #[cfg(target_os = "linux")]
-fn poll_drive_media_readiness_for_init<S: TapeInitStateOps>(
+struct MediaReadinessInitialProbeInput {
+    initial_poll: MediaReadinessPoll,
+    wait: bool,
+    timeout: StdDuration,
+    poll_interval: StdDuration,
+}
+
+#[cfg(target_os = "linux")]
+fn poll_media_readiness_after_initial_probe<S: TapeInitStateOps>(
     drive: &mut DriveHandle,
     family: MediaFamily,
     operation_id: Uuid,
     state: &mut S,
-    signal: impl FnMut() -> Option<&'static str>,
+    drive_element: u16,
+    input: MediaReadinessInitialProbeInput,
+    mut signal: impl FnMut() -> Option<&'static str>,
 ) -> Result<MediaReadinessPoll, String> {
-    poll_drive_media_readiness(
-        drive,
-        family,
-        true,
-        MEDIA_CONDITIONING_TIMEOUT,
-        MEDIA_CONDITIONING_STEADY_POLL,
-        signal,
-        |event| match event {
-            MediaReadinessPollEvent::Poll(poll) => state.record_media_readiness_transition(
-                media_readiness_transition_input(operation_id, "readiness_poll", poll),
-            ),
-            MediaReadinessPollEvent::Signal(signal) => record_media_readiness_signal_transition(
+    const SIGNAL_SLEEP_SLICE: StdDuration = StdDuration::from_millis(250);
+
+    let started = StdInstant::now();
+    let mut attempts = input.initial_poll.attempts;
+    let mut current = Some(input.initial_poll);
+    let mut unit_attention_seen = BTreeSet::<(u8, u8)>::new();
+    let mut conditional_load_sent = false;
+
+    loop {
+        let poll = if let Some(poll) = current.take() {
+            poll
+        } else {
+            if let Some(signal_name) = signal() {
+                record_media_readiness_signal_transition(
+                    state,
+                    operation_id,
+                    "readiness_poll",
+                    signal_name,
+                )?;
+                return Err(format!(
+                    "media readiness interrupted by {signal_name}; recorded aborted_unknown fence"
+                ));
+            }
+            attempts = attempts.saturating_add(1);
+            let mut readiness = drive.probe_media_readiness(family);
+            terminalize_repeated_unit_attention(&mut readiness, &mut unit_attention_seen);
+            let can_conditionally_load = input.wait
+                && !conditional_load_sent
+                && readiness_requires_conditional_load(&readiness);
+            let terminal = readiness.is_ready()
+                || !input.wait
+                || !(readiness.is_retryable_wait() || can_conditionally_load);
+            let elapsed = started.elapsed();
+            let timed_out = !terminal && elapsed >= input.timeout;
+            let poll = MediaReadinessPoll {
+                readiness,
+                attempts,
+                timed_out,
+            };
+            state.record_media_readiness_transition(media_readiness_transition_input(
+                operation_id,
+                "readiness_poll",
+                &poll,
+            ))?;
+            poll
+        };
+
+        if let Some(signal_name) = signal() {
+            record_media_readiness_signal_transition(
                 state,
                 operation_id,
                 "readiness_poll",
-                signal,
-            ),
-        },
-    )
+                signal_name,
+            )?;
+            return Err(format!(
+                "media readiness interrupted by {signal_name}; recorded aborted_unknown fence"
+            ));
+        }
+
+        if input.wait
+            && !conditional_load_sent
+            && readiness_requires_conditional_load(&poll.readiness)
+        {
+            conditional_load_sent = true;
+            record_media_readiness_signal_if_requested(
+                state,
+                operation_id,
+                "before_conditional_immediate_load",
+                &mut signal,
+            )?;
+            state.record_media_readiness_transition(media_readiness_mechanical_transition(
+                operation_id,
+                "conditional_immediate_load",
+                "pre_ready_loading",
+                Some(0x1b),
+                None,
+            ))?;
+            if let Err(error) = drive.load_immediate() {
+                if let Some(signal_name) = record_media_readiness_signal_or_mechanical_failure(
+                    state,
+                    operation_id,
+                    "conditional_immediate_load",
+                    "transport_unknown",
+                    Some(0x1b),
+                    &error.to_string(),
+                    signal(),
+                )? {
+                    return Err(signal_name);
+                }
+                return Err(format!(
+                    "immediate drive load 0x{drive_element:04x}: {error}"
+                ));
+            }
+            record_media_readiness_signal_if_requested(
+                state,
+                operation_id,
+                "after_conditional_immediate_load",
+                &mut signal,
+            )?;
+            continue;
+        }
+
+        let terminal = poll.readiness.is_ready()
+            || !input.wait
+            || !poll.readiness.is_retryable_wait()
+            || poll.timed_out;
+        if terminal {
+            return Ok(poll);
+        }
+
+        let elapsed = started.elapsed();
+        let sleep_for = if input.poll_interval == MEDIA_CONDITIONING_STEADY_POLL {
+            media_conditioning_poll_interval(elapsed)
+        } else {
+            input.poll_interval
+        };
+        let mut remaining = std::cmp::min(sleep_for, input.timeout.saturating_sub(elapsed));
+        while remaining > StdDuration::ZERO {
+            if let Some(signal_name) = signal() {
+                record_media_readiness_signal_transition(
+                    state,
+                    operation_id,
+                    "readiness_poll",
+                    signal_name,
+                )?;
+                return Err(format!(
+                    "media readiness interrupted by {signal_name}; recorded aborted_unknown fence"
+                ));
+            }
+            let chunk = std::cmp::min(SIGNAL_SLEEP_SLICE, remaining);
+            std::thread::sleep(chunk);
+            remaining = remaining.saturating_sub(chunk);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -6657,50 +6799,22 @@ fn poll_tape_init_readiness_after_initial_probe<S: TapeInitStateOps>(
     state: &mut S,
     drive_element: u16,
     initial_poll: MediaReadinessPoll,
-    mut signal: impl FnMut() -> Option<&'static str>,
+    signal: impl FnMut() -> Option<&'static str>,
 ) -> Result<MediaReadinessPoll, String> {
-    if readiness_requires_conditional_load(&initial_poll.readiness) {
-        record_media_readiness_signal_if_requested(
-            state,
-            operation_id,
-            "before_conditional_immediate_load",
-            &mut signal,
-        )?;
-        state.record_media_readiness_transition(media_readiness_mechanical_transition(
-            operation_id,
-            "conditional_immediate_load",
-            "pre_ready_loading",
-            Some(0x1b),
-            None,
-        ))?;
-        if let Err(error) = drive.load_immediate() {
-            if let Some(signal_name) = record_media_readiness_signal_or_mechanical_failure(
-                state,
-                operation_id,
-                "conditional_immediate_load",
-                "transport_unknown",
-                Some(0x1b),
-                &error.to_string(),
-                signal(),
-            )? {
-                return Err(signal_name);
-            }
-            return Err(format!(
-                "immediate drive load 0x{drive_element:04x}: {error}"
-            ));
-        }
-        record_media_readiness_signal_if_requested(
-            state,
-            operation_id,
-            "after_conditional_immediate_load",
-            &mut signal,
-        )?;
-        poll_drive_media_readiness_for_init(drive, family, operation_id, state, signal)
-    } else if initial_poll.readiness.is_ready() || !initial_poll.readiness.is_retryable_wait() {
-        Ok(initial_poll)
-    } else {
-        poll_drive_media_readiness_for_init(drive, family, operation_id, state, signal)
-    }
+    poll_media_readiness_after_initial_probe(
+        drive,
+        family,
+        operation_id,
+        state,
+        drive_element,
+        MediaReadinessInitialProbeInput {
+            initial_poll,
+            wait: true,
+            timeout: MEDIA_CONDITIONING_TIMEOUT,
+            poll_interval: MEDIA_CONDITIONING_STEADY_POLL,
+        },
+        signal,
+    )
 }
 
 fn deadline_after(timeout: StdDuration) -> Option<String> {
@@ -6708,21 +6822,6 @@ fn deadline_after(timeout: StdDuration) -> Option<String> {
     OffsetDateTime::now_utc()
         .checked_add(Duration::seconds(seconds))
         .and_then(|deadline| deadline.format(&Rfc3339).ok())
-}
-
-fn record_media_readiness_poll_transition(
-    catalog: &mut remanence_state::CatalogIndex,
-    operation_id: Uuid,
-    phase: &str,
-    poll: &MediaReadinessPoll,
-) -> Result<(), remanence_state::StateError> {
-    catalog
-        .record_media_readiness_transition(media_readiness_transition_input(
-            operation_id,
-            phase,
-            poll,
-        ))
-        .map(|_| ())
 }
 
 fn media_readiness_transition_input(
