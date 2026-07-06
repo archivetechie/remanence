@@ -15,7 +15,7 @@ set_option maxRecDepth 2048
 namespace RaoManifest
 
 /-- [rao_manifest_verif::RaoManifestError]
-    Source: 'src/lib.rs', lines 47:0-52:1
+    Source: 'src/lib.rs', lines 85:0-90:1
     Visibility: public -/
 @[discriminant isize]
 inductive RaoManifestError where
@@ -25,7 +25,7 @@ inductive RaoManifestError where
 | MissingRequiredManifestField : RaoManifestError
 
 /-- [rao_manifest_verif::DigestWords]
-    Source: 'src/lib.rs', lines 55:0-60:1
+    Source: 'src/lib.rs', lines 93:0-98:1
     Visibility: public -/
 structure DigestWords where
   w0 : Std.U64
@@ -34,7 +34,7 @@ structure DigestWords where
   w3 : Std.U64
 
 /-- [rao_manifest_verif::RegularFileCore]
-    Source: 'src/lib.rs', lines 63:0-71:1
+    Source: 'src/lib.rs', lines 101:0-109:1
     Visibility: public -/
 structure RegularFileCore where
   path_id : Std.U64
@@ -46,7 +46,7 @@ structure RegularFileCore where
   executable_tag : Std.U8
 
 /-- [rao_manifest_verif::ManifestCore]
-    Source: 'src/lib.rs', lines 74:0-79:1
+    Source: 'src/lib.rs', lines 112:0-117:1
     Visibility: public -/
 structure ManifestCore where
   object_id : Std.U64
@@ -55,7 +55,7 @@ structure ManifestCore where
   file : RegularFileCore
 
 /-- [rao_manifest_verif::RegularFileWireCore]
-    Source: 'src/lib.rs', lines 82:0-102:1
+    Source: 'src/lib.rs', lines 120:0-140:1
     Visibility: public -/
 structure RegularFileWireCore where
   map_len : Std.U64
@@ -79,7 +79,7 @@ structure RegularFileWireCore where
   metadata_preservation_data_empty : Bool
 
 /-- [rao_manifest_verif::ManifestWireCore]
-    Source: 'src/lib.rs', lines 105:0-123:1
+    Source: 'src/lib.rs', lines 143:0-161:1
     Visibility: public -/
 structure ManifestWireCore where
   root_map_len : Std.U64
@@ -90,6 +90,165 @@ structure ManifestWireCore where
   key_file_entries : Std.U64
   file_entries_len : Std.U64
   file : RegularFileWireCore
+  key_schema_version : Std.U64
+  schema_version : Std.U64
+  key_object_metadata : Std.U64
+  object_metadata_empty : Bool
+  key_caller_object_id : Std.U64
+  caller_object_id : Std.U64
+  key_external_references : Std.U64
+  external_references_empty : Bool
+  trailing_data : Bool
+
+/-- [rao_manifest_verif::RichRegularFileCore]
+    Source: 'src/lib.rs', lines 164:0-176:1
+    Visibility: public -/
+structure RichRegularFileCore where
+  path_id : Std.U64
+  file_id : Std.U64
+  size_bytes : Std.U64
+  file_sha256 : DigestWords
+  first_chunk_lba_present : Bool
+  first_chunk_lba : Std.U64
+  executable_tag : Std.U8
+  xattr_present : Bool
+  xattr_name_id : Std.U64
+  xattr_value_len : Std.U64
+  xattr_value_id : Std.U64
+
+/-- [rao_manifest_verif::HardlinkEntryCore]
+    Source: 'src/lib.rs', lines 179:0-184:1
+    Visibility: public -/
+structure HardlinkEntryCore where
+  path_id : Std.U64
+  file_id : Std.U64
+  link_target_path_id : Std.U64
+  executable_tag : Std.U8
+
+/-- [rao_manifest_verif::SymlinkEntryCore]
+    Source: 'src/lib.rs', lines 187:0-192:1
+    Visibility: public -/
+structure SymlinkEntryCore where
+  path_id : Std.U64
+  file_id : Std.U64
+  link_target_id : Std.U64
+  executable_tag : Std.U8
+
+/-- [rao_manifest_verif::DirectoryEntryCore]
+    Source: 'src/lib.rs', lines 195:0-199:1
+    Visibility: public -/
+structure DirectoryEntryCore where
+  path_id : Std.U64
+  file_id : Std.U64
+  executable_tag : Std.U8
+
+/-- [rao_manifest_verif::ManifestEntriesCore]
+    Source: 'src/lib.rs', lines 202:0-211:1
+    Visibility: public -/
+structure ManifestEntriesCore where
+  object_id : Std.U64
+  caller_object_id : Std.U64
+  chunk_size : Std.U64
+  nonempty_regular : RichRegularFileCore
+  empty_regular : RichRegularFileCore
+  hardlink : HardlinkEntryCore
+  symlink : SymlinkEntryCore
+  directory : DirectoryEntryCore
+
+/-- [rao_manifest_verif::RichRegularFileWireCore]
+    Source: 'src/lib.rs', lines 214:0-239:1
+    Visibility: public -/
+structure RichRegularFileWireCore where
+  map_len : Std.U64
+  key_path : Std.U64
+  path_id : Std.U64
+  key_file_id : Std.U64
+  file_id : Std.U64
+  key_executable : Std.U64
+  executable_tag : Std.U8
+  key_size_bytes : Std.U64
+  size_bytes : Std.U64
+  key_chunk_count : Std.U64
+  chunk_count : Std.U64
+  key_file_sha256 : Std.U64
+  file_sha256_len : Std.U64
+  file_sha256 : DigestWords
+  key_first_chunk_lba : Std.U64
+  first_chunk_lba_is_null : Bool
+  first_chunk_lba : Std.U64
+  key_metadata_preservation_data : Std.U64
+  metadata_preservation_data_map_len : Std.U64
+  metadata_key_xattrs : Std.U64
+  xattrs_map_len : Std.U64
+  xattr_name_id : Std.U64
+  xattr_value_len : Std.U64
+  xattr_value_id : Std.U64
+
+/-- [rao_manifest_verif::LinkEntryWireCore]
+    Source: 'src/lib.rs', lines 242:0-263:1
+    Visibility: public -/
+structure LinkEntryWireCore where
+  map_len : Std.U64
+  key_path : Std.U64
+  path_id : Std.U64
+  key_file_id : Std.U64
+  file_id : Std.U64
+  key_entry_type : Std.U64
+  entry_type : Std.U8
+  key_executable : Std.U64
+  executable_tag : Std.U8
+  key_size_bytes : Std.U64
+  size_bytes : Std.U64
+  key_chunk_count : Std.U64
+  chunk_count : Std.U64
+  key_link_target : Std.U64
+  link_target_id : Std.U64
+  key_first_chunk_lba : Std.U64
+  first_chunk_lba_is_null : Bool
+  key_metadata_preservation_data : Std.U64
+  metadata_preservation_data_empty : Bool
+  file_sha256_present : Bool
+
+/-- [rao_manifest_verif::DirectoryEntryWireCore]
+    Source: 'src/lib.rs', lines 266:0-286:1
+    Visibility: public -/
+structure DirectoryEntryWireCore where
+  map_len : Std.U64
+  key_path : Std.U64
+  path_id : Std.U64
+  key_file_id : Std.U64
+  file_id : Std.U64
+  key_entry_type : Std.U64
+  entry_type : Std.U8
+  key_executable : Std.U64
+  executable_tag : Std.U8
+  key_size_bytes : Std.U64
+  size_bytes : Std.U64
+  key_chunk_count : Std.U64
+  chunk_count : Std.U64
+  key_first_chunk_lba : Std.U64
+  first_chunk_lba_is_null : Bool
+  key_metadata_preservation_data : Std.U64
+  metadata_preservation_data_empty : Bool
+  file_sha256_present : Bool
+  link_target_present : Bool
+
+/-- [rao_manifest_verif::ManifestEntriesWireCore]
+    Source: 'src/lib.rs', lines 289:0-311:1
+    Visibility: public -/
+structure ManifestEntriesWireCore where
+  root_map_len : Std.U64
+  key_object_id : Std.U64
+  object_id : Std.U64
+  key_chunk_size : Std.U64
+  chunk_size : Std.U64
+  key_file_entries : Std.U64
+  file_entries_len : Std.U64
+  nonempty_regular : RichRegularFileWireCore
+  empty_regular : RichRegularFileWireCore
+  hardlink : LinkEntryWireCore
+  symlink : LinkEntryWireCore
+  directory : DirectoryEntryWireCore
   key_schema_version : Std.U64
   schema_version : Std.U64
   key_object_metadata : Std.U64

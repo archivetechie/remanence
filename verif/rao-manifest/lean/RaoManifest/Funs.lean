@@ -16,136 +16,277 @@ set_option maxRecDepth 2048
 namespace RaoManifest
 
 /-- [rao_manifest_verif::CHUNK_SIZE_GRANULARITY]
-    Source: 'src/lib.rs', lines 18:0-18:44
+    Source: 'src/lib.rs', lines 25:0-25:44
     Visibility: public -/
 @[global_simps, irreducible] def CHUNK_SIZE_GRANULARITY : Std.U64 := 512#u64
 
 /-- [rao_manifest_verif::SCHEMA_VERSION]
-    Source: 'src/lib.rs', lines 19:0-19:34
+    Source: 'src/lib.rs', lines 26:0-26:34
     Visibility: public -/
 @[global_simps, irreducible] def SCHEMA_VERSION : Std.U64 := 1#u64
 
 /-- [rao_manifest_verif::ROOT_MAP_LEN]
-    Source: 'src/lib.rs', lines 20:0-20:32
+    Source: 'src/lib.rs', lines 27:0-27:32
     Visibility: public -/
 @[global_simps, irreducible] def ROOT_MAP_LEN : Std.U64 := 7#u64
 
 /-- [rao_manifest_verif::FILE_ENTRIES_LEN_ONE]
-    Source: 'src/lib.rs', lines 21:0-21:40
+    Source: 'src/lib.rs', lines 28:0-28:40
     Visibility: public -/
 @[global_simps, irreducible] def FILE_ENTRIES_LEN_ONE : Std.U64 := 1#u64
 
+/-- [rao_manifest_verif::FILE_ENTRIES_LEN_BOUNDED]
+    Source: 'src/lib.rs', lines 29:0-29:44
+    Visibility: public -/
+@[global_simps, irreducible] def FILE_ENTRIES_LEN_BOUNDED : Std.U64 := 5#u64
+
 /-- [rao_manifest_verif::FILE_ENTRY_REGULAR_MAP_LEN]
-    Source: 'src/lib.rs', lines 22:0-22:46
+    Source: 'src/lib.rs', lines 30:0-30:46
     Visibility: public -/
 @[global_simps, irreducible] def FILE_ENTRY_REGULAR_MAP_LEN : Std.U64 := 8#u64
 
+/-- [rao_manifest_verif::FILE_ENTRY_LINK_MAP_LEN]
+    Source: 'src/lib.rs', lines 31:0-31:43
+    Visibility: public -/
+@[global_simps, irreducible] def FILE_ENTRY_LINK_MAP_LEN : Std.U64 := 9#u64
+
+/-- [rao_manifest_verif::FILE_ENTRY_DIRECTORY_MAP_LEN]
+    Source: 'src/lib.rs', lines 32:0-32:48
+    Visibility: public -/
+@[global_simps, irreducible]
+def FILE_ENTRY_DIRECTORY_MAP_LEN : Std.U64 := 8#u64
+
 /-- [rao_manifest_verif::DIGEST_BYTE_LEN]
-    Source: 'src/lib.rs', lines 23:0-23:36
+    Source: 'src/lib.rs', lines 33:0-33:36
     Visibility: public -/
 @[global_simps, irreducible] def DIGEST_BYTE_LEN : Std.U64 := 32#u64
 
 /-- [rao_manifest_verif::ROOT_KEY_OBJECT_ID]
-    Source: 'src/lib.rs', lines 25:0-25:38
+    Source: 'src/lib.rs', lines 35:0-35:38
     Visibility: public -/
 @[global_simps, irreducible] def ROOT_KEY_OBJECT_ID : Std.U64 := 0#u64
 
 /-- [rao_manifest_verif::ROOT_KEY_CHUNK_SIZE]
-    Source: 'src/lib.rs', lines 26:0-26:39
+    Source: 'src/lib.rs', lines 36:0-36:39
     Visibility: public -/
 @[global_simps, irreducible] def ROOT_KEY_CHUNK_SIZE : Std.U64 := 1#u64
 
 /-- [rao_manifest_verif::ROOT_KEY_FILE_ENTRIES]
-    Source: 'src/lib.rs', lines 27:0-27:41
+    Source: 'src/lib.rs', lines 37:0-37:41
     Visibility: public -/
 @[global_simps, irreducible] def ROOT_KEY_FILE_ENTRIES : Std.U64 := 2#u64
 
 /-- [rao_manifest_verif::ROOT_KEY_SCHEMA_VERSION]
-    Source: 'src/lib.rs', lines 28:0-28:43
+    Source: 'src/lib.rs', lines 38:0-38:43
     Visibility: public -/
 @[global_simps, irreducible] def ROOT_KEY_SCHEMA_VERSION : Std.U64 := 3#u64
 
 /-- [rao_manifest_verif::ROOT_KEY_OBJECT_METADATA]
-    Source: 'src/lib.rs', lines 29:0-29:44
+    Source: 'src/lib.rs', lines 39:0-39:44
     Visibility: public -/
 @[global_simps, irreducible] def ROOT_KEY_OBJECT_METADATA : Std.U64 := 4#u64
 
 /-- [rao_manifest_verif::ROOT_KEY_CALLER_OBJECT_ID]
-    Source: 'src/lib.rs', lines 30:0-30:45
+    Source: 'src/lib.rs', lines 40:0-40:45
     Visibility: public -/
 @[global_simps, irreducible] def ROOT_KEY_CALLER_OBJECT_ID : Std.U64 := 5#u64
 
 /-- [rao_manifest_verif::ROOT_KEY_EXTERNAL_REFERENCES]
-    Source: 'src/lib.rs', lines 31:0-31:48
+    Source: 'src/lib.rs', lines 41:0-41:48
     Visibility: public -/
 @[global_simps, irreducible]
 def ROOT_KEY_EXTERNAL_REFERENCES : Std.U64 := 6#u64
 
 /-- [rao_manifest_verif::FILE_KEY_PATH]
-    Source: 'src/lib.rs', lines 33:0-33:33
+    Source: 'src/lib.rs', lines 43:0-43:33
     Visibility: public -/
 @[global_simps, irreducible] def FILE_KEY_PATH : Std.U64 := 0#u64
 
 /-- [rao_manifest_verif::FILE_KEY_FILE_ID]
-    Source: 'src/lib.rs', lines 34:0-34:36
+    Source: 'src/lib.rs', lines 44:0-44:36
     Visibility: public -/
 @[global_simps, irreducible] def FILE_KEY_FILE_ID : Std.U64 := 1#u64
 
 /-- [rao_manifest_verif::FILE_KEY_EXECUTABLE]
-    Source: 'src/lib.rs', lines 35:0-35:39
+    Source: 'src/lib.rs', lines 45:0-45:39
     Visibility: public -/
 @[global_simps, irreducible] def FILE_KEY_EXECUTABLE : Std.U64 := 2#u64
 
 /-- [rao_manifest_verif::FILE_KEY_SIZE_BYTES]
-    Source: 'src/lib.rs', lines 36:0-36:39
+    Source: 'src/lib.rs', lines 46:0-46:39
     Visibility: public -/
 @[global_simps, irreducible] def FILE_KEY_SIZE_BYTES : Std.U64 := 3#u64
 
 /-- [rao_manifest_verif::FILE_KEY_CHUNK_COUNT]
-    Source: 'src/lib.rs', lines 37:0-37:40
+    Source: 'src/lib.rs', lines 47:0-47:40
     Visibility: public -/
 @[global_simps, irreducible] def FILE_KEY_CHUNK_COUNT : Std.U64 := 4#u64
 
 /-- [rao_manifest_verif::FILE_KEY_FILE_SHA256]
-    Source: 'src/lib.rs', lines 38:0-38:40
+    Source: 'src/lib.rs', lines 48:0-48:40
     Visibility: public -/
 @[global_simps, irreducible] def FILE_KEY_FILE_SHA256 : Std.U64 := 5#u64
 
 /-- [rao_manifest_verif::FILE_KEY_FIRST_CHUNK_LBA]
-    Source: 'src/lib.rs', lines 39:0-39:44
+    Source: 'src/lib.rs', lines 49:0-49:44
     Visibility: public -/
 @[global_simps, irreducible] def FILE_KEY_FIRST_CHUNK_LBA : Std.U64 := 6#u64
 
 /-- [rao_manifest_verif::FILE_KEY_METADATA_PRESERVATION_DATA]
-    Source: 'src/lib.rs', lines 40:0-40:55
+    Source: 'src/lib.rs', lines 50:0-50:55
     Visibility: public -/
 @[global_simps, irreducible]
 def FILE_KEY_METADATA_PRESERVATION_DATA : Std.U64 := 7#u64
 
+/-- [rao_manifest_verif::LINK_KEY_PATH]
+    Source: 'src/lib.rs', lines 52:0-52:33
+    Visibility: public -/
+@[global_simps, irreducible] def LINK_KEY_PATH : Std.U64 := 0#u64
+
+/-- [rao_manifest_verif::LINK_KEY_FILE_ID]
+    Source: 'src/lib.rs', lines 53:0-53:36
+    Visibility: public -/
+@[global_simps, irreducible] def LINK_KEY_FILE_ID : Std.U64 := 1#u64
+
+/-- [rao_manifest_verif::LINK_KEY_ENTRY_TYPE]
+    Source: 'src/lib.rs', lines 54:0-54:39
+    Visibility: public -/
+@[global_simps, irreducible] def LINK_KEY_ENTRY_TYPE : Std.U64 := 2#u64
+
+/-- [rao_manifest_verif::LINK_KEY_EXECUTABLE]
+    Source: 'src/lib.rs', lines 55:0-55:39
+    Visibility: public -/
+@[global_simps, irreducible] def LINK_KEY_EXECUTABLE : Std.U64 := 3#u64
+
+/-- [rao_manifest_verif::LINK_KEY_SIZE_BYTES]
+    Source: 'src/lib.rs', lines 56:0-56:39
+    Visibility: public -/
+@[global_simps, irreducible] def LINK_KEY_SIZE_BYTES : Std.U64 := 4#u64
+
+/-- [rao_manifest_verif::LINK_KEY_CHUNK_COUNT]
+    Source: 'src/lib.rs', lines 57:0-57:40
+    Visibility: public -/
+@[global_simps, irreducible] def LINK_KEY_CHUNK_COUNT : Std.U64 := 5#u64
+
+/-- [rao_manifest_verif::LINK_KEY_LINK_TARGET]
+    Source: 'src/lib.rs', lines 58:0-58:40
+    Visibility: public -/
+@[global_simps, irreducible] def LINK_KEY_LINK_TARGET : Std.U64 := 6#u64
+
+/-- [rao_manifest_verif::LINK_KEY_FIRST_CHUNK_LBA]
+    Source: 'src/lib.rs', lines 59:0-59:44
+    Visibility: public -/
+@[global_simps, irreducible] def LINK_KEY_FIRST_CHUNK_LBA : Std.U64 := 7#u64
+
+/-- [rao_manifest_verif::LINK_KEY_METADATA_PRESERVATION_DATA]
+    Source: 'src/lib.rs', lines 60:0-60:55
+    Visibility: public -/
+@[global_simps, irreducible]
+def LINK_KEY_METADATA_PRESERVATION_DATA : Std.U64 := 8#u64
+
+/-- [rao_manifest_verif::DIRECTORY_KEY_PATH]
+    Source: 'src/lib.rs', lines 62:0-62:38
+    Visibility: public -/
+@[global_simps, irreducible] def DIRECTORY_KEY_PATH : Std.U64 := 0#u64
+
+/-- [rao_manifest_verif::DIRECTORY_KEY_FILE_ID]
+    Source: 'src/lib.rs', lines 63:0-63:41
+    Visibility: public -/
+@[global_simps, irreducible] def DIRECTORY_KEY_FILE_ID : Std.U64 := 1#u64
+
+/-- [rao_manifest_verif::DIRECTORY_KEY_ENTRY_TYPE]
+    Source: 'src/lib.rs', lines 64:0-64:44
+    Visibility: public -/
+@[global_simps, irreducible] def DIRECTORY_KEY_ENTRY_TYPE : Std.U64 := 2#u64
+
+/-- [rao_manifest_verif::DIRECTORY_KEY_EXECUTABLE]
+    Source: 'src/lib.rs', lines 65:0-65:44
+    Visibility: public -/
+@[global_simps, irreducible] def DIRECTORY_KEY_EXECUTABLE : Std.U64 := 3#u64
+
+/-- [rao_manifest_verif::DIRECTORY_KEY_SIZE_BYTES]
+    Source: 'src/lib.rs', lines 66:0-66:44
+    Visibility: public -/
+@[global_simps, irreducible] def DIRECTORY_KEY_SIZE_BYTES : Std.U64 := 4#u64
+
+/-- [rao_manifest_verif::DIRECTORY_KEY_CHUNK_COUNT]
+    Source: 'src/lib.rs', lines 67:0-67:45
+    Visibility: public -/
+@[global_simps, irreducible] def DIRECTORY_KEY_CHUNK_COUNT : Std.U64 := 5#u64
+
+/-- [rao_manifest_verif::DIRECTORY_KEY_FIRST_CHUNK_LBA]
+    Source: 'src/lib.rs', lines 68:0-68:49
+    Visibility: public -/
+@[global_simps, irreducible]
+def DIRECTORY_KEY_FIRST_CHUNK_LBA : Std.U64 := 6#u64
+
+/-- [rao_manifest_verif::DIRECTORY_KEY_METADATA_PRESERVATION_DATA]
+    Source: 'src/lib.rs', lines 69:0-69:60
+    Visibility: public -/
+@[global_simps, irreducible]
+def DIRECTORY_KEY_METADATA_PRESERVATION_DATA : Std.U64 := 7#u64
+
+/-- [rao_manifest_verif::METADATA_PRESERVATION_EMPTY_MAP_LEN]
+    Source: 'src/lib.rs', lines 71:0-71:55
+    Visibility: public -/
+@[global_simps, irreducible]
+def METADATA_PRESERVATION_EMPTY_MAP_LEN : Std.U64 := 0#u64
+
+/-- [rao_manifest_verif::METADATA_PRESERVATION_XATTRS_MAP_LEN]
+    Source: 'src/lib.rs', lines 72:0-72:56
+    Visibility: public -/
+@[global_simps, irreducible]
+def METADATA_PRESERVATION_XATTRS_MAP_LEN : Std.U64 := 1#u64
+
+/-- [rao_manifest_verif::METADATA_KEY_XATTRS]
+    Source: 'src/lib.rs', lines 73:0-73:39
+    Visibility: public -/
+@[global_simps, irreducible] def METADATA_KEY_XATTRS : Std.U64 := 0#u64
+
+/-- [rao_manifest_verif::XATTRS_ONE_ENTRY_LEN]
+    Source: 'src/lib.rs', lines 74:0-74:40
+    Visibility: public -/
+@[global_simps, irreducible] def XATTRS_ONE_ENTRY_LEN : Std.U64 := 1#u64
+
 /-- [rao_manifest_verif::EXECUTABLE_NULL]
-    Source: 'src/lib.rs', lines 42:0-42:34
+    Source: 'src/lib.rs', lines 76:0-76:34
     Visibility: public -/
 @[global_simps, irreducible] def EXECUTABLE_NULL : Std.U8 := 0#u8
 
 /-- [rao_manifest_verif::EXECUTABLE_FALSE]
-    Source: 'src/lib.rs', lines 43:0-43:35
+    Source: 'src/lib.rs', lines 77:0-77:35
     Visibility: public -/
 @[global_simps, irreducible] def EXECUTABLE_FALSE : Std.U8 := 1#u8
 
 /-- [rao_manifest_verif::EXECUTABLE_TRUE]
-    Source: 'src/lib.rs', lines 44:0-44:34
+    Source: 'src/lib.rs', lines 78:0-78:34
     Visibility: public -/
 @[global_simps, irreducible] def EXECUTABLE_TRUE : Std.U8 := 2#u8
 
+/-- [rao_manifest_verif::ENTRY_TYPE_HARDLINK]
+    Source: 'src/lib.rs', lines 80:0-80:38
+    Visibility: public -/
+@[global_simps, irreducible] def ENTRY_TYPE_HARDLINK : Std.U8 := 1#u8
+
+/-- [rao_manifest_verif::ENTRY_TYPE_SYMLINK]
+    Source: 'src/lib.rs', lines 81:0-81:37
+    Visibility: public -/
+@[global_simps, irreducible] def ENTRY_TYPE_SYMLINK : Std.U8 := 2#u8
+
+/-- [rao_manifest_verif::ENTRY_TYPE_DIRECTORY]
+    Source: 'src/lib.rs', lines 82:0-82:39
+    Visibility: public -/
+@[global_simps, irreducible] def ENTRY_TYPE_DIRECTORY : Std.U8 := 3#u8
+
 /-- [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::RaoManifestError}::clone]:
-    Source: 'src/lib.rs', lines 46:9-46:14
+    Source: 'src/lib.rs', lines 84:9-84:14
     Visibility: public -/
 def RaoManifestError.Insts.CoreCloneClone.clone
   (self : RaoManifestError) : Result RaoManifestError := do
   ok self
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::RaoManifestError}]
-    Source: 'src/lib.rs', lines 46:9-46:14 -/
+    Source: 'src/lib.rs', lines 84:9-84:14 -/
 @[reducible]
 def RaoManifestError.Insts.CoreCloneClone : core.clone.Clone RaoManifestError
   := {
@@ -153,7 +294,7 @@ def RaoManifestError.Insts.CoreCloneClone : core.clone.Clone RaoManifestError
 }
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::marker::Copy for rao_manifest_verif::RaoManifestError}]
-    Source: 'src/lib.rs', lines 46:16-46:20 -/
+    Source: 'src/lib.rs', lines 84:16-84:20 -/
 @[reducible]
 def RaoManifestError.Insts.CoreMarkerCopy : core.marker.Copy RaoManifestError
   := {
@@ -161,7 +302,7 @@ def RaoManifestError.Insts.CoreMarkerCopy : core.marker.Copy RaoManifestError
 }
 
 /-- [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::RaoManifestError}::fmt]:
-    Source: 'src/lib.rs', lines 46:22-46:27
+    Source: 'src/lib.rs', lines 84:22-84:27
     Visibility: public -/
 def RaoManifestError.Insts.CoreFmtDebug.fmt
   (self : RaoManifestError) (f : core.fmt.Formatter) :
@@ -178,21 +319,21 @@ def RaoManifestError.Insts.CoreFmtDebug.fmt
     core.fmt.Formatter.write_str f (toStr "MissingRequiredManifestField")
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::RaoManifestError}]
-    Source: 'src/lib.rs', lines 46:22-46:27 -/
+    Source: 'src/lib.rs', lines 84:22-84:27 -/
 @[reducible]
 def RaoManifestError.Insts.CoreFmtDebug : core.fmt.Debug RaoManifestError := {
   fmt := RaoManifestError.Insts.CoreFmtDebug.fmt
 }
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::marker::StructuralPartialEq for rao_manifest_verif::RaoManifestError}]
-    Source: 'src/lib.rs', lines 46:29-46:38 -/
+    Source: 'src/lib.rs', lines 84:29-84:38 -/
 @[reducible]
 def RaoManifestError.Insts.CoreMarkerStructuralPartialEq :
   core.marker.StructuralPartialEq RaoManifestError := {
 }
 
 /-- [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::RaoManifestError> for rao_manifest_verif::RaoManifestError}::eq]:
-    Source: 'src/lib.rs', lines 46:29-46:38
+    Source: 'src/lib.rs', lines 84:29-84:38
     Visibility: public -/
 def RaoManifestError.Insts.CoreCmpPartialEqRaoManifestError.eq
   (self : RaoManifestError) (other : RaoManifestError) : Result Bool := do
@@ -201,7 +342,7 @@ def RaoManifestError.Insts.CoreCmpPartialEqRaoManifestError.eq
   ok (self1 = other1)
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::RaoManifestError> for rao_manifest_verif::RaoManifestError}]
-    Source: 'src/lib.rs', lines 46:29-46:38 -/
+    Source: 'src/lib.rs', lines 84:29-84:38 -/
 @[reducible]
 def RaoManifestError.Insts.CoreCmpPartialEqRaoManifestError :
   core.cmp.PartialEq RaoManifestError RaoManifestError := {
@@ -209,14 +350,14 @@ def RaoManifestError.Insts.CoreCmpPartialEqRaoManifestError :
 }
 
 /-- [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::RaoManifestError}::assert_fields_are_eq]:
-    Source: 'src/lib.rs', lines 46:40-46:42
+    Source: 'src/lib.rs', lines 84:40-84:42
     Visibility: public -/
 def RaoManifestError.Insts.CoreCmpEq.assert_fields_are_eq
   (self : RaoManifestError) : Result Unit := do
   ok ()
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::RaoManifestError}]
-    Source: 'src/lib.rs', lines 46:40-46:42 -/
+    Source: 'src/lib.rs', lines 84:40-84:42 -/
 @[reducible]
 def RaoManifestError.Insts.CoreCmpEq : core.cmp.Eq RaoManifestError := {
   partialEqInst := RaoManifestError.Insts.CoreCmpPartialEqRaoManifestError
@@ -224,28 +365,28 @@ def RaoManifestError.Insts.CoreCmpEq : core.cmp.Eq RaoManifestError := {
 }
 
 /-- [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::DigestWords}::clone]:
-    Source: 'src/lib.rs', lines 54:9-54:14
+    Source: 'src/lib.rs', lines 92:9-92:14
     Visibility: public -/
 def DigestWords.Insts.CoreCloneClone.clone
   (self : DigestWords) : Result DigestWords := do
   ok self
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::DigestWords}]
-    Source: 'src/lib.rs', lines 54:9-54:14 -/
+    Source: 'src/lib.rs', lines 92:9-92:14 -/
 @[reducible]
 def DigestWords.Insts.CoreCloneClone : core.clone.Clone DigestWords := {
   clone := DigestWords.Insts.CoreCloneClone.clone
 }
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::marker::Copy for rao_manifest_verif::DigestWords}]
-    Source: 'src/lib.rs', lines 54:16-54:20 -/
+    Source: 'src/lib.rs', lines 92:16-92:20 -/
 @[reducible]
 def DigestWords.Insts.CoreMarkerCopy : core.marker.Copy DigestWords := {
   cloneInst := DigestWords.Insts.CoreCloneClone
 }
 
 /-- [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::DigestWords}::fmt]:
-    Source: 'src/lib.rs', lines 54:22-54:27
+    Source: 'src/lib.rs', lines 92:22-92:27
     Visibility: public -/
 def DigestWords.Insts.CoreFmtDebug.fmt
   (self : DigestWords) (f : core.fmt.Formatter) :
@@ -259,21 +400,21 @@ def DigestWords.Insts.CoreFmtDebug.fmt
     "w0") dyn (toStr "w1") dyn1 (toStr "w2") dyn2 (toStr "w3") dyn3
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::DigestWords}]
-    Source: 'src/lib.rs', lines 54:22-54:27 -/
+    Source: 'src/lib.rs', lines 92:22-92:27 -/
 @[reducible]
 def DigestWords.Insts.CoreFmtDebug : core.fmt.Debug DigestWords := {
   fmt := DigestWords.Insts.CoreFmtDebug.fmt
 }
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::marker::StructuralPartialEq for rao_manifest_verif::DigestWords}]
-    Source: 'src/lib.rs', lines 54:29-54:38 -/
+    Source: 'src/lib.rs', lines 92:29-92:38 -/
 @[reducible]
 def DigestWords.Insts.CoreMarkerStructuralPartialEq :
   core.marker.StructuralPartialEq DigestWords := {
 }
 
 /-- [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::DigestWords> for rao_manifest_verif::DigestWords}::eq]:
-    Source: 'src/lib.rs', lines 54:29-54:38
+    Source: 'src/lib.rs', lines 92:29-92:38
     Visibility: public -/
 def DigestWords.Insts.CoreCmpPartialEqDigestWords.eq
   (self : DigestWords) (other : DigestWords) : Result Bool := do
@@ -287,7 +428,7 @@ def DigestWords.Insts.CoreCmpPartialEqDigestWords.eq
   else ok false
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::DigestWords> for rao_manifest_verif::DigestWords}]
-    Source: 'src/lib.rs', lines 54:29-54:38 -/
+    Source: 'src/lib.rs', lines 92:29-92:38 -/
 @[reducible]
 def DigestWords.Insts.CoreCmpPartialEqDigestWords : core.cmp.PartialEq
   DigestWords DigestWords := {
@@ -295,14 +436,14 @@ def DigestWords.Insts.CoreCmpPartialEqDigestWords : core.cmp.PartialEq
 }
 
 /-- [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::DigestWords}::assert_fields_are_eq]:
-    Source: 'src/lib.rs', lines 54:40-54:42
+    Source: 'src/lib.rs', lines 92:40-92:42
     Visibility: public -/
 def DigestWords.Insts.CoreCmpEq.assert_fields_are_eq
   (self : DigestWords) : Result Unit := do
   ok ()
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::DigestWords}]
-    Source: 'src/lib.rs', lines 54:40-54:42 -/
+    Source: 'src/lib.rs', lines 92:40-92:42 -/
 @[reducible]
 def DigestWords.Insts.CoreCmpEq : core.cmp.Eq DigestWords := {
   partialEqInst := DigestWords.Insts.CoreCmpPartialEqDigestWords
@@ -310,14 +451,14 @@ def DigestWords.Insts.CoreCmpEq : core.cmp.Eq DigestWords := {
 }
 
 /-- [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::RegularFileCore}::clone]:
-    Source: 'src/lib.rs', lines 62:9-62:14
+    Source: 'src/lib.rs', lines 100:9-100:14
     Visibility: public -/
 def RegularFileCore.Insts.CoreCloneClone.clone
   (self : RegularFileCore) : Result RegularFileCore := do
   ok self
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::RegularFileCore}]
-    Source: 'src/lib.rs', lines 62:9-62:14 -/
+    Source: 'src/lib.rs', lines 100:9-100:14 -/
 @[reducible]
 def RegularFileCore.Insts.CoreCloneClone : core.clone.Clone RegularFileCore
   := {
@@ -325,7 +466,7 @@ def RegularFileCore.Insts.CoreCloneClone : core.clone.Clone RegularFileCore
 }
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::marker::Copy for rao_manifest_verif::RegularFileCore}]
-    Source: 'src/lib.rs', lines 62:16-62:20 -/
+    Source: 'src/lib.rs', lines 100:16-100:20 -/
 @[reducible]
 def RegularFileCore.Insts.CoreMarkerCopy : core.marker.Copy RegularFileCore
   := {
@@ -333,7 +474,7 @@ def RegularFileCore.Insts.CoreMarkerCopy : core.marker.Copy RegularFileCore
 }
 
 /-- [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::RegularFileCore}::fmt]:
-    Source: 'src/lib.rs', lines 62:22-62:27
+    Source: 'src/lib.rs', lines 100:22-100:27
     Visibility: public -/
 def RegularFileCore.Insts.CoreFmtDebug.fmt
   (self : RegularFileCore) (f : core.fmt.Formatter) :
@@ -361,21 +502,21 @@ def RegularFileCore.Insts.CoreFmtDebug.fmt
     values
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::RegularFileCore}]
-    Source: 'src/lib.rs', lines 62:22-62:27 -/
+    Source: 'src/lib.rs', lines 100:22-100:27 -/
 @[reducible]
 def RegularFileCore.Insts.CoreFmtDebug : core.fmt.Debug RegularFileCore := {
   fmt := RegularFileCore.Insts.CoreFmtDebug.fmt
 }
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::marker::StructuralPartialEq for rao_manifest_verif::RegularFileCore}]
-    Source: 'src/lib.rs', lines 62:29-62:38 -/
+    Source: 'src/lib.rs', lines 100:29-100:38 -/
 @[reducible]
 def RegularFileCore.Insts.CoreMarkerStructuralPartialEq :
   core.marker.StructuralPartialEq RegularFileCore := {
 }
 
 /-- [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::RegularFileCore> for rao_manifest_verif::RegularFileCore}::eq]:
-    Source: 'src/lib.rs', lines 62:29-62:38
+    Source: 'src/lib.rs', lines 100:29-100:38
     Visibility: public -/
 def RegularFileCore.Insts.CoreCmpPartialEqRegularFileCore.eq
   (self : RegularFileCore) (other : RegularFileCore) : Result Bool := do
@@ -401,7 +542,7 @@ def RegularFileCore.Insts.CoreCmpPartialEqRegularFileCore.eq
   else ok false
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::RegularFileCore> for rao_manifest_verif::RegularFileCore}]
-    Source: 'src/lib.rs', lines 62:29-62:38 -/
+    Source: 'src/lib.rs', lines 100:29-100:38 -/
 @[reducible]
 def RegularFileCore.Insts.CoreCmpPartialEqRegularFileCore : core.cmp.PartialEq
   RegularFileCore RegularFileCore := {
@@ -409,14 +550,14 @@ def RegularFileCore.Insts.CoreCmpPartialEqRegularFileCore : core.cmp.PartialEq
 }
 
 /-- [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::RegularFileCore}::assert_fields_are_eq]:
-    Source: 'src/lib.rs', lines 62:40-62:42
+    Source: 'src/lib.rs', lines 100:40-100:42
     Visibility: public -/
 def RegularFileCore.Insts.CoreCmpEq.assert_fields_are_eq
   (self : RegularFileCore) : Result Unit := do
   ok ()
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::RegularFileCore}]
-    Source: 'src/lib.rs', lines 62:40-62:42 -/
+    Source: 'src/lib.rs', lines 100:40-100:42 -/
 @[reducible]
 def RegularFileCore.Insts.CoreCmpEq : core.cmp.Eq RegularFileCore := {
   partialEqInst := RegularFileCore.Insts.CoreCmpPartialEqRegularFileCore
@@ -424,28 +565,28 @@ def RegularFileCore.Insts.CoreCmpEq : core.cmp.Eq RegularFileCore := {
 }
 
 /-- [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::ManifestCore}::clone]:
-    Source: 'src/lib.rs', lines 73:9-73:14
+    Source: 'src/lib.rs', lines 111:9-111:14
     Visibility: public -/
 def ManifestCore.Insts.CoreCloneClone.clone
   (self : ManifestCore) : Result ManifestCore := do
   ok self
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::ManifestCore}]
-    Source: 'src/lib.rs', lines 73:9-73:14 -/
+    Source: 'src/lib.rs', lines 111:9-111:14 -/
 @[reducible]
 def ManifestCore.Insts.CoreCloneClone : core.clone.Clone ManifestCore := {
   clone := ManifestCore.Insts.CoreCloneClone.clone
 }
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::marker::Copy for rao_manifest_verif::ManifestCore}]
-    Source: 'src/lib.rs', lines 73:16-73:20 -/
+    Source: 'src/lib.rs', lines 111:16-111:20 -/
 @[reducible]
 def ManifestCore.Insts.CoreMarkerCopy : core.marker.Copy ManifestCore := {
   cloneInst := ManifestCore.Insts.CoreCloneClone
 }
 
 /-- [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::ManifestCore}::fmt]:
-    Source: 'src/lib.rs', lines 73:22-73:27
+    Source: 'src/lib.rs', lines 111:22-111:27
     Visibility: public -/
 def ManifestCore.Insts.CoreFmtDebug.fmt
   (self : ManifestCore) (f : core.fmt.Formatter) :
@@ -462,21 +603,21 @@ def ManifestCore.Insts.CoreFmtDebug.fmt
     (toStr "file") dyn3
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::ManifestCore}]
-    Source: 'src/lib.rs', lines 73:22-73:27 -/
+    Source: 'src/lib.rs', lines 111:22-111:27 -/
 @[reducible]
 def ManifestCore.Insts.CoreFmtDebug : core.fmt.Debug ManifestCore := {
   fmt := ManifestCore.Insts.CoreFmtDebug.fmt
 }
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::marker::StructuralPartialEq for rao_manifest_verif::ManifestCore}]
-    Source: 'src/lib.rs', lines 73:29-73:38 -/
+    Source: 'src/lib.rs', lines 111:29-111:38 -/
 @[reducible]
 def ManifestCore.Insts.CoreMarkerStructuralPartialEq :
   core.marker.StructuralPartialEq ManifestCore := {
 }
 
 /-- [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::ManifestCore> for rao_manifest_verif::ManifestCore}::eq]:
-    Source: 'src/lib.rs', lines 73:29-73:38
+    Source: 'src/lib.rs', lines 111:29-111:38
     Visibility: public -/
 def ManifestCore.Insts.CoreCmpPartialEqManifestCore.eq
   (self : ManifestCore) (other : ManifestCore) : Result Bool := do
@@ -493,7 +634,7 @@ def ManifestCore.Insts.CoreCmpPartialEqManifestCore.eq
   else ok false
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::ManifestCore> for rao_manifest_verif::ManifestCore}]
-    Source: 'src/lib.rs', lines 73:29-73:38 -/
+    Source: 'src/lib.rs', lines 111:29-111:38 -/
 @[reducible]
 def ManifestCore.Insts.CoreCmpPartialEqManifestCore : core.cmp.PartialEq
   ManifestCore ManifestCore := {
@@ -501,14 +642,14 @@ def ManifestCore.Insts.CoreCmpPartialEqManifestCore : core.cmp.PartialEq
 }
 
 /-- [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::ManifestCore}::assert_fields_are_eq]:
-    Source: 'src/lib.rs', lines 73:40-73:42
+    Source: 'src/lib.rs', lines 111:40-111:42
     Visibility: public -/
 def ManifestCore.Insts.CoreCmpEq.assert_fields_are_eq
   (self : ManifestCore) : Result Unit := do
   ok ()
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::ManifestCore}]
-    Source: 'src/lib.rs', lines 73:40-73:42 -/
+    Source: 'src/lib.rs', lines 111:40-111:42 -/
 @[reducible]
 def ManifestCore.Insts.CoreCmpEq : core.cmp.Eq ManifestCore := {
   partialEqInst := ManifestCore.Insts.CoreCmpPartialEqManifestCore
@@ -516,14 +657,14 @@ def ManifestCore.Insts.CoreCmpEq : core.cmp.Eq ManifestCore := {
 }
 
 /-- [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::RegularFileWireCore}::clone]:
-    Source: 'src/lib.rs', lines 81:9-81:14
+    Source: 'src/lib.rs', lines 119:9-119:14
     Visibility: public -/
 def RegularFileWireCore.Insts.CoreCloneClone.clone
   (self : RegularFileWireCore) : Result RegularFileWireCore := do
   ok self
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::RegularFileWireCore}]
-    Source: 'src/lib.rs', lines 81:9-81:14 -/
+    Source: 'src/lib.rs', lines 119:9-119:14 -/
 @[reducible]
 def RegularFileWireCore.Insts.CoreCloneClone : core.clone.Clone
   RegularFileWireCore := {
@@ -531,7 +672,7 @@ def RegularFileWireCore.Insts.CoreCloneClone : core.clone.Clone
 }
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::marker::Copy for rao_manifest_verif::RegularFileWireCore}]
-    Source: 'src/lib.rs', lines 81:16-81:20 -/
+    Source: 'src/lib.rs', lines 119:16-119:20 -/
 @[reducible]
 def RegularFileWireCore.Insts.CoreMarkerCopy : core.marker.Copy
   RegularFileWireCore := {
@@ -539,7 +680,7 @@ def RegularFileWireCore.Insts.CoreMarkerCopy : core.marker.Copy
 }
 
 /-- [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::RegularFileWireCore}::fmt]:
-    Source: 'src/lib.rs', lines 81:22-81:27
+    Source: 'src/lib.rs', lines 119:22-119:27
     Visibility: public -/
 def RegularFileWireCore.Insts.CoreFmtDebug.fmt
   (self : RegularFileWireCore) (f : core.fmt.Formatter) :
@@ -588,7 +729,7 @@ def RegularFileWireCore.Insts.CoreFmtDebug.fmt
     s values
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::RegularFileWireCore}]
-    Source: 'src/lib.rs', lines 81:22-81:27 -/
+    Source: 'src/lib.rs', lines 119:22-119:27 -/
 @[reducible]
 def RegularFileWireCore.Insts.CoreFmtDebug : core.fmt.Debug RegularFileWireCore
   := {
@@ -596,14 +737,14 @@ def RegularFileWireCore.Insts.CoreFmtDebug : core.fmt.Debug RegularFileWireCore
 }
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::marker::StructuralPartialEq for rao_manifest_verif::RegularFileWireCore}]
-    Source: 'src/lib.rs', lines 81:29-81:38 -/
+    Source: 'src/lib.rs', lines 119:29-119:38 -/
 @[reducible]
 def RegularFileWireCore.Insts.CoreMarkerStructuralPartialEq :
   core.marker.StructuralPartialEq RegularFileWireCore := {
 }
 
 /-- [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::RegularFileWireCore> for rao_manifest_verif::RegularFileWireCore}::eq]:
-    Source: 'src/lib.rs', lines 81:29-81:38
+    Source: 'src/lib.rs', lines 119:29-119:38
     Visibility: public -/
 def RegularFileWireCore.Insts.CoreCmpPartialEqRegularFileWireCore.eq
   (self : RegularFileWireCore) (other : RegularFileWireCore) :
@@ -671,7 +812,7 @@ def RegularFileWireCore.Insts.CoreCmpPartialEqRegularFileWireCore.eq
   else ok false
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::RegularFileWireCore> for rao_manifest_verif::RegularFileWireCore}]
-    Source: 'src/lib.rs', lines 81:29-81:38 -/
+    Source: 'src/lib.rs', lines 119:29-119:38 -/
 @[reducible]
 def RegularFileWireCore.Insts.CoreCmpPartialEqRegularFileWireCore :
   core.cmp.PartialEq RegularFileWireCore RegularFileWireCore := {
@@ -679,14 +820,14 @@ def RegularFileWireCore.Insts.CoreCmpPartialEqRegularFileWireCore :
 }
 
 /-- [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::RegularFileWireCore}::assert_fields_are_eq]:
-    Source: 'src/lib.rs', lines 81:40-81:42
+    Source: 'src/lib.rs', lines 119:40-119:42
     Visibility: public -/
 def RegularFileWireCore.Insts.CoreCmpEq.assert_fields_are_eq
   (self : RegularFileWireCore) : Result Unit := do
   ok ()
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::RegularFileWireCore}]
-    Source: 'src/lib.rs', lines 81:40-81:42 -/
+    Source: 'src/lib.rs', lines 119:40-119:42 -/
 @[reducible]
 def RegularFileWireCore.Insts.CoreCmpEq : core.cmp.Eq RegularFileWireCore := {
   partialEqInst :=
@@ -696,14 +837,14 @@ def RegularFileWireCore.Insts.CoreCmpEq : core.cmp.Eq RegularFileWireCore := {
 }
 
 /-- [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::ManifestWireCore}::clone]:
-    Source: 'src/lib.rs', lines 104:9-104:14
+    Source: 'src/lib.rs', lines 142:9-142:14
     Visibility: public -/
 def ManifestWireCore.Insts.CoreCloneClone.clone
   (self : ManifestWireCore) : Result ManifestWireCore := do
   ok self
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::ManifestWireCore}]
-    Source: 'src/lib.rs', lines 104:9-104:14 -/
+    Source: 'src/lib.rs', lines 142:9-142:14 -/
 @[reducible]
 def ManifestWireCore.Insts.CoreCloneClone : core.clone.Clone ManifestWireCore
   := {
@@ -711,7 +852,7 @@ def ManifestWireCore.Insts.CoreCloneClone : core.clone.Clone ManifestWireCore
 }
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::marker::Copy for rao_manifest_verif::ManifestWireCore}]
-    Source: 'src/lib.rs', lines 104:16-104:20 -/
+    Source: 'src/lib.rs', lines 142:16-142:20 -/
 @[reducible]
 def ManifestWireCore.Insts.CoreMarkerCopy : core.marker.Copy ManifestWireCore
   := {
@@ -719,7 +860,7 @@ def ManifestWireCore.Insts.CoreMarkerCopy : core.marker.Copy ManifestWireCore
 }
 
 /-- [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::ManifestWireCore}::fmt]:
-    Source: 'src/lib.rs', lines 104:22-104:27
+    Source: 'src/lib.rs', lines 142:22-142:27
     Visibility: public -/
 def ManifestWireCore.Insts.CoreFmtDebug.fmt
   (self : ManifestWireCore) (f : core.fmt.Formatter) :
@@ -764,21 +905,21 @@ def ManifestWireCore.Insts.CoreFmtDebug.fmt
     values
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::ManifestWireCore}]
-    Source: 'src/lib.rs', lines 104:22-104:27 -/
+    Source: 'src/lib.rs', lines 142:22-142:27 -/
 @[reducible]
 def ManifestWireCore.Insts.CoreFmtDebug : core.fmt.Debug ManifestWireCore := {
   fmt := ManifestWireCore.Insts.CoreFmtDebug.fmt
 }
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::marker::StructuralPartialEq for rao_manifest_verif::ManifestWireCore}]
-    Source: 'src/lib.rs', lines 104:29-104:38 -/
+    Source: 'src/lib.rs', lines 142:29-142:38 -/
 @[reducible]
 def ManifestWireCore.Insts.CoreMarkerStructuralPartialEq :
   core.marker.StructuralPartialEq ManifestWireCore := {
 }
 
 /-- [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::ManifestWireCore> for rao_manifest_verif::ManifestWireCore}::eq]:
-    Source: 'src/lib.rs', lines 104:29-104:38
+    Source: 'src/lib.rs', lines 142:29-142:38
     Visibility: public -/
 def ManifestWireCore.Insts.CoreCmpPartialEqManifestWireCore.eq
   (self : ManifestWireCore) (other : ManifestWireCore) : Result Bool := do
@@ -838,7 +979,7 @@ def ManifestWireCore.Insts.CoreCmpPartialEqManifestWireCore.eq
   else ok false
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::ManifestWireCore> for rao_manifest_verif::ManifestWireCore}]
-    Source: 'src/lib.rs', lines 104:29-104:38 -/
+    Source: 'src/lib.rs', lines 142:29-142:38 -/
 @[reducible]
 def ManifestWireCore.Insts.CoreCmpPartialEqManifestWireCore :
   core.cmp.PartialEq ManifestWireCore ManifestWireCore := {
@@ -846,22 +987,1352 @@ def ManifestWireCore.Insts.CoreCmpPartialEqManifestWireCore :
 }
 
 /-- [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::ManifestWireCore}::assert_fields_are_eq]:
-    Source: 'src/lib.rs', lines 104:40-104:42
+    Source: 'src/lib.rs', lines 142:40-142:42
     Visibility: public -/
 def ManifestWireCore.Insts.CoreCmpEq.assert_fields_are_eq
   (self : ManifestWireCore) : Result Unit := do
   ok ()
 
 /-- Trait implementation: [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::ManifestWireCore}]
-    Source: 'src/lib.rs', lines 104:40-104:42 -/
+    Source: 'src/lib.rs', lines 142:40-142:42 -/
 @[reducible]
 def ManifestWireCore.Insts.CoreCmpEq : core.cmp.Eq ManifestWireCore := {
   partialEqInst := ManifestWireCore.Insts.CoreCmpPartialEqManifestWireCore
   assert_fields_are_eq := ManifestWireCore.Insts.CoreCmpEq.assert_fields_are_eq
 }
 
+/-- [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::RichRegularFileCore}::clone]:
+    Source: 'src/lib.rs', lines 163:9-163:14
+    Visibility: public -/
+def RichRegularFileCore.Insts.CoreCloneClone.clone
+  (self : RichRegularFileCore) : Result RichRegularFileCore := do
+  ok self
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::RichRegularFileCore}]
+    Source: 'src/lib.rs', lines 163:9-163:14 -/
+@[reducible]
+def RichRegularFileCore.Insts.CoreCloneClone : core.clone.Clone
+  RichRegularFileCore := {
+  clone := RichRegularFileCore.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::marker::Copy for rao_manifest_verif::RichRegularFileCore}]
+    Source: 'src/lib.rs', lines 163:16-163:20 -/
+@[reducible]
+def RichRegularFileCore.Insts.CoreMarkerCopy : core.marker.Copy
+  RichRegularFileCore := {
+  cloneInst := RichRegularFileCore.Insts.CoreCloneClone
+}
+
+/-- [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::RichRegularFileCore}::fmt]:
+    Source: 'src/lib.rs', lines 163:22-163:27
+    Visibility: public -/
+def RichRegularFileCore.Insts.CoreFmtDebug.fmt
+  (self : RichRegularFileCore) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn := Dyn.mk _ core.fmt.DebugU64 self.path_id
+  let dyn1 := Dyn.mk _ core.fmt.DebugU64 self.file_id
+  let dyn2 := Dyn.mk _ core.fmt.DebugU64 self.size_bytes
+  let dyn3 := Dyn.mk _ DigestWords.Insts.CoreFmtDebug self.file_sha256
+  let dyn4 := Dyn.mk _ core.fmt.DebugBool self.first_chunk_lba_present
+  let dyn5 := Dyn.mk _ core.fmt.DebugU64 self.first_chunk_lba
+  let dyn6 := Dyn.mk _ core.fmt.DebugU8 self.executable_tag
+  let dyn7 := Dyn.mk _ core.fmt.DebugBool self.xattr_present
+  let dyn8 := Dyn.mk _ core.fmt.DebugU64 self.xattr_name_id
+  let dyn9 := Dyn.mk _ core.fmt.DebugU64 self.xattr_value_len
+  let dyn10 :=
+    Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugU64) self.xattr_value_id
+  let values :=
+    Array.to_slice
+      (Array.make 11#usize [
+        dyn, dyn1, dyn2, dyn3, dyn4, dyn5, dyn6, dyn7, dyn8, dyn9, dyn10
+        ])
+  let s ←
+    lift (Array.to_slice
+      (Array.make 11#usize [
+        toStr "path_id", toStr "file_id", toStr "size_bytes", toStr
+        "file_sha256", toStr "first_chunk_lba_present", toStr
+        "first_chunk_lba", toStr "executable_tag", toStr "xattr_present", toStr
+        "xattr_name_id", toStr "xattr_value_len", toStr "xattr_value_id"
+        ]))
+  core.fmt.Formatter.debug_struct_fields_finish f (toStr "RichRegularFileCore")
+    s values
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::RichRegularFileCore}]
+    Source: 'src/lib.rs', lines 163:22-163:27 -/
+@[reducible]
+def RichRegularFileCore.Insts.CoreFmtDebug : core.fmt.Debug RichRegularFileCore
+  := {
+  fmt := RichRegularFileCore.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::marker::StructuralPartialEq for rao_manifest_verif::RichRegularFileCore}]
+    Source: 'src/lib.rs', lines 163:29-163:38 -/
+@[reducible]
+def RichRegularFileCore.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq RichRegularFileCore := {
+}
+
+/-- [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::RichRegularFileCore> for rao_manifest_verif::RichRegularFileCore}::eq]:
+    Source: 'src/lib.rs', lines 163:29-163:38
+    Visibility: public -/
+def RichRegularFileCore.Insts.CoreCmpPartialEqRichRegularFileCore.eq
+  (self : RichRegularFileCore) (other : RichRegularFileCore) :
+  Result Bool
+  := do
+  if self.path_id = other.path_id
+  then
+    if self.file_id = other.file_id
+    then
+      if self.size_bytes = other.size_bytes
+      then
+        if self.first_chunk_lba_present = other.first_chunk_lba_present
+        then
+          if self.first_chunk_lba = other.first_chunk_lba
+          then
+            if self.executable_tag = other.executable_tag
+            then
+              if self.xattr_present = other.xattr_present
+              then
+                if self.xattr_name_id = other.xattr_name_id
+                then
+                  if self.xattr_value_len = other.xattr_value_len
+                  then
+                    if self.xattr_value_id = other.xattr_value_id
+                    then
+                      DigestWords.Insts.CoreCmpPartialEqDigestWords.eq
+                        self.file_sha256 other.file_sha256
+                    else ok false
+                  else ok false
+                else ok false
+              else ok false
+            else ok false
+          else ok false
+        else ok false
+      else ok false
+    else ok false
+  else ok false
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::RichRegularFileCore> for rao_manifest_verif::RichRegularFileCore}]
+    Source: 'src/lib.rs', lines 163:29-163:38 -/
+@[reducible]
+def RichRegularFileCore.Insts.CoreCmpPartialEqRichRegularFileCore :
+  core.cmp.PartialEq RichRegularFileCore RichRegularFileCore := {
+  eq := RichRegularFileCore.Insts.CoreCmpPartialEqRichRegularFileCore.eq
+}
+
+/-- [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::RichRegularFileCore}::assert_fields_are_eq]:
+    Source: 'src/lib.rs', lines 163:40-163:42
+    Visibility: public -/
+def RichRegularFileCore.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : RichRegularFileCore) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::RichRegularFileCore}]
+    Source: 'src/lib.rs', lines 163:40-163:42 -/
+@[reducible]
+def RichRegularFileCore.Insts.CoreCmpEq : core.cmp.Eq RichRegularFileCore := {
+  partialEqInst :=
+    RichRegularFileCore.Insts.CoreCmpPartialEqRichRegularFileCore
+  assert_fields_are_eq :=
+    RichRegularFileCore.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::HardlinkEntryCore}::clone]:
+    Source: 'src/lib.rs', lines 178:9-178:14
+    Visibility: public -/
+def HardlinkEntryCore.Insts.CoreCloneClone.clone
+  (self : HardlinkEntryCore) : Result HardlinkEntryCore := do
+  ok self
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::HardlinkEntryCore}]
+    Source: 'src/lib.rs', lines 178:9-178:14 -/
+@[reducible]
+def HardlinkEntryCore.Insts.CoreCloneClone : core.clone.Clone HardlinkEntryCore
+  := {
+  clone := HardlinkEntryCore.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::marker::Copy for rao_manifest_verif::HardlinkEntryCore}]
+    Source: 'src/lib.rs', lines 178:16-178:20 -/
+@[reducible]
+def HardlinkEntryCore.Insts.CoreMarkerCopy : core.marker.Copy HardlinkEntryCore
+  := {
+  cloneInst := HardlinkEntryCore.Insts.CoreCloneClone
+}
+
+/-- [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::HardlinkEntryCore}::fmt]:
+    Source: 'src/lib.rs', lines 178:22-178:27
+    Visibility: public -/
+def HardlinkEntryCore.Insts.CoreFmtDebug.fmt
+  (self : HardlinkEntryCore) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn := Dyn.mk _ core.fmt.DebugU64 self.path_id
+  let dyn1 := Dyn.mk _ core.fmt.DebugU64 self.file_id
+  let dyn2 := Dyn.mk _ core.fmt.DebugU64 self.link_target_path_id
+  let dyn3 :=
+    Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugU8) self.executable_tag
+  core.fmt.Formatter.debug_struct_field4_finish f (toStr "HardlinkEntryCore")
+    (toStr "path_id") dyn (toStr "file_id") dyn1 (toStr "link_target_path_id")
+    dyn2 (toStr "executable_tag") dyn3
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::HardlinkEntryCore}]
+    Source: 'src/lib.rs', lines 178:22-178:27 -/
+@[reducible]
+def HardlinkEntryCore.Insts.CoreFmtDebug : core.fmt.Debug HardlinkEntryCore
+  := {
+  fmt := HardlinkEntryCore.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::marker::StructuralPartialEq for rao_manifest_verif::HardlinkEntryCore}]
+    Source: 'src/lib.rs', lines 178:29-178:38 -/
+@[reducible]
+def HardlinkEntryCore.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq HardlinkEntryCore := {
+}
+
+/-- [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::HardlinkEntryCore> for rao_manifest_verif::HardlinkEntryCore}::eq]:
+    Source: 'src/lib.rs', lines 178:29-178:38
+    Visibility: public -/
+def HardlinkEntryCore.Insts.CoreCmpPartialEqHardlinkEntryCore.eq
+  (self : HardlinkEntryCore) (other : HardlinkEntryCore) : Result Bool := do
+  if self.path_id = other.path_id
+  then
+    if self.file_id = other.file_id
+    then
+      if self.link_target_path_id = other.link_target_path_id
+      then ok (self.executable_tag = other.executable_tag)
+      else ok false
+    else ok false
+  else ok false
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::HardlinkEntryCore> for rao_manifest_verif::HardlinkEntryCore}]
+    Source: 'src/lib.rs', lines 178:29-178:38 -/
+@[reducible]
+def HardlinkEntryCore.Insts.CoreCmpPartialEqHardlinkEntryCore :
+  core.cmp.PartialEq HardlinkEntryCore HardlinkEntryCore := {
+  eq := HardlinkEntryCore.Insts.CoreCmpPartialEqHardlinkEntryCore.eq
+}
+
+/-- [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::HardlinkEntryCore}::assert_fields_are_eq]:
+    Source: 'src/lib.rs', lines 178:40-178:42
+    Visibility: public -/
+def HardlinkEntryCore.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : HardlinkEntryCore) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::HardlinkEntryCore}]
+    Source: 'src/lib.rs', lines 178:40-178:42 -/
+@[reducible]
+def HardlinkEntryCore.Insts.CoreCmpEq : core.cmp.Eq HardlinkEntryCore := {
+  partialEqInst := HardlinkEntryCore.Insts.CoreCmpPartialEqHardlinkEntryCore
+  assert_fields_are_eq :=
+    HardlinkEntryCore.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::SymlinkEntryCore}::clone]:
+    Source: 'src/lib.rs', lines 186:9-186:14
+    Visibility: public -/
+def SymlinkEntryCore.Insts.CoreCloneClone.clone
+  (self : SymlinkEntryCore) : Result SymlinkEntryCore := do
+  ok self
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::SymlinkEntryCore}]
+    Source: 'src/lib.rs', lines 186:9-186:14 -/
+@[reducible]
+def SymlinkEntryCore.Insts.CoreCloneClone : core.clone.Clone SymlinkEntryCore
+  := {
+  clone := SymlinkEntryCore.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::marker::Copy for rao_manifest_verif::SymlinkEntryCore}]
+    Source: 'src/lib.rs', lines 186:16-186:20 -/
+@[reducible]
+def SymlinkEntryCore.Insts.CoreMarkerCopy : core.marker.Copy SymlinkEntryCore
+  := {
+  cloneInst := SymlinkEntryCore.Insts.CoreCloneClone
+}
+
+/-- [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::SymlinkEntryCore}::fmt]:
+    Source: 'src/lib.rs', lines 186:22-186:27
+    Visibility: public -/
+def SymlinkEntryCore.Insts.CoreFmtDebug.fmt
+  (self : SymlinkEntryCore) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn := Dyn.mk _ core.fmt.DebugU64 self.path_id
+  let dyn1 := Dyn.mk _ core.fmt.DebugU64 self.file_id
+  let dyn2 := Dyn.mk _ core.fmt.DebugU64 self.link_target_id
+  let dyn3 :=
+    Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugU8) self.executable_tag
+  core.fmt.Formatter.debug_struct_field4_finish f (toStr "SymlinkEntryCore")
+    (toStr "path_id") dyn (toStr "file_id") dyn1 (toStr "link_target_id") dyn2
+    (toStr "executable_tag") dyn3
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::SymlinkEntryCore}]
+    Source: 'src/lib.rs', lines 186:22-186:27 -/
+@[reducible]
+def SymlinkEntryCore.Insts.CoreFmtDebug : core.fmt.Debug SymlinkEntryCore := {
+  fmt := SymlinkEntryCore.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::marker::StructuralPartialEq for rao_manifest_verif::SymlinkEntryCore}]
+    Source: 'src/lib.rs', lines 186:29-186:38 -/
+@[reducible]
+def SymlinkEntryCore.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq SymlinkEntryCore := {
+}
+
+/-- [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::SymlinkEntryCore> for rao_manifest_verif::SymlinkEntryCore}::eq]:
+    Source: 'src/lib.rs', lines 186:29-186:38
+    Visibility: public -/
+def SymlinkEntryCore.Insts.CoreCmpPartialEqSymlinkEntryCore.eq
+  (self : SymlinkEntryCore) (other : SymlinkEntryCore) : Result Bool := do
+  if self.path_id = other.path_id
+  then
+    if self.file_id = other.file_id
+    then
+      if self.link_target_id = other.link_target_id
+      then ok (self.executable_tag = other.executable_tag)
+      else ok false
+    else ok false
+  else ok false
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::SymlinkEntryCore> for rao_manifest_verif::SymlinkEntryCore}]
+    Source: 'src/lib.rs', lines 186:29-186:38 -/
+@[reducible]
+def SymlinkEntryCore.Insts.CoreCmpPartialEqSymlinkEntryCore :
+  core.cmp.PartialEq SymlinkEntryCore SymlinkEntryCore := {
+  eq := SymlinkEntryCore.Insts.CoreCmpPartialEqSymlinkEntryCore.eq
+}
+
+/-- [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::SymlinkEntryCore}::assert_fields_are_eq]:
+    Source: 'src/lib.rs', lines 186:40-186:42
+    Visibility: public -/
+def SymlinkEntryCore.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : SymlinkEntryCore) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::SymlinkEntryCore}]
+    Source: 'src/lib.rs', lines 186:40-186:42 -/
+@[reducible]
+def SymlinkEntryCore.Insts.CoreCmpEq : core.cmp.Eq SymlinkEntryCore := {
+  partialEqInst := SymlinkEntryCore.Insts.CoreCmpPartialEqSymlinkEntryCore
+  assert_fields_are_eq := SymlinkEntryCore.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::DirectoryEntryCore}::clone]:
+    Source: 'src/lib.rs', lines 194:9-194:14
+    Visibility: public -/
+def DirectoryEntryCore.Insts.CoreCloneClone.clone
+  (self : DirectoryEntryCore) : Result DirectoryEntryCore := do
+  ok self
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::DirectoryEntryCore}]
+    Source: 'src/lib.rs', lines 194:9-194:14 -/
+@[reducible]
+def DirectoryEntryCore.Insts.CoreCloneClone : core.clone.Clone
+  DirectoryEntryCore := {
+  clone := DirectoryEntryCore.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::marker::Copy for rao_manifest_verif::DirectoryEntryCore}]
+    Source: 'src/lib.rs', lines 194:16-194:20 -/
+@[reducible]
+def DirectoryEntryCore.Insts.CoreMarkerCopy : core.marker.Copy
+  DirectoryEntryCore := {
+  cloneInst := DirectoryEntryCore.Insts.CoreCloneClone
+}
+
+/-- [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::DirectoryEntryCore}::fmt]:
+    Source: 'src/lib.rs', lines 194:22-194:27
+    Visibility: public -/
+def DirectoryEntryCore.Insts.CoreFmtDebug.fmt
+  (self : DirectoryEntryCore) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn := Dyn.mk _ core.fmt.DebugU64 self.path_id
+  let dyn1 := Dyn.mk _ core.fmt.DebugU64 self.file_id
+  let dyn2 :=
+    Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugU8) self.executable_tag
+  core.fmt.Formatter.debug_struct_field3_finish f (toStr "DirectoryEntryCore")
+    (toStr "path_id") dyn (toStr "file_id") dyn1 (toStr "executable_tag") dyn2
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::DirectoryEntryCore}]
+    Source: 'src/lib.rs', lines 194:22-194:27 -/
+@[reducible]
+def DirectoryEntryCore.Insts.CoreFmtDebug : core.fmt.Debug DirectoryEntryCore
+  := {
+  fmt := DirectoryEntryCore.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::marker::StructuralPartialEq for rao_manifest_verif::DirectoryEntryCore}]
+    Source: 'src/lib.rs', lines 194:29-194:38 -/
+@[reducible]
+def DirectoryEntryCore.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq DirectoryEntryCore := {
+}
+
+/-- [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::DirectoryEntryCore> for rao_manifest_verif::DirectoryEntryCore}::eq]:
+    Source: 'src/lib.rs', lines 194:29-194:38
+    Visibility: public -/
+def DirectoryEntryCore.Insts.CoreCmpPartialEqDirectoryEntryCore.eq
+  (self : DirectoryEntryCore) (other : DirectoryEntryCore) : Result Bool := do
+  if self.path_id = other.path_id
+  then
+    if self.file_id = other.file_id
+    then ok (self.executable_tag = other.executable_tag)
+    else ok false
+  else ok false
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::DirectoryEntryCore> for rao_manifest_verif::DirectoryEntryCore}]
+    Source: 'src/lib.rs', lines 194:29-194:38 -/
+@[reducible]
+def DirectoryEntryCore.Insts.CoreCmpPartialEqDirectoryEntryCore :
+  core.cmp.PartialEq DirectoryEntryCore DirectoryEntryCore := {
+  eq := DirectoryEntryCore.Insts.CoreCmpPartialEqDirectoryEntryCore.eq
+}
+
+/-- [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::DirectoryEntryCore}::assert_fields_are_eq]:
+    Source: 'src/lib.rs', lines 194:40-194:42
+    Visibility: public -/
+def DirectoryEntryCore.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : DirectoryEntryCore) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::DirectoryEntryCore}]
+    Source: 'src/lib.rs', lines 194:40-194:42 -/
+@[reducible]
+def DirectoryEntryCore.Insts.CoreCmpEq : core.cmp.Eq DirectoryEntryCore := {
+  partialEqInst := DirectoryEntryCore.Insts.CoreCmpPartialEqDirectoryEntryCore
+  assert_fields_are_eq :=
+    DirectoryEntryCore.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::ManifestEntriesCore}::clone]:
+    Source: 'src/lib.rs', lines 201:9-201:14
+    Visibility: public -/
+def ManifestEntriesCore.Insts.CoreCloneClone.clone
+  (self : ManifestEntriesCore) : Result ManifestEntriesCore := do
+  ok self
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::ManifestEntriesCore}]
+    Source: 'src/lib.rs', lines 201:9-201:14 -/
+@[reducible]
+def ManifestEntriesCore.Insts.CoreCloneClone : core.clone.Clone
+  ManifestEntriesCore := {
+  clone := ManifestEntriesCore.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::marker::Copy for rao_manifest_verif::ManifestEntriesCore}]
+    Source: 'src/lib.rs', lines 201:16-201:20 -/
+@[reducible]
+def ManifestEntriesCore.Insts.CoreMarkerCopy : core.marker.Copy
+  ManifestEntriesCore := {
+  cloneInst := ManifestEntriesCore.Insts.CoreCloneClone
+}
+
+/-- [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::ManifestEntriesCore}::fmt]:
+    Source: 'src/lib.rs', lines 201:22-201:27
+    Visibility: public -/
+def ManifestEntriesCore.Insts.CoreFmtDebug.fmt
+  (self : ManifestEntriesCore) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn := Dyn.mk _ core.fmt.DebugU64 self.object_id
+  let dyn1 := Dyn.mk _ core.fmt.DebugU64 self.caller_object_id
+  let dyn2 := Dyn.mk _ core.fmt.DebugU64 self.chunk_size
+  let dyn3 :=
+    Dyn.mk _ RichRegularFileCore.Insts.CoreFmtDebug self.nonempty_regular
+  let dyn4 :=
+    Dyn.mk _ RichRegularFileCore.Insts.CoreFmtDebug self.empty_regular
+  let dyn5 := Dyn.mk _ HardlinkEntryCore.Insts.CoreFmtDebug self.hardlink
+  let dyn6 := Dyn.mk _ SymlinkEntryCore.Insts.CoreFmtDebug self.symlink
+  let dyn7 :=
+    Dyn.mk _ (core.fmt.DebugShared DirectoryEntryCore.Insts.CoreFmtDebug)
+      self.directory
+  let values :=
+    Array.to_slice
+      (Array.make 8#usize [ dyn, dyn1, dyn2, dyn3, dyn4, dyn5, dyn6, dyn7 ])
+  let s ←
+    lift (Array.to_slice
+      (Array.make 8#usize [
+        toStr "object_id", toStr "caller_object_id", toStr "chunk_size", toStr
+        "nonempty_regular", toStr "empty_regular", toStr "hardlink", toStr
+        "symlink", toStr "directory"
+        ]))
+  core.fmt.Formatter.debug_struct_fields_finish f (toStr "ManifestEntriesCore")
+    s values
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::ManifestEntriesCore}]
+    Source: 'src/lib.rs', lines 201:22-201:27 -/
+@[reducible]
+def ManifestEntriesCore.Insts.CoreFmtDebug : core.fmt.Debug ManifestEntriesCore
+  := {
+  fmt := ManifestEntriesCore.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::marker::StructuralPartialEq for rao_manifest_verif::ManifestEntriesCore}]
+    Source: 'src/lib.rs', lines 201:29-201:38 -/
+@[reducible]
+def ManifestEntriesCore.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq ManifestEntriesCore := {
+}
+
+/-- [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::ManifestEntriesCore> for rao_manifest_verif::ManifestEntriesCore}::eq]:
+    Source: 'src/lib.rs', lines 201:29-201:38
+    Visibility: public -/
+def ManifestEntriesCore.Insts.CoreCmpPartialEqManifestEntriesCore.eq
+  (self : ManifestEntriesCore) (other : ManifestEntriesCore) :
+  Result Bool
+  := do
+  if self.object_id = other.object_id
+  then
+    if self.caller_object_id = other.caller_object_id
+    then
+      if self.chunk_size = other.chunk_size
+      then
+        let b ←
+          RichRegularFileCore.Insts.CoreCmpPartialEqRichRegularFileCore.eq
+            self.nonempty_regular other.nonempty_regular
+        if b
+        then
+          let b1 ←
+            RichRegularFileCore.Insts.CoreCmpPartialEqRichRegularFileCore.eq
+              self.empty_regular other.empty_regular
+          if b1
+          then
+            let b2 ←
+              HardlinkEntryCore.Insts.CoreCmpPartialEqHardlinkEntryCore.eq
+                self.hardlink other.hardlink
+            if b2
+            then
+              let b3 ←
+                SymlinkEntryCore.Insts.CoreCmpPartialEqSymlinkEntryCore.eq
+                  self.symlink other.symlink
+              if b3
+              then
+                DirectoryEntryCore.Insts.CoreCmpPartialEqDirectoryEntryCore.eq
+                  self.directory other.directory
+              else ok false
+            else ok false
+          else ok false
+        else ok false
+      else ok false
+    else ok false
+  else ok false
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::ManifestEntriesCore> for rao_manifest_verif::ManifestEntriesCore}]
+    Source: 'src/lib.rs', lines 201:29-201:38 -/
+@[reducible]
+def ManifestEntriesCore.Insts.CoreCmpPartialEqManifestEntriesCore :
+  core.cmp.PartialEq ManifestEntriesCore ManifestEntriesCore := {
+  eq := ManifestEntriesCore.Insts.CoreCmpPartialEqManifestEntriesCore.eq
+}
+
+/-- [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::ManifestEntriesCore}::assert_fields_are_eq]:
+    Source: 'src/lib.rs', lines 201:40-201:42
+    Visibility: public -/
+def ManifestEntriesCore.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : ManifestEntriesCore) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::ManifestEntriesCore}]
+    Source: 'src/lib.rs', lines 201:40-201:42 -/
+@[reducible]
+def ManifestEntriesCore.Insts.CoreCmpEq : core.cmp.Eq ManifestEntriesCore := {
+  partialEqInst :=
+    ManifestEntriesCore.Insts.CoreCmpPartialEqManifestEntriesCore
+  assert_fields_are_eq :=
+    ManifestEntriesCore.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::RichRegularFileWireCore}::clone]:
+    Source: 'src/lib.rs', lines 213:9-213:14
+    Visibility: public -/
+def RichRegularFileWireCore.Insts.CoreCloneClone.clone
+  (self : RichRegularFileWireCore) : Result RichRegularFileWireCore := do
+  ok self
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::RichRegularFileWireCore}]
+    Source: 'src/lib.rs', lines 213:9-213:14 -/
+@[reducible]
+def RichRegularFileWireCore.Insts.CoreCloneClone : core.clone.Clone
+  RichRegularFileWireCore := {
+  clone := RichRegularFileWireCore.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::marker::Copy for rao_manifest_verif::RichRegularFileWireCore}]
+    Source: 'src/lib.rs', lines 213:16-213:20 -/
+@[reducible]
+def RichRegularFileWireCore.Insts.CoreMarkerCopy : core.marker.Copy
+  RichRegularFileWireCore := {
+  cloneInst := RichRegularFileWireCore.Insts.CoreCloneClone
+}
+
+/-- [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::RichRegularFileWireCore}::fmt]:
+    Source: 'src/lib.rs', lines 213:22-213:27
+    Visibility: public -/
+def RichRegularFileWireCore.Insts.CoreFmtDebug.fmt
+  (self : RichRegularFileWireCore) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn := Dyn.mk _ core.fmt.DebugU64 self.map_len
+  let dyn1 := Dyn.mk _ core.fmt.DebugU64 self.key_path
+  let dyn2 := Dyn.mk _ core.fmt.DebugU64 self.path_id
+  let dyn3 := Dyn.mk _ core.fmt.DebugU64 self.key_file_id
+  let dyn4 := Dyn.mk _ core.fmt.DebugU64 self.file_id
+  let dyn5 := Dyn.mk _ core.fmt.DebugU64 self.key_executable
+  let dyn6 := Dyn.mk _ core.fmt.DebugU8 self.executable_tag
+  let dyn7 := Dyn.mk _ core.fmt.DebugU64 self.key_size_bytes
+  let dyn8 := Dyn.mk _ core.fmt.DebugU64 self.size_bytes
+  let dyn9 := Dyn.mk _ core.fmt.DebugU64 self.key_chunk_count
+  let dyn10 := Dyn.mk _ core.fmt.DebugU64 self.chunk_count
+  let dyn11 := Dyn.mk _ core.fmt.DebugU64 self.key_file_sha256
+  let dyn12 := Dyn.mk _ core.fmt.DebugU64 self.file_sha256_len
+  let dyn13 := Dyn.mk _ DigestWords.Insts.CoreFmtDebug self.file_sha256
+  let dyn14 := Dyn.mk _ core.fmt.DebugU64 self.key_first_chunk_lba
+  let dyn15 := Dyn.mk _ core.fmt.DebugBool self.first_chunk_lba_is_null
+  let dyn16 := Dyn.mk _ core.fmt.DebugU64 self.first_chunk_lba
+  let dyn17 := Dyn.mk _ core.fmt.DebugU64 self.key_metadata_preservation_data
+  let dyn18 :=
+    Dyn.mk _ core.fmt.DebugU64 self.metadata_preservation_data_map_len
+  let dyn19 := Dyn.mk _ core.fmt.DebugU64 self.metadata_key_xattrs
+  let dyn20 := Dyn.mk _ core.fmt.DebugU64 self.xattrs_map_len
+  let dyn21 := Dyn.mk _ core.fmt.DebugU64 self.xattr_name_id
+  let dyn22 := Dyn.mk _ core.fmt.DebugU64 self.xattr_value_len
+  let dyn23 :=
+    Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugU64) self.xattr_value_id
+  let values :=
+    Array.to_slice
+      (Array.make 24#usize [
+        dyn, dyn1, dyn2, dyn3, dyn4, dyn5, dyn6, dyn7, dyn8, dyn9, dyn10,
+        dyn11, dyn12, dyn13, dyn14, dyn15, dyn16, dyn17, dyn18, dyn19, dyn20,
+        dyn21, dyn22, dyn23
+        ])
+  let s ←
+    lift (Array.to_slice
+      (Array.make 24#usize [
+        toStr "map_len", toStr "key_path", toStr "path_id", toStr
+        "key_file_id", toStr "file_id", toStr "key_executable", toStr
+        "executable_tag", toStr "key_size_bytes", toStr "size_bytes", toStr
+        "key_chunk_count", toStr "chunk_count", toStr "key_file_sha256", toStr
+        "file_sha256_len", toStr "file_sha256", toStr "key_first_chunk_lba",
+        toStr "first_chunk_lba_is_null", toStr "first_chunk_lba", toStr
+        "key_metadata_preservation_data", toStr
+        "metadata_preservation_data_map_len", toStr "metadata_key_xattrs",
+        toStr "xattrs_map_len", toStr "xattr_name_id", toStr "xattr_value_len",
+        toStr "xattr_value_id"
+        ]))
+  core.fmt.Formatter.debug_struct_fields_finish f (toStr
+    "RichRegularFileWireCore") s values
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::RichRegularFileWireCore}]
+    Source: 'src/lib.rs', lines 213:22-213:27 -/
+@[reducible]
+def RichRegularFileWireCore.Insts.CoreFmtDebug : core.fmt.Debug
+  RichRegularFileWireCore := {
+  fmt := RichRegularFileWireCore.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::marker::StructuralPartialEq for rao_manifest_verif::RichRegularFileWireCore}]
+    Source: 'src/lib.rs', lines 213:29-213:38 -/
+@[reducible]
+def RichRegularFileWireCore.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq RichRegularFileWireCore := {
+}
+
+/-- [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::RichRegularFileWireCore> for rao_manifest_verif::RichRegularFileWireCore}::eq]:
+    Source: 'src/lib.rs', lines 213:29-213:38
+    Visibility: public -/
+def RichRegularFileWireCore.Insts.CoreCmpPartialEqRichRegularFileWireCore.eq
+  (self : RichRegularFileWireCore) (other : RichRegularFileWireCore) :
+  Result Bool
+  := do
+  if self.map_len = other.map_len
+  then
+    if self.key_path = other.key_path
+    then
+      if self.path_id = other.path_id
+      then
+        if self.key_file_id = other.key_file_id
+        then
+          if self.file_id = other.file_id
+          then
+            if self.key_executable = other.key_executable
+            then
+              if self.executable_tag = other.executable_tag
+              then
+                if self.key_size_bytes = other.key_size_bytes
+                then
+                  if self.size_bytes = other.size_bytes
+                  then
+                    if self.key_chunk_count = other.key_chunk_count
+                    then
+                      if self.chunk_count = other.chunk_count
+                      then
+                        if self.key_file_sha256 = other.key_file_sha256
+                        then
+                          if self.file_sha256_len = other.file_sha256_len
+                          then
+                            if self.key_first_chunk_lba =
+                              other.key_first_chunk_lba
+                            then
+                              if self.first_chunk_lba_is_null =
+                                other.first_chunk_lba_is_null
+                              then
+                                if self.first_chunk_lba = other.first_chunk_lba
+                                then
+                                  if self.key_metadata_preservation_data =
+                                    other.key_metadata_preservation_data
+                                  then
+                                    if self.metadata_preservation_data_map_len
+                                      =
+                                      other.metadata_preservation_data_map_len
+                                    then
+                                      if self.metadata_key_xattrs =
+                                        other.metadata_key_xattrs
+                                      then
+                                        if self.xattrs_map_len =
+                                          other.xattrs_map_len
+                                        then
+                                          if self.xattr_name_id =
+                                            other.xattr_name_id
+                                          then
+                                            if self.xattr_value_len =
+                                              other.xattr_value_len
+                                            then
+                                              if self.xattr_value_id =
+                                                other.xattr_value_id
+                                              then
+                                                DigestWords.Insts.CoreCmpPartialEqDigestWords.eq
+                                                  self.file_sha256
+                                                  other.file_sha256
+                                              else ok false
+                                            else ok false
+                                          else ok false
+                                        else ok false
+                                      else ok false
+                                    else ok false
+                                  else ok false
+                                else ok false
+                              else ok false
+                            else ok false
+                          else ok false
+                        else ok false
+                      else ok false
+                    else ok false
+                  else ok false
+                else ok false
+              else ok false
+            else ok false
+          else ok false
+        else ok false
+      else ok false
+    else ok false
+  else ok false
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::RichRegularFileWireCore> for rao_manifest_verif::RichRegularFileWireCore}]
+    Source: 'src/lib.rs', lines 213:29-213:38 -/
+@[reducible]
+def RichRegularFileWireCore.Insts.CoreCmpPartialEqRichRegularFileWireCore :
+  core.cmp.PartialEq RichRegularFileWireCore RichRegularFileWireCore := {
+  eq :=
+    RichRegularFileWireCore.Insts.CoreCmpPartialEqRichRegularFileWireCore.eq
+}
+
+/-- [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::RichRegularFileWireCore}::assert_fields_are_eq]:
+    Source: 'src/lib.rs', lines 213:40-213:42
+    Visibility: public -/
+def RichRegularFileWireCore.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : RichRegularFileWireCore) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::RichRegularFileWireCore}]
+    Source: 'src/lib.rs', lines 213:40-213:42 -/
+@[reducible]
+def RichRegularFileWireCore.Insts.CoreCmpEq : core.cmp.Eq
+  RichRegularFileWireCore := {
+  partialEqInst :=
+    RichRegularFileWireCore.Insts.CoreCmpPartialEqRichRegularFileWireCore
+  assert_fields_are_eq :=
+    RichRegularFileWireCore.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::LinkEntryWireCore}::clone]:
+    Source: 'src/lib.rs', lines 241:9-241:14
+    Visibility: public -/
+def LinkEntryWireCore.Insts.CoreCloneClone.clone
+  (self : LinkEntryWireCore) : Result LinkEntryWireCore := do
+  ok self
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::LinkEntryWireCore}]
+    Source: 'src/lib.rs', lines 241:9-241:14 -/
+@[reducible]
+def LinkEntryWireCore.Insts.CoreCloneClone : core.clone.Clone LinkEntryWireCore
+  := {
+  clone := LinkEntryWireCore.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::marker::Copy for rao_manifest_verif::LinkEntryWireCore}]
+    Source: 'src/lib.rs', lines 241:16-241:20 -/
+@[reducible]
+def LinkEntryWireCore.Insts.CoreMarkerCopy : core.marker.Copy LinkEntryWireCore
+  := {
+  cloneInst := LinkEntryWireCore.Insts.CoreCloneClone
+}
+
+/-- [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::LinkEntryWireCore}::fmt]:
+    Source: 'src/lib.rs', lines 241:22-241:27
+    Visibility: public -/
+def LinkEntryWireCore.Insts.CoreFmtDebug.fmt
+  (self : LinkEntryWireCore) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn := Dyn.mk _ core.fmt.DebugU64 self.map_len
+  let dyn1 := Dyn.mk _ core.fmt.DebugU64 self.key_path
+  let dyn2 := Dyn.mk _ core.fmt.DebugU64 self.path_id
+  let dyn3 := Dyn.mk _ core.fmt.DebugU64 self.key_file_id
+  let dyn4 := Dyn.mk _ core.fmt.DebugU64 self.file_id
+  let dyn5 := Dyn.mk _ core.fmt.DebugU64 self.key_entry_type
+  let dyn6 := Dyn.mk _ core.fmt.DebugU8 self.entry_type
+  let dyn7 := Dyn.mk _ core.fmt.DebugU64 self.key_executable
+  let dyn8 := Dyn.mk _ core.fmt.DebugU8 self.executable_tag
+  let dyn9 := Dyn.mk _ core.fmt.DebugU64 self.key_size_bytes
+  let dyn10 := Dyn.mk _ core.fmt.DebugU64 self.size_bytes
+  let dyn11 := Dyn.mk _ core.fmt.DebugU64 self.key_chunk_count
+  let dyn12 := Dyn.mk _ core.fmt.DebugU64 self.chunk_count
+  let dyn13 := Dyn.mk _ core.fmt.DebugU64 self.key_link_target
+  let dyn14 := Dyn.mk _ core.fmt.DebugU64 self.link_target_id
+  let dyn15 := Dyn.mk _ core.fmt.DebugU64 self.key_first_chunk_lba
+  let dyn16 := Dyn.mk _ core.fmt.DebugBool self.first_chunk_lba_is_null
+  let dyn17 := Dyn.mk _ core.fmt.DebugU64 self.key_metadata_preservation_data
+  let dyn18 :=
+    Dyn.mk _ core.fmt.DebugBool self.metadata_preservation_data_empty
+  let dyn19 :=
+    Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugBool) self.file_sha256_present
+  let values :=
+    Array.to_slice
+      (Array.make 20#usize [
+        dyn, dyn1, dyn2, dyn3, dyn4, dyn5, dyn6, dyn7, dyn8, dyn9, dyn10,
+        dyn11, dyn12, dyn13, dyn14, dyn15, dyn16, dyn17, dyn18, dyn19
+        ])
+  let s ←
+    lift (Array.to_slice
+      (Array.make 20#usize [
+        toStr "map_len", toStr "key_path", toStr "path_id", toStr
+        "key_file_id", toStr "file_id", toStr "key_entry_type", toStr
+        "entry_type", toStr "key_executable", toStr "executable_tag", toStr
+        "key_size_bytes", toStr "size_bytes", toStr "key_chunk_count", toStr
+        "chunk_count", toStr "key_link_target", toStr "link_target_id", toStr
+        "key_first_chunk_lba", toStr "first_chunk_lba_is_null", toStr
+        "key_metadata_preservation_data", toStr
+        "metadata_preservation_data_empty", toStr "file_sha256_present"
+        ]))
+  core.fmt.Formatter.debug_struct_fields_finish f (toStr "LinkEntryWireCore") s
+    values
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::LinkEntryWireCore}]
+    Source: 'src/lib.rs', lines 241:22-241:27 -/
+@[reducible]
+def LinkEntryWireCore.Insts.CoreFmtDebug : core.fmt.Debug LinkEntryWireCore
+  := {
+  fmt := LinkEntryWireCore.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::marker::StructuralPartialEq for rao_manifest_verif::LinkEntryWireCore}]
+    Source: 'src/lib.rs', lines 241:29-241:38 -/
+@[reducible]
+def LinkEntryWireCore.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq LinkEntryWireCore := {
+}
+
+/-- [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::LinkEntryWireCore> for rao_manifest_verif::LinkEntryWireCore}::eq]:
+    Source: 'src/lib.rs', lines 241:29-241:38
+    Visibility: public -/
+def LinkEntryWireCore.Insts.CoreCmpPartialEqLinkEntryWireCore.eq
+  (self : LinkEntryWireCore) (other : LinkEntryWireCore) : Result Bool := do
+  if self.map_len = other.map_len
+  then
+    if self.key_path = other.key_path
+    then
+      if self.path_id = other.path_id
+      then
+        if self.key_file_id = other.key_file_id
+        then
+          if self.file_id = other.file_id
+          then
+            if self.key_entry_type = other.key_entry_type
+            then
+              if self.entry_type = other.entry_type
+              then
+                if self.key_executable = other.key_executable
+                then
+                  if self.executable_tag = other.executable_tag
+                  then
+                    if self.key_size_bytes = other.key_size_bytes
+                    then
+                      if self.size_bytes = other.size_bytes
+                      then
+                        if self.key_chunk_count = other.key_chunk_count
+                        then
+                          if self.chunk_count = other.chunk_count
+                          then
+                            if self.key_link_target = other.key_link_target
+                            then
+                              if self.link_target_id = other.link_target_id
+                              then
+                                if self.key_first_chunk_lba =
+                                  other.key_first_chunk_lba
+                                then
+                                  if self.first_chunk_lba_is_null =
+                                    other.first_chunk_lba_is_null
+                                  then
+                                    if self.key_metadata_preservation_data =
+                                      other.key_metadata_preservation_data
+                                    then
+                                      if self.metadata_preservation_data_empty
+                                        =
+                                        other.metadata_preservation_data_empty
+                                      then
+                                        ok (self.file_sha256_present =
+                                          other.file_sha256_present)
+                                      else ok false
+                                    else ok false
+                                  else ok false
+                                else ok false
+                              else ok false
+                            else ok false
+                          else ok false
+                        else ok false
+                      else ok false
+                    else ok false
+                  else ok false
+                else ok false
+              else ok false
+            else ok false
+          else ok false
+        else ok false
+      else ok false
+    else ok false
+  else ok false
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::LinkEntryWireCore> for rao_manifest_verif::LinkEntryWireCore}]
+    Source: 'src/lib.rs', lines 241:29-241:38 -/
+@[reducible]
+def LinkEntryWireCore.Insts.CoreCmpPartialEqLinkEntryWireCore :
+  core.cmp.PartialEq LinkEntryWireCore LinkEntryWireCore := {
+  eq := LinkEntryWireCore.Insts.CoreCmpPartialEqLinkEntryWireCore.eq
+}
+
+/-- [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::LinkEntryWireCore}::assert_fields_are_eq]:
+    Source: 'src/lib.rs', lines 241:40-241:42
+    Visibility: public -/
+def LinkEntryWireCore.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : LinkEntryWireCore) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::LinkEntryWireCore}]
+    Source: 'src/lib.rs', lines 241:40-241:42 -/
+@[reducible]
+def LinkEntryWireCore.Insts.CoreCmpEq : core.cmp.Eq LinkEntryWireCore := {
+  partialEqInst := LinkEntryWireCore.Insts.CoreCmpPartialEqLinkEntryWireCore
+  assert_fields_are_eq :=
+    LinkEntryWireCore.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::DirectoryEntryWireCore}::clone]:
+    Source: 'src/lib.rs', lines 265:9-265:14
+    Visibility: public -/
+def DirectoryEntryWireCore.Insts.CoreCloneClone.clone
+  (self : DirectoryEntryWireCore) : Result DirectoryEntryWireCore := do
+  ok self
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::DirectoryEntryWireCore}]
+    Source: 'src/lib.rs', lines 265:9-265:14 -/
+@[reducible]
+def DirectoryEntryWireCore.Insts.CoreCloneClone : core.clone.Clone
+  DirectoryEntryWireCore := {
+  clone := DirectoryEntryWireCore.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::marker::Copy for rao_manifest_verif::DirectoryEntryWireCore}]
+    Source: 'src/lib.rs', lines 265:16-265:20 -/
+@[reducible]
+def DirectoryEntryWireCore.Insts.CoreMarkerCopy : core.marker.Copy
+  DirectoryEntryWireCore := {
+  cloneInst := DirectoryEntryWireCore.Insts.CoreCloneClone
+}
+
+/-- [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::DirectoryEntryWireCore}::fmt]:
+    Source: 'src/lib.rs', lines 265:22-265:27
+    Visibility: public -/
+def DirectoryEntryWireCore.Insts.CoreFmtDebug.fmt
+  (self : DirectoryEntryWireCore) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn := Dyn.mk _ core.fmt.DebugU64 self.map_len
+  let dyn1 := Dyn.mk _ core.fmt.DebugU64 self.key_path
+  let dyn2 := Dyn.mk _ core.fmt.DebugU64 self.path_id
+  let dyn3 := Dyn.mk _ core.fmt.DebugU64 self.key_file_id
+  let dyn4 := Dyn.mk _ core.fmt.DebugU64 self.file_id
+  let dyn5 := Dyn.mk _ core.fmt.DebugU64 self.key_entry_type
+  let dyn6 := Dyn.mk _ core.fmt.DebugU8 self.entry_type
+  let dyn7 := Dyn.mk _ core.fmt.DebugU64 self.key_executable
+  let dyn8 := Dyn.mk _ core.fmt.DebugU8 self.executable_tag
+  let dyn9 := Dyn.mk _ core.fmt.DebugU64 self.key_size_bytes
+  let dyn10 := Dyn.mk _ core.fmt.DebugU64 self.size_bytes
+  let dyn11 := Dyn.mk _ core.fmt.DebugU64 self.key_chunk_count
+  let dyn12 := Dyn.mk _ core.fmt.DebugU64 self.chunk_count
+  let dyn13 := Dyn.mk _ core.fmt.DebugU64 self.key_first_chunk_lba
+  let dyn14 := Dyn.mk _ core.fmt.DebugBool self.first_chunk_lba_is_null
+  let dyn15 := Dyn.mk _ core.fmt.DebugU64 self.key_metadata_preservation_data
+  let dyn16 :=
+    Dyn.mk _ core.fmt.DebugBool self.metadata_preservation_data_empty
+  let dyn17 := Dyn.mk _ core.fmt.DebugBool self.file_sha256_present
+  let dyn18 :=
+    Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugBool) self.link_target_present
+  let values :=
+    Array.to_slice
+      (Array.make 19#usize [
+        dyn, dyn1, dyn2, dyn3, dyn4, dyn5, dyn6, dyn7, dyn8, dyn9, dyn10,
+        dyn11, dyn12, dyn13, dyn14, dyn15, dyn16, dyn17, dyn18
+        ])
+  let s ←
+    lift (Array.to_slice
+      (Array.make 19#usize [
+        toStr "map_len", toStr "key_path", toStr "path_id", toStr
+        "key_file_id", toStr "file_id", toStr "key_entry_type", toStr
+        "entry_type", toStr "key_executable", toStr "executable_tag", toStr
+        "key_size_bytes", toStr "size_bytes", toStr "key_chunk_count", toStr
+        "chunk_count", toStr "key_first_chunk_lba", toStr
+        "first_chunk_lba_is_null", toStr "key_metadata_preservation_data",
+        toStr "metadata_preservation_data_empty", toStr "file_sha256_present",
+        toStr "link_target_present"
+        ]))
+  core.fmt.Formatter.debug_struct_fields_finish f (toStr
+    "DirectoryEntryWireCore") s values
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::DirectoryEntryWireCore}]
+    Source: 'src/lib.rs', lines 265:22-265:27 -/
+@[reducible]
+def DirectoryEntryWireCore.Insts.CoreFmtDebug : core.fmt.Debug
+  DirectoryEntryWireCore := {
+  fmt := DirectoryEntryWireCore.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::marker::StructuralPartialEq for rao_manifest_verif::DirectoryEntryWireCore}]
+    Source: 'src/lib.rs', lines 265:29-265:38 -/
+@[reducible]
+def DirectoryEntryWireCore.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq DirectoryEntryWireCore := {
+}
+
+/-- [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::DirectoryEntryWireCore> for rao_manifest_verif::DirectoryEntryWireCore}::eq]:
+    Source: 'src/lib.rs', lines 265:29-265:38
+    Visibility: public -/
+def DirectoryEntryWireCore.Insts.CoreCmpPartialEqDirectoryEntryWireCore.eq
+  (self : DirectoryEntryWireCore) (other : DirectoryEntryWireCore) :
+  Result Bool
+  := do
+  if self.map_len = other.map_len
+  then
+    if self.key_path = other.key_path
+    then
+      if self.path_id = other.path_id
+      then
+        if self.key_file_id = other.key_file_id
+        then
+          if self.file_id = other.file_id
+          then
+            if self.key_entry_type = other.key_entry_type
+            then
+              if self.entry_type = other.entry_type
+              then
+                if self.key_executable = other.key_executable
+                then
+                  if self.executable_tag = other.executable_tag
+                  then
+                    if self.key_size_bytes = other.key_size_bytes
+                    then
+                      if self.size_bytes = other.size_bytes
+                      then
+                        if self.key_chunk_count = other.key_chunk_count
+                        then
+                          if self.chunk_count = other.chunk_count
+                          then
+                            if self.key_first_chunk_lba =
+                              other.key_first_chunk_lba
+                            then
+                              if self.first_chunk_lba_is_null =
+                                other.first_chunk_lba_is_null
+                              then
+                                if self.key_metadata_preservation_data =
+                                  other.key_metadata_preservation_data
+                                then
+                                  if self.metadata_preservation_data_empty =
+                                    other.metadata_preservation_data_empty
+                                  then
+                                    if self.file_sha256_present =
+                                      other.file_sha256_present
+                                    then
+                                      ok (self.link_target_present =
+                                        other.link_target_present)
+                                    else ok false
+                                  else ok false
+                                else ok false
+                              else ok false
+                            else ok false
+                          else ok false
+                        else ok false
+                      else ok false
+                    else ok false
+                  else ok false
+                else ok false
+              else ok false
+            else ok false
+          else ok false
+        else ok false
+      else ok false
+    else ok false
+  else ok false
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::DirectoryEntryWireCore> for rao_manifest_verif::DirectoryEntryWireCore}]
+    Source: 'src/lib.rs', lines 265:29-265:38 -/
+@[reducible]
+def DirectoryEntryWireCore.Insts.CoreCmpPartialEqDirectoryEntryWireCore :
+  core.cmp.PartialEq DirectoryEntryWireCore DirectoryEntryWireCore := {
+  eq := DirectoryEntryWireCore.Insts.CoreCmpPartialEqDirectoryEntryWireCore.eq
+}
+
+/-- [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::DirectoryEntryWireCore}::assert_fields_are_eq]:
+    Source: 'src/lib.rs', lines 265:40-265:42
+    Visibility: public -/
+def DirectoryEntryWireCore.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : DirectoryEntryWireCore) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::DirectoryEntryWireCore}]
+    Source: 'src/lib.rs', lines 265:40-265:42 -/
+@[reducible]
+def DirectoryEntryWireCore.Insts.CoreCmpEq : core.cmp.Eq DirectoryEntryWireCore
+  := {
+  partialEqInst :=
+    DirectoryEntryWireCore.Insts.CoreCmpPartialEqDirectoryEntryWireCore
+  assert_fields_are_eq :=
+    DirectoryEntryWireCore.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::ManifestEntriesWireCore}::clone]:
+    Source: 'src/lib.rs', lines 288:9-288:14
+    Visibility: public -/
+def ManifestEntriesWireCore.Insts.CoreCloneClone.clone
+  (self : ManifestEntriesWireCore) : Result ManifestEntriesWireCore := do
+  ok self
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::clone::Clone for rao_manifest_verif::ManifestEntriesWireCore}]
+    Source: 'src/lib.rs', lines 288:9-288:14 -/
+@[reducible]
+def ManifestEntriesWireCore.Insts.CoreCloneClone : core.clone.Clone
+  ManifestEntriesWireCore := {
+  clone := ManifestEntriesWireCore.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::marker::Copy for rao_manifest_verif::ManifestEntriesWireCore}]
+    Source: 'src/lib.rs', lines 288:16-288:20 -/
+@[reducible]
+def ManifestEntriesWireCore.Insts.CoreMarkerCopy : core.marker.Copy
+  ManifestEntriesWireCore := {
+  cloneInst := ManifestEntriesWireCore.Insts.CoreCloneClone
+}
+
+/-- [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::ManifestEntriesWireCore}::fmt]:
+    Source: 'src/lib.rs', lines 288:22-288:27
+    Visibility: public -/
+def ManifestEntriesWireCore.Insts.CoreFmtDebug.fmt
+  (self : ManifestEntriesWireCore) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn := Dyn.mk _ core.fmt.DebugU64 self.root_map_len
+  let dyn1 := Dyn.mk _ core.fmt.DebugU64 self.key_object_id
+  let dyn2 := Dyn.mk _ core.fmt.DebugU64 self.object_id
+  let dyn3 := Dyn.mk _ core.fmt.DebugU64 self.key_chunk_size
+  let dyn4 := Dyn.mk _ core.fmt.DebugU64 self.chunk_size
+  let dyn5 := Dyn.mk _ core.fmt.DebugU64 self.key_file_entries
+  let dyn6 := Dyn.mk _ core.fmt.DebugU64 self.file_entries_len
+  let dyn7 :=
+    Dyn.mk _ RichRegularFileWireCore.Insts.CoreFmtDebug self.nonempty_regular
+  let dyn8 :=
+    Dyn.mk _ RichRegularFileWireCore.Insts.CoreFmtDebug self.empty_regular
+  let dyn9 := Dyn.mk _ LinkEntryWireCore.Insts.CoreFmtDebug self.hardlink
+  let dyn10 := Dyn.mk _ LinkEntryWireCore.Insts.CoreFmtDebug self.symlink
+  let dyn11 :=
+    Dyn.mk _ DirectoryEntryWireCore.Insts.CoreFmtDebug self.directory
+  let dyn12 := Dyn.mk _ core.fmt.DebugU64 self.key_schema_version
+  let dyn13 := Dyn.mk _ core.fmt.DebugU64 self.schema_version
+  let dyn14 := Dyn.mk _ core.fmt.DebugU64 self.key_object_metadata
+  let dyn15 := Dyn.mk _ core.fmt.DebugBool self.object_metadata_empty
+  let dyn16 := Dyn.mk _ core.fmt.DebugU64 self.key_caller_object_id
+  let dyn17 := Dyn.mk _ core.fmt.DebugU64 self.caller_object_id
+  let dyn18 := Dyn.mk _ core.fmt.DebugU64 self.key_external_references
+  let dyn19 := Dyn.mk _ core.fmt.DebugBool self.external_references_empty
+  let dyn20 :=
+    Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugBool) self.trailing_data
+  let values :=
+    Array.to_slice
+      (Array.make 21#usize [
+        dyn, dyn1, dyn2, dyn3, dyn4, dyn5, dyn6, dyn7, dyn8, dyn9, dyn10,
+        dyn11, dyn12, dyn13, dyn14, dyn15, dyn16, dyn17, dyn18, dyn19, dyn20
+        ])
+  let s ←
+    lift (Array.to_slice
+      (Array.make 21#usize [
+        toStr "root_map_len", toStr "key_object_id", toStr "object_id", toStr
+        "key_chunk_size", toStr "chunk_size", toStr "key_file_entries", toStr
+        "file_entries_len", toStr "nonempty_regular", toStr "empty_regular",
+        toStr "hardlink", toStr "symlink", toStr "directory", toStr
+        "key_schema_version", toStr "schema_version", toStr
+        "key_object_metadata", toStr "object_metadata_empty", toStr
+        "key_caller_object_id", toStr "caller_object_id", toStr
+        "key_external_references", toStr "external_references_empty", toStr
+        "trailing_data"
+        ]))
+  core.fmt.Formatter.debug_struct_fields_finish f (toStr
+    "ManifestEntriesWireCore") s values
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::fmt::Debug for rao_manifest_verif::ManifestEntriesWireCore}]
+    Source: 'src/lib.rs', lines 288:22-288:27 -/
+@[reducible]
+def ManifestEntriesWireCore.Insts.CoreFmtDebug : core.fmt.Debug
+  ManifestEntriesWireCore := {
+  fmt := ManifestEntriesWireCore.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::marker::StructuralPartialEq for rao_manifest_verif::ManifestEntriesWireCore}]
+    Source: 'src/lib.rs', lines 288:29-288:38 -/
+@[reducible]
+def ManifestEntriesWireCore.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq ManifestEntriesWireCore := {
+}
+
+/-- [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::ManifestEntriesWireCore> for rao_manifest_verif::ManifestEntriesWireCore}::eq]:
+    Source: 'src/lib.rs', lines 288:29-288:38
+    Visibility: public -/
+def ManifestEntriesWireCore.Insts.CoreCmpPartialEqManifestEntriesWireCore.eq
+  (self : ManifestEntriesWireCore) (other : ManifestEntriesWireCore) :
+  Result Bool
+  := do
+  if self.root_map_len = other.root_map_len
+  then
+    if self.key_object_id = other.key_object_id
+    then
+      if self.object_id = other.object_id
+      then
+        if self.key_chunk_size = other.key_chunk_size
+        then
+          if self.chunk_size = other.chunk_size
+          then
+            if self.key_file_entries = other.key_file_entries
+            then
+              if self.file_entries_len = other.file_entries_len
+              then
+                if self.key_schema_version = other.key_schema_version
+                then
+                  if self.schema_version = other.schema_version
+                  then
+                    if self.key_object_metadata = other.key_object_metadata
+                    then
+                      if self.object_metadata_empty =
+                        other.object_metadata_empty
+                      then
+                        if self.key_caller_object_id =
+                          other.key_caller_object_id
+                        then
+                          if self.caller_object_id = other.caller_object_id
+                          then
+                            if self.key_external_references =
+                              other.key_external_references
+                            then
+                              if self.external_references_empty =
+                                other.external_references_empty
+                              then
+                                if self.trailing_data = other.trailing_data
+                                then
+                                  let b ←
+                                    RichRegularFileWireCore.Insts.CoreCmpPartialEqRichRegularFileWireCore.eq
+                                      self.nonempty_regular
+                                      other.nonempty_regular
+                                  if b
+                                  then
+                                    let b1 ←
+                                      RichRegularFileWireCore.Insts.CoreCmpPartialEqRichRegularFileWireCore.eq
+                                        self.empty_regular other.empty_regular
+                                    if b1
+                                    then
+                                      let b2 ←
+                                        LinkEntryWireCore.Insts.CoreCmpPartialEqLinkEntryWireCore.eq
+                                          self.hardlink other.hardlink
+                                      if b2
+                                      then
+                                        let b3 ←
+                                          LinkEntryWireCore.Insts.CoreCmpPartialEqLinkEntryWireCore.eq
+                                            self.symlink other.symlink
+                                        if b3
+                                        then
+                                          DirectoryEntryWireCore.Insts.CoreCmpPartialEqDirectoryEntryWireCore.eq
+                                            self.directory other.directory
+                                        else ok false
+                                      else ok false
+                                    else ok false
+                                  else ok false
+                                else ok false
+                              else ok false
+                            else ok false
+                          else ok false
+                        else ok false
+                      else ok false
+                    else ok false
+                  else ok false
+                else ok false
+              else ok false
+            else ok false
+          else ok false
+        else ok false
+      else ok false
+    else ok false
+  else ok false
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::cmp::PartialEq<rao_manifest_verif::ManifestEntriesWireCore> for rao_manifest_verif::ManifestEntriesWireCore}]
+    Source: 'src/lib.rs', lines 288:29-288:38 -/
+@[reducible]
+def ManifestEntriesWireCore.Insts.CoreCmpPartialEqManifestEntriesWireCore :
+  core.cmp.PartialEq ManifestEntriesWireCore ManifestEntriesWireCore := {
+  eq :=
+    ManifestEntriesWireCore.Insts.CoreCmpPartialEqManifestEntriesWireCore.eq
+}
+
+/-- [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::ManifestEntriesWireCore}::assert_fields_are_eq]:
+    Source: 'src/lib.rs', lines 288:40-288:42
+    Visibility: public -/
+def ManifestEntriesWireCore.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : ManifestEntriesWireCore) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [rao_manifest_verif::{impl core::cmp::Eq for rao_manifest_verif::ManifestEntriesWireCore}]
+    Source: 'src/lib.rs', lines 288:40-288:42 -/
+@[reducible]
+def ManifestEntriesWireCore.Insts.CoreCmpEq : core.cmp.Eq
+  ManifestEntriesWireCore := {
+  partialEqInst :=
+    ManifestEntriesWireCore.Insts.CoreCmpPartialEqManifestEntriesWireCore
+  assert_fields_are_eq :=
+    ManifestEntriesWireCore.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
 /-- [rao_manifest_verif::checked_add]:
-    Source: 'src/lib.rs', lines 125:0-130:1
+    Source: 'src/lib.rs', lines 313:0-318:1
     Visibility: public -/
 def checked_add
   (a : Std.U64) (b : Std.U64) :
@@ -873,7 +2344,7 @@ def checked_add
   | some sum => ok (core.result.Result.Ok sum)
 
 /-- [rao_manifest_verif::validate_chunk_size]:
-    Source: 'src/lib.rs', lines 132:0-137:1
+    Source: 'src/lib.rs', lines 320:0-325:1
     Visibility: public -/
 def validate_chunk_size
   (chunk_size : Std.U64) :
@@ -888,7 +2359,7 @@ def validate_chunk_size
     else ok (core.result.Result.Ok ())
 
 /-- [rao_manifest_verif::chunk_count_core]:
-    Source: 'src/lib.rs', lines 139:0-146:1
+    Source: 'src/lib.rs', lines 327:0-334:1
     Visibility: public -/
 def chunk_count_core
   (size_bytes : Std.U64) (chunk_size : Std.U64) :
@@ -909,7 +2380,7 @@ def chunk_count_core
       Std.U64 (core.convert.FromSame RaoManifestError) residual
 
 /-- [rao_manifest_verif::validate_regular_file_core]:
-    Source: 'src/lib.rs', lines 148:0-168:1
+    Source: 'src/lib.rs', lines 336:0-356:1
     Visibility: public -/
 def validate_regular_file_core
   (file : RegularFileCore) (chunk_size : Std.U64) :
@@ -958,7 +2429,7 @@ def validate_regular_file_core
       Unit (core.convert.FromSame RaoManifestError) residual
 
 /-- [rao_manifest_verif::validate_manifest_core]:
-    Source: 'src/lib.rs', lines 170:0-177:1
+    Source: 'src/lib.rs', lines 358:0-365:1
     Visibility: public -/
 def validate_manifest_core
   (manifest : ManifestCore) :
@@ -984,7 +2455,7 @@ def validate_manifest_core
       Unit (core.convert.FromSame RaoManifestError) residual
 
 /-- [rao_manifest_verif::encode_regular_file_core]:
-    Source: 'src/lib.rs', lines 179:0-206:1
+    Source: 'src/lib.rs', lines 367:0-394:1
     Visibility: public -/
 def encode_regular_file_core
   (file : RegularFileCore) (chunk_size : Std.U64) :
@@ -1028,7 +2499,7 @@ def encode_regular_file_core
       RegularFileWireCore (core.convert.FromSame RaoManifestError) residual
 
 /-- [rao_manifest_verif::encode_manifest_core]:
-    Source: 'src/lib.rs', lines 208:0-230:1
+    Source: 'src/lib.rs', lines 396:0-418:1
     Visibility: public -/
 def encode_manifest_core
   (manifest : ManifestCore) :
@@ -1070,7 +2541,7 @@ def encode_manifest_core
       ManifestWireCore (core.convert.FromSame RaoManifestError) residual
 
 /-- [rao_manifest_verif::decode_regular_file_core]:
-    Source: 'src/lib.rs', lines 232:0-284:1
+    Source: 'src/lib.rs', lines 420:0-472:1
     Visibility: public -/
 def decode_regular_file_core
   (wire : RegularFileWireCore) (chunk_size : Std.U64) :
@@ -1212,7 +2683,7 @@ def decode_regular_file_core
                           RaoManifestError.InvalidManifestField)
 
 /-- [rao_manifest_verif::decode_manifest_core]:
-    Source: 'src/lib.rs', lines 286:0-328:1
+    Source: 'src/lib.rs', lines 474:0-516:1
     Visibility: public -/
 def decode_manifest_core
   (wire : ManifestWireCore) (reader_chunk_size : Std.U64) :
@@ -1310,6 +2781,1355 @@ def decode_manifest_core
                                 residual =>
                                 core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
                                   ManifestCore (core.convert.FromSame
+                                  RaoManifestError) residual
+                            else
+                              ok (core.result.Result.Err
+                                RaoManifestError.InvalidManifestField)
+                          else
+                            ok (core.result.Result.Err
+                              RaoManifestError.InvalidManifestField)
+
+/-- [rao_manifest_verif::regular_file_from_rich]:
+    Source: 'src/lib.rs', lines 518:0-528:1
+    Visibility: public -/
+def regular_file_from_rich
+  (file : RichRegularFileCore) : Result RegularFileCore := do
+  ok
+    {
+      path_id := file.path_id,
+      file_id := file.file_id,
+      size_bytes := file.size_bytes,
+      file_sha256 := file.file_sha256,
+      first_chunk_lba_present := file.first_chunk_lba_present,
+      first_chunk_lba := file.first_chunk_lba,
+      executable_tag := file.executable_tag
+    }
+
+/-- [rao_manifest_verif::validate_rich_regular_file_core]:
+    Source: 'src/lib.rs', lines 530:0-543:1
+    Visibility: public -/
+def validate_rich_regular_file_core
+  (file : RichRegularFileCore) (chunk_size : Std.U64) :
+  Result (core.result.Result Unit RaoManifestError)
+  := do
+  let rfc ← regular_file_from_rich file
+  let r ← validate_regular_file_core rfc chunk_size
+  let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+  match cf with
+  | core.ops.control_flow.ControlFlow.Continue _ =>
+    if file.xattr_present
+    then
+      if file.xattr_name_id = 0#u64
+      then ok (core.result.Result.Err RaoManifestError.InvalidManifestField)
+      else ok (core.result.Result.Ok ())
+    else
+      if file.xattr_name_id != 0#u64
+      then ok (core.result.Result.Err RaoManifestError.InvalidManifestField)
+      else
+        if file.xattr_value_len != 0#u64
+        then ok (core.result.Result.Err RaoManifestError.InvalidManifestField)
+        else
+          if file.xattr_value_id != 0#u64
+          then
+            ok (core.result.Result.Err RaoManifestError.InvalidManifestField)
+          else ok (core.result.Result.Ok ())
+  | core.ops.control_flow.ControlFlow.Break residual =>
+    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+      Unit (core.convert.FromSame RaoManifestError) residual
+
+/-- [rao_manifest_verif::validate_hardlink_entry_core]:
+    Source: 'src/lib.rs', lines 545:0-553:1
+    Visibility: public -/
+def validate_hardlink_entry_core
+  (entry : HardlinkEntryCore) :
+  Result (core.result.Result Unit RaoManifestError)
+  := do
+  if entry.path_id = 0#u64
+  then ok (core.result.Result.Err RaoManifestError.InvalidManifestField)
+  else
+    if entry.file_id = 0#u64
+    then ok (core.result.Result.Err RaoManifestError.InvalidManifestField)
+    else
+      if entry.link_target_path_id = 0#u64
+      then ok (core.result.Result.Err RaoManifestError.InvalidManifestField)
+      else
+        if entry.executable_tag > EXECUTABLE_TRUE
+        then ok (core.result.Result.Err RaoManifestError.InvalidManifestField)
+        else ok (core.result.Result.Ok ())
+
+/-- [rao_manifest_verif::validate_symlink_entry_core]:
+    Source: 'src/lib.rs', lines 555:0-563:1
+    Visibility: public -/
+def validate_symlink_entry_core
+  (entry : SymlinkEntryCore) :
+  Result (core.result.Result Unit RaoManifestError)
+  := do
+  if entry.path_id = 0#u64
+  then ok (core.result.Result.Err RaoManifestError.InvalidManifestField)
+  else
+    if entry.file_id = 0#u64
+    then ok (core.result.Result.Err RaoManifestError.InvalidManifestField)
+    else
+      if entry.link_target_id = 0#u64
+      then ok (core.result.Result.Err RaoManifestError.InvalidManifestField)
+      else
+        if entry.executable_tag > EXECUTABLE_TRUE
+        then ok (core.result.Result.Err RaoManifestError.InvalidManifestField)
+        else ok (core.result.Result.Ok ())
+
+/-- [rao_manifest_verif::validate_directory_entry_core]:
+    Source: 'src/lib.rs', lines 565:0-573:1
+    Visibility: public -/
+def validate_directory_entry_core
+  (entry : DirectoryEntryCore) :
+  Result (core.result.Result Unit RaoManifestError)
+  := do
+  if entry.path_id = 0#u64
+  then ok (core.result.Result.Err RaoManifestError.InvalidManifestField)
+  else
+    if entry.file_id = 0#u64
+    then ok (core.result.Result.Err RaoManifestError.InvalidManifestField)
+    else
+      if entry.executable_tag > EXECUTABLE_TRUE
+      then ok (core.result.Result.Err RaoManifestError.InvalidManifestField)
+      else ok (core.result.Result.Ok ())
+
+/-- [rao_manifest_verif::validate_manifest_entries_core]:
+    Source: 'src/lib.rs', lines 575:0-597:1
+    Visibility: public -/
+def validate_manifest_entries_core
+  (manifest : ManifestEntriesCore) :
+  Result (core.result.Result Unit RaoManifestError)
+  := do
+  let r ← validate_chunk_size manifest.chunk_size
+  let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+  match cf with
+  | core.ops.control_flow.ControlFlow.Continue _ =>
+    if manifest.object_id = 0#u64
+    then ok (core.result.Result.Err RaoManifestError.InvalidManifestField)
+    else
+      if manifest.nonempty_regular.size_bytes = 0#u64
+      then ok (core.result.Result.Err RaoManifestError.InvalidManifestField)
+      else
+        if manifest.empty_regular.size_bytes != 0#u64
+        then ok (core.result.Result.Err RaoManifestError.InvalidManifestField)
+        else
+          let r1 ←
+            validate_rich_regular_file_core manifest.nonempty_regular
+              manifest.chunk_size
+          let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
+          match cf1 with
+          | core.ops.control_flow.ControlFlow.Continue _ =>
+            let r2 ←
+              validate_rich_regular_file_core manifest.empty_regular
+                manifest.chunk_size
+            let cf2 ← core.result.Result.Insts.CoreOpsTry.branch r2
+            match cf2 with
+            | core.ops.control_flow.ControlFlow.Continue _ =>
+              let r3 ← validate_hardlink_entry_core manifest.hardlink
+              let cf3 ← core.result.Result.Insts.CoreOpsTry.branch r3
+              match cf3 with
+              | core.ops.control_flow.ControlFlow.Continue _ =>
+                let r4 ← validate_symlink_entry_core manifest.symlink
+                let cf4 ← core.result.Result.Insts.CoreOpsTry.branch r4
+                match cf4 with
+                | core.ops.control_flow.ControlFlow.Continue _ =>
+                  let r5 ← validate_directory_entry_core manifest.directory
+                  let cf5 ← core.result.Result.Insts.CoreOpsTry.branch r5
+                  match cf5 with
+                  | core.ops.control_flow.ControlFlow.Continue _ =>
+                    if manifest.hardlink.link_target_path_id !=
+                      manifest.nonempty_regular.path_id
+                    then
+                      ok (core.result.Result.Err
+                        RaoManifestError.InvalidManifestField)
+                    else ok (core.result.Result.Ok ())
+                  | core.ops.control_flow.ControlFlow.Break residual =>
+                    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                      Unit (core.convert.FromSame RaoManifestError) residual
+                | core.ops.control_flow.ControlFlow.Break residual =>
+                  core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                    Unit (core.convert.FromSame RaoManifestError) residual
+              | core.ops.control_flow.ControlFlow.Break residual =>
+                core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                  Unit (core.convert.FromSame RaoManifestError) residual
+            | core.ops.control_flow.ControlFlow.Break residual =>
+              core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                Unit (core.convert.FromSame RaoManifestError) residual
+          | core.ops.control_flow.ControlFlow.Break residual =>
+            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+              Unit (core.convert.FromSame RaoManifestError) residual
+  | core.ops.control_flow.ControlFlow.Break residual =>
+    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+      Unit (core.convert.FromSame RaoManifestError) residual
+
+/-- [rao_manifest_verif::encode_rich_regular_file_core]:
+    Source: 'src/lib.rs', lines 599:0-643:1
+    Visibility: public -/
+def encode_rich_regular_file_core
+  (file : RichRegularFileCore) (chunk_size : Std.U64) :
+  Result (core.result.Result RichRegularFileWireCore RaoManifestError)
+  := do
+  let r ← validate_rich_regular_file_core file chunk_size
+  let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+  match cf with
+  | core.ops.control_flow.ControlFlow.Continue _ =>
+    let r1 ← chunk_count_core file.size_bytes chunk_size
+    let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
+    match cf1 with
+    | core.ops.control_flow.ControlFlow.Continue val =>
+      let (b, i) ←
+        if file.xattr_present
+        then ok (true, METADATA_PRESERVATION_XATTRS_MAP_LEN)
+        else ok (false, METADATA_PRESERVATION_EMPTY_MAP_LEN)
+      let i1 ← if b
+                 then ok METADATA_KEY_XATTRS
+                 else ok 0#u64
+      if b
+      then
+        ok (core.result.Result.Ok
+          {
+            map_len := FILE_ENTRY_REGULAR_MAP_LEN,
+            key_path := FILE_KEY_PATH,
+            path_id := file.path_id,
+            key_file_id := FILE_KEY_FILE_ID,
+            file_id := file.file_id,
+            key_executable := FILE_KEY_EXECUTABLE,
+            executable_tag := file.executable_tag,
+            key_size_bytes := FILE_KEY_SIZE_BYTES,
+            size_bytes := file.size_bytes,
+            key_chunk_count := FILE_KEY_CHUNK_COUNT,
+            chunk_count := val,
+            key_file_sha256 := FILE_KEY_FILE_SHA256,
+            file_sha256_len := DIGEST_BYTE_LEN,
+            file_sha256 := file.file_sha256,
+            key_first_chunk_lba := FILE_KEY_FIRST_CHUNK_LBA,
+            first_chunk_lba_is_null := (¬ file.first_chunk_lba_present),
+            first_chunk_lba := file.first_chunk_lba,
+            key_metadata_preservation_data :=
+              FILE_KEY_METADATA_PRESERVATION_DATA,
+            metadata_preservation_data_map_len := i,
+            metadata_key_xattrs := i1,
+            xattrs_map_len := XATTRS_ONE_ENTRY_LEN,
+            xattr_name_id := file.xattr_name_id,
+            xattr_value_len := file.xattr_value_len,
+            xattr_value_id := file.xattr_value_id
+          })
+      else
+        ok (core.result.Result.Ok
+          {
+            map_len := FILE_ENTRY_REGULAR_MAP_LEN,
+            key_path := FILE_KEY_PATH,
+            path_id := file.path_id,
+            key_file_id := FILE_KEY_FILE_ID,
+            file_id := file.file_id,
+            key_executable := FILE_KEY_EXECUTABLE,
+            executable_tag := file.executable_tag,
+            key_size_bytes := FILE_KEY_SIZE_BYTES,
+            size_bytes := file.size_bytes,
+            key_chunk_count := FILE_KEY_CHUNK_COUNT,
+            chunk_count := val,
+            key_file_sha256 := FILE_KEY_FILE_SHA256,
+            file_sha256_len := DIGEST_BYTE_LEN,
+            file_sha256 := file.file_sha256,
+            key_first_chunk_lba := FILE_KEY_FIRST_CHUNK_LBA,
+            first_chunk_lba_is_null := (¬ file.first_chunk_lba_present),
+            first_chunk_lba := file.first_chunk_lba,
+            key_metadata_preservation_data :=
+              FILE_KEY_METADATA_PRESERVATION_DATA,
+            metadata_preservation_data_map_len := i,
+            metadata_key_xattrs := i1,
+            xattrs_map_len := 0#u64,
+            xattr_name_id := file.xattr_name_id,
+            xattr_value_len := file.xattr_value_len,
+            xattr_value_id := file.xattr_value_id
+          })
+    | core.ops.control_flow.ControlFlow.Break residual =>
+      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+        RichRegularFileWireCore (core.convert.FromSame RaoManifestError)
+        residual
+  | core.ops.control_flow.ControlFlow.Break residual =>
+    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+      RichRegularFileWireCore (core.convert.FromSame RaoManifestError) residual
+
+/-- [rao_manifest_verif::encode_hardlink_entry_core]:
+    Source: 'src/lib.rs', lines 645:0-671:1
+    Visibility: public -/
+def encode_hardlink_entry_core
+  (entry : HardlinkEntryCore) :
+  Result (core.result.Result LinkEntryWireCore RaoManifestError)
+  := do
+  let r ← validate_hardlink_entry_core entry
+  let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+  match cf with
+  | core.ops.control_flow.ControlFlow.Continue _ =>
+    ok (core.result.Result.Ok
+      {
+        map_len := FILE_ENTRY_LINK_MAP_LEN,
+        key_path := LINK_KEY_PATH,
+        path_id := entry.path_id,
+        key_file_id := LINK_KEY_FILE_ID,
+        file_id := entry.file_id,
+        key_entry_type := LINK_KEY_ENTRY_TYPE,
+        entry_type := ENTRY_TYPE_HARDLINK,
+        key_executable := LINK_KEY_EXECUTABLE,
+        executable_tag := entry.executable_tag,
+        key_size_bytes := LINK_KEY_SIZE_BYTES,
+        size_bytes := 0#u64,
+        key_chunk_count := LINK_KEY_CHUNK_COUNT,
+        chunk_count := 0#u64,
+        key_link_target := LINK_KEY_LINK_TARGET,
+        link_target_id := entry.link_target_path_id,
+        key_first_chunk_lba := LINK_KEY_FIRST_CHUNK_LBA,
+        first_chunk_lba_is_null := true,
+        key_metadata_preservation_data := LINK_KEY_METADATA_PRESERVATION_DATA,
+        metadata_preservation_data_empty := true,
+        file_sha256_present := false
+      })
+  | core.ops.control_flow.ControlFlow.Break residual =>
+    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+      LinkEntryWireCore (core.convert.FromSame RaoManifestError) residual
+
+/-- [rao_manifest_verif::encode_symlink_entry_core]:
+    Source: 'src/lib.rs', lines 673:0-699:1
+    Visibility: public -/
+def encode_symlink_entry_core
+  (entry : SymlinkEntryCore) :
+  Result (core.result.Result LinkEntryWireCore RaoManifestError)
+  := do
+  let r ← validate_symlink_entry_core entry
+  let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+  match cf with
+  | core.ops.control_flow.ControlFlow.Continue _ =>
+    ok (core.result.Result.Ok
+      {
+        map_len := FILE_ENTRY_LINK_MAP_LEN,
+        key_path := LINK_KEY_PATH,
+        path_id := entry.path_id,
+        key_file_id := LINK_KEY_FILE_ID,
+        file_id := entry.file_id,
+        key_entry_type := LINK_KEY_ENTRY_TYPE,
+        entry_type := ENTRY_TYPE_SYMLINK,
+        key_executable := LINK_KEY_EXECUTABLE,
+        executable_tag := entry.executable_tag,
+        key_size_bytes := LINK_KEY_SIZE_BYTES,
+        size_bytes := 0#u64,
+        key_chunk_count := LINK_KEY_CHUNK_COUNT,
+        chunk_count := 0#u64,
+        key_link_target := LINK_KEY_LINK_TARGET,
+        link_target_id := entry.link_target_id,
+        key_first_chunk_lba := LINK_KEY_FIRST_CHUNK_LBA,
+        first_chunk_lba_is_null := true,
+        key_metadata_preservation_data := LINK_KEY_METADATA_PRESERVATION_DATA,
+        metadata_preservation_data_empty := true,
+        file_sha256_present := false
+      })
+  | core.ops.control_flow.ControlFlow.Break residual =>
+    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+      LinkEntryWireCore (core.convert.FromSame RaoManifestError) residual
+
+/-- [rao_manifest_verif::encode_directory_entry_core]:
+    Source: 'src/lib.rs', lines 701:0-726:1
+    Visibility: public -/
+def encode_directory_entry_core
+  (entry : DirectoryEntryCore) :
+  Result (core.result.Result DirectoryEntryWireCore RaoManifestError)
+  := do
+  let r ← validate_directory_entry_core entry
+  let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+  match cf with
+  | core.ops.control_flow.ControlFlow.Continue _ =>
+    ok (core.result.Result.Ok
+      {
+        map_len := FILE_ENTRY_DIRECTORY_MAP_LEN,
+        key_path := DIRECTORY_KEY_PATH,
+        path_id := entry.path_id,
+        key_file_id := DIRECTORY_KEY_FILE_ID,
+        file_id := entry.file_id,
+        key_entry_type := DIRECTORY_KEY_ENTRY_TYPE,
+        entry_type := ENTRY_TYPE_DIRECTORY,
+        key_executable := DIRECTORY_KEY_EXECUTABLE,
+        executable_tag := entry.executable_tag,
+        key_size_bytes := DIRECTORY_KEY_SIZE_BYTES,
+        size_bytes := 0#u64,
+        key_chunk_count := DIRECTORY_KEY_CHUNK_COUNT,
+        chunk_count := 0#u64,
+        key_first_chunk_lba := DIRECTORY_KEY_FIRST_CHUNK_LBA,
+        first_chunk_lba_is_null := true,
+        key_metadata_preservation_data :=
+          DIRECTORY_KEY_METADATA_PRESERVATION_DATA,
+        metadata_preservation_data_empty := true,
+        file_sha256_present := false,
+        link_target_present := false
+      })
+  | core.ops.control_flow.ControlFlow.Break residual =>
+    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+      DirectoryEntryWireCore (core.convert.FromSame RaoManifestError) residual
+
+/-- [rao_manifest_verif::encode_manifest_entries_core]:
+    Source: 'src/lib.rs', lines 728:0-761:1
+    Visibility: public -/
+def encode_manifest_entries_core
+  (manifest : ManifestEntriesCore) :
+  Result (core.result.Result ManifestEntriesWireCore RaoManifestError)
+  := do
+  let r ← validate_manifest_entries_core manifest
+  let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+  match cf with
+  | core.ops.control_flow.ControlFlow.Continue _ =>
+    let r1 ←
+      encode_rich_regular_file_core manifest.nonempty_regular
+        manifest.chunk_size
+    let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
+    match cf1 with
+    | core.ops.control_flow.ControlFlow.Continue val =>
+      let r2 ←
+        encode_rich_regular_file_core manifest.empty_regular
+          manifest.chunk_size
+      let cf2 ← core.result.Result.Insts.CoreOpsTry.branch r2
+      match cf2 with
+      | core.ops.control_flow.ControlFlow.Continue val1 =>
+        let r3 ← encode_hardlink_entry_core manifest.hardlink
+        let cf3 ← core.result.Result.Insts.CoreOpsTry.branch r3
+        match cf3 with
+        | core.ops.control_flow.ControlFlow.Continue val2 =>
+          let r4 ← encode_symlink_entry_core manifest.symlink
+          let cf4 ← core.result.Result.Insts.CoreOpsTry.branch r4
+          match cf4 with
+          | core.ops.control_flow.ControlFlow.Continue val3 =>
+            let r5 ← encode_directory_entry_core manifest.directory
+            let cf5 ← core.result.Result.Insts.CoreOpsTry.branch r5
+            match cf5 with
+            | core.ops.control_flow.ControlFlow.Continue val4 =>
+              ok (core.result.Result.Ok
+                {
+                  root_map_len := ROOT_MAP_LEN,
+                  key_object_id := ROOT_KEY_OBJECT_ID,
+                  object_id := manifest.object_id,
+                  key_chunk_size := ROOT_KEY_CHUNK_SIZE,
+                  chunk_size := manifest.chunk_size,
+                  key_file_entries := ROOT_KEY_FILE_ENTRIES,
+                  file_entries_len := FILE_ENTRIES_LEN_BOUNDED,
+                  nonempty_regular := val,
+                  empty_regular := val1,
+                  hardlink := val2,
+                  symlink := val3,
+                  directory := val4,
+                  key_schema_version := ROOT_KEY_SCHEMA_VERSION,
+                  schema_version := SCHEMA_VERSION,
+                  key_object_metadata := ROOT_KEY_OBJECT_METADATA,
+                  object_metadata_empty := true,
+                  key_caller_object_id := ROOT_KEY_CALLER_OBJECT_ID,
+                  caller_object_id := manifest.caller_object_id,
+                  key_external_references := ROOT_KEY_EXTERNAL_REFERENCES,
+                  external_references_empty := true,
+                  trailing_data := false
+                })
+            | core.ops.control_flow.ControlFlow.Break residual =>
+              core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                ManifestEntriesWireCore (core.convert.FromSame
+                RaoManifestError) residual
+          | core.ops.control_flow.ControlFlow.Break residual =>
+            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+              ManifestEntriesWireCore (core.convert.FromSame RaoManifestError)
+              residual
+        | core.ops.control_flow.ControlFlow.Break residual =>
+          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+            ManifestEntriesWireCore (core.convert.FromSame RaoManifestError)
+            residual
+      | core.ops.control_flow.ControlFlow.Break residual =>
+        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+          ManifestEntriesWireCore (core.convert.FromSame RaoManifestError)
+          residual
+    | core.ops.control_flow.ControlFlow.Break residual =>
+      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+        ManifestEntriesWireCore (core.convert.FromSame RaoManifestError)
+        residual
+  | core.ops.control_flow.ControlFlow.Break residual =>
+    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+      ManifestEntriesWireCore (core.convert.FromSame RaoManifestError) residual
+
+/-- [rao_manifest_verif::decode_rich_regular_file_core]:
+    Source: 'src/lib.rs', lines 763:0-839:1
+    Visibility: public -/
+def decode_rich_regular_file_core
+  (wire : RichRegularFileWireCore) (chunk_size : Std.U64) :
+  Result (core.result.Result RichRegularFileCore RaoManifestError)
+  := do
+  if wire.map_len != FILE_ENTRY_REGULAR_MAP_LEN
+  then
+    ok (core.result.Result.Err RaoManifestError.MissingRequiredManifestField)
+  else
+    if wire.key_path != FILE_KEY_PATH
+    then ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+    else
+      if wire.key_file_id != FILE_KEY_FILE_ID
+      then ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+      else
+        if wire.key_executable != FILE_KEY_EXECUTABLE
+        then ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+        else
+          if wire.key_size_bytes != FILE_KEY_SIZE_BYTES
+          then ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+          else
+            if wire.key_chunk_count != FILE_KEY_CHUNK_COUNT
+            then
+              ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+            else
+              if wire.key_file_sha256 != FILE_KEY_FILE_SHA256
+              then
+                ok (core.result.Result.Err
+                  RaoManifestError.InvalidCborEncoding)
+              else
+                if wire.key_first_chunk_lba != FILE_KEY_FIRST_CHUNK_LBA
+                then
+                  ok (core.result.Result.Err
+                    RaoManifestError.InvalidCborEncoding)
+                else
+                  if wire.key_metadata_preservation_data !=
+                    FILE_KEY_METADATA_PRESERVATION_DATA
+                  then
+                    ok (core.result.Result.Err
+                      RaoManifestError.InvalidCborEncoding)
+                  else
+                    if wire.file_sha256_len != DIGEST_BYTE_LEN
+                    then
+                      ok (core.result.Result.Err
+                        RaoManifestError.InvalidManifestField)
+                    else
+                      let r ← chunk_count_core wire.size_bytes chunk_size
+                      let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+                      match cf with
+                      | core.ops.control_flow.ControlFlow.Continue val =>
+                        if wire.chunk_count != val
+                        then
+                          ok (core.result.Result.Err
+                            RaoManifestError.InvalidManifestField)
+                        else
+                          if wire.size_bytes = 0#u64
+                          then
+                            if wire.first_chunk_lba_is_null
+                            then
+                              if wire.metadata_preservation_data_map_len =
+                                METADATA_PRESERVATION_EMPTY_MAP_LEN
+                              then
+                                if wire.metadata_key_xattrs != 0#u64
+                                then
+                                  ok (core.result.Result.Err
+                                    RaoManifestError.InvalidManifestField)
+                                else
+                                  if wire.xattrs_map_len != 0#u64
+                                  then
+                                    ok (core.result.Result.Err
+                                      RaoManifestError.InvalidManifestField)
+                                  else
+                                    if wire.xattr_name_id != 0#u64
+                                    then
+                                      ok (core.result.Result.Err
+                                        RaoManifestError.InvalidManifestField)
+                                    else
+                                      if wire.xattr_value_len != 0#u64
+                                      then
+                                        ok (core.result.Result.Err
+                                          RaoManifestError.InvalidManifestField)
+                                      else
+                                        if wire.xattr_value_id != 0#u64
+                                        then
+                                          ok (core.result.Result.Err
+                                            RaoManifestError.InvalidManifestField)
+                                        else
+                                          let r1 ←
+                                            validate_rich_regular_file_core
+                                              {
+                                                path_id := wire.path_id,
+                                                file_id := wire.file_id,
+                                                size_bytes := wire.size_bytes,
+                                                file_sha256 := wire.file_sha256,
+                                                first_chunk_lba_present :=
+                                                  (¬ true),
+                                                first_chunk_lba := 0#u64,
+                                                executable_tag :=
+                                                  wire.executable_tag,
+                                                xattr_present := false,
+                                                xattr_name_id :=
+                                                  wire.xattr_name_id,
+                                                xattr_value_len :=
+                                                  wire.xattr_value_len,
+                                                xattr_value_id :=
+                                                  wire.xattr_value_id
+                                              } chunk_size
+                                          let cf1 ←
+                                            core.result.Result.Insts.CoreOpsTry.branch
+                                              r1
+                                          match cf1 with
+                                          |
+                                            core.ops.control_flow.ControlFlow.Continue
+                                            _ =>
+                                            ok (core.result.Result.Ok
+                                              {
+                                                path_id := wire.path_id,
+                                                file_id := wire.file_id,
+                                                size_bytes := wire.size_bytes,
+                                                file_sha256 := wire.file_sha256,
+                                                first_chunk_lba_present :=
+                                                  (¬ true),
+                                                first_chunk_lba := 0#u64,
+                                                executable_tag :=
+                                                  wire.executable_tag,
+                                                xattr_present := false,
+                                                xattr_name_id :=
+                                                  wire.xattr_name_id,
+                                                xattr_value_len :=
+                                                  wire.xattr_value_len,
+                                                xattr_value_id :=
+                                                  wire.xattr_value_id
+                                              })
+                                          |
+                                            core.ops.control_flow.ControlFlow.Break
+                                            residual =>
+                                            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                              RichRegularFileCore
+                                              (core.convert.FromSame
+                                              RaoManifestError) residual
+                              else
+                                if wire.metadata_preservation_data_map_len =
+                                  METADATA_PRESERVATION_XATTRS_MAP_LEN
+                                then
+                                  if wire.metadata_key_xattrs !=
+                                    METADATA_KEY_XATTRS
+                                  then
+                                    ok (core.result.Result.Err
+                                      RaoManifestError.InvalidManifestField)
+                                  else
+                                    if wire.xattrs_map_len !=
+                                      XATTRS_ONE_ENTRY_LEN
+                                    then
+                                      ok (core.result.Result.Err
+                                        RaoManifestError.InvalidManifestField)
+                                    else
+                                      if wire.xattr_name_id = 0#u64
+                                      then
+                                        ok (core.result.Result.Err
+                                          RaoManifestError.InvalidManifestField)
+                                      else
+                                        let r1 ←
+                                          validate_rich_regular_file_core
+                                            {
+                                              path_id := wire.path_id,
+                                              file_id := wire.file_id,
+                                              size_bytes := wire.size_bytes,
+                                              file_sha256 := wire.file_sha256,
+                                              first_chunk_lba_present :=
+                                                (¬ true),
+                                              first_chunk_lba := 0#u64,
+                                              executable_tag :=
+                                                wire.executable_tag,
+                                              xattr_present := true,
+                                              xattr_name_id :=
+                                                wire.xattr_name_id,
+                                              xattr_value_len :=
+                                                wire.xattr_value_len,
+                                              xattr_value_id :=
+                                                wire.xattr_value_id
+                                            } chunk_size
+                                        let cf1 ←
+                                          core.result.Result.Insts.CoreOpsTry.branch
+                                            r1
+                                        match cf1 with
+                                        |
+                                          core.ops.control_flow.ControlFlow.Continue
+                                          _ =>
+                                          ok (core.result.Result.Ok
+                                            {
+                                              path_id := wire.path_id,
+                                              file_id := wire.file_id,
+                                              size_bytes := wire.size_bytes,
+                                              file_sha256 := wire.file_sha256,
+                                              first_chunk_lba_present :=
+                                                (¬ true),
+                                              first_chunk_lba := 0#u64,
+                                              executable_tag :=
+                                                wire.executable_tag,
+                                              xattr_present := true,
+                                              xattr_name_id :=
+                                                wire.xattr_name_id,
+                                              xattr_value_len :=
+                                                wire.xattr_value_len,
+                                              xattr_value_id :=
+                                                wire.xattr_value_id
+                                            })
+                                        |
+                                          core.ops.control_flow.ControlFlow.Break
+                                          residual =>
+                                          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                            RichRegularFileCore
+                                            (core.convert.FromSame
+                                            RaoManifestError) residual
+                                else
+                                  ok (core.result.Result.Err
+                                    RaoManifestError.InvalidManifestField)
+                            else
+                              ok (core.result.Result.Err
+                                RaoManifestError.InvalidManifestField)
+                          else
+                            if wire.first_chunk_lba_is_null
+                            then
+                              ok (core.result.Result.Err
+                                RaoManifestError.InvalidManifestField)
+                            else
+                              if wire.metadata_preservation_data_map_len =
+                                METADATA_PRESERVATION_EMPTY_MAP_LEN
+                              then
+                                if wire.metadata_key_xattrs != 0#u64
+                                then
+                                  ok (core.result.Result.Err
+                                    RaoManifestError.InvalidManifestField)
+                                else
+                                  if wire.xattrs_map_len != 0#u64
+                                  then
+                                    ok (core.result.Result.Err
+                                      RaoManifestError.InvalidManifestField)
+                                  else
+                                    if wire.xattr_name_id != 0#u64
+                                    then
+                                      ok (core.result.Result.Err
+                                        RaoManifestError.InvalidManifestField)
+                                    else
+                                      if wire.xattr_value_len != 0#u64
+                                      then
+                                        ok (core.result.Result.Err
+                                          RaoManifestError.InvalidManifestField)
+                                      else
+                                        if wire.xattr_value_id != 0#u64
+                                        then
+                                          ok (core.result.Result.Err
+                                            RaoManifestError.InvalidManifestField)
+                                        else
+                                          let r1 ←
+                                            validate_rich_regular_file_core
+                                              {
+                                                path_id := wire.path_id,
+                                                file_id := wire.file_id,
+                                                size_bytes := wire.size_bytes,
+                                                file_sha256 := wire.file_sha256,
+                                                first_chunk_lba_present :=
+                                                  (¬ false),
+                                                first_chunk_lba :=
+                                                  wire.first_chunk_lba,
+                                                executable_tag :=
+                                                  wire.executable_tag,
+                                                xattr_present := false,
+                                                xattr_name_id :=
+                                                  wire.xattr_name_id,
+                                                xattr_value_len :=
+                                                  wire.xattr_value_len,
+                                                xattr_value_id :=
+                                                  wire.xattr_value_id
+                                              } chunk_size
+                                          let cf1 ←
+                                            core.result.Result.Insts.CoreOpsTry.branch
+                                              r1
+                                          match cf1 with
+                                          |
+                                            core.ops.control_flow.ControlFlow.Continue
+                                            _ =>
+                                            ok (core.result.Result.Ok
+                                              {
+                                                path_id := wire.path_id,
+                                                file_id := wire.file_id,
+                                                size_bytes := wire.size_bytes,
+                                                file_sha256 := wire.file_sha256,
+                                                first_chunk_lba_present :=
+                                                  (¬ false),
+                                                first_chunk_lba :=
+                                                  wire.first_chunk_lba,
+                                                executable_tag :=
+                                                  wire.executable_tag,
+                                                xattr_present := false,
+                                                xattr_name_id :=
+                                                  wire.xattr_name_id,
+                                                xattr_value_len :=
+                                                  wire.xattr_value_len,
+                                                xattr_value_id :=
+                                                  wire.xattr_value_id
+                                              })
+                                          |
+                                            core.ops.control_flow.ControlFlow.Break
+                                            residual =>
+                                            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                              RichRegularFileCore
+                                              (core.convert.FromSame
+                                              RaoManifestError) residual
+                              else
+                                if wire.metadata_preservation_data_map_len =
+                                  METADATA_PRESERVATION_XATTRS_MAP_LEN
+                                then
+                                  if wire.metadata_key_xattrs !=
+                                    METADATA_KEY_XATTRS
+                                  then
+                                    ok (core.result.Result.Err
+                                      RaoManifestError.InvalidManifestField)
+                                  else
+                                    if wire.xattrs_map_len !=
+                                      XATTRS_ONE_ENTRY_LEN
+                                    then
+                                      ok (core.result.Result.Err
+                                        RaoManifestError.InvalidManifestField)
+                                    else
+                                      if wire.xattr_name_id = 0#u64
+                                      then
+                                        ok (core.result.Result.Err
+                                          RaoManifestError.InvalidManifestField)
+                                      else
+                                        let r1 ←
+                                          validate_rich_regular_file_core
+                                            {
+                                              path_id := wire.path_id,
+                                              file_id := wire.file_id,
+                                              size_bytes := wire.size_bytes,
+                                              file_sha256 := wire.file_sha256,
+                                              first_chunk_lba_present :=
+                                                (¬ false),
+                                              first_chunk_lba :=
+                                                wire.first_chunk_lba,
+                                              executable_tag :=
+                                                wire.executable_tag,
+                                              xattr_present := true,
+                                              xattr_name_id :=
+                                                wire.xattr_name_id,
+                                              xattr_value_len :=
+                                                wire.xattr_value_len,
+                                              xattr_value_id :=
+                                                wire.xattr_value_id
+                                            } chunk_size
+                                        let cf1 ←
+                                          core.result.Result.Insts.CoreOpsTry.branch
+                                            r1
+                                        match cf1 with
+                                        |
+                                          core.ops.control_flow.ControlFlow.Continue
+                                          _ =>
+                                          ok (core.result.Result.Ok
+                                            {
+                                              path_id := wire.path_id,
+                                              file_id := wire.file_id,
+                                              size_bytes := wire.size_bytes,
+                                              file_sha256 := wire.file_sha256,
+                                              first_chunk_lba_present :=
+                                                (¬ false),
+                                              first_chunk_lba :=
+                                                wire.first_chunk_lba,
+                                              executable_tag :=
+                                                wire.executable_tag,
+                                              xattr_present := true,
+                                              xattr_name_id :=
+                                                wire.xattr_name_id,
+                                              xattr_value_len :=
+                                                wire.xattr_value_len,
+                                              xattr_value_id :=
+                                                wire.xattr_value_id
+                                            })
+                                        |
+                                          core.ops.control_flow.ControlFlow.Break
+                                          residual =>
+                                          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                            RichRegularFileCore
+                                            (core.convert.FromSame
+                                            RaoManifestError) residual
+                                else
+                                  ok (core.result.Result.Err
+                                    RaoManifestError.InvalidManifestField)
+                      | core.ops.control_flow.ControlFlow.Break residual =>
+                        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                          RichRegularFileCore (core.convert.FromSame
+                          RaoManifestError) residual
+
+/-- [rao_manifest_verif::decode_hardlink_entry_core]:
+    Source: 'src/lib.rs', lines 841:0-876:1
+    Visibility: public -/
+def decode_hardlink_entry_core
+  (wire : LinkEntryWireCore) :
+  Result (core.result.Result HardlinkEntryCore RaoManifestError)
+  := do
+  if wire.map_len != FILE_ENTRY_LINK_MAP_LEN
+  then
+    ok (core.result.Result.Err RaoManifestError.MissingRequiredManifestField)
+  else
+    if wire.key_path != LINK_KEY_PATH
+    then ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+    else
+      if wire.key_file_id != LINK_KEY_FILE_ID
+      then ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+      else
+        if wire.key_entry_type != LINK_KEY_ENTRY_TYPE
+        then ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+        else
+          if wire.key_executable != LINK_KEY_EXECUTABLE
+          then ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+          else
+            if wire.key_size_bytes != LINK_KEY_SIZE_BYTES
+            then
+              ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+            else
+              if wire.key_chunk_count != LINK_KEY_CHUNK_COUNT
+              then
+                ok (core.result.Result.Err
+                  RaoManifestError.InvalidCborEncoding)
+              else
+                if wire.key_link_target != LINK_KEY_LINK_TARGET
+                then
+                  ok (core.result.Result.Err
+                    RaoManifestError.InvalidCborEncoding)
+                else
+                  if wire.key_first_chunk_lba != LINK_KEY_FIRST_CHUNK_LBA
+                  then
+                    ok (core.result.Result.Err
+                      RaoManifestError.InvalidCborEncoding)
+                  else
+                    if wire.key_metadata_preservation_data !=
+                      LINK_KEY_METADATA_PRESERVATION_DATA
+                    then
+                      ok (core.result.Result.Err
+                        RaoManifestError.InvalidCborEncoding)
+                    else
+                      if wire.entry_type != ENTRY_TYPE_HARDLINK
+                      then
+                        ok (core.result.Result.Err
+                          RaoManifestError.InvalidManifestField)
+                      else
+                        if wire.size_bytes != 0#u64
+                        then
+                          ok (core.result.Result.Err
+                            RaoManifestError.InvalidManifestField)
+                        else
+                          if wire.chunk_count != 0#u64
+                          then
+                            ok (core.result.Result.Err
+                              RaoManifestError.InvalidManifestField)
+                          else
+                            if wire.first_chunk_lba_is_null
+                            then
+                              if wire.metadata_preservation_data_empty
+                              then
+                                if wire.file_sha256_present
+                                then
+                                  ok (core.result.Result.Err
+                                    RaoManifestError.InvalidManifestField)
+                                else
+                                  let r ←
+                                    validate_hardlink_entry_core
+                                      {
+                                        path_id := wire.path_id,
+                                        file_id := wire.file_id,
+                                        link_target_path_id :=
+                                          wire.link_target_id,
+                                        executable_tag := wire.executable_tag
+                                      }
+                                  let cf ←
+                                    core.result.Result.Insts.CoreOpsTry.branch
+                                      r
+                                  match cf with
+                                  | core.ops.control_flow.ControlFlow.Continue
+                                    _ =>
+                                    ok (core.result.Result.Ok
+                                      {
+                                        path_id := wire.path_id,
+                                        file_id := wire.file_id,
+                                        link_target_path_id :=
+                                          wire.link_target_id,
+                                        executable_tag := wire.executable_tag
+                                      })
+                                  | core.ops.control_flow.ControlFlow.Break
+                                    residual =>
+                                    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                      HardlinkEntryCore (core.convert.FromSame
+                                      RaoManifestError) residual
+                              else
+                                ok (core.result.Result.Err
+                                  RaoManifestError.InvalidManifestField)
+                            else
+                              ok (core.result.Result.Err
+                                RaoManifestError.InvalidManifestField)
+
+/-- [rao_manifest_verif::decode_symlink_entry_core]:
+    Source: 'src/lib.rs', lines 878:0-913:1
+    Visibility: public -/
+def decode_symlink_entry_core
+  (wire : LinkEntryWireCore) :
+  Result (core.result.Result SymlinkEntryCore RaoManifestError)
+  := do
+  if wire.map_len != FILE_ENTRY_LINK_MAP_LEN
+  then
+    ok (core.result.Result.Err RaoManifestError.MissingRequiredManifestField)
+  else
+    if wire.key_path != LINK_KEY_PATH
+    then ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+    else
+      if wire.key_file_id != LINK_KEY_FILE_ID
+      then ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+      else
+        if wire.key_entry_type != LINK_KEY_ENTRY_TYPE
+        then ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+        else
+          if wire.key_executable != LINK_KEY_EXECUTABLE
+          then ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+          else
+            if wire.key_size_bytes != LINK_KEY_SIZE_BYTES
+            then
+              ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+            else
+              if wire.key_chunk_count != LINK_KEY_CHUNK_COUNT
+              then
+                ok (core.result.Result.Err
+                  RaoManifestError.InvalidCborEncoding)
+              else
+                if wire.key_link_target != LINK_KEY_LINK_TARGET
+                then
+                  ok (core.result.Result.Err
+                    RaoManifestError.InvalidCborEncoding)
+                else
+                  if wire.key_first_chunk_lba != LINK_KEY_FIRST_CHUNK_LBA
+                  then
+                    ok (core.result.Result.Err
+                      RaoManifestError.InvalidCborEncoding)
+                  else
+                    if wire.key_metadata_preservation_data !=
+                      LINK_KEY_METADATA_PRESERVATION_DATA
+                    then
+                      ok (core.result.Result.Err
+                        RaoManifestError.InvalidCborEncoding)
+                    else
+                      if wire.entry_type != ENTRY_TYPE_SYMLINK
+                      then
+                        ok (core.result.Result.Err
+                          RaoManifestError.InvalidManifestField)
+                      else
+                        if wire.size_bytes != 0#u64
+                        then
+                          ok (core.result.Result.Err
+                            RaoManifestError.InvalidManifestField)
+                        else
+                          if wire.chunk_count != 0#u64
+                          then
+                            ok (core.result.Result.Err
+                              RaoManifestError.InvalidManifestField)
+                          else
+                            if wire.first_chunk_lba_is_null
+                            then
+                              if wire.metadata_preservation_data_empty
+                              then
+                                if wire.file_sha256_present
+                                then
+                                  ok (core.result.Result.Err
+                                    RaoManifestError.InvalidManifestField)
+                                else
+                                  let r ←
+                                    validate_symlink_entry_core
+                                      {
+                                        path_id := wire.path_id,
+                                        file_id := wire.file_id,
+                                        link_target_id := wire.link_target_id,
+                                        executable_tag := wire.executable_tag
+                                      }
+                                  let cf ←
+                                    core.result.Result.Insts.CoreOpsTry.branch
+                                      r
+                                  match cf with
+                                  | core.ops.control_flow.ControlFlow.Continue
+                                    _ =>
+                                    ok (core.result.Result.Ok
+                                      {
+                                        path_id := wire.path_id,
+                                        file_id := wire.file_id,
+                                        link_target_id := wire.link_target_id,
+                                        executable_tag := wire.executable_tag
+                                      })
+                                  | core.ops.control_flow.ControlFlow.Break
+                                    residual =>
+                                    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                      SymlinkEntryCore (core.convert.FromSame
+                                      RaoManifestError) residual
+                              else
+                                ok (core.result.Result.Err
+                                  RaoManifestError.InvalidManifestField)
+                            else
+                              ok (core.result.Result.Err
+                                RaoManifestError.InvalidManifestField)
+
+/-- [rao_manifest_verif::decode_directory_entry_core]:
+    Source: 'src/lib.rs', lines 915:0-949:1
+    Visibility: public -/
+def decode_directory_entry_core
+  (wire : DirectoryEntryWireCore) :
+  Result (core.result.Result DirectoryEntryCore RaoManifestError)
+  := do
+  if wire.map_len != FILE_ENTRY_DIRECTORY_MAP_LEN
+  then
+    ok (core.result.Result.Err RaoManifestError.MissingRequiredManifestField)
+  else
+    if wire.key_path != DIRECTORY_KEY_PATH
+    then ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+    else
+      if wire.key_file_id != DIRECTORY_KEY_FILE_ID
+      then ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+      else
+        if wire.key_entry_type != DIRECTORY_KEY_ENTRY_TYPE
+        then ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+        else
+          if wire.key_executable != DIRECTORY_KEY_EXECUTABLE
+          then ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+          else
+            if wire.key_size_bytes != DIRECTORY_KEY_SIZE_BYTES
+            then
+              ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+            else
+              if wire.key_chunk_count != DIRECTORY_KEY_CHUNK_COUNT
+              then
+                ok (core.result.Result.Err
+                  RaoManifestError.InvalidCborEncoding)
+              else
+                if wire.key_first_chunk_lba != DIRECTORY_KEY_FIRST_CHUNK_LBA
+                then
+                  ok (core.result.Result.Err
+                    RaoManifestError.InvalidCborEncoding)
+                else
+                  if wire.key_metadata_preservation_data !=
+                    DIRECTORY_KEY_METADATA_PRESERVATION_DATA
+                  then
+                    ok (core.result.Result.Err
+                      RaoManifestError.InvalidCborEncoding)
+                  else
+                    if wire.entry_type != ENTRY_TYPE_DIRECTORY
+                    then
+                      ok (core.result.Result.Err
+                        RaoManifestError.InvalidManifestField)
+                    else
+                      if wire.size_bytes != 0#u64
+                      then
+                        ok (core.result.Result.Err
+                          RaoManifestError.InvalidManifestField)
+                      else
+                        if wire.chunk_count != 0#u64
+                        then
+                          ok (core.result.Result.Err
+                            RaoManifestError.InvalidManifestField)
+                        else
+                          if wire.first_chunk_lba_is_null
+                          then
+                            if wire.metadata_preservation_data_empty
+                            then
+                              if wire.file_sha256_present
+                              then
+                                ok (core.result.Result.Err
+                                  RaoManifestError.InvalidManifestField)
+                              else
+                                if wire.link_target_present
+                                then
+                                  ok (core.result.Result.Err
+                                    RaoManifestError.InvalidManifestField)
+                                else
+                                  let r ←
+                                    validate_directory_entry_core
+                                      {
+                                        path_id := wire.path_id,
+                                        file_id := wire.file_id,
+                                        executable_tag := wire.executable_tag
+                                      }
+                                  let cf ←
+                                    core.result.Result.Insts.CoreOpsTry.branch
+                                      r
+                                  match cf with
+                                  | core.ops.control_flow.ControlFlow.Continue
+                                    _ =>
+                                    ok (core.result.Result.Ok
+                                      {
+                                        path_id := wire.path_id,
+                                        file_id := wire.file_id,
+                                        executable_tag := wire.executable_tag
+                                      })
+                                  | core.ops.control_flow.ControlFlow.Break
+                                    residual =>
+                                    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                      DirectoryEntryCore (core.convert.FromSame
+                                      RaoManifestError) residual
+                            else
+                              ok (core.result.Result.Err
+                                RaoManifestError.InvalidManifestField)
+                          else
+                            ok (core.result.Result.Err
+                              RaoManifestError.InvalidManifestField)
+
+/-- [rao_manifest_verif::decode_manifest_entries_core]:
+    Source: 'src/lib.rs', lines 951:0-1001:1
+    Visibility: public -/
+def decode_manifest_entries_core
+  (wire : ManifestEntriesWireCore) (reader_chunk_size : Std.U64) :
+  Result (core.result.Result ManifestEntriesCore RaoManifestError)
+  := do
+  if wire.trailing_data
+  then ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+  else
+    if wire.root_map_len != ROOT_MAP_LEN
+    then
+      ok (core.result.Result.Err RaoManifestError.MissingRequiredManifestField)
+    else
+      if wire.key_object_id != ROOT_KEY_OBJECT_ID
+      then ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+      else
+        if wire.key_chunk_size != ROOT_KEY_CHUNK_SIZE
+        then ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+        else
+          if wire.key_file_entries != ROOT_KEY_FILE_ENTRIES
+          then ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+          else
+            if wire.key_schema_version != ROOT_KEY_SCHEMA_VERSION
+            then
+              ok (core.result.Result.Err RaoManifestError.InvalidCborEncoding)
+            else
+              if wire.key_object_metadata != ROOT_KEY_OBJECT_METADATA
+              then
+                ok (core.result.Result.Err
+                  RaoManifestError.InvalidCborEncoding)
+              else
+                if wire.key_caller_object_id != ROOT_KEY_CALLER_OBJECT_ID
+                then
+                  ok (core.result.Result.Err
+                    RaoManifestError.InvalidCborEncoding)
+                else
+                  if wire.key_external_references !=
+                    ROOT_KEY_EXTERNAL_REFERENCES
+                  then
+                    ok (core.result.Result.Err
+                      RaoManifestError.InvalidCborEncoding)
+                  else
+                    if wire.schema_version != SCHEMA_VERSION
+                    then
+                      ok (core.result.Result.Err
+                        RaoManifestError.InvalidManifestField)
+                    else
+                      if wire.chunk_size != reader_chunk_size
+                      then
+                        ok (core.result.Result.Err
+                          RaoManifestError.InvalidManifestField)
+                      else
+                        if wire.file_entries_len != FILE_ENTRIES_LEN_BOUNDED
+                        then
+                          ok (core.result.Result.Err
+                            RaoManifestError.InvalidManifestField)
+                        else
+                          if wire.object_metadata_empty
+                          then
+                            if wire.external_references_empty
+                            then
+                              let r ←
+                                decode_rich_regular_file_core
+                                  wire.nonempty_regular reader_chunk_size
+                              let cf ←
+                                core.result.Result.Insts.CoreOpsTry.branch r
+                              match cf with
+                              | core.ops.control_flow.ControlFlow.Continue val
+                                =>
+                                let r1 ←
+                                  decode_rich_regular_file_core
+                                    wire.empty_regular reader_chunk_size
+                                let cf1 ←
+                                  core.result.Result.Insts.CoreOpsTry.branch r1
+                                match cf1 with
+                                | core.ops.control_flow.ControlFlow.Continue
+                                  val1 =>
+                                  let r2 ←
+                                    decode_hardlink_entry_core wire.hardlink
+                                  let cf2 ←
+                                    core.result.Result.Insts.CoreOpsTry.branch
+                                      r2
+                                  match cf2 with
+                                  | core.ops.control_flow.ControlFlow.Continue
+                                    val2 =>
+                                    let r3 ←
+                                      decode_symlink_entry_core wire.symlink
+                                    let cf3 ←
+                                      core.result.Result.Insts.CoreOpsTry.branch
+                                        r3
+                                    match cf3 with
+                                    |
+                                      core.ops.control_flow.ControlFlow.Continue
+                                      val3 =>
+                                      let r4 ←
+                                        decode_directory_entry_core
+                                          wire.directory
+                                      let cf4 ←
+                                        core.result.Result.Insts.CoreOpsTry.branch
+                                          r4
+                                      match cf4 with
+                                      |
+                                        core.ops.control_flow.ControlFlow.Continue
+                                        val4 =>
+                                        let r5 ←
+                                          validate_manifest_entries_core
+                                            {
+                                              object_id := wire.object_id,
+                                              caller_object_id :=
+                                                wire.caller_object_id,
+                                              chunk_size := wire.chunk_size,
+                                              nonempty_regular := val,
+                                              empty_regular := val1,
+                                              hardlink := val2,
+                                              symlink := val3,
+                                              directory := val4
+                                            }
+                                        let cf5 ←
+                                          core.result.Result.Insts.CoreOpsTry.branch
+                                            r5
+                                        match cf5 with
+                                        |
+                                          core.ops.control_flow.ControlFlow.Continue
+                                          _ =>
+                                          ok (core.result.Result.Ok
+                                            {
+                                              object_id := wire.object_id,
+                                              caller_object_id :=
+                                                wire.caller_object_id,
+                                              chunk_size := wire.chunk_size,
+                                              nonempty_regular := val,
+                                              empty_regular := val1,
+                                              hardlink := val2,
+                                              symlink := val3,
+                                              directory := val4
+                                            })
+                                        |
+                                          core.ops.control_flow.ControlFlow.Break
+                                          residual =>
+                                          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                            ManifestEntriesCore
+                                            (core.convert.FromSame
+                                            RaoManifestError) residual
+                                      | core.ops.control_flow.ControlFlow.Break
+                                        residual =>
+                                        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                          ManifestEntriesCore
+                                          (core.convert.FromSame
+                                          RaoManifestError) residual
+                                    | core.ops.control_flow.ControlFlow.Break
+                                      residual =>
+                                      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                        ManifestEntriesCore
+                                        (core.convert.FromSame
+                                        RaoManifestError) residual
+                                  | core.ops.control_flow.ControlFlow.Break
+                                    residual =>
+                                    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                      ManifestEntriesCore
+                                      (core.convert.FromSame RaoManifestError)
+                                      residual
+                                | core.ops.control_flow.ControlFlow.Break
+                                  residual =>
+                                  core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                    ManifestEntriesCore (core.convert.FromSame
+                                    RaoManifestError) residual
+                              | core.ops.control_flow.ControlFlow.Break
+                                residual =>
+                                core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                  ManifestEntriesCore (core.convert.FromSame
                                   RaoManifestError) residual
                             else
                               ok (core.result.Result.Err
