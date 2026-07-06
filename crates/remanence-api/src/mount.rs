@@ -996,6 +996,7 @@ mod tests {
         DriveBay {
             element_address,
             accessible: true,
+            exception: None,
             installed: Some(InstalledDrive {
                 serial: format!("DRV{element_address:04x}"),
                 identity_source: IdentitySource::DvcidInline,
@@ -1015,6 +1016,7 @@ mod tests {
         Slot {
             element_address,
             accessible: true,
+            exception: None,
             full: true,
             cartridge: Some(cartridge.to_string()),
         }

@@ -9,8 +9,8 @@
 //! `discover()` entry point.
 //!
 //! This crate currently exposes the value types (`Library`,
-//! `DriveBay`, `InstalledDrive`, `Slot`, `IePort`, `ElementLayout`)
-//! and the pure `Library::from_captures(...)` builder. The discovery
+//! `DriveBay`, `InstalledDrive`, `Slot`, `IePort`, `ElementLayout`,
+//! `ElementException`) and the pure `Library::from_captures(...)` builder. The discovery
 //! orchestration that issues live SCSI calls and walks sysfs lands
 //! incrementally — see `docs/layer2-design.md` §7.
 
@@ -47,8 +47,9 @@ pub use handle::tape_io::{
 };
 pub use handle::{ChangerHandle, DirtyCause, DriveHandle, LibraryHandle, RemovalLockGuard};
 pub use model::{
-    resolve_load_target, AccessPolicy, DeviceCaptures, DiscoveryReport, DriveBay, ElementLayout,
-    IdentitySource, IePort, InstalledDrive, Library, LoadPlan, Slot, StaticAllowlist,
+    resolve_load_target, AccessPolicy, DeviceCaptures, DiscoveryReport, DriveBay, ElementException,
+    ElementLayout, IdentitySource, IePort, InstalledDrive, Library, LoadPlan, Slot,
+    StaticAllowlist,
 };
 pub use ops::{apply_move, MovePatch};
 pub use physical_io::{
