@@ -647,6 +647,7 @@ fn round_up_u64(value: u64, unit: u64) -> Result<u64, FormatError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::validate_manifest;
 
     fn options(chunk_size: usize) -> RemTarObjectOptions {
         let mut opts = RemTarObjectOptions::new(
@@ -818,6 +819,44 @@ mod tests {
         assert!(manifest.contains("payload.bin"));
         assert!(!manifest.contains(MANIFEST_PATH));
         assert!(layout.manifest.is_manifest);
+    }
+
+    #[test]
+    fn planner_accepted_manifests_validate_against_reader_schema() {
+        let opts = options(4096);
+        let mut xattr_file = file("meta/with-xattr.bin", 4096);
+        xattr_file
+            .xattrs
+            .insert("user.note".to_string(), b"preserved".to_vec());
+
+        let cases = vec![
+            vec![file("single.bin", 1)],
+            vec![
+                file("target.mov", 17),
+                RemTarFileSpec::hardlink("links/copy.mov", "hardlink-1", "target.mov"),
+                RemTarFileSpec::symlink("links/latest", "link-1", "../target.mov"),
+                RemTarFileSpec::directory("empty/", "dir-1"),
+            ],
+            vec![
+                file("regular/first.bin", 4096),
+                file("regular/empty.bin", 0),
+                RemTarFileSpec::hardlink("links/empty-copy", "hardlink-empty", "regular/empty.bin"),
+                xattr_file,
+            ],
+        ];
+
+        for files in cases {
+            let layout =
+                plan_rem_tar_object(&opts, &files).expect("planner-accepted files should plan");
+            let global_pax = global_pax_records(&opts, &layout.schema_version);
+            validate_manifest(
+                &layout.manifest_cbor,
+                &layout.manifest_sha256,
+                &global_pax,
+                opts.chunk_size,
+            )
+            .expect("encoded production manifest should validate");
+        }
     }
 
     #[test]
