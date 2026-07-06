@@ -1,0 +1,10 @@
+name = "rao_manifest"
+version = "0.1.0"
+defaultTargets = ["RaoManifest"]
+
+[[require]]
+name = "aeneas"
+path = "/home/user/toolchains/aeneas/backends/lean"
+
+[[lean_lib]]
+name = "RaoManifest"
