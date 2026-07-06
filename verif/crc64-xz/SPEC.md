@@ -35,6 +35,10 @@ returns exactly this bit-vector recurrence for every `u64` input.
 `(crc ^ byte) & 0xff`, shifts the previous state by one byte, and XORs the X2
 table entry.
 
+The Lean proof additionally proves the Aeneas-extracted
+`crc64_xz_table_entry` and `crc64_xz_update` functions return exactly the
+bit-vector specification result for every input.
+
 ## X4 -- public CRC
 
 `crc64_xz(bytes)` folds X3 from the initial all-ones state and applies the
