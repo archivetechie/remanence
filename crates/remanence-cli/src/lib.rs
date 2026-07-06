@@ -67,8 +67,8 @@ use remanence_format::{
 use remanence_library::DriveHandlePhysicalSource;
 use remanence_library::{
     tape_alert_flag_name, BlockSize, DirtyCause, DiscoveryError, DiscoveryReport, DiscoveryWarning,
-    DriveBay, DriveHandleSink, DriveHandleSource, FileBlockSink, FileBlockSource, IePort,
-    IoErrorKind, Library, MediaFamily, MediaReadiness, OpenError, Slot, StaticAllowlist,
+    DriveBay, DriveHandle, DriveHandleSink, DriveHandleSource, FileBlockSink, FileBlockSource,
+    IePort, IoErrorKind, Library, MediaFamily, MediaReadiness, OpenError, Slot, StaticAllowlist,
     TapeAlerts, TapeConfig, VecBlockSource, WormMediaState,
 };
 use serde_json::{json, Value};
@@ -88,6 +88,10 @@ mod top;
 const DEFAULT_DAEMON_ENDPOINT: &str = "unix:/var/lib/rem/rem.sock";
 const DEFAULT_DEV_TAPE_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_SCSI_VARIABLE_WRITE_BYTES: usize = 0x00FF_FFFF;
+const MEDIA_CONDITIONING_TIMEOUT: StdDuration = StdDuration::from_secs(9_000);
+const MEDIA_CONDITIONING_INITIAL_POLL: StdDuration = StdDuration::from_secs(15);
+const MEDIA_CONDITIONING_STEADY_POLL: StdDuration = StdDuration::from_secs(60);
+const MEDIA_CONDITIONING_INITIAL_WINDOW: StdDuration = StdDuration::from_secs(60);
 #[cfg(not(feature = "foreign-bru"))]
 const BRU_BLOCK_SIZE: usize = 2048;
 
@@ -259,6 +263,9 @@ enum RemCommand {
         /// Also list every storage slot's status (full/empty + voltag).
         #[arg(long)]
         slots: bool,
+        /// Emit machine-readable JSON with drives, slots, and loaded barcodes.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Move a cartridge between two element addresses.
@@ -497,7 +504,15 @@ impl From<RemCommand> for Command {
     fn from(value: RemCommand) -> Self {
         match value {
             RemCommand::Libraries { json } => Self::Libraries { json },
-            RemCommand::Library { serial, slots } => Self::Library { serial, slots },
+            RemCommand::Library {
+                serial,
+                slots,
+                json,
+            } => Self::Library {
+                serial,
+                slots,
+                json,
+            },
             RemCommand::Move { serial, src, dst } => Self::Move { serial, src, dst },
             RemCommand::Load { serial, slot, bay } => Self::Load { serial, slot, bay },
             RemCommand::Unload { serial, bay, dest } => Self::Unload { serial, bay, dest },
@@ -771,6 +786,9 @@ enum Command {
         /// Also list every storage slot's status (full/empty + voltag).
         #[arg(long)]
         slots: bool,
+        /// Emit machine-readable JSON with drives, slots, and loaded barcodes.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Move a cartridge between two element addresses.
@@ -1255,6 +1273,13 @@ enum RemTapeCommand {
     /// Poll TEST UNIT READY until already-loaded media is usable.
     WaitReady(TapeWaitReadyArgs),
 
+    /// Inspect or release media-readiness quarantine fences.
+    Quarantine {
+        /// Quarantine operation.
+        #[command(subcommand)]
+        command: TapeQuarantineCommand,
+    },
+
     /// Permanently retire one tape identity in the local catalog.
     Retire(TapeRetireArgs),
 }
@@ -1267,6 +1292,7 @@ impl From<RemTapeCommand> for TapeCommand {
             }
             RemTapeCommand::Init(args) => Self::Init(args),
             RemTapeCommand::WaitReady(args) => Self::WaitReady(args),
+            RemTapeCommand::Quarantine { command } => Self::Quarantine { command },
             RemTapeCommand::Retire(args) => Self::Retire(args),
         }
     }
@@ -1283,6 +1309,13 @@ enum TapeCommand {
     /// Poll TEST UNIT READY until already-loaded media is usable.
     WaitReady(TapeWaitReadyArgs),
 
+    /// Inspect or release media-readiness quarantine fences.
+    Quarantine {
+        /// Quarantine operation.
+        #[command(subcommand)]
+        command: TapeQuarantineCommand,
+    },
+
     /// Permanently retire one tape identity in the local catalog.
     Retire(TapeRetireArgs),
 }
@@ -1293,6 +1326,7 @@ impl TapeCommand {
             Self::Alerts(args) => args.validate_before_discovery(),
             Self::Init(args) => args.validate_before_discovery(),
             Self::WaitReady(args) => args.validate_before_discovery(),
+            Self::Quarantine { command } => command.validate_before_discovery(),
             Self::Retire(args) => args.validate_before_discovery(),
         }
     }
@@ -1385,6 +1419,10 @@ impl TapeInitArgs {
 
 #[derive(Args, Debug)]
 struct TapeWaitReadyArgs {
+    /// Resume a durable media-readiness operation without moving media.
+    #[arg(long, value_name = "UUID", conflicts_with_all = ["barcode", "drive_element"])]
+    resume: Option<Uuid>,
+
     /// Barcode to find in an already-loaded drive.
     #[arg(long, value_name = "BARCODE", conflicts_with = "drive_element")]
     barcode: Option<String>,
@@ -1402,11 +1440,11 @@ struct TapeWaitReadyArgs {
     wait: bool,
 
     /// Maximum wait duration. Accepts ms/s/m/h suffixes.
-    #[arg(long, value_parser = parse_wait_duration_arg, default_value = "30s")]
+    #[arg(long, value_parser = parse_wait_duration_arg, default_value = "2.5h")]
     timeout: StdDuration,
 
     /// Poll interval. Accepts ms/s/m/h suffixes.
-    #[arg(long, value_parser = parse_wait_duration_arg, default_value = "5s")]
+    #[arg(long, value_parser = parse_wait_duration_arg, default_value = "30s")]
     poll: StdDuration,
 
     /// Path to `/etc/rem/config.toml`.
@@ -1424,8 +1462,13 @@ struct TapeWaitReadyArgs {
 
 impl TapeWaitReadyArgs {
     fn validate_before_discovery(&self) -> Result<(), String> {
-        if self.barcode.is_none() && self.drive_element.is_none() {
-            return Err("tape wait-ready requires --barcode or --drive-element".to_string());
+        if self.resume.is_none() && self.barcode.is_none() && self.drive_element.is_none() {
+            return Err(
+                "tape wait-ready requires --resume, --barcode, or --drive-element".to_string(),
+            );
+        }
+        if self.resume.is_some() && self.already_loaded {
+            return Err("tape wait-ready --resume already implies loaded media".to_string());
         }
         if self.drive_element.is_some() && !self.already_loaded {
             return Err("tape wait-ready --drive-element requires --already-loaded".to_string());
@@ -1483,6 +1526,99 @@ fn parse_wait_duration_arg(s: &str) -> Result<StdDuration, String> {
         ));
     }
     Ok(StdDuration::from_secs_f64(parsed * multiplier))
+}
+
+#[derive(Subcommand, Debug)]
+enum TapeQuarantineCommand {
+    /// List active media-readiness fences.
+    List {
+        /// Path to `/etc/rem/config.toml`.
+        #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
+        config: PathBuf,
+
+        /// Restrict to one selected library serial.
+        #[arg(long, value_name = "SERIAL")]
+        library: Option<String>,
+
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show one active media-readiness fence.
+    Show {
+        /// Quarantine id or media-readiness operation UUID.
+        quarantine: String,
+
+        /// Path to `/etc/rem/config.toml`.
+        #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
+        config: PathBuf,
+
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Release one media-readiness fence after operator/RCA acknowledgement.
+    Release {
+        /// Quarantine id or media-readiness operation UUID.
+        quarantine: String,
+
+        /// Path to `/etc/rem/config.toml`.
+        #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
+        config: PathBuf,
+
+        /// Confirm that inventory has settled after the unknown operation.
+        #[arg(long)]
+        after_settled_inventory: bool,
+
+        /// Operator/RCA acknowledgement text.
+        #[arg(long, value_name = "TEXT")]
+        ack: String,
+
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+impl TapeQuarantineCommand {
+    fn validate_before_discovery(&self) -> Result<(), String> {
+        match self {
+            Self::List { library, .. } => {
+                if library
+                    .as_deref()
+                    .is_some_and(|value| value.trim().is_empty())
+                {
+                    return Err("tape quarantine list --library cannot be empty".to_string());
+                }
+            }
+            Self::Show { quarantine, .. } => {
+                if quarantine.trim().is_empty() {
+                    return Err("tape quarantine show requires an id".to_string());
+                }
+            }
+            Self::Release {
+                quarantine,
+                after_settled_inventory,
+                ack,
+                ..
+            } => {
+                if quarantine.trim().is_empty() {
+                    return Err("tape quarantine release requires an id".to_string());
+                }
+                if !after_settled_inventory {
+                    return Err(
+                        "tape quarantine release requires --after-settled-inventory".to_string()
+                    );
+                }
+                if ack.trim().is_empty() {
+                    return Err("tape quarantine release --ack cannot be empty".to_string());
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Args, Debug)]
@@ -2958,11 +3094,15 @@ where
             let _ = writeln!(err, "error: {error}");
             return ExitCode::from(1);
         }
-        // `rem tape retire` is catalog + audit only — no SCSI, no library
-        // allowlist — so it bypasses discovery entirely (like the catalog
-        // maintenance commands above).
-        if let TapeCommand::Retire(args) = command {
-            return run_tape_retire(args, out, err);
+        // These tape subcommands are catalog + audit only — no SCSI, no
+        // library allowlist — so they bypass discovery entirely (like the
+        // catalog maintenance commands above).
+        match command {
+            TapeCommand::Retire(args) => return run_tape_retire(args, out, err),
+            TapeCommand::Quarantine { command } => {
+                return run_tape_quarantine(command, out, err);
+            }
+            _ => {}
         }
     }
 
@@ -3031,10 +3171,18 @@ where
                 print_libraries(&report, out);
             }
         }
-        Command::Library { serial, slots } => match report.library(&serial) {
+        Command::Library {
+            serial,
+            slots,
+            json,
+        } => match report.library(&serial) {
             Some(lib) => {
-                print_library(lib, &report, out);
-                if slots {
+                if json {
+                    print_library_json(lib, slots, out);
+                } else {
+                    print_library(lib, &report, out);
+                }
+                if slots && !json {
                     print_slots(lib, out);
                 }
             }
@@ -5111,6 +5259,313 @@ fn count_label(count: u64, singular: &str, plural: &str) -> String {
     }
 }
 
+fn run_tape_quarantine(
+    command: &TapeQuarantineCommand,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    match command {
+        TapeQuarantineCommand::List {
+            config,
+            library,
+            json,
+        } => {
+            let catalog = match open_catalog_read_only_for_config(config, err) {
+                Ok(catalog) => catalog,
+                Err(code) => return code,
+            };
+            let records = match catalog.list_active_media_readiness_operations(library.as_deref()) {
+                Ok(records) => records,
+                Err(error) => {
+                    let _ = writeln!(err, "error: {error}");
+                    return ExitCode::from(1);
+                }
+            };
+            print_tape_quarantine_list(&records, *json, out, err)
+        }
+        TapeQuarantineCommand::Show {
+            quarantine,
+            config,
+            json,
+        } => {
+            let catalog = match open_catalog_read_only_for_config(config, err) {
+                Ok(catalog) => catalog,
+                Err(code) => return code,
+            };
+            let records = match catalog.list_active_media_readiness_operations(None) {
+                Ok(records) => records,
+                Err(error) => {
+                    let _ = writeln!(err, "error: {error}");
+                    return ExitCode::from(1);
+                }
+            };
+            let record = match find_media_readiness_quarantine(&records, quarantine.as_str()) {
+                Ok(record) => record,
+                Err(error) => {
+                    let _ = writeln!(err, "error: {error}");
+                    return ExitCode::from(1);
+                }
+            };
+            print_tape_quarantine_show(record, *json, out, err)
+        }
+        TapeQuarantineCommand::Release {
+            quarantine,
+            config,
+            ack,
+            json,
+            ..
+        } => {
+            let (paths, config) = match load_state_config(config, err) {
+                Ok(value) => value,
+                Err(code) => return code,
+            };
+            let mut state = match remanence_state::StateHandle::open_with_config(paths, config) {
+                Ok(state) => state,
+                Err(error) => {
+                    let _ = writeln!(err, "error: {error}");
+                    return ExitCode::from(1);
+                }
+            };
+            let records = match state
+                .catalog_index()
+                .list_active_media_readiness_operations(None)
+            {
+                Ok(records) => records,
+                Err(error) => {
+                    let _ = writeln!(err, "error: {error}");
+                    return ExitCode::from(1);
+                }
+            };
+            let record = match find_media_readiness_quarantine(&records, quarantine.as_str()) {
+                Ok(record) => record.clone(),
+                Err(error) => {
+                    let _ = writeln!(err, "error: {error}");
+                    return ExitCode::from(1);
+                }
+            };
+            let operation_id = match Uuid::parse_str(record.operation_id.as_str()) {
+                Ok(operation_id) => operation_id,
+                Err(error) => {
+                    let _ = writeln!(
+                        err,
+                        "error: media readiness operation {} is not a UUID: {error}",
+                        record.operation_id
+                    );
+                    return ExitCode::from(1);
+                }
+            };
+            let released = match state.catalog_index().record_media_readiness_transition(
+                media_readiness_release_transition(operation_id, ack.trim()),
+            ) {
+                Ok(record) => record,
+                Err(error) => {
+                    let _ = writeln!(err, "error: {error}");
+                    return ExitCode::from(1);
+                }
+            };
+            print_tape_quarantine_released(&released, *json, out, err)
+        }
+    }
+}
+
+fn load_state_config(
+    config_path: &Path,
+    err: &mut dyn Write,
+) -> Result<(remanence_state::StatePaths, remanence_state::RemConfig), ExitCode> {
+    let config = match remanence_state::load_config(config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            let _ = writeln!(err, "error: {error}");
+            return Err(ExitCode::from(1));
+        }
+    };
+    let paths = remanence_state::StatePaths::from_config(config_path, &config);
+    Ok((paths, config))
+}
+
+fn open_catalog_read_only_for_config(
+    config_path: &Path,
+    err: &mut dyn Write,
+) -> Result<remanence_state::CatalogIndex, ExitCode> {
+    let (paths, _) = load_state_config(config_path, err)?;
+    remanence_state::CatalogIndex::open_read_only(&paths.sqlite_path).map_err(|error| {
+        let _ = writeln!(err, "error: {error}");
+        ExitCode::from(1)
+    })
+}
+
+fn media_readiness_quarantine_id(
+    record: &remanence_state::MediaReadinessOperationRecord,
+) -> String {
+    record
+        .quarantine_id
+        .clone()
+        .unwrap_or_else(|| format!("mrq-{}", record.operation_id))
+}
+
+fn find_media_readiness_quarantine<'a>(
+    records: &'a [remanence_state::MediaReadinessOperationRecord],
+    selector: &str,
+) -> Result<&'a remanence_state::MediaReadinessOperationRecord, String> {
+    let selector = selector.trim();
+    let matches = records
+        .iter()
+        .filter(|record| {
+            record.operation_id == selector || media_readiness_quarantine_id(record) == selector
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [record] => Ok(*record),
+        [] => Err(format!("no active media-readiness quarantine {selector:?}")),
+        _ => Err(format!(
+            "media-readiness quarantine selector {selector:?} is ambiguous"
+        )),
+    }
+}
+
+fn media_readiness_record_json(record: &remanence_state::MediaReadinessOperationRecord) -> Value {
+    json!({
+        "quarantine_id": media_readiness_quarantine_id(record),
+        "operation_id": record.operation_id.as_str(),
+        "run_id": record.run_id.as_deref(),
+        "library_serial": record.library_serial.as_str(),
+        "changer_sg": record.changer_sg.as_deref(),
+        "drive_element": format!("0x{:04x}", record.drive_element),
+        "drive_element_raw": record.drive_element,
+        "drive_sg": record.drive_sg.as_deref(),
+        "drive_serial": record.drive_serial.as_deref(),
+        "barcode": record.barcode.as_deref(),
+        "source_slot": record.source_slot.map(|slot| format!("0x{slot:04x}")),
+        "source_slot_raw": record.source_slot,
+        "media_generation": record.media_generation,
+        "phase": record.phase.as_str(),
+        "state": record.state.as_str(),
+        "dirty_scope": record.dirty_scope.as_deref(),
+        "started_at_utc": record.started_at_utc.as_str(),
+        "updated_at_utc": record.updated_at_utc.as_str(),
+        "deadline_at_utc": record.deadline_at_utc.as_deref(),
+        "last_cdb_opcode": record.last_cdb_opcode,
+        "last_sense_raw": record.last_sense_raw.as_deref(),
+        "last_sense_key": record.last_sense_key,
+        "last_asc": record.last_asc,
+        "last_ascq": record.last_ascq,
+        "last_host_status": record.last_host_status,
+        "last_driver_status": record.last_driver_status,
+        "target_status": record.target_status,
+        "transport_class": record.transport_class.as_deref(),
+        "cancel_source": record.cancel_source.as_deref(),
+        "signal": record.signal.as_deref(),
+        "evidence_path": record.evidence_path.as_deref(),
+        "last_error_json": record.last_error_json.as_deref(),
+    })
+}
+
+fn print_tape_quarantine_list(
+    records: &[remanence_state::MediaReadinessOperationRecord],
+    json_output: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    if json_output {
+        let items = records
+            .iter()
+            .map(media_readiness_record_json)
+            .collect::<Vec<_>>();
+        if let Err(error) =
+            print_json_envelope("rem.tape.quarantine.list.v1", "list", json!(items), out)
+        {
+            let _ = writeln!(err, "error: {error}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+    if records.is_empty() {
+        let _ = writeln!(out, "(no active media-readiness quarantines)");
+        return ExitCode::SUCCESS;
+    }
+    for record in records {
+        let _ = writeln!(
+            out,
+            "{} operation={} library={} drive=0x{:04x} barcode={} state={} updated={}",
+            media_readiness_quarantine_id(record),
+            record.operation_id,
+            record.library_serial,
+            record.drive_element,
+            record.barcode.as_deref().unwrap_or("(unknown)"),
+            record.state,
+            record.updated_at_utc
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_tape_quarantine_show(
+    record: &remanence_state::MediaReadinessOperationRecord,
+    json_output: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    if json_output {
+        if let Err(error) = print_json_envelope(
+            "rem.tape.quarantine.show.v1",
+            "item",
+            media_readiness_record_json(record),
+            out,
+        ) {
+            let _ = writeln!(err, "error: {error}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+    let _ = writeln!(out, "quarantine: {}", media_readiness_quarantine_id(record));
+    let _ = writeln!(out, "operation: {}", record.operation_id);
+    let _ = writeln!(out, "library: {}", record.library_serial);
+    let _ = writeln!(out, "drive: 0x{:04x}", record.drive_element);
+    let _ = writeln!(
+        out,
+        "barcode: {}",
+        record.barcode.as_deref().unwrap_or("(unknown)")
+    );
+    let _ = writeln!(out, "state: {}", record.state);
+    let _ = writeln!(
+        out,
+        "dirty_scope: {}",
+        record.dirty_scope.as_deref().unwrap_or("(unknown)")
+    );
+    let _ = writeln!(out, "updated: {}", record.updated_at_utc);
+    ExitCode::SUCCESS
+}
+
+fn print_tape_quarantine_released(
+    record: &remanence_state::MediaReadinessOperationRecord,
+    json_output: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    if json_output {
+        if let Err(error) = print_json_envelope(
+            "rem.tape.quarantine.release.v1",
+            "item",
+            media_readiness_record_json(record),
+            out,
+        ) {
+            let _ = writeln!(err, "error: {error}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+    let _ = writeln!(
+        out,
+        "released {} operation={} library={} drive=0x{:04x} barcode={}",
+        media_readiness_quarantine_id(record),
+        record.operation_id,
+        record.library_serial,
+        record.drive_element,
+        record.barcode.as_deref().unwrap_or("(unknown)")
+    );
+    ExitCode::SUCCESS
+}
+
 /// Resolve a retire target: barcode first, then 32-hex tape uuid.
 ///
 /// LTO voltags are 6-8 characters, so there is no collision space with a
@@ -5304,6 +5759,22 @@ trait TapeInitStateOps {
         parity: remanence_api::ParityConfig,
         force: bool,
     ) -> Result<(), String>;
+
+    fn record_media_readiness_operation(
+        &mut self,
+        input: remanence_state::MediaReadinessOperationInput,
+    ) -> Result<(), String> {
+        let _ = input;
+        Ok(())
+    }
+
+    fn record_media_readiness_transition(
+        &mut self,
+        input: remanence_state::MediaReadinessTransitionInput,
+    ) -> Result<(), String> {
+        let _ = input;
+        Ok(())
+    }
 }
 
 impl TapeInitStateOps for remanence_state::StateHandle {
@@ -5344,6 +5815,26 @@ impl TapeInitStateOps for remanence_state::StateHandle {
         // idempotent no-ops or refusals), so a `TapeProvisioned` append here
         // is exactly "a bootstrap was actually written".
         append_tape_provisioned_audit_event(self, tape_uuid, &voltag, block_size, &parity, force)
+    }
+
+    fn record_media_readiness_operation(
+        &mut self,
+        input: remanence_state::MediaReadinessOperationInput,
+    ) -> Result<(), String> {
+        self.catalog_index()
+            .record_media_readiness_operation(input)
+            .map(|_| ())
+            .map_err(|error| format!("record media readiness operation: {error}"))
+    }
+
+    fn record_media_readiness_transition(
+        &mut self,
+        input: remanence_state::MediaReadinessTransitionInput,
+    ) -> Result<(), String> {
+        self.catalog_index()
+            .record_media_readiness_transition(input)
+            .map(|_| ())
+            .map_err(|error| format!("record media readiness transition: {error}"))
     }
 }
 
@@ -5429,6 +5920,9 @@ fn run_tape_command(
         TapeCommand::Alerts(args) => run_tape_alerts(report, args, out, err),
         TapeCommand::Init(args) => run_tape_init(report, args, out, err),
         TapeCommand::WaitReady(args) => run_tape_wait_ready(report, args, out, err),
+        TapeCommand::Quarantine { .. } => {
+            unreachable!("tape quarantine dispatched pre-discovery")
+        }
         TapeCommand::Retire(_) => unreachable!("tape retire dispatched pre-discovery"),
     }
 }
@@ -5496,8 +5990,20 @@ fn run_tape_alerts_hardware(
 }
 
 struct TapeWaitReadyResult {
+    operation_id: Uuid,
     drive_element: u16,
     barcode: Option<String>,
+    readiness: MediaReadiness,
+    attempts: u64,
+    timed_out: bool,
+}
+
+struct TapeWaitReadyFailure {
+    message: String,
+    exit_code: u8,
+}
+
+struct MediaReadinessPoll {
     readiness: MediaReadiness,
     attempts: u64,
     timed_out: bool,
@@ -5525,13 +6031,22 @@ fn run_tape_wait_ready(
         }
     };
     let policy = configured_library_policy(&config);
-    let result = match run_tape_wait_ready_hardware(library, &policy, args) {
-        Ok(result) => result,
+    let paths = remanence_state::StatePaths::from_config(&args.config, &config);
+    let mut state = match remanence_state::StateHandle::open_with_config(paths, config.clone()) {
+        Ok(state) => state,
         Err(error) => {
             let _ = writeln!(err, "error: {error}");
-            print_setcap_hint_if_error_text_matches(&error, err);
             print_warnings(report, err);
             return ExitCode::from(1);
+        }
+    };
+    let result = match run_tape_wait_ready_hardware(library, &policy, args, state.catalog_index()) {
+        Ok(result) => result,
+        Err(failure) => {
+            let _ = writeln!(err, "error: {}", failure.message);
+            print_setcap_hint_if_error_text_matches(&failure.message, err);
+            print_warnings(report, err);
+            return ExitCode::from(failure.exit_code);
         }
     };
     print_tape_wait_ready_result(library.serial.as_str(), &result, args.json, out);
@@ -5544,44 +6059,85 @@ fn run_tape_wait_ready_hardware(
     library: &Library,
     policy: &StaticAllowlist,
     args: &TapeWaitReadyArgs,
-) -> Result<TapeWaitReadyResult, String> {
-    let (drive_element, barcode) = resolve_wait_ready_drive(library, args)?;
+    catalog: &mut remanence_state::CatalogIndex,
+) -> Result<TapeWaitReadyResult, TapeWaitReadyFailure> {
+    let (operation_id, drive_element, barcode) =
+        resolve_wait_ready_operation(library, args, catalog).map_err(|message| {
+            TapeWaitReadyFailure {
+                message,
+                exit_code: 50,
+            }
+        })?;
     let family = barcode
         .as_deref()
         .and_then(remanence_api::lto_generation_from_voltag)
         .map(media_family_for_init_generation)
         .unwrap_or(MediaFamily::Unknown);
-    let mut handle = open_library_handle(library, policy)
-        .map_err(|error| format!("opening library: {error}"))?;
-    let mut drive = handle
-        .open_drive(drive_element, policy)
-        .map_err(|error| format!("open drive 0x{drive_element:04x}: {error}"))?;
-    let started = StdInstant::now();
-    let mut attempts = 0_u64;
-    loop {
-        attempts = attempts.saturating_add(1);
-        let readiness = drive.probe_media_readiness(family);
-        if readiness.is_ready() || !args.wait || !readiness.is_retryable_wait() {
-            return Ok(TapeWaitReadyResult {
-                drive_element,
-                barcode,
-                readiness,
-                attempts,
-                timed_out: false,
+    let mut handle = match open_library_handle(library, policy) {
+        Ok(handle) => handle,
+        Err(error) => {
+            catalog
+                .record_media_readiness_transition(media_readiness_mechanical_transition(
+                    operation_id,
+                    "open_library",
+                    "transport_unknown",
+                    None,
+                    Some(error.to_string()),
+                ))
+                .map_err(|error| TapeWaitReadyFailure {
+                    message: format!("record media readiness transition: {error}"),
+                    exit_code: 1,
+                })?;
+            return Err(TapeWaitReadyFailure {
+                message: format!("opening library: {error}"),
+                exit_code: 40,
             });
         }
-        let elapsed = started.elapsed();
-        if elapsed >= args.timeout {
-            return Ok(TapeWaitReadyResult {
-                drive_element,
-                barcode,
-                readiness,
-                attempts,
-                timed_out: true,
+    };
+    let mut drive = match handle.open_drive(drive_element, policy) {
+        Ok(drive) => drive,
+        Err(error) => {
+            catalog
+                .record_media_readiness_transition(media_readiness_mechanical_transition(
+                    operation_id,
+                    "open_drive",
+                    "transport_unknown",
+                    None,
+                    Some(error.to_string()),
+                ))
+                .map_err(|error| TapeWaitReadyFailure {
+                    message: format!("record media readiness transition: {error}"),
+                    exit_code: 1,
+                })?;
+            return Err(TapeWaitReadyFailure {
+                message: format!("open drive 0x{drive_element:04x}: {error}"),
+                exit_code: 40,
             });
         }
-        std::thread::sleep(std::cmp::min(args.poll, args.timeout - elapsed));
-    }
+    };
+    let poll = poll_drive_media_readiness(
+        &mut drive,
+        family,
+        args.wait,
+        args.timeout,
+        args.poll,
+        |poll| {
+            record_media_readiness_poll_transition(catalog, operation_id, "readiness_poll", poll)
+                .map_err(|error| format!("record media readiness transition: {error}"))
+        },
+    )
+    .map_err(|message| TapeWaitReadyFailure {
+        message,
+        exit_code: 1,
+    })?;
+    Ok(TapeWaitReadyResult {
+        operation_id,
+        drive_element,
+        barcode,
+        readiness: poll.readiness,
+        attempts: poll.attempts,
+        timed_out: poll.timed_out,
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -5589,8 +6145,12 @@ fn run_tape_wait_ready_hardware(
     _library: &Library,
     _policy: &StaticAllowlist,
     _args: &TapeWaitReadyArgs,
-) -> Result<TapeWaitReadyResult, String> {
-    Err("tape wait-ready requires Linux SG_IO drive access in v0.1".to_string())
+    _catalog: &mut remanence_state::CatalogIndex,
+) -> Result<TapeWaitReadyResult, TapeWaitReadyFailure> {
+    Err(TapeWaitReadyFailure {
+        message: "tape wait-ready requires Linux SG_IO drive access in v0.1".to_string(),
+        exit_code: 1,
+    })
 }
 
 fn resolve_wait_ready_drive(
@@ -5624,6 +6184,480 @@ fn resolve_wait_ready_drive(
     ))
 }
 
+fn resolve_wait_ready_operation(
+    library: &Library,
+    args: &TapeWaitReadyArgs,
+    catalog: &mut remanence_state::CatalogIndex,
+) -> Result<(Uuid, u16, Option<String>), String> {
+    if let Some(operation_id) = args.resume {
+        let record = catalog
+            .media_readiness_operation(operation_id)
+            .map_err(|error| format!("lookup media readiness operation: {error}"))?
+            .ok_or_else(|| format!("media readiness operation {operation_id} was not found"))?;
+        if record.library_serial != library.serial {
+            return Err(format!(
+                "media readiness operation {operation_id} belongs to library {}, not {}",
+                record.library_serial, library.serial
+            ));
+        }
+        let drive_element = u16::try_from(record.drive_element).map_err(|_| {
+            format!(
+                "media readiness operation {operation_id} has invalid drive element {}",
+                record.drive_element
+            )
+        })?;
+        validate_wait_ready_resume_binding(library, operation_id, drive_element, &record)?;
+        return Ok((operation_id, drive_element, record.barcode));
+    }
+
+    let (drive_element, barcode) = resolve_wait_ready_drive(library, args)?;
+    let operation_id = Uuid::new_v4();
+    let drive_bay = library
+        .drive_bays
+        .iter()
+        .find(|bay| bay.element_address == drive_element);
+    catalog
+        .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+            operation_id,
+            run_id: None,
+            library_serial: library.serial.clone(),
+            changer_sg: Some(library.changer_sg.display().to_string()),
+            drive_element,
+            drive_sg: drive_bay
+                .and_then(|bay| bay.installed.as_ref())
+                .and_then(|drive| drive.sg_path.as_ref())
+                .map(|path| path.display().to_string()),
+            drive_serial: drive_bay
+                .and_then(|bay| bay.installed.as_ref())
+                .map(|drive| drive.serial.clone()),
+            barcode: barcode.clone(),
+            source_slot: drive_bay.and_then(|bay| bay.source_slot),
+            media_generation: barcode
+                .as_deref()
+                .and_then(remanence_api::lto_generation_from_voltag)
+                .map(|generation| generation.generation_number()),
+            phase: "readiness_poll".to_string(),
+            state: "planned".to_string(),
+            dirty_scope: Some("drive+tape".to_string()),
+            deadline_at_utc: args.wait.then(|| deadline_after(args.timeout)).flatten(),
+            evidence_path: None,
+        })
+        .map_err(|error| format!("record media readiness operation: {error}"))?;
+    Ok((operation_id, drive_element, barcode))
+}
+
+fn validate_wait_ready_resume_binding(
+    library: &Library,
+    operation_id: Uuid,
+    drive_element: u16,
+    record: &remanence_state::MediaReadinessOperationRecord,
+) -> Result<(), String> {
+    const RESUMABLE_STATES: &[&str] = &[
+        "planned",
+        "pre_ready_loading",
+        "media_initializing",
+        "becoming_ready",
+        "target_busy",
+        "unit_attention",
+    ];
+    if !RESUMABLE_STATES.contains(&record.state.as_str()) {
+        return Err(format!(
+            "media readiness operation {operation_id} is state {}; use quarantine/recovery flow instead of wait-ready --resume",
+            record.state
+        ));
+    }
+    let bay = library
+        .drive_bays
+        .iter()
+        .find(|bay| bay.element_address == drive_element)
+        .ok_or_else(|| {
+            format!(
+                "media readiness operation {operation_id} refers to drive 0x{drive_element:04x}, which is not in selected library {}",
+                library.serial
+            )
+        })?;
+    if let Some(expected) = record.drive_serial.as_deref() {
+        let actual = bay.installed.as_ref().map(|drive| drive.serial.as_str());
+        if actual != Some(expected) {
+            return Err(format!(
+                "media readiness operation {operation_id} expected drive serial {expected}, selected-library snapshot has {}",
+                actual.unwrap_or("(none)")
+            ));
+        }
+    }
+    if let Some(expected) = record.barcode.as_deref() {
+        if bay.loaded_tape.as_deref() != Some(expected) {
+            return Err(format!(
+                "media readiness operation {operation_id} expected barcode {expected} in drive 0x{drive_element:04x}, selected-library snapshot has {}",
+                bay.loaded_tape.as_deref().unwrap_or("(none)")
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn poll_drive_media_readiness(
+    drive: &mut DriveHandle,
+    family: MediaFamily,
+    wait: bool,
+    timeout: StdDuration,
+    poll: StdDuration,
+    mut record: impl FnMut(&MediaReadinessPoll) -> Result<(), String>,
+) -> Result<MediaReadinessPoll, String> {
+    let started = StdInstant::now();
+    let mut attempts = 0_u64;
+    let mut unit_attention_seen: Option<(u8, u8)> = None;
+    loop {
+        attempts = attempts.saturating_add(1);
+        let mut readiness = drive.probe_media_readiness(family);
+        if let MediaReadiness::UnitAttention { asc, ascq } = readiness {
+            if unit_attention_seen.replace((asc, ascq)).is_some() {
+                readiness = MediaReadiness::RepeatedUnitAttention { asc, ascq };
+            }
+        }
+        let terminal = readiness.is_ready() || !wait || !readiness.is_retryable_wait();
+        let elapsed = started.elapsed();
+        let timed_out = !terminal && elapsed >= timeout;
+        let current = MediaReadinessPoll {
+            readiness,
+            attempts,
+            timed_out,
+        };
+        record(&current)?;
+        if terminal || timed_out {
+            return Ok(current);
+        }
+        let sleep_for = if poll == MEDIA_CONDITIONING_STEADY_POLL {
+            media_conditioning_poll_interval(elapsed)
+        } else {
+            poll
+        };
+        std::thread::sleep(std::cmp::min(sleep_for, timeout - elapsed));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn media_conditioning_poll_interval(elapsed: StdDuration) -> StdDuration {
+    if elapsed < MEDIA_CONDITIONING_INITIAL_WINDOW {
+        MEDIA_CONDITIONING_INITIAL_POLL
+    } else {
+        MEDIA_CONDITIONING_STEADY_POLL
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn poll_already_observed_media_readiness(
+    readiness: MediaReadiness,
+    phase: &str,
+    operation_id: Uuid,
+    state: &mut impl TapeInitStateOps,
+) -> Result<MediaReadinessPoll, String> {
+    let poll = MediaReadinessPoll {
+        readiness,
+        attempts: 1,
+        timed_out: false,
+    };
+    state.record_media_readiness_transition(media_readiness_transition_input(
+        operation_id,
+        phase,
+        &poll,
+    ))?;
+    Ok(poll)
+}
+
+#[cfg(target_os = "linux")]
+fn poll_drive_media_readiness_for_init<S: TapeInitStateOps>(
+    drive: &mut DriveHandle,
+    family: MediaFamily,
+    operation_id: Uuid,
+    state: &mut S,
+) -> Result<MediaReadinessPoll, String> {
+    poll_drive_media_readiness(
+        drive,
+        family,
+        true,
+        MEDIA_CONDITIONING_TIMEOUT,
+        MEDIA_CONDITIONING_STEADY_POLL,
+        |poll| {
+            state.record_media_readiness_transition(media_readiness_transition_input(
+                operation_id,
+                "readiness_poll",
+                poll,
+            ))
+        },
+    )
+}
+
+fn deadline_after(timeout: StdDuration) -> Option<String> {
+    let seconds = i64::try_from(timeout.as_secs()).ok()?;
+    OffsetDateTime::now_utc()
+        .checked_add(Duration::seconds(seconds))
+        .and_then(|deadline| deadline.format(&Rfc3339).ok())
+}
+
+fn record_media_readiness_poll_transition(
+    catalog: &mut remanence_state::CatalogIndex,
+    operation_id: Uuid,
+    phase: &str,
+    poll: &MediaReadinessPoll,
+) -> Result<(), remanence_state::StateError> {
+    catalog
+        .record_media_readiness_transition(media_readiness_transition_input(
+            operation_id,
+            phase,
+            poll,
+        ))
+        .map(|_| ())
+}
+
+fn media_readiness_transition_input(
+    operation_id: Uuid,
+    phase: &str,
+    poll: &MediaReadinessPoll,
+) -> remanence_state::MediaReadinessTransitionInput {
+    let (sense_key, asc, ascq, target_status, transport_class, last_error_json, sense_raw) =
+        media_readiness_evidence_fields(&poll.readiness);
+    let state = media_readiness_durable_state(&poll.readiness, poll.timed_out).to_string();
+    let quarantine_id = media_readiness_state_requires_release(state.as_str())
+        .then(|| media_readiness_quarantine_id_for_operation(operation_id));
+    remanence_state::MediaReadinessTransitionInput {
+        operation_id,
+        phase: Some(phase.to_string()),
+        state,
+        dirty_scope: Some(if poll.readiness.is_ready() {
+            "none".to_string()
+        } else {
+            "drive+tape".to_string()
+        }),
+        last_cdb_opcode: Some(0x00),
+        last_sense_raw: sense_raw,
+        last_sense_key: sense_key,
+        last_asc: asc,
+        last_ascq: ascq,
+        last_host_status: None,
+        last_driver_status: None,
+        target_status,
+        transport_class,
+        cancel_source: None,
+        signal: None,
+        evidence_path: None,
+        last_error_json,
+        quarantine_id,
+    }
+}
+
+fn media_readiness_mechanical_transition(
+    operation_id: Uuid,
+    phase: &str,
+    state: &str,
+    cdb_opcode: Option<u8>,
+    error: Option<String>,
+) -> remanence_state::MediaReadinessTransitionInput {
+    remanence_state::MediaReadinessTransitionInput {
+        operation_id,
+        phase: Some(phase.to_string()),
+        state: state.to_string(),
+        dirty_scope: Some("drive+tape".to_string()),
+        last_cdb_opcode: cdb_opcode,
+        last_sense_raw: None,
+        last_sense_key: None,
+        last_asc: None,
+        last_ascq: None,
+        last_host_status: None,
+        last_driver_status: None,
+        target_status: None,
+        transport_class: (state == "transport_unknown").then(|| "unknown".to_string()),
+        cancel_source: None,
+        signal: None,
+        evidence_path: None,
+        last_error_json: error.map(|detail| json!({ "detail": detail }).to_string()),
+        quarantine_id: media_readiness_state_requires_release(state)
+            .then(|| media_readiness_quarantine_id_for_operation(operation_id)),
+    }
+}
+
+fn media_readiness_command_failure_state(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("transport error")
+        || lower.contains("completion unknown")
+        || lower.contains("host_status")
+        || lower.contains("did_")
+        || lower.contains("task aborted")
+        || lower.contains("resetting scsi")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+    {
+        "transport_unknown"
+    } else {
+        "terminal_error"
+    }
+}
+
+fn record_media_readiness_command_failure<S: TapeInitStateOps>(
+    state: &mut S,
+    operation_id: Uuid,
+    phase: &str,
+    cdb_opcode: Option<u8>,
+    error: &str,
+) -> Result<(), String> {
+    state.record_media_readiness_transition(media_readiness_mechanical_transition(
+        operation_id,
+        phase,
+        media_readiness_command_failure_state(error),
+        cdb_opcode,
+        Some(error.to_string()),
+    ))
+}
+
+fn media_readiness_release_transition(
+    operation_id: Uuid,
+    ack: &str,
+) -> remanence_state::MediaReadinessTransitionInput {
+    remanence_state::MediaReadinessTransitionInput {
+        operation_id,
+        phase: Some("quarantine_release".to_string()),
+        state: "released".to_string(),
+        dirty_scope: Some("none".to_string()),
+        last_cdb_opcode: None,
+        last_sense_raw: None,
+        last_sense_key: None,
+        last_asc: None,
+        last_ascq: None,
+        last_host_status: None,
+        last_driver_status: None,
+        target_status: None,
+        transport_class: None,
+        cancel_source: Some("operator".to_string()),
+        signal: None,
+        evidence_path: None,
+        last_error_json: Some(json!({ "ack": ack }).to_string()),
+        quarantine_id: Some(media_readiness_quarantine_id_for_operation(operation_id)),
+    }
+}
+
+fn media_readiness_state_requires_release(state: &str) -> bool {
+    matches!(
+        state,
+        "timeout_unknown" | "transport_unknown" | "terminal_error" | "reservation_conflict"
+    )
+}
+
+fn media_readiness_quarantine_id_for_operation(operation_id: Uuid) -> String {
+    format!("mrq-{operation_id}")
+}
+
+type MediaReadinessEvidenceFields = (
+    Option<u8>,
+    Option<u8>,
+    Option<u8>,
+    Option<u8>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn media_readiness_evidence_fields(readiness: &MediaReadiness) -> MediaReadinessEvidenceFields {
+    match readiness {
+        MediaReadiness::Ready => (None, None, None, None, None, None, None),
+        MediaReadiness::BecomingReady { ascq, .. } => {
+            (Some(0x02), Some(0x04), Some(*ascq), None, None, None, None)
+        }
+        MediaReadiness::NoMedium { ascq } => {
+            (Some(0x02), Some(0x3a), Some(*ascq), None, None, None, None)
+        }
+        MediaReadiness::UnitAttention { asc, ascq } => {
+            (Some(0x06), Some(*asc), Some(*ascq), None, None, None, None)
+        }
+        MediaReadiness::RepeatedUnitAttention { asc, ascq } => (
+            Some(0x06),
+            Some(*asc),
+            Some(*ascq),
+            None,
+            None,
+            Some(json!({ "action": "repeated_unit_attention" }).to_string()),
+            None,
+        ),
+        MediaReadiness::TerminalNotReady { ascq, action } => (
+            Some(0x02),
+            Some(0x04),
+            Some(*ascq),
+            None,
+            None,
+            Some(json!({ "action": action }).to_string()),
+            None,
+        ),
+        MediaReadiness::CheckCondition { key, asc, ascq } => {
+            (Some(*key), Some(*asc), Some(*ascq), None, None, None, None)
+        }
+        MediaReadiness::UndecodedCheckCondition { sense } => (
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(json!({ "error": "undecoded_check_condition" }).to_string()),
+            Some(bytes_to_hex(sense)),
+        ),
+        MediaReadiness::TargetBusy { status } | MediaReadiness::UnexpectedStatus { status } => {
+            (None, None, None, Some(*status), None, None, None)
+        }
+        MediaReadiness::ReservationConflict => (None, None, None, Some(0x18), None, None, None),
+        MediaReadiness::TaskAborted => (None, None, None, Some(0x40), None, None, None),
+        MediaReadiness::TransportUnknown { detail } => (
+            None,
+            None,
+            None,
+            None,
+            Some("unknown".to_string()),
+            Some(json!({ "detail": detail }).to_string()),
+            None,
+        ),
+        MediaReadiness::InvalidRequest { detail } => (
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(json!({ "detail": detail }).to_string()),
+            None,
+        ),
+    }
+}
+
+fn media_readiness_durable_state(readiness: &MediaReadiness, timed_out: bool) -> &'static str {
+    if timed_out {
+        return "timeout_unknown";
+    }
+    match readiness {
+        MediaReadiness::Ready => "ready",
+        MediaReadiness::BecomingReady {
+            media_initializing: true,
+            ..
+        } => "media_initializing",
+        MediaReadiness::BecomingReady { .. } => "becoming_ready",
+        MediaReadiness::NoMedium { .. } => "terminal_error",
+        MediaReadiness::UnitAttention { .. } => "unit_attention",
+        MediaReadiness::RepeatedUnitAttention { .. } => "terminal_error",
+        MediaReadiness::TerminalNotReady { .. } => "terminal_error",
+        MediaReadiness::CheckCondition { .. } => "terminal_error",
+        MediaReadiness::UndecodedCheckCondition { .. } => "terminal_error",
+        MediaReadiness::TargetBusy { .. } => "target_busy",
+        MediaReadiness::ReservationConflict => "reservation_conflict",
+        MediaReadiness::TaskAborted => "terminal_error",
+        MediaReadiness::UnexpectedStatus { .. } => "terminal_error",
+        MediaReadiness::TransportUnknown { .. } => "transport_unknown",
+        MediaReadiness::InvalidRequest { .. } => "terminal_error",
+    }
+}
+
+fn readiness_requires_conditional_load(readiness: &MediaReadiness) -> bool {
+    matches!(
+        readiness,
+        MediaReadiness::NoMedium { .. } | MediaReadiness::BecomingReady { ascq: 0x02, .. }
+    )
+}
+
 fn print_tape_wait_ready_result(
     library_serial: &str,
     result: &TapeWaitReadyResult,
@@ -5641,10 +6675,11 @@ fn print_tape_wait_ready_result(
     if json_output {
         let payload = json!({
             "schema": "rem.tape.wait_ready.v1",
+            "operation_id": result.operation_id.to_string(),
             "library_serial": library_serial,
             "drive_element": format!("0x{:04x}", result.drive_element),
             "barcode": result.barcode,
-            "state": media_readiness_state_name(&result.readiness),
+            "state": media_readiness_state_name(&result.readiness, result.timed_out),
             "ready": result.readiness.is_ready(),
             "retryable": result.readiness.is_retryable_wait(),
             "timed_out": result.timed_out,
@@ -5670,17 +6705,25 @@ fn print_tape_wait_ready_result(
     };
     let _ = writeln!(
         out,
-        "{status} library={library_serial} drive=0x{:04x}{barcode} attempts={} {summary}",
-        result.drive_element, result.attempts
+        "{status} operation_id={} library={library_serial} drive=0x{:04x}{barcode} attempts={} {summary}",
+        result.operation_id, result.drive_element, result.attempts
     );
 }
 
-fn media_readiness_state_name(readiness: &MediaReadiness) -> &'static str {
+fn media_readiness_state_name(readiness: &MediaReadiness, timed_out: bool) -> &'static str {
+    if timed_out {
+        return "timeout_unknown";
+    }
     match readiness {
         MediaReadiness::Ready => "ready",
+        MediaReadiness::BecomingReady {
+            media_initializing: true,
+            ..
+        } => "media_initializing",
         MediaReadiness::BecomingReady { .. } => "becoming_ready",
         MediaReadiness::NoMedium { .. } => "no_medium",
         MediaReadiness::UnitAttention { .. } => "unit_attention",
+        MediaReadiness::RepeatedUnitAttention { .. } => "repeated_unit_attention",
         MediaReadiness::TerminalNotReady { .. } => "terminal_not_ready",
         MediaReadiness::CheckCondition { .. } => "check_condition",
         MediaReadiness::UndecodedCheckCondition { .. } => "undecoded_check_condition",
@@ -6158,43 +7201,153 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         fresh_block_size,
         drive_element,
     } = plan;
-    let mut handle = open_library_handle(library, policy)
-        .map_err(|error| format!("opening library: {error}"))?;
+    let operation_id = Uuid::new_v4();
+    let drive_bay = library
+        .drive_bays
+        .iter()
+        .find(|bay| bay.element_address == drive_element);
+    state.record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+        operation_id,
+        run_id: None,
+        library_serial: library.serial.clone(),
+        changer_sg: Some(library.changer_sg.display().to_string()),
+        drive_element,
+        drive_sg: drive_bay
+            .and_then(|bay| bay.installed.as_ref())
+            .and_then(|drive| drive.sg_path.as_ref())
+            .map(|path| path.display().to_string()),
+        drive_serial: drive_bay
+            .and_then(|bay| bay.installed.as_ref())
+            .map(|drive| drive.serial.clone()),
+        barcode: Some(voltag.clone()),
+        source_slot: if candidate.location == TapeInitLocation::Slot {
+            Some(candidate.element_address)
+        } else {
+            drive_bay.and_then(|bay| bay.source_slot)
+        },
+        media_generation: Some(generation.generation_number()),
+        phase: "planned".to_string(),
+        state: "planned".to_string(),
+        dirty_scope: Some("drive+tape".to_string()),
+        deadline_at_utc: deadline_after(MEDIA_CONDITIONING_TIMEOUT),
+        evidence_path: None,
+    })?;
+    let mut handle = match open_library_handle(library, policy) {
+        Ok(handle) => handle,
+        Err(error) => {
+            state.record_media_readiness_transition(media_readiness_mechanical_transition(
+                operation_id,
+                "open_library",
+                "transport_unknown",
+                None,
+                Some(error.to_string()),
+            ))?;
+            return Err(format!("opening library: {error}"));
+        }
+    };
     if candidate.location == TapeInitLocation::Slot {
-        handle
-            .move_medium(candidate.element_address, drive_element, policy)
-            .map_err(|error| {
-                format!(
-                    "move slot 0x{:04x} to drive 0x{drive_element:04x}: {error}",
-                    candidate.element_address
-                )
-            })?;
+        state.record_media_readiness_transition(media_readiness_mechanical_transition(
+            operation_id,
+            "move_medium",
+            "pre_ready_loading",
+            Some(0xa5),
+            None,
+        ))?;
+        if let Err(error) = handle.move_medium(candidate.element_address, drive_element, policy) {
+            state.record_media_readiness_transition(media_readiness_mechanical_transition(
+                operation_id,
+                "move_medium",
+                "transport_unknown",
+                Some(0xa5),
+                Some(error.to_string()),
+            ))?;
+            return Err(format!(
+                "move slot 0x{:04x} to drive 0x{drive_element:04x}: {error}",
+                candidate.element_address
+            ));
+        }
     }
-    let mut drive = handle
-        .open_drive(drive_element, policy)
-        .map_err(|error| format!("open drive 0x{drive_element:04x}: {error}"))?;
-    if candidate.location == TapeInitLocation::Slot {
-        drive
-            .load_immediate()
-            .map_err(|error| format!("immediate drive load 0x{drive_element:04x}: {error}"))?;
-    }
-    let readiness = drive.probe_media_readiness(media_family_for_init_generation(generation));
-    if !readiness.is_ready() {
-        return Err(format!(
-            "media not ready for tape init on {voltag} in drive 0x{drive_element:04x}: {}",
-            describe_media_readiness(&readiness)
+    let mut drive = match handle.open_drive(drive_element, policy) {
+        Ok(drive) => drive,
+        Err(error) => {
+            state.record_media_readiness_transition(media_readiness_mechanical_transition(
+                operation_id,
+                "open_drive",
+                "transport_unknown",
+                None,
+                Some(error.to_string()),
+            ))?;
+            return Err(format!("open drive 0x{drive_element:04x}: {error}"));
+        }
+    };
+    let family = media_family_for_init_generation(generation);
+    let readiness = if candidate.location == TapeInitLocation::Slot {
+        let initial = drive.probe_media_readiness(family);
+        let initial_poll =
+            poll_already_observed_media_readiness(initial, "pre_load_tur", operation_id, state)?;
+        if readiness_requires_conditional_load(&initial_poll.readiness) {
+            state.record_media_readiness_transition(media_readiness_mechanical_transition(
+                operation_id,
+                "conditional_immediate_load",
+                "pre_ready_loading",
+                Some(0x1b),
+                None,
+            ))?;
+            if let Err(error) = drive.load_immediate() {
+                state.record_media_readiness_transition(media_readiness_mechanical_transition(
+                    operation_id,
+                    "conditional_immediate_load",
+                    "transport_unknown",
+                    Some(0x1b),
+                    Some(error.to_string()),
+                ))?;
+                return Err(format!(
+                    "immediate drive load 0x{drive_element:04x}: {error}"
+                ));
+            }
+            poll_drive_media_readiness_for_init(&mut drive, family, operation_id, state)?
+        } else if initial_poll.readiness.is_ready() || !initial_poll.readiness.is_retryable_wait() {
+            initial_poll
+        } else {
+            poll_drive_media_readiness_for_init(&mut drive, family, operation_id, state)?
+        }
+    } else {
+        poll_drive_media_readiness_for_init(&mut drive, family, operation_id, state)?
+    };
+    if !readiness.readiness.is_ready() {
+        return Err(tape_init_readiness_error(
+            voltag.as_str(),
+            drive_element,
+            &readiness,
         ));
     }
-    let drive_config = drive
-        .read_config()
-        .map_err(|error| format!("read drive config: {error}"))?;
+    let drive_config = match drive.read_config() {
+        Ok(config) => config,
+        Err(error) => {
+            record_media_readiness_command_failure(
+                state,
+                operation_id,
+                "read_drive_config",
+                None,
+                &error.to_string(),
+            )?;
+            return Err(format!("read drive config: {error}"));
+        }
+    };
     if drive_config.write_protected {
         return Err("media is write-protected according to MODE SENSE".to_string());
     }
 
-    drive
-        .rewind()
-        .map_err(|error| format!("rewind before BOT read: {error}"))?;
+    if let Err(error) = drive.rewind() {
+        record_media_readiness_command_failure(
+            state,
+            operation_id,
+            "rewind_before_bot_read",
+            Some(0x01),
+            &error.to_string(),
+        )?;
+        return Err(format!("rewind before BOT read: {error}"));
+    }
     let bot_projection = {
         let mut source = DriveHandleSource(&mut drive);
         remanence_api::classify_bot_from_source(&mut source)
@@ -6238,10 +7391,17 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
     // BOT classification reads at least the bootstrap block and may probe past
     // it for data. Rewind again so a fresh init overwrites the bootstrap at
     // block 0 rather than appending a new bootstrap after the probe reads.
-    drive
-        .rewind()
-        .map_err(|error| format!("rewind before bootstrap write: {error}"))?;
-    let action = {
+    if let Err(error) = drive.rewind() {
+        record_media_readiness_command_failure(
+            state,
+            operation_id,
+            "rewind_before_bootstrap_write",
+            Some(0x01),
+            &error.to_string(),
+        )?;
+        return Err(format!("rewind before bootstrap write: {error}"));
+    }
+    let action_result = {
         let mut sink = DriveHandleSink(&mut drive);
         remanence_api::maybe_write_tape_init_bootstrap(
             &mut sink,
@@ -6256,7 +7416,19 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
             parity.clone(),
             env!("CARGO_PKG_VERSION"),
         )
-        .map_err(|error| format!("apply init write gate: {error}"))?
+    };
+    let action = match action_result {
+        Ok(action) => action,
+        Err(error) => {
+            record_media_readiness_command_failure(
+                state,
+                operation_id,
+                "apply_init_write_gate",
+                None,
+                &error.to_string(),
+            )?;
+            return Err(format!("apply init write gate: {error}"));
+        }
     };
     if action == remanence_api::TapeInitWriteAction::WroteBootstrap {
         state.provision_initialized_tape(
@@ -6300,6 +7472,25 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
     Err("tape init requires Linux SG_IO drive access in v0.1".to_string())
 }
 
+fn tape_init_readiness_error(
+    voltag: &str,
+    drive_element: u16,
+    poll: &MediaReadinessPoll,
+) -> String {
+    let timeout = if poll.timed_out {
+        format!(
+            " after {}s readiness wait",
+            MEDIA_CONDITIONING_TIMEOUT.as_secs()
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "media not ready for tape init on {voltag} in drive 0x{drive_element:04x}{timeout}: {}; leave the tape in the drive and run `rem tape wait-ready` or fieldtest/scripts/09-media-ready.sh before retrying init",
+        describe_media_readiness(&poll.readiness)
+    )
+}
+
 fn media_family_for_init_generation(generation: remanence_api::LtoGen) -> MediaFamily {
     if generation.generation_number() >= 9 {
         MediaFamily::Lto9OrLater
@@ -6330,6 +7521,9 @@ fn describe_media_readiness(readiness: &MediaReadiness) -> String {
         }
         MediaReadiness::UnitAttention { asc, ascq } => {
             format!("unit attention during readiness probe (sense 06/{asc:02x}/{ascq:02x})")
+        }
+        MediaReadiness::RepeatedUnitAttention { asc, ascq } => {
+            format!("repeated unit attention during readiness probe (sense 06/{asc:02x}/{ascq:02x}); fence for recovery")
         }
         MediaReadiness::TerminalNotReady { ascq, action } => {
             format!("terminal not-ready state {action} (sense 02/04/{ascq:02x})")
@@ -10142,6 +11336,82 @@ fn print_libraries_json(report: &DiscoveryReport, out: &mut dyn Write) {
     let _ = writeln!(out, "{}", json!({ "libraries": libraries }));
 }
 
+fn print_library_json(lib: &Library, include_slots: bool, out: &mut dyn Write) {
+    let inq = &lib.changer_inquiry;
+    let drives = lib
+        .drive_bays
+        .iter()
+        .map(|bay| {
+            json!({
+                "element_address": format!("0x{:04x}", bay.element_address),
+                "element_address_raw": bay.element_address,
+                "accessible": bay.accessible,
+                "loaded": bay.loaded,
+                "loaded_tape": bay.loaded_tape.as_deref(),
+                "source_slot": bay.source_slot.map(|slot| format!("0x{slot:04x}")),
+                "source_slot_raw": bay.source_slot,
+                "installed": bay.installed.as_ref().map(|drive| json!({
+                    "serial": drive.serial.as_str(),
+                    "identity_source": format!("{:?}", drive.identity_source),
+                    "vendor": drive.vendor.as_deref(),
+                    "product": drive.product.as_deref(),
+                    "revision": drive.revision.as_deref(),
+                    "sg_path": drive.sg_path.as_ref().map(|path| path.display().to_string()),
+                    "sysfs_path": drive.sysfs_path.as_ref().map(|path| path.display().to_string()),
+                })),
+            })
+        })
+        .collect::<Vec<_>>();
+    let slots = include_slots.then(|| {
+        lib.slots
+            .iter()
+            .map(|slot| {
+                json!({
+                    "element_address": format!("0x{:04x}", slot.element_address),
+                    "element_address_raw": slot.element_address,
+                    "accessible": slot.accessible,
+                    "full": slot.full,
+                    "cartridge": slot.cartridge.as_deref(),
+                    "cleaning": slot.cartridge.as_deref().is_some_and(|tag| tag.starts_with("CLN")),
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    let ie_ports = lib
+        .ie_ports
+        .iter()
+        .map(|ie| {
+            json!({
+                "element_address": format!("0x{:04x}", ie.element_address),
+                "element_address_raw": ie.element_address,
+                "accessible": ie.accessible,
+                "full": ie.full,
+                "cartridge": ie.cartridge.as_deref(),
+                "import_enabled": ie.import_enabled,
+                "export_enabled": ie.export_enabled,
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = json!({
+        "serial": lib.serial.as_str(),
+        "changer_sg": lib.changer_sg.display().to_string(),
+        "changer_sysfs": lib.changer_sysfs.display().to_string(),
+        "vendor": inq.vendor_str().trim(),
+        "product": inq.product_str().trim(),
+        "revision": inq.revision_str().trim(),
+        "chassis": lib.chassis_designator.as_ref().map(|id| id.as_hex()),
+        "drive_count": lib.drive_bays.len(),
+        "slot_count": lib.slots.len(),
+        "loaded_slot_count": lib.slots.iter().filter(|slot| slot.full).count(),
+        "ie_port_count": lib.ie_ports.len(),
+        "drives": drives,
+        "slots": slots,
+        "ie_ports": ie_ports,
+    });
+    let _ = serde_json::to_writer_pretty(&mut *out, &payload);
+    let _ = writeln!(out);
+}
+
 fn print_library(lib: &Library, report: &DiscoveryReport, out: &mut dyn Write) {
     let inq = &lib.changer_inquiry;
     let vendor = inq.vendor_str().trim();
@@ -11260,6 +12530,179 @@ mod tests {
         assert_eq!(
             error.message,
             "daemon predates drive stewardship; upgrade rem-daemon"
+        );
+    }
+
+    #[test]
+    fn tape_wait_ready_accepts_resume_operation_id() {
+        let operation_id = Uuid::from_u128(0xfeed);
+        let operation_id_text = operation_id.to_string();
+        let cli = Cli::parse_from([
+            "rem",
+            "tape",
+            "wait-ready",
+            "--resume",
+            operation_id_text.as_str(),
+        ]);
+        match cli.command {
+            RemCommand::Tape { command } => match command {
+                RemTapeCommand::WaitReady(args) => {
+                    assert_eq!(args.resume, Some(operation_id));
+                    assert!(args.barcode.is_none());
+                    assert!(args.drive_element.is_none());
+                }
+                other => panic!("unexpected tape command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tape_wait_ready_defaults_to_media_conditioning_profile() {
+        let cli = Cli::parse_from(["rem", "tape", "wait-ready", "--barcode", "AOX030L9"]);
+        match cli.command {
+            RemCommand::Tape { command } => match command {
+                RemTapeCommand::WaitReady(args) => {
+                    assert_eq!(args.timeout, StdDuration::from_secs(9_000));
+                    assert_eq!(args.poll, StdDuration::from_secs(30));
+                }
+                other => panic!("unexpected tape command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn library_command_accepts_json_slots_snapshot() {
+        let cli = Cli::parse_from(["rem", "library", "LIB-A", "--json", "--slots"]);
+        match cli.command {
+            RemCommand::Library {
+                serial,
+                slots,
+                json,
+            } => {
+                assert_eq!(serial, "LIB-A");
+                assert!(slots);
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tape_quarantine_release_requires_settled_inventory_and_ack() {
+        let missing_ack = Cli::try_parse_from([
+            "rem",
+            "tape",
+            "quarantine",
+            "release",
+            "mrq-123",
+            "--after-settled-inventory",
+            "--ack",
+            "",
+        ])
+        .expect("clap accepts empty string; semantic validation catches it");
+        match missing_ack.command {
+            RemCommand::Tape { command } => match command {
+                RemTapeCommand::Quarantine { command } => {
+                    assert!(command.validate_before_discovery().is_err());
+                }
+                other => panic!("unexpected tape command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let valid = Cli::parse_from([
+            "rem",
+            "tape",
+            "quarantine",
+            "release",
+            "mrq-123",
+            "--after-settled-inventory",
+            "--ack",
+            "operator checked settled inventory",
+            "--json",
+        ]);
+        match valid.command {
+            RemCommand::Tape { command } => match command {
+                RemTapeCommand::Quarantine {
+                    command:
+                        TapeQuarantineCommand::Release {
+                            quarantine,
+                            after_settled_inventory,
+                            ack,
+                            json,
+                            ..
+                        },
+                } => {
+                    assert_eq!(quarantine, "mrq-123");
+                    assert!(after_settled_inventory);
+                    assert_eq!(ack, "operator checked settled inventory");
+                    assert!(json);
+                }
+                other => panic!("unexpected tape command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn media_readiness_unknown_states_get_quarantine_id() {
+        let operation_id = Uuid::from_u128(0x123);
+        let poll = MediaReadinessPoll {
+            readiness: MediaReadiness::TransportUnknown {
+                detail: "DID_TIME_OUT".to_string(),
+            },
+            attempts: 1,
+            timed_out: false,
+        };
+        let transition = media_readiness_transition_input(operation_id, "readiness_poll", &poll);
+        assert_eq!(transition.state, "transport_unknown");
+        assert_eq!(
+            transition.quarantine_id.as_deref(),
+            Some(format!("mrq-{operation_id}").as_str())
+        );
+    }
+
+    #[test]
+    fn media_readiness_command_failure_state_keeps_unknown_completion_fenced() {
+        assert_eq!(
+            media_readiness_command_failure_state(
+                "SG_IO transport error: host_status=0x0003 completion unknown"
+            ),
+            "transport_unknown"
+        );
+        assert_eq!(
+            media_readiness_command_failure_state("drive rejected MODE SENSE"),
+            "terminal_error"
+        );
+    }
+
+    #[test]
+    fn media_readiness_state_name_distinguishes_lto9_initializing() {
+        assert_eq!(
+            media_readiness_state_name(
+                &MediaReadiness::BecomingReady {
+                    ascq: 0x01,
+                    media_initializing: true,
+                },
+                false,
+            ),
+            "media_initializing"
+        );
+        assert_eq!(
+            media_readiness_state_name(
+                &MediaReadiness::BecomingReady {
+                    ascq: 0x01,
+                    media_initializing: false,
+                },
+                false,
+            ),
+            "becoming_ready"
+        );
+        assert_eq!(
+            media_readiness_state_name(&MediaReadiness::Ready, true),
+            "timeout_unknown"
         );
     }
 

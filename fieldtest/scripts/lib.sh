@@ -857,26 +857,54 @@ fi
 # cartridge in the drive, which exhausts a 2-drive library by the 3rd tape.
 fieldtest_drain_drives() {
   local serial="$1"
-  local lib_json bays bay
+  local lib_json loaded_drives bay barcode
   lib_json="$(mktemp)"
-  "$(fieldtest_rem_bin)" library "$serial" --json >"$lib_json" 2>/dev/null || {
+  "$(fieldtest_rem_bin)" library "$serial" --json --slots >"$lib_json" 2>/dev/null || {
     rm -f "$lib_json"; return 0
   }
-  bays="$(python3 - "$lib_json" <<'PY'
+  loaded_drives="$(python3 - "$lib_json" <<'PY'
 import json, sys
 from pathlib import Path
 lib = json.loads(Path(sys.argv[1]).read_text())
 for d in lib.get("drives", []):
     if d.get("loaded"):
-        print(d.get("element_address"))
+        print(f"{d.get('element_address')}\t{d.get('loaded_tape') or ''}")
 PY
 )"
   rm -f "$lib_json"
-  for bay in $bays; do
-    echo "draining drive bay $bay back to its home slot"
+  while IFS=$'\t' read -r bay barcode; do
+    [[ -n "${bay:-}" ]] || continue
+    if [[ -z "${barcode:-}" ]]; then
+      echo "warn: skipping drain of drive bay $bay because the loaded barcode is unreadable" >&2
+      continue
+    fi
+    if [[ "$barcode" == CLN* ]]; then
+      echo "warn: skipping drain of drive bay $bay because $barcode is a cleaning cartridge" >&2
+      continue
+    fi
+    if ! fieldtest_require_allowlisted "$barcode"; then
+      echo "warn: skipping drain of drive bay $bay because $barcode is not in the fieldtest allowlist" >&2
+      continue
+    fi
+    local readiness_out readiness_rc
+    readiness_out="$(fieldtest_artifact_path "drive-drain" "readiness-${barcode}" "$(fieldtest_timestamp_id)")"
+    mkdir -p "$(dirname -- "$readiness_out")"
+    if [[ ! -f "$(fieldtest_config_path)" ]]; then
+      echo "warn: skipping drain of drive bay $bay because $(fieldtest_config_path) is missing" >&2
+      continue
+    fi
+    set +e
+    "$(fieldtest_rem_bin)" tape wait-ready --config "$(fieldtest_config_path)" --library "$serial" --barcode "$barcode" --json >"$readiness_out" 2>&1
+    readiness_rc=$?
+    set -e
+    if [[ "$readiness_rc" -ne 0 ]]; then
+      echo "warn: skipping drain of drive bay $bay ($barcode) because media is not ready or state is unknown (rc=$readiness_rc); evidence: $readiness_out" >&2
+      continue
+    fi
+    echo "draining drive bay $bay ($barcode) back to its home slot"
     "$(fieldtest_rem_debug_bin)" --allow "$serial" unload --bay "$bay" "$serial" || \
       echo "warn: could not drain bay $bay (continuing)" >&2
-  done
+  done <<<"$loaded_drives"
 }
 
 fieldtest_write_config() {
