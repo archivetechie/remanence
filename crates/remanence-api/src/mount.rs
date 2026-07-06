@@ -211,6 +211,8 @@ async fn open_write_session_reserved(
                 selected,
                 needs_drive_load: mount.needs_drive_load,
                 library_serial: mount.library_serial.clone(),
+                barcode: mount.barcode.clone(),
+                source_slot: mount.source_slot,
                 drive_uuid: mount.drive_uuid.clone(),
                 drive_serial: mount.drive_serial.clone(),
                 reply: reply_tx,
@@ -226,7 +228,9 @@ async fn open_write_session_reserved(
     let session = match open_result {
         Ok(session) => session,
         Err(err) => {
-            compensate_open_mount(pool, &mount).await;
+            if should_compensate_open_mount(&err) {
+                compensate_open_mount(pool, &mount).await;
+            }
             return Err(err);
         }
     };
@@ -318,6 +322,8 @@ async fn open_read_session_reserved(
                 tape_uuid,
                 needs_drive_load: mount.needs_drive_load,
                 library_serial: mount.library_serial.clone(),
+                barcode: mount.barcode.clone(),
+                source_slot: mount.source_slot,
                 drive_uuid: mount.drive_uuid.clone(),
                 drive_serial: mount.drive_serial.clone(),
                 reply: reply_tx,
@@ -332,7 +338,9 @@ async fn open_read_session_reserved(
     let session = match open_result {
         Ok(session) => session,
         Err(err) => {
-            compensate_open_mount(pool, &mount).await;
+            if should_compensate_open_mount(&err) {
+                compensate_open_mount(pool, &mount).await;
+            }
             return Err(err);
         }
     };
@@ -651,6 +659,10 @@ async fn compensate_open_mount(pool: &crate::write_owner::DrivePool, mount: &Act
         let _ = drive_unload(pool, mount.bay).await;
         let _ = changer_move(pool, mount.bay, slot).await;
     }
+}
+
+fn should_compensate_open_mount(err: &Status) -> bool {
+    !err.message().contains("media_readiness_state=")
 }
 
 async fn drive_unload(pool: &crate::write_owner::DrivePool, bay: u16) -> Result<(), Status> {
