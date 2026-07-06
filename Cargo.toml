@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/remanence-scsi",
     "crates/remanence-library",
+    "crates/remanence-crc",
     "crates/remanence-aead",
     "crates/remanence-chaos",
     "crates/remanence-format-driver",

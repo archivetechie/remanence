@@ -1652,6 +1652,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "remanence-crc"
+version = "0.0.1"
+
+[[package]]
 name = "remanence-daemon"
 version = "0.0.1"
 dependencies = [
@@ -1715,6 +1719,7 @@ dependencies = [
  "hmac",
  "nix",
  "reed-solomon-erasure",
+ "remanence-crc",
  "remanence-library",
  "sha2",
  "thiserror 1.0.69",
@@ -1735,6 +1740,7 @@ version = "0.0.1"
 dependencies = [
  "ciborium",
  "nix",
+ "remanence-crc",
  "remanence-library",
  "remanence-parity",
  "rusqlite",
