@@ -124,6 +124,13 @@ pub struct Element {
     pub impexp: bool,
     /// True if the element raised an exception (ASC/ASCQ would explain why).
     pub except: bool,
+    /// Additional Sense Code from the element descriptor common prefix.
+    /// Meaningful when [`Self::except`] is set; retained even when clear so
+    /// callers can persist the target's exact bytes.
+    pub asc: u8,
+    /// Additional Sense Code Qualifier from the element descriptor common
+    /// prefix. Meaningful when [`Self::except`] is set.
+    pub ascq: u8,
     /// True if the element is accessible to the medium transport.
     pub access: bool,
     /// True if the IE port currently accepts exports (SMC-3 EXENAB
@@ -357,6 +364,8 @@ pub fn parse(buf: &[u8]) -> Result<ElementStatusData, ScsiError> {
                 full: (flags & 0x01) != 0,
                 impexp: (flags & 0x02) != 0,
                 except: (flags & 0x04) != 0,
+                asc: d[4],
+                ascq: d[5],
                 access: (flags & 0x08) != 0,
                 export_enabled: (flags & 0x10) != 0,
                 import_enabled: (flags & 0x20) != 0,
@@ -690,6 +699,26 @@ mod tests {
         assert!(!first.except);
         assert!(!second.access);
         assert!(second.except);
+    }
+
+    #[test]
+    fn parses_element_exception_asc_and_ascq() {
+        let mut response = two_slot_response();
+        let desc = HEADER_LEN + PAGE_HEADER_LEN + COMMON_DESC_LEN + VOLTAG_BLOCK_LEN;
+        response[desc + 2] |= 0x04;
+        response[desc + 4] = 0x04;
+        response[desc + 5] = 0x01;
+
+        let parsed = parse(&response).expect("RES with element exception parses");
+        let second = parsed
+            .elements
+            .iter()
+            .find(|element| element.address == 0x0401)
+            .expect("second slot");
+
+        assert!(second.except);
+        assert_eq!(second.asc, 0x04);
+        assert_eq!(second.ascq, 0x01);
     }
 
     #[test]

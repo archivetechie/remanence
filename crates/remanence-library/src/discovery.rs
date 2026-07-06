@@ -990,6 +990,8 @@ mod tests {
                 full: false,
                 impexp: false,
                 except: false,
+                asc: 0,
+                ascq: 0,
                 access: true,
                 export_enabled: false,
                 import_enabled: false,

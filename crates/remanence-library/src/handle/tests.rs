@@ -1,5 +1,6 @@
 use super::*;
 use crate::error::{AuditOp, AuditOutcome, RescanError};
+use crate::handle::tape_io::{MediaFamily, MediaReadiness};
 use crate::model::{DriveBay, ElementLayout, IePort, InstalledDrive, Slot};
 use crate::transport::{FixtureTransport, RecordingLog, RecordingTransport, TransferOutcome};
 use crate::StaticAllowlist;
@@ -1176,6 +1177,54 @@ fn lto9_inquiry() -> Vec<u8> {
     include_bytes!("../../../../fixtures/inquiry/drive1-lto9.bin").to_vec()
 }
 
+#[cfg(target_os = "linux")]
+struct FailTurWithCheckCondition<T> {
+    inner: T,
+    sense: Vec<u8>,
+    fired: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl<T: crate::transport::SgTransport> crate::transport::SgTransport
+    for FailTurWithCheckCondition<T>
+{
+    fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+        self.inner.execute_in(cdb, buf)
+    }
+
+    fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
+        self.inner.execute_none(cdb)?;
+        if cdb == [0, 0, 0, 0, 0, 0] && !self.fired {
+            self.fired = true;
+            Err(ScsiError::CheckCondition {
+                sense: self.sense.clone(),
+                bytes_transferred: 0,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn execute_out(&mut self, cdb: &[u8], buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
+        self.inner.execute_out(cdb, buf)
+    }
+
+    fn set_timeout_for(&mut self, class: TimeoutClass) {
+        self.inner.set_timeout_for(class)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn readiness_fixed_sense(key: u8, asc: u8, ascq: u8) -> Vec<u8> {
+    let mut sense = vec![0u8; 32];
+    sense[0] = 0x70;
+    sense[2] = key & 0x0f;
+    sense[7] = 24;
+    sense[12] = asc;
+    sense[13] = ascq;
+    sense
+}
+
 #[test]
 fn open_drive_succeeds_for_resolved_bay() {
     let lib = open_drive_test_lib("LIB_OD01");
@@ -1494,6 +1543,37 @@ fn drive_handle_load_issues_correct_cdb_and_audits() {
     // test exercises it — the From<ScsiError> impl is reachable
     // through DriveHandle::issue_load_unload's error path.
     let _: fn(ScsiError) -> DriveOpError = DriveOpError::from;
+}
+
+#[test]
+fn drive_handle_load_immediate_sets_immed_bit() {
+    let lib = open_drive_test_lib("LIB_OD08I");
+    let policy = StaticAllowlist::new(["LIB_OD08I"]);
+    let (factory, log) = multi_recording_factory(vec![
+        (
+            PathBuf::from("/dev/sg-mock"),
+            vec![changer_inquiry_response(), vpd80_response("LIB_OD08I")],
+        ),
+        (
+            PathBuf::from("/dev/sg-drive-mock"),
+            vec![lto9_inquiry(), vpd80_response("DRV_A")],
+        ),
+    ]);
+    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+
+    {
+        let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+        drive.load_immediate().expect("immediate load ok");
+    }
+
+    let lu_cdbs: Vec<Vec<u8>> = log
+        .borrow()
+        .iter()
+        .filter(|c| c[0] == 0x1B)
+        .cloned()
+        .collect();
+    assert_eq!(lu_cdbs.len(), 1);
+    assert_eq!(lu_cdbs[0], vec![0x1B, 0x01, 0x00, 0x00, 0x01, 0x00]);
 }
 
 #[cfg(target_os = "linux")]
@@ -3556,6 +3636,85 @@ fn drive_handle_test_unit_ready_issues_tur() {
     assert!(
         log.iter().any(|cdb| cdb.as_slice() == [0, 0, 0, 0, 0, 0]),
         "TEST UNIT READY CDB was not issued"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn drive_handle_probe_media_readiness_classifies_lto9_initializing() {
+    let lib = open_drive_test_lib("LIB_TUR02");
+    let policy = StaticAllowlist::new(["LIB_TUR02"]);
+    let log: RecordingLog = RecordingLog::new();
+    let log_cl = log.clone();
+    let mut changer_slot = Some(vec![
+        changer_inquiry_response(),
+        vpd80_response("LIB_TUR02"),
+    ]);
+    let mut drive_slot = Some(vec![lto9_inquiry(), vpd80_response("DRV_A")]);
+    let factory: Box<dyn FnMut(&Path) -> Result<Box<dyn SgTransport>, IoErrorKind>> =
+        Box::new(move |path: &Path| {
+            if path == Path::new("/dev/sg-mock") {
+                let inner = FixtureTransport::new().with_responses(
+                    changer_slot.take().ok_or_else(|| IoErrorKind {
+                        kind: "Other",
+                        message: "changer drained".into(),
+                        raw_os_error: None,
+                    })?,
+                );
+                Ok(
+                    Box::new(RecordingTransport::with_log(inner, log_cl.clone()))
+                        as Box<dyn SgTransport>,
+                )
+            } else if path == Path::new("/dev/sg-drive-mock") {
+                let inner =
+                    FixtureTransport::new().with_responses(drive_slot.take().ok_or_else(|| {
+                        IoErrorKind {
+                            kind: "Other",
+                            message: "drive drained".into(),
+                            raw_os_error: None,
+                        }
+                    })?);
+                let failing = FailTurWithCheckCondition {
+                    inner,
+                    sense: readiness_fixed_sense(0x02, 0x04, 0x01),
+                    fired: false,
+                };
+                Ok(
+                    Box::new(RecordingTransport::with_log(failing, log_cl.clone()))
+                        as Box<dyn SgTransport>,
+                )
+            } else {
+                Err(IoErrorKind {
+                    kind: "NotFound",
+                    message: format!("unknown path {path:?}"),
+                    raw_os_error: None,
+                })
+            }
+        });
+    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+
+    let readiness = {
+        let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+        drive.probe_media_readiness(MediaFamily::Lto9OrLater)
+    };
+
+    assert_eq!(
+        readiness,
+        MediaReadiness::BecomingReady {
+            ascq: 0x01,
+            media_initializing: true
+        }
+    );
+    assert!(!handle.is_dirty(), "TUR CHECK CONDITION is not dirty");
+    let log = log.borrow();
+    assert!(
+        log.iter().any(|cdb| cdb.as_slice() == [0, 0, 0, 0, 0, 0]),
+        "readiness probe did not issue TEST UNIT READY"
+    );
+    assert!(
+        !log.iter()
+            .any(|cdb| matches!(cdb[0], 0x05 | 0x1A | 0x01 | 0x34 | 0x4D)),
+        "readiness probe issued a forbidden media/config command: {log:02x?}"
     );
 }
 

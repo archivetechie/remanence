@@ -17,6 +17,8 @@
 //! `locate`/`space`/`read_block`/`write_block`/etc.
 
 pub mod model;
+/// Media readiness classification for TEST UNIT READY probes.
+pub mod readiness;
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -35,6 +37,7 @@ pub use model::{
     BlockSize, SpaceKind, SpaceResult, TapeConfig, TapePosition, WormMediaState,
     WriteFilemarksOutcome, WriteOutcome, WriteUnpositionedOutcome,
 };
+pub use readiness::{classify_media_readiness_error, MediaFamily, MediaReadiness};
 
 /// Errors a Layer 3a tape I/O operation can return. Preserves Layer
 /// 2b's dirty-state vocabulary: `Transport` always marks the parent
@@ -461,6 +464,17 @@ impl super::DriveHandle {
         let cdb = [0u8; 6];
         self.transport.set_timeout_for(TimeoutClass::TapeStatus);
         self.transport.execute_none(&cdb).map_err(map_scsi)
+    }
+
+    /// Issue TEST UNIT READY and classify media readiness without sending any
+    /// media-access or configuration command.
+    pub fn probe_media_readiness(&mut self, family: MediaFamily) -> MediaReadiness {
+        let cdb = [0u8; 6];
+        self.transport.set_timeout_for(TimeoutClass::TapeStatus);
+        match self.transport.execute_none(&cdb) {
+            Ok(()) => MediaReadiness::Ready,
+            Err(err) => classify_media_readiness_error(err, family),
+        }
     }
 
     fn read_error_counter_page(

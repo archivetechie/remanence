@@ -5,9 +5,10 @@
 //! release it before the changer can pluck it back out. The CDB has
 //! no data phase.
 //!
-//! The `IMMED` bit (return as soon as the operation starts, rather
-//! than when it completes) is deliberately *not* set: Layer 2b's
-//! callers want completion before issuing the follow-up MOVE MEDIUM.
+//! The default builder deliberately leaves the `IMMED` bit clear:
+//! existing Layer 2b callers want completion before issuing a follow-up
+//! MOVE MEDIUM. Readiness-aware callers may opt into `IMMED=1` and
+//! poll TEST UNIT READY instead.
 
 /// SCSI opcode for SSC LOAD / UNLOAD.
 pub const OPCODE: u8 = 0x1B;
@@ -19,14 +20,25 @@ pub const OPCODE: u8 = 0x1B;
 /// the defaults the tape archive workflow wants: don't retension,
 /// don't seek to end-of-tape, don't hold the cartridge after unload.
 pub fn build_cdb(load: bool) -> [u8; 6] {
+    build_cdb_with_immed(load, false)
+}
+
+/// Build the 6-byte SSC LOAD/UNLOAD CDB with explicit control over
+/// byte 1 bit 0 (`IMMED`).
+pub fn build_cdb_with_immed(load: bool, immed: bool) -> [u8; 6] {
     [
         OPCODE,
-        0x00,                           // IMMED=0 — wait for completion
-        0x00,                           // reserved
-        0x00,                           // reserved
-        if load { 0x01 } else { 0x00 }, // bit 0: LOAD
-        0x00,                           // control
+        if immed { 0x01 } else { 0x00 }, // bit 0: IMMED
+        0x00,                            // reserved
+        0x00,                            // reserved
+        if load { 0x01 } else { 0x00 },  // bit 0: LOAD
+        0x00,                            // control
     ]
+}
+
+/// Build an immediate SSC LOAD CDB for media-readiness workflows.
+pub fn build_immediate_load_cdb() -> [u8; 6] {
+    build_cdb_with_immed(true, true)
 }
 
 #[cfg(test)]
@@ -41,5 +53,13 @@ mod tests {
     #[test]
     fn unload_clears_byte_4() {
         assert_eq!(build_cdb(false), [0x1B, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn immediate_load_sets_byte_1_bit_0() {
+        assert_eq!(
+            build_immediate_load_cdb(),
+            [0x1B, 0x01, 0x00, 0x00, 0x01, 0x00]
+        );
     }
 }
