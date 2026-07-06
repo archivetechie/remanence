@@ -10,6 +10,7 @@
 //! boundaries.
 
 use hmac::{Hmac, Mac};
+pub use remanence_crc::{crc64_xz, CRC64_XZ_CHECK_VALUE};
 use sha2::{Digest, Sha256};
 
 use crate::error::ParityError;
@@ -40,14 +41,9 @@ pub const PARITY_INDEX_ENTRY_LEN: usize = 16;
 /// Byte length of one packed data-shard CRC entry.
 pub const DATA_CRC_ENTRY_LEN: usize = 8;
 
-/// CRC-64/XZ check value for ASCII `123456789`.
-pub const CRC64_XZ_CHECK_VALUE: u64 = 0x995D_C9BB_DF19_39FA;
-
 const SIDECAR_MAGIC_MESSAGE: &[u8] = b"REM\x00PAR\x01";
 const SIDECAR_FOOTER_MAGIC_MESSAGE: &[u8] = b"REM\x00PARFOOT\x01";
 const SIDECAR_METADATA_HASH_DOMAIN: &[u8] = b"remanence-sidecar-metadata-v1";
-const CRC64_XZ_REFLECTED_POLY: u64 = 0xC96C_5795_D787_0F42;
-const CRC64_XZ_TABLE: [u64; 256] = build_crc64_xz_table();
 
 /// Header/index copy identity for replicated sidecar metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,40 +276,6 @@ struct HeaderCounts {
     tail_header_start_block: u64,
     footer_block_index: u64,
     copy_generation: u32,
-}
-
-/// Compute CRC-64/XZ over `bytes`.
-///
-/// Parameters: poly `0x42F0E1EBA9EA3693`, reflected input/output, init and
-/// final xor of `0xFFFFFFFFFFFFFFFF`. The result for `b"123456789"` is
-/// [`CRC64_XZ_CHECK_VALUE`].
-pub fn crc64_xz(bytes: &[u8]) -> u64 {
-    let mut crc = u64::MAX;
-    for &byte in bytes {
-        let index = ((crc ^ u64::from(byte)) & 0xFF) as usize;
-        crc = (crc >> 8) ^ CRC64_XZ_TABLE[index];
-    }
-    crc ^ u64::MAX
-}
-
-const fn build_crc64_xz_table() -> [u64; 256] {
-    let mut table = [0u64; 256];
-    let mut byte = 0usize;
-    while byte < 256 {
-        let mut crc = byte as u64;
-        let mut bit = 0;
-        while bit < 8 {
-            if crc & 1 == 1 {
-                crc = (crc >> 1) ^ CRC64_XZ_REFLECTED_POLY;
-            } else {
-                crc >>= 1;
-            }
-            bit += 1;
-        }
-        table[byte] = crc;
-        byte += 1;
-    }
-    table
 }
 
 /// Derive the 8-byte per-tape sidecar magic from the tape UUID.
