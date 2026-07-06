@@ -72,13 +72,20 @@ green. Then physically load the scratch data tapes plus the CLN cartridge.
 ./scripts/02-discovery.sh
 ```
 
+After the allowlist is written, run a no-move readiness sweep. It polls only
+allowlisted tapes already loaded in drives; slot-only tapes are recorded as
+`SKIP/not_loaded` and are left for `10-init-pools.sh`.
+
+```bash
+./scripts/09-media-ready.sh --count 4 --no-wait
+```
+
 If `10-init-pools.sh` exits 10 with media not ready, or the MSL3040 UI shows
 Calib/initializing for a loaded tape, leave that cartridge in the drive and
 wait on it before daemon bringup. The command writes JSON with an
 `operation_id`; use that id for later resume checks.
 
 ```bash
-./scripts/09-media-ready.sh --barcode AOX030L9
 ./scripts/09-media-ready.sh --resume <operation_id-from-json>
 ```
 

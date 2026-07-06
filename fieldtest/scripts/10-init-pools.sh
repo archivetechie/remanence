@@ -45,7 +45,30 @@ init_media_not_ready() {
 
 init_transport_unknown() {
   local path="$1"
-  grep -qiE 'transport error|completion unknown|DID_TIME_OUT|host_status=0x|task aborted|resetting scsi|SG_IO transport error' "$path"
+  python3 - "$path" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text())
+text = f"{payload.get('stdout', '')}\n{payload.get('stderr', '')}"
+lower = text.lower()
+needles = [
+    "transport error",
+    "completion unknown",
+    "did_time_out",
+    "task aborted",
+    "resetting scsi",
+    "sg_io transport error",
+]
+if any(needle in lower for needle in needles):
+    raise SystemExit(0)
+for match in re.finditer(r"\bhost_status=0x([0-9a-fA-F]+)\b", text):
+    if int(match.group(1), 16) != 0:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
 }
 
 init_readiness_code() {
@@ -240,8 +263,16 @@ EOF
     return 1
   fi
   grep -q -- '--dry-run' "$rem_log"
-  ! grep -q -- '--force' "$rem_log"
-  ! grep -q -- '--clobber-data' "$rem_log"
+  if grep -q -- '--force' "$rem_log"; then
+    echo "selftest: --force should not run after readiness exit 10" >&2
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  if grep -q -- '--clobber-data' "$rem_log"; then
+    echo "selftest: --clobber-data should not run after readiness exit 10" >&2
+    rm -rf "$tmpdir"
+    return 1
+  fi
   grep -q '"status":"INFO"' "$records"
   grep -q '"media_readiness_state":"media_initializing"' "$records"
   grep -q '"rem_exit_code":10' "$records"
@@ -295,10 +326,48 @@ EOF
     return 1
   fi
   grep -q -- '--dry-run' "$rem_log"
-  ! grep -q -- '--force' "$rem_log"
-  ! grep -q -- '--clobber-data' "$rem_log"
+  if grep -q -- '--force' "$rem_log"; then
+    echo "selftest: --force should not run after unclassified non-policy exit" >&2
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  if grep -q -- '--clobber-data' "$rem_log"; then
+    echo "selftest: --clobber-data should not run after unclassified non-policy exit" >&2
+    rm -rf "$tmpdir"
+    return 1
+  fi
   grep -q '"status":"FAIL"' "$records"
   grep -q '"rem_exit_code":2' "$records"
+  rm -rf "$tmpdir"
+}
+
+init_pools_transport_regex_selftest() {
+  local tmpdir zero_path nonzero_path
+  tmpdir="$(mktemp -d)"
+  zero_path="$tmpdir/host-status-zero.json"
+  nonzero_path="$tmpdir/host-status-nonzero.json"
+  cat >"$zero_path" <<'JSON'
+{
+  "command": "rem tape init AOX030L9",
+  "exit_code": 1,
+  "stdout": "",
+  "stderr": "ordinary policy refusal with host_status=0x00 in diagnostic detail"
+}
+JSON
+  cat >"$nonzero_path" <<'JSON'
+{
+  "command": "rem tape init AOX030L9",
+  "exit_code": 1,
+  "stdout": "",
+  "stderr": "SG_IO transport error: status=0x00 host_status=0x0003 driver_status=0x0000"
+}
+JSON
+  if init_transport_unknown "$zero_path"; then
+    echo "selftest: host_status=0x00 must not classify as transport unknown" >&2
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  init_transport_unknown "$nonzero_path"
   rm -rf "$tmpdir"
 }
 
@@ -307,6 +376,7 @@ main() {
     init_pools_selftest
     init_pools_escalation_selftest
     init_pools_unclassified_exit_selftest
+    init_pools_transport_regex_selftest
     exit 0
   fi
   if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
@@ -358,7 +428,7 @@ main() {
   fieldtest_drain_drives "$serial" || true
 
   local halfway=$(((count + 1) / 2))
-  local idx init_out init_level init_bay catalog_json ok=0
+  local idx init_out init_level init_bay
   for idx in "${!data_barcodes[@]}"; do
     if (( idx >= count )); then
       break
@@ -407,7 +477,6 @@ main() {
     fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" PASS "initialized ${data_barcodes[$idx]} (level: $init_level) into pool candidate $((idx < halfway ? 1 : 2))" "$init_out"
   done
 
-  ok=1
   fieldtest_evidence_record "$SCRIPT_NAME" init-summary PASS "initialized $count allowlisted tapes (catalog visibility verified after bringup)"
 
   if [[ -n "$cleaning_barcode" ]]; then
