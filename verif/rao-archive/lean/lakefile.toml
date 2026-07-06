@@ -1,0 +1,10 @@
+name = "rao_archive"
+version = "0.1.0"
+defaultTargets = ["RaoArchive"]
+
+[[require]]
+name = "aeneas"
+path = "/home/user/toolchains/aeneas/backends/lean"
+
+[[lean_lib]]
+name = "RaoArchive"
