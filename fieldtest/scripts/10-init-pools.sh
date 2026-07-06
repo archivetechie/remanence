@@ -40,7 +40,7 @@ PY
 
 init_media_not_ready() {
   local path="$1"
-  grep -qiE 'media not ready for tape init|media initializing/calibrating|logical unit becoming ready|target busy during readiness probe|transport completion unknown during readiness probe' "$path"
+  grep -qiE 'media not ready for tape init|media initializing/calibrating|logical unit becoming ready|target busy during readiness probe' "$path"
 }
 
 init_transport_unknown() {
@@ -105,6 +105,28 @@ if isinstance(exit_code, int):
 PY
 }
 
+init_decision_contains() {
+  local path="$1" needle="$2"
+  python3 - "$path" "$needle" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text())
+needle = sys.argv[2]
+text = f"{payload.get('stdout', '')}\n{payload.get('stderr', '')}"
+raise SystemExit(0 if needle in text else 1)
+PY
+}
+
+init_requires_force_refusal() {
+  init_decision_contains "$1" "decision: require-force:"
+}
+
+init_requires_clobber_refusal() {
+  init_decision_contains "$1" "decision: refuse-clobber:"
+}
+
 init_readiness_extra_json() {
   local path="$1" code="${2:-}"
   python3 - "$path" "$code" <<'PY'
@@ -156,6 +178,11 @@ record_init_unclassified_stop() {
   fieldtest_evidence_record "$SCRIPT_NAME" "init-${barcode}" FAIL "unclassified rem exit code ${code} while initializing ${barcode}; stop destructive escalation and inspect the captured stderr/stdout before retrying" "$path" "$(init_readiness_extra_json "$path" "$code")"
 }
 
+record_init_non_policy_stop() {
+  local barcode="$1" path="$2" expected="$3"
+  fieldtest_evidence_record "$SCRIPT_NAME" "init-${barcode}" FAIL "init did not produce expected ${expected} policy-refusal marker; stopping before destructive escalation" "$path" "$(init_readiness_extra_json "$path" "$(init_raw_exit_code "$path" || true)")"
+}
+
 stop_init_escalation_if_readiness_blocked() {
   local barcode="$1" path="$2" code raw_code
   code="$(init_readiness_code "$path" || true)"
@@ -186,6 +213,28 @@ stop_init_escalation_if_readiness_blocked() {
     record_init_transport_stop "$barcode" "$path" 40
     exit 40
   fi
+}
+
+require_init_policy_refusal_before_escalation() {
+  local barcode="$1" path="$2" expected="$3"
+  case "$expected" in
+    require-force)
+      if init_requires_force_refusal "$path"; then
+        return 0
+      fi
+      ;;
+    refuse-clobber)
+      if init_requires_clobber_refusal "$path"; then
+        return 0
+      fi
+      ;;
+    *)
+      echo "internal error: unknown init policy marker $expected" >&2
+      exit 1
+      ;;
+  esac
+  record_init_non_policy_stop "$barcode" "$path" "$expected"
+  exit 1
 }
 
 init_pools_selftest() {
@@ -341,6 +390,141 @@ EOF
   rm -rf "$tmpdir"
 }
 
+init_pools_exit_one_fail_closed_selftest() {
+  local tmpdir child_rc rem_log records
+  tmpdir="$(mktemp -d)"
+  mkdir -p "$tmpdir/home/bin" "$tmpdir/home/evidence" "$tmpdir/home/state" "$tmpdir/home/log" "$tmpdir/home/spool"
+  cat >"$tmpdir/home/allowlist.txt" <<'EOF'
+AOX030L9
+EOF
+  cat >"$tmpdir/home/bin/rem" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+home="${REMFIELD_HOME:?}"
+printf '%s\n' "$*" >>"$home/rem-invocations.log"
+if [[ "${1:-}" == libraries && "${2:-}" == --json ]]; then
+  cat <<'JSON'
+{"libraries":[{"serial":"LIBMAIN","product":"MSL G3 Series","revision":"D.00","vendor":"HPE","drive_count":1,"slot_count":1,"loaded_slot_count":1,"ie_port_count":0}]}
+JSON
+  exit 0
+fi
+if [[ "${1:-}" == library && "${3:-}" == --json && "${4:-}" == --slots ]]; then
+  cat <<'JSON'
+{"serial":"LIBMAIN","drives":[],"slots":[{"element_address":"0x03eb","full":true,"cartridge":"AOX030L9"}]}
+JSON
+  exit 0
+fi
+if [[ "${1:-}" == --allow && "${3:-}" == tape && "${4:-}" == init ]]; then
+  if [[ " $* " == *" --dry-run "* ]]; then
+    echo "dry-run would write"
+    exit 0
+  fi
+  echo "generic exit-one hardware failure without policy marker" >&2
+  exit 1
+fi
+echo "unexpected mock rem invocation: $*" >&2
+exit 98
+EOF
+  chmod +x "$tmpdir/home/bin/rem"
+  REMFIELD_HOME="$tmpdir/home" bash "$0" --count 1 >/dev/null 2>"$tmpdir/selftest.stderr" || child_rc=$?
+  child_rc="${child_rc:-0}"
+  rem_log="$tmpdir/home/rem-invocations.log"
+  records="$tmpdir/home/evidence/records.jsonl"
+  if [[ "$child_rc" -ne 1 ]]; then
+    echo "selftest: expected generic exit-one stop, got $child_rc" >&2
+    cat "$tmpdir/selftest.stderr" >&2 || true
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  grep -q -- 'tape init AOX030L9' "$rem_log"
+  if grep -q -- '--force' "$rem_log"; then
+    echo "selftest: --force should not run after generic exit 1" >&2
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  if grep -q -- '--clobber-data' "$rem_log"; then
+    echo "selftest: --clobber-data should not run after generic exit 1" >&2
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  grep -q '"status":"FAIL"' "$records"
+  grep -q 'expected require-force policy-refusal marker' "$records"
+  rm -rf "$tmpdir"
+}
+
+init_pools_policy_force_selftest() {
+  local tmpdir child_rc rem_log records
+  tmpdir="$(mktemp -d)"
+  mkdir -p "$tmpdir/home/bin" "$tmpdir/home/evidence" "$tmpdir/home/state" "$tmpdir/home/log" "$tmpdir/home/spool"
+  cat >"$tmpdir/home/allowlist.txt" <<'EOF'
+AOX030L9
+EOF
+  cat >"$tmpdir/home/bin/rem" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+home="${REMFIELD_HOME:?}"
+printf '%s\n' "$*" >>"$home/rem-invocations.log"
+if [[ "${1:-}" == libraries && "${2:-}" == --json ]]; then
+  cat <<'JSON'
+{"libraries":[{"serial":"LIBMAIN","product":"MSL G3 Series","revision":"D.00","vendor":"HPE","drive_count":1,"slot_count":1,"loaded_slot_count":1,"ie_port_count":0}]}
+JSON
+  exit 0
+fi
+if [[ "${1:-}" == library && "${3:-}" == --json && "${4:-}" == --slots ]]; then
+  cat <<'JSON'
+{"serial":"LIBMAIN","drives":[],"slots":[{"element_address":"0x03eb","full":true,"cartridge":"AOX030L9"}]}
+JSON
+  exit 0
+fi
+if [[ "${1:-}" == --allow && "${3:-}" == tape && "${4:-}" == init ]]; then
+  if [[ " $* " == *" --dry-run "* ]]; then
+    echo "tape init AOX030L9: dry-run-would-write"
+    exit 0
+  fi
+  if [[ " $* " == *" --force "* ]]; then
+    echo "tape init AOX030L9: wrote-bootstrap"
+    echo "  source: 0x03eb; drive: 0x0001"
+    exit 0
+  fi
+  echo "tape init AOX030L9: refused-no-write"
+  echo "  decision: require-force: geometry mismatch"
+  exit 1
+fi
+if [[ "${1:-}" == --allow && "${3:-}" == unload ]]; then
+  exit 0
+fi
+echo "unexpected mock rem invocation: $*" >&2
+exit 98
+EOF
+  chmod +x "$tmpdir/home/bin/rem"
+  cat >"$tmpdir/home/bin/rem-debug" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+home="${REMFIELD_HOME:?}"
+printf 'rem-debug %s\n' "$*" >>"$home/rem-invocations.log"
+exit 0
+EOF
+  chmod +x "$tmpdir/home/bin/rem-debug"
+  REMFIELD_HOME="$tmpdir/home" bash "$0" --count 1 >/dev/null 2>"$tmpdir/selftest.stderr" || child_rc=$?
+  child_rc="${child_rc:-0}"
+  rem_log="$tmpdir/home/rem-invocations.log"
+  records="$tmpdir/home/evidence/records.jsonl"
+  if [[ "$child_rc" -ne 0 ]]; then
+    echo "selftest: expected explicit require-force path to pass, got $child_rc" >&2
+    cat "$tmpdir/selftest.stderr" >&2 || true
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  grep -q -- '--force' "$rem_log"
+  if grep -q -- '--clobber-data' "$rem_log"; then
+    echo "selftest: --clobber-data should not run after force success" >&2
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  grep -q '"status":"PASS"' "$records"
+  rm -rf "$tmpdir"
+}
+
 init_pools_transport_regex_selftest() {
   local tmpdir zero_path nonzero_path
   tmpdir="$(mktemp -d)"
@@ -376,6 +560,8 @@ main() {
     init_pools_selftest
     init_pools_escalation_selftest
     init_pools_unclassified_exit_selftest
+    init_pools_exit_one_fail_closed_selftest
+    init_pools_policy_force_selftest
     init_pools_transport_regex_selftest
     exit 0
   fi
@@ -428,39 +614,50 @@ main() {
   fieldtest_drain_drives "$serial" || true
 
   local halfway=$(((count + 1) / 2))
-  local idx init_out init_level init_bay
+  local idx init_base dry_run_out plain_out force_out clobber_out init_out init_level init_bay
   for idx in "${!data_barcodes[@]}"; do
     if (( idx >= count )); then
       break
     fi
     fieldtest_require_allowlisted "${data_barcodes[$idx]}"
-    init_out="$(fieldtest_artifact_path "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" "$stamp")"
+    init_base="init-${data_barcodes[$idx]}"
+    dry_run_out="$(fieldtest_artifact_path "$SCRIPT_NAME" "${init_base}-dry-run" "$stamp")"
+    plain_out="$(fieldtest_artifact_path "$SCRIPT_NAME" "${init_base}-plain" "$stamp")"
+    force_out="$(fieldtest_artifact_path "$SCRIPT_NAME" "${init_base}-force" "$stamp")"
+    clobber_out="$(fieldtest_artifact_path "$SCRIPT_NAME" "${init_base}-clobber-data" "$stamp")"
     # Escalation ladder: blank scratch passes plain; used scratch needs
     # --force or --clobber-data. The operator typed DESTROY over these
     # barcodes at allowlist time — that is the clobber consent.
     init_level="plain"
-    if fieldtest_capture_text "$init_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --dry-run; then
-      if grep -qi "already" "$init_out"; then
-        fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" PASS "already initialized by this catalog (rerun-safe skip)" "$init_out"
+    if fieldtest_capture_text "$dry_run_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --dry-run; then
+      if grep -qi "already" "$dry_run_out"; then
+        fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" PASS "already initialized by this catalog (rerun-safe skip)" "$dry_run_out"
         continue
       fi
-      stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$init_out"
+      stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$dry_run_out"
     else
-      stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$init_out"
+      stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$dry_run_out"
+      record_init_non_policy_stop "${data_barcodes[$idx]}" "$dry_run_out" "dry-run-success"
+      exit 1
     fi
-    if ! fieldtest_capture_text "$init_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial"; then
-      stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$init_out"
+    init_out="$plain_out"
+    if ! fieldtest_capture_text "$plain_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial"; then
+      stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$plain_out"
+      require_init_policy_refusal_before_escalation "${data_barcodes[$idx]}" "$plain_out" "require-force"
       init_level="force"
-      if ! fieldtest_capture_text "$init_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --force; then
-        stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$init_out"
+      init_out="$force_out"
+      if ! fieldtest_capture_text "$force_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --force; then
+        stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$force_out"
+        require_init_policy_refusal_before_escalation "${data_barcodes[$idx]}" "$force_out" "refuse-clobber"
         init_level="clobber-data"
-        if ! fieldtest_capture_text "$init_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --clobber-data; then
-          stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$init_out"
-          if grep -q "needs-explicit-rebuild" "$init_out"; then
+        init_out="$clobber_out"
+        if ! fieldtest_capture_text "$clobber_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --clobber-data; then
+          stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$clobber_out"
+          if grep -q "needs-explicit-rebuild" "$clobber_out"; then
             fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" FAIL \
-              "${data_barcodes[$idx]} carries a FOREIGN remanence identity (initialized by another rem instance); no init flag overrides this by design — use a different scratch cartridge, or physically relabel/erase this one" "$init_out"
+              "${data_barcodes[$idx]} carries a FOREIGN remanence identity (initialized by another rem instance); no init flag overrides this by design — use a different scratch cartridge, or physically relabel/erase this one" "$clobber_out"
           else
-            fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" FAIL "tape init failed for ${data_barcodes[$idx]} at every escalation level" "$init_out"
+            fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" FAIL "tape init failed for ${data_barcodes[$idx]} at every escalation level" "$clobber_out"
           fi
           exit 1
         fi
