@@ -83,6 +83,11 @@ pub const ENTRY_TYPE_HARDLINK: u8 = 1;
 pub const ENTRY_TYPE_SYMLINK: u8 = 2;
 pub const ENTRY_TYPE_DIRECTORY: u8 = 3;
 
+pub const PLANNER_ENTRY_REGULAR: u8 = 0;
+pub const PLANNER_ENTRY_HARDLINK: u8 = 1;
+pub const PLANNER_ENTRY_SYMLINK: u8 = 2;
+pub const PLANNER_ENTRY_DIRECTORY: u8 = 3;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RaoManifestError {
     InvalidChunkSize,
@@ -310,6 +315,24 @@ pub struct ManifestEntriesWireCore {
     pub key_external_references: u64,
     pub external_references_empty: bool,
     pub trailing_data: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlannerFoldStateCore {
+    pub accepted_count: u64,
+    pub regular_seen_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlannerEntryCore {
+    pub entry_type: u8,
+    pub path_id: u64,
+    pub file_id: u64,
+    pub link_target_path_id: u64,
+    pub local_entry_valid: bool,
+    pub path_seen_before: bool,
+    pub file_id_seen_before: bool,
+    pub hardlink_target_seen_regular_before: bool,
 }
 
 pub fn checked_add(a: u64, b: u64) -> Result<u64, RaoManifestError> {
@@ -1181,6 +1204,65 @@ pub fn decode_manifest_array_core(
     Ok(manifest)
 }
 
+pub fn validate_planner_entry_core(entry: PlannerEntryCore) -> Result<(), RaoManifestError> {
+    if !entry.local_entry_valid {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    if entry.path_id == 0 || entry.file_id == 0 {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    if entry.entry_type == PLANNER_ENTRY_REGULAR {
+        if entry.link_target_path_id != 0 {
+            return Err(RaoManifestError::InvalidManifestField);
+        }
+        return Ok(());
+    }
+    if entry.entry_type == PLANNER_ENTRY_HARDLINK {
+        if entry.link_target_path_id == 0 {
+            return Err(RaoManifestError::InvalidManifestField);
+        }
+        if !entry.hardlink_target_seen_regular_before {
+            return Err(RaoManifestError::InvalidManifestField);
+        }
+        return Ok(());
+    }
+    if entry.entry_type == PLANNER_ENTRY_SYMLINK {
+        if entry.link_target_path_id == 0 {
+            return Err(RaoManifestError::InvalidManifestField);
+        }
+        return Ok(());
+    }
+    if entry.entry_type == PLANNER_ENTRY_DIRECTORY {
+        if entry.link_target_path_id != 0 {
+            return Err(RaoManifestError::InvalidManifestField);
+        }
+        return Ok(());
+    }
+    Err(RaoManifestError::InvalidManifestField)
+}
+
+pub fn planner_fold_step_core(
+    state: PlannerFoldStateCore,
+    entry: PlannerEntryCore,
+) -> Result<PlannerFoldStateCore, RaoManifestError> {
+    validate_planner_entry_core(entry)?;
+    if entry.path_seen_before {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    if entry.file_id_seen_before {
+        return Err(RaoManifestError::InvalidManifestField);
+    }
+    let accepted_count = checked_add(state.accepted_count, 1)?;
+    let mut regular_seen_count = state.regular_seen_count;
+    if entry.entry_type == PLANNER_ENTRY_REGULAR {
+        regular_seen_count = checked_add(state.regular_seen_count, 1)?;
+    }
+    Ok(PlannerFoldStateCore {
+        accepted_count,
+        regular_seen_count,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1261,6 +1343,26 @@ mod tests {
         }
     }
 
+    fn planner_state() -> PlannerFoldStateCore {
+        PlannerFoldStateCore {
+            accepted_count: 0,
+            regular_seen_count: 0,
+        }
+    }
+
+    fn planner_entry(entry_type: u8, path_id: u64, file_id: u64) -> PlannerEntryCore {
+        PlannerEntryCore {
+            entry_type,
+            path_id,
+            file_id,
+            link_target_path_id: 0,
+            local_entry_valid: true,
+            path_seen_before: false,
+            file_id_seen_before: false,
+            hardlink_target_seen_regular_before: false,
+        }
+    }
+
     #[test]
     fn drift_guard() {
         let this_file = include_str!("lib.rs");
@@ -1309,6 +1411,7 @@ mod tests {
             "duplicate payload path",
             "if !seen_file_ids.insert(spec.file_id.clone())",
             "duplicate file_id",
+            "if !seen_regular_paths.contains(target)",
             "seen_regular_paths.insert(spec.path.clone());",
             "pub(crate) fn chunk_count(size_bytes: u64, chunk_size: usize)",
             "if size_bytes == 0 {\n        return Ok(0);\n    }",
@@ -1368,6 +1471,8 @@ mod tests {
             "pub fn validate_manifest_array_core(",
             "pub fn encode_manifest_array_core(",
             "pub fn decode_manifest_array_core(",
+            "pub fn validate_planner_entry_core(",
+            "pub fn planner_fold_step_core(",
             "pub fn validate_hardlink_entry_core(",
             "pub fn validate_symlink_entry_core(",
             "pub fn validate_directory_entry_core(",
@@ -1557,6 +1662,49 @@ mod tests {
         wire.hardlink.link_target_id = manifest.directory.path_id;
         assert_eq!(
             decode_manifest_array_core(wire, manifest.chunk_size),
+            Err(RaoManifestError::InvalidManifestField)
+        );
+    }
+
+    #[test]
+    fn planner_fold_step_tracks_counts_and_regular_prefix() {
+        let state = planner_state();
+        let regular = planner_entry(PLANNER_ENTRY_REGULAR, 11, 21);
+        let state = planner_fold_step_core(state, regular).expect("regular accepted");
+        assert_eq!(state.accepted_count, 1);
+        assert_eq!(state.regular_seen_count, 1);
+
+        let mut hardlink = planner_entry(PLANNER_ENTRY_HARDLINK, 12, 22);
+        hardlink.link_target_path_id = 11;
+        hardlink.hardlink_target_seen_regular_before = true;
+        let state = planner_fold_step_core(state, hardlink).expect("hardlink accepted");
+        assert_eq!(state.accepted_count, 2);
+        assert_eq!(state.regular_seen_count, 1);
+    }
+
+    #[test]
+    fn planner_fold_step_rejects_duplicate_or_unseen_target() {
+        let state = planner_state();
+
+        let mut duplicate_path = planner_entry(PLANNER_ENTRY_REGULAR, 11, 21);
+        duplicate_path.path_seen_before = true;
+        assert_eq!(
+            planner_fold_step_core(state, duplicate_path),
+            Err(RaoManifestError::InvalidManifestField)
+        );
+
+        let mut duplicate_file = planner_entry(PLANNER_ENTRY_REGULAR, 12, 22);
+        duplicate_file.file_id_seen_before = true;
+        assert_eq!(
+            planner_fold_step_core(state, duplicate_file),
+            Err(RaoManifestError::InvalidManifestField)
+        );
+
+        let mut hardlink = planner_entry(PLANNER_ENTRY_HARDLINK, 13, 23);
+        hardlink.link_target_path_id = 11;
+        hardlink.hardlink_target_seen_regular_before = false;
+        assert_eq!(
+            planner_fold_step_core(state, hardlink),
             Err(RaoManifestError::InvalidManifestField)
         );
     }

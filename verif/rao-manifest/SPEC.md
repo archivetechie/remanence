@@ -19,13 +19,16 @@ small but central writer-schema cores:
 - a fixed-capacity array/fold validator over that five-entry shape, adding
   duplicate path/file-id rejection and hardlink target accumulation across the
   preceding regular entries
+- a planner-fold bridge step for arbitrary entry sequences, abstracting the
+  production `BTreeSet` lookups as scalar membership facts and proving that an
+  arbitrary Lean list of valid generated fold steps reaches a final state
 
 Text values are represented by opaque scalar ids and SHA-256 bytes by four
 opaque `u64` words. Xattr names and values are represented by scalar ids and a
 value length. This preserves identity for the proof without proving `String`,
 `Vec`, exact CBOR bytes, UTF-8 decoding, tar/pax layout, hashing, arbitrary
-xattr maps, global-pax cross-checking, production `BTreeSet` internals, or
-arbitrary-length manifest arrays.
+xattr maps, global-pax cross-checking, production `BTreeSet` internals, or the
+real Rust `Vec` loop.
 
 ## M1 — chunk-count arithmetic (`chunk_count_core_success`)
 
@@ -144,6 +147,46 @@ fixed capacity. It still does not prove arbitrary `Vec` traversal,
 production `BTreeSet` internals, exact CBOR bytes, path syntax validation,
 or full production `validate_manifest(encode_manifest(x))` over `Vec`/`String`
 values.
+
+## M8 — planner fold bridge (`planner_fold_core_success_arbitrary`)
+
+The production planner walks arbitrary payload entries while maintaining:
+
+- a set of seen payload paths
+- a set of seen file ids
+- a set of seen regular-file paths usable as hardlink targets
+
+The proof-facing bridge models one generated planner step:
+
+```text
+planner_fold_step_core(state, entry)
+```
+
+For every valid step, the proof shows that the generated Rust step:
+
+- rejects duplicate path membership
+- rejects duplicate file-id membership
+- rejects a hardlink whose target is not already in the regular-path prefix
+- increments the accepted-entry counter
+- increments the regular-prefix counter only for regular entries
+
+The arbitrary-list theorem:
+
+```text
+planner_fold_core_success_arbitrary
+```
+
+then proves that any arbitrary Lean list of valid generated fold steps reaches
+a final fold state. This is the production-bridge layer between the fixed
+five-entry manifest invariant and the real `plan_rem_tar_object` loop shape.
+
+Boundary: this still abstracts actual `String` values and `BTreeSet` operations
+as scalar membership facts (`path_seen_before`, `file_id_seen_before`,
+`hardlink_target_seen_regular_before`). It does not prove Rust `Vec` iteration,
+`String` ordering/equality, allocator behavior, or the `BTreeSet` implementation.
+The production guardrail test
+`planner_accepted_manifests_validate_against_reader_schema` exercises real
+`plan_rem_tar_object` output against real `validate_manifest`.
 
 ## Trust anchor
 

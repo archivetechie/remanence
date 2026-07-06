@@ -6,7 +6,8 @@ what is proved, what is only tied by drift guards, and what remains normal Rust
 test coverage.
 
 Status reflects the proof-bearing state through the fixed-capacity RAO manifest
-array/fold proof and the RAO archive composition proof.
+array/fold proof, the RAO archive composition proof, and the RAO manifest
+planner-fold bridge proof.
 
 ## Trust model
 
@@ -40,7 +41,7 @@ listed below are expected to have no local placeholders.
 | `verif/aead-framing` | Pure arithmetic from `crates/remanence-aead/src/{stream,range,inspect}.rs` | Chunk-count validation, payload-frame length, stored-size rounding, ciphertext offsets, plaintext range validation, non-empty range planning, keyless inspect geometry, wrapper equivalence for `expected_stored_size`, and selected fail-closed edges. | Does not prove ChaCha20-Poly1305 security, HKDF, SHA-256, CBOR canonicalization, byte IO, allocation behavior, or full parser/open workflow. |
 | `verif/rao-header` | Scalar layout extraction from `crates/remanence-aead/src/header.rs` | RAO AEAD header-core validation, frozen-field emission, parse/serialize round trip for valid header cores, and rejection of bad magic/header length/version/suite/flags/reserved fields. | Models key id, salt, and object id as validity facts. Does not prove the exact 128-byte array, object-id UTF-8 reconstruction, SHA-256 header hashing, allocation, encryption, CBOR, or full `RaoHeader::parse(RaoHeader::serialize(x)) = x` over strings and byte arrays. |
 | `verif/rao-metadata` | Writer-schema extraction from `crates/remanence-aead/src/metadata.rs` | RAO metadata validation arithmetic, deterministic four-key writer-schema emission, decode/encode round trip for valid metadata cores, fail-closed checked arithmetic, and rejection of bad required writer-shape fields. | Models the SHA-256 digest as four opaque scalar words. Does not prove production `Vec<u8>` construction, UTF-8 decoding, exact digest byte copying, recursive CBOR extension skipping, encryption, hashing, or the full byte-level `RaoMetadata::from_cbor_bytes(RaoMetadata::to_cbor_bytes(x)) = x`. |
-| `verif/rao-manifest` | Writer-schema extraction from `crates/remanence-format/src/{layout,manifest}.rs` | RAO manifest chunk-count arithmetic, seven-key root writer shape, one-entry regular-file writer shape, `file_sha256` length, decode/encode round trip for a valid one-regular-file manifest core, bounded five-entry manifest round trip covering a nonempty regular file with one xattr, an empty regular file, hardlink target ordering, symlink, and directory, fixed-capacity array/fold round trip with duplicate path/file-id rejection and hardlink target accumulation across the two regular prefix entries, plus fail-closed rejection of bad root/file/entry writer-shape fields. | Models text values, xattr names, and xattr values as scalar ids and SHA-256 as four opaque scalar words. Does not prove production CBOR bytes, `String`, `Vec`, UTF-8, tar/pax layout, hashing, global-pax cross-checking, production `BTreeSet` internals, arbitrary xattr maps, arbitrary-length file arrays, or full `validate_manifest(encode_manifest(x))` over production values. |
+| `verif/rao-manifest` | Writer-schema extraction from `crates/remanence-format/src/{layout,manifest}.rs` | RAO manifest chunk-count arithmetic, seven-key root writer shape, one-entry regular-file writer shape, `file_sha256` length, decode/encode round trip for a valid one-regular-file manifest core, bounded five-entry manifest round trip covering a nonempty regular file with one xattr, an empty regular file, hardlink target ordering, symlink, and directory, fixed-capacity array/fold round trip with duplicate path/file-id rejection and hardlink target accumulation across the two regular prefix entries, arbitrary-list planner-fold success over generated fold steps with duplicate path/file-id and hardlink-target membership facts, plus fail-closed rejection of bad root/file/entry writer-shape fields. | Models text values, xattr names, and xattr values as scalar ids and SHA-256 as four opaque scalar words. The arbitrary fold abstracts `BTreeSet` membership as scalar facts. Does not prove production CBOR bytes, `String`, `Vec` iteration, UTF-8, tar/pax layout, hashing, global-pax cross-checking, production `BTreeSet` internals, arbitrary xattr maps, or full `validate_manifest(encode_manifest(x))` over production values. |
 | `verif/rao-archive` | Scalar composition extraction tying the RAO header, metadata, and fixed manifest-array proof surfaces together | Archive-level `decode_archive_core(encode_archive_core(x)) = x` for every `ArchiveCore` accepted by `validate_archive_core`; frozen top-level header/metadata/manifest writer-shape checks; field preservation across object id, caller object id, chunk size, metadata plaintext size, digest words, and modeled manifest entry ids; archive-level header/manifest object-id and chunk-size consistency. | This is a scalar/fixed-capacity composition theorem. It does not prove production CBOR bytes, arbitrary `Vec`/`String` traversal, path syntax, tar/pax records, hashing, encryption, allocation, IO, production `BTreeSet`/`BTreeMap` internals, or full production `decode(encode(x))` over byte archives. |
 | `verif/tape-init` | `crates/remanence-api/src/tape_init.rs::decide_tape_init` branch core | Committed-pool conflict dominance, fail-closed BOT decisions, blank BOT rules, clean bootstrap no-op, and ordered Remanence bootstrap hazards. | UUIDs, pool strings, and error payloads are compact proof-facing categories. The proof excludes BOT reading, catalog projection, bootstrap writes, and hardware orchestration. |
 | `verif/pool-selection` | `crates/remanence-api/src/pool_selection.rs` ranking kernel | Fit predicate, completion predicate, leftover arithmetic, and pairwise ranking/tie-break order for `CompleteOrFill` and `FillOldest`. | Proves the stable ranking kernel, not Rust iterator internals, `Vec`, trait-object dispatch, catalog projection, drive occupancy projection, or caller footprint projection. |
@@ -53,7 +54,8 @@ These are intentionally outside the current formal proof surface:
 - Layer-5 daemon session orchestration, cancellation, concurrency, and gRPC.
 - SQLite catalog persistence and rebuild paths.
 - RAO archive encode/decode byte round trips beyond the scalar header,
-  metadata, fixed manifest array/fold, and archive composition theorems.
+  metadata, fixed manifest array/fold, planner-fold bridge, and archive
+  composition theorems.
 - Sidecar/footer binary layout beyond the pure arithmetic already listed.
 - AEAD cryptographic security and keyed authentication.
 - End-to-end write/read/verify scenarios in `~/system`.
@@ -116,13 +118,15 @@ they prove specific kernels under specific extraction and scope boundaries.
 
 ## Recommended next target
 
-The next formal proof should make the RAO production bridge more concrete:
+The next formal proof should make the remaining RAO production bridge more
+concrete:
 
 ```text
-manifest arbitrary-array fold preserves the fixed-capacity invariants
+production String/BTreeSet membership agrees with the planner-fold facts
 ```
 
 The remaining RAO gap is no longer individual entry branches, fixed cross-entry
-state, or archive-level scalar composition. It is the production bridge:
-arbitrary `Vec` traversal, `String`/CBOR byte parsing, path syntax, and
-`BTreeSet`/`BTreeMap` internals.
+state, archive-level scalar composition, or the abstract arbitrary fold. It is
+the production bridge below the membership facts: `String` equality/ordering,
+`BTreeSet`/`BTreeMap` behavior, real `Vec` iteration, path syntax, and CBOR byte
+parsing.

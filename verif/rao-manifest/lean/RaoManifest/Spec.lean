@@ -1,5 +1,5 @@
 /- Specification theorems for RAO manifest writer-schema core extractions
-   (SPEC.md M1-M6).
+   (SPEC.md M1-M8).
 
    This file targets the Aeneas-generated definitions in `RaoManifest.Funs`.
    It proves that a valid one-regular-file manifest validates, encodes to the
@@ -10,10 +10,10 @@
    proof-facing scalar extraction back to production
    `crates/remanence-format/src/{layout,manifest}.rs`.
 
-   Scope: this proof models small writer-schema cores, not
+   Scope: this proof models writer-schema and planner-fold cores, not
    production CBOR bytes, `Vec`/`String`, UTF-8 decoding, tar/pax layout,
-   hashing, arbitrary xattr maps, global-pax cross-checking, duplicate
-   path/file-id detection, or arbitrary-length manifest arrays. -/
+   hashing, arbitrary xattr maps, global-pax cross-checking, real Rust `Vec`
+   iteration, or production `BTreeSet` internals. -/
 import RaoManifest.Funs
 
 open Aeneas Aeneas.Std Result
@@ -133,6 +133,48 @@ def ManifestArrayCoreValid (manifest : ManifestEntriesCore) : Prop :=
       manifest.nonempty_regular.path_id ∨
     manifest.hardlink.link_target_path_id =
       manifest.empty_regular.path_id)
+
+def PlannerEntryCoreValid (entry : PlannerEntryCore) : Prop :=
+  entry.local_entry_valid = true ∧
+  entry.path_id.val ≠ 0 ∧
+  entry.file_id.val ≠ 0 ∧
+  (
+    (entry.entry_type = PLANNER_ENTRY_REGULAR ∧
+      entry.link_target_path_id.val = 0) ∨
+    (entry.entry_type = PLANNER_ENTRY_HARDLINK ∧
+      entry.link_target_path_id.val ≠ 0 ∧
+      entry.hardlink_target_seen_regular_before = true) ∨
+    (entry.entry_type = PLANNER_ENTRY_SYMLINK ∧
+      entry.link_target_path_id.val ≠ 0) ∨
+    (entry.entry_type = PLANNER_ENTRY_DIRECTORY ∧
+      entry.link_target_path_id.val = 0)
+  )
+
+def PlannerStepCoreValid
+    (state : PlannerFoldStateCore) (entry : PlannerEntryCore) : Prop :=
+  PlannerEntryCoreValid entry ∧
+  entry.path_seen_before = false ∧
+  entry.file_id_seen_before = false ∧
+  state.accepted_count.val + 1 < 2 ^ 64 ∧
+  (entry.entry_type = PLANNER_ENTRY_REGULAR →
+    state.regular_seen_count.val + 1 < 2 ^ 64)
+
+def plannerFoldCore :
+    PlannerFoldStateCore → List PlannerEntryCore → Option PlannerFoldStateCore
+| state, [] => some state
+| state, entry :: tail =>
+    match planner_fold_step_core state entry with
+    | ok (.Ok next) => plannerFoldCore next tail
+    | _ => none
+
+def PlannerFoldTraceValid :
+    PlannerFoldStateCore → List PlannerEntryCore → Prop
+| _, [] => True
+| state, entry :: tail =>
+    PlannerStepCoreValid state entry ∧
+    ∀ next,
+      planner_fold_step_core state entry = ok (.Ok next) →
+        PlannerFoldTraceValid next tail
 
 def RichRegularFileWireOfCore (file : RichRegularFileCore)
     (count : Std.U64) : RichRegularFileWireCore :=
@@ -1360,6 +1402,146 @@ theorem hardlink_target_seen_regular_prefix_two_core_rejects_unseen
         ok (.Err RaoManifestError.InvalidManifestField) := by
   unfold hardlink_target_seen_regular_prefix_two_core
   simp [hfirst, hsecond]
+
+theorem validate_planner_entry_core_success
+    (entry : PlannerEntryCore)
+    (hvalid : PlannerEntryCoreValid entry) :
+    validate_planner_entry_core entry = ok (.Ok ()) := by
+  rcases hvalid with ⟨hLocal, hPathNz, hFileNz, hKind⟩
+  have hPathNe := u64_ne_zero_of_val_ne_zero entry.path_id hPathNz
+  have hFileNe := u64_ne_zero_of_val_ne_zero entry.file_id hFileNz
+  unfold validate_planner_entry_core
+  rcases hKind with hRegular | hHardlink | hSymlink | hDirectory
+  · rcases hRegular with ⟨hType, hTargetZeroVal⟩
+    have hTargetEq :=
+      u64_eq_zero_of_val_zero entry.link_target_path_id hTargetZeroVal
+    simp [hLocal, hPathNe, hFileNe, hType, hTargetEq]
+  · rcases hHardlink with ⟨hType, hTargetNz, hSeen⟩
+    have hTargetNe :=
+      u64_ne_zero_of_val_ne_zero entry.link_target_path_id hTargetNz
+    have hNotRegular : entry.entry_type ≠ PLANNER_ENTRY_REGULAR := by
+      intro hRegular
+      have hEq : PLANNER_ENTRY_HARDLINK = PLANNER_ENTRY_REGULAR := by
+        rw [← hType, hRegular]
+      unfold PLANNER_ENTRY_HARDLINK PLANNER_ENTRY_REGULAR at hEq
+      simp at hEq
+    unfold PLANNER_ENTRY_REGULAR PLANNER_ENTRY_HARDLINK PLANNER_ENTRY_SYMLINK
+      PLANNER_ENTRY_DIRECTORY at *
+    simp [hLocal, hPathNe, hFileNe, hType, hTargetNe, hSeen]
+  · rcases hSymlink with ⟨hType, hTargetNz⟩
+    have hTargetNe :=
+      u64_ne_zero_of_val_ne_zero entry.link_target_path_id hTargetNz
+    have hNotRegular : entry.entry_type ≠ PLANNER_ENTRY_REGULAR := by
+      intro hRegular
+      have hEq : PLANNER_ENTRY_SYMLINK = PLANNER_ENTRY_REGULAR := by
+        rw [← hType, hRegular]
+      unfold PLANNER_ENTRY_SYMLINK PLANNER_ENTRY_REGULAR at hEq
+      simp at hEq
+    have hNotHardlink : entry.entry_type ≠ PLANNER_ENTRY_HARDLINK := by
+      intro hHardlink
+      have hEq : PLANNER_ENTRY_SYMLINK = PLANNER_ENTRY_HARDLINK := by
+        rw [← hType, hHardlink]
+      unfold PLANNER_ENTRY_SYMLINK PLANNER_ENTRY_HARDLINK at hEq
+      simp at hEq
+    unfold PLANNER_ENTRY_REGULAR PLANNER_ENTRY_HARDLINK PLANNER_ENTRY_SYMLINK
+      PLANNER_ENTRY_DIRECTORY at *
+    simp [hLocal, hPathNe, hFileNe, hType, hTargetNe]
+  · rcases hDirectory with ⟨hType, hTargetZeroVal⟩
+    have hTargetEq :=
+      u64_eq_zero_of_val_zero entry.link_target_path_id hTargetZeroVal
+    have hNotRegular : entry.entry_type ≠ PLANNER_ENTRY_REGULAR := by
+      intro hRegular
+      have hEq : PLANNER_ENTRY_DIRECTORY = PLANNER_ENTRY_REGULAR := by
+        rw [← hType, hRegular]
+      unfold PLANNER_ENTRY_DIRECTORY PLANNER_ENTRY_REGULAR at hEq
+      simp at hEq
+    have hNotHardlink : entry.entry_type ≠ PLANNER_ENTRY_HARDLINK := by
+      intro hHardlink
+      have hEq : PLANNER_ENTRY_DIRECTORY = PLANNER_ENTRY_HARDLINK := by
+        rw [← hType, hHardlink]
+      unfold PLANNER_ENTRY_DIRECTORY PLANNER_ENTRY_HARDLINK at hEq
+      simp at hEq
+    have hNotSymlink : entry.entry_type ≠ PLANNER_ENTRY_SYMLINK := by
+      intro hSymlink
+      have hEq : PLANNER_ENTRY_DIRECTORY = PLANNER_ENTRY_SYMLINK := by
+        rw [← hType, hSymlink]
+      unfold PLANNER_ENTRY_DIRECTORY PLANNER_ENTRY_SYMLINK at hEq
+      simp at hEq
+    unfold PLANNER_ENTRY_REGULAR PLANNER_ENTRY_HARDLINK PLANNER_ENTRY_SYMLINK
+      PLANNER_ENTRY_DIRECTORY at *
+    simp [hLocal, hPathNe, hFileNe, hType, hTargetEq]
+
+theorem planner_fold_step_core_success
+    (state : PlannerFoldStateCore)
+    (entry : PlannerEntryCore)
+    (hvalid : PlannerStepCoreValid state entry) :
+    ∃ next,
+      planner_fold_step_core state entry = ok (.Ok next) ∧
+      next.accepted_count.val = state.accepted_count.val + 1 ∧
+      (entry.entry_type = PLANNER_ENTRY_REGULAR →
+        next.regular_seen_count.val = state.regular_seen_count.val + 1) ∧
+      (entry.entry_type ≠ PLANNER_ENTRY_REGULAR →
+        next.regular_seen_count = state.regular_seen_count) := by
+  rcases hvalid with
+    ⟨hEntry, hPathSeen, hFileSeen, hAcceptedLt, hRegularLt⟩
+  have hEntryValidate := validate_planner_entry_core_success entry hEntry
+  have hPathSeenFalse : entry.path_seen_before = false := hPathSeen
+  have hFileSeenFalse : entry.file_id_seen_before = false := hFileSeen
+  rcases checked_add_ok state.accepted_count 1#u64 hAcceptedLt with
+    ⟨acceptedCount, hAcceptedAdd, hAcceptedVal⟩
+  by_cases hRegular : entry.entry_type = PLANNER_ENTRY_REGULAR
+  · rcases checked_add_ok state.regular_seen_count 1#u64
+        (hRegularLt hRegular) with
+      ⟨regularCount, hRegularAdd, hRegularVal⟩
+    refine ⟨{
+      accepted_count := acceptedCount,
+      regular_seen_count := regularCount
+    }, ?_, ?_, ?_, ?_⟩
+    · unfold planner_fold_step_core
+      simp [hEntryValidate, core.result.Result.Insts.CoreOpsTry.branch,
+        hPathSeenFalse, hFileSeenFalse, hAcceptedAdd, hRegular, hRegularAdd]
+    · exact hAcceptedVal
+    · intro _
+      exact hRegularVal
+    · intro hNot
+      contradiction
+  · refine ⟨{
+      accepted_count := acceptedCount,
+      regular_seen_count := state.regular_seen_count
+    }, ?_, ?_, ?_, ?_⟩
+    · unfold planner_fold_step_core
+      simp [hEntryValidate, core.result.Result.Insts.CoreOpsTry.branch,
+        hPathSeenFalse, hFileSeenFalse, hAcceptedAdd, hRegular]
+    · exact hAcceptedVal
+    · intro hReg
+      contradiction
+    · intro _
+      rfl
+
+/-- Arbitrary manifest-planner fold theorem.
+
+    The Rust extraction exposes the production loop as a generated fold step.
+    This Lean fold ranges over an arbitrary list of entry summaries and proves
+    that any trace whose every generated step is valid reaches a final state.
+    The set-membership facts (`path_seen_before`, `file_id_seen_before`, and
+    `hardlink_target_seen_regular_before`) are the abstracted `BTreeSet`
+    lookups from `plan_rem_tar_object`. -/
+theorem planner_fold_core_success_arbitrary
+    (state : PlannerFoldStateCore)
+    (entries : List PlannerEntryCore)
+    (hvalid : PlannerFoldTraceValid state entries) :
+    ∃ final, plannerFoldCore state entries = some final := by
+  induction entries generalizing state with
+  | nil =>
+      exact ⟨state, rfl⟩
+  | cons entry tail ih =>
+      rcases hvalid with ⟨hStep, hTail⟩
+      rcases planner_fold_step_core_success state entry hStep with
+        ⟨next, hNext, _, _, _⟩
+      rcases ih next (hTail next hNext) with ⟨final, hFinal⟩
+      refine ⟨final, ?_⟩
+      unfold plannerFoldCore
+      simp [hNext, hFinal]
 
 theorem validate_manifest_array_core_success
     (manifest : ManifestEntriesCore)
