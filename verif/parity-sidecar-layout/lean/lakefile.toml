@@ -1,0 +1,12 @@
+name = "parity_sidecar_layout"
+version = "0.1.0"
+defaultTargets = ["ParitySidecarLayout"]
+
+# Local Aeneas checkout (see ~/toolchains/TOOLCHAIN.md). This verification
+# crate follows the parity-state, parity-mapping, and parity-capacity setup.
+[[require]]
+name = "aeneas"
+path = "/home/user/toolchains/aeneas/backends/lean"
+
+[[lean_lib]]
+name = "ParitySidecarLayout"
