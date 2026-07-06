@@ -5566,6 +5566,25 @@ fn print_tape_quarantine_released(
     ExitCode::SUCCESS
 }
 
+fn media_readiness_admission_error(
+    action: &str,
+    conflicts: &[remanence_state::MediaReadinessOperationRecord],
+) -> String {
+    let Some(first) = conflicts.first() else {
+        return "internal error: media-readiness admission called without conflicts".to_string();
+    };
+    format!(
+        "{action} is blocked by active media-readiness fence {} operation={} library={} drive=0x{:04x} barcode={} state={}; run `rem tape quarantine show {}` or wait-ready/resume before retrying",
+        media_readiness_quarantine_id(first),
+        first.operation_id,
+        first.library_serial,
+        first.drive_element,
+        first.barcode.as_deref().unwrap_or("(unknown)"),
+        first.state,
+        media_readiness_quarantine_id(first)
+    )
+}
+
 /// Resolve a retire target: barcode first, then 32-hex tape uuid.
 ///
 /// LTO voltags are 6-8 characters, so there is no collision space with a
@@ -5775,6 +5794,14 @@ trait TapeInitStateOps {
         let _ = input;
         Ok(())
     }
+
+    fn media_readiness_admission_conflicts(
+        &mut self,
+        library_serial: &str,
+        drive_element: Option<u16>,
+        barcode: Option<&str>,
+        library_robotics: bool,
+    ) -> Result<Vec<remanence_state::MediaReadinessOperationRecord>, String>;
 }
 
 impl TapeInitStateOps for remanence_state::StateHandle {
@@ -5835,6 +5862,23 @@ impl TapeInitStateOps for remanence_state::StateHandle {
             .record_media_readiness_transition(input)
             .map(|_| ())
             .map_err(|error| format!("record media readiness transition: {error}"))
+    }
+
+    fn media_readiness_admission_conflicts(
+        &mut self,
+        library_serial: &str,
+        drive_element: Option<u16>,
+        barcode: Option<&str>,
+        library_robotics: bool,
+    ) -> Result<Vec<remanence_state::MediaReadinessOperationRecord>, String> {
+        self.catalog_index()
+            .media_readiness_admission_conflicts(
+                library_serial,
+                drive_element,
+                barcode,
+                library_robotics,
+            )
+            .map_err(|error| format!("check media readiness admission: {error}"))
     }
 }
 
@@ -5907,6 +5951,23 @@ impl TapeInitStateOps for remanence_state::CatalogIndex {
         _force: bool,
     ) -> Result<(), String> {
         Err("internal error: dry-run attempted to provision catalog state".to_string())
+    }
+
+    fn media_readiness_admission_conflicts(
+        &mut self,
+        library_serial: &str,
+        drive_element: Option<u16>,
+        barcode: Option<&str>,
+        library_robotics: bool,
+    ) -> Result<Vec<remanence_state::MediaReadinessOperationRecord>, String> {
+        remanence_state::CatalogIndex::media_readiness_admission_conflicts(
+            self,
+            library_serial,
+            drive_element,
+            barcode,
+            library_robotics,
+        )
+        .map_err(|error| format!("check media readiness admission: {error}"))
     }
 }
 
@@ -7097,6 +7158,15 @@ fn run_one_tape_init<S: TapeInitStateOps>(
             )
         })?;
     let drive_element = select_write_compatible_drive(library, &candidate, generation)?;
+    let conflicts = state.media_readiness_admission_conflicts(
+        library.serial.as_str(),
+        Some(drive_element),
+        Some(voltag.as_str()),
+        candidate.location == TapeInitLocation::Slot,
+    )?;
+    if !conflicts.is_empty() {
+        return Err(media_readiness_admission_error("tape init", &conflicts));
+    }
     run_tape_init_hardware(
         library,
         state,
@@ -12662,6 +12732,52 @@ mod tests {
             transition.quarantine_id.as_deref(),
             Some(format!("mrq-{operation_id}").as_str())
         );
+    }
+
+    #[test]
+    fn media_readiness_admission_error_names_quarantine_and_operation() {
+        let operation_id = Uuid::from_u128(0xabc);
+        let error = media_readiness_admission_error(
+            "tape init",
+            &[remanence_state::MediaReadinessOperationRecord {
+                operation_id: operation_id.to_string(),
+                run_id: None,
+                library_serial: "LIB-A".to_string(),
+                changer_sg: None,
+                drive_element: 0x0002,
+                drive_sg: None,
+                drive_serial: Some("DRV2".to_string()),
+                barcode: Some("AOX032L9".to_string()),
+                source_slot: Some(0x03ed),
+                media_generation: Some(9),
+                phase: "readiness_poll".to_string(),
+                state: "media_initializing".to_string(),
+                dirty_scope: Some("drive+tape".to_string()),
+                started_at_utc: "2026-07-06T00:00:00Z".to_string(),
+                updated_at_utc: "2026-07-06T00:01:00Z".to_string(),
+                deadline_at_utc: None,
+                last_cdb_opcode: Some(0),
+                last_sense_raw: None,
+                last_sense_key: Some(2),
+                last_asc: Some(4),
+                last_ascq: Some(1),
+                last_host_status: None,
+                last_driver_status: None,
+                target_status: None,
+                transport_class: None,
+                cancel_source: None,
+                signal: None,
+                evidence_path: None,
+                last_error_json: None,
+                quarantine_id: Some("mrq-custom".to_string()),
+            }],
+        );
+
+        assert!(error.contains("tape init is blocked"));
+        assert!(error.contains("mrq-custom"));
+        assert!(error.contains(operation_id.to_string().as_str()));
+        assert!(error.contains("AOX032L9"));
+        assert!(error.contains("media_initializing"));
     }
 
     #[test]
