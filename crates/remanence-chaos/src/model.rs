@@ -587,6 +587,16 @@ impl ModelTransport {
         Ok(TransferOutcome::clean(n as u32))
     }
 
+    fn test_unit_ready(&self) -> Result<(), ScsiError> {
+        let bay = self.drive_bay()?;
+        let world = self.world.lock().expect("virtual world lock");
+        match world.drive_bays.get(&bay) {
+            Some(Some(barcode)) if world.tapes.contains_key(barcode) => Ok(()),
+            Some(_) => Err(check_condition(no_medium_sense(), 0)),
+            None => Err(ScsiError::InvalidInput("unknown drive bay")),
+        }
+    }
+
     fn read_6(&mut self, buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
         let mut world = self.world.lock().expect("virtual world lock");
         let position = usize::try_from(self.position)
@@ -924,6 +934,7 @@ impl SgTransport for ModelTransport {
 
     fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
         match cdb.first().copied() {
+            Some(0x00) => self.test_unit_ready(),
             Some(0x01) => {
                 self.drive_bay()?;
                 self.rewind();
@@ -1230,6 +1241,10 @@ fn blank_check_eod_sense() -> Vec<u8> {
     fixed_sense(0x08, 0x00, 0x05, Some(0), 0x00)
 }
 
+fn no_medium_sense() -> Vec<u8> {
+    fixed_sense(0x02, 0x3a, 0x00, None, 0x00)
+}
+
 fn eom_sense(key: u8, residual: i64) -> Vec<u8> {
     fixed_sense(key, 0x00, 0x00, Some(residual), 0x40)
 }
@@ -1277,6 +1292,36 @@ mod tests {
             world.lock().unwrap().loaded_barcode(0x0100),
             Some("TAPE001")
         );
+    }
+
+    #[test]
+    fn drive_test_unit_ready_reports_ready_and_no_medium() {
+        let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+            "LIB-MODEL",
+            0x0100,
+            "DRV-MODEL",
+            0x0400,
+            1,
+        )));
+        let mut drive = ModelTransport::new(Arc::clone(&world), DeviceRole::Drive { bay: 0x0100 });
+
+        let err = drive.execute_none(&[0, 0, 0, 0, 0, 0]).unwrap_err();
+        let ScsiError::CheckCondition { sense, .. } = err else {
+            panic!("empty bay should report no-medium check condition");
+        };
+        assert_eq!(sense[2] & 0x0f, 0x02);
+        assert_eq!(sense[12], 0x3a);
+        assert_eq!(sense[13], 0x00);
+
+        world.lock().unwrap().put_tape_in_drive(
+            0x0100,
+            "TAPE001",
+            Some(0x0400),
+            VirtualTape::default(),
+        );
+        drive
+            .execute_none(&[0, 0, 0, 0, 0, 0])
+            .expect("loaded tape is ready in the honest model");
     }
 
     #[test]
