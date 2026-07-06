@@ -94,6 +94,46 @@ def ManifestEntriesCoreValid (manifest : ManifestEntriesCore) : Prop :=
   manifest.hardlink.link_target_path_id =
     manifest.nonempty_regular.path_id
 
+def Distinct5Core (first second third fourth fifth : Std.U64) : Prop :=
+  first ≠ second ∧
+  first ≠ third ∧
+  first ≠ fourth ∧
+  first ≠ fifth ∧
+  second ≠ third ∧
+  second ≠ fourth ∧
+  second ≠ fifth ∧
+  third ≠ fourth ∧
+  third ≠ fifth ∧
+  fourth ≠ fifth
+
+def ManifestArrayCoreValid (manifest : ManifestEntriesCore) : Prop :=
+  manifest.chunk_size.val ≠ 0 ∧
+  manifest.chunk_size.val % ChunkGranularity = 0 ∧
+  manifest.object_id.val ≠ 0 ∧
+  manifest.nonempty_regular.size_bytes.val ≠ 0 ∧
+  manifest.empty_regular.size_bytes.val = 0 ∧
+  RichRegularFileCoreValid manifest.nonempty_regular manifest.chunk_size ∧
+  RichRegularFileCoreValid manifest.empty_regular manifest.chunk_size ∧
+  HardlinkEntryCoreValid manifest.hardlink ∧
+  SymlinkEntryCoreValid manifest.symlink ∧
+  DirectoryEntryCoreValid manifest.directory ∧
+  Distinct5Core
+    manifest.nonempty_regular.path_id
+    manifest.empty_regular.path_id
+    manifest.hardlink.path_id
+    manifest.symlink.path_id
+    manifest.directory.path_id ∧
+  Distinct5Core
+    manifest.nonempty_regular.file_id
+    manifest.empty_regular.file_id
+    manifest.hardlink.file_id
+    manifest.symlink.file_id
+    manifest.directory.file_id ∧
+  (manifest.hardlink.link_target_path_id =
+      manifest.nonempty_regular.path_id ∨
+    manifest.hardlink.link_target_path_id =
+      manifest.empty_regular.path_id)
+
 def RichRegularFileWireOfCore (file : RichRegularFileCore)
     (count : Std.U64) : RichRegularFileWireCore :=
   {
@@ -1265,6 +1305,183 @@ theorem decode_encode_manifest_entries_core_round_trip
       hNonemptyEncode, hEmptyEncode, hHardlinkEncode, hSymlinkEncode,
       hDirectoryEncode]
   · unfold decode_manifest_entries_core
+    simp [hNonemptyDecode, hEmptyDecode, hHardlinkDecode, hSymlinkDecode,
+      hDirectoryDecode, hvalidate, core.result.Result.Insts.CoreOpsTry.branch]
+
+theorem distinct5_core_success
+    (first second third fourth fifth : Std.U64)
+    (hvalid : Distinct5Core first second third fourth fifth) :
+    distinct5_core first second third fourth fifth = ok (.Ok ()) := by
+  rcases hvalid with
+    ⟨h12, h13, h14, h15, h23, h24, h25, h34, h35, h45⟩
+  unfold distinct5_core
+  simp [h12, h13, h14, h15, h23, h24, h25, h34, h35, h45]
+
+theorem distinct5_core_rejects_first_pair
+    (first second third fourth fifth : Std.U64)
+    (hdup : first = second) :
+    distinct5_core first second third fourth fifth =
+      ok (.Err RaoManifestError.InvalidManifestField) := by
+  unfold distinct5_core
+  simp [hdup]
+
+theorem distinct5_core_rejects_fourth_fifth
+    (first second third fourth fifth : Std.U64)
+    (hprefix :
+      first ≠ second ∧ first ≠ third ∧ first ≠ fourth ∧ first ≠ fifth ∧
+      second ≠ third ∧ second ≠ fourth ∧ second ≠ fifth ∧
+      third ≠ fourth ∧ third ≠ fifth)
+    (hdup : fourth = fifth) :
+    distinct5_core first second third fourth fifth =
+      ok (.Err RaoManifestError.InvalidManifestField) := by
+  rcases hprefix with
+    ⟨h12, h13, h14, h15, h23, h24, h25, h34, h35⟩
+  unfold distinct5_core
+  simp [h12, h13, h15, h23, h25, h35, hdup]
+
+theorem hardlink_target_seen_regular_prefix_two_core_success
+    (target firstRegular secondRegular : Std.U64)
+    (hseen : target = firstRegular ∨ target = secondRegular) :
+    hardlink_target_seen_regular_prefix_two_core target firstRegular
+      secondRegular = ok (.Ok ()) := by
+  unfold hardlink_target_seen_regular_prefix_two_core
+  rcases hseen with hfirst | hsecond
+  · simp [hfirst]
+  · by_cases hfirst : target = firstRegular
+    · simp [hfirst]
+    · simp [hsecond]
+
+theorem hardlink_target_seen_regular_prefix_two_core_rejects_unseen
+    (target firstRegular secondRegular : Std.U64)
+    (hfirst : target ≠ firstRegular)
+    (hsecond : target ≠ secondRegular) :
+    hardlink_target_seen_regular_prefix_two_core target firstRegular
+      secondRegular =
+        ok (.Err RaoManifestError.InvalidManifestField) := by
+  unfold hardlink_target_seen_regular_prefix_two_core
+  simp [hfirst, hsecond]
+
+theorem validate_manifest_array_core_success
+    (manifest : ManifestEntriesCore)
+    (hvalid : ManifestArrayCoreValid manifest) :
+    validate_manifest_array_core manifest = ok (.Ok ()) := by
+  rcases hvalid with
+    ⟨hChunkNz, hChunkGran, hObjectNz, hNonempty, hEmpty, hNonemptyValid,
+      hEmptyValid, hHardlinkValid, hSymlinkValid, hDirectoryValid,
+      hDistinctPaths, hDistinctFiles, hTargetSeen⟩
+  have hChunk :=
+    validate_chunk_size_success manifest.chunk_size hChunkNz hChunkGran
+  have hObjectNe := u64_ne_zero_of_val_ne_zero manifest.object_id hObjectNz
+  have hNonemptyNe :=
+    u64_ne_zero_of_val_ne_zero manifest.nonempty_regular.size_bytes hNonempty
+  have hEmptyEq :=
+    u64_eq_zero_of_val_zero manifest.empty_regular.size_bytes hEmpty
+  have hNonemptyValidate :=
+    validate_rich_regular_file_core_success manifest.nonempty_regular
+      manifest.chunk_size hNonemptyValid
+  have hEmptyValidate :=
+    validate_rich_regular_file_core_success manifest.empty_regular
+      manifest.chunk_size hEmptyValid
+  have hHardlinkValidate :=
+    validate_hardlink_entry_core_success manifest.hardlink hHardlinkValid
+  have hSymlinkValidate :=
+    validate_symlink_entry_core_success manifest.symlink hSymlinkValid
+  have hDirectoryValidate :=
+    validate_directory_entry_core_success manifest.directory hDirectoryValid
+  have hPathDistinct :=
+    distinct5_core_success
+      manifest.nonempty_regular.path_id
+      manifest.empty_regular.path_id
+      manifest.hardlink.path_id
+      manifest.symlink.path_id
+      manifest.directory.path_id
+      hDistinctPaths
+  have hFileDistinct :=
+    distinct5_core_success
+      manifest.nonempty_regular.file_id
+      manifest.empty_regular.file_id
+      manifest.hardlink.file_id
+      manifest.symlink.file_id
+      manifest.directory.file_id
+      hDistinctFiles
+  have hTarget :=
+    hardlink_target_seen_regular_prefix_two_core_success
+      manifest.hardlink.link_target_path_id
+      manifest.nonempty_regular.path_id
+      manifest.empty_regular.path_id
+      hTargetSeen
+  unfold validate_manifest_array_core
+  simp [hChunk, core.result.Result.Insts.CoreOpsTry.branch, hObjectNe,
+    hNonemptyNe, hEmptyEq, hNonemptyValidate, hEmptyValidate,
+    hHardlinkValidate, hSymlinkValidate, hDirectoryValidate, hPathDistinct,
+    hFileDistinct, hTarget]
+
+/-- Fixed-capacity array/fold theorem.
+
+    This extends the bounded entry theorem with path/file-id distinctness and
+    a two-regular-prefix model of production hardlink target accumulation.
+    It still does not prove arbitrary `Vec` traversal or production `BTreeSet`
+    internals. -/
+theorem decode_encode_manifest_array_core_round_trip
+    (manifest : ManifestEntriesCore)
+    (hvalid : ManifestArrayCoreValid manifest) :
+    ∃ wire,
+      encode_manifest_array_core manifest = ok (.Ok wire) ∧
+      decode_manifest_array_core wire manifest.chunk_size =
+        ok (.Ok manifest) := by
+  rcases hvalid with
+    ⟨hChunkNz, hChunkGran, hObjectNz, hNonempty, hEmpty, hNonemptyValid,
+      hEmptyValid, hHardlinkValid, hSymlinkValid, hDirectoryValid,
+      hDistinctPaths, hDistinctFiles, hTargetSeen⟩
+  have hvalid' : ManifestArrayCoreValid manifest :=
+    ⟨hChunkNz, hChunkGran, hObjectNz, hNonempty, hEmpty, hNonemptyValid,
+      hEmptyValid, hHardlinkValid, hSymlinkValid, hDirectoryValid,
+      hDistinctPaths, hDistinctFiles, hTargetSeen⟩
+  have hvalidate :=
+    validate_manifest_array_core_success manifest hvalid'
+  rcases decode_encode_rich_regular_file_core_round_trip
+      manifest.nonempty_regular manifest.chunk_size hNonemptyValid with
+    ⟨nonemptyWire, hNonemptyEncode, hNonemptyDecode⟩
+  rcases decode_encode_rich_regular_file_core_round_trip
+      manifest.empty_regular manifest.chunk_size hEmptyValid with
+    ⟨emptyWire, hEmptyEncode, hEmptyDecode⟩
+  rcases decode_encode_hardlink_entry_core_round_trip
+      manifest.hardlink hHardlinkValid with
+    ⟨hardlinkWire, hHardlinkEncode, hHardlinkDecode⟩
+  rcases decode_encode_symlink_entry_core_round_trip
+      manifest.symlink hSymlinkValid with
+    ⟨symlinkWire, hSymlinkEncode, hSymlinkDecode⟩
+  rcases decode_encode_directory_entry_core_round_trip
+      manifest.directory hDirectoryValid with
+    ⟨directoryWire, hDirectoryEncode, hDirectoryDecode⟩
+  refine ⟨{
+    root_map_len := ROOT_MAP_LEN,
+    key_object_id := ROOT_KEY_OBJECT_ID,
+    object_id := manifest.object_id,
+    key_chunk_size := ROOT_KEY_CHUNK_SIZE,
+    chunk_size := manifest.chunk_size,
+    key_file_entries := ROOT_KEY_FILE_ENTRIES,
+    file_entries_len := FILE_ENTRIES_LEN_BOUNDED,
+    nonempty_regular := nonemptyWire,
+    empty_regular := emptyWire,
+    hardlink := hardlinkWire,
+    symlink := symlinkWire,
+    directory := directoryWire,
+    key_schema_version := ROOT_KEY_SCHEMA_VERSION,
+    schema_version := SCHEMA_VERSION,
+    key_object_metadata := ROOT_KEY_OBJECT_METADATA,
+    object_metadata_empty := true,
+    key_caller_object_id := ROOT_KEY_CALLER_OBJECT_ID,
+    caller_object_id := manifest.caller_object_id,
+    key_external_references := ROOT_KEY_EXTERNAL_REFERENCES,
+    external_references_empty := true,
+    trailing_data := false
+  }, ?_, ?_⟩
+  · unfold encode_manifest_array_core
+    simp [hvalidate, core.result.Result.Insts.CoreOpsTry.branch,
+      hNonemptyEncode, hEmptyEncode, hHardlinkEncode, hSymlinkEncode,
+      hDirectoryEncode]
+  · unfold decode_manifest_array_core
     simp [hNonemptyDecode, hEmptyDecode, hHardlinkDecode, hSymlinkDecode,
       hDirectoryDecode, hvalidate, core.result.Result.Insts.CoreOpsTry.branch]
 
