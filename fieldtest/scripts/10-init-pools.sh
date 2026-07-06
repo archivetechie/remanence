@@ -48,17 +48,132 @@ init_transport_unknown() {
   grep -qiE 'transport error|completion unknown|DID_TIME_OUT|host_status=0x|task aborted|resetting scsi|SG_IO transport error' "$path"
 }
 
+init_readiness_code() {
+  local path="$1"
+  python3 - "$path" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text())
+text = f"{payload.get('stdout', '')}\n{payload.get('stderr', '')}"
+marker = re.search(r"\bmedia_readiness_exit_code=(\d+)\b", text)
+if marker:
+    print(marker.group(1))
+    raise SystemExit(0)
+exit_code = payload.get("exit_code")
+if exit_code in (10, 20, 30, 40, 50, 130):
+    print(exit_code)
+PY
+}
+
+init_readiness_extra_json() {
+  local path="$1" code="${2:-}"
+  python3 - "$path" "$code" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text())
+code = sys.argv[2].strip()
+text = f"{payload.get('stdout', '')}\n{payload.get('stderr', '')}"
+state = None
+match = re.search(r"\bmedia_readiness_state=([A-Za-z0-9_]+)\b", text)
+if match:
+    state = match.group(1)
+else:
+    try:
+        stdout_json = json.loads(payload.get("stdout") or "{}")
+        if isinstance(stdout_json, dict):
+            state = stdout_json.get("state")
+    except json.JSONDecodeError:
+        pass
+extra = {}
+if state:
+    extra["media_readiness_state"] = state
+if code:
+    extra["rem_exit_code"] = int(code)
+print(json.dumps(extra, separators=(",", ":")))
+PY
+}
+
 record_init_readiness_stop() {
-  local barcode="$1" path="$2"
-  fieldtest_evidence_record "$SCRIPT_NAME" "init-${barcode}" INFO "media not ready/calibrating for ${barcode}; leave the tape in the drive, run 09-media-ready.sh, and do not rerun init until readiness is ready" "$path"
+  local barcode="$1" path="$2" code="${3:-10}"
+  fieldtest_evidence_record "$SCRIPT_NAME" "init-${barcode}" INFO "media not ready/calibrating for ${barcode}; leave the tape in the drive, run 09-media-ready.sh, and do not rerun init until readiness is ready" "$path" "$(init_readiness_extra_json "$path" "$code")"
 }
 
 record_init_transport_stop() {
-  local barcode="$1" path="$2"
-  fieldtest_evidence_record "$SCRIPT_NAME" "init-${barcode}" FAIL "transport/completion-unknown while initializing ${barcode}; stop destructive escalation and collect RCA evidence" "$path"
+  local barcode="$1" path="$2" code="${3:-40}"
+  fieldtest_evidence_record "$SCRIPT_NAME" "init-${barcode}" FAIL "transport/completion-unknown while initializing ${barcode}; stop destructive escalation and collect RCA evidence" "$path" "$(init_readiness_extra_json "$path" "$code")"
+}
+
+record_init_terminal_stop() {
+  local barcode="$1" path="$2" code="$3"
+  fieldtest_evidence_record "$SCRIPT_NAME" "init-${barcode}" FAIL "media readiness stopped init for ${barcode} with rem exit code ${code}; do not escalate to force or clobber until RCA/recovery is complete" "$path" "$(init_readiness_extra_json "$path" "$code")"
+}
+
+stop_init_escalation_if_readiness_blocked() {
+  local barcode="$1" path="$2" code
+  code="$(init_readiness_code "$path" || true)"
+  case "$code" in
+    10)
+      record_init_readiness_stop "$barcode" "$path" "$code"
+      exit 10
+      ;;
+    20|30|50|130)
+      record_init_terminal_stop "$barcode" "$path" "$code"
+      exit "$code"
+      ;;
+    40)
+      record_init_transport_stop "$barcode" "$path" "$code"
+      exit 40
+      ;;
+  esac
+  if init_media_not_ready "$path"; then
+    record_init_readiness_stop "$barcode" "$path" 10
+    exit 10
+  fi
+  if init_transport_unknown "$path"; then
+    record_init_transport_stop "$barcode" "$path" 40
+    exit 40
+  fi
+}
+
+init_pools_selftest() {
+  local tmpdir detail code extra records
+  tmpdir="$(mktemp -d)"
+  mkdir -p "$tmpdir/home/evidence" "$tmpdir/home/state" "$tmpdir/home/log" "$tmpdir/home/spool"
+  detail="$tmpdir/home/evidence/init-AOX030L9.json"
+  cat >"$detail" <<'JSON'
+{
+  "command": "rem tape init AOX030L9 --dry-run",
+  "exit_code": 10,
+  "stdout": "",
+  "stderr": "media not ready for tape init on AOX030L9 in drive 0x0001 media_readiness_state=media_initializing media_readiness_exit_code=10: media initializing/calibrating"
+}
+JSON
+  REMFIELD_HOME="$tmpdir/home"
+  export REMFIELD_HOME
+  code="$(init_readiness_code "$detail")"
+  [[ "$code" == 10 ]]
+  extra="$(init_readiness_extra_json "$detail" "$code")"
+  [[ "$extra" == *'"media_readiness_state":"media_initializing"'* ]]
+  [[ "$extra" == *'"rem_exit_code":10'* ]]
+  fieldtest_evidence_record "$SCRIPT_NAME" init-AOX030L9 INFO "media not ready/calibrating for AOX030L9" "$detail" "$extra"
+  records="$(fieldtest_records_path)"
+  grep -q '"status":"INFO"' "$records"
+  grep -q '"media_readiness_state":"media_initializing"' "$records"
+  grep -q '"rem_exit_code":10' "$records"
+  rm -rf "$tmpdir"
 }
 
 main() {
+  if [[ "${1:-}" == --selftest ]]; then
+    init_pools_selftest
+    exit 0
+  fi
   if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     usage
     exit 0
@@ -124,45 +239,18 @@ main() {
         fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" PASS "already initialized by this catalog (rerun-safe skip)" "$init_out"
         continue
       fi
+      stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$init_out"
     else
-      if init_media_not_ready "$init_out"; then
-        record_init_readiness_stop "${data_barcodes[$idx]}" "$init_out"
-        exit 10
-      fi
-      if init_transport_unknown "$init_out"; then
-        record_init_transport_stop "${data_barcodes[$idx]}" "$init_out"
-        exit 1
-      fi
+      stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$init_out"
     fi
     if ! fieldtest_capture_text "$init_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial"; then
-      if init_media_not_ready "$init_out"; then
-        record_init_readiness_stop "${data_barcodes[$idx]}" "$init_out"
-        exit 10
-      fi
-      if init_transport_unknown "$init_out"; then
-        record_init_transport_stop "${data_barcodes[$idx]}" "$init_out"
-        exit 1
-      fi
+      stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$init_out"
       init_level="force"
       if ! fieldtest_capture_text "$init_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --force; then
-        if init_media_not_ready "$init_out"; then
-          record_init_readiness_stop "${data_barcodes[$idx]}" "$init_out"
-          exit 10
-        fi
-        if init_transport_unknown "$init_out"; then
-          record_init_transport_stop "${data_barcodes[$idx]}" "$init_out"
-          exit 1
-        fi
+        stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$init_out"
         init_level="clobber-data"
         if ! fieldtest_capture_text "$init_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --clobber-data; then
-          if init_media_not_ready "$init_out"; then
-            record_init_readiness_stop "${data_barcodes[$idx]}" "$init_out"
-            exit 10
-          fi
-          if init_transport_unknown "$init_out"; then
-            record_init_transport_stop "${data_barcodes[$idx]}" "$init_out"
-            exit 1
-          fi
+          stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$init_out"
           if grep -q "needs-explicit-rebuild" "$init_out"; then
             fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" FAIL \
               "${data_barcodes[$idx]} carries a FOREIGN remanence identity (initialized by another rem instance); no init flag overrides this by design — use a different scratch cartridge, or physically relabel/erase this one" "$init_out"

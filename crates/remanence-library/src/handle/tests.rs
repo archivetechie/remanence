@@ -3716,8 +3716,22 @@ fn drive_handle_probe_media_readiness_classifies_lto9_initializing() {
         "readiness probe did not issue TEST UNIT READY"
     );
     assert!(
-        !log.iter()
-            .any(|cdb| matches!(cdb[0], 0x05 | 0x1A | 0x01 | 0x34 | 0x4D)),
+        !log.iter().any(|cdb| matches!(
+            cdb[0],
+            0x01 | 0x05
+                | 0x08
+                | 0x0A
+                | 0x10
+                | 0x11
+                | 0x15
+                | 0x1A
+                | 0x1B
+                | 0x2B
+                | 0x34
+                | 0x4D
+                | 0x91
+                | 0x92
+        )),
         "readiness probe issued a forbidden media/config command: {log:02x?}"
     );
 }

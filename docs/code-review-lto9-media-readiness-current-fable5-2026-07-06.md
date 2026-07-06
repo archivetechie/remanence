@@ -67,3 +67,25 @@ urgent physical run before those fixes, it recommended disabling the
 suspect rather than conclusive, and accepting that an already-loaded
 `02/04/02` cartridge may time out until the in-drive conditional-load branch is
 fixed.
+
+## Follow-up Fold
+
+The immediate safety findings from this review were folded in the follow-up
+implementation slice:
+
+- `rem tape init` readiness failures now carry stable
+  `media_readiness_state=<state>` and `media_readiness_exit_code=<code>`
+  metadata and propagate the readiness exit code, including from `--dry-run`.
+- `fieldtest/scripts/10-init-pools.sh` now stops destructive escalation from
+  rc/metadata before falling back to legacy grep evidence, and records
+  `media_readiness_state` plus `rem_exit_code` into `records.jsonl`.
+- already-loaded `tape init` candidates now run the same post-TUR conditional
+  immediate LOAD logic as slot-loaded candidates.
+- the TUR readiness regression checks the full forbidden media/config CDB set
+  from the design.
+- `remanence-chaos` `ModelTransport` now supports honest TUR for loaded and
+  empty drives; RDY-01 fixed-sense injection now layers on a native model CDB.
+
+Remaining gates after that fold: full scenario or `covers` evidence for
+destructive-escalation refusal, the two-logical-library fixture, and broader
+wait/repeated-UA scenario coverage.
