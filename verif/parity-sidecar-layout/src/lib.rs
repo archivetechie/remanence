@@ -269,7 +269,9 @@ mod tests {
             "block0[0x88..0xA8].copy_from_slice(&header.canonical_metadata_hash);",
             "block0[0xA8..0xB0].copy_from_slice(&0u64.to_le_bytes());",
             "header.header_crc64 = crc64_xz(&block0[..SIDECAR_HEADER_CRC_OFFSET]);",
+            "block0[SIDECAR_HEADER_CRC_OFFSET..SIDECAR_HEADER_CRC_OFFSET + 8]\n        .copy_from_slice(&header.header_crc64.to_le_bytes());",
             "let crc_offset = block0.len() - 8;\n    header.block0_crc64 = crc64_xz(&block0[..crc_offset]);",
+            "block0[crc_offset..].copy_from_slice(&header.block0_crc64.to_le_bytes());",
             "if block0.len() < SIDECAR_HEADER_LEN + 8 {",
             "magic.copy_from_slice(&block0[0x00..0x08]);",
             "tape_uuid.copy_from_slice(&block0[0x08..0x18]);",
@@ -297,7 +299,11 @@ mod tests {
             "canonical_metadata_hash.copy_from_slice(&block0[0x88..0xA8]);",
             "let header_reserved = read_u64_le(block0, 0xA8);",
             "let header_crc64 = read_u64_le(block0, SIDECAR_HEADER_CRC_OFFSET);",
+            "let block_size_usize = usize::try_from(block_size)\n        .map_err(|_| sidecar_parse(format!(\"sidecar block_size {block_size} overflows usize\")))?;",
+            "if block_size_usize != block0.len() {",
+            "if block_size_usize < SIDECAR_HEADER_LEN + 8 {",
             "let computed_header_crc64 = crc64_xz(&block0[..SIDECAR_HEADER_CRC_OFFSET]);",
+            "let crc_offset = block_size_usize - 8;",
             "let block0_crc64 = read_u64_le(block0, crc_offset);",
             "let computed_block0_crc64 = crc64_xz(&block0[..crc_offset]);",
             "let inline_end = SIDECAR_HEADER_LEN + inline_index_entry_bytes as usize;",
@@ -316,6 +322,7 @@ mod tests {
             "block[0x50..0x58].copy_from_slice(&header.tail_header_start_block.to_le_bytes());",
             "block[0x58..0x78].copy_from_slice(&header.canonical_metadata_hash);",
             "let crc = crc64_xz(&block[..SIDECAR_FOOTER_CRC_OFFSET]);",
+            "block[SIDECAR_FOOTER_CRC_OFFSET..SIDECAR_FOOTER_CRC_OFFSET + 8]\n        .copy_from_slice(&crc.to_le_bytes());",
             "if footer_block.len() < SIDECAR_FOOTER_LEN {",
             "magic.copy_from_slice(&footer_block[0x00..0x08]);",
             "let sidecar_footer_version = read_u16_le(footer_block, 0x08);",
@@ -333,6 +340,10 @@ mod tests {
             "canonical_metadata_hash.copy_from_slice(&footer_block[0x58..0x78]);",
             "let footer_crc64 = read_u64_le(footer_block, SIDECAR_FOOTER_CRC_OFFSET);",
             "let computed = crc64_xz(&footer_block[..SIDECAR_FOOTER_CRC_OFFSET]);",
+            "fn write_trailing_crc(block: &mut [u8]) {",
+            "let crc_offset = block.len() - 8;\n    let crc = crc64_xz(&block[..crc_offset]);\n    block[crc_offset..].copy_from_slice(&crc.to_le_bytes());",
+            "fn validate_spill_block_crc(block: &[u8], block_index: usize) -> Result<(), ParityError> {",
+            "let crc_offset = block.len() - 8;\n    let stored = read_u64_le(block, crc_offset);\n    let computed = crc64_xz(&block[..crc_offset]);",
             "let expected_tail = u64::from(shard_index_block_count)\n        .checked_add(u64::from(parity_block_count))",
             "let expected_footer = expected_tail\n        .checked_add(u64::from(shard_index_block_count))",
             "let expected_total = expected_footer\n        .checked_add(1)",
@@ -360,6 +371,61 @@ mod tests {
                 this_file.contains(snippet),
                 "extraction snippet {i} missing from verif sidecar-layout model"
             );
+        }
+
+        let ordered_snippet_groups: &[(&str, &[&str])] = &[
+            (
+                "header parser block-size checks precede CRC ranges",
+                &[
+                    "let block_size_usize = usize::try_from(block_size)\n        .map_err(|_| sidecar_parse(format!(\"sidecar block_size {block_size} overflows usize\")))?;",
+                    "if block_size_usize != block0.len() {",
+                    "if block_size_usize < SIDECAR_HEADER_LEN + 8 {",
+                    "let computed_header_crc64 = crc64_xz(&block0[..SIDECAR_HEADER_CRC_OFFSET]);",
+                    "let crc_offset = block_size_usize - 8;",
+                    "let block0_crc64 = read_u64_le(block0, crc_offset);",
+                    "let computed_block0_crc64 = crc64_xz(&block0[..crc_offset]);",
+                ],
+            ),
+            (
+                "header writer CRC input ranges precede storage ranges",
+                &[
+                    "header.header_crc64 = crc64_xz(&block0[..SIDECAR_HEADER_CRC_OFFSET]);",
+                    "block0[SIDECAR_HEADER_CRC_OFFSET..SIDECAR_HEADER_CRC_OFFSET + 8]\n        .copy_from_slice(&header.header_crc64.to_le_bytes());",
+                    "let crc_offset = block0.len() - 8;",
+                    "header.block0_crc64 = crc64_xz(&block0[..crc_offset]);",
+                    "block0[crc_offset..].copy_from_slice(&header.block0_crc64.to_le_bytes());",
+                ],
+            ),
+            (
+                "footer writer CRC input precedes storage range",
+                &[
+                    "let crc = crc64_xz(&block[..SIDECAR_FOOTER_CRC_OFFSET]);",
+                    "block[SIDECAR_FOOTER_CRC_OFFSET..SIDECAR_FOOTER_CRC_OFFSET + 8]\n        .copy_from_slice(&crc.to_le_bytes());",
+                ],
+            ),
+            (
+                "spill CRC writer stores the trailing range it computes",
+                &[
+                    "fn write_trailing_crc(block: &mut [u8]) {",
+                    "let crc_offset = block.len() - 8;\n    let crc = crc64_xz(&block[..crc_offset]);\n    block[crc_offset..].copy_from_slice(&crc.to_le_bytes());",
+                ],
+            ),
+            (
+                "spill CRC reader checks the trailing range it reads",
+                &[
+                    "fn validate_spill_block_crc(block: &[u8], block_index: usize) -> Result<(), ParityError> {",
+                    "let crc_offset = block.len() - 8;\n    let stored = read_u64_le(block, crc_offset);\n    let computed = crc64_xz(&block[..crc_offset]);",
+                ],
+            ),
+        ];
+        for (label, group) in ordered_snippet_groups {
+            let mut cursor = 0;
+            for snippet in *group {
+                let Some(offset) = original[cursor..].find(snippet) else {
+                    panic!("{label}: snippet not found after byte offset {cursor}: {snippet:?}");
+                };
+                cursor += offset + snippet.len();
+            }
         }
     }
 
