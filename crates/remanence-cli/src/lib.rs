@@ -67,8 +67,8 @@ use remanence_library::DriveHandlePhysicalSource;
 use remanence_library::{
     tape_alert_flag_name, BlockSize, DirtyCause, DiscoveryError, DiscoveryReport, DiscoveryWarning,
     DriveBay, DriveHandleSink, DriveHandleSource, FileBlockSink, FileBlockSource, IePort,
-    IoErrorKind, Library, OpenError, Slot, StaticAllowlist, TapeAlerts, TapeConfig, VecBlockSource,
-    WormMediaState,
+    IoErrorKind, Library, MediaFamily, MediaReadiness, OpenError, Slot, StaticAllowlist,
+    TapeAlerts, TapeConfig, VecBlockSource, WormMediaState,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -5840,12 +5840,29 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         .map_err(|error| format!("opening library: {error}"))?;
     if candidate.location == TapeInitLocation::Slot {
         handle
-            .load(candidate.element_address, drive_element, policy)
-            .map_err(|error| format!("load slot 0x{:04x}: {error}", candidate.element_address))?;
+            .move_medium(candidate.element_address, drive_element, policy)
+            .map_err(|error| {
+                format!(
+                    "move slot 0x{:04x} to drive 0x{drive_element:04x}: {error}",
+                    candidate.element_address
+                )
+            })?;
     }
     let mut drive = handle
         .open_drive(drive_element, policy)
         .map_err(|error| format!("open drive 0x{drive_element:04x}: {error}"))?;
+    if candidate.location == TapeInitLocation::Slot {
+        drive
+            .load_immediate()
+            .map_err(|error| format!("immediate drive load 0x{drive_element:04x}: {error}"))?;
+    }
+    let readiness = drive.probe_media_readiness(media_family_for_init_generation(generation));
+    if !readiness.is_ready() {
+        return Err(format!(
+            "media not ready for tape init on {voltag} in drive 0x{drive_element:04x}: {}",
+            describe_media_readiness(&readiness)
+        ));
+    }
     let drive_config = drive
         .read_config()
         .map_err(|error| format!("read drive config: {error}"))?;
@@ -5959,6 +5976,67 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
     _err: &mut dyn Write,
 ) -> Result<TapeInitRunResult, String> {
     Err("tape init requires Linux SG_IO drive access in v0.1".to_string())
+}
+
+fn media_family_for_init_generation(generation: remanence_api::LtoGen) -> MediaFamily {
+    if generation.generation_number() >= 9 {
+        MediaFamily::Lto9OrLater
+    } else {
+        MediaFamily::Unknown
+    }
+}
+
+fn describe_media_readiness(readiness: &MediaReadiness) -> String {
+    match readiness {
+        MediaReadiness::Ready => "ready".to_string(),
+        MediaReadiness::BecomingReady {
+            ascq,
+            media_initializing,
+        } => {
+            if *media_initializing {
+                format!(
+                    "media initializing/calibrating (TEST UNIT READY sense 02/04/{ascq:02x}); retry after the library UI leaves Calib/initializing"
+                )
+            } else {
+                format!(
+                    "logical unit becoming ready (TEST UNIT READY sense 02/04/{ascq:02x}); retry later"
+                )
+            }
+        }
+        MediaReadiness::NoMedium { ascq } => {
+            format!("drive reports no medium (TEST UNIT READY sense 02/3a/{ascq:02x})")
+        }
+        MediaReadiness::UnitAttention { asc, ascq } => {
+            format!("unit attention during readiness probe (sense 06/{asc:02x}/{ascq:02x})")
+        }
+        MediaReadiness::TerminalNotReady { ascq, action } => {
+            format!("terminal not-ready state {action} (sense 02/04/{ascq:02x})")
+        }
+        MediaReadiness::CheckCondition { key, asc, ascq } => {
+            format!("readiness probe check condition (sense {key:02x}/{asc:02x}/{ascq:02x})")
+        }
+        MediaReadiness::UndecodedCheckCondition { sense } => {
+            format!("readiness probe returned undecoded check condition sense={sense:02x?}")
+        }
+        MediaReadiness::TargetBusy { status } => {
+            format!("target busy during readiness probe (status 0x{status:02x}); retry later")
+        }
+        MediaReadiness::ReservationConflict => {
+            "reservation conflict during readiness probe; another owner holds the drive".to_string()
+        }
+        MediaReadiness::TaskAborted => {
+            "task aborted during readiness probe; fence this operation for recovery".to_string()
+        }
+        MediaReadiness::UnexpectedStatus { status } => {
+            format!("unexpected target status during readiness probe: 0x{status:02x}")
+        }
+        MediaReadiness::TransportUnknown { detail } => {
+            format!("transport completion unknown during readiness probe: {detail}")
+        }
+        MediaReadiness::InvalidRequest { detail } => {
+            format!("invalid readiness probe request: {detail}")
+        }
+    }
 }
 
 fn should_confirm_clobber(args: &TapeInitArgs, decision: &remanence_api::InitDecision) -> bool {

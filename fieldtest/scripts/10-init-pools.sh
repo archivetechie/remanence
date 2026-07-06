@@ -38,6 +38,11 @@ print(libs[0]["serial"])
 PY
 }
 
+init_media_not_ready() {
+  local path="$1"
+  grep -qiE 'media not ready for tape init|media initializing/calibrating|logical unit becoming ready|target busy during readiness probe|transport completion unknown during readiness probe' "$path"
+}
+
 main() {
   if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     usage
@@ -99,15 +104,34 @@ main() {
     # --force or --clobber-data. The operator typed DESTROY over these
     # barcodes at allowlist time — that is the clobber consent.
     init_level="plain"
-    if fieldtest_capture_text "$init_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --dry-run && grep -qi "already" "$init_out"; then
-      fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" PASS "already initialized by this catalog (rerun-safe skip)" "$init_out"
-      continue
+    if fieldtest_capture_text "$init_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --dry-run; then
+      if grep -qi "already" "$init_out"; then
+        fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" PASS "already initialized by this catalog (rerun-safe skip)" "$init_out"
+        continue
+      fi
+    else
+      if init_media_not_ready "$init_out"; then
+        fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" FAIL "media not ready/calibrating for ${data_barcodes[$idx]}; wait for the library UI to leave Calib/initializing, then rerun 10-init-pools" "$init_out"
+        exit 1
+      fi
     fi
     if ! fieldtest_capture_text "$init_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial"; then
+      if init_media_not_ready "$init_out"; then
+        fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" FAIL "media not ready/calibrating for ${data_barcodes[$idx]}; wait for the library UI to leave Calib/initializing, then rerun 10-init-pools" "$init_out"
+        exit 1
+      fi
       init_level="force"
       if ! fieldtest_capture_text "$init_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --force; then
+        if init_media_not_ready "$init_out"; then
+          fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" FAIL "media not ready/calibrating for ${data_barcodes[$idx]}; wait for the library UI to leave Calib/initializing, then rerun 10-init-pools" "$init_out"
+          exit 1
+        fi
         init_level="clobber-data"
         if ! fieldtest_capture_text "$init_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --clobber-data; then
+          if init_media_not_ready "$init_out"; then
+            fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" FAIL "media not ready/calibrating for ${data_barcodes[$idx]}; wait for the library UI to leave Calib/initializing, then rerun 10-init-pools" "$init_out"
+            exit 1
+          fi
           if grep -q "needs-explicit-rebuild" "$init_out"; then
             fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" FAIL \
               "${data_barcodes[$idx]} carries a FOREIGN remanence identity (initialized by another rem instance); no init flag overrides this by design — use a different scratch cartridge, or physically relabel/erase this one" "$init_out"

@@ -1718,6 +1718,7 @@ fn default_sense_for_catalogue(catalogue_id: &str) -> Option<SenseSpec> {
     let (response_code, key, asc, ascq, eom) = match catalogue_id {
         "MED-01" => (0x70, 0x03, 0x11, 0x00, false),
         "EOM-01" => (0x70, 0x00, 0x00, 0x02, true),
+        "RDY-01" => (0x70, 0x02, 0x04, 0x01, false),
         "RDY-02" => (0x70, 0x02, 0x04, 0x00, false),
         "BUS-01" => (0x70, 0x06, 0x29, 0x00, false),
         "HOST-01" => (0x71, 0x03, 0x0c, 0x00, false),
@@ -1748,6 +1749,7 @@ fn sense_operation_allowed(catalogue_id: &str, command: &CommandInfo) -> bool {
     match catalogue_id {
         "MED-01" => command.operation == "read",
         "EOM-01" => command.operation == "write",
+        "RDY-01" => command.operation == "test_unit_ready",
         "RDY-02" => matches!(
             command.operation,
             "test_unit_ready" | "inquiry" | "read_block_limits" | "mode_sense"
@@ -2587,6 +2589,17 @@ mod tests {
     #[test]
     fn rdy_bus_and_host_faults_emit_fixed_check_condition_shapes() {
         let cases = [
+            (
+                "rdy01",
+                "RDY-01",
+                json!({"not_ready":{}}),
+                json!({"op":"test_unit_ready"}),
+                [0x00, 0, 0, 0, 0, 0],
+                0x70,
+                0x02,
+                0x04,
+                0x01,
+            ),
             (
                 "rdy02",
                 "RDY-02",
