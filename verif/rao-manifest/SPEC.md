@@ -22,13 +22,15 @@ small but central writer-schema cores:
 - a planner-fold bridge step for arbitrary entry sequences, abstracting the
   production `BTreeSet` lookups as scalar membership facts and proving that an
   arbitrary Lean list of valid generated fold steps reaches a final state
+- a membership-facts bridge that models the production `BTreeSet::insert`
+  contract as scalar contains/insert facts before feeding the planner fold
 
 Text values are represented by opaque scalar ids and SHA-256 bytes by four
 opaque `u64` words. Xattr names and values are represented by scalar ids and a
 value length. This preserves identity for the proof without proving `String`,
 `Vec`, exact CBOR bytes, UTF-8 decoding, tar/pax layout, hashing, arbitrary
-xattr maps, global-pax cross-checking, production `BTreeSet` internals, or the
-real Rust `Vec` loop.
+xattr maps, global-pax cross-checking, standard-library `BTreeSet` internals,
+or the real Rust `Vec` loop.
 
 ## M1 — chunk-count arithmetic (`chunk_count_core_success`)
 
@@ -187,6 +189,43 @@ as scalar membership facts (`path_seen_before`, `file_id_seen_before`,
 The production guardrail test
 `planner_accepted_manifests_validate_against_reader_schema` exercises real
 `plan_rem_tar_object` output against real `validate_manifest`.
+
+## M9 — membership-facts bridge (`planner_membership_fold_core_success_arbitrary`)
+
+M8 proved the planner fold once the membership facts were supplied. M9 proves
+the next bridge layer: a production-source entry plus scalar facts matching the
+`BTreeSet::insert` contract produces exactly those planner facts.
+
+The proof-facing source/fact step is:
+
+```text
+planner_fold_step_from_membership_core(state, source, facts)
+```
+
+The generated extraction validates:
+
+- `path_inserted = true` exactly when the path was not already seen
+- `file_id_inserted = true` exactly when the file id was not already seen
+- regular entries obey the same insert contract for the regular-path set
+- accepted regular source steps require the regular-path set did not already
+  contain the path
+- non-regular entries do not insert into the regular-path set
+- the produced planner entry carries the source path/file/link ids and the
+  membership booleans unchanged
+
+The arbitrary-list theorem:
+
+```text
+planner_membership_fold_core_success_arbitrary
+```
+
+then proves that any arbitrary Lean list of valid source/fact pairs reaches a
+final fold state through the generated membership bridge.
+
+Boundary: this proves the semantic contract that the production planner relies
+on from `BTreeSet::contains`/`insert`; it still does not verify Rust's
+standard-library `BTreeSet` implementation, `String` ordering/equality, real
+`Vec` iteration, allocator behavior, path syntax, or exact CBOR bytes.
 
 ## Trust anchor
 

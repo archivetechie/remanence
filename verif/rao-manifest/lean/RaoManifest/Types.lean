@@ -15,7 +15,7 @@ set_option maxRecDepth 2048
 namespace RaoManifest
 
 /-- [rao_manifest_verif::RaoManifestError]
-    Source: 'src/lib.rs', lines 92:0-97:1
+    Source: 'src/lib.rs', lines 94:0-99:1
     Visibility: public -/
 @[discriminant isize]
 inductive RaoManifestError where
@@ -25,7 +25,7 @@ inductive RaoManifestError where
 | MissingRequiredManifestField : RaoManifestError
 
 /-- [rao_manifest_verif::DigestWords]
-    Source: 'src/lib.rs', lines 100:0-105:1
+    Source: 'src/lib.rs', lines 102:0-107:1
     Visibility: public -/
 structure DigestWords where
   w0 : Std.U64
@@ -34,7 +34,7 @@ structure DigestWords where
   w3 : Std.U64
 
 /-- [rao_manifest_verif::RegularFileCore]
-    Source: 'src/lib.rs', lines 108:0-116:1
+    Source: 'src/lib.rs', lines 110:0-118:1
     Visibility: public -/
 structure RegularFileCore where
   path_id : Std.U64
@@ -46,7 +46,7 @@ structure RegularFileCore where
   executable_tag : Std.U8
 
 /-- [rao_manifest_verif::ManifestCore]
-    Source: 'src/lib.rs', lines 119:0-124:1
+    Source: 'src/lib.rs', lines 121:0-126:1
     Visibility: public -/
 structure ManifestCore where
   object_id : Std.U64
@@ -55,7 +55,7 @@ structure ManifestCore where
   file : RegularFileCore
 
 /-- [rao_manifest_verif::RegularFileWireCore]
-    Source: 'src/lib.rs', lines 127:0-147:1
+    Source: 'src/lib.rs', lines 129:0-149:1
     Visibility: public -/
 structure RegularFileWireCore where
   map_len : Std.U64
@@ -79,7 +79,7 @@ structure RegularFileWireCore where
   metadata_preservation_data_empty : Bool
 
 /-- [rao_manifest_verif::ManifestWireCore]
-    Source: 'src/lib.rs', lines 150:0-168:1
+    Source: 'src/lib.rs', lines 152:0-170:1
     Visibility: public -/
 structure ManifestWireCore where
   root_map_len : Std.U64
@@ -101,7 +101,7 @@ structure ManifestWireCore where
   trailing_data : Bool
 
 /-- [rao_manifest_verif::RichRegularFileCore]
-    Source: 'src/lib.rs', lines 171:0-183:1
+    Source: 'src/lib.rs', lines 173:0-185:1
     Visibility: public -/
 structure RichRegularFileCore where
   path_id : Std.U64
@@ -117,7 +117,7 @@ structure RichRegularFileCore where
   xattr_value_id : Std.U64
 
 /-- [rao_manifest_verif::HardlinkEntryCore]
-    Source: 'src/lib.rs', lines 186:0-191:1
+    Source: 'src/lib.rs', lines 188:0-193:1
     Visibility: public -/
 structure HardlinkEntryCore where
   path_id : Std.U64
@@ -126,7 +126,7 @@ structure HardlinkEntryCore where
   executable_tag : Std.U8
 
 /-- [rao_manifest_verif::SymlinkEntryCore]
-    Source: 'src/lib.rs', lines 194:0-199:1
+    Source: 'src/lib.rs', lines 196:0-201:1
     Visibility: public -/
 structure SymlinkEntryCore where
   path_id : Std.U64
@@ -135,7 +135,7 @@ structure SymlinkEntryCore where
   executable_tag : Std.U8
 
 /-- [rao_manifest_verif::DirectoryEntryCore]
-    Source: 'src/lib.rs', lines 202:0-206:1
+    Source: 'src/lib.rs', lines 204:0-208:1
     Visibility: public -/
 structure DirectoryEntryCore where
   path_id : Std.U64
@@ -143,7 +143,7 @@ structure DirectoryEntryCore where
   executable_tag : Std.U8
 
 /-- [rao_manifest_verif::ManifestEntriesCore]
-    Source: 'src/lib.rs', lines 209:0-218:1
+    Source: 'src/lib.rs', lines 211:0-220:1
     Visibility: public -/
 structure ManifestEntriesCore where
   object_id : Std.U64
@@ -156,7 +156,7 @@ structure ManifestEntriesCore where
   directory : DirectoryEntryCore
 
 /-- [rao_manifest_verif::RichRegularFileWireCore]
-    Source: 'src/lib.rs', lines 221:0-246:1
+    Source: 'src/lib.rs', lines 223:0-248:1
     Visibility: public -/
 structure RichRegularFileWireCore where
   map_len : Std.U64
@@ -185,7 +185,7 @@ structure RichRegularFileWireCore where
   xattr_value_id : Std.U64
 
 /-- [rao_manifest_verif::LinkEntryWireCore]
-    Source: 'src/lib.rs', lines 249:0-270:1
+    Source: 'src/lib.rs', lines 251:0-272:1
     Visibility: public -/
 structure LinkEntryWireCore where
   map_len : Std.U64
@@ -210,7 +210,7 @@ structure LinkEntryWireCore where
   file_sha256_present : Bool
 
 /-- [rao_manifest_verif::DirectoryEntryWireCore]
-    Source: 'src/lib.rs', lines 273:0-293:1
+    Source: 'src/lib.rs', lines 275:0-295:1
     Visibility: public -/
 structure DirectoryEntryWireCore where
   map_len : Std.U64
@@ -234,7 +234,7 @@ structure DirectoryEntryWireCore where
   link_target_present : Bool
 
 /-- [rao_manifest_verif::ManifestEntriesWireCore]
-    Source: 'src/lib.rs', lines 296:0-318:1
+    Source: 'src/lib.rs', lines 298:0-320:1
     Visibility: public -/
 structure ManifestEntriesWireCore where
   root_map_len : Std.U64
@@ -260,14 +260,14 @@ structure ManifestEntriesWireCore where
   trailing_data : Bool
 
 /-- [rao_manifest_verif::PlannerFoldStateCore]
-    Source: 'src/lib.rs', lines 321:0-324:1
+    Source: 'src/lib.rs', lines 323:0-326:1
     Visibility: public -/
 structure PlannerFoldStateCore where
   accepted_count : Std.U64
   regular_seen_count : Std.U64
 
 /-- [rao_manifest_verif::PlannerEntryCore]
-    Source: 'src/lib.rs', lines 327:0-336:1
+    Source: 'src/lib.rs', lines 329:0-338:1
     Visibility: public -/
 structure PlannerEntryCore where
   entry_type : Std.U8
@@ -277,6 +277,28 @@ structure PlannerEntryCore where
   local_entry_valid : Bool
   path_seen_before : Bool
   file_id_seen_before : Bool
+  hardlink_target_seen_regular_before : Bool
+
+/-- [rao_manifest_verif::PlannerSourceEntryCore]
+    Source: 'src/lib.rs', lines 341:0-347:1
+    Visibility: public -/
+structure PlannerSourceEntryCore where
+  entry_type : Std.U8
+  path_id : Std.U64
+  file_id : Std.U64
+  link_target_path_id : Std.U64
+  local_entry_valid : Bool
+
+/-- [rao_manifest_verif::PlannerMembershipFactsCore]
+    Source: 'src/lib.rs', lines 350:0-358:1
+    Visibility: public -/
+structure PlannerMembershipFactsCore where
+  path_seen_before : Bool
+  path_inserted : Bool
+  file_id_seen_before : Bool
+  file_id_inserted : Bool
+  regular_path_seen_before : Bool
+  regular_path_inserted : Bool
   hardlink_target_seen_regular_before : Bool
 
 end RaoManifest
