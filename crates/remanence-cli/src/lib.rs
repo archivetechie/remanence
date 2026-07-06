@@ -46,6 +46,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use remanence_aead::{header::object_id_field, inspect_bytes, open_to_vec, RootKey};
@@ -1251,6 +1252,9 @@ enum RemTapeCommand {
     /// Initialize one tape or a slot range.
     Init(TapeInitArgs),
 
+    /// Poll TEST UNIT READY until already-loaded media is usable.
+    WaitReady(TapeWaitReadyArgs),
+
     /// Permanently retire one tape identity in the local catalog.
     Retire(TapeRetireArgs),
 }
@@ -1262,6 +1266,7 @@ impl From<RemTapeCommand> for TapeCommand {
                 unreachable!("rem tape alerts is dispatched as a daemon drive-alerts alias")
             }
             RemTapeCommand::Init(args) => Self::Init(args),
+            RemTapeCommand::WaitReady(args) => Self::WaitReady(args),
             RemTapeCommand::Retire(args) => Self::Retire(args),
         }
     }
@@ -1275,6 +1280,9 @@ enum TapeCommand {
     /// Initialize one tape or a slot range.
     Init(TapeInitArgs),
 
+    /// Poll TEST UNIT READY until already-loaded media is usable.
+    WaitReady(TapeWaitReadyArgs),
+
     /// Permanently retire one tape identity in the local catalog.
     Retire(TapeRetireArgs),
 }
@@ -1284,6 +1292,7 @@ impl TapeCommand {
         match self {
             Self::Alerts(args) => args.validate_before_discovery(),
             Self::Init(args) => args.validate_before_discovery(),
+            Self::WaitReady(args) => args.validate_before_discovery(),
             Self::Retire(args) => args.validate_before_discovery(),
         }
     }
@@ -1372,6 +1381,108 @@ impl TapeInitArgs {
         }
         Ok(())
     }
+}
+
+#[derive(Args, Debug)]
+struct TapeWaitReadyArgs {
+    /// Barcode to find in an already-loaded drive.
+    #[arg(long, value_name = "BARCODE", conflicts_with = "drive_element")]
+    barcode: Option<String>,
+
+    /// Drive bay element address to poll.
+    #[arg(long, value_parser = parse_element_addr, conflicts_with = "barcode")]
+    drive_element: Option<u16>,
+
+    /// Acknowledge that the target cartridge is already in the drive.
+    #[arg(long)]
+    already_loaded: bool,
+
+    /// Keep polling retryable readiness states until timeout.
+    #[arg(long)]
+    wait: bool,
+
+    /// Maximum wait duration. Accepts ms/s/m/h suffixes.
+    #[arg(long, value_parser = parse_wait_duration_arg, default_value = "30s")]
+    timeout: StdDuration,
+
+    /// Poll interval. Accepts ms/s/m/h suffixes.
+    #[arg(long, value_parser = parse_wait_duration_arg, default_value = "5s")]
+    poll: StdDuration,
+
+    /// Path to `/etc/rem/config.toml`.
+    #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
+    config: PathBuf,
+
+    /// Select a configured library.
+    #[arg(long, value_name = "SERIAL")]
+    library: Option<String>,
+
+    /// Emit stable CLI-shaped JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+impl TapeWaitReadyArgs {
+    fn validate_before_discovery(&self) -> Result<(), String> {
+        if self.barcode.is_none() && self.drive_element.is_none() {
+            return Err("tape wait-ready requires --barcode or --drive-element".to_string());
+        }
+        if self.drive_element.is_some() && !self.already_loaded {
+            return Err("tape wait-ready --drive-element requires --already-loaded".to_string());
+        }
+        if self
+            .barcode
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err("tape wait-ready --barcode cannot be empty".to_string());
+        }
+        if self
+            .library
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err("tape wait-ready --library cannot be empty".to_string());
+        }
+        if self.wait && self.timeout.is_zero() {
+            return Err(
+                "tape wait-ready --timeout must be greater than zero with --wait".to_string(),
+            );
+        }
+        if self.wait && self.poll.is_zero() {
+            return Err("tape wait-ready --poll must be greater than zero with --wait".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn parse_wait_duration_arg(s: &str) -> Result<StdDuration, String> {
+    let trimmed = s.trim();
+    if trimmed == "0" {
+        return Ok(StdDuration::ZERO);
+    }
+    let (number, multiplier) = if let Some(value) = trimmed.strip_suffix("ms") {
+        (value.trim(), 0.001_f64)
+    } else if let Some(value) = trimmed.strip_suffix('s') {
+        (value.trim(), 1.0_f64)
+    } else if let Some(value) = trimmed.strip_suffix('m') {
+        (value.trim(), 60.0_f64)
+    } else if let Some(value) = trimmed.strip_suffix('h') {
+        (value.trim(), 3600.0_f64)
+    } else {
+        return Err(format!(
+            "invalid duration {s:?}: expected '<number>ms', '<number>s', '<number>m', '<number>h', or '0'"
+        ));
+    };
+    let parsed: f64 = number
+        .parse()
+        .map_err(|error| format!("invalid duration {s:?}: {error}"))?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err(format!(
+            "invalid duration {s:?}: must be finite and non-negative"
+        ));
+    }
+    Ok(StdDuration::from_secs_f64(parsed * multiplier))
 }
 
 #[derive(Args, Debug)]
@@ -5317,6 +5428,7 @@ fn run_tape_command(
     match command {
         TapeCommand::Alerts(args) => run_tape_alerts(report, args, out, err),
         TapeCommand::Init(args) => run_tape_init(report, args, out, err),
+        TapeCommand::WaitReady(args) => run_tape_wait_ready(report, args, out, err),
         TapeCommand::Retire(_) => unreachable!("tape retire dispatched pre-discovery"),
     }
 }
@@ -5381,6 +5493,216 @@ fn run_tape_alerts_hardware(
     _args: &TapeAlertsArgs,
 ) -> Result<TapeAlerts, String> {
     Err("tape alerts requires Linux SG_IO drive access in v0.1".to_string())
+}
+
+struct TapeWaitReadyResult {
+    drive_element: u16,
+    barcode: Option<String>,
+    readiness: MediaReadiness,
+    attempts: u64,
+    timed_out: bool,
+}
+
+fn run_tape_wait_ready(
+    report: &DiscoveryReport,
+    args: &TapeWaitReadyArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let config = match remanence_state::load_config(&args.config) {
+        Ok(config) => config,
+        Err(error) => {
+            let _ = writeln!(err, "error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let library = match unique_configured_library(report, &config, args.library.as_deref()) {
+        Ok(library) => library,
+        Err(error) => {
+            let _ = writeln!(err, "error: {error}");
+            print_warnings(report, err);
+            return ExitCode::from(1);
+        }
+    };
+    let policy = configured_library_policy(&config);
+    let result = match run_tape_wait_ready_hardware(library, &policy, args) {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = writeln!(err, "error: {error}");
+            print_setcap_hint_if_error_text_matches(&error, err);
+            print_warnings(report, err);
+            return ExitCode::from(1);
+        }
+    };
+    print_tape_wait_ready_result(library.serial.as_str(), &result, args.json, out);
+    print_warnings(report, err);
+    tape_wait_ready_exit_code(&result)
+}
+
+#[cfg(target_os = "linux")]
+fn run_tape_wait_ready_hardware(
+    library: &Library,
+    policy: &StaticAllowlist,
+    args: &TapeWaitReadyArgs,
+) -> Result<TapeWaitReadyResult, String> {
+    let (drive_element, barcode) = resolve_wait_ready_drive(library, args)?;
+    let family = barcode
+        .as_deref()
+        .and_then(remanence_api::lto_generation_from_voltag)
+        .map(media_family_for_init_generation)
+        .unwrap_or(MediaFamily::Unknown);
+    let mut handle = open_library_handle(library, policy)
+        .map_err(|error| format!("opening library: {error}"))?;
+    let mut drive = handle
+        .open_drive(drive_element, policy)
+        .map_err(|error| format!("open drive 0x{drive_element:04x}: {error}"))?;
+    let started = StdInstant::now();
+    let mut attempts = 0_u64;
+    loop {
+        attempts = attempts.saturating_add(1);
+        let readiness = drive.probe_media_readiness(family);
+        if readiness.is_ready() || !args.wait || !readiness.is_retryable_wait() {
+            return Ok(TapeWaitReadyResult {
+                drive_element,
+                barcode,
+                readiness,
+                attempts,
+                timed_out: false,
+            });
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= args.timeout {
+            return Ok(TapeWaitReadyResult {
+                drive_element,
+                barcode,
+                readiness,
+                attempts,
+                timed_out: true,
+            });
+        }
+        std::thread::sleep(std::cmp::min(args.poll, args.timeout - elapsed));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_tape_wait_ready_hardware(
+    _library: &Library,
+    _policy: &StaticAllowlist,
+    _args: &TapeWaitReadyArgs,
+) -> Result<TapeWaitReadyResult, String> {
+    Err("tape wait-ready requires Linux SG_IO drive access in v0.1".to_string())
+}
+
+fn resolve_wait_ready_drive(
+    library: &Library,
+    args: &TapeWaitReadyArgs,
+) -> Result<(u16, Option<String>), String> {
+    if let Some(drive_element) = args.drive_element {
+        return Ok((drive_element, None));
+    }
+    let barcode = args
+        .barcode
+        .as_deref()
+        .expect("validated --barcode or --drive-element")
+        .trim();
+    for bay in &library.drive_bays {
+        if bay.loaded_tape.as_deref() == Some(barcode) {
+            return Ok((bay.element_address, Some(barcode.to_string())));
+        }
+    }
+    for slot in &library.slots {
+        if slot.cartridge.as_deref() == Some(barcode) {
+            return Err(format!(
+                "barcode {barcode} is in slot 0x{:04x}; wait-ready does not move media",
+                slot.element_address
+            ));
+        }
+    }
+    Err(format!(
+        "barcode {barcode} is not visible in an already-loaded drive in library {}",
+        library.serial
+    ))
+}
+
+fn print_tape_wait_ready_result(
+    library_serial: &str,
+    result: &TapeWaitReadyResult,
+    json_output: bool,
+    out: &mut dyn Write,
+) {
+    let summary = if result.timed_out {
+        format!(
+            "timed out waiting for media readiness; last state: {}",
+            describe_media_readiness(&result.readiness)
+        )
+    } else {
+        describe_media_readiness(&result.readiness)
+    };
+    if json_output {
+        let payload = json!({
+            "schema": "rem.tape.wait_ready.v1",
+            "library_serial": library_serial,
+            "drive_element": format!("0x{:04x}", result.drive_element),
+            "barcode": result.barcode,
+            "state": media_readiness_state_name(&result.readiness),
+            "ready": result.readiness.is_ready(),
+            "retryable": result.readiness.is_retryable_wait(),
+            "timed_out": result.timed_out,
+            "attempts": result.attempts,
+            "exit_code": tape_wait_ready_exit_code_u8(result),
+            "summary": summary,
+        });
+        let _ = serde_json::to_writer_pretty(&mut *out, &payload);
+        let _ = writeln!(out);
+        return;
+    }
+    let barcode = result
+        .barcode
+        .as_deref()
+        .map(|value| format!(" barcode={value}"))
+        .unwrap_or_default();
+    let status = if result.readiness.is_ready() {
+        "ready"
+    } else if result.timed_out {
+        "timeout"
+    } else {
+        "not-ready"
+    };
+    let _ = writeln!(
+        out,
+        "{status} library={library_serial} drive=0x{:04x}{barcode} attempts={} {summary}",
+        result.drive_element, result.attempts
+    );
+}
+
+fn media_readiness_state_name(readiness: &MediaReadiness) -> &'static str {
+    match readiness {
+        MediaReadiness::Ready => "ready",
+        MediaReadiness::BecomingReady { .. } => "becoming_ready",
+        MediaReadiness::NoMedium { .. } => "no_medium",
+        MediaReadiness::UnitAttention { .. } => "unit_attention",
+        MediaReadiness::TerminalNotReady { .. } => "terminal_not_ready",
+        MediaReadiness::CheckCondition { .. } => "check_condition",
+        MediaReadiness::UndecodedCheckCondition { .. } => "undecoded_check_condition",
+        MediaReadiness::TargetBusy { .. } => "target_busy",
+        MediaReadiness::ReservationConflict => "reservation_conflict",
+        MediaReadiness::TaskAborted => "task_aborted",
+        MediaReadiness::UnexpectedStatus { .. } => "unexpected_status",
+        MediaReadiness::TransportUnknown { .. } => "transport_unknown",
+        MediaReadiness::InvalidRequest { .. } => "invalid_request",
+    }
+}
+
+fn tape_wait_ready_exit_code(result: &TapeWaitReadyResult) -> ExitCode {
+    ExitCode::from(tape_wait_ready_exit_code_u8(result))
+}
+
+fn tape_wait_ready_exit_code_u8(result: &TapeWaitReadyResult) -> u8 {
+    if result.timed_out {
+        20
+    } else {
+        u8::try_from(result.readiness.design_exit_code()).unwrap_or(1)
+    }
 }
 
 fn print_tape_alerts(library_serial: &str, bay: u16, alerts: &TapeAlerts, out: &mut dyn Write) {

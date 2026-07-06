@@ -72,6 +72,14 @@ green. Then physically load the scratch data tapes plus the CLN cartridge.
 ./scripts/02-discovery.sh
 ```
 
+If `10-init-pools.sh` stops with media not ready, or the MSL3040 UI shows
+Calib/initializing for a loaded tape, wait on that cartridge before daemon
+bringup:
+
+```bash
+./scripts/09-media-ready.sh --barcode AOX030L9
+```
+
 For a two-data-tape core run, use `./scripts/10-init-pools.sh --count 2`.
 
 At this point the daemon owns the robotics. Do not let another backup job,
