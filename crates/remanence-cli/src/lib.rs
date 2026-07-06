@@ -6889,6 +6889,13 @@ fn run_tape_init(
             return ExitCode::from(1);
         }
     };
+    if let Err(error) =
+        remanence_api::reconcile_media_readiness_on_startup(state.catalog_index(), report, &policy)
+    {
+        let _ = writeln!(err, "error: startup media-readiness reconcile: {error}");
+        print_warnings(report, err);
+        return ExitCode::from(1);
+    }
     let ctx = TapeInitRunContext {
         report,
         config: &config,
