@@ -1,0 +1,11 @@
+[package]
+name = "tape-init-verif"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone extraction of Remanence tape-init decision logic for Lean verification."
+
+# Deliberately NOT a member of the remanence workspace: this crate is consumed by
+# the Charon/Aeneas verification pipeline and must not affect the main build.
+[workspace]
+
+[dependencies]
