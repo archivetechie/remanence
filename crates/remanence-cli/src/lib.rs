@@ -6223,17 +6223,17 @@ fn run_tape_wait_ready_hardware(
     args: &TapeWaitReadyArgs,
     catalog: &mut remanence_state::CatalogIndex,
 ) -> Result<TapeWaitReadyResult, TapeWaitReadyFailure> {
+    let signal_guard =
+        MediaReadinessSignalGuard::install().map_err(|message| TapeWaitReadyFailure {
+            message,
+            exit_code: 1,
+        })?;
     let (operation_id, drive_element, barcode) =
         resolve_wait_ready_operation(library, args, catalog).map_err(|message| {
             TapeWaitReadyFailure {
                 message,
                 exit_code: 50,
             }
-        })?;
-    let signal_guard =
-        MediaReadinessSignalGuard::install().map_err(|message| TapeWaitReadyFailure {
-            message,
-            exit_code: 1,
         })?;
     let family = barcode
         .as_deref()
@@ -6253,18 +6253,24 @@ fn run_tape_wait_ready_hardware(
     let mut handle = match open_library_handle(library, policy) {
         Ok(handle) => handle,
         Err(error) => {
-            catalog
-                .record_media_readiness_transition(media_readiness_mechanical_transition(
-                    operation_id,
-                    "open_library",
-                    "transport_unknown",
-                    None,
-                    Some(error.to_string()),
-                ))
-                .map_err(|error| TapeWaitReadyFailure {
-                    message: format!("record media readiness transition: {error}"),
-                    exit_code: 1,
-                })?;
+            if let Some(signal) = record_media_readiness_signal_or_mechanical_failure(
+                catalog,
+                operation_id,
+                "open_library",
+                "transport_unknown",
+                None,
+                &error.to_string(),
+                signal_guard.requested_signal_name(),
+            )
+            .map_err(|error| TapeWaitReadyFailure {
+                message: format!("record media readiness transition: {error}"),
+                exit_code: 1,
+            })? {
+                return Err(TapeWaitReadyFailure {
+                    message: signal,
+                    exit_code: 130,
+                });
+            }
             return Err(TapeWaitReadyFailure {
                 message: format!("opening library: {error}"),
                 exit_code: 40,
@@ -6281,18 +6287,24 @@ fn run_tape_wait_ready_hardware(
     let mut drive = match handle.open_drive(drive_element, policy) {
         Ok(drive) => drive,
         Err(error) => {
-            catalog
-                .record_media_readiness_transition(media_readiness_mechanical_transition(
-                    operation_id,
-                    "open_drive",
-                    "transport_unknown",
-                    None,
-                    Some(error.to_string()),
-                ))
-                .map_err(|error| TapeWaitReadyFailure {
-                    message: format!("record media readiness transition: {error}"),
-                    exit_code: 1,
-                })?;
+            if let Some(signal) = record_media_readiness_signal_or_mechanical_failure(
+                catalog,
+                operation_id,
+                "open_drive",
+                "transport_unknown",
+                None,
+                &error.to_string(),
+                signal_guard.requested_signal_name(),
+            )
+            .map_err(|error| TapeWaitReadyFailure {
+                message: format!("record media readiness transition: {error}"),
+                exit_code: 1,
+            })? {
+                return Err(TapeWaitReadyFailure {
+                    message: signal,
+                    exit_code: 130,
+                });
+            }
             return Err(TapeWaitReadyFailure {
                 message: format!("open drive 0x{drive_element:04x}: {error}"),
                 exit_code: 40,
@@ -6329,10 +6341,7 @@ fn run_tape_wait_ready_hardware(
             ),
         },
     )
-    .map_err(|message| TapeWaitReadyFailure {
-        message,
-        exit_code: 1,
-    })?;
+    .map_err(tape_wait_ready_failure_from_poll_error)?;
     Ok(TapeWaitReadyResult {
         operation_id,
         drive_element,
@@ -6771,9 +6780,25 @@ where
         return Ok(());
     };
     record_media_readiness_signal_transition(state, operation_id, phase, signal)?;
-    Err(format!(
-        "media readiness interrupted by {signal}; recorded aborted_unknown fence"
-    ))
+    Err(media_readiness_signal_abort_message(signal))
+}
+
+fn media_readiness_signal_abort_message(signal: &str) -> String {
+    format!("media readiness interrupted by {signal}; recorded aborted_unknown fence")
+}
+
+fn media_readiness_error_is_signal_abort(message: &str) -> bool {
+    message.contains("media readiness interrupted by SIG")
+        && message.contains("recorded aborted_unknown fence")
+}
+
+fn tape_wait_ready_failure_from_poll_error(message: String) -> TapeWaitReadyFailure {
+    let exit_code = if media_readiness_error_is_signal_abort(&message) {
+        130
+    } else {
+        1
+    };
+    TapeWaitReadyFailure { message, exit_code }
 }
 
 fn media_readiness_command_failure_state(error: &str) -> &'static str {
@@ -6807,6 +6832,45 @@ fn record_media_readiness_command_failure<S: TapeInitStateOps>(
         cdb_opcode,
         Some(error.to_string()),
     ))
+}
+
+fn record_media_readiness_signal_or_mechanical_failure<S: TapeInitStateOps>(
+    state: &mut S,
+    operation_id: Uuid,
+    phase: &str,
+    mechanical_state: &str,
+    cdb_opcode: Option<u8>,
+    error: &str,
+    signal: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(signal) = signal {
+        record_media_readiness_signal_transition(state, operation_id, phase, signal)?;
+        return Ok(Some(media_readiness_signal_abort_message(signal)));
+    }
+    state.record_media_readiness_transition(media_readiness_mechanical_transition(
+        operation_id,
+        phase,
+        mechanical_state,
+        cdb_opcode,
+        Some(error.to_string()),
+    ))?;
+    Ok(None)
+}
+
+fn record_media_readiness_signal_or_command_failure<S: TapeInitStateOps>(
+    state: &mut S,
+    operation_id: Uuid,
+    phase: &str,
+    cdb_opcode: Option<u8>,
+    error: &str,
+    signal: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(signal) = signal {
+        record_media_readiness_signal_transition(state, operation_id, phase, signal)?;
+        return Ok(Some(media_readiness_signal_abort_message(signal)));
+    }
+    record_media_readiness_command_failure(state, operation_id, phase, cdb_opcode, error)?;
+    Ok(None)
 }
 
 fn media_readiness_release_transition(
@@ -7525,6 +7589,7 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         .drive_bays
         .iter()
         .find(|bay| bay.element_address == drive_element);
+    let signal_guard = MediaReadinessSignalGuard::install()?;
     state.record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
         operation_id,
         run_id: None,
@@ -7551,20 +7616,23 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         deadline_at_utc: deadline_after(MEDIA_CONDITIONING_TIMEOUT),
         evidence_path: None,
     })?;
-    let signal_guard = MediaReadinessSignalGuard::install()?;
     record_media_readiness_signal_if_requested(state, operation_id, "before_open_library", || {
         signal_guard.requested_signal_name()
     })?;
     let mut handle = match open_library_handle(library, policy) {
         Ok(handle) => handle,
         Err(error) => {
-            state.record_media_readiness_transition(media_readiness_mechanical_transition(
+            if let Some(signal) = record_media_readiness_signal_or_mechanical_failure(
+                state,
                 operation_id,
                 "open_library",
                 "transport_unknown",
                 None,
-                Some(error.to_string()),
-            ))?;
+                &error.to_string(),
+                signal_guard.requested_signal_name(),
+            )? {
+                return Err(signal);
+            }
             return Err(format!("opening library: {error}"));
         }
     };
@@ -7586,13 +7654,17 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
             None,
         ))?;
         if let Err(error) = handle.move_medium(candidate.element_address, drive_element, policy) {
-            state.record_media_readiness_transition(media_readiness_mechanical_transition(
+            if let Some(signal) = record_media_readiness_signal_or_mechanical_failure(
+                state,
                 operation_id,
                 "move_medium",
                 "transport_unknown",
                 Some(0xa5),
-                Some(error.to_string()),
-            ))?;
+                &error.to_string(),
+                signal_guard.requested_signal_name(),
+            )? {
+                return Err(signal);
+            }
             return Err(format!(
                 "move slot 0x{:04x} to drive 0x{drive_element:04x}: {error}",
                 candidate.element_address
@@ -7611,13 +7683,17 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
     let mut drive = match handle.open_drive(drive_element, policy) {
         Ok(drive) => drive,
         Err(error) => {
-            state.record_media_readiness_transition(media_readiness_mechanical_transition(
+            if let Some(signal) = record_media_readiness_signal_or_mechanical_failure(
+                state,
                 operation_id,
                 "open_drive",
                 "transport_unknown",
                 None,
-                Some(error.to_string()),
-            ))?;
+                &error.to_string(),
+                signal_guard.requested_signal_name(),
+            )? {
+                return Err(signal);
+            }
             return Err(format!("open drive 0x{drive_element:04x}: {error}"));
         }
     };
@@ -7656,13 +7732,17 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
                 None,
             ))?;
             if let Err(error) = drive.load_immediate() {
-                state.record_media_readiness_transition(media_readiness_mechanical_transition(
+                if let Some(signal) = record_media_readiness_signal_or_mechanical_failure(
+                    state,
                     operation_id,
                     "conditional_immediate_load",
                     "transport_unknown",
                     Some(0x1b),
-                    Some(error.to_string()),
-                ))?;
+                    &error.to_string(),
+                    signal_guard.requested_signal_name(),
+                )? {
+                    return Err(signal);
+                }
                 return Err(format!(
                     "immediate drive load 0x{drive_element:04x}: {error}"
                 ));
@@ -7704,13 +7784,16 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
     let drive_config = match drive.read_config() {
         Ok(config) => config,
         Err(error) => {
-            record_media_readiness_command_failure(
+            if let Some(signal) = record_media_readiness_signal_or_command_failure(
                 state,
                 operation_id,
                 "read_drive_config",
                 None,
                 &error.to_string(),
-            )?;
+                signal_guard.requested_signal_name(),
+            )? {
+                return Err(signal);
+            }
             return Err(format!("read drive config: {error}"));
         }
     };
@@ -7725,13 +7808,16 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         || signal_guard.requested_signal_name(),
     )?;
     if let Err(error) = drive.rewind() {
-        record_media_readiness_command_failure(
+        if let Some(signal) = record_media_readiness_signal_or_command_failure(
             state,
             operation_id,
             "rewind_before_bot_read",
             Some(0x01),
             &error.to_string(),
-        )?;
+            signal_guard.requested_signal_name(),
+        )? {
+            return Err(signal);
+        }
         return Err(format!("rewind before BOT read: {error}"));
     }
     record_media_readiness_signal_if_requested(
@@ -7776,7 +7862,28 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         &catalog_projection.committed_copies,
     );
     let clobber_data_confirmed = if should_confirm_clobber(args, &decision) {
-        confirm_clobber_data(voltag.as_str(), &decision, err)?
+        let confirmed = match confirm_clobber_data(voltag.as_str(), &decision, err) {
+            Ok(confirmed) => confirmed,
+            Err(error) => {
+                if let Some(signal) = signal_guard.requested_signal_name() {
+                    record_media_readiness_signal_transition(
+                        state,
+                        operation_id,
+                        "clobber_confirmation",
+                        signal,
+                    )?;
+                    return Err(media_readiness_signal_abort_message(signal));
+                }
+                return Err(error);
+            }
+        };
+        record_media_readiness_signal_if_requested(
+            state,
+            operation_id,
+            "after_clobber_confirmation",
+            || signal_guard.requested_signal_name(),
+        )?;
+        confirmed
     } else {
         false
     };
@@ -7796,13 +7903,16 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
     // it for data. Rewind again so a fresh init overwrites the bootstrap at
     // block 0 rather than appending a new bootstrap after the probe reads.
     if let Err(error) = drive.rewind() {
-        record_media_readiness_command_failure(
+        if let Some(signal) = record_media_readiness_signal_or_command_failure(
             state,
             operation_id,
             "rewind_before_bootstrap_write",
             Some(0x01),
             &error.to_string(),
-        )?;
+            signal_guard.requested_signal_name(),
+        )? {
+            return Err(signal);
+        }
         return Err(format!("rewind before bootstrap write: {error}"));
     }
     record_media_readiness_signal_if_requested(
@@ -7830,13 +7940,16 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
     let action = match action_result {
         Ok(action) => action,
         Err(error) => {
-            record_media_readiness_command_failure(
+            if let Some(signal) = record_media_readiness_signal_or_command_failure(
                 state,
                 operation_id,
                 "apply_init_write_gate",
                 None,
                 &error.to_string(),
-            )?;
+                signal_guard.requested_signal_name(),
+            )? {
+                return Err(signal);
+            }
             return Err(format!("apply init write gate: {error}"));
         }
     };
@@ -13149,6 +13262,70 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn media_readiness_signal_failure_overrides_command_failure() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-readiness-signal-failure")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = remanence_state::CatalogIndex::open(temp.path().join("state.sqlite"))
+            .expect("open catalog");
+        let operation_id = Uuid::from_u128(0x457);
+        index
+            .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+                operation_id,
+                run_id: None,
+                library_serial: "LIB-A".to_string(),
+                changer_sg: Some("/dev/sg8".to_string()),
+                drive_element: 0x0001,
+                drive_sg: Some("/dev/sg7".to_string()),
+                drive_serial: Some("DRV1".to_string()),
+                barcode: Some("AOX030L9".to_string()),
+                source_slot: Some(0x03eb),
+                media_generation: Some(9),
+                phase: "readiness_poll".to_string(),
+                state: "media_initializing".to_string(),
+                dirty_scope: Some("drive+tape".to_string()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .expect("record operation");
+
+        let message = record_media_readiness_signal_or_command_failure(
+            &mut index,
+            operation_id,
+            "rewind_before_bot_read",
+            Some(0x01),
+            "interrupted system call",
+            Some("SIGINT"),
+        )
+        .expect("record signal")
+        .expect("signal message");
+
+        assert!(media_readiness_error_is_signal_abort(&message));
+        let record = index
+            .media_readiness_operation(operation_id)
+            .expect("lookup")
+            .expect("operation exists");
+        assert_eq!(record.state, "aborted_unknown");
+        assert_eq!(record.cancel_source.as_deref(), Some("signal"));
+        assert_eq!(record.signal.as_deref(), Some("SIGINT"));
+        assert_eq!(record.last_cdb_opcode, None);
+    }
+
+    #[test]
+    fn tape_wait_ready_signal_poll_error_uses_signal_exit_code() {
+        let failure = tape_wait_ready_failure_from_poll_error(
+            "media readiness interrupted by SIGTERM; recorded aborted_unknown fence".to_string(),
+        );
+        assert_eq!(failure.exit_code, 130);
+
+        let failure = tape_wait_ready_failure_from_poll_error(
+            "record media readiness transition: sqlite busy".to_string(),
+        );
+        assert_eq!(failure.exit_code, 1);
     }
 
     #[test]
