@@ -109,3 +109,72 @@ The post-flash points isolate the firmware contribution. Never mix the two.
       crash claims to post-TIO code
 - [ ] Courtesy findings for central IT (fw leveled ✓/✗, any new alarms, and the
       still-open Feb-2026 cleaning-cartridge warning on their partition)
+
+---
+
+## Access setup — Claude drives the server directly (no copy-paste relay)
+
+Containment layers: unprivileged `remfield` user with **zero sudo**; device ACLs
+on partition-1 sg nodes only; the kit's barcode allowlist; self-expiring keys
+(both expire `20260708T1200`); tunnel = instant kill switch. the owner runs the ~4
+privileged T0 commands personally; Claude proposes anything novel in chat first.
+
+### Step 1 — HP server, the owner (sudo) — the last copy-paste
+
+```bash
+sudo useradd -m -s /bin/bash remfield
+sudo install -d -m 700 -o remfield -g remfield /home/remfield/.ssh
+echo 'expiry-time="20260708T1200",from="127.0.0.1,::1",no-agent-forwarding,no-X11-forwarding,no-port-forwarding ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK41YCPTE5X7cYt5vZDVRTuM3e34W45blkWROeGUG9q4 claude-remfield-window-2026-07-07b' | sudo tee /home/remfield/.ssh/authorized_keys >/dev/null
+sudo chown remfield:remfield /home/remfield/.ssh/authorized_keys && sudo chmod 600 /home/remfield/.ssh/authorized_keys
+sudo -u remfield ssh-keygen -t ed25519 -f /home/remfield/.ssh/tunnel_akash -N '' -C 'remfield-tunnel-2026-07-07b'
+sudo cat /home/remfield/.ssh/tunnel_akash.pub   # ← paste THIS line back to Claude
+```
+
+### Step 2 — akash, Claude
+
+Adds to `~/.ssh/authorized_keys` (restricted: forwarding only, port 2222, expiring):
+
+```
+restrict,port-forwarding,permitlisten="2222",expiry-time="20260708T1200" <tunnel pubkey from step 1>
+```
+
+If the server's connection is refused, akash's `public_guard` nft table needs an
+allow rule for the org egress IP (the owner/sudo on akash) — test first, don't assume.
+Fallback if server egress is blocked entirely: laptop chain
+(`ssh -R 2222:<hp-server>:22 owner@65.21.89.167` from the laptop).
+
+### Step 3 — HP server, the owner — start the tunnel
+
+```bash
+sudo -iu remfield tmux new -d -s tunnel \
+  'while true; do ssh -N -R 2222:localhost:22 -i ~/.ssh/tunnel_akash \
+     -o ServerAliveInterval=15 -o ExitOnForwardFailure=yes \
+     -o StrictHostKeyChecking=accept-new owner@65.21.89.167; sleep 5; done'
+```
+
+### Step 4 — Claude verifies
+
+`ssh remfield-window hostname` (config entry exists on akash: port 2222 via the
+tunnel, dedicated key, connection multiplexing for speed).
+
+### T0 privileged block — the owner personally, once
+
+1. Run `00-preflight.sh` + `02-discovery.sh` from HIS OWN account first → sg-node
+   map (which nodes = partition-1 changer + the two LTO-9 drives).
+2. `sudo setfacl -m u:remfield:rw /dev/sgX` for **partition-1 nodes ONLY**
+   (never the LTO-7 drive nodes — do NOT use the tape group, it grants all sg).
+3. The three `setcap cap_sys_rawio+ep` commands on the kit binaries.
+4. `sudo mount -t tmpfs -o size=320g tmpfs /home/remfield/remfield/spool`
+   (path per kit layout).
+
+After this, Claude operates unprivileged: numbered scripts + read-only
+diagnostics; long runs inside server-side tmux (`tmux new -d -s bench '...'`) so
+tunnel blips never kill a benchmark; every command logged into the evidence bundle.
+
+### Teardown at hand-back
+
+- [ ] Kill tunnel tmux; on akash remove the tunnel-key line (keys self-expire
+      2026-07-08 12:00 regardless)
+- [ ] `sudo userdel -r remfield` after `90-collect-evidence.sh` output is copied
+      off (or leave account disabled — central IT's preference)
+- [ ] Remove the sg ACLs + umount tmpfs (userdel/reboot covers both otherwise)
