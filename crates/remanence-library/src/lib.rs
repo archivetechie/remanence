@@ -46,7 +46,10 @@ pub use handle::tape_io::{
     TapeIoError, TapePosition, WormMediaState, WriteBatchOutcome, WriteFilemarksOutcome,
     WriteOutcome, WriteUnpositionedOutcome,
 };
-pub use handle::{ChangerHandle, DirtyCause, DriveHandle, LibraryHandle, RemovalLockGuard};
+pub use handle::{
+    ChangerHandle, DirtyCause, DriveHandle, LibraryHandle, RemovalLockGuard, TapeIoRuntimeConfig,
+    DEFAULT_TAPE_IO_BATCH_BLOCKS, DEFAULT_TAPE_IO_POSITION_CHECK_BYTES,
+};
 pub use model::{
     resolve_load_target, AccessPolicy, DeviceCaptures, DiscoveryReport, DriveBay, ElementException,
     ElementLayout, IdentitySource, IePort, InstalledDrive, Library, LoadPlan, Slot,

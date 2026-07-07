@@ -20,8 +20,8 @@ use remanence_format::{
     FORMAT_ID,
 };
 use remanence_library::{
-    BlockSink, BlockSource, TapeIoError, TapePosition, VecBlockSink, WriteFilemarksOutcome,
-    WriteOutcome,
+    BlockSink, BlockSource, TapeIoError, TapePosition, VecBlockSink, WriteBatchOutcome,
+    WriteFilemarksOutcome, WriteOutcome,
 };
 use remanence_parity::{
     bootstrap::{parse_bootstrap_block, write_bootstrap_block, BootstrapObjectRow},
@@ -333,6 +333,14 @@ pub enum WritabilityError {
         /// Catalog-accounted committed ordinals already present on the tape.
         total_committed_ordinals: u64,
     },
+    /// The tape has an active tape-I/O quarantine fence.
+    #[error("active tape-I/O fence {quarantine_id}: {reason}")]
+    TapeIoFence {
+        /// Operator-facing quarantine id.
+        quarantine_id: String,
+        /// Fence reason.
+        reason: String,
+    },
 }
 
 /// Reason an active tape should be sealed after a write boundary.
@@ -628,12 +636,24 @@ pub fn select_tape_in_pool_with_policy(
     let mut reasons = Vec::new();
     let mut eligible = Vec::new();
     for tape in tapes {
-        match check_writability_preconditions(&tape, object_size)
+        if let Err(err) = check_writability_preconditions(&tape, object_size)
             .and_then(|_| check_pool_block_size_precondition(&tape, pool_cfg))
         {
-            Ok(()) => eligible.push(tape),
-            Err(err) => reasons.push(err),
+            reasons.push(err);
+            continue;
         }
+        let tape_uuid = tape_uuid_from_vec(tape.tape_uuid.clone(), pool_id.as_str())?;
+        let conflicts = state
+            .tape_io_admission_conflicts(&tape_uuid, tape.voltag.as_deref())
+            .map_err(SelectTapeError::State)?;
+        if let Some(conflict) = conflicts.first() {
+            reasons.push(WritabilityError::TapeIoFence {
+                quarantine_id: conflict.quarantine_id.clone(),
+                reason: conflict.reason.clone(),
+            });
+            continue;
+        }
+        eligible.push(tape);
     }
     if eligible.is_empty() {
         return Err(SelectTapeError::NoWritableTapes { pool_id, reasons });
@@ -836,7 +856,7 @@ fn write_to_selected_tape_inner<S: BlockSink + ?Sized>(
     // Only the hardware-backed tape transfer below is counted live. The spool
     // write already finished in mount.rs, and parity/object replay only reads
     // the prepared in-memory object.
-    let mut counted_sink = CountingBlockSink::new(sink);
+    let mut counted_sink = CountingBlockSink::new(sink, selected.block_size);
     let prepared_write = PreparedPoolWrite { prepared, stored };
     match selected.parity_config.clone() {
         ParityConfig::Scheme(scheme) => write_parity_object_to_selected_tape(
@@ -1112,6 +1132,10 @@ struct BlockSinkStats {
     filemarks: u64,
     position_calls: u64,
     early_warning: bool,
+    legacy_single_block: bool,
+    write_batch_blocks: u32,
+    effective_batch_blocks: u32,
+    position_check_bytes: u64,
 }
 
 impl BlockSinkStats {
@@ -1156,6 +1180,14 @@ struct ObjectDigestBlockSink<'a, S: BlockSink + ?Sized> {
     hasher: Sha256,
 }
 
+struct BatchingBlockSink<'a, S: BlockSink + ?Sized> {
+    inner: &'a mut S,
+    block_size: usize,
+    batch_blocks: u32,
+    buffer: Vec<u8>,
+    cursor: Option<TapePosition>,
+}
+
 impl<'a, S: BlockSink + ?Sized> ObjectDigestBlockSink<'a, S> {
     fn new(inner: &'a mut S) -> Self {
         Self {
@@ -1172,11 +1204,112 @@ impl<'a, S: BlockSink + ?Sized> ObjectDigestBlockSink<'a, S> {
     }
 }
 
+impl<'a, S: BlockSink + ?Sized> BatchingBlockSink<'a, S> {
+    fn new(inner: &'a mut S, block_size: usize) -> Self {
+        let block_size_u32 = u32::try_from(block_size).unwrap_or(u32::MAX);
+        let batch_blocks = if inner.legacy_single_block() {
+            1
+        } else {
+            inner.write_batch_blocks(block_size_u32).max(1)
+        };
+        let capacity = block_size.saturating_mul(batch_blocks as usize);
+        Self {
+            inner,
+            block_size,
+            batch_blocks,
+            buffer: Vec::with_capacity(capacity),
+            cursor: None,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.batch_blocks > 1
+    }
+
+    fn pending_records(&self) -> u32 {
+        self.buffer.len().checked_div(self.block_size).unwrap_or(0) as u32
+    }
+
+    fn seed_cursor(&mut self) -> Result<TapePosition, TapeIoError> {
+        if let Some(position) = self.cursor {
+            return Ok(position);
+        }
+        let position = self.inner.position()?;
+        self.cursor = Some(position);
+        Ok(position)
+    }
+
+    fn advance_cursor(&mut self, records: u32, bytes: u32) -> Result<WriteOutcome, TapeIoError> {
+        let before = self.seed_cursor()?;
+        let lba = before
+            .lba
+            .checked_add(u64::from(records))
+            .ok_or_else(|| TapeIoError::OperationFailed("batch position overflow".to_string()))?;
+        let position = TapePosition {
+            lba,
+            partition: before.partition,
+            beginning_of_partition: lba == 0,
+            end_of_partition: false,
+            block_position_end_of_warning: before.block_position_end_of_warning,
+        };
+        self.cursor = Some(position);
+        Ok(WriteOutcome::from_computed_position(
+            bytes, false, false, position,
+        ))
+    }
+
+    fn flush_pending(&mut self) -> Result<(), TapeIoError> {
+        let records = self.pending_records();
+        if records == 0 {
+            return Ok(());
+        }
+        let block_size = u32::try_from(self.block_size).map_err(|_| {
+            TapeIoError::OperationFailed("batch block size exceeds u32".to_string())
+        })?;
+        let requested = records;
+        let outcome = self.inner.write_block_batch(&self.buffer, block_size)?;
+        self.buffer.clear();
+        if outcome.records_written != requested || outcome.end_of_medium {
+            return Err(TapeIoError::OperationFailed(format!(
+                "partial fixed batch uncommittable: requested_records={requested} written_records={} end_of_medium={}",
+                outcome.records_written, outcome.end_of_medium
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl<S: BlockSink + ?Sized> BlockSink for ObjectDigestBlockSink<'_, S> {
     fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
         let outcome = self.inner.write_block(buf)?;
         self.hasher.update(buf);
         Ok(outcome)
+    }
+
+    fn write_block_batch(
+        &mut self,
+        buf: &[u8],
+        block_size_bytes: u32,
+    ) -> Result<WriteBatchOutcome, TapeIoError> {
+        let outcome = self.inner.write_block_batch(buf, block_size_bytes)?;
+        self.hasher.update(buf);
+        Ok(outcome)
+    }
+
+    fn write_batch_blocks(&self, block_size_bytes: u32) -> u32 {
+        self.inner.write_batch_blocks(block_size_bytes)
+    }
+
+    fn requested_write_batch_blocks(&self) -> u32 {
+        self.inner.requested_write_batch_blocks()
+    }
+
+    fn legacy_single_block(&self) -> bool {
+        self.inner.legacy_single_block()
+    }
+
+    fn position_check_bytes(&self) -> u64 {
+        self.inner.position_check_bytes()
     }
 
     fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
@@ -1189,6 +1322,67 @@ impl<S: BlockSink + ?Sized> BlockSink for ObjectDigestBlockSink<'_, S> {
 
     fn position(&mut self) -> Result<TapePosition, TapeIoError> {
         self.inner.position()
+    }
+}
+
+impl<S: BlockSink + ?Sized> BlockSink for BatchingBlockSink<'_, S> {
+    fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
+        if !self.enabled() || buf.len() != self.block_size {
+            self.flush_pending()?;
+            return self.inner.write_block(buf);
+        }
+        self.buffer.extend_from_slice(buf);
+        let outcome = self.advance_cursor(1, buf.len() as u32)?;
+        if self.pending_records() >= self.batch_blocks {
+            self.flush_pending()?;
+        }
+        Ok(outcome)
+    }
+
+    fn write_block_batch(
+        &mut self,
+        buf: &[u8],
+        block_size_bytes: u32,
+    ) -> Result<WriteBatchOutcome, TapeIoError> {
+        self.flush_pending()?;
+        self.inner.write_block_batch(buf, block_size_bytes)
+    }
+
+    fn write_batch_blocks(&self, block_size_bytes: u32) -> u32 {
+        self.inner.write_batch_blocks(block_size_bytes)
+    }
+
+    fn requested_write_batch_blocks(&self) -> u32 {
+        self.inner.requested_write_batch_blocks()
+    }
+
+    fn legacy_single_block(&self) -> bool {
+        self.inner.legacy_single_block()
+    }
+
+    fn position_check_bytes(&self) -> u64 {
+        self.inner.position_check_bytes()
+    }
+
+    fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
+        self.flush_pending()?;
+        let outcome = self.inner.write_filemarks(count)?;
+        self.cursor = Some(outcome.position_after);
+        Ok(outcome)
+    }
+
+    fn space_to_end_of_data(&mut self) -> Result<TapePosition, TapeIoError> {
+        self.flush_pending()?;
+        let position = self.inner.space_to_end_of_data()?;
+        self.cursor = Some(position);
+        Ok(position)
+    }
+
+    fn position(&mut self) -> Result<TapePosition, TapeIoError> {
+        self.flush_pending()?;
+        let position = self.inner.position()?;
+        self.cursor = Some(position);
+        Ok(position)
     }
 }
 
@@ -1205,10 +1399,20 @@ impl<'a> LiveCounterBlockSink<'a> {
 }
 
 impl<'a, S: BlockSink + ?Sized> CountingBlockSink<'a, S> {
-    fn new(inner: &'a mut S) -> Self {
+    fn new(inner: &'a mut S, block_size: u32) -> Self {
+        let legacy_single_block = inner.legacy_single_block();
+        let write_batch_blocks = inner.requested_write_batch_blocks().max(1);
+        let effective_batch_blocks = inner.write_batch_blocks(block_size).max(1);
+        let position_check_bytes = inner.position_check_bytes();
         Self {
             inner,
-            stats: BlockSinkStats::default(),
+            stats: BlockSinkStats {
+                legacy_single_block,
+                write_batch_blocks,
+                effective_batch_blocks,
+                position_check_bytes,
+                ..BlockSinkStats::default()
+            },
         }
     }
 
@@ -1223,6 +1427,33 @@ impl<'a> BlockSink for LiveCounterBlockSink<'a> {
         self.live_write_counter
             .record_write_bytes(u64::from(outcome.bytes_written));
         Ok(outcome)
+    }
+
+    fn write_block_batch(
+        &mut self,
+        buf: &[u8],
+        block_size_bytes: u32,
+    ) -> Result<WriteBatchOutcome, TapeIoError> {
+        let outcome = self.inner.write_block_batch(buf, block_size_bytes)?;
+        self.live_write_counter
+            .record_write_bytes(u64::from(outcome.bytes_written));
+        Ok(outcome)
+    }
+
+    fn write_batch_blocks(&self, block_size_bytes: u32) -> u32 {
+        self.inner.write_batch_blocks(block_size_bytes)
+    }
+
+    fn requested_write_batch_blocks(&self) -> u32 {
+        self.inner.requested_write_batch_blocks()
+    }
+
+    fn legacy_single_block(&self) -> bool {
+        self.inner.legacy_single_block()
+    }
+
+    fn position_check_bytes(&self) -> u64 {
+        self.inner.position_check_bytes()
     }
 
     fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
@@ -1244,6 +1475,33 @@ impl<'a, S: BlockSink + ?Sized> BlockSink for CountingBlockSink<'a, S> {
         self.stats
             .record_block(u64::from(outcome.bytes_written), outcome.early_warning);
         Ok(outcome)
+    }
+
+    fn write_block_batch(
+        &mut self,
+        buf: &[u8],
+        block_size_bytes: u32,
+    ) -> Result<WriteBatchOutcome, TapeIoError> {
+        let outcome = self.inner.write_block_batch(buf, block_size_bytes)?;
+        self.stats
+            .record_block(u64::from(outcome.bytes_written), outcome.early_warning);
+        Ok(outcome)
+    }
+
+    fn write_batch_blocks(&self, block_size_bytes: u32) -> u32 {
+        self.inner.write_batch_blocks(block_size_bytes)
+    }
+
+    fn requested_write_batch_blocks(&self) -> u32 {
+        self.inner.requested_write_batch_blocks()
+    }
+
+    fn legacy_single_block(&self) -> bool {
+        self.inner.legacy_single_block()
+    }
+
+    fn position_check_bytes(&self) -> u64 {
+        self.inner.position_check_bytes()
     }
 
     fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
@@ -1279,11 +1537,12 @@ fn write_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
     let block_size = selected.block_size;
     let transfer_started = Instant::now();
     let write_report: Result<StreamingObjectWriteReport, PoolWriteError> = (|| {
-        let mut raw = BlockSinkRawTapeSink::new(sink);
+        let mut batched = BatchingBlockSink::new(sink, block_size as usize);
+        let mut raw = BlockSinkRawTapeSink::new(&mut batched);
         let mut parity =
             ParitySink::new_sidecar_only(&mut raw, scheme.clone(), tape_uuid, block_size)?;
         parity.write_bootstrap()?;
-        match &stored {
+        let report = match &stored {
             PreparedStoredObject::Plaintext => Ok(write_prepared_object_to_parity(
                 &mut parity,
                 tape_uuid,
@@ -1303,7 +1562,9 @@ fn write_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
                 &scheme,
                 block_size,
             ),
-        }
+        }?;
+        batched.flush_pending()?;
+        Ok(report)
     })();
     let transfer_elapsed = transfer_started.elapsed();
     let write_report = match write_report {
@@ -1325,6 +1586,12 @@ fn write_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
         }
         Err(err) => {
             let error = err.to_string();
+            record_tape_io_fence_for_transfer_error(
+                state,
+                &selected,
+                tape_io_fence_reason_for_transfer_error(&error),
+                &error,
+            )?;
             log_transfer_diagnostics(
                 &request,
                 &selected,
@@ -1397,24 +1664,25 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
     let append = no_parity_append_context(state, &selected)?;
     let transfer_started = Instant::now();
     let write_report: Result<StreamingObjectWriteReport, PoolWriteError> = (|| {
+        let mut batched = BatchingBlockSink::new(sink, selected.block_size as usize);
         if append.fresh_tape {
             write_no_parity_bootstrap(
-                sink,
+                &mut batched,
                 tape_uuid,
                 selected.block_size,
                 &prepared.write_timestamp,
             )?;
         } else {
-            position_no_parity_append(sink)?;
+            position_no_parity_append(&mut batched)?;
         }
-        match &stored {
+        let report = match &stored {
             PreparedStoredObject::Plaintext => {
                 let mut readers = open_prepared_readers(&prepared.files)?;
                 let mut streams = Vec::with_capacity(prepared.files.len());
                 for (file, reader) in prepared.files.iter().zip(readers.iter_mut()) {
                     streams.push(RemTarFileStream::new(file.spec.clone(), reader));
                 }
-                let mut object_sink = ObjectDigestBlockSink::new(sink);
+                let mut object_sink = ObjectDigestBlockSink::new(&mut batched);
                 let layout = write_rem_tar_object_from_readers(
                     &mut object_sink,
                     &prepared.options,
@@ -1422,7 +1690,7 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
                 )
                 .map_err(StreamingError::from)?;
                 let object_digest = object_sink.finish_digest();
-                let filemark_outcome = sink.write_filemarks(1)?;
+                let filemark_outcome = batched.write_filemarks(1)?;
                 no_parity_write_report(
                     tape_uuid,
                     &prepared,
@@ -1433,8 +1701,8 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
                 )
             }
             PreparedStoredObject::Encrypted(encrypted) => {
-                write_fixed_blocks(sink, prepared.options.chunk_size, &encrypted.sealed)?;
-                let filemark_outcome = sink.write_filemarks(1)?;
+                write_fixed_blocks(&mut batched, prepared.options.chunk_size, &encrypted.sealed)?;
+                let filemark_outcome = batched.write_filemarks(1)?;
                 no_parity_encrypted_write_report(
                     tape_uuid,
                     &prepared,
@@ -1443,7 +1711,9 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
                     append,
                 )
             }
-        }
+        }?;
+        batched.flush_pending()?;
+        Ok(report)
     })();
     let transfer_elapsed = transfer_started.elapsed();
     let write_report = match write_report {
@@ -1465,6 +1735,12 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
         }
         Err(err) => {
             let error = err.to_string();
+            record_tape_io_fence_for_transfer_error(
+                state,
+                &selected,
+                tape_io_fence_reason_for_transfer_error(&error),
+                &error,
+            )?;
             log_transfer_diagnostics(
                 &request,
                 &selected,
@@ -1522,6 +1798,49 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
         stored.copy_representation(),
         write_report,
     ))
+}
+
+fn record_tape_io_fence_for_transfer_error(
+    state: &mut CatalogIndex,
+    selected: &SelectedTape,
+    reason: &str,
+    error: &str,
+) -> Result<(), PoolWriteError> {
+    let barcode = state
+        .get_tape(&selected.tape_uuid)?
+        .and_then(|tape| tape.voltag);
+    let evidence = format!(
+        "{{\"pool_id\":\"{}\",\"tape_uuid\":\"{}\",\"error\":\"{}\"}}",
+        json_escape(selected.pool_id.as_str()),
+        uuid_text(selected.tape_uuid),
+        json_escape(error),
+    );
+    state.record_tape_io_fence(remanence_state::TapeIoFenceInput {
+        tape_uuid: selected.tape_uuid,
+        barcode,
+        reason: reason.to_string(),
+        evidence_json: Some(evidence),
+    })?;
+    Ok(())
+}
+
+fn tape_io_fence_reason_for_transfer_error(error: &str) -> &'static str {
+    if error.contains("partial fixed batch uncommittable") {
+        "partial_batch"
+    } else if error.contains("position drift") {
+        "position_drift"
+    } else {
+        "transfer_error"
+    }
+}
+
+fn json_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }
 
 struct CommitPoolWriteProjection {
@@ -1908,8 +2227,15 @@ fn log_transfer_diagnostics(
         filemarks = outcome.stats.filemarks,
         position_calls = outcome.stats.position_calls,
         early_warning = outcome.stats.early_warning,
-        scsi_write_cdb = "WRITE6_VARIABLE",
-        drive_write_per_block_read_position = true,
+        scsi_write_cdb = if outcome.stats.legacy_single_block {
+            "WRITE6_VARIABLE"
+        } else {
+            "WRITE6_FIXED_BATCH"
+        },
+        legacy_single_block = outcome.stats.legacy_single_block,
+        write_batch_blocks = outcome.stats.write_batch_blocks,
+        effective_batch_blocks = outcome.stats.effective_batch_blocks,
+        position_check_bytes = outcome.stats.position_check_bytes,
         write_filemarks_immed = false,
         elapsed_ms = crate::diagnostics::duration_ms(outcome.elapsed),
         throughput_mib_s = crate::diagnostics::mib_per_s(payload_bytes, outcome.elapsed),
@@ -2669,6 +2995,14 @@ fn ensure_selected_tape_accepts_write(
     let tape = state.get_tape(&selected.tape_uuid)?.ok_or_else(|| {
         PoolWriteError::MissingTapeGeometry("selected tape row is missing".into())
     })?;
+    let conflicts =
+        state.tape_io_admission_conflicts(&selected.tape_uuid, tape.voltag.as_deref())?;
+    if let Some(conflict) = conflicts.first() {
+        return Err(PoolWriteError::InvalidInput(format!(
+            "selected tape is blocked by active tape-I/O fence {}: {}",
+            conflict.quarantine_id, conflict.reason
+        )));
+    }
     let tape_block_size = tape_block_size(&tape)
         .map_err(|err| PoolWriteError::MissingTapeGeometry(err.to_string()))?;
     if tape_block_size != u64::from(selected.block_size) {

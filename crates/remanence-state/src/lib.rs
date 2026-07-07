@@ -30,7 +30,7 @@ pub use config::{
     validate_config, validate_tape_pool_capacity_invariant, validate_trusted_volume_paths,
     watermark_floor_bytes, AuditConfig, CacheConfig, CleaningConfig, DaemonConfig, DaemonTlsConfig,
     DrivesConfig, IndexConfig, JournalConfig, LibraryConfig, LiveStatusConfig,
-    PoolSelectionPolicyName, RemConfig, TapePoolConfig, TapePoolRuleConfig,
+    PoolSelectionPolicyName, RemConfig, TapeIoConfig, TapePoolConfig, TapePoolRuleConfig,
     DEFAULT_TAPE_BLOCK_SIZE_BYTES,
 };
 pub use error::StateError;
@@ -43,8 +43,8 @@ pub use index::{
     NativeObjectFileProjectionInput, NativeObjectFileRecord, NativeObjectProjectionInput,
     NativeObjectRecord, OperationRecord, ProvisionTapeInput, RebuildReport,
     RebuildTapeJournalInput, RestartOperation, RestartSession, RetireDriveOutcome, RetireTapeInput,
-    RetireTapeOutcome, TapeFileRecord, TapeJournalIndexInput, TapeJournalIndexReport,
-    TapeKindFilter, TapePoolProjectionInput, TapePoolRecord, TapeRecord,
+    RetireTapeOutcome, TapeFileRecord, TapeIoFenceInput, TapeIoFenceRecord, TapeJournalIndexInput,
+    TapeJournalIndexReport, TapeKindFilter, TapePoolProjectionInput, TapePoolRecord, TapeRecord,
     OBJECT_COPY_REPRESENTATION_ENCRYPTED, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
     OBJECT_COPY_REPRESENTATION_UNKNOWN, SCHEMA_VERSION,
 };

@@ -30,7 +30,7 @@ use remanence_state::{
     CatalogUnitRecord, DriveCorrelationRollupRecord, DriveHealthSnapshotInput, FileAuditLog,
     MediaReadinessOperationRecord, MediaReadinessTransitionInput, NativeObjectCopyRecord,
     NativeObjectFileRecord, NativeObjectRecord, OperationRecord, RemConfig, SourceLayer,
-    StateError, TapeFileRecord, TapePoolConfig, TapePoolRecord, TapeRecord,
+    StateError, TapeFileRecord, TapeIoConfig, TapePoolConfig, TapePoolRecord, TapeRecord,
 };
 use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
@@ -95,6 +95,34 @@ pub use tape_init::{
 const CATALOG_STREAM_BUFFER: usize = 32;
 type BytesChunkStream =
     Pin<Box<dyn Stream<Item = Result<pb::BytesChunk, Status>> + Send + 'static>>;
+
+fn tape_io_runtime_config(config: &TapeIoConfig) -> remanence_library::TapeIoRuntimeConfig {
+    remanence_library::TapeIoRuntimeConfig {
+        legacy_single_block: config.legacy_single_block,
+        write_batch_blocks: config.write_batch_blocks,
+        read_batch_blocks: config.read_batch_blocks,
+        position_check_bytes: config.position_check_bytes,
+    }
+}
+
+fn reject_active_tape_io_fences_on_startup(index: &CatalogIndex) -> Result<(), Status> {
+    let tape_io_fences = index
+        .list_active_tape_io_fences()
+        .map_err(status_from_state_error)?;
+    if let Some(first) = tape_io_fences.first() {
+        return Err(Status::failed_precondition(format!(
+            "startup blocked by active tape-I/O fence {} tape_uuid={} barcode={} reason={}; release via `rem tape quarantine release {}` before retrying",
+            first.quarantine_id,
+            Uuid::from_slice(first.tape_uuid.as_slice())
+                .map(|uuid| uuid.to_string())
+                .unwrap_or_else(|_| bytes_to_hex(first.tape_uuid.as_slice())),
+            first.barcode.as_deref().unwrap_or("(unknown)"),
+            first.reason,
+            first.quarantine_id,
+        )));
+    }
+    Ok(())
+}
 
 struct CountingBytesStream {
     inner: BytesChunkStream,
@@ -361,9 +389,11 @@ impl ApiState {
                 continue;
             }
             let bay_addr = bay.element_address;
-            let drive = library.open_drive(bay_addr, &policy).map_err(|err| {
-                Status::internal(format!("open drive bay 0x{bay_addr:04x}: {err}"))
-            })?;
+            let drive = library
+                .open_drive_with_tape_io(bay_addr, &policy, tape_io_runtime_config(&config.tape_io))
+                .map_err(|err| {
+                    Status::internal(format!("open drive bay 0x{bay_addr:04x}: {err}"))
+                })?;
             opened_drives.push((bay_addr, drive));
         }
         reconcile_library_media_readiness_on_startup(
@@ -371,6 +401,7 @@ impl ApiState {
             library.library(),
             &mut opened_drives,
         )?;
+        reject_active_tape_io_fences_on_startup(&index)?;
         if opened_drives.is_empty() {
             return Err(Status::failed_precondition(
                 "configured library has no openable drives",
@@ -398,6 +429,7 @@ impl ApiState {
             snapshot_miss_alarm: config.drives.snapshot_miss_alarm,
             managed_library_serials: Arc::new(managed_library_serials),
             cleaning: config.cleaning.clone(),
+            tape_io: config.tape_io.clone(),
         };
         let mut drive_txs = HashMap::new();
         for (bay_addr, drive) in opened_drives {
@@ -3985,7 +4017,7 @@ mod tests {
     use remanence_library::{
         BlockSink, DiscoveryReport, DriveBay, ElementLayout, IdentitySource, IePort,
         InstalledDrive, Library, Slot, TapeIoError, TapePosition, VecBlockSink, VecBlockSource,
-        WriteFilemarksOutcome, WriteOutcome,
+        WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
     };
     use remanence_parity::bootstrap::{
         parse_bootstrap_block, write_bootstrap_block, BootstrapPayload,
@@ -5844,6 +5876,183 @@ BCw3Wyv2UWY=
         }
     }
 
+    #[derive(Debug)]
+    struct BatchedVecSink {
+        inner: VecBlockSink,
+        batch_blocks: u32,
+        batch_calls: u64,
+    }
+
+    impl BatchedVecSink {
+        fn new(batch_blocks: u32) -> Self {
+            assert!(batch_blocks > 1, "test batch size must exercise batching");
+            Self {
+                inner: VecBlockSink::new(),
+                batch_blocks,
+                batch_calls: 0,
+            }
+        }
+    }
+
+    impl BlockSink for BatchedVecSink {
+        fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
+            self.inner.write_block(buf)
+        }
+
+        fn write_block_batch(
+            &mut self,
+            buf: &[u8],
+            block_size_bytes: u32,
+        ) -> Result<WriteBatchOutcome, TapeIoError> {
+            self.batch_calls = self.batch_calls.saturating_add(1);
+            self.inner.write_block_batch(buf, block_size_bytes)
+        }
+
+        fn write_batch_blocks(&self, _block_size_bytes: u32) -> u32 {
+            self.batch_blocks
+        }
+
+        fn requested_write_batch_blocks(&self) -> u32 {
+            self.batch_blocks
+        }
+
+        fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
+            self.inner.write_filemarks(count)
+        }
+
+        fn position(&mut self) -> Result<TapePosition, TapeIoError> {
+            self.inner.position()
+        }
+    }
+
+    /// Test sink that reports one partial fixed batch after the bootstrap has
+    /// been written, modeling an object body that cannot be committed.
+    #[derive(Debug)]
+    struct PartialBatchSink {
+        inner: VecBlockSink,
+        batch_blocks: u32,
+        partial_records: u32,
+        injected: bool,
+    }
+
+    impl PartialBatchSink {
+        fn new(batch_blocks: u32, partial_records: u32) -> Self {
+            assert!(batch_blocks > 1, "test batch size must exercise batching");
+            assert!(
+                partial_records > 0 && partial_records < batch_blocks,
+                "partial batch must write a nonzero prefix"
+            );
+            Self {
+                inner: VecBlockSink::new(),
+                batch_blocks,
+                partial_records,
+                injected: false,
+            }
+        }
+    }
+
+    impl BlockSink for PartialBatchSink {
+        fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
+            self.inner.write_block(buf)
+        }
+
+        fn write_block_batch(
+            &mut self,
+            buf: &[u8],
+            block_size_bytes: u32,
+        ) -> Result<WriteBatchOutcome, TapeIoError> {
+            let block_size = usize::try_from(block_size_bytes).expect("test block size fits usize");
+            assert_eq!(
+                buf.len() % block_size,
+                0,
+                "test batch buffer must contain whole records"
+            );
+            let records = u32::try_from(buf.len() / block_size).expect("test record count fits");
+            if !self.injected && records > self.partial_records {
+                self.injected = true;
+                let partial_len =
+                    usize::try_from(self.partial_records).expect("partial count fits") * block_size;
+                return self
+                    .inner
+                    .write_block_batch(&buf[..partial_len], block_size_bytes);
+            }
+            self.inner.write_block_batch(buf, block_size_bytes)
+        }
+
+        fn write_batch_blocks(&self, _block_size_bytes: u32) -> u32 {
+            self.batch_blocks
+        }
+
+        fn requested_write_batch_blocks(&self) -> u32 {
+            self.batch_blocks
+        }
+
+        fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
+            self.inner.write_filemarks(count)
+        }
+
+        fn position(&mut self) -> Result<TapePosition, TapeIoError> {
+            self.inner.position()
+        }
+    }
+
+    #[derive(Debug)]
+    struct PositionDriftBatchSink {
+        inner: VecBlockSink,
+        batch_blocks: u32,
+        injected: bool,
+    }
+
+    impl PositionDriftBatchSink {
+        fn new(batch_blocks: u32) -> Self {
+            assert!(batch_blocks > 1, "test batch size must exercise batching");
+            Self {
+                inner: VecBlockSink::new(),
+                batch_blocks,
+                injected: false,
+            }
+        }
+    }
+
+    impl BlockSink for PositionDriftBatchSink {
+        fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
+            self.inner.write_block(buf)
+        }
+
+        fn write_block_batch(
+            &mut self,
+            buf: &[u8],
+            block_size_bytes: u32,
+        ) -> Result<WriteBatchOutcome, TapeIoError> {
+            let block_size = usize::try_from(block_size_bytes).expect("test block size fits usize");
+            let records = u32::try_from(buf.len() / block_size).expect("test record count fits");
+            if !self.injected && records > 1 {
+                self.injected = true;
+                return Err(TapeIoError::OperationFailed(
+                    "position drift: expected_partition=0 expected_lba=11 device_partition=0 device_lba=12"
+                        .to_string(),
+                ));
+            }
+            self.inner.write_block_batch(buf, block_size_bytes)
+        }
+
+        fn write_batch_blocks(&self, _block_size_bytes: u32) -> u32 {
+            self.batch_blocks
+        }
+
+        fn requested_write_batch_blocks(&self) -> u32 {
+            self.batch_blocks
+        }
+
+        fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
+            self.inner.write_filemarks(count)
+        }
+
+        fn position(&mut self) -> Result<TapePosition, TapeIoError> {
+            self.inner.position()
+        }
+    }
+
     fn assert_no_pool_write_catalog_reference(
         index: &CatalogIndex,
         caller_object_id: &str,
@@ -5905,6 +6114,74 @@ BCw3Wyv2UWY=
         assert_eq!(selected.tape_uuid, POOL_WRITE_TAPE_UUID);
         assert_eq!(selected.block_size, API_SESSION_BLOCK_SIZE);
         assert!(matches!(selected.parity_config, ParityConfig::None));
+    }
+
+    #[test]
+    fn tape_io_fence_refuses_pool_selection_until_operator_release() {
+        let mut index = test_index();
+        project_pool(&mut index, "camera.copy-a");
+        project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
+        let fence = index
+            .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+                tape_uuid: POOL_WRITE_TAPE_UUID,
+                barcode: Some("RMN004L9".to_string()),
+                reason: "partial_batch".to_string(),
+                evidence_json: Some("{\"written_records\":2}".to_string()),
+            })
+            .expect("record active tape-I/O fence");
+
+        let cfg = pool_config("camera.copy-a");
+        let err = select_tape_in_pool(&index, &cfg, 123, &HashSet::new())
+            .expect_err("active tape-I/O fence must block selection");
+        match err {
+            SelectTapeError::NoWritableTapes { pool_id, reasons } => {
+                assert_eq!(pool_id, "camera.copy-a");
+                assert!(
+                    reasons.iter().any(|reason| matches!(
+                        reason,
+                        WritabilityError::TapeIoFence {
+                            quarantine_id,
+                            reason,
+                        } if quarantine_id == &fence.quarantine_id && reason == "partial_batch"
+                    )),
+                    "{reasons:?}"
+                );
+            }
+            other => panic!("unexpected selection error: {other}"),
+        }
+
+        index
+            .release_tape_io_fence(&fence.quarantine_id, "operator released")
+            .expect("release active tape-I/O fence")
+            .expect("released fence");
+        let selected = select_tape_in_pool(&index, &cfg, 123, &HashSet::new())
+            .expect("selection after release");
+        assert_eq!(selected.tape_uuid, POOL_WRITE_TAPE_UUID);
+    }
+
+    #[test]
+    fn startup_refuses_active_tape_io_fence_until_operator_release() {
+        let mut index = test_index();
+        let fence = index
+            .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+                tape_uuid: POOL_WRITE_TAPE_UUID,
+                barcode: Some("RMN004L9".to_string()),
+                reason: "position_drift".to_string(),
+                evidence_json: Some("{\"expected_lba\":9,\"device_lba\":8}".to_string()),
+            })
+            .expect("record startup fence");
+
+        let status = reject_active_tape_io_fences_on_startup(&index)
+            .expect_err("active tape-I/O fence must block startup");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains(&fence.quarantine_id));
+        assert!(status.message().contains("position_drift"));
+
+        index
+            .release_tape_io_fence(&fence.quarantine_id, "operator released")
+            .expect("release startup fence")
+            .expect("released fence");
+        reject_active_tape_io_fences_on_startup(&index).expect("startup after release");
     }
 
     #[test]
@@ -6345,6 +6622,213 @@ BCw3Wyv2UWY=
         assert_eq!(committed.copies.len(), 1);
         assert_eq!(committed.copies[0].first_parity_data_ordinal, None);
         assert_eq!(committed.copies[0].protected_until_ordinal, None);
+    }
+
+    #[test]
+    fn no_parity_stored_images_cross_read_between_serial_and_batched_paths() {
+        let source_dir = temp_dir("remanence-api-cross-version-src");
+        let source_path = source_dir.join("payload.bin");
+        let payload = (0..(API_SESSION_BLOCK_SIZE as usize * 6 + 123))
+            .map(|value| u8::try_from(value % 251).unwrap())
+            .collect::<Vec<_>>();
+        std::fs::write(&source_path, &payload).expect("write source payload");
+        let cfg = pool_config("scenario-a");
+
+        let mut batched_index = test_index();
+        project_pool(&mut batched_index, "scenario-a");
+        project_no_parity_tape(&mut batched_index, "scenario-a", POOL_WRITE_TAPE_UUID);
+        let mut batched_sink = BatchedVecSink::new(4);
+        let batched = write_object_to_pool(
+            &mut batched_index,
+            &mut batched_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source_path: source_path.clone(),
+                archive_path: "payload.bin".into(),
+                caller_object_id: "caller-batched-image".to_string(),
+                expected_content_sha256: None,
+                representation: PoolWriteRepresentation::Plaintext,
+            },
+        )
+        .expect("write batched image");
+        assert!(
+            batched_sink.batch_calls > 0,
+            "test must exercise write_block_batch"
+        );
+        let batched_block_count =
+            usize::try_from(batched.expect_write_report().object_close.data_block_count)
+                .expect("batched block count fits usize");
+        let mut old_reader =
+            VecBlockSource::new(batched_sink.inner.blocks[1..1 + batched_block_count].to_vec());
+        let old_read = read_rem_tar_object(
+            &mut old_reader,
+            API_SESSION_BLOCK_SIZE as usize,
+            batched.expect_write_report().layout.projected_size_blocks,
+        )
+        .expect("old single-block reader reads batched image");
+        assert_eq!(
+            old_read
+                .entry("payload.bin")
+                .expect("payload entry")
+                .data
+                .as_slice(),
+            payload.as_slice()
+        );
+
+        let mut serial_index = test_index();
+        project_pool(&mut serial_index, "scenario-a");
+        project_no_parity_tape(&mut serial_index, "scenario-a", POOL_WRITE_TAPE_UUID);
+        let mut serial_sink = VecBlockSink::new();
+        let serial = write_object_to_pool(
+            &mut serial_index,
+            &mut serial_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source_path,
+                archive_path: "payload.bin".into(),
+                caller_object_id: "caller-serial-image".to_string(),
+                expected_content_sha256: None,
+                representation: PoolWriteRepresentation::Plaintext,
+            },
+        )
+        .expect("write serial image");
+        let serial_block_count =
+            usize::try_from(serial.expect_write_report().object_close.data_block_count)
+                .expect("serial block count fits usize");
+        let mut batched_reader =
+            VecBlockSource::new(serial_sink.blocks[1..1 + serial_block_count].to_vec())
+                .with_read_batch_blocks_for_test(4);
+        let mut restored = Vec::new();
+        let mut capture = crate::read_core::CapturePayloadSink::new(&mut restored);
+        crate::read_core::read_object_payload(
+            &mut batched_reader,
+            API_SESSION_BLOCK_SIZE as usize,
+            serial.expect_write_report().layout.projected_size_blocks,
+            0,
+            None,
+            &mut capture,
+        )
+        .expect("new batched reader reads serial image");
+        let (bytes_written, _digest) = capture.finish().expect("finish capture");
+        assert_eq!(bytes_written, payload.len() as u64);
+        assert_eq!(restored, payload);
+        assert!(
+            batched_reader.calls.iter().any(|call| matches!(
+                call,
+                remanence_library::VecBlockSourceCall::ReadBlockBatch {
+                    requested_records,
+                    ..
+                } if *requested_records > 1
+            )),
+            "test must exercise read_block_batch: {:?}",
+            batched_reader.calls
+        );
+    }
+
+    #[test]
+    fn partial_batched_no_parity_write_is_uncommittable_and_fences_tape() {
+        let mut index = test_index();
+        project_pool(&mut index, "scenario-a");
+        project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
+        let source_dir = temp_dir("remanence-api-partial-batch-src");
+        let source_path = source_dir.join("payload.bin");
+        let payload = vec![0xA5; API_SESSION_BLOCK_SIZE as usize * 8];
+        std::fs::write(&source_path, &payload).expect("write source payload");
+        let mut tape_sink = PartialBatchSink::new(4, 2);
+        let cfg = pool_config("scenario-a");
+
+        let err = write_object_to_pool(
+            &mut index,
+            &mut tape_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source_path,
+                archive_path: "payload.bin".into(),
+                caller_object_id: "caller-partial-batch".to_string(),
+                expected_content_sha256: None,
+                representation: PoolWriteRepresentation::Plaintext,
+            },
+        )
+        .expect_err("partial batch must fail the write");
+
+        assert!(
+            err.to_string()
+                .contains("partial fixed batch uncommittable"),
+            "{err}"
+        );
+        assert_eq!(
+            tape_sink.inner.filemarks,
+            vec![1],
+            "bootstrap filemark is allowed; object-closing filemark must not be written"
+        );
+        assert_no_pool_write_catalog_reference(
+            &index,
+            "caller-partial-batch",
+            POOL_WRITE_TAPE_UUID,
+        );
+        let fences = index
+            .tape_io_admission_conflicts(&POOL_WRITE_TAPE_UUID, Some("RMN004L9"))
+            .expect("active partial-batch fence");
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].reason, "partial_batch");
+        assert!(
+            fences[0]
+                .evidence_json
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains("partial fixed batch uncommittable")),
+            "{fences:?}"
+        );
+    }
+
+    #[test]
+    fn position_drift_during_batched_write_fences_with_position_evidence() {
+        let mut index = test_index();
+        project_pool(&mut index, "scenario-a");
+        project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
+        let source_dir = temp_dir("remanence-api-position-drift-src");
+        let source_path = source_dir.join("payload.bin");
+        let payload = vec![0x5A; API_SESSION_BLOCK_SIZE as usize * 4];
+        std::fs::write(&source_path, &payload).expect("write source payload");
+        let mut tape_sink = PositionDriftBatchSink::new(4);
+        let cfg = pool_config("scenario-a");
+
+        let err = write_object_to_pool(
+            &mut index,
+            &mut tape_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source_path,
+                archive_path: "payload.bin".into(),
+                caller_object_id: "caller-position-drift".to_string(),
+                expected_content_sha256: None,
+                representation: PoolWriteRepresentation::Plaintext,
+            },
+        )
+        .expect_err("position drift must fail the write");
+
+        assert!(err.to_string().contains("position drift"), "{err}");
+        assert_eq!(
+            tape_sink.inner.filemarks,
+            vec![1],
+            "object-closing filemark must not be written after drift"
+        );
+        assert_no_pool_write_catalog_reference(
+            &index,
+            "caller-position-drift",
+            POOL_WRITE_TAPE_UUID,
+        );
+        let fences = index
+            .tape_io_admission_conflicts(&POOL_WRITE_TAPE_UUID, Some("RMN004L9"))
+            .expect("active drift fence");
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].reason, "position_drift");
+        let evidence = fences[0].evidence_json.as_deref().expect("drift evidence");
+        assert!(evidence.contains("expected_lba=11"), "{evidence}");
+        assert!(evidence.contains("device_lba=12"), "{evidence}");
     }
 
     #[test]

@@ -15,7 +15,7 @@ use remanence_format::{
     plan_plaintext_rao_file_range, stream_rem_tar_object_with_manifest_anchor, FormatError,
     RemTarEntrySink, RemTarStreamEntry,
 };
-use remanence_library::{BlockSource, SpaceKind};
+use remanence_library::{BlockSource, SpaceKind, SpaceResult, TapeIoError, TapePosition};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tonic::Status;
@@ -40,8 +40,9 @@ pub fn read_object_payload(
     sink: &mut dyn RemTarEntrySink,
 ) -> Result<(), FormatError> {
     source.space(i64::from(tape_file_number), SpaceKind::Filemarks)?;
+    let mut batched_source = BatchingBlockSource::new(source, block_size, block_count)?;
     stream_rem_tar_object_with_manifest_anchor(
-        source,
+        &mut batched_source,
         block_size,
         block_count,
         sink,
@@ -92,12 +93,14 @@ pub fn read_plaintext_file_range(
         source.space(skip_blocks, SpaceKind::Blocks)?;
     }
 
+    let mut batched_source =
+        BatchingBlockSource::new(source, request.block_size, plan.block_count)?;
     let mut block = vec![0u8; request.block_size];
     let first_block_offset = usize::try_from(plan.first_block_offset)
         .map_err(|_| FormatError::invalid("range first block offset does not fit usize"))?;
     let mut remaining = plan.range_len;
     for block_index in 0..plan.block_count {
-        let read = source.read_block(&mut block)?;
+        let read = batched_source.read_block(&mut block)?;
         if read != request.block_size {
             return Err(FormatError::parse(format!(
                 "short range object block: expected {}, got {read}",
@@ -135,6 +138,167 @@ pub fn read_plaintext_file_range(
         source,
     })?;
     Ok(())
+}
+
+struct BatchingBlockSource<'a> {
+    inner: &'a mut dyn BlockSource,
+    block_size: usize,
+    remaining_records: u64,
+    buffer: Vec<u8>,
+    buffered_records: u32,
+    next_record: u32,
+}
+
+impl<'a> BatchingBlockSource<'a> {
+    fn new(
+        inner: &'a mut dyn BlockSource,
+        block_size: usize,
+        remaining_records: u64,
+    ) -> Result<Self, FormatError> {
+        if block_size == 0 {
+            return Err(FormatError::invalid("block size must be nonzero"));
+        }
+        Ok(Self {
+            inner,
+            block_size,
+            remaining_records,
+            buffer: Vec::new(),
+            buffered_records: 0,
+            next_record: 0,
+        })
+    }
+
+    fn refill(&mut self) -> Result<(), TapeIoError> {
+        if self.next_record < self.buffered_records {
+            return Ok(());
+        }
+        self.buffer.clear();
+        self.buffered_records = 0;
+        self.next_record = 0;
+        if self.remaining_records == 0 {
+            return Ok(());
+        }
+        if self.inner.legacy_single_block() {
+            self.buffer.resize(self.block_size, 0);
+            let bytes_read = self.inner.read_block(&mut self.buffer)?;
+            if bytes_read != self.block_size {
+                return Err(TapeIoError::OperationFailed(format!(
+                    "legacy read returned unexpected block size: expected {} got {bytes_read}",
+                    self.block_size
+                )));
+            }
+            self.buffer.truncate(bytes_read);
+            self.buffered_records = 1;
+            self.remaining_records = self.remaining_records.checked_sub(1).ok_or_else(|| {
+                TapeIoError::OperationFailed("legacy read remaining underflow".to_string())
+            })?;
+            return Ok(());
+        }
+        let block_size_bytes = u32::try_from(self.block_size).map_err(|_| {
+            TapeIoError::OperationFailed("read batch block size exceeds u32".to_string())
+        })?;
+        let requested = self
+            .inner
+            .read_batch_blocks(block_size_bytes)
+            .max(1)
+            .min(u32::try_from(self.remaining_records).unwrap_or(u32::MAX));
+        let remaining_u32 = u32::try_from(self.remaining_records).unwrap_or(u32::MAX);
+        let alloc_records = requested.min(remaining_u32).max(1);
+        let alloc_bytes = self
+            .block_size
+            .checked_mul(alloc_records as usize)
+            .ok_or_else(|| {
+                TapeIoError::OperationFailed("read batch buffer overflow".to_string())
+            })?;
+        self.buffer.resize(alloc_bytes, 0);
+        let outcome = self.inner.read_block_batch(
+            &mut self.buffer,
+            block_size_bytes,
+            requested,
+            remaining_u32,
+        )?;
+        if outcome.filemark || outcome.records_read == 0 {
+            return Err(TapeIoError::OperationFailed(format!(
+                "fixed read batch stopped before object boundary: records_read={} filemark={}",
+                outcome.records_read, outcome.filemark
+            )));
+        }
+        let bytes = (outcome.records_read as usize)
+            .checked_mul(self.block_size)
+            .ok_or_else(|| {
+                TapeIoError::OperationFailed("read batch byte count overflow".to_string())
+            })?;
+        self.buffer.truncate(bytes);
+        self.buffered_records = outcome.records_read;
+        self.remaining_records = self
+            .remaining_records
+            .checked_sub(u64::from(outcome.records_read))
+            .ok_or_else(|| {
+                TapeIoError::OperationFailed("read batch remaining underflow".to_string())
+            })?;
+        Ok(())
+    }
+}
+
+impl BlockSource for BatchingBlockSource<'_> {
+    fn read_block(&mut self, buf: &mut [u8]) -> Result<usize, TapeIoError> {
+        self.refill()?;
+        if self.next_record >= self.buffered_records {
+            return self.inner.read_block(buf);
+        }
+        if buf.len() < self.block_size {
+            return Err(TapeIoError::ReadBufferTooSmall {
+                actual: self.block_size as u32,
+                provided: buf.len() as u32,
+            });
+        }
+        let start = self.next_record as usize * self.block_size;
+        let end = start + self.block_size;
+        buf[..self.block_size].copy_from_slice(&self.buffer[start..end]);
+        self.next_record += 1;
+        Ok(self.block_size)
+    }
+
+    fn read_block_batch(
+        &mut self,
+        buf: &mut [u8],
+        block_size_bytes: u32,
+        requested_records: u32,
+        remaining_records_in_file: u32,
+    ) -> Result<remanence_library::ReadBatchOutcome, TapeIoError> {
+        self.inner.read_block_batch(
+            buf,
+            block_size_bytes,
+            requested_records,
+            remaining_records_in_file,
+        )
+    }
+
+    fn read_batch_blocks(&self, block_size_bytes: u32) -> u32 {
+        self.inner.read_batch_blocks(block_size_bytes)
+    }
+
+    fn legacy_single_block(&self) -> bool {
+        self.inner.legacy_single_block()
+    }
+
+    fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
+        self.buffer.clear();
+        self.buffered_records = 0;
+        self.next_record = 0;
+        self.inner.locate(lba)
+    }
+
+    fn space(&mut self, count: i64, kind: SpaceKind) -> Result<SpaceResult, TapeIoError> {
+        self.buffer.clear();
+        self.buffered_records = 0;
+        self.next_record = 0;
+        self.inner.space(count, kind)
+    }
+
+    fn position(&mut self) -> Result<TapePosition, TapeIoError> {
+        self.inner.position()
+    }
 }
 
 /// Streaming sink that captures the single non-manifest payload entry.
@@ -322,7 +486,7 @@ mod tests {
         write_rem_tar_object, RemTarEntrySink, RemTarEntryType, RemTarFile, RemTarObjectOptions,
         RemTarStreamEntry,
     };
-    use remanence_library::{VecBlockSink, VecBlockSource};
+    use remanence_library::{VecBlockSink, VecBlockSource, VecBlockSourceCall};
     use sha2::{Digest, Sha256};
 
     use super::*;
@@ -489,6 +653,105 @@ mod tests {
         assert_eq!(payload, b"hello from tape");
         let expected: [u8; 32] = Sha256::digest(b"hello from tape").into();
         assert_eq!(digest, expected);
+    }
+
+    #[test]
+    fn read_object_payload_refills_with_batched_reads() {
+        let opts = options(512);
+        let payload = (0..7000)
+            .map(|value| u8::try_from(value % 251).unwrap())
+            .collect::<Vec<_>>();
+        let files = [RemTarFile {
+            path: "payload.bin",
+            file_id: "file-payload",
+            data: payload.as_slice(),
+            mtime: Some("0"),
+            executable: Some(false),
+        }];
+        let mut block_sink = VecBlockSink::new();
+        let layout = write_rem_tar_object(&mut block_sink, &opts, &files).unwrap();
+        let mut source = VecBlockSource::new(block_sink.blocks).with_read_batch_blocks_for_test(4);
+        let mut restored = Vec::new();
+        let mut sink = CapturePayloadSink::new(&mut restored);
+
+        read_object_payload(
+            &mut source,
+            opts.chunk_size,
+            layout.projected_size_blocks,
+            0,
+            None,
+            &mut sink,
+        )
+        .unwrap();
+
+        let (bytes_written, digest) = sink.finish().unwrap();
+        assert_eq!(bytes_written, payload.len() as u64);
+        assert_eq!(restored, payload);
+        let expected: [u8; 32] = Sha256::digest(&payload).into();
+        assert_eq!(digest, expected);
+        assert!(
+            source.calls.iter().any(|call| matches!(
+                call,
+                VecBlockSourceCall::ReadBlockBatch {
+                    requested_records,
+                    ..
+                } if *requested_records > 1
+            )),
+            "read core must use the batched BlockSource primitive: {:?}",
+            source.calls
+        );
+    }
+
+    #[test]
+    fn read_object_payload_legacy_mode_uses_single_block_reads() {
+        let opts = options(512);
+        let payload = (0..3000)
+            .map(|value| u8::try_from(value % 251).unwrap())
+            .collect::<Vec<_>>();
+        let files = [RemTarFile {
+            path: "payload.bin",
+            file_id: "file-payload",
+            data: payload.as_slice(),
+            mtime: Some("0"),
+            executable: Some(false),
+        }];
+        let mut block_sink = VecBlockSink::new();
+        let layout = write_rem_tar_object(&mut block_sink, &opts, &files).unwrap();
+        let mut source = VecBlockSource::new(block_sink.blocks)
+            .with_read_batch_blocks_for_test(4)
+            .with_legacy_single_block_for_test();
+        let mut restored = Vec::new();
+        let mut sink = CapturePayloadSink::new(&mut restored);
+
+        read_object_payload(
+            &mut source,
+            opts.chunk_size,
+            layout.projected_size_blocks,
+            0,
+            None,
+            &mut sink,
+        )
+        .unwrap();
+
+        let (bytes_written, _digest) = sink.finish().unwrap();
+        assert_eq!(bytes_written, payload.len() as u64);
+        assert_eq!(restored, payload);
+        assert!(
+            source
+                .calls
+                .iter()
+                .any(|call| matches!(call, VecBlockSourceCall::ReadBlock { .. })),
+            "legacy fallback must issue read_block calls: {:?}",
+            source.calls
+        );
+        assert!(
+            !source
+                .calls
+                .iter()
+                .any(|call| matches!(call, VecBlockSourceCall::ReadBlockBatch { .. })),
+            "legacy fallback must not issue read_block_batch calls: {:?}",
+            source.calls
+        );
     }
 
     #[test]
