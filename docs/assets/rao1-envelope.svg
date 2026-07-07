@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="156" viewBox="0 0 760 156" role="img" aria-label="RAO1 encrypted envelope in stream order: 128-byte plaintext header, encrypted metadata frame, ciphertext chunks each with a 16-byte tag, a flagged last chunk, the plaintext footer RAO1_STREAM_END., then zero fill to a chunk multiple">
+  <rect width="100%" height="100%" fill="#fcfcfc"/>
+  <style>
+    .rs { fill: #fff8f0; stroke: #a45200; }
+    .rsd { fill: #fcfcfc; stroke: #a45200; stroke-dasharray: 3 3; }
+    .rt { font: 11px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #17191b; }
+    .rtd { font: 10px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #9a9a9a; }
+    .rta { font: 9px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #a45200; letter-spacing: .18em; }
+  </style>
+  <text class="rta" x="20" y="24">ONE ENCRYPTED OBJECT — STREAM ORDER →</text>
+  <rect class="rs" x="20" y="34" width="92" height="44"/>
+  <text class="rt" x="66" y="53" text-anchor="middle">header</text>
+  <text class="rtd" x="66" y="68" text-anchor="middle">128 B · plaintext</text>
+  <rect class="rsd" x="112" y="34" width="112" height="44"/>
+  <text class="rt" x="168" y="53" text-anchor="middle">metadata frame</text>
+  <text class="rtd" x="168" y="68" text-anchor="middle">authenticated</text>
+  <rect class="rsd" x="224" y="34" width="108" height="44"/>
+  <text class="rt" x="278" y="53" text-anchor="middle">chunk 0</text>
+  <text class="rtd" x="278" y="68" text-anchor="middle">ciphertext + 16 B tag</text>
+  <rect class="rsd" x="332" y="34" width="76" height="44"/>
+  <text class="rt" x="370" y="53" text-anchor="middle">chunk 1</text>
+  <text class="rtd" x="423" y="58" text-anchor="middle">· · ·</text>
+  <rect class="rsd" x="438" y="34" width="96" height="44"/>
+  <text class="rt" x="486" y="53" text-anchor="middle">last chunk</text>
+  <text class="rtd" x="486" y="68" text-anchor="middle">nonce-flagged</text>
+  <rect class="rs" x="534" y="34" width="114" height="44"/>
+  <text class="rt" x="591" y="53" text-anchor="middle">footer</text>
+  <text class="rtd" x="591" y="68" text-anchor="middle">RAO1_STREAM_END.</text>
+  <rect class="rs" x="648" y="34" width="92" height="44"/>
+  <text class="rt" x="694" y="53" text-anchor="middle">zero fill</text>
+  <text class="rtd" x="694" y="68" text-anchor="middle">to chunk multiple</text>
+  <rect class="rs" x="20" y="94" width="16" height="12"/>
+  <text class="rtd" x="42" y="104">plaintext</text>
+  <rect class="rsd" x="120" y="94" width="16" height="12"/>
+  <text class="rtd" x="142" y="104">ciphertext — ChaCha20-Poly1305</text>
+  <text class="rtd" x="20" y="130">chunk nonces count up and the final byte flags the last chunk, so truncation is always detectable</text>
+  <text class="rtd" x="20" y="146">keys derive from a 32-byte root key via HKDF-SHA-256; the header names the key by id — no key material is ever stored</text>
+</svg>

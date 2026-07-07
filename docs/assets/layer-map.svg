@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="412" viewBox="0 0 760 412" role="img" aria-label="Remanence workspace crate map: layer 5 cli, api, and daemon over layer 4 state over layer 3 format, aead, parity, and format-driver over layer 2 library over layer 1 scsi, with the format-free platform seam between layers 3 and 2">
+  <rect width="100%" height="100%" fill="#fcfcfc"/>
+  <style>
+    .rs { fill: #fff8f0; stroke: #a45200; }
+    .gs { fill: #fcfcfc; stroke: #17191b; }
+    .rt { font: 11px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #17191b; }
+    .rtd { font: 10px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #9a9a9a; }
+    .rtg { font: 9px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #9a9a9a; letter-spacing: .18em; }
+    .rl { stroke: #9a9a9a; stroke-width: 1; fill: none; }
+    .rld { stroke: #9a9a9a; stroke-width: 1; fill: none; stroke-dasharray: 3 3; }
+  </style>
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0L10,5L0,10z" fill="#9a9a9a"/></marker></defs>
+  <text class="rtg" x="20" y="24">WORKSPACE CRATES — EACH LAYER KNOWS ONLY THE ONE BELOW</text>
+  <text class="rtg" x="20" y="62">LAYER 5</text>
+  <rect class="gs" x="100" y="36" width="180" height="44"/>
+  <text class="rt" x="190" y="55" text-anchor="middle">remanence-cli</text>
+  <text class="rtd" x="190" y="70" text-anchor="middle">rem · rem-debug</text>
+  <rect class="gs" x="290" y="36" width="250" height="44"/>
+  <text class="rt" x="415" y="55" text-anchor="middle">remanence-api</text>
+  <text class="rtd" x="415" y="70" text-anchor="middle">gRPC services · drive actors</text>
+  <rect class="gs" x="550" y="36" width="190" height="44"/>
+  <text class="rt" x="645" y="55" text-anchor="middle">remanence-daemon</text>
+  <text class="rtd" x="645" y="70" text-anchor="middle">service host</text>
+  <line class="rl" x1="420" y1="82" x2="420" y2="96" marker-end="url(#ah)"/>
+  <text class="rtg" x="20" y="124">LAYER 4</text>
+  <rect class="gs" x="100" y="98" width="640" height="44"/>
+  <text class="rt" x="420" y="117" text-anchor="middle">remanence-state</text>
+  <text class="rtd" x="420" y="132" text-anchor="middle">config · state lock · audit log · SQLite catalog — a rebuildable projection</text>
+  <line class="rl" x1="420" y1="144" x2="420" y2="158" marker-end="url(#ah)"/>
+  <text class="rtg" x="20" y="186">LAYER 3</text>
+  <rect class="rs" x="100" y="160" width="150" height="44"/>
+  <text class="rt" x="175" y="179" text-anchor="middle">remanence-format</text>
+  <text class="rtd" x="175" y="194" text-anchor="middle">rao-v1 body</text>
+  <rect class="rs" x="258" y="160" width="130" height="44"/>
+  <text class="rt" x="323" y="179" text-anchor="middle">remanence-aead</text>
+  <text class="rtd" x="323" y="194" text-anchor="middle">RAO1 envelope</text>
+  <rect class="rs" x="396" y="160" width="170" height="44"/>
+  <text class="rt" x="481" y="179" text-anchor="middle">remanence-parity</text>
+  <text class="rtd" x="481" y="194" text-anchor="middle">bootstrap · filemarks · RS parity</text>
+  <rect class="gs" x="574" y="160" width="166" height="44"/>
+  <text class="rt" x="657" y="179" text-anchor="middle">remanence-format-driver</text>
+  <text class="rtd" x="657" y="194" text-anchor="middle">driver traits</text>
+  <line class="rl" x1="420" y1="206" x2="420" y2="244" marker-end="url(#ah)"/>
+  <line class="rld" x1="20" y1="228" x2="740" y2="228"/>
+  <text class="rtg" x="740" y="222" text-anchor="end">PLATFORM SEAM — FORMAT-FREE BELOW</text>
+  <text class="rtg" x="20" y="272">LAYER 2</text>
+  <rect class="gs" x="100" y="246" width="640" height="44"/>
+  <text class="rt" x="420" y="265" text-anchor="middle">remanence-library</text>
+  <text class="rtd" x="420" y="280" text-anchor="middle">discovery · identity · policy-gated handles · robotics · drive tape I/O (3a)</text>
+  <line class="rl" x1="420" y1="292" x2="420" y2="306" marker-end="url(#ah)"/>
+  <text class="rtg" x="20" y="334">LAYER 1</text>
+  <rect class="gs" x="100" y="308" width="640" height="44"/>
+  <text class="rt" x="420" y="327" text-anchor="middle">remanence-scsi</text>
+  <text class="rtd" x="420" y="342" text-anchor="middle">CDB construction · SG_IO transport · response parsing</text>
+  <text class="rtd" x="20" y="372">amber: the crates that define the bytes on tape. format and parity are siblings — neither depends on the other;</text>
+  <text class="rtd" x="20" y="388">both write tape through layer 2's BlockSink / BlockSource traits, composed above by remanence-stream and the daemon.</text>
+  <text class="rtd" x="20" y="404">also at layer 3: remanence-stream (restore composition), remanence-bru (feature-gated legacy reader), remanence-crc (CRC-64/XZ).</text>
+</svg>

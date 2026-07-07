@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="250" viewBox="0 0 760 250" role="img" aria-label="Layer 5 topology: orchestrator, rem, and rem-debug talk gRPC to rem-daemon, which runs default-deny authorization and one actor per mounted drive; actors drive the drive and changer inside the tape library, and rem-debug also has a direct SCSI break-glass path gated by an allowlist">
+  <rect width="100%" height="100%" fill="#fcfcfc"/>
+  <style>
+    .rs { fill: #fff8f0; stroke: #a45200; }
+    .gs { fill: #fcfcfc; stroke: #17191b; }
+    .gh { fill: none; stroke: #e8e8e8; }
+    .rt { font: 11px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #17191b; }
+    .rtd { font: 10px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #9a9a9a; }
+    .rtg { font: 9px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #9a9a9a; letter-spacing: .18em; }
+    .rl { stroke: #9a9a9a; stroke-width: 1; fill: none; }
+    .rld { stroke: #9a9a9a; stroke-width: 1; fill: none; stroke-dasharray: 3 3; }
+  </style>
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0L10,5L0,10z" fill="#9a9a9a"/></marker></defs>
+  <text class="rtg" x="20" y="24">LAYER 5 TOPOLOGY — CLIENTS, DAEMON, HARDWARE</text>
+  <rect class="gs" x="20" y="36" width="118" height="40"/>
+  <text class="rt" x="79" y="52" text-anchor="middle">orchestrator</text>
+  <text class="rtd" x="79" y="67" text-anchor="middle">gRPC client</text>
+  <rect class="gs" x="20" y="88" width="118" height="40"/>
+  <text class="rt" x="79" y="104" text-anchor="middle">rem</text>
+  <text class="rtd" x="79" y="119" text-anchor="middle">operator CLI</text>
+  <rect class="gs" x="20" y="140" width="118" height="40"/>
+  <text class="rt" x="79" y="156" text-anchor="middle">rem-debug</text>
+  <text class="rtd" x="79" y="171" text-anchor="middle">break-glass CLI</text>
+  <line class="rl" x1="138" y1="56" x2="246" y2="66" marker-end="url(#ah)"/>
+  <line class="rl" x1="138" y1="108" x2="246" y2="100" marker-end="url(#ah)"/>
+  <line class="rl" x1="138" y1="152" x2="246" y2="134" marker-end="url(#ah)"/>
+  <text class="rtd" x="193" y="92" text-anchor="middle">gRPC</text>
+  <rect class="gs" x="248" y="36" width="210" height="144"/>
+  <text class="rt" x="353" y="56" text-anchor="middle">rem-daemon</text>
+  <rect class="gs" x="264" y="68" width="178" height="28"/>
+  <text class="rt" x="353" y="86" text-anchor="middle">default-deny authorization</text>
+  <rect class="gs" x="264" y="108" width="178" height="56"/>
+  <text class="rt" x="353" y="126" text-anchor="middle">drive actors</text>
+  <text class="rtd" x="353" y="141" text-anchor="middle">one per mounted drive</text>
+  <text class="rtd" x="353" y="155" text-anchor="middle">sessions · robotics · reads</text>
+  <rect class="gh" x="500" y="36" width="240" height="144"/>
+  <text class="rtg" x="620" y="52" text-anchor="middle">TAPE LIBRARY</text>
+  <rect class="gs" x="516" y="64" width="96" height="34"/>
+  <text class="rt" x="564" y="85" text-anchor="middle">drive</text>
+  <rect class="gs" x="516" y="130" width="96" height="34"/>
+  <text class="rt" x="564" y="151" text-anchor="middle">changer</text>
+  <rect class="rs" x="632" y="64" width="94" height="34"/>
+  <text class="rt" x="679" y="85" text-anchor="middle">cartridge</text>
+  <line class="rl" x1="442" y1="120" x2="514" y2="84" marker-end="url(#ah)"/>
+  <line class="rl" x1="442" y1="147" x2="514" y2="147" marker-end="url(#ah)"/>
+  <line class="rl" x1="612" y1="81" x2="630" y2="81" marker-end="url(#ah)"/>
+  <polyline class="rld" points="79,180 79,204 566,204 566,184" marker-end="url(#ah)"/>
+  <text class="rtd" x="100" y="198">direct SCSI — every mutating command must name --allow &lt;SERIAL&gt;</text>
+  <text class="rtd" x="20" y="228">transports: the unix socket at &lt;state_dir&gt;/rem.sock (peer-uid gated) and an optional mTLS TCP listener; the CLI default is unix:/var/lib/rem/rem.sock</text>
+  <text class="rtd" x="20" y="244">one actor task per mounted drive owns that drive's handle — hardware access is serial per drive, parallel across drives</text>
+</svg>
