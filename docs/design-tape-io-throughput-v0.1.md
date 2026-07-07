@@ -1,6 +1,9 @@
 # Tape I/O throughput — multi-block SCSI I/O, boundary position proofs, staged overlap — Design v0.2
 
-**Status:** panel folded (2026-07-07) — verify round pending.
+**Status:** **FROZEN v0.2** — panel folded + verify round PASS (2026-07-07,
+fresh codex: no new blockers/majors; 3 minors folded below — tmpfs policy
+pinned to refusal, §9 units normalized, DevicePositionProof newtype named).
+Prompt set: `prompt-tio-{1,2,3,4}.md`.
 **Panel 2026-07-07:** 4 blind lenses (SCSI/SSC = Opus, failure-modes = codex,
 cost/efficiency = Opus, general = GLM 5.2/OpenRouter): 2 blockers, 11 unique
 majors, 9 minors, 4 nits; dispositions in
@@ -201,12 +204,14 @@ established. This also covers field tapes written at non-default block sizes.
   any ambiguity. Re-seed points (all carry device-proven positions today):
   transfer start, `SPACE(EOD)` before append positioning, `locate`, `space`,
   `rewind`, and after any EW/EOM READ POSITION.
-- A shared **`PositionProof { lba, source: DeviceRead | Computed }`** rides
-  every position-bearing outcome (`WriteOutcome`, `WriteFilemarksOutcome`,
-  locate/space results). The layer-5 append-commit record can only be
-  constructed from `DeviceRead` proofs — enforced by type, so a computed
-  position can never reach the journal. The post-filemark proof the layer-5
-  design requires stays a real device read.
+- Position values are split into two distinct types (not a runtime flag):
+  **`DevicePositionProof(lba)`**, constructible only from a real READ
+  POSITION result, and **`ComputedPosition(lba)`** for arithmetic values.
+  Every position-bearing outcome (`WriteOutcome`, `WriteFilemarksOutcome`,
+  locate/space results) carries whichever it truly has; the layer-5
+  append-commit constructor accepts **only `DevicePositionProof`**, so a
+  computed position cannot reach the journal by construction. The
+  post-filemark proof the layer-5 design requires stays a real device read.
 - Drift tripwire: every `tape_io.position_check_bytes` (default 1 GiB), one
   READ POSITION mid-stream; mismatch ⇒ poison session + durable tape fence +
   evidence with both positions. A poisoned session invalidates the entire
@@ -261,10 +266,12 @@ Chaos coverage asserts each row (model transport + kill injection).
   fast spool is the **wear-safe** configuration, not merely fast: feed below
   the ~100–112 MB/s speed-matching floor keeps the drive back-hitching.
 - **tmpfs RAM budget**: when `spool_dir` resolves to tmpfs, reconcile the
-  spool budget (`SPOOL_MAX_BYTES`) against available RAM and refuse (or
-  overflow to a configured disk path) beyond a RAM budget — a 64 GiB
+  spool budget (`SPOOL_MAX_BYTES`) against available RAM and **refuse** the
+  append with a cause-bearing status beyond the RAM budget — a 64 GiB
   byte-budget on tmpfs can otherwise OOM the daemon under concurrent large
-  objects. Loss remains write-failure-only, never corruption.
+  objects. (v0.2 policy is refusal, fail-closed; an overflow-to-disk path is
+  explicitly deferred — no such config key exists.) Loss remains
+  write-failure-only, never corruption.
 - `create_private_spool_dir`: detect symlinks; a dangling symlink produces
   an explicit error naming link and target (the field failure surfaced as an
   opaque "File exists"). Concurrent spool-file creation is already safe
@@ -359,9 +366,12 @@ Hermetic (model transport / chaos):
 
 Physical (next MSL3040 window), acceptance split by spool placement:
 
-- root-disk spool: ≥200 MB/s sustained write expected ~230; tmpfs spool:
-  target 250–300 and read ≥250; diag shows `effective_batch_blocks` = 16
-  (not silently clamped) and position_calls ≈ boundaries + tripwires.
+- root-disk spool: gate ≥200 MB/s (≈191 MiB/s) sustained write, expected
+  ~235 MB/s (≈223 MiB/s, the spool read ceiling); tmpfs spool: target
+  250–300 MB/s (≈238–286 MiB/s) write and ≥250 MB/s read; diag shows
+  `effective_batch_blocks` = 16 (not silently clamped) and position_calls ≈
+  boundaries + tripwires. All §9 targets are stated in MB/s (SI) with MiB/s
+  conversions parenthesized.
 - batch sweep {8,16,32,64} on `20-bench-write.sh`.
 - `13-append-loop.sh` both modes; per-object latency split recorded.
 
