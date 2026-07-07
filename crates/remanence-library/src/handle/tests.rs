@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity)]
+
 use super::*;
 use crate::error::{AuditOp, AuditOutcome, RescanError};
 use crate::handle::tape_io::{MediaFamily, MediaReadiness};
