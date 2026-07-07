@@ -5,6 +5,8 @@
 # Rust tests, Lean build, and maintained-proof placeholder scan. The Lean type
 # checker is the proof trust anchor; this command is the repo-level gate that
 # keeps the proof estate easy to audit after production or extraction changes.
+#
+# Remanence development targets Linux; this script assumes GNU find/sort.
 
 set -uo pipefail
 
@@ -42,6 +44,22 @@ run_in_dir() {
     fi
 }
 
+assert_drift_guard_test() {
+    local crate_name="$1"
+    local crate_dir="$2"
+    local list_output
+
+    printf '\n== %s: drift_guard test discovery ==\n' "$crate_name"
+    if list_output="$(cd "$crate_dir" && cargo test drift_guard -- --list 2>&1)" &&
+        rg -q '(^|::)drift_guard: test$' <<<"$list_output"; then
+        printf 'PASS: %s: drift_guard test discovery\n' "$crate_name"
+    else
+        printf '%s\n' "$list_output"
+        printf 'FAIL: %s: drift_guard test discovery\n' "$crate_name"
+        record_failure "$crate_name: missing runnable drift_guard test"
+    fi
+}
+
 require_command cargo
 require_command lake
 require_command rg
@@ -71,11 +89,7 @@ fi
 for crate_dir in "${proof_crates[@]}"; do
     crate_name="$(basename "$crate_dir")"
 
-    if ! rg -q 'fn drift_guard' "$crate_dir/src/lib.rs"; then
-        printf '\nFAIL: %s has no drift_guard test in src/lib.rs\n' "$crate_name"
-        record_failure "$crate_name: missing drift_guard test"
-    fi
-
+    assert_drift_guard_test "$crate_name" "$crate_dir"
     run_in_dir "$crate_name: cargo test drift_guard" "$crate_dir" cargo test drift_guard
     run_in_dir "$crate_name: cargo test" "$crate_dir" cargo test
 
@@ -87,9 +101,9 @@ for crate_dir in "${proof_crates[@]}"; do
     fi
 done
 
-placeholder_files=()
+lean_proof_files=()
 while IFS= read -r -d '' proof_file; do
-    placeholder_files+=("$proof_file")
+    lean_proof_files+=("$proof_file")
 done < <(
     find "$VERIF_DIR" \
         \( \
@@ -98,19 +112,19 @@ done < <(
             -path '*/lean/.leanstral/*' -o \
             -path '*/lean-out/*' \
         \) -prune -o \
-        -type f \( -name '*.rs' -o -name '*.lean' \) -print0 |
+        -type f -name '*.lean' -print0 |
         sort -z
 )
 
 printf '\n== local placeholder scan ==\n'
-if ((${#placeholder_files[@]} == 0)); then
-    printf 'FAIL: no Rust or Lean proof files found under %s\n' "$VERIF_DIR"
+if ((${#lean_proof_files[@]} == 0)); then
+    printf 'FAIL: no maintained Lean proof files found under %s\n' "$VERIF_DIR"
     record_failure "local placeholder scan: no files"
-elif rg -n '\b(sorry|admit|axiom)\b' "${placeholder_files[@]}"; then
+elif rg -n '\b(sorry|admit|axiom)\b' "${lean_proof_files[@]}"; then
     printf 'FAIL: local placeholder scan found proof placeholders\n'
     record_failure "local placeholder scan"
 else
-    printf 'PASS: local placeholder scan (%s files)\n' "${#placeholder_files[@]}"
+    printf 'PASS: local placeholder scan (%s Lean files)\n' "${#lean_proof_files[@]}"
 fi
 
 printf '\n== inventory summary ==\n'

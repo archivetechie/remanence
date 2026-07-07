@@ -77,10 +77,11 @@ make proof-inventory
 This discovers each proof crate and runs:
 
 ```text
+cargo test drift_guard -- --list
 cargo test drift_guard
 cargo test
 lake build
-maintained Rust/Lean placeholder scan
+maintained Lean placeholder scan
 ```
 
 The current proof areas are:
