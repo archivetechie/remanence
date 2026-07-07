@@ -1,5 +1,16 @@
 # Why Remanence?
 
+<!-- code-anchor: none -->
+> **Status note (2026-07-07).** This document's *reasoning* still holds,
+> but its implementation-status remarks predate Layers 3–5: the on-tape
+> format, parity, catalog, audit log, and daemon described below as
+> "specified but not built" have since been implemented (the body format
+> shipped as `rao-v1` rather than the working names used here), and
+> `spec-v0.3.md` has been superseded. For what exists today, see the
+> [README](../README.md) and the
+> [architecture overview](architecture-overview.md); this file is kept
+> as the positioning record.
+
 A short positioning document. If you are choosing between Remanence and
 another way of putting data on LTO tape, this explains the trade-offs
 in operator-grade terms — not a marketing pitch, not a spec. The
