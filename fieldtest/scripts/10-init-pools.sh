@@ -243,12 +243,17 @@ init_output_bay() {
 }
 
 unload_dry_run_bay_or_stop() {
-  local barcode="$1" path="$2" serial="$3" bay
+  local barcode="$1" path="$2" serial="$3" bay out
   bay="$(init_output_bay "$path")"
   if [[ -z "$bay" ]]; then
     return 0
   fi
-  if ! "$(fieldtest_rem_debug_bin)" --allow "$serial" unload --bay "$bay" "$serial" >/dev/null 2>&1; then
+  # rem's dry-run drains the bay itself since the append-session refresh;
+  # an already-empty source element means the drain happened, not a failure.
+  if ! out="$("$(fieldtest_rem_debug_bin)" --allow "$serial" unload --bay "$bay" "$serial" 2>&1)"; then
+    if grep -q "source element ${bay} is empty" <<<"$out"; then
+      return 0
+    fi
     fieldtest_evidence_record "$SCRIPT_NAME" "init-${barcode}" FAIL "dry-run loaded ${barcode} into bay ${bay} but unload failed; stopping before real init to avoid stale slot/source state" "$path"
     exit 1
   fi
