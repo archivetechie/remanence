@@ -127,3 +127,14 @@ way the observed cap sits far below both.
 
 Morning batch sweep (batch 1/2/4 at fixed bytes) remains the final confirmation:
 flat ms/command ⇒ HBA-bound (expected); sub-linear growth ⇒ daemon slack too.
+
+**Addendum 2 — Miria AER log finds (same night):** the datamover's Atempo bundle
+contains (a) an event log wall of "Default ACL not supported" errors — the defect
+behind their silently-misrouted production jobs (Recycler incident), captured in
+the vendor's own diagnostics; (b) Media Manager logs with ~8.2k error lines
+(10% of the log), dominated by "SCSI command failed, SCSI driver failure (08h)"
+polling **drive 8031BDC7D1 — a rem-partition drive**: Miria's config registers all
+four drives across both partitions. Caveat: Debug-level poll failures, possibly
+reservation/busy. Coexistence ask for central IT: scope Miria's drive registration
+to their partition. No throughput data exists in Miria's logs (MM does not log
+rates); the email-reported tests remain the throughput record.
