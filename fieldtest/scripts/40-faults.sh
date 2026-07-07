@@ -63,8 +63,8 @@ write_fixture_object() {
   local source="$workdir/source.bin" object="$workdir/object.rao" locator="$workdir/locator.json"
   mkdir -p "$workdir"
   make_payload "$source" "$size_bytes"
-  fieldtest_capture_json "$workdir/build.json" "$(fieldtest_rem_bin)" archive build --inputs "$source" --out "$object"
-  fieldtest_capture_io_json "$locator" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$(fieldtest_selected_library_serial)" --file "$object" --pool "$pool"
+  fieldtest_capture_json "$workdir/build.json" "$(fieldtest_rem_bin)" archive build --inputs "$source" --out "$object" >&2
+  fieldtest_capture_io_json "$locator" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$(fieldtest_selected_library_serial)" --file "$object" --pool "$pool" >&2
   printf '%s\n' "$source|$object|$locator"
 }
 
