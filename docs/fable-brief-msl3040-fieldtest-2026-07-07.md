@@ -160,32 +160,42 @@ readiness, closing, unloading, or writing filemarks.
 
 ### 5.3 Append loop
 
-The current `13-append-loop.sh` run started with:
+`13-append-loop.sh` completed successfully on the physical MSL3040:
 
 ```text
 [PASS] 13-append-loop media-budget: found 2 appendable ready tape(s) in fieldtest-a for append loop
-[INFO] 13-append-loop io-readiness-83b38535: daemon I/O blocked by media-readiness fence; waiting and retrying (1/3)
-[PASS] 13-append-loop wait-ready-83b38535: media ready after daemon I/O fence
-[INFO] 13-append-loop io-readiness-99dcebd4: daemon I/O blocked by media-readiness fence; waiting and retrying (1/3)
-[PASS] 13-append-loop wait-ready-99dcebd4: media ready after daemon I/O fence
-[INFO] 13-append-loop io-readiness-ce615db6: daemon I/O blocked by media-readiness fence; waiting and retrying (1/3)
-[PASS] 13-append-loop wait-ready-ce615db6: media ready after daemon I/O fence
-[INFO] 13-append-loop io-readiness-ef8c35a7: daemon I/O blocked by media-readiness fence; waiting and retrying (1/3)
-[PASS] 13-append-loop wait-ready-ef8c35a7: media ready after daemon I/O fence
-[INFO] 13-append-loop io-readiness-d232d8f5: daemon I/O blocked by media-readiness fence; waiting and retrying (1/3)
+[PASS] 13-append-loop dense-files: wrote 6 objects to one tape with dense tape-file numbers
+[PASS] 13-append-loop fidelity-0: append-loop object 0 restored with matching SHA-256
+[PASS] 13-append-loop fidelity-1: append-loop object 1 restored with matching SHA-256
+[PASS] 13-append-loop fidelity-2: append-loop object 2 restored with matching SHA-256
+[PASS] 13-append-loop fidelity-3: append-loop object 3 restored with matching SHA-256
+[PASS] 13-append-loop fidelity-4: append-loop object 4 restored with matching SHA-256
+[PASS] 13-append-loop fidelity-5: append-loop object 5 restored with matching SHA-256
+[PASS] 13-append-loop summary: append loop completed: 6 objects, 64 MiB each, pool fieldtest-a
 ```
 
-Operator observations during this append-loop run:
+This is the strongest physical result in the session so far for the
+multi-object append design: six independent 64 MiB objects were appended to one
+tape with dense tape-file numbers, and every object was restored with matching
+SHA-256.
+
+Operator observations during the append-loop run:
 
 - output lines arrived slowly;
 - `rem top` showed a drive as busy;
 - MB/s barely moved during long periods;
-- the wait-ready artifacts appeared to succeed on the first readiness attempt;
+- every write and every read appeared to hit a media-readiness fence before
+  succeeding;
+- the wait-ready artifacts appeared to succeed on the first readiness attempt,
+  so this looked more like repeated short settle/poll overhead than a long
+  calibration window;
 - the operator asked whether these delays will affect normal tape read/write
   operations.
 
 Current interpretation:
 
+- Correctness is good: same-tape dense append and read-back fidelity both
+  passed on physical LTO-9.
 - `13-append-loop.sh` intentionally stresses repeated independent object writes.
   On physical media the default is multiple small-ish objects, not one sustained
   stream.
