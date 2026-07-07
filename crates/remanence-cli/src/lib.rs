@@ -91,9 +91,10 @@ const DEFAULT_DAEMON_ENDPOINT: &str = "unix:/var/lib/rem/rem.sock";
 const DEFAULT_DEV_TAPE_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_SCSI_VARIABLE_WRITE_BYTES: usize = 0x00FF_FFFF;
 const MEDIA_CONDITIONING_TIMEOUT: StdDuration = StdDuration::from_secs(9_000);
-const MEDIA_CONDITIONING_INITIAL_POLL: StdDuration = StdDuration::from_secs(15);
+const MEDIA_CONDITIONING_FAST_POLL_1S_UNTIL: StdDuration = StdDuration::from_secs(5);
+const MEDIA_CONDITIONING_FAST_POLL_2S_UNTIL: StdDuration = StdDuration::from_secs(15);
+const MEDIA_CONDITIONING_FAST_POLL_5S_UNTIL: StdDuration = StdDuration::from_secs(60);
 const MEDIA_CONDITIONING_STEADY_POLL: StdDuration = StdDuration::from_secs(60);
-const MEDIA_CONDITIONING_INITIAL_WINDOW: StdDuration = StdDuration::from_secs(60);
 #[cfg(test)]
 const CONDITIONAL_LOAD_SETTLE: StdDuration = StdDuration::from_millis(0);
 #[cfg(not(test))]
@@ -6664,11 +6665,7 @@ fn poll_drive_media_readiness(
         if terminal || timed_out {
             return Ok(current);
         }
-        let sleep_for = if poll == MEDIA_CONDITIONING_STEADY_POLL {
-            media_conditioning_poll_interval(elapsed)
-        } else {
-            poll
-        };
+        let sleep_for = media_conditioning_poll_interval(elapsed, poll);
         let mut remaining = std::cmp::min(sleep_for, timeout - elapsed);
         while remaining > StdDuration::ZERO {
             if let Some(signal) = signal() {
@@ -6678,7 +6675,7 @@ fn poll_drive_media_readiness(
                 ));
             }
             let chunk = std::cmp::min(SIGNAL_SLEEP_SLICE, remaining);
-            std::thread::sleep(chunk);
+            media_readiness_sleep(chunk);
             remaining = remaining.saturating_sub(chunk);
         }
     }
@@ -6702,13 +6699,25 @@ fn terminalize_repeated_unit_attention(
 }
 
 #[cfg(target_os = "linux")]
-fn media_conditioning_poll_interval(elapsed: StdDuration) -> StdDuration {
-    if elapsed < MEDIA_CONDITIONING_INITIAL_WINDOW {
-        MEDIA_CONDITIONING_INITIAL_POLL
+fn media_conditioning_poll_interval(elapsed: StdDuration, steady_poll: StdDuration) -> StdDuration {
+    if elapsed < MEDIA_CONDITIONING_FAST_POLL_1S_UNTIL {
+        StdDuration::from_secs(1)
+    } else if elapsed < MEDIA_CONDITIONING_FAST_POLL_2S_UNTIL {
+        StdDuration::from_secs(2)
+    } else if elapsed < MEDIA_CONDITIONING_FAST_POLL_5S_UNTIL {
+        StdDuration::from_secs(5)
     } else {
-        MEDIA_CONDITIONING_STEADY_POLL
+        steady_poll
     }
 }
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn media_readiness_sleep(duration: StdDuration) {
+    std::thread::sleep(duration);
+}
+
+#[cfg(all(target_os = "linux", test))]
+fn media_readiness_sleep(_duration: StdDuration) {}
 
 #[cfg(target_os = "linux")]
 fn poll_already_observed_media_readiness(
@@ -6836,7 +6845,7 @@ fn poll_media_readiness_after_initial_probe<S: TapeInitStateOps>(
                 Some(0x1b),
                 None,
             ))?;
-            std::thread::sleep(CONDITIONAL_LOAD_SETTLE);
+            media_readiness_sleep(CONDITIONAL_LOAD_SETTLE);
             if let Err(error) = drive.load_immediate() {
                 if let Some(signal_name) = record_media_readiness_signal_or_mechanical_failure(
                     state,
@@ -6872,11 +6881,7 @@ fn poll_media_readiness_after_initial_probe<S: TapeInitStateOps>(
         }
 
         let elapsed = started.elapsed();
-        let sleep_for = if poll_interval == MEDIA_CONDITIONING_STEADY_POLL {
-            media_conditioning_poll_interval(elapsed)
-        } else {
-            poll_interval
-        };
+        let sleep_for = media_conditioning_poll_interval(elapsed, poll_interval);
         let mut remaining = std::cmp::min(sleep_for, timeout.saturating_sub(elapsed));
         while remaining > StdDuration::ZERO {
             if let Some(signal_name) = signal() {
@@ -6891,7 +6896,7 @@ fn poll_media_readiness_after_initial_probe<S: TapeInitStateOps>(
                 ));
             }
             let chunk = std::cmp::min(SIGNAL_SLEEP_SLICE, remaining);
-            std::thread::sleep(chunk);
+            media_readiness_sleep(chunk);
             remaining = remaining.saturating_sub(chunk);
         }
     }
@@ -12931,6 +12936,23 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn simulated_media_readiness_probe_schedule(
+        ready_at: StdDuration,
+        steady_poll: StdDuration,
+    ) -> Vec<StdDuration> {
+        let mut elapsed = StdDuration::ZERO;
+        let mut schedule = Vec::new();
+        loop {
+            schedule.push(elapsed);
+            if elapsed >= ready_at {
+                break;
+            }
+            elapsed += media_conditioning_poll_interval(elapsed, steady_poll);
+        }
+        schedule
+    }
+
+    #[cfg(target_os = "linux")]
     struct TurSequenceTransport<T> {
         inner: T,
         tur_results: VecDeque<Result<(), ScsiError>>,
@@ -13017,7 +13039,7 @@ mod tests {
         drive_path: &Path,
         tur_results: Vec<Result<(), ScsiError>>,
     ) -> (remanence_library::LibraryHandle, DriveHandle, RecordingLog) {
-        let mut lib = fake_library(&lib_serial);
+        let mut lib = fake_library(lib_serial);
         lib.drive_bays = vec![DriveBay {
             element_address: 0x0100,
             accessible: true,
@@ -14177,6 +14199,62 @@ mod tests {
         assert_eq!(
             media_readiness_state_name(&MediaReadiness::Ready, true),
             "timeout_unknown"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn media_conditioning_poll_ramp_detects_short_settle_before_thirty_seconds() {
+        let schedule = simulated_media_readiness_probe_schedule(
+            StdDuration::from_secs(8),
+            StdDuration::from_secs(30),
+        );
+
+        assert_eq!(
+            schedule,
+            vec![
+                StdDuration::from_secs(0),
+                StdDuration::from_secs(1),
+                StdDuration::from_secs(2),
+                StdDuration::from_secs(3),
+                StdDuration::from_secs(4),
+                StdDuration::from_secs(5),
+                StdDuration::from_secs(7),
+                StdDuration::from_secs(9),
+            ]
+        );
+        assert!(
+            schedule.last().copied().unwrap() <= StdDuration::from_secs(10),
+            "ready-at-8s media must not wait for the 30s steady poll"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn media_conditioning_poll_ramp_uses_configured_steady_poll() {
+        let schedule = simulated_media_readiness_probe_schedule(
+            StdDuration::from_secs(130),
+            StdDuration::from_secs(17),
+        );
+        let steady_tail = schedule
+            .windows(2)
+            .filter(|window| window[0] >= StdDuration::from_secs(60))
+            .map(|window| window[1] - window[0])
+            .collect::<Vec<_>>();
+
+        assert!(!steady_tail.is_empty());
+        assert!(
+            steady_tail
+                .iter()
+                .all(|delta| *delta == StdDuration::from_secs(17)),
+            "steady-state deltas must respect --poll: {schedule:?}"
+        );
+        assert_eq!(
+            media_conditioning_poll_interval(
+                StdDuration::from_secs(60),
+                StdDuration::from_secs(17)
+            ),
+            StdDuration::from_secs(17)
         );
     }
 

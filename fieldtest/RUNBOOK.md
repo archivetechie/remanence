@@ -124,13 +124,20 @@ past a red gate.
 |---|---|---|
 | 1.1 | `11-happy-path.sh` | archive build → write → catalog → read → **SHA-256 fidelity** → restore, plaintext AND encrypted object |
 | 1.2 | `12-multiobject.sh` | many-object archive, manifests, ranged reads (partial restore without reading the whole object) |
-| 1.3 | `13-append-loop.sh` | repeated independent object writes to one pool; same tape UUID, dense tape-file numbers, read-back SHA-256 for every object |
+| 1.3 | `13-append-loop.sh --mode cycle` and `13-append-loop.sh --mode session` | repeated independent object writes to one pool; same tape UUID, dense tape-file numbers, read-back SHA-256 for every object |
+
+Run the append loop twice and compare the two summary records: `session`
+measures append-format behavior plus amortized throughput, while `cycle`
+measures full mount-cycle latency plus robotics stress.
 
 **GO gate:** happy-path reports `fidelity: PASS` for both objects.
 The Phase 1 scripts are LTO-9-readiness-aware for ordinary daemon I/O:
 if a write/read open returns a `media-readiness fence operation=...`, the
 script records `*-readiness-blocked-*`, waits on the operation, and retries.
-Terminal, timeout, or transport-unknown readiness results remain hard stops.
+Single readiness waits longer than `FIELD_READY_WARN_SECS` are marked in
+evidence and printed as warnings; waits longer than `FIELD_READY_FAIL_SECS`
+are hard stops. Terminal, timeout, or transport-unknown readiness results
+remain hard stops.
 **If blocked:** a single drive failing → continue on the other, note in
 evidence; catalog errors → capture `evidence/` + daemon log, then
 `91-cleanup.sh --state-only` and retry once from 1.1.
@@ -235,3 +242,13 @@ on. A refused unsafe operation is a PASS.
   overrides. All idempotent — rerunning is always safe.
 - Something inexplicable: `evidence/` + `~/remfield/log/` capture
   everything; grab them and continue with the next phase.
+
+### Environment knobs
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `FIELD_IO_READY_RETRIES` | `3` | daemon I/O fence retry count |
+| `FIELD_IO_READY_TIMEOUT` | `2.5h` | `wait-ready --timeout` used by daemon I/O fence retries |
+| `FIELD_IO_READY_POLL` | `30s` | steady-state `wait-ready --poll` used by daemon I/O fence retries |
+| `FIELD_READY_WARN_SECS` | `90` | mark a single fence wait with `readiness_warning=true` and print a warning above this duration |
+| `FIELD_READY_FAIL_SECS` | `900` | log `FAIL` and abort the daemon I/O retry loop above this duration |
