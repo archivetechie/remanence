@@ -124,7 +124,7 @@ privileged T0 commands personally; Claude proposes anything novel in chat first.
 ```bash
 sudo useradd -m -s /bin/bash remfield
 sudo install -d -m 700 -o remfield -g remfield /home/remfield/.ssh
-echo 'expiry-time="20260708T1200",from="127.0.0.1,::1",no-agent-forwarding,no-X11-forwarding,no-port-forwarding ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK41YCPTE5X7cYt5vZDVRTuM3e34W45blkWROeGUG9q4 claude-remfield-window-2026-07-07b' | sudo tee /home/remfield/.ssh/authorized_keys >/dev/null
+echo 'expiry-time="202607081200",from="127.0.0.1,::1",no-agent-forwarding,no-X11-forwarding,no-port-forwarding ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK41YCPTE5X7cYt5vZDVRTuM3e34W45blkWROeGUG9q4 claude-remfield-window-2026-07-07b' | sudo tee /home/remfield/.ssh/authorized_keys >/dev/null
 sudo chown remfield:remfield /home/remfield/.ssh/authorized_keys && sudo chmod 600 /home/remfield/.ssh/authorized_keys
 sudo -u remfield ssh-keygen -t ed25519 -f /home/remfield/.ssh/tunnel_akash -N '' -C 'remfield-tunnel-2026-07-07b'
 sudo cat /home/remfield/.ssh/tunnel_akash.pub   # ← paste THIS line back to Claude
@@ -135,7 +135,7 @@ sudo cat /home/remfield/.ssh/tunnel_akash.pub   # ← paste THIS line back to Cl
 Adds to `~/.ssh/authorized_keys` (restricted: forwarding only, port 2222, expiring):
 
 ```
-restrict,port-forwarding,permitlisten="2222",expiry-time="20260708T1200" <tunnel pubkey from step 1>
+restrict,port-forwarding,permitlisten="2222",expiry-time="202607081200" <tunnel pubkey from step 1>
 ```
 
 If the server's connection is refused, akash's `public_guard` nft table needs an
