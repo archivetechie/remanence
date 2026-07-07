@@ -947,6 +947,14 @@ fieldtest_run_with_lock() {
     "$@"
     return "$?"
   fi
+  # Re-entrancy guard: a fieldtest script invoked by another fieldtest script
+  # (e.g. 91-cleanup calling 03-bringup --stop) must not flock the work lock
+  # its parent already holds — that self-deadlocks (found live 2026-07-07).
+  # The child runs inside the parent's lock and shares its fence counters.
+  if [[ "${FIELDTEST_LOCK_HELD:-}" == 1 ]]; then
+    "$@"
+    return "$?"
+  fi
   lockfile="$(fieldtest_work_lock)"
   mkdir -p "$(dirname -- "$lockfile")"
   exec 9>"$lockfile"
@@ -956,6 +964,7 @@ fieldtest_run_with_lock() {
   fieldtest_init_fence_counters "$counters"
   set +e
   (
+    export FIELDTEST_LOCK_HELD=1
     export FIELDTEST_FENCE_COUNTERS_FILE="$counters"
     "$@"
   )
