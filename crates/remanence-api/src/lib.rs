@@ -36,7 +36,7 @@ use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio_stream::{wrappers::ReceiverStream, Stream};
+use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
 use tonic::transport::{Channel, Endpoint, Uri};
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -44,6 +44,9 @@ use uuid::Uuid;
 pub mod pb {
     tonic::include_proto!("remanence.api.v1");
 }
+
+/// Default maximum bytes admitted into one append spool reservation.
+pub const APPEND_SPOOL_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 /// Connect a gRPC channel to a Unix-socket daemon (Layer 5 dev transport).
 /// The URI authority is a placeholder ignored by the custom connector.
@@ -251,6 +254,7 @@ pub struct ApiState {
     managed_library_serials: Arc<HashSet<String>>,
     drive_pool: Option<crate::write_owner::DrivePool>,
     spool_dir: Option<Arc<PathBuf>>,
+    spool_budget_bytes: Option<u64>,
     spool_budget: Option<Arc<Semaphore>>,
     default_library_serial: Option<Arc<String>>,
     library_snapshot: Option<Arc<RwLock<Arc<LibrarySnapshot>>>>,
@@ -332,6 +336,7 @@ impl ApiState {
             managed_library_serials: Arc::new(managed_library_serials),
             drive_pool: None,
             spool_dir: None,
+            spool_budget_bytes: None,
             spool_budget: None,
             default_library_serial: None,
             library_snapshot: None,
@@ -350,6 +355,7 @@ impl ApiState {
         report: remanence_library::DiscoveryReport,
         policy: remanence_library::StaticAllowlist,
         spool_dir: PathBuf,
+        spool_budget_bytes: u64,
     ) -> Result<Self, Status> {
         let index_path = index.path().to_path_buf();
         let pool_configs: HashMap<String, TapePoolConfig> = config
@@ -454,9 +460,10 @@ impl ApiState {
         );
         state.drive_pool = Some(drive_pool.clone());
         state.spool_dir = Some(Arc::new(spool_dir));
-        state.spool_budget = Some(Arc::new(Semaphore::new(spool_budget_permits(
-            crate::write_owner::SPOOL_MAX_BYTES,
-        ) as usize)));
+        state.spool_budget_bytes = Some(spool_budget_bytes);
+        state.spool_budget = Some(Arc::new(Semaphore::new(
+            spool_budget_permits(spool_budget_bytes) as usize,
+        )));
         state.default_library_serial = default_library_serial;
         state.library_snapshot = Some(library_snapshot);
         state.reconcile_drive_catalog_from_report(config, &report)?;
@@ -784,6 +791,19 @@ impl ApiState {
     }
 
     async fn acquire_spool_budget(&self, cap_bytes: u64) -> Result<OwnedSemaphorePermit, Status> {
+        let budget_bytes = self
+            .spool_budget_bytes
+            .ok_or_else(|| Status::unavailable("daemon has no write spool (read-only mode)"))?;
+        if cap_bytes > budget_bytes {
+            let spool_dir = self
+                .spool_dir
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "(unconfigured)".to_string());
+            return Err(Status::resource_exhausted(format!(
+                "append spool request {cap_bytes} bytes exceeds effective daemon.spool_tmpfs_ram_budget {budget_bytes} bytes for {spool_dir}; overflow-to-disk is not implemented"
+            )));
+        }
         let permits = spool_budget_permits(cap_bytes);
         let budget = self
             .spool_budget
@@ -2008,12 +2028,102 @@ impl pb::write_session_service_server::WriteSessionService for WriteSessionApi {
         &self,
         request: Request<tonic::Streaming<pb::AppendObjectMessage>>,
     ) -> Result<Response<pb::ObjectRecord>, Status> {
+        let spool_dir = self.spool_dir_for_log();
+        let result = async {
+            authorize_request(&request, AuthPermission::Write)?;
+            self.append_object_stream(request.into_inner()).await
+        }
+        .await;
+        if let Err(status) = &result {
+            log_append_object_failure(spool_dir.as_str(), status);
+        }
+        result
+    }
+
+    async fn checkpoint_session(
+        &self,
+        request: Request<pb::CheckpointSessionRequest>,
+    ) -> Result<Response<pb::WriteSession>, Status> {
         authorize_request(&request, AuthPermission::Write)?;
-        let mut stream = request.into_inner();
-        let first = stream
-            .message()
-            .await
-            .map_err(|err| Status::invalid_argument(format!("append stream failed: {err}")))?
+        let request = request.into_inner();
+        reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "CheckpointSession")?;
+        Err(Status::unimplemented(
+            "CheckpointSession is not wired in this write-session slice",
+        ))
+    }
+
+    async fn close_write_session(
+        &self,
+        request: Request<pb::CloseWriteSessionRequest>,
+    ) -> Result<Response<pb::WriteSession>, Status> {
+        authorize_request(&request, AuthPermission::Write)?;
+        let request = request.into_inner();
+        reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "CloseWriteSession")?;
+        let session_id = decode_uuid_bytes(&request.session_id, "session_id")?;
+        let session_id = Uuid::from_bytes(session_id);
+        let session = crate::mount::close_write_session(&self.state, session_id).await?;
+        Ok(Response::new(session))
+    }
+
+    async fn abort_write_session(
+        &self,
+        request: Request<pb::AbortWriteSessionRequest>,
+    ) -> Result<Response<pb::WriteSession>, Status> {
+        authorize_request(&request, AuthPermission::Write)?;
+        let request = request.into_inner();
+        reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "AbortWriteSession")?;
+        let session_id = decode_uuid_bytes(&request.session_id, "session_id")?;
+        let session_id = Uuid::from_bytes(session_id);
+        let session = crate::mount::abort_write_session(&self.state, session_id).await?;
+        Ok(Response::new(session))
+    }
+
+    async fn get_write_session(
+        &self,
+        request: Request<pb::GetWriteSessionRequest>,
+    ) -> Result<Response<pb::WriteSession>, Status> {
+        authorize_request(&request, AuthPermission::Read)?;
+        let session_id = decode_uuid_bytes(&request.into_inner().session_id, "session_id")?;
+        let session_id = Uuid::from_bytes(session_id);
+        let session = crate::mount::get_write_session(&self.state, session_id).await?;
+        Ok(Response::new(session))
+    }
+}
+
+impl WriteSessionApi {
+    fn spool_dir_for_log(&self) -> String {
+        self.state
+            .spool_dir
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "(unconfigured)".to_string())
+    }
+
+    #[cfg(test)]
+    async fn append_object_stream_logged<S>(
+        &self,
+        stream: S,
+    ) -> Result<Response<pb::ObjectRecord>, Status>
+    where
+        S: Stream<Item = Result<pb::AppendObjectMessage, Status>> + Unpin,
+    {
+        let spool_dir = self.spool_dir_for_log();
+        let result = self.append_object_stream(stream).await;
+        if let Err(status) = &result {
+            log_append_object_failure(spool_dir.as_str(), status);
+        }
+        result
+    }
+
+    async fn append_object_stream<S>(
+        &self,
+        mut stream: S,
+    ) -> Result<Response<pb::ObjectRecord>, Status>
+    where
+        S: Stream<Item = Result<pb::AppendObjectMessage, Status>> + Unpin,
+    {
+        let first = next_append_message(&mut stream)
+            .await?
             .ok_or_else(|| Status::invalid_argument("append stream is empty"))?;
         let start = match first.payload {
             Some(pb::append_object_message::Payload::Start(start)) => start,
@@ -2037,11 +2147,7 @@ impl pb::write_session_service_server::WriteSessionService for WriteSessionApi {
         let spool_started = Instant::now();
         let mut spool_bytes = 0u64;
         let mut spool_chunks = 0u64;
-        while let Some(message) = stream
-            .message()
-            .await
-            .map_err(|err| Status::invalid_argument(format!("append stream failed: {err}")))?
-        {
+        while let Some(message) = next_append_message(&mut stream).await? {
             match message.payload.ok_or_else(|| {
                 Status::invalid_argument("append stream message is missing payload")
             })? {
@@ -2130,57 +2236,6 @@ impl pb::write_session_service_server::WriteSessionService for WriteSessionApi {
         Ok(Response::new(record))
     }
 
-    async fn checkpoint_session(
-        &self,
-        request: Request<pb::CheckpointSessionRequest>,
-    ) -> Result<Response<pb::WriteSession>, Status> {
-        authorize_request(&request, AuthPermission::Write)?;
-        let request = request.into_inner();
-        reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "CheckpointSession")?;
-        Err(Status::unimplemented(
-            "CheckpointSession is not wired in this write-session slice",
-        ))
-    }
-
-    async fn close_write_session(
-        &self,
-        request: Request<pb::CloseWriteSessionRequest>,
-    ) -> Result<Response<pb::WriteSession>, Status> {
-        authorize_request(&request, AuthPermission::Write)?;
-        let request = request.into_inner();
-        reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "CloseWriteSession")?;
-        let session_id = decode_uuid_bytes(&request.session_id, "session_id")?;
-        let session_id = Uuid::from_bytes(session_id);
-        let session = crate::mount::close_write_session(&self.state, session_id).await?;
-        Ok(Response::new(session))
-    }
-
-    async fn abort_write_session(
-        &self,
-        request: Request<pb::AbortWriteSessionRequest>,
-    ) -> Result<Response<pb::WriteSession>, Status> {
-        authorize_request(&request, AuthPermission::Write)?;
-        let request = request.into_inner();
-        reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "AbortWriteSession")?;
-        let session_id = decode_uuid_bytes(&request.session_id, "session_id")?;
-        let session_id = Uuid::from_bytes(session_id);
-        let session = crate::mount::abort_write_session(&self.state, session_id).await?;
-        Ok(Response::new(session))
-    }
-
-    async fn get_write_session(
-        &self,
-        request: Request<pb::GetWriteSessionRequest>,
-    ) -> Result<Response<pb::WriteSession>, Status> {
-        authorize_request(&request, AuthPermission::Read)?;
-        let session_id = decode_uuid_bytes(&request.into_inner().session_id, "session_id")?;
-        let session_id = Uuid::from_bytes(session_id);
-        let session = crate::mount::get_write_session(&self.state, session_id).await?;
-        Ok(Response::new(session))
-    }
-}
-
-impl WriteSessionApi {
     fn library_serial_for_pool_target(
         &self,
         target: &pb::TapePoolTarget,
@@ -2215,6 +2270,47 @@ impl WriteSessionApi {
         } else {
             Ok(serial)
         }
+    }
+}
+
+async fn next_append_message<S>(stream: &mut S) -> Result<Option<pb::AppendObjectMessage>, Status>
+where
+    S: Stream<Item = Result<pb::AppendObjectMessage, Status>> + Unpin,
+{
+    match stream.next().await {
+        Some(Ok(message)) => Ok(Some(message)),
+        Some(Err(err)) => Err(Status::invalid_argument(format!(
+            "append stream failed: {err}"
+        ))),
+        None => Ok(None),
+    }
+}
+
+fn log_append_object_failure(spool_dir: &str, status: &Status) {
+    let code = status.code();
+    let message = status.message();
+    if matches!(
+        code,
+        tonic::Code::Internal
+            | tonic::Code::Unknown
+            | tonic::Code::Unavailable
+            | tonic::Code::DataLoss
+    ) {
+        tracing::error!(
+            target: "remanence_api::append_object",
+            "append_object failed spool_dir={} status_code={:?} status_message={}",
+            spool_dir,
+            code,
+            message,
+        );
+    } else {
+        tracing::warn!(
+            target: "remanence_api::append_object",
+            "append_object failed spool_dir={} status_code={:?} status_message={}",
+            spool_dir,
+            code,
+            message,
+        );
     }
 }
 
@@ -2698,10 +2794,16 @@ fn parse_role_word(value: &str) -> Option<ClientRole> {
 }
 
 async fn create_append_spool(dir: PathBuf, cap: u64) -> Result<crate::write_owner::Spool, Status> {
+    let dir_for_status = dir.clone();
     tokio::task::spawn_blocking(move || crate::write_owner::Spool::create(&dir, cap))
         .await
         .map_err(|err| Status::internal(format!("create append spool task failed: {err}")))?
-        .map_err(|err| Status::internal(format!("create append spool: {err}")))
+        .map_err(|err| {
+            Status::internal(format!(
+                "create append spool in {}: {err}",
+                dir_for_status.display()
+            ))
+        })
 }
 
 async fn write_append_spool_chunk(
@@ -2726,7 +2828,7 @@ async fn finish_append_spool(spool: crate::write_owner::Spool) -> Result<PathBuf
 
 fn status_from_append_spool_write_error(err: io::Error) -> Status {
     if err.kind() == io::ErrorKind::InvalidInput {
-        Status::resource_exhausted("object exceeds append spool size cap")
+        Status::resource_exhausted(format!("object exceeds append spool size cap: {err}"))
     } else {
         Status::internal(format!("write append spool: {err}"))
     }
@@ -4035,6 +4137,7 @@ mod tests {
     };
     use remanence_stream::{restore_object_to_directory, FilesystemRestoreOptions};
     use sha2::{Digest, Sha256};
+    use tokio::sync::Semaphore;
     use tokio_stream::StreamExt;
     use tracing::dispatcher::Dispatch;
     use tracing::field::{Field, Visit};
@@ -4456,6 +4559,30 @@ mod tests {
         dir
     }
 
+    fn state_with_spool(spool_dir: PathBuf, budget_bytes: u64) -> ApiState {
+        let mut state = ApiState::new(test_index());
+        state.spool_dir = Some(Arc::new(spool_dir));
+        state.spool_budget_bytes = Some(budget_bytes);
+        state.spool_budget = Some(Arc::new(Semaphore::new(
+            spool_budget_permits(budget_bytes) as usize
+        )));
+        state
+    }
+
+    fn append_start_message(session_id: Uuid, declared_size_bytes: u64) -> pb::AppendObjectMessage {
+        pb::AppendObjectMessage {
+            payload: Some(pb::append_object_message::Payload::Start(
+                pb::AppendObjectStart {
+                    session_id: session_id.as_bytes().to_vec(),
+                    caller_object_id: "caller-object".to_string(),
+                    caller_metadata: HashMap::new(),
+                    declared_size_bytes,
+                    body_format_manifest: Vec::new(),
+                },
+            )),
+        }
+    }
+
     #[test]
     fn object_record_to_proto_carries_append_commit_info() {
         let record = NativeObjectRecord {
@@ -4572,6 +4699,91 @@ mod tests {
         ));
         assert_eq!(io_error.code(), tonic::Code::Internal);
         assert!(io_error.message().contains("write append spool"));
+    }
+
+    #[test]
+    fn append_object_spool_create_failure_returns_cause_and_logs_path() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-api-spool-create-failure")
+            .tempdir()
+            .expect("tempdir");
+        let spool_dir = temp.path().join("missing").join("spool");
+        let service =
+            state_with_spool(spool_dir.clone(), APPEND_SPOOL_MAX_BYTES).write_session_service();
+        let session_id = Uuid::new_v4();
+        let stream = tokio_stream::iter([Ok(append_start_message(session_id, 1))]);
+
+        let mut status = None;
+        let warnings = capture_warnings(|| {
+            status = Some(
+                runtime
+                    .block_on(service.append_object_stream_logged(stream))
+                    .expect_err("missing spool dir must fail"),
+            );
+        });
+        let status = status.expect("status captured");
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert!(
+            status.message().contains("create append spool in"),
+            "{status}"
+        );
+        assert!(
+            status.message().contains(&spool_dir.display().to_string()),
+            "{status}"
+        );
+        assert!(
+            !status.message().contains("stream closed"),
+            "spool-create failure must not collapse to a bare stream close: {status}"
+        );
+        assert!(
+            warnings.iter().any(|message| {
+                message.contains("append_object failed")
+                    && message.contains(&spool_dir.display().to_string())
+                    && message.contains("create append spool")
+            }),
+            "append failure log must include spool path and cause, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn append_object_refuses_request_beyond_effective_tmpfs_budget() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-api-spool-budget")
+            .tempdir()
+            .expect("tempdir");
+        let spool_dir = temp.path().join("spool");
+        std::fs::create_dir_all(&spool_dir).expect("spool dir");
+        let budget = 1024 * 1024;
+        let service = state_with_spool(spool_dir.clone(), budget).write_session_service();
+        let session_id = Uuid::new_v4();
+        let stream = tokio_stream::iter([Ok(append_start_message(session_id, budget + 1))]);
+
+        let status = runtime
+            .block_on(service.append_object_stream_logged(stream))
+            .expect_err("over-budget append must fail");
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            status.message().contains("daemon.spool_tmpfs_ram_budget"),
+            "{status}"
+        );
+        assert!(
+            status
+                .message()
+                .contains("overflow-to-disk is not implemented"),
+            "{status}"
+        );
+        assert!(
+            status.message().contains(&spool_dir.display().to_string()),
+            "{status}"
+        );
     }
 
     #[test]

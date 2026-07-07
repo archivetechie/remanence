@@ -39,7 +39,7 @@ use crate::{
     PoolWriteError, SelectTapeError, TapeUuid,
 };
 
-pub(crate) const SPOOL_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+pub(crate) const SPOOL_MAX_BYTES: u64 = crate::APPEND_SPOOL_MAX_BYTES;
 const STAGED_READ_CHANNEL_DEPTH: usize = 2;
 
 /// Robotics work to perform after the owner opens and refreshes the library.
@@ -478,7 +478,10 @@ impl Spool {
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&path)?;
+            .open(&path)
+            .map_err(|err| {
+                std::io::Error::new(err.kind(), format!("open {}: {err}", path.display()))
+            })?;
         Ok(Self {
             file,
             path,
@@ -498,16 +501,20 @@ impl Spool {
         if next > self.cap {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "spool size cap exceeded",
+                format!("spool size cap exceeded at {}", self.path.display()),
             ));
         }
-        self.file.write_all(bytes)?;
+        self.file.write_all(bytes).map_err(|err| {
+            std::io::Error::new(err.kind(), format!("write {}: {err}", self.path.display()))
+        })?;
         self.written = next;
         Ok(())
     }
 
     pub(crate) fn finish(mut self) -> std::io::Result<PathBuf> {
-        self.file.flush()?;
+        self.file.flush().map_err(|err| {
+            std::io::Error::new(err.kind(), format!("flush {}: {err}", self.path.display()))
+        })?;
         self.keep = true;
         Ok(self.path.clone())
     }

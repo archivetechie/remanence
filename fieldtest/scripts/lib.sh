@@ -1246,7 +1246,7 @@ PY
 fieldtest_write_config() {
   local config="$1" selected_serial="$2"
   python3 - "$config" "$selected_serial" <<'PY'
-import json
+import os
 import sys
 from pathlib import Path
 
@@ -1254,6 +1254,9 @@ config = Path(sys.argv[1])
 selected = sys.argv[2]
 home = config.parent
 allowlist_path = home / "allowlist.txt"
+write_batch_blocks = int(os.environ.get("FIELD_TAPE_IO_WRITE_BATCH_BLOCKS", "16"))
+read_batch_blocks = int(os.environ.get("FIELD_TAPE_IO_READ_BATCH_BLOCKS", str(write_batch_blocks)))
+position_check_bytes = os.environ.get("FIELD_TAPE_IO_POSITION_CHECK_BYTES", "1GiB")
 data_barcodes = []
 cleaning = []
 if allowlist_path.exists():
@@ -1278,6 +1281,8 @@ parts = [
     "default_idle_timeout_seconds = 120",
     "read_only = false",
     f'socket_path = "{home / "rem.sock"}"',
+    f'spool_dir = "{home / "spool"}"',
+    'spool_tmpfs_ram_budget = "64GiB"',
     "",
     "[[libraries]]",
     f'serial = "{selected}"',
@@ -1322,6 +1327,12 @@ parts.extend([
     "min_poll_interval = \"250ms\"",
     "foreign_changer_poll = \"60s\"",
     "foreign_poll_lease = \"5m\"",
+    "",
+    "[tape_io]",
+    "legacy_single_block = false",
+    f"write_batch_blocks = {write_batch_blocks}",
+    f"read_batch_blocks = {read_batch_blocks}",
+    f'position_check_bytes = "{position_check_bytes}"',
     "",
     "[journal]",
     f'dir = "{home / "state" / "journals"}"',
