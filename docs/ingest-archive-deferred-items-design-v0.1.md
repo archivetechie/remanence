@@ -236,7 +236,7 @@ extract` = RAO, with the design wanting `rem restore`) is a symptom. The real
 issue: **BRU shouldn't be in rem core at all.** There are two format
 categories — **native** (RAO plain/aead; rem *writes* these; core) and
 **foreign/legacy** (BRU, old tar, …; rem only *reads* them to migrate off old
-tapes; reverse-engineered; inherently per-deployment — archive has BRU, another
+tapes; reverse-engineered; inherently per-deployment — one deployment has BRU, another
 site has something else). Baking one organization's legacy into the core tool
 is wrong.
 

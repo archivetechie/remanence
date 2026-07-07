@@ -1,7 +1,7 @@
 # Remanence — Consolidated Spec v0.4
 
 **Version 0.4 (Consolidated) — May 2026**
-**the operating institution — Archives Team**
+**Archives Team**
 
 > This document **consolidates** what the latest code and the most recent layer-specific design docs represent, into one source of truth. It supersedes the documents listed in §16 (Document Lineage). It is normative for current contracts and implementation status as of 2026-06-10.
 >
@@ -61,7 +61,7 @@ The name refers to magnetic remanence: the property of a ferromagnetic material 
 
 ### 1.1 Why this exists
 
-the operating institution operates a multi-petabyte tape archive. The in-house dwara v2 system is in production but architecturally encumbered; a migration to commercial Atempo Miria has been in progress for an extended period without successful production deployment. Remanence is being developed as a focused, well-engineered alternative to the tape-management portion of the stack — buildable by a small team, defensible on technical merits, easy to integrate with any orchestration layer (the [Sutradhara](https://github.com/archivetechie/sutradhara) project is the planned in-house orchestrator), and deliberately uninterested in the workflows above it.
+This project was built for a multi-petabyte tape archive. The in-house dwara v2 system is in production but architecturally encumbered; a migration to commercial Atempo Miria has been in progress for an extended period without successful production deployment. Remanence is being developed as a focused, well-engineered alternative to the tape-management portion of the stack — buildable by a small team, defensible on technical merits, easy to integrate with any orchestration layer (the [Sutradhara](https://github.com/archivetechie/sutradhara) project is the planned in-house orchestrator), and deliberately uninterested in the workflows above it.
 
 ### 1.2 Design priorities (ordered)
 
@@ -564,7 +564,7 @@ On tape mount, the daemon reads the bootstrap, finds each object's body-format i
 | `remanence-tar-legacy` (planned, see below) | `PhysicalTapeRecords` / `ByteStreamDump` | catalog scan, sequential restore, verify where source permits | Reader for standard pax-tar tapes written by dwara v2 / other tools. **Read-only.** Wraps the Rust `tar` crate where possible. |
 | `remanence-bru` (planned, see below) | `PhysicalTapeRecords` / `ByteStreamDump` | catalog scan, sequential restore, verify, damage events; indexed restore after scan/index | Reverse-engineered reader for BRU/BRU-PE tapes (Tolis Group, defunct — RE is legal). **Read-only.** |
 
-The two planned legacy readers exist to support migration from existing archive tape archives written by dwara v2 (TAR) and older BRU systems. Both are reader-only — no write path. Sutradhara's migration strategy depends on these. BRU's 2048-byte logical block size must not be confused with the physical tape record size; the BRU driver reads physical records safely and splits them into logical BRU blocks.
+The two planned legacy readers exist to support migration from existing production tape archives written by dwara v2 (TAR) and older BRU systems. Both are reader-only — no write path. Sutradhara's migration strategy depends on these. BRU's 2048-byte logical block size must not be confused with the physical tape record size; the BRU driver reads physical records safely and splits them into logical BRU blocks.
 
 `rem-chunked-v1` (originally specified as the default in spec-v0.3) has been **superseded** by `rem-tar-v1`. The capability surface and tier semantics are unchanged; only the on-tape wire format differs. Rationale: the 30-year-portability argument is stronger when the on-tape body is byte-compatible with standard `tar`.
 
@@ -689,7 +689,7 @@ All strings in `rem-tar-v1` are **UTF-8 encoded**. Strict, format-wide, covering
 
 **Pre-write validation** (§9.0 of the source doc) refuses to write any object containing a non-UTF-8 filename. The writer never silently transliterates. The catalog DB charset is required to be UTF-8 (Postgres `ENCODING 'UTF8'`, SQLite default, MySQL/MariaDB `utf8mb4`).
 
-Failure mode this prevents: BRU/TOLIS deployments at archive have stored filenames in mixed encodings; ingest into a narrower-charset DB silently transliterated, and restore lookups failed because the in-catalog name didn't match the on-tape name. Strict UTF-8 at write time + UTF-8-required catalog eliminates the encoding boundary entirely.
+Failure mode this prevents: BRU/TOLIS production deployments have stored filenames in mixed encodings; ingest into a narrower-charset DB silently transliterated, and restore lookups failed because the in-catalog name didn't match the on-tape name. Strict UTF-8 at write time + UTF-8-required catalog eliminates the encoding boundary entirely.
 
 #### 8.7.7 Symlinks, special files, directories
 
