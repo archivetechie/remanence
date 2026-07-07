@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="176" viewBox="0 0 760 176" role="img" aria-label="rao-v1 stored object layout in stream order: pax global header, per-file pax header plus padding and chunk-aligned file data repeated per member, the CBOR manifest as the last member, then tar end-of-archive records and zero fill">
+  <rect width="100%" height="100%" fill="#fcfcfc"/>
+  <style>
+    .rs { fill: #fff8f0; stroke: #a45200; }
+    .rt { font: 11px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #17191b; }
+    .rtd { font: 10px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #9a9a9a; }
+    .rta { font: 9px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #a45200; letter-spacing: .18em; }
+    .rtg { font: 9px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #9a9a9a; letter-spacing: .18em; }
+    .rl { stroke: #9a9a9a; stroke-width: 1; fill: none; }
+    .rh { stroke: #e8e8e8; stroke-width: 1; fill: none; }
+  </style>
+  <text class="rta" x="20" y="24">ONE STORED OBJECT — STREAM ORDER →</text>
+  <rect class="rs" x="20" y="34" width="120" height="44"/>
+  <text class="rt" x="80" y="53" text-anchor="middle">pax global header</text>
+  <text class="rtd" x="80" y="68" text-anchor="middle">REMANENCE.* keys</text>
+  <rect class="rs" x="140" y="34" width="112" height="44"/>
+  <text class="rt" x="196" y="53" text-anchor="middle">pax header + pad</text>
+  <text class="rtd" x="196" y="68" text-anchor="middle">file_id · file_sha256</text>
+  <rect class="rs" x="252" y="34" width="128" height="44"/>
+  <text class="rt" x="316" y="53" text-anchor="middle">file data</text>
+  <text class="rtd" x="316" y="68" text-anchor="middle">chunk-aligned</text>
+  <text class="rtd" x="396" y="58" text-anchor="middle">· · ·</text>
+  <rect class="rs" x="412" y="34" width="170" height="44"/>
+  <text class="rt" x="497" y="53" text-anchor="middle">_remanence/manifest.cbor</text>
+  <text class="rtd" x="497" y="68" text-anchor="middle">deterministic CBOR index</text>
+  <rect class="rs" x="582" y="34" width="128" height="44"/>
+  <text class="rt" x="646" y="53" text-anchor="middle">tar EOF · zero fill</text>
+  <text class="rtd" x="646" y="68" text-anchor="middle">to a chunk multiple</text>
+  <polyline class="rl" points="140,82 140,88 380,88 380,82"/>
+  <text class="rtg" x="260" y="101" text-anchor="middle">ONE MEMBER PER FILE — REPEATED</text>
+  <line class="rh" x1="20" y1="114" x2="710" y2="114"/>
+  <line class="rl" x1="20" y1="110" x2="20" y2="118"/>
+  <line class="rl" x1="66" y1="110" x2="66" y2="118"/>
+  <line class="rl" x1="112" y1="110" x2="112" y2="118"/>
+  <line class="rl" x1="158" y1="110" x2="158" y2="118"/>
+  <line class="rl" x1="204" y1="110" x2="204" y2="118"/>
+  <line class="rl" x1="250" y1="110" x2="250" y2="118"/>
+  <line class="rl" x1="296" y1="110" x2="296" y2="118"/>
+  <line class="rl" x1="342" y1="110" x2="342" y2="118"/>
+  <line class="rl" x1="388" y1="110" x2="388" y2="118"/>
+  <line class="rl" x1="434" y1="110" x2="434" y2="118"/>
+  <line class="rl" x1="480" y1="110" x2="480" y2="118"/>
+  <line class="rl" x1="526" y1="110" x2="526" y2="118"/>
+  <line class="rl" x1="572" y1="110" x2="572" y2="118"/>
+  <line class="rl" x1="618" y1="110" x2="618" y2="118"/>
+  <line class="rl" x1="664" y1="110" x2="664" y2="118"/>
+  <line class="rl" x1="710" y1="110" x2="710" y2="118"/>
+  <text class="rtg" x="20" y="134">CHUNK BOUNDARIES — DEFAULT 262144 B</text>
+  <text class="rtd" x="20" y="152">every member's data starts on a chunk boundary, so file and byte-range reads seek straight to its blocks</text>
+  <text class="rtd" x="20" y="168">a plaintext object is a valid POSIX pax tar stream — stock tar extracts it; REMANENCE.* metadata rides as pax headers</text>
+</svg>

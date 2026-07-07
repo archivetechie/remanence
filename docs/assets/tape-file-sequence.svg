@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="144" viewBox="0 0 760 144" role="img" aria-label="Tape file sequence on one cartridge: bootstrap copy 0 at LBA 0, then object tape files and parity sidecars separated by filemarks, with bootstrap copies repeating down the tape">
+  <rect width="100%" height="100%" fill="#fcfcfc"/>
+  <style>
+    .rs { fill: #fff8f0; stroke: #a45200; }
+    .rt { font: 11px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #17191b; }
+    .rtd { font: 10px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #9a9a9a; }
+    .rta { font: 9px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #a45200; letter-spacing: .18em; }
+    .rl { stroke: #9a9a9a; stroke-width: 1; fill: none; }
+    .ra { stroke: #a45200; stroke-width: 1; fill: none; }
+  </style>
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0L10,5L0,10z" fill="#9a9a9a"/></marker></defs>
+  <text class="rta" x="20" y="24">ONE CARTRIDGE — TAPE MOTION →</text>
+  <rect class="rs" x="20" y="34" width="92" height="44"/>
+  <text class="rt" x="66" y="53" text-anchor="middle">bootstrap</text>
+  <text class="rtd" x="66" y="68" text-anchor="middle">copy 0 · LBA 0</text>
+  <line class="ra" x1="116" y1="30" x2="116" y2="84"/>
+  <text class="rta" x="116" y="96" text-anchor="middle">FM</text>
+  <rect class="rs" x="124" y="34" width="112" height="44"/>
+  <text class="rt" x="180" y="53" text-anchor="middle">object</text>
+  <text class="rtd" x="180" y="68" text-anchor="middle">rao-v1 body blocks</text>
+  <line class="ra" x1="240" y1="30" x2="240" y2="84"/>
+  <rect class="rs" x="248" y="34" width="112" height="44"/>
+  <text class="rt" x="304" y="53" text-anchor="middle">object</text>
+  <line class="ra" x1="364" y1="30" x2="364" y2="84"/>
+  <rect class="rs" x="372" y="34" width="128" height="44"/>
+  <text class="rt" x="436" y="53" text-anchor="middle">parity sidecar</text>
+  <text class="rtd" x="436" y="68" text-anchor="middle">RS shards + index</text>
+  <line class="ra" x1="504" y1="30" x2="504" y2="84"/>
+  <rect class="rs" x="512" y="34" width="92" height="44"/>
+  <text class="rt" x="558" y="53" text-anchor="middle">bootstrap</text>
+  <text class="rtd" x="558" y="68" text-anchor="middle">copy 1 · ~5% mark</text>
+  <line class="ra" x1="608" y1="30" x2="608" y2="84"/>
+  <text class="rtd" x="622" y="58">· · ·</text>
+  <line class="rl" x1="66" y1="80" x2="66" y2="96" marker-end="url(#ah)"/>
+  <text class="rtd" x="20" y="112">the bootstrap is the tape's self-description: UUID, block size, parity scheme, filemark-map digest — readable at BOT with no host state</text>
+  <text class="rtd" x="20" y="128">the parity layer writes every filemark; a sidecar carries Reed-Solomon parity for the object blocks since the previous sidecar</text>
+</svg>
