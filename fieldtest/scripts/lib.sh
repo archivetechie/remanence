@@ -462,6 +462,109 @@ PY
   return "$rc"
 }
 
+# Runs a daemon I/O command and handles the LTO-9 media-readiness fence that can
+# legitimately appear after a load or first access. The failed artifact is kept
+# beside the caller's output, the readiness operation is waited directly, and
+# the original I/O command is retried without moving the cartridge.
+fieldtest_readiness_operation_from_artifact() {
+  local artifact="$1"
+  python3 - "$artifact" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+artifact = Path(sys.argv[1])
+try:
+    payload = json.loads(artifact.read_text())
+except Exception:
+    raise SystemExit(1)
+
+parts = []
+for key in ("stdout", "stderr"):
+    value = payload.get(key)
+    if isinstance(value, str):
+        parts.append(value)
+        try:
+            nested = json.loads(value)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(nested, dict):
+            for nested_key in ("error", "message"):
+                nested_value = nested.get(nested_key)
+                if isinstance(nested_value, str):
+                    parts.append(nested_value)
+
+text = "\n".join(parts)
+patterns = [
+    r"media-readiness fence operation=([0-9a-fA-F-]{36})\b",
+    r"--resume\s+([0-9a-fA-F-]{36})\b",
+]
+for pattern in patterns:
+    match = re.search(pattern, text)
+    if match:
+        print(match.group(1))
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+fieldtest_wait_ready_for_operation() {
+  local operation="$1" wait_path="$2" serial timeout poll rc
+  serial="$(fieldtest_selected_library_serial)"
+  timeout="${FIELD_IO_READY_TIMEOUT:-2.5h}"
+  poll="${FIELD_IO_READY_POLL:-30s}"
+  if [[ -z "$serial" ]]; then
+    echo "error: no selected library while waiting for readiness operation $operation" >&2
+    return 1
+  fi
+  if fieldtest_capture_text "$wait_path" "$(fieldtest_rem_bin)" tape wait-ready \
+    --config "$(fieldtest_config_path)" \
+    --library "$serial" \
+    --resume "$operation" \
+    --wait \
+    --timeout "$timeout" \
+    --poll "$poll" \
+    --json; then
+    rc=0
+  else
+    rc=$?
+  fi
+  return "$rc"
+}
+
+fieldtest_capture_io_json() {
+  local outfile="$1"
+  shift
+  local max_retries attempt rc operation token blocked wait_path
+  max_retries="${FIELD_IO_READY_RETRIES:-3}"
+  attempt=0
+  while true; do
+    if fieldtest_capture_json "$outfile" "$@"; then
+      return 0
+    else
+      rc=$?
+    fi
+    operation="$(fieldtest_readiness_operation_from_artifact "$outfile" || true)"
+    if [[ -z "$operation" || "$attempt" -ge "$max_retries" ]]; then
+      return "$rc"
+    fi
+    attempt=$((attempt + 1))
+    token="${operation//[^A-Za-z0-9_.:-]/_}"
+    blocked="${outfile%.json}-readiness-blocked-${attempt}-${token}.json"
+    wait_path="${outfile%.json}-wait-ready-${attempt}-${token}.json"
+    cp -f -- "$outfile" "$blocked"
+    fieldtest_evidence_record "${SCRIPT_NAME:-fieldtest}" "io-readiness-${token:0:8}" INFO "daemon I/O blocked by media-readiness fence; waiting and retrying ($attempt/$max_retries)" "$blocked"
+    if fieldtest_wait_ready_for_operation "$operation" "$wait_path"; then
+      fieldtest_evidence_record "${SCRIPT_NAME:-fieldtest}" "wait-ready-${token:0:8}" PASS "media ready after daemon I/O fence" "$wait_path"
+    else
+      rc=$?
+      fieldtest_evidence_record "${SCRIPT_NAME:-fieldtest}" "wait-ready-${token:0:8}" FAIL "media readiness wait failed while retrying daemon I/O (rc=$rc)" "$wait_path"
+      return "$rc"
+    fi
+  done
+}
+
 fieldtest_write_json_file() {
   local outfile="$1"
   shift

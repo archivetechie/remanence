@@ -89,6 +89,12 @@ wait on it before daemon bringup. The command writes JSON with an
 ./scripts/09-media-ready.sh --resume <operation_id-from-json>
 ```
 
+Daemon write/read field scripts also auto-handle short LTO-9 readiness fences:
+if a write or read open returns `media-readiness fence operation=...`, the
+script preserves a `*-readiness-blocked-*` artifact, waits on that operation,
+and retries the same I/O command. If the wait reports `timeout_unknown`,
+`transport_unknown`, or a terminal state, stop and collect evidence.
+
 Drive drains are readiness-aware: they unload only drives whose TUR probe is
 ready. Non-ready or unknown drives are left alone and an evidence artifact is
 written under `evidence/drive-drain/`.

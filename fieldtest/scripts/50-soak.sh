@@ -46,8 +46,8 @@ with path.open("wb") as handle:
         remaining-=n
 PY
     fieldtest_capture_json "$workdir/build-$count.json" "$(fieldtest_rem_bin)" archive build --inputs "$source" --out "$object" || true
-    if fieldtest_capture_json "$locator" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$object" --pool fieldtest-a; then
-      fieldtest_capture_json "$workdir/read-$count.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator")" --out "$restore" || true
+    if fieldtest_capture_io_json "$locator" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$object" --pool fieldtest-a; then
+      fieldtest_capture_io_json "$workdir/read-$count.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator")" --out "$restore" || true
       echo "{\"cycle\":$count,\"status\":\"ok\",\"object\":\"$object\"}" >>"$journal"
     else
       echo "{\"cycle\":$count,\"status\":\"write-failed\"}" >>"$journal"

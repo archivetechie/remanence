@@ -93,13 +93,13 @@ PY
   local object_sha
   object_sha="$(sha256_file "$object")"
   local locator="$workdir/locator.json"
-  if ! fieldtest_capture_json "$locator" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$object" --pool fieldtest-a; then
+  if ! fieldtest_capture_io_json "$locator" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$object" --pool fieldtest-a; then
     fieldtest_evidence_record "$SCRIPT_NAME" write FAIL "multiobject daemon write failed" "$locator"
     exit 1
   fi
 
   local restored="$workdir/restored.rao"
-  if ! fieldtest_capture_json "$workdir/read.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator")" --out "$restored"; then
+  if ! fieldtest_capture_io_json "$workdir/read.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator")" --out "$restored"; then
     fieldtest_evidence_record "$SCRIPT_NAME" read FAIL "multiobject daemon read failed" "$workdir/read.json"
     exit 1
   fi

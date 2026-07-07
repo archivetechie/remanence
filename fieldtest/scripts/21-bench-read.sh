@@ -88,14 +88,14 @@ main() {
     fieldtest_evidence_record "$SCRIPT_NAME" build FAIL "archive build failed for read benchmark" "$workdir/build.json"
     exit 1
   fi
-  if ! fieldtest_capture_json "$locator" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$object" --pool fieldtest-a; then
+  if ! fieldtest_capture_io_json "$locator" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$object" --pool fieldtest-a; then
     fieldtest_evidence_record "$SCRIPT_NAME" write FAIL "daemon write failed for read benchmark" "$locator"
     exit 1
   fi
 
   local start end seconds mb_s bytes
   start="$(python3 -c 'import time; print(f"{time.monotonic():.9f}")')"
-  if ! fieldtest_capture_json "$workdir/read.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator")" --out "$restored"; then
+  if ! fieldtest_capture_io_json "$workdir/read.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator")" --out "$restored"; then
     fieldtest_evidence_record "$SCRIPT_NAME" read FAIL "daemon read failed for read benchmark" "$workdir/read.json"
     exit 1
   fi

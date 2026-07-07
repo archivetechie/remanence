@@ -86,7 +86,7 @@ bench_write_case() {
   sample_top "$top_stop" 9>&- &
   local sampler_pid=$!
   start="$(python3 -c 'import time; print(f"{time.monotonic():.9f}")')"
-  if ! fieldtest_capture_json "$out_path" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$source" --pool "$pool"; then
+  if ! fieldtest_capture_io_json "$out_path" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$source" --pool "$pool"; then
     touch "$top_stop"
     wait "$sampler_pid" || true
     fieldtest_evidence_record "$SCRIPT_NAME" "$label" FAIL "daemon write failed for $label" "$out_path"

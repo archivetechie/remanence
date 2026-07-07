@@ -48,7 +48,7 @@ bench_one() {
   local serial="$1" source="$2" pool="$3" out="$4"
   local start end seconds bytes mb_s
   start="$(python3 -c 'import time; print(f"{time.monotonic():.9f}")')"
-  if ! fieldtest_capture_json "$out" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$source" --pool "$pool"; then
+  if ! fieldtest_capture_io_json "$out" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$source" --pool "$pool"; then
     return 1
   fi
   end="$(python3 -c 'import time; print(f"{time.monotonic():.9f}")')"

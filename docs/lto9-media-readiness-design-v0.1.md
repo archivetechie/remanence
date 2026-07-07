@@ -47,6 +47,15 @@ that LTO-9 media initialization is one-time for new LTO-9 cartridges:
 **Local evidence:** `~/remfield/evidence/10-init-pools/20260706T101147Z-init-AOX030L9.json`,
 `~/remfield/evidence/manual-selection/20260706T104106Z-AOX030L9-retry-force.txt`,
 and the RCA note in `~/drishti/docs/msl3040-remfield-rca-notes.md`.
+**Physical follow-up 2026-07-07:** after the four-tape init summary passed on
+the MSL3040, the first daemon write/read pass still encountered short
+media-readiness fences on `AOX030L9`; explicit `wait-ready --resume` cleared
+them and the written object read back with matching SHA-256. The field scripts
+now use readiness-aware retry around ordinary daemon write/read calls; `rem
+top`/live status should still expose operation kind and readiness state. In
+the observed TUI/JSON output, a drive could show generic `busy`/`loaded` while
+the API path was blocked by a readiness fence, and `busy` did not distinguish
+write, read, seek/locate, or readiness wait.
 **Precedent docs:** `docs/chaos-adapter-design.md` RDY-01,
 `docs/chaos-phase-e-changer-faults-design-v0.1.md`,
 `docs/drive-stewardship-design-v0.1.md`,
@@ -763,6 +772,10 @@ Physical coverage:
    policy.
 8. **MR-8 Drishti alignment.** Ensure logs match the RCA fields already noted
    in `~/drishti/docs/msl3040-remfield-rca-notes.md`.
+9. **MR-9 live-status follow-up.** Extend `rem top`/`GetLiveStatus` beyond
+   generic `busy`/`loaded` so operators can see read vs write vs seek/locate vs
+   readiness wait, including the active `media_readiness_ops.operation_id` and
+   affected barcode/drive when a daemon write/read is fenced.
 
 ## 18. Verify-round questions
 
