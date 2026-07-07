@@ -56,6 +56,15 @@ top`/live status should still expose operation kind and readiness state. In
 the observed TUI/JSON output, a drive could show generic `busy`/`loaded` while
 the API path was blocked by a readiness fence, and `busy` did not distinguish
 write, read, seek/locate, or readiness wait.
+**Terminology follow-up 2026-07-07:** do not collapse every readiness wait into
+"calibration." `02/04/01` is the generic SCSI "logical unit is in process of
+becoming ready" condition. LTO-9 first-load media optimization is one important
+cause when the media/generation/library context supports it, but ordinary
+load/thread/rewind/positioning settle can also surface as a short readiness
+wait. Older LTO-7 media can still report generic becoming-ready states around
+mechanical transitions; it does not have the long LTO-9 first-load media
+optimization behavior, so long or repeated LTO-7 readiness waits should be
+treated as abnormal RCA input, not as expected calibration.
 **Precedent docs:** `docs/chaos-adapter-design.md` RDY-01,
 `docs/chaos-phase-e-changer-faults-design-v0.1.md`,
 `docs/drive-stewardship-design-v0.1.md`,
@@ -80,6 +89,12 @@ The core detector is `TEST UNIT READY`:
   optimization window.
 - the same `02/04/xx` family outside LTO-9 context stays generic
   `becoming_ready`; it is not globally labeled "calibration."
+- UI/API wording must preserve that distinction. The default operator label is
+  "waiting for media readiness" or "drive becoming ready." A calibration label
+  such as "LTO-9 media optimization" is only a display hint when corroborated by
+  context: LTO-9/LZ media, first-use or freshly initialized media, long
+  duration, a library drive state such as `Calib`, or matching readiness
+  history.
 - exact ASCQ is preserved in evidence. `04/01` is the documented expected
   signal; `04/00` and `04/07` remain non-terminal becoming-ready states during
   a media-conditioning epoch; `04/02` routes to the conditional explicit-load
@@ -775,7 +790,15 @@ Physical coverage:
 9. **MR-9 live-status follow-up.** Extend `rem top`/`GetLiveStatus` beyond
    generic `busy`/`loaded` so operators can see read vs write vs seek/locate vs
    readiness wait, including the active `media_readiness_ops.operation_id` and
-   affected barcode/drive when a daemon write/read is fenced.
+   affected barcode/drive when a daemon write/read is fenced. The live-status
+   contract should carry a generic `media_readiness_state`, the last sense tuple
+   and elapsed/deadline fields, plus a separate display hint/reason such as
+   `drive_becoming_ready`, `load_settle`, `positioning_settle`,
+   `lto9_media_optimization_possible`, or `operator_intervention_required`.
+   `rem top`, API clients, and UI should default to "waiting for media
+   readiness" unless that reason supports a narrower LTO-9 calibration label.
+   This matters for mixed fleets: LTO-7 can briefly become ready during normal
+   mechanical transitions, but it should not be shown as LTO-9 calibration.
 
 ## 18. Verify-round questions
 
