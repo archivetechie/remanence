@@ -39,3 +39,4 @@ verif/**/target/
 verif/**/*.llbc
 verif/**/lean/.lake/
 verif/**/.leanstral/
+fieldtest/tools/remfield-io/target/
