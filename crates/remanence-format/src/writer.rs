@@ -677,12 +677,12 @@ mod tests {
 
     #[test]
     fn body_block_writer_rejects_short_write_outcome() {
-        let mut sink = OutcomeSink::new(WriteOutcome {
-            bytes_written: 512,
-            early_warning: true,
-            end_of_medium: false,
-            position_after: test_position(1),
-        });
+        let mut sink = OutcomeSink::new(WriteOutcome::from_device_position(
+            512,
+            true,
+            false,
+            test_position(1),
+        ));
         let mut writer = BodyBlockWriter::new(&mut sink, 1024).unwrap();
 
         let err = writer.write_all(&vec![1u8; 1024]).expect_err("short write");
@@ -705,12 +705,12 @@ mod tests {
 
     #[test]
     fn body_block_writer_rejects_end_of_medium_outcome() {
-        let mut sink = OutcomeSink::new(WriteOutcome {
-            bytes_written: 1024,
-            early_warning: false,
-            end_of_medium: true,
-            position_after: test_position(1),
-        });
+        let mut sink = OutcomeSink::new(WriteOutcome::from_device_position(
+            1024,
+            false,
+            true,
+            test_position(1),
+        ));
         let mut writer = BodyBlockWriter::new(&mut sink, 1024).unwrap();
 
         let err = writer.write_all(&vec![1u8; 1024]).expect_err("hard EOM");
@@ -727,12 +727,12 @@ mod tests {
 
     #[test]
     fn body_block_writer_accepts_full_write_with_early_warning() {
-        let mut sink = OutcomeSink::new(WriteOutcome {
-            bytes_written: 1024,
-            early_warning: true,
-            end_of_medium: false,
-            position_after: test_position(1),
-        });
+        let mut sink = OutcomeSink::new(WriteOutcome::from_device_position(
+            1024,
+            true,
+            false,
+            test_position(1),
+        ));
         let mut writer = BodyBlockWriter::new(&mut sink, 1024).unwrap();
 
         writer.write_all(&vec![1u8; 1024]).expect("full write");

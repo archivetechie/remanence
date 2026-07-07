@@ -5619,11 +5619,11 @@ fn sidecar_only_from_resume_appends_after_committed_resume_sidecars() {
         parity_shard_block_count: 1,
         canonical_metadata_hash: [0xB1; 32],
         final_partial_epoch: false,
-        filemark_outcome: WriteFilemarksOutcome {
-            early_warning: false,
-            end_of_medium: false,
-            position_after: physical_to_tape_position(first_resume_sidecar_append),
-        },
+        filemark_outcome: WriteFilemarksOutcome::from_device_position(
+            false,
+            false,
+            physical_to_tape_position(first_resume_sidecar_append),
+        ),
     };
     let second_resume_sidecar = SidecarTapeFile {
         tape_file_number: 4,
@@ -5635,11 +5635,11 @@ fn sidecar_only_from_resume_appends_after_committed_resume_sidecars() {
         parity_shard_block_count: 1,
         canonical_metadata_hash: [0xB2; 32],
         final_partial_epoch: false,
-        filemark_outcome: WriteFilemarksOutcome {
-            early_warning: false,
-            end_of_medium: false,
-            position_after: physical_to_tape_position(committed_append),
-        },
+        filemark_outcome: WriteFilemarksOutcome::from_device_position(
+            false,
+            false,
+            physical_to_tape_position(committed_append),
+        ),
     };
     let resume_result = ResumeAppendResult {
         append_after_tape_file_number: 2,

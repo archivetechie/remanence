@@ -6,6 +6,9 @@
 
 Deliverables (design §10 TIO-2):
 
+0. Carry-over from TIO-1 diff gate: add the fixed/variable byte-identical
+   image test (§9) — serial variable writes vs one batched write produce
+   identical model-transport tape images.
 1. Switch the pool-write transfer loop and read-core to the TIO-1 batched
    primitives, honoring `tape_io.legacy_single_block` and
    `write_batch_blocks`/`read_batch_blocks`/`position_check_bytes` config.

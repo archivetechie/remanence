@@ -101,6 +101,10 @@ const SG_DXFER_TO_DEV: c_int = -2;
 const SG_DXFER_FROM_DEV: c_int = -3;
 #[allow(dead_code)]
 const SG_DXFER_TO_FROM_DEV: c_int = -4;
+#[cfg(target_os = "linux")]
+const SG_SET_RESERVED_SIZE: nix::libc::c_ulong = 0x2275;
+#[cfg(target_os = "linux")]
+const SG_GET_RESERVED_SIZE: nix::libc::c_ulong = 0x2272;
 
 /// Sense buffer size we hand the kernel. 32 bytes covers fixed-format sense
 /// (SPC-5 §4.5.3); modern descriptor-format sense can be longer but the
@@ -443,6 +447,60 @@ pub fn execute_out(
         });
     }
     Ok((dxfer_len as usize) - (hdr.resid as usize))
+}
+
+/// Request a Linux sg reserved buffer size and return the actual size
+/// granted by the kernel.
+///
+/// The sg driver may grant less than requested depending on HBA and
+/// `max_sectors_kb` limits. Callers must treat the returned value as
+/// authoritative for per-command DMA sizing.
+#[cfg(target_os = "linux")]
+pub fn set_reserved_size(dev: &File, requested_bytes: u32) -> Result<u32, ScsiError> {
+    let mut requested: nix::libc::c_int = requested_bytes.try_into().map_err(|_| {
+        ScsiError::InvalidInput("SG_SET_RESERVED_SIZE requested size must fit in c_int")
+    })?;
+    // SAFETY: SG_SET_RESERVED_SIZE expects the third ioctl argument to
+    // point to an int. `requested` lives for the duration of the call.
+    let rc = unsafe {
+        nix::libc::ioctl(
+            dev.as_raw_fd(),
+            SG_SET_RESERVED_SIZE,
+            &mut requested as *mut nix::libc::c_int,
+        )
+    };
+    if rc < 0 {
+        return Err(ScsiError::Io(std::io::Error::last_os_error()));
+    }
+    get_reserved_size(dev)
+}
+
+/// Query the actual Linux sg reserved buffer size.
+#[cfg(target_os = "linux")]
+pub fn get_reserved_size(dev: &File) -> Result<u32, ScsiError> {
+    let mut size: nix::libc::c_int = 0;
+    // SAFETY: SG_GET_RESERVED_SIZE writes an int through the third
+    // ioctl argument. `size` is a valid out-parameter for this call.
+    let rc = unsafe {
+        nix::libc::ioctl(
+            dev.as_raw_fd(),
+            SG_GET_RESERVED_SIZE,
+            &mut size as *mut nix::libc::c_int,
+        )
+    };
+    if rc < 0 {
+        return Err(ScsiError::Io(std::io::Error::last_os_error()));
+    }
+    if size < 0 {
+        return Err(ScsiError::TransportError {
+            status: 0,
+            host_status: 0,
+            driver_status: 0,
+            info: 0,
+            sense: Vec::new(),
+        });
+    }
+    Ok(size as u32)
 }
 
 #[cfg(test)]

@@ -919,11 +919,11 @@ fn write_rebuilt_sidecar_to_raw(
         canonical_metadata_hash: encoded.header.canonical_metadata_hash,
         final_partial_epoch: encoded.header.real_data_shard_count
             < encoded.header.logical_shard_count,
-        filemark_outcome: WriteFilemarksOutcome {
+        filemark_outcome: WriteFilemarksOutcome::from_device_position(
             early_warning,
             end_of_medium,
-            position_after: physical_to_tape_position(captured_position),
-        },
+            physical_to_tape_position(captured_position),
+        ),
     })
 }
 
@@ -1298,17 +1298,17 @@ mod tests {
     }
 
     fn outcome(lba: u64) -> WriteFilemarksOutcome {
-        WriteFilemarksOutcome {
-            early_warning: false,
-            end_of_medium: false,
-            position_after: TapePosition {
+        WriteFilemarksOutcome::from_device_position(
+            false,
+            false,
+            TapePosition {
                 lba,
                 partition: 0,
                 beginning_of_partition: false,
                 end_of_partition: false,
                 block_position_end_of_warning: false,
             },
-        }
+        )
     }
 
     fn sidecar(tape_file_number: u32, epoch_id: u64, start: u64, end: u64) -> SidecarTapeFile {

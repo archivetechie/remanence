@@ -233,6 +233,13 @@ pub trait SgTransport: Send {
     /// `set_timeout_for` — there's no reset; the next op is
     /// expected to set its own class.
     fn set_timeout_for(&mut self, _class: TimeoutClass) {}
+
+    /// Request the sg reserved buffer size used for large SG_IO data
+    /// transfers and return the actual size the transport can provide.
+    /// Non-Linux/test transports report the request as achieved.
+    fn configure_reserved_buffer(&mut self, requested_bytes: u32) -> Result<u32, ScsiError> {
+        Ok(requested_bytes)
+    }
 }
 
 /// Blanket impl so callers holding a `Box<dyn SgTransport>` can pass
@@ -250,6 +257,9 @@ impl SgTransport for Box<dyn SgTransport> {
     }
     fn set_timeout_for(&mut self, class: TimeoutClass) {
         (**self).set_timeout_for(class)
+    }
+    fn configure_reserved_buffer(&mut self, requested_bytes: u32) -> Result<u32, ScsiError> {
+        (**self).configure_reserved_buffer(requested_bytes)
     }
 }
 
@@ -328,6 +338,10 @@ impl<T: SgTransport> SgTransport for ForeignDriveTransport<T> {
 
     fn set_timeout_for(&mut self, class: TimeoutClass) {
         self.inner.set_timeout_for(class)
+    }
+
+    fn configure_reserved_buffer(&mut self, requested_bytes: u32) -> Result<u32, ScsiError> {
+        self.inner.configure_reserved_buffer(requested_bytes)
     }
 }
 
@@ -446,6 +460,10 @@ impl SgTransport for LinuxSgTransport {
     }
     fn set_timeout_for(&mut self, class: TimeoutClass) {
         self.timeout_ms = class.duration_ms();
+    }
+
+    fn configure_reserved_buffer(&mut self, requested_bytes: u32) -> Result<u32, ScsiError> {
+        remanence_scsi::sg_io::set_reserved_size(&self.file, requested_bytes)
     }
 }
 
@@ -617,6 +635,10 @@ impl<T: SgTransport> SgTransport for RecordingTransport<T> {
     }
     fn set_timeout_for(&mut self, class: TimeoutClass) {
         self.inner.set_timeout_for(class)
+    }
+
+    fn configure_reserved_buffer(&mut self, requested_bytes: u32) -> Result<u32, ScsiError> {
+        self.inner.configure_reserved_buffer(requested_bytes)
     }
 }
 

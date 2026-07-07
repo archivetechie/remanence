@@ -34,10 +34,18 @@ use crate::error::{AuditEvent, AuditOp, AuditOutcome};
 use crate::transport::TimeoutClass;
 
 pub use model::{
-    BlockSize, SpaceKind, SpaceResult, TapeConfig, TapePosition, WormMediaState,
+    BlockSize, ComputedPosition, DevicePositionProof, PositionAfter, ReadBatchOutcome, SpaceKind,
+    SpaceResult, TapeConfig, TapePosition, WormMediaState, WriteBatchOutcome,
     WriteFilemarksOutcome, WriteOutcome, WriteUnpositionedOutcome,
 };
 pub use readiness::{classify_media_readiness_error, MediaFamily, MediaReadiness};
+
+fn completion_unknown_check_condition(sense: Vec<u8>, bytes_transferred: u32) -> TapeIoError {
+    TapeIoError::Transport(ScsiError::CheckCondition {
+        sense,
+        bytes_transferred,
+    })
+}
 
 /// Errors a Layer 3a tape I/O operation can return. Preserves Layer
 /// 2b's dirty-state vocabulary: `Transport` always marks the parent
@@ -187,18 +195,26 @@ impl TapeIoError {
 pub(crate) fn map_scsi(err: ScsiError) -> TapeIoError {
     match err {
         #[cfg(target_os = "linux")]
-        ScsiError::CheckCondition { ref sense, .. } => match decode_sense_key_asc(sense) {
-            // NOT READY / MEDIUM NOT PRESENT — drive is loaded with no
-            // tape. IBM LTO SCSI Reference Annex B Table B.3.
-            Some((0x02, 0x3A, _)) => TapeIoError::NoMedium,
-            // DATA PROTECT / WRITE PROTECTED — the cartridge's
-            // physical write-protect switch is on. Annex B Table B.6.
-            Some((0x07, 0x27, _)) => TapeIoError::WriteProtected,
-            // DATA PROTECT — any other reason (encryption mismatch,
-            // WORM violation, etc.).
-            Some((0x07, _, _)) => TapeIoError::DataProtect(err),
-            _ => TapeIoError::CheckCondition(err),
-        },
+        ScsiError::CheckCondition {
+            ref sense,
+            bytes_transferred,
+        } => {
+            if sense_is_deferred(sense) {
+                return completion_unknown_check_condition(sense.clone(), bytes_transferred);
+            }
+            match decode_sense_key_asc(sense) {
+                // NOT READY / MEDIUM NOT PRESENT — drive is loaded with no
+                // tape. IBM LTO SCSI Reference Annex B Table B.3.
+                Some((0x02, 0x3A, _)) => TapeIoError::NoMedium,
+                // DATA PROTECT / WRITE PROTECTED — the cartridge's
+                // physical write-protect switch is on. Annex B Table B.6.
+                Some((0x07, 0x27, _)) => TapeIoError::WriteProtected,
+                // DATA PROTECT — any other reason (encryption mismatch,
+                // WORM violation, etc.).
+                Some((0x07, _, _)) => TapeIoError::DataProtect(err),
+                _ => TapeIoError::CheckCondition(err),
+            }
+        }
         #[cfg(target_os = "linux")]
         ScsiError::UnexpectedStatus { .. } => TapeIoError::UnexpectedStatus(err),
         #[cfg(target_os = "linux")]
@@ -216,6 +232,12 @@ pub(crate) fn map_scsi(err: ScsiError) -> TapeIoError {
 /// SCSI sense.
 fn decode_sense_key_asc(sense: &[u8]) -> Option<(u8, u8, u8)> {
     decode_sense(sense).map(|decoded| (decoded.key, decoded.asc, decoded.ascq))
+}
+
+fn sense_is_deferred(sense: &[u8]) -> bool {
+    decode_sense(sense)
+        .map(|decoded| matches!(decoded.response_code, 0x71 | 0x73))
+        .unwrap_or(false)
 }
 
 /// Build an [`AuditOutcome::ScsiError`] from a [`TapeIoError`],
@@ -361,7 +383,13 @@ impl super::DriveHandle {
         let started = Instant::now();
         match self.transport.execute_none(&cdb) {
             Ok(()) => {
-                self.position_known = true;
+                self.record_device_position(TapePosition {
+                    lba: 0,
+                    partition: 0,
+                    beginning_of_partition: true,
+                    end_of_partition: false,
+                    block_position_end_of_warning: false,
+                });
                 self.finish_tape_success(op, started.elapsed());
                 Ok(())
             }
@@ -654,11 +682,11 @@ impl super::DriveHandle {
             Ok(()) => match self.read_position_inline() {
                 Ok(position_after) => {
                     self.finish_tape_success(op, started.elapsed());
-                    Ok(SpaceResult {
+                    Ok(SpaceResult::from_device_position(
                         units_traversed,
                         stopped_at_boundary,
                         position_after,
-                    })
+                    ))
                 }
                 Err(mapped) => {
                     self.finish_tape_error(op, &mapped);
@@ -673,11 +701,11 @@ impl super::DriveHandle {
                     match self.read_position_inline() {
                         Ok(position_after) => {
                             self.finish_tape_success(op, started.elapsed());
-                            return Ok(SpaceResult {
+                            return Ok(SpaceResult::from_device_position(
                                 units_traversed,
-                                stopped_at_boundary: true,
+                                true,
                                 position_after,
-                            });
+                            ));
                         }
                         Err(rp_err) => {
                             // The SPACE succeeded with a boundary
@@ -689,6 +717,263 @@ impl super::DriveHandle {
                         }
                     }
                 }
+                let mapped = map_scsi(e);
+                self.finish_tape_error(op, &mapped);
+                Err(mapped)
+            }
+        }
+    }
+
+    /// Issue fixed-mode WRITE(6) for one contiguous batch of records.
+    ///
+    /// `buf.len()` must be an exact multiple of `block_size_bytes`.
+    /// The resulting CDB sets FIXED=1 and uses transfer length =
+    /// record count, not bytes. Clean completion advances the
+    /// arithmetic cursor without a READ POSITION; EW/EOM current
+    /// sense performs one post-event READ POSITION and uses its delta
+    /// as the accepted-record arbiter.
+    pub fn write_block_batch(
+        &mut self,
+        buf: &[u8],
+        block_size_bytes: u32,
+    ) -> Result<WriteBatchOutcome, TapeIoError> {
+        self.ensure_position_known_for_write()?;
+        let records = validate_fixed_batch("write_block_batch", buf.len(), block_size_bytes)?;
+        let effective_batch = self.effective_write_batch_blocks_for(block_size_bytes);
+        if records > effective_batch {
+            return Err(TapeIoError::InvalidRequest(ScsiError::InvalidInput(
+                "write_block_batch: record count exceeds effective sg/HBA batch size",
+            )));
+        }
+
+        let position_before = self.seed_expected_position()?;
+        let len_u32 = u32::try_from(buf.len()).map_err(|_| {
+            TapeIoError::InvalidRequest(ScsiError::InvalidInput(
+                "write_block_batch: transfer exceeds u32 byte accounting",
+            ))
+        })?;
+        let op = AuditOp::TapeWrite {
+            bay: self.bay_address,
+            len: len_u32,
+        };
+        let cdb = remanence_scsi::read_write::build_write_fixed_cdb(records);
+
+        self.fire_tape_started(op, &cdb);
+        self.transport.set_timeout_for(TimeoutClass::TapeIo);
+        let started = Instant::now();
+        let result = self.transport.execute_out(&cdb, buf);
+
+        match result {
+            Ok(_) => {
+                let position_after =
+                    match self.advance_expected_position(records, 0, buf.len() as u64) {
+                        Ok(position_after) => position_after,
+                        Err(err) => {
+                            self.finish_tape_error(op, &err);
+                            return Err(err);
+                        }
+                    };
+                self.finish_tape_success(op, started.elapsed());
+                Ok(WriteBatchOutcome::from_computed_position(
+                    records,
+                    len_u32,
+                    false,
+                    false,
+                    position_after,
+                ))
+            }
+            Err(ScsiError::CheckCondition {
+                sense,
+                bytes_transferred,
+            }) => {
+                if sense_is_deferred(&sense) {
+                    let mapped = completion_unknown_check_condition(sense, bytes_transferred);
+                    self.finish_tape_error(op, &mapped);
+                    return Err(mapped);
+                }
+
+                if let Some(signal) = write_eom_signal(&sense) {
+                    match self.read_position_inline() {
+                        Ok(position_after) => {
+                            let records_written = match records_delta_between(
+                                position_before,
+                                position_after,
+                                records,
+                            ) {
+                                Some(delta) => delta,
+                                None => {
+                                    let mapped = completion_unknown_check_condition(
+                                        sense,
+                                        bytes_transferred,
+                                    );
+                                    self.finish_tape_error(op, &mapped);
+                                    return Err(mapped);
+                                }
+                            };
+                            let bytes_written = records_written.saturating_mul(block_size_bytes);
+                            self.finish_tape_success(op, started.elapsed());
+                            return Ok(WriteBatchOutcome::from_device_position(
+                                records_written,
+                                bytes_written,
+                                signal.early_warning,
+                                signal.end_of_medium,
+                                position_after,
+                            ));
+                        }
+                        Err(rp_err) => {
+                            self.finish_tape_error(op, &rp_err);
+                            return Err(rp_err);
+                        }
+                    }
+                }
+
+                let records_written = match fixed_records_transferred_from_sense(&sense, records) {
+                    Some(records_written) => records_written,
+                    None => {
+                        let mapped = completion_unknown_check_condition(sense, bytes_transferred);
+                        self.finish_tape_error(op, &mapped);
+                        return Err(mapped);
+                    }
+                };
+                let bytes_written = records_written.saturating_mul(block_size_bytes);
+                let position_after = match self.advance_expected_position(
+                    records_written,
+                    0,
+                    bytes_written as u64,
+                ) {
+                    Ok(position_after) => position_after,
+                    Err(err) => {
+                        self.finish_tape_error(op, &err);
+                        return Err(err);
+                    }
+                };
+                self.finish_tape_success(op, started.elapsed());
+                Ok(WriteBatchOutcome::from_computed_position(
+                    records_written,
+                    bytes_written,
+                    false,
+                    false,
+                    position_after,
+                ))
+            }
+            Err(e) => {
+                let mapped = map_scsi(e);
+                self.finish_tape_error(op, &mapped);
+                Err(mapped)
+            }
+        }
+    }
+
+    /// Issue fixed-mode READ(6) for a batch that is clamped to the
+    /// caller's remaining records in the current tape file.
+    ///
+    /// The CDB sets SILI=0, FIXED=1. The transfer length is
+    /// `min(requested_records, remaining_records_in_file,
+    /// effective_read_batch_blocks)`, so the method never
+    /// intentionally crosses a tape-file boundary.
+    pub fn read_block_batch(
+        &mut self,
+        buf: &mut [u8],
+        block_size_bytes: u32,
+        requested_records: u32,
+        remaining_records_in_file: u32,
+    ) -> Result<ReadBatchOutcome, TapeIoError> {
+        if requested_records == 0 || remaining_records_in_file == 0 {
+            return Err(TapeIoError::InvalidRequest(ScsiError::InvalidInput(
+                "read_block_batch: requested and remaining record counts must be nonzero",
+            )));
+        }
+        if block_size_bytes == 0 {
+            return Err(TapeIoError::InvalidRequest(ScsiError::InvalidInput(
+                "read_block_batch: block_size_bytes must be nonzero",
+            )));
+        }
+        let records = requested_records
+            .min(remaining_records_in_file)
+            .min(self.effective_read_batch_blocks_for(block_size_bytes));
+        let transfer_len = fixed_batch_len_bytes("read_block_batch", records, block_size_bytes)?;
+        if buf.len() < transfer_len as usize {
+            return Err(TapeIoError::InvalidRequest(ScsiError::InvalidInput(
+                "read_block_batch: buffer is smaller than selected fixed batch",
+            )));
+        }
+
+        let _position_before = self.seed_expected_position()?;
+        let op = AuditOp::TapeRead {
+            bay: self.bay_address,
+            len: transfer_len,
+        };
+        let cdb = remanence_scsi::read_write::build_read_fixed_cdb(records);
+
+        self.fire_tape_started(op, &cdb);
+        self.transport.set_timeout_for(TimeoutClass::TapeIo);
+        let started = Instant::now();
+        let result = self
+            .transport
+            .execute_in(&cdb, &mut buf[..transfer_len as usize]);
+
+        match result {
+            Ok(_) => {
+                let position_after =
+                    match self.advance_expected_position(records, 0, transfer_len as u64) {
+                        Ok(position_after) => position_after,
+                        Err(err) => {
+                            self.finish_tape_error(op, &err);
+                            return Err(err);
+                        }
+                    };
+                self.finish_tape_success(op, started.elapsed());
+                Ok(ReadBatchOutcome::from_computed_position(
+                    records,
+                    transfer_len,
+                    false,
+                    position_after,
+                ))
+            }
+            Err(ScsiError::CheckCondition {
+                sense,
+                bytes_transferred,
+            }) => {
+                if sense_is_deferred(&sense) {
+                    let mapped = completion_unknown_check_condition(sense, bytes_transferred);
+                    self.finish_tape_error(op, &mapped);
+                    return Err(mapped);
+                }
+                if read_filemark_signal(&sense) {
+                    let records_read = match fixed_records_transferred_from_sense(&sense, records) {
+                        Some(records_read) => records_read,
+                        None => {
+                            let mapped =
+                                completion_unknown_check_condition(sense, bytes_transferred);
+                            self.finish_tape_error(op, &mapped);
+                            return Err(mapped);
+                        }
+                    };
+                    let bytes_read = records_read.saturating_mul(block_size_bytes);
+                    let position_after =
+                        match self.advance_expected_position(records_read, 1, bytes_read as u64) {
+                            Ok(position_after) => position_after,
+                            Err(err) => {
+                                self.finish_tape_error(op, &err);
+                                return Err(err);
+                            }
+                        };
+                    self.finish_tape_success(op, started.elapsed());
+                    return Ok(ReadBatchOutcome::from_computed_position(
+                        records_read,
+                        bytes_read,
+                        true,
+                        position_after,
+                    ));
+                }
+                let mapped = map_scsi(ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred,
+                });
+                self.finish_tape_error(op, &mapped);
+                Err(mapped)
+            }
+            Err(e) => {
                 let mapped = map_scsi(e);
                 self.finish_tape_error(op, &mapped);
                 Err(mapped)
@@ -843,12 +1128,12 @@ impl super::DriveHandle {
                 match self.read_position_inline() {
                     Ok(position_after) => {
                         self.finish_tape_success(op, started.elapsed());
-                        Ok(WriteOutcome {
+                        Ok(WriteOutcome::from_device_position(
                             bytes_written,
-                            early_warning: false,
-                            end_of_medium: false,
+                            false,
+                            false,
                             position_after,
-                        })
+                        ))
                     }
                     Err(rp_err) => {
                         self.finish_tape_error(op, &rp_err);
@@ -870,12 +1155,12 @@ impl super::DriveHandle {
                     match self.read_position_inline() {
                         Ok(position_after) => {
                             self.finish_tape_success(op, started.elapsed());
-                            return Ok(WriteOutcome {
+                            return Ok(WriteOutcome::from_device_position(
                                 bytes_written,
-                                early_warning: signal.early_warning,
-                                end_of_medium: signal.end_of_medium,
+                                signal.early_warning,
+                                signal.end_of_medium,
                                 position_after,
-                            });
+                            ));
                         }
                         Err(rp_err) => {
                             self.finish_tape_error(op, &rp_err);
@@ -1043,11 +1328,9 @@ impl super::DriveHandle {
             Ok(()) => match self.read_position_inline() {
                 Ok(pos) => {
                     self.finish_tape_success(op, started.elapsed());
-                    Ok(WriteFilemarksOutcome {
-                        early_warning: false,
-                        end_of_medium: false,
-                        position_after: pos,
-                    })
+                    Ok(WriteFilemarksOutcome::from_device_position(
+                        false, false, pos,
+                    ))
                 }
                 Err(rp_err) => {
                     self.finish_tape_error(op, &rp_err);
@@ -1064,11 +1347,11 @@ impl super::DriveHandle {
                     match self.read_position_inline() {
                         Ok(position_after) => {
                             self.finish_tape_success(op, started.elapsed());
-                            return Ok(WriteFilemarksOutcome {
-                                early_warning: signal.early_warning,
-                                end_of_medium: signal.end_of_medium,
+                            return Ok(WriteFilemarksOutcome::from_device_position(
+                                signal.early_warning,
+                                signal.end_of_medium,
                                 position_after,
-                            });
+                            ));
                         }
                         Err(rp_err) => {
                             self.finish_tape_error(op, &rp_err);
@@ -1243,6 +1526,7 @@ impl super::DriveHandle {
 
     fn mark_position_unknown(&mut self) {
         self.position_known = false;
+        self.expected_position = None;
     }
 
     fn ensure_position_known_for_write(&self) -> Result<(), TapeIoError> {
@@ -1253,6 +1537,73 @@ impl super::DriveHandle {
             "drive position is unknown after a completion-unknown transport error; \
              call position(), locate(), rewind(), or space() before writing",
         )))
+    }
+
+    fn effective_write_batch_blocks_for(&self, block_size_bytes: u32) -> u32 {
+        effective_batch_blocks_for(
+            self.requested_write_batch_blocks,
+            self.sg_reserved_size_bytes,
+            block_size_bytes,
+        )
+    }
+
+    fn effective_read_batch_blocks_for(&self, block_size_bytes: u32) -> u32 {
+        effective_batch_blocks_for(
+            self.requested_read_batch_blocks,
+            self.sg_reserved_size_bytes,
+            block_size_bytes,
+        )
+    }
+
+    fn seed_expected_position(&mut self) -> Result<TapePosition, TapeIoError> {
+        if let Some(position) = self.expected_position {
+            return Ok(position);
+        }
+        self.read_position_inline()
+    }
+
+    fn record_device_position(&mut self, position: TapePosition) {
+        self.position_known = true;
+        self.expected_position = Some(position);
+        self.bytes_since_position_check = 0;
+    }
+
+    fn advance_expected_position(
+        &mut self,
+        records: u32,
+        filemarks: u32,
+        bytes: u64,
+    ) -> Result<TapePosition, TapeIoError> {
+        let before = self.seed_expected_position()?;
+        let units = u64::from(records)
+            .checked_add(u64::from(filemarks))
+            .ok_or_else(position_overflow_error)?;
+        let lba = before
+            .lba
+            .checked_add(units)
+            .ok_or_else(position_overflow_error)?;
+        let position_after = TapePosition {
+            lba,
+            partition: before.partition,
+            beginning_of_partition: lba == 0,
+            end_of_partition: false,
+            block_position_end_of_warning: before.block_position_end_of_warning,
+        };
+        self.expected_position = Some(position_after);
+        self.bytes_since_position_check = self.bytes_since_position_check.saturating_add(bytes);
+        if self.position_check_bytes != 0
+            && self.bytes_since_position_check >= self.position_check_bytes
+        {
+            let device_position = self.read_position_inline()?;
+            if device_position.lba != position_after.lba
+                || device_position.partition != position_after.partition
+            {
+                self.mark_position_unknown();
+                return Err(completion_unknown_transport_error());
+            }
+            return Ok(device_position);
+        }
+        Ok(position_after)
     }
 
     /// Inline READ POSITION used by [`Self::locate`] and
@@ -1273,7 +1624,7 @@ impl super::DriveHandle {
                 let bytes = (outcome.bytes_transferred as usize).min(buf.len());
                 match parse_read_position_long(&buf[..bytes]) {
                     Ok(position) => {
-                        self.position_known = true;
+                        self.record_device_position(position);
                         Ok(position)
                     }
                     Err(err) => {
@@ -1288,6 +1639,111 @@ impl super::DriveHandle {
             }
         }
     }
+}
+
+fn effective_batch_blocks_for(requested: u32, reserved_bytes: u32, block_size_bytes: u32) -> u32 {
+    if block_size_bytes == 0 {
+        return 1;
+    }
+    let by_reserved = reserved_bytes / block_size_bytes;
+    by_reserved.max(1).min(requested.max(1))
+}
+
+fn validate_fixed_batch(
+    operation: &'static str,
+    bytes: usize,
+    block_size_bytes: u32,
+) -> Result<u32, TapeIoError> {
+    if block_size_bytes == 0 {
+        return Err(TapeIoError::InvalidRequest(ScsiError::InvalidInput(
+            "fixed batch block_size_bytes must be nonzero",
+        )));
+    }
+    if bytes == 0 {
+        return Err(TapeIoError::InvalidRequest(ScsiError::InvalidInput(
+            "fixed batch buffer must contain at least one record",
+        )));
+    }
+    let block_size = block_size_bytes as usize;
+    if bytes % block_size != 0 {
+        return Err(TapeIoError::InvalidRequest(ScsiError::InvalidInput(
+            "fixed batch buffer length must be an exact multiple of block_size_bytes",
+        )));
+    }
+    let records = bytes / block_size;
+    if records > remanence_scsi::read_write::MAX_TRANSFER_LEN as usize {
+        return Err(TapeIoError::InvalidRequest(ScsiError::InvalidInput(
+            "fixed batch record count exceeds READ/WRITE(6) 24-bit transfer-length max",
+        )));
+    }
+    u32::try_from(records).map_err(|_| {
+        TapeIoError::InvalidRequest(ScsiError::InvalidInput(match operation {
+            "write_block_batch" => "write_block_batch: record count exceeds u32",
+            _ => "fixed batch record count exceeds u32",
+        }))
+    })
+}
+
+fn fixed_batch_len_bytes(
+    operation: &'static str,
+    records: u32,
+    block_size_bytes: u32,
+) -> Result<u32, TapeIoError> {
+    if records == 0 {
+        return Err(TapeIoError::InvalidRequest(ScsiError::InvalidInput(
+            "fixed batch record count must be nonzero",
+        )));
+    }
+    records.checked_mul(block_size_bytes).ok_or({
+        TapeIoError::InvalidRequest(ScsiError::InvalidInput(match operation {
+            "read_block_batch" => "read_block_batch: selected transfer byte count overflowed u32",
+            _ => "fixed batch transfer byte count overflowed u32",
+        }))
+    })
+}
+
+fn fixed_records_transferred_from_sense(sense: &[u8], requested: u32) -> Option<u32> {
+    let decoded = decode_sense(sense)?;
+    if decoded.response_code != 0x70 || !decoded.valid {
+        return None;
+    }
+    let info_bytes: [u8; 4] = sense.get(3..7)?.try_into().ok()?;
+    let residual = u32::from_be_bytes(info_bytes);
+    if residual > requested {
+        return None;
+    }
+    Some(requested - residual)
+}
+
+fn records_delta_between(
+    position_before: TapePosition,
+    position_after: TapePosition,
+    requested: u32,
+) -> Option<u32> {
+    if position_before.partition != position_after.partition {
+        return None;
+    }
+    let delta = position_after.lba.checked_sub(position_before.lba)?;
+    if delta > u64::from(requested) {
+        return None;
+    }
+    u32::try_from(delta).ok()
+}
+
+fn position_overflow_error() -> TapeIoError {
+    TapeIoError::InvalidRequest(ScsiError::InvalidInput(
+        "tape position arithmetic overflowed u64 LBA",
+    ))
+}
+
+fn completion_unknown_transport_error() -> TapeIoError {
+    TapeIoError::Transport(ScsiError::TransportError {
+        status: 0,
+        host_status: 0,
+        driver_status: 0,
+        info: 0,
+        sense: Vec::new(),
+    })
 }
 
 /// Parse a MODE SENSE(6) response that asked for page `0x0F`
