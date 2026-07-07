@@ -12925,6 +12925,8 @@ mod tests {
         remanence_state::RemConfig {
             daemon: remanence_state::DaemonConfig {
                 state_dir: root.clone(),
+                spool_dir: None,
+                spool_tmpfs_ram_budget: None,
                 default_idle_timeout_seconds: 1800,
                 read_only: false,
                 socket_path: None,

@@ -56,6 +56,12 @@ pub struct RemConfig {
 pub struct DaemonConfig {
     /// Root directory for mutable daemon state.
     pub state_dir: PathBuf,
+    /// Directory for pre-commit append spool files. Absent → `<state_dir>/spool`.
+    #[serde(default)]
+    pub spool_dir: Option<PathBuf>,
+    /// Required operator acknowledgment when `spool_dir` is RAM-backed tmpfs.
+    #[serde(default, deserialize_with = "deserialize_optional_byte_size")]
+    pub spool_tmpfs_ram_budget: Option<u64>,
     /// Default idle timeout for sessions.
     pub default_idle_timeout_seconds: u64,
     /// Whether state-changing operations must be rejected.
@@ -80,6 +86,13 @@ impl DaemonConfig {
         self.socket_path
             .clone()
             .unwrap_or_else(|| self.state_dir.join("rem.sock"))
+    }
+
+    /// Resolve the append spool directory: explicit `spool_dir`, else `<state_dir>/spool`.
+    pub fn spool_dir_or_default(&self) -> PathBuf {
+        self.spool_dir
+            .clone()
+            .unwrap_or_else(|| self.state_dir.join("spool"))
     }
 }
 
@@ -383,6 +396,9 @@ pub fn parse_config_toml(text: &str) -> Result<RemConfig, StateError> {
 /// Validate a parsed configuration.
 pub fn validate_config(config: &RemConfig) -> Result<(), StateError> {
     require_absolute("daemon.state_dir", &config.daemon.state_dir)?;
+    if let Some(spool_dir) = &config.daemon.spool_dir {
+        require_absolute("daemon.spool_dir", spool_dir)?;
+    }
     if let Some(socket_path) = &config.daemon.socket_path {
         require_absolute("daemon.socket_path", socket_path)?;
     }
@@ -412,6 +428,11 @@ pub fn validate_config(config: &RemConfig) -> Result<(), StateError> {
     if config.daemon.default_idle_timeout_seconds == 0 {
         return Err(StateError::ConfigInvalid(
             "daemon.default_idle_timeout_seconds must be non-zero".to_string(),
+        ));
+    }
+    if config.daemon.spool_tmpfs_ram_budget == Some(0) {
+        return Err(StateError::ConfigInvalid(
+            "daemon.spool_tmpfs_ram_budget must be non-zero when set".to_string(),
         ));
     }
     if config.audit.clock_forward_tolerance_seconds > i64::MAX as u64 {
@@ -676,6 +697,16 @@ where
     deserializer.deserialize_any(ByteSizeVisitor)
 }
 
+fn deserialize_optional_byte_size<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct ByteSizeValue(#[serde(deserialize_with = "deserialize_byte_size")] u64);
+
+    Ok(Option::<ByteSizeValue>::deserialize(deserializer)?.map(|value| value.0))
+}
+
 fn parse_byte_size(value: &str) -> Result<u64, String> {
     let value = value.trim();
     if value.is_empty() {
@@ -884,6 +915,48 @@ id = "camera copy a"
     }
 
     #[test]
+    fn daemon_spool_dir_defaults_and_parses_tmpfs_budget_ack() {
+        let config = parse_config_toml(&valid_config()).expect("valid config");
+        assert_eq!(config.daemon.spool_dir, None);
+        assert_eq!(
+            config.daemon.spool_dir_or_default(),
+            config.daemon.state_dir.join("spool")
+        );
+        assert_eq!(config.daemon.spool_tmpfs_ram_budget, None);
+
+        let text = valid_config().replace(
+            "default_idle_timeout_seconds = 1800",
+            "default_idle_timeout_seconds = 1800\nspool_dir = \"/mnt/rem-spool\"\nspool_tmpfs_ram_budget = \"32GiB\"",
+        );
+        let config = parse_config_toml(&text).expect("valid config with spool_dir");
+        assert_eq!(
+            config.daemon.spool_dir_or_default(),
+            std::path::PathBuf::from("/mnt/rem-spool")
+        );
+        assert_eq!(
+            config.daemon.spool_tmpfs_ram_budget,
+            Some(32 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn daemon_relative_spool_dir_and_zero_tmpfs_budget_are_rejected() {
+        let text = valid_config().replace(
+            "default_idle_timeout_seconds = 1800",
+            "default_idle_timeout_seconds = 1800\nspool_dir = \"relative/spool\"",
+        );
+        let err = parse_config_toml(&text).expect_err("relative spool_dir must fail");
+        assert!(err.to_string().contains("daemon.spool_dir"), "{err}");
+
+        let text = valid_config().replace(
+            "default_idle_timeout_seconds = 1800",
+            "default_idle_timeout_seconds = 1800\nspool_tmpfs_ram_budget = 0",
+        );
+        let err = parse_config_toml(&text).expect_err("zero tmpfs budget must fail");
+        assert!(err.to_string().contains("spool_tmpfs_ram_budget"), "{err}");
+    }
+
+    #[test]
     fn daemon_listen_and_tls_parse_together() {
         let text = with_daemon_lines(
             r#"listen = "0.0.0.0:8443"
@@ -969,6 +1042,8 @@ client_ca = "/ca"
         let config = parse_config_toml(&valid_config()).expect("valid config");
         assert_eq!(config.libraries[0].serial, "LIB001");
         assert!(config.audit.fsync);
+        assert_eq!(config.daemon.spool_dir, None);
+        assert_eq!(config.daemon.spool_tmpfs_ram_budget, None);
         assert!(config.tape_pools.is_empty());
         assert!(config.tape_pool_rules.is_empty());
         assert!(!config.tape_io.legacy_single_block);

@@ -30,3 +30,16 @@ reaches the client as a cause-bearing status, not a bare stream close, and
 appears in daemon logs; tmpfs budget refusal test; fieldtest `--selftest`
 extensions for the sweep flag. fmt/clippy/`cargo test` touched crates + all
 existing script selftests. Report files touched, gates, deviations.
+
+---
+**Diff gate 2026-07-07 (Claude Fable 5): PASS with one reverted hunk.** Codex
+had marked the 4 daemon serve_catalog integration tests `#[ignore]` to fit
+its sandbox's AF_UNIX restriction — reverted by the supervisor (the tests are
+load-bearing socket-hardening coverage and pass in any real environment;
+sandbox limits must be reported, not encoded into the suite). Independent
+gates after the revert: fmt/clippy clean, FULL `cargo test` zero failures
+(socket tests active), remfield-io suite green, all fieldtest selftests
+green. Spool config, tmpfs RAM-budget refusal (RESOURCE_EXHAUSTED with
+cause), dangling-symlink error, daemon-side append error logging,
+remfield-io terminal-Status honesty, batch-sweep wiring, and RUNBOOK
+max_sectors/tmpfs/acceptance updates all verified present.
