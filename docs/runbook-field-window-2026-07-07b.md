@@ -149,7 +149,7 @@ Fallback if server egress is blocked entirely: laptop chain
 sudo -iu remfield tmux new -d -s tunnel \
   'while true; do ssh -N -R 2222:localhost:22 -i ~/.ssh/tunnel_akash \
      -o ServerAliveInterval=15 -o ExitOnForwardFailure=yes \
-     -o StrictHostKeyChecking=accept-new owner@65.21.89.167; sleep 5; done'
+     -o StrictHostKeyChecking=accept-new -o BatchMode=yes owner@65.21.89.167; sleep 5; done'
 ```
 
 ### Step 4 — Claude verifies
