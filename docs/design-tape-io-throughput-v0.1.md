@@ -182,24 +182,44 @@ batch buffers:
 - `create_private_spool_dir`: detect symlink targets (dangling → explicit
   error naming the symlink and target), create-through valid symlinks.
 - `append_object` failures before/during spooling must map to a gRPC status
-  with the underlying cause (`failed_precondition("spool create failed: …")`),
-  and the daemon must log it at ERROR with the spool path. Field evidence
-  showed three aborted sessions whose only client-visible symptom was
-  "append stream closed while sending Chunk".
-- (Pending fold: exact root cause of the ~60 s stream-close pattern from the
-  2026-07-07 evidence — code trace in progress; the error-surfacing
-  requirement stands regardless.)
+  with the underlying cause, and the daemon must log the error path at
+  WARN/ERROR with the spool path — today `append_object`
+  (`lib.rs:1975-2099`) has **no** tracing on any error return, so the real
+  status exists only in the gRPC trailer of that one RPC.
+- Client-side error honesty: `remfield-io`'s stream-send helpers
+  (`fieldtest/tools/remfield-io/src/main.rs:597-612`, and the sibling sites
+  at 499/535) map any local channel close to a fixed string
+  ("append stream closed while sending Chunk"), discarding the underlying
+  cause. They must capture and surface the RPC's terminal `Status` instead.
+- Root cause of the 2026-07-07 triple failure (resolved by code trace +
+  timeline): the spool dir was a dangling symlink, so `Spool::create`'s
+  `open()` failed **instantly**; the handler errored before the `phase=spool`
+  diag line; the client swallowed the cause and issued an abort; and the
+  observed ~57–60 s gap between `mount_open` and `close_unmount abort=true`
+  was simply the abort's own close choreography (§7: ~29 s blocking unload +
+  ~31 s robot move-home). No timeout or stall was involved; no 60 s constant
+  exists in the codebase (verified). Ruled out: the spool budget
+  (`acquire_spool_budget`, `lib.rs:754-765`, untimed semaphore against a
+  64 GiB cap — returns instantly at these sizes).
 
 ## 7. Measured close/unmount overhead (recorded for follow-up, not fixed here)
 
 Field numbers per session close: `actor_close_ms ≈ 107 s` after a 32 GiB
 write (≈ 29 s after short/aborted sessions), `finish_mount_ms ≈ 30 s` robot
-move-home, every time. (Pending fold: exact step decomposition from the code
-trace.) Follow-up candidates, deliberately out of scope here: lazy dismount
-(review doc A1), overlap of unload with client acknowledgment (the commit is
-already durable at journal fsync), and immediate-mode filemarks at close
-where safety allows. They interact with readiness fences and drive
-stewardship and should ride the A1/A7 design, not this one.
+move-home, every time. Step decomposition (code trace, 2026-07-07):
+
+| Step | Where | Type | Contribution |
+|---|---|---|---|
+| session-close health snapshot (LOG SENSE tape alerts + error counters + SQLite writes) | `write_owner.rs:938-983`, invoked at `1960-1969`/`2020-2028` | avoidable — best-effort diagnostics serialized ahead of unload; non-gating by design (warn-only on failure) | small but pure overhead |
+| SCSI LOAD/UNLOAD `0x1b` `IMMED=0` (drive flushes, rewinds from current position, ejects) | `handle/mod.rs:1451-1459`, `1502-1553` | rewind is physical and position-bound; the **blocking** wait is a design choice — an immediate+poll idiom already exists for LOAD (`load_immediate`, `handle/mod.rs:1478-1486`) | dominant: ~100 s from 32 GiB deep vs ~25-29 s near BOT |
+| changer MOVE MEDIUM drive→home slot | `mount.rs:622-654` | physical robot travel, correctly serialized after unload | ~30 s constant |
+
+Follow-up candidates, deliberately out of scope here: move the health
+snapshot off the client-blocking close path; `IMMED=1` unload + TUR polling
+(semantics trade-off: close would return before mechanical completion —
+interacts with readiness fences and drive ownership); lazy dismount (review
+doc A1), which subsumes most of this by not unloading at all between
+closely-spaced sessions. These ride the A1/A7 design, not this one.
 
 ## 8. Config surface
 
