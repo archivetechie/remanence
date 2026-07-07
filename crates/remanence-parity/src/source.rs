@@ -1023,11 +1023,11 @@ impl<'a> BlockSource for ObjectParitySource<'a> {
         self.last_read_erasure_body_lba = None;
         self.locate_body_lba(target)
             .map_err(parity_error_to_tape_io_error)?;
-        Ok(SpaceResult {
-            units_traversed: count,
-            stopped_at_boundary: target == 0 || target == self.object_block_count,
-            position_after: body_position(self.cursor_body_lba, self.object_block_count),
-        })
+        Ok(SpaceResult::from_device_position(
+            count,
+            target == 0 || target == self.object_block_count,
+            body_position(self.cursor_body_lba, self.object_block_count),
+        ))
     }
 
     fn position(&mut self) -> Result<TapePosition, TapeIoError> {

@@ -261,12 +261,12 @@ impl BlockSink for FileBlockSink {
             .next_lba
             .checked_add(1)
             .ok_or_else(|| TapeIoError::OperationFailed("file block LBA overflow".to_string()))?;
-        Ok(WriteOutcome {
-            bytes_written: buf.len() as u32,
-            early_warning: false,
-            end_of_medium: false,
-            position_after: file_tape_position(self.next_lba, false),
-        })
+        Ok(WriteOutcome::from_device_position(
+            buf.len() as u32,
+            false,
+            false,
+            file_tape_position(self.next_lba, false),
+        ))
     }
 
     fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
@@ -275,11 +275,11 @@ impl BlockSink for FileBlockSink {
                 "file block sink does not support filemarks".to_string(),
             ));
         }
-        Ok(WriteFilemarksOutcome {
-            early_warning: false,
-            end_of_medium: false,
-            position_after: file_tape_position(self.next_lba, false),
-        })
+        Ok(WriteFilemarksOutcome::from_device_position(
+            false,
+            false,
+            file_tape_position(self.next_lba, false),
+        ))
     }
 
     fn position(&mut self) -> Result<TapePosition, TapeIoError> {
@@ -435,11 +435,11 @@ impl BlockSource for FileBlockSource {
         };
 
         self.cursor = new_cursor_signed as u64;
-        Ok(SpaceResult {
+        Ok(SpaceResult::from_device_position(
             units_traversed,
             stopped_at_boundary,
-            position_after: file_tape_position(self.cursor, self.cursor == self.block_count),
-        })
+            file_tape_position(self.cursor, self.cursor == self.block_count),
+        ))
     }
 
     fn position(&mut self) -> Result<TapePosition, TapeIoError> {
@@ -548,18 +548,18 @@ impl BlockSink for VecBlockSink {
         self.blocks.push(buf.to_vec());
         self.next_lba = next_lba;
         self.eod_lba = self.eod_lba.max(self.next_lba);
-        Ok(WriteOutcome {
-            bytes_written: buf.len() as u32,
-            early_warning: false,
-            end_of_medium: false,
-            position_after: TapePosition {
+        Ok(WriteOutcome::from_device_position(
+            buf.len() as u32,
+            false,
+            false,
+            TapePosition {
                 lba: self.next_lba,
                 partition: 0,
                 beginning_of_partition: false,
                 end_of_partition: false,
                 block_position_end_of_warning: false,
             },
-        })
+        ))
     }
 
     fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
@@ -569,17 +569,17 @@ impl BlockSink for VecBlockSink {
             .checked_add(count as u64)
             .expect("VecBlockSink LBA overflow on filemark");
         self.eod_lba = self.eod_lba.max(self.next_lba);
-        Ok(WriteFilemarksOutcome {
-            early_warning: false,
-            end_of_medium: false,
-            position_after: TapePosition {
+        Ok(WriteFilemarksOutcome::from_device_position(
+            false,
+            false,
+            TapePosition {
                 lba: self.next_lba,
                 partition: 0,
                 beginning_of_partition: false,
                 end_of_partition: false,
                 block_position_end_of_warning: false,
             },
-        })
+        ))
     }
 
     fn space_to_end_of_data(&mut self) -> Result<TapePosition, TapeIoError> {
@@ -782,17 +782,17 @@ impl BlockSource for VecBlockSource {
         };
 
         self.cursor = new_cursor_signed as u64;
-        Ok(SpaceResult {
+        Ok(SpaceResult::from_device_position(
             units_traversed,
             stopped_at_boundary,
-            position_after: TapePosition {
+            TapePosition {
                 lba: self.cursor,
                 partition: 0,
                 beginning_of_partition: self.cursor == 0,
                 end_of_partition: self.cursor as usize >= self.blocks.len(),
                 block_position_end_of_warning: false,
             },
-        })
+        ))
     }
 
     fn position(&mut self) -> Result<TapePosition, TapeIoError> {

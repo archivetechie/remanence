@@ -73,6 +73,17 @@ type AuditHook = Box<dyn FnMut(&AuditEvent<'_>) + Send>;
 /// constructed the handle.
 type TransportFactory = Box<dyn FnMut(&Path) -> Result<Box<dyn SgTransport>, IoErrorKind>>;
 
+const DEFAULT_TAPE_IO_BATCH_BLOCKS: u32 = 16;
+const DEFAULT_TAPE_IO_RECORD_BYTES_FOR_RESERVED_BUFFER: u32 = 256 * 1024;
+const DEFAULT_TAPE_IO_POSITION_CHECK_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn effective_batch_blocks_from_reserved(reserved_bytes: u32, block_size_bytes: u32) -> u32 {
+    if block_size_bytes == 0 {
+        return 1;
+    }
+    (reserved_bytes / block_size_bytes).clamp(1, DEFAULT_TAPE_IO_BATCH_BLOCKS)
+}
+
 /// The library's medium changer plus its inventory snapshot.
 ///
 /// This handle owns the changer transport and issues changer CDBs
@@ -877,6 +888,14 @@ impl LibraryHandle {
                 actual: actual_serial,
             });
         }
+        let requested_reserved_size_bytes = DEFAULT_TAPE_IO_BATCH_BLOCKS
+            .saturating_mul(DEFAULT_TAPE_IO_RECORD_BYTES_FOR_RESERVED_BUFFER);
+        let sg_reserved_size_bytes =
+            transport.configure_reserved_buffer(requested_reserved_size_bytes)?;
+        let effective_batch_blocks = effective_batch_blocks_from_reserved(
+            sg_reserved_size_bytes,
+            DEFAULT_TAPE_IO_RECORD_BYTES_FOR_RESERVED_BUFFER,
+        );
 
         let library_serial = self.changer.library.serial.clone();
         Ok(DriveHandle {
@@ -886,6 +905,14 @@ impl LibraryHandle {
             transport,
             max_write_block_size_bytes: None,
             position_known: true,
+            expected_position: None,
+            bytes_since_position_check: 0,
+            position_check_bytes: DEFAULT_TAPE_IO_POSITION_CHECK_BYTES,
+            requested_write_batch_blocks: DEFAULT_TAPE_IO_BATCH_BLOCKS,
+            requested_read_batch_blocks: DEFAULT_TAPE_IO_BATCH_BLOCKS,
+            effective_write_batch_blocks: effective_batch_blocks,
+            effective_read_batch_blocks: effective_batch_blocks,
+            sg_reserved_size_bytes,
             shared: self.changer.shared.clone(),
         })
     }
@@ -1397,6 +1424,24 @@ pub struct DriveHandle {
     /// a positioning command or READ POSITION succeeds. Destructive
     /// writes are refused while false.
     position_known: bool,
+    /// Arithmetic cursor seeded from READ POSITION and advanced by
+    /// clean fixed-mode batched operations.
+    expected_position: Option<tape_io::TapePosition>,
+    /// Bytes advanced since the last tripwire READ POSITION.
+    bytes_since_position_check: u64,
+    /// Tripwire cadence for arithmetic cursor checks. Zero disables
+    /// mid-stream checks.
+    position_check_bytes: u64,
+    /// Configured write batch in fixed records before sg/HBA clamp.
+    requested_write_batch_blocks: u32,
+    /// Configured read batch in fixed records before sg/HBA clamp.
+    requested_read_batch_blocks: u32,
+    /// Effective write batch after sg reserved-buffer clamp.
+    effective_write_batch_blocks: u32,
+    /// Effective read batch after sg reserved-buffer clamp.
+    effective_read_batch_blocks: u32,
+    /// Actual sg reserved buffer size reported by the transport.
+    sg_reserved_size_bytes: u32,
     /// Shared audit hook + dirty-state cell cloned from the parent
     /// library handle.
     shared: Arc<Mutex<DriveShared>>,
@@ -1415,6 +1460,16 @@ impl std::fmt::Debug for DriveHandle {
                 &self.max_write_block_size_bytes,
             )
             .field("position_known", &self.position_known)
+            .field("expected_position", &self.expected_position)
+            .field(
+                "effective_write_batch_blocks",
+                &self.effective_write_batch_blocks,
+            )
+            .field(
+                "effective_read_batch_blocks",
+                &self.effective_read_batch_blocks,
+            )
+            .field("sg_reserved_size_bytes", &self.sg_reserved_size_bytes)
             .field(
                 "audit_hook",
                 &if shared.audit_hook.is_some() {
@@ -1442,6 +1497,31 @@ impl DriveHandle {
     /// Library serial this drive belongs to.
     pub fn library_serial(&self) -> &str {
         &self.library_serial
+    }
+
+    /// Requested write batch size before sg/HBA clamping.
+    pub fn requested_write_batch_blocks(&self) -> u32 {
+        self.requested_write_batch_blocks
+    }
+
+    /// Requested read batch size before sg/HBA clamping.
+    pub fn requested_read_batch_blocks(&self) -> u32 {
+        self.requested_read_batch_blocks
+    }
+
+    /// Effective write batch size after sg reserved-buffer clamping.
+    pub fn effective_write_batch_blocks(&self) -> u32 {
+        self.effective_write_batch_blocks
+    }
+
+    /// Effective read batch size after sg reserved-buffer clamping.
+    pub fn effective_read_batch_blocks(&self) -> u32 {
+        self.effective_read_batch_blocks
+    }
+
+    /// Actual sg reserved buffer size reported by the transport.
+    pub fn sg_reserved_size_bytes(&self) -> u32 {
+        self.sg_reserved_size_bytes
     }
 
     /// Issue SSC `UNLOAD` (`0x1B` with byte 4 = 0) to the drive.

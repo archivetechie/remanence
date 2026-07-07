@@ -1,10 +1,11 @@
-//! Layer 3a value types — `TapePosition`, `BlockSize`, `SpaceKind`,
-//! `SpaceResult`, `WriteOutcome`, `TapeConfig`.
+//! Layer 3a value types — `TapePosition`, position proofs,
+//! `BlockSize`, `SpaceKind`, `SpaceResult`, write/read outcomes, and
+//! `TapeConfig`.
 //!
-//! All public, all `#[derive]`-only (no manual impls). Each carries
-//! enough that the caller doesn't need a follow-up CDB to learn what
-//! just happened — see `docs/layer3a-design.md` §4 for the rationale
-//! behind each field.
+//! These structs carry enough information that callers do not need a
+//! follow-up CDB to learn what just happened. Position-bearing results
+//! also expose whether a position came from READ POSITION or from
+//! arithmetic over a previously proven cursor.
 
 /// Output of `READ POSITION` (long-form) — where the head sits right
 /// now. Returned by every Layer 3a method that moves the tape so the
@@ -40,6 +41,92 @@ pub struct TapePosition {
     /// itself does not auto-retire near-EOM tapes (Layer 5
     /// policy).
     pub block_position_end_of_warning: bool,
+}
+
+/// Position proven by a successful READ POSITION response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DevicePositionProof {
+    position: TapePosition,
+}
+
+impl DevicePositionProof {
+    pub(crate) fn from_device_position(position: TapePosition) -> Self {
+        Self { position }
+    }
+
+    /// The proven tape position.
+    pub fn position(self) -> TapePosition {
+        self.position
+    }
+
+    /// Logical block address from the proven position.
+    pub fn lba(self) -> u64 {
+        self.position.lba
+    }
+}
+
+/// Position computed by arithmetic from an earlier device proof.
+///
+/// ```compile_fail
+/// use remanence_library::{ComputedPosition, DevicePositionProof};
+///
+/// fn commit_boundary(_: DevicePositionProof) {}
+///
+/// fn cannot_commit_with_computed(position: ComputedPosition) {
+///     commit_boundary(position);
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComputedPosition {
+    position: TapePosition,
+}
+
+impl ComputedPosition {
+    pub(crate) fn from_position(position: TapePosition) -> Self {
+        Self { position }
+    }
+
+    /// The computed tape position.
+    pub fn position(self) -> TapePosition {
+        self.position
+    }
+
+    /// Logical block address from the computed position.
+    pub fn lba(self) -> u64 {
+        self.position.lba
+    }
+}
+
+/// Evidence behind a position-bearing operation result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionAfter {
+    /// Position came from READ POSITION.
+    Device(DevicePositionProof),
+    /// Position was advanced arithmetically.
+    Computed(ComputedPosition),
+}
+
+impl PositionAfter {
+    /// Return the tape position regardless of evidence kind.
+    pub fn position(self) -> TapePosition {
+        match self {
+            Self::Device(proof) => proof.position(),
+            Self::Computed(position) => position.position(),
+        }
+    }
+
+    /// Logical block address regardless of evidence kind.
+    pub fn lba(self) -> u64 {
+        self.position().lba
+    }
+
+    /// Return a device proof when this result has one.
+    pub fn device_proof(self) -> Option<DevicePositionProof> {
+        match self {
+            Self::Device(proof) => Some(proof),
+            Self::Computed(_) => None,
+        }
+    }
 }
 
 /// How Layer 3a addresses the variable-vs-fixed block choice.
@@ -110,6 +197,31 @@ pub struct SpaceResult {
     /// READ POSITION. Lets the caller turn a relative skip into an
     /// absolute LBA for the next read without a second round-trip.
     pub position_after: TapePosition,
+    position_evidence: PositionAfter,
+}
+
+impl SpaceResult {
+    /// Construct a SPACE result whose post-position came from READ
+    /// POSITION.
+    pub fn from_device_position(
+        units_traversed: i64,
+        stopped_at_boundary: bool,
+        position_after: TapePosition,
+    ) -> Self {
+        Self {
+            units_traversed,
+            stopped_at_boundary,
+            position_after,
+            position_evidence: PositionAfter::Device(DevicePositionProof::from_device_position(
+                position_after,
+            )),
+        }
+    }
+
+    /// Evidence behind `position_after`.
+    pub fn position_evidence(&self) -> PositionAfter {
+        self.position_evidence
+    }
 }
 
 /// Outcome of a `write_block` call. `WRITE` can stop short of the
@@ -134,6 +246,38 @@ pub struct WriteOutcome {
     /// just wrote without a second round-trip — useful for recording
     /// the per-chunk LBA in the catalog.
     pub position_after: TapePosition,
+    position_evidence: PositionAfter,
+}
+
+impl WriteOutcome {
+    /// Construct a write outcome whose post-position came from READ
+    /// POSITION.
+    pub fn from_device_position(
+        bytes_written: u32,
+        early_warning: bool,
+        end_of_medium: bool,
+        position_after: TapePosition,
+    ) -> Self {
+        Self {
+            bytes_written,
+            early_warning,
+            end_of_medium,
+            position_after,
+            position_evidence: PositionAfter::Device(DevicePositionProof::from_device_position(
+                position_after,
+            )),
+        }
+    }
+
+    /// Evidence behind `position_after`.
+    pub fn position_evidence(&self) -> PositionAfter {
+        self.position_evidence
+    }
+
+    /// Device proof carried by the legacy single-block write path.
+    pub fn device_position_proof(&self) -> Option<DevicePositionProof> {
+        self.position_evidence.device_proof()
+    }
 }
 
 /// Outcome of a `write_block_unpositioned` call. This is the hot-path
@@ -178,6 +322,139 @@ pub struct WriteFilemarksOutcome {
     /// inline READ POSITION). The caller can record the LBA of
     /// the marks without a second round-trip.
     pub position_after: TapePosition,
+    position_evidence: PositionAfter,
+}
+
+impl WriteFilemarksOutcome {
+    /// Construct a filemark outcome whose post-position came from
+    /// READ POSITION.
+    pub fn from_device_position(
+        early_warning: bool,
+        end_of_medium: bool,
+        position_after: TapePosition,
+    ) -> Self {
+        Self {
+            early_warning,
+            end_of_medium,
+            position_after,
+            position_evidence: PositionAfter::Device(DevicePositionProof::from_device_position(
+                position_after,
+            )),
+        }
+    }
+
+    /// Evidence behind `position_after`.
+    pub fn position_evidence(&self) -> PositionAfter {
+        self.position_evidence
+    }
+
+    /// Device proof for the post-filemark boundary.
+    pub fn device_position_proof(&self) -> DevicePositionProof {
+        match self.position_evidence {
+            PositionAfter::Device(proof) => proof,
+            PositionAfter::Computed(_) => unreachable!("filemark outcome must be device-proven"),
+        }
+    }
+}
+
+/// Outcome of a fixed-mode multi-record WRITE(6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteBatchOutcome {
+    /// Records accepted by the CDB.
+    pub records_written: u32,
+    /// Bytes represented by `records_written`.
+    pub bytes_written: u32,
+    /// True iff sense indicated approaching end-of-medium.
+    pub early_warning: bool,
+    /// True iff the drive reported hard end-of-medium.
+    pub end_of_medium: bool,
+    /// Position immediately after the accepted records.
+    pub position_after: TapePosition,
+    position_evidence: PositionAfter,
+}
+
+impl WriteBatchOutcome {
+    pub(crate) fn from_computed_position(
+        records_written: u32,
+        bytes_written: u32,
+        early_warning: bool,
+        end_of_medium: bool,
+        position_after: TapePosition,
+    ) -> Self {
+        Self {
+            records_written,
+            bytes_written,
+            early_warning,
+            end_of_medium,
+            position_after,
+            position_evidence: PositionAfter::Computed(ComputedPosition::from_position(
+                position_after,
+            )),
+        }
+    }
+
+    pub(crate) fn from_device_position(
+        records_written: u32,
+        bytes_written: u32,
+        early_warning: bool,
+        end_of_medium: bool,
+        position_after: TapePosition,
+    ) -> Self {
+        Self {
+            records_written,
+            bytes_written,
+            early_warning,
+            end_of_medium,
+            position_after,
+            position_evidence: PositionAfter::Device(DevicePositionProof::from_device_position(
+                position_after,
+            )),
+        }
+    }
+
+    /// Evidence behind `position_after`.
+    pub fn position_evidence(&self) -> PositionAfter {
+        self.position_evidence
+    }
+}
+
+/// Outcome of a fixed-mode multi-record READ(6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadBatchOutcome {
+    /// Data records read before completion or a filemark backstop.
+    pub records_read: u32,
+    /// Bytes represented by `records_read`.
+    pub bytes_read: u32,
+    /// True iff READ stopped on a filemark.
+    pub filemark: bool,
+    /// Position after the read. Filemark outcomes include the
+    /// consumed filemark in this arithmetic position.
+    pub position_after: TapePosition,
+    position_evidence: PositionAfter,
+}
+
+impl ReadBatchOutcome {
+    pub(crate) fn from_computed_position(
+        records_read: u32,
+        bytes_read: u32,
+        filemark: bool,
+        position_after: TapePosition,
+    ) -> Self {
+        Self {
+            records_read,
+            bytes_read,
+            filemark,
+            position_after,
+            position_evidence: PositionAfter::Computed(ComputedPosition::from_position(
+                position_after,
+            )),
+        }
+    }
+
+    /// Evidence behind `position_after`.
+    pub fn position_evidence(&self) -> PositionAfter {
+        self.position_evidence
+    }
 }
 
 /// WORM media state decoded from drive-reported mode data.
@@ -276,11 +553,7 @@ mod tests {
             end_of_partition: false,
             block_position_end_of_warning: false,
         };
-        let r = SpaceResult {
-            units_traversed: -5,
-            stopped_at_boundary: false,
-            position_after: p,
-        };
+        let r = SpaceResult::from_device_position(-5, false, p);
         assert_eq!(r.units_traversed, -5);
         assert_eq!(r.position_after.lba, 42);
     }
@@ -294,12 +567,7 @@ mod tests {
             end_of_partition: false,
             block_position_end_of_warning: false,
         };
-        let o = WriteOutcome {
-            bytes_written: 1024 * 1024,
-            early_warning: false,
-            end_of_medium: false,
-            position_after: p,
-        };
+        let o = WriteOutcome::from_device_position(1024 * 1024, false, false, p);
         assert!(!o.early_warning);
         assert!(!o.end_of_medium);
         assert_eq!(o.bytes_written, 1024 * 1024);
@@ -314,12 +582,7 @@ mod tests {
             end_of_partition: false,
             block_position_end_of_warning: true,
         };
-        let o = WriteOutcome {
-            bytes_written: 512 * 1024,
-            early_warning: true,
-            end_of_medium: false,
-            position_after: p,
-        };
+        let o = WriteOutcome::from_device_position(512 * 1024, true, false, p);
         assert!(o.early_warning);
         assert!(o.position_after.block_position_end_of_warning);
     }

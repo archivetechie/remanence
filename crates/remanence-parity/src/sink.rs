@@ -281,12 +281,12 @@ impl ParitySinkBackend<'_> {
                 position_after,
                 early_warning,
                 end_of_medium,
-            } => Ok(WriteOutcome {
+            } => Ok(WriteOutcome::from_device_position(
                 bytes_written,
                 early_warning,
                 end_of_medium,
-                position_after: physical_to_tape_position(position_after),
-            }),
+                physical_to_tape_position(position_after),
+            )),
             RawWriteOutcome::WroteFilemark { .. } => Err(invalid_input(
                 "RawTapeSink::write_fixed_block returned a filemark outcome",
             )),
@@ -299,11 +299,11 @@ impl ParitySinkBackend<'_> {
                 position_after,
                 early_warning,
                 end_of_medium,
-            } => Ok(WriteFilemarksOutcome {
+            } => Ok(WriteFilemarksOutcome::from_device_position(
                 early_warning,
                 end_of_medium,
-                position_after: physical_to_tape_position(position_after),
-            }),
+                physical_to_tape_position(position_after),
+            )),
             RawWriteOutcome::WroteBlock { .. } => Err(invalid_input(
                 "RawTapeSink::write_filemark returned a block outcome",
             )),

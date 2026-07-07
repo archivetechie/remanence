@@ -379,6 +379,13 @@ fn space_residual_returns_none_for_descriptor_sense() {
 }
 
 #[test]
+fn space_residual_returns_none_for_deferred_sense() {
+    let mut sense = sense_with_info(0x00, 3);
+    sense[0] = 0x80 | 0x71;
+    assert_eq!(space_residual_if_early_stop(&sense), None);
+}
+
+#[test]
 fn space_residual_handles_empty_sense() {
     assert_eq!(space_residual_if_early_stop(&[]), None);
 }
@@ -427,6 +434,13 @@ fn ili_returns_none_without_valid_bit() {
 fn ili_returns_none_for_descriptor_sense() {
     let mut sense = vec![0u8; 16];
     sense[0] = 0xF2; // descriptor + VALID
+    assert_eq!(ili_signed_information(&sense), None);
+}
+
+#[test]
+fn ili_returns_none_for_deferred_sense() {
+    let mut sense = ili_sense(100);
+    sense[0] = 0x80 | 0x71;
     assert_eq!(ili_signed_information(&sense), None);
 }
 
@@ -481,6 +495,30 @@ fn write_eom_signal_returns_none_for_descriptor_sense() {
     assert!(write_eom_signal(&s).is_none());
 }
 
+#[test]
+fn write_eom_signal_returns_none_for_deferred_sense() {
+    let mut s = eom_sense(0x00);
+    s[0] = 0x71;
+    assert!(write_eom_signal(&s).is_none());
+}
+
+#[test]
+fn fixed_records_transferred_requires_valid_current_sense() {
+    let mut sense = sense_with_info(0x00, 2);
+    assert_eq!(fixed_records_transferred_from_sense(&sense, 5), Some(3));
+
+    sense[0] = 0x70;
+    assert_eq!(fixed_records_transferred_from_sense(&sense, 5), None);
+
+    sense[0] = 0x80 | 0x70;
+    sense[3..7].copy_from_slice(&6u32.to_be_bytes());
+    assert_eq!(fixed_records_transferred_from_sense(&sense, 5), None);
+
+    sense[0] = 0x80 | 0x71;
+    sense[3..7].copy_from_slice(&2u32.to_be_bytes());
+    assert_eq!(fixed_records_transferred_from_sense(&sense, 5), None);
+}
+
 // -- read_filemark_signal helper (Step 9.6) --------------------
 
 fn filemark_sense() -> Vec<u8> {
@@ -512,6 +550,13 @@ fn read_filemark_signal_returns_none_for_descriptor_sense() {
     sense[1] = 0x00;
     sense[2] = 0x00;
     sense[3] = 0x01;
+    assert!(!read_filemark_signal(&sense));
+}
+
+#[test]
+fn read_filemark_signal_returns_none_for_deferred_sense() {
+    let mut sense = filemark_sense();
+    sense[0] = 0x80 | 0x71;
     assert!(!read_filemark_signal(&sense));
 }
 
