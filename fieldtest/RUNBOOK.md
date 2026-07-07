@@ -127,6 +127,10 @@ past a red gate.
 | 1.3 | `13-append-loop.sh` | repeated independent object writes to one pool; same tape UUID, dense tape-file numbers, read-back SHA-256 for every object |
 
 **GO gate:** happy-path reports `fidelity: PASS` for both objects.
+The Phase 1 scripts are LTO-9-readiness-aware for ordinary daemon I/O:
+if a write/read open returns a `media-readiness fence operation=...`, the
+script records `*-readiness-blocked-*`, waits on the operation, and retries.
+Terminal, timeout, or transport-unknown readiness results remain hard stops.
 **If blocked:** a single drive failing → continue on the other, note in
 evidence; catalog errors → capture `evidence/` + daemon log, then
 `91-cleanup.sh --state-only` and retry once from 1.1.

@@ -108,14 +108,14 @@ main() {
   object_sha="$(sha256_file "$object_plain")"
 
   locator_plain="$(fieldtest_artifact_path "$SCRIPT_NAME" write-locator-plain "$stamp")"
-  if ! fieldtest_capture_json "$locator_plain" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$object_plain" --pool fieldtest-a; then
+  if ! fieldtest_capture_io_json "$locator_plain" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$object_plain" --pool fieldtest-a; then
     fieldtest_evidence_record "$SCRIPT_NAME" write-plain FAIL "daemon write failed for plaintext object" "$locator_plain"
     exit 1
   fi
   fieldtest_evidence_record "$SCRIPT_NAME" write-plain PASS "plaintext object written to fieldtest-a" "$locator_plain"
 
   read_plain="$(fieldtest_artifact_path "$SCRIPT_NAME" read-plain "$stamp")"
-  if ! fieldtest_capture_json "$read_plain" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator_plain")" --out "$restored_plain"; then
+  if ! fieldtest_capture_io_json "$read_plain" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator_plain")" --out "$restored_plain"; then
     fieldtest_evidence_record "$SCRIPT_NAME" read-plain FAIL "daemon read failed for plaintext object" "$read_plain"
     exit 1
   fi
@@ -146,12 +146,12 @@ PY
   build_object "$encrypted_object" "$encrypted_manifest" "$workdir/inputs" "$key_file"
   encrypted_sha="$(sha256_file "$encrypted_object")"
   encrypted_locator="$(fieldtest_artifact_path "$SCRIPT_NAME" write-locator-encrypted "$stamp")"
-  if ! fieldtest_capture_json "$encrypted_locator" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$encrypted_object" --pool fieldtest-b; then
+  if ! fieldtest_capture_io_json "$encrypted_locator" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$encrypted_object" --pool fieldtest-b; then
     fieldtest_evidence_record "$SCRIPT_NAME" write-encrypted FAIL "daemon write failed for encrypted object" "$encrypted_locator"
     exit 1
   fi
   restored_encrypted="$workdir/restored-encrypted.rao"
-  if ! fieldtest_capture_json "$workdir/read-encrypted.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$encrypted_locator")" --out "$restored_encrypted"; then
+  if ! fieldtest_capture_io_json "$workdir/read-encrypted.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$encrypted_locator")" --out "$restored_encrypted"; then
     fieldtest_evidence_record "$SCRIPT_NAME" read-encrypted FAIL "daemon read failed for encrypted object" "$workdir/read-encrypted.json"
     exit 1
   fi
@@ -163,7 +163,7 @@ PY
 
   local verify_json
   verify_json="$workdir/verify.json"
-  if ! fieldtest_capture_json "$verify_json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator_plain")" --out "$workdir/verify-restored.rao"; then
+  if ! fieldtest_capture_io_json "$verify_json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator_plain")" --out "$workdir/verify-restored.rao"; then
     fieldtest_evidence_record "$SCRIPT_NAME" verify FAIL "daemon verify read failed for plaintext object" "$verify_json"
     exit 1
   fi

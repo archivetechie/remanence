@@ -64,7 +64,7 @@ write_fixture_object() {
   mkdir -p "$workdir"
   make_payload "$source" "$size_bytes"
   fieldtest_capture_json "$workdir/build.json" "$(fieldtest_rem_bin)" archive build --inputs "$source" --out "$object"
-  fieldtest_capture_json "$locator" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$(fieldtest_selected_library_serial)" --file "$object" --pool "$pool"
+  fieldtest_capture_io_json "$locator" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$(fieldtest_selected_library_serial)" --file "$object" --pool "$pool"
   printf '%s\n' "$source|$object|$locator"
 }
 
@@ -89,11 +89,11 @@ kill_mid_write() {
   kill -9 "$daemon_pid" || true
   wait "$writer_pid" || true
   "$(fieldtest_script_dir)/03-bringup.sh" >/dev/null 2>&1 || true
-  fieldtest_capture_json "$workdir/write-result.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator")" --out "$workdir/write-result.rao" || true
+  fieldtest_capture_io_json "$workdir/write-result.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator")" --out "$workdir/write-result.rao" || true
   local b_restored b_read_json
   b_restored="$workdir/fieldtest-b-prefix-restored.rao"
   b_read_json="$workdir/fieldtest-b-prefix-read.json"
-  if ! fieldtest_capture_json "$b_read_json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$b_locator")" --out "$b_restored"; then
+  if ! fieldtest_capture_io_json "$b_read_json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$b_locator")" --out "$b_restored"; then
     fieldtest_evidence_record "$SCRIPT_NAME" kill-mid-write FAIL "committed fieldtest-b prefix object was not readable after killed append" "$b_read_json"
     exit 1
   fi
@@ -101,7 +101,7 @@ kill_mid_write() {
     fieldtest_evidence_record "$SCRIPT_NAME" kill-mid-write FAIL "committed fieldtest-b prefix object SHA changed after killed append" "$b_read_json"
     exit 1
   fi
-  fieldtest_capture_json "$workdir/post.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$object" --pool fieldtest-a
+  fieldtest_capture_io_json "$workdir/post.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$object" --pool fieldtest-a
   fieldtest_capture_json "$workdir/catalog.json" "$(fieldtest_rem_bin)" catalog --endpoint "$(fieldtest_rem_endpoint)" tapes --json
   fieldtest_evidence_record "$SCRIPT_NAME" kill-mid-write PASS "daemon was killed mid-append, pre-existing fieldtest-b object read back, and a follow-up write succeeded" "$workdir/catalog.json"
   rm -rf -- "$workdir"
@@ -118,7 +118,7 @@ rebuild_catalog() {
   fieldtest_capture_text "$workdir/rebuild.txt" "$(fieldtest_rem_bin)" rebuild-catalog-from-journals --config "$(fieldtest_config_path)"
   "$(fieldtest_script_dir)/03-bringup.sh" >/dev/null 2>&1 || true
   local restored="$workdir/restored.rao"
-  fieldtest_capture_json "$workdir/read.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator")" --out "$restored"
+  fieldtest_capture_io_json "$workdir/read.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator")" --out "$restored"
   fieldtest_capture_json "$workdir/history.json" "$(fieldtest_rem_bin)" drive --endpoint "$(fieldtest_rem_endpoint)" history "$serial" --events --snapshots --json
   fieldtest_evidence_record "$SCRIPT_NAME" rebuild PASS "catalog rebuilt from journals and a pre-rebuild object was restored" "$workdir/rebuild.txt"
   rm -rf -- "$workdir"

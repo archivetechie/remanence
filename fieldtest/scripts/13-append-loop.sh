@@ -222,7 +222,7 @@ main() {
     locator="$(fieldtest_artifact_path "$SCRIPT_NAME" "write-${idx}" "$stamp")"
     make_payload "$source" "$payload_bytes" "$idx"
     source_shas[idx]="$(sha256_file "$source")"
-    if ! fieldtest_capture_json "$locator" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$source" --pool "$pool"; then
+    if ! fieldtest_capture_io_json "$locator" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$source" --pool "$pool"; then
       fieldtest_evidence_record "$SCRIPT_NAME" "write-${idx}" FAIL "append-loop write $idx failed" "$locator"
       exit 1
     fi
@@ -240,7 +240,7 @@ main() {
   for ((idx = 0; idx < count; idx++)); do
     restored="$workdir/restored-${idx}.bin"
     read_json="$(fieldtest_artifact_path "$SCRIPT_NAME" "read-${idx}" "$stamp")"
-    if ! fieldtest_capture_json "$read_json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "${locators[$idx]}")" --out "$restored"; then
+    if ! fieldtest_capture_io_json "$read_json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "${locators[$idx]}")" --out "$restored"; then
       fieldtest_evidence_record "$SCRIPT_NAME" "read-${idx}" FAIL "append-loop read $idx failed" "$read_json"
       exit 1
     fi
