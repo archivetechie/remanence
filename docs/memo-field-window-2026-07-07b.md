@@ -97,3 +97,33 @@ Validation of the ≥200 gate after the sg-grant + close work; dual-drive clean
 aggregate; end-of-media rollover (physically infeasible in short windows — needs a
 dedicated long window or stays VTL); soak report + teardown tomorrow morning
 (keys self-expire 2026-07-08 12:00).
+
+## Addendum (same night) — the throughput ceiling is the platform's, proven three ways
+
+Per-command arithmetic from tonight's diagnostics: tape accepts commands strictly
+serially; measured cadence ≈6.2–7.2 ms/command at the 1 MiB-per-command grant ⇒
+~160 MB/s feed ceiling. The 1 MiB grant matches the smartpqi (Smart Array
+P408e-p/E208e-p) max-transfer-per-request ceiling; sg on this host: def_reserved
+32 KiB, scatter_elem 32 KiB, allow_dio=0.
+
+**Independent corroboration from the org's own record** (mined email threads,
+`~/proposal/research/evidence-problems-waste.md`): IT's weeks of 2025 testing
+measured Miria-mediated LTO-9 at 40–299 write / 67–127 read MB/s; a single-tar
+360 GB restore at **196 MB/s ("exactly half" of their 400 expectation)**; real
+Miria jobs at 167–223 MB/s; their suspicion (4-way SAS splitter cable) was never
+validated — and doesn't hold (each SFF-8644 lane = 12 Gb/s ≈ 1.2 GB/s). Their own
+conclusion later shifted to the P408e-p controller. Three independent stacks —
+Miria, raw tar restore, remanence — converge in the same ~160–220 MB/s band on
+this controller family: **platform ceiling, not software.**
+
+**Remedy**: dedicated SAS HBA in place of the RAID-family controller for the tape
+path. Recommended: **Broadcom 9500-16e** (SAS3816, PCIe 4.0 x8, mpt3sas, ~16 MiB
+max request ⇒ 4 MiB batched commands ⇒ feed capacity ~600 MB/s = drive-limited;
+4 external ports = drive scale-out headroom for migration). ~₹40–60k. Diligence:
+MSL3040 supported-HBA matrix; HPE-branded Broadcom equivalent if procurement
+prefers; existing SFF-8644 cabling reusable. Note drive height: drishti inventory
+records HH LTO-9 (native ~300); IT's 400 expectation assumed FH spec — either
+way the observed cap sits far below both.
+
+Morning batch sweep (batch 1/2/4 at fixed bytes) remains the final confirmation:
+flat ms/command ⇒ HBA-bound (expected); sub-linear growth ⇒ daemon slack too.
