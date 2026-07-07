@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex, RwLock};
 use std::time::{Duration as StdDuration, Instant};
 
 use ciborium::value::Value as CborValue;
@@ -40,6 +40,7 @@ use crate::{
 };
 
 pub(crate) const SPOOL_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const STAGED_READ_CHANNEL_DEPTH: usize = 2;
 
 /// Robotics work to perform after the owner opens and refreshes the library.
 pub(crate) enum RoboticsAction {
@@ -3982,28 +3983,22 @@ fn stream_one_object(
     }
 
     let mut source = DriveHandleSource(drive);
-    let writer = if stream_chunk_bytes == 0 {
-        crate::read_core::ChannelWriter::new(chunk_tx)
-    } else {
-        crate::read_core::ChannelWriter::with_chunk_size(chunk_tx, stream_chunk_bytes as usize)
-    };
-    let mut sink = crate::read_core::CapturePayloadSink::new(writer);
-    crate::read_core::read_object_payload(
-        &mut source,
-        block_size_usize,
-        tape_file.block_count,
-        copy.tape_file_number,
-        manifest_sha256,
-        &mut sink,
-    )
-    .map_err(|err| Status::internal(format!("read object: {err}")))?;
-    let (writer, _payload_bytes, _digest) = sink
-        .finish_with_writer()
-        .map_err(|err| Status::internal(format!("finish payload stream: {err}")))?;
-    writer
-        .finish()
-        .map_err(|err| Status::internal(format!("finish read stream: {err}")))?;
-    Ok(())
+    stream_with_staged_read_sender(chunk_tx, stream_chunk_bytes, |writer| {
+        let mut sink = crate::read_core::CapturePayloadSink::new(writer);
+        crate::read_core::read_object_payload(
+            &mut source,
+            block_size_usize,
+            tape_file.block_count,
+            copy.tape_file_number,
+            manifest_sha256,
+            &mut sink,
+        )
+        .map_err(|err| Status::internal(format!("read object: {err}")))?;
+        let (_payload_bytes, _digest) = sink
+            .finish()
+            .map_err(|err| Status::internal(format!("finish payload stream: {err}")))?;
+        Ok(())
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4126,17 +4121,160 @@ fn stream_file_range_from_source(
 ) -> Result<(), Status> {
     // Ranged reads are opaque stored-payload reads. The daemon does not decrypt
     // or hold key material; clients interpret or decrypt the returned bytes.
-    let mut writer = if stream_chunk_bytes == 0 {
+    stream_with_staged_read_sender(chunk_tx, stream_chunk_bytes, |writer| {
+        crate::read_core::read_plaintext_file_range(source, request, writer)
+            .map_err(status_from_file_range_error)
+    })
+}
+
+fn stream_with_staged_read_sender(
+    chunk_tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
+    stream_chunk_bytes: u32,
+    produce: impl FnOnce(&mut dyn std::io::Write) -> Result<(), Status>,
+) -> Result<(), Status> {
+    let (tx, rx) = std_mpsc::sync_channel(STAGED_READ_CHANNEL_DEPTH);
+    let poison = Arc::new(Mutex::new(None::<String>));
+    std::thread::scope(|scope| {
+        let sender_poison = Arc::clone(&poison);
+        let sender = scope.spawn(move || {
+            drain_staged_read_sender(rx, chunk_tx, stream_chunk_bytes, sender_poison)
+        });
+        let mut writer = StagedReadWriter::new(tx, Arc::clone(&poison));
+        let produce_result = produce(&mut writer).and_then(|()| {
+            writer
+                .finish()
+                .map_err(|err| Status::internal(format!("finish read stream: {err}")))
+        });
+        drop(writer);
+        let sender_result = sender
+            .join()
+            .unwrap_or_else(|_| Err(Status::internal("staged read sender thread panicked")));
+        match sender_result {
+            Ok(()) => produce_result,
+            Err(status) => Err(status),
+        }
+    })
+}
+
+enum StagedReadItem {
+    Data(Vec<u8>),
+    Finish,
+}
+
+struct StagedReadWriter {
+    tx: std_mpsc::SyncSender<StagedReadItem>,
+    poison: Arc<Mutex<Option<String>>>,
+    finished: bool,
+}
+
+impl StagedReadWriter {
+    fn new(tx: std_mpsc::SyncSender<StagedReadItem>, poison: Arc<Mutex<Option<String>>>) -> Self {
+        Self {
+            tx,
+            poison,
+            finished: false,
+        }
+    }
+
+    fn check_poison(&self) -> std::io::Result<()> {
+        if let Some(message) = self
+            .poison
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                format!("staged read sender failed: {message}"),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn finish(&mut self) -> std::io::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.check_poison()?;
+        self.tx.send(StagedReadItem::Finish).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "staged read sender stopped")
+        })?;
+        self.finished = true;
+        self.check_poison()
+    }
+}
+
+impl std::io::Write for StagedReadWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.finished {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "staged read stream already finished",
+            ));
+        }
+        self.check_poison()?;
+        self.tx
+            .send(StagedReadItem::Data(buf.to_vec()))
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "staged read sender stopped")
+            })?;
+        self.check_poison()?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.check_poison()
+    }
+}
+
+fn drain_staged_read_sender(
+    rx: std_mpsc::Receiver<StagedReadItem>,
+    chunk_tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
+    stream_chunk_bytes: u32,
+    poison: Arc<Mutex<Option<String>>>,
+) -> Result<(), Status> {
+    let mut writer = Some(if stream_chunk_bytes == 0 {
         crate::read_core::ChannelWriter::new(chunk_tx)
     } else {
         crate::read_core::ChannelWriter::with_chunk_size(chunk_tx, stream_chunk_bytes as usize)
-    };
-    crate::read_core::read_plaintext_file_range(source, request, &mut writer)
-        .map_err(status_from_file_range_error)?;
-    writer
-        .finish()
-        .map_err(|err| Status::internal(format!("finish read stream: {err}")))?;
-    Ok(())
+    });
+    let mut first_error = None;
+    while let Ok(item) = rx.recv() {
+        if first_error.is_some() {
+            continue;
+        }
+        let result = match item {
+            StagedReadItem::Data(bytes) => match writer.as_mut() {
+                Some(writer) => writer
+                    .write_all(&bytes)
+                    .map_err(|err| Status::internal(format!("send read stream: {err}"))),
+                None => Err(Status::internal("staged read data after finish")),
+            },
+            StagedReadItem::Finish => match writer.take() {
+                Some(writer) => writer
+                    .finish()
+                    .map_err(|err| Status::internal(format!("finish read stream: {err}"))),
+                None => Ok(()),
+            },
+        };
+        if let Err(status) = result {
+            set_staged_read_poison(&poison, status.message());
+            first_error = Some(status);
+        }
+    }
+    match first_error {
+        Some(status) => Err(status),
+        None => Ok(()),
+    }
+}
+
+fn set_staged_read_poison(poison: &Arc<Mutex<Option<String>>>, message: &str) {
+    let mut guard = poison.lock().unwrap_or_else(|err| err.into_inner());
+    guard.get_or_insert_with(|| message.to_string());
 }
 
 fn requested_file_range(
@@ -4978,6 +5116,47 @@ mod tests {
         }
         assert!(saw_last, "range stream must send terminal frame");
         Ok(bytes)
+    }
+
+    #[tokio::test]
+    async fn l3_read_actor_batches_are_consumed_by_staged_sender() {
+        let (tx, rx) = mpsc::channel(4);
+
+        stream_with_staged_read_sender(tx, 4, |writer| {
+            std::io::Write::write_all(writer, b"abcdef")
+                .map_err(|err| Status::internal(format!("write staged bytes: {err}")))?;
+            std::io::Write::write_all(writer, b"gh")
+                .map_err(|err| Status::internal(format!("write staged bytes: {err}")))?;
+            Ok(())
+        })
+        .expect("staged read sender succeeds");
+
+        let bytes = collect_stream_chunks(rx)
+            .await
+            .expect("collect staged read stream");
+        assert_eq!(bytes, b"abcdefgh");
+    }
+
+    #[tokio::test]
+    async fn l3_read_sink_error_drains_without_hanging_actor_writer() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+
+        let err = stream_with_staged_read_sender(tx, 1, |writer| {
+            for _ in 0..8 {
+                std::io::Write::write_all(writer, b"x").map_err(|err| {
+                    Status::internal(format!("actor observed staged sender failure: {err}"))
+                })?;
+            }
+            Ok(())
+        })
+        .expect_err("closed gRPC receiver must fail staged sender");
+
+        assert!(
+            err.message().contains("read stream closed")
+                || err.message().contains("staged read sender failed"),
+            "sink error should be surfaced, got {err}"
+        );
     }
 
     async fn stream_fixture_range(
