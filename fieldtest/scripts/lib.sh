@@ -462,6 +462,172 @@ PY
   return "$rc"
 }
 
+fieldtest_monotonic_seconds() {
+  python3 - <<'PY'
+import time
+print(f"{time.monotonic():.6f}")
+PY
+}
+
+fieldtest_seconds_diff() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+start = float(sys.argv[1])
+end = float(sys.argv[2])
+print(f"{max(0.0, end - start):.6f}")
+PY
+}
+
+fieldtest_init_fence_counters() {
+  local counters="$1"
+  mkdir -p "$(dirname -- "$counters")"
+  python3 - "$counters" "${REMFIELD_ENV:-unknown}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+env = sys.argv[2]
+path.write_text(json.dumps({
+    "env": env,
+    "io_calls": 0,
+    "fence_count": 0,
+    "fence_wait_seconds": 0.0,
+}, separators=(",", ":")) + "\n")
+PY
+}
+
+fieldtest_update_fence_counters() {
+  local io_delta="$1" fence_delta="$2" wait_delta="$3"
+  [[ -n "${FIELDTEST_FENCE_COUNTERS_FILE:-}" ]] || return 0
+  python3 - "$FIELDTEST_FENCE_COUNTERS_FILE" "$io_delta" "$fence_delta" "$wait_delta" "${REMFIELD_ENV:-unknown}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+io_delta = int(sys.argv[2])
+fence_delta = int(sys.argv[3])
+wait_delta = float(sys.argv[4])
+env = sys.argv[5]
+try:
+    payload = json.loads(path.read_text())
+except Exception:
+    payload = {}
+payload["io_calls"] = int(payload.get("io_calls") or 0) + io_delta
+payload["fence_count"] = int(payload.get("fence_count") or 0) + fence_delta
+payload["fence_wait_seconds"] = float(payload.get("fence_wait_seconds") or 0.0) + wait_delta
+if env and env != "unknown":
+    payload["env"] = env
+else:
+    payload.setdefault("env", env or "unknown")
+path.write_text(json.dumps(payload, separators=(",", ":")) + "\n")
+PY
+}
+
+fieldtest_fence_counters_json() {
+  if [[ -n "${FIELDTEST_FENCE_COUNTERS_FILE:-}" && -f "${FIELDTEST_FENCE_COUNTERS_FILE:-}" ]]; then
+    python3 - "$FIELDTEST_FENCE_COUNTERS_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text())
+io_calls = int(payload.get("io_calls") or 0)
+fence_count = int(payload.get("fence_count") or 0)
+wait_seconds = float(payload.get("fence_wait_seconds") or 0.0)
+payload["fence_ratio"] = (fence_count / io_calls) if io_calls else 0.0
+print(json.dumps(payload, separators=(",", ":")))
+PY
+    return 0
+  fi
+  printf '%s\n' '{"env":"unknown","io_calls":0,"fence_count":0,"fence_wait_seconds":0.0,"fence_ratio":0.0}'
+}
+
+fieldtest_json_text_field() {
+  local key="$1"
+  python3 -c '
+import json
+import sys
+
+key = sys.argv[1]
+payload = json.load(sys.stdin)
+value = payload.get(key)
+if value is None:
+    raise SystemExit(1)
+if isinstance(value, bool):
+    print("true" if value else "false")
+else:
+    print(value)
+' "$key"
+}
+
+fieldtest_readiness_wait_extra_json() {
+  local wait_path="$1" measured_seconds="$2" warn_secs="$3" fail_secs="$4"
+  python3 - "$wait_path" "$measured_seconds" "$warn_secs" "$fail_secs" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+measured = float(sys.argv[2])
+warn = float(sys.argv[3])
+fail = float(sys.argv[4])
+wrapper = json.loads(path.read_text())
+stdout = wrapper.get("stdout") or ""
+stdout_json = {}
+try:
+    parsed = json.loads(stdout)
+    if isinstance(parsed, dict):
+        stdout_json = parsed
+except json.JSONDecodeError:
+    pass
+elapsed = stdout_json.get("elapsed_seconds", stdout_json.get("elapsed", None))
+try:
+    wait_seconds = float(elapsed)
+except (TypeError, ValueError):
+    wait_seconds = measured
+extra = {
+    "fence_wait_seconds": wait_seconds,
+    "wait_ready_wall_seconds": measured,
+}
+if "attempts" in stdout_json:
+    extra["wait_ready_attempts"] = stdout_json["attempts"]
+if wait_seconds > warn:
+    extra["readiness_warning"] = True
+if wait_seconds > fail:
+    extra["readiness_failure_threshold_exceeded"] = True
+print(json.dumps(extra, separators=(",", ":")))
+PY
+}
+
+fieldtest_io_attempt_extra_json() {
+  local attempt="$1" max_retries="$2" wall_seconds="$3"
+  python3 - "$attempt" "$max_retries" "$wall_seconds" <<'PY'
+import json
+import sys
+
+attempt = int(sys.argv[1])
+max_retries = int(sys.argv[2])
+wall_seconds = float(sys.argv[3])
+print(json.dumps({
+    "io_attempt": attempt,
+    "io_max_retries": max_retries,
+    "io_attempt_wall_seconds": wall_seconds,
+}, separators=(",", ":")))
+PY
+}
+
+fieldtest_emit_fence_summary() {
+  local counters io_calls env_for_record
+  counters="$(fieldtest_fence_counters_json)"
+  io_calls="$(printf '%s\n' "$counters" | fieldtest_json_text_field io_calls || printf '0\n')"
+  [[ "$io_calls" =~ ^[0-9]+$ ]] || io_calls=0
+  (( io_calls > 0 )) || return 0
+  env_for_record="$(printf '%s\n' "$counters" | fieldtest_json_text_field env || printf '%s\n' "${REMFIELD_ENV:-unknown}")"
+  REMFIELD_ENV="$env_for_record" fieldtest_evidence_record "${SCRIPT_NAME:-fieldtest}" fence-summary INFO "daemon I/O fence summary" "" "$counters"
+}
+
 # Runs a daemon I/O command and handles the LTO-9 media-readiness fence that can
 # legitimately appear after a load or first access. The failed artifact is kept
 # beside the caller's output, the readiness operation is waited directly, and
@@ -537,16 +703,29 @@ fieldtest_capture_io_json() {
   local outfile="$1"
   shift
   local max_retries attempt rc operation token blocked wait_path
+  local io_start io_end io_seconds wait_start wait_end wait_seconds wait_extra
+  local warn_secs fail_secs warning threshold_failed attempt_extra fence_wait
   max_retries="${FIELD_IO_READY_RETRIES:-3}"
+  warn_secs="${FIELD_READY_WARN_SECS:-90}"
+  fail_secs="${FIELD_READY_FAIL_SECS:-900}"
   attempt=0
   while true; do
+    fieldtest_update_fence_counters 1 0 0
+    io_start="$(fieldtest_monotonic_seconds)"
     if fieldtest_capture_json "$outfile" "$@"; then
+      io_end="$(fieldtest_monotonic_seconds)"
       return 0
     else
       rc=$?
+      io_end="$(fieldtest_monotonic_seconds)"
     fi
+    io_seconds="$(fieldtest_seconds_diff "$io_start" "$io_end")"
     operation="$(fieldtest_readiness_operation_from_artifact "$outfile" || true)"
-    if [[ -z "$operation" || "$attempt" -ge "$max_retries" ]]; then
+    if [[ -z "$operation" ]]; then
+      return "$rc"
+    fi
+    if [[ "$attempt" -ge "$max_retries" ]]; then
+      fieldtest_update_fence_counters 0 1 0
       return "$rc"
     fi
     attempt=$((attempt + 1))
@@ -554,12 +733,32 @@ fieldtest_capture_io_json() {
     blocked="${outfile%.json}-readiness-blocked-${attempt}-${token}.json"
     wait_path="${outfile%.json}-wait-ready-${attempt}-${token}.json"
     cp -f -- "$outfile" "$blocked"
-    fieldtest_evidence_record "${SCRIPT_NAME:-fieldtest}" "io-readiness-${token:0:8}" INFO "daemon I/O blocked by media-readiness fence; waiting and retrying ($attempt/$max_retries)" "$blocked"
+    attempt_extra="$(fieldtest_io_attempt_extra_json "$attempt" "$max_retries" "$io_seconds")"
+    fieldtest_evidence_record "${SCRIPT_NAME:-fieldtest}" "io-readiness-${token:0:8}" INFO "daemon I/O blocked by media-readiness fence; waiting and retrying ($attempt/$max_retries)" "$blocked" "$attempt_extra"
+    wait_start="$(fieldtest_monotonic_seconds)"
     if fieldtest_wait_ready_for_operation "$operation" "$wait_path"; then
-      fieldtest_evidence_record "${SCRIPT_NAME:-fieldtest}" "wait-ready-${token:0:8}" PASS "media ready after daemon I/O fence" "$wait_path"
+      rc=0
     else
       rc=$?
-      fieldtest_evidence_record "${SCRIPT_NAME:-fieldtest}" "wait-ready-${token:0:8}" FAIL "media readiness wait failed while retrying daemon I/O (rc=$rc)" "$wait_path"
+    fi
+    wait_end="$(fieldtest_monotonic_seconds)"
+    wait_seconds="$(fieldtest_seconds_diff "$wait_start" "$wait_end")"
+    wait_extra="$(fieldtest_readiness_wait_extra_json "$wait_path" "$wait_seconds" "$warn_secs" "$fail_secs")"
+    fence_wait="$(printf '%s\n' "$wait_extra" | fieldtest_json_text_field fence_wait_seconds || printf '0\n')"
+    fieldtest_update_fence_counters 0 1 "$fence_wait"
+    warning="$(printf '%s\n' "$wait_extra" | fieldtest_json_text_field readiness_warning || true)"
+    threshold_failed="$(printf '%s\n' "$wait_extra" | fieldtest_json_text_field readiness_failure_threshold_exceeded || true)"
+    if [[ "$warning" == true ]]; then
+      echo "[WARN] media-readiness fence wait ${fence_wait}s exceeded FIELD_READY_WARN_SECS=${warn_secs}" >&2
+    fi
+    if [[ "$threshold_failed" == true ]]; then
+      fieldtest_evidence_record "${SCRIPT_NAME:-fieldtest}" "wait-ready-${token:0:8}" FAIL "media readiness wait exceeded FIELD_READY_FAIL_SECS=${fail_secs}; aborting daemon I/O retry loop" "$wait_path" "$wait_extra"
+      return 1
+    fi
+    if [[ "$rc" -eq 0 ]]; then
+      fieldtest_evidence_record "${SCRIPT_NAME:-fieldtest}" "wait-ready-${token:0:8}" PASS "media ready after daemon I/O fence" "$wait_path" "$wait_extra"
+    else
+      fieldtest_evidence_record "${SCRIPT_NAME:-fieldtest}" "wait-ready-${token:0:8}" FAIL "media readiness wait failed while retrying daemon I/O (rc=$rc)" "$wait_path" "$wait_extra"
       return "$rc"
     fi
   done
@@ -743,12 +942,28 @@ PY
 }
 
 fieldtest_run_with_lock() {
-  local lockfile
+  local lockfile counters rc
+  if [[ "${2:-}" == --selftest ]]; then
+    "$@"
+    return "$?"
+  fi
   lockfile="$(fieldtest_work_lock)"
   mkdir -p "$(dirname -- "$lockfile")"
   exec 9>"$lockfile"
   flock -x 9
-  "$@"
+  mkdir -p "$(fieldtest_state_dir)"
+  counters="$(mktemp "$(fieldtest_state_dir)/fence-counters.XXXXXX")"
+  fieldtest_init_fence_counters "$counters"
+  set +e
+  (
+    export FIELDTEST_FENCE_COUNTERS_FILE="$counters"
+    "$@"
+  )
+  rc=$?
+  set -e
+  FIELDTEST_FENCE_COUNTERS_FILE="$counters" fieldtest_emit_fence_summary || true
+  rm -f -- "$counters"
+  return "$rc"
 }
 
 fieldtest_try_lock() {

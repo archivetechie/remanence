@@ -92,8 +92,11 @@ wait on it before daemon bringup. The command writes JSON with an
 Daemon write/read field scripts also auto-handle short LTO-9 readiness fences:
 if a write or read open returns `media-readiness fence operation=...`, the
 script preserves a `*-readiness-blocked-*` artifact, waits on that operation,
-and retries the same I/O command. If the wait reports `timeout_unknown`,
-`transport_unknown`, or a terminal state, stop and collect evidence.
+and retries the same I/O command. A single fence wait above
+`FIELD_READY_WARN_SECS` is marked as a warning; above
+`FIELD_READY_FAIL_SECS` it is logged as `FAIL` and the retry loop aborts. If
+the wait reports `timeout_unknown`, `transport_unknown`, or a terminal state,
+stop and collect evidence.
 
 Drive drains are readiness-aware: they unload only drives whose TUR probe is
 ready. Non-ready or unknown drives are left alone and an evidence artifact is
@@ -110,7 +113,8 @@ With 2 scratch data tapes, run the core path:
 
 ```bash
 ./scripts/11-happy-path.sh
-./scripts/13-append-loop.sh
+./scripts/13-append-loop.sh --mode cycle
+./scripts/13-append-loop.sh --mode session
 ./scripts/12-multiobject.sh
 ./scripts/20-bench-write.sh
 ./scripts/21-bench-read.sh
@@ -121,12 +125,17 @@ With 2 scratch data tapes, run the core path:
 ./scripts/90-collect-evidence.sh
 ```
 
+Compare the two append-loop summary records: `session` measures append-format
+behavior plus amortized throughput, while `cycle` measures full mount-cycle
+latency plus robotics stress.
+
 With 4 or more scratch data tapes, add the highest-value recovery tests before
 collection:
 
 ```bash
 ./scripts/11-happy-path.sh
-./scripts/13-append-loop.sh
+./scripts/13-append-loop.sh --mode cycle
+./scripts/13-append-loop.sh --mode session
 ./scripts/12-multiobject.sh
 ./scripts/20-bench-write.sh
 ./scripts/21-bench-read.sh
@@ -144,7 +153,8 @@ destructive media lifecycle test at the end:
 
 ```bash
 ./scripts/11-happy-path.sh
-./scripts/13-append-loop.sh
+./scripts/13-append-loop.sh --mode cycle
+./scripts/13-append-loop.sh --mode session
 ./scripts/12-multiobject.sh
 ./scripts/50-soak.sh start
 ./scripts/20-bench-write.sh

@@ -10,7 +10,7 @@ use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::{error::ErrorKind, Parser, Subcommand};
 use remanence_api::pb;
@@ -25,21 +25,39 @@ use uuid::Uuid;
 const DEFAULT_ENDPOINT: &str = "unix:/var/lib/rem/rem.sock";
 const DEFAULT_CHUNK_BYTES: usize = 1_048_576;
 const DEFAULT_CHUNK_BYTES_U32: u32 = 1_048_576;
+const WRITE_MANY_APPEND_FAILED_EXIT: u8 = 12;
 
 type AppResult<T> = Result<T, AppError>;
 
 #[derive(Debug)]
-struct AppError(String);
+struct AppError {
+    message: String,
+    exit_code: u8,
+}
 
 impl AppError {
     fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self {
+            message: message.into(),
+            exit_code: 1,
+        }
+    }
+
+    fn with_exit_code(message: impl Into<String>, exit_code: u8) -> Self {
+        Self {
+            message: message.into(),
+            exit_code,
+        }
+    }
+
+    fn exit_code(&self) -> u8 {
+        self.exit_code
     }
 }
 
 impl fmt::Display for AppError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.message)
     }
 }
 
@@ -47,19 +65,19 @@ impl Error for AppError {}
 
 impl From<std::io::Error> for AppError {
     fn from(error: std::io::Error) -> Self {
-        Self(error.to_string())
+        Self::new(error.to_string())
     }
 }
 
 impl From<tonic::Status> for AppError {
     fn from(status: tonic::Status) -> Self {
-        Self(status.to_string())
+        Self::new(status.to_string())
     }
 }
 
 impl From<tonic::transport::Error> for AppError {
     fn from(error: tonic::transport::Error) -> Self {
-        Self(error.to_string())
+        Self::new(error.to_string())
     }
 }
 
@@ -77,6 +95,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     Write(WriteArgs),
+    WriteMany(WriteManyArgs),
     Read(ReadArgs),
     List(ListArgs),
 }
@@ -91,6 +110,27 @@ struct WriteArgs {
 
     #[arg(long)]
     library: Option<String>,
+
+    #[arg(long, default_value_t = DEFAULT_CHUNK_BYTES)]
+    chunk_bytes: usize,
+}
+
+#[derive(Parser, Debug)]
+struct WriteManyArgs {
+    #[arg(long)]
+    pool: String,
+
+    #[arg(long)]
+    library: Option<String>,
+
+    #[arg(long)]
+    count: u64,
+
+    #[arg(long)]
+    size_mib: u64,
+
+    #[arg(long)]
+    caller_object_id_prefix: String,
 
     #[arg(long, default_value_t = DEFAULT_CHUNK_BYTES)]
     chunk_bytes: usize,
@@ -143,8 +183,9 @@ async fn main() -> ExitCode {
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            let exit_code = error.exit_code();
             print_json_error(error.to_string());
-            ExitCode::from(1)
+            ExitCode::from(exit_code)
         }
     }
 }
@@ -152,6 +193,7 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> AppResult<()> {
     match cli.command {
         Command::Write(args) => write_command(&cli.endpoint, args).await,
+        Command::WriteMany(args) => write_many_command(&cli.endpoint, args).await,
         Command::Read(args) => read_command(&cli.endpoint, args).await,
         Command::List(args) => list_command(&cli.endpoint, args).await,
     }
@@ -191,11 +233,172 @@ async fn write_command(endpoint: &str, args: WriteArgs) -> AppResult<()> {
         pb::write_session_service_client::WriteSessionServiceClient::new(channel);
 
     let started = Instant::now();
-    let session = write_client
+    let open_started = Instant::now();
+    let session_id = open_write_session(&mut write_client, &args.pool, library_uuid).await?;
+    let open_ms = duration_ms(open_started.elapsed());
+
+    let append_input = AppendInput::file(&args.file, args.chunk_bytes, metadata.len());
+    let transfer_started = Instant::now();
+    let append_result = append_object(&mut write_client, &session_id, append_input).await;
+    let transfer_ms = duration_ms(transfer_started.elapsed());
+    let record = match append_result {
+        Ok(record) => record,
+        Err(error) => {
+            abort_write_session(&mut write_client, &session_id).await;
+            return Err(error);
+        }
+    };
+
+    let close_started = Instant::now();
+    write_client
+        .close_write_session(pb::CloseWriteSessionRequest {
+            session_id: session_id.clone(),
+            idempotency_key: None,
+        })
+        .await?;
+    let close_ms = duration_ms(close_started.elapsed());
+
+    let seconds = started.elapsed().as_secs_f64();
+    let bytes = metadata.len();
+    print_json_line(write_result_json(
+        &record,
+        &args.pool,
+        bytes,
+        seconds,
+        PhaseTimings {
+            open_ms: Some(open_ms),
+            transfer_ms: Some(transfer_ms),
+            close_ms: Some(close_ms),
+        },
+    ))?;
+    Ok(())
+}
+
+async fn write_many_command(endpoint: &str, args: WriteManyArgs) -> AppResult<()> {
+    if args.chunk_bytes == 0 {
+        return Err(AppError::new("--chunk-bytes must be greater than zero"));
+    }
+    if args.count == 0 {
+        return Err(AppError::new("--count must be greater than zero"));
+    }
+    if args.size_mib == 0 {
+        return Err(AppError::new("--size-mib must be greater than zero"));
+    }
+    if args.caller_object_id_prefix.trim().is_empty() {
+        return Err(AppError::new("--caller-object-id-prefix must not be empty"));
+    }
+    let bytes_per_object = args
+        .size_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| AppError::new("--size-mib overflows u64 bytes"))?;
+
+    let channel = connect_daemon(endpoint).await?;
+    let library_uuid = resolve_library_uuid(channel.clone(), args.library.as_deref()).await?;
+    let mut write_client =
+        pb::write_session_service_client::WriteSessionServiceClient::new(channel);
+
+    let open_started = Instant::now();
+    let session_id = open_write_session(&mut write_client, &args.pool, library_uuid).await?;
+    let open_ms = duration_ms(open_started.elapsed());
+
+    let mut object_records = Vec::new();
+    for idx in 0..args.count {
+        let append_input = AppendInput::generated(
+            idx,
+            bytes_per_object,
+            args.chunk_bytes,
+            format!("{}-{idx}", args.caller_object_id_prefix.trim()),
+        );
+        let transfer_started = Instant::now();
+        match append_object(&mut write_client, &session_id, append_input).await {
+            Ok(record) => {
+                let transfer_ms = duration_ms(transfer_started.elapsed());
+                object_records.push(write_many_object_json(
+                    &record,
+                    &args.pool,
+                    idx,
+                    bytes_per_object,
+                    PhaseTimings {
+                        open_ms: (idx == 0).then_some(open_ms),
+                        transfer_ms: Some(transfer_ms),
+                        close_ms: None,
+                    },
+                ));
+            }
+            Err(error) => {
+                let transfer_ms = duration_ms(transfer_started.elapsed());
+                let close_started = Instant::now();
+                let close_result = close_write_session(&mut write_client, &session_id).await;
+                let close_ms = duration_ms(close_started.elapsed());
+                if let Some(last_record) = object_records.last_mut() {
+                    last_record["close_ms"] = json!(close_ms);
+                }
+                for record in object_records {
+                    print_json_line(record)?;
+                }
+                print_json_line(write_many_error_json(
+                    idx,
+                    &args.pool,
+                    bytes_per_object,
+                    &format!("{}-{idx}", args.caller_object_id_prefix.trim()),
+                    error.to_string(),
+                    PhaseTimings {
+                        open_ms: (idx == 0).then_some(open_ms),
+                        transfer_ms: Some(transfer_ms),
+                        close_ms: (idx == 0).then_some(close_ms),
+                    },
+                ))?;
+                print_json_line(write_many_summary_json(
+                    &args.pool,
+                    args.count,
+                    bytes_per_object,
+                    idx,
+                    Some(idx),
+                    Some(close_ms),
+                    close_result.as_ref().err().map(ToString::to_string),
+                ))?;
+                return Err(AppError::with_exit_code(
+                    format!(
+                        "write-many append {idx} failed after {idx} committed object(s): {error}"
+                    ),
+                    WRITE_MANY_APPEND_FAILED_EXIT,
+                ));
+            }
+        }
+    }
+
+    let close_started = Instant::now();
+    let close_result = close_write_session(&mut write_client, &session_id).await;
+    let close_ms = duration_ms(close_started.elapsed());
+    if let Some(last_record) = object_records.last_mut() {
+        last_record["close_ms"] = json!(close_ms);
+    }
+    for record in object_records {
+        print_json_line(record)?;
+    }
+    print_json_line(write_many_summary_json(
+        &args.pool,
+        args.count,
+        bytes_per_object,
+        args.count,
+        None,
+        Some(close_ms),
+        close_result.as_ref().err().map(ToString::to_string),
+    ))?;
+    close_result?;
+    Ok(())
+}
+
+async fn open_write_session(
+    client: &mut pb::write_session_service_client::WriteSessionServiceClient<Channel>,
+    pool: &str,
+    library_uuid: Vec<u8>,
+) -> AppResult<Vec<u8>> {
+    Ok(client
         .open_write_session(pb::OpenWriteSessionRequest {
             target: Some(pb::open_write_session_request::Target::PoolTarget(
                 pb::TapePoolTarget {
-                    pool_id: args.pool.trim().to_string(),
+                    pool_id: pool.trim().to_string(),
                     library_uuid,
                     mount_if_needed: true,
                 },
@@ -205,59 +408,89 @@ async fn write_command(endpoint: &str, args: WriteArgs) -> AppResult<()> {
             recover_session_id: Vec::new(),
         })
         .await?
-        .into_inner();
+        .into_inner()
+        .session_id)
+}
 
-    let append_result = append_file(&mut write_client, &session.session_id, &args).await;
-    let record = match append_result {
-        Ok(record) => record,
-        Err(error) => {
-            abort_write_session(&mut write_client, &session.session_id).await;
-            return Err(error);
-        }
-    };
-
-    write_client
+async fn close_write_session(
+    client: &mut pb::write_session_service_client::WriteSessionServiceClient<Channel>,
+    session_id: &[u8],
+) -> AppResult<()> {
+    client
         .close_write_session(pb::CloseWriteSessionRequest {
-            session_id: session.session_id.clone(),
+            session_id: session_id.to_vec(),
             idempotency_key: None,
         })
         .await?;
-
-    let seconds = started.elapsed().as_secs_f64();
-    let bytes = metadata.len();
-    print_json_line(write_result_json(&record, &args.pool, bytes, seconds))?;
     Ok(())
 }
 
-async fn append_file(
+#[derive(Clone, Debug)]
+struct AppendInput {
+    caller_object_id: String,
+    archive_path: String,
+    declared_size_bytes: u64,
+    chunk_bytes: usize,
+    source: AppendSource,
+}
+
+#[derive(Clone, Debug)]
+enum AppendSource {
+    File(PathBuf),
+    Generated { object_index: u64 },
+}
+
+impl AppendInput {
+    fn file(file: &Path, chunk_bytes: usize, declared_size_bytes: u64) -> Self {
+        let archive_path = file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("payload.bin")
+            .to_string();
+        Self {
+            caller_object_id: Uuid::new_v4().to_string(),
+            archive_path,
+            declared_size_bytes,
+            chunk_bytes,
+            source: AppendSource::File(file.to_path_buf()),
+        }
+    }
+
+    fn generated(
+        object_index: u64,
+        declared_size_bytes: u64,
+        chunk_bytes: usize,
+        caller_object_id: String,
+    ) -> Self {
+        Self {
+            caller_object_id,
+            archive_path: format!("generated-object-{object_index}.bin"),
+            declared_size_bytes,
+            chunk_bytes,
+            source: AppendSource::Generated { object_index },
+        }
+    }
+}
+
+async fn append_object(
     client: &mut pb::write_session_service_client::WriteSessionServiceClient<Channel>,
     session_id: &[u8],
-    args: &WriteArgs,
+    input: AppendInput,
 ) -> AppResult<pb::ObjectRecord> {
     let (tx, rx) = tokio::sync::mpsc::channel::<pb::AppendObjectMessage>(8);
     let session_id_for_task = session_id.to_vec();
-    let file = args.file.clone();
-    let chunk_bytes = args.chunk_bytes;
-    let declared_size_bytes = tokio::fs::metadata(&args.file).await?.len();
-    let caller_object_id = Uuid::new_v4().to_string();
-    let archive_path = args
-        .file
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or("payload.bin")
-        .to_string();
 
     let sender = tokio::spawn(async move {
         let mut caller_metadata = HashMap::new();
-        caller_metadata.insert("path".to_string(), archive_path);
+        caller_metadata.insert("path".to_string(), input.archive_path);
         tx.send(pb::AppendObjectMessage {
             payload: Some(pb::append_object_message::Payload::Start(
                 pb::AppendObjectStart {
                     session_id: session_id_for_task.clone(),
-                    caller_object_id,
+                    caller_object_id: input.caller_object_id,
                     caller_metadata,
-                    declared_size_bytes,
+                    declared_size_bytes: input.declared_size_bytes,
                     body_format_manifest: Vec::new(),
                 },
             )),
@@ -265,30 +498,29 @@ async fn append_file(
         .await
         .map_err(|_| AppError::new("append stream closed before Start"))?;
 
-        let mut input = tokio::fs::File::open(&file)
-            .await
-            .map_err(|error| AppError::new(format!("open {}: {error}", file.display())))?;
-        let mut buffer = vec![0_u8; chunk_bytes];
         let mut hasher = Sha256::new();
-        loop {
-            let n = input
-                .read(&mut buffer)
-                .await
-                .map_err(|error| AppError::new(format!("read {}: {error}", file.display())))?;
-            if n == 0 {
-                break;
+        match input.source {
+            AppendSource::File(file) => {
+                send_file_chunks(
+                    &tx,
+                    &session_id_for_task,
+                    &file,
+                    input.chunk_bytes,
+                    &mut hasher,
+                )
+                .await?;
             }
-            hasher.update(&buffer[..n]);
-            tx.send(pb::AppendObjectMessage {
-                payload: Some(pb::append_object_message::Payload::Chunk(
-                    pb::AppendObjectChunk {
-                        session_id: session_id_for_task.clone(),
-                        data: buffer[..n].to_vec(),
-                    },
-                )),
-            })
-            .await
-            .map_err(|_| AppError::new("append stream closed while sending Chunk"))?;
+            AppendSource::Generated { object_index } => {
+                send_generated_chunks(
+                    &tx,
+                    &session_id_for_task,
+                    object_index,
+                    input.declared_size_bytes,
+                    input.chunk_bytes,
+                    &mut hasher,
+                )
+                .await?;
+            }
         }
 
         tx.send(pb::AppendObjectMessage {
@@ -308,8 +540,95 @@ async fn append_file(
     let sender_result = sender
         .await
         .map_err(|error| AppError::new(format!("append sender task failed: {error}")))?;
-    sender_result?;
-    Ok(append?.into_inner())
+    match append {
+        Ok(response) => {
+            sender_result?;
+            Ok(response.into_inner())
+        }
+        Err(status) => Err(AppError::from(status)),
+    }
+}
+
+async fn send_file_chunks(
+    tx: &tokio::sync::mpsc::Sender<pb::AppendObjectMessage>,
+    session_id: &[u8],
+    file: &Path,
+    chunk_bytes: usize,
+    hasher: &mut Sha256,
+) -> AppResult<()> {
+    let mut input = tokio::fs::File::open(file)
+        .await
+        .map_err(|error| AppError::new(format!("open {}: {error}", file.display())))?;
+    let mut buffer = vec![0_u8; chunk_bytes];
+    loop {
+        let n = input
+            .read(&mut buffer)
+            .await
+            .map_err(|error| AppError::new(format!("read {}: {error}", file.display())))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+        send_append_chunk(tx, session_id, buffer[..n].to_vec()).await?;
+    }
+    Ok(())
+}
+
+async fn send_generated_chunks(
+    tx: &tokio::sync::mpsc::Sender<pb::AppendObjectMessage>,
+    session_id: &[u8],
+    object_index: u64,
+    total_bytes: u64,
+    chunk_bytes: usize,
+    hasher: &mut Sha256,
+) -> AppResult<()> {
+    let mut offset = 0_u64;
+    while offset < total_bytes {
+        let n = std::cmp::min(chunk_bytes as u64, total_bytes - offset) as usize;
+        let mut data = vec![0_u8; n];
+        fill_generated_payload_chunk(object_index, offset, &mut data);
+        hasher.update(&data);
+        send_append_chunk(tx, session_id, data).await?;
+        offset = offset.saturating_add(n as u64);
+    }
+    Ok(())
+}
+
+async fn send_append_chunk(
+    tx: &tokio::sync::mpsc::Sender<pb::AppendObjectMessage>,
+    session_id: &[u8],
+    data: Vec<u8>,
+) -> AppResult<()> {
+    tx.send(pb::AppendObjectMessage {
+        payload: Some(pb::append_object_message::Payload::Chunk(
+            pb::AppendObjectChunk {
+                session_id: session_id.to_vec(),
+                data,
+            },
+        )),
+    })
+    .await
+    .map_err(|_| AppError::new("append stream closed while sending Chunk"))
+}
+
+fn fill_generated_payload_chunk(object_index: u64, offset: u64, data: &mut [u8]) {
+    let object_index_bytes = object_index.to_le_bytes();
+    for (idx, byte) in data.iter_mut().enumerate() {
+        let absolute = offset.saturating_add(idx as u64);
+        *byte = if absolute < object_index_bytes.len() as u64 {
+            object_index_bytes[absolute as usize]
+        } else {
+            let word = splitmix64(object_index ^ (absolute / 8));
+            word.to_le_bytes()[(absolute % 8) as usize]
+        };
+    }
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 async fn abort_write_session(
@@ -333,6 +652,7 @@ async fn read_command(endpoint: &str, args: ReadArgs) -> AppResult<()> {
     let mut read_client = pb::read_session_service_client::ReadSessionServiceClient::new(channel);
 
     let started = Instant::now();
+    let open_started = Instant::now();
     let session = read_client
         .open_read_session(pb::OpenReadSessionRequest {
             target: Some(pb::open_read_session_request::Target::TapeTarget(
@@ -346,15 +666,20 @@ async fn read_command(endpoint: &str, args: ReadArgs) -> AppResult<()> {
         })
         .await?
         .into_inner();
+    let open_ms = duration_ms(open_started.elapsed());
 
+    let transfer_started = Instant::now();
     let read_result =
         read_object_range(&mut read_client, &session.session_id, &target, &args).await;
+    let transfer_ms = duration_ms(transfer_started.elapsed());
+    let close_started = Instant::now();
     let close_result = read_client
         .close_read_session(pb::CloseReadSessionRequest {
             session_id: session.session_id,
             idempotency_key: None,
         })
         .await;
+    let close_ms = duration_ms(close_started.elapsed());
 
     let (bytes, sha256) = read_result?;
     close_result?;
@@ -367,6 +692,10 @@ async fn read_command(endpoint: &str, args: ReadArgs) -> AppResult<()> {
         "bytes": bytes,
         "seconds": seconds,
         "mb_s": mb_s(bytes, seconds),
+        "open_ms": open_ms,
+        "transfer_ms": transfer_ms,
+        "close_ms": close_ms,
+        "mib_per_s": mib_per_s(bytes, transfer_ms),
         "sha256": sha256,
     }))?;
     Ok(())
@@ -652,7 +981,20 @@ fn read_range(
     }
 }
 
-fn write_result_json(record: &pb::ObjectRecord, pool_id: &str, bytes: u64, seconds: f64) -> Value {
+#[derive(Clone, Copy, Debug, Default)]
+struct PhaseTimings {
+    open_ms: Option<f64>,
+    transfer_ms: Option<f64>,
+    close_ms: Option<f64>,
+}
+
+fn write_result_json(
+    record: &pb::ObjectRecord,
+    pool_id: &str,
+    bytes: u64,
+    seconds: f64,
+    timings: PhaseTimings,
+) -> Value {
     let first_copy = record.copies.first();
     json!({
         "object_id": uuid_bytes_to_text(&record.object_id).unwrap_or_else(|_| bytes_to_hex(&record.object_id)),
@@ -667,7 +1009,81 @@ fn write_result_json(record: &pb::ObjectRecord, pool_id: &str, bytes: u64, secon
         "bytes": bytes,
         "seconds": seconds,
         "mb_s": mb_s(bytes, seconds),
+        "open_ms": timings.open_ms,
+        "transfer_ms": timings.transfer_ms,
+        "close_ms": timings.close_ms,
+        "mib_per_s": timings.transfer_ms.map(|transfer_ms| mib_per_s(bytes, transfer_ms)),
         "append_commit_info": append_commit_info_json(record.append_commit_info.as_ref()),
+    })
+}
+
+fn write_many_object_json(
+    record: &pb::ObjectRecord,
+    pool_id: &str,
+    object_index: u64,
+    bytes: u64,
+    timings: PhaseTimings,
+) -> Value {
+    let transfer_seconds = timings
+        .transfer_ms
+        .map(|value| value / 1000.0)
+        .unwrap_or_default();
+    let mut value = write_result_json(record, pool_id, bytes, transfer_seconds, timings);
+    value["record_type"] = json!("object");
+    value["object_index"] = json!(object_index);
+    value
+}
+
+fn write_many_error_json(
+    object_index: u64,
+    pool_id: &str,
+    bytes: u64,
+    caller_object_id: &str,
+    error: String,
+    timings: PhaseTimings,
+) -> Value {
+    json!({
+        "record_type": "object",
+        "object_index": object_index,
+        "caller_object_id": caller_object_id,
+        "pool_id": pool_id,
+        "bytes": bytes,
+        "open_ms": timings.open_ms,
+        "transfer_ms": timings.transfer_ms,
+        "close_ms": timings.close_ms,
+        "mib_per_s": timings.transfer_ms.map(|transfer_ms| mib_per_s(bytes, transfer_ms)),
+        "append_commit_info": Value::Null,
+        "error": error,
+    })
+}
+
+fn write_many_summary_json(
+    pool_id: &str,
+    requested_count: u64,
+    bytes_per_object: u64,
+    committed_count: u64,
+    failed_index: Option<u64>,
+    close_ms: Option<f64>,
+    close_error: Option<String>,
+) -> Value {
+    let prefix_committed = failed_index.map(|idx| {
+        if idx == 0 {
+            "no objects were committed before the failed append".to_string()
+        } else {
+            format!("objects 0..{} remain committed", idx - 1)
+        }
+    });
+    json!({
+        "record_type": "summary",
+        "pool_id": pool_id,
+        "requested_count": requested_count,
+        "bytes_per_object": bytes_per_object,
+        "committed_count": committed_count,
+        "failed_index": failed_index,
+        "prefix_committed": prefix_committed,
+        "close_ms": close_ms,
+        "close_error": close_error,
+        "ok": failed_index.is_none() && close_error.is_none(),
     })
 }
 
@@ -771,6 +1187,18 @@ fn mb_s(bytes: u64, seconds: f64) -> f64 {
     }
 }
 
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+fn mib_per_s(bytes: u64, transfer_ms: f64) -> f64 {
+    if transfer_ms > 0.0 {
+        (bytes as f64 / (transfer_ms / 1000.0)) / (1024.0 * 1024.0)
+    } else {
+        0.0
+    }
+}
+
 fn empty_string_as_null(value: &str) -> Option<&str> {
     if value.is_empty() {
         None
@@ -843,7 +1271,17 @@ mod tests {
             }),
         };
 
-        let value = write_result_json(&record, "camera.copy-a", 64, 2.0);
+        let value = write_result_json(
+            &record,
+            "camera.copy-a",
+            64,
+            2.0,
+            PhaseTimings {
+                open_ms: Some(1.5),
+                transfer_ms: Some(2000.0),
+                close_ms: Some(2.5),
+            },
+        );
         let info = &value["append_commit_info"];
         assert_eq!(info["append_mode"].as_str().unwrap(), "append");
         assert_eq!(
@@ -858,6 +1296,13 @@ mod tests {
         assert!(info["journal_record_ordinal"].is_null());
         assert!(info["estimated_remaining_bytes"].is_null());
         assert!(info["sealed_after_write"].is_null());
+        assert_eq!(value["open_ms"].as_f64().unwrap(), 1.5);
+        assert_eq!(value["transfer_ms"].as_f64().unwrap(), 2000.0);
+        assert_eq!(value["close_ms"].as_f64().unwrap(), 2.5);
+        assert_eq!(
+            value["mib_per_s"].as_f64().unwrap(),
+            64.0 / 2.0 / 1024.0 / 1024.0
+        );
     }
 
     #[test]
@@ -874,5 +1319,71 @@ mod tests {
         );
         assert_eq!(append_mode_name(pb::AppendMode::Seal as i32), "seal");
         assert_eq!(append_mode_name(i32::MAX), "unspecified");
+    }
+
+    #[test]
+    fn write_many_object_json_carries_phase_timing_shape() {
+        let record = pb::ObjectRecord {
+            object_id: Uuid::nil().as_bytes().to_vec(),
+            caller_object_id: "batch-7".to_string(),
+            content_sha256: vec![0x33; 32],
+            logical_size_bytes: 1024 * 1024,
+            body_format: "rao-v1".to_string(),
+            caller_metadata: Default::default(),
+            created_at: None,
+            copies: vec![pb::ObjectCopy {
+                tape_uuid: vec![0x55; 16],
+                tape_file_number: 8,
+                first_body_lba: 99,
+                last_verified_at: None,
+                health: pb::object_copy::Health::ObjectCopyHealthOk as i32,
+                pool_id: "fieldtest-a".to_string(),
+            }],
+            append_commit_info: Some(pb::AppendCommitInfo {
+                append_mode: pb::AppendMode::Append as i32,
+                tape_uuid: vec![0x55; 16],
+                voltag: Some("AOX030L9".to_string()),
+                tape_file_number: 8,
+                first_body_lba: 99,
+                position_before_lba: None,
+                position_after_lba: None,
+                journal_record_ordinal: None,
+                estimated_remaining_bytes: None,
+                sealed_after_write: None,
+            }),
+        };
+
+        let value = write_many_object_json(
+            &record,
+            "fieldtest-a",
+            7,
+            1024 * 1024,
+            PhaseTimings {
+                open_ms: None,
+                transfer_ms: Some(500.0),
+                close_ms: Some(3.0),
+            },
+        );
+
+        assert_eq!(value["record_type"], "object");
+        assert_eq!(value["object_index"], 7);
+        assert!(value["open_ms"].is_null());
+        assert_eq!(value["transfer_ms"].as_f64().unwrap(), 500.0);
+        assert_eq!(value["close_ms"].as_f64().unwrap(), 3.0);
+        assert_eq!(value["bytes"], 1024 * 1024);
+        assert_eq!(value["mib_per_s"].as_f64().unwrap(), 2.0);
+        assert_eq!(value["append_commit_info"]["append_mode"], "append");
+    }
+
+    #[test]
+    fn generated_payload_chunks_include_object_identity() {
+        let mut first = vec![0_u8; 64];
+        let mut second = vec![0_u8; 64];
+        fill_generated_payload_chunk(1, 0, &mut first);
+        fill_generated_payload_chunk(2, 0, &mut second);
+
+        assert_ne!(first, second);
+        assert_eq!(&first[..8], &1_u64.to_le_bytes());
+        assert_eq!(&second[..8], &2_u64.to_le_bytes());
     }
 }

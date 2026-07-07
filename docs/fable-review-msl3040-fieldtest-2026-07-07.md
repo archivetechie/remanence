@@ -183,6 +183,25 @@ For fold into `lto9-media-readiness-design-v0.1.md` /
   interval only).
 - **A6 Benchmark metric split** per §5 answer 8, so no future report quotes a
   single MB/s for an append-stress workload.
+- **A7 Streaming write path (found live 2026-07-07: physical bench pinned at
+  ~80 MB/s, CPU idle).** `append_object` is store-and-forward: the entire
+  object is streamed into a spool **file** first, then `append_finish` reads
+  it back and writes tape, strictly serially
+  (`crates/remanence-api/src/lib.rs:1975-2100`). The spool dir is hardwired to
+  `state_dir/spool` (`crates/remanence-daemon/src/main.rs:76`) — root disk in
+  the field layout — so every byte crosses the root disk twice and the two
+  phases serialize (effective rate ≤ ½ even with fast media). Not gRPC (local
+  unix socket, GB/s class), not block size (256 KiB back-to-back with
+  BUFFERED MODE preserved, `tape_io/mod.rs:1416-1429`, can saturate LTO-9).
+  Fixes, in order: (1) make `spool_dir` independently configurable — spool
+  contents are pre-commit and crash-disposable by design, so tmpfs is
+  legitimate; (2) overlap ingest and tape write (bounded ring buffer /
+  hash-while-writing) so per-object rate approaches drive rate; the durable
+  commit boundary (filemark → journal fsync) is untouched. Field workaround
+  needing zero code: symlink `state/spool` → tmpfs
+  (`create_private_spool_dir` is symlink-tolerant, `main.rs:141-149`).
+  Existing `remanence_write_diag` log lines already decompose spool-phase vs
+  append_finish-phase throughput per object.
 
 ## 7. Track B — fieldtest improvements (use the physical window)
 
