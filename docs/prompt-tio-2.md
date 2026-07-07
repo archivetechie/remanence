@@ -37,3 +37,19 @@ versa); tripwire mismatch fences durably. Full `cargo test` for touched
 crates + fmt/clippy. Add `rem.tape.batched_io` to `scenario-append` `covers`
 (coordinate with `~/system` bindings note in the report — do not edit
 ~/system). Report files touched, gates, deviations.
+
+---
+**Diff gate 2026-07-07 (Claude Fable 5): PASS.** Independent gates: fmt/clippy
+clean, FULL `cargo test` green including the daemon unix-socket suites that
+were sandbox-blocked for codex. Verified enforcement at all three points
+(pool selection `pool_write.rs:3002`, session open write+read
+`write_owner.rs:1803/2356` with dedicated refusal test, daemon startup
+`lib.rs:108/404` with operator-release guidance in the error). Read-side prep
+tested by `prepare_drive_for_read_sets_catalog_fixed_block_size_or_legacy_fallback`
+(block size from catalog row, MODE SENSE verify, legacy fallback). TIO-1
+carry-overs closed: byte-identical image test
+(`no_parity_stored_images_cross_read_between_serial_and_batched_paths`) and
+`legacy_single_block` config wiring. Diag fields replaced as designed.
+Deviation accepted: `rem.tape.batched_io` covers entry added to ~/system
+`scenarios/contracts.toml` by the supervisor (codex correctly did not edit
+~/system).

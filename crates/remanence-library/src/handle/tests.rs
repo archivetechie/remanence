@@ -2780,6 +2780,54 @@ fn drive_handle_write_block_batch_uses_fixed_cdb_and_boundary_position_only() {
 }
 
 #[test]
+fn drive_handle_position_check_mismatch_reports_both_positions() {
+    let lib = open_drive_test_lib("LIB_TIO07");
+    let policy = StaticAllowlist::new(["LIB_TIO07"]);
+    let (factory, _log) = multi_recording_factory(vec![
+        (
+            PathBuf::from("/dev/sg-mock"),
+            vec![changer_inquiry_response(), vpd80_response("LIB_TIO07")],
+        ),
+        (
+            PathBuf::from("/dev/sg-drive-mock"),
+            vec![
+                lto9_inquiry(),
+                vpd80_response("DRV_A"),
+                rp_long_response(0, 0, 10),
+                rp_long_response(0, 0, 12),
+            ],
+        ),
+    ]);
+    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+    let mut drive = handle
+        .open_drive_with_tape_io(
+            0x0100,
+            &policy,
+            TapeIoRuntimeConfig {
+                position_check_bytes: 4,
+                write_batch_blocks: 4,
+                read_batch_blocks: 4,
+                ..TapeIoRuntimeConfig::default()
+            },
+        )
+        .expect("drive opens");
+
+    let err = drive
+        .write_block_batch(&[0xAAu8; 4], 4)
+        .expect_err("position tripwire must reject mismatched device position");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("position drift"),
+        "unexpected drift error: {message}"
+    );
+    assert!(message.contains("expected_partition=0"), "{message}");
+    assert!(message.contains("expected_lba=11"), "{message}");
+    assert!(message.contains("device_partition=0"), "{message}");
+    assert!(message.contains("device_lba=12"), "{message}");
+}
+
+#[test]
 fn drive_handle_open_exposes_sg_reserved_buffer_clamped_batch() {
     struct ClampReserved<T> {
         inner: T,

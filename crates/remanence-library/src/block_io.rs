@@ -46,7 +46,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::handle::tape_io::{
-    SpaceKind, SpaceResult, TapeIoError, TapePosition, WriteFilemarksOutcome, WriteOutcome,
+    ReadBatchOutcome, SpaceKind, SpaceResult, TapeIoError, TapePosition, WriteBatchOutcome,
+    WriteFilemarksOutcome, WriteOutcome,
 };
 use crate::handle::DriveHandle;
 
@@ -63,6 +64,71 @@ pub trait BlockSink {
     /// Write one tape block. Mirrors
     /// [`DriveHandle::write_block`](crate::handle::DriveHandle::write_block).
     fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError>;
+
+    /// Write one fixed-size batch. The default preserves single-block
+    /// semantics by looping through [`Self::write_block`].
+    fn write_block_batch(
+        &mut self,
+        buf: &[u8],
+        block_size_bytes: u32,
+    ) -> Result<WriteBatchOutcome, TapeIoError> {
+        if block_size_bytes == 0 {
+            return Err(TapeIoError::OperationFailed(
+                "write_block_batch block size must be nonzero".to_string(),
+            ));
+        }
+        let block_size = block_size_bytes as usize;
+        if buf.is_empty() || buf.len() % block_size != 0 {
+            return Err(TapeIoError::OperationFailed(
+                "write_block_batch buffer must contain whole records".to_string(),
+            ));
+        }
+        let mut records = 0u32;
+        let mut bytes = 0u32;
+        let mut early_warning = false;
+        let mut end_of_medium = false;
+        let mut position_after = None;
+        for block in buf.chunks_exact(block_size) {
+            let outcome = self.write_block(block)?;
+            records = records.checked_add(1).ok_or_else(|| {
+                TapeIoError::OperationFailed("write batch record count overflow".to_string())
+            })?;
+            bytes = bytes.checked_add(outcome.bytes_written).ok_or_else(|| {
+                TapeIoError::OperationFailed("write batch byte count overflow".to_string())
+            })?;
+            early_warning |= outcome.early_warning;
+            end_of_medium |= outcome.end_of_medium;
+            position_after = Some(outcome.position_after);
+        }
+        Ok(WriteBatchOutcome::from_computed_position(
+            records,
+            bytes,
+            early_warning,
+            end_of_medium,
+            position_after.expect("non-empty batch has a final position"),
+        ))
+    }
+
+    /// Effective records per batch for this sink and block size. A return
+    /// value of 1 means callers should preserve single-record behavior.
+    fn write_batch_blocks(&self, _block_size_bytes: u32) -> u32 {
+        1
+    }
+
+    /// Requested records per write batch before transport-level clamping.
+    fn requested_write_batch_blocks(&self) -> u32 {
+        self.write_batch_blocks(1)
+    }
+
+    /// True when callers should preserve legacy single-block behavior.
+    fn legacy_single_block(&self) -> bool {
+        self.write_batch_blocks(1) <= 1
+    }
+
+    /// Configured drift tripwire cadence in bytes, if known.
+    fn position_check_bytes(&self) -> u64 {
+        0
+    }
 
     /// Write `count` file marks. IMMED is always 0; the call
     /// returns only after the marks are committed to media.
@@ -93,6 +159,70 @@ pub trait BlockSource {
     /// drive delivered (the block size for that block in
     /// variable-block mode).
     fn read_block(&mut self, buf: &mut [u8]) -> Result<usize, TapeIoError>;
+
+    /// Read one fixed-size batch. The default loops through
+    /// [`Self::read_block`] and never intentionally crosses `remaining`.
+    fn read_block_batch(
+        &mut self,
+        buf: &mut [u8],
+        block_size_bytes: u32,
+        requested_records: u32,
+        remaining_records_in_file: u32,
+    ) -> Result<ReadBatchOutcome, TapeIoError> {
+        if requested_records == 0 || remaining_records_in_file == 0 {
+            return Err(TapeIoError::OperationFailed(
+                "read_block_batch record counts must be nonzero".to_string(),
+            ));
+        }
+        if block_size_bytes == 0 {
+            return Err(TapeIoError::OperationFailed(
+                "read_block_batch block size must be nonzero".to_string(),
+            ));
+        }
+        let block_size = block_size_bytes as usize;
+        let records = requested_records
+            .min(remaining_records_in_file)
+            .min(self.read_batch_blocks(block_size_bytes));
+        let needed = (records as usize).checked_mul(block_size).ok_or_else(|| {
+            TapeIoError::OperationFailed("read batch byte count overflow".to_string())
+        })?;
+        if buf.len() < needed {
+            return Err(TapeIoError::OperationFailed(
+                "read_block_batch buffer too small".to_string(),
+            ));
+        }
+        let mut records_read = 0u32;
+        let mut bytes_read = 0u32;
+        for slot in buf[..needed].chunks_exact_mut(block_size) {
+            let read = self.read_block(slot)?;
+            if read != block_size {
+                return Err(TapeIoError::OperationFailed(format!(
+                    "short fixed batch read: expected {block_size}, got {read}"
+                )));
+            }
+            records_read += 1;
+            bytes_read = bytes_read.checked_add(block_size_bytes).ok_or_else(|| {
+                TapeIoError::OperationFailed("read batch byte count overflow".to_string())
+            })?;
+        }
+        let position_after = self.position()?;
+        Ok(ReadBatchOutcome::from_computed_position(
+            records_read,
+            bytes_read,
+            false,
+            position_after,
+        ))
+    }
+
+    /// Effective records per batch for this source and block size.
+    fn read_batch_blocks(&self, _block_size_bytes: u32) -> u32 {
+        1
+    }
+
+    /// True when callers should preserve legacy single-block behavior.
+    fn legacy_single_block(&self) -> bool {
+        self.read_batch_blocks(1) <= 1
+    }
 
     /// LOCATE to the given LBA.
     fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError>;
@@ -125,6 +255,39 @@ impl BlockSink for DriveHandleSink<'_> {
     fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
         self.0.write_block(buf)
     }
+    fn write_block_batch(
+        &mut self,
+        buf: &[u8],
+        block_size_bytes: u32,
+    ) -> Result<WriteBatchOutcome, TapeIoError> {
+        self.0.write_block_batch(buf, block_size_bytes)
+    }
+    fn write_batch_blocks(&self, block_size_bytes: u32) -> u32 {
+        if self.0.legacy_single_block() {
+            1
+        } else {
+            self.0.effective_write_batch_blocks().max(1).min(
+                self.0
+                    .sg_reserved_size_bytes()
+                    .checked_div(block_size_bytes.max(1))
+                    .unwrap_or(1)
+                    .max(1),
+            )
+        }
+    }
+    fn requested_write_batch_blocks(&self) -> u32 {
+        if self.0.legacy_single_block() {
+            1
+        } else {
+            self.0.requested_write_batch_blocks()
+        }
+    }
+    fn legacy_single_block(&self) -> bool {
+        self.0.legacy_single_block()
+    }
+    fn position_check_bytes(&self) -> u64 {
+        self.0.position_check_bytes()
+    }
     fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
         self.0.write_filemarks(count)
     }
@@ -144,6 +307,36 @@ pub struct DriveHandleSource<'a>(pub &'a mut DriveHandle);
 impl BlockSource for DriveHandleSource<'_> {
     fn read_block(&mut self, buf: &mut [u8]) -> Result<usize, TapeIoError> {
         self.0.read_block(buf)
+    }
+    fn read_block_batch(
+        &mut self,
+        buf: &mut [u8],
+        block_size_bytes: u32,
+        requested_records: u32,
+        remaining_records_in_file: u32,
+    ) -> Result<ReadBatchOutcome, TapeIoError> {
+        self.0.read_block_batch(
+            buf,
+            block_size_bytes,
+            requested_records,
+            remaining_records_in_file,
+        )
+    }
+    fn read_batch_blocks(&self, block_size_bytes: u32) -> u32 {
+        if self.0.legacy_single_block() {
+            1
+        } else {
+            self.0.effective_read_batch_blocks().max(1).min(
+                self.0
+                    .sg_reserved_size_bytes()
+                    .checked_div(block_size_bytes.max(1))
+                    .unwrap_or(1)
+                    .max(1),
+            )
+        }
+    }
+    fn legacy_single_block(&self) -> bool {
+        self.0.legacy_single_block()
     }
     fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
         self.0.locate(lba)
@@ -609,7 +802,7 @@ impl BlockSink for VecBlockSink {
 /// `Vec<Vec<u8>>`. LBAs are dense (0..N); seeking past the end
 /// returns a [`TapeIoError::CheckCondition`] modelled on the
 /// drive's "no medium past EOD" behaviour.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct VecBlockSource {
     /// Block payloads indexed by LBA.
     pub blocks: Vec<Vec<u8>>,
@@ -619,6 +812,14 @@ pub struct VecBlockSource {
     /// Current LBA cursor — incremented by `read_block`, set by
     /// `locate`, adjusted by `space`.
     cursor: u64,
+    read_batch_blocks: u32,
+    legacy_single_block: bool,
+}
+
+impl Default for VecBlockSource {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
 }
 
 /// One recorded call on a [`VecBlockSource`].
@@ -633,6 +834,17 @@ pub enum VecBlockSourceCall {
         requested: usize,
         /// Bytes actually copied (= min(block_size, requested)).
         returned: usize,
+    },
+    /// `read_block_batch` called at this LBA.
+    ReadBlockBatch {
+        /// LBA the cursor was at when the call landed.
+        lba: u64,
+        /// Fixed record size requested by the caller.
+        block_size_bytes: u32,
+        /// Record count selected by the caller.
+        requested_records: u32,
+        /// Data records actually copied.
+        returned_records: u32,
     },
     /// `locate` called.
     Locate {
@@ -658,7 +870,26 @@ impl VecBlockSource {
             blocks,
             calls: Vec::new(),
             cursor: 0,
+            read_batch_blocks: 1,
+            legacy_single_block: false,
         }
+    }
+
+    /// Test helper that makes `read_batch_blocks` report a larger fixed
+    /// record batch size.
+    pub fn with_read_batch_blocks_for_test(mut self, read_batch_blocks: u32) -> Self {
+        assert!(
+            read_batch_blocks > 0,
+            "VecBlockSource read batch size must be nonzero"
+        );
+        self.read_batch_blocks = read_batch_blocks;
+        self
+    }
+
+    /// Test helper that makes `legacy_single_block` report true.
+    pub fn with_legacy_single_block_for_test(mut self) -> Self {
+        self.legacy_single_block = true;
+        self
     }
 
     /// Current cursor LBA. Useful in tests to verify positioning
@@ -718,6 +949,86 @@ impl BlockSource for VecBlockSource {
                 ))
             }
         }
+    }
+
+    fn read_block_batch(
+        &mut self,
+        buf: &mut [u8],
+        block_size_bytes: u32,
+        requested_records: u32,
+        remaining_records_in_file: u32,
+    ) -> Result<ReadBatchOutcome, TapeIoError> {
+        if block_size_bytes == 0 || requested_records == 0 || remaining_records_in_file == 0 {
+            return Err(TapeIoError::OperationFailed(
+                "VecBlockSource read_block_batch requires nonzero block and record counts"
+                    .to_string(),
+            ));
+        }
+        let records = requested_records.min(remaining_records_in_file);
+        let block_size = usize::try_from(block_size_bytes).map_err(|_| {
+            TapeIoError::OperationFailed(
+                "VecBlockSource read_block_batch block size exceeds usize".to_string(),
+            )
+        })?;
+        let transfer_len = block_size.checked_mul(records as usize).ok_or_else(|| {
+            TapeIoError::OperationFailed(
+                "VecBlockSource read_block_batch transfer length overflow".to_string(),
+            )
+        })?;
+        if buf.len() < transfer_len {
+            return Err(TapeIoError::OperationFailed(
+                "VecBlockSource read_block_batch buffer is too small".to_string(),
+            ));
+        }
+
+        let start_lba = self.cursor;
+        let mut bytes_read = 0usize;
+        for record_index in 0..records {
+            let lba = self.cursor + u64::from(record_index);
+            let block = self.blocks.get(lba as usize).ok_or_else(|| {
+                TapeIoError::CheckCondition(remanence_scsi::ScsiError::CheckCondition {
+                    sense: synth_blank_check_eod_sense(),
+                    bytes_transferred: bytes_read as u32,
+                })
+            })?;
+            if block.len() != block_size {
+                return Err(TapeIoError::OperationFailed(format!(
+                    "VecBlockSource read_block_batch fixed block mismatch: expected {block_size} got {}",
+                    block.len()
+                )));
+            }
+            let end = bytes_read + block_size;
+            buf[bytes_read..end].copy_from_slice(block);
+            bytes_read = end;
+        }
+
+        self.cursor += u64::from(records);
+        self.calls.push(VecBlockSourceCall::ReadBlockBatch {
+            lba: start_lba,
+            block_size_bytes,
+            requested_records: records,
+            returned_records: records,
+        });
+        Ok(ReadBatchOutcome::from_computed_position(
+            records,
+            bytes_read as u32,
+            false,
+            TapePosition {
+                lba: self.cursor,
+                partition: 0,
+                beginning_of_partition: self.cursor == 0,
+                end_of_partition: self.cursor as usize >= self.blocks.len(),
+                block_position_end_of_warning: false,
+            },
+        ))
+    }
+
+    fn read_batch_blocks(&self, _block_size_bytes: u32) -> u32 {
+        self.read_batch_blocks
+    }
+
+    fn legacy_single_block(&self) -> bool {
+        self.legacy_single_block
     }
 
     fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {

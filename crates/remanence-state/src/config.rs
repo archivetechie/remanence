@@ -37,6 +37,9 @@ pub struct RemConfig {
     /// Live-status serving settings.
     #[serde(default)]
     pub livestatus: LiveStatusConfig,
+    /// Tape I/O batching and position-proof settings.
+    #[serde(default)]
+    pub tape_io: TapeIoConfig,
     /// Layer 3c journal settings.
     pub journal: JournalConfig,
     /// Layer 4 audit-log settings.
@@ -270,6 +273,32 @@ impl Default for LiveStatusConfig {
     }
 }
 
+/// Tape I/O batching and position-proof settings.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct TapeIoConfig {
+    /// Exact shipped single-record variable-mode behavior.
+    pub legacy_single_block: bool,
+    /// Requested fixed records per WRITE(6), before sg/HBA clamping.
+    pub write_batch_blocks: u32,
+    /// Requested fixed records per READ(6), before sg/HBA clamping.
+    pub read_batch_blocks: u32,
+    /// Drift tripwire cadence in bytes. Zero disables mid-stream checks.
+    #[serde(deserialize_with = "deserialize_byte_size")]
+    pub position_check_bytes: u64,
+}
+
+impl Default for TapeIoConfig {
+    fn default() -> Self {
+        Self {
+            legacy_single_block: false,
+            write_batch_blocks: remanence_library::DEFAULT_TAPE_IO_BATCH_BLOCKS,
+            read_batch_blocks: remanence_library::DEFAULT_TAPE_IO_BATCH_BLOCKS,
+            position_check_bytes: remanence_library::DEFAULT_TAPE_IO_POSITION_CHECK_BYTES,
+        }
+    }
+}
+
 /// Layer 3c journal configuration.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -388,6 +417,16 @@ pub fn validate_config(config: &RemConfig) -> Result<(), StateError> {
     if config.audit.clock_forward_tolerance_seconds > i64::MAX as u64 {
         return Err(StateError::ConfigInvalid(
             "audit.clock_forward_tolerance_seconds is too large".to_string(),
+        ));
+    }
+    if config.tape_io.write_batch_blocks == 0 {
+        return Err(StateError::ConfigInvalid(
+            "tape_io.write_batch_blocks must be non-zero".to_string(),
+        ));
+    }
+    if config.tape_io.read_batch_blocks == 0 {
+        return Err(StateError::ConfigInvalid(
+            "tape_io.read_batch_blocks must be non-zero".to_string(),
         ));
     }
 
@@ -932,6 +971,58 @@ client_ca = "/ca"
         assert!(config.audit.fsync);
         assert!(config.tape_pools.is_empty());
         assert!(config.tape_pool_rules.is_empty());
+        assert!(!config.tape_io.legacy_single_block);
+        assert_eq!(
+            config.tape_io.write_batch_blocks,
+            remanence_library::DEFAULT_TAPE_IO_BATCH_BLOCKS
+        );
+        assert_eq!(
+            config.tape_io.read_batch_blocks,
+            remanence_library::DEFAULT_TAPE_IO_BATCH_BLOCKS
+        );
+        assert_eq!(
+            config.tape_io.position_check_bytes,
+            remanence_library::DEFAULT_TAPE_IO_POSITION_CHECK_BYTES
+        );
+    }
+
+    #[test]
+    fn tape_io_config_parses_and_rejects_zero_batches() {
+        let mut text = valid_config();
+        text.push_str(
+            r#"
+[tape_io]
+legacy_single_block = true
+write_batch_blocks = 8
+read_batch_blocks = 6
+position_check_bytes = "16MiB"
+"#,
+        );
+        let config = parse_config_toml(&text).expect("valid tape_io config");
+        assert!(config.tape_io.legacy_single_block);
+        assert_eq!(config.tape_io.write_batch_blocks, 8);
+        assert_eq!(config.tape_io.read_batch_blocks, 6);
+        assert_eq!(config.tape_io.position_check_bytes, 16 * 1024 * 1024);
+
+        let mut zero_write = valid_config();
+        zero_write.push_str(
+            r#"
+[tape_io]
+write_batch_blocks = 0
+"#,
+        );
+        let err = parse_config_toml(&zero_write).expect_err("zero write batch rejects");
+        assert!(err.to_string().contains("write_batch_blocks"), "{err}");
+
+        let mut zero_read = valid_config();
+        zero_read.push_str(
+            r#"
+[tape_io]
+read_batch_blocks = 0
+"#,
+        );
+        let err = parse_config_toml(&zero_read).expect_err("zero read batch rejects");
+        assert!(err.to_string().contains("read_batch_blocks"), "{err}");
     }
 
     #[test]

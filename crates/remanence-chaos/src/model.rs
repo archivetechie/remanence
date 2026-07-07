@@ -597,43 +597,99 @@ impl ModelTransport {
         }
     }
 
-    fn read_6(&mut self, buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+    fn read_6(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+        let fixed = fixed_cdb(cdb);
+        let transfer_len = read_u24(cdb, 2).ok_or(ScsiError::InvalidInput("short READ(6) CDB"))?;
         let mut world = self.world.lock().expect("virtual world lock");
         let position = usize::try_from(self.position)
             .map_err(|_| ScsiError::InvalidInput("model position exceeds usize"))?;
+        let mut success_advance = 0u64;
+        let mut error_advance = 0u64;
         let outcome = self.with_loaded_tape(&mut world, |tape| {
-            let Some(record) = tape.records.get(position).cloned() else {
-                return Err(check_condition(blank_check_eod_sense(), 0));
-            };
-            match record {
-                Record::Block(block) => {
-                    let n = block.len().min(buf.len());
-                    buf[..n].copy_from_slice(&block[..n]);
-                    Ok(TransferOutcome::clean(n as u32))
+            if fixed {
+                let block_size = fixed_block_size(tape.block_size)?;
+                let records_requested = usize::try_from(transfer_len)
+                    .map_err(|_| ScsiError::InvalidInput("fixed READ count exceeds usize"))?;
+                let transfer_bytes =
+                    fixed_transfer_bytes(records_requested, block_size, "fixed READ")?;
+                if buf.len() < transfer_bytes {
+                    return Err(ScsiError::InvalidInput("fixed READ buffer too small"));
                 }
-                Record::Filemark => Err(check_condition(filemark_sense(), 0)),
+                let mut bytes_read = 0usize;
+                for record_index in 0..records_requested {
+                    let Some(record) = tape.records.get(position + record_index).cloned() else {
+                        let residual = records_requested - record_index;
+                        error_advance = record_index as u64;
+                        return Err(check_condition(
+                            blank_check_eod_sense_with_residual(residual),
+                            bytes_read as u32,
+                        ));
+                    };
+                    match record {
+                        Record::Block(block) => {
+                            if block.len() != block_size {
+                                return Err(ScsiError::InvalidInput(
+                                    "fixed READ encountered non-fixed-size block",
+                                ));
+                            }
+                            let end = bytes_read + block_size;
+                            buf[bytes_read..end].copy_from_slice(&block);
+                            bytes_read = end;
+                        }
+                        Record::Filemark => {
+                            let residual = records_requested - record_index;
+                            error_advance = record_index as u64 + 1;
+                            return Err(check_condition(
+                                filemark_sense_with_residual(residual),
+                                bytes_read as u32,
+                            ));
+                        }
+                    }
+                }
+                success_advance = records_requested as u64;
+                Ok(TransferOutcome::clean(bytes_read as u32))
+            } else {
+                let Some(record) = tape.records.get(position).cloned() else {
+                    return Err(check_condition(blank_check_eod_sense(), 0));
+                };
+                match record {
+                    Record::Block(block) => {
+                        let n = block.len().min(buf.len());
+                        buf[..n].copy_from_slice(&block[..n]);
+                        success_advance = 1;
+                        Ok(TransferOutcome::clean(n as u32))
+                    }
+                    Record::Filemark => {
+                        error_advance = 1;
+                        Err(check_condition(filemark_sense(), 0))
+                    }
+                }
             }
         });
-        let outcome = outcome
-            .inspect(|_| {
-                self.position = self.position.saturating_add(1);
-            })
-            .inspect_err(|err| {
-                if is_filemark_check_condition(err) {
-                    self.position = self.position.saturating_add(1);
-                }
-            })?;
+        let outcome = match outcome {
+            Ok(outcome) => {
+                self.position = self.position.saturating_add(success_advance);
+                outcome
+            }
+            Err(err) => {
+                self.position = self.position.saturating_add(error_advance);
+                return Err(err);
+            }
+        };
         if self.advance_drive_cleaning_state(&mut world)? {
             self.position = 0;
         }
         Ok(outcome)
     }
 
-    fn write_6(&mut self, buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
+    fn write_6(&mut self, cdb: &[u8], buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
+        let fixed = fixed_cdb(cdb);
+        let transfer_len = read_u24(cdb, 2).ok_or(ScsiError::InvalidInput("short WRITE(6) CDB"))?;
         let mut world = self.world.lock().expect("virtual world lock");
         let position = usize::try_from(self.position)
             .map_err(|_| ScsiError::InvalidInput("model position exceeds usize"))?;
         let mut crossed_eom = false;
+        let mut records_written = 0u64;
         self.with_loaded_tape(&mut world, |tape| {
             if tape.write_protected {
                 return Err(ScsiError::InvalidInput("virtual tape is write protected"));
@@ -642,12 +698,34 @@ impl ModelTransport {
                 tape.records.truncate(position);
                 recompute_written_bytes(tape);
             }
-            tape.records.push(Record::Block(buf.to_vec()));
+            if fixed {
+                let block_size = fixed_block_size(tape.block_size)?;
+                let records = usize::try_from(transfer_len)
+                    .map_err(|_| ScsiError::InvalidInput("fixed WRITE count exceeds usize"))?;
+                let expected_len = fixed_transfer_bytes(records, block_size, "fixed WRITE")?;
+                if buf.len() != expected_len {
+                    return Err(ScsiError::InvalidInput(
+                        "fixed WRITE buffer length does not match count * block size",
+                    ));
+                }
+                for block in buf.chunks_exact(block_size) {
+                    tape.records.push(Record::Block(block.to_vec()));
+                }
+                records_written = records as u64;
+            } else {
+                if usize::try_from(transfer_len).ok() != Some(buf.len()) {
+                    return Err(ScsiError::InvalidInput(
+                        "variable WRITE buffer length does not match transfer length",
+                    ));
+                }
+                tape.records.push(Record::Block(buf.to_vec()));
+                records_written = 1;
+            }
             tape.written_bytes = tape.written_bytes.saturating_add(buf.len() as u64);
             crossed_eom = tape.written_bytes > tape.capacity_bytes;
             Ok(())
         })?;
-        self.position = self.position.saturating_add(1);
+        self.position = self.position.saturating_add(records_written);
         if self.advance_drive_cleaning_state(&mut world)? {
             self.position = 0;
         }
@@ -914,7 +992,7 @@ impl SgTransport for ModelTransport {
     fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
         match cdb.first().copied() {
             Some(0x05) => self.read_block_limits(buf),
-            Some(0x08) => self.read_6(buf),
+            Some(0x08) => self.read_6(cdb, buf),
             Some(0x12) => self.inquiry(
                 buf,
                 cdb.get(1).copied().unwrap_or(0) & 0x01 != 0,
@@ -957,7 +1035,7 @@ impl SgTransport for ModelTransport {
 
     fn execute_out(&mut self, cdb: &[u8], buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
         match cdb.first().copied() {
-            Some(0x0a) => self.write_6(buf),
+            Some(0x0a) => self.write_6(cdb, buf),
             Some(0x15) => self.mode_select(buf),
             _ => Err(ScsiError::InvalidInput("unsupported data-out CDB")),
         }
@@ -1182,6 +1260,33 @@ fn read_u24(cdb: &[u8], offset: usize) -> Option<u32> {
     )
 }
 
+fn fixed_cdb(cdb: &[u8]) -> bool {
+    cdb.get(1).copied().unwrap_or(0) & 0x01 != 0
+}
+
+fn fixed_block_size(block_size: u32) -> Result<usize, ScsiError> {
+    let block_size = usize::try_from(block_size)
+        .map_err(|_| ScsiError::InvalidInput("fixed block size exceeds usize"))?;
+    if block_size == 0 {
+        return Err(ScsiError::InvalidInput("fixed block size is zero"));
+    }
+    Ok(block_size)
+}
+
+fn fixed_transfer_bytes(
+    records: usize,
+    block_size: usize,
+    operation: &'static str,
+) -> Result<usize, ScsiError> {
+    records
+        .checked_mul(block_size)
+        .ok_or(ScsiError::InvalidInput(match operation {
+            "fixed READ" => "fixed READ byte count overflow",
+            "fixed WRITE" => "fixed WRITE byte count overflow",
+            _ => "fixed transfer byte count overflow",
+        }))
+}
+
 fn sign_extend_24(value: u32) -> i32 {
     if value & 0x0080_0000 != 0 {
         (value | 0xff00_0000) as i32
@@ -1209,12 +1314,12 @@ fn check_condition(_sense: Vec<u8>, _bytes_transferred: u32) -> ScsiError {
     ScsiError::InvalidInput("CHECK CONDITION synthesis is Linux-only")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn is_filemark_check_condition(err: &ScsiError) -> bool {
     matches!(err, ScsiError::CheckCondition { sense, .. } if sense.get(2).copied().unwrap_or(0) & 0x80 != 0)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(test, not(target_os = "linux")))]
 fn is_filemark_check_condition(_err: &ScsiError) -> bool {
     false
 }
@@ -1237,8 +1342,16 @@ fn filemark_sense() -> Vec<u8> {
     fixed_sense(0x00, 0x00, 0x01, Some(0), 0x80)
 }
 
+fn filemark_sense_with_residual(residual: usize) -> Vec<u8> {
+    fixed_sense(0x00, 0x00, 0x01, Some(residual as i64), 0x80)
+}
+
 fn blank_check_eod_sense() -> Vec<u8> {
     fixed_sense(0x08, 0x00, 0x05, Some(0), 0x00)
+}
+
+fn blank_check_eod_sense_with_residual(residual: usize) -> Vec<u8> {
+    fixed_sense(0x08, 0x00, 0x05, Some(residual as i64), 0x00)
 }
 
 fn no_medium_sense() -> Vec<u8> {
@@ -1387,6 +1500,64 @@ mod tests {
             )
             .expect_err("filemark sense");
         assert!(is_filemark_check_condition(&err));
+    }
+
+    #[test]
+    fn fixed_batch_write_produces_byte_identical_model_image_to_serial_variable_writes() {
+        fn loaded_world() -> SharedVirtualWorld {
+            let mut world = VirtualWorld::single_drive("LIB-MODEL", 0x0100, "DRV-MODEL", 0x0400, 1);
+            world.put_tape_in_drive(0x0100, "TAPE001", Some(0x0400), VirtualTape::empty(1024, 4));
+            Arc::new(Mutex::new(world))
+        }
+
+        let blocks = [b"abcd".as_slice(), b"efgh".as_slice(), b"ijkl".as_slice()];
+        let serial_world = loaded_world();
+        let mut serial_drive =
+            ModelTransport::new(Arc::clone(&serial_world), DeviceRole::Drive { bay: 0x0100 });
+        for block in blocks {
+            serial_drive
+                .execute_out(
+                    &read_write::build_write_variable_cdb(block.len() as u32),
+                    block,
+                )
+                .expect("serial variable WRITE(6)");
+        }
+        let serial_records = serial_world
+            .lock()
+            .expect("serial world")
+            .tapes
+            .get("TAPE001")
+            .expect("serial tape")
+            .records
+            .clone();
+
+        let batched_world = loaded_world();
+        let mut batched_drive = ModelTransport::new(
+            Arc::clone(&batched_world),
+            DeviceRole::Drive { bay: 0x0100 },
+        );
+        let batch = blocks.concat();
+        batched_drive
+            .execute_out(&read_write::build_write_fixed_cdb(3), &batch)
+            .expect("fixed batched WRITE(6)");
+        let batched_records = batched_world
+            .lock()
+            .expect("batched world")
+            .tapes
+            .get("TAPE001")
+            .expect("batched tape")
+            .records
+            .clone();
+
+        assert_eq!(batched_records, serial_records);
+
+        batched_drive.rewind();
+        let mut read_buf = [0u8; 12];
+        let read = batched_drive
+            .execute_in(&read_write::build_read_fixed_cdb(3), &mut read_buf)
+            .expect("fixed batched READ(6)");
+        assert_eq!(read.bytes_transferred, 12);
+        assert_eq!(&read_buf, batch.as_slice());
     }
 
     #[test]

@@ -20,7 +20,7 @@ use crate::config::{derive_tape_pool_from_voltag, TapePoolRuleConfig};
 use crate::error::StateError;
 
 /// Current Layer 4 SQLite schema version.
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 const LEGACY_TAPE_POOL_MEMBERSHIPS_TABLE: &str = concat!("tape_pool_", "memberships");
 /// Catalog value for an unencrypted RAO copy row.
 pub const OBJECT_COPY_REPRESENTATION_PLAINTEXT: &str = "plaintext";
@@ -341,6 +341,44 @@ pub struct MediaReadinessOperationRecord {
     pub last_error_json: Option<String>,
     /// Quarantine id associated with this row.
     pub quarantine_id: Option<String>,
+}
+
+/// Input for recording a durable tape-I/O fence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TapeIoFenceInput {
+    /// Tape identity whose uncommitted tail must not be selected/opened.
+    pub tape_uuid: [u8; 16],
+    /// Barcode observed for this tape, when known.
+    pub barcode: Option<String>,
+    /// Stable reason class such as `partial_batch` or `position_mismatch`.
+    pub reason: String,
+    /// Structured evidence, normally JSON.
+    pub evidence_json: Option<String>,
+}
+
+/// Durable tape-I/O fence row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TapeIoFenceRecord {
+    /// SQLite row id.
+    pub fence_id: i64,
+    /// Tape UUID bytes.
+    pub tape_uuid: Vec<u8>,
+    /// Barcode observed when fenced.
+    pub barcode: Option<String>,
+    /// `active` or `released`.
+    pub state: String,
+    /// Stable reason class.
+    pub reason: String,
+    /// Structured evidence.
+    pub evidence_json: Option<String>,
+    /// Operator-facing quarantine id.
+    pub quarantine_id: String,
+    /// Creation timestamp.
+    pub created_at_utc: String,
+    /// Last update timestamp.
+    pub updated_at_utc: String,
+    /// Operator release acknowledgment.
+    pub release_ack: Option<String>,
 }
 
 /// Non-terminal session found during startup replay.
@@ -1124,6 +1162,124 @@ impl CatalogIndex {
                 )
             })
             .collect())
+    }
+
+    /// Persist a durable tape-I/O fence. Existing active fences for the same
+    /// tape/barcode remain active; callers can present any one quarantine id
+    /// to the operator.
+    pub fn record_tape_io_fence(
+        &mut self,
+        input: TapeIoFenceInput,
+    ) -> Result<TapeIoFenceRecord, StateError> {
+        let now = now_utc()?;
+        let id_time = now.replace([':', '.', '+'], "");
+        let quarantine_id = format!("tioq-{}-{}", Uuid::from_bytes(input.tape_uuid), id_time);
+        self.conn
+            .execute(
+                "insert into tape_io_fences(
+                   tape_uuid, barcode, state, reason, evidence_json,
+                   quarantine_id, created_at_utc, updated_at_utc, release_ack
+                 )
+                 values(?1, ?2, 'active', ?3, ?4, ?5, ?6, ?6, null)",
+                params![
+                    input.tape_uuid.as_slice(),
+                    input.barcode.as_deref(),
+                    input.reason.as_str(),
+                    input.evidence_json.as_deref(),
+                    quarantine_id.as_str(),
+                    now.as_str(),
+                ],
+            )
+            .map_err(|err| sqlite_error("record tape io fence", err))?;
+        self.tape_io_fence_by_quarantine_id(quarantine_id.as_str())?
+            .ok_or_else(|| StateError::IndexCorrupt("tape-I/O fence vanished".into()))
+    }
+
+    /// List active tape-I/O fences.
+    pub fn list_active_tape_io_fences(&self) -> Result<Vec<TapeIoFenceRecord>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select fence_id, tape_uuid, barcode, state, reason, evidence_json,
+                        quarantine_id, created_at_utc, updated_at_utc, release_ack
+                 from tape_io_fences
+                 where state = 'active'
+                 order by updated_at_utc desc, fence_id",
+            )
+            .map_err(|err| sqlite_error("prepare active tape io fences", err))?;
+        let rows = stmt
+            .query_map([], tape_io_fence_from_row)
+            .map_err(|err| sqlite_error("query active tape io fences", err))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| sqlite_error("read active tape io fence", err))
+    }
+
+    /// Return active tape-I/O fences matching a tape UUID or barcode.
+    pub fn tape_io_admission_conflicts(
+        &self,
+        tape_uuid: &[u8; 16],
+        barcode: Option<&str>,
+    ) -> Result<Vec<TapeIoFenceRecord>, StateError> {
+        let barcode = barcode.map(str::trim).filter(|value| !value.is_empty());
+        Ok(self
+            .list_active_tape_io_fences()?
+            .into_iter()
+            .filter(|record| {
+                record.tape_uuid.as_slice() == tape_uuid
+                    || barcode.is_some_and(|barcode| {
+                        record
+                            .barcode
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .is_some_and(|record_barcode| {
+                                record_barcode.eq_ignore_ascii_case(barcode)
+                            })
+                    })
+            })
+            .collect())
+    }
+
+    /// Release an active tape-I/O fence by quarantine id.
+    pub fn release_tape_io_fence(
+        &mut self,
+        quarantine_id: &str,
+        ack: &str,
+    ) -> Result<Option<TapeIoFenceRecord>, StateError> {
+        let now = now_utc()?;
+        let changed = self
+            .conn
+            .execute(
+                "update tape_io_fences
+                 set state = 'released',
+                     updated_at_utc = ?2,
+                     release_ack = ?3
+                 where quarantine_id = ?1 and state = 'active'",
+                params![quarantine_id, now.as_str(), ack],
+            )
+            .map_err(|err| sqlite_error("release tape io fence", err))?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.tape_io_fence_by_quarantine_id(quarantine_id)
+    }
+
+    /// Fetch one tape-I/O fence by quarantine id.
+    pub fn tape_io_fence_by_quarantine_id(
+        &self,
+        quarantine_id: &str,
+    ) -> Result<Option<TapeIoFenceRecord>, StateError> {
+        self.conn
+            .query_row(
+                "select fence_id, tape_uuid, barcode, state, reason, evidence_json,
+                        quarantine_id, created_at_utc, updated_at_utc, release_ack
+                 from tape_io_fences
+                 where quarantine_id = ?1",
+                params![quarantine_id],
+                tape_io_fence_from_row,
+            )
+            .optional()
+            .map_err(|err| sqlite_error("lookup tape io fence", err))
     }
 
     /// Run SQLite quick_check and return the result text.
@@ -7233,6 +7389,27 @@ create table if not exists media_readiness_transitions(
 create index if not exists media_readiness_transitions_op_idx
   on media_readiness_transitions(operation_id, transition_id);
 
+create table if not exists tape_io_fences(
+  fence_id integer primary key,
+  tape_uuid blob not null,
+  barcode text,
+  state text not null,
+  reason text not null,
+  evidence_json text,
+  quarantine_id text not null unique,
+  created_at_utc text not null,
+  updated_at_utc text not null,
+  release_ack text
+);
+
+create index if not exists tape_io_fences_active_tape_idx
+  on tape_io_fences(tape_uuid, state, updated_at_utc)
+  where state = 'active';
+
+create index if not exists tape_io_fences_active_barcode_idx
+  on tape_io_fences(barcode, state, updated_at_utc)
+  where state = 'active' and barcode is not null;
+
 create table if not exists sessions(
   session_id text primary key,
   session_kind text not null,
@@ -7361,6 +7538,21 @@ fn media_readiness_operation_from_row(
     })
 }
 
+fn tape_io_fence_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TapeIoFenceRecord> {
+    Ok(TapeIoFenceRecord {
+        fence_id: row.get(0)?,
+        tape_uuid: row.get(1)?,
+        barcode: row.get(2)?,
+        state: row.get(3)?,
+        reason: row.get(4)?,
+        evidence_json: row.get(5)?,
+        quarantine_id: row.get(6)?,
+        created_at_utc: row.get(7)?,
+        updated_at_utc: row.get(8)?,
+        release_ack: row.get(9)?,
+    })
+}
+
 fn media_readiness_record_conflicts_with_admission(
     record: &MediaReadinessOperationRecord,
     drive_element: Option<i64>,
@@ -7447,6 +7639,7 @@ mod tests {
         "catalog_units",
         "idempotency_keys",
         "operations",
+        "tape_io_fences",
         "sessions",
         "drives",
         "drive_events",
@@ -8742,6 +8935,81 @@ mod tests {
             .expect("lookup")
             .expect("readiness operation must survive rebuild clear");
         assert_eq!(record.barcode.as_deref(), Some("AOX031L9"));
+    }
+
+    #[test]
+    fn tape_io_fences_are_durable_scoped_and_operator_released() {
+        let temp = tempfile::Builder::new()
+            .prefix("rem-tape-io-fence")
+            .tempdir()
+            .expect("temp dir");
+        let path = temp.path().join("rem-state.sqlite");
+        let tape_uuid = [0x44; 16];
+        let other_uuid = [0x55; 16];
+        let quarantine_id = {
+            let mut index = CatalogIndex::open(&path).expect("open");
+            let record = index
+                .record_tape_io_fence(TapeIoFenceInput {
+                    tape_uuid,
+                    barcode: Some("RMN044L9".to_string()),
+                    reason: "partial_batch".to_string(),
+                    evidence_json: Some(
+                        "{\"requested_records\":4,\"written_records\":2}".to_string(),
+                    ),
+                })
+                .expect("record tape-I/O fence");
+
+            assert_eq!(record.tape_uuid, tape_uuid.to_vec());
+            assert_eq!(record.barcode.as_deref(), Some("RMN044L9"));
+            assert_eq!(record.state, "active");
+            assert_eq!(record.reason, "partial_batch");
+            assert!(record.quarantine_id.starts_with("tioq-"));
+            assert_eq!(
+                index
+                    .tape_io_admission_conflicts(&tape_uuid, Some("OTHERL9"))
+                    .expect("uuid conflict")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                index
+                    .tape_io_admission_conflicts(&other_uuid, Some(" rmn044l9 "))
+                    .expect("barcode conflict")
+                    .len(),
+                1
+            );
+            assert!(index
+                .tape_io_admission_conflicts(&other_uuid, Some("OTHERL9"))
+                .expect("unrelated no conflict")
+                .is_empty());
+
+            let tx = index.conn.transaction().expect("transaction");
+            clear_rebuildable_tables(&tx).expect("clear rebuildable");
+            tx.commit().expect("commit");
+            record.quarantine_id
+        };
+
+        let mut reopened = CatalogIndex::open(&path).expect("reopen");
+        assert_eq!(
+            reopened
+                .list_active_tape_io_fences()
+                .expect("active after reopen")
+                .len(),
+            1
+        );
+        let released = reopened
+            .release_tape_io_fence(&quarantine_id, "operator verified tape image")
+            .expect("release tape-I/O fence")
+            .expect("released record");
+        assert_eq!(released.state, "released");
+        assert_eq!(
+            released.release_ack.as_deref(),
+            Some("operator verified tape image")
+        );
+        assert!(reopened
+            .tape_io_admission_conflicts(&tape_uuid, Some("RMN044L9"))
+            .expect("released no conflict")
+            .is_empty());
     }
 
     #[test]

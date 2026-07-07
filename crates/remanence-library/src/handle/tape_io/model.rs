@@ -269,6 +269,25 @@ impl WriteOutcome {
         }
     }
 
+    /// Construct a write outcome whose post-position was tracked
+    /// arithmetically from a prior device-proven boundary.
+    pub fn from_computed_position(
+        bytes_written: u32,
+        early_warning: bool,
+        end_of_medium: bool,
+        position_after: TapePosition,
+    ) -> Self {
+        Self {
+            bytes_written,
+            early_warning,
+            end_of_medium,
+            position_after,
+            position_evidence: PositionAfter::Computed(ComputedPosition::from_position(
+                position_after,
+            )),
+        }
+    }
+
     /// Evidence behind `position_after`.
     pub fn position_evidence(&self) -> PositionAfter {
         self.position_evidence

@@ -5345,9 +5345,27 @@ fn run_tape_quarantine(
             };
             let record = match find_media_readiness_quarantine(&records, quarantine.as_str()) {
                 Ok(record) => record.clone(),
-                Err(error) => {
-                    let _ = writeln!(err, "error: {error}");
-                    return ExitCode::from(1);
+                Err(_) => {
+                    match state
+                        .catalog_index()
+                        .release_tape_io_fence(quarantine.as_str(), ack.trim())
+                    {
+                        Ok(Some(record)) => {
+                            return print_tape_io_quarantine_released(&record, *json, out, err);
+                        }
+                        Ok(None) => {
+                            let _ = writeln!(
+                                err,
+                                "error: no active media-readiness or tape-I/O quarantine {:?}",
+                                quarantine
+                            );
+                            return ExitCode::from(1);
+                        }
+                        Err(error) => {
+                            let _ = writeln!(err, "error: {error}");
+                            return ExitCode::from(1);
+                        }
+                    }
                 }
             };
             let operation_id = match Uuid::parse_str(record.operation_id.as_str()) {
@@ -5373,6 +5391,50 @@ fn run_tape_quarantine(
             print_tape_quarantine_released(&released, *json, out, err)
         }
     }
+}
+
+fn tape_io_fence_json(record: &remanence_state::TapeIoFenceRecord) -> Value {
+    json!({
+        "quarantine_id": record.quarantine_id.as_str(),
+        "fence_id": record.fence_id,
+        "tape_uuid": bytes_to_uuid_text(&record.tape_uuid),
+        "barcode": record.barcode.as_deref(),
+        "state": record.state.as_str(),
+        "reason": record.reason.as_str(),
+        "evidence_json": record.evidence_json.as_deref(),
+        "created_at_utc": record.created_at_utc.as_str(),
+        "updated_at_utc": record.updated_at_utc.as_str(),
+        "release_ack": record.release_ack.as_deref(),
+    })
+}
+
+fn print_tape_io_quarantine_released(
+    record: &remanence_state::TapeIoFenceRecord,
+    json_output: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    if json_output {
+        if let Err(error) = print_json_envelope(
+            "rem.tape.quarantine.release.v1",
+            "item",
+            tape_io_fence_json(record),
+            out,
+        ) {
+            let _ = writeln!(err, "error: {error}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+    let _ = writeln!(
+        out,
+        "released {} tape_uuid={} barcode={} reason={}",
+        record.quarantine_id,
+        bytes_to_uuid_text(&record.tape_uuid),
+        record.barcode.as_deref().unwrap_or("(unknown)"),
+        record.reason
+    );
+    ExitCode::SUCCESS
 }
 
 fn load_state_config(
@@ -12885,6 +12947,7 @@ mod tests {
             drives: remanence_state::DrivesConfig::default(),
             cleaning: remanence_state::CleaningConfig::default(),
             livestatus: remanence_state::LiveStatusConfig::default(),
+            tape_io: remanence_state::TapeIoConfig::default(),
             journal: remanence_state::JournalConfig {
                 dir: root.join("journals"),
                 require_trusted_volume: false,

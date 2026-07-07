@@ -24,7 +24,7 @@ use remanence_parity::{
 use remanence_state::{
     AuditActor, AuditEvent, AuditEventRecord, AuditSubject, CatalogIndex, CleaningConfig,
     DriveHealthSnapshotInput, DriveHealthSnapshotRecord, FileAuditLog, NativeObjectFileRecord,
-    SourceLayer, TapePoolConfig,
+    SourceLayer, TapeIoConfig, TapePoolConfig,
 };
 use remanence_stream::StreamingError;
 use time::format_description::well_known::Rfc3339;
@@ -444,6 +444,7 @@ pub(crate) struct WriteOwnerConfig {
     pub snapshot_miss_alarm: u32,
     pub managed_library_serials: Arc<HashSet<String>>,
     pub cleaning: CleaningConfig,
+    pub tape_io: TapeIoConfig,
 }
 
 pub(crate) struct ExclusiveGuard {
@@ -1799,6 +1800,15 @@ fn handle_drive_open_write(
     }
 
     let tape_uuid = selected.tape_uuid;
+    if let Err(status) = session_open_reject_tape_io_fences(
+        index,
+        &tape_uuid,
+        barcode.as_deref(),
+        "open write session",
+    ) {
+        let _ = reply.send(Err(status));
+        return;
+    }
     if let Err(status) = prepare_drive_for_write(drive, &tape_uuid, selected.block_size, session_id)
     {
         let _ = reply.send(Err(status));
@@ -2197,6 +2207,116 @@ fn fixed_no_compression_config(current_cfg: TapeConfig, block_size: u32) -> Tape
     }
 }
 
+fn prepare_drive_for_read(
+    index: &CatalogIndex,
+    drive: &mut DriveHandle,
+    tape_uuid: &TapeUuid,
+    session_id: Uuid,
+) -> Result<(), Status> {
+    let Some(tape) = index.get_tape(tape_uuid).map_err(status_from_state_error)? else {
+        drive.set_legacy_single_block(true);
+        tracing::warn!(
+            target: "remanence_read_diag",
+            phase = "drive_prepare_read",
+            session_id = %session_id,
+            tape_uuid = %Uuid::from_bytes(*tape_uuid),
+            status = "legacy_fallback",
+            reason = "tape catalog row is missing",
+            "remanence_read_diag",
+        );
+        return Ok(());
+    };
+    let Some(block_size) = tape.block_size else {
+        drive.set_legacy_single_block(true);
+        tracing::warn!(
+            target: "remanence_read_diag",
+            phase = "drive_prepare_read",
+            session_id = %session_id,
+            tape_uuid = %Uuid::from_bytes(*tape_uuid),
+            status = "legacy_fallback",
+            reason = "tape block_size is missing",
+            "remanence_read_diag",
+        );
+        return Ok(());
+    };
+    let block_size = u32::try_from(block_size)
+        .map_err(|_| Status::internal("tape block size does not fit u32"))?;
+    let started = Instant::now();
+    let current_cfg = match drive.read_config() {
+        Ok(config) => config,
+        Err(err) => {
+            drive.set_legacy_single_block(true);
+            tracing::warn!(
+                target: "remanence_read_diag",
+                phase = "drive_prepare_read",
+                session_id = %session_id,
+                tape_uuid = %Uuid::from_bytes(*tape_uuid),
+                status = "legacy_fallback",
+                reason = %format!("read config: {err}"),
+                "remanence_read_diag",
+            );
+            return Ok(());
+        }
+    };
+    let target_cfg = fixed_no_compression_config(current_cfg, block_size);
+    if let Err(err) = drive.write_config(target_cfg) {
+        drive.set_legacy_single_block(true);
+        tracing::warn!(
+            target: "remanence_read_diag",
+            phase = "drive_prepare_read",
+            session_id = %session_id,
+            tape_uuid = %Uuid::from_bytes(*tape_uuid),
+            status = "legacy_fallback",
+            reason = %format!("write config: {err}"),
+            "remanence_read_diag",
+        );
+        return Ok(());
+    }
+    let verified = match drive.read_config() {
+        Ok(config) => config,
+        Err(err) => {
+            drive.set_legacy_single_block(true);
+            tracing::warn!(
+                target: "remanence_read_diag",
+                phase = "drive_prepare_read",
+                session_id = %session_id,
+                tape_uuid = %Uuid::from_bytes(*tape_uuid),
+                status = "legacy_fallback",
+                reason = %format!("verify config: {err}"),
+                "remanence_read_diag",
+            );
+            return Ok(());
+        }
+    };
+    if verified.block_size != target_cfg.block_size {
+        drive.set_legacy_single_block(true);
+        tracing::warn!(
+            target: "remanence_read_diag",
+            phase = "drive_prepare_read",
+            session_id = %session_id,
+            tape_uuid = %Uuid::from_bytes(*tape_uuid),
+            status = "legacy_fallback",
+            expected_block_size = ?target_cfg.block_size,
+            actual_block_size = ?verified.block_size,
+            "remanence_read_diag",
+        );
+        return Ok(());
+    }
+    tracing::info!(
+        target: "remanence_read_diag",
+        phase = "drive_prepare_read",
+        session_id = %session_id,
+        tape_uuid = %Uuid::from_bytes(*tape_uuid),
+        status = "ok",
+        selected_block_size_bytes = block_size,
+        prior_block_size = ?current_cfg.block_size,
+        target_block_size = ?target_cfg.block_size,
+        elapsed_ms = crate::diagnostics::duration_ms(started.elapsed()),
+        "remanence_read_diag",
+    );
+    Ok(())
+}
+
 fn handle_drive_open_read(
     bay: u16,
     index: &mut CatalogIndex,
@@ -2233,12 +2353,25 @@ fn handle_drive_open_read(
         let _ = reply.send(Err(status));
         return;
     }
+    if let Err(status) = session_open_reject_tape_io_fences(
+        index,
+        &tape_uuid,
+        barcode.as_deref(),
+        "open read session",
+    ) {
+        let _ = reply.send(Err(status));
+        return;
+    }
     if let Err(status) = verify_loaded_tape_identity(drive, &tape_uuid) {
         let _ = reply.send(Err(status));
         return;
     }
 
     let session_id = Uuid::new_v4();
+    if let Err(status) = prepare_drive_for_read(index, drive, &tape_uuid, session_id) {
+        let _ = reply.send(Err(status));
+        return;
+    }
     let opened_at_utc = now_rfc3339().unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
     if let Err(status) = record_session_event(
         index,
@@ -2460,6 +2593,28 @@ fn handle_drive_open_read(
             }
         }
     }
+}
+
+fn session_open_reject_tape_io_fences(
+    index: &CatalogIndex,
+    tape_uuid: &TapeUuid,
+    barcode: Option<&str>,
+    action: &str,
+) -> Result<(), Status> {
+    let conflicts = index
+        .tape_io_admission_conflicts(tape_uuid, barcode)
+        .map_err(status_from_state_error)?;
+    let Some(first) = conflicts.first() else {
+        return Ok(());
+    };
+    Err(Status::failed_precondition(format!(
+        "{action} blocked by active tape-I/O fence {} tape_uuid={} barcode={} reason={}; release via `rem tape quarantine release {}` before retrying",
+        first.quarantine_id,
+        Uuid::from_bytes(*tape_uuid),
+        barcode.unwrap_or("(unknown)"),
+        first.reason,
+        first.quarantine_id
+    )))
 }
 
 fn handle_robotics(
@@ -3111,7 +3266,11 @@ fn run_cleaning_sequence(
         ));
     }
     let mut drive_handle = library
-        .open_drive(drive_bay, &cfg.policy)
+        .open_drive_with_tape_io(
+            drive_bay,
+            &cfg.policy,
+            crate::tape_io_runtime_config(&cfg.tape_io),
+        )
         .map_err(|err| Status::internal(format!("open drive for cleaning verify: {err}")))?;
     let alerts = drive_handle.read_tape_alerts().map_err(|err| {
         let _ = index.terminalize_clean_run(
@@ -3811,22 +3970,16 @@ fn stream_one_object(
         .map_err(|_| Status::internal("tape block size does not fit usize"))?;
 
     verify_loaded_tape_identity(drive, tape_uuid)?;
-    let current_cfg = drive
-        .read_config()
-        .map_err(|err| Status::internal(format!("read drive config: {err}")))?;
     let block_size_u32 = u32::try_from(block_size)
         .map_err(|_| Status::internal("tape block size does not fit u32"))?;
-    drive
-        .write_config(TapeConfig {
-            block_size: BlockSize::Fixed {
-                size_bytes: block_size_u32,
-            },
-            compression: false,
-            max_block_size_bytes: current_cfg.max_block_size_bytes,
-            write_protected: current_cfg.write_protected,
-            worm: current_cfg.worm,
-        })
-        .map_err(|err| Status::internal(format!("set fixed-block config: {err}")))?;
+    if !drive.legacy_single_block() {
+        let current_cfg = drive
+            .read_config()
+            .map_err(|err| Status::internal(format!("read drive config: {err}")))?;
+        drive
+            .write_config(fixed_no_compression_config(current_cfg, block_size_u32))
+            .map_err(|err| Status::internal(format!("set fixed-block config: {err}")))?;
+    }
 
     let mut source = DriveHandleSource(drive);
     let writer = if stream_chunk_bytes == 0 {
@@ -3871,12 +4024,14 @@ fn stream_one_file_range(
         .map_err(|_| Status::internal("tape block size does not fit u32"))?;
 
     verify_loaded_tape_identity(drive, tape_uuid)?;
-    let current_cfg = drive
-        .read_config()
-        .map_err(|err| Status::internal(format!("read drive config: {err}")))?;
-    drive
-        .write_config(fixed_no_compression_config(current_cfg, block_size_u32))
-        .map_err(|err| Status::internal(format!("set fixed-block config: {err}")))?;
+    if !drive.legacy_single_block() {
+        let current_cfg = drive
+            .read_config()
+            .map_err(|err| Status::internal(format!("read drive config: {err}")))?;
+        drive
+            .write_config(fixed_no_compression_config(current_cfg, block_size_u32))
+            .map_err(|err| Status::internal(format!("set fixed-block config: {err}")))?;
+    }
 
     let mut source = DriveHandleSource(drive);
     stream_file_range_from_source(&mut source, request, stream_chunk_bytes, chunk_tx)?;
@@ -4226,6 +4381,49 @@ mod tests {
         assert_eq!(active[0].last_asc, Some(0x04));
         assert_eq!(active[0].last_ascq, Some(0x01));
         assert!(active[0].quarantine_id.is_none());
+    }
+
+    #[test]
+    fn session_open_refuses_active_tape_io_fence_until_operator_release() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-session-open-tape-io-fence-")
+            .tempdir()
+            .expect("tempdir");
+        let mut index =
+            CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open test index");
+        let tape_uuid = [0x44; 16];
+        let fence = index
+            .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+                tape_uuid,
+                barcode: Some("AOX044L9".to_string()),
+                reason: "partial_batch".to_string(),
+                evidence_json: Some("{\"records_written\":2}".to_string()),
+            })
+            .expect("record tape-I/O fence");
+
+        let status = session_open_reject_tape_io_fences(
+            &index,
+            &tape_uuid,
+            Some("AOX044L9"),
+            "open write session",
+        )
+        .expect_err("active tape-I/O fence must block session open");
+
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains(&fence.quarantine_id));
+        assert!(status.message().contains("partial_batch"));
+
+        index
+            .release_tape_io_fence(&fence.quarantine_id, "operator released")
+            .expect("release tape-I/O fence")
+            .expect("released fence");
+        session_open_reject_tape_io_fences(
+            &index,
+            &tape_uuid,
+            Some("AOX044L9"),
+            "open write session",
+        )
+        .expect("released tape-I/O fence no longer blocks session open");
     }
 
     #[cfg(target_os = "linux")]
@@ -4633,6 +4831,7 @@ mod tests {
             snapshot_miss_alarm: 1,
             managed_library_serials: Arc::new(HashSet::from([serial])),
             cleaning: remanence_state::CleaningConfig::default(),
+            tape_io: remanence_state::TapeIoConfig::default(),
         }
     }
 
@@ -4866,6 +5065,7 @@ mod tests {
             snapshot_miss_alarm: 1,
             managed_library_serials: Arc::new(HashSet::from([library.serial.clone()])),
             cleaning: remanence_state::CleaningConfig::default(),
+            tape_io: remanence_state::TapeIoConfig::default(),
         };
         let actor = spawn_changer_actor(changer, cfg);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -5038,6 +5238,61 @@ mod tests {
         assert_eq!(prepared.max_block_size_bytes, current.max_block_size_bytes);
         assert_eq!(prepared.write_protected, current.write_protected);
         assert_eq!(prepared.worm, current.worm);
+    }
+
+    #[test]
+    fn prepare_drive_for_read_sets_catalog_fixed_block_size_or_legacy_fallback() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-read-mode-prepare-")
+            .tempdir()
+            .expect("tempdir");
+        let mut index =
+            CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open test index");
+        let tape_uuid = [0x44; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "DATA044L9".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+
+        let mut world = VirtualWorld::single_drive("LIB-READ-PREP", 0x0100, "DRV-READ", 0x0400, 1);
+        world.put_tape_in_drive(
+            0x0100,
+            "DATA044L9",
+            Some(0x0400),
+            VirtualTape::empty(1024 * 1024, 1024),
+        );
+        let world = Arc::new(Mutex::new(world));
+        let mut library = open_model_library(Arc::clone(&world));
+        let serial = library.library().serial.clone();
+        let policy = remanence_library::StaticAllowlist::new([serial.as_str()]);
+        let mut drive = library
+            .open_drive(0x0100, &policy)
+            .expect("open model drive");
+
+        prepare_drive_for_read(&index, &mut drive, &tape_uuid, Uuid::new_v4())
+            .expect("prepare fixed read mode");
+
+        assert!(!drive.legacy_single_block());
+        assert_eq!(
+            world
+                .lock()
+                .expect("world lock")
+                .tapes
+                .get("DATA044L9")
+                .expect("model tape")
+                .block_size,
+            4096
+        );
+
+        let missing_tape_uuid = [0x45; 16];
+        prepare_drive_for_read(&index, &mut drive, &missing_tape_uuid, Uuid::new_v4())
+            .expect("missing catalog row falls back to legacy mode");
+        assert!(drive.legacy_single_block());
     }
 
     #[tokio::test]
