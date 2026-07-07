@@ -101,10 +101,12 @@ const SG_DXFER_TO_DEV: c_int = -2;
 const SG_DXFER_FROM_DEV: c_int = -3;
 #[allow(dead_code)]
 const SG_DXFER_TO_FROM_DEV: c_int = -4;
+// `libc::Ioctl` is the platform request type (c_ulong on glibc, c_int on
+// musl) — hardcoding c_ulong breaks the static musl fieldtest build.
 #[cfg(target_os = "linux")]
-const SG_SET_RESERVED_SIZE: nix::libc::c_ulong = 0x2275;
+const SG_SET_RESERVED_SIZE: nix::libc::Ioctl = 0x2275;
 #[cfg(target_os = "linux")]
-const SG_GET_RESERVED_SIZE: nix::libc::c_ulong = 0x2272;
+const SG_GET_RESERVED_SIZE: nix::libc::Ioctl = 0x2272;
 
 /// Sense buffer size we hand the kernel. 32 bytes covers fixed-format sense
 /// (SPC-5 §4.5.3); modern descriptor-format sense can be longer but the
