@@ -11,7 +11,7 @@ REM_BIN ?= target/debug/rem
 SETCAP ?= setcap
 SUDO ?= sudo
 
-.PHONY: rem-dev rem-dev-setcap rem-dev-libraries
+.PHONY: rem-dev rem-dev-setcap rem-dev-libraries proof-inventory
 
 rem-dev: rem-dev-setcap
 
@@ -26,3 +26,6 @@ rem-dev-setcap:
 
 rem-dev-libraries: rem-dev-setcap
 	$(REM_BIN) libraries
+
+proof-inventory:
+	./verif/check-inventory.sh
