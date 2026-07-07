@@ -18,7 +18,7 @@ what TIO bought, on the same iron.**
 | P | Objective | Buys |
 |---|---|---|
 | P0 | TIO throughput ladder on physical LTO-9, same drive + firmware as July baseline | the engineering gate (≥200 MB/s) AND the proposal headline |
-| FW | Level drive firmware (coordinated with central IT), one drive at a time, AFTER P0 | removes the R3G3/S2S1 confound; measured fw delta for free |
+| FW | **DEFERRED 2026-07-07: images unavailable** (HPE entitlement not linked to the owner's email; IT unresponsive). Targets confirmed: LTO-9 → S2SD (both drives, one branch), library 3350→3370 (IT's hands anyway). Flash in a later maintenance slot. Silver lining: window stays same-firmware = maximal July comparability. If IT delivers mid-window: one drive at a time, AFTER P0, per original plan. | removes the R3G3/S2S1 confound; measured fw delta for free |
 | P1 | Crash re-proof under the NEW write path (batched sink + fence) | keeps the field-confidence memo honest w.r.t. shipped code |
 | P2 | Full-stack end-to-end on physical tape (scenario `rao-live-msl3040`, timeboxed; kit-native fallback) | the proposal's strongest sentence |
 | P3 | Dual-drive concurrent load (post-leveling) | migration arithmetic (aggregate MB/s); first physical multi-drive datum |
@@ -34,18 +34,24 @@ CLN experiments beyond passive alarm observation.
 
 ## Prep BEFORE the window opens (from akash, ~45 min, can start now)
 
-- [ ] **Rebuild the kit from current main** (post-TIO): `fieldtest/toolchain/`
-      packaging per `fieldtest/RUNBOOK.md` §0 → fresh `remanence-fieldtest.tar.gz`.
-      The July tarball is pre-TIO — do not reuse it.
-- [ ] Confirm `git -C ~/remanence status` clean and the suite RCA doc's harness
-      fixes don't touch remanence (they don't — A/F/Q were harness/sutradhara-side).
-- [ ] **Identify the July baseline drive** from last window's evidence bundle
-      (which S/N ran the 75/82 numbers — 8031BDC7D1/R3G3 or 8031BDC7DB/S2S1).
-      P0 MUST run on that same drive pre-flash.
-- [ ] **Firmware**: from central IT contact — target image(s) + confirmation both
-      drive part numbers level to ONE version (R3G3 vs S2S1 may be different fw
-      branches for different hw revisions; verify on HPE support, don't assume).
-      Agree the one-line authorization ("flashing partition-1 LTO-9 drives x2").
+- [x] **Kit rebuilt + shipped 2026-07-07** — static musl from `a53ba22`
+      (required a TIO musl portability fix: SG reserved-size Ioctl type),
+      scp'd to `/home/remfield/`, unpacked, preflight green except the
+      expected T0 permission gate.
+- [x] Working tree clean; suite RCA fixes are harness/sutradhara-side.
+- [x] **July baseline mined** (bundle at `/home/remfield/july-evidence/`; some
+      files root-owned/unreadable — re-copy with `--no-preserve=ownership` if
+      more is needed): formal `bench.csv` has ONE row — **write-incompressible
+      32 GiB = 37.68 MB/s** — alongside the memo's 75/82 append-path numbers ⇒
+      report tonight against BOTH configs. The CSV "drive" field is the library
+      partition id (`DEC418146K_LL02`), not a serial ⇒ baseline drive identity
+      unresolved; tonight P0's headline point runs on BOTH drives (also yields
+      the per-drive comparison the fw-mismatch question wanted).
+      **Initialized media from July: AOX030/031/032/034 L9** (init-pools
+      evidence) — tonight's allowlist candidates; no 45-min init if their
+      remanence identity is intact.
+- [x] **Firmware: deferred** (see FW row above) — no images without HPE
+      entitlement; do NOT source images anywhere other than HPE/IT.
 - [ ] **P2 plan A feasibility check (10 min, do not sink time):** can akash reach
       the HP server's rem-daemon via SSH LocalForward (pattern proven in
       `~/system/docs/runbook-e2e-off-tailnet.md`; rem certs allow 127.0.0.1 SANs)?
