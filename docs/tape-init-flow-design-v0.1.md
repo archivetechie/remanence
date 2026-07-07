@@ -276,7 +276,7 @@ discovery (Layer 2a), `DriveBay.loaded_tape`.
 
 ## 12. Open questions / decisions
 
-1. **Barcode convention** (membership-doc precondition) — confirm the archive scheme
+1. **Barcode convention** (membership-doc precondition) — confirm the deployment scheme
    has prefix room + per-pool spare ranges. Gates real config, not the code shape.
 2. **M8 detection** — *resolved:* distinguish L7 vs M8 by the **voltag suffix**
    (`…L7` vs `…M8`) as the authority for intended format (an L8 drive only writes

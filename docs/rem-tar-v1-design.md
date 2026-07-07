@@ -1065,7 +1065,7 @@ or two-track filename handling.
 #### Failure mode this prevents
 
 A real failure mode from production tape archives (observed
-on BRU/TOLIS deployments at archive and elsewhere): filenames
+on BRU/TOLIS production deployments): filenames
 with non-ASCII characters are stored on tape in some encoding
 (often Latin-1, Shift-JIS, or raw bytes from older
 filesystems). When ingested into a catalog database with a
@@ -1484,8 +1484,8 @@ options, and the spec picks the first:
    contiguous-damage tolerance. Acceptable only if the damage
    model (Appendix A of 3c — servo damage of 100 MB–2 GB)
    permits it; given the observed 2 GiB worst case, 128 MiB
-   is too low. So option 1 is correct for archive's damage
-   profile.
+   is too low. So option 1 is correct for the observed production
+   damage profile.
 
 The 3c default table must be updated to express geometry as a
 function of block size, defaulting to `S=512, m=4, k=128` at
@@ -1529,7 +1529,7 @@ unconditional.
 #### Why the format itself doesn't compress
 
 - **The workload is already compressed.** HD/4K video, MXF
-  archives, JPEG sequences, MP3/FLAC audio — archive's archive is
+  archives, JPEG sequences, MP3/FLAC audio — the target archive is
   essentially all codec-compressed already. Format-level zstd
   on top buys low-single-digit percent at best, often nothing,
   and on incompressible input slightly *expands* the data.

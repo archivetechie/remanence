@@ -226,7 +226,7 @@ manifest. No on-tape data changes.
 
 ## Storage impact
 
-For archive's archive: ~10M files over a decade gives ~10M rows.
+For the archive this was built for: ~10M files over a decade gives ~10M rows.
 At ~500 bytes per row (including indexes), ~5 GB total catalog
 storage. PostgreSQL handles this trivially.
 
