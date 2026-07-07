@@ -16,11 +16,13 @@ make proof-inventory
 
 That command discovers every `verif/*` crate with a `Cargo.toml` and runs:
 
+- `cargo test drift_guard -- --list` to prove the drift guard is a runnable
+  test, not just matching text
 - `cargo test drift_guard`
 - `cargo test`
-- `lake build`
-- a maintained Rust/Lean placeholder scan over `*.rs` and `*.lean`, excluding
-  build caches and proof-search scratch transcripts
+- `lake build`; every current proof crate must have `lean/lakefile.toml`
+- a maintained Lean placeholder scan over `*.lean`, excluding build caches and
+  proof-search scratch transcripts
 
 All current proof crates have a `drift_guard` test. Those tests pin selected
 production snippets to the proof-facing extraction, so production changes fail
