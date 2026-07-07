@@ -53,6 +53,10 @@ impl AppError {
     fn exit_code(&self) -> u8 {
         self.exit_code
     }
+
+    fn is_append_stream_closed(&self) -> bool {
+        self.message.starts_with("append stream closed ")
+    }
 }
 
 impl fmt::Display for AppError {
@@ -540,12 +544,19 @@ async fn append_object(
     let sender_result = sender
         .await
         .map_err(|error| AppError::new(format!("append sender task failed: {error}")))?;
-    match append {
-        Ok(response) => {
-            sender_result?;
-            Ok(response.into_inner())
-        }
-        Err(status) => Err(AppError::from(status)),
+    map_append_completion(append.map(|response| response.into_inner()), sender_result)
+}
+
+fn map_append_completion<T>(
+    append: Result<T, tonic::Status>,
+    sender_result: AppResult<()>,
+) -> AppResult<T> {
+    match (append, sender_result) {
+        (Ok(response), Ok(())) => Ok(response),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(status), Ok(())) => Err(AppError::from(status)),
+        (Err(status), Err(error)) if error.is_append_stream_closed() => Err(AppError::from(status)),
+        (Err(_), Err(error)) => Err(error),
     }
 }
 
@@ -1373,6 +1384,35 @@ mod tests {
         assert_eq!(value["bytes"], 1024 * 1024);
         assert_eq!(value["mib_per_s"].as_f64().unwrap(), 2.0);
         assert_eq!(value["append_commit_info"]["append_mode"], "append");
+    }
+
+    #[test]
+    fn append_completion_prefers_rpc_status_over_stream_closed_sender_error() {
+        let status = tonic::Status::resource_exhausted(
+            "create append spool in /ram/spool: no space left on device",
+        );
+        let err = map_append_completion::<()>(
+            Err(status),
+            Err(AppError::new("append stream closed while sending Chunk")),
+        )
+        .expect_err("rpc status should surface");
+
+        assert!(err
+            .to_string()
+            .contains("create append spool in /ram/spool"));
+        assert!(!err.to_string().contains("append stream closed"));
+    }
+
+    #[test]
+    fn append_completion_keeps_local_sender_errors_when_no_channel_close() {
+        let err = map_append_completion::<()>(
+            Err(tonic::Status::internal("daemon status")),
+            Err(AppError::new("read /payload.bin: input/output error")),
+        )
+        .expect_err("local read error should surface");
+
+        assert!(err.to_string().contains("read /payload.bin"));
+        assert!(!err.to_string().contains("daemon status"));
     }
 
     #[test]

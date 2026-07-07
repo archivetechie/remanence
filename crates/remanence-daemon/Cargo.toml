@@ -18,6 +18,7 @@ remanence-state = { path = "../remanence-state" }
 base64 = { workspace = true }
 clap = { workspace = true }
 libc = { workspace = true }
+nix = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
