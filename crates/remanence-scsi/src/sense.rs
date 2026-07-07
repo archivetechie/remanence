@@ -27,14 +27,19 @@ pub struct DecodedSense {
 }
 
 impl DecodedSense {
-    /// True when the sense payload uses fixed format (0x70/0x71).
+    /// True when the sense payload uses current fixed format (0x70).
     pub fn is_fixed_format(self) -> bool {
-        matches!(self.response_code, 0x70 | 0x71)
+        self.response_code == 0x70
     }
 
-    /// True when the sense payload uses descriptor format (0x72/0x73).
+    /// True when the sense payload uses current descriptor format (0x72).
     pub fn is_descriptor_format(self) -> bool {
-        matches!(self.response_code, 0x72 | 0x73)
+        self.response_code == 0x72
+    }
+
+    /// True when the sense payload reports deferred sense (0x71/0x73).
+    pub fn is_deferred(self) -> bool {
+        matches!(self.response_code, 0x71 | 0x73)
     }
 }
 
@@ -109,6 +114,30 @@ mod tests {
         assert!(decoded.is_descriptor_format());
         assert!(!decoded.valid);
         assert!(!decoded.filemark);
+    }
+
+    #[test]
+    fn deferred_fixed_sense_is_not_current_fixed_format() {
+        let mut sense = vec![0u8; 18];
+        sense[0] = 0xF1;
+        sense[2] = 0x40;
+
+        let decoded = decode_sense(&sense).expect("decode deferred fixed");
+
+        assert_eq!(decoded.response_code, 0x71);
+        assert!(!decoded.is_fixed_format());
+        assert!(decoded.is_deferred());
+    }
+
+    #[test]
+    fn deferred_descriptor_sense_is_not_current_descriptor_format() {
+        let sense = [0x73, 0x00, 0x00, 0x00];
+
+        let decoded = decode_sense(&sense).expect("decode deferred descriptor");
+
+        assert_eq!(decoded.response_code, 0x73);
+        assert!(!decoded.is_descriptor_format());
+        assert!(decoded.is_deferred());
     }
 
     #[test]

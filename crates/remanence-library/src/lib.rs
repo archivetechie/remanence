@@ -41,9 +41,10 @@ pub use error::{
     LoadError, MoveError, OpenError, RescanError, RescanWarning, UnloadError,
 };
 pub use handle::tape_io::{
-    BlockSize, DriveErrorCounters, MediaFamily, MediaReadiness, SpaceKind, SpaceResult, TapeConfig,
-    TapeIoError, TapePosition, WormMediaState, WriteFilemarksOutcome, WriteOutcome,
-    WriteUnpositionedOutcome,
+    BlockSize, ComputedPosition, DevicePositionProof, DriveErrorCounters, MediaFamily,
+    MediaReadiness, PositionAfter, ReadBatchOutcome, SpaceKind, SpaceResult, TapeConfig,
+    TapeIoError, TapePosition, WormMediaState, WriteBatchOutcome, WriteFilemarksOutcome,
+    WriteOutcome, WriteUnpositionedOutcome,
 };
 pub use handle::{ChangerHandle, DirtyCause, DriveHandle, LibraryHandle, RemovalLockGuard};
 pub use model::{

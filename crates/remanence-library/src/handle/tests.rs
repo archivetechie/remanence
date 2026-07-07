@@ -2699,8 +2699,494 @@ fn drive_handle_write_block_happy_path() {
     assert_eq!(outcome.position_after.lba, 1);
 
     // CDB log: 0x0A WRITE, then 0x34 READ POSITION.
-    let opcodes: Vec<u8> = log.borrow().iter().map(|c| c[0]).collect();
+    let logged = log.borrow();
+    let opcodes: Vec<u8> = logged.iter().map(|c| c[0]).collect();
     assert!(opcodes.windows(2).any(|w| w == [0x0A, 0x34]));
+    assert!(
+        logged.windows(2).any(|w| {
+            w[0] == remanence_scsi::read_write::build_write_variable_cdb(1_048_576)
+                && w[1] == remanence_scsi::read_position::build_cdb_long().to_vec()
+        }),
+        "legacy single-block write must stay variable WRITE then inline RP: {logged:?}"
+    );
+    assert!(!handle.is_dirty());
+}
+
+fn fixed_residual_sense(residual: u32) -> Vec<u8> {
+    let mut sense = vec![0u8; 32];
+    sense[0] = 0x80 | 0x70;
+    sense[2] = 0x00;
+    sense[3..7].copy_from_slice(&residual.to_be_bytes());
+    sense[7] = 24;
+    sense
+}
+
+fn fixed_filemark_residual_sense(residual: u32) -> Vec<u8> {
+    let mut sense = fixed_residual_sense(residual);
+    sense[2] = 0x80;
+    sense[12] = 0x00;
+    sense[13] = 0x01;
+    sense
+}
+
+#[test]
+fn drive_handle_write_block_batch_uses_fixed_cdb_and_boundary_position_only() {
+    let lib = open_drive_test_lib("LIB_TIO01");
+    let policy = StaticAllowlist::new(["LIB_TIO01"]);
+    let (factory, log) = multi_recording_factory(vec![
+        (
+            PathBuf::from("/dev/sg-mock"),
+            vec![changer_inquiry_response(), vpd80_response("LIB_TIO01")],
+        ),
+        (
+            PathBuf::from("/dev/sg-drive-mock"),
+            vec![
+                lto9_inquiry(),
+                vpd80_response("DRV_A"),
+                rp_long_response(0, 0, 10),
+            ],
+        ),
+    ]);
+    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+
+    let outcome = {
+        let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+        drive
+            .write_block_batch(&[0xAAu8; 16], 4)
+            .expect("fixed batch write")
+    };
+
+    assert_eq!(outcome.records_written, 4);
+    assert_eq!(outcome.bytes_written, 16);
+    assert_eq!(outcome.position_after.lba, 14);
+    assert!(matches!(
+        outcome.position_evidence(),
+        crate::handle::tape_io::PositionAfter::Computed(_)
+    ));
+
+    let logged = log.borrow();
+    let writes: Vec<Vec<u8>> = logged
+        .iter()
+        .filter(|cdb| cdb[0] == 0x0A)
+        .cloned()
+        .collect();
+    assert_eq!(writes, vec![vec![0x0A, 0x01, 0x00, 0x00, 0x04, 0x00]]);
+    let rp_count = logged.iter().filter(|cdb| cdb[0] == 0x34).count();
+    assert_eq!(
+        rp_count, 1,
+        "one boundary seed RP, no per-record RP: {logged:?}"
+    );
+    assert!(!handle.is_dirty());
+}
+
+#[test]
+fn drive_handle_open_exposes_sg_reserved_buffer_clamped_batch() {
+    struct ClampReserved<T> {
+        inner: T,
+        achieved_bytes: u32,
+    }
+    impl<T: SgTransport> SgTransport for ClampReserved<T> {
+        fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+            self.inner.execute_in(cdb, buf)
+        }
+        fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
+            self.inner.execute_none(cdb)
+        }
+        fn execute_out(&mut self, cdb: &[u8], buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
+            self.inner.execute_out(cdb, buf)
+        }
+        fn set_timeout_for(&mut self, class: TimeoutClass) {
+            self.inner.set_timeout_for(class);
+        }
+        fn configure_reserved_buffer(&mut self, requested_bytes: u32) -> Result<u32, ScsiError> {
+            assert_eq!(requested_bytes, 4 * 1024 * 1024);
+            Ok(self.achieved_bytes)
+        }
+    }
+
+    let lib = open_drive_test_lib("LIB_TIO06");
+    let policy = StaticAllowlist::new(["LIB_TIO06"]);
+    let mut changer_slot = Some(vec![
+        changer_inquiry_response(),
+        vpd80_response("LIB_TIO06"),
+    ]);
+    let mut drive_slot = Some(vec![lto9_inquiry(), vpd80_response("DRV_A")]);
+    #[allow(clippy::type_complexity)]
+    let factory: Box<dyn FnMut(&Path) -> Result<Box<dyn SgTransport>, IoErrorKind>> =
+        Box::new(move |path: &Path| {
+            if path == Path::new("/dev/sg-mock") {
+                Ok(Box::new(FixtureTransport::new().with_responses(
+                    changer_slot.take().ok_or_else(|| IoErrorKind {
+                        kind: "Other",
+                        message: "changer drained".into(),
+                        raw_os_error: None,
+                    })?,
+                )) as Box<dyn SgTransport>)
+            } else if path == Path::new("/dev/sg-drive-mock") {
+                let inner =
+                    FixtureTransport::new().with_responses(drive_slot.take().ok_or_else(|| {
+                        IoErrorKind {
+                            kind: "Other",
+                            message: "drive drained".into(),
+                            raw_os_error: None,
+                        }
+                    })?);
+                Ok(Box::new(ClampReserved {
+                    inner,
+                    achieved_bytes: 2 * 1024 * 1024,
+                }) as Box<dyn SgTransport>)
+            } else {
+                Err(IoErrorKind {
+                    kind: "NotFound",
+                    message: format!("unknown path {path:?}"),
+                    raw_os_error: None,
+                })
+            }
+        });
+    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+    let drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+
+    assert_eq!(drive.requested_write_batch_blocks(), 16);
+    assert_eq!(drive.requested_read_batch_blocks(), 16);
+    assert_eq!(drive.sg_reserved_size_bytes(), 2 * 1024 * 1024);
+    assert_eq!(drive.effective_write_batch_blocks(), 8);
+    assert_eq!(drive.effective_read_batch_blocks(), 8);
+}
+
+#[test]
+fn drive_handle_write_block_batch_decodes_valid_fixed_residual() {
+    let lib = open_drive_test_lib("LIB_TIO02");
+    let policy = StaticAllowlist::new(["LIB_TIO02"]);
+    let log = RecordingLog::new();
+    let log_cl = log.clone();
+    let mut changer_slot = Some(vec![
+        changer_inquiry_response(),
+        vpd80_response("LIB_TIO02"),
+    ]);
+    let mut drive_slot = Some(vec![
+        lto9_inquiry(),
+        vpd80_response("DRV_A"),
+        rp_long_response(0, 0, 7),
+    ]);
+    let sense = fixed_residual_sense(1);
+    #[allow(clippy::type_complexity)]
+    let factory: Box<dyn FnMut(&Path) -> Result<Box<dyn SgTransport>, IoErrorKind>> =
+        Box::new(move |path: &Path| {
+            if path == Path::new("/dev/sg-mock") {
+                let inner = FixtureTransport::new().with_responses(
+                    changer_slot.take().ok_or_else(|| IoErrorKind {
+                        kind: "Other",
+                        message: "changer drained".into(),
+                        raw_os_error: None,
+                    })?,
+                );
+                Ok(
+                    Box::new(RecordingTransport::with_log(inner, log_cl.clone()))
+                        as Box<dyn SgTransport>,
+                )
+            } else if path == Path::new("/dev/sg-drive-mock") {
+                let inner =
+                    FixtureTransport::new().with_responses(drive_slot.take().ok_or_else(|| {
+                        IoErrorKind {
+                            kind: "Other",
+                            message: "drive drained".into(),
+                            raw_os_error: None,
+                        }
+                    })?);
+                let failing = FailFirstWriteWithCheckCondition {
+                    inner,
+                    sense: Some(sense.clone()),
+                    bytes_transferred: 0,
+                };
+                Ok(
+                    Box::new(RecordingTransport::with_log(failing, log_cl.clone()))
+                        as Box<dyn SgTransport>,
+                )
+            } else {
+                Err(IoErrorKind {
+                    kind: "NotFound",
+                    message: format!("unknown path {path:?}"),
+                    raw_os_error: None,
+                })
+            }
+        });
+    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+
+    let outcome = {
+        let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+        drive
+            .write_block_batch(&[0x11u8; 16], 4)
+            .expect("partial fixed residual is decoded")
+    };
+
+    assert_eq!(outcome.records_written, 3);
+    assert_eq!(outcome.bytes_written, 12);
+    assert_eq!(outcome.position_after.lba, 10);
+    let rp_count = log.borrow().iter().filter(|cdb| cdb[0] == 0x34).count();
+    assert_eq!(rp_count, 1, "partial residual does not add a follow-up RP");
+    assert!(!handle.is_dirty());
+}
+
+#[test]
+fn drive_handle_write_block_batch_deferred_sense_is_completion_unknown_without_rp() {
+    let lib = open_drive_test_lib("LIB_TIO03");
+    let policy = StaticAllowlist::new(["LIB_TIO03"]);
+    let log = RecordingLog::new();
+    let log_cl = log.clone();
+    let mut changer_slot = Some(vec![
+        changer_inquiry_response(),
+        vpd80_response("LIB_TIO03"),
+    ]);
+    let mut drive_slot = Some(vec![
+        lto9_inquiry(),
+        vpd80_response("DRV_A"),
+        rp_long_response(0, 0, 3),
+    ]);
+    let mut sense = fixed_residual_sense(0);
+    sense[0] = 0x80 | 0x71;
+    #[allow(clippy::type_complexity)]
+    let factory: Box<dyn FnMut(&Path) -> Result<Box<dyn SgTransport>, IoErrorKind>> =
+        Box::new(move |path: &Path| {
+            if path == Path::new("/dev/sg-mock") {
+                let inner = FixtureTransport::new().with_responses(
+                    changer_slot.take().ok_or_else(|| IoErrorKind {
+                        kind: "Other",
+                        message: "changer drained".into(),
+                        raw_os_error: None,
+                    })?,
+                );
+                Ok(
+                    Box::new(RecordingTransport::with_log(inner, log_cl.clone()))
+                        as Box<dyn SgTransport>,
+                )
+            } else if path == Path::new("/dev/sg-drive-mock") {
+                let inner =
+                    FixtureTransport::new().with_responses(drive_slot.take().ok_or_else(|| {
+                        IoErrorKind {
+                            kind: "Other",
+                            message: "drive drained".into(),
+                            raw_os_error: None,
+                        }
+                    })?);
+                let failing = FailFirstWriteWithCheckCondition {
+                    inner,
+                    sense: Some(sense.clone()),
+                    bytes_transferred: 0,
+                };
+                Ok(
+                    Box::new(RecordingTransport::with_log(failing, log_cl.clone()))
+                        as Box<dyn SgTransport>,
+                )
+            } else {
+                Err(IoErrorKind {
+                    kind: "NotFound",
+                    message: format!("unknown path {path:?}"),
+                    raw_os_error: None,
+                })
+            }
+        });
+    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+
+    {
+        let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+        assert!(matches!(
+            drive.write_block_batch(&[0x22u8; 16], 4),
+            Err(TapeIoError::Transport(_))
+        ));
+    }
+
+    let logged = log.borrow();
+    let rp_count = logged.iter().filter(|cdb| cdb[0] == 0x34).count();
+    assert_eq!(
+        rp_count, 1,
+        "only the pre-batch seed RP is allowed: {logged:?}"
+    );
+    assert!(handle.is_dirty());
+}
+
+#[test]
+fn drive_handle_write_block_batch_transport_unknown_has_no_followup_rp() {
+    struct TransportErrorOnFirstWrite<T> {
+        inner: T,
+        fired: bool,
+    }
+    impl<T: SgTransport> SgTransport for TransportErrorOnFirstWrite<T> {
+        fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+            self.inner.execute_in(cdb, buf)
+        }
+        fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
+            self.inner.execute_none(cdb)
+        }
+        fn execute_out(&mut self, cdb: &[u8], buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
+            if cdb[0] == 0x0A && !self.fired {
+                self.fired = true;
+                return Err(ScsiError::TransportError {
+                    status: 0,
+                    host_status: 0,
+                    driver_status: 0x06,
+                    info: 1,
+                    sense: Vec::new(),
+                });
+            }
+            self.inner.execute_out(cdb, buf)
+        }
+        fn set_timeout_for(&mut self, class: TimeoutClass) {
+            self.inner.set_timeout_for(class);
+        }
+    }
+
+    let lib = open_drive_test_lib("LIB_TIO05");
+    let policy = StaticAllowlist::new(["LIB_TIO05"]);
+    let log = RecordingLog::new();
+    let log_cl = log.clone();
+    let mut changer_slot = Some(vec![
+        changer_inquiry_response(),
+        vpd80_response("LIB_TIO05"),
+    ]);
+    let mut drive_slot = Some(vec![
+        lto9_inquiry(),
+        vpd80_response("DRV_A"),
+        rp_long_response(0, 0, 30),
+    ]);
+    #[allow(clippy::type_complexity)]
+    let factory: Box<dyn FnMut(&Path) -> Result<Box<dyn SgTransport>, IoErrorKind>> =
+        Box::new(move |path: &Path| {
+            if path == Path::new("/dev/sg-mock") {
+                let inner = FixtureTransport::new().with_responses(
+                    changer_slot.take().ok_or_else(|| IoErrorKind {
+                        kind: "Other",
+                        message: "changer drained".into(),
+                        raw_os_error: None,
+                    })?,
+                );
+                Ok(
+                    Box::new(RecordingTransport::with_log(inner, log_cl.clone()))
+                        as Box<dyn SgTransport>,
+                )
+            } else if path == Path::new("/dev/sg-drive-mock") {
+                let inner =
+                    FixtureTransport::new().with_responses(drive_slot.take().ok_or_else(|| {
+                        IoErrorKind {
+                            kind: "Other",
+                            message: "drive drained".into(),
+                            raw_os_error: None,
+                        }
+                    })?);
+                let failing = TransportErrorOnFirstWrite {
+                    inner,
+                    fired: false,
+                };
+                Ok(
+                    Box::new(RecordingTransport::with_log(failing, log_cl.clone()))
+                        as Box<dyn SgTransport>,
+                )
+            } else {
+                Err(IoErrorKind {
+                    kind: "NotFound",
+                    message: format!("unknown path {path:?}"),
+                    raw_os_error: None,
+                })
+            }
+        });
+    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+
+    {
+        let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+        assert!(matches!(
+            drive.write_block_batch(&[0x33u8; 16], 4),
+            Err(TapeIoError::Transport(_))
+        ));
+    }
+
+    let logged = log.borrow();
+    let rp_count = logged.iter().filter(|cdb| cdb[0] == 0x34).count();
+    assert_eq!(
+        rp_count, 1,
+        "transport unknown allows only the pre-batch seed RP: {logged:?}"
+    );
+    let write_count = logged.iter().filter(|cdb| cdb[0] == 0x0A).count();
+    assert_eq!(write_count, 1);
+    assert!(handle.is_dirty());
+}
+
+#[test]
+fn drive_handle_read_block_batch_clamps_to_file_remaining_and_filemark_adds_one() {
+    let lib = open_drive_test_lib("LIB_TIO04");
+    let policy = StaticAllowlist::new(["LIB_TIO04"]);
+    let log = RecordingLog::new();
+    let log_cl = log.clone();
+    let mut changer_slot = Some(vec![
+        changer_inquiry_response(),
+        vpd80_response("LIB_TIO04"),
+    ]);
+    let mut drive_slot = Some(vec![
+        lto9_inquiry(),
+        vpd80_response("DRV_A"),
+        rp_long_response(0, 0, 20),
+    ]);
+    let sense = fixed_filemark_residual_sense(2);
+    #[allow(clippy::type_complexity)]
+    let factory: Box<dyn FnMut(&Path) -> Result<Box<dyn SgTransport>, IoErrorKind>> =
+        Box::new(move |path: &Path| {
+            if path == Path::new("/dev/sg-mock") {
+                let inner = FixtureTransport::new().with_responses(
+                    changer_slot.take().ok_or_else(|| IoErrorKind {
+                        kind: "Other",
+                        message: "changer drained".into(),
+                        raw_os_error: None,
+                    })?,
+                );
+                Ok(
+                    Box::new(RecordingTransport::with_log(inner, log_cl.clone()))
+                        as Box<dyn SgTransport>,
+                )
+            } else if path == Path::new("/dev/sg-drive-mock") {
+                let inner =
+                    FixtureTransport::new().with_responses(drive_slot.take().ok_or_else(|| {
+                        IoErrorKind {
+                            kind: "Other",
+                            message: "drive drained".into(),
+                            raw_os_error: None,
+                        }
+                    })?);
+                let failing = FailFirstReadWithCheckCondition {
+                    inner,
+                    sense: Some(sense.clone()),
+                    bytes_transferred: 8,
+                };
+                Ok(
+                    Box::new(RecordingTransport::with_log(failing, log_cl.clone()))
+                        as Box<dyn SgTransport>,
+                )
+            } else {
+                Err(IoErrorKind {
+                    kind: "NotFound",
+                    message: format!("unknown path {path:?}"),
+                    raw_os_error: None,
+                })
+            }
+        });
+    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+
+    let mut buf = [0u8; 64];
+    let outcome = {
+        let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+        drive
+            .read_block_batch(&mut buf, 4, 8, 4)
+            .expect("filemark residual is decoded")
+    };
+
+    assert_eq!(outcome.records_read, 2);
+    assert_eq!(outcome.bytes_read, 8);
+    assert!(outcome.filemark);
+    assert_eq!(outcome.position_after.lba, 23);
+    let reads: Vec<Vec<u8>> = log
+        .borrow()
+        .iter()
+        .filter(|cdb| cdb[0] == 0x08)
+        .cloned()
+        .collect();
+    assert_eq!(reads, vec![vec![0x08, 0x01, 0x00, 0x00, 0x04, 0x00]]);
     assert!(!handle.is_dirty());
 }
 
