@@ -1599,7 +1599,13 @@ impl super::DriveHandle {
                 || device_position.partition != position_after.partition
             {
                 self.mark_position_unknown();
-                return Err(completion_unknown_transport_error());
+                return Err(TapeIoError::OperationFailed(format!(
+                    "position drift: expected_partition={} expected_lba={} device_partition={} device_lba={}",
+                    position_after.partition,
+                    position_after.lba,
+                    device_position.partition,
+                    device_position.lba
+                )));
             }
             return Ok(device_position);
         }
@@ -1734,16 +1740,6 @@ fn position_overflow_error() -> TapeIoError {
     TapeIoError::InvalidRequest(ScsiError::InvalidInput(
         "tape position arithmetic overflowed u64 LBA",
     ))
-}
-
-fn completion_unknown_transport_error() -> TapeIoError {
-    TapeIoError::Transport(ScsiError::TransportError {
-        status: 0,
-        host_status: 0,
-        driver_status: 0,
-        info: 0,
-        sense: Vec::new(),
-    })
 }
 
 /// Parse a MODE SENSE(6) response that asked for page `0x0F`

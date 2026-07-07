@@ -73,15 +73,47 @@ type AuditHook = Box<dyn FnMut(&AuditEvent<'_>) + Send>;
 /// constructed the handle.
 type TransportFactory = Box<dyn FnMut(&Path) -> Result<Box<dyn SgTransport>, IoErrorKind>>;
 
-const DEFAULT_TAPE_IO_BATCH_BLOCKS: u32 = 16;
+/// Default fixed-record batch size for tape READ/WRITE CDBs.
+pub const DEFAULT_TAPE_IO_BATCH_BLOCKS: u32 = 16;
 const DEFAULT_TAPE_IO_RECORD_BYTES_FOR_RESERVED_BUFFER: u32 = 256 * 1024;
-const DEFAULT_TAPE_IO_POSITION_CHECK_BYTES: u64 = 1024 * 1024 * 1024;
+/// Default arithmetic-position drift tripwire cadence.
+pub const DEFAULT_TAPE_IO_POSITION_CHECK_BYTES: u64 = 1024 * 1024 * 1024;
 
-fn effective_batch_blocks_from_reserved(reserved_bytes: u32, block_size_bytes: u32) -> u32 {
+/// Runtime tape-I/O settings applied when a drive handle is opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TapeIoRuntimeConfig {
+    /// Exact legacy behavior: variable-mode single-record I/O and per-block
+    /// write-side READ POSITION.
+    pub legacy_single_block: bool,
+    /// Requested fixed records per WRITE(6) before sg/HBA clamping.
+    pub write_batch_blocks: u32,
+    /// Requested fixed records per READ(6) before sg/HBA clamping.
+    pub read_batch_blocks: u32,
+    /// Bytes advanced between arithmetic-position tripwire READ POSITIONs.
+    /// Zero disables mid-stream tripwires.
+    pub position_check_bytes: u64,
+}
+
+impl Default for TapeIoRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            legacy_single_block: false,
+            write_batch_blocks: DEFAULT_TAPE_IO_BATCH_BLOCKS,
+            read_batch_blocks: DEFAULT_TAPE_IO_BATCH_BLOCKS,
+            position_check_bytes: DEFAULT_TAPE_IO_POSITION_CHECK_BYTES,
+        }
+    }
+}
+
+fn effective_batch_blocks_from_reserved(
+    reserved_bytes: u32,
+    block_size_bytes: u32,
+    requested_batch_blocks: u32,
+) -> u32 {
     if block_size_bytes == 0 {
         return 1;
     }
-    (reserved_bytes / block_size_bytes).clamp(1, DEFAULT_TAPE_IO_BATCH_BLOCKS)
+    (reserved_bytes / block_size_bytes).clamp(1, requested_batch_blocks.max(1))
 }
 
 /// The library's medium changer plus its inventory snapshot.
@@ -818,6 +850,16 @@ impl LibraryHandle {
         bay_address: u16,
         policy: &dyn AccessPolicy,
     ) -> Result<DriveHandle, OpenError> {
+        self.open_drive_with_tape_io(bay_address, policy, TapeIoRuntimeConfig::default())
+    }
+
+    /// Open a drive with explicit tape-I/O batching settings.
+    pub fn open_drive_with_tape_io(
+        &mut self,
+        bay_address: u16,
+        policy: &dyn AccessPolicy,
+        tape_io: TapeIoRuntimeConfig,
+    ) -> Result<DriveHandle, OpenError> {
         // -- 1. Library allowlist ------------------------------------
         // Refuse early — before consuming a fixture transport in
         // tests, before any I/O in production. A caller passing a
@@ -888,13 +930,23 @@ impl LibraryHandle {
                 actual: actual_serial,
             });
         }
-        let requested_reserved_size_bytes = DEFAULT_TAPE_IO_BATCH_BLOCKS
-            .saturating_mul(DEFAULT_TAPE_IO_RECORD_BYTES_FOR_RESERVED_BUFFER);
+        let requested_batch_blocks = tape_io
+            .write_batch_blocks
+            .max(tape_io.read_batch_blocks)
+            .max(1);
+        let requested_reserved_size_bytes =
+            requested_batch_blocks.saturating_mul(DEFAULT_TAPE_IO_RECORD_BYTES_FOR_RESERVED_BUFFER);
         let sg_reserved_size_bytes =
             transport.configure_reserved_buffer(requested_reserved_size_bytes)?;
-        let effective_batch_blocks = effective_batch_blocks_from_reserved(
+        let effective_write_batch_blocks = effective_batch_blocks_from_reserved(
             sg_reserved_size_bytes,
             DEFAULT_TAPE_IO_RECORD_BYTES_FOR_RESERVED_BUFFER,
+            tape_io.write_batch_blocks,
+        );
+        let effective_read_batch_blocks = effective_batch_blocks_from_reserved(
+            sg_reserved_size_bytes,
+            DEFAULT_TAPE_IO_RECORD_BYTES_FOR_RESERVED_BUFFER,
+            tape_io.read_batch_blocks,
         );
 
         let library_serial = self.changer.library.serial.clone();
@@ -907,11 +959,12 @@ impl LibraryHandle {
             position_known: true,
             expected_position: None,
             bytes_since_position_check: 0,
-            position_check_bytes: DEFAULT_TAPE_IO_POSITION_CHECK_BYTES,
-            requested_write_batch_blocks: DEFAULT_TAPE_IO_BATCH_BLOCKS,
-            requested_read_batch_blocks: DEFAULT_TAPE_IO_BATCH_BLOCKS,
-            effective_write_batch_blocks: effective_batch_blocks,
-            effective_read_batch_blocks: effective_batch_blocks,
+            position_check_bytes: tape_io.position_check_bytes,
+            legacy_single_block: tape_io.legacy_single_block,
+            requested_write_batch_blocks: tape_io.write_batch_blocks.max(1),
+            requested_read_batch_blocks: tape_io.read_batch_blocks.max(1),
+            effective_write_batch_blocks,
+            effective_read_batch_blocks,
             sg_reserved_size_bytes,
             shared: self.changer.shared.clone(),
         })
@@ -1432,6 +1485,8 @@ pub struct DriveHandle {
     /// Tripwire cadence for arithmetic cursor checks. Zero disables
     /// mid-stream checks.
     position_check_bytes: u64,
+    /// Exact legacy variable-mode single-block behavior switch.
+    legacy_single_block: bool,
     /// Configured write batch in fixed records before sg/HBA clamp.
     requested_write_batch_blocks: u32,
     /// Configured read batch in fixed records before sg/HBA clamp.
@@ -1461,6 +1516,7 @@ impl std::fmt::Debug for DriveHandle {
             )
             .field("position_known", &self.position_known)
             .field("expected_position", &self.expected_position)
+            .field("legacy_single_block", &self.legacy_single_block)
             .field(
                 "effective_write_batch_blocks",
                 &self.effective_write_batch_blocks,
@@ -1517,6 +1573,23 @@ impl DriveHandle {
     /// Effective read batch size after sg reserved-buffer clamping.
     pub fn effective_read_batch_blocks(&self) -> u32 {
         self.effective_read_batch_blocks
+    }
+
+    /// True when callers should preserve legacy single-record behavior.
+    pub fn legacy_single_block(&self) -> bool {
+        self.legacy_single_block
+    }
+
+    /// Force the handle back to legacy single-record behavior for this open
+    /// session. Used when a read-side fixed-mode setup cannot be established
+    /// from the tape's own catalog/bootstrap geometry.
+    pub fn set_legacy_single_block(&mut self, legacy_single_block: bool) {
+        self.legacy_single_block = legacy_single_block;
+    }
+
+    /// Configured drift tripwire cadence in bytes.
+    pub fn position_check_bytes(&self) -> u64 {
+        self.position_check_bytes
     }
 
     /// Actual sg reserved buffer size reported by the transport.
