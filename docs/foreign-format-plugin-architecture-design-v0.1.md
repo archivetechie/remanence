@@ -15,7 +15,7 @@ There are two categories of "format" in rem, and they should not be peers:
   rem's identity; **core**.
 - **Foreign / legacy** (BRU, old tar, vendor backup formats) — rem only
   *reads* them, to migrate off legacy tapes. They're reverse-engineered and
-  inherently **per-deployment** (archive has BRU; another site has something
+  inherently **per-deployment** (one deployment has BRU; another site has something
   else). Baking one organization's legacy into the core tool is wrong.
 
 So foreign formats become **plugins**: rem core ships with **zero** foreign

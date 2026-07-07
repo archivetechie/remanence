@@ -157,7 +157,7 @@ operator already uses. Example layout: `A`(copy) + `CM`(content=camera) +
 cartridges and fixes the scheme for the archive's life.
 
 **Before adopting this, confirm:**
-1. The existing/planned archive barcode convention has room for a pool prefix and
+1. The existing/planned deployment barcode convention has room for a pool prefix and
    doesn't already use those positions for a conflicting purpose.
 2. The prefix scheme partitions pools unambiguously and reserves growth room
    (new pools / larger sequences) within the 6-char budget, or the library is

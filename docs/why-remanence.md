@@ -124,7 +124,7 @@ discovery call.
 
 Enterprise libraries like the HPE MSL3040 support **partitioning**:
 one physical chassis presents as several independent logical
-libraries. In the typical archive deployment the LTO-9 partition is
+libraries. In the typical production deployment the LTO-9 partition is
 owned by Remanence and the LTO-7 partition by `dwara2`. They share
 the chassis but must never touch each other's cartridges.
 
@@ -267,7 +267,7 @@ In practice, three things:
    these can leave a tape in a state where the LTFS metadata
    block is inconsistent with the data on tape. Recovery
    requires vendor-specific tools that aren't always part of the
-   distribution. We've seen this in production at archive.
+   distribution. We've seen this in production.
 
 3. **Cross-vendor interoperability is weaker than commonly
    claimed.** Encrypted LTFS volumes written by one vendor's
@@ -400,7 +400,7 @@ Honest non-goals, so you can rule it out fast if it doesn't fit:
 - **No archive workflow.** Remanence does not decide what to
   archive, when, where to put the copies, when to retire, or how
   to notify users. That's the orchestrator's job (Dwara v3 in the
-  archive deployment).
+  original deployment).
 - **No cross-tier coordination.** Disk caches, cloud tiers, hot
   storage migration — out of scope.
 - **No deduplication.** Stream-level or block-level dedup is a
