@@ -36,6 +36,10 @@ on tape): `Object` (0), `ParitySidecar` (1), `Bootstrap` (2), and
 - **Parity map** tape files are a directory of sidecar epochs, written
   when the map no longer fits inline in the bootstrap.
 
+![Tape file sequence on one cartridge: bootstrap copy 0 at LBA 0, object tape files and parity sidecars separated by filemarks, bootstrap copies repeating down the tape](assets/tape-file-sequence.svg)
+
+*Fig. 1 — One cartridge in tape-motion order: bootstrap copy 0 at LBA 0, object and parity-sidecar tape files separated by parity-layer filemarks, and bootstrap copies repeating at roughly 5% capacity intervals.*
+
 The only fixed literal on tape is the bootstrap magic, the 8 bytes
 `52 45 4D 00 42 4F 4F 01` (`REM\0BOO\x01`). Sidecar, sidecar-footer, and
 parity-map magics are derived per tape as the first 8 bytes of an
@@ -81,6 +85,10 @@ extractable with stock `tar` on any Unix system, with the Remanence
 metadata visible as pax headers. The 30-year-readability property is not
 a promise, it is the format.
 
+![rao-v1 stored object layout: pax global header, chunk-aligned members, trailing CBOR manifest, tar end-of-archive records and zero fill](assets/rao-v1-object.svg)
+
+*Fig. 2 — A rao-v1 stored object in stream order: identity in the pax global header, one chunk-aligned member per file, the CBOR manifest as the last member, then tar end-of-archive records padded to a chunk multiple.*
+
 <!-- code-anchor: crates/remanence-aead/src/header.rs crates/remanence-aead/src/stream.rs crates/remanence-aead/src/kdf.rs @ 7fb10f8 -->
 ## The encrypted envelope: RAO1
 
@@ -95,6 +103,10 @@ An encrypted object wraps the same tar byte stream in an AEAD envelope:
   chunk. Truncation is therefore detectable.
 - A 16-byte plaintext footer, `RAO1_STREAM_END.`, then zero-fill to a
   chunk-size multiple.
+
+![RAO1 encrypted envelope: plaintext 128-byte header, encrypted metadata frame, tagged ciphertext chunks, plaintext footer, zero fill](assets/rao1-envelope.svg)
+
+*Fig. 3 — The RAO1 envelope around the same tar stream: only the 128-byte header and the 16-byte footer are plaintext; everything between is authenticated ChaCha20-Poly1305 ciphertext.*
 
 Keys derive from a 32-byte root key through HKDF with the labels
 `rao1-salt-v1`, `rao1-object-v1`, `rao1-metadata-v1`, `rao1-payload-v1`.
