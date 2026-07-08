@@ -163,3 +163,33 @@ four drives across both partitions. Caveat: Debug-level poll failures, possibly
 reservation/busy. Coexistence ask for central IT: scope Miria's drive registration
 to their partition. No throughput data exists in Miria's logs (MM does not log
 rates); the email-reported tests remain the throughput record.
+
+## Window close-out (07-08 morning)
+
+**Media ledger at hand-back** (all 5 carts in home slots, drives empty, daemon
+stopped): AOX030 = rem 256 KiB, ~5 objects (bench/crash fixtures); AOX032 = rem
+256 KiB, 7 objects incl. crash-test evidence + one stray 100 MB morning object
+(selector won a fight — see below); AOX034 = **fresh-init at 4 KiB blocks**
+(geometry acceptance proven; empty); AOX031 = **retired, contains dd-test
+garbage** — awaiting an erase path (finding #11: rem's refuse-clobber ladder is
+correct but has no sanctioned erase verb for recycling foreign-data tapes);
+CLNU01L9 untouched.
+
+**RAOM (rao-live-msl3040) status:** scenario remains gated — the harness rem
+seam drives a local CLI (cannot reach a remote library), so scenario-green needs
+harness-on-server (deferred deployment exercise). Acceptance CONTENT: 256 KiB
+leg amply proven all window; 4 KiB leg HALF-proven (fresh-init accepted at
+block_size=4096; write/restore blocked on pool definition + member re-init —
+~10-minute unblock next window, precisely documented). Also learned: daemon pool
+writes need pool DEFINITIONS not just placement rules, and tape selection cannot
+be steered per-tape (remfield-io lacks --barcode; selector prefers its own
+ranking over mounted state — small tooling gap #12).
+
+**Soak post-mortem:** 573 cycles, 0 ok — first-mount fence stuck and the loop
+retried blindly all night (kit defect #10: soak needs the wait-ready/resume
+wrapper). The fence refused correctly every single time; no data was written
+wrongly. Mirror-lesson to the Miria retry-wall finding, with the fail-closed
+difference in our favor — but the script-side pattern is the same and gets fixed.
+
+**Evidence:** `~/remfield-evidence/2026-07-07b/` on akash (evidence-pack
+20260708 + bench.csv + full logs); library syslog export = the owner, at teardown.
