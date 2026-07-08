@@ -185,10 +185,10 @@ when, and only when, they appear in all capitals, as shown here.
 A single implementation may fill several roles.
 
 - **Writer**: produces RAO objects. Comprises the **Builder** (produces the
-  canonical plaintext stream; Section 4.8) and the **Sealer** (produces the
+  canonical plaintext stream; Section 4.9) and the **Sealer** (produces the
   encrypted representation; Section 5.8).
 - **Planner**: computes a plaintext object's exact layout and block count
-  without payload bytes (Section 4.8). Planning determinism extends to the
+  without payload bytes (Section 4.9). Planning determinism extends to the
   envelope: the encrypted stored size is a closed form of the plaintext size
   (Section 5.7).
 - **Reader**: recovers entries from an object in either representation
@@ -203,7 +203,9 @@ A single implementation may fill several roles.
   the degraded long-term fallback (Section 4.10). Scanners are not required
   to implement this document. No scanner role exists for the encrypted
   representation.
-- **Consumer**: interprets a decoded manifest (Section 4.7).
+- **Consumer**: interprets a decoded manifest (Section 4.7). A **Restoring
+  Consumer** additionally materializes entries to a target filesystem; its
+  safety obligations are stated in Section 12.10.
 
 ### 2.3. Definitions
 
@@ -268,6 +270,7 @@ wrap silently (Section 11).
 | `RESERVED_PREFIX` | `_remanence` | Reserved path namespace (Section 4.6) |
 | `USTAR_SIZE_MAX` | 0o77777777777 (8 GiB − 1) | Largest size representable in the ustar size field |
 | `PAX_PATH_PLACEHOLDER` | `remanence/pax-path` | ustar name placeholder for pax-backed paths (Section 4.3) |
+| `PAX_LINK_PLACEHOLDER` | `remanence/pax-linkpath` | ustar linkname placeholder for pax-backed link targets (Section 4.6.1) |
 | `GLOBAL_HEADER_NAME` | `GlobalHead.0/PaxHeaders/remanence` | ustar name of the global pax header |
 | `PAX_HEADER_NAME` | `PaxHeaders.0/remanence_file` | ustar name of member-entry pax headers |
 | `MANIFEST_PAX_HEADER_NAME` | `PaxHeaders.0/_remanence_manifest` | ustar name of the manifest's pax header |
@@ -406,8 +409,11 @@ it contains the global header, the manifest entry, and the EOF sequence.
 The object byte stream is written as consecutive fixed-size body blocks of
 exactly `chunk_size` bytes. `chunk_size` MUST be a positive multiple of 512.
 On tape `chunk_size` MUST equal the fixed tape block size of the containing
-tape file (Section 8.2); one body block is one tape block. The format defines
-no maximum; operational bounds come from drive block-size limits.
+tape file (Section 8.2); one body block is one tape block. The plaintext
+representation defines no maximum; the envelope header encodes `chunk_size`
+as a 32-bit field, so an object stored in the encrypted representation is
+bounded to `chunk_size` ≤ 2^32 − 512 (Section 5.2). Operational bounds come
+from drive block-size limits.
 
 The total object length is always an exact multiple of `chunk_size`
 (Section 4.8), and the object's block count is knowable before any payload
@@ -421,8 +427,8 @@ boundaries (Section 4.1, Section 8.2).
 
 RAO emits POSIX ustar headers [POSIX-PAX] restricted as specified here.
 Readers MUST validate the checksum of every non-zero header record
-(Section 4.3.3) and SHOULD be liberal in the fields this section marks
-reader-ignored.
+(Section 4.3.3); the reader-ignored fields are governed by the rules of
+Section 4.3.2.
 
 #### 4.3.1. Header Layout
 
@@ -431,14 +437,14 @@ Every header is one 512-byte record:
 | Offset | Length | Field | Writer-normative value |
 | ---: | ---: | --- | --- |
 | 0 | 100 | `name` | Entry-dependent (Section 4.3.2); NUL-padded |
-| 100 | 8 | `mode` | Regular entries: `0000644\0`, or `0000755\0` when `REMANENCE.executable` is `true`; hardlinks: `0000644\0`; symlinks: `0000777\0`; directories: `0000755\0` |
+| 100 | 8 | `mode` | Regular entries: `0000644\0`, or `0000755\0` when `REMANENCE.executable` is `true`; hardlinks: `0000644\0`; symlinks: `0000777\0`; directories: `0000755\0`; pax header records (`g`, `x`): `0000644\0` |
 | 108 | 8 | `uid` | `0000000\0` |
 | 116 | 8 | `gid` | `0000000\0` |
 | 124 | 12 | `size` | 11 octal digits + NUL (Section 4.3.2) |
 | 136 | 12 | `mtime` | `00000000000\0` (mtime lives in pax only, Section 4.4.4) |
 | 148 | 8 | `chksum` | Section 4.3.3 |
 | 156 | 1 | `typeflag` | `g`, `x`, `0`, `1`, `2`, or `5` (Section 4.5, Section 4.6) |
-| 157 | 100 | `linkname` | Symlink or hardlink target when it fits in ustar `linkname`; otherwise all NUL or the pax-backed placeholder (Section 4.6.1); all NUL for other entries |
+| 157 | 100 | `linkname` | Symlink or hardlink target when it fits in ustar `linkname`; otherwise `PAX_LINK_PLACEHOLDER` (Section 4.6.1); all NUL for other entries |
 | 257 | 6 | `magic` | `ustar\0` |
 | 263 | 2 | `version` | `00` |
 | 265 | 32 | `uname` | `remanence`, NUL-padded |
@@ -519,8 +525,11 @@ A pax header's payload is a sequence of records, each:
 where `<len>` is the decimal byte length of the entire record including the
 length digits themselves, the single space, and the trailing newline. `<len>`
 is self-referential; writers MUST compute it by fixed-point iteration over its
-own digit count (the value is unique; crossing a decimal-digit boundary —
-9→10, 99→100, 999→1000 — changes `<len>` by one and the iteration converges).
+own digit count, starting from the digit count of the record length with zero
+length digits (`len ← base + digits(len)`, with `digits` initialized to
+`digits(base)`, iterated until stable). At certain base lengths (8, 97, 996,
+9995, …) two self-consistent values of `<len>` exist; the upward iteration
+converges to the smaller, and writers MUST emit that smaller value.
 
 Constraints, enforced by both Writers and Readers:
 
@@ -557,7 +566,7 @@ payload framing or interpretation.
 | `path` | REQUIRED on every entry | Effective UTF-8 entry path; overrides the ustar `name` |
 | `size` | REQUIRED on every entry | Effective payload byte length (decimal); overrides the ustar `size` |
 | `linkpath` | Symlink/hardlink entries when needed | Effective symlink target (an opaque string), or hardlink target (an in-object path, Section 4.6); overrides the ustar `linkname` |
-| `mtime` | OPTIONAL | Modification time in POSIX pax decimal form: non-negative decimal seconds since the epoch, optionally followed by `.` and fractional digits. Writers MUST validate this shape |
+| `mtime` | OPTIONAL | Modification time in POSIX pax decimal form: non-negative decimal seconds since the epoch, optionally followed by `.` and fractional digits. The value is a caller-supplied string; Writers MUST validate this shape and MUST emit the validated string verbatim, so the byte stream is a deterministic function of the caller's input |
 
 Writers MUST always emit `path` and `size` even when the ustar header could
 carry them, so every entry is self-describing under pax rules alone. Readers
@@ -584,7 +593,7 @@ keyword order (Section 4.4.2):
 | Keyword | Constraint |
 | --- | --- |
 | `REMANENCE.caller_object_id` | Non-empty opaque UTF-8; orchestrator-assigned identifier |
-| `REMANENCE.chunk_size` | Decimal `chunk_size` in bytes; MUST equal the body-block size of the containing tape file |
+| `REMANENCE.chunk_size` | Decimal `chunk_size` in bytes; on tape this MUST equal the containing tape file's block size (Sections 4.2, 8.2) |
 | `REMANENCE.encryption` | MUST be `none` (Section 4.5.2, Section 10) |
 | `REMANENCE.format_id` | MUST be `rao-v1` |
 | `REMANENCE.metadata_preservation` | One of `minimal`, `archival`, `full` |
@@ -638,16 +647,16 @@ Each entry is, in order:
 4. Zero padding to the next 512-byte boundary (none if `size mod 512 = 0`).
 
 For symbolic links, Writers MUST store the target in ustar `linkname` when it
-fits in 100 bytes; otherwise they MUST store it in pax `linkpath` and put a
-placeholder in `linkname`. A symlink target is an opaque UTF-8 OS string, not
+fits in 100 bytes; otherwise they MUST store it in pax `linkpath` and store
+`PAX_LINK_PLACEHOLDER` (`remanence/pax-linkpath`) in `linkname`. A symlink target is an opaque UTF-8 OS string, not
 an RAO path: it MAY be absolute, contain `..`, or be dangling. For directories,
 Writers SHOULD emit entries only for directories that cannot be inferred from
 child paths, i.e. empty directories; directory paths MUST end in `/`.
 
 **Hardlinks.** A hardlink entry records that its path is a second name for the
 bytes of another entry — the **primary** — in the same object. Its target is
-stored exactly as a symlink target is (`linkname`, or pax `linkpath` with a
-placeholder in `linkname`), but unlike a symlink target it is **not** an
+stored exactly as a symlink target is (`linkname`, or pax `linkpath` with
+`PAX_LINK_PLACEHOLDER` in `linkname`), but unlike a symlink target it is **not** an
 arbitrary string: it MUST be a canonical relative path (Section 4.6.6) that
 resolves, within the same object, to a **regular-file primary entry appearing
 before** the hardlink entry. Of a set of names sharing one underlying file the
@@ -669,7 +678,7 @@ entry's pax header carries:
 | `REMANENCE.file_id` | REQUIRED | Non-empty opaque UTF-8 stable identifier, unique within the object |
 | `REMANENCE.file_sha256` | Regular entries only | Exactly 64 lowercase hex digits: SHA-256 of the exact payload bytes |
 | `REMANENCE.is_manifest` | Manifest entry only | MUST be `true`; MUST be absent on member entries |
-| `REMANENCE.pad` | As needed | Alignment filler (Section 4.6.3); value MUST consist solely of ASCII spaces |
+| `REMANENCE.pad` | Non-empty regular entries, as needed | Alignment filler (Section 4.6.3); value MUST consist solely of ASCII spaces. Zero-payload entries carry no pad record |
 
 Readers MUST verify `REMANENCE.compression` is present and equals `none` on
 every entry before delivering its payload (`UnsupportedFeature` otherwise;
@@ -694,7 +703,8 @@ D ≡ 0   (mod chunk_size)
 ```
 
 Zero-payload entries — empty regular files, hardlinks, symbolic links, and
-directories — are exempt and use plain 512-byte tar-record alignment. Readers MUST reject
+directories — are exempt and use plain 512-byte tar-record alignment; their
+pax headers carry no `REMANENCE.pad` record. Readers MUST reject
 an entry whose effective size is greater than zero and whose payload offset is
 not chunk-aligned with `ChunkAlignmentViolation`.
 
@@ -865,7 +875,8 @@ encoded sort order):
 | `external_references` | array | Reserved; MUST be empty (`[]`) in 1.0 writers |
 
 Each `file_entries` element is a map with the base keys below, plus the
-conditional non-regular keys. Regular entries MUST NOT carry `entry_type` or
+conditional non-regular keys. (Keys are shown grouped by function; on the
+wire they appear in the deterministic order of Section 4.7.1.) Regular entries MUST NOT carry `entry_type` or
 `link_target`, preserving the pre-expansion byte representation for
 regular-only objects.
 
@@ -892,7 +903,8 @@ Consumer obligations:
 2. A Consumer MUST reject a manifest violating the type or value constraints
    above (`ManifestInvalid`), including the cross-checks: `object_id`,
    `caller_object_id`, and `chunk_size` MUST equal the corresponding global
-   header values when both are in hand.
+   header values when both are in hand, and no two `file_entries` elements
+   may share a `path` or a `file_id`.
 3. A Consumer MUST treat unknown additional keys (top-level or per-entry) as a
    1.x extension and ignore them (Section 10), and MUST NOT reject a manifest
    whose reserved maps/arrays are non-empty — that is the designated 1.x
@@ -970,10 +982,12 @@ full block, or reports hard end-of-medium, MUST fail the object
 (`IncompleteBlockWrite`).
 
 **Reader.** A Reader receives a block source positioned at the object's inner
-`BodyLba(0)`, the object's `chunk_size`, and its block count. Two I/O profiles
-exist — **streaming** (RECOMMENDED; O(`chunk_size` + one pax header) memory)
-and **materializing** (compatibility; MUST bound up-front allocation with a
-fallible reservation) — with identical acceptance rules. A Reader operates in
+`BodyLba(0)`, the object's `chunk_size`, and its block count. Two I/O
+profiles exist, with identical acceptance rules. The **streaming** profile is
+RECOMMENDED; it requires memory proportional to `chunk_size` plus one pax
+header. The **materializing** profile exists for compatibility; a
+materializing Reader MUST bound its up-front allocation with a fallible
+reservation. A Reader operates in
 one of two modes: **restore** (the default; integrity-verifying) or
 **salvage** (a deliberately-selected, explicitly-labeled mode for damaged
 media in which verification failures are reported but delivery continues; an
@@ -1013,7 +1027,9 @@ Procedure:
    from the parity layer's block CRCs, and range-read implementations MUST say
    so rather than imply hash-verified content.
 6. Capture the entry whose effective path is `_remanence/manifest.cbor` as the
-   manifest bytes.
+   manifest bytes. An object whose EOF is reached with no manifest entry is
+   nonconformant: Verifiers MUST reject it (Section 7.4), and a restore-mode
+   Reader SHOULD report the absence to its caller.
 
 A conformant Reader accepts slightly-foreign archives where safe
 (unsorted/duplicate pax records, NUL typeflag, `prefix`-formed names, missing
@@ -1127,7 +1143,7 @@ object identifiers are UUID strings — 36 bytes.)
 
 When an input violates several requirements at once, a reader MAY report any
 one error whose condition holds; conformance test vectors contain exactly one
-fault each (Section 13.4).
+fault each (Section 13.5).
 
 ### 5.3. Key Identification and the Key Registry
 
@@ -1616,7 +1632,7 @@ arithmetic. The per-file index — `first_chunk_lba` (an inner `BodyLba`) and
 `size_bytes` per file, from the manifest or the catalog — is the **same for
 both representations** of an object, because both wrap the same canonical
 bytes. Catalog per-file rows therefore need to be stored once per object, not
-per copy. PFR indexes MUST treat plaintext offsets (inner `BodyLba`, file byte
+per copy. Restorers MUST treat plaintext offsets (inner `BodyLba`, file byte
 ranges) as the source of truth and MUST NOT make ciphertext offsets canonical;
 stored offsets are derived, reproducible from this section.
 
@@ -1627,12 +1643,12 @@ name MUST first resolve its `link_target` to the primary entry and then use the
 PFR implementation MUST NOT treat a hardlinked name as an empty or invalid
 range. (Symlinks and directories carry no payload and are not PFR targets.)
 
-A **catalog-backed** PFR index (per-file rows, not the full manifest) MUST
-preserve the ability to resolve a hardlink: a hardlink's row MUST carry
-`entry_type` + `link_target` (resolve at restore time), **or** a denormalized
-pointer to the primary's `first_chunk_lba`/`size_bytes`. A catalog that stores
-only the literal `first_chunk_lba`/`size_bytes` of a hardlink row (`null`/`0`)
-cannot restore it and is nonconformant.
+A Restorer working from a per-file index (catalog rows rather than the full
+manifest) MUST preserve the ability to resolve a hardlink: the hardlink's row
+MUST carry `entry_type` + `link_target` (resolved at restore time), **or** a
+denormalized pointer to the primary's `first_chunk_lba`/`size_bytes`. An
+index that stores only the literal `first_chunk_lba`/`size_bytes` of a
+hardlink row (`null`/`0`) cannot support conformant restore of that name.
 
 ### 6.1. Range Validation
 
@@ -1700,7 +1716,8 @@ last_stored_block  = floor((a + l − 1) / C)
 Because each stored chunk is `C + 16` bytes, the ciphertext of one inner block
 spans at most `ceil((C + 16) / C) + 1 = 3` consecutive stored blocks, and a
 run of `k` consecutive chunks occupies one contiguous stored-block range of at
-most `k + 2` blocks (the 16-byte-per-chunk tag slip is why stored `BodyLba` ≠
+most `k + ceil(16 × k / C) + 1` blocks — `k + 2` whenever `16 × k ≤ C` (the
+16-byte-per-chunk tag slip is why stored `BodyLba` ≠
 inner `BodyLba` for encrypted copies). This bounded, contiguous read
 amplification is the accepted cost of keeping the stored stream block-uniform;
 the rationale and the rejected alternative are in Appendix B.
@@ -1764,7 +1781,8 @@ writer — the chain costs hash arithmetic, never an additional read pass:
 ### 7.3. Post-Write Re-Verification (Deployment Obligation)
 
 After each copy is written, and before that copy is recorded durable, the
-deployment MUST re-read the copy via the object read path and re-verify it —
+deployment is expected to re-read the copy via the object read path and
+re-verify it —
 for a full verification, every **regular** member's `file_sha256` plus the
 Section 7.4 non-regular correspondence and hardlink referential checks (which
 transitively exercise the envelope on encrypted copies); at minimum, the copy's
@@ -1916,7 +1934,7 @@ together:
   (Sections 4.4.3, 4.7.2). Any change that could make a 1.0 Reader
   misinterpret bytes (new entry kinds with payload semantics, alignment
   changes, manifest re-keying, compression, encryption flagged inside the
-  stream) REQUIRES a new `format_id` — which is, by definition, RAO version 2.
+  stream) MUST be made under a new `format_id` — which is, by definition, RAO version 2.
   In particular, `REMANENCE.compression` and `REMANENCE.encryption` are
   permanently `none` in every conformant 1.x stream (the refusal gates of
   Sections 4.5.2 and 4.6.2): introducing a real value for either is a
@@ -1943,8 +1961,9 @@ payload semantics or changing zero-payload alignment requires a new
 Implementations SHOULD expose typed errors equivalent to the taxonomy below.
 Names are normative for the test-vector manifests (Section 13); surface syntax
 is not. I/O failures MUST remain distinguishable from format violations so
-callers can tell storage problems from invalid objects. No code path reachable
-from object bytes may panic, crash, or allocate unboundedly (Section 12.9).
+callers can tell storage problems from invalid objects. Code paths reachable
+from object bytes MUST NOT panic, crash, or allocate unboundedly
+(Section 12.9).
 
 ### 11.1. Plaintext-Stream Errors
 
@@ -1989,8 +2008,9 @@ InvalidKeyIdentifier         all-zero key_id, or key_id unknown to the resolver
 InvalidSalt                  all-zero hkdf_salt
 SaltDerivationMismatch       header hkdf_salt differs from the Section 5.4.1 derivation
                              (keyed open/verify, Section 5.9 step 4)
-InvalidObjectIdField         object_id field empty, longer than 64 bytes,
-                             interior NUL, or invalid UTF-8
+InvalidObjectIdField         object_id field all-NUL, interior NUL, or invalid
+                             UTF-8 (reader-side; a >64-byte object_id is
+                             rejected at sealing time as InvalidInput, 5.2)
 MetadataFrameLengthInvalid   metadata_frame_len outside [17, 16 MiB]
 InvalidRootKey               root key material shorter than 32 bytes
 UnexpectedEof                declared header, metadata frame, footer, or fill bytes missing
@@ -2078,12 +2098,12 @@ keyed through either input. This is the same assumption underlying the
 TLS 1.3 key schedule, which chains key-derived Extract salts; it is stated
 here as an assumption, deliberately, and no proof is inherited.
 
-As a deployment belt, the catalog SHOULD run a consistency check on
-`(key_id, hkdf_salt)` at insert. A repeat is *legitimate* exactly when the
+As a defense-in-depth measure, a deployment's catalog can run a consistency
+check on `(key_id, hkdf_salt)` at insert. A repeat is *legitimate* exactly when the
 rows are byte-identical copies of one sealed object — agreeing on `object_id`,
 `plaintext_digest`, **and** `stored_digest`: byte-stable fanout and resealing
 intentionally produce such repeats (Section 5.4.1 property 2). A repeat
-disagreeing on any of the three SHOULD be rejected loudly. The `stored_digest`
+disagreeing on any of the three warrants loud rejection. The `stored_digest`
 term is not redundant: rows agreeing on `object_id` and `plaintext_digest` but
 differing in `stored_digest` are precisely the signature of residual branch 1
 above (or of a defective sealer) — the one case in which `plaintext_digest`
@@ -2094,8 +2114,8 @@ equality cannot be trusted to mean content equality.
 The metadata nonce (12 zero bytes) is byte-identical to the nonce of a
 non-final payload chunk 0. The construction is safe only because
 `metadata_key` ≠ `payload_key`. Any change that unifies the keys converts this
-coincidence into real nonce reuse. No future revision may "simplify" the key
-schedule by merging them.
+coincidence into real nonce reuse. A future revision MUST NOT merge the
+metadata and payload keys.
 
 ### 12.3. Binding Without AAD
 
@@ -2168,8 +2188,9 @@ Keys are derived per object; no wrapped data-encryption keys are stored.
 Rotating the root key affects newly sealed objects only; re-keying an existing
 object means resealing its canonical bytes (cheap if a plaintext copy exists —
 a new seal, not a rebuild; the object and its `plaintext_digest` are
-unchanged). Old key epochs MUST remain recoverable in the registry for as long
-as objects sealed under them must remain readable.
+unchanged). Old key epochs need to remain recoverable in the registry for as long
+as objects sealed under them are to remain readable; preserving them is a
+registry/deployment obligation outside this format.
 
 ### 12.9. Hostile-Input Posture
 
@@ -2537,9 +2558,10 @@ Manifest pax base records (with `executable=false`, `is_manifest=true`,
 `a4 00 01 01 19 50 00 02 66 ... 03 58 20 ...` = 1 + 2 + 4 + 8 + 35 =
 **50 bytes** → `M` = 66. Payload frame = 20480 + 80 = 20560 bytes at offset
 194; `footer_offset` = 20754; stored pre-fill length 20770; fill 3806 →
-**`stored_size_bytes` 24576 = 6 blocks**. The metadata zero nonce does not
-collide with any payload nonce here (chunk 0 is non-final, nonce `00…00 00` —
-the collision the key separation guards, Section 12.2).
+**`stored_size_bytes` 24576 = 6 blocks**. The metadata zero nonce is
+byte-identical to payload chunk 0's nonce here (chunk 0 is non-final, nonce
+`00…00 00`) — exactly the collision that the metadata/payload key separation
+renders harmless (Sections 5.5.2, 12.2).
 
 ## Appendix B. Design Rationale (Informative)
 
