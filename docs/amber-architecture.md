@@ -3,7 +3,7 @@
 This document describes how the Amber workspace is put together and records
 the reasoning behind its main design decisions, so future changes do not
 accidentally reverse them. The normative format definition lives in the
-[AOF1 Candidate Specification](aof1_candidate_specification.md); where the
+[AOF1 Candidate Specification](historical/aof1_candidate_specification.md); where the
 two disagree, the specification wins.
 
 ## 1. What Amber Is
