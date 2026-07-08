@@ -98,35 +98,48 @@ aggregate; end-of-media rollover (physically infeasible in short windows — nee
 dedicated long window or stays VTL); soak report + teardown tomorrow morning
 (keys self-expire 2026-07-08 12:00).
 
-## Addendum (same night) — the throughput ceiling is the platform's, proven three ways
+## Addendum (same night, REVISED after source verification) — the 1 MiB/command cap is real and hardcoded; the ~160 equilibrium is the *synchronous submission tax* on top of it
+
+*(Earlier framing "platform ceiling, not software — proven three ways" overstated
+the evidence; corrected below after reading the driver source.)*
 
 Per-command arithmetic from tonight's diagnostics: tape accepts commands strictly
-serially; measured cadence ≈6.2–7.2 ms/command at the 1 MiB-per-command grant ⇒
-~160 MB/s feed ceiling. The 1 MiB grant matches the smartpqi (Smart Array
-P408e-p/E208e-p) max-transfer-per-request ceiling; sg on this host: def_reserved
-32 KiB, scatter_elem 32 KiB, allow_dio=0.
+serially; measured cadence ≈6.2–7.2 ms/command at 1 MiB/command ⇒ ~160 MB/s.
+**Source-verified**: the in-kernel smartpqi driver hardcodes
+`PQI_MAX_TRANSFER_SIZE = 1 MiB` (`drivers/scsi/smartpqi/smartpqi.h`, v5.14/RHEL9
+lineage) — exactly the observed sg reserved-buffer grant. Not firmware, not a
+module parameter (the vendor tree's `limit_xfer_size_to_1MB` defaults OFF and
+targets logical volumes — unrelated). Immovable without recompiling.
 
-**Independent corroboration from the org's own record** (mined email threads,
-`~/proposal/research/evidence-problems-waste.md`): IT's weeks of 2025 testing
-measured Miria-mediated LTO-9 at 40–299 write / 67–127 read MB/s; a single-tar
-360 GB restore at **196 MB/s ("exactly half" of their 400 expectation)**; real
-Miria jobs at 167–223 MB/s; their suspicion (4-way SAS splitter cable) was never
-validated — and doesn't hold (each SFF-8644 lane = 12 Gb/s ≈ 1.2 GB/s). Their own
-conclusion later shifted to the P408e-p controller. Three independent stacks —
-Miria, raw tar restore, remanence — converge in the same ~160–220 MB/s band on
-this controller family: **platform ceiling, not software.**
+**But 1 MiB/command is only a ceiling for synchronous submitters.** Issued
+back-to-back (the st-driver buffered path mainstream backup software uses,
+inter-command gap ~0.1 ms), 1 MiB commands stream LTO-9 at native rate through
+this same controller — which is why the field isn't full of complaints and HPE
+lists the E208e for tape attach in good conscience. Our 6.2 ms cadence = ~1 ms
+wire + **~5 ms submission gap, and that gap is rem's** (synchronous SG_IO loop,
+next-batch prep in the critical path). Miria's numbers in the same band (196
+MB/s tar restore, 167–223 MB/s jobs — email record) suggest its datamover pays
+the same synchronous tax; their splitter-cable theory remains refuted (12 Gb/s
+per lane).
 
-**Remedy**: dedicated SAS HBA in place of the RAID-family controller for the tape
-path. Recommended: **Broadcom 9500-16e** (SAS3816, PCIe 4.0 x8, mpt3sas, ~16 MiB
-max request ⇒ 4 MiB batched commands ⇒ feed capacity ~600 MB/s = drive-limited;
-4 external ports = drive scale-out headroom for migration). ~₹40–60k. Diligence:
-MSL3040 supported-HBA matrix; HPE-branded Broadcom equivalent if procurement
-prefers; existing SFF-8644 cabling reusable. Note drive height: drishti inventory
-records HH LTO-9 (native ~300); IT's 400 expectation assumed FH spec — either
-way the observed cap sits far below both.
+**Corrected remedy ranking:**
+1. **TIO-5 — pipelined submission (software, free, likely sufficient):** stage
+   the next batch while the current command flies; issue at completion with zero
+   prep in the critical path. Ordering-safe (still one command on the wire).
+   Cadence → ~1.3 ms ⇒ feed ~700 MB/s ⇒ **drive-limited ≈300 on the existing
+   HPE card.** Next-arc design item.
+2. **Broadcom 9500-16e (~₹40–60k) — optional insurance, no longer required:**
+   mpt3sas permits 4–8+ MiB commands (forgiving cadence math) + 4 external ports
+   for migration drive scale-out. Diligence unchanged (MSL3040 HBA matrix;
+   HPE-branded equivalent for procurement optics).
 
-Morning batch sweep (batch 1/2/4 at fixed bytes) remains the final confirmation:
-flat ms/command ⇒ HBA-bound (expected); sub-linear growth ⇒ daemon slack too.
+**Morning discrimination battery (before any purchase):** (a) batch sweep 1/2/4
+at fixed bytes — flat ms/command ⇒ fixed submission overhead confirmed; (b) raw
+st-driver dd, large bs, allowlisted scratch cart — ~280–300 through the same
+E208e fully vindicates the card and localizes the fix in software (needs setfacl
+on the /dev/nst node — added to privileged asks); (c) LSI card swap demoted to
+optional confirmation. Drive-height note stands (HH LTO-9 native ~300; IT's 400
+expectation was FH spec).
 
 **Addendum 2 — Miria AER log finds (same night):** the datamover's Atempo bundle
 contains (a) an event log wall of "Default ACL not supported" errors — the defect
