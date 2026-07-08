@@ -88,6 +88,10 @@ Remanence holds exactly these bytes as its object body, which is the
 data back. Second, every file's SHA-256 travels with it, so verification
 never depends on host state.
 
+![Local round trip: rem archive build turns src/ into demo.rao, rem archive extract restores it, diff -r confirms the copies are byte-identical, and rem archive inspect reads the object in place](assets/local-roundtrip.svg)
+
+*Fig. 1 — The local round trip: build a rao-v1 object from a directory, read it back, and prove the copies identical — the same bytes a tape write stores as the object body.*
+
 <!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-aead/src/lib.rs @ 7fb10f8 -->
 ## The encrypted variant
 
