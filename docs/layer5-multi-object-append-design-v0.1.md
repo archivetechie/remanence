@@ -30,7 +30,7 @@ via OpenRouter (`z-ai/glm-5.2`). Folds are incorporated in this revision.
 were pinned in this revision; MTA-2 parity journal ownership and resume
 idempotency remain gates before parity prompt cut.
 **Precedent docs:** `docs/layer5-roadmap.md`,
-`docs/archive/layer5-s4a-write-session-design-v0.1.md`,
+`docs/historical/layer5-s4a-write-session-design-v0.1.md`,
 `specs/rem-parity-1.0-specification.md`,
 `docs/pool-tape-selection-design-v0.1.md`,
 `docs/tape-read-object-design-v0.1.md`.
