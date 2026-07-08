@@ -31,6 +31,10 @@ Layers 3b and 3c are siblings, not stacked: both build on the
 body blocks; the parity layer owns the physical tape layout around them
 (bootstraps, filemarks, sidecars).
 
+![Workspace crate map: layer 5 cli, api, daemon over layer 4 state over layer 3 format, aead, parity, format-driver over layer 2 library over layer 1 scsi, with the format-free platform seam between layers 3 and 2](assets/layer-map.svg)
+
+*Fig. 1 — The workspace as a strict stack: each layer depends only on the one below it, and the format-defining crates (amber) sit directly above the format-free platform seam.*
+
 <!-- code-anchor: crates/remanence-scsi/src/lib.rs crates/remanence-library/src/lib.rs @ 7fb10f8 -->
 ## Layers 1 and 2: the tape platform
 
@@ -135,6 +139,10 @@ Inside `remanence-api`, each mounted drive is a dedicated actor task that
 owns its drive handle; sessions, robotics, and reads are messages to that
 actor. This serializes hardware access per drive while letting multiple
 drives run in parallel.
+
+![Layer 5 topology: orchestrator, rem, and rem-debug reach rem-daemon over gRPC; the daemon runs default-deny authorization and one actor per mounted drive; actors drive the drive and changer, and rem-debug keeps an allowlist-gated direct SCSI path](assets/daemon-topology.svg)
+
+*Fig. 2 — Layer 5 topology: clients reach `rem-daemon` over the unix socket or mTLS TCP, every RPC passes the default-deny role check, and one actor per mounted drive serializes hardware access; `rem-debug` keeps an allowlist-gated direct SCSI path for break-glass work.*
 
 <!-- code-anchor: crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/index.rs @ 7fb10f8 -->
 ## The write path
