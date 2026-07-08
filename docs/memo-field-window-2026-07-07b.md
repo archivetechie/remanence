@@ -117,10 +117,22 @@ inter-command gap ~0.1 ms), 1 MiB commands stream LTO-9 at native rate through
 this same controller — which is why the field isn't full of complaints and HPE
 lists the E208e for tape attach in good conscience. Our 6.2 ms cadence = ~1 ms
 wire + **~5 ms submission gap, and that gap is rem's** (synchronous SG_IO loop,
-next-batch prep in the critical path). Miria's numbers in the same band (196
-MB/s tar restore, 167–223 MB/s jobs — email record) suggest its datamover pays
-the same synchronous tax; their splitter-cable theory remains refuted (12 Gb/s
-per lane).
+next-batch prep in the critical path). Their splitter-cable theory remains
+refuted (12 Gb/s per lane).
+
+*(Corrected 07-08: Miria does NOT share rem's mechanism — its MM device config
+references `/dev/nst0–3` for data (the st path) + `/dev/sg*` for control. Its
+167–223 MB/s loss is application-layer, per its own October tests — digest+dedup
+drops ~510→~215 MB/s — and IT's own words: "the software layer is the
+bottleneck".)*
+
+**MORNING VERDICT (07-08, dd battery, same drive + card):** kernel st path
+sustained **246 MB/s @ bs=1M** and **293 MB/s @ bs=256K** (16 GiB each,
+incompressible, tmpfs source, AOX031 sacrificed + retired) — ≈ HH LTO-9 native
+rate. **The E208e is fully vindicated; no HBA purchase needed.** The entire rem
+gap (160 vs 293) is submission cadence — TIO-5's target, free, on existing
+hardware. st-source behavioral review queued (deferred-error machinery for
+immediate filemarks, UA auto-retry, EW/EOM semantics, timeout ladders).
 
 **Corrected remedy ranking:**
 1. **TIO-5 — pipelined submission (software, free, likely sufficient):** stage
