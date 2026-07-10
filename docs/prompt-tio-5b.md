@@ -78,11 +78,14 @@ Same frozen constraints as TIO-5a.
 
 ## Structural invariants (learned from the TIO-5a diff gate — binding)
 
-- **Single safety funnel:** read-path pipelining must terminate every
-  error class in the SAME fence/fail-closed machinery as the
-  non-pipelined path — no safety call site gated on the pipelining flag.
-- **Golden-baseline equivalence:** OFF-vs-shipped assertions use fixtures
-  captured from main before your changes, not this branch's own OFF mode.
+- **Single safety funnel:** the read pipeline terminates every error
+  class in the SAME fence/fail-closed machinery as the write path — one
+  funnel, no mode-conditioned safety call sites. (Design v0.6: there is
+  no pipelining flag; the pipelined path is THE batched path,
+  `legacy_single_block` the only fallback.)
+- **Golden-baseline fixtures:** read command-stream/timeout fixtures are
+  captured from main before your changes, never from this branch's own
+  behavior.
 - **Wrap, don't copy:** reuse means calling the existing helper, not
   duplicating its body. A near-verbatim copy is a defect even with green
   tests.
