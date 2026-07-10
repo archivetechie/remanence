@@ -1,6 +1,15 @@
-# Tape I/O pipelined submission (TIO-5) — staging ring, hot submitter, in-place accounting — Design v0.2
+# Tape I/O pipelined submission (TIO-5) — staging ring, hot submitter, in-place accounting — Design v0.3
 
-**Status:** v0.2 — panel folded 2026-07-10, verify round pending.
+**Status:** v0.3 — panel folded + verify round 1 folded 2026-07-10;
+re-verify pending.
+**Verify round 1 (fresh codex gpt-5.6-sol):** checklist 13/17 YES, 4 PARTIAL;
+4 fold-precision majors, all folded in v0.3 — (1) fence rule narrowed to
+safety-relevant outcomes (full-record EW stays a successful, unfenced
+outcome per TIO-1/2); (2) equivalence split two-tier (OFF-vs-shipped exact;
+ON-vs-OFF = CDB+timeout exact, audit as normalized semantic trace); (3)
+GOOD-record tests split failure-injection vs kill-injection (no
+record-survival claim across SIGKILL); (4) tripwire-mismatch-before-fence
+crash row restored.
 **Panel 2026-07-10:** 4 blind lenses (SCSI/SSC = Opus, concurrency = Opus,
 cost/efficiency = Opus, failure-modes = codex **gpt-5.6-sol**): 1 blocker,
 14 unique majors, 11 minors, 3 nits; all accepted, none rejected;
@@ -137,17 +146,26 @@ to ring → repeat.
   `records_delta_between`, deferred-sense classification) are extracted and
   reused **unmodified**. (v0.1's "reuse write_block_batch unmodified" was
   inaccurate — its audit fires are interleaved with the decode.)
-- On any non-GOOD result: **stop → classify → fence → audit → propagate**,
-  in that order. The submitter stops submitting; the raw result is
-  immediately classified with the existing decode (EW/EOM arbitration by
-  READ POSITION delta with position re-assertion of the TapeIo class after
-  the inline RP; deferred sense 0x71/0x73 → completion-unknown; partial
-  batch → uncommittable); position invalidation and durable-fence
-  persistence run **independently of any audit emission**; audit records
-  (which for errors carry raw status, sense bytes, transport fields, and
-  decoded outcome exactly as today) emit after safety persistence; then the
-  error propagates. One command in flight ⇒ attribution exact ⇒ decode
-  semantics identical by construction.
+- On any non-GOOD result: **pause the loop and classify immediately** with
+  the existing decode (EW/EOM arbitration by READ POSITION delta, with the
+  TapeIo timeout class re-asserted after the inline RP; deferred sense
+  0x71/0x73 → completion-unknown; partial batch → uncommittable). The
+  classified outcome then takes one of two paths (verify-round fix — v0.2
+  wrongly fenced everything):
+  - **Successful-with-signal** — full-record EW (all records accounted,
+    no hard EOM): recorded as a successful outcome carrying its flags,
+    exactly TIO-1/2's `Ok(WriteBatchOutcome{early_warning,..})`. **No
+    fence, no stop**; the signal propagates to the existing pool-write
+    policy and the pipeline continues per that policy, as today.
+  - **Safety-relevant** — partial batch, hard EOM, undecodable residual,
+    deferred sense, transport-unknown, tripwire mismatch: **fence → audit
+    → propagate**. Position invalidation and durable-fence persistence run
+    **independently of any audit emission**; audit records (which for
+    errors carry raw status, sense bytes, transport fields, and decoded
+    outcome exactly as today) emit after safety persistence; then the
+    error propagates and the session stops.
+  One command in flight ⇒ attribution exact ⇒ decode semantics identical
+  by construction.
 
 ### 3.3 Spool ceiling consequence
 With the submitter feeding ~740 MB/s, spool read rate is again the binding
@@ -186,9 +204,11 @@ synchronous**:
   and mismatches, filemarks, fences, session open/close.
 - **Safety-persistence invariant (folded from the panel blocker):** fences,
   position invalidation, and poison **never depend on audit-sink
-  availability**. Ordering on every path: classify → fence → audit →
-  propagate. Audit failures are recorded out-of-band (existing
-  `SharedAuditAdapter` behavior) and never block or reorder safety actions.
+  availability**. Ordering whenever the classified outcome requires safety
+  persistence (§3.2's safety-relevant class — NOT successful-with-signal
+  EW): classify → fence → audit → propagate. Audit failures are recorded
+  out-of-band (existing `SharedAuditAdapter` behavior) and never block or
+  reorder safety actions.
 - **Per-window intent marker (forensic parity):** before entering the hot
   loop for a window, one diag/audit line names the planned CDB range. Today
   a Started event precedes every ioctl; under coalescing, a kill mid-ioctl
@@ -227,16 +247,22 @@ Testable claims, all asserted hermetically:
 
 1. **Exactly one SCSI data command in flight, ever** (model transport
    asserts no overlapping execute).
-2. **CDB-stream equivalence:** pipelining ON yields a byte-identical CDB
-   sequence to pipelining OFF for the same input — same WRITEs, same
-   tripwire RPs, same filemarks; only timing changes. **Preconditions
-   (panel):** identical sg reserved size and tape-sourced block size at
-   open; the trailing partial batch rebuilds its CDB. **Equivalence is
-   proven beyond CDB bytes** (§9): timeout-class stream, audit event
-   sequence, and poison behavior are compared too — the model transport
-   gains timeout-class recording to make this visible (today its
-   `set_timeout_for` is a no-op, which would let a timeout regression pass
-   a CDB-only test).
+2. **Equivalence, two-tier (verify-round fix — exact ON/OFF audit
+   equivalence is impossible by design, since ON coalesces good-path
+   events):**
+   - **OFF vs shipped TIO-3/4: exact** — CDB stream, timeout-class stream,
+     audit event sequence, and poison behavior all byte/sequence-identical.
+   - **ON vs OFF:** CDB stream byte-identical (same WRITEs, same tripwire
+     RPs, same filemarks — only timing changes) and timeout-class stream
+     identical; audit compared as a **normalized semantic trace** —
+     exception/filemark/fence events exact in order and content; good-path
+     per-command Started/Finished events map to the window intent marker +
+     coalesced span with matching command counts and bytes.
+   **Preconditions (panel):** identical sg reserved size and tape-sourced
+   block size at open; the trailing partial batch rebuilds its CDB. The
+   model transport gains timeout-class recording to make the timeout tier
+   visible (today its `set_timeout_for` is a no-op, which would let a
+   timeout regression pass a CDB-only test).
 3. **Commit barrier unchanged:** all data GOOD (recorded) → blocking WRITE
    FILEMARKS (which sets its own timeout class, unaffected by this design) →
    DevicePositionProof → journal fsync → SQLite. The layer-5 ordering and
@@ -252,6 +278,7 @@ Crash table (extends TIO-3 §5.1; chaos kill per row):
 | mid-ioctl (command in flight) | transport-unknown → dirty fence at reopen; identical to today (one in flight = today's exposure). Intent marker (§4) bounds the forensic loss to the window |
 | after data GOOD, before in-place record/cursor update | process-local state is never trusted on restart; journaled prefix authoritative; tape tail uncommitted → layer-5 fence rules |
 | after cursor update, before tripwire RP completes | same rule; tripwire state is process-local; fence on reopen per readiness rules |
+| tripwire RP completed, mismatch observed, before durable fence persists | (row restored from TIO-3 §5.1, verify-round fix) startup reconciliation of the open session + journal/SQLite prefix comparison re-detects; the object was never journaled, tail uncommitted → fence |
 | mid-error-decode (raw non-GOOD held, fence not yet persisted) | startup reconciliation + journal/SQLite prefix comparison re-detects; object was never journaled → tail fenced. Conservative rule: lost decode ⇒ fence |
 | after fence persisted, before error audit/propagation | fence is durable and authoritative; audit loss is evidence-only |
 | staged-but-unsubmitted ring buffers | process-local; committed prefix authoritative |
@@ -333,9 +360,15 @@ Hermetic (model transport / chaos):
   proven fresh;
 - trailing partial batch: N not a multiple of B ⇒ rebuilt CDB with true
   record count;
-- GOOD-record-before-tripwire: kill/fail injected between data GOOD, cursor
-  update, RP submission, RP completion, fence persistence — the GOOD
-  command's record survives in every row;
+- GOOD-record-before-tripwire, split by injection type (verify-round fix —
+  in-place counters cannot survive SIGKILL):
+  - **failure injection** (RP failure/mismatch after data GOOD, process
+    alive): the GOOD command's in-process record survives and any
+    subsequent fence sees both the data record and the tripwire record;
+  - **kill injection** (SIGKILL between data GOOD, in-place update, RP
+    submission/completion, fence persistence): no record-survival claim —
+    recovery is conservative per §6 rows 2–4 (process-local state ignored,
+    journaled prefix authoritative, fence on lost outcomes);
 - non-GOOD mid-stream: submitter stops, no further data CDBs, decode
   outcomes reproduced exactly (EW residual, deferred sense, partial batch →
   fence); ordering classify → fence → audit → propagate asserted with a
