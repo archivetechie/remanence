@@ -22,6 +22,11 @@ ordering — MUST NOT change), `docs/layer5-multi-object-append-design-v0.1.md`
 2. **Submitter hot loop** (design §3.2) on the existing drive-actor thread:
    pop → `set_timeout_for(TapeIo)` (KEPT per command — the v0.1 hoist was
    rejected; it self-heals the class after inline RPs) → SG_IO → status
+   — **and raise the constants (st-harvest F3): `TimeoutClass::TapeIo`
+   60 s → 900 s, `TimeoutClass::WriteFilemarks` 120 s → 900 s** (st's
+   normal timeout, sized for drive-side recovery; zero application retries
+   unchanged; classes stay distinct; all other TimeoutClass values
+   unchanged). Do this BEFORE cutting equivalence fixtures
    check → record GOOD completion (in-place) → advance cursor → tripwire
    check → return buffer → repeat. The good path is a **new audit-free
    variant**; extract the TIO-1/2 decode helpers (`write_eom_signal`,
@@ -30,10 +35,21 @@ ordering — MUST NOT change), `docs/layer5-multi-object-append-design-v0.1.md`
    **Cursor arithmetic split from tripwire execution**: GOOD data command
    recorded before any tripwire RP is issued; the tripwire is its own
    recorded op.
-3. **Classified non-GOOD split** (design §3.2 — exact TIO-1/2 semantics):
-   - full-record EW ⇒ success with `early_warning` flags, NO fence, NO
-     stop, propagates to pool-write policy as today;
-   - safety-relevant (partial batch, hard EOM, undecodable residual,
+3. **Classified non-GOOD split** (design §3.2 — three classes, st-harvest
+   F1/F2 folded):
+   - **successful-with-signal**: full-record EW ⇒ success with
+     `early_warning` flags, NO fence, NO stop, propagates to pool-write
+     policy as today; **current sense key RECOVERED ERROR (0x1) with no
+     terminal flags ⇒ success, audited-as-recovered**; RECOVERED ERROR +
+     EOM ⇒ the EW class via the exact pre-position/post-RP-delta
+     arbitration. Deferred 0x71/0x73 never enters this class;
+   - **state-invalidating current sense**: UNIT ATTENTION `06/29/00..04`
+     (power-on/reset) ⇒ stop pipeline, no further CDBs, invalidate
+     `expected_position` AND cached mode validation, fence any active
+     uncommitted session before audit/propagation; recovery only via
+     readiness admission + device position proof + MODE SENSE
+     re-verification of the tape-sourced block size;
+   - **safety-relevant** (partial batch, hard EOM, undecodable residual,
      deferred sense 0x71/0x73, transport-unknown, tripwire mismatch) ⇒
      **classify → fence → audit → propagate**; fence/position-invalidation
      never wait on audit emission.
@@ -70,7 +86,15 @@ ordering — MUST NOT change), `docs/layer5-multi-object-append-design-v0.1.md`
   classes 1:1; only good data-WRITE Started/Finished fold into intent
   marker + coalesced span, counts/bytes reconciling);
 - timeout-class regression around tripwire and error-path RPs (success,
-  mismatch, RP-failure exits — next WRITE always TapeIo/60 s);
+  mismatch, RP-failure exits — next WRITE always TapeIo/900 s);
+- recovered-error matrix (design §9): `0x70/key=1` no flags → success +
+  audited-as-recovered, no fence/stop; `key=1+EOM` → EW class via RP
+  delta; `key=1+ILI/FM` → respective paths; deferred `0x71/0x73` key=1 →
+  completion-unknown always;
+- reset-UA state invalidation (design §9): `06/29/xx` on WRITE/READ/
+  FILEMARK and after a GOOD batch → stop, cursor + mode validation
+  invalidated, session fenced pre-audit, not classified deferred; recovery
+  requires position proof + MODE re-verification;
 - EW × tripwire interleave with low `position_check_bytes`
   (`position_before` pin proven fresh);
 - trailing partial batch CDB rebuild (N not a multiple of B);

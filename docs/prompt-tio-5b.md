@@ -17,7 +17,10 @@ Same frozen constraints as TIO-5a.
    behavior) withhold the buffer. The next READ CDB may be staged, but
    **any short/residual outcome (FILEMARK residual, ILI, error) cancels the
    staged CDB**; clamp recomputed from post-decode state before further
-   issue.
+   issue. **Fixed-mode ILI additionally invalidates the arithmetic cursor
+   (design §5, st-harvest F4)**: handoff withheld, `expected_position`
+   cleared, next data command requires explicit reposition + device
+   position proof — do NOT copy st's automatic backspace recovery.
 2. **Read diag parity** (design §5 — closes field gap #4): restore path
    gains the write path's decomposition — per-phase times (locate/position,
    transfer, relay), per-command cadence histograms (`gap_us`, `ioctl_us`),
@@ -44,6 +47,11 @@ Same frozen constraints as TIO-5a.
   bytes past `valid_bytes`;
 - FILEMARK residual cancels the staged next CDB (assert absence of the
   boundary-crossing READ); clamp recomputed from post-decode state;
+- fixed-mode ILI cursor invalidation (design §9): ILI after N clean
+  records and ILI before any record — staged CDB cancelled, handoff
+  withheld, `expected_position` cleared, no subsequent data CDB without
+  explicit reposition + device position proof (assert no cached-position
+  reuse);
 - fail-closed outcomes withhold the buffer (read_core behavior preserved);
 - read batching under pipelining: batch never crosses a tape-file boundary;
   SILI stays 0; read-side MODE SELECT step (TIO-2) unchanged;
