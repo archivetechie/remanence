@@ -1,5 +1,12 @@
 # Prompt TIO-5a — pipelined submission, write side (staging ring + hot submitter + in-place accounting)
 
+**SUPERSEDED NOTE (2026-07-10 evening):** this prompt was implemented on
+branch `tio-5a-wip-20260710`; the diff gate + owner decisions v0.6/v0.7
+then removed ALL mode switches (`pipelined_submission` AND
+`legacy_single_block`). Where this prompt mentions those flags, backout
+ladders, or OFF-mode equivalence, `docs/prompt-tio-5a-fixes.md` and design
+v0.7 are normative instead.
+
 **Status:** pending (cut 2026-07-10 from FROZEN design v0.5, st-harvest folded).
 **Normative source — read first and treat as binding:**
 `docs/design-tape-io-pipelined-submission-v0.1.md` (v0.5). Where this prompt

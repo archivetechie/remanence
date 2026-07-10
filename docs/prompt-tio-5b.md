@@ -80,9 +80,9 @@ Same frozen constraints as TIO-5a.
 
 - **Single safety funnel:** the read pipeline terminates every error
   class in the SAME fence/fail-closed machinery as the write path — one
-  funnel, no mode-conditioned safety call sites. (Design v0.6: there is
-  no pipelining flag; the pipelined path is THE batched path,
-  `legacy_single_block` the only fallback.)
+  funnel, no mode-conditioned safety call sites. (Design v0.7: ALL mode
+  switches are deleted — the pipelined path is THE tape I/O path; backout
+  is git + the previous binary.)
 - **Golden-baseline fixtures:** read command-stream/timeout fixtures are
   captured from main before your changes, never from this branch's own
   behavior.
