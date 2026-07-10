@@ -1,7 +1,13 @@
-# Tape I/O pipelined submission (TIO-5) — staging ring, hot submitter, in-place accounting — Design v0.3
+# Tape I/O pipelined submission (TIO-5) — staging ring, hot submitter, in-place accounting — Design v0.4
 
-**Status:** v0.3 — panel folded + verify round 1 folded 2026-07-10;
-re-verify pending.
+**Status:** v0.4 — panel folded + verify round 1 folded + re-verify folded
+2026-07-10; re-verify round 2 (final, §9-scoped) pending.
+**Re-verify round 1 (fresh codex gpt-5.6-sol):** fixes 3/4 confirmed;
+fixes 1/2 correct in the body but not propagated into §9 test rows (2
+majors + 1 minor, all §9-consistency) — folded in v0.4: non-GOOD test row
+split by classified outcome; equivalence test rows split two-tier with the
+§4 individually-audited classes preserved 1:1; kill-point → crash-row
+mapping corrected to rows 2–5.
 **Verify round 1 (fresh codex gpt-5.6-sol):** checklist 13/17 YES, 4 PARTIAL;
 4 fold-precision majors, all folded in v0.3 — (1) fence rule narrowed to
 safety-relevant outcomes (full-record EW stays a successful, unfenced
@@ -257,7 +263,10 @@ Testable claims, all asserted hermetically:
      identical; audit compared as a **normalized semantic trace** —
      exception/filemark/fence events exact in order and content; good-path
      per-command Started/Finished events map to the window intent marker +
-     coalesced span with matching command counts and bytes.
+     coalesced span with matching command counts and bytes. The
+     individually-audited classes preserved 1:1 are exactly §4's list:
+     errors, EW/EOM signals, tripwire RPs (including successful ones),
+     filemarks, fences, session open/close.
    **Preconditions (panel):** identical sg reserved size and tape-sourced
    block size at open; the trailing partial batch rebuilds its CDB. The
    model transport gains timeout-class recording to make the timeout tier
@@ -349,9 +358,14 @@ hermetic acceptance = invariants + counters, the library proves the number.
 
 Hermetic (model transport / chaos):
 - single-command-in-flight assertion under pipelining;
-- CDB-stream equivalence ON vs OFF **plus** timeout-class stream, audit
-  event sequence, and poison-behavior equivalence (model transport records
-  timeout classes — new test infra, panel);
+- equivalence, two-tier per §6.2: (i) **OFF vs shipped TIO-3/4** — exact
+  CDB, timeout-class, audit-event-sequence, and poison-behavior
+  equivalence; (ii) **ON vs OFF** — byte-identical CDB stream + identical
+  timeout-class stream + normalized audit trace (every §4
+  individually-audited class preserved 1:1; only good data-WRITE
+  Started/Finished pairs fold into intent marker + coalesced span, with
+  command counts and bytes reconciling). Model transport records timeout
+  classes (new test infra, panel);
 - timeout-class regression around the tripwire: WRITE after tripwire RP and
   after error-path RP runs at TapeIo (60 s), never TapeStatus (5 s) —
   success, mismatch, and RP-failure exits all covered;
@@ -367,12 +381,19 @@ Hermetic (model transport / chaos):
     subsequent fence sees both the data record and the tripwire record;
   - **kill injection** (SIGKILL between data GOOD, in-place update, RP
     submission/completion, fence persistence): no record-survival claim —
-    recovery is conservative per §6 rows 2–4 (process-local state ignored,
-    journaled prefix authoritative, fence on lost outcomes);
-- non-GOOD mid-stream: submitter stops, no further data CDBs, decode
-  outcomes reproduced exactly (EW residual, deferred sense, partial batch →
-  fence); ordering classify → fence → audit → propagate asserted with a
-  failing/slow audit sink (safety actions complete regardless);
+    recovery is conservative per §6 rows 2–5, each kill point mapped to its
+    crash-table row (a kill after RP failure before fence persistence is
+    row 5's lost-decode rule: process-local state ignored, journaled prefix
+    authoritative, fence on lost outcomes);
+- non-GOOD mid-stream, split by classified outcome (§3.2):
+  - **full-record EW**: no fence, no stop — success with `early_warning`
+    flags, pipeline continues under existing pool policy (assert absence of
+    fence row and of session stop);
+  - **safety-relevant** (partial batch, hard EOM, undecodable residual,
+    deferred sense, transport-unknown, tripwire mismatch): submitter stops,
+    no further data CDBs, decode outcomes reproduced exactly; ordering
+    classify → fence → audit → propagate asserted with a failing/slow audit
+    sink (safety actions complete regardless);
 - terminal poison protocol: stager parked in blocking send is released on
   every error path (close-before-join asserted); queued buffers drained
   without CDBs; no buffer leak/double-return (ring accounting balances);
