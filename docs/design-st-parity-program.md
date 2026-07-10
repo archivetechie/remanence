@@ -1,7 +1,11 @@
 # st-parity program — inheriting thirty years of tape lore without giving up control
 
 **Status: BRIEF v0.1 (2026-07-08) — for panel review, then codex audit dispatch.
-Sequenced BEFORE/WITH TIO-5 (its deferred-error chapter is TIO-5's reference).**
+Sequencing REVISED 2026-07-10 (the owner): TIO-5 is designed clean-slate FIRST
+(`design-tape-io-pipelined-submission-v0.1.md`); the st harvest runs as a
+bounded post-freeze pass feeding review deltas, never structural input. The
+brief's other legs (conformance oracle, lore watcher, qualification policy)
+are unchanged.**
 
 ## The risk
 
