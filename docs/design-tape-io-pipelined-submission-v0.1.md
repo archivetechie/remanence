@@ -1,8 +1,14 @@
-# Tape I/O pipelined submission (TIO-5) — staging ring, hot submitter, in-place accounting — Design v0.4
+# Tape I/O pipelined submission (TIO-5) — staging ring, hot submitter, in-place accounting — Design v0.5
 
-**Status:** **FROZEN v0.4** (2026-07-10) — panel (4 lenses incl. codex
+**Status:** **FROZEN v0.5** (2026-07-10) — panel (4 lenses incl. codex
 gpt-5.6-sol) → fold → verify → fold → re-verify → fold → re-verify-2
-**PASS** (all items confirmed, zero findings). Prompt set:
+**PASS**; then **st-harvest pass folded** (the owner-ordered pre-dispatch;
+`report-st-harvest-2026-07-10.md`, gpt-5.6-sol, verdict FOLD 4 FIRST):
+F1 reset-UA = state-invalidating class; F2 RECOVERED ERROR = success
+(audited-as-recovered) incl. recovered-EW via RP-delta; F3 TapeIo &
+WriteFilemarks timeouts → 900 s (stolen from st); F4 fixed-mode ILI
+invalidates the arithmetic cursor. 15 oracle items → st-parity leg 2;
+12 cruft items documented-discarded in the report. Prompt set:
 `prompt-tio-5a.md`, `prompt-tio-5b.md`.
 **Re-verify round 1 (fresh codex gpt-5.6-sol):** fixes 3/4 confirmed;
 fixes 1/2 correct in the body but not propagated into §9 test rows (2
@@ -41,6 +47,7 @@ brief's "audit BEFORE/WITH TIO-5" sequencing; the brief's other legs
 **Related:** `design-tape-io-throughput-v0.1.md` (frozen v0.2 — TIO-1..4,
 whose error machinery and commit ordering this design must not alter),
 `memo-field-window-2026-07-07b.md` (field evidence),
+`report-st-harvest-2026-07-10.md` (the harvest folded into v0.5),
 `design-st-parity-program.md` (pass-2 harvest source),
 `layer5-multi-object-append-design-v0.1.md` (durable-boundary rules),
 `lto9-media-readiness-design-v0.1.md` (fence/dirty-scope rules).
@@ -158,13 +165,29 @@ to ring → repeat.
   the existing decode (EW/EOM arbitration by READ POSITION delta, with the
   TapeIo timeout class re-asserted after the inline RP; deferred sense
   0x71/0x73 → completion-unknown; partial batch → uncommittable). The
-  classified outcome then takes one of two paths (verify-round fix — v0.2
-  wrongly fenced everything):
-  - **Successful-with-signal** — full-record EW (all records accounted,
+  classified outcome then takes one of three paths (two-way split from the
+  verify round; third class + recovered-error handling from the st harvest,
+  F1/F2):
+  - **Successful-with-signal** — (a) full-record EW (all records accounted,
     no hard EOM): recorded as a successful outcome carrying its flags,
-    exactly TIO-1/2's `Ok(WriteBatchOutcome{early_warning,..})`. **No
-    fence, no stop**; the signal propagates to the existing pool-write
-    policy and the pipeline continues per that policy, as today.
+    exactly TIO-1/2's `Ok(WriteBatchOutcome{early_warning,..})`; (b)
+    **current sense key RECOVERED ERROR (0x1) with no terminal flags**
+    (st-harvest F2 — the drive fixed its own hiccup): successful
+    completion, **audited-as-recovered** (feeds health correlation);
+    (c) **RECOVERED ERROR + EOM** joins the EW class and is arbitrated by
+    the same exact pre-position/post-RP delta rule. **No fence, no stop**
+    for any of these; signals propagate to the existing pool-write policy.
+    Deferred sense (0x71/0x73) NEVER enters this class.
+  - **State-invalidating current sense** (st-harvest F1) — UNIT ATTENTION
+    for power-on/reset (`06/29/00..04`): the command did not execute, but
+    the drive's state did — position and mode configuration are no longer
+    trustworthy. Stop the pipeline, close/drain without further CDBs,
+    **invalidate `expected_position` AND cached mode validation**, fence
+    any active uncommitted write session (before audit/propagation).
+    Recovery only via readiness admission + explicit device position proof
+    + MODE SENSE verification of the tape-sourced block size — never by
+    trusting process-cached values. Not mislabelled as deferred: the
+    uncertainty is prior session state, not this command's completion.
   - **Safety-relevant** — partial batch, hard EOM, undecodable residual,
     deferred sense, transport-unknown, tripwire mismatch: **fence → audit
     → propagate**. Position invalidation and durable-fence persistence run
@@ -174,6 +197,16 @@ to ring → repeat.
     error propagates and the session stops.
   One command in flight ⇒ attribution exact ⇒ decode semantics identical
   by construction.
+- **Timeout constants (st-harvest F3, stolen from st):**
+  `TimeoutClass::TapeIo` and `TimeoutClass::WriteFilemarks` are raised to
+  **900 s** (st's normal timeout, explicitly sized to cover drive-side
+  recovery/destage; a host-induced abort escalating into HBA/bus recovery
+  is a worse failure than a slow detection). Zero application retries
+  unchanged. The classes stay distinct even though the values now
+  coincide. Other classes (Positioning 300 s, Rewind 600 s, LoadUnload
+  600 s, TapeStatus/ModeConfig 5 s) keep rem's target-specific values
+  pending physical qualification — promotion triggers in the harvest
+  report's timeout table.
 
 ### 3.3 Spool ceiling consequence
 With the submitter feeding ~740 MB/s, spool read rate is again the binding
@@ -208,8 +241,10 @@ synchronous**:
   handful of emissions per object. If the audit hook is ever wired to a slow
   sink, coalescing keeps it off the per-command path by construction.
 - **Individually audited, inline, immediately** (exactly today's machinery
-  and record content, sense bytes included): errors, EW/EOM, tripwire RPs
-  and mismatches, filemarks, fences, session open/close.
+  and record content, sense bytes included): errors, EW/EOM,
+  **recovered-error completions (st-harvest F2 — success, but on the
+  health record)**, reset-UA state invalidations, tripwire RPs and
+  mismatches, filemarks, fences, session open/close.
 - **Safety-persistence invariant (folded from the panel blocker):** fences,
   position invalidation, and poison **never depend on audit-sink
   availability**. Ordering whenever the classified outcome requires safety
@@ -240,6 +275,13 @@ outcome (FILEMARK+VALID residual, ILI, error) cancels the staged next CDB**;
 the submitter recomputes the clamp (`remaining_records_in_file`, file
 cursor) from post-decode state before issuing anything further — reads never
 cross a tape-file boundary, including via a stale pre-staged CDB.
+**Fixed-mode ILI additionally invalidates the arithmetic cursor
+(st-harvest F4):** a size-mismatched record may have physically advanced
+the tape, so the pre-ILI cached position is untrustworthy — the handoff is
+withheld, `expected_position` is cleared, and the next data command
+requires an explicit reposition + device position proof. st's automatic
+backspace recovery is deliberately NOT copied; explicit re-proof is
+stronger.
 
 **Read diag parity (closes field gap #4):** the read path gains the write
 path's full decomposition — per-phase times (locate/position, transfer,
@@ -369,7 +411,8 @@ Hermetic (model transport / chaos):
   command counts and bytes reconciling). Model transport records timeout
   classes (new test infra, panel);
 - timeout-class regression around the tripwire: WRITE after tripwire RP and
-  after error-path RP runs at TapeIo (60 s), never TapeStatus (5 s) —
+  after error-path RP runs at TapeIo (900 s, st-harvest F3), never
+  TapeStatus (5 s) —
   success, mismatch, and RP-failure exits all covered;
 - EW × tripwire interleave: `position_check_bytes` low enough that a
   tripwire RP and an EW event land in one window; `position_before` pin
@@ -391,11 +434,28 @@ Hermetic (model transport / chaos):
   - **full-record EW**: no fence, no stop — success with `early_warning`
     flags, pipeline continues under existing pool policy (assert absence of
     fence row and of session stop);
+  - **recovered-error matrix (st-harvest F2)**: current `0x70/key=1` with
+    no terminal flags → success, audited-as-recovered, no fence, no stop;
+    `key=1 + EOM` → EW class via RP-delta arbitration (full-record ⇒
+    success-with-EW; partial ⇒ safety-relevant); `key=1 + ILI/FM` → the
+    respective ILI/filemark path, never plain success; deferred `0x71/0x73`
+    with key=1 → still completion-unknown, never recovered-success;
+  - **reset-UA state invalidation (st-harvest F1)**: current `06/29/xx` on
+    WRITE / READ / WRITE FILEMARKS, and arriving after a GOOD batch →
+    pipeline stops with no further CDBs, `expected_position` and cached
+    mode validation invalidated, active uncommitted session fenced before
+    audit/propagation; recovery path re-proves position AND re-verifies
+    MODE before any data command; assert it is NOT classified as deferred;
   - **safety-relevant** (partial batch, hard EOM, undecodable residual,
     deferred sense, transport-unknown, tripwire mismatch): submitter stops,
     no further data CDBs, decode outcomes reproduced exactly; ordering
     classify → fence → audit → propagate asserted with a failing/slow audit
     sink (safety actions complete regardless);
+  - **fixed-mode ILI cursor invalidation (st-harvest F4, read side)**:
+    ILI after N clean records and ILI before any record — staged next CDB
+    cancelled, handoff withheld, `expected_position` cleared, and no
+    subsequent data CDB issued without an explicit reposition + device
+    position proof (assert absence of cached-position reuse);
 - terminal poison protocol: stager parked in blocking send is released on
   every error path (close-before-join asserted); queued buffers drained
   without CDBs; no buffer leak/double-return (ring accounting balances);
@@ -427,11 +487,11 @@ Hermetic (model transport / chaos):
    cancellation, read diag parity, **spool orphan reconciliation**,
    runbook/fieldtest updates (tmpfs + RAM budget, acceptance legs 1–5,
    max_sectors sweep step), remaining hermetic coverage.
-3. **st harvest pass (post-freeze):** bounded checklist against the frozen
-   design — timeout ladder constants per command class, unit-attention retry
-   taxonomy, EW-handling nuances from `st.c` — findings fed back as review
-   deltas (semantics only, no code transcription; GPL provenance discipline
-   per the st-parity brief).
+3. **st harvest pass — DONE 2026-07-10** (`report-st-harvest-2026-07-10.md`,
+   run pre-dispatch on the owner's call): 4 FOLD-NOW items folded into this
+   v0.5 (F1 reset-UA class, F2 recovered-error class, F3 900 s timeouts,
+   F4 ILI cursor invalidation); 15 oracle items feed the st-parity
+   program's executable-oracle leg; 12 cruft items documented-discarded.
 4. Physical validation next window per §8 (flip `pipelined_submission` on
    validated hosts after acceptance); then **A7 streaming ingest** (now the
    named dual-drive-at-rate unlock — it deletes the spool and its RAM
