@@ -95,6 +95,22 @@ ships a regression test reproducing its failure scenario.
     `read_position_inline_with_cdb` (:2268), not re-implement its
     execute/parse/record core.
 
+## Structural invariants (bind every fix above)
+
+- **Single safety funnel:** every transfer-error class, in BOTH modes,
+  terminates in the same fence-recording path. Acceptance is grep-level:
+  after your fixes, no `record_tape_io_fence*` call site (or its caller
+  chain) is gated on `pipelined_submission`. New-path plumbing may differ;
+  the safety funnel may not.
+- **Golden-baseline equivalence:** the OFF-vs-shipped tier must assert
+  against fixtures captured from `main` (pre-TIO-5a) behavior — command
+  stream, timeout classes, audit sequence, read preconditions — not
+  against this branch's own OFF mode. Generate the fixtures from main
+  (git worktree or committed fixture files) and check them in.
+- **Wrap, don't copy:** where the design says helpers are reused
+  unmodified, a near-verbatim copy is a defect even if tests pass
+  (findings 9/10 exist because of this).
+
 ## Definition of done
 
 AGENTS.md applies: `cargo test --workspace` green, `cargo fmt --check`,
