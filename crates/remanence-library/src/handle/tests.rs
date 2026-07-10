@@ -2740,14 +2740,20 @@ fn fixed_filemark_residual_sense(residual: u32) -> Vec<u8> {
 enum HotWriteScript {
     Clean,
     CheckCondition(Vec<u8>),
+    Transport(&'static str),
+}
+
+enum HotPositionScript {
+    Clean(u64),
+    Transport(&'static str),
 }
 
 struct HotScriptTransport {
     identity_responses: VecDeque<Vec<u8>>,
-    position_responses: VecDeque<Vec<u8>>,
+    position_responses: VecDeque<HotPositionScript>,
     writes: VecDeque<HotWriteScript>,
     timeout: TimeoutClass,
-    command_timeouts: Arc<Mutex<Vec<(u8, TimeoutClass)>>>,
+    command_timeouts: Arc<Mutex<Vec<(Vec<u8>, TimeoutClass)>>>,
 }
 
 impl SgTransport for HotScriptTransport {
@@ -2755,7 +2761,7 @@ impl SgTransport for HotScriptTransport {
         self.command_timeouts
             .lock()
             .expect("timeout log")
-            .push((cdb[0], self.timeout));
+            .push((cdb.to_vec(), self.timeout));
         if cdb[0] == 0x08 {
             return match self.writes.pop_front().expect("READ response scripted") {
                 HotWriteScript::Clean => Ok(TransferOutcome::clean(buf.len() as u32)),
@@ -2763,6 +2769,9 @@ impl SgTransport for HotScriptTransport {
                     sense,
                     bytes_transferred: 0,
                 }),
+                HotWriteScript::Transport(message) => {
+                    Err(ScsiError::Io(std::io::Error::other(message)))
+                }
             };
         }
         let response = match cdb[0] {
@@ -2770,10 +2779,16 @@ impl SgTransport for HotScriptTransport {
                 .identity_responses
                 .pop_front()
                 .expect("identity response scripted"),
-            0x34 => self
+            0x34 => match self
                 .position_responses
                 .pop_front()
-                .expect("position response scripted"),
+                .expect("position response scripted")
+            {
+                HotPositionScript::Clean(lba) => rp_long_response(0, 0, lba),
+                HotPositionScript::Transport(message) => {
+                    return Err(ScsiError::Io(std::io::Error::other(message)))
+                }
+            },
             0x05 => rbl_response(0x00ff_ffff, 1),
             0x1a => mode_sense_response(4, false),
             _ => return Err(ScsiError::InvalidInput("unsupported scripted input CDB")),
@@ -2787,7 +2802,7 @@ impl SgTransport for HotScriptTransport {
         self.command_timeouts
             .lock()
             .expect("timeout log")
-            .push((cdb[0], self.timeout));
+            .push((cdb.to_vec(), self.timeout));
         if cdb[0] != 0x10 {
             return Err(ScsiError::InvalidInput("unsupported scripted no-data CDB"));
         }
@@ -2797,6 +2812,9 @@ impl SgTransport for HotScriptTransport {
                 sense,
                 bytes_transferred: 0,
             }),
+            HotWriteScript::Transport(message) => {
+                Err(ScsiError::Io(std::io::Error::other(message)))
+            }
         }
     }
 
@@ -2804,13 +2822,16 @@ impl SgTransport for HotScriptTransport {
         self.command_timeouts
             .lock()
             .expect("timeout log")
-            .push((cdb[0], self.timeout));
+            .push((cdb.to_vec(), self.timeout));
         match self.writes.pop_front().expect("WRITE response scripted") {
             HotWriteScript::Clean => Ok(TransferOutcome::clean(buf.len() as u32)),
             HotWriteScript::CheckCondition(sense) => Err(ScsiError::CheckCondition {
                 sense,
                 bytes_transferred: 0,
             }),
+            HotWriteScript::Transport(message) => {
+                Err(ScsiError::Io(std::io::Error::other(message)))
+            }
         }
     }
 
@@ -2829,15 +2850,95 @@ fn current_sense(key: u8, flags: u8, asc: u8, ascq: u8) -> Vec<u8> {
     sense
 }
 
+fn main_golden_commands(section: &str) -> Vec<(Vec<u8>, String, u64)> {
+    let fixture: toml::Value = toml::from_str(include_str!(
+        "../../../../fixtures/tape_io/main-v308b05e-command-streams.toml"
+    ))
+    .expect("main command-stream fixture parses");
+    fixture[section]["commands"]
+        .as_array()
+        .expect("fixture section has commands")
+        .iter()
+        .map(|command| {
+            let cdb = command["cdb"]
+                .as_array()
+                .expect("fixture command has cdb")
+                .iter()
+                .map(|byte| u8::try_from(byte.as_integer().expect("CDB byte integer")).unwrap())
+                .collect();
+            let class = command["timeout_class"]
+                .as_str()
+                .expect("fixture command has timeout class")
+                .to_string();
+            let timeout_ms = u64::try_from(
+                command["current_timeout_ms"]
+                    .as_integer()
+                    .expect("fixture command has current timeout"),
+            )
+            .unwrap();
+            (cdb, class, timeout_ms)
+        })
+        .collect()
+}
+
+#[test]
+fn single_path_matches_main_golden_write_and_read_command_streams() {
+    let config = TapeIoRuntimeConfig {
+        write_batch_blocks: 4,
+        read_batch_blocks: 4,
+        position_check_bytes: 0,
+        ..TapeIoRuntimeConfig::default()
+    };
+    let (mut write_drive, write_log, _) = open_hot_script_drive(
+        "LIB_MAIN_GOLDEN_WRITE",
+        [10, 15],
+        [HotWriteScript::Clean, HotWriteScript::Clean],
+        config,
+    );
+    let write_cdb = remanence_scsi::read_write::build_write_fixed_cdb(4);
+    write_drive
+        .write_block_batch_pipelined(&[0xaa; 16], 4, &write_cdb)
+        .expect("canonical fixed write");
+    write_drive
+        .write_filemarks_pipelined(1)
+        .expect("canonical commit filemark");
+
+    let (mut read_drive, read_log, _) = open_hot_script_drive(
+        "LIB_MAIN_GOLDEN_READ",
+        [20],
+        [HotWriteScript::Clean],
+        config,
+    );
+    let mut read_buffer = [0u8; 16];
+    read_drive
+        .read_block_batch(&mut read_buffer, 4, 4, 4)
+        .expect("canonical fixed read");
+
+    for (section, log) in [("write", write_log), ("read", read_log)] {
+        let actual = log
+            .lock()
+            .expect("command log")
+            .iter()
+            .filter(|(cdb, _)| matches!(cdb[0], 0x08 | 0x0a | 0x10 | 0x34))
+            .map(|(cdb, class)| {
+                (
+                    cdb.clone(),
+                    format!("{class:?}"),
+                    u64::from(class.duration_ms()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, main_golden_commands(section), "{section} fixture");
+    }
+}
+
 #[test]
 fn pipelined_hot_loop_reasserts_tape_io_after_each_tripwire() {
     let config = TapeIoRuntimeConfig {
-        pipelined_submission: true,
         staging_ring_buffers: 4,
         write_batch_blocks: 1,
         read_batch_blocks: 1,
         position_check_bytes: 4,
-        ..TapeIoRuntimeConfig::default()
     };
     let (mut drive, timeouts, _) = open_hot_script_drive(
         "LIB_HOT_TIMEOUT",
@@ -2857,8 +2958,8 @@ fn pipelined_hot_loop_reasserts_tape_io_after_each_tripwire() {
         .lock()
         .expect("timeout log")
         .iter()
-        .copied()
-        .filter(|(opcode, _)| matches!(opcode, 0x0a | 0x34))
+        .filter(|(cdb, _)| matches!(cdb[0], 0x0a | 0x34))
+        .map(|(cdb, timeout)| (cdb[0], *timeout))
         .collect::<Vec<_>>();
     assert_eq!(
         data_path,
@@ -2877,7 +2978,6 @@ fn pipelined_hot_loop_reasserts_tape_io_after_each_tripwire() {
 #[test]
 fn pipelined_good_accounting_survives_tripwire_mismatch() {
     let config = TapeIoRuntimeConfig {
-        pipelined_submission: true,
         write_batch_blocks: 1,
         read_batch_blocks: 1,
         position_check_bytes: 4,
@@ -2905,13 +3005,12 @@ fn pipelined_good_accounting_survives_tripwire_mismatch() {
     assert_eq!(diagnostics.good_records, 1);
     assert_eq!(diagnostics.good_bytes, 4);
     assert!(drive.expected_position.is_none());
-    assert!(drive.pending_pipeline_audit.is_some());
+    assert!(!drive.pending_pipeline_audits.is_empty());
 }
 
 #[test]
 fn recovered_error_matrix_preserves_current_success_and_rejects_terminal_or_deferred() {
     let config = TapeIoRuntimeConfig {
-        pipelined_submission: true,
         write_batch_blocks: 4,
         read_batch_blocks: 4,
         position_check_bytes: 0,
@@ -2998,9 +3097,8 @@ fn recovered_error_matrix_preserves_current_success_and_rejects_terminal_or_defe
 }
 
 #[test]
-fn reset_unit_attention_invalidates_cursor_and_mode_until_position_and_mode_reproof() {
+fn reset_unit_attention_same_handle_recovers_via_mode_and_position_reverification() {
     let config = TapeIoRuntimeConfig {
-        pipelined_submission: true,
         write_batch_blocks: 1,
         read_batch_blocks: 1,
         position_check_bytes: 0,
@@ -3028,21 +3126,98 @@ fn reset_unit_attention_invalidates_cursor_and_mode_until_position_and_mode_repr
     assert!(drive.write_block_batch_pipelined(&[3; 4], 4, &cdb).is_err());
 
     drive
-        .position()
-        .expect("device position proof after readiness");
-    assert!(
-        drive.write_block_batch_pipelined(&[3; 4], 4, &cdb).is_err(),
-        "position proof alone must not restore mode trust"
-    );
-    let config = drive.read_config().expect("MODE SENSE reverification");
-    assert_eq!(config.block_size, BlockSize::Fixed { size_bytes: 4 });
+        .reverify_invalidated_state()
+        .expect("same daemon-lifetime handle re-verifies MODE and position");
     assert_eq!(drive.mode_reverification_required, None);
+    assert!(drive.position_known);
+}
+
+#[test]
+fn non_reset_completion_unknown_does_not_latch_the_read_state_gate() {
+    let config = TapeIoRuntimeConfig {
+        read_batch_blocks: 1,
+        position_check_bytes: 0,
+        ..TapeIoRuntimeConfig::default()
+    };
+    let (mut drive, _, _) = open_hot_script_drive(
+        "LIB_READ_TRANSPORT_RECOVERY",
+        [10, 10],
+        [
+            HotWriteScript::Transport("first READ completion unknown"),
+            HotWriteScript::Clean,
+        ],
+        config,
+    );
+    drive.validated_fixed_block_size = Some(4);
+    let mut buffer = [0u8; 4];
+    assert!(matches!(
+        drive.read_block_batch(&mut buffer, 4, 1, 1),
+        Err(TapeIoError::Transport(_))
+    ));
+    assert_eq!(drive.mode_reverification_required, None);
+    let outcome = drive
+        .read_block_batch(&mut buffer, 4, 1, 1)
+        .expect("non-reset completion unknown must not require MODE re-verification");
+    assert_eq!(outcome.records_read, 1);
+}
+
+#[test]
+fn eom_write_with_failed_position_arbitration_preserves_write_audit_and_classification() {
+    let config = TapeIoRuntimeConfig {
+        write_batch_blocks: 4,
+        position_check_bytes: 0,
+        ..TapeIoRuntimeConfig::default()
+    };
+    let sense = fixed_residual_sense(2);
+    let mut eom_sense = sense.clone();
+    eom_sense[2] |= 0x40;
+    let (mut drive, _, audit) = open_hot_script_drive_with_positions(
+        "LIB_EOM_RP_FAILURE",
+        [
+            HotPositionScript::Clean(10),
+            HotPositionScript::Transport("arbitration READ POSITION failed"),
+        ],
+        [HotWriteScript::CheckCondition(eom_sense.clone())],
+        config,
+    );
+    let cdb = remanence_scsi::read_write::build_write_fixed_cdb(4);
+    let error = drive
+        .write_block_batch_pipelined(&[7; 16], 4, &cdb)
+        .expect_err("EOM WRITE and arbitration RP both fail");
+    assert!(matches!(
+        error,
+        TapeIoError::WriteFailureWithPositionError { ref write_error, ref position_error }
+            if matches!(write_error.as_ref(), TapeIoError::PartialBatchUncommittable {
+                requested_records: 4,
+                written_records: 2,
+                ..
+            }) && position_error.to_string().contains("arbitration READ POSITION failed")
+    ));
+    drive.flush_pending_pipeline_audit();
+    let audit = audit.lock().expect("audit");
+    assert!(audit.iter().any(|event| matches!(
+        event,
+        CapturedEvent::FinishedScsiError {
+            op: AuditOp::TapeWrite { .. },
+            summary,
+        } if summary.contains("partial fixed batch uncommittable")
+    )));
+    let failed_operations = audit
+        .iter()
+        .filter_map(|event| match event {
+            CapturedEvent::FinishedScsiError { op, .. } => Some(*op),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        failed_operations.as_slice(),
+        [AuditOp::TapeWrite { .. }, AuditOp::TapeReadPosition { .. }]
+    ));
 }
 
 #[test]
 fn reset_unit_attention_on_read_and_filemark_uses_state_invalidating_class() {
     let config = TapeIoRuntimeConfig {
-        pipelined_submission: true,
         write_batch_blocks: 1,
         read_batch_blocks: 1,
         position_check_bytes: 0,
@@ -3078,18 +3253,18 @@ fn reset_unit_attention_on_read_and_filemark_uses_state_invalidating_class() {
     ));
     assert!(filemark_drive.expected_position.is_none());
     assert_eq!(filemark_drive.mode_reverification_required, Some(4));
-    assert!(filemark_drive.pending_pipeline_audit.is_some());
+    assert!(!filemark_drive.pending_pipeline_audits.is_empty());
     assert!(timeouts
         .lock()
         .expect("timeout log")
-        .contains(&(0x10, TimeoutClass::WriteFilemarks)));
+        .iter()
+        .any(|(cdb, timeout)| cdb[0] == 0x10 && *timeout == TimeoutClass::WriteFilemarks));
     assert_eq!(TimeoutClass::WriteFilemarks.duration_ms(), 900_000);
 }
 
 #[test]
 fn pipelined_hard_eom_filemark_is_safety_relevant_with_sense_preserved() {
     let config = TapeIoRuntimeConfig {
-        pipelined_submission: true,
         position_check_bytes: 0,
         ..TapeIoRuntimeConfig::default()
     };
@@ -3107,7 +3282,7 @@ fn pipelined_hard_eom_filemark_is_safety_relevant_with_sense_preserved() {
         err,
         TapeIoError::HardEndOfMedium { sense: actual } if actual == sense
     ));
-    assert!(drive.pending_pipeline_audit.is_some());
+    assert!(!drive.pending_pipeline_audits.is_empty());
 }
 
 fn open_hot_script_drive(
@@ -3117,7 +3292,25 @@ fn open_hot_script_drive(
     config: TapeIoRuntimeConfig,
 ) -> (
     DriveHandle,
-    Arc<Mutex<Vec<(u8, TimeoutClass)>>>,
+    Arc<Mutex<Vec<(Vec<u8>, TimeoutClass)>>>,
+    Arc<Mutex<Vec<CapturedEvent>>>,
+) {
+    open_hot_script_drive_with_positions(
+        serial,
+        positions.into_iter().map(HotPositionScript::Clean),
+        writes,
+        config,
+    )
+}
+
+fn open_hot_script_drive_with_positions(
+    serial: &'static str,
+    positions: impl IntoIterator<Item = HotPositionScript>,
+    writes: impl IntoIterator<Item = HotWriteScript>,
+    config: TapeIoRuntimeConfig,
+) -> (
+    DriveHandle,
+    Arc<Mutex<Vec<(Vec<u8>, TimeoutClass)>>>,
     Arc<Mutex<Vec<CapturedEvent>>>,
 ) {
     let lib = open_drive_test_lib(serial);
@@ -3130,10 +3323,7 @@ fn open_hot_script_drive(
     );
     let mut drive = Some(HotScriptTransport {
         identity_responses: VecDeque::from([lto9_inquiry(), vpd80_response("DRV_A")]),
-        position_responses: positions
-            .into_iter()
-            .map(|lba| rp_long_response(0, 0, lba))
-            .collect(),
+        position_responses: positions.into_iter().collect(),
         writes: writes.into_iter().collect(),
         timeout: TimeoutClass::Inquiry,
         command_timeouts: drive_timeouts,

@@ -101,8 +101,6 @@ type BytesChunkStream =
 
 fn tape_io_runtime_config(config: &TapeIoConfig) -> remanence_library::TapeIoRuntimeConfig {
     remanence_library::TapeIoRuntimeConfig {
-        legacy_single_block: config.legacy_single_block,
-        pipelined_submission: config.pipelined_submission,
         staging_ring_buffers: config.staging_ring_buffers,
         write_batch_blocks: config.write_batch_blocks,
         read_batch_blocks: config.read_batch_blocks,
@@ -165,7 +163,6 @@ pub(crate) struct DriveByteCounters {
     read_bytes: AtomicU64,
     write_bytes: AtomicU64,
     counter_epoch: u64,
-    tape_io_pipelined_submission: AtomicU64,
     tape_io_staging_ring_buffers: AtomicU64,
     tape_io_effective_batch_blocks: AtomicU64,
     tape_io_gap_p50_us: AtomicU64,
@@ -184,7 +181,6 @@ impl DriveByteCounters {
             read_bytes: AtomicU64::new(0),
             write_bytes: AtomicU64::new(0),
             counter_epoch,
-            tape_io_pipelined_submission: AtomicU64::new(0),
             tape_io_staging_ring_buffers: AtomicU64::new(0),
             tape_io_effective_batch_blocks: AtomicU64::new(0),
             tape_io_gap_p50_us: AtomicU64::new(0),
@@ -206,14 +202,7 @@ impl DriveByteCounters {
         self.write_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn configure_tape_io(
-        &self,
-        pipelined_submission: bool,
-        staging_ring_buffers: u32,
-        effective_batch_blocks: u32,
-    ) {
-        self.tape_io_pipelined_submission
-            .store(u64::from(pipelined_submission), Ordering::Relaxed);
+    pub(crate) fn configure_tape_io(&self, staging_ring_buffers: u32, effective_batch_blocks: u32) {
         self.tape_io_staging_ring_buffers
             .store(u64::from(staging_ring_buffers), Ordering::Relaxed);
         self.tape_io_effective_batch_blocks
@@ -841,10 +830,6 @@ impl ApiState {
             .unwrap_or_else(|err| err.into_inner())
             .get(&drive_uuid)
         {
-            drive.tape_io_pipelined_submission = counters
-                .tape_io_pipelined_submission
-                .load(Ordering::Relaxed)
-                != 0;
             drive.tape_io_staging_ring_buffers = counters
                 .tape_io_staging_ring_buffers
                 .load(Ordering::Relaxed) as u32;
