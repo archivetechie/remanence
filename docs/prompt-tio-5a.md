@@ -2,7 +2,7 @@
 
 **Status:** pending (cut 2026-07-10 from FROZEN design v0.4).
 **Normative source — read first and treat as binding:**
-`docs/design-tape-io-pipelined-submission-v0.1.md` (v0.4). Where this prompt
+`docs/design-tape-io-pipelined-submission-v0.1.md` (v0.5). Where this prompt
 and the design disagree, the design wins. Frozen constraints it inherits:
 `docs/design-tape-io-throughput-v0.1.md` (TIO-1..4 error machinery + commit
 ordering — MUST NOT change), `docs/layer5-multi-object-append-design-v0.1.md`
@@ -56,8 +56,11 @@ ordering — MUST NOT change), `docs/layer5-multi-object-append-design-v0.1.md`
 4. **In-place accounting** (design §4): preallocated counters + fixed
    histogram buckets (`gap_us`, `ioctl_us`) bumped by the submitter; one
    coalesced TapeWrite span per staging window emitted synchronously;
-   errors/EW/EOM/tripwire RPs/filemarks/fences/session open-close audited
-   individually inline exactly as today (sense bytes preserved);
+   errors/EW/EOM/recovered-error completions/reset-UA state
+   invalidations/tripwire RPs/filemarks/fences/session open-close audited
+   individually inline exactly as today (sense bytes preserved); the
+   two-tier equivalence's preserved-1:1 list includes the recovered and
+   reset-UA classes;
    **per-window intent marker** (planned CDB range) before entering the hot
    loop. Completion records own their data by value (no ring-buffer
    borrows). NO companion thread, NO accounting queue, NO drain barriers.
