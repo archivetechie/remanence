@@ -733,6 +733,20 @@ pub enum AuditOp {
         /// drive will write).
         len: u32,
     },
+    /// One coalesced pipelined fixed-WRITE staging window. Its Started
+    /// event is the durable pre-ioctl intent marker for the planned range.
+    TapeWriteWindow {
+        /// Drive bay receiving the window.
+        bay: u16,
+        /// Planned WRITE(6) command count.
+        command_count: u32,
+        /// Planned bytes across all commands.
+        bytes: u64,
+        /// Record count in the first command's fixed-mode CDB.
+        first_records: u32,
+        /// Record count in the last command's fixed-mode CDB.
+        last_records: u32,
+    },
     /// Layer 3a: SSC WRITE FILEMARKS(6) on a tape drive.
     TapeWriteFilemarks {
         /// Drive bay address whose drive received WRITE FILEMARKS.
@@ -769,6 +783,16 @@ pub enum AuditOutcome {
         /// callers should consider calling `refresh()` before
         /// reading the snapshot.
         dirty: bool,
+    },
+    /// Current-sense RECOVERED ERROR. The command succeeded, while the
+    /// original sense is retained for drive-health correlation.
+    Recovered {
+        /// Command duration.
+        duration: std::time::Duration,
+        /// Raw current-sense bytes.
+        sense: Vec<u8>,
+        /// Stable human-readable classification.
+        summary: String,
     },
     /// CDB returned CHECK CONDITION or a transport error.
     ScsiError {

@@ -102,6 +102,8 @@ type BytesChunkStream =
 fn tape_io_runtime_config(config: &TapeIoConfig) -> remanence_library::TapeIoRuntimeConfig {
     remanence_library::TapeIoRuntimeConfig {
         legacy_single_block: config.legacy_single_block,
+        pipelined_submission: config.pipelined_submission,
+        staging_ring_buffers: config.staging_ring_buffers,
         write_batch_blocks: config.write_batch_blocks,
         read_batch_blocks: config.read_batch_blocks,
         position_check_bytes: config.position_check_bytes,
@@ -163,6 +165,17 @@ pub(crate) struct DriveByteCounters {
     read_bytes: AtomicU64,
     write_bytes: AtomicU64,
     counter_epoch: u64,
+    tape_io_pipelined_submission: AtomicU64,
+    tape_io_staging_ring_buffers: AtomicU64,
+    tape_io_effective_batch_blocks: AtomicU64,
+    tape_io_gap_p50_us: AtomicU64,
+    tape_io_gap_p95_us: AtomicU64,
+    tape_io_gap_max_us: AtomicU64,
+    tape_io_ioctl_p50_us: AtomicU64,
+    tape_io_ioctl_p95_us: AtomicU64,
+    tape_io_ioctl_max_us: AtomicU64,
+    tape_io_cadence_us: AtomicU64,
+    tape_io_effective_feed_bytes_per_second: AtomicU64,
 }
 
 impl DriveByteCounters {
@@ -171,6 +184,17 @@ impl DriveByteCounters {
             read_bytes: AtomicU64::new(0),
             write_bytes: AtomicU64::new(0),
             counter_epoch,
+            tape_io_pipelined_submission: AtomicU64::new(0),
+            tape_io_staging_ring_buffers: AtomicU64::new(0),
+            tape_io_effective_batch_blocks: AtomicU64::new(0),
+            tape_io_gap_p50_us: AtomicU64::new(0),
+            tape_io_gap_p95_us: AtomicU64::new(0),
+            tape_io_gap_max_us: AtomicU64::new(0),
+            tape_io_ioctl_p50_us: AtomicU64::new(0),
+            tape_io_ioctl_p95_us: AtomicU64::new(0),
+            tape_io_ioctl_max_us: AtomicU64::new(0),
+            tape_io_cadence_us: AtomicU64::new(0),
+            tape_io_effective_feed_bytes_per_second: AtomicU64::new(0),
         }
     }
 
@@ -180,6 +204,44 @@ impl DriveByteCounters {
 
     pub(crate) fn record_write_bytes(&self, bytes: u64) {
         self.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn configure_tape_io(
+        &self,
+        pipelined_submission: bool,
+        staging_ring_buffers: u32,
+        effective_batch_blocks: u32,
+    ) {
+        self.tape_io_pipelined_submission
+            .store(u64::from(pipelined_submission), Ordering::Relaxed);
+        self.tape_io_staging_ring_buffers
+            .store(u64::from(staging_ring_buffers), Ordering::Relaxed);
+        self.tape_io_effective_batch_blocks
+            .store(u64::from(effective_batch_blocks), Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_tape_io_diagnostics(
+        &self,
+        diagnostics: remanence_library::PipelinedWriteDiagnostics,
+    ) {
+        self.tape_io_gap_p50_us
+            .store(diagnostics.gap_p50_us, Ordering::Relaxed);
+        self.tape_io_gap_p95_us
+            .store(diagnostics.gap_p95_us, Ordering::Relaxed);
+        self.tape_io_gap_max_us
+            .store(diagnostics.gap_max_us, Ordering::Relaxed);
+        self.tape_io_ioctl_p50_us
+            .store(diagnostics.ioctl_p50_us, Ordering::Relaxed);
+        self.tape_io_ioctl_p95_us
+            .store(diagnostics.ioctl_p95_us, Ordering::Relaxed);
+        self.tape_io_ioctl_max_us
+            .store(diagnostics.ioctl_max_us, Ordering::Relaxed);
+        self.tape_io_cadence_us
+            .store(diagnostics.cadence_us, Ordering::Relaxed);
+        self.tape_io_effective_feed_bytes_per_second.store(
+            diagnostics.effective_feed_bytes_per_second,
+            Ordering::Relaxed,
+        );
     }
 
     #[cfg(test)]
@@ -772,6 +834,34 @@ impl ApiState {
         } else {
             Vec::new()
         };
+        if let Some(counters) = self
+            .live_status
+            .drive_counters
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(&drive_uuid)
+        {
+            drive.tape_io_pipelined_submission = counters
+                .tape_io_pipelined_submission
+                .load(Ordering::Relaxed)
+                != 0;
+            drive.tape_io_staging_ring_buffers = counters
+                .tape_io_staging_ring_buffers
+                .load(Ordering::Relaxed) as u32;
+            drive.tape_io_effective_batch_blocks = counters
+                .tape_io_effective_batch_blocks
+                .load(Ordering::Relaxed) as u32;
+            drive.tape_io_gap_p50_us = counters.tape_io_gap_p50_us.load(Ordering::Relaxed);
+            drive.tape_io_gap_p95_us = counters.tape_io_gap_p95_us.load(Ordering::Relaxed);
+            drive.tape_io_gap_max_us = counters.tape_io_gap_max_us.load(Ordering::Relaxed);
+            drive.tape_io_ioctl_p50_us = counters.tape_io_ioctl_p50_us.load(Ordering::Relaxed);
+            drive.tape_io_ioctl_p95_us = counters.tape_io_ioctl_p95_us.load(Ordering::Relaxed);
+            drive.tape_io_ioctl_max_us = counters.tape_io_ioctl_max_us.load(Ordering::Relaxed);
+            drive.tape_io_cadence_us = counters.tape_io_cadence_us.load(Ordering::Relaxed);
+            drive.tape_io_effective_feed_bytes_per_second = counters
+                .tape_io_effective_feed_bytes_per_second
+                .load(Ordering::Relaxed);
+        }
         if cleaning_active {
             drive.status = pb::drive::Status::DriveStatusCleaning as i32;
         } else if drive.fenced || record.fenced {

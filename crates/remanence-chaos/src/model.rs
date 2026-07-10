@@ -10,7 +10,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use remanence_library::transport::{SgTransport, TransferOutcome};
+use remanence_library::transport::{SgTransport, TimeoutClass, TransferOutcome};
 use remanence_library::{DeviceCaptures, ElementLayout, IdentitySource, Library};
 use remanence_scsi::{Inquiry, ScsiError};
 
@@ -117,6 +117,12 @@ pub struct SlotState {
 /// Shared virtual changer/tape state.
 #[derive(Clone, Debug)]
 pub struct VirtualWorld {
+    /// Every modeled command paired with the timeout class active at issue.
+    pub command_log: Vec<ModelCommandRecord>,
+    /// Current modeled command count per drive bay.
+    pub drive_commands_in_flight: HashMap<u16, u32>,
+    /// Highest modeled command concurrency observed per drive bay.
+    pub max_drive_commands_in_flight: HashMap<u16, u32>,
     /// Barcode-keyed virtual tapes.
     pub tapes: HashMap<String, VirtualTape>,
     /// Storage slots in element-address order.
@@ -179,6 +185,9 @@ impl VirtualWorld {
         let mut drive_states = HashMap::new();
         drive_states.insert(bay, VirtualDriveState::default());
         Self {
+            command_log: Vec::new(),
+            drive_commands_in_flight: HashMap::new(),
+            max_drive_commands_in_flight: HashMap::new(),
             tapes: HashMap::new(),
             slots,
             drive_bays,
@@ -408,12 +417,43 @@ pub enum DeviceRole {
     },
 }
 
+/// One model-transport command issue, including its active timeout class.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelCommandRecord {
+    /// Virtual target that received the command.
+    pub role: DeviceRole,
+    /// CDB opcode, or zero when an empty invalid CDB was presented.
+    pub opcode: u8,
+    /// Timeout class most recently selected before this command.
+    pub timeout_class: TimeoutClass,
+}
+
+struct ModelCommandGuard {
+    world: SharedVirtualWorld,
+    bay: Option<u16>,
+}
+
+impl Drop for ModelCommandGuard {
+    fn drop(&mut self) {
+        let Some(bay) = self.bay else {
+            return;
+        };
+        let mut world = self.world.lock().expect("virtual world lock");
+        let count = world
+            .drive_commands_in_flight
+            .get_mut(&bay)
+            .expect("in-flight drive command was registered");
+        *count = count.checked_sub(1).expect("in-flight count underflow");
+    }
+}
+
 /// Stateful virtual SCSI transport for one changer or drive device.
 #[derive(Debug)]
 pub struct ModelTransport {
     world: SharedVirtualWorld,
     role: DeviceRole,
     position: u64,
+    timeout_class: TimeoutClass,
 }
 
 impl ModelTransport {
@@ -423,12 +463,43 @@ impl ModelTransport {
             world,
             role,
             position: 0,
+            timeout_class: TimeoutClass::Inquiry,
         }
     }
 
     /// Return the role this transport is serving.
     pub fn role(&self) -> DeviceRole {
         self.role
+    }
+
+    fn begin_command(&self, cdb: &[u8]) -> ModelCommandGuard {
+        let bay = match self.role {
+            DeviceRole::Changer => None,
+            DeviceRole::Drive { bay } => Some(bay),
+        };
+        {
+            let mut world = self.world.lock().expect("virtual world lock");
+            world.command_log.push(ModelCommandRecord {
+                role: self.role,
+                opcode: cdb.first().copied().unwrap_or(0),
+                timeout_class: self.timeout_class,
+            });
+            if let Some(bay) = bay {
+                let in_flight = world.drive_commands_in_flight.entry(bay).or_default();
+                *in_flight = in_flight.saturating_add(1);
+                assert_eq!(
+                    *in_flight, 1,
+                    "model transport observed more than one drive command in flight"
+                );
+                let observed = *in_flight;
+                let maximum = world.max_drive_commands_in_flight.entry(bay).or_default();
+                *maximum = (*maximum).max(observed);
+            }
+        }
+        ModelCommandGuard {
+            world: Arc::clone(&self.world),
+            bay,
+        }
     }
 
     fn drive_bay(&self) -> Result<u16, ScsiError> {
@@ -990,6 +1061,7 @@ impl ModelTransport {
 
 impl SgTransport for ModelTransport {
     fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+        let _command = self.begin_command(cdb);
         match cdb.first().copied() {
             Some(0x05) => self.read_block_limits(buf),
             Some(0x08) => self.read_6(cdb, buf),
@@ -1011,6 +1083,7 @@ impl SgTransport for ModelTransport {
     }
 
     fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
+        let _command = self.begin_command(cdb);
         match cdb.first().copied() {
             Some(0x00) => self.test_unit_ready(),
             Some(0x01) => {
@@ -1034,11 +1107,16 @@ impl SgTransport for ModelTransport {
     }
 
     fn execute_out(&mut self, cdb: &[u8], buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
+        let _command = self.begin_command(cdb);
         match cdb.first().copied() {
             Some(0x0a) => self.write_6(cdb, buf),
             Some(0x15) => self.mode_select(buf),
             _ => Err(ScsiError::InvalidInput("unsupported data-out CDB")),
         }
+    }
+
+    fn set_timeout_for(&mut self, class: TimeoutClass) {
+        self.timeout_class = class;
     }
 }
 
@@ -1558,6 +1636,40 @@ mod tests {
             .expect("fixed batched READ(6)");
         assert_eq!(read.bytes_transferred, 12);
         assert_eq!(&read_buf, batch.as_slice());
+    }
+
+    #[test]
+    fn model_records_timeout_class_per_command_and_asserts_single_in_flight() {
+        let mut world = VirtualWorld::single_drive("LIB-MODEL", 0x0100, "DRV-MODEL", 0x0400, 1);
+        world.put_tape_in_drive(0x0100, "TAPE001", Some(0x0400), VirtualTape::empty(1024, 4));
+        let world = Arc::new(Mutex::new(world));
+        let mut drive = ModelTransport::new(Arc::clone(&world), DeviceRole::Drive { bay: 0x0100 });
+        drive.set_timeout_for(TimeoutClass::TapeIo);
+        drive
+            .execute_out(&read_write::build_write_fixed_cdb(1), b"abcd")
+            .expect("model WRITE");
+        drive.set_timeout_for(TimeoutClass::TapeStatus);
+        let mut position = [0u8; 32];
+        drive
+            .execute_in(
+                &remanence_scsi::read_position::build_cdb_long(),
+                &mut position,
+            )
+            .expect("model READ POSITION");
+
+        let world = world.lock().expect("world");
+        assert_eq!(
+            world
+                .command_log
+                .iter()
+                .map(|record| (record.opcode, record.timeout_class))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x0a, TimeoutClass::TapeIo),
+                (0x34, TimeoutClass::TapeStatus),
+            ]
+        );
+        assert_eq!(world.max_drive_commands_in_flight.get(&0x0100), Some(&1));
     }
 
     #[test]

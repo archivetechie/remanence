@@ -531,6 +531,7 @@ mod tests {
                     counter_epoch: 42,
                     session_id: Uuid::from_u128(4).as_bytes().to_vec(),
                     active_alert_names: vec!["cleaning".to_string()],
+                    ..Default::default()
                 }],
                 slots: vec![pb::Slot {
                     element_address: 0x0200,

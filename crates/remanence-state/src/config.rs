@@ -292,6 +292,10 @@ impl Default for LiveStatusConfig {
 pub struct TapeIoConfig {
     /// Exact shipped single-record variable-mode behavior.
     pub legacy_single_block: bool,
+    /// Enable the write-side staging ring and hot submitter.
+    pub pipelined_submission: bool,
+    /// Number of page-aligned buffers in each active drive's staging ring.
+    pub staging_ring_buffers: u32,
     /// Requested fixed records per WRITE(6), before sg/HBA clamping.
     pub write_batch_blocks: u32,
     /// Requested fixed records per READ(6), before sg/HBA clamping.
@@ -305,6 +309,8 @@ impl Default for TapeIoConfig {
     fn default() -> Self {
         Self {
             legacy_single_block: false,
+            pipelined_submission: false,
+            staging_ring_buffers: remanence_library::DEFAULT_TAPE_IO_STAGING_RING_BUFFERS,
             write_batch_blocks: remanence_library::DEFAULT_TAPE_IO_BATCH_BLOCKS,
             read_batch_blocks: remanence_library::DEFAULT_TAPE_IO_BATCH_BLOCKS,
             position_check_bytes: remanence_library::DEFAULT_TAPE_IO_POSITION_CHECK_BYTES,
@@ -449,6 +455,16 @@ pub fn validate_config(config: &RemConfig) -> Result<(), StateError> {
         return Err(StateError::ConfigInvalid(
             "tape_io.read_batch_blocks must be non-zero".to_string(),
         ));
+    }
+    if !(remanence_library::MIN_TAPE_IO_STAGING_RING_BUFFERS
+        ..=remanence_library::MAX_TAPE_IO_STAGING_RING_BUFFERS)
+        .contains(&config.tape_io.staging_ring_buffers)
+    {
+        return Err(StateError::ConfigInvalid(format!(
+            "tape_io.staging_ring_buffers must be in {}..={}",
+            remanence_library::MIN_TAPE_IO_STAGING_RING_BUFFERS,
+            remanence_library::MAX_TAPE_IO_STAGING_RING_BUFFERS,
+        )));
     }
 
     let mut serials = HashSet::new();
@@ -1047,6 +1063,11 @@ client_ca = "/ca"
         assert!(config.tape_pools.is_empty());
         assert!(config.tape_pool_rules.is_empty());
         assert!(!config.tape_io.legacy_single_block);
+        assert!(!config.tape_io.pipelined_submission);
+        assert_eq!(
+            config.tape_io.staging_ring_buffers,
+            remanence_library::DEFAULT_TAPE_IO_STAGING_RING_BUFFERS
+        );
         assert_eq!(
             config.tape_io.write_batch_blocks,
             remanence_library::DEFAULT_TAPE_IO_BATCH_BLOCKS
@@ -1068,6 +1089,8 @@ client_ca = "/ca"
             r#"
 [tape_io]
 legacy_single_block = true
+pipelined_submission = true
+staging_ring_buffers = 8
 write_batch_blocks = 8
 read_batch_blocks = 6
 position_check_bytes = "16MiB"
@@ -1075,6 +1098,8 @@ position_check_bytes = "16MiB"
         );
         let config = parse_config_toml(&text).expect("valid tape_io config");
         assert!(config.tape_io.legacy_single_block);
+        assert!(config.tape_io.pipelined_submission);
+        assert_eq!(config.tape_io.staging_ring_buffers, 8);
         assert_eq!(config.tape_io.write_batch_blocks, 8);
         assert_eq!(config.tape_io.read_batch_blocks, 6);
         assert_eq!(config.tape_io.position_check_bytes, 16 * 1024 * 1024);
@@ -1098,6 +1123,15 @@ read_batch_blocks = 0
         );
         let err = parse_config_toml(&zero_read).expect_err("zero read batch rejects");
         assert!(err.to_string().contains("read_batch_blocks"), "{err}");
+
+        for invalid_ring in [0, 1, 17] {
+            let mut invalid = valid_config();
+            invalid.push_str(&format!(
+                "\n[tape_io]\nstaging_ring_buffers = {invalid_ring}\n"
+            ));
+            let err = parse_config_toml(&invalid).expect_err("invalid ring depth rejects");
+            assert!(err.to_string().contains("staging_ring_buffers"), "{err}");
+        }
     }
 
     #[test]

@@ -103,6 +103,17 @@ pub(crate) fn project_drive(
         counter_epoch: 0,
         session_id: Vec::new(),
         active_alert_names: Vec::new(),
+        tape_io_pipelined_submission: false,
+        tape_io_staging_ring_buffers: 0,
+        tape_io_effective_batch_blocks: 0,
+        tape_io_gap_p50_us: 0,
+        tape_io_gap_p95_us: 0,
+        tape_io_gap_max_us: 0,
+        tape_io_ioctl_p50_us: 0,
+        tape_io_ioctl_p95_us: 0,
+        tape_io_ioctl_max_us: 0,
+        tape_io_cadence_us: 0,
+        tape_io_effective_feed_bytes_per_second: 0,
     }
 }
 
@@ -1590,6 +1601,16 @@ mod tests {
         state.index_path = Arc::new(index.path().to_path_buf());
         state.record_drive_read_bytes(Some(drive_uuid.as_slice()), 1_024);
         state.record_drive_write_bytes(Some(drive_uuid.as_slice()), 2_048);
+        let counters = state.drive_counters(drive_uuid.as_slice());
+        counters.configure_tape_io(true, 4, 16);
+        counters.record_tape_io_diagnostics(remanence_library::PipelinedWriteDiagnostics {
+            gap_p50_us: 100,
+            gap_p95_us: 250,
+            gap_max_us: 400,
+            cadence_us: 1_100,
+            effective_feed_bytes_per_second: 300_000_000,
+            ..Default::default()
+        });
 
         let response = state
             .library_service()
@@ -1611,6 +1632,12 @@ mod tests {
         assert_eq!(drive.status, pb::drive::Status::DriveStatusCleaning as i32);
         assert_eq!(drive.active_alert_names, vec!["cleaning".to_string()]);
         assert_ne!(drive.counter_epoch, 0);
+        assert!(drive.tape_io_pipelined_submission);
+        assert_eq!(drive.tape_io_staging_ring_buffers, 4);
+        assert_eq!(drive.tape_io_effective_batch_blocks, 16);
+        assert_eq!(drive.tape_io_gap_p95_us, 250);
+        assert_eq!(drive.tape_io_cadence_us, 1_100);
+        assert_eq!(drive.tape_io_effective_feed_bytes_per_second, 300_000_000);
     }
 
     #[tokio::test]
