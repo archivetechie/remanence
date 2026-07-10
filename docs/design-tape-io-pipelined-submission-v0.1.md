@@ -1,16 +1,21 @@
-# Tape I/O pipelined submission (TIO-5) — staging ring, hot submitter, in-place accounting — Design v0.6
+# Tape I/O pipelined submission (TIO-5) — staging ring, hot submitter, in-place accounting — Design v0.7
 
-**Status:** **FROZEN v0.6** (2026-07-10) — v0.6 = OWNER DECISION (the owner,
+**Status:** **FROZEN v0.7** (2026-07-10) — v0.6 = OWNER DECISION (the owner,
 post-diff-gate): the `pipelined_submission` runtime backout flag is
 **REMOVED**. Rationale: nothing is in production — git revert + the
 previous binary IS the backout; the flag's dual-path requirement directly
 created defect surface (diff-gate findings 1/5/7/9/10 all trace to it) and
-a permanent drift liability. Consequences: the pipelined path is THE
-batched path; the TIO-3/4 non-pipelined batched path and its
-StagedBlockSink are DELETED; `legacy_single_block` remains the single
-in-binary fallback (it is the only physically-validated path today) and
-its own removal is queued for after the pipelined path passes physical
-acceptance (§8); the two-tier ON/OFF equivalence machinery is replaced by
+a permanent drift liability. **v0.7 same day (owner veto):**
+`legacy_single_block` is deleted TOO — the owner: it gives nothing the field
+kit's previous binary doesn't, and the code changes again after the next
+physical round regardless. There is exactly ONE tape I/O path. The
+"NOT in production" rule is now standing policy (memory
+`not-in-production`): no runtime backout/compat switches of any kind
+pre-production; git revert + previous binary is the backout.
+Consequences: the pipelined path is THE
+batched path; the TIO-3/4 non-pipelined batched path, its
+StagedBlockSink, AND the legacy serial mode plumbing are DELETED;
+the two-tier ON/OFF equivalence machinery is replaced by
 **golden fixtures captured from main** (command stream + timeout classes)
 plus the existing cross-version stored-image tests as the on-tape
 compatibility proof. §§6.2/7/9/10 amended accordingly.
@@ -371,16 +376,15 @@ staging_ring_buffers = 4       # validated 2..=16; checked allocation;
                                # effective per-drive ring bytes logged
 ```
 
-**No runtime pipelining flag (owner decision, v0.6).** The pipelined path
-is the batched path. Backout, pre-production, is git revert + redeploying
-the previous binary (the remfield kit can carry both binaries for
-physical-window A/B if wanted). `legacy_single_block` remains the single
-in-binary fallback — it is the only path validated on physical hardware
-today — and is queued for deletion once the pipelined path passes the §8
-physical acceptance. The **effective mode (legacy vs pipelined) is exposed
-in live status/diag**. Memory: ring × effective batch bytes per active
-drive (4 MiB at the current 1 MiB grant; 16 MiB if the grant reaches
-4 MiB).
+**No mode switches at all (owner decisions, v0.6 + v0.7).** The pipelined
+path is THE tape I/O path — `pipelined_submission` and
+`legacy_single_block` are both deleted, along with their mode plumbing.
+Backout, pre-production, is git revert + redeploying the previous binary
+(the remfield kit carries the prior binary for physical-window A/B).
+"Old behavior" lives on only as golden fixtures and cross-version
+stored-image tests, never as shipped alternate paths. Memory: ring ×
+effective batch bytes per active drive (4 MiB at the current 1 MiB grant;
+16 MiB if the grant reaches 4 MiB).
 
 ## 8. Instrumentation (the field-verifiable mechanism)
 
@@ -491,9 +495,10 @@ Hermetic (model transport / chaos):
   enumerates, evidences, removes, re-accounts tmpfs budget before accepting
   writes; foreign files untouched;
 - crash table rows (§6) via chaos kill injection;
-- config (v0.6): `legacy_single_block=true` still reproduces the original
-  serial stream exactly; ring-bounds validation; effective mode (legacy vs
-  pipelined) visible in status.
+- config (v0.7): `staging_ring_buffers` bounds validation; the deleted
+  mode keys (`pipelined_submission`, `legacy_single_block`) are REJECTED
+  by config parsing with a message naming the removal (a stale config
+  must fail loudly, not silently change meaning).
 - Scenario: extend `scenario-append` `covers` with `rem.tape.pipelined_io`;
   full `~/system` suite green from clean slate.
 
@@ -513,8 +518,7 @@ Hermetic (model transport / chaos):
    v0.5 (F1 reset-UA class, F2 recovered-error class, F3 900 s timeouts,
    F4 ILI cursor invalidation); 15 oracle items feed the st-parity
    program's executable-oracle leg; 12 cruft items documented-discarded.
-4. Physical validation next window per §8 (acceptance also triggers the
-   queued `legacy_single_block` removal decision); then **A7 streaming
+4. Physical validation next window per §8; then **A7 streaming
    ingest** (now the
    named dual-drive-at-rate unlock — it deletes the spool and its RAM
    budget) and A1 lazy dismount take over the remaining end-to-end wall.

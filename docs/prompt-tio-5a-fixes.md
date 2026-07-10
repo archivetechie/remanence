@@ -10,18 +10,23 @@ changed after the code on this branch was written) and
 causes. Every correctness fix ships a regression test reproducing its
 failure scenario.
 
-## Fix 0 — remove the runtime flag; one batched path (design v0.6)
+## Fix 0 — remove ALL mode switches; exactly one tape I/O path (design v0.6+v0.7)
 
-Delete `tape_io.pipelined_submission` (config key, plumbing, effective-mode
-branching). The pipelined path IS the batched path:
+Delete `tape_io.pipelined_submission` AND `tape_io.legacy_single_block`
+(config keys, plumbing, every mode branch). The pipelined path IS the tape
+I/O path:
 
 - Delete the non-pipelined batched transfer path and its machinery
-  (`StagedBlockSink` and friends) — `legacy_single_block` remains the only
-  in-binary fallback and must still reproduce the original serial
-  per-block stream exactly (existing tests keep proving it).
+  (`StagedBlockSink` and friends) AND the legacy serial single-block mode
+  plumbing (the variable-mode per-block-RP branch). Single-record
+  *operations* used by identity/readiness probes stay — what dies is the
+  legacy *mode*, not the ability to read one block.
+- Config parsing REJECTS the two removed keys with a message naming the
+  removal — a stale config must fail loudly, never silently change
+  meaning.
 - `PipelinedStagedBlockSink` (rename appropriately) is now the only
-  batched sink — this subsumes diff-gate finding 9 (the near-verbatim
-  copies die with the old sink).
+  sink — this subsumes diff-gate finding 9 (the near-verbatim copies die
+  with the old sink).
 - Replace the ON/OFF equivalence tests with **golden fixtures captured
   from main** (design §6.2 v0.6): check in the canonical write/read
   command-stream + timeout-class fixtures generated from main
@@ -30,7 +35,8 @@ branching). The pipelined path IS the batched path:
   them), and assert the pipelined path reproduces them modulo the named
   designed deltas (900 s timeout values). Cross-version stored-image
   tests stay.
-- Effective mode in status/diag simplifies to legacy vs pipelined.
+- Status/diag drops the mode field entirely (one path); keep the ring and
+  cadence diag.
 
 ## Correctness fixes (all mandatory)
 
@@ -103,11 +109,11 @@ branching). The pipelined path IS the batched path:
 
 ## Structural invariants (binding)
 
-- **Single safety funnel, by construction:** after Fix 0 there is one
-  batched path; every error class terminates in the one fence-recording
-  funnel. Acceptance is grep-level: no safety call site conditioned on
-  any mode flag; `record_tape_io_fence*` reachable from exactly one
-  funnel.
+- **Single safety funnel, by construction:** after Fix 0 there is exactly
+  ONE tape I/O path; every error class terminates in the one
+  fence-recording funnel. Acceptance is grep-level: no mode flags exist;
+  no safety call site is conditioned on any mode; `record_tape_io_fence*`
+  reachable from exactly one funnel.
 - **Golden-baseline fixtures** are generated from main, never from this
   branch's own behavior.
 - **Wrap, don't copy:** a near-verbatim copy of an existing helper is a
