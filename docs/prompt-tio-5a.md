@@ -1,6 +1,6 @@
 # Prompt TIO-5a — pipelined submission, write side (staging ring + hot submitter + in-place accounting)
 
-**Status:** pending (cut 2026-07-10 from FROZEN design v0.4).
+**Status:** pending (cut 2026-07-10 from FROZEN design v0.5, st-harvest folded).
 **Normative source — read first and treat as binding:**
 `docs/design-tape-io-pipelined-submission-v0.1.md` (v0.5). Where this prompt
 and the design disagree, the design wins. Frozen constraints it inherits:
