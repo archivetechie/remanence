@@ -76,6 +76,17 @@ Same frozen constraints as TIO-5a.
 - read diag fields present and consistent (phase sum ≈ wall; cadence
   histogram populated) in hermetic runs.
 
+## Structural invariants (learned from the TIO-5a diff gate — binding)
+
+- **Single safety funnel:** read-path pipelining must terminate every
+  error class in the SAME fence/fail-closed machinery as the
+  non-pipelined path — no safety call site gated on the pipelining flag.
+- **Golden-baseline equivalence:** OFF-vs-shipped assertions use fixtures
+  captured from main before your changes, not this branch's own OFF mode.
+- **Wrap, don't copy:** reuse means calling the existing helper, not
+  duplicating its body. A near-verbatim copy is a defect even with green
+  tests.
+
 ## Definition of done (AGENTS.md applies)
 
 Same bar as TIO-5a (workspace tests green, clippy clean, socket tests run —
