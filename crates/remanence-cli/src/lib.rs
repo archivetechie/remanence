@@ -4806,7 +4806,6 @@ fn drive_live_json(drive: &pb::Drive) -> Value {
         },
         "active_alert_names": drive.active_alert_names,
         "tape_io": {
-            "pipelined_submission": drive.tape_io_pipelined_submission,
             "staging_ring_buffers": drive.tape_io_staging_ring_buffers,
             "effective_batch_blocks": drive.tape_io_effective_batch_blocks,
             "gap_p50_us": drive.tape_io_gap_p50_us,
@@ -4901,14 +4900,13 @@ fn print_live_status_text(
             };
             let _ = writeln!(
                 out,
-                "  bay {bay:04x} serial={serial} tape={tape} state={state} read={read} write={write} epoch={epoch} pipeline={pipeline} ring={ring} gap_p95_us={gap_p95} feed_Bps={feed}",
+                "  bay {bay:04x} serial={serial} tape={tape} state={state} read={read} write={write} epoch={epoch} ring={ring} gap_p95_us={gap_p95} feed_Bps={feed}",
                 bay = drive.element_address,
                 serial = drive.drive_serial,
                 state = drive_status_name(drive.status),
                 read = drive.lifetime_read_bytes,
                 write = drive.lifetime_write_bytes,
                 epoch = drive.counter_epoch,
-                pipeline = drive.tape_io_pipelined_submission,
                 ring = drive.tape_io_staging_ring_buffers,
                 gap_p95 = drive.tape_io_gap_p95_us,
                 feed = drive.tape_io_effective_feed_bytes_per_second,
@@ -13732,7 +13730,6 @@ mod tests {
                     counter_epoch: 42,
                     session_id: Uuid::from_u128(4).as_bytes().to_vec(),
                     active_alert_names: vec!["cleaning".to_string()],
-                    tape_io_pipelined_submission: true,
                     tape_io_staging_ring_buffers: 4,
                     tape_io_effective_batch_blocks: 16,
                     tape_io_gap_p95_us: 250,
@@ -13792,10 +13789,9 @@ mod tests {
             value["data"]["libraries"][0]["drives"][0]["status"],
             "cleaning"
         );
-        assert_eq!(
-            value["data"]["libraries"][0]["drives"][0]["tape_io"]["pipelined_submission"],
-            true
-        );
+        assert!(value["data"]["libraries"][0]["drives"][0]["tape_io"]
+            .get("pipelined_submission")
+            .is_none());
         assert_eq!(
             value["data"]["libraries"][0]["drives"][0]["tape_io"]["gap_p95_us"],
             250

@@ -158,11 +158,6 @@ struct PendingPipelineAudit {
 /// Runtime tape-I/O settings applied when a drive handle is opened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TapeIoRuntimeConfig {
-    /// Exact legacy behavior: variable-mode single-record I/O and per-block
-    /// write-side READ POSITION.
-    pub legacy_single_block: bool,
-    /// Enable the write-side page-aligned staging ring and hot submitter.
-    pub pipelined_submission: bool,
     /// Number of buffers in the write-side staging ring.
     pub staging_ring_buffers: u32,
     /// Requested fixed records per WRITE(6) before sg/HBA clamping.
@@ -177,8 +172,6 @@ pub struct TapeIoRuntimeConfig {
 impl Default for TapeIoRuntimeConfig {
     fn default() -> Self {
         Self {
-            legacy_single_block: false,
-            pipelined_submission: false,
             staging_ring_buffers: DEFAULT_TAPE_IO_STAGING_RING_BUFFERS,
             write_batch_blocks: DEFAULT_TAPE_IO_BATCH_BLOCKS,
             read_batch_blocks: DEFAULT_TAPE_IO_BATCH_BLOCKS,
@@ -1042,8 +1035,6 @@ impl LibraryHandle {
             expected_position: None,
             bytes_since_position_check: 0,
             position_check_bytes: tape_io.position_check_bytes,
-            legacy_single_block: tape_io.legacy_single_block,
-            pipelined_submission: tape_io.pipelined_submission && !tape_io.legacy_single_block,
             staging_ring_buffers: tape_io.staging_ring_buffers,
             requested_write_batch_blocks: tape_io.write_batch_blocks.max(1),
             requested_read_batch_blocks: tape_io.read_batch_blocks.max(1),
@@ -1051,7 +1042,7 @@ impl LibraryHandle {
             effective_read_batch_blocks,
             sg_reserved_size_bytes,
             pipeline_diagnostics: PipelineDiagnostics::default(),
-            pending_pipeline_audit: None,
+            pending_pipeline_audits: Vec::new(),
             validated_fixed_block_size: None,
             mode_reverification_required: None,
             shared: self.changer.shared.clone(),
@@ -1573,10 +1564,6 @@ pub struct DriveHandle {
     /// Tripwire cadence for arithmetic cursor checks. Zero disables
     /// mid-stream checks.
     position_check_bytes: u64,
-    /// Exact legacy variable-mode single-block behavior switch.
-    legacy_single_block: bool,
-    /// Effective write-side submission mode, after the legacy override.
-    pipelined_submission: bool,
     /// Fixed page-aligned write-buffer ring depth.
     staging_ring_buffers: u32,
     /// Configured write batch in fixed records before sg/HBA clamp.
@@ -1592,7 +1579,7 @@ pub struct DriveHandle {
     /// Allocation-free hot-submitter counters and fixed histograms.
     pipeline_diagnostics: PipelineDiagnostics,
     /// Safety-relevant completion audit held until its fence is durable.
-    pending_pipeline_audit: Option<PendingPipelineAudit>,
+    pending_pipeline_audits: Vec<PendingPipelineAudit>,
     /// Fixed block size most recently applied or reverified for this open.
     validated_fixed_block_size: Option<u32>,
     /// Tape-sourced fixed block size that must be MODE SENSE reverified after UA.
@@ -1616,8 +1603,6 @@ impl std::fmt::Debug for DriveHandle {
             )
             .field("position_known", &self.position_known)
             .field("expected_position", &self.expected_position)
-            .field("legacy_single_block", &self.legacy_single_block)
-            .field("pipelined_submission", &self.pipelined_submission)
             .field("staging_ring_buffers", &self.staging_ring_buffers)
             .field(
                 "effective_write_batch_blocks",
@@ -1677,26 +1662,9 @@ impl DriveHandle {
         self.effective_read_batch_blocks
     }
 
-    /// True when callers should preserve legacy single-record behavior.
-    pub fn legacy_single_block(&self) -> bool {
-        self.legacy_single_block
-    }
-
-    /// Effective write-side pipeline mode after the legacy override.
-    pub fn pipelined_submission(&self) -> bool {
-        self.pipelined_submission && !self.legacy_single_block
-    }
-
     /// Fixed staging-ring depth snapshotted at drive open.
     pub fn staging_ring_buffers(&self) -> u32 {
         self.staging_ring_buffers
-    }
-
-    /// Force the handle back to legacy single-record behavior for this open
-    /// session. Used when a read-side fixed-mode setup cannot be established
-    /// from the tape's own catalog/bootstrap geometry.
-    pub fn set_legacy_single_block(&mut self, legacy_single_block: bool) {
-        self.legacy_single_block = legacy_single_block;
     }
 
     /// Configured drift tripwire cadence in bytes.

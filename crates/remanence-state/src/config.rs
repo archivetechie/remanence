@@ -290,10 +290,6 @@ impl Default for LiveStatusConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct TapeIoConfig {
-    /// Exact shipped single-record variable-mode behavior.
-    pub legacy_single_block: bool,
-    /// Enable the write-side staging ring and hot submitter.
-    pub pipelined_submission: bool,
     /// Number of page-aligned buffers in each active drive's staging ring.
     pub staging_ring_buffers: u32,
     /// Requested fixed records per WRITE(6), before sg/HBA clamping.
@@ -308,8 +304,6 @@ pub struct TapeIoConfig {
 impl Default for TapeIoConfig {
     fn default() -> Self {
         Self {
-            legacy_single_block: false,
-            pipelined_submission: false,
             staging_ring_buffers: remanence_library::DEFAULT_TAPE_IO_STAGING_RING_BUFFERS,
             write_batch_blocks: remanence_library::DEFAULT_TAPE_IO_BATCH_BLOCKS,
             read_batch_blocks: remanence_library::DEFAULT_TAPE_IO_BATCH_BLOCKS,
@@ -393,6 +387,17 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<RemConfig, StateError> {
 
 /// Parse and validate a TOML configuration string.
 pub fn parse_config_toml(text: &str) -> Result<RemConfig, StateError> {
+    let document: toml::Value =
+        toml::from_str(text).map_err(|err| StateError::ConfigInvalid(err.to_string()))?;
+    if let Some(tape_io) = document.get("tape_io").and_then(toml::Value::as_table) {
+        for removed in ["pipelined_submission", "legacy_single_block"] {
+            if tape_io.contains_key(removed) {
+                return Err(StateError::ConfigInvalid(format!(
+                    "tape_io.{removed} was removed; the pipelined fixed-block path is now the only tape I/O path"
+                )));
+            }
+        }
+    }
     let config: RemConfig =
         toml::from_str(text).map_err(|err| StateError::ConfigInvalid(err.to_string()))?;
     validate_config(&config)?;
@@ -1062,8 +1067,6 @@ client_ca = "/ca"
         assert_eq!(config.daemon.spool_tmpfs_ram_budget, None);
         assert!(config.tape_pools.is_empty());
         assert!(config.tape_pool_rules.is_empty());
-        assert!(!config.tape_io.legacy_single_block);
-        assert!(!config.tape_io.pipelined_submission);
         assert_eq!(
             config.tape_io.staging_ring_buffers,
             remanence_library::DEFAULT_TAPE_IO_STAGING_RING_BUFFERS
@@ -1088,8 +1091,6 @@ client_ca = "/ca"
         text.push_str(
             r#"
 [tape_io]
-legacy_single_block = true
-pipelined_submission = true
 staging_ring_buffers = 8
 write_batch_blocks = 8
 read_batch_blocks = 6
@@ -1097,8 +1098,6 @@ position_check_bytes = "16MiB"
 "#,
         );
         let config = parse_config_toml(&text).expect("valid tape_io config");
-        assert!(config.tape_io.legacy_single_block);
-        assert!(config.tape_io.pipelined_submission);
         assert_eq!(config.tape_io.staging_ring_buffers, 8);
         assert_eq!(config.tape_io.write_batch_blocks, 8);
         assert_eq!(config.tape_io.read_batch_blocks, 6);
@@ -1131,6 +1130,19 @@ read_batch_blocks = 0
             ));
             let err = parse_config_toml(&invalid).expect_err("invalid ring depth rejects");
             assert!(err.to_string().contains("staging_ring_buffers"), "{err}");
+        }
+    }
+
+    #[test]
+    fn tape_io_removed_mode_keys_fail_with_migration_message() {
+        for removed in ["pipelined_submission", "legacy_single_block"] {
+            let mut text = valid_config();
+            text.push_str(&format!("\n[tape_io]\n{removed} = true\n"));
+            let err = parse_config_toml(&text).expect_err("removed mode key must reject");
+            let message = err.to_string();
+            assert!(message.contains(&format!("tape_io.{removed}")), "{message}");
+            assert!(message.contains("was removed"), "{message}");
+            assert!(message.contains("only tape I/O path"), "{message}");
         }
     }
 

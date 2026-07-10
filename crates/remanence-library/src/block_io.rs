@@ -132,16 +132,6 @@ pub trait BlockSink {
         self.write_batch_blocks(1)
     }
 
-    /// True when callers should preserve legacy single-block behavior.
-    fn legacy_single_block(&self) -> bool {
-        self.write_batch_blocks(1) <= 1
-    }
-
-    /// Effective write-side staging-ring mode for this open drive.
-    fn pipelined_submission(&self) -> bool {
-        false
-    }
-
     /// Number of buffers in the fixed staging ring.
     fn staging_ring_buffers(&self) -> u32 {
         crate::DEFAULT_TAPE_IO_STAGING_RING_BUFFERS
@@ -214,8 +204,18 @@ pub trait BlockSink {
         ))
     }
 
+    /// Pipeline-ordered SPACE(EOD), with safety audit completion deferred.
+    fn space_to_end_of_data_pipelined(&mut self) -> Result<TapePosition, TapeIoError> {
+        self.space_to_end_of_data()
+    }
+
     /// Current tape position via READ POSITION long-form.
     fn position(&mut self) -> Result<TapePosition, TapeIoError>;
+
+    /// Pipeline-ordered READ POSITION, with safety audit completion deferred.
+    fn position_pipelined(&mut self) -> Result<TapePosition, TapeIoError> {
+        self.position()
+    }
 }
 
 // =====================================================================
@@ -290,11 +290,6 @@ pub trait BlockSource {
         1
     }
 
-    /// True when callers should preserve legacy single-block behavior.
-    fn legacy_single_block(&self) -> bool {
-        self.read_batch_blocks(1) <= 1
-    }
-
     /// LOCATE to the given LBA.
     fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError>;
 
@@ -343,30 +338,16 @@ impl BlockSink for DriveHandleSink<'_> {
             .write_block_batch_pipelined(buf, block_size_bytes, cdb)
     }
     fn write_batch_blocks(&self, block_size_bytes: u32) -> u32 {
-        if self.0.legacy_single_block() {
-            1
-        } else {
-            self.0.effective_write_batch_blocks().max(1).min(
-                self.0
-                    .sg_reserved_size_bytes()
-                    .checked_div(block_size_bytes.max(1))
-                    .unwrap_or(1)
-                    .max(1),
-            )
-        }
+        self.0.effective_write_batch_blocks().max(1).min(
+            self.0
+                .sg_reserved_size_bytes()
+                .checked_div(block_size_bytes.max(1))
+                .unwrap_or(1)
+                .max(1),
+        )
     }
     fn requested_write_batch_blocks(&self) -> u32 {
-        if self.0.legacy_single_block() {
-            1
-        } else {
-            self.0.requested_write_batch_blocks()
-        }
-    }
-    fn legacy_single_block(&self) -> bool {
-        self.0.legacy_single_block()
-    }
-    fn pipelined_submission(&self) -> bool {
-        self.0.pipelined_submission()
+        self.0.requested_write_batch_blocks()
     }
     fn staging_ring_buffers(&self) -> u32 {
         self.0.staging_ring_buffers()
@@ -435,8 +416,17 @@ impl BlockSink for DriveHandleSink<'_> {
     fn space_to_end_of_data(&mut self) -> Result<TapePosition, TapeIoError> {
         Ok(self.0.space(0, SpaceKind::EndOfData)?.position_after)
     }
+    fn space_to_end_of_data_pipelined(&mut self) -> Result<TapePosition, TapeIoError> {
+        Ok(self
+            .0
+            .space_pipelined(0, SpaceKind::EndOfData)?
+            .position_after)
+    }
     fn position(&mut self) -> Result<TapePosition, TapeIoError> {
         self.0.position()
+    }
+    fn position_pipelined(&mut self) -> Result<TapePosition, TapeIoError> {
+        self.0.position_pipelined()
     }
 }
 
@@ -464,20 +454,13 @@ impl BlockSource for DriveHandleSource<'_> {
         )
     }
     fn read_batch_blocks(&self, block_size_bytes: u32) -> u32 {
-        if self.0.legacy_single_block() {
-            1
-        } else {
-            self.0.effective_read_batch_blocks().max(1).min(
-                self.0
-                    .sg_reserved_size_bytes()
-                    .checked_div(block_size_bytes.max(1))
-                    .unwrap_or(1)
-                    .max(1),
-            )
-        }
-    }
-    fn legacy_single_block(&self) -> bool {
-        self.0.legacy_single_block()
+        self.0.effective_read_batch_blocks().max(1).min(
+            self.0
+                .sg_reserved_size_bytes()
+                .checked_div(block_size_bytes.max(1))
+                .unwrap_or(1)
+                .max(1),
+        )
     }
     fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
         self.0.locate(lba)
@@ -954,7 +937,6 @@ pub struct VecBlockSource {
     /// `locate`, adjusted by `space`.
     cursor: u64,
     read_batch_blocks: u32,
-    legacy_single_block: bool,
 }
 
 impl Default for VecBlockSource {
@@ -1012,7 +994,6 @@ impl VecBlockSource {
             calls: Vec::new(),
             cursor: 0,
             read_batch_blocks: 1,
-            legacy_single_block: false,
         }
     }
 
@@ -1024,12 +1005,6 @@ impl VecBlockSource {
             "VecBlockSource read batch size must be nonzero"
         );
         self.read_batch_blocks = read_batch_blocks;
-        self
-    }
-
-    /// Test helper that makes `legacy_single_block` report true.
-    pub fn with_legacy_single_block_for_test(mut self) -> Self {
-        self.legacy_single_block = true;
         self
     }
 
@@ -1166,10 +1141,6 @@ impl BlockSource for VecBlockSource {
 
     fn read_batch_blocks(&self, _block_size_bytes: u32) -> u32 {
         self.read_batch_blocks
-    }
-
-    fn legacy_single_block(&self) -> bool {
-        self.legacy_single_block
     }
 
     fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {

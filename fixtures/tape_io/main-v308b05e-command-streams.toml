@@ -1,0 +1,52 @@
+# Generated from main commit 308b05e by instrumenting RecordingTransport in
+# an extracted `git archive` and running the two named source tests below.
+schema = "remanence.tape-io-main-command-stream.v1"
+source_ref = "main"
+source_commit = "308b05e"
+generated_utc = "2026-07-10"
+
+[designed_deltas]
+tape_io_timeout_ms = { main = 60000, current = 900000, design = "TIO-5 F3" }
+write_filemarks_timeout_ms = { main = 120000, current = 900000, design = "TIO-5 F3" }
+
+[write]
+source_test = "temporary handle::tests::fixture_gen_canonical_write_with_filemark on main archive"
+
+[[write.commands]]
+cdb = [52, 6, 0, 0, 0, 0, 0, 0, 0, 0]
+timeout_class = "TapeStatus"
+main_timeout_ms = 5000
+current_timeout_ms = 5000
+
+[[write.commands]]
+cdb = [10, 1, 0, 0, 4, 0]
+timeout_class = "TapeIo"
+main_timeout_ms = 60000
+current_timeout_ms = 900000
+
+[[write.commands]]
+cdb = [16, 0, 0, 0, 1, 0]
+timeout_class = "WriteFilemarks"
+main_timeout_ms = 120000
+current_timeout_ms = 900000
+
+[[write.commands]]
+cdb = [52, 6, 0, 0, 0, 0, 0, 0, 0, 0]
+timeout_class = "TapeStatus"
+main_timeout_ms = 5000
+current_timeout_ms = 5000
+
+[read]
+source_test = "handle::tests::drive_handle_read_block_batch_clamps_to_file_remaining_and_filemark_adds_one"
+
+[[read.commands]]
+cdb = [52, 6, 0, 0, 0, 0, 0, 0, 0, 0]
+timeout_class = "TapeStatus"
+main_timeout_ms = 5000
+current_timeout_ms = 5000
+
+[[read.commands]]
+cdb = [8, 1, 0, 0, 4, 0]
+timeout_class = "TapeIo"
+main_timeout_ms = 60000
+current_timeout_ms = 900000

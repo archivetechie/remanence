@@ -1329,7 +1329,6 @@ parts.extend([
     "foreign_poll_lease = \"5m\"",
     "",
     "[tape_io]",
-    "legacy_single_block = false",
     f"write_batch_blocks = {write_batch_blocks}",
     f"read_batch_blocks = {read_batch_blocks}",
     f'position_check_bytes = "{position_check_bytes}"',

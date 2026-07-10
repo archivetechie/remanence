@@ -57,7 +57,6 @@ use crate::pool_selection::{
 use crate::{append_mode_for_tape_file_number, bytes_to_hex, pb, timestamp_from_rfc3339};
 
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
-const STAGED_TRANSFER_CHANNEL_DEPTH: usize = 2;
 const VERIFY_BOOTSTRAP_READ_BYTES: usize = 1024 * 1024;
 
 /// Binary UUID used for physical tape identifiers and object identifiers.
@@ -539,6 +538,16 @@ pub enum PoolWriteError {
     /// Block sink I/O failed outside the parity wrapper.
     #[error(transparent)]
     TapeIo(#[from] TapeIoError),
+    /// A transfer's primary failure survived a secondary safety/plumbing failure.
+    #[error("{primary}; secondary {context}: {secondary}")]
+    TransferWithSecondary {
+        /// The device or producer failure that caused the transfer to stop.
+        primary: String,
+        /// The secondary operation that also failed.
+        context: &'static str,
+        /// The secondary failure detail.
+        secondary: String,
+    },
     /// Timestamp formatting failed.
     #[error("format timestamp: {0}")]
     TimeFormat(#[from] time::error::Format),
@@ -1137,11 +1146,9 @@ struct BlockSinkStats {
     filemarks: u64,
     position_calls: u64,
     early_warning: bool,
-    legacy_single_block: bool,
     write_batch_blocks: u32,
     effective_batch_blocks: u32,
     position_check_bytes: u64,
-    pipelined_submission: bool,
     staging_ring_buffers: u32,
     gap_p50_us: u64,
     gap_p95_us: u64,
@@ -1195,66 +1202,25 @@ struct ObjectDigestBlockSink<'a, S: BlockSink + ?Sized> {
     hasher: Sha256,
 }
 
-struct StagedBlockSink {
-    tx: std_mpsc::SyncSender<StagedSinkCommand>,
-    poison: Arc<Mutex<Option<String>>>,
-    caps: StagedSinkCaps,
-    buffer: Vec<u8>,
-    cursor: Option<TapePosition>,
-}
-
 #[derive(Clone, Copy)]
 struct StagedSinkCaps {
     block_size: usize,
     batch_blocks: u32,
     requested_write_batch_blocks: u32,
-    legacy_single_block: bool,
     position_check_bytes: u64,
 }
 
 impl StagedSinkCaps {
     fn from_inner<S: BlockSink + ?Sized>(inner: &S, block_size: usize) -> Self {
         let block_size_u32 = u32::try_from(block_size).unwrap_or(u32::MAX);
-        let legacy_single_block = inner.legacy_single_block();
-        let batch_blocks = if legacy_single_block {
-            1
-        } else {
-            inner.write_batch_blocks(block_size_u32).max(1)
-        };
+        let batch_blocks = inner.write_batch_blocks(block_size_u32).max(1);
         Self {
             block_size,
             batch_blocks,
             requested_write_batch_blocks: inner.requested_write_batch_blocks().max(1),
-            legacy_single_block,
             position_check_bytes: inner.position_check_bytes(),
         }
     }
-}
-
-enum StagedSinkCommand {
-    WriteBlock {
-        data: Vec<u8>,
-        reply: std_mpsc::Sender<Result<WriteOutcome, String>>,
-    },
-    WriteBatch {
-        data: Vec<u8>,
-        block_size_bytes: u32,
-    },
-    WriteBatchSync {
-        data: Vec<u8>,
-        block_size_bytes: u32,
-        reply: std_mpsc::Sender<Result<WriteBatchOutcome, String>>,
-    },
-    WriteFilemarks {
-        count: u32,
-        reply: std_mpsc::Sender<Result<WriteFilemarksOutcome, String>>,
-    },
-    SpaceToEndOfData {
-        reply: std_mpsc::Sender<Result<TapePosition, String>>,
-    },
-    Position {
-        reply: std_mpsc::Sender<Result<TapePosition, String>>,
-    },
 }
 
 const MAX_PIPELINE_WINDOW_BUFFERS: usize =
@@ -1416,9 +1382,10 @@ enum PipelinedSinkCommand {
     },
 }
 
-struct PipelinedStagedBlockSink {
+struct StagedBlockSink {
     tx: std_mpsc::SyncSender<PipelinedSinkCommand>,
     free_rx: std_mpsc::Receiver<PageAlignedBuffer>,
+    submitter_done_rx: std_mpsc::Receiver<()>,
     poison: Arc<Mutex<Option<String>>>,
     caps: StagedSinkCaps,
     ring_buffers: usize,
@@ -1440,138 +1407,6 @@ impl<'a, S: BlockSink + ?Sized> ObjectDigestBlockSink<'a, S> {
         let mut out = [0u8; 32];
         out.copy_from_slice(&digest);
         out
-    }
-}
-
-impl StagedBlockSink {
-    fn new(
-        tx: std_mpsc::SyncSender<StagedSinkCommand>,
-        poison: Arc<Mutex<Option<String>>>,
-        caps: StagedSinkCaps,
-    ) -> Self {
-        let capacity = caps.block_size.saturating_mul(caps.batch_blocks as usize);
-        Self {
-            tx,
-            poison,
-            caps,
-            buffer: Vec::with_capacity(capacity),
-            cursor: None,
-        }
-    }
-
-    fn enabled(&self) -> bool {
-        self.caps.batch_blocks > 1
-    }
-
-    fn pending_records(&self) -> u32 {
-        self.buffer
-            .len()
-            .checked_div(self.caps.block_size)
-            .unwrap_or(0) as u32
-    }
-
-    fn check_poison(&self) -> Result<(), TapeIoError> {
-        if let Some(message) = self
-            .poison
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .clone()
-        {
-            Err(TapeIoError::OperationFailed(format!(
-                "staged transfer poisoned after sink error: {message}"
-            )))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn poison_message(&self, message: impl Into<String>) {
-        let mut poison = self.poison.lock().unwrap_or_else(|err| err.into_inner());
-        poison.get_or_insert_with(|| message.into());
-    }
-
-    fn send_batch(&mut self, data: Vec<u8>, block_size_bytes: u32) -> Result<(), TapeIoError> {
-        self.check_poison()?;
-        self.tx
-            .send(StagedSinkCommand::WriteBatch {
-                data,
-                block_size_bytes,
-            })
-            .map_err(|_| {
-                TapeIoError::OperationFailed("staged transfer actor stopped".to_string())
-            })?;
-        self.check_poison()
-    }
-
-    fn request<T>(
-        &self,
-        build: impl FnOnce(std_mpsc::Sender<Result<T, String>>) -> StagedSinkCommand,
-    ) -> Result<T, TapeIoError> {
-        self.check_poison()?;
-        let (reply_tx, reply_rx) = std_mpsc::channel();
-        self.tx.send(build(reply_tx)).map_err(|_| {
-            TapeIoError::OperationFailed("staged transfer actor stopped".to_string())
-        })?;
-        match reply_rx.recv() {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(message)) => {
-                self.poison_message(message.clone());
-                Err(TapeIoError::OperationFailed(format!(
-                    "staged transfer sink error: {message}"
-                )))
-            }
-            Err(_) => Err(TapeIoError::OperationFailed(
-                "staged transfer actor dropped reply".to_string(),
-            )),
-        }
-    }
-
-    fn request_position_no_flush(&mut self) -> Result<TapePosition, TapeIoError> {
-        let position = self.request(|reply| StagedSinkCommand::Position { reply })?;
-        self.cursor = Some(position);
-        Ok(position)
-    }
-
-    fn seed_cursor(&mut self) -> Result<TapePosition, TapeIoError> {
-        if let Some(position) = self.cursor {
-            return Ok(position);
-        }
-        self.request_position_no_flush()
-    }
-
-    fn advance_cursor(&mut self, records: u32, bytes: u32) -> Result<WriteOutcome, TapeIoError> {
-        let before = self.seed_cursor()?;
-        let lba = before
-            .lba
-            .checked_add(u64::from(records))
-            .ok_or_else(|| TapeIoError::OperationFailed("batch position overflow".to_string()))?;
-        let position = TapePosition {
-            lba,
-            partition: before.partition,
-            beginning_of_partition: lba == 0,
-            end_of_partition: false,
-            block_position_end_of_warning: before.block_position_end_of_warning,
-        };
-        self.cursor = Some(position);
-        Ok(WriteOutcome::from_computed_position(
-            bytes, false, false, position,
-        ))
-    }
-
-    fn flush_pending(&mut self) -> Result<(), TapeIoError> {
-        let records = self.pending_records();
-        if records == 0 {
-            return Ok(());
-        }
-        let block_size = u32::try_from(self.caps.block_size).map_err(|_| {
-            TapeIoError::OperationFailed("batch block size exceeds u32".to_string())
-        })?;
-        let data = std::mem::take(&mut self.buffer);
-        self.send_batch(data, block_size)
-    }
-
-    fn finish(mut self) -> Result<(), TapeIoError> {
-        self.flush_pending()
     }
 }
 
@@ -1600,10 +1435,6 @@ impl<S: BlockSink + ?Sized> BlockSink for ObjectDigestBlockSink<'_, S> {
         self.inner.requested_write_batch_blocks()
     }
 
-    fn legacy_single_block(&self) -> bool {
-        self.inner.legacy_single_block()
-    }
-
     fn position_check_bytes(&self) -> u64 {
         self.inner.position_check_bytes()
     }
@@ -1621,94 +1452,11 @@ impl<S: BlockSink + ?Sized> BlockSink for ObjectDigestBlockSink<'_, S> {
     }
 }
 
-impl BlockSink for StagedBlockSink {
-    fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
-        if !self.enabled() || buf.len() != self.caps.block_size {
-            self.flush_pending()?;
-            return self.request(|reply| StagedSinkCommand::WriteBlock {
-                data: buf.to_vec(),
-                reply,
-            });
-        }
-        self.buffer.extend_from_slice(buf);
-        let outcome = self.advance_cursor(1, buf.len() as u32)?;
-        if self.pending_records() >= self.caps.batch_blocks {
-            self.flush_pending()?;
-        }
-        Ok(outcome)
-    }
-
-    fn write_block_batch(
-        &mut self,
-        buf: &[u8],
-        block_size_bytes: u32,
-    ) -> Result<WriteBatchOutcome, TapeIoError> {
-        self.flush_pending()?;
-        let outcome = self.request(|reply| StagedSinkCommand::WriteBatchSync {
-            data: buf.to_vec(),
-            block_size_bytes,
-            reply,
-        })?;
-        self.cursor = Some(outcome.position_after);
-        Ok(outcome)
-    }
-
-    fn write_batch_blocks(&self, block_size_bytes: u32) -> u32 {
-        if self.caps.legacy_single_block {
-            1
-        } else {
-            self.caps.batch_blocks.min(
-                u32::try_from(self.caps.block_size)
-                    .ok()
-                    .and_then(|configured| {
-                        configured
-                            .checked_mul(self.caps.batch_blocks)
-                            .and_then(|bytes| bytes.checked_div(block_size_bytes.max(1)))
-                    })
-                    .unwrap_or(self.caps.batch_blocks)
-                    .max(1),
-            )
-        }
-    }
-
-    fn requested_write_batch_blocks(&self) -> u32 {
-        self.caps.requested_write_batch_blocks
-    }
-
-    fn legacy_single_block(&self) -> bool {
-        self.caps.legacy_single_block
-    }
-
-    fn position_check_bytes(&self) -> u64 {
-        self.caps.position_check_bytes
-    }
-
-    fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
-        self.flush_pending()?;
-        let outcome = self.request(|reply| StagedSinkCommand::WriteFilemarks { count, reply })?;
-        self.cursor = Some(outcome.position_after);
-        Ok(outcome)
-    }
-
-    fn space_to_end_of_data(&mut self) -> Result<TapePosition, TapeIoError> {
-        self.flush_pending()?;
-        let position = self.request(|reply| StagedSinkCommand::SpaceToEndOfData { reply })?;
-        self.cursor = Some(position);
-        Ok(position)
-    }
-
-    fn position(&mut self) -> Result<TapePosition, TapeIoError> {
-        self.flush_pending()?;
-        let position = self.request(|reply| StagedSinkCommand::Position { reply })?;
-        self.cursor = Some(position);
-        Ok(position)
-    }
-}
-
-impl PipelinedStagedBlockSink {
+impl StagedBlockSink {
     fn new(
         tx: std_mpsc::SyncSender<PipelinedSinkCommand>,
         free_rx: std_mpsc::Receiver<PageAlignedBuffer>,
+        submitter_done_rx: std_mpsc::Receiver<()>,
         poison: Arc<Mutex<Option<String>>>,
         caps: StagedSinkCaps,
         ring_buffers: usize,
@@ -1716,6 +1464,7 @@ impl PipelinedStagedBlockSink {
         Self {
             tx,
             free_rx,
+            submitter_done_rx,
             poison,
             caps,
             ring_buffers,
@@ -1839,9 +1588,22 @@ impl PipelinedStagedBlockSink {
         self.request(|reply| PipelinedSinkCommand::Barrier { reply })
             .map(|_| ())
     }
+
+    fn abort(self, message: String) {
+        set_staged_poison(&self.poison, message);
+        let StagedBlockSink {
+            tx,
+            free_rx,
+            submitter_done_rx,
+            ..
+        } = self;
+        drop(tx);
+        let _free_rx = free_rx;
+        let _ = submitter_done_rx.recv();
+    }
 }
 
-impl BlockSink for PipelinedStagedBlockSink {
+impl BlockSink for StagedBlockSink {
     fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
         if buf.len() != self.caps.block_size {
             return Err(TapeIoError::OperationFailed(format!(
@@ -1916,14 +1678,6 @@ impl BlockSink for PipelinedStagedBlockSink {
         self.caps.requested_write_batch_blocks
     }
 
-    fn legacy_single_block(&self) -> bool {
-        false
-    }
-
-    fn pipelined_submission(&self) -> bool {
-        true
-    }
-
     fn staging_ring_buffers(&self) -> u32 {
         self.ring_buffers as u32
     }
@@ -1978,44 +1732,36 @@ where
     S: BlockSink + ?Sized,
     R: Send,
 {
-    if inner.pipelined_submission() {
-        return run_pipelined_staged_transfer(inner, block_size, producer, on_safety_error);
-    }
-    let (tx, rx) = std_mpsc::sync_channel(STAGED_TRANSFER_CHANNEL_DEPTH);
-    let poison = Arc::new(Mutex::new(None::<String>));
-    let caps = StagedSinkCaps::from_inner(inner, block_size);
-    std::thread::scope(|scope| {
-        let producer_poison = Arc::clone(&poison);
-        let producer_handle = scope.spawn(move || {
-            let mut staged = StagedBlockSink::new(tx, producer_poison, caps);
-            let result = producer(&mut staged);
-            match result {
-                Ok(value) => staged
-                    .finish()
-                    .map(|()| value)
-                    .map_err(PoolWriteError::from),
-                Err(err) => Err(err),
-            }
-        });
-
-        let sink_result = drain_staged_transfer(inner, rx, &poison);
-        let producer_result = producer_handle.join().unwrap_or_else(|_| {
-            Err(PoolWriteError::InvalidInput(
-                "staged transfer producer thread panicked".to_string(),
-            ))
-        });
-        match sink_result {
-            Ok(()) => producer_result,
-            Err(err) => Err(PoolWriteError::from(err)),
-        }
-    })
+    run_ring_staged_transfer(inner, block_size, producer, on_safety_error)
 }
 
-fn run_pipelined_staged_transfer<S, R>(
+fn run_fenced_staged_transfer<S, R>(
+    state: &mut CatalogIndex,
+    selected: &SelectedTape,
     inner: &mut S,
     block_size: usize,
     producer: impl FnOnce(&mut dyn BlockSink) -> Result<R, PoolWriteError> + Send,
-    on_safety_error: impl FnMut(&TapeIoError) -> Result<(), PoolWriteError>,
+) -> Result<R, PoolWriteError>
+where
+    S: BlockSink + ?Sized,
+    R: Send,
+{
+    run_staged_transfer_with_safety(inner, block_size, producer, |error| {
+        let error = error.to_string();
+        record_tape_io_fence_for_transfer_error(
+            state,
+            selected,
+            tape_io_fence_reason_for_transfer_error(&error),
+            &error,
+        )
+    })
+}
+
+fn run_ring_staged_transfer<S, R>(
+    inner: &mut S,
+    block_size: usize,
+    producer: impl FnOnce(&mut dyn BlockSink) -> Result<R, PoolWriteError> + Send,
+    mut on_safety_error: impl FnMut(&TapeIoError) -> Result<(), PoolWriteError>,
 ) -> Result<R, PoolWriteError>
 where
     S: BlockSink + ?Sized,
@@ -2043,7 +1789,6 @@ where
     tracing::info!(
         target: "remanence_write_diag",
         phase = "staging_ring_open",
-        pipelined_submission = true,
         staging_ring_buffers = ring_buffers,
         effective_batch_blocks = caps.batch_blocks,
         block_size_bytes = block_size,
@@ -2060,13 +1805,15 @@ where
             .map_err(|_| PoolWriteError::InvalidInput("failed to seed staging free ring".into()))?;
     }
     let (submit_tx, submit_rx) = std_mpsc::sync_channel(1);
+    let (submitter_done_tx, submitter_done_rx) = std_mpsc::channel();
     let poison = Arc::new(Mutex::new(None::<String>));
     let result = std::thread::scope(|scope| {
         let producer_poison = Arc::clone(&poison);
         let producer_handle = scope.spawn(move || {
-            let mut staged = PipelinedStagedBlockSink::new(
+            let mut staged = StagedBlockSink::new(
                 submit_tx,
                 free_rx,
+                submitter_done_rx,
                 producer_poison,
                 caps,
                 ring_buffers,
@@ -2077,28 +1824,65 @@ where
                     .finish()
                     .map(|()| value)
                     .map_err(PoolWriteError::from),
-                Err(err) => Err(err),
+                Err(err) => {
+                    staged.abort(err.to_string());
+                    Err(err)
+                }
             }
         });
 
         let submitter_result =
-            drain_pipelined_transfer(inner, submit_rx, free_tx, &poison, on_safety_error);
+            drain_pipelined_transfer(inner, submit_rx, free_tx, &poison, &mut on_safety_error);
+        let _ = submitter_done_tx.send(());
         let producer_result = producer_handle.join().unwrap_or_else(|_| {
             Err(PoolWriteError::InvalidInput(
                 "pipelined staging producer thread panicked".into(),
             ))
         });
         match submitter_result {
-            Ok(()) => producer_result,
+            Ok(()) => match producer_result {
+                Ok(value) => Ok(value),
+                Err(primary) => {
+                    let safety_error = TapeIoError::OperationFailed(primary.to_string());
+                    match on_safety_error(&safety_error) {
+                        Ok(()) => Err(primary),
+                        Err(secondary) => Err(attach_secondary(
+                            primary,
+                            "tape-I/O fence persistence",
+                            secondary,
+                        )),
+                    }
+                }
+            },
             Err(err) => Err(err),
         }
     });
     let allocated = accounting.allocated.load(Ordering::Relaxed);
     let dropped = accounting.dropped.load(Ordering::Relaxed);
     if allocated != dropped {
-        return Err(PoolWriteError::InvalidInput(format!(
+        let imbalance = PoolWriteError::InvalidInput(format!(
             "staging ring accounting imbalance: allocated={allocated} dropped={dropped}"
-        )));
+        ));
+        return match result {
+            Ok(_) => {
+                let safety_error = TapeIoError::OperationFailed(imbalance.to_string());
+                let fence_result = on_safety_error(&safety_error);
+                inner.flush_pending_pipeline_audit();
+                match fence_result {
+                    Ok(()) => Err(imbalance),
+                    Err(secondary) => Err(attach_secondary(
+                        imbalance,
+                        "tape-I/O fence persistence",
+                        secondary,
+                    )),
+                }
+            }
+            Err(primary) => Err(attach_secondary(
+                primary,
+                "staging ring accounting",
+                imbalance,
+            )),
+        };
     }
     result
 }
@@ -2108,13 +1892,17 @@ fn drain_pipelined_transfer<S: BlockSink + ?Sized>(
     rx: std_mpsc::Receiver<PipelinedSinkCommand>,
     free_tx: std_mpsc::SyncSender<PageAlignedBuffer>,
     poison: &Arc<Mutex<Option<String>>>,
-    mut on_safety_error: impl FnMut(&TapeIoError) -> Result<(), PoolWriteError>,
+    on_safety_error: &mut impl FnMut(&TapeIoError) -> Result<(), PoolWriteError>,
 ) -> Result<(), PoolWriteError> {
     let mut completed_since_barrier: Option<WriteBatchOutcome> = None;
     while let Ok(command) = rx.recv() {
+        if let Some(message) = staged_poison_message(poison) {
+            discard_pipelined_command(command, &free_tx, message);
+            continue;
+        }
         let result = match command {
             PipelinedSinkCommand::WriteWindow(window) => {
-                execute_pipelined_window(inner, window, &free_tx, &mut on_safety_error).map(
+                execute_pipelined_window(inner, window, &free_tx, on_safety_error).map(
                     |window_outcome| {
                         completed_since_barrier = Some(match completed_since_barrier {
                             Some(accumulated) => merge_batch_outcomes(accumulated, window_outcome),
@@ -2133,39 +1921,35 @@ fn drain_pipelined_transfer<S: BlockSink + ?Sized>(
                         let _ = reply.send(Ok(outcome));
                         Ok(())
                     }
-                    Err(err) => match on_safety_error(&err) {
-                        Ok(()) => {
-                            inner.flush_pending_pipeline_audit();
-                            let _ = reply.send(Err(err.to_string()));
-                            Err(PoolWriteError::from(err))
-                        }
-                        Err(fence_error) => {
-                            let _ = reply.send(Err(fence_error.to_string()));
-                            Err(fence_error)
-                        }
-                    },
+                    Err(err) => {
+                        let failure = finish_transfer_failure(inner, err, on_safety_error);
+                        let _ = reply.send(Err(failure.to_string()));
+                        Err(failure)
+                    }
                 }
             }
             PipelinedSinkCommand::SpaceToEndOfData { reply } => {
-                match inner.space_to_end_of_data() {
+                match inner.space_to_end_of_data_pipelined() {
                     Ok(position) => {
                         let _ = reply.send(Ok(position));
                         Ok(())
                     }
                     Err(err) => {
-                        let _ = reply.send(Err(err.to_string()));
-                        Err(PoolWriteError::from(err))
+                        let failure = finish_transfer_failure(inner, err, on_safety_error);
+                        let _ = reply.send(Err(failure.to_string()));
+                        Err(failure)
                     }
                 }
             }
-            PipelinedSinkCommand::Position { reply } => match inner.position() {
+            PipelinedSinkCommand::Position { reply } => match inner.position_pipelined() {
                 Ok(position) => {
                     let _ = reply.send(Ok(position));
                     Ok(())
                 }
                 Err(err) => {
-                    let _ = reply.send(Err(err.to_string()));
-                    Err(PoolWriteError::from(err))
+                    let failure = finish_transfer_failure(inner, err, on_safety_error);
+                    let _ = reply.send(Err(failure.to_string()));
+                    Err(failure)
                 }
             },
         };
@@ -2180,6 +1964,32 @@ fn drain_pipelined_transfer<S: BlockSink + ?Sized>(
         }
     }
     Ok(())
+}
+
+fn attach_secondary(
+    primary: PoolWriteError,
+    context: &'static str,
+    secondary: PoolWriteError,
+) -> PoolWriteError {
+    PoolWriteError::TransferWithSecondary {
+        primary: primary.to_string(),
+        context,
+        secondary: secondary.to_string(),
+    }
+}
+
+fn finish_transfer_failure<S: BlockSink + ?Sized>(
+    inner: &mut S,
+    error: TapeIoError,
+    on_safety_error: &mut impl FnMut(&TapeIoError) -> Result<(), PoolWriteError>,
+) -> PoolWriteError {
+    let fence_result = on_safety_error(&error);
+    inner.flush_pending_pipeline_audit();
+    let primary = PoolWriteError::from(error);
+    match fence_result {
+        Ok(()) => primary,
+        Err(secondary) => attach_secondary(primary, "tape-I/O fence persistence", secondary),
+    }
 }
 
 fn execute_pipelined_window<S: BlockSink + ?Sized>(
@@ -2205,9 +2015,23 @@ fn execute_pipelined_window<S: BlockSink + ?Sized>(
             batch.block_size_bytes,
             &batch.cdb,
         );
-        return_ring_buffer(free_tx, batch.buffer)?;
+        let buffer_return_error = return_ring_buffer(free_tx, batch.buffer).err();
         let outcome = match result {
             Ok(outcome) if outcome.records_written == requested && !outcome.end_of_medium => {
+                if let Some(error) = buffer_return_error {
+                    return finish_pipelined_window_failure(
+                        inner,
+                        &mut window,
+                        free_tx,
+                        on_safety_error,
+                        command_count,
+                        bytes,
+                        first_records,
+                        last_records,
+                        TapeIoError::OperationFailed(error.to_string()),
+                        None,
+                    );
+                }
                 outcome
             }
             Ok(outcome) => {
@@ -2227,6 +2051,7 @@ fn execute_pipelined_window<S: BlockSink + ?Sized>(
                     first_records,
                     last_records,
                     err,
+                    buffer_return_error,
                 );
             }
             Err(err) => {
@@ -2240,6 +2065,7 @@ fn execute_pipelined_window<S: BlockSink + ?Sized>(
                     first_records,
                     last_records,
                     err,
+                    buffer_return_error,
                 );
             }
         };
@@ -2284,11 +2110,14 @@ fn finish_pipelined_window_failure<S: BlockSink + ?Sized, T>(
     first_records: u32,
     last_records: u32,
     error: TapeIoError,
+    mut secondary: Option<PoolWriteError>,
 ) -> Result<T, PoolWriteError> {
     for batch in window.batches.iter_mut().filter_map(Option::take) {
-        return_ring_buffer(free_tx, batch.buffer)?;
+        if let Err(error) = return_ring_buffer(free_tx, batch.buffer) {
+            secondary.get_or_insert(error);
+        }
     }
-    on_safety_error(&error)?;
+    let fence_result = on_safety_error(&error);
     inner.finish_pipelined_write_window_error(
         command_count,
         bytes,
@@ -2296,7 +2125,14 @@ fn finish_pipelined_window_failure<S: BlockSink + ?Sized, T>(
         last_records,
         &error,
     );
-    Err(PoolWriteError::from(error))
+    let mut primary = PoolWriteError::from(error);
+    if let Err(error) = fence_result {
+        primary = attach_secondary(primary, "tape-I/O fence persistence", error);
+    }
+    if let Some(error) = secondary {
+        primary = attach_secondary(primary, "staging buffer return", error);
+    }
+    Err(primary)
 }
 
 fn return_ring_buffer(
@@ -2338,132 +2174,6 @@ fn discard_pipelined_command(
     }
 }
 
-fn drain_staged_transfer<S: BlockSink + ?Sized>(
-    inner: &mut S,
-    rx: std_mpsc::Receiver<StagedSinkCommand>,
-    poison: &Arc<Mutex<Option<String>>>,
-) -> Result<(), TapeIoError> {
-    let mut first_error = None;
-    while let Ok(command) = rx.recv() {
-        if let Some(message) = staged_poison_message(poison) {
-            reply_staged_poison(command, message);
-            continue;
-        }
-        match execute_staged_command(inner, command) {
-            Ok(()) => {}
-            Err(err) => {
-                let message = err.to_string();
-                set_staged_poison(poison, message.clone());
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
-            }
-        }
-    }
-    match first_error {
-        Some(err) => Err(err),
-        None => Ok(()),
-    }
-}
-
-fn execute_staged_command<S: BlockSink + ?Sized>(
-    inner: &mut S,
-    command: StagedSinkCommand,
-) -> Result<(), TapeIoError> {
-    match command {
-        StagedSinkCommand::WriteBlock { data, reply } => {
-            match inner.write_block(&data) {
-                Ok(outcome) => {
-                    let _ = reply.send(Ok(outcome));
-                    Ok(())
-                }
-                Err(err) => {
-                    let _ = reply.send(Err(err.to_string()));
-                    Err(err)
-                }
-            }
-        }
-        StagedSinkCommand::WriteBatch {
-            data,
-            block_size_bytes,
-        } => {
-            let requested = records_in_staged_batch(&data, block_size_bytes)?;
-            let outcome = inner.write_block_batch(&data, block_size_bytes)?;
-            if outcome.records_written != requested || outcome.end_of_medium {
-                return Err(TapeIoError::OperationFailed(format!(
-                    "partial fixed batch uncommittable: requested_records={requested} written_records={} end_of_medium={}",
-                    outcome.records_written, outcome.end_of_medium
-                )));
-            }
-            Ok(())
-        }
-        StagedSinkCommand::WriteBatchSync {
-            data,
-            block_size_bytes,
-            reply,
-        } => {
-            match inner
-                .write_block_batch(&data, block_size_bytes)
-                .and_then(|outcome| {
-                    let requested = records_in_staged_batch(&data, block_size_bytes)?;
-                    if outcome.records_written != requested || outcome.end_of_medium {
-                        Err(TapeIoError::OperationFailed(format!(
-                            "partial fixed batch uncommittable: requested_records={requested} written_records={} end_of_medium={}",
-                            outcome.records_written, outcome.end_of_medium
-                        )))
-                    } else {
-                        Ok(outcome)
-                    }
-                }) {
-                Ok(outcome) => {
-                    let _ = reply.send(Ok(outcome));
-                    Ok(())
-                }
-                Err(err) => {
-                    let _ = reply.send(Err(err.to_string()));
-                    Err(err)
-                }
-            }
-        }
-        StagedSinkCommand::WriteFilemarks { count, reply } => {
-            match inner.write_filemarks(count) {
-                Ok(outcome) => {
-                    let _ = reply.send(Ok(outcome));
-                    Ok(())
-                }
-                Err(err) => {
-                    let _ = reply.send(Err(err.to_string()));
-                    Err(err)
-                }
-            }
-        }
-        StagedSinkCommand::SpaceToEndOfData { reply } => {
-            match inner.space_to_end_of_data() {
-                Ok(position) => {
-                    let _ = reply.send(Ok(position));
-                    Ok(())
-                }
-                Err(err) => {
-                    let _ = reply.send(Err(err.to_string()));
-                    Err(err)
-                }
-            }
-        }
-        StagedSinkCommand::Position { reply } => {
-            match inner.position() {
-                Ok(position) => {
-                    let _ = reply.send(Ok(position));
-                    Ok(())
-                }
-                Err(err) => {
-                    let _ = reply.send(Err(err.to_string()));
-                    Err(err)
-                }
-            }
-        }
-    }
-}
-
 fn records_in_staged_batch(data: &[u8], block_size_bytes: u32) -> Result<u32, TapeIoError> {
     if block_size_bytes == 0 {
         return Err(TapeIoError::OperationFailed(
@@ -2490,27 +2200,6 @@ fn set_staged_poison(poison: &Arc<Mutex<Option<String>>>, message: String) {
     guard.get_or_insert(message);
 }
 
-fn reply_staged_poison(command: StagedSinkCommand, message: String) {
-    match command {
-        StagedSinkCommand::WriteBlock { reply, .. } => {
-            let _ = reply.send(Err(message));
-        }
-        StagedSinkCommand::WriteBatch { .. } => {}
-        StagedSinkCommand::WriteBatchSync { reply, .. } => {
-            let _ = reply.send(Err(message));
-        }
-        StagedSinkCommand::WriteFilemarks { reply, .. } => {
-            let _ = reply.send(Err(message));
-        }
-        StagedSinkCommand::SpaceToEndOfData { reply } => {
-            let _ = reply.send(Err(message));
-        }
-        StagedSinkCommand::Position { reply } => {
-            let _ = reply.send(Err(message));
-        }
-    }
-}
-
 impl<'a> LiveCounterBlockSink<'a> {
     pub(crate) fn new(
         inner: &'a mut dyn BlockSink,
@@ -2518,7 +2207,6 @@ impl<'a> LiveCounterBlockSink<'a> {
         block_size_bytes: u32,
     ) -> Self {
         live_write_counter.configure_tape_io(
-            inner.pipelined_submission(),
             inner.staging_ring_buffers(),
             inner.write_batch_blocks(block_size_bytes),
         );
@@ -2531,20 +2219,16 @@ impl<'a> LiveCounterBlockSink<'a> {
 
 impl<'a, S: BlockSink + ?Sized> CountingBlockSink<'a, S> {
     fn new(inner: &'a mut S, block_size: u32) -> Self {
-        let legacy_single_block = inner.legacy_single_block();
         let write_batch_blocks = inner.requested_write_batch_blocks().max(1);
         let effective_batch_blocks = inner.write_batch_blocks(block_size).max(1);
         let position_check_bytes = inner.position_check_bytes();
-        let pipelined_submission = inner.pipelined_submission();
         let staging_ring_buffers = inner.staging_ring_buffers();
         Self {
             inner,
             stats: BlockSinkStats {
-                legacy_single_block,
                 write_batch_blocks,
                 effective_batch_blocks,
                 position_check_bytes,
-                pipelined_submission,
                 staging_ring_buffers,
                 ..BlockSinkStats::default()
             },
@@ -2592,7 +2276,6 @@ impl<'a> BlockSink for LiveCounterBlockSink<'a> {
         cdb: &[u8],
     ) -> Result<WriteBatchOutcome, TapeIoError> {
         self.live_write_counter.configure_tape_io(
-            true,
             self.inner.staging_ring_buffers(),
             self.inner.write_batch_blocks(block_size_bytes),
         );
@@ -2619,14 +2302,6 @@ impl<'a> BlockSink for LiveCounterBlockSink<'a> {
 
     fn requested_write_batch_blocks(&self) -> u32 {
         self.inner.requested_write_batch_blocks()
-    }
-
-    fn legacy_single_block(&self) -> bool {
-        self.inner.legacy_single_block()
-    }
-
-    fn pipelined_submission(&self) -> bool {
-        self.inner.pipelined_submission()
     }
 
     fn staging_ring_buffers(&self) -> u32 {
@@ -2705,8 +2380,16 @@ impl<'a> BlockSink for LiveCounterBlockSink<'a> {
         self.inner.space_to_end_of_data()
     }
 
+    fn space_to_end_of_data_pipelined(&mut self) -> Result<TapePosition, TapeIoError> {
+        self.inner.space_to_end_of_data_pipelined()
+    }
+
     fn position(&mut self) -> Result<TapePosition, TapeIoError> {
         self.inner.position()
+    }
+
+    fn position_pipelined(&mut self) -> Result<TapePosition, TapeIoError> {
+        self.inner.position_pipelined()
     }
 }
 
@@ -2756,14 +2439,6 @@ impl<'a, S: BlockSink + ?Sized> BlockSink for CountingBlockSink<'a, S> {
 
     fn requested_write_batch_blocks(&self) -> u32 {
         self.inner.requested_write_batch_blocks()
-    }
-
-    fn legacy_single_block(&self) -> bool {
-        self.inner.legacy_single_block()
-    }
-
-    fn pipelined_submission(&self) -> bool {
-        self.inner.pipelined_submission()
     }
 
     fn staging_ring_buffers(&self) -> u32 {
@@ -2848,8 +2523,20 @@ impl<'a, S: BlockSink + ?Sized> BlockSink for CountingBlockSink<'a, S> {
         Ok(position)
     }
 
+    fn space_to_end_of_data_pipelined(&mut self) -> Result<TapePosition, TapeIoError> {
+        let position = self.inner.space_to_end_of_data_pipelined()?;
+        self.stats.record_position(position);
+        Ok(position)
+    }
+
     fn position(&mut self) -> Result<TapePosition, TapeIoError> {
         let position = self.inner.position()?;
+        self.stats.record_position(position);
+        Ok(position)
+    }
+
+    fn position_pipelined(&mut self) -> Result<TapePosition, TapeIoError> {
+        let position = self.inner.position_pipelined()?;
         self.stats.record_position(position);
         Ok(position)
     }
@@ -2867,51 +2554,36 @@ fn write_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
     let PreparedPoolWrite { prepared, stored } = prepared_write;
     let tape_uuid = selected.tape_uuid;
     let block_size = selected.block_size;
-    let pipelined_submission = sink.pipelined_submission();
-    let selected_for_fence = selected.clone();
     let transfer_started = Instant::now();
     let write_report: Result<StreamingObjectWriteReport, PoolWriteError> =
-        run_staged_transfer_with_safety(
-            sink,
-            block_size as usize,
-            |staged| {
-                let mut raw = BlockSinkRawTapeSink::new(staged);
-                let mut parity =
-                    ParitySink::new_sidecar_only(&mut raw, scheme.clone(), tape_uuid, block_size)?;
-                parity.write_bootstrap()?;
-                let report = match &stored {
-                    PreparedStoredObject::Plaintext => Ok(write_prepared_object_to_parity(
-                        &mut parity,
-                        tape_uuid,
-                        &prepared.options,
-                        &prepared.files,
-                        capacity_input(
-                            &scheme,
-                            block_size,
-                            prepared.plan.layout.projected_size_blocks,
-                        ),
-                    )?),
-                    PreparedStoredObject::Encrypted(encrypted) => write_encrypted_object_to_parity(
-                        &mut parity,
-                        tape_uuid,
-                        &prepared,
-                        encrypted,
+        run_fenced_staged_transfer(state, &selected, sink, block_size as usize, |staged| {
+            let mut raw = BlockSinkRawTapeSink::new(staged);
+            let mut parity =
+                ParitySink::new_sidecar_only(&mut raw, scheme.clone(), tape_uuid, block_size)?;
+            parity.write_bootstrap()?;
+            let report = match &stored {
+                PreparedStoredObject::Plaintext => Ok(write_prepared_object_to_parity(
+                    &mut parity,
+                    tape_uuid,
+                    &prepared.options,
+                    &prepared.files,
+                    capacity_input(
                         &scheme,
                         block_size,
+                        prepared.plan.layout.projected_size_blocks,
                     ),
-                }?;
-                Ok(report)
-            },
-            |error| {
-                let error = error.to_string();
-                record_tape_io_fence_for_transfer_error(
-                    state,
-                    &selected_for_fence,
-                    tape_io_fence_reason_for_transfer_error(&error),
-                    &error,
-                )
-            },
-        );
+                )?),
+                PreparedStoredObject::Encrypted(encrypted) => write_encrypted_object_to_parity(
+                    &mut parity,
+                    tape_uuid,
+                    &prepared,
+                    encrypted,
+                    &scheme,
+                    block_size,
+                ),
+            }?;
+            Ok(report)
+        });
     let transfer_elapsed = transfer_started.elapsed();
     let write_report = match write_report {
         Ok(write_report) => {
@@ -2932,14 +2604,6 @@ fn write_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
         }
         Err(err) => {
             let error = err.to_string();
-            if !pipelined_submission {
-                record_tape_io_fence_for_transfer_error(
-                    state,
-                    &selected,
-                    tape_io_fence_reason_for_transfer_error(&error),
-                    &error,
-                )?;
-            }
             log_transfer_diagnostics(
                 &request,
                 &selected,
@@ -3010,11 +2674,11 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
     let PreparedPoolWrite { prepared, stored } = prepared_write;
     let tape_uuid = selected.tape_uuid;
     let append = no_parity_append_context(state, &selected)?;
-    let pipelined_submission = sink.pipelined_submission();
-    let selected_for_fence = selected.clone();
     let transfer_started = Instant::now();
     let write_report: Result<StreamingObjectWriteReport, PoolWriteError> =
-        run_staged_transfer_with_safety(
+        run_fenced_staged_transfer(
+            state,
+            &selected,
             sink,
             selected.block_size as usize,
             |staged| {
@@ -3067,15 +2731,6 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
                 }?;
                 Ok(report)
             },
-            |error| {
-                let error = error.to_string();
-                record_tape_io_fence_for_transfer_error(
-                    state,
-                    &selected_for_fence,
-                    tape_io_fence_reason_for_transfer_error(&error),
-                    &error,
-                )
-            },
         );
     let transfer_elapsed = transfer_started.elapsed();
     let write_report = match write_report {
@@ -3097,14 +2752,6 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
         }
         Err(err) => {
             let error = err.to_string();
-            if !pipelined_submission {
-                record_tape_io_fence_for_transfer_error(
-                    state,
-                    &selected,
-                    tape_io_fence_reason_for_transfer_error(&error),
-                    &error,
-                )?;
-            }
             log_transfer_diagnostics(
                 &request,
                 &selected,
@@ -3593,16 +3240,10 @@ fn log_transfer_diagnostics(
         filemarks = outcome.stats.filemarks,
         position_calls = outcome.stats.position_calls,
         early_warning = outcome.stats.early_warning,
-        scsi_write_cdb = if outcome.stats.legacy_single_block {
-            "WRITE6_VARIABLE"
-        } else {
-            "WRITE6_FIXED_BATCH"
-        },
-        legacy_single_block = outcome.stats.legacy_single_block,
+        scsi_write_cdb = "WRITE6_FIXED_BATCH",
         write_batch_blocks = outcome.stats.write_batch_blocks,
         effective_batch_blocks = outcome.stats.effective_batch_blocks,
         position_check_bytes = outcome.stats.position_check_bytes,
-        pipelined_submission = outcome.stats.pipelined_submission,
         staging_ring_buffers = outcome.stats.staging_ring_buffers,
         gap_p50_us = outcome.stats.gap_p50_us,
         gap_p95_us = outcome.stats.gap_p95_us,
@@ -4692,10 +4333,15 @@ mod tests {
         inner: VecBlockSink,
         batch_blocks: u32,
         fail_on_batch_call: Option<u64>,
+        batch_error: Option<TapeIoError>,
         early_warning_on_batch_call: Option<u64>,
+        fail_space_to_eod: bool,
+        fail_position: bool,
+        fail_filemark: bool,
+        pending_deferred_audit: bool,
+        audited_partial_sense: bool,
         batch_calls: u64,
         events: Vec<String>,
-        pipelined: bool,
         ring_buffers: u32,
         cdbs: Vec<Vec<u8>>,
         alignments: Vec<usize>,
@@ -4709,10 +4355,15 @@ mod tests {
                 inner: VecBlockSink::new(),
                 batch_blocks,
                 fail_on_batch_call: None,
+                batch_error: None,
                 early_warning_on_batch_call: None,
+                fail_space_to_eod: false,
+                fail_position: false,
+                fail_filemark: false,
+                pending_deferred_audit: false,
+                audited_partial_sense: false,
                 batch_calls: 0,
                 events: Vec::new(),
-                pipelined: false,
                 ring_buffers: remanence_library::DEFAULT_TAPE_IO_STAGING_RING_BUFFERS,
                 cdbs: Vec::new(),
                 alignments: Vec::new(),
@@ -4726,9 +4377,8 @@ mod tests {
             sink
         }
 
-        fn pipelined(batch_blocks: u32, ring_buffers: u32) -> Self {
+        fn with_ring(batch_blocks: u32, ring_buffers: u32) -> Self {
             let mut sink = Self::new(batch_blocks);
-            sink.pipelined = true;
             sink.ring_buffers = ring_buffers;
             sink
         }
@@ -4749,6 +4399,9 @@ mod tests {
                 .expect("test batch contains whole records");
             self.batch_calls = self.batch_calls.saturating_add(1);
             self.events.push(format!("write_batch:{records}"));
+            if let Some(error) = self.batch_error.take() {
+                return Err(error);
+            }
             if self.fail_on_batch_call == Some(self.batch_calls) {
                 return Err(TapeIoError::OperationFailed(format!(
                     "injected sink failure on batch {}",
@@ -4793,10 +4446,6 @@ mod tests {
             self.batch_blocks
         }
 
-        fn pipelined_submission(&self) -> bool {
-            self.pipelined
-        }
-
         fn staging_ring_buffers(&self) -> u32 {
             self.ring_buffers
         }
@@ -4832,8 +4481,12 @@ mod tests {
             _bytes: u64,
             _first_records: u32,
             _last_records: u32,
-            _error: &TapeIoError,
+            error: &TapeIoError,
         ) {
+            self.audited_partial_sense = matches!(
+                error,
+                TapeIoError::PartialBatchUncommittable { sense: Some(_), .. }
+            );
             self.ordered_events
                 .lock()
                 .expect("ordered events")
@@ -4841,18 +4494,51 @@ mod tests {
             self.events.push("span_error".into());
         }
 
+        fn flush_pending_pipeline_audit(&mut self) {
+            if self.pending_deferred_audit {
+                self.pending_deferred_audit = false;
+                self.ordered_events
+                    .lock()
+                    .expect("ordered events")
+                    .push("audit".into());
+            }
+        }
+
         fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
             self.events.push(format!("filemark:{count}"));
             self.inner.write_filemarks(count)
         }
 
+        fn write_filemarks_pipelined(
+            &mut self,
+            count: u32,
+        ) -> Result<WriteFilemarksOutcome, TapeIoError> {
+            if self.fail_filemark {
+                self.pending_deferred_audit = true;
+                return Err(TapeIoError::OperationFailed(
+                    "injected WRITE FILEMARKS failure".into(),
+                ));
+            }
+            self.write_filemarks(count)
+        }
+
         fn space_to_end_of_data(&mut self) -> Result<TapePosition, TapeIoError> {
             self.events.push("space_eod".to_string());
+            if self.fail_space_to_eod {
+                return Err(TapeIoError::OperationFailed(
+                    "injected space-to-EOD failure".into(),
+                ));
+            }
             self.inner.space_to_end_of_data()
         }
 
         fn position(&mut self) -> Result<TapePosition, TapeIoError> {
             self.events.push("position".to_string());
+            if self.fail_position {
+                return Err(TapeIoError::OperationFailed(
+                    "injected READ POSITION failure".into(),
+                ));
+            }
             self.inner.position()
         }
     }
@@ -4882,14 +4568,21 @@ mod tests {
 
         assert_eq!(
             sink.events,
-            vec!["position", "write_batch:2", "write_batch:1", "filemark:1"],
+            vec![
+                "position",
+                "intent:2:12:2:1",
+                "write_batch:2",
+                "write_batch:1",
+                "span_ok:2:12:2:1",
+                "filemark:1",
+            ],
             "WRITE FILEMARKS must be actor-ordered after the final clean data batch"
         );
     }
 
     #[test]
     fn l3_crash_after_producer_read_before_batch_write_leaves_no_tape_bytes() {
-        let mut sink = StagedTestSink::new(2);
+        let mut sink = StagedTestSink::with_ring(2, 2);
 
         let err = run_staged_transfer(&mut sink, 4, |staged| {
             staged.write_block(&[1; 4])?;
@@ -4915,12 +4608,13 @@ mod tests {
     }
 
     #[test]
-    fn l3_source_error_mid_stream_drains_without_filemark() {
+    fn l3_source_error_discards_unsubmitted_window_without_filemark() {
         let mut sink = StagedTestSink::new(2);
 
         let err = run_staged_transfer(&mut sink, 4, |staged| {
-            staged.write_block(&[1; 4])?;
-            staged.write_block(&[2; 4])?;
+            for value in 0..4u8 {
+                staged.write_block(&[value; 4])?;
+            }
             Err::<(), PoolWriteError>(PoolWriteError::InvalidInput(
                 "injected source error after first batch".to_string(),
             ))
@@ -4930,8 +4624,8 @@ mod tests {
         assert!(err.to_string().contains("source error"));
         assert_eq!(
             sink.events,
-            vec!["position", "write_batch:2"],
-            "already queued clean batches drain, but no commit filemark is written"
+            vec!["position"],
+            "an unsubmitted partial ring window is discarded after producer failure"
         );
     }
 
@@ -4951,14 +4645,184 @@ mod tests {
         assert!(err.to_string().contains("injected sink failure"));
         assert_eq!(
             sink.events,
-            vec!["position", "write_batch:2", "write_batch:2"],
+            vec![
+                "position",
+                "intent:3:20:2:1",
+                "write_batch:2",
+                "write_batch:2",
+                "span_error",
+            ],
             "queued producer buffers are drained after poison, but no filemark reaches the sink"
+        );
+    }
+
+    fn fence_test_fixture() -> (tempfile::TempDir, CatalogIndex, SelectedTape) {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-transfer-fence-")
+            .tempdir()
+            .expect("tempdir");
+        let mut state =
+            CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open catalog");
+        let tape_uuid = [0x5a; 16];
+        state
+            .provision_tape(remanence_state::ProvisionTapeInput {
+                tape_uuid,
+                voltag: "FENCE1L9".into(),
+                block_size: 4,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        (
+            temp,
+            state,
+            SelectedTape {
+                pool_id: "fence.test".into(),
+                tape_uuid,
+                block_size: 4,
+                parity_config: ParityConfig::None,
+            },
+        )
+    }
+
+    fn assert_one_transfer_fence(state: &CatalogIndex, expected_error: &str) {
+        let fences = state
+            .list_active_tape_io_fences()
+            .expect("list active tape-I/O fences");
+        assert_eq!(
+            fences.len(),
+            1,
+            "exactly one safety funnel persists a fence"
+        );
+        assert!(
+            fences[0]
+                .evidence_json
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains(expected_error)),
+            "fence evidence must retain the transfer failure: {fences:?}"
+        );
+    }
+
+    #[test]
+    fn producer_error_after_committed_window_records_tape_io_fence() {
+        let (_temp, mut state, selected) = fence_test_fixture();
+        let mut sink = StagedTestSink::with_ring(2, 2);
+        let error = run_fenced_staged_transfer(&mut state, &selected, &mut sink, 4, |staged| {
+            for value in 0..4u8 {
+                staged.write_block(&[value; 4])?;
+            }
+            staged.position()?;
+            Err::<(), PoolWriteError>(PoolWriteError::InvalidInput(
+                "producer source read failed after committed window".into(),
+            ))
+        })
+        .expect_err("producer failure stops transfer");
+        assert!(error.to_string().contains("producer source read failed"));
+        assert_eq!(sink.batch_calls, 2, "one full ring window reached tape");
+        assert_one_transfer_fence(&state, "producer source read failed");
+    }
+
+    #[test]
+    fn space_to_eod_error_records_tape_io_fence() {
+        let (_temp, mut state, selected) = fence_test_fixture();
+        let mut sink = StagedTestSink::new(2);
+        sink.fail_space_to_eod = true;
+        let error = run_fenced_staged_transfer(&mut state, &selected, &mut sink, 4, |staged| {
+            staged.space_to_end_of_data().map_err(PoolWriteError::from)
+        })
+        .expect_err("SPACE(EOD) failure stops transfer");
+        assert!(error.to_string().contains("space-to-EOD failure"));
+        assert_one_transfer_fence(&state, "space-to-EOD failure");
+    }
+
+    #[test]
+    fn position_error_records_tape_io_fence() {
+        let (_temp, mut state, selected) = fence_test_fixture();
+        let mut sink = StagedTestSink::new(2);
+        sink.fail_position = true;
+        let error = run_fenced_staged_transfer(&mut state, &selected, &mut sink, 4, |staged| {
+            staged.write_block(&[1; 4]).map_err(PoolWriteError::from)
+        })
+        .expect_err("READ POSITION failure stops transfer");
+        assert!(error.to_string().contains("READ POSITION failure"));
+        assert_one_transfer_fence(&state, "READ POSITION failure");
+    }
+
+    #[test]
+    fn disconnected_free_ring_cannot_mask_inflight_tape_failure() {
+        let mut sink = StagedTestSink::with_ring(2, 2);
+        sink.batch_error = Some(TapeIoError::PartialBatchUncommittable {
+            requested_records: 2,
+            written_records: 1,
+            end_of_medium: false,
+            sense: Some(vec![0x70, 0, 0x40]),
+        });
+        let ordered = Arc::clone(&sink.ordered_events);
+        let accounting = Arc::new(RingAccounting::default());
+        let mut buffer = PageAlignedBuffer::try_new(8, accounting).expect("test ring buffer");
+        buffer.append(&[1; 8]).expect("fill test ring buffer");
+        let mut window = PipelinedWindow::new();
+        window
+            .push(PipelinedBatch {
+                buffer,
+                cdb: remanence_scsi::read_write::build_write_fixed_cdb(2),
+                records: 2,
+                block_size_bytes: 4,
+            })
+            .expect("one in-flight batch");
+        let (free_tx, free_rx) = std_mpsc::sync_channel(2);
+        drop(free_rx); // producer-side staged sink disappeared mid-window
+        let error = execute_pipelined_window(&mut sink, window, &free_tx, &mut |_error| {
+            ordered.lock().expect("ordered events").push("fence".into());
+            Ok(())
+        })
+        .expect_err("in-flight tape WRITE fails after producer drops receiver");
+        let message = error.to_string();
+        assert!(
+            message.contains("partial fixed batch uncommittable"),
+            "{message}"
+        );
+        assert!(message.contains("staging buffer return"), "{message}");
+        assert!(
+            sink.audited_partial_sense,
+            "deferred WRITE sense must be audited"
+        );
+        let ordered = sink.ordered_events.lock().expect("ordered events");
+        assert_eq!(&ordered[..3], ["classify", "fence", "audit"]);
+    }
+
+    #[test]
+    fn filemark_fence_failure_still_flushes_deferred_audit_and_reports_both() {
+        let mut sink = StagedTestSink::new(2);
+        sink.fail_filemark = true;
+        let ordered = Arc::clone(&sink.ordered_events);
+        let error = run_staged_transfer_with_safety(
+            &mut sink,
+            4,
+            |staged| staged.write_filemarks(1).map_err(PoolWriteError::from),
+            |_error| {
+                ordered.lock().expect("ordered events").push("fence".into());
+                Err(PoolWriteError::InvalidInput(
+                    "injected fence callback failure".into(),
+                ))
+            },
+        )
+        .expect_err("filemark and fence both fail");
+        let message = error.to_string();
+        assert!(message.contains("WRITE FILEMARKS failure"), "{message}");
+        assert!(message.contains("fence callback failure"), "{message}");
+        assert_eq!(
+            sink.ordered_events
+                .lock()
+                .expect("ordered events")
+                .as_slice(),
+            ["fence", "audit"]
         );
     }
 
     #[test]
     fn pipelined_ring_rebuilds_trailing_cdb_and_uses_page_aligned_buffers() {
-        let mut sink = StagedTestSink::pipelined(2, 4);
+        let mut sink = StagedTestSink::with_ring(2, 4);
 
         run_staged_transfer(&mut sink, 4, |staged| {
             for value in 0..5u8 {
@@ -4987,46 +4851,8 @@ mod tests {
     }
 
     #[test]
-    fn pipelined_on_off_preserve_payload_command_partition_and_filemark_order() {
-        fn exercise(sink: &mut StagedTestSink) {
-            run_staged_transfer(sink, 4, |staged| {
-                for value in 0..5u8 {
-                    staged.write_block(&[value; 4])?;
-                }
-                staged.write_filemarks(1)?;
-                Ok(())
-            })
-            .expect("staged transfer");
-        }
-
-        let mut off = StagedTestSink::new(2);
-        exercise(&mut off);
-        let mut on = StagedTestSink::pipelined(2, 4);
-        exercise(&mut on);
-
-        assert_eq!(
-            on.inner.blocks, off.inner.blocks,
-            "tape bytes must be identical"
-        );
-        let off_partition = off
-            .events
-            .iter()
-            .filter_map(|event| event.strip_prefix("write_batch:"))
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        let on_partition = on
-            .cdbs
-            .iter()
-            .map(|cdb| u32::from_be_bytes([0, cdb[2], cdb[3], cdb[4]]).to_string())
-            .collect::<Vec<_>>();
-        assert_eq!(on_partition, off_partition);
-        assert_eq!(off.events.last().map(String::as_str), Some("filemark:1"));
-        assert_eq!(on.events.last().map(String::as_str), Some("filemark:1"));
-    }
-
-    #[test]
     fn pipelined_synchronous_batch_propagates_successful_early_warning() {
-        let mut sink = StagedTestSink::pipelined(2, 4);
+        let mut sink = StagedTestSink::with_ring(2, 4);
         sink.early_warning_on_batch_call = Some(1);
 
         let outcome = run_staged_transfer(&mut sink, 4, |staged| {
@@ -5044,7 +4870,7 @@ mod tests {
 
     #[test]
     fn pipelined_terminal_poison_fences_before_audit_and_discards_queued_batches() {
-        let mut sink = StagedTestSink::pipelined(2, 4);
+        let mut sink = StagedTestSink::with_ring(2, 4);
         sink.fail_on_batch_call = Some(2);
         let ordered = Arc::clone(&sink.ordered_events);
 
@@ -5087,13 +4913,13 @@ mod tests {
     #[test]
     fn pipelined_ring_rejects_invalid_runtime_depths_and_checked_size_overflow() {
         for ring_buffers in [0, 1, 17] {
-            let mut sink = StagedTestSink::pipelined(2, ring_buffers);
+            let mut sink = StagedTestSink::with_ring(2, ring_buffers);
             let err = run_staged_transfer(&mut sink, 4, |_staged| Ok::<_, PoolWriteError>(()))
                 .expect_err("invalid ring depth rejects before spawning");
             assert!(err.to_string().contains("staging ring depth"), "{err}");
         }
 
-        let mut sink = StagedTestSink::pipelined(u32::MAX, 16);
+        let mut sink = StagedTestSink::with_ring(u32::MAX, 16);
         let err = run_staged_transfer(&mut sink, usize::MAX, |_staged| Ok::<_, PoolWriteError>(()))
             .expect_err("ring byte multiplication must be checked");
         assert!(
@@ -5115,6 +4941,27 @@ mod tests {
         let mut stats = BlockSinkStats::default();
         stats.record_position(tape_position_with_warning(true));
         assert!(stats.early_warning);
+    }
+
+    #[test]
+    fn write_failure_with_position_secondary_keeps_partial_batch_fence_reason() {
+        let error = TapeIoError::WriteFailureWithPositionError {
+            write_error: Box::new(TapeIoError::PartialBatchUncommittable {
+                requested_records: 4,
+                written_records: 2,
+                end_of_medium: true,
+                sense: Some(vec![0x70, 0, 0x40]),
+            }),
+            position_error: Box::new(TapeIoError::OperationFailed(
+                "injected arbitration READ POSITION failure".into(),
+            )),
+        };
+        let message = error.to_string();
+        assert_eq!(
+            tape_io_fence_reason_for_transfer_error(&message),
+            "partial_batch"
+        );
+        assert!(message.contains("arbitration READ POSITION failure"));
     }
 
     #[test]

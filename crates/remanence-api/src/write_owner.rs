@@ -2155,6 +2155,9 @@ fn prepare_drive_for_write(
     session_id: Uuid,
 ) -> Result<(), Status> {
     let prepare_started = Instant::now();
+    drive
+        .reverify_invalidated_state()
+        .map_err(|err| Status::failed_precondition(format!("reverify drive state: {err}")))?;
     let rewind_verify_started = Instant::now();
     drive
         .rewind()
@@ -2182,19 +2185,14 @@ fn prepare_drive_for_write(
     drive
         .write_config(target_cfg)
         .map_err(|err| Status::internal(format!("set fixed-block config: {err}")))?;
-    let pipelined_submission = drive.pipelined_submission();
     let staging_ring_buffers = drive.staging_ring_buffers();
-    let effective_batch_blocks = if drive.legacy_single_block() {
-        1
-    } else {
-        drive.requested_write_batch_blocks().min(
-            drive
-                .sg_reserved_size_bytes()
-                .checked_div(block_size.max(1))
-                .unwrap_or(1)
-                .max(1),
-        )
-    };
+    let effective_batch_blocks = drive.requested_write_batch_blocks().min(
+        drive
+            .sg_reserved_size_bytes()
+            .checked_div(block_size.max(1))
+            .unwrap_or(1)
+            .max(1),
+    );
     let effective_ring_bytes = u64::from(staging_ring_buffers)
         .saturating_mul(u64::from(effective_batch_blocks))
         .saturating_mul(u64::from(block_size));
@@ -2208,7 +2206,6 @@ fn prepare_drive_for_write(
         prior_compression = current_cfg.compression,
         target_block_size = ?target_cfg.block_size,
         target_compression = target_cfg.compression,
-        pipelined_submission,
         staging_ring_buffers,
         effective_batch_blocks,
         effective_ring_bytes,
@@ -2241,94 +2238,31 @@ fn prepare_drive_for_read(
     tape_uuid: &TapeUuid,
     session_id: Uuid,
 ) -> Result<(), Status> {
-    let Some(tape) = index.get_tape(tape_uuid).map_err(status_from_state_error)? else {
-        drive.set_legacy_single_block(true);
-        tracing::warn!(
-            target: "remanence_read_diag",
-            phase = "drive_prepare_read",
-            session_id = %session_id,
-            tape_uuid = %Uuid::from_bytes(*tape_uuid),
-            status = "legacy_fallback",
-            reason = "tape catalog row is missing",
-            "remanence_read_diag",
-        );
-        return Ok(());
-    };
-    let Some(block_size) = tape.block_size else {
-        drive.set_legacy_single_block(true);
-        tracing::warn!(
-            target: "remanence_read_diag",
-            phase = "drive_prepare_read",
-            session_id = %session_id,
-            tape_uuid = %Uuid::from_bytes(*tape_uuid),
-            status = "legacy_fallback",
-            reason = "tape block_size is missing",
-            "remanence_read_diag",
-        );
-        return Ok(());
-    };
+    let tape = index
+        .get_tape(tape_uuid)
+        .map_err(status_from_state_error)?
+        .ok_or_else(|| Status::failed_precondition("tape catalog row is missing"))?;
+    let block_size = tape
+        .block_size
+        .ok_or_else(|| Status::failed_precondition("tape block_size is missing"))?;
     let block_size = u32::try_from(block_size)
         .map_err(|_| Status::internal("tape block size does not fit u32"))?;
     let started = Instant::now();
-    let current_cfg = match drive.read_config() {
-        Ok(config) => config,
-        Err(err) => {
-            drive.set_legacy_single_block(true);
-            tracing::warn!(
-                target: "remanence_read_diag",
-                phase = "drive_prepare_read",
-                session_id = %session_id,
-                tape_uuid = %Uuid::from_bytes(*tape_uuid),
-                status = "legacy_fallback",
-                reason = %format!("read config: {err}"),
-                "remanence_read_diag",
-            );
-            return Ok(());
-        }
-    };
+    let current_cfg = drive
+        .read_config()
+        .map_err(|err| Status::internal(format!("read drive config: {err}")))?;
     let target_cfg = fixed_no_compression_config(current_cfg, block_size);
-    if let Err(err) = drive.write_config(target_cfg) {
-        drive.set_legacy_single_block(true);
-        tracing::warn!(
-            target: "remanence_read_diag",
-            phase = "drive_prepare_read",
-            session_id = %session_id,
-            tape_uuid = %Uuid::from_bytes(*tape_uuid),
-            status = "legacy_fallback",
-            reason = %format!("write config: {err}"),
-            "remanence_read_diag",
-        );
-        return Ok(());
-    }
-    let verified = match drive.read_config() {
-        Ok(config) => config,
-        Err(err) => {
-            drive.set_legacy_single_block(true);
-            tracing::warn!(
-                target: "remanence_read_diag",
-                phase = "drive_prepare_read",
-                session_id = %session_id,
-                tape_uuid = %Uuid::from_bytes(*tape_uuid),
-                status = "legacy_fallback",
-                reason = %format!("verify config: {err}"),
-                "remanence_read_diag",
-            );
-            return Ok(());
-        }
-    };
+    drive
+        .write_config(target_cfg)
+        .map_err(|err| Status::internal(format!("set fixed read config: {err}")))?;
+    let verified = drive
+        .read_config()
+        .map_err(|err| Status::internal(format!("verify fixed read config: {err}")))?;
     if verified.block_size != target_cfg.block_size {
-        drive.set_legacy_single_block(true);
-        tracing::warn!(
-            target: "remanence_read_diag",
-            phase = "drive_prepare_read",
-            session_id = %session_id,
-            tape_uuid = %Uuid::from_bytes(*tape_uuid),
-            status = "legacy_fallback",
-            expected_block_size = ?target_cfg.block_size,
-            actual_block_size = ?verified.block_size,
-            "remanence_read_diag",
-        );
-        return Ok(());
+        return Err(Status::failed_precondition(format!(
+            "fixed read mode verification mismatch: expected {:?}, got {:?}",
+            target_cfg.block_size, verified.block_size
+        )));
     }
     tracing::info!(
         target: "remanence_read_diag",
@@ -4000,14 +3934,12 @@ fn stream_one_object(
     verify_loaded_tape_identity(drive, tape_uuid)?;
     let block_size_u32 = u32::try_from(block_size)
         .map_err(|_| Status::internal("tape block size does not fit u32"))?;
-    if !drive.legacy_single_block() {
-        let current_cfg = drive
-            .read_config()
-            .map_err(|err| Status::internal(format!("read drive config: {err}")))?;
-        drive
-            .write_config(fixed_no_compression_config(current_cfg, block_size_u32))
-            .map_err(|err| Status::internal(format!("set fixed-block config: {err}")))?;
-    }
+    let current_cfg = drive
+        .read_config()
+        .map_err(|err| Status::internal(format!("read drive config: {err}")))?;
+    drive
+        .write_config(fixed_no_compression_config(current_cfg, block_size_u32))
+        .map_err(|err| Status::internal(format!("set fixed-block config: {err}")))?;
 
     let mut source = DriveHandleSource(drive);
     stream_with_staged_read_sender(chunk_tx, stream_chunk_bytes, |writer| {
@@ -4046,14 +3978,12 @@ fn stream_one_file_range(
         .map_err(|_| Status::internal("tape block size does not fit u32"))?;
 
     verify_loaded_tape_identity(drive, tape_uuid)?;
-    if !drive.legacy_single_block() {
-        let current_cfg = drive
-            .read_config()
-            .map_err(|err| Status::internal(format!("read drive config: {err}")))?;
-        drive
-            .write_config(fixed_no_compression_config(current_cfg, block_size_u32))
-            .map_err(|err| Status::internal(format!("set fixed-block config: {err}")))?;
-    }
+    let current_cfg = drive
+        .read_config()
+        .map_err(|err| Status::internal(format!("read drive config: {err}")))?;
+    drive
+        .write_config(fixed_no_compression_config(current_cfg, block_size_u32))
+        .map_err(|err| Status::internal(format!("set fixed-block config: {err}")))?;
 
     let mut source = DriveHandleSource(drive);
     stream_file_range_from_source(&mut source, request, stream_chunk_bytes, chunk_tx)?;
@@ -4400,9 +4330,10 @@ pub(crate) fn status_from_pool_write_error(err: PoolWriteError) -> Status {
         PoolWriteError::ReplayObjectInvalid { .. } => Status::internal(message),
         PoolWriteError::Streaming(streaming) => status_from_streaming_error(&streaming, message),
         PoolWriteError::Parity(parity) => status_from_parity_error(&parity, message),
-        PoolWriteError::Io { .. } | PoolWriteError::TapeIo(_) | PoolWriteError::TimeFormat(_) => {
-            Status::internal(message)
-        }
+        PoolWriteError::Io { .. }
+        | PoolWriteError::TapeIo(_)
+        | PoolWriteError::TransferWithSecondary { .. }
+        | PoolWriteError::TimeFormat(_) => Status::internal(message),
     }
 }
 
@@ -5447,7 +5378,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_drive_for_read_sets_catalog_fixed_block_size_or_legacy_fallback() {
+    fn prepare_drive_for_read_sets_catalog_fixed_block_size_and_rejects_missing_geometry() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-read-mode-prepare-")
             .tempdir()
@@ -5483,7 +5414,6 @@ mod tests {
         prepare_drive_for_read(&index, &mut drive, &tape_uuid, Uuid::new_v4())
             .expect("prepare fixed read mode");
 
-        assert!(!drive.legacy_single_block());
         assert_eq!(
             world
                 .lock()
@@ -5496,9 +5426,10 @@ mod tests {
         );
 
         let missing_tape_uuid = [0x45; 16];
-        prepare_drive_for_read(&index, &mut drive, &missing_tape_uuid, Uuid::new_v4())
-            .expect("missing catalog row falls back to legacy mode");
-        assert!(drive.legacy_single_block());
+        let error = prepare_drive_for_read(&index, &mut drive, &missing_tape_uuid, Uuid::new_v4())
+            .expect_err("missing catalog geometry must fail closed");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("catalog row is missing"));
     }
 
     #[tokio::test]
