@@ -1,7 +1,9 @@
 # Tape I/O pipelined submission (TIO-5) — staging ring, hot submitter, in-place accounting — Design v0.4
 
-**Status:** v0.4 — panel folded + verify round 1 folded + re-verify folded
-2026-07-10; re-verify round 2 (final, §9-scoped) pending.
+**Status:** **FROZEN v0.4** (2026-07-10) — panel (4 lenses incl. codex
+gpt-5.6-sol) → fold → verify → fold → re-verify → fold → re-verify-2
+**PASS** (all items confirmed, zero findings). Prompt set:
+`prompt-tio-5a.md`, `prompt-tio-5b.md`.
 **Re-verify round 1 (fresh codex gpt-5.6-sol):** fixes 3/4 confirmed;
 fixes 1/2 correct in the body but not propagated into §9 test rows (2
 majors + 1 minor, all §9-consistency) — folded in v0.4: non-GOOD test row
