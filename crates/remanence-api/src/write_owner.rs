@@ -2182,6 +2182,22 @@ fn prepare_drive_for_write(
     drive
         .write_config(target_cfg)
         .map_err(|err| Status::internal(format!("set fixed-block config: {err}")))?;
+    let pipelined_submission = drive.pipelined_submission();
+    let staging_ring_buffers = drive.staging_ring_buffers();
+    let effective_batch_blocks = if drive.legacy_single_block() {
+        1
+    } else {
+        drive.requested_write_batch_blocks().min(
+            drive
+                .sg_reserved_size_bytes()
+                .checked_div(block_size.max(1))
+                .unwrap_or(1)
+                .max(1),
+        )
+    };
+    let effective_ring_bytes = u64::from(staging_ring_buffers)
+        .saturating_mul(u64::from(effective_batch_blocks))
+        .saturating_mul(u64::from(block_size));
     tracing::info!(
         target: "remanence_write_diag",
         phase = "drive_prepare",
@@ -2192,6 +2208,10 @@ fn prepare_drive_for_write(
         prior_compression = current_cfg.compression,
         target_block_size = ?target_cfg.block_size,
         target_compression = target_cfg.compression,
+        pipelined_submission,
+        staging_ring_buffers,
+        effective_batch_blocks,
+        effective_ring_bytes,
         rewind_verify_ms = crate::diagnostics::duration_ms(rewind_verify_elapsed),
         verify_bootstrap_ms = crate::diagnostics::duration_ms(verify_elapsed),
         rewind_write_ms = crate::diagnostics::duration_ms(rewind_write_elapsed),

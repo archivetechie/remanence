@@ -392,8 +392,37 @@ pub struct WriteBatchOutcome {
     position_evidence: PositionAfter,
 }
 
+/// Allocation-free write-submitter telemetry snapshot. Percentiles are
+/// derived from fixed microsecond buckets; maxima preserve exact samples.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PipelinedWriteDiagnostics {
+    /// Clean data commands recorded before any following tripwire.
+    pub good_commands: u64,
+    /// Records carried by clean data commands.
+    pub good_records: u64,
+    /// Bytes carried by clean data commands.
+    pub good_bytes: u64,
+    /// Median completion-to-next-submit gap in microseconds.
+    pub gap_p50_us: u64,
+    /// 95th-percentile completion-to-next-submit gap in microseconds.
+    pub gap_p95_us: u64,
+    /// Maximum completion-to-next-submit gap in microseconds.
+    pub gap_max_us: u64,
+    /// Median SG_IO duration in microseconds.
+    pub ioctl_p50_us: u64,
+    /// 95th-percentile SG_IO duration in microseconds.
+    pub ioctl_p95_us: u64,
+    /// Maximum SG_IO duration in microseconds.
+    pub ioctl_max_us: u64,
+    /// Mean submit-to-submit cadence in microseconds.
+    pub cadence_us: u64,
+    /// Effective bytes fed per second over the observed command span.
+    pub effective_feed_bytes_per_second: u64,
+}
+
 impl WriteBatchOutcome {
-    pub(crate) fn from_computed_position(
+    /// Construct a batch outcome backed by an arithmetic cursor.
+    pub fn from_computed_position(
         records_written: u32,
         bytes_written: u32,
         early_warning: bool,

@@ -1566,6 +1566,7 @@ version = "0.0.1"
 dependencies = [
  "ciborium",
  "hyper-util",
+ "libc",
  "prost",
  "prost-build",
  "prost-derive",
@@ -1576,6 +1577,7 @@ dependencies = [
  "remanence-format",
  "remanence-library",
  "remanence-parity",
+ "remanence-scsi",
  "remanence-state",
  "remanence-stream",
  "rusqlite",

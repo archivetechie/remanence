@@ -454,6 +454,16 @@ fn eom_sense(key: u8) -> Vec<u8> {
     v
 }
 
+fn current_test_sense(key: u8, flags: u8, asc: u8, ascq: u8) -> Vec<u8> {
+    let mut sense = vec![0u8; 32];
+    sense[0] = 0x70;
+    sense[2] = (key & 0x0f) | flags;
+    sense[7] = 24;
+    sense[12] = asc;
+    sense[13] = ascq;
+    sense
+}
+
 #[test]
 fn write_eom_signal_early_warning_on_no_sense_plus_eom() {
     let s = eom_sense(0x00);
@@ -500,6 +510,37 @@ fn write_eom_signal_returns_none_for_deferred_sense() {
     let mut s = eom_sense(0x00);
     s[0] = 0x71;
     assert!(write_eom_signal(&s).is_none());
+}
+
+#[test]
+fn write_eom_signal_accepts_current_recovered_error_eom_but_not_ili_or_filemark() {
+    let mut sense = current_test_sense(0x01, 0x40, 0, 0);
+    let signal = write_eom_signal(&sense).expect("recovered EOM is an EW signal");
+    assert!(signal.early_warning);
+    assert!(!signal.end_of_medium);
+
+    sense[2] |= 0x20;
+    assert!(write_eom_signal(&sense).is_none(), "ILI is not plain EW");
+    sense[2] &= !0x20;
+    sense[2] |= 0x80;
+    assert!(
+        write_eom_signal(&sense).is_none(),
+        "FILEMARK is not plain EW"
+    );
+}
+
+#[test]
+fn reset_unit_attention_classifier_requires_current_29_00_through_04() {
+    for ascq in 0x00..=0x04 {
+        let sense = current_test_sense(0x06, 0, 0x29, ascq);
+        assert!(is_reset_unit_attention(&sense), "ASCQ {ascq:02x}");
+    }
+    assert!(!is_reset_unit_attention(&current_test_sense(
+        0x06, 0, 0x29, 0x05
+    )));
+    let mut deferred = current_test_sense(0x06, 0, 0x29, 0x00);
+    deferred[0] = 0x71;
+    assert!(!is_reset_unit_attention(&deferred));
 }
 
 #[test]

@@ -18,10 +18,12 @@ remanence-bru = { path = "../remanence-bru", optional = true }
 remanence-format = { path = "../remanence-format" }
 remanence-library = { path = "../remanence-library" }
 remanence-parity = { path = "../remanence-parity" }
+remanence-scsi = { path = "../remanence-scsi" }
 remanence-state = { path = "../remanence-state" }
 remanence-stream = { path = "../remanence-stream" }
 ciborium.workspace = true
 hyper-util.workspace = true
+libc.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true

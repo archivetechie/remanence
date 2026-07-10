@@ -228,6 +228,17 @@ message Drive {
   uint64 counter_epoch    = 13;
   bytes  session_id       = 14;
   repeated string active_alert_names = 15;
+  bool tape_io_pipelined_submission = 16;
+  uint32 tape_io_staging_ring_buffers = 17;
+  uint32 tape_io_effective_batch_blocks = 18;
+  uint64 tape_io_gap_p50_us = 19;
+  uint64 tape_io_gap_p95_us = 20;
+  uint64 tape_io_gap_max_us = 21;
+  uint64 tape_io_ioctl_p50_us = 22;
+  uint64 tape_io_ioctl_p95_us = 23;
+  uint64 tape_io_ioctl_max_us = 24;
+  uint64 tape_io_cadence_us = 25;
+  uint64 tape_io_effective_feed_bytes_per_second = 26;
 }
 
 message DriveCatalogEntry {
