@@ -1,7 +1,8 @@
 # Prompt TIO-5b — pipelined submission, read side + read diag parity + spool orphan reconciliation
 
-**Status:** pending (cut 2026-07-10 from FROZEN design v0.4; dispatch AFTER
-TIO-5a lands — it builds on the ring/submitter primitives).
+**Status:** pending (cut 2026-07-10 from FROZEN design v0.5, st-harvest
+folded; dispatch AFTER TIO-5a lands — it builds on the ring/submitter
+primitives).
 **Normative source — read first and treat as binding:**
 `docs/design-tape-io-pipelined-submission-v0.1.md` (v0.5), §§5, 6, 8, 9, 10.
 Same frozen constraints as TIO-5a.
