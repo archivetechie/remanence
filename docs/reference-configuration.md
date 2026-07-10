@@ -160,12 +160,12 @@ Serves `rem top` and the live-status RPC. Optional.
 <!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-library/src/handle/mod.rs @ 7fb10f8 -->
 ## `[tape_io]`
 
-Tape I/O batching. Optional. These defaults come from the throughput work
-that replaced one-record-per-CDB I/O with batched fixed-block transfers.
+Tape I/O batching and staging-ring settings. Optional. Fixed-block pipelined
+submission is the only tape transfer path; removed mode keys are rejected.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `legacy_single_block` | bool | `false` | Back out to the original single-record variable-mode I/O path. |
+| `staging_ring_buffers` | integer 2..=16 | `4` | Page-aligned buffers allocated per active drive for staged submission. |
 | `write_batch_blocks` | integer > 0 | `16` | Fixed-size records requested per WRITE(6) before the SG driver or HBA clamps the transfer. |
 | `read_batch_blocks` | integer > 0 | `16` | Fixed-size records requested per READ(6). |
 | `position_check_bytes` | byte size | `1073741824` (1 GiB) | Cadence of mid-stream READ POSITION drift tripwires. `0` disables mid-stream checks (boundary checks remain). |

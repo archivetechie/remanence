@@ -178,22 +178,6 @@ impl<'a> BatchingBlockSource<'a> {
         if self.remaining_records == 0 {
             return Ok(());
         }
-        if self.inner.legacy_single_block() {
-            self.buffer.resize(self.block_size, 0);
-            let bytes_read = self.inner.read_block(&mut self.buffer)?;
-            if bytes_read != self.block_size {
-                return Err(TapeIoError::OperationFailed(format!(
-                    "legacy read returned unexpected block size: expected {} got {bytes_read}",
-                    self.block_size
-                )));
-            }
-            self.buffer.truncate(bytes_read);
-            self.buffered_records = 1;
-            self.remaining_records = self.remaining_records.checked_sub(1).ok_or_else(|| {
-                TapeIoError::OperationFailed("legacy read remaining underflow".to_string())
-            })?;
-            return Ok(());
-        }
         let block_size_bytes = u32::try_from(self.block_size).map_err(|_| {
             TapeIoError::OperationFailed("read batch block size exceeds u32".to_string())
         })?;
@@ -276,10 +260,6 @@ impl BlockSource for BatchingBlockSource<'_> {
 
     fn read_batch_blocks(&self, block_size_bytes: u32) -> u32 {
         self.inner.read_batch_blocks(block_size_bytes)
-    }
-
-    fn legacy_single_block(&self) -> bool {
-        self.inner.legacy_single_block()
     }
 
     fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
@@ -698,58 +678,6 @@ mod tests {
                 } if *requested_records > 1
             )),
             "read core must use the batched BlockSource primitive: {:?}",
-            source.calls
-        );
-    }
-
-    #[test]
-    fn read_object_payload_legacy_mode_uses_single_block_reads() {
-        let opts = options(512);
-        let payload = (0..3000)
-            .map(|value| u8::try_from(value % 251).unwrap())
-            .collect::<Vec<_>>();
-        let files = [RemTarFile {
-            path: "payload.bin",
-            file_id: "file-payload",
-            data: payload.as_slice(),
-            mtime: Some("0"),
-            executable: Some(false),
-        }];
-        let mut block_sink = VecBlockSink::new();
-        let layout = write_rem_tar_object(&mut block_sink, &opts, &files).unwrap();
-        let mut source = VecBlockSource::new(block_sink.blocks)
-            .with_read_batch_blocks_for_test(4)
-            .with_legacy_single_block_for_test();
-        let mut restored = Vec::new();
-        let mut sink = CapturePayloadSink::new(&mut restored);
-
-        read_object_payload(
-            &mut source,
-            opts.chunk_size,
-            layout.projected_size_blocks,
-            0,
-            None,
-            &mut sink,
-        )
-        .unwrap();
-
-        let (bytes_written, _digest) = sink.finish().unwrap();
-        assert_eq!(bytes_written, payload.len() as u64);
-        assert_eq!(restored, payload);
-        assert!(
-            source
-                .calls
-                .iter()
-                .any(|call| matches!(call, VecBlockSourceCall::ReadBlock { .. })),
-            "legacy fallback must issue read_block calls: {:?}",
-            source.calls
-        );
-        assert!(
-            !source
-                .calls
-                .iter()
-                .any(|call| matches!(call, VecBlockSourceCall::ReadBlockBatch { .. })),
-            "legacy fallback must not issue read_block_batch calls: {:?}",
             source.calls
         );
     }
