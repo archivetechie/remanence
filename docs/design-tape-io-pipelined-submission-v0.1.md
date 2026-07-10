@@ -1,6 +1,20 @@
-# Tape I/O pipelined submission (TIO-5) — staging ring, hot submitter, in-place accounting — Design v0.5
+# Tape I/O pipelined submission (TIO-5) — staging ring, hot submitter, in-place accounting — Design v0.6
 
-**Status:** **FROZEN v0.5** (2026-07-10) — panel (4 lenses incl. codex
+**Status:** **FROZEN v0.6** (2026-07-10) — v0.6 = OWNER DECISION (the owner,
+post-diff-gate): the `pipelined_submission` runtime backout flag is
+**REMOVED**. Rationale: nothing is in production — git revert + the
+previous binary IS the backout; the flag's dual-path requirement directly
+created defect surface (diff-gate findings 1/5/7/9/10 all trace to it) and
+a permanent drift liability. Consequences: the pipelined path is THE
+batched path; the TIO-3/4 non-pipelined batched path and its
+StagedBlockSink are DELETED; `legacy_single_block` remains the single
+in-binary fallback (it is the only physically-validated path today) and
+its own removal is queued for after the pipelined path passes physical
+acceptance (§8); the two-tier ON/OFF equivalence machinery is replaced by
+**golden fixtures captured from main** (command stream + timeout classes)
+plus the existing cross-version stored-image tests as the on-tape
+compatibility proof. §§6.2/7/9/10 amended accordingly.
+Prior status: FROZEN v0.5 — panel (4 lenses incl. codex
 gpt-5.6-sol) → fold → verify → fold → re-verify → fold → re-verify-2
 **PASS**; then **st-harvest pass folded** (the owner-ordered pre-dispatch;
 `report-st-harvest-2026-07-10.md`, gpt-5.6-sol, verdict FOLD 4 FIRST):
@@ -306,26 +320,27 @@ Testable claims, all asserted hermetically:
 
 1. **Exactly one SCSI data command in flight, ever** (model transport
    asserts no overlapping execute).
-2. **Equivalence, two-tier (verify-round fix — exact ON/OFF audit
-   equivalence is impossible by design, since ON coalesces good-path
-   events):**
-   - **OFF vs shipped TIO-3/4: exact** — CDB stream, timeout-class stream,
-     audit event sequence, and poison behavior all byte/sequence-identical.
-   - **ON vs OFF:** CDB stream byte-identical (same WRITEs, same tripwire
-     RPs, same filemarks — only timing changes) and timeout-class stream
-     identical; audit compared as a **normalized semantic trace** —
-     exception/filemark/fence events exact in order and content; good-path
-     per-command Started/Finished events map to the window intent marker +
-     coalesced span with matching command counts and bytes. The
-     individually-audited classes preserved 1:1 are exactly §4's list:
-     errors, EW/EOM signals, recovered-error completions, reset-UA state
-     invalidations, tripwire RPs (including successful ones), filemarks,
-     fences, session open/close.
+2. **Golden-fixture regression vs main (v0.6 — replaces the two-tier
+   ON/OFF equivalence, which died with the flag):**
+   - **Command-stream fixtures:** the exact CDB sequence and per-command
+     timeout classes for a canonical write and read transfer are captured
+     from `main` (pre-TIO-5a) as checked-in fixtures; the pipelined path
+     must reproduce them exactly modulo the DESIGNED deltas, each named in
+     the fixture manifest (batched WRITE grouping is identical; tripwire
+     RP cadence identical; timeout values 900 s per F3).
+   - **On-tape compatibility:** cross-version stored-image tests (old code
+     reads a pipelined-written image; pipelined code reads an old image)
+     remain the format-unchanged proof.
+   - **Audit-trace shape:** exception/filemark/fence/recovered/reset-UA
+     events (§4's individually-audited list) are asserted 1:1 against
+     fixture expectations; good-path per-command events are replaced by
+     the window intent marker + coalesced span with reconciling counts
+     and bytes — asserted as such, not against main.
    **Preconditions (panel):** identical sg reserved size and tape-sourced
    block size at open; the trailing partial batch rebuilds its CDB. The
-   model transport gains timeout-class recording to make the timeout tier
-   visible (today its `set_timeout_for` is a no-op, which would let a
-   timeout regression pass a CDB-only test).
+   model transport gains timeout-class recording to make timeout
+   regressions visible (its `set_timeout_for` was a no-op, which would let
+   a timeout regression pass a CDB-only test).
 3. **Commit barrier unchanged:** all data GOOD (recorded) → blocking WRITE
    FILEMARKS (which sets its own timeout class, unaffected by this design) →
    DevicePositionProof → journal fsync → SQLite. The layer-5 ordering and
@@ -348,26 +363,24 @@ Crash table (extends TIO-3 §5.1; chaos kill per row):
 | **spool file at SIGKILL** | **corrected (panel):** `Spool::Drop` removes only on normal unwinding — SIGKILL orphans the file (on tmpfs: RAM held across crashes, outside the budget). TIO-5b adds **startup orphan reconciliation**: enumerate owned `spool-*.bin`, record evidence, remove, account remaining tmpfs budget — before accepting writes |
 | after last data GOOD, before filemark | unchanged layer-5 row: tail without journal record is fenced, never adopted |
 
-## 7. Config and backout
+## 7. Config and backout (v0.6)
 
 ```toml
 [tape_io]
-pipelined_submission = false   # SHIPS DEFAULT-OFF (panel): flip per-host
-                               # after physical validation; false = exact
-                               # TIO-3/4 staged behavior
 staging_ring_buffers = 4       # validated 2..=16; checked allocation;
                                # effective per-drive ring bytes logged
 ```
 
-Backout ladder: `legacy_single_block` > `pipelined_submission` (legacy
-implies pipelining off). **Fleet rollout (panel):** `TapeIoConfig` rejects
-unknown fields, so old binaries refuse the new keys — ship code fleet-wide
-default-off first, drain active sessions, then enable canaries and widen.
-Config is snapshotted at drive-open: editing the file affects neither active
-sessions nor their backout — the **effective mode is exposed in live
-status/diag** so an operator can see what a session is actually running.
-Memory: ring × effective batch bytes per active drive (4 MiB at the current
-1 MiB grant; 16 MiB if the grant reaches 4 MiB).
+**No runtime pipelining flag (owner decision, v0.6).** The pipelined path
+is the batched path. Backout, pre-production, is git revert + redeploying
+the previous binary (the remfield kit can carry both binaries for
+physical-window A/B if wanted). `legacy_single_block` remains the single
+in-binary fallback — it is the only path validated on physical hardware
+today — and is queued for deletion once the pipelined path passes the §8
+physical acceptance. The **effective mode (legacy vs pipelined) is exposed
+in live status/diag**. Memory: ring × effective batch bytes per active
+drive (4 MiB at the current 1 MiB grant; 16 MiB if the grant reaches
+4 MiB).
 
 ## 8. Instrumentation (the field-verifiable mechanism)
 
@@ -412,14 +425,13 @@ hermetic acceptance = invariants + counters, the library proves the number.
 
 Hermetic (model transport / chaos):
 - single-command-in-flight assertion under pipelining;
-- equivalence, two-tier per §6.2: (i) **OFF vs shipped TIO-3/4** — exact
-  CDB, timeout-class, audit-event-sequence, and poison-behavior
-  equivalence; (ii) **ON vs OFF** — byte-identical CDB stream + identical
-  timeout-class stream + normalized audit trace (every §4
-  individually-audited class preserved 1:1; only good data-WRITE
-  Started/Finished pairs fold into intent marker + coalesced span, with
-  command counts and bytes reconciling). Model transport records timeout
-  classes (new test infra, panel);
+- golden-fixture regression per §6.2 (v0.6): checked-in fixtures captured
+  from main assert the CDB sequence + per-command timeout classes for
+  canonical write/read transfers, modulo the named designed deltas
+  (900 s timeouts); audit-trace shape asserted per §6.2 (individually-
+  audited classes 1:1, good-path events as intent marker + reconciling
+  coalesced span). Model transport records timeout classes (new test
+  infra, panel);
 - timeout-class regression around the tripwire: WRITE after tripwire RP and
   after error-path RP runs at TapeIo (900 s, st-harvest F3), never
   TapeStatus (5 s) —
@@ -479,10 +491,9 @@ Hermetic (model transport / chaos):
   enumerates, evidences, removes, re-accounts tmpfs budget before accepting
   writes; foreign files untouched;
 - crash table rows (§6) via chaos kill injection;
-- config: `pipelined_submission=false` reproduces TIO-3/4 behavior
-  (CDB + timeout + audit + poison equivalence, not CDB-only);
-  `legacy_single_block=true` still reproduces the original serial stream;
-  effective mode visible in status.
+- config (v0.6): `legacy_single_block=true` still reproduces the original
+  serial stream exactly; ring-bounds validation; effective mode (legacy vs
+  pipelined) visible in status.
 - Scenario: extend `scenario-append` `covers` with `rem.tape.pipelined_io`;
   full `~/system` suite green from clean slate.
 
@@ -491,7 +502,7 @@ Hermetic (model transport / chaos):
 1. **TIO-5a** — write side: staging ring + invariants, submitter hot loop
    (audit-free good-path variant, decode helpers extracted unmodified),
    in-place accounting + coalesced spans + intent marker, poison protocol,
-   config keys (default-off) + effective-mode status, model-transport
+   config keys + effective-mode status, model-transport
    timeout-class recording, hermetic coverage (§9 write-side rows).
 2. **TIO-5b** — read side: read pipeline + typed handoff + staged-CDB
    cancellation, read diag parity, **spool orphan reconciliation**,
@@ -502,7 +513,8 @@ Hermetic (model transport / chaos):
    v0.5 (F1 reset-UA class, F2 recovered-error class, F3 900 s timeouts,
    F4 ILI cursor invalidation); 15 oracle items feed the st-parity
    program's executable-oracle leg; 12 cruft items documented-discarded.
-4. Physical validation next window per §8 (flip `pipelined_submission` on
-   validated hosts after acceptance); then **A7 streaming ingest** (now the
+4. Physical validation next window per §8 (acceptance also triggers the
+   queued `legacy_single_block` removal decision); then **A7 streaming
+   ingest** (now the
    named dual-drive-at-rate unlock — it deletes the spool and its RAM
    budget) and A1 lazy dismount take over the remaining end-to-end wall.

@@ -1,47 +1,66 @@
-# Prompt TIO-5a-fixes — diff-gate findings on the pipelined write path
+# Prompt TIO-5a-fixes — flag removal + diff-gate findings on the pipelined write path
 
-**Status:** pending (cut 2026-07-10 from the TIO-5a diff gate — 6 CONFIRMED
-correctness findings + 4 cleanups; branch `tio-5a-wip-20260710`, base commit
-`603a921`).
+**Status:** pending (cut 2026-07-10 from the TIO-5a diff gate; REVISED same
+day for the v0.6 owner decision — the runtime backout flag is removed).
 **Work ON the branch `tio-5a-wip-20260710`** (do NOT merge to main; do not
 rebase). **Normative:** `docs/design-tape-io-pipelined-submission-v0.1.md`
-(FROZEN v0.5) and `docs/prompt-tio-5a.md`. The findings below are verified
-against the code — fix root causes, not symptoms. Every correctness fix
-ships a regression test reproducing its failure scenario.
+(**FROZEN v0.6** — read the v0.6 status block and §§6.2/7 first; they
+changed after the code on this branch was written) and
+`docs/prompt-tio-5a.md`. Findings are verified against the code — fix root
+causes. Every correctness fix ships a regression test reproducing its
+failure scenario.
+
+## Fix 0 — remove the runtime flag; one batched path (design v0.6)
+
+Delete `tape_io.pipelined_submission` (config key, plumbing, effective-mode
+branching). The pipelined path IS the batched path:
+
+- Delete the non-pipelined batched transfer path and its machinery
+  (`StagedBlockSink` and friends) — `legacy_single_block` remains the only
+  in-binary fallback and must still reproduce the original serial
+  per-block stream exactly (existing tests keep proving it).
+- `PipelinedStagedBlockSink` (rename appropriately) is now the only
+  batched sink — this subsumes diff-gate finding 9 (the near-verbatim
+  copies die with the old sink).
+- Replace the ON/OFF equivalence tests with **golden fixtures captured
+  from main** (design §6.2 v0.6): check in the canonical write/read
+  command-stream + timeout-class fixtures generated from main
+  (git worktree of main, or committed fixture files produced by a
+  fixture-gen test on main — state in your summary how you generated
+  them), and assert the pipelined path reproduces them modulo the named
+  designed deltas (900 s timeout values). Cross-version stored-image
+  tests stay.
+- Effective mode in status/diag simplifies to legacy vs pipelined.
 
 ## Correctness fixes (all mandatory)
 
-1. **Fence every pipelined transfer error** —
-   `crates/remanence-api/src/pool_write.rs:2935` (+ the no-parity variant
-   ~:3100, and :2155): the outer error path is gated on
-   `if !pipelined_submission`, so producer-side errors (source read I/O,
-   parity/format) and SPACE(EOD)/Position failures inside the drain never
-   call `record_tape_io_fence_for_transfer_error`, while TIO-3/4 fenced
-   every transfer error. Fix: pipelined transfers must reach the same
-   fence-recording path for EVERY transfer error class, not only
-   window/filemark sink failures via `on_safety_error`. Test: producer
-   fails after ≥1 committed window ⇒ fence row present; same for
-   space_to_end_of_data and position failures.
+1. **Fence every transfer error class** —
+   `crates/remanence-api/src/pool_write.rs:2935` (+ no-parity variant
+   ~:3100, :2155): with the flag gone the `if !pipelined_submission` gate
+   dies, but the pipelined drain must still route EVERY transfer error
+   into `record_tape_io_fence_for_transfer_error` — producer-side errors
+   (source read I/O, parity/format), SPACE(EOD) failures, and Position
+   failures included, exactly as TIO-3/4 fenced every transfer error.
+   Test: producer fails after ≥1 committed window ⇒ fence row present;
+   same for space_to_end_of_data and position failures.
 
-2. **Never let ring plumbing mask a device error** —
-   `pool_write.rs:2208` (`execute_pipelined_window`) and :2289
+2. **Never let ring plumbing mask a device error** — `pool_write.rs:2208`
+   (`execute_pipelined_window`) and :2289
    (`finish_pipelined_window_failure`): `return_ring_buffer(...)?` runs
-   BEFORE the write result is examined, so a disconnected free ring
-   (producer already exited) discards a fence-worthy device failure and
-   its deferred audit, surfacing a channel-plumbing error instead. Fix:
-   evaluate/record the device outcome first; treat buffer-return failure
-   as secondary (log/attach, never replace). Test: producer drops sink
-   mid-window + in-flight WRITE partial-fails ⇒ fence row with the tape
-   error, deferred sense audited, surfaced error names the tape failure.
+   BEFORE the write result is examined; a disconnected free ring discards
+   a fence-worthy device failure and its deferred audit. Fix: evaluate and
+   record the device outcome first; buffer-return failure is secondary
+   (log/attach, never replace). Test: producer drops sink mid-window +
+   in-flight WRITE partial-fails ⇒ fence row records the tape error,
+   deferred sense audited, surfaced error names the tape failure.
 
 3. **Audit emission must not depend on fence success** —
    `pool_write.rs:2291` and the WriteFilemarks drain arm (:2142-2145):
    `on_safety_error(&error)?` returns before the deferred pipeline audit
-   flushes, so a fence-write failure (catalog DB error) loses the SCSI
-   error audit entirely. Design rule: fence-before-audit is an ORDERING,
-   not a dependency — audit evidence must flush even when the fence write
-   fails (both failures surfaced). Fix + test: fence callback errors ⇒
-   deferred audit still flushed, both errors reported.
+   flushes. Design rule: fence-before-audit is an ORDERING, not a
+   dependency — audit evidence flushes even when the fence write fails
+   (both failures surfaced). Test: fence callback errors ⇒ deferred audit
+   still flushed, both errors reported.
 
 4. **Make reset-UA recovery reachable** —
    `crates/remanence-library/src/handle/tape_io/mod.rs:2069`:
@@ -49,67 +68,50 @@ ships a regression test reproducing its failure scenario.
    daemon-lifetime DriveHandle — `prepare_drive_for_write`
    (write_owner.rs:2151) runs `verify_tape_identity` (read gated by the
    flag) BEFORE `read_config`, and `write_config` refuses revalidation
-   while the flag is set. Fix per design §3.2 state-invalidating recovery:
-   the write-prepare path must perform MODE SENSE re-verification of the
-   tape-sourced block size (and re-prove position) as the FIRST step when
-   the flag is set, clearing it on success — before any read-dependent
-   step. Test: reset-UA mid-session ⇒ next prepare on the same handle
-   succeeds after re-verification; no daemon restart required.
+   while the flag is set. Fix per design §3.2: when the flag is set, the
+   write-prepare path performs MODE SENSE re-verification of the
+   tape-sourced block size (and re-proves position) FIRST, clearing the
+   flag on success. Test: reset-UA mid-session ⇒ next prepare on the same
+   handle succeeds after re-verification; no daemon restart.
 
-5. **Restore OFF-path read equivalence** — `tape_io/mod.rs:1258`
+5. **Scope the read-side state gate correctly** — `tape_io/mod.rs:1258`
    (`read_block_batch`) and :1406 (`read_block`): the
-   `ensure_position_known_for_write` gate was added unconditionally —
-   a flag-independent behavior change to the `pipelined_submission=false`
-   path (contract: exact TIO-3/4 reproduction) and broader than the
-   design's reset-UA-only read-side mandate (F1). Fix: scope the read-side
-   gate to the state-invalidating class (reset-UA / mode-invalidated),
-   applied identically in both modes only where design §5 mandates it;
-   OFF-path behavior for other completion-unknown classes reverts to
-   TIO-3/4. Rename the helper so its name no longer claims "for_write".
-   Test: OFF-path equivalence extended to cover reads after a
-   non-reset completion-unknown event.
+   `ensure_position_known_for_write` gate fires for ALL completion-unknown
+   classes — broader than design §5's mandate (state-invalidating
+   reset-UA / mode-invalidated only). Scope it to the state-invalidating
+   class; rename the helper so it no longer claims "for_write". Test:
+   reads after a non-reset completion-unknown event behave as TIO-3/4
+   did; reads after reset-UA refuse until position + MODE re-proof.
 
 6. **Preserve the WRITE's sense when arbitration RP fails** —
    `tape_io/mod.rs:1162` (`write_block_batch_pipelined` EOM path):
    `self.read_position_pipelined()?` drops the original WRITE's non-GOOD
    sense — no TapeWrite audit, fence misclassified as `transfer_error`
    instead of `partial_batch`. Fix: on RP failure, still audit the WRITE
-   with its sense, classify the fence from the WRITE outcome
-   (completion-unknown/partial), and attach the RP failure as secondary.
-   Test: EOM WRITE failure + injected RP failure ⇒ WRITE audit present,
-   fence reason `partial_batch`/completion-unknown, RP error attached.
+   with its sense, classify the fence from the WRITE outcome, attach the
+   RP failure as secondary. Test: EOM WRITE failure + injected RP failure
+   ⇒ WRITE audit present, fence reason correct, RP error attached.
 
-## Cleanups (mandatory unless a fix above already removes the code)
+## Cleanups
 
-7. `tape_io/mod.rs:1162` vs :969/:1798 — EW/EOM classification uses
-   audited `read_position_pipelined()` on the ON path but unaudited
-   `read_position_inline()` on OFF/write_filemarks: unify so the ON-vs-OFF
-   normalized audit trace does not diverge for the EW/EOM class.
-8. `pool_write.rs:2100` — the ring-accounting imbalance check must not
+7. `pool_write.rs:2100` — the ring-accounting imbalance check must not
    replace a real transfer error; attach, don't overwrite.
-9. `pool_write.rs:1791` — deduplicate
-   `PipelinedStagedBlockSink::{check_poison, request, seed_cursor,
-   advance_cursor}` against `StagedBlockSink` (:1473+); one behavioral
-   drift already exists — eliminate it via shared code.
-10. `tape_io/mod.rs:2182` — `read_position_pipelined_expected` must wrap
-    `read_position_inline_with_cdb` (:2268), not re-implement its
-    execute/parse/record core.
+8. `tape_io/mod.rs:2182` — `read_position_pipelined_expected` must wrap
+   `read_position_inline_with_cdb` (:2268), not re-implement its
+   execute/parse/record core. Same policy for the :1162 vs :969/:1798
+   READ POSITION split — one helper, one audit policy, used everywhere.
 
-## Structural invariants (bind every fix above)
+## Structural invariants (binding)
 
-- **Single safety funnel:** every transfer-error class, in BOTH modes,
-  terminates in the same fence-recording path. Acceptance is grep-level:
-  after your fixes, no `record_tape_io_fence*` call site (or its caller
-  chain) is gated on `pipelined_submission`. New-path plumbing may differ;
-  the safety funnel may not.
-- **Golden-baseline equivalence:** the OFF-vs-shipped tier must assert
-  against fixtures captured from `main` (pre-TIO-5a) behavior — command
-  stream, timeout classes, audit sequence, read preconditions — not
-  against this branch's own OFF mode. Generate the fixtures from main
-  (git worktree or committed fixture files) and check them in.
-- **Wrap, don't copy:** where the design says helpers are reused
-  unmodified, a near-verbatim copy is a defect even if tests pass
-  (findings 9/10 exist because of this).
+- **Single safety funnel, by construction:** after Fix 0 there is one
+  batched path; every error class terminates in the one fence-recording
+  funnel. Acceptance is grep-level: no safety call site conditioned on
+  any mode flag; `record_tape_io_fence*` reachable from exactly one
+  funnel.
+- **Golden-baseline fixtures** are generated from main, never from this
+  branch's own behavior.
+- **Wrap, don't copy:** a near-verbatim copy of an existing helper is a
+  defect even with green tests.
 
 ## Definition of done
 
@@ -117,4 +119,5 @@ AGENTS.md applies: `cargo test --workspace` green, `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, socket tests run (sandbox
 limits reported, never `#[ignore]`d), commit per green milestone ON THE
 BRANCH. No design deviations — raise instead of deviating. Summary lists
-each finding # → fix commit → regression test name.
+each fix # → commit → regression test name, and how the golden fixtures
+were generated.
