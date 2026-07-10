@@ -175,9 +175,13 @@ to ring → repeat.
     (st-harvest F2 — the drive fixed its own hiccup): successful
     completion, **audited-as-recovered** (feeds health correlation);
     (c) **RECOVERED ERROR + EOM** joins the EW class and is arbitrated by
-    the same exact pre-position/post-RP delta rule. **No fence, no stop**
-    for any of these; signals propagate to the existing pool-write policy.
-    Deferred sense (0x71/0x73) NEVER enters this class.
+    the same exact pre-position/post-RP delta rule — **full-record ⇒
+    success-with-EW; partial ⇒ safety-relevant** (below), exactly like
+    NO-SENSE EW. **No fence, no stop** for (a), (b), and full-record (c);
+    signals propagate to the existing pool-write policy. On fixed READ,
+    recovered-with-no-terminal-flags is likewise success, delivering only
+    proven-complete records via the §5 typed handoff (`valid_bytes`
+    retained). Deferred sense (0x71/0x73) NEVER enters this class.
   - **State-invalidating current sense** (st-harvest F1) — UNIT ATTENTION
     for power-on/reset (`06/29/00..04`): the command did not execute, but
     the drive's state did — position and mode configuration are no longer
@@ -281,7 +285,12 @@ the tape, so the pre-ILI cached position is untrustworthy — the handoff is
 withheld, `expected_position` is cleared, and the next data command
 requires an explicit reposition + device position proof. st's automatic
 backspace recovery is deliberately NOT copied; explicit re-proof is
-stronger.
+stronger. **Read-side classification parity (st-harvest F1/F2):** a fixed
+READ completing with current RECOVERED ERROR and no terminal flags is a
+success delivering only proven-complete records (`valid_bytes` set
+accordingly); a reset-UA (`06/29/xx`) on READ is state-invalidating
+exactly as on the write path (§3.2) — stop, invalidate cursor + mode
+validation, re-prove before further reads.
 
 **Read diag parity (closes field gap #4):** the read path gains the write
 path's full decomposition — per-phase times (locate/position, transfer,
@@ -309,8 +318,9 @@ Testable claims, all asserted hermetically:
      per-command Started/Finished events map to the window intent marker +
      coalesced span with matching command counts and bytes. The
      individually-audited classes preserved 1:1 are exactly §4's list:
-     errors, EW/EOM signals, tripwire RPs (including successful ones),
-     filemarks, fences, session open/close.
+     errors, EW/EOM signals, recovered-error completions, reset-UA state
+     invalidations, tripwire RPs (including successful ones), filemarks,
+     fences, session open/close.
    **Preconditions (panel):** identical sg reserved size and tape-sourced
    block size at open; the trailing partial batch rebuilds its CDB. The
    model transport gains timeout-class recording to make the timeout tier

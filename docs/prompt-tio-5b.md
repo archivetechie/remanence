@@ -3,7 +3,7 @@
 **Status:** pending (cut 2026-07-10 from FROZEN design v0.4; dispatch AFTER
 TIO-5a lands — it builds on the ring/submitter primitives).
 **Normative source — read first and treat as binding:**
-`docs/design-tape-io-pipelined-submission-v0.1.md` (v0.4), §§5, 6, 8, 9, 10.
+`docs/design-tape-io-pipelined-submission-v0.1.md` (v0.5), §§5, 6, 8, 9, 10.
 Same frozen constraints as TIO-5a.
 
 ## Scope (design §10 item 2)
@@ -21,6 +21,12 @@ Same frozen constraints as TIO-5a.
    (design §5, st-harvest F4)**: handoff withheld, `expected_position`
    cleared, next data command requires explicit reposition + device
    position proof — do NOT copy st's automatic backspace recovery.
+   **Read-side classification parity (design §5, st-harvest F1/F2):**
+   fixed READ with current RECOVERED ERROR and no terminal flags =
+   success delivering only proven-complete records (`valid_bytes` set
+   accordingly, audited-as-recovered); reset-UA `06/29/xx` on READ =
+   state-invalidating exactly as the write path (stop, invalidate cursor
+   + mode validation, re-prove position + MODE before further reads).
 2. **Read diag parity** (design §5 — closes field gap #4): restore path
    gains the write path's decomposition — per-phase times (locate/position,
    transfer, relay), per-command cadence histograms (`gap_us`, `ioctl_us`),
@@ -52,6 +58,13 @@ Same frozen constraints as TIO-5a.
   withheld, `expected_position` cleared, no subsequent data CDB without
   explicit reposition + device position proof (assert no cached-position
   reuse);
+- recovered-error READ (design §5): current `0x70/key=1` no terminal
+  flags → success, only proven-complete records delivered, `valid_bytes`
+  consistent, audited-as-recovered; deferred `0x71/0x73` key=1 →
+  completion-unknown always;
+- reset-UA on READ (design §5/§9): `06/29/xx` mid-restore → pipeline
+  stops, staged CDB cancelled, cursor + mode validation invalidated, no
+  further READ without position proof + MODE re-verification;
 - fail-closed outcomes withhold the buffer (read_core behavior preserved);
 - read batching under pipelining: batch never crosses a tape-file boundary;
   SILI stays 0; read-side MODE SELECT step (TIO-2) unchanged;
