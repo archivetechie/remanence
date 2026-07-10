@@ -75,9 +75,85 @@ type TransportFactory = Box<dyn FnMut(&Path) -> Result<Box<dyn SgTransport>, IoE
 
 /// Default fixed-record batch size for tape READ/WRITE CDBs.
 pub const DEFAULT_TAPE_IO_BATCH_BLOCKS: u32 = 16;
+/// Default number of page-aligned write buffers in the pipelined staging ring.
+pub const DEFAULT_TAPE_IO_STAGING_RING_BUFFERS: u32 = 4;
+/// Smallest supported staging ring. A depth of one is not a pipeline.
+pub const MIN_TAPE_IO_STAGING_RING_BUFFERS: u32 = 2;
+/// Largest supported staging ring, bounding per-drive locked working memory.
+pub const MAX_TAPE_IO_STAGING_RING_BUFFERS: u32 = 16;
 const DEFAULT_TAPE_IO_RECORD_BYTES_FOR_RESERVED_BUFFER: u32 = 256 * 1024;
 /// Default arithmetic-position drift tripwire cadence.
 pub const DEFAULT_TAPE_IO_POSITION_CHECK_BYTES: u64 = 1024 * 1024 * 1024;
+
+const PIPELINE_HISTOGRAM_UPPER_US: [u64; 12] = [
+    10,
+    25,
+    50,
+    100,
+    250,
+    500,
+    1_000,
+    2_500,
+    5_000,
+    10_000,
+    50_000,
+    u64::MAX,
+];
+
+#[derive(Debug, Default)]
+struct PipelineHistogram {
+    buckets: [u64; PIPELINE_HISTOGRAM_UPPER_US.len()],
+    samples: u64,
+    max: u64,
+}
+
+impl PipelineHistogram {
+    fn record(&mut self, sample_us: u64) {
+        let bucket = PIPELINE_HISTOGRAM_UPPER_US
+            .iter()
+            .position(|upper| sample_us <= *upper)
+            .unwrap_or(PIPELINE_HISTOGRAM_UPPER_US.len() - 1);
+        self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
+        self.samples = self.samples.saturating_add(1);
+        self.max = self.max.max(sample_us);
+    }
+
+    fn percentile(&self, numerator: u64, denominator: u64) -> u64 {
+        if self.samples == 0 {
+            return 0;
+        }
+        let wanted = self
+            .samples
+            .saturating_mul(numerator)
+            .saturating_add(denominator - 1)
+            / denominator;
+        let mut seen = 0u64;
+        for (count, upper) in self.buckets.iter().zip(PIPELINE_HISTOGRAM_UPPER_US) {
+            seen = seen.saturating_add(*count);
+            if seen >= wanted {
+                return if upper == u64::MAX { self.max } else { upper };
+            }
+        }
+        self.max
+    }
+}
+
+#[derive(Debug, Default)]
+struct PipelineDiagnostics {
+    gap_us: PipelineHistogram,
+    ioctl_us: PipelineHistogram,
+    good_commands: u64,
+    good_records: u64,
+    good_bytes: u64,
+    first_submit: Option<Instant>,
+    previous_completion: Option<Instant>,
+    last_completion: Option<Instant>,
+}
+
+struct PendingPipelineAudit {
+    operation: AuditOp,
+    outcome: AuditOutcome,
+}
 
 /// Runtime tape-I/O settings applied when a drive handle is opened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +161,10 @@ pub struct TapeIoRuntimeConfig {
     /// Exact legacy behavior: variable-mode single-record I/O and per-block
     /// write-side READ POSITION.
     pub legacy_single_block: bool,
+    /// Enable the write-side page-aligned staging ring and hot submitter.
+    pub pipelined_submission: bool,
+    /// Number of buffers in the write-side staging ring.
+    pub staging_ring_buffers: u32,
     /// Requested fixed records per WRITE(6) before sg/HBA clamping.
     pub write_batch_blocks: u32,
     /// Requested fixed records per READ(6) before sg/HBA clamping.
@@ -98,6 +178,8 @@ impl Default for TapeIoRuntimeConfig {
     fn default() -> Self {
         Self {
             legacy_single_block: false,
+            pipelined_submission: false,
+            staging_ring_buffers: DEFAULT_TAPE_IO_STAGING_RING_BUFFERS,
             write_batch_blocks: DEFAULT_TAPE_IO_BATCH_BLOCKS,
             read_batch_blocks: DEFAULT_TAPE_IO_BATCH_BLOCKS,
             position_check_bytes: DEFAULT_TAPE_IO_POSITION_CHECK_BYTES,
@@ -961,11 +1043,17 @@ impl LibraryHandle {
             bytes_since_position_check: 0,
             position_check_bytes: tape_io.position_check_bytes,
             legacy_single_block: tape_io.legacy_single_block,
+            pipelined_submission: tape_io.pipelined_submission && !tape_io.legacy_single_block,
+            staging_ring_buffers: tape_io.staging_ring_buffers,
             requested_write_batch_blocks: tape_io.write_batch_blocks.max(1),
             requested_read_batch_blocks: tape_io.read_batch_blocks.max(1),
             effective_write_batch_blocks,
             effective_read_batch_blocks,
             sg_reserved_size_bytes,
+            pipeline_diagnostics: PipelineDiagnostics::default(),
+            pending_pipeline_audit: None,
+            validated_fixed_block_size: None,
+            mode_reverification_required: None,
             shared: self.changer.shared.clone(),
         })
     }
@@ -1487,6 +1575,10 @@ pub struct DriveHandle {
     position_check_bytes: u64,
     /// Exact legacy variable-mode single-block behavior switch.
     legacy_single_block: bool,
+    /// Effective write-side submission mode, after the legacy override.
+    pipelined_submission: bool,
+    /// Fixed page-aligned write-buffer ring depth.
+    staging_ring_buffers: u32,
     /// Configured write batch in fixed records before sg/HBA clamp.
     requested_write_batch_blocks: u32,
     /// Configured read batch in fixed records before sg/HBA clamp.
@@ -1497,6 +1589,14 @@ pub struct DriveHandle {
     effective_read_batch_blocks: u32,
     /// Actual sg reserved buffer size reported by the transport.
     sg_reserved_size_bytes: u32,
+    /// Allocation-free hot-submitter counters and fixed histograms.
+    pipeline_diagnostics: PipelineDiagnostics,
+    /// Safety-relevant completion audit held until its fence is durable.
+    pending_pipeline_audit: Option<PendingPipelineAudit>,
+    /// Fixed block size most recently applied or reverified for this open.
+    validated_fixed_block_size: Option<u32>,
+    /// Tape-sourced fixed block size that must be MODE SENSE reverified after UA.
+    mode_reverification_required: Option<u32>,
     /// Shared audit hook + dirty-state cell cloned from the parent
     /// library handle.
     shared: Arc<Mutex<DriveShared>>,
@@ -1517,6 +1617,8 @@ impl std::fmt::Debug for DriveHandle {
             .field("position_known", &self.position_known)
             .field("expected_position", &self.expected_position)
             .field("legacy_single_block", &self.legacy_single_block)
+            .field("pipelined_submission", &self.pipelined_submission)
+            .field("staging_ring_buffers", &self.staging_ring_buffers)
             .field(
                 "effective_write_batch_blocks",
                 &self.effective_write_batch_blocks,
@@ -1578,6 +1680,16 @@ impl DriveHandle {
     /// True when callers should preserve legacy single-record behavior.
     pub fn legacy_single_block(&self) -> bool {
         self.legacy_single_block
+    }
+
+    /// Effective write-side pipeline mode after the legacy override.
+    pub fn pipelined_submission(&self) -> bool {
+        self.pipelined_submission && !self.legacy_single_block
+    }
+
+    /// Fixed staging-ring depth snapshotted at drive open.
+    pub fn staging_ring_buffers(&self) -> u32 {
+        self.staging_ring_buffers
     }
 
     /// Force the handle back to legacy single-record behavior for this open

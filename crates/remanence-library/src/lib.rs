@@ -42,13 +42,15 @@ pub use error::{
 };
 pub use handle::tape_io::{
     BlockSize, ComputedPosition, DevicePositionProof, DriveErrorCounters, MediaFamily,
-    MediaReadiness, PositionAfter, ReadBatchOutcome, SpaceKind, SpaceResult, TapeConfig,
-    TapeIoError, TapePosition, WormMediaState, WriteBatchOutcome, WriteFilemarksOutcome,
-    WriteOutcome, WriteUnpositionedOutcome,
+    MediaReadiness, PipelinedWriteDiagnostics, PositionAfter, ReadBatchOutcome, SpaceKind,
+    SpaceResult, TapeConfig, TapeIoError, TapePosition, WormMediaState, WriteBatchOutcome,
+    WriteFilemarksOutcome, WriteOutcome, WriteUnpositionedOutcome,
 };
 pub use handle::{
     ChangerHandle, DirtyCause, DriveHandle, LibraryHandle, RemovalLockGuard, TapeIoRuntimeConfig,
     DEFAULT_TAPE_IO_BATCH_BLOCKS, DEFAULT_TAPE_IO_POSITION_CHECK_BYTES,
+    DEFAULT_TAPE_IO_STAGING_RING_BUFFERS, MAX_TAPE_IO_STAGING_RING_BUFFERS,
+    MIN_TAPE_IO_STAGING_RING_BUFFERS,
 };
 pub use model::{
     resolve_load_target, AccessPolicy, DeviceCaptures, DiscoveryReport, DriveBay, ElementException,

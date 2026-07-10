@@ -89,6 +89,8 @@ pub enum Layer2AuditOpTag {
     TapeRead,
     /// SSC WRITE.
     TapeWrite,
+    /// Coalesced pipelined tape-write window.
+    TapeWriteWindow,
     /// SSC WRITE FILEMARKS.
     TapeWriteFilemarks,
     /// Tape configuration read.
@@ -118,6 +120,7 @@ impl Layer2AuditOpTag {
             Self::TapeSpace => "tape_space",
             Self::TapeRead => "tape_read",
             Self::TapeWrite => "tape_write",
+            Self::TapeWriteWindow => "tape_write_window",
             Self::TapeWriteFilemarks => "tape_write_filemarks",
             Self::TapeReadConfig => "tape_read_config",
             Self::TapeWriteConfig => "tape_write_config",
@@ -144,6 +147,7 @@ impl Layer2AuditOpTag {
             LibraryAuditOp::TapeSpace { .. } => Self::TapeSpace,
             LibraryAuditOp::TapeRead { .. } => Self::TapeRead,
             LibraryAuditOp::TapeWrite { .. } => Self::TapeWrite,
+            LibraryAuditOp::TapeWriteWindow { .. } => Self::TapeWriteWindow,
             LibraryAuditOp::TapeWriteFilemarks { .. } => Self::TapeWriteFilemarks,
             LibraryAuditOp::TapeReadConfig { .. } => Self::TapeReadConfig,
             LibraryAuditOp::TapeWriteConfig { .. } => Self::TapeWriteConfig,
@@ -156,6 +160,8 @@ impl Layer2AuditOpTag {
 pub enum Layer2AuditOutcomeTag {
     /// The CDB completed successfully.
     Success,
+    /// The drive recovered an error and completed the command.
+    Recovered,
     /// The CDB returned CHECK CONDITION or transport failure.
     ScsiError,
     /// Layer 2 reported an unclassified failure.
@@ -167,6 +173,7 @@ impl Layer2AuditOutcomeTag {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Success => "success",
+            Self::Recovered => "recovered",
             Self::ScsiError => "scsi_error",
             Self::Other => "other",
         }
@@ -176,6 +183,7 @@ impl Layer2AuditOutcomeTag {
     pub const fn from_outcome(outcome: &LibraryAuditOutcome) -> Self {
         match outcome {
             LibraryAuditOutcome::Success { .. } => Self::Success,
+            LibraryAuditOutcome::Recovered { .. } => Self::Recovered,
             LibraryAuditOutcome::ScsiError { .. } => Self::ScsiError,
             LibraryAuditOutcome::Other { .. } => Self::Other,
         }
@@ -715,6 +723,19 @@ fn add_library_operation_detail(
             uint(detail, "bay_element", u64::from(bay));
             uint(detail, "len", u64::from(len));
         }
+        LibraryAuditOp::TapeWriteWindow {
+            bay,
+            command_count,
+            bytes,
+            first_records,
+            last_records,
+        } => {
+            uint(detail, "bay_element", u64::from(bay));
+            uint(detail, "command_count", u64::from(command_count));
+            uint(detail, "bytes", bytes);
+            uint(detail, "first_records", u64::from(first_records));
+            uint(detail, "last_records", u64::from(last_records));
+        }
         LibraryAuditOp::TapeWriteFilemarks { bay, count } => {
             uint(detail, "bay_element", u64::from(bay));
             uint(detail, "count", u64::from(count));
@@ -740,6 +761,16 @@ fn add_library_outcome_detail(
             uint(detail, "duration_millis", duration_millis(*duration));
             bool_value(detail, "snapshot_patched", *snapshot_patched);
             bool_value(detail, "dirty", *dirty);
+        }
+        LibraryAuditOutcome::Recovered {
+            duration,
+            sense,
+            summary,
+        } => {
+            uint(detail, "duration_millis", duration_millis(*duration));
+            optional_bytes(detail, "sense", Some(sense));
+            text(detail, "summary", summary);
+            bool_value(detail, "dirty", false);
         }
         LibraryAuditOutcome::ScsiError {
             sense,
@@ -791,7 +822,9 @@ fn add_rescan_warning_detail(
 
 fn library_outcome_audit_event(outcome: &LibraryAuditOutcome) -> AuditEvent {
     match outcome {
-        LibraryAuditOutcome::Success { .. } => AuditEvent::OperationFinished,
+        LibraryAuditOutcome::Success { .. } | LibraryAuditOutcome::Recovered { .. } => {
+            AuditEvent::OperationFinished
+        }
         LibraryAuditOutcome::ScsiError { dirty, .. } if *dirty => AuditEvent::CompletionUnknown,
         LibraryAuditOutcome::ScsiError { .. } | LibraryAuditOutcome::Other { .. } => {
             AuditEvent::OperationFailed

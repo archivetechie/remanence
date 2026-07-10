@@ -44,10 +44,11 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::time::Duration;
 
 use crate::handle::tape_io::{
-    ReadBatchOutcome, SpaceKind, SpaceResult, TapeIoError, TapePosition, WriteBatchOutcome,
-    WriteFilemarksOutcome, WriteOutcome,
+    PipelinedWriteDiagnostics, ReadBatchOutcome, SpaceKind, SpaceResult, TapeIoError, TapePosition,
+    WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
 };
 use crate::handle::DriveHandle;
 
@@ -109,6 +110,17 @@ pub trait BlockSink {
         ))
     }
 
+    /// Submit a prebuilt fixed-mode WRITE(6) on the pipelined hot path.
+    /// Non-drive sinks preserve semantics through the ordinary batch method.
+    fn write_block_batch_pipelined(
+        &mut self,
+        buf: &[u8],
+        block_size_bytes: u32,
+        _cdb: &[u8],
+    ) -> Result<WriteBatchOutcome, TapeIoError> {
+        self.write_block_batch(buf, block_size_bytes)
+    }
+
     /// Effective records per batch for this sink and block size. A return
     /// value of 1 means callers should preserve single-record behavior.
     fn write_batch_blocks(&self, _block_size_bytes: u32) -> u32 {
@@ -125,6 +137,56 @@ pub trait BlockSink {
         self.write_batch_blocks(1) <= 1
     }
 
+    /// Effective write-side staging-ring mode for this open drive.
+    fn pipelined_submission(&self) -> bool {
+        false
+    }
+
+    /// Number of buffers in the fixed staging ring.
+    fn staging_ring_buffers(&self) -> u32 {
+        crate::DEFAULT_TAPE_IO_STAGING_RING_BUFFERS
+    }
+
+    /// Snapshot allocation-free hot-submitter timing and accounting.
+    fn pipelined_write_diagnostics(&self) -> PipelinedWriteDiagnostics {
+        PipelinedWriteDiagnostics::default()
+    }
+
+    /// Emit a pre-ioctl intent marker and open the coalesced window span.
+    fn begin_pipelined_write_window(
+        &mut self,
+        _command_count: u32,
+        _bytes: u64,
+        _first_records: u32,
+        _last_records: u32,
+    ) {
+    }
+
+    /// Close a successful coalesced window span.
+    fn finish_pipelined_write_window_success(
+        &mut self,
+        _command_count: u32,
+        _bytes: u64,
+        _first_records: u32,
+        _last_records: u32,
+        _duration: Duration,
+    ) {
+    }
+
+    /// Emit deferred per-command safety evidence, then close a failed span.
+    fn finish_pipelined_write_window_error(
+        &mut self,
+        _command_count: u32,
+        _bytes: u64,
+        _first_records: u32,
+        _last_records: u32,
+        _error: &TapeIoError,
+    ) {
+    }
+
+    /// Flush deferred safety evidence after the caller's durable fence.
+    fn flush_pending_pipeline_audit(&mut self) {}
+
     /// Configured drift tripwire cadence in bytes, if known.
     fn position_check_bytes(&self) -> u64 {
         0
@@ -133,6 +195,15 @@ pub trait BlockSink {
     /// Write `count` file marks. IMMED is always 0; the call
     /// returns only after the marks are committed to media.
     fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError>;
+
+    /// Pipelined-session filemark path. Drive sinks defer safety-relevant
+    /// completion evidence until the caller has persisted its fence.
+    fn write_filemarks_pipelined(
+        &mut self,
+        count: u32,
+    ) -> Result<WriteFilemarksOutcome, TapeIoError> {
+        self.write_filemarks(count)
+    }
 
     /// Position the sink at logical end-of-data before appending another
     /// tape file. Real drives use SSC SPACE(EOD); fixtures may model the
@@ -262,6 +333,15 @@ impl BlockSink for DriveHandleSink<'_> {
     ) -> Result<WriteBatchOutcome, TapeIoError> {
         self.0.write_block_batch(buf, block_size_bytes)
     }
+    fn write_block_batch_pipelined(
+        &mut self,
+        buf: &[u8],
+        block_size_bytes: u32,
+        cdb: &[u8],
+    ) -> Result<WriteBatchOutcome, TapeIoError> {
+        self.0
+            .write_block_batch_pipelined(buf, block_size_bytes, cdb)
+    }
     fn write_batch_blocks(&self, block_size_bytes: u32) -> u32 {
         if self.0.legacy_single_block() {
             1
@@ -285,11 +365,72 @@ impl BlockSink for DriveHandleSink<'_> {
     fn legacy_single_block(&self) -> bool {
         self.0.legacy_single_block()
     }
+    fn pipelined_submission(&self) -> bool {
+        self.0.pipelined_submission()
+    }
+    fn staging_ring_buffers(&self) -> u32 {
+        self.0.staging_ring_buffers()
+    }
+    fn pipelined_write_diagnostics(&self) -> PipelinedWriteDiagnostics {
+        self.0.pipelined_write_diagnostics()
+    }
+    fn begin_pipelined_write_window(
+        &mut self,
+        command_count: u32,
+        bytes: u64,
+        first_records: u32,
+        last_records: u32,
+    ) {
+        self.0
+            .begin_pipelined_write_window(command_count, bytes, first_records, last_records);
+    }
+    fn finish_pipelined_write_window_success(
+        &mut self,
+        command_count: u32,
+        bytes: u64,
+        first_records: u32,
+        last_records: u32,
+        duration: Duration,
+    ) {
+        self.0.finish_pipelined_write_window_success(
+            command_count,
+            bytes,
+            first_records,
+            last_records,
+            duration,
+        );
+    }
+    fn finish_pipelined_write_window_error(
+        &mut self,
+        command_count: u32,
+        bytes: u64,
+        first_records: u32,
+        last_records: u32,
+        error: &TapeIoError,
+    ) {
+        self.0.flush_pending_pipeline_audit();
+        self.0.finish_pipelined_write_window_error(
+            command_count,
+            bytes,
+            first_records,
+            last_records,
+            error,
+        );
+    }
+    fn flush_pending_pipeline_audit(&mut self) {
+        self.0.flush_pending_pipeline_audit();
+    }
     fn position_check_bytes(&self) -> u64 {
         self.0.position_check_bytes()
     }
     fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
         self.0.write_filemarks(count)
+    }
+    fn write_filemarks_pipelined(
+        &mut self,
+        count: u32,
+    ) -> Result<WriteFilemarksOutcome, TapeIoError> {
+        self.0.write_filemarks_pipelined(count)
     }
     fn space_to_end_of_data(&mut self) -> Result<TapePosition, TapeIoError> {
         Ok(self.0.space(0, SpaceKind::EndOfData)?.position_after)

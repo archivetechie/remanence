@@ -75,12 +75,12 @@ pub enum TimeoutClass {
     /// PREVENT / ALLOW MEDIUM REMOVAL. A config-only CDB the
     /// firmware applies immediately. 5 s is generous.
     PreventAllow,
-    /// Block-level READ / WRITE on a loaded tape (Layer 3a). 60 s
-    /// per CDB. Block reads at LTO-9 line rate are sub-second;
-    /// the budget covers retries and drive-side buffering hiccups.
+    /// Block-level READ / WRITE on a loaded tape (Layer 3a). 900 s
+    /// per CDB, matching the normal tape-driver timeout so drive-side
+    /// recovery and buffered destage are not aborted by the host.
     TapeIo,
     /// WRITE FILEMARKS (forces sync to media unless IMMED is set;
-    /// rem doesn't set IMMED). 120 s.
+    /// rem doesn't set IMMED). 900 s for drive recovery and destage.
     WriteFilemarks,
     /// LOCATE / SPACE — anything that moves the heads without
     /// reading or writing user data. 300 s covers the LTO-9
@@ -105,10 +105,10 @@ impl TimeoutClass {
             Self::PreventAllow => 5_000,
             Self::ModeConfig => 5_000,
             Self::TapeStatus => 5_000,
-            Self::TapeIo => 60_000,
+            Self::TapeIo => 900_000,
             Self::ReadElementStatus => 60_000,
             Self::Move => 120_000,
-            Self::WriteFilemarks => 120_000,
+            Self::WriteFilemarks => 900_000,
             Self::Positioning => 300_000,
             Self::InitElementStatus => 600_000,
             Self::LoadUnload => 600_000,
@@ -825,8 +825,8 @@ mod tests {
     fn new_timeout_class_variants_have_documented_durations() {
         // Layer 3a's new timeout classes — pin the numeric mapping
         // so any accidental change to `duration_ms()` shows up here.
-        assert_eq!(TimeoutClass::TapeIo.duration_ms(), 60_000);
-        assert_eq!(TimeoutClass::WriteFilemarks.duration_ms(), 120_000);
+        assert_eq!(TimeoutClass::TapeIo.duration_ms(), 900_000);
+        assert_eq!(TimeoutClass::WriteFilemarks.duration_ms(), 900_000);
         assert_eq!(TimeoutClass::Positioning.duration_ms(), 300_000);
         assert_eq!(TimeoutClass::Rewind.duration_ms(), 600_000);
         assert_eq!(TimeoutClass::ModeConfig.duration_ms(), 5_000);
