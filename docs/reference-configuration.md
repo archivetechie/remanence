@@ -54,7 +54,7 @@ string with a suffix: `B`, `KiB`/`K`/`KB`, `MiB`/`M`/`MB`, `GiB`/`G`/`GB`,
 | `state_dir` | absolute path | required | Root directory for mutable daemon state (lock file, default socket, default spool). |
 | `default_idle_timeout_seconds` | integer > 0 | required | Default idle timeout for write/read sessions. |
 | `spool_dir` | absolute path | `<state_dir>/spool` | Pre-commit append spool. Created with mode `0700` at startup. |
-| `spool_tmpfs_ram_budget` | byte size > 0 | unset | Required acknowledgement when the spool resolves to tmpfs/ramfs: caps spool RAM use. The effective budget is the smallest of 64 GiB, this value, and available RAM. Must be ≤ `io_memory_ceiling` once that key lands (TIO-6 R2). |
+| `spool_tmpfs_ram_budget` | byte size > 0 | unset | Required acknowledgement when the spool resolves to tmpfs/ramfs. Post-R2, spool growth reserves this fixed budget from the shared `io_memory_ceiling`; runtime `MemAvailable` never clamps or authorizes growth. Must be ≤ `io_memory_ceiling`. |
 | `io_memory_ceiling` | byte size > 0 | — (**TIO-6 R2**, not yet landed) | Fixed total for ALL pipeline I/O memory: append-spool reservations plus every drive's read reservoir, granted through one atomic permit manager. See the deployment note below. |
 | `read_only` | bool | `false` | Reject state-changing operations; skips library discovery and the drive pool at startup. |
 | `socket_path` | absolute path | `<state_dir>/rem.sock` | Unix-domain gRPC socket. Parent directory created `0700`; socket chmod `0660`; connecting peers must be root or the daemon's own user. |
@@ -220,7 +220,15 @@ submission is the only tape transfer path; removed mode keys are rejected.
 | `staging_ring_buffers` | integer 2..=16 | `4` | Page-aligned buffers allocated per active drive for staged submission. |
 | `write_batch_blocks` | integer > 0 | `16` | Fixed-size records requested per WRITE(6) before the SG driver or HBA clamps the transfer. |
 | `read_batch_blocks` | integer > 0 | `16` | Fixed-size records requested per READ(6). |
+| `read_reservoir_bytes` | byte size > 0 | `"8GiB"` | Per-restore-stream reservoir target. Must hold at least `staging_ring_buffers × effective_read_batch_blocks × block_size` and must not exceed `io_memory_ceiling`. |
+| `read_reservoir_high_pct` | integer 1..=100 | `90` | Stop issuing READs when reservoir occupancy reaches this percentage of its effective capacity. Must be greater than `read_reservoir_low_pct`. |
+| `read_reservoir_low_pct` | integer 1..=99 | `25` | Resume READ submission after occupancy drains to this percentage. Must be less than `read_reservoir_high_pct`. |
 | `position_check_bytes` | byte size | `1073741824` (1 GiB) | Cadence of mid-stream READ POSITION drift tripwires. `0` disables mid-stream checks (boundary checks remain). |
+| `position_check_bytes_ranged` | byte size > 0 | `"256MiB"` | Proof cadence for hash-less ranged reads, effectively clamped to half the active reservoir. |
+
+Configuration loading rejects degenerate reservoir settings: `high ≤ low`, a
+reservoir smaller than the minimum staging pool, a per-stream reservoir above
+the shared ceiling, or a spool budget above the shared ceiling.
 
 <!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-state/src/paths.rs @ 7fb10f8 -->
 ## `[journal]`, `[audit]`, `[index]`, `[cache]` (required)

@@ -530,13 +530,16 @@ fn write_eom_signal_accepts_current_recovered_error_eom_but_not_ili_or_filemark(
 }
 
 #[test]
-fn reset_unit_attention_classifier_requires_current_29_00_through_04() {
+fn reset_unit_attention_classifier_accepts_current_reset_and_nexus_loss() {
     for ascq in 0x00..=0x04 {
         let sense = current_test_sense(0x06, 0, 0x29, ascq);
         assert!(is_reset_unit_attention(&sense), "ASCQ {ascq:02x}");
     }
     assert!(!is_reset_unit_attention(&current_test_sense(
         0x06, 0, 0x29, 0x05
+    )));
+    assert!(is_reset_unit_attention(&current_test_sense(
+        0x06, 0, 0x29, 0x07
     )));
     let mut deferred = current_test_sense(0x06, 0, 0x29, 0x00);
     deferred[0] = 0x71;

@@ -937,7 +937,7 @@ impl<'a> ObjectParitySource<'a> {
     }
 }
 
-impl<'a> BlockSource for ObjectParitySource<'a> {
+impl<'a> remanence_library::BlockRead for ObjectParitySource<'a> {
     fn read_block(&mut self, buf: &mut [u8]) -> Result<usize, TapeIoError> {
         let body_lba = self.cursor_body_lba;
         self.ensure_body_lba_in_range(body_lba)
@@ -987,7 +987,9 @@ impl<'a> BlockSource for ObjectParitySource<'a> {
             Err(err) => Err(err),
         }
     }
+}
 
+impl<'a> BlockSource for ObjectParitySource<'a> {
     fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
         self.auto_read_blocks.clear();
         self.last_read_erasure_body_lba = None;
@@ -1203,6 +1205,7 @@ mod object_source_tests {
     use crate::mapping::ordinal_to_stripe;
     use crate::model::{SchemeId, SidecarMetadataHealth, SidecarMetadataHealthEvent};
     use crate::sidecar::{data_shard_crc64, encode_sidecar_tape_file, SidecarDescriptor};
+    use remanence_library::BlockRead;
     use std::collections::{BTreeMap, BTreeSet};
     use std::ops::Range;
     use std::sync::Mutex;

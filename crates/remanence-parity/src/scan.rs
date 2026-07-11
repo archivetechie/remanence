@@ -781,7 +781,7 @@ mod tests {
         SidecarDescriptor, SIDECAR_FOOTER_CRC_OFFSET, SIDECAR_HEADER_CRC_OFFSET,
     };
     use crate::source::{ObjectParitySource, OpenTrust};
-    use remanence_library::BlockSource;
+    use remanence_library::BlockRead;
 
     const BLOCK_SIZE: u32 = 512;
     const TAPE_UUID: [u8; 16] = [0x42; 16];

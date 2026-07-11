@@ -1910,7 +1910,7 @@ mod l1b_tests {
         RemTarObjectOptions,
     };
     use remanence_library::{
-        AuditEvent, AuditOutcome, BlockSource, DriveHandle, IoErrorKind, LibraryHandle, MoveError,
+        AuditEvent, AuditOutcome, BlockRead, DriveHandle, IoErrorKind, LibraryHandle, MoveError,
         StaticAllowlist, TapeIoError,
     };
     use remanence_parity::{
