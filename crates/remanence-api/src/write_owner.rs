@@ -286,6 +286,19 @@ impl DrivePool {
             .collect()
     }
 
+    /// Snapshot sessions by their enforcement key for advisory status only.
+    ///
+    /// The reservation atomics remain the sole authority for admission. This
+    /// projection may race with an open/close and must never gate tape I/O.
+    pub(crate) fn sessions_by_bay(&self) -> HashMap<u16, (Uuid, MountedSession)> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .iter()
+            .map(|(session_id, mounted)| (mounted.bay, (*session_id, mounted.clone())))
+            .collect()
+    }
+
     pub(crate) fn mounted_tape_uuids(&self) -> HashSet<TapeUuid> {
         let mut in_use = self
             .sessions
