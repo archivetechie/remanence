@@ -25,10 +25,16 @@
       "expected_error": "InvalidHeaderLength"
     },
     {
-      "id": "format-version-2",
+      "id": "unsupported-format-version",
       "operation": "inspect",
-      "fault": "format_version field is 2",
+      "fault": "format_version field is 3",
       "expected_error": "UnsupportedFormatVersion"
+    },
+    {
+      "id": "v1-shape-version-flipped-to-2",
+      "operation": "inspect",
+      "fault": "a v1 header has only its format_version changed from 1 to 2",
+      "expected_error": "InvalidWrapSuite"
     },
     {
       "id": "unknown-suite-id",

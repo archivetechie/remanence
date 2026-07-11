@@ -1033,7 +1033,9 @@ Procedure:
 6. Capture the entry whose effective path is `_remanence/manifest.cbor` as the
    manifest bytes. An object whose EOF is reached with no manifest entry is
    nonconformant: Verifiers MUST reject it (Section 7.4), and a restore-mode
-   Reader SHOULD report the absence to its caller.
+   Reader SHOULD report the absence to its caller. The reference Reader reports
+   this non-fatally as the typed `MissingManifest` warning; the absence remains
+   visible even when member payloads can otherwise be restored.
 
 A conformant Reader accepts mildly foreign archives where safe
 (unsorted/duplicate pax records, NUL typeflag, `prefix`-formed names, missing
@@ -2258,6 +2260,13 @@ negative vectors — the expected Section 11 error name. Vectors use small `chun
 values (e.g. 4096) so full object byte streams are practical to pin; at least
 one vector MUST use `DEFAULT_CHUNK_SIZE`.
 
+The companion archive is `remanence-test-vectors.tar`, SHA-256
+`596e5ee7baffb355366407d6b4384fe7caafa64509e489508df2ed5dc2eadc7d`.
+Its `MANIFEST.tsv` inventories every contained vector manifest and generated
+artifact, `CHECKSUMS.sha256` authenticates them, and the included `verify.py`
+checks the archive without a source checkout. The archive is reproducibly
+generated with the `publication-test-vectors` build target.
+
 Values marked **[pinned-at-generation]** are produced by the reference
 implementation when the fixtures are first generated, then frozen; they cannot
 be derived by arithmetic alone and this document does not guess them.
@@ -2397,7 +2406,9 @@ non-shortest integer encoding; indefinite-length item; float; tag; duplicate
 map key; `schema_version` 2; `file_sha256` of wrong length; nesting depth
 exceeding `MANIFEST_MAX_DEPTH`; manifest bytes disagreeing with the anchor;
 manifest `chunk_size` disagreeing with the global header; unknown extra key
-(MUST be accepted).
+(MUST be accepted); two `file_entries` sharing a `path`; two `file_entries`
+sharing a `file_id`. A restore-report vector reaches EOF without a manifest
+and asserts the typed `MissingManifest` report rather than silent absence.
 
 **Envelope.** Header: wrong magic; `header_len` ≠ 128; `format_version` 2;
 unknown `suite_id`; `chunk_size` 0 and `chunk_size` not a multiple of 512;
@@ -2772,5 +2783,6 @@ sequentially, an acceptable cost over sequential media.
 ## Author's Address
 
 The ArchiveTech Project
-archivetech.org
+Website: https://archivetech.org
 Email: specs@archivetech.org
+Reference implementation: https://github.com/archivetechie/remanence

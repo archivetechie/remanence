@@ -16,6 +16,14 @@ pub const LABEL_OBJECT: &[u8] = b"rao1-object-v1";
 pub const LABEL_METADATA: &[u8] = b"rao1-metadata-v1";
 /// Payload-key HKDF info label.
 pub const LABEL_PAYLOAD: &[u8] = b"rao1-payload-v1";
+/// v2 salt derivation HKDF info label.
+pub const LABEL_SALT_V2: &[u8] = b"rao2-salt-v1";
+/// v2 object-secret HKDF info label.
+pub const LABEL_OBJECT_V2: &[u8] = b"rao2-object-v1";
+/// v2 metadata-key HKDF info label.
+pub const LABEL_METADATA_V2: &[u8] = b"rao2-metadata-v1";
+/// v2 payload-key HKDF info label.
+pub const LABEL_PAYLOAD_V2: &[u8] = b"rao2-payload-v1";
 
 /// Caller-supplied root key material.
 #[derive(Clone)]
@@ -110,6 +118,48 @@ pub fn derive_salt(
     Err(RaoAeadError::InvalidSalt)
 }
 
+/// Derive the deterministic nonzero v2 salt from the per-object DEK.
+pub fn derive_salt_v2(
+    dek: &[u8; 32],
+    object_id_field: &[u8; 64],
+    plaintext_digest: &[u8; 32],
+    metadata_plaintext: &[u8],
+) -> Result<[u8; 16]> {
+    derive_salt_bytes(
+        dek,
+        LABEL_SALT_V2,
+        object_id_field,
+        plaintext_digest,
+        metadata_plaintext,
+    )
+}
+
+fn derive_salt_bytes(
+    ikm: &[u8],
+    label: &[u8],
+    object_id_field: &[u8; 64],
+    plaintext_digest: &[u8; 32],
+    metadata_plaintext: &[u8],
+) -> Result<[u8; 16]> {
+    let metadata_hash = Sha256::digest(metadata_plaintext);
+    for ctr in 0u8..=u8::MAX {
+        let mut info = Vec::with_capacity(label.len() + 1 + object_id_field.len() + 32 + 32);
+        info.extend_from_slice(label);
+        info.push(ctr);
+        info.extend_from_slice(object_id_field);
+        info.extend_from_slice(plaintext_digest);
+        info.extend_from_slice(&metadata_hash);
+        let mut salt = [0u8; 16];
+        Hkdf::<Sha256>::new(Some(&[]), ikm)
+            .expand(&info, &mut salt)
+            .map_err(|_| RaoAeadError::InvalidRootKey)?;
+        if salt != [0; 16] {
+            return Ok(salt);
+        }
+    }
+    Err(RaoAeadError::InvalidSalt)
+}
+
 /// Derive object, metadata, and payload keys from the final header.
 pub fn derive_keys(
     root_key: &RootKey,
@@ -144,6 +194,52 @@ pub fn derive_keys(
     metadata_key.zeroize();
     payload_key.zeroize();
     Ok(derived)
+}
+
+/// Derive the three distinct v2 keys from a DEK and header-plus-frame hash.
+pub fn derive_keys_v2(
+    dek: &[u8; 32],
+    salt: &[u8; 16],
+    header_hash: &[u8; 32],
+) -> Result<DerivedKeys> {
+    derive_keys_bytes(
+        dek,
+        salt,
+        header_hash,
+        LABEL_OBJECT_V2,
+        LABEL_METADATA_V2,
+        LABEL_PAYLOAD_V2,
+    )
+}
+
+fn derive_keys_bytes(
+    ikm: &[u8],
+    salt: &[u8; 16],
+    header_hash: &[u8; 32],
+    object_label: &[u8],
+    metadata_label: &[u8],
+    payload_label: &[u8],
+) -> Result<DerivedKeys> {
+    let mut object_info = Vec::with_capacity(object_label.len() + header_hash.len());
+    object_info.extend_from_slice(object_label);
+    object_info.extend_from_slice(header_hash);
+    let mut object_secret = [0u8; 32];
+    Hkdf::<Sha256>::new(Some(salt), ikm)
+        .expand(&object_info, &mut object_secret)
+        .map_err(|_| RaoAeadError::InvalidRootKey)?;
+    let mut metadata_key = [0u8; 32];
+    Hkdf::<Sha256>::new(Some(&[]), &object_secret)
+        .expand(metadata_label, &mut metadata_key)
+        .map_err(|_| RaoAeadError::InvalidRootKey)?;
+    let mut payload_key = [0u8; 32];
+    Hkdf::<Sha256>::new(Some(&[]), &object_secret)
+        .expand(payload_label, &mut payload_key)
+        .map_err(|_| RaoAeadError::InvalidRootKey)?;
+    Ok(DerivedKeys {
+        object_secret,
+        metadata_key,
+        payload_key,
+    })
 }
 
 #[cfg(test)]

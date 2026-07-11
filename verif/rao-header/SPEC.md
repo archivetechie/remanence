@@ -1,7 +1,8 @@
 # rao-header formal specification
 
 Target: `verif/rao-header/src/lib.rs`, a proof-facing extraction of the scalar
-RAO AEAD header layout in `crates/remanence-aead/src/header.rs`.
+RAO AEAD header layout in `crates/remanence-aead/src/header.rs` and canonical
+key-frame rules in `crates/remanence-aead/src/key_frame.rs`.
 
 The production header is a 128-byte byte array with a UTF-8 object id field and
 two 16-byte binary fields. This extraction models the fixed scalar checks and
@@ -67,6 +68,16 @@ over all 128 bytes and the object id string.
 The parser rejects mismatched frozen fields before accepting the header core:
 bad magic, bad header length, unsupported format version, invalid suite id,
 nonzero flags, and nonzero reserved bytes.
+
+## H6 — v2 and key-frame status (not formally proved)
+
+Production unit tests, negative vectors, fuzz targets, and the Rust drift guard
+cover v1/v2 disjoint parsing, the v2 scalar layout, and canonical key-frame
+bytes. The Aeneas-generated `Funs.lean` file does not contain v2 parser or
+key-frame functions, so none of those v2 properties are claimed as Lean
+theorems. Follow-up **RAO-V2-FORMAL-HEADER-KEY-FRAME** must extract the actual
+byte parser/serializer and key-frame codec before round-trip or disjointness
+coverage can be advertised as formal.
 
 ## Trust anchor
 
