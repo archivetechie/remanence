@@ -4,6 +4,17 @@ Date: 2026-07-08. This is the executive summary; the full record is in
 [REVIEW-REPORT.md](REVIEW-REPORT.md), and all 261 raw panel findings are in
 [panel-findings-2026-07-07.md](panel-findings-2026-07-07.md).
 
+> **Resolution (2026-07-11).** The three specs have since been combined into one
+> normative publication document,
+> [`rao-object-format-1.0.md`](rao-object-format-1.0.md) (base + 1.1 xattr delta
+> + on-tape v2 HPKE envelope). The four "Needs your decision before publishing"
+> items below are all resolved: (1) bootstrap re-typing and (2) the two
+> manifest gaps landed in the scanner/reader; (3) the author line is **The
+> ArchiveTech Project** (archivetech.org / specs@archivetech.org), not the
+> earlier The ArchiveTech Project / archivetech.org placeholder; (4) the test-vector
+> archive exists with SHA-256 `596e5ee7…` pinned. This summary is retained as a
+> dated historical record.
+
 ## Task
 
 Take the three Remanence specifications — RAO 1.0 (the on-tape file format),
