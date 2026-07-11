@@ -402,12 +402,34 @@ message AckAlarmRequest {
 
 message GetLiveStatusRequest {}
 
+// Advisory projection of the existing per-bay atomic reservation. Consumers
+// must key arbitration on (library_serial, bay), never drive_uuid: a physical
+// drive identity can move to another bay after swap or retirement.
+message DriveAssignment {
+  string library_serial = 1;
+  uint32 bay = 2;
+  // Operator-legibility hint only; not an arbitration key.
+  bytes drive_uuid = 3;
+  enum State {
+    DRIVE_ASSIGNMENT_STATE_UNSPECIFIED = 0;
+    DRIVE_ASSIGNMENT_STATE_IDLE = 1;
+    DRIVE_ASSIGNMENT_STATE_ACTIVE = 2;
+  }
+  State state = 4;
+  // Empty during reservation/mount transitions and non-session operations.
+  bytes current_session_id = 5;
+  // Empty when no cataloged tape is known to be loaded in this bay.
+  bytes loaded_tape_uuid = 6;
+}
+
 message GetLiveStatusResponse {
   repeated LibraryState libraries = 1;
   repeated OperationRef operations = 2;
   repeated Alarm alarms = 3;
   string snapshot_at_utc = 4;
   uint64 daemon_epoch = 5;
+  // Advisory only. The atomic per-bay reservation remains sole enforcement.
+  repeated DriveAssignment drive_assignments = 6;
 }
 
 message Slot {
