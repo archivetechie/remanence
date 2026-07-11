@@ -2261,10 +2261,11 @@ values (e.g. 4096) so full object byte streams are practical to pin; at least
 one vector MUST use `DEFAULT_CHUNK_SIZE`.
 
 The companion archive is `remanence-test-vectors.tar`, SHA-256
-`53ae763287a49eb2b82ac4bd3bc0bf2c8d2d0dff13a1e412cee210ccdc659366`.
+`596e5ee7baffb355366407d6b4384fe7caafa64509e489508df2ed5dc2eadc7d`.
 Its `MANIFEST.tsv` inventories every contained vector manifest and generated
-object byte stream, and `CHECKSUMS.sha256` authenticates them. The archive is reproducibly generated with the
-`publication-test-vectors` build target.
+artifact, `CHECKSUMS.sha256` authenticates them, and the included `verify.py`
+checks the archive without a source checkout. The archive is reproducibly
+generated with the `publication-test-vectors` build target.
 
 Values marked **[pinned-at-generation]** are produced by the reference
 implementation when the fixtures are first generated, then frozen; they cannot
