@@ -1,6 +1,6 @@
 # Design v2: RAO envelope encryption — wrapped-DEK key frame
 
-**Status: folded (v2 full rewrite) 2026-07-11 — awaiting verify round.**
+**Status: refolded 2026-07-11 (verify-1 findings folded verbatim) — awaiting verify round 2.**
 `panel 2026-07-11: 72 findings (13 security / 17 failure / 15 contract / 8 cost /
 19 DR-UX); folded as v2 rewrite` — consolidated report:
 `panel-rao-wrapped-key-2026-07-11.md`; verbatim lenses: `panel-lenses-2026-07-11/`.
@@ -34,35 +34,62 @@ tweak.
 **Layout:** `[128-byte scalar header][key frame][encrypted metadata frame]
 [body chunks][footer]`.
 
-- **Scalar header** stays 128 bytes. `format_version = 2`. New fields in
-  currently-reserved bytes: `wrap_suite: u8` (0x00 = none/registry-symmetric,
-  0x01 = HPKE-v1 below) and `key_frame_len: u32`. `key_frame_len = 0` with
-  `wrap_suite = 0` is the registry-symmetric v2 form (reserved; not emitted in
-  phase 1). Note for implementers: v1 readers reject a 256-byte read on LENGTH
-  before version — keeping the scalar header at 128 bytes means old readers fail
-  cleanly on `format_version`, the intended axis (contract finding).
-- **Key frame** (variable length, plaintext, authenticated — see Seal ordering):
-  ASCII magic, count-prefixed array of recipient slots, each:
-  `recipient_epoch_id[16]` + `epoch_label` (short ASCII, human-eyeball
-  diagnosable) + `slot_index: u8` + HPKE encapsulation + wrapped DEK. Array-shaped
-  from day one (adding/rotating recipients never bumps the format). Byte-level
-  test vectors are a deliverable of the implementation prompt.
+- **Scalar header** stays 128 bytes. `format_version = 2`. Byte placement
+  (verify-round-pinned against header.rs: free regions are 0x0C..0x10 and
+  0x38..0x40; byte 0x07 is the payload cipher-suite id and is NOT free):
+  `wrap_suite: u8 @ 0x38` (0x00 = registry-symmetric, 0x01 = HPKE-v1 below),
+  `0x39..0x3C` reserved-zero, `key_frame_len: u32 big-endian @ 0x3C..0x40`.
+  `key_frame_len = 0` with `wrap_suite = 0` is the registry-symmetric v2 form
+  (reserved; not emitted in phase 1). **v2 field dispositions:** `hkdf_salt[16]`
+  keeps its role (now derived from the DEK per the seal transcript below);
+  `key_id[16]` is zero in envelope mode — recipient identity lives ONLY in the
+  key frame (single source; mode rules already forbid registry fallback).
+  Old readers fail cleanly on `format_version` (the header stays 128 bytes, so
+  the length check never trips first).
+- **Key frame** (variable length, plaintext, authenticated — see Seal ordering).
+  Frozen grammar (all integers big-endian): magic `RAOK` (4 B), `slot_count: u8`
+  (1..=8), then per slot in ascending `slot_index` order (duplicates forbidden):
+  `slot_index: u8`, `recipient_epoch_id[16]`, `label_len: u8` (<=32) +
+  `epoch_label` (printable ASCII, human-eyeball diagnosable), HPKE
+  encapsulation `enc[32]` (X25519), wrapped-DEK ciphertext `ct[48]`
+  (32-byte key + 16-byte tag). `key_frame_len` counts EVERY framing byte from
+  the magic through the last slot; hard maximum 4096 bytes. Canonical encoding
+  is byte-exact: ordering violations, duplicate slots, or trailing bytes are
+  parse rejects. Byte-level test vectors are a deliverable. Array-shaped from
+  day one (adding/rotating recipients never bumps the format).
 - **Wrap suite 0x01 (frozen):** HPKE Base mode, DHKEM(X25519, HKDF-SHA256),
   HKDF-SHA256, ChaCha20-Poly1305 (RFC 9180), via the `rust-hpke` crate
   (RFC test-vector conformance; hand-rolling from `ring` primitives and libsodium
-  rejected — audit burden / C dependency). HPKE `info` binds
-  `("rao-wrap-v1", object_id, recipient_epoch_id, slot_index, format_version,
-  wrap_suite)` — a wrapped DEK cannot be transplanted between objects or slots.
-- **Footer:** unchanged literal; completion detected at the version-derived
-  offset (header + key frame + metadata frame + body geometry).
+  rejected — audit burden / C dependency). HPKE `info` is a frozen
+  fixed-width byte transcript: `"rao-wrap-v1\0"` (12 B) ‖ canonical NUL-padded
+  `object_id_field[64]` ‖ `recipient_epoch_id[16]` ‖ `slot_index: u8` ‖
+  `format_version: u8` ‖ `wrap_suite: u8` — a wrapped DEK cannot be
+  transplanted between objects or slots, and the transcript is interoperable by
+  construction.
+- **Footer:** unchanged literal. v2 `inspect` geometry (direct generalization
+  of inspect.rs; zero-fill is shorter than one chunk so it cannot raise the
+  quotient): `n = floor((stored_size − 128 − key_frame_len −
+  metadata_frame_len − 16) / (chunk_size + 16))`; `footer_offset = 128 +
+  key_frame_len + metadata_frame_len + n × (chunk_size + 16)`.
 
-**Seal ordering (normative):** generate random DEK → wrap to ALL configured
-recipient slots → serialize key frame → serialize canonical scalar header →
-`header_hash = SHA-256(scalar header ‖ key frame)` → HKDF(DEK, salt, header_hash)
-→ encrypt metadata + chunks. This preserves v1's authentication mechanism (full
-header binding through key derivation — the draft's "add AAD" idea is dropped as
-redundant-or-weaker) and makes any tamper of version/suite/slots/key-frame bytes
-an immediate decrypt failure. **Consequence: re-wrap without re-seal is
+**Seal ordering (normative — verify-round transcript, mirrors the v1 flow in
+seal.rs/open.rs/kdf.rs):**
+1. Generate the random DEK and the canonical metadata plaintext.
+2. Derive `hkdf_salt` from the DEK:
+   `rao2-salt-v1 ‖ ctr ‖ object_id_field[64] ‖ plaintext_digest[32] ‖
+   SHA-256(metadata_plaintext)`.
+3. Wrap the DEK to ALL configured recipient slots; serialize the canonical key
+   frame.
+4. Serialize the scalar header (contains the salt and `key_frame_len`).
+5. `header_hash = SHA-256(scalar header ‖ key frame)`.
+6. Derive object/metadata/payload keys from (DEK, salt, header_hash) under
+   distinct `rao2-*` labels; encrypt metadata + chunks.
+The key frame does NOT participate in `derive_salt` — its binding through
+`header_hash` suffices. Opening mirrors v1: derive keys from the header salt +
+hash, decrypt metadata, recompute and compare the salt. This preserves v1's
+authentication mechanism (full binding through key derivation — the draft's
+"add AAD" idea is dropped as redundant-or-weaker): any tamper of
+version/suite/slots/key-frame bytes is an immediate decrypt failure. **Consequence: re-wrap without re-seal is
 forbidden** — recipient rotation applies to newly sealed objects; old epochs'
 private keys are retained per the retention policy below.
 
@@ -149,10 +176,13 @@ documented; not whole-stream atomic).
 
 ## Migration & rollout
 
-- Census today: ~6 sealed AEAD bundles. **All existing v1 AEAD objects are
-  re-sealed to v2 during rollout** — near-zero cost now, and mandatory rather
-  than optional because v1 roots derive from the publicly-known dev seed
-  (v1-forever would escrow a public secret). Standing rule for the future:
+- Census today: ~6 sealed AEAD bundles. **All existing archive AEAD copies
+  migrating into envelope pools are re-sealed to v2 during rollout** (hdcache
+  and other non-envelope domains keep v1 per the scope rule; their dev-seed
+  exposure is closed by the dev-seed replacement arc, not this format) —
+  near-zero cost now, and mandatory rather than optional because v1 archive
+  roots derive from the publicly-known dev seed (v1-forever would escrow a
+  public secret). Standing rule for the future:
   re-seal rides tape-generation migrations, never a dedicated pass.
 - Rollout order: every reader/verify host upgrades to v2-capable BEFORE the first
   v2 object lands on shared media; multi-object tape readers skip-and-continue
@@ -191,12 +221,9 @@ documented; not whole-stream atomic).
 - **ops (small but human)**: safe contents, Shamir shares, epoch registry
   printing, runbook authoring, drill scheduling (gardener).
 
-## Open questions for the verify round
+## Open questions
 
-1. Exact reserved-byte availability in the 128-byte scalar header for
-   `wrap_suite` + `key_frame_len` (contract lens confirmed object_id is fixed
-   64 B at 0x40..0x80; the verify round must pin the free offsets).
-2. Whether the key frame participates in `derive_salt` as well as `header_hash`
-   (v1 feeds both salt and header hash into derivation — pin the exact v2
-   transcript with domain-separated labels, e.g. `rao2-payload-v1`).
-3. `rust-hpke` crate audit status vs pinning an exact version + vendoring.
+1. `rust-hpke` exact version pin, audit status, vendoring posture — resolved in
+   the implementation prompt, not blocking the freeze.
+(Verify round 1 answered the former questions 1-2: byte offsets pinned in the
+Format section; salt transcript pinned in Seal ordering.)
