@@ -234,3 +234,17 @@ minor) — do not wait out the grace on a dead tape / hardware fault.
    lands.
 6. **Physical acceptance:** MSL3040 leg — measured throughput + park behavior on a real 2-hop encrypted
    tape restore.
+
+## 6.8 CROSS-CUTTING from RM1.2 (M3) — tape needs single-pass inline-verify, NOT the disk double-read
+RM1.2's OpenRestore selector uses **verify-before-first-frame**: `_prepare_open` drains the chosen source
+to EOF to verify integrity BEFORE emitting `manifest_head` (so a failed candidate emits no partial frames
+and the SUSPECT-fallback can try the next candidate cleanly), then `_stream` RE-READS the source to
+deliver. On disk this **double-reads** the object (O(whole-object) latency-to-first-byte + 2 AEAD decrypts
+per restore — diff-gate RM1.2b M3); tolerable for RM1's disk tier, **UNACCEPTABLE for tape** (2 locate+
+stream passes per restore). **RM3 (or a sutradhara change RM3 depends on) MUST replace the tape path's
+verify-before-first-frame with a single-pass INLINE-verify streaming mode:** deliver frames as the tape is
+read, verify per-chunk + at EOF, and on integrity failure emit a trailing `RestoreError` frame — the
+client (RM2) discards via the **committed_index-divergence contract** (already authored in `restore.proto`)
+and the fallback is a fresh `OpenRestore` on the next candidate, not an in-line pre-drain. This trades the
+"zero partial frames" property (fine — the client already truncates/discards on divergence) for one tape
+pass. Sequence this with RM3.1b (app-restart) / the extract path; do NOT ship a tape leg that pre-drains.
