@@ -21,6 +21,27 @@ pub enum RaoAeadError {
     /// The suite id is not HKDF-SHA-256 + ChaCha20-Poly1305.
     #[error("invalid RAO AEAD suite")]
     InvalidSuite,
+    /// The v2 wrapping suite is unknown or inconsistent with its key frame.
+    #[error("invalid RAO wrapping suite")]
+    InvalidWrapSuite,
+    /// The v2 key-frame length is outside its frozen bounds.
+    #[error("invalid RAO key-frame length")]
+    InvalidKeyFrameLength,
+    /// The v2 wrapped-key frame is malformed or non-canonical.
+    #[error("invalid RAO wrapped-key frame")]
+    InvalidKeyFrame,
+    /// The caller's configured key mode disagrees with the object header.
+    #[error("RAO key mode does not match object header")]
+    KeyModeMismatch,
+    /// The operating system could not provide cryptographic randomness.
+    #[error("operating-system CSPRNG failed")]
+    EntropyUnavailable,
+    /// HPKE key parsing, encapsulation, or authenticated opening failed.
+    #[error("RAO HPKE operation failed")]
+    HpkeFailed,
+    /// No wrapped-key slot matches the supplied recipient epoch.
+    #[error("no RAO recipient slot matches the supplied private key")]
+    RecipientEpochMismatch,
     /// The chunk size is not a positive multiple of 512.
     #[error("invalid RAO chunk size")]
     InvalidChunkSize,

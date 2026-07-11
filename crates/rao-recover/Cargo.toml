@@ -1,0 +1,25 @@
+[package]
+name        = "rao-recover"
+description = "Small standalone catalogless disaster-recovery tool for RAO objects."
+version     .workspace = true
+edition     .workspace = true
+rust-version.workspace = true
+authors     .workspace = true
+license     .workspace = true
+repository  .workspace = true
+
+[dependencies]
+remanence-aead    = { path = "../remanence-aead" }
+remanence-format  = { path = "../remanence-format" }
+remanence-library = { path = "../remanence-library" }
+remanence-stream  = { path = "../remanence-stream" }
+clap              = { workspace = true }
+tempfile          = { workspace = true }
+zeroize           = { workspace = true }
+
+[dev-dependencies]
+sha2 = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"

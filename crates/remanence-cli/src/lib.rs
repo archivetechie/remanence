@@ -51,7 +51,10 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use remanence_aead::{header::object_id_field, inspect_bytes, open, open_to_vec, RootKey};
+use remanence_aead::{
+    header::object_id_field, inspect_bytes, open, open_to_vec, seal_envelope, EnvelopeSealOptions,
+    RaoHeader, RecipientPublicKey, RootKey, SealOptions, RAO_HEADER_LEN,
+};
 use remanence_api::pb;
 #[cfg(feature = "foreign-bru")]
 use remanence_bru::{BruFormat, BRU_BLOCK_SIZE};
@@ -1742,6 +1745,12 @@ impl DevCommand {
 
 #[derive(Subcommand, Debug)]
 enum RemArchiveCommand {
+    /// Print machine-readable archive feature capabilities.
+    Capabilities,
+
+    /// Re-seal one v1 registry object as a v2 recipient envelope.
+    Reseal(ArchiveResealArgs),
+
     /// Build a portable RAO object file from local inputs.
     Build(RemArchiveBuildArgs),
 
@@ -2157,6 +2166,8 @@ struct RemArchiveSourceArgs {
 impl From<RemArchiveCommand> for ArchiveCommand {
     fn from(value: RemArchiveCommand) -> Self {
         match value {
+            RemArchiveCommand::Capabilities => Self::Capabilities,
+            RemArchiveCommand::Reseal(args) => Self::Reseal(args),
             RemArchiveCommand::Build(args) => Self::Build(args.into()),
             RemArchiveCommand::Inspect(args) => Self::Inspect(args.into()),
             RemArchiveCommand::Extract(args) => Self::Extract(args.into()),
@@ -2342,6 +2353,12 @@ impl From<RemArchiveSourceArgs> for ArchiveSourceArgs {
 
 #[derive(Subcommand, Debug)]
 enum ArchiveCommand {
+    /// Print machine-readable archive feature capabilities.
+    Capabilities,
+
+    /// Re-seal one v1 registry object as a v2 recipient envelope.
+    Reseal(ArchiveResealArgs),
+
     /// Build a portable RAO object file from local inputs.
     Build(ArchiveBuildArgs),
 
@@ -2382,6 +2399,30 @@ enum ArchiveCommand {
 
     /// List native objects from the local catalog (no tape access).
     List(ArchiveListArgs),
+}
+
+/// Arguments for `rem archive reseal`.
+#[derive(Args, Debug)]
+struct ArchiveResealArgs {
+    /// Existing complete RAO v1 encrypted object.
+    #[arg(long, value_name = "PATH")]
+    object: PathBuf,
+
+    /// Registry root-key file used by the v1 object.
+    #[arg(long, value_name = "PATH")]
+    registry_key: PathBuf,
+
+    /// Canonical RAOR recipient public-key files, in ascending slot order.
+    #[arg(long = "recipient", value_name = "PATH", num_args = 2..=8)]
+    recipients: Vec<PathBuf>,
+
+    /// New v2 envelope object path; must not already exist.
+    #[arg(long, value_name = "PATH")]
+    out: PathBuf,
+
+    /// Directory for the temporary plaintext; defaults adjacent to --out.
+    #[arg(long, value_name = "DIR")]
+    staging_dir: Option<PathBuf>,
 }
 
 /// Arguments for the shared `archive build` command.
@@ -2765,7 +2806,12 @@ enum ArchiveFormat {
 impl ArchiveCommand {
     fn tape_target(&self) -> Option<&str> {
         match self {
-            Self::Build(_) | Self::Inspect(_) | Self::Extract(_) | Self::ExtractStream(_) => None,
+            Self::Capabilities
+            | Self::Reseal(_)
+            | Self::Build(_)
+            | Self::Inspect(_)
+            | Self::Extract(_)
+            | Self::ExtractStream(_) => None,
             // `archive write` is state-changing; gate it through `--allow`
             // against the supplied `--library` serial.
             Self::Write(args) => Some(args.library.as_str()),
@@ -2781,6 +2827,8 @@ impl ArchiveCommand {
     fn is_dump_command(&self) -> bool {
         match self {
             Self::Build(_)
+            | Self::Capabilities
+            | Self::Reseal(_)
             | Self::Inspect(_)
             | Self::Extract(_)
             | Self::ExtractStream(_)
@@ -2803,6 +2851,8 @@ impl ArchiveCommand {
             Self::Restore(args) => &args.source,
             Self::Recover(args) => &args.source,
             Self::Build(_) => panic!("ArchiveCommand::Build has no dump/tape source"),
+            Self::Capabilities => panic!("ArchiveCommand::Capabilities has no dump/tape source"),
+            Self::Reseal(_) => panic!("ArchiveCommand::Reseal has no dump/tape source"),
             Self::Inspect(_) => panic!("ArchiveCommand::Inspect has no dump/tape source"),
             Self::Extract(_) => panic!("ArchiveCommand::Extract has no dump/tape source"),
             Self::ExtractStream(_) => {
@@ -2824,6 +2874,8 @@ impl ArchiveCommand {
             Self::Restore(args) => args.format,
             Self::Recover(args) => args.format,
             Self::Build(_) => panic!("ArchiveCommand::Build has no format"),
+            Self::Capabilities => panic!("ArchiveCommand::Capabilities has no format"),
+            Self::Reseal(_) => panic!("ArchiveCommand::Reseal has no format"),
             Self::Inspect(_) => panic!("ArchiveCommand::Inspect has no format"),
             Self::Extract(_) => panic!("ArchiveCommand::Extract has no format"),
             Self::ExtractStream(_) => panic!("ArchiveCommand::ExtractStream has no format"),
@@ -3190,6 +3242,12 @@ where
     }
     if let Command::Archive { command } = &cli.command {
         let command = command.as_ref();
+        if matches!(command, ArchiveCommand::Capabilities) {
+            return run_archive_capabilities(out, err);
+        }
+        if let ArchiveCommand::Reseal(args) = command {
+            return run_archive_reseal(args, out, err);
+        }
         if let ArchiveCommand::Build(args) = command {
             return run_archive_build(args, out, err);
         }
@@ -3524,6 +3582,313 @@ where
     }
     print_warnings(&report, err);
     ExitCode::SUCCESS
+}
+
+fn run_archive_capabilities(out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    let capabilities = json!({
+        "capabilities": ["rao-v2-envelope", "wrap-suite-hpke-v1"]
+    });
+    match serde_json::to_writer(&mut *out, &capabilities)
+        .and_then(|()| writeln!(out).map_err(serde_json::Error::io))
+    {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            let _ = writeln!(err, "error: write archive capabilities: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_archive_reseal(
+    args: &ArchiveResealArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    run_archive_reseal_with(args, out, err, reseal_archive_object)
+}
+
+fn run_archive_reseal_with<F>(
+    args: &ArchiveResealArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    operation: F,
+) -> ExitCode
+where
+    F: FnOnce(&ArchiveResealArgs) -> Result<PublishedReseal, String>,
+{
+    match operation(args) {
+        Ok(publication) => match serde_json::to_writer(&mut *out, &publication.report)
+            .and_then(|()| writeln!(out).map_err(serde_json::Error::io))
+        {
+            Ok(()) => {
+                publication.commit();
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                let _ = writeln!(err, "error: write reseal report: {error}");
+                ExitCode::from(1)
+            }
+        },
+        Err(error) => {
+            let _ = writeln!(err, "error: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Armed publication whose output is removed unless report emission commits it.
+struct PublishedReseal {
+    report: Value,
+    output: PathBuf,
+    #[cfg(unix)]
+    output_identity: (u64, u64),
+    armed: bool,
+}
+
+impl PublishedReseal {
+    fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PublishedReseal {
+    fn drop(&mut self) {
+        // Documented limitation: the still_owns_output() stat and remove_file are
+        // not atomic — a sub-ms TOCTOU exists if a concurrent actor unlinks and
+        // recreates --out in that window. Accepted under the single-operator
+        // reseal threat model, and strictly safer than an unconditional delete.
+        if self.armed && self.still_owns_output() {
+            let _ = fs::remove_file(&self.output);
+        }
+    }
+}
+
+impl PublishedReseal {
+    #[cfg(unix)]
+    fn still_owns_output(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        fs::metadata(&self.output)
+            .map(|metadata| (metadata.dev(), metadata.ino()) == self.output_identity)
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(unix))]
+    fn still_owns_output(&self) -> bool {
+        self.output.exists()
+    }
+}
+
+fn reseal_archive_object(args: &ArchiveResealArgs) -> Result<PublishedReseal, String> {
+    reseal_archive_object_with_verifier(args, |path, expected| {
+        let actual = sha256_file(path)?;
+        if actual != expected {
+            return Err("staged v2 object hash differs from the sealer report".to_string());
+        }
+        Ok(actual)
+    })
+}
+
+fn reseal_archive_object_with_verifier<F>(
+    args: &ArchiveResealArgs,
+    verify_staged: F,
+) -> Result<PublishedReseal, String>
+where
+    F: FnOnce(&Path, [u8; 32]) -> Result<[u8; 32], String>,
+{
+    if args.out.exists() {
+        return Err(format!("--out {} already exists", args.out.display()));
+    }
+    let mut encrypted = File::open(&args.object)
+        .map_err(|error| format!("open v1 object {}: {error}", args.object.display()))?;
+    let mut header_bytes = [0u8; RAO_HEADER_LEN];
+    encrypted
+        .read_exact(&mut header_bytes)
+        .map_err(|error| format!("read v1 object header: {error}"))?;
+    let input_header = RaoHeader::parse(&header_bytes)
+        .map_err(|error| format!("parse v1 object header: {error}"))?;
+    if input_header.format_version != 1 {
+        return Err("archive reseal accepts only a v1 registry object as input".to_string());
+    }
+    encrypted
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind v1 object: {error}"))?;
+    let mut recipients = Vec::with_capacity(args.recipients.len());
+    for path in &args.recipients {
+        let bytes = fs::read(path)
+            .map_err(|error| format!("read recipient {}: {error}", path.display()))?;
+        recipients.push(
+            RecipientPublicKey::parse(&bytes)
+                .map_err(|error| format!("parse recipient {}: {error}", path.display()))?,
+        );
+    }
+    if recipients.len() < 2
+        || recipients
+            .windows(2)
+            .any(|pair| pair[0].slot_index >= pair[1].slot_index)
+        || recipients.iter().enumerate().any(|(index, recipient)| {
+            recipients[..index]
+                .iter()
+                .any(|earlier| earlier.recipient_epoch_id == recipient.recipient_epoch_id)
+        })
+    {
+        return Err(
+            "recipients must contain at least two distinct epochs in ascending slot order"
+                .to_string(),
+        );
+    }
+
+    let registry_key = read_root_key_file(&args.registry_key)?;
+    let staging_dir = args
+        .staging_dir
+        .as_deref()
+        .or_else(|| {
+            args.out
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+        })
+        .unwrap_or_else(|| Path::new("."));
+    let mut plaintext = SecurePlaintextStage::new_in(staging_dir)?;
+    let opened = open(&mut encrypted, plaintext.as_file_mut(), &registry_key)
+        .map_err(|error| format!("open v1 object: {error}"))?;
+    plaintext
+        .as_file_mut()
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind secure plaintext staging file: {error}"))?;
+
+    let seal_options = EnvelopeSealOptions {
+        common: SealOptions {
+            chunk_size: opened.header.chunk_size,
+            key_id: [0; 16],
+            object_id: opened.header.object_id.clone(),
+            plaintext_size: opened.metadata.plaintext_size,
+            plaintext_digest: opened.metadata.plaintext_digest,
+        },
+        recipients,
+    };
+
+    let temp = temporary_archive_output_path(&args.out);
+    if temp.exists() {
+        return Err(format!(
+            "temporary output {} already exists",
+            temp.display()
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|error| format!("create {}: {error}", temp.display()))?;
+    let report = match seal_envelope(plaintext.as_file_mut(), &mut file, &seal_options) {
+        Ok(report) => report,
+        Err(error) => {
+            drop(file);
+            let _ = fs::remove_file(&temp);
+            return Err(format!("seal v2 object: {error}"));
+        }
+    };
+    if let Err(error) = file.sync_all() {
+        drop(file);
+        let _ = fs::remove_file(&temp);
+        return Err(format!("sync {}: {error}", temp.display()));
+    }
+    #[cfg(unix)]
+    let output_identity = {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                drop(file);
+                let _ = fs::remove_file(&temp);
+                return Err(format!("stat {}: {error}", temp.display()));
+            }
+        };
+        (metadata.dev(), metadata.ino())
+    };
+    drop(file);
+    let write_result: Result<Value, String> = (|| {
+        let staged_digest = verify_staged(&temp, report.stored_digest)?;
+        let value = json!({
+            "input": args.object,
+            "output": args.out,
+            "object_id": report.header.object_id,
+            "input_format_version": 1,
+            "output_format_version": 2,
+            "recipient_epochs": report.key_frame.as_ref().expect("v2 seal has key frame")
+                .slots.iter().map(|slot| slot.epoch_label.as_str()).collect::<Vec<_>>(),
+            "stored_size_bytes": report.stored_size_bytes,
+            "expected_sha256": bytes_to_hex(&report.stored_digest),
+            "published_sha256": bytes_to_hex(&staged_digest),
+            "verified_after_write": true
+        });
+        publish_noreplace(&temp, &args.out).map_err(|error| {
+            format!(
+                "publish resealed object {} -> {}: {error}",
+                temp.display(),
+                args.out.display()
+            )
+        })?;
+        Ok(value)
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    Ok(PublishedReseal {
+        report: write_result?,
+        output: args.out.clone(),
+        #[cfg(unix)]
+        output_identity,
+        armed: true,
+    })
+}
+
+/// Publishes without replacing a destination created by a racing process.
+fn publish_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let source = CString::new(source.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "source path contains NUL"))?;
+        let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(ErrorKind::InvalidInput, "destination path contains NUL")
+        })?;
+        // SAFETY: both pointers are valid NUL-terminated path strings for the
+        // duration of the syscall, and no mutable memory is shared with it.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
+        ) {
+            return Err(error);
+        }
+    }
+
+    // Portable fallback for kernels without renameat2 support (ENOSYS/EINVAL/
+    // EOPNOTSUPP). hard_link is an atomic O_EXCL-style create (fails EEXIST →
+    // no-replace preserved), then unlink completes the move. EXDEV cannot arise:
+    // the staging temp and destination are always co-located on one filesystem.
+    fs::hard_link(source, destination)?;
+    if let Err(error) = fs::remove_file(source) {
+        let _ = fs::remove_file(destination);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn run_daemon_client_command(
@@ -9154,6 +9519,12 @@ fn run_archive_dump_command(
         ArchiveCommand::Build(_) => {
             unreachable!("archive build dispatched before the dump handler")
         }
+        ArchiveCommand::Capabilities => {
+            unreachable!("archive capabilities dispatched before the dump handler")
+        }
+        ArchiveCommand::Reseal(_) => {
+            unreachable!("archive reseal dispatched before the dump handler")
+        }
         ArchiveCommand::Inspect(_) => {
             unreachable!("archive inspect dispatched before the dump handler")
         }
@@ -11523,6 +11894,37 @@ fn temporary_archive_output_path(out: &Path) -> PathBuf {
     out.with_file_name(tmp_name)
 }
 
+/// Plaintext staging file that is truncated before its directory entry is removed.
+struct SecurePlaintextStage(tempfile::NamedTempFile);
+
+impl SecurePlaintextStage {
+    fn new_in(directory: &Path) -> Result<Self, String> {
+        tempfile::Builder::new()
+            .prefix(".rao-plaintext.")
+            .tempfile_in(directory)
+            .map(Self)
+            .map_err(|error| {
+                format!(
+                    "create secure plaintext staging file in {}: {error}",
+                    directory.display()
+                )
+            })
+    }
+
+    fn as_file_mut(&mut self) -> &mut File {
+        self.0.as_file_mut()
+    }
+}
+
+impl Drop for SecurePlaintextStage {
+    fn drop(&mut self) {
+        // Best effort only: filesystems and storage devices may retain old
+        // blocks, but truncation avoids leaving an intact plaintext file.
+        let _ = self.0.as_file_mut().set_len(0);
+        let _ = self.0.as_file_mut().sync_all();
+    }
+}
+
 fn read_root_key_file(path: &Path) -> Result<RootKey, String> {
     let mut bytes = std::fs::read(path)
         .map_err(|error| format!("read --key-file {}: {error}", path.display()))?;
@@ -11776,6 +12178,12 @@ fn run_archive_tape_with_drive(
         }
         ArchiveCommand::Build(_) => {
             unreachable!("archive build dispatched before the tape archive handler")
+        }
+        ArchiveCommand::Capabilities => {
+            unreachable!("archive capabilities dispatched before the tape archive handler")
+        }
+        ArchiveCommand::Reseal(_) => {
+            unreachable!("archive reseal dispatched before the tape archive handler")
         }
         ArchiveCommand::Inspect(_) => {
             unreachable!("archive inspect dispatched before the tape archive handler")
@@ -13469,6 +13877,140 @@ mod tests {
                 "rem help unexpectedly exposes {command}:\n{help}"
             );
         }
+    }
+
+    #[test]
+    fn archive_capabilities_are_machine_readable_without_discovery() {
+        let cli = Cli::try_parse_from(["rem", "archive", "capabilities"]).unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(
+            cli,
+            || panic!("archive capabilities must not perform hardware discovery"),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(err.is_empty());
+        let value: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            value["capabilities"],
+            json!(["rao-v2-envelope", "wrap-suite-hpke-v1"])
+        );
+    }
+
+    #[test]
+    fn archive_reseal_converts_v1_to_verified_v2() {
+        let plaintext = vec![0x5a; 1024];
+        let digest: [u8; 32] = Sha256::digest(&plaintext).into();
+        let root = RootKey::new([0x11; 32]).unwrap();
+        let (v1, _) = remanence_aead::seal_to_vec(
+            &plaintext,
+            &root,
+            &SealOptions {
+                chunk_size: 512,
+                key_id: [0x22; 16],
+                object_id: "reseal-object".to_string(),
+                plaintext_size: plaintext.len() as u64,
+                plaintext_digest: digest,
+            },
+        )
+        .unwrap();
+        let safe = remanence_aead::RecipientPrivateKey::new([1; 16], "safe", [7; 32]).unwrap();
+        let escrow = remanence_aead::RecipientPrivateKey::new([2; 16], "escrow", [8; 32]).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let object = temp.path().join("object-v1.rao");
+        let root_path = temp.path().join("registry.key");
+        let safe_path = temp.path().join("safe.raor");
+        let escrow_path = temp.path().join("escrow.raor");
+        let output = temp.path().join("object-v2.rao");
+        let staging = temp.path().join("plaintext-staging");
+        fs::create_dir(&staging).unwrap();
+        fs::write(&object, v1).unwrap();
+        fs::write(&root_path, [0x11; 32]).unwrap();
+        fs::write(&safe_path, safe.public_key(0).unwrap().serialize().unwrap()).unwrap();
+        fs::write(
+            &escrow_path,
+            escrow.public_key(1).unwrap().serialize().unwrap(),
+        )
+        .unwrap();
+
+        let args = ArchiveResealArgs {
+            object,
+            registry_key: root_path,
+            recipients: vec![safe_path, escrow_path],
+            out: output.clone(),
+            staging_dir: Some(staging.clone()),
+        };
+        let mut failure_out = Vec::new();
+        let mut failure_err = Vec::new();
+        let failure = run_archive_reseal_with(&args, &mut failure_out, &mut failure_err, |args| {
+            reseal_archive_object_with_verifier(args, |path, expected| {
+                let mut bytes = fs::read(path).map_err(|error| error.to_string())?;
+                bytes[RAO_HEADER_LEN] ^= 0x80;
+                fs::write(path, bytes).map_err(|error| error.to_string())?;
+                let actual = sha256_file(path)?;
+                if actual != expected {
+                    return Err("staged v2 object hash differs from the sealer report".to_string());
+                }
+                Ok(actual)
+            })
+        });
+        assert_ne!(failure, ExitCode::SUCCESS);
+        assert!(!output.exists(), "failed verification published --out");
+        assert!(!temporary_archive_output_path(&output).exists());
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
+
+        let raced_bytes = b"unrelated raced destination";
+        let race_error = reseal_archive_object_with_verifier(&args, |path, expected| {
+            fs::write(&output, raced_bytes).map_err(|error| error.to_string())?;
+            let actual = sha256_file(path)?;
+            assert_eq!(actual, expected);
+            Ok(actual)
+        })
+        .err()
+        .expect("raced destination must reject no-replace publication");
+        assert!(race_error.contains("publish resealed object"));
+        assert_eq!(fs::read(&output).unwrap(), raced_bytes);
+        fs::remove_file(&output).unwrap();
+
+        struct FailingReportWriter;
+        impl Write for FailingReportWriter {
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(ErrorKind::BrokenPipe, "injected failure"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut failing_writer = FailingReportWriter;
+        let mut report_error = Vec::new();
+        let report_failure = run_archive_reseal(&args, &mut failing_writer, &mut report_error);
+        assert_ne!(report_failure, ExitCode::SUCCESS);
+        assert!(String::from_utf8(report_error)
+            .unwrap()
+            .contains("write reseal report"));
+        assert!(!output.exists(), "report failure left published --out");
+        assert!(!temporary_archive_output_path(&output).exists());
+
+        let mut report_out = Vec::new();
+        let mut report_err = Vec::new();
+        assert_eq!(
+            run_archive_reseal(&args, &mut report_out, &mut report_err),
+            ExitCode::SUCCESS
+        );
+        assert!(report_err.is_empty());
+        let report: Value = serde_json::from_slice(&report_out).unwrap();
+        assert_eq!(report["verified_after_write"], true);
+        let v2 = fs::read(&output).unwrap();
+        assert_eq!(inspect_bytes(&v2).unwrap().header.format_version, 2);
+        assert_eq!(fs::read_dir(staging).unwrap().count(), 0);
+        assert_eq!(
+            remanence_aead::open_envelope_to_vec(&v2, &safe).unwrap().0,
+            plaintext
+        );
     }
 
     #[test]

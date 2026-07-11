@@ -11,6 +11,8 @@ use crate::stream::round_up;
 pub struct InspectReport {
     /// Parsed plaintext header.
     pub header: RaoHeader,
+    /// Parsed canonical v2 key frame, absent for v1.
+    pub key_frame: Option<crate::KeyFrame>,
     /// Total stored input size.
     pub stored_size_bytes: u64,
     /// SHA-256 over all stored bytes.
@@ -31,12 +33,28 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<InspectReport> {
         .try_into()
         .map_err(|_| RaoAeadError::UnexpectedEof)?;
     let header = RaoHeader::parse(&header_bytes)?;
+    let key_frame_len = u64::from(header.key_frame_len);
+    let key_frame = if header.format_version == 2 && header.key_frame_len != 0 {
+        let end = RAO_HEADER_LEN
+            .checked_add(header.key_frame_len as usize)
+            .ok_or(RaoAeadError::SizeOverflow)?;
+        Some(crate::KeyFrame::parse(
+            bytes
+                .get(RAO_HEADER_LEN..end)
+                .ok_or(RaoAeadError::UnexpectedEof)?,
+        )?)
+    } else {
+        None
+    };
     let stored_size_bytes = u64::try_from(bytes.len()).map_err(|_| RaoAeadError::SizeOverflow)?;
     if stored_size_bytes % u64::from(header.chunk_size) != 0 {
         return Err(RaoAeadError::TrailingData);
     }
     if stored_size_bytes
-        < RAO_HEADER_LEN as u64 + RAO_FOOTER.len() as u64 + header.metadata_frame_len
+        < RAO_HEADER_LEN as u64
+            + key_frame_len
+            + RAO_FOOTER.len() as u64
+            + header.metadata_frame_len
     {
         return Err(RaoAeadError::UnexpectedEof);
     }
@@ -49,7 +67,9 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<InspectReport> {
         .checked_add(16)
         .ok_or(RaoAeadError::SizeOverflow)?;
     let numerator = stored_size_bytes
-        .checked_sub(144)
+        .checked_sub(RAO_HEADER_LEN as u64)
+        .and_then(|value| value.checked_sub(key_frame_len))
+        .and_then(|value| value.checked_sub(RAO_FOOTER.len() as u64))
         .and_then(|value| value.checked_sub(header.metadata_frame_len))
         .ok_or(RaoAeadError::UnexpectedEof)?;
     let chunk_count = numerator / stride;
@@ -60,7 +80,8 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<InspectReport> {
         .checked_mul(u64::from(header.chunk_size))
         .ok_or(RaoAeadError::SizeOverflow)?;
     let footer_offset = (RAO_HEADER_LEN as u64)
-        .checked_add(header.metadata_frame_len)
+        .checked_add(key_frame_len)
+        .and_then(|value| value.checked_add(header.metadata_frame_len))
         .and_then(|value| value.checked_add(chunk_count.checked_mul(stride)?))
         .ok_or(RaoAeadError::SizeOverflow)?;
     let expected_size = round_up(
@@ -86,6 +107,7 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<InspectReport> {
 
     Ok(InspectReport {
         header,
+        key_frame,
         stored_size_bytes,
         stored_digest,
         chunk_count,
@@ -119,5 +141,21 @@ mod tests {
         assert_eq!(inspected.chunk_count, 2);
         assert_eq!(inspected.plaintext_size, 1024);
         assert_eq!(inspected.stored_digest, report.stored_digest);
+    }
+
+    #[test]
+    fn inspect_rejects_v1_shape_with_version_flipped_to_v2() {
+        let header = RaoHeader::new(512, [0x10; 16], [0x20; 16], 17, "registry-v1").unwrap();
+        let mut object = header.serialize().unwrap().to_vec();
+        object[6] = 2;
+        object.extend_from_slice(&[0u8; 17]);
+        object.extend_from_slice(&[0u8; 512 + 16]);
+        object.extend_from_slice(RAO_FOOTER);
+        object.resize(object.len().div_ceil(512) * 512, 0);
+
+        assert!(matches!(
+            inspect_bytes(&object),
+            Err(RaoAeadError::InvalidWrapSuite)
+        ));
     }
 }
