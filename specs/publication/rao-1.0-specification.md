@@ -2772,5 +2772,6 @@ sequentially, an acceptable cost over sequential media.
 ## Author's Address
 
 The ArchiveTech Project
-archivetech.org
+Website: https://archivetech.org
 Email: specs@archivetech.org
+Reference implementation: https://github.com/archivetechie/remanence
