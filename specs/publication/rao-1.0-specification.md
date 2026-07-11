@@ -1,5 +1,12 @@
 # Rem Archive Object (RAO) Format
 
+> **SUPERSEDED (2026-07-11).** This split draft has been folded, together with
+> the RAO 1.1 xattr delta and the on-tape v2 HPKE envelope, into the single
+> combined publication document
+> [`rao-object-format-1.0.md`](rao-object-format-1.0.md) — the normative RAO
+> Format Specification, Version 1.0. This file is retained as an internal
+> revision record only; do not cite or publish it.
+
 ## Version 1.0 — Specification
 
 | | |

@@ -1,5 +1,11 @@
 # Rem Archive Object (RAO) Format — Version 1.1
 
+> **SUPERSEDED (2026-07-11).** The xattr metadata-preservation content of this
+> additive delta has been folded into the single combined publication document
+> [`rao-object-format-1.0.md`](rao-object-format-1.0.md) — the normative RAO
+> Format Specification, Version 1.0. This file is retained as an internal
+> revision record only; do not cite or publish it.
+
 | | |
 | --- | --- |
 | Status | Draft for review |
