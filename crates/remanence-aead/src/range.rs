@@ -3,7 +3,9 @@
 //! The functions here implement the Section 6 ciphertext mapping: decrypt the
 //! authenticated metadata frame, map plaintext body chunks to stored
 //! ciphertext ranges, authenticate every fetched chunk, and release only the
-//! caller-requested plaintext bytes.
+//! caller-requested plaintext bytes. This is per-frame fail-closed behavior,
+//! not whole-object authentication: corruption in an unrelated payload frame
+//! does not invalidate an otherwise authenticated returned range.
 
 use crate::error::{RaoAeadError, Result};
 use crate::header::{RaoHeader, RAO_HEADER_LEN};
@@ -37,9 +39,9 @@ pub struct RangeOpenReport {
 /// Open an absolute plaintext byte range from an encrypted RAO object.
 ///
 /// `plaintext_start` and `plaintext_len` address the canonical plaintext
-/// object. The input is the encrypted representation byte string; only the
-/// metadata frame and the ciphertext chunks covering the requested range are
-/// decrypted.
+/// object. The scalar header, v2 key frame (when present), metadata frame, and
+/// every ciphertext chunk covering the requested range are authenticated
+/// before bytes are returned. Unrequested payload chunks are not authenticated.
 pub fn open_plaintext_range_to_vec(
     input: &[u8],
     root_key: &RootKey,
@@ -77,8 +79,7 @@ pub fn open_inner_range_to_vec(
     open_plaintext_range_with_context(input, header, metadata, keys, absolute_start, range_len)
 }
 
-/// Open and authenticate a v2 envelope plaintext range.
-///
+/// Open and authenticate a v2 envelope plaintext range with per-frame semantics.
 pub fn open_plaintext_range_envelope_to_vec(
     input: &[u8],
     recipient: &crate::RecipientPrivateKey,
@@ -333,7 +334,10 @@ fn validate_range(start: u64, len: u64, plaintext_size: u64) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{cipher_offset, open_to_vec, seal_to_vec, SealOptions};
+    use crate::{
+        cipher_offset, open_to_vec, seal_envelope_to_vec, seal_to_vec, EnvelopeSealOptions,
+        RecipientPrivateKey, SealOptions,
+    };
     use sha2::{Digest, Sha256};
 
     fn sealed() -> (Vec<u8>, Vec<u8>, RootKey, SealOptions) {
@@ -351,6 +355,25 @@ mod tests {
         };
         let sealed = seal_to_vec(&plaintext, &root, &options).unwrap().0;
         (sealed, plaintext, root, options)
+    }
+
+    fn sealed_v2() -> (Vec<u8>, Vec<u8>, RecipientPrivateKey) {
+        let plaintext: Vec<u8> = (0..1536).map(|i| (i % 251) as u8).collect();
+        let plaintext_digest = Sha256::digest(&plaintext).into();
+        let safe = RecipientPrivateKey::new([1; 16], "safe", [7; 32]).unwrap();
+        let escrow = RecipientPrivateKey::new([2; 16], "escrow", [8; 32]).unwrap();
+        let options = EnvelopeSealOptions {
+            common: SealOptions {
+                chunk_size: 512,
+                key_id: [0; 16],
+                object_id: "object-v2-range".to_string(),
+                plaintext_size: plaintext.len() as u64,
+                plaintext_digest,
+            },
+            recipients: vec![safe.public_key(0).unwrap(), escrow.public_key(1).unwrap()],
+        };
+        let sealed = seal_envelope_to_vec(&plaintext, &options).unwrap().0;
+        (sealed, plaintext, safe)
     }
 
     #[test]
@@ -401,6 +424,46 @@ mod tests {
             open_plaintext_range_to_vec(&sealed, &root, 512, 128),
             Err(RaoAeadError::AeadAuthenticationFailed)
         ));
+    }
+
+    #[test]
+    fn v2_range_authenticates_returned_frames_but_not_unrequested_payload() {
+        let (sealed, plaintext, safe) = sealed_v2();
+        let inspected = crate::inspect_bytes(&sealed).unwrap();
+        let chunk_zero = cipher_offset_with_key_frame(
+            inspected.header.key_frame_len,
+            inspected.header.metadata_frame_len,
+            inspected.header.chunk_size,
+            0,
+        )
+        .unwrap() as usize;
+        let chunk_two = cipher_offset_with_key_frame(
+            inspected.header.key_frame_len,
+            inspected.header.metadata_frame_len,
+            inspected.header.chunk_size,
+            2,
+        )
+        .unwrap() as usize;
+
+        let mut requested_tamper = sealed.clone();
+        requested_tamper[chunk_zero] ^= 0x80;
+        assert!(matches!(
+            open_plaintext_range_envelope_to_vec(&requested_tamper, &safe, 0, 128),
+            Err(RaoAeadError::AeadAuthenticationFailed)
+        ));
+
+        let mut unrelated_tamper = sealed;
+        unrelated_tamper[chunk_two] ^= 0x80;
+        let (range, _) =
+            open_plaintext_range_envelope_to_vec(&unrelated_tamper, &safe, 0, 128).unwrap();
+        assert_eq!(range, plaintext[..128]);
+    }
+
+    #[test]
+    fn v2_range_rejects_key_frame_tamper_outside_requested_payload() {
+        let (mut sealed, _plaintext, safe) = sealed_v2();
+        sealed[RAO_HEADER_LEN + 6] ^= 0x80;
+        assert!(open_plaintext_range_envelope_to_vec(&sealed, &safe, 0, 128).is_err());
     }
 
     #[test]

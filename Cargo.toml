@@ -15,6 +15,7 @@ members = [
     "crates/remanence-api",
     "crates/remanence-cli",
     "crates/remanence-daemon",
+    "crates/rao-recover",
 ]
 
 # Shared metadata so each crate's Cargo.toml stays minimal.

@@ -16,10 +16,6 @@ path = "src/main.rs"
 name = "rem-debug"
 path = "src/rem_debug.rs"
 
-[[bin]]
-name = "rao-recover"
-path = "src/rao_recover.rs"
-
 [dependencies]
 remanence-bru     = { path = "../remanence-bru", optional = true }
 remanence-aead    = { path = "../remanence-aead" }

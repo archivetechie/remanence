@@ -69,20 +69,15 @@ The parser rejects mismatched frozen fields before accepting the header core:
 bad magic, bad header length, unsupported format version, invalid suite id,
 nonzero flags, and nonzero reserved bytes.
 
-## H6 — v1/v2 disjoint dispatch and v2 scalar round trip
+## H6 — v2 and key-frame status (not formally proved)
 
-`v1_v2_dispatch_disjoint` proves that no format version can enter both parser
-branches. For a valid v2 envelope scalar header, including zero `key_id`, HPKE
-wrap suite 1, reserved-zero bytes, and `103 <= key_frame_len <= 4096`,
-`parse_serialize_v2_header_round_trip` proves the scalar round trip.
-
-## H7 — canonical key-frame round trip
-
-For a nonempty frame of at most eight slots with strictly increasing slot
-indexes and printable labels of at most 32 bytes,
-`parse_serialize_key_frame_round_trip` proves the abstract grammar round trip.
-Rust byte-exact vectors and the drift guard bind this abstract result to the
-`RAOK` framing and fixed-width epoch/enc/ciphertext fields.
+Production unit tests, negative vectors, fuzz targets, and the Rust drift guard
+cover v1/v2 disjoint parsing, the v2 scalar layout, and canonical key-frame
+bytes. The Aeneas-generated `Funs.lean` file does not contain v2 parser or
+key-frame functions, so none of those v2 properties are claimed as Lean
+theorems. Follow-up **RAO-V2-FORMAL-HEADER-KEY-FRAME** must extract the actual
+byte parser/serializer and key-frame codec before round-trip or disjointness
+coverage can be advertised as formal.
 
 ## Trust anchor
 
