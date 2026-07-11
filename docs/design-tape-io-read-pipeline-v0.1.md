@@ -1,8 +1,13 @@
 # Tape I/O read pipeline (TIO-6) — read submitter, read reservoir (watermark stop-start), relay unblocking — Design v0.4
 
-**Status:** **FOLDED v0.4** (2026-07-11) — IN_BAND regime removed (owner);
-single-regime reservoir stop-start; re-verify gaps closed; pending final
-verify before freeze.
+**Status:** **FROZEN v0.4** (2026-07-11) — IN_BAND regime removed (owner);
+single-regime reservoir stop-start. **Final codex verify (gpt-5.6-sol) 2026-07-11
+11:41 — PASS, no blockers/majors; design FREEZES.** 2 doc/spec MINORS to fold at
+prompt-cut: (1) `reference-configuration.md` add the 4 reservoir/proof keys
+(`read_reservoir_bytes`, both watermark %, `position_check_bytes_ranged`) + rewrite
+the spool row so post-R2 authority is the shared ceiling not a `MemAvailable` clamp;
+(2) §3.2 — size free/delivery channels at window-creation for the effective max slab
+count (bounded channels don't grow), assert `allocated ≤ capacity`.
 **Fold record:** panel 2026-07-11: 37 findings (14 failure / 9 concurrency /
 7 scsi / 7 cost); folded + owner decisions. The dominant convergence (3 lenses)
 was the wrap-don't-copy contradiction — resolved in §3.3/§3.6/§5. The single
