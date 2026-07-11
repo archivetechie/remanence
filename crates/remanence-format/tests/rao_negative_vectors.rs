@@ -13,7 +13,8 @@ use remanence_format::{
     plan_rem_tar_object, read_encrypted_rao_object, read_rem_tar_object, stream_rem_tar_object,
     write_rem_tar_object, write_rem_tar_object_from_readers, FormatError, MetadataPreservation,
     RemTarEntrySink, RemTarEntryType, RemTarFile, RemTarFileLayout, RemTarFileSpec,
-    RemTarFileStream, RemTarObjectLayout, RemTarObjectOptions, RemTarStreamEntry, TAR_RECORD_SIZE,
+    RemTarFileStream, RemTarObjectLayout, RemTarObjectOptions, RemTarReadWarning,
+    RemTarStreamEntry, TAR_RECORD_SIZE,
 };
 use remanence_library::{VecBlockSink, VecBlockSource};
 use serde_json::Value;
@@ -390,9 +391,28 @@ fn hardlink_plaintext_archive() -> PlaintextArchive {
 fn assert_plaintext_reader_case(case: &Value) {
     let id = str_field(case, "id");
     let operation = str_field(case, "operation");
-    let expected = str_field(case, "expected_error");
-    let err = run_plaintext_reader_case(id, operation).unwrap_err();
-    assert_eq!(format_error_name(&err), expected, "{id}: {err}");
+    if operation == "restore-report" {
+        let warnings = run_plaintext_reader_report_case(id);
+        assert_eq!(warnings, vec![RemTarReadWarning::MissingManifest]);
+        assert_eq!(str_field(case, "expected_report"), "MissingManifest");
+    } else {
+        let expected = str_field(case, "expected_error");
+        let err = run_plaintext_reader_case(id, operation).unwrap_err();
+        assert_eq!(format_error_name(&err), expected, "{id}: {err}");
+    }
+}
+
+fn run_plaintext_reader_report_case(id: &str) -> Vec<RemTarReadWarning> {
+    let mut archive = base_plaintext_archive();
+    mutate_plaintext_archive(id, &mut archive);
+    let mut source = source_from_bytes(&archive.bytes, archive.chunk_size);
+    read_rem_tar_object(
+        &mut source,
+        archive.chunk_size,
+        block_count(&archive.bytes, archive.chunk_size),
+    )
+    .expect("reporting vector remains readable")
+    .warnings
 }
 
 fn run_plaintext_reader_case(id: &str, operation: &str) -> Result<(), FormatError> {
@@ -491,6 +511,9 @@ fn mutate_plaintext_archive(id: &str, archive: &mut PlaintextArchive) {
             b"a/../b",
         ),
         "entry-after-manifest" => insert_entry_after_manifest(archive),
+        "missing-manifest" => {
+            archive.bytes[archive.layout.manifest.pax_header_offset as usize..].fill(0);
+        }
         "flipped-payload-bit" => {
             let offset = archive.layout.files[0].data_offset as usize;
             archive.bytes[offset] ^= 1;
@@ -1671,6 +1694,7 @@ fn plaintext_reader_negative_vectors_match_manifest_errors() {
             "hardlink-missing-target",
             "hardlink-forward-target",
             "hardlink-nonregular-target",
+            "missing-manifest",
         ],
     );
     let base = fixture.get("base").expect("plaintext reader base exists");
