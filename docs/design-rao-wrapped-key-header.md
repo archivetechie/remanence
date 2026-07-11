@@ -223,7 +223,12 @@ documented; not whole-stream atomic).
 
 ## Open questions
 
-1. `rust-hpke` exact version pin, audit status, vendoring posture — resolved in
-   the implementation prompt, not blocking the freeze.
+1. **Resolved 2026-07-11:** pin `hpke = 0.13.0` exactly, with only its `std` and
+   `x25519` features. It is the latest stable release compatible with the
+   workspace MSRV, includes RFC 9180 known-answer tests, is pure Rust, and its
+   primitive versions align with this workspace. The upstream crate has not
+   received a formal independent audit (Cloudflare reviewed v0.8); therefore
+   keep the exact Cargo.lock pin and vendor the complete locked dependency set
+   in the escrowed source/toolchain image rather than maintaining a fork.
 (Verify round 1 answered the former questions 1-2: byte offsets pinned in the
 Format section; salt transcript pinned in Seal ordering.)
