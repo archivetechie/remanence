@@ -1,6 +1,6 @@
 # Design v2: RAO envelope encryption — wrapped-DEK key frame
 
-**Status: refolded 2026-07-11 (verify-1 findings folded verbatim) — awaiting verify round 2.**
+**Status: FROZEN 2026-07-11** (panel 72 findings → v2 rewrite → verify-1 FAIL folded verbatim → verify-2 PASS, no new blockers/majors). Implementation sequences with the dev-seed replacement arc; prompts not yet cut.
 `panel 2026-07-11: 72 findings (13 security / 17 failure / 15 contract / 8 cost /
 19 DR-UX); folded as v2 rewrite` — consolidated report:
 `panel-rao-wrapped-key-2026-07-11.md`; verbatim lenses: `panel-lenses-2026-07-11/`.
