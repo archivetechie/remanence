@@ -161,7 +161,7 @@ journal/                        Dated work journal
 
 ![Workspace crate map: layer 5 cli, api, daemon over layer 4 state over layer 3 format, aead, parity, format-driver over layer 2 library over layer 1 scsi, with the format-free platform seam between layers 3 and 2](docs/assets/layer-map.svg)
 
-*Fig. 1 — The crate stack: each layer depends only on the one below it; amber marks the crates that define the bytes on tape, and everything below the platform seam is format-free.*
+*Fig. 1 — The crate stack: each layer depends only on the one below it; the highlighted crates define the bytes on tape, and everything below the platform seam is format-free.*
 
 ## License
 
