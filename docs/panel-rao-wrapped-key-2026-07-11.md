@@ -121,3 +121,15 @@ is therefore a full v2 rewrite, not a patch. All decisions below are Claude's
 Panel stats: 72 findings (13 security / 17 failure / 15 contract / 8 cost / 19
 DR-UX) → 8 blocker themes + 12 major themes folded; 0 business questions (all
 technical; key decisions pre-delegated). Fold output: design v2 (full rewrite).
+
+## Verify rounds
+
+**Verify-1 (fresh codex): FAIL** — 2 blockers (incomplete wire spec; missing salt
+transcript) + 2 majors (HPKE info not a byte transcript; migration wording vs
+scope rule). All four arrived with dictated fixes, folded verbatim; verify-1 also
+ANSWERED the design's open questions (exact free header offsets 0x0C..0x10 and
+0x38..0x40; salt derivation order; footer geometry formula confirmed).
+
+**Verify-2 (fresh codex): PASS** — all four resolved against header.rs/seal.rs/
+open.rs/kdf.rs; key-frame grammar independently parseable; no refold-introduced
+errors. **Design FROZEN at the 2-round structure (panel + fold + 2 verifies).**
