@@ -75,6 +75,62 @@ pub fn open_inner_range_to_vec(
     open_plaintext_range_with_context(input, header, metadata, keys, absolute_start, range_len)
 }
 
+/// Open and authenticate a v2 envelope plaintext range.
+///
+/// The standalone recovery path deliberately authenticates the complete object
+/// before releasing a slice. Tape PFR can later replace this conservative
+/// implementation without changing its strict envelope-mode contract.
+pub fn open_plaintext_range_envelope_to_vec(
+    input: &[u8],
+    recipient: &crate::RecipientPrivateKey,
+    plaintext_start: u64,
+    plaintext_len: u64,
+) -> Result<(Vec<u8>, RangeOpenReport)> {
+    let (plaintext, opened) = crate::open_envelope_to_vec(input, recipient)?;
+    let plaintext_end = validate_range(
+        plaintext_start,
+        plaintext_len,
+        opened.metadata.plaintext_size,
+    )?;
+    let start = usize::try_from(plaintext_start).map_err(|_| RaoAeadError::SizeOverflow)?;
+    let end = usize::try_from(plaintext_end).map_err(|_| RaoAeadError::SizeOverflow)?;
+    let bytes = plaintext
+        .get(start..end)
+        .ok_or(RaoAeadError::SizeOverflow)?
+        .to_vec();
+    let chunk_size = u64::from(opened.header.chunk_size);
+    let (first_chunk, chunk_count, stored_range_start, stored_range_len) = if plaintext_len == 0 {
+        (None, 0, None, 0)
+    } else {
+        let first = plaintext_start / chunk_size;
+        let last = (plaintext_end - 1) / chunk_size;
+        let count = last - first + 1;
+        let start = crate::cipher_offset_with_key_frame(
+            opened.header.key_frame_len,
+            opened.header.metadata_frame_len,
+            opened.header.chunk_size,
+            first,
+        )?;
+        let len = count
+            .checked_mul(chunk_size + CHACHA20POLY1305_TAG_LEN)
+            .ok_or(RaoAeadError::SizeOverflow)?;
+        (Some(first), count, Some(start), len)
+    };
+    Ok((
+        bytes,
+        RangeOpenReport {
+            header: opened.header,
+            metadata: opened.metadata,
+            plaintext_start,
+            plaintext_len,
+            first_chunk,
+            chunk_count,
+            stored_range_start,
+            stored_range_len,
+        },
+    ))
+}
+
 fn open_plaintext_range_with_context(
     input: &[u8],
     header: RaoHeader,
@@ -201,6 +257,9 @@ fn open_authenticated_metadata(
         .try_into()
         .map_err(|_| RaoAeadError::UnexpectedEof)?;
     let header = RaoHeader::parse(&header_bytes)?;
+    if header.format_version != 1 {
+        return Err(RaoAeadError::KeyModeMismatch);
+    }
     let keys = derive_keys(root_key, &header.hkdf_salt, &header.header_hash()?)?;
     let metadata_frame_len =
         usize::try_from(header.metadata_frame_len).map_err(|_| RaoAeadError::SizeOverflow)?;
