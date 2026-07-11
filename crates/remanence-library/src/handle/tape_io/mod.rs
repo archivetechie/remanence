@@ -35,10 +35,10 @@ use crate::transport::TimeoutClass;
 
 pub use model::{
     BlockSize, ComputedPosition, DevicePositionProof, PipelinedReadDiagnostics,
-    PipelinedWriteDiagnostics, PositionAfter, ReadBatchOutcome, ReadBufferHandoff, ReadDelivery,
-    ReadHandoffOutcome, ReadTerminalFlags, SequencedHandoff, SpaceKind, SpaceResult, TapeConfig,
-    TapePosition, WormMediaState, WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
-    WriteUnpositionedOutcome,
+    PipelinedWriteDiagnostics, PositionAfter, ReadBatchOutcome, ReadBuffer, ReadBufferHandoff,
+    ReadDelivery, ReadHandoffOutcome, ReadTerminalFlags, SequencedHandoff, SpaceKind, SpaceResult,
+    TapeConfig, TapePosition, WormMediaState, WriteBatchOutcome, WriteFilemarksOutcome,
+    WriteOutcome, WriteUnpositionedOutcome,
 };
 pub use readiness::{classify_media_readiness_error, MediaFamily, MediaReadiness};
 
@@ -2400,6 +2400,15 @@ impl super::DriveHandle {
     /// the caller persists the durable tape-I/O fence.
     pub fn position_pipelined(&mut self) -> Result<TapePosition, TapeIoError> {
         self.read_position_pipelined_expected(None)
+    }
+
+    /// Pipeline-ordered READ POSITION that must match the supplied read cursor.
+    pub fn prove_read_position_pipelined(
+        &mut self,
+        expected: TapePosition,
+    ) -> Result<DevicePositionProof, TapeIoError> {
+        self.read_position_pipelined_expected(Some(expected))
+            .map(DevicePositionProof::from_device_position)
     }
 
     fn run_pipelined_position_tripwire(

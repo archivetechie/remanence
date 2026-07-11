@@ -856,7 +856,7 @@ fn mount_tape_object(
 
 /// Mount, position, and stream one object's payload through `sink_writer`,
 /// returning the streamed hash + byte count.
-fn stream_tape_object<W: Write>(
+fn stream_tape_object<W: Write + Send>(
     report: &remanence_library::DiscoveryReport,
     target: &TapeObjectRef<'_>,
     allow: &[String],

@@ -11,6 +11,13 @@ use crate::error::StateError;
 /// Default fixed tape block size for newly initialized tapes.
 pub const DEFAULT_TAPE_BLOCK_SIZE_BYTES: u64 = 256 * 1024;
 
+/// Default fixed ceiling shared by append spools and read reservoirs.
+pub const DEFAULT_IO_MEMORY_CEILING_BYTES: u64 = 24 * 1024 * 1024 * 1024;
+/// Default target size of one restore stream's read reservoir.
+pub const DEFAULT_READ_RESERVOIR_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Default ranged-read device-position proof cadence.
+pub const DEFAULT_RANGED_POSITION_CHECK_BYTES: u64 = 256 * 1024 * 1024;
+
 const MAX_TAPE_BLOCK_SIZE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Top-level Remanence daemon configuration.
@@ -62,6 +69,12 @@ pub struct DaemonConfig {
     /// Required operator acknowledgment when `spool_dir` is RAM-backed tmpfs.
     #[serde(default, deserialize_with = "deserialize_optional_byte_size")]
     pub spool_tmpfs_ram_budget: Option<u64>,
+    /// Fixed aggregate budget for spool and read-reservoir memory.
+    #[serde(
+        default = "default_io_memory_ceiling",
+        deserialize_with = "deserialize_byte_size"
+    )]
+    pub io_memory_ceiling: u64,
     /// Default idle timeout for sessions.
     pub default_idle_timeout_seconds: u64,
     /// Whether state-changing operations must be rejected.
@@ -299,6 +312,16 @@ pub struct TapeIoConfig {
     /// Drift tripwire cadence in bytes. Zero disables mid-stream checks.
     #[serde(deserialize_with = "deserialize_byte_size")]
     pub position_check_bytes: u64,
+    /// Target byte capacity of one restore stream's host-RAM reservoir.
+    #[serde(deserialize_with = "deserialize_byte_size")]
+    pub read_reservoir_bytes: u64,
+    /// Stop issuing reads at this percentage of effective reservoir capacity.
+    pub read_reservoir_high_pct: u8,
+    /// Resume issuing reads at this percentage of effective reservoir capacity.
+    pub read_reservoir_low_pct: u8,
+    /// Device-position proof cadence for hash-less ranged reads.
+    #[serde(deserialize_with = "deserialize_byte_size")]
+    pub position_check_bytes_ranged: u64,
 }
 
 impl Default for TapeIoConfig {
@@ -308,8 +331,16 @@ impl Default for TapeIoConfig {
             write_batch_blocks: remanence_library::DEFAULT_TAPE_IO_BATCH_BLOCKS,
             read_batch_blocks: remanence_library::DEFAULT_TAPE_IO_BATCH_BLOCKS,
             position_check_bytes: remanence_library::DEFAULT_TAPE_IO_POSITION_CHECK_BYTES,
+            read_reservoir_bytes: DEFAULT_READ_RESERVOIR_BYTES,
+            read_reservoir_high_pct: 90,
+            read_reservoir_low_pct: 25,
+            position_check_bytes_ranged: DEFAULT_RANGED_POSITION_CHECK_BYTES,
         }
     }
+}
+
+const fn default_io_memory_ceiling() -> u64 {
+    DEFAULT_IO_MEMORY_CEILING_BYTES
 }
 
 /// Layer 3c journal configuration.
@@ -446,6 +477,20 @@ pub fn validate_config(config: &RemConfig) -> Result<(), StateError> {
             "daemon.spool_tmpfs_ram_budget must be non-zero when set".to_string(),
         ));
     }
+    if config.daemon.io_memory_ceiling == 0 {
+        return Err(StateError::ConfigInvalid(
+            "daemon.io_memory_ceiling must be non-zero".to_string(),
+        ));
+    }
+    if config
+        .daemon
+        .spool_tmpfs_ram_budget
+        .is_some_and(|budget| budget > config.daemon.io_memory_ceiling)
+    {
+        return Err(StateError::ConfigInvalid(
+            "daemon.spool_tmpfs_ram_budget must not exceed daemon.io_memory_ceiling".to_string(),
+        ));
+    }
     if config.audit.clock_forward_tolerance_seconds > i64::MAX as u64 {
         return Err(StateError::ConfigInvalid(
             "audit.clock_forward_tolerance_seconds is too large".to_string(),
@@ -459,6 +504,28 @@ pub fn validate_config(config: &RemConfig) -> Result<(), StateError> {
     if config.tape_io.read_batch_blocks == 0 {
         return Err(StateError::ConfigInvalid(
             "tape_io.read_batch_blocks must be non-zero".to_string(),
+        ));
+    }
+    if config.tape_io.read_reservoir_bytes == 0
+        || config.tape_io.read_reservoir_bytes > config.daemon.io_memory_ceiling
+    {
+        return Err(StateError::ConfigInvalid(
+            "tape_io.read_reservoir_bytes must be non-zero and not exceed daemon.io_memory_ceiling"
+                .to_string(),
+        ));
+    }
+    if config.tape_io.read_reservoir_low_pct == 0
+        || config.tape_io.read_reservoir_low_pct >= config.tape_io.read_reservoir_high_pct
+        || config.tape_io.read_reservoir_high_pct > 100
+    {
+        return Err(StateError::ConfigInvalid(
+            "tape_io reservoir watermarks require 0 < read_reservoir_low_pct < read_reservoir_high_pct <= 100"
+                .to_string(),
+        ));
+    }
+    if config.tape_io.position_check_bytes_ranged == 0 {
+        return Err(StateError::ConfigInvalid(
+            "tape_io.position_check_bytes_ranged must be non-zero".to_string(),
         ));
     }
     if !(remanence_library::MIN_TAPE_IO_STAGING_RING_BUFFERS
@@ -947,7 +1014,7 @@ id = "camera copy a"
 
         let text = valid_config().replace(
             "default_idle_timeout_seconds = 1800",
-            "default_idle_timeout_seconds = 1800\nspool_dir = \"/mnt/rem-spool\"\nspool_tmpfs_ram_budget = \"32GiB\"",
+            "default_idle_timeout_seconds = 1800\nspool_dir = \"/mnt/rem-spool\"\nspool_tmpfs_ram_budget = \"16GiB\"",
         );
         let config = parse_config_toml(&text).expect("valid config with spool_dir");
         assert_eq!(
@@ -956,7 +1023,7 @@ id = "camera copy a"
         );
         assert_eq!(
             config.daemon.spool_tmpfs_ram_budget,
-            Some(32 * 1024 * 1024 * 1024)
+            Some(16 * 1024 * 1024 * 1024)
         );
     }
 
@@ -1065,6 +1132,10 @@ client_ca = "/ca"
         assert!(config.audit.fsync);
         assert_eq!(config.daemon.spool_dir, None);
         assert_eq!(config.daemon.spool_tmpfs_ram_budget, None);
+        assert_eq!(
+            config.daemon.io_memory_ceiling,
+            DEFAULT_IO_MEMORY_CEILING_BYTES
+        );
         assert!(config.tape_pools.is_empty());
         assert!(config.tape_pool_rules.is_empty());
         assert_eq!(
@@ -1083,6 +1154,41 @@ client_ca = "/ca"
             config.tape_io.position_check_bytes,
             remanence_library::DEFAULT_TAPE_IO_POSITION_CHECK_BYTES
         );
+    }
+
+    #[test]
+    fn read_reservoir_and_shared_ceiling_parse_and_reject_degenerate_values() {
+        let mut configured = with_daemon_lines("io_memory_ceiling = \"12GiB\"\n");
+        configured.push_str(
+            "\n[tape_io]\nread_reservoir_bytes = \"4GiB\"\nread_reservoir_high_pct = 80\nread_reservoir_low_pct = 20\nposition_check_bytes_ranged = \"128MiB\"\n",
+        );
+        let config = parse_config_toml(&configured).expect("reservoir config");
+        assert_eq!(config.daemon.io_memory_ceiling, 12 * 1024 * 1024 * 1024);
+        assert_eq!(config.tape_io.read_reservoir_bytes, 4 * 1024 * 1024 * 1024);
+        assert_eq!(config.tape_io.read_reservoir_high_pct, 80);
+        assert_eq!(config.tape_io.read_reservoir_low_pct, 20);
+        assert_eq!(
+            config.tape_io.position_check_bytes_ranged,
+            128 * 1024 * 1024
+        );
+
+        let bad_watermarks = configured.replace(
+            "read_reservoir_high_pct = 80",
+            "read_reservoir_high_pct = 20",
+        );
+        assert!(parse_config_toml(&bad_watermarks)
+            .expect_err("equal watermarks rejected")
+            .to_string()
+            .contains("watermarks"));
+
+        let over_ceiling = configured.replace(
+            "read_reservoir_bytes = \"4GiB\"",
+            "read_reservoir_bytes = \"16GiB\"",
+        );
+        assert!(parse_config_toml(&over_ceiling)
+            .expect_err("reservoir above ceiling rejected")
+            .to_string()
+            .contains("io_memory_ceiling"));
     }
 
     #[test]

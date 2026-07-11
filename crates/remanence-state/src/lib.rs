@@ -31,7 +31,8 @@ pub use config::{
     watermark_floor_bytes, AuditConfig, CacheConfig, CleaningConfig, DaemonConfig, DaemonTlsConfig,
     DrivesConfig, IndexConfig, JournalConfig, LibraryConfig, LiveStatusConfig,
     PoolSelectionPolicyName, RemConfig, TapeIoConfig, TapePoolConfig, TapePoolRuleConfig,
-    DEFAULT_TAPE_BLOCK_SIZE_BYTES,
+    DEFAULT_IO_MEMORY_CEILING_BYTES, DEFAULT_RANGED_POSITION_CHECK_BYTES,
+    DEFAULT_READ_RESERVOIR_BYTES, DEFAULT_TAPE_BLOCK_SIZE_BYTES,
 };
 pub use error::StateError;
 pub use index::{

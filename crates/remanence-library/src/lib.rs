@@ -43,9 +43,9 @@ pub use error::{
 pub use handle::tape_io::{
     BlockSize, ComputedPosition, DevicePositionProof, DriveErrorCounters, MediaFamily,
     MediaReadiness, PipelinedReadDiagnostics, PipelinedWriteDiagnostics, PositionAfter,
-    ReadBatchOutcome, ReadBufferHandoff, ReadDelivery, ReadHandoffOutcome, ReadTerminalFlags,
-    SequencedHandoff, SpaceKind, SpaceResult, TapeConfig, TapeIoError, TapePosition,
-    WormMediaState, WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
+    ReadBatchOutcome, ReadBuffer, ReadBufferHandoff, ReadDelivery, ReadHandoffOutcome,
+    ReadTerminalFlags, SequencedHandoff, SpaceKind, SpaceResult, TapeConfig, TapeIoError,
+    TapePosition, WormMediaState, WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
     WriteUnpositionedOutcome,
 };
 pub use handle::{
