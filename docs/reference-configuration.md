@@ -54,10 +54,26 @@ string with a suffix: `B`, `KiB`/`K`/`KB`, `MiB`/`M`/`MB`, `GiB`/`G`/`GB`,
 | `state_dir` | absolute path | required | Root directory for mutable daemon state (lock file, default socket, default spool). |
 | `default_idle_timeout_seconds` | integer > 0 | required | Default idle timeout for write/read sessions. |
 | `spool_dir` | absolute path | `<state_dir>/spool` | Pre-commit append spool. Created with mode `0700` at startup. |
-| `spool_tmpfs_ram_budget` | byte size > 0 | unset | Required acknowledgement when the spool resolves to tmpfs/ramfs: caps spool RAM use. The effective budget is the smallest of 64 GiB, this value, and available RAM. |
+| `spool_tmpfs_ram_budget` | byte size > 0 | unset | Required acknowledgement when the spool resolves to tmpfs/ramfs: caps spool RAM use. The effective budget is the smallest of 64 GiB, this value, and available RAM. Must be ≤ `io_memory_ceiling` once that key lands (TIO-6 R2). |
+| `io_memory_ceiling` | byte size > 0 | — (**TIO-6 R2**, not yet landed) | Fixed total for ALL pipeline I/O memory: append-spool reservations plus every drive's read reservoir, granted through one atomic permit manager. See the deployment note below. |
 | `read_only` | bool | `false` | Reject state-changing operations; skips library discovery and the drive pool at startup. |
 | `socket_path` | absolute path | `<state_dir>/rem.sock` | Unix-domain gRPC socket. Parent directory created `0700`; socket chmod `0660`; connecting peers must be root or the daemon's own user. |
 | `listen` | `host:port` string | unset | TCP listen address for mTLS gRPC. Requires `[daemon.tls]`. |
+
+### I/O memory ceiling deployment note (TIO-6 R2)
+
+Specified by `design-tape-io-read-pipeline-v0.1.md` §4.6; lands with the
+TIO-6 R2 commit. The daemon unit must run under a cgroup memory limit
+(systemd `MemoryMax`) with `io_memory_ceiling` + daemon baseline headroom
+≤ `MemoryMax` (guidance: leave ≥ 2 GiB), and `LimitMEMLOCK` sized ≥ the
+ceiling (a safe upper bound: only read-reservoir slabs are actually
+mlocked). Residency scoping: **read-reservoir slabs are mlocked —
+never-swap holds for them**; the tmpfs spool is **ceiling-reserved but
+NOT guaranteed-resident** (tmpfs pages are file-backed and swappable
+under memory pressure — the reservation bounds its size, not its
+residency). `MemAvailable` and `RLIMIT_MEMLOCK` are consulted once at
+startup as loud sanity warnings only; the ceiling is the authority and
+the cgroup limit is the enforcement backstop.
 
 ### `[daemon.tls]`
 
@@ -85,6 +101,26 @@ client receive window. With tonic, apply `initial_stream_window_size(4 * 1024 *
 1024)` and `initial_connection_window_size(4 * 1024 * 1024)` to the client
 `Endpoint`. Client-side flag ownership is intentionally deferred; until that
 surface exists, client implementations must set these values directly.
+
+### HTTP/2 keepalive (dead-peer detection) — TIO-6 R2 transport defaults
+
+Specified by `design-tape-io-read-pipeline-v0.1.md` §4.5 (lands with the
+TIO-6 R2 transport commit, alongside the windows above). Like the windows,
+these are compiled transport defaults, not configuration keys:
+
+- **Server (tonic builder, both listeners — TCP/mTLS and Unix socket):**
+  `http2_keepalive_interval = 30 s`, `http2_keepalive_timeout = 20 s`.
+- **Client (tonic `Endpoint`):** `http2_keep_alive_interval = 30 s`,
+  `keep_alive_timeout = 20 s`, `keep_alive_while_idle(true)`.
+
+The PING must run while streams are idle or send-stalled — a parked read
+reservoir behind a stalled sender is exactly the guarded state — so a
+half-open peer (power loss, no FIN) tears down the connection, stream,
+receiver, and session within roughly interval + timeout (≤ ~50 s), and a
+drive parked for that session never moves. This bound is what makes the
+park-indefinitely-for-slow-but-alive-clients policy coherent; it is
+verified by the half-open-while-parked integration test required by the
+TIO-6 design (§10).
 
 <!-- code-anchor: crates/remanence-state/src/config.rs @ 7fb10f8 -->
 ## `[[libraries]]`
