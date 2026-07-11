@@ -2,12 +2,15 @@
 
 use std::fmt;
 
+use chacha20::{
+    cipher::{KeyIvInit, StreamCipher},
+    ChaCha20,
+};
 use hpke::{
     aead::ChaCha20Poly1305, kdf::HkdfSha256, kem::X25519HkdfSha256, setup_receiver, setup_sender,
     Deserializable, Kem as _, OpModeR, OpModeS, Serializable,
 };
-use rand_chacha::ChaCha20Rng;
-use rand_core::{CryptoRng, RngCore, SeedableRng};
+use rand_core::{CryptoRng, RngCore};
 use zeroize::Zeroize;
 
 use crate::error::{RaoAeadError, Result};
@@ -18,32 +21,49 @@ type Kem = X25519HkdfSha256;
 type Kdf = HkdfSha256;
 type Aead = ChaCha20Poly1305;
 
-/// OS-seeded CSPRNG that can satisfy arbitrary-length HPKE entropy draws.
+/// OS-seeded, zeroize-on-drop CSPRNG for arbitrary-length HPKE entropy draws.
 struct EphemeralRng {
-    inner: ChaCha20Rng,
+    inner: ChaCha20,
 }
 
 impl EphemeralRng {
     fn from_os() -> Result<Self> {
         let mut seed = [0u8; 32];
-        getrandom::fill(&mut seed).map_err(|_| RaoAeadError::EntropyUnavailable)?;
-        let inner = ChaCha20Rng::from_seed(seed);
+        if getrandom::fill(&mut seed).is_err() {
+            seed.zeroize();
+            return Err(RaoAeadError::EntropyUnavailable);
+        }
+        let inner = Self::from_seed(&seed);
         seed.zeroize();
-        Ok(Self { inner })
+        Ok(inner)
+    }
+
+    fn from_seed(seed: &[u8; 32]) -> Self {
+        // The zeroize-enabled ChaCha20 core and its buffered wrapper both wipe
+        // their state on drop. A random key with this fixed nonce defines an
+        // independent stream for each ephemeral generator.
+        Self {
+            inner: ChaCha20::new(seed.into(), &[0u8; 12].into()),
+        }
     }
 }
 
 impl RngCore for EphemeralRng {
     fn next_u32(&mut self) -> u32 {
-        self.inner.next_u32()
+        let mut bytes = [0u8; 4];
+        self.fill_bytes(&mut bytes);
+        u32::from_le_bytes(bytes)
     }
 
     fn next_u64(&mut self) -> u64 {
-        self.inner.next_u64()
+        let mut bytes = [0u8; 8];
+        self.fill_bytes(&mut bytes);
+        u64::from_le_bytes(bytes)
     }
 
     fn fill_bytes(&mut self, destination: &mut [u8]) {
-        self.inner.fill_bytes(destination);
+        destination.fill(0);
+        self.inner.apply_keystream(destination);
     }
 }
 
@@ -407,9 +427,10 @@ mod tests {
 
     #[test]
     fn ephemeral_rng_serves_draws_larger_than_its_os_seed() {
-        let mut rng = EphemeralRng {
-            inner: ChaCha20Rng::from_seed([0x5a; 32]),
-        };
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>(_value: &T) {}
+
+        let mut rng = EphemeralRng::from_os().expect("OS entropy should seed ephemeral RNG");
+        assert_zeroize_on_drop(&rng.inner);
         let mut output = [0u8; 96];
         rng.fill_bytes(&mut output);
         assert!(output.iter().any(|byte| *byte != 0));

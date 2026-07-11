@@ -37,7 +37,8 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     out: PathBuf,
 
-    /// Directory for temporary plaintext; defaults adjacent to --out.
+    /// Directory for temporary plaintext; defaults inside an existing --out,
+    /// otherwise adjacent to --out.
     #[arg(long, value_name = "DIR")]
     staging_dir: Option<PathBuf>,
 
@@ -96,12 +97,7 @@ fn recover(args: &Args) -> Result<RecoverySummary, String> {
     let staging_dir = args
         .staging_dir
         .as_deref()
-        .or_else(|| {
-            args.out
-                .parent()
-                .filter(|path| !path.as_os_str().is_empty())
-        })
-        .unwrap_or_else(|| Path::new("."));
+        .unwrap_or_else(|| default_staging_dir(&args.out));
     let mut staged = SecurePlaintextStage::new_in(staging_dir)?;
     let opened = match header.format_version {
         1 => open_v1(args, &mut encrypted, staged.as_file_mut())?,
@@ -162,6 +158,17 @@ fn recover(args: &Args) -> Result<RecoverySummary, String> {
         format_version: header.format_version,
         object_id: header.object_id,
     })
+}
+
+/// Chooses the target filesystem for authenticated plaintext staging.
+fn default_staging_dir(out: &Path) -> &Path {
+    if out.is_dir() {
+        out
+    } else {
+        out.parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+    }
 }
 
 fn open_v1<R: Read, W: std::io::Write>(
@@ -345,8 +352,7 @@ mod tests {
         let object = temp.path().join("object.rao");
         let private_key = temp.path().join("safe.raop");
         let out = temp.path().join("out");
-        let staging = temp.path().join("large-volume-staging");
-        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&out).unwrap();
         fs::write(&object, sealed).unwrap();
         fs::write(&private_key, safe.serialize()).unwrap();
         let summary = recover(&Args {
@@ -354,13 +360,13 @@ mod tests {
             private_key: Some(private_key),
             registry_key: None,
             out: out.clone(),
-            staging_dir: Some(staging.clone()),
+            staging_dir: None,
             overwrite: false,
         })
         .unwrap();
         assert_eq!(summary.format_version, 2);
         assert_eq!(fs::read(out.join("member.txt")).unwrap(), payload);
-        assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&out).unwrap().count(), 1);
 
         let registry = RootKey::new([0x55; 32]).unwrap();
         let (v1, _) = seal_to_vec(
@@ -419,5 +425,27 @@ mod tests {
 
         assert!(read_root_key(&short).unwrap_err().contains("got 31"));
         assert!(read_root_key(&long).unwrap_err().contains("got 33"));
+    }
+
+    #[test]
+    fn default_staging_stays_on_existing_output_filesystem() {
+        let temp = tempfile::tempdir().unwrap();
+        let existing_out = temp.path().join("mounted-output");
+        fs::create_dir(&existing_out).unwrap();
+
+        assert_eq!(default_staging_dir(&existing_out), existing_out);
+        let stage = SecurePlaintextStage::new_in(default_staging_dir(&existing_out)).unwrap();
+        assert_eq!(stage.path().parent().unwrap(), existing_out);
+    }
+
+    #[test]
+    fn default_staging_uses_parent_for_uncreated_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let uncreated_out = temp.path().join("future-output");
+
+        assert!(!uncreated_out.exists());
+        assert_eq!(default_staging_dir(&uncreated_out), temp.path());
+        let stage = SecurePlaintextStage::new_in(default_staging_dir(&uncreated_out)).unwrap();
+        assert_eq!(stage.path().parent().unwrap(), temp.path());
     }
 }

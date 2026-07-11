@@ -34,12 +34,12 @@ readme = "README.md"
 base64             = "0.22"
 bytes               = "1"
 chacha20poly1305   = "0.10"
+chacha20           = { version = "0.9", features = ["zeroize"] }
 ciborium            = "0.2"
 clap                = { version = "4",   features = ["derive"] }
 hkdf                = "0.12"
 hpke                = { version = "=0.13.0", default-features = false, features = ["std", "x25519"] }
 getrandom           = "=0.3.3"
-rand_chacha         = "=0.9.0"
 rand_core           = "=0.9.3"
 hmac                = "0.12"
 hyper-util          = "0.1"
