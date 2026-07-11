@@ -33,7 +33,7 @@ body blocks; the parity layer owns the physical tape layout around them
 
 ![Workspace crate map: layer 5 cli, api, daemon over layer 4 state over layer 3 format, aead, parity, format-driver over layer 2 library over layer 1 scsi, with the format-free platform seam between layers 3 and 2](assets/layer-map.svg)
 
-*Fig. 1 — The workspace as a strict stack: each layer depends only on the one below it, and the format-defining crates (amber) sit directly above the format-free platform seam.*
+*Fig. 1 — The workspace as a strict stack: each layer depends only on the one below it, and the format-defining crates sit directly above the format-free platform seam.*
 
 <!-- code-anchor: crates/remanence-scsi/src/lib.rs crates/remanence-library/src/lib.rs @ 7fb10f8 -->
 ## Layers 1 and 2: the tape platform
