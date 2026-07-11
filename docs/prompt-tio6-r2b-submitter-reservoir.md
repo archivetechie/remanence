@@ -76,3 +76,12 @@ restore scenario's `covers` with `rem.tape.read_pipeline`; full `~/system` suite
 socket tests run (sandbox limits reported, never `#[ignore]`d). Summary lists files touched, each
 §10 row → test name, confirms one-in-flight + plan-bounded + park-re-proof + no-OOM/swap. Physical
 acceptance = §10 legs 0–6 at the next MSL3040 window (target 300 MB/s at leg 1).
+
+## R2a diff-gate follow-ups (fold into R2b — minor)
+- **Ord-order guard (§5.6):** the terminal precedence relies on `enum ReadTerminalPriority`
+  declaration order + derived `Ord`. Add a one-line comment (`// declaration order defines
+  rank — ScsiRoot first`) AND a direct unit assert `assert!(ScsiRoot < Decode && Decode <
+  Sender)` so a future variant reorder can't silently invert precedence with green types.
+- **compile_fail explicitness (§3.3):** the `HandoffBlockSource` compile_fail doctest may also
+  `use remanence_library::BlockSource;` and still fail — make the "decode source cannot reach a
+  drive method" guarantee maximally explicit.
