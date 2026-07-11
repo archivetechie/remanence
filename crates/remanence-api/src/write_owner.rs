@@ -149,7 +149,7 @@ pub(crate) enum DriveCommand {
         object_id: String,
         file_id: Vec<u8>,
         stream_chunk_bytes: u32,
-        chunk_tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
+        chunk_tx: crate::read_core::ReadStreamSender,
     },
     ReadObjectRange {
         session_id: Uuid,
@@ -158,7 +158,7 @@ pub(crate) enum DriveCommand {
         start_byte: u64,
         end_byte: u64,
         stream_chunk_bytes: u32,
-        chunk_tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
+        chunk_tx: crate::read_core::ReadStreamSender,
     },
     CloseRead {
         session_id: Uuid,
@@ -4043,6 +4043,7 @@ fn log_restore_read_diagnostics(
         drive_rate_mib_s = crate::diagnostics::mib_per_s(phases.bytes, phases.transfer),
         relay_rate_mib_s = crate::diagnostics::mib_per_s(phases.bytes, relay),
         client_write_ms = crate::diagnostics::duration_ms(relay_diagnostics.client_write),
+        sender_stall_ms = crate::diagnostics::duration_ms(relay_diagnostics.sender_stall),
         client_write_bytes = relay_diagnostics.bytes,
         client_write_rate_mib_s = crate::diagnostics::mib_per_s(
             relay_diagnostics.bytes,
@@ -4077,7 +4078,7 @@ fn stream_one_object(
     tape_uuid: &[u8; 16],
     object_id: &str,
     stream_chunk_bytes: u32,
-    chunk_tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
+    chunk_tx: crate::read_core::ReadStreamSender,
 ) -> Result<(), Status> {
     let object = index
         .get_native_object(object_id)
@@ -4180,7 +4181,7 @@ fn stream_one_file_range(
     start_byte: u64,
     end_byte: u64,
     stream_chunk_bytes: u32,
-    chunk_tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
+    chunk_tx: crate::read_core::ReadStreamSender,
 ) -> Result<(), Status> {
     let request =
         file_range_read_request(index, tape_uuid, object_id, file_id, start_byte, end_byte)?;
@@ -4308,7 +4309,7 @@ fn stream_file_range_from_source(
     source: &mut dyn BlockSource,
     request: crate::read_core::PlaintextFileRangeReadRequest,
     stream_chunk_bytes: u32,
-    chunk_tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
+    chunk_tx: crate::read_core::ReadStreamSender,
 ) -> Result<StagedReadRelayDiagnostics, Status> {
     // Ranged reads are opaque stored-payload reads. The daemon does not decrypt
     // or hold key material; clients interpret or decrypt the returned bytes.
@@ -4321,11 +4322,12 @@ fn stream_file_range_from_source(
 #[derive(Clone, Copy, Debug, Default)]
 struct StagedReadRelayDiagnostics {
     client_write: StdDuration,
+    sender_stall: StdDuration,
     bytes: u64,
 }
 
 fn stream_with_staged_read_sender_diagnostics(
-    chunk_tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
+    chunk_tx: crate::read_core::ReadStreamSender,
     stream_chunk_bytes: u32,
     produce: impl FnOnce(&mut dyn std::io::Write) -> Result<(), Status>,
 ) -> Result<StagedReadRelayDiagnostics, Status> {
@@ -4430,7 +4432,7 @@ impl std::io::Write for StagedReadWriter {
 
 fn drain_staged_read_sender(
     rx: std_mpsc::Receiver<StagedReadItem>,
-    chunk_tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
+    chunk_tx: crate::read_core::ReadStreamSender,
     stream_chunk_bytes: u32,
     poison: Arc<Mutex<Option<String>>>,
 ) -> Result<StagedReadRelayDiagnostics, Status> {
@@ -4453,6 +4455,7 @@ fn drain_staged_read_sender(
                     let result = writer
                         .write_all(&bytes)
                         .map_err(|err| Status::internal(format!("send read stream: {err}")));
+                    diagnostics.sender_stall = writer.sender_stall();
                     if result.is_ok() {
                         diagnostics.bytes = diagnostics.bytes.saturating_add(bytes_len);
                     }
@@ -4461,9 +4464,13 @@ fn drain_staged_read_sender(
                 None => Err(Status::internal("staged read data after finish")),
             },
             StagedReadItem::Finish => match writer.take() {
-                Some(writer) => writer
-                    .finish()
-                    .map_err(|err| Status::internal(format!("finish read stream: {err}"))),
+                Some(mut writer) => {
+                    let result = writer
+                        .finish()
+                        .map_err(|err| Status::internal(format!("finish read stream: {err}")));
+                    diagnostics.sender_stall = writer.sender_stall();
+                    result
+                }
                 None => Ok(()),
             },
         };
@@ -4651,6 +4658,7 @@ mod tests {
         NativeObjectFileProjectionInput, NativeObjectProjectionInput, ProvisionTapeInput,
         TapeJournalIndexInput, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
     };
+    use tokio_stream::StreamExt;
 
     const RANGE_OBJECT_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     const RANGE_TAPE_UUID: [u8; 16] = [0xAB; 16];
@@ -5327,11 +5335,11 @@ mod tests {
     }
 
     async fn collect_stream_chunks(
-        mut rx: mpsc::Receiver<Result<pb::BytesChunk, Status>>,
+        mut rx: crate::read_core::ReadStreamReceiver,
     ) -> Result<Vec<u8>, Status> {
         let mut bytes = Vec::new();
         let mut saw_last = false;
-        while let Some(item) = rx.recv().await {
+        while let Some(item) = rx.next().await {
             let chunk = item?;
             bytes.extend_from_slice(&chunk.data);
             saw_last |= chunk.is_last;
@@ -5345,7 +5353,7 @@ mod tests {
 
     #[tokio::test]
     async fn l3_read_actor_batches_are_consumed_by_staged_sender() {
-        let (tx, rx) = mpsc::channel(4);
+        let (tx, rx) = crate::read_core::read_stream_channel(4);
 
         let diagnostics = stream_with_staged_read_sender_diagnostics(tx, 4, |writer| {
             std::io::Write::write_all(writer, b"abcdef")
@@ -5364,8 +5372,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn staged_sender_surfaces_full_channel_stall_time() {
+        let requested_chunk =
+            u32::try_from(crate::read_core::READ_STREAM_CHANNEL_BYTE_BUDGET + 1).unwrap();
+        let (tx, rx) = crate::read_core::read_stream_channel(requested_chunk as usize);
+        let sender = tokio::task::spawn_blocking(move || {
+            stream_with_staged_read_sender_diagnostics(tx, requested_chunk, |writer| {
+                std::io::Write::write_all(writer, b"a")
+                    .map_err(|err| Status::internal(format!("write first byte: {err}")))?;
+                std::io::Write::write_all(writer, b"b")
+                    .map_err(|err| Status::internal(format!("write second byte: {err}")))?;
+                Ok(())
+            })
+        });
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+        let bytes = collect_stream_chunks(rx)
+            .await
+            .expect("drain staged stream");
+        let diagnostics = sender
+            .await
+            .expect("sender task joins")
+            .expect("staged sender succeeds");
+
+        assert_eq!(bytes, b"ab");
+        assert!(
+            diagnostics.sender_stall >= StdDuration::from_millis(5),
+            "full-channel wait must surface in restore diagnostics: {:?}",
+            diagnostics.sender_stall
+        );
+    }
+
+    #[tokio::test]
     async fn l3_read_sink_error_drains_without_hanging_actor_writer() {
-        let (tx, rx) = mpsc::channel(1);
+        let (tx, rx) = crate::read_core::read_stream_channel(1);
         drop(rx);
 
         let err = stream_with_staged_read_sender_diagnostics(tx, 1, |writer| {
@@ -5400,7 +5439,7 @@ mod tests {
             end_byte,
         )?;
         let mut source = VecBlockSource::new(fixture.blocks.clone());
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = crate::read_core::read_stream_channel(256);
         stream_file_range_from_source(&mut source, request, 0, tx)?;
         collect_stream_chunks(rx).await
     }
@@ -6380,7 +6419,7 @@ mod tests {
         )
         .expect("request builder allows planner to catch arithmetic overflow");
         let mut source = VecBlockSource::new(fixture.blocks.clone());
-        let (tx, _rx) = mpsc::channel(8);
+        let (tx, _rx) = crate::read_core::read_stream_channel(8);
         let overflow = stream_file_range_from_source(&mut source, overflow_request, 0, tx)
             .expect_err("overflow must fail");
         assert_eq!(overflow.code(), tonic::Code::InvalidArgument);

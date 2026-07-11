@@ -571,7 +571,7 @@ pub(crate) async fn read_file(
     object_id: String,
     file_id: Vec<u8>,
     stream_chunk_bytes: u32,
-    chunk_tx: tokio::sync::mpsc::Sender<Result<pb::BytesChunk, Status>>,
+    chunk_tx: crate::read_core::ReadStreamSender,
 ) -> Result<(), Status> {
     let pool = state.drive_pool()?.clone();
     let mounted = pool.session(session_id)?;
@@ -600,7 +600,7 @@ pub(crate) struct ReadObjectRangeDispatch {
 pub(crate) async fn read_object_range(
     state: &ApiState,
     request: ReadObjectRangeDispatch,
-    chunk_tx: tokio::sync::mpsc::Sender<Result<pb::BytesChunk, Status>>,
+    chunk_tx: crate::read_core::ReadStreamSender,
 ) -> Result<(), Status> {
     let pool = state.drive_pool()?.clone();
     let mounted = pool.session(request.session_id)?;

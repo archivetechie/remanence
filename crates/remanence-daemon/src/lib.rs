@@ -21,6 +21,29 @@ use tonic::transport::Server;
 mod tls;
 pub use tls::{load_server_tls, TlsConfigError, TlsListener};
 
+const H2_INITIAL_STREAM_WINDOW_BYTES: u32 = 4 * 1024 * 1024;
+const H2_INITIAL_CONNECTION_WINDOW_BYTES: u32 = 4 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct H2FlowControlConfig {
+    initial_stream_window_bytes: u32,
+    initial_connection_window_bytes: u32,
+}
+
+fn h2_flow_control_config() -> H2FlowControlConfig {
+    H2FlowControlConfig {
+        initial_stream_window_bytes: H2_INITIAL_STREAM_WINDOW_BYTES,
+        initial_connection_window_bytes: H2_INITIAL_CONNECTION_WINDOW_BYTES,
+    }
+}
+
+fn server_builder() -> Server {
+    let config = h2_flow_control_config();
+    Server::builder()
+        .initial_stream_window_size(config.initial_stream_window_bytes)
+        .initial_connection_window_size(config.initial_connection_window_bytes)
+}
+
 /// Serve Layer 5 over the local Unix socket and optional TCP/mTLS listener.
 ///
 /// A stale socket from a prior unclean exit is removed before bind; the socket
@@ -51,7 +74,7 @@ pub async fn serve(
     let tcp_task_input = if let Some((tcp, tls)) = tcp_listener {
         let tcp_state = state.clone();
         let tcp_shutdown = shutdown_future(shutdown_rx.clone());
-        let mut tcp_builder = match Server::builder().tls_config(tls) {
+        let mut tcp_builder = match server_builder().tls_config(tls) {
             Ok(builder) => builder,
             Err(err) => {
                 let _ = std::fs::remove_file(socket_path);
@@ -96,7 +119,7 @@ pub async fn serve(
             Ok(_) => None,
             Err(err) => Some(Err(err)),
         });
-        Server::builder()
+        server_builder()
             .add_service(pb::daemon_server::DaemonServer::new(
                 unix_state.daemon_service(),
             ))
@@ -283,5 +306,13 @@ mod tests {
         assert!(unix_peer_uid_allowed(0, 1000));
         assert!(unix_peer_uid_allowed(1000, 1000));
         assert!(!unix_peer_uid_allowed(1001, 1000));
+    }
+
+    #[test]
+    fn daemon_server_builder_uses_four_mib_h2_windows() {
+        let config = h2_flow_control_config();
+        assert_eq!(config.initial_stream_window_bytes, 4 * 1024 * 1024);
+        assert_eq!(config.initial_connection_window_bytes, 4 * 1024 * 1024);
+        let _builder = server_builder();
     }
 }

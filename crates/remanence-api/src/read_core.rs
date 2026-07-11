@@ -7,7 +7,8 @@
 //! materializing the object in memory.
 
 use std::io::Write;
-use std::thread;
+use std::pin::Pin;
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use remanence_format::{
@@ -18,12 +19,233 @@ use remanence_format::{
 use remanence_library::{BlockSource, SpaceKind, SpaceResult, TapeIoError, TapePosition};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
+use tokio_stream::Stream;
 use tonic::Status;
 
 use crate::pb;
 
 const DEFAULT_READ_SEND_TIMEOUT: Duration = Duration::from_secs(30);
-const READ_SEND_RETRY_DELAY: Duration = Duration::from_millis(10);
+pub(crate) const DEFAULT_READ_STREAM_CHUNK_BYTES: usize = 256 * 1024;
+pub(crate) const READ_STREAM_CHANNEL_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+const READ_STREAM_CHANNEL_MAX_MESSAGES: usize = 1024;
+
+type ReadStreamItem = Result<pb::BytesChunk, Status>;
+
+/// Return the effective protobuf chunk size for a client request.
+pub(crate) fn effective_read_stream_chunk_bytes(requested: usize) -> usize {
+    if requested == 0 {
+        DEFAULT_READ_STREAM_CHUNK_BYTES
+    } else {
+        requested
+    }
+}
+
+/// Size the delivery queue from a byte budget rather than a message count.
+pub(crate) fn read_stream_channel_capacity(chunk_bytes: usize) -> usize {
+    READ_STREAM_CHANNEL_BYTE_BUDGET
+        .checked_div(effective_read_stream_chunk_bytes(chunk_bytes))
+        .unwrap_or(0)
+        .clamp(1, READ_STREAM_CHANNEL_MAX_MESSAGES)
+}
+
+#[derive(Clone)]
+pub(crate) struct ReadStreamSender {
+    inner: Arc<ReadStreamSenderInner>,
+}
+
+struct ReadStreamSenderInner {
+    tx: mpsc::Sender<ReadStreamItem>,
+    watchdog: SendWatchdog,
+}
+
+impl Drop for ReadStreamSenderInner {
+    fn drop(&mut self) {
+        self.watchdog.shutdown();
+    }
+}
+
+impl ReadStreamSender {
+    #[cfg(test)]
+    pub(crate) async fn send(
+        &self,
+        item: ReadStreamItem,
+    ) -> Result<(), mpsc::error::SendError<ReadStreamItem>> {
+        self.inner.tx.send(item).await
+    }
+
+    pub(crate) fn blocking_send(
+        &self,
+        item: ReadStreamItem,
+    ) -> Result<(), mpsc::error::SendError<ReadStreamItem>> {
+        self.inner.tx.blocking_send(item)
+    }
+
+    fn send_with_timeout(
+        &self,
+        item: ReadStreamItem,
+        timeout: Duration,
+    ) -> Result<Duration, BlockingReadStreamSendError> {
+        let was_full = self.inner.tx.capacity() == 0;
+        let started = Instant::now();
+        let generation = self.inner.watchdog.arm(timeout);
+        let result = self.inner.tx.blocking_send(item);
+        let timed_out = self.inner.watchdog.disarm(generation);
+        let stalled = if was_full {
+            started.elapsed()
+        } else {
+            Duration::ZERO
+        };
+        match result {
+            _ if timed_out => Err(BlockingReadStreamSendError::TimedOut(started.elapsed())),
+            Ok(()) => Ok(stalled),
+            Err(_) => Err(BlockingReadStreamSendError::Closed),
+        }
+    }
+}
+
+pub(crate) struct ReadStreamReceiver {
+    rx: Arc<Mutex<mpsc::Receiver<ReadStreamItem>>>,
+}
+
+impl Stream for ReadStreamReceiver {
+    type Item = ReadStreamItem;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.rx
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .poll_recv(cx)
+    }
+}
+
+pub(crate) fn read_stream_channel(chunk_bytes: usize) -> (ReadStreamSender, ReadStreamReceiver) {
+    read_stream_channel_with_capacity(read_stream_channel_capacity(chunk_bytes))
+}
+
+fn read_stream_channel_with_capacity(capacity: usize) -> (ReadStreamSender, ReadStreamReceiver) {
+    let (tx, rx) = mpsc::channel(capacity);
+    let rx = Arc::new(Mutex::new(rx));
+    let watchdog = SendWatchdog::new(Arc::downgrade(&rx));
+    (
+        ReadStreamSender {
+            inner: Arc::new(ReadStreamSenderInner { tx, watchdog }),
+        },
+        ReadStreamReceiver { rx },
+    )
+}
+
+#[derive(Debug)]
+enum BlockingReadStreamSendError {
+    Closed,
+    TimedOut(Duration),
+}
+
+#[derive(Default)]
+struct SendWatchdogState {
+    next_generation: u64,
+    armed: Option<(u64, Instant)>,
+    timed_out: Option<u64>,
+    shutdown: bool,
+}
+
+struct SendWatchdog {
+    state: Arc<(Mutex<SendWatchdogState>, Condvar)>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl SendWatchdog {
+    fn new(receiver: Weak<Mutex<mpsc::Receiver<ReadStreamItem>>>) -> Self {
+        let state = Arc::new((Mutex::new(SendWatchdogState::default()), Condvar::new()));
+        let thread_state = Arc::clone(&state);
+        let thread = std::thread::Builder::new()
+            .name("read-stream-send-watchdog".to_string())
+            .spawn(move || run_send_watchdog(thread_state, receiver))
+            .expect("spawn read stream send watchdog");
+        Self {
+            state,
+            thread: Mutex::new(Some(thread)),
+        }
+    }
+
+    fn arm(&self, timeout: Duration) -> u64 {
+        let (lock, wake) = &*self.state;
+        let mut state = lock.lock().unwrap_or_else(|err| err.into_inner());
+        state.next_generation = state.next_generation.wrapping_add(1);
+        let generation = state.next_generation;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
+        state.armed = Some((generation, deadline));
+        state.timed_out = None;
+        wake.notify_one();
+        generation
+    }
+
+    fn disarm(&self, generation: u64) -> bool {
+        let (lock, wake) = &*self.state;
+        let mut state = lock.lock().unwrap_or_else(|err| err.into_inner());
+        if matches!(state.armed, Some((armed, _)) if armed == generation) {
+            state.armed = None;
+        }
+        let timed_out = state.timed_out == Some(generation);
+        wake.notify_one();
+        timed_out
+    }
+
+    fn shutdown(&self) {
+        let (lock, wake) = &*self.state;
+        lock.lock().unwrap_or_else(|err| err.into_inner()).shutdown = true;
+        wake.notify_one();
+        if let Some(thread) = self
+            .thread
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take()
+        {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn run_send_watchdog(
+    state: Arc<(Mutex<SendWatchdogState>, Condvar)>,
+    receiver: Weak<Mutex<mpsc::Receiver<ReadStreamItem>>>,
+) {
+    let (lock, wake) = &*state;
+    let mut guard = lock.lock().unwrap_or_else(|err| err.into_inner());
+    loop {
+        if guard.shutdown {
+            return;
+        }
+        let Some((generation, deadline)) = guard.armed else {
+            guard = wake.wait(guard).unwrap_or_else(|err| err.into_inner());
+            continue;
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            let (next_guard, _) = wake
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(|err| err.into_inner());
+            guard = next_guard;
+            continue;
+        }
+        if matches!(guard.armed, Some((armed, _)) if armed == generation) {
+            guard.armed = None;
+            guard.timed_out = Some(generation);
+            drop(guard);
+            if let Some(receiver) = receiver.upgrade() {
+                receiver
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .close();
+            }
+            guard = lock.lock().unwrap_or_else(|err| err.into_inner());
+        }
+    }
+}
 
 /// Position to `tape_file_number` and stream the object's payload blocks into `sink`.
 ///
@@ -411,34 +633,29 @@ impl<W: Write> RemTarEntrySink for CapturePayloadSink<W> {
 
 /// Synchronous writer that frames payload bytes into `ReadSessionService` chunks.
 pub(crate) struct ChannelWriter {
-    tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
+    tx: ReadStreamSender,
     max_chunk_bytes: usize,
     send_timeout: Duration,
+    sender_stall: Duration,
 }
 
 impl ChannelWriter {
-    pub(crate) fn new(tx: mpsc::Sender<Result<pb::BytesChunk, Status>>) -> Self {
+    pub(crate) fn new(tx: ReadStreamSender) -> Self {
         Self::with_chunk_size(tx, 0)
     }
 
-    pub(crate) fn with_chunk_size(
-        tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
-        chunk_bytes: usize,
-    ) -> Self {
+    pub(crate) fn with_chunk_size(tx: ReadStreamSender, chunk_bytes: usize) -> Self {
         Self {
             tx,
-            max_chunk_bytes: if chunk_bytes == 0 {
-                64 * 1024
-            } else {
-                chunk_bytes
-            },
+            max_chunk_bytes: effective_read_stream_chunk_bytes(chunk_bytes),
             send_timeout: DEFAULT_READ_SEND_TIMEOUT,
+            sender_stall: Duration::ZERO,
         }
     }
 
     #[cfg(test)]
     fn with_chunk_size_and_timeout(
-        tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
+        tx: ReadStreamSender,
         chunk_bytes: usize,
         send_timeout: Duration,
     ) -> Self {
@@ -448,38 +665,33 @@ impl ChannelWriter {
     }
 
     /// Send the terminal `is_last=true` frame.
-    pub(crate) fn finish(self) -> std::io::Result<()> {
+    pub(crate) fn finish(&mut self) -> std::io::Result<()> {
         self.send_chunk(pb::BytesChunk {
             data: Vec::new(),
             is_last: true,
         })
     }
 
-    fn send_chunk(&self, chunk: pb::BytesChunk) -> std::io::Result<()> {
-        let mut item = Ok(chunk);
-        let deadline = Instant::now()
-            .checked_add(self.send_timeout)
-            .unwrap_or_else(Instant::now);
-        loop {
-            match self.tx.try_send(item) {
-                Ok(()) => return Ok(()),
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "read stream closed",
-                    ));
-                }
-                Err(mpsc::error::TrySendError::Full(returned)) => {
-                    item = returned;
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "read stream receiver stalled",
-                        ));
-                    }
-                    thread::sleep(remaining.min(READ_SEND_RETRY_DELAY));
-                }
+    pub(crate) fn sender_stall(&self) -> Duration {
+        self.sender_stall
+    }
+
+    fn send_chunk(&mut self, chunk: pb::BytesChunk) -> std::io::Result<()> {
+        match self.tx.send_with_timeout(Ok(chunk), self.send_timeout) {
+            Ok(stalled) => {
+                self.sender_stall = self.sender_stall.saturating_add(stalled);
+                Ok(())
+            }
+            Err(BlockingReadStreamSendError::Closed) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "read stream closed",
+            )),
+            Err(BlockingReadStreamSendError::TimedOut(stalled)) => {
+                self.sender_stall = self.sender_stall.saturating_add(stalled);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "read stream receiver stalled",
+                ))
             }
         }
     }
@@ -516,6 +728,7 @@ mod tests {
     };
     use remanence_library::{VecBlockSink, VecBlockSource, VecBlockSourceCall};
     use sha2::{Digest, Sha256};
+    use tokio_stream::StreamExt;
 
     use super::*;
 
@@ -589,7 +802,7 @@ mod tests {
 
     #[tokio::test]
     async fn channel_writer_frames_and_streams() {
-        let (tx, mut rx) = mpsc::channel::<Result<pb::BytesChunk, Status>>(8);
+        let (tx, mut rx) = read_stream_channel_with_capacity(8);
         let handle = tokio::task::spawn_blocking(move || {
             use std::io::Write as _;
             let mut writer = ChannelWriter::new(tx);
@@ -599,7 +812,7 @@ mod tests {
 
         let mut got = Vec::new();
         let mut saw_last = false;
-        while let Some(item) = rx.recv().await {
+        while let Some(item) = rx.next().await {
             let chunk = item.unwrap();
             got.extend_from_slice(&chunk.data);
             saw_last |= chunk.is_last;
@@ -611,7 +824,7 @@ mod tests {
 
     #[tokio::test]
     async fn channel_writer_honors_requested_chunk_size() {
-        let (tx, mut rx) = mpsc::channel::<Result<pb::BytesChunk, Status>>(8);
+        let (tx, mut rx) = read_stream_channel_with_capacity(8);
         let handle = tokio::task::spawn_blocking(move || {
             use std::io::Write as _;
             let mut writer = ChannelWriter::with_chunk_size(tx, 3);
@@ -620,7 +833,7 @@ mod tests {
         });
 
         let mut chunk_lengths = Vec::new();
-        while let Some(item) = rx.recv().await {
+        while let Some(item) = rx.next().await {
             let chunk = item.unwrap();
             if !chunk.is_last {
                 chunk_lengths.push(chunk.data.len());
@@ -634,8 +847,8 @@ mod tests {
     fn channel_writer_times_out_when_receiver_stalls() {
         use std::io::Write as _;
 
-        let (tx, _rx) = mpsc::channel::<Result<pb::BytesChunk, Status>>(1);
-        tx.try_send(Ok(pb::BytesChunk {
+        let (tx, _rx) = read_stream_channel_with_capacity(1);
+        tx.blocking_send(Ok(pb::BytesChunk {
             data: b"held".to_vec(),
             is_last: false,
         }))
@@ -648,6 +861,94 @@ mod tests {
             .expect_err("stalled receiver times out");
 
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            writer.sender_stall() >= Duration::from_millis(1),
+            "timed-out full-channel wait must be observable"
+        );
+    }
+
+    #[test]
+    fn channel_writer_reports_broken_pipe_for_closed_receiver() {
+        use std::io::Write as _;
+
+        let (tx, rx) = read_stream_channel_with_capacity(1);
+        drop(rx);
+        let mut writer = ChannelWriter::with_chunk_size(tx, 3);
+        let err = writer
+            .write_all(b"abc")
+            .expect_err("closed receiver must fail the write");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn default_chunk_and_channel_capacity_follow_byte_budget() {
+        assert_eq!(
+            effective_read_stream_chunk_bytes(0),
+            DEFAULT_READ_STREAM_CHUNK_BYTES
+        );
+        assert_eq!(DEFAULT_READ_STREAM_CHUNK_BYTES, 256 * 1024);
+        for chunk_bytes in [64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024] {
+            let capacity = read_stream_channel_capacity(chunk_bytes);
+            assert!(capacity >= 1);
+            assert!(
+                capacity * chunk_bytes <= READ_STREAM_CHANNEL_BYTE_BUDGET,
+                "chunk={chunk_bytes} capacity={capacity} must honor byte budget"
+            );
+        }
+        assert_eq!(
+            read_stream_channel_capacity(READ_STREAM_CHANNEL_BYTE_BUDGET + 1),
+            1,
+            "an oversized requested chunk still gets exactly one queue slot"
+        );
+        assert_eq!(
+            read_stream_channel_capacity(1),
+            READ_STREAM_CHANNEL_MAX_MESSAGES,
+            "tiny chunks must not turn the byte budget into millions of queue slots"
+        );
+    }
+
+    #[test]
+    fn blocking_send_tracks_slow_drain_without_ten_millisecond_quantization() {
+        use std::io::Write as _;
+
+        const CHUNKS: usize = 40;
+        let (tx, mut rx) = read_stream_channel_with_capacity(1);
+        let drain = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build slow-drain runtime");
+            runtime.block_on(async move {
+                for _ in 0..CHUNKS {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    rx.next().await.expect("writer keeps channel open").unwrap();
+                }
+            });
+        });
+        let mut writer = ChannelWriter::with_chunk_size(tx, 1);
+        let started = Instant::now();
+        writer
+            .write_all(&[0xA5; CHUNKS])
+            .expect("slow drain remains live");
+        let elapsed = started.elapsed();
+        drain.join().expect("slow-drain thread joins");
+
+        assert!(writer.sender_stall() >= Duration::from_millis(20));
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "{CHUNKS} chunks took {elapsed:?}; a 10 ms retry quantum would take about 400 ms"
+        );
+    }
+
+    #[test]
+    fn sender_stall_is_zero_when_channel_never_fills() {
+        use std::io::Write as _;
+
+        let (tx, _rx) = read_stream_channel_with_capacity(8);
+        let mut writer = ChannelWriter::with_chunk_size(tx, 1);
+        writer.write_all(b"fast").expect("queue has spare capacity");
+        assert_eq!(writer.sender_stall(), Duration::ZERO);
     }
 
     #[test]
