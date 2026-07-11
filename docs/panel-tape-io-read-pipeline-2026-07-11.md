@@ -62,3 +62,128 @@ Concurrency #5 is the key R1 diff-gate item: verify deadline-preserving mechanis
 - Q3 client-flag ownership: still business (who owns client-side gRPC flags).
 - Q6 4KiB: it's a tape geometry not small-object; in-R2-iff-microbench-binds.
 - R2-vs-R1 (new, from throughput-MAJOR-1): the big one — gate R2 on measurement. Business-ish (spend decision).
+
+---
+
+## VERIFY ROUND (codex gpt-5.6-sol, 2026-07-11 09:10) — FAIL (8 majors + 2 minors)
+
+codex
+FAIL — the design does not meet the freeze bar. No blocker remains, but I found six majors, including two panel majors that are not actually resolved.
+
+## Findings
+
+1. **major × §5.5 / §3.2 × ranged-read proof cannot reach the decoder**
+
+   The delivery type remains `Result<ReadBufferHandoff, TapeIoError>`, but `ReadBufferHandoff` carries only bytes, record count, and terminal flags; it discards `ReadBatchOutcome::position_evidence`. Therefore the decoder cannot know which handoff completed a device-proven tripwire and cannot advance the release frontier described in §5.5. See [design §3.2](/home/user/remanence/docs/design-tape-io-read-pipeline-v0.1.md:260) and [ReadBufferHandoff](/home/user/remanence/crates/remanence-library/src/handle/tape_io/model.rs:511).
+
+   The document also omits where the withheld ≤256 MiB is stored and charged. Returning those buffers before proof would expose/reuse them; retaining them requires a bounded pending-proof queue included in reservoir occupancy and RAM accounting.
+
+   **Claim:** Prior SCSI M3 and the second-path major are resolved.
+
+   **Fix:** Extend the delivery protocol with ordered proof-frontier metadata, such as a handoff sequence/end cursor plus optional `DevicePositionProof`, preserving proof evidence from `ReadBatchOutcome`. Specify a bounded pending-proof queue, count it as reservoir occupancy, release only through a matching proof frontier, and test proof failure with buffered output. Transport unification itself is resolved; integrity is not.
+
+2. **major × §5.6 × a once-cell cannot enforce the stated error precedence**
+
+   A first-writer-wins once-cell cannot guarantee `submitter > decode > sender`: a sender failure can fill it before the later SCSI root arrives. “Highest-precedence via a once-cell” is internally contradictory. See [design §5.6](/home/user/remanence/docs/design-tape-io-read-pipeline-v0.1.md:792).
+
+   **Claim:** The real SCSI cause always reaches the client.
+
+   **Fix:** Use a replaceable priority-ranked terminal accumulator, and do not emit terminal gRPC status until all upstream producers have closed/joined or an explicit finalization barrier proves no higher-priority cause can still arrive. Preserve genuine disconnect as the separate short-circuit case.
+
+3. **major × §4.2 × consumer EWMA does not prove the drive is speed-matched or guarantee zero parks**
+
+   Consumer drain rate is only a demand proxy. It does not reveal drive-buffer state, actual tape speed band, backhitches, or whether the drive has already parked. Consequently, “demand converges to consumer rate → hardware speed-matching → zero parks” is a hypothesis, not a sound control invariant. A bursty consumer can remain above the EWMA floor while still presenting gaps long enough to stop the drive.
+
+   The `high−ε` controller also leaves ε undefined relative to one command, watermark overshoot, sample period, EWMA time constant, and minimum dwell time. The ±10%/10-second selector prevents noise flapping near a steady floor, but not repeated transitions under bursty workloads.
+
+   **Claim:** One rate comparison safely selects in-band versus sub-band control without thrash.
+
+   **Fix:** Define ε as at least one maximum handoff/command credit; specify EWMA sampling and time constant, minimum regime dwell, and transition state. Treat “in-band” as provisional and use observed park/backhitch or drive-buffer/LOG SENSE evidence as negative feedback: any park under in-band control demotes to full-hysteresis batching. Remove the unconditional “zero parks” claim until leg 3 proves it.
+
+4. **major × §4.3 × `T_reproof = 250 ms` is an unqualified proxy for parking**
+
+   The safety rule says re-proof after a pause “in which the drive may have parked,” but implements that as pause duration greater than 250 ms. No evidence establishes that this drive cannot park or reposition during a shorter pause. Therefore a legitimate sub-250-ms stop can issue its first subsequent READ without the promised proof. See [design §4.3](/home/user/remanence/docs/design-tape-io-read-pipeline-v0.1.md:519).
+
+   Filemark handling itself is coherent: gating is at classified command boundaries, plan-bounded windows do not intentionally cross object/filemark boundaries, and an unexpected mid-plan filemark terminates the window.
+
+   **Claim:** The first post-park READ is always gated by `DevicePositionProof`.
+
+   **Fix:** Re-proof after every deliberate watermark park/resume regardless of duration. Use `T_reproof` only for incidental free-buffer waits, and either qualify it physically or conservatively re-proof every such resumed wait. Make the RP result/proof an explicit precondition before issuing the next READ.
+
+5. **major × §4.5 × dead-peer teardown has no specified bounded implementation**
+
+   The design says keepalive values are in `reference-configuration.md`, but that file contains only h2 flow-control windows—no keepalive interval, timeout, or idle behavior. The current server builder likewise configures windows only. See [reference configuration](/home/user/remanence/docs/reference-configuration.md:73) and [server builder](/home/user/remanence/crates/remanence-daemon/src/lib.rs:40).
+
+   Thus the claimed interval+timeout bound is undefined. As folded, a half-open peer can still leave a parked drive reserved forever—the failure §4.5 is intended to eliminate.
+
+   **Claim:** Dead and half-open peers are always detected independently of send progress.
+
+   **Fix:** Specify concrete interval/timeout defaults, whether PING runs while otherwise idle/stalled, and the exact tonic server/client settings. Include the values in configuration documentation and test a half-open connection while the reservoir is parked. Slow but transport-alive indefinite parking is an explicit owner decision and is internally coherent once death detection is bounded.
+
+6. **major × §4.6 × RAM rules do not justify “never OOM, never swap”**
+
+   `MemAvailable` is a transient observation, not a reservation. Two streams can both observe the same availability unless capacity is reserved atomically before either grows. The document mentions a generalized shared ceiling but does not define its fixed size, reservation order, permit granularity, or how memlock allowance is atomically shared.
+
+   “If `mlock` fails, clamp to the minimum pool” also contradicts “resident, non-swappable”: an `mlock` failure does not establish that even the minimum pool can be locked. Incremental `MemAvailable` checks cannot prevent unrelated processes from consuming memory after the check.
+
+   **Claim:** The math cannot OOM or swap, including two restores plus append spool.
+
+   **Fix:** Define a fixed daemon I/O-memory ceiling below a cgroup/systemd memory limit and an atomic reservation manager shared by spool and all drives. Reserve locked-byte permits before allocation; rollback permits on allocation or `mlock` failure. Refuse or explicitly permit only the legacy minimum swappable ring if minimum locking fails—do not call it “never swap.” Include concurrent growth races, not merely second-stream startup, in tests.
+
+7. **major × §4.1 / §4.8 × cycle arithmetic contradicts the defaults and understates wear**
+
+   The design correctly states cycles ≈ `restore_bytes ÷ (high−low)`, then claims a 100 GB reservoir gives about 180 cycles for 18 TB. With 90/25 watermarks, the span is 65 GB, giving roughly 277 cycles, not 180. With the 4 GiB default, the span is 2.6 GiB and a full 18 TiB restore is roughly 7,100 park/resume cycles.
+
+   At a 110 MiB/s consumer, draining that 2.6 GiB span takes only about 24 seconds, so the default can generate around 150 cycles/hour. That is not demonstrated to meet the anti-wear goal.
+
+   **Claim:** The 4 GiB, 90/25 defaults are sane and the stated wear estimate supports them.
+
+   **Fix:** Correct all arithmetic using effective `(high−low)` bytes; define an acceptable maximum cycles/hour or cycles/full-tape target; derive the default reservoir from that target and qualified floor. Until physical qualification, label 4 GiB as an experimental minimum, not a sane anti-wear default.
+
+8. **major × §4.4 / §5 × “one shared funnel fixes reads and writes” is false and write compatibility is underspecified**
+
+   The read hardening is correctly placed in `read_block_batch`, but reads and writes do not share that funnel. There are also two distinct write implementations: `write_block_batch` and `write_block_batch_pipelined`. Their recovered/EOM arbitration differs. See [ordinary write funnel](/home/user/remanence/crates/remanence-library/src/handle/tape_io/mod.rs:958), [pipelined write funnel](/home/user/remanence/crates/remanence-library/src/handle/tape_io/mod.rs:1119), and [read funnel](/home/user/remanence/crates/remanence-library/src/handle/tape_io/mod.rs:1324).
+
+   The fold merely says “symmetric check in the same commit”; it does not identify applicable write branches or prove that `bytes_transferred` has the required data-out semantics. A naive check could conflict with the write path’s device-position arbiter.
+
+   **Claim:** The hardening benefits reads and writes without changing existing write behavior.
+
+   **Fix:** Keep the read checks in the single read funnel. Separately specify a shared validation helper and enumerate its call sites in both write functions. State which residual-derived write outcomes it governs, verify transport `bytes_transferred` semantics for data-out CHECK CONDITION, and preserve device-position arbitration for EOM/EW. Add parity tests for ordinary and pipelined writes.
+
+9. **minor × §3.1 / §5.2 × submitter remaining is mislabeled as “post-decode”**
+
+   The submitter decrements its authoritative count after funnel completion, while decode runs asynchronously and may lag by reservoir depth. Therefore `remaining_after_decode` is not the state used to issue the next READ. See [design §3.1](/home/user/remanence/docs/design-tape-io-read-pipeline-v0.1.md:188).
+
+   **Fix:** Rename this consistently to `remaining_after_classified_completion` or `submitter_remaining`; keep the decoder’s sum explicitly diagnostic/derived.
+
+10. **minor × §4.3 / §4.8 × `T_reproof` is called a default but is absent from configuration**
+
+   It is described as a constant/default of 250 ms, but §4.8 lists no key and the validation rules do not cover it.
+
+   **Fix:** Either declare it a non-configurable named constant everywhere or add a validated configuration key. The safety fix above should remove it from deliberate park decisions.
+
+## Panel-resolution ledger
+
+Actually resolved in the fold:
+
+- Wrap-don’t-copy, audit coalescing dropped, and per-command audit retained.
+- Decode thread has no drive reference; `BlockRead` removes motion by type.
+- Exactly one SCSI data command in flight is coherent by ownership construction.
+- Count recomputation before every issue; only the buffer is staged.
+- GOOD + tripwire-RP-fail and impossible-residual rows are present.
+- Recovered VALID nonzero residual and `29/07` are specified fail-closed in the read funnel.
+- Per-mount identity verification and the multi-object physical leg are added.
+- Decode→sender channel is byte-sized.
+- `feed_gap_us` subtracts free-wait and park; cross-thread counters are atomic or post-join.
+- R1’s naive blocking-send and zero-copy proposals were removed/replaced.
+- Read-cadence uncertainty is now stated.
+- R2 measurement gating was explicitly overruled by the owner, rather than silently ignored.
+- SHA-NI and 4 KiB costs are made pre-measurement obligations.
+
+Not actually resolved:
+
+- Panel SCSI M3 ranged-read integrity: transport unification is resolved; the proof/release mechanism is not implementable with the specified handoff.
+- Panel failure-mode error precedence: priority is stated, but the once-cell mechanism cannot enforce it.
+- Panel residual/write-wide hardening: read handling is specified; cross-write-funnel behavior and compatibility are not.
+
+No files were modified and no implementation tests were run, consistent with the read-only design-review charter.
