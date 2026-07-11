@@ -65,6 +65,16 @@
       "expected_error": "ManifestInvalid"
     },
     {
+      "id": "duplicate-entry-path",
+      "fault": "two file_entries elements share the same path",
+      "expected_error": "ManifestInvalid"
+    },
+    {
+      "id": "duplicate-entry-file-id",
+      "fault": "two file_entries elements share the same file_id",
+      "expected_error": "ManifestInvalid"
+    },
+    {
       "id": "unknown-extra-key-accepted",
       "fault": "unknown top-level extension key with valid manifest-profile CBOR is present",
       "expected_outcome": "accepted"

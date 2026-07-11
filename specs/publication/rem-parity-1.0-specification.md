@@ -1313,7 +1313,12 @@ each 1-block tape file classified as an object by elimination because its
 head block was unreadable, re-hypothesize its kind as Bootstrap (block
 count 1, no ordinal), renumber the object ordinals, and revalidate;
 accept the first hypothesis whose digest and scope scalars validate. The
-hypothesis space is bounded by the number of unreadable 1-block files.
+hypothesis space is bounded by the number of unreadable 1-block files. The
+reference Scanner tests candidates one at a time in ascending tape-file order;
+it does not re-type readable corrupt headers, genuine readable 1-block
+objects, or combinations of candidates. Each hypothesis is passed through the
+same directory overlay, ordinal renumbering, digest, and scope-scalar checks as
+the original scan.
 Without re-typing, single-block damage to a checkpoint bootstrap would
 invalidate every digest scope covering it, defeating the isolation goal
 of Section 12.5.
@@ -1551,6 +1556,15 @@ vectors — the expected Section 15 error name. Vectors use small geometries
 practical to pin; at least one header-level vector MUST use the default
 geometry parameters. Negative vectors contain exactly one fault each.
 
+The companion archive is `remanence-test-vectors.tar`, SHA-256
+`596e5ee7baffb355366407d6b4384fe7caafa64509e489508df2ed5dc2eadc7d`.
+Its `MANIFEST.tsv` inventories every contained vector manifest and generated
+artifact, `CHECKSUMS.sha256` authenticates them, and the included `verify.py`
+checks the archive without a source checkout. The archive is reproducibly
+generated with the `publication-test-vectors` build target. The REM-PARITY
+`vectors.json` records deterministic inputs, expected outputs or Section 15
+typed errors, artifact hashes, and a checksum for every vector.
+
 The arithmetic vectors stated in this document — the Section 5.1 CRC
 values, the Section 6.8 Reed–Solomon values, and the Section 7.3 canonical
 digest — are normative now and independently re-derivable from this
@@ -1587,7 +1601,8 @@ image (committed prefix → reopened → appended).
   peer counted as an erasure and then recovered around; a
   reconstructed-block CRC mismatch; a pending-epoch refusal; an
   outside-prefix refusal.
-- *Damage matrix*: for the minimal image, single-block damage at each of —
+- *Damage matrix*: for the minimal image (and the external parity_map image
+  for the parity_map-primary cell), single-block damage at each of —
   the object's head block; the sidecar primary header; the sidecar footer;
   the sidecar footer **and** primary (directory-assisted tail rescue); the
   parity_map primary; one bootstrap copy (exercising the Section 12.4
@@ -1605,7 +1620,7 @@ change the set of valid tapes (anything else is version 2):
 1. At least one complete implementation implements this document in every
    role — Writer, Scanner, Recoverer, Resumer, Verifier — with no known
    divergences from this document.
-2. The Section 17 fixtures exist in-repo and pass, including the
+2. The Section 17 fixtures are present in the companion archive and pass, including the
    single-block damage matrix and the byte-pinned minimal tape image. Every
    **[pinned-at-generation]** value is independently re-derived by a second
    implementation (different language or library) before freezing, so a
@@ -1877,17 +1892,17 @@ verifiable against any directory entry.
 3. **The last-resort full filemark-walk scan** (Section 8.4 step 5) is a
    SHOULD-offer whose operational parameters (geometry hints, abort
    conditions, progress reporting) are not yet specified.
-4. **Overlay tie-breaks and re-typing status.** When several structurally
+4. **Overlay tie-breaks.** When several structurally
    discovered parity_map files survive with no bootstrap reference
-   (Section 12.4), the selection rule among them is not yet specified; and
-   whether bootstrap re-typing (Section 12.4) should be promoted from
-   SHOULD to MUST — with a pinned damage-matrix vector — is an open
-   decision.
-4. **Throughput program.** Accelerated GF(2⁸) and CRC kernels must land and
+   (Section 12.4), the selection rule among them is not yet specified.
+   Bootstrap re-typing is implemented at SHOULD strength with a damage-matrix
+   vector; promotion to MUST, if desired before freeze, remains a specification
+   policy decision rather than an implementation gap.
+5. **Throughput program.** Accelerated GF(2⁸) and CRC kernels must land and
    be proven byte-identical via the Section 17 vectors (Section 18
    criterion 6) before freeze, so the conformance anchor is generated at
    production speed and layout.
-5. **Key-30 recovery tooling.** Bootstrap object rows (Section 8.2.1) need a
+6. **Key-30 recovery tooling.** Bootstrap object rows (Section 8.2.1) need a
    scanner/recovery reader that validates each row against the
    recovered filemark map and emits a catalog-less recovery report for both
    plaintext and encrypted RAO objects, demonstrated before format freeze.
@@ -1895,5 +1910,6 @@ verifiable against any directory entry.
 ## Author's Address
 
 The ArchiveTech Project
-archivetech.org
+Website: https://archivetech.org
 Email: specs@archivetech.org
+Reference implementation: https://github.com/archivetechie/remanence

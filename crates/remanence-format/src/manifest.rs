@@ -129,8 +129,25 @@ fn validate_manifest_schema(
             "manifest file_entries exceeds MAX_FILE_ENTRIES",
         ));
     }
+    let mut seen_paths = BTreeSet::new();
+    let mut seen_file_ids = BTreeSet::new();
     let mut seen_regular_paths = BTreeSet::new();
     for entry in file_entries {
+        let entry_map = entry
+            .as_map()
+            .ok_or_else(|| FormatError::manifest_invalid("file_entries item must be a map"))?;
+        let path = required_text(entry_map, "path")?;
+        if !seen_paths.insert(path.to_string()) {
+            return Err(FormatError::manifest_invalid(format!(
+                "duplicate file_entries path {path:?}"
+            )));
+        }
+        let file_id = required_text(entry_map, "file_id")?;
+        if !seen_file_ids.insert(file_id.to_string()) {
+            return Err(FormatError::manifest_invalid(format!(
+                "duplicate file_entries file_id {file_id:?}"
+            )));
+        }
         if let Some(path) = validate_file_entry(entry, reader_chunk_size, &seen_regular_paths)? {
             seen_regular_paths.insert(path);
         }
@@ -830,6 +847,14 @@ mod tests {
                 base_manifest_with(512, vec![("zzzzzzzzzzzzzzzzzzzz", cbor_uint(1))])
             }
             "manifest-chunk-size-mismatch" => base_manifest_with(1024, Vec::new()),
+            "duplicate-entry-path" => manifest_with_file_entries(vec![
+                regular_file_entry_with(Vec::new()),
+                regular_file_entry_with(vec![("file_id", cbor_text("file-b"))]),
+            ]),
+            "duplicate-entry-file-id" => manifest_with_file_entries(vec![
+                regular_file_entry_with(Vec::new()),
+                regular_file_entry_with(vec![("path", cbor_text("b.bin"))]),
+            ]),
             other => panic!("unhandled manifest vector {other:?}"),
         }
     }
@@ -889,6 +914,8 @@ mod tests {
                 "nesting-depth-over-max",
                 "manifest-digest-mismatch",
                 "manifest-chunk-size-mismatch",
+                "duplicate-entry-path",
+                "duplicate-entry-file-id",
                 "unknown-extra-key-accepted",
             ],
         );

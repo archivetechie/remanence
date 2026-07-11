@@ -44,8 +44,8 @@ pub use reader::{
     read_rem_tar_object_with_mode_and_manifest_anchor, stream_rem_tar_object,
     stream_rem_tar_object_with_manifest_anchor, stream_rem_tar_object_with_mode,
     stream_rem_tar_object_with_mode_and_manifest_anchor, EncryptedRaoReadObject, ReadMode,
-    RemTarDigestMismatch, RemTarEntrySink, RemTarReadEntry, RemTarReadObject, RemTarStreamEntry,
-    RemTarStreamReport,
+    RemTarDigestMismatch, RemTarEntrySink, RemTarReadEntry, RemTarReadObject, RemTarReadWarning,
+    RemTarStreamEntry, RemTarStreamReport,
 };
 pub use remanence_format_driver::{
     ArchiveEventSink, ArchiveGapCause, ArchiveGapRange, ArchiveReader, ArchiveWriter, DamageRange,

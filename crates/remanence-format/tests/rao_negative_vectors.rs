@@ -6,14 +6,15 @@ use remanence_aead::stream::{
     encrypt_chunk, encrypt_metadata, stored_size_from_parts, CHACHA20POLY1305_TAG_LEN,
 };
 use remanence_aead::{
-    derive_keys, derive_salt, inspect_bytes, open_to_vec, seal_to_vec, RaoAeadError, RaoHeader,
-    RaoMetadata, RootKey, SealOptions, RAO_FOOTER,
+    derive_keys, derive_salt, inspect_bytes, open_to_vec, seal_to_vec, KeyFrame, RaoAeadError,
+    RaoHeader, RaoMetadata, RecipientSlot, RootKey, SealOptions, RAO_FOOTER,
 };
 use remanence_format::{
     plan_rem_tar_object, read_encrypted_rao_object, read_rem_tar_object, stream_rem_tar_object,
     write_rem_tar_object, write_rem_tar_object_from_readers, FormatError, MetadataPreservation,
     RemTarEntrySink, RemTarEntryType, RemTarFile, RemTarFileLayout, RemTarFileSpec,
-    RemTarFileStream, RemTarObjectLayout, RemTarObjectOptions, RemTarStreamEntry, TAR_RECORD_SIZE,
+    RemTarFileStream, RemTarObjectLayout, RemTarObjectOptions, RemTarReadWarning,
+    RemTarStreamEntry, TAR_RECORD_SIZE,
 };
 use remanence_library::{VecBlockSink, VecBlockSource};
 use serde_json::Value;
@@ -88,6 +89,10 @@ fn aead_error_name(error: &RaoAeadError) -> &'static str {
         RaoAeadError::InvalidHeaderLength => "InvalidHeaderLength",
         RaoAeadError::UnsupportedFormatVersion => "UnsupportedFormatVersion",
         RaoAeadError::InvalidSuite => "InvalidSuite",
+        RaoAeadError::InvalidWrapSuite => "InvalidWrapSuite",
+        RaoAeadError::InvalidKeyFrameLength => "InvalidKeyFrameLength",
+        RaoAeadError::InvalidKeyFrame => "InvalidKeyFrame",
+        RaoAeadError::KeyModeMismatch => "KeyModeMismatch",
         RaoAeadError::InvalidChunkSize => "InvalidChunkSize",
         RaoAeadError::ReservedBytesNotZero => "ReservedBytesNotZero",
         RaoAeadError::InvalidKeyIdentifier => "InvalidKeyIdentifier",
@@ -386,9 +391,28 @@ fn hardlink_plaintext_archive() -> PlaintextArchive {
 fn assert_plaintext_reader_case(case: &Value) {
     let id = str_field(case, "id");
     let operation = str_field(case, "operation");
-    let expected = str_field(case, "expected_error");
-    let err = run_plaintext_reader_case(id, operation).unwrap_err();
-    assert_eq!(format_error_name(&err), expected, "{id}: {err}");
+    if operation == "restore-report" {
+        let warnings = run_plaintext_reader_report_case(id);
+        assert_eq!(warnings, vec![RemTarReadWarning::MissingManifest]);
+        assert_eq!(str_field(case, "expected_report"), "MissingManifest");
+    } else {
+        let expected = str_field(case, "expected_error");
+        let err = run_plaintext_reader_case(id, operation).unwrap_err();
+        assert_eq!(format_error_name(&err), expected, "{id}: {err}");
+    }
+}
+
+fn run_plaintext_reader_report_case(id: &str) -> Vec<RemTarReadWarning> {
+    let mut archive = base_plaintext_archive();
+    mutate_plaintext_archive(id, &mut archive);
+    let mut source = source_from_bytes(&archive.bytes, archive.chunk_size);
+    read_rem_tar_object(
+        &mut source,
+        archive.chunk_size,
+        block_count(&archive.bytes, archive.chunk_size),
+    )
+    .expect("reporting vector remains readable")
+    .warnings
 }
 
 fn run_plaintext_reader_case(id: &str, operation: &str) -> Result<(), FormatError> {
@@ -487,6 +511,9 @@ fn mutate_plaintext_archive(id: &str, archive: &mut PlaintextArchive) {
             b"a/../b",
         ),
         "entry-after-manifest" => insert_entry_after_manifest(archive),
+        "missing-manifest" => {
+            archive.bytes[archive.layout.manifest.pax_header_offset as usize..].fill(0);
+        }
         "flipped-payload-bit" => {
             let offset = archive.layout.files[0].data_offset as usize;
             archive.bytes[offset] ^= 1;
@@ -1368,7 +1395,8 @@ fn run_envelope_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
     match id {
         "wrong-magic" => sealed[0] = b'X',
         "header-len-not-128" => sealed[5] = 127,
-        "format-version-2" => sealed[6] = 2,
+        "unsupported-format-version" => sealed[6] = 3,
+        "v1-shape-version-flipped-to-2" => sealed[6] = 2,
         "unknown-suite-id" => sealed[7] = 2,
         "chunk-size-zero" => sealed[8..12].copy_from_slice(&0u32.to_be_bytes()),
         "chunk-size-not-multiple-of-512" => sealed[8..12].copy_from_slice(&513u32.to_be_bytes()),
@@ -1546,6 +1574,61 @@ fn assert_envelope_base(fixture: &Value) {
     assert_eq!(str_field(base, "object_id"), "object-1");
 }
 
+fn v2_slot(index: u8, label: &str) -> RecipientSlot {
+    RecipientSlot {
+        slot_index: index,
+        recipient_epoch_id: [index.wrapping_add(1); 16],
+        epoch_label: label.to_string(),
+        enc: [index.wrapping_add(2); 32],
+        ciphertext: [index.wrapping_add(3); 48],
+    }
+}
+
+fn base_v2_envelope() -> (Vec<u8>, usize) {
+    let key_frame = KeyFrame::new(vec![v2_slot(0, "safe"), v2_slot(1, "escrow")])
+        .unwrap()
+        .serialize()
+        .unwrap();
+    let header =
+        RaoHeader::new_v2_envelope(512, [0x22; 16], 17, "object-v2", key_frame.len() as u32)
+            .unwrap();
+    let mut object = header.serialize().unwrap().to_vec();
+    object.extend_from_slice(&key_frame);
+    object.extend_from_slice(&[0u8; 17]);
+    object.extend_from_slice(&[0u8; 512 + 16]);
+    object.extend_from_slice(RAO_FOOTER);
+    object.resize(object.len().div_ceil(512) * 512, 0);
+    (object, key_frame.len())
+}
+
+fn run_v2_envelope_case(id: &str) -> Result<(), RaoAeadError> {
+    let (mut object, key_frame_len) = base_v2_envelope();
+    match id {
+        "v2-version-flip" => object[6] = 1,
+        "v2-suite-flip" => object[0x38] = 0xff,
+        "v2-truncated-key-frame" => object.truncate(128 + key_frame_len - 1),
+        "v2-duplicate-slots" => {
+            let second_slot = 128 + 5 + 98 + "safe".len();
+            object[second_slot] = 0;
+        }
+        "v2-misordered-slots" => {
+            let second_slot = 128 + 5 + 98 + "safe".len();
+            object[128 + 5] = 2;
+            object[second_slot] = 1;
+        }
+        "v2-key-frame-trailing-byte" => {
+            object[0x3c..0x40].copy_from_slice(&((key_frame_len + 1) as u32).to_be_bytes());
+            object.insert(128 + key_frame_len, 0);
+        }
+        "v2-oversize-key-frame" => {
+            object[0x3c..0x40].copy_from_slice(&4097u32.to_be_bytes());
+        }
+        other => panic!("unhandled v2 envelope negative vector {other:?}"),
+    }
+    inspect_bytes(&object)?;
+    Ok(())
+}
+
 #[test]
 fn plaintext_writer_negative_vectors_match_manifest_errors() {
     let fixture = fixture(include_str!("../../../fixtures/rao/negative-writer.json"));
@@ -1611,6 +1694,7 @@ fn plaintext_reader_negative_vectors_match_manifest_errors() {
             "hardlink-missing-target",
             "hardlink-forward-target",
             "hardlink-nonregular-target",
+            "missing-manifest",
         ],
     );
     let base = fixture.get("base").expect("plaintext reader base exists");
@@ -1657,7 +1741,8 @@ fn envelope_negative_vectors_match_manifest_errors() {
         &[
             "wrong-magic",
             "header-len-not-128",
-            "format-version-2",
+            "unsupported-format-version",
+            "v1-shape-version-flipped-to-2",
             "unknown-suite-id",
             "chunk-size-zero",
             "chunk-size-not-multiple-of-512",
@@ -1716,5 +1801,33 @@ fn envelope_negative_vectors_match_manifest_errors() {
     assert_envelope_base(&fixture);
     for case in cases(&fixture) {
         assert_envelope_case(case);
+    }
+}
+
+#[test]
+fn envelope_v2_negative_vectors_match_manifest_errors() {
+    let fixture = fixture(include_str!(
+        "../../../fixtures/rao/negative-envelope-v2.json"
+    ));
+    assert_complete_case_ids(
+        &fixture,
+        &[
+            "v2-version-flip",
+            "v2-suite-flip",
+            "v2-truncated-key-frame",
+            "v2-duplicate-slots",
+            "v2-misordered-slots",
+            "v2-key-frame-trailing-byte",
+            "v2-oversize-key-frame",
+        ],
+    );
+    for case in cases(&fixture) {
+        let id = str_field(case, "id");
+        let error = run_v2_envelope_case(id).unwrap_err();
+        assert_eq!(
+            aead_error_name(&error),
+            str_field(case, "expected_error"),
+            "{id}: {error}"
+        );
     }
 }

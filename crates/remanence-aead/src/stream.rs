@@ -118,9 +118,20 @@ pub fn stored_size_from_parts(
     metadata_frame_len: u64,
     plaintext_size: u64,
 ) -> Result<u64> {
+    stored_size_from_parts_with_key_frame(chunk_size, 0, metadata_frame_len, plaintext_size)
+}
+
+/// Compute padded stored size with a variable plaintext key frame.
+pub fn stored_size_from_parts_with_key_frame(
+    chunk_size: u32,
+    key_frame_len: u32,
+    metadata_frame_len: u64,
+    plaintext_size: u64,
+) -> Result<u64> {
     let payload_len = payload_frame_len(plaintext_size, chunk_size)?;
     let footer_end = (RAO_HEADER_LEN as u64)
-        .checked_add(metadata_frame_len)
+        .checked_add(u64::from(key_frame_len))
+        .and_then(|value| value.checked_add(metadata_frame_len))
         .and_then(|value| value.checked_add(payload_len))
         .and_then(|value| value.checked_add(RAO_FOOTER.len() as u64))
         .ok_or(RaoAeadError::SizeOverflow)?;
@@ -138,11 +149,22 @@ pub fn expected_stored_size(
 
 /// Ciphertext offset of inner body block `b`.
 pub fn cipher_offset(metadata_frame_len: u64, chunk_size: u32, b: u64) -> Result<u64> {
+    cipher_offset_with_key_frame(0, metadata_frame_len, chunk_size, b)
+}
+
+/// Stored offset of payload block `b` with an explicit key-frame length.
+pub fn cipher_offset_with_key_frame(
+    key_frame_len: u32,
+    metadata_frame_len: u64,
+    chunk_size: u32,
+    b: u64,
+) -> Result<u64> {
     let stride = u64::from(chunk_size)
         .checked_add(CHACHA20POLY1305_TAG_LEN)
         .ok_or(RaoAeadError::SizeOverflow)?;
     (RAO_HEADER_LEN as u64)
-        .checked_add(metadata_frame_len)
+        .checked_add(u64::from(key_frame_len))
+        .and_then(|value| value.checked_add(metadata_frame_len))
         .and_then(|base| base.checked_add(b.checked_mul(stride)?))
         .ok_or(RaoAeadError::SizeOverflow)
 }

@@ -10,7 +10,11 @@ repository  .workspace = true
 
 [dependencies]
 chacha20poly1305 = { workspace = true }
+chacha20         = { workspace = true }
 hkdf             = { workspace = true }
+hpke             = { workspace = true }
+getrandom        = { workspace = true }
+rand_core        = { workspace = true }
 sha2             = { workspace = true }
 thiserror        = { workspace = true }
 zeroize          = { workspace = true }

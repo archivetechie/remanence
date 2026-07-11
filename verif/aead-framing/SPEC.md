@@ -5,9 +5,10 @@ pure framing arithmetic in `crates/remanence-aead/src/stream.rs`,
 `crates/remanence-aead/src/range.rs`, and
 `crates/remanence-aead/src/inspect.rs`.
 
-Constants:
+Parameters and constants:
 
-- `H = 128` = encrypted RAO header length
+- `H` = scalar encrypted RAO header length (`128` for v1 and v2)
+- `K` = plaintext key-frame length (`0` for v1; variable for v2)
 - `F = 16` = completion footer length
 - `T = 16` = ChaCha20-Poly1305 tag length
 - `C` = AEAD plaintext chunk size
@@ -27,14 +28,14 @@ For valid chunk-count inputs and no `u64` overflow,
 
 ## A3 -- stored object size
 
-For valid payload inputs and no `u64` overflow,
+For valid payload inputs and no `u64` overflow, the extracted v1
 `stored_size_from_parts(C, M, P)` returns
-`round_up(H + M + payload_frame_len(P, C) + F, C)`.
+`round_up(128 + M + payload_frame_len(P, C) + F, C)`.
 
 ## A4 -- ciphertext chunk offset
 
-For no `u64` overflow, `cipher_offset(M, C, b)` returns
-`H + M + b * (C + T)`.
+For no `u64` overflow, the extracted v1 `cipher_offset(M, C, b)` returns
+`128 + M + b * (C + T)`.
 
 ## A5 -- plaintext range validation
 
@@ -71,6 +72,16 @@ The Lean proof also covers small but important edge contracts:
 - zero chunk size is rejected by chunk-size validation and non-empty range
   planning
 - empty ranges are rejected by `nonempty_range_plan` after range validation
+
+## A9 -- v2 prefix status (not formally proved)
+
+The Rust extraction and production tests exercise `(H, K)` geometry for v1
+`(128, 0)` and v2 `(128, key_frame_len)`, but the current Aeneas-generated
+`Funs.lean` signatures still hardwire the v1 `K = 0` path. Therefore v2
+geometry is unit-test- and drift-guard-covered only; it is not part of the Lean
+proof claim. Follow-up **RAO-V2-FORMAL-PREFIX** must carry `key_frame_len`
+through the extracted stored-size, ciphertext-offset, range-plan, and inspect
+functions and re-prove the existing success theorems over `(H, K)`.
 
 ## Trust anchor
 

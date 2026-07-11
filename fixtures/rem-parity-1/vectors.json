@@ -1,0 +1,31 @@
+{
+  "vector_set": "REM-PARITY-1.0",
+  "spec_section": "17",
+  "status": "complete",
+  "arithmetic": {
+    "crc64_xz": [
+      {"input_hex": "313233343536373839", "expected": "995dc9bbdf1939fa"},
+      {"input_hex": "", "expected": "0000000000000000"},
+      {"input_hex": "00", "expected": "1fada17364673f59"},
+      {"input_hex": "ff", "expected": "ff00000000000000"}
+    ],
+    "reed_solomon": {
+      "k": 2,
+      "m": 2,
+      "generator_rows_hex": ["8ef4", "f48e"],
+      "data_hex": ["01020304", "10203040"],
+      "parity_hex": ["75ea9fc9", "fce519d7"]
+    },
+    "canonical_map_projection": {
+      "cbor_hex": "8387000201f6f6f6f68701000300f6f6f687020102f6000307",
+      "sha256": "548ca6c967073a6c1ad011d10fc132c2739e251d015ea45a628bbec96892c26b"
+    }
+  },
+  "executable_suites": [
+    {"claim": "bootstrap, sidecar, parity_map, and canonical-map byte vectors", "command": "cargo test -p remanence-parity"},
+    {"claim": "catalog-less scan and authoritative directory overlays", "command": "cargo test -p remanence-parity scan::tests"},
+    {"claim": "unreadable checkpoint bootstrap re-typing", "test": "scan::tests::acquire_filemark_map_retypes_unreadable_checkpoint_bootstrap"},
+    {"claim": "end-to-end scan/recovery/resume images", "command": "cargo test -p remanence-parity --test scan_round_trip"},
+    {"claim": "single-block damage matrix", "tests": "scan::tests and recovery::tests damage/corruption cases"}
+  ]
+}

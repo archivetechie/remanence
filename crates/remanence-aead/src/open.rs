@@ -12,6 +12,7 @@ use crate::stream::{
     decrypt_chunk, decrypt_metadata, finalize_sha256, payload_frame_len, round_up, PlaintextStats,
     CHACHA20POLY1305_TAG_LEN,
 };
+use crate::wrap::{unwrap_dek, RecipientPrivateKey};
 
 /// Report returned after successfully opening a RAO encrypted object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +36,9 @@ pub fn open<R: Read, W: Write>(
     let mut header_bytes = [0u8; RAO_HEADER_LEN];
     read_exact(&mut input, &mut header_bytes)?;
     let header = RaoHeader::parse(&header_bytes)?;
+    if header.format_version != 1 {
+        return Err(RaoAeadError::KeyModeMismatch);
+    }
     validate_metadata_frame_len(header.metadata_frame_len)?;
 
     let keys = derive_keys(root_key, &header.hkdf_salt, &header.header_hash()?)?;
@@ -89,6 +93,83 @@ pub fn open<R: Read, W: Write>(
 pub fn open_to_vec(input: &[u8], root_key: &RootKey) -> Result<(Vec<u8>, OpenReport)> {
     let mut out = Vec::new();
     let report = open(input, &mut out, root_key)?;
+    Ok((out, report))
+}
+
+/// Open a v2 envelope object with a matching recipient private key.
+pub fn open_envelope<R: Read, W: Write>(
+    mut input: R,
+    mut output: W,
+    recipient: &RecipientPrivateKey,
+) -> Result<OpenReport> {
+    let mut header_bytes = [0u8; RAO_HEADER_LEN];
+    read_exact(&mut input, &mut header_bytes)?;
+    let header = RaoHeader::parse(&header_bytes)?;
+    if header.format_version != 2 || header.wrap_suite != crate::WRAP_SUITE_HPKE_V1 {
+        return Err(RaoAeadError::KeyModeMismatch);
+    }
+    let mut key_frame_bytes = vec![0u8; header.key_frame_len as usize];
+    read_exact(&mut input, &mut key_frame_bytes)?;
+    let key_frame = crate::KeyFrame::parse(&key_frame_bytes)?;
+    let dek = unwrap_dek(&key_frame, &header.object_id, recipient)?;
+    let keys = crate::kdf::derive_keys_v2(
+        dek.as_bytes(),
+        &header.hkdf_salt,
+        &header.header_hash_with_key_frame(&key_frame_bytes)?,
+    )?;
+    let metadata_frame_len = usize::try_from(header.metadata_frame_len)
+        .map_err(|_| RaoAeadError::MetadataFrameLengthInvalid)?;
+    let mut metadata_frame = vec![0u8; metadata_frame_len];
+    read_exact(&mut input, &mut metadata_frame)?;
+    let metadata_plaintext = decrypt_metadata(&keys.metadata_key, &metadata_frame)?;
+    let metadata = RaoMetadata::from_cbor_bytes(&metadata_plaintext, header.chunk_size)?;
+    let expected_salt = crate::kdf::derive_salt_v2(
+        dek.as_bytes(),
+        &header.object_id_field()?,
+        &metadata.plaintext_digest,
+        &metadata_plaintext,
+    )?;
+    if expected_salt != header.hkdf_salt {
+        return Err(RaoAeadError::SaltDerivationMismatch);
+    }
+    let plaintext_stats = decrypt_payload(&mut input, &mut output, &header, &metadata, &keys)?;
+    if plaintext_stats.size != metadata.plaintext_size {
+        return Err(RaoAeadError::PlaintextSizeMismatch);
+    }
+    if plaintext_stats.digest != metadata.plaintext_digest {
+        return Err(RaoAeadError::PlaintextDigestMismatch);
+    }
+    read_footer(&mut input)?;
+    let payload_len = payload_frame_len(metadata.plaintext_size, header.chunk_size)?;
+    let footer_end = (RAO_HEADER_LEN as u64)
+        .checked_add(u64::from(header.key_frame_len))
+        .and_then(|value| value.checked_add(header.metadata_frame_len))
+        .and_then(|value| value.checked_add(payload_len))
+        .and_then(|value| value.checked_add(RAO_FOOTER.len() as u64))
+        .ok_or(RaoAeadError::SizeOverflow)?;
+    let stored_size_bytes = round_up(footer_end, u64::from(header.chunk_size))?;
+    read_zero_fill(
+        &mut input,
+        stored_size_bytes
+            .checked_sub(footer_end)
+            .ok_or(RaoAeadError::SizeOverflow)?,
+    )?;
+    ensure_eof(&mut input)?;
+    Ok(OpenReport {
+        header,
+        metadata,
+        stored_size_bytes,
+        plaintext: plaintext_stats,
+    })
+}
+
+/// Open a v2 envelope into a vector.
+pub fn open_envelope_to_vec(
+    input: &[u8],
+    recipient: &RecipientPrivateKey,
+) -> Result<(Vec<u8>, OpenReport)> {
+    let mut out = Vec::new();
+    let report = open_envelope(input, &mut out, recipient)?;
     Ok((out, report))
 }
 
