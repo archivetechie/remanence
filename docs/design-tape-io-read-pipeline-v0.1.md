@@ -1,13 +1,22 @@
-# Tape I/O read pipeline (TIO-6) — read submitter, read reservoir + anti-shoe-shine controller, relay unblocking — Design v0.2
+# Tape I/O read pipeline (TIO-6) — read submitter, read reservoir + anti-shoe-shine controller, relay unblocking — Design v0.3
 
-**Status:** **FOLDED v0.2** (2026-07-11) — panel review folded + owner decisions
-incorporated; pending one codex verify round before freeze.
+**Status:** **FOLDED v0.3** (2026-07-11) — codex verify round folded (failed
+the freeze bar on §4 controller under-specification plus three v0.2 fold
+claims that were not actually implementable as written); pending re-verify
+before freeze.
 **Fold record:** panel 2026-07-11: 37 findings (14 failure / 9 concurrency /
 7 scsi / 7 cost); folded + owner decisions. The dominant convergence (3 lenses)
 was the wrap-don't-copy contradiction — resolved in §3.3/§3.6/§5. The single
 largest v0.1→v0.2 change is an **owner reversal**: v0.1 §4 "reads accept
 shoe-shine" is REJECTED; anti-shoe-shine is now core, designed in §4 as a
-watermark-controlled host-RAM read reservoir.
+watermark-controlled host-RAM read reservoir. verify 2026-07-11: 8 majors +
+2 minors; folded → v0.3 — proof-frontier delivery protocol (§3.2/§5.5),
+priority terminal accumulator + finalization barrier (§5.6), controller
+spec'd with negative feedback (§4.2), duration-proxy-free park re-proof
+(§4.3), concrete keepalive (§4.5), fixed-ceiling atomic RAM reservation
+(§4.6), corrected wear arithmetic + derived 8 GiB default (§4.1/§4.8),
+enumerated write-side helper scope (§4.4/§5), `submitter_remaining` rename,
+`T_REPROOF_INCIDENTAL` as a named constant.
 **Naming:** settled — **TIO-6** (commits on main already use it; v0.1 Q5 closed).
 **Problem source:** the 2026-07-07b MSL3040 window measured field restore at
 **13.28 MB/s** end-to-end (undecomposable at the time — read diag was missing),
@@ -184,17 +193,21 @@ Runs on the drive-actor thread that owns the `DriveHandle` — no new
 ownership or locking semantics, mirror of TIO-5 §3.2. **The drive-side
 `BlockSource` moves INTO the submitter closure; no other thread can reach the
 drive, by construction (§3.3, §5.4).** GOOD-path loop, in full: check the
-reservoir gate (§4 — pass-through unless at high-water) → pop a free ring
+reservoir gate (§4 — pass-through unless gated; resuming from ANY gate pause
+requires the §4.3 proof precondition to PASS first) → pop a free ring
 buffer (blocking only when the pool is exhausted) → **recompute the record
-count from post-decode state**:
+count from post-classified-completion state** (the prior funnel outcome —
+"decode" here never means the decode THREAD, which lags by reservoir depth
+and plays no part in issue decisions):
 `records = min(read_batch_blocks_effective, remaining_records_in_plan)`
 → call **`BlockSource::read_buffer_handoff`** (which is `read_block_batch`
 — the single READ funnel, timeout class, CDB build, sense decode, position
 arithmetic, tripwire, per-command audit events, diag histograms, **all
 unmodified**) passing the fresh `remaining` (the funnel's own
 `requested.min(remaining_records_in_file)` clamp at `tape_io/mod.rs:1342`
-remains the backstop) → push the typed `Ok(ReadBufferHandoff)` into the
-delivery channel (never blocks, §3.2) → decrement `remaining_records_in_plan`
+remains the backstop) → push the typed `Ok(SequencedHandoff)` (§3.2 — the
+TIO-5b handoff plus ordered proof-frontier metadata) into the delivery
+channel (never blocks, §3.2) → decrement `remaining_records_in_plan`
 by `records_read` → repeat until the plan is exhausted.
 
 - **Plan-bounded read-ahead:** the total records to read are known before
@@ -214,7 +227,11 @@ by `records_read` → repeat until the plan is exhausted.
   partial-batch CDB rebuild. Because the staged READ never reaches the
   kernel early (approach B rejected), **cancellation is control flow and is
   always possible**: see §5.2. Hermetic assertion:
-  `requested_records ≤ remaining_after_decode` on every issue (§10).
+  `requested_records ≤ submitter_remaining` on every issue (§10) —
+  **`submitter_remaining` is the rename of v0.2's `remaining_after_decode`
+  (verify minor):** it is the submitter's own plan cursor after the prior
+  *classified completion*; the decode-thread Σ is a diagnostic derived
+  checksum only (§3.3), never an issue-decision input.
 - **How read-ahead coexists with exactly one command in flight:** the
   submitter thread is *blocked inside* the SG_IO for the duration of each
   command — there is never a second command, staged or otherwise, at the
@@ -258,16 +275,31 @@ channel **carries errors**:
   delivery_capacity_headroom` — the non-blocking-push proof (below) is
   guarded by this assertion, not assumed from config.
 - **Delivery channel:** bounded, capacity = pool size, element type
-  **`Result<ReadBufferHandoff, TapeIoError>`** (panel: error precedence,
-  §5.6). The submitter can hold at most `pool` buffers across in-flight +
-  queued, so its `Ok` push never blocks — asserted per the construction
-  assertion. If the push fails (receiver dropped = consumer died), the
-  submitter stops issuing immediately: **no tape motion for a dead client**,
-  bounded by the one command already in flight.
-- **Ownership handoff:** `ReadBufferHandoff` (TIO-5b's type) moves the
-  buffer by value; `valid_bytes`/`records_read`/terminal flags travel with
-  it. Fail-closed funnel outcomes return `Err` and never surface a buffer —
-  unchanged. The stale-tail property (sentinel-prefill test) is unchanged
+  **`Result<SequencedHandoff, TapeIoError>`** (errors in-band: §5.6; proof
+  frontier in-band: §5.5). The submitter can hold at most `pool` buffers
+  across in-flight + queued, so its `Ok` push never blocks — asserted per
+  the construction assertion. If the push fails (receiver dropped =
+  consumer died), the submitter stops issuing immediately: **no tape motion
+  for a dead client**, bounded by the one command already in flight.
+- **Ownership handoff + proof metadata (verify major — v0.2's release
+  bound was unimplementable with the bare handoff):** the delivery element
+  wraps TIO-5b's type, unchanged, in ordered frontier metadata:
+  `SequencedHandoff { seq: u64, plan_records_end: u64, position_after:
+  TapePosition, evidence: PositionAfter, handoff: ReadBufferHandoff }`.
+  `seq` is strictly monotonic per window; `plan_records_end` = Σ
+  `records_read` through this handoff (the frontier cursor); `evidence`
+  **preserves `ReadBatchOutcome::position_evidence`** —
+  `Device(DevicePositionProof)` when this command carried a device proof
+  (window-open RP, periodic tripwire RP, §4.3 gate-resume RP, §5.5
+  on-demand RP), `Computed` otherwise. Today
+  `ReadBufferHandoff::from_outcome` (model.rs:522) DISCARDS the evidence;
+  `read_buffer_handoff` therefore returns the outcome's evidence + position
+  alongside the handoff so the pipeline can carry them. `ReadBufferHandoff`
+  itself is unchanged — the typed exposure surface (`valid_bytes`
+  truncation, stale-tail property) is untouched. `ReadBufferHandoff` moves
+  the buffer by value; `valid_bytes`/`records_read`/terminal flags travel
+  with it. Fail-closed funnel outcomes return `Err` and never surface a
+  buffer — unchanged. The stale-tail property (sentinel-prefill test) is unchanged
   because the exposure surface — the typed handoff — is unchanged; §4.4
   adds the `bytes_transferred` cross-check because reservoir buffers now
   live far longer across reuse, which *amplifies* stale-tail exposure if a
@@ -317,9 +349,10 @@ state. v0.2:
 - **Decode-side `remaining` is slaved, never recomputed:**
   `remaining = plan_total − Σ handoff.records_read`, decremented only by
   received handoffs. There is exactly one *authoritative* plan cursor (the
-  submitter's); the decode-side counter is a derived checksum of it, and a
-  mismatch at window close (Σ received ≠ Σ issued) is a fail-closed error,
-  not a silent divergence.
+  submitter's `submitter_remaining`, §3.1); the decode-side counter is a
+  derived diagnostic checksum of it — it lags by up to reservoir depth and
+  never feeds an issue decision — and a mismatch at window close
+  (Σ received ≠ Σ issued) is a fail-closed error, not a silent divergence.
 - **Validation parity is a test obligation, not a code-reuse claim:** the
   consumer-side checks that today live in `refill` — the byte/record
   mismatch check, the filemark-before-plan-end fail-closed error,
@@ -435,7 +468,8 @@ concurrently. The diag moves to per-thread busy/idle accounting:
 - The restore_total diag line keeps its fields; `relay_ms` becomes
   sender-busy, and a new `bottleneck=` field names the thread with the
   highest busy fraction. New reservoir gauges: occupancy bytes (live),
-  park/resume cycle count, regime (§4). **A live signal, not just
+  withheld-pending-proof bytes (§5.5, separate gauge), park/resume cycle
+  count, regime + demotion events with cause (§4.2). **A live signal, not just
   session-close accounting (panel minor):** reservoir occupancy + park
   count are readable mid-session from shared diag state and feed the
   Drishti signal (§8).
@@ -470,13 +504,32 @@ byte-budgeted **read reservoir** with configurable **high/low watermarks**
 - **At low-water: resume** — a single reposition + position re-proof
   (§4.3), then full-speed fill again.
 
-**Wear arithmetic (the point):** park/resume cycles per restore ≈
-`restore_bytes ÷ (high − low watermark span)`. The owner's example: a 100 GB
-reservoir against a full 18 TB LTO-9 stream ≈ **180 clean stop-starts** for
-the entire tape — versus continuous shoe-shining for the whole multi-hour
-session without it. Typical clip-pull restores are far smaller than a full
-tape, so typical cycle counts are single digits. The knob is RAM, which is
-cheap and reusable; the thing it buys is head/media life, which is not.
+**Wear arithmetic (the point — CORRECTED, verify major):** park/resume
+cycles per restore ≈ `restore_bytes ÷ effective_span`, where
+`effective_span = (high_pct − low_pct) × effective_reservoir_bytes` — the
+divisor is the watermark DELTA, not the reservoir size (v0.2 divided by the
+full reservoir, understating cycles by 1/0.65 at the 90/25 defaults). The
+owner's example, corrected: a 100 GB reservoir at 90/25 has a 65 GB span ⇒
+≈ **277 clean stop-starts** for a full 18 TB LTO-9 stream — versus
+continuous shoe-shining for the whole multi-hour session without it.
+Typical clip-pull restores are far smaller than a full tape, so typical
+cycle counts are single digits. The knob is RAM, which is cheap and
+reusable; the thing it buys is head/media life, which is not.
+
+**Anti-wear target (NEW — the number the default is derived from):** the
+design target is **≤ 60 park/resume cycles/hour sustained** on the worst
+supported sub-band consumer. Provenance: engineering judgment — roughly one
+clean stop-start per minute, an order-plus below continuous shoe-shine's
+backhitch-every-few-seconds (~10³/hr) — pending vendor mechanism-life data
+and leg-3 qualification; it is a stated, revisable choice, not physics.
+Cycle rate for a sub-band consumer at rate `c` against drive rate `d`:
+`cycles/hr = 3600 ÷ (span/c + span/(d−c))` — drain-while-parked plus
+refill-while-still-draining. Cycle time shrinks as `c` rises (for
+`c < d/2`), so the worst case is a consumer just under the qualified floor.
+The §4.8 default reservoir is DERIVED from this target at the floor;
+per-full-tape totals are reported as an observation, not a second target
+(a full-tape sub-band restore is a pathological workload — §4.8's sizing
+guidance covers it with a bigger reservoir).
 
 **What the reservoir cannot do (unchanged honesty from v0.1):** sustained
 end-to-end throughput is still `min(chain)` — a 110 MB/s consumer gets
@@ -493,28 +546,72 @@ The same reservoir serves both poles of the archive's identity:
 - **In-band consumer (within the drive's speed-matching range, roughly
   ⅓–1× native on HH LTO-9):** **hardware speed-matching first (owner).**
   At high-water the submitter gates *per command* — it issues the next READ
-  as soon as consumption frees space below high-water. Sustained submitter
-  demand therefore converges to the consumer's rate; the drive's own
-  speed-matching steps tape speed down to match, and the drive streams
-  continuously with zero parks. The reservoir hovers at high-water and
-  absorbs band-granularity jitter (the drive's internal buffer absorbs the
-  rest).
+  as soon as consumption frees at least one command credit below high-water
+  (ε, control law below). Sustained submitter
+  demand therefore converges to the consumer's rate; the HYPOTHESIS is that
+  the drive's own speed-matching steps tape speed down to match and streams
+  continuously without repositioning. **That is a hypothesis about the
+  drive, not an invariant this design can promise** — the controller treats
+  IN_BAND as provisional and demotes on observed evidence (control law
+  below); leg 3 proves or disproves it. The reservoir hovers at high-water
+  and absorbs band-granularity jitter (the drive's internal buffer absorbs
+  the rest).
 - **Sub-band consumer (below the drive's lowest speed-matching band):** the
   drive cannot go slow enough; without intervention it backhitches
   continuously. This is the **stop-start batching fallback**: at high-water
   the submitter stops entirely and waits for **low-water** before resuming
   (full hysteresis span), producing the §4.1 park/drain/resume cycle.
 
-**Unified control law:** pause at high-water, resume at a threshold — where
-the resume threshold is `high-water − ε` (in-band: effectively per-command
-gating) or `low-water` (sub-band: full hysteresis). Regime selection: an
-EWMA of consumer drain rate compared against the configured drive floor
-(`read_drive_floor_mib_s`, §4.8), with switch hysteresis (enter sub-band
-below `floor × 0.9` sustained ~10 s; return above `floor × 1.1` sustained
-~10 s) so a consumer hovering at the floor doesn't flap regimes. The floor
-default is conservative (~⅓ native ≈ 100 MiB/s for HH LTO-9); **leg 3
-qualifies the real floor for this drive** and the default is corrected from
-measurement.
+**Unified control law (SPECIFIED — verify major; v0.2 left ε, sampling,
+dwell, and the in-band proof obligation undefined):** pause at high-water,
+resume at a regime-dependent threshold. Every parameter is named so the
+controller is implementable without invention:
+
+- **States:** `STREAMING` (consumer ≥ drive rate; watermarks never trip),
+  `IN_BAND` (per-command gating — always PROVISIONAL), `SUB_BAND`
+  (full-hysteresis stop-start batching, §4.1).
+- **Resume thresholds and ε:** IN_BAND resumes at `high_water − ε` with
+  **ε = one full command credit = `effective_read_batch_blocks ×
+  block_size`** (1 MiB today) — never less, so one consumption step always
+  admits at least one whole command without immediately re-tripping the
+  gate. SUB_BAND resumes at `low_water` (full span). **Overshoot bound,
+  stated:** the gate is checked before issue and exactly one command is
+  ever in flight, so occupancy exceeds high-water by at most one command's
+  bytes — asserted in the hermetic rows (§10).
+- **Rate estimator:** consumer drain rate is an EWMA over fixed
+  **Δ = 500 ms sampling periods** (bytes consumed per period), time
+  constant **τ = 10 s** (α = 1 − e^(−Δ/τ) ≈ 0.049), evaluated once per
+  period. The EWMA is a demand proxy ONLY — it cannot see drive-buffer
+  state, tape speed bands, backhitches, or whether the drive has already
+  parked; that blindness is exactly why IN_BAND is provisional.
+- **Regime selection, hysteresis, dwell:** enter SUB_BAND when EWMA <
+  `floor × 0.9` sustained 10 s; promote SUB_BAND → IN_BAND when EWMA >
+  `floor × 1.1` sustained 10 s **and** a **minimum regime dwell of 30 s**
+  since the last transition has elapsed (a bursty consumer straddling the
+  thresholds gets batching, not thrash). Demotions in the safety/wear
+  direction (→ SUB_BAND) are exempt from dwell — they act immediately.
+- **Negative feedback — the demotion rule (in-band is proven by the
+  drive, not assumed):** any evidence of a park/backhitch while under
+  IN_BAND control demotes to SUB_BAND immediately, for the remainder of
+  the window (diag notes the demotion + cause; re-promotion is not
+  attempted intra-window). Evidence sources, cheapest first: (a) a READ
+  ioctl completing over **`park_detect_ioctl_ms` = 1 s** under IN_BAND
+  gating — a drive that had to relocate answers in seconds, not
+  milliseconds; (b) LOG SENSE repositioning-counter deltas, polled by the
+  submitter between commands (~60 s cadence under IN_BAND; ~ms cost, same
+  thread, never concurrent with a data command) and at every park and
+  session close. Leg 3 refines both detector thresholds.
+- **What is promised vs measured:** SUB_BAND's park/resume arithmetic
+  (§4.1) is the design's wear guarantee. IN_BAND
+  streaming-without-repositioning is a measured outcome — v0.2's "zero
+  parks" claim is DELETED; leg 3 proves it or the negative feedback
+  converges every sub-native consumer to clean batching, and "never
+  continuous shoe-shine" survives on that mechanism alone.
+
+Regime selection compares the EWMA against the configured drive floor
+(`read_drive_floor_mib_s`, §4.8). The floor default is conservative
+(~⅓ native ≈ 100 MiB/s for HH LTO-9); **leg 3 qualifies the real floor for
+this drive** and the default is corrected from measurement.
 
 ### 4.3 SAFETY: park and resume never weaken position trust
 
@@ -525,16 +622,39 @@ measurement.
   reads are plan-bounded within one tape file; a FILEMARK outcome mid-plan
   is already a fail-closed error (§5.1) and ends the window — there is no
   state in which the submitter parks with an unresolved boundary.
-- **Position is RE-PROVEN on resume.** After any pause in which the drive
-  may have parked/repositioned (rule: any submitter pause — gate or
-  free-wait — longer than `T_reproof`, a constant, default 250 ms), the
-  first action on resume is an explicit **READ POSITION**, verified against
-  the expected cursor via the existing `DevicePositionProof` machinery,
-  BEFORE the next READ is issued. Mismatch ⇒ `mark_position_unknown()` +
-  poison — identical to the tripwire path. An RP costs ~1 ms against a
-  multi-second reposition, so the conservative trigger is essentially free.
-  The 1 GiB drift tripwire continues unchanged on top of this; park re-proof
-  is additional, not a replacement.
+- **Position is RE-PROVEN on resume — no duration proxy for deliberate
+  pauses (verify major: v0.2's 250 ms threshold was an unqualified parking
+  proxy; nothing establishes this drive cannot reposition inside a shorter
+  pause).** Two pause classes, two rules:
+  - **Deliberate gate pauses** — every pause the controller itself creates
+    (SUB_BAND watermark park AND IN_BAND per-command gating), **regardless
+    of duration**: the first command on resume is an explicit
+    **READ POSITION**, verified against the expected cursor via the
+    existing `DevicePositionProof` machinery, and **the passing proof is
+    an explicit precondition for the next READ** — encoded as submitter
+    states `GATED → RESUMING(rp-pending) → FILLING`, where FILLING is
+    reachable only through a passing proof. Cost honesty: under IN_BAND
+    this is one ~1 ms RP per command, but under IN_BAND the submitter is
+    by definition not the bottleneck (it paces down to the consumer's
+    rate), so the RP hides inside the gate pause and costs zero
+    end-to-end; it also upgrades every IN_BAND handoff to `Device` proof
+    evidence, which tightens the §5.5 release frontier for free. Under
+    SUB_BAND, one RP per park/resume cycle is noise against a
+    multi-second reposition.
+  - **Incidental waits** (free-channel wait with the gate open — decode
+    slow returning buffers): re-proof before the next READ when the wait
+    exceeded **`T_REPROOF_INCIDENTAL` = 250 ms — a named, non-configurable
+    code constant** (not a config key; §4.8 records that explicitly).
+    This one IS a heuristic and is labeled so: leg 3 measures the drive's
+    minimum observed park latency, and if the drive can stop in under
+    250 ms the constant is dropped in favor of conservative
+    always-re-proof. Incidental waits under healthy streaming are
+    microseconds; the constant exists only to keep the hot path free of
+    per-command RPs where no real pause happened.
+
+  Mismatch ⇒ `mark_position_unknown()` + poison — identical to the
+  tripwire path. The 1 GiB drift tripwire continues unchanged on top of
+  this; park re-proof is additional, not a replacement.
 - The drive's own reposition on resume is the drive's business (it re-ramps
   and relocates to where its buffer left off); rem's obligation is exactly
   the re-proof above — trust nothing across a park that has not been proven.
@@ -543,7 +663,8 @@ measurement.
 
 Reservoir entry *is* the typed handoff push — there is no other door:
 
-- A buffer enters the reservoir only inside an `Ok(ReadBufferHandoff)` whose
+- A buffer enters the reservoir only inside an `Ok(SequencedHandoff)`
+  wrapping a `ReadBufferHandoff` whose
   `valid_bytes`/`records_read` came from the funnel's sense decode.
   Fail-closed outcomes never surface a buffer (TIO-5b, unchanged).
 - **NEW — `bytes_transferred` cross-check (panel, convergent, funnel
@@ -556,10 +677,64 @@ Reservoir entry *is* the typed handoff push — there is no other door:
   case. v0.2 requires, on every residual-derived success path:
   `records_read × block_size ≤ bytes_transferred`, **fail-closed
   (completion-unknown) on disagreement**, with a hermetic test. This lands
-  **inside the one funnel** (`read_block_batch`) as a prerequisite hardening
-  commit that benefits every caller — it is a shared-funnel safety fix, not
-  a pipeline fork (the write path gets the symmetric check in the same
-  commit).
+  **inside the one READ funnel** (`read_block_batch`) as a prerequisite
+  hardening commit that benefits every read caller — a shared-funnel safety
+  fix, not a pipeline fork.
+- **Write-side scope, ENUMERATED (verify major — v0.2's "the write path
+  gets the symmetric check in the same commit" glossed a false premise:
+  reads and writes do NOT share a funnel, and there are TWO write entry
+  points with different recovered/EOM arbitration — `write_block_batch`
+  (mod.rs:958) and `write_block_batch_pipelined` (mod.rs:1119)).** The
+  cross-direction hardening is a **shared pure HELPER** called from
+  enumerated sites, never a claim of shared control flow:
+  - **Helper:** `validate_residual_claim(records_claimed, block_size,
+    bytes_transferred) → Result<(), CompletionUnknown>` — fails iff
+    `records_claimed × block_size > bytes_transferred`. One-sided (`≤`)
+    by design; see transport semantics below for why.
+  - **`read_block_batch` sites:** the FILEMARK+residual path
+    (mod.rs:1422) and the recovered-no-terminal path (mod.rs:1451) — the
+    checks stay in the read funnel as specified above.
+  - **`write_block_batch` sites:** (1) the recovered-no-terminal-flags
+    full-batch path (mod.rs:1060) — claim = full `records`; (2) the
+    residual-derived partial-completion fall-through (mod.rs:1079) —
+    claim = `records_written` from sense INFORMATION. **NOT the EOM/EW
+    path (mod.rs:1021):** there `records_written` comes from the
+    post-event READ POSITION delta (`records_delta_between`) —
+    device-position arbitration remains the SOLE authority on that path;
+    a `bytes_transferred` disagreement there is recorded as diag only and
+    never overrides the device position.
+  - **`write_block_batch_pipelined` sites:** (1) the
+    recovered-no-terminal path (mod.rs:1271) — claim = full `records`;
+    (2) the non-EOM fall-through that populates
+    `PartialBatchUncommittable.written_records` from the residual
+    (mod.rs:1294) — on helper failure the error DEGRADES to
+    `completion_unknown_check_condition` rather than asserting a specific
+    written count. The EOM/EW path (mod.rs:1214; delta at
+    mod.rs:1239–1245) keeps device-position arbitration untouched, helper
+    diag-only — same rule as the ordinary funnel. (The `unwrap_or(0)`
+    reporting count inside `WriteFailureWithPositionError`
+    (mod.rs:1221–1224) is error-payload reporting on a path already
+    failing for position reasons — out of scope, noted.)
+  - **Transport `bytes_transferred` semantics (verified, not assumed):**
+    the sg transport computes `bytes_transferred = dxfer_len − resid`,
+    **clamped to 0 when resid is out of range**
+    (`remanence-scsi/src/sg_io.rs:249`), identically for data-in and
+    data-out. Consequences: (a) a garbage resid clamps to 0, so any
+    nonzero claim fails ⇒ completion-unknown — conservative and correct,
+    test row; (b) data-out residual reporting is HBA/driver-dependent —
+    a stack that never reports data-out resid yields `bytes_transferred =
+    dxfer_len`, making the write-side check **vacuously satisfied (safe:
+    it can never spuriously fail) but not protective on that stack**.
+    Implementation obligation: hermetic model-transport rows in both
+    directions, plus a leg-0 probe recording whether the E208e/mpt3sas
+    path reports nonzero data-out resid on a forced partial; if it does
+    not, the write-side check is documented as vacuous on this stack and
+    still lands (it protects stacks that do report).
+  - **Parity tests (§10):** identical sense fixtures driven through BOTH
+    write entry points must produce identical helper accept/degrade
+    decisions, and the existing EOM/EW arbitration tests must pass
+    byte-identically — the proof that the helper changed no landed write
+    behavior.
 - **NEW — impossible-residual fail-closed (panel SCSI-M4, st O7):** a
   RECOVERED ERROR with **no** terminal flag but a VALID nonzero residual is
   physically incoherent for fixed-mode reads — trusting it as a short read
@@ -588,10 +763,30 @@ Owner decision resolves it:
   drops the tonic response future → the read-stream receiver drops → R1's
   landed receiver-drop watchdog already converts a blocked sender into an
   immediate `BrokenPipe`. For half-open TCP (client power loss, no FIN),
-  the daemon enables **HTTP/2 keepalive PING** (`http2_keepalive_interval` +
-  `http2_keepalive_timeout`, values in `reference-configuration.md`) so the
-  connection — and with it the stream, the receiver, and the session — dies
-  within interval+timeout regardless of send-stall state.
+  the daemon enables **HTTP/2 keepalive PING with CONCRETE settings
+  (verify major: v0.2 pointed at `reference-configuration.md`, which today
+  records only the 4 MiB h2 windows — no keepalive exists anywhere yet;
+  the R2 commit adds these as compiled transport defaults alongside the
+  windows, in code and in that doc):**
+  - **Server (tonic builder, both listeners):**
+    `http2_keepalive_interval = 30 s`, `http2_keepalive_timeout = 20 s` —
+    on the TCP/mTLS listener where half-open is real, and identically on
+    the Unix socket for uniformity (peer death there is kernel-reported
+    anyway; the PING is harmless).
+  - **Client (sutra-agent deliverable, §11.3):**
+    `http2_keep_alive_interval = 30 s`, `keep_alive_timeout = 20 s`,
+    `keep_alive_while_idle = true` on the `Endpoint`.
+  - **PING runs while idle/stalled — required, not assumed:** PING is a
+    connection-level frame and must fire while streams are idle or
+    send-stalled (a parked reservoir behind a stalled sender is exactly
+    the guarded state). This property is asserted against the pinned
+    tonic/hyper version at implementation time, and the required test is
+    the **half-open-while-parked row** (§10): traffic dropped without FIN
+    while the drive is parked ⇒ connection, stream, receiver, and session
+    all tear down within ≈ interval + timeout (≤ ~50 s; test bound 2×),
+    the poison drain runs, and the drive never moves. Detection is thereby
+    bounded independent of send progress — which is what makes the
+    slow-but-alive park-indefinitely owner decision coherent.
 - **R1's 30 s per-chunk `send_with_timeout` deadline is RE-SCOPED in R2:**
   it stops being a client-kill policy and becomes a diagnostic tick — on
   expiry the sender records the stall (Drishti signal, §8) and re-arms; it
@@ -607,36 +802,65 @@ Owner decision resolves it:
   parked-forever sessions are a real operational problem, that is a future
   policy design with its own review.
 
-### 4.6 RAM guardrails — never OOM, never swap
+### 4.6 RAM guardrails — fixed ceiling, atomic reservation (verify major: rewritten)
 
-- **Budgeted, not aspirational:** effective reservoir size at window open =
-  `min(read_reservoir_bytes, MemAvailable − os_headroom, memlock allowance)`
-  — reusing the TIO-5b budget-accounting pattern (the
-  `daemon.spool_tmpfs_ram_budget` semaphore machinery in
-  `remanence-api/src/lib.rs`, generalized: append spool reservations and
-  read reservoir reservations draw from **one shared daemon I/O RAM
-  ceiling**, so restore + concurrent append can never jointly blow the
-  box). Clamp-and-warn (loud, in the window-open log line and diag) when
-  the configured size exceeds what is safely available; **refuse to start
-  the window** only when even the minimum pool (`staging_ring_buffers`
-  buffers) cannot be allocated.
-- **Incremental allocation with re-check:** reservoir slabs are allocated
-  on demand during fill (checked allocation, page-aligned), and
-  `MemAvailable` is re-consulted at growth steps — if headroom would be
-  violated, growth stops and the current size becomes the effective cap
-  (warn once). Never a single up-front multi-GB allocation spike.
-- **Resident, non-swappable:** slabs are `mlock`ed as allocated. A swapped
-  reservoir defeats its purpose (drain-rate collapse at exactly the wrong
-  moment) — the deployment requirement is `LimitMEMLOCK` on the daemon
-  unit (documented in `reference-configuration.md`). If `mlock` fails, the
-  reservoir clamps to the minimum pool with a loud warning — a big
-  swappable reservoir is worse than a small locked one.
+v0.2's rules could not deliver their own heading: `MemAvailable` is a
+transient observation, not a reservation (two streams can both pass the
+same check and jointly overshoot); the shared ceiling was named but never
+defined; and "mlock fails ⇒ clamp to minimum pool" contradicted "resident,
+non-swappable". Replaced wholesale:
+
+- **One FIXED daemon I/O-memory ceiling.** A new config key,
+  `daemon.io_memory_ceiling` (byte size, validated > 0; §4.8), is the
+  fixed total for ALL pipeline I/O memory: append-spool reservations
+  (`spool_tmpfs_ram_budget` generalizes INTO this ceiling — validation:
+  spool budget ≤ ceiling) plus every drive's read reservoir. Deployment
+  requirement, documented in `reference-configuration.md`: the daemon unit
+  runs under a cgroup memory limit (systemd `MemoryMax`) with
+  `io_memory_ceiling + daemon baseline headroom ≤ MemoryMax` (guidance:
+  leave ≥ 2 GiB), plus `LimitMEMLOCK` sized ≥ the ceiling.
+  `MemAvailable` and `RLIMIT_MEMLOCK` are consulted ONCE at startup as
+  loud sanity warnings (ceiling exceeds available RAM or the memlock
+  allowance ⇒ warn, naming the limit); they are never runtime authority —
+  the ceiling is the authority, the cgroup limit is the enforcement
+  backstop.
+- **Atomic reservation manager, permits before allocation.** One
+  `IoMemoryReservation` manager (generalizing the TIO-5b
+  `spool_tmpfs_ram_budget` semaphore machinery in
+  `remanence-api/src/lib.rs`) owns the ceiling. Order, per slab:
+  **reserve locked-byte permit → allocate (checked, page-aligned) →
+  `mlock`** — failure at ANY step rolls the permit back before the error
+  propagates (RAII permits). The manager's invariant — Σ outstanding
+  permits ≤ ceiling — is asserted and RACED in tests: two streams plus
+  the spool growing concurrently against a near-exhausted ceiling, granted
+  permits never exceeding it (the concurrent-growth race row, §10 — not
+  merely second-stream startup).
+- **Minimum pool locks or the window REFUSES.** A window opens only if its
+  minimum pool (`staging_ring_buffers` buffers) can be reserved,
+  allocated, AND mlocked. If minimum mlock fails, the window refuses to
+  start with an error naming `LimitMEMLOCK`. There is NO swappable
+  fallback ring — v0.2's clamp silently shipped swappable memory under a
+  "never swap" banner; the honest choices were refuse or explicitly
+  permit a swappable legacy minimum, and this design REFUSES (fail-closed
+  culture; the fix is the unit file, not a degraded mode). The claims are
+  now scoped honestly: **every reservoir/spool slab byte in a running
+  window is mlocked** (never-swap holds for what the daemon owns), and
+  **the daemon's I/O memory can never exceed the fixed ceiling under its
+  cgroup limit** (never-OOM is a statement about this daemon's
+  reservations; other processes on the box are the cgroup's job, not a
+  promise this design can make).
+- **Incremental growth, same funnel:** reservoir slabs are allocated on
+  demand during fill through the same reserve→alloc→mlock sequence; a
+  growth-step failure (permit denied or mlock refused) is non-fatal —
+  growth stops, the current size becomes the effective cap, warned once
+  in the window log line and diag; the window continues on its already-
+  locked bytes. Never a single up-front multi-GB allocation spike.
 - **Per-drive, per-stream:** each concurrent restore stream owns its own
-  reservoir; dual-drive concurrent restore = 2× reservation, both drawn
-  from the shared ceiling — integrating the TIO-5 dual-drive RAM budget
-  question rather than duplicating it. If the second stream cannot reserve
-  its configured size, it clamps-and-warns down to what the ceiling allows
-  (never below the minimum pool).
+  reservoir; dual-drive concurrent restore = two reservations from the one
+  ceiling — integrating the TIO-5 dual-drive RAM budget question rather
+  than duplicating it. A second stream that cannot reserve its configured
+  size clamps-and-warns down to what the ceiling allows — never below the
+  mlocked minimum pool (below that: refuse, as above).
 
 ### 4.7 Volatile-is-safe
 
@@ -650,23 +874,49 @@ rejected. Crash rows in §9.
 ### 4.8 Config keys (documented in `reference-configuration.md`)
 
 ```toml
+[daemon]
+io_memory_ceiling            = "24GiB"  # NEW (§4.6): FIXED ceiling, spool + all reservoirs
+
 [tape_io]
-staging_ring_buffers        = 4        # existing; now the reservoir's MINIMUM pool
-read_batch_blocks           = 16       # existing, unchanged semantics
-read_reservoir_bytes        = "4GiB"   # NEW: reservoir cap per restore stream
-read_reservoir_high_pct     = 90       # NEW: stop-issuing threshold (% of effective cap)
-read_reservoir_low_pct      = 25       # NEW: sub-band resume threshold (% of effective cap)
-read_drive_floor_mib_s      = 100      # NEW: lowest speed-matching band (leg-3 qualified)
+staging_ring_buffers         = 4        # existing; now the reservoir's MINIMUM pool
+read_batch_blocks            = 16       # existing, unchanged semantics
+read_reservoir_bytes         = "8GiB"   # NEW: per restore stream — DERIVED default, below
+read_reservoir_high_pct      = 90       # NEW: stop-issuing threshold (% of effective cap)
+read_reservoir_low_pct       = 25       # NEW: sub-band resume threshold (% of effective cap)
+read_drive_floor_mib_s       = 100      # NEW: lowest speed-matching band (leg-3 qualified)
+position_check_bytes_ranged  = "256MiB" # NEW (§5.5): proof cadence, hash-less windows
 ```
+
+`T_REPROOF_INCIDENTAL` (250 ms, §4.3) and `park_detect_ioctl_ms` (1 s,
+§4.2) are deliberately NOT config keys — named code constants (verify
+minor: v0.2 called `T_reproof` a "default" while listing no key). The
+former no longer touches deliberate-park decisions at all (§4.3).
 
 Validation, fail-closed at config load: `0 < low_pct < high_pct ≤ 100`
 (degenerate `high ≤ low` REJECTED, per owner), `read_reservoir_bytes ≥`
-minimum pool bytes, `read_drive_floor_mib_s > 0`. Sizing guidance in the
-reference doc: parks-per-restore ≈ restore_bytes ÷ hysteresis span; the
-4 GiB default is deliberately modest (RAM safety on small hosts) — restore-
-heavy deployments with slow consumers SHOULD raise it (the owner's 100 GB
-example yields ≈180 parks per full 18 TB tape); the Drishti reposition-rate
-signal (§8) is the tell that a deployment needs a bigger reservoir.
+minimum pool bytes, `read_drive_floor_mib_s > 0`,
+`spool_tmpfs_ram_budget ≤ io_memory_ceiling`, per-stream reservoir ≤
+ceiling; the effective ranged proof cadence is clamped to
+`min(position_check_bytes_ranged, effective_reservoir_bytes / 2)` (§5.5).
+
+**The 8 GiB default is DERIVED, not chosen by feel (verify major):** from
+the §4.1 anti-wear target (≤ 60 cycles/hr) at the worst sub-band consumer
+— just under the ~100–110 MiB/s floor — against a ~300 MB/s drive:
+`span ≥ 60 s ÷ (1/110 + 1/190) ≈ 4.1 GiB`, and span = 65% of the reservoir
+at 90/25 ⇒ reservoir ≥ ~6.3 GiB, rounded up to **8 GiB** (span 5.2 GiB ⇒
+~47 cycles/hr worst-case; slower consumers cycle LESS often). Re-derived
+if leg 3 moves the floor or the drive-rate anchor. Sizing guidance in the
+reference doc: parks-per-restore ≈ restore_bytes ÷ effective span
+(= `(high−low)% × reservoir`); the owner's 100 GB example yields ≈ 277
+parks per full 18 TB tape at ~6/hr-class cycle rates. **4 GiB is an
+experimental MINIMUM for small-RAM hosts, not a sane anti-wear default**
+(v0.2 mislabeled it): at 90/25 its 2.6 GiB span drains in ~24 s at
+110 MiB/s ⇒ ~150 cycles/hr and ~7,100 cycles across a full 18 TiB restore
+— far above the target; the config comment and reference doc must say so.
+Restore-heavy deployments with slow consumers SHOULD raise the reservoir
+(100 GB-class for full-tape sub-band workloads); the Drishti
+reposition-rate signal (§8) is the tell that a deployment needs a bigger
+reservoir.
 
 ## 5. Safety composition — one funnel, wrapped, never duplicated
 
@@ -674,10 +924,16 @@ The submitter calls `read_buffer_handoff` → `read_block_batch` —
 **unmodified by the pipeline**. Every TIO-5b behavior holds because the code
 that implements it is the code that runs. Two clarifications sharpen this
 from v0.1: (a) per-command audit events are RETAINED (§3.6) — the funnel is
-not forked for coalescing; (b) the §4.4 hardening items
+not forked for coalescing; (b) the §4.4 read-hardening items
 (`bytes_transferred` cross-check, impossible-residual, 29/07) land **inside
-the shared funnel** as a prerequisite commit for all callers — a safety fix
-to the one funnel is not a fork of it. What pipelining adds is *what the
+the one READ funnel** as a prerequisite commit for every read caller — a
+safety fix to the funnel is not a fork of it. **"One funnel" is a
+PER-DIRECTION statement (verify major):** reads have exactly one
+(`read_block_batch`); the write side has TWO entry points with their own
+recovered/EOM arbitration (`write_block_batch`,
+`write_block_batch_pipelined`), and the write-facing hardening is the
+enumerated shared HELPER of §4.4 — never a claim that writes ride this
+funnel. What pipelining adds is *what the
 submitter does with each classified outcome*:
 
 ### 5.1 Outcome table
@@ -702,7 +958,8 @@ because the *prior* command's outcome (residual, filemark, ILI, error)
 invalidates its parameters. Design (tightened per panel concurrency #1):
 
 - `StagedRead` carries the **buffer only**. The record count is recomputed
-  as `min(batch, remaining_records_in_plan)` from post-decode state before
+  as `min(batch, remaining_records_in_plan)` from post-classified-completion
+  state before
   **every** issue — full-count outcomes included. There is no "armed intent
   survives as-is" fast path (v0.1 wording deleted): carrying a count across
   the plan tail requests `batch` where `remaining < batch`, and while the
@@ -712,15 +969,15 @@ invalidates its parameters. Design (tightened per panel concurrency #1):
 - **Invalidation rule:** any funnel return where
   `records_read != records_requested` **or** any terminal flag is set
   **or** `Err` ⇒ the staged buffer is discarded/recycled *before* any issue,
-  and `remaining_records_in_plan` / clamp are recomputed from post-decode
-  state (`records_read`, cursor validity).
+  and `remaining_records_in_plan` / clamp are recomputed from
+  post-classified-completion state (`records_read`, cursor validity).
 - Because approach B was rejected, the staged READ exists only as host
   memory: cancellation cannot fail, cannot race the transport, and needs no
   kernel cooperation. This is TIO-5b's staged-CDB-cancel machinery promoted
   from a single-refill property to a loop invariant, with hermetic
   assertions (§10): **no READ CDB is ever issued whose record count exceeds
-  the post-decode remaining plan — under every outcome in the matrix,
-  including all-GOOD tails.**
+  `submitter_remaining` (the post-classified-completion plan cursor, §3.1)
+  — under every outcome in the matrix, including all-GOOD tails.**
 
 ### 5.3 New failure surfaces introduced by pipelining (owned honestly)
 
@@ -761,52 +1018,107 @@ narrow trait exists rather than pretending required trait members away.
 Ranged reads do their SPACE (filemarks + blocks) before the window opens,
 on the actor thread, as today.
 
-### 5.5 Ranged reads — same transport, bounded deliver-ahead (panel convergent)
+### 5.5 Ranged reads — same transport, proof-frontier release (verify major: mechanized)
 
 v0.1 left `read_plaintext_file_range` as a second, synchronous consumer with
 **no integrity check at all** (no hash; only the 1 GiB arithmetic tripwire
 bounds how far an undetected position error could stream) — and read-ahead
-would have *widened* that window to reservoir scale. v0.2:
+would have *widened* that window to reservoir scale. v0.2 unified the
+transport but specified a release bound the delivered types could not
+implement: `ReadBufferHandoff` discards
+`ReadBatchOutcome::position_evidence` (model.rs:522), so the decoder had no
+way to know where the proven cursor was, and the withheld bytes were
+neither stored nor charged anywhere. v0.3 mechanizes it end to end. The
+owner position stands: this is integrity-first — ranged reads get the FULL
+mechanism, no exemption.
 
-- **Transport unified:** ranged reads ride the same
+- **Transport unified (held from v0.2):** ranged reads ride the same
   submitter/reservoir/decode/sender pipeline (`HandoffBlockSource` + range
   framing in the decode layer). The one-path claim is true again; the
   second synchronous consumer is deleted.
-- **Integrity, honestly bounded:** the RAO in-band manifest (§3.4) carries
-  whole-file checksums; a byte-range has no per-range digest today, so
-  ranged reads remain hash-less at the payload level. For hash-less reads
-  the pipeline **bounds deliver-ahead past unproven position**: bytes are
-  released to the sender only up to the last device-proven cursor (proof =
-  window-open RP, periodic tripwire RP, park-resume RP), and the proof
-  cadence for ranged windows is tightened (RP every
-  `position_check_bytes_ranged`, default 256 MiB — vs 1 GiB — chosen so the
-  proof cost stays noise while the unproven-delivery window shrinks 4×).
-  Records between the proven cursor and the read cursor sit in the
-  reservoir, undelivered, until the next proof lands. Full-object reads are
-  exempt from the release bound — their end-to-end manifest hash catches
-  wrong-position data with certainty at delivery.
+- **Proof frontier, carried in-band:** every delivery is a
+  `SequencedHandoff` (§3.2) — strictly monotonic `seq`,
+  `plan_records_end`, and the preserved `PositionAfter` evidence. The
+  decode thread maintains **`proven_frontier`** = the greatest
+  `plan_records_end` among handoffs received **in seq order** whose
+  evidence is `Device(DevicePositionProof)` (window-open RP, periodic
+  tripwire RP, §4.3 gate-resume RP — per-command under IN_BAND — or the
+  on-demand RP below). A passing device proof after command N proves the
+  position after command N and therefore every earlier in-order handoff
+  too: the frontier jumps to N.
+- **Release rule (hash-less windows):** bytes are released to the sender
+  only up to `proven_frontier`. Handoffs beyond it are **withheld**,
+  in seq order, in a bounded pending-proof queue on the decode side.
+- **Withheld bytes are stored IN the reservoir and charged AS the
+  reservoir:** pending-proof handoffs hold reservoir slabs that are, by
+  definition, filled-and-not-yet-consumed — they stay inside the
+  reservoir's §4.6 reservation (no second allocation, no separate budget)
+  and **count toward watermark occupancy**, so a lagging frontier
+  throttles the submitter through the ordinary gate. Bound: withheld
+  bytes ≤ effective proof cadence + one handoff, and the cadence is
+  CLAMPED to `min(position_check_bytes_ranged,
+  effective_reservoir_bytes / 2)` (default 256 MiB — vs the 1 GiB
+  tripwire, a 4× tighter unproven window at noise-level RP cost) so
+  withholding can never consume the whole reservoir.
+- **Proof-on-demand — no park deadlock, by construction:** if withheld
+  bytes exist and the submitter is about to park (or is gated while the
+  frontier trails the read cursor and no data READ is issuable), the
+  submitter issues a standalone READ POSITION before parking. A passing
+  proof covers everything issued so far ⇒ frontier = read cursor ⇒ the
+  withheld queue drains. Without this rule, a reservoir full of unproven
+  handoffs would park the submitter and no future proof could ever
+  arrive — a deadlock the v0.2 text silently permitted.
+- **Proof failure with buffered output (test row, §10):** RP mismatch ⇒
+  `mark_position_unknown()` + poison, and every withheld handoff is
+  DISCARDED — never delivered. That is the entire point of withholding:
+  bytes already released were covered by an earlier passing proof; bytes
+  in doubt die in the reservoir.
+- **Full-object reads:** exempt from the release rule — their end-to-end
+  manifest hash (§3.4) catches wrong-position data with certainty at
+  delivery. The `SequencedHandoff` metadata still flows (ONE delivery
+  protocol, no variant types); the decode layer simply does not apply the
+  bound.
 - **Upgrade path, named:** if/when the RAO format grows per-chunk digests,
   the decode layer verifies ranges directly and the release bound retires.
   Format question, tracked in §12, not R2 scope.
 
-### 5.6 Error precedence across three threads (panel convergent)
+### 5.6 Error precedence across three threads (verify major: mechanism replaced)
 
 Without a rule, a submitter-side SCSI error surfaces to the client as a
 derived "channel closed" from whichever thread noticed last — gutting
-attributability. The rule:
+attributability. v0.2 stated the right precedence but proposed a once-cell
+— first-writer-wins, which CANNOT enforce a priority order (a sender
+failure that fills the cell beats the later-arriving SCSI root). v0.3:
 
-- The delivery channel carries `Result<ReadBufferHandoff, TapeIoError>`
+- The delivery channel carries `Result<SequencedHandoff, TapeIoError>`
   (§3.2); the submitter's classified root error travels **in-band, exactly
   once**.
-- **Precedence: submitter root error > decode-derived error > sender/
-  transport error** — except a genuine client disconnect (h2/TCP-proven,
-  §4.5), which short-circuits as its own terminal cause (there is no client
-  to attribute to).
-- **Single emitter:** the sender thread is the sole writer of the terminal
-  gRPC status; decode folds any in-band `Err` it receives into its
-  downstream channel unchanged; concurrent poison sources (submitter error
-  + decode panic + sender stall racing) resolve to the highest-precedence
-  cause via a once-cell terminal slot, asserted in tests (§10).
+- **Precedence: P0 submitter-classified funnel/SCSI root > P1
+  decode-derived (validation / format / frontier) > P2 sender/transport**
+  — and a genuine client disconnect (h2/TCP-proven, §4.5) is a separate
+  short-circuit CAUSE, not a rank (there is no client to attribute to).
+- **Mechanism: a REPLACEABLE priority-ranked terminal accumulator** — a
+  shared slot where a write replaces the held cause iff strictly
+  higher-priority; equal/lower-priority late arrivals are dropped (first
+  of a rank wins within the rank). Deliberate stop-on-consumer-death is
+  NOT a cause: the submitter records P0 only for classified funnel
+  errors; noticing a dead consumer records nothing (otherwise a sender
+  death would launder itself into a submitter-rank cause).
+- **Finalization barrier — no terminal status until no higher-priority
+  cause can still arrive:** producers follow a **record-then-close
+  discipline** — each thread records its terminal cause into the
+  accumulator BEFORE closing/dropping its downstream channel. Channel
+  closes propagate submitter → decode → sender, so when a downstream
+  stage sees close, every upstream cause is already recorded. The window
+  teardown then **joins all three threads — the joins ARE the barrier
+  proof — and emits the terminal gRPC status exactly once** from the
+  accumulator. No thread fabricates a terminal status from its local
+  view; nothing is emitted while any upstream producer is live.
+- **Disconnect short-circuit:** on proven client death the full teardown
+  still runs (poison, drain, joins, pool accounting) but status emission
+  is skipped — no peer. Asserted in tests alongside the race rows (§10):
+  submitter SCSI error racing a decode panic racing a sender stall ⇒ the
+  client status carries the SCSI root **even when it is recorded last**.
 
 ## 6. The 13.28 MB/s pathology — hypothesis ladder (R1 LANDED)
 
@@ -896,7 +1208,8 @@ covers the real workload shape.
 - **1GbE client:** ~105–110 MB/s, network-bound. **Deployment note, not a
   defect and not a reason to skip R2 (owner):** the drive-side behavior is
   now §4's — in-band speed-matching if ≥ the drive floor, clean park/resume
-  batching if below; never continuous shoe-shine.
+  batching if below; never continuous shoe-shine (the "never" is enforced
+  by §4.2's demote-on-evidence fallback, not by the in-band hypothesis).
 - **What this design does NOT claim:** that 300 MB/s end-to-end is reachable
   on any path whose slowest link is below 300; that the 13.28 number is
   explained until leg 0 measures the landed R1 in the field; that
@@ -911,9 +1224,10 @@ funnel, restore_total decomposition line) — full spec in §3.6; summary:
 - Submitter: `free_wait_us`, `park_us`, derived `feed_gap_us` (= gap −
   deliberate waits; the acceptance signal), window intent marker at window
   open. **Per-command audit events retained; no coalescing (§3.6).**
-- Reservoir: live occupancy gauge, park/resume cycle counter, current
-  regime (streaming / speed-matched / parked), effective reservoir bytes +
-  clamp reason at window open.
+- Reservoir: live occupancy gauge, withheld-pending-proof gauge (§5.5),
+  park/resume cycle counter, current regime (STREAMING / IN_BAND-provisional
+  / SUB_BAND) + demotion events with cause (§4.2 negative feedback),
+  effective reservoir bytes + clamp reason at window open.
 - Decode: busy vs recv-wait. Sender: busy vs stall (`sender_stall_ms`,
   landed) — now a re-arming diagnostic tick, not a kill (§4.5).
 - restore_total: `bottleneck=` (max busy fraction); `relay_ms` becomes
@@ -944,24 +1258,29 @@ funnel, restore_total decomposition line) — full spec in §3.6; summary:
    byte-identical claim holds only on the all-GOOD path — residual/
    recovered/filemark outcomes make subsequent counts runtime-derived by
    design; those paths are covered by the §5.2 assertions instead
-   (`requested ≤ remaining_after_decode`), not by fixture identity.
-3. **One funnel:** every READ goes through `read_block_batch` via
-   `read_buffer_handoff`; no parallel decode, no submitter-side sense
-   interpretation, **no audit-motivated fork (§3.6)**. Funnel-hardening
-   commits (§4.4) modify the one funnel for all callers. (Codex
-   additive-bias rule: wrap, don't copy — this is the single-safety-funnel
-   statement for the prompt set.)
+   (`requested ≤ submitter_remaining`), not by fixture identity.
+3. **One funnel per direction:** every READ goes through `read_block_batch`
+   via `read_buffer_handoff`; no parallel decode, no submitter-side sense
+   interpretation, **no audit-motivated fork (§3.6)**. Read-hardening
+   commits (§4.4) modify the one read funnel for all read callers; the
+   write side has TWO entry points and gets the enumerated shared helper
+   (§4.4), never a shared-funnel claim. (Codex additive-bias rule: wrap,
+   don't copy — this is the single-safety-funnel statement for the prompt
+   set.)
 4. **Typed-handoff exposure unchanged + tightened:** the only path from
    pool memory to consumer bytes is `ReadBufferHandoff` honoring
    `valid_bytes`, now cross-checked against `bytes_transferred` (§4.4);
    sentinel test re-run across multi-window reservoir-scale reuse.
 5. **No CDB after invalidation:** after ILI/reset-UA/poison, zero data CDBs
-   without explicit reposition + proof (funnel gate, asserted). After any
-   park > `T_reproof`: no data CDB before a passing READ POSITION re-proof
-   (§4.3).
-6. **No delivery past unproven position beyond the bound, for hash-less
-   reads** (§5.5): ranged windows release bytes only ≤ the last proven
-   cursor.
+   without explicit reposition + proof (funnel gate, asserted). After ANY
+   deliberate gate pause (either regime, regardless of duration) and after
+   any incidental wait ≥ `T_REPROOF_INCIDENTAL`: no data CDB before a
+   passing READ POSITION re-proof — proof-pass is a state-machine
+   precondition, `GATED → RESUMING(rp-pending) → FILLING` (§4.3).
+6. **No delivery past the proven frontier, for hash-less reads** (§5.5):
+   ranged windows release bytes only ≤ `proven_frontier`, advanced solely
+   by in-seq-order `Device` evidence in `SequencedHandoff`s; withheld
+   handoffs are reservoir-charged and are DISCARDED on proof failure.
 7. **Plan-bounded motion:** total records issued == plan, asserted; no
    speculative record, ever.
 
@@ -989,31 +1308,54 @@ Hermetic (model transport / chaos), symmetric to TIO-5 §9's write rows:
   recovered-full, recovered-with-VALID-residual (⇒ fail-closed, §4.4),
   deferred sense, transport error, tripwire mismatch, GOOD+tripwire-RP-fail
   — each asserting (a) no boundary-crossing or stale-count READ is issued
-  (`requested ≤ remaining_after_decode`, including all-GOOD tail batches),
+  (`requested ≤ submitter_remaining`, including all-GOOD tail batches),
   (b) handoff withheld/delivered exactly per the §5.1 table, (c) cursor/mode
   invalidation state matches TIO-5b's existing tests;
 - **funnel hardening rows (§4.4):** `records_read × block_size >
-  bytes_transferred` ⇒ completion-unknown, on filemark and recovered paths;
-  impossible-residual fail-closed; write-side symmetric check;
+  bytes_transferred` ⇒ completion-unknown, on filemark and recovered read
+  paths; impossible-residual fail-closed; **write-helper rows:** enumerated
+  call sites in `write_block_batch` (recovered-full, residual-partial) and
+  `write_block_batch_pipelined` (recovered-full,
+  `PartialBatchUncommittable` degrade-to-completion-unknown); **parity:**
+  identical sense fixtures through both write entry points ⇒ identical
+  helper decisions; EOM/EW device-position arbitration byte-identical
+  (helper diag-only there); garbage-resid clamp-to-0 ⇒ completion-unknown;
+  data-out resid-unreported ⇒ check passes vacuously (never spuriously
+  fails);
 - **error precedence rows (§5.6):** submitter SCSI error + racing decode
-  panic + sender stall ⇒ client status carries the SCSI root cause;
-  genuine client disconnect ⇒ disconnect status; terminal status emitted
-  exactly once;
+  panic + sender stall ⇒ client status carries the SCSI root cause **even
+  when the SCSI root is recorded last** (accumulator replace rule beats
+  arrival order); record-then-close ordering asserted per thread; terminal
+  status emitted exactly once, only after all three joins; genuine client
+  disconnect ⇒ teardown runs, emission skipped;
 - sentinel stale-tail across multi-window reservoir-scale reuse;
 - consumer-death row: drop the delivery receiver mid-window ⇒ submitter
   issues no further READs (≤1 completes), poison protocol ordering
   asserted (close-before-join, §3.2 drop order), pool accounting balances;
   symmetric row for free-channel disconnect;
 - **reservoir/controller rows (§4):** watermark park at high-water /
-  resume at low-water (sub-band) vs per-command gating (in-band); regime
-  switch hysteresis (no flapping at the floor boundary); **position
-  re-proof after park** (pause > `T_reproof` ⇒ RP before next READ; RP
-  mismatch ⇒ poison); degenerate config rejection (`high ≤ low`, reservoir
-  < minimum pool); RAM clamp-and-warn (budget below configured);
-  refuse-to-start (below minimum pool); mlock-failure clamp; growth-step
-  budget re-check; slow-alive client parked indefinitely with NO abort;
+  resume at low-water (SUB_BAND) vs per-command gating (IN_BAND); ε resume
+  credit admits one full command; occupancy overshoot ≤ one command's
+  bytes; regime switch hysteresis + 30 s dwell (no flapping at the floor
+  boundary, no thrash under a bursty consumer straddling the thresholds);
+  **demotion on suspected park** (ioctl-latency-spike row; LOG SENSE
+  repositioning-delta row) acts immediately, no dwell, sticks for the
+  window; **position re-proof rows:** EVERY deliberate gate-pause resume —
+  both regimes, zero-duration included — requires a passing RP before the
+  next READ (`GATED → RESUMING → FILLING` precondition asserted);
+  incidental wait ≥ `T_REPROOF_INCIDENTAL` likewise; RP mismatch ⇒ poison;
+  degenerate config rejection (`high ≤ low`, reservoir < minimum pool,
+  spool budget > ceiling); **RAM reservation rows (§4.6):** Σ granted
+  permits ≤ ceiling under a concurrent-growth RACE (two streams + spool
+  against a near-exhausted ceiling); permit rollback on alloc/mlock
+  failure; refuse-to-start on minimum-pool mlock failure (no swappable
+  fallback exists); growth-step permit denial non-fatal (effective cap,
+  warn once); slow-alive client parked indefinitely with NO abort;
   dead peer while parked ⇒ h2/receiver-drop teardown, drive never moves;
-  shared-ceiling contention (two streams, second clamps);
+  **half-open-while-parked (no FIN):** keepalive PING tears down
+  connection/stream/receiver/session within the §4.5 bound, poison drain
+  runs, drive never moves; shared-ceiling contention (two streams, second
+  clamps);
 - slow-consumer row: throttled decode ⇒ submitter blocks/parks (never
   spins, never drops), `free_wait_us`/`park_us` recorded, `feed_gap_us`
   clean, all bytes exact;
@@ -1026,9 +1368,15 @@ Hermetic (model transport / chaos), symmetric to TIO-5 §9's write rows:
   filemark-early, zero-record outcomes reproduce today's `refill` errors
   byte-for-byte; decode-side `remaining` slaving (Σ received ≠ Σ issued at
   close ⇒ fail-closed);
-- **ranged-read rows (§5.5):** ranged restore rides the pipeline (one-path
-  proof); deliver-ahead bound enforced (bytes past proven cursor withheld
-  until proof lands); tightened proof cadence honored;
+- **ranged-read / proof-frontier rows (§5.5):** ranged restore rides the
+  pipeline (one-path proof); frontier advances only on in-seq-order
+  `Device` evidence; bytes past `proven_frontier` withheld until proof
+  lands; withheld bytes counted as reservoir occupancy and gate the
+  submitter; **proof-on-demand RP before park drains the withheld queue
+  (no-deadlock row: reservoir full of unproven handoffs must not wedge)**;
+  proof failure with buffered output ⇒ every withheld handoff discarded,
+  never delivered; cadence clamp (≤ half effective reservoir) honored;
+  full-object exemption (metadata flows, bound not applied);
 - **4 KiB micro-bench (pre-freeze):** copy-out + parse at 4 KiB records;
   coalesced copy-out folds into R2 iff it binds;
 - chaos kill rows per §9 table (incl. kill-while-parked);
@@ -1041,8 +1389,10 @@ Physical (next MSL3040 window), in order:
 0. **Decompose-first (R1 field confirmation):** re-run the July 4 GiB
    restore on main@5740f1a (R1 landed) with TIO-5b diag BEFORE R2 is
    enabled — confirm H1/H2/H3 fixed in the field, pin the baseline R2 is
-   judged against, measure read ioctl cadence (§1.2), and run the DL385
-   `sha_ni` one-liner (§3.3).
+   judged against, measure read ioctl cadence (§1.2), run the DL385
+   `sha_ni` one-liner (§3.3), and probe whether the E208e/mpt3sas path
+   reports nonzero data-out resid on a forced partial (§4.4 write-helper
+   scope: protective vs vacuous on this stack).
 1. Daemon restore, server-local tmpfs sink: sustained rate at the
    drive-limited ceiling; `feed_gap_us` p95 ≤ 500 µs; `free_wait_us` ≈ 0
    (drive-limited proof). Target 300 MB/s (§11).
@@ -1051,11 +1401,17 @@ Physical (next MSL3040 window), in order:
 3. **Throttled-consumer soak + floor qualification:** cap the client at
    ~100 MB/s and then well below the floor (~30 MB/s), ≥ 30 min each;
    qualify the drive's real speed-matching floor
-   (`read_drive_floor_mib_s`); verify in-band ⇒ continuous speed-matched
-   streaming, zero parks; sub-band ⇒ clean park/resume cycles at the
-   configured watermarks, reposition counts (library syslog + LOG SENSE)
+   (`read_drive_floor_mib_s`); **measure IN_BAND behavior — the
+   streaming-without-repositioning hypothesis is proven or demoted HERE,
+   never assumed (§4.2)** — and verify the demotion path fires on any
+   observed park; sub-band ⇒ clean park/resume cycles at the configured
+   watermarks, reposition counts (library syslog + LOG SENSE)
    ≈ predicted cycles and **orders of magnitude below un-reservoired
-   shoe-shine**; park re-proof RPs visible in diag; Drishti signal fires.
+   shoe-shine**; validate the ≤ 60 cycles/hr anti-wear arithmetic at the
+   qualified floor and re-derive the §4.8 default if the floor moved;
+   qualify the drive's minimum observed park latency
+   (`T_REPROOF_INCIDENTAL` keep-or-drop, §4.3); park re-proof RPs visible
+   in diag; Drishti signal fires.
 4. **Multi-object restore leg (panel):** N-clip pull across the tape;
    measure per-object positioning share; this leg prices the §3.5
    follow-up arc with data.
@@ -1108,7 +1464,7 @@ Stages (each independently landable, diff-gated, scenario-verified):
    and the watermark defaults from measurement; leg 4 prices the
    positioning-amortization arc.
 
-## 12. Open questions — v0.1 answers recorded, v0.2 residuals
+## 12. Open questions — v0.1 answers recorded, v0.3 residuals
 
 **Answered (owner, 2026-07-11):**
 
@@ -1127,7 +1483,7 @@ Stages (each independently landable, diff-gated, scenario-verified):
 6. ~~4 KiB coalesced copy-out~~ — **in R2 iff the pre-freeze micro-bench
    shows it binding** (§7.2, §10).
 
-**Remaining open (tracked for the verify round / field legs):**
+**Remaining open (tracked for the re-verify / field legs):**
 
 1. **Read ioctl cadence** (§1.2/§7.2): the model's biggest uncertainty;
    leg 0/1 measures. If materially worse than write cadence, §7 reflows —
@@ -1135,14 +1491,16 @@ Stages (each independently landable, diff-gated, scenario-verified):
 2. **Drive speed-matching floor** (`read_drive_floor_mib_s` default):
    conservative 100 MiB/s until leg 3 qualifies the real band edge for
    this drive.
-3. **Watermark defaults** (90/25 on a 4 GiB default reservoir): sane on
-   paper; leg 3's park-cycle counts confirm or adjust. Sizing guidance
-   (bigger reservoir for slow-consumer deployments) is documentation, but
-   whether the *default* should be larger on big-RAM hosts is a deployment
+3. **Watermark defaults** (90/25 on the DERIVED 8 GiB default; 4 GiB
+   relabeled experimental minimum — §4.8): the derivation is only as good
+   as its inputs (floor, drive rate, ≤60 cycles/hr target); leg 3's
+   park-cycle counts confirm or re-derive. Sizing guidance (bigger
+   reservoir for slow-consumer deployments) is documentation, but whether
+   the *default* should be larger on big-RAM hosts is a deployment
    judgment for after leg 3.
 4. **Per-range digests in RAO** (§5.5): format-layer question — would
-   retire the ranged deliver-ahead bound. Owned by the RAO format thread,
-   not R2.
+   retire the ranged proof-frontier release bound (§5.5). Owned by the RAO
+   format thread, not R2.
 5. **Sender-thread necessity post-R1/R2** (v0.1 Q4): keep the split (it
    isolates network stalls from hash/parse and now feeds the reservoir
    drain); with the decode→sender channel byte-sized (§3.3), measure, and
@@ -1154,3 +1512,14 @@ Stages (each independently landable, diff-gated, scenario-verified):
    speculative eviction machinery).
 7. **Positioning-amortization arc** (§3.5): leg 4 prices it; likely the
    next TIO thread after R2 for clip-pull workloads.
+8. **Anti-wear target provenance** (§4.1): ≤ 60 cycles/hr is engineering
+   judgment, stated as revisable; vendor mechanism-life data would firm
+   it; leg 3 validates the arithmetic at the qualified floor.
+9. **Data-out resid reporting on this stack** (§4.4): the leg-0 probe
+   decides whether the write-side residual helper is protective or
+   vacuous on E208e/mpt3sas (it is safe either way — one-sided check).
+10. **Minimum park latency** (§4.3): can this drive stop/reposition inside
+    250 ms? Leg 3 measures; decides whether `T_REPROOF_INCIDENTAL`
+    survives or incidental waits go to conservative always-re-proof.
+    (Deliberate pauses are already duration-independent — this residual
+    touches only the incidental-wait heuristic.)
