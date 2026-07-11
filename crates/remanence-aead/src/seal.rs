@@ -9,8 +9,10 @@ use crate::header::{validate_chunk_size, RaoHeader, RAO_FOOTER};
 use crate::kdf::{derive_keys, derive_salt, RootKey};
 use crate::metadata::RaoMetadata;
 use crate::stream::{
-    encrypt_chunk, encrypt_metadata, finalize_sha256, stored_size_from_parts, PlaintextStats,
+    encrypt_chunk, encrypt_metadata, finalize_sha256, stored_size_from_parts,
+    stored_size_from_parts_with_key_frame, PlaintextStats,
 };
+use crate::wrap::{wrap_dek, DataEncryptionKey, RecipientPublicKey};
 
 /// Inputs to the RAO sealer.
 #[derive(Debug, Clone)]
@@ -32,6 +34,8 @@ pub struct SealOptions {
 pub struct SealReport {
     /// Serialized header used for this object.
     pub header: RaoHeader,
+    /// Parsed v2 key frame, absent for v1 objects.
+    pub key_frame: Option<crate::KeyFrame>,
     /// Metadata plaintext size before the AEAD tag.
     pub metadata_plaintext_len: u64,
     /// Metadata frame size including the AEAD tag.
@@ -116,6 +120,7 @@ pub fn seal<R: Read, W: Write>(
 
     Ok(SealReport {
         header,
+        key_frame: None,
         metadata_plaintext_len: metadata_plaintext.len() as u64,
         metadata_frame_len,
         stored_size_bytes,
@@ -123,6 +128,129 @@ pub fn seal<R: Read, W: Write>(
         stored_digest,
         plaintext: plaintext_stats,
     })
+}
+
+/// Inputs unique to a v2 envelope-mode seal.
+#[derive(Debug, Clone)]
+pub struct EnvelopeSealOptions {
+    /// Common framing and plaintext facts; `key_id` must be zero.
+    pub common: SealOptions,
+    /// At least two distinct-custody recipient epochs in canonical slot order.
+    pub recipients: Vec<RecipientPublicKey>,
+}
+
+/// Seal a canonical plaintext RAO object as a v2 HPKE envelope.
+pub fn seal_envelope<R: Read, W: Write>(
+    mut plaintext: R,
+    mut output: W,
+    options: &EnvelopeSealOptions,
+) -> Result<SealReport> {
+    validate_chunk_size(options.common.chunk_size)?;
+    crate::header::object_id_field(&options.common.object_id)?;
+    let chunk = u64::from(options.common.chunk_size);
+    if options.common.key_id != [0; 16]
+        || options.common.plaintext_size == 0
+        || options.common.plaintext_size % chunk != 0
+        || options.recipients.len() < 2
+    {
+        return Err(RaoAeadError::InvalidInput(
+            "v2 envelope seal requires zero key_id, aligned plaintext, and at least two recipients"
+                .to_string(),
+        ));
+    }
+    if options
+        .recipients
+        .windows(2)
+        .any(|pair| pair[0].recipient_epoch_id == pair[1].recipient_epoch_id)
+    {
+        return Err(RaoAeadError::InvalidInput(
+            "recipient epochs must be distinct".to_string(),
+        ));
+    }
+
+    let dek = DataEncryptionKey::generate()?;
+    let metadata = RaoMetadata::new(
+        options.common.plaintext_size,
+        options.common.plaintext_digest,
+        options.common.chunk_size,
+    )?;
+    let metadata_plaintext = metadata.to_cbor_bytes(options.common.chunk_size)?;
+    let metadata_frame_len = (metadata_plaintext.len() as u64)
+        .checked_add(16)
+        .ok_or(RaoAeadError::SizeOverflow)?;
+    let object_id_field = crate::header::object_id_field(&options.common.object_id)?;
+    let salt = crate::kdf::derive_salt_v2(
+        dek.as_bytes(),
+        &object_id_field,
+        &options.common.plaintext_digest,
+        &metadata_plaintext,
+    )?;
+    let key_frame = wrap_dek(&dek, &options.common.object_id, &options.recipients)?;
+    let key_frame_bytes = key_frame.serialize()?;
+    let key_frame_len =
+        u32::try_from(key_frame_bytes.len()).map_err(|_| RaoAeadError::InvalidKeyFrameLength)?;
+    let header = RaoHeader::new_v2_envelope(
+        options.common.chunk_size,
+        salt,
+        metadata_frame_len,
+        options.common.object_id.clone(),
+        key_frame_len,
+    )?;
+    let keys = crate::kdf::derive_keys_v2(
+        dek.as_bytes(),
+        &header.hkdf_salt,
+        &header.header_hash_with_key_frame(&key_frame_bytes)?,
+    )?;
+    let metadata_frame = encrypt_metadata(&keys.metadata_key, &metadata_plaintext)?;
+
+    let mut hashing_output = HashingWriter::new(&mut output);
+    hashing_output.write_all(&header.serialize()?)?;
+    hashing_output.write_all(&key_frame_bytes)?;
+    hashing_output.write_all(&metadata_frame)?;
+    let plaintext_stats =
+        encrypt_payload(&mut plaintext, &mut hashing_output, &options.common, &keys)?;
+    if plaintext_stats.size != options.common.plaintext_size {
+        return Err(RaoAeadError::PlaintextSizeMismatch);
+    }
+    if plaintext_stats.digest != options.common.plaintext_digest {
+        return Err(RaoAeadError::PlaintextDigestMismatch);
+    }
+    ensure_eof(&mut plaintext)?;
+    hashing_output.write_all(RAO_FOOTER)?;
+    let stored_size_bytes = stored_size_from_parts_with_key_frame(
+        options.common.chunk_size,
+        key_frame_len,
+        metadata_frame_len,
+        options.common.plaintext_size,
+    )?;
+    let fill_len = stored_size_bytes
+        .checked_sub(hashing_output.count)
+        .ok_or(RaoAeadError::SizeOverflow)?;
+    write_zero_fill(&mut hashing_output, fill_len)?;
+    let (_, stored_len, stored_digest) = hashing_output.finish();
+    if stored_len != stored_size_bytes {
+        return Err(RaoAeadError::SizeOverflow);
+    }
+    Ok(SealReport {
+        header,
+        key_frame: Some(key_frame),
+        metadata_plaintext_len: metadata_plaintext.len() as u64,
+        metadata_frame_len,
+        stored_size_bytes,
+        stored_size_blocks: stored_size_bytes / u64::from(options.common.chunk_size),
+        stored_digest,
+        plaintext: plaintext_stats,
+    })
+}
+
+/// Seal a v2 envelope into a newly allocated vector.
+pub fn seal_envelope_to_vec(
+    plaintext: &[u8],
+    options: &EnvelopeSealOptions,
+) -> Result<(Vec<u8>, SealReport)> {
+    let mut out = Vec::new();
+    let report = seal_envelope(plaintext, &mut out, options)?;
+    Ok((out, report))
 }
 
 /// Seal into a newly allocated vector, for tests and file-object builders.
