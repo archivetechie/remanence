@@ -1895,5 +1895,6 @@ verifiable against any directory entry.
 ## Author's Address
 
 The ArchiveTech Project
-archivetech.org
+Website: https://archivetech.org
 Email: specs@archivetech.org
+Reference implementation: https://github.com/archivetechie/remanence
