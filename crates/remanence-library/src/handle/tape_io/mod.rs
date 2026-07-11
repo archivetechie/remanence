@@ -34,8 +34,9 @@ use crate::error::{AuditEvent, AuditOp, AuditOutcome};
 use crate::transport::TimeoutClass;
 
 pub use model::{
-    BlockSize, ComputedPosition, DevicePositionProof, PipelinedWriteDiagnostics, PositionAfter,
-    ReadBatchOutcome, SpaceKind, SpaceResult, TapeConfig, TapePosition, WormMediaState,
+    BlockSize, ComputedPosition, DevicePositionProof, PipelinedReadDiagnostics,
+    PipelinedWriteDiagnostics, PositionAfter, ReadBatchOutcome, ReadBufferHandoff,
+    ReadTerminalFlags, SpaceKind, SpaceResult, TapeConfig, TapePosition, WormMediaState,
     WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome, WriteUnpositionedOutcome,
 };
 pub use readiness::{classify_media_readiness_error, MediaFamily, MediaReadiness};
@@ -1327,7 +1328,7 @@ impl super::DriveHandle {
         requested_records: u32,
         remaining_records_in_file: u32,
     ) -> Result<ReadBatchOutcome, TapeIoError> {
-        self.ensure_data_command_state_valid(false)?;
+        self.ensure_data_command_state_valid(true)?;
         if requested_records == 0 || remaining_records_in_file == 0 {
             return Err(TapeIoError::InvalidRequest(ScsiError::InvalidInput(
                 "read_block_batch: requested and remaining record counts must be nonzero",
@@ -1356,14 +1357,30 @@ impl super::DriveHandle {
         let cdb = remanence_scsi::read_write::build_read_fixed_cdb(records);
 
         self.fire_tape_started(op, &cdb);
+        let submitted_at = Instant::now();
+        if let Some(previous_completion) = self.pipeline_diagnostics.previous_completion {
+            self.pipeline_diagnostics.gap_us.record(duration_us(
+                submitted_at.duration_since(previous_completion),
+            ));
+        }
+        self.pipeline_diagnostics
+            .first_submit
+            .get_or_insert(submitted_at);
         self.transport.set_timeout_for(TimeoutClass::TapeIo);
         let started = Instant::now();
         let result = self
             .transport
             .execute_in(&cdb, &mut buf[..transfer_len as usize]);
+        let completed_at = Instant::now();
+        self.pipeline_diagnostics
+            .ioctl_us
+            .record(duration_us(completed_at.duration_since(started)));
+        self.pipeline_diagnostics.previous_completion = Some(completed_at);
+        self.pipeline_diagnostics.last_completion = Some(completed_at);
 
         match result {
             Ok(_) => {
+                self.record_pipeline_good(records, transfer_len);
                 let position_after =
                     match self.advance_expected_position(records, 0, transfer_len as u64) {
                         Ok(position_after) => position_after,
@@ -1392,6 +1409,15 @@ impl super::DriveHandle {
                     self.finish_tape_error(op, &mapped);
                     return Err(mapped);
                 }
+                if sense_has_current_ili(&sense) {
+                    self.mark_position_unknown();
+                    let mapped = map_scsi(ScsiError::CheckCondition {
+                        sense,
+                        bytes_transferred,
+                    });
+                    self.finish_tape_error(op, &mapped);
+                    return Err(mapped);
+                }
                 if read_filemark_signal(&sense) {
                     let records_read = match fixed_records_transferred_from_sense(&sense, records) {
                         Some(records_read) => records_read,
@@ -1403,6 +1429,9 @@ impl super::DriveHandle {
                         }
                     };
                     let bytes_read = records_read.saturating_mul(block_size_bytes);
+                    if records_read != 0 {
+                        self.record_pipeline_good(records_read, bytes_read);
+                    }
                     let position_after =
                         match self.advance_expected_position(records_read, 1, bytes_read as u64) {
                             Ok(position_after) => position_after,
@@ -1420,18 +1449,25 @@ impl super::DriveHandle {
                     ));
                 }
                 if sense_is_current_recovered_without_terminal_flags(&sense) {
-                    let position_after =
-                        match self.advance_expected_position(records, 0, u64::from(transfer_len)) {
-                            Ok(position_after) => position_after,
-                            Err(err) => {
-                                self.finish_tape_error(op, &err);
-                                return Err(err);
-                            }
-                        };
+                    let records_read =
+                        fixed_records_transferred_from_sense(&sense, records).unwrap_or(records);
+                    let bytes_read = records_read.saturating_mul(block_size_bytes);
+                    self.record_pipeline_good(records_read, bytes_read);
+                    let position_after = match self.advance_expected_position(
+                        records_read,
+                        0,
+                        u64::from(bytes_read),
+                    ) {
+                        Ok(position_after) => position_after,
+                        Err(err) => {
+                            self.finish_tape_error(op, &err);
+                            return Err(err);
+                        }
+                    };
                     self.finish_tape_recovered(op, started.elapsed(), sense);
                     return Ok(ReadBatchOutcome::from_computed_position(
-                        records,
-                        transfer_len,
+                        records_read,
+                        bytes_read,
                         false,
                         position_after,
                     ));
@@ -2159,7 +2195,7 @@ impl super::DriveHandle {
         if require_known_position && !self.position_known {
             return Err(TapeIoError::InvalidRequest(ScsiError::InvalidInput(
                 "drive position is unknown after a completion-unknown transport error or reset; \
-                 call position(), locate(), rewind(), or space() before writing",
+                 call position(), locate(), rewind(), or space() before the next data command",
             )));
         }
         if self.mode_reverification_required.is_some() {
@@ -2316,6 +2352,8 @@ impl super::DriveHandle {
             .unwrap_or(0);
         let commands = self.pipeline_diagnostics.ioctl_us.samples;
         PipelinedWriteDiagnostics {
+            gap_samples: self.pipeline_diagnostics.gap_us.samples,
+            ioctl_samples: self.pipeline_diagnostics.ioctl_us.samples,
             good_commands: self.pipeline_diagnostics.good_commands,
             good_records: self.pipeline_diagnostics.good_records,
             good_bytes: self.pipeline_diagnostics.good_bytes,
@@ -2336,6 +2374,16 @@ impl super::DriveHandle {
                     .unwrap_or(u64::MAX)
             },
         }
+    }
+
+    /// Reset cadence counters at the start of one field-measured transfer.
+    pub fn reset_pipelined_diagnostics(&mut self) {
+        self.pipeline_diagnostics = Default::default();
+    }
+
+    /// Return read-submitter telemetry using the shared cadence schema.
+    pub fn pipelined_read_diagnostics(&self) -> PipelinedReadDiagnostics {
+        self.pipelined_write_diagnostics()
     }
 
     /// Inline READ POSITION used by [`Self::locate`] and
@@ -2491,6 +2539,10 @@ fn sense_is_current_recovered_without_terminal_flags(sense: &[u8]) -> bool {
             && !decoded.ili
             && !decoded.filemark
     })
+}
+
+fn sense_has_current_ili(sense: &[u8]) -> bool {
+    decode_sense(sense).is_some_and(|decoded| !decoded.is_deferred() && decoded.ili)
 }
 
 fn position_overflow_error() -> TapeIoError {
