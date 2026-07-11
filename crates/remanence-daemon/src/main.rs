@@ -40,6 +40,7 @@ async fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    warn_io_memory_sanity(config.daemon.io_memory_ceiling);
 
     let socket_path = args
         .socket
@@ -338,6 +339,7 @@ fn resolve_spool_budget(
     effective_spool_budget(
         remanence_api::APPEND_SPOOL_MAX_BYTES,
         config.spool_tmpfs_ram_budget,
+        config.io_memory_ceiling,
         info,
     )
     .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))
@@ -346,11 +348,12 @@ fn resolve_spool_budget(
 fn effective_spool_budget(
     default_bytes: u64,
     configured_tmpfs_budget: Option<u64>,
+    io_memory_ceiling: u64,
     info: SpoolFilesystemInfo,
 ) -> Result<SpoolBudget, String> {
     if !info.is_tmpfs {
         return Ok(SpoolBudget {
-            effective_bytes: default_bytes,
+            effective_bytes: default_bytes.min(io_memory_ceiling),
             available_bytes: info.available_bytes,
             is_tmpfs: false,
         });
@@ -359,7 +362,7 @@ fn effective_spool_budget(
         "daemon.spool_tmpfs_ram_budget is required when daemon.spool_dir resolves to tmpfs"
             .to_string()
     })?;
-    let effective = default_bytes.min(acknowledged).min(info.available_bytes);
+    let effective = default_bytes.min(acknowledged).min(io_memory_ceiling);
     if effective == 0 {
         return Err(
             "daemon.spool_dir resolves to tmpfs but no RAM budget is currently available"
@@ -418,6 +421,37 @@ fn parse_mem_available_bytes(text: &str) -> Option<u64> {
     let _label = parts.next()?;
     let kb = parts.next()?.parse::<u64>().ok()?;
     kb.checked_mul(1024)
+}
+
+fn warn_io_memory_sanity(ceiling: u64) {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(available) = read_mem_available_bytes() {
+            if ceiling > available {
+                eprintln!(
+                    "rem-daemon: warning daemon.io_memory_ceiling={ceiling} exceeds startup MemAvailable={available}; the fixed ceiling remains authoritative"
+                );
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` points to writable storage of the exact type required
+        // by `getrlimit`; the call does not retain the pointer.
+        if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } == 0
+            && limit.rlim_cur != libc::RLIM_INFINITY
+            && ceiling > limit.rlim_cur
+        {
+            eprintln!(
+                "rem-daemon: warning daemon.io_memory_ceiling={ceiling} exceeds LimitMEMLOCK={}; minimum read reservoirs will refuse to start if they cannot be locked",
+                limit.rlim_cur
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -518,18 +552,23 @@ mod tests {
     }
 
     #[test]
-    fn tmpfs_spool_budget_requires_acknowledgment_and_clamps_to_available_ram() {
+    fn tmpfs_spool_budget_requires_acknowledgment_but_not_memavailable_authority() {
         let info = SpoolFilesystemInfo {
             is_tmpfs: true,
             available_bytes: 2 * 1024 * 1024,
         };
-        let err = effective_spool_budget(64 * 1024 * 1024, None, info)
+        let err = effective_spool_budget(64 * 1024 * 1024, None, 32 * 1024 * 1024, info)
             .expect_err("tmpfs budget ack required");
         assert!(err.contains("daemon.spool_tmpfs_ram_budget"), "{err}");
 
-        let budget =
-            effective_spool_budget(64 * 1024 * 1024, Some(8 * 1024 * 1024), info).expect("budget");
-        assert_eq!(budget.effective_bytes, 2 * 1024 * 1024);
+        let budget = effective_spool_budget(
+            64 * 1024 * 1024,
+            Some(8 * 1024 * 1024),
+            32 * 1024 * 1024,
+            info,
+        )
+        .expect("budget");
+        assert_eq!(budget.effective_bytes, 8 * 1024 * 1024);
         assert_eq!(budget.available_bytes, 2 * 1024 * 1024);
         assert!(budget.is_tmpfs);
     }
@@ -539,13 +578,14 @@ mod tests {
         let budget = effective_spool_budget(
             64 * 1024 * 1024,
             None,
+            32 * 1024 * 1024,
             SpoolFilesystemInfo {
                 is_tmpfs: false,
                 available_bytes: 512,
             },
         )
         .expect("non-tmpfs budget");
-        assert_eq!(budget.effective_bytes, 64 * 1024 * 1024);
+        assert_eq!(budget.effective_bytes, 32 * 1024 * 1024);
         assert!(!budget.is_tmpfs);
     }
 

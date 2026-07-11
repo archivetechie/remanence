@@ -9,6 +9,7 @@ license     .workspace = true
 repository  .workspace = true
 
 [dependencies]
+libc.workspace = true
 remanence-scsi = { path = "../remanence-scsi" }
 thiserror      = { workspace = true }
 tokio          = { workspace = true }

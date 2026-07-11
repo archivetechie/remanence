@@ -551,11 +551,12 @@ pub struct ReadTerminalFlags {
 }
 
 /// Owned, length-typed handoff from the tape submitter to a read consumer.
-/// The backing vector is shortened to `valid_bytes` before construction, so
-/// stale bytes from a reused ring slot cannot be observed through safe APIs.
+/// The backing slab's visible region is shortened to `valid_bytes` before
+/// construction, so stale bytes from a reused ring slot cannot be observed
+/// through safe APIs.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ReadBufferHandoff {
-    buffer: Vec<u8>,
+    buffer: ReadBuffer,
     /// Bytes proven complete by the READ completion and residual decode.
     pub valid_bytes: usize,
     /// Complete fixed records represented by `valid_bytes`.
@@ -566,14 +567,14 @@ pub struct ReadBufferHandoff {
 
 impl ReadBufferHandoff {
     pub(crate) fn from_outcome(
-        mut buffer: Vec<u8>,
+        mut buffer: ReadBuffer,
         outcome: ReadBatchOutcome,
     ) -> Result<Self, &'static str> {
         let valid_bytes = outcome.bytes_read as usize;
         if valid_bytes > buffer.len() {
             return Err("read outcome exceeds supplied buffer");
         }
-        buffer.truncate(valid_bytes);
+        buffer.resize(valid_bytes)?;
         Ok(Self {
             buffer,
             valid_bytes,
@@ -588,14 +589,109 @@ impl ReadBufferHandoff {
 
     /// Return only bytes proven complete by the READ outcome.
     pub fn valid_data(&self) -> &[u8] {
-        &self.buffer
+        self.buffer.as_slice()
     }
 
     /// Reclaim the allocation for a later ring refill. Its visible length is
     /// still exactly `valid_bytes`; callers must resize before the next READ.
-    pub fn into_reusable_buffer(self) -> Vec<u8> {
+    pub fn into_reusable_buffer(self) -> ReadBuffer {
         self.buffer
     }
+}
+
+/// Page-aligned owned storage reused by the read reservoir.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReadBuffer {
+    storage: Vec<u8>,
+    start: usize,
+    len: usize,
+    capacity: usize,
+}
+
+impl ReadBuffer {
+    /// Allocate `capacity` usable bytes whose first byte is page-aligned.
+    pub fn try_new_page_aligned(capacity: usize) -> Result<Self, String> {
+        let page_size = system_page_size();
+        let allocation = capacity
+            .checked_add(page_size - 1)
+            .ok_or_else(|| "read reservoir allocation size overflow".to_string())?;
+        let mut storage = Vec::new();
+        storage
+            .try_reserve_exact(allocation)
+            .map_err(|err| format!("allocate page-aligned read buffer: {err}"))?;
+        storage.resize(allocation, 0);
+        let address = storage.as_ptr() as usize;
+        let start = (page_size - (address % page_size)) % page_size;
+        debug_assert_eq!((address + start) % page_size, 0);
+        debug_assert!(start + capacity <= storage.len());
+        Ok(Self {
+            storage,
+            start,
+            len: capacity,
+            capacity,
+        })
+    }
+
+    /// Visible byte length.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the visible region is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Fixed usable capacity of this slab.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Resize the visible region without reallocating the aligned slab.
+    pub fn resize(&mut self, len: usize) -> Result<(), &'static str> {
+        if len > self.capacity {
+            return Err("read buffer resize exceeds aligned slab capacity");
+        }
+        self.len = len;
+        Ok(())
+    }
+
+    /// Visible bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.storage[self.start..self.start + self.len]
+    }
+
+    /// Mutable visible bytes.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.storage[self.start..self.start + self.len]
+    }
+
+    /// True when the first visible byte is aligned to the system page size.
+    pub fn is_page_aligned(&self) -> bool {
+        (self.as_slice().as_ptr() as usize) % system_page_size() == 0
+    }
+}
+
+impl From<Vec<u8>> for ReadBuffer {
+    fn from(storage: Vec<u8>) -> Self {
+        let len = storage.len();
+        Self {
+            storage,
+            start: 0,
+            len,
+            capacity: len,
+        }
+    }
+}
+
+fn system_page_size() -> usize {
+    // SAFETY: `sysconf(_SC_PAGESIZE)` takes no pointers and has no memory side
+    // effects. A non-positive result falls back to 4 KiB.
+    let reported = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(reported)
+        .ok()
+        .filter(|size| *size > 0)
+        .unwrap_or(4096)
 }
 
 impl ReadBatchOutcome {

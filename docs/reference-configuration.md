@@ -55,15 +55,15 @@ string with a suffix: `B`, `KiB`/`K`/`KB`, `MiB`/`M`/`MB`, `GiB`/`G`/`GB`,
 | `default_idle_timeout_seconds` | integer > 0 | required | Default idle timeout for write/read sessions. |
 | `spool_dir` | absolute path | `<state_dir>/spool` | Pre-commit append spool. Created with mode `0700` at startup. |
 | `spool_tmpfs_ram_budget` | byte size > 0 | unset | Required acknowledgement when the spool resolves to tmpfs/ramfs. Post-R2, spool growth reserves this fixed budget from the shared `io_memory_ceiling`; runtime `MemAvailable` never clamps or authorizes growth. Must be ≤ `io_memory_ceiling`. |
-| `io_memory_ceiling` | byte size > 0 | — (**TIO-6 R2**, not yet landed) | Fixed total for ALL pipeline I/O memory: append-spool reservations plus every drive's read reservoir, granted through one atomic permit manager. See the deployment note below. |
+| `io_memory_ceiling` | byte size > 0 | `"24GiB"` | Fixed total for ALL pipeline I/O memory: append-spool reservations plus every drive's read reservoir, granted through one atomic permit manager. See the deployment note below. |
 | `read_only` | bool | `false` | Reject state-changing operations; skips library discovery and the drive pool at startup. |
 | `socket_path` | absolute path | `<state_dir>/rem.sock` | Unix-domain gRPC socket. Parent directory created `0700`; socket chmod `0660`; connecting peers must be root or the daemon's own user. |
 | `listen` | `host:port` string | unset | TCP listen address for mTLS gRPC. Requires `[daemon.tls]`. |
 
 ### I/O memory ceiling deployment note (TIO-6 R2)
 
-Specified by `design-tape-io-read-pipeline-v0.1.md` §4.6; lands with the
-TIO-6 R2 commit. The daemon unit must run under a cgroup memory limit
+Specified by `design-tape-io-read-pipeline-v0.1.md` §4.6. The daemon unit must
+run under a cgroup memory limit
 (systemd `MemoryMax`) with `io_memory_ceiling` + daemon baseline headroom
 ≤ `MemoryMax` (guidance: leave ≥ 2 GiB), and `LimitMEMLOCK` sized ≥ the
 ceiling (a safe upper bound: only read-reservoir slabs are actually
@@ -104,8 +104,7 @@ surface exists, client implementations must set these values directly.
 
 ### HTTP/2 keepalive (dead-peer detection) — TIO-6 R2 transport defaults
 
-Specified by `design-tape-io-read-pipeline-v0.1.md` §4.5 (lands with the
-TIO-6 R2 transport commit, alongside the windows above). Like the windows,
+Specified by `design-tape-io-read-pipeline-v0.1.md` §4.5. Like the windows,
 these are compiled transport defaults, not configuration keys:
 
 - **Server (tonic builder, both listeners — TCP/mTLS and Unix socket):**

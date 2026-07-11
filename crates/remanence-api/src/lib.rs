@@ -35,7 +35,6 @@ use remanence_state::{
 use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
 use tonic::transport::{Channel, Endpoint, Uri};
 use tonic::{Request, Response, Status};
@@ -52,6 +51,9 @@ pub const APPEND_SPOOL_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 /// The URI authority is a placeholder ignored by the custom connector.
 pub async fn connect_unix(socket_path: PathBuf) -> Result<Channel, tonic::transport::Error> {
     Endpoint::try_from("http://[::1]:50051")?
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .keep_alive_timeout(Duration::from_secs(20))
+        .keep_alive_while_idle(true)
         .connect_with_connector(tower::service_fn(move |_: Uri| {
             let path = socket_path.clone();
             async move {
@@ -65,6 +67,7 @@ pub async fn connect_unix(socket_path: PathBuf) -> Result<Channel, tonic::transp
 pub use remanence_parity::ParityConfig;
 
 mod diagnostics;
+mod io_memory;
 mod library;
 mod mount;
 mod operations;
@@ -306,7 +309,7 @@ pub struct ApiState {
     drive_pool: Option<crate::write_owner::DrivePool>,
     spool_dir: Option<Arc<PathBuf>>,
     spool_budget_bytes: Option<u64>,
-    spool_budget: Option<Arc<Semaphore>>,
+    io_memory: Arc<crate::io_memory::IoMemoryReservation>,
     default_library_serial: Option<Arc<String>>,
     library_snapshot: Option<Arc<RwLock<Arc<LibrarySnapshot>>>>,
     live_status: Arc<LiveStatusState>,
@@ -388,7 +391,10 @@ impl ApiState {
             drive_pool: None,
             spool_dir: None,
             spool_budget_bytes: None,
-            spool_budget: None,
+            io_memory: crate::io_memory::IoMemoryReservation::new(
+                remanence_state::DEFAULT_IO_MEMORY_CEILING_BYTES,
+            )
+            .expect("nonzero default I/O memory ceiling"),
             default_library_serial: None,
             library_snapshot: None,
             live_status: Arc::new(LiveStatusState::new(live_status_interval)),
@@ -471,6 +477,8 @@ impl ApiState {
                 .collect::<HashMap<_, _>>(),
         );
         let managed_library_serials = drive_managed_library_serials(config);
+        let io_memory = crate::io_memory::IoMemoryReservation::new(config.daemon.io_memory_ceiling)
+            .map_err(Status::invalid_argument)?;
         let base_cfg = crate::write_owner::WriteOwnerConfig {
             index_path: index_path.clone(),
             report: report.clone(),
@@ -487,6 +495,7 @@ impl ApiState {
             managed_library_serials: Arc::new(managed_library_serials),
             cleaning: config.cleaning.clone(),
             tape_io: config.tape_io.clone(),
+            io_memory: Arc::clone(&io_memory),
         };
         let mut drive_txs = HashMap::new();
         for (bay_addr, drive) in opened_drives {
@@ -512,9 +521,7 @@ impl ApiState {
         state.drive_pool = Some(drive_pool.clone());
         state.spool_dir = Some(Arc::new(spool_dir));
         state.spool_budget_bytes = Some(spool_budget_bytes);
-        state.spool_budget = Some(Arc::new(Semaphore::new(
-            spool_budget_permits(spool_budget_bytes) as usize,
-        )));
+        state.io_memory = io_memory;
         state.default_library_serial = default_library_serial;
         state.library_snapshot = Some(library_snapshot);
         state.reconcile_drive_catalog_from_report(config, &report)?;
@@ -865,7 +872,7 @@ impl ApiState {
             .ok_or_else(|| Status::unavailable("daemon has no write spool (read-only mode)"))
     }
 
-    async fn acquire_spool_budget(&self, cap_bytes: u64) -> Result<OwnedSemaphorePermit, Status> {
+    fn validate_spool_budget(&self, cap_bytes: u64) -> Result<(), Status> {
         let budget_bytes = self
             .spool_budget_bytes
             .ok_or_else(|| Status::unavailable("daemon has no write spool (read-only mode)"))?;
@@ -879,16 +886,15 @@ impl ApiState {
                 "append spool request {cap_bytes} bytes exceeds effective daemon.spool_tmpfs_ram_budget {budget_bytes} bytes for {spool_dir}; overflow-to-disk is not implemented"
             )));
         }
-        let permits = spool_budget_permits(cap_bytes);
-        let budget = self
-            .spool_budget
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| Status::unavailable("daemon has no write spool (read-only mode)"))?;
-        budget
-            .acquire_many_owned(permits)
-            .await
-            .map_err(|_| Status::unavailable("append spool budget is closed"))
+        Ok(())
+    }
+
+    fn reserve_io_memory(&self, bytes: u64) -> Result<crate::io_memory::IoMemoryPermit, Status> {
+        self.io_memory.try_reserve(bytes).ok_or_else(|| {
+            Status::resource_exhausted(format!(
+                "append spool growth of {bytes} bytes exceeds remaining daemon.io_memory_ceiling capacity"
+            ))
+        })
     }
 
     pub(crate) fn drive_pool(&self) -> Result<&crate::write_owner::DrivePool, Status> {
@@ -2216,8 +2222,9 @@ impl WriteSessionApi {
         let session_id = decode_uuid_bytes(&start.session_id, "session_id")?;
         let session_id = Uuid::from_bytes(session_id);
         let cap = append_spool_cap(start.declared_size_bytes);
-        let _spool_budget = self.state.acquire_spool_budget(cap).await?;
+        self.state.validate_spool_budget(cap)?;
         let mut spool = create_append_spool(self.state.spool_dir()?.to_path_buf(), cap).await?;
+        let mut spool_permits = Vec::new();
         let mut finish = None;
         let spool_started = Instant::now();
         let mut spool_bytes = 0u64;
@@ -2238,7 +2245,9 @@ impl WriteSessionApi {
                         return Err(err);
                     }
                     let chunk_len = chunk.data.len() as u64;
+                    let permit = self.state.reserve_io_memory(chunk_len)?;
                     spool = write_append_spool_chunk(spool, chunk.data).await?;
+                    spool_permits.push(permit);
                     spool_bytes = spool_bytes.saturating_add(chunk_len);
                     spool_chunks = spool_chunks.saturating_add(1);
                 }
@@ -2708,13 +2717,6 @@ fn append_spool_cap(declared_size_bytes: u64) -> u64 {
     } else {
         declared_size_bytes.min(crate::write_owner::SPOOL_MAX_BYTES)
     }
-}
-
-const SPOOL_BUDGET_UNIT_BYTES: u64 = 1024 * 1024;
-
-fn spool_budget_permits(bytes: u64) -> u32 {
-    let units = bytes.div_ceil(SPOOL_BUDGET_UNIT_BYTES).max(1);
-    u32::try_from(units).unwrap_or(u32::MAX)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4214,7 +4216,6 @@ mod tests {
     };
     use remanence_stream::{restore_object_to_directory, FilesystemRestoreOptions};
     use sha2::{Digest, Sha256};
-    use tokio::sync::Semaphore;
     use tokio_stream::StreamExt;
     use tracing::dispatcher::Dispatch;
     use tracing::field::{Field, Visit};
@@ -4640,9 +4641,8 @@ mod tests {
         let mut state = ApiState::new(test_index());
         state.spool_dir = Some(Arc::new(spool_dir));
         state.spool_budget_bytes = Some(budget_bytes);
-        state.spool_budget = Some(Arc::new(Semaphore::new(
-            spool_budget_permits(budget_bytes) as usize
-        )));
+        state.io_memory = crate::io_memory::IoMemoryReservation::new(budget_bytes)
+            .expect("test I/O memory ceiling");
         state
     }
 
@@ -4746,18 +4746,6 @@ mod tests {
         assert_eq!(
             append_spool_cap(u64::MAX),
             crate::write_owner::SPOOL_MAX_BYTES
-        );
-    }
-
-    #[test]
-    fn spool_budget_permits_rounds_up_to_mib_units() {
-        assert_eq!(spool_budget_permits(0), 1);
-        assert_eq!(spool_budget_permits(1), 1);
-        assert_eq!(spool_budget_permits(1024 * 1024), 1);
-        assert_eq!(spool_budget_permits(1024 * 1024 + 1), 2);
-        assert_eq!(
-            spool_budget_permits(crate::write_owner::SPOOL_MAX_BYTES),
-            64 * 1024
         );
     }
 

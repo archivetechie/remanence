@@ -12942,6 +12942,7 @@ mod tests {
                 state_dir: root.clone(),
                 spool_dir: None,
                 spool_tmpfs_ram_budget: None,
+                io_memory_ceiling: remanence_state::DEFAULT_IO_MEMORY_CEILING_BYTES,
                 default_idle_timeout_seconds: 1800,
                 read_only: false,
                 socket_path: None,
