@@ -1,9 +1,8 @@
-# Tape I/O read pipeline (TIO-6) — read submitter, read reservoir + anti-shoe-shine controller, relay unblocking — Design v0.3
+# Tape I/O read pipeline (TIO-6) — read submitter, read reservoir (watermark stop-start), relay unblocking — Design v0.4
 
-**Status:** **FOLDED v0.3** (2026-07-11) — codex verify round folded (failed
-the freeze bar on §4 controller under-specification plus three v0.2 fold
-claims that were not actually implementable as written); pending re-verify
-before freeze.
+**Status:** **FOLDED v0.4** (2026-07-11) — IN_BAND regime removed (owner);
+single-regime reservoir stop-start; re-verify gaps closed; pending final
+verify before freeze.
 **Fold record:** panel 2026-07-11: 37 findings (14 failure / 9 concurrency /
 7 scsi / 7 cost); folded + owner decisions. The dominant convergence (3 lenses)
 was the wrap-don't-copy contradiction — resolved in §3.3/§3.6/§5. The single
@@ -11,12 +10,13 @@ largest v0.1→v0.2 change is an **owner reversal**: v0.1 §4 "reads accept
 shoe-shine" is REJECTED; anti-shoe-shine is now core, designed in §4 as a
 watermark-controlled host-RAM read reservoir. verify 2026-07-11: 8 majors +
 2 minors; folded → v0.3 — proof-frontier delivery protocol (§3.2/§5.5),
-priority terminal accumulator + finalization barrier (§5.6), controller
-spec'd with negative feedback (§4.2), duration-proxy-free park re-proof
-(§4.3), concrete keepalive (§4.5), fixed-ceiling atomic RAM reservation
-(§4.6), corrected wear arithmetic + derived 8 GiB default (§4.1/§4.8),
-enumerated write-side helper scope (§4.4/§5), `submitter_remaining` rename,
+priority terminal accumulator + finalization barrier (§5.6), concrete
+keepalive (§4.5), fixed-ceiling atomic RAM reservation (§4.6), corrected
+wear arithmetic + derived 8 GiB default (§4.1/§4.8), enumerated write-side
+helper scope (§4.4/§5), `submitter_remaining` rename,
 `T_REPROOF_INCIDENTAL` as a named constant.
+owner 2026-07-11: IN_BAND regime REMOVED (over-engineering); single-regime
+reservoir stop-start; re-verify gaps closed → v0.4.
 **Naming:** settled — **TIO-6** (commits on main already use it; v0.1 Q5 closed).
 **Problem source:** the 2026-07-07b MSL3040 window measured field restore at
 **13.28 MB/s** end-to-end (undecomposable at the time — read diag was missing),
@@ -193,7 +193,7 @@ Runs on the drive-actor thread that owns the `DriveHandle` — no new
 ownership or locking semantics, mirror of TIO-5 §3.2. **The drive-side
 `BlockSource` moves INTO the submitter closure; no other thread can reach the
 drive, by construction (§3.3, §5.4).** GOOD-path loop, in full: check the
-reservoir gate (§4 — pass-through unless gated; resuming from ANY gate pause
+reservoir gate (§4 — pass-through unless gated; resuming from ANY park
 requires the §4.3 proof precondition to PASS first) → pop a free ring
 buffer (blocking only when the pool is exhausted) → **recompute the record
 count from post-classified-completion state** (the prior funnel outcome —
@@ -274,24 +274,40 @@ channel **carries errors**:
   growth step, `allocated_buffers == free_capacity_headroom ==
   delivery_capacity_headroom` — the non-blocking-push proof (below) is
   guarded by this assertion, not assumed from config.
-- **Delivery channel:** bounded, capacity = pool size, element type
-  **`Result<SequencedHandoff, TapeIoError>`** (errors in-band: §5.6; proof
-  frontier in-band: §5.5). The submitter can hold at most `pool` buffers
-  across in-flight + queued, so its `Ok` push never blocks — asserted per
-  the construction assertion. If the push fails (receiver dropped =
-  consumer died), the submitter stops issuing immediately: **no tape motion
-  for a dead client**, bounded by the one command already in flight.
+- **Delivery channel:** bounded, element type
+  **`Result<ReadDelivery, TapeIoError>`** where `ReadDelivery` is
+  `Handoff(SequencedHandoff)` or a buffer-less **`ProofFrontier`** message
+  (errors in-band: §5.6; proof frontier in-band: §5.5). Capacity = pool
+  size in buffer-carrying elements plus a small fixed headroom for
+  proof-only messages. The submitter can hold at most `pool` buffers
+  across in-flight + queued, so its `Ok(Handoff)` push never blocks —
+  asserted per the construction assertion. A proof-only push may block if
+  that headroom is momentarily full — benign: every standalone RP happens
+  at a pause point, holding no buffer, so blocking there IS the park (and
+  a resume-time push always has headroom — the consumer just drained a
+  full span). If any push fails (receiver dropped = consumer died), the
+  submitter stops issuing immediately: **no tape motion for a dead
+  client**, bounded by the one command already in flight.
 - **Ownership handoff + proof metadata (verify major — v0.2's release
-  bound was unimplementable with the bare handoff):** the delivery element
+  bound was unimplementable with the bare handoff):** the data element
   wraps TIO-5b's type, unchanged, in ordered frontier metadata:
   `SequencedHandoff { seq: u64, plan_records_end: u64, position_after:
   TapePosition, evidence: PositionAfter, handoff: ReadBufferHandoff }`.
   `seq` is strictly monotonic per window; `plan_records_end` = Σ
   `records_read` through this handoff (the frontier cursor); `evidence`
   **preserves `ReadBatchOutcome::position_evidence`** —
-  `Device(DevicePositionProof)` when this command carried a device proof
-  (window-open RP, periodic tripwire RP, §4.3 gate-resume RP, §5.5
-  on-demand RP), `Computed` otherwise. Today
+  `Device(DevicePositionProof)` iff THIS command carried the funnel's
+  inline tripwire RP (which proves the cursor through this command),
+  `Computed` otherwise. **Standalone RPs ride a proof-only message, not a
+  handoff:** the window-open RP, the mandatory §4.3 park-resume RP, and
+  the §5.5 on-demand RP do not accompany a data command; each is delivered
+  as `ProofFrontier { through_seq: u64, plan_records_end: u64, proof:
+  DevicePositionProof }` naming the **exact cursor it proves — the LAST
+  COMPLETED command** (`through_seq` = the highest `seq` already pushed;
+  0-equivalent at window open). A resume RP therefore proves through the
+  PREVIOUS command, never the next — the off-by-one that credited an RP
+  to the command issued after it is closed by attaching every RP to the
+  cursor it actually measured. Today
   `ReadBufferHandoff::from_outcome` (model.rs:522) DISCARDS the evidence;
   `read_buffer_handoff` therefore returns the outcome's evidence + position
   alongside the handoff so the pipeline can carry them. `ReadBufferHandoff`
@@ -447,7 +463,8 @@ concurrently. The diag moves to per-thread busy/idle accounting:
   therefore also records a derived `feed_gap_us = gap − free_wait − park`
   per iteration, and **acceptance gates read `feed_gap_us`** (panel minor:
   no double-counting, no polluted feed-health signal). `free_wait_us` high ⇒
-  consumer-bound; `park_us` accumulating ⇒ sub-band consumer (§4).
+  consumer-bound; `park_us` accumulating ⇒ slow consumer parking the
+  drive (§4).
 - Decode thread: busy time (parse+hash) vs recv-wait (drive-bound signal).
 - Sender: busy vs channel-wait, plus R1's landed `sender_stall_ms`.
 - **Per-command audit events are RETAINED (panel BLOCKER resolved):** v0.1
@@ -469,7 +486,7 @@ concurrently. The diag moves to per-thread busy/idle accounting:
   sender-busy, and a new `bottleneck=` field names the thread with the
   highest busy fraction. New reservoir gauges: occupancy bytes (live),
   withheld-pending-proof bytes (§5.5, separate gauge), park/resume cycle
-  count, regime + demotion events with cause (§4.2). **A live signal, not just
+  count. **A live signal, not just
   session-close accounting (panel minor):** reservoir occupancy + park
   count are readable mid-session from shared diag state and feed the
   Drishti signal (§8).
@@ -477,7 +494,7 @@ concurrently. The diag moves to per-thread busy/idle accounting:
   shared diag state, never via a `DriveCommand` (actor busy for the window —
   unchanged known property).
 
-## 4. The read reservoir and the anti-shoe-shine controller (owner reversal — CORE)
+## 4. The read reservoir — watermark stop-start, anti-shoe-shine (owner reversal — CORE)
 
 **v0.1 §4 said "reads accept shoe-shine." The owner REJECTED that.** The
 throughput lens had already shown the dismissal was on the wrong grounds:
@@ -504,114 +521,75 @@ byte-budgeted **read reservoir** with configurable **high/low watermarks**
 - **At low-water: resume** — a single reposition + position re-proof
   (§4.3), then full-speed fill again.
 
-**Wear arithmetic (the point — CORRECTED, verify major):** park/resume
-cycles per restore ≈ `restore_bytes ÷ effective_span`, where
-`effective_span = (high_pct − low_pct) × effective_reservoir_bytes` — the
-divisor is the watermark DELTA, not the reservoir size (v0.2 divided by the
-full reservoir, understating cycles by 1/0.65 at the 90/25 defaults). The
-owner's example, corrected: a 100 GB reservoir at 90/25 has a 65 GB span ⇒
-≈ **277 clean stop-starts** for a full 18 TB LTO-9 stream — versus
-continuous shoe-shining for the whole multi-hour session without it.
-Typical clip-pull restores are far smaller than a full tape, so typical
-cycle counts are single digits. The knob is RAM, which is cheap and
-reusable; the thing it buys is head/media life, which is not.
+**Wear arithmetic (the point — made self-consistent, v0.4):** for a
+consumer at rate `c` against drive rate `d` with
+`span = (high_pct − low_pct) × effective_reservoir_bytes` (the watermark
+DELTA — not the full reservoir):
 
-**Anti-wear target (NEW — the number the default is derived from):** the
-design target is **≤ 60 park/resume cycles/hour sustained** on the worst
-supported sub-band consumer. Provenance: engineering judgment — roughly one
-clean stop-start per minute, an order-plus below continuous shoe-shine's
+- **cycles per restore ≈ `restore_bytes × (d−c) ÷ (d × span)`** — each
+  cycle moves `d·span/(d−c)` bytes off tape (the consumer keeps draining
+  during refill), so the slow-consumer LIMIT `restore_bytes ÷ span` is the
+  upper bound (c→0), not the estimate.
+- **cycle rate = `3600 ÷ (span/c + span/(d−c))` cycles/hr** —
+  drain-while-parked plus refill-while-still-draining. The two formulas
+  are the same model (rate × duration = count).
+
+The owner's example: a 100 GB reservoir at 90/25 has a 65 GB span ⇒
+≤ **277 clean stop-starts** for a full 18 TB LTO-9 stream (≈175 at a
+110 MB/s consumer) — versus continuous shoe-shining for the whole
+multi-hour session without it. Typical clip-pull restores are far smaller
+than a full tape, so typical cycle counts are single digits. The knob is
+RAM, which is cheap and reusable; the thing it buys is head/media life,
+which is not.
+
+**Anti-wear target (the number the default is derived from):** the design
+target is **≤ 60 park/resume cycles/hour sustained** at the worst-case
+consumer rate. Provenance: engineering judgment — roughly one clean
+stop-start per minute, an order-plus below continuous shoe-shine's
 backhitch-every-few-seconds (~10³/hr) — pending vendor mechanism-life data
 and leg-3 qualification; it is a stated, revisable choice, not physics.
-Cycle rate for a sub-band consumer at rate `c` against drive rate `d`:
-`cycles/hr = 3600 ÷ (span/c + span/(d−c))` — drain-while-parked plus
-refill-while-still-draining. Cycle time shrinks as `c` rises (for
-`c < d/2`), so the worst case is a consumer just under the qualified floor.
-The §4.8 default reservoir is DERIVED from this target at the floor;
-per-full-tape totals are reported as an observation, not a second target
-(a full-tape sub-band restore is a pathological workload — §4.8's sizing
-guidance covers it with a bigger reservoir).
+Cycle time is minimized (rate maximized) at **`c = d/2`** — that is the
+worst case the §4.8 default is derived from; both slower and faster
+consumers cycle less often. Per-full-tape totals are reported as an
+observation, not a second target (a full-tape slow-consumer restore is a
+pathological workload — §4.8's sizing guidance covers it with a bigger
+reservoir).
 
 **What the reservoir cannot do (unchanged honesty from v0.1):** sustained
 end-to-end throughput is still `min(chain)` — a 110 MB/s consumer gets
 110 MB/s. The reservoir changes the drive's *duty pattern* (long full-speed
-bursts + parks instead of sub-band crawl/backhitch), not the average.
+bursts + parks instead of slow crawl/backhitch), not the average.
 
-### 4.2 Two regimes, one control law
+### 4.2 One regime: watermark stop-start
 
-The same reservoir serves both poles of the archive's identity:
+**v0.3's second, "gentle speed-matching" regime (IN_BAND: consumer-EWMA
+regime selector, per-command gating at `high − ε`, park detectors) is
+REMOVED — owner 2026-07-11: fold-introduced over-engineering** that
+generated most of the re-verify majors (a park detector with nothing to
+observe — no reposition counter exists in
+`crates/remanence-scsi/src/log_sense.rs`, ioctl latency is a guess; a
+per-command READ POSITION reintroducing the tax TIO-5 removed; a
+resume-RP off-by-one). The wear guarantee never depended on it:
 
-- **Fast consumer (≥ drive streaming rate):** the reservoir stays near
+- **Fast consumer (≥ drive streaming rate):** the reservoir hovers near
   empty; read-ahead keeps the drive streaming at native rate (→300 MB/s).
   Watermarks never trip. This is the §3 submitter story, unchanged.
-- **In-band consumer (within the drive's speed-matching range, roughly
-  ⅓–1× native on HH LTO-9):** **hardware speed-matching first (owner).**
-  At high-water the submitter gates *per command* — it issues the next READ
-  as soon as consumption frees at least one command credit below high-water
-  (ε, control law below). Sustained submitter
-  demand therefore converges to the consumer's rate; the HYPOTHESIS is that
-  the drive's own speed-matching steps tape speed down to match and streams
-  continuously without repositioning. **That is a hypothesis about the
-  drive, not an invariant this design can promise** — the controller treats
-  IN_BAND as provisional and demotes on observed evidence (control law
-  below); leg 3 proves or disproves it. The reservoir hovers at high-water
-  and absorbs band-granularity jitter (the drive's internal buffer absorbs
-  the rest).
-- **Sub-band consumer (below the drive's lowest speed-matching band):** the
-  drive cannot go slow enough; without intervention it backhitches
-  continuously. This is the **stop-start batching fallback**: at high-water
-  the submitter stops entirely and waits for **low-water** before resuming
-  (full hysteresis span), producing the §4.1 park/drain/resume cycle.
+- **Every slower consumer:** fill at whatever rate the drive gives (the
+  drive's own hardware speed-matching governs the instantaneous fill rate
+  — no software control law, no consumer-rate estimation, no park
+  detection); at **high-water STOP issuing READs** — the drive, seeing no
+  demand, parks cleanly; **drain to low-water; resume** (§4.3 proof
+  first). That is the whole mechanism.
 
-**Unified control law (SPECIFIED — verify major; v0.2 left ε, sampling,
-dwell, and the in-band proof obligation undefined):** pause at high-water,
-resume at a regime-dependent threshold. Every parameter is named so the
-controller is implementable without invention:
+**Why no park detection is needed:** the reservoir bounds reposition
+COUNT by construction — §4.1's arithmetic (≈ `restore_bytes × (d−c) /
+(d × span)`) is the wear guarantee, and it holds regardless of what the
+drive's servo does between watermarks. The design promises clean bounded
+stop-starts, not zero of them.
 
-- **States:** `STREAMING` (consumer ≥ drive rate; watermarks never trip),
-  `IN_BAND` (per-command gating — always PROVISIONAL), `SUB_BAND`
-  (full-hysteresis stop-start batching, §4.1).
-- **Resume thresholds and ε:** IN_BAND resumes at `high_water − ε` with
-  **ε = one full command credit = `effective_read_batch_blocks ×
-  block_size`** (1 MiB today) — never less, so one consumption step always
-  admits at least one whole command without immediately re-tripping the
-  gate. SUB_BAND resumes at `low_water` (full span). **Overshoot bound,
-  stated:** the gate is checked before issue and exactly one command is
-  ever in flight, so occupancy exceeds high-water by at most one command's
-  bytes — asserted in the hermetic rows (§10).
-- **Rate estimator:** consumer drain rate is an EWMA over fixed
-  **Δ = 500 ms sampling periods** (bytes consumed per period), time
-  constant **τ = 10 s** (α = 1 − e^(−Δ/τ) ≈ 0.049), evaluated once per
-  period. The EWMA is a demand proxy ONLY — it cannot see drive-buffer
-  state, tape speed bands, backhitches, or whether the drive has already
-  parked; that blindness is exactly why IN_BAND is provisional.
-- **Regime selection, hysteresis, dwell:** enter SUB_BAND when EWMA <
-  `floor × 0.9` sustained 10 s; promote SUB_BAND → IN_BAND when EWMA >
-  `floor × 1.1` sustained 10 s **and** a **minimum regime dwell of 30 s**
-  since the last transition has elapsed (a bursty consumer straddling the
-  thresholds gets batching, not thrash). Demotions in the safety/wear
-  direction (→ SUB_BAND) are exempt from dwell — they act immediately.
-- **Negative feedback — the demotion rule (in-band is proven by the
-  drive, not assumed):** any evidence of a park/backhitch while under
-  IN_BAND control demotes to SUB_BAND immediately, for the remainder of
-  the window (diag notes the demotion + cause; re-promotion is not
-  attempted intra-window). Evidence sources, cheapest first: (a) a READ
-  ioctl completing over **`park_detect_ioctl_ms` = 1 s** under IN_BAND
-  gating — a drive that had to relocate answers in seconds, not
-  milliseconds; (b) LOG SENSE repositioning-counter deltas, polled by the
-  submitter between commands (~60 s cadence under IN_BAND; ~ms cost, same
-  thread, never concurrent with a data command) and at every park and
-  session close. Leg 3 refines both detector thresholds.
-- **What is promised vs measured:** SUB_BAND's park/resume arithmetic
-  (§4.1) is the design's wear guarantee. IN_BAND
-  streaming-without-repositioning is a measured outcome — v0.2's "zero
-  parks" claim is DELETED; leg 3 proves it or the negative feedback
-  converges every sub-native consumer to clean batching, and "never
-  continuous shoe-shine" survives on that mechanism alone.
-
-Regime selection compares the EWMA against the configured drive floor
-(`read_drive_floor_mib_s`, §4.8). The floor default is conservative
-(~⅓ native ≈ 100 MiB/s for HH LTO-9); **leg 3 qualifies the real floor for
-this drive** and the default is corrected from measurement.
+**Overshoot bound (kept from v0.3):** the gate is checked before issue and
+exactly one command is ever in flight, so occupancy exceeds high-water by
+at most one command's bytes — asserted in the hermetic rows (§10).
 
 ### 4.3 SAFETY: park and resume never weaken position trust
 
@@ -626,20 +604,17 @@ this drive** and the default is corrected from measurement.
   pauses (verify major: v0.2's 250 ms threshold was an unqualified parking
   proxy; nothing establishes this drive cannot reposition inside a shorter
   pause).** Two pause classes, two rules:
-  - **Deliberate gate pauses** — every pause the controller itself creates
-    (SUB_BAND watermark park AND IN_BAND per-command gating), **regardless
-    of duration**: the first command on resume is an explicit
+  - **Watermark parks — every park→resume, MANDATORY, regardless of
+    duration:** the first command on resume is an explicit
     **READ POSITION**, verified against the expected cursor via the
     existing `DevicePositionProof` machinery, and **the passing proof is
     an explicit precondition for the next READ** — encoded as submitter
     states `GATED → RESUMING(rp-pending) → FILLING`, where FILLING is
-    reachable only through a passing proof. Cost honesty: under IN_BAND
-    this is one ~1 ms RP per command, but under IN_BAND the submitter is
-    by definition not the bottleneck (it paces down to the consumer's
-    rate), so the RP hides inside the gate pause and costs zero
-    end-to-end; it also upgrades every IN_BAND handoff to `Device` proof
-    evidence, which tightens the §5.5 release frontier for free. Under
-    SUB_BAND, one RP per park/resume cycle is noise against a
+    reachable only through a passing proof. The resume RP **proves the
+    cursor through the LAST COMPLETED command** (nothing has moved since)
+    and enters the §5.5 frontier as a `ProofFrontier` message attached to
+    exactly that seq/cursor — never credited to the command about to be
+    issued. Cost: one ~1 ms RP per park/resume cycle — noise against a
     multi-second reposition.
   - **Incidental waits** (free-channel wait with the gate open — decode
     slow returning buffers): re-proof before the next READ when the wait
@@ -650,7 +625,7 @@ this drive** and the default is corrected from measurement.
     250 ms the constant is dropped in favor of conservative
     always-re-proof. Incidental waits under healthy streaming are
     microseconds; the constant exists only to keep the hot path free of
-    per-command RPs where no real pause happened.
+    RPs where no real pause happened.
 
   Mismatch ⇒ `mark_position_unknown()` + poison — identical to the
   tripwire path. The 1 GiB drift tripwire continues unchanged on top of
@@ -827,14 +802,15 @@ non-swappable". Replaced wholesale:
 - **Atomic reservation manager, permits before allocation.** One
   `IoMemoryReservation` manager (generalizing the TIO-5b
   `spool_tmpfs_ram_budget` semaphore machinery in
-  `remanence-api/src/lib.rs`) owns the ceiling. Order, per slab:
-  **reserve locked-byte permit → allocate (checked, page-aligned) →
+  `remanence-api/src/lib.rs`) owns the ceiling. Order, per RESERVOIR
+  slab: **reserve byte permit → allocate (checked, page-aligned) →
   `mlock`** — failure at ANY step rolls the permit back before the error
-  propagates (RAII permits). The manager's invariant — Σ outstanding
-  permits ≤ ceiling — is asserted and RACED in tests: two streams plus
-  the spool growing concurrently against a near-exhausted ceiling, granted
-  permits never exceeding it (the concurrent-growth race row, §10 — not
-  merely second-stream startup).
+  propagates (RAII permits). Spool growth reserves permits from the SAME
+  ceiling but its tmpfs pages are not mlocked (scoping below). The
+  manager's invariant — Σ outstanding permits ≤ ceiling — is asserted and
+  RACED in tests: two streams plus the spool growing concurrently against
+  a near-exhausted ceiling, granted permits never exceeding it (the
+  concurrent-growth race row, §10 — not merely second-stream startup).
 - **Minimum pool locks or the window REFUSES.** A window opens only if its
   minimum pool (`staging_ring_buffers` buffers) can be reserved,
   allocated, AND mlocked. If minimum mlock fails, the window refuses to
@@ -842,13 +818,17 @@ non-swappable". Replaced wholesale:
   fallback ring — v0.2's clamp silently shipped swappable memory under a
   "never swap" banner; the honest choices were refuse or explicitly
   permit a swappable legacy minimum, and this design REFUSES (fail-closed
-  culture; the fix is the unit file, not a degraded mode). The claims are
-  now scoped honestly: **every reservoir/spool slab byte in a running
-  window is mlocked** (never-swap holds for what the daemon owns), and
-  **the daemon's I/O memory can never exceed the fixed ceiling under its
-  cgroup limit** (never-OOM is a statement about this daemon's
-  reservations; other processes on the box are the cgroup's job, not a
-  promise this design can make).
+  culture; the fix is the unit file, not a degraded mode).
+- **Claim scoping (verify major, v0.4 sharpened):** never-swap is a
+  **RESERVOIR-only** guarantee — every reservoir slab byte in a running
+  window is mlocked. The tmpfs `Spool` is **ceiling-RESERVED but NOT
+  guaranteed-resident**: tmpfs pages are file-backed and swappable under
+  memory pressure; the reservation bounds the spool's SIZE against the
+  ceiling, and no never-swap claim is made for it (its durability story
+  never depended on residency — it is a pre-commit spool). Never-OOM is a
+  statement about this daemon's reservations under its cgroup limit
+  (`io_memory_ceiling + baseline headroom ≤ MemoryMax`); other processes
+  on the box are the cgroup's job, not a promise this design can make.
 - **Incremental growth, same funnel:** reservoir slabs are allocated on
   demand during fill through the same reserve→alloc→mlock sequence; a
   growth-step failure (permit denied or mlock refused) is non-fatal —
@@ -882,41 +862,41 @@ staging_ring_buffers         = 4        # existing; now the reservoir's MINIMUM 
 read_batch_blocks            = 16       # existing, unchanged semantics
 read_reservoir_bytes         = "8GiB"   # NEW: per restore stream — DERIVED default, below
 read_reservoir_high_pct      = 90       # NEW: stop-issuing threshold (% of effective cap)
-read_reservoir_low_pct       = 25       # NEW: sub-band resume threshold (% of effective cap)
-read_drive_floor_mib_s       = 100      # NEW: lowest speed-matching band (leg-3 qualified)
+read_reservoir_low_pct       = 25       # NEW: resume threshold (% of effective cap)
 position_check_bytes_ranged  = "256MiB" # NEW (§5.5): proof cadence, hash-less windows
 ```
 
-`T_REPROOF_INCIDENTAL` (250 ms, §4.3) and `park_detect_ioctl_ms` (1 s,
-§4.2) are deliberately NOT config keys — named code constants (verify
-minor: v0.2 called `T_reproof` a "default" while listing no key). The
-former no longer touches deliberate-park decisions at all (§4.3).
+`T_REPROOF_INCIDENTAL` (250 ms, §4.3) is deliberately NOT a config key —
+a named code constant (verify minor: v0.2 called `T_reproof` a "default"
+while listing no key). It never touches deliberate-park decisions (§4.3).
+(v0.3's `read_drive_floor_mib_s` and `park_detect_ioctl_ms` are GONE with
+the IN_BAND regime — nothing consumes a floor or a park detector.)
 
 Validation, fail-closed at config load: `0 < low_pct < high_pct ≤ 100`
 (degenerate `high ≤ low` REJECTED, per owner), `read_reservoir_bytes ≥`
-minimum pool bytes, `read_drive_floor_mib_s > 0`,
-`spool_tmpfs_ram_budget ≤ io_memory_ceiling`, per-stream reservoir ≤
-ceiling; the effective ranged proof cadence is clamped to
-`min(position_check_bytes_ranged, effective_reservoir_bytes / 2)` (§5.5).
+minimum pool bytes, `spool_tmpfs_ram_budget ≤ io_memory_ceiling`,
+per-stream reservoir ≤ ceiling; the effective ranged proof cadence is
+clamped to `min(position_check_bytes_ranged, effective_reservoir_bytes /
+2)` (§5.5).
 
-**The 8 GiB default is DERIVED, not chosen by feel (verify major):** from
-the §4.1 anti-wear target (≤ 60 cycles/hr) at the worst sub-band consumer
-— just under the ~100–110 MiB/s floor — against a ~300 MB/s drive:
-`span ≥ 60 s ÷ (1/110 + 1/190) ≈ 4.1 GiB`, and span = 65% of the reservoir
-at 90/25 ⇒ reservoir ≥ ~6.3 GiB, rounded up to **8 GiB** (span 5.2 GiB ⇒
-~47 cycles/hr worst-case; slower consumers cycle LESS often). Re-derived
-if leg 3 moves the floor or the drive-rate anchor. Sizing guidance in the
-reference doc: parks-per-restore ≈ restore_bytes ÷ effective span
-(= `(high−low)% × reservoir`); the owner's 100 GB example yields ≈ 277
-parks per full 18 TB tape at ~6/hr-class cycle rates. **4 GiB is an
-experimental MINIMUM for small-RAM hosts, not a sane anti-wear default**
-(v0.2 mislabeled it): at 90/25 its 2.6 GiB span drains in ~24 s at
-110 MiB/s ⇒ ~150 cycles/hr and ~7,100 cycles across a full 18 TiB restore
-— far above the target; the config comment and reference doc must say so.
-Restore-heavy deployments with slow consumers SHOULD raise the reservoir
-(100 GB-class for full-tape sub-band workloads); the Drishti
-reposition-rate signal (§8) is the tell that a deployment needs a bigger
-reservoir.
+**The 8 GiB default is DERIVED, not chosen by feel:** from the §4.1
+anti-wear target (≤ 60 cycles/hr) at the worst-case consumer rate
+`c = d/2` against a ~300 MB/s drive: cycle time `span/c + span/(d−c) =
+4·span/d ≥ 60 s` ⇒ `span ≥ 15·d ≈ 4.4 GiB`, and span = 65% of the
+reservoir at 90/25 ⇒ reservoir ≥ ~6.8 GiB, rounded up to **8 GiB**
+(span 5.2 GiB ⇒ ~51 cycles/hr worst-case; both slower and faster
+consumers cycle LESS often). Re-derived if leg 3 moves the drive-rate
+anchor. Sizing guidance in the reference doc: parks-per-restore ≈
+`restore_bytes × (d−c) ÷ (d × span)`, bounded by `restore_bytes ÷ span`
+(§4.1); the owner's 100 GB example yields ≤ 277 parks per full 18 TB tape
+at ~6/hr-class cycle rates. **4 GiB is an experimental MINIMUM for
+small-RAM hosts, not a sane anti-wear default**: at 90/25 its 2.6 GiB
+span gives ~100 cycles/hr worst-case and ~4,500 cycles across a full
+18 TiB restore at a 110 MiB/s consumer — far above the target; the config
+comment and reference doc must say so. Restore-heavy deployments with
+slow consumers SHOULD raise the reservoir (100 GB-class for full-tape
+slow-consumer workloads); the Drishti reposition-rate signal (§8) is the
+tell that a deployment needs a bigger reservoir.
 
 ## 5. Safety composition — one funnel, wrapped, never duplicated
 
@@ -1036,16 +1016,20 @@ mechanism, no exemption.
   submitter/reservoir/decode/sender pipeline (`HandoffBlockSource` + range
   framing in the decode layer). The one-path claim is true again; the
   second synchronous consumer is deleted.
-- **Proof frontier, carried in-band:** every delivery is a
-  `SequencedHandoff` (§3.2) — strictly monotonic `seq`,
-  `plan_records_end`, and the preserved `PositionAfter` evidence. The
-  decode thread maintains **`proven_frontier`** = the greatest
-  `plan_records_end` among handoffs received **in seq order** whose
-  evidence is `Device(DevicePositionProof)` (window-open RP, periodic
-  tripwire RP, §4.3 gate-resume RP — per-command under IN_BAND — or the
-  on-demand RP below). A passing device proof after command N proves the
-  position after command N and therefore every earlier in-order handoff
-  too: the frontier jumps to N.
+- **Proof frontier, carried in-band, from exactly two sources:** data
+  deliveries are `SequencedHandoff`s (§3.2) — strictly monotonic `seq`,
+  `plan_records_end`, preserved `PositionAfter` evidence; standalone RPs
+  arrive as `ProofFrontier` messages naming the exact `through_seq` /
+  cursor they prove. The decode thread maintains **`proven_frontier`** =
+  the greatest proven `plan_records_end`, advanced **in seq order** by
+  (a) a handoff whose evidence is `Device(DevicePositionProof)` — the
+  funnel's periodic inline **tripwire RP**, proving through THAT command
+  (cadence clamped to 256 MiB in hash-less windows, below), and (b) a
+  `ProofFrontier` message — the window-open RP, the **mandatory §4.3
+  park-resume RP**, or the on-demand RP below — proving through the LAST
+  COMPLETED command it names (never the next; §3.2). A passing device
+  proof through command N proves every earlier in-order handoff too: the
+  frontier jumps to N.
 - **Release rule (hash-less windows):** bytes are released to the sender
   only up to `proven_frontier`. Handoffs beyond it are **withheld**,
   in seq order, in a bounded pending-proof queue on the decode side.
@@ -1075,9 +1059,9 @@ mechanism, no exemption.
   in doubt die in the reservoir.
 - **Full-object reads:** exempt from the release rule — their end-to-end
   manifest hash (§3.4) catches wrong-position data with certainty at
-  delivery. The `SequencedHandoff` metadata still flows (ONE delivery
-  protocol, no variant types); the decode layer simply does not apply the
-  bound.
+  delivery. The same `ReadDelivery` protocol flows (ONE delivery protocol
+  for full-object and ranged windows alike); the decode layer simply does
+  not apply the bound.
 - **Upgrade path, named:** if/when the RAO format grows per-chunk digests,
   the decode layer verifies ranges directly and the release bound retires.
   Format question, tracked in §12, not R2 scope.
@@ -1090,7 +1074,7 @@ attributability. v0.2 stated the right precedence but proposed a once-cell
 — first-writer-wins, which CANNOT enforce a priority order (a sender
 failure that fills the cell beats the later-arriving SCSI root). v0.3:
 
-- The delivery channel carries `Result<SequencedHandoff, TapeIoError>`
+- The delivery channel carries `Result<ReadDelivery, TapeIoError>`
   (§3.2); the submitter's classified root error travels **in-band, exactly
   once**.
 - **Precedence: P0 submitter-classified funnel/SCSI root > P1
@@ -1114,6 +1098,15 @@ failure that fills the cell beats the later-arriving SCSI root). v0.3:
   proof — and emits the terminal gRPC status exactly once** from the
   accumulator. No thread fabricates a terminal status from its local
   view; nothing is emitted while any upstream producer is live.
+- **Panics: post-join ranked-cause translation (mechanism CHOSEN, v0.4 —
+  over per-stage `catch_unwind`, which would force sender-ownership
+  contortions to keep channel-drop ordering intact).** A panicking stage
+  records nothing itself; its unwind drops its channel endpoints, so the
+  §3.2 close propagation and drop order hold unaided. At the barrier,
+  a `JoinHandle` that returns a panic is translated into a cause at that
+  stage's rank (decode panic ⇒ P1, sender panic ⇒ P2) and offered to the
+  accumulator under the same replace-iff-strictly-higher rule — a
+  recorded P0 SCSI root still wins over any panic translation.
 - **Disconnect short-circuit:** on proven client death the full teardown
   still runs (poison, drain, joins, pool accounting) but status emission
   is skipped — no peer. Asserted in tests alongside the race rows (§10):
@@ -1207,9 +1200,9 @@ covers the real workload shape.
   230–280 MB/s; honest unknown until leg 0 decomposes R1 in the field.
 - **1GbE client:** ~105–110 MB/s, network-bound. **Deployment note, not a
   defect and not a reason to skip R2 (owner):** the drive-side behavior is
-  now §4's — in-band speed-matching if ≥ the drive floor, clean park/resume
-  batching if below; never continuous shoe-shine (the "never" is enforced
-  by §4.2's demote-on-evidence fallback, not by the in-band hypothesis).
+  now §4's — clean bounded park/resume batching, never continuous
+  shoe-shine (the "never" holds by construction: reposition count is
+  bounded by the §4.1 arithmetic, no detection or control law involved).
 - **What this design does NOT claim:** that 300 MB/s end-to-end is reachable
   on any path whose slowest link is below 300; that the 13.28 number is
   explained until leg 0 measures the landed R1 in the field; that
@@ -1225,9 +1218,8 @@ funnel, restore_total decomposition line) — full spec in §3.6; summary:
   deliberate waits; the acceptance signal), window intent marker at window
   open. **Per-command audit events retained; no coalescing (§3.6).**
 - Reservoir: live occupancy gauge, withheld-pending-proof gauge (§5.5),
-  park/resume cycle counter, current regime (STREAMING / IN_BAND-provisional
-  / SUB_BAND) + demotion events with cause (§4.2 negative feedback),
-  effective reservoir bytes + clamp reason at window open.
+  park/resume cycle counter, effective reservoir bytes + clamp reason at
+  window open.
 - Decode: busy vs recv-wait. Sender: busy vs stall (`sender_stall_ms`,
   landed) — now a re-arming diagnostic tick, not a kill (§4.5).
 - restore_total: `bottleneck=` (max busy fraction); `relay_ms` becomes
@@ -1235,8 +1227,9 @@ funnel, restore_total decomposition line) — full spec in §3.6; summary:
 - Cross-thread counters: atomics or post-join snapshot (§3.6).
 - **Drishti/viveka slow-I/O signal — DUAL-SIDED (owner decision):** emit a
   "drive below streaming rate / reposition-rate" signal for **both** restore
-  (read: park/resume rate, sub-band regime entry, reposition counts from
-  LOG SENSE at session close + live park counter) **and** ingest (write:
+  (read: park/resume cycle rate + live park counter — the pipeline's own
+  counters; no LOG SENSE reposition counter exists on this stack) **and**
+  ingest (write:
   feed-rate below streaming band on the write submitter's existing diag).
   This is the "unmonitored slow share quietly wears the drive" guard — the
   alert, wired into the viveka policy config, is what turns a chronically
@@ -1272,15 +1265,17 @@ funnel, restore_total decomposition line) — full spec in §3.6; summary:
    `valid_bytes`, now cross-checked against `bytes_transferred` (§4.4);
    sentinel test re-run across multi-window reservoir-scale reuse.
 5. **No CDB after invalidation:** after ILI/reset-UA/poison, zero data CDBs
-   without explicit reposition + proof (funnel gate, asserted). After ANY
-   deliberate gate pause (either regime, regardless of duration) and after
-   any incidental wait ≥ `T_REPROOF_INCIDENTAL`: no data CDB before a
-   passing READ POSITION re-proof — proof-pass is a state-machine
-   precondition, `GATED → RESUMING(rp-pending) → FILLING` (§4.3).
+   without explicit reposition + proof (funnel gate, asserted). After
+   EVERY watermark park (regardless of duration) and after any incidental
+   wait ≥ `T_REPROOF_INCIDENTAL`: no data CDB before a passing
+   READ POSITION re-proof — proof-pass is a state-machine precondition,
+   `GATED → RESUMING(rp-pending) → FILLING` (§4.3).
 6. **No delivery past the proven frontier, for hash-less reads** (§5.5):
    ranged windows release bytes only ≤ `proven_frontier`, advanced solely
-   by in-seq-order `Device` evidence in `SequencedHandoff`s; withheld
-   handoffs are reservoir-charged and are DISCARDED on proof failure.
+   by in-seq-order proof evidence — `Device`-evidence handoffs (inline
+   tripwire RP) and `ProofFrontier` messages, each attached to the exact
+   cursor it proves; withheld handoffs are reservoir-charged and are
+   DISCARDED on proof failure.
 7. **Plan-bounded motion:** total records issued == plan, asserted; no
    speculative record, ever.
 
@@ -1325,7 +1320,9 @@ Hermetic (model transport / chaos), symmetric to TIO-5 §9's write rows:
 - **error precedence rows (§5.6):** submitter SCSI error + racing decode
   panic + sender stall ⇒ client status carries the SCSI root cause **even
   when the SCSI root is recorded last** (accumulator replace rule beats
-  arrival order); record-then-close ordering asserted per thread; terminal
+  arrival order); a panicked stage is translated post-join into its rank
+  (decode ⇒ P1, sender ⇒ P2) and never outranks a recorded P0;
+  record-then-close ordering asserted per thread; terminal
   status emitted exactly once, only after all three joins; genuine client
   disconnect ⇒ teardown runs, emission skipped;
 - sentinel stale-tail across multi-window reservoir-scale reuse;
@@ -1333,19 +1330,17 @@ Hermetic (model transport / chaos), symmetric to TIO-5 §9's write rows:
   issues no further READs (≤1 completes), poison protocol ordering
   asserted (close-before-join, §3.2 drop order), pool accounting balances;
   symmetric row for free-channel disconnect;
-- **reservoir/controller rows (§4):** watermark park at high-water /
-  resume at low-water (SUB_BAND) vs per-command gating (IN_BAND); ε resume
-  credit admits one full command; occupancy overshoot ≤ one command's
-  bytes; regime switch hysteresis + 30 s dwell (no flapping at the floor
-  boundary, no thrash under a bursty consumer straddling the thresholds);
-  **demotion on suspected park** (ioctl-latency-spike row; LOG SENSE
-  repositioning-delta row) acts immediately, no dwell, sticks for the
-  window; **position re-proof rows:** EVERY deliberate gate-pause resume —
-  both regimes, zero-duration included — requires a passing RP before the
-  next READ (`GATED → RESUMING → FILLING` precondition asserted);
-  incidental wait ≥ `T_REPROOF_INCIDENTAL` likewise; RP mismatch ⇒ poison;
-  degenerate config rejection (`high ≤ low`, reservoir < minimum pool,
-  spool budget > ceiling); **RAM reservation rows (§4.6):** Σ granted
+- **reservoir rows (§4):** park at high-water / resume at low-water;
+  occupancy overshoot ≤ one command's bytes; **position re-proof rows:**
+  EVERY park→resume — zero-duration included — requires a passing RP
+  before the next READ (`GATED → RESUMING → FILLING` precondition
+  asserted); **resume-RP attribution:** the resume RP's `ProofFrontier`
+  names the LAST COMPLETED command's seq/cursor — a fixture crediting it
+  to the next-issued command must FAIL (the §3.2 off-by-one row);
+  incidental wait ≥ `T_REPROOF_INCIDENTAL` likewise re-proves; RP
+  mismatch ⇒ poison; degenerate config rejection (`high ≤ low`, reservoir
+  < minimum pool, spool budget > ceiling); **RAM reservation rows
+  (§4.6):** Σ granted
   permits ≤ ceiling under a concurrent-growth RACE (two streams + spool
   against a near-exhausted ceiling); permit rollback on alloc/mlock
   failure; refuse-to-start on minimum-pool mlock failure (no swappable
@@ -1398,20 +1393,15 @@ Physical (next MSL3040 window), in order:
    (drive-limited proof). Target 300 MB/s (§11).
 2. Chunk-size and h2-window sweep over one LAN client (H2/H3 residuals);
    requires the sutra-agent client-side matching (§11).
-3. **Throttled-consumer soak + floor qualification:** cap the client at
-   ~100 MB/s and then well below the floor (~30 MB/s), ≥ 30 min each;
-   qualify the drive's real speed-matching floor
-   (`read_drive_floor_mib_s`); **measure IN_BAND behavior — the
-   streaming-without-repositioning hypothesis is proven or demoted HERE,
-   never assumed (§4.2)** — and verify the demotion path fires on any
-   observed park; sub-band ⇒ clean park/resume cycles at the configured
-   watermarks, reposition counts (library syslog + LOG SENSE)
-   ≈ predicted cycles and **orders of magnitude below un-reservoired
-   shoe-shine**; validate the ≤ 60 cycles/hr anti-wear arithmetic at the
-   qualified floor and re-derive the §4.8 default if the floor moved;
-   qualify the drive's minimum observed park latency
-   (`T_REPROOF_INCIDENTAL` keep-or-drop, §4.3); park re-proof RPs visible
-   in diag; Drishti signal fires.
+3. **Throttled-consumer soak:** cap the client at ~150 MB/s (the §4.1
+   worst-case `c = d/2`), ~100 MB/s, and ~30 MB/s, ≥ 30 min each; clean
+   park/resume cycles at the configured watermarks; reposition counts
+   (library syslog) ≈ predicted cycles per the §4.1 arithmetic and
+   **orders of magnitude below un-reservoired shoe-shine**; validate the
+   ≤ 60 cycles/hr anti-wear arithmetic at the worst case and re-derive
+   the §4.8 default if the drive-rate anchor moves; qualify the drive's
+   minimum observed park latency (`T_REPROOF_INCIDENTAL` keep-or-drop,
+   §4.3); park re-proof RPs visible in diag; Drishti signal fires.
 4. **Multi-object restore leg (panel):** N-clip pull across the tape;
    measure per-object positioning share; this leg prices the §3.5
    follow-up arc with data.
@@ -1422,9 +1412,13 @@ Physical (next MSL3040 window), in order:
 
 ## 11. Config and rollout
 
-Config: §4.8 (two existing keys, four new reservoir/controller keys, all
-documented in `reference-configuration.md`, degenerate configs rejected at
-load). **No mode switches** (v0.7 one-path rule / NOT-in-production
+Config: §4.8 (two existing keys, five new keys — the daemon
+`io_memory_ceiling` plus four reservoir/proof keys — all documented in
+`reference-configuration.md`, degenerate configs rejected at load), plus
+the §4.5 keepalive transport defaults (server 30 s interval / 20 s
+timeout; client 30 s / 20 s with `keep_alive_while_idle(true)`) recorded
+in `reference-configuration.md` alongside the R1 h2 windows. **No mode
+switches** (v0.7 one-path rule / NOT-in-production
 policy): the pipelined read path is THE read path; backout is git revert +
 previous binary; old behavior survives as the golden READ-CDB fixture and
 the existing cross-version stored-image tests.
@@ -1444,10 +1438,11 @@ Stages (each independently landable, diff-gated, scenario-verified):
    Additionally, R2 now carries the anti-shoe-shine reservoir — a wear
    mechanism wanted independent of peak throughput — which moots
    gate-on-throughput on its own. Scope: §3 architecture (incl. retyped
-   consumer), §4 reservoir/controller, §4.4 funnel hardening (prerequisite
-   commit), §5 state machine incl. ranged unification, §8 diag, §10
-   hermetic rows. Prerequisite ordering within R2: funnel hardening →
-   trait split (`BlockRead`) → submitter/reservoir → ranged unification.
+   consumer), §4 reservoir (watermark stop-start), §4.4 funnel hardening
+   (prerequisite commit), §5 state machine incl. ranged unification, §8
+   diag, §10 hermetic rows. Prerequisite ordering within R2: funnel
+   hardening → trait split (`BlockRead`) → submitter/reservoir → ranged
+   unification.
 3. **Cross-repo deliverable (owner decision): sutra-agent client-side
    matching.** The client must set matching h2 stream/connection windows
    and the 256 KiB chunk request on its channel, or H2 re-appears
@@ -1460,11 +1455,11 @@ Stages (each independently landable, diff-gated, scenario-verified):
    below-streaming-rate / reposition-rate signal (§8) lands with R2's diag
    and is registered in the viveka policy config. Write-side spool-sizing
    analog: follow-up, noted in §8.
-5. Physical validation per §10; leg 3 corrects `read_drive_floor_mib_s`
-   and the watermark defaults from measurement; leg 4 prices the
-   positioning-amortization arc.
+5. Physical validation per §10; leg 3 validates the park-cycle arithmetic
+   and re-derives the reservoir/watermark defaults if the measured
+   drive-rate anchor moves; leg 4 prices the positioning-amortization arc.
 
-## 12. Open questions — v0.1 answers recorded, v0.3 residuals
+## 12. Open questions — v0.1 answers recorded, v0.4 residuals
 
 **Answered (owner, 2026-07-11):**
 
@@ -1483,43 +1478,40 @@ Stages (each independently landable, diff-gated, scenario-verified):
 6. ~~4 KiB coalesced copy-out~~ — **in R2 iff the pre-freeze micro-bench
    shows it binding** (§7.2, §10).
 
-**Remaining open (tracked for the re-verify / field legs):**
+**Remaining open (tracked for the final verify / field legs):**
 
 1. **Read ioctl cadence** (§1.2/§7.2): the model's biggest uncertainty;
    leg 0/1 measures. If materially worse than write cadence, §7 reflows —
    the design's *structure* is unaffected, its numbers are.
-2. **Drive speed-matching floor** (`read_drive_floor_mib_s` default):
-   conservative 100 MiB/s until leg 3 qualifies the real band edge for
-   this drive.
-3. **Watermark defaults** (90/25 on the DERIVED 8 GiB default; 4 GiB
-   relabeled experimental minimum — §4.8): the derivation is only as good
-   as its inputs (floor, drive rate, ≤60 cycles/hr target); leg 3's
+2. **Watermark defaults** (90/25 on the DERIVED 8 GiB default; 4 GiB
+   labeled experimental minimum — §4.8): the derivation is only as good
+   as its inputs (drive-rate anchor, ≤60 cycles/hr target); leg 3's
    park-cycle counts confirm or re-derive. Sizing guidance (bigger
    reservoir for slow-consumer deployments) is documentation, but whether
    the *default* should be larger on big-RAM hosts is a deployment
    judgment for after leg 3.
-4. **Per-range digests in RAO** (§5.5): format-layer question — would
+3. **Per-range digests in RAO** (§5.5): format-layer question — would
    retire the ranged proof-frontier release bound (§5.5). Owned by the RAO
    format thread, not R2.
-5. **Sender-thread necessity post-R1/R2** (v0.1 Q4): keep the split (it
+4. **Sender-thread necessity post-R1/R2** (v0.1 Q4): keep the split (it
    isolates network stalls from hash/parse and now feeds the reservoir
    drain); with the decode→sender channel byte-sized (§3.3), measure, and
    simplify later if the sender is provably pass-through.
-6. **Parked-session occupancy policy** (§4.5): park-and-wait is the v1
+5. **Parked-session occupancy policy** (§4.5): park-and-wait is the v1
    rule (owner); if the field produces parked-forever sessions holding
    drive reservations, an idle policy is a *future* design with its own
    review — explicitly NOT designed now (NOT-in-production rule: no
    speculative eviction machinery).
-7. **Positioning-amortization arc** (§3.5): leg 4 prices it; likely the
+6. **Positioning-amortization arc** (§3.5): leg 4 prices it; likely the
    next TIO thread after R2 for clip-pull workloads.
-8. **Anti-wear target provenance** (§4.1): ≤ 60 cycles/hr is engineering
+7. **Anti-wear target provenance** (§4.1): ≤ 60 cycles/hr is engineering
    judgment, stated as revisable; vendor mechanism-life data would firm
-   it; leg 3 validates the arithmetic at the qualified floor.
-9. **Data-out resid reporting on this stack** (§4.4): the leg-0 probe
+   it; leg 3 validates the arithmetic at the measured worst case.
+8. **Data-out resid reporting on this stack** (§4.4): the leg-0 probe
    decides whether the write-side residual helper is protective or
    vacuous on E208e/mpt3sas (it is safe either way — one-sided check).
-10. **Minimum park latency** (§4.3): can this drive stop/reposition inside
-    250 ms? Leg 3 measures; decides whether `T_REPROOF_INCIDENTAL`
-    survives or incidental waits go to conservative always-re-proof.
-    (Deliberate pauses are already duration-independent — this residual
-    touches only the incidental-wait heuristic.)
+9. **Minimum park latency** (§4.3): can this drive stop/reposition inside
+   250 ms? Leg 3 measures; decides whether `T_REPROOF_INCIDENTAL`
+   survives or incidental waits go to conservative always-re-proof.
+   (Watermark parks are already duration-independent — this residual
+   touches only the incidental-wait heuristic.)
