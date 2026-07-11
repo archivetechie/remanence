@@ -5,9 +5,10 @@ pure framing arithmetic in `crates/remanence-aead/src/stream.rs`,
 `crates/remanence-aead/src/range.rs`, and
 `crates/remanence-aead/src/inspect.rs`.
 
-Constants:
+Parameters and constants:
 
-- `H = 128` = encrypted RAO header length
+- `H` = scalar encrypted RAO header length (`128` for v1 and v2)
+- `K` = plaintext key-frame length (`0` for v1; variable for v2)
 - `F = 16` = completion footer length
 - `T = 16` = ChaCha20-Poly1305 tag length
 - `C` = AEAD plaintext chunk size
@@ -28,13 +29,13 @@ For valid chunk-count inputs and no `u64` overflow,
 ## A3 -- stored object size
 
 For valid payload inputs and no `u64` overflow,
-`stored_size_from_parts(C, M, P)` returns
-`round_up(H + M + payload_frame_len(P, C) + F, C)`.
+`stored_size_from_parts_with_prefix(H, K, C, M, P)` returns
+`round_up(H + K + M + payload_frame_len(P, C) + F, C)`.
 
 ## A4 -- ciphertext chunk offset
 
-For no `u64` overflow, `cipher_offset(M, C, b)` returns
-`H + M + b * (C + T)`.
+For no `u64` overflow, `cipher_offset_with_prefix(H, K, M, C, b)` returns
+`H + K + M + b * (C + T)`.
 
 ## A5 -- plaintext range validation
 
@@ -71,6 +72,16 @@ The Lean proof also covers small but important edge contracts:
 - zero chunk size is rejected by chunk-size validation and non-empty range
   planning
 - empty ranges are rejected by `nonempty_range_plan` after range validation
+
+## A9 -- generic v1/v2 prefix
+
+`generic_prefix_geometry`, `generic_footer_end_geometry`,
+`generic_stored_size_v2_uses_key_frame_prefix`, and
+`generic_inspect_numerator_geometry` quantify the offset, stored-size, and
+inspect formulae once over arbitrary `(H, K)`. The v1 `(128, 0)` and v2
+`(128, key_frame_len)` geometries are direct instances. The Rust extraction
+exercises the corresponding generic stored-size, offset, and inspect functions
+for both instances.
 
 ## Trust anchor
 

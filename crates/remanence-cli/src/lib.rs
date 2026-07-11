@@ -51,7 +51,10 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use remanence_aead::{header::object_id_field, inspect_bytes, open_to_vec, RootKey};
+use remanence_aead::{
+    header::object_id_field, inspect_bytes, open, open_to_vec, seal_envelope, EnvelopeSealOptions,
+    RaoHeader, RecipientPublicKey, RootKey, SealOptions, RAO_HEADER_LEN,
+};
 use remanence_api::pb;
 #[cfg(feature = "foreign-bru")]
 use remanence_bru::{BruFormat, BRU_BLOCK_SIZE};
@@ -1742,6 +1745,12 @@ impl DevCommand {
 
 #[derive(Subcommand, Debug)]
 enum RemArchiveCommand {
+    /// Print machine-readable archive feature capabilities.
+    Capabilities,
+
+    /// Re-seal one v1 registry object as a v2 recipient envelope.
+    Reseal(ArchiveResealArgs),
+
     /// Build a portable RAO object file from local inputs.
     Build(RemArchiveBuildArgs),
 
@@ -2141,6 +2150,8 @@ struct RemArchiveSourceArgs {
 impl From<RemArchiveCommand> for ArchiveCommand {
     fn from(value: RemArchiveCommand) -> Self {
         match value {
+            RemArchiveCommand::Capabilities => Self::Capabilities,
+            RemArchiveCommand::Reseal(args) => Self::Reseal(args),
             RemArchiveCommand::Build(args) => Self::Build(args.into()),
             RemArchiveCommand::Inspect(args) => Self::Inspect(args.into()),
             RemArchiveCommand::Extract(args) => Self::Extract(args.into()),
@@ -2316,6 +2327,12 @@ impl From<RemArchiveSourceArgs> for ArchiveSourceArgs {
 
 #[derive(Subcommand, Debug)]
 enum ArchiveCommand {
+    /// Print machine-readable archive feature capabilities.
+    Capabilities,
+
+    /// Re-seal one v1 registry object as a v2 recipient envelope.
+    Reseal(ArchiveResealArgs),
+
     /// Build a portable RAO object file from local inputs.
     Build(ArchiveBuildArgs),
 
@@ -2352,6 +2369,26 @@ enum ArchiveCommand {
 
     /// List native objects from the local catalog (no tape access).
     List(ArchiveListArgs),
+}
+
+/// Arguments for `rem archive reseal`.
+#[derive(Args, Debug)]
+struct ArchiveResealArgs {
+    /// Existing complete RAO v1 encrypted object.
+    #[arg(long, value_name = "PATH")]
+    object: PathBuf,
+
+    /// Registry root-key file used by the v1 object.
+    #[arg(long, value_name = "PATH")]
+    registry_key: PathBuf,
+
+    /// Canonical RAOR recipient public-key files, in ascending slot order.
+    #[arg(long = "recipient", value_name = "PATH", num_args = 2..=8)]
+    recipients: Vec<PathBuf>,
+
+    /// New v2 envelope object path; must not already exist.
+    #[arg(long, value_name = "PATH")]
+    out: PathBuf,
 }
 
 /// Arguments for the shared `archive build` command.
@@ -2723,7 +2760,11 @@ enum ArchiveFormat {
 impl ArchiveCommand {
     fn tape_target(&self) -> Option<&str> {
         match self {
-            Self::Build(_) | Self::Inspect(_) | Self::Extract(_) => None,
+            Self::Capabilities
+            | Self::Reseal(_)
+            | Self::Build(_)
+            | Self::Inspect(_)
+            | Self::Extract(_) => None,
             // `archive write` is state-changing; gate it through `--allow`
             // against the supplied `--library` serial.
             Self::Write(args) => Some(args.library.as_str()),
@@ -2739,6 +2780,8 @@ impl ArchiveCommand {
     fn is_dump_command(&self) -> bool {
         match self {
             Self::Build(_)
+            | Self::Capabilities
+            | Self::Reseal(_)
             | Self::Inspect(_)
             | Self::Extract(_)
             | Self::Write(_)
@@ -2760,6 +2803,8 @@ impl ArchiveCommand {
             Self::Restore(args) => &args.source,
             Self::Recover(args) => &args.source,
             Self::Build(_) => panic!("ArchiveCommand::Build has no dump/tape source"),
+            Self::Capabilities => panic!("ArchiveCommand::Capabilities has no dump/tape source"),
+            Self::Reseal(_) => panic!("ArchiveCommand::Reseal has no dump/tape source"),
             Self::Inspect(_) => panic!("ArchiveCommand::Inspect has no dump/tape source"),
             Self::Extract(_) => panic!("ArchiveCommand::Extract has no dump/tape source"),
             Self::Write(_) => panic!("ArchiveCommand::Write has no dump/tape source"),
@@ -2778,6 +2823,8 @@ impl ArchiveCommand {
             Self::Restore(args) => args.format,
             Self::Recover(args) => args.format,
             Self::Build(_) => panic!("ArchiveCommand::Build has no format"),
+            Self::Capabilities => panic!("ArchiveCommand::Capabilities has no format"),
+            Self::Reseal(_) => panic!("ArchiveCommand::Reseal has no format"),
             Self::Inspect(_) => panic!("ArchiveCommand::Inspect has no format"),
             Self::Extract(_) => panic!("ArchiveCommand::Extract has no format"),
             Self::Write(_) => panic!("ArchiveCommand::Write has no format"),
@@ -3126,6 +3173,12 @@ where
     }
     if let Command::Archive { command } = &cli.command {
         let command = command.as_ref();
+        if matches!(command, ArchiveCommand::Capabilities) {
+            return run_archive_capabilities(out, err);
+        }
+        if let ArchiveCommand::Reseal(args) = command {
+            return run_archive_reseal(args, out, err);
+        }
         if let ArchiveCommand::Build(args) = command {
             return run_archive_build(args, out, err);
         }
@@ -3457,6 +3510,172 @@ where
     }
     print_warnings(&report, err);
     ExitCode::SUCCESS
+}
+
+fn run_archive_capabilities(out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    let capabilities = json!({
+        "capabilities": ["rao-v2-envelope", "wrap-suite-hpke-v1"]
+    });
+    match serde_json::to_writer(&mut *out, &capabilities)
+        .and_then(|()| writeln!(out).map_err(serde_json::Error::io))
+    {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            let _ = writeln!(err, "error: write archive capabilities: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_archive_reseal(
+    args: &ArchiveResealArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    match reseal_archive_object(args) {
+        Ok(report) => match serde_json::to_writer(&mut *out, &report)
+            .and_then(|()| writeln!(out).map_err(serde_json::Error::io))
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                let _ = writeln!(err, "error: write reseal report: {error}");
+                ExitCode::from(1)
+            }
+        },
+        Err(error) => {
+            let _ = writeln!(err, "error: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn reseal_archive_object(args: &ArchiveResealArgs) -> Result<Value, String> {
+    if args.out.exists() {
+        return Err(format!("--out {} already exists", args.out.display()));
+    }
+    let mut encrypted = File::open(&args.object)
+        .map_err(|error| format!("open v1 object {}: {error}", args.object.display()))?;
+    let mut header_bytes = [0u8; RAO_HEADER_LEN];
+    encrypted
+        .read_exact(&mut header_bytes)
+        .map_err(|error| format!("read v1 object header: {error}"))?;
+    let input_header = RaoHeader::parse(&header_bytes)
+        .map_err(|error| format!("parse v1 object header: {error}"))?;
+    if input_header.format_version != 1 {
+        return Err("archive reseal accepts only a v1 registry object as input".to_string());
+    }
+    encrypted
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind v1 object: {error}"))?;
+    let mut recipients = Vec::with_capacity(args.recipients.len());
+    for path in &args.recipients {
+        let bytes = fs::read(path)
+            .map_err(|error| format!("read recipient {}: {error}", path.display()))?;
+        recipients.push(
+            RecipientPublicKey::parse(&bytes)
+                .map_err(|error| format!("parse recipient {}: {error}", path.display()))?,
+        );
+    }
+    if recipients.len() < 2
+        || recipients
+            .windows(2)
+            .any(|pair| pair[0].slot_index >= pair[1].slot_index)
+        || recipients.iter().enumerate().any(|(index, recipient)| {
+            recipients[..index]
+                .iter()
+                .any(|earlier| earlier.recipient_epoch_id == recipient.recipient_epoch_id)
+        })
+    {
+        return Err(
+            "recipients must contain at least two distinct epochs in ascending slot order"
+                .to_string(),
+        );
+    }
+
+    let registry_key = read_root_key_file(&args.registry_key)?;
+    let mut plaintext = tempfile::NamedTempFile::new()
+        .map_err(|error| format!("create secure plaintext staging file: {error}"))?;
+    let opened = open(&mut encrypted, plaintext.as_file_mut(), &registry_key)
+        .map_err(|error| format!("open v1 object: {error}"))?;
+    plaintext
+        .as_file_mut()
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind secure plaintext staging file: {error}"))?;
+
+    let seal_options = EnvelopeSealOptions {
+        common: SealOptions {
+            chunk_size: opened.header.chunk_size,
+            key_id: [0; 16],
+            object_id: opened.header.object_id.clone(),
+            plaintext_size: opened.metadata.plaintext_size,
+            plaintext_digest: opened.metadata.plaintext_digest,
+        },
+        recipients,
+    };
+
+    let temp = temporary_archive_output_path(&args.out);
+    if temp.exists() {
+        return Err(format!(
+            "temporary output {} already exists",
+            temp.display()
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|error| format!("create {}: {error}", temp.display()))?;
+    let report = match seal_envelope(plaintext.as_file_mut(), &mut file, &seal_options) {
+        Ok(report) => report,
+        Err(error) => {
+            drop(file);
+            let _ = fs::remove_file(&temp);
+            return Err(format!("seal v2 object: {error}"));
+        }
+    };
+    if let Err(error) = file.sync_all() {
+        drop(file);
+        let _ = fs::remove_file(&temp);
+        return Err(format!("sync {}: {error}", temp.display()));
+    }
+    drop(file);
+    let write_result = (|| {
+        let staged_digest = sha256_file(&temp)?;
+        if staged_digest != report.stored_digest {
+            return Err("staged v2 object hash differs from the sealer report".to_string());
+        }
+        fs::hard_link(&temp, &args.out).map_err(|error| {
+            format!(
+                "publish resealed object {} -> {}: {error}",
+                temp.display(),
+                args.out.display()
+            )
+        })?;
+        let remote_digest = sha256_file(&args.out)?;
+        if remote_digest != report.stored_digest {
+            return Err("published v2 object hash differs from the sealer report".to_string());
+        }
+        fs::remove_file(&temp)
+            .map_err(|error| format!("remove staged output {}: {error}", temp.display()))?;
+        Ok(remote_digest)
+    })();
+    if write_result.is_err() && temp.exists() {
+        let _ = fs::remove_file(&temp);
+    }
+    let remote_digest = write_result?;
+    Ok(json!({
+        "input": args.object,
+        "output": args.out,
+        "object_id": report.header.object_id,
+        "input_format_version": 1,
+        "output_format_version": 2,
+        "recipient_epochs": report.key_frame.as_ref().expect("v2 seal has key frame")
+            .slots.iter().map(|slot| slot.epoch_label.as_str()).collect::<Vec<_>>(),
+        "stored_size_bytes": report.stored_size_bytes,
+        "expected_sha256": bytes_to_hex(&report.stored_digest),
+        "published_sha256": bytes_to_hex(&remote_digest),
+        "verified_after_write": true
+    }))
 }
 
 fn run_daemon_client_command(
@@ -9087,6 +9306,12 @@ fn run_archive_dump_command(
         ArchiveCommand::Build(_) => {
             unreachable!("archive build dispatched before the dump handler")
         }
+        ArchiveCommand::Capabilities => {
+            unreachable!("archive capabilities dispatched before the dump handler")
+        }
+        ArchiveCommand::Reseal(_) => {
+            unreachable!("archive reseal dispatched before the dump handler")
+        }
         ArchiveCommand::Inspect(_) => {
             unreachable!("archive inspect dispatched before the dump handler")
         }
@@ -11574,6 +11799,12 @@ fn run_archive_tape_with_drive(
         ArchiveCommand::Build(_) => {
             unreachable!("archive build dispatched before the tape archive handler")
         }
+        ArchiveCommand::Capabilities => {
+            unreachable!("archive capabilities dispatched before the tape archive handler")
+        }
+        ArchiveCommand::Reseal(_) => {
+            unreachable!("archive reseal dispatched before the tape archive handler")
+        }
         ArchiveCommand::Inspect(_) => {
             unreachable!("archive inspect dispatched before the tape archive handler")
         }
@@ -13262,6 +13493,76 @@ mod tests {
                 "rem help unexpectedly exposes {command}:\n{help}"
             );
         }
+    }
+
+    #[test]
+    fn archive_capabilities_are_machine_readable_without_discovery() {
+        let cli = Cli::try_parse_from(["rem", "archive", "capabilities"]).unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(
+            cli,
+            || panic!("archive capabilities must not perform hardware discovery"),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(err.is_empty());
+        let value: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            value["capabilities"],
+            json!(["rao-v2-envelope", "wrap-suite-hpke-v1"])
+        );
+    }
+
+    #[test]
+    fn archive_reseal_converts_v1_to_verified_v2() {
+        let plaintext = vec![0x5a; 1024];
+        let digest: [u8; 32] = Sha256::digest(&plaintext).into();
+        let root = RootKey::new([0x11; 32]).unwrap();
+        let (v1, _) = remanence_aead::seal_to_vec(
+            &plaintext,
+            &root,
+            &SealOptions {
+                chunk_size: 512,
+                key_id: [0x22; 16],
+                object_id: "reseal-object".to_string(),
+                plaintext_size: plaintext.len() as u64,
+                plaintext_digest: digest,
+            },
+        )
+        .unwrap();
+        let safe = remanence_aead::RecipientPrivateKey::new([1; 16], "safe", [7; 32]).unwrap();
+        let escrow = remanence_aead::RecipientPrivateKey::new([2; 16], "escrow", [8; 32]).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let object = temp.path().join("object-v1.rao");
+        let root_path = temp.path().join("registry.key");
+        let safe_path = temp.path().join("safe.raor");
+        let escrow_path = temp.path().join("escrow.raor");
+        let output = temp.path().join("object-v2.rao");
+        fs::write(&object, v1).unwrap();
+        fs::write(&root_path, [0x11; 32]).unwrap();
+        fs::write(&safe_path, safe.public_key(0).unwrap().serialize().unwrap()).unwrap();
+        fs::write(
+            &escrow_path,
+            escrow.public_key(1).unwrap().serialize().unwrap(),
+        )
+        .unwrap();
+
+        let report = reseal_archive_object(&ArchiveResealArgs {
+            object,
+            registry_key: root_path,
+            recipients: vec![safe_path, escrow_path],
+            out: output.clone(),
+        })
+        .unwrap();
+        assert_eq!(report["verified_after_write"], true);
+        let v2 = fs::read(output).unwrap();
+        assert_eq!(inspect_bytes(&v2).unwrap().header.format_version, 2);
+        assert_eq!(
+            remanence_aead::open_envelope_to_vec(&v2, &safe).unwrap().0,
+            plaintext
+        );
     }
 
     #[test]

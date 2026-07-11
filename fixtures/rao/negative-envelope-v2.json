@@ -1,0 +1,15 @@
+{
+  "vector_set": "RAO-NEG-ENVELOPE-2",
+  "spec_section": "Design v2: Format and Proof & test plan",
+  "status": "complete",
+  "scope": "v2 scalar-header and canonical wrapped-DEK key-frame parser rejects",
+  "cases": [
+    { "id": "v2-version-flip", "expected_error": "ReservedBytesNotZero" },
+    { "id": "v2-suite-flip", "expected_error": "InvalidWrapSuite" },
+    { "id": "v2-truncated-key-frame", "expected_error": "UnexpectedEof" },
+    { "id": "v2-duplicate-slots", "expected_error": "InvalidKeyFrame" },
+    { "id": "v2-misordered-slots", "expected_error": "InvalidKeyFrame" },
+    { "id": "v2-key-frame-trailing-byte", "expected_error": "InvalidKeyFrame" },
+    { "id": "v2-oversize-key-frame", "expected_error": "InvalidKeyFrameLength" }
+  ]
+}

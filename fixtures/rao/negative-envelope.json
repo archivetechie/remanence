@@ -25,9 +25,9 @@
       "expected_error": "InvalidHeaderLength"
     },
     {
-      "id": "format-version-2",
+      "id": "unsupported-format-version",
       "operation": "inspect",
-      "fault": "format_version field is 2",
+      "fault": "format_version field is 3",
       "expected_error": "UnsupportedFormatVersion"
     },
     {
