@@ -568,6 +568,7 @@ mod tests {
             }],
             snapshot_at_utc: "2026-07-04T00:00:00Z".to_string(),
             daemon_epoch: 17,
+            drive_assignments: Vec::new(),
         }
     }
 

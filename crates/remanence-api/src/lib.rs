@@ -689,7 +689,9 @@ impl ApiState {
             .clone()
         {
             if snapshot_at - cached.0 < self.live_status.min_poll_interval {
-                return Ok(cached.1);
+                let mut response = cached.1;
+                response.drive_assignments = self.drive_assignments(&response.libraries)?;
+                return Ok(response);
             }
         }
 
@@ -768,12 +770,14 @@ impl ApiState {
         let snapshot_at_utc = snapshot_at
             .format(&Rfc3339)
             .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+        let drive_assignments = self.drive_assignments(&libraries)?;
         let response = pb::GetLiveStatusResponse {
             libraries,
             operations,
             alarms,
             snapshot_at_utc,
             daemon_epoch: self.daemon_epoch,
+            drive_assignments,
         };
         *self
             .live_status
@@ -781,6 +785,73 @@ impl ApiState {
             .write()
             .unwrap_or_else(|err| err.into_inner()) = Some((snapshot_at, response.clone()));
         Ok(response)
+    }
+
+    /// Project the live reservation atomics without making them a policy gate.
+    fn drive_assignments(
+        &self,
+        libraries: &[pb::LibraryState],
+    ) -> Result<Vec<pb::DriveAssignment>, Status> {
+        let Some(drive_pool) = self.drive_pool.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let busy_bays = drive_pool.busy_bays();
+        let sessions_by_bay = drive_pool.sessions_by_bay();
+        let Some(reservation_library_serial) = self
+            .default_library_serial
+            .as_deref()
+            .map(String::as_str)
+            .or_else(|| match libraries {
+                [library_state] => library_state
+                    .library
+                    .as_ref()
+                    .map(|library| library.library_serial.as_str()),
+                _ => None,
+            })
+        else {
+            return Ok(Vec::new());
+        };
+        let mut assignments = Vec::new();
+        for library_state in libraries {
+            let Some(library) = library_state.library.as_ref() else {
+                continue;
+            };
+            if library.library_serial != reservation_library_serial {
+                continue;
+            }
+            for drive in &library_state.drives {
+                let bay = u16::try_from(drive.element_address)
+                    .map_err(|_| Status::invalid_argument("drive element address overflows u16"))?;
+                let is_busy = busy_bays.contains(&bay);
+                let session = if is_busy {
+                    sessions_by_bay
+                        .get(&bay)
+                        .filter(|(_, mounted)| mounted.library_serial == library.library_serial)
+                } else {
+                    None
+                };
+                assignments.push(pb::DriveAssignment {
+                    library_serial: library.library_serial.clone(),
+                    bay: u32::from(bay),
+                    drive_uuid: drive.drive_uuid.clone(),
+                    state: if is_busy {
+                        pb::drive_assignment::State::DriveAssignmentStateActive as i32
+                    } else {
+                        pb::drive_assignment::State::DriveAssignmentStateIdle as i32
+                    },
+                    current_session_id: session
+                        .map(|(session_id, _)| session_id.as_bytes().to_vec())
+                        .unwrap_or_default(),
+                    loaded_tape_uuid: session
+                        .map(|(_, mounted)| mounted.tape_uuid.to_vec())
+                        .unwrap_or_else(|| drive.loaded_tape_uuid.clone()),
+                });
+            }
+        }
+        assignments.sort_by(|left, right| {
+            (&left.library_serial, left.bay).cmp(&(&right.library_serial, right.bay))
+        });
+        Ok(assignments)
     }
 
     fn enrich_live_drive(

@@ -965,6 +965,7 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -1636,6 +1637,69 @@ mod tests {
         assert_eq!(drive.tape_io_gap_p95_us, 250);
         assert_eq!(drive.tape_io_cadence_us, 1_100);
         assert_eq!(drive.tape_io_effective_feed_bytes_per_second, 300_000_000);
+    }
+
+    #[tokio::test]
+    async fn get_live_status_projects_advisory_bay_assignment_and_atomic_enforcement() {
+        let mut index = test_index();
+        let drive_uuid = observe_test_drive(&mut index, "DRV-ASSIGN", "DvcidAndInquiry", 1);
+        let mut state = state_with_snapshot();
+        state.index_path = Arc::new(index.path().to_path_buf());
+        let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
+        let reservations = Arc::new(HashMap::from([(1, AtomicBool::new(false))]));
+        let pool = crate::write_owner::DrivePool::new(changer_tx, HashMap::new(), reservations);
+        state.drive_pool = Some(pool.clone());
+
+        let idle = state
+            .library_service()
+            .get_live_status(Request::new(pb::GetLiveStatusRequest {}))
+            .await
+            .expect("idle live status")
+            .into_inner();
+        assert_eq!(idle.drive_assignments.len(), 1);
+        let assignment = &idle.drive_assignments[0];
+        assert_eq!(assignment.library_serial, "DEC418146K_LL02");
+        assert_eq!(assignment.bay, 1);
+        assert_eq!(assignment.drive_uuid, drive_uuid);
+        assert_eq!(
+            assignment.state,
+            pb::drive_assignment::State::DriveAssignmentStateIdle as i32
+        );
+        assert!(assignment.current_session_id.is_empty());
+
+        let _reservation = pool.reserve_drive(1).expect("reserve bay for live session");
+        let session_id = Uuid::new_v4();
+        let tape_uuid = Uuid::new_v4();
+        pool.record_session(
+            session_id,
+            crate::write_owner::MountedSession {
+                bay: 1,
+                library_serial: "DEC418146K_LL02".to_string(),
+                barcode: Some("S30002L9".to_string()),
+                home_slot: Some(0x040a),
+                tape_uuid: *tape_uuid.as_bytes(),
+                drive_uuid: Some(drive_uuid.clone()),
+            },
+        );
+
+        let active = state
+            .library_service()
+            .get_live_status(Request::new(pb::GetLiveStatusRequest {}))
+            .await
+            .expect("active live status")
+            .into_inner();
+        let assignment = &active.drive_assignments[0];
+        assert_eq!(
+            assignment.state,
+            pb::drive_assignment::State::DriveAssignmentStateActive as i32
+        );
+        assert_eq!(assignment.current_session_id, session_id.as_bytes());
+        assert_eq!(assignment.loaded_tape_uuid, tape_uuid.as_bytes());
+
+        let second = pool
+            .reserve_drive(1)
+            .expect_err("atomic bay reservation must still reject a second open");
+        assert_eq!(second.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]
