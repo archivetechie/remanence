@@ -2389,6 +2389,10 @@ struct ArchiveResealArgs {
     /// New v2 envelope object path; must not already exist.
     #[arg(long, value_name = "PATH")]
     out: PathBuf,
+
+    /// Directory for the temporary plaintext; defaults adjacent to --out.
+    #[arg(long, value_name = "DIR")]
+    staging_dir: Option<PathBuf>,
 }
 
 /// Arguments for the shared `archive build` command.
@@ -3532,7 +3536,19 @@ fn run_archive_reseal(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    match reseal_archive_object(args) {
+    run_archive_reseal_with(args, out, err, reseal_archive_object)
+}
+
+fn run_archive_reseal_with<F>(
+    args: &ArchiveResealArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    operation: F,
+) -> ExitCode
+where
+    F: FnOnce(&ArchiveResealArgs) -> Result<Value, String>,
+{
+    match operation(args) {
         Ok(report) => match serde_json::to_writer(&mut *out, &report)
             .and_then(|()| writeln!(out).map_err(serde_json::Error::io))
         {
@@ -3550,6 +3566,22 @@ fn run_archive_reseal(
 }
 
 fn reseal_archive_object(args: &ArchiveResealArgs) -> Result<Value, String> {
+    reseal_archive_object_with_verifier(args, |path, expected| {
+        let actual = sha256_file(path)?;
+        if actual != expected {
+            return Err("staged v2 object hash differs from the sealer report".to_string());
+        }
+        Ok(actual)
+    })
+}
+
+fn reseal_archive_object_with_verifier<F>(
+    args: &ArchiveResealArgs,
+    verify_staged: F,
+) -> Result<Value, String>
+where
+    F: FnOnce(&Path, [u8; 32]) -> Result<[u8; 32], String>,
+{
     if args.out.exists() {
         return Err(format!("--out {} already exists", args.out.display()));
     }
@@ -3593,8 +3625,16 @@ fn reseal_archive_object(args: &ArchiveResealArgs) -> Result<Value, String> {
     }
 
     let registry_key = read_root_key_file(&args.registry_key)?;
-    let mut plaintext = tempfile::NamedTempFile::new()
-        .map_err(|error| format!("create secure plaintext staging file: {error}"))?;
+    let staging_dir = args
+        .staging_dir
+        .as_deref()
+        .or_else(|| {
+            args.out
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+        })
+        .unwrap_or_else(|| Path::new("."));
+    let mut plaintext = SecurePlaintextStage::new_in(staging_dir)?;
     let opened = open(&mut encrypted, plaintext.as_file_mut(), &registry_key)
         .map_err(|error| format!("open v1 object: {error}"))?;
     plaintext
@@ -3639,28 +3679,24 @@ fn reseal_archive_object(args: &ArchiveResealArgs) -> Result<Value, String> {
         return Err(format!("sync {}: {error}", temp.display()));
     }
     drop(file);
-    let write_result = (|| {
-        let staged_digest = sha256_file(&temp)?;
-        if staged_digest != report.stored_digest {
-            return Err("staged v2 object hash differs from the sealer report".to_string());
-        }
-        fs::hard_link(&temp, &args.out).map_err(|error| {
+    let mut published = false;
+    let write_result: Result<[u8; 32], String> = (|| {
+        let staged_digest = verify_staged(&temp, report.stored_digest)?;
+        fs::rename(&temp, &args.out).map_err(|error| {
             format!(
                 "publish resealed object {} -> {}: {error}",
                 temp.display(),
                 args.out.display()
             )
         })?;
-        let remote_digest = sha256_file(&args.out)?;
-        if remote_digest != report.stored_digest {
-            return Err("published v2 object hash differs from the sealer report".to_string());
-        }
-        fs::remove_file(&temp)
-            .map_err(|error| format!("remove staged output {}: {error}", temp.display()))?;
-        Ok(remote_digest)
+        published = true;
+        Ok(staged_digest)
     })();
-    if write_result.is_err() && temp.exists() {
+    if write_result.is_err() {
         let _ = fs::remove_file(&temp);
+        if published {
+            let _ = fs::remove_file(&args.out);
+        }
     }
     let remote_digest = write_result?;
     Ok(json!({
@@ -11545,6 +11581,37 @@ fn temporary_archive_output_path(out: &Path) -> PathBuf {
     out.with_file_name(tmp_name)
 }
 
+/// Plaintext staging file that is truncated before its directory entry is removed.
+struct SecurePlaintextStage(tempfile::NamedTempFile);
+
+impl SecurePlaintextStage {
+    fn new_in(directory: &Path) -> Result<Self, String> {
+        tempfile::Builder::new()
+            .prefix(".rao-plaintext.")
+            .tempfile_in(directory)
+            .map(Self)
+            .map_err(|error| {
+                format!(
+                    "create secure plaintext staging file in {}: {error}",
+                    directory.display()
+                )
+            })
+    }
+
+    fn as_file_mut(&mut self) -> &mut File {
+        self.0.as_file_mut()
+    }
+}
+
+impl Drop for SecurePlaintextStage {
+    fn drop(&mut self) {
+        // Best effort only: filesystems and storage devices may retain old
+        // blocks, but truncation avoids leaving an intact plaintext file.
+        let _ = self.0.as_file_mut().set_len(0);
+        let _ = self.0.as_file_mut().sync_all();
+    }
+}
+
 fn read_root_key_file(path: &Path) -> Result<RootKey, String> {
     let mut bytes = std::fs::read(path)
         .map_err(|error| format!("read --key-file {}: {error}", path.display()))?;
@@ -13540,6 +13607,8 @@ mod tests {
         let safe_path = temp.path().join("safe.raor");
         let escrow_path = temp.path().join("escrow.raor");
         let output = temp.path().join("object-v2.rao");
+        let staging = temp.path().join("plaintext-staging");
+        fs::create_dir(&staging).unwrap();
         fs::write(&object, v1).unwrap();
         fs::write(&root_path, [0x11; 32]).unwrap();
         fs::write(&safe_path, safe.public_key(0).unwrap().serialize().unwrap()).unwrap();
@@ -13549,16 +13618,37 @@ mod tests {
         )
         .unwrap();
 
-        let report = reseal_archive_object(&ArchiveResealArgs {
+        let args = ArchiveResealArgs {
             object,
             registry_key: root_path,
             recipients: vec![safe_path, escrow_path],
             out: output.clone(),
-        })
-        .unwrap();
+            staging_dir: Some(staging.clone()),
+        };
+        let mut failure_out = Vec::new();
+        let mut failure_err = Vec::new();
+        let failure = run_archive_reseal_with(&args, &mut failure_out, &mut failure_err, |args| {
+            reseal_archive_object_with_verifier(args, |path, expected| {
+                let mut bytes = fs::read(path).map_err(|error| error.to_string())?;
+                bytes[RAO_HEADER_LEN] ^= 0x80;
+                fs::write(path, bytes).map_err(|error| error.to_string())?;
+                let actual = sha256_file(path)?;
+                if actual != expected {
+                    return Err("staged v2 object hash differs from the sealer report".to_string());
+                }
+                Ok(actual)
+            })
+        });
+        assert_ne!(failure, ExitCode::SUCCESS);
+        assert!(!output.exists(), "failed verification published --out");
+        assert!(!temporary_archive_output_path(&output).exists());
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
+
+        let report = reseal_archive_object(&args).unwrap();
         assert_eq!(report["verified_after_write"], true);
         let v2 = fs::read(output).unwrap();
         assert_eq!(inspect_bytes(&v2).unwrap().header.format_version, 2);
+        assert_eq!(fs::read_dir(staging).unwrap().count(), 0);
         assert_eq!(
             remanence_aead::open_envelope_to_vec(&v2, &safe).unwrap().0,
             plaintext

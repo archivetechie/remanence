@@ -34,11 +34,11 @@ prominently.
    registry-key path. Static-friendly build (no dynamic deps beyond libc).
 5. **`rem archive capabilities` verb**: machine-readable (JSON) capability list
    including `rao-v2-envelope`, `wrap-suite-hpke-v1`.
-6. **Proofs**: parametrize `aead-framing` over (header, key-frame) lengths —
-   prove once, both geometries as instances; extend `rao-header` kernels for v2 +
-   key-frame roundtrip; update every pinned literal the design enumerates
-   (checked_sub(144) → parametrized, assert 128s, `rw [header_len_val]` sites);
-   drift guards + `make proof-inventory` green.
+6. **Proof follow-ups**: **RAO-V2-FORMAL-PREFIX** must carry (header,
+   key-frame) lengths through the Aeneas extraction before proving both
+   geometries; **RAO-V2-FORMAL-HEADER-KEY-FRAME** must extract the actual v2
+   header/key-frame byte codecs before a round-trip theorem is claimed. Until
+   then v2 is Rust-test/fuzz/drift-guard-covered, not formally proved.
 7. **Re-seal tool**: `rem archive reseal` — reads a v1 AEAD object with a
    registry key file, re-seals v2 to configured recipients; used for the
    ~6-object migration. Verify-after-write (remote hash comparison pattern).

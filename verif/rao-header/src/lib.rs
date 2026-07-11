@@ -267,6 +267,7 @@ mod tests {
             "let flags = u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);",
             "if flags != 0",
             "let metadata_frame_len = u64::from_be_bytes([",
+            "if bytes[0x38..0x40].iter().any(|byte| *byte != 0)",
             "if bytes[0x39..0x3c].iter().any(|byte| *byte != 0)",
             "bytes[0x38] = self.wrap_suite;",
             "bytes[0x3c..0x40].copy_from_slice(&self.key_frame_len.to_be_bytes());",
