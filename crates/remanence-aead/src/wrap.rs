@@ -6,7 +6,8 @@ use hpke::{
     aead::ChaCha20Poly1305, kdf::HkdfSha256, kem::X25519HkdfSha256, setup_receiver, setup_sender,
     Deserializable, Kem as _, OpModeR, OpModeS, Serializable,
 };
-use rand_core::{CryptoRng, RngCore};
+use rand_chacha::ChaCha20Rng;
+use rand_core::{CryptoRng, RngCore, SeedableRng};
 use zeroize::Zeroize;
 
 use crate::error::{RaoAeadError, Result};
@@ -17,60 +18,36 @@ type Kem = X25519HkdfSha256;
 type Kdf = HkdfSha256;
 type Aead = ChaCha20Poly1305;
 
-/// Single-use, zeroizing entropy source for one X25519 ephemeral key.
+/// OS-seeded CSPRNG that can satisfy arbitrary-length HPKE entropy draws.
 struct EphemeralRng {
-    bytes: [u8; 32],
-    cursor: usize,
+    inner: ChaCha20Rng,
 }
 
 impl EphemeralRng {
     fn from_os() -> Result<Self> {
-        let mut bytes = [0u8; 32];
-        getrandom::fill(&mut bytes).map_err(|_| RaoAeadError::EntropyUnavailable)?;
-        Ok(Self { bytes, cursor: 0 })
-    }
-
-    #[cfg(test)]
-    fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self { bytes, cursor: 0 }
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).map_err(|_| RaoAeadError::EntropyUnavailable)?;
+        let inner = ChaCha20Rng::from_seed(seed);
+        seed.zeroize();
+        Ok(Self { inner })
     }
 }
 
 impl RngCore for EphemeralRng {
     fn next_u32(&mut self) -> u32 {
-        let mut bytes = [0u8; 4];
-        self.fill_bytes(&mut bytes);
-        u32::from_le_bytes(bytes)
+        self.inner.next_u32()
     }
 
     fn next_u64(&mut self) -> u64 {
-        let mut bytes = [0u8; 8];
-        self.fill_bytes(&mut bytes);
-        u64::from_le_bytes(bytes)
+        self.inner.next_u64()
     }
 
     fn fill_bytes(&mut self, destination: &mut [u8]) {
-        let end = self
-            .cursor
-            .checked_add(destination.len())
-            .expect("ephemeral RNG cursor overflow");
-        assert!(
-            end <= self.bytes.len(),
-            "HPKE suite requested more than its pinned 32-byte X25519 IKM"
-        );
-        destination.copy_from_slice(&self.bytes[self.cursor..end]);
-        self.cursor = end;
+        self.inner.fill_bytes(destination);
     }
 }
 
 impl CryptoRng for EphemeralRng {}
-
-impl Drop for EphemeralRng {
-    fn drop(&mut self) {
-        self.bytes.zeroize();
-        self.cursor = 0;
-    }
-}
 
 /// Frozen prefix in the fixed-width HPKE info transcript.
 pub const WRAP_INFO_PREFIX: &[u8; 12] = b"rao-wrap-v1\0";
@@ -381,6 +358,32 @@ fn validate_label(label: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    struct CountingByteRng {
+        byte: u8,
+        bytes_generated: usize,
+    }
+
+    impl RngCore for CountingByteRng {
+        fn next_u32(&mut self) -> u32 {
+            let mut bytes = [0u8; 4];
+            self.fill_bytes(&mut bytes);
+            u32::from_le_bytes(bytes)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut bytes = [0u8; 8];
+            self.fill_bytes(&mut bytes);
+            u64::from_le_bytes(bytes)
+        }
+
+        fn fill_bytes(&mut self, destination: &mut [u8]) {
+            destination.fill(self.byte);
+            self.bytes_generated += destination.len();
+        }
+    }
+
+    impl CryptoRng for CountingByteRng {}
+
     fn decode_hex(hex: &str) -> Vec<u8> {
         assert_eq!(hex.len() % 2, 0);
         hex.as_bytes()
@@ -400,6 +403,16 @@ mod tests {
         assert!(info[15..76].iter().all(|byte| *byte == 0));
         assert_eq!(&info[76..92], &[0x44; 16]);
         assert_eq!(&info[92..], &[7, 2, 1]);
+    }
+
+    #[test]
+    fn ephemeral_rng_serves_draws_larger_than_its_os_seed() {
+        let mut rng = EphemeralRng {
+            inner: ChaCha20Rng::from_seed([0x5a; 32]),
+        };
+        let mut output = [0u8; 96];
+        rng.fill_bytes(&mut output);
+        assert!(output.iter().any(|byte| *byte != 0));
     }
 
     #[test]
@@ -462,8 +475,12 @@ mod tests {
         let secret = RecipientPrivateKey::new([3; 16], "safe-2026", [7; 32]).unwrap();
         let public = secret.public_key(0).unwrap();
         let dek = DataEncryptionKey::from_bytes([9; 32]);
-        let mut rng = EphemeralRng::from_bytes([0x42; 32]);
+        let mut rng = CountingByteRng {
+            byte: 0x42,
+            bytes_generated: 0,
+        };
         let slot = wrap_recipient(&dek, "object-a", &public, &mut rng).unwrap();
+        assert_eq!(rng.bytes_generated, 32, "rust-hpke X25519 entropy draw");
         assert_eq!(
             slot.enc,
             [

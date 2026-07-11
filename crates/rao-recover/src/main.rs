@@ -37,6 +37,10 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     out: PathBuf,
 
+    /// Directory for temporary plaintext; defaults adjacent to --out.
+    #[arg(long, value_name = "DIR")]
+    staging_dir: Option<PathBuf>,
+
     /// Replace existing destination members.
     #[arg(long)]
     overwrite: bool,
@@ -89,8 +93,16 @@ fn recover(args: &Args) -> Result<RecoverySummary, String> {
     encrypted
         .seek(SeekFrom::Start(0))
         .map_err(|error| format!("rewind encrypted object: {error}"))?;
-    let mut staged = tempfile::NamedTempFile::new()
-        .map_err(|error| format!("create secure plaintext staging file: {error}"))?;
+    let staging_dir = args
+        .staging_dir
+        .as_deref()
+        .or_else(|| {
+            args.out
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+        })
+        .unwrap_or_else(|| Path::new("."));
+    let mut staged = SecurePlaintextStage::new_in(staging_dir)?;
     let opened = match header.format_version {
         1 => open_v1(args, &mut encrypted, staged.as_file_mut())?,
         2 => open_v2(
@@ -215,9 +227,52 @@ fn open_v2<R: Read, W: std::io::Write>(
 }
 
 fn read_root_key(path: &Path) -> Result<RootKey, String> {
-    let bytes =
+    let mut bytes =
         fs::read(path).map_err(|error| format!("read registry key {}: {error}", path.display()))?;
+    if bytes.len() != 32 {
+        let len = bytes.len();
+        bytes.zeroize();
+        return Err(format!(
+            "registry key {} must contain exactly 32 bytes, got {len}",
+            path.display()
+        ));
+    }
     RootKey::new(bytes).map_err(|error| format!("parse registry key {}: {error}", path.display()))
+}
+
+/// Plaintext staging file that is truncated before its directory entry is removed.
+struct SecurePlaintextStage(tempfile::NamedTempFile);
+
+impl SecurePlaintextStage {
+    fn new_in(directory: &Path) -> Result<Self, String> {
+        tempfile::Builder::new()
+            .prefix(".rao-recover-plaintext.")
+            .tempfile_in(directory)
+            .map(Self)
+            .map_err(|error| {
+                format!(
+                    "create secure plaintext staging file in {}: {error}",
+                    directory.display()
+                )
+            })
+    }
+
+    fn as_file_mut(&mut self) -> &mut File {
+        self.0.as_file_mut()
+    }
+
+    fn path(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl Drop for SecurePlaintextStage {
+    fn drop(&mut self) {
+        // Best effort only: storage may retain old blocks, but no intact
+        // plaintext staging file remains in the caller-selected directory.
+        let _ = self.0.as_file_mut().set_len(0);
+        let _ = self.0.as_file_mut().sync_all();
+    }
 }
 
 struct DiscardEntrySink;
@@ -290,6 +345,8 @@ mod tests {
         let object = temp.path().join("object.rao");
         let private_key = temp.path().join("safe.raop");
         let out = temp.path().join("out");
+        let staging = temp.path().join("large-volume-staging");
+        fs::create_dir(&staging).unwrap();
         fs::write(&object, sealed).unwrap();
         fs::write(&private_key, safe.serialize()).unwrap();
         let summary = recover(&Args {
@@ -297,11 +354,13 @@ mod tests {
             private_key: Some(private_key),
             registry_key: None,
             out: out.clone(),
+            staging_dir: Some(staging.clone()),
             overwrite: false,
         })
         .unwrap();
         assert_eq!(summary.format_version, 2);
         assert_eq!(fs::read(out.join("member.txt")).unwrap(), payload);
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
 
         let registry = RootKey::new([0x55; 32]).unwrap();
         let (v1, _) = seal_to_vec(
@@ -326,6 +385,7 @@ mod tests {
             private_key: None,
             registry_key: Some(registry_path),
             out: v1_out.clone(),
+            staging_dir: None,
             overwrite: false,
         })
         .unwrap();
@@ -340,11 +400,24 @@ mod tests {
             private_key: Some(wrong_path),
             registry_key: None,
             out: temp.path().join("wrong-out"),
+            staging_dir: None,
             overwrite: false,
         })
         .err()
         .unwrap();
         assert!(error.contains("object wants epoch safe-2026/escrow-2026"));
         assert!(error.contains("you supplied wrong-2026"));
+    }
+
+    #[test]
+    fn registry_key_file_must_be_exactly_32_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let short = temp.path().join("short.key");
+        let long = temp.path().join("long.key");
+        fs::write(&short, [0x11; 31]).unwrap();
+        fs::write(&long, [0x11; 33]).unwrap();
+
+        assert!(read_root_key(&short).unwrap_err().contains("got 31"));
+        assert!(read_root_key(&long).unwrap_err().contains("got 33"));
     }
 }

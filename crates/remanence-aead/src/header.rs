@@ -224,10 +224,11 @@ impl RaoHeader {
                 }
             }
             2 => match self.wrap_suite {
+                // Registry-symmetric v2 is reserved by the frozen design but is
+                // not emitted in phase 1. Rejecting it keeps a flipped v1
+                // version byte a loud format error instead of a mode mismatch.
                 WRAP_SUITE_REGISTRY if self.key_frame_len == 0 => {
-                    if self.key_id == ZERO_16 {
-                        return Err(RaoAeadError::InvalidKeyIdentifier);
-                    }
+                    return Err(RaoAeadError::InvalidWrapSuite);
                 }
                 WRAP_SUITE_HPKE_V1 => {
                     if self.key_id != ZERO_16 {

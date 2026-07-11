@@ -31,6 +31,12 @@
       "expected_error": "UnsupportedFormatVersion"
     },
     {
+      "id": "v1-shape-version-flipped-to-2",
+      "operation": "inspect",
+      "fault": "a v1 header has only its format_version changed from 1 to 2",
+      "expected_error": "InvalidWrapSuite"
+    },
+    {
       "id": "unknown-suite-id",
       "operation": "inspect",
       "fault": "suite_id field is unknown",

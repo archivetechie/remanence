@@ -144,26 +144,18 @@ mod tests {
     }
 
     #[test]
-    fn inspect_accepts_reserved_v2_registry_geometry_without_key_frame() {
-        let header = RaoHeader {
-            format_version: 2,
-            chunk_size: 512,
-            key_id: [0x10; 16],
-            hkdf_salt: [0x20; 16],
-            metadata_frame_len: 17,
-            object_id: "registry-v2".to_string(),
-            wrap_suite: crate::WRAP_SUITE_REGISTRY,
-            key_frame_len: 0,
-        };
+    fn inspect_rejects_v1_shape_with_version_flipped_to_v2() {
+        let header = RaoHeader::new(512, [0x10; 16], [0x20; 16], 17, "registry-v1").unwrap();
         let mut object = header.serialize().unwrap().to_vec();
+        object[6] = 2;
         object.extend_from_slice(&[0u8; 17]);
         object.extend_from_slice(&[0u8; 512 + 16]);
         object.extend_from_slice(RAO_FOOTER);
         object.resize(object.len().div_ceil(512) * 512, 0);
 
-        let report = inspect_bytes(&object).unwrap();
-        assert_eq!(report.header, header);
-        assert_eq!(report.key_frame, None);
-        assert_eq!(report.chunk_count, 1);
+        assert!(matches!(
+            inspect_bytes(&object),
+            Err(RaoAeadError::InvalidWrapSuite)
+        ));
     }
 }
