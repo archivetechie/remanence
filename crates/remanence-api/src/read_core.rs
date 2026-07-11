@@ -145,6 +145,7 @@ struct BatchingBlockSource<'a> {
     block_size: usize,
     remaining_records: u64,
     buffer: Vec<u8>,
+    free_buffers: Vec<Vec<u8>>,
     buffered_records: u32,
     next_record: u32,
 }
@@ -158,11 +159,42 @@ impl<'a> BatchingBlockSource<'a> {
         if block_size == 0 {
             return Err(FormatError::invalid("block size must be nonzero"));
         }
+        let ring_depth = usize::try_from(inner.read_ring_buffers())
+            .map_err(|_| FormatError::invalid("read staging ring depth does not fit usize"))?;
+        if ring_depth < remanence_library::MIN_TAPE_IO_STAGING_RING_BUFFERS as usize
+            || ring_depth > remanence_library::MAX_TAPE_IO_STAGING_RING_BUFFERS as usize
+        {
+            return Err(FormatError::invalid(format!(
+                "read staging ring depth {ring_depth} is outside {}..={}",
+                remanence_library::MIN_TAPE_IO_STAGING_RING_BUFFERS,
+                remanence_library::MAX_TAPE_IO_STAGING_RING_BUFFERS
+            )));
+        }
+        let block_size_u32 = u32::try_from(block_size)
+            .map_err(|_| FormatError::invalid("read block size exceeds u32"))?;
+        let batch_records = inner.read_batch_blocks(block_size_u32).max(1);
+        let batch_bytes = block_size
+            .checked_mul(batch_records as usize)
+            .ok_or_else(|| FormatError::invalid("read staging ring buffer size overflow"))?;
+        let mut ring = Vec::new();
+        ring.try_reserve_exact(ring_depth)
+            .map_err(|err| FormatError::invalid(format!("allocate read staging ring: {err}")))?;
+        for _ in 0..ring_depth {
+            let mut buffer = Vec::new();
+            buffer.try_reserve_exact(batch_bytes).map_err(|err| {
+                FormatError::invalid(format!("allocate read staging ring buffer: {err}"))
+            })?;
+            ring.push(buffer);
+        }
+        let buffer = ring
+            .pop()
+            .ok_or_else(|| FormatError::invalid("read staging ring is empty"))?;
         Ok(Self {
             inner,
             block_size,
             remaining_records,
-            buffer: Vec::new(),
+            buffer,
+            free_buffers: ring,
             buffered_records: 0,
             next_record: 0,
         })
@@ -194,29 +226,45 @@ impl<'a> BatchingBlockSource<'a> {
             .ok_or_else(|| {
                 TapeIoError::OperationFailed("read batch buffer overflow".to_string())
             })?;
-        self.buffer.resize(alloc_bytes, 0);
-        let outcome = self.inner.read_block_batch(
-            &mut self.buffer,
+        let drained = std::mem::take(&mut self.buffer);
+        self.free_buffers.push(drained);
+        if self.free_buffers.is_empty() {
+            return Err(TapeIoError::OperationFailed(
+                "read staging ring exhausted".to_string(),
+            ));
+        }
+        let mut ring_buffer = self.free_buffers.swap_remove(0);
+        ring_buffer.resize(alloc_bytes, 0);
+        let handoff = self.inner.read_buffer_handoff(
+            ring_buffer,
             block_size_bytes,
             requested,
             remaining_u32,
         )?;
-        if outcome.filemark || outcome.records_read == 0 {
+        if handoff.terminal_flags.filemark || handoff.records_read == 0 {
             return Err(TapeIoError::OperationFailed(format!(
                 "fixed read batch stopped before object boundary: records_read={} filemark={}",
-                outcome.records_read, outcome.filemark
+                handoff.records_read, handoff.terminal_flags.filemark
             )));
         }
-        let bytes = (outcome.records_read as usize)
+        let bytes = (handoff.records_read as usize)
             .checked_mul(self.block_size)
             .ok_or_else(|| {
                 TapeIoError::OperationFailed("read batch byte count overflow".to_string())
             })?;
-        self.buffer.truncate(bytes);
-        self.buffered_records = outcome.records_read;
+        if bytes != handoff.valid_bytes {
+            return Err(TapeIoError::OperationFailed(format!(
+                "read handoff byte/record mismatch: valid_bytes={} records_read={} block_size={}",
+                handoff.valid_bytes, handoff.records_read, self.block_size
+            )));
+        }
+        self.buffer = handoff.into_reusable_buffer();
+        self.buffered_records = u32::try_from(bytes / self.block_size).map_err(|_| {
+            TapeIoError::OperationFailed("read handoff record count exceeds u32".to_string())
+        })?;
         self.remaining_records = self
             .remaining_records
-            .checked_sub(u64::from(outcome.records_read))
+            .checked_sub(u64::from(self.buffered_records))
             .ok_or_else(|| {
                 TapeIoError::OperationFailed("read batch remaining underflow".to_string())
             })?;
@@ -679,6 +727,33 @@ mod tests {
             )),
             "read core must use the batched BlockSource primitive: {:?}",
             source.calls
+        );
+    }
+
+    #[test]
+    fn chaos_process_loss_discards_unconsumed_read_ring_without_extra_data_command() {
+        let blocks = (0u8..8).map(|value| vec![value; 4]).collect::<Vec<_>>();
+        let mut source = VecBlockSource::new(blocks).with_read_batch_blocks_for_test(4);
+        {
+            let mut batched = BatchingBlockSource::new(&mut source, 4, 8).expect("open read ring");
+            let mut record = [0xa5; 4];
+            batched
+                .read_block(&mut record)
+                .expect("consume one record before injected process loss");
+            assert_eq!(record, [0; 4]);
+            // Dropping here models every read-side crash-table point after the
+            // completed CDB: typed handoffs and unused ring slots are
+            // process-local and cannot trigger a destructor-side READ.
+        }
+
+        let reads = source
+            .calls
+            .iter()
+            .filter(|call| matches!(call, VecBlockSourceCall::ReadBlockBatch { .. }))
+            .count();
+        assert_eq!(
+            reads, 1,
+            "process loss must discard staged buffers without issuing another READ"
         );
     }
 

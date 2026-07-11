@@ -17,6 +17,12 @@ tar xzf remanence-fieldtest.tar.gz -C ~ && cd ~/remfield
 Preflight tells you exactly which sudo lines you need (setcap ×4 + sg
 access + the tmpfs mount). Run them, re-run preflight until green.
 
+Before dual-drive work, write down the RAM gate: `2 × largest concurrent
+object + ring bytes for both drives + OS headroom`, and verify it fits both
+tmpfs free space and `MemAvailable`. The daemon must report any removed
+`spool-<uuid>.bin` crash orphans before it reports the re-accounted tmpfs
+budget. No tmpfs/no RAM evidence means no TIO-5 throughput acceptance.
+
 ## The one ordering rule
 **Init before daemon; daemon owns the robotics once it's up.**
 The scripts enforce it themselves (they refuse when the order is wrong,
@@ -68,5 +74,11 @@ Also grab `~/remfield/log/` wholesale if anything was weird.
 ## Numbers to expect (LTO-9, so you can smell trouble live)
 - Single-drive sustained write (incompressible, tmpfs source): **~280–310 MB/s**
 - Dual-drive aggregate: **~550–620 MB/s**
+- TIO-5 gate: write p95 submit gap **≤500 µs**; bench output must name
+  `effective_mode=fixed_pipelined`, effective batch, and receive-feed rate
+- Run the dual leg as concurrent **restore + append** after both-drive
+  readiness pre-warm; compare 1 MiB and 4 MiB `max_sectors_kb` separately
+- Read evidence must contain locate/position, transfer, relay, bytes/records,
+  batch effectiveness, and populated gap/ioctl cadence fields
 - Much lower + preflight showed slow disk → source starvation, not tape
 - `rem top` in a spare tmux window is your live truth all day

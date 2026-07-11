@@ -396,6 +396,10 @@ pub struct WriteBatchOutcome {
 /// derived from fixed microsecond buckets; maxima preserve exact samples.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PipelinedWriteDiagnostics {
+    /// Completion-to-submit gap samples retained in the histogram.
+    pub gap_samples: u64,
+    /// SG_IO duration samples retained in the histogram.
+    pub ioctl_samples: u64,
     /// Clean data commands recorded before any following tripwire.
     pub good_commands: u64,
     /// Records carried by clean data commands.
@@ -419,6 +423,11 @@ pub struct PipelinedWriteDiagnostics {
     /// Effective bytes fed per second over the observed command span.
     pub effective_feed_bytes_per_second: u64,
 }
+
+/// Read-submitter telemetry has the same allocation-free cadence schema as
+/// write submission. The alias keeps field tooling identical while restore
+/// diagnostics name the direction explicitly.
+pub type PipelinedReadDiagnostics = PipelinedWriteDiagnostics;
 
 impl WriteBatchOutcome {
     /// Construct a batch outcome backed by an arithmetic cursor.
@@ -479,6 +488,68 @@ pub struct ReadBatchOutcome {
     /// consumed filemark in this arithmetic position.
     pub position_after: TapePosition,
     position_evidence: PositionAfter,
+}
+
+/// Terminal conditions attached to a successfully delivered fixed-read buffer.
+/// Fail-closed errors never produce a handoff, so `error` remains false for a
+/// value returned through the safe read API and exists to keep the relay
+/// contract explicit and forward-compatible.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadTerminalFlags {
+    /// The READ consumed a filemark after the delivered records.
+    pub filemark: bool,
+    /// The READ reached logical end-of-data.
+    pub end_of_data: bool,
+    /// A terminal error accompanied this buffer.
+    pub error: bool,
+}
+
+/// Owned, length-typed handoff from the tape submitter to a read consumer.
+/// The backing vector is shortened to `valid_bytes` before construction, so
+/// stale bytes from a reused ring slot cannot be observed through safe APIs.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReadBufferHandoff {
+    buffer: Vec<u8>,
+    /// Bytes proven complete by the READ completion and residual decode.
+    pub valid_bytes: usize,
+    /// Complete fixed records represented by `valid_bytes`.
+    pub records_read: u32,
+    /// Boundary conditions decoded from the completion.
+    pub terminal_flags: ReadTerminalFlags,
+}
+
+impl ReadBufferHandoff {
+    pub(crate) fn from_outcome(
+        mut buffer: Vec<u8>,
+        outcome: ReadBatchOutcome,
+    ) -> Result<Self, &'static str> {
+        let valid_bytes = outcome.bytes_read as usize;
+        if valid_bytes > buffer.len() {
+            return Err("read outcome exceeds supplied buffer");
+        }
+        buffer.truncate(valid_bytes);
+        Ok(Self {
+            buffer,
+            valid_bytes,
+            records_read: outcome.records_read,
+            terminal_flags: ReadTerminalFlags {
+                filemark: outcome.filemark,
+                end_of_data: false,
+                error: false,
+            },
+        })
+    }
+
+    /// Return only bytes proven complete by the READ outcome.
+    pub fn valid_data(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    /// Reclaim the allocation for a later ring refill. Its visible length is
+    /// still exactly `valid_bytes`; callers must resize before the next READ.
+    pub fn into_reusable_buffer(self) -> Vec<u8> {
+        self.buffer
+    }
 }
 
 impl ReadBatchOutcome {

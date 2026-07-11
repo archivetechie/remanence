@@ -2737,6 +2737,12 @@ fn fixed_filemark_residual_sense(residual: u32) -> Vec<u8> {
     sense
 }
 
+fn fixed_ili_residual_sense(residual: u32) -> Vec<u8> {
+    let mut sense = fixed_residual_sense(residual);
+    sense[2] = 0x20;
+    sense
+}
+
 enum HotWriteScript {
     Clean,
     CheckCondition(Vec<u8>),
@@ -3133,7 +3139,7 @@ fn reset_unit_attention_same_handle_recovers_via_mode_and_position_reverificatio
 }
 
 #[test]
-fn non_reset_completion_unknown_does_not_latch_the_read_state_gate() {
+fn completion_unknown_read_requires_explicit_position_proof_before_reuse() {
     let config = TapeIoRuntimeConfig {
         read_batch_blocks: 1,
         position_check_bytes: 0,
@@ -3155,10 +3161,184 @@ fn non_reset_completion_unknown_does_not_latch_the_read_state_gate() {
         Err(TapeIoError::Transport(_))
     ));
     assert_eq!(drive.mode_reverification_required, None);
+    assert!(matches!(
+        drive.read_block_batch(&mut buffer, 4, 1, 1),
+        Err(TapeIoError::InvalidRequest(_))
+    ));
+    drive.position().expect("explicit READ POSITION proof");
     let outcome = drive
         .read_block_batch(&mut buffer, 4, 1, 1)
-        .expect("non-reset completion unknown must not require MODE re-verification");
+        .expect("read resumes only after explicit position proof");
     assert_eq!(outcome.records_read, 1);
+}
+
+#[test]
+fn fixed_read_ili_withholds_data_invalidates_cursor_and_blocks_cached_reuse() {
+    let config = TapeIoRuntimeConfig {
+        read_batch_blocks: 4,
+        position_check_bytes: 0,
+        ..TapeIoRuntimeConfig::default()
+    };
+    let (mut drive, commands, _) = open_hot_script_drive(
+        "LIB_READ_ILI",
+        [10, 12],
+        [
+            HotWriteScript::CheckCondition(fixed_ili_residual_sense(2)),
+            HotWriteScript::Clean,
+        ],
+        config,
+    );
+    let mut buffer = [0xa5; 16];
+
+    assert!(matches!(
+        drive.read_block_batch(&mut buffer, 4, 4, 4),
+        Err(TapeIoError::CheckCondition(_))
+    ));
+    assert!(drive.expected_position.is_none());
+    assert!(!drive.position_known);
+    assert!(matches!(
+        drive.read_block_batch(&mut buffer, 4, 4, 4),
+        Err(TapeIoError::InvalidRequest(_))
+    ));
+    assert_eq!(
+        commands
+            .lock()
+            .expect("command log")
+            .iter()
+            .filter(|(cdb, _)| cdb[0] == 0x08)
+            .count(),
+        1,
+        "no staged or cached-position READ may issue after ILI"
+    );
+
+    drive.position().expect("explicit device position proof");
+    let outcome = drive
+        .read_block_batch(&mut buffer, 4, 4, 4)
+        .expect("read after explicit proof");
+    assert_eq!(outcome.records_read, 4);
+}
+
+#[test]
+fn fixed_read_ili_before_any_record_also_invalidates_and_stops() {
+    let config = TapeIoRuntimeConfig {
+        read_batch_blocks: 4,
+        position_check_bytes: 0,
+        ..TapeIoRuntimeConfig::default()
+    };
+    let (mut drive, commands, _) = open_hot_script_drive(
+        "LIB_READ_ILI_ZERO",
+        [10],
+        [HotWriteScript::CheckCondition(fixed_ili_residual_sense(4))],
+        config,
+    );
+    let mut buffer = [0xa5; 16];
+
+    assert!(matches!(
+        drive.read_block_batch(&mut buffer, 4, 4, 4),
+        Err(TapeIoError::CheckCondition(_))
+    ));
+    assert!(drive.expected_position.is_none());
+    assert!(matches!(
+        drive.read_block_batch(&mut buffer, 4, 4, 4),
+        Err(TapeIoError::InvalidRequest(_))
+    ));
+    assert_eq!(
+        commands
+            .lock()
+            .expect("command log")
+            .iter()
+            .filter(|(cdb, _)| cdb[0] == 0x08)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn recovered_fixed_read_delivers_only_residual_proven_records() {
+    let config = TapeIoRuntimeConfig {
+        read_batch_blocks: 4,
+        position_check_bytes: 0,
+        ..TapeIoRuntimeConfig::default()
+    };
+    let mut recovered = fixed_residual_sense(2);
+    recovered[2] = 0x01;
+    let (mut drive, _, audit) = open_hot_script_drive(
+        "LIB_READ_RECOVERED_RESIDUAL",
+        [10],
+        [HotWriteScript::CheckCondition(recovered.clone())],
+        config,
+    );
+    let mut buffer = [0xa5; 16];
+
+    let outcome = drive
+        .read_block_batch(&mut buffer, 4, 4, 4)
+        .expect("current recovered READ succeeds");
+
+    assert_eq!(outcome.records_read, 2);
+    assert_eq!(outcome.bytes_read, 8);
+    assert_eq!(outcome.position_after.lba, 12);
+    assert!(audit.lock().expect("audit").iter().any(|event| {
+        matches!(event, CapturedEvent::FinishedRecovered { sense, .. } if sense == &recovered)
+    }));
+}
+
+#[test]
+fn deferred_recovered_fixed_read_is_always_completion_unknown() {
+    let config = TapeIoRuntimeConfig {
+        read_batch_blocks: 4,
+        position_check_bytes: 0,
+        ..TapeIoRuntimeConfig::default()
+    };
+    for (serial, response_code) in [
+        ("LIB_READ_DEFERRED_71", 0x71),
+        ("LIB_READ_DEFERRED_73", 0x73),
+    ] {
+        let mut sense = fixed_residual_sense(0);
+        sense[0] = 0x80 | response_code;
+        sense[2] = 0x01;
+        let (mut drive, _, _) = open_hot_script_drive(
+            serial,
+            [10],
+            [HotWriteScript::CheckCondition(sense)],
+            config,
+        );
+        let mut buffer = [0xa5; 16];
+        assert!(matches!(
+            drive.read_block_batch(&mut buffer, 4, 4, 4),
+            Err(TapeIoError::Transport(_))
+        ));
+        assert!(drive.expected_position.is_none());
+    }
+}
+
+#[test]
+fn fixed_read_cadence_histograms_and_batch_effectiveness_are_populated() {
+    let config = TapeIoRuntimeConfig {
+        read_batch_blocks: 4,
+        position_check_bytes: 0,
+        ..TapeIoRuntimeConfig::default()
+    };
+    let (mut drive, _, _) = open_hot_script_drive(
+        "LIB_READ_DIAGNOSTICS",
+        [20],
+        [HotWriteScript::Clean, HotWriteScript::Clean],
+        config,
+    );
+    drive.reset_pipelined_diagnostics();
+    let mut buffer = [0u8; 16];
+    drive
+        .read_block_batch(&mut buffer, 4, 4, 4)
+        .expect("first batch");
+    drive
+        .read_block_batch(&mut buffer, 4, 4, 4)
+        .expect("second batch");
+
+    let diagnostics = drive.pipelined_read_diagnostics();
+    assert_eq!(diagnostics.ioctl_samples, 2);
+    assert_eq!(diagnostics.gap_samples, 1);
+    assert_eq!(diagnostics.good_commands, 2);
+    assert_eq!(diagnostics.good_records, 8);
+    assert_eq!(diagnostics.good_bytes, 32);
 }
 
 #[test]
@@ -3224,7 +3404,7 @@ fn reset_unit_attention_on_read_and_filemark_uses_state_invalidating_class() {
         ..TapeIoRuntimeConfig::default()
     };
     let reset = current_sense(0x06, 0, 0x29, 0x04);
-    let (mut read_drive, _, _) = open_hot_script_drive(
+    let (mut read_drive, read_commands, _) = open_hot_script_drive(
         "LIB_RESET_READ",
         [5],
         [HotWriteScript::CheckCondition(reset.clone())],
@@ -3239,6 +3419,16 @@ fn reset_unit_attention_on_read_and_filemark_uses_state_invalidating_class() {
     assert!(read_drive.expected_position.is_none());
     assert_eq!(read_drive.mode_reverification_required, Some(4));
     assert!(read_drive.read_block_batch(&mut buffer, 4, 1, 1).is_err());
+    assert_eq!(
+        read_commands
+            .lock()
+            .expect("command log")
+            .iter()
+            .filter(|(cdb, _)| cdb[0] == 0x08)
+            .count(),
+        1,
+        "reset-UA must cancel any next READ until MODE and position are re-proven"
+    );
 
     let (mut filemark_drive, timeouts, _) = open_hot_script_drive(
         "LIB_RESET_FILEMARK",

@@ -47,8 +47,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::handle::tape_io::{
-    PipelinedWriteDiagnostics, ReadBatchOutcome, SpaceKind, SpaceResult, TapeIoError, TapePosition,
-    WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
+    PipelinedWriteDiagnostics, ReadBatchOutcome, ReadBufferHandoff, SpaceKind, SpaceResult,
+    TapeIoError, TapePosition, WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
 };
 use crate::handle::DriveHandle;
 
@@ -285,9 +285,41 @@ pub trait BlockSource {
         ))
     }
 
+    /// Fill an owned ring buffer and return only bytes proven complete by the
+    /// fixed READ outcome. Errors withhold ownership from the consumer by
+    /// returning `Err`; the buffer is then dropped by this safety funnel.
+    fn read_buffer_handoff(
+        &mut self,
+        mut buffer: Vec<u8>,
+        block_size_bytes: u32,
+        requested_records: u32,
+        remaining_records_in_file: u32,
+    ) -> Result<ReadBufferHandoff, TapeIoError> {
+        let selected_records = requested_records
+            .min(remaining_records_in_file)
+            .min(self.read_batch_blocks(block_size_bytes).max(1));
+        let selected_bytes = (selected_records as usize)
+            .checked_mul(block_size_bytes as usize)
+            .ok_or_else(|| TapeIoError::OperationFailed("read handoff size overflow".into()))?;
+        buffer.resize(selected_bytes, 0);
+        let outcome = self.read_block_batch(
+            &mut buffer,
+            block_size_bytes,
+            requested_records,
+            remaining_records_in_file,
+        )?;
+        ReadBufferHandoff::from_outcome(buffer, outcome)
+            .map_err(|message| TapeIoError::OperationFailed(message.to_string()))
+    }
+
     /// Effective records per batch for this source and block size.
     fn read_batch_blocks(&self, _block_size_bytes: u32) -> u32 {
         1
+    }
+
+    /// Number of owned buffers available to the read-side staging ring.
+    fn read_ring_buffers(&self) -> u32 {
+        crate::handle::MIN_TAPE_IO_STAGING_RING_BUFFERS
     }
 
     /// LOCATE to the given LBA.
@@ -461,6 +493,9 @@ impl BlockSource for DriveHandleSource<'_> {
                 .unwrap_or(1)
                 .max(1),
         )
+    }
+    fn read_ring_buffers(&self) -> u32 {
+        self.0.staging_ring_buffers()
     }
     fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
         self.0.locate(lba)
@@ -1256,6 +1291,83 @@ mod tests {
     use std::fs;
 
     use tempfile::tempdir;
+
+    struct ShortRecoveredSource {
+        fail_closed: bool,
+    }
+
+    impl BlockSource for ShortRecoveredSource {
+        fn read_block(&mut self, _buf: &mut [u8]) -> Result<usize, TapeIoError> {
+            panic!("typed handoff test must use fixed batch READ")
+        }
+
+        fn read_block_batch(
+            &mut self,
+            buf: &mut [u8],
+            _block_size_bytes: u32,
+            _requested_records: u32,
+            _remaining_records_in_file: u32,
+        ) -> Result<ReadBatchOutcome, TapeIoError> {
+            if self.fail_closed {
+                return Err(TapeIoError::OperationFailed(
+                    "scripted fail-closed READ".to_string(),
+                ));
+            }
+            buf[..4].copy_from_slice(&[1, 2, 3, 4]);
+            Ok(ReadBatchOutcome::from_computed_position(
+                1,
+                4,
+                false,
+                TapePosition {
+                    lba: 1,
+                    partition: 0,
+                    beginning_of_partition: false,
+                    end_of_partition: false,
+                    block_position_end_of_warning: false,
+                },
+            ))
+        }
+
+        fn read_batch_blocks(&self, _block_size_bytes: u32) -> u32 {
+            4
+        }
+
+        fn locate(&mut self, _lba: u64) -> Result<TapePosition, TapeIoError> {
+            panic!("typed handoff test must not locate")
+        }
+
+        fn space(&mut self, _count: i64, _kind: SpaceKind) -> Result<SpaceResult, TapeIoError> {
+            panic!("typed handoff test must not space")
+        }
+
+        fn position(&mut self) -> Result<TapePosition, TapeIoError> {
+            panic!("typed handoff test must not query position")
+        }
+    }
+
+    #[test]
+    fn typed_read_handoff_never_exposes_sentinel_tail_after_short_completion() {
+        let mut source = ShortRecoveredSource { fail_closed: false };
+        let buffer = vec![0xa5; 16];
+
+        let handoff = source
+            .read_buffer_handoff(buffer, 4, 4, 4)
+            .expect("short proven read handoff");
+
+        assert_eq!(handoff.valid_bytes, 4);
+        assert_eq!(handoff.records_read, 1);
+        assert_eq!(handoff.valid_data(), [1, 2, 3, 4]);
+        assert_eq!(handoff.into_reusable_buffer().len(), 4);
+    }
+
+    #[test]
+    fn fail_closed_read_outcome_withholds_the_typed_handoff() {
+        let mut source = ShortRecoveredSource { fail_closed: true };
+
+        let result = source.read_buffer_handoff(vec![0xa5; 16], 4, 4, 4);
+
+        assert!(matches!(result, Err(TapeIoError::OperationFailed(_))));
+    }
 
     #[test]
     fn file_sink_and_source_round_trip_fixed_blocks() {

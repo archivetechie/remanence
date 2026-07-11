@@ -793,6 +793,60 @@ fieldtest_bench_record() {
   printf '%s,%s,%s,%s,%s,%s,%s\n' "$metric" "$drive" "$block_size" "$payload" "$mb_s" "$seconds" "$bytes" >>"$csv"
 }
 
+fieldtest_capture_tape_io_mode() {
+  local script="$1" label="$2" phase="$3"
+  local log_file out
+  log_file="$(fieldtest_log_dir)/rem-daemon.log"
+  out="$(fieldtest_artifact_path "$script" "${label}-tape-io" "$(fieldtest_timestamp_id)")"
+  if ! python3 - "$log_file" "$phase" "$out" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+log_path = Path(sys.argv[1])
+phase = sys.argv[2]
+out_path = Path(sys.argv[3])
+matches = []
+spool_matches = []
+for raw in log_path.read_text(errors="replace").splitlines():
+    try:
+        item = json.loads(raw)
+    except json.JSONDecodeError:
+        continue
+    if item.get("phase") == phase:
+        matches.append(item)
+    if item.get("phase") == "spool":
+        spool_matches.append(item)
+if not matches:
+    raise SystemExit(f"missing daemon diagnostic phase={phase} in {log_path}")
+item = matches[-1]
+if item.get("effective_mode") != "fixed_pipelined":
+    raise SystemExit(f"unexpected effective_mode in {phase}: {item.get('effective_mode')!r}")
+batch = item.get("effective_batch_blocks")
+if not isinstance(batch, int) or batch < 1:
+    raise SystemExit(f"missing effective_batch_blocks in {phase}: {batch!r}")
+out_path.parent.mkdir(parents=True, exist_ok=True)
+payload = {"tape_io": item}
+summary = f"effective_mode={item['effective_mode']} effective_batch_blocks={batch}"
+if phase == "staging_ring_open":
+    if not spool_matches:
+        raise SystemExit(f"missing receive-feed spool diagnostic in {log_path}")
+    spool = spool_matches[-1]
+    rate = spool.get("throughput_mib_s")
+    if not isinstance(rate, (int, float)):
+        raise SystemExit(f"missing receive-feed throughput_mib_s: {rate!r}")
+    payload["receive_feed"] = spool
+    summary += f" receive_feed_rate_mib_s={rate}"
+out_path.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n")
+print(summary)
+PY
+  then
+    fieldtest_evidence_record "$script" "${label}-tape-io" FAIL "missing or invalid effective tape I/O mode/batch diagnostic" "$log_file"
+    return 1
+  fi
+  fieldtest_evidence_record "$script" "${label}-tape-io" PASS "effective mode and batch captured" "$out"
+}
+
 fieldtest_detect_env() {
   if [[ "${REMFIELD_ENV:-}" == vtl || "${REMFIELD_ENV:-}" == real ]]; then
     export REMFIELD_ENV

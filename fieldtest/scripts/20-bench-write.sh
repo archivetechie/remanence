@@ -95,6 +95,7 @@ bench_write_case() {
     fieldtest_evidence_record "$SCRIPT_NAME" "$label" FAIL "daemon write failed for $label" "$out_path"
     return 1
   fi
+  fieldtest_capture_tape_io_mode "$SCRIPT_NAME" "$label" staging_ring_open
   end="$(python3 -c 'import time; print(f"{time.monotonic():.9f}")')"
   touch "$top_stop"
   wait "$sampler_pid" || true
