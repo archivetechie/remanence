@@ -105,8 +105,25 @@ pub fn stored_size_from_parts(
     metadata_frame_len: u64,
     plaintext_size: u64,
 ) -> Result<u64, AeadFrameError> {
+    stored_size_from_parts_with_prefix(
+        RAO_HEADER_LEN,
+        0,
+        chunk_size,
+        metadata_frame_len,
+        plaintext_size,
+    )
+}
+
+pub fn stored_size_from_parts_with_prefix(
+    header_len: u64,
+    key_frame_len: u64,
+    chunk_size: u64,
+    metadata_frame_len: u64,
+    plaintext_size: u64,
+) -> Result<u64, AeadFrameError> {
     let payload_len = payload_frame_len(plaintext_size, chunk_size)?;
-    let footer_base = checked_add(RAO_HEADER_LEN, metadata_frame_len)?;
+    let prefix_len = checked_add(header_len, key_frame_len)?;
+    let footer_base = checked_add(prefix_len, metadata_frame_len)?;
     let footer_payload_end = checked_add(footer_base, payload_len)?;
     let footer_end = checked_add(footer_payload_end, RAO_FOOTER_LEN)?;
     round_up(footer_end, chunk_size)
@@ -125,8 +142,25 @@ pub fn cipher_offset(
     chunk_size: u64,
     block_index: u64,
 ) -> Result<u64, AeadFrameError> {
+    cipher_offset_with_prefix(
+        RAO_HEADER_LEN,
+        0,
+        metadata_frame_len,
+        chunk_size,
+        block_index,
+    )
+}
+
+pub fn cipher_offset_with_prefix(
+    header_len: u64,
+    key_frame_len: u64,
+    metadata_frame_len: u64,
+    chunk_size: u64,
+    block_index: u64,
+) -> Result<u64, AeadFrameError> {
     let stride = checked_add(chunk_size, CHACHA20POLY1305_TAG_LEN)?;
-    let base = checked_add(RAO_HEADER_LEN, metadata_frame_len)?;
+    let prefix_len = checked_add(header_len, key_frame_len)?;
+    let base = checked_add(prefix_len, metadata_frame_len)?;
     let payload_offset = checked_mul(block_index, stride)?;
     checked_add(base, payload_offset)
 }
@@ -191,22 +225,37 @@ pub fn inspect_geometry(
     metadata_frame_len: u64,
     chunk_size: u64,
 ) -> Result<InspectGeometry, AeadFrameError> {
+    inspect_geometry_with_prefix(
+        RAO_HEADER_LEN,
+        0,
+        stored_size_bytes,
+        metadata_frame_len,
+        chunk_size,
+    )
+}
+
+pub fn inspect_geometry_with_prefix(
+    header_len: u64,
+    key_frame_len: u64,
+    stored_size_bytes: u64,
+    metadata_frame_len: u64,
+    chunk_size: u64,
+) -> Result<InspectGeometry, AeadFrameError> {
     if chunk_size == 0 {
         return Err(AeadFrameError::InvalidChunkSize);
     }
     if stored_size_bytes % chunk_size != 0 {
         return Err(AeadFrameError::TrailingData);
     }
-    let minimum_size = checked_add(
-        checked_add(RAO_HEADER_LEN, RAO_FOOTER_LEN)?,
-        metadata_frame_len,
-    )?;
+    let prefix_len = checked_add(header_len, key_frame_len)?;
+    let minimum_size = checked_add(checked_add(prefix_len, RAO_FOOTER_LEN)?, metadata_frame_len)?;
     if stored_size_bytes < minimum_size {
         return Err(AeadFrameError::UnexpectedEof);
     }
 
     let stride = checked_add(chunk_size, CHACHA20POLY1305_TAG_LEN)?;
-    let without_fixed = match stored_size_bytes.checked_sub(RAO_HEADER_LEN + RAO_FOOTER_LEN) {
+    let fixed_len = checked_add(prefix_len, RAO_FOOTER_LEN)?;
+    let without_fixed = match stored_size_bytes.checked_sub(fixed_len) {
         Some(value) => value,
         None => return Err(AeadFrameError::UnexpectedEof),
     };
@@ -220,7 +269,7 @@ pub fn inspect_geometry(
     }
     let plaintext_size = checked_mul(chunk_count, chunk_size)?;
     let payload_span = checked_mul(chunk_count, stride)?;
-    let footer_base = checked_add(RAO_HEADER_LEN, metadata_frame_len)?;
+    let footer_base = checked_add(prefix_len, metadata_frame_len)?;
     let footer_offset = checked_add(footer_base, payload_span)?;
     let footer_end = checked_add(footer_offset, RAO_FOOTER_LEN)?;
     let expected_stored_size = round_up(footer_end, chunk_size)?;
@@ -266,10 +315,12 @@ mod tests {
         let stream_snippets: &[&str] = &[
             "if chunk == 0 || plaintext_size == 0 || plaintext_size % chunk != 0",
             "plaintext_size\n        .checked_add(\n            CHACHA20POLY1305_TAG_LEN\n                .checked_mul(chunks)",
-            "(RAO_HEADER_LEN as u64)\n        .checked_add(metadata_frame_len)\n        .and_then(|value| value.checked_add(payload_len))\n        .and_then(|value| value.checked_add(RAO_FOOTER.len() as u64))",
+            "stored_size_from_parts_with_key_frame(chunk_size, 0, metadata_frame_len, plaintext_size)",
+            ".checked_add(u64::from(key_frame_len))\n        .and_then(|value| value.checked_add(metadata_frame_len))",
             "let remainder = value % multiple;\n    if remainder == 0 {\n        Ok(value)\n    } else {",
             "let stride = u64::from(chunk_size)\n        .checked_add(CHACHA20POLY1305_TAG_LEN)",
-            "(RAO_HEADER_LEN as u64)\n        .checked_add(metadata_frame_len)\n        .and_then(|base| base.checked_add(b.checked_mul(stride)?))",
+            "cipher_offset_with_key_frame(0, metadata_frame_len, chunk_size, b)",
+            ".checked_add(u64::from(key_frame_len))\n        .and_then(|value| value.checked_add(metadata_frame_len))",
         ];
         for (i, snippet) in stream_snippets.iter().enumerate() {
             assert!(
@@ -284,7 +335,7 @@ mod tests {
             "let last_chunk = (plaintext_end - 1) / chunk_size;",
             "let fetched_chunk_count = last_chunk\n        .checked_sub(first_chunk)\n        .and_then(|value| value.checked_add(1))",
             "let stored_chunk_len_u64 = chunk_size\n        .checked_add(CHACHA20POLY1305_TAG_LEN)",
-            "let stored_range_start =\n        cipher_offset(header.metadata_frame_len, header.chunk_size, first_chunk)?;",
+            "let stored_range_start = cipher_offset_with_key_frame(\n        header.key_frame_len,\n        header.metadata_frame_len,\n        header.chunk_size,\n        first_chunk,",
             "let stored_range_end = last_chunk_start\n        .checked_add(stored_chunk_len_u64)",
             "let trim_start =\n        usize::try_from(plaintext_start % chunk_size)",
             "let end = start.checked_add(len).ok_or_else(||",
@@ -301,11 +352,12 @@ mod tests {
         let inspect_snippets: &[&str] = &[
             "if stored_size_bytes % u64::from(header.chunk_size) != 0",
             "let stride = u64::from(header.chunk_size)\n        .checked_add(16)",
-            "let numerator = stored_size_bytes\n        .checked_sub(144)\n        .and_then(|value| value.checked_sub(header.metadata_frame_len))",
+            "let key_frame_len = u64::from(header.key_frame_len);",
+            ".checked_sub(RAO_HEADER_LEN as u64)\n        .and_then(|value| value.checked_sub(key_frame_len))\n        .and_then(|value| value.checked_sub(RAO_FOOTER.len() as u64))",
             "let chunk_count = numerator / stride;",
             "if chunk_count == 0 {",
             "let plaintext_size = chunk_count\n        .checked_mul(u64::from(header.chunk_size))",
-            "let footer_offset = (RAO_HEADER_LEN as u64)\n        .checked_add(header.metadata_frame_len)\n        .and_then(|value| value.checked_add(chunk_count.checked_mul(stride)?))",
+            "let footer_offset = (RAO_HEADER_LEN as u64)\n        .checked_add(key_frame_len)\n        .and_then(|value| value.checked_add(header.metadata_frame_len))",
             "let expected_size = round_up(\n        footer_offset\n            .checked_add(RAO_FOOTER.len() as u64)",
             "if expected_size != stored_size_bytes {",
         ];
@@ -318,7 +370,8 @@ mod tests {
 
         let extraction_snippets: &[&str] = &[
             "let chunks = chunk_count(plaintext_size, chunk_size)?;",
-            "let footer_base = checked_add(RAO_HEADER_LEN, metadata_frame_len)?;",
+            "let prefix_len = checked_add(header_len, key_frame_len)?;",
+            "let footer_base = checked_add(prefix_len, metadata_frame_len)?;",
             "let footer_payload_end = checked_add(footer_base, payload_len)?;",
             "let footer_end = checked_add(footer_payload_end, RAO_FOOTER_LEN)?;",
             "let stride = checked_add(chunk_size, CHACHA20POLY1305_TAG_LEN)?;",
@@ -373,5 +426,22 @@ mod tests {
         assert_eq!(geometry.footer_offset, 1776);
         assert_eq!(geometry.expected_stored_size, 2048);
         assert_eq!(geometry.fill_len, 256);
+    }
+
+    #[test]
+    fn generic_prefix_geometry_covers_v1_and_v2_instances() {
+        let v1 = inspect_geometry_with_prefix(128, 0, 2048, 64, 512).unwrap();
+        assert_eq!(v1, inspect_geometry(2048, 64, 512).unwrap());
+
+        let key_frame_len = 211;
+        let v2_stored =
+            stored_size_from_parts_with_prefix(128, key_frame_len, 512, 64, 1536).unwrap();
+        let v2 = inspect_geometry_with_prefix(128, key_frame_len, v2_stored, 64, 512).unwrap();
+        assert_eq!(v2.chunk_count, 3);
+        assert_eq!(v2.footer_offset, 128 + key_frame_len + 64 + 3 * 528);
+        assert_eq!(
+            cipher_offset_with_prefix(128, key_frame_len, 64, 512, 2).unwrap(),
+            128 + key_frame_len + 64 + 2 * 528
+        );
     }
 }

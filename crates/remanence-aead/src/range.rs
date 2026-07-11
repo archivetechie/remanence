@@ -9,7 +9,9 @@ use crate::error::{RaoAeadError, Result};
 use crate::header::{RaoHeader, RAO_HEADER_LEN};
 use crate::kdf::{derive_keys, derive_salt, RootKey};
 use crate::metadata::RaoMetadata;
-use crate::stream::{cipher_offset, decrypt_chunk, decrypt_metadata, CHACHA20POLY1305_TAG_LEN};
+use crate::stream::{
+    cipher_offset_with_key_frame, decrypt_chunk, decrypt_metadata, CHACHA20POLY1305_TAG_LEN,
+};
 
 /// Report returned after successfully opening a plaintext subrange.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,58 +79,21 @@ pub fn open_inner_range_to_vec(
 
 /// Open and authenticate a v2 envelope plaintext range.
 ///
-/// The standalone recovery path deliberately authenticates the complete object
-/// before releasing a slice. Tape PFR can later replace this conservative
-/// implementation without changing its strict envelope-mode contract.
 pub fn open_plaintext_range_envelope_to_vec(
     input: &[u8],
     recipient: &crate::RecipientPrivateKey,
     plaintext_start: u64,
     plaintext_len: u64,
 ) -> Result<(Vec<u8>, RangeOpenReport)> {
-    let (plaintext, opened) = crate::open_envelope_to_vec(input, recipient)?;
-    let plaintext_end = validate_range(
+    let (header, metadata, keys) = open_authenticated_metadata_envelope(input, recipient)?;
+    open_plaintext_range_with_context(
+        input,
+        header,
+        metadata,
+        keys,
         plaintext_start,
         plaintext_len,
-        opened.metadata.plaintext_size,
-    )?;
-    let start = usize::try_from(plaintext_start).map_err(|_| RaoAeadError::SizeOverflow)?;
-    let end = usize::try_from(plaintext_end).map_err(|_| RaoAeadError::SizeOverflow)?;
-    let bytes = plaintext
-        .get(start..end)
-        .ok_or(RaoAeadError::SizeOverflow)?
-        .to_vec();
-    let chunk_size = u64::from(opened.header.chunk_size);
-    let (first_chunk, chunk_count, stored_range_start, stored_range_len) = if plaintext_len == 0 {
-        (None, 0, None, 0)
-    } else {
-        let first = plaintext_start / chunk_size;
-        let last = (plaintext_end - 1) / chunk_size;
-        let count = last - first + 1;
-        let start = crate::cipher_offset_with_key_frame(
-            opened.header.key_frame_len,
-            opened.header.metadata_frame_len,
-            opened.header.chunk_size,
-            first,
-        )?;
-        let len = count
-            .checked_mul(chunk_size + CHACHA20POLY1305_TAG_LEN)
-            .ok_or(RaoAeadError::SizeOverflow)?;
-        (Some(first), count, Some(start), len)
-    };
-    Ok((
-        bytes,
-        RangeOpenReport {
-            header: opened.header,
-            metadata: opened.metadata,
-            plaintext_start,
-            plaintext_len,
-            first_chunk,
-            chunk_count,
-            stored_range_start,
-            stored_range_len,
-        },
-    ))
+    )
 }
 
 fn open_plaintext_range_with_context(
@@ -169,9 +134,18 @@ fn open_plaintext_range_with_context(
         .ok_or(RaoAeadError::SizeOverflow)?;
     let stored_chunk_len =
         usize::try_from(stored_chunk_len_u64).map_err(|_| RaoAeadError::SizeOverflow)?;
-    let stored_range_start =
-        cipher_offset(header.metadata_frame_len, header.chunk_size, first_chunk)?;
-    let last_chunk_start = cipher_offset(header.metadata_frame_len, header.chunk_size, last_chunk)?;
+    let stored_range_start = cipher_offset_with_key_frame(
+        header.key_frame_len,
+        header.metadata_frame_len,
+        header.chunk_size,
+        first_chunk,
+    )?;
+    let last_chunk_start = cipher_offset_with_key_frame(
+        header.key_frame_len,
+        header.metadata_frame_len,
+        header.chunk_size,
+        last_chunk,
+    )?;
     let stored_range_end = last_chunk_start
         .checked_add(stored_chunk_len_u64)
         .ok_or(RaoAeadError::SizeOverflow)?;
@@ -274,6 +248,58 @@ fn open_authenticated_metadata(
     let metadata = RaoMetadata::from_cbor_bytes(&metadata_plaintext, header.chunk_size)?;
     let expected_salt = derive_salt(
         root_key,
+        &header.object_id_field()?,
+        &metadata.plaintext_digest,
+        &metadata_plaintext,
+    )?;
+    if expected_salt != header.hkdf_salt {
+        return Err(RaoAeadError::SaltDerivationMismatch);
+    }
+    Ok((header, metadata, keys))
+}
+
+fn open_authenticated_metadata_envelope(
+    input: &[u8],
+    recipient: &crate::RecipientPrivateKey,
+) -> Result<(RaoHeader, RaoMetadata, crate::kdf::DerivedKeys)> {
+    let header_bytes: [u8; RAO_HEADER_LEN] = input
+        .get(..RAO_HEADER_LEN)
+        .ok_or(RaoAeadError::UnexpectedEof)?
+        .try_into()
+        .map_err(|_| RaoAeadError::UnexpectedEof)?;
+    let header = RaoHeader::parse(&header_bytes)?;
+    if header.format_version != 2 || header.wrap_suite != crate::WRAP_SUITE_HPKE_V1 {
+        return Err(RaoAeadError::KeyModeMismatch);
+    }
+
+    let key_frame_len =
+        usize::try_from(header.key_frame_len).map_err(|_| RaoAeadError::SizeOverflow)?;
+    let key_frame_end = RAO_HEADER_LEN
+        .checked_add(key_frame_len)
+        .ok_or(RaoAeadError::SizeOverflow)?;
+    let key_frame_bytes = input
+        .get(RAO_HEADER_LEN..key_frame_end)
+        .ok_or(RaoAeadError::UnexpectedEof)?;
+    let key_frame = crate::KeyFrame::parse(key_frame_bytes)?;
+    let dek = crate::unwrap_dek(&key_frame, &header.object_id, recipient)?;
+    let keys = crate::derive_keys_v2(
+        dek.as_bytes(),
+        &header.hkdf_salt,
+        &header.header_hash_with_key_frame(key_frame_bytes)?,
+    )?;
+
+    let metadata_frame_len =
+        usize::try_from(header.metadata_frame_len).map_err(|_| RaoAeadError::SizeOverflow)?;
+    let metadata_end = key_frame_end
+        .checked_add(metadata_frame_len)
+        .ok_or(RaoAeadError::SizeOverflow)?;
+    let metadata_frame = input
+        .get(key_frame_end..metadata_end)
+        .ok_or(RaoAeadError::UnexpectedEof)?;
+    let metadata_plaintext = decrypt_metadata(&keys.metadata_key, metadata_frame)?;
+    let metadata = RaoMetadata::from_cbor_bytes(&metadata_plaintext, header.chunk_size)?;
+    let expected_salt = crate::derive_salt_v2(
+        dek.as_bytes(),
         &header.object_id_field()?,
         &metadata.plaintext_digest,
         &metadata_plaintext,
