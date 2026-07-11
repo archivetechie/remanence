@@ -146,6 +146,12 @@
       "operation": "read",
       "fault": "hardlink entry points at a preceding symlink rather than a regular-file primary",
       "expected_error": "InvalidHardlinkTarget"
+    },
+    {
+      "id": "missing-manifest",
+      "operation": "restore-report",
+      "fault": "tar EOF is reached without a _remanence/manifest.cbor entry",
+      "expected_report": "MissingManifest"
     }
   ]
 }
