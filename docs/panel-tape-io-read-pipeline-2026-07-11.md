@@ -187,3 +187,13 @@ Not actually resolved:
 - Panel residual/write-wide hardening: read handling is specified; cross-write-funnel behavior and compatibility are not.
 
 No files were modified and no implementation tests were run, consistent with the read-only design-review charter.
+
+---
+
+## FINAL VERIFY (codex gpt-5.6-sol, 2026-07-11 11:41) — v0.4 after IN_BAND removal
+
+**PASS — no blockers or majors. TIO-6 v0.4 meets the freeze bar; design FREEZES.**
+
+IN_BAND genuinely deleted (3 majors dissolved). Proof-frontier implementable + correctly attributed (off-by-one prohibited+tested). Proof-only blocking benign/deadlock-free. Keepalive + RAM values present (tonic 0.14.5 exposes APIs; live builder intentionally pre-R2). RAM/residency scope sound — tmpfs spool ceiling-reserved-but-swappable, NO TIO-5 never-swap contradiction. Cycle arithmetic checks (~50.7 cyc/hr @ 8GiB/90-25/c=d/2; leg-3 = physical qual, not a defect). Error precedence fixed. Accepted decisions intact.
+
+Two MINORS to fold at prompt-cut: (1) reference-configuration.md missing 4 reservoir/proof keys + spool-row post-R2 authority wording; (2) §3.2 channel-growth assertion — size at window-creation for effective max slab count, assert allocated ≤ capacity.
