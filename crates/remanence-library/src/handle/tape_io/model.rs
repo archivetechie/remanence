@@ -406,6 +406,8 @@ pub struct PipelinedWriteDiagnostics {
     pub good_records: u64,
     /// Bytes carried by clean data commands.
     pub good_bytes: u64,
+    /// Residual/transport disagreements observed on position-arbitrated EOM/EW.
+    pub residual_claim_mismatches: u64,
     /// Median completion-to-next-submit gap in microseconds.
     pub gap_p50_us: u64,
     /// 95th-percentile completion-to-next-submit gap in microseconds.
@@ -490,6 +492,50 @@ pub struct ReadBatchOutcome {
     position_evidence: PositionAfter,
 }
 
+/// A fixed-read handoff together with the position evidence produced by the
+/// same command. Keeping this wrapper outside [`ReadBufferHandoff`] preserves
+/// the handoff's length-typed data surface while preventing evidence loss.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReadHandoffOutcome {
+    /// Position immediately after the fixed READ.
+    pub position_after: TapePosition,
+    /// Whether that position was computed or proven by READ POSITION.
+    pub evidence: PositionAfter,
+    /// The unchanged, stale-tail-safe data handoff.
+    pub handoff: ReadBufferHandoff,
+}
+
+/// One ordered data-buffer delivery from the read submitter.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SequencedHandoff {
+    /// Strictly monotonic command sequence within the read window.
+    pub seq: u64,
+    /// Cumulative planned records completed through this command.
+    pub plan_records_end: u64,
+    /// Position immediately after this command.
+    pub position_after: TapePosition,
+    /// Position evidence carried by this command's funnel outcome.
+    pub evidence: PositionAfter,
+    /// The unchanged, stale-tail-safe data handoff.
+    pub handoff: ReadBufferHandoff,
+}
+
+/// In-band delivery protocol between the read submitter and decoder.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReadDelivery {
+    /// A data-bearing fixed-read completion.
+    Handoff(SequencedHandoff),
+    /// A standalone READ POSITION proof naming the exact completed frontier.
+    ProofFrontier {
+        /// Highest command sequence covered by the proof.
+        through_seq: u64,
+        /// Cumulative planned records covered by the proof.
+        plan_records_end: u64,
+        /// Device position proof for that frontier.
+        proof: DevicePositionProof,
+    },
+}
+
 /// Terminal conditions attached to a successfully delivered fixed-read buffer.
 /// Fail-closed errors never produce a handoff, so `error` remains false for a
 /// value returned through the safe read API and exists to keep the relay
@@ -567,6 +613,21 @@ impl ReadBatchOutcome {
             position_evidence: PositionAfter::Computed(ComputedPosition::from_position(
                 position_after,
             )),
+        }
+    }
+
+    pub(crate) fn from_position_evidence(
+        records_read: u32,
+        bytes_read: u32,
+        filemark: bool,
+        position_evidence: PositionAfter,
+    ) -> Self {
+        Self {
+            records_read,
+            bytes_read,
+            filemark,
+            position_after: position_evidence.position(),
+            position_evidence,
         }
     }
 

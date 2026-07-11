@@ -145,6 +145,7 @@ struct PipelineDiagnostics {
     good_commands: u64,
     good_records: u64,
     good_bytes: u64,
+    residual_claim_mismatches: u64,
     first_submit: Option<Instant>,
     previous_completion: Option<Instant>,
     last_completion: Option<Instant>,

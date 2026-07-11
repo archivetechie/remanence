@@ -61,7 +61,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use remanence_library::{
-    BlockSink, BlockSource, DriveHandle, StaticAllowlist, TapeConfig, TapeIoError,
+    BlockRead, BlockSink, DriveHandle, StaticAllowlist, TapeConfig, TapeIoError,
 };
 use remanence_parity::bootstrap::{parse_bootstrap_block, write_bootstrap_block};
 use remanence_parity::{
