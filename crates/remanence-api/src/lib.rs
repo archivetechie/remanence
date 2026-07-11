@@ -2517,7 +2517,8 @@ impl ReadSessionApi {
         let session_id = decode_uuid_bytes(&session_id, "session_id")?;
         let session_id = Uuid::from_bytes(session_id);
         let object_id = decode_object_id(&object_id)?;
-        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Result<pb::BytesChunk, Status>>(16);
+        let (chunk_tx, chunk_rx) =
+            crate::read_core::read_stream_channel(stream_chunk_bytes as usize);
         crate::mount::read_file(
             &self.state,
             session_id,
@@ -2534,7 +2535,7 @@ impl ReadSessionApi {
             mounted.drive_uuid.clone()
         };
         Ok(Box::pin(CountingBytesStream {
-            inner: Box::pin(ReceiverStream::new(chunk_rx)),
+            inner: Box::pin(chunk_rx),
             state,
             drive_uuid,
         }))
@@ -2553,7 +2554,8 @@ impl ReadSessionApi {
         let session_id = Uuid::from_bytes(session_id);
         let object_id = decode_object_id(&object_id)?;
         let file_id = decode_text_id(&file_id, "file_id")?;
-        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Result<pb::BytesChunk, Status>>(16);
+        let (chunk_tx, chunk_rx) =
+            crate::read_core::read_stream_channel(stream_chunk_bytes as usize);
         crate::mount::read_object_range(
             &self.state,
             crate::mount::ReadObjectRangeDispatch {
@@ -2574,7 +2576,7 @@ impl ReadSessionApi {
             mounted.drive_uuid.clone()
         };
         Ok(Box::pin(CountingBytesStream {
-            inner: Box::pin(ReceiverStream::new(chunk_rx)),
+            inner: Box::pin(chunk_rx),
             state,
             drive_uuid,
         }))

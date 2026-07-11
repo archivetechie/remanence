@@ -70,6 +70,22 @@ are required, with no defaults:
 | `key` | Server private key PEM. The file must not be group- or world-accessible (mode bits `077` must be clear) or the daemon refuses to start. |
 | `client_ca` | CA certificate PEM that every client certificate must chain to. Clients without a valid certificate are rejected at the TLS layer. |
 
+### gRPC transport flow control
+
+The daemon explicitly advertises 4 MiB HTTP/2 initial stream and connection
+flow-control windows on both its Unix-socket and TCP/mTLS servers. These values
+are compiled transport defaults rather than configuration keys. The restore
+server defaults a client-requested `stream_chunk_bytes = 0` to 256 KiB and
+bounds its delivery queue to a 4 MiB byte budget (or one message when a client
+explicitly requests a chunk larger than that budget).
+
+TCP clients must configure matching HTTP/2 initial stream and connection
+windows of at least 4 MiB; changing only the server cannot remove a smaller
+client receive window. With tonic, apply `initial_stream_window_size(4 * 1024 *
+1024)` and `initial_connection_window_size(4 * 1024 * 1024)` to the client
+`Endpoint`. Client-side flag ownership is intentionally deferred; until that
+surface exists, client implementations must set these values directly.
+
 <!-- code-anchor: crates/remanence-state/src/config.rs @ 7fb10f8 -->
 ## `[[libraries]]`
 
