@@ -3546,13 +3546,16 @@ fn run_archive_reseal_with<F>(
     operation: F,
 ) -> ExitCode
 where
-    F: FnOnce(&ArchiveResealArgs) -> Result<Value, String>,
+    F: FnOnce(&ArchiveResealArgs) -> Result<PublishedReseal, String>,
 {
     match operation(args) {
-        Ok(report) => match serde_json::to_writer(&mut *out, &report)
+        Ok(publication) => match serde_json::to_writer(&mut *out, &publication.report)
             .and_then(|()| writeln!(out).map_err(serde_json::Error::io))
         {
-            Ok(()) => ExitCode::SUCCESS,
+            Ok(()) => {
+                publication.commit();
+                ExitCode::SUCCESS
+            }
             Err(error) => {
                 let _ = writeln!(err, "error: write reseal report: {error}");
                 ExitCode::from(1)
@@ -3565,7 +3568,46 @@ where
     }
 }
 
-fn reseal_archive_object(args: &ArchiveResealArgs) -> Result<Value, String> {
+/// Armed publication whose output is removed unless report emission commits it.
+struct PublishedReseal {
+    report: Value,
+    output: PathBuf,
+    #[cfg(unix)]
+    output_identity: (u64, u64),
+    armed: bool,
+}
+
+impl PublishedReseal {
+    fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PublishedReseal {
+    fn drop(&mut self) {
+        if self.armed && self.still_owns_output() {
+            let _ = fs::remove_file(&self.output);
+        }
+    }
+}
+
+impl PublishedReseal {
+    #[cfg(unix)]
+    fn still_owns_output(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        fs::metadata(&self.output)
+            .map(|metadata| (metadata.dev(), metadata.ino()) == self.output_identity)
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(unix))]
+    fn still_owns_output(&self) -> bool {
+        self.output.exists()
+    }
+}
+
+fn reseal_archive_object(args: &ArchiveResealArgs) -> Result<PublishedReseal, String> {
     reseal_archive_object_with_verifier(args, |path, expected| {
         let actual = sha256_file(path)?;
         if actual != expected {
@@ -3578,7 +3620,7 @@ fn reseal_archive_object(args: &ArchiveResealArgs) -> Result<Value, String> {
 fn reseal_archive_object_with_verifier<F>(
     args: &ArchiveResealArgs,
     verify_staged: F,
-) -> Result<Value, String>
+) -> Result<PublishedReseal, String>
 where
     F: FnOnce(&Path, [u8; 32]) -> Result<[u8; 32], String>,
 {
@@ -3678,40 +3720,101 @@ where
         let _ = fs::remove_file(&temp);
         return Err(format!("sync {}: {error}", temp.display()));
     }
+    #[cfg(unix)]
+    let output_identity = {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                drop(file);
+                let _ = fs::remove_file(&temp);
+                return Err(format!("stat {}: {error}", temp.display()));
+            }
+        };
+        (metadata.dev(), metadata.ino())
+    };
     drop(file);
-    let mut published = false;
-    let write_result: Result<[u8; 32], String> = (|| {
+    let write_result: Result<Value, String> = (|| {
         let staged_digest = verify_staged(&temp, report.stored_digest)?;
-        fs::rename(&temp, &args.out).map_err(|error| {
+        let value = json!({
+            "input": args.object,
+            "output": args.out,
+            "object_id": report.header.object_id,
+            "input_format_version": 1,
+            "output_format_version": 2,
+            "recipient_epochs": report.key_frame.as_ref().expect("v2 seal has key frame")
+                .slots.iter().map(|slot| slot.epoch_label.as_str()).collect::<Vec<_>>(),
+            "stored_size_bytes": report.stored_size_bytes,
+            "expected_sha256": bytes_to_hex(&report.stored_digest),
+            "published_sha256": bytes_to_hex(&staged_digest),
+            "verified_after_write": true
+        });
+        publish_noreplace(&temp, &args.out).map_err(|error| {
             format!(
                 "publish resealed object {} -> {}: {error}",
                 temp.display(),
                 args.out.display()
             )
         })?;
-        published = true;
-        Ok(staged_digest)
+        Ok(value)
     })();
     if write_result.is_err() {
         let _ = fs::remove_file(&temp);
-        if published {
-            let _ = fs::remove_file(&args.out);
+    }
+    Ok(PublishedReseal {
+        report: write_result?,
+        output: args.out.clone(),
+        #[cfg(unix)]
+        output_identity,
+        armed: true,
+    })
+}
+
+/// Publishes without replacing a destination created by a racing process.
+fn publish_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let source = CString::new(source.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "source path contains NUL"))?;
+        let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(ErrorKind::InvalidInput, "destination path contains NUL")
+        })?;
+        // SAFETY: both pointers are valid NUL-terminated path strings for the
+        // duration of the syscall, and no mutable memory is shared with it.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
+        ) {
+            return Err(error);
         }
     }
-    let remote_digest = write_result?;
-    Ok(json!({
-        "input": args.object,
-        "output": args.out,
-        "object_id": report.header.object_id,
-        "input_format_version": 1,
-        "output_format_version": 2,
-        "recipient_epochs": report.key_frame.as_ref().expect("v2 seal has key frame")
-            .slots.iter().map(|slot| slot.epoch_label.as_str()).collect::<Vec<_>>(),
-        "stored_size_bytes": report.stored_size_bytes,
-        "expected_sha256": bytes_to_hex(&report.stored_digest),
-        "published_sha256": bytes_to_hex(&remote_digest),
-        "verified_after_write": true
-    }))
+
+    // Portable fallback for kernels/filesystems without renameat2 support:
+    // hard_link is an atomic O_EXCL-style create, then unlink completes move.
+    fs::hard_link(source, destination)?;
+    if let Err(error) = fs::remove_file(source) {
+        let _ = fs::remove_file(destination);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn run_daemon_client_command(
@@ -13644,9 +13747,50 @@ mod tests {
         assert!(!temporary_archive_output_path(&output).exists());
         assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
 
-        let report = reseal_archive_object(&args).unwrap();
+        let raced_bytes = b"unrelated raced destination";
+        let race_error = reseal_archive_object_with_verifier(&args, |path, expected| {
+            fs::write(&output, raced_bytes).map_err(|error| error.to_string())?;
+            let actual = sha256_file(path)?;
+            assert_eq!(actual, expected);
+            Ok(actual)
+        })
+        .err()
+        .expect("raced destination must reject no-replace publication");
+        assert!(race_error.contains("publish resealed object"));
+        assert_eq!(fs::read(&output).unwrap(), raced_bytes);
+        fs::remove_file(&output).unwrap();
+
+        struct FailingReportWriter;
+        impl Write for FailingReportWriter {
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(ErrorKind::BrokenPipe, "injected failure"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut failing_writer = FailingReportWriter;
+        let mut report_error = Vec::new();
+        let report_failure = run_archive_reseal(&args, &mut failing_writer, &mut report_error);
+        assert_ne!(report_failure, ExitCode::SUCCESS);
+        assert!(String::from_utf8(report_error)
+            .unwrap()
+            .contains("write reseal report"));
+        assert!(!output.exists(), "report failure left published --out");
+        assert!(!temporary_archive_output_path(&output).exists());
+
+        let mut report_out = Vec::new();
+        let mut report_err = Vec::new();
+        assert_eq!(
+            run_archive_reseal(&args, &mut report_out, &mut report_err),
+            ExitCode::SUCCESS
+        );
+        assert!(report_err.is_empty());
+        let report: Value = serde_json::from_slice(&report_out).unwrap();
         assert_eq!(report["verified_after_write"], true);
-        let v2 = fs::read(output).unwrap();
+        let v2 = fs::read(&output).unwrap();
         assert_eq!(inspect_bytes(&v2).unwrap().header.format_version, 2);
         assert_eq!(fs::read_dir(staging).unwrap().count(), 0);
         assert_eq!(
