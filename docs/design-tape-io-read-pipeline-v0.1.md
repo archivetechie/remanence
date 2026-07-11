@@ -1448,14 +1448,21 @@ Stages (each independently landable, diff-gated, scenario-verified):
    diag, §10 hermetic rows. Prerequisite ordering within R2: funnel
    hardening → trait split (`BlockRead`) → submitter/reservoir → ranged
    unification.
-3. **Cross-repo deliverable (owner decision): sutra-agent client-side
-   matching.** The client must set matching h2 stream/connection windows
-   and the 256 KiB chunk request on its channel, or H2 re-appears
-   client-side on any non-local link. A sutra-agent prompt/design follows
-   (that repo's docs/); if the flag surface spans repos, single-source it
-   as a shared contract (`contract-read-stream-tuning.md`) per the
-   referenced-contracts rule. Server-side values are already recorded in
-   `reference-configuration.md` (R1).
+3. **Cross-repo deliverable: RESTORE-consumer client-side matching.**
+   **ERRATA 2026-07-11: this is NOT sutra-agent** — sutra-agent is the
+   INGEST/receive client and does not consume the restore `ReadSessionService`
+   stream; the earlier "sutra-agent" attribution was wrong (owner-confirmed).
+   The RESTORE consumer (the client that reads restore streams over a non-local
+   link — TBD / not yet built) must set a matching h2 **stream/connection
+   receive window** and the 256 KiB chunk request on ITS channel, or H2 re-caps
+   restore throughput client-side on any non-local link. **Direction note:** flow
+   control is per-direction — restore is server→client, so the CLIENT's *receive*
+   window governs restore speed; R1's server-side windows govern the client→server
+   (ingest/request) direction and do NOT by themselves speed restore downloads.
+   R1's H1 fix (the 10 ms send poll) is the direct restore win and is
+   direction-agnostic. Local (unix-socket) restore is not window-limited. When a
+   network restore consumer exists, single-source the values from
+   `reference-configuration.md` (R1) per the referenced-contracts rule.
 4. **Drishti/viveka wiring (owner decision):** the dual-sided
    below-streaming-rate / reposition-rate signal (§8) lands with R2's diag
    and is registered in the viveka policy config. Write-side spool-sizing
