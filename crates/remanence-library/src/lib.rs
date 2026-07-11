@@ -30,8 +30,8 @@ pub mod transport;
 pub mod watch;
 
 pub use block_io::{
-    BlockSink, BlockSource, DriveHandleSink, DriveHandleSource, FileBlockSink, FileBlockSource,
-    VecBlockSink, VecBlockSource, VecBlockSourceCall,
+    BlockRead, BlockSink, BlockSource, DriveHandleSink, DriveHandleSource, FileBlockSink,
+    FileBlockSource, VecBlockSink, VecBlockSource, VecBlockSourceCall,
 };
 #[cfg(target_os = "linux")]
 pub use discovery::discover;
@@ -43,9 +43,10 @@ pub use error::{
 pub use handle::tape_io::{
     BlockSize, ComputedPosition, DevicePositionProof, DriveErrorCounters, MediaFamily,
     MediaReadiness, PipelinedReadDiagnostics, PipelinedWriteDiagnostics, PositionAfter,
-    ReadBatchOutcome, ReadBufferHandoff, ReadTerminalFlags, SpaceKind, SpaceResult, TapeConfig,
-    TapeIoError, TapePosition, WormMediaState, WriteBatchOutcome, WriteFilemarksOutcome,
-    WriteOutcome, WriteUnpositionedOutcome,
+    ReadBatchOutcome, ReadBufferHandoff, ReadDelivery, ReadHandoffOutcome, ReadTerminalFlags,
+    SequencedHandoff, SpaceKind, SpaceResult, TapeConfig, TapeIoError, TapePosition,
+    WormMediaState, WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
+    WriteUnpositionedOutcome,
 };
 pub use handle::{
     ChangerHandle, DirtyCause, DriveHandle, LibraryHandle, RemovalLockGuard, TapeIoRuntimeConfig,

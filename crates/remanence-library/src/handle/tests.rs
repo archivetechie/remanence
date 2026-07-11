@@ -2746,6 +2746,7 @@ fn fixed_ili_residual_sense(residual: u32) -> Vec<u8> {
 enum HotWriteScript {
     Clean,
     CheckCondition(Vec<u8>),
+    CheckConditionWithBytes(Vec<u8>, u32),
     Transport(&'static str),
 }
 
@@ -2773,8 +2774,14 @@ impl SgTransport for HotScriptTransport {
                 HotWriteScript::Clean => Ok(TransferOutcome::clean(buf.len() as u32)),
                 HotWriteScript::CheckCondition(sense) => Err(ScsiError::CheckCondition {
                     sense,
-                    bytes_transferred: 0,
+                    bytes_transferred: buf.len() as u32,
                 }),
+                HotWriteScript::CheckConditionWithBytes(sense, bytes_transferred) => {
+                    Err(ScsiError::CheckCondition {
+                        sense,
+                        bytes_transferred,
+                    })
+                }
                 HotWriteScript::Transport(message) => {
                     Err(ScsiError::Io(std::io::Error::other(message)))
                 }
@@ -2818,6 +2825,12 @@ impl SgTransport for HotScriptTransport {
                 sense,
                 bytes_transferred: 0,
             }),
+            HotWriteScript::CheckConditionWithBytes(sense, bytes_transferred) => {
+                Err(ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred,
+                })
+            }
             HotWriteScript::Transport(message) => {
                 Err(ScsiError::Io(std::io::Error::other(message)))
             }
@@ -2833,8 +2846,14 @@ impl SgTransport for HotScriptTransport {
             HotWriteScript::Clean => Ok(TransferOutcome::clean(buf.len() as u32)),
             HotWriteScript::CheckCondition(sense) => Err(ScsiError::CheckCondition {
                 sense,
-                bytes_transferred: 0,
+                bytes_transferred: buf.len() as u32,
             }),
+            HotWriteScript::CheckConditionWithBytes(sense, bytes_transferred) => {
+                Err(ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred,
+                })
+            }
             HotWriteScript::Transport(message) => {
                 Err(ScsiError::Io(std::io::Error::other(message)))
             }
@@ -3254,7 +3273,7 @@ fn fixed_read_ili_before_any_record_also_invalidates_and_stops() {
 }
 
 #[test]
-fn recovered_fixed_read_delivers_only_residual_proven_records() {
+fn recovered_fixed_read_with_valid_nonzero_residual_is_completion_unknown() {
     let config = TapeIoRuntimeConfig {
         read_batch_blocks: 4,
         position_check_bytes: 0,
@@ -3270,14 +3289,11 @@ fn recovered_fixed_read_delivers_only_residual_proven_records() {
     );
     let mut buffer = [0xa5; 16];
 
-    let outcome = drive
-        .read_block_batch(&mut buffer, 4, 4, 4)
-        .expect("current recovered READ succeeds");
-
-    assert_eq!(outcome.records_read, 2);
-    assert_eq!(outcome.bytes_read, 8);
-    assert_eq!(outcome.position_after.lba, 12);
-    assert!(audit.lock().expect("audit").iter().any(|event| {
+    assert!(matches!(
+        drive.read_block_batch(&mut buffer, 4, 4, 4),
+        Err(TapeIoError::Transport(_))
+    ));
+    assert!(!audit.lock().expect("audit").iter().any(|event| {
         matches!(event, CapturedEvent::FinishedRecovered { sense, .. } if sense == &recovered)
     }));
 }
@@ -3308,6 +3324,213 @@ fn deferred_recovered_fixed_read_is_always_completion_unknown() {
             Err(TapeIoError::Transport(_))
         ));
         assert!(drive.expected_position.is_none());
+    }
+}
+
+#[test]
+fn fixed_read_filemark_residual_cannot_claim_bytes_transport_did_not_move() {
+    let config = TapeIoRuntimeConfig {
+        read_batch_blocks: 4,
+        position_check_bytes: 0,
+        ..TapeIoRuntimeConfig::default()
+    };
+    let (mut drive, _, _) = open_hot_script_drive(
+        "LIB_READ_FILEMARK_BYTES",
+        [10],
+        [HotWriteScript::CheckConditionWithBytes(
+            fixed_filemark_residual_sense(2),
+            4,
+        )],
+        config,
+    );
+    let mut buffer = [0xa5; 16];
+
+    assert!(matches!(
+        drive.read_block_batch(&mut buffer, 4, 4, 4),
+        Err(TapeIoError::Transport(_))
+    ));
+}
+
+#[test]
+fn fixed_read_recovered_full_cannot_claim_bytes_transport_did_not_move() {
+    let config = TapeIoRuntimeConfig {
+        read_batch_blocks: 4,
+        position_check_bytes: 0,
+        ..TapeIoRuntimeConfig::default()
+    };
+    let (mut drive, _, _) = open_hot_script_drive(
+        "LIB_READ_RECOVERED_BYTES",
+        [10],
+        [HotWriteScript::CheckConditionWithBytes(
+            current_sense(0x01, 0, 0, 0),
+            12,
+        )],
+        config,
+    );
+    let mut buffer = [0xa5; 16];
+
+    assert!(matches!(
+        drive.read_block_batch(&mut buffer, 4, 4, 4),
+        Err(TapeIoError::Transport(_))
+    ));
+}
+
+fn write_residual_claim_is_completion_unknown(
+    serial: &'static str,
+    pipelined: bool,
+    sense: Vec<u8>,
+    bytes_transferred: u32,
+) -> bool {
+    let config = TapeIoRuntimeConfig {
+        write_batch_blocks: 4,
+        position_check_bytes: 0,
+        ..TapeIoRuntimeConfig::default()
+    };
+    let (mut drive, _, _) = open_hot_script_drive(
+        serial,
+        [10],
+        [HotWriteScript::CheckConditionWithBytes(
+            sense,
+            bytes_transferred,
+        )],
+        config,
+    );
+    let result = if pipelined {
+        let cdb = remanence_scsi::read_write::build_write_fixed_cdb(4);
+        drive.write_block_batch_pipelined(&[0x5a; 16], 4, &cdb)
+    } else {
+        drive.write_block_batch(&[0x5a; 16], 4)
+    };
+    matches!(result, Err(TapeIoError::Transport(_)))
+}
+
+#[test]
+fn both_write_funnels_reject_recovered_full_residual_claim_mismatch() {
+    for (serial, pipelined) in [
+        ("LIB_WRITE_RECOVERED_ORD", false),
+        ("LIB_WRITE_RECOVERED_PIPE", true),
+    ] {
+        assert!(write_residual_claim_is_completion_unknown(
+            serial,
+            pipelined,
+            current_sense(0x01, 0, 0, 0),
+            12,
+        ));
+    }
+}
+
+#[test]
+fn both_write_funnels_reject_partial_and_garbage_residual_claims() {
+    for (serial, pipelined) in [
+        ("LIB_WRITE_PARTIAL_ORD", false),
+        ("LIB_WRITE_PARTIAL_PIPE", true),
+        ("LIB_WRITE_GARBAGE_ORD", false),
+        ("LIB_WRITE_GARBAGE_PIPE", true),
+    ] {
+        let garbage = serial.contains("GARBAGE");
+        assert!(write_residual_claim_is_completion_unknown(
+            serial,
+            pipelined,
+            fixed_residual_sense(1),
+            if garbage { 0 } else { 8 },
+        ));
+    }
+}
+
+#[test]
+fn write_residual_helper_is_one_sided_and_entry_point_decisions_match() {
+    for (suffix, sense, bytes_transferred) in [
+        ("RECOVERED", current_sense(0x01, 0, 0, 0), 16),
+        ("PARTIAL", fixed_residual_sense(1), 12),
+    ] {
+        let ordinary = write_residual_claim_is_completion_unknown(
+            if suffix == "RECOVERED" {
+                "LIB_WRITE_PASS_REC_ORD"
+            } else {
+                "LIB_WRITE_PASS_PART_ORD"
+            },
+            false,
+            sense.clone(),
+            bytes_transferred,
+        );
+        let pipelined = write_residual_claim_is_completion_unknown(
+            if suffix == "RECOVERED" {
+                "LIB_WRITE_PASS_REC_PIPE"
+            } else {
+                "LIB_WRITE_PASS_PART_PIPE"
+            },
+            true,
+            sense,
+            bytes_transferred,
+        );
+        assert_eq!(ordinary, pipelined, "helper parity for {suffix}");
+        assert!(!ordinary, "valid one-sided claim must not spuriously fail");
+    }
+}
+
+#[test]
+fn fixed_read_recovered_full_with_unset_valid_passes_vacuously() {
+    let config = TapeIoRuntimeConfig {
+        read_batch_blocks: 4,
+        position_check_bytes: 0,
+        ..TapeIoRuntimeConfig::default()
+    };
+    let (mut drive, _, _) = open_hot_script_drive(
+        "LIB_READ_RECOVERED_VACUOUS",
+        [10],
+        [HotWriteScript::CheckConditionWithBytes(
+            current_sense(0x01, 0, 0, 0),
+            16,
+        )],
+        config,
+    );
+    let mut buffer = [0xa5; 16];
+
+    let outcome = drive
+        .read_block_batch(&mut buffer, 4, 4, 4)
+        .expect("full recovered READ fits transport byte count");
+    assert_eq!(outcome.records_read, 4);
+    assert_eq!(outcome.bytes_read, 16);
+}
+
+#[test]
+fn write_eom_position_arbitration_ignores_helper_mismatch_and_records_diagnostic() {
+    let config = TapeIoRuntimeConfig {
+        write_batch_blocks: 4,
+        position_check_bytes: 0,
+        ..TapeIoRuntimeConfig::default()
+    };
+    for (serial, pipelined) in [
+        ("LIB_WRITE_EOM_DIAG_ORD", false),
+        ("LIB_WRITE_EOM_DIAG_PIPE", true),
+    ] {
+        let (mut drive, _, _) = open_hot_script_drive(
+            serial,
+            [10, 14],
+            [HotWriteScript::CheckConditionWithBytes(
+                current_sense(0x01, 0x40, 0, 0),
+                0,
+            )],
+            config,
+        );
+        let outcome = if pipelined {
+            let cdb = remanence_scsi::read_write::build_write_fixed_cdb(4);
+            drive
+                .write_block_batch_pipelined(&[0x5a; 16], 4, &cdb)
+                .expect("position-proven pipelined EOM remains landed")
+        } else {
+            drive
+                .write_block_batch(&[0x5a; 16], 4)
+                .expect("position-proven ordinary EOM remains landed")
+        };
+        assert_eq!(outcome.records_written, 4);
+        assert!(outcome.early_warning);
+        assert_eq!(
+            drive
+                .pipelined_write_diagnostics()
+                .residual_claim_mismatches,
+            1
+        );
     }
 }
 
@@ -3396,14 +3619,14 @@ fn eom_write_with_failed_position_arbitration_preserves_write_audit_and_classifi
 }
 
 #[test]
-fn reset_unit_attention_on_read_and_filemark_uses_state_invalidating_class() {
+fn reset_and_nexus_loss_unit_attention_use_state_invalidating_class() {
     let config = TapeIoRuntimeConfig {
         write_batch_blocks: 1,
         read_batch_blocks: 1,
         position_check_bytes: 0,
         ..TapeIoRuntimeConfig::default()
     };
-    let reset = current_sense(0x06, 0, 0x29, 0x04);
+    let reset = current_sense(0x06, 0, 0x29, 0x07);
     let (mut read_drive, read_commands, _) = open_hot_script_drive(
         "LIB_RESET_READ",
         [5],
@@ -3755,7 +3978,7 @@ fn drive_handle_write_block_batch_decodes_valid_fixed_residual() {
                 let failing = FailFirstWriteWithCheckCondition {
                     inner,
                     sense: Some(sense.clone()),
-                    bytes_transferred: 0,
+                    bytes_transferred: 12,
                 };
                 Ok(
                     Box::new(RecordingTransport::with_log(failing, log_cl.clone()))

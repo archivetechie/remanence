@@ -8,6 +8,7 @@
 
 use std::io::Write;
 use std::pin::Pin;
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -16,7 +17,10 @@ use remanence_format::{
     plan_plaintext_rao_file_range, stream_rem_tar_object_with_manifest_anchor, FormatError,
     RemTarEntrySink, RemTarStreamEntry,
 };
-use remanence_library::{BlockSource, SpaceKind, SpaceResult, TapeIoError, TapePosition};
+use remanence_library::{
+    BlockRead, BlockSource, ReadBufferHandoff, ReadDelivery, SpaceKind, SpaceResult, TapeIoError,
+    TapePosition,
+};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_stream::Stream;
@@ -28,6 +32,233 @@ const DEFAULT_READ_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const DEFAULT_READ_STREAM_CHUNK_BYTES: usize = 256 * 1024;
 pub(crate) const READ_STREAM_CHANNEL_BYTE_BUDGET: usize = 4 * 1024 * 1024;
 const READ_STREAM_CHANNEL_MAX_MESSAGES: usize = 1024;
+
+/// Decode-side fixed-block source fed only by typed read deliveries.
+///
+/// This type intentionally contains no drive handle and implements only
+/// [`BlockRead`]. The submitter/reservoir stage wires these channels in R2b.
+/// Tape motion is therefore absent by type:
+///
+/// ```compile_fail
+/// use remanence_api::read_core::HandoffBlockSource;
+///
+/// fn decoder_cannot_query_drive(source: &mut HandoffBlockSource) {
+///     source.position();
+/// }
+/// ```
+pub struct HandoffBlockSource {
+    delivery_receiver: Receiver<Result<ReadDelivery, TapeIoError>>,
+    free_sender: SyncSender<Vec<u8>>,
+    block_size: usize,
+    remaining: u64,
+    current: Option<ReadBufferHandoff>,
+    next_record: u32,
+}
+
+impl HandoffBlockSource {
+    /// Construct the no-drive decode source for one planned read window.
+    pub fn new(
+        delivery_receiver: Receiver<Result<ReadDelivery, TapeIoError>>,
+        free_sender: SyncSender<Vec<u8>>,
+        block_size: usize,
+        remaining: u64,
+    ) -> Result<Self, TapeIoError> {
+        if block_size == 0 {
+            return Err(TapeIoError::OperationFailed(
+                "handoff block size must be nonzero".to_string(),
+            ));
+        }
+        Ok(Self {
+            delivery_receiver,
+            free_sender,
+            block_size,
+            remaining,
+            current: None,
+            next_record: 0,
+        })
+    }
+
+    fn refill(&mut self) -> Result<(), TapeIoError> {
+        if let Some(current) = self.current.take() {
+            self.free_sender
+                .try_send(current.into_reusable_buffer())
+                .map_err(|_| {
+                    TapeIoError::OperationFailed(
+                        "read reservoir free-buffer channel unavailable".to_string(),
+                    )
+                })?;
+        }
+        self.next_record = 0;
+        loop {
+            let delivery = self.delivery_receiver.recv().map_err(|_| {
+                TapeIoError::OperationFailed("read delivery channel closed".to_string())
+            })??;
+            let ReadDelivery::Handoff(delivery) = delivery else {
+                continue;
+            };
+            let handoff = delivery.handoff;
+            let expected_bytes = (handoff.records_read as usize)
+                .checked_mul(self.block_size)
+                .ok_or_else(|| {
+                    TapeIoError::OperationFailed("read handoff byte count overflow".to_string())
+                })?;
+            if expected_bytes != handoff.valid_bytes {
+                return Err(TapeIoError::OperationFailed(format!(
+                    "read handoff byte/record mismatch: valid_bytes={} records_read={} block_size={}",
+                    handoff.valid_bytes, handoff.records_read, self.block_size
+                )));
+            }
+            if handoff.terminal_flags.filemark || handoff.records_read == 0 {
+                return Err(TapeIoError::OperationFailed(format!(
+                    "fixed read batch stopped before object boundary: records_read={} filemark={}",
+                    handoff.records_read, handoff.terminal_flags.filemark
+                )));
+            }
+            self.remaining = self
+                .remaining
+                .checked_sub(u64::from(handoff.records_read))
+                .ok_or_else(|| {
+                    TapeIoError::OperationFailed("read handoff remaining underflow".to_string())
+                })?;
+            self.current = Some(handoff);
+            return Ok(());
+        }
+    }
+}
+
+impl BlockRead for HandoffBlockSource {
+    fn read_block(&mut self, buf: &mut [u8]) -> Result<usize, TapeIoError> {
+        let exhausted = self
+            .current
+            .as_ref()
+            .is_none_or(|handoff| self.next_record >= handoff.records_read);
+        if exhausted {
+            if self.remaining == 0 {
+                return Ok(0);
+            }
+            self.refill()?;
+        }
+        if buf.len() < self.block_size {
+            return Err(TapeIoError::ReadBufferTooSmall {
+                actual: u32::try_from(self.block_size).unwrap_or(u32::MAX),
+                provided: u32::try_from(buf.len()).unwrap_or(u32::MAX),
+            });
+        }
+        let handoff = self.current.as_ref().ok_or_else(|| {
+            TapeIoError::OperationFailed("read handoff source is empty".to_string())
+        })?;
+        let start = self.next_record as usize * self.block_size;
+        let end = start + self.block_size;
+        buf[..self.block_size].copy_from_slice(&handoff.valid_data()[start..end]);
+        self.next_record += 1;
+        Ok(self.block_size)
+    }
+}
+
+// Foundation mechanism wired into the live three-thread path by TIO-6 R2b.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ReadTerminalPriority {
+    ScsiRoot,
+    Decode,
+    Sender,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReadTerminalDisposition {
+    Emitted,
+    Disconnected,
+    NoCause,
+    AlreadyFinalized,
+}
+
+#[allow(dead_code)]
+#[derive(Default)]
+struct ReadTerminalState {
+    cause: Option<(ReadTerminalPriority, Status)>,
+    disconnected: bool,
+    finalized: bool,
+}
+
+/// Replaceable ranked terminal cause plus the post-join emission barrier.
+#[allow(dead_code)]
+#[derive(Default)]
+pub(crate) struct ReadTerminalAccumulator {
+    state: Mutex<ReadTerminalState>,
+}
+
+#[allow(dead_code)]
+impl ReadTerminalAccumulator {
+    pub(crate) fn record(&self, priority: ReadTerminalPriority, status: Status) {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        if state.finalized {
+            return;
+        }
+        let should_replace = state
+            .cause
+            .as_ref()
+            .is_none_or(|(held, _)| priority < *held);
+        if should_replace {
+            state.cause = Some((priority, status));
+        }
+    }
+
+    pub(crate) fn record_then_close(
+        &self,
+        priority: ReadTerminalPriority,
+        status: Status,
+        close: impl FnOnce(),
+    ) {
+        self.record(priority, status);
+        close();
+    }
+
+    pub(crate) fn mark_disconnected(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .disconnected = true;
+    }
+
+    pub(crate) fn join_and_emit(
+        &self,
+        joins: Vec<(
+            ReadTerminalPriority,
+            &'static str,
+            std::thread::JoinHandle<()>,
+        )>,
+        mut emit: impl FnMut(Status),
+    ) -> ReadTerminalDisposition {
+        for (priority, stage, join) in joins {
+            if join.join().is_err() {
+                self.record(
+                    priority,
+                    Status::internal(format!("{stage} thread panicked")),
+                );
+            }
+        }
+
+        let status = {
+            let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+            if state.finalized {
+                return ReadTerminalDisposition::AlreadyFinalized;
+            }
+            state.finalized = true;
+            if state.disconnected {
+                return ReadTerminalDisposition::Disconnected;
+            }
+            state.cause.take().map(|(_, status)| status)
+        };
+        match status {
+            Some(status) => {
+                emit(status);
+                ReadTerminalDisposition::Emitted
+            }
+            None => ReadTerminalDisposition::NoCause,
+        }
+    }
+}
 
 type ReadStreamItem = Result<pb::BytesChunk, Status>;
 
@@ -457,12 +688,13 @@ impl<'a> BatchingBlockSource<'a> {
         }
         let mut ring_buffer = self.free_buffers.swap_remove(0);
         ring_buffer.resize(alloc_bytes, 0);
-        let handoff = self.inner.read_buffer_handoff(
+        let outcome = self.inner.read_buffer_handoff(
             ring_buffer,
             block_size_bytes,
             requested,
             remaining_u32,
         )?;
+        let handoff = outcome.handoff;
         if handoff.terminal_flags.filemark || handoff.records_read == 0 {
             return Err(TapeIoError::OperationFailed(format!(
                 "fixed read batch stopped before object boundary: records_read={} filemark={}",
@@ -494,7 +726,7 @@ impl<'a> BatchingBlockSource<'a> {
     }
 }
 
-impl BlockSource for BatchingBlockSource<'_> {
+impl BlockRead for BatchingBlockSource<'_> {
     fn read_block(&mut self, buf: &mut [u8]) -> Result<usize, TapeIoError> {
         self.refill()?;
         if self.next_record >= self.buffered_records {
@@ -512,7 +744,9 @@ impl BlockSource for BatchingBlockSource<'_> {
         self.next_record += 1;
         Ok(self.block_size)
     }
+}
 
+impl BlockSource for BatchingBlockSource<'_> {
     fn read_block_batch(
         &mut self,
         buf: &mut [u8],
@@ -1091,5 +1325,160 @@ mod tests {
         .unwrap();
 
         assert_eq!(range, payload[400..1100]);
+    }
+
+    #[test]
+    fn terminal_accumulator_scsi_root_recorded_last_still_wins() {
+        let accumulator = Arc::new(ReadTerminalAccumulator::default());
+        let (sender_recorded, wait_for_sender) = std::sync::mpsc::channel();
+        let sender_accumulator = Arc::clone(&accumulator);
+        let sender = std::thread::spawn(move || {
+            sender_accumulator.record(
+                ReadTerminalPriority::Sender,
+                Status::unavailable("sender stalled"),
+            );
+            sender_recorded.send(()).expect("signal sender cause");
+        });
+        let decode = std::thread::spawn(|| panic!("decode panic"));
+        wait_for_sender.recv().expect("sender cause recorded");
+        accumulator.record(
+            ReadTerminalPriority::ScsiRoot,
+            Status::data_loss("SCSI completion unknown"),
+        );
+        let submitter = std::thread::spawn(|| {});
+        let mut emitted = Vec::new();
+
+        let disposition = accumulator.join_and_emit(
+            vec![
+                (ReadTerminalPriority::Sender, "sender", sender),
+                (ReadTerminalPriority::Decode, "decode", decode),
+                (ReadTerminalPriority::ScsiRoot, "submitter", submitter),
+            ],
+            |status| emitted.push(status),
+        );
+
+        assert_eq!(disposition, ReadTerminalDisposition::Emitted);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].message(), "SCSI completion unknown");
+    }
+
+    #[test]
+    fn terminal_accumulator_translates_post_join_panic_at_stage_rank() {
+        let accumulator = ReadTerminalAccumulator::default();
+        accumulator.record(
+            ReadTerminalPriority::Sender,
+            Status::unavailable("sender failed"),
+        );
+        let decode = std::thread::spawn(|| panic!("decode panic"));
+        let sender = std::thread::spawn(|| panic!("sender panic"));
+        let mut emitted = Vec::new();
+
+        accumulator.join_and_emit(
+            vec![
+                (ReadTerminalPriority::Sender, "sender", sender),
+                (ReadTerminalPriority::Decode, "decode", decode),
+            ],
+            |status| emitted.push(status),
+        );
+
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].message(), "decode thread panicked");
+    }
+
+    #[test]
+    fn terminal_status_emits_once_only_after_all_joins_and_record_then_close() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let accumulator = Arc::new(ReadTerminalAccumulator::default());
+        let joined = Arc::new(AtomicUsize::new(0));
+        let close_observed = Arc::new(AtomicUsize::new(0));
+        let close_accumulator = Arc::clone(&accumulator);
+        let close_inspector = Arc::clone(&accumulator);
+        let close_observed_thread = Arc::clone(&close_observed);
+        let sender_joined = Arc::clone(&joined);
+        let sender = std::thread::spawn(move || {
+            close_accumulator.record_then_close(
+                ReadTerminalPriority::Sender,
+                Status::unavailable("sender failed"),
+                || {
+                    assert!(close_inspector
+                        .state
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .cause
+                        .is_some());
+                    close_observed_thread.store(1, Ordering::SeqCst);
+                },
+            );
+            sender_joined.fetch_add(1, Ordering::SeqCst);
+        });
+        let decode_joined = Arc::clone(&joined);
+        let decode = std::thread::spawn(move || {
+            decode_joined.fetch_add(1, Ordering::SeqCst);
+        });
+        let submitter_joined = Arc::clone(&joined);
+        let submitter = std::thread::spawn(move || {
+            submitter_joined.fetch_add(1, Ordering::SeqCst);
+        });
+        let joined_at_emit = Arc::clone(&joined);
+        let mut emissions = 0;
+
+        let disposition = accumulator.join_and_emit(
+            vec![
+                (ReadTerminalPriority::Sender, "sender", sender),
+                (ReadTerminalPriority::Decode, "decode", decode),
+                (ReadTerminalPriority::ScsiRoot, "submitter", submitter),
+            ],
+            |_| {
+                assert_eq!(joined_at_emit.load(Ordering::SeqCst), 3);
+                emissions += 1;
+            },
+        );
+        assert_eq!(close_observed.load(Ordering::SeqCst), 1);
+        assert_eq!(disposition, ReadTerminalDisposition::Emitted);
+        assert_eq!(emissions, 1);
+        assert_eq!(
+            accumulator.join_and_emit(Vec::new(), |_| emissions += 1),
+            ReadTerminalDisposition::AlreadyFinalized
+        );
+        assert_eq!(emissions, 1);
+    }
+
+    #[test]
+    fn terminal_disconnect_runs_teardown_and_skips_emission() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let accumulator = ReadTerminalAccumulator::default();
+        accumulator.record(
+            ReadTerminalPriority::ScsiRoot,
+            Status::data_loss("would otherwise emit"),
+        );
+        accumulator.mark_disconnected();
+        let teardown = Arc::new(AtomicUsize::new(0));
+        let joins = (0..3)
+            .map(|_| {
+                let teardown = Arc::clone(&teardown);
+                std::thread::spawn(move || {
+                    teardown.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+            .collect::<Vec<_>>();
+        let ranked = [
+            ReadTerminalPriority::ScsiRoot,
+            ReadTerminalPriority::Decode,
+            ReadTerminalPriority::Sender,
+        ];
+        let joins = joins
+            .into_iter()
+            .zip(ranked)
+            .map(|(join, priority)| (priority, "stage", join))
+            .collect();
+        let mut emissions = 0;
+
+        let disposition = accumulator.join_and_emit(joins, |_| emissions += 1);
+
+        assert_eq!(teardown.load(Ordering::SeqCst), 3);
+        assert_eq!(disposition, ReadTerminalDisposition::Disconnected);
+        assert_eq!(emissions, 0);
     }
 }

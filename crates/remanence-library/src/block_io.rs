@@ -47,9 +47,11 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::handle::tape_io::{
-    PipelinedWriteDiagnostics, ReadBatchOutcome, ReadBufferHandoff, SpaceKind, SpaceResult,
-    TapeIoError, TapePosition, WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
+    PipelinedWriteDiagnostics, ReadBatchOutcome, ReadBufferHandoff, ReadHandoffOutcome, SpaceKind,
+    SpaceResult, TapeIoError, TapePosition, WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
 };
+#[cfg(test)]
+use crate::handle::tape_io::{ReadDelivery, SequencedHandoff};
 use crate::handle::DriveHandle;
 
 // =====================================================================
@@ -222,15 +224,22 @@ pub trait BlockSink {
 //  BlockSource — read path
 // =====================================================================
 
-/// Block-level read surface that higher layers code against.
-/// Implemented by [`DriveHandleSource`] for production and
-/// [`VecBlockSource`] for tests.
-pub trait BlockSource {
+/// Narrow read-only surface used by format decoders.
+///
+/// Tape motion is deliberately absent. Decode-side implementations can
+/// satisfy this trait without possessing a drive handle, making it impossible
+/// for format parsing to issue LOCATE, SPACE, or READ POSITION by type.
+pub trait BlockRead {
     /// Read one tape block, returning the number of bytes the
     /// drive delivered (the block size for that block in
     /// variable-block mode).
     fn read_block(&mut self, buf: &mut [u8]) -> Result<usize, TapeIoError>;
+}
 
+/// Full block source used by drive-owning orchestration code.
+/// Implemented by [`DriveHandleSource`] for production and
+/// [`VecBlockSource`] for tests. Format decoders accept [`BlockRead`] instead.
+pub trait BlockSource: BlockRead {
     /// Read one fixed-size batch. The default loops through
     /// [`Self::read_block`] and never intentionally crosses `remaining`.
     fn read_block_batch(
@@ -294,7 +303,7 @@ pub trait BlockSource {
         block_size_bytes: u32,
         requested_records: u32,
         remaining_records_in_file: u32,
-    ) -> Result<ReadBufferHandoff, TapeIoError> {
+    ) -> Result<ReadHandoffOutcome, TapeIoError> {
         let selected_records = requested_records
             .min(remaining_records_in_file)
             .min(self.read_batch_blocks(block_size_bytes).max(1));
@@ -308,8 +317,15 @@ pub trait BlockSource {
             requested_records,
             remaining_records_in_file,
         )?;
-        ReadBufferHandoff::from_outcome(buffer, outcome)
-            .map_err(|message| TapeIoError::OperationFailed(message.to_string()))
+        let position_after = outcome.position_after;
+        let evidence = outcome.position_evidence();
+        let handoff = ReadBufferHandoff::from_outcome(buffer, outcome)
+            .map_err(|message| TapeIoError::OperationFailed(message.to_string()))?;
+        Ok(ReadHandoffOutcome {
+            position_after,
+            evidence,
+            handoff,
+        })
     }
 
     /// Effective records per batch for this source and block size.
@@ -467,10 +483,13 @@ impl BlockSink for DriveHandleSink<'_> {
 /// [`DriveHandleSink`].
 pub struct DriveHandleSource<'a>(pub &'a mut DriveHandle);
 
-impl BlockSource for DriveHandleSource<'_> {
+impl BlockRead for DriveHandleSource<'_> {
     fn read_block(&mut self, buf: &mut [u8]) -> Result<usize, TapeIoError> {
         self.0.read_block(buf)
     }
+}
+
+impl BlockSource for DriveHandleSource<'_> {
     fn read_block_batch(
         &mut self,
         buf: &mut [u8],
@@ -721,7 +740,7 @@ impl FileBlockSource {
     }
 }
 
-impl BlockSource for FileBlockSource {
+impl BlockRead for FileBlockSource {
     fn read_block(&mut self, buf: &mut [u8]) -> Result<usize, TapeIoError> {
         let lba = self.cursor;
         if lba >= self.block_count {
@@ -757,7 +776,9 @@ impl BlockSource for FileBlockSource {
             .ok_or_else(|| TapeIoError::OperationFailed("file block LBA overflow".to_string()))?;
         Ok(self.block_size)
     }
+}
 
+impl BlockSource for FileBlockSource {
     fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
         if lba > self.block_count {
             self.cursor = self.block_count;
@@ -1050,7 +1071,7 @@ impl VecBlockSource {
     }
 }
 
-impl BlockSource for VecBlockSource {
+impl BlockRead for VecBlockSource {
     fn read_block(&mut self, buf: &mut [u8]) -> Result<usize, TapeIoError> {
         let lba = self.cursor;
         let block = self.blocks.get(lba as usize).cloned();
@@ -1101,7 +1122,9 @@ impl BlockSource for VecBlockSource {
             }
         }
     }
+}
 
+impl BlockSource for VecBlockSource {
     fn read_block_batch(
         &mut self,
         buf: &mut [u8],
@@ -1294,13 +1317,16 @@ mod tests {
 
     struct ShortRecoveredSource {
         fail_closed: bool,
+        device_evidence: bool,
     }
 
-    impl BlockSource for ShortRecoveredSource {
+    impl BlockRead for ShortRecoveredSource {
         fn read_block(&mut self, _buf: &mut [u8]) -> Result<usize, TapeIoError> {
             panic!("typed handoff test must use fixed batch READ")
         }
+    }
 
+    impl BlockSource for ShortRecoveredSource {
         fn read_block_batch(
             &mut self,
             buf: &mut [u8],
@@ -1314,17 +1340,24 @@ mod tests {
                 ));
             }
             buf[..4].copy_from_slice(&[1, 2, 3, 4]);
-            Ok(ReadBatchOutcome::from_computed_position(
-                1,
-                4,
-                false,
-                TapePosition {
-                    lba: 1,
-                    partition: 0,
-                    beginning_of_partition: false,
-                    end_of_partition: false,
-                    block_position_end_of_warning: false,
-                },
+            let position = TapePosition {
+                lba: 1,
+                partition: 0,
+                beginning_of_partition: false,
+                end_of_partition: false,
+                block_position_end_of_warning: false,
+            };
+            let evidence = if self.device_evidence {
+                crate::handle::tape_io::PositionAfter::Device(
+                    crate::handle::tape_io::DevicePositionProof::from_device_position(position),
+                )
+            } else {
+                crate::handle::tape_io::PositionAfter::Computed(
+                    crate::handle::tape_io::ComputedPosition::from_position(position),
+                )
+            };
+            Ok(ReadBatchOutcome::from_position_evidence(
+                1, 4, false, evidence,
             ))
         }
 
@@ -1347,12 +1380,37 @@ mod tests {
 
     #[test]
     fn typed_read_handoff_never_exposes_sentinel_tail_after_short_completion() {
-        let mut source = ShortRecoveredSource { fail_closed: false };
+        let mut source = ShortRecoveredSource {
+            fail_closed: false,
+            device_evidence: true,
+        };
         let buffer = vec![0xa5; 16];
 
-        let handoff = source
+        let outcome = source
             .read_buffer_handoff(buffer, 4, 4, 4)
             .expect("short proven read handoff");
+        assert_eq!(outcome.position_after.lba, 1);
+        assert!(matches!(
+            outcome.evidence,
+            crate::handle::tape_io::PositionAfter::Device(_)
+        ));
+        let delivery = ReadDelivery::Handoff(SequencedHandoff {
+            seq: 7,
+            plan_records_end: 1,
+            position_after: outcome.position_after,
+            evidence: outcome.evidence,
+            handoff: outcome.handoff,
+        });
+        let ReadDelivery::Handoff(delivery) = delivery else {
+            panic!("constructed handoff delivery changed variant")
+        };
+        assert_eq!(delivery.seq, 7);
+        assert_eq!(delivery.plan_records_end, 1);
+        assert!(matches!(
+            delivery.evidence,
+            crate::handle::tape_io::PositionAfter::Device(_)
+        ));
+        let handoff = delivery.handoff;
 
         assert_eq!(handoff.valid_bytes, 4);
         assert_eq!(handoff.records_read, 1);
@@ -1362,7 +1420,10 @@ mod tests {
 
     #[test]
     fn fail_closed_read_outcome_withholds_the_typed_handoff() {
-        let mut source = ShortRecoveredSource { fail_closed: true };
+        let mut source = ShortRecoveredSource {
+            fail_closed: true,
+            device_evidence: false,
+        };
 
         let result = source.read_buffer_handoff(vec![0xa5; 16], 4, 4, 4);
 

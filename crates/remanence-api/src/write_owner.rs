@@ -3924,7 +3924,7 @@ impl<'a> DiagnosticBlockSource<'a> {
     }
 }
 
-impl BlockSource for DiagnosticBlockSource<'_> {
+impl remanence_library::BlockRead for DiagnosticBlockSource<'_> {
     fn read_block(&mut self, buf: &mut [u8]) -> Result<usize, TapeIoError> {
         let started = Instant::now();
         let result = self.inner.read_block(buf);
@@ -3936,7 +3936,9 @@ impl BlockSource for DiagnosticBlockSource<'_> {
         }
         result
     }
+}
 
+impl BlockSource for DiagnosticBlockSource<'_> {
     fn read_block_batch(
         &mut self,
         buf: &mut [u8],

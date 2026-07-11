@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use remanence_aead::{open_to_vec, OpenReport, RootKey};
-use remanence_library::BlockSource;
+use remanence_library::BlockRead;
 use sha2::{Digest, Sha256};
 
 use crate::error::{FormatError, FormatGate};
@@ -148,7 +148,7 @@ impl RemTarReadObject {
 /// This compatibility reader materializes the full object archive and every
 /// file payload in memory. Prefer [`stream_rem_tar_object`] for restore paths
 /// that should avoid full-object buffering.
-pub fn read_rem_tar_object<S: BlockSource + ?Sized>(
+pub fn read_rem_tar_object<S: BlockRead + ?Sized>(
     source: &mut S,
     chunk_size: usize,
     block_count: u64,
@@ -157,7 +157,7 @@ pub fn read_rem_tar_object<S: BlockSource + ?Sized>(
 }
 
 /// Read and parse one object archive with an explicit reader integrity mode.
-pub fn read_rem_tar_object_with_mode<S: BlockSource + ?Sized>(
+pub fn read_rem_tar_object_with_mode<S: BlockRead + ?Sized>(
     source: &mut S,
     chunk_size: usize,
     block_count: u64,
@@ -167,7 +167,7 @@ pub fn read_rem_tar_object_with_mode<S: BlockSource + ?Sized>(
 }
 
 /// Read and parse one object archive with an optional external manifest anchor.
-pub fn read_rem_tar_object_with_manifest_anchor<S: BlockSource + ?Sized>(
+pub fn read_rem_tar_object_with_manifest_anchor<S: BlockRead + ?Sized>(
     source: &mut S,
     chunk_size: usize,
     block_count: u64,
@@ -183,7 +183,7 @@ pub fn read_rem_tar_object_with_manifest_anchor<S: BlockSource + ?Sized>(
 }
 
 /// Read and parse one object archive with explicit reader mode and manifest anchor.
-pub fn read_rem_tar_object_with_mode_and_manifest_anchor<S: BlockSource + ?Sized>(
+pub fn read_rem_tar_object_with_mode_and_manifest_anchor<S: BlockRead + ?Sized>(
     source: &mut S,
     chunk_size: usize,
     block_count: u64,
@@ -220,7 +220,7 @@ pub fn read_rem_tar_object_with_mode_and_manifest_anchor<S: BlockSource + ?Sized
 /// read from `source`, opened with `root_key`, then the authenticated inner
 /// plaintext stream is parsed by the ordinary RAO reader. Streaming and PFR
 /// readers can build on the same envelope primitives later.
-pub fn read_encrypted_rao_object<S: BlockSource + ?Sized>(
+pub fn read_encrypted_rao_object<S: BlockRead + ?Sized>(
     source: &mut S,
     chunk_size: usize,
     block_count: u64,
@@ -236,7 +236,7 @@ pub fn read_encrypted_rao_object<S: BlockSource + ?Sized>(
 }
 
 /// Read, decrypt, and parse one encrypted RAO object with an explicit reader mode.
-pub fn read_encrypted_rao_object_with_mode<S: BlockSource + ?Sized>(
+pub fn read_encrypted_rao_object_with_mode<S: BlockRead + ?Sized>(
     source: &mut S,
     chunk_size: usize,
     block_count: u64,
@@ -254,7 +254,7 @@ pub fn read_encrypted_rao_object_with_mode<S: BlockSource + ?Sized>(
 }
 
 /// Read, decrypt, and parse one encrypted RAO object with an optional inner manifest anchor.
-pub fn read_encrypted_rao_object_with_manifest_anchor<S: BlockSource + ?Sized>(
+pub fn read_encrypted_rao_object_with_manifest_anchor<S: BlockRead + ?Sized>(
     source: &mut S,
     chunk_size: usize,
     block_count: u64,
@@ -272,7 +272,7 @@ pub fn read_encrypted_rao_object_with_manifest_anchor<S: BlockSource + ?Sized>(
 }
 
 /// Read, decrypt, and parse one encrypted RAO object with explicit mode and manifest anchor.
-pub fn read_encrypted_rao_object_with_mode_and_manifest_anchor<S: BlockSource + ?Sized>(
+pub fn read_encrypted_rao_object_with_mode_and_manifest_anchor<S: BlockRead + ?Sized>(
     source: &mut S,
     chunk_size: usize,
     block_count: u64,
@@ -367,7 +367,7 @@ pub fn stream_rem_tar_object<S, T>(
     entry_sink: &mut T,
 ) -> Result<RemTarStreamReport, FormatError>
 where
-    S: BlockSource + ?Sized,
+    S: BlockRead + ?Sized,
     T: RemTarEntrySink + ?Sized,
 {
     stream_rem_tar_object_with_mode(
@@ -388,7 +388,7 @@ pub fn stream_rem_tar_object_with_manifest_anchor<S, T>(
     manifest_sha256: Option<[u8; 32]>,
 ) -> Result<RemTarStreamReport, FormatError>
 where
-    S: BlockSource + ?Sized,
+    S: BlockRead + ?Sized,
     T: RemTarEntrySink + ?Sized,
 {
     stream_rem_tar_object_with_mode_and_manifest_anchor(
@@ -410,7 +410,7 @@ pub fn stream_rem_tar_object_with_mode<S, T>(
     mode: ReadMode,
 ) -> Result<RemTarStreamReport, FormatError>
 where
-    S: BlockSource + ?Sized,
+    S: BlockRead + ?Sized,
     T: RemTarEntrySink + ?Sized,
 {
     stream_rem_tar_object_with_mode_and_manifest_anchor(
@@ -433,7 +433,7 @@ pub fn stream_rem_tar_object_with_mode_and_manifest_anchor<S, T>(
     manifest_sha256: Option<[u8; 32]>,
 ) -> Result<RemTarStreamReport, FormatError>
 where
-    S: BlockSource + ?Sized,
+    S: BlockRead + ?Sized,
     T: RemTarEntrySink + ?Sized,
 {
     validate_chunk_size(chunk_size)?;
@@ -744,7 +744,7 @@ fn parse_rem_tar_bytes_with_mode_and_manifest_anchor(
     })
 }
 
-fn read_object_bytes<S: BlockSource + ?Sized>(
+fn read_object_bytes<S: BlockRead + ?Sized>(
     source: &mut S,
     chunk_size: usize,
     block_count: u64,
@@ -771,7 +771,7 @@ fn read_object_bytes<S: BlockSource + ?Sized>(
     Ok(bytes)
 }
 
-struct BlockByteReader<'a, S: BlockSource + ?Sized> {
+struct BlockByteReader<'a, S: BlockRead + ?Sized> {
     source: &'a mut S,
     chunk_size: usize,
     blocks_remaining: u64,
@@ -780,7 +780,7 @@ struct BlockByteReader<'a, S: BlockSource + ?Sized> {
     offset: u64,
 }
 
-impl<'a, S: BlockSource + ?Sized> BlockByteReader<'a, S> {
+impl<'a, S: BlockRead + ?Sized> BlockByteReader<'a, S> {
     fn new(source: &'a mut S, chunk_size: usize, block_count: u64) -> Self {
         Self {
             source,

@@ -35,9 +35,10 @@ use crate::transport::TimeoutClass;
 
 pub use model::{
     BlockSize, ComputedPosition, DevicePositionProof, PipelinedReadDiagnostics,
-    PipelinedWriteDiagnostics, PositionAfter, ReadBatchOutcome, ReadBufferHandoff,
-    ReadTerminalFlags, SpaceKind, SpaceResult, TapeConfig, TapePosition, WormMediaState,
-    WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome, WriteUnpositionedOutcome,
+    PipelinedWriteDiagnostics, PositionAfter, ReadBatchOutcome, ReadBufferHandoff, ReadDelivery,
+    ReadHandoffOutcome, ReadTerminalFlags, SequencedHandoff, SpaceKind, SpaceResult, TapeConfig,
+    TapePosition, WormMediaState, WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
+    WriteUnpositionedOutcome,
 };
 pub use readiness::{classify_media_readiness_error, MediaFamily, MediaReadiness};
 
@@ -46,6 +47,25 @@ fn completion_unknown_check_condition(sense: Vec<u8>, bytes_transferred: u32) ->
         sense,
         bytes_transferred,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResidualClaimMismatch;
+
+/// Validate the one-sided claim that complete fixed records fit inside the
+/// byte count reported by the transport. Data-out stacks that report no
+/// residual pass vacuously because `bytes_transferred == dxfer_len`.
+fn validate_residual_claim(
+    records_claimed: u32,
+    block_size_bytes: u32,
+    bytes_transferred: u32,
+) -> Result<(), ResidualClaimMismatch> {
+    let claimed_bytes = u64::from(records_claimed) * u64::from(block_size_bytes);
+    if claimed_bytes > u64::from(bytes_transferred) {
+        Err(ResidualClaimMismatch)
+    } else {
+        Ok(())
+    }
 }
 
 /// Errors a Layer 3a tape I/O operation can return. Preserves Layer
@@ -990,7 +1010,7 @@ impl super::DriveHandle {
             Ok(_) => {
                 let position_after =
                     match self.advance_expected_position(records, 0, buf.len() as u64) {
-                        Ok(position_after) => position_after,
+                        Ok(position_after) => position_after.position(),
                         Err(err) => {
                             self.finish_tape_error(op, &err);
                             return Err(err);
@@ -1037,6 +1057,18 @@ impl super::DriveHandle {
                                 }
                             };
                             let bytes_written = records_written.saturating_mul(block_size_bytes);
+                            if validate_residual_claim(
+                                records_written,
+                                block_size_bytes,
+                                bytes_transferred,
+                            )
+                            .is_err()
+                            {
+                                self.pipeline_diagnostics.residual_claim_mismatches = self
+                                    .pipeline_diagnostics
+                                    .residual_claim_mismatches
+                                    .saturating_add(1);
+                            }
                             if sense_is_current_recovered(&sense) {
                                 self.finish_tape_recovered(op, started.elapsed(), sense);
                             } else {
@@ -1058,9 +1090,16 @@ impl super::DriveHandle {
                 }
 
                 if sense_is_current_recovered_without_terminal_flags(&sense) {
+                    if validate_residual_claim(records, block_size_bytes, bytes_transferred)
+                        .is_err()
+                    {
+                        let mapped = completion_unknown_check_condition(sense, bytes_transferred);
+                        self.finish_tape_error(op, &mapped);
+                        return Err(mapped);
+                    }
                     let position_after =
                         match self.advance_expected_position(records, 0, u64::from(len_u32)) {
-                            Ok(position_after) => position_after,
+                            Ok(position_after) => position_after.position(),
                             Err(err) => {
                                 self.finish_tape_error(op, &err);
                                 return Err(err);
@@ -1084,13 +1123,20 @@ impl super::DriveHandle {
                         return Err(mapped);
                     }
                 };
+                if validate_residual_claim(records_written, block_size_bytes, bytes_transferred)
+                    .is_err()
+                {
+                    let mapped = completion_unknown_check_condition(sense, bytes_transferred);
+                    self.finish_tape_error(op, &mapped);
+                    return Err(mapped);
+                }
                 let bytes_written = records_written.saturating_mul(block_size_bytes);
                 let position_after = match self.advance_expected_position(
                     records_written,
                     0,
                     bytes_written as u64,
                 ) {
-                    Ok(position_after) => position_after,
+                    Ok(position_after) => position_after.position(),
                     Err(err) => {
                         self.finish_tape_error(op, &err);
                         return Err(err);
@@ -1244,6 +1290,14 @@ impl super::DriveHandle {
                         return Err(mapped);
                     };
                     let bytes_written = records_written.saturating_mul(block_size_bytes);
+                    if validate_residual_claim(records_written, block_size_bytes, bytes_transferred)
+                        .is_err()
+                    {
+                        self.pipeline_diagnostics.residual_claim_mismatches = self
+                            .pipeline_diagnostics
+                            .residual_claim_mismatches
+                            .saturating_add(1);
+                    }
                     let recovered = sense_is_current_recovered(&sense);
                     if records_written != records || signal.end_of_medium {
                         let mapped = TapeIoError::PartialBatchUncommittable {
@@ -1269,6 +1323,14 @@ impl super::DriveHandle {
                     }
                     Ok(outcome)
                 } else if sense_is_current_recovered_without_terminal_flags(&sense) {
+                    if validate_residual_claim(records, block_size_bytes, bytes_transferred)
+                        .is_err()
+                    {
+                        let mapped = completion_unknown_check_condition(sense, bytes_transferred);
+                        self.fire_tape_started(operation, cdb);
+                        self.defer_pipeline_error_audit(operation, &mapped);
+                        return Err(mapped);
+                    }
                     self.record_pipeline_good(records, len_u32);
                     let position_after =
                         self.advance_expected_position_arithmetic(records, 0, u64::from(len_u32))?;
@@ -1292,13 +1354,23 @@ impl super::DriveHandle {
                     Ok(outcome)
                 } else {
                     let mapped = match fixed_records_transferred_from_sense(&sense, records) {
-                        Some(records_written) => TapeIoError::PartialBatchUncommittable {
-                            requested_records: records,
-                            written_records: records_written,
-                            end_of_medium: false,
-                            sense: Some(sense),
-                        },
+                        Some(records_written)
+                            if validate_residual_claim(
+                                records_written,
+                                block_size_bytes,
+                                bytes_transferred,
+                            )
+                            .is_ok() =>
+                        {
+                            TapeIoError::PartialBatchUncommittable {
+                                requested_records: records,
+                                written_records: records_written,
+                                end_of_medium: false,
+                                sense: Some(sense),
+                            }
+                        }
                         None => completion_unknown_check_condition(sense, bytes_transferred),
+                        Some(_) => completion_unknown_check_condition(sense, bytes_transferred),
                     };
                     self.fire_tape_started(operation, cdb);
                     self.defer_pipeline_error_audit(operation, &mapped);
@@ -1381,7 +1453,7 @@ impl super::DriveHandle {
         match result {
             Ok(_) => {
                 self.record_pipeline_good(records, transfer_len);
-                let position_after =
+                let position_evidence =
                     match self.advance_expected_position(records, 0, transfer_len as u64) {
                         Ok(position_after) => position_after,
                         Err(err) => {
@@ -1390,11 +1462,11 @@ impl super::DriveHandle {
                         }
                     };
                 self.finish_tape_success(op, started.elapsed());
-                Ok(ReadBatchOutcome::from_computed_position(
+                Ok(ReadBatchOutcome::from_position_evidence(
                     records,
                     transfer_len,
                     false,
-                    position_after,
+                    position_evidence,
                 ))
             }
             Err(ScsiError::CheckCondition {
@@ -1428,11 +1500,18 @@ impl super::DriveHandle {
                             return Err(mapped);
                         }
                     };
+                    if validate_residual_claim(records_read, block_size_bytes, bytes_transferred)
+                        .is_err()
+                    {
+                        let mapped = completion_unknown_check_condition(sense, bytes_transferred);
+                        self.finish_tape_error(op, &mapped);
+                        return Err(mapped);
+                    }
                     let bytes_read = records_read.saturating_mul(block_size_bytes);
                     if records_read != 0 {
                         self.record_pipeline_good(records_read, bytes_read);
                     }
-                    let position_after =
+                    let position_evidence =
                         match self.advance_expected_position(records_read, 1, bytes_read as u64) {
                             Ok(position_after) => position_after,
                             Err(err) => {
@@ -1441,19 +1520,32 @@ impl super::DriveHandle {
                             }
                         };
                     self.finish_tape_success(op, started.elapsed());
-                    return Ok(ReadBatchOutcome::from_computed_position(
+                    return Ok(ReadBatchOutcome::from_position_evidence(
                         records_read,
                         bytes_read,
                         true,
-                        position_after,
+                        position_evidence,
                     ));
                 }
                 if sense_is_current_recovered_without_terminal_flags(&sense) {
+                    if valid_fixed_residual_from_sense(&sense).is_some_and(|residual| residual != 0)
+                    {
+                        let mapped = completion_unknown_check_condition(sense, bytes_transferred);
+                        self.finish_tape_error(op, &mapped);
+                        return Err(mapped);
+                    }
                     let records_read =
                         fixed_records_transferred_from_sense(&sense, records).unwrap_or(records);
+                    if validate_residual_claim(records_read, block_size_bytes, bytes_transferred)
+                        .is_err()
+                    {
+                        let mapped = completion_unknown_check_condition(sense, bytes_transferred);
+                        self.finish_tape_error(op, &mapped);
+                        return Err(mapped);
+                    }
                     let bytes_read = records_read.saturating_mul(block_size_bytes);
                     self.record_pipeline_good(records_read, bytes_read);
-                    let position_after = match self.advance_expected_position(
+                    let position_evidence = match self.advance_expected_position(
                         records_read,
                         0,
                         u64::from(bytes_read),
@@ -1465,11 +1557,11 @@ impl super::DriveHandle {
                         }
                     };
                     self.finish_tape_recovered(op, started.elapsed(), sense);
-                    return Ok(ReadBatchOutcome::from_computed_position(
+                    return Ok(ReadBatchOutcome::from_position_evidence(
                         records_read,
                         bytes_read,
                         false,
-                        position_after,
+                        position_evidence,
                     ));
                 }
                 let mapped = map_scsi(ScsiError::CheckCondition {
@@ -2240,7 +2332,7 @@ impl super::DriveHandle {
         records: u32,
         filemarks: u32,
         bytes: u64,
-    ) -> Result<TapePosition, TapeIoError> {
+    ) -> Result<PositionAfter, TapeIoError> {
         let position_after =
             self.advance_expected_position_arithmetic(records, filemarks, bytes)?;
         if self.pipeline_tripwire_due() {
@@ -2251,9 +2343,13 @@ impl super::DriveHandle {
                 self.mark_position_unknown();
                 return Err(position_drift_error(position_after, device_position));
             }
-            return Ok(device_position);
+            return Ok(PositionAfter::Device(
+                model::DevicePositionProof::from_device_position(device_position),
+            ));
         }
-        Ok(position_after)
+        Ok(PositionAfter::Computed(
+            model::ComputedPosition::from_position(position_after),
+        ))
     }
 
     fn advance_expected_position_arithmetic(
@@ -2357,6 +2453,7 @@ impl super::DriveHandle {
             good_commands: self.pipeline_diagnostics.good_commands,
             good_records: self.pipeline_diagnostics.good_records,
             good_bytes: self.pipeline_diagnostics.good_bytes,
+            residual_claim_mismatches: self.pipeline_diagnostics.residual_claim_mismatches,
             gap_p50_us: self.pipeline_diagnostics.gap_us.percentile(50, 100),
             gap_p95_us: self.pipeline_diagnostics.gap_us.percentile(95, 100),
             gap_max_us: self.pipeline_diagnostics.gap_us.max,
@@ -2483,16 +2580,20 @@ fn fixed_batch_len_bytes(
 }
 
 fn fixed_records_transferred_from_sense(sense: &[u8], requested: u32) -> Option<u32> {
+    let residual = valid_fixed_residual_from_sense(sense)?;
+    if residual > requested {
+        return None;
+    }
+    Some(requested - residual)
+}
+
+fn valid_fixed_residual_from_sense(sense: &[u8]) -> Option<u32> {
     let decoded = decode_sense(sense)?;
     if decoded.response_code != 0x70 || !decoded.valid {
         return None;
     }
     let info_bytes: [u8; 4] = sense.get(3..7)?.try_into().ok()?;
-    let residual = u32::from_be_bytes(info_bytes);
-    if residual > requested {
-        return None;
-    }
-    Some(requested - residual)
+    Some(u32::from_be_bytes(info_bytes))
 }
 
 fn records_delta_between(
@@ -2523,7 +2624,10 @@ fn position_drift_error(expected: TapePosition, device: TapePosition) -> TapeIoE
 
 fn is_reset_unit_attention(sense: &[u8]) -> bool {
     decode_sense(sense).is_some_and(|decoded| {
-        !decoded.is_deferred() && decoded.key == 0x06 && decoded.asc == 0x29 && decoded.ascq <= 0x04
+        !decoded.is_deferred()
+            && decoded.key == 0x06
+            && decoded.asc == 0x29
+            && (decoded.ascq <= 0x04 || decoded.ascq == 0x07)
     })
 }
 
