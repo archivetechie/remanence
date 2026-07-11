@@ -51,7 +51,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use remanence_aead::{header::object_id_field, inspect_bytes, open_to_vec, RootKey};
+use remanence_aead::{header::object_id_field, inspect_bytes, open, open_to_vec, RootKey};
 use remanence_api::pb;
 #[cfg(feature = "foreign-bru")]
 use remanence_bru::{BruFormat, BRU_BLOCK_SIZE};
@@ -1751,6 +1751,10 @@ enum RemArchiveCommand {
     /// Extract a portable RAO object file into a directory.
     Extract(RemArchiveExtractArgs),
 
+    /// Decrypt an encrypted RAO object from stdin to stdout.
+    #[command(name = "extract-stream")]
+    ExtractStream(RemArchiveExtractStreamArgs),
+
     /// Probe an archive dump without streaming entries.
     Probe(RemArchiveInputArgs),
 
@@ -1950,6 +1954,18 @@ struct RemArchiveExtractArgs {
     blob_member: Option<String>,
 }
 
+/// Arguments for `rem archive extract-stream`.
+#[derive(Args, Debug)]
+struct RemArchiveExtractStreamArgs {
+    /// 32-byte root key file used to decrypt the encrypted RAO stream.
+    #[arg(long, value_name = "PATH")]
+    key_file: PathBuf,
+
+    /// Absolute plaintext byte range to write, formatted as start:length.
+    #[arg(long = "range", value_name = "START:LEN", value_parser = parse_archive_byte_range)]
+    range: Option<ArchiveByteRange>,
+}
+
 /// Arguments for `rem archive write`.
 #[derive(Args, Debug)]
 struct RemArchiveWriteArgs {
@@ -2144,6 +2160,7 @@ impl From<RemArchiveCommand> for ArchiveCommand {
             RemArchiveCommand::Build(args) => Self::Build(args.into()),
             RemArchiveCommand::Inspect(args) => Self::Inspect(args.into()),
             RemArchiveCommand::Extract(args) => Self::Extract(args.into()),
+            RemArchiveCommand::ExtractStream(args) => Self::ExtractStream(args.into()),
             RemArchiveCommand::Probe(args) => Self::Probe(args.into()),
             RemArchiveCommand::Scan(args) => Self::Scan(args.into()),
             RemArchiveCommand::Restore(args) => Self::Restore(args.into()),
@@ -2209,6 +2226,15 @@ impl From<RemArchiveExtractArgs> for ArchiveExtractArgs {
             no_unwrap: value.no_unwrap,
             blob_entry: value.blob_entry,
             blob_member: value.blob_member,
+        }
+    }
+}
+
+impl From<RemArchiveExtractStreamArgs> for ArchiveExtractStreamArgs {
+    fn from(value: RemArchiveExtractStreamArgs) -> Self {
+        Self {
+            key_file: value.key_file,
+            range: value.range,
         }
     }
 }
@@ -2324,6 +2350,10 @@ enum ArchiveCommand {
 
     /// Extract a portable RAO object file into a directory.
     Extract(ArchiveExtractArgs),
+
+    /// Decrypt an encrypted RAO object from stdin to stdout.
+    #[command(name = "extract-stream")]
+    ExtractStream(ArchiveExtractStreamArgs),
 
     /// Probe an archive source without streaming entries.
     Probe(ArchiveInputArgs),
@@ -2519,6 +2549,18 @@ struct ArchiveExtractArgs {
     /// Member path inside --blob-entry to restore.
     #[arg(long = "blob-member", value_name = "TAR_PATH", requires = "blob_entry")]
     blob_member: Option<String>,
+}
+
+/// Arguments for the shared `archive extract-stream` command.
+#[derive(Args, Debug)]
+struct ArchiveExtractStreamArgs {
+    /// 32-byte root key file used to decrypt the encrypted RAO stream.
+    #[arg(long, value_name = "PATH")]
+    key_file: PathBuf,
+
+    /// Absolute plaintext byte range to write, formatted as start:length.
+    #[arg(long = "range", value_name = "START:LEN", value_parser = parse_archive_byte_range)]
+    range: Option<ArchiveByteRange>,
 }
 
 /// Arguments for the shared `archive write` command (post-From transform).
@@ -2723,7 +2765,7 @@ enum ArchiveFormat {
 impl ArchiveCommand {
     fn tape_target(&self) -> Option<&str> {
         match self {
-            Self::Build(_) | Self::Inspect(_) | Self::Extract(_) => None,
+            Self::Build(_) | Self::Inspect(_) | Self::Extract(_) | Self::ExtractStream(_) => None,
             // `archive write` is state-changing; gate it through `--allow`
             // against the supplied `--library` serial.
             Self::Write(args) => Some(args.library.as_str()),
@@ -2741,6 +2783,7 @@ impl ArchiveCommand {
             Self::Build(_)
             | Self::Inspect(_)
             | Self::Extract(_)
+            | Self::ExtractStream(_)
             | Self::Write(_)
             | Self::Read(_)
             | Self::ExportObject(_)
@@ -2762,6 +2805,9 @@ impl ArchiveCommand {
             Self::Build(_) => panic!("ArchiveCommand::Build has no dump/tape source"),
             Self::Inspect(_) => panic!("ArchiveCommand::Inspect has no dump/tape source"),
             Self::Extract(_) => panic!("ArchiveCommand::Extract has no dump/tape source"),
+            Self::ExtractStream(_) => {
+                panic!("ArchiveCommand::ExtractStream has no dump/tape source")
+            }
             Self::Write(_) => panic!("ArchiveCommand::Write has no dump/tape source"),
             Self::Read(_) => panic!("ArchiveCommand::Read has no dump/tape source"),
             Self::ExportObject(_) => {
@@ -2780,6 +2826,7 @@ impl ArchiveCommand {
             Self::Build(_) => panic!("ArchiveCommand::Build has no format"),
             Self::Inspect(_) => panic!("ArchiveCommand::Inspect has no format"),
             Self::Extract(_) => panic!("ArchiveCommand::Extract has no format"),
+            Self::ExtractStream(_) => panic!("ArchiveCommand::ExtractStream has no format"),
             Self::Write(_) => panic!("ArchiveCommand::Write has no format"),
             Self::Read(_) => panic!("ArchiveCommand::Read has no format"),
             Self::ExportObject(_) => panic!("ArchiveCommand::ExportObject has no format"),
@@ -2954,9 +3001,11 @@ fn run_cli(cli: ParsedCli, mode: CliMode) -> ExitCode {
     };
     let stdout = io::stdout();
     let stderr = io::stderr();
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
     let mut out = stdout.lock();
     let mut err = stderr.lock();
-    run_with_mode(cli, mode, discover_fn, &mut out, &mut err)
+    run_with_mode(cli, mode, discover_fn, &mut input, &mut out, &mut err)
 }
 
 /// Core entry-point — generic over the discovery function and the
@@ -2969,7 +3018,14 @@ fn run<F>(cli: Cli, discover_fn: F, out: &mut dyn Write, err: &mut dyn Write) ->
 where
     F: FnOnce() -> Result<DiscoveryReport, DiscoveryError>,
 {
-    run_with_mode(cli.into(), CliMode::Rem, discover_fn, out, err)
+    run_with_mode(
+        cli.into(),
+        CliMode::Rem,
+        discover_fn,
+        &mut io::empty(),
+        out,
+        err,
+    )
 }
 
 #[cfg(test)]
@@ -2977,13 +3033,21 @@ fn run_debug<F>(cli: DebugCli, discover_fn: F, out: &mut dyn Write, err: &mut dy
 where
     F: FnOnce() -> Result<DiscoveryReport, DiscoveryError>,
 {
-    run_with_mode(cli.into(), CliMode::Debug, discover_fn, out, err)
+    run_with_mode(
+        cli.into(),
+        CliMode::Debug,
+        discover_fn,
+        &mut io::empty(),
+        out,
+        err,
+    )
 }
 
 fn run_with_mode<F>(
     cli: ParsedCli,
     mode: CliMode,
     discover_fn: F,
+    input: &mut dyn Read,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode
@@ -3134,6 +3198,9 @@ where
         }
         if let ArchiveCommand::Extract(args) = command {
             return run_archive_extract(args, out, err);
+        }
+        if let ArchiveCommand::ExtractStream(args) = command {
+            return run_archive_extract_stream(args, input, out, err);
         }
         if command.is_dump_command() {
             return run_archive_dump_command(command, out, err);
@@ -9093,6 +9160,9 @@ fn run_archive_dump_command(
         ArchiveCommand::Extract(_) => {
             unreachable!("archive extract dispatched before the dump handler")
         }
+        ArchiveCommand::ExtractStream(_) => {
+            unreachable!("archive extract-stream dispatched before the dump handler")
+        }
         ArchiveCommand::Write(_) => {
             unreachable!("archive write dispatched before the dump handler")
         }
@@ -9240,6 +9310,139 @@ fn run_archive_extract(
             let _ = writeln!(err, "error: {error}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Decrypt one complete encrypted RAO stream from `input` to `out`.
+///
+/// `remanence_aead::open` authenticates each payload chunk before invoking the
+/// writer. The optional writer below only slices that already-authenticated
+/// plaintext; it never changes AEAD framing or final-chunk validation.
+fn run_archive_extract_stream(
+    args: &ArchiveExtractStreamArgs,
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let result = (|| -> Result<Value, String> {
+        let root_key = read_root_key_file(&args.key_file)?;
+        let (report, bytes_written) = if let Some(range) = args.range {
+            let requested_end = range
+                .start
+                .checked_add(range.len)
+                .ok_or_else(|| "--range arithmetic overflow".to_string())?;
+            let mut selected = PlaintextRangeWriter::new(out, range.start, requested_end);
+            let report = open(input, &mut selected, &root_key)
+                .map_err(|error| format!("decrypt encrypted RAO stream: {error}"))?;
+            selected
+                .flush()
+                .map_err(|error| format!("flush plaintext stdout: {error}"))?;
+            if requested_end > report.plaintext.size {
+                return Err(format!(
+                    "--range {}:{} extends past plaintext size {}",
+                    range.start, range.len, report.plaintext.size
+                ));
+            }
+            (report, selected.bytes_written())
+        } else {
+            let report = open(input, &mut *out, &root_key)
+                .map_err(|error| format!("decrypt encrypted RAO stream: {error}"))?;
+            out.flush()
+                .map_err(|error| format!("flush plaintext stdout: {error}"))?;
+            let size = report.plaintext.size;
+            (report, size)
+        };
+
+        Ok(json!({
+            "command": "archive extract-stream",
+            "status": "ok",
+            "object_id": report.header.object_id,
+            "key_id": bytes_to_hex(&report.header.key_id),
+            "chunk_size": report.header.chunk_size,
+            "stored_size_bytes": report.stored_size_bytes,
+            "plaintext_size_bytes": report.plaintext.size,
+            "plaintext_sha256": bytes_to_hex(&report.plaintext.digest),
+            "bytes_written": bytes_written,
+            "range": args.range.map(|range| json!({
+                "start": range.start,
+                "len": range.len,
+            })),
+        }))
+    })();
+
+    match result {
+        Ok(report) => {
+            let line = serde_json::to_string(&report)
+                .unwrap_or_else(|error| format!("{{\"error\":\"{error}\"}}"));
+            if writeln!(err, "{line}").is_ok() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
+        Err(error) => {
+            let _ = writeln!(err, "error: archive extract-stream: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Streaming selector for an absolute byte range in authenticated plaintext.
+struct PlaintextRangeWriter<'a> {
+    inner: &'a mut dyn Write,
+    start: u64,
+    end: u64,
+    position: u64,
+    bytes_written: u64,
+}
+
+impl<'a> PlaintextRangeWriter<'a> {
+    fn new(inner: &'a mut dyn Write, start: u64, end: u64) -> Self {
+        Self {
+            inner,
+            start,
+            end,
+            position: 0,
+            bytes_written: 0,
+        }
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+}
+
+impl Write for PlaintextRangeWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let buf_len = u64::try_from(buf.len())
+            .map_err(|_| io::Error::new(ErrorKind::InvalidData, "plaintext chunk too large"))?;
+        let chunk_end = self
+            .position
+            .checked_add(buf_len)
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "plaintext offset overflow"))?;
+        let selected_start = self.position.max(self.start);
+        let selected_end = chunk_end.min(self.end);
+        if selected_start < selected_end {
+            let local_start = usize::try_from(selected_start - self.position).map_err(|_| {
+                io::Error::new(ErrorKind::InvalidData, "plaintext range offset too large")
+            })?;
+            let local_end = usize::try_from(selected_end - self.position).map_err(|_| {
+                io::Error::new(ErrorKind::InvalidData, "plaintext range offset too large")
+            })?;
+            self.inner.write_all(&buf[local_start..local_end])?;
+            self.bytes_written = self
+                .bytes_written
+                .checked_add(selected_end - selected_start)
+                .ok_or_else(|| {
+                    io::Error::new(ErrorKind::InvalidData, "plaintext byte count overflow")
+                })?;
+        }
+        self.position = chunk_end;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -11580,6 +11783,9 @@ fn run_archive_tape_with_drive(
         ArchiveCommand::Extract(_) => {
             unreachable!("archive extract dispatched before the tape archive handler")
         }
+        ArchiveCommand::ExtractStream(_) => {
+            unreachable!("archive extract-stream dispatched before the tape archive handler")
+        }
         ArchiveCommand::Write(_) => {
             unreachable!("archive write dispatched before the tape archive handler")
         }
@@ -13315,7 +13521,15 @@ mod tests {
             );
         }
         for command in [
-            "build", "inspect", "extract", "probe", "scan", "restore", "recover", "list",
+            "build",
+            "inspect",
+            "extract",
+            "extract-stream",
+            "probe",
+            "scan",
+            "restore",
+            "recover",
+            "list",
         ] {
             assert!(
                 help.contains(&format!("\n  {command}")),
@@ -13450,6 +13664,35 @@ mod tests {
                     Some(ArchiveByteRange {
                         start: 512,
                         len: 768
+                    })
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rem_archive_extract_stream_parses_pipe_command() {
+        let cli = Cli::parse_from([
+            "rem",
+            "archive",
+            "extract-stream",
+            "--key-file",
+            "/tmp/root.key",
+            "--range",
+            "511:514",
+        ]);
+
+        match cli.command {
+            RemCommand::Archive {
+                command: RemArchiveCommand::ExtractStream(args),
+            } => {
+                assert_eq!(args.key_file, PathBuf::from("/tmp/root.key"));
+                assert_eq!(
+                    args.range,
+                    Some(ArchiveByteRange {
+                        start: 511,
+                        len: 514
                     })
                 );
             }
@@ -17644,6 +17887,156 @@ blob Project/Render Files/
             fs::read(restore_dir.join("secret.txt")).unwrap(),
             b"classified payload"
         );
+    }
+
+    fn sealed_stream_fixture(chunk_size: u32, chunk_count: usize) -> (Vec<u8>, Vec<u8>, RootKey) {
+        let plaintext: Vec<u8> = (0..chunk_size as usize * chunk_count)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let root_key = RootKey::new([0x63; 32]).unwrap();
+        let options = remanence_aead::SealOptions {
+            chunk_size,
+            key_id: [0x64; 16],
+            object_id: "extract-stream-fixture".to_string(),
+            plaintext_size: plaintext.len() as u64,
+            plaintext_digest: sha256_bytes(&plaintext),
+        };
+        let sealed = remanence_aead::seal_to_vec(&plaintext, &root_key, &options)
+            .unwrap()
+            .0;
+        (sealed, plaintext, root_key)
+    }
+
+    fn invoke_extract_stream(
+        encrypted: &[u8],
+        key_file: &Path,
+        range: Option<ArchiveByteRange>,
+    ) -> (ExitCode, Vec<u8>, String) {
+        let args = ArchiveExtractStreamArgs {
+            key_file: key_file.to_path_buf(),
+            range,
+        };
+        let mut input = Cursor::new(encrypted);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_archive_extract_stream(&args, &mut input, &mut stdout, &mut stderr);
+        (
+            code,
+            stdout,
+            String::from_utf8(stderr).expect("extract-stream stderr is UTF-8"),
+        )
+    }
+
+    #[test]
+    fn archive_extract_stream_round_trips_to_pure_stdout() {
+        let temp = tempfile::tempdir().unwrap();
+        let key_file = temp.path().join("root.key");
+        fs::write(&key_file, [0x63; 32]).unwrap();
+        let (encrypted, plaintext, root_key) = sealed_stream_fixture(512, 4);
+        let expected = remanence_aead::open_to_vec(&encrypted, &root_key)
+            .unwrap()
+            .0;
+
+        let (code, stdout, stderr) = invoke_extract_stream(&encrypted, &key_file, None);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert_eq!(stdout, plaintext);
+        assert_eq!(stdout, expected);
+        let report: Value = serde_json::from_str(stderr.trim()).expect("stderr report JSON");
+        assert_eq!(report["status"], "ok");
+        assert_eq!(report["bytes_written"], plaintext.len() as u64);
+    }
+
+    #[test]
+    fn archive_extract_stream_corrupt_chunk_releases_only_preceding_chunks() {
+        let temp = tempfile::tempdir().unwrap();
+        let key_file = temp.path().join("root.key");
+        fs::write(&key_file, [0x63; 32]).unwrap();
+        let (mut encrypted, plaintext, _root_key) = sealed_stream_fixture(512, 4);
+        let inspected = remanence_aead::inspect_bytes(&encrypted).unwrap();
+        let corrupt_chunk = 2u64;
+        let corrupt_offset = remanence_aead::cipher_offset(
+            inspected.header.metadata_frame_len,
+            inspected.header.chunk_size,
+            corrupt_chunk,
+        )
+        .unwrap() as usize;
+        encrypted[corrupt_offset + 17] ^= 0x80;
+
+        let (code, stdout, stderr) = invoke_extract_stream(&encrypted, &key_file, None);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert_eq!(stdout, plaintext[..1024]);
+        assert!(stderr.contains("authentication failed"), "{stderr}");
+    }
+
+    #[test]
+    fn archive_extract_stream_truncation_fails_after_authenticated_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let key_file = temp.path().join("root.key");
+        fs::write(&key_file, [0x63; 32]).unwrap();
+        let (mut encrypted, plaintext, _root_key) = sealed_stream_fixture(512, 4);
+        let inspected = remanence_aead::inspect_bytes(&encrypted).unwrap();
+        let final_chunk_offset = remanence_aead::cipher_offset(
+            inspected.header.metadata_frame_len,
+            inspected.header.chunk_size,
+            3,
+        )
+        .unwrap() as usize;
+        encrypted.truncate(final_chunk_offset + 100);
+
+        let (code, stdout, stderr) = invoke_extract_stream(&encrypted, &key_file, None);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert_eq!(stdout, plaintext[..1536]);
+        assert!(
+            stderr.contains("missing authenticated final AEAD chunk"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn archive_extract_stream_ranges_span_boundaries_and_reach_final_chunk() {
+        let temp = tempfile::tempdir().unwrap();
+        let key_file = temp.path().join("root.key");
+        fs::write(&key_file, [0x63; 32]).unwrap();
+        let (encrypted, plaintext, _root_key) = sealed_stream_fixture(512, 4);
+
+        for range in [
+            ArchiveByteRange {
+                start: 500,
+                len: 700,
+            },
+            ArchiveByteRange {
+                start: 1800,
+                len: 248,
+            },
+        ] {
+            let (code, stdout, stderr) = invoke_extract_stream(&encrypted, &key_file, Some(range));
+            assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+            assert_eq!(
+                stdout,
+                plaintext[range.start as usize..(range.start + range.len) as usize]
+            );
+            let report: Value = serde_json::from_str(stderr.trim()).expect("stderr report JSON");
+            assert_eq!(report["bytes_written"], range.len);
+        }
+
+        let mut damaged_tail = encrypted.clone();
+        let inspected = remanence_aead::inspect_bytes(&damaged_tail).unwrap();
+        let tail_offset = remanence_aead::cipher_offset(
+            inspected.header.metadata_frame_len,
+            inspected.header.chunk_size,
+            3,
+        )
+        .unwrap() as usize;
+        damaged_tail[tail_offset] ^= 0x40;
+        let early_range = ArchiveByteRange { start: 0, len: 64 };
+        let (code, stdout, stderr) =
+            invoke_extract_stream(&damaged_tail, &key_file, Some(early_range));
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert_eq!(stdout, plaintext[..64]);
+        assert!(stderr.contains("authentication failed"), "{stderr}");
     }
 
     #[test]
