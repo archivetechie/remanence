@@ -1557,12 +1557,13 @@ practical to pin; at least one header-level vector MUST use the default
 geometry parameters. Negative vectors contain exactly one fault each.
 
 The companion archive is `remanence-test-vectors.tar`, SHA-256
-`53ae763287a49eb2b82ac4bd3bc0bf2c8d2d0dff13a1e412cee210ccdc659366`.
-Its `MANIFEST.tsv` inventories the contained vector manifests and RAO object
-byte streams, and `CHECKSUMS.sha256` authenticates them. The archive is reproducibly generated with the
-`publication-test-vectors` build target; the REM-PARITY manifest names the
-executable conformance entrypoints for structural, recovery, resume, and
-damage-matrix cases.
+`596e5ee7baffb355366407d6b4384fe7caafa64509e489508df2ed5dc2eadc7d`.
+Its `MANIFEST.tsv` inventories every contained vector manifest and generated
+artifact, `CHECKSUMS.sha256` authenticates them, and the included `verify.py`
+checks the archive without a source checkout. The archive is reproducibly
+generated with the `publication-test-vectors` build target. The REM-PARITY
+`vectors.json` records deterministic inputs, expected outputs or Section 15
+typed errors, artifact hashes, and a checksum for every vector.
 
 The arithmetic vectors stated in this document — the Section 5.1 CRC
 values, the Section 6.8 Reed–Solomon values, and the Section 7.3 canonical
@@ -1600,7 +1601,8 @@ image (committed prefix → reopened → appended).
   peer counted as an erasure and then recovered around; a
   reconstructed-block CRC mismatch; a pending-epoch refusal; an
   outside-prefix refusal.
-- *Damage matrix*: for the minimal image, single-block damage at each of —
+- *Damage matrix*: for the minimal image (and the external parity_map image
+  for the parity_map-primary cell), single-block damage at each of —
   the object's head block; the sidecar primary header; the sidecar footer;
   the sidecar footer **and** primary (directory-assisted tail rescue); the
   parity_map primary; one bootstrap copy (exercising the Section 12.4
