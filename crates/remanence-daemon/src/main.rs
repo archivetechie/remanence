@@ -78,6 +78,27 @@ async fn main() -> ExitCode {
             eprintln!("error: create spool dir {}: {error}", spool_dir.display());
             return ExitCode::from(1);
         }
+        let reconciliation = match reconcile_spool_orphans(&spool_dir) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                eprintln!(
+                    "error: reconcile append spool {} before accepting writes: {error}",
+                    spool_dir.display()
+                );
+                return ExitCode::from(1);
+            }
+        };
+        if !reconciliation.is_empty() {
+            eprintln!(
+                "rem-daemon: append spool orphan reconciliation spool_dir={} removed_count={} removed_bytes={} evidence={}",
+                spool_dir.display(),
+                reconciliation.len(),
+                reconciliation
+                    .iter()
+                    .fold(0u64, |total, item| total.saturating_add(item.size_bytes)),
+                format_spool_orphan_evidence(&reconciliation),
+            );
+        }
         let spool_budget = match resolve_spool_budget(&config.daemon, &spool_dir) {
             Ok(budget) => budget,
             Err(error) => {
@@ -174,6 +195,92 @@ struct SpoolBudget {
 struct SpoolFilesystemInfo {
     is_tmpfs: bool,
     available_bytes: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SpoolOrphanEvidence {
+    name: String,
+    size_bytes: u64,
+    modified_unix_seconds: Option<u64>,
+}
+
+/// Remove only daemon-owned UUID-named append spools left by an unclean exit.
+/// This runs before budget discovery so tmpfs capacity is re-accounted after
+/// orphan removal and before the API can accept a write stream.
+fn reconcile_spool_orphans(path: &Path) -> std::io::Result<Vec<SpoolOrphanEvidence>> {
+    let mut evidence = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(uuid_text) = name
+            .strip_prefix("spool-")
+            .and_then(|rest| rest.strip_suffix(".bin"))
+        else {
+            continue;
+        };
+        if !is_canonical_uuid(uuid_text) {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        let modified_unix_seconds = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs());
+        evidence.push(SpoolOrphanEvidence {
+            name: name.to_string(),
+            size_bytes: metadata.len(),
+            modified_unix_seconds,
+        });
+    }
+    evidence.sort_by(|left, right| left.name.cmp(&right.name));
+    if !evidence.is_empty() {
+        eprintln!(
+            "rem-daemon: append spool orphan evidence spool_dir={} orphan_count={} orphan_bytes={} action=remove_before_budget_reaccount evidence={}",
+            path.display(),
+            evidence.len(),
+            evidence
+                .iter()
+                .fold(0u64, |total, item| total.saturating_add(item.size_bytes)),
+            format_spool_orphan_evidence(&evidence),
+        );
+    }
+    for item in &evidence {
+        std::fs::remove_file(path.join(&item.name))?;
+    }
+    Ok(evidence)
+}
+
+fn is_canonical_uuid(text: &str) -> bool {
+    text.len() == 36
+        && text.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'),
+        })
+}
+
+fn format_spool_orphan_evidence(evidence: &[SpoolOrphanEvidence]) -> String {
+    evidence
+        .iter()
+        .map(|item| {
+            format!(
+                "{}:{}:{}",
+                item.name,
+                item.size_bytes,
+                item.modified_unix_seconds
+                    .map(|seconds| seconds.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn create_private_spool_dir(path: &Path) -> std::io::Result<()> {
@@ -316,6 +423,65 @@ fn parse_mem_available_bytes(text: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_reconciliation_removes_owned_orphans_and_preserves_foreign_files() {
+        let temp = tempfile::Builder::new()
+            .prefix("rem-daemon-spool-reconcile")
+            .tempdir()
+            .expect("tempdir");
+        let owned_name = "spool-01234567-89ab-cdef-0123-456789abcdef.bin";
+        let owned = temp.path().join(owned_name);
+        std::fs::write(&owned, b"orphan payload").expect("write owned orphan");
+        let foreign_names = [
+            "spool-not-a-uuid.bin",
+            "spool-01234567-89AB-CDEF-0123-456789ABCDEF.bin",
+            "spool-01234567-89ab-cdef-0123-456789abcdef.bin.keep",
+            "operator-notes.txt",
+        ];
+        for name in foreign_names {
+            std::fs::write(temp.path().join(name), b"foreign").expect("write foreign file");
+        }
+
+        let evidence = reconcile_spool_orphans(temp.path()).expect("reconcile orphans");
+
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].name, owned_name);
+        assert_eq!(evidence[0].size_bytes, 14);
+        assert!(!owned.exists(), "owned orphan must be removed");
+        for name in foreign_names {
+            assert!(
+                temp.path().join(name).exists(),
+                "foreign file {name} must be preserved"
+            );
+        }
+        let formatted = format_spool_orphan_evidence(&evidence);
+        assert!(formatted.contains(owned_name));
+        assert!(formatted.contains(":14:"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_reconciliation_does_not_follow_owned_named_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::Builder::new()
+            .prefix("rem-daemon-spool-reconcile-link")
+            .tempdir()
+            .expect("tempdir");
+        let target = temp.path().join("foreign-target");
+        std::fs::write(&target, b"foreign").expect("write target");
+        let link = temp
+            .path()
+            .join("spool-01234567-89ab-cdef-0123-456789abcdef.bin");
+        symlink(&target, &link).expect("create symlink");
+
+        let evidence = reconcile_spool_orphans(temp.path()).expect("reconcile orphans");
+
+        assert!(evidence.is_empty());
+        assert!(link.exists(), "foreign symlink must be untouched");
+        assert_eq!(std::fs::read(target).expect("read target"), b"foreign");
+    }
 
     #[cfg(unix)]
     #[test]

@@ -15,7 +15,8 @@ use remanence_format::error::FormatError;
 use remanence_format::model::BodyLba;
 use remanence_library::{
     BlockSize, BlockSource, ChangerHandle, DiscoveryReport, DriveHandle, DriveHandleSink,
-    DriveHandleSource, MediaFamily, MediaReadiness, StaticAllowlist, TapeConfig,
+    DriveHandleSource, MediaFamily, MediaReadiness, ReadBatchOutcome, SpaceKind, SpaceResult,
+    StaticAllowlist, TapeConfig, TapeIoError, TapePosition,
 };
 use remanence_parity::{
     scan_reconstruct_filemark_map, DriveHandleRawSource, FilemarkMap, ParityError, TapeFileEntry,
@@ -2384,6 +2385,7 @@ fn handle_drive_open_read(
                     stream_one_object(
                         index,
                         drive,
+                        session_id,
                         &tape_uuid,
                         object_id.as_str(),
                         stream_chunk_bytes,
@@ -2398,6 +2400,7 @@ fn handle_drive_open_read(
                             stream_one_file_range(
                                 index,
                                 drive,
+                                session_id,
                                 &tape_uuid,
                                 object_id.as_str(),
                                 file_id.as_str(),
@@ -2429,6 +2432,7 @@ fn handle_drive_open_read(
                 if let Err(status) = stream_one_file_range(
                     index,
                     drive,
+                    session_id,
                     &tape_uuid,
                     object_id.as_str(),
                     file_id.as_str(),
@@ -3883,9 +3887,193 @@ fn record_reconcile_event(
     )
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RestoreReadPhases {
+    position: StdDuration,
+    transfer: StdDuration,
+    bytes: u64,
+    records: u64,
+    commands: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RestoreDiagnosticContext {
+    session_id: Uuid,
+    tape_uuid: [u8; 16],
+    block_size_bytes: u32,
+    success: bool,
+}
+
+/// Times the existing `BlockSource` safety funnel without reimplementing any
+/// tape operation. Every call delegates exactly once to the wrapped source.
+struct DiagnosticBlockSource<'a> {
+    inner: &'a mut dyn BlockSource,
+    phases: RestoreReadPhases,
+}
+
+impl<'a> DiagnosticBlockSource<'a> {
+    fn new(inner: &'a mut dyn BlockSource) -> Self {
+        Self {
+            inner,
+            phases: RestoreReadPhases::default(),
+        }
+    }
+
+    fn phases(&self) -> RestoreReadPhases {
+        self.phases
+    }
+}
+
+impl BlockSource for DiagnosticBlockSource<'_> {
+    fn read_block(&mut self, buf: &mut [u8]) -> Result<usize, TapeIoError> {
+        let started = Instant::now();
+        let result = self.inner.read_block(buf);
+        self.phases.transfer += started.elapsed();
+        if let Ok(bytes) = result {
+            self.phases.commands = self.phases.commands.saturating_add(1);
+            self.phases.records = self.phases.records.saturating_add(1);
+            self.phases.bytes = self.phases.bytes.saturating_add(bytes as u64);
+        }
+        result
+    }
+
+    fn read_block_batch(
+        &mut self,
+        buf: &mut [u8],
+        block_size_bytes: u32,
+        requested_records: u32,
+        remaining_records_in_file: u32,
+    ) -> Result<ReadBatchOutcome, TapeIoError> {
+        let started = Instant::now();
+        let result = self.inner.read_block_batch(
+            buf,
+            block_size_bytes,
+            requested_records,
+            remaining_records_in_file,
+        );
+        self.phases.transfer += started.elapsed();
+        if let Ok(outcome) = result {
+            self.phases.commands = self.phases.commands.saturating_add(1);
+            self.phases.records = self
+                .phases
+                .records
+                .saturating_add(u64::from(outcome.records_read));
+            self.phases.bytes = self
+                .phases
+                .bytes
+                .saturating_add(u64::from(outcome.bytes_read));
+        }
+        result
+    }
+
+    fn read_batch_blocks(&self, block_size_bytes: u32) -> u32 {
+        self.inner.read_batch_blocks(block_size_bytes)
+    }
+
+    fn read_ring_buffers(&self) -> u32 {
+        self.inner.read_ring_buffers()
+    }
+
+    fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
+        let started = Instant::now();
+        let result = self.inner.locate(lba);
+        self.phases.position += started.elapsed();
+        result
+    }
+
+    fn space(&mut self, count: i64, kind: SpaceKind) -> Result<SpaceResult, TapeIoError> {
+        let started = Instant::now();
+        let result = self.inner.space(count, kind);
+        self.phases.position += started.elapsed();
+        result
+    }
+
+    fn position(&mut self) -> Result<TapePosition, TapeIoError> {
+        let started = Instant::now();
+        let result = self.inner.position();
+        self.phases.position += started.elapsed();
+        result
+    }
+}
+
+fn log_restore_read_diagnostics(
+    drive: &DriveHandle,
+    context: RestoreDiagnosticContext,
+    phases: RestoreReadPhases,
+    relay_diagnostics: StagedReadRelayDiagnostics,
+    wall: StdDuration,
+) {
+    let relay = exclusive_restore_relay_phase(wall, phases.position, phases.transfer);
+    let phase_sum = phases
+        .position
+        .saturating_add(phases.transfer)
+        .saturating_add(relay);
+    let diagnostics = drive.pipelined_read_diagnostics();
+    let effective_batch_blocks = drive.requested_read_batch_blocks().min(
+        drive
+            .sg_reserved_size_bytes()
+            .checked_div(context.block_size_bytes.max(1))
+            .unwrap_or(1)
+            .max(1),
+    );
+    let batch_effectiveness = if phases.commands == 0 {
+        0.0
+    } else {
+        phases.records as f64 / phases.commands as f64
+    };
+    tracing::info!(
+        target: "remanence_read_diag",
+        phase = "restore_total",
+        session_id = %context.session_id,
+        tape_uuid = %Uuid::from_bytes(context.tape_uuid),
+        status = if context.success { "ok" } else { "error" },
+        effective_mode = "fixed_pipelined",
+        block_size_bytes = context.block_size_bytes,
+        staging_ring_buffers = drive.staging_ring_buffers(),
+        effective_batch_blocks,
+        batch_effectiveness_records_per_command = batch_effectiveness,
+        bytes = phases.bytes,
+        records = phases.records,
+        commands = phases.commands,
+        locate_position_ms = crate::diagnostics::duration_ms(phases.position),
+        transfer_ms = crate::diagnostics::duration_ms(phases.transfer),
+        relay_ms = crate::diagnostics::duration_ms(relay),
+        phase_sum_ms = crate::diagnostics::duration_ms(phase_sum),
+        wall_ms = crate::diagnostics::duration_ms(wall),
+        drive_rate_mib_s = crate::diagnostics::mib_per_s(phases.bytes, phases.transfer),
+        relay_rate_mib_s = crate::diagnostics::mib_per_s(phases.bytes, relay),
+        client_write_ms = crate::diagnostics::duration_ms(relay_diagnostics.client_write),
+        client_write_bytes = relay_diagnostics.bytes,
+        client_write_rate_mib_s = crate::diagnostics::mib_per_s(
+            relay_diagnostics.bytes,
+            relay_diagnostics.client_write,
+        ),
+        gap_samples = diagnostics.gap_samples,
+        ioctl_samples = diagnostics.ioctl_samples,
+        gap_p50_us = diagnostics.gap_p50_us,
+        gap_p95_us = diagnostics.gap_p95_us,
+        gap_max_us = diagnostics.gap_max_us,
+        ioctl_p50_us = diagnostics.ioctl_p50_us,
+        ioctl_p95_us = diagnostics.ioctl_p95_us,
+        ioctl_max_us = diagnostics.ioctl_max_us,
+        cadence_us = diagnostics.cadence_us,
+        effective_feed_bytes_per_second = diagnostics.effective_feed_bytes_per_second,
+        "remanence_read_diag",
+    );
+}
+
+fn exclusive_restore_relay_phase(
+    wall: StdDuration,
+    position: StdDuration,
+    transfer: StdDuration,
+) -> StdDuration {
+    wall.saturating_sub(position).saturating_sub(transfer)
+}
+
 fn stream_one_object(
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
+    session_id: Uuid,
     tape_uuid: &[u8; 16],
     object_id: &str,
     stream_chunk_bytes: u32,
@@ -3941,29 +4129,51 @@ fn stream_one_object(
         .write_config(fixed_no_compression_config(current_cfg, block_size_u32))
         .map_err(|err| Status::internal(format!("set fixed-block config: {err}")))?;
 
-    let mut source = DriveHandleSource(drive);
-    stream_with_staged_read_sender(chunk_tx, stream_chunk_bytes, |writer| {
-        let mut sink = crate::read_core::CapturePayloadSink::new(writer);
-        crate::read_core::read_object_payload(
-            &mut source,
-            block_size_usize,
-            tape_file.block_count,
-            copy.tape_file_number,
-            manifest_sha256,
-            &mut sink,
-        )
-        .map_err(|err| Status::internal(format!("read object: {err}")))?;
-        let (_payload_bytes, _digest) = sink
-            .finish()
-            .map_err(|err| Status::internal(format!("finish payload stream: {err}")))?;
-        Ok(())
-    })
+    drive.reset_pipelined_diagnostics();
+    let wall_started = Instant::now();
+    let (result, phases) = {
+        let mut source = DriveHandleSource(drive);
+        let mut diagnostic_source = DiagnosticBlockSource::new(&mut source);
+        let result =
+            stream_with_staged_read_sender_diagnostics(chunk_tx, stream_chunk_bytes, |writer| {
+                let mut sink = crate::read_core::CapturePayloadSink::new(writer);
+                crate::read_core::read_object_payload(
+                    &mut diagnostic_source,
+                    block_size_usize,
+                    tape_file.block_count,
+                    copy.tape_file_number,
+                    manifest_sha256,
+                    &mut sink,
+                )
+                .map_err(|err| Status::internal(format!("read object: {err}")))?;
+                let (_payload_bytes, _digest) = sink
+                    .finish()
+                    .map_err(|err| Status::internal(format!("finish payload stream: {err}")))?;
+                Ok(())
+            });
+        (result, diagnostic_source.phases())
+    };
+    let wall = wall_started.elapsed();
+    log_restore_read_diagnostics(
+        drive,
+        RestoreDiagnosticContext {
+            session_id,
+            tape_uuid: *tape_uuid,
+            block_size_bytes: block_size_u32,
+            success: result.is_ok(),
+        },
+        phases,
+        result.as_ref().copied().unwrap_or_default(),
+        wall,
+    );
+    result.map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn stream_one_file_range(
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
+    session_id: Uuid,
     tape_uuid: &[u8; 16],
     object_id: &str,
     file_id: &str,
@@ -3985,9 +4195,33 @@ fn stream_one_file_range(
         .write_config(fixed_no_compression_config(current_cfg, block_size_u32))
         .map_err(|err| Status::internal(format!("set fixed-block config: {err}")))?;
 
-    let mut source = DriveHandleSource(drive);
-    stream_file_range_from_source(&mut source, request, stream_chunk_bytes, chunk_tx)?;
-    Ok(())
+    drive.reset_pipelined_diagnostics();
+    let wall_started = Instant::now();
+    let (result, phases) = {
+        let mut source = DriveHandleSource(drive);
+        let mut diagnostic_source = DiagnosticBlockSource::new(&mut source);
+        let result = stream_file_range_from_source(
+            &mut diagnostic_source,
+            request,
+            stream_chunk_bytes,
+            chunk_tx,
+        );
+        (result, diagnostic_source.phases())
+    };
+    let wall = wall_started.elapsed();
+    log_restore_read_diagnostics(
+        drive,
+        RestoreDiagnosticContext {
+            session_id,
+            tape_uuid: *tape_uuid,
+            block_size_bytes: block_size_u32,
+            success: result.is_ok(),
+        },
+        phases,
+        result.as_ref().copied().unwrap_or_default(),
+        wall,
+    );
+    result.map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4075,20 +4309,26 @@ fn stream_file_range_from_source(
     request: crate::read_core::PlaintextFileRangeReadRequest,
     stream_chunk_bytes: u32,
     chunk_tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
-) -> Result<(), Status> {
+) -> Result<StagedReadRelayDiagnostics, Status> {
     // Ranged reads are opaque stored-payload reads. The daemon does not decrypt
     // or hold key material; clients interpret or decrypt the returned bytes.
-    stream_with_staged_read_sender(chunk_tx, stream_chunk_bytes, |writer| {
+    stream_with_staged_read_sender_diagnostics(chunk_tx, stream_chunk_bytes, |writer| {
         crate::read_core::read_plaintext_file_range(source, request, writer)
             .map_err(status_from_file_range_error)
     })
 }
 
-fn stream_with_staged_read_sender(
+#[derive(Clone, Copy, Debug, Default)]
+struct StagedReadRelayDiagnostics {
+    client_write: StdDuration,
+    bytes: u64,
+}
+
+fn stream_with_staged_read_sender_diagnostics(
     chunk_tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
     stream_chunk_bytes: u32,
     produce: impl FnOnce(&mut dyn std::io::Write) -> Result<(), Status>,
-) -> Result<(), Status> {
+) -> Result<StagedReadRelayDiagnostics, Status> {
     let (tx, rx) = std_mpsc::sync_channel(STAGED_READ_CHANNEL_DEPTH);
     let poison = Arc::new(Mutex::new(None::<String>));
     std::thread::scope(|scope| {
@@ -4107,7 +4347,7 @@ fn stream_with_staged_read_sender(
             .join()
             .unwrap_or_else(|_| Err(Status::internal("staged read sender thread panicked")));
         match sender_result {
-            Ok(()) => produce_result,
+            Ok(diagnostics) => produce_result.map(|()| diagnostics),
             Err(status) => Err(status),
         }
     })
@@ -4193,22 +4433,31 @@ fn drain_staged_read_sender(
     chunk_tx: mpsc::Sender<Result<pb::BytesChunk, Status>>,
     stream_chunk_bytes: u32,
     poison: Arc<Mutex<Option<String>>>,
-) -> Result<(), Status> {
+) -> Result<StagedReadRelayDiagnostics, Status> {
     let mut writer = Some(if stream_chunk_bytes == 0 {
         crate::read_core::ChannelWriter::new(chunk_tx)
     } else {
         crate::read_core::ChannelWriter::with_chunk_size(chunk_tx, stream_chunk_bytes as usize)
     });
     let mut first_error = None;
+    let mut diagnostics = StagedReadRelayDiagnostics::default();
     while let Ok(item) = rx.recv() {
         if first_error.is_some() {
             continue;
         }
+        let client_started = Instant::now();
         let result = match item {
             StagedReadItem::Data(bytes) => match writer.as_mut() {
-                Some(writer) => writer
-                    .write_all(&bytes)
-                    .map_err(|err| Status::internal(format!("send read stream: {err}"))),
+                Some(writer) => {
+                    let bytes_len = bytes.len() as u64;
+                    let result = writer
+                        .write_all(&bytes)
+                        .map_err(|err| Status::internal(format!("send read stream: {err}")));
+                    if result.is_ok() {
+                        diagnostics.bytes = diagnostics.bytes.saturating_add(bytes_len);
+                    }
+                    result
+                }
                 None => Err(Status::internal("staged read data after finish")),
             },
             StagedReadItem::Finish => match writer.take() {
@@ -4218,6 +4467,7 @@ fn drain_staged_read_sender(
                 None => Ok(()),
             },
         };
+        diagnostics.client_write += client_started.elapsed();
         if let Err(status) = result {
             set_staged_read_poison(&poison, status.message());
             first_error = Some(status);
@@ -4225,7 +4475,7 @@ fn drain_staged_read_sender(
     }
     match first_error {
         Some(status) => Err(status),
-        None => Ok(()),
+        None => Ok(diagnostics),
     }
 }
 
@@ -4404,6 +4654,23 @@ mod tests {
 
     const RANGE_OBJECT_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     const RANGE_TAPE_UUID: [u8; 16] = [0xAB; 16];
+
+    #[test]
+    fn restore_phase_decomposition_sums_to_wall_including_saturation() {
+        let wall = StdDuration::from_millis(100);
+        let position = StdDuration::from_millis(20);
+        let transfer = StdDuration::from_millis(65);
+        let relay = exclusive_restore_relay_phase(wall, position, transfer);
+        assert_eq!(relay, StdDuration::from_millis(15));
+        assert_eq!(position + transfer + relay, wall);
+
+        let saturated = exclusive_restore_relay_phase(
+            StdDuration::from_millis(5),
+            StdDuration::from_millis(4),
+            StdDuration::from_millis(4),
+        );
+        assert_eq!(saturated, StdDuration::ZERO);
+    }
 
     #[test]
     fn session_open_media_family_uses_lto9_barcode_suffix() {
@@ -5080,7 +5347,7 @@ mod tests {
     async fn l3_read_actor_batches_are_consumed_by_staged_sender() {
         let (tx, rx) = mpsc::channel(4);
 
-        stream_with_staged_read_sender(tx, 4, |writer| {
+        let diagnostics = stream_with_staged_read_sender_diagnostics(tx, 4, |writer| {
             std::io::Write::write_all(writer, b"abcdef")
                 .map_err(|err| Status::internal(format!("write staged bytes: {err}")))?;
             std::io::Write::write_all(writer, b"gh")
@@ -5088,6 +5355,7 @@ mod tests {
             Ok(())
         })
         .expect("staged read sender succeeds");
+        assert_eq!(diagnostics.bytes, 8);
 
         let bytes = collect_stream_chunks(rx)
             .await
@@ -5100,7 +5368,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
 
-        let err = stream_with_staged_read_sender(tx, 1, |writer| {
+        let err = stream_with_staged_read_sender_diagnostics(tx, 1, |writer| {
             for _ in 0..8 {
                 std::io::Write::write_all(writer, b"x").map_err(|err| {
                     Status::internal(format!("actor observed staged sender failure: {err}"))
@@ -5280,6 +5548,29 @@ mod tests {
         };
         assert!(!path.exists());
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn process_loss_without_drop_leaves_owned_spool_for_startup_reconciliation() {
+        let dir = std::env::temp_dir().join(format!(
+            "remanence-spool-process-loss-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create spool test dir");
+        let mut spool = Spool::create(&dir, 16).expect("create spool");
+        spool.write_chunk(b"orphan").expect("write orphan bytes");
+        let path = spool.path().to_path_buf();
+
+        std::mem::forget(spool);
+
+        assert!(path.exists(), "process loss bypasses Spool::drop");
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("UTF-8 spool name");
+        assert!(name.starts_with("spool-") && name.ends_with(".bin"));
+        std::fs::remove_file(path).expect("remove simulated orphan");
+        std::fs::remove_dir(dir).expect("remove spool test dir");
     }
 
     #[test]

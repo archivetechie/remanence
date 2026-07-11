@@ -99,6 +99,7 @@ main() {
     fieldtest_evidence_record "$SCRIPT_NAME" read FAIL "daemon read failed for read benchmark" "$workdir/read.json"
     exit 1
   fi
+  fieldtest_capture_tape_io_mode "$SCRIPT_NAME" sustained restore_total
   end="$(python3 -c 'import time; print(f"{time.monotonic():.9f}")')"
   bytes="$(stat -c '%s' "$restored")"
   seconds="$(python3 - "$start" "$end" <<'PY'

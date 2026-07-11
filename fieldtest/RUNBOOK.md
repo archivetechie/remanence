@@ -60,6 +60,17 @@ source anywhere else. If sudo policy prefers a separate mountpoint, mount
 tmpfs at `~/remfield/ram` and symlink `~/remfield/spool` to it before
 `03-bringup.sh`; dangling spool symlinks are startup errors by design.
 
+**DL385 dual-drive RAM gate (mandatory):** before starting the daemon, record
+`MemAvailable`, the tmpfs size/free bytes, the largest object used by either
+concurrent leg, configured ring depth, effective batch bytes, and drive count.
+The admitted budget must cover `2 × largest_object + ring_depth ×
+effective_batch_bytes × 2 drives + OS headroom`. The daemon's acknowledged
+`spool_tmpfs_ram_budget` must fit inside that amount and tmpfs free capacity.
+If it does not, reduce object size/concurrency or enlarge the mount; do not let
+swap or the root disk turn this into a tape benchmark. Startup removes and
+evidences owned `spool-<uuid>.bin` crash orphans before re-accounting this
+budget; any reconciliation failure prevents writes from being accepted.
+
 ### Host I/O setup for batched tape commands
 
 Before Phase 2, raise and verify the SCSI generic single-I/O ceiling. The
@@ -167,22 +178,33 @@ evidence; catalog errors → capture `evidence/` + daemon log, then
 
 | Step | Script | Measures |
 |---|---|---|
-| 2.1 | `20-bench-write.sh` | sustained write MB/s per drive; incompressible AND compressible payloads (tape hardware compresses — both numbers matter for honest capacity planning). For the post-TIO validation run, set `FIELD_BENCH_BATCH_SWEEP=1` to sweep batches `{8,16,32,64}`; the script restarts the daemon between batch sizes and restores the original config at the end. |
-| 2.2 | `21-bench-read.sh` | sustained read MB/s; locate/seek time; **ranged-read time-to-first-byte** (the newsroom-restore number) |
-| 2.3 | `22-bench-dual.sh` | BOTH drives concurrently — aggregate throughput; proves the multidrive architecture on real hardware |
+| 2.1 | `20-bench-write.sh` | acceptance leg 1: single-drive sustained write and p95 submit-gap gate; incompressible AND compressible payloads. The bench prints and records effective mode, effective batch, and gRPC receive→spool feed rate. |
+| 2.2 | `21-bench-read.sh` | acceptance leg 4: sustained read plus complete `restore_total` decomposition (locate/position, transfer, relay, cadence/ioctl histograms, batch effectiveness, bytes/records); ranged-read time-to-first-byte follows. |
+| 2.3 | `22-bench-dual.sh` | acceptance leg 2: BOTH drives concurrently, one restore + one append through the E208e/smartpqi ring. The script readiness-conditions both drives first (kit defect #9 pre-warm/resume-wait), then records per-leg and aggregate rates. This is the HBA purchase-decision leg. |
+| 2.3a | repeat `20-bench-write.sh` once with 1 MiB and once with 4 MiB `max_sectors_kb`/sg grant | acceptance leg 3: determines whether the larger grant is useful margin. Record sysfs before/after and the effective batch printed by the bench. |
+| 2.3b | `20-bench-write.sh` output/evidence | acceptance leg 5: capture the `receive_feed_rate_mib_s` gRPC-receive→spool counter in the same window for A7 sizing. |
 | 2.5 | `20-bench-write.sh --source <zfs-mount-path>` | the "current production storage path" INFO line: archive real video files directly from the ZFS/QSAN mount (see storage tiers) — labeled degraded-source, NOT a remanence number |
 | 2.6 | `11-happy-path.sh --source <tmpfs-video-subset>` | realism pass: real broadcast video files through archive→restore→SHA-256 + ranged reads (the partial-file-restore story) |
 | 2.4 | (automatic) | `rem top --once --json` sampled every 5 s during every benchmark → live MB/s evidence + a demo screenshot moment: run `rem top` in a spare tmux window and watch |
 
-Acceptance is split by spool placement. With a root-disk spool, sustained
-single-drive write must be ≥200 MB/s (≈191 MiB/s), expected near the spool-read
-ceiling. With tmpfs spool, target 250–300 MB/s (≈238–286 MiB/s) write and
-≥250 MB/s read. In both cases the write diagnostics must show
-`effective_batch_blocks = 16` unless the batch sweep is intentionally testing
-another value, and `position_calls` should be only boundary/tripwire reads.
-Dual-drive aggregate target remains ≥500 MB/s. If numbers land far below, the
-script's diagnostics distinguish source-disk starvation vs tape-path problems
-(it records both disk and tape rates).
+TIO-5 acceptance requires tmpfs; root-disk numbers are informational only.
+Leg 1 passes at p95 submit gap ≤500 µs and sustained pure transfer ≥280 MB/s
+with the 1 MiB grant. Leg 2 should approach twice the measured single-drive
+rate, with per-drive cadence retained. For leg 3, run and evidence:
+
+```bash
+echo 1024 | sudo tee /sys/module/sg/parameters/max_sectors_kb
+./scripts/20-bench-write.sh
+echo 4096 | sudo tee /sys/module/sg/parameters/max_sectors_kb
+./scripts/20-bench-write.sh
+```
+
+Use the equivalent sg parameter name exposed by the host. Each bench must
+print `effective_mode=fixed_pipelined`, `effective_batch_blocks=...`, and (for
+writes) `receive_feed_rate_mib_s=...`; absence is a failed leg, not a skipped
+counter. Leg 4 accepts decomposition, not a promised read-rate improvement:
+`phase_sum_ms` must approximately equal `wall_ms`, and cadence/ioctl samples
+must be populated for a multi-command restore.
 
 **If short on time and you have 2+ scratch tapes:** run 2.1 and 2.3 only — one-drive write + dual
 aggregate are the two numbers management will remember.

@@ -1789,6 +1789,7 @@ where
     tracing::info!(
         target: "remanence_write_diag",
         phase = "staging_ring_open",
+        effective_mode = "fixed_pipelined",
         staging_ring_buffers = ring_buffers,
         effective_batch_blocks = caps.batch_blocks,
         block_size_bytes = block_size,
