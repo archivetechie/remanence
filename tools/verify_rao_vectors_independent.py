@@ -1610,6 +1610,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="regenerate the additional RAO 13.1 plaintext fixture JSON files",
     )
+    parser.add_argument(
+        "--export-directory",
+        type=pathlib.Path,
+        help="write the regenerated positive object byte streams to this directory",
+    )
     return parser.parse_args(argv)
 
 
@@ -1686,6 +1691,25 @@ def main(argv: list[str] | None = None) -> int:
         check_positive_plaintext_fixture(filename, vector_id, options, files)
         for filename, vector_id, options, files in positive_plaintext_vector_definitions()
     ]
+
+    if args.export_directory is not None:
+        export_directory = args.export_directory
+        export_directory.mkdir(parents=True, exist_ok=True)
+        exports = {
+            "rao-tv-p1.rao": p1_plaintext,
+            "rao-tv-e1.rao": e1_actual["stored"],
+            "rao-tv-d1-plaintext.rao": d1_plaintext,
+            "rao-tv-d1-encrypted.rao": d1_actual["stored"],
+        }
+        exports.update(
+            {
+                f"{vector.vector_id.lower()}.rao": vector.plaintext
+                for vector in extra_plaintext_vectors
+            }
+        )
+        for filename, payload in sorted(exports.items()):
+            (export_directory / filename).write_bytes(payload)
+        print(f"exported {len(exports)} positive RAO byte streams to {export_directory}")
 
     if args.check_plaintext_interop:
         check_plaintext_interop(

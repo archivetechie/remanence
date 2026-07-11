@@ -78,14 +78,78 @@ pub fn acquire_filemark_map(
             "authoritative bootstrap does not carry a filemark-map digest",
         ));
     };
-    let reconstructed = scan_reconstruct_filemark_map(
+    let reconstructed = scan_reconstruct_filemark_map_with_provenance(
         source,
         &authoritative_bootstrap.tape_uuid,
         authoritative_bootstrap.block_size_bytes,
     )?;
+    match validate_scan_hypothesis(
+        source,
+        reconstructed.map.clone(),
+        authoritative_bootstrap,
+        digest,
+    ) {
+        Ok(scoped) => Ok(scoped),
+        Err(original_error) => {
+            for tape_file_number in reconstructed.unreadable_one_block_objects {
+                let hypothesis = retype_object_as_bootstrap(&reconstructed.map, tape_file_number)?;
+                if let Ok(scoped) =
+                    validate_scan_hypothesis(source, hypothesis, authoritative_bootstrap, digest)
+                {
+                    return Ok(scoped);
+                }
+            }
+            Err(original_error)
+        }
+    }
+}
+
+fn validate_scan_hypothesis(
+    source: &mut dyn RawTapeSource,
+    reconstructed: FilemarkMap,
+    authoritative_bootstrap: &BootstrapPayload,
+    digest: &crate::filemark_map::FilemarkMapDigest,
+) -> Result<ScopedFilemarkMap, ParityError> {
     let reconstructed =
         apply_authoritative_directory_overlay(source, reconstructed, authoritative_bootstrap)?;
     ScopedFilemarkMap::validate_against_digest(reconstructed, digest)
+}
+
+fn retype_object_as_bootstrap(
+    map: &FilemarkMap,
+    tape_file_number: u32,
+) -> Result<FilemarkMap, ParityError> {
+    let mut next_object_ordinal = 0u64;
+    let mut entries = Vec::with_capacity(map.entries().len());
+    let mut found_candidate = false;
+    for entry in map.entries() {
+        if entry.tape_file_number == tape_file_number {
+            if entry.kind != TapeFileKind::Object || entry.block_count != 1 {
+                return Err(filemark_scan_error(format!(
+                    "bootstrap re-typing candidate {tape_file_number} is not a one-block object"
+                )));
+            }
+            found_candidate = true;
+            entries.push(TapeFileMapEntry::bootstrap(tape_file_number, 1));
+        } else if entry.kind == TapeFileKind::Object {
+            entries.push(TapeFileMapEntry::object(
+                entry.tape_file_number,
+                entry.block_count,
+                next_object_ordinal,
+            ));
+            next_object_ordinal = next_object_ordinal
+                .checked_add(entry.block_count)
+                .ok_or_else(|| filemark_scan_error("bootstrap re-typing ordinals overflow"))?;
+        } else {
+            entries.push(entry.clone());
+        }
+    }
+    if !found_candidate {
+        return Err(filemark_scan_error(format!(
+            "bootstrap re-typing candidate {tape_file_number} is absent from the scanned map"
+        )));
+    }
+    FilemarkMap::new(entries)
 }
 
 /// Reconstruct a structural filemark map by scanning the tape file by file.
@@ -101,6 +165,20 @@ pub fn scan_reconstruct_filemark_map(
     tape_uuid: &[u8; 16],
     block_size: u32,
 ) -> Result<FilemarkMap, ParityError> {
+    Ok(scan_reconstruct_filemark_map_with_provenance(source, tape_uuid, block_size)?.map)
+}
+
+#[derive(Debug)]
+struct ScanReconstruction {
+    map: FilemarkMap,
+    unreadable_one_block_objects: Vec<u32>,
+}
+
+fn scan_reconstruct_filemark_map_with_provenance(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+) -> Result<ScanReconstruction, ParityError> {
     if block_size == 0 {
         return Err(ParityError::Invariant("scan block size is zero"));
     }
@@ -113,6 +191,7 @@ pub fn scan_reconstruct_filemark_map(
     let mut builder = FilemarkMapBuilder::new();
     let mut buf = vec![0u8; block_size_usize];
     let mut saw_file = false;
+    let mut unreadable_one_block_objects = Vec::new();
 
     loop {
         let file_start = source.position()?;
@@ -148,7 +227,8 @@ pub fn scan_reconstruct_filemark_map(
             Err(_err) => {
                 source.locate_physical(file_start)?;
                 let measured = measure_current_file(source, file_start)?;
-                append_entry_with_unreadable_head(
+                let tape_file_number = builder.next_tape_file_number()?;
+                let classified_as_object = append_entry_with_unreadable_head(
                     source,
                     &mut builder,
                     tape_uuid,
@@ -156,6 +236,9 @@ pub fn scan_reconstruct_filemark_map(
                     file_start,
                     measured.block_count,
                 )?;
+                if measured.block_count == 1 && classified_as_object {
+                    unreadable_one_block_objects.push(tape_file_number);
+                }
                 source.locate_physical(measured.position_after)?;
                 saw_file = true;
             }
@@ -166,7 +249,10 @@ pub fn scan_reconstruct_filemark_map(
         return Err(filemark_scan_error("scan found no tape files"));
     }
 
-    builder.build()
+    Ok(ScanReconstruction {
+        map: builder.build()?,
+        unreadable_one_block_objects,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -315,7 +401,7 @@ fn append_entry_with_unreadable_head(
     block_size: u32,
     file_start: PhysicalPositionHint,
     block_count: u64,
-) -> Result<(), ParityError> {
+) -> Result<bool, ParityError> {
     if let Some(header) =
         classify_sidecar_from_footer_tail(source, file_start, tape_uuid, block_size, block_count)?
     {
@@ -325,10 +411,11 @@ fn append_entry_with_unreadable_head(
             header.protected_ordinal_start,
             header.protected_ordinal_end_exclusive,
         )?;
+        Ok(false)
     } else {
         builder.push_object(block_count)?;
+        Ok(true)
     }
-    Ok(())
 }
 
 fn classify_sidecar_from_footer_tail(
@@ -2538,6 +2625,40 @@ mod tests {
         let err =
             ScopedFilemarkMap::validate_against_digest(reconstructed, &final_digest).unwrap_err();
         assert!(matches!(err, ParityError::FilemarkMapDigestMismatch));
+    }
+
+    #[test]
+    fn acquire_filemark_map_does_not_retype_readable_corrupt_bootstrap() {
+        let (records, expected_map) = fixture_records(true, false);
+        let final_payload = bootstrap_payload(expected_map.digest(true).unwrap(), 1);
+        let mut source = RecordingRawSource::new(records);
+
+        let err = acquire_filemark_map(&mut source, &final_payload, None)
+            .expect_err("readable corrupt bootstrap is not eligible for re-typing");
+
+        assert!(matches!(err, ParityError::FilemarkMapDigestMismatch));
+    }
+
+    #[test]
+    fn acquire_filemark_map_retypes_unreadable_checkpoint_bootstrap() {
+        let (mut records, expected_map, checkpoint_tape_file) =
+            fixture_records_with_intermediate_bootstrap();
+        let checkpoint_position = expected_map
+            .physical_position(TapeFilePosition {
+                tape_file_number: checkpoint_tape_file,
+                block_within_file: 0,
+            })
+            .expect("checkpoint position resolves");
+        records[checkpoint_position.lba as usize] = Record::Unreadable;
+        let final_payload = bootstrap_payload(expected_map.digest(true).unwrap(), 2);
+        let mut source = RecordingRawSource::new(records);
+
+        let scoped = acquire_filemark_map(&mut source, &final_payload, None)
+            .expect("unreadable checkpoint is re-typed from the authoritative digest");
+
+        assert_eq!(scoped.map, expected_map);
+        assert_eq!(scoped.validated_prefix_tape_files, None);
+        assert_eq!(scoped.scope.watermark(), 4);
     }
 
     #[test]

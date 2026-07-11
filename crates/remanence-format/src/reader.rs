@@ -37,6 +37,13 @@ pub struct RemTarDigestMismatch {
     pub actual: String,
 }
 
+/// Non-fatal conformance issue reported by a restore-mode RAO reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemTarReadWarning {
+    /// Tar EOF was reached without the required final manifest entry.
+    MissingManifest,
+}
+
 /// One entry recovered from a `rao-v1` object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemTarReadEntry {
@@ -108,6 +115,8 @@ pub struct RemTarStreamReport {
     pub manifest_cbor: Option<Vec<u8>>,
     /// File digest mismatches observed in [`ReadMode::Salvage`].
     pub digest_mismatches: Vec<RemTarDigestMismatch>,
+    /// Non-fatal conformance issues observed in restore mode.
+    pub warnings: Vec<RemTarReadWarning>,
 }
 
 /// Parsed `rao-v1` object archive.
@@ -121,6 +130,8 @@ pub struct RemTarReadObject {
     pub manifest_cbor: Option<Vec<u8>>,
     /// File digest mismatches observed in [`ReadMode::Salvage`].
     pub digest_mismatches: Vec<RemTarDigestMismatch>,
+    /// Non-fatal conformance issues observed in restore mode.
+    pub warnings: Vec<RemTarReadWarning>,
 }
 
 /// Parsed encrypted RAO object and authenticated envelope report.
@@ -582,12 +593,14 @@ where
     if let Some(manifest) = &manifest_cbor {
         hydrate_stream_entry_xattrs(&mut entries, manifest)?;
     }
+    let warnings = reader_warnings(mode, manifest_cbor.is_some());
 
     Ok(RemTarStreamReport {
         global_pax,
         entries,
         manifest_cbor,
         digest_mismatches,
+        warnings,
     })
 }
 
@@ -736,12 +749,22 @@ fn parse_rem_tar_bytes_with_mode_and_manifest_anchor(
     if let Some(manifest) = &manifest_cbor {
         hydrate_read_entry_xattrs(&mut entries, manifest)?;
     }
+    let warnings = reader_warnings(mode, manifest_cbor.is_some());
     Ok(RemTarReadObject {
         global_pax,
         entries,
         manifest_cbor,
         digest_mismatches,
+        warnings,
     })
+}
+
+fn reader_warnings(mode: ReadMode, has_manifest: bool) -> Vec<RemTarReadWarning> {
+    if mode == ReadMode::Restore && !has_manifest {
+        vec![RemTarReadWarning::MissingManifest]
+    } else {
+        Vec::new()
+    }
 }
 
 fn read_object_bytes<S: BlockSource + ?Sized>(
@@ -1569,6 +1592,44 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    #[test]
+    fn restore_readers_report_missing_manifest() {
+        let opts = options(4096);
+        let files = [RemTarFile {
+            path: "a.txt",
+            file_id: "file-a",
+            data: b"hello",
+            mtime: None,
+            executable: Some(false),
+        }];
+        let mut sink = VecBlockSink::new();
+        let layout = write_rem_tar_object(&mut sink, &opts, &files).unwrap();
+        let mut bytes = sink.blocks.into_iter().flatten().collect::<Vec<_>>();
+        bytes[layout.manifest.pax_header_offset as usize..].fill(0);
+        let blocks = bytes
+            .chunks_exact(opts.chunk_size)
+            .map(Vec::from)
+            .collect::<Vec<_>>();
+
+        let mut source = VecBlockSource::new(blocks.clone());
+        let read = read_rem_tar_object(&mut source, opts.chunk_size, layout.projected_size_blocks)
+            .expect("restore-mode materializing reader reports rather than hides absence");
+        assert_eq!(read.manifest_cbor, None);
+        assert_eq!(read.warnings, vec![RemTarReadWarning::MissingManifest]);
+
+        let mut source = VecBlockSource::new(blocks);
+        let mut entries = CollectingEntrySink::default();
+        let report = stream_rem_tar_object(
+            &mut source,
+            opts.chunk_size,
+            layout.projected_size_blocks,
+            &mut entries,
+        )
+        .expect("restore-mode streaming reader reports rather than hides absence");
+        assert_eq!(report.manifest_cbor, None);
+        assert_eq!(report.warnings, vec![RemTarReadWarning::MissingManifest]);
     }
 
     #[test]
