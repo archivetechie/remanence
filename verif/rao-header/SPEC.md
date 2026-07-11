@@ -1,7 +1,8 @@
 # rao-header formal specification
 
 Target: `verif/rao-header/src/lib.rs`, a proof-facing extraction of the scalar
-RAO AEAD header layout in `crates/remanence-aead/src/header.rs`.
+RAO AEAD header layout in `crates/remanence-aead/src/header.rs` and canonical
+key-frame rules in `crates/remanence-aead/src/key_frame.rs`.
 
 The production header is a 128-byte byte array with a UTF-8 object id field and
 two 16-byte binary fields. This extraction models the fixed scalar checks and
@@ -67,6 +68,21 @@ over all 128 bytes and the object id string.
 The parser rejects mismatched frozen fields before accepting the header core:
 bad magic, bad header length, unsupported format version, invalid suite id,
 nonzero flags, and nonzero reserved bytes.
+
+## H6 — v1/v2 disjoint dispatch and v2 scalar round trip
+
+`v1_v2_dispatch_disjoint` proves that no format version can enter both parser
+branches. For a valid v2 envelope scalar header, including zero `key_id`, HPKE
+wrap suite 1, reserved-zero bytes, and `103 <= key_frame_len <= 4096`,
+`parse_serialize_v2_header_round_trip` proves the scalar round trip.
+
+## H7 — canonical key-frame round trip
+
+For a nonempty frame of at most eight slots with strictly increasing slot
+indexes and printable labels of at most 32 bytes,
+`parse_serialize_key_frame_round_trip` proves the abstract grammar round trip.
+Rust byte-exact vectors and the drift guard bind this abstract result to the
+`RAOK` framing and fixed-width epoch/enc/ciphertext fields.
 
 ## Trust anchor
 

@@ -6,8 +6,7 @@ use hpke::{
     aead::ChaCha20Poly1305, kdf::HkdfSha256, kem::X25519HkdfSha256, setup_receiver, setup_sender,
     Deserializable, Kem as _, OpModeR, OpModeS, Serializable,
 };
-use rand_chacha::ChaCha20Rng;
-use rand_core::SeedableRng;
+use rand_core::{CryptoRng, RngCore};
 use zeroize::Zeroize;
 
 use crate::error::{RaoAeadError, Result};
@@ -17,6 +16,61 @@ use crate::key_frame::{KeyFrame, RecipientSlot};
 type Kem = X25519HkdfSha256;
 type Kdf = HkdfSha256;
 type Aead = ChaCha20Poly1305;
+
+/// Single-use, zeroizing entropy source for one X25519 ephemeral key.
+struct EphemeralRng {
+    bytes: [u8; 32],
+    cursor: usize,
+}
+
+impl EphemeralRng {
+    fn from_os() -> Result<Self> {
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).map_err(|_| RaoAeadError::EntropyUnavailable)?;
+        Ok(Self { bytes, cursor: 0 })
+    }
+
+    #[cfg(test)]
+    fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self { bytes, cursor: 0 }
+    }
+}
+
+impl RngCore for EphemeralRng {
+    fn next_u32(&mut self) -> u32 {
+        let mut bytes = [0u8; 4];
+        self.fill_bytes(&mut bytes);
+        u32::from_le_bytes(bytes)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut bytes = [0u8; 8];
+        self.fill_bytes(&mut bytes);
+        u64::from_le_bytes(bytes)
+    }
+
+    fn fill_bytes(&mut self, destination: &mut [u8]) {
+        let end = self
+            .cursor
+            .checked_add(destination.len())
+            .expect("ephemeral RNG cursor overflow");
+        assert!(
+            end <= self.bytes.len(),
+            "HPKE suite requested more than its pinned 32-byte X25519 IKM"
+        );
+        destination.copy_from_slice(&self.bytes[self.cursor..end]);
+        self.cursor = end;
+    }
+}
+
+impl CryptoRng for EphemeralRng {}
+
+impl Drop for EphemeralRng {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+        self.cursor = 0;
+    }
+}
 
 /// Frozen prefix in the fixed-width HPKE info transcript.
 pub const WRAP_INFO_PREFIX: &[u8; 12] = b"rao-wrap-v1\0";
@@ -68,6 +122,58 @@ pub struct RecipientPublicKey {
     pub epoch_label: String,
     /// Serialized X25519 public key.
     pub public_key: [u8; 32],
+}
+
+impl RecipientPublicKey {
+    /// Serialize the canonical public-recipient file (`RAOR`, slot, id, label, public key).
+    pub fn serialize(&self) -> Result<Vec<u8>> {
+        validate_label(&self.epoch_label)?;
+        <<Kem as hpke::Kem>::PublicKey as Deserializable>::from_bytes(&self.public_key)
+            .map_err(|_| RaoAeadError::HpkeFailed)?;
+        let mut out = Vec::with_capacity(54 + self.epoch_label.len());
+        out.extend_from_slice(b"RAOR");
+        out.push(self.slot_index);
+        out.extend_from_slice(&self.recipient_epoch_id);
+        out.push(self.epoch_label.len() as u8);
+        out.extend_from_slice(self.epoch_label.as_bytes());
+        out.extend_from_slice(&self.public_key);
+        Ok(out)
+    }
+
+    /// Parse a complete canonical public-recipient file.
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.get(..4) != Some(b"RAOR") || bytes.len() < 54 {
+            return Err(RaoAeadError::InvalidInput(
+                "invalid RAO recipient public-key file".to_string(),
+            ));
+        }
+        let slot_index = bytes[4];
+        let recipient_epoch_id = bytes[5..21].try_into().expect("fixed slice");
+        let label_len = bytes[21] as usize;
+        let expected = 54usize
+            .checked_add(label_len)
+            .ok_or(RaoAeadError::SizeOverflow)?;
+        if bytes.len() != expected {
+            return Err(RaoAeadError::InvalidInput(
+                "invalid RAO recipient public-key file length".to_string(),
+            ));
+        }
+        let epoch_label = std::str::from_utf8(&bytes[22..22 + label_len])
+            .map_err(|_| RaoAeadError::InvalidInput("invalid recipient label".to_string()))?
+            .to_string();
+        validate_label(&epoch_label)?;
+        let public_key: [u8; 32] = bytes[22 + label_len..]
+            .try_into()
+            .map_err(|_| RaoAeadError::HpkeFailed)?;
+        <<Kem as hpke::Kem>::PublicKey as Deserializable>::from_bytes(&public_key)
+            .map_err(|_| RaoAeadError::HpkeFailed)?;
+        Ok(Self {
+            slot_index,
+            recipient_epoch_id,
+            epoch_label,
+            public_key,
+        })
+    }
 }
 
 /// Secret recovery key plus its human-diagnosable epoch identity.
@@ -193,40 +299,45 @@ pub fn wrap_dek(
 ) -> Result<KeyFrame> {
     let mut slots = Vec::with_capacity(recipients.len());
     for recipient in recipients {
-        validate_label(&recipient.epoch_label)?;
-        let public =
-            <<Kem as hpke::Kem>::PublicKey as Deserializable>::from_bytes(&recipient.public_key)
-                .map_err(|_| RaoAeadError::HpkeFailed)?;
-        let mut seed = [0u8; 32];
-        getrandom::fill(&mut seed).map_err(|_| RaoAeadError::EntropyUnavailable)?;
-        let mut rng = ChaCha20Rng::from_seed(seed);
-        seed.zeroize();
-        let info = wrap_info(
-            object_id,
-            &recipient.recipient_epoch_id,
-            recipient.slot_index,
-        )?;
-        let (enc, mut context) =
-            setup_sender::<Aead, Kdf, Kem, _>(&OpModeS::Base, &public, &info, &mut rng)
-                .map_err(|_| RaoAeadError::HpkeFailed)?;
-        let ciphertext = context
-            .seal(dek.as_bytes(), &[])
-            .map_err(|_| RaoAeadError::HpkeFailed)?;
-        slots.push(RecipientSlot {
-            slot_index: recipient.slot_index,
-            recipient_epoch_id: recipient.recipient_epoch_id,
-            epoch_label: recipient.epoch_label.clone(),
-            enc: enc
-                .to_bytes()
-                .as_slice()
-                .try_into()
-                .map_err(|_| RaoAeadError::HpkeFailed)?,
-            ciphertext: ciphertext
-                .try_into()
-                .map_err(|_| RaoAeadError::HpkeFailed)?,
-        });
+        let mut rng = EphemeralRng::from_os()?;
+        slots.push(wrap_recipient(dek, object_id, recipient, &mut rng)?);
     }
     KeyFrame::new(slots)
+}
+
+fn wrap_recipient<R: CryptoRng + RngCore>(
+    dek: &DataEncryptionKey,
+    object_id: &str,
+    recipient: &RecipientPublicKey,
+    rng: &mut R,
+) -> Result<RecipientSlot> {
+    validate_label(&recipient.epoch_label)?;
+    let public =
+        <<Kem as hpke::Kem>::PublicKey as Deserializable>::from_bytes(&recipient.public_key)
+            .map_err(|_| RaoAeadError::HpkeFailed)?;
+    let info = wrap_info(
+        object_id,
+        &recipient.recipient_epoch_id,
+        recipient.slot_index,
+    )?;
+    let (enc, mut context) = setup_sender::<Aead, Kdf, Kem, _>(&OpModeS::Base, &public, &info, rng)
+        .map_err(|_| RaoAeadError::HpkeFailed)?;
+    let ciphertext = context
+        .seal(dek.as_bytes(), &[])
+        .map_err(|_| RaoAeadError::HpkeFailed)?;
+    Ok(RecipientSlot {
+        slot_index: recipient.slot_index,
+        recipient_epoch_id: recipient.recipient_epoch_id,
+        epoch_label: recipient.epoch_label.clone(),
+        enc: enc
+            .to_bytes()
+            .as_slice()
+            .try_into()
+            .map_err(|_| RaoAeadError::HpkeFailed)?,
+        ciphertext: ciphertext
+            .try_into()
+            .map_err(|_| RaoAeadError::HpkeFailed)?,
+    })
 }
 
 /// Unwrap the slot matching the supplied private-key epoch; never tries another mode.
@@ -270,6 +381,17 @@ fn validate_label(label: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn decode_hex(hex: &str) -> Vec<u8> {
+        assert_eq!(hex.len() % 2, 0);
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair).unwrap();
+                u8::from_str_radix(pair, 16).unwrap()
+            })
+            .collect()
+    }
+
     #[test]
     fn info_is_byte_exact_and_fixed_width() {
         let info = wrap_info("obj", &[0x44; 16], 7).unwrap();
@@ -291,6 +413,14 @@ mod tests {
     }
 
     #[test]
+    fn public_key_file_is_canonical() {
+        let private = RecipientPrivateKey::new([3; 16], "safe-2026", [7; 32]).unwrap();
+        let public = private.public_key(4).unwrap();
+        let bytes = public.serialize().unwrap();
+        assert_eq!(RecipientPublicKey::parse(&bytes).unwrap(), public);
+    }
+
+    #[test]
     fn wrap_round_trip_and_transplant_rejection() {
         let secret = RecipientPrivateKey::new([3; 16], "safe-2026", [7; 32]).unwrap();
         let public = secret.public_key(0).unwrap();
@@ -301,5 +431,55 @@ mod tests {
             &[9; 32]
         );
         assert!(unwrap_dek(&frame, "object-b", &secret).is_err());
+    }
+
+    #[test]
+    fn rfc_9180_appendix_a2_base_vector_opens() {
+        let private = <<Kem as hpke::Kem>::PrivateKey as Deserializable>::from_bytes(&decode_hex(
+            "8057991eef8f1f1af18f4a9491d16a1ce333f695d4db8e38da75975c4478e0fb",
+        ))
+        .unwrap();
+        let enc = <<Kem as hpke::Kem>::EncappedKey as Deserializable>::from_bytes(&decode_hex(
+            "1afa08d3dec047a643885163f1180476fa7ddb54c6a8029ea33f95796bf2ac4a",
+        ))
+        .unwrap();
+        let info = decode_hex("4f6465206f6e2061204772656369616e2055726e");
+        let aad = decode_hex("436f756e742d30");
+        let ciphertext = decode_hex(concat!(
+            "1c5250d8034ec2b784ba2cfd69dbdb8af406cfe3ff938e131f0def8c8b60b4db",
+            "21993c62ce81883d2dd1b51a28"
+        ));
+        let mut context =
+            setup_receiver::<Aead, Kdf, Kem>(&OpModeR::Base, &private, &enc, &info).unwrap();
+        assert_eq!(
+            context.open(&ciphertext, &aad).unwrap(),
+            b"Beauty is truth, truth beauty"
+        );
+    }
+
+    #[test]
+    fn rao_wrap_vector_is_byte_exact() {
+        let secret = RecipientPrivateKey::new([3; 16], "safe-2026", [7; 32]).unwrap();
+        let public = secret.public_key(0).unwrap();
+        let dek = DataEncryptionKey::from_bytes([9; 32]);
+        let mut rng = EphemeralRng::from_bytes([0x42; 32]);
+        let slot = wrap_recipient(&dek, "object-a", &public, &mut rng).unwrap();
+        assert_eq!(
+            slot.enc,
+            [
+                0xae, 0x3b, 0xf1, 0xcd, 0x87, 0xc2, 0xd2, 0xed, 0x25, 0xaf, 0x4a, 0x1a, 0x23, 0x9e,
+                0xed, 0x04, 0xa9, 0x90, 0xf0, 0x0e, 0x74, 0x03, 0xe4, 0xc8, 0x06, 0x59, 0x27, 0xde,
+                0x01, 0x0f, 0xd1, 0x7a,
+            ]
+        );
+        assert_eq!(
+            slot.ciphertext,
+            [
+                0xfd, 0x48, 0x22, 0x7f, 0x58, 0xc8, 0xa2, 0xb4, 0xac, 0x3e, 0xb0, 0xb2, 0x24, 0xb1,
+                0x18, 0x5e, 0x85, 0x8c, 0x7a, 0x46, 0x44, 0xf9, 0x6a, 0x70, 0x67, 0xd2, 0xc2, 0xd3,
+                0x2d, 0x1c, 0x67, 0xda, 0xd5, 0x73, 0xcb, 0xa8, 0xd9, 0x4b, 0x66, 0x8c, 0xa2, 0xab,
+                0x98, 0xb6, 0xca, 0x12, 0xa1, 0x8c,
+            ]
+        );
     }
 }

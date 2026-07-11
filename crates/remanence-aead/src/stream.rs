@@ -131,7 +131,7 @@ pub fn stored_size_from_parts_with_key_frame(
     let payload_len = payload_frame_len(plaintext_size, chunk_size)?;
     let footer_end = (RAO_HEADER_LEN as u64)
         .checked_add(u64::from(key_frame_len))
-        .checked_add(metadata_frame_len)
+        .and_then(|value| value.checked_add(metadata_frame_len))
         .and_then(|value| value.checked_add(payload_len))
         .and_then(|value| value.checked_add(RAO_FOOTER.len() as u64))
         .ok_or(RaoAeadError::SizeOverflow)?;
@@ -164,7 +164,7 @@ pub fn cipher_offset_with_key_frame(
         .ok_or(RaoAeadError::SizeOverflow)?;
     (RAO_HEADER_LEN as u64)
         .checked_add(u64::from(key_frame_len))
-        .checked_add(metadata_frame_len)
+        .and_then(|value| value.checked_add(metadata_frame_len))
         .and_then(|base| base.checked_add(b.checked_mul(stride)?))
         .ok_or(RaoAeadError::SizeOverflow)
 }

@@ -34,7 +34,7 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<InspectReport> {
         .map_err(|_| RaoAeadError::UnexpectedEof)?;
     let header = RaoHeader::parse(&header_bytes)?;
     let key_frame_len = u64::from(header.key_frame_len);
-    let key_frame = if header.format_version == 2 {
+    let key_frame = if header.format_version == 2 && header.key_frame_len != 0 {
         let end = RAO_HEADER_LEN
             .checked_add(header.key_frame_len as usize)
             .ok_or(RaoAeadError::SizeOverflow)?;
@@ -81,7 +81,7 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<InspectReport> {
         .ok_or(RaoAeadError::SizeOverflow)?;
     let footer_offset = (RAO_HEADER_LEN as u64)
         .checked_add(key_frame_len)
-        .checked_add(header.metadata_frame_len)
+        .and_then(|value| value.checked_add(header.metadata_frame_len))
         .and_then(|value| value.checked_add(chunk_count.checked_mul(stride)?))
         .ok_or(RaoAeadError::SizeOverflow)?;
     let expected_size = round_up(
@@ -141,5 +141,29 @@ mod tests {
         assert_eq!(inspected.chunk_count, 2);
         assert_eq!(inspected.plaintext_size, 1024);
         assert_eq!(inspected.stored_digest, report.stored_digest);
+    }
+
+    #[test]
+    fn inspect_accepts_reserved_v2_registry_geometry_without_key_frame() {
+        let header = RaoHeader {
+            format_version: 2,
+            chunk_size: 512,
+            key_id: [0x10; 16],
+            hkdf_salt: [0x20; 16],
+            metadata_frame_len: 17,
+            object_id: "registry-v2".to_string(),
+            wrap_suite: crate::WRAP_SUITE_REGISTRY,
+            key_frame_len: 0,
+        };
+        let mut object = header.serialize().unwrap().to_vec();
+        object.extend_from_slice(&[0u8; 17]);
+        object.extend_from_slice(&[0u8; 512 + 16]);
+        object.extend_from_slice(RAO_FOOTER);
+        object.resize(object.len().div_ceil(512) * 512, 0);
+
+        let report = inspect_bytes(&object).unwrap();
+        assert_eq!(report.header, header);
+        assert_eq!(report.key_frame, None);
+        assert_eq!(report.chunk_count, 1);
     }
 }
