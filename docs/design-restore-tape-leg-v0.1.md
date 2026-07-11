@@ -1,6 +1,8 @@
 # Design — RM3: restore tape leg (app-restart contract + per-drive arbitration + measured backpressure)
 
-**Status:** design, FOR PANEL REVIEW (Claude 2026-07-11). **RM3** of the restore-agent build — the
+**Status:** design v0.2 — panel folded (Claude 2026-07-12). **Build to §6 (the fold); §§3-5 below are
+the SUPERSEDED v0.1 where §6 corrects them.** Panel = Opus code-grounded (SOUND-WITH-FIXES, authoritative)
++ GLM prose (NEEDS-REWORK). Reconciliation in §6. **RM3** of the restore-agent build — the
 tape-specific pieces the disk-tier RM1/RM2 deferred. Spans **remanence** (the app-restart session
 contract, the per-drive arbitration surface, the ranged-ciphertext AEAD extract, the diag) +
 **sutradhara** (the arbitration consumer + the extract-stream timeout). Grounded in a file:line map of
@@ -137,3 +139,98 @@ N-member encrypted bundle O(object) not O(N×object) on tape.
 5. **Ranged-ciphertext reader variant (§3.5)** — adding a stream/reader API to `range.rs` without
    regressing its bounded/authenticated guarantees; the multi-member linear pass complexity vs N
    independent ranged opens (simpler, still O(covering-chunks) per member).
+
+---
+
+# 6. v0.2 PANEL FOLD (BINDING — build to this; §§3-5 superseded where corrected here)
+
+**Reconciliation.** Opus reviewed code-grounded (file:line-verified) → **SOUND-WITH-FIXES, no blockers**;
+GLM reviewed prose-only → NEEDS-REWORK (3 blockers). Per [[code-grounding-in-reviews]] the code-grounded
+lens is authoritative: **2 of GLM's 3 blockers are refuted or dissolved by the actual code**, but GLM
+independently **sharpened 3 real points** (tape identity, drive_uuid/bay desync, fail-fast grace) that
+Opus also raised — those are confirmed-by-two. Net: SOUND-WITH-FIXES stands; the fixes below are binding.
+(Scoreboard: GLM overstated blockers on the atomic-reservation and async-ripple axes that code inspection
+settled; its value was reinforcing 3 majors, not the blocker verdict.)
+
+## 6.1 Ground-truth correction (fixes §2 bullet 2)
+`remanence-aead/range.rs` `open_plaintext_range*` is **NOT unwired** — it IS wired to the BUFFERED
+`archive extract` path (`remanence-format/src/pfr.rs:85` → `remanence-cli/src/lib.rs:10114`, tested
+`lib.rs:18043`). The accurate, narrower claim: the **streaming `extract-stream` path** (`lib.rs:9321/
+9335/9348`) does not use it — it calls whole-object `open()` and trims plaintext OUTPUT only. This
+STRENGTHENS RM3.3: the ranged primitive is proven + shipped; RM3.3 is a new SURFACE on a tested core, not
+new crypto.
+
+## 6.2 App-restart resume token (corrects §3.1) — confirmed-by-two: bind tape identity
+The resume token persists **session-independent, durable** coordinates and re-opens COLD (no session_id
+is ever persisted — resume always mints a fresh session): `{tape_uuid, object_id, file_id,
+file_boundary_byte_offset, expected_position_lba, daemon_epoch}`.
+- **ADD `tape_uuid` (both reviewers).** `object_id` does not identify the mount target (`OpenReadSession`
+  takes a TapeTarget); a swapped/stale tape can present a matching physical LBA for the WRONG tape.
+  Resume MUST verify the mounted tape's identity (library barcode/uuid) BEFORE trusting the position
+  proof — physical-position continuity is necessary but not sufficient; tape-identity binding closes it.
+- **Resume granularity is FILE-BOUNDARY, never mid-file (resolves GLM Major 2).** RM1's `committed_index`
+  is per-file; a partially-received file re-streams from its START. So the per-file RAO SHA-256 is ALWAYS
+  computable on the agent (it never holds a half-file it can't hash) — the weaker position proof
+  (correctness-of-restart, not corruption-detection) is sound precisely because integrity lives at the
+  file layer and resume never lands mid-file. `file_boundary_byte_offset` is chunk/file aligned.
+- **Proof wire form:** reuse the proven WRITE-side precedent — `AppendCommitInfo.position_after_lba`
+  (`proto:613`, a `uint64` LBA); the write path already has `OpenWriteSessionRequest.recover_session_id`
+  (`proto:960-961`) + `APPEND_MODE_RESUME_CONTROL`. §3.1 is PORTING a shipped write-side resume pattern
+  to reads, not inventing one. `DevicePositionProof` is internal today (`read_core.rs:163`) — define its
+  serialized form via this encoding.
+
+## 6.3 Per-drive arbitration (corrects §3.2) — advisory surface + re-queue, keyed on bay
+- **Enforcement is ALREADY race-free** — the bay reservation is an atomic `compare_exchange`
+  (`write_owner.rs:239`). So the query surface can only ever be ADVISORY; **no atomic queue-and-open RPC
+  is needed** (refutes GLM Blocker 1) PROVIDED sutradhara treats a lost-race `FailedPrecondition`
+  (`write_owner.rs:2531`) as **"re-queue," never "fail."** State this explicitly — it is the entire
+  substance of GLM's TOCTOU concern and it costs one branch.
+- **Queue key = `(library_serial, bay)`, the enforcement unit — NOT `drive_uuid`** (confirmed-by-two).
+  `drive_uuid` is a point-in-time attribute of a bay (`mount.rs:761-767`) that can migrate across bays
+  when an operator swaps/retires a drive (`mount.rs:747-760`); keying the queue on it desyncs from
+  enforcement. Expose `drive_uuid` in the surface as an operator-legibility HINT only.
+
+## 6.4 Measured backpressure (refines §3.3) — stable structured diag, still log-scraped
+Keep the log-scraping acceptance harness (Opus: robust enough; a `GetReadSessionDiag` RPC would plumb
+hot-path-adjacent `ReservoirState` for no acceptance benefit). Address GLM's brittleness minor by pinning
+the close-line as a **stable structured JSON event** (versioned key set: `park_cycles`, `occupancy_bytes`,
+etc.) emitted ONLY at pipeline open/close (`read_core.rs:617-626/885-896` — off the per-block hot path);
+the harness contracts on the JSON, not on prose formatting. **Never add per-iteration diag to the drive
+actor loop** (that WOULD be a hot-path risk).
+
+## 6.5 extract-stream timeout (corrects §3.4) — PULL FIRST; two-phase, no proto change
+This is a CURRENT live-path availability bug (a cold LTO mount+locate >120 s false-kills every physical
+encrypted-tape leg) — **sequence it FIRST**, ahead of all RM3 remanence work (it is sutradhara-only).
+Fix = two clocks in `archive_restore.py`, **no proto change** (rejects the async `OperationRef` option →
+dissolves GLM Blocker 3's pump-thread ripple): a generous **mount-phase grace** (`mount_seek_grace_seconds`,
+set from MEASURED MSL3040 load+locate latencies) that runs until the backend session opens
+(`backend/remanence.py:344` returns after mount), then a separate **120 s streaming-phase inactivity**
+clock stamped on each `ReadObjectRange` chunk. **Fail-fast on an explicit library mount ERROR** (GLM
+minor) — do not wait out the grace on a dead tape / hardware fault.
+
+## 6.6 Ranged-ciphertext AEAD (corrects §3.5) — mapping stays in Rust; N ranged opens
+- **Keep the plaintext→ciphertext offset mapping in Rust** (`range.rs:117` `cipher_offset` + tag padding
+  — security-critical). Sutradhara passes the **plaintext** member range; Rust computes the covering
+  stored range. Adopt **option (c)**: a small remanence query returns the covering stored byte-range for
+  `(object_id, file_id, plaintext_start, len)`; sutradhara issues a bounded `ReadObjectRange(start,end)`
+  and pumps only that into a trimming reader/stream variant of `range.rs` (single source of truth, pure
+  filter, one extra round-trip). Do NOT reimplement the mapping in Python.
+- **N independent ranged opens (one per member) — sidesteps GLM Major 1.** Per-object opens keep each
+  `(chunk_index, final_chunk)` nonce unambiguous (no multi-object boundary demarcation problem). N ranged
+  opens ALREADY fix the O(N×object)→O(object) BYTE cost. **Defer** the single-stream multi-member linear
+  pass (a locate-COUNT optimization only, and exactly where the multi-object boundary ambiguity would
+  bite) until a physical leg proves locate overhead dominates.
+
+## 6.7 Corrected milestones + sequence (supersedes §4)
+1. **§6.5 extract-stream timeout fix** (sutradhara-only, no remanence change) — unblocks physical
+   encrypted-tape legs. FIRST.
+2. **RM3.1a — arbitration surface + bay-keyed queueing** (remanence advisory surface over the existing
+   atomic reservation + sutradhara `(library_serial,bay)` queue with re-queue-on-FailedPrecondition).
+   Lower risk, highest value (prevents the §8-B2 park-oscillation).
+3. **RM3.2 — structured diag + measured-backpressure harness** (§6.4).
+4. **RM3.3 — ranged-ciphertext AEAD extract** (§6.6, option c; N ranged opens).
+5. **RM3.1b — app-restart session contract** (§6.2; the hard durable-token + read-path resume-open +
+   proof wire form). LAST among correctness items — it has no consumer until the RM2 agent resume path
+   lands.
+6. **Physical acceptance:** MSL3040 leg — measured throughput + park behavior on a real 2-hop encrypted
+   tape restore.
