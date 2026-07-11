@@ -3585,6 +3585,10 @@ impl PublishedReseal {
 
 impl Drop for PublishedReseal {
     fn drop(&mut self) {
+        // Documented limitation: the still_owns_output() stat and remove_file are
+        // not atomic — a sub-ms TOCTOU exists if a concurrent actor unlinks and
+        // recreates --out in that window. Accepted under the single-operator
+        // reseal threat model, and strictly safer than an unconditional delete.
         if self.armed && self.still_owns_output() {
             let _ = fs::remove_file(&self.output);
         }
@@ -3807,8 +3811,10 @@ fn publish_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
         }
     }
 
-    // Portable fallback for kernels/filesystems without renameat2 support:
-    // hard_link is an atomic O_EXCL-style create, then unlink completes move.
+    // Portable fallback for kernels without renameat2 support (ENOSYS/EINVAL/
+    // EOPNOTSUPP). hard_link is an atomic O_EXCL-style create (fails EEXIST →
+    // no-replace preserved), then unlink completes the move. EXDEV cannot arise:
+    // the staging temp and destination are always co-located on one filesystem.
     fs::hard_link(source, destination)?;
     if let Err(error) = fs::remove_file(source) {
         let _ = fs::remove_file(destination);
