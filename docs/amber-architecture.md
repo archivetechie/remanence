@@ -1,5 +1,14 @@
 # Amber Architecture
 
+> **Historical reference only.** Amber/AOF1 was retired before publication or
+> deployment. Its useful AEAD construction was absorbed into Remanence's RAO
+> implementation; it is not a current workspace, CLI, service, or dependency.
+> For the current format and implementation boundary, read
+> [`rao-v1-specification.md`](rao-v1-specification.md) and
+> [`architecture-overview.md`](architecture-overview.md). The remainder of
+> this document is retained to explain the predecessor design and migration
+> decisions, not to describe the live code.
+
 This document describes how the Amber workspace is put together and records
 the reasoning behind its main design decisions, so future changes do not
 accidentally reverse them. The normative format definition lives in the
