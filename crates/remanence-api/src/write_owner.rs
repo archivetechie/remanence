@@ -41,7 +41,6 @@ use crate::{
 };
 
 pub(crate) const SPOOL_MAX_BYTES: u64 = crate::APPEND_SPOOL_MAX_BYTES;
-const STAGED_READ_CHANNEL_DEPTH: usize = 2;
 
 /// Robotics work to perform after the owner opens and refreshes the library.
 pub(crate) enum RoboticsAction {
@@ -447,6 +446,7 @@ pub(crate) struct WriteOwnerConfig {
     pub managed_library_serials: Arc<HashSet<String>>,
     pub cleaning: CleaningConfig,
     pub tape_io: TapeIoConfig,
+    pub io_memory: Arc<crate::io_memory::IoMemoryReservation>,
 }
 
 pub(crate) struct ExclusiveGuard {
@@ -2385,6 +2385,7 @@ fn handle_drive_open_read(
                     stream_one_object(
                         index,
                         drive,
+                        cfg,
                         session_id,
                         &tape_uuid,
                         object_id.as_str(),
@@ -2400,6 +2401,7 @@ fn handle_drive_open_read(
                             stream_one_file_range(
                                 index,
                                 drive,
+                                cfg,
                                 session_id,
                                 &tape_uuid,
                                 object_id.as_str(),
@@ -2432,6 +2434,7 @@ fn handle_drive_open_read(
                 if let Err(status) = stream_one_file_range(
                     index,
                     drive,
+                    cfg,
                     session_id,
                     &tape_uuid,
                     object_id.as_str(),
@@ -3976,6 +3979,16 @@ impl BlockSource for DiagnosticBlockSource<'_> {
         self.inner.read_ring_buffers()
     }
 
+    fn prove_read_position(
+        &mut self,
+        expected: TapePosition,
+    ) -> Result<remanence_library::DevicePositionProof, TapeIoError> {
+        let started = Instant::now();
+        let result = self.inner.prove_read_position(expected);
+        self.phases.position += started.elapsed();
+        result
+    }
+
     fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
         let started = Instant::now();
         let result = self.inner.locate(lba);
@@ -4005,11 +4018,13 @@ fn log_restore_read_diagnostics(
     relay_diagnostics: StagedReadRelayDiagnostics,
     wall: StdDuration,
 ) {
-    let relay = exclusive_restore_relay_phase(wall, phases.position, phases.transfer);
-    let phase_sum = phases
-        .position
-        .saturating_add(phases.transfer)
-        .saturating_add(relay);
+    let relay = relay_diagnostics.client_write;
+    let phase_sum = wall;
+    let bottleneck = if phases.transfer >= relay {
+        "drive"
+    } else {
+        "sender"
+    };
     let diagnostics = drive.pipelined_read_diagnostics();
     let effective_batch_blocks = drive.requested_read_batch_blocks().min(
         drive
@@ -4042,6 +4057,7 @@ fn log_restore_read_diagnostics(
         relay_ms = crate::diagnostics::duration_ms(relay),
         phase_sum_ms = crate::diagnostics::duration_ms(phase_sum),
         wall_ms = crate::diagnostics::duration_ms(wall),
+        bottleneck,
         drive_rate_mib_s = crate::diagnostics::mib_per_s(phases.bytes, phases.transfer),
         relay_rate_mib_s = crate::diagnostics::mib_per_s(phases.bytes, relay),
         client_write_ms = crate::diagnostics::duration_ms(relay_diagnostics.client_write),
@@ -4065,6 +4081,7 @@ fn log_restore_read_diagnostics(
     );
 }
 
+#[cfg(test)]
 fn exclusive_restore_relay_phase(
     wall: StdDuration,
     position: StdDuration,
@@ -4073,9 +4090,11 @@ fn exclusive_restore_relay_phase(
     wall.saturating_sub(position).saturating_sub(transfer)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stream_one_object(
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
+    cfg: &WriteOwnerConfig,
     session_id: Uuid,
     tape_uuid: &[u8; 16],
     object_id: &str,
@@ -4122,38 +4141,49 @@ fn stream_one_object(
     let block_size_usize = usize::try_from(block_size)
         .map_err(|_| Status::internal("tape block size does not fit usize"))?;
 
-    verify_loaded_tape_identity(drive, tape_uuid)?;
     let block_size_u32 = u32::try_from(block_size)
         .map_err(|_| Status::internal("tape block size does not fit u32"))?;
-    let current_cfg = drive
-        .read_config()
-        .map_err(|err| Status::internal(format!("read drive config: {err}")))?;
     drive
-        .write_config(fixed_no_compression_config(current_cfg, block_size_u32))
-        .map_err(|err| Status::internal(format!("set fixed-block config: {err}")))?;
+        .rewind()
+        .map_err(|err| Status::internal(format!("rewind before object read: {err}")))?;
 
     drive.reset_pipelined_diagnostics();
     let wall_started = Instant::now();
     let (result, phases) = {
         let mut source = DriveHandleSource(drive);
         let mut diagnostic_source = DiagnosticBlockSource::new(&mut source);
-        let result =
-            stream_with_staged_read_sender_diagnostics(chunk_tx, stream_chunk_bytes, |writer| {
+        let result = stream_with_staged_read_sender_diagnostics(
+            chunk_tx,
+            stream_chunk_bytes,
+            |writer, terminal| {
                 let mut sink = crate::read_core::CapturePayloadSink::new(writer);
-                crate::read_core::read_object_payload(
+                crate::read_core::read_object_payload_with_pipeline(
                     &mut diagnostic_source,
                     block_size_usize,
                     tape_file.block_count,
                     copy.tape_file_number,
                     manifest_sha256,
                     &mut sink,
+                    crate::read_core::ReadPipelineConfig {
+                        reservoir_bytes: cfg.tape_io.read_reservoir_bytes,
+                        high_pct: cfg.tape_io.read_reservoir_high_pct,
+                        low_pct: cfg.tape_io.read_reservoir_low_pct,
+                        ranged_frontier: false,
+                        proof_cadence_bytes: cfg
+                            .tape_io
+                            .position_check_bytes_ranged
+                            .min(cfg.tape_io.read_reservoir_bytes / 2),
+                        terminal: Some(terminal),
+                    },
+                    Arc::clone(&cfg.io_memory),
                 )
                 .map_err(|err| Status::internal(format!("read object: {err}")))?;
                 let (_payload_bytes, _digest) = sink
                     .finish()
                     .map_err(|err| Status::internal(format!("finish payload stream: {err}")))?;
                 Ok(())
-            });
+            },
+        );
         (result, diagnostic_source.phases())
     };
     let wall = wall_started.elapsed();
@@ -4176,6 +4206,7 @@ fn stream_one_object(
 fn stream_one_file_range(
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
+    cfg: &WriteOwnerConfig,
     session_id: Uuid,
     tape_uuid: &[u8; 16],
     object_id: &str,
@@ -4189,14 +4220,9 @@ fn stream_one_file_range(
         file_range_read_request(index, tape_uuid, object_id, file_id, start_byte, end_byte)?;
     let block_size_u32 = u32::try_from(request.block_size)
         .map_err(|_| Status::internal("tape block size does not fit u32"))?;
-
-    verify_loaded_tape_identity(drive, tape_uuid)?;
-    let current_cfg = drive
-        .read_config()
-        .map_err(|err| Status::internal(format!("read drive config: {err}")))?;
     drive
-        .write_config(fixed_no_compression_config(current_cfg, block_size_u32))
-        .map_err(|err| Status::internal(format!("set fixed-block config: {err}")))?;
+        .rewind()
+        .map_err(|err| Status::internal(format!("rewind before ranged read: {err}")))?;
 
     drive.reset_pipelined_diagnostics();
     let wall_started = Instant::now();
@@ -4208,6 +4234,8 @@ fn stream_one_file_range(
             request,
             stream_chunk_bytes,
             chunk_tx,
+            &cfg.tape_io,
+            Arc::clone(&cfg.io_memory),
         );
         (result, diagnostic_source.phases())
     };
@@ -4312,12 +4340,29 @@ fn stream_file_range_from_source(
     request: crate::read_core::PlaintextFileRangeReadRequest,
     stream_chunk_bytes: u32,
     chunk_tx: crate::read_core::ReadStreamSender,
+    tape_io: &TapeIoConfig,
+    io_memory: Arc<crate::io_memory::IoMemoryReservation>,
 ) -> Result<StagedReadRelayDiagnostics, Status> {
     // Ranged reads are opaque stored-payload reads. The daemon does not decrypt
     // or hold key material; clients interpret or decrypt the returned bytes.
-    stream_with_staged_read_sender_diagnostics(chunk_tx, stream_chunk_bytes, |writer| {
-        crate::read_core::read_plaintext_file_range(source, request, writer)
-            .map_err(status_from_file_range_error)
+    stream_with_staged_read_sender_diagnostics(chunk_tx, stream_chunk_bytes, |writer, terminal| {
+        crate::read_core::read_plaintext_file_range_with_pipeline(
+            source,
+            request,
+            writer,
+            crate::read_core::ReadPipelineConfig {
+                reservoir_bytes: tape_io.read_reservoir_bytes,
+                high_pct: tape_io.read_reservoir_high_pct,
+                low_pct: tape_io.read_reservoir_low_pct,
+                ranged_frontier: true,
+                proof_cadence_bytes: tape_io
+                    .position_check_bytes_ranged
+                    .min(tape_io.read_reservoir_bytes / 2),
+                terminal: Some(terminal),
+            },
+            io_memory,
+        )
+        .map_err(status_from_file_range_error)
     })
 }
 
@@ -4331,28 +4376,60 @@ struct StagedReadRelayDiagnostics {
 fn stream_with_staged_read_sender_diagnostics(
     chunk_tx: crate::read_core::ReadStreamSender,
     stream_chunk_bytes: u32,
-    produce: impl FnOnce(&mut dyn std::io::Write) -> Result<(), Status>,
+    produce: impl FnOnce(
+        &mut (dyn std::io::Write + Send),
+        Arc<crate::read_core::ReadTerminalAccumulator>,
+    ) -> Result<(), Status>,
 ) -> Result<StagedReadRelayDiagnostics, Status> {
-    let (tx, rx) = std_mpsc::sync_channel(STAGED_READ_CHANNEL_DEPTH);
+    let staged_capacity = crate::read_core::read_stream_channel_capacity(
+        usize::try_from(stream_chunk_bytes).unwrap_or(usize::MAX),
+    );
+    let (tx, rx) = std_mpsc::sync_channel(staged_capacity);
     let poison = Arc::new(Mutex::new(None::<String>));
+    let terminal = Arc::new(crate::read_core::ReadTerminalAccumulator::default());
     std::thread::scope(|scope| {
         let sender_poison = Arc::clone(&poison);
+        let sender_terminal = Arc::clone(&terminal);
         let sender = scope.spawn(move || {
-            drain_staged_read_sender(rx, chunk_tx, stream_chunk_bytes, sender_poison)
+            let result = drain_staged_read_sender(rx, chunk_tx, stream_chunk_bytes, sender_poison);
+            if let Err(status) = &result {
+                sender_terminal.record(
+                    crate::read_core::ReadTerminalPriority::Sender,
+                    status.clone(),
+                );
+            }
+            result
         });
-        let mut writer = StagedReadWriter::new(tx, Arc::clone(&poison));
-        let produce_result = produce(&mut writer).and_then(|()| {
+        let mut writer = StagedReadWriter::new(
+            tx,
+            Arc::clone(&poison),
+            usize::try_from(stream_chunk_bytes).unwrap_or(usize::MAX),
+        );
+        let produce_result = produce(&mut writer, Arc::clone(&terminal)).and_then(|()| {
             writer
                 .finish()
                 .map_err(|err| Status::internal(format!("finish read stream: {err}")))
         });
+        if let Err(status) = &produce_result {
+            terminal.record(
+                crate::read_core::ReadTerminalPriority::Decode,
+                status.clone(),
+            );
+        }
         drop(writer);
-        let sender_result = sender
-            .join()
-            .unwrap_or_else(|_| Err(Status::internal("staged read sender thread panicked")));
-        match sender_result {
-            Ok(diagnostics) => produce_result.map(|()| diagnostics),
-            Err(status) => Err(status),
+        let sender_result = sender.join().unwrap_or_else(|_| {
+            let status = Status::internal("staged read sender thread panicked");
+            terminal.record(
+                crate::read_core::ReadTerminalPriority::Sender,
+                status.clone(),
+            );
+            Err(status)
+        });
+        match (produce_result, sender_result) {
+            (Ok(()), Ok(diagnostics)) => Ok(diagnostics),
+            _ => Err(terminal.finalize_after_join().unwrap_or_else(|| {
+                Status::internal("read pipeline failed without terminal cause")
+            })),
         }
     })
 }
@@ -4366,14 +4443,20 @@ struct StagedReadWriter {
     tx: std_mpsc::SyncSender<StagedReadItem>,
     poison: Arc<Mutex<Option<String>>>,
     finished: bool,
+    max_chunk_bytes: usize,
 }
 
 impl StagedReadWriter {
-    fn new(tx: std_mpsc::SyncSender<StagedReadItem>, poison: Arc<Mutex<Option<String>>>) -> Self {
+    fn new(
+        tx: std_mpsc::SyncSender<StagedReadItem>,
+        poison: Arc<Mutex<Option<String>>>,
+        chunk_bytes: usize,
+    ) -> Self {
         Self {
             tx,
             poison,
             finished: false,
+            max_chunk_bytes: crate::read_core::effective_read_stream_chunk_bytes(chunk_bytes),
         }
     }
 
@@ -4418,11 +4501,16 @@ impl std::io::Write for StagedReadWriter {
             ));
         }
         self.check_poison()?;
-        self.tx
-            .send(StagedReadItem::Data(buf.to_vec()))
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "staged read sender stopped")
-            })?;
+        for chunk in buf.chunks(self.max_chunk_bytes) {
+            self.tx
+                .send(StagedReadItem::Data(chunk.to_vec()))
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "staged read sender stopped",
+                    )
+                })?;
+        }
         self.check_poison()?;
         Ok(buf.len())
     }
@@ -5205,7 +5293,16 @@ mod tests {
             managed_library_serials: Arc::new(HashSet::from([serial])),
             cleaning: remanence_state::CleaningConfig::default(),
             tape_io: remanence_state::TapeIoConfig::default(),
+            io_memory: crate::io_memory::IoMemoryReservation::new(
+                remanence_state::DEFAULT_IO_MEMORY_CEILING_BYTES,
+            )
+            .expect("test I/O memory manager"),
         }
+    }
+
+    fn test_io_memory() -> Arc<crate::io_memory::IoMemoryReservation> {
+        crate::io_memory::IoMemoryReservation::new(remanence_state::DEFAULT_IO_MEMORY_CEILING_BYTES)
+            .expect("test I/O memory manager")
     }
 
     fn library_snapshot_cell(library: Library) -> Arc<RwLock<Arc<crate::LibrarySnapshot>>> {
@@ -5357,7 +5454,7 @@ mod tests {
     async fn l3_read_actor_batches_are_consumed_by_staged_sender() {
         let (tx, rx) = crate::read_core::read_stream_channel(4);
 
-        let diagnostics = stream_with_staged_read_sender_diagnostics(tx, 4, |writer| {
+        let diagnostics = stream_with_staged_read_sender_diagnostics(tx, 4, |writer, _| {
             std::io::Write::write_all(writer, b"abcdef")
                 .map_err(|err| Status::internal(format!("write staged bytes: {err}")))?;
             std::io::Write::write_all(writer, b"gh")
@@ -5379,7 +5476,7 @@ mod tests {
             u32::try_from(crate::read_core::READ_STREAM_CHANNEL_BYTE_BUDGET + 1).unwrap();
         let (tx, rx) = crate::read_core::read_stream_channel(requested_chunk as usize);
         let sender = tokio::task::spawn_blocking(move || {
-            stream_with_staged_read_sender_diagnostics(tx, requested_chunk, |writer| {
+            stream_with_staged_read_sender_diagnostics(tx, requested_chunk, |writer, _| {
                 std::io::Write::write_all(writer, b"a")
                     .map_err(|err| Status::internal(format!("write first byte: {err}")))?;
                 std::io::Write::write_all(writer, b"b")
@@ -5409,7 +5506,7 @@ mod tests {
         let (tx, rx) = crate::read_core::read_stream_channel(1);
         drop(rx);
 
-        let err = stream_with_staged_read_sender_diagnostics(tx, 1, |writer| {
+        let err = stream_with_staged_read_sender_diagnostics(tx, 1, |writer, _| {
             for _ in 0..8 {
                 std::io::Write::write_all(writer, b"x").map_err(|err| {
                     Status::internal(format!("actor observed staged sender failure: {err}"))
@@ -5442,7 +5539,14 @@ mod tests {
         )?;
         let mut source = VecBlockSource::new(fixture.blocks.clone());
         let (tx, rx) = crate::read_core::read_stream_channel(256);
-        stream_file_range_from_source(&mut source, request, 0, tx)?;
+        stream_file_range_from_source(
+            &mut source,
+            request,
+            0,
+            tx,
+            &TapeIoConfig::default(),
+            test_io_memory(),
+        )?;
         collect_stream_chunks(rx).await
     }
 
@@ -5512,6 +5616,7 @@ mod tests {
             managed_library_serials: Arc::new(HashSet::from([library.serial.clone()])),
             cleaning: remanence_state::CleaningConfig::default(),
             tape_io: remanence_state::TapeIoConfig::default(),
+            io_memory: test_io_memory(),
         };
         let actor = spawn_changer_actor(changer, cfg);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -6422,8 +6527,15 @@ mod tests {
         .expect("request builder allows planner to catch arithmetic overflow");
         let mut source = VecBlockSource::new(fixture.blocks.clone());
         let (tx, _rx) = crate::read_core::read_stream_channel(8);
-        let overflow = stream_file_range_from_source(&mut source, overflow_request, 0, tx)
-            .expect_err("overflow must fail");
+        let overflow = stream_file_range_from_source(
+            &mut source,
+            overflow_request,
+            0,
+            tx,
+            &TapeIoConfig::default(),
+            test_io_memory(),
+        )
+        .expect_err("overflow must fail");
         assert_eq!(overflow.code(), tonic::Code::InvalidArgument);
 
         let reversed =

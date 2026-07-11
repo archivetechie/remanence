@@ -47,8 +47,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::handle::tape_io::{
-    PipelinedWriteDiagnostics, ReadBatchOutcome, ReadBufferHandoff, ReadHandoffOutcome, SpaceKind,
-    SpaceResult, TapeIoError, TapePosition, WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
+    DevicePositionProof, PipelinedWriteDiagnostics, ReadBatchOutcome, ReadBuffer,
+    ReadBufferHandoff, ReadHandoffOutcome, SpaceKind, SpaceResult, TapeIoError, TapePosition,
+    WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
 };
 #[cfg(test)]
 use crate::handle::tape_io::{ReadDelivery, SequencedHandoff};
@@ -299,7 +300,7 @@ pub trait BlockSource: BlockRead {
     /// returning `Err`; the buffer is then dropped by this safety funnel.
     fn read_buffer_handoff(
         &mut self,
-        mut buffer: Vec<u8>,
+        mut buffer: ReadBuffer,
         block_size_bytes: u32,
         requested_records: u32,
         remaining_records_in_file: u32,
@@ -310,9 +311,11 @@ pub trait BlockSource: BlockRead {
         let selected_bytes = (selected_records as usize)
             .checked_mul(block_size_bytes as usize)
             .ok_or_else(|| TapeIoError::OperationFailed("read handoff size overflow".into()))?;
-        buffer.resize(selected_bytes, 0);
+        buffer
+            .resize(selected_bytes)
+            .map_err(|message| TapeIoError::OperationFailed(message.to_string()))?;
         let outcome = self.read_block_batch(
-            &mut buffer,
+            buffer.as_mut_slice(),
             block_size_bytes,
             requested_records,
             remaining_records_in_file,
@@ -336,6 +339,21 @@ pub trait BlockSource: BlockRead {
     /// Number of owned buffers available to the read-side staging ring.
     fn read_ring_buffers(&self) -> u32 {
         crate::handle::MIN_TAPE_IO_STAGING_RING_BUFFERS
+    }
+
+    /// Re-prove that the drive is still at `expected` before resuming reads.
+    fn prove_read_position(
+        &mut self,
+        expected: TapePosition,
+    ) -> Result<DevicePositionProof, TapeIoError> {
+        let observed = self.position()?;
+        if observed.partition != expected.partition || observed.lba != expected.lba {
+            return Err(TapeIoError::OperationFailed(format!(
+                "read position drift: expected partition {} lba {}, observed partition {} lba {}",
+                expected.partition, expected.lba, observed.partition, observed.lba
+            )));
+        }
+        Ok(DevicePositionProof::from_device_position(observed))
     }
 
     /// LOCATE to the given LBA.
@@ -515,6 +533,13 @@ impl BlockSource for DriveHandleSource<'_> {
     }
     fn read_ring_buffers(&self) -> u32 {
         self.0.staging_ring_buffers()
+    }
+
+    fn prove_read_position(
+        &mut self,
+        expected: TapePosition,
+    ) -> Result<DevicePositionProof, TapeIoError> {
+        self.0.prove_read_position_pipelined(expected)
     }
     fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
         self.0.locate(lba)
@@ -1387,7 +1412,7 @@ mod tests {
         let buffer = vec![0xa5; 16];
 
         let outcome = source
-            .read_buffer_handoff(buffer, 4, 4, 4)
+            .read_buffer_handoff(buffer.into(), 4, 4, 4)
             .expect("short proven read handoff");
         assert_eq!(outcome.position_after.lba, 1);
         assert!(matches!(
@@ -1419,13 +1444,24 @@ mod tests {
     }
 
     #[test]
+    fn read_reservoir_buffer_is_page_aligned_and_never_reallocates_on_resize() {
+        let mut buffer = ReadBuffer::try_new_page_aligned(16 * 1024).expect("aligned slab");
+        let pointer = buffer.as_slice().as_ptr();
+        assert!(buffer.is_page_aligned());
+        buffer.resize(17).expect("shrink");
+        assert_eq!(buffer.as_slice().as_ptr(), pointer);
+        buffer.resize(16 * 1024).expect("restore full capacity");
+        assert_eq!(buffer.as_slice().as_ptr(), pointer);
+    }
+
+    #[test]
     fn fail_closed_read_outcome_withholds_the_typed_handoff() {
         let mut source = ShortRecoveredSource {
             fail_closed: true,
             device_evidence: false,
         };
 
-        let result = source.read_buffer_handoff(vec![0xa5; 16], 4, 4, 4);
+        let result = source.read_buffer_handoff(vec![0xa5; 16].into(), 4, 4, 4);
 
         assert!(matches!(result, Err(TapeIoError::OperationFailed(_))));
     }

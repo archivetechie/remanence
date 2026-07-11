@@ -1707,6 +1707,7 @@ name = "remanence-library"
 version = "0.0.1"
 dependencies = [
  "futures-util",
+ "libc",
  "remanence-scsi",
  "tempfile",
  "thiserror 1.0.69",

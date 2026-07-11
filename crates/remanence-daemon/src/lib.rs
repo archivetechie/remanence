@@ -8,6 +8,7 @@ use std::future::Future;
 use std::io;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::Path;
+use std::time::Duration;
 
 use remanence_api::{pb, ApiState};
 #[cfg(unix)]
@@ -23,17 +24,23 @@ pub use tls::{load_server_tls, TlsConfigError, TlsListener};
 
 const H2_INITIAL_STREAM_WINDOW_BYTES: u32 = 4 * 1024 * 1024;
 const H2_INITIAL_CONNECTION_WINDOW_BYTES: u32 = 4 * 1024 * 1024;
+const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct H2FlowControlConfig {
     initial_stream_window_bytes: u32,
     initial_connection_window_bytes: u32,
+    keepalive_interval: Duration,
+    keepalive_timeout: Duration,
 }
 
 fn h2_flow_control_config() -> H2FlowControlConfig {
     H2FlowControlConfig {
         initial_stream_window_bytes: H2_INITIAL_STREAM_WINDOW_BYTES,
         initial_connection_window_bytes: H2_INITIAL_CONNECTION_WINDOW_BYTES,
+        keepalive_interval: H2_KEEPALIVE_INTERVAL,
+        keepalive_timeout: H2_KEEPALIVE_TIMEOUT,
     }
 }
 
@@ -42,6 +49,8 @@ fn server_builder() -> Server {
     Server::builder()
         .initial_stream_window_size(config.initial_stream_window_bytes)
         .initial_connection_window_size(config.initial_connection_window_bytes)
+        .http2_keepalive_interval(Some(config.keepalive_interval))
+        .http2_keepalive_timeout(Some(config.keepalive_timeout))
 }
 
 /// Serve Layer 5 over the local Unix socket and optional TCP/mTLS listener.
@@ -309,10 +318,12 @@ mod tests {
     }
 
     #[test]
-    fn daemon_server_builder_uses_four_mib_h2_windows() {
+    fn daemon_server_builder_uses_windows_and_dead_peer_keepalive() {
         let config = h2_flow_control_config();
         assert_eq!(config.initial_stream_window_bytes, 4 * 1024 * 1024);
         assert_eq!(config.initial_connection_window_bytes, 4 * 1024 * 1024);
+        assert_eq!(config.keepalive_interval, Duration::from_secs(30));
+        assert_eq!(config.keepalive_timeout, Duration::from_secs(20));
         let _builder = server_builder();
     }
 }
