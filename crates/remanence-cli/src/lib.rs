@@ -52,8 +52,9 @@ use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use remanence_aead::{
-    header::object_id_field, inspect_bytes, open, open_to_vec, seal_envelope, EnvelopeSealOptions,
-    RaoHeader, RecipientPublicKey, RootKey, SealOptions, RAO_HEADER_LEN,
+    covering_stored_range, header::object_id_field, inspect_bytes, open,
+    open_plaintext_range_from_reader, open_to_vec, seal_envelope, EnvelopeSealOptions, RaoHeader,
+    RecipientPublicKey, RootKey, SealOptions, RAO_HEADER_LEN,
 };
 use remanence_api::pb;
 #[cfg(feature = "foreign-bru")]
@@ -1764,6 +1765,10 @@ enum RemArchiveCommand {
     #[command(name = "extract-stream")]
     ExtractStream(RemArchiveExtractStreamArgs),
 
+    /// Query the stored ciphertext frames covering a plaintext member range.
+    #[command(name = "covering-range")]
+    CoveringRange(RemArchiveCoveringRangeArgs),
+
     /// Probe an archive dump without streaming entries.
     Probe(RemArchiveInputArgs),
 
@@ -1973,6 +1978,44 @@ struct RemArchiveExtractStreamArgs {
     /// Absolute plaintext byte range to write, formatted as start:length.
     #[arg(long = "range", value_name = "START:LEN", value_parser = parse_archive_byte_range)]
     range: Option<ArchiveByteRange>,
+
+    /// Authenticated header+metadata prefix for ranged-ciphertext input.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "stored_range_start",
+        requires = "range"
+    )]
+    authenticated_prefix: Option<PathBuf>,
+
+    /// Absolute stored offset at which ranged ciphertext stdin begins.
+    #[arg(
+        long,
+        value_name = "BYTE",
+        requires = "authenticated_prefix",
+        requires = "range"
+    )]
+    stored_range_start: Option<u64>,
+}
+
+/// Arguments for `rem archive covering-range`.
+#[derive(Args, Debug)]
+struct RemArchiveCoveringRangeArgs {
+    /// 32-byte root key file used to authenticate the envelope prefix.
+    #[arg(long, value_name = "PATH")]
+    key_file: PathBuf,
+
+    /// Expected encrypted object identifier.
+    #[arg(long, value_name = "ID")]
+    object_id: String,
+
+    /// Caller member identifier, echoed in the machine-readable response.
+    #[arg(long, value_name = "ID")]
+    file_id: String,
+
+    /// Absolute plaintext member range, formatted as start:length.
+    #[arg(long = "range", value_name = "START:LEN", value_parser = parse_archive_byte_range)]
+    range: ArchiveByteRange,
 }
 
 /// Arguments for `rem archive write`.
@@ -2172,6 +2215,7 @@ impl From<RemArchiveCommand> for ArchiveCommand {
             RemArchiveCommand::Inspect(args) => Self::Inspect(args.into()),
             RemArchiveCommand::Extract(args) => Self::Extract(args.into()),
             RemArchiveCommand::ExtractStream(args) => Self::ExtractStream(args.into()),
+            RemArchiveCommand::CoveringRange(args) => Self::CoveringRange(args.into()),
             RemArchiveCommand::Probe(args) => Self::Probe(args.into()),
             RemArchiveCommand::Scan(args) => Self::Scan(args.into()),
             RemArchiveCommand::Restore(args) => Self::Restore(args.into()),
@@ -2245,6 +2289,19 @@ impl From<RemArchiveExtractStreamArgs> for ArchiveExtractStreamArgs {
     fn from(value: RemArchiveExtractStreamArgs) -> Self {
         Self {
             key_file: value.key_file,
+            range: value.range,
+            authenticated_prefix: value.authenticated_prefix,
+            stored_range_start: value.stored_range_start,
+        }
+    }
+}
+
+impl From<RemArchiveCoveringRangeArgs> for ArchiveCoveringRangeArgs {
+    fn from(value: RemArchiveCoveringRangeArgs) -> Self {
+        Self {
+            key_file: value.key_file,
+            object_id: value.object_id,
+            file_id: value.file_id,
             range: value.range,
         }
     }
@@ -2371,6 +2428,10 @@ enum ArchiveCommand {
     /// Decrypt an encrypted RAO object from stdin to stdout.
     #[command(name = "extract-stream")]
     ExtractStream(ArchiveExtractStreamArgs),
+
+    /// Query the stored ciphertext frames covering a plaintext member range.
+    #[command(name = "covering-range")]
+    CoveringRange(ArchiveCoveringRangeArgs),
 
     /// Probe an archive source without streaming entries.
     Probe(ArchiveInputArgs),
@@ -2602,6 +2663,44 @@ struct ArchiveExtractStreamArgs {
     /// Absolute plaintext byte range to write, formatted as start:length.
     #[arg(long = "range", value_name = "START:LEN", value_parser = parse_archive_byte_range)]
     range: Option<ArchiveByteRange>,
+
+    /// Authenticated header+metadata prefix for ranged-ciphertext input.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "stored_range_start",
+        requires = "range"
+    )]
+    authenticated_prefix: Option<PathBuf>,
+
+    /// Absolute stored offset at which ranged ciphertext stdin begins.
+    #[arg(
+        long,
+        value_name = "BYTE",
+        requires = "authenticated_prefix",
+        requires = "range"
+    )]
+    stored_range_start: Option<u64>,
+}
+
+/// Arguments for the shared `archive covering-range` command.
+#[derive(Args, Debug)]
+struct ArchiveCoveringRangeArgs {
+    /// 32-byte root key file used to authenticate the envelope prefix.
+    #[arg(long, value_name = "PATH")]
+    key_file: PathBuf,
+
+    /// Expected encrypted object identifier.
+    #[arg(long, value_name = "ID")]
+    object_id: String,
+
+    /// Caller member identifier, echoed in the machine-readable response.
+    #[arg(long, value_name = "ID")]
+    file_id: String,
+
+    /// Absolute plaintext member range, formatted as start:length.
+    #[arg(long = "range", value_name = "START:LEN", value_parser = parse_archive_byte_range)]
+    range: ArchiveByteRange,
 }
 
 /// Arguments for the shared `archive write` command (post-From transform).
@@ -2858,6 +2957,9 @@ impl ArchiveCommand {
             Self::ExtractStream(_) => {
                 panic!("ArchiveCommand::ExtractStream has no dump/tape source")
             }
+            Self::CoveringRange(_) => {
+                panic!("ArchiveCommand::CoveringRange has no dump/tape source")
+            }
             Self::Write(_) => panic!("ArchiveCommand::Write has no dump/tape source"),
             Self::Read(_) => panic!("ArchiveCommand::Read has no dump/tape source"),
             Self::ExportObject(_) => {
@@ -2879,6 +2981,7 @@ impl ArchiveCommand {
             Self::Inspect(_) => panic!("ArchiveCommand::Inspect has no format"),
             Self::Extract(_) => panic!("ArchiveCommand::Extract has no format"),
             Self::ExtractStream(_) => panic!("ArchiveCommand::ExtractStream has no format"),
+            Self::CoveringRange(_) => panic!("ArchiveCommand::CoveringRange has no format"),
             Self::Write(_) => panic!("ArchiveCommand::Write has no format"),
             Self::Read(_) => panic!("ArchiveCommand::Read has no format"),
             Self::ExportObject(_) => panic!("ArchiveCommand::ExportObject has no format"),
@@ -3260,6 +3363,9 @@ where
         if let ArchiveCommand::ExtractStream(args) = command {
             return run_archive_extract_stream(args, input, out, err);
         }
+        if let ArchiveCommand::CoveringRange(args) = command {
+            return run_archive_covering_range(args, input, out, err);
+        }
         if command.is_dump_command() {
             return run_archive_dump_command(command, out, err);
         }
@@ -3586,7 +3692,11 @@ where
 
 fn run_archive_capabilities(out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let capabilities = json!({
-        "capabilities": ["rao-v2-envelope", "wrap-suite-hpke-v1"]
+        "capabilities": [
+            "rao-v2-envelope",
+            "wrap-suite-hpke-v1",
+            "ranged-ciphertext-extract"
+        ]
     });
     match serde_json::to_writer(&mut *out, &capabilities)
         .and_then(|()| writeln!(out).map_err(serde_json::Error::io))
@@ -9534,6 +9644,9 @@ fn run_archive_dump_command(
         ArchiveCommand::ExtractStream(_) => {
             unreachable!("archive extract-stream dispatched before the dump handler")
         }
+        ArchiveCommand::CoveringRange(_) => {
+            unreachable!("archive covering-range dispatched before the dump handler")
+        }
         ArchiveCommand::Write(_) => {
             unreachable!("archive write dispatched before the dump handler")
         }
@@ -9684,7 +9797,87 @@ fn run_archive_extract(
     }
 }
 
-/// Decrypt one complete encrypted RAO stream from `input` to `out`.
+/// Read exactly the bounded header/key-frame/metadata prefix from an RAO stream.
+fn read_rao_authenticated_prefix(input: &mut dyn Read) -> Result<Vec<u8>, String> {
+    let mut header_bytes = [0u8; RAO_HEADER_LEN];
+    input
+        .read_exact(&mut header_bytes)
+        .map_err(|error| format!("read encrypted RAO header: {error}"))?;
+    let header = RaoHeader::parse(&header_bytes)
+        .map_err(|error| format!("parse encrypted RAO header: {error}"))?;
+    let remaining_len = usize::try_from(header.key_frame_len)
+        .ok()
+        .and_then(|key_len| {
+            usize::try_from(header.metadata_frame_len)
+                .ok()
+                .and_then(|metadata_len| key_len.checked_add(metadata_len))
+        })
+        .ok_or_else(|| "encrypted RAO prefix length is too large for this host".to_string())?;
+    let total_len = RAO_HEADER_LEN
+        .checked_add(remaining_len)
+        .ok_or_else(|| "encrypted RAO prefix length overflows".to_string())?;
+    let mut prefix = Vec::new();
+    prefix
+        .try_reserve_exact(total_len)
+        .map_err(|_| "cannot allocate bounded encrypted RAO prefix".to_string())?;
+    prefix.extend_from_slice(&header_bytes);
+    prefix.resize(total_len, 0);
+    input
+        .read_exact(&mut prefix[RAO_HEADER_LEN..])
+        .map_err(|error| format!("read encrypted RAO authenticated prefix: {error}"))?;
+    Ok(prefix)
+}
+
+/// Authenticate a prefix and emit Rust-computed covering stored geometry.
+fn run_archive_covering_range(
+    args: &ArchiveCoveringRangeArgs,
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let result = (|| -> Result<Value, String> {
+        let root_key = read_root_key_file(&args.key_file)?;
+        let prefix = read_rao_authenticated_prefix(input)?;
+        let plan = covering_stored_range(&prefix, &root_key, args.range.start, args.range.len)
+            .map_err(|error| format!("authenticate and map encrypted RAO range: {error}"))?;
+        let stored_range_end = plan
+            .stored_range_start
+            .and_then(|start| start.checked_add(plan.stored_range_len));
+        Ok(json!({
+            "command": "archive covering-range",
+            "status": "ok",
+            "object_id": args.object_id,
+            "envelope_object_id": plan.header.object_id,
+            "file_id": args.file_id,
+            "plaintext_start": plan.plaintext_start,
+            "plaintext_len": plan.plaintext_len,
+            "first_chunk": plan.first_chunk,
+            "chunk_count": plan.chunk_count,
+            "stored_range_start": plan.stored_range_start,
+            "stored_range_len": plan.stored_range_len,
+            "stored_range_end": stored_range_end,
+            "authenticated_prefix_len": prefix.len(),
+        }))
+    })();
+
+    match result {
+        Ok(report) => match serde_json::to_writer(&mut *out, &report)
+            .and_then(|()| writeln!(out).map_err(serde_json::Error::io))
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                let _ = writeln!(err, "error: archive covering-range: {error}");
+                ExitCode::from(1)
+            }
+        },
+        Err(error) => {
+            let _ = writeln!(err, "error: archive covering-range: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Decrypt one complete or explicitly ranged encrypted RAO stream to `out`.
 ///
 /// `remanence_aead::open` authenticates each payload chunk before invoking the
 /// writer. The optional writer below only slices that already-authenticated
@@ -9697,6 +9890,49 @@ fn run_archive_extract_stream(
 ) -> ExitCode {
     let result = (|| -> Result<Value, String> {
         let root_key = read_root_key_file(&args.key_file)?;
+        if let (Some(prefix_path), Some(stored_range_start), Some(range)) = (
+            args.authenticated_prefix.as_deref(),
+            args.stored_range_start,
+            args.range,
+        ) {
+            let mut prefix_file = File::open(prefix_path).map_err(|error| {
+                format!(
+                    "open authenticated prefix {}: {error}",
+                    prefix_path.display()
+                )
+            })?;
+            let prefix = read_rao_authenticated_prefix(&mut prefix_file)?;
+            let report = open_plaintext_range_from_reader(
+                &prefix,
+                input,
+                stored_range_start,
+                out,
+                &root_key,
+                range.start,
+                range.len,
+            )
+            .map_err(|error| format!("decrypt ranged encrypted RAO stream: {error}"))?;
+            out.flush()
+                .map_err(|error| format!("flush plaintext stdout: {error}"))?;
+            return Ok(json!({
+                "command": "archive extract-stream",
+                "status": "ok",
+                "mode": "ranged-ciphertext",
+                "object_id": report.header.object_id,
+                "key_id": bytes_to_hex(&report.header.key_id),
+                "chunk_size": report.header.chunk_size,
+                "plaintext_size_bytes": report.metadata.plaintext_size,
+                "plaintext_sha256": bytes_to_hex(&report.metadata.plaintext_digest),
+                "bytes_written": report.plaintext_len,
+                "authenticated_chunks": report.chunk_count,
+                "stored_range_start": report.stored_range_start,
+                "stored_range_len": report.stored_range_len,
+                "range": {
+                    "start": range.start,
+                    "len": range.len,
+                },
+            }));
+        }
         let (report, bytes_written) = if let Some(range) = args.range {
             let requested_end = range
                 .start
@@ -12194,6 +12430,9 @@ fn run_archive_tape_with_drive(
         ArchiveCommand::ExtractStream(_) => {
             unreachable!("archive extract-stream dispatched before the tape archive handler")
         }
+        ArchiveCommand::CoveringRange(_) => {
+            unreachable!("archive covering-range dispatched before the tape archive handler")
+        }
         ArchiveCommand::Write(_) => {
             unreachable!("archive write dispatched before the tape archive handler")
         }
@@ -13895,7 +14134,11 @@ mod tests {
         let value: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             value["capabilities"],
-            json!(["rao-v2-envelope", "wrap-suite-hpke-v1"])
+            json!([
+                "rao-v2-envelope",
+                "wrap-suite-hpke-v1",
+                "ranged-ciphertext-extract"
+            ])
         );
     }
 
@@ -14067,6 +14310,7 @@ mod tests {
             "inspect",
             "extract",
             "extract-stream",
+            "covering-range",
             "probe",
             "scan",
             "restore",
@@ -14078,6 +14322,79 @@ mod tests {
                 "rem archive help should expose {command}:\n{help}"
             );
         }
+    }
+
+    #[test]
+    fn rem_archive_ranged_ciphertext_commands_parse_required_geometry() {
+        let query = Cli::parse_from([
+            "rem",
+            "archive",
+            "covering-range",
+            "--key-file",
+            "/tmp/key",
+            "--object-id",
+            "stored-object",
+            "--file-id",
+            "member-1",
+            "--range",
+            "100:25",
+        ]);
+        let RemCommand::Archive {
+            command: RemArchiveCommand::CoveringRange(args),
+        } = query.command
+        else {
+            panic!("expected covering-range command");
+        };
+        assert_eq!(args.object_id, "stored-object");
+        assert_eq!(args.file_id, "member-1");
+        assert_eq!(
+            args.range,
+            ArchiveByteRange {
+                start: 100,
+                len: 25
+            }
+        );
+
+        let ranged = Cli::parse_from([
+            "rem",
+            "archive",
+            "extract-stream",
+            "--key-file",
+            "/tmp/key",
+            "--range",
+            "100:25",
+            "--authenticated-prefix",
+            "/tmp/prefix",
+            "--stored-range-start",
+            "4096",
+        ]);
+        let RemCommand::Archive {
+            command: RemArchiveCommand::ExtractStream(args),
+        } = ranged.command
+        else {
+            panic!("expected extract-stream command");
+        };
+        assert_eq!(args.stored_range_start, Some(4096));
+        assert_eq!(
+            args.range,
+            Some(ArchiveByteRange {
+                start: 100,
+                len: 25
+            })
+        );
+
+        assert!(Cli::try_parse_from([
+            "rem",
+            "archive",
+            "extract-stream",
+            "--key-file",
+            "/tmp/key",
+            "--range",
+            "100:25",
+            "--authenticated-prefix",
+            "/tmp/prefix",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -18458,6 +18775,8 @@ blob Project/Render Files/
         let args = ArchiveExtractStreamArgs {
             key_file: key_file.to_path_buf(),
             range,
+            authenticated_prefix: None,
+            stored_range_start: None,
         };
         let mut input = Cursor::new(encrypted);
         let mut stdout = Vec::new();
@@ -18580,6 +18899,123 @@ blob Project/Render Files/
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
         assert_eq!(stdout, plaintext[..64]);
         assert!(stderr.contains("authentication failed"), "{stderr}");
+    }
+
+    #[test]
+    fn archive_covering_query_drives_ranged_ciphertext_extract() {
+        let temp = tempfile::tempdir().unwrap();
+        let key_file = temp.path().join("root.key");
+        fs::write(&key_file, [0x63; 32]).unwrap();
+        let (encrypted, plaintext, root_key) = sealed_stream_fixture(512, 8);
+        let inspected = remanence_aead::inspect_bytes(&encrypted).unwrap();
+        let prefix_len = RAO_HEADER_LEN + inspected.header.metadata_frame_len as usize;
+        let prefix = &encrypted[..prefix_len];
+        let prefix_file = temp.path().join("prefix.rao");
+        fs::write(&prefix_file, prefix).unwrap();
+        let range = ArchiveByteRange {
+            start: 1000,
+            len: 900,
+        };
+
+        let query_args = ArchiveCoveringRangeArgs {
+            key_file: key_file.clone(),
+            object_id: "extract-stream-fixture".to_string(),
+            file_id: "member-7".to_string(),
+            range,
+        };
+        let mut query_input = Cursor::new(prefix);
+        let mut query_stdout = Vec::new();
+        let mut query_stderr = Vec::new();
+        let query_code = run_archive_covering_range(
+            &query_args,
+            &mut query_input,
+            &mut query_stdout,
+            &mut query_stderr,
+        );
+        assert_eq!(
+            format!("{query_code:?}"),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
+        assert!(query_stderr.is_empty());
+        let query: Value = serde_json::from_slice(&query_stdout).unwrap();
+        assert_eq!(query["file_id"], "member-7");
+
+        let plan = remanence_aead::covering_stored_range(prefix, &root_key, range.start, range.len)
+            .unwrap();
+        assert_eq!(
+            query["stored_range_start"],
+            plan.stored_range_start.unwrap()
+        );
+        assert_eq!(query["stored_range_len"], plan.stored_range_len);
+        let stored_start = plan.stored_range_start.unwrap() as usize;
+        let stored_end = stored_start + plan.stored_range_len as usize;
+        let args = ArchiveExtractStreamArgs {
+            key_file,
+            range: Some(range),
+            authenticated_prefix: Some(prefix_file),
+            stored_range_start: Some(stored_start as u64),
+        };
+        let mut ranged_input = Cursor::new(&encrypted[stored_start..stored_end]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_archive_extract_stream(&args, &mut ranged_input, &mut stdout, &mut stderr);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert_eq!(
+            stdout,
+            plaintext[range.start as usize..(range.start + range.len) as usize]
+        );
+        assert_eq!(ranged_input.position(), plan.stored_range_len);
+        let report: Value = serde_json::from_slice(&stderr).unwrap();
+        assert_eq!(report["mode"], "ranged-ciphertext");
+        assert_eq!(report["authenticated_chunks"], plan.chunk_count);
+    }
+
+    #[test]
+    fn archive_ranged_ciphertext_extract_rejects_tampered_prefix_and_chunk() {
+        let temp = tempfile::tempdir().unwrap();
+        let key_file = temp.path().join("root.key");
+        fs::write(&key_file, [0x63; 32]).unwrap();
+        let (encrypted, _plaintext, root_key) = sealed_stream_fixture(512, 4);
+        let inspected = remanence_aead::inspect_bytes(&encrypted).unwrap();
+        let prefix_len = RAO_HEADER_LEN + inspected.header.metadata_frame_len as usize;
+        let prefix = &encrypted[..prefix_len];
+        let range = ArchiveByteRange {
+            start: 512,
+            len: 64,
+        };
+        let plan = remanence_aead::covering_stored_range(prefix, &root_key, range.start, range.len)
+            .unwrap();
+        let stored_start = plan.stored_range_start.unwrap() as usize;
+        let stored_end = stored_start + plan.stored_range_len as usize;
+
+        for tamper_prefix in [true, false] {
+            let prefix_file = temp.path().join(format!("prefix-{tamper_prefix}.rao"));
+            let mut selected_prefix = prefix.to_vec();
+            let mut selected_chunk = encrypted[stored_start..stored_end].to_vec();
+            if tamper_prefix {
+                selected_prefix[RAO_HEADER_LEN + 1] ^= 0x80;
+            } else {
+                selected_chunk[1] ^= 0x80;
+            }
+            fs::write(&prefix_file, selected_prefix).unwrap();
+            let args = ArchiveExtractStreamArgs {
+                key_file: key_file.clone(),
+                range: Some(range),
+                authenticated_prefix: Some(prefix_file),
+                stored_range_start: Some(stored_start as u64),
+            };
+            let mut input = Cursor::new(selected_chunk);
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code = run_archive_extract_stream(&args, &mut input, &mut stdout, &mut stderr);
+            assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+            assert!(stdout.is_empty());
+            assert!(String::from_utf8(stderr)
+                .unwrap()
+                .contains("authentication failed"));
+        }
     }
 
     #[test]
