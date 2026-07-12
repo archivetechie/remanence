@@ -1730,6 +1730,7 @@ dependencies = [
  "remanence-state",
  "remanence-stream",
  "rusqlite",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror 1.0.69",
@@ -1742,6 +1743,7 @@ dependencies = [
  "tonic-prost-build",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "x509-parser",
 ]
