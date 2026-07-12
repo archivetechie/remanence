@@ -42,6 +42,18 @@ use crate::{
 
 pub(crate) const SPOOL_MAX_BYTES: u64 = crate::APPEND_SPOOL_MAX_BYTES;
 
+/// Session-independent coordinates used to position a newly minted read
+/// session at a catalogued file boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReadResumeTarget {
+    pub(crate) tape_uuid: [u8; 16],
+    pub(crate) object_id: String,
+    pub(crate) file_id: String,
+    pub(crate) file_boundary_byte_offset: u64,
+    pub(crate) expected_position_lba: Option<u64>,
+    pub(crate) prior_daemon_epoch: Option<u64>,
+}
+
 /// Robotics work to perform after the owner opens and refreshes the library.
 pub(crate) enum RoboticsAction {
     Refresh,
@@ -104,6 +116,8 @@ pub(crate) enum DriveCommand {
         source_slot: Option<u16>,
         drive_uuid: Option<Vec<u8>>,
         drive_serial: Option<String>,
+        resume_target: Option<ReadResumeTarget>,
+        daemon_epoch: u64,
         reply: oneshot::Sender<Result<pb::ReadSession, Status>>,
     },
     Unload {
@@ -731,6 +745,8 @@ fn drive_loop(
                 source_slot,
                 drive_uuid,
                 drive_serial,
+                resume_target,
+                daemon_epoch,
                 reply,
             } => handle_drive_open_read(
                 bay,
@@ -747,6 +763,8 @@ fn drive_loop(
                     source_slot,
                     drive_uuid,
                     drive_serial,
+                    resume_target,
+                    daemon_epoch,
                     reply,
                 },
             ),
@@ -871,6 +889,8 @@ struct OpenReadActorRequest {
     source_slot: Option<u16>,
     drive_uuid: Option<Vec<u8>>,
     drive_serial: Option<String>,
+    resume_target: Option<ReadResumeTarget>,
+    daemon_epoch: u64,
     reply: oneshot::Sender<Result<pb::ReadSession, Status>>,
 }
 
@@ -2310,6 +2330,8 @@ fn handle_drive_open_read(
         source_slot,
         drive_uuid,
         drive_serial,
+        resume_target,
+        daemon_epoch,
         reply,
     } = request;
 
@@ -2338,16 +2360,42 @@ fn handle_drive_open_read(
         let _ = reply.send(Err(status));
         return;
     }
-    if let Err(status) = verify_loaded_tape_identity(drive, &tape_uuid) {
-        let _ = reply.send(Err(status));
+    if resume_target
+        .as_ref()
+        .is_some_and(|target| target.tape_uuid != tape_uuid)
+    {
+        let _ = reply.send(Err(Status::invalid_argument(
+            "resume target tape UUID does not match mounted read target",
+        )));
         return;
     }
-
     let session_id = Uuid::new_v4();
-    if let Err(status) = prepare_drive_for_read(index, drive, &tape_uuid, session_id) {
-        let _ = reply.send(Err(status));
-        return;
-    }
+    let position_proof = match resume_target.as_ref() {
+        Some(target) => {
+            if let Err(status) = prepare_drive_for_read(index, drive, &tape_uuid, session_id) {
+                let _ = reply.send(Err(status));
+                return;
+            }
+            match position_read_resume(index, drive, target) {
+                Ok(proof) => Some(proof),
+                Err(status) => {
+                    let _ = reply.send(Err(status));
+                    return;
+                }
+            }
+        }
+        None => {
+            if let Err(status) = verify_loaded_tape_identity(drive, &tape_uuid) {
+                let _ = reply.send(Err(status));
+                return;
+            }
+            if let Err(status) = prepare_drive_for_read(index, drive, &tape_uuid, session_id) {
+                let _ = reply.send(Err(status));
+                return;
+            }
+            None
+        }
+    };
     let opened_at_utc = now_rfc3339().unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
     if let Err(status) = record_session_event(
         index,
@@ -2372,6 +2420,8 @@ fn handle_drive_open_read(
         pb::read_session::State::ReadSessionStateOpen,
         opened_at_utc.as_str(),
         bay,
+        position_proof,
+        daemon_epoch,
     );
     if reply.send(Ok(open_reply)).is_err() {
         if needs_drive_load {
@@ -2488,6 +2538,8 @@ fn handle_drive_open_read(
                         pb::read_session::State::ReadSessionStateClosed,
                         opened_at_utc.as_str(),
                         bay,
+                        position_proof,
+                        daemon_epoch,
                     ))
                 } else {
                     Err(Status::not_found("read session not found"))
@@ -2527,6 +2579,8 @@ fn handle_drive_open_read(
                         pb::read_session::State::ReadSessionStateOpen,
                         opened_at_utc.as_str(),
                         bay,
+                        position_proof,
+                        daemon_epoch,
                     ))
                 } else {
                     Err(Status::not_found("read session not found"))
@@ -4628,12 +4682,94 @@ fn verify_loaded_tape_identity(
     Ok(())
 }
 
+fn position_read_resume(
+    index: &CatalogIndex,
+    drive: &mut DriveHandle,
+    target: &ReadResumeTarget,
+) -> Result<u64, Status> {
+    let request = file_range_read_request(
+        index,
+        &target.tape_uuid,
+        target.object_id.as_str(),
+        target.file_id.as_str(),
+        0,
+        0,
+    )?;
+    drive
+        .rewind()
+        .map_err(|err| Status::internal(format!("rewind before resume position: {err}")))?;
+    let mut source = DriveHandleSource(drive);
+    verify_and_position_read_resume_from_source(&mut source, request, target)
+}
+
+fn verify_and_position_read_resume_from_source(
+    source: &mut dyn BlockSource,
+    request: crate::read_core::PlaintextFileRangeReadRequest,
+    target: &ReadResumeTarget,
+) -> Result<u64, Status> {
+    verify_tape_identity(source, &target.tape_uuid)
+        .map_err(|err| Status::failed_precondition(format!("tape identity: {err}")))?;
+    source
+        .locate(0)
+        .map_err(|err| Status::internal(format!("return to BOT after identity proof: {err}")))?;
+    position_read_resume_from_source(source, request, target)
+}
+
+fn position_read_resume_from_source(
+    source: &mut dyn BlockSource,
+    request: crate::read_core::PlaintextFileRangeReadRequest,
+    target: &ReadResumeTarget,
+) -> Result<u64, Status> {
+    let first_chunk_lba = request.first_chunk_lba.ok_or_else(|| {
+        Status::failed_precondition("resume target file has no data-chunk boundary")
+    })?;
+    let block_size = u64::try_from(request.block_size)
+        .map_err(|_| Status::internal("tape block size does not fit u64"))?;
+    let catalog_boundary = first_chunk_lba
+        .0
+        .checked_mul(block_size)
+        .ok_or_else(|| Status::internal("catalogued file boundary byte offset overflow"))?;
+    if target.file_boundary_byte_offset != catalog_boundary {
+        return Err(Status::invalid_argument(format!(
+            "resume offset is not the catalogued file boundary: expected {catalog_boundary}, got {}",
+            target.file_boundary_byte_offset
+        )));
+    }
+
+    let mut positioned = source
+        .space(i64::from(request.tape_file_number), SpaceKind::Filemarks)
+        .map_err(|err| Status::internal(format!("space to resume object: {err}")))?
+        .position_after;
+    let skip_blocks = i64::try_from(first_chunk_lba.0)
+        .map_err(|_| Status::invalid_argument("resume file boundary exceeds SPACE range"))?;
+    if skip_blocks != 0 {
+        positioned = source
+            .space(skip_blocks, SpaceKind::Blocks)
+            .map_err(|err| Status::internal(format!("space to resume file boundary: {err}")))?
+            .position_after;
+    }
+    let proof = source
+        .prove_read_position(positioned)
+        .map_err(|err| Status::failed_precondition(format!("resume position proof: {err}")))?;
+    if let Some(expected) = target.expected_position_lba {
+        if proof.lba() != expected {
+            return Err(Status::failed_precondition(format!(
+                "resume position proof mismatch: expected LBA {expected}, observed {}",
+                proof.lba()
+            )));
+        }
+    }
+    Ok(proof.lba())
+}
+
 fn read_session_proto(
     session_id: Uuid,
     tape_uuid: &TapeUuid,
     state: pb::read_session::State,
     opened_at_utc: &str,
     drive_element_address: u16,
+    position_after_lba: Option<u64>,
+    daemon_epoch: u64,
 ) -> pb::ReadSession {
     pb::ReadSession {
         session_id: session_id.as_bytes().to_vec(),
@@ -4641,6 +4777,9 @@ fn read_session_proto(
         drive_element_address: u32::from(drive_element_address),
         state: state as i32,
         opened_at: timestamp_from_rfc3339(opened_at_utc),
+        position_proof: position_after_lba
+            .map(|position_after_lba| pb::DevicePositionProof { position_after_lba }),
+        daemon_epoch,
     }
 }
 
@@ -4742,6 +4881,7 @@ fn now_rfc3339() -> Result<String, time::error::Format> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message as _;
     use remanence_aead::RootKey;
     use remanence_chaos::model::{ModelTransport, VirtualTape, VirtualWorld};
     use remanence_format::{
@@ -4751,10 +4891,12 @@ mod tests {
     use remanence_library::{
         DriveBay, ElementLayout, FixtureTransport, IdentitySource, InstalledDrive, Library,
         RecordingLog, RecordingTransport, SgTransport, Slot, VecBlockSink, VecBlockSource,
-        WormMediaState,
+        VecBlockSourceCall, WormMediaState,
     };
+    use remanence_parity::bootstrap::write_bootstrap_block;
     use remanence_parity::{
-        CommittedBundle, CommittedBundleKind, ParityConfig, TapeFileEntry, TapeFileKind,
+        BootstrapPayload, CommittedBundle, CommittedBundleKind, ParityConfig, TapeFileEntry,
+        TapeFileKind,
     };
     use remanence_state::{
         CatalogIndex, DriveObservationInput, NativeObjectCopyProjectionInput,
@@ -5754,10 +5896,192 @@ mod tests {
             pb::read_session::State::ReadSessionStateOpen,
             opened_at,
             0x0101,
+            None,
+            7,
         );
 
         assert_eq!(write.drive_element_address, 0x0100);
         assert_eq!(read.drive_element_address, 0x0101);
+        assert_eq!(read.daemon_epoch, 7);
+    }
+
+    fn resume_target_for_fixture(fixture: &RangeCatalogFixture) -> ReadResumeTarget {
+        let first_chunk_lba = fixture.layout.files[0]
+            .first_chunk_lba
+            .expect("fixture file has a body-chunk boundary")
+            .0;
+        ReadResumeTarget {
+            tape_uuid: RANGE_TAPE_UUID,
+            object_id: RANGE_OBJECT_ID.to_string(),
+            file_id: "payload-file".to_string(),
+            file_boundary_byte_offset: first_chunk_lba * 512,
+            expected_position_lba: Some(first_chunk_lba),
+            prior_daemon_epoch: Some(11),
+        }
+    }
+
+    #[test]
+    fn cold_resume_relocates_returns_proof_and_mints_fresh_session() {
+        let fixture = cataloged_payload_fixture(b"cold resume payload");
+        let target = resume_target_for_fixture(&fixture);
+        let request = file_range_read_request(
+            &fixture.index,
+            &target.tape_uuid,
+            target.object_id.as_str(),
+            target.file_id.as_str(),
+            0,
+            0,
+        )
+        .expect("resolve durable resume coordinates");
+
+        let first_session_id = Uuid::new_v4();
+        let first = read_session_proto(
+            first_session_id,
+            &target.tape_uuid,
+            pb::read_session::State::ReadSessionStateOpen,
+            "2026-07-12T00:00:00Z",
+            0x0101,
+            None,
+            target.prior_daemon_epoch.expect("prior epoch"),
+        );
+        drop(first);
+
+        let mut cold_source = VecBlockSource::new(fixture.blocks.clone());
+        let proof_lba = position_read_resume_from_source(&mut cold_source, request, &target)
+            .expect("cold resume position proof");
+        let resumed_session_id = Uuid::new_v4();
+        let resumed = read_session_proto(
+            resumed_session_id,
+            &target.tape_uuid,
+            pb::read_session::State::ReadSessionStateOpen,
+            "2026-07-12T00:01:00Z",
+            0x0101,
+            Some(proof_lba),
+            12,
+        );
+
+        assert_ne!(resumed_session_id, first_session_id);
+        assert_eq!(resumed.session_id, resumed_session_id.as_bytes());
+        assert_eq!(resumed.daemon_epoch, 12);
+        assert_eq!(
+            resumed
+                .position_proof
+                .expect("resume open returns proof")
+                .position_after_lba,
+            target.expected_position_lba.expect("expected LBA")
+        );
+        assert!(cold_source.calls.iter().any(|call| matches!(
+            call,
+            VecBlockSourceCall::Space {
+                kind: SpaceKind::Blocks,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn wrong_tape_is_rejected_before_position_even_at_matching_lba() {
+        let fixture = cataloged_payload_fixture(b"wrong tape position collision");
+        let actual_tape_uuid = RANGE_TAPE_UUID;
+        let requested_tape_uuid = [0xCD; 16];
+        let payload = BootstrapPayload {
+            scheme: None,
+            no_parity_flag: true,
+            filemark_map_digest: None,
+            tape_uuid: actual_tape_uuid,
+            written_by_version: "test".to_string(),
+            written_at: "2026-07-12T00:00:00Z".to_string(),
+            sequence: 0,
+            block_size_bytes: 4096,
+            drive_compression: false,
+            sidecar_epoch_directory: None,
+            parity_map_reference: None,
+            object_rows: Vec::new(),
+        };
+        let mut block = vec![0u8; 4096];
+        write_bootstrap_block(&payload, &mut block).expect("write wrong-tape bootstrap");
+        let mut target = resume_target_for_fixture(&fixture);
+        target.tape_uuid = requested_tape_uuid;
+        let request = file_range_read_request(
+            &fixture.index,
+            &actual_tape_uuid,
+            target.object_id.as_str(),
+            target.file_id.as_str(),
+            0,
+            0,
+        )
+        .expect("resolve colliding physical position");
+        let expected_lba = target.expected_position_lba.expect("expected LBA");
+        let mut blocks = vec![block];
+        blocks.resize_with(expected_lba as usize + 1, || vec![0u8; 512]);
+        let mut source = VecBlockSource::new(blocks);
+
+        let error = verify_and_position_read_resume_from_source(&mut source, request, &target)
+            .expect_err("wrong tape must fail before trusting its matching LBA");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("tape identity mismatch"));
+        assert_eq!(
+            source.cursor(),
+            1,
+            "identity read stops at an LBA from which the expected proof was reachable"
+        );
+        assert!(source.calls.iter().all(|call| !matches!(
+            call,
+            VecBlockSourceCall::Space { .. } | VecBlockSourceCall::Position
+        )));
+    }
+
+    #[test]
+    fn resume_rejects_mid_file_offset_without_positioning() {
+        let fixture = cataloged_payload_fixture(b"file-boundary payload");
+        let mut target = resume_target_for_fixture(&fixture);
+        target.file_boundary_byte_offset += 1;
+        let request = file_range_read_request(
+            &fixture.index,
+            &target.tape_uuid,
+            target.object_id.as_str(),
+            target.file_id.as_str(),
+            0,
+            0,
+        )
+        .expect("resolve durable resume coordinates");
+        let mut source = VecBlockSource::new(fixture.blocks.clone());
+
+        let error = position_read_resume_from_source(&mut source, request, &target)
+            .expect_err("mid-file resume must fail");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("file boundary"));
+        assert!(
+            source.calls.is_empty(),
+            "invalid offset must not move the tape"
+        );
+    }
+
+    #[test]
+    fn serialized_resume_token_contains_no_session_id() {
+        let persisted_session_id = [0xEE; 16];
+        let token = pb::ReadResumeTarget {
+            tape_uuid: RANGE_TAPE_UUID.to_vec(),
+            object_id: Uuid::parse_str(RANGE_OBJECT_ID)
+                .expect("object UUID")
+                .as_bytes()
+                .to_vec(),
+            file_id: b"payload-file".to_vec(),
+            file_boundary_byte_offset: 1024,
+            expected_position_lba: Some(17),
+            daemon_epoch: Some(41),
+        };
+
+        let encoded = token.encode_to_vec();
+
+        assert!(
+            !encoded
+                .windows(persisted_session_id.len())
+                .any(|window| window == persisted_session_id),
+            "the durable resume token must not serialize a session id"
+        );
     }
 
     #[test]

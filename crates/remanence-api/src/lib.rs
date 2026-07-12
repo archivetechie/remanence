@@ -2485,7 +2485,9 @@ impl pb::read_session_service_server::ReadSessionService for ReadSessionApi {
         let request = request.into_inner();
         reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "OpenReadSession")?;
         let tape_uuid = select_read_target(&self.state, request.target)?;
-        let session = crate::mount::open_read_session(&self.state, tape_uuid).await?;
+        let resume_target = decode_read_resume_target(request.resume_target, tape_uuid)?;
+        let session =
+            crate::mount::open_read_session(&self.state, tape_uuid, resume_target).await?;
         Ok(Response::new(session))
     }
 
@@ -2584,6 +2586,35 @@ impl pb::read_session_service_server::ReadSessionService for ReadSessionApi {
         };
         Ok(Response::new(stream))
     }
+}
+
+fn decode_read_resume_target(
+    target: Option<pb::ReadResumeTarget>,
+    selected_tape_uuid: [u8; 16],
+) -> Result<Option<crate::write_owner::ReadResumeTarget>, Status> {
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    let tape_uuid = decode_uuid_bytes(&target.tape_uuid, "resume_target.tape_uuid")?;
+    if tape_uuid != selected_tape_uuid {
+        return Err(Status::invalid_argument(
+            "resume_target.tape_uuid must match the read-session tape target",
+        ));
+    }
+    let file_id = decode_text_id(&target.file_id, "resume_target.file_id")?;
+    if file_id.is_empty() {
+        return Err(Status::invalid_argument(
+            "resume_target.file_id must identify a catalogued file",
+        ));
+    }
+    Ok(Some(crate::write_owner::ReadResumeTarget {
+        tape_uuid,
+        object_id: decode_object_id(&target.object_id)?,
+        file_id,
+        file_boundary_byte_offset: target.file_boundary_byte_offset,
+        expected_position_lba: target.expected_position_lba,
+        prior_daemon_epoch: target.daemon_epoch,
+    }))
 }
 
 impl ReadSessionApi {
@@ -9110,6 +9141,7 @@ BCw3Wyv2UWY=
                     },
                 )),
                 idempotency_key: None,
+                resume_target: None,
             }),
         )
         .await
