@@ -270,11 +270,14 @@ async fn open_write_session_reserved(
 pub(crate) async fn open_read_session(
     state: &ApiState,
     tape_uuid: TapeUuid,
+    resume_target: Option<crate::write_owner::ReadResumeTarget>,
 ) -> Result<pb::ReadSession, Status> {
     let state = state.clone();
     await_critical_task(
         "open_read_session",
-        tokio::spawn(async move { open_read_session_critical(state, tape_uuid).await }),
+        tokio::spawn(
+            async move { open_read_session_critical(state, tape_uuid, resume_target).await },
+        ),
     )
     .await
 }
@@ -282,6 +285,7 @@ pub(crate) async fn open_read_session(
 async fn open_read_session_critical(
     state: ApiState,
     tape_uuid: TapeUuid,
+    resume_target: Option<crate::write_owner::ReadResumeTarget>,
 ) -> Result<pb::ReadSession, Status> {
     let pool = state.drive_pool()?.clone();
     let library_serial = state
@@ -300,7 +304,7 @@ async fn open_read_session_critical(
         Ok(reservation) => reservation,
         Err(err) => return Err(err),
     };
-    open_read_session_reserved(&state, &pool, library_serial, tape_uuid).await
+    open_read_session_reserved(&state, &pool, library_serial, tape_uuid, resume_target).await
 }
 
 async fn open_read_session_reserved(
@@ -308,6 +312,7 @@ async fn open_read_session_reserved(
     pool: &crate::write_owner::DrivePool,
     library_serial: String,
     tape_uuid: TapeUuid,
+    resume_target: Option<crate::write_owner::ReadResumeTarget>,
 ) -> Result<pb::ReadSession, Status> {
     let (mount, drive_reservation) =
         resolve_and_reserve_actor_mount(state, pool, &library_serial, &tape_uuid)?;
@@ -326,6 +331,8 @@ async fn open_read_session_reserved(
                 source_slot: mount.source_slot,
                 drive_uuid: mount.drive_uuid.clone(),
                 drive_serial: mount.drive_serial.clone(),
+                resume_target,
+                daemon_epoch: state.daemon_epoch,
                 reply: reply_tx,
             })
             .await

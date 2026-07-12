@@ -1093,6 +1093,11 @@ message ReadSession {
   }
   State state                = 4;
   google.protobuf.Timestamp opened_at = 5;
+  // Present after a cold resume open. Encoded identically to the write-side
+  // AppendCommitInfo.position_after_lba field.
+  DevicePositionProof position_proof = 6;
+  // Epoch of the daemon that minted this fresh read session.
+  uint64 daemon_epoch = 7;
 }
 
 message OpenReadSessionRequest {
@@ -1101,6 +1106,27 @@ message OpenReadSessionRequest {
     TapeTarget  tape_target  = 2;
   }
   IdempotencyKey idempotency_key = 3;
+  // Durable coordinates for a cold resume. This deliberately contains no
+  // session_id: every resume open creates a fresh read session.
+  ReadResumeTarget resume_target = 4;
+}
+
+message ReadResumeTarget {
+  bytes tape_uuid                    = 1;
+  bytes object_id                    = 2;
+  bytes file_id                      = 3;
+  // Object-local byte offset of the file's first body chunk. The server
+  // rejects offsets that do not equal the catalogued file boundary.
+  uint64 file_boundary_byte_offset   = 4;
+  optional uint64 expected_position_lba = 5;
+  optional uint64 daemon_epoch       = 6;
+}
+
+// Caller-visible proof produced by READ POSITION after resume positioning.
+message DevicePositionProof {
+  // Uses the established AppendCommitInfo.position_after_lba uint64 LBA wire
+  // representation; it is not a byte offset.
+  uint64 position_after_lba = 1;
 }
 
 message CloseReadSessionRequest {
