@@ -48,7 +48,9 @@ foreign-bru = ["dep:remanence-bru"]
 [dev-dependencies]
 remanence-chaos = { path = "../remanence-chaos" }
 rusqlite = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

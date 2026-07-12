@@ -39,6 +39,57 @@ const READ_STREAM_CHANNEL_MAX_MESSAGES: usize = 1024;
 const READ_DELIVERY_PROOF_SLOTS: usize = 4;
 const MAX_READ_RESERVOIR_SLABS: usize = 131_072;
 const T_REPROOF_INCIDENTAL: Duration = Duration::from_millis(250);
+const READ_DIAG_SCHEMA_VERSION: u64 = 1;
+static NEXT_READ_DIAG_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Stable, log-scraped read-pipeline diagnostic schema (version 1).
+///
+/// The daemon's flattened JSON tracing formatter emits every field below on
+/// exactly two single-line events per pipeline: `open` and `close`. Fields are
+/// never added from the per-block submitter loop. Consumers must select target
+/// `remanence_read_diag`, validate `schema_version`, correlate `session_id`,
+/// and treat this fixed key set as the versioned acceptance interface.
+#[derive(Clone, Copy)]
+struct ReadDiagRecord {
+    phase: &'static str,
+    session_id: u64,
+    block_size_bytes: u64,
+    batch_records: u64,
+    minimum_slabs: u64,
+    maximum_slabs: u64,
+    effective_reservoir_bytes: u64,
+    reservoir_high_watermark: u64,
+    occupancy_bytes: u64,
+    park_cycles: u64,
+    park_us: u64,
+    free_wait_us: u64,
+    feed_gap_total_us: u64,
+    feed_gap_max_us: u64,
+    feed_gap_samples: u64,
+}
+
+fn emit_read_diag(record: ReadDiagRecord) {
+    tracing::info!(
+        target: "remanence_read_diag",
+        schema_version = READ_DIAG_SCHEMA_VERSION,
+        event = "read_pipeline_diag",
+        phase = record.phase,
+        session_id = record.session_id,
+        block_size_bytes = record.block_size_bytes,
+        batch_records = record.batch_records,
+        minimum_slabs = record.minimum_slabs,
+        maximum_slabs = record.maximum_slabs,
+        effective_reservoir_bytes = record.effective_reservoir_bytes,
+        reservoir_high_watermark = record.reservoir_high_watermark,
+        occupancy_bytes = record.occupancy_bytes,
+        park_cycles = record.park_cycles,
+        park_us = record.park_us,
+        free_wait_us = record.free_wait_us,
+        feed_gap_total_us = record.feed_gap_total_us,
+        feed_gap_max_us = record.feed_gap_max_us,
+        feed_gap_samples = record.feed_gap_samples,
+    );
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WatermarkSubmitterState {
@@ -614,16 +665,25 @@ fn run_read_pipeline<T: Send>(
         "allocated buffers exceed delivery capacity"
     );
 
-    tracing::info!(
-        target: "remanence_read_diag",
-        phase = "read_reservoir_open",
-        block_size_bytes = block_size,
-        batch_records,
-        minimum_slabs,
-        maximum_slabs = max_slabs,
-        effective_reservoir_bytes = effective_capacity_bytes,
-        "remanence_read_diag",
-    );
+    let diag_session_id = NEXT_READ_DIAG_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+    let diag_base = ReadDiagRecord {
+        phase: "open",
+        session_id: diag_session_id,
+        block_size_bytes: block_size as u64,
+        batch_records: u64::from(batch_records),
+        minimum_slabs: minimum_slabs as u64,
+        maximum_slabs: max_slabs as u64,
+        effective_reservoir_bytes: effective_capacity_bytes,
+        reservoir_high_watermark: reservoir.high_bytes.load(Ordering::Acquire),
+        occupancy_bytes: 0,
+        park_cycles: 0,
+        park_us: 0,
+        free_wait_us: 0,
+        feed_gap_total_us: 0,
+        feed_gap_max_us: 0,
+        feed_gap_samples: 0,
+    };
+    emit_read_diag(diag_base);
 
     let result = std::thread::scope(|scope| {
         let decode_reservoir = Arc::clone(&reservoir);
@@ -729,7 +789,7 @@ fn run_read_pipeline<T: Send>(
                             Err(err) => {
                                 if !growth_warned {
                                     tracing::warn!(
-                                        target: "remanence_read_diag",
+                                        target: "remanence_read_reservoir",
                                         reason = %err,
                                         allocated,
                                         "read reservoir growth stopped at effective cap",
@@ -882,18 +942,18 @@ fn run_read_pipeline<T: Send>(
         }
         decode_result
     });
-    tracing::info!(
-        target: "remanence_read_diag",
-        phase = "read_reservoir_close",
-        occupancy_bytes = reservoir.occupancy_bytes.load(Ordering::Acquire),
-        park_cycles = reservoir.park_cycles.load(Ordering::Relaxed),
-        park_us = reservoir.park_us.load(Ordering::Relaxed),
-        free_wait_us = reservoir.free_wait_us.load(Ordering::Relaxed),
-        feed_gap_total_us = reservoir.feed_gap_total_us.load(Ordering::Relaxed),
-        feed_gap_max_us = reservoir.feed_gap_max_us.load(Ordering::Relaxed),
-        feed_gap_samples = reservoir.feed_gap_samples.load(Ordering::Relaxed),
-        "remanence_read_diag",
-    );
+    emit_read_diag(ReadDiagRecord {
+        phase: "close",
+        reservoir_high_watermark: reservoir.high_bytes.load(Ordering::Acquire),
+        occupancy_bytes: reservoir.occupancy_bytes.load(Ordering::Acquire),
+        park_cycles: reservoir.park_cycles.load(Ordering::Relaxed),
+        park_us: reservoir.park_us.load(Ordering::Relaxed),
+        free_wait_us: reservoir.free_wait_us.load(Ordering::Relaxed),
+        feed_gap_total_us: reservoir.feed_gap_total_us.load(Ordering::Relaxed),
+        feed_gap_max_us: reservoir.feed_gap_max_us.load(Ordering::Relaxed),
+        feed_gap_samples: reservoir.feed_gap_samples.load(Ordering::Relaxed),
+        ..diag_base
+    });
     result
 }
 
@@ -1433,15 +1493,141 @@ impl Write for ChannelWriter {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::io;
+
     use remanence_format::{
         write_rem_tar_object, RemTarEntrySink, RemTarEntryType, RemTarFile, RemTarObjectOptions,
         RemTarStreamEntry,
     };
     use remanence_library::{VecBlockSink, VecBlockSource, VecBlockSourceCall};
+    use serde_json::Value;
     use sha2::{Digest, Sha256};
     use tokio_stream::StreamExt;
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct SharedLogGuard(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for SharedLogGuard {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SharedLogWriter {
+        type Writer = SharedLogGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogGuard(Arc::clone(&self.0))
+        }
+    }
+
+    fn capture_read_diag<T>(run: impl FnOnce() -> T) -> (T, Vec<Value>) {
+        let writer = SharedLogWriter::default();
+        let bytes = Arc::clone(&writer.0);
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .without_time()
+            .with_writer(writer)
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, run);
+        let output = String::from_utf8(
+            bytes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
+        )
+        .expect("diagnostic log is UTF-8");
+        let events = output
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("diagnostic line is JSON"))
+            .filter(|event: &Value| {
+                event.get("target").and_then(Value::as_str) == Some("remanence_read_diag")
+            })
+            .collect();
+        (result, events)
+    }
+
+    fn diag_u64(event: &Value, key: &str) -> u64 {
+        event
+            .get(key)
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("diagnostic field {key} is missing or not u64: {event}"))
+    }
+
+    fn assert_read_diag_schema(event: &Value) {
+        let expected = [
+            "batch_records",
+            "block_size_bytes",
+            "effective_reservoir_bytes",
+            "event",
+            "feed_gap_max_us",
+            "feed_gap_samples",
+            "feed_gap_total_us",
+            "free_wait_us",
+            "maximum_slabs",
+            "minimum_slabs",
+            "occupancy_bytes",
+            "park_cycles",
+            "park_us",
+            "phase",
+            "reservoir_high_watermark",
+            "schema_version",
+            "session_id",
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let actual = event
+            .as_object()
+            .expect("diagnostic event is an object")
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !matches!(*key, "timestamp" | "level" | "target"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected, "version 1 diagnostic key set changed");
+        assert_eq!(
+            event.get("target").and_then(Value::as_str),
+            Some("remanence_read_diag")
+        );
+        assert_eq!(event.get("level").and_then(Value::as_str), Some("INFO"));
+        assert_eq!(diag_u64(event, "schema_version"), 1);
+        assert_eq!(
+            event.get("event").and_then(Value::as_str),
+            Some("read_pipeline_diag")
+        );
+        for key in [
+            "batch_records",
+            "block_size_bytes",
+            "effective_reservoir_bytes",
+            "feed_gap_max_us",
+            "feed_gap_samples",
+            "feed_gap_total_us",
+            "free_wait_us",
+            "maximum_slabs",
+            "minimum_slabs",
+            "occupancy_bytes",
+            "park_cycles",
+            "park_us",
+            "reservoir_high_watermark",
+            "schema_version",
+            "session_id",
+        ] {
+            let _ = diag_u64(event, key);
+        }
+    }
 
     struct InstrumentedReadSource {
         inner: VecBlockSource,
@@ -2181,6 +2367,61 @@ mod tests {
     }
 
     #[test]
+    fn read_pipeline_diag_open_and_close_have_stable_json_schema() {
+        let mut source = InstrumentedReadSource {
+            inner: VecBlockSource::new((0u8..4).map(|value| vec![value; 4]).collect())
+                .with_read_batch_blocks_for_test(2),
+            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            proofs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail_proof_at: None,
+        };
+        let expected = source.position().expect("window cursor");
+        let (result, events) = capture_read_diag(|| {
+            run_read_pipeline(
+                &mut source,
+                4,
+                4,
+                expected,
+                ReadPipelineConfig {
+                    reservoir_bytes: 32,
+                    high_pct: 50,
+                    low_pct: 25,
+                    ranged_frontier: false,
+                    proof_cadence_bytes: 8,
+                    terminal: None,
+                },
+                IoMemoryReservation::new(64).expect("manager"),
+                |handoffs| {
+                    for _ in 0..4 {
+                        let mut block = [0; 4];
+                        assert_eq!(handoffs.read_block(&mut block)?, 4);
+                    }
+                    Ok(())
+                },
+            )
+        });
+        result.expect("pipeline");
+
+        assert_eq!(events.len(), 2, "one OPEN and one CLOSE event are required");
+        for event in &events {
+            assert_read_diag_schema(event);
+        }
+        assert_eq!(events[0].get("phase").and_then(Value::as_str), Some("open"));
+        assert_eq!(
+            events[1].get("phase").and_then(Value::as_str),
+            Some("close")
+        );
+        assert_eq!(
+            diag_u64(&events[0], "session_id"),
+            diag_u64(&events[1], "session_id"),
+            "OPEN and CLOSE must correlate"
+        );
+        assert_eq!(diag_u64(&events[0], "park_cycles"), 0);
+        assert_eq!(diag_u64(&events[0], "occupancy_bytes"), 0);
+    }
+
+    #[test]
     fn slow_consumer_parks_reproves_and_keeps_one_command_in_flight() {
         let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let max_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2195,34 +2436,48 @@ mod tests {
         };
         let expected = source.position().expect("window cursor");
         let manager = IoMemoryReservation::new(64).expect("manager");
-        let restored = run_read_pipeline(
-            &mut source,
-            4,
-            10,
-            expected,
-            ReadPipelineConfig {
-                reservoir_bytes: 32,
-                high_pct: 50,
-                low_pct: 25,
-                ranged_frontier: false,
-                proof_cadence_bytes: 8,
-                terminal: None,
-            },
-            manager,
-            |handoffs| {
-                let mut restored = Vec::new();
-                for _ in 0..10 {
-                    let mut block = [0; 4];
-                    assert_eq!(handoffs.read_block(&mut block)?, 4);
-                    restored.push(block[0]);
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                Ok(restored)
-            },
-        )
-        .expect("pipeline");
+        let (restored, events) = capture_read_diag(|| {
+            run_read_pipeline(
+                &mut source,
+                4,
+                10,
+                expected,
+                ReadPipelineConfig {
+                    reservoir_bytes: 32,
+                    high_pct: 50,
+                    low_pct: 25,
+                    ranged_frontier: false,
+                    proof_cadence_bytes: 8,
+                    terminal: None,
+                },
+                manager,
+                |handoffs| {
+                    let mut restored = Vec::new();
+                    for _ in 0..10 {
+                        let mut block = [0; 4];
+                        assert_eq!(handoffs.read_block(&mut block)?, 4);
+                        restored.push(block[0]);
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Ok(restored)
+                },
+            )
+        });
+        let restored = restored.expect("pipeline");
 
         assert_eq!(restored, (0u8..10).collect::<Vec<_>>());
+        assert_eq!(events.len(), 2, "slow harness must scrape OPEN and CLOSE");
+        let close = &events[1];
+        assert_read_diag_schema(close);
+        assert_eq!(close.get("phase").and_then(Value::as_str), Some("close"));
+        assert!(
+            diag_u64(close, "park_cycles") >= 2,
+            "slow consumer must park the drive repeatedly: {close}"
+        );
+        assert!(
+            diag_u64(close, "occupancy_bytes") <= diag_u64(close, "reservoir_high_watermark"),
+            "reported reservoir occupancy must remain bounded: {close}"
+        );
         assert_eq!(max_in_flight.load(Ordering::Acquire), 1);
         assert!(
             proofs.load(Ordering::Acquire) >= 2,
