@@ -37,7 +37,9 @@ pub use key_frame::{
 pub use metadata::RaoMetadata;
 pub use open::{open, open_envelope, open_envelope_to_vec, open_to_vec, OpenReport};
 pub use range::{
-    open_inner_range_to_vec, open_plaintext_range_envelope_to_vec, open_plaintext_range_to_vec,
+    covering_stored_range, covering_stored_range_envelope, open_inner_range_to_vec,
+    open_plaintext_range_envelope_from_reader, open_plaintext_range_envelope_to_vec,
+    open_plaintext_range_from_reader, open_plaintext_range_to_vec, CoveringStoredRange,
     RangeOpenReport,
 };
 pub use seal::{
