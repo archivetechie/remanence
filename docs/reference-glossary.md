@@ -3,7 +3,7 @@
 Project-internal terms and the tape-industry vocabulary Remanence leans
 on. Definitions reflect what the code does today, not aspirations.
 
-<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-aead/src/header.rs crates/remanence-parity/src/lib.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-aead/src/header.rs crates/remanence-parity/src/lib.rs @ 2a20106 -->
 ## Formats and objects
 
 **RAO** — Rem Archive Object, the native stored-object format. One RAO
@@ -15,7 +15,28 @@ manifest. Readable with stock `tar`.
 
 **RAO1** — the encrypted representation of an RAO object: a 128-byte
 header (magic `RAO1`), HKDF-SHA-256 key derivation, and a
-ChaCha20-Poly1305 STREAM over the tar bytes.
+ChaCha20-Poly1305 STREAM over the tar bytes. Comes in two key-wrapping
+shapes sharing that same AEAD suite — see **format version 1/2** below.
+
+**format version 1 (registry key)** — the original RAO1 shape: the
+caller supplies one 32-byte symmetric root key (named by a 16-byte key
+id) that every reader must also hold. Produced by `rem archive build
+--encrypt`.
+
+**format version 2 (HPKE envelope)** — a RAO1 shape with no shared
+secret: a fresh per-object **data-encryption key (DEK)** is generated
+and wrapped once per recipient with HPKE (RFC 9180, X25519-HKDF-SHA256-
+ChaCha20Poly1305) into a **key frame** (wire tag `RAOK`, 1-8 recipient
+slots) sitting between the header and the metadata frame. Produced only
+by `rem archive reseal` (a one-shot v1→v2 conversion); opened only by
+`rao-recover` or the crate-internal `open_envelope` function — neither
+`rem` nor `rem-debug` exposes a whole-object v2 open.
+
+**covering range** — the mapping, computed once by `remanence-aead`,
+from a requested plaintext byte range to the smallest span of AEAD
+chunks (and their stored ciphertext byte offsets) that must be fetched
+and authenticated to serve it. What `rem archive covering-range` prints
+and `extract-stream`'s ranged mode consumes.
 
 **REM-PARITY** — the tape-layout-plus-parity format: bootstrap blocks,
 object tape files, Reed-Solomon parity sidecars, and parity maps.
@@ -54,7 +75,7 @@ entries.
 Remanence reads BRU/BRU-PE dumps through the `bru` foreign-format driver
 for migrating old archives; it never writes them.
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/pool_write.rs crates/remanence-state/src/index.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/pool_write.rs crates/remanence-state/src/index.rs @ 2a20106 -->
 ## Catalog and daemon
 
 **catalog** — the queryable model of what is on which tape. The durable
@@ -96,15 +117,49 @@ queryable and cancellable via `rem op`.
 
 **session** — the daemon's write or read transaction: open, append or
 read, checkpoint, close. Sessions have idle timeouts and abort paths.
+Every open always mints a brand-new session id — sessions never
+continue across a client restart; see **cold resume** below for what a
+read session offers instead. Write sessions have no restart contract at
+all (`recover_session_id` returns unimplemented).
+
+**cold resume / resume target** — a read-only alternative to session
+continuation: a client that lost its session id (typically across an
+app restart) can reopen with a *resume target* — durable coordinates
+`(tape_uuid, object_id, file_id, file_boundary_byte_offset)` it saved
+itself — instead of nothing. The daemon still mints a fresh session, but
+first re-verifies the mounted tape's identity against `tape_uuid`
+(rejecting a swapped cartridge before trusting any position) and
+relocates to the exact catalogued file boundary (never mid-file).
+
+**position proof** — a real SCSI READ POSITION result (not an arithmetic
+estimate) returned to a caller as evidence of where the drive actually
+is. Long-standing on the write side; RM3.1b added it to read-session
+opens (including cold resumes) too.
+
+**daemon epoch** — a random value minted once when `rem-daemon` starts
+and returned on every `ReadSession`, letting a client detect that it's
+now talking to a restarted daemon instance by diffing epochs. (The
+request side of this field, `prior_daemon_epoch`, is currently decoded
+but never checked against anything — a client can't yet ask the daemon
+to reject a stale-epoch resume.)
+
+**advisory arbitration surface / drive assignment** — a read-only
+projection (`GetLiveStatusResponse.drive_assignments`) of the existing
+per-`(library_serial, bay)` atomic reservation, exposed for an external
+arbitration client to make scheduling decisions against. It cannot gate,
+queue, or block a mount — the atomic reservation itself remains the sole
+enforcement path, unchanged by this projection existing. `rem top` does
+not currently render it.
 
 **spool** — the daemon's pre-commit staging directory for appends
-(default `<state_dir>/spool`).
+(default `<state_dir>/spool`), sized from the shared `io_memory_ceiling`
+budget (see **I/O memory ceiling** below).
 
 **drive stewardship** — the drive-fleet lifecycle machinery: identity by
 drive UUID, health snapshots, TapeAlert polling, cleaning runs, history,
 annotation, retirement.
 
-<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-library/src/handle/mod.rs crates/remanence-state/src/index.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-library/src/handle/mod.rs crates/remanence-state/src/index.rs @ 2a20106 -->
 ## Safety machinery
 
 **allowlist** — the explicit list of library serials a process may
@@ -138,6 +193,44 @@ tapes, never in batch).
 **media optimization / conditioning** — the one-time calibration pass an
 LTO-9 cartridge performs on first load; can exceed an hour and is why
 readiness waits default to 2.5h.
+
+**poison** — a fail-closed "don't proceed" mark set after a failed data
+command, at two independent scopes. *Transfer poison* discards the rest
+of one already-failing `AppendObject` call's queued staging-ring
+batches. *Session poison* (`AppendGate`) fails every subsequent append
+for the rest of that write session, permanently — the fix is to close
+the session and open a new one, not retry. Distinct from a **dirty
+snapshot** (a library/robotics-layer concern) and from a **fence** (a
+durable, catalog-persisted refusal); see
+[troubleshooting](guide-troubleshooting.md#dirty-snapshots-and-completion-unknown).
+
+**staging ring** — the fixed pool of page-aligned buffers
+(`tape_io.staging_ring_buffers`, default 4) a write session's producer
+thread fills while a submitter issues one blocking tape-write command at
+a time. The only tape I/O path — there is no non-pipelined fallback.
+
+**read reservoir / watermark stop-start** — the host-RAM buffer a read
+session's submitter fills up to a high watermark
+(`tape_io.read_reservoir_high_pct`, default 90%) before parking the
+drive, resuming only once the consumer has drained it below the low
+watermark (`tape_io.read_reservoir_low_pct`, default 25%). Every resume
+from a park forces a fresh **position proof**, not just a periodic one.
+
+**proof-frontier** — for byte-range reads, the rule that data is never
+handed to the decoder until a real position proof has "covered" it —
+preventing a caller from receiving bytes the drive hasn't actually
+confirmed reaching.
+
+**position tripwire** — the periodic real READ POSITION check
+(`tape_io.position_check_bytes`, default 1 GiB) during a long write or
+read that catches silent arithmetic position drift between checks.
+
+**I/O memory ceiling** (`daemon.io_memory_ceiling`, default 24 GiB) —
+the one shared budget every pipeline consumer draws from: the append
+spool and every drive's read reservoir. Enforced by a single atomic
+permit manager; exceeding it at daemon startup (via `validate_config`)
+or at read-pipeline-start (if the reservoir can't fit its minimum
+staging pool) is a hard error, not a soft degrade.
 
 <!-- code-anchor: none -->
 ## Tape and SCSI background

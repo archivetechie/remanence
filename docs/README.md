@@ -26,25 +26,32 @@ User-facing documentation, kept current against the code:
 - [reference-glossary.md](reference-glossary.md) — project and tape
   vocabulary.
 
-<!-- code-anchor: crates/remanence-api/src/lib.rs crates/remanence-api/src/library.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-api/src/lib.rs crates/remanence-api/src/library.rs @ 2a20106 -->
 ## Current implementation status
 
 Remanence is pre-alpha, but the implemented surface covers the whole
 stack:
 
 - Layers 1 through 4 have working Rust implementations: SCSI primitives,
-  library discovery/robotics/watching, batched tape I/O, the rao-v1 and
-  RAO1 formats, sidecar parity with recovery and scan, and the
+  library discovery/robotics/watching, pipelined batched tape I/O (the
+  sole write/read path, staging-ring backed), the rao-v1 format, the
+  RAO1 envelope in both v1 (registry key) and v2 (multi-recipient HPKE)
+  shapes, sidecar parity with recovery and scan, and the
   audit/journal/SQLite state layer.
 - Layer 5 serves catalog reads, pool-targeted write sessions,
-  object/file/byte-range read sessions, operation tracking and
-  cancellation, library inspection and robotics, drive stewardship,
-  alarms, and live status over Unix-socket and mTLS TCP transports.
+  object/file/byte-range read sessions (including an app-restart
+  cold-resume contract with tape-identity verification and device
+  position proofs), an advisory per-drive assignment projection for
+  external arbitration, operation tracking and cancellation, library
+  inspection and robotics, drive stewardship, alarms, and live status
+  over Unix-socket and mTLS TCP transports.
 - Legacy BRU read support and restore/recovery streaming sinks are
-  present (feature-gated).
+  present (feature-gated). A standalone `rao-recover` binary decrypts
+  either envelope version with no daemon or catalog dependency.
 - Remaining Layer 5 work includes authorization depth, serving the
-  audit-query service, live library-event streaming, session
-  checkpointing, and parity-tape append.
+  audit-query service, live library-event streaming and mailslot
+  import/export, write-session checkpointing and restart, and
+  parity-tape append.
 
 The detailed Layer 5 slice status is maintained in
 [layer5-roadmap.md](layer5-roadmap.md).
@@ -86,14 +93,14 @@ their section numbers. When a historical design note conflicts with
 current code, the code wins; the current user-facing docs above are kept
 verified against it.
 
-<!-- code-anchor: Cargo.toml @ 7fb10f8 -->
+<!-- code-anchor: Cargo.toml @ 2a20106 -->
 ## Crate map
 
 ```text
 remanence-scsi           Layer 1 SCSI CDB and SG_IO primitives
 remanence-library        Layer 2 discovery/ops/watch and Layer 3a tape I/O
 remanence-crc            Shared CRC-64/XZ
-remanence-aead           RAO1 encrypted-envelope primitives
+remanence-aead           RAO1 encrypted-envelope primitives (v1 registry key + v2 HPKE)
 remanence-format-driver  Published format-driver traits
 remanence-format         Native rao-v1 body format
 remanence-bru            Legacy BRU archive reader
@@ -103,6 +110,7 @@ remanence-state          Layer 4 catalog, audit log, config, lock protocol
 remanence-api            Layer 5 gRPC service implementations
 remanence-daemon         rem-daemon service host
 remanence-cli            rem and rem-debug command surfaces
+rao-recover              Standalone catalogless RAO disaster-recovery binary
 remanence-chaos          Fault-injection scaffolding
 ```
 
