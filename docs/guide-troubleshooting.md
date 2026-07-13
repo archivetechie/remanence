@@ -5,7 +5,7 @@ recurring theme: when the stack cannot prove what state the hardware is in,
 it stops and says so rather than guessing. Most of what looks like an outage
 is a fence doing its job.
 
-<!-- code-anchor: crates/remanence-library/src/error.rs crates/remanence-cli/src/lib.rs crates/remanence-scsi/src/error.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-library/src/error.rs crates/remanence-cli/src/lib.rs crates/remanence-scsi/src/error.rs @ 2a20106 -->
 ## Discovery finds no libraries
 
 `rem libraries` reporting `no tape libraries reachable on this host` has
@@ -42,7 +42,7 @@ For the daemon under systemd, grant the capability in the unit instead:
 check that `/dev/sg*` nodes exist at all (no HBA, no VTL, or the module
 is not loaded).
 
-<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-cli/src/lib.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-cli/src/lib.rs @ 2a20106 -->
 ## Media-readiness fences and quarantine
 
 Remanence classifies TEST UNIT READY results into an explicit readiness
@@ -91,7 +91,7 @@ The `--ack` text is recorded. The fence is deliberately annoying: its
 whole purpose is that nobody writes to a tape whose state was last seen
 mid-uncertainty.
 
-<!-- code-anchor: crates/remanence-library/src/handle/mod.rs crates/remanence-library/src/handle/tape_io/mod.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-library/src/handle/mod.rs crates/remanence-library/src/handle/tape_io/mod.rs @ 2a20106 -->
 ## Dirty snapshots and completion-unknown
 
 For every state-changing SCSI command, Remanence distinguishes "the device
@@ -103,7 +103,16 @@ partway marks it `PartialFailure`. A dirty snapshot means: refresh or
 `rem-debug rescan` before trusting either endpoint of the last move. The
 error string to look for is `transport error (completion unknown)`.
 
-<!-- code-anchor: crates/remanence-daemon/src/main.rs crates/remanence-daemon/src/tls.rs crates/remanence-state/src/error.rs crates/remanence-state/src/config.rs @ 7fb10f8 -->
+This is a *robotics/library-snapshot* concept, distinct from the
+write-path's own fail-closed mechanisms (see [Writes are
+refused](#writes-are-refused) below): a reset UNIT ATTENTION also
+invalidates the drive handle's own notion of tape position and mode
+until it's re-verified, and a failed data command can additionally
+poison the write transfer or the whole write session. All three are
+independent "don't trust what you can't prove" mechanisms at different
+layers — seeing one does not imply the others tripped too.
+
+<!-- code-anchor: crates/remanence-daemon/src/main.rs crates/remanence-daemon/src/tls.rs crates/remanence-state/src/error.rs crates/remanence-state/src/config.rs @ 2a20106 -->
 ## The daemon refuses to start
 
 `rem-daemon` checks its world in order and exits 1 with a specific
@@ -111,15 +120,34 @@ error string to look for is `transport error (completion unknown)`.
 
 | Message | Cause and fix |
 |---|---|
-| `error: load config ...` | TOML parse or validation failure. Unknown keys are hard errors; all paths must be absolute; `listen` requires `[daemon.tls]`. |
-| `state lock is already held: <path>` | Another daemon (or a crashed one's live process) owns the state dir. One daemon per state dir. |
+| `error: load config ...` | TOML parse or validation failure. Unknown keys are hard errors; all paths must be absolute; `listen` requires `[daemon.tls]`; `tape_io.legacy_single_block`/`tape_io.pipelined_submission` are removed keys that fail to load with a migration-specific message — the pipelined path is now the only one, delete the key. |
+| `daemon.io_memory_ceiling must be non-zero` / `... exceeds daemon.io_memory_ceiling` (on `spool_tmpfs_ram_budget` or `tape_io.read_reservoir_bytes`) | The shared I/O memory budget is zero, or a per-purpose reservation exceeds it. `io_memory_ceiling` (default 24 GiB) is the hard cap shared by the append spool and every drive's read reservoir. |
+| `tape_io reservoir watermarks require 0 < read_reservoir_low_pct < read_reservoir_high_pct <= 100` | Watermark percentages misordered or out of range. |
+| `tape_io.staging_ring_buffers` validation failure | Must be in `2..=16`. |
 | `untrusted state volume ...` | State, journal, audit, index, cache, or socket path sits on tmpfs/NFS/SMB/overlayfs and `journal.require_trusted_volume` is `true` (the default). Move the state or consciously disable the check. |
 | `error: configure spool dir ...` | The spool resolved to tmpfs and `spool_tmpfs_ram_budget` is not set. Spooling to RAM needs an explicit budget acknowledgement. |
 | `TLS private key ... has insecure permissions` | The key file is group- or world-accessible. `chmod 600` it. |
 | `startup blocked by active tape-I/O fence <id> ...` | A write was interrupted in a completion-unknown state before shutdown. `rem tape quarantine release <id>` after verifying the tape, as the message says. |
 | `error: discover libraries: ...` | Same permission gates as the CLI (tape group + `CAP_SYS_RAWIO`, via systemd `AmbientCapabilities` for a service). |
 
-<!-- code-anchor: crates/remanence-api/src/pool_write.rs crates/remanence-parity/src/error.rs @ 7fb10f8 -->
+Two non-fatal, stderr-only warnings worth recognizing (they don't stop
+startup): `daemon.io_memory_ceiling=... exceeds startup MemAvailable=...;
+the fixed ceiling remains authoritative` and `daemon.io_memory_ceiling=...
+exceeds LimitMEMLOCK=...; minimum read reservoirs will refuse to start if
+they cannot be locked` — both are sanity checks against the host's actual
+memory/mlock limits, checked once at startup; the ceiling itself is what
+the daemon actually enforces at runtime.
+
+**There is no "another daemon already owns this state dir" startup
+check.** `rem-daemon` never takes the `state.lock` file at all (only
+`rem-debug`'s offline state-mutating subcommands do — see the
+[configuration reference](reference-configuration.md#what-ends-up-on-disk));
+its only concurrent-instance guard is a liveness probe on its own Unix
+socket path (`AddrInUse` if something is already listening there). Two
+daemons pointed at the same `state_dir` with *different* `socket_path`s
+will both start — this is a known gap, not a safety net you can rely on.
+
+<!-- code-anchor: crates/remanence-api/src/pool_write.rs crates/remanence-parity/src/error.rs @ 2a20106 -->
 ## Writes are refused
 
 Pool writes fail closed on a set of preconditions. The common refusals:
@@ -136,8 +164,19 @@ Pool writes fail closed on a set of preconditions. The common refusals:
 - `medium is write-protected` — the physical tab.
 - `daemon has no write spool (read-only mode)` — the daemon is running
   with `read_only = true`.
+- `write session poisoned by a failed append; abort the session and open
+  a new one` — the session-level poison: the first failed `AppendObject`
+  in a write session poisons it permanently, so a retry cannot silently
+  start writing a fresh mid-tape bootstrap. There is no way to clear this
+  short of closing the session and opening a new one. This is separate
+  from (and stricter than) the per-transfer staging-ring poison, which is
+  scoped to discarding the rest of one already-failing `AppendObject`
+  call rather than the whole session.
+- `staging ring accounting imbalance` — an internal invariant violation
+  in the pipelined write path (allocated/returned buffer counts don't
+  match at transfer end); treat as a bug report, not an operator action.
 
-<!-- code-anchor: crates/remanence-daemon/src/main.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-daemon/src/main.rs @ 2a20106 -->
 ## Reading the logs
 
 The daemon logs JSON to stderr, one flattened object per event, filtered
@@ -147,18 +186,35 @@ carry `tape_uuid`, `pool_id`, and `session_id` fields, so `jq
 not use the tracing stack at all: `rem` and `rem-debug` print
 human-readable text, or stable JSON with `--json`.
 
+Read-pipeline health has its own structured event: every read session
+emits exactly two JSON log lines, `target: "remanence_read_diag"`, one
+`phase: "open"` and one `phase: "close"`, with reservoir occupancy,
+park-cycle count, and feed-gap timing fields. `jq 'select(.target ==
+"remanence_read_diag")'` isolates them; a `park_cycles` that keeps
+climbing across sessions, or an `occupancy_bytes` close to
+`reservoir_high_watermark` at close, points at a consumer that can't
+keep up with the drive (increase `tape_io.read_reservoir_bytes`, or
+speed up the reader) rather than a hardware fault.
+
 Strings worth grepping for, mapped to the sections above:
 
 | String | Points at |
 |---|---|
 | `no tape libraries reachable` | permissions or no hardware |
 | `every SCSI probe returned EPERM` | missing CAP_SYS_RAWIO |
-| `state lock is already held` | second daemon on one state dir |
+| `was removed; the pipelined fixed-block path is now the only tape I/O path` | stale `tape_io.legacy_single_block`/`pipelined_submission` key in config |
 | `blocked by active media-readiness fence` | quarantined media |
 | `startup blocked by active tape-I/O fence` | interrupted write before restart |
 | `transport error (completion unknown)` | dirty snapshot; rescan |
+| `write session poisoned by a failed append` | session-level write poison; open a new session |
 | `has insecure permissions` | TLS key mode |
 | `read-only mode` | daemon started with `read_only = true` |
+| `remanence_read_diag` (as `target`) | read-pipeline reservoir/backpressure diagnostics, see above |
+
+Note there is deliberately no `state lock is already held` row here —
+`rem-daemon` itself never takes that lock (see [The daemon refuses to
+start](#the-daemon-refuses-to-start)); you would only see that message
+from a `rem-debug` state-mutating subcommand racing another one.
 
 <!-- code-anchor: none -->
 ## Known open issue

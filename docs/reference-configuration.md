@@ -1,6 +1,6 @@
 # Configuration reference
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-daemon/src/main.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-daemon/src/main.rs @ 2a20106 -->
 ## The config file
 
 Remanence reads a single TOML file. There is no config-file search path and
@@ -46,12 +46,12 @@ string with a suffix: `B`, `KiB`/`K`/`KB`, `MiB`/`M`/`MB`, `GiB`/`G`/`GB`,
 `TiB`/`T`/`TB`, `PiB`/`P`/`PB`. Every suffix is a power of 1024 — `KB` means
 1024 bytes here, not 1000.
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-daemon/src/main.rs crates/remanence-daemon/src/tls.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-daemon/src/main.rs crates/remanence-daemon/src/tls.rs @ 2a20106 -->
 ## `[daemon]` (required)
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `state_dir` | absolute path | required | Root directory for mutable daemon state (lock file, default socket, default spool). |
+| `state_dir` | absolute path | required | Root directory for mutable daemon state (default socket, default spool, and — only for `rem-debug` state-mutating subcommands, not `rem-daemon` itself — `state.lock`; see [What ends up on disk](#what-ends-up-on-disk)). |
 | `default_idle_timeout_seconds` | integer > 0 | required | Default idle timeout for write/read sessions. |
 | `spool_dir` | absolute path | `<state_dir>/spool` | Pre-commit append spool. Created with mode `0700` at startup. |
 | `spool_tmpfs_ram_budget` | byte size > 0 | unset | Required acknowledgement when the spool resolves to tmpfs/ramfs. Post-R2, spool growth reserves this fixed budget from the shared `io_memory_ceiling`; runtime `MemAvailable` never clamps or authorizes growth. Must be ≤ `io_memory_ceiling`. |
@@ -121,7 +121,7 @@ park-indefinitely-for-slow-but-alive-clients policy coherent; it is
 verified by the half-open-while-parked integration test required by the
 TIO-6 design (§10).
 
-<!-- code-anchor: crates/remanence-state/src/config.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs @ 2a20106 -->
 ## `[[libraries]]`
 
 An array of tables, one per tape library the daemon may operate. This is the
@@ -138,7 +138,7 @@ but never mutated. Serials must be non-empty and unique.
 serial = "DEC91001xx"
 ```
 
-<!-- code-anchor: crates/remanence-state/src/config.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs @ 2a20106 -->
 ## `[[tape_pools]]` and `[[tape_pool_rules]]`
 
 Tape pools group cartridges for write targeting; a write session names a
@@ -171,7 +171,7 @@ prefix = "RMA"
 pool_id = "archive-a"
 ```
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/lib.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/lib.rs @ 2a20106 -->
 ## `[drives]`
 
 Drive-stewardship settings. The whole section is optional.
@@ -208,7 +208,7 @@ Serves `rem top` and the live-status RPC. Optional.
 | `foreign_changer_poll` | duration string | `"60s"` | Inventory poll cadence for foreign changers while live-status clients are active. |
 | `foreign_poll_lease` | duration string | `"5m"` | How recently a client must have polled to count as active. |
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-library/src/handle/mod.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-library/src/handle/mod.rs @ 2a20106 -->
 ## `[tape_io]`
 
 Tape I/O batching and staging-ring settings. Optional. Fixed-block pipelined
@@ -225,11 +225,18 @@ submission is the only tape transfer path; removed mode keys are rejected.
 | `position_check_bytes` | byte size | `1073741824` (1 GiB) | Cadence of mid-stream READ POSITION drift tripwires. `0` disables mid-stream checks (boundary checks remain). |
 | `position_check_bytes_ranged` | byte size > 0 | `"256MiB"` | Proof cadence for hash-less ranged reads, effectively clamped to half the active reservoir. |
 
-Configuration loading rejects degenerate reservoir settings: `high ≤ low`, a
-reservoir smaller than the minimum staging pool, a per-stream reservoir above
-the shared ceiling, or a spool budget above the shared ceiling.
+Two different points enforce these constraints. Config *loading* rejects
+`high_pct ≤ low_pct` (or either out of `1..=100`/`1..=99`), a zero or
+out-of-range `staging_ring_buffers`, and a `read_reservoir_bytes` that is
+zero or exceeds `io_memory_ceiling` — these fail at daemon startup or CLI
+config load, before anything touches hardware. A reservoir smaller than
+the minimum staging pool (`staging_ring_buffers × read_batch_blocks ×
+block_size`) is instead caught later, the first time a read pipeline
+actually starts (`"read reservoir N bytes is smaller than minimum pool M
+bytes"`) — a config that passes validation can still refuse the first
+read if these two settings are mismatched.
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-state/src/paths.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-state/src/paths.rs @ 2a20106 -->
 ## `[journal]`, `[audit]`, `[index]`, `[cache]` (required)
 
 These four sections place the durable state. They are deliberately
@@ -246,7 +253,7 @@ minimal config above puts them there.
 | `index.sqlite_path` | absolute path | required | The SQLite catalog projection file. The filename is yours to choose; `rem-state.sqlite` is the conventional name. This file is a rebuildable cache — see `rem rebuild-catalog-from-journals`. |
 | `cache.tape_catalog_dir` | absolute path | required | Directory of per-tape catalog cache files. |
 
-<!-- code-anchor: crates/remanence-daemon/src/main.rs crates/remanence-chaos/src/lib.rs crates/remanence-state/src/audit.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-daemon/src/main.rs crates/remanence-chaos/src/lib.rs crates/remanence-state/src/audit.rs @ 2a20106 -->
 ## Environment variables
 
 Remanence reads very little from the environment; configuration belongs in
@@ -264,20 +271,34 @@ the config file.
 Hardware integration tests read additional `REM_QUADSTOR_*` variables; they
 are documented in the test modules and are never read by production code.
 
-<!-- code-anchor: crates/remanence-state/src/paths.rs crates/remanence-state/src/lock.rs crates/remanence-daemon/src/lib.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-state/src/paths.rs crates/remanence-state/src/lock.rs crates/remanence-daemon/src/lib.rs @ 2a20106 -->
 ## What ends up on disk
 
 For the minimal config above, a running daemon owns:
 
 ```text
-/var/lib/rem/                     state_dir (lock file with pid/host/version)
+/var/lib/rem/                     state_dir
+/var/lib/rem/state.lock           only written by rem-debug state-mutating commands (see below)
 /var/lib/rem/rem.sock             gRPC Unix socket (mode 0660)
-/var/lib/rem/spool/               pre-commit append spool (mode 0700)
+/var/lib/rem/spool/               pre-commit append spool (mode 0700, spool-<uuid>.bin files)
 /var/lib/rem/journal/*.remjournal per-tape journals (source of truth on disk)
 /var/lib/rem/audit/*.remaudit     daily append-only audit segments
 /var/lib/rem/rem-state.sqlite     rebuildable SQLite catalog projection
 /var/lib/rem/tape-catalog/        per-tape catalog cache files
 ```
+
+`state.lock` is a kernel `flock`, and **`rem-daemon` never takes it** —
+it opens the SQLite catalog and drive pool directly. Only `rem-debug`'s
+offline state-mutating subcommands (tape init, pool ops, catalog reset,
+and similar) acquire it, to serialize themselves against each other; the
+lock is released automatically if the holding process dies, regardless
+of what the file's `pid=`/`host_id=` diagnostics still say. This means
+`rem-daemon`'s only defense against a second instance starting is a
+liveness probe against its own Unix socket path at bind time — nothing
+stops two daemons with *different* `socket_path`s from both starting
+against the same `state_dir`. On startup, a non-read-only `rem-daemon`
+also deletes any of its own leftover `spool-<uuid>.bin` files from a
+prior unclean exit before resolving the spool budget.
 
 The audit log and per-tape journals are append-only records; the SQLite
 file is a projection that `rem rebuild-catalog-from-journals` can
