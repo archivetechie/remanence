@@ -1,10 +1,11 @@
 # CLI reference
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/main.rs crates/remanence-cli/src/rem_debug.rs @ 7fb10f8 -->
-## The two binaries
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/main.rs crates/remanence-cli/src/rem_debug.rs @ 2a20106 -->
+## The binaries
 
 Remanence ships two command-line tools built from `crates/remanence-cli`,
-plus the daemon binary from `crates/remanence-daemon`:
+the daemon binary from `crates/remanence-daemon`, and a standalone
+disaster-recovery binary from its own crate `crates/rao-recover`:
 
 - **`rem`** is the operator CLI. It talks to a running `rem-daemon` over
   gRPC for daemon-backed commands, and works directly against local state
@@ -21,6 +22,17 @@ plus the daemon binary from `crates/remanence-daemon`:
 - **`rem-daemon`** is the long-running Layer 5 service. It takes only
   `--config <PATH>` (default `/etc/rem/config.toml`) and `--socket <PATH>`
   (overrides the config's socket path).
+- **`rao-recover`** is a small, standalone catalogless disaster-recovery
+  tool — see [`rao-recover`: standalone recovery](#rao-recover-standalone-recovery)
+  below. It shares no code path with the daemon or the CLI's `--allow`
+  gauntlet: it doesn't touch tape, the catalog, or a config file at all,
+  only a RAO object file already sitting on disk.
+
+`rem` and `rem-debug` are two separate binaries built from the same
+`remanence-cli` crate — not aliases of one binary — sharing one large
+`clap` command tree; `rem`'s direct-hardware verbs exist in that tree
+only as hidden legacy-compatibility aliases and are documented under
+`rem-debug` below, where they're first-class.
 
 Conventions shared across both CLIs:
 
@@ -37,7 +49,7 @@ Conventions shared across both CLIs:
 Both binaries print full usage with `--help` at every level; this page is a
 map, not a substitute for it.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-library/src/handle/tape_io/readiness.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-library/src/handle/tape_io/readiness.rs @ 2a20106 -->
 ## Exit codes
 
 Most subcommands exit 0 on success and 1 on failure (2 appears for a few
@@ -60,7 +72,7 @@ finer taxonomy so scripts can branch on what the drive reported:
 The `--json` output carries the same decoding in structured form
 (`recommended_next_command`, `operator_action` fields).
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 2a20106 -->
 ## Discovery and hot-plug
 
 | Command | What it does |
@@ -73,7 +85,7 @@ Discovery is read-only but still issues SCSI commands, so it needs the
 `tape` group and `CAP_SYS_RAWIO` (see the [quickstart](guide-quickstart.md)
 and [troubleshooting](guide-troubleshooting.md)).
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 2a20106 -->
 ## Daemon queries
 
 All of these speak gRPC to `rem-daemon` and take `--endpoint` and `--json`.
@@ -91,7 +103,12 @@ All of these speak gRPC to `rem-daemon` and take `--endpoint` and `--json`.
 | `rem top [--once] [--json]` | Live TUI over daemon state; `--once` takes a single snapshot. |
 | `rem alarms [--all]` / `rem alarms ack <CONDITION_KEY>` | List standing alarms (with `--all`, cleared ones too) or acknowledge one. |
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 7fb10f8 -->
+Note: `GetLiveStatus` also carries an advisory `drive_assignments`
+projection (per-bay busy/idle state, keyed `(library_serial, bay)`) for
+an external arbitration client — `rem top` does not currently render
+this field; it's wire-only today.
+
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 2a20106 -->
 ## Drive stewardship
 
 Drive-fleet management through the daemon. A drive is addressed by serial
@@ -107,7 +124,7 @@ or UUID.
 | `rem drive annotate <DRIVE> ...` | Record purchase date, warranty, cost, and notes. |
 | `rem drive retire <DRIVE> --reason <TEXT> --i-understand-fleet-removal-is-permanent` | Permanently remove a drive from the managed fleet. |
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 2a20106 -->
 ## Tape lifecycle
 
 These run against the local config/state (not the daemon) and drive real
@@ -124,7 +141,7 @@ each initialization must pass.
 | `rem tape quarantine release <ID> --ack <TEXT> [--after-settled-inventory]` | Release a fence after operator root-cause acknowledgement. |
 | `rem tape retire <TARGET> --reason <TEXT> --i-understand-copies-become-unreadable [--dry-run]` | Permanently retire a tape identity in the local catalog. Every copy on that tape becomes unreadable through the catalog. |
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/archive_ingest.rs crates/remanence-cli/src/archive_map.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/archive_ingest.rs crates/remanence-cli/src/archive_map.rs @ 2a20106 -->
 ## Archive objects (local, no tape)
 
 `rem archive` builds and reads portable RAO object files on local disk.
@@ -132,9 +149,13 @@ None of these touch tape; they are the easiest way to exercise the format.
 
 | Command | What it does |
 |---|---|
-| `rem archive build --inputs <PATH>... --out <FILE>` | Build a plaintext `rao-v1` object from files/directories and print a JSON build report. `--encrypt --key-file <32-byte-key> --key-id <32-hex>` builds the encrypted `RAO1` representation instead. `--map`/`--source-root`/`--map-sha256` accept a planner-emitted source map instead of `--inputs`. `--scan-only` classifies inputs and reports without writing. `--rules` applies an ingest ruleset; `--manifest-out` (requires `--rules`) writes the member manifest JSON. |
-| `rem archive inspect --object <FILE> [--key-file <KEY>]` | Print an object's header, manifest digest, and member table as JSON. |
-| `rem archive extract --object <FILE> --dest <DIR>` | Extract a whole object. `--path` plus `--range <START:LEN>` extracts a member byte range; `--blob-entry`/`--blob-member` restore a single member from inside a blob wrapper. |
+| `rem archive capabilities` | Print a one-line JSON list of this build's RAO capabilities (e.g. `rao-v2-envelope`, `wrap-suite-hpke-v1`, `ranged-ciphertext-extract`) with zero hardware discovery. Useful for scripts probing what a given binary supports before calling it. |
+| `rem archive build --inputs <PATH>... --out <FILE>` | Build a plaintext `rao-v1` object from files/directories and print a JSON build report. `--encrypt --key-file <32-byte-key> --key-id <32-hex>` builds the encrypted `RAO1` v1 (registry-key) representation instead — `build` has no direct path to a v2/HPKE envelope; see `reseal` below for that. `--map`/`--source-root`/`--map-sha256` accept a planner-emitted source map instead of `--inputs`. `--scan-only` classifies inputs and reports without writing. `--rules` applies an ingest ruleset; `--manifest-out` (requires `--rules`) writes the member manifest JSON. |
+| `rem archive reseal --object <FILE> --registry-key <KEY> --recipient <PUBKEY>... --out <FILE> [--staging-dir <DIR>]` | Convert an existing plaintext-registry-key (v1) object into a multi-recipient HPKE (v2) envelope. Takes 2-8 recipient public keys in ascending slot order. Verifies the resealed output's digest before an atomic `renameat2(RENAME_NOREPLACE)` publish (never clobbers an existing `--out`); staging happens next to the destination, never in `/tmp`. One-shot v1→v2 migration only — there is no v2→v2 rewrap/key-rotation mode and no v2→v1 downgrade. |
+| `rem archive inspect --object <FILE> [--key-file <KEY>]` | Print an object's header, manifest digest, and member table as JSON. Works keylessly on both v1 and v2 headers (a v2 key frame is parsed and validated without needing any key). |
+| `rem archive extract --object <FILE> --dest <DIR>` | Extract a whole object. `--path` plus `--range <START:LEN>` extracts a member byte range; `--blob-entry`/`--blob-member` restore a single member from inside a blob wrapper. **v1-only** — there is no `--private-key`/recipient flag here, so a v2 (HPKE) envelope cannot be opened through this command; use `rao-recover` instead. |
+| `rem archive extract-stream --key-file <KEY> [--range <START:LEN> --authenticated-prefix <FILE> --stored-range-start <BYTE>]` | Stream-decrypt from stdin to stdout with per-chunk authentication and bounded memory. With the three ranged flags together, performs a bounded ranged-ciphertext decrypt: it re-authenticates the header/metadata prefix from `--authenticated-prefix`, then decrypts only the covering ciphertext frames fed on stdin (which must start exactly at `--stored-range-start`). **v1-only** (root key), same as `extract`. |
+| `rem archive covering-range --key-file <KEY> --object-id <ID> --file-id <ID> --range <START:LEN>` | Given a requested plaintext byte range inside one member, authenticate the object's header/metadata prefix (read from stdin) and print the smallest covering stored-ciphertext byte range as JSON (`stored_range_start`/`stored_range_len`/`first_chunk`/`chunk_count`) — the geometry `extract-stream`'s ranged mode needs. **v1-only.** See [`reference-extract-stream-protocol.md`](reference-extract-stream-protocol.md) for the full stream framing and exit codes. |
 | `rem restore --object <FILE> --dest <DIR>` | Top-level alias surface for native RAO restore, same flags as `extract`. |
 | `rem archive list` | List native objects from the local catalog (no tape access). |
 | `rem archive probe --format bru --dump <FILE>` | Identify a legacy archive dump without streaming it. |
@@ -148,7 +169,13 @@ exist only in binaries built with `--features remanence-cli/foreign-bru`,
 and CI guards that the default dependency graph stays free of the legacy
 reader.
 
-<!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/lib.rs @ 7fb10f8 -->
+**No `rem`/`rem-debug` command opens a whole v2 (HPKE) envelope end to
+end.** The only ways to fully decrypt a v2 object are the standalone
+[`rao-recover`](#rao-recover-standalone-recovery) binary, or a
+crate-internal call to `remanence-aead::open_envelope` (not exposed by
+either CLI).
+
+<!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/lib.rs @ 2a20106 -->
 ## rem-debug extras
 
 Everything above exists in `rem-debug` too. What `rem-debug` adds:
@@ -187,10 +214,41 @@ The `--allow-derived <SERIAL>` flag additionally permits operating drive
 bays whose identity was derived rather than read from the device; it must
 be a subset of `--allow`.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 2a20106 -->
 ## Catalog rebuild
 
 `rem rebuild-catalog-from-journals [--config <PATH>]` rebuilds the SQLite
 catalog projection from the audit log and per-tape journals. This is the
 recovery path that makes the SQLite file a disposable cache rather than a
 single point of failure.
+
+<!-- code-anchor: crates/rao-recover/src/main.rs @ 2a20106 -->
+## `rao-recover`: standalone recovery
+
+`rao-recover` is a separate crate and binary (`crates/rao-recover`), not
+part of `remanence-cli`. It exists for the case where the rest of the
+stack — daemon, catalog, config file — is unavailable, untrusted, or
+simply not worth standing up: given one RAO object file and a key, it
+recovers plaintext members with nothing else.
+
+```
+rao-recover --object <FILE> --out <DIR> (--private-key <FILE> | --registry-key <FILE>)
+            [--staging-dir <DIR>] [--overwrite]
+```
+
+It reads the object's header directly (no daemon/catalog dependency),
+detects the format version itself, and dispatches accordingly:
+`--registry-key` opens a v1 (registry symmetric key) object;
+`--private-key` opens a v2 (HPKE) envelope using one recipient's private
+key — the two flags are mutually exclusive, and supplying the wrong one
+for the object's actual version fails with a message naming which
+recipient epoch labels the object actually wants. Decrypted plaintext is
+staged in a temporary file next to `--out` (or inside `--staging-dir` if
+given, never `/tmp`) and securely zeroed on drop before the restore
+completes. It validates the embedded object id against the header before
+writing files out, and refuses to overwrite existing output unless
+`--overwrite` is given.
+
+This is currently the **only** way to fully decrypt a v2 (HPKE) envelope
+end to end — neither `rem` nor `rem-debug` exposes an equivalent
+whole-object open for v2.

@@ -10,7 +10,7 @@ Commands in the local sections were run as written against the current
 tree; hardware sections are marked, because they need a library (real or
 virtual) and host privileges.
 
-<!-- code-anchor: Cargo.toml crates/remanence-cli/Cargo.toml @ 7fb10f8 -->
+<!-- code-anchor: Cargo.toml crates/remanence-cli/Cargo.toml @ 2a20106 -->
 ## Build
 
 You need Rust 1.85 or newer. The workspace builds on stock Linux with no
@@ -22,8 +22,10 @@ cd remanence
 cargo build --release
 ```
 
-That produces three binaries under `target/release/`: `rem` (operator
-CLI), `rem-debug` (break-glass CLI), and `rem-daemon` (the service).
+That produces four binaries under `target/release/`: `rem` (operator
+CLI), `rem-debug` (break-glass CLI), `rem-daemon` (the service), and
+`rao-recover` (a standalone catalogless disaster-recovery tool — see the
+[CLI reference](reference-cli.md#rao-recover-standalone-recovery)).
 
 Two optional cargo features widen the surface:
 
@@ -43,7 +45,7 @@ cargo test --workspace --exclude remanence-chaos
 Hardware and large-memory tests are `#[ignore]`d by default and opt in
 through environment variables documented in their test modules.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/archive_ingest.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/archive_ingest.rs @ 2a20106 -->
 ## First archive, no tape required
 
 Build a stored object from a directory, look inside it, and restore it.
@@ -92,12 +94,17 @@ never depends on host state.
 
 *Fig. 1 — The local round trip: build a rao-v1 object from a directory, read it back, and prove the copies identical — the same bytes a tape write stores as the object body.*
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-aead/src/lib.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-aead/src/lib.rs @ 2a20106 -->
 ## The encrypted variant
 
 The encrypted representation wraps the same tar stream in an
-authenticated ChaCha20-Poly1305 envelope. Keys are 32 raw bytes; the key
-id is 16 bytes of hex that names the key without revealing it:
+authenticated ChaCha20-Poly1305 envelope. There are two envelope shapes,
+sharing the same AEAD suite but different key management:
+
+**Format version 1** wraps a single symmetric registry key you supply.
+Keys are 32 raw bytes; the key id is 16 bytes of hex that names the key
+without revealing it. This is the only shape `archive build` produces
+directly:
 
 ```sh
 head -c 32 /dev/urandom > root.key
@@ -112,7 +119,33 @@ Without the key file, `inspect` still reads the plaintext envelope header
 (format version, chunk size, key id, object id) — enough to know what the
 object is and which key it needs, and nothing more.
 
-<!-- code-anchor: crates/remanence-library/src/discovery.rs crates/remanence-cli/src/lib.rs Makefile @ 7fb10f8 -->
+**Format version 2** drops the shared registry key entirely: each object
+gets a fresh key wrapped once per recipient with HPKE (RFC 9180,
+X25519-HKDF-SHA256-ChaCha20Poly1305), so 2-8 named recipients can each
+open it with their own private key and nobody needs to hold a symmetric
+secret. There is no direct `archive build --encrypt` path to v2 — you
+get there by *resealing* an existing v1 object:
+
+```sh
+rem archive reseal --object demo-enc.rao --registry-key root.key \
+    --recipient alice.pub --recipient bob.pub --out demo-v2.rao
+```
+
+Reading a v2 envelope back is not something either CLI does end to end —
+neither `rem` nor `rem-debug` exposes a whole-object v2 open. Use the
+standalone `rao-recover` binary instead, with one recipient's private key:
+
+```sh
+rao-recover --object demo-v2.rao --private-key alice.priv --out restored-v2
+diff -r src restored-v2 && echo identical
+```
+
+`rao-recover` needs no daemon, catalog, or config file — it's the
+disaster-recovery path of last resort. `rem archive inspect` (keyless)
+still works on a v2 object too: it parses and validates the recipient
+key frame without needing any key at all.
+
+<!-- code-anchor: crates/remanence-library/src/discovery.rs crates/remanence-cli/src/lib.rs Makefile @ 2a20106 -->
 ## Talking to a library (requires hardware)
 
 From here on you need a tape library — a real chassis or a virtual one
@@ -147,7 +180,7 @@ rem library <SERIAL> --slots
 Both commands take `--json` for scripting. Discovery is read-only: it
 issues INQUIRY, VPD, and READ ELEMENT STATUS, and moves nothing.
 
-<!-- code-anchor: crates/remanence-daemon/src/main.rs crates/remanence-state/src/config.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-daemon/src/main.rs crates/remanence-state/src/config.rs @ 2a20106 -->
 ## Running the daemon (requires hardware)
 
 The daemon needs a config file. A minimal one, using `/var/lib/rem` for
@@ -210,7 +243,7 @@ rem catalog pools
 If your state dir is not `/var/lib/rem`, pass `--endpoint
 unix:<state_dir>/rem.sock` — the CLI default assumes that path.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-api/src/tape_init.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-api/src/tape_init.rs @ 2a20106 -->
 ## Initializing a tape (requires hardware, writes to media)
 
 A fresh cartridge must be initialized before a pool will accept it:

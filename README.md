@@ -21,7 +21,7 @@ reasoning is laid out in [docs/why-remanence.md](docs/why-remanence.md).
 It is developed against a QuadStor virtual tape library and field-tested
 on an HPE MSL3040 with LTO-9 drives.
 
-<!-- code-anchor: Cargo.toml crates @ 7fb10f8 -->
+<!-- code-anchor: Cargo.toml crates proto/layer5.proto @ 2a20106 -->
 ## Status
 
 Pre-alpha, version 0.0.1. Interfaces and the gRPC contract may still
@@ -30,31 +30,46 @@ change before a stable release; the published on-tape formats (RAO 1.0/
 
 - Layer 1 SCSI primitives and Layer 2 library discovery, identity,
   robotics, and hot-plug watching, with per-library allowlisting.
-- Layer 3 end to end: batched fixed-block tape I/O with position proofs,
-  the `rao-v1` object format, the `RAO1` encrypted envelope, and
-  Reed-Solomon sidecar parity with recovery, resume, and catalog-less
-  scan.
+- Layer 3 end to end: pipelined, staging-ring-backed fixed-block tape
+  I/O with position proofs (this is now the only write/read path — the
+  earlier non-pipelined mode and its config flag are gone), a
+  watermark-gated host-RAM read reservoir with proof-frontier ranged
+  reads, the `rao-v1` object format, the `RAO1` encrypted envelope in
+  both v1 (registry symmetric key) and v2 (multi-recipient HPKE
+  wrapped-key) shapes, and Reed-Solomon sidecar parity with recovery,
+  resume, and catalog-less scan.
 - Layer 4 state: audit log, per-tape journals, and a SQLite catalog that
   is a rebuildable projection, plus media-readiness records and tape-I/O
   fences.
 - Layer 5 daemon: catalog queries, pool-targeted idempotent write
-  sessions, object/file/byte-range read sessions, operations with
-  cancellation, library inspection and robotics, drive stewardship,
-  alarms, live status, over a Unix socket and optional mTLS TCP.
+  sessions, object/file/byte-range read sessions with an app-restart
+  cold-resume contract (tape-identity check + device position proof),
+  an advisory per-drive assignment projection for external arbitration,
+  operations with cancellation, library inspection and robotics, drive
+  stewardship, alarms, live status, over a Unix socket and optional
+  mTLS TCP.
 - Operator CLIs: `rem` and `rem-debug`, including the destructive-safety
   gauntlet for tape initialization, media-readiness quarantine tooling,
-  and local RAO object build/inspect/extract that needs no hardware.
+  local RAO object build/inspect/extract that needs no hardware, and a
+  ranged-ciphertext `extract-stream`/`covering-range` pair for bounded,
+  memory-cheap partial reads of an object already fetched locally. A
+  standalone `rao-recover` binary decrypts either envelope version with
+  no daemon, catalog, or config file at all — the disaster-recovery path
+  of last resort.
 - Legacy BRU archive reading (feature-gated) for migrating old tapes,
   chaos fault-injection for tests, and Lean/Aeneas proofs over the
   parity and format cores (`verif/`).
 
 The main gaps, from the code as it stands: authorization is a shallow
 role matrix, the audit-query service is defined but not yet served,
-library-event streaming and session checkpointing return unimplemented,
-parity tapes do not yet support appending further objects after a
-committed session, and hardware soak coverage is still growing.
+library import/export (mailslot) handling, library-event streaming, and
+write-session checkpointing/restart all return unimplemented, parity
+tapes do not yet support appending further objects after a committed
+session, `rem`/`rem-debug` have no CLI path to decrypt a v2 (HPKE)
+envelope short of `rao-recover` or `archive reseal`'s output, and
+hardware soak coverage is still growing.
 
-<!-- code-anchor: Cargo.toml @ 7fb10f8 -->
+<!-- code-anchor: Cargo.toml @ 2a20106 -->
 ## Build
 
 Rust 1.85+, Linux. No system dependencies for the default build:
@@ -63,7 +78,10 @@ Rust 1.85+, Linux. No system dependencies for the default build:
 cargo build --release
 ```
 
-yields `target/release/{rem,rem-debug,rem-daemon}`. Optional features:
+yields `target/release/{rem,rem-debug,rem-daemon,rao-recover}`. `rem`
+and `rem-debug` are two binaries built from the same crate (operator vs.
+break-glass direct-hardware CLI); `rao-recover` is its own crate with no
+dependency on the daemon, catalog, or config file. Optional features:
 `remanence-cli/linux-udev` (hot-plug `rem watch`; needs `pkg-config` +
 `libudev-dev`) and `remanence-cli/foreign-bru` (legacy BRU commands).
 
@@ -78,7 +96,7 @@ cargo test --workspace --exclude remanence-chaos
 Hardware-touching tests are ignored by default and opt in via
 environment variables documented in their test modules.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 2a20106 -->
 ## Quickstart
 
 The native object format works against local files, no tape required:
@@ -131,14 +149,14 @@ RAO object files follow the same discipline: they contain only the
 object's stored bytes — tape filemarks, bootstrap rows, and parity
 sidecars are tape-only framing.
 
-<!-- code-anchor: Cargo.toml @ 7fb10f8 -->
+<!-- code-anchor: Cargo.toml @ 2a20106 -->
 ## Repository layout
 
 ```text
 crates/remanence-scsi           Layer 1 SCSI CDB/SG_IO primitives
 crates/remanence-library        Layer 2 library model/ops and Layer 3a tape I/O
 crates/remanence-crc            Shared CRC-64/XZ
-crates/remanence-aead           RAO1 encrypted-envelope primitives
+crates/remanence-aead           RAO1 encrypted-envelope primitives (v1 registry key + v2 HPKE)
 crates/remanence-format-driver  Published format-driver traits
 crates/remanence-format         Native rao-v1 body format
 crates/remanence-bru            Legacy BRU reader (feature-gated)
@@ -148,6 +166,7 @@ crates/remanence-state          Layer 4 catalog, audit, config, lock
 crates/remanence-api            Layer 5 gRPC service implementations
 crates/remanence-daemon         rem-daemon service host
 crates/remanence-cli            rem and rem-debug binaries
+crates/rao-recover              Standalone catalogless RAO disaster-recovery binary
 crates/remanence-chaos          Fault-injection scaffolding (excluded from CI gates)
 specs/                          Published format specifications
 docs/                           Guides, references, design records (see INDEX.md)
