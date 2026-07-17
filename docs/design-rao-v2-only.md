@@ -96,8 +96,11 @@ dropped in the same pass.
 - **registry epoch id**: the domain-prefixed string
   `<domain>-<32hex>`; its 32-hex payload IS the wire id, hex-encoded.
   `key_domain()` derives the domain from the prefix (no default-to-archive).
-- **wire `epoch_label`**: human-readable slot label; set to the registry
-  epoch id string at seal time.
+- **wire `epoch_label`**: human-readable slot label. *(P3 amendment,
+  2026-07-17: the wire caps labels at 32 bytes while registry ids run
+  39–41, so the label carries only the domain; the 16-byte wire epoch id
+  remains the canonical identity and sutradhara reconstructs
+  `<domain>-<32hex>` for reports and metadata.)*
 Durable encodings: CLI report JSON emits
 `recipient_epochs: [{"epoch_id": "<32hex>", "label": "<registry id>"}]`;
 sutradhara `storage_metadata["recipient_epochs"]` is a JSON array of
