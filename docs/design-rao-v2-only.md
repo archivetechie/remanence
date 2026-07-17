@@ -1,6 +1,6 @@
 # RAO v2-only: v1 excision + v2 productionization
 
-**Status:** design v0.2 — panel-folded (3 lenses, 2026-07-17); pending codex verify round
+**Status:** design v0.3 — panel-folded + codex verify round folded (2026-07-17); ready for prompt cutting
 **Date:** 2026-07-17
 **Owner decision:** the owner, 2026-07-17 — remove format_version 1 (registry-symmetric
 encryption) from the publication spec AND the implementation before tagging
@@ -49,15 +49,26 @@ that only speaks v1.
 rejecting `format_version == 1`. Excision re-describes bytes `0x10..0x20` as
 `reserved` (MUST be zero) and marks `format_version = 1` **permanently
 reserved — never reassigned** (§10). `RAO1` magic, 128-byte header, key
-frame, and all v2 test vectors are unchanged.
+frame, and all **positive** v2 test vectors are unchanged. One negative
+expectation re-pins (verify V-6): the `v2-version-flip` case currently
+expects `ReservedBytesNotZero` because the parser accepts version 1 before
+interpreting v1 reserved bytes; with version 1 rejected at the gate, the
+same bytes produce `UnsupportedFormatVersion`.
 
-**D2 — `reseal` is deleted, not repurposed.** Its only valid input class (v1
-objects) ceases to exist, and §12.8 forbids rewrapping a key frame without
-resealing. Rotation remains re-seal (open + seal → new DEK, new
-`stored_digest`) driven by the orchestrator. `rao-recover` drops its
-`--registry-key`/v1 leg. The reseal implementation's recipient handling
-(2–8 distinct epochs, RAOR file parsing) is **lifted into `archive build`**,
-not rewritten.
+**D2 — `reseal` survives, redefined v2→v2 (verify-round reversal).** The
+verify pass established that `extract` + `build` is a *rebuild* (fresh
+object/manifest ids, regenerated canonical stream → different
+`plaintext_digest`), while §12.8's rotation semantics promise a re-seal that
+**preserves the canonical bytes, `object_id`, `chunk_size`, and
+`plaintext_digest`** — exactly what the current reseal implementation does
+(`lib.rs:3862` copies them into the new seal options). So the verb is
+retained with its input leg swapped: input = a **v2** object +
+`--private-key` (unwrap DEK path), output = the same canonical bytes sealed
+to a new recipient set (new DEK, new salt, new `stored_digest`). This is
+spec-legal — §12.8 forbids *rewrap-without-reseal*; this IS a re-seal. Only
+the v1 input leg and `--registry-key` die. `rao-recover` drops its v1 leg.
+The recipient handling (2–8 distinct epochs, RAOR parsing) is additionally
+**lifted into `archive build`**.
 
 **D3 — v2 production path, single-funnel.** `remanence-format` gains
 envelope writer/reader/PFR functions that **wrap `seal_envelope` /
@@ -74,20 +85,45 @@ recipient epoch id list actually sealed; `storage_metadata`). The state
 schema replaces `object_copies.key_id` semantics with the recipient epoch id
 list (non-empty required for encrypted rows);
 `BootstrapObjectRepresentation::Encrypted` extends to carry the epoch ids
-and `key_frame_len`. Old shapes are **replaced, not migrated** —
+and `key_frame_len` under **new** CBOR keys (the old `key_id` tag is
+retired, never reused). Old shapes are **replaced, not migrated** —
 pre-production, no compat branches (hard rule). The `_envelope` suffixes are
 dropped in the same pass.
 
+*Recipient identity — three distinct names, pinned (verify V-3):*
+- **wire `recipient_epoch_id`**: the `[u8;16]` in the key-frame slot
+  (`wrap.rs:111`) — canonical identity of an epoch on disk/tape.
+- **registry epoch id**: the domain-prefixed string
+  `<domain>-<32hex>`; its 32-hex payload IS the wire id, hex-encoded.
+  `key_domain()` derives the domain from the prefix (no default-to-archive).
+- **wire `epoch_label`**: human-readable slot label; set to the registry
+  epoch id string at seal time.
+Durable encodings: CLI report JSON emits
+`recipient_epochs: [{"epoch_id": "<32hex>", "label": "<registry id>"}]`;
+sutradhara `storage_metadata["recipient_epochs"]` is a JSON array of
+registry epoch id strings; the state schema stores the same array
+(JSON-encoded) in place of `key_id`; bootstrap CBOR carries an array of
+16-byte byte-strings.
+
+*Reader slot policy (verify Q4):* the ≥2-slot floor is a **Sealer**
+obligation; Readers accept any structurally valid key frame with ≥1 slot
+(robustness: a foreign one-slot object still opens). Negative vectors
+reject 0 slots and >8; a positive one-slot read-acceptance vector documents
+the asymmetry.
+
 **D4 — CLI surface (a contract change, not a flag rename).**
 `archive build`/`write`/`pool write` gain repeatable `--recipient
-<public-key file>` (2–8, distinct epochs — semantics lifted from reseal);
-`extract`/`extract-stream`/`covering-range`/`read`/`export-object` replace
-`--key-file` with `--private-key`; **`inspect` drops `--key-file` entirely**,
-parses the key frame, and reports `recipient_epochs` + `format_version`
-instead of `key_id`. Build/write **report JSON schemas change in lockstep**
-(`key_id` → `recipient_epochs`) and
-`docs/reference-extract-stream-protocol.md` is updated (epoch selection by
-private key). `capabilities` output is already correct.
+<public-key file>` (2–8, distinct epochs — semantics lifted from reseal).
+**`--encrypt` is removed: the presence of `--recipient` IS the encryption
+switch** (verify V-5; one knob, no ambiguity).
+`extract`/`extract-stream`/`covering-range`/`read`/**`verify`** replace
+`--key-file` with `--private-key` (`export-object` exports stored bytes and
+carries no key — it was wrongly listed before; `verify` was wrongly
+omitted). **`inspect` drops `--key-file` entirely**, parses the key frame,
+and reports `recipient_epochs` + `format_version` instead of `key_id`.
+Build/write **report JSON schemas change in lockstep** (per the D3 encoding)
+and `docs/reference-extract-stream-protocol.md` is updated (epoch selection
+by private key). `capabilities` output is already correct.
 
 **D5 — Positive v2 vector (RAO-TV-E2) via deterministic-seal refactor.**
 `wrap_dek` currently constructs its RNG internally; it is **refactored to
@@ -100,10 +136,20 @@ verification: `verify_rao_vectors_independent.py` gains a v2 **open-direction**
 verifier (X25519 + HKDF + ChaCha20-Poly1305 via Python `cryptography`) that
 decrypts the pinned artifact and recovers byte-exact plaintext.
 `negative-envelope.json`'s version-agnostic cases re-base onto a v2 object;
-v1-specific cases drop; v2-specific negative coverage (key-frame corruption,
-slot-count, wrap-suite, epoch-id cases) extends `negative-envelope-v2.json`.
-TV-D1's encrypted half re-bases to v2. Then `make publication-test-vectors`
-and the new tar SHA-256 re-pins in **both** publication specs.
+v1-specific cases drop (`all-zero-key-id`, `key-id-swapped`,
+`root-key-too-short`; `reserved-bytes-nonzero` re-targets v2 reserved bytes
+`0x39..0x3B`). v2-specific negative coverage extends
+`negative-envelope-v2.json` per the verify-round Q4 list: structurally-valid
+key-frame tampering (label, encapsulation, wrapped-DEK ciphertext, slot
+insertion/removal), slot counts 0 and 9 + writer rejection of 0/1/>8,
+one-slot **read acceptance** (D3 reader policy), known-suite mismatches
+(suite 0 with nonempty frame; HPKE suite with zero/undersized
+`key_frame_len`), duplicate `recipient_epoch_id` across distinct slots
+(parser must reject, not just sealer), internal slot truncation →
+`InvalidKeyFrame`, nonzero v2 reserved `key_id`, malformed key-frame magic,
+wrong recipient private key, malformed encapsulation. TV-D1's encrypted
+half re-bases to v2. Then `make publication-test-vectors` and the new tar
+SHA-256 re-pins in **both** publication specs.
 
 **D6 — Proof estate: cheap-honest path, no new Lean derivation** (standing
 rule). A proof survives ONLY if its drift-guard-pinned snippets are
@@ -177,27 +223,41 @@ update. **`scenarios/sealing_support.py` changes first** — it is the shared
 assertion library the load-bearing scenarios import. Load-bearing (rewritten
 + green as verification members): `scenario_rao`, `scenario_rao_archive`,
 `scenario_rao_archive_bundling`, `scenario_lbk` (moves to `backup` domain),
-`scenario_q`, `scenario_o`, `scenario_arrangement_submit_live`, plus the new
-hermetic RAOE scenario. Incidental literal-fixture updates: `scenario_ag`,
+`scenario_q`, `scenario_o`, `scenario_arrangement_submit_live`,
+`scenario_rao_live` (source rewritten now — its `key_id` assertions and
+root-key materialization are v1; live-tape *execution* stays deferred), plus
+the new hermetic RAOE scenario. Incidental literal-fixture updates: `scenario_ag`,
 `scenario_n`, `scenario_bsh`, `scenario_retention_gate`,
 `scenario_rao_archive_policy`, `scenario_arrangement_submit`,
 `scenario_pfr`, `scenario_restore_agent`. Live-tape RAOE legs remain
 post-merge smoke items for the next MSL3040 window.
 
-**D10 — v2 fuzz coverage lands with the excision.** The whole-object fuzz
-target ports to `open_envelope` with a fixed recipient key; the
-key-frame-parse fuzz surface stays covered by `rao_envelope_header` (v1 arm
-pruned).
+**D10 — v2 fuzz coverage lands with the excision (verify V-7 shape).** The
+whole-object target ports to `open_envelope` with a fixed recipient key AND
+gets seeded with a valid v2 object sealed to that exact key (generated via
+the D5 deterministic hook) — without the seed, fuzzing dies at
+header/key-frame rejection and never reaches the metadata/payload/footer/
+digest paths v1's corpus exercised (current corpus: 195 v1 seeds, zero v2).
+A **direct `KeyFrame::parse` fuzz target** is added (the header target only
+reaches it behind a valid 128-byte header, and its whole corpus is <128
+bytes), seeded with one-, two-, and eight-slot valid frames plus
+malformed/truncated variants. The old v1 corpus is migrated/minimized.
 
 **D11 — recovery epoch: the mandatory second recipient, everywhere.** The
 spec's ≥2-slot floor collides with single-hot-key domains (hdcache, backup)
-unless the second slot is defined. Resolution: the registry maintains a
-dedicated **`recovery` domain** whose epoch public key is included as the
-second recipient in **every** seal across all domains. Its private half
-never lives on any serving host — it is the escrow object (the existing
-Shamir 2-of-3 custody thread now has a concrete key to hold). This satisfies
-the floor uniformly, makes every object recoverable if a hot domain key is
-lost, and is the reason the floor exists.
+unless the second slot is defined. Resolution: a dedicated **`recovery`
+domain** whose epoch public key is included as the second recipient in
+**every** seal across all domains. Custody (verify V-4 fix): recovery
+epochs are **offline-minted** — a `sutra admin keys mint-recovery` step run
+on an operator/offline machine emits the keypair; only the **public half is
+imported** into the serving-host registry (a new public-only epoch kind the
+registry must support — no private material ever written under
+`registry_dir` for this domain); the private half goes directly to escrow
+(the existing Shamir 2-of-3 custody thread now has a concrete key object).
+Loss/rotation: mint a new recovery epoch offline, import its public half;
+subsequent seals use it; existing objects re-seal opportunistically via the
+D2 verb (pre-production: acceptable to defer). This satisfies the floor
+uniformly and makes every object recoverable if a hot domain key is lost.
 
 **D12 — red-main window policy.** Between P1 landing (v1 flags gone from
 `rem`) and P3/P4 landing, real-seam AEAD scenarios are necessarily red — no
@@ -210,16 +270,17 @@ disregarded.
 
 ## 4. Work breakdown → prompt set
 
-P1 is staged (Kimi L2-5): one codex dispatch, **five mandatory checkpoint
-commits**, tree compiles + tests green at each:
+P1 is staged **additive-first** (verify V-1 restage: deleting the v1 API
+first breaks every consumer, so no per-stage green checkpoint is possible in
+excision order; the "no parallel paths" rule binds the FINAL state, not
+intermediate commits). One codex dispatch, **three mandatory checkpoint
+commits**, whole tree compiles + tests green at each:
 
 | Stage | Content | Checkpoint |
 | --- | --- | --- |
-| P1a | aead v1 excision + `_envelope` renames + `wrap_dek` RNG-injection refactor + deterministic-seal entry + fuzz port | `cargo test -p remanence-aead` |
-| P1b | `remanence-format` v2 writer/reader/PFR (wrapping aead; v1 fns deleted) | format crate tests |
-| P1c | `remanence-api` / `remanence-state` / `remanence-parity` representation + schema + bootstrap row | workspace tests |
-| P1d | CLI verbs (`--recipient` on build/write/pool-write, `--private-key` on read verbs, keyless inspect + report schemas, delete `reseal`, `rao-recover` v1 leg) | CLI tests |
-| P1e | proof retirement (guards + inventory list + STATUS) + repo docs (reference-cli, quickstart, glossary, architecture-overview, tape-layout + SVG caption, extract-stream protocol, amber-architecture → historical note) | `make proof-inventory` + full workspace |
+| P1-ADD | Add v2 everywhere, delete nothing yet: `wrap_dek` RNG-injection refactor + deterministic-seal entry (aead); `remanence-format` v2 writer/reader/PFR (wrapping aead); `remanence-api`/`state`/`parity` v2 representation + schema + bootstrap row (D3 encodings); CLI `--recipient` on build/write/pool-write, `--private-key` on extract/extract-stream/covering-range/read/verify, keyless inspect + `recipient_epochs` report, reseal v2-input leg | full workspace tests |
+| P1-EXCISE | Delete v1 in one slice across all layers: aead v1 fns + `RaoHeader.key_id` field (region → reserved-zero) + `_envelope` renames; format v1 fns; api/state/parity v1 shapes; CLI v1 flags (`--encrypt`, `--key-file`, `--key-id`), reseal v1 leg, `rao-recover --registry-key`; v1 fixtures/tests deleted or re-based; fuzz port + seeds + new `KeyFrame::parse` target (D10) | full workspace tests + fuzz targets build |
+| P1-RETIRE | Proof retirement (guards + `check-inventory.sh` build list + STATUS + formal-verification doc) + repo docs (reference-cli, quickstart, glossary, architecture-overview, tape-layout + SVG caption, extract-stream protocol, amber-architecture → historical note) | `make proof-inventory` + full workspace |
 
 | Prompt | Repo | Content | Depends on |
 | --- | --- | --- | --- |
@@ -243,10 +304,11 @@ wrap-don't-copy, no compat/backout paths).
 
 ## 6. Publication sequencing
 
-P1 → P2 land → tag `v1.0.0` → Zenodo DOI (org-only creator) → PRONOM
-submission (signature keys on `RAO1` magic + `rao-v1` pax keyword, both
-untouched). P3/P4 land before the tag so the DOI snapshot is coherent
-across the stack the README describes.
+Pinned order (verify V-9): **P1 → (P2 ∥ P3) → P4 → clean-slate `make suite`
+green → tag `v1.0.0` → Zenodo DOI (org-only creator) → PRONOM submission.**
+The tag waits for the full stack; the DOI snapshot must be coherent across
+everything the README describes. (PRONOM signature keys on `RAO1` magic +
+`rao-v1` pax keyword, both untouched by this arc.)
 
 ## 7. Panel fold record (2026-07-17)
 
@@ -263,6 +325,18 @@ enumeration + inspect_rao), L3-3 (domain validator lockstep), L3-4
 LUKS honesty), L3-6 (two axes), L3-7 (sealing_support linchpin + load-bearing
 list), L3-8 (→ D12 red-window policy), L3-9 (pilot pristine-wipe).
 Rejected: L2-2's "provide a migration for existing rows" (violates the
-pre-production hard rule). Pending verify round: L1 Q2 (reseal loss-check),
-Q4 (negative-vector completeness), Q6 (fuzz adequacy) — GLM continuation
-flaked twice; these three go to the codex verify pass explicitly.
+pre-production hard rule).
+
+**Verify round (codex gpt-5.6-sol, 2026-07-17): BLOCK → folded into v0.3.**
+V-1 (staging restage → additive-first P1-ADD/EXCISE/RETIRE), V-2 (**reversal
+of v0.2's D2**: reseal retained as v2→v2 — extract+build is a rebuild and
+cannot preserve `plaintext_digest`), V-3 (recipient identity triple pinned +
+durable encodings), V-4 (recovery epochs offline-minted, public-only import),
+V-5 (CLI matrix: `verify` in, `export-object` out; `--encrypt` removed),
+V-6 (v2-version-flip negative re-pins to `UnsupportedFormatVersion`),
+V-7 (fuzz seeds + direct KeyFrame target), V-8 (`scenario_rao_live` source
+into P4 scope), V-9 (sequencing pinned P1→(P2∥P3)→P4→suite→tag). Verify
+also answered the three questions GLM dropped: Q2 not-expressible-without-
+reseal (→ V-2), Q4 missing-case list (→ D5), Q6 inadequate-without-seeds
+(→ D10), and surfaced the one-slot reader-policy decision (→ D3: Sealer
+floor, Reader ≥1).
