@@ -666,8 +666,8 @@ pub struct NativeObjectCopyRecord {
     pub pool_id: Option<String>,
     /// RAO representation stored in this copy: `plaintext`, `encrypted`, or `unknown`.
     pub representation: String,
-    /// Opaque 16-byte RAO key id for encrypted copies.
-    pub key_id: Option<Vec<u8>>,
+    /// Lowercase 32-hex recipient epoch ids for encrypted copies.
+    pub recipient_epoch_ids: Option<Vec<String>>,
     /// Encrypted RAO metadata frame length.
     pub metadata_frame_len: Option<u64>,
     /// SHA-256 of the canonical plaintext RAO object bytes.
@@ -737,8 +737,8 @@ pub struct NativeObjectCopyProjectionInput {
     pub status: String,
     /// RAO representation stored in this copy: `plaintext` or `encrypted`.
     pub representation: String,
-    /// Opaque 16-byte RAO key id for encrypted copies.
-    pub key_id: Option<Vec<u8>>,
+    /// Lowercase 32-hex recipient epoch ids for encrypted copies.
+    pub recipient_epoch_ids: Option<Vec<String>>,
     /// Encrypted RAO metadata frame length.
     pub metadata_frame_len: Option<u64>,
     /// SHA-256 of the canonical plaintext RAO object bytes.
@@ -3622,7 +3622,7 @@ impl CatalogIndex {
                         object_copies.status,
                         object_copies.pool_id,
                         object_copies.representation,
-                        object_copies.key_id,
+                        object_copies.recipient_epoch_ids,
                         object_copies.metadata_frame_len,
                         object_copies.plaintext_digest,
                         object_copies.stored_digest
@@ -3852,7 +3852,7 @@ impl CatalogIndex {
                 "select object_id, tape_uuid, tape_file_number,
                         first_body_lba, first_parity_data_ordinal,
                         protected_until_ordinal, status, pool_id,
-                        representation, key_id, metadata_frame_len,
+                        representation, recipient_epoch_ids, metadata_frame_len,
                         plaintext_digest, stored_digest
                  from object_copies
                  where object_id = ?1
@@ -3912,7 +3912,7 @@ impl CatalogIndex {
                 "select object_id, tape_uuid, tape_file_number,
                         first_body_lba, first_parity_data_ordinal,
                         protected_until_ordinal, status, pool_id,
-                        representation, key_id, metadata_frame_len,
+                        representation, recipient_epoch_ids, metadata_frame_len,
                         plaintext_digest, stored_digest
                  from object_copies
                  order by object_id, hex(tape_uuid), tape_file_number",
@@ -4662,7 +4662,7 @@ fn index_committed_tape_journal_tx(
                             .map(|_| state.highest_protected_ordinal),
                         status: "committed",
                         representation: envelope.representation,
-                        key_id: envelope.key_id,
+                        recipient_epoch_ids: envelope.recipient_epoch_ids.as_deref(),
                         metadata_frame_len: envelope.metadata_frame_len,
                         plaintext_digest: None,
                         stored_digest: None,
@@ -4767,7 +4767,7 @@ fn upsert_native_object_projection_tx(
                 protected_until_ordinal: copy.protected_until_ordinal,
                 status: copy.status.as_str(),
                 representation: Some(copy.representation.as_str()),
-                key_id: copy.key_id.as_deref(),
+                recipient_epoch_ids: copy.recipient_epoch_ids.as_deref(),
                 metadata_frame_len: copy.metadata_frame_len,
                 plaintext_digest: copy.plaintext_digest.as_deref(),
                 stored_digest: copy.stored_digest.as_deref(),
@@ -4955,7 +4955,7 @@ fn project_committed_tape_file_bundle_tx(
                             .map(|_| bundle.highest_protected_ordinal),
                         status: "committed",
                         representation: envelope.representation,
-                        key_id: envelope.key_id,
+                        recipient_epoch_ids: envelope.recipient_epoch_ids.as_deref(),
                         metadata_frame_len: envelope.metadata_frame_len,
                         plaintext_digest: None,
                         stored_digest: None,
@@ -5855,25 +5855,25 @@ struct ObjectCopyProjectionRow<'a> {
     protected_until_ordinal: Option<u64>,
     status: &'a str,
     representation: Option<&'a str>,
-    key_id: Option<&'a [u8]>,
+    recipient_epoch_ids: Option<&'a [String]>,
     metadata_frame_len: Option<u64>,
     plaintext_digest: Option<&'a [u8]>,
     stored_digest: Option<&'a [u8]>,
 }
 
-struct ObjectCopyEnvelopeProjection<'a> {
+struct ObjectCopyEnvelopeProjection {
     representation: Option<&'static str>,
-    key_id: Option<&'a [u8]>,
+    recipient_epoch_ids: Option<Vec<String>>,
     metadata_frame_len: Option<u64>,
 }
 
 fn object_copy_envelope_from_tape_entry(
     entry: &TapeFileEntry,
-) -> Result<ObjectCopyEnvelopeProjection<'_>, StateError> {
+) -> Result<ObjectCopyEnvelopeProjection, StateError> {
     let Some(row) = entry.bootstrap_object_row.as_ref() else {
         return Ok(ObjectCopyEnvelopeProjection {
             representation: Some(OBJECT_COPY_REPRESENTATION_UNKNOWN),
-            key_id: None,
+            recipient_epoch_ids: None,
             metadata_frame_len: None,
         });
     };
@@ -5892,15 +5892,21 @@ fn object_copy_envelope_from_tape_entry(
     match &row.representation {
         BootstrapObjectRepresentation::Plaintext { .. } => Ok(ObjectCopyEnvelopeProjection {
             representation: Some(OBJECT_COPY_REPRESENTATION_PLAINTEXT),
-            key_id: None,
+            recipient_epoch_ids: None,
             metadata_frame_len: None,
         }),
         BootstrapObjectRepresentation::Encrypted {
-            key_id,
+            recipient_epoch_ids,
             metadata_frame_len,
+            ..
         } => Ok(ObjectCopyEnvelopeProjection {
             representation: Some(OBJECT_COPY_REPRESENTATION_ENCRYPTED),
-            key_id: Some(key_id.as_slice()),
+            recipient_epoch_ids: Some(
+                recipient_epoch_ids
+                    .iter()
+                    .map(|epoch_id| hex_bytes(epoch_id))
+                    .collect(),
+            ),
             metadata_frame_len: Some(*metadata_frame_len),
         }),
     }
@@ -5910,16 +5916,29 @@ fn insert_object_copy_projection_tx(
     tx: &rusqlite::Transaction<'_>,
     row: ObjectCopyProjectionRow<'_>,
 ) -> Result<(), StateError> {
-    validate_object_copy_envelope(row.representation, row.key_id, row.metadata_frame_len)?;
+    validate_object_copy_envelope(
+        row.representation,
+        row.recipient_epoch_ids,
+        row.metadata_frame_len,
+    )?;
     validate_optional_sha256(row.plaintext_digest, "object_copies.plaintext_digest")?;
     validate_optional_sha256(row.stored_digest, "object_copies.stored_digest")?;
     let metadata_frame_len =
         opt_u64_to_i64(row.metadata_frame_len, "object_copies.metadata_frame_len")?;
+    let recipient_epoch_ids = row
+        .recipient_epoch_ids
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| {
+            StateError::IndexMigrationFailed(format!(
+                "serialize object_copies.recipient_epoch_ids: {error}"
+            ))
+        })?;
     tx.execute(
         "insert into object_copies(
            object_id, tape_uuid, tape_file_number,
            first_body_lba, first_parity_data_ordinal,
-           protected_until_ordinal, status, representation, key_id,
+           protected_until_ordinal, status, representation, recipient_epoch_ids,
            metadata_frame_len, plaintext_digest, stored_digest, pool_id
          )
          values(
@@ -5941,10 +5960,10 @@ fn insert_object_copy_projection_tx(
                when ?8 is not null and ?8 != 'unknown' then excluded.representation
                else object_copies.representation
              end,
-           key_id =
+           recipient_epoch_ids =
              case
-               when ?8 is not null and ?8 != 'unknown' then excluded.key_id
-               else object_copies.key_id
+               when ?8 is not null and ?8 != 'unknown' then excluded.recipient_epoch_ids
+               else object_copies.recipient_epoch_ids
              end,
            metadata_frame_len =
              case
@@ -5963,7 +5982,7 @@ fn insert_object_copy_projection_tx(
             opt_u64_to_i64(row.protected_until_ordinal, "protected_until_ordinal")?,
             row.status,
             row.representation,
-            row.key_id,
+            recipient_epoch_ids,
             metadata_frame_len,
             row.plaintext_digest,
             row.stored_digest,
@@ -5986,11 +6005,11 @@ fn validate_optional_sha256(value: Option<&[u8]>, field: &str) -> Result<(), Sta
 
 fn validate_object_copy_envelope(
     representation: Option<&str>,
-    key_id: Option<&[u8]>,
+    recipient_epoch_ids: Option<&[String]>,
     metadata_frame_len: Option<u64>,
 ) -> Result<(), StateError> {
     let Some(representation) = representation else {
-        if key_id.is_some() || metadata_frame_len.is_some() {
+        if recipient_epoch_ids.is_some() || metadata_frame_len.is_some() {
             return Err(StateError::IndexMigrationFailed(
                 "object copy envelope details require an explicit representation".to_string(),
             ));
@@ -5999,7 +6018,7 @@ fn validate_object_copy_envelope(
     };
     match representation {
         OBJECT_COPY_REPRESENTATION_PLAINTEXT => {
-            if key_id.is_some() || metadata_frame_len.is_some() {
+            if recipient_epoch_ids.is_some() || metadata_frame_len.is_some() {
                 return Err(StateError::IndexMigrationFailed(
                     "plaintext object copy rows must not carry encrypted envelope fields"
                         .to_string(),
@@ -6008,7 +6027,7 @@ fn validate_object_copy_envelope(
             Ok(())
         }
         OBJECT_COPY_REPRESENTATION_UNKNOWN => {
-            if key_id.is_some() || metadata_frame_len.is_some() {
+            if recipient_epoch_ids.is_some() || metadata_frame_len.is_some() {
                 return Err(StateError::IndexMigrationFailed(
                     "unknown object copy rows must not carry encrypted envelope fields".to_string(),
                 ));
@@ -6016,14 +6035,24 @@ fn validate_object_copy_envelope(
             Ok(())
         }
         OBJECT_COPY_REPRESENTATION_ENCRYPTED => {
-            let Some(key_id) = key_id else {
+            let Some(recipient_epoch_ids) = recipient_epoch_ids else {
                 return Err(StateError::IndexMigrationFailed(
-                    "encrypted object copy rows require key_id".to_string(),
+                    "encrypted object copy rows require recipient_epoch_ids".to_string(),
                 ));
             };
-            if key_id.len() != 16 || key_id.iter().all(|byte| *byte == 0) {
+            if recipient_epoch_ids.is_empty()
+                || recipient_epoch_ids.len() > 8
+                || recipient_epoch_ids
+                    .iter()
+                    .any(|epoch_id| !is_lower_hex_epoch_id(epoch_id))
+                || recipient_epoch_ids
+                    .iter()
+                    .enumerate()
+                    .any(|(index, epoch_id)| recipient_epoch_ids[..index].contains(epoch_id))
+            {
                 return Err(StateError::IndexMigrationFailed(
-                    "encrypted object copy key_id must be 16 nonzero bytes".to_string(),
+                    "encrypted object copy recipient_epoch_ids must contain 1..=8 distinct lowercase nonzero 32-hex ids"
+                        .to_string(),
                 ));
             }
             let Some(metadata_frame_len) = metadata_frame_len else {
@@ -6042,6 +6071,14 @@ fn validate_object_copy_envelope(
             "unsupported object copy representation {other}"
         ))),
     }
+}
+
+fn is_lower_hex_epoch_id(value: &str) -> bool {
+    value.len() == 32
+        && value != "00000000000000000000000000000000"
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn insert_native_catalog_unit_tx(
@@ -6239,7 +6276,11 @@ fn native_object_copy_from_row(
         status: row_get(row, 6, "object_copies.status")?,
         pool_id: row_get(row, 7, "object_copies.pool_id")?,
         representation: row_get(row, 8, "object_copies.representation")?,
-        key_id: row_get(row, 9, "object_copies.key_id")?,
+        recipient_epoch_ids: parse_recipient_epoch_ids_json(row_get(
+            row,
+            9,
+            "object_copies.recipient_epoch_ids",
+        )?)?,
         metadata_frame_len: opt_i64_to_u64(
             row_get(row, 10, "object_copies.metadata_frame_len")?,
             "metadata_frame_len",
@@ -6307,7 +6348,11 @@ fn native_object_copy_from_join_row(
         status: row_get(row, offset + 6, "object_copies.status")?,
         pool_id: row_get(row, offset + 7, "object_copies.pool_id")?,
         representation: row_get(row, offset + 8, "object_copies.representation")?,
-        key_id: row_get(row, offset + 9, "object_copies.key_id")?,
+        recipient_epoch_ids: parse_recipient_epoch_ids_json(row_get(
+            row,
+            offset + 9,
+            "object_copies.recipient_epoch_ids",
+        )?)?,
         metadata_frame_len: opt_i64_to_u64(
             row_get(row, offset + 10, "object_copies.metadata_frame_len")?,
             "metadata_frame_len",
@@ -6315,6 +6360,26 @@ fn native_object_copy_from_join_row(
         plaintext_digest: row_get(row, offset + 11, "object_copies.plaintext_digest")?,
         stored_digest: row_get(row, offset + 12, "object_copies.stored_digest")?,
     }))
+}
+
+fn parse_recipient_epoch_ids_json(
+    value: Option<String>,
+) -> Result<Option<Vec<String>>, StateError> {
+    value
+        .map(|json| {
+            let ids: Vec<String> = serde_json::from_str(&json).map_err(|error| {
+                StateError::IndexCorrupt(format!(
+                    "object_copies.recipient_epoch_ids is invalid JSON: {error}"
+                ))
+            })?;
+            validate_object_copy_envelope(
+                Some(OBJECT_COPY_REPRESENTATION_ENCRYPTED),
+                Some(&ids),
+                Some(17),
+            )?;
+            Ok(ids)
+        })
+        .transpose()
 }
 
 fn tape_from_row(row: &rusqlite::Row<'_>) -> Result<TapeRecord, StateError> {
@@ -7027,6 +7092,12 @@ fn migrate(conn: &Connection) -> Result<(), StateError> {
     ensure_column(
         conn,
         "object_copies",
+        "recipient_epoch_ids",
+        "recipient_epoch_ids text",
+    )?;
+    ensure_column(
+        conn,
+        "object_copies",
         "metadata_frame_len",
         "metadata_frame_len integer",
     )?;
@@ -7254,6 +7325,7 @@ create table if not exists object_copies(
   status text not null,
   representation text not null default 'unknown',
   key_id blob,
+  recipient_epoch_ids text,
   metadata_frame_len integer,
   plaintext_digest blob,
   stored_digest blob,
@@ -7855,7 +7927,7 @@ mod tests {
             protected_until_ordinal: None,
             status: "committed".to_string(),
             representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
-            key_id: None,
+            recipient_epoch_ids: None,
             metadata_frame_len: None,
             plaintext_digest: Some(vec![0x43; 32]),
             stored_digest: Some(vec![0x43; 32]),
@@ -8320,7 +8392,7 @@ mod tests {
                     protected_until_ordinal: Some(3),
                     status: "committed".to_string(),
                     representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
-                    key_id: None,
+                    recipient_epoch_ids: None,
                     metadata_frame_len: None,
                     plaintext_digest: Some(vec![0x31; 32]),
                     stored_digest: Some(vec![0x31; 32]),
@@ -9232,6 +9304,7 @@ mod tests {
         for column in [
             "representation",
             "key_id",
+            "recipient_epoch_ids",
             "metadata_frame_len",
             "plaintext_digest",
             "stored_digest",
@@ -11759,7 +11832,7 @@ mod tests {
                     protected_until_ordinal: Some(3),
                     status: "committed".to_string(),
                     representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
-                    key_id: None,
+                    recipient_epoch_ids: None,
                     metadata_frame_len: None,
                     plaintext_digest: Some(vec![0x32; 32]),
                     stored_digest: Some(vec![0x32; 32]),
@@ -11847,7 +11920,7 @@ mod tests {
                     protected_until_ordinal: Some(10),
                     status: "committed".to_string(),
                     representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
-                    key_id: None,
+                    recipient_epoch_ids: None,
                     metadata_frame_len: None,
                     plaintext_digest: Some(vec![0x33; 32]),
                     stored_digest: Some(vec![0x33; 32]),
@@ -12030,7 +12103,7 @@ mod tests {
                         protected_until_ordinal: None,
                         status: status.to_string(),
                         representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
-                        key_id: None,
+                        recipient_epoch_ids: None,
                         metadata_frame_len: None,
                         plaintext_digest: Some(vec![0x55; 32]),
                         stored_digest: Some(vec![0x55; 32]),
@@ -12074,7 +12147,10 @@ mod tests {
         let tape_uuid = [12u8; 16];
         let scheme = provision_scheme();
         let object_id = "encrypted-object-1";
-        let key_id = vec![0x24u8; 16];
+        let recipient_epoch_ids = vec![
+            "24242424242424242424242424242424".to_string(),
+            "25252525252525252525252525252525".to_string(),
+        ];
 
         index
             .project_native_object_and_committed_tape_file_bundle(
@@ -12097,7 +12173,7 @@ mod tests {
                     protected_until_ordinal: Some(31),
                     status: "committed".to_string(),
                     representation: OBJECT_COPY_REPRESENTATION_ENCRYPTED.to_string(),
-                    key_id: Some(key_id.clone()),
+                    recipient_epoch_ids: Some(recipient_epoch_ids.clone()),
                     metadata_frame_len: Some(66),
                     plaintext_digest: Some(vec![0x44; 32]),
                     stored_digest: Some(vec![0x55; 32]),
@@ -12138,32 +12214,43 @@ mod tests {
             copies[0].representation,
             OBJECT_COPY_REPRESENTATION_ENCRYPTED
         );
-        assert_eq!(copies[0].key_id.as_deref(), Some(key_id.as_slice()));
+        assert_eq!(
+            copies[0].recipient_epoch_ids.as_deref(),
+            Some(recipient_epoch_ids.as_slice())
+        );
         assert_eq!(copies[0].metadata_frame_len, Some(66));
         assert_eq!(copies[0].plaintext_digest.as_deref(), Some(&[0x44; 32][..]));
         assert_eq!(copies[0].stored_digest.as_deref(), Some(&[0x55; 32][..]));
 
-        let (representation, stored_key_id, metadata_frame_len, plaintext_digest, stored_digest) =
-            index
-                .conn
-                .query_row(
-                    "select representation, key_id, metadata_frame_len,
+        let (
+            representation,
+            stored_recipient_epoch_ids,
+            metadata_frame_len,
+            plaintext_digest,
+            stored_digest,
+        ) = index
+            .conn
+            .query_row(
+                "select representation, recipient_epoch_ids, metadata_frame_len,
                         plaintext_digest, stored_digest
                  from object_copies where object_id = ?1",
-                    params![object_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, Vec<u8>>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, Vec<u8>>(3)?,
-                            row.get::<_, Vec<u8>>(4)?,
-                        ))
-                    },
-                )
-                .expect("read raw object copy row");
+                params![object_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                    ))
+                },
+            )
+            .expect("read raw object copy row");
         assert_eq!(representation, OBJECT_COPY_REPRESENTATION_ENCRYPTED);
-        assert_eq!(stored_key_id, key_id);
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&stored_recipient_epoch_ids).unwrap(),
+            recipient_epoch_ids
+        );
         assert_eq!(metadata_frame_len, 66);
         assert_eq!(plaintext_digest, vec![0x44; 32]);
         assert_eq!(stored_digest, vec![0x55; 32]);
@@ -12174,7 +12261,7 @@ mod tests {
         for metadata_frame_len in [0, 16, 16 * 1024 * 1024 + 1] {
             let err = validate_object_copy_envelope(
                 Some(OBJECT_COPY_REPRESENTATION_ENCRYPTED),
-                Some(&[0x24; 16]),
+                Some(&["24242424242424242424242424242424".to_string()]),
                 Some(metadata_frame_len),
             )
             .unwrap_err();
@@ -12229,7 +12316,7 @@ mod tests {
             .expect("find object copies");
         assert_eq!(copies.len(), 1);
         assert_eq!(copies[0].representation, OBJECT_COPY_REPRESENTATION_UNKNOWN);
-        assert!(copies[0].key_id.is_none());
+        assert!(copies[0].recipient_epoch_ids.is_none());
         assert!(copies[0].metadata_frame_len.is_none());
     }
 
@@ -12241,7 +12328,7 @@ mod tests {
             .expect("temp dir");
         let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
         let tape_uuid = [13u8; 16];
-        let key_id = [0x35u8; 16];
+        let recipient_epoch_ids = vec![[0x35u8; 16], [0x36u8; 16]];
         let object_id = "journal-encrypted-object";
 
         index
@@ -12264,7 +12351,13 @@ mod tests {
                         protected_ordinal_start: None,
                         protected_ordinal_end_exclusive: None,
                         canonical_metadata_hash: None,
-                        bootstrap_object_row: Some(BootstrapObjectRow::encrypted(5, 9, key_id, 66)),
+                        bootstrap_object_row: Some(BootstrapObjectRow::encrypted(
+                            5,
+                            9,
+                            recipient_epoch_ids.clone(),
+                            66,
+                            207,
+                        )),
                     }],
                     highest_protected_ordinal: 26,
                     total_committed_ordinals: 26,
@@ -12280,7 +12373,16 @@ mod tests {
             copies[0].representation,
             OBJECT_COPY_REPRESENTATION_ENCRYPTED
         );
-        assert_eq!(copies[0].key_id.as_deref(), Some(key_id.as_slice()));
+        assert_eq!(
+            copies[0].recipient_epoch_ids.as_deref(),
+            Some(
+                [
+                    "35353535353535353535353535353535".to_string(),
+                    "36363636363636363636363636363636".to_string(),
+                ]
+                .as_slice()
+            )
+        );
         assert_eq!(copies[0].metadata_frame_len, Some(66));
     }
 
@@ -12327,7 +12429,7 @@ mod tests {
                     protected_until_ordinal: Some(3),
                     status: "committed".to_string(),
                     representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
-                    key_id: None,
+                    recipient_epoch_ids: None,
                     metadata_frame_len: None,
                     plaintext_digest: Some(vec![0x34; 32]),
                     stored_digest: Some(vec![0x34; 32]),

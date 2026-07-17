@@ -3,7 +3,10 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 
-use remanence_aead::{header::object_id_field, seal_to_vec, RootKey, SealOptions, SealReport};
+use remanence_aead::{
+    header::object_id_field, seal_envelope_to_vec, seal_to_vec, EnvelopeSealOptions,
+    RecipientPublicKey, RootKey, SealOptions, SealReport,
+};
 use remanence_library::{BlockSink, VecBlockSink};
 use sha2::{Digest, Sha256};
 
@@ -309,6 +312,100 @@ pub fn write_encrypted_rao_object_from_readers<S: BlockSink + ?Sized>(
         plaintext_layout,
         envelope,
     })
+}
+
+/// Write a complete v2 recipient-envelope RAO object to `sink`.
+///
+/// Canonical archive construction remains in this crate while all encrypted
+/// framing and cryptography are delegated to `remanence-aead`.
+pub fn write_envelope_rao_object<S: BlockSink + ?Sized>(
+    sink: &mut S,
+    options: &RemTarObjectOptions,
+    files: &[RemTarFile<'_>],
+    recipients: &[RecipientPublicKey],
+) -> Result<EncryptedRaoWriteReport, FormatError> {
+    let chunk_size = validate_recipient_envelope_preconditions(options)?;
+    let mut plaintext_sink = VecBlockSink::new();
+    let plaintext_layout = write_rem_tar_object(&mut plaintext_sink, options, files)?;
+    let plaintext = flatten_blocks(plaintext_sink.blocks, options.chunk_size)?;
+    seal_recipient_envelope(
+        sink,
+        options,
+        recipients,
+        chunk_size,
+        plaintext_layout,
+        plaintext,
+    )
+}
+
+/// Write a complete v2 recipient-envelope RAO object from streaming sources.
+pub fn write_envelope_rao_object_from_readers<S: BlockSink + ?Sized>(
+    sink: &mut S,
+    options: &RemTarObjectOptions,
+    files: &mut [RemTarFileStream<'_>],
+    recipients: &[RecipientPublicKey],
+) -> Result<EncryptedRaoWriteReport, FormatError> {
+    let chunk_size = validate_recipient_envelope_preconditions(options)?;
+    let mut plaintext_sink = VecBlockSink::new();
+    let plaintext_layout = write_rem_tar_object_from_readers(&mut plaintext_sink, options, files)?;
+    let plaintext = flatten_blocks(plaintext_sink.blocks, options.chunk_size)?;
+    seal_recipient_envelope(
+        sink,
+        options,
+        recipients,
+        chunk_size,
+        plaintext_layout,
+        plaintext,
+    )
+}
+
+fn seal_recipient_envelope<S: BlockSink + ?Sized>(
+    sink: &mut S,
+    options: &RemTarObjectOptions,
+    recipients: &[RecipientPublicKey],
+    chunk_size: u32,
+    plaintext_layout: RemTarObjectLayout,
+    plaintext: Vec<u8>,
+) -> Result<EncryptedRaoWriteReport, FormatError> {
+    if plaintext.len() as u64 != plaintext_layout.total_size_bytes {
+        return Err(FormatError::layout(format!(
+            "plaintext byte length {} does not match layout {}",
+            plaintext.len(),
+            plaintext_layout.total_size_bytes
+        )));
+    }
+    let plaintext_digest = sha256_array(&plaintext);
+    let seal_options = EnvelopeSealOptions {
+        common: SealOptions {
+            chunk_size,
+            key_id: [0; 16],
+            object_id: options.object_id.clone(),
+            plaintext_size: plaintext.len() as u64,
+            plaintext_digest,
+        },
+        recipients: recipients.to_vec(),
+    };
+    let (sealed, envelope) = seal_envelope_to_vec(&plaintext, &seal_options)?;
+    let written_blocks = write_fixed_blocks(sink, options.chunk_size, &sealed)?;
+    if written_blocks != envelope.stored_size_blocks {
+        return Err(FormatError::layout(format!(
+            "encrypted blocks written {written_blocks} does not match envelope {}",
+            envelope.stored_size_blocks
+        )));
+    }
+    Ok(EncryptedRaoWriteReport {
+        plaintext_layout,
+        envelope,
+    })
+}
+
+fn validate_recipient_envelope_preconditions(
+    options: &RemTarObjectOptions,
+) -> Result<u32, FormatError> {
+    crate::pax::validate_chunk_size(options.chunk_size)?;
+    object_id_field(&options.object_id)?;
+    u32::try_from(options.chunk_size)
+        .map_err(|_| FormatError::invalid("chunk_size does not fit RAO header uint32"))
 }
 
 fn validate_encrypted_envelope_preconditions(

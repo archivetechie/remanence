@@ -145,8 +145,9 @@ fn worst_case_bootstrap_object_row(
         BootstrapObjectRowAdmission::EncryptedRao => Ok(BootstrapObjectRow::encrypted(
             tape_file_number,
             stored_block_count,
-            [0xFF; 16],
+            (1u8..=8).map(|byte| [byte; 16]).collect(),
             OBJECT_ROW_METADATA_FRAME_MAX_LEN,
+            4096,
         )),
     }
 }

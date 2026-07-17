@@ -17,10 +17,10 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use remanence_aead::{seal_to_vec, RaoMetadata, RootKey, SealOptions, SealReport};
+use remanence_aead::{RecipientPublicKey, SealReport};
 use remanence_format::{
-    write_rem_tar_object_from_readers, RemTarFileLayout, RemTarFileStream, RemTarObjectOptions,
-    FORMAT_ID,
+    write_envelope_rao_object_from_readers, write_rem_tar_object_from_readers, RemTarFileLayout,
+    RemTarFileStream, RemTarObjectOptions, FORMAT_ID,
 };
 use remanence_library::{
     BlockSink, BlockSource, PipelinedWriteDiagnostics, TapeIoError, TapePosition, VecBlockSink,
@@ -69,10 +69,8 @@ pub enum PoolWriteRepresentation {
     Plaintext,
     /// Store the RAO1 encrypted representation.
     Encrypted {
-        /// Root key material used to seal the object.
-        root_key: RootKey,
-        /// Opaque 16-byte RAO key identifier to record in the envelope.
-        key_id: [u8; 16],
+        /// Public recipient epochs to which the per-object DEK is wrapped.
+        recipients: Vec<RecipientPublicKey>,
     },
 }
 
@@ -152,8 +150,8 @@ pub struct PoolWriteObjectCopyRecord {
     pub pool_id: String,
     /// Stored RAO representation: `plaintext` or `encrypted`.
     pub representation: String,
-    /// Opaque RAO key id for encrypted copies.
-    pub key_id: Option<[u8; 16]>,
+    /// Lowercase 32-hex recipient epoch ids for encrypted copies.
+    pub recipient_epoch_ids: Option<Vec<String>>,
     /// Encrypted RAO metadata frame length.
     pub metadata_frame_len: Option<u64>,
 }
@@ -2904,10 +2902,7 @@ fn commit_pool_write(
         protected_until_ordinal: projection.protected_until_ordinal,
         status: "committed".to_string(),
         representation: projection.copy_representation.representation.to_string(),
-        key_id: projection
-            .copy_representation
-            .key_id
-            .map(|key_id| key_id.to_vec()),
+        recipient_epoch_ids: projection.copy_representation.recipient_epoch_ids.clone(),
         metadata_frame_len: projection.copy_representation.metadata_frame_len,
         plaintext_digest: Some(write_report.catalog.object_copy.plaintext_digest.to_vec()),
         stored_digest: Some(write_report.catalog.object_copy.stored_digest.to_vec()),
@@ -2974,7 +2969,7 @@ fn pool_write_result(
             first_body_lba,
             pool_id: selected.pool_id,
             representation: copy_representation.representation.to_string(),
-            key_id: copy_representation.key_id,
+            recipient_epoch_ids: copy_representation.recipient_epoch_ids,
             metadata_frame_len: copy_representation.metadata_frame_len,
         }],
     };
@@ -3067,22 +3062,13 @@ fn pool_write_copy_record_from_native(
         copy.tape_uuid.as_slice().try_into().map_err(|_| {
             replay_object_invalid(&copy.object_id, "copy tape_uuid is not 16 bytes")
         })?;
-    let key_id = copy
-        .key_id
-        .as_deref()
-        .map(|value| {
-            value
-                .try_into()
-                .map_err(|_| replay_object_invalid(&copy.object_id, "copy key_id is not 16 bytes"))
-        })
-        .transpose()?;
     Ok(PoolWriteObjectCopyRecord {
         tape_uuid,
         tape_file_number: u64::from(copy.tape_file_number),
         first_body_lba: copy.first_body_lba,
         pool_id: pool_id.to_string(),
         representation: copy.representation.clone(),
-        key_id,
+        recipient_epoch_ids: copy.recipient_epoch_ids.clone(),
         metadata_frame_len: copy.metadata_frame_len,
     })
 }
@@ -3149,10 +3135,7 @@ impl PreparedStoredObject {
     fn copy_representation(&self) -> CopyRepresentation {
         match self {
             Self::Plaintext => CopyRepresentation::plaintext(),
-            Self::Encrypted(encrypted) => CopyRepresentation::encrypted(
-                encrypted.envelope.header.key_id,
-                encrypted.envelope.metadata_frame_len,
-            ),
+            Self::Encrypted(encrypted) => CopyRepresentation::encrypted(&encrypted.envelope),
         }
     }
 }
@@ -3174,10 +3157,10 @@ fn stored_footprint_bytes(
         .ok_or_else(|| PoolWriteError::InvalidInput("stored object byte size overflow".to_string()))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct CopyRepresentation {
     representation: &'static str,
-    key_id: Option<[u8; 16]>,
+    recipient_epoch_ids: Option<Vec<String>>,
     metadata_frame_len: Option<u64>,
 }
 
@@ -3185,16 +3168,24 @@ impl CopyRepresentation {
     fn plaintext() -> Self {
         Self {
             representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT,
-            key_id: None,
+            recipient_epoch_ids: None,
             metadata_frame_len: None,
         }
     }
 
-    fn encrypted(key_id: [u8; 16], metadata_frame_len: u64) -> Self {
+    fn encrypted(envelope: &SealReport) -> Self {
+        let recipient_epoch_ids = envelope
+            .key_frame
+            .as_ref()
+            .expect("v2 envelope seal report carries a key frame")
+            .slots
+            .iter()
+            .map(|slot| bytes_to_hex(&slot.recipient_epoch_id))
+            .collect();
         Self {
             representation: OBJECT_COPY_REPRESENTATION_ENCRYPTED,
-            key_id: Some(key_id),
-            metadata_frame_len: Some(metadata_frame_len),
+            recipient_epoch_ids: Some(recipient_epoch_ids),
+            metadata_frame_len: Some(envelope.metadata_frame_len),
         }
     }
 }
@@ -3330,71 +3321,37 @@ fn prepare_stored_object(
 ) -> Result<PreparedStoredObject, PoolWriteError> {
     match representation {
         PoolWriteRepresentation::Plaintext => Ok(PreparedStoredObject::Plaintext),
-        PoolWriteRepresentation::Encrypted { root_key, key_id } => {
-            Ok(PreparedStoredObject::Encrypted(Box::new(
-                seal_prepared_object(prepared, root_key, *key_id)?,
-            )))
-        }
+        PoolWriteRepresentation::Encrypted { recipients } => Ok(PreparedStoredObject::Encrypted(
+            Box::new(seal_prepared_object(prepared, recipients)?),
+        )),
     }
 }
 
 fn seal_prepared_object(
     prepared: &PreparedPoolObject,
-    root_key: &RootKey,
-    key_id: [u8; 16],
+    recipients: &[RecipientPublicKey],
 ) -> Result<PreparedEncryptedPoolObject, PoolWriteError> {
-    let mut plaintext_sink = VecBlockSink::new();
+    let mut encrypted_sink = VecBlockSink::new();
     let mut readers = open_prepared_readers(&prepared.files)?;
     let mut streams = Vec::with_capacity(prepared.files.len());
     for (file, reader) in prepared.files.iter().zip(readers.iter_mut()) {
         streams.push(RemTarFileStream::new(file.spec.clone(), reader));
     }
-    let plaintext_layout =
-        write_rem_tar_object_from_readers(&mut plaintext_sink, &prepared.options, &mut streams)
-            .map_err(StreamingError::from)?;
+    let report = write_envelope_rao_object_from_readers(
+        &mut encrypted_sink,
+        &prepared.options,
+        &mut streams,
+        recipients,
+    )
+    .map_err(StreamingError::from)?;
+    let plaintext_layout = report.plaintext_layout;
     if plaintext_layout.projected_size_blocks != prepared.plan.layout.projected_size_blocks {
         return Err(PoolWriteError::InvalidInput(
             "sealed plaintext layout differs from pre-admission plan".to_string(),
         ));
     }
-    let plaintext = flatten_blocks(plaintext_sink.blocks, prepared.options.chunk_size)?;
-    if plaintext.len() as u64 != plaintext_layout.total_size_bytes {
-        return Err(PoolWriteError::InvalidInput(format!(
-            "sealed plaintext byte length {} does not match layout {}",
-            plaintext.len(),
-            plaintext_layout.total_size_bytes
-        )));
-    }
-    let plaintext_digest = sha256_array(&plaintext);
-    let chunk_size = u32::try_from(prepared.options.chunk_size)
-        .map_err(|_| PoolWriteError::InvalidInput("RAO chunk size exceeds u32".to_string()))?;
-    let metadata = RaoMetadata::new(
-        plaintext_layout.total_size_bytes,
-        plaintext_digest,
-        chunk_size,
-    )
-    .map_err(|error| PoolWriteError::InvalidInput(format!("build RAO metadata: {error}")))?;
-    let metadata_plaintext = metadata
-        .to_cbor_bytes(chunk_size)
-        .map_err(|error| PoolWriteError::InvalidInput(format!("encode RAO metadata: {error}")))?;
-    let seal_options = SealOptions {
-        chunk_size,
-        key_id,
-        object_id: prepared.options.object_id.clone(),
-        plaintext_size: plaintext_layout.total_size_bytes,
-        plaintext_digest,
-    };
-    let (sealed, envelope) = seal_to_vec(&plaintext, root_key, &seal_options)
-        .map_err(|error| PoolWriteError::InvalidInput(format!("seal encrypted RAO: {error}")))?;
-    let expected_metadata_frame_len = u64::try_from(metadata_plaintext.len())
-        .ok()
-        .and_then(|len| len.checked_add(16))
-        .ok_or_else(|| PoolWriteError::InvalidInput("RAO metadata length overflow".to_string()))?;
-    if envelope.metadata_frame_len != expected_metadata_frame_len {
-        return Err(PoolWriteError::InvalidInput(
-            "encrypted RAO metadata frame length changed during seal".to_string(),
-        ));
-    }
+    let envelope = report.envelope;
+    let sealed = flatten_blocks(encrypted_sink.blocks, prepared.options.chunk_size)?;
     let block_count = u64::try_from(sealed.len() / prepared.options.chunk_size)
         .map_err(|_| PoolWriteError::InvalidInput("sealed RAO block count overflow".to_string()))?;
     if sealed.len() % prepared.options.chunk_size != 0 || block_count != envelope.stored_size_blocks
@@ -3428,11 +3385,15 @@ fn flatten_blocks(blocks: Vec<Vec<u8>>, block_size: usize) -> Result<Vec<u8>, Po
     Ok(out)
 }
 
-fn sha256_array(bytes: &[u8]) -> [u8; 32] {
-    let digest = Sha256::digest(bytes);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    out
+fn envelope_recipient_epoch_ids(envelope: &SealReport) -> Vec<[u8; 16]> {
+    envelope
+        .key_frame
+        .as_ref()
+        .expect("v2 envelope seal report carries a key frame")
+        .slots
+        .iter()
+        .map(|slot| slot.recipient_epoch_id)
+        .collect()
 }
 
 fn write_fixed_blocks(
@@ -3633,8 +3594,9 @@ fn write_encrypted_object_to_parity(
     parity.record_bootstrap_object_row(BootstrapObjectRow::encrypted(
         opened.0,
         encrypted.envelope.stored_size_blocks,
-        encrypted.envelope.header.key_id,
+        envelope_recipient_epoch_ids(&encrypted.envelope),
         encrypted.envelope.metadata_frame_len,
+        encrypted.envelope.header.key_frame_len,
     ))?;
     let object_close = parity.finish_object()?;
     if opened.0 != object_close.tape_file_number {
@@ -3674,8 +3636,9 @@ fn no_parity_encrypted_write_report(
         bootstrap_object_row: Some(BootstrapObjectRow::encrypted(
             append.tape_file_number,
             encrypted.envelope.stored_size_blocks,
-            encrypted.envelope.header.key_id,
+            envelope_recipient_epoch_ids(&encrypted.envelope),
             encrypted.envelope.metadata_frame_len,
+            encrypted.envelope.header.key_frame_len,
         )),
     };
     encrypted_write_report(
@@ -5000,7 +4963,7 @@ mod tests {
                 first_body_lba: 9,
                 pool_id: "camera.copy-a".to_string(),
                 representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
-                key_id: None,
+                recipient_epoch_ids: None,
                 metadata_frame_len: None,
             }],
         };

@@ -37,14 +37,14 @@ pub use key_frame::{
 pub use metadata::RaoMetadata;
 pub use open::{open, open_envelope, open_envelope_to_vec, open_to_vec, OpenReport};
 pub use range::{
-    covering_stored_range, covering_stored_range_envelope, open_inner_range_to_vec,
-    open_plaintext_range_envelope_from_reader, open_plaintext_range_envelope_to_vec,
-    open_plaintext_range_from_reader, open_plaintext_range_to_vec, CoveringStoredRange,
-    RangeOpenReport,
+    covering_stored_range, covering_stored_range_envelope, open_inner_range_envelope_to_vec,
+    open_inner_range_to_vec, open_plaintext_range_envelope_from_reader,
+    open_plaintext_range_envelope_to_vec, open_plaintext_range_from_reader,
+    open_plaintext_range_to_vec, CoveringStoredRange, RangeOpenReport,
 };
 pub use seal::{
-    seal, seal_envelope, seal_envelope_to_vec, seal_to_vec, EnvelopeSealOptions, SealOptions,
-    SealReport,
+    seal, seal_envelope, seal_envelope_deterministic_for_test_vectors, seal_envelope_to_vec,
+    seal_to_vec, EnvelopeSealOptions, SealOptions, SealReport,
 };
 pub use stream::{
     cipher_offset, cipher_offset_with_key_frame, decrypt_chunk, encrypt_chunk,

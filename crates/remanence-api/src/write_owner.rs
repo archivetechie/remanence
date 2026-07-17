@@ -5549,7 +5549,7 @@ mod tests {
                     protected_until_ordinal: None,
                     status: "committed".to_string(),
                     representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
-                    key_id: None,
+                    recipient_epoch_ids: None,
                     metadata_frame_len: None,
                     plaintext_digest: None,
                     stored_digest: None,
