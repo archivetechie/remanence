@@ -18,7 +18,7 @@ Layer 5   remanence-api, remanence-daemon, remanence-cli
 Layer 4   remanence-state
           config, state lock, audit log, rebuildable SQLite catalog
 Layer 3   remanence-format (3b: rao-v1 body)   remanence-parity (3c: parity)
-          + remanence-aead (RAO1 envelope, v1 + v2/HPKE), remanence-format-driver (traits),
+          + remanence-aead (RAO1 v2/HPKE envelope), remanence-format-driver (traits),
             remanence-bru (legacy reader), remanence-stream (composition)
 Layer 2   remanence-library
           discovery, identity, policy-gated handles, robotics, tape I/O
@@ -34,10 +34,10 @@ body blocks; the parity layer owns the physical tape layout around them
 One crate sits outside the stack by design: `crates/rao-recover` is a
 standalone disaster-recovery binary that links `remanence-aead`,
 `remanence-format`, `remanence-library`, and `remanence-stream` directly,
-skipping Layers 4 and 5 entirely. It exists so a v1 or v2 RAO object can
-be decrypted and restored with nothing but the object bytes and a key —
-no daemon, no catalog, no config file — for the scenario where the rest
-of the stack is unavailable or untrusted.
+skipping Layers 4 and 5 entirely. It exists so a v2 RAO envelope can be
+decrypted and restored with nothing but the object bytes and one matching
+recipient private key — no daemon, no catalog, no config file — for the
+scenario where the rest of the stack is unavailable or untrusted.
 
 ![Workspace crate map: layer 5 cli, api, daemon over layer 4 state over layer 3 format, aead, parity, format-driver over layer 2 library over layer 1 scsi, with the format-free platform seam between layers 3 and 2](assets/layer-map.svg)
 
@@ -102,19 +102,18 @@ Six crates share this layer:
   maps a requested plaintext byte range to the smallest span of AEAD
   chunks that must be fetched and decrypted to serve it.
 - `remanence-aead` is the isolated crypto boundary: the `RAO1` encrypted
-  envelope, in two key-wrapping shapes that share one AEAD suite
-  (HKDF-SHA-256 key derivation, ChaCha20-Poly1305 STREAM). Format
-  version 1 wraps a caller-supplied registry symmetric root key.
-  Version 2 generates a fresh per-object data-encryption key and wraps a
-  copy of it to each of 1-8 recipients with HPKE (RFC 9180, Base mode,
+  format-version-2 envelope (HKDF-SHA-256 key derivation and a
+  ChaCha20-Poly1305 STREAM). It generates a fresh per-object
+  data-encryption key and wraps a copy of it to each recipient with HPKE
+  (RFC 9180 Base mode,
   X25519-HKDF-SHA256-ChaCha20Poly1305) in a `RAOK`-tagged key frame
-  between the header and the metadata frame — there is no shared secret
-  in v2 at all, and a v1 object with just its version byte flipped is
-  rejected loudly rather than silently misread. The crate depends on no
-  other Remanence crate, so the envelope is auditable on its own. It
-  also exposes ranged, streaming open/seal functions for both versions,
-  used by the `extract-stream`/`covering-range` CLI surface and by
-  `rao-recover`.
+  between the header and metadata frame. Readers accept 1-8 slots;
+  production sealers require 2-8 distinct epochs. There is no shared
+  secret, and format version 1 is permanently rejected as unsupported.
+  The crate depends on no other Remanence crate, so the envelope is
+  auditable on its own. Its v2 whole-object and ranged primitives are
+  wrapped by `remanence-format`, which is the funnel used by the CLI,
+  API, and `rao-recover`.
 - `remanence-parity` owns the physical tape layout: bootstrap blocks,
   filemark discipline, Reed-Solomon sidecar parity, resume, and the
   catalog-less scan that reconstructs a tape's structure from the media
@@ -132,13 +131,12 @@ Six crates share this layer:
 - `remanence-crc` is the shared CRC-64/XZ used by the parity structures
   and the audit log.
 
-The only way to produce a v2 (HPKE) envelope today is `rem archive
-reseal`, which converts an existing v1 registry-key object to v2 — there
-is no direct `archive build --encrypt` path to v2 yet. The only shipped
-way to fully decrypt a v2 object is the standalone `rao-recover` binary
-or a crate-internal call to `open_envelope`; neither `rem` nor
-`rem-debug` has a CLI verb that opens a whole v2 envelope (the ranged
-`extract-stream`/`covering-range` CLI commands are v1-only).
+`archive build` and pool-selected `archive write` produce v2 when given
+2-8 ordered `--recipient` RAOR files; omitting recipients keeps the body
+plaintext. `archive reseal` is a v2→v2 recipient-rotation path. Whole,
+streaming, and ranged opens use a RAOP `--private-key`; its epoch id selects
+the matching key-frame slot. `rao-recover` provides the same v2 open without
+the daemon, catalog, or config.
 
 <!-- code-anchor: crates/remanence-state/src/lib.rs crates/remanence-state/src/state.rs @ 2a20106 -->
 ## Layer 4: state
@@ -223,7 +221,8 @@ What happens when an orchestrator writes an object:
    against the received bytes before anything touches tape. On startup,
    `rem-daemon` deletes its own daemon-owned leftover spool files from a
    prior unclean exit before resolving the budget.
-4. The object is laid out as rao-v1 (encrypted first if requested) and
+4. The object is laid out as a plaintext `rao-v1` body or sealed as a v2
+   recipient envelope, then
    written through the parity sink. Tape I/O itself is pipelined: a
    fixed pool of page-aligned staging-ring buffers (`tape_io.staging_ring_buffers`,
    default 4) is filled by a producer thread while a submitter issues
