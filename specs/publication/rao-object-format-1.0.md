@@ -70,8 +70,13 @@ Appendix C. [Revision History (Informative)](#appendix-c-revision-history-inform
 
 ### 1.1. Purpose and Design Goals
 
-RAO wraps a set of named file payloads into one archival object. Its design
-goals, in priority order:
+RAO wraps a set of named file payloads into one archival object. The format
+originates in **Remanence**, an open archival tape stack that serves as this
+specification's reference implementation (see Author's Address). This document
+specifies the format completely, so that it stands alone from any
+implementation; the name survives in the format itself only as fixed wire
+identifiers — the `REMANENCE.` vendor-keyword namespace and the `_remanence/`
+manifest path (Section 4). RAO's design goals, in priority order:
 
 1. **Plaintext longevity comes first.** A plaintext RAO object is a
    fully valid POSIX pax tar archive. A standard pax-aware `tar` extracts
@@ -117,24 +122,7 @@ encrypted representation adds confidentiality and cryptographic
 authentication while preserving the self-description and closed-form
 byte-range addressing of the plaintext form — *with the key*.
 
-### 1.3. Deployment Context (Informative)
-
-In the intended deployment each archival master is kept as three copies with
-different jobs:
-
-| Copy | Role | Format |
-| --- | --- | --- |
-| copy-1 | working (random-access restore) | RAO, plaintext representation |
-| copy-2 | offsite/disaster-recovery + cloud blob | RAO, encrypted representation |
-| copy-3 | shelf (cold, last resort) | plain GNU tar — **not** RAO, by design |
-
-Copy-3 is a deliberately different format and implementation, for
-format/implementation diversity (a latent bug in the RAO writer cannot
-corrupt all three baskets identically); it is out of scope of this document.
-Copies 1 and 2 are the same RAO object in its two representations: built once,
-fanned out byte-stable, sharing one `plaintext_digest`.
-
-### 1.4. Relationship to Adjacent Components
+### 1.3. Relationship to Adjacent Components
 
 RAO is the archival object format of the Remanence tape stack. It owns one
 thing — the stored bytes of one object — and leaves the rest to the
@@ -153,7 +141,7 @@ components around it:
   carries an opaque `key_id`; a `format_version = 2` object carries recipient
   epoch identifiers and HPKE-wrapped copies of its DEK, never a plaintext key.
 
-### 1.5. Non-Goals
+### 1.4. Non-Goals
 
 RAO performs no compression: the payload workload is already-compressed media,
 and whole-stream compression destroys closed-form range addressing (a later
@@ -523,7 +511,7 @@ Readers MUST verify the unsigned checksum and reject a mismatch with
 Readers MUST reject any other typeflag with `UnsupportedTarTypeflag`. This is
 deliberate: version 1.0's entry set is regular files, hardlinks, symbolic
 links, and directories — a faithful tree of files — and excludes device,
-FIFO, socket, and other special entries (Section 1.5); accepting an
+FIFO, socket, and other special entries (Section 1.4); accepting an
 unsupported typeflag silently would misrepresent an unsupported archive as
 fully restored.
 
@@ -1107,7 +1095,7 @@ directories, and also writes one extra file `_remanence/manifest.cbor`. Unknown
 only header size, never content; the manifest decodes with any generic CBOR
 tool into self-describingly-named text fields. Stock tar faithfully restores
 absolute or dangling symlinks too; that fidelity is correct but not a safety
-claim (Section 12.10). With all Remanence metadata lost, a Scanner can still
+claim (Section 12.10). With all RAO-specific metadata lost, a Scanner can still
 walk the archive using only tar rules — header, `size`, `roundup512(size)`,
 repeat — recovering payload bytes, hardlink relationships, symlink targets,
 directory entries, and names; it loses only chunk addressing (irrelevant when scanning) and
@@ -2509,8 +2497,9 @@ object leaks no filenames, sizes, count, or structure (Section 12.5).
 Self-description holds *with the key*; keyless operation keeps exactly the
 scrub/inventory surface of the plaintext header. A cleartext manifest beside
 encrypted payloads was rejected: filenames, sizes, and counts are routinely
-sensitive for the offsite/cloud copy, and the catalog plus the plaintext
-working copy already provide keyless rebuild paths.
+sensitive precisely for the copies that leave the operator's custody, and
+keyless rebuild paths remain available wherever a catalog or a plaintext
+representation of the object exists.
 
 ### B.6. Stored bytes are a block multiple; the fill is inside them
 
