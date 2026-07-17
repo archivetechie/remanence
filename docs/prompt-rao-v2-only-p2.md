@@ -5,9 +5,12 @@ Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, 
 **Contract:** `docs/design-rao-v2-only.md` (v0.3) — decisions D1, D2, D5
 (vector strategy + the full Q4 negative-case list), D3 (reader slot policy,
 identity encodings). Read it in full; it wins on any disagreement.
-**Precondition:** P1 (`docs/prompt-rao-v2-only-p1.md`) has fully landed —
-the workspace is v2-only and `seal_envelope_deterministic_for_test_vectors`
-exists. Verify that before starting; stop if not.
+**Precondition:** P1 (`docs/prompt-rao-v2-only-p1.md`) has fully landed
+(commits 2882dc7 / e420970 / 9ddd32d) — the workspace is v2-only and the
+deterministic hook exists under its post-rename name
+**`seal_deterministic_for_test_vectors`** (the `_envelope` suffix was
+dropped repo-wide in P1-EXCISE; read its signature before use). Verify
+that before starting; stop if not.
 
 **Repo:** this repo only. Scope: `fixtures/rao/`, `tools/`,
 `specs/publication/`, `Makefile` vector targets. Do not touch crate source
@@ -28,7 +31,7 @@ except where a test consumes a fixture you re-base.
 
 1. **RAO-TV-E2** (D5): a positive whole-object v2 vector — fixed inputs,
    fixed DEK, seeded ephemeral RNG via
-   `seal_envelope_deterministic_for_test_vectors`; pinned artifact
+   `seal_deterministic_for_test_vectors`; pinned artifact
    (`rao/objects/rao-tv-e2.rao`) + fixture manifest with the full derivation
    chain (recipient keypairs included as test material). Byte-exact
    regeneration proven by generating twice.
