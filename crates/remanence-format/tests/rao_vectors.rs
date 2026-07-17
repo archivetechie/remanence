@@ -1,10 +1,12 @@
 //! Verifies the RAO Section 13 fixture manifests against regenerated objects.
 
-use remanence_aead::{derive_keys, inspect_bytes, open_to_vec, RootKey};
+use remanence_aead::{
+    derive_keys_v2, inspect_bytes, open_to_vec, seal_deterministic_for_test_vectors,
+    DataEncryptionKey, EnvelopeSealOptions, RecipientPrivateKey, RecipientPublicKey, SealOptions,
+};
 use remanence_format::{
-    write_encrypted_rao_object, write_rem_tar_object, write_rem_tar_object_from_readers,
-    MetadataPreservation, RemTarEntryType, RemTarFile, RemTarFileSpec, RemTarFileStream,
-    RemTarObjectOptions,
+    write_rem_tar_object, write_rem_tar_object_from_readers, MetadataPreservation, RemTarEntryType,
+    RemTarFile, RemTarFileSpec, RemTarFileStream, RemTarObjectOptions,
 };
 use remanence_library::VecBlockSink;
 use serde_json::Value;
@@ -12,8 +14,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
-const KEY_ID: [u8; 16] = *b"KID:rao-tv-e1.01";
-const ROOT_KEY_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+const D1_DEK: [u8; 32] = [0x5d; 32];
+const D1_HPKE_RNG_SEED: [u8; 32] = [0xa7; 32];
 
 fn fixture(json: &str) -> Value {
     serde_json::from_str(json).expect("fixture manifest is valid JSON")
@@ -104,8 +106,14 @@ fn flatten_sink(sink: &VecBlockSink) -> Vec<u8> {
     sink.blocks.iter().flatten().copied().collect()
 }
 
-fn root_key() -> RootKey {
-    RootKey::new((0u8..=31).collect::<Vec<_>>()).expect("root key has 32 bytes")
+fn d1_recipient_pair() -> (RecipientPrivateKey, Vec<RecipientPublicKey>) {
+    let primary = RecipientPrivateKey::new([0x31; 16], "primary-2026", [0x41; 32]).unwrap();
+    let recovery = RecipientPrivateKey::new([0x32; 16], "recovery-2026", [0x42; 32]).unwrap();
+    let recipients = vec![
+        primary.public_key(0).unwrap(),
+        recovery.public_key(1).unwrap(),
+    ];
+    (primary, recipients)
 }
 
 fn p1_options() -> RemTarObjectOptions {
@@ -719,94 +727,6 @@ fn rao_tv_p1_matches_fixture_manifest() {
 }
 
 #[test]
-fn rao_tv_e1_matches_fixture_manifest() {
-    let p1_fixture = fixture(include_str!("../../../fixtures/rao/rao-tv-p1.json"));
-    let e1_fixture = fixture(include_str!("../../../fixtures/rao/rao-tv-e1.json"));
-    let inputs = field(&e1_fixture, "inputs");
-    let expected = field(&e1_fixture, "expected");
-    let hello = b"hello, rem archive object\n";
-    let pattern: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
-    let files = p1_files(hello, &pattern);
-    let key = root_key();
-
-    assert_eq!(str_field(inputs, "plaintext_vector"), "RAO-TV-P1");
-    assert_eq!(str_field(inputs, "root_key"), ROOT_KEY_HEX);
-    assert_eq!(str_field(inputs, "key_id"), hex(&KEY_ID));
-
-    let mut sink = VecBlockSink::new();
-    let report =
-        write_encrypted_rao_object(&mut sink, &p1_options(), &files, &key, KEY_ID).unwrap();
-    let bytes = flatten_sink(&sink);
-    let inspect = inspect_bytes(&bytes).unwrap();
-    let (_plaintext, open) = open_to_vec(&bytes, &key).unwrap();
-    let header_bytes = open.header.serialize().unwrap();
-    let header_hash = open.header.header_hash().unwrap();
-    let keys = derive_keys(&key, &open.header.hkdf_salt, &header_hash).unwrap();
-    let metadata_start = 128usize;
-    let metadata_end = metadata_start + open.header.metadata_frame_len as usize;
-    let footer_offset = inspect.footer_offset as usize;
-
-    assert_eq!(
-        inspect.plaintext_size,
-        u64_field(expected, "plaintext_size")
-    );
-    assert_eq!(inspect.chunk_count, u64_field(expected, "chunk_count"));
-    assert_eq!(
-        report.envelope.metadata_plaintext_len,
-        u64_field(expected, "metadata_plaintext_len")
-    );
-    assert_eq!(
-        report.envelope.metadata_frame_len,
-        u64_field(expected, "metadata_frame_len")
-    );
-    assert_eq!(
-        metadata_end as u64,
-        u64_field(expected, "payload_frame_start")
-    );
-    assert_eq!(
-        footer_offset as u64 - 1,
-        u64_field(expected, "payload_frame_end_inclusive")
-    );
-    assert_eq!(inspect.footer_offset, u64_field(expected, "footer_offset"));
-    assert_eq!(
-        inspect.stored_size_bytes,
-        u64_field(expected, "stored_size_bytes")
-    );
-    assert_eq!(
-        report.envelope.stored_size_blocks,
-        u64_field(expected, "stored_size_blocks")
-    );
-    assert_eq!(
-        hex(&open.header.hkdf_salt),
-        str_field(expected, "hkdf_salt")
-    );
-    assert_eq!(hex(&header_bytes), str_field(expected, "header_hex"));
-    assert_eq!(hex(&header_hash), str_field(expected, "header_hash"));
-    assert_eq!(hex(&keys.metadata_key), str_field(expected, "metadata_key"));
-    assert_eq!(hex(&keys.payload_key), str_field(expected, "payload_key"));
-    assert_eq!(
-        hex(&bytes[metadata_start..metadata_end]),
-        str_field(expected, "metadata_frame_hex")
-    );
-    assert_eq!(
-        sha256_hex(&bytes[metadata_end..footer_offset]),
-        str_field(expected, "payload_frame_sha256")
-    );
-    assert_eq!(
-        hex(&inspect.stored_digest),
-        str_field(expected, "stored_digest")
-    );
-    assert_eq!(
-        hex(&open.metadata.plaintext_digest),
-        str_field(expected, "plaintext_digest")
-    );
-    assert_eq!(
-        str_field(field(&p1_fixture, "expected"), "stored_digest"),
-        str_field(expected, "plaintext_digest")
-    );
-}
-
-#[test]
 fn rao_tv_d1_matches_fixture_manifest() {
     let fixture = fixture(include_str!("../../../fixtures/rao/rao-tv-d1.json"));
     let inputs = field(&fixture, "inputs");
@@ -838,8 +758,12 @@ fn rao_tv_d1_matches_fixture_manifest() {
         options.manifest_file_id.as_str(),
         str_field(inputs, "manifest_file_id")
     );
-    assert_eq!(str_field(inputs, "encrypted_root_key"), ROOT_KEY_HEX);
-    assert_eq!(str_field(inputs, "encrypted_key_id"), hex(&KEY_ID));
+    assert_eq!(str_field(inputs, "recipient_mode"), "hpke-x25519");
+    assert_eq!(str_field(inputs, "deterministic_dek"), hex(&D1_DEK));
+    assert_eq!(
+        str_field(inputs, "deterministic_hpke_rng_seed"),
+        hex(&D1_HPKE_RNG_SEED)
+    );
 
     assert_eq!(
         sha256_hex(&payload),
@@ -879,17 +803,38 @@ fn rao_tv_d1_matches_fixture_manifest() {
     assert_layout(&layout.files[0], field(plaintext, "file_layout"));
     assert_manifest_layout(&layout.manifest, field(plaintext, "manifest_layout"));
 
-    let key = root_key();
-    let mut encrypted_sink = VecBlockSink::new();
-    let report =
-        write_encrypted_rao_object(&mut encrypted_sink, &options, &files, &key, KEY_ID).unwrap();
-    let encrypted_bytes = flatten_sink(&encrypted_sink);
+    let (primary, recipients) = d1_recipient_pair();
+    let mut plaintext_digest = [0u8; 32];
+    plaintext_digest.copy_from_slice(&Sha256::digest(&bytes));
+    let envelope_options = EnvelopeSealOptions {
+        common: SealOptions {
+            chunk_size: options.chunk_size as u32,
+            object_id: options.object_id.clone(),
+            plaintext_size: bytes.len() as u64,
+            plaintext_digest,
+        },
+        recipients,
+    };
+    let mut encrypted_bytes = Vec::new();
+    let report = seal_deterministic_for_test_vectors(
+        Cursor::new(&bytes),
+        &mut encrypted_bytes,
+        &envelope_options,
+        DataEncryptionKey::from_bytes(D1_DEK),
+        D1_HPKE_RNG_SEED,
+    )
+    .unwrap();
     let inspect = inspect_bytes(&encrypted_bytes).unwrap();
-    let (_opened, open) = open_to_vec(&encrypted_bytes, &key).unwrap();
+    let (opened, open) = open_to_vec(&encrypted_bytes, &primary).unwrap();
+    assert_eq!(opened, bytes);
     let header_bytes = open.header.serialize().unwrap();
-    let header_hash = open.header.header_hash().unwrap();
-    let keys = derive_keys(&key, &open.header.hkdf_salt, &header_hash).unwrap();
-    let metadata_start = 128usize;
+    let key_frame_bytes = open.key_frame.serialize().unwrap();
+    let header_hash = open
+        .header
+        .header_hash_with_key_frame(&key_frame_bytes)
+        .unwrap();
+    let keys = derive_keys_v2(&D1_DEK, &open.header.hkdf_salt, &header_hash).unwrap();
+    let metadata_start = 128usize + key_frame_bytes.len();
     let metadata_end = metadata_start + open.header.metadata_frame_len as usize;
     let footer_offset = inspect.footer_offset as usize;
 
@@ -899,11 +844,11 @@ fn rao_tv_d1_matches_fixture_manifest() {
     );
     assert_eq!(inspect.chunk_count, u64_field(encrypted, "chunk_count"));
     assert_eq!(
-        report.envelope.metadata_plaintext_len,
+        report.metadata_plaintext_len,
         u64_field(encrypted, "metadata_plaintext_len")
     );
     assert_eq!(
-        report.envelope.metadata_frame_len,
+        report.metadata_frame_len,
         u64_field(encrypted, "metadata_frame_len")
     );
     assert_eq!(
@@ -920,14 +865,19 @@ fn rao_tv_d1_matches_fixture_manifest() {
         u64_field(encrypted, "stored_size_bytes")
     );
     assert_eq!(
-        report.envelope.stored_size_blocks,
+        report.stored_size_blocks,
         u64_field(encrypted, "stored_size_blocks")
+    );
+    assert_eq!(
+        key_frame_bytes.len() as u64,
+        u64_field(encrypted, "key_frame_len")
     );
     assert_eq!(
         hex(&open.header.hkdf_salt),
         str_field(encrypted, "hkdf_salt")
     );
     assert_eq!(hex(&header_bytes), str_field(encrypted, "header_hex"));
+    assert_eq!(hex(&key_frame_bytes), str_field(encrypted, "key_frame_hex"));
     assert_eq!(hex(&header_hash), str_field(encrypted, "header_hash"));
     assert_eq!(
         hex(&keys.metadata_key),

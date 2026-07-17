@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use remanence_aead::{RecipientPublicKey, SealReport};
 use remanence_format::{
-    write_envelope_rao_object_from_readers, write_rem_tar_object_from_readers, RemTarFileLayout,
+    write_encrypted_rao_object_from_readers, write_rem_tar_object_from_readers, RemTarFileLayout,
     RemTarFileStream, RemTarObjectOptions, FORMAT_ID,
 };
 use remanence_library::{
@@ -3176,8 +3176,6 @@ impl CopyRepresentation {
     fn encrypted(envelope: &SealReport) -> Self {
         let recipient_epoch_ids = envelope
             .key_frame
-            .as_ref()
-            .expect("v2 envelope seal report carries a key frame")
             .slots
             .iter()
             .map(|slot| bytes_to_hex(&slot.recipient_epoch_id))
@@ -3337,7 +3335,7 @@ fn seal_prepared_object(
     for (file, reader) in prepared.files.iter().zip(readers.iter_mut()) {
         streams.push(RemTarFileStream::new(file.spec.clone(), reader));
     }
-    let report = write_envelope_rao_object_from_readers(
+    let report = write_encrypted_rao_object_from_readers(
         &mut encrypted_sink,
         &prepared.options,
         &mut streams,
@@ -3388,8 +3386,6 @@ fn flatten_blocks(blocks: Vec<Vec<u8>>, block_size: usize) -> Result<Vec<u8>, Po
 fn envelope_recipient_epoch_ids(envelope: &SealReport) -> Vec<[u8; 16]> {
     envelope
         .key_frame
-        .as_ref()
-        .expect("v2 envelope seal report carries a key frame")
         .slots
         .iter()
         .map(|slot| slot.recipient_epoch_id)

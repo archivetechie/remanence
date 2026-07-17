@@ -6,8 +6,8 @@ use std::io::Cursor;
 
 use remanence_aead::RecipientPrivateKey;
 use remanence_format::{
-    plan_rem_tar_object, read_envelope_rao_file_range_to_vec, read_envelope_rao_object,
-    read_rem_tar_object, stream_rem_tar_object, write_envelope_rao_object, write_rem_tar_object,
+    plan_rem_tar_object, read_encrypted_rao_file_range_to_vec, read_encrypted_rao_object,
+    read_rem_tar_object, stream_rem_tar_object, write_encrypted_rao_object, write_rem_tar_object,
     write_rem_tar_object_from_readers, FormatError, RemTarEntrySink, RemTarFile, RemTarFileSpec,
     RemTarFileStream, RemTarObjectOptions, RemTarStreamEntry,
 };
@@ -230,7 +230,7 @@ fn encrypted_rao_ciphertext_recovers_through_parity_before_keyed_open() {
     ];
 
     let mut planning_sink = VecBlockSink::new();
-    let planned_report = write_envelope_rao_object(&mut planning_sink, &opts, &files, &recipients)
+    let planned_report = write_encrypted_rao_object(&mut planning_sink, &opts, &files, &recipients)
         .expect("encrypted planning fixture writes without parity");
     let planned_ciphertext = planning_sink
         .blocks
@@ -238,7 +238,7 @@ fn encrypted_rao_ciphertext_recovers_through_parity_before_keyed_open() {
         .flatten()
         .copied()
         .collect::<Vec<_>>();
-    let pfr = read_envelope_rao_file_range_to_vec(
+    let pfr = read_encrypted_rao_file_range_to_vec(
         &planned_ciphertext,
         &recovery,
         planned_report.plaintext_layout.files[0].first_chunk_lba,
@@ -267,7 +267,7 @@ fn encrypted_rao_ciphertext_recovers_through_parity_before_keyed_open() {
                 .0,
             1
         );
-        report = write_envelope_rao_object(&mut parity, &opts, &files, &recipients)
+        report = write_encrypted_rao_object(&mut parity, &opts, &files, &recipients)
             .expect("encrypted RAO writes through parity sink");
         parity
             .record_bootstrap_object_row(BootstrapObjectRow::encrypted(
@@ -345,7 +345,7 @@ fn encrypted_rao_ciphertext_recovers_through_parity_before_keyed_open() {
     let object_end = object_start + usize::try_from(report.envelope.stored_size_blocks).unwrap();
     let tampered_object_blocks = damaged_blocks[object_start..object_end].to_vec();
     let mut tampered_source = VecBlockSource::new(tampered_object_blocks);
-    read_envelope_rao_object(
+    read_encrypted_rao_object(
         &mut tampered_source,
         opts.chunk_size,
         report.envelope.stored_size_blocks,
@@ -382,7 +382,7 @@ fn encrypted_rao_ciphertext_recovers_through_parity_before_keyed_open() {
         OpenTrust::RequireValidated,
     )
     .expect("object parity source opens for keyed read");
-    let read = read_envelope_rao_object(
+    let read = read_encrypted_rao_object(
         &mut object_source,
         opts.chunk_size,
         report.envelope.stored_size_blocks,

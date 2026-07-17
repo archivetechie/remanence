@@ -13,6 +13,7 @@ libfuzzer-sys = "0.4"
 remanence-aead = { path = "../crates/remanence-aead" }
 remanence-format = { path = "../crates/remanence-format", features = ["fuzzing"] }
 remanence-library = { path = "../crates/remanence-library" }
+sha2 = "0.10"
 
 [[bin]]
 name = "rao_envelope_header"
@@ -45,6 +46,13 @@ bench = false
 [[bin]]
 name = "rao_whole_object_open_verify"
 path = "fuzz_targets/rao_whole_object_open_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rao_key_frame"
+path = "fuzz_targets/rao_key_frame.rs"
 test = false
 doc = false
 bench = false

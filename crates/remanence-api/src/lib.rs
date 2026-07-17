@@ -4295,7 +4295,7 @@ mod tests {
     use remanence_aead::{RecipientPrivateKey, RecipientPublicKey};
     #[cfg(feature = "foreign-bru")]
     use remanence_bru::{bru_checksum, BRU_BLOCK_SIZE};
-    use remanence_format::{read_envelope_rao_object, read_rem_tar_object};
+    use remanence_format::{read_encrypted_rao_object, read_rem_tar_object};
     use remanence_library::scsi::{DeviceType, Inquiry};
     use remanence_library::{
         BlockSink, DiscoveryReport, DriveBay, ElementLayout, IdentitySource, IePort,
@@ -7317,7 +7317,7 @@ BCw3Wyv2UWY=
             usize::try_from(result.expect_write_report().object_close.data_block_count)
                 .expect("stored block count fits usize");
         let mut source = VecBlockSource::new(tape_sink.blocks[1..1 + stored_block_count].to_vec());
-        let opened = read_envelope_rao_object(
+        let opened = read_encrypted_rao_object(
             &mut source,
             API_SESSION_BLOCK_SIZE as usize,
             result.expect_write_report().object_close.data_block_count,
@@ -7559,7 +7559,7 @@ BCw3Wyv2UWY=
         .expect("encrypted object block count fits usize");
         let mut encrypted_source =
             VecBlockSource::new(encrypted_sink.blocks[1..1 + encrypted_block_count].to_vec());
-        let opened = read_envelope_rao_object(
+        let opened = read_encrypted_rao_object(
             &mut encrypted_source,
             CUSTOM_BLOCK_SIZE as usize,
             encrypted

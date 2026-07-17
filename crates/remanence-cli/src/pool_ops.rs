@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::bytes_to_hex;
-use remanence_aead::{RecipientPrivateKey, RecipientPublicKey, RootKey};
+use remanence_aead::{RecipientPrivateKey, RecipientPublicKey};
 use remanence_api::{
     load_tape_by_uuid,
     read_core::{read_object_payload, CapturePayloadSink},
@@ -23,7 +23,7 @@ use remanence_api::{
     WriteObjectToPoolRequest,
 };
 use remanence_format::{
-    read_envelope_rao_object_with_manifest_anchor, RemTarReadObject, MANIFEST_PATH,
+    read_encrypted_rao_object_with_manifest_anchor, RemTarReadObject, MANIFEST_PATH,
 };
 use remanence_library::{
     BlockSize, BlockSource, DriveHandleSink, DriveHandleSource, SpaceKind, StaticAllowlist,
@@ -53,12 +53,6 @@ pub struct ArchiveWriteArgs {
     pub archive_path: Option<PathBuf>,
     /// Opaque caller/orchestrator object id (optional; default: new UUID).
     pub caller_object_id: Option<String>,
-    /// Store the RAO1 encrypted representation instead of plaintext rao-v1.
-    pub encrypt: bool,
-    /// 32-byte root key file for encrypted writes.
-    pub key_file: Option<PathBuf>,
-    /// 16-byte key identifier as 32 hex characters.
-    pub key_id: Option<String>,
     /// Canonical RAOR recipient public-key files.
     pub recipients: Vec<PathBuf>,
     /// Emit locator JSON to stdout instead of human-readable form.
@@ -308,13 +302,6 @@ fn write_representation_from_args(
     err: &mut dyn Write,
 ) -> Result<WriteRepresentationSelection, ExitCode> {
     if !args.recipients.is_empty() {
-        if args.encrypt || args.key_file.is_some() || args.key_id.is_some() {
-            let _ = writeln!(
-                err,
-                "error: --recipient cannot be combined with --encrypt/--key-file/--key-id"
-            );
-            return Err(ExitCode::from(1));
-        }
         let recipients = read_recipient_files(&args.recipients).map_err(|error| {
             let _ = writeln!(err, "error: {error}");
             ExitCode::from(1)
@@ -333,49 +320,10 @@ fn write_representation_from_args(
             recipient_epochs: Some(recipient_epochs),
         });
     }
-    if !args.encrypt {
-        if args.key_file.is_some() || args.key_id.is_some() {
-            let _ = writeln!(err, "error: --key-file/--key-id require --encrypt");
-            return Err(ExitCode::from(1));
-        }
-        return Ok(WriteRepresentationSelection {
-            representation: PoolWriteRepresentation::Plaintext,
-            recipient_epochs: None,
-        });
-    }
-
-    let key_file = match args.key_file.as_deref() {
-        Some(path) => path,
-        None => {
-            let _ = writeln!(err, "error: --encrypt requires --key-file");
-            return Err(ExitCode::from(1));
-        }
-    };
-    let key_id = match args.key_id.as_deref().map(parse_key_id) {
-        Some(Ok(key_id)) => key_id,
-        Some(Err(error)) => {
-            let _ = writeln!(err, "error: --key-id: {error}");
-            return Err(ExitCode::from(1));
-        }
-        None => {
-            let _ = writeln!(err, "error: --encrypt requires --key-id");
-            return Err(ExitCode::from(1));
-        }
-    };
-    let root_key = match read_root_key_file(key_file) {
-        Ok(root_key) => root_key,
-        Err(error) => {
-            let _ = writeln!(err, "error: {error}");
-            return Err(ExitCode::from(1));
-        }
-    };
-    drop(root_key);
-    let _ = key_id;
-    let _ = writeln!(
-        err,
-        "error: registry-symmetric writes are retired; use two or more --recipient files"
-    );
-    Err(ExitCode::from(1))
+    Ok(WriteRepresentationSelection {
+        representation: PoolWriteRepresentation::Plaintext,
+        recipient_epochs: None,
+    })
 }
 
 fn read_recipient_files(paths: &[PathBuf]) -> Result<Vec<RecipientPublicKey>, String> {
@@ -405,19 +353,6 @@ fn read_recipient_files(paths: &[PathBuf]) -> Result<Vec<RecipientPublicKey>, St
     Ok(recipients)
 }
 
-fn read_root_key_file(path: &Path) -> Result<RootKey, String> {
-    let mut bytes = std::fs::read(path)
-        .map_err(|error| format!("read --key-file {}: {error}", path.display()))?;
-    if bytes.len() != 32 {
-        let len = bytes.len();
-        bytes.zeroize();
-        return Err(format!(
-            "--key-file must contain exactly 32 bytes, got {len}"
-        ));
-    }
-    RootKey::new(bytes).map_err(|error| error.to_string())
-}
-
 fn read_private_key_file(path: &Path) -> Result<RecipientPrivateKey, String> {
     let mut bytes = std::fs::read(path)
         .map_err(|error| format!("read --private-key {}: {error}", path.display()))?;
@@ -425,12 +360,6 @@ fn read_private_key_file(path: &Path) -> Result<RecipientPrivateKey, String> {
         .map_err(|error| format!("parse --private-key {}: {error}", path.display()));
     bytes.zeroize();
     parsed
-}
-
-fn parse_key_id(value: &str) -> Result<[u8; 16], String> {
-    let bytes = hex_to_bytes(value)?;
-    <[u8; 16]>::try_from(bytes)
-        .map_err(|bytes| format!("key id must decode to 16 bytes, got {}", bytes.len()))
 }
 
 // =====================================================================
@@ -598,8 +527,6 @@ pub struct ArchiveReadArgs {
     pub locator: String,
     /// Destination path for the restored payload bytes.
     pub out: PathBuf,
-    /// 32-byte root key file for encrypted object copies.
-    pub key_file: Option<PathBuf>,
     /// Canonical RAOP private-key file for encrypted object copies.
     pub private_key: Option<PathBuf>,
     /// Path to config file.
@@ -626,8 +553,6 @@ pub struct ArchiveVerifyArgs {
     pub locator: String,
     /// Expected payload SHA-256, hex (the catalog's recorded asset hash).
     pub expected_sha256: String,
-    /// 32-byte root key file for encrypted object copies.
-    pub key_file: Option<PathBuf>,
     /// Canonical RAOP private-key file for encrypted object copies.
     pub private_key: Option<PathBuf>,
     /// Path to config file.
@@ -831,7 +756,6 @@ struct TapeObjectRef<'a> {
     library: &'a str,
     config: &'a Path,
     locator_json: &'a str,
-    key_file: Option<&'a Path>,
     private_key: Option<&'a Path>,
 }
 
@@ -960,7 +884,7 @@ fn stream_tape_object<W: Write + Send>(
 
     let (payload_bytes, actual_sha256) = match mounted.plan.representation.as_str() {
         OBJECT_COPY_REPRESENTATION_PLAINTEXT => {
-            if target.key_file.is_some() || target.private_key.is_some() {
+            if target.private_key.is_some() {
                 let _ = writeln!(
                     err,
                     "error: key options are only valid for encrypted copies"
@@ -989,10 +913,6 @@ fn stream_tape_object<W: Write + Send>(
             })?
         }
         OBJECT_COPY_REPRESENTATION_ENCRYPTED => {
-            if target.key_file.is_some() {
-                let _ = writeln!(err, "error: v2 encrypted copies require --private-key");
-                return Err(ExitCode::from(1));
-            }
             let private_key = target.private_key.ok_or_else(|| {
                 let _ = writeln!(err, "error: encrypted copy requires --private-key");
                 ExitCode::from(1)
@@ -1010,7 +930,7 @@ fn stream_tape_object<W: Write + Send>(
                     let _ = writeln!(err, "error: space to object tape file: {error}");
                     return Err(ExitCode::from(1));
                 }
-                read_envelope_rao_object_with_manifest_anchor(
+                read_encrypted_rao_object_with_manifest_anchor(
                     &mut source,
                     mounted.plan.block_size_bytes as usize,
                     mounted.plan.block_count,
@@ -1025,8 +945,6 @@ fn stream_tape_object<W: Write + Send>(
             let opened_recipient_epoch_ids = opened
                 .envelope
                 .key_frame
-                .as_ref()
-                .expect("v2 open report carries key frame")
                 .slots
                 .iter()
                 .map(|slot| bytes_to_hex(&slot.recipient_epoch_id))
@@ -1212,7 +1130,6 @@ pub fn run_archive_read(
         library: &args.library,
         config: &args.config,
         locator_json: &args.locator,
-        key_file: args.key_file.as_deref(),
         private_key: args.private_key.as_deref(),
     };
     let outcome = match stream_tape_object(report, &target, allow, allow_derived, out_file, err) {
@@ -1277,7 +1194,6 @@ pub fn run_archive_export_object(
         library: &args.library,
         config: &args.config,
         locator_json: &args.locator,
-        key_file: None,
         private_key: None,
     };
     let outcome =
@@ -1359,7 +1275,6 @@ pub fn run_archive_verify(
         library: &args.library,
         config: &args.config,
         locator_json: &args.locator,
-        key_file: args.key_file.as_deref(),
         private_key: args.private_key.as_deref(),
     };
     let outcome =

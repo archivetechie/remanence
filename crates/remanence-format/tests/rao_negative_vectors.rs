@@ -6,8 +6,10 @@ use remanence_aead::stream::{
     encrypt_chunk, encrypt_metadata, stored_size_from_parts, CHACHA20POLY1305_TAG_LEN,
 };
 use remanence_aead::{
-    derive_keys, derive_salt, inspect_bytes, open_to_vec, seal_to_vec, KeyFrame, RaoAeadError,
-    RaoHeader, RaoMetadata, RecipientSlot, RootKey, SealOptions, RAO_FOOTER,
+    derive_keys_v2, derive_salt_v2, inspect_bytes, open_to_vec,
+    seal_deterministic_for_test_vectors, seal_to_vec, DataEncryptionKey, EnvelopeSealOptions,
+    KeyFrame, RaoAeadError, RaoHeader, RaoMetadata, RecipientPrivateKey, RecipientPublicKey,
+    RecipientSlot, SealOptions, RAO_FOOTER,
 };
 use remanence_format::{
     plan_rem_tar_object, read_encrypted_rao_object, read_rem_tar_object, stream_rem_tar_object,
@@ -92,11 +94,8 @@ fn aead_error_name(error: &RaoAeadError) -> &'static str {
         RaoAeadError::InvalidWrapSuite => "InvalidWrapSuite",
         RaoAeadError::InvalidKeyFrameLength => "InvalidKeyFrameLength",
         RaoAeadError::InvalidKeyFrame => "InvalidKeyFrame",
-        RaoAeadError::KeyModeMismatch => "KeyModeMismatch",
         RaoAeadError::InvalidChunkSize => "InvalidChunkSize",
         RaoAeadError::ReservedBytesNotZero => "ReservedBytesNotZero",
-        RaoAeadError::InvalidKeyIdentifier => "InvalidKeyIdentifier",
-        RaoAeadError::InvalidRootKey => "InvalidRootKey",
         RaoAeadError::InvalidSalt => "InvalidSalt",
         RaoAeadError::MetadataFrameLengthInvalid => "MetadataFrameLengthInvalid",
         RaoAeadError::InvalidObjectIdField => "InvalidObjectIdField",
@@ -117,15 +116,6 @@ fn aead_error_name(error: &RaoAeadError) -> &'static str {
         RaoAeadError::Io(_) => "Io",
         _ => "UnknownEnvelopeError",
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
 }
 
 fn sha256_array(bytes: &[u8]) -> [u8; 32] {
@@ -918,49 +908,58 @@ fn run_inner_case(id: &str) -> Result<(), FormatError> {
         }
         other => panic!("unhandled inner negative vector {other:?}"),
     }
-    let root = RootKey::new([0x33; 32]).expect("root key is valid");
-    let key_id = [0x44; 16];
+    let (recipient, recipients) = recipient_pair();
     let plaintext_digest = sha256_array(&archive.bytes);
-    let seal_options = SealOptions {
-        chunk_size: archive.chunk_size as u32,
-        key_id,
-        object_id: header_object_id,
-        plaintext_size: archive.bytes.len() as u64,
-        plaintext_digest,
+    let seal_options = EnvelopeSealOptions {
+        common: SealOptions {
+            chunk_size: archive.chunk_size as u32,
+            object_id: header_object_id,
+            plaintext_size: archive.bytes.len() as u64,
+            plaintext_digest,
+        },
+        recipients,
     };
-    let (sealed, report) = seal_to_vec(&archive.bytes, &root, &seal_options)?;
+    let (sealed, report) = seal_to_vec(&archive.bytes, &seal_options)?;
     let mut source = source_from_bytes(&sealed, archive.chunk_size);
     read_encrypted_rao_object(
         &mut source,
         archive.chunk_size,
         report.stored_size_blocks,
-        &root,
+        &recipient,
     )
     .map(|_| ())
 }
 
-fn base_envelope() -> (Vec<u8>, RootKey) {
+fn recipient_pair() -> (RecipientPrivateKey, Vec<RecipientPublicKey>) {
+    let primary = RecipientPrivateKey::new([0x31; 16], "primary-2026", [0x41; 32]).unwrap();
+    let recovery = RecipientPrivateKey::new([0x32; 16], "recovery-2026", [0x42; 32]).unwrap();
+    let recipients = vec![
+        primary.public_key(0).unwrap(),
+        recovery.public_key(1).unwrap(),
+    ];
+    (primary, recipients)
+}
+
+fn base_envelope() -> (Vec<u8>, RecipientPrivateKey) {
     let plaintext = base_envelope_plaintext();
-    let root = base_root_key();
-    let options = base_seal_options(&plaintext);
-    let sealed = seal_to_vec(&plaintext, &root, &options)
+    let (recipient, recipients) = recipient_pair();
+    let options = EnvelopeSealOptions {
+        common: base_seal_options(&plaintext),
+        recipients,
+    };
+    let sealed = seal_to_vec(&plaintext, &options)
         .expect("base envelope seals")
         .0;
-    (sealed, root)
+    (sealed, recipient)
 }
 
 fn base_envelope_plaintext() -> Vec<u8> {
     vec![0x5a; 1024]
 }
 
-fn base_root_key() -> RootKey {
-    RootKey::new([0x11; 32]).expect("root key is valid")
-}
-
 fn base_seal_options(plaintext: &[u8]) -> SealOptions {
     SealOptions {
         chunk_size: 512,
-        key_id: [0x10; 16],
         object_id: "object-1".to_string(),
         plaintext_size: plaintext.len() as u64,
         plaintext_digest: sha256_array(plaintext),
@@ -1186,7 +1185,6 @@ fn metadata_plaintext_case(id: &str, options: &SealOptions) -> Option<Vec<u8>> {
 /// Builds authenticated but intentionally nonconformant envelopes for Section 13.5.
 fn defective_envelope(
     plaintext: &[u8],
-    root: &RootKey,
     options: &SealOptions,
     metadata_digest: [u8; 32],
     salt_override: Option<[u8; 16]>,
@@ -1195,7 +1193,6 @@ fn defective_envelope(
     let metadata_plaintext = metadata.to_cbor_bytes(options.chunk_size)?;
     envelope_from_metadata_plaintext(
         plaintext,
-        root,
         options,
         &metadata_plaintext,
         metadata_digest,
@@ -1206,7 +1203,6 @@ fn defective_envelope(
 
 fn envelope_from_metadata_plaintext(
     plaintext: &[u8],
-    root: &RootKey,
     options: &SealOptions,
     metadata_plaintext: &[u8],
     salt_digest: [u8; 32],
@@ -1218,18 +1214,29 @@ fn envelope_from_metadata_plaintext(
         .and_then(|len| len.checked_add(CHACHA20POLY1305_TAG_LEN))
         .ok_or(RaoAeadError::SizeOverflow)?;
     let object_id_field = remanence_aead::header::object_id_field(&options.object_id)?;
+    let dek_bytes = [0x5d; 32];
     let salt = match salt_override {
         Some(salt) => salt,
-        None => derive_salt(root, &object_id_field, &salt_digest, metadata_plaintext)?,
+        None => derive_salt_v2(
+            &dek_bytes,
+            &object_id_field,
+            &salt_digest,
+            metadata_plaintext,
+        )?,
     };
-    let header = RaoHeader::new(
+    let key_frame = v2_key_frame(plaintext, options)?;
+    let header = RaoHeader::new_v2_envelope(
         options.chunk_size,
-        options.key_id,
         salt,
         metadata_frame_len,
         options.object_id.clone(),
+        u32::try_from(key_frame.len()).map_err(|_| RaoAeadError::SizeOverflow)?,
     )?;
-    let keys = derive_keys(root, &header.hkdf_salt, &header.header_hash()?)?;
+    let keys = derive_keys_v2(
+        &dek_bytes,
+        &header.hkdf_salt,
+        &header.header_hash_with_key_frame(&key_frame)?,
+    )?;
 
     let chunk_size =
         usize::try_from(options.chunk_size).map_err(|_| RaoAeadError::InvalidChunkSize)?;
@@ -1244,6 +1251,7 @@ fn envelope_from_metadata_plaintext(
 
     let mut out = Vec::new();
     out.extend_from_slice(&header.serialize()?);
+    out.extend_from_slice(&key_frame);
     out.extend_from_slice(&encrypt_metadata(&keys.metadata_key, metadata_plaintext)?);
     let chunk_count = plaintext.len() / chunk_size;
     for index in 0..chunk_count {
@@ -1264,6 +1272,7 @@ fn envelope_from_metadata_plaintext(
     out.extend_from_slice(RAO_FOOTER);
     let stored_size = stored_size_from_parts(
         options.chunk_size,
+        header.key_frame_len,
         metadata_frame_len,
         options.plaintext_size,
     )?;
@@ -1277,7 +1286,6 @@ fn envelope_from_metadata_plaintext(
 
 fn envelope_with_extra_payload_chunk(
     plaintext: &[u8],
-    root: &RootKey,
     options: &SealOptions,
 ) -> Result<Vec<u8>, RaoAeadError> {
     let metadata = RaoMetadata::new(
@@ -1291,20 +1299,26 @@ fn envelope_with_extra_payload_chunk(
         .and_then(|len| len.checked_add(CHACHA20POLY1305_TAG_LEN))
         .ok_or(RaoAeadError::SizeOverflow)?;
     let object_id_field = remanence_aead::header::object_id_field(&options.object_id)?;
-    let salt = derive_salt(
-        root,
+    let dek_bytes = [0x5d; 32];
+    let salt = derive_salt_v2(
+        &dek_bytes,
         &object_id_field,
         &options.plaintext_digest,
         &metadata_plaintext,
     )?;
-    let header = RaoHeader::new(
+    let key_frame = v2_key_frame(plaintext, options)?;
+    let header = RaoHeader::new_v2_envelope(
         options.chunk_size,
-        options.key_id,
         salt,
         metadata_frame_len,
         options.object_id.clone(),
+        u32::try_from(key_frame.len()).map_err(|_| RaoAeadError::SizeOverflow)?,
     )?;
-    let keys = derive_keys(root, &header.hkdf_salt, &header.header_hash()?)?;
+    let keys = derive_keys_v2(
+        &dek_bytes,
+        &header.hkdf_salt,
+        &header.header_hash_with_key_frame(&key_frame)?,
+    )?;
     let chunk_size =
         usize::try_from(options.chunk_size).map_err(|_| RaoAeadError::InvalidChunkSize)?;
     if plaintext.len() as u64 != options.plaintext_size
@@ -1318,6 +1332,7 @@ fn envelope_with_extra_payload_chunk(
 
     let mut out = Vec::new();
     out.extend_from_slice(&header.serialize()?);
+    out.extend_from_slice(&key_frame);
     out.extend_from_slice(&encrypt_metadata(&keys.metadata_key, &metadata_plaintext)?);
     let chunk_count = plaintext.len() / chunk_size;
     for index in 0..chunk_count {
@@ -1344,6 +1359,7 @@ fn envelope_with_extra_payload_chunk(
         .ok_or(RaoAeadError::SizeOverflow)?;
     let stored_size = stored_size_from_parts(
         options.chunk_size,
+        header.key_frame_len,
         metadata_frame_len,
         apparent_plaintext_size,
     )?;
@@ -1355,7 +1371,7 @@ fn envelope_with_extra_payload_chunk(
     Ok(out)
 }
 
-fn non_derived_salt(root: &RootKey, options: &SealOptions) -> Result<[u8; 16], RaoAeadError> {
+fn non_derived_salt(options: &SealOptions) -> Result<[u8; 16], RaoAeadError> {
     let metadata = RaoMetadata::new(
         options.plaintext_size,
         options.plaintext_digest,
@@ -1363,8 +1379,8 @@ fn non_derived_salt(root: &RootKey, options: &SealOptions) -> Result<[u8; 16], R
     )?;
     let metadata_plaintext = metadata.to_cbor_bytes(options.chunk_size)?;
     let object_id_field = remanence_aead::header::object_id_field(&options.object_id)?;
-    let expected = derive_salt(
-        root,
+    let expected = derive_salt_v2(
+        &[0x5d; 32],
         &object_id_field,
         &options.plaintext_digest,
         &metadata_plaintext,
@@ -1376,6 +1392,23 @@ fn non_derived_salt(root: &RootKey, options: &SealOptions) -> Result<[u8; 16], R
     Ok(salt)
 }
 
+fn v2_key_frame(plaintext: &[u8], options: &SealOptions) -> Result<Vec<u8>, RaoAeadError> {
+    let (_, recipients) = recipient_pair();
+    let envelope_options = EnvelopeSealOptions {
+        common: options.clone(),
+        recipients,
+    };
+    let mut discarded = Vec::new();
+    let report = seal_deterministic_for_test_vectors(
+        Cursor::new(plaintext),
+        &mut discarded,
+        &envelope_options,
+        DataEncryptionKey::from_bytes([0x5d; 32]),
+        [0xa7; 32],
+    )?;
+    report.key_frame.serialize()
+}
+
 fn assert_envelope_case(case: &Value) {
     let id = str_field(case, "id");
     let operation = str_field(case, "operation");
@@ -1385,9 +1418,9 @@ fn assert_envelope_case(case: &Value) {
 }
 
 fn run_envelope_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
-    let (mut sealed, root) = base_envelope();
+    let (mut sealed, recipient) = base_envelope();
     let inspected = inspect_bytes(&sealed).expect("base envelope inspects");
-    let metadata_start = 128usize;
+    let metadata_start = 128usize + inspected.header.key_frame_len as usize;
     let metadata_end = metadata_start + inspected.header.metadata_frame_len as usize;
     let chunk_frame_len = inspected.header.chunk_size as usize + 16;
     let footer_offset = inspected.footer_offset as usize;
@@ -1396,13 +1429,11 @@ fn run_envelope_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
         "wrong-magic" => sealed[0] = b'X',
         "header-len-not-128" => sealed[5] = 127,
         "unsupported-format-version" => sealed[6] = 3,
-        "v1-shape-version-flipped-to-2" => sealed[6] = 2,
         "unknown-suite-id" => sealed[7] = 2,
         "chunk-size-zero" => sealed[8..12].copy_from_slice(&0u32.to_be_bytes()),
         "chunk-size-not-multiple-of-512" => sealed[8..12].copy_from_slice(&513u32.to_be_bytes()),
         "flags-nonzero" => sealed[15] = 1,
-        "reserved-bytes-nonzero" => sealed[0x38] = 1,
-        "all-zero-key-id" => sealed[0x10..0x20].fill(0),
+        "reserved-bytes-nonzero" => sealed[0x10] = 1,
         "all-zero-hkdf-salt" => sealed[0x20..0x30].fill(0),
         "object-id-all-nul" => sealed[0x40..0x80].fill(0),
         "object-id-interior-nul" => {
@@ -1420,7 +1451,6 @@ fn run_envelope_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
             sealed[0x30..0x38].copy_from_slice(&(16u64 * 1024 * 1024 + 1).to_be_bytes());
         }
         "salt-bit-flipped" => sealed[0x20] ^= 1,
-        "key-id-swapped" => sealed[0x10] ^= 1,
         "ciphertext-bit-flipped" => sealed[metadata_end] ^= 1,
         "payload-chunks-transposed" => {
             let first = metadata_end;
@@ -1440,7 +1470,6 @@ fn run_envelope_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
             let metadata_plaintext = metadata.to_cbor_bytes(options.chunk_size)?;
             sealed = envelope_from_metadata_plaintext(
                 &plaintext,
-                &root,
                 &options,
                 &metadata_plaintext,
                 options.plaintext_digest,
@@ -1451,24 +1480,23 @@ fn run_envelope_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
         "payload-extra-chunk-appended" => {
             let plaintext = base_envelope_plaintext();
             let options = base_seal_options(&plaintext);
-            sealed = envelope_with_extra_payload_chunk(&plaintext, &root, &options)?;
+            sealed = envelope_with_extra_payload_chunk(&plaintext, &options)?;
         }
         "sealed-metadata-wrong-plaintext-digest" => {
             let plaintext = base_envelope_plaintext();
             let options = base_seal_options(&plaintext);
             let mut wrong_digest = options.plaintext_digest;
             wrong_digest[0] ^= 1;
-            sealed = defective_envelope(&plaintext, &root, &options, wrong_digest, None)?;
+            sealed = defective_envelope(&plaintext, &options, wrong_digest, None)?;
         }
         "sealed-under-non-derived-salt" => {
             let plaintext = base_envelope_plaintext();
             let options = base_seal_options(&plaintext);
             sealed = defective_envelope(
                 &plaintext,
-                &root,
                 &options,
                 options.plaintext_digest,
-                Some(non_derived_salt(&root, &options)?),
+                Some(non_derived_salt(&options)?),
             )?;
         }
         "metadata-float"
@@ -1500,7 +1528,6 @@ fn run_envelope_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
                 metadata_plaintext_case(id, &options).expect("metadata vector is known");
             sealed = envelope_from_metadata_plaintext(
                 &plaintext,
-                &root,
                 &options,
                 &metadata_plaintext,
                 options.plaintext_digest,
@@ -1513,7 +1540,7 @@ fn run_envelope_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
         "payload-absent-after-metadata" => sealed.truncate(metadata_end),
         "footer-bytes-wrong" => sealed[footer_offset] ^= 1,
         "fill-byte-nonzero" => sealed[footer_offset + 16] = 1,
-        "trailing-byte" | "trailing-byte-keyed" => sealed.push(0),
+        "trailing-byte" => sealed.push(0),
         "seal-plaintext-size-not-multiple" => {
             let plaintext = vec![0x5a; 513];
             let digest = Sha256::digest(&plaintext);
@@ -1521,12 +1548,18 @@ fn run_envelope_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
             plaintext_digest.copy_from_slice(&digest);
             let options = SealOptions {
                 chunk_size: 512,
-                key_id: [0x10; 16],
                 object_id: "object-1".to_string(),
                 plaintext_size: plaintext.len() as u64,
                 plaintext_digest,
             };
-            seal_to_vec(&plaintext, &root, &options)?;
+            let (_, recipients) = recipient_pair();
+            seal_to_vec(
+                &plaintext,
+                &EnvelopeSealOptions {
+                    common: options,
+                    recipients,
+                },
+            )?;
             return Ok(());
         }
         "seal-object-id-too-long" => {
@@ -1536,16 +1569,18 @@ fn run_envelope_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
             plaintext_digest.copy_from_slice(&digest);
             let options = SealOptions {
                 chunk_size: 512,
-                key_id: [0x10; 16],
                 object_id: "x".repeat(65),
                 plaintext_size: plaintext.len() as u64,
                 plaintext_digest,
             };
-            seal_to_vec(&plaintext, &root, &options)?;
-            return Ok(());
-        }
-        "root-key-too-short" => {
-            RootKey::new([0x11; 16])?;
+            let (_, recipients) = recipient_pair();
+            seal_to_vec(
+                &plaintext,
+                &EnvelopeSealOptions {
+                    common: options,
+                    recipients,
+                },
+            )?;
             return Ok(());
         }
         other => panic!("unhandled envelope negative vector {other:?}"),
@@ -1553,12 +1588,12 @@ fn run_envelope_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
 
     match operation {
         "open" => {
-            open_to_vec(&sealed, &root)?;
+            open_to_vec(&sealed, &recipient)?;
         }
         "inspect" => {
             inspect_bytes(&sealed)?;
         }
-        "seal" | "root-key" => panic!("case {id:?} did not return from its {operation} branch"),
+        "seal" => panic!("case {id:?} did not return from its {operation} branch"),
         other => panic!("unhandled envelope operation {other:?} for case {id:?}"),
     }
     Ok(())
@@ -1569,8 +1604,7 @@ fn assert_envelope_base(fixture: &Value) {
     assert_eq!(u64_field(base, "chunk_size"), 512);
     assert_eq!(u64_field(base, "plaintext_size"), 1024);
     assert_eq!(str_field(base, "plaintext_byte"), "5a");
-    assert_eq!(str_field(base, "root_key"), hex(&[0x11; 32]));
-    assert_eq!(str_field(base, "key_id"), hex(&[0x10; 16]));
+    assert_eq!(str_field(base, "recipient_mode"), "hpke-x25519");
     assert_eq!(str_field(base, "object_id"), "object-1");
 }
 
@@ -1726,8 +1760,7 @@ fn encrypted_inner_negative_vectors_match_manifest_errors() {
         str_field(base, "inner_object_id"),
         "99999999-9999-4999-8999-999999999999"
     );
-    assert_eq!(str_field(base, "root_key"), hex(&[0x33; 32]));
-    assert_eq!(str_field(base, "key_id"), hex(&[0x44; 16]));
+    assert_eq!(str_field(base, "recipient_mode"), "hpke-x25519");
     for case in cases(&fixture) {
         assert_inner_case(case);
     }
@@ -1742,13 +1775,11 @@ fn envelope_negative_vectors_match_manifest_errors() {
             "wrong-magic",
             "header-len-not-128",
             "unsupported-format-version",
-            "v1-shape-version-flipped-to-2",
             "unknown-suite-id",
             "chunk-size-zero",
             "chunk-size-not-multiple-of-512",
             "flags-nonzero",
             "reserved-bytes-nonzero",
-            "all-zero-key-id",
             "all-zero-hkdf-salt",
             "object-id-all-nul",
             "object-id-interior-nul",
@@ -1756,7 +1787,6 @@ fn envelope_negative_vectors_match_manifest_errors() {
             "metadata-frame-len-16",
             "metadata-frame-len-over-max",
             "salt-bit-flipped",
-            "key-id-swapped",
             "ciphertext-bit-flipped",
             "payload-chunks-transposed",
             "payload-final-flag-wrong",
@@ -1792,10 +1822,8 @@ fn envelope_negative_vectors_match_manifest_errors() {
             "footer-bytes-wrong",
             "fill-byte-nonzero",
             "trailing-byte",
-            "trailing-byte-keyed",
             "seal-plaintext-size-not-multiple",
             "seal-object-id-too-long",
-            "root-key-too-short",
         ],
     );
     assert_envelope_base(&fixture);

@@ -2,7 +2,8 @@
   "vector_id": "RAO-TV-D1",
   "spec_section": "13.4",
   "status": "pinned-at-generation",
-  "independent_rederivation": "verified by tools/verify_rao_vectors_independent.py",
+  "plaintext_independent_rederivation": "verified by tools/verify_rao_vectors_independent.py",
+  "encrypted_expectation": "pinned by remanence-aead deterministic v2 test-vector entry point",
   "inputs": {
     "chunk_size": 262144,
     "object_id": "00000000-0000-4000-8000-000000000002",
@@ -10,8 +11,9 @@
     "write_timestamp": "2026-01-01T00:00:00Z",
     "metadata_preservation": "minimal",
     "manifest_file_id": "00000000-0000-4000-8000-0000000000fe",
-    "encrypted_root_key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-    "encrypted_key_id": "4b49443a72616f2d74762d65312e3031"
+    "recipient_mode": "hpke-x25519",
+    "deterministic_dek": "5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d",
+    "deterministic_hpke_rng_seed": "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7"
   },
   "expected": {
     "plaintext": {
@@ -45,23 +47,25 @@
       }
     },
     "encrypted": {
+      "key_frame_len": 226,
+      "key_frame_hex": "52414f4b0200313131313131313131313131313131310c7072696d6172792d323032363b3d89637285f63d32d39a03f6a166f768eb1f21a0720fff829ee6be3d375d0a330b9bc34c5bd0ed9aa314a0f0616075ae0ef334cc2b97b6b5e6e7bfed0f1dedd9befdcb336c7ea4ac1376a3140a314a01323232323232323232323232323232320d7265636f766572792d32303236dcc80ba2851890b1da76cc0c275158cca03e949f62f8d04f44b6bee83f0ede1d7d53653eff40724d4d00d08ff043f8e7a621bbb5235ea6db50ea7a1b7558410a7bd72020fb58b164823a7c2c3f82a9d2",
       "plaintext_size": 1048576,
       "chunk_count": 4,
       "metadata_plaintext_len": 52,
       "metadata_frame_len": 68,
-      "payload_frame_start": 196,
-      "payload_frame_end_inclusive": 1048835,
-      "footer_offset": 1048836,
+      "payload_frame_start": 422,
+      "payload_frame_end_inclusive": 1049061,
+      "footer_offset": 1049062,
       "stored_size_bytes": 1310720,
       "stored_size_blocks": 5,
-      "hkdf_salt": "eb55e651e2cd87b5838526546888cc8e",
-      "header_hex": "52414f310080010100040000000000004b49443a72616f2d74762d65312e3031eb55e651e2cd87b5838526546888cc8e0000000000000044000000000000000030303030303030302d303030302d343030302d383030302d30303030303030303030303200000000000000000000000000000000000000000000000000000000",
-      "header_hash": "98349440c22c2158d18cd7f1426d3548352746221a6997289153405f45e8ed2c",
-      "metadata_key": "5ff2cbd027952b37bb42419d5251cb7e923aa426eaeef36c037a519fde9c0e51",
-      "payload_key": "12d2697f97dfcb9e77b40677c3466671146f73651ad2399456ac30f4a063157a",
-      "metadata_frame_hex": "befb339385b70da735128249a00c628a42970d1a75e4560a9105887887e5cb1f0d3ec8834b3d2a626a747814cad20ff9ab0f3e419292f9836508370e5b644a45e2fb36d0",
-      "payload_frame_sha256": "aa5bbc834a0e4646c5405567dde47a802e4b1e00cf7dffac43ca7bb1f41d99b3",
-      "stored_digest": "99176f528a02d56732ee1ba3ce775df2ba8848005c0e6025563113887b01bbc9",
+      "hkdf_salt": "f4152a2ab031993dd49ff5447f16194b",
+      "header_hex": "52414f3100800201000400000000000000000000000000000000000000000000f4152a2ab031993dd49ff5447f16194b000000000000004401000000000000e230303030303030302d303030302d343030302d383030302d30303030303030303030303200000000000000000000000000000000000000000000000000000000",
+      "header_hash": "78cab0a43fcf8daa4a66df3eb50b44664184384fc15b62b381ba7874bcd37d8e",
+      "metadata_key": "43683598ee16174054a6524c787391bfda0b97ec9c48a6858f5be380220ab92d",
+      "payload_key": "2605e323e5957d94548ce4ee60575c8d0727eeab4cea7b3906e91c09ea0fabdc",
+      "metadata_frame_hex": "6477881c5ab05034478eb64188e8396aa02609d323f9a425ba22263b5fdd2cb75260d999f1f0d0fab4004bcd9f1f35bc17749d57e9d0008efc670b8b8b615dd6e7f8afcc",
+      "payload_frame_sha256": "0ace2149cb8399cb7e3aba2e0bed2a8455c3b3d6b7b66ebc5165f397477e691e",
+      "stored_digest": "f6a7ba7e1a6a6d1796a9b9b38387142552b7420765b410e40526127b7cdddc47",
       "plaintext_digest": "44c77b10e2961d1d73fc719235419e76ccaab24c8a4bcce745e4650ffb3a6d5c"
     }
   }

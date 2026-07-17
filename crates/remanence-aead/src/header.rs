@@ -1,4 +1,4 @@
-//! RAO v1/v2 128-byte plaintext scalar envelope header.
+//! RAO v2 128-byte plaintext scalar envelope header.
 
 use sha2::{Digest, Sha256};
 
@@ -14,8 +14,6 @@ pub const RAO_METADATA_FRAME_MIN_LEN: u64 = 17;
 pub const RAO_FOOTER: &[u8; 16] = b"RAO1_STREAM_END.";
 
 const MAGIC: &[u8; 4] = b"RAO1";
-/// Registry-symmetric v2 wrapping suite (reserved; not emitted yet).
-pub const WRAP_SUITE_REGISTRY: u8 = 0;
 /// HPKE Base X25519/HKDF-SHA256/ChaCha20-Poly1305 wrapping suite.
 pub const WRAP_SUITE_HPKE_V1: u8 = 1;
 const SUITE_ID_HKDF_SHA256_CHACHA20POLY1305: u8 = 0x01;
@@ -24,47 +22,23 @@ const ZERO_16: [u8; 16] = [0; 16];
 /// Parsed RAO encrypted-envelope header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RaoHeader {
-    /// Envelope format version (1 or 2).
+    /// Envelope format version (always 2 for accepted objects).
     pub format_version: u8,
     /// Object body block size and AEAD plaintext chunk size.
     pub chunk_size: u32,
-    /// Opaque archive key identifier.
-    pub key_id: [u8; 16],
     /// Deterministically derived per-object HKDF salt.
     pub hkdf_salt: [u8; 16],
     /// Encrypted metadata frame length, including its 16-byte AEAD tag.
     pub metadata_frame_len: u64,
     /// Inner canonical RAO object id.
     pub object_id: String,
-    /// v2 DEK wrapping suite; zero for v1.
+    /// DEK wrapping suite.
     pub wrap_suite: u8,
-    /// v2 plaintext key-frame length; zero for v1.
+    /// Plaintext key-frame length.
     pub key_frame_len: u32,
 }
 
 impl RaoHeader {
-    /// Construct and validate a RAO header.
-    pub fn new(
-        chunk_size: u32,
-        key_id: [u8; 16],
-        hkdf_salt: [u8; 16],
-        metadata_frame_len: u64,
-        object_id: impl Into<String>,
-    ) -> Result<Self> {
-        let header = Self {
-            format_version: 1,
-            chunk_size,
-            key_id,
-            hkdf_salt,
-            metadata_frame_len,
-            object_id: object_id.into(),
-            wrap_suite: 0,
-            key_frame_len: 0,
-        };
-        header.validate()?;
-        Ok(header)
-    }
-
     /// Construct and validate a v2 envelope-mode scalar header.
     pub fn new_v2_envelope(
         chunk_size: u32,
@@ -76,7 +50,6 @@ impl RaoHeader {
         let header = Self {
             format_version: 2,
             chunk_size,
-            key_id: ZERO_16,
             hkdf_salt,
             metadata_frame_len,
             object_id: object_id.into(),
@@ -97,7 +70,7 @@ impl RaoHeader {
             return Err(RaoAeadError::InvalidHeaderLength);
         }
         let format_version = bytes[6];
-        if !matches!(format_version, 1 | 2) {
+        if format_version != 2 {
             return Err(RaoAeadError::UnsupportedFormatVersion);
         }
         if bytes[7] != SUITE_ID_HKDF_SHA256_CHACHA20POLY1305 {
@@ -110,8 +83,9 @@ impl RaoHeader {
             return Err(RaoAeadError::ReservedBytesNotZero);
         }
 
-        let mut key_id = [0u8; 16];
-        key_id.copy_from_slice(&bytes[0x10..0x20]);
+        if bytes[0x10..0x20].iter().any(|byte| *byte != 0) {
+            return Err(RaoAeadError::ReservedBytesNotZero);
+        }
         let mut hkdf_salt = [0u8; 16];
         hkdf_salt.copy_from_slice(&bytes[0x20..0x30]);
         let metadata_frame_len = u64::from_be_bytes([
@@ -124,30 +98,16 @@ impl RaoHeader {
             bytes[0x36],
             bytes[0x37],
         ]);
-        let (wrap_suite, key_frame_len) = match format_version {
-            1 => {
-                if bytes[0x38..0x40].iter().any(|byte| *byte != 0) {
-                    return Err(RaoAeadError::ReservedBytesNotZero);
-                }
-                (0, 0)
-            }
-            2 => {
-                if bytes[0x39..0x3c].iter().any(|byte| *byte != 0) {
-                    return Err(RaoAeadError::ReservedBytesNotZero);
-                }
-                (
-                    bytes[0x38],
-                    u32::from_be_bytes(bytes[0x3c..0x40].try_into().expect("fixed slice")),
-                )
-            }
-            _ => unreachable!(),
-        };
+        if bytes[0x39..0x3c].iter().any(|byte| *byte != 0) {
+            return Err(RaoAeadError::ReservedBytesNotZero);
+        }
+        let wrap_suite = bytes[0x38];
+        let key_frame_len = u32::from_be_bytes(bytes[0x3c..0x40].try_into().expect("fixed slice"));
 
         let object_id = decode_object_id_field(&bytes[0x40..0x80])?;
         let header = Self {
             format_version,
             chunk_size,
-            key_id,
             hkdf_salt,
             metadata_frame_len,
             object_id,
@@ -169,13 +129,10 @@ impl RaoHeader {
         bytes[7] = SUITE_ID_HKDF_SHA256_CHACHA20POLY1305;
         bytes[8..12].copy_from_slice(&self.chunk_size.to_be_bytes());
         bytes[12..16].copy_from_slice(&0u32.to_be_bytes());
-        bytes[0x10..0x20].copy_from_slice(&self.key_id);
         bytes[0x20..0x30].copy_from_slice(&self.hkdf_salt);
         bytes[0x30..0x38].copy_from_slice(&self.metadata_frame_len.to_be_bytes());
-        if self.format_version == 2 {
-            bytes[0x38] = self.wrap_suite;
-            bytes[0x3c..0x40].copy_from_slice(&self.key_frame_len.to_be_bytes());
-        }
+        bytes[0x38] = self.wrap_suite;
+        bytes[0x3c..0x40].copy_from_slice(&self.key_frame_len.to_be_bytes());
         bytes[0x40..0x80].copy_from_slice(&object_id_field(&self.object_id)?);
         Ok(bytes)
     }
@@ -191,12 +148,6 @@ impl RaoHeader {
 
     /// SHA-256 of the exact scalar header followed by its v2 key frame.
     pub fn header_hash_with_key_frame(&self, key_frame: &[u8]) -> Result<[u8; 32]> {
-        if self.format_version == 1 {
-            if !key_frame.is_empty() {
-                return Err(RaoAeadError::InvalidKeyFrameLength);
-            }
-            return self.header_hash();
-        }
         if key_frame.len() != self.key_frame_len as usize {
             return Err(RaoAeadError::InvalidKeyFrameLength);
         }
@@ -211,39 +162,19 @@ impl RaoHeader {
         object_id_field(&self.object_id)
     }
 
-    /// Validate this header under the disjoint v1/v2 frozen-field rules.
+    /// Validate this header under the v2 frozen-field rules.
     pub fn validate(&self) -> Result<()> {
         validate_chunk_size(self.chunk_size)?;
-        match self.format_version {
-            1 => {
-                if self.key_id == ZERO_16 {
-                    return Err(RaoAeadError::InvalidKeyIdentifier);
-                }
-                if self.wrap_suite != 0 || self.key_frame_len != 0 {
-                    return Err(RaoAeadError::ReservedBytesNotZero);
-                }
-            }
-            2 => match self.wrap_suite {
-                // Registry-symmetric v2 is reserved by the frozen design but is
-                // not emitted in phase 1. Rejecting it keeps a flipped v1
-                // version byte a loud format error instead of a mode mismatch.
-                WRAP_SUITE_REGISTRY if self.key_frame_len == 0 => {
-                    return Err(RaoAeadError::InvalidWrapSuite);
-                }
-                WRAP_SUITE_HPKE_V1 => {
-                    if self.key_id != ZERO_16 {
-                        return Err(RaoAeadError::InvalidKeyIdentifier);
-                    }
-                    if !(crate::key_frame::RAO_KEY_FRAME_MIN_LEN
-                        ..=crate::key_frame::RAO_KEY_FRAME_MAX_LEN)
-                        .contains(&(self.key_frame_len as usize))
-                    {
-                        return Err(RaoAeadError::InvalidKeyFrameLength);
-                    }
-                }
-                _ => return Err(RaoAeadError::InvalidWrapSuite),
-            },
-            _ => return Err(RaoAeadError::UnsupportedFormatVersion),
+        if self.format_version != 2 {
+            return Err(RaoAeadError::UnsupportedFormatVersion);
+        }
+        if self.wrap_suite != WRAP_SUITE_HPKE_V1 {
+            return Err(RaoAeadError::InvalidWrapSuite);
+        }
+        if !(crate::key_frame::RAO_KEY_FRAME_MIN_LEN..=crate::key_frame::RAO_KEY_FRAME_MAX_LEN)
+            .contains(&(self.key_frame_len as usize))
+        {
+            return Err(RaoAeadError::InvalidKeyFrameLength);
         }
         if self.hkdf_salt == ZERO_16 {
             return Err(RaoAeadError::InvalidSalt);
@@ -300,7 +231,7 @@ mod tests {
     use super::*;
 
     fn valid_header() -> RaoHeader {
-        RaoHeader::new(262_144, [1; 16], [2; 16], 64, "object-1").unwrap()
+        RaoHeader::new_v2_envelope(262_144, [2; 16], 64, "object-1", 103).unwrap()
     }
 
     #[test]
@@ -309,13 +240,13 @@ mod tests {
         let bytes = header.serialize().unwrap();
         assert_eq!(&bytes[0x00..0x04], b"RAO1");
         assert_eq!(u16::from_be_bytes([bytes[0x04], bytes[0x05]]), 128);
-        assert_eq!(bytes[0x06], 1);
+        assert_eq!(bytes[0x06], 2);
         assert_eq!(bytes[0x07], 1);
         assert_eq!(
             u32::from_be_bytes(bytes[0x08..0x0c].try_into().unwrap()),
             262_144
         );
-        assert_eq!(&bytes[0x10..0x20], &[1; 16]);
+        assert_eq!(&bytes[0x10..0x20], &[0; 16]);
         assert_eq!(&bytes[0x20..0x30], &[2; 16]);
         assert_eq!(
             u64::from_be_bytes(bytes[0x30..0x38].try_into().unwrap()),
@@ -326,10 +257,15 @@ mod tests {
         let parsed = RaoHeader::parse(&bytes).unwrap();
         assert_eq!(parsed, header);
         assert_ne!(header.header_hash().unwrap(), [0; 32]);
+        assert_eq!(bytes[0x38], WRAP_SUITE_HPKE_V1);
+        assert_eq!(
+            u32::from_be_bytes(bytes[0x3c..0x40].try_into().unwrap()),
+            103
+        );
     }
 
     #[test]
-    fn v2_header_round_trips_at_frozen_offsets() {
+    fn header_rejects_unsupported_version_and_suite() {
         let header = RaoHeader::new_v2_envelope(4096, [2; 16], 64, "object-2", 103).unwrap();
         let bytes = header.serialize().unwrap();
         assert_eq!(bytes[0x06], 2);
@@ -350,7 +286,7 @@ mod tests {
             Err(RaoAeadError::InvalidWrapSuite)
         ));
         let mut version_flip = bytes;
-        version_flip[6] = 3;
+        version_flip[6] = 1;
         assert!(matches!(
             RaoHeader::parse(&version_flip),
             Err(RaoAeadError::UnsupportedFormatVersion)
@@ -383,7 +319,7 @@ mod tests {
         ));
 
         let mut bytes = valid_header().serialize().unwrap();
-        bytes[0x38] = 1;
+        bytes[0x10] = 1;
         assert!(matches!(
             RaoHeader::parse(&bytes),
             Err(RaoAeadError::ReservedBytesNotZero)

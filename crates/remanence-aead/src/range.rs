@@ -9,11 +9,8 @@
 
 use crate::error::{RaoAeadError, Result};
 use crate::header::{RaoHeader, RAO_HEADER_LEN};
-use crate::kdf::{derive_keys, derive_salt, RootKey};
 use crate::metadata::RaoMetadata;
-use crate::stream::{
-    cipher_offset_with_key_frame, decrypt_chunk, decrypt_metadata, CHACHA20POLY1305_TAG_LEN,
-};
+use crate::stream::{cipher_offset, decrypt_chunk, decrypt_metadata, CHACHA20POLY1305_TAG_LEN};
 use std::io::{Read, Write};
 
 /// Report returned after successfully opening a plaintext subrange.
@@ -41,7 +38,7 @@ pub struct RangeOpenReport {
 ///
 /// This is the query surface used by callers that must fetch only the stored
 /// payload frames covering a plaintext member. The mapping is deliberately
-/// produced here, beside [`cipher_offset_with_key_frame`], so consumers never
+/// produced here, beside [`cipher_offset`], so consumers never
 /// duplicate the envelope geometry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoveringStoredRange {
@@ -63,64 +60,14 @@ pub struct CoveringStoredRange {
     pub stored_range_len: u64,
 }
 
-/// Open an absolute plaintext byte range from an encrypted RAO object.
-///
-/// `plaintext_start` and `plaintext_len` address the canonical plaintext
-/// object. The scalar header, v2 key frame (when present), metadata frame, and
-/// every ciphertext chunk covering the requested range are authenticated
-/// before bytes are returned. Unrequested payload chunks are not authenticated.
-pub fn open_plaintext_range_to_vec(
-    input: &[u8],
-    root_key: &RootKey,
-    plaintext_start: u64,
-    plaintext_len: u64,
-) -> Result<(Vec<u8>, RangeOpenReport)> {
-    let (header, metadata, keys) = open_authenticated_metadata(input, root_key)?;
-    open_plaintext_range_from_slice_with_context(
-        input,
-        header,
-        metadata,
-        keys,
-        plaintext_start,
-        plaintext_len,
-    )
-}
-
-/// Open a range relative to an inner RAO body block.
-///
-/// This is the direct Section 6.2/6.3 bridge used by file-level PFR:
-/// `first_inner_chunk` is the member file's `first_chunk_lba`, and
-/// `range_start`/`range_len` are byte offsets within that member file.
-pub fn open_inner_range_to_vec(
-    input: &[u8],
-    root_key: &RootKey,
-    first_inner_chunk: u64,
-    range_start: u64,
-    range_len: u64,
-) -> Result<(Vec<u8>, RangeOpenReport)> {
-    let (header, metadata, keys) = open_authenticated_metadata(input, root_key)?;
-    let absolute_start = first_inner_chunk
-        .checked_mul(u64::from(header.chunk_size))
-        .and_then(|value| value.checked_add(range_start))
-        .ok_or(RaoAeadError::SizeOverflow)?;
-    open_plaintext_range_from_slice_with_context(
-        input,
-        header,
-        metadata,
-        keys,
-        absolute_start,
-        range_len,
-    )
-}
-
 /// Open and authenticate a v2 envelope plaintext range with per-frame semantics.
-pub fn open_plaintext_range_envelope_to_vec(
+pub fn open_plaintext_range_to_vec(
     input: &[u8],
     recipient: &crate::RecipientPrivateKey,
     plaintext_start: u64,
     plaintext_len: u64,
 ) -> Result<(Vec<u8>, RangeOpenReport)> {
-    let (header, metadata, keys) = open_authenticated_metadata_envelope(input, recipient)?;
+    let (header, metadata, keys) = open_authenticated_metadata(input, recipient)?;
     open_plaintext_range_from_slice_with_context(
         input,
         header,
@@ -132,14 +79,14 @@ pub fn open_plaintext_range_envelope_to_vec(
 }
 
 /// Open a v2 envelope range relative to an inner RAO body block.
-pub fn open_inner_range_envelope_to_vec(
+pub fn open_inner_range_to_vec(
     input: &[u8],
     recipient: &crate::RecipientPrivateKey,
     first_inner_chunk: u64,
     range_start: u64,
     range_len: u64,
 ) -> Result<(Vec<u8>, RangeOpenReport)> {
-    let (header, metadata, keys) = open_authenticated_metadata_envelope(input, recipient)?;
+    let (header, metadata, keys) = open_authenticated_metadata(input, recipient)?;
     let absolute_start = first_inner_chunk
         .checked_mul(u64::from(header.chunk_size))
         .and_then(|value| value.checked_add(range_start))
@@ -154,70 +101,28 @@ pub fn open_inner_range_envelope_to_vec(
     )
 }
 
-/// Authenticate a v1 prefix and return the stored frames covering a plaintext range.
-pub fn covering_stored_range(
-    authenticated_prefix: &[u8],
-    root_key: &RootKey,
-    plaintext_start: u64,
-    plaintext_len: u64,
-) -> Result<CoveringStoredRange> {
-    let (header, metadata, _keys) = open_authenticated_metadata(authenticated_prefix, root_key)?;
-    range_geometry(header, metadata, plaintext_start, plaintext_len)
-}
-
 /// Authenticate a v2 recipient prefix and return its covering stored frames.
-pub fn covering_stored_range_envelope(
+pub fn covering_stored_range(
     authenticated_prefix: &[u8],
     recipient: &crate::RecipientPrivateKey,
     plaintext_start: u64,
     plaintext_len: u64,
 ) -> Result<CoveringStoredRange> {
-    let (header, metadata, _keys) =
-        open_authenticated_metadata_envelope(authenticated_prefix, recipient)?;
+    let (header, metadata, _keys) = open_authenticated_metadata(authenticated_prefix, recipient)?;
     range_geometry(header, metadata, plaintext_start, plaintext_len)
 }
 
-/// Stream a v1 plaintext range from an input positioned at `stored_range_start`.
-///
-/// `authenticated_prefix` contains only the scalar header, optional key frame,
-/// and metadata frame. `ranged_input` must be bounded to the covering stored
-/// range returned by [`covering_stored_range`]. At most one ciphertext frame
-/// and one plaintext chunk are held at a time, and every chunk is authenticated
-/// before any bytes from that chunk are written.
+/// Stream a v2 recipient-envelope plaintext range from a bounded ranged input.
 pub fn open_plaintext_range_from_reader<R: Read + ?Sized, W: Write + ?Sized>(
     authenticated_prefix: &[u8],
     ranged_input: &mut R,
     stored_range_start: u64,
     output: &mut W,
-    root_key: &RootKey,
-    plaintext_start: u64,
-    plaintext_len: u64,
-) -> Result<RangeOpenReport> {
-    let (header, metadata, keys) = open_authenticated_metadata(authenticated_prefix, root_key)?;
-    open_plaintext_range_from_reader_with_context(
-        ranged_input,
-        stored_range_start,
-        output,
-        header,
-        metadata,
-        keys,
-        plaintext_start,
-        plaintext_len,
-    )
-}
-
-/// Stream a v2 recipient-envelope plaintext range from a bounded ranged input.
-pub fn open_plaintext_range_envelope_from_reader<R: Read + ?Sized, W: Write + ?Sized>(
-    authenticated_prefix: &[u8],
-    ranged_input: &mut R,
-    stored_range_start: u64,
-    output: &mut W,
     recipient: &crate::RecipientPrivateKey,
     plaintext_start: u64,
     plaintext_len: u64,
 ) -> Result<RangeOpenReport> {
-    let (header, metadata, keys) =
-        open_authenticated_metadata_envelope(authenticated_prefix, recipient)?;
+    let (header, metadata, keys) = open_authenticated_metadata(authenticated_prefix, recipient)?;
     open_plaintext_range_from_reader_with_context(
         ranged_input,
         stored_range_start,
@@ -295,13 +200,13 @@ fn range_geometry(
     let stored_chunk_len = chunk_size
         .checked_add(CHACHA20POLY1305_TAG_LEN)
         .ok_or(RaoAeadError::SizeOverflow)?;
-    let stored_range_start = cipher_offset_with_key_frame(
+    let stored_range_start = cipher_offset(
         header.key_frame_len,
         header.metadata_frame_len,
         header.chunk_size,
         first_chunk,
     )?;
-    let stored_range_end = cipher_offset_with_key_frame(
+    let stored_range_end = cipher_offset(
         header.key_frame_len,
         header.metadata_frame_len,
         header.chunk_size,
@@ -409,43 +314,6 @@ impl From<CoveringStoredRange> for RangeOpenReport {
 
 fn open_authenticated_metadata(
     input: &[u8],
-    root_key: &RootKey,
-) -> Result<(RaoHeader, RaoMetadata, crate::kdf::DerivedKeys)> {
-    let header_bytes: [u8; RAO_HEADER_LEN] = input
-        .get(..RAO_HEADER_LEN)
-        .ok_or(RaoAeadError::UnexpectedEof)?
-        .try_into()
-        .map_err(|_| RaoAeadError::UnexpectedEof)?;
-    let header = RaoHeader::parse(&header_bytes)?;
-    if header.format_version != 1 {
-        return Err(RaoAeadError::KeyModeMismatch);
-    }
-    let keys = derive_keys(root_key, &header.hkdf_salt, &header.header_hash()?)?;
-    let metadata_frame_len =
-        usize::try_from(header.metadata_frame_len).map_err(|_| RaoAeadError::SizeOverflow)?;
-    let metadata_start = RAO_HEADER_LEN;
-    let metadata_end = metadata_start
-        .checked_add(metadata_frame_len)
-        .ok_or(RaoAeadError::SizeOverflow)?;
-    let metadata_frame = input
-        .get(metadata_start..metadata_end)
-        .ok_or(RaoAeadError::UnexpectedEof)?;
-    let metadata_plaintext = decrypt_metadata(&keys.metadata_key, metadata_frame)?;
-    let metadata = RaoMetadata::from_cbor_bytes(&metadata_plaintext, header.chunk_size)?;
-    let expected_salt = derive_salt(
-        root_key,
-        &header.object_id_field()?,
-        &metadata.plaintext_digest,
-        &metadata_plaintext,
-    )?;
-    if expected_salt != header.hkdf_salt {
-        return Err(RaoAeadError::SaltDerivationMismatch);
-    }
-    Ok((header, metadata, keys))
-}
-
-fn open_authenticated_metadata_envelope(
-    input: &[u8],
     recipient: &crate::RecipientPrivateKey,
 ) -> Result<(RaoHeader, RaoMetadata, crate::kdf::DerivedKeys)> {
     let header_bytes: [u8; RAO_HEADER_LEN] = input
@@ -454,10 +322,6 @@ fn open_authenticated_metadata_envelope(
         .try_into()
         .map_err(|_| RaoAeadError::UnexpectedEof)?;
     let header = RaoHeader::parse(&header_bytes)?;
-    if header.format_version != 2 || header.wrap_suite != crate::WRAP_SUITE_HPKE_V1 {
-        return Err(RaoAeadError::KeyModeMismatch);
-    }
-
     let key_frame_len =
         usize::try_from(header.key_frame_len).map_err(|_| RaoAeadError::SizeOverflow)?;
     let key_frame_end = RAO_HEADER_LEN
@@ -520,8 +384,8 @@ fn validate_range(start: u64, len: u64, plaintext_size: u64) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::{
-        cipher_offset, open_to_vec, seal_envelope_to_vec, seal_to_vec, EnvelopeSealOptions,
-        RecipientPrivateKey, SealOptions,
+        cipher_offset, open_to_vec, seal_to_vec, EnvelopeSealOptions, RecipientPrivateKey,
+        SealOptions,
     };
     use sha2::{Digest, Sha256};
     use std::io::Read;
@@ -557,40 +421,22 @@ mod tests {
         }
     }
 
-    fn sealed() -> (Vec<u8>, Vec<u8>, RootKey, SealOptions) {
-        let root = RootKey::new([0x11; 32]).unwrap();
+    fn sealed() -> (Vec<u8>, Vec<u8>, RecipientPrivateKey, SealOptions) {
         let plaintext: Vec<u8> = (0..1536).map(|i| (i % 251) as u8).collect();
-        let digest = Sha256::digest(&plaintext);
-        let mut plaintext_digest = [0u8; 32];
-        plaintext_digest.copy_from_slice(&digest);
-        let options = SealOptions {
+        let common = SealOptions {
             chunk_size: 512,
-            key_id: [0x10; 16],
-            object_id: "object-1".to_string(),
+            object_id: "object-v2-range".to_string(),
             plaintext_size: plaintext.len() as u64,
-            plaintext_digest,
+            plaintext_digest: Sha256::digest(&plaintext).into(),
         };
-        let sealed = seal_to_vec(&plaintext, &root, &options).unwrap().0;
-        (sealed, plaintext, root, options)
-    }
-
-    fn sealed_v2() -> (Vec<u8>, Vec<u8>, RecipientPrivateKey) {
-        let plaintext: Vec<u8> = (0..1536).map(|i| (i % 251) as u8).collect();
-        let plaintext_digest = Sha256::digest(&plaintext).into();
         let safe = RecipientPrivateKey::new([1; 16], "safe", [7; 32]).unwrap();
         let escrow = RecipientPrivateKey::new([2; 16], "escrow", [8; 32]).unwrap();
         let options = EnvelopeSealOptions {
-            common: SealOptions {
-                chunk_size: 512,
-                key_id: [0; 16],
-                object_id: "object-v2-range".to_string(),
-                plaintext_size: plaintext.len() as u64,
-                plaintext_digest,
-            },
+            common: common.clone(),
             recipients: vec![safe.public_key(0).unwrap(), escrow.public_key(1).unwrap()],
         };
-        let sealed = seal_envelope_to_vec(&plaintext, &options).unwrap().0;
-        (sealed, plaintext, safe)
+        let sealed = seal_to_vec(&plaintext, &options).unwrap().0;
+        (sealed, plaintext, safe, common)
     }
 
     #[test]
@@ -605,7 +451,15 @@ mod tests {
         assert_eq!(report.chunk_count, 3);
         assert_eq!(
             report.stored_range_start,
-            Some(cipher_offset(report.header.metadata_frame_len, options.chunk_size, 0).unwrap())
+            Some(
+                cipher_offset(
+                    report.header.key_frame_len,
+                    report.header.metadata_frame_len,
+                    options.chunk_size,
+                    0,
+                )
+                .unwrap()
+            )
         );
         assert_eq!(
             report.stored_range_len,
@@ -643,16 +497,16 @@ mod tests {
 
     #[test]
     fn recipient_reader_range_matches_whole_object_trim() {
-        let (sealed, plaintext, recipient) = sealed_v2();
+        let (sealed, plaintext, recipient, _) = sealed();
         let inspected = crate::inspect_bytes(&sealed).unwrap();
         let prefix = &sealed[..prefix_len(&inspected.header)];
-        let plan = covering_stored_range_envelope(prefix, &recipient, 500, 600).unwrap();
+        let plan = covering_stored_range(prefix, &recipient, 500, 600).unwrap();
         let start = plan.stored_range_start.unwrap() as usize;
         let end = start + plan.stored_range_len as usize;
         let mut input = CountingReader::new(&sealed[start..end]);
         let mut output = Vec::new();
 
-        open_plaintext_range_envelope_from_reader(
+        open_plaintext_range_from_reader(
             prefix,
             &mut input,
             start as u64,
@@ -673,7 +527,7 @@ mod tests {
         let inspected = crate::inspect_bytes(&sealed).unwrap();
         let prefix_end = prefix_len(&inspected.header);
         let mut bad_prefix = sealed[..prefix_end].to_vec();
-        bad_prefix[RAO_HEADER_LEN + 3] ^= 0x80;
+        bad_prefix[0x20] ^= 0x80;
         assert!(matches!(
             covering_stored_range(&bad_prefix, &root, 512, 64),
             Err(RaoAeadError::AeadAuthenticationFailed)
@@ -740,8 +594,13 @@ mod tests {
     fn range_open_does_not_authenticate_unrequested_payload_chunks() {
         let (mut sealed, plaintext, root, options) = sealed();
         let report = crate::inspect_bytes(&sealed).unwrap();
-        let chunk_two = cipher_offset(report.header.metadata_frame_len, options.chunk_size, 2)
-            .unwrap() as usize;
+        let chunk_two = cipher_offset(
+            report.header.key_frame_len,
+            report.header.metadata_frame_len,
+            options.chunk_size,
+            2,
+        )
+        .unwrap() as usize;
         sealed[chunk_two] ^= 0x80;
 
         assert!(matches!(
@@ -756,8 +615,13 @@ mod tests {
     fn range_open_fails_closed_for_requested_chunk_authentication_failure() {
         let (mut sealed, _plaintext, root, options) = sealed();
         let report = crate::inspect_bytes(&sealed).unwrap();
-        let chunk_one = cipher_offset(report.header.metadata_frame_len, options.chunk_size, 1)
-            .unwrap() as usize;
+        let chunk_one = cipher_offset(
+            report.header.key_frame_len,
+            report.header.metadata_frame_len,
+            options.chunk_size,
+            1,
+        )
+        .unwrap() as usize;
         sealed[chunk_one] ^= 0x80;
 
         assert!(matches!(
@@ -768,16 +632,16 @@ mod tests {
 
     #[test]
     fn v2_range_authenticates_returned_frames_but_not_unrequested_payload() {
-        let (sealed, plaintext, safe) = sealed_v2();
+        let (sealed, plaintext, safe, _) = sealed();
         let inspected = crate::inspect_bytes(&sealed).unwrap();
-        let chunk_zero = cipher_offset_with_key_frame(
+        let chunk_zero = cipher_offset(
             inspected.header.key_frame_len,
             inspected.header.metadata_frame_len,
             inspected.header.chunk_size,
             0,
         )
         .unwrap() as usize;
-        let chunk_two = cipher_offset_with_key_frame(
+        let chunk_two = cipher_offset(
             inspected.header.key_frame_len,
             inspected.header.metadata_frame_len,
             inspected.header.chunk_size,
@@ -788,22 +652,21 @@ mod tests {
         let mut requested_tamper = sealed.clone();
         requested_tamper[chunk_zero] ^= 0x80;
         assert!(matches!(
-            open_plaintext_range_envelope_to_vec(&requested_tamper, &safe, 0, 128),
+            open_plaintext_range_to_vec(&requested_tamper, &safe, 0, 128),
             Err(RaoAeadError::AeadAuthenticationFailed)
         ));
 
         let mut unrelated_tamper = sealed;
         unrelated_tamper[chunk_two] ^= 0x80;
-        let (range, _) =
-            open_plaintext_range_envelope_to_vec(&unrelated_tamper, &safe, 0, 128).unwrap();
+        let (range, _) = open_plaintext_range_to_vec(&unrelated_tamper, &safe, 0, 128).unwrap();
         assert_eq!(range, plaintext[..128]);
     }
 
     #[test]
     fn v2_range_rejects_key_frame_tamper_outside_requested_payload() {
-        let (mut sealed, _plaintext, safe) = sealed_v2();
+        let (mut sealed, _plaintext, safe, _) = sealed();
         sealed[RAO_HEADER_LEN + 6] ^= 0x80;
-        assert!(open_plaintext_range_envelope_to_vec(&sealed, &safe, 0, 128).is_err());
+        assert!(open_plaintext_range_to_vec(&sealed, &safe, 0, 128).is_err());
     }
 
     #[test]

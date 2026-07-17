@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use remanence_aead::{open_envelope_to_vec, open_to_vec, OpenReport, RecipientPrivateKey, RootKey};
+use remanence_aead::{open_to_vec, OpenReport, RecipientPrivateKey};
 use remanence_library::BlockRead;
 use sha2::{Digest, Sha256};
 
@@ -224,87 +224,14 @@ pub fn read_rem_tar_object_with_mode_and_manifest_anchor<S: BlockRead + ?Sized>(
     parse_rem_tar_bytes_with_mode_and_manifest_anchor(&archive, chunk_size, mode, manifest_sha256)
 }
 
-/// Read, decrypt, and parse one encrypted RAO object from fixed-size blocks.
-///
-/// This materializing helper is the first format-level bridge between the
-/// canonical plaintext stream and `remanence-aead`. The encrypted object is
-/// read from `source`, opened with `root_key`, then the authenticated inner
-/// plaintext stream is parsed by the ordinary RAO reader. Streaming and PFR
-/// readers can build on the same envelope primitives later.
-pub fn read_encrypted_rao_object<S: BlockRead + ?Sized>(
-    source: &mut S,
-    chunk_size: usize,
-    block_count: u64,
-    root_key: &RootKey,
-) -> Result<EncryptedRaoReadObject, FormatError> {
-    read_encrypted_rao_object_with_mode(
-        source,
-        chunk_size,
-        block_count,
-        root_key,
-        ReadMode::Restore,
-    )
-}
-
-/// Read, decrypt, and parse one encrypted RAO object with an explicit reader mode.
-pub fn read_encrypted_rao_object_with_mode<S: BlockRead + ?Sized>(
-    source: &mut S,
-    chunk_size: usize,
-    block_count: u64,
-    root_key: &RootKey,
-    mode: ReadMode,
-) -> Result<EncryptedRaoReadObject, FormatError> {
-    read_encrypted_rao_object_with_mode_and_manifest_anchor(
-        source,
-        chunk_size,
-        block_count,
-        root_key,
-        mode,
-        None,
-    )
-}
-
-/// Read, decrypt, and parse one encrypted RAO object with an optional inner manifest anchor.
-pub fn read_encrypted_rao_object_with_manifest_anchor<S: BlockRead + ?Sized>(
-    source: &mut S,
-    chunk_size: usize,
-    block_count: u64,
-    root_key: &RootKey,
-    manifest_sha256: Option<[u8; 32]>,
-) -> Result<EncryptedRaoReadObject, FormatError> {
-    read_encrypted_rao_object_with_mode_and_manifest_anchor(
-        source,
-        chunk_size,
-        block_count,
-        root_key,
-        ReadMode::Restore,
-        manifest_sha256,
-    )
-}
-
-/// Read, decrypt, and parse one encrypted RAO object with explicit mode and manifest anchor.
-pub fn read_encrypted_rao_object_with_mode_and_manifest_anchor<S: BlockRead + ?Sized>(
-    source: &mut S,
-    chunk_size: usize,
-    block_count: u64,
-    root_key: &RootKey,
-    mode: ReadMode,
-    manifest_sha256: Option<[u8; 32]>,
-) -> Result<EncryptedRaoReadObject, FormatError> {
-    validate_chunk_size(chunk_size)?;
-    let encrypted = read_object_bytes(source, chunk_size, block_count)?;
-    let (plaintext, envelope) = open_to_vec(&encrypted, root_key)?;
-    parse_opened_encrypted_object(plaintext, envelope, chunk_size, mode, manifest_sha256)
-}
-
 /// Read, decrypt, and parse one v2 recipient-envelope RAO object.
-pub fn read_envelope_rao_object<S: BlockRead + ?Sized>(
+pub fn read_encrypted_rao_object<S: BlockRead + ?Sized>(
     source: &mut S,
     chunk_size: usize,
     block_count: u64,
     recipient: &RecipientPrivateKey,
 ) -> Result<EncryptedRaoReadObject, FormatError> {
-    read_envelope_rao_object_with_mode(
+    read_encrypted_rao_object_with_mode(
         source,
         chunk_size,
         block_count,
@@ -314,14 +241,14 @@ pub fn read_envelope_rao_object<S: BlockRead + ?Sized>(
 }
 
 /// Read a v2 recipient-envelope RAO object with an explicit integrity mode.
-pub fn read_envelope_rao_object_with_mode<S: BlockRead + ?Sized>(
+pub fn read_encrypted_rao_object_with_mode<S: BlockRead + ?Sized>(
     source: &mut S,
     chunk_size: usize,
     block_count: u64,
     recipient: &RecipientPrivateKey,
     mode: ReadMode,
 ) -> Result<EncryptedRaoReadObject, FormatError> {
-    read_envelope_rao_object_with_mode_and_manifest_anchor(
+    read_encrypted_rao_object_with_mode_and_manifest_anchor(
         source,
         chunk_size,
         block_count,
@@ -332,14 +259,14 @@ pub fn read_envelope_rao_object_with_mode<S: BlockRead + ?Sized>(
 }
 
 /// Read a v2 recipient-envelope RAO object with an external manifest anchor.
-pub fn read_envelope_rao_object_with_manifest_anchor<S: BlockRead + ?Sized>(
+pub fn read_encrypted_rao_object_with_manifest_anchor<S: BlockRead + ?Sized>(
     source: &mut S,
     chunk_size: usize,
     block_count: u64,
     recipient: &RecipientPrivateKey,
     manifest_sha256: Option<[u8; 32]>,
 ) -> Result<EncryptedRaoReadObject, FormatError> {
-    read_envelope_rao_object_with_mode_and_manifest_anchor(
+    read_encrypted_rao_object_with_mode_and_manifest_anchor(
         source,
         chunk_size,
         block_count,
@@ -350,7 +277,7 @@ pub fn read_envelope_rao_object_with_manifest_anchor<S: BlockRead + ?Sized>(
 }
 
 /// Read a v2 recipient-envelope RAO object with explicit mode and manifest anchor.
-pub fn read_envelope_rao_object_with_mode_and_manifest_anchor<S: BlockRead + ?Sized>(
+pub fn read_encrypted_rao_object_with_mode_and_manifest_anchor<S: BlockRead + ?Sized>(
     source: &mut S,
     chunk_size: usize,
     block_count: u64,
@@ -360,7 +287,7 @@ pub fn read_envelope_rao_object_with_mode_and_manifest_anchor<S: BlockRead + ?Si
 ) -> Result<EncryptedRaoReadObject, FormatError> {
     validate_chunk_size(chunk_size)?;
     let encrypted = read_object_bytes(source, chunk_size, block_count)?;
-    let (plaintext, envelope) = open_envelope_to_vec(&encrypted, recipient)?;
+    let (plaintext, envelope) = open_to_vec(&encrypted, recipient)?;
     parse_opened_encrypted_object(plaintext, envelope, chunk_size, mode, manifest_sha256)
 }
 
@@ -1504,7 +1431,10 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use remanence_aead::{inspect_bytes, seal_to_vec, RootKey, SealOptions};
+    use remanence_aead::{
+        inspect_bytes, seal_to_vec, EnvelopeSealOptions, RecipientPrivateKey, RecipientPublicKey,
+        SealOptions,
+    };
     use remanence_library::{FileBlockSink, FileBlockSource, VecBlockSink, VecBlockSource};
 
     use super::*;
@@ -1523,6 +1453,16 @@ mod tests {
         );
         opts.chunk_size = chunk_size;
         opts
+    }
+
+    fn recipient_pair() -> (RecipientPrivateKey, Vec<RecipientPublicKey>) {
+        let primary = RecipientPrivateKey::new([0x31; 16], "primary-2026", [0x41; 32]).unwrap();
+        let recovery = RecipientPrivateKey::new([0x32; 16], "recovery-2026", [0x42; 32]).unwrap();
+        let recipients = vec![
+            primary.public_key(0).unwrap(),
+            recovery.public_key(1).unwrap(),
+        ];
+        (primary, recipients)
     }
 
     fn pax_record(key: &str, value: &str) -> Vec<u8> {
@@ -2033,16 +1973,15 @@ mod tests {
                 executable: Some(true),
             },
         ];
-        let root_key = RootKey::new([0x42; 32]).unwrap();
-        let key_id = [0x24; 16];
+        let (primary, recipients) = recipient_pair();
         let mut sink = VecBlockSink::new();
         let write_report =
-            write_encrypted_rao_object(&mut sink, &opts, &files, &root_key, key_id).unwrap();
+            write_encrypted_rao_object(&mut sink, &opts, &files, &recipients).unwrap();
         let encrypted: Vec<u8> = sink.blocks.iter().flatten().copied().collect();
 
         let inspected = inspect_bytes(&encrypted).unwrap();
-        assert_eq!(inspected.header.key_id, key_id);
         assert_eq!(inspected.header.object_id, opts.object_id);
+        assert_eq!(inspected.key_frame.slots.len(), 2);
         assert_eq!(
             inspected.stored_size_bytes,
             write_report.envelope.stored_size_bytes
@@ -2056,7 +1995,7 @@ mod tests {
             &mut source,
             opts.chunk_size,
             write_report.envelope.stored_size_blocks,
-            &root_key,
+            &primary,
         )
         .unwrap();
 
@@ -2094,19 +2033,17 @@ mod tests {
                 executable: Some(false),
             },
         ];
-        let root_key = RootKey::new([0x42; 32]).unwrap();
-        let key_id = [0x24; 16];
+        let (primary, recipients) = recipient_pair();
         let path = temp_object_path("encrypted");
         let write_report = {
             let mut sink = FileBlockSink::create_truncate(&path, opts.chunk_size).unwrap();
-            let report =
-                write_encrypted_rao_object(&mut sink, &opts, &files, &root_key, key_id).unwrap();
+            let report = write_encrypted_rao_object(&mut sink, &opts, &files, &recipients).unwrap();
             sink.flush().unwrap();
             report
         };
         let encrypted = fs::read(&path).unwrap();
         assert!(!contains_bytes(&encrypted, b"secret/name.bin"));
-        assert_eq!(inspect_bytes(&encrypted).unwrap().header.key_id, key_id);
+        assert_eq!(inspect_bytes(&encrypted).unwrap().key_frame.slots.len(), 2);
 
         let mut source = FileBlockSource::open(&path, opts.chunk_size).unwrap();
         assert_eq!(
@@ -2114,8 +2051,8 @@ mod tests {
             write_report.envelope.stored_size_blocks
         );
         let block_count = source.block_count();
-        let read = read_encrypted_rao_object(&mut source, opts.chunk_size, block_count, &root_key)
-            .unwrap();
+        let read =
+            read_encrypted_rao_object(&mut source, opts.chunk_size, block_count, &primary).unwrap();
         assert_eq!(read.object.entry("a.txt").unwrap().data, b"hello");
         assert_eq!(
             read.object.entry("secret/name.bin").unwrap().data,
@@ -2134,11 +2071,10 @@ mod tests {
             mtime: None,
             executable: Some(false),
         }];
-        let root_key = RootKey::new([0x42; 32]).unwrap();
-        let wrong_key = RootKey::new([0x43; 32]).unwrap();
+        let (_primary, recipients) = recipient_pair();
+        let wrong_key = RecipientPrivateKey::new([0x33; 16], "wrong-2026", [0x43; 32]).unwrap();
         let mut sink = VecBlockSink::new();
-        let report =
-            write_encrypted_rao_object(&mut sink, &opts, &files, &root_key, [0x24; 16]).unwrap();
+        let report = write_encrypted_rao_object(&mut sink, &opts, &files, &recipients).unwrap();
         let mut source = VecBlockSource::new(sink.blocks);
 
         let err = read_encrypted_rao_object(
@@ -2162,7 +2098,7 @@ mod tests {
             mtime: None,
             executable: Some(false),
         }];
-        let root_key = RootKey::new([0x42; 32]).unwrap();
+        let (primary, recipients) = recipient_pair();
         let mut plaintext_sink = VecBlockSink::new();
         let layout = write_rem_tar_object(&mut plaintext_sink, &opts, &files).unwrap();
         let mut plaintext: Vec<u8> = plaintext_sink.blocks.iter().flatten().copied().collect();
@@ -2171,14 +2107,16 @@ mod tests {
         let digest = Sha256::digest(&plaintext);
         let mut plaintext_digest = [0u8; 32];
         plaintext_digest.copy_from_slice(&digest);
-        let seal_options = SealOptions {
-            chunk_size: opts.chunk_size as u32,
-            key_id: [0x24; 16],
-            object_id: opts.object_id.clone(),
-            plaintext_size: plaintext.len() as u64,
-            plaintext_digest,
+        let seal_options = EnvelopeSealOptions {
+            common: SealOptions {
+                chunk_size: opts.chunk_size as u32,
+                object_id: opts.object_id.clone(),
+                plaintext_size: plaintext.len() as u64,
+                plaintext_digest,
+            },
+            recipients,
         };
-        let (sealed, report) = seal_to_vec(&plaintext, &root_key, &seal_options).unwrap();
+        let (sealed, report) = seal_to_vec(&plaintext, &seal_options).unwrap();
         let mut source = VecBlockSource::new(
             sealed
                 .chunks_exact(opts.chunk_size)
@@ -2190,7 +2128,7 @@ mod tests {
             &mut source,
             opts.chunk_size,
             report.stored_size_blocks,
-            &root_key,
+            &primary,
         )
         .unwrap_err();
 
@@ -2213,7 +2151,7 @@ mod tests {
             mtime: None,
             executable: Some(false),
         }];
-        let root_key = RootKey::new([0x42; 32]).unwrap();
+        let (primary, recipients) = recipient_pair();
         let mut plaintext_sink = VecBlockSink::new();
         let _layout = write_rem_tar_object(&mut plaintext_sink, &opts, &files).unwrap();
         replace_once_in_blocks(
@@ -2225,14 +2163,16 @@ mod tests {
         let digest = Sha256::digest(&plaintext);
         let mut plaintext_digest = [0u8; 32];
         plaintext_digest.copy_from_slice(&digest);
-        let seal_options = SealOptions {
-            chunk_size: opts.chunk_size as u32,
-            key_id: [0x24; 16],
-            object_id: opts.object_id.clone(),
-            plaintext_size: plaintext.len() as u64,
-            plaintext_digest,
+        let seal_options = EnvelopeSealOptions {
+            common: SealOptions {
+                chunk_size: opts.chunk_size as u32,
+                object_id: opts.object_id.clone(),
+                plaintext_size: plaintext.len() as u64,
+                plaintext_digest,
+            },
+            recipients,
         };
-        let (sealed, report) = seal_to_vec(&plaintext, &root_key, &seal_options).unwrap();
+        let (sealed, report) = seal_to_vec(&plaintext, &seal_options).unwrap();
         let mut source = VecBlockSource::new(
             sealed
                 .chunks_exact(opts.chunk_size)
@@ -2244,7 +2184,7 @@ mod tests {
             &mut source,
             opts.chunk_size,
             report.stored_size_blocks,
-            &root_key,
+            &primary,
         )
         .unwrap_err();
 
