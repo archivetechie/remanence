@@ -4292,10 +4292,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use ciborium::value::Value as CborValue;
-    use remanence_aead::RootKey;
+    use remanence_aead::{RecipientPrivateKey, RecipientPublicKey};
     #[cfg(feature = "foreign-bru")]
     use remanence_bru::{bru_checksum, BRU_BLOCK_SIZE};
-    use remanence_format::{read_encrypted_rao_object, read_rem_tar_object};
+    use remanence_format::{read_envelope_rao_object, read_rem_tar_object};
     use remanence_library::scsi::{DeviceType, Inquiry};
     use remanence_library::{
         BlockSink, DiscoveryReport, DriveBay, ElementLayout, IdentitySource, IePort,
@@ -4739,6 +4739,27 @@ mod tests {
         dir
     }
 
+    fn recipient_pair(first_epoch: u8) -> (RecipientPrivateKey, Vec<RecipientPublicKey>) {
+        let primary = RecipientPrivateKey::new(
+            [first_epoch; 16],
+            format!("archive-{first_epoch:02x}"),
+            [first_epoch.wrapping_add(1); 32],
+        )
+        .expect("primary recipient key");
+        let recovery_epoch = first_epoch.wrapping_add(1);
+        let recovery = RecipientPrivateKey::new(
+            [recovery_epoch; 16],
+            format!("recovery-{recovery_epoch:02x}"),
+            [recovery_epoch.wrapping_add(1); 32],
+        )
+        .expect("recovery recipient key");
+        let recipients = vec![
+            primary.public_key(0).expect("primary public key"),
+            recovery.public_key(1).expect("recovery public key"),
+        ];
+        (primary, recipients)
+    }
+
     fn state_with_spool(spool_dir: PathBuf, budget_bytes: u64) -> ApiState {
         let mut state = ApiState::new(test_index());
         state.spool_dir = Some(Arc::new(spool_dir));
@@ -4782,7 +4803,7 @@ mod tests {
                 status: "committed".to_string(),
                 pool_id: Some("camera.copy-a".to_string()),
                 representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
-                key_id: None,
+                recipient_epoch_ids: None,
                 metadata_frame_len: None,
                 plaintext_digest: Some(vec![0x33; 32]),
                 stored_digest: Some(vec![0x33; 32]),
@@ -5668,7 +5689,7 @@ BCw3Wyv2UWY=
                     protected_until_ordinal: Some(8),
                     status: "committed".to_string(),
                     representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
-                    key_id: None,
+                    recipient_epoch_ids: None,
                     metadata_frame_len: None,
                     plaintext_digest: Some(vec![0x51; 32]),
                     stored_digest: Some(vec![0x51; 32]),
@@ -5718,7 +5739,7 @@ BCw3Wyv2UWY=
                     protected_until_ordinal: Some(8),
                     status: "committed".to_string(),
                     representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
-                    key_id: None,
+                    recipient_epoch_ids: None,
                     metadata_frame_len: None,
                     plaintext_digest: Some(vec![0x51; 32]),
                     stored_digest: Some(vec![0x51; 32]),
@@ -7221,8 +7242,11 @@ BCw3Wyv2UWY=
         std::fs::write(&source_path, &payload).expect("write source payload");
         let mut tape_sink = VecBlockSink::new();
         let cfg = pool_config("scenario-a");
-        let root_key = RootKey::new([0x31; 32]).expect("root key");
-        let key_id = [0x42; 16];
+        let (primary_key, recipients) = recipient_pair(0x42);
+        let recipient_epoch_ids = vec![
+            "42424242424242424242424242424242".to_string(),
+            "43434343434343434343434343434343".to_string(),
+        ];
 
         let result = write_object_to_pool(
             &mut index,
@@ -7234,10 +7258,7 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-encrypted-no-parity".to_string(),
                 expected_content_sha256: None,
-                representation: PoolWriteRepresentation::Encrypted {
-                    root_key: root_key.clone(),
-                    key_id,
-                },
+                representation: PoolWriteRepresentation::Encrypted { recipients },
             },
         )
         .expect("write encrypted no-parity object");
@@ -7247,7 +7268,10 @@ BCw3Wyv2UWY=
             result.object.copies[0].representation,
             OBJECT_COPY_REPRESENTATION_ENCRYPTED
         );
-        assert_eq!(result.object.copies[0].key_id, Some(key_id));
+        assert_eq!(
+            result.object.copies[0].recipient_epoch_ids,
+            Some(recipient_epoch_ids.clone())
+        );
         let metadata_frame_len = result.object.copies[0]
             .metadata_frame_len
             .expect("metadata frame length");
@@ -7259,11 +7283,13 @@ BCw3Wyv2UWY=
             .expect("encrypted bootstrap row");
         match &bootstrap_row.representation {
             remanence_parity::bootstrap::BootstrapObjectRepresentation::Encrypted {
-                key_id: row_key_id,
+                recipient_epoch_ids: row_recipient_epoch_ids,
                 metadata_frame_len: row_metadata_frame_len,
+                key_frame_len,
             } => {
-                assert_eq!(*row_key_id, key_id);
+                assert_eq!(row_recipient_epoch_ids, &vec![[0x42; 16], [0x43; 16]]);
                 assert_eq!(*row_metadata_frame_len, metadata_frame_len);
+                assert!(*key_frame_len > 0);
             }
             other => panic!("unexpected bootstrap row representation: {other:?}"),
         }
@@ -7278,7 +7304,10 @@ BCw3Wyv2UWY=
             committed.copies[0].representation,
             OBJECT_COPY_REPRESENTATION_ENCRYPTED
         );
-        assert_eq!(committed.copies[0].key_id.as_deref(), Some(&key_id[..]));
+        assert_eq!(
+            committed.copies[0].recipient_epoch_ids.as_deref(),
+            Some(recipient_epoch_ids.as_slice())
+        );
         assert_eq!(
             committed.copies[0].metadata_frame_len,
             Some(metadata_frame_len)
@@ -7288,16 +7317,16 @@ BCw3Wyv2UWY=
             usize::try_from(result.expect_write_report().object_close.data_block_count)
                 .expect("stored block count fits usize");
         let mut source = VecBlockSource::new(tape_sink.blocks[1..1 + stored_block_count].to_vec());
-        let opened = read_encrypted_rao_object(
+        let opened = read_envelope_rao_object(
             &mut source,
             API_SESSION_BLOCK_SIZE as usize,
             result.expect_write_report().object_close.data_block_count,
-            &root_key,
+            &primary_key,
         )
         .expect("decrypt encrypted RAO object");
         let restored = opened.object.entry("payload.bin").expect("payload entry");
         assert_eq!(restored.data, payload);
-        assert_eq!(opened.envelope.header.key_id, key_id);
+        assert_eq!(opened.envelope.header.format_version, 2);
         assert_eq!(
             opened.envelope.header.metadata_frame_len,
             metadata_frame_len
@@ -7486,8 +7515,7 @@ BCw3Wyv2UWY=
         std::fs::write(&encrypted_path, &encrypted_payload).expect("write encrypted source");
         let mut encrypted_sink = VecBlockSink::new();
         let encrypted_cfg = pool_config_with_block_size("custom-encrypted", CUSTOM_BLOCK_SIZE);
-        let root_key = RootKey::new([0x52; 32]).expect("root key");
-        let key_id = [0x62; 16];
+        let (primary_key, recipients) = recipient_pair(0x62);
 
         let encrypted = write_object_to_pool(
             &mut encrypted_index,
@@ -7499,10 +7527,7 @@ BCw3Wyv2UWY=
                 archive_path: "secret.bin".into(),
                 caller_object_id: "caller-custom-block-encrypted".to_string(),
                 expected_content_sha256: None,
-                representation: PoolWriteRepresentation::Encrypted {
-                    root_key: root_key.clone(),
-                    key_id,
-                },
+                representation: PoolWriteRepresentation::Encrypted { recipients },
             },
         )
         .expect("write encrypted custom-block object");
@@ -7534,14 +7559,14 @@ BCw3Wyv2UWY=
         .expect("encrypted object block count fits usize");
         let mut encrypted_source =
             VecBlockSource::new(encrypted_sink.blocks[1..1 + encrypted_block_count].to_vec());
-        let opened = read_encrypted_rao_object(
+        let opened = read_envelope_rao_object(
             &mut encrypted_source,
             CUSTOM_BLOCK_SIZE as usize,
             encrypted
                 .expect_write_report()
                 .object_close
                 .data_block_count,
-            &root_key,
+            &primary_key,
         )
         .expect("decrypt encrypted custom-block RAO object");
         assert_eq!(opened.envelope.header.chunk_size, CUSTOM_BLOCK_SIZE);
@@ -7575,8 +7600,7 @@ BCw3Wyv2UWY=
         let cfg = pool_config("scenario-a");
         let selected = select_tape_in_pool(&index, &cfg, payload.len() as u64, &HashSet::new())
             .expect("select no-parity tape");
-        let root_key = RootKey::new([0x31; 32]).expect("root key");
-        let key_id = [0x42; 16];
+        let (_primary_key, recipients) = recipient_pair(0x42);
         let mut tape_sink = FailAfterBlocksSink::new(1);
 
         let err = write_to_selected_tape(
@@ -7589,7 +7613,7 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-encrypted-transfer-fail".to_string(),
                 expected_content_sha256: None,
-                representation: PoolWriteRepresentation::Encrypted { root_key, key_id },
+                representation: PoolWriteRepresentation::Encrypted { recipients },
             },
             selected,
         )

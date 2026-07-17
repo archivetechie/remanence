@@ -15,6 +15,7 @@
 pub mod error {
     pub use remanence_format_driver::{FormatError, FormatGate};
 }
+mod envelope;
 pub mod layout;
 mod manifest;
 pub mod model;
@@ -24,6 +25,10 @@ pub mod reader;
 pub mod tar;
 pub mod writer;
 
+pub use envelope::{
+    covering_envelope_rao_stored_range, open_envelope_rao_range_from_reader,
+    open_envelope_rao_stream, seal_envelope_rao_stream,
+};
 pub use error::{FormatError, FormatGate};
 pub use layout::{plan_rem_tar_object, RemTarObjectLayout};
 #[cfg(feature = "fuzzing")]
@@ -34,12 +39,15 @@ pub use model::{
     MANIFEST_PATH, SCHEMA_VERSION, SCHEMA_VERSION_XATTRS, TAR_RECORD_SIZE,
 };
 pub use pfr::{
-    plan_plaintext_rao_file_range, read_encrypted_rao_file_range_to_vec, validate_file_range,
-    EncryptedRaoFileRange, PlaintextRaoFileRangePlan,
+    plan_plaintext_rao_file_range, read_encrypted_rao_file_range_to_vec,
+    read_envelope_rao_file_range_to_vec, validate_file_range, EncryptedRaoFileRange,
+    PlaintextRaoFileRangePlan,
 };
 pub use reader::{
     read_encrypted_rao_object, read_encrypted_rao_object_with_manifest_anchor,
     read_encrypted_rao_object_with_mode, read_encrypted_rao_object_with_mode_and_manifest_anchor,
+    read_envelope_rao_object, read_envelope_rao_object_with_manifest_anchor,
+    read_envelope_rao_object_with_mode, read_envelope_rao_object_with_mode_and_manifest_anchor,
     read_rem_tar_object, read_rem_tar_object_with_manifest_anchor, read_rem_tar_object_with_mode,
     read_rem_tar_object_with_mode_and_manifest_anchor, stream_rem_tar_object,
     stream_rem_tar_object_with_manifest_anchor, stream_rem_tar_object_with_mode,
@@ -55,6 +63,7 @@ pub use remanence_format_driver::{
     SourceRequirement, StreamReport,
 };
 pub use writer::{
-    write_encrypted_rao_object, write_encrypted_rao_object_from_readers, write_rem_tar_object,
+    write_encrypted_rao_object, write_encrypted_rao_object_from_readers, write_envelope_rao_object,
+    write_envelope_rao_object_from_readers, write_rem_tar_object,
     write_rem_tar_object_from_readers, BodyBlockWriter, EncryptedRaoWriteReport,
 };

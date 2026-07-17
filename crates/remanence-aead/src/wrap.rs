@@ -22,12 +22,12 @@ type Kdf = HkdfSha256;
 type Aead = ChaCha20Poly1305;
 
 /// OS-seeded, zeroize-on-drop CSPRNG for arbitrary-length HPKE entropy draws.
-struct EphemeralRng {
+pub(crate) struct EphemeralRng {
     inner: ChaCha20,
 }
 
 impl EphemeralRng {
-    fn from_os() -> Result<Self> {
+    pub(crate) fn from_os() -> Result<Self> {
         let mut seed = [0u8; 32];
         if getrandom::fill(&mut seed).is_err() {
             seed.zeroize();
@@ -38,7 +38,7 @@ impl EphemeralRng {
         Ok(inner)
     }
 
-    fn from_seed(seed: &[u8; 32]) -> Self {
+    pub(crate) fn from_seed(seed: &[u8; 32]) -> Self {
         // The zeroize-enabled ChaCha20 core and its buffered wrapper both wipe
         // their state on drop. A random key with this fixed nonce defines an
         // independent stream for each ephemeral generator.
@@ -289,15 +289,15 @@ pub fn wrap_info(
 }
 
 /// Wrap one DEK to all recipients, failing closed if any slot fails.
-pub fn wrap_dek(
+pub fn wrap_dek<R: CryptoRng + RngCore>(
     dek: &DataEncryptionKey,
     object_id: &str,
     recipients: &[RecipientPublicKey],
+    rng: &mut R,
 ) -> Result<KeyFrame> {
     let mut slots = Vec::with_capacity(recipients.len());
     for recipient in recipients {
-        let mut rng = EphemeralRng::from_os()?;
-        slots.push(wrap_recipient(dek, object_id, recipient, &mut rng)?);
+        slots.push(wrap_recipient(dek, object_id, recipient, rng)?);
     }
     KeyFrame::new(slots)
 }
@@ -459,7 +459,11 @@ mod tests {
         let secret = RecipientPrivateKey::new([3; 16], "safe-2026", [7; 32]).unwrap();
         let public = secret.public_key(0).unwrap();
         let dek = DataEncryptionKey::from_bytes([9; 32]);
-        let frame = wrap_dek(&dek, "object-a", &[public]).unwrap();
+        let mut rng = CountingByteRng {
+            byte: 0x42,
+            bytes_generated: 0,
+        };
+        let frame = wrap_dek(&dek, "object-a", &[public], &mut rng).unwrap();
         assert_eq!(
             unwrap_dek(&frame, "object-a", &secret).unwrap().as_bytes(),
             &[9; 32]

@@ -53,7 +53,7 @@ use std::time::{Duration as StdDuration, Instant as StdInstant};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use remanence_aead::{
     covering_stored_range, header::object_id_field, inspect_bytes, open,
-    open_plaintext_range_from_reader, open_to_vec, seal_envelope, EnvelopeSealOptions, RaoHeader,
+    open_plaintext_range_from_reader, open_to_vec, EnvelopeSealOptions, RaoHeader,
     RecipientPublicKey, RootKey, SealOptions, RAO_HEADER_LEN,
 };
 use remanence_api::pb;
@@ -1879,6 +1879,10 @@ struct RemArchiveBuildArgs {
     #[arg(long, value_name = "HEX", requires = "encrypt")]
     key_id: Option<String>,
 
+    /// Canonical RAOR recipient public-key file; repeat 2 to 8 times.
+    #[arg(long = "recipient", value_name = "RAOR")]
+    recipients: Vec<PathBuf>,
+
     /// Object id to record in the RAO global header (default: fresh UUID).
     #[arg(long, value_name = "ID")]
     object_id: Option<String>,
@@ -1935,6 +1939,10 @@ struct RemArchiveExtractArgs {
     #[arg(long, value_name = "PATH")]
     key_file: Option<PathBuf>,
 
+    /// Canonical RAOP private-key file. Required for v2 encrypted objects.
+    #[arg(long, value_name = "PATH")]
+    private_key: Option<PathBuf>,
+
     /// Archive member path for byte-range extraction.
     #[arg(long = "path", value_name = "RAO_PATH")]
     path: Option<String>,
@@ -1973,7 +1981,11 @@ struct RemArchiveExtractArgs {
 struct RemArchiveExtractStreamArgs {
     /// 32-byte root key file used to decrypt the encrypted RAO stream.
     #[arg(long, value_name = "PATH")]
-    key_file: PathBuf,
+    key_file: Option<PathBuf>,
+
+    /// Canonical RAOP private-key file used to decrypt the v2 envelope.
+    #[arg(long, value_name = "PATH")]
+    private_key: Option<PathBuf>,
 
     /// Absolute plaintext byte range to write, formatted as start:length.
     #[arg(long = "range", value_name = "START:LEN", value_parser = parse_archive_byte_range)]
@@ -2003,7 +2015,11 @@ struct RemArchiveExtractStreamArgs {
 struct RemArchiveCoveringRangeArgs {
     /// 32-byte root key file used to authenticate the envelope prefix.
     #[arg(long, value_name = "PATH")]
-    key_file: PathBuf,
+    key_file: Option<PathBuf>,
+
+    /// Canonical RAOP private-key file used to authenticate the v2 envelope.
+    #[arg(long, value_name = "PATH")]
+    private_key: Option<PathBuf>,
 
     /// Expected encrypted object identifier.
     #[arg(long, value_name = "ID")]
@@ -2053,6 +2069,10 @@ struct RemArchiveWriteArgs {
     #[arg(long, value_name = "HEX", requires = "encrypt")]
     key_id: Option<String>,
 
+    /// Canonical RAOR recipient public-key file; repeat 2 to 8 times.
+    #[arg(long = "recipient", value_name = "RAOR")]
+    recipients: Vec<PathBuf>,
+
     /// Emit the locator as one JSON line to stdout (seam contract §4).
     #[arg(long)]
     json: bool,
@@ -2080,6 +2100,10 @@ struct RemArchiveReadArgs {
     /// 32-byte root key file. Required for encrypted object copies.
     #[arg(long, value_name = "PATH")]
     key_file: Option<PathBuf>,
+
+    /// Canonical RAOP private-key file. Required for v2 encrypted copies.
+    #[arg(long, value_name = "PATH")]
+    private_key: Option<PathBuf>,
 
     /// Path to `/etc/rem/config.toml`.
     #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
@@ -2124,6 +2148,10 @@ struct RemArchiveVerifyArgs {
     /// 32-byte root key file. Required for encrypted object copies.
     #[arg(long, value_name = "PATH")]
     key_file: Option<PathBuf>,
+
+    /// Canonical RAOP private-key file. Required for v2 encrypted copies.
+    #[arg(long, value_name = "PATH")]
+    private_key: Option<PathBuf>,
 
     /// Path to `/etc/rem/config.toml`.
     #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
@@ -2247,6 +2275,7 @@ impl From<RemArchiveBuildArgs> for ArchiveBuildArgs {
             encrypt: value.encrypt,
             key_file: value.key_file,
             key_id: value.key_id,
+            recipients: value.recipients,
             object_id: value.object_id,
             caller_object_id: value.caller_object_id,
             manifest_file_id: value.manifest_file_id,
@@ -2273,6 +2302,7 @@ impl From<RemArchiveExtractArgs> for ArchiveExtractArgs {
             dest: value.dest,
             chunk_size: value.chunk_size,
             key_file: value.key_file,
+            private_key: value.private_key,
             path: value.path,
             first_chunk_lba: value.first_chunk_lba,
             file_size_bytes: value.file_size_bytes,
@@ -2289,6 +2319,7 @@ impl From<RemArchiveExtractStreamArgs> for ArchiveExtractStreamArgs {
     fn from(value: RemArchiveExtractStreamArgs) -> Self {
         Self {
             key_file: value.key_file,
+            private_key: value.private_key,
             range: value.range,
             authenticated_prefix: value.authenticated_prefix,
             stored_range_start: value.stored_range_start,
@@ -2300,6 +2331,7 @@ impl From<RemArchiveCoveringRangeArgs> for ArchiveCoveringRangeArgs {
     fn from(value: RemArchiveCoveringRangeArgs) -> Self {
         Self {
             key_file: value.key_file,
+            private_key: value.private_key,
             object_id: value.object_id,
             file_id: value.file_id,
             range: value.range,
@@ -2318,6 +2350,7 @@ impl From<RemArchiveWriteArgs> for ArchiveWriteArgs {
             encrypt: value.encrypt,
             key_file: value.key_file,
             key_id: value.key_id,
+            recipients: value.recipients,
             json_output: value.json,
             config: value.config,
         }
@@ -2331,6 +2364,7 @@ impl From<RemArchiveReadArgs> for ArchiveReadArgs {
             locator: value.locator,
             out: value.out,
             key_file: value.key_file,
+            private_key: value.private_key,
             config: value.config,
         }
     }
@@ -2354,6 +2388,7 @@ impl From<RemArchiveVerifyArgs> for ArchiveVerifyArgs {
             locator: value.locator,
             expected_sha256: value.expected_sha256,
             key_file: value.key_file,
+            private_key: value.private_key,
             config: value.config,
         }
     }
@@ -2471,7 +2506,11 @@ struct ArchiveResealArgs {
 
     /// Registry root-key file used by the v1 object.
     #[arg(long, value_name = "PATH")]
-    registry_key: PathBuf,
+    registry_key: Option<PathBuf>,
+
+    /// Canonical RAOP private-key file used to open the v2 input object.
+    #[arg(long, value_name = "PATH")]
+    private_key: Option<PathBuf>,
 
     /// Canonical RAOR recipient public-key files, in ascending slot order.
     #[arg(long = "recipient", value_name = "PATH", num_args = 2..=8)]
@@ -2564,6 +2603,10 @@ struct ArchiveBuildArgs {
     #[arg(long, value_name = "HEX", requires = "encrypt")]
     key_id: Option<String>,
 
+    /// Canonical RAOR recipient public-key file; repeat 2 to 8 times.
+    #[arg(long = "recipient", value_name = "RAOR")]
+    recipients: Vec<PathBuf>,
+
     /// Object id to record in the RAO global header (default: fresh UUID).
     #[arg(long, value_name = "ID")]
     object_id: Option<String>,
@@ -2620,6 +2663,10 @@ struct ArchiveExtractArgs {
     #[arg(long, value_name = "PATH")]
     key_file: Option<PathBuf>,
 
+    /// Canonical RAOP private-key file. Required for v2 encrypted objects.
+    #[arg(long, value_name = "PATH")]
+    private_key: Option<PathBuf>,
+
     /// Archive member path for byte-range extraction.
     #[arg(long = "path", value_name = "RAO_PATH")]
     path: Option<String>,
@@ -2658,7 +2705,11 @@ struct ArchiveExtractArgs {
 struct ArchiveExtractStreamArgs {
     /// 32-byte root key file used to decrypt the encrypted RAO stream.
     #[arg(long, value_name = "PATH")]
-    key_file: PathBuf,
+    key_file: Option<PathBuf>,
+
+    /// Canonical RAOP private-key file used to decrypt the v2 envelope.
+    #[arg(long, value_name = "PATH")]
+    private_key: Option<PathBuf>,
 
     /// Absolute plaintext byte range to write, formatted as start:length.
     #[arg(long = "range", value_name = "START:LEN", value_parser = parse_archive_byte_range)]
@@ -2688,7 +2739,11 @@ struct ArchiveExtractStreamArgs {
 struct ArchiveCoveringRangeArgs {
     /// 32-byte root key file used to authenticate the envelope prefix.
     #[arg(long, value_name = "PATH")]
-    key_file: PathBuf,
+    key_file: Option<PathBuf>,
+
+    /// Canonical RAOP private-key file used to authenticate the v2 envelope.
+    #[arg(long, value_name = "PATH")]
+    private_key: Option<PathBuf>,
 
     /// Expected encrypted object identifier.
     #[arg(long, value_name = "ID")]
@@ -2739,6 +2794,10 @@ struct ArchiveWriteArgs {
     #[arg(long, value_name = "HEX", requires = "encrypt")]
     key_id: Option<String>,
 
+    /// Canonical RAOR recipient public-key file; repeat 2 to 8 times.
+    #[arg(long = "recipient", value_name = "RAOR")]
+    recipients: Vec<PathBuf>,
+
     /// Emit the locator as one JSON line to stdout (seam contract §4).
     #[arg(long = "json")]
     json_output: bool,
@@ -2766,6 +2825,10 @@ struct ArchiveReadArgs {
     /// 32-byte root key file. Required for encrypted object copies.
     #[arg(long, value_name = "PATH")]
     key_file: Option<PathBuf>,
+
+    /// Canonical RAOP private-key file. Required for v2 encrypted copies.
+    #[arg(long, value_name = "PATH")]
+    private_key: Option<PathBuf>,
 
     /// Path to `/etc/rem/config.toml`.
     #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
@@ -2810,6 +2873,10 @@ struct ArchiveVerifyArgs {
     /// 32-byte root key file. Required for encrypted object copies.
     #[arg(long, value_name = "PATH")]
     key_file: Option<PathBuf>,
+
+    /// Canonical RAOP private-key file. Required for v2 encrypted copies.
+    #[arg(long, value_name = "PATH")]
+    private_key: Option<PathBuf>,
 
     /// Path to `/etc/rem/config.toml`.
     #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
@@ -3622,6 +3689,7 @@ where
                             encrypt: args.encrypt,
                             key_file: args.key_file.clone(),
                             key_id: args.key_id.clone(),
+                            recipients: args.recipients.clone(),
                             json_output: args.json_output,
                             config: args.config.clone(),
                         },
@@ -3640,6 +3708,7 @@ where
                         locator: args.locator.clone(),
                         out: args.out.clone(),
                         key_file: args.key_file.clone(),
+                        private_key: args.private_key.clone(),
                         config: args.config.clone(),
                     },
                     &allow,
@@ -3671,6 +3740,7 @@ where
                         locator: args.locator.clone(),
                         expected_sha256: args.expected_sha256.clone(),
                         key_file: args.key_file.clone(),
+                        private_key: args.private_key.clone(),
                         config: args.config.clone(),
                     },
                     &allow,
@@ -3810,45 +3880,17 @@ where
         return Err(format!("--out {} already exists", args.out.display()));
     }
     let mut encrypted = File::open(&args.object)
-        .map_err(|error| format!("open v1 object {}: {error}", args.object.display()))?;
+        .map_err(|error| format!("open encrypted object {}: {error}", args.object.display()))?;
     let mut header_bytes = [0u8; RAO_HEADER_LEN];
     encrypted
         .read_exact(&mut header_bytes)
-        .map_err(|error| format!("read v1 object header: {error}"))?;
+        .map_err(|error| format!("read encrypted object header: {error}"))?;
     let input_header = RaoHeader::parse(&header_bytes)
-        .map_err(|error| format!("parse v1 object header: {error}"))?;
-    if input_header.format_version != 1 {
-        return Err("archive reseal accepts only a v1 registry object as input".to_string());
-    }
+        .map_err(|error| format!("parse encrypted object header: {error}"))?;
     encrypted
         .seek(SeekFrom::Start(0))
-        .map_err(|error| format!("rewind v1 object: {error}"))?;
-    let mut recipients = Vec::with_capacity(args.recipients.len());
-    for path in &args.recipients {
-        let bytes = fs::read(path)
-            .map_err(|error| format!("read recipient {}: {error}", path.display()))?;
-        recipients.push(
-            RecipientPublicKey::parse(&bytes)
-                .map_err(|error| format!("parse recipient {}: {error}", path.display()))?,
-        );
-    }
-    if recipients.len() < 2
-        || recipients
-            .windows(2)
-            .any(|pair| pair[0].slot_index >= pair[1].slot_index)
-        || recipients.iter().enumerate().any(|(index, recipient)| {
-            recipients[..index]
-                .iter()
-                .any(|earlier| earlier.recipient_epoch_id == recipient.recipient_epoch_id)
-        })
-    {
-        return Err(
-            "recipients must contain at least two distinct epochs in ascending slot order"
-                .to_string(),
-        );
-    }
-
-    let registry_key = read_root_key_file(&args.registry_key)?;
+        .map_err(|error| format!("rewind encrypted object: {error}"))?;
+    let recipients = read_recipient_public_key_files(&args.recipients)?;
     let staging_dir = args
         .staging_dir
         .as_deref()
@@ -3859,8 +3901,37 @@ where
         })
         .unwrap_or_else(|| Path::new("."));
     let mut plaintext = SecurePlaintextStage::new_in(staging_dir)?;
-    let opened = open(&mut encrypted, plaintext.as_file_mut(), &registry_key)
-        .map_err(|error| format!("open v1 object: {error}"))?;
+    let opened = match input_header.format_version {
+        1 => {
+            if args.private_key.is_some() {
+                return Err("v1 reseal input requires --registry-key".to_string());
+            }
+            let registry_key_path = args
+                .registry_key
+                .as_deref()
+                .ok_or_else(|| "v1 reseal input requires --registry-key".to_string())?;
+            let registry_key = read_root_key_file(registry_key_path)?;
+            open(&mut encrypted, plaintext.as_file_mut(), &registry_key)
+                .map_err(|error| format!("open v1 object: {error}"))?
+        }
+        2 => {
+            if args.registry_key.is_some() {
+                return Err("v2 reseal input requires --private-key".to_string());
+            }
+            let private_key_path = args
+                .private_key
+                .as_deref()
+                .ok_or_else(|| "v2 reseal input requires --private-key".to_string())?;
+            let private_key = read_private_key_file(private_key_path)?;
+            remanence_format::open_envelope_rao_stream(
+                &mut encrypted,
+                plaintext.as_file_mut(),
+                &private_key,
+            )
+            .map_err(|error| format!("open v2 object: {error}"))?
+        }
+        other => return Err(format!("unsupported reseal input format version {other}")),
+    };
     plaintext
         .as_file_mut()
         .seek(SeekFrom::Start(0))
@@ -3889,7 +3960,11 @@ where
         .create_new(true)
         .open(&temp)
         .map_err(|error| format!("create {}: {error}", temp.display()))?;
-    let report = match seal_envelope(plaintext.as_file_mut(), &mut file, &seal_options) {
+    let report = match remanence_format::seal_envelope_rao_stream(
+        plaintext.as_file_mut(),
+        &mut file,
+        &seal_options,
+    ) {
         Ok(report) => report,
         Err(error) => {
             drop(file);
@@ -3923,10 +3998,13 @@ where
             "input": args.object,
             "output": args.out,
             "object_id": report.header.object_id,
-            "input_format_version": 1,
+            "chunk_size": report.header.chunk_size,
+            "plaintext_digest": bytes_to_hex(&report.plaintext.digest),
+            "input_format_version": input_header.format_version,
             "output_format_version": 2,
-            "recipient_epochs": report.key_frame.as_ref().expect("v2 seal has key frame")
-                .slots.iter().map(|slot| slot.epoch_label.as_str()).collect::<Vec<_>>(),
+            "recipient_epochs": recipient_epochs_json(
+                report.key_frame.as_ref().expect("v2 seal has key frame")
+            ),
             "stored_size_bytes": report.stored_size_bytes,
             "expected_sha256": bytes_to_hex(&report.stored_digest),
             "published_sha256": bytes_to_hex(&staged_digest),
@@ -9836,10 +9914,24 @@ fn run_archive_covering_range(
     err: &mut dyn Write,
 ) -> ExitCode {
     let result = (|| -> Result<Value, String> {
-        let root_key = read_root_key_file(&args.key_file)?;
+        let key = encrypted_stream_key(args.key_file.as_deref(), args.private_key.as_deref())?;
         let prefix = read_rao_authenticated_prefix(input)?;
-        let plan = covering_stored_range(&prefix, &root_key, args.range.start, args.range.len)
-            .map_err(|error| format!("authenticate and map encrypted RAO range: {error}"))?;
+        let plan = match &key {
+            EncryptedArchiveKey::Registry(root_key) => {
+                covering_stored_range(&prefix, root_key, args.range.start, args.range.len).map_err(
+                    |error| format!("authenticate and map v1 encrypted RAO range: {error}"),
+                )?
+            }
+            EncryptedArchiveKey::Recipient(recipient) => {
+                remanence_format::covering_envelope_rao_stored_range(
+                    &prefix,
+                    recipient,
+                    args.range.start,
+                    args.range.len,
+                )
+                .map_err(|error| format!("authenticate and map v2 encrypted RAO range: {error}"))?
+            }
+        };
         let stored_range_end = plan
             .stored_range_start
             .and_then(|start| start.checked_add(plan.stored_range_len));
@@ -9889,7 +9981,7 @@ fn run_archive_extract_stream(
     err: &mut dyn Write,
 ) -> ExitCode {
     let result = (|| -> Result<Value, String> {
-        let root_key = read_root_key_file(&args.key_file)?;
+        let key = encrypted_stream_key(args.key_file.as_deref(), args.private_key.as_deref())?;
         if let (Some(prefix_path), Some(stored_range_start), Some(range)) = (
             args.authenticated_prefix.as_deref(),
             args.stored_range_start,
@@ -9902,16 +9994,30 @@ fn run_archive_extract_stream(
                 )
             })?;
             let prefix = read_rao_authenticated_prefix(&mut prefix_file)?;
-            let report = open_plaintext_range_from_reader(
-                &prefix,
-                input,
-                stored_range_start,
-                out,
-                &root_key,
-                range.start,
-                range.len,
-            )
-            .map_err(|error| format!("decrypt ranged encrypted RAO stream: {error}"))?;
+            let report = match &key {
+                EncryptedArchiveKey::Registry(root_key) => open_plaintext_range_from_reader(
+                    &prefix,
+                    input,
+                    stored_range_start,
+                    out,
+                    root_key,
+                    range.start,
+                    range.len,
+                )
+                .map_err(|error| format!("decrypt ranged v1 RAO stream: {error}"))?,
+                EncryptedArchiveKey::Recipient(recipient) => {
+                    remanence_format::open_envelope_rao_range_from_reader(
+                        &prefix,
+                        input,
+                        stored_range_start,
+                        out,
+                        recipient,
+                        range.start,
+                        range.len,
+                    )
+                    .map_err(|error| format!("decrypt ranged v2 RAO stream: {error}"))?
+                }
+            };
             out.flush()
                 .map_err(|error| format!("flush plaintext stdout: {error}"))?;
             return Ok(json!({
@@ -9919,7 +10025,8 @@ fn run_archive_extract_stream(
                 "status": "ok",
                 "mode": "ranged-ciphertext",
                 "object_id": report.header.object_id,
-                "key_id": bytes_to_hex(&report.header.key_id),
+                "key_id": (report.header.format_version == 1)
+                    .then(|| bytes_to_hex(&report.header.key_id)),
                 "chunk_size": report.header.chunk_size,
                 "plaintext_size_bytes": report.metadata.plaintext_size,
                 "plaintext_sha256": bytes_to_hex(&report.metadata.plaintext_digest),
@@ -9939,8 +10046,14 @@ fn run_archive_extract_stream(
                 .checked_add(range.len)
                 .ok_or_else(|| "--range arithmetic overflow".to_string())?;
             let mut selected = PlaintextRangeWriter::new(out, range.start, requested_end);
-            let report = open(input, &mut selected, &root_key)
-                .map_err(|error| format!("decrypt encrypted RAO stream: {error}"))?;
+            let report = match &key {
+                EncryptedArchiveKey::Registry(root_key) => open(input, &mut selected, root_key)
+                    .map_err(|error| format!("decrypt v1 RAO stream: {error}"))?,
+                EncryptedArchiveKey::Recipient(recipient) => {
+                    remanence_format::open_envelope_rao_stream(input, &mut selected, recipient)
+                        .map_err(|error| format!("decrypt v2 RAO stream: {error}"))?
+                }
+            };
             selected
                 .flush()
                 .map_err(|error| format!("flush plaintext stdout: {error}"))?;
@@ -9952,8 +10065,14 @@ fn run_archive_extract_stream(
             }
             (report, selected.bytes_written())
         } else {
-            let report = open(input, &mut *out, &root_key)
-                .map_err(|error| format!("decrypt encrypted RAO stream: {error}"))?;
+            let report = match &key {
+                EncryptedArchiveKey::Registry(root_key) => open(input, &mut *out, root_key)
+                    .map_err(|error| format!("decrypt v1 RAO stream: {error}"))?,
+                EncryptedArchiveKey::Recipient(recipient) => {
+                    remanence_format::open_envelope_rao_stream(input, &mut *out, recipient)
+                        .map_err(|error| format!("decrypt v2 RAO stream: {error}"))?
+                }
+            };
             out.flush()
                 .map_err(|error| format!("flush plaintext stdout: {error}"))?;
             let size = report.plaintext.size;
@@ -9964,7 +10083,10 @@ fn run_archive_extract_stream(
             "command": "archive extract-stream",
             "status": "ok",
             "object_id": report.header.object_id,
-            "key_id": bytes_to_hex(&report.header.key_id),
+            "key_id": (report.header.format_version == 1)
+                .then(|| bytes_to_hex(&report.header.key_id)),
+            "recipient_epochs": report.key_frame.as_ref().map(recipient_epochs_json),
+            "format_version": report.header.format_version,
             "chunk_size": report.header.chunk_size,
             "stored_size_bytes": report.stored_size_bytes,
             "plaintext_size_bytes": report.plaintext.size,
@@ -10096,7 +10218,11 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
         );
     }
     if args.scan_only {
-        if args.encrypt || args.key_file.is_some() || args.key_id.is_some() {
+        if args.encrypt
+            || args.key_file.is_some()
+            || args.key_id.is_some()
+            || !args.recipients.is_empty()
+        {
             return Err("--scan-only cannot be combined with encryption options".to_string());
         }
         if args.manifest_out.is_some() {
@@ -10140,7 +10266,7 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
         .manifest_file_id
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    if args.encrypt {
+    if args.encrypt || !args.recipients.is_empty() {
         object_id_field(&object_id)
             .map_err(|error| format!("--object-id is invalid for encrypted RAO: {error}"))?;
     }
@@ -10206,7 +10332,43 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
     let build_result = (|| {
         let mut sink = FileBlockSink::create(&temp_path, args.chunk_size)
             .map_err(|error| format!("create {}: {error}", temp_path.display()))?;
-        if args.encrypt {
+        if !args.recipients.is_empty() {
+            if args.encrypt || args.key_file.is_some() || args.key_id.is_some() {
+                return Err(
+                    "--recipient cannot be combined with --encrypt/--key-file/--key-id".to_string(),
+                );
+            }
+            let recipients = read_recipient_public_key_files(&args.recipients)?;
+            let mut readers = open_archive_build_readers(&inputs)?;
+            let mut streams = archive_build_streams(&inputs, &mut readers);
+            let report = remanence_format::write_envelope_rao_object_from_readers(
+                &mut sink,
+                &options,
+                &mut streams,
+                &recipients,
+            )
+            .map_err(|error| format!("write v2 encrypted RAO: {error}"))?;
+            sink.sync_all()
+                .map_err(|error| format!("sync {}: {error}", temp_path.display()))?;
+            Ok(ArchiveBuildResult {
+                layout: report.plaintext_layout,
+                representation: "encrypted",
+                encryption: "RAO1",
+                format_version: Some(2),
+                key_id: None,
+                recipient_epochs: Some(recipient_epochs_json(
+                    report
+                        .envelope
+                        .key_frame
+                        .as_ref()
+                        .expect("v2 seal report carries key frame"),
+                )),
+                stored_digest: report.envelope.stored_digest,
+                plaintext_digest: report.envelope.plaintext.digest,
+                stored_size_bytes: report.envelope.stored_size_bytes,
+                stored_size_blocks: report.envelope.stored_size_blocks,
+            })
+        } else if args.encrypt {
             let key_path = args
                 .key_file
                 .as_ref()
@@ -10229,7 +10391,9 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
                 layout: report.plaintext_layout,
                 representation: "encrypted",
                 encryption: "RAO1",
+                format_version: Some(1),
                 key_id: Some(key_id),
+                recipient_epochs: None,
                 stored_digest: report.envelope.stored_digest,
                 plaintext_digest: report.envelope.plaintext.digest,
                 stored_size_bytes: report.envelope.stored_size_bytes,
@@ -10252,7 +10416,9 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
                 layout,
                 representation: "plaintext",
                 encryption: "none",
+                format_version: None,
                 key_id: None,
+                recipient_epochs: None,
                 stored_digest,
                 plaintext_digest: stored_digest,
             })
@@ -10328,8 +10494,8 @@ fn extract_archive_object_file(args: &ArchiveExtractArgs) -> Result<Value, Strin
     if archive_object_is_encrypted(&args.object)? {
         extract_encrypted_archive_object_file(args)
     } else {
-        if args.key_file.is_some() {
-            return Err("--key-file is only valid for encrypted RAO objects".to_string());
+        if args.key_file.is_some() || args.private_key.is_some() {
+            return Err("key options are only valid for encrypted RAO objects".to_string());
         }
         extract_plaintext_archive_object_file(args)
     }
@@ -10452,6 +10618,101 @@ fn extract_plaintext_archive_object_file(args: &ArchiveExtractArgs) -> Result<Va
     Ok(value)
 }
 
+enum EncryptedArchiveKey {
+    Registry(RootKey),
+    Recipient(remanence_aead::RecipientPrivateKey),
+}
+
+fn encrypted_stream_key(
+    key_file: Option<&Path>,
+    private_key: Option<&Path>,
+) -> Result<EncryptedArchiveKey, String> {
+    match (key_file, private_key) {
+        (Some(_), Some(_)) => {
+            Err("--key-file and --private-key are mutually exclusive".to_string())
+        }
+        (Some(path), None) => read_root_key_file(path).map(EncryptedArchiveKey::Registry),
+        (None, Some(path)) => read_private_key_file(path).map(EncryptedArchiveKey::Recipient),
+        (None, None) => Err("encrypted RAO operation requires --private-key".to_string()),
+    }
+}
+
+fn encrypted_archive_key(
+    args: &ArchiveExtractArgs,
+    format_version: u8,
+) -> Result<EncryptedArchiveKey, String> {
+    match format_version {
+        1 => {
+            if args.private_key.is_some() {
+                return Err("v1 encrypted RAO objects require --key-file".to_string());
+            }
+            let path = args
+                .key_file
+                .as_deref()
+                .ok_or_else(|| "v1 encrypted RAO extract requires --key-file".to_string())?;
+            read_root_key_file(path).map(EncryptedArchiveKey::Registry)
+        }
+        2 => {
+            if args.key_file.is_some() {
+                return Err("v2 encrypted RAO objects require --private-key".to_string());
+            }
+            let path = args
+                .private_key
+                .as_deref()
+                .ok_or_else(|| "v2 encrypted RAO extract requires --private-key".to_string())?;
+            read_private_key_file(path).map(EncryptedArchiveKey::Recipient)
+        }
+        other => Err(format!("unsupported encrypted RAO format version {other}")),
+    }
+}
+
+fn open_encrypted_archive_bytes(
+    encrypted: &[u8],
+    key: &EncryptedArchiveKey,
+) -> Result<(Vec<u8>, remanence_aead::OpenReport), String> {
+    match key {
+        EncryptedArchiveKey::Registry(root_key) => open_to_vec(encrypted, root_key)
+            .map_err(|error| format!("open v1 encrypted RAO: {error}")),
+        EncryptedArchiveKey::Recipient(recipient) => {
+            let mut plaintext = Vec::new();
+            let envelope =
+                remanence_format::open_envelope_rao_stream(encrypted, &mut plaintext, recipient)
+                    .map_err(|error| format!("open v2 encrypted RAO: {error}"))?;
+            Ok((plaintext, envelope))
+        }
+    }
+}
+
+fn read_encrypted_archive_file_range(
+    encrypted: &[u8],
+    key: &EncryptedArchiveKey,
+    first_chunk_lba: Option<BodyLba>,
+    file_size_bytes: u64,
+    range_start: u64,
+    range_len: u64,
+) -> Result<remanence_format::EncryptedRaoFileRange, FormatError> {
+    match key {
+        EncryptedArchiveKey::Registry(root_key) => read_encrypted_rao_file_range_to_vec(
+            encrypted,
+            root_key,
+            first_chunk_lba,
+            file_size_bytes,
+            range_start,
+            range_len,
+        ),
+        EncryptedArchiveKey::Recipient(recipient) => {
+            remanence_format::read_envelope_rao_file_range_to_vec(
+                encrypted,
+                recipient,
+                first_chunk_lba,
+                file_size_bytes,
+                range_start,
+                range_len,
+            )
+        }
+    }
+}
+
 fn extract_encrypted_archive_object_file(args: &ArchiveExtractArgs) -> Result<Value, String> {
     let (range_path, range) = archive_extract_range_request(args)?;
     if args.blob_member.is_some() {
@@ -10467,16 +10728,11 @@ fn extract_encrypted_archive_object_file(args: &ArchiveExtractArgs) -> Result<Va
             range,
         );
     }
-    let key_path = args
-        .key_file
-        .as_deref()
-        .ok_or_else(|| "encrypted RAO extract requires --key-file".to_string())?;
     let encrypted = read_archive_object_bytes(&args.object)?;
     let inspected =
         inspect_bytes(&encrypted).map_err(|error| format!("inspect encrypted RAO: {error}"))?;
-    let root_key = read_root_key_file(key_path)?;
-    let (plaintext, envelope) = open_to_vec(&encrypted, &root_key)
-        .map_err(|error| format!("open encrypted RAO: {error}"))?;
+    let key = encrypted_archive_key(args, inspected.header.format_version)?;
+    let (plaintext, envelope) = open_encrypted_archive_bytes(&encrypted, &key)?;
     if envelope.header != inspected.header {
         return Err("encrypted header changed between inspect and open".to_string());
     }
@@ -10538,16 +10794,11 @@ fn attach_unwrap_report(
 }
 
 fn extract_encrypted_blob_member_file(args: &ArchiveExtractArgs) -> Result<Value, String> {
-    let key_path = args
-        .key_file
-        .as_deref()
-        .ok_or_else(|| "encrypted RAO blob-member extract requires --key-file".to_string())?;
     let encrypted = read_archive_object_bytes(&args.object)?;
     let inspected =
         inspect_bytes(&encrypted).map_err(|error| format!("inspect encrypted RAO: {error}"))?;
-    let root_key = read_root_key_file(key_path)?;
-    let (plaintext, envelope) = open_to_vec(&encrypted, &root_key)
-        .map_err(|error| format!("open encrypted RAO: {error}"))?;
+    let key = encrypted_archive_key(args, inspected.header.format_version)?;
+    let (plaintext, envelope) = open_encrypted_archive_bytes(&encrypted, &key)?;
     if envelope.header != inspected.header {
         return Err("encrypted header changed between inspect and open".to_string());
     }
@@ -10564,7 +10815,7 @@ fn extract_encrypted_blob_member_file(args: &ArchiveExtractArgs) -> Result<Value
     extract_encrypted_blob_member_range_file(
         args,
         &encrypted,
-        &root_key,
+        &key,
         &scan,
         BlobMemberExtractContext {
             representation: "encrypted",
@@ -10702,7 +10953,7 @@ fn extract_plaintext_blob_member_file(
 fn extract_encrypted_blob_member_range_file(
     args: &ArchiveExtractArgs,
     encrypted: &[u8],
-    root_key: &RootKey,
+    key: &EncryptedArchiveKey,
     scan: &RaoLocatorScan,
     context: BlobMemberExtractContext,
 ) -> Result<Value, String> {
@@ -10718,9 +10969,9 @@ fn extract_encrypted_blob_member_range_file(
     let idx_entry = require_regular_locator(scan, &idx_path)?;
     let blob = require_regular_locator(scan, blob_entry)?;
 
-    let idx_range = read_encrypted_rao_file_range_to_vec(
+    let idx_range = read_encrypted_archive_file_range(
         encrypted,
-        root_key,
+        key,
         idx_entry.first_chunk_lba,
         idx_entry.size_bytes,
         0,
@@ -10730,9 +10981,9 @@ fn extract_encrypted_blob_member_range_file(
     verify_locator_sha256(idx_entry, &idx_range.bytes, &idx_path)?;
     let member =
         archive_ingest::resolve_blob_member_from_index(&idx_range.bytes, &idx_path, member_path)?;
-    let blob_range = read_encrypted_rao_file_range_to_vec(
+    let blob_range = read_encrypted_archive_file_range(
         encrypted,
-        root_key,
+        key,
         blob.first_chunk_lba,
         blob.size_bytes,
         member.offset,
@@ -11211,10 +11462,6 @@ fn extract_encrypted_archive_range_file(
     member_path: &str,
     range: ArchiveByteRange,
 ) -> Result<Value, String> {
-    let key_path = args
-        .key_file
-        .as_deref()
-        .ok_or_else(|| "encrypted RAO range extract requires --key-file".to_string())?;
     let file_size_bytes = args
         .file_size_bytes
         .ok_or_else(|| "encrypted RAO range extract requires --file-size-bytes".to_string())?;
@@ -11230,10 +11477,10 @@ fn extract_encrypted_archive_range_file(
     let encrypted = read_archive_object_bytes(&args.object)?;
     let inspected =
         inspect_bytes(&encrypted).map_err(|error| format!("inspect encrypted RAO: {error}"))?;
-    let root_key = read_root_key_file(key_path)?;
-    let range_result = read_encrypted_rao_file_range_to_vec(
+    let key = encrypted_archive_key(args, inspected.header.format_version)?;
+    let range_result = read_encrypted_archive_file_range(
         &encrypted,
-        &root_key,
+        &key,
         first_chunk_lba,
         file_size_bytes,
         range.start,
@@ -11354,14 +11601,18 @@ fn plaintext_archive_inspect_json(
 }
 
 fn encrypted_archive_keyless_json(path: &Path, report: &remanence_aead::InspectReport) -> Value {
+    let recipient_epochs = report.key_frame.as_ref().map(recipient_epochs_json);
     json!({
         "representation": "encrypted",
         "encryption": "RAO1",
         "keyed": false,
         "object": path,
         "object_id": report.header.object_id,
+        "format_version": report.header.format_version,
         "chunk_size": report.header.chunk_size,
-        "key_id": bytes_to_hex(&report.header.key_id),
+        "key_id": (report.header.format_version == 1)
+            .then(|| bytes_to_hex(&report.header.key_id)),
+        "recipient_epochs": recipient_epochs,
         "hkdf_salt": bytes_to_hex(&report.header.hkdf_salt),
         "metadata_frame_len": report.header.metadata_frame_len,
         "stored_size_bytes": report.stored_size_bytes,
@@ -11685,7 +11936,9 @@ struct ArchiveBuildResult {
     layout: RemTarObjectLayout,
     representation: &'static str,
     encryption: &'static str,
+    format_version: Option<u8>,
     key_id: Option<[u8; 16]>,
+    recipient_epochs: Option<Vec<Value>>,
     stored_digest: [u8; 32],
     plaintext_digest: [u8; 32],
     stored_size_bytes: u64,
@@ -11713,7 +11966,9 @@ fn archive_build_report_json(
         "body_format": FORMAT_ID,
         "representation": build.representation,
         "encryption": build.encryption,
+        "format_version": build.format_version,
         "key_id": build.key_id.map(|key_id| bytes_to_hex(&key_id)),
+        "recipient_epochs": build.recipient_epochs,
         "chunk_size": build.layout.chunk_size,
         "stored_size_bytes": build.stored_size_bytes,
         "stored_size_blocks": build.stored_size_blocks,
@@ -12172,6 +12427,55 @@ fn read_root_key_file(path: &Path) -> Result<RootKey, String> {
         ));
     }
     RootKey::new(bytes).map_err(|error| error.to_string())
+}
+
+fn read_private_key_file(path: &Path) -> Result<remanence_aead::RecipientPrivateKey, String> {
+    let mut bytes = std::fs::read(path)
+        .map_err(|error| format!("read --private-key {}: {error}", path.display()))?;
+    let parsed = remanence_aead::RecipientPrivateKey::parse(&bytes)
+        .map_err(|error| format!("parse --private-key {}: {error}", path.display()));
+    bytes.zeroize();
+    parsed
+}
+
+fn read_recipient_public_key_files(paths: &[PathBuf]) -> Result<Vec<RecipientPublicKey>, String> {
+    if !(2..=8).contains(&paths.len()) {
+        return Err("--recipient must be repeated 2 to 8 times".to_string());
+    }
+    let mut recipients = Vec::with_capacity(paths.len());
+    for path in paths {
+        let bytes = fs::read(path)
+            .map_err(|error| format!("read --recipient {}: {error}", path.display()))?;
+        recipients.push(
+            RecipientPublicKey::parse(&bytes)
+                .map_err(|error| format!("parse --recipient {}: {error}", path.display()))?,
+        );
+    }
+    if recipients
+        .windows(2)
+        .any(|pair| pair[0].slot_index >= pair[1].slot_index)
+        || recipients.iter().enumerate().any(|(index, recipient)| {
+            recipients[..index]
+                .iter()
+                .any(|earlier| earlier.recipient_epoch_id == recipient.recipient_epoch_id)
+        })
+    {
+        return Err("--recipient epochs must be distinct and in ascending slot order".to_string());
+    }
+    Ok(recipients)
+}
+
+fn recipient_epochs_json(key_frame: &remanence_aead::KeyFrame) -> Vec<Value> {
+    key_frame
+        .slots
+        .iter()
+        .map(|slot| {
+            json!({
+                "epoch_id": bytes_to_hex(&slot.recipient_epoch_id),
+                "label": slot.epoch_label,
+            })
+        })
+        .collect()
 }
 
 fn parse_key_id(value: Option<&str>) -> Result<[u8; 16], String> {
@@ -14180,7 +14484,8 @@ mod tests {
 
         let args = ArchiveResealArgs {
             object,
-            registry_key: root_path,
+            registry_key: Some(root_path),
+            private_key: None,
             recipients: vec![safe_path, escrow_path],
             out: output.clone(),
             staging_dir: Some(staging.clone()),
@@ -14254,6 +14559,50 @@ mod tests {
             remanence_aead::open_envelope_to_vec(&v2, &safe).unwrap().0,
             plaintext
         );
+
+        let safe_private_path = temp.path().join("safe.raop");
+        fs::write(&safe_private_path, safe.serialize()).unwrap();
+        let next_primary =
+            remanence_aead::RecipientPrivateKey::new([3; 16], "next-safe", [9; 32]).unwrap();
+        let next_recovery =
+            remanence_aead::RecipientPrivateKey::new([4; 16], "next-escrow", [10; 32]).unwrap();
+        let next_primary_path = temp.path().join("next-safe.raor");
+        let next_recovery_path = temp.path().join("next-escrow.raor");
+        fs::write(
+            &next_primary_path,
+            next_primary.public_key(0).unwrap().serialize().unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &next_recovery_path,
+            next_recovery.public_key(1).unwrap().serialize().unwrap(),
+        )
+        .unwrap();
+        let resealed_again = temp.path().join("object-v2-resealed.rao");
+        let v2_args = ArchiveResealArgs {
+            object: output,
+            registry_key: None,
+            private_key: Some(safe_private_path),
+            recipients: vec![next_primary_path, next_recovery_path],
+            out: resealed_again.clone(),
+            staging_dir: None,
+        };
+        let v2_publication = reseal_archive_object(&v2_args).unwrap();
+        assert_eq!(v2_publication.report["input_format_version"], 2);
+        assert_eq!(v2_publication.report["object_id"], "reseal-object");
+        assert_eq!(v2_publication.report["chunk_size"], 512);
+        assert_eq!(
+            v2_publication.report["plaintext_digest"],
+            bytes_to_hex(&digest)
+        );
+        v2_publication.commit();
+        let resealed_again = fs::read(resealed_again).unwrap();
+        let (opened_again, opened_report) =
+            remanence_aead::open_envelope_to_vec(&resealed_again, &next_recovery).unwrap();
+        assert_eq!(opened_again, plaintext);
+        assert_eq!(opened_report.header.object_id, "reseal-object");
+        assert_eq!(opened_report.header.chunk_size, 512);
+        assert_eq!(opened_report.metadata.plaintext_digest, digest);
     }
 
     #[test]
@@ -14546,7 +14895,7 @@ mod tests {
             RemCommand::Archive {
                 command: RemArchiveCommand::ExtractStream(args),
             } => {
-                assert_eq!(args.key_file, PathBuf::from("/tmp/root.key"));
+                assert_eq!(args.key_file, Some(PathBuf::from("/tmp/root.key")));
                 assert_eq!(
                     args.range,
                     Some(ArchiveByteRange {
@@ -16300,6 +16649,7 @@ mod tests {
             encrypt: false,
             key_file: None,
             key_id: None,
+            recipients: Vec::new(),
             object_id: Some("object-map-direct".to_string()),
             caller_object_id: Some("caller-map-direct".to_string()),
             manifest_file_id: Some("manifest-map-direct".to_string()),
@@ -18749,6 +19099,115 @@ blob Project/Render Files/
         );
     }
 
+    #[test]
+    fn archive_build_v2_recipient_envelope_reports_inspects_and_extracts() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rao-build-v2")
+            .tempdir()
+            .unwrap();
+        let input_dir = temp.path().join("inputs");
+        fs::create_dir_all(&input_dir).unwrap();
+        fs::write(input_dir.join("secret.txt"), b"recipient payload").unwrap();
+
+        let primary =
+            remanence_aead::RecipientPrivateKey::new([0x24; 16], "primary", [0x42; 32]).unwrap();
+        let recovery =
+            remanence_aead::RecipientPrivateKey::new([0x25; 16], "recovery", [0x43; 32]).unwrap();
+        let primary_public_path = temp.path().join("primary.raor");
+        let recovery_public_path = temp.path().join("recovery.raor");
+        let primary_private_path = temp.path().join("primary.raop");
+        fs::write(
+            &primary_public_path,
+            primary.public_key(0).unwrap().serialize().unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &recovery_public_path,
+            recovery.public_key(1).unwrap().serialize().unwrap(),
+        )
+        .unwrap();
+        fs::write(&primary_private_path, primary.serialize()).unwrap();
+        let out_path = temp.path().join("encrypted-v2.rao");
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            input_dir.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+            "--recipient",
+            primary_public_path.to_str().unwrap(),
+            "--recipient",
+            recovery_public_path.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+            "--object-id",
+            "object-encrypted-v2",
+            "--caller-object-id",
+            "caller-encrypted-v2",
+            "--manifest-file-id",
+            "manifest-encrypted-v2",
+            "--timestamp",
+            "2026-01-01T00:00:00Z",
+        ]);
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(stderr.is_empty(), "{stderr}");
+        let report: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(report["format_version"], 2);
+        assert!(report["key_id"].is_null());
+        assert_eq!(
+            report["recipient_epochs"],
+            json!([
+                {
+                    "epoch_id": "24242424242424242424242424242424",
+                    "label": "primary"
+                },
+                {
+                    "epoch_id": "25252525252525252525252525252525",
+                    "label": "recovery"
+                }
+            ])
+        );
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "inspect",
+            "--object",
+            out_path.to_str().unwrap(),
+        ]);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(stderr.is_empty(), "{stderr}");
+        let inspected: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(inspected["format_version"], 2);
+        assert_eq!(inspected["recipient_epochs"], report["recipient_epochs"]);
+        assert!(inspected["key_id"].is_null());
+
+        let restore_dir = temp.path().join("restore");
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "extract",
+            "--object",
+            out_path.to_str().unwrap(),
+            "--dest",
+            restore_dir.to_str().unwrap(),
+            "--private-key",
+            primary_private_path.to_str().unwrap(),
+        ]);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(stderr.is_empty(), "{stderr}");
+        let extracted: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(extracted["files_written"], 1);
+        assert_eq!(
+            fs::read(restore_dir.join("secret.txt")).unwrap(),
+            b"recipient payload"
+        );
+    }
+
     fn sealed_stream_fixture(chunk_size: u32, chunk_count: usize) -> (Vec<u8>, Vec<u8>, RootKey) {
         let plaintext: Vec<u8> = (0..chunk_size as usize * chunk_count)
             .map(|index| (index % 251) as u8)
@@ -18773,7 +19232,8 @@ blob Project/Render Files/
         range: Option<ArchiveByteRange>,
     ) -> (ExitCode, Vec<u8>, String) {
         let args = ArchiveExtractStreamArgs {
-            key_file: key_file.to_path_buf(),
+            key_file: Some(key_file.to_path_buf()),
+            private_key: None,
             range,
             authenticated_prefix: None,
             stored_range_start: None,
@@ -18918,7 +19378,8 @@ blob Project/Render Files/
         };
 
         let query_args = ArchiveCoveringRangeArgs {
-            key_file: key_file.clone(),
+            key_file: Some(key_file.clone()),
+            private_key: None,
             object_id: "extract-stream-fixture".to_string(),
             file_id: "member-7".to_string(),
             range,
@@ -18950,7 +19411,8 @@ blob Project/Render Files/
         let stored_start = plan.stored_range_start.unwrap() as usize;
         let stored_end = stored_start + plan.stored_range_len as usize;
         let args = ArchiveExtractStreamArgs {
-            key_file,
+            key_file: Some(key_file),
+            private_key: None,
             range: Some(range),
             authenticated_prefix: Some(prefix_file),
             stored_range_start: Some(stored_start as u64),
@@ -19001,7 +19463,8 @@ blob Project/Render Files/
             }
             fs::write(&prefix_file, selected_prefix).unwrap();
             let args = ArchiveExtractStreamArgs {
-                key_file: key_file.clone(),
+                key_file: Some(key_file.clone()),
+                private_key: None,
                 range: Some(range),
                 authenticated_prefix: Some(prefix_file),
                 stored_range_start: Some(stored_start as u64),
