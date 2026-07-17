@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Independently re-derive the RAO 1.0 positive vector manifests.
+"""Independently re-derive the retained RAO positive plaintext manifests.
 
 This verifier deliberately avoids the Remanence Rust crates. It rebuilds the
-RAO-TV-P1 and RAO-TV-D1 plaintext tar streams, the additional RAO 13.1
-positive plaintext vectors, deterministic manifest CBOR, and RAO-TV-E1/D1
-encrypted envelopes using Python standard-library code plus cryptography's
-ChaCha20-Poly1305 implementation. The goal is to catch reference
+RAO-TV-P1 and RAO-TV-D1 plaintext tar streams, the additional positive
+plaintext vectors, and deterministic manifest CBOR. Retired v1 encrypted
+vectors are no longer generated here; the v2 deterministic envelope
+expectation is pinned by the Rust vector test until the P2 publication packet
+is regenerated. The goal is to catch reference
 implementation bugs before pinned-at-generation values become conformance
 anchors.
 
@@ -13,11 +14,8 @@ With --check-plaintext-interop it also exercises the Section 14 plaintext
 interop gate for the positive plaintext vectors using GNU tar, bsdtar, and
 Python's tarfile module.
 
-With --long-term-recovery-drill it performs the Section 14 drill from the
-stored bytes alone: standard tar extracts a payload and manifest from a
-plaintext object, a standalone CBOR decoder verifies the manifest, and a
-generic ChaCha20-Poly1305/HKDF opener decrypts the encrypted twin before the
-same tar/CBOR payload verification.
+The retired --long-term-recovery-drill flag fails loudly until its P2 v2
+replacement lands.
 """
 
 from __future__ import annotations
@@ -1598,7 +1596,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--long-term-recovery-drill",
         action="store_true",
-        help="also run the Section 14 plaintext/encrypted long-term recovery drill",
+        help="retired with the v1 encrypted vector; fails until the P2 v2 drill lands",
     )
     parser.add_argument(
         "--allow-missing-bsdtar",
@@ -1630,7 +1628,6 @@ def main(argv: list[str] | None = None) -> int:
         print("wrote additional RAO 13.1 positive plaintext fixtures")
 
     p1 = load("rao-tv-p1.json")
-    e1 = load("rao-tv-e1.json")
     d1 = load("rao-tv-d1.json")
 
     p1_files = [
@@ -1646,10 +1643,6 @@ def main(argv: list[str] | None = None) -> int:
     check_layouts("RAO-TV-P1", p1_layout["files"], p1["expected"]["file_layouts"])
     check_layouts("RAO-TV-P1 manifest", [p1_layout["manifest"]], [p1["expected"]["manifest_layout"]])
 
-    e1_actual = seal(p1_plaintext, p1["inputs"], ROOT_KEY, KEY_ID)
-    check_encrypted("RAO-TV-E1", e1_actual, e1["expected"])
-    assert_eq(e1["expected"]["plaintext_digest"], p1["expected"]["stored_digest"], "RAO-TV-E1 plaintext_digest equality")
-
     d1_file = FileSpec(
         "v.bin",
         "00000000-0000-4000-8000-000000000012",
@@ -1664,10 +1657,6 @@ def main(argv: list[str] | None = None) -> int:
     check_plaintext("RAO-TV-D1 plaintext", d1, d1_plaintext, d1_layout, d1_expected_plain)
     check_layouts("RAO-TV-D1", d1_layout["files"], [d1_expected_plain["file_layout"]])
     check_layouts("RAO-TV-D1 manifest", [d1_layout["manifest"]], [d1_expected_plain["manifest_layout"]])
-
-    d1_actual = seal(d1_plaintext, d1["inputs"], bytes.fromhex(d1["inputs"]["encrypted_root_key"]), bytes.fromhex(d1["inputs"]["encrypted_key_id"]))
-    check_encrypted("RAO-TV-D1 encrypted", d1_actual, d1["expected"]["encrypted"])
-    assert_eq(d1["expected"]["encrypted"]["plaintext_digest"], d1_expected_plain["stored_digest"], "RAO-TV-D1 plaintext_digest equality")
 
     p1_vector = PlaintextVector(
         vector_id="RAO-TV-P1",
@@ -1697,9 +1686,7 @@ def main(argv: list[str] | None = None) -> int:
         export_directory.mkdir(parents=True, exist_ok=True)
         exports = {
             "rao-tv-p1.rao": p1_plaintext,
-            "rao-tv-e1.rao": e1_actual["stored"],
             "rao-tv-d1-plaintext.rao": d1_plaintext,
-            "rao-tv-d1-encrypted.rao": d1_actual["stored"],
         }
         exports.update(
             {
@@ -1718,19 +1705,14 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.long_term_recovery_drill:
-        check_long_term_recovery_drill(
-            p1_vector,
-            "RAO-TV-E1",
-            e1_actual["stored"],
-            ROOT_KEY,
-            KEY_ID,
-            "b/pattern.bin",
-            p1["inputs"]["object_id"],
+        raise RuntimeError(
+            "the v1 encrypted recovery drill was retired in P1; "
+            "the v2 publication drill is a P2 deliverable"
         )
 
     print(
-        "verified RAO-TV-P1, RAO-TV-E1, RAO-TV-D1, and additional "
-        "RAO 13.1 positive plaintext vectors independently"
+        "verified RAO-TV-P1, RAO-TV-D1 plaintext, and additional "
+        "RAO positive plaintext vectors independently"
     )
     return 0
 

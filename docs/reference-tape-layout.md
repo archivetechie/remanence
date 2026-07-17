@@ -93,27 +93,22 @@ a promise, it is the format.
 ## The encrypted envelope: RAO1
 
 An encrypted object wraps the same tar byte stream in an AEAD envelope.
-Both header versions below share one 128-byte layout and one AEAD suite
-(cipher-suite id 0x01, HKDF-SHA-256 + ChaCha20-Poly1305); they differ
-only in how the payload key is delivered:
+The live wire format is version 2 only (cipher-suite id `0x01`,
+HKDF-SHA-256 + ChaCha20-Poly1305). Format version 1 is permanently reserved
+and rejected with `UnsupportedFormatVersion`; there is no compatibility
+reader or writer.
 
-- **Format version 1 (registry key).** The header's `0x38-0x40` byte
-  range is reserved-zero, the 16-byte key id field names a caller-held
-  32-byte symmetric root key, and there is no key frame — the metadata
-  frame follows the header directly.
-- **Format version 2 (HPKE envelope).** The same `0x38-0x40` range
-  instead holds a 1-byte wrap-suite id (`0x01` = HPKE, RFC 9180 Base
-  mode, X25519-HKDF-SHA256-ChaCha20Poly1305) and a 4-byte key-frame
-  length; the 16-byte key id field is all-zero (there's no shared key to
-  name). A **key frame** (wire tag `RAOK`, 1-8 recipient slots, each
-  `[slot_index][recipient_epoch_id:16][label][enc:32][ciphertext:48]`)
-  sits between the header and the metadata frame, one HPKE-wrapped copy
-  of a freshly generated 32-byte data-encryption key (DEK) per recipient.
-  A v1 header with just its version byte flipped to 2 is rejected loudly
-  (`InvalidWrapSuite`) rather than silently misread, because the
-  all-zero `0x38` byte that a flipped-but-otherwise-untouched v1 header
-  would carry there is exactly the reserved "registry-symmetric v2"
-  value the format deliberately never emits.
+- The fixed plaintext scalar header is 128 bytes. Bytes `0x10..0x20` are
+  reserved and must be zero. Byte `0x38` is wrap-suite id `0x01` (HPKE,
+  RFC 9180 Base mode, X25519-HKDF-SHA256-ChaCha20Poly1305), bytes
+  `0x39..0x3c` are reserved-zero, and `0x3c..0x40` holds the key-frame
+  length.
+- A plaintext **key frame** follows immediately (wire tag `RAOK`). Readers
+  accept 1-8 slots; production sealers require 2-8 distinct recipient
+  epochs in ascending slot order. Each slot is
+  `[slot_index][recipient_epoch_id:16][label][enc:32][ciphertext:48]` and
+  carries one HPKE-wrapped copy of the object's freshly generated 32-byte
+  data-encryption key (DEK).
 - An authenticated metadata frame, then the payload as an age-style
   STREAM: each chunk is `chunk_size` bytes of ciphertext plus a 16-byte
   tag, with an 11-byte counter nonce whose final byte flags the last
@@ -123,21 +118,19 @@ only in how the payload key is delivered:
 - A 16-byte plaintext footer, `RAO1_STREAM_END.`, then zero-fill to a
   chunk-size multiple.
 
-![RAO1 encrypted envelope: plaintext 128-byte header, encrypted metadata frame, tagged ciphertext chunks, plaintext footer, zero fill](assets/rao1-envelope.svg)
+![RAO1 v2 encrypted envelope: plaintext 128-byte header and recipient key frame, encrypted metadata frame, tagged ciphertext chunks, plaintext footer, zero fill](assets/rao1-envelope.svg)
 
-*Fig. 3 — The RAO1 envelope around the same tar stream (v1 shape shown): only the 128-byte header and the 16-byte footer are plaintext; everything between is authenticated ChaCha20-Poly1305 ciphertext. A v2 envelope inserts one more plaintext-adjacent block, the key frame, directly after the header.*
+*Fig. 3 — The v2 RAO1 envelope around the same tar stream. The scalar header,
+recipient key frame, footer, and fill are plaintext framing; metadata and
+payload chunks are ChaCha20-Poly1305 ciphertext. The key frame is bound into
+key derivation, so changing any slot invalidates authentication.*
 
-**Format version 1** keys derive from the caller's 32-byte root key
-through HKDF with the labels `rao1-salt-v1`, `rao1-object-v1`,
-`rao1-metadata-v1`, `rao1-payload-v1`; the key id in the header names
-that root key, and Remanence never stores key material. **Format version
-2** has no shared root key at all: its labels (`rao2-salt-v1` and
-siblings) derive from the per-object DEK, and the value hashed into key
-derivation is the header *plus* the exact key-frame bytes, so key-frame
-tampering is caught the same way header tampering is. The only way to
-produce a v2 object today is `rem archive reseal` (converts an existing
-v1 object, one-shot, no v2→v2 rewrap); the only way to fully open one is
-the standalone `rao-recover` binary — see the [CLI
+Version 2 has no shared root key. Its labels (`rao2-salt-v1` and siblings)
+derive from the per-object DEK, and the derivation hash covers the scalar
+header plus the exact key-frame bytes. `archive build` and pool writes seal
+directly to recipients, while `archive reseal` rotates one v2 envelope to a
+new recipient set. CLI open/read/verify paths and standalone `rao-recover`
+select a slot using the RAOP private key's epoch id; see the [CLI
 reference](reference-cli.md#rao-recover-standalone-recovery).
 
 <!-- code-anchor: crates/remanence-parity/src/bootstrap.rs crates/remanence-state/src/index.rs @ 7fb10f8 -->

@@ -17,7 +17,7 @@
   <text class="rta" x="116" y="96" text-anchor="middle">FM</text>
   <rect class="rs" x="124" y="34" width="112" height="44"/>
   <text class="rt" x="180" y="53" text-anchor="middle">object</text>
-  <text class="rtd" x="180" y="68" text-anchor="middle">rao-v1 body blocks</text>
+  <text class="rtd" x="180" y="68" text-anchor="middle">RAO stored blocks</text>
   <line class="ra" x1="240" y1="30" x2="240" y2="84"/>
   <rect class="rs" x="248" y="34" width="112" height="44"/>
   <text class="rt" x="304" y="53" text-anchor="middle">object</text>

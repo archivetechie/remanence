@@ -98,52 +98,54 @@ never depends on host state.
 ## The encrypted variant
 
 The encrypted representation wraps the same tar stream in an
-authenticated ChaCha20-Poly1305 envelope. There are two envelope shapes,
-sharing the same AEAD suite but different key management:
+authenticated ChaCha20-Poly1305 envelope. Encryption is v2-only: every
+object gets a fresh data-encryption key, wrapped separately to each
+recipient with HPKE (RFC 9180 Base mode,
+X25519-HKDF-SHA256-ChaCha20Poly1305). Writers require 2-8 distinct recipient
+epochs in ascending slot order.
 
-**Format version 1** wraps a single symmetric registry key you supply.
-Keys are 32 raw bytes; the key id is 16 bytes of hex that names the key
-without revealing it. This is the only shape `archive build` produces
-directly:
+Remanence consumes canonical RAOR public-key files and RAOP private-key
+files; key-pair provisioning belongs to the custodian/key-registry tooling,
+not this CLI. Assuming two custodians supplied `primary.raor` and
+`recovery.raor`, build the encrypted object directly:
 
 ```sh
-head -c 32 /dev/urandom > root.key
-chmod 600 root.key
 rem archive build --inputs src --out demo-enc.rao \
-    --encrypt --key-file root.key --key-id 000102030405060708090a0b0c0d0e0f
-rem archive extract --object demo-enc.rao --dest restored-enc --key-file root.key
+    --recipient primary.raor --recipient recovery.raor
+rem archive inspect --object demo-enc.rao
+rem archive extract --object demo-enc.rao --dest restored-enc \
+    --private-key primary.raop
 diff -r src restored-enc && echo identical
 ```
 
-Without the key file, `inspect` still reads the plaintext envelope header
-(format version, chunk size, key id, object id) — enough to know what the
-object is and which key it needs, and nothing more.
+`inspect` needs no key. It validates the v2 header and key frame and reports
+the ordered `recipient_epochs`, but cannot expose the encrypted manifest.
+The matching RAOP file selects its epoch's slot during open.
 
-**Format version 2** drops the shared registry key entirely: each object
-gets a fresh key wrapped once per recipient with HPKE (RFC 9180,
-X25519-HKDF-SHA256-ChaCha20Poly1305), so 2-8 named recipients can each
-open it with their own private key and nobody needs to hold a symmetric
-secret. There is no direct `archive build --encrypt` path to v2 — you
-get there by *resealing* an existing v1 object:
+To rotate recipients, open the existing v2 object with one current private
+key and reseal it to a new 2-8-recipient set:
 
 ```sh
-rem archive reseal --object demo-enc.rao --registry-key root.key \
-    --recipient alice.pub --recipient bob.pub --out demo-v2.rao
+rem archive reseal --object demo-enc.rao --private-key primary.raop \
+    --recipient primary-rotated.raor recovery.raor \
+    --out demo-rotated.rao
 ```
 
-Reading a v2 envelope back is not something either CLI does end to end —
-neither `rem` nor `rem-debug` exposes a whole-object v2 open. Use the
-standalone `rao-recover` binary instead, with one recipient's private key:
+`reseal` is v2→v2: it verifies the new stored digest before publishing and
+never overwrites an existing output. There is no v2→v1 downgrade.
+
+For catalogless disaster recovery, use the standalone `rao-recover` binary
+with any matching recipient private key:
 
 ```sh
-rao-recover --object demo-v2.rao --private-key alice.priv --out restored-v2
-diff -r src restored-v2 && echo identical
+rao-recover --object demo-enc.rao --private-key recovery.raop --out recovered
+diff -r src recovered && echo identical
 ```
 
 `rao-recover` needs no daemon, catalog, or config file — it's the
-disaster-recovery path of last resort. `rem archive inspect` (keyless)
-still works on a v2 object too: it parses and validates the recipient
-key frame without needing any key at all.
+disaster-recovery path of last resort. For streaming and partial retrieval,
+`archive extract-stream` and `archive covering-range` use the same
+`--private-key` epoch-selection contract.
 
 <!-- code-anchor: crates/remanence-library/src/discovery.rs crates/remanence-cli/src/lib.rs Makefile @ 2a20106 -->
 ## Talking to a library (requires hardware)
@@ -282,19 +284,23 @@ the command line. Note the `--allow` flag: every state-changing
 ```sh
 rem-debug --allow <SERIAL> archive write \
     --library <SERIAL> --pool demo --file /path/to/payload.bin --json \
+    --recipient primary.raor --recipient recovery.raor \
     > locator.json
 
 rem-debug --allow <SERIAL> archive verify \
     --library <SERIAL> --locator "$(cat locator.json)" \
+    --private-key primary.raop \
     --expected-sha256 "$(sha256sum /path/to/payload.bin | cut -d' ' -f1)"
 
 rem-debug --allow <SERIAL> archive read \
-    --library <SERIAL> --locator "$(cat locator.json)" --out restored.bin
+    --library <SERIAL> --locator "$(cat locator.json)" --out restored.bin \
+    --private-key primary.raop
 ```
 
 The locator JSON emitted by `write` pins the object copy to physical
-media; `verify` streams the tape bytes against a digest without
-restoring anything.
+media and records `format_version: 2` plus the recipient epochs; `verify`
+streams and authenticates the tape object against a digest without restoring
+anything.
 
 ## Where to go next
 
