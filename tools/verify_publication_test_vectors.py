@@ -63,6 +63,52 @@ REQUIRED_DAMAGE = {
     "parity-map-primary",
     "bootstrap-copy",
 }
+REQUIRED_RAO_OBJECTS = {
+    "rao-tv-boundary.rao",
+    "rao-tv-d1-encrypted.rao",
+    "rao-tv-d1-plaintext.rao",
+    "rao-tv-e2.rao",
+    "rao-tv-empty-file.rao",
+    "rao-tv-empty.rao",
+    "rao-tv-hardlinks.rao",
+    "rao-tv-manifest.rao",
+    "rao-tv-metadata.rao",
+    "rao-tv-nonregular.rao",
+    "rao-tv-one-byte.rao",
+    "rao-tv-order.rao",
+    "rao-tv-p1.rao",
+    "rao-tv-paths.rao",
+    "rao-tv-xattrs.rao",
+}
+REQUIRED_V2_ENVELOPE_CASES = {
+    "v2-version-flip",
+    "v2-suite-flip",
+    "v2-truncated-key-frame",
+    "v2-duplicate-slots",
+    "v2-misordered-slots",
+    "v2-key-frame-trailing-byte",
+    "v2-oversize-key-frame",
+    "v2-key-frame-label-tamper",
+    "v2-key-frame-enc-tamper",
+    "v2-key-frame-ciphertext-tamper",
+    "v2-key-frame-slot-inserted",
+    "v2-key-frame-slot-removed",
+    "v2-slot-count-zero",
+    "v2-slot-count-nine",
+    "v2-writer-zero-slots",
+    "v2-writer-one-slot",
+    "v2-writer-nine-slots",
+    "v2-reader-one-slot",
+    "v2-wrap-suite-zero-nonempty",
+    "v2-hpke-zero-key-frame-len",
+    "v2-hpke-undersized-key-frame-len",
+    "v2-duplicate-recipient-epoch-id",
+    "v2-internal-slot-truncation",
+    "v2-nonzero-reserved-key-region",
+    "v2-malformed-key-frame-magic",
+    "v2-wrong-recipient-private-key",
+    "v2-malformed-encapsulation",
+}
 
 
 def sha256(path: pathlib.Path) -> str:
@@ -75,6 +121,17 @@ def sha256(path: pathlib.Path) -> str:
 
 def fail(message: str) -> None:
     raise SystemExit(f"publication vector verification failed: {message}")
+
+
+def load_json(path: pathlib.Path) -> dict[str, object]:
+    """Load one required archive JSON document or fail with its path."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        fail(f"cannot parse {path}: {error}")
+    if not isinstance(value, dict):
+        fail(f"{path} is not a JSON object")
+    return value
 
 
 def main() -> int:
@@ -91,11 +148,54 @@ def main() -> int:
         if actual != expected:
             fail(f"checksum mismatch for {relative}: {actual} != {expected}")
 
+    rao_root = root / "rao"
+    rao_objects = {path.name for path in (rao_root / "objects").glob("*.rao")}
+    if rao_objects != REQUIRED_RAO_OBJECTS:
+        fail(
+            "RAO object inventory differs: "
+            f"missing={sorted(REQUIRED_RAO_OBJECTS - rao_objects)}, "
+            f"extra={sorted(rao_objects - REQUIRED_RAO_OBJECTS)}"
+        )
+    manifests = rao_root / "manifests"
+    e2 = load_json(manifests / "rao-tv-e2.json")
+    if e2.get("vector_id") != "RAO-TV-E2":
+        fail("rao-tv-e2.json has the wrong vector_id")
+    e2_expected = e2.get("expected")
+    if not isinstance(e2_expected, dict) or e2_expected.get("stored_digest") != sha256(
+        rao_root / "objects" / "rao-tv-e2.rao"
+    ):
+        fail("RAO-TV-E2 stored_digest does not match its pinned object")
+    d1 = load_json(manifests / "rao-tv-d1.json")
+    d1_expected = d1.get("expected")
+    d1_encrypted = d1_expected.get("encrypted") if isinstance(d1_expected, dict) else None
+    if not isinstance(d1_encrypted, dict) or d1_encrypted.get("stored_digest") != sha256(
+        rao_root / "objects" / "rao-tv-d1-encrypted.rao"
+    ):
+        fail("RAO-TV-D1 encrypted stored_digest does not match its pinned object")
+    v2_negative = load_json(manifests / "negative-envelope-v2.json")
+    if v2_negative.get("status") != "complete":
+        fail("negative-envelope-v2.json is not marked complete")
+    v2_cases = v2_negative.get("cases")
+    if not isinstance(v2_cases, list) or not all(isinstance(case, dict) for case in v2_cases):
+        fail("negative-envelope-v2.json cases are malformed")
+    v2_case_ids = [case.get("id") for case in v2_cases]
+    if not all(isinstance(case_id, str) for case_id in v2_case_ids):
+        fail("negative-envelope-v2.json case ids are malformed")
+    if len(v2_case_ids) != len(set(v2_case_ids)):
+        fail("negative-envelope-v2.json contains duplicate case ids")
+    if set(v2_case_ids) != REQUIRED_V2_ENVELOPE_CASES:
+        fail(
+            "v2 envelope coverage differs: "
+            f"missing={sorted(REQUIRED_V2_ENVELOPE_CASES - set(v2_case_ids))}, "
+            f"extra={sorted(set(v2_case_ids) - REQUIRED_V2_ENVELOPE_CASES)}"
+        )
+    for case in v2_cases:
+        outcomes = int("expected_error" in case) + int("expected_outcome" in case)
+        if outcomes != 1 or not isinstance(case.get("operation"), str):
+            fail(f"v2 envelope case {case.get('id')!r} has an invalid outcome/operation")
+
     vector_file = root / "rem-parity-1" / "vectors.json"
-    try:
-        document = json.loads(vector_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        fail(f"cannot parse vectors.json: {error}")
+    document = load_json(vector_file)
     vectors = document.get("vectors")
     if not isinstance(vectors, list):
         fail("vectors.json has no vector list")

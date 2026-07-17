@@ -12,10 +12,14 @@ use remanence_library::VecBlockSink;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::Cursor;
+use std::path::PathBuf;
 
 const D1_DEK: [u8; 32] = [0x5d; 32];
 const D1_HPKE_RNG_SEED: [u8; 32] = [0xa7; 32];
+const E2_DEK: [u8; 32] = [0x7d; 32];
+const E2_HPKE_RNG_SEED: [u8; 32] = [0xc3; 32];
 
 fn fixture(json: &str) -> Value {
     serde_json::from_str(json).expect("fixture manifest is valid JSON")
@@ -114,6 +118,73 @@ fn d1_recipient_pair() -> (RecipientPrivateKey, Vec<RecipientPublicKey>) {
         recovery.public_key(1).unwrap(),
     ];
     (primary, recipients)
+}
+
+fn e2_recipient_pair() -> (RecipientPrivateKey, Vec<RecipientPublicKey>) {
+    let primary = RecipientPrivateKey::new([0x61; 16], "archive-2026-01", [0x51; 32]).unwrap();
+    let recovery = RecipientPrivateKey::new([0x62; 16], "recovery-2026-01", [0x52; 32]).unwrap();
+    let recipients = vec![
+        primary.public_key(0).unwrap(),
+        recovery.public_key(1).unwrap(),
+    ];
+    (primary, recipients)
+}
+
+fn build_p1_plaintext() -> Vec<u8> {
+    let hello = b"hello, rem archive object\n";
+    let pattern: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
+    let files = p1_files(hello, &pattern);
+    let mut sink = VecBlockSink::new();
+    write_rem_tar_object(&mut sink, &p1_options(), &files).unwrap();
+    flatten_sink(&sink)
+}
+
+fn build_d1_plaintext() -> Vec<u8> {
+    let payload: Vec<u8> = (0..262145).map(|i| (i % 256) as u8).collect();
+    let files = [RemTarFile {
+        path: "v.bin",
+        file_id: "00000000-0000-4000-8000-000000000012",
+        data: &payload,
+        mtime: None,
+        executable: None,
+    }];
+    let mut sink = VecBlockSink::new();
+    write_rem_tar_object(&mut sink, &d1_options(), &files).unwrap();
+    flatten_sink(&sink)
+}
+
+fn seal_fixed_vector(
+    plaintext: &[u8],
+    options: &RemTarObjectOptions,
+    recipients: Vec<RecipientPublicKey>,
+    dek: [u8; 32],
+    hpke_rng_seed: [u8; 32],
+) -> Vec<u8> {
+    let envelope_options = EnvelopeSealOptions {
+        common: SealOptions {
+            chunk_size: options.chunk_size as u32,
+            object_id: options.object_id.clone(),
+            plaintext_size: plaintext.len() as u64,
+            plaintext_digest: Sha256::digest(plaintext).into(),
+        },
+        recipients,
+    };
+    let mut encrypted = Vec::new();
+    seal_deterministic_for_test_vectors(
+        Cursor::new(plaintext),
+        &mut encrypted,
+        &envelope_options,
+        DataEncryptionKey::from_bytes(dek),
+        hpke_rng_seed,
+    )
+    .unwrap();
+    encrypted
+}
+
+fn fixture_object_path(filename: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/rao/objects")
+        .join(filename)
 }
 
 fn p1_options() -> RemTarObjectOptions {
@@ -724,6 +795,172 @@ fn rao_tv_p1_matches_fixture_manifest() {
     assert_layout(&layout.files[0], item(file_layouts, 0));
     assert_layout(&layout.files[1], item(file_layouts, 1));
     assert_manifest_layout(&layout.manifest, field(expected, "manifest_layout"));
+}
+
+#[test]
+fn rao_v2_publication_objects_regenerate_byte_exactly() {
+    let e2_fixture = fixture(include_str!("../../../fixtures/rao/rao-tv-e2.json"));
+    let e2_inputs = field(&e2_fixture, "inputs");
+    let e2_expected = field(&e2_fixture, "expected");
+    let p1_plaintext = build_p1_plaintext();
+    let (e2_primary, e2_recipients) = e2_recipient_pair();
+    let e2_first = seal_fixed_vector(
+        &p1_plaintext,
+        &p1_options(),
+        e2_recipients.clone(),
+        E2_DEK,
+        E2_HPKE_RNG_SEED,
+    );
+    let e2_second = seal_fixed_vector(
+        &p1_plaintext,
+        &p1_options(),
+        e2_recipients.clone(),
+        E2_DEK,
+        E2_HPKE_RNG_SEED,
+    );
+    assert_eq!(e2_first, e2_second, "RAO-TV-E2 regenerates byte-exactly");
+
+    let d1_plaintext = build_d1_plaintext();
+    let (_, d1_recipients) = d1_recipient_pair();
+    let d1_first = seal_fixed_vector(
+        &d1_plaintext,
+        &d1_options(),
+        d1_recipients.clone(),
+        D1_DEK,
+        D1_HPKE_RNG_SEED,
+    );
+    let d1_second = seal_fixed_vector(
+        &d1_plaintext,
+        &d1_options(),
+        d1_recipients,
+        D1_DEK,
+        D1_HPKE_RNG_SEED,
+    );
+    assert_eq!(
+        d1_first, d1_second,
+        "RAO-TV-D1 encrypted half regenerates byte-exactly"
+    );
+
+    if let Some(directory) = std::env::var_os("RAO_VECTOR_EXPORT_DIR") {
+        let directory = PathBuf::from(directory);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("rao-tv-e2.rao"), &e2_first).unwrap();
+        fs::write(directory.join("rao-tv-d1-encrypted.rao"), &d1_first).unwrap();
+    }
+
+    assert_eq!(
+        fs::read(fixture_object_path("rao-tv-e2.rao")).unwrap(),
+        e2_first,
+        "RAO-TV-E2 pinned object"
+    );
+    assert_eq!(
+        fs::read(fixture_object_path("rao-tv-d1-encrypted.rao")).unwrap(),
+        d1_first,
+        "RAO-TV-D1 pinned encrypted object"
+    );
+
+    assert_eq!(str_field(e2_inputs, "plaintext_vector"), "RAO-TV-P1");
+    assert_eq!(str_field(e2_inputs, "deterministic_dek"), hex(&E2_DEK));
+    assert_eq!(
+        str_field(e2_inputs, "deterministic_hpke_rng_seed"),
+        hex(&E2_HPKE_RNG_SEED)
+    );
+    let recipients = field(e2_inputs, "recipients");
+    for (index, recipient) in e2_recipients.iter().enumerate() {
+        let expected = item(recipients, index);
+        assert_eq!(
+            u64::from(recipient.slot_index),
+            u64_field(expected, "slot_index")
+        );
+        assert_eq!(
+            hex(&recipient.recipient_epoch_id),
+            str_field(expected, "recipient_epoch_id")
+        );
+        assert_eq!(recipient.epoch_label, str_field(expected, "epoch_label"));
+        assert_eq!(
+            hex(&recipient.public_key),
+            str_field(expected, "public_key")
+        );
+    }
+
+    let inspect = inspect_bytes(&e2_first).unwrap();
+    let (opened, open) = open_to_vec(&e2_first, &e2_primary).unwrap();
+    assert_eq!(opened, p1_plaintext);
+    let header_bytes = open.header.serialize().unwrap();
+    let key_frame_bytes = open.key_frame.serialize().unwrap();
+    let header_hash = open
+        .header
+        .header_hash_with_key_frame(&key_frame_bytes)
+        .unwrap();
+    let keys = derive_keys_v2(&E2_DEK, &open.header.hkdf_salt, &header_hash).unwrap();
+    let metadata_plaintext = open.metadata.to_cbor_bytes(open.header.chunk_size).unwrap();
+    let metadata_start = 128usize + key_frame_bytes.len();
+    let metadata_end = metadata_start + open.header.metadata_frame_len as usize;
+    let footer_offset = inspect.footer_offset as usize;
+
+    assert_eq!(
+        inspect.plaintext_size,
+        u64_field(e2_expected, "plaintext_size")
+    );
+    assert_eq!(inspect.chunk_count, u64_field(e2_expected, "chunk_count"));
+    assert_eq!(
+        metadata_plaintext.len() as u64,
+        u64_field(e2_expected, "metadata_plaintext_len")
+    );
+    assert_eq!(
+        hex(&metadata_plaintext),
+        str_field(e2_expected, "metadata_plaintext_hex")
+    );
+    assert_eq!(
+        key_frame_bytes.len() as u64,
+        u64_field(e2_expected, "key_frame_len")
+    );
+    assert_eq!(
+        hex(&key_frame_bytes),
+        str_field(e2_expected, "key_frame_hex")
+    );
+    assert_eq!(hex(&header_bytes), str_field(e2_expected, "header_hex"));
+    assert_eq!(hex(&header_hash), str_field(e2_expected, "header_hash"));
+    assert_eq!(
+        hex(&open.header.hkdf_salt),
+        str_field(e2_expected, "hkdf_salt")
+    );
+    assert_eq!(
+        hex(&keys.object_secret),
+        str_field(e2_expected, "object_secret")
+    );
+    assert_eq!(
+        hex(&keys.metadata_key),
+        str_field(e2_expected, "metadata_key")
+    );
+    assert_eq!(
+        hex(&keys.payload_key),
+        str_field(e2_expected, "payload_key")
+    );
+    assert_eq!(
+        hex(&e2_first[metadata_start..metadata_end]),
+        str_field(e2_expected, "metadata_frame_hex")
+    );
+    assert_eq!(
+        sha256_hex(&e2_first[metadata_end..footer_offset]),
+        str_field(e2_expected, "payload_frame_sha256")
+    );
+    assert_eq!(
+        inspect.footer_offset,
+        u64_field(e2_expected, "footer_offset")
+    );
+    assert_eq!(
+        inspect.stored_size_bytes,
+        u64_field(e2_expected, "stored_size_bytes")
+    );
+    assert_eq!(
+        hex(&inspect.stored_digest),
+        str_field(e2_expected, "stored_digest")
+    );
+    assert_eq!(
+        hex(&open.metadata.plaintext_digest),
+        str_field(e2_expected, "plaintext_digest")
+    );
 }
 
 #[test]

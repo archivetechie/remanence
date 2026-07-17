@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
-"""Independently re-derive the retained RAO positive plaintext manifests.
+"""Independently re-derive and open the RAO positive publication vectors.
 
 This verifier deliberately avoids the Remanence Rust crates. It rebuilds the
 RAO-TV-P1 and RAO-TV-D1 plaintext tar streams, the additional positive
-plaintext vectors, and deterministic manifest CBOR. Retired v1 encrypted
-vectors are no longer generated here; the v2 deterministic envelope
-expectation is pinned by the Rust vector test until the P2 publication packet
-is regenerated. The goal is to catch reference
-implementation bugs before pinned-at-generation values become conformance
-anchors.
+plaintext vectors, and deterministic manifest CBOR. It independently opens
+the pinned RAO-TV-E2 and encrypted RAO-TV-D1 objects with generic X25519,
+HKDF-SHA-256, and ChaCha20-Poly1305 primitives, then verifies the recovered
+canonical bytes, plaintext digest, manifest, and per-file digests.
 
 With --check-plaintext-interop it also exercises the Section 14 plaintext
 interop gate for the positive plaintext vectors using GNU tar, bsdtar, and
 Python's tarfile module.
 
-The retired --long-term-recovery-drill flag fails loudly until its P2 v2
-replacement lands.
 """
 
 from __future__ import annotations
@@ -23,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import io
 import json
 import pathlib
 import shutil
@@ -33,6 +30,11 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.x25519 import (
+    X25519PrivateKey,
+    X25519PublicKey,
+)
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 
@@ -52,12 +54,18 @@ TYPE_PAX_GLOBAL = b"g"[0]
 PAD_KEY = "REMANENCE.pad"
 RAO_HEADER_LEN = 128
 RAO_FOOTER = b"RAO1_STREAM_END."
-LABEL_SALT = b"rao1-salt-v1"
-LABEL_OBJECT = b"rao1-object-v1"
-LABEL_METADATA = b"rao1-metadata-v1"
-LABEL_PAYLOAD = b"rao1-payload-v1"
-KEY_ID = b"KID:rao-tv-e1.01"
-ROOT_KEY = bytes(range(32))
+LABEL_SALT_V2 = b"rao2-salt-v1"
+LABEL_OBJECT_V2 = b"rao2-object-v1"
+LABEL_METADATA_V2 = b"rao2-metadata-v1"
+LABEL_PAYLOAD_V2 = b"rao2-payload-v1"
+WRAP_INFO_PREFIX = b"rao-wrap-v1\0"
+HPKE_VERSION_LABEL = b"HPKE-v1"
+HPKE_KEM_ID = 0x0020
+HPKE_KDF_ID = 0x0001
+HPKE_AEAD_ID = 0x0003
+RAO_KEY_FRAME_MIN_LEN = 103
+RAO_KEY_FRAME_MAX_LEN = 4096
+RAO_KEY_FRAME_MAX_SLOTS = 8
 
 
 @dataclass
@@ -116,10 +124,20 @@ class FileLayout:
 class EncryptedHeader:
     bytes: bytes
     chunk_size: int
-    key_id: bytes
     salt: bytes
     metadata_frame_len: int
     object_id: str
+    wrap_suite: int
+    key_frame_len: int
+
+
+@dataclass
+class RecipientSlot:
+    slot_index: int
+    recipient_epoch_id: bytes
+    epoch_label: str
+    enc: bytes
+    ciphertext: bytes
 
 
 def sha256(data: bytes) -> bytes:
@@ -130,8 +148,8 @@ def hx(data: bytes) -> str:
     return data.hex()
 
 
-def load(name: str) -> dict[str, Any]:
-    with (FIXTURES / name).open("r", encoding="utf-8") as handle:
+def load(directory: pathlib.Path, name: str) -> dict[str, Any]:
+    with (directory / name).open("r", encoding="utf-8") as handle:
         return json.load(handle)
 
 
@@ -647,86 +665,24 @@ def object_id_field(object_id: str) -> bytes:
     return data + b"\0" * (64 - len(data))
 
 
-def metadata_plaintext(plaintext_size: int, plaintext_digest: bytes) -> bytes:
-    return cbor({0: 1, 1: plaintext_size, 2: "sha256", 3: plaintext_digest})
-
-
-def derive_salt(root_key: bytes, object_id: str, plaintext_digest: bytes, metadata: bytes) -> bytes:
+def derive_salt_v2(
+    dek: bytes,
+    object_id: str,
+    plaintext_digest: bytes,
+    metadata: bytes,
+) -> tuple[bytes, int]:
     metadata_hash = sha256(metadata)
     oid = object_id_field(object_id)
     for ctr in range(256):
-        info = LABEL_SALT + bytes([ctr]) + oid + plaintext_digest + metadata_hash
-        salt = hkdf(b"", root_key, info, 16)
+        info = LABEL_SALT_V2 + bytes([ctr]) + oid + plaintext_digest + metadata_hash
+        salt = hkdf(b"", dek, info, 16)
         if salt != b"\0" * 16:
-            return salt
+            return salt, ctr
     raise AssertionError("could not derive nonzero salt")
-
-
-def serialize_header(chunk_size: int, key_id: bytes, salt: bytes, metadata_frame_len: int, object_id: str) -> bytes:
-    return (
-        b"RAO1"
-        + RAO_HEADER_LEN.to_bytes(2, "big")
-        + b"\x01\x01"
-        + chunk_size.to_bytes(4, "big")
-        + (0).to_bytes(4, "big")
-        + key_id
-        + salt
-        + metadata_frame_len.to_bytes(8, "big")
-        + b"\0" * 8
-        + object_id_field(object_id)
-    )
 
 
 def stream_nonce(counter: int, final_chunk: bool) -> bytes:
     return b"\0\0\0" + counter.to_bytes(8, "big") + (b"\x01" if final_chunk else b"\x00")
-
-
-def seal(plaintext: bytes, options: dict[str, Any], root_key: bytes, key_id: bytes) -> dict[str, Any]:
-    chunk_size = options["chunk_size"]
-    plaintext_digest = sha256(plaintext)
-    metadata = metadata_plaintext(len(plaintext), plaintext_digest)
-    metadata_frame_len = len(metadata) + 16
-    salt = derive_salt(root_key, options["object_id"], plaintext_digest, metadata)
-    header = serialize_header(chunk_size, key_id, salt, metadata_frame_len, options["object_id"])
-    header_hash = sha256(header)
-    object_secret = hkdf(salt, root_key, LABEL_OBJECT + header_hash, 32)
-    metadata_key = hkdf(b"", object_secret, LABEL_METADATA, 32)
-    payload_key = hkdf(b"", object_secret, LABEL_PAYLOAD, 32)
-
-    metadata_frame = ChaCha20Poly1305(metadata_key).encrypt(b"\0" * 12, metadata, b"")
-    payload = bytearray()
-    chunks = [plaintext[i : i + chunk_size] for i in range(0, len(plaintext), chunk_size)]
-    for index, chunk in enumerate(chunks):
-        payload.extend(
-            ChaCha20Poly1305(payload_key).encrypt(
-                stream_nonce(index, index + 1 == len(chunks)),
-                chunk,
-                b"",
-            )
-        )
-    stored = bytearray(header + metadata_frame + bytes(payload) + RAO_FOOTER)
-    stored_size = round_up(len(stored), chunk_size)
-    stored.extend(b"\0" * (stored_size - len(stored)))
-    return {
-        "plaintext_size": len(plaintext),
-        "chunk_count": len(chunks),
-        "metadata_plaintext_len": len(metadata),
-        "metadata_frame_len": metadata_frame_len,
-        "payload_frame_start": RAO_HEADER_LEN + metadata_frame_len,
-        "payload_frame_end_inclusive": RAO_HEADER_LEN + metadata_frame_len + len(payload) - 1,
-        "footer_offset": RAO_HEADER_LEN + metadata_frame_len + len(payload),
-        "stored_size_bytes": len(stored),
-        "stored_size_blocks": len(stored) // chunk_size,
-        "hkdf_salt": salt,
-        "header": header,
-        "header_hash": header_hash,
-        "metadata_key": metadata_key,
-        "payload_key": payload_key,
-        "metadata_frame": metadata_frame,
-        "payload_frame": bytes(payload),
-        "stored": bytes(stored),
-        "plaintext_digest": plaintext_digest,
-    }
 
 
 def check_plaintext(vector_id: str, fixture: dict[str, Any], plaintext: bytes, layout: dict[str, Any], expected: dict[str, Any]) -> None:
@@ -746,29 +702,6 @@ def check_layouts(vector_id: str, layouts: list[FileLayout], expected_layouts: l
                 assert_eq(getattr(layout, field), expected[field], f"{vector_id} {layout.path} {field}")
 
 
-def check_encrypted(vector_id: str, actual: dict[str, Any], expected: dict[str, Any]) -> None:
-    scalar_fields = [
-        "plaintext_size",
-        "chunk_count",
-        "metadata_plaintext_len",
-        "metadata_frame_len",
-        "payload_frame_start",
-        "payload_frame_end_inclusive",
-        "footer_offset",
-        "stored_size_bytes",
-        "stored_size_blocks",
-    ]
-    for field in scalar_fields:
-        assert_eq(actual[field], expected[field], f"{vector_id} {field}")
-    assert_eq(hx(actual["hkdf_salt"]), expected["hkdf_salt"], f"{vector_id} hkdf_salt")
-    assert_eq(hx(actual["header"]), expected["header_hex"], f"{vector_id} header_hex")
-    assert_eq(hx(actual["header_hash"]), expected["header_hash"], f"{vector_id} header_hash")
-    assert_eq(hx(actual["metadata_key"]), expected["metadata_key"], f"{vector_id} metadata_key")
-    assert_eq(hx(actual["payload_key"]), expected["payload_key"], f"{vector_id} payload_key")
-    assert_eq(hx(actual["metadata_frame"]), expected["metadata_frame_hex"], f"{vector_id} metadata_frame_hex")
-    assert_eq(hx(sha256(actual["payload_frame"])), expected["payload_frame_sha256"], f"{vector_id} payload_frame_sha256")
-    assert_eq(hx(sha256(actual["stored"])), expected["stored_digest"], f"{vector_id} stored_digest")
-    assert_eq(hx(actual["plaintext_digest"]), expected["plaintext_digest"], f"{vector_id} plaintext_digest")
 
 
 def vector_options(suffix: int, caller_object_id: str, manifest_suffix: str) -> dict[str, Any]:
@@ -1283,42 +1216,6 @@ def check_plaintext_interop(vectors: list[PlaintextVector], allow_missing_bsdtar
     print(f"verified RAO plaintext interop for {vector_ids} with {readers}")
 
 
-def require_standard_tar() -> str:
-    path = shutil.which("tar")
-    if path is None:
-        raise AssertionError("standard tar not found on PATH")
-    return path
-
-
-def run_standard_tar_extract(
-    vector_id: str,
-    chunk_size: int,
-    archive: pathlib.Path,
-    out_dir: pathlib.Path,
-) -> None:
-    tar_path = require_standard_tar()
-    result = subprocess.run(
-        [
-            tar_path,
-            "-b",
-            str(chunk_size // TAR_RECORD_SIZE),
-            "-xf",
-            str(archive),
-            "-C",
-            str(out_dir),
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise AssertionError(
-            f"{vector_id} standard tar failed with exit {result.returncode}\n"
-            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-        )
-
-
 def find_manifest_entry(manifest: dict[Any, Any], path: str) -> dict[Any, Any]:
     entries = manifest.get("file_entries")
     if not isinstance(entries, list):
@@ -1329,80 +1226,31 @@ def find_manifest_entry(manifest: dict[Any, Any], path: str) -> dict[Any, Any]:
     return matches[0]
 
 
-def verify_manifest_payload(
-    vector_id: str,
-    manifest_cbor: bytes,
-    payload_path: str,
-    payload: bytes,
-    chunk_size: int,
-    object_id: str,
-) -> None:
-    manifest = decode_cbor_exact(manifest_cbor)
-    if not isinstance(manifest, dict):
-        raise AssertionError(f"{vector_id}: manifest is not a CBOR map")
-    assert_eq(manifest.get("schema_version"), 1, f"{vector_id} manifest schema_version")
-    assert_eq(manifest.get("chunk_size"), chunk_size, f"{vector_id} manifest chunk_size")
-    assert_eq(manifest.get("object_id"), object_id, f"{vector_id} manifest object_id")
-    entry = find_manifest_entry(manifest, payload_path)
-    assert_eq(entry.get("size_bytes"), len(payload), f"{vector_id} {payload_path} size_bytes")
-    assert_eq(entry.get("file_sha256"), sha256(payload), f"{vector_id} {payload_path} file_sha256")
-    assert_eq(entry.get("chunk_count"), chunk_count(len(payload), chunk_size), f"{vector_id} {payload_path} chunk_count")
-
-
-def verify_payload_with_standard_tar(
-    vector_id: str,
-    archive_bytes: bytes,
-    chunk_size: int,
-    payload_path: str,
-    expected_payload: bytes,
-    object_id: str,
-    tmp: pathlib.Path,
-) -> None:
-    archive = tmp / f"{vector_id}.rao"
-    out_dir = tmp / f"{vector_id}-extract"
-    out_dir.mkdir()
-    archive.write_bytes(archive_bytes)
-    run_standard_tar_extract(vector_id, chunk_size, archive, out_dir)
-    payload_file = out_dir / payload_path
-    manifest_file = out_dir / MANIFEST_PATH
-    if not payload_file.is_file():
-        raise AssertionError(f"{vector_id}: standard tar did not extract {payload_path!r}")
-    if not manifest_file.is_file():
-        raise AssertionError(f"{vector_id}: standard tar did not extract {MANIFEST_PATH!r}")
-    payload = payload_file.read_bytes()
-    assert_eq(payload, expected_payload, f"{vector_id} standard tar {payload_path}")
-    verify_manifest_payload(
-        vector_id,
-        manifest_file.read_bytes(),
-        payload_path,
-        payload,
-        chunk_size,
-        object_id,
-    )
-
-
 def parse_encrypted_header(stored: bytes) -> EncryptedHeader:
     if len(stored) < RAO_HEADER_LEN:
         raise AssertionError("encrypted object is shorter than the RAO1 header")
     header = stored[:RAO_HEADER_LEN]
     assert_eq(header[:4], b"RAO1", "encrypted header magic")
     assert_eq(int.from_bytes(header[4:6], "big"), RAO_HEADER_LEN, "encrypted header_len")
-    assert_eq(header[6], 1, "encrypted format_version")
+    assert_eq(header[6], 2, "encrypted format_version")
     assert_eq(header[7], 1, "encrypted suite_id")
     chunk_size = int.from_bytes(header[8:12], "big")
     if chunk_size <= 0 or chunk_size % TAR_RECORD_SIZE != 0:
         raise AssertionError(f"encrypted chunk_size is invalid: {chunk_size}")
     assert_eq(header[12:16], b"\0" * 4, "encrypted flags")
-    key_id = header[16:32]
-    if key_id == b"\0" * 16:
-        raise AssertionError("encrypted key_id is all zero")
+    assert_eq(header[16:32], b"\0" * 16, "encrypted reserved key region")
     salt = header[32:48]
     if salt == b"\0" * 16:
         raise AssertionError("encrypted hkdf_salt is all zero")
     metadata_frame_len = int.from_bytes(header[48:56], "big")
-    if metadata_frame_len < 17:
-        raise AssertionError(f"metadata frame length is too small: {metadata_frame_len}")
-    assert_eq(header[56:64], b"\0" * 8, "encrypted reserved")
+    if not 17 <= metadata_frame_len <= 16 * 1024 * 1024:
+        raise AssertionError(f"metadata frame length is invalid: {metadata_frame_len}")
+    wrap_suite = header[56]
+    assert_eq(wrap_suite, 1, "encrypted wrap_suite")
+    assert_eq(header[57:60], b"\0" * 3, "encrypted reserved")
+    key_frame_len = int.from_bytes(header[60:64], "big")
+    if not RAO_KEY_FRAME_MIN_LEN <= key_frame_len <= RAO_KEY_FRAME_MAX_LEN:
+        raise AssertionError(f"encrypted key_frame_len is invalid: {key_frame_len}")
     object_id_field_bytes = header[64:128]
     if object_id_field_bytes == b"\0" * 64:
         raise AssertionError("encrypted object_id field is empty")
@@ -1417,7 +1265,160 @@ def parse_encrypted_header(stored: bytes) -> EncryptedHeader:
         object_id = object_id_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise AssertionError("encrypted object_id field is not UTF-8") from exc
-    return EncryptedHeader(header, chunk_size, key_id, salt, metadata_frame_len, object_id)
+    return EncryptedHeader(
+        header,
+        chunk_size,
+        salt,
+        metadata_frame_len,
+        object_id,
+        wrap_suite,
+        key_frame_len,
+    )
+
+
+def parse_key_frame(vector_id: str, encoded: bytes) -> list[RecipientSlot]:
+    if not RAO_KEY_FRAME_MIN_LEN <= len(encoded) <= RAO_KEY_FRAME_MAX_LEN:
+        raise AssertionError(f"{vector_id}: key frame length is outside bounds")
+    assert_eq(encoded[:4], b"RAOK", f"{vector_id} key frame magic")
+    slot_count = encoded[4]
+    if not 1 <= slot_count <= RAO_KEY_FRAME_MAX_SLOTS:
+        raise AssertionError(f"{vector_id}: invalid key-frame slot count {slot_count}")
+    cursor = 5
+    slots: list[RecipientSlot] = []
+    for _ in range(slot_count):
+        if cursor + 18 > len(encoded):
+            raise AssertionError(f"{vector_id}: truncated key-frame slot prefix")
+        slot_index = encoded[cursor]
+        recipient_epoch_id = encoded[cursor + 1 : cursor + 17]
+        label_len = encoded[cursor + 17]
+        cursor += 18
+        end = cursor + label_len + 32 + 48
+        if label_len > 32 or end > len(encoded):
+            raise AssertionError(f"{vector_id}: truncated or oversized key-frame slot")
+        label_bytes = encoded[cursor : cursor + label_len]
+        if not all(0x20 <= byte <= 0x7E for byte in label_bytes):
+            raise AssertionError(f"{vector_id}: invalid key-frame label")
+        epoch_label = label_bytes.decode("ascii")
+        cursor += label_len
+        enc = encoded[cursor : cursor + 32]
+        cursor += 32
+        ciphertext = encoded[cursor : cursor + 48]
+        cursor += 48
+        if slots and slot_index <= slots[-1].slot_index:
+            raise AssertionError(f"{vector_id}: key-frame slots are not strictly ordered")
+        if any(slot.recipient_epoch_id == recipient_epoch_id for slot in slots):
+            raise AssertionError(f"{vector_id}: duplicate recipient_epoch_id")
+        slots.append(
+            RecipientSlot(
+                slot_index,
+                recipient_epoch_id,
+                epoch_label,
+                enc,
+                ciphertext,
+            )
+        )
+    if cursor != len(encoded):
+        raise AssertionError(f"{vector_id}: trailing key-frame bytes")
+    return slots
+
+
+def hpke_labeled_extract(
+    suite_id: bytes,
+    salt: bytes,
+    label: bytes,
+    ikm: bytes,
+) -> bytes:
+    return hkdf_extract(salt, HPKE_VERSION_LABEL + suite_id + label + ikm)
+
+
+def hpke_labeled_expand(
+    suite_id: bytes,
+    prk: bytes,
+    label: bytes,
+    info: bytes,
+    length: int,
+) -> bytes:
+    labeled_info = (
+        length.to_bytes(2, "big")
+        + HPKE_VERSION_LABEL
+        + suite_id
+        + label
+        + info
+    )
+    return hkdf_expand(prk, labeled_info, length)
+
+
+def hpke_unwrap_dek(
+    vector_id: str,
+    slot: RecipientSlot,
+    object_id: str,
+    recipient: dict[str, Any],
+) -> tuple[bytes, dict[str, bytes]]:
+    private_bytes = bytes.fromhex(recipient["private_key"])
+    expected_public = bytes.fromhex(recipient["public_key"])
+    private_key = X25519PrivateKey.from_private_bytes(private_bytes)
+    actual_public = private_key.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    assert_eq(actual_public, expected_public, f"{vector_id} recipient public key")
+    assert_eq(
+        slot.recipient_epoch_id,
+        bytes.fromhex(recipient["recipient_epoch_id"]),
+        f"{vector_id} recipient epoch id",
+    )
+    assert_eq(slot.slot_index, recipient["slot_index"], f"{vector_id} recipient slot")
+    assert_eq(slot.epoch_label, recipient["epoch_label"], f"{vector_id} recipient label")
+
+    kem_suite_id = b"KEM" + HPKE_KEM_ID.to_bytes(2, "big")
+    dh = private_key.exchange(X25519PublicKey.from_public_bytes(slot.enc))
+    kem_context = slot.enc + actual_public
+    eae_prk = hpke_labeled_extract(kem_suite_id, b"", b"eae_prk", dh)
+    shared_secret = hpke_labeled_expand(
+        kem_suite_id,
+        eae_prk,
+        b"shared_secret",
+        kem_context,
+        32,
+    )
+
+    hpke_suite_id = (
+        b"HPKE"
+        + HPKE_KEM_ID.to_bytes(2, "big")
+        + HPKE_KDF_ID.to_bytes(2, "big")
+        + HPKE_AEAD_ID.to_bytes(2, "big")
+    )
+    info = (
+        WRAP_INFO_PREFIX
+        + object_id_field(object_id)
+        + slot.recipient_epoch_id
+        + bytes([slot.slot_index, 2, 1])
+    )
+    psk_id_hash = hpke_labeled_extract(hpke_suite_id, b"", b"psk_id_hash", b"")
+    info_hash = hpke_labeled_extract(hpke_suite_id, b"", b"info_hash", info)
+    key_schedule_context = b"\0" + psk_id_hash + info_hash
+    secret = hpke_labeled_extract(hpke_suite_id, shared_secret, b"secret", b"")
+    key = hpke_labeled_expand(
+        hpke_suite_id,
+        secret,
+        b"key",
+        key_schedule_context,
+        32,
+    )
+    base_nonce = hpke_labeled_expand(
+        hpke_suite_id,
+        secret,
+        b"base_nonce",
+        key_schedule_context,
+        12,
+    )
+    dek = ChaCha20Poly1305(key).decrypt(base_nonce, slot.ciphertext, b"")
+    assert_eq(len(dek), 32, f"{vector_id} unwrapped DEK length")
+    return dek, {
+        "shared_secret": shared_secret,
+        "key": key,
+        "base_nonce": base_nonce,
+    }
 
 
 def validate_encrypted_metadata(vector_id: str, metadata: Any, chunk_size: int) -> tuple[int, bytes]:
@@ -1440,17 +1441,43 @@ def validate_encrypted_metadata(vector_id: str, metadata: Any, chunk_size: int) 
 def open_encrypted_with_generic_crypto(
     vector_id: str,
     stored: bytes,
-    root_key: bytes,
-    expected_key_id: bytes,
-) -> tuple[bytes, EncryptedHeader]:
+    recipient: dict[str, Any],
+    expected: dict[str, Any],
+    expected_dek: bytes,
+) -> tuple[bytes, EncryptedHeader, dict[str, Any]]:
     header = parse_encrypted_header(stored)
-    assert_eq(header.key_id, expected_key_id, f"{vector_id} key_id")
-    header_hash = sha256(header.bytes)
-    object_secret = hkdf(header.salt, root_key, LABEL_OBJECT + header_hash, 32)
-    metadata_key = hkdf(b"", object_secret, LABEL_METADATA, 32)
-    payload_key = hkdf(b"", object_secret, LABEL_PAYLOAD, 32)
+    key_frame_start = RAO_HEADER_LEN
+    key_frame_end = key_frame_start + header.key_frame_len
+    if key_frame_end > len(stored):
+        raise AssertionError(f"{vector_id}: encrypted object ends inside key frame")
+    key_frame = stored[key_frame_start:key_frame_end]
+    slots = parse_key_frame(vector_id, key_frame)
+    recipient_epoch_id = bytes.fromhex(recipient["recipient_epoch_id"])
+    matching_slots = [
+        slot for slot in slots if slot.recipient_epoch_id == recipient_epoch_id
+    ]
+    if len(matching_slots) != 1:
+        raise AssertionError(
+            f"{vector_id}: found {len(matching_slots)} slots for recipient epoch"
+        )
+    dek, hpke_trace = hpke_unwrap_dek(
+        vector_id,
+        matching_slots[0],
+        header.object_id,
+        recipient,
+    )
+    assert_eq(dek, expected_dek, f"{vector_id} unwrapped DEK")
+    header_hash = sha256(header.bytes + key_frame)
+    object_secret = hkdf(
+        header.salt,
+        dek,
+        LABEL_OBJECT_V2 + header_hash,
+        32,
+    )
+    metadata_key = hkdf(b"", object_secret, LABEL_METADATA_V2, 32)
+    payload_key = hkdf(b"", object_secret, LABEL_PAYLOAD_V2, 32)
 
-    metadata_start = RAO_HEADER_LEN
+    metadata_start = key_frame_end
     metadata_end = metadata_start + header.metadata_frame_len
     if metadata_end > len(stored):
         raise AssertionError(f"{vector_id}: encrypted object ends inside metadata frame")
@@ -1462,7 +1489,12 @@ def open_encrypted_with_generic_crypto(
         metadata,
         header.chunk_size,
     )
-    expected_salt = derive_salt(root_key, header.object_id, plaintext_digest, metadata_plain)
+    expected_salt, salt_derivation_counter = derive_salt_v2(
+        dek,
+        header.object_id,
+        plaintext_digest,
+        metadata_plain,
+    )
     assert_eq(header.salt, expected_salt, f"{vector_id} derived salt")
 
     chunk_total = plaintext_size // header.chunk_size
@@ -1494,61 +1526,166 @@ def open_encrypted_with_generic_crypto(
     recovered = bytes(plaintext)
     assert_eq(len(recovered), plaintext_size, f"{vector_id} recovered plaintext_size")
     assert_eq(sha256(recovered), plaintext_digest, f"{vector_id} recovered plaintext_digest")
-    return recovered, header
+    actual = {
+        "plaintext_size": plaintext_size,
+        "chunk_count": chunk_total,
+        "metadata_plaintext_len": len(metadata_plain),
+        "metadata_frame_len": len(metadata_frame),
+        "metadata_plaintext_hex": hx(metadata_plain),
+        "metadata_hash": hx(sha256(metadata_plain)),
+        "key_frame_len": len(key_frame),
+        "key_frame_hex": hx(key_frame),
+        "header_hex": hx(header.bytes),
+        "header_hash": hx(header_hash),
+        "hkdf_salt": hx(header.salt),
+        "salt_derivation_counter": salt_derivation_counter,
+        "object_secret": hx(object_secret),
+        "metadata_key": hx(metadata_key),
+        "payload_key": hx(payload_key),
+        "metadata_frame_hex": hx(metadata_frame),
+        "payload_frame_start": payload_start,
+        "payload_frame_end_inclusive": footer_offset - 1,
+        "payload_frame_sha256": hx(sha256(stored[payload_start:footer_offset])),
+        "footer_offset": footer_offset,
+        "stored_size_bytes": len(stored),
+        "stored_size_blocks": len(stored) // header.chunk_size,
+        "stored_digest": hx(sha256(stored)),
+        "plaintext_digest": hx(plaintext_digest),
+    }
+    unknown_expected = set(expected) - set(actual) - {"slots"}
+    if unknown_expected:
+        raise AssertionError(
+            f"{vector_id}: unverified expected fields {sorted(unknown_expected)!r}"
+        )
+    for key, expected_value in expected.items():
+        if key in actual:
+            assert_eq(actual[key], expected_value, f"{vector_id} {key}")
+    expected_slots = expected.get("slots", [])
+    if expected_slots:
+        assert_eq(len(slots), len(expected_slots), f"{vector_id} expected slots")
+        for slot, expected_slot in zip(slots, expected_slots, strict=True):
+            assert_eq(slot.slot_index, expected_slot["slot_index"], f"{vector_id} slot index")
+            assert_eq(
+                hx(slot.recipient_epoch_id),
+                expected_slot["recipient_epoch_id"],
+                f"{vector_id} slot epoch id",
+            )
+            assert_eq(slot.epoch_label, expected_slot["epoch_label"], f"{vector_id} slot label")
+            assert_eq(hx(slot.enc), expected_slot["enc"], f"{vector_id} slot enc")
+            assert_eq(
+                hx(slot.ciphertext),
+                expected_slot["wrapped_dek_ciphertext"],
+                f"{vector_id} slot ciphertext",
+            )
+    trace_expected = next(
+        (
+            expected_slot
+            for expected_slot in expected_slots
+            if expected_slot["slot_index"] == recipient["slot_index"]
+        ),
+        {},
+    )
+    for key, value in hpke_trace.items():
+        expected_key = f"hpke_{key}"
+        if expected_key in trace_expected:
+            assert_eq(hx(value), trace_expected[expected_key], f"{vector_id} {expected_key}")
+    return recovered, header, actual
 
 
-def check_long_term_recovery_drill(
+def verify_recovered_file_digests(
+    vector_id: str,
+    recovered: bytes,
+    expected_files: dict[str, bytes],
+    object_id: str,
+    chunk_size: int,
+) -> None:
+    with tarfile.open(fileobj=io.BytesIO(recovered), mode="r:") as archive:
+        manifest_file = archive.extractfile(MANIFEST_PATH)
+        if manifest_file is None:
+            raise AssertionError(f"{vector_id}: recovered manifest is absent")
+        manifest_bytes = manifest_file.read()
+        assert_eq(
+            manifest_bytes,
+            expected_files[MANIFEST_PATH],
+            f"{vector_id} recovered manifest bytes",
+        )
+        manifest = decode_cbor_exact(manifest_bytes)
+        if not isinstance(manifest, dict):
+            raise AssertionError(f"{vector_id}: recovered manifest is not a map")
+        assert_eq(manifest.get("object_id"), object_id, f"{vector_id} manifest object_id")
+        assert_eq(manifest.get("chunk_size"), chunk_size, f"{vector_id} manifest chunk_size")
+        for path, expected_payload in expected_files.items():
+            if path == MANIFEST_PATH:
+                continue
+            payload_file = archive.extractfile(path)
+            if payload_file is None:
+                raise AssertionError(f"{vector_id}: recovered payload {path!r} is absent")
+            payload = payload_file.read()
+            assert_eq(payload, expected_payload, f"{vector_id} recovered {path}")
+            entry = find_manifest_entry(manifest, path)
+            assert_eq(entry.get("size_bytes"), len(payload), f"{vector_id} {path} size")
+            assert_eq(
+                entry.get("file_sha256"),
+                sha256(payload),
+                f"{vector_id} {path} digest",
+            )
+
+
+def check_v2_recovery_vector(
     plaintext_vector: PlaintextVector,
     encrypted_vector_id: str,
     encrypted_stored: bytes,
-    encrypted_root_key: bytes,
-    encrypted_key_id: bytes,
-    payload_path: str,
+    fixture: dict[str, Any],
     object_id: str,
 ) -> None:
-    expected_payload = plaintext_vector.expected_files[payload_path]
-    with tempfile.TemporaryDirectory(prefix="rao-long-term-recovery-") as tmp_name:
-        tmp = pathlib.Path(tmp_name)
-        verify_payload_with_standard_tar(
-            plaintext_vector.vector_id,
-            plaintext_vector.plaintext,
-            plaintext_vector.chunk_size,
-            payload_path,
-            expected_payload,
-            object_id,
-            tmp,
-        )
-        recovered_plaintext, encrypted_header = open_encrypted_with_generic_crypto(
+    inputs = fixture["inputs"]
+    expected = fixture["expected"]
+    if "encrypted" in expected:
+        expected = expected["encrypted"]
+    recovered_plaintext = b""
+    encrypted_header: EncryptedHeader | None = None
+    for recipient in inputs["recipients"]:
+        recovered_plaintext, current_header, _actual = open_encrypted_with_generic_crypto(
             encrypted_vector_id,
             encrypted_stored,
-            encrypted_root_key,
-            encrypted_key_id,
+            recipient,
+            expected,
+            bytes.fromhex(inputs["deterministic_dek"]),
         )
-        assert_eq(recovered_plaintext, plaintext_vector.plaintext, f"{encrypted_vector_id} recovered plaintext")
-        assert_eq(encrypted_header.chunk_size, plaintext_vector.chunk_size, f"{encrypted_vector_id} header chunk_size")
-        assert_eq(encrypted_header.object_id, object_id, f"{encrypted_vector_id} header object_id")
-        verify_payload_with_standard_tar(
-            encrypted_vector_id,
+        assert_eq(
             recovered_plaintext,
-            encrypted_header.chunk_size,
-            payload_path,
-            expected_payload,
-            encrypted_header.object_id,
-            tmp,
+            plaintext_vector.plaintext,
+            f"{encrypted_vector_id} recovered plaintext",
         )
-    print(
-        "verified RAO long-term recovery drill for RAO-TV-P1 plaintext and "
-        "RAO-TV-E1 encrypted twin"
+        if encrypted_header is None:
+            encrypted_header = current_header
+        else:
+            assert_eq(current_header, encrypted_header, f"{encrypted_vector_id} header")
+    if encrypted_header is None:
+        raise AssertionError(f"{encrypted_vector_id}: fixture has no recipient test material")
+    assert_eq(
+        encrypted_header.chunk_size,
+        plaintext_vector.chunk_size,
+        f"{encrypted_vector_id} header chunk_size",
+    )
+    assert_eq(encrypted_header.object_id, object_id, f"{encrypted_vector_id} header object_id")
+    verify_recovered_file_digests(
+        encrypted_vector_id,
+        recovered_plaintext,
+        plaintext_vector.expected_files,
+        object_id,
+        plaintext_vector.chunk_size,
     )
 
 
 def check_positive_plaintext_fixture(
+    fixture_directory: pathlib.Path,
     filename: str,
     vector_id: str,
     options: dict[str, Any],
     files: list[FileSpec],
 ) -> PlaintextVector:
-    fixture = load(filename)
+    fixture = load(fixture_directory, filename)
     expected = fixture["expected"]
     assert_eq(fixture["vector_id"], vector_id, f"{vector_id} fixture id")
     plaintext, layout = build_plaintext(options, files)
@@ -1594,11 +1731,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="also require Section 14 extraction equality for positive plaintext vectors",
     )
     parser.add_argument(
-        "--long-term-recovery-drill",
-        action="store_true",
-        help="retired with the v1 encrypted vector; fails until the P2 v2 drill lands",
-    )
-    parser.add_argument(
         "--allow-missing-bsdtar",
         action="store_true",
         help="with --check-plaintext-interop, run available checks when bsdtar is absent",
@@ -1613,22 +1745,36 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=pathlib.Path,
         help="write the regenerated positive object byte streams to this directory",
     )
+    parser.add_argument(
+        "--fixture-directory",
+        type=pathlib.Path,
+        default=FIXTURES,
+        help="directory containing the RAO fixture manifests",
+    )
+    parser.add_argument(
+        "--encrypted-object-directory",
+        type=pathlib.Path,
+        default=FIXTURES / "objects",
+        help="directory containing the pinned RAO-TV-E2 and encrypted RAO-TV-D1 objects",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    fixture_directory = args.fixture_directory
     if args.write_new_plaintext_fixtures:
         for filename, vector_id, options, files in positive_plaintext_vector_definitions():
             payload = fixture_json(vector_id, options, files)
-            (FIXTURES / filename).write_text(
+            (fixture_directory / filename).write_text(
                 json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
                 encoding="utf-8",
             )
         print("wrote additional RAO 13.1 positive plaintext fixtures")
 
-    p1 = load("rao-tv-p1.json")
-    d1 = load("rao-tv-d1.json")
+    p1 = load(fixture_directory, "rao-tv-p1.json")
+    e2 = load(fixture_directory, "rao-tv-e2.json")
+    d1 = load(fixture_directory, "rao-tv-d1.json")
 
     p1_files = [
         FileSpec("a/hello.txt", "00000000-0000-4000-8000-000000000010", b"hello, rem archive object\n"),
@@ -1677,9 +1823,29 @@ def main(argv: list[str] | None = None) -> int:
         expected_directories=expected_directories([d1_file]),
     )
     extra_plaintext_vectors = [
-        check_positive_plaintext_fixture(filename, vector_id, options, files)
+        check_positive_plaintext_fixture(
+            fixture_directory, filename, vector_id, options, files
+        )
         for filename, vector_id, options, files in positive_plaintext_vector_definitions()
     ]
+
+    encrypted_directory = args.encrypted_object_directory
+    e2_stored = (encrypted_directory / "rao-tv-e2.rao").read_bytes()
+    d1_encrypted_stored = (encrypted_directory / "rao-tv-d1-encrypted.rao").read_bytes()
+    check_v2_recovery_vector(
+        p1_vector,
+        "RAO-TV-E2",
+        e2_stored,
+        e2,
+        p1["inputs"]["object_id"],
+    )
+    check_v2_recovery_vector(
+        d1_vector,
+        "RAO-TV-D1 encrypted",
+        d1_encrypted_stored,
+        d1,
+        d1["inputs"]["object_id"],
+    )
 
     if args.export_directory is not None:
         export_directory = args.export_directory
@@ -1687,6 +1853,8 @@ def main(argv: list[str] | None = None) -> int:
         exports = {
             "rao-tv-p1.rao": p1_plaintext,
             "rao-tv-d1-plaintext.rao": d1_plaintext,
+            "rao-tv-e2.rao": e2_stored,
+            "rao-tv-d1-encrypted.rao": d1_encrypted_stored,
         }
         exports.update(
             {
@@ -1704,15 +1872,9 @@ def main(argv: list[str] | None = None) -> int:
             args.allow_missing_bsdtar,
         )
 
-    if args.long_term_recovery_drill:
-        raise RuntimeError(
-            "the v1 encrypted recovery drill was retired in P1; "
-            "the v2 publication drill is a P2 deliverable"
-        )
-
     print(
-        "verified RAO-TV-P1, RAO-TV-D1 plaintext, and additional "
-        "RAO positive plaintext vectors independently"
+        "verified RAO-TV-E2 and RAO-TV-D1 v2 OPEN, RAO-TV-P1 and "
+        "RAO-TV-D1 plaintext, and additional RAO positive vectors independently"
     )
     return 0
 

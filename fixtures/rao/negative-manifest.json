@@ -1,6 +1,6 @@
 {
   "vector_set": "RAO-NEG-MANIFEST-1",
-  "spec_section": "13.5",
+  "spec_section": "13.6",
   "status": "complete",
   "scope": "manifest-profile CBOR, manifest schema, anchor digest, and accepted unknown-key extension vectors",
   "base": {

@@ -1,6 +1,6 @@
 {
   "vector_set": "RAO-NEG-ENVELOPE-V2",
-  "spec_section": "13.5",
+  "spec_section": "13.6",
   "status": "complete",
   "scope": "encrypted envelope header, metadata-profile, framing, cryptographic-tamper, defective-sealer, and writer-side vectors executable through public RAO AEAD APIs",
   "base": {
@@ -56,7 +56,7 @@
     {
       "id": "reserved-bytes-nonzero",
       "operation": "inspect",
-      "fault": "reserved bytes are nonzero",
+      "fault": "one v2 reserved byte in header range 0x39..0x3b is nonzero",
       "expected_error": "ReservedBytesNotZero"
     },
     {

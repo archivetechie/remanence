@@ -13,7 +13,23 @@
     "manifest_file_id": "00000000-0000-4000-8000-0000000000fe",
     "recipient_mode": "hpke-x25519",
     "deterministic_dek": "5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d",
-    "deterministic_hpke_rng_seed": "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7"
+    "deterministic_hpke_rng_seed": "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+    "recipients": [
+      {
+        "slot_index": 0,
+        "recipient_epoch_id": "31313131313131313131313131313131",
+        "epoch_label": "primary-2026",
+        "private_key": "4141414141414141414141414141414141414141414141414141414141414141",
+        "public_key": "7a1a4e709bf085ac494aba0469b9b1eda0ab1f78b16aabb79ffeda90623e8522"
+      },
+      {
+        "slot_index": 1,
+        "recipient_epoch_id": "32323232323232323232323232323232",
+        "epoch_label": "recovery-2026",
+        "private_key": "4242424242424242424242424242424242424242424242424242424242424242",
+        "public_key": "132c442be010fbd57e72603328aa76e71fccc1503aae219327d14d9c9993f472"
+      }
+    ]
   },
   "expected": {
     "plaintext": {
