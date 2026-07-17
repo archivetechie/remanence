@@ -1,10 +1,13 @@
 # RAO v2-only: v1 excision + v2 productionization
 
-**Status:** design v0.1 — pending panel review
+**Status:** design v0.2 — panel-folded (3 lenses, 2026-07-17); pending codex verify round
 **Date:** 2026-07-17
 **Owner decision:** the owner, 2026-07-17 — remove format_version 1 (registry-symmetric
 encryption) from the publication spec AND the implementation before tagging
 v1.0.0 / minting the Zenodo DOI. Publication 1.0 is v2-only.
+**Panel:** L1 crypto/format = GLM 5.2 (packet-grounded), L2 systems = Kimi
+K2.7 (packet-grounded), L3 orchestrator/ops = Opus (repo-grounded). All three
+folded below; fold notes in §7.
 
 ## 1. Why
 
@@ -13,26 +16,26 @@ key that must be present, in secret form, on the sealing host. v2 (HPKE
 wrapped-DEK) seals to recipient *public* keys — no long-term secret on the
 write path, per-object DEKs, and an escrow/custody story. v1's one
 distinguishing property (deterministic sealing) is also a confidentiality
-defect the spec itself concedes (ciphertext equality disclosure, §12.7 area).
-No external implementer exists, the spec has never been published, and the
-project is pre-production — the cost of keeping v1 is permanent (frozen into
-the citable 1.0); the cost of removing it is bounded and paid once, now.
+defect the spec itself concedes (ciphertext equality disclosure). No external
+implementer exists, the spec has never been published, and the project is
+pre-production — the cost of keeping v1 is permanent (frozen into the citable
+1.0); the cost of removing it is bounded and paid once, now.
 
-## 2. What the surveys established (2026-07-17, two Sonnet sweeps)
+## 2. What the surveys established (2026-07-17, two Sonnet sweeps + L3 verification)
 
 The deletion itself is clean, but **v2 was never wired into the production
 write path**. Current state:
 
 | Layer | State |
 | --- | --- |
-| `remanence-aead` | v1 and v2 coexist as separately-named functions (`seal`/`seal_envelope`, `open`/`open_envelope`, unsuffixed/`_envelope` range API) sharing version-agnostic framing (`stream.rs`, `metadata.rs`). One dual struct (`RaoHeader`, `key_id` v1-only) and one shared options struct (`SealOptions.key_id` vestigial for v2). |
-| `remanence-format` | **v1-only, end to end.** `write_encrypted_rao_object*` → `seal_to_vec`; `read_encrypted_rao_object*` → `open_to_vec`; `pfr.rs` → v1 range fns. Zero v2 functions. |
+| `remanence-aead` | v1 and v2 coexist as separately-named functions sharing version-agnostic framing (`stream.rs`, `metadata.rs`). One dual struct (`RaoHeader`, `key_id` v1-only) and one shared options struct (`SealOptions.key_id` vestigial for v2). `wrap_dek` hardcodes `EphemeralRng::from_os()` internally — no injection seam. |
+| `remanence-format` | **v1-only, end to end.** Zero v2 functions. |
 | `remanence-api` / `remanence-state` / `remanence-parity` | `PoolWriteRepresentation::{Plaintext, Encrypted{root_key,key_id}}`; catalog `object_copies.key_id` column with nonzero-required validation; `BootstrapObjectRepresentation::Encrypted{key_id,..}`. No v2 variant anywhere. |
-| `remanence-cli` | All archive verbs carry v1 flags (`--encrypt --key-file --key-id`). v2 is producible **only** via `reseal` (v1→v2, refuses non-v1 input) and readable via `rao-recover --private-key`. `capabilities` already reports v2-only strings. |
-| Vectors | `tools/verify_rao_vectors_independent.py` (the independent Python re-implementation) has **zero HPKE support**; the tar's only positive envelope vectors (TV-E1, TV-D1-encrypted) are v1. `negative-envelope-v2.json` is v2 and survives. No deterministic v2 seal hook is publicly reachable (`EphemeralRng::from_seed` is module-private; `seal_envelope` always uses OS randomness). |
-| Proofs (`verif/`) | `aead-framing`, `rao-header`, `rao-archive` prove **v1 geometry only**; drift guards string-pin exact v1 source lines (`"if !matches!(format_version, 1 | 2)"`, `"if self.key_id == ZERO_16"`). v2 formal coverage is an open follow-up (RAO-V2-FORMAL-PREFIX / -HEADER-KEY-FRAME). |
-| sutradhara | Everything funnels through `run_rem_archive_build()` + `RaoCliSealer`/`RaoCliOpener`; `KeyRegistry` is symmetric-only, dev-seed-derived (STANDING escalated item); `Copy.storage_metadata["key_epoch"]` is a single flat string, written in 2 places, read fail-closed in 2 places. hdcache uses the identical v1 seal in its own key domain (frozen hd-disk-tier design). |
-| system harness | Duplicate registry seam (`harness/seams/keys.py`), v1 flags in `harness/seams/rao.py`, ~15 scenarios carrying v1 shapes, `bindings.toml` rows for root-key ops. |
+| `remanence-cli` | All archive verbs carry v1 flags. v2 is producible **only** via `reseal` (v1→v2, refuses non-v1 input, already enforces 2–8 distinct recipients at `lib.rs:3835-3846`) and readable via `rao-recover --private-key`. `inspect` accepts `--key-file` and reports `key_id`; the reseal report already emits `recipient_epochs` (`lib.rs:3928`). `capabilities` already reports v2-only strings. |
+| Vectors | Independent Python verifier has **zero HPKE support**; the tar's only positive envelope vectors are v1. `negative-envelope-v2.json` survives. No public deterministic v2 seal hook. |
+| Proofs (`verif/`) | `aead-framing`, `rao-header`, `rao-archive` prove **v1 geometry only**; drift guards string-pin exact v1 source lines. v2 formal coverage is an open follow-up. |
+| sutradhara | Seal funnels: `run_rem_archive_cli.py::run_rem_archive_build` + `RaoCliSealer/Opener`. **Three** seal-time root-key materialization sites (`sealing/rao.py:104`, `archive_fanout.py:407`, `jobs/handlers/cloud_blob.py:194`) plus open-time (`archive_fanout.py:489`, three `archive_restore.py` call sites, `restore.py` via gRPC). **Three** writers of `storage_metadata["key_epoch"]` (`replication.py:679`, `archive_fanout.py:901`, `cloud_blob.py:134`) and **three** fail-closed readers (`archive_fanout.py:1289`, `archive_restore.py:1900`, `restore.py:259`). `inspect_rao` hard-requires `report["key_id"]` (`sealing/rao.py:204-208`). Registry validators hardcode two domains (`KEY_DOMAINS`, prefix-based `key_domain()`, `_validate_key_id`). hdcache uses the identical v1 seal in its own hot key domain (frozen hd-disk-tier design §12.10; LUKS FDE below it is a separate, unaffected layer). |
+| system harness | Duplicate registry seam (`harness/seams/keys.py`), v1 flags in `harness/seams/rao.py:213-218`, `bindings.toml:58-67` seam rows, **`scenarios/sealing_support.py` — the shared assertion library (require_key_id, require_keyless_rao_header, wrong_root_key_file) that the load-bearing scenarios import** — plus 16 scenario files. |
 
 Consequence: "remove v1" = **productionize v2 first, then excise v1** — one
 tree, not separable, because deleting v1 breaks compilation of every layer
@@ -40,134 +43,226 @@ that only speaks v1.
 
 ## 3. Design decisions
 
-**D1 — The v2 wire format is byte-invariant.** Spec §5.2 already requires
-`key_id` (bytes `0x10..0x20`) all-zero for v2. Excision re-describes that
-region as `reserved` (MUST be zero) and marks `format_version = 1`
-**permanently reserved — never reassigned** (§10). `RAO1` magic, 128-byte
-header, key frame, and all v2 test vectors are unchanged. Nothing sealed as
-v2 before this change becomes invalid.
+**D1 — The v2 wire format is byte-invariant.** Verified by L1 against
+`header.rs`: the v2 `validate()` arm already rejects nonzero `key_id`;
+`serialize()` writes zeros there for v2; the only acceptance-set change is
+rejecting `format_version == 1`. Excision re-describes bytes `0x10..0x20` as
+`reserved` (MUST be zero) and marks `format_version = 1` **permanently
+reserved — never reassigned** (§10). `RAO1` magic, 128-byte header, key
+frame, and all v2 test vectors are unchanged.
 
 **D2 — `reseal` is deleted, not repurposed.** Its only valid input class (v1
-objects) ceases to exist, and §12.8 already forbids rewrapping a key frame
-without resealing (the frame is covered by `header_hash`). Rotation remains
-what the spec says it is: re-seal (open + seal_envelope → new DEK, new
-`stored_digest`), driven by the orchestrator. `rao-recover` drops its
-`--registry-key`/v1 leg and keeps `--private-key`.
+objects) ceases to exist, and §12.8 forbids rewrapping a key frame without
+resealing. Rotation remains re-seal (open + seal → new DEK, new
+`stored_digest`) driven by the orchestrator. `rao-recover` drops its
+`--registry-key`/v1 leg. The reseal implementation's recipient handling
+(2–8 distinct epochs, RAOR file parsing) is **lifted into `archive build`**,
+not rewritten.
 
 **D3 — v2 production path, single-funnel.** `remanence-format` gains
 envelope writer/reader/PFR functions that **wrap `seal_envelope` /
-`open_envelope` / `*_envelope` range fns — no parallel crypto, no copied
-framing code**. `PoolWriteRepresentation::Encrypted` changes shape to carry
-recipient public keys (≥2, per the spec's two-slot floor). The state schema
-replaces the single `key_id` column semantics with the object's recipient
-epoch id list; the parity bootstrap encrypted-row carries what the
-publication spec already specifies for v2 rows. Old shapes are **replaced,
-not versioned** — pre-production, no compat branches (hard rule). The
-`_envelope` suffixes are dropped in the same pass (`open_envelope` → `open`,
-etc.): with one version left, the suffix is noise.
+`open_envelope` / range fns — no parallel crypto, no copied framing code**;
+the CLI's build/extract/read paths and `remanence-api::pool_write` route
+through them (the reseal path's hand-rolled envelope orchestration dies with
+the verb). `PoolWriteRepresentation::Encrypted` carries recipient public
+keys. The **≥2-slot floor is enforced in the library (`seal_envelope`) AND
+at CLI arg validation** — API callers and vector generators cannot emit
+single-slot objects. Two data axes are distinct and both change shape:
+the *write-policy axis* (pool → recipient set to seal new writes to;
+`PoolTarget.key_epoch` / `PlacementTarget`) and the *record axis* (copy →
+recipient epoch id list actually sealed; `storage_metadata`). The state
+schema replaces `object_copies.key_id` semantics with the recipient epoch id
+list (non-empty required for encrypted rows);
+`BootstrapObjectRepresentation::Encrypted` extends to carry the epoch ids
+and `key_frame_len`. Old shapes are **replaced, not migrated** —
+pre-production, no compat branches (hard rule). The `_envelope` suffixes are
+dropped in the same pass.
 
-**D4 — CLI surface.** `archive build`/`write`/`pool write` gain repeatable
-`--recipient <public-key file>` (enforcing the ≥2-slot floor at arg
-validation); `extract`/`extract-stream`/`covering-range`/`read`/
-`export-object` replace `--key-file` (root key) with `--private-key`;
-`inspect` stays keyless (reports recipient epoch ids instead of `key_id`).
-`capabilities` output is already correct.
+**D4 — CLI surface (a contract change, not a flag rename).**
+`archive build`/`write`/`pool write` gain repeatable `--recipient
+<public-key file>` (2–8, distinct epochs — semantics lifted from reseal);
+`extract`/`extract-stream`/`covering-range`/`read`/`export-object` replace
+`--key-file` with `--private-key`; **`inspect` drops `--key-file` entirely**,
+parses the key frame, and reports `recipient_epochs` + `format_version`
+instead of `key_id`. Build/write **report JSON schemas change in lockstep**
+(`key_id` → `recipient_epochs`) and
+`docs/reference-extract-stream-protocol.md` is updated (epoch selection by
+private key). `capabilities` output is already correct.
 
-**D5 — Positive v2 vector (RAO-TV-E2) via deterministic-seal hook.**
-Sealing is intentionally randomized, so the vector strategy is:
-(a) add one narrow, clearly-labeled deterministic entry point for vector
-generation — same `seal_envelope` internals with an injected `EphemeralRng`
-seed and fixed DEK (`DataEncryptionKey::from_bytes` already exists) — so the
-pinned artifact is *regenerable byte-exactly*; (b) pin the sealed object +
-full derivation chain in the fixture manifest; (c) extend
-`verify_rao_vectors_independent.py` with a v2 **open-direction** verifier
-(X25519 + HKDF + ChaCha20-Poly1305 via the Python `cryptography` package) so
-independent verification is preserved — the independent implementation
-proves it can *read* the pinned artifact and recover byte-exact plaintext,
-which is what a reader-conformance vector requires. `negative-envelope.json`
-is re-based: the ~40 version-agnostic header/metadata/footer cases move onto
-a v2 base object; the v1-specific cases (`all-zero-key-id`, `root-key-*`,
-v1-salt cases) are dropped. TV-D1's encrypted half is re-based to v2.
-Then `make publication-test-vectors`, and the new tar SHA-256 is re-pinned
-in **both** publication specs.
+**D5 — Positive v2 vector (RAO-TV-E2) via deterministic-seal refactor.**
+`wrap_dek` currently constructs its RNG internally; it is **refactored to
+accept `rng: &mut R` as a parameter** — the production caller passes
+`EphemeralRng::from_os()`, the vector path injects a seeded RNG and a fixed
+DEK (`DataEncryptionKey::from_bytes`). Same internals, one signature change,
+no parallel path. The pinned RAO-TV-E2 artifact is regenerable byte-exactly;
+the fixture manifest pins the full derivation chain. Independent
+verification: `verify_rao_vectors_independent.py` gains a v2 **open-direction**
+verifier (X25519 + HKDF + ChaCha20-Poly1305 via Python `cryptography`) that
+decrypts the pinned artifact and recovers byte-exact plaintext.
+`negative-envelope.json`'s version-agnostic cases re-base onto a v2 object;
+v1-specific cases drop; v2-specific negative coverage (key-frame corruption,
+slot-count, wrap-suite, epoch-id cases) extends `negative-envelope-v2.json`.
+TV-D1's encrypted half re-bases to v2. Then `make publication-test-vectors`
+and the new tar SHA-256 re-pins in **both** publication specs.
 
 **D6 — Proof estate: cheap-honest path, no new Lean derivation** (standing
-rule). Proofs whose pinned source survives verbatim stay untouched. Proofs
-that prove *deleted* v1 behavior are **retired**: drift guard removed with
-the code it pins, `verif/STATUS.md` and `docs/formal-verification-status.md`
-updated to record the retirement and the reason ("v1 removed from the
-format; proof preserved in git history"), and the already-named follow-ups
-(RAO-V2-FORMAL-PREFIX, RAO-V2-FORMAL-HEADER-KEY-FRAME) remain the v2 proof
-targets. `make proof-inventory` must be green *and truthful* after.
+rule). A proof survives ONLY if its drift-guard-pinned snippets are
+**byte-identical** after the edits; anything else is retired: drift guard
+removed with the code it pins, the crate removed from the
+`make proof-inventory` build list (`verif/check-inventory.sh`),
+`verif/STATUS.md` + `docs/formal-verification-status.md` updated with the
+retirement reason ("v1 removed from the format; proof preserved in git
+history"), and RAO-V2-FORMAL-PREFIX / -HEADER-KEY-FRAME remain the named v2
+follow-ups. Expected outcome: `aead-framing`, `rao-header`, `rao-archive`
+retire; `rao-metadata`, `rao-manifest`, `parity-state` (zero v1 coupling)
+survive untouched. `make proof-inventory` must be green *and truthful*.
 
 **D7 — sutradhara registry pivot (closes the dev-seed STANDING row).**
-`KeyRegistry` mints X25519 recipient **keypairs** per epoch per domain
-(`archive`, `hdcache`, and the new `backup` domain), with **random-at-mint
-via OS entropy**. The hard-coded `_TEST_SEED` derivation survives only
-behind an explicit test switch (env/constructor), used by hermetic scenarios
-— production default is random. `materialized_root_key` becomes
-`materialized_private_key` (same 0600-temp-file discipline) for the open
-path; the seal path passes public-key files (no secret). `storage_metadata`
-carries the recipient epoch id list (replaces the single `key_epoch`
-string); both writer sites and both fail-closed reader sites change in
-lockstep. Existing pilot cloud blobs are **regenerated** by the normal job
-path from the plaintext copies — derived artifacts, no reseal, no compat.
-The `consult-backup-ledger-keys-2026-07-10.md` recommendation (extend v1
-with a backup domain) is superseded by this design.
+`KeyRegistry` mints X25519 recipient **keypairs** per epoch per domain, with
+**random-at-mint via OS entropy**. Full enumerated blast radius (L3-verified):
+
+- *Domains:* `archive`, `hdcache`, new `backup`, new `recovery` (D11). Adding
+  domains requires lockstep edits to `KEY_DOMAINS` (`registry.py:25`),
+  `key_domain()` (`:273-278` — prefix table, no more "default archive"),
+  and `_validate_key_id()` (`:303-315`).
+- *Mint/read:* the root-material re-derivation mismatch check
+  (`registry.py:79-80`) is deleted — random keys cannot be re-derived.
+  `materialized_root_key` → `materialized_private_key` (same 0600-temp
+  discipline); a non-secret public-key accessor serves the seal path.
+- *Deterministic test mode — three interlocks, never env-alone:*
+  (1) explicit constructor flag (`deterministic_test=True`) that production
+  factory code never passes; (2) **path interlock** — refuse deterministic
+  mode unless `registry_dir` resolves outside the production root (reject
+  `_DEFAULT_REGISTRY_DIR` and anything under `/var/lib`); (3) every
+  deterministic epoch is self-identifying in its state file so a scrub/CSO
+  scan can flag one that reached production.
+- *Seal sites (root-key file → recipient public keys):* `sealing/rao.py:104`,
+  `archive_fanout.py:407`, `cloud_blob.py:194`.
+- *Open sites (root-key file → private key + epoch selection):*
+  `archive_fanout.py:489`, `archive_restore.py` ×3 (extract,
+  extract-stream, covering-range), `restore.py`/gRPC path, hdcache
+  manager/walker/repopulate.
+- *Metadata (single string → epoch id list + selection):* writers
+  `replication.py:679`, `archive_fanout.py:901`, `cloud_blob.py:134`;
+  readers `archive_fanout.py:1289`, `archive_restore.py:1900`,
+  `restore.py:259`. Readers gain **selection logic** — choose the recipient
+  epoch whose private key this host holds (by domain), fail closed when none
+  matches.
+- *Inspect contract:* `inspect_rao` (`sealing/rao.py:185-209`) switches from
+  `report["key_id"]` to `report["recipient_epochs"]`; `RaoInspection`
+  consumers update.
+- *Pilot data:* regenerate via the **documented pristine-wipe path**
+  (`runbook-pilot-ingest.md`: remove `pilot.db` + stale `.rao` outputs,
+  re-ingest) — the cloud-blob job's idempotency guard (`already_copied`
+  short-circuit, `cloud_blob.py:72-80`) means "re-run the job" alone
+  regenerates nothing. The re-ingest doubles as end-to-end verification of
+  the new seal path.
+- The `consult-backup-ledger-keys-2026-07-10.md` recommendation (extend v1
+  with a backup domain) is superseded by this design.
 
 **D8 — hdcache pivots to v2 with a hot private key.** The frozen
-hd-disk-tier design keeps cache decrypt unattended on the serving host; v2
-preserves that by holding the hdcache-domain recipient private key hot on
-that host — identical exposure to today's hot root key, same domain
-isolation (cross-domain refused at seal), only the envelope changes. This is
-an explicit amendment to the frozen design's letter, preserving its intent;
-the hdcache prompt set (M1–M6) consumes the same `RaoCliSealer`/`Opener`
-interfaces and is unaffected beyond the key-material type.
+hd-disk-tier design (§12.10) isolates cache keys because they are hot by
+design; v2 preserves exactly that — the hdcache-domain recipient private key
+is held hot on the serving host, same 0600-temp lifecycle, same domain
+isolation at seal time. Honest deltas stated: each open adds one X25519 DH +
+HKDF unwrap (microseconds; the CLI subprocess spawn dominates), and the
+LUKS-FDE layer beneath the cache disks is orthogonal and unaffected. This
+amends the frozen design's letter while preserving its intent; the hdcache
+M1–M6 prompt set consumes the same `RaoCliSealer`/`Opener` interfaces.
 
-**D9 — harness.** `harness/seams/keys.py` mirrors the keypair contract;
-`harness/seams/rao.py` mirrors the new flags; `bindings.toml` gains/renames
-the seam rows; affected scenarios (~15) update mechanically (epoch ids stay
-16-byte identifiers; root-key files become keypair files; `scenario_lbk`
-moves to the `backup` domain). The RAOE envelope scenario
-(`docs/historical/prompt-scenario-rao-v2-envelope.md`) is cut into a real
-hermetic scenario as the harness-side verification member; its live-tape
-legs remain post-merge smoke items for the next MSL3040 window.
+**D9 — harness.** `harness/seams/keys.py` mirrors the keypair contract
+(public-key materialization for seal, private-key for open);
+`harness/seams/rao.py` mirrors the new flags; `bindings.toml` seam rows
+update. **`scenarios/sealing_support.py` changes first** — it is the shared
+assertion library the load-bearing scenarios import. Load-bearing (rewritten
++ green as verification members): `scenario_rao`, `scenario_rao_archive`,
+`scenario_rao_archive_bundling`, `scenario_lbk` (moves to `backup` domain),
+`scenario_q`, `scenario_o`, `scenario_arrangement_submit_live`, plus the new
+hermetic RAOE scenario. Incidental literal-fixture updates: `scenario_ag`,
+`scenario_n`, `scenario_bsh`, `scenario_retention_gate`,
+`scenario_rao_archive_policy`, `scenario_arrangement_submit`,
+`scenario_pfr`, `scenario_restore_agent`. Live-tape RAOE legs remain
+post-merge smoke items for the next MSL3040 window.
 
 **D10 — v2 fuzz coverage lands with the excision.** The whole-object fuzz
-target (`rao_whole_object_open_verify`) is ported to `open_envelope` with a
-fixed recipient key; deleting v1 without this leaves whole-object open/verify
-fuzzing at zero.
+target ports to `open_envelope` with a fixed recipient key; the
+key-frame-parse fuzz surface stays covered by `rao_envelope_header` (v1 arm
+pruned).
+
+**D11 — recovery epoch: the mandatory second recipient, everywhere.** The
+spec's ≥2-slot floor collides with single-hot-key domains (hdcache, backup)
+unless the second slot is defined. Resolution: the registry maintains a
+dedicated **`recovery` domain** whose epoch public key is included as the
+second recipient in **every** seal across all domains. Its private half
+never lives on any serving host — it is the escrow object (the existing
+Shamir 2-of-3 custody thread now has a concrete key to hold). This satisfies
+the floor uniformly, makes every object recoverable if a hot domain key is
+lost, and is the reason the floor exists.
+
+**D12 — red-main window policy.** Between P1 landing (v1 flags gone from
+`rem`) and P3/P4 landing, real-seam AEAD scenarios are necessarily red — no
+compat shims (hard rule). Mitigation: P1→P4 land as one coordinated push
+(codex prompts dispatched back-to-back, suite re-run at the end); the
+transient RAO reds during the window are expected arc-state, **not**
+STANDING-escalation material — GAPBOARD annotation carries a pointer to this
+design until P4 lands. Nightly suite results from inside the window are
+disregarded.
 
 ## 4. Work breakdown → prompt set
 
+P1 is staged (Kimi L2-5): one codex dispatch, **five mandatory checkpoint
+commits**, tree compiles + tests green at each:
+
+| Stage | Content | Checkpoint |
+| --- | --- | --- |
+| P1a | aead v1 excision + `_envelope` renames + `wrap_dek` RNG-injection refactor + deterministic-seal entry + fuzz port | `cargo test -p remanence-aead` |
+| P1b | `remanence-format` v2 writer/reader/PFR (wrapping aead; v1 fns deleted) | format crate tests |
+| P1c | `remanence-api` / `remanence-state` / `remanence-parity` representation + schema + bootstrap row | workspace tests |
+| P1d | CLI verbs (`--recipient` on build/write/pool-write, `--private-key` on read verbs, keyless inspect + report schemas, delete `reseal`, `rao-recover` v1 leg) | CLI tests |
+| P1e | proof retirement (guards + inventory list + STATUS) + repo docs (reference-cli, quickstart, glossary, architecture-overview, tape-layout + SVG caption, extract-stream protocol, amber-architecture → historical note) | `make proof-inventory` + full workspace |
+
 | Prompt | Repo | Content | Depends on |
 | --- | --- | --- | --- |
-| **P1 rem-core** | remanence | W1 aead excision + renames + deterministic-seal hook + fuzz port; W2 v2 production path (format/api/state/parity/CLI flags, delete `reseal`, `rao-recover` v1 leg); W6 proof-estate retirement; repo docs (reference-cli, quickstart, glossary, architecture-overview, tape-layout + SVG caption, extract-stream protocol). | — |
-| **P2 rem-vectors+spec** | remanence | W3 RAO-TV-E2 + Python v2 open-verifier + negative re-base + TV-D1 re-base + tar regen; W4 publication-spec excision (both docs) + SHA re-pin. | P1 |
-| **P3 sutra-pivot** | sutradhara | W7: registry keypairs (random-at-mint + test switch), sealer/opener → new CLI flags, metadata shape, all callers, hdcache + backup domains, pilot blob regeneration path. | P1 |
-| **P4 harness** | system | W8: seams, bindings, scenario sweep, RAOE hermetic scenario (verification member). | P1, P3 |
+| **P1 rem-core** | remanence | P1a–P1e above | — |
+| **P2 rem-vectors+spec** | remanence | RAO-TV-E2 + Python v2 open-verifier + negative re-base + TV-D1 re-base + tar regen; publication-spec excision (both docs) + SHA re-pin. Spec-gate greps include: `format_version = 1`, `registry-symmetric`, `root key`, `MUST implement v1`, `no test-only`, plus §13.3's determinism sentence and §14's conformance clause rewritten by hand. | P1 |
+| **P3 sutra-pivot** | sutradhara | D7 + D8 + D11 in full (enumerated sites above); pilot pristine-wipe + re-ingest as the closing verification step. | P1 |
+| **P4 harness** | system | D9: `sealing_support.py` first, seams, bindings, load-bearing scenario rewrites, incidental fixture updates, RAOE hermetic scenario. | P1, P3 |
 
-P2 ∥ P3 after P1. P4 last. Verification gates: P1 = workspace tests +
-`make proof-inventory` green; P2 = vector build + independent verifier pass +
-publication-doc grep gate (zero hits for `format_version = 1` /
-`registry-symmetric` / root-key language); P3 = sutradhara pytest; P4 =
-`make suite` from clean slate. Each prompt carries the standard preamble
-(single-funnel, golden fixtures, wrap-don't-copy, no compat/backout paths).
+P2 ∥ P3 after P1. P4 last, then `make suite` from clean slate. Each prompt
+carries the standard preamble (single-funnel, golden fixtures,
+wrap-don't-copy, no compat/backout paths).
 
 ## 5. Out of scope (follow-ups filed, not built now)
 
 - RAO-V2-FORMAL-* Lean proofs (existing named follow-ups; no derivation now).
 - KMS/HSM-backed key storage — 1.0 posture is OS-random local keypairs with
-  0600 discipline; custody ceremony (Shamir escrow of recipient private
-  keys) is the existing escrow thread, unblocked (not implemented) by D7.
-- A convenience `rotate`/re-seal orchestration verb — rotation is
-  open+seal by the orchestrator for now (§12.8 semantics).
+  0600 discipline; the recovery-epoch escrow ceremony (Shamir) is the
+  existing custody thread, now with a concrete key object.
+- A convenience rotation verb — rotation is open+seal by the orchestrator.
 - Live-tape RAOE legs (next MSL3040 window).
 
 ## 6. Publication sequencing
 
 P1 → P2 land → tag `v1.0.0` → Zenodo DOI (org-only creator) → PRONOM
-submission (unchanged: signature keys on `RAO1` magic + `rao-v1` pax keyword,
-both untouched; one header form makes the signature note simpler). P3/P4 are
-required for **suite-green main**, and land before the tag so the DOI
-snapshot is coherent across the stack the README describes.
+submission (signature keys on `RAO1` magic + `rao-v1` pax keyword, both
+untouched). P3/P4 land before the tag so the DOI snapshot is coherent
+across the stack the README describes.
+
+## 7. Panel fold record (2026-07-17)
+
+Accepted: L1-1 (D1 verified sound), L1-2 (`wrap_dek` refactor → D5), L1-3/L1-4
+(spec-gate misses → P2 gate expanded, §13.3/§14 hand-rewrites), L2-1 (funnel
+routed through remanence-format, reseal orchestration dies), L2-2 (schema +
+bootstrap shape; *migration* clause rejected — pre-production, replace not
+migrate), L2-3 (floor in library + CLI), L2-4 (proof-inventory build list;
+byte-identical survival criterion), L2-5 (P1 staging), L2-6 (inspect/report
+contract + protocol doc), L2-8 (seams lockstep), L3-1 (3×3 metadata sites +
+selection logic — the fold's biggest correction), L3-2 (seal/open site
+enumeration + inspect_rao), L3-3 (domain validator lockstep), L3-4
+(deterministic-mode triple interlock), L3-5 (→ D11 recovery epoch; cost +
+LUKS honesty), L3-6 (two axes), L3-7 (sealing_support linchpin + load-bearing
+list), L3-8 (→ D12 red-window policy), L3-9 (pilot pristine-wipe).
+Rejected: L2-2's "provide a migration for existing rows" (violates the
+pre-production hard rule). Pending verify round: L1 Q2 (reseal loss-check),
+Q4 (negative-vector completeness), Q6 (fuzz adequacy) — GLM continuation
+flaked twice; these three go to the codex verify pass explicitly.
