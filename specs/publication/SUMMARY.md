@@ -10,8 +10,8 @@ Date: 2026-07-08. This is the executive summary; the full record is in
 > + on-tape v2 HPKE envelope). The four "Needs your decision before publishing"
 > items below are all resolved: (1) bootstrap re-typing and (2) the two
 > manifest gaps landed in the scanner/reader; (3) the author line is **The
-> ArchiveTech Project** (archivetech.org / specs@archivetech.org), not the
-> earlier The ArchiveTech Project / archivetech.org placeholder; (4) the test-vector
+> ArchiveTech Project** (archivetech.org / specs@archivetech.org), replacing an
+> earlier personal-name-and-affiliation placeholder; (4) the test-vector
 > archive exists with SHA-256 `596e5ee7…` pinned. This summary is retained as a
 > dated historical record.
 
@@ -98,7 +98,7 @@ prohibitions promoted to MUST NOT; duplicate-strength statements deduplicated.
    manifest duplicate path/file_id rejection, and missing-manifest reporting —
    spec'd now, not yet in `manifest.rs`/`reader.rs`.
 3. **Author line** — confirm the name/affiliation/email added to all three
-   (The ArchiveTech Project / archivetech.org / work email).
+   (personal name / employer affiliation / work email).
 4. **Test-vector distribution** — the docs now promise vectors "distributed
    alongside this specification"; that archive has to exist at freeze, with its
    SHA-256 printed in §13/§17.
