@@ -72,7 +72,7 @@ Appendix C. [Revision History (Informative)](#appendix-c-revision-history-inform
 
 RAO wraps a set of named file payloads into one archival object. The format
 originates in **Remanence**, an open archival tape stack that serves as this
-specification's reference implementation (see Author's Address). This document
+specification's reference implementation [REMANENCE]. This document
 specifies the format completely, so that it stands alone from any
 implementation; the name survives in the format itself only as fixed wire
 identifiers — the `REMANENCE.` vendor-keyword namespace and the `_remanence/`
@@ -2389,6 +2389,10 @@ its versioning rules
   Luykx, A., and S. Schmieg, "How to Abuse and Fix Authenticated Encryption
   Without Key Commitment", 31st USENIX Security Symposium, 2022,
   <https://www.usenix.org/conference/usenixsecurity22/presentation/albertini>.
+- [REMANENCE] — "Remanence", the reference implementation of this
+  specification: an open archival tape stack (tape library control, tape
+  I/O, parity, and this object format),
+  <https://github.com/archivetechie/remanence>.
 
 ---
 
