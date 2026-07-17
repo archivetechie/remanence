@@ -461,15 +461,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ppv-lite86"
-version = "0.2.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
-dependencies = [
- "zerocopy",
-]
-
-[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -494,16 +485,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
-name = "rand_chacha"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
-dependencies = [
- "ppv-lite86",
- "rand_core 0.9.3",
-]
-
-[[package]]
 name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -517,9 +498,6 @@ name = "rand_core"
 version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "99d9a13982dcf210057a8a78572b2217b667c3beacbf3a0d8b454f6f82837d38"
-dependencies = [
- "getrandom 0.3.3",
-]
 
 [[package]]
 name = "redox_syscall"
@@ -534,11 +512,11 @@ dependencies = [
 name = "remanence-aead"
 version = "0.0.1"
 dependencies = [
+ "chacha20",
  "chacha20poly1305",
  "getrandom 0.3.3",
  "hkdf",
  "hpke",
- "rand_chacha",
  "rand_core 0.9.3",
  "sha2",
  "thiserror",
@@ -575,12 +553,14 @@ dependencies = [
  "remanence-aead",
  "remanence-format",
  "remanence-library",
+ "sha2",
 ]
 
 [[package]]
 name = "remanence-library"
 version = "0.0.1"
 dependencies = [
+ "libc",
  "remanence-scsi",
  "thiserror",
  "tokio",

@@ -4882,7 +4882,7 @@ fn now_rfc3339() -> Result<String, time::error::Format> {
 mod tests {
     use super::*;
     use prost::Message as _;
-    use remanence_aead::RootKey;
+    use remanence_aead::RecipientPrivateKey;
     use remanence_chaos::model::{ModelTransport, VirtualTape, VirtualWorld};
     use remanence_format::{
         read_encrypted_rao_file_range_to_vec, write_encrypted_rao_object, write_rem_tar_object,
@@ -6807,14 +6807,18 @@ mod tests {
             mtime: Some("0"),
             executable: Some(false),
         }];
-        let root_key = RootKey::new([0x42; 32]).expect("test key");
+        let primary = RecipientPrivateKey::new([0x31; 16], "primary-2026", [0x41; 32]).unwrap();
+        let recovery = RecipientPrivateKey::new([0x32; 16], "recovery-2026", [0x42; 32]).unwrap();
+        let recipients = vec![
+            primary.public_key(0).unwrap(),
+            recovery.public_key(1).unwrap(),
+        ];
         let mut encrypted_sink = VecBlockSink::new();
         let encrypted_report = write_encrypted_rao_object(
             &mut encrypted_sink,
             &encrypted_opts,
             &encrypted_files,
-            &root_key,
-            [0x24; 16],
+            &recipients,
         )
         .expect("write encrypted payload");
         let encrypted_payload: Vec<u8> = encrypted_sink.blocks.iter().flatten().copied().collect();
@@ -6833,7 +6837,7 @@ mod tests {
 
         let opened = read_encrypted_rao_file_range_to_vec(
             &opaque,
-            &root_key,
+            &primary,
             encrypted_report.plaintext_layout.files[0].first_chunk_lba,
             secret.len() as u64,
             300,

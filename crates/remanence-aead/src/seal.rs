@@ -6,11 +6,9 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{RaoAeadError, Result};
 use crate::header::{validate_chunk_size, RaoHeader, RAO_FOOTER};
-use crate::kdf::{derive_keys, derive_salt, RootKey};
 use crate::metadata::RaoMetadata;
 use crate::stream::{
-    encrypt_chunk, encrypt_metadata, finalize_sha256, stored_size_from_parts,
-    stored_size_from_parts_with_key_frame, PlaintextStats,
+    encrypt_chunk, encrypt_metadata, finalize_sha256, stored_size_from_parts, PlaintextStats,
 };
 use crate::wrap::{wrap_dek, DataEncryptionKey, EphemeralRng, RecipientPublicKey};
 
@@ -19,8 +17,6 @@ use crate::wrap::{wrap_dek, DataEncryptionKey, EphemeralRng, RecipientPublicKey}
 pub struct SealOptions {
     /// Body block size and AEAD plaintext chunk size.
     pub chunk_size: u32,
-    /// Opaque 16-byte key identifier.
-    pub key_id: [u8; 16],
     /// Inner canonical object id.
     pub object_id: String,
     /// Expected canonical plaintext size.
@@ -34,8 +30,8 @@ pub struct SealOptions {
 pub struct SealReport {
     /// Serialized header used for this object.
     pub header: RaoHeader,
-    /// Parsed v2 key frame, absent for v1 objects.
-    pub key_frame: Option<crate::KeyFrame>,
+    /// Parsed v2 key frame.
+    pub key_frame: crate::KeyFrame,
     /// Metadata plaintext size before the AEAD tag.
     pub metadata_plaintext_len: u64,
     /// Metadata frame size including the AEAD tag.
@@ -50,112 +46,32 @@ pub struct SealReport {
     pub plaintext: PlaintextStats,
 }
 
-/// Seal a canonical plaintext RAO object into the encrypted representation.
-pub fn seal<R: Read, W: Write>(
-    mut plaintext: R,
-    mut output: W,
-    root_key: &RootKey,
-    options: &SealOptions,
-) -> Result<SealReport> {
-    validate_options(options)?;
-
-    let metadata = RaoMetadata::new(
-        options.plaintext_size,
-        options.plaintext_digest,
-        options.chunk_size,
-    )?;
-    let metadata_plaintext = metadata.to_cbor_bytes(options.chunk_size)?;
-    let metadata_frame_len = u64::try_from(metadata_plaintext.len())
-        .ok()
-        .and_then(|len| len.checked_add(16))
-        .ok_or(RaoAeadError::SizeOverflow)?;
-    let object_id_field = crate::header::object_id_field(&options.object_id)?;
-    let salt = derive_salt(
-        root_key,
-        &object_id_field,
-        &options.plaintext_digest,
-        &metadata_plaintext,
-    )?;
-    let header = RaoHeader::new(
-        options.chunk_size,
-        options.key_id,
-        salt,
-        metadata_frame_len,
-        options.object_id.clone(),
-    )?;
-    let keys = derive_keys(root_key, &header.hkdf_salt, &header.header_hash()?)?;
-    let metadata_frame = encrypt_metadata(&keys.metadata_key, &metadata_plaintext)?;
-    if metadata_frame.len() as u64 != metadata_frame_len {
-        return Err(RaoAeadError::MetadataFrameLengthInvalid);
-    }
-
-    let mut hashing_output = HashingWriter::new(&mut output);
-    hashing_output.write_all(&header.serialize()?)?;
-    hashing_output.write_all(&metadata_frame)?;
-
-    let plaintext_stats = encrypt_payload(&mut plaintext, &mut hashing_output, options, &keys)?;
-    if plaintext_stats.size != options.plaintext_size {
-        return Err(RaoAeadError::PlaintextSizeMismatch);
-    }
-    if plaintext_stats.digest != options.plaintext_digest {
-        return Err(RaoAeadError::PlaintextDigestMismatch);
-    }
-    ensure_eof(&mut plaintext)?;
-
-    hashing_output.write_all(RAO_FOOTER)?;
-    let stored_size_bytes = stored_size_from_parts(
-        options.chunk_size,
-        metadata_frame_len,
-        options.plaintext_size,
-    )?;
-    let current_len = hashing_output.count;
-    let fill_len = stored_size_bytes
-        .checked_sub(current_len)
-        .ok_or(RaoAeadError::SizeOverflow)?;
-    write_zero_fill(&mut hashing_output, fill_len)?;
-    let (_, stored_len, stored_digest) = hashing_output.finish();
-    if stored_len != stored_size_bytes {
-        return Err(RaoAeadError::SizeOverflow);
-    }
-
-    Ok(SealReport {
-        header,
-        key_frame: None,
-        metadata_plaintext_len: metadata_plaintext.len() as u64,
-        metadata_frame_len,
-        stored_size_bytes,
-        stored_size_blocks: stored_size_bytes / u64::from(options.chunk_size),
-        stored_digest,
-        plaintext: plaintext_stats,
-    })
-}
-
 /// Inputs unique to a v2 envelope-mode seal.
 #[derive(Debug, Clone)]
 pub struct EnvelopeSealOptions {
-    /// Common framing and plaintext facts; `key_id` must be zero.
+    /// Common framing and plaintext facts.
     pub common: SealOptions,
     /// At least two distinct-custody recipient epochs in canonical slot order.
     pub recipients: Vec<RecipientPublicKey>,
 }
 
 /// Seal a canonical plaintext RAO object as a v2 HPKE envelope.
-pub fn seal_envelope<R: Read, W: Write>(
+pub fn seal<R: Read, W: Write>(
     plaintext: R,
     output: W,
     options: &EnvelopeSealOptions,
 ) -> Result<SealReport> {
     let dek = DataEncryptionKey::generate()?;
     let mut rng = EphemeralRng::from_os()?;
-    seal_envelope_with_material(plaintext, output, options, &dek, &mut rng)
+    seal_with_material(plaintext, output, options, &dek, &mut rng)
 }
 
 /// Seal a byte-identical v2 object from fixed test-vector key material.
 ///
 /// This entry point exists only to generate reproducible conformance test
-/// vectors. Production callers must use [`seal_envelope`], which obtains the
+/// vectors. Production callers must use [`seal`], which obtains the
 /// DEK and HPKE randomness from operating-system entropy.
-pub fn seal_envelope_deterministic_for_test_vectors<R: Read, W: Write>(
+pub fn seal_deterministic_for_test_vectors<R: Read, W: Write>(
     plaintext: R,
     output: W,
     options: &EnvelopeSealOptions,
@@ -163,10 +79,10 @@ pub fn seal_envelope_deterministic_for_test_vectors<R: Read, W: Write>(
     hpke_rng_seed: [u8; 32],
 ) -> Result<SealReport> {
     let mut rng = EphemeralRng::from_seed(&hpke_rng_seed);
-    seal_envelope_with_material(plaintext, output, options, &dek, &mut rng)
+    seal_with_material(plaintext, output, options, &dek, &mut rng)
 }
 
-fn seal_envelope_with_material<R, W, G>(
+fn seal_with_material<R, W, G>(
     mut plaintext: R,
     mut output: W,
     options: &EnvelopeSealOptions,
@@ -181,14 +97,12 @@ where
     validate_chunk_size(options.common.chunk_size)?;
     crate::header::object_id_field(&options.common.object_id)?;
     let chunk = u64::from(options.common.chunk_size);
-    if options.common.key_id != [0; 16]
-        || options.common.plaintext_size == 0
+    if options.common.plaintext_size == 0
         || options.common.plaintext_size % chunk != 0
         || options.recipients.len() < 2
     {
         return Err(RaoAeadError::InvalidInput(
-            "v2 envelope seal requires zero key_id, aligned plaintext, and at least two recipients"
-                .to_string(),
+            "v2 envelope seal requires aligned plaintext and at least two recipients".to_string(),
         ));
     }
     if options
@@ -254,7 +168,7 @@ where
     }
     ensure_eof(&mut plaintext)?;
     hashing_output.write_all(RAO_FOOTER)?;
-    let stored_size_bytes = stored_size_from_parts_with_key_frame(
+    let stored_size_bytes = stored_size_from_parts(
         options.common.chunk_size,
         key_frame_len,
         metadata_frame_len,
@@ -270,7 +184,7 @@ where
     }
     Ok(SealReport {
         header,
-        key_frame: Some(key_frame),
+        key_frame,
         metadata_plaintext_len: metadata_plaintext.len() as u64,
         metadata_frame_len,
         stored_size_bytes,
@@ -281,39 +195,13 @@ where
 }
 
 /// Seal a v2 envelope into a newly allocated vector.
-pub fn seal_envelope_to_vec(
+pub fn seal_to_vec(
     plaintext: &[u8],
     options: &EnvelopeSealOptions,
 ) -> Result<(Vec<u8>, SealReport)> {
     let mut out = Vec::new();
-    let report = seal_envelope(plaintext, &mut out, options)?;
+    let report = seal(plaintext, &mut out, options)?;
     Ok((out, report))
-}
-
-/// Seal into a newly allocated vector, for tests and file-object builders.
-pub fn seal_to_vec(
-    plaintext: &[u8],
-    root_key: &RootKey,
-    options: &SealOptions,
-) -> Result<(Vec<u8>, SealReport)> {
-    let mut out = Vec::new();
-    let report = seal(plaintext, &mut out, root_key, options)?;
-    Ok((out, report))
-}
-
-fn validate_options(options: &SealOptions) -> Result<()> {
-    validate_chunk_size(options.chunk_size)?;
-    if options.key_id == [0; 16] {
-        return Err(RaoAeadError::InvalidKeyIdentifier);
-    }
-    crate::header::object_id_field(&options.object_id)?;
-    let chunk = u64::from(options.chunk_size);
-    if options.plaintext_size == 0 || options.plaintext_size % chunk != 0 {
-        return Err(RaoAeadError::InvalidInput(
-            "plaintext_size must be a positive multiple of chunk_size".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 fn encrypt_payload<R: Read, W: Write>(
@@ -417,10 +305,7 @@ impl<W: Write> Write for HashingWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        inspect_bytes, open_envelope_to_vec, open_plaintext_range_envelope_to_vec, open_to_vec,
-        RecipientPrivateKey,
-    };
+    use crate::{inspect_bytes, open_plaintext_range_to_vec, open_to_vec, RecipientPrivateKey};
     use std::io;
 
     fn options(plaintext: &[u8]) -> SealOptions {
@@ -433,102 +318,31 @@ mod tests {
         plaintext_digest.copy_from_slice(&digest);
         SealOptions {
             chunk_size: 512,
-            key_id: [0x10; 16],
             object_id: object_id.to_string(),
             plaintext_size: plaintext.len() as u64,
             plaintext_digest,
         }
     }
 
-    fn derived_key_tuple(root: &RootKey, report: &SealReport) -> ([u8; 32], [u8; 32], [u8; 32]) {
-        let keys = derive_keys(
-            root,
-            &report.header.hkdf_salt,
-            &report.header.header_hash().unwrap(),
-        )
-        .unwrap();
-        (keys.object_secret, keys.metadata_key, keys.payload_key)
-    }
-
-    fn seal_with_salt_override(
-        plaintext: &[u8],
-        root: &RootKey,
-        options: &SealOptions,
-        salt: [u8; 16],
-    ) -> Vec<u8> {
-        let metadata = RaoMetadata::new(
-            options.plaintext_size,
-            options.plaintext_digest,
-            options.chunk_size,
-        )
-        .unwrap();
-        let metadata_plaintext = metadata.to_cbor_bytes(options.chunk_size).unwrap();
-        let metadata_frame_len = metadata_plaintext.len() as u64 + 16;
-        let header = RaoHeader::new(
-            options.chunk_size,
-            options.key_id,
-            salt,
-            metadata_frame_len,
-            options.object_id.clone(),
-        )
-        .unwrap();
-        let keys = derive_keys(root, &header.hkdf_salt, &header.header_hash().unwrap()).unwrap();
-        let chunk_size = options.chunk_size as usize;
-        assert_eq!(plaintext.len() as u64, options.plaintext_size);
-        assert_eq!(plaintext.len() % chunk_size, 0);
-        let chunk_count = options.plaintext_size / u64::from(options.chunk_size);
-        let mut out = Vec::new();
-        out.extend_from_slice(&header.serialize().unwrap());
-        out.extend_from_slice(&encrypt_metadata(&keys.metadata_key, &metadata_plaintext).unwrap());
-        for (index, chunk) in plaintext.chunks_exact(chunk_size).enumerate() {
-            out.extend_from_slice(
-                &encrypt_chunk(
-                    &keys.payload_key,
-                    index as u64,
-                    index as u64 + 1 == chunk_count,
-                    chunk,
-                )
-                .unwrap(),
-            );
-        }
-        out.extend_from_slice(RAO_FOOTER);
-        let stored_size = stored_size_from_parts(
-            options.chunk_size,
-            metadata_frame_len,
-            options.plaintext_size,
-        )
-        .unwrap() as usize;
-        out.resize(stored_size, 0);
-        out
-    }
-
-    fn footer_offset_for(options: &SealOptions) -> usize {
-        let metadata = RaoMetadata::new(
-            options.plaintext_size,
-            options.plaintext_digest,
-            options.chunk_size,
-        )
-        .unwrap();
-        let metadata_plaintext = metadata.to_cbor_bytes(options.chunk_size).unwrap();
-        let metadata_frame_len = metadata_plaintext.len() + 16;
-        let chunk_count = options.plaintext_size / u64::from(options.chunk_size);
-        crate::header::RAO_HEADER_LEN
-            + metadata_frame_len
-            + (chunk_count as usize * (options.chunk_size as usize + 16))
-    }
-
-    fn assert_no_footer_at_derived_offset(output: &[u8], options: &SealOptions) {
-        let footer_offset = footer_offset_for(options);
+    fn assert_no_footer(output: &[u8]) {
         assert!(
-            output.len() <= footer_offset,
-            "failed seal wrote beyond derived footer offset: len={}, footer_offset={footer_offset}",
-            output.len()
-        );
-        assert_ne!(
-            output.get(footer_offset..footer_offset + RAO_FOOTER.len()),
-            Some(&RAO_FOOTER[..]),
+            !output
+                .windows(RAO_FOOTER.len())
+                .any(|window| window == RAO_FOOTER),
             "failed seal wrote the completion footer"
         );
+    }
+
+    fn envelope_options(common: SealOptions) -> EnvelopeSealOptions {
+        let primary = RecipientPrivateKey::new([1; 16], "primary", [7; 32]).unwrap();
+        let recovery = RecipientPrivateKey::new([2; 16], "recovery", [8; 32]).unwrap();
+        EnvelopeSealOptions {
+            common,
+            recipients: vec![
+                primary.public_key(0).unwrap(),
+                recovery.public_key(1).unwrap(),
+            ],
+        }
     }
 
     struct FailAfterWriter {
@@ -562,30 +376,9 @@ mod tests {
     }
 
     #[test]
-    fn seal_is_deterministic_and_opens() {
-        let root = RootKey::new([0x11; 32]).unwrap();
-        let plaintext = vec![0x5a; 1024];
-        let options = options(&plaintext);
-        let (first, first_report) = seal_to_vec(&plaintext, &root, &options).unwrap();
-        let (second, second_report) = seal_to_vec(&plaintext, &root, &options).unwrap();
-        assert_eq!(first, second);
-        assert_eq!(first_report.stored_digest, second_report.stored_digest);
-        assert_eq!(first.len() as u64, first_report.stored_size_bytes);
-        assert_eq!(first.len() % options.chunk_size as usize, 0);
-
-        let (opened, open_report) = open_to_vec(&first, &root).unwrap();
-        assert_eq!(opened, plaintext);
-        assert_eq!(
-            open_report.metadata.plaintext_digest,
-            options.plaintext_digest
-        );
-    }
-
-    #[test]
-    fn v2_envelope_seal_open_range_inspect_and_mode_rules() {
+    fn envelope_seal_open_range_and_inspect() {
         let plaintext: Vec<u8> = (0..1536).map(|index| (index % 251) as u8).collect();
-        let mut common = options(&plaintext);
-        common.key_id = [0; 16];
+        let common = options(&plaintext);
         let safe = RecipientPrivateKey::new([0x31; 16], "safe-2026", [7; 32]).unwrap();
         let escrow = RecipientPrivateKey::new([0x32; 16], "escrow-2026", [8; 32]).unwrap();
         let options = EnvelopeSealOptions {
@@ -593,10 +386,9 @@ mod tests {
             recipients: vec![safe.public_key(0).unwrap(), escrow.public_key(1).unwrap()],
         };
 
-        let (sealed, sealed_report) = seal_envelope_to_vec(&plaintext, &options).unwrap();
+        let (sealed, sealed_report) = seal_to_vec(&plaintext, &options).unwrap();
         assert_eq!(sealed_report.header.format_version, 2);
-        assert_eq!(sealed_report.header.key_id, [0; 16]);
-        assert_eq!(sealed_report.key_frame.as_ref().unwrap().slots.len(), 2);
+        assert_eq!(sealed_report.key_frame.slots.len(), 2);
 
         let inspected = inspect_bytes(&sealed).unwrap();
         assert_eq!(inspected.header, sealed_report.header);
@@ -604,20 +396,19 @@ mod tests {
         assert_eq!(inspected.chunk_count, 3);
         assert_eq!(inspected.stored_size_bytes, sealed.len() as u64);
 
-        let (opened_safe, safe_report) = open_envelope_to_vec(&sealed, &safe).unwrap();
-        let (opened_escrow, _) = open_envelope_to_vec(&sealed, &escrow).unwrap();
+        let (opened_safe, safe_report) = open_to_vec(&sealed, &safe).unwrap();
+        let (opened_escrow, _) = open_to_vec(&sealed, &escrow).unwrap();
         assert_eq!(opened_safe, plaintext);
         assert_eq!(opened_escrow, plaintext);
         assert_eq!(safe_report.header, sealed_report.header);
 
-        let (range, range_report) =
-            open_plaintext_range_envelope_to_vec(&sealed, &safe, 400, 700).unwrap();
+        let (range, range_report) = open_plaintext_range_to_vec(&sealed, &safe, 400, 700).unwrap();
         assert_eq!(range, plaintext[400..1100]);
         assert_eq!(range_report.first_chunk, Some(0));
         assert_eq!(range_report.chunk_count, 3);
 
         let mut unrequested_chunk_corrupt = sealed.clone();
-        let third_chunk = crate::cipher_offset_with_key_frame(
+        let third_chunk = crate::cipher_offset(
             sealed_report.header.key_frame_len,
             sealed_report.header.metadata_frame_len,
             sealed_report.header.chunk_size,
@@ -626,32 +417,17 @@ mod tests {
         .unwrap() as usize;
         unrequested_chunk_corrupt[third_chunk] ^= 0x80;
         assert!(matches!(
-            open_envelope_to_vec(&unrequested_chunk_corrupt, &safe),
+            open_to_vec(&unrequested_chunk_corrupt, &safe),
             Err(RaoAeadError::AeadAuthenticationFailed)
         ));
         let (first_chunk_only, partial_report) =
-            open_plaintext_range_envelope_to_vec(&unrequested_chunk_corrupt, &safe, 0, 512)
-                .unwrap();
+            open_plaintext_range_to_vec(&unrequested_chunk_corrupt, &safe, 0, 512).unwrap();
         assert_eq!(first_chunk_only, plaintext[..512]);
         assert_eq!(partial_report.chunk_count, 1);
 
-        let registry_key = RootKey::new([0x11; 32]).unwrap();
-        assert!(matches!(
-            open_to_vec(&sealed, &registry_key),
-            Err(RaoAeadError::KeyModeMismatch)
-        ));
-
-        let mut v1_options = options.common.clone();
-        v1_options.key_id = [0x10; 16];
-        let (v1, _) = seal_to_vec(&plaintext, &registry_key, &v1_options).unwrap();
-        assert!(matches!(
-            open_envelope_to_vec(&v1, &safe),
-            Err(RaoAeadError::KeyModeMismatch)
-        ));
-
         let wrong_epoch = RecipientPrivateKey::new([0x33; 16], "wrong", [9; 32]).unwrap();
         assert!(matches!(
-            open_envelope_to_vec(&sealed, &wrong_epoch),
+            open_to_vec(&sealed, &wrong_epoch),
             Err(RaoAeadError::RecipientEpochMismatch)
         ));
 
@@ -659,7 +435,7 @@ mod tests {
         let first_enc = crate::RAO_HEADER_LEN + 5 + 1 + 16 + 1 + "safe-2026".len();
         malformed_encapsulation[first_enc..first_enc + 32].fill(0);
         assert!(matches!(
-            open_envelope_to_vec(&malformed_encapsulation, &safe),
+            open_to_vec(&malformed_encapsulation, &safe),
             Err(RaoAeadError::HpkeFailed)
         ));
 
@@ -667,7 +443,7 @@ mod tests {
         let first_label = crate::RAO_HEADER_LEN + 5 + 1 + 16 + 1;
         changed_label[first_label] = b'S';
         assert!(matches!(
-            open_envelope_to_vec(&changed_label, &safe),
+            open_to_vec(&changed_label, &safe),
             Err(RaoAeadError::AeadAuthenticationFailed)
         ));
     }
@@ -675,8 +451,7 @@ mod tests {
     #[test]
     fn v2_envelope_rejects_nonadjacent_duplicate_epoch() {
         let plaintext = vec![0x5a; 512];
-        let mut common = options(&plaintext);
-        common.key_id = [0; 16];
+        let common = options(&plaintext);
         let first = RecipientPrivateKey::new([1; 16], "safe", [7; 32]).unwrap();
         let second = RecipientPrivateKey::new([2; 16], "escrow", [8; 32]).unwrap();
         let duplicate = RecipientPrivateKey::new([1; 16], "safe-copy", [9; 32]).unwrap();
@@ -689,7 +464,7 @@ mod tests {
             ],
         };
         assert!(matches!(
-            seal_envelope_to_vec(&plaintext, &options),
+            seal_to_vec(&plaintext, &options),
             Err(RaoAeadError::InvalidInput(_))
         ));
     }
@@ -697,8 +472,7 @@ mod tests {
     #[test]
     fn deterministic_v2_seal_matches_checked_in_expectation() {
         let plaintext = vec![0x5a; 512];
-        let mut common = options_with_object_id(&plaintext, "deterministic-vector");
-        common.key_id = [0; 16];
+        let common = options_with_object_id(&plaintext, "deterministic-vector");
         let primary = RecipientPrivateKey::new([0x11; 16], "primary", [0x31; 32]).unwrap();
         let recovery = RecipientPrivateKey::new([0x22; 16], "recovery", [0x32; 32]).unwrap();
         let options = EnvelopeSealOptions {
@@ -709,7 +483,7 @@ mod tests {
             ],
         };
         let mut sealed = Vec::new();
-        seal_envelope_deterministic_for_test_vectors(
+        seal_deterministic_for_test_vectors(
             &plaintext[..],
             &mut sealed,
             &options,
@@ -723,88 +497,27 @@ mod tests {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         assert_eq!(encoded, expected_hex);
-        let (opened, _) = open_envelope_to_vec(&sealed, &primary).unwrap();
+        let (opened, _) = open_to_vec(&sealed, &primary).unwrap();
         assert_eq!(opened, plaintext);
     }
 
     #[test]
-    fn salt_derivation_conformance_covers_epoch_content_and_object_id() {
-        let root = RootKey::new([0x11; 32]).unwrap();
-        let plaintext = vec![0x5a; 1024];
-        let same_options = options(&plaintext);
-        let (first, first_report) = seal_to_vec(&plaintext, &root, &same_options).unwrap();
-        let (second, second_report) = seal_to_vec(&plaintext, &root, &same_options).unwrap();
-        assert_eq!(first, second);
-        assert_eq!(
-            first_report.header.hkdf_salt,
-            second_report.header.hkdf_salt
-        );
-        assert_eq!(
-            derived_key_tuple(&root, &first_report),
-            derived_key_tuple(&root, &second_report)
-        );
-
-        let mut changed_content = plaintext.clone();
-        changed_content[0] ^= 0x01;
-        let changed_content_options = options(&changed_content);
-        let (content_variant, content_report) =
-            seal_to_vec(&changed_content, &root, &changed_content_options).unwrap();
-        assert_ne!(
-            first_report.header.hkdf_salt,
-            content_report.header.hkdf_salt
-        );
-        assert_ne!(
-            derived_key_tuple(&root, &first_report),
-            derived_key_tuple(&root, &content_report)
-        );
-        assert_ne!(first, content_variant);
-        assert_ne!(first_report.stored_digest, content_report.stored_digest);
-
-        let changed_object_id_options = options_with_object_id(&plaintext, "object-2");
-        let (object_id_variant, object_id_report) =
-            seal_to_vec(&plaintext, &root, &changed_object_id_options).unwrap();
-        assert_ne!(
-            first_report.header.hkdf_salt,
-            object_id_report.header.hkdf_salt
-        );
-        assert_ne!(
-            derived_key_tuple(&root, &first_report),
-            derived_key_tuple(&root, &object_id_report)
-        );
-        assert_ne!(first, object_id_variant);
-        assert_ne!(first_report.stored_digest, object_id_report.stored_digest);
-
-        let mut non_derived_salt = [0x77; 16];
-        if non_derived_salt == first_report.header.hkdf_salt {
-            non_derived_salt[0] ^= 0x01;
-        }
-        let nonconformant =
-            seal_with_salt_override(&plaintext, &root, &same_options, non_derived_salt);
-        assert!(matches!(
-            open_to_vec(&nonconformant, &root),
-            Err(RaoAeadError::SaltDerivationMismatch)
-        ));
-    }
-
-    #[test]
     fn failed_seal_paths_do_not_write_completion_footer() {
-        let root = RootKey::new([0x11; 32]).unwrap();
         let plaintext = vec![0x5a; 1024];
-        let options = options(&plaintext);
+        let options = envelope_options(options(&plaintext));
 
         let mut bad_digest_options = options.clone();
-        bad_digest_options.plaintext_digest[0] ^= 0x01;
+        bad_digest_options.common.plaintext_digest[0] ^= 0x01;
         let mut digest_mismatch_output = Vec::new();
         assert!(matches!(
             seal(
                 plaintext.as_slice(),
                 &mut digest_mismatch_output,
-                &root,
                 &bad_digest_options,
             ),
             Err(RaoAeadError::PlaintextDigestMismatch)
         ));
-        assert_no_footer_at_derived_offset(&digest_mismatch_output, &bad_digest_options);
+        assert_no_footer(&digest_mismatch_output);
 
         let mut oversized_plaintext = plaintext.clone();
         oversized_plaintext.push(0x01);
@@ -813,29 +526,27 @@ mod tests {
             seal(
                 oversized_plaintext.as_slice(),
                 &mut size_mismatch_output,
-                &root,
                 &options,
             ),
             Err(RaoAeadError::PlaintextSizeMismatch)
         ));
-        assert_no_footer_at_derived_offset(&size_mismatch_output, &options);
+        assert_no_footer(&size_mismatch_output);
 
-        let mut failing_output = FailAfterWriter::new(footer_offset_for(&options));
+        let mut failing_output = FailAfterWriter::new(256);
         assert!(matches!(
-            seal(plaintext.as_slice(), &mut failing_output, &root, &options),
+            seal(plaintext.as_slice(), &mut failing_output, &options),
             Err(RaoAeadError::Io(_))
         ));
-        assert_no_footer_at_derived_offset(&failing_output.bytes, &options);
+        assert_no_footer(&failing_output.bytes);
     }
 
     #[test]
     fn seal_refuses_extra_plaintext_bytes() {
-        let root = RootKey::new([0x11; 32]).unwrap();
         let mut plaintext = vec![0x5a; 1024];
-        let options = options(&plaintext);
+        let options = envelope_options(options(&plaintext));
         plaintext.push(1);
         assert!(matches!(
-            seal_to_vec(&plaintext, &root, &options),
+            seal_to_vec(&plaintext, &options),
             Err(RaoAeadError::PlaintextSizeMismatch)
         ));
     }

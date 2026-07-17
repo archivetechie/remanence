@@ -7088,7 +7088,6 @@ fn migrate(conn: &Connection) -> Result<(), StateError> {
         "representation",
         "representation text not null default 'unknown'",
     )?;
-    ensure_column(conn, "object_copies", "key_id", "key_id blob")?;
     ensure_column(
         conn,
         "object_copies",
@@ -7324,7 +7323,6 @@ create table if not exists object_copies(
   protected_until_ordinal integer,
   status text not null,
   representation text not null default 'unknown',
-  key_id blob,
   recipient_epoch_ids text,
   metadata_frame_len integer,
   plaintext_digest blob,
@@ -9303,7 +9301,6 @@ mod tests {
         );
         for column in [
             "representation",
-            "key_id",
             "recipient_epoch_ids",
             "metadata_frame_len",
             "plaintext_digest",

@@ -112,17 +112,8 @@ pub fn payload_frame_len(plaintext_size: u64, chunk_size: u32) -> Result<u64> {
         .ok_or(RaoAeadError::SizeOverflow)
 }
 
-/// Stored object size after footer and zero fill.
+/// Compute padded stored size with the plaintext key frame.
 pub fn stored_size_from_parts(
-    chunk_size: u32,
-    metadata_frame_len: u64,
-    plaintext_size: u64,
-) -> Result<u64> {
-    stored_size_from_parts_with_key_frame(chunk_size, 0, metadata_frame_len, plaintext_size)
-}
-
-/// Compute padded stored size with a variable plaintext key frame.
-pub fn stored_size_from_parts_with_key_frame(
     chunk_size: u32,
     key_frame_len: u32,
     metadata_frame_len: u64,
@@ -138,22 +129,8 @@ pub fn stored_size_from_parts_with_key_frame(
     round_up(footer_end, u64::from(chunk_size))
 }
 
-/// Stored object size for a metadata frame plus plaintext size.
-pub fn expected_stored_size(
-    chunk_size: u32,
-    metadata_frame_len: u64,
-    plaintext_size: u64,
-) -> Result<u64> {
-    stored_size_from_parts(chunk_size, metadata_frame_len, plaintext_size)
-}
-
-/// Ciphertext offset of inner body block `b`.
-pub fn cipher_offset(metadata_frame_len: u64, chunk_size: u32, b: u64) -> Result<u64> {
-    cipher_offset_with_key_frame(0, metadata_frame_len, chunk_size, b)
-}
-
-/// Stored offset of payload block `b` with an explicit key-frame length.
-pub fn cipher_offset_with_key_frame(
+/// Stored offset of payload block `b` after the explicit key frame.
+pub fn cipher_offset(
     key_frame_len: u32,
     metadata_frame_len: u64,
     chunk_size: u32,

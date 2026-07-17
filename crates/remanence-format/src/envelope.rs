@@ -19,7 +19,7 @@ pub fn seal_envelope_rao_stream<R: Read, W: Write>(
     output: W,
     options: &EnvelopeSealOptions,
 ) -> Result<SealReport, FormatError> {
-    remanence_aead::seal_envelope(plaintext, output, options).map_err(Into::into)
+    remanence_aead::seal(plaintext, output, options).map_err(Into::into)
 }
 
 /// Open a v2 recipient envelope to canonical RAO plaintext.
@@ -28,7 +28,7 @@ pub fn open_envelope_rao_stream<R: Read, W: Write>(
     output: W,
     recipient: &RecipientPrivateKey,
 ) -> Result<OpenReport, FormatError> {
-    remanence_aead::open_envelope(input, output, recipient).map_err(Into::into)
+    remanence_aead::open(input, output, recipient).map_err(Into::into)
 }
 
 /// Authenticate an envelope prefix and map a plaintext range to stored bytes.
@@ -38,7 +38,7 @@ pub fn covering_envelope_rao_stored_range(
     plaintext_start: u64,
     plaintext_len: u64,
 ) -> Result<CoveringStoredRange, FormatError> {
-    remanence_aead::covering_stored_range_envelope(
+    remanence_aead::covering_stored_range(
         authenticated_prefix,
         recipient,
         plaintext_start,
@@ -57,7 +57,7 @@ pub fn open_envelope_rao_range_from_reader<R: Read + ?Sized, W: Write + ?Sized>(
     plaintext_start: u64,
     plaintext_len: u64,
 ) -> Result<RangeOpenReport, FormatError> {
-    remanence_aead::open_plaintext_range_envelope_from_reader(
+    remanence_aead::open_plaintext_range_from_reader(
         authenticated_prefix,
         ranged_input,
         stored_range_start,
