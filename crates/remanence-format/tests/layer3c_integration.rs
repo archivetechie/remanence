@@ -4,12 +4,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Cursor;
 
-use remanence_aead::RootKey;
+use remanence_aead::RecipientPrivateKey;
 use remanence_format::{
-    plan_rem_tar_object, read_encrypted_rao_object, read_rem_tar_object, stream_rem_tar_object,
-    write_encrypted_rao_object, write_rem_tar_object, write_rem_tar_object_from_readers,
-    FormatError, RemTarEntrySink, RemTarFile, RemTarFileSpec, RemTarFileStream,
-    RemTarObjectOptions, RemTarStreamEntry,
+    plan_rem_tar_object, read_envelope_rao_file_range_to_vec, read_envelope_rao_object,
+    read_rem_tar_object, stream_rem_tar_object, write_envelope_rao_object, write_rem_tar_object,
+    write_rem_tar_object_from_readers, FormatError, RemTarEntrySink, RemTarFile, RemTarFileSpec,
+    RemTarFileStream, RemTarObjectOptions, RemTarStreamEntry,
 };
 use remanence_library::{scsi::ScsiError, TapeIoError, VecBlockSink, VecBlockSource};
 use remanence_parity::{
@@ -202,8 +202,14 @@ fn streaming_rem_tar_roundtrips_through_parity_object_source() {
 #[test]
 fn encrypted_rao_ciphertext_recovers_through_parity_before_keyed_open() {
     let opts = options();
-    let root_key = RootKey::new([0x42; 32]).expect("root key is valid");
-    let key_id = [0x24; 16];
+    let primary = RecipientPrivateKey::new([0x24; 16], "archive-primary", [0x42; 32])
+        .expect("primary recipient key");
+    let recovery = RecipientPrivateKey::new([0x25; 16], "recovery", [0x43; 32])
+        .expect("recovery recipient key");
+    let recipients = vec![
+        primary.public_key(0).expect("primary public key"),
+        recovery.public_key(1).expect("recovery public key"),
+    ];
     let photo = vec![0xA5; 18_000];
     let sidecar = b"encrypted parity acceptance".to_vec();
     let files = [
@@ -224,9 +230,24 @@ fn encrypted_rao_ciphertext_recovers_through_parity_before_keyed_open() {
     ];
 
     let mut planning_sink = VecBlockSink::new();
-    let planned_report =
-        write_encrypted_rao_object(&mut planning_sink, &opts, &files, &root_key, key_id)
-            .expect("encrypted planning fixture writes without parity");
+    let planned_report = write_envelope_rao_object(&mut planning_sink, &opts, &files, &recipients)
+        .expect("encrypted planning fixture writes without parity");
+    let planned_ciphertext = planning_sink
+        .blocks
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    let pfr = read_envelope_rao_file_range_to_vec(
+        &planned_ciphertext,
+        &recovery,
+        planned_report.plaintext_layout.files[0].first_chunk_lba,
+        photo.len() as u64,
+        257,
+        8193,
+    )
+    .expect("recipient-envelope PFR opens through the format funnel");
+    assert_eq!(pfr.bytes, photo[257..8450]);
 
     let mut tape = VecBlockSink::new();
     let report;
@@ -246,14 +267,15 @@ fn encrypted_rao_ciphertext_recovers_through_parity_before_keyed_open() {
                 .0,
             1
         );
-        report = write_encrypted_rao_object(&mut parity, &opts, &files, &root_key, key_id)
+        report = write_envelope_rao_object(&mut parity, &opts, &files, &recipients)
             .expect("encrypted RAO writes through parity sink");
         parity
             .record_bootstrap_object_row(BootstrapObjectRow::encrypted(
                 1,
                 report.envelope.stored_size_blocks,
-                key_id,
+                vec![[0x24; 16], [0x25; 16]],
                 report.envelope.metadata_frame_len,
+                report.envelope.header.key_frame_len,
             ))
             .expect("encrypted bootstrap row records");
         close = parity.finish_object().expect("parity object closes");
@@ -275,11 +297,13 @@ fn encrypted_rao_ciphertext_recovers_through_parity_before_keyed_open() {
     );
     match &bootstrap_object_row.representation {
         BootstrapObjectRepresentation::Encrypted {
-            key_id: row_key_id,
+            recipient_epoch_ids,
             metadata_frame_len,
+            key_frame_len,
         } => {
-            assert_eq!(*row_key_id, key_id);
+            assert_eq!(recipient_epoch_ids, &vec![[0x24; 16], [0x25; 16]]);
             assert_eq!(*metadata_frame_len, report.envelope.metadata_frame_len);
+            assert_eq!(*key_frame_len, report.envelope.header.key_frame_len);
         }
         BootstrapObjectRepresentation::Plaintext { .. } => {
             panic!("encrypted parity write emitted plaintext bootstrap row")
@@ -321,11 +345,11 @@ fn encrypted_rao_ciphertext_recovers_through_parity_before_keyed_open() {
     let object_end = object_start + usize::try_from(report.envelope.stored_size_blocks).unwrap();
     let tampered_object_blocks = damaged_blocks[object_start..object_end].to_vec();
     let mut tampered_source = VecBlockSource::new(tampered_object_blocks);
-    read_encrypted_rao_object(
+    read_envelope_rao_object(
         &mut tampered_source,
         opts.chunk_size,
         report.envelope.stored_size_blocks,
-        &root_key,
+        &primary,
     )
     .expect_err("clean-read ciphertext tamper must fail authentication before repair");
 
@@ -358,11 +382,11 @@ fn encrypted_rao_ciphertext_recovers_through_parity_before_keyed_open() {
         OpenTrust::RequireValidated,
     )
     .expect("object parity source opens for keyed read");
-    let read = read_encrypted_rao_object(
+    let read = read_envelope_rao_object(
         &mut object_source,
         opts.chunk_size,
         report.envelope.stored_size_blocks,
-        &root_key,
+        &primary,
     )
     .expect("keyed open succeeds after parity restores ciphertext");
 

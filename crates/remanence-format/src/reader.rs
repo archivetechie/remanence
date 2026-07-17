@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use remanence_aead::{open_to_vec, OpenReport, RootKey};
+use remanence_aead::{open_envelope_to_vec, open_to_vec, OpenReport, RecipientPrivateKey, RootKey};
 use remanence_library::BlockRead;
 use sha2::{Digest, Sha256};
 
@@ -294,6 +294,83 @@ pub fn read_encrypted_rao_object_with_mode_and_manifest_anchor<S: BlockRead + ?S
     validate_chunk_size(chunk_size)?;
     let encrypted = read_object_bytes(source, chunk_size, block_count)?;
     let (plaintext, envelope) = open_to_vec(&encrypted, root_key)?;
+    parse_opened_encrypted_object(plaintext, envelope, chunk_size, mode, manifest_sha256)
+}
+
+/// Read, decrypt, and parse one v2 recipient-envelope RAO object.
+pub fn read_envelope_rao_object<S: BlockRead + ?Sized>(
+    source: &mut S,
+    chunk_size: usize,
+    block_count: u64,
+    recipient: &RecipientPrivateKey,
+) -> Result<EncryptedRaoReadObject, FormatError> {
+    read_envelope_rao_object_with_mode(
+        source,
+        chunk_size,
+        block_count,
+        recipient,
+        ReadMode::Restore,
+    )
+}
+
+/// Read a v2 recipient-envelope RAO object with an explicit integrity mode.
+pub fn read_envelope_rao_object_with_mode<S: BlockRead + ?Sized>(
+    source: &mut S,
+    chunk_size: usize,
+    block_count: u64,
+    recipient: &RecipientPrivateKey,
+    mode: ReadMode,
+) -> Result<EncryptedRaoReadObject, FormatError> {
+    read_envelope_rao_object_with_mode_and_manifest_anchor(
+        source,
+        chunk_size,
+        block_count,
+        recipient,
+        mode,
+        None,
+    )
+}
+
+/// Read a v2 recipient-envelope RAO object with an external manifest anchor.
+pub fn read_envelope_rao_object_with_manifest_anchor<S: BlockRead + ?Sized>(
+    source: &mut S,
+    chunk_size: usize,
+    block_count: u64,
+    recipient: &RecipientPrivateKey,
+    manifest_sha256: Option<[u8; 32]>,
+) -> Result<EncryptedRaoReadObject, FormatError> {
+    read_envelope_rao_object_with_mode_and_manifest_anchor(
+        source,
+        chunk_size,
+        block_count,
+        recipient,
+        ReadMode::Restore,
+        manifest_sha256,
+    )
+}
+
+/// Read a v2 recipient-envelope RAO object with explicit mode and manifest anchor.
+pub fn read_envelope_rao_object_with_mode_and_manifest_anchor<S: BlockRead + ?Sized>(
+    source: &mut S,
+    chunk_size: usize,
+    block_count: u64,
+    recipient: &RecipientPrivateKey,
+    mode: ReadMode,
+    manifest_sha256: Option<[u8; 32]>,
+) -> Result<EncryptedRaoReadObject, FormatError> {
+    validate_chunk_size(chunk_size)?;
+    let encrypted = read_object_bytes(source, chunk_size, block_count)?;
+    let (plaintext, envelope) = open_envelope_to_vec(&encrypted, recipient)?;
+    parse_opened_encrypted_object(plaintext, envelope, chunk_size, mode, manifest_sha256)
+}
+
+fn parse_opened_encrypted_object(
+    plaintext: Vec<u8>,
+    envelope: OpenReport,
+    chunk_size: usize,
+    mode: ReadMode,
+    manifest_sha256: Option<[u8; 32]>,
+) -> Result<EncryptedRaoReadObject, FormatError> {
     let header_chunk_size = usize::try_from(envelope.header.chunk_size)
         .map_err(|_| FormatError::unsupported_feature("encrypted header chunk_size too large"))?;
     if header_chunk_size != chunk_size {

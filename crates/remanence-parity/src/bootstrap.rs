@@ -57,6 +57,9 @@ const BOOTSTRAP_PAYLOAD_CRC_LEN: usize = 8;
 const OBJECT_ROWS_KEY: u64 = 30;
 const OBJECT_ROW_METADATA_FRAME_MIN_LEN: u64 = 17;
 const OBJECT_ROW_METADATA_FRAME_MAX_LEN: u64 = 16 * 1024 * 1024;
+const OBJECT_ROW_KEY_FRAME_MIN_LEN: u32 = 103;
+const OBJECT_ROW_KEY_FRAME_MAX_LEN: u32 = 4096;
+const OBJECT_ROW_MAX_RECIPIENTS: usize = 8;
 
 /// Decoded bootstrap-block payload.
 ///
@@ -152,15 +155,17 @@ impl BootstrapObjectRow {
     pub fn encrypted(
         tape_file_number: u32,
         stored_block_count: u64,
-        key_id: [u8; 16],
+        recipient_epoch_ids: Vec<[u8; 16]>,
         metadata_frame_len: u64,
+        key_frame_len: u32,
     ) -> Self {
         Self {
             tape_file_number,
             stored_block_count,
             representation: BootstrapObjectRepresentation::Encrypted {
-                key_id,
+                recipient_epoch_ids,
                 metadata_frame_len,
+                key_frame_len,
             },
         }
     }
@@ -183,10 +188,12 @@ pub enum BootstrapObjectRepresentation {
     /// Encrypted RAO representation: bootstrap row carries envelope fields
     /// only and deliberately omits plaintext manifest anchors.
     Encrypted {
-        /// Opaque 16-byte key identifier from the RAO encrypted header.
-        key_id: [u8; 16],
+        /// Recipient epoch ids from the v2 key-frame slots.
+        recipient_epoch_ids: Vec<[u8; 16]>,
         /// RAO encrypted metadata frame length.
         metadata_frame_len: u64,
+        /// Serialized v2 key-frame length.
+        key_frame_len: u32,
     },
 }
 
@@ -973,8 +980,9 @@ pub(crate) fn encode_bootstrap_object_row_cbor(
             ]);
         }
         BootstrapObjectRepresentation::Encrypted {
-            key_id,
+            recipient_epoch_ids,
             metadata_frame_len,
+            key_frame_len,
         } => {
             entries.insert(
                 1,
@@ -985,12 +993,21 @@ pub(crate) fn encode_bootstrap_object_row_cbor(
             );
             entries.extend([
                 (
-                    CborValue::Integer(20.into()),
-                    CborValue::Bytes(key_id.to_vec()),
+                    CborValue::Integer(22.into()),
+                    CborValue::Array(
+                        recipient_epoch_ids
+                            .iter()
+                            .map(|epoch_id| CborValue::Bytes(epoch_id.to_vec()))
+                            .collect(),
+                    ),
                 ),
                 (
                     CborValue::Integer(21.into()),
                     CborValue::Integer((*metadata_frame_len).into()),
+                ),
+                (
+                    CborValue::Integer(23.into()),
+                    CborValue::Integer((*key_frame_len).into()),
                 ),
             ]);
         }
@@ -1018,8 +1035,9 @@ pub(crate) fn decode_bootstrap_object_row_cbor(
     let mut manifest_size_bytes = None;
     let mut manifest_chunk_count = None;
     let mut manifest_sha256 = None;
-    let mut key_id = None;
+    let mut recipient_epoch_ids = None;
     let mut metadata_frame_len = None;
+    let mut key_frame_len = None;
     let mut seen_integer_keys = std::collections::BTreeSet::new();
 
     for (key, value) in map {
@@ -1058,16 +1076,28 @@ pub(crate) fn decode_bootstrap_object_row_cbor(
                     ))
                 })?)
             }
-            (20, CborValue::Bytes(bytes)) => {
-                key_id = Some(bytes.try_into().map_err(|bytes: Vec<u8>| {
-                    ParityError::BootstrapParse(format!(
-                        "object_row.key_id has length {}, expected 16",
-                        bytes.len()
-                    ))
-                })?)
-            }
             (21, CborValue::Integer(i)) => {
                 metadata_frame_len = Some(int_to_u64(i, "object_row.metadata_frame_len")?)
+            }
+            (22, CborValue::Array(values)) => {
+                let mut ids = Vec::with_capacity(values.len());
+                for value in values {
+                    let CborValue::Bytes(bytes) = value else {
+                        return Err(ParityError::BootstrapParse(
+                            "object_row.recipient_epoch_ids entry is not bytes".into(),
+                        ));
+                    };
+                    ids.push(bytes.try_into().map_err(|bytes: Vec<u8>| {
+                        ParityError::BootstrapParse(format!(
+                            "object_row.recipient_epoch_id has length {}, expected 16",
+                            bytes.len()
+                        ))
+                    })?);
+                }
+                recipient_epoch_ids = Some(ids);
+            }
+            (23, CborValue::Integer(i)) => {
+                key_frame_len = Some(int_to_u32(i, "object_row.key_frame_len")?)
             }
             _ => {}
         }
@@ -1082,7 +1112,10 @@ pub(crate) fn decode_bootstrap_object_row_cbor(
         .ok_or_else(|| ParityError::BootstrapParse("object row missing representation".into()))?;
     let row = match representation.as_str() {
         "plaintext" => {
-            if key_id.is_some() || metadata_frame_len.is_some() {
+            if recipient_epoch_ids.is_some()
+                || metadata_frame_len.is_some()
+                || key_frame_len.is_some()
+            {
                 return Err(ParityError::BootstrapParse(
                     "plaintext object row carries encrypted envelope fields".into(),
                 ));
@@ -1125,13 +1158,18 @@ pub(crate) fn decode_bootstrap_object_row_cbor(
             BootstrapObjectRow::encrypted(
                 tape_file_number,
                 stored_block_count,
-                key_id.ok_or_else(|| {
-                    ParityError::BootstrapParse("encrypted object row missing key_id".into())
+                recipient_epoch_ids.ok_or_else(|| {
+                    ParityError::BootstrapParse(
+                        "encrypted object row missing recipient_epoch_ids".into(),
+                    )
                 })?,
                 metadata_frame_len.ok_or_else(|| {
                     ParityError::BootstrapParse(
                         "encrypted object row missing metadata_frame_len".into(),
                     )
+                })?,
+                key_frame_len.ok_or_else(|| {
+                    ParityError::BootstrapParse("encrypted object row missing key_frame_len".into())
                 })?,
             )
         }
@@ -1231,12 +1269,23 @@ pub(crate) fn validate_bootstrap_object_row(
             }
         }
         BootstrapObjectRepresentation::Encrypted {
-            key_id,
+            recipient_epoch_ids,
             metadata_frame_len,
+            key_frame_len,
         } => {
-            if key_id.iter().all(|byte| *byte == 0) {
+            if recipient_epoch_ids.is_empty()
+                || recipient_epoch_ids.len() > OBJECT_ROW_MAX_RECIPIENTS
+                || recipient_epoch_ids
+                    .iter()
+                    .any(|epoch_id| epoch_id.iter().all(|byte| *byte == 0))
+                || recipient_epoch_ids
+                    .iter()
+                    .enumerate()
+                    .any(|(index, epoch_id)| recipient_epoch_ids[..index].contains(epoch_id))
+            {
                 return Err(ParityError::BootstrapParse(
-                    "encrypted object row key_id must be nonzero".into(),
+                    "encrypted object row recipient_epoch_ids must contain 1..=8 distinct nonzero ids"
+                        .into(),
                 ));
             }
             if !(OBJECT_ROW_METADATA_FRAME_MIN_LEN..=OBJECT_ROW_METADATA_FRAME_MAX_LEN)
@@ -1244,6 +1293,13 @@ pub(crate) fn validate_bootstrap_object_row(
             {
                 return Err(ParityError::BootstrapParse(
                     "encrypted object row metadata_frame_len is outside RAO bounds".into(),
+                ));
+            }
+            if !(OBJECT_ROW_KEY_FRAME_MIN_LEN..=OBJECT_ROW_KEY_FRAME_MAX_LEN)
+                .contains(key_frame_len)
+            {
+                return Err(ParityError::BootstrapParse(
+                    "encrypted object row key_frame_len is outside RAO bounds".into(),
                 ));
             }
         }
@@ -1607,7 +1663,7 @@ mod tests {
         let mut payload = sample_payload();
         payload.object_rows = vec![
             BootstrapObjectRow::plaintext(1, 8, 6, 1234, 1, [0xA1; 32]),
-            BootstrapObjectRow::encrypted(3, 11, [0x24; 16], 66),
+            BootstrapObjectRow::encrypted(3, 11, vec![[0x24; 16], [0x25; 16]], 66, 207),
         ];
         let mut buf = vec![0xCC; payload.block_size_bytes as usize];
 
@@ -1629,10 +1685,14 @@ mod tests {
             (CborValue::Integer(3.into()), CborValue::Integer(4.into())),
             (CborValue::Integer(10.into()), CborValue::Integer(2.into())),
             (
-                CborValue::Integer(20.into()),
-                CborValue::Bytes(vec![0x24; 16]),
+                CborValue::Integer(22.into()),
+                CborValue::Array(vec![CborValue::Bytes(vec![0x24; 16])]),
             ),
             (CborValue::Integer(21.into()), CborValue::Integer(66.into())),
+            (
+                CborValue::Integer(23.into()),
+                CborValue::Integer(103.into()),
+            ),
         ]);
 
         let err = decode_bootstrap_object_row_cbor(row, Some(4096)).unwrap_err();
@@ -1653,10 +1713,14 @@ mod tests {
             ),
             (CborValue::Integer(3.into()), CborValue::Integer(4.into())),
             (
-                CborValue::Integer(20.into()),
-                CborValue::Bytes(vec![0x24; 16]),
+                CborValue::Integer(22.into()),
+                CborValue::Array(vec![CborValue::Bytes(vec![0x24; 16])]),
             ),
             (CborValue::Integer(21.into()), CborValue::Integer(66.into())),
+            (
+                CborValue::Integer(23.into()),
+                CborValue::Integer(103.into()),
+            ),
         ]);
 
         let err = decode_bootstrap_object_row_cbor(row, Some(4096)).unwrap_err();
@@ -1671,7 +1735,7 @@ mod tests {
     fn writer_rejects_unsorted_object_rows() {
         let mut payload = sample_payload();
         payload.object_rows = vec![
-            BootstrapObjectRow::encrypted(3, 11, [0x24; 16], 66),
+            BootstrapObjectRow::encrypted(3, 11, vec![[0x24; 16]], 66, 103),
             BootstrapObjectRow::plaintext(1, 8, 6, 1234, 1, [0xA1; 32]),
         ];
         let mut buf = vec![0; payload.block_size_bytes as usize];

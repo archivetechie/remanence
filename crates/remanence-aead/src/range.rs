@@ -131,6 +131,29 @@ pub fn open_plaintext_range_envelope_to_vec(
     )
 }
 
+/// Open a v2 envelope range relative to an inner RAO body block.
+pub fn open_inner_range_envelope_to_vec(
+    input: &[u8],
+    recipient: &crate::RecipientPrivateKey,
+    first_inner_chunk: u64,
+    range_start: u64,
+    range_len: u64,
+) -> Result<(Vec<u8>, RangeOpenReport)> {
+    let (header, metadata, keys) = open_authenticated_metadata_envelope(input, recipient)?;
+    let absolute_start = first_inner_chunk
+        .checked_mul(u64::from(header.chunk_size))
+        .and_then(|value| value.checked_add(range_start))
+        .ok_or(RaoAeadError::SizeOverflow)?;
+    open_plaintext_range_from_slice_with_context(
+        input,
+        header,
+        metadata,
+        keys,
+        absolute_start,
+        range_len,
+    )
+}
+
 /// Authenticate a v1 prefix and return the stored frames covering a plaintext range.
 pub fn covering_stored_range(
     authenticated_prefix: &[u8],

@@ -12,7 +12,7 @@ use crate::stream::{
     encrypt_chunk, encrypt_metadata, finalize_sha256, stored_size_from_parts,
     stored_size_from_parts_with_key_frame, PlaintextStats,
 };
-use crate::wrap::{wrap_dek, DataEncryptionKey, RecipientPublicKey};
+use crate::wrap::{wrap_dek, DataEncryptionKey, EphemeralRng, RecipientPublicKey};
 
 /// Inputs to the RAO sealer.
 #[derive(Debug, Clone)]
@@ -141,10 +141,43 @@ pub struct EnvelopeSealOptions {
 
 /// Seal a canonical plaintext RAO object as a v2 HPKE envelope.
 pub fn seal_envelope<R: Read, W: Write>(
+    plaintext: R,
+    output: W,
+    options: &EnvelopeSealOptions,
+) -> Result<SealReport> {
+    let dek = DataEncryptionKey::generate()?;
+    let mut rng = EphemeralRng::from_os()?;
+    seal_envelope_with_material(plaintext, output, options, &dek, &mut rng)
+}
+
+/// Seal a byte-identical v2 object from fixed test-vector key material.
+///
+/// This entry point exists only to generate reproducible conformance test
+/// vectors. Production callers must use [`seal_envelope`], which obtains the
+/// DEK and HPKE randomness from operating-system entropy.
+pub fn seal_envelope_deterministic_for_test_vectors<R: Read, W: Write>(
+    plaintext: R,
+    output: W,
+    options: &EnvelopeSealOptions,
+    dek: DataEncryptionKey,
+    hpke_rng_seed: [u8; 32],
+) -> Result<SealReport> {
+    let mut rng = EphemeralRng::from_seed(&hpke_rng_seed);
+    seal_envelope_with_material(plaintext, output, options, &dek, &mut rng)
+}
+
+fn seal_envelope_with_material<R, W, G>(
     mut plaintext: R,
     mut output: W,
     options: &EnvelopeSealOptions,
-) -> Result<SealReport> {
+    dek: &DataEncryptionKey,
+    rng: &mut G,
+) -> Result<SealReport>
+where
+    R: Read,
+    W: Write,
+    G: rand_core::CryptoRng + rand_core::RngCore,
+{
     validate_chunk_size(options.common.chunk_size)?;
     crate::header::object_id_field(&options.common.object_id)?;
     let chunk = u64::from(options.common.chunk_size);
@@ -173,7 +206,6 @@ pub fn seal_envelope<R: Read, W: Write>(
         ));
     }
 
-    let dek = DataEncryptionKey::generate()?;
     let metadata = RaoMetadata::new(
         options.common.plaintext_size,
         options.common.plaintext_digest,
@@ -190,7 +222,7 @@ pub fn seal_envelope<R: Read, W: Write>(
         &options.common.plaintext_digest,
         &metadata_plaintext,
     )?;
-    let key_frame = wrap_dek(&dek, &options.common.object_id, &options.recipients)?;
+    let key_frame = wrap_dek(dek, &options.common.object_id, &options.recipients, rng)?;
     let key_frame_bytes = key_frame.serialize()?;
     let key_frame_len =
         u32::try_from(key_frame_bytes.len()).map_err(|_| RaoAeadError::InvalidKeyFrameLength)?;
@@ -660,6 +692,39 @@ mod tests {
             seal_envelope_to_vec(&plaintext, &options),
             Err(RaoAeadError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn deterministic_v2_seal_matches_checked_in_expectation() {
+        let plaintext = vec![0x5a; 512];
+        let mut common = options_with_object_id(&plaintext, "deterministic-vector");
+        common.key_id = [0; 16];
+        let primary = RecipientPrivateKey::new([0x11; 16], "primary", [0x31; 32]).unwrap();
+        let recovery = RecipientPrivateKey::new([0x22; 16], "recovery", [0x32; 32]).unwrap();
+        let options = EnvelopeSealOptions {
+            common,
+            recipients: vec![
+                primary.public_key(0).unwrap(),
+                recovery.public_key(1).unwrap(),
+            ],
+        };
+        let mut sealed = Vec::new();
+        seal_envelope_deterministic_for_test_vectors(
+            &plaintext[..],
+            &mut sealed,
+            &options,
+            DataEncryptionKey::from_bytes([0x44; 32]),
+            [0x55; 32],
+        )
+        .unwrap();
+        let expected_hex = include_str!("../testdata/deterministic-v2-seal.hex").trim();
+        let encoded = sealed
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(encoded, expected_hex);
+        let (opened, _) = open_envelope_to_vec(&sealed, &primary).unwrap();
+        assert_eq!(opened, plaintext);
     }
 
     #[test]

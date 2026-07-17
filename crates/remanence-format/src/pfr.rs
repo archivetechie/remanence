@@ -5,7 +5,10 @@
 //! keeps file-range validation in the body-format layer while delegating
 //! authentication and decryption to `remanence-aead`.
 
-use remanence_aead::{open_inner_range_to_vec, RangeOpenReport, RootKey};
+use remanence_aead::{
+    open_inner_range_envelope_to_vec, open_inner_range_to_vec,
+    open_plaintext_range_envelope_to_vec, RangeOpenReport, RecipientPrivateKey, RootKey,
+};
 
 use crate::error::FormatError;
 use crate::model::BodyLba;
@@ -105,6 +108,43 @@ pub fn read_encrypted_rao_file_range_to_vec(
     let (bytes, envelope) = open_inner_range_to_vec(
         encrypted,
         root_key,
+        first_chunk_lba.0,
+        range_start,
+        range_len,
+    )?;
+    Ok(EncryptedRaoFileRange { bytes, envelope })
+}
+
+/// Read and authenticate a member-file range from a v2 recipient envelope.
+pub fn read_envelope_rao_file_range_to_vec(
+    encrypted: &[u8],
+    recipient: &RecipientPrivateKey,
+    first_chunk_lba: Option<BodyLba>,
+    file_size_bytes: u64,
+    range_start: u64,
+    range_len: u64,
+) -> Result<EncryptedRaoFileRange, FormatError> {
+    validate_file_range(file_size_bytes, range_start, range_len)?;
+    if range_len == 0 {
+        let (bytes, envelope) = if let Some(first_chunk_lba) = first_chunk_lba {
+            open_inner_range_envelope_to_vec(
+                encrypted,
+                recipient,
+                first_chunk_lba.0,
+                range_start,
+                0,
+            )?
+        } else {
+            open_plaintext_range_envelope_to_vec(encrypted, recipient, 0, 0)?
+        };
+        return Ok(EncryptedRaoFileRange { bytes, envelope });
+    }
+    let first_chunk_lba = first_chunk_lba.ok_or_else(|| {
+        FormatError::invalid("non-empty encrypted file range requires first_chunk_lba")
+    })?;
+    let (bytes, envelope) = open_inner_range_envelope_to_vec(
+        encrypted,
+        recipient,
         first_chunk_lba.0,
         range_start,
         range_len,

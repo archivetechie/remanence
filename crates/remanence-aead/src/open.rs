@@ -19,6 +19,8 @@ use crate::wrap::{unwrap_dek, RecipientPrivateKey};
 pub struct OpenReport {
     /// Parsed plaintext header.
     pub header: RaoHeader,
+    /// Parsed v2 key frame, absent for v1 objects.
+    pub key_frame: Option<crate::KeyFrame>,
     /// Decrypted metadata.
     pub metadata: RaoMetadata,
     /// Stored object byte length consumed.
@@ -83,6 +85,7 @@ pub fn open<R: Read, W: Write>(
 
     Ok(OpenReport {
         header,
+        key_frame: None,
         metadata,
         stored_size_bytes,
         plaintext: plaintext_stats,
@@ -157,6 +160,7 @@ pub fn open_envelope<R: Read, W: Write>(
     ensure_eof(&mut input)?;
     Ok(OpenReport {
         header,
+        key_frame: Some(key_frame),
         metadata,
         stored_size_bytes,
         plaintext: plaintext_stats,

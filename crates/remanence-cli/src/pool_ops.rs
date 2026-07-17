@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::bytes_to_hex;
-use remanence_aead::RootKey;
+use remanence_aead::{RecipientPrivateKey, RecipientPublicKey, RootKey};
 use remanence_api::{
     load_tape_by_uuid,
     read_core::{read_object_payload, CapturePayloadSink},
@@ -23,7 +23,7 @@ use remanence_api::{
     WriteObjectToPoolRequest,
 };
 use remanence_format::{
-    read_encrypted_rao_object_with_manifest_anchor, RemTarReadObject, MANIFEST_PATH,
+    read_envelope_rao_object_with_manifest_anchor, RemTarReadObject, MANIFEST_PATH,
 };
 use remanence_library::{
     BlockSize, BlockSource, DriveHandleSink, DriveHandleSource, SpaceKind, StaticAllowlist,
@@ -59,6 +59,8 @@ pub struct ArchiveWriteArgs {
     pub key_file: Option<PathBuf>,
     /// 16-byte key identifier as 32 hex characters.
     pub key_id: Option<String>,
+    /// Canonical RAOR recipient public-key files.
+    pub recipients: Vec<PathBuf>,
     /// Emit locator JSON to stdout instead of human-readable form.
     pub json_output: bool,
     /// Path to config file.
@@ -261,7 +263,7 @@ pub fn run_archive_write(
         archive_path,
         caller_object_id,
         expected_content_sha256: None,
-        representation,
+        representation: representation.representation,
     };
 
     let result = {
@@ -278,7 +280,12 @@ pub fn run_archive_write(
     match result {
         Ok(PoolWriteResult { object, .. }) => {
             if args.json_output {
-                print_locator_json(&object, &pool_id, out);
+                print_locator_json_with_recipients(
+                    &object,
+                    &pool_id,
+                    representation.recipient_epochs.as_deref(),
+                    out,
+                );
             } else {
                 print_locator_human(&object, &pool_id, out);
             }
@@ -291,16 +298,50 @@ pub fn run_archive_write(
     }
 }
 
+struct WriteRepresentationSelection {
+    representation: PoolWriteRepresentation,
+    recipient_epochs: Option<Vec<serde_json::Value>>,
+}
+
 fn write_representation_from_args(
     args: &ArchiveWriteArgs,
     err: &mut dyn Write,
-) -> Result<PoolWriteRepresentation, ExitCode> {
+) -> Result<WriteRepresentationSelection, ExitCode> {
+    if !args.recipients.is_empty() {
+        if args.encrypt || args.key_file.is_some() || args.key_id.is_some() {
+            let _ = writeln!(
+                err,
+                "error: --recipient cannot be combined with --encrypt/--key-file/--key-id"
+            );
+            return Err(ExitCode::from(1));
+        }
+        let recipients = read_recipient_files(&args.recipients).map_err(|error| {
+            let _ = writeln!(err, "error: {error}");
+            ExitCode::from(1)
+        })?;
+        let recipient_epochs = recipients
+            .iter()
+            .map(|recipient| {
+                serde_json::json!({
+                    "epoch_id": bytes_to_hex(&recipient.recipient_epoch_id),
+                    "label": recipient.epoch_label,
+                })
+            })
+            .collect();
+        return Ok(WriteRepresentationSelection {
+            representation: PoolWriteRepresentation::Encrypted { recipients },
+            recipient_epochs: Some(recipient_epochs),
+        });
+    }
     if !args.encrypt {
         if args.key_file.is_some() || args.key_id.is_some() {
             let _ = writeln!(err, "error: --key-file/--key-id require --encrypt");
             return Err(ExitCode::from(1));
         }
-        return Ok(PoolWriteRepresentation::Plaintext);
+        return Ok(WriteRepresentationSelection {
+            representation: PoolWriteRepresentation::Plaintext,
+            recipient_epochs: None,
+        });
     }
 
     let key_file = match args.key_file.as_deref() {
@@ -328,7 +369,40 @@ fn write_representation_from_args(
             return Err(ExitCode::from(1));
         }
     };
-    Ok(PoolWriteRepresentation::Encrypted { root_key, key_id })
+    drop(root_key);
+    let _ = key_id;
+    let _ = writeln!(
+        err,
+        "error: registry-symmetric writes are retired; use two or more --recipient files"
+    );
+    Err(ExitCode::from(1))
+}
+
+fn read_recipient_files(paths: &[PathBuf]) -> Result<Vec<RecipientPublicKey>, String> {
+    if !(2..=8).contains(&paths.len()) {
+        return Err("--recipient must be repeated 2 to 8 times".to_string());
+    }
+    let mut recipients = Vec::with_capacity(paths.len());
+    for path in paths {
+        let bytes = std::fs::read(path)
+            .map_err(|error| format!("read --recipient {}: {error}", path.display()))?;
+        recipients.push(
+            RecipientPublicKey::parse(&bytes)
+                .map_err(|error| format!("parse --recipient {}: {error}", path.display()))?,
+        );
+    }
+    if recipients
+        .windows(2)
+        .any(|pair| pair[0].slot_index >= pair[1].slot_index)
+        || recipients.iter().enumerate().any(|(index, recipient)| {
+            recipients[..index]
+                .iter()
+                .any(|earlier| earlier.recipient_epoch_id == recipient.recipient_epoch_id)
+        })
+    {
+        return Err("--recipient epochs must be distinct and in ascending slot order".to_string());
+    }
+    Ok(recipients)
 }
 
 fn read_root_key_file(path: &Path) -> Result<RootKey, String> {
@@ -344,6 +418,15 @@ fn read_root_key_file(path: &Path) -> Result<RootKey, String> {
     RootKey::new(bytes).map_err(|error| error.to_string())
 }
 
+fn read_private_key_file(path: &Path) -> Result<RecipientPrivateKey, String> {
+    let mut bytes = std::fs::read(path)
+        .map_err(|error| format!("read --private-key {}: {error}", path.display()))?;
+    let parsed = RecipientPrivateKey::parse(&bytes)
+        .map_err(|error| format!("parse --private-key {}: {error}", path.display()));
+    bytes.zeroize();
+    parsed
+}
+
 fn parse_key_id(value: &str) -> Result<[u8; 16], String> {
     let bytes = hex_to_bytes(value)?;
     <[u8; 16]>::try_from(bytes)
@@ -355,9 +438,19 @@ fn parse_key_id(value: &str) -> Result<[u8; 16], String> {
 // =====================================================================
 
 /// Print the locator as a single JSON line to stdout (§4 contract).
+#[cfg(test)]
 pub(crate) fn print_locator_json(
     object: &PoolWriteObjectRecord,
     pool_id: &str,
+    out: &mut dyn Write,
+) {
+    print_locator_json_with_recipients(object, pool_id, None, out);
+}
+
+fn print_locator_json_with_recipients(
+    object: &PoolWriteObjectRecord,
+    pool_id: &str,
+    recipient_epochs: Option<&[serde_json::Value]>,
     out: &mut dyn Write,
 ) {
     let copy = match object.copies.first() {
@@ -372,7 +465,6 @@ pub(crate) fn print_locator_json(
     } else {
         "none"
     };
-    let key_id = copy.key_id.map(|value| bytes_to_hex(&value));
     let append_mode = append_mode_name_for_tape_file_number(copy.tape_file_number);
 
     // §4: single compact line on stdout — no pretty-printing.
@@ -387,7 +479,9 @@ pub(crate) fn print_locator_json(
         "body_format": "rao-v1",
         "representation": copy.representation.as_str(),
         "encryption": encryption,
-        "key_id": key_id,
+        "format_version": (copy.representation == OBJECT_COPY_REPRESENTATION_ENCRYPTED)
+            .then_some(2),
+        "recipient_epochs": recipient_epochs,
         "metadata_frame_len": copy.metadata_frame_len,
         "append_commit_info": {
             "append_mode": append_mode,
@@ -446,8 +540,8 @@ fn print_locator_human(object: &PoolWriteObjectRecord, pool_id: &str, out: &mut 
     let _ = writeln!(out, "  body_format:    rao-v1");
     let _ = writeln!(out, "  representation: {}", copy.representation);
     let _ = writeln!(out, "  encryption:     {encryption}");
-    if let Some(key_id) = copy.key_id {
-        let _ = writeln!(out, "  key_id:         {}", bytes_to_hex(&key_id));
+    if let Some(recipient_epoch_ids) = &copy.recipient_epoch_ids {
+        let _ = writeln!(out, "  recipient_ids:  {}", recipient_epoch_ids.join(","));
     }
     if let Some(metadata_frame_len) = copy.metadata_frame_len {
         let _ = writeln!(out, "  metadata_frame: {metadata_frame_len}");
@@ -492,7 +586,7 @@ struct ObjectReadPlan {
     block_size_bytes: u32,
     manifest_sha256: Option<[u8; 32]>,
     representation: String,
-    key_id: Option<[u8; 16]>,
+    recipient_epoch_ids: Option<Vec<String>>,
     metadata_frame_len: Option<u64>,
 }
 
@@ -506,6 +600,8 @@ pub struct ArchiveReadArgs {
     pub out: PathBuf,
     /// 32-byte root key file for encrypted object copies.
     pub key_file: Option<PathBuf>,
+    /// Canonical RAOP private-key file for encrypted object copies.
+    pub private_key: Option<PathBuf>,
     /// Path to config file.
     pub config: PathBuf,
 }
@@ -532,6 +628,8 @@ pub struct ArchiveVerifyArgs {
     pub expected_sha256: String,
     /// 32-byte root key file for encrypted object copies.
     pub key_file: Option<PathBuf>,
+    /// Canonical RAOP private-key file for encrypted object copies.
+    pub private_key: Option<PathBuf>,
     /// Path to config file.
     pub config: PathBuf,
 }
@@ -642,23 +740,16 @@ fn plan_from_records(
                 loc.object_id, loc.tape_file_number, loc.first_body_lba
             )
         })?;
-    let key_id = copy
-        .key_id
-        .as_deref()
-        .map(|bytes| {
-            <[u8; 16]>::try_from(bytes)
-                .map_err(|_| format!("catalog key_id must be 16 bytes, got {}", bytes.len()))
-        })
-        .transpose()?;
+    let recipient_epoch_ids = copy.recipient_epoch_ids.clone();
     match copy.representation.as_str() {
         OBJECT_COPY_REPRESENTATION_PLAINTEXT => {
-            if key_id.is_some() || copy.metadata_frame_len.is_some() {
+            if recipient_epoch_ids.is_some() || copy.metadata_frame_len.is_some() {
                 return Err("plaintext catalog copy carries encrypted envelope fields".to_string());
             }
         }
         OBJECT_COPY_REPRESENTATION_ENCRYPTED => {
-            if key_id.is_none() {
-                return Err("encrypted catalog copy is missing key_id".to_string());
+            if recipient_epoch_ids.as_ref().is_none_or(Vec::is_empty) {
+                return Err("encrypted catalog copy is missing recipient_epoch_ids".to_string());
             }
             if copy.metadata_frame_len.is_none() {
                 return Err("encrypted catalog copy is missing metadata_frame_len".to_string());
@@ -693,7 +784,7 @@ fn plan_from_records(
         block_size_bytes,
         manifest_sha256,
         representation: copy.representation.clone(),
-        key_id,
+        recipient_epoch_ids,
         metadata_frame_len: copy.metadata_frame_len,
     })
 }
@@ -741,6 +832,7 @@ struct TapeObjectRef<'a> {
     config: &'a Path,
     locator_json: &'a str,
     key_file: Option<&'a Path>,
+    private_key: Option<&'a Path>,
 }
 
 /// Mounted, identity-checked, fixed-block-configured tape object.
@@ -868,8 +960,11 @@ fn stream_tape_object<W: Write + Send>(
 
     let (payload_bytes, actual_sha256) = match mounted.plan.representation.as_str() {
         OBJECT_COPY_REPRESENTATION_PLAINTEXT => {
-            if target.key_file.is_some() {
-                let _ = writeln!(err, "error: --key-file is only valid for encrypted copies");
+            if target.key_file.is_some() || target.private_key.is_some() {
+                let _ = writeln!(
+                    err,
+                    "error: key options are only valid for encrypted copies"
+                );
                 return Err(ExitCode::from(1));
             }
             let mut sink = CapturePayloadSink::new(sink_writer);
@@ -894,11 +989,15 @@ fn stream_tape_object<W: Write + Send>(
             })?
         }
         OBJECT_COPY_REPRESENTATION_ENCRYPTED => {
-            let key_file = target.key_file.ok_or_else(|| {
-                let _ = writeln!(err, "error: encrypted copy requires --key-file");
+            if target.key_file.is_some() {
+                let _ = writeln!(err, "error: v2 encrypted copies require --private-key");
+                return Err(ExitCode::from(1));
+            }
+            let private_key = target.private_key.ok_or_else(|| {
+                let _ = writeln!(err, "error: encrypted copy requires --private-key");
                 ExitCode::from(1)
             })?;
-            let root_key = read_root_key_file(key_file).map_err(|error| {
+            let recipient = read_private_key_file(private_key).map_err(|error| {
                 let _ = writeln!(err, "error: {error}");
                 ExitCode::from(1)
             })?;
@@ -911,11 +1010,11 @@ fn stream_tape_object<W: Write + Send>(
                     let _ = writeln!(err, "error: space to object tape file: {error}");
                     return Err(ExitCode::from(1));
                 }
-                read_encrypted_rao_object_with_manifest_anchor(
+                read_envelope_rao_object_with_manifest_anchor(
                     &mut source,
                     mounted.plan.block_size_bytes as usize,
                     mounted.plan.block_count,
-                    &root_key,
+                    &recipient,
                     mounted.plan.manifest_sha256,
                 )
             }
@@ -923,8 +1022,20 @@ fn stream_tape_object<W: Write + Send>(
                 let _ = writeln!(err, "error: open encrypted RAO: {error}");
                 ExitCode::from(1)
             })?;
-            if Some(opened.envelope.header.key_id) != mounted.plan.key_id {
-                let _ = writeln!(err, "error: encrypted RAO key_id differs from catalog");
+            let opened_recipient_epoch_ids = opened
+                .envelope
+                .key_frame
+                .as_ref()
+                .expect("v2 open report carries key frame")
+                .slots
+                .iter()
+                .map(|slot| bytes_to_hex(&slot.recipient_epoch_id))
+                .collect::<Vec<_>>();
+            if Some(opened_recipient_epoch_ids) != mounted.plan.recipient_epoch_ids {
+                let _ = writeln!(
+                    err,
+                    "error: encrypted RAO recipient epochs differ from catalog"
+                );
                 return Err(ExitCode::from(1));
             }
             if Some(opened.envelope.header.metadata_frame_len) != mounted.plan.metadata_frame_len {
@@ -1102,6 +1213,7 @@ pub fn run_archive_read(
         config: &args.config,
         locator_json: &args.locator,
         key_file: args.key_file.as_deref(),
+        private_key: args.private_key.as_deref(),
     };
     let outcome = match stream_tape_object(report, &target, allow, allow_derived, out_file, err) {
         Ok(o) => o,
@@ -1166,6 +1278,7 @@ pub fn run_archive_export_object(
         config: &args.config,
         locator_json: &args.locator,
         key_file: None,
+        private_key: None,
     };
     let outcome =
         match stream_stored_tape_object(report, &target, allow, allow_derived, out_file, err) {
@@ -1247,6 +1360,7 @@ pub fn run_archive_verify(
         config: &args.config,
         locator_json: &args.locator,
         key_file: args.key_file.as_deref(),
+        private_key: args.private_key.as_deref(),
     };
     let outcome =
         match stream_tape_object(report, &target, allow, allow_derived, std::io::sink(), err) {
@@ -1519,7 +1633,7 @@ mod tests {
             status: "committed".to_string(),
             pool_id: Some("scenario-a".to_string()),
             representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
-            key_id: None,
+            recipient_epoch_ids: None,
             metadata_frame_len: None,
             plaintext_digest: Some(vec![0x51; 32]),
             stored_digest: Some(vec![0x51; 32]),
@@ -1741,7 +1855,7 @@ mod tests {
                 first_body_lba: 2,
                 pool_id: "scenario-a".to_string(),
                 representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
-                key_id: None,
+                recipient_epoch_ids: None,
                 metadata_frame_len: None,
             }],
         };
@@ -1768,7 +1882,8 @@ mod tests {
             "body_format",
             "representation",
             "encryption",
-            "key_id",
+            "format_version",
+            "recipient_epochs",
             "metadata_frame_len",
             "append_commit_info",
         ] {
@@ -1783,7 +1898,8 @@ mod tests {
         assert_eq!(parsed["body_format"].as_str().unwrap(), "rao-v1");
         assert_eq!(parsed["representation"].as_str().unwrap(), "plaintext");
         assert_eq!(parsed["encryption"].as_str().unwrap(), "none");
-        assert!(parsed["key_id"].is_null());
+        assert!(parsed["format_version"].is_null());
+        assert!(parsed["recipient_epochs"].is_null());
         assert!(parsed["metadata_frame_len"].is_null());
         let append_info = parsed["append_commit_info"].as_object().unwrap();
         assert_eq!(append_info["append_mode"].as_str().unwrap(), "fresh");
