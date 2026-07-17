@@ -284,7 +284,7 @@ commits**, whole tree compiles + tests green at each:
 
 | Prompt | Repo | Content | Depends on |
 | --- | --- | --- | --- |
-| **P1 rem-core** | remanence | P1a–P1e above | — |
+| **P1 rem-core** | remanence | P1-ADD / P1-EXCISE / P1-RETIRE above | — |
 | **P2 rem-vectors+spec** | remanence | RAO-TV-E2 + Python v2 open-verifier + negative re-base + TV-D1 re-base + tar regen; publication-spec excision (both docs) + SHA re-pin. Spec-gate greps include: `format_version = 1`, `registry-symmetric`, `root key`, `MUST implement v1`, `no test-only`, plus §13.3's determinism sentence and §14's conformance clause rewritten by hand. | P1 |
 | **P3 sutra-pivot** | sutradhara | D7 + D8 + D11 in full (enumerated sites above); pilot pristine-wipe + re-ingest as the closing verification step. | P1 |
 | **P4 harness** | system | D9: `sealing_support.py` first, seams, bindings, load-bearing scenario rewrites, incidental fixture updates, RAOE hermetic scenario. | P1, P3 |
