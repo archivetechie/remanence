@@ -1,0 +1,20 @@
+{
+  "title": "Remanence: open tape archival infrastructure and the RAO object format",
+  "upload_type": "software",
+  "creators": [
+    {
+      "name": "The ArchiveTech Project"
+    }
+  ],
+  "description": "Remanence is open Rust infrastructure for writing archives to LTO tape and reading them back decades later: library control, tape I/O, erasure-coded parity, and a self-describing on-tape object format. The repository is the reference implementation of two published specifications: the RAO (Rem Archive Object) Format 1.0 — a constrained POSIX pax tar container with per-file SHA-256 identities, closed-form byte-range addressing, a deterministic CBOR manifest, and an HPKE wrapped-DEK encrypted representation — and the REM-PARITY 1.0 tape format for catalog-less, parity-protected recovery from bare tape. The specifications and their pinned test-vector archive are in specs/publication/.",
+  "license": "agpl-3.0-or-later",
+  "keywords": [
+    "digital preservation",
+    "archival storage",
+    "LTO tape",
+    "file format",
+    "erasure coding",
+    "tar",
+    "HPKE"
+  ]
+}
