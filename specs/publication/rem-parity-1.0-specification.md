@@ -130,16 +130,7 @@ sidecars. A bare, damaged tape is recovered by finding any bootstrap,
 reconstructing and validating the filemark map, and repairing damaged blocks
 from parity — all without reading a single byte of object content.
 
-### 1.3. Deployment Context (Informative)
-
-In the originating deployment, the objects are Rem Archive Objects [RAO] —
-self-describing archival containers in plaintext or encrypted representation
-— and the off-tape commit record is implemented by a tape-file journal and a
-catalog. Neither is required by this format: Section 4 states the whole
-contract an object must meet, and Section 3.4 states the abstract commit
-record any durable off-tape store can implement.
-
-### 1.4. Relationship to Adjacent Components
+### 1.3. Relationship to Adjacent Components
 
 - **Object formats above** (e.g. [RAO]) define the bytes inside object tape
   files; this format treats them as opaque fixed blocks (Section 4).
@@ -154,7 +145,7 @@ record any durable off-tape store can implement.
   tapes (Section 11.4): block bytes must map 1:1 to media so damage
   geometry and parity coverage correspond.
 
-### 1.5. Non-Goals
+### 1.4. Non-Goals
 
 This format performs no encryption and no authentication (Section 16.1) —
 confidentiality and authenticity of object content belong to the object
@@ -411,11 +402,11 @@ A payload format carried as REM-PARITY objects:
 
 ### 4.4. Payload Format Bindings (Informative)
 
-**Rem Archive Objects [RAO].** The reference deployment writes RAO objects,
-whose stored bytes are an exact positive multiple of the object's
-`chunk_size` in both representations (plaintext and encrypted) by
-construction; the tape block size equals `chunk_size`, so one RAO body block
-is one tape block. Parity is computed over stored bytes — ciphertext when
+**Rem Archive Objects [RAO].** An RAO object meets the contract by
+construction: its stored bytes are an exact positive multiple of the
+object's `chunk_size` in both representations (plaintext and encrypted);
+with the tape block size equal to `chunk_size`, one RAO body block is one
+tape block. Parity is computed over stored bytes — ciphertext when
 the object is encrypted — so damaged encrypted objects are repaired keyless
 and decryption is retried on the recovered bytes.
 
