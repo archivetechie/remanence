@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use std::io::Read;
 
 use remanence_aead::{
-    header::object_id_field, seal_envelope_to_vec, seal_to_vec, EnvelopeSealOptions,
-    RecipientPublicKey, RootKey, SealOptions, SealReport,
+    header::object_id_field, seal_to_vec, EnvelopeSealOptions, RecipientPublicKey, SealOptions,
+    SealReport,
 };
 use remanence_library::{BlockSink, VecBlockSink};
 use sha2::{Digest, Sha256};
@@ -221,104 +221,11 @@ pub fn write_rem_tar_object_from_readers<S: BlockSink + ?Sized>(
     Ok(layout)
 }
 
-/// Write a complete encrypted RAO object to `sink`.
-///
-/// This helper builds the canonical plaintext RAO stream with the existing
-/// writer, seals those bytes through `remanence-aead`, and then writes the
-/// stored encrypted representation as fixed-size object blocks. It is the
-/// materializing bridge used until the file-object and streaming encrypted
-/// build paths are wired.
-pub fn write_encrypted_rao_object<S: BlockSink + ?Sized>(
-    sink: &mut S,
-    options: &RemTarObjectOptions,
-    files: &[RemTarFile<'_>],
-    root_key: &RootKey,
-    key_id: [u8; 16],
-) -> Result<EncryptedRaoWriteReport, FormatError> {
-    let chunk_size = validate_encrypted_envelope_preconditions(options, key_id)?;
-    let mut plaintext_sink = VecBlockSink::new();
-    let plaintext_layout = write_rem_tar_object(&mut plaintext_sink, options, files)?;
-    let plaintext = flatten_blocks(plaintext_sink.blocks, options.chunk_size)?;
-    if plaintext.len() as u64 != plaintext_layout.total_size_bytes {
-        return Err(FormatError::layout(format!(
-            "plaintext byte length {} does not match layout {}",
-            plaintext.len(),
-            plaintext_layout.total_size_bytes
-        )));
-    }
-
-    let plaintext_digest = sha256_array(&plaintext);
-    let seal_options = SealOptions {
-        chunk_size,
-        key_id,
-        object_id: options.object_id.clone(),
-        plaintext_size: plaintext.len() as u64,
-        plaintext_digest,
-    };
-    let (sealed, envelope) = seal_to_vec(&plaintext, root_key, &seal_options)?;
-    let written_blocks = write_fixed_blocks(sink, options.chunk_size, &sealed)?;
-    if written_blocks != envelope.stored_size_blocks {
-        return Err(FormatError::layout(format!(
-            "encrypted blocks written {written_blocks} does not match envelope {}",
-            envelope.stored_size_blocks
-        )));
-    }
-    Ok(EncryptedRaoWriteReport {
-        plaintext_layout,
-        envelope,
-    })
-}
-
-/// Write a complete encrypted RAO object from streaming file sources.
-///
-/// This helper still materializes the canonical plaintext RAO stream before
-/// sealing, but callers do not need to preload every source payload in memory.
-pub fn write_encrypted_rao_object_from_readers<S: BlockSink + ?Sized>(
-    sink: &mut S,
-    options: &RemTarObjectOptions,
-    files: &mut [RemTarFileStream<'_>],
-    root_key: &RootKey,
-    key_id: [u8; 16],
-) -> Result<EncryptedRaoWriteReport, FormatError> {
-    let chunk_size = validate_encrypted_envelope_preconditions(options, key_id)?;
-    let mut plaintext_sink = VecBlockSink::new();
-    let plaintext_layout = write_rem_tar_object_from_readers(&mut plaintext_sink, options, files)?;
-    let plaintext = flatten_blocks(plaintext_sink.blocks, options.chunk_size)?;
-    if plaintext.len() as u64 != plaintext_layout.total_size_bytes {
-        return Err(FormatError::layout(format!(
-            "plaintext byte length {} does not match layout {}",
-            plaintext.len(),
-            plaintext_layout.total_size_bytes
-        )));
-    }
-
-    let plaintext_digest = sha256_array(&plaintext);
-    let seal_options = SealOptions {
-        chunk_size,
-        key_id,
-        object_id: options.object_id.clone(),
-        plaintext_size: plaintext.len() as u64,
-        plaintext_digest,
-    };
-    let (sealed, envelope) = seal_to_vec(&plaintext, root_key, &seal_options)?;
-    let written_blocks = write_fixed_blocks(sink, options.chunk_size, &sealed)?;
-    if written_blocks != envelope.stored_size_blocks {
-        return Err(FormatError::layout(format!(
-            "encrypted blocks written {written_blocks} does not match envelope {}",
-            envelope.stored_size_blocks
-        )));
-    }
-    Ok(EncryptedRaoWriteReport {
-        plaintext_layout,
-        envelope,
-    })
-}
-
 /// Write a complete v2 recipient-envelope RAO object to `sink`.
 ///
 /// Canonical archive construction remains in this crate while all encrypted
 /// framing and cryptography are delegated to `remanence-aead`.
-pub fn write_envelope_rao_object<S: BlockSink + ?Sized>(
+pub fn write_encrypted_rao_object<S: BlockSink + ?Sized>(
     sink: &mut S,
     options: &RemTarObjectOptions,
     files: &[RemTarFile<'_>],
@@ -339,7 +246,7 @@ pub fn write_envelope_rao_object<S: BlockSink + ?Sized>(
 }
 
 /// Write a complete v2 recipient-envelope RAO object from streaming sources.
-pub fn write_envelope_rao_object_from_readers<S: BlockSink + ?Sized>(
+pub fn write_encrypted_rao_object_from_readers<S: BlockSink + ?Sized>(
     sink: &mut S,
     options: &RemTarObjectOptions,
     files: &mut [RemTarFileStream<'_>],
@@ -378,14 +285,13 @@ fn seal_recipient_envelope<S: BlockSink + ?Sized>(
     let seal_options = EnvelopeSealOptions {
         common: SealOptions {
             chunk_size,
-            key_id: [0; 16],
             object_id: options.object_id.clone(),
             plaintext_size: plaintext.len() as u64,
             plaintext_digest,
         },
         recipients: recipients.to_vec(),
     };
-    let (sealed, envelope) = seal_envelope_to_vec(&plaintext, &seal_options)?;
+    let (sealed, envelope) = seal_to_vec(&plaintext, &seal_options)?;
     let written_blocks = write_fixed_blocks(sink, options.chunk_size, &sealed)?;
     if written_blocks != envelope.stored_size_blocks {
         return Err(FormatError::layout(format!(
@@ -403,20 +309,6 @@ fn validate_recipient_envelope_preconditions(
     options: &RemTarObjectOptions,
 ) -> Result<u32, FormatError> {
     crate::pax::validate_chunk_size(options.chunk_size)?;
-    object_id_field(&options.object_id)?;
-    u32::try_from(options.chunk_size)
-        .map_err(|_| FormatError::invalid("chunk_size does not fit RAO header uint32"))
-}
-
-fn validate_encrypted_envelope_preconditions(
-    options: &RemTarObjectOptions,
-    key_id: [u8; 16],
-) -> Result<u32, FormatError> {
-    // Enforce fixed RAO1 header fields before materializing plaintext bytes.
-    crate::pax::validate_chunk_size(options.chunk_size)?;
-    if key_id == [0; 16] {
-        return Err(remanence_aead::RaoAeadError::InvalidKeyIdentifier.into());
-    }
     object_id_field(&options.object_id)?;
     u32::try_from(options.chunk_size)
         .map_err(|_| FormatError::invalid("chunk_size does not fit RAO header uint32"))
@@ -699,6 +591,7 @@ mod tests {
     use std::io::{self, Cursor, Read};
     use std::process::Command;
 
+    use remanence_aead::RecipientPrivateKey;
     use remanence_library::{
         BlockSink, TapeIoError, TapePosition, VecBlockSink, VecBlockSource, WriteFilemarksOutcome,
         WriteOutcome,
@@ -716,6 +609,15 @@ mod tests {
         );
         opts.chunk_size = chunk_size;
         opts
+    }
+
+    fn recipient_public_keys() -> Vec<remanence_aead::RecipientPublicKey> {
+        let primary = RecipientPrivateKey::new([0x31; 16], "primary-2026", [0x41; 32]).unwrap();
+        let recovery = RecipientPrivateKey::new([0x32; 16], "recovery-2026", [0x42; 32]).unwrap();
+        vec![
+            primary.public_key(0).unwrap(),
+            recovery.public_key(1).unwrap(),
+        ]
     }
 
     fn test_position(lba: u64) -> TapePosition {
@@ -1076,8 +978,7 @@ mod tests {
     fn encrypted_writer_rejects_overlong_object_id_before_plaintext_work() {
         let mut opts = options(4096);
         opts.object_id = "x".repeat(65);
-        let root_key = RootKey::new([0x11; 32]).expect("root key");
-        let key_id = [0x22; 16];
+        let recipients = recipient_public_keys();
         let files = [RemTarFile {
             path: "payload.bin",
             file_id: "file-payload",
@@ -1087,8 +988,7 @@ mod tests {
         }];
         let mut sink = VecBlockSink::new();
 
-        let err =
-            write_encrypted_rao_object(&mut sink, &opts, &files, &root_key, key_id).unwrap_err();
+        let err = write_encrypted_rao_object(&mut sink, &opts, &files, &recipients).unwrap_err();
 
         assert!(matches!(
             err,
@@ -1120,8 +1020,7 @@ mod tests {
             &mut streaming_sink,
             &opts,
             &mut streams,
-            &root_key,
-            key_id,
+            &recipients,
         )
         .unwrap_err();
 

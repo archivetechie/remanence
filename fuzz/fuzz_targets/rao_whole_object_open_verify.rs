@@ -3,12 +3,12 @@
 //! Fuzz target for whole RAO object open/verify paths.
 //!
 //! Inputs beginning with `RAO1` exercise keyless encrypted inspection and
-//! keyed open with a fixed test root key. Other inputs exercise the plaintext
+//! keyed open with a fixed test recipient key. Other inputs exercise the plaintext
 //! object stream verifier. If encrypted open succeeds, the decrypted canonical
 //! plaintext is also passed through the plaintext verifier.
 
 use libfuzzer_sys::fuzz_target;
-use remanence_aead::{inspect_bytes, open_to_vec, RootKey};
+use remanence_aead::{inspect_bytes, open_to_vec, RecipientPrivateKey};
 use remanence_format::{stream_rem_tar_object, FormatError, RemTarEntrySink, RemTarStreamEntry};
 use remanence_library::VecBlockSource;
 
@@ -36,11 +36,9 @@ fuzz_target!(|data: &[u8]| {
     let data = &data[..data.len().min(MAX_INPUT_BYTES)];
     if data.starts_with(b"RAO1") {
         let inspected = inspect_bytes(data);
-        let root = match RootKey::new([0x11; 32]) {
-            Ok(root) => root,
-            Err(_) => return,
-        };
-        if let Ok((plaintext, report)) = open_to_vec(data, &root) {
+        let recipient = RecipientPrivateKey::new([0x31; 16], "primary-2026", [0x41; 32])
+            .expect("fixed fuzz recipient must be valid");
+        if let Ok((plaintext, report)) = open_to_vec(data, &recipient) {
             let chunk_size = report.header.chunk_size as usize;
             if chunk_size <= MAX_PARSE_CHUNK_SIZE {
                 parse_plaintext_blocks(&plaintext, chunk_size);

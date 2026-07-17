@@ -1,4 +1,4 @@
-//! Standalone, catalogless recovery for RAO v1 registry and v2 envelope objects.
+//! Standalone, catalogless recovery for RAO v2 recipient-envelope objects.
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
@@ -6,10 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use remanence_aead::{
-    open, open_envelope, KeyFrame, OpenReport, RaoHeader, RecipientPrivateKey, RootKey,
-    RAO_HEADER_LEN,
-};
+use remanence_aead::{open, KeyFrame, OpenReport, RaoHeader, RecipientPrivateKey, RAO_HEADER_LEN};
 use remanence_format::{stream_rem_tar_object, FormatError, RemTarEntrySink, RemTarStreamEntry};
 use remanence_library::FileBlockSource;
 use remanence_stream::{restore_object_to_directory, FilesystemRestoreOptions};
@@ -25,13 +22,9 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     object: PathBuf,
 
-    /// RAOP recipient private-key file for a v2 envelope object.
-    #[arg(long, value_name = "PATH", conflicts_with = "registry_key")]
-    private_key: Option<PathBuf>,
-
-    /// Registry root-key file for a v1 object.
-    #[arg(long, value_name = "PATH", conflicts_with = "private_key")]
-    registry_key: Option<PathBuf>,
+    /// RAOP recipient private-key file for the v2 envelope object.
+    #[arg(long, value_name = "PATH")]
+    private_key: PathBuf,
 
     /// Destination directory for recovered plaintext members.
     #[arg(long, value_name = "DIR")]
@@ -82,15 +75,12 @@ fn recover(args: &Args) -> Result<RecoverySummary, String> {
         .map_err(|error| format!("read object header: {error}"))?;
     let header =
         RaoHeader::parse(&header_bytes).map_err(|error| format!("parse object header: {error}"))?;
-    let key_frame = if header.format_version == 2 && header.key_frame_len != 0 {
-        let mut bytes = vec![0u8; header.key_frame_len as usize];
-        encrypted
-            .read_exact(&mut bytes)
-            .map_err(|error| format!("read object key frame: {error}"))?;
-        Some(KeyFrame::parse(&bytes).map_err(|error| format!("parse object key frame: {error}"))?)
-    } else {
-        None
-    };
+    let mut key_frame_bytes = vec![0u8; header.key_frame_len as usize];
+    encrypted
+        .read_exact(&mut key_frame_bytes)
+        .map_err(|error| format!("read object key frame: {error}"))?;
+    let key_frame = KeyFrame::parse(&key_frame_bytes)
+        .map_err(|error| format!("parse object key frame: {error}"))?;
     encrypted
         .seek(SeekFrom::Start(0))
         .map_err(|error| format!("rewind encrypted object: {error}"))?;
@@ -99,16 +89,7 @@ fn recover(args: &Args) -> Result<RecoverySummary, String> {
         .as_deref()
         .unwrap_or_else(|| default_staging_dir(&args.out));
     let mut staged = SecurePlaintextStage::new_in(staging_dir)?;
-    let opened = match header.format_version {
-        1 => open_v1(args, &mut encrypted, staged.as_file_mut())?,
-        2 => open_v2(
-            args,
-            &mut encrypted,
-            key_frame.as_ref(),
-            staged.as_file_mut(),
-        )?,
-        version => return Err(format!("unsupported RAO format version {version}")),
-    };
+    let opened = open_object(args, &mut encrypted, &key_frame, staged.as_file_mut())?;
     staged
         .as_file_mut()
         .sync_all()
@@ -171,54 +152,25 @@ fn default_staging_dir(out: &Path) -> &Path {
     }
 }
 
-fn open_v1<R: Read, W: std::io::Write>(
+fn open_object<R: Read, W: std::io::Write>(
     args: &Args,
     encrypted: &mut R,
+    key_frame: &KeyFrame,
     output: &mut W,
 ) -> Result<OpenReport, String> {
-    if args.private_key.is_some() {
-        return Err(
-            "RAO v1 object requires --registry-key; a v2 recipient private key cannot open it"
-                .to_string(),
-        );
-    }
-    let path = args
-        .registry_key
-        .as_deref()
-        .ok_or_else(|| "RAO v1 object requires --registry-key".to_string())?;
-    let key = read_root_key(path)?;
-    open(encrypted, output, &key).map_err(|error| format!("open RAO v1 object: {error}"))
-}
-
-fn open_v2<R: Read, W: std::io::Write>(
-    args: &Args,
-    encrypted: &mut R,
-    key_frame: Option<&KeyFrame>,
-    output: &mut W,
-) -> Result<OpenReport, String> {
-    if args.registry_key.is_some() {
-        return Err(
-            "RAO v2 envelope object requires --private-key; registry fallback is forbidden"
-                .to_string(),
-        );
-    }
-    let path = args
-        .private_key
-        .as_deref()
-        .ok_or_else(|| "RAO v2 envelope object requires --private-key".to_string())?;
+    let path = &args.private_key;
     let mut bytes = fs::read(path)
         .map_err(|error| format!("read recipient private key {}: {error}", path.display()))?;
     let parsed = RecipientPrivateKey::parse(&bytes);
     bytes.zeroize();
     let key = parsed
         .map_err(|error| format!("parse recipient private key {}: {error}", path.display()))?;
-    let frame = key_frame.ok_or_else(|| "RAO v2 object is missing its key frame".to_string())?;
-    if !frame
+    if !key_frame
         .slots
         .iter()
         .any(|slot| slot.recipient_epoch_id == key.recipient_epoch_id)
     {
-        let wanted = frame
+        let wanted = key_frame
             .slots
             .iter()
             .map(|slot| slot.epoch_label.as_str())
@@ -229,22 +181,7 @@ fn open_v2<R: Read, W: std::io::Write>(
             key.epoch_label
         ));
     }
-    open_envelope(encrypted, output, &key)
-        .map_err(|error| format!("open RAO v2 envelope object: {error}"))
-}
-
-fn read_root_key(path: &Path) -> Result<RootKey, String> {
-    let mut bytes =
-        fs::read(path).map_err(|error| format!("read registry key {}: {error}", path.display()))?;
-    if bytes.len() != 32 {
-        let len = bytes.len();
-        bytes.zeroize();
-        return Err(format!(
-            "registry key {} must contain exactly 32 bytes, got {len}",
-            path.display()
-        ));
-    }
-    RootKey::new(bytes).map_err(|error| format!("parse registry key {}: {error}", path.display()))
+    open(encrypted, output, &key).map_err(|error| format!("open RAO v2 object: {error}"))
 }
 
 /// Plaintext staging file that is truncated before its directory entry is removed.
@@ -301,7 +238,7 @@ impl RemTarEntrySink for DiscardEntrySink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use remanence_aead::{seal_envelope_to_vec, seal_to_vec, EnvelopeSealOptions, SealOptions};
+    use remanence_aead::{seal_to_vec, EnvelopeSealOptions, SealOptions};
     use remanence_format::{write_rem_tar_object, RemTarFile, RemTarObjectOptions};
     use remanence_library::VecBlockSink;
     use sha2::{Digest, Sha256};
@@ -333,14 +270,13 @@ mod tests {
         let digest: [u8; 32] = Sha256::digest(&plaintext).into();
         let common = SealOptions {
             chunk_size: 512,
-            key_id: [0; 16],
             object_id: "recovery-object".to_string(),
             plaintext_size: plaintext.len() as u64,
             plaintext_digest: digest,
         };
         let safe = RecipientPrivateKey::new([1; 16], "safe-2026", [7; 32]).unwrap();
         let escrow = RecipientPrivateKey::new([2; 16], "escrow-2026", [8; 32]).unwrap();
-        let (sealed, _) = seal_envelope_to_vec(
+        let (sealed, _) = seal_to_vec(
             &plaintext,
             &EnvelopeSealOptions {
                 common,
@@ -357,8 +293,7 @@ mod tests {
         fs::write(&private_key, safe.serialize()).unwrap();
         let summary = recover(&Args {
             object: object.clone(),
-            private_key: Some(private_key),
-            registry_key: None,
+            private_key,
             out: out.clone(),
             staging_dir: None,
             overwrite: false,
@@ -368,43 +303,12 @@ mod tests {
         assert_eq!(fs::read(out.join("member.txt")).unwrap(), payload);
         assert_eq!(fs::read_dir(&out).unwrap().count(), 1);
 
-        let registry = RootKey::new([0x55; 32]).unwrap();
-        let (v1, _) = seal_to_vec(
-            &plaintext,
-            &registry,
-            &SealOptions {
-                chunk_size: 512,
-                key_id: [0x44; 16],
-                object_id: "recovery-object".to_string(),
-                plaintext_size: plaintext.len() as u64,
-                plaintext_digest: digest,
-            },
-        )
-        .unwrap();
-        let v1_object = temp.path().join("object-v1.rao");
-        let registry_path = temp.path().join("registry.key");
-        let v1_out = temp.path().join("v1-out");
-        fs::write(&v1_object, v1).unwrap();
-        fs::write(&registry_path, [0x55; 32]).unwrap();
-        let v1_summary = recover(&Args {
-            object: v1_object,
-            private_key: None,
-            registry_key: Some(registry_path),
-            out: v1_out.clone(),
-            staging_dir: None,
-            overwrite: false,
-        })
-        .unwrap();
-        assert_eq!(v1_summary.format_version, 1);
-        assert_eq!(fs::read(v1_out.join("member.txt")).unwrap(), payload);
-
         let wrong = RecipientPrivateKey::new([3; 16], "wrong-2026", [9; 32]).unwrap();
         let wrong_path = temp.path().join("wrong.raop");
         fs::write(&wrong_path, wrong.serialize()).unwrap();
         let error = recover(&Args {
             object,
-            private_key: Some(wrong_path),
-            registry_key: None,
+            private_key: wrong_path,
             out: temp.path().join("wrong-out"),
             staging_dir: None,
             overwrite: false,
@@ -413,18 +317,6 @@ mod tests {
         .unwrap();
         assert!(error.contains("object wants epoch safe-2026/escrow-2026"));
         assert!(error.contains("you supplied wrong-2026"));
-    }
-
-    #[test]
-    fn registry_key_file_must_be_exactly_32_bytes() {
-        let temp = tempfile::tempdir().unwrap();
-        let short = temp.path().join("short.key");
-        let long = temp.path().join("long.key");
-        fs::write(&short, [0x11; 31]).unwrap();
-        fs::write(&long, [0x11; 33]).unwrap();
-
-        assert!(read_root_key(&short).unwrap_err().contains("got 31"));
-        assert!(read_root_key(&long).unwrap_err().contains("got 33"));
     }
 
     #[test]

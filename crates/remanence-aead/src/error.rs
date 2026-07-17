@@ -30,9 +30,6 @@ pub enum RaoAeadError {
     /// The v2 wrapped-key frame is malformed or non-canonical.
     #[error("invalid RAO wrapped-key frame")]
     InvalidKeyFrame,
-    /// The caller's configured key mode disagrees with the object header.
-    #[error("RAO key mode does not match object header")]
-    KeyModeMismatch,
     /// The operating system could not provide cryptographic randomness.
     #[error("operating-system CSPRNG failed")]
     EntropyUnavailable,
@@ -48,12 +45,9 @@ pub enum RaoAeadError {
     /// Reserved header bytes or flags are nonzero.
     #[error("reserved RAO header bytes or flags are not zero")]
     ReservedBytesNotZero,
-    /// The key identifier is all zero or mismatched.
-    #[error("invalid RAO key identifier")]
-    InvalidKeyIdentifier,
-    /// Root key material is shorter than the RAO minimum.
-    #[error("invalid RAO root key material")]
-    InvalidRootKey,
+    /// HKDF could not expand one of the fixed-size v2 output keys.
+    #[error("RAO HKDF expansion failed")]
+    KdfExpansionFailed,
     /// The header salt is invalid.
     #[error("invalid RAO HKDF salt")]
     InvalidSalt,

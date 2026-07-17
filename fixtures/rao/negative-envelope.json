@@ -1,5 +1,5 @@
 {
-  "vector_set": "RAO-NEG-ENVELOPE-1",
+  "vector_set": "RAO-NEG-ENVELOPE-V2",
   "spec_section": "13.5",
   "status": "complete",
   "scope": "encrypted envelope header, metadata-profile, framing, cryptographic-tamper, defective-sealer, and writer-side vectors executable through public RAO AEAD APIs",
@@ -7,8 +7,7 @@
     "chunk_size": 512,
     "plaintext_size": 1024,
     "plaintext_byte": "5a",
-    "root_key": "1111111111111111111111111111111111111111111111111111111111111111",
-    "key_id": "10101010101010101010101010101010",
+    "recipient_mode": "hpke-x25519",
     "object_id": "object-1"
   },
   "cases": [
@@ -29,12 +28,6 @@
       "operation": "inspect",
       "fault": "format_version field is 3",
       "expected_error": "UnsupportedFormatVersion"
-    },
-    {
-      "id": "v1-shape-version-flipped-to-2",
-      "operation": "inspect",
-      "fault": "a v1 header has only its format_version changed from 1 to 2",
-      "expected_error": "InvalidWrapSuite"
     },
     {
       "id": "unknown-suite-id",
@@ -65,12 +58,6 @@
       "operation": "inspect",
       "fault": "reserved bytes are nonzero",
       "expected_error": "ReservedBytesNotZero"
-    },
-    {
-      "id": "all-zero-key-id",
-      "operation": "inspect",
-      "fault": "key_id is all zero",
-      "expected_error": "InvalidKeyIdentifier"
     },
     {
       "id": "all-zero-hkdf-salt",
@@ -112,12 +99,6 @@
       "id": "salt-bit-flipped",
       "operation": "open",
       "fault": "one hkdf_salt bit is flipped in an otherwise structurally valid object",
-      "expected_error": "AeadAuthenticationFailed"
-    },
-    {
-      "id": "key-id-swapped",
-      "operation": "open",
-      "fault": "key_id is changed after sealing",
       "expected_error": "AeadAuthenticationFailed"
     },
     {
@@ -331,12 +312,6 @@
       "expected_error": "TrailingData"
     },
     {
-      "id": "trailing-byte-keyed",
-      "operation": "open",
-      "fault": "one byte is appended after stored_size_bytes and detected by keyed open",
-      "expected_error": "TrailingData"
-    },
-    {
       "id": "seal-plaintext-size-not-multiple",
       "operation": "seal",
       "fault": "sealing plaintext size is not a multiple of chunk_size",
@@ -347,12 +322,6 @@
       "operation": "seal",
       "fault": "sealing object_id exceeds the 64-byte header field",
       "expected_error": "InvalidObjectIdField"
-    },
-    {
-      "id": "root-key-too-short",
-      "operation": "root-key",
-      "fault": "root key has only 16 bytes",
-      "expected_error": "InvalidRootKey"
     }
   ]
 }

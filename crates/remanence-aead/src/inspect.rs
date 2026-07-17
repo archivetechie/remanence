@@ -11,8 +11,8 @@ use crate::stream::round_up;
 pub struct InspectReport {
     /// Parsed plaintext header.
     pub header: RaoHeader,
-    /// Parsed canonical v2 key frame, absent for v1.
-    pub key_frame: Option<crate::KeyFrame>,
+    /// Parsed canonical v2 key frame.
+    pub key_frame: crate::KeyFrame,
     /// Total stored input size.
     pub stored_size_bytes: u64,
     /// SHA-256 over all stored bytes.
@@ -34,18 +34,14 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<InspectReport> {
         .map_err(|_| RaoAeadError::UnexpectedEof)?;
     let header = RaoHeader::parse(&header_bytes)?;
     let key_frame_len = u64::from(header.key_frame_len);
-    let key_frame = if header.format_version == 2 && header.key_frame_len != 0 {
-        let end = RAO_HEADER_LEN
-            .checked_add(header.key_frame_len as usize)
-            .ok_or(RaoAeadError::SizeOverflow)?;
-        Some(crate::KeyFrame::parse(
-            bytes
-                .get(RAO_HEADER_LEN..end)
-                .ok_or(RaoAeadError::UnexpectedEof)?,
-        )?)
-    } else {
-        None
-    };
+    let key_frame_end = RAO_HEADER_LEN
+        .checked_add(header.key_frame_len as usize)
+        .ok_or(RaoAeadError::SizeOverflow)?;
+    let key_frame = crate::KeyFrame::parse(
+        bytes
+            .get(RAO_HEADER_LEN..key_frame_end)
+            .ok_or(RaoAeadError::UnexpectedEof)?,
+    )?;
     let stored_size_bytes = u64::try_from(bytes.len()).map_err(|_| RaoAeadError::SizeOverflow)?;
     if stored_size_bytes % u64::from(header.chunk_size) != 0 {
         return Err(RaoAeadError::TrailingData);
@@ -119,43 +115,30 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<InspectReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{seal_to_vec, RootKey, SealOptions};
+    use crate::{seal_to_vec, EnvelopeSealOptions, RecipientPrivateKey, SealOptions};
 
     #[test]
     fn inspect_reports_header_without_key() {
-        let root = RootKey::new([0x11; 32]).unwrap();
         let plaintext = vec![0x5a; 1024];
-        let digest = Sha256::digest(&plaintext);
-        let mut plaintext_digest = [0u8; 32];
-        plaintext_digest.copy_from_slice(&digest);
-        let options = SealOptions {
-            chunk_size: 512,
-            key_id: [0x10; 16],
-            object_id: "object-1".to_string(),
-            plaintext_size: plaintext.len() as u64,
-            plaintext_digest,
+        let primary = RecipientPrivateKey::new([1; 16], "primary", [7; 32]).unwrap();
+        let recovery = RecipientPrivateKey::new([2; 16], "recovery", [8; 32]).unwrap();
+        let options = EnvelopeSealOptions {
+            common: SealOptions {
+                chunk_size: 512,
+                object_id: "object-1".to_string(),
+                plaintext_size: plaintext.len() as u64,
+                plaintext_digest: Sha256::digest(&plaintext).into(),
+            },
+            recipients: vec![
+                primary.public_key(0).unwrap(),
+                recovery.public_key(1).unwrap(),
+            ],
         };
-        let (sealed, report) = seal_to_vec(&plaintext, &root, &options).unwrap();
+        let (sealed, report) = seal_to_vec(&plaintext, &options).unwrap();
         let inspected = inspect_bytes(&sealed).unwrap();
         assert_eq!(inspected.header.object_id, "object-1");
         assert_eq!(inspected.chunk_count, 2);
         assert_eq!(inspected.plaintext_size, 1024);
         assert_eq!(inspected.stored_digest, report.stored_digest);
-    }
-
-    #[test]
-    fn inspect_rejects_v1_shape_with_version_flipped_to_v2() {
-        let header = RaoHeader::new(512, [0x10; 16], [0x20; 16], 17, "registry-v1").unwrap();
-        let mut object = header.serialize().unwrap().to_vec();
-        object[6] = 2;
-        object.extend_from_slice(&[0u8; 17]);
-        object.extend_from_slice(&[0u8; 512 + 16]);
-        object.extend_from_slice(RAO_FOOTER);
-        object.resize(object.len().div_ceil(512) * 512, 0);
-
-        assert!(matches!(
-            inspect_bytes(&object),
-            Err(RaoAeadError::InvalidWrapSuite)
-        ));
     }
 }
