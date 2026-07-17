@@ -19,6 +19,10 @@ from typing import Any
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "specs" / "publication" / "remanence-test-vectors.tar"
 BLOCK_SIZE = 4096
+RAO_V2_ENCRYPTED_OBJECTS = (
+    "rao-tv-d1-encrypted.rao",
+    "rao-tv-e2.rao",
+)
 
 
 def sha256(path: pathlib.Path) -> str:
@@ -36,6 +40,42 @@ def write_json(path: pathlib.Path, value: Any) -> None:
         encoding="utf-8",
         newline="\n",
     )
+
+
+def generate_v2_encrypted_objects(output: pathlib.Path) -> None:
+    """Regenerate the pinned v2 objects through the Rust deterministic hook."""
+    environment = os.environ.copy()
+    environment["RAO_VECTOR_EXPORT_DIR"] = str(output)
+    subprocess.run(
+        [
+            "cargo",
+            "test",
+            "--quiet",
+            "-p",
+            "remanence-format",
+            "--test",
+            "rao_vectors",
+            "rao_v2_publication_objects_regenerate_byte_exactly",
+            "--",
+            "--exact",
+        ],
+        cwd=ROOT,
+        env=environment,
+        check=True,
+    )
+
+
+def verify_v2_encrypted_regeneration(first: pathlib.Path, second: pathlib.Path) -> None:
+    """Require two regenerations and the checked-in pins to be byte-identical."""
+    pinned = ROOT / "fixtures" / "rao" / "objects"
+    for filename in RAO_V2_ENCRYPTED_OBJECTS:
+        first_bytes = (first / filename).read_bytes()
+        second_bytes = (second / filename).read_bytes()
+        pinned_bytes = (pinned / filename).read_bytes()
+        if first_bytes != second_bytes:
+            raise AssertionError(f"{filename} differs across deterministic regenerations")
+        if first_bytes != pinned_bytes:
+            raise AssertionError(f"{filename} differs from its checked-in pin")
 
 
 def crc64_xz(data: bytes | bytearray) -> int:
@@ -374,6 +414,7 @@ def build_vector_index(rem_root: pathlib.Path, records: list[dict[str, Any]]) ->
 
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="remanence-publication-vectors-") as tmp_name:
+        temporary_root = pathlib.Path(tmp_name)
         stage = pathlib.Path(tmp_name) / "remanence-test-vectors"
         (stage / "rao" / "manifests").mkdir(parents=True)
         (stage / "rao" / "objects").mkdir(parents=True)
@@ -387,12 +428,20 @@ def main() -> int:
             if source.is_file():
                 shutil.copyfile(source, rem_root / source.name)
 
+        encrypted_first = temporary_root / "rao-v2-encrypted-first"
+        encrypted_second = temporary_root / "rao-v2-encrypted-second"
+        generate_v2_encrypted_objects(encrypted_first)
+        generate_v2_encrypted_objects(encrypted_second)
+        verify_v2_encrypted_regeneration(encrypted_first, encrypted_second)
+
         subprocess.run(
             [
                 sys.executable,
                 str(ROOT / "tools" / "verify_rao_vectors_independent.py"),
                 "--export-directory",
                 str(stage / "rao" / "objects"),
+                "--encrypted-object-directory",
+                str(encrypted_first),
             ],
             cwd=ROOT,
             check=True,

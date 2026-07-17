@@ -1,5 +1,10 @@
 # Rem Archive Object (RAO)
 
+> **Historical record.** This document is retained as a v1 design record.
+> The normative publication specification is
+> `specs/publication/rao-object-format-1.0.md`, which defines the v2-only
+> format.
+
 ## Version 1 — Specification
 
 | | |

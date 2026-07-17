@@ -120,8 +120,11 @@ impl KeyFrame {
             return Err(RaoAeadError::InvalidKeyFrame);
         }
         let mut previous = None;
-        for slot in &self.slots {
+        for (index, slot) in self.slots.iter().enumerate() {
             if previous.is_some_and(|value| slot.slot_index <= value)
+                || self.slots[..index]
+                    .iter()
+                    .any(|earlier| earlier.recipient_epoch_id == slot.recipient_epoch_id)
                 || slot.epoch_label.len() > 32
                 || !slot
                     .epoch_label
@@ -178,6 +181,9 @@ mod tests {
     fn rejects_truncation_order_duplicates_trailing_and_oversize() {
         assert!(KeyFrame::new(vec![slot(1, "a"), slot(1, "b")]).is_err());
         assert!(KeyFrame::new(vec![slot(2, "a"), slot(1, "b")]).is_err());
+        let mut duplicate_epoch = slot(2, "b");
+        duplicate_epoch.recipient_epoch_id = slot(1, "a").recipient_epoch_id;
+        assert!(KeyFrame::new(vec![slot(1, "a"), duplicate_epoch]).is_err());
         let bytes = KeyFrame::new(vec![slot(0, "a")])
             .unwrap()
             .serialize()

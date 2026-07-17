@@ -752,20 +752,22 @@ strictly increasing `tape_file_number` order:
 | 11 | uint | plaintext only | `manifest_size_bytes` |
 | 12 | uint | plaintext only | `manifest_chunk_count` |
 | 13 | bytes .size 32 | plaintext only | `manifest_sha256` |
-| 20 | bytes .size 16 | encrypted only | RAO encrypted-header `key_id`; all-zero is invalid |
 | 21 | uint | encrypted only | RAO encrypted-header `metadata_frame_len`; bounds `[17, 16 MiB]` |
+| 22 | array of bytes .size 16 | encrypted only | RAO key-frame `recipient_epoch_id` values; 1 through 8 distinct nonzero ids |
+| 23 | uint | encrypted only | RAO encrypted-header `key_frame_len`; bounds `[103, 4096]` |
 
 Key 10 (`manifest_first_chunk_lba`) is the zero-based block index, *within
 the object's tape file*, of the first block of the manifest entry's payload —
 an RAO inner `BodyLba`, not a Section 3.2 physical LBA; one RAO body block is
 one tape block (Section 4.4). Key 11 is the manifest's payload byte length,
-key 12 its block count, and key 13 the SHA-256 of its CBOR bytes. Keys 20–21
-are the `key_id` and `metadata_frame_len` fields of the RAO encrypted-envelope
-header; their semantics and bounds are defined by [RAO], which is a normative
-reference for implementations of key 30.
+key 12 its block count, and key 13 the SHA-256 of its CBOR bytes. Key 21 is the
+RAO encrypted-envelope header's `metadata_frame_len`; key 22 records the
+recipient epoch ids present in its key frame; key 23 is the header's
+`key_frame_len`. Their semantics and bounds are defined by [RAO], which is a
+normative reference for implementations of key 30.
 
-Plaintext rows MUST carry keys 10–13 and MUST NOT carry keys 20–21.
-Encrypted rows MUST carry keys 20–21 and MUST NOT carry keys 10–13. For
+Plaintext rows MUST carry keys 10–13 and MUST NOT carry keys 21–23.
+Encrypted rows MUST carry keys 21–23 and MUST NOT carry keys 10–13. For
 plaintext rows, `manifest_chunk_count` and `manifest_size_bytes` MUST be
 positive, the manifest chunk range MUST fit within `stored_block_count`, and
 the manifest byte length MUST fit within `manifest_chunk_count ×
@@ -1531,9 +1533,10 @@ Bootstrap key 30 (Section 8.2.1) is the designated bounded surface for
 payload-binding object rows. A plaintext RAO row exposes manifest location,
 manifest size, manifest chunk count, and manifest digest; this is acceptable
 because plaintext RAO objects are not confidential against a tape reader.
-An encrypted RAO row exposes only `key_id` and `metadata_frame_len`, both
-already plaintext in the RAO encrypted envelope header stored in the same
-tape file. The encrypted row MUST NOT carry plaintext manifest anchors
+An encrypted RAO row exposes only recipient epoch ids, `metadata_frame_len`,
+and `key_frame_len`, all already plaintext in the RAO encrypted envelope
+stored in the same tape file. The encrypted row MUST NOT carry plaintext
+manifest anchors
 (`manifest_first_chunk_lba`, `manifest_size_bytes`, `manifest_chunk_count`,
 or `manifest_sha256`), because those values describe confidential inner
 content and would add leakage beyond the RAO envelope.
@@ -1548,7 +1551,7 @@ practical to pin; at least one header-level vector MUST use the default
 geometry parameters. Negative vectors contain exactly one fault each.
 
 The companion archive is `remanence-test-vectors.tar`, SHA-256
-`596e5ee7baffb355366407d6b4384fe7caafa64509e489508df2ed5dc2eadc7d`.
+`f8f7075f89017597b834d08a98b21917453eeb15d636850585267202d5309bed`.
 Its `MANIFEST.tsv` inventories every contained vector manifest and generated
 artifact, `CHECKSUMS.sha256` authenticates them, and the included `verify.py`
 checks the archive without a source checkout. The archive is reproducibly

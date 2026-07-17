@@ -4,10 +4,10 @@
 | --- | --- |
 | Status | Publication specification |
 | Version | 1.0 |
-| Date | 2026-07-11 |
+| Date | 2026-07-17 |
 | Envelope magic | `RAO1` (encrypted representation) |
 | Stream format identifier | `rao-v1` (plaintext representation) |
-| On-tape format versions | `1` (registry-symmetric), `2` (HPKE envelope) |
+| On-tape format version | `2` (HPKE wrapped-DEK envelope) |
 | Default file extension | `.rao` |
 
 ## Status of This Document
@@ -15,8 +15,8 @@
 This document is the publication specification for the RAO format. It is the
 normative fixed point for the format it defines: an implementation is
 validated against this document, not the reverse. It consolidates the base
-container, extended-attribute preservation, registry-symmetric encryption,
-and HPKE envelope encryption into one independently implementable baseline.
+container, extended-attribute preservation, and HPKE envelope encryption into
+one independently implementable baseline.
 
 ## Abstract
 
@@ -27,10 +27,9 @@ POSIX pax tar stream carrying per-file SHA-256 identities, closed-form
 byte-range addressing, and a deterministic CBOR manifest — and exists in
 exactly two representations: **plaintext**, the bare container stream,
 extractable by any standard `tar`; and **encrypted**, the same byte stream
-sealed inside a confidential authenticated envelope using either an external
-registry root key (`format_version = 1`) or an HPKE-wrapped per-object data
-encryption key (`format_version = 2`), HKDF-SHA-256 key derivation, and a
-chunked ChaCha20-Poly1305 stream construction. Both
+sealed inside a confidential authenticated envelope using an HPKE-wrapped
+per-object data-encryption key, HKDF-SHA-256 key derivation, and a chunked
+ChaCha20-Poly1305 stream construction. Both
 representations of one object share a logical identity (`plaintext_digest`);
 each stored copy has a physical identity (`stored_digest`) that backends scrub
 without keys. Encryption preserves partial file restore:
@@ -39,7 +38,9 @@ one-to-one with the object's body blocks, so a per-file block index addresses
 ciphertext by closed-form arithmetic. The format is designed for single-pass
 writing, byte-stable fanout to tape, disk, and object storage, parity
 protection over stored bytes, and long-term recovery from this document and
-its static test vectors alone.
+its static test vectors alone. Canonical plaintext construction is
+deterministic; every encrypted seal uses fresh randomness and therefore
+normally produces different envelope bytes.
 
 ## Table of Contents
 
@@ -97,10 +98,10 @@ manifest path (Section 4). RAO's design goals, in priority order:
 5. **Separation of identities.** The logical plaintext identity
    (`plaintext_digest`) is distinct from the physical stored identity
    (`stored_digest`); backends scrub by the latter without keys.
-6. **Deterministic canonical representation.** Given identical inputs and
-   options, every conformant writer produces the identical plaintext stream.
-   Registry-symmetric envelopes are deterministic given their root key; HPKE
-   envelopes intentionally vary because each seal uses fresh randomness.
+6. **Deterministic canonical plaintext representation.** Given identical
+   inputs and options, every conformant Builder produces the identical
+   plaintext stream. Encrypted envelopes intentionally vary because every
+   seal uses a fresh DEK and fresh HPKE encapsulation randomness.
 7. **Long-term recoverability.** The format is recoverable from this document
    plus its static test vectors, and — degraded, plaintext representation
    only — from knowledge of POSIX tar alone.
@@ -137,9 +138,9 @@ components around it:
   ciphertext when the object is encrypted (Section 9).
 - **The catalog and restore orchestration** above the format own catalogs,
   object selection, restore policy, and restore-time path sanitization.
-- **Key custody is external** (Section 5.3). A `format_version = 1` object
-  carries an opaque `key_id`; a `format_version = 2` object carries recipient
-  epoch identifiers and HPKE-wrapped copies of its DEK, never a plaintext key.
+- **Key custody is external** (Section 5.3). An encrypted object carries
+  recipient epoch identifiers and HPKE-wrapped copies of its DEK, never a
+  plaintext key.
 
 ### 1.4. Non-Goals
 
@@ -226,11 +227,9 @@ A single implementation may fill several roles.
 - **Stored bytes**: the exact bytes of one stored copy, from byte 0 through
   the final byte of its final block. `stored_digest` is defined over these.
 - **Envelope**: the encrypted representation's framing — plaintext header,
-  metadata frame, payload frame, footer, and final fill (Section 5.1).
-- **Key registry**: the external system mapping a `format_version = 1`
-  16-byte `key_id` to root key material or a retrieval procedure.
+  key frame, metadata frame, payload frame, footer, and final fill (Section 5.1).
 - **Data-encryption key (DEK)**: the fresh 32-byte per-object secret used as
-  the root of a `format_version = 2` envelope's key schedule.
+  the root of an encrypted envelope's key schedule.
 - **Recipient epoch**: one X25519 key pair identified by a 16-byte
   `recipient_epoch_id` and a printable recovery label.
 - **Deterministic CBOR**: the canonical CBOR encoding rules of Section 4.7.1,
@@ -273,13 +272,11 @@ pseudorandom function; PFR denotes partial file restore (Section 6).
 | `MANIFEST_MAX_DEPTH` | 8 | Maximum manifest CBOR nesting depth (Section 4.7) |
 | `RAO_MAGIC` | `RAO1` (`0x52 0x41 0x4F 0x31`) | Envelope magic |
 | `RAO_HEADER_LEN` | 128 | Envelope plaintext header length in bytes |
-| `RAO_FORMAT_VERSION_REGISTRY` | 1 | Registry-symmetric envelope `format_version` |
 | `RAO_FORMAT_VERSION_HPKE` | 2 | HPKE envelope `format_version` |
 | `RAO_SUITE_HKDF_CHACHA` | `0x01` | `suite_id`: HKDF-SHA-256 + ChaCha20-Poly1305 |
 | `RAO_WRAP_SUITE_HPKE_V1` | `0x01` | v2 HPKE Base wrap suite |
 | `RAO_KEY_FRAME_MAX_LEN` | 4096 | Maximum v2 key-frame length |
 | `RAO_KEY_FRAME_MAX_SLOTS` | 8 | Maximum v2 recipient slots |
-| `RAO_KEY_ID_LEN` | 16 | Key identifier length in bytes |
 | `RAO_SALT_LEN` | 16 | `hkdf_salt` length in bytes |
 | `RAO_OBJECT_ID_FIELD_LEN` | 64 | Fixed `object_id` header field length in bytes |
 | `RAO_TAG_LEN` | 16 | Poly1305 tag length in bytes |
@@ -289,10 +286,6 @@ pseudorandom function; PFR denotes partial file restore (Section 6).
 | `RAO_MAX_CBOR_NESTING_DEPTH` | 32 | Maximum envelope metadata nesting depth |
 | `RAO_MAX_METADATA_ITEMS` | 65536 | Maximum envelope metadata data-item count |
 | `RAO_FOOTER` | `RAO1_STREAM_END.` | 16-byte completion footer (Section 5.8); hex `52 41 4F 31 5F 53 54 52 45 41 4D 5F 45 4E 44 2E` |
-| `LABEL_SALT` | `rao1-salt-v1` | HKDF info label, 12 ASCII bytes, no terminator (Section 5.5) |
-| `LABEL_OBJECT` | `rao1-object-v1` | HKDF info label, 14 ASCII bytes, no terminator |
-| `LABEL_METADATA` | `rao1-metadata-v1` | HKDF info label, 16 ASCII bytes, no terminator |
-| `LABEL_PAYLOAD` | `rao1-payload-v1` | HKDF info label, 15 ASCII bytes, no terminator |
 | `LABEL_SALT_V2` | `rao2-salt-v1` | v2 salt-derivation info label, 12 ASCII bytes |
 | `LABEL_OBJECT_V2` | `rao2-object-v1` | v2 object-secret info label, 14 ASCII bytes |
 | `LABEL_METADATA_V2` | `rao2-metadata-v1` | v2 metadata-key info label, 16 ASCII bytes |
@@ -316,7 +309,7 @@ therefore identical across representations.
 | Representation | Stored bytes | Confidentiality |
 | --- | --- | --- |
 | `plaintext` | The canonical plaintext object, verbatim | None; self-describing in the clear; `tar`-extractable |
-| `encrypted` | The Section 5 envelope: plaintext header ‖ optional v2 key frame ‖ encrypted metadata frame ‖ chunked AEAD ciphertext of the canonical plaintext object ‖ footer ‖ zero fill | Confidential and authenticated; self-describing **with the key**; opaque without it |
+| `encrypted` | The Section 5 envelope: plaintext header ‖ key frame ‖ encrypted metadata frame ‖ chunked AEAD ciphertext of the canonical plaintext object ‖ footer ‖ zero fill | Confidential and authenticated; self-describing **with the key**; opaque without it |
 
 There is no third representation: the plaintext representation is the bare
 container stream itself, preserving standard-`tar` extractability, and the
@@ -1107,28 +1100,23 @@ Python `tarfile` (Section 14).
 
 ### 5.1. Frame Sequence and Version Gate
 
-An encrypted RAO object is one of two version-gated layouts:
+An encrypted RAO object has one layout:
 
 ```text
-format_version = 1:
-  scalar header (128) || metadata frame (M) || payload chunks ||
-  footer (16) || zero fill
-
-format_version = 2:
-  scalar header (128) || key frame (K) || metadata frame (M) ||
-  payload chunks || footer (16) || zero fill
+scalar header (128) || key frame (K) || metadata frame (M) ||
+payload chunks || footer (16) || zero fill
 ```
 
-The header, v2 key frame, footer, and fill are plaintext. The metadata frame
+The header, key frame, footer, and fill are plaintext. The metadata frame
 and payload chunks are ChaCha20-Poly1305 ciphertext. The payload plaintext is
 the complete canonical object of Section 4, manifest included. Total stored
 length MUST be a positive multiple of `chunk_size`.
 
 `format_version` is an on-tape field, not this document's version. A Reader
-MUST select exactly one key mode from it: version 1 requires a registry root
-key; version 2 requires a matching recipient private key. A Reader MUST NOT
-fall back to the other mode after any parse, key-resolution, unwrap, or
-authentication failure.
+MUST accept only value 2 and requires a matching recipient private key. It
+MUST NOT attempt another key mode after any parse, key-resolution, unwrap, or
+authentication failure. Value 1 is permanently reserved as stated in
+Section 10.
 
 ### 5.2. Scalar Header
 
@@ -1138,25 +1126,25 @@ The scalar header is exactly 128 bytes. All integers are unsigned big-endian.
 | --- | ---: | --- | --- | --- |
 | `0x00` | 4 | `magic` | ASCII | `RAO1` |
 | `0x04` | 2 | `header_len` | `uint16` | 128 |
-| `0x06` | 1 | `format_version` | `uint8` | 1 or 2 |
+| `0x06` | 1 | `format_version` | `uint8` | 2 |
 | `0x07` | 1 | `suite_id` | `uint8` | `0x01` (HKDF-SHA-256 and ChaCha20-Poly1305) |
 | `0x08` | 4 | `chunk_size` | `uint32` | Positive multiple of 512; equal to the inner stream value |
 | `0x0C` | 4 | `flags` | `uint32` | Zero |
-| `0x10` | 16 | `key_id` | bytes | v1: nonzero opaque registry id; v2: all zero |
+| `0x10` | 16 | `reserved` | bytes | Zero |
 | `0x20` | 16 | `hkdf_salt` | bytes | Nonzero salt derived by Section 5.5 |
 | `0x30` | 8 | `metadata_frame_len` | `uint64` | `M`, including the 16-byte tag; 17 through 16777216 |
-| `0x38` | 1 | `wrap_suite` | `uint8` | v1: zero as reserved; v2: `0x01` |
+| `0x38` | 1 | `wrap_suite` | `uint8` | `0x01` |
 | `0x39` | 3 | `reserved` | bytes | Zero |
-| `0x3C` | 4 | `key_frame_len` | `uint32` | v1: zero; v2: canonical key-frame length `K` |
+| `0x3C` | 4 | `key_frame_len` | `uint32` | Canonical key-frame length `K` |
 | `0x40` | 64 | `object_id` | UTF-8 field | 1–64 non-NUL bytes, then NUL padding |
 
-For version 1, the complete range `0x38..0x40` is reserved and MUST be zero.
-For version 2, `wrap_suite = 0x01`, `key_id` is all zero, and
-`key_frame_len` MUST be between 103 and 4096 inclusive. Although `103` is the
+Bytes `0x10..0x20` and `0x39..0x3C` are reserved and MUST be zero.
+`wrap_suite = 0x01`, and `key_frame_len` MUST be between 103 and 4096
+inclusive. Although `103` is the
 smallest syntactically possible one-slot frame, a conforming v2 Sealer emits
 at least two slots, so its emitted minimum is 201 bytes when both labels are
-empty. The reserved registry-symmetric v2 combination (`wrap_suite = 0`,
-`key_frame_len = 0`) is not a valid object in this specification.
+empty. A zero wrap suite or absent/undersized key frame is not a valid object
+in this specification.
 
 The `object_id` value is the inner `REMANENCE.object_id`. It contains no NUL,
 is valid UTF-8, and is right-padded with zero bytes. Readers MUST reject an
@@ -1203,12 +1191,13 @@ K = 5 + sum_over_slots(98 + label_len)
 ```
 
 and MUST consume exactly `K` bytes. A Reader MUST reject truncation, trailing
-bytes, a non-increasing or duplicate slot index, an invalid label, an invalid
-slot count, or a frame outside the header's length bounds. A v2 Sealer MUST
-emit at least two slots with distinct `recipient_epoch_id` values and MUST
-fail the entire seal if any recipient cannot be wrapped. Slot order is the
-strictly increasing `slot_index` order; callers therefore MUST supply values
-that serialize in that order.
+bytes, a non-increasing or duplicate slot index, a duplicate
+`recipient_epoch_id`, an invalid label, an invalid slot count, or a frame
+outside the header's length bounds. A Sealer MUST emit at least two slots with
+distinct `recipient_epoch_id` values and MUST fail the entire seal if any
+recipient cannot be wrapped. A Reader accepts any structurally valid frame
+with at least one slot. Slot order is the strictly increasing `slot_index`
+order; callers therefore MUST supply values that serialize in that order.
 
 Wrap suite `0x01` is HPKE Base mode [RFC9180] with
 DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, and ChaCha20-Poly1305. The HPKE
@@ -1239,11 +1228,7 @@ absence is a hard recipient-epoch mismatch.
 
 ### 5.4. Key Inputs and Identification
 
-For version 1, `key_id` is an opaque 16-byte identifier into an external key
-registry. The caller supplies the corresponding root key; it MUST contain at
-least 32 bytes. Exactly 32 uniformly random bytes are RECOMMENDED.
-
-For version 2, the Sealer generates a fresh uniformly random 32-byte DEK for
+The Sealer generates a fresh uniformly random 32-byte DEK for
 every object and wraps it independently to every recipient slot. The Sealer
 MUST obtain both DEK and encapsulation randomness from a fallible,
 operating-system-backed CSPRNG and MUST fail closed if entropy is unavailable.
@@ -1260,11 +1245,7 @@ canonical metadata plaintext and `object_id_field` the exact 64 header bytes.
 For the first `ctr` in `0x00..=0xFF` whose output is nonzero, derive:
 
 ```text
-v1_salt = HKDF(root_key, empty,
-  "rao1-salt-v1" || ctr || object_id_field || plaintext_digest || metadata_hash,
-  16)
-
-v2_salt = HKDF(DEK, empty,
+hkdf_salt = HKDF(DEK, empty,
   "rao2-salt-v1" || ctr || object_id_field || plaintext_digest || metadata_hash,
   16)
 ```
@@ -1273,29 +1254,20 @@ The one-byte `ctr` follows the ASCII label with no separator. A Sealer MUST
 derive the salt and MUST NOT accept a caller-supplied value. An opener MUST
 rederive it after metadata authentication and reject a mismatch.
 
-Define the version-specific header hash:
-
-```text
-v1_header_hash = SHA-256(exact 128-byte scalar header)
-v2_header_hash = SHA-256(exact 128-byte scalar header || exact key frame)
-```
+Define `header_hash = SHA-256(exact 128-byte scalar header || exact key
+frame)`.
 
 Then derive three distinct 32-byte keys:
 
 ```text
-v1 object_secret = HKDF(root_key, v1_salt,
-                         "rao1-object-v1" || v1_header_hash, 32)
-   metadata_key  = HKDF(object_secret, empty, "rao1-metadata-v1", 32)
-   payload_key   = HKDF(object_secret, empty, "rao1-payload-v1", 32)
-
-v2 object_secret = HKDF(DEK, v2_salt,
-                         "rao2-object-v1" || v2_header_hash, 32)
-   metadata_key  = HKDF(object_secret, empty, "rao2-metadata-v1", 32)
-   payload_key   = HKDF(object_secret, empty, "rao2-payload-v1", 32)
+object_secret = HKDF(DEK, hkdf_salt,
+                     "rao2-object-v1" || header_hash, 32)
+metadata_key  = HKDF(object_secret, empty, "rao2-metadata-v1", 32)
+payload_key   = HKDF(object_secret, empty, "rao2-payload-v1", 32)
 ```
 
-This binds every scalar-header byte and, for v2, every key-frame byte through
-the derived AEAD keys. Rewrapping a v2 key frame without resealing metadata
+This binds every scalar-header byte and every key-frame byte through the
+derived AEAD keys. Rewrapping a key frame without resealing metadata
 and payload is therefore impossible and MUST NOT be attempted.
 
 ### 5.6. Metadata Frame
@@ -1351,7 +1323,7 @@ hex:   52 41 4f 31 5f 53 54 52 45 41 4d 5f 45 4e 44 2e
 
 It follows the last payload chunk. Zero bytes then fill through the next
 `C`-byte boundary. The fill is part of the stored bytes and `stored_digest`.
-Let `K = 0` for v1 and the header's key-frame length for v2:
+Let `K` be the header's key-frame length:
 
 ```text
 payload_len       = P + 16 * (P / C)
@@ -1377,16 +1349,15 @@ completion but do not authenticate the object.
 A Sealer MUST perform the following logical sequence, using checked
 arithmetic throughout:
 
-1. Validate `C`, `P`, `object_id`, expected digest, and the selected mode.
+1. Validate `C`, `P`, `object_id`, expected digest, and recipient set.
 2. Construct the canonical metadata plaintext.
-3. For v1, resolve the root key and derive the v1 salt. For v2, generate the
-   DEK, derive the v2 salt, wrap the DEK to every configured recipient, and
-   serialize the canonical key frame.
-4. Serialize the final scalar header, including `M`, salt, mode fields, and
-   `K` for v2.
-5. Hash the scalar header alone for v1 or scalar header plus key frame for v2;
-   derive the version-specific object, metadata, and payload keys.
-6. Emit header, optional key frame, encrypted metadata, and every encrypted
+3. Generate the DEK, derive the salt, wrap the DEK to every configured
+   recipient, and serialize the canonical key frame.
+4. Serialize the final scalar header, including `M`, salt, wrap suite, and
+   `K`.
+5. Hash the scalar header plus key frame; derive the object, metadata, and
+   payload keys.
+6. Emit header, key frame, encrypted metadata, and every encrypted
    full payload chunk while recomputing plaintext size and SHA-256.
 7. Reject any expected/observed size or digest mismatch and reject source
    bytes beyond `P`.
@@ -1395,10 +1366,9 @@ arithmetic throughout:
 
 ### 5.10. Opening, Recovery, and Keyless Inspection
 
-A keyed Reader MUST parse the scalar header and dispatch solely on
-`format_version`. For v1 it obtains the registry root key by `key_id`. For v2
-it reads and canonically parses the key frame, selects the slot matching the
-supplied epoch id, and unwraps the DEK using Section 5.3. It then derives the
+A keyed Reader MUST parse the scalar header, require format value 2, read and
+canonically parse the key frame, select the slot matching the supplied epoch
+id, and unwrap the DEK using Section 5.3. It then derives the
 keys, authenticates and parses metadata, rederives the salt, decrypts exactly
 `N` chunks, verifies plaintext size and SHA-256, verifies the footer and zero
 fill, and requires end of input. It MUST release no unauthenticated chunk.
@@ -1406,9 +1376,8 @@ fill, and requires end of input. It MUST release no unauthenticated chunk.
 After whole-object authentication, a recovery implementation SHOULD validate
 the inner RAO stream and MUST compare its `REMANENCE.object_id` with the scalar
 header before publishing restored members. Catalogless recovery is possible:
-a v2 object plus one matching recipient private key is sufficient; v1 also
-requires the matching registry root key. Recovery output SHOULD be staged and
-published only after complete success.
+an object plus one matching recipient private key is sufficient. Recovery
+output SHOULD be staged and published only after complete success.
 
 A Keyless Verifier MAY parse the header and v2 key frame, compute
 `stored_digest`, and validate Section 5.8 geometry, footer, and fill. It MUST
@@ -1466,9 +1435,8 @@ computation: inner blocks are stored blocks; read them and trim.
 
 ### 6.3. Ciphertext Mapping (Encrypted Representation)
 
-Inner body block `b` is AEAD chunk `b` (Section 5.7). Let `K = 0` for
-`format_version = 1` and `K = key_frame_len` for version 2, and let
-`F = 128 + K + metadata_frame_len`:
+Inner body block `b` is AEAD chunk `b` (Section 5.7). Let
+`K = key_frame_len` and `F = 128 + K + metadata_frame_len`:
 
 ```text
 cipher_offset(b) = F + b × (C + 16)
@@ -1628,9 +1596,8 @@ identical bytes everywhere ("byte-stable fanout"). A backend needs no keys, no
 plaintext access, and no format knowledge to store, replicate, compare, or
 scrub a copy. Backends SHOULD record per copy: location, representation,
 `stored_digest`, `stored_size_bytes`/block count, `chunk_size`,
-`format_version`, `metadata_frame_len`, and `key_frame_len`. For v1 they
-SHOULD also record `key_id`; for v2 they SHOULD record the recipient epoch ids
-actually present.
+`format_version`, `metadata_frame_len`, `key_frame_len`, and the recipient
+epoch ids actually present.
 
 ### 8.2. Tape Binding
 
@@ -1647,8 +1614,7 @@ Bootstrap rows differ by representation, deliberately. A **plaintext**
 object's row carries the manifest anchors (`manifest_first_chunk_lba` — an
 inner `BodyLba` — `manifest_size_bytes`, `manifest_chunk_count`,
 `manifest_sha256`). An **encrypted** object's row carries no manifest anchors
-— only the public envelope geometry, the format version, and the v1 key id or
-v2 recipient epochs; [REMPARITY] states this as a
+— only the public envelope geometry and recipient epochs; [REMPARITY] states this as a
 normative rule of its bootstrap rows, and a Writer producing the tape
 binding MUST honor it. Manifest size and location are
 structural facts about confidential content — manifest size correlates
@@ -1657,10 +1623,9 @@ the envelope protects; the envelope's authenticated metadata already anchors
 the manifest more strongly than an external digest could (Section 7.1).
 The exact bootstrap encoding belongs to the REM-PARITY specification and is
 not duplicated here. Catalogless recovery begins with stored block 0: it
-reveals `object_id`, format version, and either v1 `key_id` or the length of
-the adjacent v2 key frame, from which recipient epochs are read. With the
-corresponding key, the full self-describing object — the manifest located by sequential
-decryption rather than by anchor, an acceptable cost on a recovery path over
+reveals `object_id`, format version, and the length of the adjacent key frame,
+from which recipient epochs are read. With the corresponding key, the full self-describing object — the manifest located by sequential
+decryption rather than by anchor — is recovered, an acceptable cost on a recovery path over
 sequential media. Plaintext objects remain fully recoverable keyless
 (Section 4.10).
 
@@ -1721,9 +1686,10 @@ Three independent fields are deliberately not interchangeable:
    present. Both use `REMANENCE.format_id = rao-v1` and manifest integer
    `schema_version = 1`.
 3. **Encrypted-envelope `format_version`** is the byte at header offset
-   `0x06`: `1` for registry-symmetric encryption and `2` for HPKE-wrapped-DEK
-   encryption. It does not indicate the stream schema and is unrelated to the
-   decimal specification version.
+   `0x06`: value `2` identifies HPKE-wrapped-DEK encryption. Value `1` is
+   permanently reserved, MUST never be accepted, and MUST never be
+   reassigned. The field does not indicate the stream schema and is unrelated
+   to the decimal specification version.
 
 A Reader of `rao-v1` gates on stream-schema major 1 and ignores unknown pax
 keywords, manifest keys, and extension-container keys. Extensions MUST NOT
@@ -1731,9 +1697,8 @@ change an existing field's meaning, alignment, entry semantics, compression
 or encryption gates, or any other rule enforced by this document. Such a
 change requires a new stream `format_id`.
 
-For the `RAO1` envelope magic, only the disjoint header forms in Section 5.2
-are valid. Version 1 has no key frame; version 2 has HPKE wrap suite `0x01`
-and a key frame. Unknown format or suite values are hard errors, not
+For the `RAO1` envelope magic, only the header form in Section 5.2 is valid:
+format value `2`, HPKE wrap suite `0x01`, and a key frame. Unknown format or suite values are hard errors, not
 negotiation. A future envelope change not expressible by ignorable metadata
 requires a new format value or magic and a successor specification.
 
@@ -1781,25 +1746,22 @@ TapeIo                    block sink/source failure (not a format violation)
 ```text
 InvalidMagicBytes            input does not begin with RAO1
 InvalidHeaderLength          header_len field is not 128
-UnsupportedFormatVersion     format_version is neither 1 nor 2
+UnsupportedFormatVersion     format_version is not 2
 InvalidSuite                 suite_id is not 0x01
 InvalidChunkSize             chunk_size is zero or not a multiple of 512
 ReservedBytesNotZero         flags or reserved bytes are nonzero
-InvalidKeyIdentifier         v1 key_id is zero, v2 key_id is nonzero, or v1 id is unknown
-InvalidWrapSuite             v2 wrap_suite is not 0x01, including reserved suite 0
+InvalidWrapSuite             wrap_suite is not 0x01, including reserved suite 0
 InvalidKeyFrameLength        key_frame_len violates the version gate or bounds
 InvalidKeyFrame              malformed or non-canonical RAOK frame
 RecipientEpochMismatch       no slot matches the supplied private-key epoch
 HpkeFailed                   HPKE key parsing, setup, wrap, or unwrap failed
 EntropyUnavailable           OS-backed randomness could not be obtained
-KeyModeMismatch              caller supplied the wrong key mode for format_version
 InvalidSalt                  all-zero hkdf_salt
 SaltDerivationMismatch       header hkdf_salt differs from Section 5.5 derivation
 InvalidObjectIdField         object_id field all-NUL, interior NUL, or invalid
                              UTF-8 (reader-side; a >64-byte object_id is
                              rejected at sealing time as InvalidInput, 5.2)
 MetadataFrameLengthInvalid   metadata_frame_len outside [17, 16 MiB]
-InvalidRootKey               root key material shorter than 32 bytes
 UnexpectedEof                declared header, metadata frame, footer, or fill bytes missing
 MissingFinalChunk            EOF within the payload frame before an authenticated final chunk
 AeadAuthenticationFailed     metadata or chunk tag verification failed
@@ -1826,78 +1788,26 @@ test vectors are single-fault by construction (Section 13).
 
 ### 12.1. Per-Object Key Uniqueness Is Structural
 
-For v1, the catastrophic failure would be two objects under one root key
-deriving identical `metadata_key`/`payload_key` for *different*
-plaintexts: the zero metadata nonce and every payload chunk-index nonce would
-then be reused across distinct contents — for ChaCha20-Poly1305 a total
-failure (XOR of plaintexts leaks immediately; Poly1305 key recovery enables
-forgery). RAO closes every operational path to that state by two independent
-mechanisms, leaving only the quantified residual stated below:
+Every seal MUST use a fresh uniformly random 32-byte DEK and fresh HPKE
+encapsulation randomness for every recipient, following [RFC9180] Section
+9.2.3. Entropy failure is fatal. The DEK feeds both the salt derivation and
+the header-bound key schedule, so independent seals of identical canonical
+bytes produce independent envelope keys and normally different stored bytes.
 
-1. **Header binding.** Keys derive from `header_hash`, and the header contains
-   the 64-byte `object_id`: objects with distinct identifiers derive distinct
-   keys *regardless of their salts*.
-2. **Salt derivation.** The salt is a PRF of the object's identifier, its
-   content digest, *and* its metadata bytes (Section 5.5): objects sharing
-   an identifier but differing in content or metadata derive distinct salts,
-   hence distinct headers, hence distinct keys — and the derivation is
-   re-verified on every keyed open (Section 5.10), so a defective sealer
-   cannot produce a readable object that violates it.
+Within one envelope, `header_hash` binds the complete scalar header and key
+frame, including `object_id`, recipient slots, encapsulations, and wrapped-DEK
+ciphertexts. The derived salt also binds `object_id`, `plaintext_digest`, and
+the metadata hash. Reusing an `object_id` is still forbidden by the object
+model, but it does not collapse distinct seals onto one key because their
+DEKs are independently random. The remaining catastrophic cases require a
+DEK collision, a primitive break, or a defective entropy source; the Sealer's
+fail-closed obligation is therefore part of nonce safety, not merely an
+availability policy.
 
-Every residual path to identical keys over distinct plaintexts begins with an
-`object_id` reused across seals that differ in content or in envelope metadata
-(a defect in the identifier-assigning system or the sealer — identifiers are
-required to be unique by whoever assigns them;
-v1 metadata cannot differ for one object, Section 5.6, but a metadata
-extension can, which is why the model covers it); for distinct identifiers,
-header binding ends the analysis. Given such a reuse, keys collide only if one
-of two further things happens:
-
-1. **A SHA-256 collision in the digest inputs.** The derivation sees content
-   only through `plaintext_digest` and metadata only through `metadata_hash`,
-   so two distinct same-size canonical objects with colliding content
-   digests — or two distinct metadata plaintexts with colliding hashes —
-   would derive identical salts, headers, and keys outright. This is a
-   collision-resistance break of SHA-256 — an assumption the format already
-   stakes its entire integrity chain on (`file_sha256`, `plaintext_digest`,
-   `manifest_sha256`; Section 7.1) — so the residual model adds no primitive
-   assumption the format did not already carry.
-2. **A truncated-PRF output collision.** Distinct derivation inputs can still
-   collide in the 16-byte salt with probability 2^−128 per pair — a truncation
-   bound, not a SHA-256 or HMAC break (128 bits of salt cannot promise more),
-   and accidental-only: the PRF is keyed by `root_key`, so no party without
-   the root key can compute — let alone search for — salt values, and a party
-   holding the root key is already inside the trust boundary (Section 12.7).
-
-Version 1 sealing consumes no randomness; the registry root key still requires
-high-quality generation. Version 2 instead requires a fresh random DEK and
-fresh HPKE encapsulation randomness for every recipient, following the
-randomness requirements of [RFC9180] Section 9.2.3, and fails closed when OS
-entropy is unavailable. What *can* recur in v1 is
-the benign case: resealing the identical canonical object (identical metadata
-included — in version 1 the metadata is a function of the object,
-Section 5.6) reproduces identical keys with the identical plaintexts —
-deterministic encryption of one object, disclosing only an equality that the
-header `object_id` already discloses (Section 5.5).
-
-On the key-dependent Extract salt (a salt that is a PRF output under the same
-`root_key` later used as the Extract `ikm`): the construction rests explicitly
-on the dual-PRF assumption for HMAC-SHA-256 [RFC2104] — that it behaves as a
-PRF when keyed through either input. This is the same assumption underlying
-the TLS 1.3 key schedule [RFC8446], which chains key-derived Extract salts;
-it is stated
-here as an assumption, deliberately, and no proof is inherited.
-
-As a defense-in-depth measure, a deployment's catalog can run a consistency
-check on `(key_id, hkdf_salt)` at insert. A repeat is *legitimate* exactly when the
-rows are byte-identical copies of one sealed object — agreeing on `object_id`,
-`plaintext_digest`, **and** `stored_digest`: byte-stable fanout and resealing
-intentionally produce such repeats. A repeat
-disagreeing on any of the three warrants loud rejection. The `stored_digest`
-term is not redundant: rows agreeing on `object_id` and `plaintext_digest` but
-differing in `stored_digest` are precisely the signature of residual branch 1
-above (or of a defective sealer) — the one case in which `plaintext_digest`
-equality cannot be trusted to mean content equality.
+The deterministic entry point used to generate Section 13 vectors injects a
+fixed DEK and seeded encapsulation stream solely for reproducible conformance
+artifacts. It is not a production sealing mode; production callers MUST use
+operating-system entropy as required by Section 5.4.
 
 ### 12.2. Key Separation Is Required for Nonce Safety
 
@@ -1910,7 +1820,7 @@ metadata and payload keys.
 ### 12.3. Binding Without AAD
 
 Both AEADs use empty AAD. Object identity and chunk position are bound
-structurally: the scalar header and, for v2, the complete key frame are bound
+structurally: the scalar header and the complete key frame are bound
 through `header_hash` in the key derivation, and the chunk
 index and finality are bound through the nonce. Cross-object splicing fails
 because the keys differ; intra-object reordering, duplication, or truncation
@@ -1929,7 +1839,7 @@ as success; streamed output is not valid until the whole-object open succeeds.
 ### 12.5. Confidentiality Boundary and Size Leakage
 
 An encrypted copy reveals, by design: that it is an RAO object; the format and
-suites; `chunk_size`; v1 `key_id` or v2 recipient epoch ids and labels; the
+suites; `chunk_size`; recipient epoch ids and labels; the
 salt; public frame lengths; `object_id`; and its stored length — from which the
 **exact** `plaintext_size` and `chunk_count` are derivable by the Section 5.8
 arithmetic. Encryption hides content, never size. It reveals no filenames,
@@ -1957,7 +1867,8 @@ manifest consistently. A lone plaintext object whose hashes verify internally
 proves only self-consistency. The trust anchor is external — the catalog's
 `stored_digest` and, on tape, the bootstrap's parity-protected
 `manifest_sha256` (plaintext rows, Section 8.2). Encrypted copies are
-cryptographically authenticated under the root key — subject to Section 12.7.
+cryptographically authenticated under keys derived from the wrapped DEK —
+subject to Section 12.7.
 
 ### 12.7. Non-Committing AEAD
 
@@ -1965,22 +1876,22 @@ ChaCha20-Poly1305 is not key-committing: a party holding multiple candidate
 keys can in principle construct equivocal ciphertext [AEAD-COMMIT]
 [PART-ORACLE]. `stored_digest` does not prevent this because equivocation uses
 one byte string. RAO therefore claims confidentiality and self-consistency,
-not writer identity or provenance. Version 1 relies on exact trusted-registry
-resolution. Version 2 binds the complete recipient frame but possession of
-recipient public keys still permits fabrication of a new internally valid
-object. Deployments requiring provenance need an independently authenticated
-or signed external manifest.
+not writer identity or provenance. The complete recipient frame is bound, but
+possession of recipient public keys still permits fabrication of a new
+internally valid object. Deployments requiring provenance need an independently
+authenticated or signed external manifest.
 
 ### 12.8. Key Rotation and Epoch Longevity
 
-For v1, rotating the registry root affects newly sealed objects; old roots
-must remain recoverable while any live object names their `key_id`. For v2,
-recipient rotation likewise affects newly sealed objects. Because the key
-frame is included in `header_hash`, rewrapping without resealing is forbidden.
-An epoch private key MUST NOT be destroyed while any live object's key frame
-references it. Re-sealing preserves the canonical bytes and
-`plaintext_digest` but changes the encrypted stored bytes and
-`stored_digest`.
+Recipient rotation affects newly sealed objects. Because the key frame is
+included in `header_hash`, rewrapping without resealing is forbidden. An epoch
+private key MUST NOT be destroyed while any live object's key frame references
+it. The `reseal` operation opens an existing v2 envelope with a matching
+private key and seals the identical canonical bytes to a new recipient set;
+it is therefore a v2-to-v2 re-seal, not a key-frame rewrite. Re-sealing
+preserves `object_id`, `chunk_size`, the canonical bytes, and
+`plaintext_digest`, but uses a fresh DEK and salt and changes the encrypted
+stored bytes and `stored_digest`.
 
 ### 12.9. Hostile-Input Posture
 
@@ -2035,12 +1946,12 @@ applied, if at all, through an interface that does not follow the link.
 
 ### 12.11. Envelope Threat Model and Secret Handling
 
-The v2 confidentiality claim is time-scoped:
+The encrypted-envelope confidentiality claim is time-scoped:
 
 | Attacker capability | Can read or do | Cannot read, assuming uncompromised primitives and custody |
 | --- | --- | --- |
-| Steals only v2 object media | Public header/key-frame facts and exact size | Metadata and payload |
-| Compromises the sealing host at time T | Host plaintext; in-memory keys; objects being or later sealed while compromise persists; substitute future recipient keys if pinning also fails | Earlier v2 objects whose DEKs and recipient private keys are absent |
+| Steals only object media | Public header/key-frame facts and exact size | Metadata and payload |
+| Compromises the sealing host at time T | Host plaintext; in-memory keys; objects being or later sealed while compromise persists; substitute future recipient keys if pinning also fails | Earlier objects whose DEKs and recipient private keys are absent |
 | Holds one recipient private key | Every object wrapped to that epoch | Objects not wrapped to that epoch |
 | Holds only recipient public keys | Create new internally valid objects; observe public facts | Existing-object plaintext |
 
@@ -2050,7 +1961,7 @@ independent custody process if key substitution is in scope. At least two
 distinct-custody recipients reduce loss risk but do not impose a cryptographic
 threshold: either private key decrypts alone.
 
-Implementations SHOULD keep root keys, DEKs, derived keys, recipient private
+Implementations SHOULD keep DEKs, derived keys, recipient private
 keys, HPKE ephemeral secrets, and RNG state in non-cloneable or otherwise
 minimally copied containers and MUST zeroize mutable secret buffers promptly
 after use. Secrets MUST NOT appear in logs, diagnostics, command lines, core
@@ -2068,12 +1979,12 @@ values (e.g. 4096) so full object byte streams are practical to pin; at least
 one vector MUST use `DEFAULT_CHUNK_SIZE`.
 
 The authoritative companion archive is `remanence-test-vectors.tar`, SHA-256
-`596e5ee7baffb355366407d6b4384fe7caafa64509e489508df2ed5dc2eadc7d`.
+`f8f7075f89017597b834d08a98b21917453eeb15d636850585267202d5309bed`.
 Its `MANIFEST.tsv` inventories every contained vector manifest and generated
 artifact, `CHECKSUMS.sha256` authenticates them, and the included `verify.py`
 checks the archive without a source checkout. It contains plaintext and xattr
-positive objects, registry-envelope positive objects, and v1/v2 envelope
-negative manifests. The archive's checksums, rather than abbreviated values
+positive objects, HPKE-envelope positive objects, and envelope negative
+manifests. The archive's checksums, rather than abbreviated values
 in this prose, are the byte-identity authority. Payload digests are
 independently checkable with `sha256sum`.
 
@@ -2136,37 +2047,47 @@ Pinned outputs: the exact full object byte stream; the manifest CBOR bytes;
 `manifest_sha256`; `plaintext_digest` = `stored_digest`. Exact values are
 pinned in the companion archive.
 
-### 13.3. RAO-TV-E1 — Encrypted Twin of RAO-TV-P1
+### 13.3. RAO-TV-E2 — Encrypted Twin of RAO-TV-P1
 
-Inputs: the RAO-TV-P1 canonical bytes, plus —
+RAO-TV-E2 seals the exact RAO-TV-P1 canonical bytes. Its manifest records the
+complete inputs and derivation chain; the essential fixed inputs are:
 
 | Input | Value |
 | --- | --- |
-| `root_key` (32 bytes) | hex `000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f` |
-| `key_id` (16 bytes) | hex `4b49443a72616f2d74762d65312e3031` (ASCII `KID:rao-tv-e1.01`) |
-| `hkdf_salt` | Derived per Section 5.5 (`ctr` = `0x00`); value pinned in the archive |
+| DEK | byte `7d` repeated 32 times |
+| HPKE RNG seed | byte `c3` repeated 32 times |
+| Slot 0 | index 0; epoch id `61` repeated 16 times; label `archive-2026-01`; private key `51` repeated 32 times; public key `ad908a8a708aca07588cda7c4ed3e44d4966a80a9abb2f1e4bbac53c67414e34` |
+| Slot 1 | index 1; epoch id `62` repeated 16 times; label `recovery-2026-01`; private key `52` repeated 32 times; public key `f68b05ba03f7185e1ba88878682f8dd0b15158f6050889c9481d79c2d7d2fa07` |
 | Envelope metadata | The four required keys of Section 5.6 |
 
-Expected geometry (derivable):
+The private keys, DEK, and seed are public test material, not operational
+examples. Expected geometry is:
 
 | Quantity | Expected value |
 | --- | --- |
 | `plaintext_size` `P` | 20480; `chunk_count` = 5 |
+| Key frame | `K` = 232 bytes; two recipient slots |
 | Metadata plaintext | 50-byte map `{0: 1, 1: 20480, 2: "sha256", 3: <32 digest bytes>}` |
 | `metadata_frame_len` `M` | 66 |
-| Payload frame | bytes 194–20753 (5 chunks × 4112) |
-| `footer_offset` | 20754; footer + 3806 zero-fill bytes |
+| Payload frame | bytes 426–20985 (5 chunks × 4112) |
+| `footer_offset` | 20986; footer + 3574 zero-fill bytes |
 | `stored_size_bytes` / blocks | 24576 / 6 |
 
-Pinned outputs in the archive: the derived `hkdf_salt`
-(Section 5.5); the exact 128 header bytes and `header_hash`; derived
-`metadata_key` and `payload_key`; the exact metadata frame bytes; SHA-256 of
-the payload frame; `stored_digest`. Because sealing is deterministic
-(Section 5.5), the entire stored byte string is reproducible from
-the inputs above with no test-only interfaces. Required equality: this
-object's `plaintext_digest` MUST equal RAO-TV-P1's `stored_digest`, and the
-value of metadata map key `3` (`plaintext_digest`, Section 5.6) MUST equal
-that digest.
+The manifest pins each recipient's `enc`, wrapped-DEK ciphertext, HPKE shared
+secret, HPKE AEAD key and base nonce; the metadata plaintext and hash; derived
+`hkdf_salt` (`ctr = 0x00`), `object_secret`, `metadata_key`, and `payload_key`;
+the exact header, key frame, metadata frame, and `header_hash`; payload-frame
+SHA-256; `stored_digest`; and `plaintext_digest`. Required equality: the
+`plaintext_digest` MUST equal RAO-TV-P1's `stored_digest`.
+
+The reference generator calls `seal_deterministic_for_test_vectors` with the
+fixed DEK and seed, generates the object twice, and requires byte equality
+with `rao/objects/rao-tv-e2.rao`. This deterministic-generation hook exists
+solely to reproduce conformance artifacts. Production sealing uses a fresh
+DEK and operating-system-backed HPKE randomness as required by Section 5.4.
+The independent verifier implements only the OPEN direction from this prose
+using generic cryptographic primitives; it unwraps both slots and verifies the
+canonical bytes, metadata digest, manifest, and per-file digests.
 
 ### 13.4. RAO-TV-D1 — Default Chunk Size
 
@@ -2178,12 +2099,14 @@ One vector MUST use `DEFAULT_CHUNK_SIZE`. Inputs: `chunk_size` 262144;
 `00000000-0000-4000-8000-000000000012`, contents 262145 bytes with byte `i` =
 `i mod 256` (expected `file_sha256`
 `c35991ad254f48ff8b02becb9f0cc56581e86a0b477b13e5ebb0030a3b91c848`,
-`chunk_count` 2), sealed both plaintext and encrypted under the RAO-TV-E1 key
-material (salt derived per Section 5.5). Pinned outputs as in 13.2/13.3
+`chunk_count` 2), represented both as plaintext and as a two-recipient HPKE
+envelope. The encrypted half uses DEK byte `5d` repeated 32 times, HPKE RNG
+seed byte `a7` repeated 32 times, and the two recipient keypairs recorded in
+its manifest. Pinned outputs as in 13.2/13.3
 (digests only for the large streams; exact bytes for header, metadata frame,
 and manifest).
 
-### 13.5. Xattr and Version 2 Envelope Vectors
+### 13.5. Xattr and HPKE Component Vectors
 
 `rao/objects/rao-tv-xattrs.rao` and its manifest pin an xattr round trip. The
 entry `tagged.txt` carries `user.comment` with bytes `62 6c 75 65` (`blue`)
@@ -2202,9 +2125,9 @@ the exact deterministic CBOR, layout, `manifest_sha256`, and
 `stored_digest`. The no-xattr writer path remains schema `1.0` and emits empty
 containers as required by Section 4.7.3.
 
-The archive's `negative-envelope-v2.json` pins the v2 parser rejects for a
-version flip, suite flip, truncated frame, duplicate or misordered slots,
-trailing frame data, and an oversized frame. The implementation's positive
+The archive's `negative-envelope-v2.json` pins the complete header,
+key-frame, HPKE-tamper, Sealer-slot, and Reader-slot policy matrix described in
+Section 13.6. The implementation's positive
 component vector fixes `object_id = object-a`, epoch id `03` repeated 16
 times, label `safe-2026`, slot 0, DEK `09` repeated 32 times, and a deterministic
 test-only HPKE entropy draw of `42` repeated 32 times. Its exact outputs are:
@@ -2259,16 +2182,17 @@ manifest `chunk_size` disagreeing with the global header; unknown extra key
 sharing a `file_id`. A restore-report vector reaches EOF without a manifest
 and asserts the typed `MissingManifest` report rather than silent absence.
 
-**Envelope.** Header: wrong magic; `header_len` ≠ 128; `format_version` 3;
-unknown `suite_id`; `chunk_size` 0 and `chunk_size` not a multiple of 512;
-nonzero `flags`; nonzero version-reserved bytes; v1 all-zero `key_id`; v2
-nonzero `key_id`; v2 unknown or reserved `wrap_suite`; invalid
+**Envelope.** Header: wrong magic; `header_len` ≠ 128; unsupported format
+values (including the permanently reserved value 1); unknown `suite_id`;
+`chunk_size` 0 and `chunk_size` not a multiple of 512; nonzero `flags`;
+nonzero bytes in either reserved region; unknown or reserved `wrap_suite`;
+suite 0 with a nonempty frame; HPKE suite with zero, undersized, or oversized
 `key_frame_len`; all-zero `hkdf_salt`;
 all-NUL `object_id` field; interior-NUL `object_id`; non-UTF-8 `object_id`;
 `metadata_frame_len` 16 and `metadata_frame_len` > 16 MiB. Cryptographic
 binding: a flipped salt bit (structurally valid → `AeadAuthenticationFailed`);
-v1 `key_id` swapped to another known test key
-(`AeadAuthenticationFailed`); a v2 slot transplant or key-frame bit flip; a
+a structurally valid key-frame label, encapsulation, wrapped-DEK ciphertext,
+slot insertion, or slot removal tamper; a
 flipped ciphertext bit in chunk 1; chunks 1 and 2 transposed; wrong final flag
 (a 6th chunk appended / final chunk re-sealed non-final); sealed metadata
 deliberately misstating `plaintext_digest` (opens MUST fail
@@ -2286,16 +2210,23 @@ same input is advisory — Section 5.8). Inner cross-checks (defective-sealer
 harness): inner `object_id` differing from the header; inner `chunk_size`
 differing; inner `REMANENCE.encryption` ≠ `none` (`InnerObjectMismatch`).
 Writer-side: sealing input with `P` not a multiple of `C`; `object_id` > 64
-bytes; v1 root key of 16 bytes (`InvalidRootKey`); v2 fewer than two
-recipients, duplicate epoch ids, non-canonical slot order, or entropy failure.
+bytes; recipient counts 0, 1, and greater than 8; duplicate epoch ids;
+non-canonical slot order; or entropy failure.
+
+Key-frame structure additionally covers slot counts 0 and 9, duplicate slot
+indices, misordered slots, duplicate `recipient_epoch_id` values across
+distinct slots, internal slot truncation, trailing frame bytes, malformed
+`RAOK` magic, malformed encapsulation, and a wrong recipient private key. A
+positive case opens a structurally valid one-slot object, recording the
+policy asymmetry: Sealers MUST emit at least two slots, while Readers accept
+one through eight.
 
 ## 14. Conformance
 
 An implementation conforms only for the roles it claims. A conforming Writer
 implements the canonical stream and every feature it emits. A conforming
-encrypted Sealer and Reader MUST implement v1; an implementation claiming v2
-support MUST additionally implement the complete v2 header, key-frame, HPKE,
-key schedule, and mode-separation rules. A Reader MAY decline xattr restore,
+encrypted Sealer and Reader MUST implement the complete format-2 header,
+key-frame, HPKE, key schedule, and mode-separation rules. A Reader MAY decline xattr restore,
 but it MUST preserve file-byte recovery, ignore the extension safely, and
 report that the attributes were not applied.
 
@@ -2303,17 +2234,17 @@ Conformance evidence MUST include:
 
 1. byte-exact agreement with the applicable positive objects and manifests in
    the Section 13 archive;
-2. the applicable typed rejects in the negative manifests, including the v2
+2. the applicable typed rejects in the negative manifests, including the
    key-frame set;
 3. GNU tar, bsdtar, and Python `tarfile` extraction equality for plaintext
    objects;
 4. authenticated range recovery across a chunk boundary and in the final
-   chunk for each claimed encrypted format version;
+   encrypted chunk;
 5. failure without a completion footer on injected size, digest, entropy, and
    I/O failures applicable to the claimed mode;
 6. whole-object keyed verification and keyless structural verification with
    the claims kept distinct; and
-7. reconstruction of one catalogless v2 object using only object bytes, a
+7. reconstruction of one catalogless encrypted object using only object bytes, a
    matching recipient private key, this specification, and generic
    cryptographic libraries.
 
@@ -2325,8 +2256,9 @@ specification or an explicitly published erratum.
 
 This document has no IANA actions. The identifiers this specification
 defines — the `rao-v1` stream format identifier, the `REMANENCE.` pax
-keyword namespace, the `RAO1` envelope magic, `format_version` values 1 and 2,
-the `suite_id` value `0x01`, the v2 `wrap_suite` value `0x01`, and the
+keyword namespace, the `RAO1` envelope magic, `format_version` value 2 (with
+value 1 permanently reserved), the `suite_id` value `0x01`, the
+`wrap_suite` value `0x01`, and the
 `"xattrs"` preservation key — are assigned by this document and governed by
 its versioning rules
 (Section 10); no registry is established or required.
@@ -2434,10 +2366,11 @@ Manifest pax base records (with `executable=false`, `is_manifest=true`,
 548 bytes padding to 17408. Tar EOF (1024 bytes) ends at 18432; zero fill to
 **20480 = 5 blocks**.
 
-**RAO-TV-E1.** `P` = 20480, `C` = 4096 → `chunk_count` 5. Metadata plaintext:
+**RAO-TV-E2.** `P` = 20480, `C` = 4096 → `chunk_count` 5. Metadata plaintext:
 `a4 00 01 01 19 50 00 02 66 ... 03 58 20 ...` = 1 + 2 + 4 + 8 + 35 =
-**50 bytes** → `M` = 66. Payload frame = 20480 + 80 = 20560 bytes at offset
-194; `footer_offset` = 20754; stored pre-fill length 20770; fill 3806 →
+**50 bytes** → `M` = 66. The two-slot key frame has `K` = 232. Payload frame
+= 20480 + 80 = 20560 bytes at offset 128 + 232 + 66 = 426;
+`footer_offset` = 20986; stored pre-fill length 21002; fill 3574 →
 **`stored_size_bytes` 24576 = 6 blocks**. The metadata zero nonce is
 byte-identical to payload chunk 0's nonce here (chunk 0 is non-final, nonce
 `00…00 00`) — exactly the collision that the metadata/payload key separation
@@ -2530,7 +2463,7 @@ Both profiles use deterministic-CBOR validation (Sections 4.7.1 and 5.6).
 ### B.8. Empty AAD
 
 Both AEADs use empty AAD because the bindings are already structural: the
-the scalar header and, in v2, the key frame are bound through `header_hash` in
+scalar header and the key frame are bound through `header_hash` in
 the key derivation, and chunk index and finality are
 bound through the nonce. Re-binding the same facts as AAD would add bytes and
 a second mechanism without adding security.
@@ -2552,26 +2485,22 @@ framing the stream already provides (self-description, digests).
 
 ### B.11. Derived salts, not random salts
 
-`hkdf_salt` is derived from the v1 root key or v2 DEK, the object identifier,
-the content digest, and the metadata bytes (Section 5.5), never drawn directly
-from a random number generator. For v1, the catastrophic precondition — identical keys for different
-plaintexts — then requires an identifier-reuse bug combined with a SHA-256
-digest collision or a 2^−128 truncated-PRF collision (Section 12.1) rather
-than an RNG failure; RNG failures are documented history (e.g. cloned VMs and
-fork-without-reseed entropy reuse) while the hash and keyed-PRF assumptions
-are ones the format already carries. V1 sealing is deterministic. V2 sealing
-is deliberately randomized by its fresh DEK and HPKE encapsulations, while
-the salt remains reproducibly derived once that DEK is known.
+`hkdf_salt` is derived from the per-object DEK, object identifier, content
+digest, and metadata bytes (Section 5.5), never drawn directly from a random
+number generator. The envelope is nevertheless deliberately randomized by
+its fresh DEK and HPKE encapsulations, while the salt remains reproducibly
+derived once that DEK is known. This separates the entropy input from the
+wire salt and binds the salt to the object facts authenticated on open.
 
-### B.12. Envelope metadata is fixed in v1 and bound into the salt
+### B.12. Envelope metadata is fixed and bound into the salt
 
 If variable optional metadata existed, resealing the same object with
 different metadata of the same encoded length could reproduce the same
 `metadata_key` while the zero metadata nonce encrypted a *different* plaintext
-— the nonce reuse [RFC8439] forbids. Two layers prevent this: version 1
-defines no optional metadata keys (the frame is a deterministic function of
-the canonical object), and SHA-256 of the metadata plaintext is bound into the
-salt derivation and verified on every keyed open, so a future 1.x metadata
+— the nonce reuse [RFC8439] forbids. Two layers prevent this: the current
+format defines no optional metadata keys (the frame is a deterministic
+function of the canonical object), and SHA-256 of the metadata plaintext is bound into the
+salt derivation and verified on every keyed open, so a future metadata
 extension — or a defective sealer — cannot reach the reused-nonce state in a
 readable object.
 
