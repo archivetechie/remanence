@@ -3,11 +3,13 @@
 > **Historical reference only.** Amber/AOF1 was retired before publication or
 > deployment. Its useful AEAD construction was absorbed into Remanence's RAO
 > implementation; it is not a current workspace, CLI, service, or dependency.
-> For the current format and implementation boundary, read
-> [`rao-v1-specification.md`](rao-v1-specification.md) and
-> [`architecture-overview.md`](architecture-overview.md). The remainder of
-> this document is retained to explain the predecessor design and migration
-> decisions, not to describe the live code.
+> In particular, the root-key, key-id, resolver, and registry material in its
+> crypto sections describes the now-retired RAO format-version-1 design; it
+> must not be used as current implementation guidance. Live encrypted RAO is
+> v2 HPKE recipient-envelope only. For the current boundary, read the
+> [`tape layout reference`](reference-tape-layout.md) and
+> [`architecture overview`](architecture-overview.md). The remainder is
+> retained to explain predecessor decisions, not live code.
 
 This document describes how the Amber workspace is put together and records
 the reasoning behind its main design decisions, so future changes do not

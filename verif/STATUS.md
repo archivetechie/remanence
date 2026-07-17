@@ -4,7 +4,7 @@ This is the concise entry point for Remanence's local formal-verification
 estate. Detailed theorem statements live in each `verif/<area>/SPEC.md`; the
 broader reviewer-facing inventory lives in `docs/formal-verification-status.md`.
 
-Status date: 2026-07-11.
+Status date: 2026-07-17.
 
 ## Replay gate
 
@@ -49,16 +49,26 @@ mirror and the boundary it does not cross.
 | `parity-mapping` | `crates/remanence-parity/src/mapping.rs` | Epoch size, coordinate bounds, row-major shape, round trip, and invalid-coordinate rejection. | Sidecar encoding and tape IO. |
 | `parity-sidecar-layout` | `crates/remanence-parity/src/sidecar.rs` | Fixed sidecar header/footer/index ranges, CRC windows, block placement, and checked range bounds. | Reed-Solomon recovery, raw shard contents, variable traversal, allocation, and tape IO. |
 | `crc64-xz` | `crates/remanence-crc/src/lib.rs` | CRC-64/XZ bit step, table entry, table update, public slice loop, and normative vectors. | Call-site byte-window selection outside the CRC function. |
-| `aead-framing` | `crates/remanence-aead/src/{stream,range,inspect}.rs` | V1 (`key_frame_len = 0`) chunk counts, payload/stored sizes, ciphertext offsets, plaintext range validation, range planning, and inspect geometry. | V2 key-frame geometry (Rust tests/drift guard only), AEAD security, HKDF, hashing, CBOR, allocation, and byte IO. |
-| `rao-header` | `crates/remanence-aead/src/header.rs` | V1 header-core validation, frozen-field emission, parse/serialize round trip, and bad-field rejection. | V2 header/key-frame parsing (Rust vectors/fuzz/tests only), exact string/array reconstruction, hashing, encryption, CBOR, and allocation. |
 | `rao-metadata` | `crates/remanence-aead/src/metadata.rs` | Metadata-core validation, writer-schema emission, decode/encode round trip, and checked arithmetic failure paths. | Exact digest byte copying, recursive CBOR extension skipping, encryption, hashing, and allocation. |
 | `rao-manifest` | `crates/remanence-format/src/{layout,manifest}.rs` | Manifest chunk arithmetic, writer shapes, bounded/fixed-capacity entry round trips, fold/membership bridge, duplicate rejection, and hardlink accumulation. | Production CBOR bytes, real `Vec`/`String` traversal, tar/pax layout, hashing, maps, and arbitrary xattr payloads. |
-| `rao-archive` | RAO header/metadata/manifest archive composition | Scalar archive `decode(encode(x)) = x` for validated archive cores and top-level consistency checks. | Exact byte archives, production container internals, path syntax, tar/pax records, hashing, encryption, allocation, and IO. |
 | `tape-init` | `crates/remanence-api/src/tape_init.rs::decide_tape_init` | Committed-pool conflict dominance, fail-closed BOT decisions, blank BOT rules, clean no-op, and ordered bootstrap hazards. | BOT reads, catalog projection, bootstrap writes, and hardware orchestration. |
 | `pool-selection` | `crates/remanence-api/src/pool_selection.rs` | Fit/completion predicates, leftover arithmetic, and ranking/tie-break order for `CompleteOrFill` and `FillOldest`. | Iterator internals, catalog projection, drive occupancy projection, and caller footprint projection. |
+
+## Retired proof areas
+
+The v1-only `aead-framing`, `rao-header`, and `rao-archive` proof crates were
+retired on 2026-07-17 when production RAO format-version-1 support was
+excised. Their drift guards no longer matched the v2-only production geometry,
+so retaining the proofs would have overstated current coverage. The retired
+sources and guards were deleted rather than weakened or relabeled.
+
+Replacement work is tracked as **RAO-V2-FORMAL-PREFIX** for v2 prefix/range
+geometry and **RAO-V2-FORMAL-HEADER-KEY-FRAME** for the v2 scalar header plus
+key-frame codec.
 
 ## Next target
 
 The named next targets are **RAO-V2-FORMAL-PREFIX** and
-**RAO-V2-FORMAL-HEADER-KEY-FRAME**: regenerate the extraction with v2 geometry
-and the real byte codec, then prove those production-connected functions.
+**RAO-V2-FORMAL-HEADER-KEY-FRAME**: create fresh extractions from the v2-only
+production geometry and byte codec, then prove those production-connected
+functions.

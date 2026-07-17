@@ -150,13 +150,13 @@ None of these touch tape; they are the easiest way to exercise the format.
 | Command | What it does |
 |---|---|
 | `rem archive capabilities` | Print a one-line JSON list of this build's RAO capabilities (e.g. `rao-v2-envelope`, `wrap-suite-hpke-v1`, `ranged-ciphertext-extract`) with zero hardware discovery. Useful for scripts probing what a given binary supports before calling it. |
-| `rem archive build --inputs <PATH>... --out <FILE>` | Build a plaintext `rao-v1` object from files/directories and print a JSON build report. `--encrypt --key-file <32-byte-key> --key-id <32-hex>` builds the encrypted `RAO1` v1 (registry-key) representation instead — `build` has no direct path to a v2/HPKE envelope; see `reseal` below for that. `--map`/`--source-root`/`--map-sha256` accept a planner-emitted source map instead of `--inputs`. `--scan-only` classifies inputs and reports without writing. `--rules` applies an ingest ruleset; `--manifest-out` (requires `--rules`) writes the member manifest JSON. |
-| `rem archive reseal --object <FILE> --registry-key <KEY> --recipient <PUBKEY>... --out <FILE> [--staging-dir <DIR>]` | Convert an existing plaintext-registry-key (v1) object into a multi-recipient HPKE (v2) envelope. Takes 2-8 recipient public keys in ascending slot order. Verifies the resealed output's digest before an atomic `renameat2(RENAME_NOREPLACE)` publish (never clobbers an existing `--out`); staging happens next to the destination, never in `/tmp`. One-shot v1→v2 migration only — there is no v2→v2 rewrap/key-rotation mode and no v2→v1 downgrade. |
-| `rem archive inspect --object <FILE> [--key-file <KEY>]` | Print an object's header, manifest digest, and member table as JSON. Works keylessly on both v1 and v2 headers (a v2 key frame is parsed and validated without needing any key). |
-| `rem archive extract --object <FILE> --dest <DIR>` | Extract a whole object. `--path` plus `--range <START:LEN>` extracts a member byte range; `--blob-entry`/`--blob-member` restore a single member from inside a blob wrapper. **v1-only** — there is no `--private-key`/recipient flag here, so a v2 (HPKE) envelope cannot be opened through this command; use `rao-recover` instead. |
-| `rem archive extract-stream --key-file <KEY> [--range <START:LEN> --authenticated-prefix <FILE> --stored-range-start <BYTE>]` | Stream-decrypt from stdin to stdout with per-chunk authentication and bounded memory. With the three ranged flags together, performs a bounded ranged-ciphertext decrypt: it re-authenticates the header/metadata prefix from `--authenticated-prefix`, then decrypts only the covering ciphertext frames fed on stdin (which must start exactly at `--stored-range-start`). **v1-only** (root key), same as `extract`. |
-| `rem archive covering-range --key-file <KEY> --object-id <ID> --file-id <ID> --range <START:LEN>` | Given a requested plaintext byte range inside one member, authenticate the object's header/metadata prefix (read from stdin) and print the smallest covering stored-ciphertext byte range as JSON (`stored_range_start`/`stored_range_len`/`first_chunk`/`chunk_count`) — the geometry `extract-stream`'s ranged mode needs. **v1-only.** See [`reference-extract-stream-protocol.md`](reference-extract-stream-protocol.md) for the full stream framing and exit codes. |
-| `rem restore --object <FILE> --dest <DIR>` | Top-level alias surface for native RAO restore, same flags as `extract`. |
+| `rem archive build --inputs <PATH>... --out <FILE> [--recipient <RAOR>]...` | Build a portable object and print a JSON build report. Omitting `--recipient` writes the plaintext `rao-v1` body. Repeating it 2-8 times with distinct epochs in ascending slot order writes a v2 HPKE envelope; the presence of recipients is the encryption switch. `--map`/`--source-root`/`--map-sha256` accept a planner-emitted source map instead of `--inputs`. `--scan-only` classifies inputs and reports without writing. `--rules` applies an ingest ruleset; `--manifest-out` (requires `--rules`) writes the member manifest JSON. |
+| `rem archive reseal --object <FILE> --private-key <RAOP> --recipient <RAOR> <RAOR>... --out <FILE> [--staging-dir <DIR>]` | Open one v2 envelope with a matching recipient private key and seal the same authenticated plaintext to a new ordered set of 2-8 distinct recipients. Unlike build/write's repeatable flag, reseal takes its 2-8 paths as one `--recipient` value list. It verifies the new stored digest before an atomic no-replace publish; staging happens next to the destination unless `--staging-dir` is supplied. Input and output are both v2, and downgrade is impossible. |
+| `rem archive inspect --object <FILE>` | Inspect a plaintext body or parse and validate a v2 header/key frame without a key. Encrypted output reports `format_version` and `recipient_epochs`; it cannot expose encrypted manifest members. |
+| `rem archive extract --object <FILE> --dest <DIR> [--private-key <RAOP>]` | Extract a whole object. `--private-key` is required for an encrypted object and rejected for plaintext. `--path` plus `--range <START:LEN>` extracts a member byte range; `--blob-entry`/`--blob-member` restores a single member from a blob wrapper. |
+| `rem archive extract-stream --private-key <RAOP> [--range <START:LEN> --authenticated-prefix <FILE> --stored-range-start <BYTE>]` | Stream-decrypt a v2 envelope from stdin to stdout with per-chunk authentication and bounded memory. With the three ranged flags together, re-authenticate the header/key-frame/metadata prefix and decrypt only the covering ciphertext frames beginning at `--stored-range-start`. |
+| `rem archive covering-range --private-key <RAOP> --object-id <ID> --file-id <ID> --range <START:LEN>` | Authenticate a v2 header/key-frame/metadata prefix from stdin and print the smallest covering stored-ciphertext range (`stored_range_start`, `stored_range_len`, `first_chunk`, `chunk_count`). See [`reference-extract-stream-protocol.md`](reference-extract-stream-protocol.md). |
+| `rem restore --object <FILE> --dest <DIR> [--private-key <RAOP>]` | Top-level native-restore alias with the same key contract as `extract`. |
 | `rem archive list` | List native objects from the local catalog (no tape access). |
 | `rem archive probe --format bru --dump <FILE>` | Identify a legacy archive dump without streaming it. |
 | `rem archive scan --format bru --dump <FILE>` | Catalog entries from a legacy dump. |
@@ -169,11 +169,42 @@ exist only in binaries built with `--features remanence-cli/foreign-bru`,
 and CI guards that the default dependency graph stays free of the legacy
 reader.
 
-**No `rem`/`rem-debug` command opens a whole v2 (HPKE) envelope end to
-end.** The only ways to fully decrypt a v2 object are the standalone
-[`rao-recover`](#rao-recover-standalone-recovery) binary, or a
-crate-internal call to `remanence-aead::open_envelope` (not exposed by
-either CLI).
+### Encryption flag matrix
+
+| Operation | Seal/open key input | Result |
+|---|---|---|
+| `archive build`, `archive write` | no recipient flags | Plaintext `rao-v1` body. |
+| `archive build`, `archive write` | `--recipient <RAOR>` repeated 2-8 times | Encrypted format version 2. Epoch ids must be distinct and slot order ascending. |
+| `archive reseal` | one matching `--private-key <RAOP>` plus one `--recipient` list containing 2-8 new RAOR files | v2→v2 recipient rotation. |
+| `archive inspect`, `archive export-object` | none | Keyless envelope inspection, or opaque stored-byte export. |
+| `archive extract`, `restore`, `archive read`, `archive verify` | `--private-key <RAOP>` for encrypted input | The private key's epoch id selects its matching key-frame slot. |
+| `archive extract-stream`, `archive covering-range` | `--private-key <RAOP>` | v2 streaming or bounded ranged open. |
+
+The retired `--encrypt`, `--key-file`, `--key-id`, and `--registry-key`
+flags are not compatibility aliases; Clap rejects them.
+
+### Encrypted report schemas
+
+`recipient_epochs` is consistently an ordered JSON array of objects shaped
+as `{"epoch_id":"<32 lowercase hex>","label":"<epoch label>"}`.
+
+- An encrypted `archive build` report has `representation: "encrypted"`,
+  `encryption: "RAO1"`, `format_version: 2`, `recipient_epochs`, stored and
+  plaintext digests/sizes, manifest digest, and file layout. The plaintext
+  form uses `format_version: null` and `recipient_epochs: null`.
+- Encrypted `archive inspect` is explicitly keyless (`keyed: false`) and
+  reports the object id, format version, recipients, salt, prefix geometry,
+  stored digest/size, and plaintext size/chunk count. It does not claim to
+  expose the encrypted manifest.
+- `archive reseal` reports `input_format_version: 2`,
+  `output_format_version: 2`, the new `recipient_epochs`, plaintext and
+  published stored digests, sizes, and `verified_after_write: true`.
+- Encrypted local-extract reports and tape-write locators carry
+  `recipient_epochs`. Direct tape read/verify receipts keep their existing
+  payload byte/hash fields; recipient provenance remains in the locator and
+  catalog. Whole-object `extract-stream` additionally reports
+  `format_version: 2`; ranged mode reports the recipients parsed from the
+  authenticated prefix and the authenticated-chunk/stored-range geometry.
 
 <!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/lib.rs @ 2a20106 -->
 ## rem-debug extras
@@ -196,10 +227,10 @@ journals):
 
 | Command | What it does |
 |---|---|
-| `rem-debug archive write --library <SERIAL> --file <PATH> --pool <POOL> [--encrypt ...] [--json]` | Write one local file to a pool-selected tape and emit a locator JSON line. |
-| `rem-debug archive read --library <SERIAL> --locator <JSON> --out <PATH>` | Read an object back by locator. |
+| `rem-debug archive write --library <SERIAL> --file <PATH> --pool <POOL> [--recipient <RAOR>]... [--json]` | Write one local file to a pool-selected tape. Repeating `--recipient` 2-8 times writes v2; omitting it writes plaintext. The locator includes `format_version` and `recipient_epochs`. |
+| `rem-debug archive read --library <SERIAL> --locator <JSON> --out <PATH> [--private-key <RAOP>]` | Read an object by locator; an encrypted copy requires the matching private key. |
 | `rem-debug archive export-object ...` | Export the complete stored object bytes (including envelope) by locator. |
-| `rem-debug archive verify --locator <JSON> --expected-sha256 <HEX>` | Stream and hash an object on tape against an expected digest, restoring nothing. |
+| `rem-debug archive verify --locator <JSON> --expected-sha256 <HEX> [--private-key <RAOP>]` | Stream and hash an object on tape against an expected digest, restoring nothing; encrypted copies require the matching private key. |
 | `rem-debug archive probe/scan/restore/recover --tape <SERIAL> --bay <BAY> [--rewind]` | Run the foreign-format driver directly against a mounted tape instead of a dump file. |
 | `rem-debug tape alerts --bay <BAY>` | Read the loaded drive's TapeAlert LOG SENSE page directly. |
 
@@ -232,23 +263,19 @@ simply not worth standing up: given one RAO object file and a key, it
 recovers plaintext members with nothing else.
 
 ```
-rao-recover --object <FILE> --out <DIR> (--private-key <FILE> | --registry-key <FILE>)
+rao-recover --object <FILE> --private-key <RAOP> --out <DIR>
             [--staging-dir <DIR>] [--overwrite]
 ```
 
-It reads the object's header directly (no daemon/catalog dependency),
-detects the format version itself, and dispatches accordingly:
-`--registry-key` opens a v1 (registry symmetric key) object;
-`--private-key` opens a v2 (HPKE) envelope using one recipient's private
-key — the two flags are mutually exclusive, and supplying the wrong one
-for the object's actual version fails with a message naming which
-recipient epoch labels the object actually wants. Decrypted plaintext is
+It parses the v2 header and key frame directly (no daemon/catalog
+dependency), selects the slot matching the private key's epoch id, and
+fails with a message naming the object recipient labels when none match.
+Decrypted plaintext is
 staged in a temporary file next to `--out` (or inside `--staging-dir` if
 given, never `/tmp`) and securely zeroed on drop before the restore
 completes. It validates the embedded object id against the header before
 writing files out, and refuses to overwrite existing output unless
 `--overwrite` is given.
 
-This is currently the **only** way to fully decrypt a v2 (HPKE) envelope
-end to end — neither `rem` nor `rem-debug` exposes an equivalent
-whole-object open for v2.
+Use this deliberately small binary when the full CLI stack is unavailable;
+ordinary local restores can use `rem archive extract --private-key`.

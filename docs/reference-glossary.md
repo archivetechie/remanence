@@ -15,22 +15,23 @@ manifest. Readable with stock `tar`.
 
 **RAO1** — the encrypted representation of an RAO object: a 128-byte
 header (magic `RAO1`), HKDF-SHA-256 key derivation, and a
-ChaCha20-Poly1305 STREAM over the tar bytes. Comes in two key-wrapping
-shapes sharing that same AEAD suite — see **format version 1/2** below.
+ChaCha20-Poly1305 STREAM over the tar bytes. The accepted representation
+is format version 2 with an HPKE recipient key frame.
 
-**format version 1 (registry key)** — the original RAO1 shape: the
-caller supplies one 32-byte symmetric root key (named by a 16-byte key
-id) that every reader must also hold. Produced by `rem archive build
---encrypt`.
+**format version 1 (reserved)** — a permanently unsupported RAO1 wire
+version retained only as a reserved version number. Current parsers reject
+it with `UnsupportedFormatVersion`; there is no compatibility reader,
+writer, recovery mode, or CLI flag for it.
 
 **format version 2 (HPKE envelope)** — a RAO1 shape with no shared
 secret: a fresh per-object **data-encryption key (DEK)** is generated
 and wrapped once per recipient with HPKE (RFC 9180, X25519-HKDF-SHA256-
 ChaCha20Poly1305) into a **key frame** (wire tag `RAOK`, 1-8 recipient
-slots) sitting between the header and the metadata frame. Produced only
-by `rem archive reseal` (a one-shot v1→v2 conversion); opened only by
-`rao-recover` or the crate-internal `open_envelope` function — neither
-`rem` nor `rem-debug` exposes a whole-object v2 open.
+slots accepted by readers) sitting between the header and metadata frame.
+Production sealers require 2-8 distinct recipient epochs. `archive build`,
+pool-selected `archive write`, and v2→v2 `archive reseal` produce it;
+`archive extract`/`restore`/`read`/`verify`, the streaming range commands,
+and `rao-recover` open it with a matching RAOP private key.
 
 **covering range** — the mapping, computed once by `remanence-aead`,
 from a requested plaintext byte range to the smallest span of AEAD
