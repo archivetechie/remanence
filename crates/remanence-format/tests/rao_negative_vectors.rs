@@ -94,6 +94,8 @@ fn aead_error_name(error: &RaoAeadError) -> &'static str {
         RaoAeadError::InvalidWrapSuite => "InvalidWrapSuite",
         RaoAeadError::InvalidKeyFrameLength => "InvalidKeyFrameLength",
         RaoAeadError::InvalidKeyFrame => "InvalidKeyFrame",
+        RaoAeadError::HpkeFailed => "HpkeFailed",
+        RaoAeadError::RecipientEpochMismatch => "RecipientEpochMismatch",
         RaoAeadError::InvalidChunkSize => "InvalidChunkSize",
         RaoAeadError::ReservedBytesNotZero => "ReservedBytesNotZero",
         RaoAeadError::InvalidSalt => "InvalidSalt",
@@ -1433,7 +1435,7 @@ fn run_envelope_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
         "chunk-size-zero" => sealed[8..12].copy_from_slice(&0u32.to_be_bytes()),
         "chunk-size-not-multiple-of-512" => sealed[8..12].copy_from_slice(&513u32.to_be_bytes()),
         "flags-nonzero" => sealed[15] = 1,
-        "reserved-bytes-nonzero" => sealed[0x10] = 1,
+        "reserved-bytes-nonzero" => sealed[0x39] = 1,
         "all-zero-hkdf-salt" => sealed[0x20..0x30].fill(0),
         "object-id-all-nul" => sealed[0x40..0x80].fill(0),
         "object-id-interior-nul" => {
@@ -1618,35 +1620,202 @@ fn v2_slot(index: u8, label: &str) -> RecipientSlot {
     }
 }
 
-fn base_v2_envelope() -> (Vec<u8>, usize) {
-    let key_frame = KeyFrame::new(vec![v2_slot(0, "safe"), v2_slot(1, "escrow")])
-        .unwrap()
-        .serialize()
-        .unwrap();
-    let header =
-        RaoHeader::new_v2_envelope(512, [0x22; 16], 17, "object-v2", key_frame.len() as u32)
-            .unwrap();
-    let mut object = header.serialize().unwrap().to_vec();
-    object.extend_from_slice(&key_frame);
-    object.extend_from_slice(&[0u8; 17]);
-    object.extend_from_slice(&[0u8; 512 + 16]);
-    object.extend_from_slice(RAO_FOOTER);
-    object.resize(object.len().div_ceil(512) * 512, 0);
-    (object, key_frame.len())
+fn parsed_key_frame(object: &[u8]) -> KeyFrame {
+    let inspected = inspect_bytes(object).expect("base v2 object inspects");
+    let end = 128 + inspected.header.key_frame_len as usize;
+    KeyFrame::parse(&object[128..end]).expect("base v2 key frame parses")
 }
 
-fn run_v2_envelope_case(id: &str) -> Result<(), RaoAeadError> {
-    let (mut object, key_frame_len) = base_v2_envelope();
+fn replace_key_frame(object: &[u8], key_frame: &KeyFrame) -> Vec<u8> {
+    let inspected = inspect_bytes(object).expect("base v2 object inspects");
+    let old_metadata_start = 128 + inspected.header.key_frame_len as usize;
+    let body_end = inspected.footer_offset as usize + RAO_FOOTER.len();
+    let key_frame_bytes = key_frame
+        .serialize()
+        .expect("replacement key frame serializes");
+    let header = RaoHeader::new_v2_envelope(
+        inspected.header.chunk_size,
+        inspected.header.hkdf_salt,
+        inspected.header.metadata_frame_len,
+        inspected.header.object_id,
+        key_frame_bytes.len() as u32,
+    )
+    .expect("replacement header serializes");
+    let mut replaced = header.serialize().unwrap().to_vec();
+    replaced.extend_from_slice(&key_frame_bytes);
+    replaced.extend_from_slice(&object[old_metadata_start..body_end]);
+    let stored_size = stored_size_from_parts(
+        header.chunk_size,
+        header.key_frame_len,
+        header.metadata_frame_len,
+        inspected.plaintext_size,
+    )
+    .expect("replacement geometry is valid") as usize;
+    replaced.resize(stored_size, 0);
+    replaced
+}
+
+fn deterministic_base_envelope() -> (Vec<u8>, RecipientPrivateKey) {
+    let plaintext = base_envelope_plaintext();
+    let (recipient, recipients) = recipient_pair();
+    let options = EnvelopeSealOptions {
+        common: base_seal_options(&plaintext),
+        recipients,
+    };
+    let mut sealed = Vec::new();
+    seal_deterministic_for_test_vectors(
+        Cursor::new(&plaintext),
+        &mut sealed,
+        &options,
+        DataEncryptionKey::from_bytes([0x5d; 32]),
+        [0xa7; 32],
+    )
+    .expect("base deterministic envelope seals");
+    (sealed, recipient)
+}
+
+fn one_slot_readable_envelope() -> (Vec<u8>, RecipientPrivateKey) {
+    let plaintext = base_envelope_plaintext();
+    let options = base_seal_options(&plaintext);
+    let (recipient, recipients) = recipient_pair();
+    let envelope_options = EnvelopeSealOptions {
+        common: options.clone(),
+        recipients,
+    };
+    let mut discarded = Vec::new();
+    let report = seal_deterministic_for_test_vectors(
+        Cursor::new(&plaintext),
+        &mut discarded,
+        &envelope_options,
+        DataEncryptionKey::from_bytes([0x5d; 32]),
+        [0xa7; 32],
+    )
+    .expect("two-slot source envelope seals");
+    let key_frame = KeyFrame::new(vec![report.key_frame.slots[0].clone()])
+        .expect("readable one-slot frame is structurally valid");
+    let key_frame_bytes = key_frame.serialize().unwrap();
+    let metadata = RaoMetadata::new(
+        options.plaintext_size,
+        options.plaintext_digest,
+        options.chunk_size,
+    )
+    .unwrap();
+    let metadata_plaintext = metadata.to_cbor_bytes(options.chunk_size).unwrap();
+    let salt = derive_salt_v2(
+        &[0x5d; 32],
+        &remanence_aead::header::object_id_field(&options.object_id).unwrap(),
+        &options.plaintext_digest,
+        &metadata_plaintext,
+    )
+    .unwrap();
+    let header = RaoHeader::new_v2_envelope(
+        options.chunk_size,
+        salt,
+        metadata_plaintext.len() as u64 + CHACHA20POLY1305_TAG_LEN,
+        options.object_id,
+        key_frame_bytes.len() as u32,
+    )
+    .unwrap();
+    let keys = derive_keys_v2(
+        &[0x5d; 32],
+        &salt,
+        &header.header_hash_with_key_frame(&key_frame_bytes).unwrap(),
+    )
+    .unwrap();
+    let mut sealed = header.serialize().unwrap().to_vec();
+    sealed.extend_from_slice(&key_frame_bytes);
+    sealed.extend_from_slice(&encrypt_metadata(&keys.metadata_key, &metadata_plaintext).unwrap());
+    let chunk_count = plaintext.len() / options.chunk_size as usize;
+    for (index, chunk) in plaintext
+        .chunks_exact(options.chunk_size as usize)
+        .enumerate()
+    {
+        sealed.extend_from_slice(
+            &encrypt_chunk(
+                &keys.payload_key,
+                index as u64,
+                index + 1 == chunk_count,
+                chunk,
+            )
+            .unwrap(),
+        );
+    }
+    sealed.extend_from_slice(RAO_FOOTER);
+    let stored_size = stored_size_from_parts(
+        header.chunk_size,
+        header.key_frame_len,
+        header.metadata_frame_len,
+        options.plaintext_size,
+    )
+    .unwrap() as usize;
+    sealed.resize(stored_size, 0);
+    (sealed, recipient)
+}
+
+fn writer_recipients(count: usize) -> Vec<RecipientPublicKey> {
+    (0..count)
+        .map(|index| {
+            RecipientPrivateKey::new(
+                [index as u8 + 1; 16],
+                format!("recipient-{index}"),
+                [index as u8 + 0x40; 32],
+            )
+            .unwrap()
+            .public_key(index as u8)
+            .unwrap()
+        })
+        .collect()
+}
+
+fn run_v2_envelope_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
+    if matches!(
+        id,
+        "v2-writer-zero-slots" | "v2-writer-one-slot" | "v2-writer-nine-slots"
+    ) {
+        let count = match id {
+            "v2-writer-zero-slots" => 0,
+            "v2-writer-one-slot" => 1,
+            "v2-writer-nine-slots" => 9,
+            _ => unreachable!(),
+        };
+        let plaintext = base_envelope_plaintext();
+        let options = EnvelopeSealOptions {
+            common: base_seal_options(&plaintext),
+            recipients: writer_recipients(count),
+        };
+        let mut output = Vec::new();
+        seal_deterministic_for_test_vectors(
+            Cursor::new(&plaintext),
+            &mut output,
+            &options,
+            DataEncryptionKey::from_bytes([0x5d; 32]),
+            [0xa7; 32],
+        )?;
+        return Ok(());
+    }
+
+    if id == "v2-reader-one-slot" {
+        let (object, recipient) = one_slot_readable_envelope();
+        let (opened, report) = open_to_vec(&object, &recipient)?;
+        assert_eq!(opened, base_envelope_plaintext());
+        assert_eq!(report.key_frame.slots.len(), 1);
+        return Ok(());
+    }
+
+    let (mut object, recipient) = deterministic_base_envelope();
+    let key_frame_len = inspect_bytes(&object)?.header.key_frame_len as usize;
     match id {
         "v2-version-flip" => object[6] = 1,
         "v2-suite-flip" => object[0x38] = 0xff,
         "v2-truncated-key-frame" => object.truncate(128 + key_frame_len - 1),
         "v2-duplicate-slots" => {
-            let second_slot = 128 + 5 + 98 + "safe".len();
+            let frame = parsed_key_frame(&object);
+            let second_slot = 128 + 5 + 98 + frame.slots[0].epoch_label.len();
             object[second_slot] = 0;
         }
         "v2-misordered-slots" => {
-            let second_slot = 128 + 5 + 98 + "safe".len();
+            let frame = parsed_key_frame(&object);
+            let second_slot = 128 + 5 + 98 + frame.slots[0].epoch_label.len();
             object[128 + 5] = 2;
             object[second_slot] = 1;
         }
@@ -1657,9 +1826,75 @@ fn run_v2_envelope_case(id: &str) -> Result<(), RaoAeadError> {
         "v2-oversize-key-frame" => {
             object[0x3c..0x40].copy_from_slice(&4097u32.to_be_bytes());
         }
+        "v2-key-frame-label-tamper" => {
+            let mut frame = parsed_key_frame(&object);
+            frame.slots[0].epoch_label.replace_range(0..1, "P");
+            object = replace_key_frame(&object, &frame);
+        }
+        "v2-key-frame-enc-tamper" => {
+            let mut frame = parsed_key_frame(&object);
+            frame.slots[0].enc[0] ^= 1;
+            object = replace_key_frame(&object, &frame);
+        }
+        "v2-key-frame-ciphertext-tamper" => {
+            let mut frame = parsed_key_frame(&object);
+            frame.slots[0].ciphertext[0] ^= 1;
+            object = replace_key_frame(&object, &frame);
+        }
+        "v2-key-frame-slot-inserted" => {
+            let mut frame = parsed_key_frame(&object);
+            frame.slots.push(v2_slot(2, "inserted"));
+            object = replace_key_frame(&object, &KeyFrame::new(frame.slots).unwrap());
+        }
+        "v2-key-frame-slot-removed" => {
+            let mut frame = parsed_key_frame(&object);
+            frame.slots.pop();
+            object = replace_key_frame(&object, &KeyFrame::new(frame.slots).unwrap());
+        }
+        "v2-slot-count-zero" => object[128 + 4] = 0,
+        "v2-slot-count-nine" => object[128 + 4] = 9,
+        "v2-wrap-suite-zero-nonempty" => object[0x38] = 0,
+        "v2-hpke-zero-key-frame-len" => object[0x3c..0x40].copy_from_slice(&0u32.to_be_bytes()),
+        "v2-hpke-undersized-key-frame-len" => {
+            object[0x3c..0x40].copy_from_slice(&102u32.to_be_bytes());
+        }
+        "v2-duplicate-recipient-epoch-id" => {
+            let frame = parsed_key_frame(&object);
+            let second_slot = 128 + 5 + 98 + frame.slots[0].epoch_label.len();
+            let first_epoch = object[128 + 6..128 + 22].to_vec();
+            object[second_slot + 1..second_slot + 17].copy_from_slice(&first_epoch);
+        }
+        "v2-internal-slot-truncation" => {
+            let frame = parsed_key_frame(&object);
+            let second_slot = 128 + 5 + 98 + frame.slots[0].epoch_label.len();
+            object[second_slot + 17] = 32;
+        }
+        "v2-nonzero-reserved-key-region" => object[0x10] = 1,
+        "v2-malformed-key-frame-magic" => object[128] = b'X',
+        "v2-wrong-recipient-private-key" => {
+            let wrong = RecipientPrivateKey::new([0x31; 16], "primary-2026", [0x43; 32]).unwrap();
+            open_to_vec(&object, &wrong)?;
+            return Ok(());
+        }
+        "v2-malformed-encapsulation" => {
+            let mut frame = parsed_key_frame(&object);
+            frame.slots[0].enc.fill(0);
+            object = replace_key_frame(&object, &frame);
+        }
         other => panic!("unhandled v2 envelope negative vector {other:?}"),
     }
-    inspect_bytes(&object)?;
+
+    match operation {
+        "inspect" => {
+            inspect_bytes(&object)?;
+        }
+        "open" => {
+            open_to_vec(&object, &recipient)?;
+        }
+        "seal" => panic!("case {id:?} did not return from its seal branch"),
+        "read" => panic!("case {id:?} did not return from its read branch"),
+        other => panic!("unhandled v2 envelope operation {other:?} for case {id:?}"),
+    }
     Ok(())
 }
 
@@ -1847,15 +2082,42 @@ fn envelope_v2_negative_vectors_match_manifest_errors() {
             "v2-misordered-slots",
             "v2-key-frame-trailing-byte",
             "v2-oversize-key-frame",
+            "v2-key-frame-label-tamper",
+            "v2-key-frame-enc-tamper",
+            "v2-key-frame-ciphertext-tamper",
+            "v2-key-frame-slot-inserted",
+            "v2-key-frame-slot-removed",
+            "v2-slot-count-zero",
+            "v2-slot-count-nine",
+            "v2-writer-zero-slots",
+            "v2-writer-one-slot",
+            "v2-writer-nine-slots",
+            "v2-reader-one-slot",
+            "v2-wrap-suite-zero-nonempty",
+            "v2-hpke-zero-key-frame-len",
+            "v2-hpke-undersized-key-frame-len",
+            "v2-duplicate-recipient-epoch-id",
+            "v2-internal-slot-truncation",
+            "v2-nonzero-reserved-key-region",
+            "v2-malformed-key-frame-magic",
+            "v2-wrong-recipient-private-key",
+            "v2-malformed-encapsulation",
         ],
     );
     for case in cases(&fixture) {
         let id = str_field(case, "id");
-        let error = run_v2_envelope_case(id).unwrap_err();
-        assert_eq!(
-            aead_error_name(&error),
-            str_field(case, "expected_error"),
-            "{id}: {error}"
-        );
+        let operation = str_field(case, "operation");
+        let result = run_v2_envelope_case(id, operation);
+        if let Some(expected) = case.get("expected_error") {
+            let error = result.unwrap_err();
+            assert_eq!(
+                aead_error_name(&error),
+                expected.as_str().expect("expected_error is text"),
+                "{id}: {error}"
+            );
+        } else {
+            assert_eq!(str_field(case, "expected_outcome"), "accepted");
+            result.unwrap_or_else(|error| panic!("{id}: expected acceptance, got {error}"));
+        }
     }
 }

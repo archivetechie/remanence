@@ -1,6 +1,6 @@
 {
   "vector_set": "RAO-NEG-WRITER-1",
-  "spec_section": "13.5",
+  "spec_section": "13.6",
   "status": "complete",
   "scope": "plaintext writer-side vectors executable through public RAO writer APIs",
   "cases": [

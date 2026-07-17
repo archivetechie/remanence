@@ -1,6 +1,6 @@
 {
   "vector_set": "RAO-NEG-PLAINTEXT-READER-1",
-  "spec_section": "13.5",
+  "spec_section": "13.6",
   "status": "complete",
   "scope": "plaintext reader-side byte vectors executable against materializing, streaming, or restore-mode RAO readers",
   "base": {
