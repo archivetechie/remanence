@@ -1013,7 +1013,7 @@ enum Command {
     },
 
     /// Query the daemon audit log.
-    #[command(name = "audit")]
+    #[command(name = "audit", hide = true)]
     AuditClient {
         /// Daemon gRPC endpoint URI.
         #[arg(
@@ -1032,7 +1032,7 @@ enum Command {
     },
 
     /// Query and mutate daemon drive stewardship state.
-    #[command(name = "drive")]
+    #[command(name = "drive", hide = true)]
     DriveClient {
         /// Daemon gRPC endpoint URI.
         #[arg(
@@ -1051,7 +1051,7 @@ enum Command {
     },
 
     /// List or acknowledge standing daemon alarms.
-    #[command(name = "alarms")]
+    #[command(name = "alarms", hide = true)]
     AlarmsClient {
         /// Daemon gRPC endpoint URI.
         #[arg(
@@ -1073,6 +1073,7 @@ enum Command {
     },
 
     /// Live top view over daemon state.
+    #[command(hide = true)]
     Top {
         /// Daemon gRPC endpoint URI.
         #[arg(
@@ -14750,6 +14751,59 @@ mod tests {
                 "rem archive help should expose {command}:\n{help}"
             );
         }
+    }
+
+    #[test]
+    fn top_level_help_and_mode_gates_agree_for_rem_and_rem_debug() {
+        let rem_help = command_help(Cli::command());
+        assert!(rem_help.contains("\n  audit"), "{rem_help}");
+        assert!(rem_help.contains("\n  drive"), "{rem_help}");
+        assert!(!rem_help.contains("\n  load"), "{rem_help}");
+
+        let debug_help = command_help(DebugCli::command());
+        assert!(debug_help.contains("\n  load"), "{debug_help}");
+        assert!(!debug_help.contains("\n  audit"), "{debug_help}");
+        assert!(!debug_help.contains("\n  drive"), "{debug_help}");
+
+        let rem_audit: ParsedCli = Cli::parse_from([
+            "rem",
+            "audit",
+            "query",
+            "--since",
+            "2026-07-18T00:00:00Z",
+            "--until",
+            "2026-07-19T00:00:00Z",
+        ])
+        .into();
+        assert!(rem_debug_only_reason(&rem_audit.command).is_none());
+
+        let debug_load: ParsedCli = DebugCli::parse_from([
+            "rem-debug",
+            "load",
+            "LIB",
+            "--slot",
+            "0x0400",
+            "--bay",
+            "0x0100",
+        ])
+        .into();
+        assert!(rem_only_reason(&debug_load.command).is_none());
+
+        let hidden_rem_load: ParsedCli =
+            Cli::parse_from(["rem", "load", "LIB", "--slot", "0x0400", "--bay", "0x0100"]).into();
+        assert!(rem_debug_only_reason(&hidden_rem_load.command).is_some());
+
+        let hidden_debug_audit: ParsedCli = DebugCli::parse_from([
+            "rem-debug",
+            "audit",
+            "query",
+            "--since",
+            "2026-07-18T00:00:00Z",
+            "--until",
+            "2026-07-19T00:00:00Z",
+        ])
+        .into();
+        assert!(rem_only_reason(&hidden_debug_audit.command).is_some());
     }
 
     #[test]

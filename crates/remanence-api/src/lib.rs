@@ -2541,7 +2541,7 @@ impl TryFrom<pb::QueryAuditRequest> for AuditQuery {
         let mut filter = BTreeMap::new();
         for (raw_key, raw_value) in request.filter {
             let key = raw_key.trim().to_ascii_lowercase();
-            let value = raw_value.trim().to_string();
+            let mut value = raw_value.trim().to_string();
             if value.is_empty() {
                 return Err(Status::invalid_argument(format!(
                     "audit filter {raw_key:?} must not be empty"
@@ -2549,9 +2549,11 @@ impl TryFrom<pb::QueryAuditRequest> for AuditQuery {
             }
             match key.as_str() {
                 "session_id" | "operation_id" => {
-                    Uuid::parse_str(value.as_str()).map_err(|_| {
-                        Status::invalid_argument(format!("audit filter {key} must be a UUID"))
-                    })?;
+                    value = Uuid::parse_str(value.as_str())
+                        .map_err(|_| {
+                            Status::invalid_argument(format!("audit filter {key} must be a UUID"))
+                        })?
+                        .to_string();
                 }
                 "event_kind" | "event" | "kind" | "actor" | "source_layer" | "subject_kind"
                 | "subject_id" => {}
@@ -2590,14 +2592,23 @@ fn audit_entry_stream(audit_dir: PathBuf, query: AuditQuery) -> AuditEntryStream
     let (tx, rx) = tokio::sync::mpsc::channel(AUDIT_STREAM_BUFFER);
     tokio::task::spawn_blocking(move || {
         let result = (|| -> Result<(), Status> {
-            let records = FileAuditLog::replay(&audit_dir).map_err(status_from_state_error)?;
-            for record in records {
-                if !audit_record_matches(&record, &query)? {
-                    continue;
+            let mut match_error = None;
+            FileAuditLog::replay_incremental(&audit_dir, |record| {
+                let matched = match audit_record_matches(&record, &query) {
+                    Ok(matched) => matched,
+                    Err(status) => {
+                        match_error = Some(status);
+                        return ControlFlow::Break(());
+                    }
+                };
+                if !matched {
+                    return ControlFlow::Continue(());
                 }
-                if send_stream_item(&tx, audit_record_to_proto(record)).is_break() {
-                    return Ok(());
-                }
+                send_stream_item(&tx, audit_record_to_proto(record))
+            })
+            .map_err(status_from_state_error)?;
+            if let Some(status) = match_error {
+                return Err(status);
             }
             Ok(())
         })();
@@ -4628,6 +4639,9 @@ mod tests {
     use remanence_aead::{RecipientPrivateKey, RecipientPublicKey};
     #[cfg(feature = "foreign-bru")]
     use remanence_bru::{bru_checksum, BRU_BLOCK_SIZE};
+    use remanence_chaos::model::{
+        DeviceRole, ModelTransport, Record as VirtualRecord, VirtualTape, VirtualWorld,
+    };
     use remanence_format::{read_encrypted_rao_object, read_rem_tar_object};
     use remanence_library::scsi::{DeviceType, Inquiry};
     use remanence_library::{
@@ -8810,6 +8824,137 @@ BCw3Wyv2UWY=
         actor.await.expect("mock drive actor joins");
     }
 
+    #[tokio::test]
+    async fn drive_target_read_open_uses_virtual_world_actor_and_proves_bot_identity() {
+        const LIBRARY_SERIAL: &str = "LIB-DRIVE-TARGET";
+        const DRIVE_SERIAL: &str = "DRV-DRIVE-TARGET";
+        const BAY: u16 = 1;
+        const SLOT: u16 = 0x03e9;
+
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-api-drive-target-actor")
+            .tempdir()
+            .expect("temp dir");
+        let mut index =
+            CatalogIndex::open(temp.path().join("state.sqlite")).expect("open test catalog");
+        project_pool(&mut index, "camera.copy-a");
+        project_no_parity_tape(&mut index, "camera.copy-a", TAPE_UUID);
+
+        let barcode = format!("RMN{:03}L9", TAPE_UUID[0]);
+        let bootstrap = no_parity_bootstrap_block(TAPE_UUID);
+        let mut tape = VirtualTape::empty(64 * 1024 * 1024, API_SESSION_BLOCK_SIZE);
+        tape.written_bytes = bootstrap.len() as u64;
+        tape.records.push(VirtualRecord::Block(bootstrap));
+        let mut virtual_world =
+            VirtualWorld::single_drive(LIBRARY_SERIAL, BAY, DRIVE_SERIAL, SLOT, 1);
+        virtual_world.put_tape_in_drive(BAY, barcode, None, tape);
+        let world = Arc::new(Mutex::new(virtual_world));
+
+        let discovered_library = world.lock().expect("virtual world lock").library_snapshot();
+        let report = DiscoveryReport {
+            libraries: vec![discovered_library.clone()],
+            warnings: Vec::new(),
+        };
+        let policy = remanence_library::StaticAllowlist::new([LIBRARY_SERIAL]);
+        let actor_world = Arc::clone(&world);
+        let mut library = discovered_library
+            .open_with(&policy, move |path| {
+                let role = actor_world
+                    .lock()
+                    .expect("virtual world lock")
+                    .role_for_path(path)
+                    .expect("known virtual device path");
+                Ok::<_, remanence_library::IoErrorKind>(Box::new(ModelTransport::new(
+                    Arc::clone(&actor_world),
+                    role,
+                ))
+                    as Box<dyn remanence_library::SgTransport>)
+            })
+            .expect("open virtual library");
+        let drive = library
+            .open_drive(BAY, &policy)
+            .expect("open virtual drive");
+        let library_snapshot = Arc::new(RwLock::new(Arc::new(LibrarySnapshot {
+            report: report.clone(),
+            captured_at: OffsetDateTime::UNIX_EPOCH,
+        })));
+        let reservations = Arc::new(HashMap::from([(BAY, AtomicBool::new(false))]));
+
+        let mut state = ApiState::new(index);
+        let owner_config = crate::write_owner::WriteOwnerConfig {
+            index_path: state.index_path.as_ref().clone(),
+            report,
+            policy,
+            audit_dir: state.audit_dir.as_ref().clone(),
+            audit_fsync: false,
+            audit_append_lock: Arc::clone(&state.audit_append_lock),
+            reservations: Arc::clone(&reservations),
+            default_library_serial: Some(LIBRARY_SERIAL.to_string()),
+            library_snapshot: Arc::clone(&library_snapshot),
+            snapshot_miss_alarm: 1,
+            managed_library_serials: Arc::new(HashSet::from([LIBRARY_SERIAL.to_string()])),
+            cleaning: remanence_state::CleaningConfig::default(),
+            tape_io: remanence_state::TapeIoConfig::default(),
+            io_memory: crate::io_memory::IoMemoryReservation::new(
+                remanence_state::DEFAULT_IO_MEMORY_CEILING_BYTES,
+            )
+            .expect("test I/O memory manager"),
+        };
+        let drive_tx = crate::write_owner::spawn_drive_actor(BAY, drive, owner_config.clone());
+        let changer_tx =
+            crate::write_owner::spawn_changer_actor(library.into_changer(), owner_config);
+        state.drive_pool = Some(crate::write_owner::DrivePool::new(
+            changer_tx,
+            HashMap::from([(BAY, drive_tx)]),
+            reservations,
+        ));
+        state.default_library_serial = Some(Arc::new(LIBRARY_SERIAL.to_string()));
+        state.library_snapshot = Some(library_snapshot);
+
+        let opened = pb::read_session_service_server::ReadSessionService::open_read_session(
+            &state.read_session_service(),
+            Request::new(drive_target_request("camera.copy-a")),
+        )
+        .await
+        .expect("open read session through real drive actor")
+        .into_inner();
+
+        assert_eq!(opened.tape_uuid, TAPE_UUID);
+        assert_eq!(opened.drive_element_address, u32::from(BAY));
+        let drive_opcodes = world
+            .lock()
+            .expect("virtual world lock")
+            .command_log
+            .iter()
+            .filter_map(|command| {
+                matches!(command.role, DeviceRole::Drive { bay: BAY }).then_some(command.opcode)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            drive_opcodes.contains(&0x00),
+            "actor must prove media readiness with TEST UNIT READY: {drive_opcodes:?}"
+        );
+        assert!(
+            drive_opcodes.contains(&0x01) && drive_opcodes.contains(&0x08),
+            "actor must rewind and read the BOT bootstrap identity: {drive_opcodes:?}"
+        );
+
+        let closed = pb::read_session_service_server::ReadSessionService::close_read_session(
+            &state.read_session_service(),
+            Request::new(pb::CloseReadSessionRequest {
+                session_id: opened.session_id,
+                idempotency_key: None,
+            }),
+        )
+        .await
+        .expect("close real-actor read session")
+        .into_inner();
+        assert_eq!(
+            closed.state,
+            pb::read_session::State::ReadSessionStateClosed as i32
+        );
+    }
+
     #[test]
     fn drive_target_read_errors_are_precise_and_pool_guard_is_enforced() {
         let (empty, _rx) = drive_target_test_state(false, None, false);
@@ -8944,6 +9089,38 @@ BCw3Wyv2UWY=
             .map(|record| record.sequence)
             .collect::<Vec<_>>();
         assert_eq!(matched, vec![2]);
+    }
+
+    #[test]
+    fn audit_query_uuid_filters_canonicalize_uppercase_and_unhyphenated_inputs() {
+        let session_id =
+            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("session UUID");
+        let operation_id =
+            Uuid::parse_str("a987fbc9-4bed-4078-8f07-9141ba07c9f3").expect("operation UUID");
+        let query = AuditQuery::try_from(pb::QueryAuditRequest {
+            since: None,
+            until: None,
+            filter: HashMap::from([
+                (
+                    "session_id".to_string(),
+                    session_id.to_string().to_ascii_uppercase(),
+                ),
+                (
+                    "operation_id".to_string(),
+                    operation_id.simple().to_string(),
+                ),
+            ]),
+        })
+        .expect("non-canonical UUID spellings are valid filters");
+        let record = audit_test_record(
+            1,
+            "2026-07-18T10:30:00Z",
+            Some(session_id),
+            Some(operation_id),
+            AuditEvent::OperationFailed,
+        );
+
+        assert!(audit_record_matches(&record, &query).expect("match canonical UUIDs"));
     }
 
     #[tokio::test]
