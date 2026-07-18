@@ -108,11 +108,15 @@ stored bytes hold those twenty seconds and reading only them, even from
 an encrypted copy) are load-bearing in the *same* format, rather than
 traded off against each other.
 
-The formats themselves are content-agnostic. Nothing in them knows what a
-video file is; the design pressure came from high-bitrate media, but a
-telescope's nightly output, a sequencing run, or a courtroom's records
-archive the same way. If your data is large, fixed once written, and must
-both survive and stay reachable, the shape fits.
+The formats themselves are content-agnostic, but it is honest to say what
+they were tuned for: they carry no compression of their own, because the
+design assumed video and other already-compressed media, where compression
+would buy nothing and would destroy the range arithmetic (Section 8). A
+telescope's nightly output or a sequencing run fits exactly as well. Data
+that *is* highly compressible — text, logs, records — should be compressed
+*before* it reaches the archive, as part of ingest; it then archives the
+same way as everything else. If your data is large, fixed once written,
+and must both survive and stay reachable, the shape fits.
 
 ## 4. The bets
 
@@ -152,6 +156,25 @@ stored bytes. Verification is therefore always a mechanical comparison, and
 
 An RAO object ("Rem Archive Object") bundles a set of files — typically the
 contents of one camera card or one submission — into a single unit.
+
+**Bundling is not a convenience; it is how tape survives real data.** A
+tape drive is magnificent at one thing: streaming large amounts of data
+without stopping. Ask it to handle a million four-kilobyte files
+individually and everything collapses — the drive stops and repositions
+constantly, throughput falls off a cliff, and the catalog bloats with a
+million fingerprint records for cache fragments nobody will ever restore
+one at a time. Real collections are full of exactly that: an editing
+application's cache directory, the sweepings of a decommissioned laptop, a
+project folder with ten thousand thumbnails. The format answers at two
+levels. First, the object itself: many files become one large,
+tape-friendly unit, written as a single stream. Second, **wrapping**: at
+ingest, rules can direct that a pathological subtree — that cache
+directory, that thumbnail forest — be wrapped into a *single member* with
+one fingerprint and its own internal listing. The wrapped subtree can
+still be restored whole, or opened and picked from when someone really
+does need one file out of it, but it costs the tape one stream and the
+manifest one record instead of ten thousand. What deserves individual
+identity keeps it; what doesn't is carried honestly in bulk.
 
 **It is a tar file with discipline.** The object is a POSIX pax tar stream,
 which is the modern, standardized flavor of tar. Two rules give it its
@@ -262,8 +285,12 @@ So, as objects stream to tape, the writer accumulates Reed–Solomon
 parity — the same mathematical family that lets a scratched CD play — over
 fixed groups of blocks, and writes it in *separate* tape files at natural
 boundaries, physically elsewhere on the tape than the blocks it protects.
-The default geometry tolerates roughly half a gigabyte of *contiguous*
-unreadable tape in each protected region, repairable by mathematics alone.
+How much damage it absorbs is a
+tunable geometry, not a fixed promise — at today's defaults, hundreds of
+megabytes of *contiguous* unreadable tape per protected region, repairable
+by mathematics alone — and the geometry is recorded on the tape itself, so
+the numbers can grow with cartridge capacities. The format is designed to
+outlive any particular LTO generation; nothing in it assumes one.
 
 **The bootstrap makes the tape self-starting.** At the beginning of the
 tape — and again at checkpoints and at the end — sits a bootstrap block: the
@@ -274,21 +301,25 @@ bootstrap copy, rebuild the map, verify it cryptographically, repair damaged
 blocks from parity, then read objects. Every step is specified; none
 requires a database, a catalog, or any prior knowledge of the tape.
 
-And because a latent bug in one writer could corrupt every copy it ever
-wrote in the same way, the intended deployment keeps one copy in a
+One further practice belongs here, though it is a **recommendation, not
+part of the formats**: because a latent bug in one writer could corrupt
+every copy it ever wrote in the same way, we suggest keeping one copy in a
 *different* format written by *different* code — format diversity as the
-last line of defense. That copy is out of scope of these specifications, but
-it is part of the same philosophy: no single artifact, program, or database
-may be a single point of failure for the archive.
+last line of defense. Nothing in the specifications requires or describes
+this; it is simply the same philosophy taken one step further — no single
+artifact, program, or database should be a single point of failure for the
+archive.
 
 ## 8. What the formats refuse to do
 
 Restraint is a feature. Some notable refusals, and their reasons:
 
-- **No compression.** The payload is overwhelmingly already-compressed
-  media, so there is little to gain — and whole-stream compression would
-  destroy the closed-form arithmetic of Bet 4, because any byte's position
-  would depend on decompressing everything before it.
+- **No compression.** The expected payload is already-compressed media,
+  so there is little to gain — and whole-stream compression would destroy
+  the closed-form arithmetic of Bet 4, because any byte's position would
+  depend on decompressing everything before it. Compressible data belongs
+  in the pipeline *before* the archive: compress at ingest, then archive
+  the result (Section 3).
 - **No re-keying in place.** You cannot swap an encrypted object's
   recipients by editing its header, because the header is
   cryptographically bound to the object. Changing the audience means
