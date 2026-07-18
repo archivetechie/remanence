@@ -217,10 +217,12 @@ fn rem_debug_only_reason(cmd: &Command) -> Option<&'static str> {
         | Command::DaemonClient { .. }
         | Command::OperationClient { .. }
         | Command::CatalogClient { .. }
+        | Command::AuditClient { .. }
         | Command::DriveClient { .. }
         | Command::AlarmsClient { .. }
         | Command::Top { .. }
         | Command::TapeAlertsAlias { .. }
+        | Command::ArchiveVerifyClient { .. }
         | Command::Tape { .. } => None,
     }
 }
@@ -230,10 +232,12 @@ fn rem_only_reason(cmd: &Command) -> Option<&'static str> {
         Command::DaemonClient { .. }
         | Command::OperationClient { .. }
         | Command::CatalogClient { .. }
+        | Command::AuditClient { .. }
         | Command::DriveClient { .. }
         | Command::AlarmsClient { .. }
         | Command::Top { .. }
-        | Command::TapeAlertsAlias { .. } => Some("daemon client commands"),
+        | Command::TapeAlertsAlias { .. }
+        | Command::ArchiveVerifyClient { .. } => Some("daemon client commands"),
         Command::Libraries { .. }
         | Command::Library { .. }
         | Command::Move { .. }
@@ -426,6 +430,24 @@ enum RemCommand {
         command: CatalogClientCommand,
     },
 
+    /// Query the daemon's append-only audit log.
+    Audit {
+        /// Daemon gRPC endpoint URI.
+        #[arg(
+            long,
+            value_name = "URI",
+            default_value = DEFAULT_DAEMON_ENDPOINT,
+            global = true
+        )]
+        endpoint: String,
+        /// Emit one JSON object per audit entry.
+        #[arg(long, global = true)]
+        json: bool,
+        /// Audit command to run.
+        #[command(subcommand)]
+        command: AuditClientCommand,
+    },
+
     /// Query and mutate daemon drive stewardship state.
     Drive {
         /// Daemon gRPC endpoint URI.
@@ -561,6 +583,15 @@ impl From<RemCommand> for Command {
                 json,
                 command,
             },
+            RemCommand::Audit {
+                endpoint,
+                json,
+                command,
+            } => Self::AuditClient {
+                endpoint,
+                json,
+                command,
+            },
             RemCommand::Drive {
                 endpoint,
                 json,
@@ -600,9 +631,7 @@ impl From<RemCommand> for Command {
                     command: other.into(),
                 },
             },
-            RemCommand::Archive { command } => Self::Archive {
-                command: Box::new(command.into()),
-            },
+            RemCommand::Archive { command } => command.into_command(),
             RemCommand::Restore(args) => Self::Archive {
                 command: Box::new(ArchiveCommand::Extract(args.into())),
             },
@@ -636,10 +665,12 @@ fn state_changing_target(cmd: &Command) -> Option<&str> {
         | Command::DaemonClient { .. }
         | Command::OperationClient { .. }
         | Command::CatalogClient { .. }
+        | Command::AuditClient { .. }
         | Command::DriveClient { .. }
         | Command::AlarmsClient { .. }
         | Command::Top { .. }
         | Command::TapeAlertsAlias { .. }
+        | Command::ArchiveVerifyClient { .. }
         | Command::Tape { .. } => None,
     }
 }
@@ -981,6 +1012,25 @@ enum Command {
         command: CatalogClientCommand,
     },
 
+    /// Query the daemon audit log.
+    #[command(name = "audit")]
+    AuditClient {
+        /// Daemon gRPC endpoint URI.
+        #[arg(
+            long,
+            value_name = "URI",
+            default_value = DEFAULT_DAEMON_ENDPOINT,
+            global = true
+        )]
+        endpoint: String,
+        /// Emit one JSON object per audit entry.
+        #[arg(long, global = true)]
+        json: bool,
+        /// Audit command to run.
+        #[command(subcommand)]
+        command: AuditClientCommand,
+    },
+
     /// Query and mutate daemon drive stewardship state.
     #[command(name = "drive")]
     DriveClient {
@@ -1063,6 +1113,16 @@ enum Command {
         /// Archive operation to run.
         #[command(subcommand)]
         command: Box<ArchiveCommand>,
+    },
+
+    /// Verify an object through a read session pinned to a chosen drive.
+    #[command(name = "archive-verify-client", hide = true)]
+    ArchiveVerifyClient {
+        endpoint: String,
+        library: String,
+        drive: u16,
+        locator: String,
+        expected_sha256: String,
     },
 
     /// Development-only hardware helpers.
@@ -1163,6 +1223,9 @@ enum CatalogClientCommand {
 
 #[derive(Subcommand, Debug)]
 enum DriveClientCommand {
+    /// Load a selected tape into a selected drive bay and wait for completion.
+    Load(DriveLoadArgs),
+
     /// List cataloged drives.
     List {
         /// Include foreign drives.
@@ -1213,6 +1276,47 @@ enum DriveClientCommand {
     Clean {
         /// Drive serial or UUID.
         drive: String,
+    },
+}
+
+#[derive(Args, Debug)]
+#[command(group(
+    clap::ArgGroup::new("source")
+        .required(true)
+        .multiple(false)
+        .args(["barcode", "slot"])
+))]
+struct DriveLoadArgs {
+    /// Library serial or UUID.
+    #[arg(long, value_name = "LIBRARY")]
+    library: String,
+
+    /// Tape barcode to find in the current slot inventory.
+    #[arg(long, value_name = "BARCODE")]
+    barcode: Option<String>,
+
+    /// Source slot element address.
+    #[arg(long, value_parser = parse_element_addr)]
+    slot: Option<u16>,
+
+    /// Destination drive bay element address.
+    #[arg(long, value_parser = parse_element_addr)]
+    bay: u16,
+}
+
+#[derive(Subcommand, Debug)]
+enum AuditClientCommand {
+    /// Stream entries in the half-open interval [since, until).
+    Query {
+        /// Inclusive RFC3339 lower bound.
+        #[arg(long, value_name = "RFC3339")]
+        since: String,
+        /// Exclusive RFC3339 upper bound.
+        #[arg(long, value_name = "RFC3339")]
+        until: String,
+        /// Exact-match filter in k=v form; repeat for multiple fields.
+        #[arg(long = "filter", value_name = "K=V")]
+        filters: Vec<String>,
     },
 }
 
@@ -1791,8 +1895,7 @@ enum RemArchiveCommand {
     #[command(name = "export-object", hide = true)]
     ExportObject(RemArchiveExportObjectArgs),
 
-    /// Compatibility parser for direct local archive verification.
-    #[command(hide = true)]
+    /// Verify an object through the tape currently loaded in a chosen drive.
     Verify(RemArchiveVerifyArgs),
 
     /// List native objects from the local catalog (no tape access).
@@ -2087,9 +2190,17 @@ struct RemArchiveExportObjectArgs {
 /// Arguments for `rem archive verify`.
 #[derive(Args, Debug)]
 struct RemArchiveVerifyArgs {
-    /// Library serial for the physical tape library.
-    #[arg(long, value_name = "SERIAL")]
+    /// Daemon gRPC endpoint URI.
+    #[arg(long, value_name = "URI", default_value = DEFAULT_DAEMON_ENDPOINT)]
+    endpoint: String,
+
+    /// Library serial or UUID.
+    #[arg(long, value_name = "LIBRARY")]
     library: String,
+
+    /// Drive bay containing the tape to verify.
+    #[arg(long, value_parser = parse_element_addr)]
+    drive: u16,
 
     /// Canonical locator JSON emitted by `archive write --json`.
     #[arg(long, value_name = "JSON")]
@@ -2098,14 +2209,6 @@ struct RemArchiveVerifyArgs {
     /// Expected payload SHA-256 (hex) to compare the tape bytes against.
     #[arg(long, value_name = "HEX")]
     expected_sha256: String,
-
-    /// Canonical RAOP private-key file. Required for encrypted copies.
-    #[arg(long, value_name = "PATH")]
-    private_key: Option<PathBuf>,
-
-    /// Path to `/etc/rem/config.toml`.
-    #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
-    config: PathBuf,
 }
 
 /// Arguments for `rem archive list`.
@@ -2184,25 +2287,36 @@ struct RemArchiveSourceArgs {
     rewind: bool,
 }
 
-impl From<RemArchiveCommand> for ArchiveCommand {
-    fn from(value: RemArchiveCommand) -> Self {
-        match value {
-            RemArchiveCommand::Capabilities => Self::Capabilities,
-            RemArchiveCommand::Reseal(args) => Self::Reseal(args),
-            RemArchiveCommand::Build(args) => Self::Build(args.into()),
-            RemArchiveCommand::Inspect(args) => Self::Inspect(args.into()),
-            RemArchiveCommand::Extract(args) => Self::Extract(args.into()),
-            RemArchiveCommand::ExtractStream(args) => Self::ExtractStream(args.into()),
-            RemArchiveCommand::CoveringRange(args) => Self::CoveringRange(args.into()),
-            RemArchiveCommand::Probe(args) => Self::Probe(args.into()),
-            RemArchiveCommand::Scan(args) => Self::Scan(args.into()),
-            RemArchiveCommand::Restore(args) => Self::Restore(args.into()),
-            RemArchiveCommand::Recover(args) => Self::Recover(args.into()),
-            RemArchiveCommand::Write(args) => Self::Write(args.into()),
-            RemArchiveCommand::Read(args) => Self::Read(args.into()),
-            RemArchiveCommand::ExportObject(args) => Self::ExportObject(args.into()),
-            RemArchiveCommand::Verify(args) => Self::Verify(args.into()),
-            RemArchiveCommand::List(args) => Self::List(args.into()),
+impl RemArchiveCommand {
+    fn into_command(self) -> Command {
+        let archive = match self {
+            Self::Verify(args) => {
+                return Command::ArchiveVerifyClient {
+                    endpoint: args.endpoint,
+                    library: args.library,
+                    drive: args.drive,
+                    locator: args.locator,
+                    expected_sha256: args.expected_sha256,
+                };
+            }
+            Self::Capabilities => ArchiveCommand::Capabilities,
+            Self::Reseal(args) => ArchiveCommand::Reseal(args),
+            Self::Build(args) => ArchiveCommand::Build(args.into()),
+            Self::Inspect(args) => ArchiveCommand::Inspect(args.into()),
+            Self::Extract(args) => ArchiveCommand::Extract(args.into()),
+            Self::ExtractStream(args) => ArchiveCommand::ExtractStream(args.into()),
+            Self::CoveringRange(args) => ArchiveCommand::CoveringRange(args.into()),
+            Self::Probe(args) => ArchiveCommand::Probe(args.into()),
+            Self::Scan(args) => ArchiveCommand::Scan(args.into()),
+            Self::Restore(args) => ArchiveCommand::Restore(args.into()),
+            Self::Recover(args) => ArchiveCommand::Recover(args.into()),
+            Self::Write(args) => ArchiveCommand::Write(args.into()),
+            Self::Read(args) => ArchiveCommand::Read(args.into()),
+            Self::ExportObject(args) => ArchiveCommand::ExportObject(args.into()),
+            Self::List(args) => ArchiveCommand::List(args.into()),
+        };
+        Command::Archive {
+            command: Box::new(archive),
         }
     }
 }
@@ -2315,18 +2429,6 @@ impl From<RemArchiveExportObjectArgs> for ArchiveExportObjectArgs {
             library: value.library,
             locator: value.locator,
             out: value.out,
-            config: value.config,
-        }
-    }
-}
-
-impl From<RemArchiveVerifyArgs> for ArchiveVerifyArgs {
-    fn from(value: RemArchiveVerifyArgs) -> Self {
-        Self {
-            library: value.library,
-            locator: value.locator,
-            expected_sha256: value.expected_sha256,
-            private_key: value.private_key,
             config: value.config,
         }
     }
@@ -3198,6 +3300,11 @@ where
             json,
             command,
         } => return run_catalog_client_command(endpoint, *json, command, out, err),
+        Command::AuditClient {
+            endpoint,
+            json,
+            command,
+        } => return run_audit_client_command(endpoint, *json, command, out, err),
         Command::DriveClient {
             endpoint,
             json,
@@ -3223,6 +3330,23 @@ where
                 drive: drive.clone(),
             };
             return run_drive_client_command(endpoint, *json, &command, out, err);
+        }
+        Command::ArchiveVerifyClient {
+            endpoint,
+            library,
+            drive,
+            locator,
+            expected_sha256,
+        } => {
+            return run_archive_verify_client(
+                endpoint,
+                library,
+                *drive,
+                locator,
+                expected_sha256,
+                out,
+                err,
+            );
         }
         Command::Libraries { .. }
         | Command::Library { .. }
@@ -3635,7 +3759,9 @@ where
         Command::Dev { command } => {
             return run_dev_command(&report, &command, &allow, &allow_derived, out, err);
         }
-        Command::Top { .. } => unreachable!("top command returns before discovery"),
+        Command::Top { .. } | Command::AuditClient { .. } | Command::ArchiveVerifyClient { .. } => {
+            unreachable!("daemon client command returns before discovery")
+        }
     }
     print_warnings(&report, err);
     ExitCode::SUCCESS
@@ -4128,6 +4254,123 @@ fn run_catalog_client_command(
     finish_daemon_client_result(result, json_output, err)
 }
 
+fn run_audit_client_command(
+    endpoint: &str,
+    json_output: bool,
+    command: &AuditClientCommand,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let result = daemon_runtime().and_then(|runtime| {
+        runtime.block_on(async {
+            let channel = connect_daemon(endpoint)
+                .await
+                .map_err(DaemonClientError::from)?;
+            let mut client = pb::audit_client::AuditClient::new(channel);
+            match command {
+                AuditClientCommand::Query {
+                    since,
+                    until,
+                    filters,
+                } => {
+                    let since = parse_audit_timestamp(since, "since")?;
+                    let until = parse_audit_timestamp(until, "until")?;
+                    let filter = parse_audit_filters(filters)?;
+                    let mut stream = client
+                        .query_audit(pb::QueryAuditRequest {
+                            since: Some(since),
+                            until: Some(until),
+                            filter: filter.into_iter().collect(),
+                        })
+                        .await
+                        .map_err(status_error)?
+                        .into_inner();
+                    while let Some(entry) = stream.message().await.map_err(status_error)? {
+                        print_audit_entry(entry, json_output, out)
+                            .map_err(DaemonClientError::from)?;
+                    }
+                    Ok(())
+                }
+            }
+        })
+    });
+    finish_daemon_client_result(result, json_output, err)
+}
+
+fn parse_audit_timestamp(
+    value: &str,
+    field: &str,
+) -> Result<prost_types::Timestamp, DaemonClientError> {
+    let parsed = OffsetDateTime::parse(value, &Rfc3339).map_err(|error| {
+        DaemonClientError::client(format!(
+            "invalid --{field} RFC3339 timestamp {value:?}: {error}"
+        ))
+    })?;
+    Ok(prost_types::Timestamp {
+        seconds: parsed.unix_timestamp(),
+        nanos: i32::try_from(parsed.nanosecond()).expect("nanoseconds fit i32"),
+    })
+}
+
+fn parse_audit_filters(filters: &[String]) -> Result<BTreeMap<String, String>, DaemonClientError> {
+    let mut parsed = BTreeMap::new();
+    for filter in filters {
+        let (key, value) = filter.split_once('=').ok_or_else(|| {
+            DaemonClientError::client(format!("invalid --filter {filter:?}; expected k=v"))
+        })?;
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            return Err(DaemonClientError::client(format!(
+                "invalid --filter {filter:?}; key and value must be nonempty"
+            )));
+        }
+        if parsed.insert(key.to_string(), value.to_string()).is_some() {
+            return Err(DaemonClientError::client(format!(
+                "duplicate audit filter key {key:?}"
+            )));
+        }
+    }
+    Ok(parsed)
+}
+
+fn print_audit_entry(
+    entry: pb::AuditEntry,
+    json_output: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let detail = serde_json::from_str::<Value>(&entry.detail_json)
+        .unwrap_or_else(|_| Value::String(entry.detail_json.clone()));
+    let value = json!({
+        "sequence": entry.sequence,
+        "timestamp": timestamp_value(entry.timestamp.as_ref()),
+        "actor": entry.actor.clone(),
+        "source_layer": entry.source_layer.clone(),
+        "operation_id": optional_uuid_text(&entry.operation_id),
+        "session_id": optional_uuid_text(&entry.session_id),
+        "event_kind": entry.event_kind.clone(),
+        "detail": detail,
+    });
+    if json_output {
+        serde_json::to_writer(&mut *out, &value).map_err(|error| error.to_string())?;
+        writeln!(out).map_err(|error| error.to_string())
+    } else {
+        writeln!(
+            out,
+            "{} {} {} {}",
+            entry.sequence,
+            timestamp_text(entry.timestamp.as_ref()).unwrap_or_else(|| "-".to_string()),
+            entry.event_kind,
+            entry.actor,
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+fn optional_uuid_text(bytes: &[u8]) -> Option<String> {
+    (!bytes.is_empty()).then(|| bytes_to_uuid_text(bytes))
+}
+
 async fn resolve_tape_uuid_arg(
     client: &mut pb::catalog_client::CatalogClient<Channel>,
     arg: &str,
@@ -4173,6 +4416,72 @@ async fn resolve_drive_uuid_arg(
     drive_uuid_from_selector(arg, Some(drive)).map_err(DaemonClientError::client)
 }
 
+async fn resolve_library_arg(
+    client: &mut pb::library_service_client::LibraryServiceClient<Channel>,
+    arg: &str,
+) -> Result<pb::Library, DaemonClientError> {
+    let libraries = client
+        .list_libraries(())
+        .await
+        .map_err(status_error)?
+        .into_inner()
+        .libraries;
+    let requested_uuid = Uuid::parse_str(arg).ok();
+    libraries
+        .into_iter()
+        .find(|library| {
+            library.library_serial == arg
+                || requested_uuid.is_some_and(|requested| {
+                    library.library_uuid.as_slice() == requested.as_bytes()
+                })
+        })
+        .ok_or_else(|| {
+            DaemonClientError::client(format!("library {arg:?} was not found by serial or UUID"))
+        })
+}
+
+async fn wait_for_operation(
+    channel: Channel,
+    operation_id: Vec<u8>,
+) -> Result<pb::OperationStatus, DaemonClientError> {
+    let mut stream = pb::daemon_client::DaemonClient::new(channel)
+        .watch_operation(pb::GetOperationRequest { operation_id })
+        .await
+        .map_err(status_error)?
+        .into_inner();
+    let mut terminal = None;
+    while let Some(status) = stream.message().await.map_err(status_error)? {
+        let state =
+            pb::OperationState::try_from(status.state).unwrap_or(pb::OperationState::Unspecified);
+        if matches!(
+            state,
+            pb::OperationState::Succeeded
+                | pb::OperationState::Failed
+                | pb::OperationState::Cancelled
+                | pb::OperationState::Unknown
+        ) {
+            terminal = Some(status);
+            break;
+        }
+    }
+    let status = terminal.ok_or_else(|| {
+        DaemonClientError::client("operation watch ended before a terminal status")
+    })?;
+    if status.state != pb::OperationState::Succeeded as i32 {
+        let state = operation_state_name(status.state);
+        let detail = if status.error_summary.is_empty() {
+            state.to_string()
+        } else {
+            format!("{state}: {}", status.error_summary)
+        };
+        return Err(DaemonClientError::client(format!(
+            "operation {} finished {detail}",
+            bytes_to_uuid_text(&status.operation_id)
+        )));
+    }
+    Ok(status)
+}
+
 fn drive_uuid_from_selector(
     selector: &str,
     drive: Option<pb::DriveCatalogEntry>,
@@ -4215,8 +4524,52 @@ fn run_drive_client_command(
             let channel = connect_daemon(endpoint)
                 .await
                 .map_err(DaemonClientError::from)?;
-            let mut client = pb::library_service_client::LibraryServiceClient::new(channel);
+            let mut client =
+                pb::library_service_client::LibraryServiceClient::new(channel.clone());
             match command {
+                DriveClientCommand::Load(args) => {
+                    if args.barcode.is_some() == args.slot.is_some() {
+                        return Err(DaemonClientError::client(
+                            "drive load requires exactly one of --barcode or --slot",
+                        ));
+                    }
+                    let library = resolve_library_arg(&mut client, args.library.as_str()).await?;
+                    let slot = if let Some(slot) = args.slot {
+                        u32::from(slot)
+                    } else {
+                        let barcode = args.barcode.as_deref().expect("clap requires load source");
+                        let state = client
+                            .get_library(pb::GetLibraryRequest {
+                                library_uuid: library.library_uuid.clone(),
+                            })
+                            .await
+                            .map_err(status_error)?
+                            .into_inner();
+                        state
+                            .slots
+                            .iter()
+                            .find(|slot| slot.voltag == barcode)
+                            .map(|slot| slot.element_address)
+                            .ok_or_else(|| {
+                                DaemonClientError::client(format!(
+                                    "barcode {barcode:?} is not present in a storage slot of library {:?}",
+                                    library.library_serial
+                                ))
+                            })?
+                    };
+                    let operation = client
+                        .load_drive(pb::LoadDriveRequest {
+                            library_uuid: library.library_uuid,
+                            slot_element_address: slot,
+                            drive_element_address: u32::from(args.bay),
+                            idempotency_key: None,
+                        })
+                        .await
+                        .map_err(status_error)?
+                        .into_inner();
+                    let status = wait_for_operation(channel, operation.operation_id).await?;
+                    print_operation(status, json_output, out).map_err(DaemonClientError::from)
+                }
                 DriveClientCommand::List { foreign, retired } => {
                     let drives = client
                         .list_drives(pb::ListDrivesRequest {
@@ -4327,6 +4680,137 @@ fn run_drive_client_command(
         })
     });
     finish_daemon_client_result(result, json_output, err)
+}
+
+fn run_archive_verify_client(
+    endpoint: &str,
+    library: &str,
+    drive: u16,
+    locator: &str,
+    expected_sha256: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let result = daemon_runtime().and_then(|runtime| {
+        runtime.block_on(async {
+            let locator = pool_ops::decode_locator(locator)
+                .map_err(|error| DaemonClientError::client(format!("locator: {error}")))?;
+            let expected: [u8; 32] = pool_ops::hex_to_bytes(expected_sha256)
+                .and_then(|bytes| {
+                    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+                        format!("expected-sha256 must be 32 bytes, got {}", bytes.len())
+                    })
+                })
+                .map_err(|error| {
+                    DaemonClientError::client(format!("--expected-sha256: {error}"))
+                })?;
+            let object_id = Uuid::parse_str(locator.object_id.as_str()).map_err(|error| {
+                DaemonClientError::client(format!("locator object_id: {error}"))
+            })?;
+            let channel = connect_daemon(endpoint)
+                .await
+                .map_err(DaemonClientError::from)?;
+            let library = {
+                let mut client =
+                    pb::library_service_client::LibraryServiceClient::new(channel.clone());
+                resolve_library_arg(&mut client, library).await?
+            };
+            let mut client =
+                pb::read_session_service_client::ReadSessionServiceClient::new(channel);
+            let session = client
+                .open_read_session(pb::OpenReadSessionRequest {
+                    target: Some(pb::open_read_session_request::Target::DriveTarget(
+                        pb::DriveTarget {
+                            library_uuid: library.library_uuid,
+                            drive_element_address: u32::from(drive),
+                            required_pool_id: String::new(),
+                        },
+                    )),
+                    idempotency_key: None,
+                    resume_target: None,
+                })
+                .await
+                .map_err(status_error)?
+                .into_inner();
+            if session.tape_uuid.as_slice() != locator.tape_uuid {
+                let original = DaemonClientError::client(format!(
+                    "drive 0x{drive:04x} contains tape {}, but locator requires {}",
+                    bytes_to_uuid_text(&session.tape_uuid),
+                    Uuid::from_bytes(locator.tape_uuid),
+                ));
+                let _ = client
+                    .close_read_session(pb::CloseReadSessionRequest {
+                        session_id: session.session_id,
+                        idempotency_key: None,
+                    })
+                    .await;
+                return Err(original);
+            }
+            let session_id = session.session_id;
+            let read_result = async {
+                let mut stream = client
+                    .read_file(pb::ReadFileRequest {
+                        session_id: session_id.clone(),
+                        object_id: object_id.as_bytes().to_vec(),
+                        file_id: Vec::new(),
+                        stream_chunk_bytes: 0,
+                    })
+                    .await
+                    .map_err(status_error)?
+                    .into_inner();
+                let mut hasher = Sha256::new();
+                let mut bytes_read = 0u64;
+                let mut saw_terminal = false;
+                while let Some(chunk) = stream.message().await.map_err(status_error)? {
+                    hasher.update(&chunk.data);
+                    bytes_read = bytes_read
+                        .checked_add(chunk.data.len() as u64)
+                        .ok_or_else(|| DaemonClientError::client("verified byte count overflow"))?;
+                    saw_terminal |= chunk.is_last;
+                }
+                if !saw_terminal {
+                    return Err(DaemonClientError::client(
+                        "read stream ended without a terminal chunk",
+                    ));
+                }
+                Ok::<_, DaemonClientError>((bytes_read, <[u8; 32]>::from(hasher.finalize())))
+            }
+            .await;
+            let close_result = client
+                .close_read_session(pb::CloseReadSessionRequest {
+                    session_id,
+                    idempotency_key: None,
+                })
+                .await
+                .map_err(status_error);
+            let (bytes_read, actual) = match read_result {
+                Err(original) => return Err(original),
+                Ok(outcome) => {
+                    close_result?;
+                    outcome
+                }
+            };
+            let verified = actual == expected;
+            let receipt = json!({
+                "verified": verified,
+                "expected_sha256": bytes_to_hex(&expected),
+                "actual_sha256": bytes_to_hex(&actual),
+                "bytes_read": bytes_read,
+                "tape_uuid": Uuid::from_bytes(locator.tape_uuid).to_string(),
+                "drive_element_address": drive,
+            });
+            serde_json::to_writer(&mut *out, &receipt)
+                .map_err(|error| DaemonClientError::client(error.to_string()))?;
+            writeln!(out).map_err(|error| DaemonClientError::client(error.to_string()))?;
+            if !verified {
+                return Err(DaemonClientError::client(
+                    "sha256 mismatch (drive payload vs --expected-sha256)",
+                ));
+            }
+            Ok(())
+        })
+    });
+    finish_daemon_client_result(result, false, err)
 }
 
 fn run_alarms_client_command(
@@ -14237,12 +14721,12 @@ mod tests {
     }
 
     #[test]
-    fn rem_archive_help_hides_direct_tape_object_commands() {
+    fn rem_archive_help_exposes_daemon_verify_and_hides_direct_mutations() {
         let mut command = Cli::command();
         let archive = command.find_subcommand_mut("archive").unwrap();
         let help = command_help(archive.clone());
 
-        for command in ["write", "read", "verify"] {
+        for command in ["write", "read"] {
             assert!(
                 !help.contains(&format!("\n  {command}")),
                 "rem archive help should not expose direct tape command {command}:\n{help}"
@@ -14258,6 +14742,7 @@ mod tests {
             "scan",
             "restore",
             "recover",
+            "verify",
             "list",
         ] {
             assert!(
@@ -14265,6 +14750,129 @@ mod tests {
                 "rem archive help should expose {command}:\n{help}"
             );
         }
+    }
+
+    #[test]
+    fn rem_drive_load_parses_barcode_or_slot_source() {
+        let barcode = Cli::parse_from([
+            "rem",
+            "drive",
+            "load",
+            "--library",
+            "mainlib",
+            "--barcode",
+            "ACM003L9",
+            "--bay",
+            "0x0101",
+        ]);
+        assert!(matches!(
+            barcode.command,
+            RemCommand::Drive {
+                command: DriveClientCommand::Load(DriveLoadArgs {
+                    barcode: Some(ref barcode),
+                    slot: None,
+                    bay: 0x0101,
+                    ..
+                }),
+                ..
+            } if barcode == "ACM003L9"
+        ));
+
+        let slot = Cli::parse_from([
+            "rem",
+            "drive",
+            "load",
+            "--library",
+            "mainlib",
+            "--slot",
+            "0x0400",
+            "--bay",
+            "0x0102",
+        ]);
+        assert!(matches!(
+            slot.command,
+            RemCommand::Drive {
+                command: DriveClientCommand::Load(DriveLoadArgs {
+                    barcode: None,
+                    slot: Some(0x0400),
+                    bay: 0x0102,
+                    ..
+                }),
+                ..
+            }
+        ));
+
+        assert!(Cli::try_parse_from([
+            "rem",
+            "drive",
+            "load",
+            "--library",
+            "mainlib",
+            "--bay",
+            "0x0102",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "rem",
+            "drive",
+            "load",
+            "--library",
+            "mainlib",
+            "--barcode",
+            "ACM003L9",
+            "--slot",
+            "0x0400",
+            "--bay",
+            "0x0102",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn rem_audit_query_and_drive_verify_parse_supported_surfaces() {
+        let audit = Cli::parse_from([
+            "rem",
+            "audit",
+            "query",
+            "--since",
+            "2026-07-18T00:00:00Z",
+            "--until",
+            "2026-07-19T00:00:00Z",
+            "--filter",
+            "event_kind=OperationFailed",
+            "--json",
+        ]);
+        assert!(matches!(
+            audit.command,
+            RemCommand::Audit {
+                json: true,
+                command: AuditClientCommand::Query { ref filters, .. },
+                ..
+            } if filters == &["event_kind=OperationFailed"]
+        ));
+
+        let verify = Cli::parse_from([
+            "rem",
+            "archive",
+            "verify",
+            "--library",
+            "mainlib",
+            "--drive",
+            "0x0102",
+            "--locator",
+            "{}",
+            "--expected-sha256",
+            "00",
+        ]);
+        let parsed: ParsedCli = verify.into();
+        assert!(matches!(
+            parsed.command,
+            Command::ArchiveVerifyClient {
+                drive: 0x0102,
+                ref library,
+                ..
+            } if library == "mainlib"
+        ));
     }
 
     #[test]

@@ -500,9 +500,9 @@ pub struct ObjectLocator {
 }
 
 /// Locator decoded into rem's byte-typed identity fields.
-struct DecodedLocator {
-    tape_uuid: TapeUuid,
-    object_id: String,
+pub(crate) struct DecodedLocator {
+    pub(crate) tape_uuid: TapeUuid,
+    pub(crate) object_id: String,
     tape_file_number: u32,
     first_body_lba: u64,
     content_sha256: [u8; 32],
@@ -587,7 +587,7 @@ struct ArchiveVerifyReceipt {
 }
 
 /// Hex-decode a `2*N`-char string into `N` bytes.
-fn hex_to_bytes(s: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn hex_to_bytes(s: &str) -> Result<Vec<u8>, String> {
     let bytes = s.as_bytes();
     if bytes.len() % 2 != 0 {
         return Err(format!("hex string has odd length {}", bytes.len()));
@@ -616,7 +616,7 @@ fn hex_to_bytes(s: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Parse + hex-decode the canonical locator into byte-typed fields.
-fn decode_locator(raw: &str) -> Result<DecodedLocator, String> {
+pub(crate) fn decode_locator(raw: &str) -> Result<DecodedLocator, String> {
     let loc: ObjectLocator =
         serde_json::from_str(raw).map_err(|e| format!("parse locator json: {e}"))?;
     let _locator_metadata = (&loc.caller_object_id, &loc.pool_id, &loc.body_format);
