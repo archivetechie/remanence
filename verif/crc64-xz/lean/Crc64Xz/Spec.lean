@@ -40,9 +40,6 @@ def byteRemainderFromState (crc : U64) : U64 :=
 def tableEntry (byte : U8) : U64 :=
   byteRemainderFromState (byte.zeroExtend 64)
 
-theorem table_entry_is_eight_reflected_bit_steps (byte : U8) :
-    tableEntry byte = byteRemainderFromState (byte.zeroExtend 64) := by
-  rfl
 
 def tableIndex (crc : U64) (byte : U8) : U8 :=
   ((crc ^^^ byte.zeroExtend 64) &&& 0xff#64).truncate 8
@@ -50,10 +47,6 @@ def tableIndex (crc : U64) (byte : U8) : U8 :=
 def update (crc : U64) (byte : U8) : U64 :=
   (crc >>> 8) ^^^ tableEntry (tableIndex crc byte)
 
-theorem update_uses_reflected_table_index (crc : U64) (byte : U8) :
-    update crc byte =
-      (crc >>> 8) ^^^ tableEntry (((crc ^^^ byte.zeroExtend 64) &&& 0xff#64).truncate 8) := by
-  rfl
 
 def foldState : List U8 -> U64 -> U64
   | [], crc => crc

@@ -19,11 +19,15 @@ small but central writer-schema cores:
 - a fixed-capacity array/fold validator over that five-entry shape, adding
   duplicate path/file-id rejection and hardlink target accumulation across the
   preceding regular entries
-- a planner-fold bridge step for arbitrary entry sequences, abstracting the
-  production `BTreeSet` lookups as scalar membership facts and proving that an
-  arbitrary Lean list of valid generated fold steps reaches a final state
+- a planner-fold progress bridge for arbitrary entry sequences, abstracting
+  the production `BTreeSet` lookups as scalar membership facts and proving
+  that a Lean list of fold steps that are already valid and duplicate-free at
+  every step reaches some final state — a liveness result only; it proves no
+  property of the final state and does not prove duplicate rejection
+  (rejection is proved separately in the fixed-capacity theorems)
 - a membership-facts bridge that models the production `BTreeSet::insert`
-  contract as scalar contains/insert facts before feeding the planner fold
+  contract as scalar contains/insert facts before feeding the planner fold,
+  with the same progress-only scope
 
 Text values are represented by opaque scalar ids and SHA-256 bytes by four
 opaque `u64` words. Xattr names and values are represented by scalar ids and a
