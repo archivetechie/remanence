@@ -641,6 +641,11 @@ fn replay_segments_summary(dir: &Path) -> Result<ReplaySummary, StateError> {
     replay_segments_impl(dir, &mut |_| ControlFlow::Continue(()))
 }
 
+// Memory bound: record bodies stream through the visitor one at a time, but
+// the sorted path list and the two per-segment maps below are retained for
+// the whole replay — O(segment count), not O(1). Accepted at the 2026-07-18
+// re-gate: segments rotate by date, so the count grows by file, not by
+// record, and streaming segment discovery is not worth its complexity here.
 fn replay_segments_impl(
     dir: &Path,
     visitor: &mut impl FnMut(AuditRecord) -> ControlFlow<()>,
