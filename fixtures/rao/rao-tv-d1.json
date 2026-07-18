@@ -3,7 +3,7 @@
   "spec_section": "13.4",
   "status": "pinned-at-generation",
   "plaintext_independent_rederivation": "verified by tools/verify_rao_vectors_independent.py",
-  "encrypted_expectation": "pinned by remanence-aead deterministic v2 test-vector entry point",
+  "encrypted_expectation": "pinned by remanence-aead deterministic envelope test-vector entry point",
   "inputs": {
     "chunk_size": 262144,
     "object_id": "00000000-0000-4000-8000-000000000002",

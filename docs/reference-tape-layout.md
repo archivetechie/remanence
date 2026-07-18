@@ -118,17 +118,17 @@ reader or writer.
 - A 16-byte plaintext footer, `RAO1_STREAM_END.`, then zero-fill to a
   chunk-size multiple.
 
-![RAO1 v2 encrypted envelope: plaintext 128-byte header and recipient key frame, encrypted metadata frame, tagged ciphertext chunks, plaintext footer, zero fill](assets/rao1-envelope.svg)
+![RAO1 encrypted envelope: plaintext 128-byte header and recipient key frame, encrypted metadata frame, tagged ciphertext chunks, plaintext footer, zero fill](assets/rao1-envelope.svg)
 
-*Fig. 3 — The v2 RAO1 envelope around the same tar stream. The scalar header,
+*Fig. 3 — The encrypted RAO1 envelope around the same tar stream. The scalar header,
 recipient key frame, footer, and fill are plaintext framing; metadata and
 payload chunks are ChaCha20-Poly1305 ciphertext. The key frame is bound into
 key derivation, so changing any slot invalidates authentication.*
 
-Version 2 has no shared root key. Its labels (`rao2-salt-v1` and siblings)
+The envelope has no shared root key. Its labels (`rao2-salt-v1` and siblings)
 derive from the per-object DEK, and the derivation hash covers the scalar
 header plus the exact key-frame bytes. `archive build` and pool writes seal
-directly to recipients, while `archive reseal` rotates one v2 envelope to a
+directly to recipients, while `archive reseal` performs a full re-seal to a
 new recipient set. CLI open/read/verify paths and standalone `rao-recover`
 select a slot using the RAOP private key's epoch id; see the [CLI
 reference](reference-cli.md#rao-recover-standalone-recovery).

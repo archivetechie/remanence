@@ -60,7 +60,7 @@ pub struct CoveringStoredRange {
     pub stored_range_len: u64,
 }
 
-/// Open and authenticate a v2 envelope plaintext range with per-frame semantics.
+/// Open and authenticate an envelope plaintext range with per-frame semantics.
 pub fn open_plaintext_range_to_vec(
     input: &[u8],
     recipient: &crate::RecipientPrivateKey,
@@ -78,7 +78,7 @@ pub fn open_plaintext_range_to_vec(
     )
 }
 
-/// Open a v2 envelope range relative to an inner RAO body block.
+/// Open an envelope range relative to an inner RAO body block.
 pub fn open_inner_range_to_vec(
     input: &[u8],
     recipient: &crate::RecipientPrivateKey,
@@ -101,7 +101,7 @@ pub fn open_inner_range_to_vec(
     )
 }
 
-/// Authenticate a v2 recipient prefix and return its covering stored frames.
+/// Authenticate a recipient prefix and return its covering stored frames.
 pub fn covering_stored_range(
     authenticated_prefix: &[u8],
     recipient: &crate::RecipientPrivateKey,
@@ -112,7 +112,7 @@ pub fn covering_stored_range(
     range_geometry(header, metadata, plaintext_start, plaintext_len)
 }
 
-/// Stream a v2 recipient-envelope plaintext range from a bounded ranged input.
+/// Stream an envelope plaintext range from a bounded ranged input.
 pub fn open_plaintext_range_from_reader<R: Read + ?Sized, W: Write + ?Sized>(
     authenticated_prefix: &[u8],
     ranged_input: &mut R,
@@ -332,7 +332,7 @@ fn open_authenticated_metadata(
         .ok_or(RaoAeadError::UnexpectedEof)?;
     let key_frame = crate::KeyFrame::parse(key_frame_bytes)?;
     let dek = crate::unwrap_dek(&key_frame, &header.object_id, recipient)?;
-    let keys = crate::derive_keys_v2(
+    let keys = crate::derive_keys(
         dek.as_bytes(),
         &header.hkdf_salt,
         &header.header_hash_with_key_frame(key_frame_bytes)?,
@@ -348,7 +348,7 @@ fn open_authenticated_metadata(
         .ok_or(RaoAeadError::UnexpectedEof)?;
     let metadata_plaintext = decrypt_metadata(&keys.metadata_key, metadata_frame)?;
     let metadata = RaoMetadata::from_cbor_bytes(&metadata_plaintext, header.chunk_size)?;
-    let expected_salt = crate::derive_salt_v2(
+    let expected_salt = crate::derive_salt(
         dek.as_bytes(),
         &header.object_id_field()?,
         &metadata.plaintext_digest,
@@ -425,7 +425,7 @@ mod tests {
         let plaintext: Vec<u8> = (0..1536).map(|i| (i % 251) as u8).collect();
         let common = SealOptions {
             chunk_size: 512,
-            object_id: "object-v2-range".to_string(),
+            object_id: "object-envelope-range".to_string(),
             plaintext_size: plaintext.len() as u64,
             plaintext_digest: Sha256::digest(&plaintext).into(),
         };
@@ -631,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_range_authenticates_returned_frames_but_not_unrequested_payload() {
+    fn ranged_open_authenticates_returned_frames_but_not_unrequested_payload() {
         let (sealed, plaintext, safe, _) = sealed();
         let inspected = crate::inspect_bytes(&sealed).unwrap();
         let chunk_zero = cipher_offset(
@@ -663,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_range_rejects_key_frame_tamper_outside_requested_payload() {
+    fn ranged_open_rejects_key_frame_tamper_outside_requested_payload() {
         let (mut sealed, _plaintext, safe, _) = sealed();
         sealed[RAO_HEADER_LEN + 6] ^= 0x80;
         assert!(open_plaintext_range_to_vec(&sealed, &safe, 0, 128).is_err());

@@ -1,4 +1,4 @@
-//! RAO v2 HPKE Base wrapping for per-object data-encryption keys.
+//! RAO HPKE Base wrapping for per-object data-encryption keys.
 
 use std::fmt;
 

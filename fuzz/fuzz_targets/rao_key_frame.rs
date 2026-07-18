@@ -1,6 +1,6 @@
 #![no_main]
 
-//! Fuzz target for direct v2 wrapped-DEK key-frame parsing.
+//! Fuzz target for direct wrapped-DEK key-frame parsing.
 
 use libfuzzer_sys::fuzz_target;
 use remanence_aead::KeyFrame;

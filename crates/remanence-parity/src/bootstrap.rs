@@ -188,11 +188,11 @@ pub enum BootstrapObjectRepresentation {
     /// Encrypted RAO representation: bootstrap row carries envelope fields
     /// only and deliberately omits plaintext manifest anchors.
     Encrypted {
-        /// Recipient epoch ids from the v2 key-frame slots.
+        /// Recipient epoch ids from the key-frame slots.
         recipient_epoch_ids: Vec<[u8; 16]>,
         /// RAO encrypted metadata frame length.
         metadata_frame_len: u64,
-        /// Serialized v2 key-frame length.
+        /// Serialized key-frame length.
         key_frame_len: u32,
     },
 }

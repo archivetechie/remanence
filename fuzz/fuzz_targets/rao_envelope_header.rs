@@ -1,6 +1,6 @@
 #![no_main]
 
-//! Fuzz target for the v2 RAO scalar-header parser.
+//! Fuzz target for the RAO envelope scalar-header parser.
 //!
 //! The header parser consumes exactly 128 bytes. Shorter fuzzer inputs are
 //! zero-padded so libFuzzer still exercises the frozen-field validation order

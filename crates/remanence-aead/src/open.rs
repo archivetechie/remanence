@@ -18,7 +18,7 @@ use crate::wrap::{unwrap_dek, RecipientPrivateKey};
 pub struct OpenReport {
     /// Parsed plaintext header.
     pub header: RaoHeader,
-    /// Parsed v2 key frame.
+    /// Parsed key frame.
     pub key_frame: crate::KeyFrame,
     /// Decrypted metadata.
     pub metadata: RaoMetadata,
@@ -28,7 +28,7 @@ pub struct OpenReport {
     pub plaintext: PlaintextStats,
 }
 
-/// Open a v2 envelope object with a matching recipient private key.
+/// Open an envelope object with a matching recipient private key.
 pub fn open<R: Read, W: Write>(
     mut input: R,
     mut output: W,
@@ -42,7 +42,7 @@ pub fn open<R: Read, W: Write>(
     read_exact(&mut input, &mut key_frame_bytes)?;
     let key_frame = crate::KeyFrame::parse(&key_frame_bytes)?;
     let dek = unwrap_dek(&key_frame, &header.object_id, recipient)?;
-    let keys = crate::kdf::derive_keys_v2(
+    let keys = crate::kdf::derive_keys(
         dek.as_bytes(),
         &header.hkdf_salt,
         &header.header_hash_with_key_frame(&key_frame_bytes)?,
@@ -53,7 +53,7 @@ pub fn open<R: Read, W: Write>(
     read_exact(&mut input, &mut metadata_frame)?;
     let metadata_plaintext = decrypt_metadata(&keys.metadata_key, &metadata_frame)?;
     let metadata = RaoMetadata::from_cbor_bytes(&metadata_plaintext, header.chunk_size)?;
-    let expected_salt = crate::kdf::derive_salt_v2(
+    let expected_salt = crate::kdf::derive_salt(
         dek.as_bytes(),
         &header.object_id_field()?,
         &metadata.plaintext_digest,
@@ -94,7 +94,7 @@ pub fn open<R: Read, W: Write>(
     })
 }
 
-/// Open a v2 envelope into a vector.
+/// Open an envelope into a vector.
 pub fn open_to_vec(input: &[u8], recipient: &RecipientPrivateKey) -> Result<(Vec<u8>, OpenReport)> {
     let mut out = Vec::new();
     let report = open(input, &mut out, recipient)?;

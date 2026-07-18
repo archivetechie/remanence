@@ -1,7 +1,7 @@
 //! Verifies the RAO Section 13 fixture manifests against regenerated objects.
 
 use remanence_aead::{
-    derive_keys_v2, inspect_bytes, open_to_vec, seal_deterministic_for_test_vectors,
+    derive_keys, inspect_bytes, open_to_vec, seal_deterministic_for_test_vectors,
     DataEncryptionKey, EnvelopeSealOptions, RecipientPrivateKey, RecipientPublicKey, SealOptions,
 };
 use remanence_format::{
@@ -798,7 +798,7 @@ fn rao_tv_p1_matches_fixture_manifest() {
 }
 
 #[test]
-fn rao_v2_publication_objects_regenerate_byte_exactly() {
+fn rao_publication_objects_regenerate_byte_exactly() {
     let e2_fixture = fixture(include_str!("../../../fixtures/rao/rao-tv-e2.json"));
     let e2_inputs = field(&e2_fixture, "inputs");
     let e2_expected = field(&e2_fixture, "expected");
@@ -892,7 +892,7 @@ fn rao_v2_publication_objects_regenerate_byte_exactly() {
         .header
         .header_hash_with_key_frame(&key_frame_bytes)
         .unwrap();
-    let keys = derive_keys_v2(&E2_DEK, &open.header.hkdf_salt, &header_hash).unwrap();
+    let keys = derive_keys(&E2_DEK, &open.header.hkdf_salt, &header_hash).unwrap();
     let metadata_plaintext = open.metadata.to_cbor_bytes(open.header.chunk_size).unwrap();
     let metadata_start = 128usize + key_frame_bytes.len();
     let metadata_end = metadata_start + open.header.metadata_frame_len as usize;
@@ -1070,7 +1070,7 @@ fn rao_tv_d1_matches_fixture_manifest() {
         .header
         .header_hash_with_key_frame(&key_frame_bytes)
         .unwrap();
-    let keys = derive_keys_v2(&D1_DEK, &open.header.hkdf_salt, &header_hash).unwrap();
+    let keys = derive_keys(&D1_DEK, &open.header.hkdf_salt, &header_hash).unwrap();
     let metadata_start = 128usize + key_frame_bytes.len();
     let metadata_end = metadata_start + open.header.metadata_frame_len as usize;
     let footer_offset = inspect.footer_offset as usize;

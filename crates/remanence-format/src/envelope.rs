@@ -13,7 +13,7 @@ use remanence_aead::{
 
 use crate::FormatError;
 
-/// Seal canonical RAO plaintext as a v2 recipient envelope.
+/// Seal canonical RAO plaintext as a recipient envelope.
 pub fn seal_envelope_rao_stream<R: Read, W: Write>(
     plaintext: R,
     output: W,
@@ -22,7 +22,7 @@ pub fn seal_envelope_rao_stream<R: Read, W: Write>(
     remanence_aead::seal(plaintext, output, options).map_err(Into::into)
 }
 
-/// Open a v2 recipient envelope to canonical RAO plaintext.
+/// Open a recipient envelope to canonical RAO plaintext.
 pub fn open_envelope_rao_stream<R: Read, W: Write>(
     input: R,
     output: W,
@@ -47,7 +47,7 @@ pub fn covering_envelope_rao_stored_range(
     .map_err(Into::into)
 }
 
-/// Open a v2 plaintext range from bounded covering ciphertext frames.
+/// Open a plaintext range from bounded covering ciphertext frames.
 pub fn open_envelope_rao_range_from_reader<R: Read + ?Sized, W: Write + ?Sized>(
     authenticated_prefix: &[u8],
     ranged_input: &mut R,

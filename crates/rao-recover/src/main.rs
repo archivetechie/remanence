@@ -1,4 +1,4 @@
-//! Standalone, catalogless recovery for RAO v2 recipient-envelope objects.
+//! Standalone, catalogless recovery for RAO recipient-envelope objects.
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
@@ -22,7 +22,7 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     object: PathBuf,
 
-    /// RAOP recipient private-key file for the v2 envelope object.
+    /// RAOP recipient private-key file for the envelope object.
     #[arg(long, value_name = "PATH")]
     private_key: PathBuf,
 
@@ -181,7 +181,7 @@ fn open_object<R: Read, W: std::io::Write>(
             key.epoch_label
         ));
     }
-    open(encrypted, output, &key).map_err(|error| format!("open RAO v2 object: {error}"))
+    open(encrypted, output, &key).map_err(|error| format!("open RAO envelope: {error}"))
 }
 
 /// Plaintext staging file that is truncated before its directory entry is removed.
@@ -244,7 +244,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     #[test]
-    fn recovers_v2_members_and_reports_epoch_mismatch() {
+    fn recovers_encrypted_members_and_reports_epoch_mismatch() {
         let payload = b"recovery payload";
         let mut sink = VecBlockSink::new();
         let mut inner_options = RemTarObjectOptions::new(

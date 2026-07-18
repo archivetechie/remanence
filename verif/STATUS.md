@@ -56,19 +56,19 @@ mirror and the boundary it does not cross.
 
 ## Retired proof areas
 
-The v1-only `aead-framing`, `rao-header`, and `rao-archive` proof crates were
-retired on 2026-07-17 when production RAO format-version-1 support was
-excised. Their drift guards no longer matched the v2-only production geometry,
+The registry-symmetric `aead-framing`, `rao-header`, and `rao-archive` proof
+crates were retired on 2026-07-17 when that encrypted representation was
+excised. Their drift guards no longer matched the production envelope geometry,
 so retaining the proofs would have overstated current coverage. The retired
 sources and guards were deleted rather than weakened or relabeled.
 
-Replacement work is tracked as **RAO-V2-FORMAL-PREFIX** for v2 prefix/range
-geometry and **RAO-V2-FORMAL-HEADER-KEY-FRAME** for the v2 scalar header plus
+Replacement work is tracked as **RAO-FORMAL-PREFIX** for prefix/range
+geometry and **RAO-FORMAL-HEADER-KEY-FRAME** for the scalar header plus
 key-frame codec.
 
 ## Next target
 
-The named next targets are **RAO-V2-FORMAL-PREFIX** and
-**RAO-V2-FORMAL-HEADER-KEY-FRAME**: create fresh extractions from the v2-only
+The named next targets are **RAO-FORMAL-PREFIX** and
+**RAO-FORMAL-HEADER-KEY-FRAME**: create fresh extractions from the envelope
 production geometry and byte codec, then prove those production-connected
 functions.

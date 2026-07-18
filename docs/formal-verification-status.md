@@ -47,15 +47,15 @@ listed below are expected to have no local placeholders.
 
 ## Retired proof areas
 
-The v1-only `verif/aead-framing`, `verif/rao-header`, and
-`verif/rao-archive` proof crates were retired on 2026-07-17 with the production
-RAO v1 excision. Their drift-guard-pinned production snippets changed under
-the v2-only geometry, so the old theorems no longer described the shipped
+The registry-symmetric `verif/aead-framing`, `verif/rao-header`, and
+`verif/rao-archive` proof crates were retired on 2026-07-17 when that encrypted
+representation was removed. Their drift-guard-pinned production snippets changed
+under the envelope geometry, so the old theorems no longer described the shipped
 code. The proof crates and guards were deleted; no Lean statement was weakened
-or relabeled as v2 coverage.
+or relabeled as current envelope coverage.
 
-The replacements are tracked as **RAO-V2-FORMAL-PREFIX** and
-**RAO-V2-FORMAL-HEADER-KEY-FRAME**.
+The replacements are tracked as **RAO-FORMAL-PREFIX** and
+**RAO-FORMAL-HEADER-KEY-FRAME**.
 
 ## Normal-test-only areas
 
@@ -64,13 +64,13 @@ These are intentionally outside the current formal proof surface:
 - SCSI/changer/drive behavior and all physical tape interactions.
 - Layer-5 daemon session orchestration, cancellation, concurrency, and gRPC.
 - SQLite catalog persistence and rebuild paths.
-- RAO v2 header/key-frame/prefix geometry and archive composition beyond the
+- RAO header/key-frame/prefix geometry and archive composition beyond the
   retained metadata and manifest proof surfaces.
 - Production sidecar byte-buffer construction/parsing beyond the proved fixed
   scalar layout, CRC-window, and range-bound arithmetic.
 - AEAD cryptographic security and keyed authentication.
-- RAO v2 key-frame geometry and v2 header/key-frame codec proofs, tracked as
-  **RAO-V2-FORMAL-PREFIX** and **RAO-V2-FORMAL-HEADER-KEY-FRAME**.
+- RAO key-frame geometry and header/key-frame codec proofs, tracked as
+  **RAO-FORMAL-PREFIX** and **RAO-FORMAL-HEADER-KEY-FRAME**.
 - End-to-end write/read/verify scenarios in `~/system`.
 
 Those areas remain covered by Rust unit tests, integration tests, system
@@ -137,9 +137,9 @@ they prove specific kernels under specific extraction and scope boundaries.
 
 ## Recommended next target
 
-The next formal work is **RAO-V2-FORMAL-PREFIX** followed by
-**RAO-V2-FORMAL-HEADER-KEY-FRAME**. These must start from fresh v2-only
+The next formal work is **RAO-FORMAL-PREFIX** followed by
+**RAO-FORMAL-HEADER-KEY-FRAME**. These must start from fresh envelope
 extractions and cover key-frame-dependent prefix/range geometry plus the exact
 scalar-header/key-frame codec boundary. The retained metadata and manifest
-proofs remain useful, but there is currently no live formal claim for the v2
+proofs remain useful, but there is currently no live formal claim for the
 header, prefix geometry, or archive-level composition.

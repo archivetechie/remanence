@@ -12,7 +12,7 @@
     {
       "id": "wrong-format-id",
       "operation": "read",
-      "fault": "global REMANENCE.format_id is rao-v2",
+      "fault": "global REMANENCE.format_id is rao-v0",
       "expected_error": "UnsupportedFeature"
     },
     {
