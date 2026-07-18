@@ -186,7 +186,6 @@ verif/                          Lean/Aeneas proof targets
 fieldtest/                      Physical field-test kit and runbooks
 fixtures/                       Captured hardware/SCSI fixtures
 fuzz/                           RAO fuzz targets
-journal/                        Development process journal (not documentation)
 ```
 
 ![Workspace crate map: layer 5 cli, api, daemon over layer 4 state over layer 3 format, aead, parity, format-driver over layer 2 library over layer 1 scsi, with the format-free platform seam between layers 3 and 2](docs/assets/layer-map.svg)
