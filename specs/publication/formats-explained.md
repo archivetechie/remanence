@@ -396,5 +396,23 @@ it is replaceable within that architecture, which is precisely the point.
   tape archival stack that produces and consumes these formats:
   <https://github.com/archivetechie/remanence>.
 
+## 12. A note on maturity
+
+The reference implementation was developed against a QuadStor virtual tape
+library and field-tested on an HPE MSL3040 tape library with LTO-9 drives.
+That is real hardware, but it is one library family and one drive
+generation — a young footprint for formats that talk about decades.
+
+So a closing piece of advice, offered in the same spirit as everything
+above: this is version 1.0, and **you should not extend it trust it has
+not yet earned**. Whatever you deploy, operate a standing process in which
+data is not merely written but *restored and verified* — routinely, from
+the actual media, compared fingerprint-for-fingerprint against what was
+ingested. The formats make this cheap to automate: every file carries its
+fingerprint, every copy carries its own, and "verified" is a mechanical
+comparison rather than a judgment call. An archive's guarantees live in
+its restore drills, not in its write logs — that is true of every archive
+system ever built, and a 1.0 is exactly the moment to build the habit.
+
 *Author: The ArchiveTech Project — <https://archivetech.org> —
 specs@archivetech.org*
