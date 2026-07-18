@@ -1,25 +1,21 @@
-# Published Specifications
+# Format specifications
 
-This directory holds the public format specifications.
+The published, citable specifications live in [publication/](publication/):
 
-- [rao-1.0-specification.md](rao-1.0-specification.md): Rem Archive Object
-  (RAO) Format, Version 1.0.
-- [rao-1.1-specification.md](rao-1.1-specification.md): Rem Archive Object
-  (RAO) Format, Version 1.1 additive metadata-preservation minor.
-- [rem-parity-1.0-specification.md](rem-parity-1.0-specification.md): Rem Tape
-  Parity (REM-PARITY) Format, Version 1.0.
+- [rao-object-format-1.0.md](publication/rao-object-format-1.0.md) — the
+  **RAO (Rem Archive Object) Format Specification, Version 1.0**: the
+  archival object container, its manifest, closed-form byte-range
+  addressing, and the encrypted envelope.
+- [rem-parity-1.0-specification.md](publication/rem-parity-1.0-specification.md)
+  — the **REM-PARITY Tape Format Specification, Version 1.0**: on-tape
+  layout, sidecar parity, bootstrap blocks, and catalog-less recovery.
+- [formats-explained.md](publication/formats-explained.md) — the
+  plain-language companion: motivation and design, informative only.
+- [remanence-test-vectors.tar](publication/remanence-test-vectors.tar) —
+  the pinned test-vector archive; its SHA-256 is printed in both
+  specifications.
 
-## Canonical external publication (Version 1.0)
-
-The single combined publication document is
-[publication/rao-object-format-1.0.md](publication/rao-object-format-1.0.md):
-the RAO Format Specification, Version 1.0, merging the base object format, the
-1.1 xattr metadata delta, and the on-tape v2 HPKE envelope into **one** normative
-document (author: The ArchiveTech Project). The companion tape/parity format is
-[publication/rem-parity-1.0-specification.md](publication/rem-parity-1.0-specification.md).
-
-The split `publication/rao-1.0-specification.md` and
-`publication/rao-1.1-specification.md` are superseded internal revision records,
-folded into the combined 1.0 document above; the review record lives in
-`publication/REVIEW-REPORT.md` / `publication/SUMMARY.md`. The files listed above
-in `specs/` remain the untouched working originals.
+The specifications are the normative fixed points for the formats:
+implementations are validated against these documents, not the reverse.
+Earlier internal revisions and review records are preserved in git
+history, not in the working tree.
