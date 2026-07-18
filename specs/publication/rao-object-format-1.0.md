@@ -274,9 +274,9 @@ pseudorandom function; PFR denotes partial file restore (Section 6).
 | `RAO_HEADER_LEN` | 128 | Envelope plaintext header length in bytes |
 | `RAO_FORMAT_VERSION_HPKE` | 2 | HPKE envelope `format_version` |
 | `RAO_SUITE_HKDF_CHACHA` | `0x01` | `suite_id`: HKDF-SHA-256 + ChaCha20-Poly1305 |
-| `RAO_WRAP_SUITE_HPKE_V1` | `0x01` | v2 HPKE Base wrap suite |
-| `RAO_KEY_FRAME_MAX_LEN` | 4096 | Maximum v2 key-frame length |
-| `RAO_KEY_FRAME_MAX_SLOTS` | 8 | Maximum v2 recipient slots |
+| `RAO_WRAP_SUITE_HPKE_V1` | `0x01` | HPKE Base wrap suite |
+| `RAO_KEY_FRAME_MAX_LEN` | 4096 | Maximum key-frame length |
+| `RAO_KEY_FRAME_MAX_SLOTS` | 8 | Maximum recipient slots |
 | `RAO_SALT_LEN` | 16 | `hkdf_salt` length in bytes |
 | `RAO_OBJECT_ID_FIELD_LEN` | 64 | Fixed `object_id` header field length in bytes |
 | `RAO_TAG_LEN` | 16 | Poly1305 tag length in bytes |
@@ -286,10 +286,10 @@ pseudorandom function; PFR denotes partial file restore (Section 6).
 | `RAO_MAX_CBOR_NESTING_DEPTH` | 32 | Maximum envelope metadata nesting depth |
 | `RAO_MAX_METADATA_ITEMS` | 65536 | Maximum envelope metadata data-item count |
 | `RAO_FOOTER` | `RAO1_STREAM_END.` | 16-byte completion footer (Section 5.8); hex `52 41 4F 31 5F 53 54 52 45 41 4D 5F 45 4E 44 2E` |
-| `LABEL_SALT_V2` | `rao2-salt-v1` | v2 salt-derivation info label, 12 ASCII bytes |
-| `LABEL_OBJECT_V2` | `rao2-object-v1` | v2 object-secret info label, 14 ASCII bytes |
-| `LABEL_METADATA_V2` | `rao2-metadata-v1` | v2 metadata-key info label, 16 ASCII bytes |
-| `LABEL_PAYLOAD_V2` | `rao2-payload-v1` | v2 payload-key info label, 15 ASCII bytes |
+| `LABEL_SALT` | `rao2-salt-v1` | Salt-derivation info label, 12 ASCII bytes |
+| `LABEL_OBJECT` | `rao2-object-v1` | Object-secret info label, 14 ASCII bytes |
+| `LABEL_METADATA` | `rao2-metadata-v1` | Metadata-key info label, 16 ASCII bytes |
+| `LABEL_PAYLOAD` | `rao2-payload-v1` | Payload-key info label, 15 ASCII bytes |
 | `WRAP_INFO_PREFIX` | `rao-wrap-v1` followed by NUL | 12-byte HPKE info prefix |
 
 ## 3. Object Model
@@ -1141,7 +1141,7 @@ The scalar header is exactly 128 bytes. All integers are unsigned big-endian.
 Bytes `0x10..0x20` and `0x39..0x3C` are reserved and MUST be zero.
 `wrap_suite = 0x01`, and `key_frame_len` MUST be between 103 and 4096
 inclusive. Although `103` is the
-smallest syntactically possible one-slot frame, a conforming v2 Sealer emits
+smallest syntactically possible one-slot frame, a conforming Sealer emits
 at least two slots, so its emitted minimum is 201 bytes when both labels are
 empty. A zero wrap suite or absent/undersized key frame is not a valid object
 in this specification.
@@ -1152,7 +1152,7 @@ all-zero field, an interior NUL followed by a nonzero byte, invalid UTF-8, or
 a value longer than 64 bytes. The header's `chunk_size` and `object_id` MUST
 equal the authenticated inner values after opening.
 
-The byte-exact beginning of a v2 header with `chunk_size = 4096`,
+The byte-exact beginning of an envelope header with `chunk_size = 4096`,
 `metadata_frame_len = 64`, `key_frame_len = 103`, object id `object-2`, and
 the illustrative salt `02` repeated 16 times is:
 
@@ -1167,9 +1167,9 @@ the illustrative salt `02` repeated 16 times is:
 The final line occupies the 64-byte `object_id` field. The repeated salt is a
 layout illustration, not a derived conformance value.
 
-### 5.3. Version 2 Key Frame and HPKE Wrapping
+### 5.3. The Key Frame and HPKE Wrapping
 
-The v2 key frame begins immediately at byte 128 and occupies exactly
+The key frame begins immediately at byte 128 and occupies exactly
 `key_frame_len` bytes. Its canonical grammar is:
 
 | Relative offset | Length | Field | Constraint |
@@ -1379,7 +1379,7 @@ header before publishing restored members. Catalogless recovery is possible:
 an object plus one matching recipient private key is sufficient. Recovery
 output SHOULD be staged and published only after complete success.
 
-A Keyless Verifier MAY parse the header and v2 key frame, compute
+A Keyless Verifier MAY parse the header and key frame, compute
 `stored_digest`, and validate Section 5.8 geometry, footer, and fill. It MUST
 describe this result as public structural consistency, not cryptographic
 authenticity or provenance.
@@ -1886,9 +1886,9 @@ authenticated or signed external manifest.
 Recipient rotation affects newly sealed objects. Because the key frame is
 included in `header_hash`, rewrapping without resealing is forbidden. An epoch
 private key MUST NOT be destroyed while any live object's key frame references
-it. The `reseal` operation opens an existing v2 envelope with a matching
+it. The `reseal` operation opens an existing envelope with a matching
 private key and seals the identical canonical bytes to a new recipient set;
-it is therefore a v2-to-v2 re-seal, not a key-frame rewrite. Re-sealing
+it is therefore a full re-seal, not a key-frame rewrite. Re-sealing
 preserves `object_id`, `chunk_size`, the canonical bytes, and
 `plaintext_digest`, but uses a fresh DEK and salt and changes the encrypted
 stored bytes and `stored_digest`.
@@ -2125,7 +2125,7 @@ the exact deterministic CBOR, layout, `manifest_sha256`, and
 `stored_digest`. The no-xattr writer path remains schema `1.0` and emits empty
 containers as required by Section 4.7.3.
 
-The archive's `negative-envelope-v2.json` pins the complete header,
+The archive's `negative-key-frame.json` pins the complete header,
 key-frame, HPKE-tamper, Sealer-slot, and Reader-slot policy matrix described in
 Section 13.6. The implementation's positive
 component vector fixes `object_id = object-a`, epoch id `03` repeated 16

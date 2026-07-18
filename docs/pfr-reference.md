@@ -1,9 +1,12 @@
 # Reference: Partial File Restore (PFR) on LTO
 
-**Status:** Working reference, not a specification. Captures the mechanics
-the rem-chunked-v1 format and the `ByteRangeAddressable` trait must respect.
-Where this document and `docs/spec-v0.3.md` disagree, the spec wins after
-review — this doc exists to make sure the spec's assumptions are correct.
+**Status:** Working reference, not a specification. Written during the
+format's design phase, and some of it predates the shipped names — the
+design-phase "rem-chunked-v1" became the `rao-v1` object format defined by
+the published RAO Format Specification (`specs/publication/`). Where this
+document and the published specification disagree, the specification wins;
+this document exists to explain the drive mechanics and arithmetic behind
+the format's range-addressing design.
 
 Sources are listed at the bottom. Anything that looks definitive but is
 not cited should be verified against the IBM LTO SCSI Reference and the

@@ -25,8 +25,8 @@ on an HPE MSL3040 with LTO-9 drives.
 ## Status
 
 Pre-alpha, version 0.0.1. Interfaces and the gRPC contract may still
-change before a stable release; the published on-tape formats (RAO 1.0/
-1.1, REM-PARITY 1.0) are specified and implemented. Working today:
+change before a stable release; the published on-tape formats (RAO 1.0,
+REM-PARITY 1.0) are specified and implemented. Working today:
 
 - Layer 1 SCSI primitives and Layer 2 library discovery, identity,
   robotics, and hot-plug watching, with per-library allowlisting.
@@ -34,10 +34,10 @@ change before a stable release; the published on-tape formats (RAO 1.0/
   I/O with position proofs (this is now the only write/read path — the
   earlier non-pipelined mode and its config flag are gone), a
   watermark-gated host-RAM read reservoir with proof-frontier ranged
-  reads, the `rao-v1` object format, the `RAO1` encrypted envelope in
-  both v1 (registry symmetric key) and v2 (multi-recipient HPKE
-  wrapped-key) shapes, and Reed-Solomon sidecar parity with recovery,
-  resume, and catalog-less scan.
+  reads, the `rao-v1` object format, the `RAO1` encrypted envelope
+  (a fresh per-object key, wrapped to multiple recipient public keys via
+  HPKE, stored in the object's own header), and Reed-Solomon sidecar
+  parity with recovery, resume, and catalog-less scan.
 - Layer 4 state: audit log, per-tape journals, and a SQLite catalog that
   is a rebuildable projection, plus media-readiness records and tape-I/O
   fences.
@@ -53,9 +53,9 @@ change before a stable release; the published on-tape formats (RAO 1.0/
   local RAO object build/inspect/extract that needs no hardware, and a
   ranged-ciphertext `extract-stream`/`covering-range` pair for bounded,
   memory-cheap partial reads of an object already fetched locally. A
-  standalone `rao-recover` binary decrypts either envelope version with
-  no daemon, catalog, or config file at all — the disaster-recovery path
-  of last resort.
+  standalone `rao-recover` binary decrypts archive objects with no
+  daemon, catalog, or config file at all — the disaster-recovery path of
+  last resort.
 - Legacy BRU archive reading (feature-gated) for migrating old tapes,
   chaos fault-injection for tests, and Lean/Aeneas proofs over the
   parity and format cores (`verif/`).
@@ -65,9 +65,7 @@ role matrix, the audit-query service is defined but not yet served,
 library import/export (mailslot) handling, library-event streaming, and
 write-session checkpointing/restart all return unimplemented, parity
 tapes do not yet support appending further objects after a committed
-session, `rem`/`rem-debug` have no CLI path to decrypt a v2 (HPKE)
-envelope short of `rao-recover` or `archive reseal`'s output, and
-hardware soak coverage is still growing.
+session, and hardware soak coverage is still growing.
 
 <!-- code-anchor: Cargo.toml @ 2a20106 -->
 ## Build
@@ -128,11 +126,13 @@ tape write, is [docs/guide-quickstart.md](docs/guide-quickstart.md).
   fences, and permissions.
 - [Glossary](docs/reference-glossary.md) — project terms and tape
   vocabulary.
-- Published format specifications: [RAO 1.0](specs/rao-1.0-specification.md),
-  [RAO 1.1](specs/rao-1.1-specification.md),
-  [REM-PARITY 1.0](specs/rem-parity-1.0-specification.md).
-- [docs/INDEX.md](docs/INDEX.md) — the full documentation registry,
-  including design records and reviews.
+- [The formats, explained](specs/publication/formats-explained.md) —
+  a plain-language companion to the specifications: the motivation and
+  the design, without the normative terseness.
+- Published format specifications:
+  [RAO Format 1.0](specs/publication/rao-object-format-1.0.md) and
+  [REM-PARITY 1.0](specs/publication/rem-parity-1.0-specification.md),
+  with their pinned test-vector archive alongside.
 - [proto/layer5.proto](proto/layer5.proto) — the draft gRPC contract.
 
 <!-- code-anchor: crates/remanence-library/tests/platform_dependency_guard.rs @ 7fb10f8 -->
@@ -156,7 +156,7 @@ sidecars are tape-only framing.
 crates/remanence-scsi           Layer 1 SCSI CDB/SG_IO primitives
 crates/remanence-library        Layer 2 library model/ops and Layer 3a tape I/O
 crates/remanence-crc            Shared CRC-64/XZ
-crates/remanence-aead           RAO1 encrypted-envelope primitives (v1 registry key + v2 HPKE)
+crates/remanence-aead           RAO1 encrypted-envelope primitives (HPKE wrapped-DEK)
 crates/remanence-format-driver  Published format-driver traits
 crates/remanence-format         Native rao-v1 body format
 crates/remanence-bru            Legacy BRU reader (feature-gated)
@@ -168,19 +168,28 @@ crates/remanence-daemon         rem-daemon service host
 crates/remanence-cli            rem and rem-debug binaries
 crates/rao-recover              Standalone catalogless RAO disaster-recovery binary
 crates/remanence-chaos          Fault-injection scaffolding (excluded from CI gates)
-specs/                          Published format specifications
+specs/publication/              Published format specifications + test vectors
 docs/                           Guides, references, design records (see INDEX.md)
 proto/                          Layer 5 protobuf contract
 verif/                          Lean/Aeneas proof targets
 fieldtest/                      Physical field-test kit and runbooks
 fixtures/                       Captured hardware/SCSI fixtures
 fuzz/                           RAO fuzz targets
-journal/                        Dated work journal
+journal/                        Development process journal (not documentation)
 ```
 
 ![Workspace crate map: layer 5 cli, api, daemon over layer 4 state over layer 3 format, aead, parity, format-driver over layer 2 library over layer 1 scsi, with the format-free platform seam between layers 3 and 2](docs/assets/layer-map.svg)
 
 *Fig. 1 — The crate stack: each layer depends only on the one below it; the highlighted crates define the bytes on tape, and everything below the platform seam is format-free.*
+
+## Contributing and security
+
+Issues and pull requests are welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md) for how the project works day to day.
+To report a security issue, especially anything affecting the encryption
+envelope or the integrity guarantees, see [SECURITY.md](SECURITY.md);
+please do not open a public issue for suspected vulnerabilities.
+Release history lives in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
