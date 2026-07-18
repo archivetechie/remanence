@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -297,11 +298,12 @@ impl FileAuditLog {
         if !path.exists() {
             write_segment_header(&path, effective_segment_date, replay.terminal_hash)?;
         } else {
+            let mut discard_record = |_| ControlFlow::Continue(());
             let segment = replay_segment(
                 &path,
                 Some(replay.previous_hash_for(effective_segment_date)?),
                 replay.first_sequence_for(effective_segment_date)?,
-                false,
+                &mut discard_record,
             )?;
             let file = File::options()
                 .write(true)
@@ -332,9 +334,29 @@ impl FileAuditLog {
         })
     }
 
-    /// Replay all audit records in a directory.
+    /// Replay all audit records in a directory into a collection.
+    ///
+    /// Call [`Self::replay_incremental`] when the caller does not inherently
+    /// need the complete history resident in memory.
     pub fn replay(dir: impl AsRef<Path>) -> Result<Vec<AuditRecord>, StateError> {
-        Ok(replay_segments(dir.as_ref())?.records)
+        let mut records = Vec::new();
+        Self::replay_incremental(dir, |record| {
+            records.push(record);
+            ControlFlow::Continue(())
+        })?;
+        Ok(records)
+    }
+
+    /// Replay and validate audit records one at a time in chain order.
+    ///
+    /// The visitor may stop replay early with [`ControlFlow::Break`]. Apart
+    /// from the currently decoded record, this path does not retain history.
+    pub fn replay_incremental(
+        dir: impl AsRef<Path>,
+        mut visitor: impl FnMut(AuditRecord) -> ControlFlow<()>,
+    ) -> Result<(), StateError> {
+        replay_segments(dir.as_ref(), &mut visitor)?;
+        Ok(())
     }
 
     /// Current segment path.
@@ -575,7 +597,6 @@ impl AuditSink for FileAuditLog {
 
 #[derive(Debug)]
 struct ReplaySummary {
-    records: Vec<AuditRecord>,
     terminal_hash: [u8; 32],
     next_sequence: u64,
     segment_previous: BTreeMap<String, [u8; 32]>,
@@ -602,26 +623,31 @@ impl ReplaySummary {
 
 #[derive(Debug)]
 struct SegmentReplay {
-    records: Vec<AuditRecord>,
     record_count: u64,
     terminal_hash: [u8; 32],
     valid_len: u64,
     last_timestamp_utc: Option<String>,
+    stopped: bool,
 }
 
-fn replay_segments(dir: &Path) -> Result<ReplaySummary, StateError> {
-    replay_segments_impl(dir, true)
+fn replay_segments(
+    dir: &Path,
+    visitor: &mut impl FnMut(AuditRecord) -> ControlFlow<()>,
+) -> Result<ReplaySummary, StateError> {
+    replay_segments_impl(dir, visitor)
 }
 
 fn replay_segments_summary(dir: &Path) -> Result<ReplaySummary, StateError> {
-    replay_segments_impl(dir, false)
+    replay_segments_impl(dir, &mut |_| ControlFlow::Continue(()))
 }
 
-fn replay_segments_impl(dir: &Path, collect_records: bool) -> Result<ReplaySummary, StateError> {
+fn replay_segments_impl(
+    dir: &Path,
+    visitor: &mut impl FnMut(AuditRecord) -> ControlFlow<()>,
+) -> Result<ReplaySummary, StateError> {
     let mut paths = audit_segment_paths(dir)?;
     paths.sort();
 
-    let mut records = Vec::new();
     let mut previous_hash = [0u8; 32];
     let mut next_sequence = 1u64;
     let mut segment_previous = BTreeMap::new();
@@ -633,18 +659,19 @@ fn replay_segments_impl(dir: &Path, collect_records: bool) -> Result<ReplaySumma
         let date = segment_date_from_path(&path)?;
         segment_previous.insert(date.clone(), previous_hash);
         segment_first_sequence.insert(date.clone(), next_sequence);
-        let segment = replay_segment(&path, Some(previous_hash), next_sequence, collect_records)?;
+        let segment = replay_segment(&path, Some(previous_hash), next_sequence, visitor)?;
         next_sequence += segment.record_count;
         previous_hash = segment.terminal_hash;
         latest_segment_date = Some(date);
         if segment.last_timestamp_utc.is_some() {
             last_timestamp_utc = segment.last_timestamp_utc;
         }
-        records.extend(segment.records);
+        if segment.stopped {
+            break;
+        }
     }
 
     Ok(ReplaySummary {
-        records,
         terminal_hash: previous_hash,
         next_sequence,
         segment_previous,
@@ -658,7 +685,7 @@ fn replay_segment(
     path: &Path,
     expected_previous_hash: Option<[u8; 32]>,
     first_expected_sequence: u64,
-    collect_records: bool,
+    visitor: &mut impl FnMut(AuditRecord) -> ControlFlow<()>,
 ) -> Result<SegmentReplay, StateError> {
     let mut file =
         File::open(path).map_err(|err| StateError::io_at("open audit segment", path, err))?;
@@ -683,7 +710,6 @@ fn replay_segment(
         }
     }
 
-    let mut records = Vec::new();
     let mut record_count = 0u64;
     let mut previous_hash = header.previous_segment_terminal_hash;
     let mut expected_sequence = first_expected_sequence;
@@ -699,11 +725,11 @@ fn replay_segment(
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
                 return Ok(SegmentReplay {
-                    records,
                     record_count,
                     terminal_hash: previous_hash,
                     valid_len,
                     last_timestamp_utc,
+                    stopped: false,
                 });
             }
             Err(err) => return Err(StateError::io_at("read audit record length", path, err)),
@@ -718,11 +744,11 @@ fn replay_segment(
         let record_end = record_start + 4 + u64::from(record_len);
         if record_end > file_len {
             return Ok(SegmentReplay {
-                records,
                 record_count,
                 terminal_hash: previous_hash,
                 valid_len,
                 last_timestamp_utc,
+                stopped: false,
             });
         }
 
@@ -770,8 +796,14 @@ fn replay_segment(
         valid_len = record_end;
         record_count += 1;
         last_timestamp_utc = Some(record.timestamp_utc.clone());
-        if collect_records {
-            records.push(record);
+        if visitor(record).is_break() {
+            return Ok(SegmentReplay {
+                record_count,
+                terminal_hash: previous_hash,
+                valid_len,
+                last_timestamp_utc,
+                stopped: true,
+            });
         }
     }
 }
@@ -1460,6 +1492,40 @@ mod tests {
         assert_eq!(records[0].sequence, 1);
         assert_eq!(records[1].sequence, 2);
         assert_eq!(records[1].subject.id.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn incremental_replay_visits_records_without_collecting_the_history() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-audit-incremental")
+            .tempdir()
+            .expect("temp dir");
+        let mut log =
+            FileAuditLog::open_for_date(temp.path(), "2026-05-27", true).expect("open audit");
+        for sequence in 1..=40 {
+            log.append(event(sequence.to_string().as_str()))
+                .expect("append audit record");
+        }
+        drop(log);
+
+        let mut visited = Vec::new();
+        FileAuditLog::replay_incremental(temp.path(), |record| {
+            visited.push(record.sequence);
+            if visited.len() == 3 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .expect("incremental replay");
+
+        assert_eq!(visited, vec![1, 2, 3]);
+        assert_eq!(
+            FileAuditLog::replay(temp.path())
+                .expect("collecting replay remains available")
+                .len(),
+            40
+        );
     }
 
     #[test]
