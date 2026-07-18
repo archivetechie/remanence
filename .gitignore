@@ -40,3 +40,9 @@ verif/**/*.llbc
 verif/**/lean/.lake/
 verif/**/.leanstral/
 fieldtest/tools/remfield-io/target/
+
+# Internal working files — present locally, not part of the public repo
+/journal/
+CLAUDE.md
+AGENTS.md
+.claude/
