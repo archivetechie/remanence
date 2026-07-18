@@ -11,8 +11,8 @@ specification disagree, the specification wins.*
 ## 1. The problem
 
 Suppose you are responsible for a large media archive — decades of footage,
-still growing every day — and your job is to make sure it exists in fifty
-years. Not "probably exists". Exists.
+still growing every day — and your job is to make sure that in fifty
+years it still exists, and can still be read.
 
 Magnetic tape is still the medium of choice for this: it is cheap per
 terabyte, it sits on a shelf using no power, and its raw bit rot rates are
@@ -46,7 +46,8 @@ contracts, and professional services to change a setting. Worse than the
 price is the dependency it buys: the on-tape format is the vendor's, the
 catalog is the vendor's, and the day the contract lapses or the product is
 discontinued, your archive's readability has an expiry date. For an
-institution thinking in decades, the licensing model *is* an archival risk.
+institution thinking in decades, the licensing model itself becomes an
+archival risk.
 
 **The open-source shelf** holds two things. Backup suites (Bacula and its
 descendants) are honest tools shaped for a different job — rotating
@@ -157,13 +158,12 @@ stored bytes. Verification is therefore always a mechanical comparison, and
 An RAO object ("Rem Archive Object") bundles a set of files — typically the
 contents of one camera card or one submission — into a single unit.
 
-**Bundling is not a convenience; it is how tape survives real data.** A
-tape drive is magnificent at one thing: streaming large amounts of data
-without stopping. Ask it to handle a million four-kilobyte files
-individually and everything collapses — the drive stops and repositions
-constantly, throughput falls off a cliff, and the catalog bloats with a
-million fingerprint records for cache fragments nobody will ever restore
-one at a time. Real collections are full of exactly that: an editing
+**Bundling exists for a practical reason: tape only performs well when it
+streams.** A tape drive is very good at one thing — writing large amounts
+of data in one continuous motion. Ask it to handle a million four-kilobyte
+files individually and throughput collapses: the drive stops and
+repositions constantly, and the catalog fills with a million fingerprint
+records for cache fragments nobody will ever restore one at a time. Real collections are full of exactly that: an editing
 application's cache directory, the sweepings of a decommissioned laptop, a
 project folder with ten thousand thumbnails. The format answers at two
 levels. First, the object itself: many files become one large,
@@ -173,8 +173,8 @@ directory, that thumbnail forest — be wrapped into a *single member* with
 one fingerprint and its own internal listing. The wrapped subtree can
 still be restored whole, or opened and picked from when someone really
 does need one file out of it, but it costs the tape one stream and the
-manifest one record instead of ten thousand. What deserves individual
-identity keeps it; what doesn't is carried honestly in bulk.
+manifest one record instead of ten thousand. Files that deserve
+individual identity keep it; the rest are carried in bulk, deliberately.
 
 **It is a tar file with discipline.** The object is a POSIX pax tar stream,
 which is the modern, standardized flavor of tar. Two rules give it its
@@ -209,11 +209,11 @@ scrub copies against the physical fingerprint without needing to understand
 ## 6. Encryption without a hostage situation
 
 Some copies leave the building — an offsite tape, a rented object store.
-Those copies are encrypted. Encrypting an archive, however, creates the most
-dangerous failure mode in this entire design space: **the archive that
-outlives its keys is gone**, as thoroughly as if the tapes had burned. So
-the encrypted representation is designed around key custody first and
-cryptography second.
+Those copies are encrypted. Encrypting an archive, however, introduces the
+most serious failure mode in this whole design space: an archive that
+outlives its keys is lost as thoroughly as if the tapes had burned. For
+that reason the encrypted representation is designed around key custody
+first and cryptography second.
 
 **The envelope.** An encrypted object is the *identical* plaintext stream —
 manifest and all — sealed inside an authenticated envelope. Nothing about
@@ -243,7 +243,7 @@ Three consequences, each deliberate:
   key used for day-to-day restores; the other is a **recovery key** whose
   private half is generated on an offline machine, split into shares held
   by different people, and never present on any server. Losing the
-  operational key is then an inconvenience, not an extinction event.
+  operational key is then an inconvenience rather than a catastrophe.
 
 **Range reads still work.** The encryption is chunked so that its blocks
 line up one-to-one with the plaintext's blocks. The same arithmetic that
@@ -278,8 +278,9 @@ servo tracks disturbed by dust or a handling crease leave the drive unable
 to position over certain stretches of tape at all. The data there was
 written perfectly; it is simply unreachable, and every file that lived in
 that span is gone — even though the other 99% of the cartridge reads
-flawlessly. A format with per-region redundancy turns exactly that event
-from permanent loss into arithmetic.
+flawlessly. Parity exists for exactly that event: with per-region
+redundancy on the tape, an unreadable stretch becomes a repair job instead
+of a permanent loss.
 
 So, as objects stream to tape, the writer accumulates Reed–Solomon
 parity — the same mathematical family that lets a scratched CD play — over
@@ -404,8 +405,9 @@ That is real hardware, but it is one library family and one drive
 generation — a young footprint for formats that talk about decades.
 
 So a closing piece of advice, offered in the same spirit as everything
-above: this is version 1.0, and **you should not extend it trust it has
-not yet earned**. Whatever you deploy, operate a standing process in which
+above: this is version 1.0, and it has not yet had the years of operation
+that earn an archive system real trust. Treat it accordingly. Whatever you
+deploy, operate a standing process in which
 data is not merely written but *restored and verified* — routinely, from
 the actual media, compared fingerprint-for-fingerprint against what was
 ingested. The formats make this cheap to automate: every file carries its
