@@ -1,6 +1,8 @@
 <!-- code-anchor: none -->
 # Remanence
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21425126.svg)](https://doi.org/10.5281/zenodo.21425126)
+
 Remanence is open Rust infrastructure for writing archives to LTO tape
 and getting them back decades later. It is the mechanism layer of an
 archive system: a daemon and CLIs that discover tape libraries, move
@@ -198,7 +200,11 @@ Issues and pull requests are welcome — see
 To report a security issue, especially anything affecting the encryption
 envelope or the integrity guarantees, see [SECURITY.md](SECURITY.md);
 please do not open a public issue for suspected vulnerabilities.
-Release history lives in [CHANGELOG.md](CHANGELOG.md).
+Release history lives in [CHANGELOG.md](CHANGELOG.md). Released
+versions are archived on Zenodo; to cite the project or the format
+specifications, use DOI
+[10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126) (see
+[CITATION.cff](CITATION.cff)).
 
 ## License
 

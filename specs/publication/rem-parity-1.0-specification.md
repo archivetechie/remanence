@@ -7,6 +7,7 @@
 | Status | Draft for review |
 | Version | 1.0 |
 | Date | 2026-06-11 |
+| Archived release DOI | [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126) |
 | Bootstrap magic | `52 45 4D 00 42 4F 4F 01` (`"REM\0BOO\x01"`, fixed bytes) |
 | Erasure scheme identifier | `rs-cauchy-gf256-v1` |
 | parity_map format identifier | `rem-parity-map-v1` |
