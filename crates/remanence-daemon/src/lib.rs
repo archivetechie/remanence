@@ -107,6 +107,9 @@ pub async fn serve(
                     tcp_state.read_session_service(),
                 ),
             )
+            .add_service(pb::audit_server::AuditServer::new(
+                tcp_state.audit_service(),
+            ))
             .add_service(pb::library_service_server::LibraryServiceServer::new(
                 tcp_state.library_service(),
             ));
@@ -145,6 +148,9 @@ pub async fn serve(
                     unix_state.read_session_service(),
                 ),
             )
+            .add_service(pb::audit_server::AuditServer::new(
+                unix_state.audit_service(),
+            ))
             .add_service(pb::library_service_server::LibraryServiceServer::new(
                 unix_state.library_service(),
             ))

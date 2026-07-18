@@ -1817,6 +1817,7 @@ dependencies = [
  "clap",
  "libc",
  "nix",
+ "prost-types",
  "remanence-api",
  "remanence-library",
  "remanence-state",
@@ -1826,6 +1827,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

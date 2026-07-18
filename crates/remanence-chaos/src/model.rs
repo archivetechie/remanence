@@ -636,23 +636,27 @@ impl ModelTransport {
     fn log_sense(&self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
         let bay = self.drive_bay()?;
         let page_code = cdb.get(2).copied().unwrap_or(0) & 0x3f;
-        if page_code != remanence_scsi::log_sense::PAGE_TAPE_ALERT {
-            return Err(ScsiError::InvalidInput("unsupported LOG SENSE page"));
-        }
-
-        let world = self.world.lock().expect("virtual world lock");
-        let mut flags = world
-            .drive_alert_flags
-            .get(&bay)
-            .cloned()
-            .unwrap_or_default();
-        if let Some(barcode) = world.loaded_barcode(bay) {
-            if let Some(tape) = world.tapes.get(barcode) {
-                flags.extend(tape.tape_alert_flags.iter().copied());
+        let page = match page_code {
+            remanence_scsi::log_sense::PAGE_TAPE_ALERT => {
+                let world = self.world.lock().expect("virtual world lock");
+                let mut flags = world
+                    .drive_alert_flags
+                    .get(&bay)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(barcode) = world.loaded_barcode(bay) {
+                    if let Some(tape) = world.tapes.get(barcode) {
+                        flags.extend(tape.tape_alert_flags.iter().copied());
+                    }
+                }
+                remanence_scsi::log_sense::synthesize_tape_alert_page(&flags)
             }
-        }
-
-        let page = remanence_scsi::log_sense::synthesize_tape_alert_page(&flags);
+            remanence_scsi::log_sense::PAGE_WRITE_ERROR_COUNTER
+            | remanence_scsi::log_sense::PAGE_READ_ERROR_COUNTER => {
+                remanence_scsi::log_sense::synthesize_error_counter_page(page_code, 0, 0)
+            }
+            _ => return Err(ScsiError::InvalidInput("unsupported LOG SENSE page")),
+        };
         let n = page.len().min(buf.len()).min(log_sense_alloc_len(cdb));
         buf[..n].copy_from_slice(&page[..n]);
         Ok(TransferOutcome::clean(n as u32))

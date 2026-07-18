@@ -3,8 +3,13 @@
 //! LibraryService.list_libraries through it.
 
 use remanence_api::{pb, ApiState};
-use remanence_state::{CatalogIndex, TapePoolProjectionInput};
+use remanence_state::{
+    AuditActor, AuditEvent, AuditEventRecord, AuditSubject, CatalogIndex, FileAuditLog,
+    SourceLayer, TapePoolProjectionInput,
+};
+use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig};
 
 #[tokio::test]
 async fn serve_catalog_roundtrips_health_and_pools_over_unix_socket() {
@@ -24,8 +29,24 @@ async fn serve_catalog_roundtrips_health_and_pools_over_unix_socket() {
             created_at_utc: None,
         })
         .expect("seed pool");
+    let session_id = uuid::Uuid::new_v4();
+    FileAuditLog::open(dir.path().join("audit"), false)
+        .expect("open audit")
+        .append_and_return_record(AuditEventRecord {
+            actor: AuditActor::System,
+            source_layer: SourceLayer::Layer5,
+            operation_id: None,
+            session_id: Some(session_id),
+            idempotency_key: None,
+            event: AuditEvent::OperationFailed,
+            subject: AuditSubject {
+                kind: "session".to_string(),
+                id: Some(session_id.to_string()),
+            },
+            detail: BTreeMap::new(),
+        })
+        .expect("seed audit");
     let state = ApiState::new(index);
-
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let serve_socket = socket_path.clone();
     let server = tokio::spawn(async move {
@@ -73,12 +94,162 @@ async fn serve_catalog_roundtrips_health_and_pools_over_unix_socket() {
         "read-only state has no inventory snapshot"
     );
 
+    let channel = remanence_api::connect_unix(socket_path.clone())
+        .await
+        .expect("reconnect unix audit");
+    let mut audit = pb::audit_client::AuditClient::new(channel);
+    let mut entries = audit
+        .query_audit(pb::QueryAuditRequest {
+            since: Some(prost_types::Timestamp {
+                seconds: 0,
+                nanos: 0,
+            }),
+            until: Some(prost_types::Timestamp {
+                seconds: 4_102_444_800,
+                nanos: 0,
+            }),
+            filter: [("session_id".to_string(), session_id.to_string())]
+                .into_iter()
+                .collect(),
+        })
+        .await
+        .expect("query audit over unix transport")
+        .into_inner();
+    let entry = entries
+        .message()
+        .await
+        .expect("read audit entry")
+        .expect("filtered audit entry");
+    assert_eq!(entry.session_id, session_id.as_bytes());
+    assert_eq!(entry.event_kind, "OperationFailed");
+    assert!(
+        entries
+            .message()
+            .await
+            .expect("finish audit stream")
+            .is_none(),
+        "audit filter must return exactly one entry"
+    );
+
     let _ = shutdown_tx.send(());
     server.await.expect("server task");
     assert!(
         !socket_path.exists(),
         "socket should be unlinked on shutdown"
     );
+}
+
+#[tokio::test]
+async fn serve_audit_query_roundtrips_over_mtls_transport() {
+    let dir = tempfile::Builder::new()
+        .prefix("rem-daemon-audit-mtls")
+        .tempdir()
+        .expect("tempdir");
+    let socket_path = dir.path().join("rem.sock");
+    let index = CatalogIndex::open(dir.path().join("state.sqlite")).expect("open index");
+    let session_id = uuid::Uuid::new_v4();
+    FileAuditLog::open(dir.path().join("audit"), false)
+        .expect("open audit")
+        .append_and_return_record(AuditEventRecord {
+            actor: AuditActor::System,
+            source_layer: SourceLayer::Layer5,
+            operation_id: None,
+            session_id: Some(session_id),
+            idempotency_key: None,
+            event: AuditEvent::OperationFailed,
+            subject: AuditSubject {
+                kind: "session".to_string(),
+                id: Some(session_id.to_string()),
+            },
+            detail: BTreeMap::new(),
+        })
+        .expect("seed audit");
+    let reserved_tcp = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("loopback TCP must be available for the mTLS transport test");
+    let tcp_addr = reserved_tcp.local_addr().expect("reserved TCP address");
+    drop(reserved_tcp);
+    let ca = include_bytes!("fixtures/tls/ca.pem");
+    let tls_listener = remanence_daemon::TlsListener {
+        addr: tcp_addr,
+        tls: ServerTlsConfig::new()
+            .identity(Identity::from_pem(
+                include_bytes!("fixtures/tls/server.pem"),
+                include_bytes!("fixtures/tls/server.key"),
+            ))
+            .client_ca_root(Certificate::from_pem(ca)),
+    };
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve_socket = socket_path.clone();
+    let server = tokio::spawn(async move {
+        remanence_daemon::serve(
+            ApiState::new(index),
+            &serve_socket,
+            Some(tls_listener),
+            async {
+                let _ = shutdown_rx.await;
+            },
+        )
+        .await
+        .expect("serve");
+    });
+    for _ in 0..100 {
+        if socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(socket_path.exists(), "daemon did not create the socket");
+
+    let tls = ClientTlsConfig::new()
+        .domain_name("localhost")
+        .ca_certificate(Certificate::from_pem(ca))
+        .identity(Identity::from_pem(
+            include_bytes!("fixtures/tls/client.pem"),
+            include_bytes!("fixtures/tls/client.key"),
+        ));
+    let channel = Endpoint::from_shared(format!("https://localhost:{}", tcp_addr.port()))
+        .expect("TCP endpoint")
+        .tls_config(tls)
+        .expect("client TLS config")
+        .connect()
+        .await
+        .expect("connect mTLS transport");
+    let mut audit = pb::audit_client::AuditClient::new(channel);
+    let mut entries = audit
+        .query_audit(pb::QueryAuditRequest {
+            since: Some(prost_types::Timestamp {
+                seconds: 0,
+                nanos: 0,
+            }),
+            until: Some(prost_types::Timestamp {
+                seconds: 4_102_444_800,
+                nanos: 0,
+            }),
+            filter: [("event_kind".to_string(), "OperationFailed".to_string())]
+                .into_iter()
+                .collect(),
+        })
+        .await
+        .expect("query audit over mTLS transport")
+        .into_inner();
+    let entry = entries
+        .message()
+        .await
+        .expect("read mTLS audit entry")
+        .expect("filtered mTLS audit entry");
+    assert_eq!(entry.session_id, session_id.as_bytes());
+    assert_eq!(entry.event_kind, "OperationFailed");
+    assert!(
+        entries
+            .message()
+            .await
+            .expect("finish mTLS audit stream")
+            .is_none(),
+        "mTLS audit filter must return exactly one entry"
+    );
+
+    let _ = shutdown_tx.send(());
+    server.await.expect("server task");
 }
 
 #[tokio::test]
