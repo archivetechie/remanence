@@ -6,7 +6,9 @@ per-release summaries.
 
 ## v1.0.0 — 2026-07-18
 
-First publication release.
+First publication release. Archived: DOI
+[10.5281/zenodo.21425127](https://doi.org/10.5281/zenodo.21425127)
+(concept DOI [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126)).
 
 - **RAO Format Specification 1.0** (`specs/publication/`): the archival
   object format — a byte-deterministic, chunk-aligned POSIX pax tar
