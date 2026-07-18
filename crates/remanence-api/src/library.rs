@@ -378,13 +378,24 @@ impl LibraryServiceApi {
             .state
             .current_library_snapshot()
             .ok_or_else(|| Status::not_found("library not found"))?;
-        snapshot
+        let library_serial = snapshot
             .report
             .libraries
             .iter()
             .find(|library| library_uuid(&library.serial) == requested)
             .map(|library| library.serial.clone())
-            .ok_or_else(|| Status::not_found("library not found"))
+            .ok_or_else(|| Status::not_found("library not found"))?;
+        if self
+            .state
+            .default_library_serial
+            .as_deref()
+            .is_some_and(|operated| operated.as_str() != library_serial)
+        {
+            return Err(Status::failed_precondition(format!(
+                "library {library_serial} is discovered but is not operated by this daemon"
+            )));
+        }
+        Ok(library_serial)
     }
 
     async fn dispatch_robotics(
@@ -470,7 +481,7 @@ impl LibraryServiceApi {
     }
 }
 
-fn narrow_element(address: u32, field: &str) -> Result<u16, Status> {
+pub(crate) fn narrow_element(address: u32, field: &str) -> Result<u16, Status> {
     u16::try_from(address)
         .map_err(|_| Status::invalid_argument(format!("{field} exceeds the 16-bit element range")))
 }
@@ -1448,6 +1459,34 @@ mod tests {
             .await
             .expect_err("no owner");
         assert_eq!(err.code(), tonic::Code::Unavailable);
+    }
+
+    #[test]
+    fn robotics_resolution_rejects_discovered_non_operated_library() {
+        let mut state = state_with_snapshot();
+        state.default_library_serial = Some(Arc::new("DEC418146K_LL02".to_string()));
+        let mut second_library = mk_library();
+        second_library.serial = "D2LIB".to_string();
+        let current = state.current_library_snapshot().expect("library snapshot");
+        state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::LibrarySnapshot {
+                report: DiscoveryReport {
+                    libraries: vec![current.report.libraries[0].clone(), second_library],
+                    warnings: Vec::new(),
+                },
+                captured_at: current.captured_at,
+            },
+        ))));
+
+        let error = state
+            .library_service()
+            .resolve_library_serial(&library_uuid("D2LIB"))
+            .expect_err("a discovered second library must not alias the operated changer");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            error.message(),
+            "library D2LIB is discovered but is not operated by this daemon"
+        );
     }
 
     #[tokio::test]

@@ -267,55 +267,95 @@ async fn open_write_session_reserved(
     Ok(session)
 }
 
+/// Inventory constraint used to select the mount for a read-session open.
+///
+/// Both variants converge on the same drive-actor open path below; the pinned
+/// variant changes only mount selection and never bypasses readiness, media
+/// fencing, BOT identity proof, or session audit recording.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReadSessionTarget {
+    Tape {
+        tape_uuid: TapeUuid,
+    },
+    LoadedDrive {
+        tape_uuid: TapeUuid,
+        library_serial: String,
+        bay: u16,
+    },
+}
+
+impl ReadSessionTarget {
+    pub(crate) fn tape_uuid(&self) -> TapeUuid {
+        match self {
+            Self::Tape { tape_uuid } | Self::LoadedDrive { tape_uuid, .. } => *tape_uuid,
+        }
+    }
+}
+
 pub(crate) async fn open_read_session(
     state: &ApiState,
-    tape_uuid: TapeUuid,
+    target: ReadSessionTarget,
     resume_target: Option<crate::write_owner::ReadResumeTarget>,
 ) -> Result<pb::ReadSession, Status> {
     let state = state.clone();
     await_critical_task(
         "open_read_session",
-        tokio::spawn(
-            async move { open_read_session_critical(state, tape_uuid, resume_target).await },
-        ),
+        tokio::spawn(async move { open_read_session_critical(state, target, resume_target).await }),
     )
     .await
 }
 
 async fn open_read_session_critical(
     state: ApiState,
-    tape_uuid: TapeUuid,
+    target: ReadSessionTarget,
     resume_target: Option<crate::write_owner::ReadResumeTarget>,
 ) -> Result<pb::ReadSession, Status> {
     let pool = state.drive_pool()?.clone();
-    let library_serial = state
-        .default_library_serial
-        .as_deref()
-        .map(|serial| serial.as_str().to_string())
-        .ok_or_else(|| {
-            Status::invalid_argument(
-                "tape-target read sessions require exactly one configured library in this slice",
-            )
-        })?;
-    if pool.is_tape_mounted(&tape_uuid) {
-        return Err(Status::failed_precondition("tape is already mounted"));
-    }
-    let _tape_reservation = match pool.reserve_tape(tape_uuid) {
-        Ok(reservation) => reservation,
-        Err(err) => return Err(err),
+    let tape_uuid = target.tape_uuid();
+    let _tape_reservation = pool.reserve_tape(tape_uuid)?;
+    let (mount, drive_reservation) = match target {
+        ReadSessionTarget::Tape { .. } => {
+            let library_serial = state
+                .default_library_serial
+                .as_deref()
+                .map(|serial| serial.as_str().to_string())
+                .ok_or_else(|| {
+                    Status::invalid_argument(
+                        "tape-target read sessions require exactly one configured library in this slice",
+                    )
+                })?;
+            resolve_and_reserve_actor_mount(&state, &pool, &library_serial, &tape_uuid)?
+        }
+        ReadSessionTarget::LoadedDrive {
+            library_serial,
+            bay,
+            ..
+        } => {
+            let reservation = pool.reserve_drive(bay)?;
+            let mount = resolve_pinned_actor_mount(&state, &library_serial, bay, &tape_uuid)?;
+            ensure_actor_mount_media_readiness_admitted(&state, &library_serial, &mount)?;
+            (mount, reservation)
+        }
     };
-    open_read_session_reserved(&state, &pool, library_serial, tape_uuid, resume_target).await
+    open_read_session_on_mount(
+        &state,
+        &pool,
+        mount,
+        drive_reservation,
+        tape_uuid,
+        resume_target,
+    )
+    .await
 }
 
-async fn open_read_session_reserved(
+async fn open_read_session_on_mount(
     state: &ApiState,
     pool: &crate::write_owner::DrivePool,
-    library_serial: String,
+    mount: ActorMount,
+    drive_reservation: crate::write_owner::DriveReservation,
     tape_uuid: TapeUuid,
     resume_target: Option<crate::write_owner::ReadResumeTarget>,
 ) -> Result<pb::ReadSession, Status> {
-    let (mount, drive_reservation) =
-        resolve_and_reserve_actor_mount(state, pool, &library_serial, &tape_uuid)?;
     let drive = pool.drive_tx(mount.bay)?;
     if let Some(slot) = mount.source_slot {
         changer_move(pool, slot, mount.bay).await?;
@@ -751,6 +791,75 @@ fn resolve_actor_mount(
     let mut mount = resolve_actor_mount_from_library(library, voltag.as_str(), busy_bays)?;
     mount.library_serial = library_serial.to_string();
     mount.barcode = barcode;
+    enrich_actor_mount_from_catalog(&index, library_serial, &mut mount)?;
+    Ok(mount)
+}
+
+fn resolve_pinned_actor_mount(
+    state: &ApiState,
+    library_serial: &str,
+    bay: u16,
+    tape_uuid: &TapeUuid,
+) -> Result<ActorMount, Status> {
+    let index = CatalogIndex::open_read_only(state.index_path.as_ref())
+        .map_err(|err| Status::internal(err.to_string()))?;
+    let tape = index
+        .get_tape(tape_uuid)
+        .map_err(status_from_state_error)?
+        .ok_or_else(|| Status::not_found("tape not found"))?;
+    let expected_barcode = tape.voltag.ok_or_else(|| {
+        Status::failed_precondition(format!(
+            "drive bay 0x{bay:04x} tape identity cannot be proven: catalog tape has no barcode"
+        ))
+    })?;
+    let snapshot = state
+        .current_library_snapshot()
+        .ok_or_else(|| Status::not_found("library not found"))?;
+    let library = snapshot
+        .report
+        .libraries
+        .iter()
+        .find(|library| library.serial == library_serial)
+        .ok_or_else(|| Status::not_found(format!("library {library_serial} not found")))?;
+    let drive_bay = library
+        .drive_bays
+        .iter()
+        .find(|candidate| candidate.element_address == bay)
+        .ok_or_else(|| Status::not_found(format!("drive bay 0x{bay:04x} not found")))?;
+    if !drive_bay.loaded {
+        return Err(Status::failed_precondition(format!(
+            "drive bay 0x{bay:04x} is empty"
+        )));
+    }
+    let observed_barcode = drive_bay.loaded_tape.as_deref().ok_or_else(|| {
+        Status::failed_precondition(format!(
+            "drive bay 0x{bay:04x} tape identity cannot be proven: loaded media has no readable barcode"
+        ))
+    })?;
+    if observed_barcode != expected_barcode {
+        return Err(Status::failed_precondition(format!(
+            "drive bay 0x{bay:04x} tape identity cannot be proven: expected barcode {expected_barcode}, observed {observed_barcode}"
+        )));
+    }
+    let mut mount = ActorMount {
+        bay,
+        barcode: Some(observed_barcode.to_string()),
+        source_slot: None,
+        home_slot: drive_bay.source_slot,
+        needs_drive_load: false,
+        library_serial: library_serial.to_string(),
+        drive_uuid: None,
+        drive_serial: None,
+    };
+    enrich_actor_mount_from_catalog(&index, library_serial, &mut mount)?;
+    Ok(mount)
+}
+
+fn enrich_actor_mount_from_catalog(
+    index: &CatalogIndex,
+    library_serial: &str,
+    mount: &mut ActorMount,
+) -> Result<(), Status> {
     if index
         .list_drives(true, true)
         .map_err(status_from_state_error)?
@@ -772,7 +881,7 @@ fn resolve_actor_mount(
         mount.drive_uuid = Some(drive.drive_uuid);
         mount.drive_serial = Some(drive.serial);
     }
-    Ok(mount)
+    Ok(())
 }
 
 fn ensure_actor_mount_media_readiness_admitted(

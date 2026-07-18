@@ -331,19 +331,6 @@ impl DrivePool {
         in_use
     }
 
-    pub(crate) fn is_tape_mounted(&self, tape_uuid: &TapeUuid) -> bool {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .values()
-            .any(|mounted| &mounted.tape_uuid == tape_uuid)
-            || self
-                .tape_reservations
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .contains(tape_uuid)
-    }
-
     pub(crate) fn reserve_tape(&self, tape_uuid: TapeUuid) -> Result<TapeReservation, Status> {
         if self
             .sessions
@@ -1034,6 +1021,29 @@ fn record_session_close_snapshot(
     tape_uuid: [u8; 16],
     consecutive_misses: &mut u32,
 ) {
+    record_session_snapshot(
+        index,
+        cfg,
+        drive,
+        drive_uuid,
+        session_id,
+        tape_uuid,
+        "session-close",
+        consecutive_misses,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_session_snapshot(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    drive: &mut DriveHandle,
+    drive_uuid: Option<Vec<u8>>,
+    session_id: Uuid,
+    tape_uuid: [u8; 16],
+    trigger: &'static str,
+    consecutive_misses: &mut u32,
+) {
     let Some(drive_uuid) = drive_uuid else {
         return;
     };
@@ -1043,7 +1053,7 @@ fn record_session_close_snapshot(
         drive,
         DriveSnapshotRequest {
             drive_uuid: drive_uuid.clone(),
-            trigger: "session-close",
+            trigger,
             session_id: Some(session_id),
             tape_uuid: Some(tape_uuid),
         },
@@ -2000,6 +2010,16 @@ fn handle_drive_open_write(
                             throughput_mib_s = crate::diagnostics::mib_per_s(logical_size, append_elapsed),
                             "remanence_write_diag",
                         );
+                        record_session_snapshot(
+                            index,
+                            cfg,
+                            drive,
+                            drive_uuid.clone(),
+                            session_id,
+                            tape_uuid,
+                            "append-failure",
+                            snapshot_misses,
+                        );
                         let _ = reply.send(Err(status_from_pool_write_error(err)));
                     }
                 }
@@ -2477,6 +2497,16 @@ fn handle_drive_open_read(
                         })
                 };
                 if let Err(status) = result {
+                    record_session_snapshot(
+                        index,
+                        cfg,
+                        drive,
+                        drive_uuid.clone(),
+                        session_id,
+                        tape_uuid,
+                        "read-failure",
+                        snapshot_misses,
+                    );
                     let _ = chunk_tx.blocking_send(Err(status));
                 }
             }
@@ -2507,6 +2537,16 @@ fn handle_drive_open_read(
                     stream_chunk_bytes,
                     chunk_tx.clone(),
                 ) {
+                    record_session_snapshot(
+                        index,
+                        cfg,
+                        drive,
+                        drive_uuid.clone(),
+                        session_id,
+                        tape_uuid,
+                        "read-failure",
+                        snapshot_misses,
+                    );
                     let _ = chunk_tx.blocking_send(Err(status));
                 }
             }
@@ -4883,7 +4923,7 @@ mod tests {
     use super::*;
     use prost::Message as _;
     use remanence_aead::RecipientPrivateKey;
-    use remanence_chaos::model::{ModelTransport, VirtualTape, VirtualWorld};
+    use remanence_chaos::model::{ModelTransport, Record, VirtualTape, VirtualWorld};
     use remanence_format::{
         read_encrypted_rao_file_range_to_vec, write_encrypted_rao_object, write_rem_tar_object,
         RemTarFile, RemTarObjectLayout, RemTarObjectOptions,
@@ -4901,7 +4941,7 @@ mod tests {
     use remanence_state::{
         CatalogIndex, DriveObservationInput, NativeObjectCopyProjectionInput,
         NativeObjectFileProjectionInput, NativeObjectProjectionInput, ProvisionTapeInput,
-        TapeJournalIndexInput, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+        TapeJournalIndexInput, TapePoolProjectionInput, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
     };
     use tokio_stream::StreamExt;
 
@@ -6129,6 +6169,295 @@ mod tests {
                 .expect("alarm row")
                 .state,
             "cleared"
+        );
+    }
+
+    #[test]
+    fn failure_snapshots_are_keyed_by_failing_session() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-api-failure-snapshots")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+        let drive_uuid = index
+            .observe_drive(DriveObservationInput {
+                serial: "DRV-FAIL-SNAPSHOT".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("LIB-FAIL-SNAPSHOT".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-18T00:00:00Z".to_string()),
+            })
+            .expect("observe drive")
+            .drive_uuid;
+        let mut world =
+            VirtualWorld::single_drive("LIB-FAIL-SNAPSHOT", 0x0100, "DRV-FAIL-SNAPSHOT", 0x0400, 1);
+        world.put_tape_in_drive(0x0100, "FAIL001L9", Some(0x0400), VirtualTape::default());
+        let world = Arc::new(Mutex::new(world));
+        let mut library = open_model_library(Arc::clone(&world));
+        let snapshot = library_snapshot_cell(library.library().clone());
+        let audit_dir = temp.path().join("audit");
+        std::fs::create_dir_all(&audit_dir).expect("create audit dir");
+        let cfg = test_write_owner_config(index_path, audit_dir, &library, snapshot);
+        let serial = library.library().serial.clone();
+        let policy = remanence_library::StaticAllowlist::new([serial.as_str()]);
+        let mut drive = library
+            .open_drive(0x0100, &policy)
+            .expect("open model drive");
+        let append_session = Uuid::new_v4();
+        let read_session = Uuid::new_v4();
+        let tape_uuid = [0x77; 16];
+        let mut misses = 0;
+
+        record_session_snapshot(
+            &mut index,
+            &cfg,
+            &mut drive,
+            Some(drive_uuid.clone()),
+            append_session,
+            tape_uuid,
+            "append-failure",
+            &mut misses,
+        );
+        record_session_snapshot(
+            &mut index,
+            &cfg,
+            &mut drive,
+            Some(drive_uuid.clone()),
+            read_session,
+            tape_uuid,
+            "read-failure",
+            &mut misses,
+        );
+
+        let rows = index
+            .list_drive_health_snapshots(&drive_uuid)
+            .expect("list failure snapshots");
+        let append_session = append_session.to_string();
+        let read_session = read_session.to_string();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].trigger, "append-failure");
+        assert_eq!(rows[0].session_id.as_deref(), Some(append_session.as_str()));
+        assert_eq!(rows[1].trigger, "read-failure");
+        assert_eq!(rows[1].session_id.as_deref(), Some(read_session.as_str()));
+    }
+
+    #[tokio::test]
+    async fn induced_append_and_read_failures_persist_session_snapshots() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-api-induced-failure-snapshots")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+        let tape_uuid = [0x78; 16];
+        index
+            .upsert_tape_pool_projection(TapePoolProjectionInput {
+                pool_id: "failure-test".to_string(),
+                display_name: None,
+                copy_class: None,
+                content_class: None,
+                created_at_utc: None,
+            })
+            .expect("project pool");
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "FAIL002L9".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        index
+            .project_tape_pool_membership(tape_uuid, "failure-test")
+            .expect("assign pool");
+        let drive_uuid = index
+            .observe_drive(DriveObservationInput {
+                serial: "DRV-INDUCED-FAIL".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("LIB-INDUCED-FAIL".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-18T00:00:00Z".to_string()),
+            })
+            .expect("observe drive")
+            .drive_uuid;
+
+        let bootstrap = BootstrapPayload {
+            scheme: None,
+            no_parity_flag: true,
+            filemark_map_digest: None,
+            tape_uuid,
+            written_by_version: "test".to_string(),
+            written_at: "2026-07-18T00:00:00Z".to_string(),
+            sequence: 0,
+            block_size_bytes: 4096,
+            drive_compression: false,
+            sidecar_epoch_directory: None,
+            parity_map_reference: None,
+            object_rows: Vec::new(),
+        };
+        let mut bootstrap_block = vec![0u8; 4096];
+        write_bootstrap_block(&bootstrap, &mut bootstrap_block).expect("encode bootstrap");
+        let mut tape = VirtualTape::empty(64 * 1024 * 1024, 4096);
+        tape.records = vec![
+            Record::Block(bootstrap_block),
+            Record::Filemark,
+            Record::Filemark,
+        ];
+        tape.written_bytes = 4096;
+        let mut world =
+            VirtualWorld::single_drive("LIB-INDUCED-FAIL", 0x0100, "DRV-INDUCED-FAIL", 0x0400, 1);
+        world.put_tape_in_drive(0x0100, "FAIL002L9", Some(0x0400), tape);
+        let world = Arc::new(Mutex::new(world));
+        let mut library = open_model_library(Arc::clone(&world));
+        let snapshot = library_snapshot_cell(library.library().clone());
+        let audit_dir = temp.path().join("audit");
+        std::fs::create_dir_all(&audit_dir).expect("create audit dir");
+        let cfg = test_write_owner_config(index_path.clone(), audit_dir, &library, snapshot);
+        let serial = library.library().serial.clone();
+        let policy = remanence_library::StaticAllowlist::new([serial.as_str()]);
+        let drive = library
+            .open_drive(0x0100, &policy)
+            .expect("open model drive");
+        let drive_tx = spawn_drive_actor(0x0100, drive, cfg);
+
+        let (open_read_tx, open_read_rx) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::OpenRead {
+                tape_uuid,
+                needs_drive_load: false,
+                library_serial: serial.clone(),
+                barcode: Some("FAIL002L9".to_string()),
+                source_slot: None,
+                drive_uuid: Some(drive_uuid.clone()),
+                drive_serial: Some("DRV-INDUCED-FAIL".to_string()),
+                resume_target: None,
+                daemon_epoch: 1,
+                reply: open_read_tx,
+            })
+            .await
+            .expect("send read open");
+        let read_session = open_read_rx
+            .await
+            .expect("read open reply")
+            .expect("open read session");
+        let read_session_id =
+            Uuid::from_slice(&read_session.session_id).expect("read session UUID");
+        let (chunk_tx, mut chunk_rx) = crate::read_core::read_stream_channel(4096);
+        drive_tx
+            .send(DriveCommand::ReadFile {
+                session_id: read_session_id,
+                object_id: Uuid::new_v4().to_string(),
+                file_id: Vec::new(),
+                stream_chunk_bytes: 4096,
+                chunk_tx,
+            })
+            .await
+            .expect("send failing read");
+        chunk_rx
+            .next()
+            .await
+            .expect("read failure item")
+            .expect_err("missing object induces read failure");
+        let (close_read_tx, close_read_rx) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::CloseRead {
+                session_id: read_session_id,
+                unload_before_close: false,
+                reply: close_read_tx,
+            })
+            .await
+            .expect("send read close");
+        close_read_rx
+            .await
+            .expect("read close reply")
+            .expect("close read session");
+
+        let pool_cfg = TapePoolConfig {
+            id: "failure-test".to_string(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
+            watermark_low: 0.9,
+            watermark_high: 0.95,
+            block_size_bytes: 4096,
+            min_object_size_bytes: 0,
+        };
+        let (open_write_tx, open_write_rx) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::OpenWrite {
+                pool_cfg: pool_cfg.clone(),
+                selected: SelectedTape {
+                    pool_id: "failure-test".to_string(),
+                    tape_uuid,
+                    block_size: 4096,
+                    parity_config: ParityConfig::None,
+                },
+                needs_drive_load: false,
+                library_serial: serial,
+                barcode: Some("FAIL002L9".to_string()),
+                source_slot: None,
+                drive_uuid: Some(drive_uuid.clone()),
+                drive_serial: Some("DRV-INDUCED-FAIL".to_string()),
+                reply: open_write_tx,
+            })
+            .await
+            .expect("send write open");
+        let write_session = open_write_rx
+            .await
+            .expect("write open reply")
+            .expect("open write session");
+        let write_session_id =
+            Uuid::from_slice(&write_session.session_id).expect("write session UUID");
+        let spool = temp.path().join("invalid-archive-path.spool");
+        std::fs::write(&spool, b"induced append failure").expect("write spool");
+        let (append_tx, append_rx) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::AppendFinish {
+                session_id: write_session_id,
+                spool_path: spool,
+                archive_path: PathBuf::from("../invalid"),
+                caller_object_id: "failure-test-object".to_string(),
+                expected_content_sha256: None,
+                live_write_counter: None,
+                reply: append_tx,
+            })
+            .await
+            .expect("send failing append");
+        append_rx
+            .await
+            .expect("append reply")
+            .expect_err("invalid archive path induces append failure");
+
+        let check = CatalogIndex::open(&index_path).expect("reopen catalog");
+        let rows = check
+            .list_drive_health_snapshots(&drive_uuid)
+            .expect("list snapshots");
+        let read_session_text = read_session_id.to_string();
+        let write_session_text = write_session_id.to_string();
+        assert!(
+            rows.iter().any(|row| {
+                row.trigger == "read-failure"
+                    && row.session_id.as_deref() == Some(read_session_text.as_str())
+            }),
+            "missing read-failure snapshot: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| {
+                row.trigger == "append-failure"
+                    && row.session_id.as_deref() == Some(write_session_text.as_str())
+            }),
+            "missing append-failure snapshot: {rows:#?}"
         );
     }
 

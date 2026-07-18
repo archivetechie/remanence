@@ -26,11 +26,12 @@ use remanence_format::{
     EntryKind, NormalizedEntry,
 };
 use remanence_state::{
-    AuditActor, AuditEvent, AuditEventRecord, AuditSubject, CatalogIndex, CatalogUnitFilter,
-    CatalogUnitRecord, DriveCorrelationRollupRecord, DriveHealthSnapshotInput, FileAuditLog,
-    MediaReadinessOperationRecord, MediaReadinessTransitionInput, NativeObjectCopyRecord,
-    NativeObjectFileRecord, NativeObjectRecord, OperationRecord, RemConfig, SourceLayer,
-    StateError, TapeFileRecord, TapeIoConfig, TapePoolConfig, TapePoolRecord, TapeRecord,
+    AuditActor, AuditEvent, AuditEventRecord, AuditRecord, AuditSubject, CatalogIndex,
+    CatalogUnitFilter, CatalogUnitRecord, DriveCorrelationRollupRecord, DriveHealthSnapshotInput,
+    FileAuditLog, MediaReadinessOperationRecord, MediaReadinessTransitionInput,
+    NativeObjectCopyRecord, NativeObjectFileRecord, NativeObjectRecord, OperationRecord, RemConfig,
+    SourceLayer, StateError, TapeFileRecord, TapeIoConfig, TapePoolConfig, TapePoolRecord,
+    TapeRecord,
 };
 use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
@@ -99,8 +100,11 @@ pub use tape_init::{
 };
 
 const CATALOG_STREAM_BUFFER: usize = 32;
+const AUDIT_STREAM_BUFFER: usize = 32;
 type BytesChunkStream =
     Pin<Box<dyn Stream<Item = Result<pb::BytesChunk, Status>> + Send + 'static>>;
+type AuditEntryStream =
+    Pin<Box<dyn Stream<Item = Result<pb::AuditEntry, Status>> + Send + 'static>>;
 
 fn tape_io_runtime_config(config: &TapeIoConfig) -> remanence_library::TapeIoRuntimeConfig {
     remanence_library::TapeIoRuntimeConfig {
@@ -554,6 +558,13 @@ impl ApiState {
     /// Return the read-session service implementation.
     pub fn read_session_service(&self) -> ReadSessionApi {
         ReadSessionApi {
+            state: self.clone(),
+        }
+    }
+
+    /// Return the read-only append-log query service implementation.
+    pub fn audit_service(&self) -> AuditApi {
+        AuditApi {
             state: self.clone(),
         }
     }
@@ -2475,6 +2486,239 @@ pub struct ReadSessionApi {
     state: ApiState,
 }
 
+/// Read-only Layer 5 audit-query service over the authoritative hash chain.
+#[derive(Clone)]
+pub struct AuditApi {
+    state: ApiState,
+}
+
+#[tonic::async_trait]
+impl pb::audit_server::Audit for AuditApi {
+    type QueryAuditStream = AuditEntryStream;
+
+    async fn query_audit(
+        &self,
+        request: Request<pb::QueryAuditRequest>,
+    ) -> Result<Response<Self::QueryAuditStream>, Status> {
+        authorize_request(&request, AuthPermission::Read)?;
+        let query = AuditQuery::try_from(request.into_inner())?;
+        Ok(Response::new(audit_entry_stream(
+            self.state.audit_dir.as_ref().clone(),
+            query,
+        )))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AuditQuery {
+    since: Option<OffsetDateTime>,
+    until: Option<OffsetDateTime>,
+    filter: BTreeMap<String, String>,
+}
+
+impl TryFrom<pb::QueryAuditRequest> for AuditQuery {
+    type Error = Status;
+
+    fn try_from(request: pb::QueryAuditRequest) -> Result<Self, Self::Error> {
+        let since = request
+            .since
+            .as_ref()
+            .map(|timestamp| audit_query_timestamp(timestamp, "since"))
+            .transpose()?;
+        let until = request
+            .until
+            .as_ref()
+            .map(|timestamp| audit_query_timestamp(timestamp, "until"))
+            .transpose()?;
+        if since
+            .zip(until)
+            .is_some_and(|(since, until)| since >= until)
+        {
+            return Err(Status::invalid_argument(
+                "audit query requires since to be earlier than until",
+            ));
+        }
+        let mut filter = BTreeMap::new();
+        for (raw_key, raw_value) in request.filter {
+            let key = raw_key.trim().to_ascii_lowercase();
+            let value = raw_value.trim().to_string();
+            if value.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "audit filter {raw_key:?} must not be empty"
+                )));
+            }
+            match key.as_str() {
+                "session_id" | "operation_id" => {
+                    Uuid::parse_str(value.as_str()).map_err(|_| {
+                        Status::invalid_argument(format!("audit filter {key} must be a UUID"))
+                    })?;
+                }
+                "event_kind" | "event" | "kind" | "actor" | "source_layer" | "subject_kind"
+                | "subject_id" => {}
+                _ => {
+                    return Err(Status::invalid_argument(format!(
+                        "unsupported audit filter {raw_key:?}"
+                    )))
+                }
+            }
+            filter.insert(key, value);
+        }
+        Ok(Self {
+            since,
+            until,
+            filter,
+        })
+    }
+}
+
+fn audit_query_timestamp(
+    timestamp: &prost_types::Timestamp,
+    field: &str,
+) -> Result<OffsetDateTime, Status> {
+    if !(0..1_000_000_000).contains(&timestamp.nanos) {
+        return Err(Status::invalid_argument(format!(
+            "{field}.nanos must be in 0..1000000000"
+        )));
+    }
+    OffsetDateTime::from_unix_timestamp(timestamp.seconds)
+        .ok()
+        .and_then(|base| base.checked_add(time::Duration::nanoseconds(i64::from(timestamp.nanos))))
+        .ok_or_else(|| Status::invalid_argument(format!("{field} is outside the supported range")))
+}
+
+fn audit_entry_stream(audit_dir: PathBuf, query: AuditQuery) -> AuditEntryStream {
+    let (tx, rx) = tokio::sync::mpsc::channel(AUDIT_STREAM_BUFFER);
+    tokio::task::spawn_blocking(move || {
+        let result = (|| -> Result<(), Status> {
+            let records = FileAuditLog::replay(&audit_dir).map_err(status_from_state_error)?;
+            for record in records {
+                if !audit_record_matches(&record, &query)? {
+                    continue;
+                }
+                if send_stream_item(&tx, audit_record_to_proto(record)).is_break() {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        })();
+        if let Err(status) = result {
+            let _ = tx.blocking_send(Err(status));
+        }
+    });
+    Box::pin(ReceiverStream::new(rx))
+}
+
+fn audit_record_matches(record: &AuditRecord, query: &AuditQuery) -> Result<bool, Status> {
+    let timestamp = OffsetDateTime::parse(record.timestamp_utc.as_str(), &Rfc3339)
+        .map_err(|err| Status::internal(format!("stored audit timestamp is invalid: {err}")))?;
+    if query.since.is_some_and(|since| timestamp < since)
+        || query.until.is_some_and(|until| timestamp >= until)
+    {
+        return Ok(false);
+    }
+    for (key, expected) in &query.filter {
+        let matched = match key.as_str() {
+            "session_id" => record
+                .session_id
+                .is_some_and(|value| value.to_string() == *expected),
+            "operation_id" => record
+                .operation_id
+                .is_some_and(|value| value.to_string() == *expected),
+            "event_kind" | "event" | "kind" => audit_event_name(&record.event) == expected,
+            "actor" => audit_actor_name(&record.actor) == *expected,
+            "source_layer" => audit_source_layer_name(&record.source_layer) == expected,
+            "subject_kind" => record.subject.kind == *expected,
+            "subject_id" => record.subject.id.as_deref() == Some(expected.as_str()),
+            _ => unreachable!("audit filter keys are validated before streaming"),
+        };
+        if !matched {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn audit_record_to_proto(record: AuditRecord) -> Result<pb::AuditEntry, Status> {
+    let timestamp = timestamp_from_rfc3339(record.timestamp_utc.as_str())
+        .ok_or_else(|| Status::internal("stored audit timestamp is invalid"))?;
+    let detail_json = serde_json::to_string(&record.detail)
+        .map_err(|err| Status::internal(format!("serialize audit detail as JSON: {err}")))?;
+    Ok(pb::AuditEntry {
+        sequence: record.sequence,
+        timestamp: Some(timestamp),
+        actor: audit_actor_name(&record.actor),
+        source_layer: audit_source_layer_name(&record.source_layer).to_string(),
+        operation_id: record
+            .operation_id
+            .map(|value| value.as_bytes().to_vec())
+            .unwrap_or_default(),
+        session_id: record
+            .session_id
+            .map(|value| value.as_bytes().to_vec())
+            .unwrap_or_default(),
+        event_kind: audit_event_name(&record.event).to_string(),
+        detail_json,
+    })
+}
+
+fn audit_actor_name(actor: &AuditActor) -> String {
+    match actor {
+        AuditActor::System => "system".to_string(),
+        AuditActor::User(id) => format!("user:{id}"),
+        AuditActor::Service(id) => format!("service:{id}"),
+    }
+}
+
+fn audit_source_layer_name(source: &SourceLayer) -> &'static str {
+    match source {
+        SourceLayer::Layer2 => "layer2",
+        SourceLayer::Layer3b => "layer3b",
+        SourceLayer::Layer3c => "layer3c",
+        SourceLayer::Layer4 => "layer4",
+        SourceLayer::Layer5 => "layer5",
+    }
+}
+
+fn audit_event_name(event: &AuditEvent) -> &'static str {
+    match event {
+        AuditEvent::RequestReceived => "RequestReceived",
+        AuditEvent::OperationStarted => "OperationStarted",
+        AuditEvent::OperationProgress => "OperationProgress",
+        AuditEvent::OperationFinished => "OperationFinished",
+        AuditEvent::OperationFailed => "OperationFailed",
+        AuditEvent::CancelRequested => "CancelRequested",
+        AuditEvent::CancelledBeforeDispatch => "CancelledBeforeDispatch",
+        AuditEvent::CompletedAfterCancel => "CompletedAfterCancel",
+        AuditEvent::CancellationRejected => "CancellationRejected",
+        AuditEvent::CompletionUnknown => "CompletionUnknown",
+        AuditEvent::SessionOpened => "SessionOpened",
+        AuditEvent::SessionCheckpointed => "SessionCheckpointed",
+        AuditEvent::SessionClosed => "SessionClosed",
+        AuditEvent::SessionOrphaned => "SessionOrphaned",
+        AuditEvent::SessionLostByRestart => "SessionLostByRestart",
+        AuditEvent::ClockRegressionObserved => "ClockRegressionObserved",
+        AuditEvent::ClockForwardJumpObserved => "ClockForwardJumpObserved",
+        AuditEvent::HardwareWarning => "HardwareWarning",
+        AuditEvent::RecoveryEvent => "RecoveryEvent",
+        AuditEvent::ConfigLoaded => "ConfigLoaded",
+        AuditEvent::ConfigRejected => "ConfigRejected",
+        AuditEvent::IndexRebuilt => "IndexRebuilt",
+        AuditEvent::ReadOnlyModeEntered => "ReadOnlyModeEntered",
+        AuditEvent::ReadOnlyModeLeft => "ReadOnlyModeLeft",
+        AuditEvent::AuditWriteFailed => "AuditWriteFailed",
+        AuditEvent::TapeRetired => "TapeRetired",
+        AuditEvent::TapeProvisioned => "TapeProvisioned",
+        AuditEvent::DriveRetired => "DriveRetired",
+        AuditEvent::DriveAnnotated => "DriveAnnotated",
+        AuditEvent::DriveCleaned => "DriveCleaned",
+        AuditEvent::CleaningCartridgeExpired => "CleaningCartridgeExpired",
+        AuditEvent::CleaningCartridgeRegistered => "CleaningCartridgeRegistered",
+        AuditEvent::DriveFenced => "DriveFenced",
+        AuditEvent::DriveUnfenced => "DriveUnfenced",
+        AuditEvent::AlarmAcked => "AlarmAcked",
+    }
+}
+
 #[tonic::async_trait]
 impl pb::read_session_service_server::ReadSessionService for ReadSessionApi {
     async fn open_read_session(
@@ -2484,10 +2728,9 @@ impl pb::read_session_service_server::ReadSessionService for ReadSessionApi {
         authorize_request(&request, AuthPermission::ReadTape)?;
         let request = request.into_inner();
         reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "OpenReadSession")?;
-        let tape_uuid = select_read_target(&self.state, request.target)?;
-        let resume_target = decode_read_resume_target(request.resume_target, tape_uuid)?;
-        let session =
-            crate::mount::open_read_session(&self.state, tape_uuid, resume_target).await?;
+        let target = select_read_target(&self.state, request.target)?;
+        let resume_target = decode_read_resume_target(request.resume_target, target.tape_uuid())?;
+        let session = crate::mount::open_read_session(&self.state, target, resume_target).await?;
         Ok(Response::new(session))
     }
 
@@ -2697,7 +2940,7 @@ impl ReadSessionApi {
 fn select_read_target(
     state: &ApiState,
     target: Option<pb::open_read_session_request::Target>,
-) -> Result<[u8; 16], Status> {
+) -> Result<crate::mount::ReadSessionTarget, Status> {
     let index = state.index()?;
     match target.ok_or_else(|| Status::invalid_argument("missing read-session target"))? {
         pb::open_read_session_request::Target::TapeTarget(target) => {
@@ -2712,12 +2955,102 @@ fn select_read_target(
                 .map_err(|err| Status::internal(err.to_string()))?
                 .ok_or_else(|| Status::not_found("tape not found"))?;
             ensure_tape_matches_pool(&index, &tape_uuid, target.required_pool_id.as_str())?;
-            Ok(tape_uuid)
+            Ok(crate::mount::ReadSessionTarget::Tape { tape_uuid })
         }
-        pb::open_read_session_request::Target::DriveTarget(_) => Err(Status::unimplemented(
-            "drive-target read sessions need library inventory wiring",
-        )),
+        pb::open_read_session_request::Target::DriveTarget(target) => {
+            let bay = crate::library::narrow_element(
+                target.drive_element_address,
+                "drive_element_address",
+            )?;
+            let library_serial = resolve_read_target_library_serial(state, &target.library_uuid)?;
+            if state.busy_drive_bays().contains(&bay) {
+                return Err(Status::failed_precondition(format!(
+                    "drive bay 0x{bay:04x} is busy"
+                )));
+            }
+            let snapshot = state
+                .current_library_snapshot()
+                .ok_or_else(|| Status::not_found("library not found"))?;
+            let library = snapshot
+                .report
+                .libraries
+                .iter()
+                .find(|library| library.serial == library_serial)
+                .ok_or_else(|| Status::not_found("library not found"))?;
+            let drive = library
+                .drive_bays
+                .iter()
+                .find(|drive| drive.element_address == bay)
+                .ok_or_else(|| Status::not_found(format!("drive bay 0x{bay:04x} not found")))?;
+            if !drive.loaded {
+                return Err(Status::failed_precondition(format!(
+                    "drive bay 0x{bay:04x} is empty"
+                )));
+            }
+            let barcode = drive.loaded_tape.as_deref().ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "drive bay 0x{bay:04x} tape identity cannot be proven: loaded media has no readable barcode"
+                ))
+            })?;
+            let tape = index
+                .get_tape_by_voltag(barcode)
+                .map_err(status_from_state_error)?
+                .ok_or_else(|| {
+                    Status::failed_precondition(format!(
+                        "drive bay 0x{bay:04x} tape identity cannot be proven: barcode {barcode} is not registered in the catalog"
+                    ))
+                })?;
+            let tape_uuid = tape
+                .tape_uuid
+                .as_slice()
+                .try_into()
+                .map_err(|_| Status::internal("catalog tape UUID is not 16 bytes"))?;
+            ensure_tape_matches_pool(&index, &tape_uuid, target.required_pool_id.as_str())?;
+            Ok(crate::mount::ReadSessionTarget::LoadedDrive {
+                tape_uuid,
+                library_serial,
+                bay,
+            })
+        }
     }
+}
+
+fn resolve_read_target_library_serial(
+    state: &ApiState,
+    requested_library_uuid: &[u8],
+) -> Result<String, Status> {
+    if requested_library_uuid.is_empty() {
+        return state
+            .default_library_serial
+            .as_ref()
+            .map(|serial| serial.as_str().to_string())
+            .ok_or_else(|| {
+                Status::invalid_argument(
+                    "library_uuid is required when config does not name exactly one library",
+                )
+            });
+    }
+    let requested = decode_uuid_bytes(requested_library_uuid, "library_uuid")?;
+    let snapshot = state
+        .current_library_snapshot()
+        .ok_or_else(|| Status::not_found("library not found"))?;
+    let library_serial = snapshot
+        .report
+        .libraries
+        .iter()
+        .find(|library| crate::library::library_uuid(&library.serial) == requested)
+        .map(|library| library.serial.clone())
+        .ok_or_else(|| Status::not_found("library not found"))?;
+    if state
+        .default_library_serial
+        .as_deref()
+        .is_some_and(|operated| operated.as_str() != library_serial)
+    {
+        return Err(Status::failed_precondition(format!(
+            "library {library_serial} is discovered but is not operated by this daemon"
+        )));
+    }
+    Ok(library_serial)
 }
 
 fn ensure_tape_matches_pool(
@@ -8383,6 +8716,279 @@ BCw3Wyv2UWY=
         assert!(!version.rust_target.is_empty());
     }
 
+    fn drive_target_test_state(
+        loaded: bool,
+        loaded_tape: Option<&str>,
+        busy: bool,
+    ) -> (
+        ApiState,
+        tokio::sync::mpsc::Receiver<crate::write_owner::DriveCommand>,
+    ) {
+        let mut state = populated_state();
+        let serial = "LIB-DRIVE-TARGET";
+        let mut library = test_library(serial);
+        library.drive_bays[0].loaded = loaded;
+        library.drive_bays[0].loaded_tape = loaded_tape.map(str::to_string);
+        library.drive_bays[0].source_slot = loaded.then_some(0x03e9);
+        state.default_library_serial = Some(Arc::new(serial.to_string()));
+        state.library_snapshot = Some(Arc::new(RwLock::new(Arc::new(LibrarySnapshot {
+            report: DiscoveryReport {
+                libraries: vec![library],
+                warnings: Vec::new(),
+            },
+            captured_at: OffsetDateTime::UNIX_EPOCH,
+        }))));
+        let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
+        let (drive_tx, drive_rx) = tokio::sync::mpsc::channel(1);
+        state.drive_pool = Some(crate::write_owner::DrivePool::new(
+            changer_tx,
+            HashMap::from([(1, drive_tx)]),
+            Arc::new(HashMap::from([(1, AtomicBool::new(busy))])),
+        ));
+        (state, drive_rx)
+    }
+
+    fn drive_target_request(required_pool_id: &str) -> pb::OpenReadSessionRequest {
+        pb::OpenReadSessionRequest {
+            target: Some(pb::open_read_session_request::Target::DriveTarget(
+                pb::DriveTarget {
+                    library_uuid: crate::library::library_uuid("LIB-DRIVE-TARGET").to_vec(),
+                    drive_element_address: 1,
+                    required_pool_id: required_pool_id.to_string(),
+                },
+            )),
+            idempotency_key: None,
+            resume_target: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn drive_target_read_open_uses_loaded_drive_and_reports_it() {
+        let (state, mut drive_rx) = drive_target_test_state(true, Some("ACM003L9"), false);
+        let session_id = Uuid::new_v4();
+        let actor = tokio::spawn(async move {
+            match drive_rx.recv().await.expect("read-open command") {
+                crate::write_owner::DriveCommand::OpenRead {
+                    tape_uuid,
+                    needs_drive_load,
+                    source_slot,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(tape_uuid, TAPE_UUID);
+                    assert!(!needs_drive_load);
+                    assert_eq!(source_slot, None);
+                    reply
+                        .send(Ok(pb::ReadSession {
+                            session_id: session_id.as_bytes().to_vec(),
+                            tape_uuid: TAPE_UUID.to_vec(),
+                            drive_element_address: 1,
+                            state: pb::read_session::State::ReadSessionStateOpen as i32,
+                            opened_at: Some(prost_types::Timestamp {
+                                seconds: 0,
+                                nanos: 0,
+                            }),
+                            position_proof: None,
+                            daemon_epoch: 1,
+                        }))
+                        .expect("open reply receiver");
+                }
+                _ => panic!("drive-target open must use the common OpenRead actor command"),
+            }
+        });
+
+        let opened = pb::read_session_service_server::ReadSessionService::open_read_session(
+            &state.read_session_service(),
+            Request::new(drive_target_request("camera.copy-a")),
+        )
+        .await
+        .expect("open read session on loaded drive")
+        .into_inner();
+
+        assert_eq!(opened.tape_uuid, TAPE_UUID);
+        assert_eq!(opened.drive_element_address, 1);
+        actor.await.expect("mock drive actor joins");
+    }
+
+    #[test]
+    fn drive_target_read_errors_are_precise_and_pool_guard_is_enforced() {
+        let (empty, _rx) = drive_target_test_state(false, None, false);
+        let error = select_read_target(&empty, drive_target_request("").target)
+            .expect_err("empty drive must fail");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(error.message(), "drive bay 0x0001 is empty");
+
+        let (busy, _rx) = drive_target_test_state(true, Some("ACM003L9"), true);
+        let error = select_read_target(&busy, drive_target_request("").target)
+            .expect_err("busy drive must fail");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(error.message(), "drive bay 0x0001 is busy");
+
+        let (unproven, _rx) = drive_target_test_state(true, None, false);
+        let error = select_read_target(&unproven, drive_target_request("").target)
+            .expect_err("unproven identity must fail");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("identity cannot be proven"));
+
+        let (wrong_pool, _rx) = drive_target_test_state(true, Some("ACM003L9"), false);
+        let error = select_read_target(&wrong_pool, drive_target_request("camera.copy-b").target)
+            .expect_err("pool guard mismatch must fail");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(error.message(), "tape is not assigned to the required pool");
+
+        let (mut foreign, _rx) = drive_target_test_state(true, Some("ACM003L9"), false);
+        let mut second_library = test_library("LIB-D2");
+        second_library.drive_bays[0].loaded = true;
+        second_library.drive_bays[0].loaded_tape = Some("ACM003L9".to_string());
+        let current = foreign
+            .current_library_snapshot()
+            .expect("library snapshot");
+        foreign.library_snapshot = Some(Arc::new(RwLock::new(Arc::new(LibrarySnapshot {
+            report: DiscoveryReport {
+                libraries: vec![current.report.libraries[0].clone(), second_library],
+                warnings: Vec::new(),
+            },
+            captured_at: current.captured_at,
+        }))));
+        let mut request = drive_target_request("");
+        let Some(pb::open_read_session_request::Target::DriveTarget(target)) =
+            request.target.as_mut()
+        else {
+            panic!("drive target request")
+        };
+        target.library_uuid = crate::library::library_uuid("LIB-D2").to_vec();
+        let error = select_read_target(&foreign, request.target)
+            .expect_err("a foreign discovered library must not alias the operated drive pool");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            error.message(),
+            "library LIB-D2 is discovered but is not operated by this daemon"
+        );
+    }
+
+    fn audit_test_record(
+        sequence: u64,
+        timestamp_utc: &str,
+        session_id: Option<Uuid>,
+        operation_id: Option<Uuid>,
+        event: AuditEvent,
+    ) -> AuditRecord {
+        AuditRecord {
+            schema_version: 1,
+            record_uuid: Uuid::new_v4(),
+            sequence,
+            timestamp_utc: timestamp_utc.to_string(),
+            host_id: "test-host".to_string(),
+            process_id: 1,
+            actor: AuditActor::System,
+            source_layer: SourceLayer::Layer5,
+            operation_id,
+            session_id,
+            idempotency_key: None,
+            event,
+            subject: AuditSubject {
+                kind: "session".to_string(),
+                id: session_id.map(|value| value.to_string()),
+            },
+            detail: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn audit_query_window_and_filters_select_exact_entries() {
+        let session_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let query = AuditQuery::try_from(pb::QueryAuditRequest {
+            since: timestamp_from_rfc3339("2026-07-18T10:00:00Z"),
+            until: timestamp_from_rfc3339("2026-07-18T11:00:00Z"),
+            filter: HashMap::from([
+                ("session_id".to_string(), session_id.to_string()),
+                ("operation_id".to_string(), operation_id.to_string()),
+                ("event_kind".to_string(), "OperationFailed".to_string()),
+            ]),
+        })
+        .expect("valid audit query");
+        let records = [
+            audit_test_record(
+                1,
+                "2026-07-18T09:59:59Z",
+                Some(session_id),
+                Some(operation_id),
+                AuditEvent::OperationFailed,
+            ),
+            audit_test_record(
+                2,
+                "2026-07-18T10:30:00Z",
+                Some(session_id),
+                Some(operation_id),
+                AuditEvent::OperationFailed,
+            ),
+            audit_test_record(
+                3,
+                "2026-07-18T11:00:00Z",
+                Some(session_id),
+                Some(operation_id),
+                AuditEvent::OperationFailed,
+            ),
+            audit_test_record(
+                4,
+                "2026-07-18T10:45:00Z",
+                Some(Uuid::new_v4()),
+                Some(operation_id),
+                AuditEvent::OperationFailed,
+            ),
+        ];
+        let matched = records
+            .iter()
+            .filter(|record| audit_record_matches(record, &query).expect("match audit record"))
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(matched, vec![2]);
+    }
+
+    #[tokio::test]
+    async fn audit_service_streams_filtered_records() {
+        let state = ApiState::new(test_index());
+        let session_id = Uuid::new_v4();
+        let mut audit = FileAuditLog::open(state.audit_dir.as_ref(), false).expect("open audit");
+        for (current_session, event) in [
+            (session_id, AuditEvent::OperationFailed),
+            (Uuid::new_v4(), AuditEvent::OperationFinished),
+        ] {
+            audit
+                .append_and_return_record(AuditEventRecord {
+                    actor: AuditActor::System,
+                    source_layer: SourceLayer::Layer5,
+                    operation_id: None,
+                    session_id: Some(current_session),
+                    idempotency_key: None,
+                    event,
+                    subject: AuditSubject {
+                        kind: "session".to_string(),
+                        id: Some(current_session.to_string()),
+                    },
+                    detail: BTreeMap::new(),
+                })
+                .expect("append audit record");
+        }
+        drop(audit);
+        let mut stream = pb::audit_server::Audit::query_audit(
+            &state.audit_service(),
+            Request::new(pb::QueryAuditRequest {
+                since: timestamp_from_rfc3339("2020-01-01T00:00:00Z"),
+                until: timestamp_from_rfc3339("2100-01-01T00:00:00Z"),
+                filter: HashMap::from([("session_id".to_string(), session_id.to_string())]),
+            }),
+        )
+        .await
+        .expect("query audit")
+        .into_inner();
+        let entry = stream.next().await.expect("one entry").expect("audit item");
+        assert_eq!(entry.session_id, session_id.as_bytes());
+        assert_eq!(entry.event_kind, "OperationFailed");
+        assert!(stream.next().await.is_none());
+    }
+
     #[tokio::test]
     async fn daemon_operations_are_projected() {
         let service = state_with_operation().daemon_service();
@@ -8633,10 +9239,9 @@ BCw3Wyv2UWY=
             },
         );
 
-        assert!(pool.is_tape_mounted(&TAPE_UUID));
         assert!(pool.mounted_tape_uuids().contains(&TAPE_UUID));
         pool.forget_session(session_id);
-        assert!(!pool.is_tape_mounted(&TAPE_UUID));
+        assert!(!pool.mounted_tape_uuids().contains(&TAPE_UUID));
     }
 
     #[tokio::test]
@@ -8825,7 +9430,6 @@ BCw3Wyv2UWY=
 
         let reservation = pool.reserve_tape(TAPE_UUID).expect("reserve tape");
 
-        assert!(pool.is_tape_mounted(&TAPE_UUID));
         assert!(pool.mounted_tape_uuids().contains(&TAPE_UUID));
         assert_eq!(
             pool.reserve_tape(TAPE_UUID)
@@ -8834,7 +9438,7 @@ BCw3Wyv2UWY=
             tonic::Code::FailedPrecondition
         );
         drop(reservation);
-        assert!(!pool.is_tape_mounted(&TAPE_UUID));
+        assert!(!pool.mounted_tape_uuids().contains(&TAPE_UUID));
     }
 
     #[tokio::test]
