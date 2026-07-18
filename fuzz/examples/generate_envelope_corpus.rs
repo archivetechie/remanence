@@ -21,7 +21,7 @@ fn write_whole_object_seed() {
     let options = EnvelopeSealOptions {
         common: SealOptions {
             chunk_size: 512,
-            object_id: "fuzz-v2-object".to_string(),
+            object_id: "fuzz-envelope-object".to_string(),
             plaintext_size: plaintext.len() as u64,
             plaintext_digest: digest,
         },
@@ -40,10 +40,10 @@ fn write_whole_object_seed() {
     )
     .unwrap();
     write_seed(
-        "corpus/rao_whole_object_open_verify/valid-v2-recipient-object",
+        "corpus/rao_whole_object_open_verify/valid-recipient-envelope",
         &sealed,
     );
-    write_seed("corpus/rao_envelope_header/valid-v2-header", &sealed[..128]);
+    write_seed("corpus/rao_envelope_header/valid-envelope-header", &sealed[..128]);
 }
 
 fn write_key_frame_seeds() {

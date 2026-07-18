@@ -1,4 +1,4 @@
-//! RAO v2 HKDF-SHA-256 key derivation from a per-object DEK.
+//! RAO envelope HKDF-SHA-256 key derivation from a per-object DEK.
 
 use std::fmt;
 
@@ -8,14 +8,14 @@ use zeroize::Zeroize;
 
 use crate::error::{RaoAeadError, Result};
 
-/// v2 salt derivation HKDF info label.
-pub const LABEL_SALT_V2: &[u8] = b"rao2-salt-v1";
-/// v2 object-secret HKDF info label.
-pub const LABEL_OBJECT_V2: &[u8] = b"rao2-object-v1";
-/// v2 metadata-key HKDF info label.
-pub const LABEL_METADATA_V2: &[u8] = b"rao2-metadata-v1";
-/// v2 payload-key HKDF info label.
-pub const LABEL_PAYLOAD_V2: &[u8] = b"rao2-payload-v1";
+/// Salt derivation HKDF info label.
+pub const LABEL_SALT: &[u8] = b"rao2-salt-v1";
+/// Object-secret HKDF info label.
+pub const LABEL_OBJECT: &[u8] = b"rao2-object-v1";
+/// Metadata-key HKDF info label.
+pub const LABEL_METADATA: &[u8] = b"rao2-metadata-v1";
+/// Payload-key HKDF info label.
+pub const LABEL_PAYLOAD: &[u8] = b"rao2-payload-v1";
 
 /// Derived RAO object, metadata, and payload keys.
 pub struct DerivedKeys {
@@ -45,8 +45,8 @@ impl fmt::Debug for DerivedKeys {
     }
 }
 
-/// Derive the deterministic nonzero v2 salt from the per-object DEK.
-pub fn derive_salt_v2(
+/// Derive the deterministic nonzero envelope salt from the per-object DEK.
+pub fn derive_salt(
     dek: &[u8; 32],
     object_id_field: &[u8; 64],
     plaintext_digest: &[u8; 32],
@@ -54,7 +54,7 @@ pub fn derive_salt_v2(
 ) -> Result<[u8; 16]> {
     derive_salt_bytes(
         dek,
-        LABEL_SALT_V2,
+        LABEL_SALT,
         object_id_field,
         plaintext_digest,
         metadata_plaintext,
@@ -87,19 +87,15 @@ fn derive_salt_bytes(
     Err(RaoAeadError::InvalidSalt)
 }
 
-/// Derive the three distinct v2 keys from a DEK and header-plus-frame hash.
-pub fn derive_keys_v2(
-    dek: &[u8; 32],
-    salt: &[u8; 16],
-    header_hash: &[u8; 32],
-) -> Result<DerivedKeys> {
+/// Derive the three distinct envelope keys from a DEK and header-plus-frame hash.
+pub fn derive_keys(dek: &[u8; 32], salt: &[u8; 16], header_hash: &[u8; 32]) -> Result<DerivedKeys> {
     derive_keys_bytes(
         dek,
         salt,
         header_hash,
-        LABEL_OBJECT_V2,
-        LABEL_METADATA_V2,
-        LABEL_PAYLOAD_V2,
+        LABEL_OBJECT,
+        LABEL_METADATA,
+        LABEL_PAYLOAD,
     )
 }
 
@@ -143,9 +139,9 @@ mod tests {
         let object_id = [b'a'; 64];
         let digest = [0x22; 32];
         let metadata = b"metadata";
-        let first = derive_salt_v2(&dek, &object_id, &digest, metadata).unwrap();
-        let second = derive_salt_v2(&dek, &object_id, &digest, metadata).unwrap();
-        let changed = derive_salt_v2(&dek, &object_id, &[0x23; 32], metadata).unwrap();
+        let first = derive_salt(&dek, &object_id, &digest, metadata).unwrap();
+        let second = derive_salt(&dek, &object_id, &digest, metadata).unwrap();
+        let changed = derive_salt(&dek, &object_id, &[0x23; 32], metadata).unwrap();
         assert_eq!(first, second);
         assert_ne!(first, changed);
         assert_ne!(first, [0; 16]);
@@ -156,8 +152,8 @@ mod tests {
         let dek = [0x11; 32];
         let salt = [0x33; 16];
         let header_hash = [0x44; 32];
-        let a = derive_keys_v2(&dek, &salt, &header_hash).unwrap();
-        let b = derive_keys_v2(&dek, &salt, &header_hash).unwrap();
+        let a = derive_keys(&dek, &salt, &header_hash).unwrap();
+        let b = derive_keys(&dek, &salt, &header_hash).unwrap();
         assert_eq!(a.metadata_key, b.metadata_key);
         assert_eq!(a.payload_key, b.payload_key);
         assert_ne!(a.metadata_key, a.payload_key);

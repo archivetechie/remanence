@@ -98,7 +98,8 @@ never depends on host state.
 ## The encrypted variant
 
 The encrypted representation wraps the same tar stream in an
-authenticated ChaCha20-Poly1305 envelope. Encryption is v2-only: every
+authenticated ChaCha20-Poly1305 envelope. This is the only encrypted
+representation: every
 object gets a fresh data-encryption key, wrapped separately to each
 recipient with HPKE (RFC 9180 Base mode,
 X25519-HKDF-SHA256-ChaCha20Poly1305). Writers require 2-8 distinct recipient
@@ -118,11 +119,11 @@ rem archive extract --object demo-enc.rao --dest restored-enc \
 diff -r src restored-enc && echo identical
 ```
 
-`inspect` needs no key. It validates the v2 header and key frame and reports
+`inspect` needs no key. It validates the envelope header and key frame and reports
 the ordered `recipient_epochs`, but cannot expose the encrypted manifest.
 The matching RAOP file selects its epoch's slot during open.
 
-To rotate recipients, open the existing v2 object with one current private
+To rotate recipients, open the existing encrypted object with one current private
 key and reseal it to a new 2-8-recipient set:
 
 ```sh
@@ -131,8 +132,9 @@ rem archive reseal --object demo-enc.rao --private-key primary.raop \
     --out demo-rotated.rao
 ```
 
-`reseal` is v2→v2: it verifies the new stored digest before publishing and
-never overwrites an existing output. There is no v2→v1 downgrade.
+`reseal` performs a full re-seal: it verifies the new stored digest before
+publishing and never overwrites an existing output. It always emits an encrypted
+envelope.
 
 For catalogless disaster recovery, use the standalone `rao-recover` binary
 with any matching recipient private key:

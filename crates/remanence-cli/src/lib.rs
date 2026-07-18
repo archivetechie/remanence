@@ -1747,7 +1747,7 @@ enum RemArchiveCommand {
     /// Print machine-readable archive feature capabilities.
     Capabilities,
 
-    /// Re-seal one v2 recipient envelope to a new recipient set.
+    /// Re-seal one recipient envelope to a new recipient set.
     Reseal(ArchiveResealArgs),
 
     /// Build a portable RAO object file from local inputs.
@@ -1917,7 +1917,7 @@ struct RemArchiveExtractArgs {
     #[arg(long, value_name = "BYTES", value_parser = parse_archive_chunk_size, default_value = "256KiB")]
     chunk_size: usize,
 
-    /// Canonical RAOP private-key file. Required for v2 encrypted objects.
+    /// Canonical RAOP private-key file. Required for encrypted objects.
     #[arg(long, value_name = "PATH")]
     private_key: Option<PathBuf>,
 
@@ -1957,7 +1957,7 @@ struct RemArchiveExtractArgs {
 /// Arguments for `rem archive extract-stream`.
 #[derive(Args, Debug)]
 struct RemArchiveExtractStreamArgs {
-    /// Canonical RAOP private-key file used to decrypt the v2 envelope.
+    /// Canonical RAOP private-key file used to decrypt the envelope.
     #[arg(long, value_name = "PATH")]
     private_key: Option<PathBuf>,
 
@@ -1987,7 +1987,7 @@ struct RemArchiveExtractStreamArgs {
 /// Arguments for `rem archive covering-range`.
 #[derive(Args, Debug)]
 struct RemArchiveCoveringRangeArgs {
-    /// Canonical RAOP private-key file used to authenticate the v2 envelope.
+    /// Canonical RAOP private-key file used to authenticate the envelope.
     #[arg(long, value_name = "PATH")]
     private_key: Option<PathBuf>,
 
@@ -2055,7 +2055,7 @@ struct RemArchiveReadArgs {
     #[arg(long, value_name = "PATH")]
     out: PathBuf,
 
-    /// Canonical RAOP private-key file. Required for v2 encrypted copies.
+    /// Canonical RAOP private-key file. Required for encrypted copies.
     #[arg(long, value_name = "PATH")]
     private_key: Option<PathBuf>,
 
@@ -2099,7 +2099,7 @@ struct RemArchiveVerifyArgs {
     #[arg(long, value_name = "HEX")]
     expected_sha256: String,
 
-    /// Canonical RAOP private-key file. Required for v2 encrypted copies.
+    /// Canonical RAOP private-key file. Required for encrypted copies.
     #[arg(long, value_name = "PATH")]
     private_key: Option<PathBuf>,
 
@@ -2386,7 +2386,7 @@ enum ArchiveCommand {
     /// Print machine-readable archive feature capabilities.
     Capabilities,
 
-    /// Re-seal one v1 registry object as a v2 recipient envelope.
+    /// Fully re-seal one recipient envelope to a new recipient set.
     Reseal(ArchiveResealArgs),
 
     /// Build a portable RAO object file from local inputs.
@@ -2438,11 +2438,11 @@ enum ArchiveCommand {
 /// Arguments for `rem archive reseal`.
 #[derive(Args, Debug)]
 struct ArchiveResealArgs {
-    /// Existing complete RAO v2 encrypted object.
+    /// Existing complete encrypted RAO object.
     #[arg(long, value_name = "PATH")]
     object: PathBuf,
 
-    /// Canonical RAOP private-key file used to open the v2 input object.
+    /// Canonical RAOP private-key file used to open the input object.
     #[arg(long, value_name = "PATH")]
     private_key: PathBuf,
 
@@ -2450,7 +2450,7 @@ struct ArchiveResealArgs {
     #[arg(long = "recipient", value_name = "PATH", num_args = 2..=8)]
     recipients: Vec<PathBuf>,
 
-    /// New v2 envelope object path; must not already exist.
+    /// New envelope object path; must not already exist.
     #[arg(long, value_name = "PATH")]
     out: PathBuf,
 
@@ -2577,7 +2577,7 @@ struct ArchiveExtractArgs {
     #[arg(long, value_name = "BYTES", value_parser = parse_archive_chunk_size, default_value = "256KiB")]
     chunk_size: usize,
 
-    /// Canonical RAOP private-key file. Required for v2 encrypted objects.
+    /// Canonical RAOP private-key file. Required for encrypted objects.
     #[arg(long, value_name = "PATH")]
     private_key: Option<PathBuf>,
 
@@ -2617,7 +2617,7 @@ struct ArchiveExtractArgs {
 /// Arguments for the shared `archive extract-stream` command.
 #[derive(Args, Debug)]
 struct ArchiveExtractStreamArgs {
-    /// Canonical RAOP private-key file used to decrypt the v2 envelope.
+    /// Canonical RAOP private-key file used to decrypt the envelope.
     #[arg(long, value_name = "PATH")]
     private_key: Option<PathBuf>,
 
@@ -2647,7 +2647,7 @@ struct ArchiveExtractStreamArgs {
 /// Arguments for the shared `archive covering-range` command.
 #[derive(Args, Debug)]
 struct ArchiveCoveringRangeArgs {
-    /// Canonical RAOP private-key file used to authenticate the v2 envelope.
+    /// Canonical RAOP private-key file used to authenticate the envelope.
     #[arg(long, value_name = "PATH")]
     private_key: Option<PathBuf>,
 
@@ -2716,7 +2716,7 @@ struct ArchiveReadArgs {
     #[arg(long, value_name = "PATH")]
     out: PathBuf,
 
-    /// Canonical RAOP private-key file. Required for v2 encrypted copies.
+    /// Canonical RAOP private-key file. Required for encrypted copies.
     #[arg(long, value_name = "PATH")]
     private_key: Option<PathBuf>,
 
@@ -2760,7 +2760,7 @@ struct ArchiveVerifyArgs {
     #[arg(long, value_name = "HEX")]
     expected_sha256: String,
 
-    /// Canonical RAOP private-key file. Required for v2 encrypted copies.
+    /// Canonical RAOP private-key file. Required for encrypted copies.
     #[arg(long, value_name = "PATH")]
     private_key: Option<PathBuf>,
 
@@ -3644,7 +3644,7 @@ where
 fn run_archive_capabilities(out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let capabilities = json!({
         "capabilities": [
-            "rao-v2-envelope",
+            "rao-envelope",
             "wrap-suite-hpke-v1",
             "ranged-ciphertext-extract"
         ]
@@ -3744,7 +3744,7 @@ fn reseal_archive_object(args: &ArchiveResealArgs) -> Result<PublishedReseal, St
     reseal_archive_object_with_verifier(args, |path, expected| {
         let actual = sha256_file(path)?;
         if actual != expected {
-            return Err("staged v2 object hash differs from the sealer report".to_string());
+            return Err("staged encrypted object hash differs from the sealer report".to_string());
         }
         Ok(actual)
     })
@@ -3788,7 +3788,7 @@ where
         plaintext.as_file_mut(),
         &private_key,
     )
-    .map_err(|error| format!("open v2 object: {error}"))?;
+    .map_err(|error| format!("open encrypted object: {error}"))?;
     plaintext
         .as_file_mut()
         .seek(SeekFrom::Start(0))
@@ -3825,7 +3825,7 @@ where
         Err(error) => {
             drop(file);
             let _ = fs::remove_file(&temp);
-            return Err(format!("seal v2 object: {error}"));
+            return Err(format!("seal encrypted object: {error}"));
         }
     };
     if let Err(error) = file.sync_all() {
@@ -10174,7 +10174,7 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
                 &mut streams,
                 &recipients,
             )
-            .map_err(|error| format!("write v2 encrypted RAO: {error}"))?;
+            .map_err(|error| format!("write encrypted RAO: {error}"))?;
             sink.sync_all()
                 .map_err(|error| format!("sync {}: {error}", temp_path.display()))?;
             Ok(ArchiveBuildResult {
@@ -14089,7 +14089,7 @@ mod tests {
         assert_eq!(
             value["capabilities"],
             json!([
-                "rao-v2-envelope",
+                "rao-envelope",
                 "wrap-suite-hpke-v1",
                 "ranged-ciphertext-extract"
             ])
@@ -14097,7 +14097,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_reseal_converts_v2_to_verified_v2() {
+    fn archive_reseal_fully_reseals_and_verifies() {
         let plaintext = vec![0x5a; 1024];
         let digest: [u8; 32] = Sha256::digest(&plaintext).into();
         let source_primary =
@@ -14127,11 +14127,11 @@ mod tests {
         let next_recovery =
             remanence_aead::RecipientPrivateKey::new([4; 16], "next-escrow", [10; 32]).unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let object = temp.path().join("object-v2.rao");
+        let object = temp.path().join("object-encrypted.rao");
         let source_private_path = temp.path().join("source-safe.raop");
         let next_primary_path = temp.path().join("next-safe.raor");
         let next_recovery_path = temp.path().join("next-escrow.raor");
-        let output = temp.path().join("object-v2-resealed.rao");
+        let output = temp.path().join("object-resealed.rao");
         let staging = temp.path().join("plaintext-staging");
         fs::create_dir(&staging).unwrap();
         fs::write(&object, source_object).unwrap();
@@ -14163,7 +14163,9 @@ mod tests {
                 fs::write(path, bytes).map_err(|error| error.to_string())?;
                 let actual = sha256_file(path)?;
                 if actual != expected {
-                    return Err("staged v2 object hash differs from the sealer report".to_string());
+                    return Err(
+                        "staged encrypted object hash differs from the sealer report".to_string(),
+                    );
                 }
                 Ok(actual)
             })
@@ -18593,9 +18595,9 @@ blob Project/Render Files/
     }
 
     #[test]
-    fn archive_build_v2_recipient_envelope_reports_inspects_and_extracts() {
+    fn archive_build_recipient_envelope_reports_inspects_and_extracts() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-build-v2")
+            .prefix("remanence-cli-rao-build-envelope")
             .tempdir()
             .unwrap();
         let input_dir = temp.path().join("inputs");
@@ -18620,7 +18622,7 @@ blob Project/Render Files/
         )
         .unwrap();
         fs::write(&primary_private_path, primary.serialize()).unwrap();
-        let out_path = temp.path().join("encrypted-v2.rao");
+        let out_path = temp.path().join("encrypted.rao");
 
         let (code, stdout, stderr) = invoke_without_discovery(&[
             "rem",
@@ -18637,11 +18639,11 @@ blob Project/Render Files/
             "--chunk-size",
             "4KiB",
             "--object-id",
-            "object-encrypted-v2",
+            "object-encrypted",
             "--caller-object-id",
-            "caller-encrypted-v2",
+            "caller-encrypted",
             "--manifest-file-id",
-            "manifest-encrypted-v2",
+            "manifest-encrypted",
             "--timestamp",
             "2026-01-01T00:00:00Z",
         ]);

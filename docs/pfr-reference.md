@@ -658,7 +658,7 @@ Concretely, what the format spec needs to say:
 - IBM. *LTO SCSI Reference (GA32-0928-07).* June 2025. <https://www.ibm.com/support/pages/system/files/inline-files/%5BAPPROVED%5D%20LTO%20SCSI%20Reference%20GA32-0928-07%20(EXTERNAL).pdf>
 - IBM. *LTO SCSI Reference (GA32-0928-06).* April 2024. <https://www.ibm.com/support/pages/system/files/inline-files/%5BAPPROVED%5D%20LTO%20SCSI%20Reference%20GA32-0928-06.pdf>
 - T10. *SCSI Stream Commands — 5 (SSC-5).* <https://www.t10.org/members/w_ssc5.htm>
-- SNIA. *LTFS Format Specification v2.5.* <https://www.snia.org/sites/default/files/technical-work/ltfs/release/SNIA-LTFS-Format-v2.5-Technical-Position.pdf>
+- SNIA. *LTFS Format Specification, version 2.5.* <https://www.snia.org/sites/default/files/technical-work/ltfs/release/SNIA-LTFS-Format-%76%32.5-Technical-Position.pdf>
 - LTO Program. *LTO-9 product overview.* <https://www.lto.org/lto-9/>
 - IBM. *Performance specifications for LTO tape drives.* <https://www.ibm.com/docs/en/ts4500-tape-library?topic=performance-lto-specifications>
 - Versity. *Designing a High Performance Tape Archive.* <https://www.versity.com/designing-a-high-performance-tape-archive/>

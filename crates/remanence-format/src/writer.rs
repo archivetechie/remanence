@@ -221,7 +221,7 @@ pub fn write_rem_tar_object_from_readers<S: BlockSink + ?Sized>(
     Ok(layout)
 }
 
-/// Write a complete v2 recipient-envelope RAO object to `sink`.
+/// Write a complete recipient-envelope RAO object to `sink`.
 ///
 /// Canonical archive construction remains in this crate while all encrypted
 /// framing and cryptography are delegated to `remanence-aead`.
@@ -245,7 +245,7 @@ pub fn write_encrypted_rao_object<S: BlockSink + ?Sized>(
     )
 }
 
-/// Write a complete v2 recipient-envelope RAO object from streaming sources.
+/// Write a complete recipient-envelope RAO object from streaming sources.
 pub fn write_encrypted_rao_object_from_readers<S: BlockSink + ?Sized>(
     sink: &mut S,
     options: &RemTarObjectOptions,

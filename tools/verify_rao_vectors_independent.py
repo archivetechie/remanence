@@ -54,10 +54,10 @@ TYPE_PAX_GLOBAL = b"g"[0]
 PAD_KEY = "REMANENCE.pad"
 RAO_HEADER_LEN = 128
 RAO_FOOTER = b"RAO1_STREAM_END."
-LABEL_SALT_V2 = b"rao2-salt-v1"
-LABEL_OBJECT_V2 = b"rao2-object-v1"
-LABEL_METADATA_V2 = b"rao2-metadata-v1"
-LABEL_PAYLOAD_V2 = b"rao2-payload-v1"
+LABEL_SALT = b"rao2-salt-v1"
+LABEL_OBJECT = b"rao2-object-v1"
+LABEL_METADATA = b"rao2-metadata-v1"
+LABEL_PAYLOAD = b"rao2-payload-v1"
 WRAP_INFO_PREFIX = b"rao-wrap-v1\0"
 HPKE_VERSION_LABEL = b"HPKE-v1"
 HPKE_KEM_ID = 0x0020
@@ -665,7 +665,7 @@ def object_id_field(object_id: str) -> bytes:
     return data + b"\0" * (64 - len(data))
 
 
-def derive_salt_v2(
+def derive_salt(
     dek: bytes,
     object_id: str,
     plaintext_digest: bytes,
@@ -674,7 +674,7 @@ def derive_salt_v2(
     metadata_hash = sha256(metadata)
     oid = object_id_field(object_id)
     for ctr in range(256):
-        info = LABEL_SALT_V2 + bytes([ctr]) + oid + plaintext_digest + metadata_hash
+        info = LABEL_SALT + bytes([ctr]) + oid + plaintext_digest + metadata_hash
         salt = hkdf(b"", dek, info, 16)
         if salt != b"\0" * 16:
             return salt, ctr
@@ -1471,11 +1471,11 @@ def open_encrypted_with_generic_crypto(
     object_secret = hkdf(
         header.salt,
         dek,
-        LABEL_OBJECT_V2 + header_hash,
+        LABEL_OBJECT + header_hash,
         32,
     )
-    metadata_key = hkdf(b"", object_secret, LABEL_METADATA_V2, 32)
-    payload_key = hkdf(b"", object_secret, LABEL_PAYLOAD_V2, 32)
+    metadata_key = hkdf(b"", object_secret, LABEL_METADATA, 32)
+    payload_key = hkdf(b"", object_secret, LABEL_PAYLOAD, 32)
 
     metadata_start = key_frame_end
     metadata_end = metadata_start + header.metadata_frame_len
@@ -1489,7 +1489,7 @@ def open_encrypted_with_generic_crypto(
         metadata,
         header.chunk_size,
     )
-    expected_salt, salt_derivation_counter = derive_salt_v2(
+    expected_salt, salt_derivation_counter = derive_salt(
         dek,
         header.object_id,
         plaintext_digest,
@@ -1631,7 +1631,7 @@ def verify_recovered_file_digests(
             )
 
 
-def check_v2_recovery_vector(
+def check_recovery_vector(
     plaintext_vector: PlaintextVector,
     encrypted_vector_id: str,
     encrypted_stored: bytes,
@@ -1832,14 +1832,14 @@ def main(argv: list[str] | None = None) -> int:
     encrypted_directory = args.encrypted_object_directory
     e2_stored = (encrypted_directory / "rao-tv-e2.rao").read_bytes()
     d1_encrypted_stored = (encrypted_directory / "rao-tv-d1-encrypted.rao").read_bytes()
-    check_v2_recovery_vector(
+    check_recovery_vector(
         p1_vector,
         "RAO-TV-E2",
         e2_stored,
         e2,
         p1["inputs"]["object_id"],
     )
-    check_v2_recovery_vector(
+    check_recovery_vector(
         d1_vector,
         "RAO-TV-D1 encrypted",
         d1_encrypted_stored,
@@ -1873,7 +1873,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     print(
-        "verified RAO-TV-E2 and RAO-TV-D1 v2 OPEN, RAO-TV-P1 and "
+        "verified RAO-TV-E2 and RAO-TV-D1 encrypted OPEN, RAO-TV-P1 and "
         "RAO-TV-D1 plaintext, and additional RAO positive vectors independently"
     )
     return 0

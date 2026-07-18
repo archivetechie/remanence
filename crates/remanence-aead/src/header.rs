@@ -1,4 +1,4 @@
-//! RAO v2 128-byte plaintext scalar envelope header.
+//! RAO 128-byte plaintext scalar envelope header.
 
 use sha2::{Digest, Sha256};
 
@@ -39,8 +39,8 @@ pub struct RaoHeader {
 }
 
 impl RaoHeader {
-    /// Construct and validate a v2 envelope-mode scalar header.
-    pub fn new_v2_envelope(
+    /// Construct and validate an envelope-mode scalar header.
+    pub fn new_envelope(
         chunk_size: u32,
         hkdf_salt: [u8; 16],
         metadata_frame_len: u64,
@@ -146,7 +146,7 @@ impl RaoHeader {
         Ok(out)
     }
 
-    /// SHA-256 of the exact scalar header followed by its v2 key frame.
+    /// SHA-256 of the exact scalar header followed by its key frame.
     pub fn header_hash_with_key_frame(&self, key_frame: &[u8]) -> Result<[u8; 32]> {
         if key_frame.len() != self.key_frame_len as usize {
             return Err(RaoAeadError::InvalidKeyFrameLength);
@@ -162,7 +162,7 @@ impl RaoHeader {
         object_id_field(&self.object_id)
     }
 
-    /// Validate this header under the v2 frozen-field rules.
+    /// Validate this header under the frozen envelope-field rules.
     pub fn validate(&self) -> Result<()> {
         validate_chunk_size(self.chunk_size)?;
         if self.format_version != 2 {
@@ -231,7 +231,7 @@ mod tests {
     use super::*;
 
     fn valid_header() -> RaoHeader {
-        RaoHeader::new_v2_envelope(262_144, [2; 16], 64, "object-1", 103).unwrap()
+        RaoHeader::new_envelope(262_144, [2; 16], 64, "object-1", 103).unwrap()
     }
 
     #[test]
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn header_rejects_unsupported_version_and_suite() {
-        let header = RaoHeader::new_v2_envelope(4096, [2; 16], 64, "object-2", 103).unwrap();
+        let header = RaoHeader::new_envelope(4096, [2; 16], 64, "object-2", 103).unwrap();
         let bytes = header.serialize().unwrap();
         assert_eq!(bytes[0x06], 2);
         assert_eq!(bytes[0x07], 1);
