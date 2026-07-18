@@ -80,34 +80,34 @@ REQUIRED_RAO_OBJECTS = {
     "rao-tv-paths.rao",
     "rao-tv-xattrs.rao",
 }
-REQUIRED_V2_ENVELOPE_CASES = {
-    "v2-version-flip",
-    "v2-suite-flip",
-    "v2-truncated-key-frame",
-    "v2-duplicate-slots",
-    "v2-misordered-slots",
-    "v2-key-frame-trailing-byte",
-    "v2-oversize-key-frame",
-    "v2-key-frame-label-tamper",
-    "v2-key-frame-enc-tamper",
-    "v2-key-frame-ciphertext-tamper",
-    "v2-key-frame-slot-inserted",
-    "v2-key-frame-slot-removed",
-    "v2-slot-count-zero",
-    "v2-slot-count-nine",
-    "v2-writer-zero-slots",
-    "v2-writer-one-slot",
-    "v2-writer-nine-slots",
-    "v2-reader-one-slot",
-    "v2-wrap-suite-zero-nonempty",
-    "v2-hpke-zero-key-frame-len",
-    "v2-hpke-undersized-key-frame-len",
-    "v2-duplicate-recipient-epoch-id",
-    "v2-internal-slot-truncation",
-    "v2-nonzero-reserved-key-region",
-    "v2-malformed-key-frame-magic",
-    "v2-wrong-recipient-private-key",
-    "v2-malformed-encapsulation",
+REQUIRED_KEY_FRAME_CASES = {
+    "version-flip",
+    "suite-flip",
+    "truncated-key-frame",
+    "duplicate-slots",
+    "misordered-slots",
+    "key-frame-trailing-byte",
+    "oversize-key-frame",
+    "key-frame-label-tamper",
+    "key-frame-enc-tamper",
+    "key-frame-ciphertext-tamper",
+    "key-frame-slot-inserted",
+    "key-frame-slot-removed",
+    "slot-count-zero",
+    "slot-count-nine",
+    "writer-zero-slots",
+    "writer-one-slot",
+    "writer-nine-slots",
+    "reader-one-slot",
+    "wrap-suite-zero-nonempty",
+    "hpke-zero-key-frame-len",
+    "hpke-undersized-key-frame-len",
+    "duplicate-recipient-epoch-id",
+    "internal-slot-truncation",
+    "nonzero-reserved-key-region",
+    "malformed-key-frame-magic",
+    "wrong-recipient-private-key",
+    "malformed-encapsulation",
 }
 
 
@@ -172,27 +172,29 @@ def main() -> int:
         rao_root / "objects" / "rao-tv-d1-encrypted.rao"
     ):
         fail("RAO-TV-D1 encrypted stored_digest does not match its pinned object")
-    v2_negative = load_json(manifests / "negative-envelope-v2.json")
-    if v2_negative.get("status") != "complete":
-        fail("negative-envelope-v2.json is not marked complete")
-    v2_cases = v2_negative.get("cases")
-    if not isinstance(v2_cases, list) or not all(isinstance(case, dict) for case in v2_cases):
-        fail("negative-envelope-v2.json cases are malformed")
-    v2_case_ids = [case.get("id") for case in v2_cases]
-    if not all(isinstance(case_id, str) for case_id in v2_case_ids):
-        fail("negative-envelope-v2.json case ids are malformed")
-    if len(v2_case_ids) != len(set(v2_case_ids)):
-        fail("negative-envelope-v2.json contains duplicate case ids")
-    if set(v2_case_ids) != REQUIRED_V2_ENVELOPE_CASES:
+    key_frame_negative = load_json(manifests / "negative-key-frame.json")
+    if key_frame_negative.get("status") != "complete":
+        fail("negative-key-frame.json is not marked complete")
+    key_frame_cases = key_frame_negative.get("cases")
+    if not isinstance(key_frame_cases, list) or not all(
+        isinstance(case, dict) for case in key_frame_cases
+    ):
+        fail("negative-key-frame.json cases are malformed")
+    key_frame_case_ids = [case.get("id") for case in key_frame_cases]
+    if not all(isinstance(case_id, str) for case_id in key_frame_case_ids):
+        fail("negative-key-frame.json case ids are malformed")
+    if len(key_frame_case_ids) != len(set(key_frame_case_ids)):
+        fail("negative-key-frame.json contains duplicate case ids")
+    if set(key_frame_case_ids) != REQUIRED_KEY_FRAME_CASES:
         fail(
-            "v2 envelope coverage differs: "
-            f"missing={sorted(REQUIRED_V2_ENVELOPE_CASES - set(v2_case_ids))}, "
-            f"extra={sorted(set(v2_case_ids) - REQUIRED_V2_ENVELOPE_CASES)}"
+            "key-frame coverage differs: "
+            f"missing={sorted(REQUIRED_KEY_FRAME_CASES - set(key_frame_case_ids))}, "
+            f"extra={sorted(set(key_frame_case_ids) - REQUIRED_KEY_FRAME_CASES)}"
         )
-    for case in v2_cases:
+    for case in key_frame_cases:
         outcomes = int("expected_error" in case) + int("expected_outcome" in case)
         if outcomes != 1 or not isinstance(case.get("operation"), str):
-            fail(f"v2 envelope case {case.get('id')!r} has an invalid outcome/operation")
+            fail(f"key-frame case {case.get('id')!r} has an invalid outcome/operation")
 
     vector_file = root / "rem-parity-1" / "vectors.json"
     document = load_json(vector_file)

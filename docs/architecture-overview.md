@@ -18,7 +18,7 @@ Layer 5   remanence-api, remanence-daemon, remanence-cli
 Layer 4   remanence-state
           config, state lock, audit log, rebuildable SQLite catalog
 Layer 3   remanence-format (3b: rao-v1 body)   remanence-parity (3c: parity)
-          + remanence-aead (RAO1 v2/HPKE envelope), remanence-format-driver (traits),
+          + remanence-aead (RAO1 HPKE envelope), remanence-format-driver (traits),
             remanence-bru (legacy reader), remanence-stream (composition)
 Layer 2   remanence-library
           discovery, identity, policy-gated handles, robotics, tape I/O
@@ -34,7 +34,7 @@ body blocks; the parity layer owns the physical tape layout around them
 One crate sits outside the stack by design: `crates/rao-recover` is a
 standalone disaster-recovery binary that links `remanence-aead`,
 `remanence-format`, `remanence-library`, and `remanence-stream` directly,
-skipping Layers 4 and 5 entirely. It exists so a v2 RAO envelope can be
+skipping Layers 4 and 5 entirely. It exists so an encrypted RAO envelope can be
 decrypted and restored with nothing but the object bytes and one matching
 recipient private key — no daemon, no catalog, no config file — for the
 scenario where the rest of the stack is unavailable or untrusted.
@@ -111,7 +111,7 @@ Six crates share this layer:
   production sealers require 2-8 distinct epochs. There is no shared
   secret, and format version 1 is permanently rejected as unsupported.
   The crate depends on no other Remanence crate, so the envelope is
-  auditable on its own. Its v2 whole-object and ranged primitives are
+  auditable on its own. Its whole-object and ranged primitives are
   wrapped by `remanence-format`, which is the funnel used by the CLI,
   API, and `rao-recover`.
 - `remanence-parity` owns the physical tape layout: bootstrap blocks,
@@ -131,11 +131,12 @@ Six crates share this layer:
 - `remanence-crc` is the shared CRC-64/XZ used by the parity structures
   and the audit log.
 
-`archive build` and pool-selected `archive write` produce v2 when given
+`archive build` and pool-selected `archive write` produce the encrypted
+representation when given
 2-8 ordered `--recipient` RAOR files; omitting recipients keeps the body
-plaintext. `archive reseal` is a v2→v2 recipient-rotation path. Whole,
+plaintext. `archive reseal` performs a full re-seal to rotate recipients. Whole,
 streaming, and ranged opens use a RAOP `--private-key`; its epoch id selects
-the matching key-frame slot. `rao-recover` provides the same v2 open without
+the matching key-frame slot. `rao-recover` provides the same encrypted open without
 the daemon, catalog, or config.
 
 <!-- code-anchor: crates/remanence-state/src/lib.rs crates/remanence-state/src/state.rs @ 2a20106 -->
@@ -221,7 +222,7 @@ What happens when an orchestrator writes an object:
    against the received bytes before anything touches tape. On startup,
    `rem-daemon` deletes its own daemon-owned leftover spool files from a
    prior unclean exit before resolving the budget.
-4. The object is laid out as a plaintext `rao-v1` body or sealed as a v2
+4. The object is laid out as a plaintext `rao-v1` body or sealed as a
    recipient envelope, then
    written through the parity sink. Tape I/O itself is pipelined: a
    fixed pool of page-aligned staging-ring buffers (`tape_io.staging_ring_buffers`,

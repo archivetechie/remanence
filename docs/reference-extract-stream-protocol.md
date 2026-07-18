@@ -20,7 +20,7 @@ or alternate key source.
 
 ## Whole-object streams
 
-- **stdin:** exactly one complete encrypted RAO1 v2 stored-object byte string,
+- **stdin:** exactly one complete encrypted RAO1 stored-object byte string,
   from its 128-byte scalar header through the recipient key frame,
   authenticated metadata/payload, completion footer, and zero fill. Trailing
   bytes are an error. Input is consumed sequentially; the helper does not seek.

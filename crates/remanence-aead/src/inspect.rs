@@ -11,7 +11,7 @@ use crate::stream::round_up;
 pub struct InspectReport {
     /// Parsed plaintext header.
     pub header: RaoHeader,
-    /// Parsed canonical v2 key frame.
+    /// Parsed canonical key frame.
     pub key_frame: crate::KeyFrame,
     /// Total stored input size.
     pub stored_size_bytes: u64,

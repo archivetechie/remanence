@@ -30,7 +30,7 @@ pub struct SealOptions {
 pub struct SealReport {
     /// Serialized header used for this object.
     pub header: RaoHeader,
-    /// Parsed v2 key frame.
+    /// Parsed key frame.
     pub key_frame: crate::KeyFrame,
     /// Metadata plaintext size before the AEAD tag.
     pub metadata_plaintext_len: u64,
@@ -46,7 +46,7 @@ pub struct SealReport {
     pub plaintext: PlaintextStats,
 }
 
-/// Inputs unique to a v2 envelope-mode seal.
+/// Inputs unique to an envelope-mode seal.
 #[derive(Debug, Clone)]
 pub struct EnvelopeSealOptions {
     /// Common framing and plaintext facts.
@@ -55,7 +55,7 @@ pub struct EnvelopeSealOptions {
     pub recipients: Vec<RecipientPublicKey>,
 }
 
-/// Seal a canonical plaintext RAO object as a v2 HPKE envelope.
+/// Seal a canonical plaintext RAO object as an HPKE envelope.
 pub fn seal<R: Read, W: Write>(
     plaintext: R,
     output: W,
@@ -66,7 +66,7 @@ pub fn seal<R: Read, W: Write>(
     seal_with_material(plaintext, output, options, &dek, &mut rng)
 }
 
-/// Seal a byte-identical v2 object from fixed test-vector key material.
+/// Seal a byte-identical envelope from fixed test-vector key material.
 ///
 /// This entry point exists only to generate reproducible conformance test
 /// vectors. Production callers must use [`seal`], which obtains the
@@ -102,7 +102,7 @@ where
         || options.recipients.len() < 2
     {
         return Err(RaoAeadError::InvalidInput(
-            "v2 envelope seal requires aligned plaintext and at least two recipients".to_string(),
+            "envelope seal requires aligned plaintext and at least two recipients".to_string(),
         ));
     }
     if options
@@ -130,7 +130,7 @@ where
         .checked_add(16)
         .ok_or(RaoAeadError::SizeOverflow)?;
     let object_id_field = crate::header::object_id_field(&options.common.object_id)?;
-    let salt = crate::kdf::derive_salt_v2(
+    let salt = crate::kdf::derive_salt(
         dek.as_bytes(),
         &object_id_field,
         &options.common.plaintext_digest,
@@ -140,14 +140,14 @@ where
     let key_frame_bytes = key_frame.serialize()?;
     let key_frame_len =
         u32::try_from(key_frame_bytes.len()).map_err(|_| RaoAeadError::InvalidKeyFrameLength)?;
-    let header = RaoHeader::new_v2_envelope(
+    let header = RaoHeader::new_envelope(
         options.common.chunk_size,
         salt,
         metadata_frame_len,
         options.common.object_id.clone(),
         key_frame_len,
     )?;
-    let keys = crate::kdf::derive_keys_v2(
+    let keys = crate::kdf::derive_keys(
         dek.as_bytes(),
         &header.hkdf_salt,
         &header.header_hash_with_key_frame(&key_frame_bytes)?,
@@ -194,7 +194,7 @@ where
     })
 }
 
-/// Seal a v2 envelope into a newly allocated vector.
+/// Seal an envelope into a newly allocated vector.
 pub fn seal_to_vec(
     plaintext: &[u8],
     options: &EnvelopeSealOptions,
@@ -449,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_envelope_rejects_nonadjacent_duplicate_epoch() {
+    fn envelope_rejects_nonadjacent_duplicate_epoch() {
         let plaintext = vec![0x5a; 512];
         let common = options(&plaintext);
         let first = RecipientPrivateKey::new([1; 16], "safe", [7; 32]).unwrap();
@@ -470,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_v2_seal_matches_checked_in_expectation() {
+    fn deterministic_seal_matches_checked_in_expectation() {
         let plaintext = vec![0x5a; 512];
         let common = options_with_object_id(&plaintext, "deterministic-vector");
         let primary = RecipientPrivateKey::new([0x11; 16], "primary", [0x31; 32]).unwrap();
@@ -491,7 +491,7 @@ mod tests {
             [0x55; 32],
         )
         .unwrap();
-        let expected_hex = include_str!("../testdata/deterministic-v2-seal.hex").trim();
+        let expected_hex = include_str!("../testdata/deterministic-seal.hex").trim();
         let encoded = sealed
             .iter()
             .map(|byte| format!("{byte:02x}"))

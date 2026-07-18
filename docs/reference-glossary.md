@@ -29,7 +29,7 @@ and wrapped once per recipient with HPKE (RFC 9180, X25519-HKDF-SHA256-
 ChaCha20Poly1305) into a **key frame** (wire tag `RAOK`, 1-8 recipient
 slots accepted by readers) sitting between the header and metadata frame.
 Production sealers require 2-8 distinct recipient epochs. `archive build`,
-pool-selected `archive write`, and v2→v2 `archive reseal` produce it;
+pool-selected `archive write`, and a full `archive reseal` produce it;
 `archive extract`/`restore`/`read`/`verify`, the streaming range commands,
 and `rao-recover` open it with a matching RAOP private key.
 

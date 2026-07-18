@@ -1,4 +1,4 @@
-//! Canonical RAO v2 wrapped-DEK key-frame codec.
+//! Canonical RAO wrapped-DEK key-frame codec.
 
 use crate::error::{RaoAeadError, Result};
 
@@ -26,7 +26,7 @@ pub struct RecipientSlot {
     pub ciphertext: [u8; 48],
 }
 
-/// Canonically ordered RAO v2 recipient slots.
+/// Canonically ordered RAO recipient slots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyFrame {
     /// Recipient slots in strictly ascending slot-index order.

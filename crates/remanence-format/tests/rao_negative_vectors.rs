@@ -6,10 +6,9 @@ use remanence_aead::stream::{
     encrypt_chunk, encrypt_metadata, stored_size_from_parts, CHACHA20POLY1305_TAG_LEN,
 };
 use remanence_aead::{
-    derive_keys_v2, derive_salt_v2, inspect_bytes, open_to_vec,
-    seal_deterministic_for_test_vectors, seal_to_vec, DataEncryptionKey, EnvelopeSealOptions,
-    KeyFrame, RaoAeadError, RaoHeader, RaoMetadata, RecipientPrivateKey, RecipientPublicKey,
-    RecipientSlot, SealOptions, RAO_FOOTER,
+    derive_keys, derive_salt, inspect_bytes, open_to_vec, seal_deterministic_for_test_vectors,
+    seal_to_vec, DataEncryptionKey, EnvelopeSealOptions, KeyFrame, RaoAeadError, RaoHeader,
+    RaoMetadata, RecipientPrivateKey, RecipientPublicKey, RecipientSlot, SealOptions, RAO_FOOTER,
 };
 use remanence_format::{
     plan_rem_tar_object, read_encrypted_rao_object, read_rem_tar_object, stream_rem_tar_object,
@@ -447,7 +446,7 @@ fn run_plaintext_reader_case(id: &str, operation: &str) -> Result<(), FormatErro
 
 fn mutate_plaintext_archive(id: &str, archive: &mut PlaintextArchive) {
     match id {
-        "wrong-format-id" => replace_once(&mut archive.bytes, b"rao-v1", b"rao-v2"),
+        "wrong-format-id" => replace_once(&mut archive.bytes, b"rao-v1", b"rao-v0"),
         "schema-major-2" => replace_once(
             &mut archive.bytes,
             b"REMANENCE.schema_version=1.0",
@@ -1219,22 +1218,22 @@ fn envelope_from_metadata_plaintext(
     let dek_bytes = [0x5d; 32];
     let salt = match salt_override {
         Some(salt) => salt,
-        None => derive_salt_v2(
+        None => derive_salt(
             &dek_bytes,
             &object_id_field,
             &salt_digest,
             metadata_plaintext,
         )?,
     };
-    let key_frame = v2_key_frame(plaintext, options)?;
-    let header = RaoHeader::new_v2_envelope(
+    let key_frame = build_key_frame(plaintext, options)?;
+    let header = RaoHeader::new_envelope(
         options.chunk_size,
         salt,
         metadata_frame_len,
         options.object_id.clone(),
         u32::try_from(key_frame.len()).map_err(|_| RaoAeadError::SizeOverflow)?,
     )?;
-    let keys = derive_keys_v2(
+    let keys = derive_keys(
         &dek_bytes,
         &header.hkdf_salt,
         &header.header_hash_with_key_frame(&key_frame)?,
@@ -1302,21 +1301,21 @@ fn envelope_with_extra_payload_chunk(
         .ok_or(RaoAeadError::SizeOverflow)?;
     let object_id_field = remanence_aead::header::object_id_field(&options.object_id)?;
     let dek_bytes = [0x5d; 32];
-    let salt = derive_salt_v2(
+    let salt = derive_salt(
         &dek_bytes,
         &object_id_field,
         &options.plaintext_digest,
         &metadata_plaintext,
     )?;
-    let key_frame = v2_key_frame(plaintext, options)?;
-    let header = RaoHeader::new_v2_envelope(
+    let key_frame = build_key_frame(plaintext, options)?;
+    let header = RaoHeader::new_envelope(
         options.chunk_size,
         salt,
         metadata_frame_len,
         options.object_id.clone(),
         u32::try_from(key_frame.len()).map_err(|_| RaoAeadError::SizeOverflow)?,
     )?;
-    let keys = derive_keys_v2(
+    let keys = derive_keys(
         &dek_bytes,
         &header.hkdf_salt,
         &header.header_hash_with_key_frame(&key_frame)?,
@@ -1381,7 +1380,7 @@ fn non_derived_salt(options: &SealOptions) -> Result<[u8; 16], RaoAeadError> {
     )?;
     let metadata_plaintext = metadata.to_cbor_bytes(options.chunk_size)?;
     let object_id_field = remanence_aead::header::object_id_field(&options.object_id)?;
-    let expected = derive_salt_v2(
+    let expected = derive_salt(
         &[0x5d; 32],
         &object_id_field,
         &options.plaintext_digest,
@@ -1394,7 +1393,7 @@ fn non_derived_salt(options: &SealOptions) -> Result<[u8; 16], RaoAeadError> {
     Ok(salt)
 }
 
-fn v2_key_frame(plaintext: &[u8], options: &SealOptions) -> Result<Vec<u8>, RaoAeadError> {
+fn build_key_frame(plaintext: &[u8], options: &SealOptions) -> Result<Vec<u8>, RaoAeadError> {
     let (_, recipients) = recipient_pair();
     let envelope_options = EnvelopeSealOptions {
         common: options.clone(),
@@ -1610,7 +1609,7 @@ fn assert_envelope_base(fixture: &Value) {
     assert_eq!(str_field(base, "object_id"), "object-1");
 }
 
-fn v2_slot(index: u8, label: &str) -> RecipientSlot {
+fn recipient_slot(index: u8, label: &str) -> RecipientSlot {
     RecipientSlot {
         slot_index: index,
         recipient_epoch_id: [index.wrapping_add(1); 16],
@@ -1621,19 +1620,19 @@ fn v2_slot(index: u8, label: &str) -> RecipientSlot {
 }
 
 fn parsed_key_frame(object: &[u8]) -> KeyFrame {
-    let inspected = inspect_bytes(object).expect("base v2 object inspects");
+    let inspected = inspect_bytes(object).expect("base encrypted object inspects");
     let end = 128 + inspected.header.key_frame_len as usize;
-    KeyFrame::parse(&object[128..end]).expect("base v2 key frame parses")
+    KeyFrame::parse(&object[128..end]).expect("base key frame parses")
 }
 
 fn replace_key_frame(object: &[u8], key_frame: &KeyFrame) -> Vec<u8> {
-    let inspected = inspect_bytes(object).expect("base v2 object inspects");
+    let inspected = inspect_bytes(object).expect("base encrypted object inspects");
     let old_metadata_start = 128 + inspected.header.key_frame_len as usize;
     let body_end = inspected.footer_offset as usize + RAO_FOOTER.len();
     let key_frame_bytes = key_frame
         .serialize()
         .expect("replacement key frame serializes");
-    let header = RaoHeader::new_v2_envelope(
+    let header = RaoHeader::new_envelope(
         inspected.header.chunk_size,
         inspected.header.hkdf_salt,
         inspected.header.metadata_frame_len,
@@ -1701,14 +1700,14 @@ fn one_slot_readable_envelope() -> (Vec<u8>, RecipientPrivateKey) {
     )
     .unwrap();
     let metadata_plaintext = metadata.to_cbor_bytes(options.chunk_size).unwrap();
-    let salt = derive_salt_v2(
+    let salt = derive_salt(
         &[0x5d; 32],
         &remanence_aead::header::object_id_field(&options.object_id).unwrap(),
         &options.plaintext_digest,
         &metadata_plaintext,
     )
     .unwrap();
-    let header = RaoHeader::new_v2_envelope(
+    let header = RaoHeader::new_envelope(
         options.chunk_size,
         salt,
         metadata_plaintext.len() as u64 + CHACHA20POLY1305_TAG_LEN,
@@ -1716,7 +1715,7 @@ fn one_slot_readable_envelope() -> (Vec<u8>, RecipientPrivateKey) {
         key_frame_bytes.len() as u32,
     )
     .unwrap();
-    let keys = derive_keys_v2(
+    let keys = derive_keys(
         &[0x5d; 32],
         &salt,
         &header.header_hash_with_key_frame(&key_frame_bytes).unwrap(),
@@ -1767,15 +1766,15 @@ fn writer_recipients(count: usize) -> Vec<RecipientPublicKey> {
         .collect()
 }
 
-fn run_v2_envelope_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
+fn run_key_frame_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
     if matches!(
         id,
-        "v2-writer-zero-slots" | "v2-writer-one-slot" | "v2-writer-nine-slots"
+        "writer-zero-slots" | "writer-one-slot" | "writer-nine-slots"
     ) {
         let count = match id {
-            "v2-writer-zero-slots" => 0,
-            "v2-writer-one-slot" => 1,
-            "v2-writer-nine-slots" => 9,
+            "writer-zero-slots" => 0,
+            "writer-one-slot" => 1,
+            "writer-nine-slots" => 9,
             _ => unreachable!(),
         };
         let plaintext = base_envelope_plaintext();
@@ -1794,7 +1793,7 @@ fn run_v2_envelope_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
         return Ok(());
     }
 
-    if id == "v2-reader-one-slot" {
+    if id == "reader-one-slot" {
         let (object, recipient) = one_slot_readable_envelope();
         let (opened, report) = open_to_vec(&object, &recipient)?;
         assert_eq!(opened, base_envelope_plaintext());
@@ -1805,83 +1804,83 @@ fn run_v2_envelope_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
     let (mut object, recipient) = deterministic_base_envelope();
     let key_frame_len = inspect_bytes(&object)?.header.key_frame_len as usize;
     match id {
-        "v2-version-flip" => object[6] = 1,
-        "v2-suite-flip" => object[0x38] = 0xff,
-        "v2-truncated-key-frame" => object.truncate(128 + key_frame_len - 1),
-        "v2-duplicate-slots" => {
+        "version-flip" => object[6] = 1,
+        "suite-flip" => object[0x38] = 0xff,
+        "truncated-key-frame" => object.truncate(128 + key_frame_len - 1),
+        "duplicate-slots" => {
             let frame = parsed_key_frame(&object);
             let second_slot = 128 + 5 + 98 + frame.slots[0].epoch_label.len();
             object[second_slot] = 0;
         }
-        "v2-misordered-slots" => {
+        "misordered-slots" => {
             let frame = parsed_key_frame(&object);
             let second_slot = 128 + 5 + 98 + frame.slots[0].epoch_label.len();
             object[128 + 5] = 2;
             object[second_slot] = 1;
         }
-        "v2-key-frame-trailing-byte" => {
+        "key-frame-trailing-byte" => {
             object[0x3c..0x40].copy_from_slice(&((key_frame_len + 1) as u32).to_be_bytes());
             object.insert(128 + key_frame_len, 0);
         }
-        "v2-oversize-key-frame" => {
+        "oversize-key-frame" => {
             object[0x3c..0x40].copy_from_slice(&4097u32.to_be_bytes());
         }
-        "v2-key-frame-label-tamper" => {
+        "key-frame-label-tamper" => {
             let mut frame = parsed_key_frame(&object);
             frame.slots[0].epoch_label.replace_range(0..1, "P");
             object = replace_key_frame(&object, &frame);
         }
-        "v2-key-frame-enc-tamper" => {
+        "key-frame-enc-tamper" => {
             let mut frame = parsed_key_frame(&object);
             frame.slots[0].enc[0] ^= 1;
             object = replace_key_frame(&object, &frame);
         }
-        "v2-key-frame-ciphertext-tamper" => {
+        "key-frame-ciphertext-tamper" => {
             let mut frame = parsed_key_frame(&object);
             frame.slots[0].ciphertext[0] ^= 1;
             object = replace_key_frame(&object, &frame);
         }
-        "v2-key-frame-slot-inserted" => {
+        "key-frame-slot-inserted" => {
             let mut frame = parsed_key_frame(&object);
-            frame.slots.push(v2_slot(2, "inserted"));
+            frame.slots.push(recipient_slot(2, "inserted"));
             object = replace_key_frame(&object, &KeyFrame::new(frame.slots).unwrap());
         }
-        "v2-key-frame-slot-removed" => {
+        "key-frame-slot-removed" => {
             let mut frame = parsed_key_frame(&object);
             frame.slots.pop();
             object = replace_key_frame(&object, &KeyFrame::new(frame.slots).unwrap());
         }
-        "v2-slot-count-zero" => object[128 + 4] = 0,
-        "v2-slot-count-nine" => object[128 + 4] = 9,
-        "v2-wrap-suite-zero-nonempty" => object[0x38] = 0,
-        "v2-hpke-zero-key-frame-len" => object[0x3c..0x40].copy_from_slice(&0u32.to_be_bytes()),
-        "v2-hpke-undersized-key-frame-len" => {
+        "slot-count-zero" => object[128 + 4] = 0,
+        "slot-count-nine" => object[128 + 4] = 9,
+        "wrap-suite-zero-nonempty" => object[0x38] = 0,
+        "hpke-zero-key-frame-len" => object[0x3c..0x40].copy_from_slice(&0u32.to_be_bytes()),
+        "hpke-undersized-key-frame-len" => {
             object[0x3c..0x40].copy_from_slice(&102u32.to_be_bytes());
         }
-        "v2-duplicate-recipient-epoch-id" => {
+        "duplicate-recipient-epoch-id" => {
             let frame = parsed_key_frame(&object);
             let second_slot = 128 + 5 + 98 + frame.slots[0].epoch_label.len();
             let first_epoch = object[128 + 6..128 + 22].to_vec();
             object[second_slot + 1..second_slot + 17].copy_from_slice(&first_epoch);
         }
-        "v2-internal-slot-truncation" => {
+        "internal-slot-truncation" => {
             let frame = parsed_key_frame(&object);
             let second_slot = 128 + 5 + 98 + frame.slots[0].epoch_label.len();
             object[second_slot + 17] = 32;
         }
-        "v2-nonzero-reserved-key-region" => object[0x10] = 1,
-        "v2-malformed-key-frame-magic" => object[128] = b'X',
-        "v2-wrong-recipient-private-key" => {
+        "nonzero-reserved-key-region" => object[0x10] = 1,
+        "malformed-key-frame-magic" => object[128] = b'X',
+        "wrong-recipient-private-key" => {
             let wrong = RecipientPrivateKey::new([0x31; 16], "primary-2026", [0x43; 32]).unwrap();
             open_to_vec(&object, &wrong)?;
             return Ok(());
         }
-        "v2-malformed-encapsulation" => {
+        "malformed-encapsulation" => {
             let mut frame = parsed_key_frame(&object);
             frame.slots[0].enc.fill(0);
             object = replace_key_frame(&object, &frame);
         }
-        other => panic!("unhandled v2 envelope negative vector {other:?}"),
+        other => panic!("unhandled key-frame negative vector {other:?}"),
     }
 
     match operation {
@@ -1893,7 +1892,7 @@ fn run_v2_envelope_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
         }
         "seal" => panic!("case {id:?} did not return from its seal branch"),
         "read" => panic!("case {id:?} did not return from its read branch"),
-        other => panic!("unhandled v2 envelope operation {other:?} for case {id:?}"),
+        other => panic!("unhandled envelope operation {other:?} for case {id:?}"),
     }
     Ok(())
 }
@@ -2068,46 +2067,46 @@ fn envelope_negative_vectors_match_manifest_errors() {
 }
 
 #[test]
-fn envelope_v2_negative_vectors_match_manifest_errors() {
+fn key_frame_negative_vectors_match_manifest_errors() {
     let fixture = fixture(include_str!(
-        "../../../fixtures/rao/negative-envelope-v2.json"
+        "../../../fixtures/rao/negative-key-frame.json"
     ));
     assert_complete_case_ids(
         &fixture,
         &[
-            "v2-version-flip",
-            "v2-suite-flip",
-            "v2-truncated-key-frame",
-            "v2-duplicate-slots",
-            "v2-misordered-slots",
-            "v2-key-frame-trailing-byte",
-            "v2-oversize-key-frame",
-            "v2-key-frame-label-tamper",
-            "v2-key-frame-enc-tamper",
-            "v2-key-frame-ciphertext-tamper",
-            "v2-key-frame-slot-inserted",
-            "v2-key-frame-slot-removed",
-            "v2-slot-count-zero",
-            "v2-slot-count-nine",
-            "v2-writer-zero-slots",
-            "v2-writer-one-slot",
-            "v2-writer-nine-slots",
-            "v2-reader-one-slot",
-            "v2-wrap-suite-zero-nonempty",
-            "v2-hpke-zero-key-frame-len",
-            "v2-hpke-undersized-key-frame-len",
-            "v2-duplicate-recipient-epoch-id",
-            "v2-internal-slot-truncation",
-            "v2-nonzero-reserved-key-region",
-            "v2-malformed-key-frame-magic",
-            "v2-wrong-recipient-private-key",
-            "v2-malformed-encapsulation",
+            "version-flip",
+            "suite-flip",
+            "truncated-key-frame",
+            "duplicate-slots",
+            "misordered-slots",
+            "key-frame-trailing-byte",
+            "oversize-key-frame",
+            "key-frame-label-tamper",
+            "key-frame-enc-tamper",
+            "key-frame-ciphertext-tamper",
+            "key-frame-slot-inserted",
+            "key-frame-slot-removed",
+            "slot-count-zero",
+            "slot-count-nine",
+            "writer-zero-slots",
+            "writer-one-slot",
+            "writer-nine-slots",
+            "reader-one-slot",
+            "wrap-suite-zero-nonempty",
+            "hpke-zero-key-frame-len",
+            "hpke-undersized-key-frame-len",
+            "duplicate-recipient-epoch-id",
+            "internal-slot-truncation",
+            "nonzero-reserved-key-region",
+            "malformed-key-frame-magic",
+            "wrong-recipient-private-key",
+            "malformed-encapsulation",
         ],
     );
     for case in cases(&fixture) {
         let id = str_field(case, "id");
         let operation = str_field(case, "operation");
-        let result = run_v2_envelope_case(id, operation);
+        let result = run_key_frame_case(id, operation);
         if let Some(expected) = case.get("expected_error") {
             let error = result.unwrap_err();
             assert_eq!(

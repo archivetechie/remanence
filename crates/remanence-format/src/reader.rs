@@ -224,7 +224,7 @@ pub fn read_rem_tar_object_with_mode_and_manifest_anchor<S: BlockRead + ?Sized>(
     parse_rem_tar_bytes_with_mode_and_manifest_anchor(&archive, chunk_size, mode, manifest_sha256)
 }
 
-/// Read, decrypt, and parse one v2 recipient-envelope RAO object.
+/// Read, decrypt, and parse one recipient-envelope RAO object.
 pub fn read_encrypted_rao_object<S: BlockRead + ?Sized>(
     source: &mut S,
     chunk_size: usize,
@@ -240,7 +240,7 @@ pub fn read_encrypted_rao_object<S: BlockRead + ?Sized>(
     )
 }
 
-/// Read a v2 recipient-envelope RAO object with an explicit integrity mode.
+/// Read a recipient-envelope RAO object with an explicit integrity mode.
 pub fn read_encrypted_rao_object_with_mode<S: BlockRead + ?Sized>(
     source: &mut S,
     chunk_size: usize,
@@ -258,7 +258,7 @@ pub fn read_encrypted_rao_object_with_mode<S: BlockRead + ?Sized>(
     )
 }
 
-/// Read a v2 recipient-envelope RAO object with an external manifest anchor.
+/// Read a recipient-envelope RAO object with an external manifest anchor.
 pub fn read_encrypted_rao_object_with_manifest_anchor<S: BlockRead + ?Sized>(
     source: &mut S,
     chunk_size: usize,
@@ -276,7 +276,7 @@ pub fn read_encrypted_rao_object_with_manifest_anchor<S: BlockRead + ?Sized>(
     )
 }
 
-/// Read a v2 recipient-envelope RAO object with explicit mode and manifest anchor.
+/// Read a recipient-envelope RAO object with explicit mode and manifest anchor.
 pub fn read_encrypted_rao_object_with_mode_and_manifest_anchor<S: BlockRead + ?Sized>(
     source: &mut S,
     chunk_size: usize,
@@ -1936,7 +1936,7 @@ mod tests {
         }];
         let mut sink = VecBlockSink::new();
         let layout = write_rem_tar_object(&mut sink, &opts, &files).unwrap();
-        replace_once_in_blocks(&mut sink.blocks, b"rao-v1", b"rao-v2");
+        replace_once_in_blocks(&mut sink.blocks, b"rao-v1", b"rao-v0");
         let mut source = VecBlockSource::new(sink.blocks);
 
         let err = read_rem_tar_object(&mut source, opts.chunk_size, layout.projected_size_blocks)

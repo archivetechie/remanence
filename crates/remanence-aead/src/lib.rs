@@ -27,8 +27,7 @@ pub use header::{
 };
 pub use inspect::{inspect_bytes, InspectReport};
 pub use kdf::{
-    derive_keys_v2, derive_salt_v2, DerivedKeys, LABEL_METADATA_V2, LABEL_OBJECT_V2,
-    LABEL_PAYLOAD_V2, LABEL_SALT_V2,
+    derive_keys, derive_salt, DerivedKeys, LABEL_METADATA, LABEL_OBJECT, LABEL_PAYLOAD, LABEL_SALT,
 };
 pub use key_frame::{
     KeyFrame, RecipientSlot, RAO_KEY_FRAME_MAX_LEN, RAO_KEY_FRAME_MAX_SLOTS, RAO_KEY_FRAME_MIN_LEN,

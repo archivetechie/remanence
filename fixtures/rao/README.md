@@ -9,7 +9,7 @@ freeze a value produced only by the Rust implementation.
 
 The independent Python verifier rebuilds the positive plaintext streams without
 using the Remanence Rust crates. It also opens the pinned RAO-TV-E2 and
-RAO-TV-D1 v2 envelopes with generic X25519, HKDF-SHA-256, and
+RAO-TV-D1 envelopes with generic X25519, HKDF-SHA-256, and
 ChaCha20-Poly1305 primitives, verifying the recovered canonical bytes,
 `plaintext_digest`, manifest bytes, and every regular-file digest.
 

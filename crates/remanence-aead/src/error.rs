@@ -21,13 +21,13 @@ pub enum RaoAeadError {
     /// The suite id is not HKDF-SHA-256 + ChaCha20-Poly1305.
     #[error("invalid RAO AEAD suite")]
     InvalidSuite,
-    /// The v2 wrapping suite is unknown or inconsistent with its key frame.
+    /// The wrapping suite is unknown or inconsistent with its key frame.
     #[error("invalid RAO wrapping suite")]
     InvalidWrapSuite,
-    /// The v2 key-frame length is outside its frozen bounds.
+    /// The key-frame length is outside its frozen bounds.
     #[error("invalid RAO key-frame length")]
     InvalidKeyFrameLength,
-    /// The v2 wrapped-key frame is malformed or non-canonical.
+    /// The wrapped-key frame is malformed or non-canonical.
     #[error("invalid RAO wrapped-key frame")]
     InvalidKeyFrame,
     /// The operating system could not provide cryptographic randomness.
@@ -45,7 +45,7 @@ pub enum RaoAeadError {
     /// Reserved header bytes or flags are nonzero.
     #[error("reserved RAO header bytes or flags are not zero")]
     ReservedBytesNotZero,
-    /// HKDF could not expand one of the fixed-size v2 output keys.
+    /// HKDF could not expand one of the fixed-size output keys.
     #[error("RAO HKDF expansion failed")]
     KdfExpansionFailed,
     /// The header salt is invalid.

@@ -56,8 +56,7 @@ REM-PARITY 1.0) are specified and implemented. Working today:
   standalone `rao-recover` binary decrypts archive objects with no
   daemon, catalog, or config file at all — the disaster-recovery path of
   last resort.
-- Legacy BRU archive reading (feature-gated) for migrating old tapes,
-  chaos fault-injection for tests, and Lean/Aeneas proofs over the
+- Chaos fault-injection for tests, and Lean/Aeneas proofs over the
   parity and format cores (`verif/`).
 
 The main gaps, from the code as it stands: authorization is a shallow
@@ -136,6 +135,16 @@ tape write, is [docs/guide-quickstart.md](docs/guide-quickstart.md).
 - [proto/layer5.proto](proto/layer5.proto) — the draft gRPC contract.
 
 <!-- code-anchor: crates/remanence-library/tests/platform_dependency_guard.rs @ 7fb10f8 -->
+## Migrating foreign tapes
+
+`crates/remanence-bru` reads tapes written by the legacy BRU backup tool.
+It is auxiliary migration tooling for the narrow audience holding
+BRU-written cartridges, and it is **never part of the default build or
+the core binaries** — nothing links it unless you opt in with
+`cargo build --features remanence-cli/foreign-bru`. Further foreign-format
+readers will follow the same rule: the archival core stays lean, and
+migration tooling is something you ask for.
+
 ## Platform crate contract
 
 `remanence-scsi` and `remanence-library` are the reusable tape-platform
@@ -159,7 +168,7 @@ crates/remanence-crc            Shared CRC-64/XZ
 crates/remanence-aead           RAO1 encrypted-envelope primitives (HPKE wrapped-DEK)
 crates/remanence-format-driver  Published format-driver traits
 crates/remanence-format         Native rao-v1 body format
-crates/remanence-bru            Legacy BRU reader (feature-gated)
+crates/remanence-bru            Foreign-tape migration: legacy BRU reader (opt-in feature, never in default build)
 crates/remanence-parity         Layer 3c sidecar parity and recovery
 crates/remanence-stream         Restore/recovery streaming composition
 crates/remanence-state          Layer 4 catalog, audit, config, lock
