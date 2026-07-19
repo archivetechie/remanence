@@ -6,7 +6,7 @@ defaultTargets = ["ParityState"]
 # the pilot; pin to a GitHub rev if this outlives the pilot.
 [[require]]
 name = "aeneas"
-path = "/home/user/toolchains/aeneas/backends/lean"
+path = "../../../../toolchains/aeneas/backends/lean"
 
 [[lean_lib]]
 name = "ParityState"

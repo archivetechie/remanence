@@ -2,7 +2,7 @@
 # Show the current state of the QuadStor VTL on akash.
 # Safe to run any time; makes no changes.
 #
-# Usage:  sudo /home/user/remanence/scripts/quadstor/status.sh
+# Usage:  sudo scripts-relative: scripts/quadstor/status.sh
 
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

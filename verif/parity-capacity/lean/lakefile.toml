@@ -6,7 +6,7 @@ defaultTargets = ["ParityCapacity"]
 # crate follows the parity-state and parity-mapping proof setup.
 [[require]]
 name = "aeneas"
-path = "/home/user/toolchains/aeneas/backends/lean"
+path = "../../../../toolchains/aeneas/backends/lean"
 
 [[lean_lib]]
 name = "ParityCapacity"

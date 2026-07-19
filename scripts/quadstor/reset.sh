@@ -5,7 +5,7 @@
 # Use when you want a clean library to play with but don't want to wait for the
 # disk-initialization step in setup.sh.
 #
-# Usage:  sudo /home/user/remanence/scripts/quadstor/reset.sh
+# Usage:  sudo scripts-relative: scripts/quadstor/reset.sh
 
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

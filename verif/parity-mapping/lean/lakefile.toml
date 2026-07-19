@@ -6,7 +6,7 @@ defaultTargets = ["ParityMapping"]
 # crate follows the parity-state pilot's machine-local Lean setup.
 [[require]]
 name = "aeneas"
-path = "/home/user/toolchains/aeneas/backends/lean"
+path = "../../../../toolchains/aeneas/backends/lean"
 
 [[lean_lib]]
 name = "ParityMapping"

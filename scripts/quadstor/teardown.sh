@@ -9,9 +9,9 @@
 #
 # Leaves QuadStor itself (the .deb) installed. To uninstall, see INSTALL.md.
 #
-# Usage:  sudo /home/user/remanence/scripts/quadstor/teardown.sh
-#         sudo /home/user/remanence/scripts/quadstor/teardown.sh --keep-backing
-#         sudo /home/user/remanence/scripts/quadstor/teardown.sh --remove-defs
+# Usage:  sudo scripts-relative: scripts/quadstor/teardown.sh
+#         sudo scripts-relative: scripts/quadstor/teardown.sh --keep-backing
+#         sudo scripts-relative: scripts/quadstor/teardown.sh --remove-defs
 
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
