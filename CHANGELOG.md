@@ -6,9 +6,9 @@ per-release summaries.
 
 ## v1.0.1 — 2026-07-19
 
-Maintenance and capability release. Archived under the same concept DOI
-[10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126); the
-version DOI is backfilled here after archiving.
+Maintenance and capability release. Archived: DOI
+[10.5281/zenodo.21438555](https://doi.org/10.5281/zenodo.21438555)
+(concept DOI [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126)).
 
 - Drive-targeted reads: a read session can now be opened on the tape
   currently loaded in a chosen drive (`DriveTarget`), with the same identity
