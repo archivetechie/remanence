@@ -4,6 +4,34 @@ Notable changes to Remanence and its published formats. The format
 specifications carry their own revision histories; entries here are
 per-release summaries.
 
+## v1.0.1 — 2026-07-19
+
+Maintenance and capability release. Archived under the same concept DOI
+[10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126); the
+version DOI is backfilled here after archiving.
+
+- Drive-targeted reads: a read session can now be opened on the tape
+  currently loaded in a chosen drive (`DriveTarget`), with the same identity
+  proof, pool guard, and readiness path as every other session open. With
+  the existing load-to-drive command this makes cross-drive read-back
+  checks — "read this tape in the other drive" — performable end to end,
+  and supported `rem` verbs are provided for the composition.
+- Audit query service: `QueryAudit` is now served over both transports,
+  streaming a time window of the append-only audit log with exact filters
+  (session, operation, event kind), plus a `rem audit query` verb. Replay
+  streams record bodies with bounded memory; the retained per-segment
+  bookkeeping is proportional to segment count and is documented in code.
+- Telemetry at the moments that matter: TapeAlert and error-counter
+  snapshots are now also recorded when an append or read fails, not only at
+  clean session close.
+- Two-library safety: robotics requests against a discovered but
+  non-operated library are rejected, preventing bay aliasing between
+  co-resident libraries.
+- Verification housekeeping: the 2026-07-18 tautology audit deleted three
+  proof-free theorems and sharpened the remaining claims. Zenodo DOIs are
+  recorded in the README and citation metadata; internal working files are
+  no longer tracked.
+
 ## v1.0.0 — 2026-07-18
 
 First publication release. Archived: DOI
