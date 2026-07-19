@@ -10,9 +10,9 @@
 #
 # Idempotent. Safe to re-run after a partial setup.
 #
-# Usage:  sudo /home/user/remanence/scripts/quadstor/setup.sh
-# Reset:  sudo /home/user/remanence/scripts/quadstor/reset.sh     (rebuilds just the VTL)
-# Nuke:   sudo /home/user/remanence/scripts/quadstor/teardown.sh  (removes everything)
+# Usage:  sudo scripts-relative: scripts/quadstor/setup.sh
+# Reset:  sudo scripts-relative: scripts/quadstor/reset.sh     (rebuilds just the VTL)
+# Nuke:   sudo scripts-relative: scripts/quadstor/teardown.sh  (removes everything)
 
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

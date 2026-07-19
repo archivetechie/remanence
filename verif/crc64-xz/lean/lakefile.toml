@@ -4,7 +4,7 @@ defaultTargets = ["Crc64Xz"]
 
 [[require]]
 name = "aeneas"
-path = "/home/user/toolchains/aeneas/backends/lean"
+path = "../../../../toolchains/aeneas/backends/lean"
 
 [[lean_lib]]
 name = "Crc64Xz"

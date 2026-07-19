@@ -6,7 +6,7 @@ defaultTargets = ["ParitySidecarLayout"]
 # crate follows the parity-state, parity-mapping, and parity-capacity setup.
 [[require]]
 name = "aeneas"
-path = "/home/user/toolchains/aeneas/backends/lean"
+path = "../../../../toolchains/aeneas/backends/lean"
 
 [[lean_lib]]
 name = "ParitySidecarLayout"

@@ -4,7 +4,7 @@ defaultTargets = ["RaoMetadata"]
 
 [[require]]
 name = "aeneas"
-path = "/home/user/toolchains/aeneas/backends/lean"
+path = "../../../../toolchains/aeneas/backends/lean"
 
 [[lean_lib]]
 name = "RaoMetadata"
