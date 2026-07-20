@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use remanence_aead::{RecipientPublicKey, SealReport};
 use remanence_format::{
     write_encrypted_rao_object_from_readers, write_rem_tar_object_from_readers, RemTarFileLayout,
-    RemTarFileStream, RemTarObjectOptions, FORMAT_ID,
+    RemTarFileSpec, RemTarFileStream, RemTarObjectOptions, FORMAT_ID,
 };
 use remanence_library::{
     BlockSink, BlockSource, PipelinedWriteDiagnostics, TapeIoError, TapePosition, VecBlockSink,
@@ -40,7 +40,7 @@ use remanence_state::{
     OBJECT_COPY_REPRESENTATION_PLAINTEXT,
 };
 use remanence_stream::{
-    plan_prepared_object, prepare_regular_file, write_prepared_object_to_parity,
+    plan_prepared_object, prepare_regular_file, write_prepared_object_to_parity_from_readers,
     FileCatalogProjection, ObjectCatalogProjection, ObjectCopyProjection, PreparedFile,
     StreamingAuditEvent, StreamingCatalogProjection, StreamingError, StreamingObjectPlan,
     StreamingObjectWriteReport,
@@ -74,13 +74,85 @@ pub enum PoolWriteRepresentation {
     },
 }
 
+/// Live plaintext source metadata and reader supplied by the append RPC.
+pub struct StreamedWriteSource {
+    reader: Arc<Mutex<Box<dyn Read + Send>>>,
+    size_bytes: u64,
+    content_sha256: [u8; 32],
+    control: Arc<crate::append_ring::AppendRingControl>,
+}
+
+impl fmt::Debug for StreamedWriteSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StreamedWriteSource")
+            .field("size_bytes", &self.size_bytes)
+            .field("content_sha256", &bytes_to_hex(&self.content_sha256))
+            .finish_non_exhaustive()
+    }
+}
+
+impl StreamedWriteSource {
+    pub(crate) fn new(
+        reader: impl Read + Send + 'static,
+        size_bytes: u64,
+        content_sha256: [u8; 32],
+        control: Arc<crate::append_ring::AppendRingControl>,
+    ) -> Self {
+        Self {
+            reader: Arc::new(Mutex::new(Box::new(reader))),
+            size_bytes,
+            content_sha256,
+            control,
+        }
+    }
+}
+
+/// Payload source for one pool write.
+#[derive(Debug)]
+pub enum WriteObjectSource {
+    /// Completed local file used by the legacy serial and in-process paths.
+    Path(PathBuf),
+    /// Live bounded-ring consumer used only by plaintext overlap appends.
+    Streamed(StreamedWriteSource),
+}
+
+impl WriteObjectSource {
+    pub(crate) fn size_bytes(&self) -> Result<u64, PoolWriteError> {
+        match self {
+            Self::Path(path) => source_file_size(path),
+            Self::Streamed(source) => Ok(source.size_bytes),
+        }
+    }
+
+    fn content_sha256(&self) -> Result<[u8; 32], PoolWriteError> {
+        match self {
+            Self::Path(path) => sha256_file(path),
+            Self::Streamed(source) => Ok(source.content_sha256),
+        }
+    }
+
+    pub(crate) fn stream_control(&self) -> Option<Arc<crate::append_ring::AppendRingControl>> {
+        match self {
+            Self::Path(_) => None,
+            Self::Streamed(source) => Some(Arc::clone(&source.control)),
+        }
+    }
+
+    pub(crate) fn remove_completed_path(&self) {
+        if let Self::Path(path) = self {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 /// Inputs for writing one regular file as one `rao-v1` object to a pool.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct WriteObjectToPoolRequest {
     /// Pool requested by the caller.
     pub pool_id: String,
-    /// Local regular file to stream into the object.
-    pub source_path: PathBuf,
+    /// Completed path or live bounded-ring consumer.
+    pub source: WriteObjectSource,
     /// UTF-8 relative path to record inside the `rao-v1` object.
     pub archive_path: PathBuf,
     /// Opaque caller/orchestrator object id.
@@ -751,7 +823,7 @@ pub fn write_object_to_pool(
     if let Some(result) = maybe_replay_pool_write(state, pool_cfg, &request)? {
         return Ok(result);
     }
-    let source_size = source_file_size(&request.source_path)?;
+    let source_size = request.source.size_bytes()?;
     let reserved_tape_uuids = HashSet::new();
     let selected = select_tape_in_pool(state, pool_cfg, source_size, &reserved_tape_uuids)?;
     write_to_selected_tape_inner(state, sink, pool_cfg, request, selected, false)
@@ -1885,7 +1957,7 @@ where
     S: BlockSink + ?Sized,
     R: Send,
 {
-    run_ring_staged_transfer(inner, block_size, producer, on_safety_error)?.result
+    run_ring_staged_transfer(inner, block_size, producer, None, on_safety_error)?.result
 }
 
 #[cfg(test)]
@@ -1900,7 +1972,7 @@ where
     S: BlockSink + ?Sized,
     R: Send,
 {
-    run_ring_staged_transfer(inner, block_size, producer, |error| {
+    run_ring_staged_transfer(inner, block_size, producer, None, |error| {
         let error = error.to_string();
         record_tape_io_fence_for_transfer_error(
             state,
@@ -1917,21 +1989,30 @@ fn run_counted_fenced_staged_transfer<S, R>(
     selected: &SelectedTape,
     inner: &mut CountingBlockSink<'_, S>,
     block_size: usize,
+    overlap_control: Option<Arc<crate::append_ring::AppendRingControl>>,
     producer: impl FnOnce(&mut dyn BlockSink) -> Result<R, PoolWriteError> + Send,
 ) -> Result<R, PoolWriteError>
 where
     S: BlockSink + ?Sized,
     R: Send,
 {
-    let outcome = run_ring_staged_transfer(inner, block_size, producer, |error| {
-        let error = error.to_string();
-        record_tape_io_fence_for_transfer_error(
-            state,
-            selected,
-            tape_io_fence_reason_for_transfer_error(&error),
-            &error,
-        )
-    })?;
+    let tape_write_control = overlap_control.as_ref().map(Arc::clone);
+    let outcome =
+        run_ring_staged_transfer(inner, block_size, producer, tape_write_control, |error| {
+            if overlap_control
+                .as_ref()
+                .is_some_and(|control| !control.tape_started())
+            {
+                return Ok(());
+            }
+            let error = error.to_string();
+            record_tape_io_fence_for_transfer_error(
+                state,
+                selected,
+                tape_io_fence_reason_for_transfer_error(&error),
+                &error,
+            )
+        })?;
     inner.stats.record_staging(&outcome.staging_diagnostics);
     outcome.result
 }
@@ -1945,6 +2026,7 @@ fn run_ring_staged_transfer<S, R>(
     inner: &mut S,
     block_size: usize,
     producer: impl FnOnce(&mut dyn BlockSink) -> Result<R, PoolWriteError> + Send,
+    tape_write_control: Option<Arc<crate::append_ring::AppendRingControl>>,
     mut on_safety_error: impl FnMut(&TapeIoError) -> Result<(), PoolWriteError>,
 ) -> Result<RingStagedTransferOutcome<R>, PoolWriteError>
 where
@@ -2020,8 +2102,14 @@ where
             }
         });
 
-        let submitter_result =
-            drain_pipelined_transfer(inner, submit_rx, free_tx, &poison, &mut on_safety_error);
+        let submitter_result = drain_pipelined_transfer(
+            inner,
+            submit_rx,
+            free_tx,
+            &poison,
+            tape_write_control.as_deref(),
+            &mut on_safety_error,
+        );
         let _ = submitter_done_tx.send(());
         let (producer_result, staging_diagnostics) = match producer_handle.join() {
             Ok(result) => result,
@@ -2110,6 +2198,7 @@ fn drain_pipelined_transfer<S: BlockSink + ?Sized>(
     rx: std_mpsc::Receiver<PipelinedSinkCommand>,
     free_tx: std_mpsc::SyncSender<PageAlignedBuffer>,
     poison: &Arc<Mutex<Option<String>>>,
+    tape_write_control: Option<&crate::append_ring::AppendRingControl>,
     on_safety_error: &mut impl FnMut(&TapeIoError) -> Result<(), PoolWriteError>,
 ) -> Result<(), PoolWriteError> {
     let mut completed_since_barrier: Option<WriteBatchOutcome> = None;
@@ -2119,21 +2208,27 @@ fn drain_pipelined_transfer<S: BlockSink + ?Sized>(
             continue;
         }
         let result = match command {
-            PipelinedSinkCommand::WriteWindow(window) => {
-                execute_pipelined_window(inner, window, &free_tx, on_safety_error).map(
-                    |window_outcome| {
-                        completed_since_barrier = Some(match completed_since_barrier {
-                            Some(accumulated) => merge_batch_outcomes(accumulated, window_outcome),
-                            None => window_outcome,
-                        });
-                    },
-                )
-            }
+            PipelinedSinkCommand::WriteWindow(window) => execute_pipelined_window(
+                inner,
+                window,
+                &free_tx,
+                tape_write_control,
+                on_safety_error,
+            )
+            .map(|window_outcome| {
+                completed_since_barrier = Some(match completed_since_barrier {
+                    Some(accumulated) => merge_batch_outcomes(accumulated, window_outcome),
+                    None => window_outcome,
+                });
+            }),
             PipelinedSinkCommand::Barrier { reply } => {
                 let _ = reply.send(Ok(completed_since_barrier.take()));
                 Ok(())
             }
             PipelinedSinkCommand::WriteFilemarks { count, reply } => {
+                if let Some(control) = tape_write_control {
+                    control.mark_tape_started();
+                }
                 match inner.write_filemarks_pipelined(count) {
                     Ok(outcome) => {
                         let _ = reply.send(Ok(outcome));
@@ -2214,6 +2309,7 @@ fn execute_pipelined_window<S: BlockSink + ?Sized>(
     inner: &mut S,
     mut window: PipelinedWindow,
     free_tx: &std_mpsc::SyncSender<PageAlignedBuffer>,
+    tape_write_control: Option<&crate::append_ring::AppendRingControl>,
     on_safety_error: &mut impl FnMut(&TapeIoError) -> Result<(), PoolWriteError>,
 ) -> Result<WriteBatchOutcome, PoolWriteError> {
     let command_count = window.len as u32;
@@ -2228,6 +2324,9 @@ fn execute_pipelined_window<S: BlockSink + ?Sized>(
             .take()
             .expect("window slot below len is occupied");
         let requested = batch.records;
+        if let Some(control) = tape_write_control {
+            control.mark_tape_started();
+        }
         let result = inner.write_block_batch_pipelined(
             batch.buffer.bytes(),
             batch.block_size_bytes,
@@ -2797,6 +2896,154 @@ impl<'a, S: BlockSink + ?Sized> BlockSink for CountingBlockSink<'a, S> {
     }
 }
 
+/// Write-side hysteresis gate layered immediately above the existing bounded
+/// hardware staging funnel. A pause flushes the current safe batch, waits for
+/// the receive ring to refill, and re-proves the exact next physical LBA.
+struct OverlapBlockSink<'a> {
+    inner: &'a mut dyn BlockSink,
+    control: Arc<crate::append_ring::AppendRingControl>,
+    expected_initial_lba: u64,
+    expected_next_lba: u64,
+    initial_position_proved: bool,
+    write_started: bool,
+    low_water_events: u64,
+}
+
+impl OverlapBlockSink<'_> {
+    fn ensure_prefill(&self) -> Result<(), TapeIoError> {
+        if self.control.prefill_satisfied() {
+            Ok(())
+        } else {
+            Err(TapeIoError::OperationFailed(
+                "overlap first-block gate reached before high-water prefill and live-source validation"
+                    .to_string(),
+            ))
+        }
+    }
+
+    fn prove_position(
+        &self,
+        observed: TapePosition,
+        expected_lba: u64,
+        context: &str,
+    ) -> Result<(), TapeIoError> {
+        if observed.partition != 0 || observed.lba != expected_lba {
+            return Err(TapeIoError::OperationFailed(format!(
+                "overlap write position drift during {context}: expected partition 0 lba {expected_lba}, observed partition {} lba {}",
+                observed.partition, observed.lba
+            )));
+        }
+        Ok(())
+    }
+
+    fn prove_initial_position(&mut self) -> Result<(), TapeIoError> {
+        if !self.initial_position_proved {
+            self.ensure_prefill()?;
+            let observed = self.inner.position()?;
+            self.prove_position(observed, self.expected_initial_lba, "first-block gate")?;
+            self.initial_position_proved = true;
+        }
+        Ok(())
+    }
+
+    fn pause_if_low(&mut self) -> Result<(), TapeIoError> {
+        if !self.write_started || !self.control.should_pause() {
+            return Ok(());
+        }
+        let expected = self.expected_next_lba;
+        let before_pause = self.inner.position()?;
+        self.prove_position(before_pause, expected, "low-water pause boundary")?;
+        self.low_water_events = self.low_water_events.saturating_add(1);
+        let pause_started = Instant::now();
+        tracing::info!(
+            target: "remanence_write_diag",
+            phase = "overlap_pause",
+            low_water_events = self.low_water_events,
+            ring_occupancy_bytes = self.control.occupancy_bytes(),
+            ring_low_bytes = self.control.low_bytes(),
+            expected_next_lba = expected,
+            "remanence_write_diag",
+        );
+        self.control
+            .wait_for_resume()
+            .map_err(|err| TapeIoError::OperationFailed(format!("overlap refill failed: {err}")))?;
+        let observed = self.inner.position()?;
+        let proof = self.prove_position(observed, expected, "low-water resume");
+        tracing::info!(
+            target: "remanence_write_diag",
+            phase = "overlap_resume_proof",
+            low_water_events = self.low_water_events,
+            ring_occupancy_bytes = self.control.occupancy_bytes(),
+            ring_high_bytes = self.control.high_bytes(),
+            pause_duration_ms = crate::diagnostics::duration_ms(pause_started.elapsed()),
+            expected_next_lba = expected,
+            observed_next_lba = observed.lba,
+            resume_proof_ok = proof.is_ok(),
+            "remanence_write_diag",
+        );
+        proof
+    }
+}
+
+impl BlockSink for OverlapBlockSink<'_> {
+    fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
+        self.prove_initial_position()?;
+        if let Some(message) = self.control.failure_message() {
+            return Err(TapeIoError::OperationFailed(format!(
+                "overlap source failed before WRITE submission: {message}"
+            )));
+        }
+        self.pause_if_low()?;
+        self.write_started = true;
+        let outcome = self.inner.write_block(buf)?;
+        let expected = self.expected_next_lba.checked_add(1).ok_or_else(|| {
+            TapeIoError::OperationFailed("overlap expected next LBA overflow".to_string())
+        })?;
+        self.prove_position(outcome.position_after, expected, "WRITE completion")?;
+        self.expected_next_lba = expected;
+        Ok(outcome)
+    }
+
+    fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
+        self.inner.write_filemarks(count)
+    }
+
+    fn space_to_end_of_data(&mut self) -> Result<TapePosition, TapeIoError> {
+        self.ensure_prefill()?;
+        let observed = self.inner.space_to_end_of_data()?;
+        self.prove_position(observed, self.expected_initial_lba, "append-position gate")?;
+        self.initial_position_proved = true;
+        Ok(observed)
+    }
+
+    fn position(&mut self) -> Result<TapePosition, TapeIoError> {
+        self.inner.position()
+    }
+}
+
+fn with_overlap_sink<R>(
+    inner: &mut dyn BlockSink,
+    control: Option<Arc<crate::append_ring::AppendRingControl>>,
+    expected_initial_lba: u64,
+    operation: impl FnOnce(&mut dyn BlockSink) -> Result<R, PoolWriteError>,
+) -> Result<R, PoolWriteError> {
+    match control {
+        Some(control) => {
+            let mut gated = OverlapBlockSink {
+                inner,
+                control,
+                expected_initial_lba,
+                expected_next_lba: expected_initial_lba,
+                initial_position_proved: false,
+                write_started: false,
+                low_water_events: 0,
+            };
+            operation(&mut gated)
+        }
+        None => operation(inner),
+    }
+}
+
 fn write_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
     state: &mut CatalogIndex,
     sink: &mut CountingBlockSink<'_, S>,
@@ -2809,36 +3056,56 @@ fn write_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
     let PreparedPoolWrite { prepared, stored } = prepared_write;
     let tape_uuid = selected.tape_uuid;
     let block_size = selected.block_size;
+    let overlap_control = prepared.overlap_control();
     let transfer_started = Instant::now();
     let write_report: Result<StreamingObjectWriteReport, PoolWriteError> =
-        run_counted_fenced_staged_transfer(state, &selected, sink, block_size as usize, |staged| {
-            let mut raw = BlockSinkRawTapeSink::new(staged);
-            let mut parity =
-                ParitySink::new_sidecar_only(&mut raw, scheme.clone(), tape_uuid, block_size)?;
-            parity.write_bootstrap()?;
-            let report = match &stored {
-                PreparedStoredObject::Plaintext => Ok(write_prepared_object_to_parity(
-                    &mut parity,
-                    tape_uuid,
-                    &prepared.options,
-                    &prepared.files,
-                    capacity_input(
-                        &scheme,
+        run_counted_fenced_staged_transfer(
+            state,
+            &selected,
+            sink,
+            block_size as usize,
+            overlap_control.as_ref().map(Arc::clone),
+            |staged| {
+                with_overlap_sink(staged, overlap_control, 0, |gated| {
+                    let mut raw = BlockSinkRawTapeSink::new(gated);
+                    let mut parity = ParitySink::new_sidecar_only(
+                        &mut raw,
+                        scheme.clone(),
+                        tape_uuid,
                         block_size,
-                        prepared.plan.layout.projected_size_blocks,
-                    ),
-                )?),
-                PreparedStoredObject::Encrypted(encrypted) => write_encrypted_object_to_parity(
-                    &mut parity,
-                    tape_uuid,
-                    &prepared,
-                    encrypted,
-                    &scheme,
-                    block_size,
-                ),
-            }?;
-            Ok(report)
-        });
+                    )?;
+                    parity.write_bootstrap()?;
+                    let report = match &stored {
+                        PreparedStoredObject::Plaintext => {
+                            let mut readers = open_prepared_readers(&prepared)?;
+                            Ok(write_prepared_object_to_parity_from_readers(
+                                &mut parity,
+                                tape_uuid,
+                                &prepared.options,
+                                &prepared.files,
+                                &mut readers,
+                                capacity_input(
+                                    &scheme,
+                                    block_size,
+                                    prepared.plan.layout.projected_size_blocks,
+                                ),
+                            )?)
+                        }
+                        PreparedStoredObject::Encrypted(encrypted) => {
+                            write_encrypted_object_to_parity(
+                                &mut parity,
+                                tape_uuid,
+                                &prepared,
+                                encrypted,
+                                &scheme,
+                                block_size,
+                            )
+                        }
+                    }?;
+                    Ok(report)
+                })
+            },
+        );
     let transfer_elapsed = transfer_started.elapsed();
     let write_report = match write_report {
         Ok(write_report) => {
@@ -2933,6 +3200,19 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
     let PreparedPoolWrite { prepared, stored } = prepared_write;
     let tape_uuid = selected.tape_uuid;
     let append = no_parity_append_context(state, &selected)?;
+    let expected_initial_lba = if append.fresh_tape {
+        0
+    } else {
+        append
+            .previous_total_committed_ordinals
+            .checked_add(u64::from(append.tape_file_number))
+            .ok_or_else(|| {
+                PoolWriteError::MissingTapeGeometry(
+                    "expected no-parity append LBA overflows u64".to_string(),
+                )
+            })?
+    };
+    let overlap_control = prepared.overlap_control();
     let transfer_started = Instant::now();
     let write_report: Result<StreamingObjectWriteReport, PoolWriteError> =
         run_counted_fenced_staged_transfer(
@@ -2940,55 +3220,65 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
             &selected,
             sink,
             selected.block_size as usize,
+            overlap_control.as_ref().map(Arc::clone),
             |staged| {
-                if append.fresh_tape {
-                    write_no_parity_bootstrap(
-                        staged,
-                        tape_uuid,
-                        selected.block_size,
-                        &prepared.write_timestamp,
-                    )?;
-                } else {
-                    position_no_parity_append(staged)?;
-                }
-                let report = match &stored {
-                    PreparedStoredObject::Plaintext => {
-                        let mut readers = open_prepared_readers(&prepared.files)?;
-                        let mut streams = Vec::with_capacity(prepared.files.len());
-                        for (file, reader) in prepared.files.iter().zip(readers.iter_mut()) {
-                            streams.push(RemTarFileStream::new(file.spec.clone(), reader));
+                with_overlap_sink(staged, overlap_control, expected_initial_lba, |gated| {
+                    if append.fresh_tape {
+                        write_no_parity_bootstrap(
+                            gated,
+                            tape_uuid,
+                            selected.block_size,
+                            &prepared.write_timestamp,
+                        )?;
+                    } else {
+                        position_no_parity_append(gated)?;
+                    }
+                    let report = match &stored {
+                        PreparedStoredObject::Plaintext => {
+                            let mut readers = open_prepared_readers(&prepared)?;
+                            let mut streams = Vec::with_capacity(prepared.files.len());
+                            for (file, reader) in prepared.files.iter().zip(readers.iter_mut()) {
+                                streams.push(RemTarFileStream::new(
+                                    file.spec.clone(),
+                                    reader.as_mut(),
+                                ));
+                            }
+                            let mut object_sink = ObjectDigestBlockSink::new(gated);
+                            let layout = write_rem_tar_object_from_readers(
+                                &mut object_sink,
+                                &prepared.options,
+                                &mut streams,
+                            )
+                            .map_err(StreamingError::from)?;
+                            let object_digest = object_sink.finish_digest();
+                            let filemark_outcome = gated.write_filemarks(1)?;
+                            no_parity_write_report(
+                                tape_uuid,
+                                &prepared,
+                                layout,
+                                object_digest,
+                                filemark_outcome,
+                                append,
+                            )
                         }
-                        let mut object_sink = ObjectDigestBlockSink::new(staged);
-                        let layout = write_rem_tar_object_from_readers(
-                            &mut object_sink,
-                            &prepared.options,
-                            &mut streams,
-                        )
-                        .map_err(StreamingError::from)?;
-                        let object_digest = object_sink.finish_digest();
-                        let filemark_outcome = staged.write_filemarks(1)?;
-                        no_parity_write_report(
-                            tape_uuid,
-                            &prepared,
-                            layout,
-                            object_digest,
-                            filemark_outcome,
-                            append,
-                        )
-                    }
-                    PreparedStoredObject::Encrypted(encrypted) => {
-                        write_fixed_blocks(staged, prepared.options.chunk_size, &encrypted.sealed)?;
-                        let filemark_outcome = staged.write_filemarks(1)?;
-                        no_parity_encrypted_write_report(
-                            tape_uuid,
-                            &prepared,
-                            encrypted,
-                            filemark_outcome,
-                            append,
-                        )
-                    }
-                }?;
-                Ok(report)
+                        PreparedStoredObject::Encrypted(encrypted) => {
+                            write_fixed_blocks(
+                                gated,
+                                prepared.options.chunk_size,
+                                &encrypted.sealed,
+                            )?;
+                            let filemark_outcome = gated.write_filemarks(1)?;
+                            no_parity_encrypted_write_report(
+                                tape_uuid,
+                                &prepared,
+                                encrypted,
+                                filemark_outcome,
+                                append,
+                            )
+                        }
+                    }?;
+                    Ok(report)
+                })
             },
         );
     let transfer_elapsed = transfer_started.elapsed();
@@ -3261,8 +3551,8 @@ pub(crate) fn maybe_replay_pool_write(
     else {
         return Ok(None);
     };
-    source_file_size(&request.source_path)?;
-    let requested_hash = sha256_file(&request.source_path)?;
+    let _ = request.source.size_bytes()?;
+    let requested_hash = request.source.content_sha256()?;
     if let Some(expected) = request.expected_content_sha256 {
         if requested_hash != expected {
             return Err(PoolWriteError::ContentHashMismatch {
@@ -3366,6 +3656,24 @@ struct PreparedPoolObject {
     options: RemTarObjectOptions,
     files: Vec<PreparedFile>,
     plan: StreamingObjectPlan,
+    source: PreparedPoolSource,
+}
+
+impl PreparedPoolObject {
+    fn overlap_control(&self) -> Option<Arc<crate::append_ring::AppendRingControl>> {
+        match &self.source {
+            PreparedPoolSource::Paths => None,
+            PreparedPoolSource::Streamed { control, .. } => Some(Arc::clone(control)),
+        }
+    }
+}
+
+enum PreparedPoolSource {
+    Paths,
+    Streamed {
+        reader: Arc<Mutex<Box<dyn Read + Send>>>,
+        control: Arc<crate::append_ring::AppendRingControl>,
+    },
 }
 
 struct PreparedPoolWrite {
@@ -3585,8 +3893,7 @@ fn prepare_pool_object(
     request: &WriteObjectToPoolRequest,
     block_size: u32,
 ) -> Result<PreparedPoolObject, PoolWriteError> {
-    let _ = source_file_size(&request.source_path)?;
-    let content_sha256 = sha256_file(&request.source_path)?;
+    let content_sha256 = request.source.content_sha256()?;
     let object_uuid = Uuid::new_v4();
     let object_id = object_uuid.to_string();
     let write_timestamp = now_rfc3339()?;
@@ -3597,11 +3904,44 @@ fn prepare_pool_object(
         Uuid::new_v4().to_string(),
     );
     options.chunk_size = block_size as usize;
-    let files = vec![prepare_regular_file(
-        &request.source_path,
-        &request.archive_path,
-        Uuid::new_v4().to_string(),
-    )?];
+    let (files, source) = match &request.source {
+        WriteObjectSource::Path(source_path) => (
+            vec![prepare_regular_file(
+                source_path,
+                &request.archive_path,
+                Uuid::new_v4().to_string(),
+            )?],
+            PreparedPoolSource::Paths,
+        ),
+        WriteObjectSource::Streamed(streamed) => {
+            if !matches!(request.representation, PoolWriteRepresentation::Plaintext) {
+                return Err(PoolWriteError::InvalidInput(
+                    "streamed pool sources support plaintext representation only".to_string(),
+                ));
+            }
+            let archive_path = request.archive_path.to_str().ok_or_else(|| {
+                PoolWriteError::InvalidInput("streamed archive path must be UTF-8".to_string())
+            })?;
+            let mut spec = RemTarFileSpec::new(
+                archive_path,
+                Uuid::new_v4().to_string(),
+                streamed.size_bytes,
+                streamed.content_sha256,
+            );
+            spec.mtime = None;
+            spec.executable = Some(false);
+            (
+                vec![PreparedFile {
+                    source_path: PathBuf::new(),
+                    spec,
+                }],
+                PreparedPoolSource::Streamed {
+                    reader: Arc::clone(&streamed.reader),
+                    control: Arc::clone(&streamed.control),
+                },
+            )
+        }
+    };
     let plan = plan_prepared_object(&options, &files)?;
     Ok(PreparedPoolObject {
         content_sha256,
@@ -3610,6 +3950,7 @@ fn prepare_pool_object(
         options,
         files,
         plan,
+        source,
     })
 }
 
@@ -3630,7 +3971,7 @@ fn seal_prepared_object(
     recipients: &[RecipientPublicKey],
 ) -> Result<PreparedEncryptedPoolObject, PoolWriteError> {
     let mut encrypted_sink = VecBlockSink::new();
-    let mut readers = open_prepared_readers(&prepared.files)?;
+    let mut readers = open_prepared_readers(prepared)?;
     let mut streams = Vec::with_capacity(prepared.files.len());
     for (file, reader) in prepared.files.iter().zip(readers.iter_mut()) {
         streams.push(RemTarFileStream::new(file.spec.clone(), reader));
@@ -3732,17 +4073,38 @@ fn write_no_parity_bootstrap(
     write_tape_bootstrap(sink, &payload)
 }
 
-fn open_prepared_readers(files: &[PreparedFile]) -> Result<Vec<File>, PoolWriteError> {
-    files
-        .iter()
-        .map(|file| {
-            File::open(&file.source_path).map_err(|source| PoolWriteError::Io {
-                context: "open source file for streaming",
-                path: file.source_path.clone(),
-                source,
+struct SharedStreamReader(Arc<Mutex<Box<dyn Read + Send>>>);
+
+impl Read for SharedStreamReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .read(output)
+    }
+}
+
+fn open_prepared_readers(
+    prepared: &PreparedPoolObject,
+) -> Result<Vec<Box<dyn Read + Send>>, PoolWriteError> {
+    match &prepared.source {
+        PreparedPoolSource::Paths => prepared
+            .files
+            .iter()
+            .map(|file| {
+                File::open(&file.source_path)
+                    .map(|reader| Box::new(reader) as Box<dyn Read + Send>)
+                    .map_err(|source| PoolWriteError::Io {
+                        context: "open source file for streaming",
+                        path: file.source_path.clone(),
+                        source,
+                    })
             })
-        })
-        .collect()
+            .collect(),
+        PreparedPoolSource::Streamed { reader, .. } => {
+            Ok(vec![Box::new(SharedStreamReader(Arc::clone(reader)))])
+        }
+    }
 }
 
 fn no_parity_write_report(
@@ -4586,6 +4948,8 @@ fn uuid_text(value: [u8; 16]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
 
     #[derive(Debug)]
@@ -4609,6 +4973,7 @@ mod tests {
         diagnostic_resets: u64,
         diagnostic_publications: u64,
         ordered_events: Arc<Mutex<Vec<String>>>,
+        position_overrides: VecDeque<TapePosition>,
     }
 
     impl StagedTestSink {
@@ -4634,6 +4999,7 @@ mod tests {
                 diagnostic_resets: 0,
                 diagnostic_publications: 0,
                 ordered_events: Arc::new(Mutex::new(Vec::new())),
+                position_overrides: VecDeque::new(),
             }
         }
 
@@ -4823,7 +5189,10 @@ mod tests {
                     "injected READ POSITION failure".into(),
                 ));
             }
-            self.inner.position()
+            match self.position_overrides.pop_front() {
+                Some(position) => Ok(position),
+                None => self.inner.position(),
+            }
         }
     }
 
@@ -4835,6 +5204,261 @@ mod tests {
             end_of_partition: false,
             block_position_end_of_warning,
         }
+    }
+
+    #[tokio::test]
+    async fn overlap_first_block_gate_requires_high_prefill_then_position_proof() {
+        let capacity = 2 * crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
+        let manager = crate::io_memory::IoMemoryReservation::new(capacity).expect("manager");
+        let (mut producer, _consumer, control) =
+            crate::append_ring::create_append_ring(&manager, capacity, 50, 25, capacity)
+                .expect("ring");
+        producer
+            .push(&vec![0x11; crate::append_ring::APPEND_RING_SLAB_BYTES / 2])
+            .await
+            .expect("sub-high prefill");
+        let mut sink = StagedTestSink::new(2);
+        {
+            let mut gated = OverlapBlockSink {
+                inner: &mut sink,
+                control: Arc::clone(&control),
+                expected_initial_lba: 0,
+                expected_next_lba: 0,
+                initial_position_proved: false,
+                write_started: false,
+                low_water_events: 0,
+            };
+            let error = gated
+                .write_block(&[0u8; 4])
+                .expect_err("sub-high ring must not reach tape");
+            assert!(error.to_string().contains("first-block gate"), "{error}");
+            let error = gated
+                .space_to_end_of_data()
+                .expect_err("sub-high ring must not position an append");
+            assert!(error.to_string().contains("first-block gate"), "{error}");
+        }
+        assert!(
+            sink.events.is_empty(),
+            "no tape command may precede the high-water gate: {:?}",
+            sink.events
+        );
+
+        producer
+            .push(&vec![0x22; crate::append_ring::APPEND_RING_SLAB_BYTES / 2])
+            .await
+            .expect("reach high prefill");
+        {
+            let mut gated = OverlapBlockSink {
+                inner: &mut sink,
+                control,
+                expected_initial_lba: 0,
+                expected_next_lba: 0,
+                initial_position_proved: false,
+                write_started: false,
+                low_water_events: 0,
+            };
+            gated.write_block(&[0u8; 4]).expect("gated first block");
+        }
+        assert_eq!(sink.events, ["position", "write_block:4"]);
+    }
+
+    #[test]
+    fn overlap_low_water_pause_refills_then_reproves_next_lba() {
+        let capacity = 4 * crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
+        let manager = crate::io_memory::IoMemoryReservation::new(capacity).expect("manager");
+        let (mut producer, mut consumer, control) =
+            crate::append_ring::create_append_ring(&manager, capacity, 50, 25, 8 * capacity)
+                .expect("ring");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime
+            .block_on(producer.push(&vec![
+                0x31;
+                2 * crate::append_ring::APPEND_RING_SLAB_BYTES + 1
+            ]))
+            .expect("initial high-water fill");
+
+        let mut sink = StagedTestSink::new(2);
+        let mut gated = OverlapBlockSink {
+            inner: &mut sink,
+            control: Arc::clone(&control),
+            expected_initial_lba: 0,
+            expected_next_lba: 0,
+            initial_position_proved: false,
+            write_started: false,
+            low_water_events: 0,
+        };
+        gated.write_block(&[0x41; 4]).expect("first block");
+
+        let mut drained = vec![0u8; crate::append_ring::APPEND_RING_SLAB_BYTES + 1];
+        consumer
+            .read_exact(&mut drained)
+            .expect("drain to low watermark");
+        assert!(control.should_pause(), "ring must be at the low watermark");
+
+        let refill = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("refill runtime");
+            runtime.block_on(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                producer
+                    .push(&vec![0x52; 2 * crate::append_ring::APPEND_RING_SLAB_BYTES])
+                    .await
+                    .expect("refill to high watermark");
+                producer
+            })
+        });
+        gated
+            .write_block(&[0x42; 4])
+            .expect("resume after fresh proof");
+        let producer = refill.join().expect("refill thread");
+        drop(producer);
+        drop(gated);
+
+        assert_eq!(
+            sink.events,
+            [
+                "position",
+                "write_block:4",
+                "position",
+                "position",
+                "write_block:4",
+            ],
+            "resume must flush/prove, wait, then issue a fresh proof before WRITE"
+        );
+    }
+
+    #[test]
+    fn overlap_resume_refuses_position_drift_before_the_next_write() {
+        let capacity = 4 * crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
+        let manager = crate::io_memory::IoMemoryReservation::new(capacity).expect("manager");
+        let (mut producer, mut consumer, control) =
+            crate::append_ring::create_append_ring(&manager, capacity, 50, 25, 8 * capacity)
+                .expect("ring");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime
+            .block_on(producer.push(&vec![
+                0x61;
+                2 * crate::append_ring::APPEND_RING_SLAB_BYTES + 1
+            ]))
+            .expect("initial high-water fill");
+
+        let position = |lba| TapePosition {
+            lba,
+            partition: 0,
+            beginning_of_partition: lba == 0,
+            end_of_partition: false,
+            block_position_end_of_warning: false,
+        };
+        let mut sink = StagedTestSink::new(2);
+        sink.position_overrides = [position(0), position(1), position(9)].into();
+        let mut gated = OverlapBlockSink {
+            inner: &mut sink,
+            control: Arc::clone(&control),
+            expected_initial_lba: 0,
+            expected_next_lba: 0,
+            initial_position_proved: false,
+            write_started: false,
+            low_water_events: 0,
+        };
+        gated.write_block(&[0x71; 4]).expect("first block");
+        let mut drained = vec![0u8; crate::append_ring::APPEND_RING_SLAB_BYTES + 1];
+        consumer.read_exact(&mut drained).expect("drain to low");
+
+        let refill = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("refill runtime");
+            runtime.block_on(async move {
+                producer
+                    .push(&vec![0x72; 2 * crate::append_ring::APPEND_RING_SLAB_BYTES])
+                    .await
+                    .expect("refill to high");
+            });
+        });
+        let error = gated
+            .write_block(&[0x73; 4])
+            .expect_err("drifted resume must fail closed");
+        refill.join().expect("refill thread");
+        drop(gated);
+        assert!(error.to_string().contains("position drift"), "{error}");
+        assert_eq!(
+            sink.events,
+            ["position", "write_block:4", "position", "position"],
+            "no WRITE may follow a failed resume proof"
+        );
+    }
+
+    #[test]
+    fn overlap_admission_plans_object_larger_than_legacy_64_gib_cap() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-large-overlap-admission-")
+            .tempdir()
+            .expect("tempdir");
+        let mut state =
+            CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open catalog");
+        let tape_uuid = [0x6b; 16];
+        let block_size = 256 * 1024;
+        state
+            .provision_tape(remanence_state::ProvisionTapeInput {
+                tape_uuid,
+                voltag: "LARGE1L9".into(),
+                block_size,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision mocked LTO-9");
+        let selected = SelectedTape {
+            pool_id: "large.overlap".into(),
+            tape_uuid,
+            block_size,
+            parity_config: ParityConfig::None,
+        };
+        let ring_bytes = crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
+        let manager = crate::io_memory::IoMemoryReservation::new(ring_bytes).expect("manager");
+        let (_producer, consumer, control) = crate::append_ring::create_append_ring(
+            &manager,
+            ring_bytes,
+            90,
+            25,
+            crate::APPEND_SPOOL_MAX_BYTES + 1,
+        )
+        .expect("ring");
+        let digest = [0x42; 32];
+        let request = WriteObjectToPoolRequest {
+            pool_id: selected.pool_id.clone(),
+            source: WriteObjectSource::Streamed(StreamedWriteSource::new(
+                consumer,
+                crate::APPEND_SPOOL_MAX_BYTES + 1,
+                digest,
+                control,
+            )),
+            archive_path: "large.bin".into(),
+            caller_object_id: "overlap-larger-than-spool-cap".into(),
+            expected_content_sha256: Some(digest),
+            representation: PoolWriteRepresentation::Plaintext,
+        };
+
+        let prepared = prepare_pool_object(&request, selected.block_size)
+            .expect("large streamed source must be plannable without payload");
+        assert_eq!(
+            prepared_payload_bytes(&prepared),
+            crate::APPEND_SPOOL_MAX_BYTES + 1
+        );
+        let stored = prepare_stored_object(&prepared, &request.representation)
+            .expect("plaintext stored plan");
+        let footprint = stored_footprint_bytes(&stored, &prepared, selected.block_size)
+            .expect("large footprint");
+        ensure_selected_tape_has_capacity(&state, &selected, footprint)
+            .expect("mocked LTO-9 admits object beyond the legacy spool cap");
     }
 
     #[test]
@@ -4988,6 +5612,176 @@ mod tests {
     }
 
     #[test]
+    fn overlap_recovery_cut_matrix_never_projects_partial_object() {
+        for cut in [
+            "before-first-block",
+            "payload",
+            "finish-validation",
+            "filemark",
+        ] {
+            let (temp, mut state, selected) = fence_test_fixture();
+            let mut sink = StagedTestSink::new(2);
+            if cut == "filemark" {
+                sink.fail_filemark = true;
+            }
+            let ring_bytes = crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
+            let manager =
+                crate::io_memory::IoMemoryReservation::new(ring_bytes).expect("memory manager");
+            let (_producer, _consumer, control) =
+                crate::append_ring::create_append_ring(&manager, ring_bytes, 90, 25, ring_bytes)
+                    .expect("ring");
+            let cut_control = Arc::clone(&control);
+            let mut counted = CountingBlockSink::new(&mut sink, selected.block_size);
+            let result = run_counted_fenced_staged_transfer(
+                &mut state,
+                &selected,
+                &mut counted,
+                4,
+                Some(control),
+                |staged| match cut {
+                    "before-first-block" => Err(PoolWriteError::InvalidInput(
+                        "injected disconnect before first block".into(),
+                    )),
+                    "payload" => {
+                        cut_control.mark_tape_started();
+                        staged.write_block(&[0x11; 4])?;
+                        Err(PoolWriteError::InvalidInput(
+                            "injected disconnect during payload".into(),
+                        ))
+                    }
+                    "finish-validation" => {
+                        cut_control.mark_tape_started();
+                        staged.write_block(&[0x22; 4])?;
+                        Err(PoolWriteError::InvalidInput(
+                            "injected Finish digest disagreement".into(),
+                        ))
+                    }
+                    "filemark" => {
+                        cut_control.mark_tape_started();
+                        staged.write_block(&[0x33; 4])?;
+                        staged.write_filemarks(1)?;
+                        Ok(())
+                    }
+                    other => panic!("unhandled cut {other}"),
+                },
+            );
+            assert!(result.is_err(), "cut {cut} must fail closed");
+            assert!(
+                state
+                    .list_native_objects()
+                    .expect("list native objects")
+                    .is_empty(),
+                "cut {cut} must not project an object"
+            );
+            let fences = state
+                .list_active_tape_io_fences()
+                .expect("list tape-I/O fences");
+            if cut == "before-first-block" {
+                assert!(
+                    fences.is_empty(),
+                    "pre-write failure has no uncertain tape tail"
+                );
+            } else {
+                assert_eq!(fences.len(), 1, "cut {cut} must fence the tape");
+            }
+
+            let retry_pool = "fence.retry";
+            let retry_tape = [0x6d; 16];
+            state
+                .upsert_tape_pool_projection(remanence_state::TapePoolProjectionInput {
+                    pool_id: retry_pool.into(),
+                    display_name: None,
+                    copy_class: None,
+                    content_class: None,
+                    created_at_utc: None,
+                })
+                .expect("project retry pool");
+            state
+                .provision_tape(remanence_state::ProvisionTapeInput {
+                    tape_uuid: retry_tape,
+                    voltag: "RETRY1L9".into(),
+                    block_size: 4096,
+                    parity: ParityConfig::None,
+                    force: false,
+                })
+                .expect("provision clean retry tape");
+            state
+                .project_tape_pool_membership(retry_tape, retry_pool)
+                .expect("assign clean retry tape");
+            let retry_cfg = TapePoolConfig {
+                id: retry_pool.into(),
+                display_name: None,
+                copy_class: None,
+                content_class: None,
+                selection_policy: Default::default(),
+                watermark_low: 0.0001,
+                watermark_high: 1.0,
+                block_size_bytes: 4096,
+                min_object_size_bytes: 0,
+            };
+            let retry_payload = format!("replay from zero after {cut}").into_bytes();
+            let retry_digest: [u8; 32] = Sha256::digest(&retry_payload).into();
+            let retry_path = temp.path().join("retry.bin");
+            fs::write(&retry_path, &retry_payload).expect("write retained caller source");
+            let retry_request = || WriteObjectToPoolRequest {
+                pool_id: retry_pool.into(),
+                source: WriteObjectSource::Path(retry_path.clone()),
+                archive_path: "retry.bin".into(),
+                caller_object_id: format!("retry-after-{cut}"),
+                expected_content_sha256: Some(retry_digest),
+                representation: PoolWriteRepresentation::Plaintext,
+            };
+            let mut retry_sink = VecBlockSink::new();
+            let landed =
+                write_object_to_pool(&mut state, &mut retry_sink, &retry_cfg, retry_request())
+                    .expect("re-send from byte zero lands on a clean tape");
+            assert!(!landed.is_replay());
+            let blocks_after_landing = retry_sink.blocks.len();
+            let replayed =
+                write_object_to_pool(&mut state, &mut retry_sink, &retry_cfg, retry_request())
+                    .expect("same caller id and digest replays idempotently");
+            assert!(replayed.is_replay());
+            assert_eq!(retry_sink.blocks.len(), blocks_after_landing);
+        }
+    }
+
+    #[test]
+    fn overlap_staged_only_failure_does_not_raise_a_false_tape_fence() {
+        let (_temp, mut state, selected) = fence_test_fixture();
+        let mut sink = StagedTestSink::new(2);
+        let ring_bytes = crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
+        let manager = crate::io_memory::IoMemoryReservation::new(ring_bytes).expect("manager");
+        let (_producer, _consumer, control) =
+            crate::append_ring::create_append_ring(&manager, ring_bytes, 90, 25, ring_bytes)
+                .expect("ring");
+        let mut counted = CountingBlockSink::new(&mut sink, selected.block_size);
+        let error = run_counted_fenced_staged_transfer(
+            &mut state,
+            &selected,
+            &mut counted,
+            4,
+            Some(Arc::clone(&control)),
+            |staged| {
+                staged.write_block(&[0x91; 4])?;
+                Err::<(), PoolWriteError>(PoolWriteError::InvalidInput(
+                    "source failed while first block was still process-local".into(),
+                ))
+            },
+        )
+        .expect_err("source failure aborts staged transfer");
+        assert!(error.to_string().contains("process-local"), "{error}");
+        assert!(!control.tape_started());
+        assert!(sink.inner.blocks.is_empty());
+        assert!(
+            state
+                .list_active_tape_io_fences()
+                .expect("list fences")
+                .is_empty(),
+            "no physical WRITE attempt means there is no uncertain tape tail"
+        );
+    }
+
+    #[test]
     fn producer_error_after_committed_window_records_tape_io_fence() {
         let (_temp, mut state, selected) = fence_test_fixture();
         let mut sink = StagedTestSink::with_ring(2, 2);
@@ -5056,7 +5850,7 @@ mod tests {
             .expect("one in-flight batch");
         let (free_tx, free_rx) = std_mpsc::sync_channel(2);
         drop(free_rx); // producer-side staged sink disappeared mid-window
-        let error = execute_pipelined_window(&mut sink, window, &free_tx, &mut |_error| {
+        let error = execute_pipelined_window(&mut sink, window, &free_tx, None, &mut |_error| {
             ordered.lock().expect("ordered events").push("fence".into());
             Ok(())
         })
@@ -5428,7 +6222,7 @@ mod tests {
         std::fs::write(&payload_path, b"abcdef").expect("write payload");
         let request = WriteObjectToPoolRequest {
             pool_id: pool_id.to_string(),
-            source_path: payload_path.clone(),
+            source: WriteObjectSource::Path(payload_path.clone()),
             archive_path: PathBuf::from("payload.bin"),
             caller_object_id: "caller-object".to_string(),
             expected_content_sha256: None,

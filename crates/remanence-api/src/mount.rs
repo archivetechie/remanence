@@ -426,10 +426,44 @@ pub(crate) async fn append_finish(
     drive
         .send(crate::write_owner::DriveCommand::AppendFinish {
             session_id,
-            spool_path,
+            source: crate::WriteObjectSource::Path(spool_path),
             archive_path,
             caller_object_id,
             expected_content_sha256,
+            live_write_counter,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| Status::internal("drive actor unavailable"))?;
+    let outcome = reply_rx
+        .await
+        .map_err(|_| Status::internal("drive actor dropped reply"))??;
+    Ok(outcome.record)
+}
+
+pub(crate) async fn append_streamed(
+    state: &ApiState,
+    session_id: Uuid,
+    source: crate::StreamedWriteSource,
+    archive_path: std::path::PathBuf,
+    caller_object_id: String,
+    expected_content_sha256: [u8; 32],
+) -> Result<crate::write_owner::AppendFinishOutcome, Status> {
+    let pool = state.drive_pool()?.clone();
+    let mounted = pool.session(session_id)?;
+    let drive = pool.drive_tx(mounted.bay)?;
+    let live_write_counter = mounted
+        .drive_uuid
+        .as_deref()
+        .map(|drive_uuid| state.drive_counters(drive_uuid));
+    let (reply_tx, reply_rx) = oneshot::channel();
+    drive
+        .send(crate::write_owner::DriveCommand::AppendFinish {
+            session_id,
+            source: crate::WriteObjectSource::Streamed(source),
+            archive_path,
+            caller_object_id,
+            expected_content_sha256: Some(expected_content_sha256),
             live_write_counter,
             reply: reply_tx,
         })

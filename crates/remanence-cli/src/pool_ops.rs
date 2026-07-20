@@ -253,7 +253,7 @@ pub fn run_archive_write(
 
     let request = WriteObjectToPoolRequest {
         pool_id: pool_id.clone(),
-        source_path: args.file.clone(),
+        source: remanence_api::WriteObjectSource::Path(args.file.clone()),
         archive_path,
         caller_object_id,
         expected_content_sha256: None,
