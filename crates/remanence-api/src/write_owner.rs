@@ -4593,6 +4593,13 @@ impl BlockSource for DiagnosticBlockSource<'_> {
         result
     }
 
+    fn rewind(&mut self) -> Result<(), TapeIoError> {
+        let started = Instant::now();
+        let result = self.inner.rewind();
+        self.phases.position += started.elapsed();
+        result
+    }
+
     fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
         let started = Instant::now();
         let result = self.inner.locate(lba);
@@ -4841,9 +4848,6 @@ fn stream_one_file_range(
         file_range_read_request(index, tape_uuid, object_id, file_id, start_byte, end_byte)?;
     let block_size_u32 = u32::try_from(request.block_size)
         .map_err(|_| Status::internal("tape block size does not fit u32"))?;
-    drive
-        .rewind()
-        .map_err(|err| Status::internal(format!("rewind before ranged read: {err}")))?;
 
     drive.reset_pipelined_diagnostics();
     let wall_started = Instant::now();
@@ -4919,14 +4923,42 @@ fn file_range_read_request(
         .ok_or_else(|| Status::internal("tape block size unknown"))?;
     let block_size_usize = usize::try_from(block_size)
         .map_err(|_| Status::internal("tape block size does not fit usize"))?;
+    let physical_file_start_lba =
+        derive_physical_file_start_lba(tape_files.as_slice(), tape_file.tape_file_number);
     Ok(crate::read_core::PlaintextFileRangeReadRequest {
         block_size: block_size_usize,
         tape_file_number: tape_file.tape_file_number,
+        physical_file_start_lba,
         first_chunk_lba: file.first_chunk_lba.map(BodyLba),
         file_size_bytes: file.size_bytes,
         range_start,
         range_len,
     })
+}
+
+/// Derive an absolute tape-file start from the dense committed catalog prefix.
+/// Each trailing filemark consumes one physical LBA, matching the filemark-map
+/// physical-position calculation. An incomplete or non-dense prefix returns
+/// `None` so the range reader uses its logical REWIND/SPACE fallback.
+fn derive_physical_file_start_lba(
+    tape_files: &[remanence_state::TapeFileRecord],
+    target_file_number: u32,
+) -> Option<u64> {
+    let mut expected_file_number = 0u32;
+    let mut next_file_lba = 0u64;
+    for tape_file in tape_files {
+        if tape_file.tape_file_number != expected_file_number {
+            return None;
+        }
+        if tape_file.tape_file_number == target_file_number {
+            return Some(next_file_lba);
+        }
+        next_file_lba = next_file_lba
+            .checked_add(tape_file.block_count)?
+            .checked_add(1)?;
+        expected_file_number = expected_file_number.checked_add(1)?;
+    }
+    None
 }
 
 fn resolve_object_file_for_range(
@@ -5455,7 +5487,8 @@ mod tests {
     use remanence_state::{
         CatalogIndex, DriveObservationInput, NativeObjectCopyProjectionInput,
         NativeObjectFileProjectionInput, NativeObjectProjectionInput, ProvisionTapeInput,
-        TapeJournalIndexInput, TapePoolProjectionInput, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+        TapeFileRecord, TapeJournalIndexInput, TapePoolProjectionInput,
+        OBJECT_COPY_REPRESENTATION_PLAINTEXT,
     };
     use tokio_stream::StreamExt;
 
@@ -6173,6 +6206,43 @@ mod tests {
             blocks: sink.blocks,
             layout,
         }
+    }
+
+    #[test]
+    fn ranged_absolute_lba_derives_from_dense_filemark_prefix() {
+        let tape_uuid = RANGE_TAPE_UUID.to_vec();
+        let files = [
+            TapeFileRecord {
+                tape_uuid: tape_uuid.clone(),
+                tape_file_number: 0,
+                kind: "bootstrap".to_string(),
+                block_count: 1,
+                object_id: None,
+            },
+            TapeFileRecord {
+                tape_uuid: tape_uuid.clone(),
+                tape_file_number: 1,
+                kind: "object".to_string(),
+                block_count: 10,
+                object_id: Some("first".to_string()),
+            },
+            TapeFileRecord {
+                tape_uuid,
+                tape_file_number: 2,
+                kind: "object".to_string(),
+                block_count: 3,
+                object_id: Some("target".to_string()),
+            },
+        ];
+        assert_eq!(derive_physical_file_start_lba(&files, 2), Some(13));
+
+        let mut incomplete = files.to_vec();
+        incomplete.remove(1);
+        assert_eq!(
+            derive_physical_file_start_lba(&incomplete, 2),
+            None,
+            "a non-dense prefix must use the logical fallback"
+        );
     }
 
     async fn collect_stream_chunks(

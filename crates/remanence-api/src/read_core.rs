@@ -1241,6 +1241,9 @@ pub struct PlaintextFileRangeReadRequest {
     pub block_size: usize,
     /// Filemark-delimited tape-file number containing the object.
     pub tape_file_number: u32,
+    /// Absolute physical LBA of the first block in the containing tape file,
+    /// when the committed catalog prefix can derive it.
+    pub physical_file_start_lba: Option<u64>,
     /// First object-local body block containing the member-file data.
     pub first_chunk_lba: Option<BodyLba>,
     /// Exact size of the member file.
@@ -1281,14 +1284,7 @@ pub(crate) fn read_plaintext_file_range_with_pipeline<W: Write + Send + ?Sized>(
     let Some(plan) = plan else {
         return Ok(());
     };
-    let mut positioned = source
-        .space(i64::from(request.tape_file_number), SpaceKind::Filemarks)?
-        .position_after;
-    let skip_blocks = i64::try_from(plan.first_body_lba.0)
-        .map_err(|_| FormatError::invalid("range first_body_lba exceeds SPACE range"))?;
-    if skip_blocks != 0 {
-        positioned = source.space(skip_blocks, SpaceKind::Blocks)?.position_after;
-    }
+    let positioned = position_plaintext_file_range(source, request, plan.first_body_lba)?;
     run_read_pipeline(
         source,
         request.block_size,
@@ -1340,6 +1336,65 @@ pub(crate) fn read_plaintext_file_range_with_pipeline<W: Write + Send + ?Sized>(
             })
         },
     )
+}
+
+/// Position a ranged read from the live cursor, preferring same-file forward
+/// SPACE and absolute LOCATE before falling back to REWIND plus logical motion.
+/// The caller retains the existing mandatory proof immediately before the
+/// first READ by passing the returned position into `run_read_pipeline`.
+fn position_plaintext_file_range(
+    source: &mut dyn BlockSource,
+    request: PlaintextFileRangeReadRequest,
+    first_body_lba: BodyLba,
+) -> Result<TapePosition, FormatError> {
+    let current = source.position()?;
+    if let Some(file_start_lba) = request.physical_file_start_lba {
+        let target_lba = file_start_lba
+            .checked_add(first_body_lba.0)
+            .ok_or_else(|| FormatError::invalid("range physical target LBA overflow"))?;
+        // SPACE(Blocks) stops at a filemark, so it is safe as the fast path
+        // only when both cursors are inside the target tape file.
+        let positioned =
+            if current.partition == 0 && current.lba >= file_start_lba && current.lba <= target_lba
+            {
+                let delta = target_lba - current.lba;
+                match i64::try_from(delta) {
+                    Ok(0) => current,
+                    Ok(delta) => {
+                        let outcome = source.space(delta, SpaceKind::Blocks)?;
+                        if outcome.stopped_at_boundary {
+                            return Err(FormatError::parse(
+                                "range forward SPACE stopped at an unexpected tape-file boundary",
+                            ));
+                        }
+                        outcome.position_after
+                    }
+                    Err(_) => source.locate(target_lba)?,
+                }
+            } else {
+                source.locate(target_lba)?
+            };
+        if positioned.partition != 0 || positioned.lba != target_lba {
+            return Err(FormatError::parse(format!(
+                "range positioning mismatch: expected partition 0 lba {target_lba}, observed partition {} lba {}",
+                positioned.partition, positioned.lba
+            )));
+        }
+        return Ok(positioned);
+    }
+
+    if current.partition != 0 || current.lba != 0 {
+        source.rewind()?;
+    }
+    let mut positioned = source
+        .space(i64::from(request.tape_file_number), SpaceKind::Filemarks)?
+        .position_after;
+    let skip_blocks = i64::try_from(first_body_lba.0)
+        .map_err(|_| FormatError::invalid("range first_body_lba exceeds SPACE range"))?;
+    if skip_blocks != 0 {
+        positioned = source.space(skip_blocks, SpaceKind::Blocks)?.position_after;
+    }
+    Ok(positioned)
 }
 
 /// Streaming sink that captures the single non-manifest payload entry.
@@ -2031,7 +2086,7 @@ mod tests {
     }
 
     #[test]
-    fn read_plaintext_file_range_streams_only_requested_bytes() {
+    fn ranged_read_matches_full_read_slice() {
         let opts = options(512);
         let payload = (0..1600)
             .map(|value| u8::try_from(value % 251).unwrap())
@@ -2045,6 +2100,20 @@ mod tests {
         }];
         let mut block_sink = VecBlockSink::new();
         let layout = write_rem_tar_object(&mut block_sink, &opts, &files).unwrap();
+        let mut full_source = VecBlockSource::new(block_sink.blocks.clone());
+        let mut full = Vec::new();
+        let mut full_sink = CapturePayloadSink::new(&mut full);
+        read_object_payload(
+            &mut full_source,
+            opts.chunk_size,
+            layout.projected_size_blocks,
+            0,
+            None,
+            &mut full_sink,
+        )
+        .unwrap();
+        full_sink.finish().unwrap();
+
         let mut source = VecBlockSource::new(block_sink.blocks);
         let mut range = Vec::new();
 
@@ -2053,6 +2122,7 @@ mod tests {
             PlaintextFileRangeReadRequest {
                 block_size: opts.chunk_size,
                 tape_file_number: 0,
+                physical_file_start_lba: Some(0),
                 first_chunk_lba: layout.files[0].first_chunk_lba,
                 file_size_bytes: u64::try_from(payload.len()).unwrap(),
                 range_start: 400,
@@ -2062,7 +2132,182 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(range, payload[400..1100]);
+        assert_eq!(full, payload);
+        assert_eq!(range, full[400..1100]);
+    }
+
+    #[test]
+    fn ranged_read_issues_batched_read_commands() {
+        let opts = options(512);
+        let payload = (0..7000)
+            .map(|value| u8::try_from(value % 251).unwrap())
+            .collect::<Vec<_>>();
+        let files = [RemTarFile {
+            path: "funnel.bin",
+            file_id: "file-funnel",
+            data: payload.as_slice(),
+            mtime: Some("0"),
+            executable: Some(false),
+        }];
+        let mut block_sink = VecBlockSink::new();
+        let layout = write_rem_tar_object(&mut block_sink, &opts, &files).unwrap();
+        let mut source = VecBlockSource::new(block_sink.blocks).with_read_batch_blocks_for_test(4);
+        let mut restored = Vec::new();
+
+        read_plaintext_file_range(
+            &mut source,
+            PlaintextFileRangeReadRequest {
+                block_size: opts.chunk_size,
+                tape_file_number: 0,
+                physical_file_start_lba: Some(0),
+                first_chunk_lba: layout.files[0].first_chunk_lba,
+                file_size_bytes: payload.len() as u64,
+                range_start: 0,
+                range_len: payload.len() as u64,
+            },
+            &mut restored,
+        )
+        .unwrap();
+
+        assert_eq!(restored, payload);
+        assert!(
+            source.calls.iter().any(|call| matches!(
+                call,
+                VecBlockSourceCall::ReadBlockBatch {
+                    requested_records,
+                    ..
+                } if *requested_records > 1
+            )),
+            "ranged reads must ride the batched READ funnel: {:?}",
+            source.calls
+        );
+        assert!(
+            source
+                .calls
+                .iter()
+                .all(|call| !matches!(call, VecBlockSourceCall::ReadBlock { .. })),
+            "ranged reads must not fall back to one synchronous READ per block: {:?}",
+            source.calls
+        );
+    }
+
+    #[test]
+    fn ranged_read_enforces_proof_cadence() {
+        let proofs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut source = InstrumentedReadSource {
+            inner: VecBlockSource::new((0u8..5).map(|value| vec![value; 4]).collect())
+                .with_read_batch_blocks_for_test(2),
+            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            proofs: Arc::clone(&proofs),
+            fail_proof_at: None,
+        };
+        let mut restored = Vec::new();
+
+        read_plaintext_file_range_with_pipeline(
+            &mut source,
+            PlaintextFileRangeReadRequest {
+                block_size: 4,
+                tape_file_number: 0,
+                physical_file_start_lba: Some(0),
+                first_chunk_lba: Some(BodyLba(0)),
+                file_size_bytes: 16,
+                range_start: 0,
+                range_len: 16,
+            },
+            &mut restored,
+            ReadPipelineConfig {
+                reservoir_bytes: 32,
+                high_pct: 90,
+                low_pct: 25,
+                ranged_frontier: true,
+                proof_cadence_bytes: 8,
+                terminal: None,
+            },
+            IoMemoryReservation::new(64).expect("manager"),
+        )
+        .expect("ranged pipeline");
+
+        assert_eq!(restored, [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]);
+        assert_eq!(
+            proofs.load(Ordering::Acquire),
+            4,
+            "initial, each 8-byte frontier, and final frontier proofs are mandatory"
+        );
+    }
+
+    #[test]
+    fn ranged_positioning_prefers_forward_space_then_locate_then_rewind() {
+        let blocks = (0u8..16).map(|value| vec![value; 4]).collect::<Vec<_>>();
+        let request = PlaintextFileRangeReadRequest {
+            block_size: 4,
+            tape_file_number: 2,
+            physical_file_start_lba: Some(2),
+            first_chunk_lba: Some(BodyLba(0)),
+            file_size_bytes: 16,
+            range_start: 0,
+            range_len: 4,
+        };
+
+        let mut forward = VecBlockSource::new(blocks.clone());
+        forward.locate(3).expect("seed forward cursor");
+        forward.calls.clear();
+        let positioned = position_plaintext_file_range(&mut forward, request, BodyLba(5))
+            .expect("forward positioning");
+        assert_eq!(positioned.lba, 7);
+        assert_eq!(
+            forward.calls,
+            [
+                VecBlockSourceCall::Position,
+                VecBlockSourceCall::Space {
+                    count: 4,
+                    kind: SpaceKind::Blocks,
+                },
+            ]
+        );
+
+        let mut backward = VecBlockSource::new(blocks.clone());
+        backward.locate(9).expect("seed backward cursor");
+        backward.calls.clear();
+        let positioned = position_plaintext_file_range(&mut backward, request, BodyLba(5))
+            .expect("absolute positioning");
+        assert_eq!(positioned.lba, 7);
+        assert_eq!(
+            backward.calls,
+            [
+                VecBlockSourceCall::Position,
+                VecBlockSourceCall::Locate { target: 7 },
+            ]
+        );
+
+        let mut fallback = VecBlockSource::new(blocks);
+        fallback.locate(9).expect("seed fallback cursor");
+        fallback.calls.clear();
+        let positioned = position_plaintext_file_range(
+            &mut fallback,
+            PlaintextFileRangeReadRequest {
+                physical_file_start_lba: None,
+                ..request
+            },
+            BodyLba(5),
+        )
+        .expect("logical fallback positioning");
+        assert_eq!(positioned.lba, 7);
+        assert_eq!(
+            fallback.calls,
+            [
+                VecBlockSourceCall::Position,
+                VecBlockSourceCall::Rewind,
+                VecBlockSourceCall::Space {
+                    count: 2,
+                    kind: SpaceKind::Filemarks,
+                },
+                VecBlockSourceCall::Space {
+                    count: 5,
+                    kind: SpaceKind::Blocks,
+                },
+            ]
+        );
     }
 
     #[test]
