@@ -1032,6 +1032,11 @@ message AppendObjectMessage {
   }
 }
 
+enum SourceReplayCapability {
+  SOURCE_REPLAY_CAPABILITY_UNSPECIFIED       = 0;
+  SOURCE_REPLAY_CAPABILITY_REPLAY_FROM_START = 1;
+}
+
 message AppendObjectStart {
   bytes session_id                    = 1;
   string caller_object_id             = 2; // §4.2 orchestrator opaque id
@@ -1044,6 +1049,12 @@ message AppendObjectStart {
   // accordingly. The exact shape is body-format-specific; this draft leaves
   // it as a serialized blob owned by the format adapter.
   bytes body_format_manifest          = 5;
+  // Binding payload digest used for overlap admission. New clients mirror
+  // this value in AppendObjectFinish during the compatibility window.
+  bytes expected_content_sha256       = 6;
+  // Whether the caller retains immutable source bytes and can replay them
+  // from byte zero after an interrupted overlap append.
+  SourceReplayCapability source_replay_capability = 7;
 }
 
 message AppendObjectChunk {
