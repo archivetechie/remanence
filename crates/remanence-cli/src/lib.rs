@@ -5754,6 +5754,12 @@ fn drive_live_json(drive: &pb::Drive) -> Value {
         } else {
             Value::String(bytes_to_uuid_text(&drive.loaded_tape_uuid))
         },
+        "loaded_tape_barcode": if drive.loaded_tape_barcode.is_empty() {
+            Value::Null
+        } else {
+            Value::String(drive.loaded_tape_barcode.clone())
+        },
+        "mount_age_seconds": drive.mount_age_seconds,
         "status": drive_status_name(drive.status),
         "drive_uuid": bytes_to_uuid_text(&drive.drive_uuid),
         "cleaning_due": drive.cleaning_due,
@@ -5777,7 +5783,8 @@ fn drive_live_json(drive: &pb::Drive) -> Value {
             "ioctl_p95_us": drive.tape_io_ioctl_p95_us,
             "ioctl_max_us": drive.tape_io_ioctl_max_us,
             "cadence_us": drive.tape_io_cadence_us,
-            "effective_feed_bytes_per_second": drive.tape_io_effective_feed_bytes_per_second,
+            "window_feed_bytes_per_second": drive.tape_io_window_feed_bytes_per_second,
+            "session_average_feed_bytes_per_second": drive.tape_io_effective_feed_bytes_per_second,
         },
     })
 }
@@ -5855,14 +5862,11 @@ fn print_live_status_text(
         let managed = library.managed.as_str();
         let _ = writeln!(out, "library {serial} [{managed}]");
         for drive in &library.drives {
-            let tape = if drive.loaded_tape_uuid.is_empty() {
-                "-"
-            } else {
-                "loaded"
-            };
+            let tape = drive.loaded_tape_barcode.as_str();
+            let tape = if tape.is_empty() { "-" } else { tape };
             let _ = writeln!(
                 out,
-                "  bay {bay:04x} serial={serial} tape={tape} state={state} read={read} write={write} epoch={epoch} ring={ring} gap_p95_us={gap_p95} feed_Bps={feed}",
+                "  bay {bay:04x} serial={serial} tape_barcode={tape} mount_age_s={mount_age} state={state} read={read} write={write} epoch={epoch} ring={ring} gap_p95_us={gap_p95} feed_window_Bps={window_feed} feed_session_avg_Bps={session_feed}",
                 bay = drive.element_address,
                 serial = drive.drive_serial,
                 state = drive_status_name(drive.status),
@@ -5871,7 +5875,9 @@ fn print_live_status_text(
                 epoch = drive.counter_epoch,
                 ring = drive.tape_io_staging_ring_buffers,
                 gap_p95 = drive.tape_io_gap_p95_us,
-                feed = drive.tape_io_effective_feed_bytes_per_second,
+                window_feed = drive.tape_io_window_feed_bytes_per_second,
+                session_feed = drive.tape_io_effective_feed_bytes_per_second,
+                mount_age = drive.mount_age_seconds,
             );
         }
     }
@@ -15482,6 +15488,9 @@ mod tests {
                     tape_io_gap_p95_us: 250,
                     tape_io_cadence_us: 1_100,
                     tape_io_effective_feed_bytes_per_second: 300_000_000,
+                    loaded_tape_barcode: "CLN001".to_string(),
+                    mount_age_seconds: 83,
+                    tape_io_window_feed_bytes_per_second: 304_000_000,
                     ..Default::default()
                 }],
                 slots: vec![pb::Slot {
@@ -15544,7 +15553,37 @@ mod tests {
             value["data"]["libraries"][0]["drives"][0]["tape_io"]["gap_p95_us"],
             250
         );
+        assert_eq!(
+            value["data"]["libraries"][0]["drives"][0]["loaded_tape_barcode"],
+            "CLN001"
+        );
+        assert_eq!(
+            value["data"]["libraries"][0]["drives"][0]["mount_age_seconds"],
+            83
+        );
+        assert_eq!(
+            value["data"]["libraries"][0]["drives"][0]["tape_io"]["window_feed_bytes_per_second"],
+            304_000_000
+        );
+        assert_eq!(
+            value["data"]["libraries"][0]["drives"][0]["tape_io"]
+                ["session_average_feed_bytes_per_second"],
+            300_000_000
+        );
         assert!(value["operation"].is_null());
+    }
+
+    #[test]
+    fn top_text_labels_window_and_session_rates_with_barcode_age() {
+        let mut out = Vec::new();
+        print_live_status_text(&sample_live_status_response(), &mut out).expect("print top text");
+        let text = String::from_utf8(out).expect("top text is utf-8");
+
+        assert!(text.contains("tape_barcode=CLN001"), "{text}");
+        assert!(text.contains("mount_age_s=83"), "{text}");
+        assert!(text.contains("feed_window_Bps=304000000"), "{text}");
+        assert!(text.contains("feed_session_avg_Bps=300000000"), "{text}");
+        assert!(!text.contains(" feed_Bps="), "{text}");
     }
 
     #[test]

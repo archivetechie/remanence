@@ -1,9 +1,7 @@
 #[cfg(feature = "tui")]
-use std::collections::HashMap;
-#[cfg(feature = "tui")]
 use std::io::{self, Write};
 #[cfg(feature = "tui")]
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::{bytes_to_uuid_text, connect_daemon, daemon_runtime, drive_status_name, status_error};
 #[cfg(feature = "tui")]
@@ -29,28 +27,13 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 #[cfg(feature = "tui")]
 use remanence_api::pb;
 #[cfg(feature = "tui")]
-use tonic::transport::Channel;
-
-#[cfg(feature = "tui")]
-#[derive(Clone, Debug)]
-struct DriveRateSample {
-    at: Instant,
-    epoch: u64,
-    read_bytes: u64,
-    write_bytes: u64,
-}
-
-#[cfg(feature = "tui")]
 #[derive(Clone, Debug, Default)]
 struct TopState {
     live: Option<pb::GetLiveStatusResponse>,
-    tape_voltags: HashMap<Vec<u8>, String>,
     selected_library: usize,
     show_slots: bool,
     paused: bool,
     help: bool,
-    last_rates: HashMap<Vec<u8>, DriveRateSample>,
-    drive_mbps: HashMap<Vec<u8>, f64>,
 }
 
 #[cfg(feature = "tui")]
@@ -103,9 +86,7 @@ pub(crate) fn run_top_tui(
             let channel = connect_daemon(endpoint)
                 .await
                 .map_err(crate::DaemonClientError::from)?;
-            let mut library_client =
-                pb::library_service_client::LibraryServiceClient::new(channel.clone());
-            let mut catalog_client = pb::catalog_client::CatalogClient::new(channel);
+            let mut library_client = pb::library_service_client::LibraryServiceClient::new(channel);
 
             let mut state = TopState {
                 show_slots: true,
@@ -130,8 +111,7 @@ pub(crate) fn run_top_tui(
             let loop_result = async {
                 loop {
                     if !state.paused {
-                        refresh_top_state(&mut library_client, &mut catalog_client, &mut state)
-                            .await?;
+                        refresh_top_state(&mut library_client, &mut state).await?;
                     }
                     terminal
                         .draw(|frame| render_top(frame, &state))
@@ -185,7 +165,6 @@ async fn refresh_top_state(
     library_client: &mut pb::library_service_client::LibraryServiceClient<
         tonic::transport::Channel,
     >,
-    catalog_client: &mut pb::catalog_client::CatalogClient<Channel>,
     state: &mut TopState,
 ) -> Result<(), crate::DaemonClientError> {
     let live = library_client
@@ -193,70 +172,11 @@ async fn refresh_top_state(
         .await
         .map_err(status_error)?
         .into_inner();
-    let tapes = catalog_client
-        .list_tapes(pb::ListTapesRequest {
-            library_uuid: Vec::new(),
-            page_token: None,
-            page_size: 0,
-            pool_id: String::new(),
-            kind: "all".to_string(),
-        })
-        .await
-        .map_err(status_error)?
-        .into_inner()
-        .tapes;
-
-    let tape_voltags = tape_voltags_from_tapes(tapes);
-    update_drive_rates(state, &live);
     if state.selected_library >= live.libraries.len() {
         state.selected_library = 0;
     }
-    state.tape_voltags = tape_voltags;
     state.live = Some(live);
     Ok(())
-}
-
-#[cfg(feature = "tui")]
-fn tape_voltags_from_tapes(tapes: impl IntoIterator<Item = pb::Tape>) -> HashMap<Vec<u8>, String> {
-    tapes
-        .into_iter()
-        .map(|tape| (tape.tape_uuid, tape.voltag))
-        .collect()
-}
-
-#[cfg(feature = "tui")]
-fn update_drive_rates(state: &mut TopState, live: &pb::GetLiveStatusResponse) {
-    let now = Instant::now();
-    for library in &live.libraries {
-        for drive in &library.drives {
-            let key = drive.drive_uuid.clone();
-            let sample = DriveRateSample {
-                at: now,
-                epoch: drive.counter_epoch,
-                read_bytes: drive.lifetime_read_bytes,
-                write_bytes: drive.lifetime_write_bytes,
-            };
-            let rate = match state.last_rates.get(&key) {
-                Some(previous) if previous.epoch == sample.epoch && sample.at > previous.at => {
-                    let elapsed = sample.at.duration_since(previous.at).as_secs_f64();
-                    if elapsed > 0.0 {
-                        let delta = sample
-                            .read_bytes
-                            .saturating_add(sample.write_bytes)
-                            .saturating_sub(
-                                previous.read_bytes.saturating_add(previous.write_bytes),
-                            );
-                        (delta as f64) / elapsed / 1_048_576.0
-                    } else {
-                        0.0
-                    }
-                }
-                _ => 0.0,
-            };
-            state.drive_mbps.insert(key.clone(), rate.max(0.0));
-            state.last_rates.insert(key, sample);
-        }
-    }
 }
 
 #[cfg(feature = "tui")]
@@ -340,28 +260,29 @@ fn render_pinned_band(frame: &mut Frame<'_>, area: Rect, state: &TopState) {
                 .drives
                 .iter()
                 .map(|drive| {
-                    let voltag = state
-                        .tape_voltags
-                        .get(&drive.loaded_tape_uuid)
-                        .cloned()
-                        .unwrap_or_else(|| "-".to_string());
+                    let barcode = if drive.loaded_tape_barcode.is_empty() {
+                        "-"
+                    } else {
+                        drive.loaded_tape_barcode.as_str()
+                    };
                     let badges = drive_badges(drive);
                     Row::new(vec![
                         Cell::from(format!("{:04x}", drive.element_address)),
                         Cell::from(drive.drive_serial.clone()),
-                        Cell::from(voltag),
+                        Cell::from(barcode.to_string()),
+                        Cell::from(mount_age_label(drive)),
                         Cell::from(format!(
                             "{} {}",
                             drive_state_glyph(drive.status),
                             drive_status_name(drive.status)
                         )),
                         Cell::from(format!(
-                            "{:.2}",
-                            state
-                                .drive_mbps
-                                .get(&drive.drive_uuid)
-                                .copied()
-                                .unwrap_or(0.0)
+                            "{:.1}",
+                            drive.tape_io_window_feed_bytes_per_second as f64 / 1_048_576.0
+                        )),
+                        Cell::from(format!(
+                            "{:.1}",
+                            drive.tape_io_effective_feed_bytes_per_second as f64 / 1_048_576.0
                         )),
                         Cell::from(badges),
                     ])
@@ -373,19 +294,23 @@ fn render_pinned_band(frame: &mut Frame<'_>, area: Rect, state: &TopState) {
         rows,
         [
             Constraint::Length(6),
-            Constraint::Length(18),
-            Constraint::Length(12),
-            Constraint::Length(18),
+            Constraint::Length(14),
+            Constraint::Length(11),
             Constraint::Length(8),
-            Constraint::Min(10),
+            Constraint::Length(12),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Min(8),
         ],
     )
     .header(Row::new(vec![
         Cell::from("bay"),
         Cell::from("serial"),
-        Cell::from("tape voltag"),
+        Cell::from("barcode"),
+        Cell::from("age"),
         Cell::from("state"),
-        Cell::from("MB/s"),
+        Cell::from("win MB/s"),
+        Cell::from("avg MB/s"),
         Cell::from("badges"),
     ]))
     .block(
@@ -499,6 +424,21 @@ fn drive_badges(drive: &pb::Drive) -> String {
 }
 
 #[cfg(feature = "tui")]
+fn mount_age_label(drive: &pb::Drive) -> String {
+    if drive.loaded_tape_barcode.is_empty() {
+        return "-".to_string();
+    }
+    let seconds = drive.mount_age_seconds;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h{:02}m", seconds / 3_600, (seconds % 3_600) / 60)
+    }
+}
+
+#[cfg(feature = "tui")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,6 +471,10 @@ mod tests {
                     counter_epoch: 42,
                     session_id: Uuid::from_u128(4).as_bytes().to_vec(),
                     active_alert_names: vec!["cleaning".to_string()],
+                    loaded_tape_barcode: "CLN001".to_string(),
+                    mount_age_seconds: 83,
+                    tape_io_window_feed_bytes_per_second: 304 * 1024 * 1024,
+                    tape_io_effective_feed_bytes_per_second: 13 * 1024 * 1024,
                     ..Default::default()
                 }],
                 slots: vec![pb::Slot {
@@ -576,29 +520,13 @@ mod tests {
     fn renders_pinned_band_and_paused_banner() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
-        let mut state = TopState {
+        let state = TopState {
             live: Some(sample_response()),
             show_slots: true,
             paused: true,
             help: true,
             ..Default::default()
         };
-        state
-            .tape_voltags
-            .extend(tape_voltags_from_tapes(vec![pb::Tape {
-                tape_uuid: Uuid::from_u128(2).as_bytes().to_vec(),
-                voltag: "CLN001".to_string(),
-                body_format: String::new(),
-                block_size_bytes: 0,
-                data_blocks_per_stripe: 0,
-                parity_blocks_per_stripe: 0,
-                stripes_per_neighborhood: 0,
-                last_committed_tape_file: 0,
-                state: 0,
-                updated_at: None,
-                pool_id: String::new(),
-                correlation_rollups: Vec::new(),
-            }]));
         terminal
             .draw(|frame| render_top(frame, &state))
             .expect("draw");
@@ -609,32 +537,11 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(text.contains("PAUSED"));
-        assert!(text.contains("tape voltag"));
+        assert!(text.contains("win MB/s"));
+        assert!(text.contains("avg MB/s"));
         assert!(text.contains("DRV-01"));
         assert!(text.contains("CLN001"));
-    }
-
-    #[test]
-    fn cleaning_tape_voltags_are_kept_for_label_lookup() {
-        let map = tape_voltags_from_tapes(vec![pb::Tape {
-            tape_uuid: Uuid::from_u128(2).as_bytes().to_vec(),
-            voltag: "CLN001".to_string(),
-            body_format: String::new(),
-            block_size_bytes: 0,
-            data_blocks_per_stripe: 0,
-            parity_blocks_per_stripe: 0,
-            stripes_per_neighborhood: 0,
-            last_committed_tape_file: 0,
-            state: 0,
-            updated_at: None,
-            pool_id: String::new(),
-            correlation_rollups: Vec::new(),
-        }]);
-
-        assert_eq!(
-            map.get(Uuid::from_u128(2).as_bytes().as_slice()),
-            Some(&"CLN001".to_string())
-        );
+        assert!(text.contains("1m23s"));
     }
 
     #[test]
@@ -648,21 +555,9 @@ mod tests {
     }
 
     #[test]
-    fn drive_rate_baseline_never_goes_negative_on_epoch_change() {
-        let mut state = TopState::default();
-        let mut live = sample_response();
-        update_drive_rates(&mut state, &live);
-        let first = state.drive_mbps.clone();
-        live.libraries[0].drives[0].counter_epoch = 99;
-        live.libraries[0].drives[0].lifetime_read_bytes = 0;
-        live.libraries[0].drives[0].lifetime_write_bytes = 0;
-        update_drive_rates(&mut state, &live);
-        let rate = state
-            .drive_mbps
-            .get(Uuid::from_u128(3).as_bytes().as_slice())
-            .copied()
-            .unwrap_or(-1.0);
-        assert!(rate >= 0.0);
-        assert_eq!(first.len(), 1);
+    fn mount_age_labels_loaded_and_empty_bays() {
+        let drive = &sample_response().libraries[0].drives[0];
+        assert_eq!(mount_age_label(drive), "1m23s");
+        assert_eq!(mount_age_label(&pb::Drive::default()), "-");
     }
 }
