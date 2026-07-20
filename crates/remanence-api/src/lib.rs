@@ -67,6 +67,7 @@ pub async fn connect_unix(socket_path: PathBuf) -> Result<Channel, tonic::transp
 
 pub use remanence_parity::ParityConfig;
 
+mod append_ring;
 mod diagnostics;
 mod io_memory;
 mod library;
@@ -86,8 +87,8 @@ pub use pool_write::{
     seal_decision_after_write, select_tape_in_pool, verify_tape_identity, write_object_to_pool,
     write_tape_bootstrap, write_to_selected_tape, LtoGen, PoolWriteError,
     PoolWriteObjectCopyRecord, PoolWriteObjectRecord, PoolWriteRepresentation, PoolWriteResult,
-    SelectTapeError, SelectedTape, TapeIdentityError, TapePositionAfterWrite, TapeSealReason,
-    TapeUuid, WritabilityError, WriteObjectToPoolRequest,
+    SelectTapeError, SelectedTape, StreamedWriteSource, TapeIdentityError, TapePositionAfterWrite,
+    TapeSealReason, TapeUuid, WritabilityError, WriteObjectSource, WriteObjectToPoolRequest,
 };
 pub use remanence_library::{resolve_load_target, LoadError, LoadPlan};
 pub use tape_init::{
@@ -434,6 +435,10 @@ pub struct ApiState {
     spool_dir: Option<Arc<PathBuf>>,
     spool_budget_bytes: Option<u64>,
     io_memory: Arc<crate::io_memory::IoMemoryReservation>,
+    append_staging_mode: remanence_state::AppendStagingMode,
+    append_ring_bytes: u64,
+    append_ring_high_pct: u8,
+    append_ring_low_pct: u8,
     default_library_serial: Option<Arc<String>>,
     library_snapshot: Option<Arc<RwLock<Arc<LibrarySnapshot>>>>,
     live_status: Arc<LiveStatusState>,
@@ -459,7 +464,7 @@ impl ApiState {
             .into_iter()
             .map(|pool| (pool.id.trim().to_string(), pool))
             .collect();
-        Self::new_with_pool_configs_inner(
+        let mut state = Self::new_with_pool_configs_inner(
             index_path,
             pool_configs,
             // Configured-or-daemon-operated set (never raw config.drives —
@@ -470,7 +475,12 @@ impl ApiState {
             config.audit.fsync,
             Arc::new(std::sync::Mutex::new(())),
             live_status_config_from(&config.livestatus),
-        )
+        );
+        state.append_staging_mode = config.daemon.append_staging_mode;
+        state.append_ring_bytes = config.daemon.append_ring_bytes;
+        state.append_ring_high_pct = config.daemon.append_ring_high_pct;
+        state.append_ring_low_pct = config.daemon.append_ring_low_pct;
+        state
     }
 
     /// Build service state with explicit tape-pool selection config.
@@ -520,6 +530,10 @@ impl ApiState {
                 remanence_state::DEFAULT_IO_MEMORY_CEILING_BYTES,
             )
             .expect("nonzero default I/O memory ceiling"),
+            append_staging_mode: remanence_state::AppendStagingMode::Serial,
+            append_ring_bytes: remanence_state::DEFAULT_APPEND_RING_BYTES,
+            append_ring_high_pct: 90,
+            append_ring_low_pct: 25,
             default_library_serial: None,
             library_snapshot: None,
             live_status: Arc::new(LiveStatusState::new(live_status_interval)),
@@ -648,6 +662,10 @@ impl ApiState {
         state.spool_dir = Some(Arc::new(spool_dir));
         state.spool_budget_bytes = Some(spool_budget_bytes);
         state.io_memory = io_memory;
+        state.append_staging_mode = config.daemon.append_staging_mode;
+        state.append_ring_bytes = config.daemon.append_ring_bytes;
+        state.append_ring_high_pct = config.daemon.append_ring_high_pct;
+        state.append_ring_low_pct = config.daemon.append_ring_low_pct;
         state.default_library_serial = default_library_serial;
         state.library_snapshot = Some(library_snapshot);
         state.drive_idle_unload_seconds = config.daemon.drive_idle_unload_seconds;
@@ -2403,7 +2421,7 @@ impl WriteSessionApi {
         stream: S,
     ) -> Result<Response<pb::ObjectRecord>, Status>
     where
-        S: Stream<Item = Result<pb::AppendObjectMessage, Status>> + Unpin,
+        S: Stream<Item = Result<pb::AppendObjectMessage, Status>> + Unpin + Send + 'static,
     {
         let spool_dir = self.spool_dir_for_log();
         let result = self.append_object_stream(stream).await;
@@ -2418,7 +2436,7 @@ impl WriteSessionApi {
         mut stream: S,
     ) -> Result<Response<pb::ObjectRecord>, Status>
     where
-        S: Stream<Item = Result<pb::AppendObjectMessage, Status>> + Unpin,
+        S: Stream<Item = Result<pb::AppendObjectMessage, Status>> + Unpin + Send + 'static,
     {
         let first = next_append_message(&mut stream)
             .await?
@@ -2438,6 +2456,22 @@ impl WriteSessionApi {
         }
         let session_id = decode_uuid_bytes(&start.session_id, "session_id")?;
         let session_id = Uuid::from_bytes(session_id);
+        let start_digest = expected_content_sha256(&start.expected_content_sha256)?;
+        let overlap_eligible = overlap_append_eligible(
+            self.state.append_staging_mode,
+            &start,
+            start_digest.as_ref(),
+        );
+        if overlap_eligible {
+            return self
+                .append_object_overlap(
+                    stream,
+                    start,
+                    session_id,
+                    start_digest.expect("overlap eligibility requires a start digest"),
+                )
+                .await;
+        }
         let cap = append_spool_cap(start.declared_size_bytes);
         self.state.validate_spool_budget(cap)?;
         let mut spool = create_append_spool(self.state.spool_dir()?.to_path_buf(), cap).await?;
@@ -2491,7 +2525,14 @@ impl WriteSessionApi {
         }
         let finish =
             finish.ok_or_else(|| Status::invalid_argument("append stream must end with Finish"))?;
-        let expected_content_sha256 = expected_content_sha256(&finish.expected_content_sha256)?;
+        let finish_digest = expected_content_sha256(&finish.expected_content_sha256)?;
+        if start_digest.is_some() && finish_digest.is_some() && start_digest != finish_digest {
+            let _ = fs::remove_file(spool.path());
+            return Err(Status::invalid_argument(
+                "Start and Finish expected_content_sha256 values disagree",
+            ));
+        }
+        let expected_content_sha256 = start_digest.or(finish_digest);
         let archive_path = archive_path_from_start(&start);
         let spool_path = finish_append_spool(spool).await?;
         let spool_elapsed = spool_started.elapsed();
@@ -2535,6 +2576,108 @@ impl WriteSessionApi {
             "remanence_write_diag",
         );
         Ok(Response::new(record))
+    }
+
+    async fn append_object_overlap<S>(
+        &self,
+        stream: S,
+        start: pb::AppendObjectStart,
+        session_id: Uuid,
+        start_digest: [u8; 32],
+    ) -> Result<Response<pb::ObjectRecord>, Status>
+    where
+        S: Stream<Item = Result<pb::AppendObjectMessage, Status>> + Unpin + Send + 'static,
+    {
+        let (producer, consumer, control) = crate::append_ring::create_append_ring(
+            &self.state.io_memory,
+            self.state.append_ring_bytes,
+            self.state.append_ring_high_pct,
+            self.state.append_ring_low_pct,
+            start.declared_size_bytes,
+        )?;
+        let declared_size_bytes = start.declared_size_bytes;
+        let receive_control = Arc::clone(&control);
+        let receive_task = tokio::spawn(receive_overlap_messages(
+            stream,
+            producer,
+            session_id,
+            declared_size_bytes,
+            start_digest,
+            receive_control,
+        ));
+        if let Err(status) = control.wait_for_prefill().await {
+            let receive = receive_task.await.map_err(|err| {
+                Status::internal(format!("overlap receive task failed before prefill: {err}"))
+            })?;
+            return Err(receive.err().unwrap_or(status));
+        }
+        tracing::info!(
+            target: "remanence_write_diag",
+            phase = "overlap_prefill",
+            session_id = %session_id,
+            ring_occupancy_bytes = control.occupancy_bytes(),
+            ring_peak_occupancy_bytes = control.peak_occupancy_bytes(),
+            ring_capacity_bytes = control.capacity_bytes(),
+            ring_high_bytes = control.high_bytes(),
+            declared_size_bytes,
+            client_live = true,
+            "remanence_write_diag",
+        );
+
+        let source = crate::StreamedWriteSource::new(
+            consumer,
+            declared_size_bytes,
+            start_digest,
+            Arc::clone(&control),
+        );
+        let append_started = Instant::now();
+        let append = crate::mount::append_streamed(
+            &self.state,
+            session_id,
+            source,
+            archive_path_from_start(&start),
+            start.caller_object_id,
+            start_digest,
+        )
+        .await;
+        match append {
+            Ok(outcome) if outcome.replay => {
+                receive_task.abort();
+                let _ = receive_task.await;
+                Ok(Response::new(outcome.record))
+            }
+            Ok(outcome) => {
+                let receive = receive_task.await.map_err(|err| {
+                    Status::internal(format!("overlap receive task failed: {err}"))
+                })??;
+                tracing::info!(
+                    target: "remanence_write_diag",
+                    phase = "overlap_complete",
+                    session_id = %session_id,
+                    payload_bytes = receive.bytes,
+                    chunks = receive.chunks,
+                    ring_peak_occupancy_bytes = control.peak_occupancy_bytes(),
+                    elapsed_ms = crate::diagnostics::duration_ms(append_started.elapsed()),
+                    throughput_mib_s = crate::diagnostics::mib_per_s(
+                        receive.bytes,
+                        append_started.elapsed()
+                    ),
+                    "remanence_write_diag",
+                );
+                Ok(Response::new(outcome.record))
+            }
+            Err(actor_status) => {
+                if receive_task.is_finished() {
+                    if let Ok(Err(receive_status)) = receive_task.await {
+                        return Err(receive_status);
+                    }
+                } else {
+                    receive_task.abort();
+                    let _ = receive_task.await;
+                }
+                Err(actor_status)
+            }
+        }
     }
 
     fn library_serial_for_pool_target(
@@ -2584,6 +2727,130 @@ where
             "append stream failed: {err}"
         ))),
         None => Ok(None),
+    }
+}
+
+#[derive(Debug)]
+struct OverlapReceiveReport {
+    bytes: u64,
+    chunks: u64,
+}
+
+/// Receive and hash one overlap body. The final slab is withheld until the
+/// exact byte count, stream shape, receiver digest, and Finish digest pass.
+async fn receive_overlap_messages<S>(
+    mut stream: S,
+    mut producer: crate::append_ring::AppendRingProducer,
+    session_id: Uuid,
+    declared_size_bytes: u64,
+    start_digest: [u8; 32],
+    control: Arc<crate::append_ring::AppendRingControl>,
+) -> Result<OverlapReceiveReport, Status>
+where
+    S: Stream<Item = Result<pb::AppendObjectMessage, Status>> + Unpin,
+{
+    let receive_started = Instant::now();
+    let mut sample_started = receive_started;
+    let mut received_bytes = 0u64;
+    let mut chunks = 0u64;
+    let mut hasher = Sha256::new();
+    let mut finish = None;
+    let receive_result = async {
+        while let Some(message) = next_append_message(&mut stream).await? {
+            match message.payload.ok_or_else(|| {
+                Status::invalid_argument("append stream message is missing payload")
+            })? {
+                pb::append_object_message::Payload::Chunk(chunk) => {
+                    if finish.is_some() {
+                        return Err(Status::invalid_argument(
+                            "append stream has chunk after finish",
+                        ));
+                    }
+                    ensure_same_session(&chunk.session_id, session_id)?;
+                    let chunk_len = chunk.data.len() as u64;
+                    let next = received_bytes.checked_add(chunk_len).ok_or_else(|| {
+                        Status::invalid_argument("append received byte count overflows u64")
+                    })?;
+                    if next > declared_size_bytes {
+                        return Err(Status::invalid_argument(format!(
+                            "append body exceeds declared_size_bytes {declared_size_bytes}"
+                        )));
+                    }
+                    hasher.update(&chunk.data);
+                    producer.push(&chunk.data).await?;
+                    received_bytes = next;
+                    chunks = chunks.saturating_add(1);
+                    if sample_started.elapsed() >= Duration::from_secs(1) {
+                        crate::append_ring::log_ring_sample(
+                            session_id,
+                            &control,
+                            received_bytes,
+                            receive_started,
+                            sample_started.elapsed(),
+                        );
+                        sample_started = Instant::now();
+                    }
+                }
+                pb::append_object_message::Payload::Finish(next_finish) => {
+                    if finish.is_some() {
+                        return Err(Status::invalid_argument(
+                            "append stream has more than one finish message",
+                        ));
+                    }
+                    ensure_same_session(&next_finish.session_id, session_id)?;
+                    finish = Some(next_finish);
+                }
+                pb::append_object_message::Payload::Start(_) => {
+                    return Err(Status::invalid_argument(
+                        "append stream has more than one start message",
+                    ));
+                }
+            }
+        }
+        let finish = finish
+            .ok_or_else(|| Status::invalid_argument("append stream must end with Finish"))?;
+        if received_bytes != declared_size_bytes {
+            return Err(Status::invalid_argument(format!(
+                "append received {received_bytes} bytes but declared_size_bytes is {declared_size_bytes}"
+            )));
+        }
+        let finish_digest = expected_content_sha256(&finish.expected_content_sha256)?;
+        if finish_digest.is_some_and(|digest| digest != start_digest) {
+            return Err(Status::invalid_argument(
+                "Start and Finish expected_content_sha256 values disagree",
+            ));
+        }
+        let actual = hasher.finalize();
+        if actual.as_slice() != start_digest {
+            return Err(Status::invalid_argument(format!(
+                "append payload SHA-256 {} does not match Start expected_content_sha256 {}",
+                bytes_to_hex(actual.as_slice()),
+                bytes_to_hex(&start_digest)
+            )));
+        }
+        Ok(OverlapReceiveReport {
+            bytes: received_bytes,
+            chunks,
+        })
+    }
+    .await;
+
+    match receive_result {
+        Ok(report) => {
+            producer.finish().await?;
+            crate::append_ring::log_ring_sample(
+                session_id,
+                &control,
+                report.bytes,
+                receive_started,
+                sample_started.elapsed(),
+            );
+            Ok(report)
+        }
+        Err(status) => {
+            producer.abort(&status).await;
+            Err(status)
+        }
     }
 }
 
@@ -3246,6 +3513,19 @@ fn expected_content_sha256(value: &[u8]) -> Result<Option<[u8; 32]>, Status> {
             Status::invalid_argument("expected_content_sha256 must be 32 bytes when supplied")
         })
     }
+}
+
+fn overlap_append_eligible(
+    mode: remanence_state::AppendStagingMode,
+    start: &pb::AppendObjectStart,
+    start_digest: Option<&[u8; 32]>,
+) -> bool {
+    mode == remanence_state::AppendStagingMode::Overlap
+        && !start.caller_object_id.trim().is_empty()
+        && start.declared_size_bytes != 0
+        && start_digest.is_some()
+        && start.source_replay_capability == pb::SourceReplayCapability::ReplayFromStart as i32
+        && start.body_format_manifest.is_empty()
 }
 
 fn archive_path_from_start(start: &pb::AppendObjectStart) -> PathBuf {
@@ -4770,6 +5050,7 @@ fn alarm_record_to_proto(record: remanence_state::AlarmRecord) -> pb::Alarm {
 mod tests {
     use std::collections::{BTreeMap, HashSet};
     use std::fmt;
+    use std::io::Read as _;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex};
 
@@ -5307,6 +5588,30 @@ mod tests {
                     caller_metadata: HashMap::new(),
                     declared_size_bytes,
                     body_format_manifest: Vec::new(),
+                    expected_content_sha256: Vec::new(),
+                    source_replay_capability: pb::SourceReplayCapability::Unspecified as i32,
+                },
+            )),
+        }
+    }
+
+    fn append_chunk_message(session_id: Uuid, data: Vec<u8>) -> pb::AppendObjectMessage {
+        pb::AppendObjectMessage {
+            payload: Some(pb::append_object_message::Payload::Chunk(
+                pb::AppendObjectChunk {
+                    session_id: session_id.as_bytes().to_vec(),
+                    data,
+                },
+            )),
+        }
+    }
+
+    fn append_finish_message(session_id: Uuid, digest: [u8; 32]) -> pb::AppendObjectMessage {
+        pb::AppendObjectMessage {
+            payload: Some(pb::append_object_message::Payload::Finish(
+                pb::AppendObjectFinish {
+                    session_id: session_id.as_bytes().to_vec(),
+                    expected_content_sha256: digest.to_vec(),
                 },
             )),
         }
@@ -5399,6 +5704,148 @@ mod tests {
             append_spool_cap(u64::MAX),
             crate::write_owner::SPOOL_MAX_BYTES
         );
+    }
+
+    #[test]
+    fn overlap_admission_compatibility_table_routes_deterministically() {
+        let digest = [0x44; 32];
+        let eligible = pb::AppendObjectStart {
+            session_id: Uuid::new_v4().as_bytes().to_vec(),
+            caller_object_id: "caller-object".into(),
+            caller_metadata: HashMap::new(),
+            declared_size_bytes: 123,
+            body_format_manifest: Vec::new(),
+            expected_content_sha256: digest.to_vec(),
+            source_replay_capability: pb::SourceReplayCapability::ReplayFromStart as i32,
+        };
+        assert!(overlap_append_eligible(
+            remanence_state::AppendStagingMode::Overlap,
+            &eligible,
+            Some(&digest)
+        ));
+        assert!(!overlap_append_eligible(
+            remanence_state::AppendStagingMode::Serial,
+            &eligible,
+            Some(&digest)
+        ));
+
+        let mut missing_id = eligible.clone();
+        missing_id.caller_object_id.clear();
+        let mut unknown_size = eligible.clone();
+        unknown_size.declared_size_bytes = 0;
+        let mut no_replay = eligible.clone();
+        no_replay.source_replay_capability = pb::SourceReplayCapability::Unspecified as i32;
+        for fallback in [&missing_id, &unknown_size, &no_replay] {
+            assert!(!overlap_append_eligible(
+                remanence_state::AppendStagingMode::Overlap,
+                fallback,
+                Some(&digest)
+            ));
+        }
+        assert!(!overlap_append_eligible(
+            remanence_state::AppendStagingMode::Overlap,
+            &eligible,
+            None
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overlap_receiver_preserves_bytes_and_accepts_only_the_binding_digest() {
+        let session_id = Uuid::new_v4();
+        let payload = b"receiver and RAO writer observe the same plaintext".to_vec();
+        let digest: [u8; 32] = Sha256::digest(&payload).into();
+        let capacity = crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
+        let manager = crate::io_memory::IoMemoryReservation::new(capacity).expect("manager");
+        let (producer, mut consumer, control) = crate::append_ring::create_append_ring(
+            &manager,
+            capacity,
+            90,
+            25,
+            payload.len() as u64,
+        )
+        .expect("ring");
+        let stream = tokio_stream::iter([
+            Ok(append_chunk_message(session_id, payload.clone())),
+            Ok(append_finish_message(session_id, digest)),
+        ]);
+        let receive = tokio::spawn(receive_overlap_messages(
+            stream,
+            producer,
+            session_id,
+            payload.len() as u64,
+            digest,
+            control,
+        ));
+        let consumed = tokio::task::spawn_blocking(move || {
+            let mut bytes = Vec::new();
+            consumer.read_to_end(&mut bytes).expect("consume ring");
+            bytes
+        });
+
+        let report = receive.await.expect("receive task").expect("valid Finish");
+        assert_eq!(report.bytes, payload.len() as u64);
+        assert_eq!(report.chunks, 1);
+        assert_eq!(consumed.await.expect("consumer task"), payload);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overlap_receiver_rejects_finish_or_observed_digest_disagreement() {
+        for mismatch in ["finish", "observed"] {
+            let session_id = Uuid::new_v4();
+            let payload = format!("payload for {mismatch}").into_bytes();
+            let actual_digest: [u8; 32] = Sha256::digest(&payload).into();
+            let binding_digest = if mismatch == "observed" {
+                [0x7b; 32]
+            } else {
+                actual_digest
+            };
+            let finish_digest = if mismatch == "finish" {
+                [0x8c; 32]
+            } else {
+                binding_digest
+            };
+            let capacity = crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
+            let manager = crate::io_memory::IoMemoryReservation::new(capacity).expect("manager");
+            let (producer, mut consumer, control) = crate::append_ring::create_append_ring(
+                &manager,
+                capacity,
+                90,
+                25,
+                payload.len() as u64,
+            )
+            .expect("ring");
+            let stream = tokio_stream::iter([
+                Ok(append_chunk_message(session_id, payload.clone())),
+                Ok(append_finish_message(session_id, finish_digest)),
+            ]);
+            let receive = tokio::spawn(receive_overlap_messages(
+                stream,
+                producer,
+                session_id,
+                payload.len() as u64,
+                binding_digest,
+                control,
+            ));
+            let consumer_task = tokio::task::spawn_blocking(move || {
+                let mut bytes = Vec::new();
+                consumer
+                    .read_to_end(&mut bytes)
+                    .expect_err("invalid Finish reaches consumer")
+            });
+
+            let status = receive
+                .await
+                .expect("receive task")
+                .expect_err("digest disagreement must reject");
+            assert_eq!(status.code(), tonic::Code::InvalidArgument);
+            let error = consumer_task.await.expect("consumer task");
+            let expected = if mismatch == "finish" {
+                "disagree"
+            } else {
+                "payload SHA-256"
+            };
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]
@@ -7401,7 +7848,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: " camera.copy-a ".to_string(),
-                source_path: source_path.clone(),
+                source: crate::WriteObjectSource::Path(source_path.clone()),
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-pool-core".to_string(),
                 expected_content_sha256: None,
@@ -7509,7 +7956,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path,
+                source: crate::WriteObjectSource::Path(source_path),
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-no-parity".to_string(),
                 expected_content_sha256: None,
@@ -7597,7 +8044,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path: source_path.clone(),
+                source: crate::WriteObjectSource::Path(source_path.clone()),
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-batched-image".to_string(),
                 expected_content_sha256: None,
@@ -7639,7 +8086,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path,
+                source: crate::WriteObjectSource::Path(source_path),
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-serial-image".to_string(),
                 expected_content_sha256: None,
@@ -7698,7 +8145,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path,
+                source: crate::WriteObjectSource::Path(source_path),
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-partial-batch".to_string(),
                 expected_content_sha256: None,
@@ -7754,7 +8201,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path,
+                source: crate::WriteObjectSource::Path(source_path),
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-position-drift".to_string(),
                 expected_content_sha256: None,
@@ -7807,7 +8254,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path,
+                source: crate::WriteObjectSource::Path(source_path),
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-encrypted-no-parity".to_string(),
                 expected_content_sha256: None,
@@ -7904,7 +8351,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path,
+                source: crate::WriteObjectSource::Path(source_path),
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-block-mismatch".to_string(),
                 expected_content_sha256: None,
@@ -7950,7 +8397,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path: selected_path,
+                source: crate::WriteObjectSource::Path(selected_path),
                 archive_path: "selected-payload.bin".into(),
                 caller_object_id: "caller-selected-block-mismatch".to_string(),
                 expected_content_sha256: None,
@@ -7997,7 +8444,7 @@ BCw3Wyv2UWY=
             &plaintext_cfg,
             WriteObjectToPoolRequest {
                 pool_id: "custom-plain".to_string(),
-                source_path: plaintext_path,
+                source: crate::WriteObjectSource::Path(plaintext_path),
                 archive_path: "plain.bin".into(),
                 caller_object_id: "caller-custom-block-plain".to_string(),
                 expected_content_sha256: None,
@@ -8076,7 +8523,7 @@ BCw3Wyv2UWY=
             &encrypted_cfg,
             WriteObjectToPoolRequest {
                 pool_id: "custom-encrypted".to_string(),
-                source_path: encrypted_path,
+                source: crate::WriteObjectSource::Path(encrypted_path),
                 archive_path: "secret.bin".into(),
                 caller_object_id: "caller-custom-block-encrypted".to_string(),
                 expected_content_sha256: None,
@@ -8162,7 +8609,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path,
+                source: crate::WriteObjectSource::Path(source_path),
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-encrypted-transfer-fail".to_string(),
                 expected_content_sha256: None,
@@ -8217,7 +8664,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path,
+                source: crate::WriteObjectSource::Path(source_path),
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-plaintext-transfer-fail".to_string(),
                 expected_content_sha256: None,
@@ -8275,7 +8722,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path: first_path,
+                source: crate::WriteObjectSource::Path(first_path),
                 archive_path: "first.bin".into(),
                 caller_object_id: "caller-retire-first".to_string(),
                 expected_content_sha256: None,
@@ -8371,7 +8818,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path: second_path,
+                source: crate::WriteObjectSource::Path(second_path),
                 archive_path: "second.bin".into(),
                 caller_object_id: "caller-retire-second".to_string(),
                 expected_content_sha256: None,
@@ -8422,7 +8869,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path: first_path,
+                source: crate::WriteObjectSource::Path(first_path),
                 archive_path: "first.bin".into(),
                 caller_object_id: "caller-no-parity-first".to_string(),
                 expected_content_sha256: None,
@@ -8441,7 +8888,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path: second_path,
+                source: crate::WriteObjectSource::Path(second_path),
                 archive_path: "second.bin".into(),
                 caller_object_id: "caller-no-parity-second".to_string(),
                 expected_content_sha256: None,
@@ -8533,7 +8980,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path: source_path.clone(),
+                source: crate::WriteObjectSource::Path(source_path.clone()),
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-replay".to_string(),
                 expected_content_sha256: None,
@@ -8551,7 +8998,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path,
+                source: crate::WriteObjectSource::Path(source_path),
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-replay".to_string(),
                 expected_content_sha256: None,
@@ -8603,7 +9050,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path: first_path,
+                source: crate::WriteObjectSource::Path(first_path),
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-conflict".to_string(),
                 expected_content_sha256: None,
@@ -8620,7 +9067,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path: second_path,
+                source: crate::WriteObjectSource::Path(second_path),
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-conflict".to_string(),
                 expected_content_sha256: None,
@@ -8662,6 +9109,66 @@ BCw3Wyv2UWY=
     }
 
     #[test]
+    fn streamed_caller_id_digest_conflict_rejects_before_any_tape_motion() {
+        let mut index = test_index();
+        project_pool(&mut index, "scenario-a");
+        project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
+        let source_dir = temp_dir("remanence-api-streamed-caller-conflict");
+        let committed_path = source_dir.join("committed.bin");
+        let committed_payload = b"committed overlap identity".to_vec();
+        std::fs::write(&committed_path, &committed_payload).expect("write committed payload");
+        let cfg = pool_config("scenario-a");
+        let mut tape_sink = VecBlockSink::new();
+        write_object_to_pool(
+            &mut index,
+            &mut tape_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source: crate::WriteObjectSource::Path(committed_path),
+                archive_path: "payload.bin".into(),
+                caller_object_id: "streamed-conflict".to_string(),
+                expected_content_sha256: None,
+                representation: PoolWriteRepresentation::Plaintext,
+            },
+        )
+        .expect("seed committed object");
+        let blocks_before_conflict = tape_sink.blocks.len();
+        let conflicting_digest: [u8; 32] = sha256_bytes(b"different streamed bytes")
+            .try_into()
+            .expect("SHA-256 length");
+        let ring_bytes = crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
+        let manager = crate::io_memory::IoMemoryReservation::new(ring_bytes).expect("manager");
+        let (_producer, consumer, control) =
+            crate::append_ring::create_append_ring(&manager, ring_bytes, 90, 25, ring_bytes)
+                .expect("ring");
+        let request = WriteObjectToPoolRequest {
+            pool_id: "scenario-a".to_string(),
+            source: crate::WriteObjectSource::Streamed(crate::StreamedWriteSource::new(
+                consumer,
+                ring_bytes,
+                conflicting_digest,
+                control,
+            )),
+            archive_path: "payload.bin".into(),
+            caller_object_id: "streamed-conflict".to_string(),
+            expected_content_sha256: Some(conflicting_digest),
+            representation: PoolWriteRepresentation::Plaintext,
+        };
+        let error = crate::pool_write::maybe_replay_pool_write(&index, &cfg, &request)
+            .expect_err("different streamed digest must conflict");
+        assert!(matches!(
+            error,
+            PoolWriteError::CallerObjectIdConflict { .. }
+        ));
+        assert_eq!(
+            tape_sink.blocks.len(),
+            blocks_before_conflict,
+            "identity conflict must not issue another tape write"
+        );
+    }
+
+    #[test]
     fn pool_write_empty_caller_object_id_remains_non_idempotent() {
         let mut index = test_index();
         project_pool(&mut index, "scenario-a");
@@ -8678,7 +9185,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path: source_path.clone(),
+                source: crate::WriteObjectSource::Path(source_path.clone()),
                 archive_path: "payload.bin".into(),
                 caller_object_id: String::new(),
                 expected_content_sha256: None,
@@ -8692,7 +9199,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path,
+                source: crate::WriteObjectSource::Path(source_path),
                 archive_path: "payload.bin".into(),
                 caller_object_id: String::new(),
                 expected_content_sha256: None,
@@ -8736,7 +9243,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path: first_path,
+                source: crate::WriteObjectSource::Path(first_path),
                 archive_path: "first.bin".into(),
                 caller_object_id: "caller-parity-first".to_string(),
                 expected_content_sha256: None,
@@ -8753,7 +9260,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path: second_path,
+                source: crate::WriteObjectSource::Path(second_path),
                 archive_path: "second.bin".into(),
                 caller_object_id: "caller-parity-second".to_string(),
                 expected_content_sha256: None,
@@ -8801,7 +9308,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source_path,
+                source: crate::WriteObjectSource::Path(source_path),
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-hash-mismatch".to_string(),
                 expected_content_sha256: Some(wrong_hash),
@@ -8838,7 +9345,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "seal.pool".to_string(),
-                source_path,
+                source: crate::WriteObjectSource::Path(source_path),
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-seal".to_string(),
                 expected_content_sha256: None,
@@ -8895,7 +9402,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "camera.copy-a".to_string(),
-                source_path: source_dir,
+                source: crate::WriteObjectSource::Path(source_dir),
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-non-regular".to_string(),
                 expected_content_sha256: None,
@@ -9818,25 +10325,34 @@ BCw3Wyv2UWY=
             while let Some(cmd) = drive_rx.recv().await {
                 match cmd {
                     crate::write_owner::DriveCommand::AppendFinish {
-                        spool_path,
+                        source,
                         live_write_counter,
                         reply,
                         ..
                     } => {
+                        let spool_path = match source {
+                            crate::WriteObjectSource::Path(path) => path,
+                            crate::WriteObjectSource::Streamed(_) => {
+                                panic!("test expected path-backed append source")
+                            }
+                        };
                         let counter = live_write_counter.expect("live write counter");
                         counter.record_write_bytes(3);
                         counter.record_write_bytes(5);
                         let _ = std::fs::remove_file(spool_path);
-                        let _ = reply.send(Ok(pb::ObjectRecord {
-                            object_id: Uuid::nil().to_string().into_bytes(),
-                            caller_object_id: "caller-object".to_string(),
-                            content_sha256: vec![0x11; 32],
-                            logical_size_bytes: 8,
-                            body_format: "rao-v1".to_string(),
-                            caller_metadata: Default::default(),
-                            created_at: None,
-                            copies: Vec::new(),
-                            append_commit_info: None,
+                        let _ = reply.send(Ok(crate::write_owner::AppendFinishOutcome {
+                            record: pb::ObjectRecord {
+                                object_id: Uuid::nil().to_string().into_bytes(),
+                                caller_object_id: "caller-object".to_string(),
+                                content_sha256: vec![0x11; 32],
+                                logical_size_bytes: 8,
+                                body_format: "rao-v1".to_string(),
+                                caller_metadata: Default::default(),
+                                created_at: None,
+                                copies: Vec::new(),
+                                append_commit_info: None,
+                            },
+                            replay: false,
                         }));
                     }
                     _ => panic!("unexpected drive command"),
@@ -9864,6 +10380,100 @@ BCw3Wyv2UWY=
         assert_eq!(counter.write_bytes(), 8);
 
         actor.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overlap_idempotent_replay_cancels_the_live_receive_and_returns_the_record() {
+        let mut state = ApiState::new(test_index());
+        let session_id = Uuid::new_v4();
+        let bay = 0x0102;
+        let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
+        let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
+        let reservations = Arc::new(std::collections::HashMap::from([(
+            bay,
+            std::sync::atomic::AtomicBool::new(false),
+        )]));
+        let pool = crate::write_owner::DrivePool::new(
+            changer_tx,
+            std::collections::HashMap::from([(bay, drive_tx)]),
+            reservations,
+        );
+        pool.record_session(
+            session_id,
+            crate::write_owner::MountedSession {
+                bay,
+                library_serial: "LIB-A".to_string(),
+                barcode: Some("AOX002L9".to_string()),
+                home_slot: Some(0x0401),
+                tape_uuid: [0xAC; 16],
+                drive_uuid: None,
+            },
+        );
+        state.drive_pool = Some(pool);
+        state.append_staging_mode = remanence_state::AppendStagingMode::Overlap;
+        let ring_bytes = crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
+        state.append_ring_bytes = ring_bytes;
+        state.append_ring_high_pct = 50;
+        state.append_ring_low_pct = 25;
+        state.io_memory = crate::io_memory::IoMemoryReservation::new(ring_bytes).expect("manager");
+
+        let replayed_id = Uuid::new_v4();
+        let actor = tokio::spawn(async move {
+            let command = drive_rx.recv().await.expect("append command");
+            let crate::write_owner::DriveCommand::AppendFinish { source, reply, .. } = command
+            else {
+                panic!("expected append command");
+            };
+            assert!(matches!(source, crate::WriteObjectSource::Streamed(_)));
+            let _ = reply.send(Ok(crate::write_owner::AppendFinishOutcome {
+                record: pb::ObjectRecord {
+                    object_id: replayed_id.as_bytes().to_vec(),
+                    caller_object_id: "caller-object".to_string(),
+                    content_sha256: vec![0x11; 32],
+                    logical_size_bytes: 2 * ring_bytes,
+                    body_format: "rao-v1".to_string(),
+                    caller_metadata: Default::default(),
+                    created_at: None,
+                    copies: Vec::new(),
+                    append_commit_info: None,
+                },
+                replay: true,
+            }));
+        });
+
+        let payload = vec![0x5a; 2 * crate::append_ring::APPEND_RING_SLAB_BYTES];
+        let digest: [u8; 32] = Sha256::digest(&payload).into();
+        let mut start_message = append_start_message(session_id, payload.len() as u64);
+        let Some(pb::append_object_message::Payload::Start(start_fields)) =
+            start_message.payload.as_mut()
+        else {
+            panic!("start helper must emit Start");
+        };
+        start_fields.expected_content_sha256 = digest.to_vec();
+        start_fields.source_replay_capability = pb::SourceReplayCapability::ReplayFromStart as i32;
+        let messages = vec![
+            Ok(start_message),
+            Ok(append_chunk_message(
+                session_id,
+                payload[..crate::append_ring::APPEND_RING_SLAB_BYTES].to_vec(),
+            )),
+            Ok(append_chunk_message(
+                session_id,
+                payload[crate::append_ring::APPEND_RING_SLAB_BYTES..].to_vec(),
+            )),
+            Ok(append_finish_message(session_id, digest)),
+        ];
+        let api = WriteSessionApi { state };
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            api.append_object_stream(tokio_stream::iter(messages)),
+        )
+        .await
+        .expect("replay must not deadlock on a full receive ring")
+        .expect("committed replay returns success")
+        .into_inner();
+        assert_eq!(response.object_id, replayed_id.as_bytes());
+        actor.await.expect("actor task");
     }
 
     #[test]

@@ -148,12 +148,12 @@ pub(crate) enum DriveCommand {
     },
     AppendFinish {
         session_id: Uuid,
-        spool_path: PathBuf,
+        source: crate::WriteObjectSource,
         archive_path: PathBuf,
         caller_object_id: String,
         expected_content_sha256: Option<[u8; 32]>,
         live_write_counter: Option<Arc<crate::DriveByteCounters>>,
-        reply: oneshot::Sender<Result<pb::ObjectRecord, Status>>,
+        reply: oneshot::Sender<Result<AppendFinishOutcome, Status>>,
     },
     Close {
         session_id: Uuid,
@@ -191,6 +191,12 @@ pub(crate) enum DriveCommand {
         session_id: Uuid,
         reply: oneshot::Sender<Result<pb::ReadSession, Status>>,
     },
+}
+
+#[derive(Debug)]
+pub(crate) struct AppendFinishOutcome {
+    pub(crate) record: pb::ObjectRecord,
+    pub(crate) replay: bool,
 }
 
 #[derive(Debug)]
@@ -956,10 +962,8 @@ fn drive_loop(
                     });
                 let _ = reply.send(result);
             }
-            DriveCommand::AppendFinish {
-                reply, spool_path, ..
-            } => {
-                let _ = std::fs::remove_file(spool_path);
+            DriveCommand::AppendFinish { reply, source, .. } => {
+                source.remove_completed_path();
                 let _ = reply.send(Err(Status::failed_precondition("no active write session")));
             }
             DriveCommand::Get { reply, .. } => {
@@ -1000,10 +1004,8 @@ fn drain_failed_drive_commands(mut rx: mpsc::Receiver<DriveCommand>, message: St
             DriveCommand::Heartbeat { reply, .. } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
-            DriveCommand::AppendFinish {
-                reply, spool_path, ..
-            } => {
-                let _ = std::fs::remove_file(spool_path);
+            DriveCommand::AppendFinish { reply, source, .. } => {
+                source.remove_completed_path();
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
             DriveCommand::Close { reply, .. } | DriveCommand::Abort { reply, .. } => {
@@ -2282,7 +2284,7 @@ fn handle_drive_open_write(
         match cmd {
             DriveCommand::AppendFinish {
                 session_id: requested,
-                spool_path,
+                source,
                 archive_path,
                 caller_object_id,
                 expected_content_sha256,
@@ -2290,21 +2292,24 @@ fn handle_drive_open_write(
                 reply,
             } => {
                 if requested != session_id {
-                    let _ = std::fs::remove_file(spool_path);
+                    source.remove_completed_path();
                     let _ = reply.send(Err(Status::not_found("write session not found")));
                     continue;
                 }
                 if let Err(status) = append_gate.check() {
-                    let _ = std::fs::remove_file(spool_path);
+                    source.remove_completed_path();
                     let _ = reply.send(Err(status));
                     continue;
                 }
-                let logical_size = std::fs::metadata(&spool_path)
-                    .map(|meta| meta.len())
-                    .unwrap_or(0);
+                let logical_size = source.size_bytes().unwrap_or(0);
+                let stream_control = source.stream_control();
+                let cleanup_path = match &source {
+                    crate::WriteObjectSource::Path(path) => Some(path.clone()),
+                    crate::WriteObjectSource::Streamed(_) => None,
+                };
                 let request = WriteObjectToPoolRequest {
                     pool_id: pool_cfg.id.clone(),
-                    source_path: spool_path.clone(),
+                    source,
                     archive_path,
                     caller_object_id,
                     expected_content_sha256,
@@ -2329,7 +2334,9 @@ fn handle_drive_open_write(
                     Err(err) => Err(err),
                 };
                 let append_elapsed = append_started.elapsed();
-                let _ = std::fs::remove_file(&spool_path);
+                if let Some(path) = cleanup_path {
+                    let _ = std::fs::remove_file(path);
+                }
                 match result {
                     Ok(result) => {
                         let replay = result.is_replay();
@@ -2356,10 +2363,19 @@ fn handle_drive_open_write(
                             },
                             "remanence_write_diag",
                         );
-                        let _ = reply.send(Ok(result.object.to_proto()));
+                        let _ = reply.send(Ok(AppendFinishOutcome {
+                            record: result.object.to_proto(),
+                            replay,
+                        }));
                     }
                     Err(err) => {
-                        append_gate.record_failure();
+                        if stream_control
+                            .as_ref()
+                            .map(|control| control.tape_started())
+                            .unwrap_or(true)
+                        {
+                            append_gate.record_failure();
+                        }
                         tracing::info!(
                             target: "remanence_write_diag",
                             phase = "drive_append_total",
@@ -2969,10 +2985,8 @@ fn handle_drive_open_read(
                     "read session already active",
                 )));
             }
-            DriveCommand::AppendFinish {
-                reply, spool_path, ..
-            } => {
-                let _ = std::fs::remove_file(spool_path);
+            DriveCommand::AppendFinish { reply, source, .. } => {
+                source.remove_completed_path();
                 let _ = reply.send(Err(Status::failed_precondition(
                     "active session is a read session",
                 )));
@@ -7041,7 +7055,7 @@ mod tests {
         drive_tx
             .send(DriveCommand::AppendFinish {
                 session_id: write_session_id,
-                spool_path: spool,
+                source: crate::WriteObjectSource::Path(spool),
                 archive_path: PathBuf::from("../invalid"),
                 caller_object_id: "failure-test-object".to_string(),
                 expected_content_sha256: None,
