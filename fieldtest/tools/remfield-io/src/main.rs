@@ -124,6 +124,10 @@ struct WriteArgs {
 
     #[arg(long, default_value_t = DEFAULT_CHUNK_BYTES)]
     chunk_bytes: usize,
+
+    /// Omit overlap admission proofs and force the legacy full-spool path.
+    #[arg(long)]
+    serial: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -340,6 +344,15 @@ async fn write_command(endpoint: &str, args: WriteArgs, no_wait: bool) -> AppRes
         )));
     }
 
+    // This field client has only a local file, so overlap mode pays a pre-read
+    // before Start. A production caller should pass its already-known
+    // immutable digest instead of adding another read on the Remanence host.
+    let content_sha256 = if args.serial {
+        None
+    } else {
+        Some(hash_file_before_start(&args.file).await?)
+    };
+
     let channel = connect_daemon(endpoint).await?;
     let library_uuid = resolve_library_uuid(channel.clone(), args.library.as_deref()).await?;
     let mut write_client =
@@ -357,7 +370,8 @@ async fn write_command(endpoint: &str, args: WriteArgs, no_wait: bool) -> AppRes
     .await?;
     let open_ms = duration_ms(open_started.elapsed());
 
-    let append_input = AppendInput::file(&args.file, args.chunk_bytes, metadata.len());
+    let append_input =
+        AppendInput::file(&args.file, args.chunk_bytes, metadata.len(), content_sha256);
     let transfer_started = Instant::now();
     let append_result = append_object(&mut write_client, &session_id, append_input).await;
     let transfer_ms = duration_ms(transfer_started.elapsed());
@@ -568,6 +582,8 @@ struct AppendInput {
     archive_path: String,
     declared_size_bytes: u64,
     chunk_bytes: usize,
+    start_digest: Option<[u8; 32]>,
+    replay_from_start: bool,
     source: AppendSource,
 }
 
@@ -578,7 +594,12 @@ enum AppendSource {
 }
 
 impl AppendInput {
-    fn file(file: &Path, chunk_bytes: usize, declared_size_bytes: u64) -> Self {
+    fn file(
+        file: &Path,
+        chunk_bytes: usize,
+        declared_size_bytes: u64,
+        content_sha256: Option<[u8; 32]>,
+    ) -> Self {
         let archive_path = file
             .file_name()
             .and_then(|name| name.to_str())
@@ -590,6 +611,8 @@ impl AppendInput {
             archive_path,
             declared_size_bytes,
             chunk_bytes,
+            start_digest: content_sha256,
+            replay_from_start: content_sha256.is_some(),
             source: AppendSource::File(file.to_path_buf()),
         }
     }
@@ -605,6 +628,8 @@ impl AppendInput {
             archive_path: format!("generated-object-{object_index}.bin"),
             declared_size_bytes,
             chunk_bytes,
+            start_digest: None,
+            replay_from_start: false,
             source: AppendSource::Generated { object_index },
         }
     }
@@ -621,6 +646,7 @@ async fn append_object(
     let sender = tokio::spawn(async move {
         let mut caller_metadata = HashMap::new();
         caller_metadata.insert("path".to_string(), input.archive_path);
+        let start_digest = input.start_digest;
         tx.send(pb::AppendObjectMessage {
             payload: Some(pb::append_object_message::Payload::Start(
                 pb::AppendObjectStart {
@@ -629,6 +655,14 @@ async fn append_object(
                     caller_metadata,
                     declared_size_bytes: input.declared_size_bytes,
                     body_format_manifest: Vec::new(),
+                    expected_content_sha256: start_digest
+                        .map(|digest| digest.to_vec())
+                        .unwrap_or_default(),
+                    source_replay_capability: if input.replay_from_start {
+                        pb::SourceReplayCapability::ReplayFromStart as i32
+                    } else {
+                        pb::SourceReplayCapability::Unspecified as i32
+                    },
                 },
             )),
         })
@@ -664,7 +698,9 @@ async fn append_object(
             payload: Some(pb::append_object_message::Payload::Finish(
                 pb::AppendObjectFinish {
                     session_id: session_id_for_task,
-                    expected_content_sha256: hasher.finalize().to_vec(),
+                    expected_content_sha256: start_digest
+                        .map(|digest| digest.to_vec())
+                        .unwrap_or_else(|| hasher.finalize().to_vec()),
                 },
             )),
         })
@@ -680,12 +716,32 @@ async fn append_object(
     map_append_completion(append.map(|response| response.into_inner()), sender_result)
 }
 
+async fn hash_file_before_start(path: &Path) -> AppResult<[u8; 32]> {
+    let mut input = tokio::fs::File::open(path)
+        .await
+        .map_err(|error| AppError::new(format!("open {} for hashing: {error}", path.display())))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; DEFAULT_CHUNK_BYTES];
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .await
+            .map_err(|error| AppError::new(format!("hash {}: {error}", path.display())))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
+}
+
 fn map_append_completion<T>(
     append: Result<T, tonic::Status>,
     sender_result: AppResult<()>,
 ) -> AppResult<T> {
     match (append, sender_result) {
         (Ok(response), Ok(())) => Ok(response),
+        (Ok(response), Err(error)) if error.is_append_stream_closed() => Ok(response),
         (Ok(_), Err(error)) => Err(error),
         (Err(status), Ok(())) => Err(AppError::from(status)),
         (Err(status), Err(error)) if error.is_append_stream_closed() => Err(AppError::from(status)),
@@ -1411,6 +1467,24 @@ mod tests {
     }
 
     #[test]
+    fn write_serial_flag_selects_legacy_ab_path() {
+        let cli = Cli::try_parse_from([
+            "remfield-io",
+            "write",
+            "--file",
+            "/tmp/payload.bin",
+            "--pool",
+            "copy-a",
+            "--serial",
+        ])
+        .expect("parse write --serial");
+        let Command::Write(write) = cli.command else {
+            panic!("expected write command");
+        };
+        assert!(write.serial);
+    }
+
+    #[test]
     fn readiness_fence_parser_accepts_new_and_existing_fence_wording() {
         let operation_id = Uuid::from_u128(0x42);
         let created = format!(
@@ -1587,6 +1661,16 @@ mod tests {
             .to_string()
             .contains("create append spool in /ram/spool"));
         assert!(!err.to_string().contains("append stream closed"));
+    }
+
+    #[test]
+    fn append_completion_accepts_early_success_for_idempotent_replay() {
+        let result = map_append_completion(
+            Ok("committed-object"),
+            Err(AppError::new("append stream closed while sending Chunk")),
+        )
+        .expect("an early successful replay response is authoritative");
+        assert_eq!(result, "committed-object");
     }
 
     #[test]
