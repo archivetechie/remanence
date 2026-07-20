@@ -58,6 +58,7 @@ use crate::{append_mode_for_tape_file_number, bytes_to_hex, pb, timestamp_from_r
 
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 const VERIFY_BOOTSTRAP_READ_BYTES: usize = 1024 * 1024;
+const NO_PARITY_BOOTSTRAP_BLOCKS: u64 = 1;
 
 /// Binary UUID used for physical tape identifiers and object identifiers.
 pub type TapeUuid = [u8; 16];
@@ -676,6 +677,25 @@ struct NoParityAppendContext {
 }
 
 impl NoParityAppendContext {
+    /// Return the physical EOD LBA where the next no-parity tape file starts.
+    ///
+    /// `previous_total_committed_ordinals` counts object data only. A dense
+    /// prefix ending before `tape_file_number` also contains one bootstrap
+    /// block and one trailing filemark for every preceding tape file.
+    fn expected_append_lba(self) -> Result<u64, PoolWriteError> {
+        if self.fresh_tape {
+            return Ok(0);
+        }
+        self.previous_total_committed_ordinals
+            .checked_add(u64::from(self.tape_file_number))
+            .and_then(|lba| lba.checked_add(NO_PARITY_BOOTSTRAP_BLOCKS))
+            .ok_or_else(|| {
+                PoolWriteError::MissingTapeGeometry(
+                    "expected no-parity append LBA overflows u64".to_string(),
+                )
+            })
+    }
+
     fn object_total_committed_ordinals(self, object_blocks: u64) -> Result<u64, PoolWriteError> {
         self.previous_total_committed_ordinals
             .checked_add(object_blocks)
@@ -3225,18 +3245,7 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
     let PreparedPoolWrite { prepared, stored } = prepared_write;
     let tape_uuid = selected.tape_uuid;
     let append = no_parity_append_context(state, &selected)?;
-    let expected_initial_lba = if append.fresh_tape {
-        0
-    } else {
-        append
-            .previous_total_committed_ordinals
-            .checked_add(u64::from(append.tape_file_number))
-            .ok_or_else(|| {
-                PoolWriteError::MissingTapeGeometry(
-                    "expected no-parity append LBA overflows u64".to_string(),
-                )
-            })?
-    };
+    let expected_initial_lba = append.expected_append_lba()?;
     let overlap_control = prepared.overlap_control();
     let transfer_started = Instant::now();
     let write_report: Result<StreamingObjectWriteReport, PoolWriteError> =
@@ -5316,6 +5325,77 @@ mod tests {
             gated.write_block(&[0u8; 4]).expect("gated first block");
         }
         assert_eq!(sink.events, ["position", "write_block:4"]);
+    }
+
+    #[tokio::test]
+    async fn overlap_append_gate_counts_bootstrap_and_committed_trailing_filemark() {
+        let capacity = 2 * crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
+        let manager = crate::io_memory::IoMemoryReservation::new(capacity).expect("manager");
+        let (mut producer, _consumer, control) =
+            crate::append_ring::create_append_ring(&manager, capacity, 50, 25, capacity)
+                .expect("ring");
+        producer
+            .push(&vec![0x21; crate::append_ring::APPEND_RING_SLAB_BYTES])
+            .await
+            .expect("reach high prefill");
+
+        let object_blocks = 2u64;
+        let append = NoParityAppendContext {
+            tape_file_number: 2,
+            previous_total_committed_ordinals: object_blocks,
+            fresh_tape: false,
+        };
+        let expected = append.expected_append_lba().expect("expected append LBA");
+
+        let mut sink = StagedTestSink::new(2);
+        sink.write_block(&[0xb0; 4]).expect("bootstrap block");
+        sink.write_filemarks(1).expect("bootstrap filemark");
+        for _ in 0..object_blocks {
+            sink.write_block(&[0x0b; 4])
+                .expect("committed object block");
+        }
+        sink.write_filemarks(1)
+            .expect("committed object trailing filemark");
+        sink.inner.set_next_lba_for_test(0);
+        sink.events.clear();
+
+        {
+            let mut gated = OverlapBlockSink {
+                inner: &mut sink,
+                control: Arc::clone(&control),
+                expected_initial_lba: expected,
+                expected_next_lba: expected,
+                initial_position_proved: false,
+                write_started: false,
+                low_water_events: 0,
+            };
+            let observed = position_no_parity_append(&mut gated).expect("position and prove EOD");
+            assert_eq!(expected, observed.lba);
+            assert_eq!(observed.lba, 5, "block + filemark records define EOD");
+        }
+        assert_eq!(sink.events, ["space_eod"]);
+
+        sink.inner.set_next_lba_for_test(0);
+        sink.events.clear();
+        let old_fencepost = expected.checked_sub(1).expect("nonzero append LBA");
+        let mut gated = OverlapBlockSink {
+            inner: &mut sink,
+            control,
+            expected_initial_lba: old_fencepost,
+            expected_next_lba: old_fencepost,
+            initial_position_proved: false,
+            write_started: false,
+            low_water_events: 0,
+        };
+        let error = position_no_parity_append(&mut gated)
+            .expect_err("one-LBA fencepost must still fail closed");
+        assert!(
+            error.to_string().contains(&format!(
+                "expected partition 0 lba {old_fencepost}, observed partition 0 lba {expected}"
+            )),
+            "{error}"
+        );
+        assert_eq!(sink.events, ["space_eod"]);
     }
 
     #[test]
