@@ -41,8 +41,9 @@ pub use error::{
     LoadError, MoveError, OpenError, RescanError, RescanWarning, UnloadError,
 };
 pub use handle::tape_io::{
-    BlockSize, ComputedPosition, DevicePositionProof, DriveErrorCounters, MediaFamily,
-    MediaReadiness, PipelinedReadDiagnostics, PipelinedWriteDiagnostics, PositionAfter,
+    media_readiness_poll_interval, BlockSize, ComputedPosition, DevicePositionProof,
+    DriveErrorCounters, MediaFamily, MediaReadiness, MediaReadinessPoll, MediaReadinessWaitEvent,
+    MediaReadinessWaitOptions, PipelinedReadDiagnostics, PipelinedWriteDiagnostics, PositionAfter,
     ReadBatchOutcome, ReadBuffer, ReadBufferHandoff, ReadDelivery, ReadHandoffOutcome,
     ReadTerminalFlags, SequencedHandoff, SpaceKind, SpaceResult, TapeConfig, TapeIoError,
     TapePosition, WormMediaState, WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,

@@ -26,6 +26,9 @@ const DEFAULT_ENDPOINT: &str = "unix:/var/lib/rem/rem.sock";
 const DEFAULT_CHUNK_BYTES: usize = 1_048_576;
 const DEFAULT_CHUNK_BYTES_U32: u32 = 1_048_576;
 const WRITE_MANY_APPEND_FAILED_EXIT: u8 = 12;
+const DEFAULT_READY_TIMEOUT_SECONDS: u32 = 9_000;
+const DEFAULT_READY_POLL_SECONDS: u32 = 30;
+const DRIVE_BUSY_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 type AppResult<T> = Result<T, AppError>;
 
@@ -91,6 +94,10 @@ impl From<tonic::transport::Error> for AppError {
 struct Cli {
     #[arg(long, global = true, default_value = DEFAULT_ENDPOINT)]
     endpoint: String,
+
+    /// Return immediately on media-readiness fences and busy drive bays.
+    #[arg(long, global = true)]
+    no_wait: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -196,9 +203,9 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> AppResult<()> {
     match cli.command {
-        Command::Write(args) => write_command(&cli.endpoint, args).await,
-        Command::WriteMany(args) => write_many_command(&cli.endpoint, args).await,
-        Command::Read(args) => read_command(&cli.endpoint, args).await,
+        Command::Write(args) => write_command(&cli.endpoint, args, cli.no_wait).await,
+        Command::WriteMany(args) => write_many_command(&cli.endpoint, args, cli.no_wait).await,
+        Command::Read(args) => read_command(&cli.endpoint, args, cli.no_wait).await,
         Command::List(args) => list_command(&cli.endpoint, args).await,
     }
 }
@@ -217,7 +224,109 @@ async fn connect_daemon(endpoint: &str) -> AppResult<Channel> {
         .map_err(|error| AppError::new(format!("connect daemon at {endpoint}: {error}")))
 }
 
-async fn write_command(endpoint: &str, args: WriteArgs) -> AppResult<()> {
+async fn wait_before_open_retry(channel: Channel, status: &tonic::Status) -> AppResult<()> {
+    if status.code() != tonic::Code::FailedPrecondition {
+        return Err(status.clone().into());
+    }
+    if let Some(operation_id) = media_readiness_operation_id(status.message()) {
+        eprintln!(
+            "remfield-io: open fenced by media readiness operation {operation_id}; waiting up to {}s",
+            DEFAULT_READY_TIMEOUT_SECONDS
+        );
+        return wait_for_media_readiness_operation(channel, operation_id).await;
+    }
+    if drive_bay_busy(status.message()) {
+        eprintln!(
+            "remfield-io: open found a busy drive bay; retrying once after {:.0}s",
+            DRIVE_BUSY_RETRY_DELAY.as_secs_f64()
+        );
+        tokio::time::sleep(DRIVE_BUSY_RETRY_DELAY).await;
+        return Ok(());
+    }
+    Err(status.clone().into())
+}
+
+fn media_readiness_operation_id(message: &str) -> Option<Uuid> {
+    if !message.contains("media-readiness") {
+        return None;
+    }
+    message.split_ascii_whitespace().find_map(|token| {
+        let value = token.strip_prefix("operation=")?;
+        Uuid::parse_str(value.trim_matches(|ch: char| !ch.is_ascii_hexdigit() && ch != '-')).ok()
+    })
+}
+
+fn drive_bay_busy(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    (lower.contains("drive bay") && lower.contains("is busy"))
+        || lower.contains("drive-session owner is busy")
+}
+
+async fn wait_for_media_readiness_operation(channel: Channel, operation_id: Uuid) -> AppResult<()> {
+    let mut library = pb::library_service_client::LibraryServiceClient::new(channel.clone());
+    let operation = library
+        .resume_media_readiness(pb::ResumeMediaReadinessRequest {
+            operation_id: operation_id.as_bytes().to_vec(),
+            timeout_seconds: DEFAULT_READY_TIMEOUT_SECONDS,
+            poll_interval_seconds: DEFAULT_READY_POLL_SECONDS,
+        })
+        .await?
+        .into_inner();
+    let mut stream = pb::daemon_client::DaemonClient::new(channel)
+        .watch_operation(pb::GetOperationRequest {
+            operation_id: operation.operation_id,
+        })
+        .await?
+        .into_inner();
+    while let Some(status) = stream.message().await? {
+        let state =
+            pb::OperationState::try_from(status.state).unwrap_or(pb::OperationState::Unspecified);
+        let readiness = status
+            .progress
+            .get("state")
+            .map(String::as_str)
+            .unwrap_or("unknown");
+        let attempts = status
+            .progress
+            .get("attempts")
+            .map(String::as_str)
+            .unwrap_or("-");
+        let elapsed = status
+            .progress
+            .get("elapsed_seconds")
+            .map(String::as_str)
+            .unwrap_or("-");
+        eprintln!(
+            "remfield-io: media readiness operation {operation_id} state={readiness} attempts={attempts} elapsed_s={elapsed}"
+        );
+        match state {
+            pb::OperationState::Succeeded => {
+                eprintln!(
+                    "remfield-io: media readiness operation {operation_id} reached READY; retrying open once"
+                );
+                return Ok(());
+            }
+            pb::OperationState::Failed
+            | pb::OperationState::Cancelled
+            | pb::OperationState::Unknown => {
+                let summary = if status.error_summary.is_empty() {
+                    format!("finished {state:?}")
+                } else {
+                    status.error_summary
+                };
+                return Err(AppError::new(format!(
+                    "media readiness operation {operation_id} did not reach READY: {summary}"
+                )));
+            }
+            _ => {}
+        }
+    }
+    Err(AppError::new(format!(
+        "media readiness operation {operation_id} watch ended before READY"
+    )))
+}
+
+async fn write_command(endpoint: &str, args: WriteArgs, no_wait: bool) -> AppResult<()> {
     if args.chunk_bytes == 0 {
         return Err(AppError::new("--chunk-bytes must be greater than zero"));
     }
@@ -234,11 +343,18 @@ async fn write_command(endpoint: &str, args: WriteArgs) -> AppResult<()> {
     let channel = connect_daemon(endpoint).await?;
     let library_uuid = resolve_library_uuid(channel.clone(), args.library.as_deref()).await?;
     let mut write_client =
-        pb::write_session_service_client::WriteSessionServiceClient::new(channel);
+        pb::write_session_service_client::WriteSessionServiceClient::new(channel.clone());
 
     let started = Instant::now();
     let open_started = Instant::now();
-    let session_id = open_write_session(&mut write_client, &args.pool, library_uuid).await?;
+    let session_id = open_write_session(
+        channel,
+        &mut write_client,
+        &args.pool,
+        library_uuid,
+        no_wait,
+    )
+    .await?;
     let open_ms = duration_ms(open_started.elapsed());
 
     let append_input = AppendInput::file(&args.file, args.chunk_bytes, metadata.len());
@@ -278,7 +394,7 @@ async fn write_command(endpoint: &str, args: WriteArgs) -> AppResult<()> {
     Ok(())
 }
 
-async fn write_many_command(endpoint: &str, args: WriteManyArgs) -> AppResult<()> {
+async fn write_many_command(endpoint: &str, args: WriteManyArgs, no_wait: bool) -> AppResult<()> {
     if args.chunk_bytes == 0 {
         return Err(AppError::new("--chunk-bytes must be greater than zero"));
     }
@@ -299,10 +415,17 @@ async fn write_many_command(endpoint: &str, args: WriteManyArgs) -> AppResult<()
     let channel = connect_daemon(endpoint).await?;
     let library_uuid = resolve_library_uuid(channel.clone(), args.library.as_deref()).await?;
     let mut write_client =
-        pb::write_session_service_client::WriteSessionServiceClient::new(channel);
+        pb::write_session_service_client::WriteSessionServiceClient::new(channel.clone());
 
     let open_started = Instant::now();
-    let session_id = open_write_session(&mut write_client, &args.pool, library_uuid).await?;
+    let session_id = open_write_session(
+        channel,
+        &mut write_client,
+        &args.pool,
+        library_uuid,
+        no_wait,
+    )
+    .await?;
     let open_ms = duration_ms(open_started.elapsed());
 
     let mut object_records = Vec::new();
@@ -394,26 +517,36 @@ async fn write_many_command(endpoint: &str, args: WriteManyArgs) -> AppResult<()
 }
 
 async fn open_write_session(
+    channel: Channel,
     client: &mut pb::write_session_service_client::WriteSessionServiceClient<Channel>,
     pool: &str,
     library_uuid: Vec<u8>,
+    no_wait: bool,
 ) -> AppResult<Vec<u8>> {
-    Ok(client
-        .open_write_session(pb::OpenWriteSessionRequest {
-            target: Some(pb::open_write_session_request::Target::PoolTarget(
-                pb::TapePoolTarget {
-                    pool_id: pool.trim().to_string(),
-                    library_uuid,
-                    mount_if_needed: true,
-                },
-            )),
-            body_format: "rao-v1".to_string(),
-            idempotency_key: None,
-            recover_session_id: Vec::new(),
-        })
-        .await?
-        .into_inner()
-        .session_id)
+    let request = || pb::OpenWriteSessionRequest {
+        target: Some(pb::open_write_session_request::Target::PoolTarget(
+            pb::TapePoolTarget {
+                pool_id: pool.trim().to_string(),
+                library_uuid: library_uuid.clone(),
+                mount_if_needed: true,
+            },
+        )),
+        body_format: "rao-v1".to_string(),
+        idempotency_key: None,
+        recover_session_id: Vec::new(),
+    };
+    match client.open_write_session(request()).await {
+        Ok(response) => Ok(response.into_inner().session_id),
+        Err(status) if !no_wait => {
+            wait_before_open_retry(channel, &status).await?;
+            Ok(client
+                .open_write_session(request())
+                .await?
+                .into_inner()
+                .session_id)
+        }
+        Err(status) => Err(status.into()),
+    }
 }
 
 async fn close_write_session(
@@ -655,29 +788,35 @@ async fn abort_write_session(
         .await;
 }
 
-async fn read_command(endpoint: &str, args: ReadArgs) -> AppResult<()> {
+async fn read_command(endpoint: &str, args: ReadArgs, no_wait: bool) -> AppResult<()> {
     let channel = connect_daemon(endpoint).await?;
     let mut catalog_client = pb::catalog_client::CatalogClient::new(channel.clone());
     let target =
         resolve_read_target(&mut catalog_client, &args.object, args.offset, args.length).await?;
-    let mut read_client = pb::read_session_service_client::ReadSessionServiceClient::new(channel);
+    let mut read_client =
+        pb::read_session_service_client::ReadSessionServiceClient::new(channel.clone());
 
     let started = Instant::now();
     let open_started = Instant::now();
-    let session = read_client
-        .open_read_session(pb::OpenReadSessionRequest {
-            target: Some(pb::open_read_session_request::Target::TapeTarget(
-                pb::TapeTarget {
-                    tape_uuid: target.tape_uuid.to_vec(),
-                    mount_if_needed: true,
-                    required_pool_id: target.required_pool_id.clone(),
-                },
-            )),
-            idempotency_key: None,
-            resume_target: None,
-        })
-        .await?
-        .into_inner();
+    let request = || pb::OpenReadSessionRequest {
+        target: Some(pb::open_read_session_request::Target::TapeTarget(
+            pb::TapeTarget {
+                tape_uuid: target.tape_uuid.to_vec(),
+                mount_if_needed: true,
+                required_pool_id: target.required_pool_id.clone(),
+            },
+        )),
+        idempotency_key: None,
+        resume_target: None,
+    };
+    let session = match read_client.open_read_session(request()).await {
+        Ok(response) => response.into_inner(),
+        Err(status) if !no_wait => {
+            wait_before_open_retry(channel, &status).await?;
+            read_client.open_read_session(request()).await?.into_inner()
+        }
+        Err(status) => return Err(status.into()),
+    };
     let open_ms = duration_ms(open_started.elapsed());
 
     let transfer_started = Instant::now();
@@ -1250,6 +1389,52 @@ fn print_json_error(message: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_wait_is_a_plain_global_flag() {
+        let cli = Cli::try_parse_from([
+            "remfield-io",
+            "write-many",
+            "--pool",
+            "copy-a",
+            "--count",
+            "1",
+            "--size-mib",
+            "1",
+            "--caller-object-id-prefix",
+            "field",
+            "--no-wait",
+        ])
+        .expect("parse --no-wait after subcommand arguments");
+
+        assert!(cli.no_wait);
+    }
+
+    #[test]
+    fn readiness_fence_parser_accepts_new_and_existing_fence_wording() {
+        let operation_id = Uuid::from_u128(0x42);
+        let created = format!(
+            "open write session blocked by media-readiness fence operation={operation_id} library=LIBMAIN"
+        );
+        let existing = format!(
+            "open read session blocked by active media-readiness fence operation={operation_id} state=becoming_ready"
+        );
+
+        assert_eq!(media_readiness_operation_id(&created), Some(operation_id));
+        assert_eq!(media_readiness_operation_id(&existing), Some(operation_id));
+        assert_eq!(
+            media_readiness_operation_id(&format!("unrelated operation={operation_id}")),
+            None
+        );
+    }
+
+    #[test]
+    fn drive_busy_retry_is_narrowly_classified() {
+        assert!(drive_bay_busy("drive bay 0x0100 is busy"));
+        assert!(drive_bay_busy("drive-session owner is busy"));
+        assert!(!drive_bay_busy("all drives are busy"));
+        assert!(!drive_bay_busy("drive bay 0x0100 is fenced"));
+    }
 
     #[test]
     fn write_result_json_surfaces_append_commit_info() {
