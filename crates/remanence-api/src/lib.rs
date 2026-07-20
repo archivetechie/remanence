@@ -3260,6 +3260,7 @@ fn audit_record_to_proto(record: AuditRecord) -> Result<pb::AuditEntry, Status> 
             .unwrap_or_default(),
         event_kind: audit_event_name(&record.event).to_string(),
         detail_json,
+        software_build: record.software_build,
     })
 }
 
@@ -7428,6 +7429,7 @@ BCw3Wyv2UWY=
             timestamp_utc: format!("2026-05-28T13:15:0{sequence}Z"),
             host_id: "host".to_string(),
             process_id: 123,
+            software_build: Some("test-build".to_string()),
             actor: AuditActor::System,
             source_layer: SourceLayer::Layer5,
             operation_id: Some(operation_id),
@@ -9937,6 +9939,7 @@ BCw3Wyv2UWY=
             timestamp_utc: timestamp_utc.to_string(),
             host_id: "test-host".to_string(),
             process_id: 1,
+            software_build: Some("test-build".to_string()),
             actor: AuditActor::System,
             source_layer: SourceLayer::Layer5,
             operation_id,
@@ -10075,6 +10078,10 @@ BCw3Wyv2UWY=
         let entry = stream.next().await.expect("one entry").expect("audit item");
         assert_eq!(entry.session_id, session_id.as_bytes());
         assert_eq!(entry.event_kind, "OperationFailed");
+        assert_eq!(
+            entry.software_build.as_deref(),
+            Some(remanence_state::audit::software_build())
+        );
         assert!(stream.next().await.is_none());
     }
 
