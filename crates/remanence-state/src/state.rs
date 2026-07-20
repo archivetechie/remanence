@@ -17,7 +17,8 @@ use crate::config::{load_config, validate_trusted_volume_paths, RemConfig};
 use crate::error::StateError;
 use crate::index::{
     AuditReplayReport, CatalogIndex, RebuildReport, RebuildTapeJournalInput, RetireTapeInput,
-    RetireTapeOutcome, TapeJournalIndexInput, TapeJournalIndexReport, TapePoolProjectionInput,
+    RetireTapeOutcome, TapeIoFenceRecord, TapeJournalIndexInput, TapeJournalIndexReport,
+    TapePoolProjectionInput,
 };
 use crate::lock::StateLockGuard;
 use crate::paths::StatePaths;
@@ -223,6 +224,46 @@ impl StateHandle {
             })?;
         }
         Ok(outcome)
+    }
+
+    /// Release a tape-I/O fence and append its durable release evidence.
+    pub fn release_tape_io_fence(
+        &mut self,
+        quarantine_id: &str,
+        ack: &str,
+    ) -> Result<Option<TapeIoFenceRecord>, StateError> {
+        let released = self.index.release_tape_io_fence(quarantine_id, ack)?;
+        let Some(record) = released else {
+            return Ok(None);
+        };
+        let mut detail = BTreeMap::from([
+            (
+                "tape_uuid".to_string(),
+                CborValue::Bytes(record.tape_uuid.clone()),
+            ),
+            (
+                "quarantine_id".to_string(),
+                CborValue::Text(record.quarantine_id.clone()),
+            ),
+            ("release_ack".to_string(), CborValue::Text(ack.to_string())),
+        ]);
+        if let Some(barcode) = record.barcode.as_ref() {
+            detail.insert("barcode".to_string(), CborValue::Text(barcode.clone()));
+        }
+        self.audit.append(AuditEventRecord {
+            actor: AuditActor::local_user(),
+            source_layer: SourceLayer::Layer4,
+            operation_id: None,
+            session_id: None,
+            idempotency_key: None,
+            event: AuditEvent::TapeIoFenceReleased,
+            subject: AuditSubject {
+                kind: "tape_io_fence".to_string(),
+                id: Some(record.quarantine_id.clone()),
+            },
+            detail,
+        })?;
+        Ok(Some(record))
     }
 
     /// Return the Layer 3c journal path for a tape UUID.
@@ -1041,7 +1082,7 @@ pool_id = "camera.copy-a"
     }
 
     #[test]
-    fn audit_replay_treats_retire_and_provision_events_as_inert() {
+    fn audit_replay_projects_retire_and_provision_events_without_disturbing_sessions() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-state-retire-inert")
             .tempdir()
@@ -1129,8 +1170,8 @@ pool_id = "camera.copy-a"
                 .expect("append session closed");
         }
 
-        // Replay must round-trip the new event kinds from disk and project
-        // operations/sessions exactly as if the new events were absent.
+        // Replay projects both the catalog lifecycle and the independent
+        // operation/session history from the same ordered ledger.
         let mut restarted =
             StateHandle::open_with_config(paths, config).expect("open restarted handle");
         let report = restarted.startup_replay().expect("startup replay");
@@ -1138,6 +1179,15 @@ pool_id = "camera.copy-a"
         assert_eq!(report.rebuild.audit_records_replayed, 4);
         assert_eq!(report.lost_operations_marked, 0);
         assert_eq!(report.lost_sessions_marked, 0);
+        assert_eq!(
+            restarted
+                .catalog_index()
+                .get_tape(&[0x21; 16])
+                .expect("tape lookup")
+                .expect("audit-projected tape")
+                .state,
+            "retired"
+        );
         assert_eq!(
             restarted
                 .catalog_index()

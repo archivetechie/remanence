@@ -677,6 +677,16 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
             "drive_uuid".to_string(),
             CborValue::Bytes(drive_uuid.clone()),
         );
+        for (key, value) in [
+            ("purchase_date", stored.purchase_date.as_ref()),
+            ("warranty_until", stored.warranty_until.as_ref()),
+            ("cost", stored.cost.as_ref()),
+            ("notes", stored.notes.as_ref()),
+        ] {
+            if let Some(value) = value {
+                detail.insert(key.to_string(), CborValue::Text(value.clone()));
+            }
+        }
         self.state.record_drive_audit(
             actor,
             remanence_state::AuditEvent::DriveAnnotated,
