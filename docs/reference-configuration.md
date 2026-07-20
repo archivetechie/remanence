@@ -20,6 +20,7 @@ A minimal working config:
 [daemon]
 state_dir = "/var/lib/rem"
 default_idle_timeout_seconds = 300
+drive_idle_unload_seconds = 300
 
 [journal]
 dir = "/var/lib/rem/journal"
@@ -53,6 +54,7 @@ string with a suffix: `B`, `KiB`/`K`/`KB`, `MiB`/`M`/`MB`, `GiB`/`G`/`GB`,
 |---|---|---|---|
 | `state_dir` | absolute path | required | Root directory for mutable daemon state (default socket, default spool, and — only for `rem-debug` state-mutating subcommands, not `rem-daemon` itself — `state.lock`; see [What ends up on disk](#what-ends-up-on-disk)). |
 | `default_idle_timeout_seconds` | integer > 0 | required | Default idle timeout for write/read sessions. |
+| `drive_idle_unload_seconds` | integer ≥ 0 | `300` | Rewind, unload, and return a seated cartridge to its home slot after this many idle seconds. `0` keeps it seated until eviction or daemon shutdown. |
 | `spool_dir` | absolute path | `<state_dir>/spool` | Pre-commit append spool. Created with mode `0700` at startup. |
 | `spool_tmpfs_ram_budget` | byte size > 0 | unset | Required acknowledgement when the spool resolves to tmpfs/ramfs. Post-R2, spool growth reserves this fixed budget from the shared `io_memory_ceiling`; runtime `MemAvailable` never clamps or authorizes growth. Must be ≤ `io_memory_ceiling`. |
 | `io_memory_ceiling` | byte size > 0 | `"24GiB"` | Fixed total for ALL pipeline I/O memory: append-spool reservations plus every drive's read reservoir, granted through one atomic permit manager. See the deployment note below. |

@@ -17,6 +17,8 @@ pub const DEFAULT_IO_MEMORY_CEILING_BYTES: u64 = 24 * 1024 * 1024 * 1024;
 pub const DEFAULT_READ_RESERVOIR_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Default ranged-read device-position proof cadence.
 pub const DEFAULT_RANGED_POSITION_CHECK_BYTES: u64 = 256 * 1024 * 1024;
+/// Default delay before an idle library drive is rewound and unloaded.
+pub const DEFAULT_DRIVE_IDLE_UNLOAD_SECONDS: u64 = 300;
 
 const MAX_TAPE_BLOCK_SIZE_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -77,6 +79,10 @@ pub struct DaemonConfig {
     pub io_memory_ceiling: u64,
     /// Default idle timeout for sessions.
     pub default_idle_timeout_seconds: u64,
+    /// Delay before a seated cartridge in an idle drive is returned home.
+    /// Zero keeps idle cartridges seated until eviction or daemon shutdown.
+    #[serde(default = "default_drive_idle_unload_seconds")]
+    pub drive_idle_unload_seconds: u64,
     /// Whether state-changing operations must be rejected.
     #[serde(default)]
     pub read_only: bool,
@@ -341,6 +347,10 @@ impl Default for TapeIoConfig {
 
 const fn default_io_memory_ceiling() -> u64 {
     DEFAULT_IO_MEMORY_CEILING_BYTES
+}
+
+const fn default_drive_idle_unload_seconds() -> u64 {
+    DEFAULT_DRIVE_IDLE_UNLOAD_SECONDS
 }
 
 /// Layer 3c journal configuration.
@@ -987,6 +997,10 @@ id = "camera copy a"
         let config = parse_config_toml(&valid_config()).expect("valid config");
         assert_eq!(config.daemon.socket_path, None);
         assert_eq!(
+            config.daemon.drive_idle_unload_seconds,
+            DEFAULT_DRIVE_IDLE_UNLOAD_SECONDS
+        );
+        assert_eq!(
             config.daemon.socket_path_or_default(),
             config.daemon.state_dir.join("rem.sock")
         );
@@ -1000,6 +1014,17 @@ id = "camera copy a"
             config.daemon.socket_path_or_default(),
             std::path::PathBuf::from("/run/rem/rem.sock")
         );
+    }
+
+    #[test]
+    fn daemon_drive_idle_unload_timeout_accepts_zero_and_positive_values() {
+        let disabled = with_daemon_lines("drive_idle_unload_seconds = 0\n");
+        let config = parse_config_toml(&disabled).expect("zero disables idle unload");
+        assert_eq!(config.daemon.drive_idle_unload_seconds, 0);
+
+        let configured = with_daemon_lines("drive_idle_unload_seconds = 45\n");
+        let config = parse_config_toml(&configured).expect("positive idle unload timeout");
+        assert_eq!(config.daemon.drive_idle_unload_seconds, 45);
     }
 
     #[test]
