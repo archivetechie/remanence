@@ -160,6 +160,10 @@ pub struct RebuildReport {
     pub audit_records_replayed: u64,
     /// Number of tape-journal files replayed.
     pub journal_records_replayed: u64,
+    /// Cache rows retained because no matching durable audit evidence exists.
+    pub preserved_fallbacks: Vec<String>,
+    /// Cache values that disagreed with audit evidence and were overridden.
+    pub replay_divergences: Vec<String>,
 }
 
 /// Non-terminal operation found during startup replay.
@@ -2837,10 +2841,12 @@ impl CatalogIndex {
         tx.execute("delete from sessions", [])
             .map_err(|err| sqlite_error("clear sessions projection", err))?;
 
+        let mut replay_divergences = Vec::new();
         for record in records {
             project_session_record(&tx, record)?;
             project_operation_record(&tx, record)?;
             project_idempotency_record(&tx, record, IdempotencyProjectionMode::Replay)?;
+            project_catalog_evidence_record(&tx, record, &mut replay_divergences)?;
         }
 
         let operations_rebuilt = table_count(&tx, "operations")?;
@@ -2848,6 +2854,9 @@ impl CatalogIndex {
         let idempotency_keys_rebuilt = table_count(&tx, "idempotency_keys")?;
         tx.commit()
             .map_err(|err| sqlite_error("commit audit replay transaction", err))?;
+        for warning in replay_divergences {
+            tracing::warn!("audit-replay-divergence: {warning}; ledger value applied");
+        }
 
         Ok(AuditReplayReport {
             audit_records_replayed: records.len() as u64,
@@ -2869,6 +2878,7 @@ impl CatalogIndex {
             .transaction()
             .map_err(|err| sqlite_error("begin full index rebuild transaction", err))?;
         let preserved_tapes = query_preserved_tape_rows_tx(&tx)?;
+        let preserved_evidence = query_preserved_evidence_keys_tx(&tx)?;
         clear_rebuildable_tables(&tx)?;
         restore_preserved_tape_rows_tx(&tx, &preserved_tapes)?;
 
@@ -2896,6 +2906,23 @@ impl CatalogIndex {
         }
         merge_preserved_tape_operator_columns_tx(&tx, &preserved_tapes)?;
 
+        // Catalog evidence is replayed after tape journals and the legacy
+        // cache fallback so an audit fact always wins over either projection.
+        // This second pass is intentionally separate from operations and
+        // sessions: journal replay may otherwise overwrite tape lifecycle
+        // state established by an earlier audit event.
+        let mut replay_divergences = Vec::new();
+        for record in audit_records {
+            project_catalog_evidence_record(&tx, record, &mut replay_divergences)?;
+        }
+        let preserved_fallbacks = preserved_evidence.fallbacks(&preserved_tapes, audit_records);
+        for warning in &preserved_fallbacks {
+            tracing::warn!("preserved-not-replayed: {warning}");
+        }
+        for warning in &replay_divergences {
+            tracing::warn!("audit-replay-divergence: {warning}; ledger value applied");
+        }
+
         // Copy status is derived from tape state (a copy on a retired tape
         // is `missing`, always), so it is re-derived here after journal
         // replay re-created the copies as `committed`. This keeps copy rows
@@ -2917,6 +2944,8 @@ impl CatalogIndex {
             object_copies_rebuilt,
             audit_records_replayed: audit_records.len() as u64,
             journal_records_replayed: tape_journals.len() as u64,
+            preserved_fallbacks,
+            replay_divergences,
         })
     }
 
@@ -2929,6 +2958,11 @@ impl CatalogIndex {
         project_session_record(&tx, record)?;
         project_operation_record(&tx, record)?;
         project_idempotency_record(&tx, record, IdempotencyProjectionMode::Live)?;
+        let mut divergences = Vec::new();
+        project_catalog_evidence_record(&tx, record, &mut divergences)?;
+        for warning in divergences {
+            tracing::warn!("audit-projection-divergence: {warning}; ledger value applied");
+        }
         tx.commit()
             .map_err(|err| sqlite_error("commit incremental audit projection", err))?;
         Ok(())
@@ -4252,6 +4286,181 @@ struct PreservedTapeRow {
     updated_at_utc: String,
 }
 
+/// Stable identities for cache rows whose original writers predate durable
+/// catalog-evidence audit events. Rebuild retains these rows as a compatibility
+/// fallback and reports every row that could not be reconstructed by replay.
+#[derive(Debug, Default)]
+struct PreservedEvidenceKeys {
+    alarms: Vec<String>,
+    tape_io_fences: Vec<String>,
+    drive_health_snapshots: Vec<String>,
+}
+
+impl PreservedEvidenceKeys {
+    fn fallbacks(&self, tapes: &[PreservedTapeRow], records: &[AuditRecord]) -> Vec<String> {
+        let mut tape_lifecycle = HashSet::new();
+        let mut tape_barcode_binding = HashSet::new();
+        let mut tape_pool = HashSet::new();
+        let mut alarm_rows = HashSet::new();
+        let mut fence_rows = HashSet::new();
+        let mut health_rows = HashSet::new();
+
+        for record in records {
+            match record.event {
+                AuditEvent::TapeProvisioned
+                | AuditEvent::TapeRetired
+                | AuditEvent::TapeSealed
+                | AuditEvent::CleaningCartridgeExpired
+                | AuditEvent::CleaningCartridgeRegistered => {
+                    if let Some(id) = audit_tape_identity(record) {
+                        tape_lifecycle.insert(id);
+                    }
+                    if matches!(record.event, AuditEvent::TapeProvisioned) {
+                        if detail_text(record, "voltag").is_some() {
+                            if let Some(id) = audit_tape_identity(record) {
+                                tape_barcode_binding.insert(id);
+                            }
+                        }
+                        if detail_text(record, "pool_id").is_some() {
+                            if let Some(id) = audit_tape_identity(record) {
+                                tape_pool.insert(id);
+                            }
+                        }
+                    } else if matches!(record.event, AuditEvent::CleaningCartridgeRegistered)
+                        && (detail_text(record, "voltag").is_some()
+                            || detail_text(record, "barcode").is_some())
+                    {
+                        if let Some(id) = audit_tape_identity(record) {
+                            tape_barcode_binding.insert(id);
+                        }
+                    }
+                }
+                AuditEvent::TapePoolAssigned => {
+                    if let Some(id) = audit_tape_identity(record) {
+                        tape_pool.insert(id);
+                    }
+                }
+                AuditEvent::AlarmRaised => {
+                    if let Some(id) = record.subject.id.as_ref() {
+                        alarm_rows.insert(id.clone());
+                    }
+                }
+                AuditEvent::TapeIoFenceRaised => {
+                    if let Some(id) =
+                        detail_text(record, "quarantine_id").or_else(|| record.subject.id.clone())
+                    {
+                        fence_rows.insert(id);
+                    }
+                }
+                AuditEvent::DriveHealthObserved => {
+                    if let Some(key) = audit_drive_health_key(record) {
+                        health_rows.insert(key);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut warnings = Vec::new();
+        for tape in tapes {
+            let id = hex_uuid_from_slice(tape.tape_uuid.as_slice());
+            if !tape_lifecycle.contains(&id) {
+                warnings.push(format!("tape lifecycle row tape_uuid={id}"));
+            }
+            if tape.voltag.is_some() && !tape_barcode_binding.contains(&id) {
+                warnings.push(format!("barcode binding row tape_uuid={id}"));
+            }
+            if tape.pool_id.is_some() && !tape_pool.contains(&id) {
+                warnings.push(format!("tape pool membership row tape_uuid={id}"));
+            }
+        }
+        for id in &self.alarms {
+            if !alarm_rows.contains(id) {
+                warnings.push(format!("alarm row condition_key={id}"));
+            }
+        }
+        for id in &self.tape_io_fences {
+            if !fence_rows.contains(id) {
+                warnings.push(format!("tape-I/O fence row quarantine_id={id}"));
+            }
+        }
+        for id in &self.drive_health_snapshots {
+            if !health_rows.contains(id) {
+                warnings.push(format!("drive-health row {id}"));
+            }
+        }
+        warnings.sort();
+        warnings
+    }
+}
+
+fn query_preserved_evidence_keys_tx(
+    tx: &rusqlite::Transaction<'_>,
+) -> Result<PreservedEvidenceKeys, StateError> {
+    let alarms = query_text_column_tx(
+        tx,
+        "select condition_key from alarms order by condition_key",
+        "alarms.condition_key",
+    )?;
+    let tape_io_fences = query_text_column_tx(
+        tx,
+        "select quarantine_id from tape_io_fences order by quarantine_id",
+        "tape_io_fences.quarantine_id",
+    )?;
+    let mut stmt = tx
+        .prepare(
+            "select drive_uuid, at_utc, trigger, session_id
+             from drive_health_snapshots
+             order by drive_uuid, at_utc, trigger, coalesce(session_id, '')",
+        )
+        .map_err(|err| sqlite_error("prepare preserved drive-health query", err))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|err| sqlite_error("query preserved drive-health rows", err))?;
+    let mut drive_health_snapshots = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|err| sqlite_error("iterate preserved drive-health rows", err))?
+    {
+        let drive_uuid: Vec<u8> = row_get(row, 0, "drive_health_snapshots.drive_uuid")?;
+        let at_utc: String = row_get(row, 1, "drive_health_snapshots.at_utc")?;
+        let trigger: String = row_get(row, 2, "drive_health_snapshots.trigger")?;
+        let session_id: Option<String> = row_get(row, 3, "drive_health_snapshots.session_id")?;
+        drive_health_snapshots.push(drive_health_key(
+            drive_uuid.as_slice(),
+            at_utc.as_str(),
+            trigger.as_str(),
+            session_id.as_deref(),
+        ));
+    }
+    Ok(PreservedEvidenceKeys {
+        alarms,
+        tape_io_fences,
+        drive_health_snapshots,
+    })
+}
+
+fn query_text_column_tx(
+    tx: &rusqlite::Transaction<'_>,
+    sql: &str,
+    field: &str,
+) -> Result<Vec<String>, StateError> {
+    let mut stmt = tx
+        .prepare(sql)
+        .map_err(|err| sqlite_error("prepare preserved evidence query", err))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|err| sqlite_error("query preserved evidence rows", err))?;
+    let mut values = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|err| sqlite_error("iterate preserved evidence rows", err))?
+    {
+        values.push(row_get(row, 0, field)?);
+    }
+    Ok(values)
+}
+
 impl ExistingProvisionedTape {
     fn is_unwritten(&self) -> bool {
         self.last_committed_tape_file.is_none()
@@ -5554,6 +5763,826 @@ fn project_idempotency_record(
     }
 
     Ok(())
+}
+
+/// Replay catalog/lifecycle evidence whose durable source is the audit log.
+///
+/// Callers must apply this after journal and legacy-cache restoration during a
+/// full rebuild. Every statement is an upsert or an idempotent update so the
+/// same ordered ledger produces the same projection on every invocation.
+fn project_catalog_evidence_record(
+    tx: &rusqlite::Transaction<'_>,
+    record: &AuditRecord,
+    divergences: &mut Vec<String>,
+) -> Result<(), StateError> {
+    match record.event {
+        AuditEvent::TapeProvisioned => {
+            let Some(tape_uuid) = audit_tape_uuid(record) else {
+                divergences.push(format!(
+                    "record {} TapeProvisioned has no valid tape identity",
+                    record.record_uuid
+                ));
+                return Ok(());
+            };
+            let voltag = detail_text(record, "voltag");
+            let pool_id = detail_text(record, "pool_id");
+            let block_size = detail_i64(record, "block_size");
+            let geometry = audit_tape_geometry(record);
+            if let Some(voltag) = voltag.as_deref() {
+                let conflicting_tape_uuid: Option<Vec<u8>> = tx
+                    .query_row(
+                        "select tape_uuid from tapes
+                         where voltag = ?1 and tape_uuid != ?2",
+                        params![voltag, tape_uuid.as_slice()],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|err| sqlite_error("compare barcode binding replay", err))?;
+                if let Some(conflicting_tape_uuid) = conflicting_tape_uuid {
+                    divergences.push(format!(
+                        "barcode binding row voltag={voltag}: cache_tape_uuid={} ledger_tape_uuid={}",
+                        hex_uuid_from_slice(conflicting_tape_uuid.as_slice()),
+                        hex_uuid_from_slice(tape_uuid.as_slice())
+                    ));
+                    tx.execute(
+                        "update tapes set voltag = null
+                         where voltag = ?1 and tape_uuid != ?2",
+                        params![voltag, tape_uuid.as_slice()],
+                    )
+                    .map_err(|err| sqlite_error("clear divergent barcode binding", err))?;
+                }
+            }
+            if let Some((cached_voltag, cached_block_size, cached_state)) = tx
+                .query_row(
+                    "select voltag, block_size, state from tapes where tape_uuid = ?1",
+                    params![tape_uuid.as_slice()],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|err| sqlite_error("compare provisioned tape replay", err))?
+            {
+                if cached_state == "ready" {
+                    record_field_divergence(
+                        divergences,
+                        "tape",
+                        audit_tape_identity(record).as_deref().unwrap_or("invalid"),
+                        "voltag",
+                        cached_voltag.as_ref(),
+                        voltag.as_ref(),
+                    );
+                }
+                record_field_divergence(
+                    divergences,
+                    "tape",
+                    audit_tape_identity(record).as_deref().unwrap_or("invalid"),
+                    "block_size",
+                    cached_block_size.as_ref(),
+                    block_size.as_ref(),
+                );
+            }
+            tx.execute(
+                "insert into tapes(
+                   tape_uuid, voltag, pool_id, block_size, scheme_id,
+                   data_blocks_per_stripe, parity_blocks_per_stripe,
+                   stripes_per_neighborhood, state, updated_at_utc
+                 )
+                 values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ready', ?9)
+                 on conflict(tape_uuid) do update set
+                   voltag = coalesce(excluded.voltag, tapes.voltag),
+                   pool_id = coalesce(excluded.pool_id, tapes.pool_id),
+                   block_size = coalesce(excluded.block_size, tapes.block_size),
+                   scheme_id = coalesce(excluded.scheme_id, tapes.scheme_id),
+                   data_blocks_per_stripe = coalesce(
+                     excluded.data_blocks_per_stripe,
+                     tapes.data_blocks_per_stripe
+                   ),
+                   parity_blocks_per_stripe = coalesce(
+                     excluded.parity_blocks_per_stripe,
+                     tapes.parity_blocks_per_stripe
+                   ),
+                   stripes_per_neighborhood = coalesce(
+                     excluded.stripes_per_neighborhood,
+                     tapes.stripes_per_neighborhood
+                   ),
+                   state = 'ready',
+                   updated_at_utc = max(tapes.updated_at_utc, excluded.updated_at_utc)",
+                params![
+                    tape_uuid,
+                    voltag,
+                    pool_id,
+                    block_size,
+                    geometry.scheme_id,
+                    geometry.data_blocks_per_stripe,
+                    geometry.parity_blocks_per_stripe,
+                    geometry.stripes_per_neighborhood,
+                    record.timestamp_utc.as_str(),
+                ],
+            )
+            .map_err(|err| sqlite_error("project TapeProvisioned audit record", err))?;
+        }
+        AuditEvent::TapePoolAssigned => {
+            let Some(tape_uuid) = audit_tape_uuid(record) else {
+                divergences.push(format!(
+                    "record {} TapePoolAssigned has no valid tape identity",
+                    record.record_uuid
+                ));
+                return Ok(());
+            };
+            let Some(pool_id) = detail_text(record, "pool_id") else {
+                divergences.push(format!(
+                    "record {} TapePoolAssigned has no pool_id",
+                    record.record_uuid
+                ));
+                return Ok(());
+            };
+            let cached: Option<Option<String>> = tx
+                .query_row(
+                    "select pool_id from tapes where tape_uuid = ?1",
+                    params![tape_uuid.as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|err| sqlite_error("compare tape pool replay", err))?;
+            if let Some(cached) = cached {
+                record_field_divergence(
+                    divergences,
+                    "tape",
+                    audit_tape_identity(record).as_deref().unwrap_or("invalid"),
+                    "pool_id",
+                    cached.as_ref(),
+                    Some(&pool_id),
+                );
+            }
+            tx.execute(
+                "update tapes
+                 set pool_id = ?2, updated_at_utc = ?3
+                 where tape_uuid = ?1",
+                params![tape_uuid, pool_id, record.timestamp_utc.as_str()],
+            )
+            .map_err(|err| sqlite_error("project TapePoolAssigned audit record", err))?;
+        }
+        AuditEvent::TapeSealed | AuditEvent::TapeRetired => {
+            let Some(tape_uuid) = audit_tape_uuid(record) else {
+                divergences.push(format!(
+                    "record {} {:?} has no valid tape identity",
+                    record.record_uuid, record.event
+                ));
+                return Ok(());
+            };
+            let state = if matches!(record.event, AuditEvent::TapeRetired) {
+                "retired"
+            } else {
+                "sealed"
+            };
+            tx.execute(
+                "insert into tapes(tape_uuid, voltag, state, updated_at_utc)
+                 values(?1, null, ?2, ?3)
+                 on conflict(tape_uuid) do update set
+                   voltag = case when excluded.state = 'retired' then null else tapes.voltag end,
+                   state = excluded.state,
+                   updated_at_utc = excluded.updated_at_utc",
+                params![tape_uuid, state, record.timestamp_utc.as_str()],
+            )
+            .map_err(|err| sqlite_error("project tape lifecycle audit record", err))?;
+        }
+        AuditEvent::CleaningCartridgeRegistered | AuditEvent::CleaningCartridgeExpired => {
+            let Some(tape_uuid) = audit_tape_uuid(record) else {
+                return Ok(());
+            };
+            let cleaning_state = if matches!(record.event, AuditEvent::CleaningCartridgeExpired) {
+                "expired"
+            } else {
+                "unverified"
+            };
+            tx.execute(
+                "update tapes
+                 set kind = 'cleaning',
+                     cleaning_uses = coalesce(cleaning_uses, 0),
+                     cleaning_state = ?2,
+                     updated_at_utc = ?3
+                 where tape_uuid = ?1",
+                params![tape_uuid, cleaning_state, record.timestamp_utc.as_str()],
+            )
+            .map_err(|err| sqlite_error("project cleaning cartridge audit record", err))?;
+        }
+        AuditEvent::DriveRetired
+        | AuditEvent::DriveAnnotated
+        | AuditEvent::DriveFenced
+        | AuditEvent::DriveUnfenced
+        | AuditEvent::DriveCleaned => {
+            project_drive_lifecycle_record(tx, record, divergences)?;
+        }
+        AuditEvent::AlarmRaised => project_alarm_raised_record(tx, record, divergences)?,
+        AuditEvent::AlarmAcked | AuditEvent::AlarmCleared => {
+            project_alarm_state_record(tx, record, divergences)?;
+        }
+        AuditEvent::TapeIoFenceRaised => project_tape_io_fence_raised(tx, record, divergences)?,
+        AuditEvent::TapeIoFenceReleased => {
+            project_tape_io_fence_released(tx, record, divergences)?;
+        }
+        AuditEvent::DriveHealthObserved => {
+            project_drive_health_record(tx, record, divergences)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct AuditTapeGeometry {
+    scheme_id: Option<String>,
+    data_blocks_per_stripe: Option<i64>,
+    parity_blocks_per_stripe: Option<i64>,
+    stripes_per_neighborhood: Option<i64>,
+}
+
+fn audit_tape_geometry(record: &AuditRecord) -> AuditTapeGeometry {
+    let Some(value) = detail_text(record, "geometry") else {
+        return AuditTapeGeometry::default();
+    };
+    if value == "no-parity" {
+        return AuditTapeGeometry::default();
+    }
+    let mut geometry = AuditTapeGeometry::default();
+    for part in value.split_ascii_whitespace() {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        match key {
+            "scheme" => geometry.scheme_id = Some(value.to_string()),
+            "data" => geometry.data_blocks_per_stripe = value.parse().ok(),
+            "parity" => geometry.parity_blocks_per_stripe = value.parse().ok(),
+            "stripes" => geometry.stripes_per_neighborhood = value.parse().ok(),
+            _ => {}
+        }
+    }
+    geometry
+}
+
+fn project_drive_lifecycle_record(
+    tx: &rusqlite::Transaction<'_>,
+    record: &AuditRecord,
+    divergences: &mut Vec<String>,
+) -> Result<(), StateError> {
+    let Some(drive_uuid) = detail_bytes(record, "drive_uuid")
+        .or_else(|| record.subject.id.as_deref().and_then(parse_uuid_bytes))
+    else {
+        divergences.push(format!(
+            "record {} {:?} has no valid drive_uuid",
+            record.record_uuid, record.event
+        ));
+        return Ok(());
+    };
+    let exists = tx
+        .query_row(
+            "select 1 from drives where drive_uuid = ?1",
+            params![drive_uuid.as_slice()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|err| sqlite_error("find drive for lifecycle replay", err))?
+        .is_some();
+    if !exists {
+        divergences.push(format!(
+            "record {} {:?} references absent drive_uuid={}",
+            record.record_uuid,
+            record.event,
+            hex_uuid_from_slice(drive_uuid.as_slice())
+        ));
+        return Ok(());
+    }
+
+    match record.event {
+        AuditEvent::DriveRetired => {
+            tx.execute(
+                "update drives
+                 set state = 'retired', retired_at_utc = ?2,
+                     retire_reason = coalesce(?3, retire_reason), last_seen_utc = ?2
+                 where drive_uuid = ?1",
+                params![
+                    drive_uuid,
+                    record.timestamp_utc.as_str(),
+                    detail_text(record, "reason")
+                ],
+            )
+            .map_err(|err| sqlite_error("project DriveRetired audit record", err))?;
+        }
+        AuditEvent::DriveAnnotated => {
+            tx.execute(
+                "update drives set
+                   purchase_date = coalesce(?2, purchase_date),
+                   warranty_until = coalesce(?3, warranty_until),
+                   cost = coalesce(?4, cost),
+                   notes = coalesce(?5, notes)
+                 where drive_uuid = ?1",
+                params![
+                    drive_uuid,
+                    detail_text(record, "purchase_date"),
+                    detail_text(record, "warranty_until"),
+                    detail_text(record, "cost"),
+                    detail_text(record, "notes"),
+                ],
+            )
+            .map_err(|err| sqlite_error("project DriveAnnotated audit record", err))?;
+        }
+        AuditEvent::DriveFenced | AuditEvent::DriveUnfenced => {
+            let fenced = i64::from(matches!(record.event, AuditEvent::DriveFenced));
+            tx.execute(
+                "update drives set fenced = ?2, last_seen_utc = ?3 where drive_uuid = ?1",
+                params![drive_uuid, fenced, record.timestamp_utc.as_str()],
+            )
+            .map_err(|err| sqlite_error("project drive fence audit record", err))?;
+        }
+        AuditEvent::DriveCleaned => {
+            tx.execute(
+                "update drives
+                 set cleaning_due = 'none', fenced = 0, last_seen_utc = ?2
+                 where drive_uuid = ?1",
+                params![drive_uuid, record.timestamp_utc.as_str()],
+            )
+            .map_err(|err| sqlite_error("project DriveCleaned audit record", err))?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn project_alarm_raised_record(
+    tx: &rusqlite::Transaction<'_>,
+    record: &AuditRecord,
+    divergences: &mut Vec<String>,
+) -> Result<(), StateError> {
+    let Some(condition_key) = record.subject.id.as_ref() else {
+        divergences.push(format!(
+            "record {} AlarmRaised has no condition_key",
+            record.record_uuid
+        ));
+        return Ok(());
+    };
+    let Some(kind) = detail_text(record, "kind") else {
+        divergences.push(format!(
+            "record {} AlarmRaised has no kind",
+            record.record_uuid
+        ));
+        return Ok(());
+    };
+    let Some(severity) = detail_text(record, "severity") else {
+        divergences.push(format!(
+            "record {} AlarmRaised has no severity",
+            record.record_uuid
+        ));
+        return Ok(());
+    };
+    tx.execute(
+        "insert into alarms(
+           condition_key, kind, severity, state, first_seen_utc,
+           last_seen_utc, acked_by, acked_at_utc, detail
+         )
+         values(?1, ?2, ?3, 'open', ?4, ?4, null, null, ?5)
+         on conflict(condition_key) do update set
+           kind = excluded.kind,
+           severity = excluded.severity,
+           state = case
+             when alarms.state = 'cleared' then 'open'
+             else alarms.state
+           end,
+           first_seen_utc = case
+             when alarms.state = 'cleared' then excluded.first_seen_utc
+             else alarms.first_seen_utc
+           end,
+           last_seen_utc = excluded.last_seen_utc,
+           detail = coalesce(excluded.detail, alarms.detail)",
+        params![
+            condition_key,
+            kind,
+            severity,
+            record.timestamp_utc.as_str(),
+            detail_text(record, "detail")
+        ],
+    )
+    .map_err(|err| sqlite_error("project AlarmRaised audit record", err))?;
+    Ok(())
+}
+
+fn project_alarm_state_record(
+    tx: &rusqlite::Transaction<'_>,
+    record: &AuditRecord,
+    divergences: &mut Vec<String>,
+) -> Result<(), StateError> {
+    let Some(condition_key) = record.subject.id.as_ref() else {
+        divergences.push(format!(
+            "record {} {:?} has no condition_key",
+            record.record_uuid, record.event
+        ));
+        return Ok(());
+    };
+    let state = if matches!(record.event, AuditEvent::AlarmAcked) {
+        "acked"
+    } else {
+        "cleared"
+    };
+    let changed = tx
+        .execute(
+            "update alarms
+             set state = ?2,
+                 last_seen_utc = ?3,
+                 acked_by = case when ?2 = 'acked' then ?4 else acked_by end,
+                 acked_at_utc = case when ?2 = 'acked' then ?3 else acked_at_utc end
+             where condition_key = ?1",
+            params![
+                condition_key,
+                state,
+                record.timestamp_utc.as_str(),
+                actor_fingerprint(&record.actor)
+            ],
+        )
+        .map_err(|err| sqlite_error("project alarm state audit record", err))?;
+    if changed == 0 {
+        divergences.push(format!(
+            "record {} {:?} references absent alarm condition_key={condition_key}",
+            record.record_uuid, record.event
+        ));
+    }
+    Ok(())
+}
+
+fn project_tape_io_fence_raised(
+    tx: &rusqlite::Transaction<'_>,
+    record: &AuditRecord,
+    divergences: &mut Vec<String>,
+) -> Result<(), StateError> {
+    let Some(quarantine_id) =
+        detail_text(record, "quarantine_id").or_else(|| record.subject.id.clone())
+    else {
+        divergences.push(format!(
+            "record {} TapeIoFenceRaised has no quarantine_id",
+            record.record_uuid
+        ));
+        return Ok(());
+    };
+    let Some(tape_uuid) = detail_tape_uuid(record, "tape_uuid") else {
+        divergences.push(format!(
+            "record {} TapeIoFenceRaised has no tape_uuid",
+            record.record_uuid
+        ));
+        return Ok(());
+    };
+    let Some(reason) = detail_text(record, "reason") else {
+        divergences.push(format!(
+            "record {} TapeIoFenceRaised has no reason",
+            record.record_uuid
+        ));
+        return Ok(());
+    };
+    tx.execute(
+        "insert into tape_io_fences(
+           tape_uuid, barcode, state, reason, evidence_json, quarantine_id,
+           created_at_utc, updated_at_utc, release_ack
+         )
+         values(?1, ?2, 'active', ?3, ?4, ?5, ?6, ?6, null)
+         on conflict(quarantine_id) do update set
+           tape_uuid = excluded.tape_uuid,
+           barcode = excluded.barcode,
+           state = 'active',
+           reason = excluded.reason,
+           evidence_json = excluded.evidence_json,
+           created_at_utc = excluded.created_at_utc,
+           updated_at_utc = excluded.updated_at_utc,
+           release_ack = null",
+        params![
+            tape_uuid,
+            detail_text(record, "barcode"),
+            reason,
+            detail_text(record, "evidence_json"),
+            quarantine_id,
+            record.timestamp_utc.as_str(),
+        ],
+    )
+    .map_err(|err| sqlite_error("project TapeIoFenceRaised audit record", err))?;
+    Ok(())
+}
+
+fn project_tape_io_fence_released(
+    tx: &rusqlite::Transaction<'_>,
+    record: &AuditRecord,
+    divergences: &mut Vec<String>,
+) -> Result<(), StateError> {
+    let Some(quarantine_id) =
+        detail_text(record, "quarantine_id").or_else(|| record.subject.id.clone())
+    else {
+        divergences.push(format!(
+            "record {} TapeIoFenceReleased has no quarantine_id",
+            record.record_uuid
+        ));
+        return Ok(());
+    };
+    let changed = tx
+        .execute(
+            "update tape_io_fences
+             set state = 'released', updated_at_utc = ?2, release_ack = ?3
+             where quarantine_id = ?1",
+            params![
+                quarantine_id,
+                record.timestamp_utc.as_str(),
+                detail_text(record, "release_ack")
+            ],
+        )
+        .map_err(|err| sqlite_error("project TapeIoFenceReleased audit record", err))?;
+    if changed == 0 {
+        divergences.push(format!(
+            "record {} TapeIoFenceReleased references absent fence quarantine_id={quarantine_id}",
+            record.record_uuid
+        ));
+    }
+    Ok(())
+}
+
+fn project_drive_health_record(
+    tx: &rusqlite::Transaction<'_>,
+    record: &AuditRecord,
+    divergences: &mut Vec<String>,
+) -> Result<(), StateError> {
+    let Some(drive_uuid) = detail_bytes(record, "drive_uuid")
+        .or_else(|| record.subject.id.as_deref().and_then(parse_uuid_bytes))
+    else {
+        divergences.push(format!(
+            "record {} DriveHealthObserved has no drive_uuid",
+            record.record_uuid
+        ));
+        return Ok(());
+    };
+    let Some(trigger) = detail_text(record, "trigger") else {
+        divergences.push(format!(
+            "record {} DriveHealthObserved has no trigger",
+            record.record_uuid
+        ));
+        return Ok(());
+    };
+    let at_utc = detail_text(record, "at_utc").unwrap_or_else(|| record.timestamp_utc.clone());
+    let session_id = detail_text(record, "session_id");
+    let exists = tx
+        .query_row(
+            "select 1 from drives where drive_uuid = ?1",
+            params![drive_uuid.as_slice()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|err| sqlite_error("find drive for health replay", err))?
+        .is_some();
+    if !exists {
+        // Health evidence must survive loss of the inventory cache. A replay-
+        // discovered placeholder is deliberately non-actionable until normal
+        // hardware discovery re-establishes the drive identity claim.
+        tx.execute(
+            "insert into drives(
+               drive_uuid, serial, identity_source, actionable, vendor, product,
+               firmware_rev, managed, state, cleaning_due, fenced,
+               first_seen_utc, last_seen_utc
+             )
+             values(?1, ?2, 'audit-replay', 0, ?3, ?4, ?5, ?6,
+                    'active', 'none', 0, ?7, ?7)",
+            params![
+                drive_uuid.as_slice(),
+                detail_text(record, "drive_serial").unwrap_or_default(),
+                detail_text(record, "vendor"),
+                detail_text(record, "product"),
+                detail_text(record, "firmware_rev"),
+                detail_text(record, "managed").unwrap_or_else(|| "foreign".to_string()),
+                at_utc.as_str(),
+            ],
+        )
+        .map_err(|err| sqlite_error("restore drive placeholder from health audit", err))?;
+    }
+    type CachedDriveHealth = (
+        i64,
+        Vec<u8>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+    );
+    let read_cached = |row: &rusqlite::Row<'_>| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+            row.get(9)?,
+        ))
+    };
+    let select = "select snapshot_id, drive_uuid, at_utc, session_id,
+                         tape_alert_flags, write_errors_corrected,
+                         write_errors_uncorrected, read_errors_corrected,
+                         read_errors_uncorrected, raw_pages
+                  from drive_health_snapshots";
+    let cached: Option<CachedDriveHealth> = if let Some(session_id) = session_id.as_deref() {
+        tx.query_row(
+            &format!("{select} where session_id = ?1 and trigger = ?2"),
+            params![session_id, trigger.as_str()],
+            read_cached,
+        )
+        .optional()
+    } else {
+        tx.query_row(
+            &format!(
+                "{select}
+                 where drive_uuid = ?1 and at_utc = ?2 and trigger = ?3
+                   and session_id is null
+                 order by snapshot_id
+                 limit 1"
+            ),
+            params![drive_uuid.as_slice(), at_utc.as_str(), trigger.as_str()],
+            read_cached,
+        )
+        .optional()
+    }
+    .map_err(|err| sqlite_error("find replayed drive-health row", err))?;
+    let tape_alert_flags = detail_text(record, "tape_alert_flags");
+    let write_errors_corrected = detail_i64(record, "write_errors_corrected");
+    let write_errors_uncorrected = detail_i64(record, "write_errors_uncorrected");
+    let read_errors_corrected = detail_i64(record, "read_errors_corrected");
+    let read_errors_uncorrected = detail_i64(record, "read_errors_uncorrected");
+    let raw_pages = detail_text(record, "raw_pages");
+    if let Some(cached) = cached {
+        let row_id = drive_health_key(
+            drive_uuid.as_slice(),
+            at_utc.as_str(),
+            trigger.as_str(),
+            session_id.as_deref(),
+        );
+        record_field_divergence(
+            divergences,
+            "drive-health",
+            row_id.as_str(),
+            "drive_uuid",
+            Some(&cached.1),
+            Some(&drive_uuid),
+        );
+        record_field_divergence(
+            divergences,
+            "drive-health",
+            row_id.as_str(),
+            "at_utc",
+            Some(&cached.2),
+            Some(&at_utc),
+        );
+        for (field, cached_value, replayed_value) in [
+            ("session_id", &cached.3, &session_id),
+            ("tape_alert_flags", &cached.4, &tape_alert_flags),
+            ("raw_pages", &cached.9, &raw_pages),
+        ] {
+            record_field_divergence(
+                divergences,
+                "drive-health",
+                row_id.as_str(),
+                field,
+                Some(cached_value),
+                Some(replayed_value),
+            );
+        }
+        for (field, cached_value, replayed_value) in [
+            ("write_errors_corrected", &cached.5, &write_errors_corrected),
+            (
+                "write_errors_uncorrected",
+                &cached.6,
+                &write_errors_uncorrected,
+            ),
+            ("read_errors_corrected", &cached.7, &read_errors_corrected),
+            (
+                "read_errors_uncorrected",
+                &cached.8,
+                &read_errors_uncorrected,
+            ),
+        ] {
+            record_field_divergence(
+                divergences,
+                "drive-health",
+                row_id.as_str(),
+                field,
+                Some(cached_value),
+                Some(replayed_value),
+            );
+        }
+        tx.execute(
+            "update drive_health_snapshots
+             set drive_uuid = ?2, at_utc = ?3, trigger = ?4, session_id = ?5,
+                 tape_alert_flags = ?6, write_errors_corrected = ?7,
+                 write_errors_uncorrected = ?8, read_errors_corrected = ?9,
+                 read_errors_uncorrected = ?10, raw_pages = ?11
+             where snapshot_id = ?1",
+            params![
+                cached.0,
+                drive_uuid,
+                at_utc,
+                trigger,
+                session_id,
+                tape_alert_flags,
+                write_errors_corrected,
+                write_errors_uncorrected,
+                read_errors_corrected,
+                read_errors_uncorrected,
+                raw_pages,
+            ],
+        )
+        .map_err(|err| sqlite_error("update drive health from audit replay", err))?;
+    } else {
+        tx.execute(
+            "insert into drive_health_snapshots(
+               drive_uuid, at_utc, trigger, session_id, tape_alert_flags,
+               write_errors_corrected, write_errors_uncorrected,
+               read_errors_corrected, read_errors_uncorrected, raw_pages
+             )
+             values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                drive_uuid,
+                at_utc,
+                trigger,
+                session_id,
+                tape_alert_flags,
+                write_errors_corrected,
+                write_errors_uncorrected,
+                read_errors_corrected,
+                read_errors_uncorrected,
+                raw_pages,
+            ],
+        )
+        .map_err(|err| sqlite_error("project DriveHealthObserved audit record", err))?;
+    }
+    Ok(())
+}
+
+fn record_field_divergence<T: std::fmt::Debug + PartialEq>(
+    divergences: &mut Vec<String>,
+    row_kind: &str,
+    row_id: &str,
+    field: &str,
+    cached: Option<&T>,
+    replayed: Option<&T>,
+) {
+    if let Some(replayed) = replayed {
+        if cached != Some(replayed) {
+            divergences.push(format!(
+                "{row_kind} row {row_id} field {field}: cache={cached:?} ledger={replayed:?}"
+            ));
+        }
+    }
+}
+
+fn audit_tape_uuid(record: &AuditRecord) -> Option<Vec<u8>> {
+    record
+        .subject
+        .id
+        .as_deref()
+        .and_then(parse_uuid_bytes)
+        .or_else(|| detail_tape_uuid(record, "tape_uuid"))
+}
+
+fn audit_tape_identity(record: &AuditRecord) -> Option<String> {
+    audit_tape_uuid(record).map(|uuid| hex_uuid_from_slice(uuid.as_slice()))
+}
+
+fn drive_health_key(
+    drive_uuid: &[u8],
+    at_utc: &str,
+    trigger: &str,
+    session_id: Option<&str>,
+) -> String {
+    match session_id {
+        Some(session_id) => format!("session_id={session_id} trigger={trigger}"),
+        None => format!(
+            "drive_uuid={} at_utc={at_utc} trigger={trigger} session_id=<none>",
+            hex_uuid_from_slice(drive_uuid)
+        ),
+    }
+}
+
+fn audit_drive_health_key(record: &AuditRecord) -> Option<String> {
+    let drive_uuid = detail_bytes(record, "drive_uuid")
+        .or_else(|| record.subject.id.as_deref().and_then(parse_uuid_bytes))?;
+    let at_utc = detail_text(record, "at_utc").unwrap_or_else(|| record.timestamp_utc.clone());
+    let trigger = detail_text(record, "trigger")?;
+    let session_id = detail_text(record, "session_id");
+    Some(drive_health_key(
+        drive_uuid.as_slice(),
+        at_utc.as_str(),
+        trigger.as_str(),
+        session_id.as_deref(),
+    ))
 }
 
 fn upsert_idempotency_request(
@@ -7863,6 +8892,18 @@ mod tests {
             },
             detail,
         }
+    }
+
+    fn catalog_evidence_record(
+        sequence: u64,
+        event: AuditEvent,
+        subject_kind: &str,
+        subject_id: &str,
+        detail: BTreeMap<String, CborValue>,
+    ) -> AuditRecord {
+        let mut record = audit_record(sequence, event, None, None, None, subject_kind, detail);
+        record.subject.id = Some(subject_id.to_string());
+        record
     }
 
     fn detail(entries: &[(&str, CborValue)]) -> BTreeMap<String, CborValue> {
@@ -12758,6 +13799,441 @@ mod tests {
         assert_eq!(unwritten.state, "ready");
         assert_eq!(unwritten.total_committed_ordinals, 0);
         assert_eq!(unwritten.last_committed_tape_file, None);
+    }
+
+    #[test]
+    fn catalog_evidence_replay_matches_cache_and_is_idempotent() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [0x42; 16];
+        let tape_id = hex_uuid(tape_uuid);
+        let drive = index
+            .observe_drive(DriveObservationInput {
+                serial: "DRV-LEDGER".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("mainlib".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-05-27T10:00:00Z".to_string()),
+            })
+            .expect("observe drive");
+        index
+            .upsert_tape_pool_projection(TapePoolProjectionInput {
+                pool_id: "camera.copy-a".to_string(),
+                display_name: None,
+                copy_class: None,
+                content_class: None,
+                created_at_utc: Some("2026-05-27T10:00:00Z".to_string()),
+            })
+            .expect("seed tape pool cache");
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "RMN042L9".to_string(),
+                block_size: 262_144,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("seed tape binding cache");
+        index
+            .project_tape_pool_membership(tape_uuid, "camera.copy-a")
+            .expect("seed tape pool membership cache");
+        index
+            .seal_tape(tape_uuid)
+            .expect("seed tape lifecycle cache");
+        index
+            .raise_alarm(
+                "snapshot-persist-failing:mainlib",
+                "snapshot-persist-failing",
+                "warning",
+                Some("{}"),
+            )
+            .expect("seed alarm cache");
+        index
+            .ack_alarm("snapshot-persist-failing:mainlib", "user:alice")
+            .expect("ack seeded alarm")
+            .expect("seeded alarm exists");
+        let fence = index
+            .record_tape_io_fence(TapeIoFenceInput {
+                tape_uuid,
+                barcode: Some("RMN042L9".to_string()),
+                reason: "position_drift".to_string(),
+                evidence_json: Some("{}".to_string()),
+            })
+            .expect("seed tape-I/O fence cache");
+        let quarantine_id = fence.quarantine_id;
+        index
+            .release_tape_io_fence(quarantine_id.as_str(), "verified")
+            .expect("release seeded tape-I/O fence")
+            .expect("seeded tape-I/O fence exists");
+        let health_at = "2026-05-27T10:07:00Z";
+        index
+            .record_drive_health_snapshot(DriveHealthSnapshotInput {
+                drive_uuid: drive.drive_uuid.clone(),
+                trigger: "manual".to_string(),
+                session_id: None,
+                tape_alert_flags: None,
+                write_errors_corrected: Some(3),
+                write_errors_uncorrected: Some(0),
+                read_errors_corrected: Some(4),
+                read_errors_uncorrected: Some(0),
+                raw_pages: None,
+                at_utc: Some(health_at.to_string()),
+            })
+            .expect("seed drive-health cache");
+        let preserved_tape = index
+            .get_tape(&tape_uuid)
+            .expect("preserved tape lookup")
+            .expect("preserved tape row");
+        let preserved_alarm = index
+            .get_alarm("snapshot-persist-failing:mainlib")
+            .expect("preserved alarm lookup")
+            .expect("preserved alarm row");
+        let preserved_fence = index
+            .tape_io_fence_by_quarantine_id(quarantine_id.as_str())
+            .expect("preserved fence lookup")
+            .expect("preserved fence row");
+        let preserved_health = index
+            .list_drive_health_snapshots(drive.drive_uuid.as_slice())
+            .expect("preserved health lookup");
+        let records = vec![
+            catalog_evidence_record(
+                1,
+                AuditEvent::TapeProvisioned,
+                "tape",
+                tape_id.as_str(),
+                detail(&[
+                    ("voltag", CborValue::Text("RMN042L9".to_string())),
+                    ("pool_id", CborValue::Text("camera.copy-a".to_string())),
+                    ("block_size", CborValue::Integer(262_144.into())),
+                    ("geometry", CborValue::Text("no-parity".to_string())),
+                ]),
+            ),
+            catalog_evidence_record(
+                2,
+                AuditEvent::TapePoolAssigned,
+                "tape",
+                tape_id.as_str(),
+                detail(&[("pool_id", CborValue::Text("camera.copy-a".to_string()))]),
+            ),
+            catalog_evidence_record(
+                3,
+                AuditEvent::DriveFenced,
+                "drive",
+                hex_uuid_from_slice(drive.drive_uuid.as_slice()).as_str(),
+                detail(&[("drive_uuid", CborValue::Bytes(drive.drive_uuid.clone()))]),
+            ),
+            catalog_evidence_record(
+                4,
+                AuditEvent::DriveUnfenced,
+                "drive",
+                hex_uuid_from_slice(drive.drive_uuid.as_slice()).as_str(),
+                detail(&[("drive_uuid", CborValue::Bytes(drive.drive_uuid.clone()))]),
+            ),
+            catalog_evidence_record(
+                5,
+                AuditEvent::AlarmRaised,
+                "alarm",
+                "snapshot-persist-failing:mainlib",
+                detail(&[
+                    (
+                        "kind",
+                        CborValue::Text("snapshot-persist-failing".to_string()),
+                    ),
+                    ("severity", CborValue::Text("warning".to_string())),
+                    ("detail", CborValue::Text("{}".to_string())),
+                ]),
+            ),
+            catalog_evidence_record(
+                6,
+                AuditEvent::AlarmAcked,
+                "alarm",
+                "snapshot-persist-failing:mainlib",
+                BTreeMap::new(),
+            ),
+            catalog_evidence_record(
+                7,
+                AuditEvent::TapeIoFenceRaised,
+                "tape_io_fence",
+                quarantine_id.as_str(),
+                detail(&[
+                    ("tape_uuid", CborValue::Bytes(tape_uuid.to_vec())),
+                    ("barcode", CborValue::Text("RMN042L9".to_string())),
+                    ("reason", CborValue::Text("position_drift".to_string())),
+                    ("quarantine_id", CborValue::Text(quarantine_id.clone())),
+                    ("evidence_json", CborValue::Text("{}".to_string())),
+                ]),
+            ),
+            catalog_evidence_record(
+                8,
+                AuditEvent::DriveHealthObserved,
+                "drive",
+                hex_uuid_from_slice(drive.drive_uuid.as_slice()).as_str(),
+                detail(&[
+                    ("drive_uuid", CborValue::Bytes(drive.drive_uuid.clone())),
+                    ("drive_serial", CborValue::Text("DRV-LEDGER".to_string())),
+                    ("managed", CborValue::Text("rem".to_string())),
+                    ("at_utc", CborValue::Text(health_at.to_string())),
+                    ("trigger", CborValue::Text("manual".to_string())),
+                    ("write_errors_corrected", CborValue::Integer(3.into())),
+                    ("write_errors_uncorrected", CborValue::Integer(0.into())),
+                    ("read_errors_corrected", CborValue::Integer(4.into())),
+                    ("read_errors_uncorrected", CborValue::Integer(0.into())),
+                ]),
+            ),
+            catalog_evidence_record(
+                9,
+                AuditEvent::TapeIoFenceReleased,
+                "tape_io_fence",
+                quarantine_id.as_str(),
+                detail(&[
+                    ("quarantine_id", CborValue::Text(quarantine_id.clone())),
+                    ("release_ack", CborValue::Text("verified".to_string())),
+                ]),
+            ),
+            catalog_evidence_record(
+                10,
+                AuditEvent::TapeSealed,
+                "tape",
+                tape_id.as_str(),
+                BTreeMap::new(),
+            ),
+        ];
+
+        let first = index
+            .rebuild_from_authoritative_sources(&records, &[])
+            .expect("first evidence replay");
+        assert!(first.preserved_fallbacks.is_empty(), "{first:?}");
+        assert!(first.replay_divergences.is_empty(), "{first:?}");
+        let replayed_tape = index
+            .get_tape(&tape_uuid)
+            .expect("replayed tape lookup")
+            .expect("replayed tape row");
+        assert_eq!(replayed_tape.voltag, preserved_tape.voltag);
+        assert_eq!(replayed_tape.pool_id, preserved_tape.pool_id);
+        assert_eq!(replayed_tape.state, preserved_tape.state);
+        let replayed_alarm = index
+            .get_alarm("snapshot-persist-failing:mainlib")
+            .expect("replayed alarm lookup")
+            .expect("replayed alarm row");
+        assert_eq!(replayed_alarm.kind, preserved_alarm.kind);
+        assert_eq!(replayed_alarm.severity, preserved_alarm.severity);
+        assert_eq!(replayed_alarm.state, preserved_alarm.state);
+        assert_eq!(replayed_alarm.detail, preserved_alarm.detail);
+        let replayed_fence = index
+            .tape_io_fence_by_quarantine_id(quarantine_id.as_str())
+            .expect("replayed fence lookup")
+            .expect("replayed fence row");
+        assert_eq!(replayed_fence.tape_uuid, preserved_fence.tape_uuid);
+        assert_eq!(replayed_fence.barcode, preserved_fence.barcode);
+        assert_eq!(replayed_fence.state, preserved_fence.state);
+        assert_eq!(replayed_fence.reason, preserved_fence.reason);
+        assert_eq!(replayed_fence.evidence_json, preserved_fence.evidence_json);
+        assert_eq!(replayed_fence.release_ack, preserved_fence.release_ack);
+        assert_eq!(
+            index
+                .list_drive_health_snapshots(drive.drive_uuid.as_slice())
+                .expect("replayed health lookup"),
+            preserved_health
+        );
+        let expected = (
+            index.get_tape(&tape_uuid).expect("tape lookup"),
+            index
+                .get_alarm("snapshot-persist-failing:mainlib")
+                .expect("alarm lookup"),
+            index
+                .tape_io_fence_by_quarantine_id(quarantine_id.as_str())
+                .expect("fence lookup"),
+            index
+                .list_drive_health_snapshots(drive.drive_uuid.as_slice())
+                .expect("health snapshots"),
+            index
+                .get_drive_by_uuid(drive.drive_uuid.as_slice())
+                .expect("drive lookup"),
+        );
+
+        let second = index
+            .rebuild_from_authoritative_sources(&records, &[])
+            .expect("second evidence replay");
+        assert!(second.preserved_fallbacks.is_empty(), "{second:?}");
+        assert!(second.replay_divergences.is_empty(), "{second:?}");
+        let actual = (
+            index.get_tape(&tape_uuid).expect("tape lookup"),
+            index
+                .get_alarm("snapshot-persist-failing:mainlib")
+                .expect("alarm lookup"),
+            index
+                .tape_io_fence_by_quarantine_id(quarantine_id.as_str())
+                .expect("fence lookup"),
+            index
+                .list_drive_health_snapshots(drive.drive_uuid.as_slice())
+                .expect("health snapshots"),
+            index
+                .get_drive_by_uuid(drive.drive_uuid.as_slice())
+                .expect("drive lookup"),
+        );
+        assert_eq!(actual, expected);
+        let tape = actual.0.expect("tape row");
+        assert_eq!(tape.state, "sealed");
+        assert_eq!(tape.voltag.as_deref(), Some("RMN042L9"));
+        assert_eq!(tape.pool_id.as_deref(), Some("camera.copy-a"));
+        assert_eq!(actual.1.expect("alarm row").state, "acked");
+        assert_eq!(actual.2.expect("fence row").state, "released");
+        assert_eq!(actual.3.len(), 1);
+        assert!(!actual.4.expect("drive row").fenced);
+    }
+
+    #[test]
+    fn catalog_evidence_replay_reports_cache_divergence_and_applies_ledger() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [0x43; 16];
+        let stale_binding_tape_uuid = [0x44; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: stale_binding_tape_uuid,
+                voltag: "LEDGER43L9".to_string(),
+                block_size: 262_144,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("seed conflicting barcode binding cache");
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "CACHE43L9".to_string(),
+                block_size: 262_144,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("seed divergent tape cache");
+        let drive = index
+            .observe_drive(DriveObservationInput {
+                serial: "DRV-DIVERGENT".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("mainlib".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-05-27T10:00:00Z".to_string()),
+            })
+            .expect("observe divergent drive");
+        let health_session = Uuid::from_u128(0x4343).to_string();
+        index
+            .record_drive_health_snapshot(DriveHealthSnapshotInput {
+                drive_uuid: drive.drive_uuid.clone(),
+                trigger: "manual".to_string(),
+                session_id: Some(health_session.clone()),
+                tape_alert_flags: None,
+                write_errors_corrected: Some(99),
+                write_errors_uncorrected: Some(0),
+                read_errors_corrected: Some(0),
+                read_errors_uncorrected: Some(0),
+                raw_pages: None,
+                at_utc: Some("2026-05-27T10:02:00Z".to_string()),
+            })
+            .expect("seed divergent drive-health cache");
+        let tape_record = catalog_evidence_record(
+            1,
+            AuditEvent::TapeProvisioned,
+            "tape",
+            hex_uuid(tape_uuid).as_str(),
+            detail(&[
+                ("voltag", CborValue::Text("LEDGER43L9".to_string())),
+                ("block_size", CborValue::Integer(262_144.into())),
+                ("geometry", CborValue::Text("no-parity".to_string())),
+            ]),
+        );
+        let health_record = catalog_evidence_record(
+            2,
+            AuditEvent::DriveHealthObserved,
+            "drive",
+            hex_uuid_from_slice(drive.drive_uuid.as_slice()).as_str(),
+            detail(&[
+                ("drive_uuid", CborValue::Bytes(drive.drive_uuid.clone())),
+                ("drive_serial", CborValue::Text("DRV-DIVERGENT".to_string())),
+                (
+                    "at_utc",
+                    CborValue::Text("2026-05-27T10:02:00Z".to_string()),
+                ),
+                ("trigger", CborValue::Text("manual".to_string())),
+                ("session_id", CborValue::Text(health_session)),
+                ("write_errors_corrected", CborValue::Integer(3.into())),
+                ("write_errors_uncorrected", CborValue::Integer(0.into())),
+                ("read_errors_corrected", CborValue::Integer(0.into())),
+                ("read_errors_uncorrected", CborValue::Integer(0.into())),
+            ]),
+        );
+
+        let report = index
+            .rebuild_from_authoritative_sources(&[tape_record, health_record], &[])
+            .expect("rebuild applies ledger value");
+
+        assert!(
+            report.preserved_fallbacks.iter().any(|value| {
+                value.contains("barcode binding row")
+                    && value.contains(hex_uuid(stale_binding_tape_uuid).as_str())
+            }),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .replay_divergences
+                .iter()
+                .any(|value| value.contains("field voltag") && value.contains("CACHE43L9")),
+            "{report:?}"
+        );
+        assert!(
+            report.replay_divergences.iter().any(|value| {
+                value.contains("drive-health")
+                    && value.contains("write_errors_corrected")
+                    && value.contains("99")
+            }),
+            "{report:?}"
+        );
+        assert!(
+            report.replay_divergences.iter().any(|value| {
+                value.contains("barcode binding row voltag=LEDGER43L9")
+                    && value.contains(hex_uuid(stale_binding_tape_uuid).as_str())
+                    && value.contains(hex_uuid(tape_uuid).as_str())
+            }),
+            "{report:?}"
+        );
+        assert_eq!(
+            index
+                .get_tape(&tape_uuid)
+                .expect("tape lookup")
+                .expect("tape row")
+                .voltag
+                .as_deref(),
+            Some("LEDGER43L9")
+        );
+        assert_eq!(
+            index
+                .get_tape(&stale_binding_tape_uuid)
+                .expect("stale binding tape lookup")
+                .expect("stale binding tape row")
+                .voltag,
+            None
+        );
+        assert_eq!(
+            index
+                .list_drive_health_snapshots(drive.drive_uuid.as_slice())
+                .expect("drive health lookup")[0]
+                .write_errors_corrected,
+            Some(3)
+        );
     }
 
     #[test]

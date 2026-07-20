@@ -126,6 +126,10 @@ pub enum AuditEvent {
     TapeRetired,
     /// A tape was provisioned after a bootstrap write.
     TapeProvisioned,
+    /// A tape was assigned to an operator-defined pool.
+    TapePoolAssigned,
+    /// A tape was sealed against future appends.
+    TapeSealed,
     /// A drive was permanently removed from the managed fleet.
     DriveRetired,
     /// Operator metadata was attached to a drive.
@@ -142,6 +146,16 @@ pub enum AuditEvent {
     DriveUnfenced,
     /// A standing alarm was acknowledged.
     AlarmAcked,
+    /// A standing alarm was raised or refreshed.
+    AlarmRaised,
+    /// A standing alarm was cleared.
+    AlarmCleared,
+    /// A tape-I/O quarantine fence was raised.
+    TapeIoFenceRaised,
+    /// A tape-I/O quarantine fence was released.
+    TapeIoFenceReleased,
+    /// A drive-health measurement was recorded.
+    DriveHealthObserved,
 }
 
 /// Subject of an audit event.
@@ -1206,6 +1220,8 @@ impl AuditEvent {
             AuditEvent::AuditWriteFailed => "AuditWriteFailed",
             AuditEvent::TapeRetired => "TapeRetired",
             AuditEvent::TapeProvisioned => "TapeProvisioned",
+            AuditEvent::TapePoolAssigned => "TapePoolAssigned",
+            AuditEvent::TapeSealed => "TapeSealed",
             AuditEvent::DriveRetired => "DriveRetired",
             AuditEvent::DriveAnnotated => "DriveAnnotated",
             AuditEvent::DriveCleaned => "DriveCleaned",
@@ -1214,6 +1230,11 @@ impl AuditEvent {
             AuditEvent::DriveFenced => "DriveFenced",
             AuditEvent::DriveUnfenced => "DriveUnfenced",
             AuditEvent::AlarmAcked => "AlarmAcked",
+            AuditEvent::AlarmRaised => "AlarmRaised",
+            AuditEvent::AlarmCleared => "AlarmCleared",
+            AuditEvent::TapeIoFenceRaised => "TapeIoFenceRaised",
+            AuditEvent::TapeIoFenceReleased => "TapeIoFenceReleased",
+            AuditEvent::DriveHealthObserved => "DriveHealthObserved",
         }
     }
 
@@ -1246,6 +1267,8 @@ impl AuditEvent {
             "AuditWriteFailed" => Ok(Self::AuditWriteFailed),
             "TapeRetired" => Ok(Self::TapeRetired),
             "TapeProvisioned" => Ok(Self::TapeProvisioned),
+            "TapePoolAssigned" => Ok(Self::TapePoolAssigned),
+            "TapeSealed" => Ok(Self::TapeSealed),
             "DriveRetired" => Ok(Self::DriveRetired),
             "DriveAnnotated" => Ok(Self::DriveAnnotated),
             "DriveCleaned" => Ok(Self::DriveCleaned),
@@ -1254,6 +1277,11 @@ impl AuditEvent {
             "DriveFenced" => Ok(Self::DriveFenced),
             "DriveUnfenced" => Ok(Self::DriveUnfenced),
             "AlarmAcked" => Ok(Self::AlarmAcked),
+            "AlarmRaised" => Ok(Self::AlarmRaised),
+            "AlarmCleared" => Ok(Self::AlarmCleared),
+            "TapeIoFenceRaised" => Ok(Self::TapeIoFenceRaised),
+            "TapeIoFenceReleased" => Ok(Self::TapeIoFenceReleased),
+            "DriveHealthObserved" => Ok(Self::DriveHealthObserved),
             _ => Err(StateError::AuditCorrupt(format!(
                 "unknown audit event {value}"
             ))),

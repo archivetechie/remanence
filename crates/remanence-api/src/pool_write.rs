@@ -267,12 +267,18 @@ pub struct PoolWriteResult {
     /// this empty because no tape transfer happened in that call.
     pub write_report: Option<StreamingObjectWriteReport>,
     append_commit_diagnostics: AppendCommitDiagnostics,
+    sealed_after_write: bool,
 }
 
 impl PoolWriteResult {
     /// True when this result was returned from the catalog replay path.
     pub fn is_replay(&self) -> bool {
         self.write_report.is_none()
+    }
+
+    /// Whether this commit crossed a sealing threshold and closed the tape.
+    pub fn sealed_after_write(&self) -> bool {
+        self.sealed_after_write
     }
 
     /// Borrow the streaming report for callers that require proof of a new write.
@@ -3159,9 +3165,10 @@ fn write_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
         transfer_stats.early_warning,
     );
     let commit_elapsed = commit_started.elapsed();
-    match commit_result {
-        Ok(()) => {
-            log_commit_diagnostics(&request, &selected, &prepared, commit_elapsed, "ok", None)
+    let sealed_after_write = match commit_result {
+        Ok(sealed_after_write) => {
+            log_commit_diagnostics(&request, &selected, &prepared, commit_elapsed, "ok", None);
+            sealed_after_write
         }
         Err(err) => {
             let error = err.to_string();
@@ -3175,7 +3182,7 @@ fn write_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
             );
             return Err(err);
         }
-    }
+    };
     Ok(pool_write_result(
         request,
         selected,
@@ -3186,6 +3193,7 @@ fn write_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
             filemark_write_drain: transfer_stats.filemark_write_drain,
             catalog_journal_fsync: commit_elapsed,
         },
+        sealed_after_write,
     ))
 }
 
@@ -3334,9 +3342,10 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
         transfer_stats.early_warning,
     );
     let commit_elapsed = commit_started.elapsed();
-    match commit_result {
-        Ok(()) => {
-            log_commit_diagnostics(&request, &selected, &prepared, commit_elapsed, "ok", None)
+    let sealed_after_write = match commit_result {
+        Ok(sealed_after_write) => {
+            log_commit_diagnostics(&request, &selected, &prepared, commit_elapsed, "ok", None);
+            sealed_after_write
         }
         Err(err) => {
             let error = err.to_string();
@@ -3350,7 +3359,7 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
             );
             return Err(err);
         }
-    }
+    };
     Ok(pool_write_result(
         request,
         selected,
@@ -3361,6 +3370,7 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
             filemark_write_drain: transfer_stats.filemark_write_drain,
             catalog_journal_fsync: commit_elapsed,
         },
+        sealed_after_write,
     ))
 }
 
@@ -3424,7 +3434,7 @@ fn commit_pool_write(
     projection: CommitPoolWriteProjection,
     pool_cfg: &TapePoolConfig,
     hardware_early_warning: bool,
-) -> Result<(), PoolWriteError> {
+) -> Result<bool, PoolWriteError> {
     let first_body_lba = first_payload_body_lba(write_report);
     let metadata_hash =
         if projection.copy_representation.representation == OBJECT_COPY_REPRESENTATION_PLAINTEXT {
@@ -3484,8 +3494,7 @@ fn commit_pool_write(
             &write_report.catalog.tape_file_bundle,
         )?;
     }
-    seal_selected_tape_if_needed(state, selected, pool_cfg, hardware_early_warning)?;
-    Ok(())
+    seal_selected_tape_if_needed(state, selected, pool_cfg, hardware_early_warning)
 }
 
 fn native_object_file_projection(file: &FileCatalogProjection) -> NativeObjectFileProjectionInput {
@@ -3509,6 +3518,7 @@ fn pool_write_result(
     copy_representation: CopyRepresentation,
     write_report: StreamingObjectWriteReport,
     append_commit_diagnostics: AppendCommitDiagnostics,
+    sealed_after_write: bool,
 ) -> PoolWriteResult {
     let first_body_lba = first_payload_body_lba(&write_report);
     let object = PoolWriteObjectRecord {
@@ -3533,6 +3543,7 @@ fn pool_write_result(
         object,
         write_report: Some(write_report),
         append_commit_diagnostics,
+        sealed_after_write,
     }
 }
 
@@ -3574,6 +3585,7 @@ pub(crate) fn maybe_replay_pool_write(
         object: pool_write_object_record_from_native(existing, pool_cfg.id.as_str())?,
         write_report: None,
         append_commit_diagnostics: AppendCommitDiagnostics::default(),
+        sealed_after_write: false,
     }))
 }
 
@@ -4742,7 +4754,7 @@ fn seal_selected_tape_if_needed(
     selected: &SelectedTape,
     pool_cfg: &TapePoolConfig,
     hardware_early_warning: bool,
-) -> Result<(), PoolWriteError> {
+) -> Result<bool, PoolWriteError> {
     let tape = state.get_tape(&selected.tape_uuid)?.ok_or_else(|| {
         PoolWriteError::MissingTapeGeometry("selected tape row is missing".into())
     })?;
@@ -4768,8 +4780,9 @@ fn seal_selected_tape_if_needed(
     .is_some()
     {
         state.seal_tape(selected.tape_uuid)?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn missing_geometry(reason: impl Into<String>) -> WritabilityError {
