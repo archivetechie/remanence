@@ -3853,7 +3853,7 @@ impl CatalogIndex {
                  from objects
                  where content_hash_algorithm = 'sha256' and content_hash = ?1
                  order by created_at_utc, object_id
-                 limit 1",
+                 limit 2",
             )
             .map_err(|err| sqlite_error("prepare native object content-hash lookup", err))?;
         let mut rows = stmt
@@ -3866,6 +3866,16 @@ impl CatalogIndex {
             return Ok(None);
         };
         let mut object = native_object_from_row(row)?;
+        if rows
+            .next()
+            .map_err(|err| sqlite_error("check native object content-hash uniqueness", err))?
+            .is_some()
+        {
+            return Err(StateError::AmbiguousCatalogLookup(format!(
+                "content digest {} matches multiple logical objects",
+                hex_bytes(content_hash)
+            )));
+        }
         drop(rows);
         drop(stmt);
         object = self.attach_native_object_copies(object)?;

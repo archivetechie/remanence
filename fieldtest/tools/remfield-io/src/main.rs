@@ -312,7 +312,7 @@ async fn wait_for_media_readiness_operation(channel: Channel, operation_id: Uuid
             }
             pb::OperationState::Failed
             | pb::OperationState::Cancelled
-            | pb::OperationState::Unknown => {
+            | pb::OperationState::CompletionUnknown => {
                 let summary = if status.error_summary.is_empty() {
                     format!("finished {state:?}")
                 } else {

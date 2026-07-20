@@ -4463,7 +4463,7 @@ async fn wait_for_operation(
             pb::OperationState::Succeeded
                 | pb::OperationState::Failed
                 | pb::OperationState::Cancelled
-                | pb::OperationState::Unknown
+                | pb::OperationState::CompletionUnknown
         ) {
             terminal = Some(status);
             break;
@@ -5063,8 +5063,7 @@ fn print_health(
     if !health.detail.is_empty() {
         let _ = writeln!(out, "detail: {}", health.detail);
     }
-    let mut components = health.components.into_iter().collect::<Vec<_>>();
-    components.sort_by(|a, b| a.0.cmp(&b.0));
+    let components = health_components(&health);
     if !components.is_empty() {
         let _ = writeln!(out, "components:");
         for (name, status) in components {
@@ -5614,9 +5613,39 @@ fn print_json_error(code: &str, message: &str, err: &mut dyn Write) -> Result<()
 fn health_json(health: &pb::HealthResponse) -> Value {
     json!({
         "status": health_status_name(health.status),
-        "components": health.components,
+        "components": health_components(health),
         "detail": health.detail,
     })
+}
+
+fn health_components(health: &pb::HealthResponse) -> std::collections::BTreeMap<String, String> {
+    if health.component_health.is_empty() {
+        return health
+            .components
+            .iter()
+            .map(|(component, status)| (component.clone(), status.clone()))
+            .collect();
+    }
+    health
+        .component_health
+        .iter()
+        .map(|component| {
+            let status = match pb::component_health::Status::try_from(component.status)
+                .unwrap_or(pb::component_health::Status::Unspecified)
+            {
+                pb::component_health::Status::Healthy => "healthy".to_string(),
+                pb::component_health::Status::ReadOnly => "read_only".to_string(),
+                pb::component_health::Status::Degraded => "degraded".to_string(),
+                pb::component_health::Status::Failed => "failed".to_string(),
+                pb::component_health::Status::Other if !component.other_status.is_empty() => {
+                    component.other_status.clone()
+                }
+                pb::component_health::Status::Other => "other".to_string(),
+                pb::component_health::Status::Unspecified => "unspecified".to_string(),
+            };
+            (component.component.clone(), status)
+        })
+        .collect()
 }
 
 fn version_json(version: &pb::VersionResponse) -> Value {
@@ -5714,12 +5743,19 @@ fn drive_event_json(event: &pb::DriveHistoryEvent) -> Value {
 }
 
 fn drive_snapshot_json(snapshot: &pb::DriveHealthSnapshot) -> Value {
+    let session_id = if snapshot.session_uuid.len() == 16 {
+        Some(bytes_to_uuid_text(&snapshot.session_uuid))
+    } else if snapshot.session_id.is_empty() {
+        None
+    } else {
+        Some(snapshot.session_id.clone())
+    };
     json!({
         "snapshot_id": snapshot.snapshot_id,
         "drive_uuid": bytes_to_uuid_text(&snapshot.drive_uuid),
         "at_utc": timestamp_value(snapshot.at_utc.as_ref()),
         "trigger": snapshot.trigger,
-        "session_id": snapshot.session_id,
+        "session_id": session_id,
         "tape_alert_flags": snapshot.tape_alert_flags,
         "write_errors_corrected": snapshot.write_errors_corrected,
         "write_errors_uncorrected": snapshot.write_errors_uncorrected,
@@ -5989,7 +6025,8 @@ fn operation_state_name(value: i32) -> &'static str {
         3 => "succeeded",
         4 => "failed",
         5 => "cancelled",
-        6 => "unknown",
+        6 => "legacy_unknown",
+        7 => "completion_unknown",
         _ => "unspecified",
     }
 }
@@ -6042,7 +6079,8 @@ fn catalog_entry_state_name(value: i32) -> &'static str {
         2 => "partial",
         3 => "damaged",
         4 => "unsupported",
-        5 => "unknown",
+        5 => "legacy_unknown",
+        6 => "unclassified",
         _ => "unspecified",
     }
 }
@@ -15454,6 +15492,15 @@ mod tests {
                 status: pb::health_response::Status::Healthy as i32,
                 components,
                 detail: "sqlite quick_check=ok".to_string(),
+                component_health: vec![pb::ComponentHealth {
+                    component: "sqlite_index".to_string(),
+                    status: pb::component_health::Status::Healthy as i32,
+                    other_status: String::new(),
+                }, pb::ComponentHealth {
+                    component: "robot".to_string(),
+                    status: pb::component_health::Status::Other as i32,
+                    other_status: "warming".to_string(),
+                }],
             },
             true,
             &mut out,
@@ -15464,7 +15511,8 @@ mod tests {
         assert_eq!(value["schema"], "rem.daemon.health.v1");
         assert_eq!(value["kind"], "item");
         assert_eq!(value["data"]["status"], "healthy");
-        assert_eq!(value["data"]["components"]["sqlite_index"], "ok");
+        assert_eq!(value["data"]["components"]["sqlite_index"], "healthy");
+        assert_eq!(value["data"]["components"]["robot"], "warming");
         assert!(value["operation"].is_null());
     }
 
