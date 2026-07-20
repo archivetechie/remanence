@@ -6493,6 +6493,8 @@ mod tests {
                 kind: "bootstrap".to_string(),
                 block_count: 1,
                 object_id: None,
+                canonical_metadata_hash: None,
+                canonical_metadata_hash_algorithm: None,
             },
             TapeFileRecord {
                 tape_uuid: tape_uuid.clone(),
@@ -6500,6 +6502,8 @@ mod tests {
                 kind: "object".to_string(),
                 block_count: 10,
                 object_id: Some("first".to_string()),
+                canonical_metadata_hash: None,
+                canonical_metadata_hash_algorithm: None,
             },
             TapeFileRecord {
                 tape_uuid,
@@ -6507,6 +6511,8 @@ mod tests {
                 kind: "object".to_string(),
                 block_count: 3,
                 object_id: Some("target".to_string()),
+                canonical_metadata_hash: None,
+                canonical_metadata_hash_algorithm: None,
             },
         ];
         assert_eq!(derive_physical_file_start_lba(&files, 2), Some(13));

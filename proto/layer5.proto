@@ -55,6 +55,13 @@ message OperationRef {
   bytes operation_id = 1; // 16-byte UUID assigned by daemon.
 }
 
+// A digest claim whose algorithm remains explicit and independently evolvable.
+// Writers currently emit only algorithm="sha256".
+message Digest {
+  string algorithm = 1;
+  bytes value       = 2;
+}
+
 // State of a long-running operation.
 enum OperationState {
   OPERATION_STATE_UNSPECIFIED = 0;
@@ -635,6 +642,7 @@ message TapeFile {
   uint64 block_count           = 4;
   // Set for kind="object".
   bytes object_id              = 5;
+  Digest canonical_metadata_digest = 6;
 }
 
 enum AppendMode {
@@ -672,6 +680,11 @@ message ObjectRecord {
   google.protobuf.Timestamp created_at = 7;
   repeated ObjectCopy copies   = 8;
   AppendCommitInfo append_commit_info = 9;
+  // Algorithm-aware mirror of content_sha256. During the compatibility
+  // window servers populate both fields with the same SHA-256 value.
+  Digest content_digest        = 10;
+  // Canonical body-format metadata digest when the catalog has one.
+  Digest metadata_digest       = 11;
 }
 
 message ObjectCopy {
@@ -692,6 +705,8 @@ message ObjectCopy {
   Health health                = 5;
   // Pool of the tape when this copy was committed. Empty means unassigned.
   string pool_id               = 6;
+  Digest plaintext_digest      = 7;
+  Digest stored_digest         = 8;
 }
 
 // A single payload file inside an object (rem-tar-v1: one pax entry).
@@ -706,6 +721,9 @@ message FileRecord {
   // chunk-aligned start).
   uint64 first_chunk_body_lba  = 6;
   uint32 chunk_count           = 7;
+  // Algorithm-aware mirror of file_sha256. During the compatibility window
+  // servers populate both fields with the same SHA-256 value.
+  Digest file_digest           = 8;
 }
 
 message ListTapesRequest {
@@ -756,6 +774,7 @@ message GetObjectRequest {
     bytes  object_id        = 1; // Remanence UUID
     bytes  content_sha256   = 2; // by content hash
     string caller_object_id = 3; // by orchestrator-supplied id
+    Digest content_digest   = 4; // algorithm-aware logical-asset identity
   }
 }
 
@@ -764,6 +783,7 @@ message FindObjectCopiesRequest {
     bytes  object_id        = 1;
     bytes  content_sha256   = 2;
     string caller_object_id = 3;
+    Digest content_digest   = 4;
   }
 }
 message FindObjectCopiesResponse {
@@ -1055,6 +1075,8 @@ message AppendObjectStart {
   // Whether the caller retains immutable source bytes and can replay them
   // from byte zero after an interrupted overlap append.
   SourceReplayCapability source_replay_capability = 7;
+  // Algorithm-aware mirror of expected_content_sha256.
+  Digest expected_content_digest = 8;
 }
 
 message AppendObjectChunk {
@@ -1067,6 +1089,8 @@ message AppendObjectFinish {
   // If client pre-computed the object's content_sha256, daemon validates
   // before committing.
   bytes expected_content_sha256 = 2;
+  // Algorithm-aware mirror of expected_content_sha256.
+  Digest expected_content_digest = 3;
 }
 
 message CheckpointSessionRequest {

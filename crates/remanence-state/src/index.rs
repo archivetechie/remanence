@@ -20,7 +20,10 @@ use crate::config::{derive_tape_pool_from_voltag, TapePoolRuleConfig};
 use crate::error::StateError;
 
 /// Current Layer 4 SQLite schema version.
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
+
+/// Digest algorithm emitted by the current catalog writers.
+pub const DIGEST_ALGORITHM_SHA256: &str = "sha256";
 const LEGACY_TAPE_POOL_MEMBERSHIPS_TABLE: &str = concat!("tape_pool_", "memberships");
 /// Catalog value for an unencrypted RAO copy row.
 pub const OBJECT_COPY_REPRESENTATION_PLAINTEXT: &str = "plaintext";
@@ -643,8 +646,12 @@ pub struct NativeObjectRecord {
     pub logical_size_bytes: Option<u64>,
     /// Content hash if known.
     pub content_hash: Option<Vec<u8>>,
+    /// Algorithm naming the content hash when present.
+    pub content_hash_algorithm: Option<String>,
     /// Metadata hash if known.
     pub metadata_hash: Option<Vec<u8>>,
+    /// Algorithm naming the metadata hash when present.
+    pub metadata_hash_algorithm: Option<String>,
     /// Creation timestamp.
     pub created_at_utc: String,
     /// Known object copies.
@@ -678,8 +685,12 @@ pub struct NativeObjectCopyRecord {
     pub metadata_frame_len: Option<u64>,
     /// SHA-256 of the canonical plaintext RAO object bytes.
     pub plaintext_digest: Option<Vec<u8>>,
+    /// Algorithm naming the plaintext digest when present.
+    pub plaintext_digest_algorithm: Option<String>,
     /// SHA-256 of the stored representation bytes for this copy.
     pub stored_digest: Option<Vec<u8>>,
+    /// Algorithm naming the stored digest when present.
+    pub stored_digest_algorithm: Option<String>,
 }
 
 /// Native object member-file row for catalog-backed partial-file restore.
@@ -695,6 +706,8 @@ pub struct NativeObjectFileRecord {
     pub size_bytes: u64,
     /// SHA-256 of the exact file payload bytes.
     pub file_sha256: Vec<u8>,
+    /// Algorithm naming `file_sha256`.
+    pub file_digest_algorithm: String,
     /// First object-local body LBA containing file data.
     pub first_chunk_lba: Option<u64>,
     /// Number of body chunks containing file data.
@@ -873,6 +886,10 @@ pub struct TapeFileRecord {
     pub block_count: u64,
     /// Object id when kind is `object`.
     pub object_id: Option<String>,
+    /// Canonical metadata digest when recorded by the tape journal.
+    pub canonical_metadata_hash: Option<Vec<u8>>,
+    /// Algorithm naming the canonical metadata digest when present.
+    pub canonical_metadata_hash_algorithm: Option<String>,
 }
 
 impl CatalogIndex {
@@ -3603,7 +3620,8 @@ impl CatalogIndex {
         let mut stmt = self
             .conn
             .prepare(
-                "select tape_uuid, tape_file_number, kind, block_count, object_id
+                "select tape_uuid, tape_file_number, kind, block_count, object_id,
+                        canonical_metadata_hash, canonical_metadata_hash_algorithm
                  from tape_files
                  where tape_uuid = ?1
                  order by tape_file_number",
@@ -3653,7 +3671,8 @@ impl CatalogIndex {
             .conn
             .prepare(
                 "select object_id, caller_object_id, body_format, logical_size_bytes,
-                        content_hash, metadata_hash, created_at_utc
+                        content_hash, content_hash_algorithm,
+                        metadata_hash, metadata_hash_algorithm, created_at_utc
                  from objects
                  order by created_at_utc, object_id",
             )
@@ -3694,7 +3713,8 @@ impl CatalogIndex {
             .prepare(
                 "select objects.object_id, objects.caller_object_id,
                         objects.body_format, objects.logical_size_bytes,
-                        objects.content_hash, objects.metadata_hash,
+                        objects.content_hash, objects.content_hash_algorithm,
+                        objects.metadata_hash, objects.metadata_hash_algorithm,
                         objects.created_at_utc,
                         object_copies.object_id, object_copies.tape_uuid,
                         object_copies.tape_file_number,
@@ -3707,7 +3727,9 @@ impl CatalogIndex {
                         object_copies.recipient_epoch_ids,
                         object_copies.metadata_frame_len,
                         object_copies.plaintext_digest,
-                        object_copies.stored_digest
+                        object_copies.plaintext_digest_algorithm,
+                        object_copies.stored_digest,
+                        object_copies.stored_digest_algorithm
                  from objects
                  left join object_copies
                    on object_copies.object_id = objects.object_id
@@ -3737,7 +3759,7 @@ impl CatalogIndex {
                 }
                 current = Some(native_object_from_row(row)?);
             }
-            if let Some(copy) = native_object_copy_from_join_row(row, 7)? {
+            if let Some(copy) = native_object_copy_from_join_row(row, 9)? {
                 if let Some(object) = current.as_mut() {
                     object.copies.push(copy);
                 }
@@ -3770,7 +3792,8 @@ impl CatalogIndex {
             .conn
             .prepare(
                 "select object_id, file_id, path, size_bytes, file_sha256,
-                        first_chunk_lba, chunk_count, mtime, executable
+                        first_chunk_lba, chunk_count, mtime, executable,
+                        file_digest_algorithm
                  from object_files
                  where object_id = ?1 and file_id = ?2",
             )
@@ -3796,7 +3819,8 @@ impl CatalogIndex {
             .conn
             .prepare(
                 "select object_id, file_id, path, size_bytes, file_sha256,
-                        first_chunk_lba, chunk_count, mtime, executable
+                        first_chunk_lba, chunk_count, mtime, executable,
+                        file_digest_algorithm
                  from object_files
                  where object_id = ?1
                  order by path, file_id",
@@ -3824,9 +3848,10 @@ impl CatalogIndex {
             .conn
             .prepare(
                 "select object_id, caller_object_id, body_format, logical_size_bytes,
-                        content_hash, metadata_hash, created_at_utc
+                        content_hash, content_hash_algorithm,
+                        metadata_hash, metadata_hash_algorithm, created_at_utc
                  from objects
-                 where content_hash = ?1
+                 where content_hash_algorithm = 'sha256' and content_hash = ?1
                  order by created_at_utc, object_id
                  limit 1",
             )
@@ -3856,7 +3881,8 @@ impl CatalogIndex {
             .conn
             .prepare(
                 "select object_id, caller_object_id, body_format, logical_size_bytes,
-                        content_hash, metadata_hash, created_at_utc
+                        content_hash, content_hash_algorithm,
+                        metadata_hash, metadata_hash_algorithm, created_at_utc
                  from objects
                  where caller_object_id = ?1
                  order by created_at_utc, object_id
@@ -3890,7 +3916,8 @@ impl CatalogIndex {
             .conn
             .prepare(
                 "select object_id, caller_object_id, body_format, logical_size_bytes,
-                        content_hash, metadata_hash, created_at_utc
+                        content_hash, content_hash_algorithm,
+                        metadata_hash, metadata_hash_algorithm, created_at_utc
                  from objects
                  where caller_object_id = ?1
                    and exists (
@@ -3935,7 +3962,8 @@ impl CatalogIndex {
                         first_body_lba, first_parity_data_ordinal,
                         protected_until_ordinal, status, pool_id,
                         representation, recipient_epoch_ids, metadata_frame_len,
-                        plaintext_digest, stored_digest
+                        plaintext_digest, plaintext_digest_algorithm,
+                        stored_digest, stored_digest_algorithm
                  from object_copies
                  where object_id = ?1
                  order by hex(tape_uuid), tape_file_number",
@@ -3962,7 +3990,8 @@ impl CatalogIndex {
             .conn
             .prepare(
                 "select object_id, caller_object_id, body_format, logical_size_bytes,
-                        content_hash, metadata_hash, created_at_utc
+                        content_hash, content_hash_algorithm,
+                        metadata_hash, metadata_hash_algorithm, created_at_utc
                  from objects
                  where object_id = ?1",
             )
@@ -3995,7 +4024,8 @@ impl CatalogIndex {
                         first_body_lba, first_parity_data_ordinal,
                         protected_until_ordinal, status, pool_id,
                         representation, recipient_epoch_ids, metadata_frame_len,
-                        plaintext_digest, stored_digest
+                        plaintext_digest, plaintext_digest_algorithm,
+                        stored_digest, stored_digest_algorithm
                  from object_copies
                  order by object_id, hex(tape_uuid), tape_file_number",
             )
@@ -4974,15 +5004,23 @@ fn upsert_native_object_projection_tx(
     tx.execute(
         "insert into objects(
            object_id, caller_object_id, body_format, logical_size_bytes,
-           content_hash, metadata_hash, created_at_utc
+           content_hash, content_hash_algorithm,
+           metadata_hash, metadata_hash_algorithm, created_at_utc
          )
-         values(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         values(
+           ?1, ?2, ?3, ?4,
+           ?5, case when ?5 is null then null else 'sha256' end,
+           ?6, case when ?6 is null then null else 'sha256' end,
+           ?7
+         )
          on conflict(object_id) do update set
            caller_object_id = excluded.caller_object_id,
            body_format = excluded.body_format,
            logical_size_bytes = excluded.logical_size_bytes,
            content_hash = excluded.content_hash,
-           metadata_hash = excluded.metadata_hash",
+           content_hash_algorithm = excluded.content_hash_algorithm,
+           metadata_hash = excluded.metadata_hash,
+           metadata_hash_algorithm = excluded.metadata_hash_algorithm",
         params![
             object.object_id.as_str(),
             object.caller_object_id.as_deref(),
@@ -5100,9 +5138,9 @@ fn insert_native_object_file_projection_tx(
     tx.execute(
         "insert into object_files(
            object_id, file_id, path, size_bytes, file_sha256,
-           first_chunk_lba, chunk_count, mtime, executable
+           first_chunk_lba, chunk_count, mtime, executable, file_digest_algorithm
          )
-         values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'sha256')",
         params![
             file.object_id.as_str(),
             file.file_id.as_str(),
@@ -6767,9 +6805,15 @@ fn insert_tape_file(
         "insert into tape_files(
            tape_uuid, tape_file_number, kind, block_count, physical_start_hint,
            object_id, first_parity_data_ordinal, epoch_id, protected_ordinal_start,
-           protected_ordinal_end_exclusive, canonical_metadata_hash, bundle_uuid, bundle_kind
+           protected_ordinal_end_exclusive,
+           canonical_metadata_hash, canonical_metadata_hash_algorithm,
+           bundle_uuid, bundle_kind
          )
-         values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, null, null)
+         values(
+           ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+           ?11, case when ?11 is null then null else 'sha256' end,
+           null, null
+         )
          on conflict(tape_uuid, tape_file_number) do update set
            kind = excluded.kind,
            block_count = excluded.block_count,
@@ -6780,6 +6824,7 @@ fn insert_tape_file(
            protected_ordinal_start = excluded.protected_ordinal_start,
            protected_ordinal_end_exclusive = excluded.protected_ordinal_end_exclusive,
            canonical_metadata_hash = excluded.canonical_metadata_hash,
+           canonical_metadata_hash_algorithm = excluded.canonical_metadata_hash_algorithm,
            bundle_uuid = excluded.bundle_uuid,
            bundle_kind = excluded.bundle_kind",
         params![
@@ -7023,11 +7068,14 @@ fn insert_object_copy_projection_tx(
            object_id, tape_uuid, tape_file_number,
            first_body_lba, first_parity_data_ordinal,
            protected_until_ordinal, status, representation, recipient_epoch_ids,
-           metadata_frame_len, plaintext_digest, stored_digest, pool_id
+           metadata_frame_len,
+           plaintext_digest, plaintext_digest_algorithm,
+           stored_digest, stored_digest_algorithm, pool_id
          )
          values(
            ?1, ?2, ?3, ?4, ?5, ?6, ?7, coalesce(?8, 'unknown'), ?9, ?10,
-           ?11, ?12,
+           ?11, case when ?11 is null then null else 'sha256' end,
+           ?12, case when ?12 is null then null else 'sha256' end,
            (select pool_id from tapes where tape_uuid = ?2)
          )
          on conflict(object_id, tape_uuid, tape_file_number) do update set
@@ -7055,7 +7103,15 @@ fn insert_object_copy_projection_tx(
                else object_copies.metadata_frame_len
              end,
            plaintext_digest = coalesce(excluded.plaintext_digest, object_copies.plaintext_digest),
+           plaintext_digest_algorithm = coalesce(
+             excluded.plaintext_digest_algorithm,
+             object_copies.plaintext_digest_algorithm
+           ),
            stored_digest = coalesce(excluded.stored_digest, object_copies.stored_digest),
+           stored_digest_algorithm = coalesce(
+             excluded.stored_digest_algorithm,
+             object_copies.stored_digest_algorithm
+           ),
            pool_id = coalesce(object_copies.pool_id, excluded.pool_id)",
         params![
             row.object_id,
@@ -7085,6 +7141,27 @@ fn validate_optional_sha256(value: Option<&[u8]>, field: &str) -> Result<(), Sta
         }
     }
     Ok(())
+}
+
+fn validate_catalog_digest_pair(
+    value: Option<&[u8]>,
+    algorithm: Option<&str>,
+    field: &str,
+) -> Result<(), StateError> {
+    match (value, algorithm) {
+        (None, None) => Ok(()),
+        (Some(value), Some(DIGEST_ALGORITHM_SHA256)) => validate_optional_sha256(Some(value), field),
+        (Some(_), Some("")) => Err(StateError::IndexCorrupt(format!(
+            "{field} has an empty digest algorithm"
+        ))),
+        (Some(_), Some(_)) => Ok(()),
+        (Some(_), None) => Err(StateError::IndexCorrupt(format!(
+            "{field} has a value without an algorithm"
+        ))),
+        (None, Some(_)) => Err(StateError::IndexCorrupt(format!(
+            "{field} has an algorithm without a value"
+        ))),
+    }
 }
 
 fn validate_object_copy_envelope(
@@ -7320,6 +7397,22 @@ fn catalog_unit_from_row(row: &rusqlite::Row<'_>) -> Result<CatalogUnitRecord, S
 }
 
 fn native_object_from_row(row: &rusqlite::Row<'_>) -> Result<NativeObjectRecord, StateError> {
+    let content_hash: Option<Vec<u8>> = row_get(row, 4, "objects.content_hash")?;
+    let content_hash_algorithm: Option<String> =
+        row_get(row, 5, "objects.content_hash_algorithm")?;
+    validate_catalog_digest_pair(
+        content_hash.as_deref(),
+        content_hash_algorithm.as_deref(),
+        "objects.content_hash",
+    )?;
+    let metadata_hash: Option<Vec<u8>> = row_get(row, 6, "objects.metadata_hash")?;
+    let metadata_hash_algorithm: Option<String> =
+        row_get(row, 7, "objects.metadata_hash_algorithm")?;
+    validate_catalog_digest_pair(
+        metadata_hash.as_deref(),
+        metadata_hash_algorithm.as_deref(),
+        "objects.metadata_hash",
+    )?;
     Ok(NativeObjectRecord {
         object_id: row_get(row, 0, "objects.object_id")?,
         caller_object_id: row_get(row, 1, "objects.caller_object_id")?,
@@ -7329,9 +7422,11 @@ fn native_object_from_row(row: &rusqlite::Row<'_>) -> Result<NativeObjectRecord,
             row_get(row, 3, "objects.logical_size_bytes")?,
             "logical_size_bytes",
         )?,
-        content_hash: row_get(row, 4, "objects.content_hash")?,
-        metadata_hash: row_get(row, 5, "objects.metadata_hash")?,
-        created_at_utc: row_get(row, 6, "objects.created_at_utc")?,
+        content_hash,
+        content_hash_algorithm,
+        metadata_hash,
+        metadata_hash_algorithm,
+        created_at_utc: row_get(row, 8, "objects.created_at_utc")?,
         copies: Vec::new(),
     })
 }
@@ -7339,6 +7434,23 @@ fn native_object_from_row(row: &rusqlite::Row<'_>) -> Result<NativeObjectRecord,
 fn native_object_copy_from_row(
     row: &rusqlite::Row<'_>,
 ) -> Result<NativeObjectCopyRecord, StateError> {
+    let plaintext_digest: Option<Vec<u8>> =
+        row_get(row, 11, "object_copies.plaintext_digest")?;
+    let plaintext_digest_algorithm: Option<String> =
+        row_get(row, 12, "object_copies.plaintext_digest_algorithm")?;
+    validate_catalog_digest_pair(
+        plaintext_digest.as_deref(),
+        plaintext_digest_algorithm.as_deref(),
+        "object_copies.plaintext_digest",
+    )?;
+    let stored_digest: Option<Vec<u8>> = row_get(row, 13, "object_copies.stored_digest")?;
+    let stored_digest_algorithm: Option<String> =
+        row_get(row, 14, "object_copies.stored_digest_algorithm")?;
+    validate_catalog_digest_pair(
+        stored_digest.as_deref(),
+        stored_digest_algorithm.as_deref(),
+        "object_copies.stored_digest",
+    )?;
     Ok(NativeObjectCopyRecord {
         object_id: row_get(row, 0, "object_copies.object_id")?,
         tape_uuid: row_get(row, 1, "object_copies.tape_uuid")?,
@@ -7370,14 +7482,24 @@ fn native_object_copy_from_row(
             row_get(row, 10, "object_copies.metadata_frame_len")?,
             "metadata_frame_len",
         )?,
-        plaintext_digest: row_get(row, 11, "object_copies.plaintext_digest")?,
-        stored_digest: row_get(row, 12, "object_copies.stored_digest")?,
+        plaintext_digest,
+        plaintext_digest_algorithm,
+        stored_digest,
+        stored_digest_algorithm,
     })
 }
 
 fn native_object_file_from_row(
     row: &rusqlite::Row<'_>,
 ) -> Result<NativeObjectFileRecord, StateError> {
+    let file_sha256: Vec<u8> = row_get(row, 4, "object_files.file_sha256")?;
+    let file_digest_algorithm: String =
+        row_get(row, 9, "object_files.file_digest_algorithm")?;
+    validate_catalog_digest_pair(
+        Some(file_sha256.as_slice()),
+        Some(file_digest_algorithm.as_str()),
+        "object_files.file_sha256",
+    )?;
     let executable = row_get::<Option<i64>>(row, 8, "object_files.executable")?
         .map(|value| match value {
             0 => Ok(false),
@@ -7392,7 +7514,8 @@ fn native_object_file_from_row(
         file_id: row_get(row, 1, "object_files.file_id")?,
         path: row_get(row, 2, "object_files.path")?,
         size_bytes: i64_to_u64(row_get(row, 3, "object_files.size_bytes")?, "size_bytes")?,
-        file_sha256: row_get(row, 4, "object_files.file_sha256")?,
+        file_sha256,
+        file_digest_algorithm,
         first_chunk_lba: opt_i64_to_u64(
             row_get(row, 5, "object_files.first_chunk_lba")?,
             "first_chunk_lba",
@@ -7411,6 +7534,30 @@ fn native_object_copy_from_join_row(
     let Some(object_id) = object_id else {
         return Ok(None);
     };
+    let plaintext_digest: Option<Vec<u8>> =
+        row_get(row, offset + 11, "object_copies.plaintext_digest")?;
+    let plaintext_digest_algorithm: Option<String> = row_get(
+        row,
+        offset + 12,
+        "object_copies.plaintext_digest_algorithm",
+    )?;
+    validate_catalog_digest_pair(
+        plaintext_digest.as_deref(),
+        plaintext_digest_algorithm.as_deref(),
+        "object_copies.plaintext_digest",
+    )?;
+    let stored_digest: Option<Vec<u8>> =
+        row_get(row, offset + 13, "object_copies.stored_digest")?;
+    let stored_digest_algorithm: Option<String> = row_get(
+        row,
+        offset + 14,
+        "object_copies.stored_digest_algorithm",
+    )?;
+    validate_catalog_digest_pair(
+        stored_digest.as_deref(),
+        stored_digest_algorithm.as_deref(),
+        "object_copies.stored_digest",
+    )?;
     Ok(Some(NativeObjectCopyRecord {
         object_id,
         tape_uuid: row_get(row, offset + 1, "object_copies.tape_uuid")?,
@@ -7442,8 +7589,10 @@ fn native_object_copy_from_join_row(
             row_get(row, offset + 10, "object_copies.metadata_frame_len")?,
             "metadata_frame_len",
         )?,
-        plaintext_digest: row_get(row, offset + 11, "object_copies.plaintext_digest")?,
-        stored_digest: row_get(row, offset + 12, "object_copies.stored_digest")?,
+        plaintext_digest,
+        plaintext_digest_algorithm,
+        stored_digest,
+        stored_digest_algorithm,
     }))
 }
 
@@ -8025,6 +8174,18 @@ fn raise_alarm_tx(
 }
 
 fn tape_file_from_row(row: &rusqlite::Row<'_>) -> Result<TapeFileRecord, StateError> {
+    let canonical_metadata_hash: Option<Vec<u8>> =
+        row_get(row, 5, "tape_files.canonical_metadata_hash")?;
+    let canonical_metadata_hash_algorithm: Option<String> = row_get(
+        row,
+        6,
+        "tape_files.canonical_metadata_hash_algorithm",
+    )?;
+    validate_catalog_digest_pair(
+        canonical_metadata_hash.as_deref(),
+        canonical_metadata_hash_algorithm.as_deref(),
+        "tape_files.canonical_metadata_hash",
+    )?;
     Ok(TapeFileRecord {
         tape_uuid: row_get(row, 0, "tape_files.tape_uuid")?,
         tape_file_number: i64_to_u32(
@@ -8034,6 +8195,8 @@ fn tape_file_from_row(row: &rusqlite::Row<'_>) -> Result<TapeFileRecord, StateEr
         kind: row_get(row, 2, "tape_files.kind")?,
         block_count: i64_to_u64(row_get(row, 3, "tape_files.block_count")?, "block_count")?,
         object_id: row_get(row, 4, "tape_files.object_id")?,
+        canonical_metadata_hash,
+        canonical_metadata_hash_algorithm,
     })
 }
 
@@ -8192,6 +8355,61 @@ fn migrate(conn: &Connection) -> Result<(), StateError> {
         "plaintext_digest blob",
     )?;
     ensure_column(conn, "object_copies", "stored_digest", "stored_digest blob")?;
+    ensure_column(
+        conn,
+        "object_copies",
+        "plaintext_digest_algorithm",
+        "plaintext_digest_algorithm text",
+    )?;
+    ensure_column(
+        conn,
+        "object_copies",
+        "stored_digest_algorithm",
+        "stored_digest_algorithm text",
+    )?;
+    ensure_column(
+        conn,
+        "objects",
+        "content_hash_algorithm",
+        "content_hash_algorithm text",
+    )?;
+    ensure_column(
+        conn,
+        "objects",
+        "metadata_hash_algorithm",
+        "metadata_hash_algorithm text",
+    )?;
+    ensure_column(
+        conn,
+        "object_files",
+        "file_digest_algorithm",
+        "file_digest_algorithm text not null default 'sha256'",
+    )?;
+    ensure_column(
+        conn,
+        "tape_files",
+        "canonical_metadata_hash_algorithm",
+        "canonical_metadata_hash_algorithm text",
+    )?;
+    conn.execute_batch(
+        "update objects
+           set content_hash_algorithm = 'sha256'
+           where content_hash is not null and content_hash_algorithm is null;
+         update objects
+           set metadata_hash_algorithm = 'sha256'
+           where metadata_hash is not null and metadata_hash_algorithm is null;
+         update object_copies
+           set plaintext_digest_algorithm = 'sha256'
+           where plaintext_digest is not null and plaintext_digest_algorithm is null;
+         update object_copies
+           set stored_digest_algorithm = 'sha256'
+           where stored_digest is not null and stored_digest_algorithm is null;
+         update tape_files
+           set canonical_metadata_hash_algorithm = 'sha256'
+           where canonical_metadata_hash is not null
+             and canonical_metadata_hash_algorithm is null;",
+    )
+    .map_err(|err| sqlite_error("backfill catalog digest algorithms", err))?;
     ensure_column(conn, "catalog_units", "source_kind", "source_kind text")?;
     ensure_column(conn, "catalog_units", "source_id", "source_id text")?;
     ensure_column(conn, "tapes", "pool_id", "pool_id text")?;
@@ -8242,6 +8460,13 @@ fn migrate(conn: &Connection) -> Result<(), StateError> {
         [],
     )
     .map_err(|err| sqlite_error("create object_copies_pool_idx", err))?;
+    conn.execute(
+        "create index if not exists objects_content_digest_idx
+         on objects(content_hash_algorithm, content_hash)
+         where content_hash is not null",
+        [],
+    )
+    .map_err(|err| sqlite_error("create objects_content_digest_idx", err))?;
     conn.execute(
         "create unique index if not exists tapes_voltag_unique
          on tapes(voltag)
@@ -8377,6 +8602,7 @@ create table if not exists tape_files(
   protected_ordinal_start integer,
   protected_ordinal_end_exclusive integer,
   canonical_metadata_hash blob,
+  canonical_metadata_hash_algorithm text,
   bundle_uuid text,
   bundle_kind text,
   primary key(tape_uuid, tape_file_number)
@@ -8388,7 +8614,9 @@ create table if not exists objects(
   body_format text,
   logical_size_bytes integer,
   content_hash blob,
+  content_hash_algorithm text,
   metadata_hash blob,
+  metadata_hash_algorithm text,
   created_at_utc text not null
 );
 
@@ -8412,7 +8640,9 @@ create table if not exists object_copies(
   recipient_epoch_ids text,
   metadata_frame_len integer,
   plaintext_digest blob,
+  plaintext_digest_algorithm text,
   stored_digest blob,
+  stored_digest_algorithm text,
   pool_id text,
   primary key(object_id, tape_uuid, tape_file_number)
 );
@@ -8423,6 +8653,7 @@ create table if not exists object_files(
   path text not null,
   size_bytes integer not null,
   file_sha256 blob not null,
+  file_digest_algorithm text not null default 'sha256',
   first_chunk_lba integer,
   chunk_count integer not null,
   mtime text,
@@ -10431,11 +10662,24 @@ mod tests {
             "recipient_epoch_ids",
             "metadata_frame_len",
             "plaintext_digest",
+            "plaintext_digest_algorithm",
             "stored_digest",
+            "stored_digest_algorithm",
         ] {
             assert!(
                 table_column_exists(&conn, "object_copies", column).expect("table_info"),
                 "object_copies.{column} column must exist after migration"
+            );
+        }
+        for (table, column) in [
+            ("objects", "content_hash_algorithm"),
+            ("objects", "metadata_hash_algorithm"),
+            ("object_files", "file_digest_algorithm"),
+            ("tape_files", "canonical_metadata_hash_algorithm"),
+        ] {
+            assert!(
+                table_column_exists(&conn, table, column).expect("table_info"),
+                "{table}.{column} column must exist after migration"
             );
         }
         assert!(
@@ -13104,10 +13348,26 @@ mod tests {
         assert_eq!(objects[0].caller_object_id.as_deref(), Some("caller-1"));
         assert_eq!(objects[0].body_format, "rao-v1");
         assert_eq!(objects[0].logical_size_bytes, Some(42));
+        assert_eq!(
+            objects[0].content_hash_algorithm.as_deref(),
+            Some(DIGEST_ALGORITHM_SHA256)
+        );
+        assert_eq!(
+            objects[0].metadata_hash_algorithm.as_deref(),
+            Some(DIGEST_ALGORITHM_SHA256)
+        );
         assert_eq!(objects[0].copies.len(), 1);
         assert_eq!(objects[0].copies[0].tape_file_number, 9);
         assert_eq!(objects[0].copies[0].first_parity_data_ordinal, Some(3));
         assert_eq!(objects[0].copies[0].pool_id, None);
+        assert_eq!(
+            objects[0].copies[0].plaintext_digest_algorithm.as_deref(),
+            Some(DIGEST_ALGORITHM_SHA256)
+        );
+        assert_eq!(
+            objects[0].copies[0].stored_digest_algorithm.as_deref(),
+            Some(DIGEST_ALGORITHM_SHA256)
+        );
 
         index
             .upsert_tape_pool_projection(TapePoolProjectionInput {
