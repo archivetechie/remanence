@@ -4352,6 +4352,7 @@ fn print_audit_entry(
         "operation_id": optional_uuid_text(&entry.operation_id),
         "session_id": optional_uuid_text(&entry.session_id),
         "event_kind": entry.event_kind.clone(),
+        "software_build": entry.software_build.clone(),
         "detail": detail,
     });
     if json_output {
@@ -4360,11 +4361,12 @@ fn print_audit_entry(
     } else {
         writeln!(
             out,
-            "{} {} {} {}",
+            "{} {} {} {} build={}",
             entry.sequence,
             timestamp_text(entry.timestamp.as_ref()).unwrap_or_else(|| "-".to_string()),
             entry.event_kind,
             entry.actor,
+            entry.software_build.as_deref().unwrap_or("legacy-unknown"),
         )
         .map_err(|error| error.to_string())
     }

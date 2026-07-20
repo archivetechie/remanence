@@ -8880,6 +8880,7 @@ mod tests {
             timestamp_utc: format!("2026-05-27T10:{sequence:02}:00Z"),
             host_id: "host".to_string(),
             process_id: 123,
+            software_build: Some("test-build".to_string()),
             actor: AuditActor::User("alice".to_string()),
             source_layer: crate::audit::SourceLayer::Layer5,
             operation_id,

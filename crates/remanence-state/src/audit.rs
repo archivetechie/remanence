@@ -203,6 +203,11 @@ pub struct AuditRecord {
     pub host_id: String,
     /// Process identifier.
     pub process_id: u32,
+    /// Producing crate version plus build-time source-control description.
+    ///
+    /// `None` is accepted only when replaying records written before this
+    /// field was introduced; every new append sets it.
+    pub software_build: Option<String>,
     /// Actor responsible for this event.
     pub actor: AuditActor,
     /// Source layer that emitted this event.
@@ -511,6 +516,7 @@ impl FileAuditLog {
             timestamp_utc: format_timestamp_utc(timestamp_utc)?,
             host_id: host_id(),
             process_id: std::process::id(),
+            software_build: Some(software_build().to_string()),
             actor: event.actor,
             source_layer: event.source_layer,
             operation_id: event.operation_id,
@@ -926,7 +932,7 @@ fn decode_record_cbor(bytes: &[u8]) -> Result<AuditRecord, StateError> {
 }
 
 fn record_to_cbor(record: &AuditRecord) -> CborValue {
-    sorted_map(vec![
+    let mut entries = vec![
         ("actor", actor_to_cbor(&record.actor)),
         ("detail", string_value_map(&record.detail)),
         ("event", CborValue::Text(record.event.as_str().to_string())),
@@ -962,7 +968,11 @@ fn record_to_cbor(record: &AuditRecord) -> CborValue {
             "timestamp_utc",
             CborValue::Text(record.timestamp_utc.clone()),
         ),
-    ])
+    ];
+    if let Some(software_build) = record.software_build.as_ref() {
+        entries.push(("software_build", CborValue::Text(software_build.clone())));
+    }
+    sorted_map(entries)
 }
 
 fn record_from_cbor(value: &CborValue) -> Result<AuditRecord, StateError> {
@@ -978,6 +988,7 @@ fn record_from_cbor(value: &CborValue) -> Result<AuditRecord, StateError> {
         host_id: required_text(fields, "host_id")?,
         process_id: u32::try_from(required_u64(fields, "process_id")?)
             .map_err(|_| StateError::AuditCorrupt("process_id out of range".to_string()))?,
+        software_build: optional_text_if_present(fields, "software_build")?,
         actor: actor_from_cbor(required_value(fields, "actor")?)?,
         source_layer: SourceLayer::parse(&required_text(fields, "source_layer")?)?,
         operation_id: optional_uuid(fields, "operation_id")?,
@@ -1111,6 +1122,27 @@ fn optional_text(
     match required_value(fields, key)? {
         CborValue::Null => Ok(None),
         CborValue::Text(text) => Ok(Some(text.clone())),
+        _ => Err(StateError::AuditCorrupt(format!(
+            "audit field {key} is not optional text"
+        ))),
+    }
+}
+
+fn optional_text_if_present(
+    fields: &[(CborValue, CborValue)],
+    key: &str,
+) -> Result<Option<String>, StateError> {
+    let Some(value) = fields.iter().find_map(|(candidate, value)| {
+        matches!(candidate, CborValue::Text(text) if text == key).then_some(value)
+    }) else {
+        return Ok(None);
+    };
+    match value {
+        CborValue::Null => Ok(None),
+        CborValue::Text(text) if !text.trim().is_empty() => Ok(Some(text.clone())),
+        CborValue::Text(_) => Err(StateError::AuditCorrupt(
+            "audit field software_build is empty".to_string(),
+        )),
         _ => Err(StateError::AuditCorrupt(format!(
             "audit field {key} is not optional text"
         ))),
@@ -1459,6 +1491,11 @@ fn host_id() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Build identifier stamped into every newly appended audit record.
+pub fn software_build() -> &'static str {
+    env!("REMANENCE_SOFTWARE_BUILD")
+}
+
 fn sync_directory(path: &Path) -> Result<(), StateError> {
     let dir = File::open(path).map_err(|err| StateError::io_at("open audit dir", path, err))?;
     dir.sync_all()
@@ -1525,6 +1562,32 @@ mod tests {
         assert_eq!(records[0].sequence, 1);
         assert_eq!(records[1].sequence, 2);
         assert_eq!(records[1].subject.id.as_deref(), Some("second"));
+        assert_eq!(records[0].software_build.as_deref(), Some(software_build()));
+        assert!(!software_build().trim().is_empty());
+        assert!(software_build().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn audit_decoder_tolerates_legacy_record_without_software_build() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-audit-legacy-build")
+            .tempdir()
+            .expect("temp dir");
+        let mut log = FileAuditLog::open_for_date(temp.path(), "2026-05-27", true).expect("open");
+        let (_, mut current) = log
+            .append_and_return_record(event("legacy"))
+            .expect("append current record");
+        current.software_build = None;
+
+        let encoded = canonical_record_cbor(&current).expect("encode legacy-shaped record");
+        let decoded = decode_record_cbor(&encoded).expect("decode legacy-shaped record");
+
+        assert_eq!(decoded.software_build, None);
+        let value: CborValue = ciborium::de::from_reader(encoded.as_slice()).expect("decode map");
+        assert!(value_map(&value, "legacy record")
+            .expect("map")
+            .iter()
+            .all(|(key, _)| key != &CborValue::Text("software_build".to_string())));
     }
 
     #[test]
