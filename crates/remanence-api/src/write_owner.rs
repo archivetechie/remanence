@@ -25,9 +25,9 @@ use remanence_parity::{
     TapeFileKind,
 };
 use remanence_state::{
-    AuditActor, AuditEvent, AuditEventRecord, AuditSubject, CatalogIndex, CleaningConfig,
-    DriveHealthSnapshotInput, DriveHealthSnapshotRecord, FileAuditLog, NativeObjectFileRecord,
-    SourceLayer, TapeIoConfig, TapePoolConfig,
+    AlarmRecord, AuditActor, AuditEvent, AuditEventRecord, AuditSubject, CatalogIndex,
+    CleaningConfig, DriveHealthSnapshotInput, DriveHealthSnapshotRecord, FileAuditLog,
+    NativeObjectFileRecord, SourceLayer, TapeIoConfig, TapeIoFenceRecord, TapePoolConfig,
 };
 use remanence_stream::StreamingError;
 use time::format_description::well_known::Rfc3339;
@@ -750,10 +750,12 @@ fn changer_loop(
                     match observe_refreshed_library(&mut index, &cfg, changer.library()) {
                         Ok(()) => clear_library_snapshot_persist_alarm(
                             &mut index,
+                            &cfg,
                             changer.library().serial.as_str(),
                         ),
                         Err(err) => record_library_observation_failure(
                             &mut index,
+                            &cfg,
                             changer.library(),
                             err.message(),
                         ),
@@ -1136,7 +1138,7 @@ struct DriveSnapshotRequest {
 
 fn collect_drive_health_snapshot(
     index: &mut CatalogIndex,
-    _cfg: &WriteOwnerConfig,
+    cfg: &WriteOwnerConfig,
     drive: &mut DriveHandle,
     request: DriveSnapshotRequest,
 ) -> Result<DriveHealthSnapshotRecord, Status> {
@@ -1178,7 +1180,116 @@ fn collect_drive_health_snapshot(
             .touch_drive_last_seen(&request.drive_uuid)
             .map_err(crate::status_from_state_error)?;
     }
+    append_drive_health_evidence(index, cfg, &snapshot)?;
     Ok(snapshot)
+}
+
+/// Append the durable evidence twin for a just-committed health snapshot and
+/// project that exact record through the same replay funnel used at rebuild.
+fn append_drive_health_evidence(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    snapshot: &DriveHealthSnapshotRecord,
+) -> Result<(), Status> {
+    let detail = crate::drive_health_audit_detail(index, snapshot)?;
+    crate::append_and_project_audit(
+        index,
+        cfg.audit_dir.as_path(),
+        cfg.audit_fsync,
+        &cfg.audit_append_lock,
+        crate::ProjectedAuditInput {
+            actor: AuditActor::System,
+            source_layer: SourceLayer::Layer4,
+            operation_id: None,
+            session_id: snapshot
+                .session_id
+                .as_deref()
+                .and_then(|value| Uuid::parse_str(value).ok()),
+            idempotency_key: None,
+            event: AuditEvent::DriveHealthObserved,
+            subject_kind: "drive",
+            subject_id: Some(crate::bytes_to_hex(snapshot.drive_uuid.as_slice())),
+            detail,
+        },
+    )?;
+    Ok(())
+}
+
+fn insert_optional_audit_text(
+    detail: &mut BTreeMap<String, CborValue>,
+    key: &str,
+    value: Option<&String>,
+) {
+    if let Some(value) = value {
+        detail.insert(key.to_string(), CborValue::Text(value.clone()));
+    }
+}
+
+fn raise_alarm_with_evidence(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    condition_key: &str,
+    kind: &str,
+    severity: &str,
+    alarm_detail: Option<&str>,
+) -> Result<AlarmRecord, Status> {
+    let alarm = index
+        .raise_alarm(condition_key, kind, severity, alarm_detail)
+        .map_err(crate::status_from_state_error)
+        .inspect_err(
+            |error| tracing::warn!(condition_key, %error, "failed to raise catalog alarm"),
+        )?;
+    append_alarm_evidence(index, cfg, &alarm, AuditEvent::AlarmRaised).inspect_err(
+        |error| tracing::warn!(condition_key, %error, "failed to append raised-alarm evidence"),
+    )?;
+    Ok(alarm)
+}
+
+fn clear_alarm_with_evidence(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    condition_key: &str,
+) -> Result<Option<AlarmRecord>, Status> {
+    let alarm = index
+        .clear_alarm(condition_key)
+        .map_err(crate::status_from_state_error)
+        .inspect_err(
+            |error| tracing::warn!(condition_key, %error, "failed to clear catalog alarm"),
+        )?;
+    if let Some(alarm) = alarm.as_ref() {
+        append_alarm_evidence(index, cfg, alarm, AuditEvent::AlarmCleared).inspect_err(
+            |error| {
+                tracing::warn!(condition_key, %error, "failed to append cleared-alarm evidence")
+            },
+        )?;
+    }
+    Ok(alarm)
+}
+
+fn append_alarm_evidence(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    alarm: &AlarmRecord,
+    event: AuditEvent,
+) -> Result<(), Status> {
+    crate::append_and_project_audit(
+        index,
+        cfg.audit_dir.as_path(),
+        cfg.audit_fsync,
+        &cfg.audit_append_lock,
+        crate::ProjectedAuditInput {
+            actor: AuditActor::System,
+            source_layer: SourceLayer::Layer4,
+            operation_id: None,
+            session_id: None,
+            idempotency_key: None,
+            event,
+            subject_kind: "alarm",
+            subject_id: Some(alarm.condition_key.clone()),
+            detail: crate::alarm_audit_detail(alarm),
+        },
+    )?;
+    Ok(())
 }
 
 fn record_session_close_snapshot(
@@ -1228,7 +1339,7 @@ fn record_session_snapshot(
         },
     ) {
         Ok(_) => {
-            clear_snapshot_persist_alarm(index, drive_uuid.as_slice());
+            clear_snapshot_persist_alarm(index, cfg, drive_uuid.as_slice());
             *consecutive_misses = 0;
         }
         Err(err) => {
@@ -1250,7 +1361,9 @@ fn record_session_snapshot(
                     *consecutive_misses,
                     err.to_string().replace('"', "'")
                 );
-                if let Err(alarm_err) = index.raise_alarm(
+                if let Err(alarm_err) = raise_alarm_with_evidence(
+                    index,
+                    cfg,
                     condition_key.as_str(),
                     "snapshot-persist-failing",
                     "warning",
@@ -1274,9 +1387,13 @@ fn snapshot_persist_alarm_key(drive_uuid: &[u8]) -> String {
     )
 }
 
-fn clear_snapshot_persist_alarm(index: &mut CatalogIndex, drive_uuid: &[u8]) {
+fn clear_snapshot_persist_alarm(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    drive_uuid: &[u8],
+) {
     let condition_key = snapshot_persist_alarm_key(drive_uuid);
-    if let Err(err) = index.clear_alarm(condition_key.as_str()) {
+    if let Err(err) = clear_alarm_with_evidence(index, cfg, condition_key.as_str()) {
         tracing::warn!(
             "failed to clear snapshot miss alarm condition_key={} error={}",
             condition_key,
@@ -2340,6 +2457,15 @@ fn handle_drive_open_write(
                 match result {
                     Ok(result) => {
                         let replay = result.is_replay();
+                        if result.sealed_after_write() {
+                            if let Err(audit_err) =
+                                append_tape_sealed_evidence(index, cfg, selected.tape_uuid)
+                            {
+                                tracing::warn!(
+                                    "failed to append tape sealing evidence after committed write: {audit_err}"
+                                );
+                            }
+                        }
                         append_commit_diagnostics.accumulate(result.append_commit_diagnostics());
                         if !replay {
                             objects_committed = objects_committed.saturating_add(1);
@@ -2389,6 +2515,13 @@ fn handle_drive_open_write(
                             throughput_mib_s = crate::diagnostics::mib_per_s(logical_size, append_elapsed),
                             "remanence_write_diag",
                         );
+                        if let Err(audit_err) =
+                            append_latest_tape_io_fence_evidence(index, cfg, selected.tape_uuid)
+                        {
+                            tracing::warn!(
+                                "failed to append tape-I/O fence evidence after write error: {audit_err}"
+                            );
+                        }
                         record_session_snapshot(
                             index,
                             cfg,
@@ -2538,6 +2671,87 @@ fn handle_drive_open_write(
             }
         }
     }
+}
+
+fn append_latest_tape_io_fence_evidence(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    tape_uuid: [u8; 16],
+) -> Result<(), Status> {
+    let fence = index
+        .list_active_tape_io_fences()
+        .map_err(crate::status_from_state_error)?
+        .into_iter()
+        .find(|fence| fence.tape_uuid.as_slice() == tape_uuid);
+    let Some(fence) = fence else {
+        return Ok(());
+    };
+    append_tape_io_fence_evidence(index, cfg, &fence, AuditEvent::TapeIoFenceRaised)
+}
+
+fn append_tape_sealed_evidence(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    tape_uuid: [u8; 16],
+) -> Result<(), Status> {
+    crate::append_and_project_audit(
+        index,
+        cfg.audit_dir.as_path(),
+        cfg.audit_fsync,
+        &cfg.audit_append_lock,
+        crate::ProjectedAuditInput {
+            actor: AuditActor::System,
+            source_layer: SourceLayer::Layer4,
+            operation_id: None,
+            session_id: None,
+            idempotency_key: None,
+            event: AuditEvent::TapeSealed,
+            subject_kind: "tape",
+            subject_id: Some(crate::bytes_to_hex(tape_uuid.as_slice())),
+            detail: BTreeMap::new(),
+        },
+    )?;
+    Ok(())
+}
+
+fn append_tape_io_fence_evidence(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    fence: &TapeIoFenceRecord,
+    event: AuditEvent,
+) -> Result<(), Status> {
+    let mut detail = BTreeMap::from([
+        (
+            "tape_uuid".to_string(),
+            CborValue::Bytes(fence.tape_uuid.clone()),
+        ),
+        (
+            "quarantine_id".to_string(),
+            CborValue::Text(fence.quarantine_id.clone()),
+        ),
+        ("reason".to_string(), CborValue::Text(fence.reason.clone())),
+    ]);
+    insert_optional_audit_text(&mut detail, "barcode", fence.barcode.as_ref());
+    insert_optional_audit_text(&mut detail, "evidence_json", fence.evidence_json.as_ref());
+    insert_optional_audit_text(&mut detail, "release_ack", fence.release_ack.as_ref());
+    crate::append_and_project_audit(
+        index,
+        cfg.audit_dir.as_path(),
+        cfg.audit_fsync,
+        &cfg.audit_append_lock,
+        crate::ProjectedAuditInput {
+            actor: AuditActor::System,
+            source_layer: SourceLayer::Layer4,
+            operation_id: None,
+            session_id: None,
+            idempotency_key: None,
+            event,
+            subject_kind: "tape_io_fence",
+            subject_id: Some(fence.quarantine_id.clone()),
+            detail,
+        },
+    )?;
+    Ok(())
 }
 
 fn prepare_drive_for_write(
@@ -3330,6 +3544,7 @@ fn library_snapshot_persist_alarm_key(library_serial: &str) -> String {
 
 fn record_library_observation_failure(
     index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
     library: &remanence_library::Library,
     error: &str,
 ) {
@@ -3344,7 +3559,9 @@ fn record_library_observation_failure(
         library.serial.replace('"', "'"),
         error.replace('"', "'")
     );
-    if let Err(err) = index.raise_alarm(
+    if let Err(err) = raise_alarm_with_evidence(
+        index,
+        cfg,
         condition_key.as_str(),
         "snapshot-persist-failing",
         "warning",
@@ -3358,9 +3575,13 @@ fn record_library_observation_failure(
     }
 }
 
-fn clear_library_snapshot_persist_alarm(index: &mut CatalogIndex, library_serial: &str) {
+fn clear_library_snapshot_persist_alarm(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    library_serial: &str,
+) {
     let condition_key = library_snapshot_persist_alarm_key(library_serial);
-    if let Err(err) = index.clear_alarm(condition_key.as_str()) {
+    if let Err(err) = clear_alarm_with_evidence(index, cfg, condition_key.as_str()) {
         tracing::warn!(
             "failed to clear library snapshot alarm condition_key={} error={}",
             condition_key,
@@ -3611,7 +3832,9 @@ fn run_cleaning_sequence(
             "{{\"drive_uuid\":\"{}\",\"recovery_step\":\"frequency-cap\"}}",
             json_escape_text(&crate::bytes_to_hex(drive_uuid)),
         );
-        let _ = index.raise_alarm(
+        let _ = raise_alarm_with_evidence(
+            index,
+            cfg,
             format!(
                 "drive-cleaning-abnormal-frequency:{}",
                 crate::bytes_to_hex(drive_uuid)
@@ -3636,7 +3859,9 @@ fn run_cleaning_sequence(
         json_escape_text(&run.run_id),
         json_escape_text(&crate::bytes_to_hex(drive_uuid)),
     );
-    if let Err(err) = index.raise_alarm(
+    if let Err(err) = raise_alarm_with_evidence(
+        index,
+        cfg,
         format!("cleaning-needs-operator:{}", run.run_id).as_str(),
         "cleaning-needs-operator",
         "warning",
@@ -3644,7 +3869,7 @@ fn run_cleaning_sequence(
     ) {
         let _ =
             index.terminalize_clean_run(run.run_id.as_str(), "failed", Some(fence_detail.as_str()));
-        return Err(status_from_state_error(err));
+        return Err(err);
     }
     index
         .set_drive_fenced(drive_uuid, true)
@@ -3739,7 +3964,11 @@ fn run_cleaning_sequence(
             "{{\"reason\":\"{}\",\"recovery_step\":\"selecting\"}}",
             json_escape_text(&reason)
         );
-        let _ = index.clear_alarm(format!("cleaning-needs-operator:{}", run.run_id).as_str());
+        let _ = clear_alarm_with_evidence(
+            index,
+            cfg,
+            format!("cleaning-needs-operator:{}", run.run_id).as_str(),
+        );
         let _ = index.set_drive_fenced(drive_uuid, false);
         let _ = record_library_event(
             index,
@@ -3758,7 +3987,9 @@ fn run_cleaning_sequence(
                 ),
             ]),
         );
-        let _ = index.raise_alarm(
+        let _ = raise_alarm_with_evidence(
+            index,
+            cfg,
             format!("no-cln-cart:{library_serial}").as_str(),
             "no-cln-cart",
             "critical",
@@ -3784,7 +4015,7 @@ fn run_cleaning_sequence(
         .last_element_address
         .and_then(|value| u16::try_from(value).ok())
         .ok_or_else(|| Status::failed_precondition("drive has no current bay"))?;
-    retry_cleaning_move(index, run_id.as_str(), drive_uuid, "moving-in", || {
+    retry_cleaning_move(index, cfg, run_id.as_str(), drive_uuid, "moving-in", || {
         library
             .load(slot_address, drive_bay, &cfg.policy)
             .map_err(|err| format!("load cleaning cartridge: {err}"))?;
@@ -3816,7 +4047,9 @@ fn run_cleaning_sequence(
             json_escape_text(&voltag),
         );
         let _ = index.mark_clean_run_needs_operator(run_id.as_str(), Some(detail.as_str()));
-        let _ = index.raise_alarm(
+        let _ = raise_alarm_with_evidence(
+            index,
+            cfg,
             format!("cleaning-needs-operator:{}", run_id).as_str(),
             "cleaning-needs-operator",
             "warning",
@@ -3835,7 +4068,9 @@ fn run_cleaning_sequence(
                 Some("{\"reason\":\"fast-eject\"}"),
             )
             .map_err(status_from_state_error)?;
-        let _ = index.raise_alarm(
+        let _ = raise_alarm_with_evidence(
+            index,
+            cfg,
             format!("cln-cart-expired:{}", voltag).as_str(),
             "cln-cart-expired",
             "warning",
@@ -3875,7 +4110,9 @@ fn run_cleaning_sequence(
         let _ = index
             .advance_clean_run(run_id.as_str(), "failed", Some("{\"reason\":\"flag-22\"}"))
             .map_err(status_from_state_error)?;
-        let _ = index.raise_alarm(
+        let _ = raise_alarm_with_evidence(
+            index,
+            cfg,
             format!("cln-cart-expired:{}", voltag).as_str(),
             "cln-cart-expired",
             "warning",
@@ -3896,7 +4133,9 @@ fn run_cleaning_sequence(
                 Some("{\"reason\":\"corroboration\"}"),
             )
             .map_err(status_from_state_error)?;
-        let _ = index.raise_alarm(
+        let _ = raise_alarm_with_evidence(
+            index,
+            cfg,
             format!("cart-not-cleaning-behavior:{}", voltag).as_str(),
             "cart-not-cleaning-behavior",
             "warning",
@@ -3913,12 +4152,19 @@ fn run_cleaning_sequence(
             Some("{\"phase\":\"moving-back\"}"),
         )
         .map_err(status_from_state_error)?;
-    retry_cleaning_move(index, run_id.as_str(), drive_uuid, "moving-back", || {
-        library
-            .unload(drive_bay, Some(slot_address), &cfg.policy)
-            .map_err(|err| format!("unload cleaning cartridge: {err}"))?;
-        Ok(())
-    })?;
+    retry_cleaning_move(
+        index,
+        cfg,
+        run_id.as_str(),
+        drive_uuid,
+        "moving-back",
+        || {
+            library
+                .unload(drive_bay, Some(slot_address), &cfg.policy)
+                .map_err(|err| format!("unload cleaning cartridge: {err}"))?;
+            Ok(())
+        },
+    )?;
     let eject_observed = std::time::Instant::now();
     if eject_observed.duration_since(load_completed)
         < std::time::Duration::from_millis(min_cycle_millis)
@@ -3933,7 +4179,9 @@ fn run_cleaning_sequence(
                 Some("{\"reason\":\"fast-eject\"}"),
             )
             .map_err(status_from_state_error)?;
-        let _ = index.raise_alarm(
+        let _ = raise_alarm_with_evidence(
+            index,
+            cfg,
             format!("cln-cart-expired:{}", voltag).as_str(),
             "cln-cart-expired",
             "warning",
@@ -3964,16 +4212,26 @@ fn run_cleaning_sequence(
             Some(detail.as_str()),
         )
         .map_err(status_from_state_error)?;
-    let _ = index.clear_alarm(format!("cleaning-needs-operator:{}", run_id).as_str());
-    let _ = index.clear_alarm(
+    let _ = clear_alarm_with_evidence(
+        index,
+        cfg,
+        format!("cleaning-needs-operator:{}", run_id).as_str(),
+    );
+    let _ = clear_alarm_with_evidence(
+        index,
+        cfg,
         format!(
             "drive-cleaning-abnormal-frequency:{}",
             crate::bytes_to_hex(drive_uuid)
         )
         .as_str(),
     );
-    let _ = index.clear_alarm(format!("cln-cart-expired:{}", voltag).as_str());
-    let _ = index.clear_alarm(format!("cart-not-cleaning-behavior:{}", voltag).as_str());
+    let _ = clear_alarm_with_evidence(index, cfg, format!("cln-cart-expired:{}", voltag).as_str());
+    let _ = clear_alarm_with_evidence(
+        index,
+        cfg,
+        format!("cart-not-cleaning-behavior:{}", voltag).as_str(),
+    );
     let _ = active_alerts;
     let _ = record_library_event(
         index,
@@ -4107,6 +4365,7 @@ fn cleaning_drive_is_idle(
 
 fn retry_cleaning_move(
     index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
     run_id: &str,
     drive_uuid: &[u8],
     label: &str,
@@ -4133,7 +4392,9 @@ fn retry_cleaning_move(
         json_escape_text(&err),
     );
     let _ = index.terminalize_clean_run(run_id, "failed", Some(detail.as_str()));
-    let _ = index.raise_alarm(
+    let _ = raise_alarm_with_evidence(
+        index,
+        cfg,
         format!("cleaning-needs-operator:{}", run_id).as_str(),
         "cleaning-needs-operator",
         "warning",
@@ -6791,7 +7052,9 @@ mod tests {
             )
             .expect("raise snapshot alarm");
 
-        clear_snapshot_persist_alarm(&mut index, &drive_uuid);
+        index
+            .clear_alarm(condition_key.as_str())
+            .expect("clear snapshot alarm");
 
         assert_eq!(
             index

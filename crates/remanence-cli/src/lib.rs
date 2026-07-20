@@ -6075,6 +6075,15 @@ fn run_rebuild_catalog_from_journals(
             let _ = writeln!(out, "  object copies: {}", report.object_copies_rebuilt);
             let _ = writeln!(out, "  audit records: {}", report.audit_records_replayed);
             let _ = writeln!(out, "  tape journals: {}", report.journal_records_replayed);
+            for warning in &report.preserved_fallbacks {
+                let _ = writeln!(err, "WARN preserved-not-replayed: {warning}");
+            }
+            for warning in &report.replay_divergences {
+                let _ = writeln!(
+                    err,
+                    "WARN audit-replay-divergence: {warning}; ledger value applied"
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -6328,28 +6337,23 @@ fn run_tape_quarantine(
             };
             let record = match find_media_readiness_quarantine(&records, quarantine.as_str()) {
                 Ok(record) => record.clone(),
-                Err(_) => {
-                    match state
-                        .catalog_index()
-                        .release_tape_io_fence(quarantine.as_str(), ack.trim())
-                    {
-                        Ok(Some(record)) => {
-                            return print_tape_io_quarantine_released(&record, *json, out, err);
-                        }
-                        Ok(None) => {
-                            let _ = writeln!(
-                                err,
-                                "error: no active media-readiness or tape-I/O quarantine {:?}",
-                                quarantine
-                            );
-                            return ExitCode::from(1);
-                        }
-                        Err(error) => {
-                            let _ = writeln!(err, "error: {error}");
-                            return ExitCode::from(1);
-                        }
+                Err(_) => match state.release_tape_io_fence(quarantine.as_str(), ack.trim()) {
+                    Ok(Some(record)) => {
+                        return print_tape_io_quarantine_released(&record, *json, out, err);
                     }
-                }
+                    Ok(None) => {
+                        let _ = writeln!(
+                            err,
+                            "error: no active media-readiness or tape-I/O quarantine {:?}",
+                            quarantine
+                        );
+                        return ExitCode::from(1);
+                    }
+                    Err(error) => {
+                        let _ = writeln!(err, "error: {error}");
+                        return ExitCode::from(1);
+                    }
+                },
             };
             let operation_id = match Uuid::parse_str(record.operation_id.as_str()) {
                 Ok(operation_id) => operation_id,
@@ -6893,7 +6897,19 @@ impl TapeInitStateOps for remanence_state::StateHandle {
         // (the CLI calls this when `action == WroteBootstrap`, never for
         // idempotent no-ops or refusals), so a `TapeProvisioned` append here
         // is exactly "a bootstrap was actually written".
-        append_tape_provisioned_audit_event(self, tape_uuid, &voltag, block_size, &parity, force)
+        let pool_id = self
+            .catalog_index()
+            .get_tape_pool_membership(&tape_uuid)
+            .map_err(|error| format!("read projected tape pool membership: {error}"))?;
+        append_tape_provisioned_audit_event(
+            self,
+            tape_uuid,
+            &voltag,
+            block_size,
+            &parity,
+            force,
+            pool_id.as_deref(),
+        )
     }
 
     fn record_media_readiness_operation(
@@ -6941,6 +6957,7 @@ fn append_tape_provisioned_audit_event(
     block_size: u32,
     parity: &remanence_api::ParityConfig,
     forced: bool,
+    pool_id: Option<&str>,
 ) -> Result<(), String> {
     use ciborium::value::Value as CborValue;
 
@@ -6954,7 +6971,7 @@ fn append_tape_provisioned_audit_event(
             scheme.stripes_per_neighborhood
         ),
     };
-    let detail = std::collections::BTreeMap::from([
+    let mut detail = std::collections::BTreeMap::from([
         ("voltag".to_string(), CborValue::Text(voltag.to_string())),
         (
             "block_size".to_string(),
@@ -6963,6 +6980,9 @@ fn append_tape_provisioned_audit_event(
         ("geometry".to_string(), CborValue::Text(geometry)),
         ("forced".to_string(), CborValue::Bool(forced)),
     ]);
+    if let Some(pool_id) = pool_id {
+        detail.insert("pool_id".to_string(), CborValue::Text(pool_id.to_string()));
+    }
     state
         .audit()
         .append(remanence_state::AuditEventRecord {
@@ -6979,6 +6999,27 @@ fn append_tape_provisioned_audit_event(
             detail,
         })
         .map_err(|error| format!("append tape provisioning audit record: {error}"))?;
+    if let Some(pool_id) = pool_id {
+        state
+            .audit()
+            .append(remanence_state::AuditEventRecord {
+                actor: remanence_state::AuditActor::local_user(),
+                source_layer: remanence_state::SourceLayer::Layer4,
+                operation_id: None,
+                session_id: None,
+                idempotency_key: None,
+                event: remanence_state::AuditEvent::TapePoolAssigned,
+                subject: remanence_state::AuditSubject {
+                    kind: "tape".to_string(),
+                    id: Some(bytes_to_hex(&tape_uuid)),
+                },
+                detail: std::collections::BTreeMap::from([(
+                    "pool_id".to_string(),
+                    CborValue::Text(pool_id.to_string()),
+                )]),
+            })
+            .map_err(|error| format!("append tape pool assignment audit record: {error}"))?;
+    }
     Ok(())
 }
 

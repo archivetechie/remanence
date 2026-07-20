@@ -26,12 +26,12 @@ use remanence_format::{
     EntryKind, NormalizedEntry,
 };
 use remanence_state::{
-    AuditActor, AuditEvent, AuditEventRecord, AuditRecord, AuditSubject, CatalogIndex,
+    AlarmRecord, AuditActor, AuditEvent, AuditEventRecord, AuditRecord, AuditSubject, CatalogIndex,
     CatalogUnitFilter, CatalogUnitRecord, DriveCorrelationRollupRecord, DriveHealthSnapshotInput,
-    FileAuditLog, MediaReadinessOperationRecord, MediaReadinessTransitionInput,
-    NativeObjectCopyRecord, NativeObjectFileRecord, NativeObjectRecord, OperationRecord, RemConfig,
-    SourceLayer, StateError, TapeFileRecord, TapeIoConfig, TapePoolConfig, TapePoolRecord,
-    TapeRecord,
+    DriveHealthSnapshotRecord, FileAuditLog, MediaReadinessOperationRecord,
+    MediaReadinessTransitionInput, NativeObjectCopyRecord, NativeObjectFileRecord,
+    NativeObjectRecord, OperationRecord, RemConfig, SourceLayer, StateError, TapeFileRecord,
+    TapeIoConfig, TapePoolConfig, TapePoolRecord, TapeRecord,
 };
 use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
@@ -672,7 +672,13 @@ impl ApiState {
         state.reconcile_drive_catalog_from_report(config, &report)?;
         state.reconcile_clean_runs_from_report(&report)?;
         crate::mount::register_startup_seated_cartridges(&state, &report);
-        spawn_drive_collection_workers(index_path, report, config, drive_pool);
+        spawn_drive_collection_workers(
+            index_path,
+            report,
+            config,
+            drive_pool,
+            Arc::clone(&state.audit_append_lock),
+        );
         Ok(state)
     }
 
@@ -1361,6 +1367,7 @@ fn spawn_drive_collection_workers(
     report: remanence_library::DiscoveryReport,
     config: &RemConfig,
     drive_pool: crate::write_owner::DrivePool,
+    audit_append_lock: Arc<std::sync::Mutex<()>>,
 ) {
     let heartbeat = parse_duration_or(&config.drives.heartbeat, Duration::from_secs(60 * 60));
     let heartbeat_index_path = index_path.clone();
@@ -1381,6 +1388,11 @@ fn spawn_drive_collection_workers(
         Duration::from_secs(60 * 60),
     );
     let drives_cfg = config.drives.clone();
+    let audit = AuditAppendContext {
+        dir: config.audit.dir.clone(),
+        fsync: config.audit.fsync,
+        lock: audit_append_lock,
+    };
     let daemon_libraries = config
         .libraries
         .iter()
@@ -1395,10 +1407,18 @@ fn spawn_drive_collection_workers(
                 report,
                 drives_cfg,
                 daemon_libraries,
+                audit,
                 foreign_poll,
             )
         })
         .expect("spawn foreign drive poll worker");
+}
+
+#[derive(Clone)]
+struct AuditAppendContext {
+    dir: PathBuf,
+    fsync: bool,
+    lock: Arc<std::sync::Mutex<()>>,
 }
 
 fn touch_managed_drive_heartbeats(
@@ -1430,6 +1450,7 @@ fn foreign_drive_poll_loop(
     report: remanence_library::DiscoveryReport,
     drives_cfg: remanence_state::DrivesConfig,
     daemon_libraries: std::collections::HashSet<String>,
+    audit: AuditAppendContext,
     base_cadence: Duration,
 ) {
     let mut backoff = Duration::from_secs(0);
@@ -1440,8 +1461,13 @@ fn foreign_drive_poll_loop(
             backoff
         };
         std::thread::sleep(delay);
-        match poll_foreign_drive_counters_once(&index_path, &report, &drives_cfg, &daemon_libraries)
-        {
+        match poll_foreign_drive_counters_once(
+            &index_path,
+            &report,
+            &drives_cfg,
+            &daemon_libraries,
+            &audit,
+        ) {
             Ok(()) => backoff = Duration::from_secs(0),
             Err(ForeignPollError::Retryable(message)) => {
                 tracing::warn!("foreign drive counter poll retryable failure: {message}");
@@ -1460,12 +1486,14 @@ fn poll_foreign_drive_counters_once(
     report: &remanence_library::DiscoveryReport,
     drives_cfg: &remanence_state::DrivesConfig,
     daemon_libraries: &std::collections::HashSet<String>,
+    audit: &AuditAppendContext,
 ) -> Result<(), ForeignPollError> {
     poll_foreign_drive_counters_once_with_reader(
         index_path,
         report,
         drives_cfg,
         daemon_libraries,
+        audit,
         read_foreign_drive_snapshot,
     )
 }
@@ -1475,6 +1503,7 @@ fn poll_foreign_drive_counters_once_with_reader(
     report: &remanence_library::DiscoveryReport,
     drives_cfg: &remanence_state::DrivesConfig,
     daemon_libraries: &std::collections::HashSet<String>,
+    audit: &AuditAppendContext,
     mut read_snapshot: impl FnMut(&Path, bool) -> Result<ForeignDriveSnapshot, ForeignPollError>,
 ) -> Result<(), ForeignPollError> {
     let mut index = CatalogIndex::open(index_path)
@@ -1521,7 +1550,7 @@ fn poll_foreign_drive_counters_once_with_reader(
             }
             let snapshot = read_snapshot(sg_path, drives_cfg.foreign_tapealert)?;
             let tape_alert_flags = snapshot.tape_alert_flags.clone();
-            index
+            let recorded_snapshot = index
                 .record_drive_health_snapshot(DriveHealthSnapshotInput {
                     drive_uuid: drive.drive_uuid.clone(),
                     trigger: "foreign-counter".to_string(),
@@ -1539,12 +1568,57 @@ fn poll_foreign_drive_counters_once_with_reader(
                     at_utc: None,
                 })
                 .map_err(|err| ForeignPollError::Permanent(err.to_string()))?;
-            index
+            let health_detail = drive_health_audit_detail(&index, &recorded_snapshot)
+                .map_err(|err| ForeignPollError::Permanent(err.to_string()))?;
+            append_and_project_audit(
+                &mut index,
+                audit.dir.as_path(),
+                audit.fsync,
+                &audit.lock,
+                ProjectedAuditInput {
+                    actor: AuditActor::System,
+                    source_layer: SourceLayer::Layer4,
+                    operation_id: None,
+                    session_id: None,
+                    idempotency_key: None,
+                    event: AuditEvent::DriveHealthObserved,
+                    subject_kind: "drive",
+                    subject_id: Some(bytes_to_hex(recorded_snapshot.drive_uuid.as_slice())),
+                    detail: health_detail,
+                },
+            )
+            .map_err(|err| ForeignPollError::Permanent(err.to_string()))?;
+            let alarm = index
                 .observe_foreign_drive_tapealert_advisory(
                     &drive.drive_uuid,
                     snapshot.tape_alert_flags.as_deref(),
                 )
                 .map_err(|err| ForeignPollError::Permanent(err.to_string()))?;
+            if let Some(alarm) = alarm {
+                let event = if alarm.state == "cleared" {
+                    AuditEvent::AlarmCleared
+                } else {
+                    AuditEvent::AlarmRaised
+                };
+                append_and_project_audit(
+                    &mut index,
+                    audit.dir.as_path(),
+                    audit.fsync,
+                    &audit.lock,
+                    ProjectedAuditInput {
+                        actor: AuditActor::System,
+                        source_layer: SourceLayer::Layer4,
+                        operation_id: None,
+                        session_id: None,
+                        idempotency_key: None,
+                        event,
+                        subject_kind: "alarm",
+                        subject_id: Some(alarm.condition_key.clone()),
+                        detail: alarm_audit_detail(&alarm),
+                    },
+                )
+                .map_err(|err| ForeignPollError::Permanent(err.to_string()))?;
+            }
             index
                 .touch_drive_last_seen(&drive.drive_uuid)
                 .map_err(|err| ForeignPollError::Permanent(err.to_string()))?;
@@ -1745,6 +1819,133 @@ pub(crate) struct OperationAuditInput<'a> {
     pub(crate) detail: BTreeMap<String, CborValue>,
 }
 
+pub(crate) struct ProjectedAuditInput<'a> {
+    pub(crate) actor: AuditActor,
+    pub(crate) source_layer: SourceLayer,
+    pub(crate) operation_id: Option<Uuid>,
+    pub(crate) session_id: Option<Uuid>,
+    pub(crate) idempotency_key: Option<Uuid>,
+    pub(crate) event: AuditEvent,
+    pub(crate) subject_kind: &'a str,
+    pub(crate) subject_id: Option<String>,
+    pub(crate) detail: BTreeMap<String, CborValue>,
+}
+
+/// Append one audit fact and immediately feed that exact record through the
+/// catalog projector. All API-side evidence writers share this funnel so live
+/// state and rebuild replay cannot drift through duplicated append logic.
+pub(crate) fn append_and_project_audit(
+    index: &mut CatalogIndex,
+    audit_dir: &Path,
+    audit_fsync: bool,
+    audit_append_lock: &Arc<std::sync::Mutex<()>>,
+    input: ProjectedAuditInput<'_>,
+) -> Result<AuditRecord, Status> {
+    let _guard = audit_append_lock
+        .lock()
+        .map_err(|_| Status::internal("audit append lock poisoned"))?;
+    fs::create_dir_all(audit_dir).map_err(|err| {
+        Status::internal(format!(
+            "create audit directory {}: {err}",
+            audit_dir.display()
+        ))
+    })?;
+    let mut audit = FileAuditLog::open(audit_dir, audit_fsync)
+        .map_err(|err| Status::internal(err.to_string()))?;
+    let (_, record) = audit
+        .append_and_return_record(AuditEventRecord {
+            actor: input.actor,
+            source_layer: input.source_layer,
+            operation_id: input.operation_id,
+            session_id: input.session_id,
+            idempotency_key: input.idempotency_key,
+            event: input.event,
+            subject: AuditSubject {
+                kind: input.subject_kind.to_string(),
+                id: input.subject_id,
+            },
+            detail: input.detail,
+        })
+        .map_err(status_from_state_error)?;
+    index
+        .project_audit_record(&record)
+        .map_err(status_from_state_error)?;
+    Ok(record)
+}
+
+pub(crate) fn drive_health_audit_detail(
+    index: &CatalogIndex,
+    snapshot: &DriveHealthSnapshotRecord,
+) -> Result<BTreeMap<String, CborValue>, Status> {
+    let mut detail = BTreeMap::from([
+        (
+            "drive_uuid".to_string(),
+            CborValue::Bytes(snapshot.drive_uuid.clone()),
+        ),
+        (
+            "at_utc".to_string(),
+            CborValue::Text(snapshot.at_utc.clone()),
+        ),
+        (
+            "trigger".to_string(),
+            CborValue::Text(snapshot.trigger.clone()),
+        ),
+    ]);
+    for (key, value) in [
+        ("session_id", snapshot.session_id.as_ref()),
+        ("tape_alert_flags", snapshot.tape_alert_flags.as_ref()),
+        ("raw_pages", snapshot.raw_pages.as_ref()),
+    ] {
+        if let Some(value) = value {
+            detail.insert(key.to_string(), CborValue::Text(value.clone()));
+        }
+    }
+    for (key, value) in [
+        ("write_errors_corrected", snapshot.write_errors_corrected),
+        (
+            "write_errors_uncorrected",
+            snapshot.write_errors_uncorrected,
+        ),
+        ("read_errors_corrected", snapshot.read_errors_corrected),
+        ("read_errors_uncorrected", snapshot.read_errors_uncorrected),
+    ] {
+        if let Some(value) = value {
+            detail.insert(key.to_string(), CborValue::Integer(value.into()));
+        }
+    }
+    if let Some(drive) = index
+        .get_drive_by_uuid(snapshot.drive_uuid.as_slice())
+        .map_err(status_from_state_error)?
+    {
+        detail.insert("drive_serial".to_string(), CborValue::Text(drive.serial));
+        detail.insert("managed".to_string(), CborValue::Text(drive.managed));
+        for (key, value) in [
+            ("vendor", drive.vendor.as_ref()),
+            ("product", drive.product.as_ref()),
+            ("firmware_rev", drive.firmware_rev.as_ref()),
+        ] {
+            if let Some(value) = value {
+                detail.insert(key.to_string(), CborValue::Text(value.clone()));
+            }
+        }
+    }
+    Ok(detail)
+}
+
+pub(crate) fn alarm_audit_detail(alarm: &AlarmRecord) -> BTreeMap<String, CborValue> {
+    let mut detail = BTreeMap::from([
+        ("kind".to_string(), CborValue::Text(alarm.kind.clone())),
+        (
+            "severity".to_string(),
+            CborValue::Text(alarm.severity.clone()),
+        ),
+    ]);
+    if let Some(value) = alarm.detail.as_ref() {
+        detail.insert("detail".to_string(), CborValue::Text(value.clone()));
+    }
+    detail
+}
+
 pub(crate) fn append_operation_audit(
     index: &mut CatalogIndex,
     audit_dir: &Path,
@@ -1752,39 +1953,27 @@ pub(crate) fn append_operation_audit(
     audit_append_lock: &Arc<std::sync::Mutex<()>>,
     input: OperationAuditInput<'_>,
 ) -> Result<(), Status> {
-    let _guard = audit_append_lock
-        .lock()
-        .map_err(|_| Status::internal("operation audit append lock poisoned"))?;
-    fs::create_dir_all(audit_dir).map_err(|err| {
-        Status::internal(format!(
-            "create operation audit directory {}: {err}",
-            audit_dir.display()
-        ))
-    })?;
     let mut detail = input.detail;
     detail
         .entry("operation_kind".to_string())
         .or_insert_with(|| CborValue::Text(input.operation_kind.to_string()));
-    let mut audit = FileAuditLog::open(audit_dir, audit_fsync)
-        .map_err(|err| Status::internal(err.to_string()))?;
-    let (_, record) = audit
-        .append_and_return_record(AuditEventRecord {
+    append_and_project_audit(
+        index,
+        audit_dir,
+        audit_fsync,
+        audit_append_lock,
+        ProjectedAuditInput {
             actor: input.actor,
             source_layer: SourceLayer::Layer5,
             operation_id: Some(input.operation_id),
             session_id: None,
             idempotency_key: input.idempotency_key,
             event: input.event,
-            subject: AuditSubject {
-                kind: input.subject_kind.to_string(),
-                id: input.subject_id,
-            },
+            subject_kind: input.subject_kind,
+            subject_id: input.subject_id,
             detail,
-        })
-        .map_err(status_from_state_error)?;
-    index
-        .project_audit_record(&record)
-        .map_err(status_from_state_error)?;
+        },
+    )?;
     Ok(())
 }
 
@@ -3121,6 +3310,8 @@ fn audit_event_name(event: &AuditEvent) -> &'static str {
         AuditEvent::AuditWriteFailed => "AuditWriteFailed",
         AuditEvent::TapeRetired => "TapeRetired",
         AuditEvent::TapeProvisioned => "TapeProvisioned",
+        AuditEvent::TapePoolAssigned => "TapePoolAssigned",
+        AuditEvent::TapeSealed => "TapeSealed",
         AuditEvent::DriveRetired => "DriveRetired",
         AuditEvent::DriveAnnotated => "DriveAnnotated",
         AuditEvent::DriveCleaned => "DriveCleaned",
@@ -3129,6 +3320,11 @@ fn audit_event_name(event: &AuditEvent) -> &'static str {
         AuditEvent::DriveFenced => "DriveFenced",
         AuditEvent::DriveUnfenced => "DriveUnfenced",
         AuditEvent::AlarmAcked => "AlarmAcked",
+        AuditEvent::AlarmRaised => "AlarmRaised",
+        AuditEvent::AlarmCleared => "AlarmCleared",
+        AuditEvent::TapeIoFenceRaised => "TapeIoFenceRaised",
+        AuditEvent::TapeIoFenceReleased => "TapeIoFenceReleased",
+        AuditEvent::DriveHealthObserved => "DriveHealthObserved",
     }
 }
 
@@ -6900,12 +7096,18 @@ BCw3Wyv2UWY=
             foreign_tapealert: true,
             ..remanence_state::DrivesConfig::default()
         };
+        let audit = AuditAppendContext {
+            dir: temp.path().join("audit"),
+            fsync: false,
+            lock: Arc::new(std::sync::Mutex::new(())),
+        };
         let mut reads = Vec::new();
         poll_foreign_drive_counters_once_with_reader(
             &index_path,
             &report,
             &drives_cfg,
             &HashSet::new(),
+            &audit,
             |path, _foreign_tapealert| {
                 reads.push(path.to_path_buf());
                 Ok(foreign_counter_snapshot(Some("[20]")))
@@ -6972,12 +7174,18 @@ BCw3Wyv2UWY=
             foreign_tapealert: true,
             ..remanence_state::DrivesConfig::default()
         };
+        let audit = AuditAppendContext {
+            dir: temp.path().join("audit"),
+            fsync: false,
+            lock: Arc::new(std::sync::Mutex::new(())),
+        };
         let mut reads = Vec::new();
         poll_foreign_drive_counters_once_with_reader(
             &index_path,
             &report,
             &drives_cfg,
             &HashSet::new(),
+            &audit,
             |path, foreign_tapealert| {
                 assert!(foreign_tapealert, "test config must request TapeAlert");
                 reads.push(path.to_path_buf());
@@ -7001,6 +7209,13 @@ BCw3Wyv2UWY=
         assert_eq!(target_snapshots.len(), 1);
         assert_eq!(target_snapshots[0].trigger, "foreign-counter");
         assert_eq!(target_snapshots[0].write_errors_corrected, Some(11));
+        let audit_records = FileAuditLog::replay(audit.dir.as_path()).expect("replay poll audit");
+        assert!(audit_records
+            .iter()
+            .any(|record| record.event == AuditEvent::DriveHealthObserved));
+        assert!(audit_records
+            .iter()
+            .any(|record| record.event == AuditEvent::AlarmRaised));
         let advisory = index
             .list_alarms(false)
             .expect("list active alarms")
@@ -7848,7 +8063,7 @@ BCw3Wyv2UWY=
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: " camera.copy-a ".to_string(),
-                source: crate::WriteObjectSource::Path(source_path.clone()),
+                source: crate::WriteObjectSource::Path(source_path),
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-pool-core".to_string(),
                 expected_content_sha256: None,
