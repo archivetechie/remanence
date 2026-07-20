@@ -362,6 +362,16 @@ pub trait BlockSource: BlockRead {
         Ok(DevicePositionProof::from_device_position(observed))
     }
 
+    /// Return to beginning-of-partition before a positioning plan that cannot
+    /// use either the current cursor or an absolute LBA.
+    ///
+    /// The default uses `LOCATE(0)` for portable sources. The physical-drive
+    /// adapter overrides this with SSC `REWIND`, preserving the distinction
+    /// between the normal absolute-seek path and the last-resort rewind path.
+    fn rewind(&mut self) -> Result<(), TapeIoError> {
+        self.locate(0).map(|_| ())
+    }
+
     /// LOCATE to the given LBA.
     fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError>;
 
@@ -549,6 +559,9 @@ impl BlockSource for DriveHandleSource<'_> {
         expected: TapePosition,
     ) -> Result<DevicePositionProof, TapeIoError> {
         self.0.prove_read_position_pipelined(expected)
+    }
+    fn rewind(&mut self) -> Result<(), TapeIoError> {
+        self.0.rewind()
     }
     fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
         self.0.locate(lba)
@@ -813,6 +826,11 @@ impl BlockRead for FileBlockSource {
 }
 
 impl BlockSource for FileBlockSource {
+    fn rewind(&mut self) -> Result<(), TapeIoError> {
+        self.cursor = 0;
+        Ok(())
+    }
+
     fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
         if lba > self.block_count {
             self.cursor = self.block_count;
@@ -1059,6 +1077,8 @@ pub enum VecBlockSourceCall {
         /// Data records actually copied.
         returned_records: u32,
     },
+    /// `rewind` called.
+    Rewind,
     /// `locate` called.
     Locate {
         /// Target LBA.
@@ -1233,6 +1253,12 @@ impl BlockSource for VecBlockSource {
 
     fn read_batch_blocks(&self, _block_size_bytes: u32) -> u32 {
         self.read_batch_blocks
+    }
+
+    fn rewind(&mut self) -> Result<(), TapeIoError> {
+        self.calls.push(VecBlockSourceCall::Rewind);
+        self.cursor = 0;
+        Ok(())
     }
 
     fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
