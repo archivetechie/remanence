@@ -1550,6 +1550,19 @@ mod tests {
         assert_eq!(u64::from_be_bytes(rp[8..16].try_into().unwrap()), 3);
 
         drive.rewind();
+        drive
+            .execute_none(&space::build_cdb_6(space::SpaceCode::EndOfData, 0))
+            .expect("space to EOD after trailing filemark");
+        drive
+            .execute_in(&read_position::build_cdb_long(), &mut rp)
+            .expect("read EOD position");
+        assert_eq!(
+            u64::from_be_bytes(rp[8..16].try_into().unwrap()),
+            3,
+            "EOD must be after both data blocks and the trailing filemark"
+        );
+
+        drive.rewind();
         let err = drive
             .execute_none(&space::build_cdb_6(space::SpaceCode::Blocks, -1))
             .expect_err("negative SPACE from BOT reports residual");
