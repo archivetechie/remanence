@@ -1,6 +1,19 @@
 use super::*;
 
 #[test]
+fn ramp_detector_reports_end_of_first_qualifying_five_second_window() {
+    let mut ramp_bytes = [0u64; 12];
+    ramp_bytes[2..7].fill(80);
+
+    assert_eq!(
+        pipeline_time_to_steady_ms(&ramp_bytes, 12, 100),
+        Some(7_000)
+    );
+    assert_eq!(pipeline_time_to_steady_ms(&ramp_bytes, 4, 100), None);
+    assert_eq!(pipeline_time_to_steady_ms(&ramp_bytes, 12, 0), None);
+}
+
+#[test]
 fn check_condition_is_not_completion_unknown() {
     let e = TapeIoError::CheckCondition(ScsiError::CheckCondition {
         sense: Vec::new(),

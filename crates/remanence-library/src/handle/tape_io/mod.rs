@@ -30,7 +30,11 @@ use remanence_scsi::{
 };
 use thiserror::Error;
 
-use super::{fire_audit, lock_drive_shared, DirtyCause};
+use super::{
+    fire_audit, lock_drive_shared, DirtyCause, PipelineDiagnostics, PIPELINE_FIRST_WINDOW_SECONDS,
+    PIPELINE_RAMP_OBSERVATION_SECONDS, PIPELINE_STEADY_THRESHOLD_PERCENT,
+    PIPELINE_STEADY_WINDOW_SECONDS,
+};
 use crate::error::{AuditEvent, AuditOp, AuditOutcome};
 use crate::transport::TimeoutClass;
 
@@ -1287,15 +1291,11 @@ impl super::DriveHandle {
             .get_or_insert(ioctl_started);
         let result = self.transport.execute_out(cdb, buf);
         let completed_at = Instant::now();
-        self.pipeline_diagnostics
-            .ioctl_us
-            .record(duration_us(completed_at.duration_since(ioctl_started)));
-        self.pipeline_diagnostics.previous_completion = Some(completed_at);
-        self.pipeline_diagnostics.last_completion = Some(completed_at);
+        self.record_pipeline_ioctl(ioctl_started, completed_at);
 
         match result {
             Ok(_) => {
-                self.record_pipeline_good(records, len_u32);
+                self.record_pipeline_good(records, len_u32, completed_at);
                 let position_after =
                     self.advance_expected_position_arithmetic(records, 0, u64::from(len_u32))?;
                 let outcome = WriteBatchOutcome::from_computed_position(
@@ -1412,7 +1412,7 @@ impl super::DriveHandle {
                         self.defer_pipeline_error_audit(operation, &mapped);
                         return Err(mapped);
                     }
-                    self.record_pipeline_good(records, len_u32);
+                    self.record_pipeline_good(records, len_u32, completed_at);
                     let position_after =
                         self.advance_expected_position_arithmetic(records, 0, u64::from(len_u32))?;
                     let outcome = WriteBatchOutcome::from_computed_position(
@@ -1526,15 +1526,11 @@ impl super::DriveHandle {
             .transport
             .execute_in(&cdb, &mut buf[..transfer_len as usize]);
         let completed_at = Instant::now();
-        self.pipeline_diagnostics
-            .ioctl_us
-            .record(duration_us(completed_at.duration_since(started)));
-        self.pipeline_diagnostics.previous_completion = Some(completed_at);
-        self.pipeline_diagnostics.last_completion = Some(completed_at);
+        self.record_pipeline_ioctl(started, completed_at);
 
         match result {
             Ok(_) => {
-                self.record_pipeline_good(records, transfer_len);
+                self.record_pipeline_good(records, transfer_len, completed_at);
                 let position_evidence =
                     match self.advance_expected_position(records, 0, transfer_len as u64) {
                         Ok(position_after) => position_after,
@@ -1593,7 +1589,7 @@ impl super::DriveHandle {
                     }
                     let bytes_read = records_read.saturating_mul(block_size_bytes);
                     if records_read != 0 {
-                        self.record_pipeline_good(records_read, bytes_read);
+                        self.record_pipeline_good(records_read, bytes_read, completed_at);
                     }
                     let position_evidence =
                         match self.advance_expected_position(records_read, 1, bytes_read as u64) {
@@ -1630,7 +1626,7 @@ impl super::DriveHandle {
                         return Err(mapped);
                     }
                     let bytes_read = records_read.saturating_mul(block_size_bytes);
-                    self.record_pipeline_good(records_read, bytes_read);
+                    self.record_pipeline_good(records_read, bytes_read, completed_at);
                     let position_evidence = match self.advance_expected_position(
                         records_read,
                         0,
@@ -2471,7 +2467,21 @@ impl super::DriveHandle {
             && self.bytes_since_position_check >= self.position_check_bytes
     }
 
-    fn record_pipeline_good(&mut self, records: u32, bytes: u32) {
+    fn record_pipeline_ioctl(&mut self, started: Instant, completed_at: Instant) {
+        let elapsed_us = duration_us(completed_at.duration_since(started));
+        self.pipeline_diagnostics.ioctl_us.record(elapsed_us);
+        if self.pipeline_diagnostics.reset_at.is_some_and(|reset_at| {
+            started.duration_since(reset_at).as_secs() < PIPELINE_FIRST_WINDOW_SECONDS
+        }) {
+            self.pipeline_diagnostics
+                .first_60s_ioctl_us
+                .record(elapsed_us);
+        }
+        self.pipeline_diagnostics.previous_completion = Some(completed_at);
+        self.pipeline_diagnostics.last_completion = Some(completed_at);
+    }
+
+    fn record_pipeline_good(&mut self, records: u32, bytes: u32, completed_at: Instant) {
         self.pipeline_diagnostics.good_commands =
             self.pipeline_diagnostics.good_commands.saturating_add(1);
         self.pipeline_diagnostics.good_records = self
@@ -2482,6 +2492,12 @@ impl super::DriveHandle {
             .pipeline_diagnostics
             .good_bytes
             .saturating_add(u64::from(bytes));
+        if let Some(reset_at) = self.pipeline_diagnostics.reset_at {
+            let second = completed_at.duration_since(reset_at).as_secs() as usize;
+            if let Some(bucket) = self.pipeline_diagnostics.ramp_bytes.get_mut(second) {
+                *bucket = bucket.saturating_add(u64::from(bytes));
+            }
+        }
     }
 
     fn record_pipeline_accounting(&mut self, completed_at: Instant) {
@@ -2550,6 +2566,27 @@ impl super::DriveHandle {
             .map(|(first, last)| duration_us(last.duration_since(first)))
             .unwrap_or(0);
         let commands = self.pipeline_diagnostics.ioctl_us.samples;
+        let effective_feed_bytes_per_second = if elapsed_us == 0 {
+            0
+        } else {
+            self.pipeline_diagnostics
+                .good_bytes
+                .saturating_mul(1_000_000)
+                .checked_div(elapsed_us)
+                .unwrap_or(u64::MAX)
+        };
+        let observed_seconds = self
+            .pipeline_diagnostics
+            .reset_at
+            .zip(self.pipeline_diagnostics.last_completion)
+            .map(|(reset, last)| last.duration_since(reset).as_secs() as usize)
+            .unwrap_or(0)
+            .min(PIPELINE_RAMP_OBSERVATION_SECONDS);
+        let time_to_steady_ms = pipeline_time_to_steady_ms(
+            &self.pipeline_diagnostics.ramp_bytes,
+            observed_seconds,
+            effective_feed_bytes_per_second,
+        );
         PipelinedWriteDiagnostics {
             gap_samples: self.pipeline_diagnostics.gap_us.samples,
             ioctl_samples: self.pipeline_diagnostics.ioctl_us.samples,
@@ -2565,27 +2602,44 @@ impl super::DriveHandle {
             ioctl_p95_us: self.pipeline_diagnostics.ioctl_us.percentile(95, 100),
             ioctl_max_us: self.pipeline_diagnostics.ioctl_us.max,
             ioctl_mean_us: self.pipeline_diagnostics.ioctl_us.mean(),
+            first_60s_ioctl_samples: self.pipeline_diagnostics.first_60s_ioctl_us.samples,
+            first_60s_ioctl_p50_us: self
+                .pipeline_diagnostics
+                .first_60s_ioctl_us
+                .percentile(50, 100),
+            first_60s_ioctl_p95_us: self
+                .pipeline_diagnostics
+                .first_60s_ioctl_us
+                .percentile(95, 100),
+            first_60s_ioctl_max_us: self.pipeline_diagnostics.first_60s_ioctl_us.max,
+            first_60s_ioctl_mean_us: self.pipeline_diagnostics.first_60s_ioctl_us.mean(),
             accounting_samples: self.pipeline_diagnostics.accounting_us.samples,
             accounting_p50_us: self.pipeline_diagnostics.accounting_us.percentile(50, 100),
             accounting_p95_us: self.pipeline_diagnostics.accounting_us.percentile(95, 100),
             accounting_max_us: self.pipeline_diagnostics.accounting_us.max,
             accounting_mean_us: self.pipeline_diagnostics.accounting_us.mean(),
             cadence_us: elapsed_us.checked_div(commands.max(1)).unwrap_or(0),
-            effective_feed_bytes_per_second: if elapsed_us == 0 {
-                0
-            } else {
-                self.pipeline_diagnostics
-                    .good_bytes
-                    .saturating_mul(1_000_000)
-                    .checked_div(elapsed_us)
-                    .unwrap_or(u64::MAX)
-            },
+            effective_feed_bytes_per_second,
+            time_to_first_ioctl_ms: self
+                .pipeline_diagnostics
+                .reset_at
+                .zip(self.pipeline_diagnostics.first_submit)
+                .map(|(reset, first)| duration_ms(first.duration_since(reset)))
+                .unwrap_or(0),
+            steady_reached: time_to_steady_ms.is_some(),
+            time_to_steady_ms: time_to_steady_ms.unwrap_or(0),
+            steady_window_seconds: PIPELINE_STEADY_WINDOW_SECONDS as u32,
+            steady_threshold_percent: PIPELINE_STEADY_THRESHOLD_PERCENT as u32,
+            ramp_observation_seconds: PIPELINE_RAMP_OBSERVATION_SECONDS as u32,
         }
     }
 
     /// Reset cadence counters at the start of one field-measured transfer.
     pub fn reset_pipelined_diagnostics(&mut self) {
-        self.pipeline_diagnostics = Default::default();
+        self.pipeline_diagnostics = PipelineDiagnostics {
+            reset_at: Some(Instant::now()),
+            ..PipelineDiagnostics::default()
+        };
     }
 
     /// Return read-submitter telemetry using the shared cadence schema.
@@ -2723,6 +2777,37 @@ fn records_delta_between(
 
 fn duration_us(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn pipeline_time_to_steady_ms(
+    ramp_bytes: &[u64],
+    observed_seconds: usize,
+    final_feed_bytes_per_second: u64,
+) -> Option<u64> {
+    if final_feed_bytes_per_second == 0 || observed_seconds < PIPELINE_STEADY_WINDOW_SECONDS {
+        return None;
+    }
+    let observed_seconds = observed_seconds.min(ramp_bytes.len());
+    let threshold_bytes = u128::from(final_feed_bytes_per_second)
+        .saturating_mul(PIPELINE_STEADY_WINDOW_SECONDS as u128)
+        .saturating_mul(u128::from(PIPELINE_STEADY_THRESHOLD_PERCENT))
+        .div_ceil(100);
+    ramp_bytes[..observed_seconds]
+        .windows(PIPELINE_STEADY_WINDOW_SECONDS)
+        .position(|window| {
+            window.iter().fold(0u128, |total, bytes| {
+                total.saturating_add(u128::from(*bytes))
+            }) >= threshold_bytes
+        })
+        .map(|start| {
+            u64::try_from(start.saturating_add(PIPELINE_STEADY_WINDOW_SECONDS))
+                .unwrap_or(u64::MAX)
+                .saturating_mul(1_000)
+        })
 }
 
 fn position_drift_error(expected: TapePosition, device: TapePosition) -> TapeIoError {

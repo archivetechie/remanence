@@ -3563,6 +3563,11 @@ fn fixed_read_cadence_histograms_and_batch_effectiveness_are_populated() {
     assert_eq!(diagnostics.good_records, 8);
     assert_eq!(diagnostics.good_bytes, 32);
     assert_eq!(diagnostics.accounting_samples, 2);
+    assert_eq!(diagnostics.first_60s_ioctl_samples, 2);
+    assert_eq!(diagnostics.steady_window_seconds, 5);
+    assert_eq!(diagnostics.steady_threshold_percent, 80);
+    assert_eq!(diagnostics.ramp_observation_seconds, 300);
+    assert!(!diagnostics.steady_reached);
 }
 
 #[test]
