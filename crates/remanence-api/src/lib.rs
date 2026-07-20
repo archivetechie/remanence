@@ -2645,7 +2645,10 @@ impl WriteSessionApi {
         }
         let session_id = decode_uuid_bytes(&start.session_id, "session_id")?;
         let session_id = Uuid::from_bytes(session_id);
-        let start_digest = expected_content_sha256(&start.expected_content_sha256)?;
+        let start_digest = expected_content_digest(
+            &start.expected_content_sha256,
+            start.expected_content_digest.as_ref(),
+        )?;
         let overlap_eligible = overlap_append_eligible(
             self.state.append_staging_mode,
             &start,
@@ -2714,7 +2717,10 @@ impl WriteSessionApi {
         }
         let finish =
             finish.ok_or_else(|| Status::invalid_argument("append stream must end with Finish"))?;
-        let finish_digest = expected_content_sha256(&finish.expected_content_sha256)?;
+        let finish_digest = expected_content_digest(
+            &finish.expected_content_sha256,
+            finish.expected_content_digest.as_ref(),
+        )?;
         if start_digest.is_some() && finish_digest.is_some() && start_digest != finish_digest {
             let _ = fs::remove_file(spool.path());
             return Err(Status::invalid_argument(
@@ -3003,7 +3009,10 @@ where
                 "append received {received_bytes} bytes but declared_size_bytes is {declared_size_bytes}"
             )));
         }
-        let finish_digest = expected_content_sha256(&finish.expected_content_sha256)?;
+        let finish_digest = expected_content_digest(
+            &finish.expected_content_sha256,
+            finish.expected_content_digest.as_ref(),
+        )?;
         if finish_digest.is_some_and(|digest| digest != start_digest) {
             return Err(Status::invalid_argument(
                 "Start and Finish expected_content_sha256 values disagree",
@@ -3702,14 +3711,35 @@ fn ensure_same_session(value: &[u8], expected: Uuid) -> Result<(), Status> {
     }
 }
 
-fn expected_content_sha256(value: &[u8]) -> Result<Option<[u8; 32]>, Status> {
-    if value.is_empty() {
-        Ok(None)
+fn expected_content_digest(
+    legacy_sha256: &[u8],
+    digest: Option<&pb::Digest>,
+) -> Result<Option<[u8; 32]>, Status> {
+    let legacy = if legacy_sha256.is_empty() {
+        None
     } else {
-        value.try_into().map(Some).map_err(|_| {
+        Some(legacy_sha256.try_into().map_err(|_| {
             Status::invalid_argument("expected_content_sha256 must be 32 bytes when supplied")
+        })?)
+    };
+    let paired = digest
+        .map(|digest| {
+            if digest.algorithm != remanence_state::DIGEST_ALGORITHM_SHA256 {
+                return Err(Status::invalid_argument(
+                    "expected_content_digest.algorithm must be sha256",
+                ));
+            }
+            digest.value.as_slice().try_into().map_err(|_| {
+                Status::invalid_argument("expected_content_digest.value must be 32 bytes")
+            })
         })
+        .transpose()?;
+    if legacy.is_some() && paired.is_some() && legacy != paired {
+        return Err(Status::invalid_argument(
+            "expected_content_sha256 and expected_content_digest disagree",
+        ));
     }
+    Ok(paired.or(legacy))
 }
 
 fn overlap_append_eligible(
@@ -4634,6 +4664,22 @@ fn find_object_for_key(
             .index()?
             .get_native_object_by_content_hash(hash.as_slice())
             .map_err(|err| Status::internal(err.to_string())),
+        pb::get_object_request::Key::ContentDigest(digest) => {
+            if digest.algorithm != remanence_state::DIGEST_ALGORITHM_SHA256 {
+                return Err(Status::invalid_argument(
+                    "content_digest.algorithm must be sha256",
+                ));
+            }
+            if digest.value.len() != 32 {
+                return Err(Status::invalid_argument(
+                    "content_digest.value must be exactly 32 bytes",
+                ));
+            }
+            state
+                .index()?
+                .get_native_object_by_content_hash(digest.value.as_slice())
+                .map_err(|err| Status::internal(err.to_string()))
+        }
         pb::get_object_request::Key::CallerObjectId(caller_id) => state
             .index()?
             .get_native_object_by_caller_object_id(caller_id.as_str())
@@ -4654,6 +4700,9 @@ fn find_copy_object_for_key(
         }
         pb::find_object_copies_request::Key::CallerObjectId(value) => {
             pb::get_object_request::Key::CallerObjectId(value)
+        }
+        pb::find_object_copies_request::Key::ContentDigest(value) => {
+            pb::get_object_request::Key::ContentDigest(value)
         }
     };
     find_object_for_key(state, Some(get_key))
@@ -4845,6 +4894,10 @@ fn tape_state(value: &str) -> pb::tape::State {
 }
 
 fn tape_file_to_proto(record: TapeFileRecord) -> Result<pb::TapeFile, Status> {
+    let canonical_metadata_digest = catalog_digest_to_proto(
+        record.canonical_metadata_hash_algorithm,
+        record.canonical_metadata_hash,
+    );
     Ok(pb::TapeFile {
         tape_uuid: record.tape_uuid,
         tape_file_number: u64::from(record.tape_file_number),
@@ -4856,10 +4909,15 @@ fn tape_file_to_proto(record: TapeFileRecord) -> Result<pb::TapeFile, Status> {
             .map(encode_uuid_text)
             .transpose()?
             .unwrap_or_default(),
+        canonical_metadata_digest,
     })
 }
 
 fn native_object_file_to_proto(record: NativeObjectFileRecord) -> Result<pb::FileRecord, Status> {
+    let file_digest = Some(pb::Digest {
+        algorithm: record.file_digest_algorithm,
+        value: record.file_sha256.clone(),
+    });
     Ok(pb::FileRecord {
         object_id: encode_uuid_text(record.object_id.as_str())?,
         file_id: record.file_id.into_bytes(),
@@ -4869,6 +4927,7 @@ fn native_object_file_to_proto(record: NativeObjectFileRecord) -> Result<pb::Fil
         first_chunk_body_lba: record.first_chunk_lba.unwrap_or_default(),
         chunk_count: u32::try_from(record.chunk_count)
             .map_err(|_| Status::internal("object file chunk_count does not fit u32"))?,
+        file_digest,
     })
 }
 
@@ -4886,6 +4945,12 @@ fn object_record_to_proto(record: NativeObjectRecord) -> Result<pb::ObjectRecord
         .copies
         .first()
         .map(append_commit_info_from_native_copy);
+    let content_digest = catalog_digest_to_proto(
+        record.content_hash_algorithm.clone(),
+        record.content_hash.clone(),
+    );
+    let metadata_digest =
+        catalog_digest_to_proto(record.metadata_hash_algorithm, record.metadata_hash);
     Ok(pb::ObjectRecord {
         object_id: encode_uuid_text(record.object_id.as_str())?,
         caller_object_id: record.caller_object_id.unwrap_or_default(),
@@ -4896,6 +4961,8 @@ fn object_record_to_proto(record: NativeObjectRecord) -> Result<pb::ObjectRecord
         created_at: timestamp_from_rfc3339(record.created_at_utc.as_str()),
         copies: record.copies.iter().map(object_copy_to_proto).collect(),
         append_commit_info,
+        content_digest,
+        metadata_digest,
     })
 }
 
@@ -4912,7 +4979,21 @@ fn object_copy_to_proto(copy: &NativeObjectCopyRecord) -> pb::ObjectCopy {
         last_verified_at: None,
         health: health as i32,
         pool_id: copy.pool_id.clone().unwrap_or_default(),
+        plaintext_digest: catalog_digest_to_proto(
+            copy.plaintext_digest_algorithm.clone(),
+            copy.plaintext_digest.clone(),
+        ),
+        stored_digest: catalog_digest_to_proto(
+            copy.stored_digest_algorithm.clone(),
+            copy.stored_digest.clone(),
+        ),
     }
+}
+
+fn catalog_digest_to_proto(algorithm: Option<String>, value: Option<Vec<u8>>) -> Option<pb::Digest> {
+    algorithm
+        .zip(value)
+        .map(|(algorithm, value)| pb::Digest { algorithm, value })
 }
 
 pub(crate) fn append_mode_for_tape_file_number(tape_file_number: u64) -> pb::AppendMode {
@@ -5787,6 +5868,7 @@ mod tests {
                     body_format_manifest: Vec::new(),
                     expected_content_sha256: Vec::new(),
                     source_replay_capability: pb::SourceReplayCapability::Unspecified as i32,
+                    expected_content_digest: None,
                 },
             )),
         }
@@ -5809,6 +5891,7 @@ mod tests {
                 pb::AppendObjectFinish {
                     session_id: session_id.as_bytes().to_vec(),
                     expected_content_sha256: digest.to_vec(),
+                    expected_content_digest: None,
                 },
             )),
         }
@@ -5822,7 +5905,9 @@ mod tests {
             body_format: "rao-v1".to_string(),
             logical_size_bytes: Some(456),
             content_hash: Some(vec![0x33; 32]),
+            content_hash_algorithm: Some(remanence_state::DIGEST_ALGORITHM_SHA256.to_string()),
             metadata_hash: None,
+            metadata_hash_algorithm: None,
             created_at_utc: "2026-07-05T00:00:00Z".to_string(),
             copies: vec![NativeObjectCopyRecord {
                 object_id: OBJECT_ID_TEXT.to_string(),
@@ -5837,7 +5922,13 @@ mod tests {
                 recipient_epoch_ids: None,
                 metadata_frame_len: None,
                 plaintext_digest: Some(vec![0x33; 32]),
+                plaintext_digest_algorithm: Some(
+                    remanence_state::DIGEST_ALGORITHM_SHA256.to_string(),
+                ),
                 stored_digest: Some(vec![0x33; 32]),
+                stored_digest_algorithm: Some(
+                    remanence_state::DIGEST_ALGORITHM_SHA256.to_string(),
+                ),
             }],
         };
 
@@ -5852,6 +5943,19 @@ mod tests {
         assert_eq!(info.position_before_lba, None);
         assert_eq!(info.position_after_lba, None);
         assert_eq!(info.journal_record_ordinal, None);
+        let content_digest = proto.content_digest.expect("content digest pair");
+        assert_eq!(content_digest.algorithm, "sha256");
+        assert_eq!(content_digest.value, vec![0x33; 32]);
+        assert!(proto.metadata_digest.is_none());
+        let copy = proto.copies.first().expect("copy");
+        assert_eq!(
+            copy.plaintext_digest.as_ref().map(|digest| digest.algorithm.as_str()),
+            Some("sha256")
+        );
+        assert_eq!(
+            copy.stored_digest.as_ref().map(|digest| digest.value.as_slice()),
+            Some(&[0x33; 32][..])
+        );
     }
 
     #[test]
@@ -5878,6 +5982,8 @@ mod tests {
             created_at: None,
             copies: Vec::new(),
             append_commit_info: None,
+            content_digest: None,
+            metadata_digest: None,
         };
         let mut encoded = Vec::new();
         record.encode(&mut encoded).expect("encode object record");
@@ -5914,6 +6020,7 @@ mod tests {
             body_format_manifest: Vec::new(),
             expected_content_sha256: digest.to_vec(),
             source_replay_capability: pb::SourceReplayCapability::ReplayFromStart as i32,
+            expected_content_digest: None,
         };
         assert!(overlap_append_eligible(
             remanence_state::AppendStagingMode::Overlap,
@@ -5944,6 +6051,44 @@ mod tests {
             &eligible,
             None
         ));
+    }
+
+    #[test]
+    fn algorithm_aware_expected_digest_validates_compatibility_mirror() {
+        let digest = [0x45; 32];
+        let paired = pb::Digest {
+            algorithm: "sha256".to_string(),
+            value: digest.to_vec(),
+        };
+        assert_eq!(
+            expected_content_digest(&[], Some(&paired)).expect("paired digest"),
+            Some(digest)
+        );
+        assert_eq!(
+            expected_content_digest(&digest, Some(&paired)).expect("matching mirrors"),
+            Some(digest)
+        );
+
+        let mismatch = pb::Digest {
+            algorithm: "sha256".to_string(),
+            value: vec![0x46; 32],
+        };
+        assert_eq!(
+            expected_content_digest(&digest, Some(&mismatch))
+                .expect_err("mismatched mirrors")
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let unsupported = pb::Digest {
+            algorithm: "sha512".to_string(),
+            value: vec![0x45; 64],
+        };
+        assert_eq!(
+            expected_content_digest(&[], Some(&unsupported))
+                .expect_err("unsupported digest algorithm")
+                .code(),
+            tonic::Code::InvalidArgument
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10557,6 +10702,8 @@ BCw3Wyv2UWY=
                                 created_at: None,
                                 copies: Vec::new(),
                                 append_commit_info: None,
+                                content_digest: None,
+                                metadata_digest: None,
                             },
                             replay: false,
                         }));
@@ -10642,6 +10789,8 @@ BCw3Wyv2UWY=
                     created_at: None,
                     copies: Vec::new(),
                     append_commit_info: None,
+                    content_digest: None,
+                    metadata_digest: None,
                 },
                 replay: true,
             }));
@@ -10857,6 +11006,14 @@ BCw3Wyv2UWY=
         assert_eq!(file.path, "payload.bin");
         assert_eq!(file.size_bytes, 17);
         assert_eq!(file.file_sha256, vec![7u8; 32]);
+        assert_eq!(
+            file.file_digest.as_ref().map(|digest| digest.algorithm.as_str()),
+            Some("sha256")
+        );
+        assert_eq!(
+            file.file_digest.as_ref().map(|digest| digest.value.as_slice()),
+            Some(&[7u8; 32][..])
+        );
         assert_eq!(file.first_chunk_body_lba, 2);
         assert_eq!(file.chunk_count, 1);
 
@@ -10938,6 +11095,23 @@ BCw3Wyv2UWY=
         .expect("get object by uuid")
         .into_inner();
         assert_eq!(fetched_by_id.object_id, object_uuid().as_bytes().to_vec());
+
+        let fetched_by_digest = pb::catalog_server::Catalog::get_object(
+            &service,
+            Request::new(pb::GetObjectRequest {
+                key: Some(pb::get_object_request::Key::ContentDigest(pb::Digest {
+                    algorithm: "sha256".to_string(),
+                    value: vec![7u8; 32],
+                })),
+            }),
+        )
+        .await
+        .expect("get object by algorithm-aware digest")
+        .into_inner();
+        assert_eq!(
+            fetched_by_digest.object_id,
+            object_uuid().as_bytes().to_vec()
+        );
 
         let copies = pb::catalog_server::Catalog::find_object_copies(
             &service,

@@ -1551,7 +1551,9 @@ mod tests {
             recipient_epoch_ids: None,
             metadata_frame_len: None,
             plaintext_digest: Some(vec![0x51; 32]),
+            plaintext_digest_algorithm: Some("sha256".to_string()),
             stored_digest: Some(vec![0x51; 32]),
+            stored_digest_algorithm: Some("sha256".to_string()),
         }
     }
 
@@ -1562,6 +1564,8 @@ mod tests {
             kind: "object".to_string(),
             block_count,
             object_id: Some(object_id.to_string()),
+            canonical_metadata_hash: None,
+            canonical_metadata_hash_algorithm: None,
         }
     }
 
@@ -1772,6 +1776,8 @@ mod tests {
                 representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
                 recipient_epoch_ids: None,
                 metadata_frame_len: None,
+                plaintext_digest: Some([0x31; 32]),
+                stored_digest: Some([0x32; 32]),
             }],
         };
 

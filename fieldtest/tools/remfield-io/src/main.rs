@@ -658,6 +658,10 @@ async fn append_object(
                     expected_content_sha256: start_digest
                         .map(|digest| digest.to_vec())
                         .unwrap_or_default(),
+                    expected_content_digest: start_digest.map(|digest| pb::Digest {
+                        algorithm: "sha256".to_string(),
+                        value: digest.to_vec(),
+                    }),
                     source_replay_capability: if input.replay_from_start {
                         pb::SourceReplayCapability::ReplayFromStart as i32
                     } else {
@@ -694,13 +698,18 @@ async fn append_object(
             }
         }
 
+        let finish_digest = start_digest
+            .map(|digest| digest.to_vec())
+            .unwrap_or_else(|| hasher.finalize().to_vec());
         tx.send(pb::AppendObjectMessage {
             payload: Some(pb::append_object_message::Payload::Finish(
                 pb::AppendObjectFinish {
                     session_id: session_id_for_task,
-                    expected_content_sha256: start_digest
-                        .map(|digest| digest.to_vec())
-                        .unwrap_or_else(|| hasher.finalize().to_vec()),
+                    expected_content_sha256: finish_digest.clone(),
+                    expected_content_digest: Some(pb::Digest {
+                        algorithm: "sha256".to_string(),
+                        value: finish_digest,
+                    }),
                 },
             )),
         })
@@ -1520,6 +1529,11 @@ mod tests {
             body_format: "rao-v1".to_string(),
             caller_metadata: Default::default(),
             created_at: None,
+            content_digest: Some(pb::Digest {
+                algorithm: "sha256".to_string(),
+                value: vec![0x22; 32],
+            }),
+            metadata_digest: None,
             copies: vec![pb::ObjectCopy {
                 tape_uuid: vec![0x44; 16],
                 tape_file_number: 3,
@@ -1527,6 +1541,11 @@ mod tests {
                 last_verified_at: None,
                 health: pb::object_copy::Health::ObjectCopyHealthOk as i32,
                 pool_id: "camera.copy-a".to_string(),
+                plaintext_digest: Some(pb::Digest {
+                    algorithm: "sha256".to_string(),
+                    value: vec![0x22; 32],
+                }),
+                stored_digest: None,
             }],
             append_commit_info: Some(pb::AppendCommitInfo {
                 append_mode: pb::AppendMode::Append as i32,
@@ -1602,6 +1621,11 @@ mod tests {
             body_format: "rao-v1".to_string(),
             caller_metadata: Default::default(),
             created_at: None,
+            content_digest: Some(pb::Digest {
+                algorithm: "sha256".to_string(),
+                value: vec![0x33; 32],
+            }),
+            metadata_digest: None,
             copies: vec![pb::ObjectCopy {
                 tape_uuid: vec![0x55; 16],
                 tape_file_number: 8,
@@ -1609,6 +1633,11 @@ mod tests {
                 last_verified_at: None,
                 health: pb::object_copy::Health::ObjectCopyHealthOk as i32,
                 pool_id: "fieldtest-a".to_string(),
+                plaintext_digest: Some(pb::Digest {
+                    algorithm: "sha256".to_string(),
+                    value: vec![0x33; 32],
+                }),
+                stored_digest: None,
             }],
             append_commit_info: Some(pb::AppendCommitInfo {
                 append_mode: pb::AppendMode::Append as i32,

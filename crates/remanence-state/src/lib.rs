@@ -47,8 +47,8 @@ pub use index::{
     RebuildTapeJournalInput, RestartOperation, RestartSession, RetireDriveOutcome, RetireTapeInput,
     RetireTapeOutcome, TapeFileRecord, TapeIoFenceInput, TapeIoFenceRecord, TapeJournalIndexInput,
     TapeJournalIndexReport, TapeKindFilter, TapePoolProjectionInput, TapePoolRecord, TapeRecord,
-    OBJECT_COPY_REPRESENTATION_ENCRYPTED, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
-    OBJECT_COPY_REPRESENTATION_UNKNOWN, SCHEMA_VERSION,
+    DIGEST_ALGORITHM_SHA256, OBJECT_COPY_REPRESENTATION_ENCRYPTED,
+    OBJECT_COPY_REPRESENTATION_PLAINTEXT, OBJECT_COPY_REPRESENTATION_UNKNOWN, SCHEMA_VERSION,
 };
 pub use lock::StateLockGuard;
 pub use paths::StatePaths;
