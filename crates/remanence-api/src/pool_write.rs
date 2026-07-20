@@ -1926,6 +1926,7 @@ where
     let (submit_tx, submit_rx) = std_mpsc::sync_channel(1);
     let (submitter_done_tx, submitter_done_rx) = std_mpsc::channel();
     let poison = Arc::new(Mutex::new(None::<String>));
+    inner.reset_pipelined_write_diagnostics();
     let result = std::thread::scope(|scope| {
         let producer_poison = Arc::clone(&poison);
         let producer_handle = scope.spawn(move || {
@@ -2461,6 +2462,12 @@ impl<'a> BlockSink for LiveCounterBlockSink<'a> {
         self.inner.pipelined_write_diagnostics()
     }
 
+    fn reset_pipelined_write_diagnostics(&mut self) {
+        self.inner.reset_pipelined_write_diagnostics();
+        self.live_write_counter
+            .record_tape_io_diagnostics(PipelinedWriteDiagnostics::default());
+    }
+
     fn publish_pipelined_write_diagnostics(&mut self) {
         self.live_write_counter
             .record_tape_io_diagnostics(self.inner.pipelined_write_diagnostics());
@@ -2601,6 +2608,10 @@ impl<'a, S: BlockSink + ?Sized> BlockSink for CountingBlockSink<'a, S> {
 
     fn pipelined_write_diagnostics(&self) -> PipelinedWriteDiagnostics {
         self.inner.pipelined_write_diagnostics()
+    }
+
+    fn reset_pipelined_write_diagnostics(&mut self) {
+        self.inner.reset_pipelined_write_diagnostics();
     }
 
     fn publish_pipelined_write_diagnostics(&mut self) {
@@ -4491,6 +4502,8 @@ mod tests {
         ring_buffers: u32,
         cdbs: Vec<Vec<u8>>,
         alignments: Vec<usize>,
+        diagnostic_ioctl_samples: u64,
+        diagnostic_resets: u64,
         diagnostic_publications: u64,
         ordered_events: Arc<Mutex<Vec<String>>>,
     }
@@ -4514,6 +4527,8 @@ mod tests {
                 ring_buffers: remanence_library::DEFAULT_TAPE_IO_STAGING_RING_BUFFERS,
                 cdbs: Vec::new(),
                 alignments: Vec::new(),
+                diagnostic_ioctl_samples: 0,
+                diagnostic_resets: 0,
                 diagnostic_publications: 0,
                 ordered_events: Arc::new(Mutex::new(Vec::new())),
             }
@@ -4546,6 +4561,7 @@ mod tests {
             let records = records_in_staged_batch(buf, block_size_bytes)
                 .expect("test batch contains whole records");
             self.batch_calls = self.batch_calls.saturating_add(1);
+            self.diagnostic_ioctl_samples = self.diagnostic_ioctl_samples.saturating_add(1);
             self.events.push(format!("write_batch:{records}"));
             if let Some(error) = self.batch_error.take() {
                 return Err(error);
@@ -4596,6 +4612,19 @@ mod tests {
 
         fn staging_ring_buffers(&self) -> u32 {
             self.ring_buffers
+        }
+
+        fn pipelined_write_diagnostics(&self) -> PipelinedWriteDiagnostics {
+            PipelinedWriteDiagnostics {
+                ioctl_samples: self.diagnostic_ioctl_samples,
+                ioctl_max_us: self.diagnostic_ioctl_samples.saturating_mul(1_000),
+                ..PipelinedWriteDiagnostics::default()
+            }
+        }
+
+        fn reset_pipelined_write_diagnostics(&mut self) {
+            self.diagnostic_ioctl_samples = 0;
+            self.diagnostic_resets = self.diagnostic_resets.saturating_add(1);
         }
 
         fn publish_pipelined_write_diagnostics(&mut self) {
@@ -5073,6 +5102,36 @@ mod tests {
         assert!(
             fence < audit,
             "safety persistence must precede audit: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn pipelined_diagnostics_reset_for_each_staged_transfer() {
+        let mut sink = StagedTestSink::with_ring(2, 4);
+
+        run_staged_transfer(&mut sink, 4, |staged| {
+            for value in 0..4u8 {
+                staged.write_block(&[value; 4])?;
+            }
+            Ok(())
+        })
+        .expect("first transfer succeeds");
+        assert_eq!(sink.pipelined_write_diagnostics().ioctl_samples, 2);
+        assert_eq!(sink.pipelined_write_diagnostics().ioctl_max_us, 2_000);
+
+        run_staged_transfer(&mut sink, 4, |staged| {
+            staged.write_block(&[9; 4])?;
+            Ok(())
+        })
+        .expect("second transfer succeeds");
+
+        assert_eq!(sink.diagnostic_resets, 2);
+        assert_eq!(sink.diagnostic_publications, 2);
+        assert_eq!(sink.pipelined_write_diagnostics().ioctl_samples, 1);
+        assert_eq!(
+            sink.pipelined_write_diagnostics().ioctl_max_us,
+            1_000,
+            "the prior transfer maximum must not survive"
         );
     }
 
