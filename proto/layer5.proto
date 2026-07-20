@@ -480,6 +480,8 @@ message LoadDriveRequest {
   uint32 slot_element_address     = 2;
   uint32 drive_element_address    = 3;
   IdempotencyKey idempotency_key  = 4;
+  // Skip the post-load TEST UNIT READY wait and preserve legacy behavior.
+  bool no_wait                    = 5;
 }
 
 message ResumeMediaReadinessRequest {

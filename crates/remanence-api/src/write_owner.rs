@@ -14,10 +14,11 @@ use ciborium::value::Value as CborValue;
 use remanence_format::error::FormatError;
 use remanence_format::model::BodyLba;
 use remanence_library::{
-    BlockSize, BlockSource, ChangerHandle, DiscoveryReport, DriveHandle, DriveHandleSink,
-    DriveHandleSource, MediaFamily, MediaReadiness, MediaReadinessWaitEvent,
-    MediaReadinessWaitOptions, ReadBatchOutcome, SpaceKind, SpaceResult, StaticAllowlist,
-    TapeConfig, TapeIoError, TapePosition,
+    classify_media_readiness_error_ref, BlockSize, BlockSource, ChangerHandle, DiscoveryReport,
+    DriveHandle, DriveHandleSink, DriveHandleSource, DriveOpError, LoadError, MediaFamily,
+    MediaReadiness, MediaReadinessPoll, MediaReadinessWaitEvent, MediaReadinessWaitOptions,
+    ReadBatchOutcome, SpaceKind, SpaceResult, StaticAllowlist, TapeConfig, TapeIoError,
+    TapePosition,
 };
 use remanence_parity::{
     scan_reconstruct_filemark_map, DriveHandleRawSource, FilemarkMap, ParityError, TapeFileEntry,
@@ -42,6 +43,8 @@ use crate::{
 };
 
 pub(crate) const SPOOL_MAX_BYTES: u64 = crate::APPEND_SPOOL_MAX_BYTES;
+const LOAD_READY_TIMEOUT: StdDuration = StdDuration::from_secs(9_000);
+const LOAD_READY_POLL_INTERVAL: StdDuration = StdDuration::from_secs(30);
 
 /// Session-independent coordinates used to position a newly minted read
 /// session at a catalogued file boundary.
@@ -65,6 +68,7 @@ pub(crate) enum RoboticsAction {
     Load {
         slot: u16,
         bay: u16,
+        wait_ready: bool,
     },
     Unload {
         bay: u16,
@@ -1403,45 +1407,14 @@ fn handle_drive_wait_ready(
         pb::OperationState::Running,
         &[("phase", "readiness_poll"), ("state", "starting")],
     );
-    let result = drive.wait_for_media_readiness(
+    let result = poll_drive_media_readiness(
+        index,
+        drive,
+        operation_id,
         family,
-        None,
         options,
-        || {
-            handle
-                .is_cancelled()
-                .then(|| "daemon cancellation".to_string())
-        },
-        |event| match event {
-            MediaReadinessWaitEvent::Poll(poll) => {
-                record_session_open_readiness_poll_transition(
-                    index,
-                    operation_id,
-                    "grpc_wait_ready",
-                    &poll.readiness,
-                    poll.timed_out,
-                )
-                .map_err(|error| format!("record media readiness transition: {error}"))?;
-                let attempts = poll.attempts.to_string();
-                let elapsed_seconds = poll.elapsed.as_secs().to_string();
-                let state = if poll.timed_out {
-                    "timeout_unknown"
-                } else {
-                    session_open_readiness_state(&poll.readiness)
-                };
-                handle.publish_state(
-                    pb::OperationState::Running,
-                    &[
-                        ("phase", "readiness_poll"),
-                        ("state", state),
-                        ("attempts", attempts.as_str()),
-                        ("elapsed_seconds", elapsed_seconds.as_str()),
-                    ],
-                );
-                Ok(())
-            }
-            MediaReadinessWaitEvent::Cancelled(_) => Ok(()),
-        },
+        handle,
+        "grpc_wait_ready",
     );
 
     match result {
@@ -1477,6 +1450,57 @@ fn handle_drive_wait_ready(
             &[("phase", "readiness_poll"), ("state", "recording_failed")],
         ),
     }
+}
+
+fn poll_drive_media_readiness(
+    index: &mut CatalogIndex,
+    drive: &mut DriveHandle,
+    operation_id: Uuid,
+    family: MediaFamily,
+    options: MediaReadinessWaitOptions,
+    handle: &crate::operations::OperationHandle,
+    phase: &str,
+) -> Result<MediaReadinessPoll, String> {
+    drive.wait_for_media_readiness(
+        family,
+        None,
+        options,
+        || {
+            handle
+                .is_cancelled()
+                .then(|| "daemon cancellation".to_string())
+        },
+        |event| match event {
+            MediaReadinessWaitEvent::Poll(poll) => {
+                record_session_open_readiness_poll_transition(
+                    index,
+                    operation_id,
+                    phase,
+                    &poll.readiness,
+                    poll.timed_out,
+                )
+                .map_err(|error| format!("record media readiness transition: {error}"))?;
+                let attempts = poll.attempts.to_string();
+                let elapsed_seconds = poll.elapsed.as_secs().to_string();
+                let state = if poll.timed_out {
+                    "timeout_unknown"
+                } else {
+                    session_open_readiness_state(&poll.readiness)
+                };
+                handle.publish_state(
+                    pb::OperationState::Running,
+                    &[
+                        ("phase", "readiness_poll"),
+                        ("state", state),
+                        ("attempts", attempts.as_str()),
+                        ("elapsed_seconds", elapsed_seconds.as_str()),
+                    ],
+                );
+                Ok(())
+            }
+            MediaReadinessWaitEvent::Cancelled(_) => Ok(()),
+        },
+    )
 }
 
 fn session_open_reject_admission_conflicts(
@@ -3074,9 +3098,11 @@ fn handle_robotics(
         RoboticsAction::Move { src, dst } => library
             .move_medium(*src, *dst, &cfg.policy)
             .map_err(|err| err.to_string()),
-        RoboticsAction::Load { slot, bay } => library
-            .load(*slot, *bay, &cfg.policy)
-            .map_err(|err| err.to_string()),
+        RoboticsAction::Load {
+            slot,
+            bay,
+            wait_ready,
+        } => run_load_sequence(index, cfg, &handle, &mut library, *slot, *bay, *wait_ready),
         RoboticsAction::Unload { bay, destination } => library
             .unload(*bay, *destination, &cfg.policy)
             .map_err(|err| err.to_string()),
@@ -3141,6 +3167,135 @@ fn handle_robotics(
             );
         }
     }
+}
+
+fn run_load_sequence(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    handle: &crate::operations::OperationHandle,
+    library: &mut remanence_library::LibraryHandle,
+    slot: u16,
+    bay: u16,
+    wait_ready: bool,
+) -> Result<(), String> {
+    if !wait_ready {
+        return library
+            .load(slot, bay, &cfg.policy)
+            .map_err(|error| error.to_string());
+    }
+
+    let barcode = library
+        .library()
+        .slots
+        .iter()
+        .find(|candidate| candidate.element_address == slot)
+        .and_then(|candidate| candidate.cartridge.clone());
+    let drive_bay = library
+        .library()
+        .drive_bays
+        .iter()
+        .find(|candidate| candidate.element_address == bay);
+    let drive_serial = drive_bay
+        .and_then(|candidate| candidate.installed.as_ref())
+        .map(|drive| drive.serial.clone());
+    let drive_sg = drive_bay
+        .and_then(|candidate| candidate.installed.as_ref())
+        .and_then(|drive| drive.sg_path.as_ref())
+        .map(|path| path.display().to_string());
+    let family = session_open_media_family(barcode.as_deref());
+    let retryable_load_completion = match library.load(slot, bay, &cfg.policy) {
+        Ok(()) => None,
+        Err(error) => match retryable_readiness_from_load_error(&error, family) {
+            Some(readiness) => Some(readiness),
+            None => return Err(error.to_string()),
+        },
+    };
+
+    let operation_id = handle.op_id_uuid();
+    index
+        .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+            operation_id,
+            run_id: None,
+            library_serial: library.library().serial.clone(),
+            changer_sg: Some(library.library().changer_sg.display().to_string()),
+            drive_element: bay,
+            drive_sg,
+            drive_serial,
+            barcode,
+            source_slot: Some(slot),
+            media_generation: library
+                .library()
+                .drive_bays
+                .iter()
+                .find(|candidate| candidate.element_address == bay)
+                .and_then(|candidate| candidate.loaded_tape.as_deref())
+                .and_then(crate::lto_generation_from_voltag)
+                .map(|generation| generation.generation_number()),
+            phase: "load_drive_readiness".to_string(),
+            state: "planned".to_string(),
+            dirty_scope: Some("drive+tape".to_string()),
+            deadline_at_utc: OffsetDateTime::now_utc()
+                .checked_add(Duration::seconds(9_000))
+                .and_then(|deadline| deadline.format(&Rfc3339).ok()),
+            evidence_path: None,
+        })
+        .map_err(|error| format!("record load media-readiness operation: {error}"))?;
+    if let Some(readiness) = retryable_load_completion.as_ref() {
+        record_session_open_readiness_poll_transition(
+            index,
+            operation_id,
+            "load_drive_completion",
+            readiness,
+            false,
+        )
+        .map_err(|error| format!("record LOAD readiness transition: {error}"))?;
+    }
+
+    handle.publish_state(
+        pb::OperationState::Running,
+        &[("phase", "readiness_poll"), ("state", "starting")],
+    );
+    let mut drive = library
+        .open_drive(bay, &cfg.policy)
+        .map_err(|error| format!("open drive 0x{bay:04x} for readiness wait: {error}"))?;
+    let poll = poll_drive_media_readiness(
+        index,
+        &mut drive,
+        operation_id,
+        family,
+        MediaReadinessWaitOptions {
+            wait: true,
+            timeout: LOAD_READY_TIMEOUT,
+            poll_interval: LOAD_READY_POLL_INTERVAL,
+        },
+        handle,
+        "load_drive_readiness",
+    )?;
+    if !poll.readiness.is_ready() {
+        let state = if poll.timed_out {
+            "timeout_unknown"
+        } else {
+            session_open_readiness_state(&poll.readiness)
+        };
+        return Err(format!(
+            "load drive 0x{bay:04x} did not reach READY (state={state}): {}",
+            session_open_readiness_summary(&poll.readiness)
+        ));
+    }
+    library
+        .refresh()
+        .map_err(|error| format!("refresh inventory after READY: {error}"))
+}
+
+fn retryable_readiness_from_load_error(
+    error: &LoadError,
+    family: MediaFamily,
+) -> Option<MediaReadiness> {
+    let LoadError::DriveLoad(DriveOpError::ScsiError(error)) = error else {
+        return None;
+    };
+    let readiness = classify_media_readiness_error_ref(error, family);
+    readiness.is_retryable_wait().then_some(readiness)
 }
 
 fn observe_refreshed_library(
@@ -3334,7 +3489,11 @@ fn robotics_detail(action: &RoboticsAction) -> BTreeMap<String, CborValue> {
                 CborValue::Integer(u64::from(*dst).into()),
             );
         }
-        RoboticsAction::Load { slot, bay } => {
+        RoboticsAction::Load {
+            slot,
+            bay,
+            wait_ready,
+        } => {
             detail.insert(
                 "slot".to_string(),
                 CborValue::Integer(u64::from(*slot).into()),
@@ -3343,6 +3502,7 @@ fn robotics_detail(action: &RoboticsAction) -> BTreeMap<String, CborValue> {
                 "bay".to_string(),
                 CborValue::Integer(u64::from(*bay).into()),
             );
+            detail.insert("wait_ready".to_string(), CborValue::Bool(*wait_ready));
         }
         RoboticsAction::Unload { bay, destination } => {
             detail.insert(
@@ -5320,6 +5480,39 @@ mod tests {
             session_open_media_family(None),
             MediaFamily::Unknown
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn load_wait_absorbs_only_retryable_drive_completions() {
+        fn load_check_condition(key: u8, asc: u8, ascq: u8) -> LoadError {
+            let mut sense = vec![0_u8; 32];
+            sense[0] = 0x70;
+            sense[2] = key;
+            sense[7] = 24;
+            sense[12] = asc;
+            sense[13] = ascq;
+            LoadError::DriveLoad(DriveOpError::ScsiError(
+                remanence_library::ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred: 0,
+                },
+            ))
+        }
+
+        let first_mount_attention = load_check_condition(0x06, 0x28, 0x00);
+        assert!(matches!(
+            retryable_readiness_from_load_error(&first_mount_attention, MediaFamily::Lto9OrLater),
+            Some(MediaReadiness::UnitAttention {
+                asc: 0x28,
+                ascq: 0x00
+            })
+        ));
+
+        let medium_error = load_check_condition(0x03, 0x11, 0x00);
+        assert!(
+            retryable_readiness_from_load_error(&medium_error, MediaFamily::Lto9OrLater).is_none()
+        );
     }
 
     #[test]
