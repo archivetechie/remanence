@@ -200,6 +200,11 @@ impl PoolWriteObjectRecord {
                 .map(PoolWriteObjectCopyRecord::to_proto)
                 .collect(),
             append_commit_info,
+            content_digest: Some(pb::Digest {
+                algorithm: remanence_state::DIGEST_ALGORITHM_SHA256.to_string(),
+                value: self.content_sha256.to_vec(),
+            }),
+            metadata_digest: None,
         }
     }
 
@@ -226,6 +231,10 @@ pub struct PoolWriteObjectCopyRecord {
     pub recipient_epoch_ids: Option<Vec<String>>,
     /// Encrypted RAO metadata frame length.
     pub metadata_frame_len: Option<u64>,
+    /// SHA-256 of the canonical plaintext RAO object bytes.
+    pub plaintext_digest: Option<[u8; 32]>,
+    /// SHA-256 of the stored representation bytes.
+    pub stored_digest: Option<[u8; 32]>,
 }
 
 impl PoolWriteObjectCopyRecord {
@@ -237,6 +246,14 @@ impl PoolWriteObjectCopyRecord {
             last_verified_at: None,
             health: pb::object_copy::Health::ObjectCopyHealthOk as i32,
             pool_id: self.pool_id.clone(),
+            plaintext_digest: self.plaintext_digest.map(|value| pb::Digest {
+                algorithm: remanence_state::DIGEST_ALGORITHM_SHA256.to_string(),
+                value: value.to_vec(),
+            }),
+            stored_digest: self.stored_digest.map(|value| pb::Digest {
+                algorithm: remanence_state::DIGEST_ALGORITHM_SHA256.to_string(),
+                value: value.to_vec(),
+            }),
         }
     }
 }
@@ -3536,6 +3553,8 @@ fn pool_write_result(
             representation: copy_representation.representation.to_string(),
             recipient_epoch_ids: copy_representation.recipient_epoch_ids,
             metadata_frame_len: copy_representation.metadata_frame_len,
+            plaintext_digest: Some(write_report.catalog.object_copy.plaintext_digest),
+            stored_digest: Some(write_report.catalog.object_copy.stored_digest),
         }],
     };
 
@@ -3639,7 +3658,31 @@ fn pool_write_copy_record_from_native(
         representation: copy.representation.clone(),
         recipient_epoch_ids: copy.recipient_epoch_ids.clone(),
         metadata_frame_len: copy.metadata_frame_len,
+        plaintext_digest: optional_native_copy_digest(
+            copy.plaintext_digest.as_deref(),
+            &copy.object_id,
+            "plaintext_digest",
+        )?,
+        stored_digest: optional_native_copy_digest(
+            copy.stored_digest.as_deref(),
+            &copy.object_id,
+            "stored_digest",
+        )?,
     })
+}
+
+fn optional_native_copy_digest(
+    digest: Option<&[u8]>,
+    object_id: &str,
+    field: &str,
+) -> Result<Option<[u8; 32]>, PoolWriteError> {
+    digest
+        .map(|digest| {
+            digest
+                .try_into()
+                .map_err(|_| replay_object_invalid(object_id, format!("{field} is not 32 bytes")))
+        })
+        .transpose()
 }
 
 fn native_object_content_sha256(object: &NativeObjectRecord) -> Result<[u8; 32], PoolWriteError> {
@@ -6154,6 +6197,8 @@ mod tests {
                 representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
                 recipient_epoch_ids: None,
                 metadata_frame_len: None,
+                plaintext_digest: Some([0x33; 32]),
+                stored_digest: Some([0x44; 32]),
             }],
         };
 
@@ -6168,6 +6213,20 @@ mod tests {
         assert_eq!(info.position_before_lba, None);
         assert_eq!(info.position_after_lba, None);
         assert_eq!(info.journal_record_ordinal, None);
+        assert_eq!(
+            proto.copies[0]
+                .plaintext_digest
+                .as_ref()
+                .map(|digest| digest.value.as_slice()),
+            Some(&[0x33; 32][..])
+        );
+        assert_eq!(
+            proto.copies[0]
+                .stored_digest
+                .as_ref()
+                .map(|digest| digest.algorithm.as_str()),
+            Some("sha256")
+        );
     }
 
     #[test]
