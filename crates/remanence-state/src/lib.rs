@@ -28,12 +28,12 @@ pub use audit::{
 pub use config::{
     derive_tape_pool_from_voltag, load_config, parse_config_toml, validate_block_size,
     validate_config, validate_tape_pool_capacity_invariant, validate_trusted_volume_paths,
-    watermark_floor_bytes, AuditConfig, CacheConfig, CleaningConfig, DaemonConfig, DaemonTlsConfig,
-    DrivesConfig, IndexConfig, JournalConfig, LibraryConfig, LiveStatusConfig,
-    PoolSelectionPolicyName, RemConfig, TapeIoConfig, TapePoolConfig, TapePoolRuleConfig,
-    DEFAULT_DRIVE_IDLE_UNLOAD_SECONDS, DEFAULT_IO_MEMORY_CEILING_BYTES,
-    DEFAULT_RANGED_POSITION_CHECK_BYTES, DEFAULT_READ_RESERVOIR_BYTES,
-    DEFAULT_TAPE_BLOCK_SIZE_BYTES,
+    watermark_floor_bytes, AppendStagingMode, AuditConfig, CacheConfig, CleaningConfig,
+    DaemonConfig, DaemonTlsConfig, DrivesConfig, IndexConfig, JournalConfig, LibraryConfig,
+    LiveStatusConfig, PoolSelectionPolicyName, RemConfig, TapeIoConfig, TapePoolConfig,
+    TapePoolRuleConfig, DEFAULT_APPEND_RING_BYTES, DEFAULT_DRIVE_IDLE_UNLOAD_SECONDS,
+    DEFAULT_IO_MEMORY_CEILING_BYTES, DEFAULT_RANGED_POSITION_CHECK_BYTES,
+    DEFAULT_READ_RESERVOIR_BYTES, DEFAULT_TAPE_BLOCK_SIZE_BYTES,
 };
 pub use error::StateError;
 pub use index::{
