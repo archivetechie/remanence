@@ -15,8 +15,9 @@ use remanence_format::error::FormatError;
 use remanence_format::model::BodyLba;
 use remanence_library::{
     BlockSize, BlockSource, ChangerHandle, DiscoveryReport, DriveHandle, DriveHandleSink,
-    DriveHandleSource, MediaFamily, MediaReadiness, ReadBatchOutcome, SpaceKind, SpaceResult,
-    StaticAllowlist, TapeConfig, TapeIoError, TapePosition,
+    DriveHandleSource, MediaFamily, MediaReadiness, MediaReadinessWaitEvent,
+    MediaReadinessWaitOptions, ReadBatchOutcome, SpaceKind, SpaceResult, StaticAllowlist,
+    TapeConfig, TapeIoError, TapePosition,
 };
 use remanence_parity::{
     scan_reconstruct_filemark_map, DriveHandleRawSource, FilemarkMap, ParityError, TapeFileEntry,
@@ -97,6 +98,13 @@ pub(crate) enum ChangerCommand {
 }
 
 pub(crate) enum DriveCommand {
+    WaitReady {
+        operation_id: Uuid,
+        family: MediaFamily,
+        options: MediaReadinessWaitOptions,
+        handle: crate::operations::OperationHandle,
+        reservation: DriveReservation,
+    },
     OpenWrite {
         pool_cfg: TapePoolConfig,
         selected: SelectedTape,
@@ -829,6 +837,21 @@ fn drive_loop(
     let mut snapshot_misses = 0u32;
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
+            DriveCommand::WaitReady {
+                operation_id,
+                family,
+                options,
+                handle,
+                reservation: _reservation,
+            } => handle_drive_wait_ready(
+                bay,
+                &mut index,
+                drive,
+                operation_id,
+                family,
+                options,
+                &handle,
+            ),
             DriveCommand::OpenWrite {
                 pool_cfg,
                 selected,
@@ -955,6 +978,9 @@ fn drive_loop(
 fn drain_failed_drive_commands(mut rx: mpsc::Receiver<DriveCommand>, message: String) {
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
+            DriveCommand::WaitReady { handle, .. } => {
+                handle.publish_failed(&message, &[("phase", "drive_actor")]);
+            }
             DriveCommand::OpenWrite { reply, .. } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
@@ -1364,6 +1390,95 @@ fn session_open_short_probe_or_load(
     ))
 }
 
+fn handle_drive_wait_ready(
+    bay: u16,
+    index: &mut CatalogIndex,
+    drive: &mut DriveHandle,
+    operation_id: Uuid,
+    family: MediaFamily,
+    options: MediaReadinessWaitOptions,
+    handle: &crate::operations::OperationHandle,
+) {
+    handle.publish_state(
+        pb::OperationState::Running,
+        &[("phase", "readiness_poll"), ("state", "starting")],
+    );
+    let result = drive.wait_for_media_readiness(
+        family,
+        None,
+        options,
+        || {
+            handle
+                .is_cancelled()
+                .then(|| "daemon cancellation".to_string())
+        },
+        |event| match event {
+            MediaReadinessWaitEvent::Poll(poll) => {
+                record_session_open_readiness_poll_transition(
+                    index,
+                    operation_id,
+                    "grpc_wait_ready",
+                    &poll.readiness,
+                    poll.timed_out,
+                )
+                .map_err(|error| format!("record media readiness transition: {error}"))?;
+                let attempts = poll.attempts.to_string();
+                let elapsed_seconds = poll.elapsed.as_secs().to_string();
+                let state = if poll.timed_out {
+                    "timeout_unknown"
+                } else {
+                    session_open_readiness_state(&poll.readiness)
+                };
+                handle.publish_state(
+                    pb::OperationState::Running,
+                    &[
+                        ("phase", "readiness_poll"),
+                        ("state", state),
+                        ("attempts", attempts.as_str()),
+                        ("elapsed_seconds", elapsed_seconds.as_str()),
+                    ],
+                );
+                Ok(())
+            }
+            MediaReadinessWaitEvent::Cancelled(_) => Ok(()),
+        },
+    );
+
+    match result {
+        Ok(poll) if poll.readiness.is_ready() => handle.publish_state(
+            pb::OperationState::Succeeded,
+            &[("phase", "ready"), ("state", "ready")],
+        ),
+        Ok(poll) => {
+            let state = if poll.timed_out {
+                "timeout_unknown"
+            } else {
+                session_open_readiness_state(&poll.readiness)
+            };
+            let summary = if poll.timed_out {
+                format!(
+                    "timed out waiting for media readiness in drive bay 0x{bay:04x}: {}",
+                    session_open_readiness_summary(&poll.readiness)
+                )
+            } else {
+                format!(
+                    "media readiness became non-retryable in drive bay 0x{bay:04x}: {}",
+                    session_open_readiness_summary(&poll.readiness)
+                )
+            };
+            handle.publish_failed(&summary, &[("phase", "readiness_poll"), ("state", state)]);
+        }
+        Err(error) if handle.is_cancelled() => handle.publish_state(
+            pb::OperationState::Cancelled,
+            &[("phase", "cancelled"), ("detail", error.as_str())],
+        ),
+        Err(error) => handle.publish_failed(
+            error.as_str(),
+            &[("phase", "readiness_poll"), ("state", "recording_failed")],
+        ),
+    }
+}
+
 fn session_open_reject_admission_conflicts(
     index: &mut CatalogIndex,
     ctx: &SessionOpenReadinessContext<'_>,
@@ -1663,7 +1778,21 @@ fn record_session_open_readiness_transition(
     phase: &str,
     readiness: &MediaReadiness,
 ) -> Result<(), remanence_state::StateError> {
-    let state = session_open_readiness_state(readiness);
+    record_session_open_readiness_poll_transition(index, operation_id, phase, readiness, false)
+}
+
+fn record_session_open_readiness_poll_transition(
+    index: &mut CatalogIndex,
+    operation_id: Uuid,
+    phase: &str,
+    readiness: &MediaReadiness,
+    timed_out: bool,
+) -> Result<(), remanence_state::StateError> {
+    let state = if timed_out {
+        "timeout_unknown"
+    } else {
+        session_open_readiness_state(readiness)
+    };
     let (sense_key, asc, ascq, target_status, transport_class, last_error_json, sense_raw) =
         session_open_readiness_evidence(readiness);
     index
@@ -2338,6 +2467,9 @@ fn handle_drive_open_write(
                     "write session already active",
                 )));
             }
+            DriveCommand::WaitReady { handle, .. } => {
+                handle.publish_failed("write session already active", &[("phase", "admission")]);
+            }
             DriveCommand::Unload { reply } => {
                 let _ = reply.send(Err(Status::failed_precondition(
                     "write session already active",
@@ -2794,6 +2926,9 @@ fn handle_drive_open_read(
                 let _ = reply.send(Err(Status::failed_precondition(
                     "read session already active",
                 )));
+            }
+            DriveCommand::WaitReady { handle, .. } => {
+                handle.publish_failed("read session already active", &[("phase", "admission")]);
             }
             DriveCommand::Unload { reply } => {
                 let _ = reply.send(Err(Status::failed_precondition(

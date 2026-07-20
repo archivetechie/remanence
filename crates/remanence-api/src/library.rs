@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::pin::Pin;
+use std::time::Duration;
 
 use ciborium::value::Value as CborValue;
 use remanence_library::{DriveBay, IePort, Library, Slot};
@@ -909,6 +910,134 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
             detail,
         )
         .await
+    }
+
+    async fn resume_media_readiness(
+        &self,
+        request: Request<pb::ResumeMediaReadinessRequest>,
+    ) -> Result<Response<pb::OperationRef>, Status> {
+        crate::authorize_request(&request, crate::AuthPermission::OperationControl)?;
+        let request = request.into_inner();
+        if request.timeout_seconds == 0 || request.poll_interval_seconds == 0 {
+            return Err(Status::invalid_argument(
+                "media-readiness timeout and poll interval must be non-zero",
+            ));
+        }
+        let operation_uuid = crate::decode_uuid_bytes(
+            request.operation_id.as_slice(),
+            "media_readiness_operation_id",
+        )?;
+        let operation_id = Uuid::from_bytes(operation_uuid);
+        let record = self
+            .state
+            .index()?
+            .media_readiness_operation(operation_id)
+            .map_err(crate::status_from_state_error)?
+            .ok_or_else(|| Status::not_found("media-readiness operation not found"))?;
+        const RESUMABLE_STATES: &[&str] = &[
+            "planned",
+            "pre_ready_loading",
+            "media_initializing",
+            "becoming_ready",
+            "target_busy",
+            "unit_attention",
+        ];
+        if !RESUMABLE_STATES.contains(&record.state.as_str()) {
+            return Err(Status::failed_precondition(format!(
+                "media-readiness operation {operation_id} is state {} and cannot be resumed",
+                record.state
+            )));
+        }
+        if self
+            .state
+            .default_library_serial
+            .as_deref()
+            .is_some_and(|serial| serial.as_str() != record.library_serial)
+        {
+            return Err(Status::failed_precondition(format!(
+                "media-readiness operation {operation_id} belongs to library {}, which this daemon does not operate",
+                record.library_serial
+            )));
+        }
+        let bay = u16::try_from(record.drive_element).map_err(|_| {
+            Status::failed_precondition(format!(
+                "media-readiness operation {operation_id} has invalid drive element {}",
+                record.drive_element
+            ))
+        })?;
+        let snapshot = self
+            .state
+            .current_library_snapshot()
+            .ok_or_else(|| Status::not_found("library snapshot unavailable"))?;
+        let library = snapshot
+            .report
+            .library(record.library_serial.as_str())
+            .ok_or_else(|| Status::not_found("media-readiness library not found"))?;
+        let drive_bay = library
+            .drive_bays
+            .iter()
+            .find(|candidate| candidate.element_address == bay)
+            .ok_or_else(|| Status::not_found("media-readiness drive bay not found"))?;
+        if let Some(expected) = record.drive_serial.as_deref() {
+            let actual = drive_bay
+                .installed
+                .as_ref()
+                .map(|drive| drive.serial.as_str());
+            if actual != Some(expected) {
+                return Err(Status::failed_precondition(format!(
+                    "media-readiness operation {operation_id} expected drive serial {expected}, snapshot has {}",
+                    actual.unwrap_or("(none)")
+                )));
+            }
+        }
+        if let Some(expected) = record.barcode.as_deref() {
+            if drive_bay.loaded_tape.as_deref() != Some(expected) {
+                return Err(Status::failed_precondition(format!(
+                    "media-readiness operation {operation_id} expected barcode {expected} in drive 0x{bay:04x}, snapshot has {}",
+                    drive_bay.loaded_tape.as_deref().unwrap_or("(none)")
+                )));
+            }
+        }
+
+        let pool = self.state.drive_pool()?.clone();
+        let reservation = pool.reserve_drive(bay)?;
+        let drive_tx = pool.drive_tx(bay)?;
+        let handle = self
+            .state
+            .operations
+            .register(operation_id, "media_readiness_wait");
+        let family = if record
+            .media_generation
+            .is_some_and(|generation| generation >= 9)
+        {
+            remanence_library::MediaFamily::Lto9OrLater
+        } else {
+            remanence_library::MediaFamily::Unknown
+        };
+        let command = crate::write_owner::DriveCommand::WaitReady {
+            operation_id,
+            family,
+            options: remanence_library::MediaReadinessWaitOptions {
+                wait: true,
+                timeout: Duration::from_secs(u64::from(request.timeout_seconds)),
+                poll_interval: Duration::from_secs(u64::from(request.poll_interval_seconds)),
+            },
+            handle: handle.clone(),
+            reservation,
+        };
+        match drive_tx.try_send(command) {
+            Ok(()) => Ok(Response::new(pb::OperationRef {
+                operation_id: operation_id.as_bytes().to_vec(),
+            })),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                handle.publish_failed("drive-session owner is busy", &[("phase", "dispatch")]);
+                Err(Status::failed_precondition("drive-session owner is busy"))
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                handle.publish_failed("drive-session owner is stopped", &[("phase", "dispatch")]);
+                Err(Status::unavailable("drive-session owner is stopped"))
+            }
+        }
     }
 
     async fn unload_drive(

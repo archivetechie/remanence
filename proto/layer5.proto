@@ -166,6 +166,9 @@ service LibraryService {
   rpc RetireDrive       (RetireDriveRequest)          returns (RetireDriveResponse);
   rpc PollDrive         (PollDriveRequest)            returns (DriveHealthSnapshot);
   rpc CleanDrive        (CleanDriveRequest)           returns (OperationRef);
+  // Resume an existing durable media-readiness fence in place. Progress is
+  // observed through Daemon.WatchOperation using the returned operation id.
+  rpc ResumeMediaReadiness (ResumeMediaReadinessRequest) returns (OperationRef);
   rpc ListAlarms        (ListAlarmsRequest)           returns (ListAlarmsResponse);
   rpc AckAlarm          (AckAlarmRequest)             returns (Alarm);
   rpc GetLiveStatus     (GetLiveStatusRequest)        returns (GetLiveStatusResponse);
@@ -477,6 +480,14 @@ message LoadDriveRequest {
   uint32 slot_element_address     = 2;
   uint32 drive_element_address    = 3;
   IdempotencyKey idempotency_key  = 4;
+}
+
+message ResumeMediaReadinessRequest {
+  // Durable media-readiness operation UUID returned in a readiness fence.
+  bytes operation_id            = 1;
+  // Bounded wait parameters. Both must be non-zero.
+  uint32 timeout_seconds        = 2;
+  uint32 poll_interval_seconds  = 3;
 }
 
 message UnloadDriveRequest {
