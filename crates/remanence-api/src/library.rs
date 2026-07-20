@@ -906,7 +906,11 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
             actor,
             &request.library_uuid,
             "load_drive",
-            crate::write_owner::RoboticsAction::Load { slot, bay },
+            crate::write_owner::RoboticsAction::Load {
+                slot,
+                bay,
+                wait_ready: !request.no_wait,
+            },
             detail,
         )
         .await

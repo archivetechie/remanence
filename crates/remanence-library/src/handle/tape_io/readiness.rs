@@ -194,11 +194,20 @@ impl MediaReadiness {
 
 /// Classify a failed TEST UNIT READY call.
 pub fn classify_media_readiness_error(err: ScsiError, family: MediaFamily) -> MediaReadiness {
+    classify_media_readiness_error_ref(&err, family)
+}
+
+/// Classify a borrowed SCSI failure for readiness-aware composed commands.
+///
+/// This is the same classifier as [`classify_media_readiness_error`], exposed
+/// by reference so a higher layer can decide whether a failed LOAD is safe to
+/// follow with TEST UNIT READY while retaining the original error for display.
+pub fn classify_media_readiness_error_ref(err: &ScsiError, family: MediaFamily) -> MediaReadiness {
     match err {
         #[cfg(target_os = "linux")]
-        ScsiError::CheckCondition { sense, .. } => classify_check_condition(sense, family),
+        ScsiError::CheckCondition { sense, .. } => classify_check_condition(sense.clone(), family),
         #[cfg(target_os = "linux")]
-        ScsiError::UnexpectedStatus { status } => classify_target_status(status),
+        ScsiError::UnexpectedStatus { status } => classify_target_status(*status),
         #[cfg(target_os = "linux")]
         ScsiError::TransportError { .. } | ScsiError::Io(_) => MediaReadiness::TransportUnknown {
             detail: err.to_string(),

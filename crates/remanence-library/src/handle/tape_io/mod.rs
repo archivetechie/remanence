@@ -42,8 +42,9 @@ pub use model::{
     WriteOutcome, WriteUnpositionedOutcome,
 };
 pub use readiness::{
-    classify_media_readiness_error, media_readiness_poll_interval, MediaFamily, MediaReadiness,
-    MediaReadinessPoll, MediaReadinessWaitEvent, MediaReadinessWaitOptions,
+    classify_media_readiness_error, classify_media_readiness_error_ref,
+    media_readiness_poll_interval, MediaFamily, MediaReadiness, MediaReadinessPoll,
+    MediaReadinessWaitEvent, MediaReadinessWaitOptions,
 };
 
 #[cfg(not(test))]

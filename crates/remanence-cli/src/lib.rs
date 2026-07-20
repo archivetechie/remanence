@@ -1301,6 +1301,10 @@ struct DriveLoadArgs {
     /// Destination drive bay element address.
     #[arg(long, value_parser = parse_element_addr)]
     bay: u16,
+
+    /// Return after legacy LOAD completion without waiting for cartridge readiness.
+    #[arg(long)]
+    no_wait: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -4562,6 +4566,7 @@ fn run_drive_client_command(
                             slot_element_address: slot,
                             drive_element_address: u32::from(args.bay),
                             idempotency_key: None,
+                            no_wait: args.no_wait,
                         })
                         .await
                         .map_err(status_error)?
@@ -14864,6 +14869,26 @@ mod tests {
                     bay: 0x0102,
                     ..
                 }),
+                ..
+            }
+        ));
+
+        let no_wait = Cli::parse_from([
+            "rem",
+            "drive",
+            "load",
+            "--library",
+            "mainlib",
+            "--slot",
+            "0x0400",
+            "--bay",
+            "0x0102",
+            "--no-wait",
+        ]);
+        assert!(matches!(
+            no_wait.command,
+            RemCommand::Drive {
+                command: DriveClientCommand::Load(DriveLoadArgs { no_wait: true, .. }),
                 ..
             }
         ));
