@@ -307,13 +307,42 @@ pub fn write_prepared_object_to_parity(
     files: &[PreparedFile],
     reserve: CapacityReserveInput,
 ) -> Result<StreamingObjectWriteReport, StreamingError> {
+    let mut readers = open_prepared_readers(files)?
+        .into_iter()
+        .map(|reader| Box::new(reader) as Box<dyn Read + Send>)
+        .collect::<Vec<_>>();
+    write_prepared_object_to_parity_from_readers(
+        parity,
+        tape_uuid,
+        options,
+        files,
+        &mut readers,
+        reserve,
+    )
+}
+
+/// Write a prepared object from caller-owned readers through the same parity
+/// and catalog funnel used by path-backed writes.
+pub fn write_prepared_object_to_parity_from_readers(
+    parity: &mut ParitySink<'_>,
+    tape_uuid: [u8; 16],
+    options: &RemTarObjectOptions,
+    files: &[PreparedFile],
+    readers: &mut [Box<dyn Read + Send>],
+    reserve: CapacityReserveInput,
+) -> Result<StreamingObjectWriteReport, StreamingError> {
     let plan = plan_prepared_object(options, files)?;
     validate_reserve(options, &plan.layout, reserve)?;
-
-    let mut readers = open_prepared_readers(files)?;
+    if readers.len() != files.len() {
+        return Err(StreamingError::InvalidInput(format!(
+            "prepared file count {} does not match reader count {}",
+            files.len(),
+            readers.len()
+        )));
+    }
     let mut streams = Vec::with_capacity(files.len());
     for (file, reader) in files.iter().zip(readers.iter_mut()) {
-        streams.push(RemTarFileStream::new(file.spec.clone(), reader));
+        streams.push(RemTarFileStream::new(file.spec.clone(), reader.as_mut()));
     }
 
     let opened = parity.begin_object_with_capacity_reserve_and_bootstrap_object_row(
@@ -1387,6 +1416,66 @@ mod tests {
         let err = plan_prepared_object(&options(), &[file]).unwrap_err();
 
         assert!(err.to_string().contains("regular files only"), "{err}");
+    }
+
+    #[test]
+    fn path_and_live_reader_emit_identical_rao_bytes_and_catalog_projection() {
+        let source_dir = tempfile::Builder::new()
+            .prefix("remanence-stream-equivalence")
+            .tempdir()
+            .expect("source tempdir");
+        let source_path = source_dir.path().join("golden.bin");
+        let payload = (0..19_731u32)
+            .map(|value| (value.wrapping_mul(31) % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&source_path, &payload).expect("write golden payload");
+        let files = vec![
+            prepare_regular_file(&source_path, "golden/payload.bin", "golden-file")
+                .expect("prepare path source"),
+        ];
+        let opts = options();
+        let plan = plan_prepared_object(&opts, &files).expect("plan object");
+
+        let mut serial_tape = VecBlockSink::new();
+        let serial_report = {
+            let mut raw = BlockSinkRawTapeSink::new(&mut serial_tape);
+            let mut parity =
+                ParitySink::new_sidecar_only(&mut raw, scheme(), TAPE_UUID, BLOCK_SIZE)
+                    .expect("serial parity");
+            parity.write_bootstrap().expect("serial bootstrap");
+            write_prepared_object_to_parity(
+                &mut parity,
+                TAPE_UUID,
+                &opts,
+                &files,
+                capacity_input(plan.layout.projected_size_blocks),
+            )
+            .expect("serial write")
+        };
+
+        let mut overlap_tape = VecBlockSink::new();
+        let overlap_report = {
+            let mut raw = BlockSinkRawTapeSink::new(&mut overlap_tape);
+            let mut parity =
+                ParitySink::new_sidecar_only(&mut raw, scheme(), TAPE_UUID, BLOCK_SIZE)
+                    .expect("overlap parity");
+            parity.write_bootstrap().expect("overlap bootstrap");
+            let mut readers: Vec<Box<dyn Read + Send>> =
+                vec![Box::new(std::io::Cursor::new(payload))];
+            write_prepared_object_to_parity_from_readers(
+                &mut parity,
+                TAPE_UUID,
+                &opts,
+                &files,
+                &mut readers,
+                capacity_input(plan.layout.projected_size_blocks),
+            )
+            .expect("overlap write")
+        };
+
+        assert_eq!(overlap_tape.blocks, serial_tape.blocks);
+        assert_eq!(overlap_tape.filemarks, serial_tape.filemarks);
+        assert_eq!(overlap_report.catalog, serial_report.catalog);
     }
 
     #[test]
