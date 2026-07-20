@@ -9169,7 +9169,7 @@ BCw3Wyv2UWY=
     }
 
     #[test]
-    fn pool_write_empty_caller_object_id_remains_non_idempotent() {
+    fn pool_write_rejects_empty_caller_object_id_without_tape_io() {
         let mut index = test_index();
         project_pool(&mut index, "scenario-a");
         project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
@@ -9179,7 +9179,7 @@ BCw3Wyv2UWY=
         let cfg = pool_config("scenario-a");
         let mut tape_sink = VecBlockSink::new();
 
-        let first = write_object_to_pool(
+        let error = write_object_to_pool(
             &mut index,
             &mut tape_sink,
             &cfg,
@@ -9192,34 +9192,18 @@ BCw3Wyv2UWY=
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
-        .expect("first empty-caller write succeeds");
-        let second = write_object_to_pool(
-            &mut index,
-            &mut tape_sink,
-            &cfg,
-            WriteObjectToPoolRequest {
-                pool_id: "scenario-a".to_string(),
-                source: crate::WriteObjectSource::Path(source_path),
-                archive_path: "payload.bin".into(),
-                caller_object_id: String::new(),
-                expected_content_sha256: None,
-                representation: PoolWriteRepresentation::Plaintext,
-            },
-        )
-        .expect("second empty-caller write succeeds");
+        .expect_err("empty caller_object_id must be rejected");
 
-        assert!(!first.is_replay());
-        assert!(!second.is_replay());
-        assert_ne!(first.object.object_id, second.object.object_id);
-        assert_eq!(first.object.copies[0].tape_file_number, 1);
-        assert_eq!(second.object.copies[0].tape_file_number, 2);
         assert_eq!(
-            index
-                .list_native_objects()
-                .expect("list native objects")
-                .len(),
-            2
+            error.to_string(),
+            "invalid RAO input: caller_object_id must not be empty"
         );
+        assert!(tape_sink.blocks.is_empty());
+        assert!(tape_sink.filemarks.is_empty());
+        assert!(index
+            .list_native_objects()
+            .expect("list native objects")
+            .is_empty());
     }
 
     #[test]
