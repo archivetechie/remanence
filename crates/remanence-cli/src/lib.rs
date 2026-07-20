@@ -2968,7 +2968,8 @@ impl ArchiveCommand {
             | Self::Build(_)
             | Self::Inspect(_)
             | Self::Extract(_)
-            | Self::ExtractStream(_) => None,
+            | Self::ExtractStream(_)
+            | Self::CoveringRange(_) => None,
             // `archive write` is state-changing; gate it through `--allow`
             // against the supplied `--library` serial.
             Self::Write(args) => Some(args.library.as_str()),
@@ -15492,15 +15493,18 @@ mod tests {
                 status: pb::health_response::Status::Healthy as i32,
                 components,
                 detail: "sqlite quick_check=ok".to_string(),
-                component_health: vec![pb::ComponentHealth {
-                    component: "sqlite_index".to_string(),
-                    status: pb::component_health::Status::Healthy as i32,
-                    other_status: String::new(),
-                }, pb::ComponentHealth {
-                    component: "robot".to_string(),
-                    status: pb::component_health::Status::Other as i32,
-                    other_status: "warming".to_string(),
-                }],
+                component_health: vec![
+                    pb::ComponentHealth {
+                        component: "sqlite_index".to_string(),
+                        status: pb::component_health::Status::Healthy as i32,
+                        other_status: String::new(),
+                    },
+                    pb::ComponentHealth {
+                        component: "robot".to_string(),
+                        status: pb::component_health::Status::Other as i32,
+                        other_status: "warming".to_string(),
+                    },
+                ],
             },
             true,
             &mut out,
@@ -19771,6 +19775,103 @@ blob Project/Render Files/
         assert_eq!(
             fs::read(range_dir.join("big.bin")).unwrap(),
             payload[400..900]
+        );
+    }
+
+    #[test]
+    fn archive_covering_range_consumes_authenticated_prefix_from_stdin() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-covering-range")
+            .tempdir()
+            .unwrap();
+        let input_dir = temp.path().join("inputs");
+        fs::create_dir_all(&input_dir).unwrap();
+        fs::write(input_dir.join("small.bin"), vec![0x5a; 900]).unwrap();
+        let (_primary, primary_public, recovery_public, primary_private) =
+            write_test_recipient_files(temp.path(), "cover", 0x62);
+        let object_path = temp.path().join("covering-range.rao");
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            input_dir.to_str().unwrap(),
+            "--out",
+            object_path.to_str().unwrap(),
+            "--recipient",
+            primary_public.to_str().unwrap(),
+            "--recipient",
+            recovery_public.to_str().unwrap(),
+            "--chunk-size",
+            "512",
+            "--object-id",
+            "object-cover",
+            "--caller-object-id",
+            "caller-cover",
+            "--manifest-file-id",
+            "manifest-cover",
+            "--timestamp",
+            "2026-01-01T00:00:00Z",
+        ]);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(stderr.is_empty(), "{stderr}");
+        let build: Value = serde_json::from_str(&stdout).expect("build json");
+        assert_eq!(build["format_version"], 2);
+
+        let stored = fs::read(&object_path).unwrap();
+        let inspected = remanence_aead::inspect_bytes(&stored).unwrap();
+        let authenticated_prefix_len = RAO_HEADER_LEN
+            + inspected.header.key_frame_len as usize
+            + inspected.header.metadata_frame_len as usize;
+        let mut stdin_prefix = &stored[..authenticated_prefix_len];
+        let cli = Cli::parse_from([
+            "rem",
+            "archive",
+            "covering-range",
+            "--private-key",
+            primary_private.to_str().unwrap(),
+            "--object-id",
+            "stored-object",
+            "--file-id",
+            "member-1",
+            "--range",
+            "100:25",
+        ]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_mode(
+            cli.into(),
+            CliMode::Rem,
+            || -> Result<DiscoveryReport, DiscoveryError> {
+                panic!("covering-range must bypass device discovery")
+            },
+            &mut stdin_prefix,
+            &mut out,
+            &mut err,
+        );
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+        let report: Value = serde_json::from_slice(&out).expect("covering-range json");
+        assert_eq!(report["command"], "archive covering-range");
+        assert_eq!(report["status"], "ok");
+        assert_eq!(report["object_id"], "stored-object");
+        assert_eq!(report["file_id"], "member-1");
+        assert_eq!(report["plaintext_start"], 100);
+        assert_eq!(report["plaintext_len"], 25);
+        assert_eq!(report["first_chunk"], 0);
+        assert_eq!(report["chunk_count"], 1);
+        assert_eq!(
+            report["authenticated_prefix_len"],
+            authenticated_prefix_len as u64
+        );
+        assert!(report["stored_range_start"].as_u64().is_some());
+        assert!(report["stored_range_len"].as_u64().unwrap() > 0);
+        assert_eq!(
+            report["stored_range_end"].as_u64().unwrap(),
+            report["stored_range_start"].as_u64().unwrap()
+                + report["stored_range_len"].as_u64().unwrap()
         );
     }
 
