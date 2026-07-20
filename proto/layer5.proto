@@ -242,7 +242,14 @@ message Drive {
   uint64 tape_io_ioctl_p95_us = 23;
   uint64 tape_io_ioctl_max_us = 24;
   uint64 tape_io_cadence_us = 25;
+  // Cumulative average over the current/most recently published transfer.
   uint64 tape_io_effective_feed_bytes_per_second = 26;
+  // Changer-reported seated cartridge barcode; empty when no cartridge is loaded.
+  string loaded_tape_barcode = 27;
+  // Seconds since this daemon first observed the current barcode seated in this bay.
+  uint64 mount_age_seconds = 28;
+  // Combined read/write byte rate over the daemon's rolling ~5 second window.
+  uint64 tape_io_window_feed_bytes_per_second = 29;
 }
 
 message DriveCatalogEntry {
