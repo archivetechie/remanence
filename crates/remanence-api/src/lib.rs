@@ -4133,11 +4133,14 @@ where
 fn operation_to_proto(record: OperationRecord) -> Result<pb::OperationStatus, Status> {
     let operation_id = encode_uuid_text(record.operation_id.as_str())?;
     let error_summary = match record.state.as_str() {
-        "failed" => "operation failed",
-        "completion_unknown" => "completion unknown",
-        _ => "",
-    }
-    .to_string();
+        "failed" => record
+            .error_summary
+            .clone()
+            .filter(|summary| !summary.trim().is_empty())
+            .unwrap_or_else(|| "operation failed".to_string()),
+        "completion_unknown" => "completion unknown".to_string(),
+        _ => String::new(),
+    };
     Ok(pb::OperationStatus {
         operation_id,
         operation_kind: record.operation_kind,
@@ -6450,6 +6453,30 @@ BCw3Wyv2UWY=
         index
             .project_audit_record(&record)
             .expect("project queued operation");
+        ApiState::new(index)
+    }
+
+    fn state_with_failed_operation() -> ApiState {
+        let mut index = test_index();
+        let operation_id = operation_uuid();
+        let record = audit_record(
+            1,
+            AuditEvent::OperationFailed,
+            operation_id,
+            None,
+            detail(&[
+                ("operation_kind", CborValue::Text("clean_drive".to_string())),
+                (
+                    "error_summary",
+                    CborValue::Text(
+                        "no eligible cleaning cartridge: CLNU01L9 is expired".to_string(),
+                    ),
+                ),
+            ]),
+        );
+        index
+            .project_audit_record(&record)
+            .expect("project failed operation");
         ApiState::new(index)
     }
 
@@ -9240,6 +9267,28 @@ BCw3Wyv2UWY=
         assert_eq!(status.created_at, status.updated_at);
         assert!(status.progress.is_empty());
         assert!(status.error_summary.is_empty());
+    }
+
+    #[tokio::test]
+    async fn daemon_reports_durable_operation_failure_detail() {
+        let service = state_with_failed_operation().daemon_service();
+
+        let status = pb::daemon_server::Daemon::get_operation(
+            &service,
+            Request::new(pb::GetOperationRequest {
+                operation_id: operation_uuid().as_bytes().to_vec(),
+            }),
+        )
+        .await
+        .expect("get failed operation")
+        .into_inner();
+
+        assert_eq!(status.operation_kind, "clean_drive");
+        assert_eq!(status.state, pb::OperationState::Failed as i32);
+        assert_eq!(
+            status.error_summary,
+            "no eligible cleaning cartridge: CLNU01L9 is expired"
+        );
     }
 
     #[tokio::test]

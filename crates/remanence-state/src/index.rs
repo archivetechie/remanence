@@ -20,7 +20,7 @@ use crate::config::{derive_tape_pool_from_voltag, TapePoolRuleConfig};
 use crate::error::StateError;
 
 /// Current Layer 4 SQLite schema version.
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
 const LEGACY_TAPE_POOL_MEMBERSHIPS_TABLE: &str = concat!("tape_pool_", "memberships");
 /// Catalog value for an unencrypted RAO copy row.
 pub const OBJECT_COPY_REPRESENTATION_PLAINTEXT: &str = "plaintext";
@@ -192,6 +192,8 @@ pub struct OperationRecord {
     pub session_id: Option<String>,
     /// Projected subject string, if any.
     pub subject: Option<String>,
+    /// Durable failure reason projected from the terminal audit record.
+    pub error_summary: Option<String>,
     /// Operation creation/start timestamp.
     ///
     /// For operations observed from `RequestReceived`, this is the request
@@ -1478,6 +1480,52 @@ impl CatalogIndex {
             changed = changed.saturating_add(count as u64);
         }
         Ok(changed)
+    }
+
+    /// Register an inventory-identified cleaning cartridge by barcode.
+    ///
+    /// Cleaning media do not carry a Remanence BOT identity. Their stable
+    /// catalog identity is therefore a namespaced UUID derived solely from
+    /// the barcode. Existing data rows still pass through the kind-flip guard.
+    pub fn ensure_cleaning_cartridge(&mut self, voltag: &str) -> Result<TapeRecord, StateError> {
+        let voltag = voltag.trim();
+        if voltag.is_empty() {
+            return Err(StateError::ConfigInvalid(
+                "cleaning cartridge requires a non-empty voltag".to_string(),
+            ));
+        }
+        if let Some(existing) = self.get_tape_by_voltag(voltag)? {
+            if existing.kind == "cleaning" {
+                return Ok(existing);
+            }
+            return self
+                .set_tape_kind(existing.tape_uuid.as_slice(), "cleaning")?
+                .ok_or_else(|| {
+                    StateError::IndexCorrupt(format!(
+                        "cleaning cartridge {voltag} disappeared during kind reconciliation"
+                    ))
+                });
+        }
+
+        let identity_name = format!("remanence:cleaning-cartridge:{voltag}");
+        let tape_uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, identity_name.as_bytes());
+        let updated_at = now_utc()?;
+        self.conn
+            .execute(
+                "insert into tapes(
+                   tape_uuid, voltag, kind, cleaning_uses, cleaning_state,
+                   highest_protected_ordinal, total_committed_ordinals,
+                   last_committed_tape_file, state, updated_at_utc
+                 )
+                 values(?1, ?2, 'cleaning', 0, 'unverified', 0, 0, null, 'ready', ?3)",
+                params![tape_uuid.as_bytes().as_slice(), voltag, updated_at],
+            )
+            .map_err(|err| sqlite_error("register inventory cleaning cartridge", err))?;
+        self.get_tape(tape_uuid.as_bytes())?.ok_or_else(|| {
+            StateError::IndexCorrupt(format!(
+                "cleaning cartridge {voltag} was not readable after registration"
+            ))
+        })
     }
 
     /// Record one drive inventory observation and assign or refresh its surrogate UUID.
@@ -3937,7 +3985,7 @@ impl CatalogIndex {
             .conn
             .prepare(
                 "select operation_id, operation_kind, state, session_id, subject,
-                        started_at_utc, updated_at_utc
+                        error_summary, started_at_utc, updated_at_utc
                  from operations
                  where operation_id = ?1",
             )
@@ -3960,7 +4008,7 @@ impl CatalogIndex {
             .conn
             .prepare(
                 "select operation_id, operation_kind, state, session_id, subject,
-                        started_at_utc, updated_at_utc
+                        error_summary, started_at_utc, updated_at_utc
                  from operations
                  order by updated_at_utc desc, operation_id",
             )
@@ -5361,12 +5409,17 @@ fn project_operation_record(
         operation_kind
     };
     let subject = subject_projection(record);
+    let error_summary = if matches!(record.event, AuditEvent::OperationFailed) {
+        detail_text(record, "error_summary").filter(|summary| !summary.trim().is_empty())
+    } else {
+        None
+    };
     tx.execute(
         "insert into operations(
-           operation_id, operation_kind, state, session_id, subject,
+           operation_id, operation_kind, state, session_id, subject, error_summary,
            started_at_utc, updated_at_utc
          )
-         values(?1, ?2, ?3, ?4, ?5, ?6, ?6)
+         values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
          on conflict(operation_id) do update set
            operation_kind = case
              when excluded.operation_kind != 'unknown' then excluded.operation_kind
@@ -5375,6 +5428,7 @@ fn project_operation_record(
            state = excluded.state,
            session_id = coalesce(excluded.session_id, operations.session_id),
            subject = coalesce(excluded.subject, operations.subject),
+           error_summary = excluded.error_summary,
            updated_at_utc = excluded.updated_at_utc",
         params![
             operation_id.to_string(),
@@ -5382,6 +5436,7 @@ fn project_operation_record(
             state,
             record.session_id.map(|uuid| uuid.to_string()),
             subject,
+            error_summary,
             record.timestamp_utc.as_str(),
         ],
     )
@@ -6197,8 +6252,9 @@ fn operation_from_row(row: &rusqlite::Row<'_>) -> Result<OperationRecord, StateE
         state: row_get(row, 2, "operations.state")?,
         session_id: row_get(row, 3, "operations.session_id")?,
         subject: row_get(row, 4, "operations.subject")?,
-        started_at_utc: row_get(row, 5, "operations.started_at_utc")?,
-        updated_at_utc: row_get(row, 6, "operations.updated_at_utc")?,
+        error_summary: row_get(row, 5, "operations.error_summary")?,
+        started_at_utc: row_get(row, 6, "operations.started_at_utc")?,
+        updated_at_utc: row_get(row, 7, "operations.updated_at_utc")?,
     })
 }
 
@@ -7114,6 +7170,7 @@ fn migrate(conn: &Connection) -> Result<(), StateError> {
     ensure_column(conn, "tapes", "cleaning_uses", "cleaning_uses integer")?;
     ensure_column(conn, "tapes", "cleaning_state", "cleaning_state text")?;
     ensure_column(conn, "sessions", "drive_uuid", "drive_uuid blob")?;
+    ensure_column(conn, "operations", "error_summary", "error_summary text")?;
     if current < 9 {
         conn.execute(
             "update tapes
@@ -7387,6 +7444,7 @@ create table if not exists operations(
   state text not null,
   session_id text,
   subject text,
+  error_summary text,
   started_at_utc text not null,
   updated_at_utc text not null
 );
@@ -8245,6 +8303,33 @@ mod tests {
             .list_tapes(None, TapeKindFilter::All)
             .expect("list all");
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn inventory_cleaning_cartridge_is_registered_without_bot_identity() {
+        let dir = tempfile::Builder::new()
+            .prefix("rem-cleaning-inventory")
+            .tempdir()
+            .expect("tempdir");
+        let mut index = CatalogIndex::open(dir.path().join("s.sqlite")).expect("open");
+
+        let first = index
+            .ensure_cleaning_cartridge(" CLNU01L9 ")
+            .expect("register inventory cleaning cartridge");
+        let second = index
+            .ensure_cleaning_cartridge("CLNU01L9")
+            .expect("registration is idempotent");
+
+        assert_eq!(first, second);
+        assert_eq!(first.voltag.as_deref(), Some("CLNU01L9"));
+        assert_eq!(first.kind, "cleaning");
+        assert_eq!(first.block_size, None);
+        assert_eq!(
+            index
+                .get_tape_cleaning_state(first.tape_uuid.as_slice())
+                .expect("cleaning state"),
+            Some(Some("unverified".to_string()))
+        );
     }
 
     #[test]
@@ -9311,6 +9396,52 @@ mod tests {
                 "object_copies.{column} column must exist after migration"
             );
         }
+        assert!(
+            table_column_exists(&conn, "operations", "error_summary").expect("table_info"),
+            "operations.error_summary column must exist after migration"
+        );
+    }
+
+    #[test]
+    fn schema_v12_operation_rows_gain_nullable_failure_detail() {
+        let dir = tempfile::Builder::new()
+            .prefix("rem-operation-detail-migration")
+            .tempdir()
+            .expect("tempdir");
+        let path = dir.path().join("rem-state.sqlite");
+        let conn = Connection::open(&path).expect("open legacy sqlite");
+        conn.execute_batch(
+            "create table operations(
+               operation_id text primary key,
+               operation_kind text not null,
+               state text not null,
+               session_id text,
+               subject text,
+               started_at_utc text not null,
+               updated_at_utc text not null
+             );
+             insert into operations values(
+               '00000000-0000-0000-0000-000000000013', 'clean_drive', 'failed',
+               null, 'library:mainlib', '2026-07-20T01:00:00Z', '2026-07-20T01:01:00Z'
+             );",
+        )
+        .expect("seed v12 operation table");
+        conn.pragma_update(None, "user_version", 12_u32)
+            .expect("mark schema v12");
+        drop(conn);
+
+        let index = CatalogIndex::open(&path).expect("migrate v12 index");
+        let operation = index
+            .get_operation("00000000-0000-0000-0000-000000000013")
+            .expect("query migrated operation")
+            .expect("legacy operation preserved");
+
+        assert_eq!(
+            index.schema_version().expect("schema version"),
+            SCHEMA_VERSION
+        );
+        assert_eq!(operation.operation_kind, "clean_drive");
+        assert_eq!(operation.error_summary, None);
     }
 
     #[test]
@@ -12709,6 +12840,47 @@ mod tests {
         assert_eq!(non_terminal.len(), 1);
         assert_eq!(non_terminal[0].operation_id, operation_id);
         assert_eq!(non_terminal[0].idempotency_key, Some(idempotency_key));
+    }
+
+    #[test]
+    fn operation_failure_summary_survives_durable_projection() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-operation-failure")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let operation_id = Uuid::from_u128(0xDEAD);
+        let record = audit_record(
+            1,
+            AuditEvent::OperationFailed,
+            Some(operation_id),
+            None,
+            None,
+            "clean_drive",
+            detail(&[
+                ("operation_kind", CborValue::Text("clean_drive".to_string())),
+                (
+                    "error_summary",
+                    CborValue::Text(
+                        "no eligible cleaning cartridge: CLNU01L9 is expired".to_string(),
+                    ),
+                ),
+            ]),
+        );
+
+        index
+            .project_audit_record(&record)
+            .expect("project operation failure");
+
+        let operation = index
+            .get_operation(&operation_id.to_string())
+            .expect("get operation")
+            .expect("operation exists");
+        assert_eq!(operation.state, "failed");
+        assert_eq!(
+            operation.error_summary.as_deref(),
+            Some("no eligible cleaning cartridge: CLNU01L9 is expired")
+        );
     }
 
     #[test]
