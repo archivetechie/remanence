@@ -317,6 +317,7 @@ pub struct ApiState {
     default_library_serial: Option<Arc<String>>,
     library_snapshot: Option<Arc<RwLock<Arc<LibrarySnapshot>>>>,
     live_status: Arc<LiveStatusState>,
+    drive_idle_unload_seconds: u64,
     daemon_epoch: u64,
     daemon_version: String,
     api_version: String,
@@ -402,6 +403,7 @@ impl ApiState {
             default_library_serial: None,
             library_snapshot: None,
             live_status: Arc::new(LiveStatusState::new(live_status_interval)),
+            drive_idle_unload_seconds: remanence_state::DEFAULT_DRIVE_IDLE_UNLOAD_SECONDS,
             daemon_epoch,
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             api_version: "v1-draft".to_string(),
@@ -528,10 +530,17 @@ impl ApiState {
         state.io_memory = io_memory;
         state.default_library_serial = default_library_serial;
         state.library_snapshot = Some(library_snapshot);
+        state.drive_idle_unload_seconds = config.daemon.drive_idle_unload_seconds;
         state.reconcile_drive_catalog_from_report(config, &report)?;
         state.reconcile_clean_runs_from_report(&report)?;
+        crate::mount::register_startup_seated_cartridges(&state, &report);
         spawn_drive_collection_workers(index_path, report, config, drive_pool);
         Ok(state)
+    }
+
+    /// Rewind, unload, and return idle seated cartridges before daemon exit.
+    pub async fn shutdown_drive_pool(&self) -> Result<(), Status> {
+        crate::mount::shutdown_drive_pool(self).await
     }
 
     /// Return the daemon service implementation.
@@ -9424,6 +9433,30 @@ BCw3Wyv2UWY=
     }
 
     #[test]
+    fn drive_pool_shutdown_closes_normal_admission_but_keeps_cleanup_reservation() {
+        let bay = 0x0101;
+        let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
+        let reservations = Arc::new(HashMap::from([(bay, AtomicBool::new(false))]));
+        let pool =
+            crate::write_owner::DrivePool::new(changer_tx, HashMap::new(), reservations.clone());
+
+        pool.begin_shutdown();
+
+        let err = pool
+            .reserve_drive(bay)
+            .expect_err("normal admission must close during shutdown");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        let cleanup = pool
+            .reserve_drive_for_shutdown(bay)
+            .expect("shutdown cleanup keeps a reservation path");
+        assert!(reservations
+            .get(&bay)
+            .expect("reservation")
+            .load(std::sync::atomic::Ordering::SeqCst));
+        drop(cleanup);
+    }
+
+    #[test]
     fn drive_pool_exclusive_guard_drop_releases_all_bays() {
         let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
         let reservations = Arc::new(HashMap::from([
@@ -9468,6 +9501,41 @@ BCw3Wyv2UWY=
         assert!(pool.mounted_tape_uuids().contains(&TAPE_UUID));
         pool.forget_session(session_id);
         assert!(!pool.mounted_tape_uuids().contains(&TAPE_UUID));
+    }
+
+    #[test]
+    fn drive_pool_close_parks_cartridge_and_follow_on_session_claims_it() {
+        let bay = 0x0101;
+        let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
+        let reservations = Arc::new(HashMap::from([(bay, AtomicBool::new(true))]));
+        let pool =
+            crate::write_owner::DrivePool::new(changer_tx, HashMap::new(), reservations.clone());
+        let first_session = Uuid::new_v4();
+        let mounted = crate::write_owner::MountedSession {
+            bay,
+            library_serial: "LIB-A".to_string(),
+            barcode: Some("AOX001L9".to_string()),
+            home_slot: Some(0x1001),
+            tape_uuid: TAPE_UUID,
+            drive_uuid: Some(Uuid::new_v4().as_bytes().to_vec()),
+        };
+        pool.record_session(first_session, mounted.clone());
+
+        let parked = pool
+            .finish_session(first_session, mounted.clone())
+            .expect("library tape remains parked");
+        assert!(pool.parked_is_current(&parked));
+        assert_eq!(parked.seated.prior_session_id, Some(first_session));
+        assert!(!reservations
+            .get(&bay)
+            .expect("reservation")
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!pool.mounted_tape_uuids().contains(&TAPE_UUID));
+
+        let follow_on = Uuid::new_v4();
+        pool.record_session(follow_on, mounted);
+        assert!(pool.parked_at(bay).is_none());
+        assert!(pool.mounted_tape_uuids().contains(&TAPE_UUID));
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@ use remanence_library::{
 };
 use remanence_state::{CatalogIndex, StateError};
 use std::collections::HashSet;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tonic::Status;
 use uuid::Uuid;
@@ -192,7 +192,7 @@ async fn open_write_session_reserved(
     let open_started = Instant::now();
     let resolve_started = Instant::now();
     let (mount, drive_reservation) =
-        resolve_and_reserve_actor_mount(state, pool, &library_serial, &tape_uuid)?;
+        resolve_and_reserve_actor_mount(state, pool, &library_serial, &tape_uuid).await?;
     let resolve_elapsed = resolve_started.elapsed();
     let drive = pool.drive_tx(mount.bay)?;
     let pool_id_for_diag = pool_cfg.id.clone();
@@ -324,7 +324,7 @@ async fn open_read_session_critical(
                         "tape-target read sessions require exactly one configured library in this slice",
                     )
                 })?;
-            resolve_and_reserve_actor_mount(&state, &pool, &library_serial, &tape_uuid)?
+            resolve_and_reserve_actor_mount(&state, &pool, &library_serial, &tape_uuid).await?
         }
         ReadSessionTarget::LoadedDrive {
             library_serial,
@@ -498,13 +498,11 @@ async fn close_write_like_critical(
     let (reply_tx, reply_rx) = oneshot::channel();
     let close_started = Instant::now();
     let actor_close_started = Instant::now();
-    let unload_before_close = mounted.home_slot.is_some();
     ensure_mounted_session_media_readiness_admitted(&state, "close session", &mounted)?;
     if abort {
         drive
             .send(crate::write_owner::DriveCommand::Abort {
                 session_id,
-                unload_before_close,
                 reply: reply_tx,
             })
             .await
@@ -513,7 +511,6 @@ async fn close_write_like_critical(
         drive
             .send(crate::write_owner::DriveCommand::Close {
                 session_id,
-                unload_before_close,
                 reply: reply_tx,
             })
             .await
@@ -531,8 +528,7 @@ async fn close_write_like_critical(
         .saturating_add(actor_reply.diagnostics.session_audit_projection);
     let actor_unattributed = actor_close_elapsed.saturating_sub(actor_attributed);
     let finish_started = Instant::now();
-    let move_home = mounted.home_slot.is_some();
-    finish_mounted_session(&pool, session_id, mounted).await?;
+    finish_mounted_session(&state, &pool, session_id, mounted);
     let finish_elapsed = finish_started.elapsed();
     let close_elapsed = close_started.elapsed();
     tracing::info!(
@@ -540,8 +536,7 @@ async fn close_write_like_critical(
         phase = "close_unmount",
         session_id = %session_id,
         abort,
-        unload_before_close,
-        move_home,
+        unload = "skipped",
         commit_phases_completed_before_close = true,
         commit_phase_scope = "session_accumulated_append_finish",
         append_commits = actor_reply.session.objects_committed,
@@ -557,14 +552,15 @@ async fn close_write_like_critical(
         rewind_ms = crate::diagnostics::duration_ms(actor_reply.diagnostics.rewind),
         separate_rewind_command = false,
         ssc_unload_ms = crate::diagnostics::duration_ms(actor_reply.diagnostics.ssc_unload),
-        ssc_unload_includes_rewind = unload_before_close,
+        ssc_unload_includes_rewind = false,
         session_audit_projection_ms = crate::diagnostics::duration_ms(
             actor_reply.diagnostics.session_audit_projection
         ),
         actor_unattributed_ms = crate::diagnostics::duration_ms(actor_unattributed),
         actor_close_ms = crate::diagnostics::duration_ms(actor_close_elapsed),
-        changer_move_home_ms = crate::diagnostics::duration_ms(finish_elapsed),
-        finish_mount_ms = crate::diagnostics::duration_ms(finish_elapsed),
+        park_ms = crate::diagnostics::duration_ms(finish_elapsed),
+        changer_move_home_ms = 0.0,
+        finish_mount_ms = 0.0,
         elapsed_ms = crate::diagnostics::duration_ms(close_elapsed),
         "remanence_write_diag",
     );
@@ -615,7 +611,6 @@ async fn close_read_session_critical(
     drive
         .send(crate::write_owner::DriveCommand::CloseRead {
             session_id,
-            unload_before_close: mounted.home_slot.is_some(),
             reply: reply_tx,
         })
         .await
@@ -623,7 +618,14 @@ async fn close_read_session_critical(
     let session = reply_rx
         .await
         .map_err(|_| Status::internal("drive actor dropped reply"))??;
-    finish_mounted_session(&pool, session_id, mounted).await?;
+    finish_mounted_session(&state, &pool, session_id, mounted);
+    tracing::info!(
+        target: "remanence_read_diag",
+        phase = "close_unmount",
+        session_id = %session_id,
+        unload = "skipped",
+        "remanence_read_diag",
+    );
     Ok(session)
 }
 
@@ -694,19 +696,15 @@ pub(crate) async fn read_object_range(
         .map_err(|_| Status::internal("drive actor unavailable"))
 }
 
-async fn finish_mounted_session(
+fn finish_mounted_session(
+    state: &ApiState,
     pool: &crate::write_owner::DrivePool,
     session_id: Uuid,
     mounted: crate::write_owner::MountedSession,
-) -> Result<(), Status> {
-    let result = if let Some(home_slot) = mounted.home_slot {
-        changer_move(pool, mounted.bay, home_slot).await
-    } else {
-        Ok(())
-    };
-    pool.forget_session(session_id);
-    pool.release(mounted.bay);
-    result
+) {
+    if let Some(parked) = pool.finish_session(session_id, mounted) {
+        schedule_idle_dismount(state.clone(), parked);
+    }
 }
 
 async fn changer_move(
@@ -740,7 +738,7 @@ fn should_compensate_open_mount(err: &Status) -> bool {
     !err.message().contains("media_readiness_state=")
 }
 
-async fn drive_unload(pool: &crate::write_owner::DrivePool, bay: u16) -> Result<(), Status> {
+async fn drive_unload(pool: &crate::write_owner::DrivePool, bay: u16) -> Result<Duration, Status> {
     let drive = pool.drive_tx(bay)?;
     let (reply_tx, reply_rx) = oneshot::channel();
     drive
@@ -750,6 +748,344 @@ async fn drive_unload(pool: &crate::write_owner::DrivePool, bay: u16) -> Result<
     reply_rx
         .await
         .map_err(|_| Status::internal("drive actor dropped reply"))?
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DismountReason {
+    Evicted,
+    IdleTimeout,
+    Shutdown,
+}
+
+const SHUTDOWN_RESERVATION_WAIT: Duration = Duration::from_secs(600);
+
+impl DismountReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Evicted => "evicted",
+            Self::IdleTimeout => "idle_timeout",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+/// Perform the one canonical rewind/unload/move-home tail while the caller
+/// holds the bay reservation. Session close only parks the cartridge; eviction,
+/// idle expiry, and shutdown all converge here.
+async fn dismount_reserved_cartridge(
+    state: &ApiState,
+    pool: &crate::write_owner::DrivePool,
+    seated: &crate::write_owner::SeatedCartridge,
+    reason: DismountReason,
+) -> Result<(), Status> {
+    ensure_seated_cartridge_media_readiness_admitted(state, seated, reason)?;
+    ensure_seated_cartridge_matches_snapshot(state, seated)?;
+
+    let started = Instant::now();
+    let ssc_unload = drive_unload(pool, seated.bay).await?;
+    let move_started = Instant::now();
+    changer_move(pool, seated.bay, seated.home_slot).await?;
+    let changer_move = move_started.elapsed();
+    if let Some(parked) = pool.parked_at(seated.bay) {
+        pool.forget_parked(&parked);
+    }
+    let session_id = seated
+        .prior_session_id
+        .map(|session_id| session_id.to_string())
+        .unwrap_or_else(|| "(startup)".to_string());
+    tracing::info!(
+        target: "remanence_write_diag",
+        phase = "close_unmount",
+        session_id = %session_id,
+        library_serial = %seated.library_serial,
+        bay = seated.bay,
+        home_slot = seated.home_slot,
+        barcode = seated.barcode.as_deref().unwrap_or("(unknown)"),
+        unload = reason.as_str(),
+        rewind_ms = 0.0,
+        separate_rewind_command = false,
+        ssc_unload_ms = crate::diagnostics::duration_ms(ssc_unload),
+        ssc_unload_includes_rewind = true,
+        changer_move_home_ms = crate::diagnostics::duration_ms(changer_move),
+        elapsed_ms = crate::diagnostics::duration_ms(started.elapsed()),
+        "remanence_write_diag",
+    );
+    Ok(())
+}
+
+fn ensure_seated_cartridge_media_readiness_admitted(
+    state: &ApiState,
+    seated: &crate::write_owner::SeatedCartridge,
+    reason: DismountReason,
+) -> Result<(), Status> {
+    let index = CatalogIndex::open_read_only(state.index_path.as_ref())
+        .map_err(|err| Status::internal(err.to_string()))?;
+    crate::ensure_media_readiness_admitted(
+        &index,
+        reason.as_str(),
+        seated.library_serial.as_str(),
+        Some(seated.bay),
+        seated.barcode.as_deref(),
+        true,
+    )
+}
+
+fn ensure_seated_cartridge_matches_snapshot(
+    state: &ApiState,
+    seated: &crate::write_owner::SeatedCartridge,
+) -> Result<(), Status> {
+    let snapshot = state
+        .current_library_snapshot()
+        .ok_or_else(|| Status::not_found("library not found"))?;
+    let bay = snapshot
+        .report
+        .libraries
+        .iter()
+        .find(|library| library.serial == seated.library_serial)
+        .and_then(|library| {
+            library
+                .drive_bays
+                .iter()
+                .find(|bay| bay.element_address == seated.bay)
+        })
+        .ok_or_else(|| {
+            Status::not_found(format!(
+                "drive bay 0x{:04x} not found in library {}",
+                seated.bay, seated.library_serial
+            ))
+        })?;
+    if !bay.loaded || bay.loaded_tape != seated.barcode || bay.source_slot != Some(seated.home_slot)
+    {
+        return Err(Status::failed_precondition(format!(
+            "drive bay 0x{:04x} seated cartridge changed before dismount",
+            seated.bay
+        )));
+    }
+    Ok(())
+}
+
+fn schedule_idle_dismount(state: ApiState, parked: crate::write_owner::ParkedCartridge) {
+    let timeout_seconds = state.drive_idle_unload_seconds;
+    if timeout_seconds == 0 {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!(
+            bay = parked.seated.bay,
+            "cannot schedule idle drive unload without a Tokio runtime"
+        );
+        return;
+    };
+    runtime.spawn(async move {
+        let pool = match state.drive_pool() {
+            Ok(pool) => pool.clone(),
+            Err(_) => return,
+        };
+        tokio::time::sleep(Duration::from_secs(timeout_seconds)).await;
+        loop {
+            if pool.is_shutting_down() || !pool.parked_is_current(&parked) {
+                return;
+            }
+            let reservation = match pool.reserve_drive(parked.seated.bay) {
+                Ok(reservation) => reservation,
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            if !pool.parked_is_current(&parked) {
+                drop(reservation);
+                return;
+            }
+            if let Err(err) = ensure_seated_cartridge_matches_snapshot(&state, &parked.seated) {
+                tracing::warn!(
+                    bay = parked.seated.bay,
+                    error = %err,
+                    "discarding stale idle drive record after inventory changed"
+                );
+                pool.forget_parked(&parked);
+                drop(reservation);
+                return;
+            }
+            match dismount_reserved_cartridge(
+                &state,
+                &pool,
+                &parked.seated,
+                DismountReason::IdleTimeout,
+            )
+            .await
+            {
+                Ok(()) => return,
+                Err(err) => tracing::warn!(
+                    bay = parked.seated.bay,
+                    error = %err,
+                    "idle drive unload failed; retrying after the configured timeout"
+                ),
+            }
+            drop(reservation);
+            tokio::time::sleep(Duration::from_secs(timeout_seconds)).await;
+        }
+    });
+}
+
+pub(crate) fn register_startup_seated_cartridges(
+    state: &ApiState,
+    report: &remanence_library::DiscoveryReport,
+) {
+    let Ok(pool) = state.drive_pool() else {
+        return;
+    };
+    let Some(configured_library_serial) = state.default_library_serial.as_deref() else {
+        return;
+    };
+    let voltags = CatalogIndex::open_read_only(state.index_path.as_ref())
+        .map_err(|err| Status::internal(err.to_string()))
+        .and_then(|index| crate::library::voltag_uuid_map(&index))
+        .unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "cannot join startup seated cartridges to tape UUIDs");
+            Default::default()
+        });
+    for library in report
+        .libraries
+        .iter()
+        .filter(|library| library.serial == configured_library_serial.as_str())
+    {
+        for bay in &library.drive_bays {
+            let Some(home_slot) = bay.source_slot.filter(|_| bay.loaded) else {
+                continue;
+            };
+            if pool.drive_tx(bay.element_address).is_err() {
+                continue;
+            }
+            let tape_uuid = bay
+                .loaded_tape
+                .as_ref()
+                .and_then(|barcode| voltags.get(barcode))
+                .and_then(|bytes| <[u8; 16]>::try_from(bytes.as_slice()).ok());
+            let parked = pool.park_cartridge(crate::write_owner::SeatedCartridge {
+                bay: bay.element_address,
+                library_serial: library.serial.clone(),
+                barcode: bay.loaded_tape.clone(),
+                home_slot,
+                tape_uuid,
+                prior_session_id: None,
+            });
+            schedule_idle_dismount(state.clone(), parked);
+        }
+    }
+}
+
+pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> {
+    let Ok(pool) = state.drive_pool() else {
+        return Ok(());
+    };
+    pool.begin_shutdown();
+    let snapshot = state
+        .current_library_snapshot()
+        .ok_or_else(|| Status::not_found("library not found"))?;
+    let configured_library_serial = state.default_library_serial.as_deref().ok_or_else(|| {
+        Status::failed_precondition("drive pool has no configured library serial")
+    })?;
+    let library_drive_bays = snapshot
+        .report
+        .libraries
+        .iter()
+        .find(|library| library.serial == configured_library_serial.as_str())
+        .ok_or_else(|| {
+            Status::not_found(format!(
+                "configured library {} not found during shutdown",
+                configured_library_serial.as_str()
+            ))
+        })?
+        .drive_bays
+        .clone();
+    drop(snapshot);
+    let mut failures = Vec::new();
+    let mut drive_bays = Vec::new();
+    for bay in library_drive_bays {
+        if pool.drive_tx(bay.element_address).is_ok() {
+            drive_bays.push(bay.element_address);
+        } else if bay.loaded && bay.source_slot.is_some() {
+            failures.push(format!(
+                "bay 0x{:04x}: seated cartridge has no drive actor",
+                bay.element_address
+            ));
+        }
+    }
+    for bay in drive_bays {
+        let reservation_wait_started = Instant::now();
+        let reservation = loop {
+            match pool.reserve_drive_for_shutdown(bay) {
+                Ok(reservation) => break Some(reservation),
+                Err(err) => {
+                    if err.code() == tonic::Code::NotFound
+                        || pool.sessions_by_bay().contains_key(&bay)
+                    {
+                        failures.push(format!("bay 0x{bay:04x}: {err}"));
+                        break None;
+                    }
+                    if reservation_wait_started.elapsed() >= SHUTDOWN_RESERVATION_WAIT {
+                        failures.push(format!(
+                            "bay 0x{bay:04x}: timed out waiting for an idle drive reservation"
+                        ));
+                        break None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        };
+        let Some(reservation) = reservation else {
+            continue;
+        };
+        let current = state.current_library_snapshot().and_then(|snapshot| {
+            snapshot
+                .report
+                .libraries
+                .iter()
+                .find(|library| library.serial == configured_library_serial.as_str())
+                .and_then(|library| {
+                    library
+                        .drive_bays
+                        .iter()
+                        .find(|candidate| candidate.element_address == bay)
+                        .cloned()
+                })
+        });
+        let Some(current) = current else {
+            failures.push(format!("bay 0x{bay:04x}: missing from shutdown inventory"));
+            drop(reservation);
+            continue;
+        };
+        let Some(home_slot) = current.source_slot.filter(|_| current.loaded) else {
+            drop(reservation);
+            continue;
+        };
+        let parked = pool.parked_at(bay);
+        let seated = crate::write_owner::SeatedCartridge {
+            bay,
+            library_serial: configured_library_serial.to_string(),
+            barcode: current.loaded_tape,
+            home_slot,
+            tape_uuid: parked.as_ref().and_then(|parked| parked.seated.tape_uuid),
+            prior_session_id: parked
+                .as_ref()
+                .and_then(|parked| parked.seated.prior_session_id),
+        };
+        if let Err(err) =
+            dismount_reserved_cartridge(state, pool, &seated, DismountReason::Shutdown).await
+        {
+            failures.push(format!("bay 0x{bay:04x}: {err}"));
+        }
+        drop(reservation);
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(Status::internal(format!(
+            "daemon shutdown could not unload every seated cartridge: {}",
+            failures.join("; ")
+        )))
+    }
 }
 
 #[derive(Debug)]
@@ -764,7 +1100,24 @@ struct ActorMount {
     drive_serial: Option<String>,
 }
 
-fn resolve_and_reserve_actor_mount(
+#[derive(Debug)]
+enum ActorMountPlan {
+    Ready(ActorMount),
+    Evict {
+        mount: ActorMount,
+        seated: crate::write_owner::SeatedCartridge,
+    },
+}
+
+impl ActorMountPlan {
+    fn mount_mut(&mut self) -> &mut ActorMount {
+        match self {
+            Self::Ready(mount) | Self::Evict { mount, .. } => mount,
+        }
+    }
+}
+
+async fn resolve_and_reserve_actor_mount(
     state: &ApiState,
     pool: &crate::write_owner::DrivePool,
     library_serial: &str,
@@ -773,12 +1126,32 @@ fn resolve_and_reserve_actor_mount(
     const ATTEMPTS: usize = 2;
     for attempt in 0..ATTEMPTS {
         let busy_bays = pool.busy_bays();
-        let mount = resolve_actor_mount(state, library_serial, tape_uuid, &busy_bays)?;
-        match pool.reserve_drive(mount.bay) {
-            Ok(reservation) => {
-                ensure_actor_mount_media_readiness_admitted(state, library_serial, &mount)?;
-                return Ok((mount, reservation));
-            }
+        let plan = resolve_actor_mount(state, library_serial, tape_uuid, &busy_bays)?;
+        let bay = match &plan {
+            ActorMountPlan::Ready(mount) | ActorMountPlan::Evict { mount, .. } => mount.bay,
+        };
+        match pool.reserve_drive(bay) {
+            Ok(reservation) => match plan {
+                ActorMountPlan::Ready(mount) => {
+                    ensure_actor_mount_media_readiness_admitted(state, library_serial, &mount)?;
+                    return Ok((mount, reservation));
+                }
+                ActorMountPlan::Evict { mount, mut seated } => {
+                    ensure_actor_mount_media_readiness_admitted(state, library_serial, &mount)?;
+                    if let Some(parked) = pool.parked_at(seated.bay) {
+                        if parked.seated.library_serial == seated.library_serial
+                            && parked.seated.barcode == seated.barcode
+                            && parked.seated.home_slot == seated.home_slot
+                        {
+                            seated.tape_uuid = parked.seated.tape_uuid;
+                            seated.prior_session_id = parked.seated.prior_session_id;
+                        }
+                    }
+                    dismount_reserved_cartridge(state, pool, &seated, DismountReason::Evicted)
+                        .await?;
+                    return Ok((mount, reservation));
+                }
+            },
             Err(err) if err.code() == tonic::Code::FailedPrecondition && attempt + 1 < ATTEMPTS => {
                 continue;
             }
@@ -793,7 +1166,7 @@ fn resolve_actor_mount(
     library_serial: &str,
     tape_uuid: &TapeUuid,
     busy_bays: &HashSet<u16>,
-) -> Result<ActorMount, Status> {
+) -> Result<ActorMountPlan, Status> {
     let index = CatalogIndex::open_read_only(state.index_path.as_ref())
         .map_err(|err| Status::internal(err.to_string()))?;
     let tape = index
@@ -816,11 +1189,15 @@ fn resolve_actor_mount(
         .iter()
         .find(|library| library.serial == library_serial)
         .ok_or_else(|| Status::not_found(format!("library {library_serial} not found")))?;
-    let mut mount = resolve_actor_mount_from_library(library, voltag.as_str(), busy_bays)?;
+    let mut plan = resolve_actor_mount_plan_from_library(library, voltag.as_str(), busy_bays)?;
+    let mount = plan.mount_mut();
     mount.library_serial = library_serial.to_string();
     mount.barcode = barcode;
-    enrich_actor_mount_from_catalog(&index, library_serial, &mut mount)?;
-    Ok(mount)
+    enrich_actor_mount_from_catalog(&index, library_serial, mount)?;
+    if let ActorMountPlan::Evict { seated, .. } = &mut plan {
+        seated.library_serial = library_serial.to_string();
+    }
+    Ok(plan)
 }
 
 fn resolve_pinned_actor_mount(
@@ -950,11 +1327,11 @@ fn ensure_mounted_session_media_readiness_admitted(
     )
 }
 
-fn resolve_actor_mount_from_library(
+fn resolve_actor_mount_plan_from_library(
     library: &Library,
     voltag: &str,
     busy_bays: &HashSet<u16>,
-) -> Result<ActorMount, Status> {
+) -> Result<ActorMountPlan, Status> {
     if let Some(bay) = library
         .drive_bays
         .iter()
@@ -985,7 +1362,7 @@ fn resolve_actor_mount_from_library(
                 .iter()
                 .find(|drive| drive.element_address == bay)
                 .and_then(|drive| drive.source_slot);
-            Ok(ActorMount {
+            Ok(ActorMountPlan::Ready(ActorMount {
                 bay,
                 barcode: Some(voltag.to_string()),
                 source_slot: None,
@@ -994,11 +1371,11 @@ fn resolve_actor_mount_from_library(
                 library_serial: String::new(),
                 drive_uuid: None,
                 drive_serial: None,
-            })
+            }))
         }
         Ok(LoadPlan::Load { slot, bay }) => {
             ensure_target_bay_can_receive(library, bay)?;
-            Ok(ActorMount {
+            Ok(ActorMountPlan::Ready(ActorMount {
                 bay,
                 barcode: Some(voltag.to_string()),
                 source_slot: Some(slot),
@@ -1007,16 +1384,84 @@ fn resolve_actor_mount_from_library(
                 library_serial: String::new(),
                 drive_uuid: None,
                 drive_serial: None,
-            })
+            }))
         }
         Err(LoadError::NotInLibrary) => Err(Status::not_found(format!(
             "cartridge {voltag} not found in library inventory (slot or drive)"
         ))),
-        Err(LoadError::NoFreeDrive) => Err(Status::failed_precondition(format!(
-            "no free drive bay available to load cartridge {voltag}"
-        ))),
+        Err(LoadError::NoFreeDrive) => {
+            let source_slot = library
+                .slots
+                .iter()
+                .find(|slot| slot.cartridge.as_deref() == Some(voltag))
+                .map(|slot| slot.element_address)
+                .ok_or_else(|| {
+                    Status::not_found(format!(
+                        "cartridge {voltag} not found in library inventory (slot or drive)"
+                    ))
+                })?;
+            let candidate = library.drive_bays.iter().find(|bay| {
+                bay.loaded
+                    && !busy_bays.contains(&bay.element_address)
+                    && bay
+                        .installed
+                        .as_ref()
+                        .and_then(|drive| drive.sg_path.as_ref())
+                        .is_some()
+                    && bay.source_slot.is_some_and(|home_slot| {
+                        library.slots.iter().any(|slot| {
+                            slot.element_address == home_slot
+                                && slot.accessible
+                                && slot.exception.is_none()
+                                && !slot.full
+                        })
+                    })
+            });
+            let Some(candidate) = candidate else {
+                return Err(Status::failed_precondition(format!(
+                    "no free drive bay available to load cartridge {voltag}"
+                )));
+            };
+            let home_slot = candidate
+                .source_slot
+                .expect("eviction candidate must have an empty home slot");
+            Ok(ActorMountPlan::Evict {
+                mount: ActorMount {
+                    bay: candidate.element_address,
+                    barcode: Some(voltag.to_string()),
+                    source_slot: Some(source_slot),
+                    home_slot: Some(source_slot),
+                    needs_drive_load: true,
+                    library_serial: String::new(),
+                    drive_uuid: None,
+                    drive_serial: None,
+                },
+                seated: crate::write_owner::SeatedCartridge {
+                    bay: candidate.element_address,
+                    library_serial: String::new(),
+                    barcode: candidate.loaded_tape.clone(),
+                    home_slot,
+                    tape_uuid: None,
+                    prior_session_id: None,
+                },
+            })
+        }
         Err(err) => Err(Status::internal(format!(
             "resolve load target for cartridge {voltag}: {err}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+fn resolve_actor_mount_from_library(
+    library: &Library,
+    voltag: &str,
+    busy_bays: &HashSet<u16>,
+) -> Result<ActorMount, Status> {
+    match resolve_actor_mount_plan_from_library(library, voltag, busy_bays)? {
+        ActorMountPlan::Ready(mount) => Ok(mount),
+        ActorMountPlan::Evict { .. } => Err(Status::failed_precondition(format!(
+            "no free drive bay available to load cartridge {voltag}"
         ))),
     }
 }
@@ -1116,6 +1561,222 @@ mod tests {
         assert!(err.message().contains("busy"), "{err}");
     }
 
+    #[test]
+    fn actor_mount_plan_evicts_only_an_idle_cart_with_an_empty_home_slot() {
+        let mut loaded = drive_bay(0x0101, true, Some("OLD001L9"));
+        loaded.source_slot = Some(0x0401);
+        let library = test_library(
+            vec![loaded],
+            vec![empty_slot(0x0401), slot(0x0402, "RMN002L9")],
+        );
+
+        let plan = resolve_actor_mount_plan_from_library(&library, "RMN002L9", &HashSet::new())
+            .expect("idle seated cart should be evictable");
+        let ActorMountPlan::Evict { mount, seated } = plan else {
+            panic!("expected an eviction plan");
+        };
+        assert_eq!(mount.bay, 0x0101);
+        assert_eq!(mount.source_slot, Some(0x0402));
+        assert!(mount.needs_drive_load);
+        assert_eq!(seated.barcode.as_deref(), Some("OLD001L9"));
+        assert_eq!(seated.home_slot, 0x0401);
+
+        let err =
+            resolve_actor_mount_plan_from_library(&library, "RMN002L9", &HashSet::from([0x0101]))
+                .expect_err("a reserved seated cart must never be evicted");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("no free drive"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn canonical_dismount_tail_unloads_then_moves_home() {
+        let harness = dismount_harness(0);
+        let parked = harness.pool.park_cartridge(harness.seated.clone());
+        let responder = tokio::spawn(reply_to_dismount_commands(
+            harness.drive_rx,
+            harness.changer_rx,
+        ));
+        let _reservation = harness
+            .pool
+            .reserve_drive(0x0101)
+            .expect("reserve idle bay");
+        dismount_reserved_cartridge(
+            &harness.state,
+            &harness.pool,
+            &harness.seated,
+            DismountReason::IdleTimeout,
+        )
+        .await
+        .expect("dismount succeeds");
+        responder.await.expect("mock actors join");
+        assert!(!harness.pool.parked_is_current(&parked));
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_dispatches_the_canonical_dismount_tail() {
+        let harness = dismount_harness(1);
+        let parked = harness.pool.park_cartridge(harness.seated.clone());
+        schedule_idle_dismount(harness.state.clone(), parked.clone());
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            reply_to_dismount_commands(harness.drive_rx, harness.changer_rx),
+        )
+        .await
+        .expect("idle timeout must dispatch unload within two seconds");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while harness.pool.parked_is_current(&parked) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("idle dismount must clear parked state");
+        assert!(!harness.pool.parked_is_current(&parked));
+    }
+
+    #[tokio::test]
+    async fn daemon_shutdown_dispatches_the_canonical_dismount_tail() {
+        let harness = dismount_harness(0);
+        let parked = harness.pool.park_cartridge(harness.seated.clone());
+        let responder = tokio::spawn(reply_to_dismount_commands(
+            harness.drive_rx,
+            harness.changer_rx,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), shutdown_drive_pool(&harness.state))
+            .await
+            .expect("shutdown must not hang")
+            .expect("shutdown dismount succeeds");
+        responder.await.expect("mock actors join");
+        assert!(!harness.pool.parked_is_current(&parked));
+    }
+
+    #[test]
+    fn startup_parking_is_scoped_to_the_configured_library_serial() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-startup-parking-scope")
+            .tempdir()
+            .expect("tempdir");
+        let index = CatalogIndex::open(temp.path().join("state.sqlite")).expect("open catalog");
+        let mut state = ApiState::new(index);
+        state.default_library_serial = Some(Arc::new("LIB001".to_string()));
+        state.drive_idle_unload_seconds = 0;
+        let (drive_tx, _drive_rx) = tokio::sync::mpsc::channel(1);
+        let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
+        let pool = crate::write_owner::DrivePool::new(
+            changer_tx,
+            std::collections::HashMap::from([(0x0101, drive_tx)]),
+            Arc::new(std::collections::HashMap::from([(
+                0x0101,
+                AtomicBool::new(false),
+            )])),
+        );
+        state.drive_pool = Some(pool.clone());
+        let managed = test_library(
+            vec![drive_bay(0x0101, true, Some("MAIN01L9"))],
+            vec![empty_slot(0x0401)],
+        );
+        let mut foreign = test_library(
+            vec![drive_bay(0x0101, true, Some("D2T001L9"))],
+            vec![empty_slot(0x0401)],
+        );
+        foreign.serial = "D2LIB".to_string();
+        let report = remanence_library::DiscoveryReport {
+            libraries: vec![foreign, managed],
+            warnings: Vec::new(),
+        };
+
+        register_startup_seated_cartridges(&state, &report);
+
+        let parked = pool.parked_at(0x0101).expect("managed cartridge parked");
+        assert_eq!(parked.seated.library_serial, "LIB001");
+        assert_eq!(parked.seated.barcode.as_deref(), Some("MAIN01L9"));
+    }
+
+    struct DismountHarness {
+        _temp: tempfile::TempDir,
+        state: ApiState,
+        pool: crate::write_owner::DrivePool,
+        seated: crate::write_owner::SeatedCartridge,
+        drive_rx: tokio::sync::mpsc::Receiver<crate::write_owner::DriveCommand>,
+        changer_rx: tokio::sync::mpsc::Receiver<crate::write_owner::ChangerCommand>,
+    }
+
+    /// Build a one-drive library whose actor channels expose dismount ordering.
+    fn dismount_harness(drive_idle_unload_seconds: u64) -> DismountHarness {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-lazy-dismount")
+            .tempdir()
+            .expect("tempdir");
+        let index = CatalogIndex::open(temp.path().join("state.sqlite")).expect("open catalog");
+        let mut state = ApiState::new(index);
+        state.default_library_serial = Some(Arc::new("LIB001".to_string()));
+        state.drive_idle_unload_seconds = drive_idle_unload_seconds;
+        let mut loaded = drive_bay(0x0101, true, Some("OLD001L9"));
+        loaded.source_slot = Some(0x0401);
+        let library = test_library(vec![loaded], vec![empty_slot(0x0401)]);
+        state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::LibrarySnapshot {
+                report: remanence_library::DiscoveryReport {
+                    libraries: vec![library],
+                    warnings: Vec::new(),
+                },
+                captured_at: time::OffsetDateTime::UNIX_EPOCH,
+            },
+        ))));
+        let (drive_tx, drive_rx) = tokio::sync::mpsc::channel(1);
+        let (changer_tx, changer_rx) = tokio::sync::mpsc::channel(1);
+        let pool = crate::write_owner::DrivePool::new(
+            changer_tx,
+            std::collections::HashMap::from([(0x0101, drive_tx)]),
+            Arc::new(std::collections::HashMap::from([(
+                0x0101,
+                AtomicBool::new(false),
+            )])),
+        );
+        state.drive_pool = Some(pool.clone());
+        DismountHarness {
+            _temp: temp,
+            state,
+            pool,
+            seated: crate::write_owner::SeatedCartridge {
+                bay: 0x0101,
+                library_serial: "LIB001".to_string(),
+                barcode: Some("OLD001L9".to_string()),
+                home_slot: 0x0401,
+                tape_uuid: None,
+                prior_session_id: None,
+            },
+            drive_rx,
+            changer_rx,
+        }
+    }
+
+    async fn reply_to_dismount_commands(
+        mut drive_rx: tokio::sync::mpsc::Receiver<crate::write_owner::DriveCommand>,
+        mut changer_rx: tokio::sync::mpsc::Receiver<crate::write_owner::ChangerCommand>,
+    ) {
+        let crate::write_owner::DriveCommand::Unload { reply } =
+            drive_rx.recv().await.expect("unload command")
+        else {
+            panic!("dismount must issue drive unload first");
+        };
+        reply
+            .send(Ok(Duration::from_millis(7)))
+            .expect("unload reply receiver");
+        let crate::write_owner::ChangerCommand::Move { src, dst, reply } =
+            changer_rx.recv().await.expect("move-home command")
+        else {
+            panic!("dismount must use the changer move command");
+        };
+        assert_eq!((src, dst), (0x0101, 0x0401));
+        reply.send(Ok(())).expect("move reply receiver");
+    }
+
     fn test_library(drive_bays: Vec<DriveBay>, slots: Vec<Slot>) -> Library {
         Library {
             serial: "LIB001".to_string(),
@@ -1175,6 +1836,16 @@ mod tests {
             exception: None,
             full: true,
             cartridge: Some(cartridge.to_string()),
+        }
+    }
+
+    fn empty_slot(element_address: u16) -> Slot {
+        Slot {
+            element_address,
+            accessible: true,
+            exception: None,
+            full: false,
+            cartridge: None,
         }
     }
 }
