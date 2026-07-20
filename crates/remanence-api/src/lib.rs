@@ -2017,10 +2017,25 @@ impl pb::daemon_server::Daemon for DaemonService {
         };
         let mut components = std::collections::HashMap::new();
         components.insert("sqlite_index".to_string(), quick_check.clone());
+        let component_status = if quick_check == "ok" {
+            pb::component_health::Status::Healthy
+        } else {
+            pb::component_health::Status::Other
+        };
+        let component_health = vec![pb::ComponentHealth {
+            component: "sqlite_index".to_string(),
+            status: component_status as i32,
+            other_status: if component_status == pb::component_health::Status::Other {
+                quick_check.clone()
+            } else {
+                String::new()
+            },
+        }];
         Ok(Response::new(pb::HealthResponse {
             status: status as i32,
             components,
             detail: format!("sqlite quick_check={quick_check}"),
+            component_health,
         }))
     }
 
@@ -4660,31 +4675,40 @@ fn find_object_for_key(
                 .get_native_object(object_id.as_str())
                 .map_err(|err| Status::internal(err.to_string()))
         }
-        pb::get_object_request::Key::ContentSha256(hash) => state
-            .index()?
-            .get_native_object_by_content_hash(hash.as_slice())
-            .map_err(|err| Status::internal(err.to_string())),
+        pb::get_object_request::Key::ContentSha256(hash) => {
+            find_object_by_content_sha256(state, hash.as_slice())
+        }
         pb::get_object_request::Key::ContentDigest(digest) => {
             if digest.algorithm != remanence_state::DIGEST_ALGORITHM_SHA256 {
                 return Err(Status::invalid_argument(
                     "content_digest.algorithm must be sha256",
                 ));
             }
-            if digest.value.len() != 32 {
-                return Err(Status::invalid_argument(
-                    "content_digest.value must be exactly 32 bytes",
-                ));
-            }
-            state
-                .index()?
-                .get_native_object_by_content_hash(digest.value.as_slice())
-                .map_err(|err| Status::internal(err.to_string()))
+            find_object_by_content_sha256(state, digest.value.as_slice())
         }
         pb::get_object_request::Key::CallerObjectId(caller_id) => state
             .index()?
             .get_native_object_by_caller_object_id(caller_id.as_str())
             .map_err(|err| Status::internal(err.to_string())),
     }
+}
+
+fn find_object_by_content_sha256(
+    state: &ApiState,
+    hash: &[u8],
+) -> Result<Option<NativeObjectRecord>, Status> {
+    if hash.len() != 32 {
+        return Err(Status::invalid_argument(
+            "content SHA-256 lookup value must be exactly 32 bytes",
+        ));
+    }
+    state
+        .index()?
+        .get_native_object_by_content_hash(hash)
+        .map_err(|err| match err {
+            StateError::AmbiguousCatalogLookup(message) => Status::failed_precondition(message),
+            other => Status::internal(other.to_string()),
+        })
 }
 
 fn find_copy_object_for_key(
@@ -4820,7 +4844,7 @@ pub(crate) fn operation_state(value: &str) -> pb::OperationState {
         "finished" | "completed_after_cancel" => pb::OperationState::Succeeded,
         "failed" => pb::OperationState::Failed,
         "cancelled_before_dispatch" => pb::OperationState::Cancelled,
-        "completion_unknown" => pb::OperationState::Unknown,
+        "completion_unknown" => pb::OperationState::CompletionUnknown,
         _ => pb::OperationState::Unspecified,
     }
 }
@@ -9779,6 +9803,13 @@ BCw3Wyv2UWY=
             health.components.get("sqlite_index").map(String::as_str),
             Some("ok")
         );
+        assert_eq!(health.component_health.len(), 1);
+        assert_eq!(health.component_health[0].component, "sqlite_index");
+        assert_eq!(
+            health.component_health[0].status,
+            pb::component_health::Status::Healthy as i32
+        );
+        assert!(health.component_health[0].other_status.is_empty());
 
         let version = pb::daemon_server::Daemon::version(&service, Request::new(()))
             .await
@@ -11129,6 +11160,53 @@ BCw3Wyv2UWY=
         assert_eq!(copies.copies[0].tape_uuid, vec![3u8; 16]);
         assert_eq!(copies.copies[0].tape_file_number, 4);
         assert_eq!(copies.copies[0].pool_id, "camera.copy-a");
+    }
+
+    #[test]
+    fn content_digest_lookup_rejects_ambiguous_or_malformed_keys() {
+        let state = populated_state();
+        let second_object_id = Uuid::from_u128(0x2222).to_string();
+        let mut index = CatalogIndex::open(state.index_path.as_ref()).expect("open test index");
+        index
+            .upsert_native_object_projection(
+                NativeObjectProjectionInput {
+                    object_id: second_object_id,
+                    caller_object_id: Some("caller-2".to_string()),
+                    body_format: "rao-v1".to_string(),
+                    logical_size_bytes: Some(17),
+                    content_hash: Some(vec![7u8; 32]),
+                    metadata_hash: None,
+                    created_at_utc: Some("2026-05-28T13:00:00Z".to_string()),
+                },
+                &[],
+            )
+            .expect("project colliding logical object");
+        drop(index);
+
+        let ambiguous = find_object_for_key(
+            &state,
+            Some(pb::get_object_request::Key::ContentSha256(vec![7u8; 32])),
+        )
+        .expect_err("ambiguous content identity must fail");
+        assert_eq!(ambiguous.code(), tonic::Code::FailedPrecondition);
+        assert!(ambiguous.message().contains("multiple logical objects"));
+
+        let malformed = find_object_for_key(
+            &state,
+            Some(pb::get_object_request::Key::ContentSha256(vec![7u8; 31])),
+        )
+        .expect_err("malformed SHA-256 key must fail");
+        assert_eq!(malformed.code(), tonic::Code::InvalidArgument);
+
+        let unsupported = find_object_for_key(
+            &state,
+            Some(pb::get_object_request::Key::ContentDigest(pb::Digest {
+                algorithm: "sha512".to_string(),
+                value: vec![7u8; 64],
+            })),
+        )
+        .expect_err("unsupported digest algorithm must fail");
+        assert_eq!(unsupported.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]

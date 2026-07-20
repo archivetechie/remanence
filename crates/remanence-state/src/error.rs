@@ -68,6 +68,9 @@ pub enum StateError {
     /// A catalog cache digest does not match its authoritative source.
     #[error("catalog cache digest mismatch: {0}")]
     CatalogCacheDigestMismatch(String),
+    /// A lookup documented as exactly-one matched more than one catalog row.
+    #[error("ambiguous catalog lookup: {0}")]
+    AmbiguousCatalogLookup(String),
     /// The lock file looked stale to an operator, but kernel lock state is authoritative.
     #[error("state lock stale diagnostic: {0}")]
     StateLockStale(String),

@@ -289,7 +289,7 @@ fn state_matches(record_state: &str, filter_state: &str) -> bool {
         "succeeded" | "success" | "finished" => state == pb::OperationState::Succeeded,
         "failed" => state == pb::OperationState::Failed,
         "cancelled" | "canceled" => state == pb::OperationState::Cancelled,
-        "unknown" => state == pb::OperationState::Unknown,
+        "unknown" => state == pb::OperationState::CompletionUnknown,
         "unspecified" => state == pb::OperationState::Unspecified,
         other => record_state.eq_ignore_ascii_case(other),
     }

@@ -269,6 +269,12 @@ fn drive_event_to_proto(record: DriveEventRecord) -> pb::DriveHistoryEvent {
 }
 
 fn drive_snapshot_to_proto(record: DriveHealthSnapshotRecord) -> pb::DriveHealthSnapshot {
+    let session_uuid = record
+        .session_id
+        .as_deref()
+        .and_then(|session_id| uuid::Uuid::parse_str(session_id).ok())
+        .map(|session_id| session_id.as_bytes().to_vec())
+        .unwrap_or_default();
     pb::DriveHealthSnapshot {
         snapshot_id: u64::try_from(record.snapshot_id).unwrap_or_default(),
         drive_uuid: record.drive_uuid,
@@ -293,6 +299,7 @@ fn drive_snapshot_to_proto(record: DriveHealthSnapshotRecord) -> pb::DriveHealth
             .and_then(|value| u64::try_from(value).ok())
             .unwrap_or_default(),
         raw_pages: record.raw_pages.unwrap_or_default(),
+        session_uuid,
     }
 }
 
@@ -1149,6 +1156,27 @@ mod tests {
             product: *b"MSL3040         ",
             revision: *b"6.40",
         }
+    }
+
+    #[test]
+    fn drive_snapshot_uses_canonical_binary_session_uuid() {
+        let session_id = uuid::Uuid::from_u128(0x1234);
+        let snapshot = drive_snapshot_to_proto(DriveHealthSnapshotRecord {
+            snapshot_id: 1,
+            drive_uuid: vec![1; 16],
+            at_utc: "2026-07-21T00:00:00Z".to_string(),
+            trigger: "manual".to_string(),
+            session_id: Some(session_id.to_string()),
+            tape_alert_flags: None,
+            write_errors_corrected: None,
+            write_errors_uncorrected: None,
+            read_errors_corrected: None,
+            read_errors_uncorrected: None,
+            raw_pages: None,
+        });
+
+        assert_eq!(snapshot.session_uuid, session_id.as_bytes());
+        assert_eq!(snapshot.session_id, session_id.to_string());
     }
 
     fn mk_library() -> Library {
