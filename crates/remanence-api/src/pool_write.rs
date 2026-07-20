@@ -1171,6 +1171,16 @@ struct BlockSinkStats {
     effective_batch_blocks: u32,
     position_check_bytes: u64,
     staging_ring_buffers: u32,
+    staging_wait_samples: u64,
+    staging_wait_p50_us: u64,
+    staging_wait_p95_us: u64,
+    staging_wait_max_us: u64,
+    staging_wait_mean_us: u64,
+    refill_samples: u64,
+    refill_p50_us: u64,
+    refill_p95_us: u64,
+    refill_max_us: u64,
+    refill_mean_us: u64,
     gap_samples: u64,
     gap_p50_us: u64,
     gap_p95_us: u64,
@@ -1181,6 +1191,11 @@ struct BlockSinkStats {
     ioctl_p95_us: u64,
     ioctl_max_us: u64,
     ioctl_mean_us: u64,
+    first_60s_ioctl_samples: u64,
+    first_60s_ioctl_p50_us: u64,
+    first_60s_ioctl_p95_us: u64,
+    first_60s_ioctl_max_us: u64,
+    first_60s_ioctl_mean_us: u64,
     accounting_samples: u64,
     accounting_p50_us: u64,
     accounting_p95_us: u64,
@@ -1188,6 +1203,12 @@ struct BlockSinkStats {
     accounting_mean_us: u64,
     cadence_us: u64,
     effective_feed_bytes_per_second: u64,
+    time_to_first_ioctl_ms: u64,
+    steady_reached: bool,
+    time_to_steady_ms: u64,
+    steady_window_seconds: u32,
+    steady_threshold_percent: u32,
+    ramp_observation_seconds: u32,
 }
 
 impl BlockSinkStats {
@@ -1215,6 +1236,19 @@ impl BlockSinkStats {
     fn record_position(&mut self, position: TapePosition) {
         self.position_calls = self.position_calls.saturating_add(1);
         self.early_warning |= position.block_position_end_of_warning;
+    }
+
+    fn record_staging(&mut self, diagnostics: &StagingPhaseDiagnostics) {
+        self.staging_wait_samples = diagnostics.wait_us.samples;
+        self.staging_wait_p50_us = diagnostics.wait_us.percentile(50, 100);
+        self.staging_wait_p95_us = diagnostics.wait_us.percentile(95, 100);
+        self.staging_wait_max_us = diagnostics.wait_us.max_us;
+        self.staging_wait_mean_us = diagnostics.wait_us.mean();
+        self.refill_samples = diagnostics.refill_us.samples;
+        self.refill_p50_us = diagnostics.refill_us.percentile(50, 100);
+        self.refill_p95_us = diagnostics.refill_us.percentile(95, 100);
+        self.refill_max_us = diagnostics.refill_us.max_us;
+        self.refill_mean_us = diagnostics.refill_us.mean();
     }
 }
 
@@ -1840,6 +1874,7 @@ where
     run_staged_transfer_with_safety(inner, block_size, producer, |_| Ok(()))
 }
 
+#[cfg(test)]
 fn run_staged_transfer_with_safety<S, R>(
     inner: &mut S,
     block_size: usize,
@@ -1850,9 +1885,10 @@ where
     S: BlockSink + ?Sized,
     R: Send,
 {
-    run_ring_staged_transfer(inner, block_size, producer, on_safety_error)
+    run_ring_staged_transfer(inner, block_size, producer, on_safety_error)?.result
 }
 
+#[cfg(test)]
 fn run_fenced_staged_transfer<S, R>(
     state: &mut CatalogIndex,
     selected: &SelectedTape,
@@ -1864,7 +1900,7 @@ where
     S: BlockSink + ?Sized,
     R: Send,
 {
-    run_staged_transfer_with_safety(inner, block_size, producer, |error| {
+    run_ring_staged_transfer(inner, block_size, producer, |error| {
         let error = error.to_string();
         record_tape_io_fence_for_transfer_error(
             state,
@@ -1872,7 +1908,37 @@ where
             tape_io_fence_reason_for_transfer_error(&error),
             &error,
         )
-    })
+    })?
+    .result
+}
+
+fn run_counted_fenced_staged_transfer<S, R>(
+    state: &mut CatalogIndex,
+    selected: &SelectedTape,
+    inner: &mut CountingBlockSink<'_, S>,
+    block_size: usize,
+    producer: impl FnOnce(&mut dyn BlockSink) -> Result<R, PoolWriteError> + Send,
+) -> Result<R, PoolWriteError>
+where
+    S: BlockSink + ?Sized,
+    R: Send,
+{
+    let outcome = run_ring_staged_transfer(inner, block_size, producer, |error| {
+        let error = error.to_string();
+        record_tape_io_fence_for_transfer_error(
+            state,
+            selected,
+            tape_io_fence_reason_for_transfer_error(&error),
+            &error,
+        )
+    })?;
+    inner.stats.record_staging(&outcome.staging_diagnostics);
+    outcome.result
+}
+
+struct RingStagedTransferOutcome<R> {
+    result: Result<R, PoolWriteError>,
+    staging_diagnostics: StagingPhaseDiagnostics,
 }
 
 fn run_ring_staged_transfer<S, R>(
@@ -1880,7 +1946,7 @@ fn run_ring_staged_transfer<S, R>(
     block_size: usize,
     producer: impl FnOnce(&mut dyn BlockSink) -> Result<R, PoolWriteError> + Send,
     mut on_safety_error: impl FnMut(&TapeIoError) -> Result<(), PoolWriteError>,
-) -> Result<R, PoolWriteError>
+) -> Result<RingStagedTransferOutcome<R>, PoolWriteError>
 where
     S: BlockSink + ?Sized,
     R: Send,
@@ -1967,7 +2033,7 @@ where
             ),
         };
         log_staging_phase_diagnostics(&staging_diagnostics);
-        match submitter_result {
+        let result = match submitter_result {
             Ok(()) => match producer_result {
                 Ok(value) => Ok(value),
                 Err(primary) => {
@@ -1983,8 +2049,10 @@ where
                 }
             },
             Err(err) => Err(err),
-        }
+        };
+        (result, staging_diagnostics)
     });
+    let (mut result, staging_diagnostics) = result;
     inner.publish_pipelined_write_diagnostics();
     let allocated = accounting.allocated.load(Ordering::Relaxed);
     let dropped = accounting.dropped.load(Ordering::Relaxed);
@@ -1992,7 +2060,7 @@ where
         let imbalance = PoolWriteError::InvalidInput(format!(
             "staging ring accounting imbalance: allocated={allocated} dropped={dropped}"
         ));
-        return match result {
+        result = match result {
             Ok(_) => {
                 let safety_error = TapeIoError::OperationFailed(imbalance.to_string());
                 let fence_result = on_safety_error(&safety_error);
@@ -2013,7 +2081,10 @@ where
             )),
         };
     }
-    result
+    Ok(RingStagedTransferOutcome {
+        result,
+        staging_diagnostics,
+    })
 }
 
 fn log_staging_phase_diagnostics(diagnostics: &StagingPhaseDiagnostics) {
@@ -2395,6 +2466,11 @@ impl<'a, S: BlockSink + ?Sized> CountingBlockSink<'a, S> {
         stats.ioctl_p95_us = diagnostics.ioctl_p95_us;
         stats.ioctl_max_us = diagnostics.ioctl_max_us;
         stats.ioctl_mean_us = diagnostics.ioctl_mean_us;
+        stats.first_60s_ioctl_samples = diagnostics.first_60s_ioctl_samples;
+        stats.first_60s_ioctl_p50_us = diagnostics.first_60s_ioctl_p50_us;
+        stats.first_60s_ioctl_p95_us = diagnostics.first_60s_ioctl_p95_us;
+        stats.first_60s_ioctl_max_us = diagnostics.first_60s_ioctl_max_us;
+        stats.first_60s_ioctl_mean_us = diagnostics.first_60s_ioctl_mean_us;
         stats.accounting_samples = diagnostics.accounting_samples;
         stats.accounting_p50_us = diagnostics.accounting_p50_us;
         stats.accounting_p95_us = diagnostics.accounting_p95_us;
@@ -2402,6 +2478,12 @@ impl<'a, S: BlockSink + ?Sized> CountingBlockSink<'a, S> {
         stats.accounting_mean_us = diagnostics.accounting_mean_us;
         stats.cadence_us = diagnostics.cadence_us;
         stats.effective_feed_bytes_per_second = diagnostics.effective_feed_bytes_per_second;
+        stats.time_to_first_ioctl_ms = diagnostics.time_to_first_ioctl_ms;
+        stats.steady_reached = diagnostics.steady_reached;
+        stats.time_to_steady_ms = diagnostics.time_to_steady_ms;
+        stats.steady_window_seconds = diagnostics.steady_window_seconds;
+        stats.steady_threshold_percent = diagnostics.steady_threshold_percent;
+        stats.ramp_observation_seconds = diagnostics.ramp_observation_seconds;
         stats
     }
 }
@@ -2729,7 +2811,7 @@ fn write_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
     let block_size = selected.block_size;
     let transfer_started = Instant::now();
     let write_report: Result<StreamingObjectWriteReport, PoolWriteError> =
-        run_fenced_staged_transfer(state, &selected, sink, block_size as usize, |staged| {
+        run_counted_fenced_staged_transfer(state, &selected, sink, block_size as usize, |staged| {
             let mut raw = BlockSinkRawTapeSink::new(staged);
             let mut parity =
                 ParitySink::new_sidecar_only(&mut raw, scheme.clone(), tape_uuid, block_size)?;
@@ -2853,7 +2935,7 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
     let append = no_parity_append_context(state, &selected)?;
     let transfer_started = Instant::now();
     let write_report: Result<StreamingObjectWriteReport, PoolWriteError> =
-        run_fenced_staged_transfer(
+        run_counted_fenced_staged_transfer(
             state,
             &selected,
             sink,
@@ -3423,6 +3505,16 @@ fn log_transfer_diagnostics(
         effective_batch_blocks = outcome.stats.effective_batch_blocks,
         position_check_bytes = outcome.stats.position_check_bytes,
         staging_ring_buffers = outcome.stats.staging_ring_buffers,
+        staging_wait_samples = outcome.stats.staging_wait_samples,
+        staging_wait_p50_us = outcome.stats.staging_wait_p50_us,
+        staging_wait_p95_us = outcome.stats.staging_wait_p95_us,
+        staging_wait_max_us = outcome.stats.staging_wait_max_us,
+        staging_wait_mean_us = outcome.stats.staging_wait_mean_us,
+        refill_samples = outcome.stats.refill_samples,
+        refill_p50_us = outcome.stats.refill_p50_us,
+        refill_p95_us = outcome.stats.refill_p95_us,
+        refill_max_us = outcome.stats.refill_max_us,
+        refill_mean_us = outcome.stats.refill_mean_us,
         gap_samples = outcome.stats.gap_samples,
         gap_p50_us = outcome.stats.gap_p50_us,
         gap_p95_us = outcome.stats.gap_p95_us,
@@ -3433,6 +3525,11 @@ fn log_transfer_diagnostics(
         ioctl_p95_us = outcome.stats.ioctl_p95_us,
         ioctl_max_us = outcome.stats.ioctl_max_us,
         ioctl_mean_us = outcome.stats.ioctl_mean_us,
+        first_60s_ioctl_samples = outcome.stats.first_60s_ioctl_samples,
+        first_60s_ioctl_p50_us = outcome.stats.first_60s_ioctl_p50_us,
+        first_60s_ioctl_p95_us = outcome.stats.first_60s_ioctl_p95_us,
+        first_60s_ioctl_max_us = outcome.stats.first_60s_ioctl_max_us,
+        first_60s_ioctl_mean_us = outcome.stats.first_60s_ioctl_mean_us,
         accounting_samples = outcome.stats.accounting_samples,
         accounting_p50_us = outcome.stats.accounting_p50_us,
         accounting_p95_us = outcome.stats.accounting_p95_us,
@@ -3440,6 +3537,12 @@ fn log_transfer_diagnostics(
         accounting_mean_us = outcome.stats.accounting_mean_us,
         cadence_us = outcome.stats.cadence_us,
         effective_feed_bytes_per_second = outcome.stats.effective_feed_bytes_per_second,
+        time_to_first_ioctl_ms = outcome.stats.time_to_first_ioctl_ms,
+        steady_reached = outcome.stats.steady_reached,
+        time_to_steady_ms = outcome.stats.time_to_steady_ms,
+        steady_window_seconds = outcome.stats.steady_window_seconds,
+        steady_threshold_percent = outcome.stats.steady_threshold_percent,
+        ramp_observation_seconds = outcome.stats.ramp_observation_seconds,
         write_filemarks_immed = false,
         elapsed_ms = crate::diagnostics::duration_ms(outcome.elapsed),
         throughput_mib_s = crate::diagnostics::mib_per_s(payload_bytes, outcome.elapsed),
@@ -5043,6 +5146,23 @@ mod tests {
         assert_eq!(histogram.percentile(50, 100), 25);
         assert_eq!(histogram.percentile(95, 100), 50);
         assert_eq!(histogram.max_us, 39);
+    }
+
+    #[test]
+    fn transfer_stats_include_staging_wait_and_refill_histograms() {
+        let mut diagnostics = StagingPhaseDiagnostics::default();
+        diagnostics.wait_us.record(Duration::from_micros(11));
+        diagnostics.wait_us.record(Duration::from_micros(39));
+        diagnostics.refill_us.record(Duration::from_micros(101));
+
+        let mut stats = BlockSinkStats::default();
+        stats.record_staging(&diagnostics);
+
+        assert_eq!(stats.staging_wait_samples, 2);
+        assert_eq!(stats.staging_wait_mean_us, 25);
+        assert_eq!(stats.staging_wait_p95_us, 50);
+        assert_eq!(stats.refill_samples, 1);
+        assert_eq!(stats.refill_mean_us, 101);
     }
 
     #[test]

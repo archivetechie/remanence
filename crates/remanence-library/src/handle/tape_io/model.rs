@@ -424,6 +424,16 @@ pub struct PipelinedWriteDiagnostics {
     pub ioctl_max_us: u64,
     /// Mean SG_IO duration in microseconds.
     pub ioctl_mean_us: u64,
+    /// SG_IO samples whose submission began during the first 60 seconds.
+    pub first_60s_ioctl_samples: u64,
+    /// Median SG_IO duration during the first 60 seconds, in microseconds.
+    pub first_60s_ioctl_p50_us: u64,
+    /// 95th-percentile SG_IO duration during the first 60 seconds, in microseconds.
+    pub first_60s_ioctl_p95_us: u64,
+    /// Maximum SG_IO duration during the first 60 seconds, in microseconds.
+    pub first_60s_ioctl_max_us: u64,
+    /// Mean SG_IO duration during the first 60 seconds, in microseconds.
+    pub first_60s_ioctl_mean_us: u64,
     /// Clean commands with a post-ioctl accounting sample.
     pub accounting_samples: u64,
     /// Median time from SG_IO completion through cursor/accounting work.
@@ -438,6 +448,18 @@ pub struct PipelinedWriteDiagnostics {
     pub cadence_us: u64,
     /// Effective bytes fed per second over the observed command span.
     pub effective_feed_bytes_per_second: u64,
+    /// Milliseconds from the diagnostic reset to the first data SG_IO submission.
+    pub time_to_first_ioctl_ms: u64,
+    /// True when a complete steady-rate observation window was found.
+    pub steady_reached: bool,
+    /// End of the first steady-rate window, in milliseconds from diagnostic reset.
+    pub time_to_steady_ms: u64,
+    /// Width of the steady-rate observation window in seconds.
+    pub steady_window_seconds: u32,
+    /// Required percentage of the final whole-run feed rate.
+    pub steady_threshold_percent: u32,
+    /// Maximum prefix, in seconds, retained for steady-rate detection.
+    pub ramp_observation_seconds: u32,
 }
 
 /// Read-submitter telemetry has the same allocation-free cadence schema as

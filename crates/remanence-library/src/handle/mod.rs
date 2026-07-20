@@ -99,6 +99,10 @@ const PIPELINE_HISTOGRAM_UPPER_US: [u64; 12] = [
     50_000,
     u64::MAX,
 ];
+const PIPELINE_FIRST_WINDOW_SECONDS: u64 = 60;
+const PIPELINE_STEADY_WINDOW_SECONDS: usize = 5;
+const PIPELINE_STEADY_THRESHOLD_PERCENT: u64 = 80;
+const PIPELINE_RAMP_OBSERVATION_SECONDS: usize = 300;
 
 #[derive(Debug, Default)]
 struct PipelineHistogram {
@@ -144,18 +148,41 @@ impl PipelineHistogram {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PipelineDiagnostics {
     gap_us: PipelineHistogram,
     ioctl_us: PipelineHistogram,
+    first_60s_ioctl_us: PipelineHistogram,
     accounting_us: PipelineHistogram,
     good_commands: u64,
     good_records: u64,
     good_bytes: u64,
     residual_claim_mismatches: u64,
+    reset_at: Option<Instant>,
     first_submit: Option<Instant>,
     previous_completion: Option<Instant>,
     last_completion: Option<Instant>,
+    ramp_bytes: [u64; PIPELINE_RAMP_OBSERVATION_SECONDS],
+}
+
+impl Default for PipelineDiagnostics {
+    fn default() -> Self {
+        Self {
+            gap_us: PipelineHistogram::default(),
+            ioctl_us: PipelineHistogram::default(),
+            first_60s_ioctl_us: PipelineHistogram::default(),
+            accounting_us: PipelineHistogram::default(),
+            good_commands: 0,
+            good_records: 0,
+            good_bytes: 0,
+            residual_claim_mismatches: 0,
+            reset_at: None,
+            first_submit: None,
+            previous_completion: None,
+            last_completion: None,
+            ramp_bytes: [0; PIPELINE_RAMP_OBSERVATION_SECONDS],
+        }
+    }
 }
 
 struct PendingPipelineAudit {
