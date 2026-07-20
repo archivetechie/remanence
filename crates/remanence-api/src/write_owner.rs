@@ -121,7 +121,7 @@ pub(crate) enum DriveCommand {
         reply: oneshot::Sender<Result<pb::ReadSession, Status>>,
     },
     Unload {
-        reply: oneshot::Sender<Result<(), Status>>,
+        reply: oneshot::Sender<Result<StdDuration, Status>>,
     },
     PollHealth {
         drive_uuid: Vec<u8>,
@@ -145,12 +145,10 @@ pub(crate) enum DriveCommand {
     },
     Close {
         session_id: Uuid,
-        unload_before_close: bool,
         reply: oneshot::Sender<Result<CloseWriteActorReply, Status>>,
     },
     Abort {
         session_id: Uuid,
-        unload_before_close: bool,
         reply: oneshot::Sender<Result<CloseWriteActorReply, Status>>,
     },
     Get {
@@ -175,7 +173,6 @@ pub(crate) enum DriveCommand {
     },
     CloseRead {
         session_id: Uuid,
-        unload_before_close: bool,
         reply: oneshot::Sender<Result<pb::ReadSession, Status>>,
     },
     GetRead {
@@ -198,9 +195,9 @@ pub(crate) struct CloseWriteActorDiagnostics {
     pub(crate) catalog_journal_fsync: StdDuration,
     /// Close-time health snapshot and projection work.
     pub(crate) drive_snapshot: StdDuration,
-    /// Separate explicit rewind time. Zero while close retains monolithic SSC UNLOAD.
+    /// Always zero for lazy session close; later dismount diagnostics own rewind time.
     pub(crate) rewind: StdDuration,
-    /// Synchronous SSC UNLOAD time, including its device-internal rewind.
+    /// Always zero for lazy session close; later dismount diagnostics own SSC UNLOAD time.
     pub(crate) ssc_unload: StdDuration,
     /// SessionClosed audit append/fsync and SQLite projection time.
     pub(crate) session_audit_projection: StdDuration,
@@ -216,6 +213,30 @@ pub(crate) struct MountedSession {
     pub drive_uuid: Option<Vec<u8>>,
 }
 
+/// A library cartridge intentionally left seated after its session closes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SeatedCartridge {
+    pub(crate) bay: u16,
+    pub(crate) library_serial: String,
+    pub(crate) barcode: Option<String>,
+    pub(crate) home_slot: u16,
+    pub(crate) tape_uuid: Option<TapeUuid>,
+    pub(crate) prior_session_id: Option<Uuid>,
+}
+
+/// Generation-tagged idle record used to invalidate stale timeout tasks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ParkedCartridge {
+    pub(crate) seated: SeatedCartridge,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct ParkedState {
+    next_generation: u64,
+    by_bay: HashMap<u16, ParkedCartridge>,
+}
+
 #[derive(Clone)]
 pub(crate) struct DrivePool {
     changer_tx: mpsc::Sender<ChangerCommand>,
@@ -223,6 +244,8 @@ pub(crate) struct DrivePool {
     reservations: Arc<HashMap<u16, AtomicBool>>,
     sessions: Arc<Mutex<HashMap<Uuid, MountedSession>>>,
     tape_reservations: Arc<Mutex<HashSet<TapeUuid>>>,
+    parked: Arc<Mutex<ParkedState>>,
+    shutting_down: Arc<AtomicBool>,
 }
 
 impl DrivePool {
@@ -237,6 +260,8 @@ impl DrivePool {
             reservations,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             tape_reservations: Arc::new(Mutex::new(HashSet::new())),
+            parked: Arc::new(Mutex::new(ParkedState::default())),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -267,6 +292,17 @@ impl DrivePool {
     }
 
     pub(crate) fn reserve_drive(&self, bay: u16) -> Result<DriveReservation, Status> {
+        if self.is_shutting_down() {
+            return Err(Status::unavailable("drive pool is shutting down"));
+        }
+        self.reserve_drive_inner(bay)
+    }
+
+    pub(crate) fn reserve_drive_for_shutdown(&self, bay: u16) -> Result<DriveReservation, Status> {
+        self.reserve_drive_inner(bay)
+    }
+
+    fn reserve_drive_inner(&self, bay: u16) -> Result<DriveReservation, Status> {
         let reservation = self
             .reservations
             .get(&bay)
@@ -288,6 +324,9 @@ impl DrivePool {
     }
 
     pub(crate) fn reserve_all_exclusive(&self) -> Result<(), Status> {
+        if self.is_shutting_down() {
+            return Err(Status::unavailable("drive pool is shutting down"));
+        }
         let mut acquired = Vec::new();
         let mut bays = self.reservations.keys().copied().collect::<Vec<_>>();
         bays.sort_unstable();
@@ -377,6 +416,11 @@ impl DrivePool {
     }
 
     pub(crate) fn record_session(&self, session_id: Uuid, mounted: MountedSession) {
+        self.parked
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .by_bay
+            .remove(&mounted.bay);
         self.sessions
             .lock()
             .unwrap_or_else(|err| err.into_inner())
@@ -397,6 +441,74 @@ impl DrivePool {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .remove(&session_id);
+    }
+
+    /// Convert a completed session reservation into an idle seated cartridge.
+    /// The bay remains reserved until all bookkeeping is published.
+    pub(crate) fn finish_session(
+        &self,
+        session_id: Uuid,
+        mounted: MountedSession,
+    ) -> Option<ParkedCartridge> {
+        let bay = mounted.bay;
+        self.forget_session(session_id);
+        let parked = mounted.home_slot.map(|home_slot| {
+            self.park_cartridge(SeatedCartridge {
+                bay: mounted.bay,
+                library_serial: mounted.library_serial,
+                barcode: mounted.barcode,
+                home_slot,
+                tape_uuid: Some(mounted.tape_uuid),
+                prior_session_id: Some(session_id),
+            })
+        });
+        self.release(bay);
+        parked
+    }
+
+    /// Register a cartridge found seated at startup or during reconciliation.
+    pub(crate) fn park_cartridge(&self, seated: SeatedCartridge) -> ParkedCartridge {
+        let mut state = self.parked.lock().unwrap_or_else(|err| err.into_inner());
+        state.next_generation = state.next_generation.wrapping_add(1).max(1);
+        let parked = ParkedCartridge {
+            seated,
+            generation: state.next_generation,
+        };
+        state.by_bay.insert(parked.seated.bay, parked.clone());
+        parked
+    }
+
+    pub(crate) fn parked_at(&self, bay: u16) -> Option<ParkedCartridge> {
+        self.parked
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .by_bay
+            .get(&bay)
+            .cloned()
+    }
+
+    pub(crate) fn parked_is_current(&self, parked: &ParkedCartridge) -> bool {
+        self.parked_at(parked.seated.bay)
+            .is_some_and(|current| current.generation == parked.generation)
+    }
+
+    pub(crate) fn forget_parked(&self, parked: &ParkedCartridge) {
+        let mut state = self.parked.lock().unwrap_or_else(|err| err.into_inner());
+        if state
+            .by_bay
+            .get(&parked.seated.bay)
+            .is_some_and(|current| current.generation == parked.generation)
+        {
+            state.by_bay.remove(&parked.seated.bay);
+        }
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
     }
 
     pub(crate) async fn poll_drive_health(
@@ -778,8 +890,10 @@ fn drive_loop(
                 },
             ),
             DriveCommand::Unload { reply } => {
+                let started = Instant::now();
                 let result = drive
                     .unload()
+                    .map(|()| started.elapsed())
                     .map_err(|err| Status::internal(format!("unload drive: {err}")));
                 let _ = reply.send(result);
             }
@@ -1851,7 +1965,6 @@ struct CloseWriteActorInput<'a> {
     opened_at_utc: &'a str,
     last_checkpoint_at_utc: Option<&'a str>,
     state: pb::write_session::State,
-    unload_before_close: bool,
     append_commit_diagnostics: crate::pool_write::AppendCommitDiagnostics,
 }
 
@@ -1873,15 +1986,6 @@ fn close_write_actor(input: CloseWriteActorInput<'_>) -> Result<CloseWriteActorR
         input.snapshot_misses,
     );
     diagnostics.drive_snapshot = snapshot_started.elapsed();
-
-    if input.unload_before_close {
-        let unload_started = Instant::now();
-        input
-            .drive
-            .unload()
-            .map_err(|err| Status::internal(format!("unload drive: {err}")))?;
-        diagnostics.ssc_unload = unload_started.elapsed();
-    }
 
     let session = session_proto(WriteSessionProtoInput {
         session_id: input.session_id,
@@ -2132,7 +2236,6 @@ fn handle_drive_open_write(
             }
             DriveCommand::Close {
                 session_id: requested,
-                unload_before_close,
                 reply,
             } => {
                 if requested != session_id {
@@ -2155,7 +2258,6 @@ fn handle_drive_open_write(
                     opened_at_utc: opened_at_utc.as_str(),
                     last_checkpoint_at_utc: last_checkpoint_at_utc.as_deref(),
                     state: pb::write_session::State::WriteSessionStateClosed,
-                    unload_before_close,
                     append_commit_diagnostics,
                 });
                 match result {
@@ -2171,7 +2273,6 @@ fn handle_drive_open_write(
             }
             DriveCommand::Abort {
                 session_id: requested,
-                unload_before_close,
                 reply,
             } => {
                 if requested != session_id {
@@ -2194,7 +2295,6 @@ fn handle_drive_open_write(
                     opened_at_utc: opened_at_utc.as_str(),
                     last_checkpoint_at_utc: last_checkpoint_at_utc.as_deref(),
                     state: pb::write_session::State::WriteSessionStateAborted,
-                    unload_before_close,
                     append_commit_diagnostics,
                 });
                 match result {
@@ -2618,7 +2718,6 @@ fn handle_drive_open_read(
             }
             DriveCommand::CloseRead {
                 session_id: requested,
-                unload_before_close,
                 reply,
             } => {
                 let status = if requested == session_id {
@@ -2631,13 +2730,6 @@ fn handle_drive_open_read(
                         tape_uuid,
                         snapshot_misses,
                     );
-                    if unload_before_close {
-                        if let Err(err) = drive.unload() {
-                            let _ =
-                                reply.send(Err(Status::internal(format!("unload drive: {err}"))));
-                            continue;
-                        }
-                    }
                     Ok(read_session_proto(
                         session_id,
                         &tape_uuid,
@@ -6482,7 +6574,6 @@ mod tests {
         drive_tx
             .send(DriveCommand::CloseRead {
                 session_id: read_session_id,
-                unload_before_close: false,
                 reply: close_read_tx,
             })
             .await
@@ -6554,7 +6645,6 @@ mod tests {
         drive_tx
             .send(DriveCommand::Close {
                 session_id: write_session_id,
-                unload_before_close: true,
                 reply: close_write_tx,
             })
             .await
@@ -6576,6 +6666,7 @@ mod tests {
             StdDuration::ZERO
         );
         assert_eq!(close_reply.diagnostics.rewind, StdDuration::ZERO);
+        assert_eq!(close_reply.diagnostics.ssc_unload, StdDuration::ZERO);
         let close_opcodes = world
             .lock()
             .expect("world lock")
@@ -6585,8 +6676,8 @@ mod tests {
             .map(|command| command.opcode)
             .collect::<Vec<_>>();
         assert!(
-            close_opcodes.contains(&0x1b),
-            "close must retain the existing SSC UNLOAD command: {close_opcodes:?}"
+            !close_opcodes.contains(&0x1b),
+            "session close must leave the cartridge seated: {close_opcodes:?}"
         );
         assert!(
             !close_opcodes.contains(&0x01),

@@ -14236,6 +14236,7 @@ mod tests {
                 spool_tmpfs_ram_budget: None,
                 io_memory_ceiling: remanence_state::DEFAULT_IO_MEMORY_CEILING_BYTES,
                 default_idle_timeout_seconds: 1800,
+                drive_idle_unload_seconds: remanence_state::DEFAULT_DRIVE_IDLE_UNLOAD_SECONDS,
                 read_only: false,
                 socket_path: None,
                 listen: None,

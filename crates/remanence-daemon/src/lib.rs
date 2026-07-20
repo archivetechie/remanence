@@ -168,7 +168,7 @@ pub async fn serve(
         None
     };
 
-    let result: Result<(), Box<dyn std::error::Error + Send + Sync>> =
+    let mut result: Result<(), Box<dyn std::error::Error + Send + Sync>> =
         if let Some(mut tcp_server) = tcp_server {
             tokio::select! {
                 unix_join = &mut unix_server => match unix_join {
@@ -210,6 +210,15 @@ pub async fn serve(
             }
         };
 
+    if let Err(err) = state.shutdown_drive_pool().await {
+        let message = match result {
+            Ok(()) => format!("drive-pool shutdown dismount failed: {err}"),
+            Err(server_err) => {
+                format!("server failed: {server_err}; drive-pool shutdown dismount failed: {err}")
+            }
+        };
+        result = Err(Box::new(io::Error::other(message)));
+    }
     let _ = std::fs::remove_file(socket_path);
     result
 }
