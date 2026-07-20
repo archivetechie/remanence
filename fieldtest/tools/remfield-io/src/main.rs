@@ -674,6 +674,7 @@ async fn read_command(endpoint: &str, args: ReadArgs) -> AppResult<()> {
                 },
             )),
             idempotency_key: None,
+            resume_target: None,
         })
         .await?
         .into_inner();
