@@ -20,6 +20,7 @@ pub mod model;
 /// Media readiness classification for TEST UNIT READY probes.
 pub mod readiness;
 
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant, SystemTime};
 
 use remanence_scsi::{
@@ -40,7 +41,18 @@ pub use model::{
     TapeConfig, TapePosition, WormMediaState, WriteBatchOutcome, WriteFilemarksOutcome,
     WriteOutcome, WriteUnpositionedOutcome,
 };
-pub use readiness::{classify_media_readiness_error, MediaFamily, MediaReadiness};
+pub use readiness::{
+    classify_media_readiness_error, media_readiness_poll_interval, MediaFamily, MediaReadiness,
+    MediaReadinessPoll, MediaReadinessWaitEvent, MediaReadinessWaitOptions,
+};
+
+#[cfg(not(test))]
+fn sleep_media_readiness_poll(duration: Duration) {
+    std::thread::sleep(duration);
+}
+
+#[cfg(test)]
+fn sleep_media_readiness_poll(_duration: Duration) {}
 
 fn completion_unknown_check_condition(sense: Vec<u8>, bytes_transferred: u32) -> TapeIoError {
     TapeIoError::Transport(ScsiError::CheckCondition {
@@ -726,6 +738,73 @@ impl super::DriveHandle {
         match self.transport.execute_none(&cdb) {
             Ok(()) => MediaReadiness::Ready,
             Err(err) => classify_media_readiness_error(err, family),
+        }
+    }
+
+    /// Poll TEST UNIT READY with the shared bounded readiness state machine.
+    ///
+    /// `initial` lets a caller feed an observation it already issued into the
+    /// same epoch without sending a duplicate command. The event callback is
+    /// invoked for every observation and cancellation before this method
+    /// returns, allowing higher layers to durably record fences and publish
+    /// progress without reimplementing the polling rules.
+    pub fn wait_for_media_readiness(
+        &mut self,
+        family: MediaFamily,
+        initial: Option<MediaReadiness>,
+        options: MediaReadinessWaitOptions,
+        mut cancellation: impl FnMut() -> Option<String>,
+        mut event: impl for<'a> FnMut(MediaReadinessWaitEvent<'a>) -> Result<(), String>,
+    ) -> Result<MediaReadinessPoll, String> {
+        const CANCEL_SLEEP_SLICE: Duration = Duration::from_millis(250);
+
+        let started = Instant::now();
+        let mut attempts = 0_u64;
+        let mut initial = initial;
+        let mut unit_attention_seen = BTreeSet::<(u8, u8)>::new();
+        loop {
+            if let Some(reason) = cancellation() {
+                event(MediaReadinessWaitEvent::Cancelled(reason.as_str()))?;
+                return Err(format!("media readiness interrupted by {reason}"));
+            }
+
+            attempts = attempts.saturating_add(1);
+            let mut readiness = initial
+                .take()
+                .unwrap_or_else(|| self.probe_media_readiness(family));
+            if let MediaReadiness::UnitAttention { asc, ascq } = &readiness {
+                if !unit_attention_seen.insert((*asc, *ascq)) {
+                    readiness = MediaReadiness::RepeatedUnitAttention {
+                        asc: *asc,
+                        ascq: *ascq,
+                    };
+                }
+            }
+            let elapsed = started.elapsed();
+            let terminal = readiness.is_ready() || !options.wait || !readiness.is_retryable_wait();
+            let timed_out = !terminal && elapsed >= options.timeout;
+            let poll = MediaReadinessPoll {
+                readiness,
+                attempts,
+                elapsed,
+                timed_out,
+            };
+            event(MediaReadinessWaitEvent::Poll(&poll))?;
+            if terminal || timed_out {
+                return Ok(poll);
+            }
+
+            let sleep_for = media_readiness_poll_interval(elapsed, options.poll_interval);
+            let mut remaining = std::cmp::min(sleep_for, options.timeout.saturating_sub(elapsed));
+            while remaining > Duration::ZERO {
+                if let Some(reason) = cancellation() {
+                    event(MediaReadinessWaitEvent::Cancelled(reason.as_str()))?;
+                    return Err(format!("media readiness interrupted by {reason}"));
+                }
+                let chunk = std::cmp::min(CANCEL_SLEEP_SLICE, remaining);
+                sleep_media_readiness_poll(chunk);
+                remaining = remaining.saturating_sub(chunk);
+            }
         }
     }
 

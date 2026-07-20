@@ -72,8 +72,9 @@ use remanence_library::DriveHandlePhysicalSource;
 use remanence_library::{
     tape_alert_flag_name, BlockSize, DirtyCause, DiscoveryError, DiscoveryReport, DiscoveryWarning,
     DriveBay, DriveHandle, DriveHandleSink, DriveHandleSource, ElementException, FileBlockSink,
-    FileBlockSource, IePort, IoErrorKind, Library, MediaFamily, MediaReadiness, OpenError, Slot,
-    StaticAllowlist, TapeAlerts, TapeConfig, VecBlockSource, WormMediaState,
+    FileBlockSource, IePort, IoErrorKind, Library, MediaFamily, MediaReadiness,
+    MediaReadinessWaitEvent, MediaReadinessWaitOptions, OpenError, Slot, StaticAllowlist,
+    TapeAlerts, TapeConfig, VecBlockSource, WormMediaState,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -93,9 +94,6 @@ const DEFAULT_DAEMON_ENDPOINT: &str = "unix:/var/lib/rem/rem.sock";
 const DEFAULT_DEV_TAPE_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_SCSI_VARIABLE_WRITE_BYTES: usize = 0x00FF_FFFF;
 const MEDIA_CONDITIONING_TIMEOUT: StdDuration = StdDuration::from_secs(9_000);
-const MEDIA_CONDITIONING_FAST_POLL_1S_UNTIL: StdDuration = StdDuration::from_secs(5);
-const MEDIA_CONDITIONING_FAST_POLL_2S_UNTIL: StdDuration = StdDuration::from_secs(15);
-const MEDIA_CONDITIONING_FAST_POLL_5S_UNTIL: StdDuration = StdDuration::from_secs(60);
 const MEDIA_CONDITIONING_STEADY_POLL: StdDuration = StdDuration::from_secs(60);
 #[cfg(test)]
 const CONDITIONAL_LOAD_SETTLE: StdDuration = StdDuration::from_millis(0);
@@ -7427,9 +7425,46 @@ fn run_tape_wait_ready_hardware(
         exit_code: 130,
     })?;
     let initial = drive.probe_media_readiness(family);
-    let initial_poll =
-        poll_already_observed_media_readiness(initial, "wait_ready_tur", operation_id, catalog)
-            .map_err(tape_wait_ready_failure_from_poll_error)?;
+    let poll = drive
+        .wait_for_media_readiness(
+            family,
+            Some(initial),
+            MediaReadinessWaitOptions {
+                wait: args.wait,
+                timeout: args.timeout,
+                poll_interval: args.poll,
+            },
+            || signal_guard.requested_signal_name().map(ToOwned::to_owned),
+            |event| match event {
+                MediaReadinessWaitEvent::Poll(observed) => {
+                    let observed = MediaReadinessPoll {
+                        readiness: observed.readiness.clone(),
+                        attempts: observed.attempts,
+                        timed_out: observed.timed_out,
+                    };
+                    TapeInitStateOps::record_media_readiness_transition(
+                        catalog,
+                        media_readiness_transition_input(operation_id, "wait_ready_tur", &observed),
+                    )
+                }
+                MediaReadinessWaitEvent::Cancelled(signal) => {
+                    record_media_readiness_signal_transition(
+                        catalog,
+                        operation_id,
+                        "wait_ready_tur",
+                        signal,
+                    )
+                }
+            },
+        )
+        .map_err(|message| {
+            let message = if message.starts_with("media readiness interrupted by SIG") {
+                format!("{message}; recorded aborted_unknown fence")
+            } else {
+                message
+            };
+            tape_wait_ready_failure_from_poll_error(message)
+        })?;
     record_media_readiness_signal_if_requested(
         catalog,
         operation_id,
@@ -7440,22 +7475,6 @@ fn run_tape_wait_ready_hardware(
         message,
         exit_code: 130,
     })?;
-    let poll = poll_media_readiness_after_initial_probe(
-        &mut drive,
-        family,
-        operation_id,
-        catalog,
-        drive_element,
-        MediaReadinessInitialProbeInput {
-            initial_poll,
-            wait: args.wait,
-            timeout: args.timeout,
-            poll_interval: args.poll,
-            conditional_load_on_no_medium: false,
-        },
-        || signal_guard.requested_signal_name(),
-    )
-    .map_err(tape_wait_ready_failure_from_poll_error)?;
     Ok(TapeWaitReadyResult {
         operation_id,
         drive_element,
@@ -7736,15 +7755,7 @@ fn terminalize_repeated_unit_attention(
 
 #[cfg(target_os = "linux")]
 fn media_conditioning_poll_interval(elapsed: StdDuration, steady_poll: StdDuration) -> StdDuration {
-    if elapsed < MEDIA_CONDITIONING_FAST_POLL_1S_UNTIL {
-        StdDuration::from_secs(1)
-    } else if elapsed < MEDIA_CONDITIONING_FAST_POLL_2S_UNTIL {
-        StdDuration::from_secs(2)
-    } else if elapsed < MEDIA_CONDITIONING_FAST_POLL_5S_UNTIL {
-        StdDuration::from_secs(5)
-    } else {
-        steady_poll
-    }
+    remanence_library::media_readiness_poll_interval(elapsed, steady_poll)
 }
 
 #[cfg(all(target_os = "linux", not(test)))]

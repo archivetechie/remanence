@@ -7,6 +7,8 @@
 //! keeps the detector limited to TEST UNIT READY and turns the raw SCSI result
 //! into a stable state machine vocabulary.
 
+use std::time::Duration;
+
 use remanence_scsi::ScsiError;
 
 use super::decode_sense_key_asc;
@@ -108,6 +110,53 @@ pub enum MediaReadiness {
         /// Display string from the low-level error.
         detail: String,
     },
+}
+
+/// Options for a bounded TEST UNIT READY polling epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaReadinessWaitOptions {
+    /// Keep polling retryable readiness states instead of returning after the
+    /// first observation.
+    pub wait: bool,
+    /// Maximum wall time for retryable observations.
+    pub timeout: Duration,
+    /// Steady-state poll interval after the initial fast-poll ramp.
+    pub poll_interval: Duration,
+}
+
+/// One durable observation from a media-readiness polling epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaReadinessPoll {
+    /// Classified TEST UNIT READY result.
+    pub readiness: MediaReadiness,
+    /// Number of TEST UNIT READY commands issued in this polling epoch.
+    pub attempts: u64,
+    /// Wall time since the polling epoch began.
+    pub elapsed: Duration,
+    /// True when a retryable state remained after the configured deadline.
+    pub timed_out: bool,
+}
+
+/// Callback event emitted by the shared media-readiness poll loop.
+#[derive(Debug)]
+pub enum MediaReadinessWaitEvent<'a> {
+    /// A TEST UNIT READY result that callers should persist or publish.
+    Poll(&'a MediaReadinessPoll),
+    /// Cancellation detected before another TEST UNIT READY was issued.
+    Cancelled(&'a str),
+}
+
+/// Apply the common fast-to-steady polling schedule used by readiness waits.
+pub fn media_readiness_poll_interval(elapsed: Duration, steady_poll: Duration) -> Duration {
+    if elapsed < Duration::from_secs(5) {
+        Duration::from_secs(1)
+    } else if elapsed < Duration::from_secs(15) {
+        Duration::from_secs(2)
+    } else if elapsed < Duration::from_secs(60) {
+        Duration::from_secs(5)
+    } else {
+        steady_poll
+    }
 }
 
 impl MediaReadiness {
