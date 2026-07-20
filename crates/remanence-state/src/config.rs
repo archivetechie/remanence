@@ -13,6 +13,8 @@ pub const DEFAULT_TAPE_BLOCK_SIZE_BYTES: u64 = 256 * 1024;
 
 /// Default fixed ceiling shared by append spools and read reservoirs.
 pub const DEFAULT_IO_MEMORY_CEILING_BYTES: u64 = 24 * 1024 * 1024 * 1024;
+/// Default target size of one overlap append's receive ring.
+pub const DEFAULT_APPEND_RING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Default target size of one restore stream's read reservoir.
 pub const DEFAULT_READ_RESERVOIR_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Default ranged-read device-position proof cadence.
@@ -77,6 +79,21 @@ pub struct DaemonConfig {
         deserialize_with = "deserialize_byte_size"
     )]
     pub io_memory_ceiling: u64,
+    /// Append receive strategy. The v0.1 rollout remains opt-in.
+    #[serde(default)]
+    pub append_staging_mode: AppendStagingMode,
+    /// Target byte capacity of one overlap append receive ring.
+    #[serde(
+        default = "default_append_ring_bytes",
+        deserialize_with = "deserialize_byte_size"
+    )]
+    pub append_ring_bytes: u64,
+    /// Start or resume tape submission at this ring occupancy percentage.
+    #[serde(default = "default_append_ring_high_pct")]
+    pub append_ring_high_pct: u8,
+    /// Pause tape submission at this ring occupancy percentage.
+    #[serde(default = "default_append_ring_low_pct")]
+    pub append_ring_low_pct: u8,
     /// Default idle timeout for sessions.
     pub default_idle_timeout_seconds: u64,
     /// Delay before a seated cartridge in an idle drive is returned home.
@@ -97,6 +114,17 @@ pub struct DaemonConfig {
     /// Mutual-TLS material for the TCP listener. Requires `listen`.
     #[serde(default)]
     pub tls: Option<DaemonTlsConfig>,
+}
+
+/// Daemon policy for Layer 5 append receive staging.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AppendStagingMode {
+    /// Receive the complete object into the legacy spool before tape writing.
+    #[default]
+    Serial,
+    /// Use a bounded live receive ring when the caller supplies every proof.
+    Overlap,
 }
 
 impl DaemonConfig {
@@ -349,6 +377,18 @@ const fn default_io_memory_ceiling() -> u64 {
     DEFAULT_IO_MEMORY_CEILING_BYTES
 }
 
+const fn default_append_ring_bytes() -> u64 {
+    DEFAULT_APPEND_RING_BYTES
+}
+
+const fn default_append_ring_high_pct() -> u8 {
+    90
+}
+
+const fn default_append_ring_low_pct() -> u8 {
+    25
+}
+
 const fn default_drive_idle_unload_seconds() -> u64 {
     DEFAULT_DRIVE_IDLE_UNLOAD_SECONDS
 }
@@ -490,6 +530,19 @@ pub fn validate_config(config: &RemConfig) -> Result<(), StateError> {
     if config.daemon.io_memory_ceiling == 0 {
         return Err(StateError::ConfigInvalid(
             "daemon.io_memory_ceiling must be non-zero".to_string(),
+        ));
+    }
+    if config.daemon.append_ring_bytes == 0 {
+        return Err(StateError::ConfigInvalid(
+            "daemon.append_ring_bytes must be non-zero".to_string(),
+        ));
+    }
+    if config.daemon.append_ring_low_pct == 0
+        || config.daemon.append_ring_low_pct >= config.daemon.append_ring_high_pct
+        || config.daemon.append_ring_high_pct > 100
+    {
+        return Err(StateError::ConfigInvalid(
+            "daemon append ring watermarks require 0 < low < high <= 100".to_string(),
         ));
     }
     if config
@@ -1161,6 +1214,10 @@ client_ca = "/ca"
             config.daemon.io_memory_ceiling,
             DEFAULT_IO_MEMORY_CEILING_BYTES
         );
+        assert_eq!(config.daemon.append_staging_mode, AppendStagingMode::Serial);
+        assert_eq!(config.daemon.append_ring_bytes, DEFAULT_APPEND_RING_BYTES);
+        assert_eq!(config.daemon.append_ring_high_pct, 90);
+        assert_eq!(config.daemon.append_ring_low_pct, 25);
         assert!(config.tape_pools.is_empty());
         assert!(config.tape_pool_rules.is_empty());
         assert_eq!(
@@ -1179,6 +1236,47 @@ client_ca = "/ca"
             config.tape_io.position_check_bytes,
             remanence_library::DEFAULT_TAPE_IO_POSITION_CHECK_BYTES
         );
+    }
+
+    #[test]
+    fn overlap_append_config_parses_and_rejects_invalid_bounds() {
+        let configured = with_daemon_lines(
+            "io_memory_ceiling = \"12GiB\"\nappend_staging_mode = \"overlap\"\nappend_ring_bytes = \"4GiB\"\nappend_ring_high_pct = 80\nappend_ring_low_pct = 20\n",
+        );
+        let config = parse_config_toml(&configured).expect("overlap append config");
+        assert_eq!(
+            config.daemon.append_staging_mode,
+            AppendStagingMode::Overlap
+        );
+        assert_eq!(config.daemon.append_ring_bytes, 4 * 1024 * 1024 * 1024);
+        assert_eq!(config.daemon.append_ring_high_pct, 80);
+        assert_eq!(config.daemon.append_ring_low_pct, 20);
+
+        let bad_mode = configured.replace(
+            "append_staging_mode = \"overlap\"",
+            "append_staging_mode = \"auto\"",
+        );
+        assert!(
+            parse_config_toml(&bad_mode).is_err(),
+            "v0.1 must not invent auto policy"
+        );
+
+        let bad_watermarks =
+            configured.replace("append_ring_high_pct = 80", "append_ring_high_pct = 20");
+        let error =
+            parse_config_toml(&bad_watermarks).expect_err("equal append watermarks must reject");
+        assert!(
+            error.to_string().contains("append ring watermarks"),
+            "{error}"
+        );
+
+        let over_ceiling = configured.replace(
+            "append_ring_bytes = \"4GiB\"",
+            "append_ring_bytes = \"16GiB\"",
+        );
+        let config = parse_config_toml(&over_ceiling)
+            .expect("reservation, not serial-mode config parsing, enforces shared ceiling");
+        assert_eq!(config.daemon.append_ring_bytes, 16 * 1024 * 1024 * 1024);
     }
 
     #[test]
