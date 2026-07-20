@@ -64,13 +64,17 @@ message Digest {
 
 // State of a long-running operation.
 enum OperationState {
+  reserved 6;
+  reserved "OPERATION_STATE_UNKNOWN";
   OPERATION_STATE_UNSPECIFIED = 0;
   OPERATION_STATE_QUEUED      = 1;
   OPERATION_STATE_RUNNING     = 2;
   OPERATION_STATE_SUCCEEDED   = 3;
   OPERATION_STATE_FAILED      = 4;
   OPERATION_STATE_CANCELLED   = 5;
-  OPERATION_STATE_UNKNOWN     = 6; // CompletionUnknown per audit semantics
+  // A completed attempt whose durable outcome cannot be established. This is
+  // distinct from UNSPECIFIED, which means no state was supplied.
+  OPERATION_STATE_COMPLETION_UNKNOWN = 7;
 }
 
 message OperationStatus {
@@ -120,8 +124,25 @@ message HealthResponse {
   }
   Status status            = 1;
   // Per-component summary (e.g., "library:7CBAD9CF74" → "healthy").
+  // Deprecated compatibility view; use component_health.
   map<string, string> components = 2;
   string detail            = 3;
+  repeated ComponentHealth component_health = 4;
+}
+
+message ComponentHealth {
+  string component = 1;
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_HEALTHY = 1;
+    STATUS_READ_ONLY = 2;
+    STATUS_DEGRADED = 3;
+    STATUS_FAILED = 4;
+    // `other_status` carries the unrecognized implementation-specific value.
+    STATUS_OTHER = 5;
+  }
+  Status status = 2;
+  string other_status = 3;
 }
 
 message VersionResponse {
@@ -315,6 +336,7 @@ message DriveHealthSnapshot {
   bytes drive_uuid = 2;
   google.protobuf.Timestamp at_utc = 3;
   string trigger = 4;
+  // Deprecated canonical UUID text retained for compatibility.
   string session_id = 5;
   string tape_alert_flags = 6;
   uint64 write_errors_corrected = 7;
@@ -322,6 +344,9 @@ message DriveHealthSnapshot {
   uint64 read_errors_corrected = 9;
   uint64 read_errors_uncorrected = 10;
   string raw_pages = 11;
+  // Canonical 16-byte UUID form shared with Drive.session_id and
+  // DriveAssignment.current_session_id.
+  bytes session_uuid = 12;
 }
 
 message Alarm {
@@ -771,8 +796,13 @@ message EnumerateObjectsRequest {
 
 message GetObjectRequest {
   oneof key {
-    bytes  object_id        = 1; // Remanence UUID
-    bytes  content_sha256   = 2; // by content hash
+    bytes  object_id        = 1; // Remanence daemon-local primary-key UUID
+    // Canonical logical-asset identity lookup, not proof that a particular
+    // physical copy was measured. The server requires exactly one matching
+    // logical object; zero is NOT_FOUND and multiple matches are
+    // FAILED_PRECONDITION. Never use this tautological index lookup as
+    // deletion evidence; re-derive measured copy evidence at action time.
+    bytes  content_sha256   = 2;
     string caller_object_id = 3; // by orchestrator-supplied id
     Digest content_digest   = 4; // algorithm-aware logical-asset identity
   }
@@ -908,12 +938,16 @@ enum CatalogEntryKind {
 }
 
 enum CatalogEntryState {
+  reserved 5;
+  reserved "CATALOG_ENTRY_STATE_UNKNOWN";
   CATALOG_ENTRY_STATE_UNSPECIFIED = 0;
   CATALOG_ENTRY_STATE_COMPLETE = 1;
   CATALOG_ENTRY_STATE_PARTIAL = 2;
   CATALOG_ENTRY_STATE_DAMAGED = 3;
   CATALOG_ENTRY_STATE_UNSUPPORTED = 4;
-  CATALOG_ENTRY_STATE_UNKNOWN = 5;
+  // A scan ran but could not classify the entry state. This is distinct from
+  // UNSPECIFIED, which means no state was supplied.
+  CATALOG_ENTRY_STATE_UNCLASSIFIED = 6;
 }
 
 enum IntegrityBasis {
