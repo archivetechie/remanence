@@ -1224,4 +1224,7 @@ message AuditEntry {
   // Free-form structured detail; CBOR-encoded in the on-disk log, JSON-ified
   // here for client convenience.
   string detail_json           = 8;
+  // Producing crate version plus build-time git description. Absent only for
+  // audit records written before this field was introduced.
+  optional string software_build = 9;
 }
