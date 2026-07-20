@@ -1195,17 +1195,16 @@ impl super::DriveHandle {
             len: len_u32,
         };
 
-        let submitted_at = Instant::now();
+        self.transport.set_timeout_for(TimeoutClass::TapeIo);
+        let ioctl_started = Instant::now();
         if let Some(previous_completion) = self.pipeline_diagnostics.previous_completion {
             self.pipeline_diagnostics.gap_us.record(duration_us(
-                submitted_at.duration_since(previous_completion),
+                ioctl_started.duration_since(previous_completion),
             ));
         }
         self.pipeline_diagnostics
             .first_submit
-            .get_or_insert(submitted_at);
-        self.transport.set_timeout_for(TimeoutClass::TapeIo);
-        let ioctl_started = Instant::now();
+            .get_or_insert(ioctl_started);
         let result = self.transport.execute_out(cdb, buf);
         let completed_at = Instant::now();
         self.pipeline_diagnostics
@@ -1228,12 +1227,14 @@ impl super::DriveHandle {
                 );
                 if self.pipeline_tripwire_due() {
                     if let Err(cause) = self.run_pipelined_position_tripwire(position_after) {
+                        self.record_pipeline_accounting(completed_at);
                         return Err(TapeIoError::GoodWriteTripwire {
                             outcome,
                             cause: Box::new(cause),
                         });
                     }
                 }
+                self.record_pipeline_accounting(completed_at);
                 Ok(outcome)
             }
             Err(ScsiError::CheckCondition {
@@ -1345,12 +1346,14 @@ impl super::DriveHandle {
                     self.finish_tape_recovered(operation, ioctl_started.elapsed(), sense);
                     if self.pipeline_tripwire_due() {
                         if let Err(cause) = self.run_pipelined_position_tripwire(position_after) {
+                            self.record_pipeline_accounting(completed_at);
                             return Err(TapeIoError::GoodWriteTripwire {
                                 outcome,
                                 cause: Box::new(cause),
                             });
                         }
                     }
+                    self.record_pipeline_accounting(completed_at);
                     Ok(outcome)
                 } else {
                     let mapped = match fixed_records_transferred_from_sense(&sense, records) {
@@ -1429,17 +1432,16 @@ impl super::DriveHandle {
         let cdb = remanence_scsi::read_write::build_read_fixed_cdb(records);
 
         self.fire_tape_started(op, &cdb);
-        let submitted_at = Instant::now();
+        self.transport.set_timeout_for(TimeoutClass::TapeIo);
+        let started = Instant::now();
         if let Some(previous_completion) = self.pipeline_diagnostics.previous_completion {
-            self.pipeline_diagnostics.gap_us.record(duration_us(
-                submitted_at.duration_since(previous_completion),
-            ));
+            self.pipeline_diagnostics
+                .gap_us
+                .record(duration_us(started.duration_since(previous_completion)));
         }
         self.pipeline_diagnostics
             .first_submit
-            .get_or_insert(submitted_at);
-        self.transport.set_timeout_for(TimeoutClass::TapeIo);
-        let started = Instant::now();
+            .get_or_insert(started);
         let result = self
             .transport
             .execute_in(&cdb, &mut buf[..transfer_len as usize]);
@@ -1462,12 +1464,14 @@ impl super::DriveHandle {
                         }
                     };
                 self.finish_tape_success(op, started.elapsed());
-                Ok(ReadBatchOutcome::from_position_evidence(
+                let outcome = ReadBatchOutcome::from_position_evidence(
                     records,
                     transfer_len,
                     false,
                     position_evidence,
-                ))
+                );
+                self.record_pipeline_accounting(completed_at);
+                Ok(outcome)
             }
             Err(ScsiError::CheckCondition {
                 sense,
@@ -1520,12 +1524,14 @@ impl super::DriveHandle {
                             }
                         };
                     self.finish_tape_success(op, started.elapsed());
-                    return Ok(ReadBatchOutcome::from_position_evidence(
+                    let outcome = ReadBatchOutcome::from_position_evidence(
                         records_read,
                         bytes_read,
                         true,
                         position_evidence,
-                    ));
+                    );
+                    self.record_pipeline_accounting(completed_at);
+                    return Ok(outcome);
                 }
                 if sense_is_current_recovered_without_terminal_flags(&sense) {
                     if valid_fixed_residual_from_sense(&sense).is_some_and(|residual| residual != 0)
@@ -1557,12 +1563,14 @@ impl super::DriveHandle {
                         }
                     };
                     self.finish_tape_recovered(op, started.elapsed(), sense);
-                    return Ok(ReadBatchOutcome::from_position_evidence(
+                    let outcome = ReadBatchOutcome::from_position_evidence(
                         records_read,
                         bytes_read,
                         false,
                         position_evidence,
-                    ));
+                    );
+                    self.record_pipeline_accounting(completed_at);
+                    return Ok(outcome);
                 }
                 let mapped = map_scsi(ScsiError::CheckCondition {
                     sense,
@@ -2396,6 +2404,12 @@ impl super::DriveHandle {
             .saturating_add(u64::from(bytes));
     }
 
+    fn record_pipeline_accounting(&mut self, completed_at: Instant) {
+        self.pipeline_diagnostics
+            .accounting_us
+            .record(duration_us(completed_at.elapsed()));
+    }
+
     /// Pipeline-ordered READ POSITION whose error completion is deferred until
     /// the caller persists the durable tape-I/O fence.
     pub fn position_pipelined(&mut self) -> Result<TapePosition, TapeIoError> {
@@ -2466,9 +2480,16 @@ impl super::DriveHandle {
             gap_p50_us: self.pipeline_diagnostics.gap_us.percentile(50, 100),
             gap_p95_us: self.pipeline_diagnostics.gap_us.percentile(95, 100),
             gap_max_us: self.pipeline_diagnostics.gap_us.max,
+            gap_mean_us: self.pipeline_diagnostics.gap_us.mean(),
             ioctl_p50_us: self.pipeline_diagnostics.ioctl_us.percentile(50, 100),
             ioctl_p95_us: self.pipeline_diagnostics.ioctl_us.percentile(95, 100),
             ioctl_max_us: self.pipeline_diagnostics.ioctl_us.max,
+            ioctl_mean_us: self.pipeline_diagnostics.ioctl_us.mean(),
+            accounting_samples: self.pipeline_diagnostics.accounting_us.samples,
+            accounting_p50_us: self.pipeline_diagnostics.accounting_us.percentile(50, 100),
+            accounting_p95_us: self.pipeline_diagnostics.accounting_us.percentile(95, 100),
+            accounting_max_us: self.pipeline_diagnostics.accounting_us.max,
+            accounting_mean_us: self.pipeline_diagnostics.accounting_us.mean(),
             cadence_us: elapsed_us.checked_div(commands.max(1)).unwrap_or(0),
             effective_feed_bytes_per_second: if elapsed_us == 0 {
                 0

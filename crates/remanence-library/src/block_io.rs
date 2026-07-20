@@ -145,6 +145,9 @@ pub trait BlockSink {
         PipelinedWriteDiagnostics::default()
     }
 
+    /// Publish the final diagnostic snapshot after the transfer hot loop.
+    fn publish_pipelined_write_diagnostics(&mut self) {}
+
     /// Emit a pre-ioctl intent marker and open the coalesced window span.
     fn begin_pipelined_write_window(
         &mut self,

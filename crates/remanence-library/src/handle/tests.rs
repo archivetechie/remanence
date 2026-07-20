@@ -3562,6 +3562,18 @@ fn fixed_read_cadence_histograms_and_batch_effectiveness_are_populated() {
     assert_eq!(diagnostics.good_commands, 2);
     assert_eq!(diagnostics.good_records, 8);
     assert_eq!(diagnostics.good_bytes, 32);
+    assert_eq!(diagnostics.accounting_samples, 2);
+}
+
+#[test]
+fn pipeline_histogram_keeps_exact_mean_beside_bucketed_percentiles() {
+    let mut histogram = PipelineHistogram::default();
+    histogram.record(11);
+    histogram.record(39);
+
+    assert_eq!(histogram.mean(), 25);
+    assert_eq!(histogram.percentile(50, 100), 25);
+    assert_eq!(histogram.percentile(95, 100), 50);
 }
 
 #[test]

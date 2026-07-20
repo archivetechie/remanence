@@ -414,12 +414,26 @@ pub struct PipelinedWriteDiagnostics {
     pub gap_p95_us: u64,
     /// Maximum completion-to-next-submit gap in microseconds.
     pub gap_max_us: u64,
+    /// Mean completion-to-next-submit gap in microseconds.
+    pub gap_mean_us: u64,
     /// Median SG_IO duration in microseconds.
     pub ioctl_p50_us: u64,
     /// 95th-percentile SG_IO duration in microseconds.
     pub ioctl_p95_us: u64,
     /// Maximum SG_IO duration in microseconds.
     pub ioctl_max_us: u64,
+    /// Mean SG_IO duration in microseconds.
+    pub ioctl_mean_us: u64,
+    /// Clean commands with a post-ioctl accounting sample.
+    pub accounting_samples: u64,
+    /// Median time from SG_IO completion through cursor/accounting work.
+    pub accounting_p50_us: u64,
+    /// 95th-percentile time from SG_IO completion through cursor/accounting work.
+    pub accounting_p95_us: u64,
+    /// Maximum time from SG_IO completion through cursor/accounting work.
+    pub accounting_max_us: u64,
+    /// Mean time from SG_IO completion through cursor/accounting work.
+    pub accounting_mean_us: u64,
     /// Mean submit-to-submit cadence in microseconds.
     pub cadence_us: u64,
     /// Effective bytes fed per second over the observed command span.
