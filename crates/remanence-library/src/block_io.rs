@@ -145,6 +145,9 @@ pub trait BlockSink {
         PipelinedWriteDiagnostics::default()
     }
 
+    /// Reset hot-submitter telemetry before the first command of one transfer.
+    fn reset_pipelined_write_diagnostics(&mut self) {}
+
     /// Publish the final diagnostic snapshot after the transfer hot loop.
     fn publish_pipelined_write_diagnostics(&mut self) {}
 
@@ -423,6 +426,9 @@ impl BlockSink for DriveHandleSink<'_> {
     }
     fn pipelined_write_diagnostics(&self) -> PipelinedWriteDiagnostics {
         self.0.pipelined_write_diagnostics()
+    }
+    fn reset_pipelined_write_diagnostics(&mut self) {
+        self.0.reset_pipelined_diagnostics();
     }
     fn begin_pipelined_write_window(
         &mut self,
