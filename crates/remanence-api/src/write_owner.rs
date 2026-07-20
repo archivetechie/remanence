@@ -2966,6 +2966,14 @@ fn fail_library_operation(
     error_summary: &str,
     progress: &[(&str, &str)],
 ) {
+    tracing::error!(
+        target: "remanence_library_operation",
+        operation_id = %handle.op_id_uuid(),
+        operation_kind = %handle.operation_kind(),
+        library_serial,
+        error_summary,
+        "library operation failed"
+    );
     let mut detail = BTreeMap::new();
     detail.insert(
         "error_summary".to_string(),
@@ -3190,38 +3198,77 @@ fn run_cleaning_sequence(
     ) {
         tracing::warn!("failed to append cleaning fence audit: {err}");
     }
-    let tape_prefixes = &clean_cfg.voltag_prefixes;
-    let mut eligible_carts = library
-        .library()
-        .slots
+    let tape_prefixes = clean_cfg
+        .voltag_prefixes
         .iter()
-        .filter_map(|slot| {
-            let voltag = slot.cartridge.as_ref()?;
-            if !tape_prefixes
-                .iter()
-                .any(|prefix| voltag.starts_with(prefix))
-            {
-                return None;
-            }
-            let tape = index.get_tape_by_voltag(voltag).ok().flatten()?;
-            let cleaning_state = index
-                .get_tape_cleaning_state(tape.tape_uuid.as_slice())
-                .ok()
-                .flatten()
-                .flatten();
-            if tape.kind != "cleaning" {
-                return None;
-            }
-            match cleaning_state.as_deref() {
-                None | Some("unverified") | Some("ok") => {
-                    Some((slot.element_address, voltag.clone(), tape))
-                }
-                Some("expired") | Some("rejected") => None,
-                _ => None,
-            }
-        })
+        .map(|prefix| prefix.trim())
+        .filter(|prefix| !prefix.is_empty())
         .collect::<Vec<_>>();
+    let mut prefix_matches = 0_usize;
+    let mut rejected_carts = Vec::new();
+    let mut eligible_carts = Vec::new();
+    for slot in &library.library().slots {
+        let Some(voltag) = slot.cartridge.as_ref() else {
+            continue;
+        };
+        if !tape_prefixes
+            .iter()
+            .any(|prefix| voltag.starts_with(prefix))
+        {
+            continue;
+        }
+        prefix_matches = prefix_matches.saturating_add(1);
+        let tape = match index.ensure_cleaning_cartridge(voltag) {
+            Ok(tape) => tape,
+            Err(err) => {
+                rejected_carts.push(format!(
+                    "slot=0x{:04x} voltag={} registration={err}",
+                    slot.element_address, voltag
+                ));
+                continue;
+            }
+        };
+        let cleaning_state = match index.get_tape_cleaning_state(tape.tape_uuid.as_slice()) {
+            Ok(state) => state.flatten(),
+            Err(err) => {
+                rejected_carts.push(format!(
+                    "slot=0x{:04x} voltag={} state-query={err}",
+                    slot.element_address, voltag
+                ));
+                continue;
+            }
+        };
+        match cleaning_state.as_deref() {
+            None | Some("unverified") | Some("ok") => {
+                eligible_carts.push((slot.element_address, voltag.clone(), tape));
+            }
+            Some(state) => rejected_carts.push(format!(
+                "slot=0x{:04x} voltag={} cleaning_state={state}",
+                slot.element_address, voltag
+            )),
+        }
+    }
     if eligible_carts.is_empty() {
+        let rejection_summary = if rejected_carts.is_empty() {
+            "none".to_string()
+        } else {
+            rejected_carts.join("; ")
+        };
+        let reason = format!(
+            "no eligible cleaning cartridge in library {library_serial}: configured prefixes=[{}], inventory prefix matches={prefix_matches}, rejected=[{rejection_summary}]",
+            tape_prefixes.join(",")
+        );
+        tracing::error!(
+            target: "remanence_cleaning",
+            library_serial,
+            drive_uuid = %crate::bytes_to_hex(drive_uuid),
+            reason,
+            "cleaning cartridge selection failed"
+        );
+        let detail = format!(
+            "{{\"reason\":\"{}\",\"recovery_step\":\"selecting\"}}",
+            json_escape_text(&reason)
+        );
         let _ = index.clear_alarm(format!("cleaning-needs-operator:{}", run.run_id).as_str());
         let _ = index.set_drive_fenced(drive_uuid, false);
         let _ = record_library_event(
@@ -3245,16 +3292,10 @@ fn run_cleaning_sequence(
             format!("no-cln-cart:{library_serial}").as_str(),
             "no-cln-cart",
             "critical",
-            Some("{\"recovery_step\":\"selecting\"}"),
+            Some(detail.as_str()),
         );
-        let _ = index.terminalize_clean_run(
-            run.run_id.as_str(),
-            "failed",
-            Some("{\"reason\":\"no-cln-cart\"}"),
-        );
-        return Err(Status::failed_precondition(
-            "no eligible cleaning cartridge is available",
-        ));
+        let _ = index.terminalize_clean_run(run.run_id.as_str(), "failed", Some(detail.as_str()));
+        return Err(Status::failed_precondition(reason));
     }
     eligible_carts.sort_by_key(|(slot, _, _)| *slot);
     let (slot_address, voltag, tape_row) = eligible_carts.remove(0);
@@ -7030,7 +7071,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_eject_cleaning_cart_is_not_credited() {
+    fn inventory_only_cleaning_cart_is_recognized_before_fast_eject() {
         let world = std::sync::Arc::new(std::sync::Mutex::new(VirtualWorld::single_drive(
             "LIB-FAST", 0x0100, "DRV-FAST", 0x0400, 1,
         )));
@@ -7038,7 +7079,7 @@ mod tests {
             let mut world = world.lock().expect("world lock");
             world.put_tape_in_slot(
                 0x0400,
-                "CLN-FAST",
+                "CLNU01L9",
                 VirtualTape {
                     cleaning_cart: true,
                     cleaning_cart_expired: true,
@@ -7068,24 +7109,6 @@ mod tests {
             })
             .expect("observe drive")
             .drive_uuid;
-        let cln_uuid = [0x93; 16];
-        index
-            .provision_tape(ProvisionTapeInput {
-                tape_uuid: cln_uuid,
-                voltag: "CLN-FAST".to_string(),
-                block_size: 4096,
-                parity: ParityConfig::None,
-                force: false,
-            })
-            .expect("provision cleaning tape");
-        index
-            .set_tape_kind(&cln_uuid, "cleaning")
-            .expect("mark cleaning cart")
-            .expect("cleaning tape row");
-        index
-            .set_tape_cleaning_state(&cln_uuid, "ok")
-            .expect("mark cleaning cart state")
-            .expect("cleaning tape row");
         let cfg = test_write_owner_config(
             index_path.clone(),
             temp.path().join("audit"),
@@ -7100,9 +7123,18 @@ mod tests {
             run_cleaning_sequence(&mut index, &cfg, &handle, &mut library, &drive_uuid, "now")
                 .expect_err("fast-eject cart must be rejected");
         assert_ne!(err.code(), tonic::Code::Ok);
+        assert!(
+            !err.message().contains("no eligible cleaning cartridge"),
+            "inventory-only cart must reach the physical cleaning path: {err}"
+        );
+        let cart = index
+            .get_tape_by_voltag("CLNU01L9")
+            .expect("cleaning cart lookup")
+            .expect("inventory cart registered");
+        assert_eq!(cart.kind, "cleaning");
         assert_eq!(
             index
-                .get_tape_cleaning_state(cln_uuid.as_slice())
+                .get_tape_cleaning_state(cart.tape_uuid.as_slice())
                 .expect("cleaning state lookup")
                 .flatten()
                 .as_deref(),
