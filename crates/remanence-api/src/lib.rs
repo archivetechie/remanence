@@ -5014,7 +5014,10 @@ fn object_copy_to_proto(copy: &NativeObjectCopyRecord) -> pb::ObjectCopy {
     }
 }
 
-fn catalog_digest_to_proto(algorithm: Option<String>, value: Option<Vec<u8>>) -> Option<pb::Digest> {
+fn catalog_digest_to_proto(
+    algorithm: Option<String>,
+    value: Option<Vec<u8>>,
+) -> Option<pb::Digest> {
     algorithm
         .zip(value)
         .map(|(algorithm, value)| pb::Digest { algorithm, value })
@@ -5950,9 +5953,7 @@ mod tests {
                     remanence_state::DIGEST_ALGORITHM_SHA256.to_string(),
                 ),
                 stored_digest: Some(vec![0x33; 32]),
-                stored_digest_algorithm: Some(
-                    remanence_state::DIGEST_ALGORITHM_SHA256.to_string(),
-                ),
+                stored_digest_algorithm: Some(remanence_state::DIGEST_ALGORITHM_SHA256.to_string()),
             }],
         };
 
@@ -5973,11 +5974,15 @@ mod tests {
         assert!(proto.metadata_digest.is_none());
         let copy = proto.copies.first().expect("copy");
         assert_eq!(
-            copy.plaintext_digest.as_ref().map(|digest| digest.algorithm.as_str()),
+            copy.plaintext_digest
+                .as_ref()
+                .map(|digest| digest.algorithm.as_str()),
             Some("sha256")
         );
         assert_eq!(
-            copy.stored_digest.as_ref().map(|digest| digest.value.as_slice()),
+            copy.stored_digest
+                .as_ref()
+                .map(|digest| digest.value.as_slice()),
             Some(&[0x33; 32][..])
         );
     }
@@ -11038,11 +11043,15 @@ BCw3Wyv2UWY=
         assert_eq!(file.size_bytes, 17);
         assert_eq!(file.file_sha256, vec![7u8; 32]);
         assert_eq!(
-            file.file_digest.as_ref().map(|digest| digest.algorithm.as_str()),
+            file.file_digest
+                .as_ref()
+                .map(|digest| digest.algorithm.as_str()),
             Some("sha256")
         );
         assert_eq!(
-            file.file_digest.as_ref().map(|digest| digest.value.as_slice()),
+            file.file_digest
+                .as_ref()
+                .map(|digest| digest.value.as_slice()),
             Some(&[7u8; 32][..])
         );
         assert_eq!(file.first_chunk_body_lba, 2);

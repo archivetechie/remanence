@@ -7160,7 +7160,9 @@ fn validate_catalog_digest_pair(
 ) -> Result<(), StateError> {
     match (value, algorithm) {
         (None, None) => Ok(()),
-        (Some(value), Some(DIGEST_ALGORITHM_SHA256)) => validate_optional_sha256(Some(value), field),
+        (Some(value), Some(DIGEST_ALGORITHM_SHA256)) => {
+            validate_optional_sha256(Some(value), field)
+        }
         (Some(_), Some("")) => Err(StateError::IndexCorrupt(format!(
             "{field} has an empty digest algorithm"
         ))),
@@ -7408,8 +7410,7 @@ fn catalog_unit_from_row(row: &rusqlite::Row<'_>) -> Result<CatalogUnitRecord, S
 
 fn native_object_from_row(row: &rusqlite::Row<'_>) -> Result<NativeObjectRecord, StateError> {
     let content_hash: Option<Vec<u8>> = row_get(row, 4, "objects.content_hash")?;
-    let content_hash_algorithm: Option<String> =
-        row_get(row, 5, "objects.content_hash_algorithm")?;
+    let content_hash_algorithm: Option<String> = row_get(row, 5, "objects.content_hash_algorithm")?;
     validate_catalog_digest_pair(
         content_hash.as_deref(),
         content_hash_algorithm.as_deref(),
@@ -7444,8 +7445,7 @@ fn native_object_from_row(row: &rusqlite::Row<'_>) -> Result<NativeObjectRecord,
 fn native_object_copy_from_row(
     row: &rusqlite::Row<'_>,
 ) -> Result<NativeObjectCopyRecord, StateError> {
-    let plaintext_digest: Option<Vec<u8>> =
-        row_get(row, 11, "object_copies.plaintext_digest")?;
+    let plaintext_digest: Option<Vec<u8>> = row_get(row, 11, "object_copies.plaintext_digest")?;
     let plaintext_digest_algorithm: Option<String> =
         row_get(row, 12, "object_copies.plaintext_digest_algorithm")?;
     validate_catalog_digest_pair(
@@ -7503,8 +7503,7 @@ fn native_object_file_from_row(
     row: &rusqlite::Row<'_>,
 ) -> Result<NativeObjectFileRecord, StateError> {
     let file_sha256: Vec<u8> = row_get(row, 4, "object_files.file_sha256")?;
-    let file_digest_algorithm: String =
-        row_get(row, 9, "object_files.file_digest_algorithm")?;
+    let file_digest_algorithm: String = row_get(row, 9, "object_files.file_digest_algorithm")?;
     validate_catalog_digest_pair(
         Some(file_sha256.as_slice()),
         Some(file_digest_algorithm.as_str()),
@@ -7546,23 +7545,16 @@ fn native_object_copy_from_join_row(
     };
     let plaintext_digest: Option<Vec<u8>> =
         row_get(row, offset + 11, "object_copies.plaintext_digest")?;
-    let plaintext_digest_algorithm: Option<String> = row_get(
-        row,
-        offset + 12,
-        "object_copies.plaintext_digest_algorithm",
-    )?;
+    let plaintext_digest_algorithm: Option<String> =
+        row_get(row, offset + 12, "object_copies.plaintext_digest_algorithm")?;
     validate_catalog_digest_pair(
         plaintext_digest.as_deref(),
         plaintext_digest_algorithm.as_deref(),
         "object_copies.plaintext_digest",
     )?;
-    let stored_digest: Option<Vec<u8>> =
-        row_get(row, offset + 13, "object_copies.stored_digest")?;
-    let stored_digest_algorithm: Option<String> = row_get(
-        row,
-        offset + 14,
-        "object_copies.stored_digest_algorithm",
-    )?;
+    let stored_digest: Option<Vec<u8>> = row_get(row, offset + 13, "object_copies.stored_digest")?;
+    let stored_digest_algorithm: Option<String> =
+        row_get(row, offset + 14, "object_copies.stored_digest_algorithm")?;
     validate_catalog_digest_pair(
         stored_digest.as_deref(),
         stored_digest_algorithm.as_deref(),
@@ -8186,11 +8178,8 @@ fn raise_alarm_tx(
 fn tape_file_from_row(row: &rusqlite::Row<'_>) -> Result<TapeFileRecord, StateError> {
     let canonical_metadata_hash: Option<Vec<u8>> =
         row_get(row, 5, "tape_files.canonical_metadata_hash")?;
-    let canonical_metadata_hash_algorithm: Option<String> = row_get(
-        row,
-        6,
-        "tape_files.canonical_metadata_hash_algorithm",
-    )?;
+    let canonical_metadata_hash_algorithm: Option<String> =
+        row_get(row, 6, "tape_files.canonical_metadata_hash_algorithm")?;
     validate_catalog_digest_pair(
         canonical_metadata_hash.as_deref(),
         canonical_metadata_hash_algorithm.as_deref(),
