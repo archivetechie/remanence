@@ -104,6 +104,7 @@ const PIPELINE_HISTOGRAM_UPPER_US: [u64; 12] = [
 struct PipelineHistogram {
     buckets: [u64; PIPELINE_HISTOGRAM_UPPER_US.len()],
     samples: u64,
+    sum_us: u64,
     max: u64,
 }
 
@@ -115,7 +116,12 @@ impl PipelineHistogram {
             .unwrap_or(PIPELINE_HISTOGRAM_UPPER_US.len() - 1);
         self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
         self.samples = self.samples.saturating_add(1);
+        self.sum_us = self.sum_us.saturating_add(sample_us);
         self.max = self.max.max(sample_us);
+    }
+
+    fn mean(&self) -> u64 {
+        self.sum_us.checked_div(self.samples.max(1)).unwrap_or(0)
     }
 
     fn percentile(&self, numerator: u64, denominator: u64) -> u64 {
@@ -142,6 +148,7 @@ impl PipelineHistogram {
 struct PipelineDiagnostics {
     gap_us: PipelineHistogram,
     ioctl_us: PipelineHistogram,
+    accounting_us: PipelineHistogram,
     good_commands: u64,
     good_records: u64,
     good_bytes: u64,

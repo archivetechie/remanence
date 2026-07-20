@@ -1148,12 +1148,21 @@ struct BlockSinkStats {
     effective_batch_blocks: u32,
     position_check_bytes: u64,
     staging_ring_buffers: u32,
+    gap_samples: u64,
     gap_p50_us: u64,
     gap_p95_us: u64,
     gap_max_us: u64,
+    gap_mean_us: u64,
+    ioctl_samples: u64,
     ioctl_p50_us: u64,
     ioctl_p95_us: u64,
     ioctl_max_us: u64,
+    ioctl_mean_us: u64,
+    accounting_samples: u64,
+    accounting_p50_us: u64,
+    accounting_p95_us: u64,
+    accounting_max_us: u64,
+    accounting_mean_us: u64,
     cadence_us: u64,
     effective_feed_bytes_per_second: u64,
 }
@@ -1230,11 +1239,82 @@ struct RingAccounting {
     dropped: AtomicU32,
 }
 
+const HOT_PHASE_HISTOGRAM_UPPER_US: [u64; 12] = [
+    10,
+    25,
+    50,
+    100,
+    250,
+    500,
+    1_000,
+    2_500,
+    5_000,
+    10_000,
+    50_000,
+    u64::MAX,
+];
+
+#[derive(Default)]
+struct HotPhaseHistogram {
+    buckets: [u64; HOT_PHASE_HISTOGRAM_UPPER_US.len()],
+    samples: u64,
+    sum_us: u64,
+    max_us: u64,
+}
+
+impl HotPhaseHistogram {
+    fn record(&mut self, duration: Duration) {
+        let sample_us = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+        let bucket = HOT_PHASE_HISTOGRAM_UPPER_US
+            .iter()
+            .position(|upper| sample_us <= *upper)
+            .unwrap_or(HOT_PHASE_HISTOGRAM_UPPER_US.len() - 1);
+        self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
+        self.samples = self.samples.saturating_add(1);
+        self.sum_us = self.sum_us.saturating_add(sample_us);
+        self.max_us = self.max_us.max(sample_us);
+    }
+
+    fn percentile(&self, numerator: u64, denominator: u64) -> u64 {
+        if self.samples == 0 {
+            return 0;
+        }
+        let wanted = self
+            .samples
+            .saturating_mul(numerator)
+            .saturating_add(denominator - 1)
+            / denominator;
+        let mut seen = 0u64;
+        for (count, upper) in self.buckets.iter().zip(HOT_PHASE_HISTOGRAM_UPPER_US) {
+            seen = seen.saturating_add(*count);
+            if seen >= wanted {
+                return if upper == u64::MAX {
+                    self.max_us
+                } else {
+                    upper
+                };
+            }
+        }
+        self.max_us
+    }
+
+    fn mean(&self) -> u64 {
+        self.sum_us.checked_div(self.samples.max(1)).unwrap_or(0)
+    }
+}
+
+#[derive(Default)]
+struct StagingPhaseDiagnostics {
+    wait_us: HotPhaseHistogram,
+    refill_us: HotPhaseHistogram,
+}
+
 struct PageAlignedBuffer {
     storage: Vec<u8>,
     start: usize,
     capacity: usize,
     used: usize,
+    refill_elapsed: Duration,
     accounting: Arc<RingAccounting>,
 }
 
@@ -1261,6 +1341,7 @@ impl PageAlignedBuffer {
             start,
             capacity,
             used: 0,
+            refill_elapsed: Duration::ZERO,
             accounting,
         })
     }
@@ -1291,6 +1372,7 @@ impl PageAlignedBuffer {
 
     fn reset(&mut self) {
         self.used = 0;
+        self.refill_elapsed = Duration::ZERO;
     }
 }
 
@@ -1390,6 +1472,7 @@ struct StagedBlockSink {
     current: Option<PageAlignedBuffer>,
     window: PipelinedWindow,
     cursor: Option<TapePosition>,
+    diagnostics: StagingPhaseDiagnostics,
 }
 
 impl<'a, S: BlockSink + ?Sized> ObjectDigestBlockSink<'a, S> {
@@ -1469,6 +1552,7 @@ impl StagedBlockSink {
             current: None,
             window: PipelinedWindow::new(),
             cursor: None,
+            diagnostics: StagingPhaseDiagnostics::default(),
         }
     }
 
@@ -1487,7 +1571,10 @@ impl StagedBlockSink {
             return Ok(());
         }
         self.check_poison()?;
-        let buffer = self.free_rx.recv().map_err(|_| {
+        let wait_started = Instant::now();
+        let received = self.free_rx.recv();
+        self.diagnostics.wait_us.record(wait_started.elapsed());
+        let buffer = received.map_err(|_| {
             TapeIoError::OperationFailed("pipelined staging ring was closed".into())
         })?;
         self.current = Some(buffer);
@@ -1502,6 +1589,7 @@ impl StagedBlockSink {
             self.current = Some(buffer);
             return Ok(());
         }
+        self.diagnostics.refill_us.record(buffer.refill_elapsed);
         let block_size_bytes = u32::try_from(self.caps.block_size)
             .map_err(|_| TapeIoError::OperationFailed("batch block size exceeds u32".into()))?;
         let records = records_in_staged_batch(buffer.bytes(), block_size_bytes)?;
@@ -1581,23 +1669,27 @@ impl StagedBlockSink {
         Ok(position)
     }
 
-    fn finish(mut self) -> Result<(), TapeIoError> {
-        self.flush_pending()?;
-        self.request(|reply| PipelinedSinkCommand::Barrier { reply })
-            .map(|_| ())
+    fn finish(mut self) -> (Result<(), TapeIoError>, StagingPhaseDiagnostics) {
+        let result = self.flush_pending().and_then(|()| {
+            self.request(|reply| PipelinedSinkCommand::Barrier { reply })
+                .map(|_| ())
+        });
+        (result, self.diagnostics)
     }
 
-    fn abort(self, message: String) {
+    fn abort(self, message: String) -> StagingPhaseDiagnostics {
         set_staged_poison(&self.poison, message);
         let StagedBlockSink {
             tx,
             free_rx,
             submitter_done_rx,
+            diagnostics,
             ..
         } = self;
         drop(tx);
         let _free_rx = free_rx;
         let _ = submitter_done_rx.recv();
+        diagnostics
     }
 }
 
@@ -1611,10 +1703,14 @@ impl BlockSink for StagedBlockSink {
             )));
         }
         self.acquire_buffer()?;
+        let refill_started = Instant::now();
+        let append_result = self.current.as_mut().expect("buffer acquired").append(buf);
+        let refill_elapsed = refill_started.elapsed();
         self.current
             .as_mut()
-            .expect("buffer acquired")
-            .append(buf)?;
+            .expect("buffer remains acquired")
+            .refill_elapsed += refill_elapsed;
+        append_result?;
         let position = self.advance_cursor(1)?;
         if self
             .current
@@ -1819,13 +1915,16 @@ where
             );
             let result = producer(&mut staged);
             match result {
-                Ok(value) => staged
-                    .finish()
-                    .map(|()| value)
-                    .map_err(PoolWriteError::from),
+                Ok(value) => {
+                    let (finish_result, diagnostics) = staged.finish();
+                    (
+                        finish_result.map(|()| value).map_err(PoolWriteError::from),
+                        diagnostics,
+                    )
+                }
                 Err(err) => {
-                    staged.abort(err.to_string());
-                    Err(err)
+                    let diagnostics = staged.abort(err.to_string());
+                    (Err(err), diagnostics)
                 }
             }
         });
@@ -1833,11 +1932,16 @@ where
         let submitter_result =
             drain_pipelined_transfer(inner, submit_rx, free_tx, &poison, &mut on_safety_error);
         let _ = submitter_done_tx.send(());
-        let producer_result = producer_handle.join().unwrap_or_else(|_| {
-            Err(PoolWriteError::InvalidInput(
-                "pipelined staging producer thread panicked".into(),
-            ))
-        });
+        let (producer_result, staging_diagnostics) = match producer_handle.join() {
+            Ok(result) => result,
+            Err(_) => (
+                Err(PoolWriteError::InvalidInput(
+                    "pipelined staging producer thread panicked".into(),
+                )),
+                StagingPhaseDiagnostics::default(),
+            ),
+        };
+        log_staging_phase_diagnostics(&staging_diagnostics);
         match submitter_result {
             Ok(()) => match producer_result {
                 Ok(value) => Ok(value),
@@ -1856,6 +1960,7 @@ where
             Err(err) => Err(err),
         }
     });
+    inner.publish_pipelined_write_diagnostics();
     let allocated = accounting.allocated.load(Ordering::Relaxed);
     let dropped = accounting.dropped.load(Ordering::Relaxed);
     if allocated != dropped {
@@ -1884,6 +1989,24 @@ where
         };
     }
     result
+}
+
+fn log_staging_phase_diagnostics(diagnostics: &StagingPhaseDiagnostics) {
+    tracing::info!(
+        target: "remanence_write_diag",
+        phase = "staging_subphases",
+        staging_wait_samples = diagnostics.wait_us.samples,
+        staging_wait_p50_us = diagnostics.wait_us.percentile(50, 100),
+        staging_wait_p95_us = diagnostics.wait_us.percentile(95, 100),
+        staging_wait_max_us = diagnostics.wait_us.max_us,
+        staging_wait_mean_us = diagnostics.wait_us.mean(),
+        refill_samples = diagnostics.refill_us.samples,
+        refill_p50_us = diagnostics.refill_us.percentile(50, 100),
+        refill_p95_us = diagnostics.refill_us.percentile(95, 100),
+        refill_max_us = diagnostics.refill_us.max_us,
+        refill_mean_us = diagnostics.refill_us.mean(),
+        "remanence_write_diag",
+    );
 }
 
 fn drain_pipelined_transfer<S: BlockSink + ?Sized>(
@@ -2237,12 +2360,21 @@ impl<'a, S: BlockSink + ?Sized> CountingBlockSink<'a, S> {
     fn stats(&self) -> BlockSinkStats {
         let mut stats = self.stats;
         let diagnostics = self.inner.pipelined_write_diagnostics();
+        stats.gap_samples = diagnostics.gap_samples;
         stats.gap_p50_us = diagnostics.gap_p50_us;
         stats.gap_p95_us = diagnostics.gap_p95_us;
         stats.gap_max_us = diagnostics.gap_max_us;
+        stats.gap_mean_us = diagnostics.gap_mean_us;
+        stats.ioctl_samples = diagnostics.ioctl_samples;
         stats.ioctl_p50_us = diagnostics.ioctl_p50_us;
         stats.ioctl_p95_us = diagnostics.ioctl_p95_us;
         stats.ioctl_max_us = diagnostics.ioctl_max_us;
+        stats.ioctl_mean_us = diagnostics.ioctl_mean_us;
+        stats.accounting_samples = diagnostics.accounting_samples;
+        stats.accounting_p50_us = diagnostics.accounting_p50_us;
+        stats.accounting_p95_us = diagnostics.accounting_p95_us;
+        stats.accounting_max_us = diagnostics.accounting_max_us;
+        stats.accounting_mean_us = diagnostics.accounting_mean_us;
         stats.cadence_us = diagnostics.cadence_us;
         stats.effective_feed_bytes_per_second = diagnostics.effective_feed_bytes_per_second;
         stats
@@ -2274,10 +2406,6 @@ impl<'a> BlockSink for LiveCounterBlockSink<'a> {
         block_size_bytes: u32,
         cdb: &[u8],
     ) -> Result<WriteBatchOutcome, TapeIoError> {
-        self.live_write_counter.configure_tape_io(
-            self.inner.staging_ring_buffers(),
-            self.inner.write_batch_blocks(block_size_bytes),
-        );
         let result = self
             .inner
             .write_block_batch_pipelined(buf, block_size_bytes, cdb);
@@ -2290,8 +2418,6 @@ impl<'a> BlockSink for LiveCounterBlockSink<'a> {
                 .record_write_bytes(u64::from(outcome.bytes_written)),
             Err(_) => {}
         }
-        self.live_write_counter
-            .record_tape_io_diagnostics(self.inner.pipelined_write_diagnostics());
         result
     }
 
@@ -2309,6 +2435,11 @@ impl<'a> BlockSink for LiveCounterBlockSink<'a> {
 
     fn pipelined_write_diagnostics(&self) -> PipelinedWriteDiagnostics {
         self.inner.pipelined_write_diagnostics()
+    }
+
+    fn publish_pipelined_write_diagnostics(&mut self) {
+        self.live_write_counter
+            .record_tape_io_diagnostics(self.inner.pipelined_write_diagnostics());
     }
 
     fn begin_pipelined_write_window(
@@ -2446,6 +2577,10 @@ impl<'a, S: BlockSink + ?Sized> BlockSink for CountingBlockSink<'a, S> {
 
     fn pipelined_write_diagnostics(&self) -> PipelinedWriteDiagnostics {
         self.inner.pipelined_write_diagnostics()
+    }
+
+    fn publish_pipelined_write_diagnostics(&mut self) {
+        self.inner.publish_pipelined_write_diagnostics();
     }
 
     fn begin_pipelined_write_window(
@@ -3235,12 +3370,21 @@ fn log_transfer_diagnostics(
         effective_batch_blocks = outcome.stats.effective_batch_blocks,
         position_check_bytes = outcome.stats.position_check_bytes,
         staging_ring_buffers = outcome.stats.staging_ring_buffers,
+        gap_samples = outcome.stats.gap_samples,
         gap_p50_us = outcome.stats.gap_p50_us,
         gap_p95_us = outcome.stats.gap_p95_us,
         gap_max_us = outcome.stats.gap_max_us,
+        gap_mean_us = outcome.stats.gap_mean_us,
+        ioctl_samples = outcome.stats.ioctl_samples,
         ioctl_p50_us = outcome.stats.ioctl_p50_us,
         ioctl_p95_us = outcome.stats.ioctl_p95_us,
         ioctl_max_us = outcome.stats.ioctl_max_us,
+        ioctl_mean_us = outcome.stats.ioctl_mean_us,
+        accounting_samples = outcome.stats.accounting_samples,
+        accounting_p50_us = outcome.stats.accounting_p50_us,
+        accounting_p95_us = outcome.stats.accounting_p95_us,
+        accounting_max_us = outcome.stats.accounting_max_us,
+        accounting_mean_us = outcome.stats.accounting_mean_us,
         cadence_us = outcome.stats.cadence_us,
         effective_feed_bytes_per_second = outcome.stats.effective_feed_bytes_per_second,
         write_filemarks_immed = false,
@@ -4305,6 +4449,7 @@ mod tests {
         ring_buffers: u32,
         cdbs: Vec<Vec<u8>>,
         alignments: Vec<usize>,
+        diagnostic_publications: u64,
         ordered_events: Arc<Mutex<Vec<String>>>,
     }
 
@@ -4327,6 +4472,7 @@ mod tests {
                 ring_buffers: remanence_library::DEFAULT_TAPE_IO_STAGING_RING_BUFFERS,
                 cdbs: Vec::new(),
                 alignments: Vec::new(),
+                diagnostic_publications: 0,
                 ordered_events: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -4408,6 +4554,10 @@ mod tests {
 
         fn staging_ring_buffers(&self) -> u32 {
             self.ring_buffers
+        }
+
+        fn publish_pipelined_write_diagnostics(&mut self) {
+            self.diagnostic_publications += 1;
         }
 
         fn begin_pipelined_write_window(
@@ -4792,6 +4942,8 @@ mod tests {
         })
         .expect("pipelined transfer succeeds");
 
+        assert_eq!(sink.diagnostic_publications, 1);
+
         assert_eq!(
             sink.cdbs,
             vec![
@@ -4808,6 +4960,18 @@ mod tests {
         );
         assert!(sink.events.contains(&"intent:3:20:2:1".to_string()));
         assert!(sink.events.contains(&"span_ok:3:20:2:1".to_string()));
+    }
+
+    #[test]
+    fn hot_phase_histogram_reports_exact_mean_and_bucketed_tail() {
+        let mut histogram = HotPhaseHistogram::default();
+        histogram.record(Duration::from_micros(11));
+        histogram.record(Duration::from_micros(39));
+
+        assert_eq!(histogram.mean(), 25);
+        assert_eq!(histogram.percentile(50, 100), 25);
+        assert_eq!(histogram.percentile(95, 100), 50);
+        assert_eq!(histogram.max_us, 39);
     }
 
     #[test]
