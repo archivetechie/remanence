@@ -194,6 +194,7 @@ pub struct PoolWriteResult {
     /// A caller-object replay returns the already committed object and leaves
     /// this empty because no tape transfer happened in that call.
     pub write_report: Option<StreamingObjectWriteReport>,
+    append_commit_diagnostics: AppendCommitDiagnostics,
 }
 
 impl PoolWriteResult {
@@ -207,12 +208,33 @@ impl PoolWriteResult {
         self.write_report.as_ref()
     }
 
+    pub(crate) fn append_commit_diagnostics(&self) -> AppendCommitDiagnostics {
+        self.append_commit_diagnostics
+    }
+
     /// Borrow the streaming report and panic if the result was a replay.
     #[cfg(test)]
     pub fn expect_write_report(&self) -> &StreamingObjectWriteReport {
         self.write_report
             .as_ref()
             .expect("pool write result should include a new write report")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AppendCommitDiagnostics {
+    pub(crate) filemark_write_drain: Duration,
+    pub(crate) catalog_journal_fsync: Duration,
+}
+
+impl AppendCommitDiagnostics {
+    pub(crate) fn accumulate(&mut self, other: Self) {
+        self.filemark_write_drain = self
+            .filemark_write_drain
+            .saturating_add(other.filemark_write_drain);
+        self.catalog_journal_fsync = self
+            .catalog_journal_fsync
+            .saturating_add(other.catalog_journal_fsync);
     }
 }
 
@@ -1142,6 +1164,7 @@ struct BlockSinkStats {
     max_block_bytes: Option<u64>,
     filemark_calls: u64,
     filemarks: u64,
+    filemark_write_drain: Duration,
     position_calls: u64,
     early_warning: bool,
     write_batch_blocks: u32,
@@ -1182,9 +1205,10 @@ impl BlockSinkStats {
         );
     }
 
-    fn record_filemarks(&mut self, count: u32, early_warning: bool) {
+    fn record_filemarks(&mut self, count: u32, early_warning: bool, elapsed: Duration) {
         self.filemark_calls = self.filemark_calls.saturating_add(1);
         self.filemarks = self.filemarks.saturating_add(u64::from(count));
+        self.filemark_write_drain = self.filemark_write_drain.saturating_add(elapsed);
         self.early_warning |= early_warning;
     }
 
@@ -2637,8 +2661,10 @@ impl<'a, S: BlockSink + ?Sized> BlockSink for CountingBlockSink<'a, S> {
     }
 
     fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
+        let started = Instant::now();
         let outcome = self.inner.write_filemarks(count)?;
-        self.stats.record_filemarks(count, outcome.early_warning);
+        self.stats
+            .record_filemarks(count, outcome.early_warning, started.elapsed());
         Ok(outcome)
     }
 
@@ -2646,8 +2672,10 @@ impl<'a, S: BlockSink + ?Sized> BlockSink for CountingBlockSink<'a, S> {
         &mut self,
         count: u32,
     ) -> Result<WriteFilemarksOutcome, TapeIoError> {
+        let started = Instant::now();
         let outcome = self.inner.write_filemarks_pipelined(count)?;
-        self.stats.record_filemarks(count, outcome.early_warning);
+        self.stats
+            .record_filemarks(count, outcome.early_warning, started.elapsed());
         Ok(outcome)
     }
 
@@ -2794,6 +2822,10 @@ fn write_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
         prepared,
         stored.copy_representation(),
         write_report,
+        AppendCommitDiagnostics {
+            filemark_write_drain: transfer_stats.filemark_write_drain,
+            catalog_journal_fsync: commit_elapsed,
+        },
     ))
 }
 
@@ -2942,6 +2974,10 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
         prepared,
         stored.copy_representation(),
         write_report,
+        AppendCommitDiagnostics {
+            filemark_write_drain: transfer_stats.filemark_write_drain,
+            catalog_journal_fsync: commit_elapsed,
+        },
     ))
 }
 
@@ -3089,6 +3125,7 @@ fn pool_write_result(
     prepared: PreparedPoolObject,
     copy_representation: CopyRepresentation,
     write_report: StreamingObjectWriteReport,
+    append_commit_diagnostics: AppendCommitDiagnostics,
 ) -> PoolWriteResult {
     let first_body_lba = first_payload_body_lba(&write_report);
     let object = PoolWriteObjectRecord {
@@ -3112,6 +3149,7 @@ fn pool_write_result(
     PoolWriteResult {
         object,
         write_report: Some(write_report),
+        append_commit_diagnostics,
     }
 }
 
@@ -3152,6 +3190,7 @@ pub(crate) fn maybe_replay_pool_write(
     Ok(Some(PoolWriteResult {
         object: pool_write_object_record_from_native(existing, pool_cfg.id.as_str())?,
         write_report: None,
+        append_commit_diagnostics: AppendCommitDiagnostics::default(),
     }))
 }
 
@@ -3363,6 +3402,9 @@ fn log_transfer_diagnostics(
         max_block_bytes = outcome.stats.max_block_bytes.unwrap_or(0),
         filemark_calls = outcome.stats.filemark_calls,
         filemarks = outcome.stats.filemarks,
+        filemark_write_drain_ms = crate::diagnostics::duration_ms(
+            outcome.stats.filemark_write_drain
+        ),
         position_calls = outcome.stats.position_calls,
         early_warning = outcome.stats.early_warning,
         scsi_write_cdb = "WRITE6_FIXED_BATCH",
@@ -5059,8 +5101,9 @@ mod tests {
         assert!(stats.early_warning);
 
         let mut stats = BlockSinkStats::default();
-        stats.record_filemarks(1, true);
+        stats.record_filemarks(1, true, Duration::from_millis(7));
         assert!(stats.early_warning);
+        assert_eq!(stats.filemark_write_drain, Duration::from_millis(7));
 
         let mut stats = BlockSinkStats::default();
         stats.record_position(tape_position_with_warning(true));
