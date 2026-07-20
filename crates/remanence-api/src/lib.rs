@@ -12,7 +12,7 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use ciborium::value::Value as CborValue;
@@ -180,6 +180,74 @@ pub(crate) struct DriveByteCounters {
     tape_io_ioctl_max_us: AtomicU64,
     tape_io_cadence_us: AtomicU64,
     tape_io_effective_feed_bytes_per_second: AtomicU64,
+    window: Mutex<RollingByteWindow>,
+}
+
+const RATE_WINDOW_MILLIS: u64 = 5_000;
+const RATE_BUCKET_MILLIS: u64 = 500;
+const RATE_BUCKET_COUNT: usize = 11;
+
+#[derive(Clone, Copy, Debug)]
+struct RateBucket {
+    tick: u64,
+    bytes: u64,
+}
+
+impl RateBucket {
+    const EMPTY: Self = Self {
+        tick: u64::MAX,
+        bytes: 0,
+    };
+}
+
+#[derive(Debug)]
+struct RollingByteWindow {
+    started_at: Instant,
+    buckets: [RateBucket; RATE_BUCKET_COUNT],
+}
+
+impl RollingByteWindow {
+    fn new(started_at: Instant) -> Self {
+        Self {
+            started_at,
+            buckets: [RateBucket::EMPTY; RATE_BUCKET_COUNT],
+        }
+    }
+
+    fn record_at(&mut self, bytes: u64, now: Instant) {
+        let tick = u64::try_from(now.duration_since(self.started_at).as_millis())
+            .unwrap_or(u64::MAX)
+            / RATE_BUCKET_MILLIS;
+        let index =
+            usize::try_from(tick % RATE_BUCKET_COUNT as u64).expect("rate bucket index fits usize");
+        let bucket = &mut self.buckets[index];
+        if bucket.tick != tick {
+            *bucket = RateBucket { tick, bytes: 0 };
+        }
+        bucket.bytes = bucket.bytes.saturating_add(bytes);
+    }
+
+    fn bytes_per_second_at(&self, now: Instant) -> u64 {
+        let elapsed_millis =
+            u64::try_from(now.duration_since(self.started_at).as_millis()).unwrap_or(u64::MAX);
+        let tick = elapsed_millis / RATE_BUCKET_MILLIS;
+        let window_ticks = RATE_WINDOW_MILLIS / RATE_BUCKET_MILLIS;
+        let bytes = self.buckets.iter().fold(0u64, |total, bucket| {
+            if bucket.tick != u64::MAX && tick.saturating_sub(bucket.tick) < window_ticks {
+                total.saturating_add(bucket.bytes)
+            } else {
+                total
+            }
+        });
+        let denominator_millis = elapsed_millis.clamp(1, RATE_WINDOW_MILLIS);
+        u64::try_from(
+            u128::from(bytes)
+                .saturating_mul(1_000)
+                .checked_div(u128::from(denominator_millis))
+                .unwrap_or(u128::from(u64::MAX)),
+        )
+        .unwrap_or(u64::MAX)
+    }
 }
 
 impl DriveByteCounters {
@@ -198,15 +266,24 @@ impl DriveByteCounters {
             tape_io_ioctl_max_us: AtomicU64::new(0),
             tape_io_cadence_us: AtomicU64::new(0),
             tape_io_effective_feed_bytes_per_second: AtomicU64::new(0),
+            window: Mutex::new(RollingByteWindow::new(Instant::now())),
         }
     }
 
     pub(crate) fn record_read_bytes(&self, bytes: u64) {
         self.read_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.window
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .record_at(bytes, Instant::now());
     }
 
     pub(crate) fn record_write_bytes(&self, bytes: u64) {
         self.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.window
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .record_at(bytes, Instant::now());
     }
 
     pub(crate) fn configure_tape_io(&self, staging_ring_buffers: u32, effective_batch_blocks: u32) {
@@ -240,6 +317,13 @@ impl DriveByteCounters {
         );
     }
 
+    fn window_feed_bytes_per_second(&self) -> u64 {
+        self.window
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .bytes_per_second_at(Instant::now())
+    }
+
     #[cfg(test)]
     pub(crate) fn write_bytes(&self) -> u64 {
         self.write_bytes.load(Ordering::Relaxed)
@@ -251,6 +335,13 @@ struct LiveStatusState {
     min_poll_interval: Duration,
     cache: RwLock<Option<(OffsetDateTime, pb::GetLiveStatusResponse)>>,
     drive_counters: RwLock<HashMap<Vec<u8>, Arc<DriveByteCounters>>>,
+    mount_observations: Mutex<HashMap<(String, u32), MountObservation>>,
+}
+
+#[derive(Debug)]
+struct MountObservation {
+    barcode: String,
+    seated_at: Instant,
 }
 
 impl LiveStatusState {
@@ -259,7 +350,36 @@ impl LiveStatusState {
             min_poll_interval,
             cache: RwLock::new(None),
             drive_counters: RwLock::new(HashMap::new()),
+            mount_observations: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn observe_mount(&self, library_serial: &str, drive: &mut pb::Drive) {
+        self.observe_mount_at(library_serial, drive, Instant::now());
+    }
+
+    fn observe_mount_at(&self, library_serial: &str, drive: &mut pb::Drive, now: Instant) {
+        let key = (library_serial.to_string(), drive.element_address);
+        let mut observations = self
+            .mount_observations
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if drive.loaded_tape_barcode.is_empty() {
+            observations.remove(&key);
+            drive.mount_age_seconds = 0;
+            return;
+        }
+        let observation = observations.entry(key).or_insert_with(|| MountObservation {
+            barcode: drive.loaded_tape_barcode.clone(),
+            seated_at: now,
+        });
+        if observation.barcode != drive.loaded_tape_barcode {
+            *observation = MountObservation {
+                barcode: drive.loaded_tape_barcode.clone(),
+                seated_at: now,
+            };
+        }
+        drive.mount_age_seconds = now.duration_since(observation.seated_at).as_secs();
     }
 
     fn counter_epoch(daemon_epoch: u64, drive_uuid: &[u8]) -> u64 {
@@ -710,6 +830,7 @@ impl ApiState {
         {
             if snapshot_at - cached.0 < self.live_status.min_poll_interval {
                 let mut response = cached.1;
+                self.refresh_live_observations(&mut response);
                 response.drive_assignments = self.drive_assignments(&response.libraries)?;
                 return Ok(response);
             }
@@ -754,6 +875,8 @@ impl ApiState {
             };
 
             for drive in state.drives.iter_mut() {
+                self.live_status
+                    .observe_mount(library.serial.as_str(), drive);
                 let bay = u16::try_from(drive.element_address)
                     .map_err(|_| Status::invalid_argument("drive element address overflows u16"))?;
                 let record = self.drive_record_at_bay(library.serial.as_str(), bay)?;
@@ -805,6 +928,20 @@ impl ApiState {
             .write()
             .unwrap_or_else(|err| err.into_inner()) = Some((snapshot_at, response.clone()));
         Ok(response)
+    }
+
+    fn refresh_live_observations(&self, response: &mut pb::GetLiveStatusResponse) {
+        for library_state in &mut response.libraries {
+            let library_serial = library_state
+                .library
+                .as_ref()
+                .map(|library| library.library_serial.as_str())
+                .unwrap_or_default();
+            for drive in &mut library_state.drives {
+                self.live_status.observe_mount(library_serial, drive);
+                self.enrich_live_counters(drive);
+            }
+        }
     }
 
     /// Project the live reservation atomics without making them a policy gate.
@@ -889,45 +1026,38 @@ impl ApiState {
             record.cleaning_due.clone()
         };
         drive.fenced = record.fenced;
-        drive.lifetime_read_bytes = self
-            .live_status
-            .drive_counters
-            .read()
-            .unwrap_or_else(|err| err.into_inner())
-            .get(&drive_uuid)
-            .map(|counters| counters.read_bytes.load(Ordering::Relaxed))
-            .unwrap_or(0);
-        drive.lifetime_write_bytes = self
-            .live_status
-            .drive_counters
-            .read()
-            .unwrap_or_else(|err| err.into_inner())
-            .get(&drive_uuid)
-            .map(|counters| counters.write_bytes.load(Ordering::Relaxed))
-            .unwrap_or(0);
-        drive.counter_epoch = self
-            .live_status
-            .drive_counters
-            .read()
-            .unwrap_or_else(|err| err.into_inner())
-            .get(&drive_uuid)
-            .map(|counters| counters.counter_epoch)
-            .unwrap_or_else(|| {
-                LiveStatusState::counter_epoch(self.daemon_epoch, drive_uuid.as_slice())
-            });
         drive.session_id = open_session_id.cloned().unwrap_or_default();
         drive.active_alert_names = if cleaning_active {
             vec!["cleaning".to_string()]
         } else {
             Vec::new()
         };
-        if let Some(counters) = self
+        self.enrich_live_counters(drive);
+        if cleaning_active {
+            drive.status = pb::drive::Status::DriveStatusCleaning as i32;
+        } else if drive.fenced || record.fenced {
+            drive.status = pb::drive::Status::DriveStatusFenced as i32;
+        }
+    }
+
+    fn enrich_live_counters(&self, drive: &mut pb::Drive) {
+        if drive.drive_uuid.is_empty() {
+            return;
+        }
+        let counters = self
             .live_status
             .drive_counters
             .read()
             .unwrap_or_else(|err| err.into_inner())
-            .get(&drive_uuid)
-        {
+            .get(&drive.drive_uuid)
+            .cloned();
+        drive.counter_epoch = counters.as_ref().map_or_else(
+            || LiveStatusState::counter_epoch(self.daemon_epoch, drive.drive_uuid.as_slice()),
+            |counters| counters.counter_epoch,
+        );
+        if let Some(counters) = counters {
+            drive.lifetime_read_bytes = counters.read_bytes.load(Ordering::Relaxed);
+            drive.lifetime_write_bytes = counters.write_bytes.load(Ordering::Relaxed);
             drive.tape_io_staging_ring_buffers = counters
                 .tape_io_staging_ring_buffers
                 .load(Ordering::Relaxed) as u32;
@@ -944,11 +1074,7 @@ impl ApiState {
             drive.tape_io_effective_feed_bytes_per_second = counters
                 .tape_io_effective_feed_bytes_per_second
                 .load(Ordering::Relaxed);
-        }
-        if cleaning_active {
-            drive.status = pb::drive::Status::DriveStatusCleaning as i32;
-        } else if drive.fenced || record.fenced {
-            drive.status = pb::drive::Status::DriveStatusFenced as i32;
+            drive.tape_io_window_feed_bytes_per_second = counters.window_feed_bytes_per_second();
         }
     }
 
@@ -4690,6 +4816,50 @@ mod tests {
     const OPERATION_ID_TEXT: &str = "22222222-2222-2222-2222-222222222222";
     const TAPE_UUID: [u8; 16] = [3u8; 16];
     const POOL_WRITE_TAPE_UUID: [u8; 16] = [4u8; 16];
+
+    #[test]
+    fn rolling_drive_rate_uses_only_the_last_five_seconds() {
+        let started_at = Instant::now();
+        let mut window = RollingByteWindow::new(started_at);
+        window.record_at(5_000, started_at + Duration::from_secs(1));
+        window.record_at(5_000, started_at + Duration::from_secs(4));
+
+        assert_eq!(
+            window.bytes_per_second_at(started_at + Duration::from_secs(5)),
+            2_000
+        );
+        assert_eq!(
+            window.bytes_per_second_at(started_at + Duration::from_millis(6_100)),
+            1_000
+        );
+        assert_eq!(
+            window.bytes_per_second_at(started_at + Duration::from_millis(9_100)),
+            0
+        );
+    }
+
+    #[test]
+    fn mount_age_resets_on_barcode_change_or_empty_bay() {
+        let state = LiveStatusState::new(Duration::from_secs(1));
+        let started_at = Instant::now();
+        let mut drive = pb::Drive {
+            element_address: 0x0100,
+            loaded_tape_barcode: "A00001L9".to_string(),
+            ..pb::Drive::default()
+        };
+
+        state.observe_mount_at("mainlib", &mut drive, started_at);
+        state.observe_mount_at("mainlib", &mut drive, started_at + Duration::from_secs(83));
+        assert_eq!(drive.mount_age_seconds, 83);
+
+        drive.loaded_tape_barcode = "A00002L9".to_string();
+        state.observe_mount_at("mainlib", &mut drive, started_at + Duration::from_secs(84));
+        assert_eq!(drive.mount_age_seconds, 0);
+
+        drive.loaded_tape_barcode.clear();
+        state.observe_mount_at("mainlib", &mut drive, started_at + Duration::from_secs(85));
+        assert_eq!(drive.mount_age_seconds, 0);
+    }
     const SECOND_POOL_WRITE_TAPE_UUID: [u8; 16] = [5u8; 16];
     const API_SESSION_BLOCK_SIZE: u32 = 4096;
 

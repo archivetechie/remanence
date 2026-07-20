@@ -114,6 +114,9 @@ pub(crate) fn project_drive(
         tape_io_ioctl_max_us: 0,
         tape_io_cadence_us: 0,
         tape_io_effective_feed_bytes_per_second: 0,
+        loaded_tape_barcode: bay.loaded_tape.clone().unwrap_or_default(),
+        mount_age_seconds: 0,
+        tape_io_window_feed_bytes_per_second: 0,
     }
 }
 
@@ -1334,6 +1337,7 @@ mod tests {
         );
         assert_eq!(state.drives.len(), 1);
         assert_eq!(state.drives[0].loaded_tape_uuid, vec![9u8; 16]);
+        assert_eq!(state.drives[0].loaded_tape_barcode, "S30002L9");
         assert_eq!(
             state.drives[0].status,
             pb::drive::Status::DriveStatusLoaded as i32
@@ -1809,6 +1813,19 @@ mod tests {
         assert_eq!(drive.tape_io_gap_p95_us, 250);
         assert_eq!(drive.tape_io_cadence_us, 1_100);
         assert_eq!(drive.tape_io_effective_feed_bytes_per_second, 300_000_000);
+        assert_eq!(drive.loaded_tape_barcode, "S30002L9");
+        assert!(drive.tape_io_window_feed_bytes_per_second > 0);
+
+        state.record_drive_write_bytes(Some(drive_uuid.as_slice()), 4_096);
+        let cached = state
+            .library_service()
+            .get_live_status(Request::new(pb::GetLiveStatusRequest {}))
+            .await
+            .expect("cached live status")
+            .into_inner();
+        let cached_drive = &cached.libraries[0].drives[0];
+        assert_eq!(cached_drive.lifetime_write_bytes, 6_144);
+        assert!(cached_drive.tape_io_window_feed_bytes_per_second > 0);
     }
 
     #[tokio::test]
