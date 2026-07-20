@@ -146,12 +146,12 @@ pub(crate) enum DriveCommand {
     Close {
         session_id: Uuid,
         unload_before_close: bool,
-        reply: oneshot::Sender<Result<pb::WriteSession, Status>>,
+        reply: oneshot::Sender<Result<CloseWriteActorReply, Status>>,
     },
     Abort {
         session_id: Uuid,
         unload_before_close: bool,
-        reply: oneshot::Sender<Result<pb::WriteSession, Status>>,
+        reply: oneshot::Sender<Result<CloseWriteActorReply, Status>>,
     },
     Get {
         session_id: Uuid,
@@ -182,6 +182,28 @@ pub(crate) enum DriveCommand {
         session_id: Uuid,
         reply: oneshot::Sender<Result<pb::ReadSession, Status>>,
     },
+}
+
+#[derive(Debug)]
+pub(crate) struct CloseWriteActorReply {
+    pub(crate) session: pb::WriteSession,
+    pub(crate) diagnostics: CloseWriteActorDiagnostics,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CloseWriteActorDiagnostics {
+    /// Synchronous object-closing filemark time accumulated by append calls.
+    pub(crate) filemark_write_drain: StdDuration,
+    /// Catalog/journal commit time accumulated after those filemarks.
+    pub(crate) catalog_journal_fsync: StdDuration,
+    /// Close-time health snapshot and projection work.
+    pub(crate) drive_snapshot: StdDuration,
+    /// Separate explicit rewind time. Zero while close retains monolithic SSC UNLOAD.
+    pub(crate) rewind: StdDuration,
+    /// Synchronous SSC UNLOAD time, including its device-internal rewind.
+    pub(crate) ssc_unload: StdDuration,
+    /// SessionClosed audit append/fsync and SQLite projection time.
+    pub(crate) session_audit_projection: StdDuration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -840,9 +862,10 @@ fn drain_failed_drive_commands(mut rx: mpsc::Receiver<DriveCommand>, message: St
                 let _ = std::fs::remove_file(spool_path);
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
-            DriveCommand::Close { reply, .. }
-            | DriveCommand::Abort { reply, .. }
-            | DriveCommand::Get { reply, .. } => {
+            DriveCommand::Close { reply, .. } | DriveCommand::Abort { reply, .. } => {
+                let _ = reply.send(Err(Status::internal(message.clone())));
+            }
+            DriveCommand::Get { reply, .. } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
             DriveCommand::CloseRead { reply, .. } | DriveCommand::GetRead { reply, .. } => {
@@ -1812,6 +1835,87 @@ fn session_open_recording_failure_status(
     ))
 }
 
+struct CloseWriteActorInput<'a> {
+    index: &'a mut CatalogIndex,
+    cfg: &'a WriteOwnerConfig,
+    drive: &'a mut DriveHandle,
+    drive_uuid: &'a Option<Vec<u8>>,
+    drive_serial: &'a Option<String>,
+    snapshot_misses: &'a mut u32,
+    session_id: Uuid,
+    tape_uuid: TapeUuid,
+    library_serial: &'a str,
+    bay: u16,
+    objects_committed: u64,
+    bytes_committed: u64,
+    opened_at_utc: &'a str,
+    last_checkpoint_at_utc: Option<&'a str>,
+    state: pb::write_session::State,
+    unload_before_close: bool,
+    append_commit_diagnostics: crate::pool_write::AppendCommitDiagnostics,
+}
+
+fn close_write_actor(input: CloseWriteActorInput<'_>) -> Result<CloseWriteActorReply, Status> {
+    let mut diagnostics = CloseWriteActorDiagnostics {
+        filemark_write_drain: input.append_commit_diagnostics.filemark_write_drain,
+        catalog_journal_fsync: input.append_commit_diagnostics.catalog_journal_fsync,
+        ..CloseWriteActorDiagnostics::default()
+    };
+
+    let snapshot_started = Instant::now();
+    record_session_close_snapshot(
+        input.index,
+        input.cfg,
+        input.drive,
+        input.drive_uuid.clone(),
+        input.session_id,
+        input.tape_uuid,
+        input.snapshot_misses,
+    );
+    diagnostics.drive_snapshot = snapshot_started.elapsed();
+
+    if input.unload_before_close {
+        let unload_started = Instant::now();
+        input
+            .drive
+            .unload()
+            .map_err(|err| Status::internal(format!("unload drive: {err}")))?;
+        diagnostics.ssc_unload = unload_started.elapsed();
+    }
+
+    let session = session_proto(WriteSessionProtoInput {
+        session_id: input.session_id,
+        tape_uuid: &input.tape_uuid,
+        state: input.state,
+        objects_committed: input.objects_committed,
+        bytes_committed: input.bytes_committed,
+        opened_at_utc: input.opened_at_utc,
+        last_checkpoint_at_utc: input.last_checkpoint_at_utc,
+        drive_element_address: input.bay,
+    });
+    let audit_started = Instant::now();
+    record_session_event(
+        input.index,
+        input.cfg,
+        SessionAuditInput {
+            session_id: input.session_id,
+            session_kind: "write",
+            event: AuditEvent::SessionClosed,
+            tape_uuid: Some(input.tape_uuid),
+            library_serial: Some(input.library_serial.to_string()),
+            drive_bay: Some(input.bay),
+            drive_uuid: input.drive_uuid.clone(),
+            drive_serial: input.drive_serial.clone(),
+        },
+    )?;
+    diagnostics.session_audit_projection = audit_started.elapsed();
+
+    Ok(CloseWriteActorReply {
+        session,
+        diagnostics,
+    })
+}
+
 fn handle_drive_open_write(
     bay: u16,
     index: &mut CatalogIndex,
@@ -1916,6 +2020,7 @@ fn handle_drive_open_write(
     }
 
     let mut append_gate = SessionAppendGate::default();
+    let mut append_commit_diagnostics = crate::pool_write::AppendCommitDiagnostics::default();
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
             DriveCommand::AppendFinish {
@@ -1971,6 +2076,7 @@ fn handle_drive_open_write(
                 match result {
                     Ok(result) => {
                         let replay = result.is_replay();
+                        append_commit_diagnostics.accumulate(result.append_commit_diagnostics());
                         if !replay {
                             objects_committed = objects_committed.saturating_add(1);
                             bytes_committed = bytes_committed.saturating_add(logical_size);
@@ -2029,58 +2135,38 @@ fn handle_drive_open_write(
                 unload_before_close,
                 reply,
             } => {
-                let status = if requested == session_id {
-                    record_session_close_snapshot(
-                        index,
-                        cfg,
-                        drive,
-                        drive_uuid.clone(),
-                        session_id,
-                        tape_uuid,
-                        snapshot_misses,
-                    );
-                    if unload_before_close {
-                        if let Err(err) = drive.unload() {
-                            let _ =
-                                reply.send(Err(Status::internal(format!("unload drive: {err}"))));
-                            continue;
-                        }
+                if requested != session_id {
+                    let _ = reply.send(Err(Status::not_found("write session not found")));
+                    continue;
+                }
+                let result = close_write_actor(CloseWriteActorInput {
+                    index,
+                    cfg,
+                    drive,
+                    drive_uuid: &drive_uuid,
+                    drive_serial: &drive_serial,
+                    snapshot_misses,
+                    session_id,
+                    tape_uuid,
+                    library_serial: library_serial.as_str(),
+                    bay,
+                    objects_committed,
+                    bytes_committed,
+                    opened_at_utc: opened_at_utc.as_str(),
+                    last_checkpoint_at_utc: last_checkpoint_at_utc.as_deref(),
+                    state: pb::write_session::State::WriteSessionStateClosed,
+                    unload_before_close,
+                    append_commit_diagnostics,
+                });
+                match result {
+                    Ok(result) => {
+                        let _ = reply.send(Ok(result));
+                        break;
                     }
-                    Ok(session_proto(WriteSessionProtoInput {
-                        session_id,
-                        tape_uuid: &tape_uuid,
-                        state: pb::write_session::State::WriteSessionStateClosed,
-                        objects_committed,
-                        bytes_committed,
-                        opened_at_utc: opened_at_utc.as_str(),
-                        last_checkpoint_at_utc: last_checkpoint_at_utc.as_deref(),
-                        drive_element_address: bay,
-                    }))
-                } else {
-                    Err(Status::not_found("write session not found"))
-                };
-                if status.is_ok() {
-                    if let Err(err) = record_session_event(
-                        index,
-                        cfg,
-                        SessionAuditInput {
-                            session_id,
-                            session_kind: "write",
-                            event: AuditEvent::SessionClosed,
-                            tape_uuid: Some(tape_uuid),
-                            library_serial: Some(library_serial.clone()),
-                            drive_bay: Some(bay),
-                            drive_uuid: drive_uuid.clone(),
-                            drive_serial: drive_serial.clone(),
-                        },
-                    ) {
+                    Err(err) => {
                         let _ = reply.send(Err(err));
                         continue;
                     }
-                }
-                let _ = reply.send(status);
-                if requested == session_id {
-                    break;
                 }
             }
             DriveCommand::Abort {
@@ -2088,58 +2174,38 @@ fn handle_drive_open_write(
                 unload_before_close,
                 reply,
             } => {
-                let status = if requested == session_id {
-                    record_session_close_snapshot(
-                        index,
-                        cfg,
-                        drive,
-                        drive_uuid.clone(),
-                        session_id,
-                        tape_uuid,
-                        snapshot_misses,
-                    );
-                    if unload_before_close {
-                        if let Err(err) = drive.unload() {
-                            let _ =
-                                reply.send(Err(Status::internal(format!("unload drive: {err}"))));
-                            continue;
-                        }
+                if requested != session_id {
+                    let _ = reply.send(Err(Status::not_found("write session not found")));
+                    continue;
+                }
+                let result = close_write_actor(CloseWriteActorInput {
+                    index,
+                    cfg,
+                    drive,
+                    drive_uuid: &drive_uuid,
+                    drive_serial: &drive_serial,
+                    snapshot_misses,
+                    session_id,
+                    tape_uuid,
+                    library_serial: library_serial.as_str(),
+                    bay,
+                    objects_committed,
+                    bytes_committed,
+                    opened_at_utc: opened_at_utc.as_str(),
+                    last_checkpoint_at_utc: last_checkpoint_at_utc.as_deref(),
+                    state: pb::write_session::State::WriteSessionStateAborted,
+                    unload_before_close,
+                    append_commit_diagnostics,
+                });
+                match result {
+                    Ok(result) => {
+                        let _ = reply.send(Ok(result));
+                        break;
                     }
-                    Ok(session_proto(WriteSessionProtoInput {
-                        session_id,
-                        tape_uuid: &tape_uuid,
-                        state: pb::write_session::State::WriteSessionStateAborted,
-                        objects_committed,
-                        bytes_committed,
-                        opened_at_utc: opened_at_utc.as_str(),
-                        last_checkpoint_at_utc: last_checkpoint_at_utc.as_deref(),
-                        drive_element_address: bay,
-                    }))
-                } else {
-                    Err(Status::not_found("write session not found"))
-                };
-                if status.is_ok() {
-                    if let Err(err) = record_session_event(
-                        index,
-                        cfg,
-                        SessionAuditInput {
-                            session_id,
-                            session_kind: "write",
-                            event: AuditEvent::SessionClosed,
-                            tape_uuid: Some(tape_uuid),
-                            library_serial: Some(library_serial.clone()),
-                            drive_bay: Some(bay),
-                            drive_uuid: drive_uuid.clone(),
-                            drive_serial: drive_serial.clone(),
-                        },
-                    ) {
+                    Err(err) => {
                         let _ = reply.send(Err(err));
                         continue;
                     }
-                }
-                let _ = reply.send(status);
-                if requested == session_id {
-                    break;
                 }
             }
             DriveCommand::Get {
@@ -2660,9 +2726,12 @@ fn handle_drive_open_read(
                     "active session is a read session",
                 )));
             }
-            DriveCommand::Close { reply, .. }
-            | DriveCommand::Abort { reply, .. }
-            | DriveCommand::Get { reply, .. } => {
+            DriveCommand::Close { reply, .. } | DriveCommand::Abort { reply, .. } => {
+                let _ = reply.send(Err(Status::failed_precondition(
+                    "active session is a read session",
+                )));
+            }
+            DriveCommand::Get { reply, .. } => {
                 let _ = reply.send(Err(Status::failed_precondition(
                     "active session is a read session",
                 )));
@@ -6479,6 +6548,50 @@ mod tests {
             .await
             .expect("append reply")
             .expect_err("invalid archive path induces append failure");
+
+        let close_command_start = world.lock().expect("world lock").command_log.len();
+        let (close_write_tx, close_write_rx) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::Close {
+                session_id: write_session_id,
+                unload_before_close: true,
+                reply: close_write_tx,
+            })
+            .await
+            .expect("send write close");
+        let close_reply = close_write_rx
+            .await
+            .expect("write close reply")
+            .expect("close write session");
+        assert_eq!(
+            close_reply.session.state,
+            pb::write_session::State::WriteSessionStateClosed as i32
+        );
+        assert_eq!(
+            close_reply.diagnostics.filemark_write_drain,
+            StdDuration::ZERO
+        );
+        assert_eq!(
+            close_reply.diagnostics.catalog_journal_fsync,
+            StdDuration::ZERO
+        );
+        assert_eq!(close_reply.diagnostics.rewind, StdDuration::ZERO);
+        let close_opcodes = world
+            .lock()
+            .expect("world lock")
+            .command_log
+            .iter()
+            .skip(close_command_start)
+            .map(|command| command.opcode)
+            .collect::<Vec<_>>();
+        assert!(
+            close_opcodes.contains(&0x1b),
+            "close must retain the existing SSC UNLOAD command: {close_opcodes:?}"
+        );
+        assert!(
+            !close_opcodes.contains(&0x01),
+            "diagnostics must not add a separate REWIND command: {close_opcodes:?}"
+        );
 
         let check = CatalogIndex::open(&index_path).expect("reopen catalog");
         let rows = check

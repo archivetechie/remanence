@@ -519,10 +519,17 @@ async fn close_write_like_critical(
             .await
             .map_err(|_| Status::internal("drive actor unavailable"))?;
     }
-    let session = reply_rx
+    let actor_reply = reply_rx
         .await
         .map_err(|_| Status::internal("drive actor dropped reply"))??;
     let actor_close_elapsed = actor_close_started.elapsed();
+    let actor_attributed = actor_reply
+        .diagnostics
+        .drive_snapshot
+        .saturating_add(actor_reply.diagnostics.rewind)
+        .saturating_add(actor_reply.diagnostics.ssc_unload)
+        .saturating_add(actor_reply.diagnostics.session_audit_projection);
+    let actor_unattributed = actor_close_elapsed.saturating_sub(actor_attributed);
     let finish_started = Instant::now();
     let move_home = mounted.home_slot.is_some();
     finish_mounted_session(&pool, session_id, mounted).await?;
@@ -535,12 +542,33 @@ async fn close_write_like_critical(
         abort,
         unload_before_close,
         move_home,
+        commit_phases_completed_before_close = true,
+        commit_phase_scope = "session_accumulated_append_finish",
+        append_commits = actor_reply.session.objects_committed,
+        filemark_write_drain_ms = crate::diagnostics::duration_ms(
+            actor_reply.diagnostics.filemark_write_drain
+        ),
+        catalog_journal_fsync_ms = crate::diagnostics::duration_ms(
+            actor_reply.diagnostics.catalog_journal_fsync
+        ),
+        drive_snapshot_ms = crate::diagnostics::duration_ms(
+            actor_reply.diagnostics.drive_snapshot
+        ),
+        rewind_ms = crate::diagnostics::duration_ms(actor_reply.diagnostics.rewind),
+        separate_rewind_command = false,
+        ssc_unload_ms = crate::diagnostics::duration_ms(actor_reply.diagnostics.ssc_unload),
+        ssc_unload_includes_rewind = unload_before_close,
+        session_audit_projection_ms = crate::diagnostics::duration_ms(
+            actor_reply.diagnostics.session_audit_projection
+        ),
+        actor_unattributed_ms = crate::diagnostics::duration_ms(actor_unattributed),
         actor_close_ms = crate::diagnostics::duration_ms(actor_close_elapsed),
+        changer_move_home_ms = crate::diagnostics::duration_ms(finish_elapsed),
         finish_mount_ms = crate::diagnostics::duration_ms(finish_elapsed),
         elapsed_ms = crate::diagnostics::duration_ms(close_elapsed),
         "remanence_write_diag",
     );
-    Ok(session)
+    Ok(actor_reply.session)
 }
 
 pub(crate) async fn get_read_session(
