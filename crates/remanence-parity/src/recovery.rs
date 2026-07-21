@@ -16,7 +16,9 @@ use crate::error::ParityError;
 use crate::filemark_map::{
     MapScope, ScopedFilemarkMap, TapeFileKind, TapeFileMapEntry, TapeFilePosition,
 };
-use crate::mapping::{data_shards_per_epoch, ordinal_to_stripe, stripe_data_to_ordinal};
+#[cfg(test)]
+use crate::mapping::{data_shards_per_epoch, ordinal_to_stripe};
+use crate::mapping::{ordinal_to_stripe_in_epoch, stripe_data_to_ordinal_in_epoch};
 use crate::model::{ParityScheme, SidecarMetadataHealth, StripeAddress, StripePosition};
 use crate::raw::{PhysicalPositionHint, RawReadOutcome, RawTapeSource};
 use crate::sidecar::{
@@ -150,7 +152,8 @@ pub fn recover_object_region_from_sidecar(
             tape_file_number,
             ordinal,
         )?;
-        let stripe = ordinal_to_stripe(ordinal, scheme)?;
+        let sidecar_entry = find_sidecar_covering_ordinal(scoped_map, ordinal)?;
+        let stripe = stripe_for_sidecar_ordinal(sidecar_entry, ordinal, scheme)?;
         let StripePosition::Data { index } = stripe.position else {
             return Err(ParityError::Invariant(
                 "ordinal_to_stripe returned a parity address",
@@ -293,7 +296,8 @@ fn recover_ordinal_from_sidecar_inside_boundary(
         failed_ordinal,
     )?;
 
-    let failed_stripe = ordinal_to_stripe(failed_ordinal, scheme)?;
+    let sidecar_entry = find_sidecar_covering_ordinal(scoped_map, failed_ordinal)?;
+    let failed_stripe = stripe_for_sidecar_ordinal(sidecar_entry, failed_ordinal, scheme)?;
     let failed_data_index = match failed_stripe.position {
         StripePosition::Data { index } => index as usize,
         StripePosition::Parity { .. } => {
@@ -302,12 +306,7 @@ fn recover_ordinal_from_sidecar_inside_boundary(
             ));
         }
     };
-    let epoch_data_shards = data_shards_per_epoch(scheme)?;
-    let epoch_start = failed_stripe
-        .neighborhood
-        .checked_mul(epoch_data_shards)
-        .ok_or(ParityError::Invariant("epoch ordinal start overflows"))?;
-    let sidecar_entry = find_epoch_sidecar(scoped_map, failed_stripe.neighborhood)?;
+    let epoch_start = sidecar_range(sidecar_entry)?.0;
     ensure_inside_durable_recovery_boundary(
         scoped_map,
         read_boundary,
@@ -341,12 +340,13 @@ fn recover_ordinal_from_sidecar_inside_boundary(
         let position = StripePosition::Data {
             index: data_index as u16,
         };
-        let ordinal = stripe_data_to_ordinal(
+        let ordinal = stripe_data_to_ordinal_in_epoch(
             &StripeAddress {
                 neighborhood: failed_stripe.neighborhood,
                 stripe_index: failed_stripe.stripe_index,
                 position,
             },
+            epoch_start,
             scheme,
         )?;
         attempted[data_index] = true;
@@ -457,11 +457,8 @@ fn recover_epoch_region_from_sidecar(
     max_stripes_per_window: u64,
     recovered_by_lba: &mut BTreeMap<u64, SidecarRecoveryResult>,
 ) -> Result<(), ParityError> {
-    let epoch_data_shards = data_shards_per_epoch(scheme)?;
-    let epoch_start = epoch_id
-        .checked_mul(epoch_data_shards)
-        .ok_or(ParityError::Invariant("epoch ordinal start overflows"))?;
     let sidecar_entry = find_epoch_sidecar(scoped_map, epoch_id)?;
+    let epoch_start = sidecar_range(sidecar_entry)?.0;
     ensure_inside_durable_recovery_boundary(
         scoped_map,
         read_boundary,
@@ -558,12 +555,13 @@ fn read_bulk_window_peers(
             if requested_indexes.contains(&data_index) {
                 continue;
             }
-            let ordinal = stripe_data_to_ordinal(
+            let ordinal = stripe_data_to_ordinal_in_epoch(
                 &StripeAddress {
                     neighborhood: sidecar.header.epoch_id,
                     stripe_index: *stripe_index,
                     position: StripePosition::Data { index: data_index },
                 },
+                epoch_start,
                 scheme,
             )?;
             if ordinal >= sidecar.header.protected_ordinal_end_exclusive {
@@ -668,12 +666,13 @@ fn recover_bulk_stripe_from_cache(
         if requested_by_index.contains_key(&data_index) {
             continue;
         }
-        let ordinal = stripe_data_to_ordinal(
+        let ordinal = stripe_data_to_ordinal_in_epoch(
             &StripeAddress {
                 neighborhood: epoch_id,
                 stripe_index,
                 position: StripePosition::Data { index: data_index },
             },
+            epoch_start,
             scheme,
         )?;
         if ordinal >= sidecar.header.protected_ordinal_end_exclusive {
@@ -841,6 +840,54 @@ fn find_epoch_sidecar(
                 "no parity sidecar entry for protected epoch {epoch_id}"
             ))
         })
+}
+
+fn find_sidecar_covering_ordinal(
+    scoped_map: &ScopedFilemarkMap,
+    ordinal: u64,
+) -> Result<&TapeFileMapEntry, ParityError> {
+    scoped_map
+        .map
+        .entries()
+        .iter()
+        .find(|entry| {
+            entry.kind == TapeFileKind::ParitySidecar
+                && matches!(
+                    (entry.protected_ordinal_start, entry.protected_ordinal_end_exclusive),
+                    (Some(start), Some(end)) if start <= ordinal && ordinal < end
+                )
+        })
+        .ok_or_else(|| {
+            ParityError::FilemarkMapReconstruct(format!(
+                "no parity sidecar range contains protected ordinal {ordinal}"
+            ))
+        })
+}
+
+fn sidecar_range(entry: &TapeFileMapEntry) -> Result<(u64, u64, u64), ParityError> {
+    match (
+        entry.epoch_id,
+        entry.protected_ordinal_start,
+        entry.protected_ordinal_end_exclusive,
+    ) {
+        (Some(epoch_id), Some(start), Some(end)) if start < end => Ok((start, end, epoch_id)),
+        _ => Err(ParityError::FilemarkMapReconstruct(format!(
+            "parity sidecar tape file {} has incomplete epoch range metadata",
+            entry.tape_file_number
+        ))),
+    }
+}
+
+pub(crate) fn stripe_for_sidecar_ordinal(
+    entry: &TapeFileMapEntry,
+    ordinal: u64,
+    scheme: &ParityScheme,
+) -> Result<StripeAddress, ParityError> {
+    let (start, end, epoch_id) = sidecar_range(entry)?;
+    let real_data_shard_count = end
+        .checked_sub(start)
+        .ok_or(ParityError::Invariant("sidecar protected range underflows"))?;
+    ordinal_to_stripe_in_epoch(ordinal, epoch_id, start, real_data_shard_count, scheme)
 }
 
 fn read_and_parse_sidecar_index(
@@ -1117,6 +1164,17 @@ fn validate_sidecar_for_recovery(
             sidecar.header.protected_ordinal_start
         )));
     }
+    let descriptor_real_data_shards = sidecar
+        .header
+        .protected_ordinal_end_exclusive
+        .checked_sub(sidecar.header.protected_ordinal_start)
+        .ok_or(ParityError::Invariant("sidecar protected range underflows"))?;
+    if sidecar.header.real_data_shard_count != descriptor_real_data_shards {
+        return Err(ParityError::SidecarParse(format!(
+            "sidecar real_data_shard_count {} does not match descriptor range length {descriptor_real_data_shards}",
+            sidecar.header.real_data_shard_count
+        )));
+    }
     if sidecar_entry.protected_ordinal_start != Some(sidecar.header.protected_ordinal_start)
         || sidecar_entry.protected_ordinal_end_exclusive
             != Some(sidecar.header.protected_ordinal_end_exclusive)
@@ -1226,7 +1284,7 @@ mod tests {
     use crate::model::SchemeId;
     use crate::raw::{RawTapeSink, RawWriteOutcome};
     use crate::resume::{
-        emit_resume_rebuilt_sidecars_to_raw,
+        emit_resume_rebuilt_sidecars_to_raw_without_journal,
         rebuild_legacy_forensic_open_epoch_from_committed_prefix,
     };
     use crate::sidecar::{data_shard_crc64, encode_sidecar_tape_file, SidecarDescriptor};
@@ -1362,7 +1420,11 @@ mod tests {
             })
         }
 
-        fn write_filemark(&mut self) -> Result<RawWriteOutcome, ParityError> {
+        fn write_filemarks(
+            &mut self,
+            _count: u32,
+            _immed: bool,
+        ) -> Result<RawWriteOutcome, ParityError> {
             if self.cursor != self.records.len() {
                 return Err(ParityError::Invariant(
                     "append sink cursor is not at the physical append point",
@@ -2379,7 +2441,7 @@ mod tests {
         let mut append_sink =
             AppendRawVecSink::at_append_position(committed_records, rebuild.plan.append_position);
         let mut commit_events = Vec::new();
-        let resume_result = emit_resume_rebuilt_sidecars_to_raw(
+        let resume_result = emit_resume_rebuilt_sidecars_to_raw_without_journal(
             &mut append_sink,
             rebuild.plan,
             &rebuild.rebuilt_sidecars,

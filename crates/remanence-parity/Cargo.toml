@@ -27,6 +27,7 @@ ciborium  = { workspace = true }
 hmac      = { workspace = true }
 sha2      = { workspace = true }
 nix       = { workspace = true }
+serde     = { workspace = true }
 
 # Error enum.
 thiserror = { workspace = true }

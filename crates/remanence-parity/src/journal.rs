@@ -5,8 +5,10 @@
 //! [`CommittedBundle`] through a [`TapeFileJournal`]. The default
 //! [`FileTapeFileJournal`] is a local append-only file: a fixed header followed
 //! by length-prefixed canonical CBOR bundle records with CRC-64/XZ checksums.
-//! Replay stops at the first torn trailing record, so the recovered committed
-//! prefix is exactly the set of bundles whose `commit_bundle` call returned.
+//! Replay stops at the first torn trailing record and then filters valid
+//! records through the last `CheckpointedThrough` marker. Later valid bundles
+//! are surfaced as orphans because their tape writes were not included in a
+//! daemon checkpoint projection.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -16,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use ciborium::value::Value as CborValue;
 use nix::fcntl::{Flock, FlockArg};
+use serde::{Deserialize, Serialize};
 
 use crate::bootstrap::{
     decode_bootstrap_object_row_cbor, encode_bootstrap_object_row_cbor,
@@ -28,7 +31,7 @@ use crate::model::ParityScheme;
 use crate::sidecar::crc64_xz;
 
 const JOURNAL_MAGIC: &[u8; 8] = b"REMJRNL\x01";
-const JOURNAL_VERSION: u16 = 2;
+const JOURNAL_VERSION: u16 = 3;
 const FIXED_HEADER_LEN_WITHOUT_SCHEME: usize = 8 + 2 + 16 + 4 + 1 + 2 + 2 + 4 + 2;
 const MAX_RECORD_LEN: u64 = 64 * 1024 * 1024;
 
@@ -63,7 +66,7 @@ impl JournalError {
 }
 
 /// One journaled tape-file row inside a committed bundle.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct TapeFileEntry {
     /// Dense filemark-delimited tape-file number.
     pub tape_file_number: u32,
@@ -128,7 +131,7 @@ impl From<TapeFileMapEntry> for TapeFileEntry {
 }
 
 /// Operational kind for one atomic committed bundle.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum CommittedBundleKind {
     /// Object tape file plus the sidecars it completed.
     Object,
@@ -138,10 +141,13 @@ pub enum CommittedBundleKind {
     ResumeSidecars,
     /// Final sidecar/bootstrap bundle at tape close.
     Finish,
+    /// Watermark proving that all preceding bundles were projected by the
+    /// shared checkpoint barrier.
+    CheckpointedThrough,
 }
 
 /// One atomic journal commit unit.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CommittedBundle {
     /// Operational bundle kind.
     pub kind: CommittedBundleKind,
@@ -163,6 +169,9 @@ pub struct CommittedState {
     pub highest_protected_ordinal: u64,
     /// Total committed object-data ordinals `T`.
     pub total_committed_ordinals: u64,
+    /// Valid bundles after the last checkpoint watermark. These records are
+    /// excluded from `entries` and the committed watermarks.
+    pub orphaned_bundles: Vec<CommittedBundle>,
 }
 
 impl CommittedState {
@@ -178,10 +187,11 @@ impl CommittedState {
 
     /// Validate the v0.7.2 restart invariant for a committed prefix.
     ///
-    /// Atomic object bundles guarantee that restart only has to rebuild one
-    /// live partial epoch. If `T - W` reaches a full epoch, this journal is
-    /// either corrupt or from an obsolete experimental writer and must not be
-    /// resumed in production mode.
+    /// A full epoch auto-closes, so restart only has to rebuild the one open
+    /// explicit range after `W`. This bound does not imply that `W` is aligned
+    /// to `S*k`: a prior barrier may have closed a short epoch at any ordinal.
+    /// If `T - W` reaches a full epoch, the auto-close invariant was violated
+    /// and the journal must not be resumed in production mode.
     pub fn validate_v1_restart_bound(&self, scheme: &ParityScheme) -> Result<(), ParityError> {
         if self.highest_protected_ordinal > self.total_committed_ordinals {
             return Err(ParityError::ResumeAppend(format!(
@@ -236,6 +246,7 @@ pub struct FileTapeFileJournal {
     first_create: bool,
     last_highest_protected_ordinal: u64,
     last_total_committed_ordinals: u64,
+    orphaned_bundles_truncated_on_open: usize,
 }
 
 /// Read-only, shared-lock replay handle for a file-backed tape journal.
@@ -321,6 +332,7 @@ impl FileTapeFileJournal {
         let len = file.metadata()?.len();
         let mut last_highest_protected_ordinal = 0;
         let mut last_total_committed_ordinals = 0;
+        let mut orphaned_bundles_truncated_on_open = 0;
         if len == 0 {
             write_header(&mut file, tape_uuid, block_size, &scheme)?;
             file.sync_all()?;
@@ -336,9 +348,11 @@ impl FileTapeFileJournal {
             {
                 return Err(JournalError::HeaderMismatch);
             }
-            let committed = load_committed_from_reader(&mut file, len, TruncateTornTail::Yes)?;
+            let committed =
+                load_committed_from_reader(&mut file, len, ReplayTruncation::TornAndOrphans)?;
             last_highest_protected_ordinal = committed.highest_protected_ordinal;
             last_total_committed_ordinals = committed.total_committed_ordinals;
+            orphaned_bundles_truncated_on_open = committed.orphaned_bundles.len();
         }
         file.seek(SeekFrom::End(0))?;
         Ok(Self {
@@ -351,7 +365,13 @@ impl FileTapeFileJournal {
             first_create: !existed,
             last_highest_protected_ordinal,
             last_total_committed_ordinals,
+            orphaned_bundles_truncated_on_open,
         })
+    }
+
+    /// Number of valid post-watermark bundles removed by this exclusive open.
+    pub fn orphaned_bundles_truncated_on_open(&self) -> usize {
+        self.orphaned_bundles_truncated_on_open
     }
 
     /// Path backing this journal.
@@ -471,7 +491,7 @@ impl FileTapeFileJournalReader {
         {
             return Err(JournalError::HeaderMismatch);
         }
-        load_committed_from_reader(&mut file, file_len, TruncateTornTail::No)
+        load_committed_from_reader(&mut file, file_len, ReplayTruncation::No)
     }
 
     #[cfg(test)]
@@ -523,7 +543,7 @@ impl TapeFileJournal for FileTapeFileJournal {
         {
             return Err(JournalError::HeaderMismatch);
         }
-        load_committed_from_reader(&mut file, file_len, TruncateTornTail::Yes)
+        load_committed_from_reader(&mut file, file_len, ReplayTruncation::TornOnly)
     }
 }
 
@@ -582,6 +602,24 @@ fn validate_commit_watermarks(
     last_highest_protected_ordinal: u64,
     last_total_committed_ordinals: u64,
 ) -> Result<(), JournalError> {
+    if bundle.kind == CommittedBundleKind::CheckpointedThrough {
+        if !bundle.entries.is_empty() {
+            return Err(JournalError::Codec(
+                "checkpointed-through bundle must not contain tape-file entries".into(),
+            ));
+        }
+        if bundle.highest_protected_ordinal != last_highest_protected_ordinal
+            || bundle.total_committed_ordinals != last_total_committed_ordinals
+        {
+            return Err(JournalError::Codec(format!(
+                "checkpointed-through bundle W/T ({}/{}) must equal preceding journal state ({}/{})",
+                bundle.highest_protected_ordinal,
+                bundle.total_committed_ordinals,
+                last_highest_protected_ordinal,
+                last_total_committed_ordinals
+            )));
+        }
+    }
     if bundle.highest_protected_ordinal > bundle.total_committed_ordinals {
         return Err(JournalError::Codec(format!(
             "committed bundle W={} exceeds T={}",
@@ -606,12 +644,13 @@ fn validate_commit_watermarks(
 fn load_committed_from_reader(
     file: &mut File,
     file_len: u64,
-    truncate_torn_tail: TruncateTornTail,
+    truncation: ReplayTruncation,
 ) -> Result<CommittedState, JournalError> {
-    let mut entries = Vec::new();
-    let mut highest_protected_ordinal = 0;
-    let mut total_committed_ordinals = 0;
-    let mut valid_end = file.stream_position()?;
+    let records_start = file.stream_position()?;
+    let mut replay_highest_protected_ordinal = 0;
+    let mut replay_total_committed_ordinals = 0;
+    let mut valid_end = records_start;
+    let mut records = Vec::new();
     loop {
         let record_start = file.stream_position()?;
         let mut len_buf = [0u8; 4];
@@ -646,39 +685,73 @@ fn load_committed_from_reader(
             break;
         }
         let bundle = decode_bundle(&payload)?;
-        if bundle.highest_protected_ordinal < highest_protected_ordinal {
+        if bundle.highest_protected_ordinal < replay_highest_protected_ordinal {
             return Err(JournalError::Codec(format!(
                 "journal bundle regressed highest_protected_ordinal from {} to {}",
-                highest_protected_ordinal, bundle.highest_protected_ordinal
+                replay_highest_protected_ordinal, bundle.highest_protected_ordinal
             )));
         }
-        if bundle.total_committed_ordinals < total_committed_ordinals {
+        if bundle.total_committed_ordinals < replay_total_committed_ordinals {
             return Err(JournalError::Codec(format!(
                 "journal bundle regressed total_committed_ordinals from {} to {}",
-                total_committed_ordinals, bundle.total_committed_ordinals
+                replay_total_committed_ordinals, bundle.total_committed_ordinals
             )));
         }
-        entries.extend(bundle.entries);
+        validate_commit_watermarks(
+            &bundle,
+            replay_highest_protected_ordinal,
+            replay_total_committed_ordinals,
+        )?;
+        replay_highest_protected_ordinal = bundle.highest_protected_ordinal;
+        replay_total_committed_ordinals = bundle.total_committed_ordinals;
+        valid_end = file.stream_position()?;
+        records.push((bundle, valid_end));
+    }
+
+    let last_checkpoint_index = records
+        .iter()
+        .rposition(|(bundle, _)| bundle.kind == CommittedBundleKind::CheckpointedThrough);
+    let retained_record_count = last_checkpoint_index.map_or(0, |index| index + 1);
+    let retained_end = last_checkpoint_index
+        .map(|index| records[index].1)
+        .unwrap_or(records_start);
+    let orphaned_records = records.split_off(retained_record_count);
+    let orphaned_bundles = orphaned_records
+        .into_iter()
+        .map(|(bundle, _)| bundle)
+        .collect();
+    let mut entries = Vec::new();
+    let mut highest_protected_ordinal = 0;
+    let mut total_committed_ordinals = 0;
+    for (bundle, _) in records {
+        entries.extend(bundle.entries.iter().cloned());
         highest_protected_ordinal = bundle.highest_protected_ordinal;
         total_committed_ordinals = bundle.total_committed_ordinals;
-        valid_end = file.stream_position()?;
     }
-    if truncate_torn_tail == TruncateTornTail::Yes && valid_end < file_len {
-        file.set_len(valid_end)?;
-        file.seek(SeekFrom::Start(valid_end))?;
+
+    let truncate_end = match truncation {
+        ReplayTruncation::No => None,
+        ReplayTruncation::TornOnly => (valid_end < file_len).then_some(valid_end),
+        ReplayTruncation::TornAndOrphans => (retained_end < file_len).then_some(retained_end),
+    };
+    if let Some(truncate_end) = truncate_end {
+        file.set_len(truncate_end)?;
+        file.seek(SeekFrom::Start(truncate_end))?;
         file.sync_all()?;
     }
     Ok(CommittedState {
         entries,
         highest_protected_ordinal,
         total_committed_ordinals,
+        orphaned_bundles,
     })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TruncateTornTail {
-    Yes,
+enum ReplayTruncation {
     No,
+    TornOnly,
+    TornAndOrphans,
 }
 
 fn rollback_failed_append(
@@ -1193,6 +1266,7 @@ fn kind_code(kind: CommittedBundleKind) -> u64 {
         CommittedBundleKind::Control => 1,
         CommittedBundleKind::ResumeSidecars => 2,
         CommittedBundleKind::Finish => 3,
+        CommittedBundleKind::CheckpointedThrough => 4,
     }
 }
 
@@ -1202,6 +1276,7 @@ fn kind_from_code(value: u64) -> Result<CommittedBundleKind, JournalError> {
         1 => Ok(CommittedBundleKind::Control),
         2 => Ok(CommittedBundleKind::ResumeSidecars),
         3 => Ok(CommittedBundleKind::Finish),
+        4 => Ok(CommittedBundleKind::CheckpointedThrough),
         _ => Err(JournalError::Codec(format!(
             "unknown bundle kind code {value}"
         ))),
@@ -1277,6 +1352,24 @@ mod tests {
             highest_protected_ordinal: 3,
             total_committed_ordinals: 3,
         }
+    }
+
+    fn sample_checkpoint() -> CommittedBundle {
+        CommittedBundle {
+            kind: CommittedBundleKind::CheckpointedThrough,
+            entries: Vec::new(),
+            highest_protected_ordinal: 3,
+            total_committed_ordinals: 3,
+        }
+    }
+
+    fn commit_sample_checkpoint(journal: &mut FileTapeFileJournal) {
+        journal
+            .commit_bundle(&sample_bundle())
+            .expect("commit sample bundle");
+        journal
+            .commit_bundle(&sample_checkpoint())
+            .expect("commit checkpoint watermark");
     }
 
     fn small_scheme() -> ParityScheme {
@@ -1386,9 +1479,7 @@ mod tests {
                 !journal.drive_compression(),
                 "parity journal header must record compression disabled"
             );
-            journal
-                .commit_bundle(&sample_bundle())
-                .expect("commit bundle");
+            commit_sample_checkpoint(&mut journal);
         }
 
         let reopened = FileTapeFileJournal::open_without_volume_check_for_tests(
@@ -1459,9 +1550,7 @@ mod tests {
                 scheme.clone(),
             )
             .expect("open journal");
-            journal
-                .commit_bundle(&sample_bundle())
-                .expect("commit first bundle");
+            commit_sample_checkpoint(&mut journal);
             journal.file.write_all(&99u32.to_le_bytes()).unwrap();
             journal.file.write_all(&[0xAA, 0xBB]).unwrap();
             journal.file.sync_all().unwrap();
@@ -1496,9 +1585,7 @@ mod tests {
                 scheme.clone(),
             )
             .expect("open journal");
-            journal
-                .commit_bundle(&sample_bundle())
-                .expect("commit first bundle");
+            commit_sample_checkpoint(&mut journal);
             valid_len = journal.file.stream_position().expect("journal offset");
             journal.file.write_all(&u32::MAX.to_le_bytes()).unwrap();
             journal.file.sync_all().unwrap();
@@ -1605,9 +1692,7 @@ mod tests {
                 scheme.clone(),
             )
             .expect("open journal");
-            journal
-                .commit_bundle(&sample_bundle())
-                .expect("commit first bundle");
+            commit_sample_checkpoint(&mut journal);
             valid_len = journal.file.stream_position().expect("journal offset");
             journal.file.write_all(&u32::MAX.to_le_bytes()).unwrap();
             journal.file.sync_all().unwrap();
@@ -1630,6 +1715,110 @@ mod tests {
             len_with_torn_tail,
             "read-only replay must not truncate the journal"
         );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn replay_filters_watermark_orphans_and_exclusive_reopen_truncates_them() {
+        let path = temp_journal_path("watermark-orphans");
+        let tape_uuid = [0x4B; 16];
+        let scheme = default_scheme();
+        let checkpoint_len;
+        let orphan = CommittedBundle {
+            kind: CommittedBundleKind::Object,
+            entries: vec![TapeFileEntry::from_map_entry(TapeFileMapEntry::object(
+                2, 2, 3,
+            ))],
+            highest_protected_ordinal: 3,
+            total_committed_ordinals: 5,
+        };
+        {
+            let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+                &path,
+                tape_uuid,
+                256 * 1024,
+                scheme.clone(),
+            )
+            .expect("open journal");
+            commit_sample_checkpoint(&mut journal);
+            checkpoint_len = journal.file.stream_position().expect("checkpoint offset");
+            journal
+                .commit_bundle(&orphan)
+                .expect("commit orphan fixture");
+        }
+        let orphaned_len = fs::metadata(&path).expect("stat orphaned journal").len();
+        assert!(orphaned_len > checkpoint_len);
+
+        let reader = FileTapeFileJournalReader::open_without_volume_check_for_tests(
+            &path,
+            tape_uuid,
+            256 * 1024,
+            scheme.clone(),
+        )
+        .expect("open shared reader");
+        let state = reader.load_committed().expect("shared replay");
+        assert_eq!(state.entries, sample_bundle().entries);
+        assert_eq!(state.total_committed_ordinals, 3);
+        assert_eq!(state.orphaned_bundles, vec![orphan]);
+        assert_eq!(fs::metadata(&path).unwrap().len(), orphaned_len);
+
+        let reopened = FileTapeFileJournal::open_without_volume_check_for_tests(
+            &path,
+            tape_uuid,
+            256 * 1024,
+            scheme,
+        )
+        .expect("exclusive reopen truncates orphans");
+        assert_eq!(reopened.orphaned_bundles_truncated_on_open(), 1);
+        assert_eq!(fs::metadata(&path).unwrap().len(), checkpoint_len);
+        let repaired = reopened.load_committed().expect("replay repaired journal");
+        assert_eq!(repaired.entries, sample_bundle().entries);
+        assert!(repaired.orphaned_bundles.is_empty());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn replay_treats_all_bundles_as_orphans_before_the_first_watermark() {
+        let path = temp_journal_path("pre-watermark-orphans");
+        let tape_uuid = [0x5B; 16];
+        let scheme = default_scheme();
+        {
+            let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+                &path,
+                tape_uuid,
+                256 * 1024,
+                scheme.clone(),
+            )
+            .expect("open journal");
+            journal
+                .commit_bundle(&sample_bundle())
+                .expect("commit pre-watermark crash fixture");
+        }
+
+        let reader = FileTapeFileJournalReader::open_without_volume_check_for_tests(
+            &path,
+            tape_uuid,
+            256 * 1024,
+            scheme.clone(),
+        )
+        .expect("open shared reader");
+        let state = reader.load_committed().expect("shared replay");
+        assert!(state.entries.is_empty());
+        assert_eq!(state.orphaned_bundles, vec![sample_bundle()]);
+
+        let reopened = FileTapeFileJournal::open_without_volume_check_for_tests(
+            &path,
+            tape_uuid,
+            256 * 1024,
+            scheme,
+        )
+        .expect("exclusive reopen truncates pre-watermark bundles");
+        assert_eq!(reopened.orphaned_bundles_truncated_on_open(), 1);
+        let repaired = reopened.load_committed().expect("replay repaired journal");
+        assert!(repaired.entries.is_empty());
+        assert!(repaired.orphaned_bundles.is_empty());
 
         let _ = fs::remove_file(path);
     }
@@ -1702,6 +1891,9 @@ mod tests {
             journal
                 .commit_bundle(&sample_bundle())
                 .expect("commit first bundle");
+            journal
+                .commit_bundle(&sample_checkpoint())
+                .expect("commit checkpoint watermark");
             let mut regressed = sample_bundle();
             regressed.highest_protected_ordinal = 2;
             regressed.total_committed_ordinals = 2;
@@ -1853,6 +2045,7 @@ mod tests {
             entries: Vec::new(),
             highest_protected_ordinal: 6,
             total_committed_ordinals: 11,
+            orphaned_bundles: Vec::new(),
         };
         ok.validate_v1_restart_bound(&scheme)
             .expect("less than one open epoch is resumable");
@@ -1861,6 +2054,7 @@ mod tests {
             entries: Vec::new(),
             highest_protected_ordinal: 6,
             total_committed_ordinals: 12,
+            orphaned_bundles: Vec::new(),
         };
         let err = full_epoch
             .validate_v1_restart_bound(&scheme)
@@ -1871,6 +2065,7 @@ mod tests {
             entries: Vec::new(),
             highest_protected_ordinal: 12,
             total_committed_ordinals: 11,
+            orphaned_bundles: Vec::new(),
         };
         let err = incoherent
             .validate_v1_restart_bound(&scheme)

@@ -14,14 +14,54 @@ use remanence_format::{
 use remanence_library::{scsi::ScsiError, TapeIoError, VecBlockSink, VecBlockSource};
 use remanence_parity::{
     BlockSinkRawTapeSink, BootstrapObjectRepresentation, BootstrapObjectRow,
-    BootstrapObjectRowAdmission, CapacityReserveInput, FilemarkMap, ObjectParitySource, OpenTrust,
-    ParityError, ParityScheme, ParitySink, PhysicalPositionHint, RawReadOutcome, RawTapeSource,
-    SchemeId, ScopedFilemarkMap, SpaceFilemarksOutcome, TapeFileMapEntry, TapeFilePosition,
+    BootstrapObjectRowAdmission, CapacityReserveInput, CommittedBundle, CommittedBundleKind,
+    CommittedState, FilemarkMap, JournalError, ObjectParitySource, OpenTrust, ParityError,
+    ParityScheme, ParitySink, PhysicalPositionHint, RawReadOutcome, RawTapeSource, SchemeId,
+    ScopedFilemarkMap, SpaceFilemarksOutcome, TapeFileJournal, TapeFileMapEntry, TapeFilePosition,
 };
 use sha2::{Digest, Sha256};
 
 const BLOCK_SIZE: u32 = 4096;
 const TAPE_UUID: [u8; 16] = [0x3B; 16];
+
+#[derive(Default)]
+struct TestJournal {
+    bundles: Vec<CommittedBundle>,
+}
+
+impl TapeFileJournal for TestJournal {
+    fn tape_uuid(&self) -> [u8; 16] {
+        TAPE_UUID
+    }
+
+    fn commit_bundle(&mut self, bundle: &CommittedBundle) -> Result<(), JournalError> {
+        self.bundles.push(bundle.clone());
+        Ok(())
+    }
+
+    fn load_committed(&self) -> Result<CommittedState, JournalError> {
+        let retained_end = self
+            .bundles
+            .iter()
+            .rposition(|bundle| bundle.kind == CommittedBundleKind::CheckpointedThrough)
+            .map_or(0, |index| index + 1);
+        let retained = &self.bundles[..retained_end];
+        let last = retained
+            .iter()
+            .rev()
+            .find(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough);
+        Ok(CommittedState {
+            entries: retained
+                .iter()
+                .filter(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough)
+                .flat_map(|bundle| bundle.entries.iter().cloned())
+                .collect(),
+            highest_protected_ordinal: last.map_or(0, |bundle| bundle.highest_protected_ordinal),
+            total_committed_ordinals: last.map_or(0, |bundle| bundle.total_committed_ordinals),
+            orphaned_bundles: self.bundles[retained_end..].to_vec(),
+        })
+    }
+}
 
 #[test]
 fn rem_tar_writer_composes_with_parity_sink_and_reads_back_object_blocks() {
@@ -52,8 +92,10 @@ fn rem_tar_writer_composes_with_parity_sink_and_reads_back_object_blocks() {
     let close;
     {
         let mut raw = BlockSinkRawTapeSink::new(&mut tape);
-        let mut parity = ParitySink::new_sidecar_only(&mut raw, scheme(), TAPE_UUID, BLOCK_SIZE)
-            .expect("parity sink constructs");
+        let mut journal = TestJournal::default();
+        let mut parity =
+            ParitySink::new_with_journal(&mut raw, &mut journal, scheme(), TAPE_UUID, BLOCK_SIZE)
+                .expect("parity sink constructs");
         assert_eq!(parity.write_bootstrap().expect("BOT bootstrap"), 0);
         assert_eq!(
             parity
@@ -122,8 +164,10 @@ fn streaming_rem_tar_roundtrips_through_parity_object_source() {
     let close;
     {
         let mut raw = BlockSinkRawTapeSink::new(&mut tape);
-        let mut parity = ParitySink::new_sidecar_only(&mut raw, scheme(), TAPE_UUID, BLOCK_SIZE)
-            .expect("parity sink constructs");
+        let mut journal = TestJournal::default();
+        let mut parity =
+            ParitySink::new_with_journal(&mut raw, &mut journal, scheme(), TAPE_UUID, BLOCK_SIZE)
+                .expect("parity sink constructs");
         assert_eq!(parity.write_bootstrap().expect("BOT bootstrap"), 0);
         assert_eq!(
             parity
@@ -254,8 +298,10 @@ fn encrypted_rao_ciphertext_recovers_through_parity_before_keyed_open() {
     let close;
     {
         let mut raw = BlockSinkRawTapeSink::new(&mut tape);
-        let mut parity = ParitySink::new_sidecar_only(&mut raw, scheme(), TAPE_UUID, BLOCK_SIZE)
-            .expect("parity sink constructs");
+        let mut journal = TestJournal::default();
+        let mut parity =
+            ParitySink::new_with_journal(&mut raw, &mut journal, scheme(), TAPE_UUID, BLOCK_SIZE)
+                .expect("parity sink constructs");
         assert_eq!(parity.write_bootstrap().expect("BOT bootstrap"), 0);
         assert_eq!(
             parity

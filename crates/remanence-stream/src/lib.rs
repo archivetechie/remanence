@@ -1409,15 +1409,56 @@ mod tests {
     use remanence_format::{RemTarEntryType, RemTarObjectOptions};
     use remanence_library::{TapeIoError, VecBlockSink, VecBlockSource};
     use remanence_parity::{
-        BlockSinkRawTapeSink, BootstrapObjectRepresentation, FilemarkMap, ObjectParitySource,
-        OpenTrust, ParityScheme, PhysicalPositionHint, RawReadOutcome, RawTapeSource, SchemeId,
-        ScopedFilemarkMap, SpaceFilemarksOutcome, TapeFileMapEntry,
+        BlockSinkRawTapeSink, BootstrapObjectRepresentation, CommittedBundle, CommittedBundleKind,
+        CommittedState, FilemarkMap, JournalError, ObjectParitySource, OpenTrust, ParityScheme,
+        PhysicalPositionHint, RawReadOutcome, RawTapeSource, SchemeId, ScopedFilemarkMap,
+        SpaceFilemarksOutcome, TapeFileJournal, TapeFileMapEntry,
     };
 
     use super::*;
 
     const BLOCK_SIZE: u32 = 4096;
     const TAPE_UUID: [u8; 16] = [0x51; 16];
+
+    #[derive(Default)]
+    struct TestJournal {
+        bundles: Vec<CommittedBundle>,
+    }
+
+    impl TapeFileJournal for TestJournal {
+        fn tape_uuid(&self) -> [u8; 16] {
+            TAPE_UUID
+        }
+
+        fn commit_bundle(&mut self, bundle: &CommittedBundle) -> Result<(), JournalError> {
+            self.bundles.push(bundle.clone());
+            Ok(())
+        }
+
+        fn load_committed(&self) -> Result<CommittedState, JournalError> {
+            let retained_end = self
+                .bundles
+                .iter()
+                .rposition(|bundle| bundle.kind == CommittedBundleKind::CheckpointedThrough)
+                .map_or(0, |index| index + 1);
+            let retained = &self.bundles[..retained_end];
+            let last = retained
+                .iter()
+                .rev()
+                .find(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough);
+            Ok(CommittedState {
+                entries: retained
+                    .iter()
+                    .filter(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough)
+                    .flat_map(|bundle| bundle.entries.iter().cloned())
+                    .collect(),
+                highest_protected_ordinal: last
+                    .map_or(0, |bundle| bundle.highest_protected_ordinal),
+                total_committed_ordinals: last.map_or(0, |bundle| bundle.total_committed_ordinals),
+                orphaned_bundles: self.bundles[retained_end..].to_vec(),
+            })
+        }
+    }
 
     #[test]
     fn plan_rejects_nonregular_catalog_projection_entries() {
@@ -1452,9 +1493,15 @@ mod tests {
         let mut serial_tape = VecBlockSink::new();
         let serial_report = {
             let mut raw = BlockSinkRawTapeSink::new(&mut serial_tape);
-            let mut parity =
-                ParitySink::new_sidecar_only(&mut raw, scheme(), TAPE_UUID, BLOCK_SIZE)
-                    .expect("serial parity");
+            let mut journal = TestJournal::default();
+            let mut parity = ParitySink::new_with_journal(
+                &mut raw,
+                &mut journal,
+                scheme(),
+                TAPE_UUID,
+                BLOCK_SIZE,
+            )
+            .expect("serial parity");
             parity.write_bootstrap().expect("serial bootstrap");
             write_prepared_object_to_parity(
                 &mut parity,
@@ -1469,9 +1516,15 @@ mod tests {
         let mut overlap_tape = VecBlockSink::new();
         let overlap_report = {
             let mut raw = BlockSinkRawTapeSink::new(&mut overlap_tape);
-            let mut parity =
-                ParitySink::new_sidecar_only(&mut raw, scheme(), TAPE_UUID, BLOCK_SIZE)
-                    .expect("overlap parity");
+            let mut journal = TestJournal::default();
+            let mut parity = ParitySink::new_with_journal(
+                &mut raw,
+                &mut journal,
+                scheme(),
+                TAPE_UUID,
+                BLOCK_SIZE,
+            )
+            .expect("overlap parity");
             parity.write_bootstrap().expect("overlap bootstrap");
             let mut readers: Vec<Box<dyn Read + Send>> =
                 vec![Box::new(std::io::Cursor::new(payload))];
@@ -1515,8 +1568,15 @@ mod tests {
         let report;
         {
             let mut raw = BlockSinkRawTapeSink::new(&mut tape);
-            let mut parity =
-                ParitySink::new_sidecar_only(&mut raw, scheme(), TAPE_UUID, BLOCK_SIZE).unwrap();
+            let mut journal = TestJournal::default();
+            let mut parity = ParitySink::new_with_journal(
+                &mut raw,
+                &mut journal,
+                scheme(),
+                TAPE_UUID,
+                BLOCK_SIZE,
+            )
+            .unwrap();
             assert_eq!(parity.write_bootstrap().unwrap(), 0);
             report = write_prepared_object_to_parity(
                 &mut parity,

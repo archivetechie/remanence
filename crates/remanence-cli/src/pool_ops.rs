@@ -18,9 +18,9 @@ use remanence_aead::{RecipientPrivateKey, RecipientPublicKey};
 use remanence_api::{
     load_tape_by_uuid,
     read_core::{read_object_payload, CapturePayloadSink},
-    select_tape_in_pool, verify_tape_identity, write_to_selected_tape, PoolWriteObjectRecord,
-    PoolWriteRepresentation, PoolWriteResult, TapeIdentityError, TapeUuid,
-    WriteObjectToPoolRequest,
+    select_tape_in_pool_for_write_session, verify_tape_identity,
+    write_to_selected_tape_checkpointed, PoolWriteObjectRecord, PoolWriteRepresentation,
+    PoolWriteResult, TapeIdentityError, TapeUuid, WriteObjectToPoolRequest,
 };
 use remanence_format::{
     read_encrypted_rao_object_with_manifest_anchor, RemTarReadObject, MANIFEST_PATH,
@@ -134,9 +134,16 @@ pub fn run_archive_write(
     // -- Select tape (catalog-only, no hardware) --------------------------
     // No live reservations on a one-shot CLI invocation.
     let reserved: HashSet<TapeUuid> = HashSet::new();
+    let checkpoint_journal_dir = state_handle.config().journal.dir.join("checkpoints");
     let selected = {
         let index = state_handle.catalog_index();
-        match select_tape_in_pool(index, &pool_cfg, object_size, &reserved) {
+        match select_tape_in_pool_for_write_session(
+            index,
+            &pool_cfg,
+            object_size,
+            &reserved,
+            &checkpoint_journal_dir,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 let _ = writeln!(err, "error: select tape in pool {pool_id}: {e}");
@@ -260,14 +267,17 @@ pub fn run_archive_write(
         representation: representation.representation,
     };
 
+    let parity_journal_path = state_handle.journal_path(selected.tape_uuid);
     let result = {
         let mut sink = DriveHandleSink(&mut drive);
-        write_to_selected_tape(
+        write_to_selected_tape_checkpointed(
             state_handle.catalog_index(),
             &mut sink,
             &pool_cfg,
             request,
             selected,
+            &checkpoint_journal_dir,
+            &parity_journal_path,
         )
     };
 

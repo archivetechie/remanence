@@ -16,6 +16,7 @@
 //! fixed-block reads rather than buffer-size changes.
 
 use remanence_library::{scsi::decode_sense, TapeIoError};
+use serde::{Deserialize, Serialize};
 
 use crate::error::ParityError;
 use crate::filemark_map::FilemarkMapDigest;
@@ -119,7 +120,7 @@ pub struct BootstrapPayload {
 }
 
 /// One object row carried in a bootstrap payload's object directory.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct BootstrapObjectRow {
     /// Filemark-delimited tape-file number of the object copy.
     pub tape_file_number: u32,
@@ -182,7 +183,7 @@ impl BootstrapObjectRow {
 }
 
 /// Representation-specific payload for one bootstrap object row.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum BootstrapObjectRepresentation {
     /// Plaintext RAO representation: bootstrap row carries manifest anchors.
     Plaintext {
