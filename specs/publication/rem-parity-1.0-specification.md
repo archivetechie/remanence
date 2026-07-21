@@ -225,7 +225,7 @@ read from tape MUST be checked; overflow is rejection, never wraparound
 | Constant | Value |
 | --- | --- |
 | `BOOTSTRAP_MAGIC` | `52 45 4D 00 42 4F 4F 01` (`"REM\0BOO\x01"`, fixed bytes) |
-| `BOOTSTRAP_SCHEMA_MAJOR` / `MINOR` | 1 / 1 |
+| `BOOTSTRAP_SCHEMA_MAJOR` / `MINOR` | 1 / 2 (minor 2 added RAO object rows, key 30; Section 8.2.1) |
 | `BOOTSTRAP_HEADER_LEN` | 0x34 |
 | `FLAG_NO_PARITY` | bit 0 of the bootstrap flags |
 | `MAX_BOOTSTRAP_SCAN_BLOCKS` | 1024 |
@@ -749,6 +749,7 @@ strictly increasing `tape_file_number` order:
 | 1 | uint | REQUIRED | filemark-delimited object `tape_file_number` |
 | 2 | tstr | REQUIRED | representation marker: `"plaintext"` or `"encrypted"` |
 | 3 | uint | REQUIRED | stored block count for the object tape file |
+| 4 | bytes .size 16 | REQUIRED from minor 3 | RAO `object_id` — the identity the archive answers "where is object X" with. Readers of minors ≤ 2 tolerate its absence; a Writer at minor 3 or later MUST emit it. |
 | 10 | uint | plaintext only | `manifest_first_chunk_lba` |
 | 11 | uint | plaintext only | `manifest_size_bytes` |
 | 12 | uint | plaintext only | `manifest_chunk_count` |
@@ -828,9 +829,14 @@ opt-in.
 When the block size is unknown, the discovery candidates (256 KiB, 512 KiB,
 1 MiB) MUST each be applied as a real drive reconfiguration before reading;
 a parsed bootstrap is accepted only if its `block_size_bytes` equals the
-configured read size. Block sizes outside the candidate set are not
-discoverable without an out-of-band hint; a Scanner MUST accept an
-operator-supplied block-size hint and apply it as a configured read size.
+configured read size.
+
+A conformant Writer MUST use one of the discovery-candidate block sizes.
+This closes the writer-legal set over the discovery set: every conformant
+tape is discoverable from the media alone, with no out-of-band hint. A
+Scanner MUST nevertheless accept an operator-supplied block-size hint and
+apply it as a configured read size — the hint path serves damaged-media
+recovery and nonconformant tapes, not Writer freedom.
 
 Per-block scan rules, applied identically on the known-size and
 candidate-size paths:
