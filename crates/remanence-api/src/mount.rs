@@ -10,7 +10,7 @@ use tokio::sync::oneshot;
 use tonic::Status;
 use uuid::Uuid;
 
-use crate::pool_write::select_tape_in_pool;
+use crate::pool_write::select_tape_in_pool_for_write_session;
 use crate::{bytes_to_hex, pb, status_from_state_error, ApiState, TapeUuid};
 
 /// Error variants from `load_tape_by_uuid`.
@@ -179,8 +179,15 @@ async fn open_write_session_reserved(
     let mut select_attempts = 0u64;
     let (selected, _tape_reservation) = loop {
         select_attempts = select_attempts.saturating_add(1);
-        let selected = select_tape_in_pool(&index, &pool_cfg, 0, &pool.mounted_tape_uuids())
-            .map_err(crate::write_owner::status_from_select_tape_error)?;
+        let selected = select_tape_in_pool_for_write_session(
+            &index,
+            &pool_cfg,
+            0,
+            &pool.mounted_tape_uuids(),
+            state.checkpoint_mode,
+            state.checkpoint_journal_dir.as_path(),
+        )
+        .map_err(crate::write_owner::status_from_select_tape_error)?;
         if state.checkpoint_mode == remanence_state::CheckpointMode::Batched
             && !matches!(selected.parity_config, remanence_parity::ParityConfig::None)
         {
@@ -1649,7 +1656,125 @@ mod tests {
     use remanence_library::{
         DriveBay, ElementLayout, IdentitySource, IePort, InstalledDrive, Slot,
     };
+    use remanence_parity::{
+        CommittedBundle, CommittedBundleKind, ParityConfig, TapeFileEntry, TapeFileKind,
+    };
+    use remanence_state::{
+        CheckpointMode, PoolSelectionPolicyName, ProvisionTapeInput, TapeJournalIndexInput,
+        TapePoolConfig, TapePoolProjectionInput,
+    };
     use std::path::PathBuf;
+
+    #[test]
+    fn batched_selection_avoids_no_free_bay_failure_for_loaded_fresh_tape() {
+        const LEGACY_UUID: [u8; 16] = [1; 16];
+        const FRESH_UUID: [u8; 16] = [2; 16];
+        const BLOCK_SIZE: u32 = 256 * 1024;
+
+        let temp = tempfile::tempdir().expect("temporary mixed-estate catalog");
+        let mut index = CatalogIndex::open(temp.path().join("state.sqlite"))
+            .expect("open mixed-estate catalog");
+        index
+            .upsert_tape_pool_projection(TapePoolProjectionInput {
+                pool_id: "camera.copy-a".to_string(),
+                display_name: None,
+                copy_class: None,
+                content_class: None,
+                created_at_utc: None,
+            })
+            .expect("project pool");
+        for (tape_uuid, voltag) in [(LEGACY_UUID, "LEG001L9"), (FRESH_UUID, "NEW002L9")] {
+            index
+                .provision_tape(ProvisionTapeInput {
+                    tape_uuid,
+                    voltag: voltag.to_string(),
+                    block_size: BLOCK_SIZE,
+                    parity: ParityConfig::None,
+                    force: false,
+                })
+                .expect("provision pool tape");
+            index
+                .project_tape_pool_membership(tape_uuid, "camera.copy-a")
+                .expect("assign pool tape");
+        }
+        index
+            .project_committed_tape_file_bundle(
+                TapeJournalIndexInput {
+                    tape_uuid: LEGACY_UUID,
+                    block_size: BLOCK_SIZE,
+                    scheme: None,
+                    journal_offset_bytes: 0,
+                },
+                &CommittedBundle {
+                    kind: CommittedBundleKind::Object,
+                    entries: vec![TapeFileEntry {
+                        tape_file_number: 1,
+                        kind: TapeFileKind::Object,
+                        block_count: 3,
+                        physical_start_hint: Some(0),
+                        object_id: None,
+                        first_parity_data_ordinal: None,
+                        epoch_id: None,
+                        protected_ordinal_start: None,
+                        protected_ordinal_end_exclusive: None,
+                        canonical_metadata_hash: None,
+                        bootstrap_object_row: None,
+                    }],
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals: 3,
+                },
+            )
+            .expect("project legacy tape usage");
+        let cfg = TapePoolConfig {
+            id: "camera.copy-a".to_string(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            selection_policy: PoolSelectionPolicyName::CompleteOrFill,
+            watermark_low: 0.92,
+            watermark_high: 0.97,
+            block_size_bytes: u64::from(BLOCK_SIZE),
+            min_object_size_bytes: 0,
+        };
+
+        let batched = select_tape_in_pool_for_write_session(
+            &index,
+            &cfg,
+            0,
+            &HashSet::new(),
+            CheckpointMode::Batched,
+            &temp.path().join("checkpoints"),
+        )
+        .expect("batched selection should choose the loaded fresh tape");
+        assert_eq!(batched.tape_uuid, FRESH_UUID);
+
+        let mut fresh_bay = drive_bay(0x0101, true, Some("NEW002L9"));
+        fresh_bay.source_slot = None;
+        let mut occupied_bay = drive_bay(0x0102, true, Some("OTHER1L9"));
+        occupied_bay.source_slot = None;
+        let library = test_library(
+            vec![fresh_bay, occupied_bay],
+            vec![slot(0x0401, "LEG001L9")],
+        );
+        let mount = resolve_actor_mount_from_library(&library, "NEW002L9", &HashSet::new())
+            .expect("already-loaded fresh tape should not require a free bay");
+        assert_eq!(mount.bay, 0x0101);
+        assert!(!mount.needs_drive_load);
+
+        let per_object = select_tape_in_pool_for_write_session(
+            &index,
+            &cfg,
+            0,
+            &HashSet::new(),
+            CheckpointMode::PerObject,
+            &temp.path().join("checkpoints"),
+        )
+        .expect("per-object ranking should continue to choose the legacy tape");
+        assert_eq!(per_object.tape_uuid, LEGACY_UUID);
+        let error = resolve_actor_mount_from_library(&library, "LEG001L9", &HashSet::new())
+            .expect_err("legacy selection reproduces the occupied-bay failure");
+        assert!(error.message().contains("no free drive bay"), "{error}");
+    }
 
     #[test]
     fn actor_mount_resolution_skips_pool_busy_bay_for_slot_load() {

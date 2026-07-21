@@ -6720,6 +6720,7 @@ pub(crate) fn status_from_select_tape_error(err: SelectTapeError) -> Status {
         | SelectTapeError::NoWritableTapes { .. }
         | SelectTapeError::NoUnreservedWritableTapes { .. }
         | SelectTapeError::AmbiguousNeedsPolicy { .. } => Status::resource_exhausted(message),
+        SelectTapeError::NoBatchedEligibleTapes { .. } => Status::failed_precondition(message),
         SelectTapeError::InvalidTapeGeometry { .. } => Status::failed_precondition(message),
         SelectTapeError::InvalidTapeUuid { .. } => Status::internal(message),
         SelectTapeError::State(state) => status_from_state_error(state),

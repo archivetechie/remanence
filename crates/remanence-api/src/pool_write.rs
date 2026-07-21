@@ -575,6 +575,16 @@ pub enum SelectTapeError {
         /// Candidate tapes excluded by the live-session reservation filter.
         reserved_tape_count: usize,
     },
+    /// Every otherwise-writable candidate is unsafe for batched append.
+    #[error(
+        "pool {pool_id} has no tapes eligible for checkpoint_mode=batched; journal-less non-fresh candidates: {ineligible_candidates:?}; adoption path: rem tape adopt-checkpoint <barcode> (Phase 1.5; not yet implemented), or add a fresh tape"
+    )]
+    NoBatchedEligibleTapes {
+        /// Requested pool id.
+        pool_id: String,
+        /// Barcodes and UUIDs of candidates requiring checkpoint adoption.
+        ineligible_candidates: Vec<String>,
+    },
     /// More than one eligible tape exists; policy must choose later.
     #[error(
         "pool {pool_id} has {eligible_tape_count} eligible tapes; selection policy is not wired"
@@ -812,6 +822,48 @@ pub fn select_tape_in_pool(
     }
 }
 
+/// Select a tape for a write-session open under the configured durability mode.
+///
+/// Per-object mode delegates directly to the historical selector. Batched mode
+/// removes journal-less non-fresh tapes before the configured policy ranks the
+/// remaining candidates, keeping drive admission as a final safety backstop.
+pub(crate) fn select_tape_in_pool_for_write_session(
+    state: &CatalogIndex,
+    pool_cfg: &TapePoolConfig,
+    object_size: u64,
+    reserved_tape_uuids: &HashSet<TapeUuid>,
+    checkpoint_mode: remanence_state::CheckpointMode,
+    checkpoint_journal_dir: &Path,
+) -> Result<SelectedTape, SelectTapeError> {
+    match checkpoint_mode {
+        remanence_state::CheckpointMode::PerObject => {
+            select_tape_in_pool(state, pool_cfg, object_size, reserved_tape_uuids)
+        }
+        remanence_state::CheckpointMode::Batched => match pool_cfg.selection_policy {
+            remanence_state::PoolSelectionPolicyName::CompleteOrFill => {
+                select_tape_in_pool_with_policy_and_batched_eligibility(
+                    state,
+                    pool_cfg,
+                    object_size,
+                    reserved_tape_uuids,
+                    &CompleteOrFill,
+                    checkpoint_journal_dir,
+                )
+            }
+            remanence_state::PoolSelectionPolicyName::FillOldest => {
+                select_tape_in_pool_with_policy_and_batched_eligibility(
+                    state,
+                    pool_cfg,
+                    object_size,
+                    reserved_tape_uuids,
+                    &FillOldest,
+                    checkpoint_journal_dir,
+                )
+            }
+        },
+    }
+}
+
 /// Select an eligible tape from a pool using a caller-supplied pure policy.
 ///
 /// This is the narrow integration adapter for the current non-hardware path:
@@ -824,6 +876,42 @@ pub fn select_tape_in_pool_with_policy(
     object_size: u64,
     reserved_tape_uuids: &HashSet<TapeUuid>,
     policy: &dyn PoolSelectionPolicy,
+) -> Result<SelectedTape, SelectTapeError> {
+    select_tape_in_pool_with_policy_and_eligibility(
+        state,
+        pool_cfg,
+        object_size,
+        reserved_tape_uuids,
+        policy,
+        None,
+    )
+}
+
+fn select_tape_in_pool_with_policy_and_batched_eligibility(
+    state: &CatalogIndex,
+    pool_cfg: &TapePoolConfig,
+    object_size: u64,
+    reserved_tape_uuids: &HashSet<TapeUuid>,
+    policy: &dyn PoolSelectionPolicy,
+    checkpoint_journal_dir: &Path,
+) -> Result<SelectedTape, SelectTapeError> {
+    select_tape_in_pool_with_policy_and_eligibility(
+        state,
+        pool_cfg,
+        object_size,
+        reserved_tape_uuids,
+        policy,
+        Some(checkpoint_journal_dir),
+    )
+}
+
+fn select_tape_in_pool_with_policy_and_eligibility(
+    state: &CatalogIndex,
+    pool_cfg: &TapePoolConfig,
+    object_size: u64,
+    reserved_tape_uuids: &HashSet<TapeUuid>,
+    policy: &dyn PoolSelectionPolicy,
+    checkpoint_journal_dir: Option<&Path>,
 ) -> Result<SelectedTape, SelectTapeError> {
     let requested_pool_id = pool_cfg.id.trim();
     let pool =
@@ -842,11 +930,15 @@ pub fn select_tape_in_pool_with_policy(
         return Err(SelectTapeError::EmptyPool { pool_id });
     }
     validate_pool_capacity_invariant_for_tapes(pool_cfg, &tapes)?;
+    let checkpoint_journal_tapes = checkpoint_journal_dir
+        .map(checkpoint_journal_tape_uuids)
+        .transpose()?;
 
     // 2a-2 owns the hard writability precondition (state/geometry/capacity fit);
     // the policy ranks only the tapes that pass it (design §6 boundary).
     let mut reasons = Vec::new();
     let mut eligible = Vec::new();
+    let mut batched_ineligible = Vec::new();
     for tape in tapes {
         if let Err(err) = check_writability_preconditions(&tape, object_size)
             .and_then(|_| check_pool_block_size_precondition(&tape, pool_cfg))
@@ -865,9 +957,35 @@ pub fn select_tape_in_pool_with_policy(
             });
             continue;
         }
+        if let (Some(checkpoint_journal_dir), Some(checkpoint_journal_tapes)) =
+            (checkpoint_journal_dir, checkpoint_journal_tapes.as_ref())
+        {
+            let fresh =
+                tape.total_committed_ordinals == 0 && tape.last_committed_tape_file.is_none();
+            let carries_checkpoint = fresh
+                || tape_carries_checkpoint(
+                    checkpoint_journal_dir,
+                    checkpoint_journal_tapes,
+                    tape_uuid,
+                )?;
+            if !carries_checkpoint {
+                batched_ineligible.push(format!(
+                    "{} ({})",
+                    tape.voltag.as_deref().unwrap_or("<no-voltag>"),
+                    Uuid::from_bytes(tape_uuid)
+                ));
+                continue;
+            }
+        }
         eligible.push(tape);
     }
     if eligible.is_empty() {
+        if !batched_ineligible.is_empty() {
+            return Err(SelectTapeError::NoBatchedEligibleTapes {
+                pool_id,
+                ineligible_candidates: batched_ineligible,
+            });
+        }
         return Err(SelectTapeError::NoWritableTapes { pool_id, reasons });
     }
     eligible.sort_by(compare_tapes_for_pool_selection);
@@ -915,6 +1033,30 @@ pub fn select_tape_in_pool_with_policy(
             }),
         Selection::NeedFreshTape => Err(SelectTapeError::NoWritableTapes { pool_id, reasons }),
     }
+}
+
+fn checkpoint_journal_tape_uuids(
+    checkpoint_journal_dir: &Path,
+) -> Result<HashSet<TapeUuid>, StateError> {
+    let mut journal_tapes = HashSet::new();
+    for path in remanence_state::list_checkpoint_journals(checkpoint_journal_dir)? {
+        let tape_uuid = remanence_state::tape_uuid_from_checkpoint_path(path.as_path())?;
+        journal_tapes.insert(tape_uuid);
+    }
+    Ok(journal_tapes)
+}
+
+fn tape_carries_checkpoint(
+    checkpoint_journal_dir: &Path,
+    checkpoint_journal_tapes: &HashSet<TapeUuid>,
+    tape_uuid: TapeUuid,
+) -> Result<bool, StateError> {
+    if !checkpoint_journal_tapes.contains(&tape_uuid) {
+        return Ok(false);
+    }
+    remanence_state::FileCheckpointJournal::open(checkpoint_journal_dir, tape_uuid)?
+        .last()
+        .map(|record| record.is_some())
 }
 
 /// Write one regular file to a caller-named pool using the Phase 1
