@@ -66,7 +66,7 @@ pub use journal::{
     CommittedBundle, CommittedBundleKind, CommittedState, FileTapeFileJournal,
     FileTapeFileJournalReader, JournalError, TapeFileEntry, TapeFileJournal,
 };
-pub use mapping::{data_shards_per_epoch};
+pub use mapping::data_shards_per_epoch;
 pub use model::{
     FinalGeometry, ObjectParityState, ObjectParityStateUpdateRange, ParityScheme, RecoveryEvent,
     RecoveryOutcome, SchemeId, SidecarMetadataHealth, SidecarMetadataHealthEvent, StripeAddress,
