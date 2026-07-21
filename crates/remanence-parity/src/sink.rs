@@ -167,6 +167,74 @@ fn worst_case_parity_map_reference() -> ParityMapReference {
     }
 }
 
+fn checkpoint_batch_candidate_rows(
+    committed_rows: &[BootstrapObjectRow],
+    object_count: u64,
+    block_size_bytes: u32,
+) -> Result<Vec<BootstrapObjectRow>, ParityError> {
+    let mut candidate_rows = committed_rows.to_vec();
+    let object_count_u32 = u32::try_from(object_count)
+        .map_err(|_| ParityError::Invariant("checkpoint object limit exceeds u32"))?;
+    let first_tape_file = u32::MAX
+        .checked_sub(object_count_u32.saturating_sub(1))
+        .ok_or(ParityError::Invariant(
+            "checkpoint row reservation tape-file range underflows",
+        ))?;
+    for offset in 0..object_count {
+        let offset = u32::try_from(offset)
+            .map_err(|_| ParityError::Invariant("checkpoint object limit exceeds u32"))?;
+        let tape_file_number =
+            first_tape_file
+                .checked_add(offset)
+                .ok_or(ParityError::Invariant(
+                    "checkpoint row reservation tape-file number overflows",
+                ))?;
+        candidate_rows.push(worst_case_bootstrap_object_row(
+            BootstrapObjectRowAdmission::EncryptedRao,
+            tape_file_number,
+            u64::MAX,
+            block_size_bytes,
+        )?);
+    }
+    Ok(candidate_rows)
+}
+
+fn validate_bootstrap_object_rows_fit_for(
+    scheme: &ParityScheme,
+    tape_uuid: [u8; 16],
+    block_size_bytes: u32,
+    object_rows: &[BootstrapObjectRow],
+) -> Result<(), ParityError> {
+    let payload = BootstrapPayload {
+        scheme: Some(ParitySchemeRecord {
+            id: scheme.id.as_str().to_string(),
+            data_blocks_per_stripe: scheme.data_blocks_per_stripe,
+            parity_blocks_per_stripe: scheme.parity_blocks_per_stripe,
+            stripes_per_neighborhood: scheme.stripes_per_neighborhood,
+            no_parity_flag: false,
+        }),
+        no_parity_flag: false,
+        filemark_map_digest: Some(FilemarkMapDigest {
+            map_sha256: [0; 32],
+            tape_file_count: u32::MAX,
+            map_total_data_ordinals: u64::MAX,
+            highest_protected_ordinal: u64::MAX,
+            is_final_map: true,
+        }),
+        tape_uuid,
+        written_by_version: env!("CARGO_PKG_VERSION").to_string(),
+        written_at: String::new(),
+        sequence: u32::MAX,
+        block_size_bytes,
+        drive_compression: false,
+        sidecar_epoch_directory: None,
+        parity_map_reference: Some(worst_case_parity_map_reference()),
+        object_rows: object_rows.to_vec(),
+    };
+    let mut block = vec![0u8; block_size_bytes as usize];
+    write_bootstrap_block(&payload, &mut block).map(|_| ())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct EarlyWarningReserveState {
     input: CapacityReserveInput,
@@ -267,6 +335,7 @@ struct PendingSidecar {
     protected_ordinal_end_exclusive: u64,
     parity_shards: Vec<Vec<u8>>,
     data_shard_crc64s: Vec<u64>,
+    is_terminal: bool,
 }
 
 struct ParitySinkBackend<'a>(&'a mut dyn RawTapeSink);
@@ -296,8 +365,16 @@ impl ParitySinkBackend<'_> {
         }
     }
 
-    fn write_one_filemark(&mut self) -> Result<WriteFilemarksOutcome, TapeIoError> {
-        match self.0.write_filemark().map_err(parity_error_to_tape_io)? {
+    fn write_filemarks(
+        &mut self,
+        count: u32,
+        immed: bool,
+    ) -> Result<WriteFilemarksOutcome, TapeIoError> {
+        match self
+            .0
+            .write_filemarks(count, immed)
+            .map_err(parity_error_to_tape_io)?
+        {
             RawWriteOutcome::WroteFilemark {
                 position_after,
                 early_warning,
@@ -308,7 +385,7 @@ impl ParitySinkBackend<'_> {
                 physical_to_tape_position(position_after),
             )),
             RawWriteOutcome::WroteBlock { .. } => Err(invalid_input(
-                "RawTapeSink::write_filemark returned a block outcome",
+                "RawTapeSink::write_filemarks returned a block outcome",
             )),
         }
     }
@@ -510,6 +587,108 @@ pub struct CheckpointResult {
     pub highest_protected_ordinal: u64,
     /// Total committed object-data ordinals after the checkpoint bundle.
     pub total_committed_ordinals: u64,
+    /// Sidecars emitted by this stop, including a short open epoch if present.
+    pub sidecars_emitted: Vec<SidecarWriteSummary>,
+    /// Successful zero-count synchronous barrier outcome.
+    pub barrier_outcome: WriteFilemarksOutcome,
+    /// Physical blocks used through the proved post-barrier position.
+    pub used_tape_blocks: u64,
+    /// True for the terminal Finish close.
+    pub is_terminal: bool,
+    /// Control/finish bundle made durable by this stop, excluding the
+    /// following zero-entry watermark marker.
+    pub committed_bundle: CommittedBundle,
+}
+
+/// Reason the session-scoped parity sink closes its current epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseReason {
+    /// Checkpoint boundary; a short epoch is legal and non-terminal.
+    Barrier,
+    /// Terminal tape close.
+    Finish,
+}
+
+/// Opaque actor-carried state for one logical parity write session.
+///
+/// The raw transport and journal handles are deliberately excluded so an
+/// owner actor can release their mutable borrows between commands while the
+/// epoch accumulator, file-numbering state, and bootstrap directory survive
+/// across object appends.
+#[allow(missing_debug_implementations)]
+pub struct ParitySinkSessionState {
+    scheme: ParityScheme,
+    tape_uuid: [u8; 16],
+    codec: ReedSolomonCodec,
+    block_size_bytes: u32,
+    neighborhood_idx: u64,
+    current_epoch_start: u64,
+    data_blocks_in_neighborhood: u64,
+    parity_accumulators: Vec<Vec<Vec<u8>>>,
+    current_epoch_data_crc64s: Vec<u64>,
+    pending_sidecars: Vec<PendingSidecar>,
+    highest_protected_ordinal: u64,
+    block_size: Option<usize>,
+    poisoned: bool,
+    last_data_lba: u64,
+    filemark_map: FilemarkMapBuilder,
+    sidecar_directory_entries: Vec<SidecarEpochDirectoryEntry>,
+    bootstrap_object_rows: Vec<BootstrapObjectRow>,
+    durable_boundary: DurableBoundaryState,
+    control_metadata_hashes: BTreeMap<u32, [u8; 32]>,
+    early_warning_reserve: Option<EarlyWarningReserveState>,
+    hardware_early_warning_seen: bool,
+    next_bootstrap_sequence: u32,
+    next_parity_map_sequence: u32,
+    bootstrap_placement_policy: Option<BootstrapPlacementPolicy>,
+    bootstrap_placement_state: BootstrapPlacementState,
+    last_physical_lba: u64,
+    reserved_bootstrap_object_row_slots: u64,
+}
+
+impl ParitySinkSessionState {
+    /// Total object-data ordinals already present in this logical session.
+    pub fn total_committed_ordinals(&self) -> Result<u64, ParityError> {
+        self.filemark_map.total_data_ordinals()
+    }
+
+    /// Last physical LBA proved by the sink.
+    pub fn used_tape_blocks(&self) -> u64 {
+        self.last_physical_lba
+    }
+
+    /// Whether any successful raw operation in this session reported early
+    /// warning. The bit is sticky so a later checkpoint barrier cannot lose
+    /// an EW observed in the middle of an object or sidecar.
+    pub fn hardware_early_warning_seen(&self) -> bool {
+        self.hardware_early_warning_seen
+    }
+
+    /// Reserve worst-case encrypted bootstrap rows before a checkpoint batch
+    /// consumes this detached session state.
+    pub fn reserve_checkpoint_batch_object_rows(
+        &mut self,
+        object_count: u64,
+    ) -> Result<(), ParityError> {
+        if self.reserved_bootstrap_object_row_slots != 0 {
+            return Err(ParityError::Invariant(
+                "checkpoint row headroom can only be reserved between batches",
+            ));
+        }
+        let candidate_rows = checkpoint_batch_candidate_rows(
+            &self.bootstrap_object_rows,
+            object_count,
+            self.block_size_bytes,
+        )?;
+        validate_bootstrap_object_rows_fit_for(
+            &self.scheme,
+            self.tape_uuid,
+            self.block_size_bytes,
+            &candidate_rows,
+        )?;
+        self.reserved_bootstrap_object_row_slots = object_count;
+        Ok(())
+    }
 }
 
 /// Content-driven bootstrap cadence from Layer 3c §7.3.
@@ -607,7 +786,7 @@ pub struct ResumeWriterSeed<'a> {
     /// Rebuilt partial epoch to load into the writer. `Some` means the
     /// resume rebuild left a non-empty partial epoch; `None` means
     /// `resume_result.live_epoch_start == resume_result.next_data_ordinal`
-    /// and that ordinal is epoch-aligned. Consumed by value so the shard
+    /// at the end of the last explicit protected range. Consumed by value so the shard
     /// buffers are moved into the sink rather than cloned.
     pub live_epoch: Option<ResumeLiveEpochState>,
     /// Next sink-owned bootstrap sequence number to assign. Must be at least
@@ -641,6 +820,10 @@ pub struct ParitySink<'a> {
     /// the writer finishes emitting parity for a full
     /// neighborhood (step 11.8).
     neighborhood_idx: u64,
+
+    /// First ordinal in the explicitly ranged current epoch. Epoch ids are
+    /// bare monotonic labels and never derive this value.
+    current_epoch_start: u64,
 
     /// Count of data blocks the writer has handed us in the
     /// current neighborhood. Drives the row-major interleave
@@ -736,6 +919,9 @@ pub struct ParitySink<'a> {
     /// not-yet-durable commitments?" predicate.
     early_warning_reserve: Option<EarlyWarningReserveState>,
 
+    /// Sticky hardware EW observation for barrier-time sealing.
+    hardware_early_warning_seen: bool,
+
     /// Next sink-owned bootstrap sequence number.
     next_bootstrap_sequence: u32,
 
@@ -752,9 +938,106 @@ pub struct ParitySink<'a> {
     /// avoids issuing extra POSITION probes solely for placement distance
     /// accounting.
     last_physical_lba: u64,
+
+    /// Worst-case directory rows reserved by the actor at batch admission.
+    reserved_bootstrap_object_row_slots: u64,
 }
 
 impl<'a> ParitySink<'a> {
+    /// Detach the logical session state after an object or barrier boundary.
+    ///
+    /// This is the actor handoff seam: no tape file may be active, and the
+    /// next command must reattach the state to the same tape journal.
+    pub fn into_session_state(self) -> Result<ParitySinkSessionState, ParityError> {
+        if self.active_object.is_some() || self.pending_bootstrap_object_row.is_some() {
+            return Err(ParityError::Invariant(
+                "cannot detach parity session state while an object is active",
+            ));
+        }
+        Ok(ParitySinkSessionState {
+            scheme: self.scheme,
+            tape_uuid: self.tape_uuid,
+            codec: self.codec,
+            block_size_bytes: self.block_size_bytes,
+            neighborhood_idx: self.neighborhood_idx,
+            current_epoch_start: self.current_epoch_start,
+            data_blocks_in_neighborhood: self.data_blocks_in_neighborhood,
+            parity_accumulators: self.parity_accumulators,
+            current_epoch_data_crc64s: self.current_epoch_data_crc64s,
+            pending_sidecars: self.pending_sidecars,
+            highest_protected_ordinal: self.highest_protected_ordinal,
+            block_size: self.block_size,
+            poisoned: self.poisoned,
+            last_data_lba: self.last_data_lba,
+            filemark_map: self.filemark_map,
+            sidecar_directory_entries: self.sidecar_directory_entries,
+            bootstrap_object_rows: self.bootstrap_object_rows,
+            durable_boundary: self.durable_boundary,
+            control_metadata_hashes: self.control_metadata_hashes,
+            early_warning_reserve: self.early_warning_reserve,
+            hardware_early_warning_seen: self.hardware_early_warning_seen,
+            next_bootstrap_sequence: self.next_bootstrap_sequence,
+            next_parity_map_sequence: self.next_parity_map_sequence,
+            bootstrap_placement_policy: self.bootstrap_placement_policy,
+            bootstrap_placement_state: self.bootstrap_placement_state,
+            last_physical_lba: self.last_physical_lba,
+            reserved_bootstrap_object_row_slots: self.reserved_bootstrap_object_row_slots,
+        })
+    }
+
+    /// Reattach actor-carried state to the transport and durable sink journal.
+    pub fn from_session_state(
+        inner: &'a mut dyn RawTapeSink,
+        journal: &'a mut dyn TapeFileJournal,
+        state: ParitySinkSessionState,
+    ) -> Result<Self, ParityError> {
+        if journal.tape_uuid() != state.tape_uuid {
+            return Err(ParityError::SessionOpen(
+                "journal tape UUID does not match parity session state".into(),
+            ));
+        }
+        let observed = inner.position()?;
+        if observed.partition != 0 || observed.lba != state.last_physical_lba {
+            return Err(ParityError::SessionOpen(format!(
+                "parity session transport is at partition {} lba {}, expected partition 0 lba {}",
+                observed.partition, observed.lba, state.last_physical_lba
+            )));
+        }
+        Ok(Self {
+            backend: ParitySinkBackend(inner),
+            journal: Some(journal),
+            scheme: state.scheme,
+            tape_uuid: state.tape_uuid,
+            codec: state.codec,
+            block_size_bytes: state.block_size_bytes,
+            neighborhood_idx: state.neighborhood_idx,
+            current_epoch_start: state.current_epoch_start,
+            data_blocks_in_neighborhood: state.data_blocks_in_neighborhood,
+            parity_accumulators: state.parity_accumulators,
+            current_epoch_data_crc64s: state.current_epoch_data_crc64s,
+            pending_sidecars: state.pending_sidecars,
+            highest_protected_ordinal: state.highest_protected_ordinal,
+            block_size: state.block_size,
+            poisoned: state.poisoned,
+            last_data_lba: state.last_data_lba,
+            active_object: None,
+            pending_bootstrap_object_row: None,
+            filemark_map: state.filemark_map,
+            sidecar_directory_entries: state.sidecar_directory_entries,
+            bootstrap_object_rows: state.bootstrap_object_rows,
+            durable_boundary: state.durable_boundary,
+            control_metadata_hashes: state.control_metadata_hashes,
+            early_warning_reserve: state.early_warning_reserve,
+            hardware_early_warning_seen: state.hardware_early_warning_seen,
+            next_bootstrap_sequence: state.next_bootstrap_sequence,
+            next_parity_map_sequence: state.next_parity_map_sequence,
+            bootstrap_placement_policy: state.bootstrap_placement_policy,
+            bootstrap_placement_state: state.bootstrap_placement_state,
+            last_physical_lba: state.last_physical_lba,
+            reserved_bootstrap_object_row_slots: state.reserved_bootstrap_object_row_slots,
+        })
+    }
+
     /// Construct a new sidecar-only parity sink wrapping `inner`.
     ///
     /// `block_size_bytes` is the tape's logical block size
@@ -764,7 +1047,8 @@ impl<'a> ParitySink<'a> {
     /// write and needs to know how big the on-tape buffer is.
     /// Returns [`ParityError::InvalidScheme`] if the scheme
     /// fails validation.
-    pub fn new(
+    #[cfg(test)]
+    pub(crate) fn new(
         inner: &'a mut dyn RawTapeSink,
         scheme: ParityScheme,
         tape_uuid: [u8; 16],
@@ -808,7 +1092,8 @@ impl<'a> ParitySink<'a> {
     /// Construct a Layer 3c v0.4.4 sidecar-only parity sink.
     ///
     /// Retained as a readable alias for [`Self::new`].
-    pub fn new_sidecar_only(
+    #[cfg(test)]
+    pub(crate) fn new_sidecar_only(
         inner: &'a mut dyn RawTapeSink,
         scheme: ParityScheme,
         tape_uuid: [u8; 16],
@@ -825,6 +1110,49 @@ impl<'a> ParitySink<'a> {
     /// without cloning its data shards.
     pub fn new_sidecar_only_from_resume(
         inner: &'a mut dyn RawTapeSink,
+        journal: &'a mut dyn TapeFileJournal,
+        scheme: ParityScheme,
+        tape_uuid: [u8; 16],
+        block_size_bytes: u32,
+        resume_seed: ResumeWriterSeed<'_>,
+    ) -> Result<Self, ParityError> {
+        if journal.tape_uuid() != tape_uuid {
+            return Err(ParityError::SessionOpen(
+                "journal tape UUID does not match parity sink tape UUID".into(),
+            ));
+        }
+        Self::new_sidecar_only_from_resume_inner(
+            inner,
+            Some(journal),
+            scheme,
+            tape_uuid,
+            block_size_bytes,
+            resume_seed,
+        )
+    }
+
+    /// Journal-less constructor for unit tests of failure boundaries.
+    #[cfg(test)]
+    pub(crate) fn new_sidecar_only_from_resume_without_journal(
+        inner: &'a mut dyn RawTapeSink,
+        scheme: ParityScheme,
+        tape_uuid: [u8; 16],
+        block_size_bytes: u32,
+        resume_seed: ResumeWriterSeed<'_>,
+    ) -> Result<Self, ParityError> {
+        Self::new_sidecar_only_from_resume_inner(
+            inner,
+            None,
+            scheme,
+            tape_uuid,
+            block_size_bytes,
+            resume_seed,
+        )
+    }
+
+    fn new_sidecar_only_from_resume_inner(
+        inner: &'a mut dyn RawTapeSink,
+        journal: Option<&'a mut dyn TapeFileJournal>,
         scheme: ParityScheme,
         tape_uuid: [u8; 16],
         block_size_bytes: u32,
@@ -832,7 +1160,7 @@ impl<'a> ParitySink<'a> {
     ) -> Result<Self, ParityError> {
         let mut sink = Self::new_with_backend(
             ParitySinkBackend(inner),
-            None,
+            journal,
             scheme,
             tape_uuid,
             block_size_bytes,
@@ -957,6 +1285,7 @@ impl<'a> ParitySink<'a> {
             codec,
             block_size_bytes,
             neighborhood_idx: 0,
+            current_epoch_start: 0,
             data_blocks_in_neighborhood: 0,
             parity_accumulators,
             current_epoch_data_crc64s: Vec::new(),
@@ -973,12 +1302,37 @@ impl<'a> ParitySink<'a> {
             durable_boundary: DurableBoundaryState::new(),
             control_metadata_hashes: BTreeMap::new(),
             early_warning_reserve: None,
+            hardware_early_warning_seen: false,
             next_bootstrap_sequence: 0,
             next_parity_map_sequence: 0,
             bootstrap_placement_policy: None,
             bootstrap_placement_state: BootstrapPlacementState::default(),
             last_physical_lba: 0,
+            reserved_bootstrap_object_row_slots: 0,
         })
+    }
+
+    /// Reserve worst-case encrypted bootstrap-directory rows for a new batch.
+    ///
+    /// The barrier owner calls this before the first object reaches tape. Once
+    /// it succeeds, exact row recording cannot become a fallible ceiling gate.
+    pub fn reserve_checkpoint_batch_object_rows(
+        &mut self,
+        object_count: u64,
+    ) -> Result<(), ParityError> {
+        if self.active_object.is_some() || self.reserved_bootstrap_object_row_slots != 0 {
+            return Err(ParityError::Invariant(
+                "checkpoint row headroom can only be reserved between batches",
+            ));
+        }
+        let candidate_rows = checkpoint_batch_candidate_rows(
+            &self.bootstrap_object_rows,
+            object_count,
+            self.block_size_bytes,
+        )?;
+        self.validate_bootstrap_object_rows_fit(&candidate_rows)?;
+        self.reserved_bootstrap_object_row_slots = object_count;
+        Ok(())
     }
 
     fn validate_resume_prefix(
@@ -1139,21 +1493,23 @@ impl<'a> ParitySink<'a> {
         resume_result: &ResumeAppendResult,
         live_epoch: Option<ResumeLiveEpochState>,
     ) -> Result<(), ParityError> {
-        let epoch_data_shards = self.epoch_data_shards()?;
         let Some(live) = live_epoch else {
             if resume_result.live_epoch_start != resume_result.next_data_ordinal {
                 return Err(ParityError::Invariant(
                     "resume result without live epoch has a non-empty live range",
                 ));
             }
-            if resume_result.next_data_ordinal % epoch_data_shards != 0 {
+            if resume_result.highest_protected_ordinal != resume_result.next_data_ordinal {
                 return Err(ParityError::Invariant(
-                    "resume result without live epoch is not aligned to an epoch boundary",
+                    "resume result without live epoch does not end at its protection watermark",
                 ));
             }
-            self.neighborhood_idx = resume_result.next_data_ordinal / epoch_data_shards;
+            self.neighborhood_idx = resume_result.next_epoch_id;
+            self.current_epoch_start = resume_result.next_data_ordinal;
             return Ok(());
         };
+
+        let epoch_data_shards = self.epoch_data_shards()?;
 
         let ResumeLiveEpochState {
             epoch_id,
@@ -1171,15 +1527,14 @@ impl<'a> ParitySink<'a> {
                 "resume live epoch range does not match ResumeAppendResult",
             ));
         }
-        if protected_ordinal_start % epoch_data_shards != 0 {
+        if protected_ordinal_start != resume_result.highest_protected_ordinal {
             return Err(ParityError::Invariant(
-                "resume live epoch does not start on an epoch boundary",
+                "resume live epoch does not start at the protected-range watermark",
             ));
         }
-        let expected_epoch_id = protected_ordinal_start / epoch_data_shards;
-        if epoch_id != expected_epoch_id {
+        if epoch_id != resume_result.next_epoch_id {
             return Err(ParityError::Invariant(
-                "resume live epoch id does not match its ordinal range",
+                "resume live epoch id does not match the next monotonic epoch id",
             ));
         }
         let data_blocks = next_data_ordinal
@@ -1250,6 +1605,7 @@ impl<'a> ParitySink<'a> {
         }
 
         self.neighborhood_idx = epoch_id;
+        self.current_epoch_start = protected_ordinal_start;
         self.data_blocks_in_neighborhood = data_blocks_in_epoch;
         self.block_size = Some(block_size);
         self.current_epoch_data_crc64s = data_shard_crc64s;
@@ -1310,7 +1666,15 @@ impl<'a> ParitySink<'a> {
         self.validate_capacity_reserve_input(&input)?;
         let report = input.evaluate()?;
         if let Some(admission) = object_row_admission {
-            self.validate_bootstrap_object_row_admission_fit(admission, input)?;
+            if self.reserved_bootstrap_object_row_slots == 0 {
+                self.validate_bootstrap_object_row_admission_fit(admission, input)?;
+            } else {
+                debug_assert!(
+                    self.validate_bootstrap_object_row_admission_fit(admission, input)
+                        .is_ok(),
+                    "batch-admitted bootstrap row must fit at object begin"
+                );
+            }
         }
         let tape_file_number = self.start_object_after_reserve(input, report)?;
         Ok((tape_file_number, report))
@@ -1339,7 +1703,7 @@ impl<'a> ParitySink<'a> {
                 "finish_object called before any object blocks were written",
             ));
         }
-        let filemark_outcome = match self.backend.write_one_filemark() {
+        let filemark_outcome = match self.backend.write_filemarks(1, true) {
             Ok(outcome) => outcome,
             Err(err) => {
                 if err.is_completion_unknown() {
@@ -1495,7 +1859,16 @@ impl<'a> ParitySink<'a> {
         }
         let mut candidate_rows = self.bootstrap_object_rows.clone();
         candidate_rows.push(row.clone());
-        self.validate_bootstrap_object_rows_fit(&candidate_rows)?;
+        if self.reserved_bootstrap_object_row_slots == 0 {
+            self.validate_bootstrap_object_rows_fit(&candidate_rows)?;
+        } else {
+            debug_assert!(
+                self.validate_bootstrap_object_rows_fit(&candidate_rows)
+                    .is_ok(),
+                "batch-admitted bootstrap row must fit at record time"
+            );
+            self.reserved_bootstrap_object_row_slots -= 1;
+        }
         self.pending_bootstrap_object_row = Some(row);
         Ok(())
     }
@@ -1504,34 +1877,12 @@ impl<'a> ParitySink<'a> {
         &self,
         object_rows: &[BootstrapObjectRow],
     ) -> Result<(), ParityError> {
-        let payload = BootstrapPayload {
-            scheme: Some(ParitySchemeRecord {
-                id: self.scheme.id.as_str().to_string(),
-                data_blocks_per_stripe: self.scheme.data_blocks_per_stripe,
-                parity_blocks_per_stripe: self.scheme.parity_blocks_per_stripe,
-                stripes_per_neighborhood: self.scheme.stripes_per_neighborhood,
-                no_parity_flag: false,
-            }),
-            no_parity_flag: false,
-            filemark_map_digest: Some(FilemarkMapDigest {
-                map_sha256: [0; 32],
-                tape_file_count: u32::MAX,
-                map_total_data_ordinals: u64::MAX,
-                highest_protected_ordinal: u64::MAX,
-                is_final_map: true,
-            }),
-            tape_uuid: self.tape_uuid,
-            written_by_version: env!("CARGO_PKG_VERSION").to_string(),
-            written_at: String::new(),
-            sequence: u32::MAX,
-            block_size_bytes: self.block_size_bytes,
-            drive_compression: false,
-            sidecar_epoch_directory: None,
-            parity_map_reference: Some(worst_case_parity_map_reference()),
-            object_rows: object_rows.to_vec(),
-        };
-        let mut block = vec![0u8; self.block_size_bytes as usize];
-        write_bootstrap_block(&payload, &mut block).map(|_| ())
+        validate_bootstrap_object_rows_fit_for(
+            &self.scheme,
+            self.tape_uuid,
+            self.block_size_bytes,
+            object_rows,
+        )
     }
 
     fn validate_bootstrap_object_row_admission_fit(
@@ -1577,13 +1928,7 @@ impl<'a> ParitySink<'a> {
     /// partial parity epoch; restart rebuilds that open epoch from the
     /// committed prefix.
     pub fn checkpoint(&mut self) -> Result<CheckpointResult, ParityError> {
-        let bootstrap_tape_file_number = self.write_bootstrap()?;
-        Ok(CheckpointResult {
-            bootstrap_tape_file_number,
-            tape_file_count: self.filemark_map.next_tape_file_number()?,
-            highest_protected_ordinal: self.highest_protected_ordinal,
-            total_committed_ordinals: self.filemark_map.total_data_ordinals()?,
-        })
+        self.close_open_epoch(CloseReason::Barrier)
     }
 
     fn write_bootstrap_with_finality(&mut self, is_final_map: bool) -> Result<u32, ParityError> {
@@ -2024,7 +2369,7 @@ impl<'a> ParitySink<'a> {
                 ));
             }
         };
-        let outcome = match self.backend.write_one_filemark() {
+        let outcome = match self.backend.write_filemarks(1, true) {
             Ok(outcome) => outcome,
             Err(e) => {
                 self.poisoned = true;
@@ -2087,7 +2432,6 @@ impl<'a> ParitySink<'a> {
                 "ParitySink::finish called while an object is active; call finish_object first",
             ));
         }
-        let blocks_in_neighborhood = self.data_blocks_in_neighborhood;
         // Per codex idref=30bf15c0 (Medium #1): `data_area_end_lba`
         // is the LBA where user data ENDED (= the next LBA after
         // the last user data block), NOT the post-parity physical
@@ -2095,32 +2439,82 @@ impl<'a> ParitySink<'a> {
         // `write_block` data write as `self.last_data_lba`; use it.
         let data_area_end_lba = self.last_data_lba;
 
+        self.close_open_epoch(CloseReason::Finish)?;
+        Ok(FinalGeometry { data_area_end_lba })
+    }
+
+    /// Close the current explicit epoch and publish one checkpoint edition.
+    ///
+    /// This is the sole parity checkpoint funnel. It emits a short sidecar when
+    /// needed, writes a non-final or terminal bootstrap, issues a zero-count
+    /// synchronous filemark barrier, and only then commits the sink journal.
+    pub fn close_open_epoch(
+        &mut self,
+        reason: CloseReason,
+    ) -> Result<CheckpointResult, ParityError> {
+        if self.poisoned {
+            return Err(ParityError::Invariant(
+                "close_open_epoch called on poisoned parity sink",
+            ));
+        }
+        if self.active_object.is_some() {
+            return Err(ParityError::Invariant(
+                "close_open_epoch called while an object is active",
+            ));
+        }
+        let is_terminal = reason == CloseReason::Finish;
         let bundle_start = self.filemark_map.next_tape_file_number()?;
-        let sidecars_emitted = if blocks_in_neighborhood == 0 {
-            // Either we're at BOT or the previous neighborhood
-            // closed exactly. No padding needed; trailing
-            // parity has already been emitted (if any).
-            self.emit_pending_sidecars()?
-        } else {
-            // We're inside a partial epoch. Layer 3c v0.4.4 computes parity
-            // over implicit zero shards and emits a sidecar; it does not write
-            // zero padding blocks to tape.
+        if self.data_blocks_in_neighborhood > 0 {
             let block_size = self.block_size.ok_or(ParityError::Invariant(
-                "finish: data_blocks_in_neighborhood > 0 but block_size unpinned",
+                "open epoch contains data but block size is unpinned",
             ))?;
-            self.queue_partial_sidecar_without_writing_padding(block_size)?;
-            self.emit_pending_sidecars()?
+            self.queue_partial_sidecar_without_writing_padding(block_size, is_terminal)?;
+        }
+        let sidecars_emitted = self.emit_pending_sidecars()?;
+        let bootstrap_tape_file_number = self.write_bootstrap_with_finality(is_terminal)?;
+        let barrier_outcome = self.backend.write_filemarks(0, false)?;
+        self.record_physical_position(barrier_outcome.position_after.lba);
+        if barrier_outcome.end_of_medium {
+            self.poisoned = true;
+            return Err(ParityError::Invariant(
+                "checkpoint zero-count barrier reached end of medium",
+            ));
+        }
+        let kind = if is_terminal {
+            CommittedBundleKind::Finish
+        } else {
+            CommittedBundleKind::Control
         };
-        self.write_bootstrap_with_finality(true)?;
-        if let Err(err) = self.commit_journal_map_range(
-            CommittedBundleKind::Finish,
-            bundle_start,
-            &sidecars_emitted,
-        ) {
+        let committed_bundle =
+            self.journal_map_range_bundle(kind, bundle_start, &sidecars_emitted)?;
+        if let Err(err) = self.commit_journal_bundle(&committed_bundle) {
             self.poisoned = true;
             return Err(err);
         }
-        Ok(FinalGeometry { data_area_end_lba })
+        self.commit_checkpointed_through()?;
+        self.reserved_bootstrap_object_row_slots = 0;
+        self.bootstrap_placement_state.reset_counters();
+        Ok(CheckpointResult {
+            bootstrap_tape_file_number,
+            tape_file_count: self.filemark_map.next_tape_file_number()?,
+            highest_protected_ordinal: self.highest_protected_ordinal,
+            total_committed_ordinals: self.filemark_map.total_data_ordinals()?,
+            sidecars_emitted,
+            barrier_outcome,
+            used_tape_blocks: self.last_physical_lba,
+            is_terminal,
+            committed_bundle,
+        })
+    }
+
+    fn commit_checkpointed_through(&mut self) -> Result<(), ParityError> {
+        let total_committed_ordinals = self.filemark_map.total_data_ordinals()?;
+        self.commit_journal_bundle(&CommittedBundle {
+            kind: CommittedBundleKind::CheckpointedThrough,
+            entries: Vec::new(),
+            highest_protected_ordinal: self.highest_protected_ordinal,
+            total_committed_ordinals,
+        })
     }
 
     fn commit_journal_bundle(&mut self, bundle: &CommittedBundle) -> Result<(), ParityError> {
@@ -2139,6 +2533,16 @@ impl<'a> ParitySink<'a> {
         if self.journal.is_none() {
             return Ok(());
         }
+        let bundle = self.journal_map_range_bundle(kind, start_tape_file_number, sidecars)?;
+        self.commit_journal_bundle(&bundle)
+    }
+
+    fn journal_map_range_bundle(
+        &self,
+        kind: CommittedBundleKind,
+        start_tape_file_number: u32,
+        sidecars: &[SidecarWriteSummary],
+    ) -> Result<CommittedBundle, ParityError> {
         let start = usize::try_from(start_tape_file_number).map_err(|_| {
             ParityError::Invariant("journal bundle start tape-file number does not fit usize")
         })?;
@@ -2168,7 +2572,7 @@ impl<'a> ParitySink<'a> {
             highest_protected_ordinal: self.highest_protected_ordinal,
             total_committed_ordinals: self.filemark_map.total_data_ordinals()?,
         };
-        self.commit_journal_bundle(&bundle)
+        Ok(bundle)
     }
 
     fn control_entries_from(
@@ -2331,8 +2735,15 @@ impl<'a> ParitySink<'a> {
     }
 
     fn advance_to_next_epoch(&mut self) -> Result<(), ParityError> {
+        self.current_epoch_start = self
+            .current_epoch_start
+            .checked_add(self.data_blocks_in_neighborhood)
+            .ok_or(ParityError::Invariant("epoch protected range overflows"))?;
         self.reset_parity_accumulators()?;
-        self.neighborhood_idx += 1;
+        self.neighborhood_idx = self
+            .neighborhood_idx
+            .checked_add(1)
+            .ok_or(ParityError::Invariant("epoch id overflows"))?;
         self.data_blocks_in_neighborhood = 0;
         Ok(())
     }
@@ -2392,7 +2803,7 @@ impl<'a> ParitySink<'a> {
             ));
         };
 
-        self.queue_epoch_sidecar_from_accumulators(block_size, false)?;
+        self.queue_epoch_sidecar_from_accumulators(block_size, false, false)?;
         self.advance_to_next_epoch()?;
         Ok(())
     }
@@ -2400,8 +2811,9 @@ impl<'a> ParitySink<'a> {
     fn queue_partial_sidecar_without_writing_padding(
         &mut self,
         block_size: usize,
+        is_terminal: bool,
     ) -> Result<(), ParityError> {
-        self.queue_epoch_sidecar_from_accumulators(block_size, true)?;
+        self.queue_epoch_sidecar_from_accumulators(block_size, true, is_terminal)?;
         self.advance_to_next_epoch()?;
         Ok(())
     }
@@ -2410,6 +2822,7 @@ impl<'a> ParitySink<'a> {
         &mut self,
         block_size: usize,
         allow_partial_epoch: bool,
+        is_terminal: bool,
     ) -> Result<(), ParityError> {
         let m = self.codec.parity_blocks();
         let mut parity_shards =
@@ -2436,7 +2849,12 @@ impl<'a> ParitySink<'a> {
         for stripe in epoch_accumulators {
             parity_shards.extend(stripe);
         }
-        self.queue_epoch_sidecar_with_parity_shards(parity_shards, block_size, allow_partial_epoch)
+        self.queue_epoch_sidecar_with_parity_shards(
+            parity_shards,
+            block_size,
+            allow_partial_epoch,
+            is_terminal,
+        )
     }
 
     fn queue_epoch_sidecar_with_parity_shards(
@@ -2444,6 +2862,7 @@ impl<'a> ParitySink<'a> {
         parity_shards: Vec<Vec<u8>>,
         block_size: usize,
         allow_partial_epoch: bool,
+        is_terminal: bool,
     ) -> Result<(), ParityError> {
         let s = self.scheme.stripes_per_neighborhood as usize;
         let k = self.codec.data_blocks();
@@ -2506,10 +2925,7 @@ impl<'a> ParitySink<'a> {
             }
         }
 
-        let start = self
-            .neighborhood_idx
-            .checked_mul(logical_data as u64)
-            .ok_or(ParityError::Invariant("sidecar protected range overflows"))?;
+        let start = self.current_epoch_start;
         let end = start
             .checked_add(real_data as u64)
             .ok_or(ParityError::Invariant("sidecar protected range overflows"))?;
@@ -2521,6 +2937,7 @@ impl<'a> ParitySink<'a> {
             protected_ordinal_end_exclusive: end,
             parity_shards,
             data_shard_crc64s,
+            is_terminal,
         });
         Ok(())
     }
@@ -2612,7 +3029,7 @@ impl<'a> ParitySink<'a> {
             }
         }
 
-        let filemark_outcome = match self.backend.write_one_filemark() {
+        let filemark_outcome = match self.backend.write_filemarks(1, true) {
             Ok(outcome) => outcome,
             Err(err) => {
                 self.poisoned = true;
@@ -2690,8 +3107,8 @@ impl<'a> ParitySink<'a> {
             sidecar_header_block_count: encoded.header.shard_index_block_count,
             parity_shard_block_count: encoded.header.parity_block_count,
             canonical_metadata_hash: encoded.header.canonical_metadata_hash,
-            final_partial_epoch: encoded.header.real_data_shard_count
-                < encoded.header.logical_shard_count,
+            final_partial_epoch: sidecar.is_terminal
+                && encoded.header.real_data_shard_count < encoded.header.logical_shard_count,
             filemark_outcome,
         };
         self.sidecar_directory_entries
@@ -2777,6 +3194,7 @@ impl<'a> ParitySink<'a> {
         early_warning: bool,
         end_of_medium: bool,
     ) -> Result<(), ParityError> {
+        self.hardware_early_warning_seen |= early_warning;
         if end_of_medium {
             return Ok(());
         }
@@ -2809,13 +3227,18 @@ impl<'a> ParitySink<'a> {
                 "object commit bundle protection watermark exceeds committed ordinals",
             ));
         }
-        let epoch_data_shards = self.epoch_data_shards()?;
         let unprotected_after_bundle = total_committed_ordinals_after
             .checked_sub(self.highest_protected_ordinal)
             .ok_or(ParityError::Invariant(
                 "object commit bundle watermark exceeds committed ordinals",
             ))?;
-        if unprotected_after_bundle >= epoch_data_shards {
+        let open_epoch_len = total_committed_ordinals_after
+            .checked_sub(self.current_epoch_start)
+            .ok_or(ParityError::Invariant(
+                "object commit precedes current open epoch start",
+            ))?;
+        debug_assert_eq!(unprotected_after_bundle, open_epoch_len);
+        if open_epoch_len >= self.epoch_data_shards()? {
             return Err(ParityError::Invariant(
                 "object commit bundle violates v1 bounded restart invariant",
             ));

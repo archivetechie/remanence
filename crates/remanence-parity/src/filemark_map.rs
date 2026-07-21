@@ -7,6 +7,7 @@
 //! data ordinals and physical block-position hints.
 
 use ciborium::value::Value as CborValue;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::ParityError;
@@ -39,7 +40,7 @@ pub struct TapeFilePosition {
 }
 
 /// Kind discriminator for a filemark-map entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum TapeFileKind {
     /// Body-format object archive; every fixed block gets a
     /// `ParityDataOrdinal`.

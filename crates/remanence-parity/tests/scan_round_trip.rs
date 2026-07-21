@@ -8,19 +8,84 @@ use remanence_parity::bootstrap::{
     parse_bootstrap_block, write_bootstrap_block, BootstrapPayload, ParitySchemeRecord,
 };
 use remanence_parity::{
-    acquire_filemark_map, emit_resume_rebuilt_sidecars_to_raw,
+    acquire_filemark_map, emit_resume_rebuilt_sidecars_to_raw as emit_resume_sidecars_journaled,
     rebuild_legacy_forensic_open_epoch_from_committed_prefix,
-    rebuild_open_epoch_from_committed_prefix, scan_reconstruct_filemark_map, BlockSinkRawTapeSink,
-    CapacityReserveInput, CatalogFilemarkMapInput, FilemarkMap, ObjectParityState, ParityError,
-    ParityScheme, ParitySink, PhysicalPositionHint, RawReadOutcome, RawTapeSink, RawTapeSource,
-    RawWriteOutcome, ResumeLiveEpochState, ResumeWriterSeed, SchemeId, ScopedFilemarkMap,
-    SidecarEpochDirectoryEntry, SpaceFilemarksOutcome, TapeFileKind, TapeFileMapEntry,
-    TapeFilePosition, SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD,
-    SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
+    rebuild_open_epoch_from_committed_prefix, recover_ordinal_from_sidecar,
+    scan_reconstruct_filemark_map, BlockSinkRawTapeSink, CapacityReserveInput,
+    CatalogFilemarkMapInput, CommittedBundle, CommittedBundleKind, CommittedState, FilemarkMap,
+    JournalError, ObjectParityState, ParityError, ParityScheme, ParitySink, PhysicalPositionHint,
+    RawReadOutcome, RawTapeSink, RawTapeSource, RawWriteOutcome, ResumeLiveEpochState,
+    ResumeWriterSeed, SchemeId, ScopedFilemarkMap, SidecarEpochDirectoryEntry,
+    SpaceFilemarksOutcome, TapeFileJournal, TapeFileKind, TapeFileMapEntry, TapeFilePosition,
+    SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD, SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
 };
 
 const BLOCK_SIZE: u32 = 512;
 const TAPE_UUID: [u8; 16] = [0x5A; 16];
+
+#[derive(Default)]
+struct VecJournal {
+    bundles: Vec<CommittedBundle>,
+}
+
+impl TapeFileJournal for VecJournal {
+    fn tape_uuid(&self) -> [u8; 16] {
+        TAPE_UUID
+    }
+
+    fn commit_bundle(&mut self, bundle: &CommittedBundle) -> Result<(), JournalError> {
+        self.bundles.push(bundle.clone());
+        Ok(())
+    }
+
+    fn load_committed(&self) -> Result<CommittedState, JournalError> {
+        let retained_end = self
+            .bundles
+            .iter()
+            .rposition(|bundle| bundle.kind == CommittedBundleKind::CheckpointedThrough)
+            .map_or(0, |index| index + 1);
+        let retained = &self.bundles[..retained_end];
+        let last = retained
+            .iter()
+            .rev()
+            .find(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough);
+        Ok(CommittedState {
+            entries: retained
+                .iter()
+                .filter(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough)
+                .flat_map(|bundle| bundle.entries.iter().cloned())
+                .collect(),
+            highest_protected_ordinal: last.map_or(0, |bundle| bundle.highest_protected_ordinal),
+            total_committed_ordinals: last.map_or(0, |bundle| bundle.total_committed_ordinals),
+            orphaned_bundles: self.bundles[retained_end..].to_vec(),
+        })
+    }
+}
+
+fn fixture_journal() -> &'static mut VecJournal {
+    Box::leak(Box::new(VecJournal::default()))
+}
+
+fn emit_resume_sidecars_with_fixture_journal<F>(
+    sink: &mut dyn RawTapeSink,
+    plan: remanence_parity::ResumeAppendPlan,
+    rebuilt_sidecars: &[remanence_parity::ResumeRebuiltSidecar],
+    expected_tape_uuid: [u8; 16],
+    commit_sidecar: F,
+) -> Result<remanence_parity::ResumeAppendResult, ParityError>
+where
+    F: FnMut(&remanence_parity::SidecarTapeFile) -> Result<(), ParityError>,
+{
+    let mut journal = VecJournal::default();
+    emit_resume_sidecars_journaled(
+        sink,
+        &mut journal,
+        plan,
+        rebuilt_sidecars,
+        expected_tape_uuid,
+        commit_sidecar,
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TapeRecord {
@@ -64,8 +129,8 @@ impl RawTapeSink for FailAfterFixedBlocksRawSink<'_> {
         self.inner.write_fixed_block(buf)
     }
 
-    fn write_filemark(&mut self) -> Result<RawWriteOutcome, ParityError> {
-        self.inner.write_filemark()
+    fn write_filemarks(&mut self, count: u32, immed: bool) -> Result<RawWriteOutcome, ParityError> {
+        self.inner.write_filemarks(count, immed)
     }
 
     fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
@@ -98,14 +163,14 @@ impl RawTapeSink for FailOnNthFilemarkRawSink<'_> {
         self.inner.write_fixed_block(buf)
     }
 
-    fn write_filemark(&mut self) -> Result<RawWriteOutcome, ParityError> {
+    fn write_filemarks(&mut self, count: u32, immed: bool) -> Result<RawWriteOutcome, ParityError> {
         self.filemark_calls += 1;
         if self.filemark_calls == self.fail_on_filemark_call {
             return Err(ParityError::ResumeAppend(
                 "simulated crash during resume sidecar filemark".to_string(),
             ));
         }
-        self.inner.write_filemark()
+        self.inner.write_filemarks(count, immed)
     }
 
     fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
@@ -369,6 +434,131 @@ fn object_block(seed: u8) -> Vec<u8> {
     block
 }
 
+#[test]
+fn short_epoch_checkpoint_resume_damage_reconstruct_round_trip() {
+    let scheme = scheme();
+    let mut tape = VecBlockSink::new();
+    let mut journal = VecJournal::default();
+
+    let first_checkpoint = {
+        let mut raw = BlockSinkRawTapeSink::new(&mut tape);
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw,
+            &mut journal,
+            scheme.clone(),
+            TAPE_UUID,
+            BLOCK_SIZE,
+        )
+        .expect("fresh journaled sink opens");
+        sink.write_bootstrap().expect("BOT bootstrap writes");
+        sink.begin_object_with_capacity_reserve(capacity_input(3))
+            .expect("first short object admits");
+        for seed in 1..=3 {
+            sink.write_block(&object_block(seed))
+                .expect("first short object block writes");
+        }
+        sink.finish_object().expect("first object closes");
+        sink.close_open_epoch(remanence_parity::CloseReason::Barrier)
+            .expect("barrier closes first short epoch")
+    };
+    assert_eq!(first_checkpoint.sidecars_emitted.len(), 1);
+    assert_eq!(first_checkpoint.sidecars_emitted[0].epoch_id, 0);
+    assert_eq!(
+        (
+            first_checkpoint.sidecars_emitted[0].protected_ordinal_start,
+            first_checkpoint.sidecars_emitted[0].protected_ordinal_end_exclusive,
+        ),
+        (0, 3)
+    );
+    assert!(!first_checkpoint.sidecars_emitted[0].final_partial_epoch);
+
+    let committed = journal
+        .load_committed()
+        .expect("checkpoint journal replays");
+    assert!(committed.orphaned_bundles.is_empty());
+    let (_, prefix) = remanence_parity::committed_prefix_from_journal(&journal, &scheme)
+        .expect("checkpoint prefix builds");
+    let plan = remanence_parity::plan_resume_append_from_committed_prefix(&prefix, &scheme)
+        .expect("clean short-epoch prefix plans");
+    assert_eq!(plan.live_epoch_start, 3);
+    assert_eq!(plan.next_epoch_id, 1);
+    assert!(plan.sidecars_to_emit.is_empty());
+    let resume_result = plan.complete(Vec::new()).expect("clean resume completes");
+    let directory = remanence_parity::sidecar_directory_from_committed_state(&committed, &scheme)
+        .expect("committed sidecar directory rebuilds");
+    let next_bootstrap_sequence = u32::try_from(
+        committed
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == TapeFileKind::Bootstrap)
+            .count(),
+    )
+    .expect("bootstrap count fits");
+
+    let terminal = {
+        let mut raw = BlockSinkRawTapeSink::new(&mut tape);
+        let mut sink = ParitySink::new_sidecar_only_from_resume(
+            &mut raw,
+            &mut journal,
+            scheme.clone(),
+            TAPE_UUID,
+            BLOCK_SIZE,
+            ResumeWriterSeed {
+                committed_prefix: &prefix,
+                committed_prefix_sidecar_directory_entries: directory,
+                committed_prefix_object_rows: Vec::new(),
+                resume_result: &resume_result,
+                live_epoch: None,
+                next_bootstrap_sequence,
+            },
+        )
+        .expect("resumed journaled sink opens");
+        sink.begin_object_with_capacity_reserve(capacity_input(3))
+            .expect("second short object admits");
+        for seed in 4..=6 {
+            sink.write_block(&object_block(seed))
+                .expect("resumed short object block writes");
+        }
+        sink.finish_object().expect("resumed object closes");
+        sink.close_open_epoch(remanence_parity::CloseReason::Finish)
+            .expect("terminal close seals resumed short epoch")
+    };
+    assert_eq!(terminal.sidecars_emitted.len(), 1);
+    assert_eq!(terminal.sidecars_emitted[0].epoch_id, 1);
+    assert_eq!(
+        (
+            terminal.sidecars_emitted[0].protected_ordinal_start,
+            terminal.sidecars_emitted[0].protected_ordinal_end_exclusive,
+        ),
+        (3, 6)
+    );
+    assert!(terminal.sidecars_emitted[0].final_partial_epoch);
+
+    let committed = journal.load_committed().expect("terminal journal replays");
+    let map = committed.filemark_map().expect("terminal map rebuilds");
+    let failed_ordinal = 4;
+    let failed_position = map
+        .position_for_ordinal(failed_ordinal)
+        .expect("failed ordinal maps");
+    let failed_lba = map
+        .physical_position(failed_position)
+        .expect("failed ordinal has a physical position")
+        .lba;
+    let scoped = ScopedFilemarkMap::from_catalog(map, committed.highest_protected_ordinal);
+    let mut damaged = RawVecTape::from_sink(&tape).with_unreadable_lba(failed_lba);
+    let recovered = recover_ordinal_from_sidecar(
+        &mut damaged,
+        &scoped,
+        &scheme,
+        TAPE_UUID,
+        BLOCK_SIZE,
+        failed_ordinal,
+    )
+    .expect("non-aligned second short epoch reconstructs from its containing range");
+    assert_eq!(recovered.sidecar_tape_file_number, 5);
+    assert_eq!(recovered.recovered_block, object_block(5));
+}
+
 fn committed_object_prefix(object_blocks: u8) -> (FilemarkMap, VecBlockSink) {
     let bot_prefix =
         FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)]).expect("BOT prefix validates");
@@ -451,7 +641,7 @@ fn crash_after_object_data_before_filemark_truncates_partial_file_from_catalog_p
     let mut commit_calls = 0usize;
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut resumed_sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             rebuild.plan.clone(),
             &rebuild.rebuilt_sidecars,
@@ -484,6 +674,7 @@ fn crash_after_object_data_before_filemark_truncates_partial_file_from_catalog_p
         };
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -622,7 +813,7 @@ fn crash_after_object_filemark_before_db_commit_uses_catalog_prefix() {
 
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut resumed_sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             rebuild.plan.clone(),
             &rebuild.rebuilt_sidecars,
@@ -650,6 +841,7 @@ fn crash_after_object_filemark_before_db_commit_uses_catalog_prefix() {
         };
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -724,8 +916,14 @@ fn uncheckpointed_clean_end_resumes_from_journal_prefix_and_tape_scan() {
     let object_blocks = (1..=3).map(object_block).collect::<Vec<_>>();
     {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut uncheckpointed_sink);
-        let mut sink = ParitySink::new_sidecar_only(&mut raw_sink, scheme(), TAPE_UUID, BLOCK_SIZE)
-            .expect("sink constructs");
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw_sink,
+            fixture_journal(),
+            scheme(),
+            TAPE_UUID,
+            BLOCK_SIZE,
+        )
+        .expect("sink constructs");
         assert_eq!(sink.write_bootstrap().expect("BOT bootstrap"), 0);
         assert_eq!(
             sink.begin_object_with_capacity_reserve(capacity_input(object_blocks.len() as u64))
@@ -826,6 +1024,7 @@ fn uncheckpointed_clean_end_resumes_from_journal_prefix_and_tape_scan() {
         };
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -922,8 +1121,14 @@ fn crash_after_second_object_data_before_filemark_preserves_committed_prefix() {
     let mut crashed_sink_blocks = VecBlockSink::new();
     let committed_sidecar = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut crashed_sink_blocks);
-        let mut sink = ParitySink::new_sidecar_only(&mut raw_sink, scheme(), TAPE_UUID, BLOCK_SIZE)
-            .expect("sink constructs");
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw_sink,
+            fixture_journal(),
+            scheme(),
+            TAPE_UUID,
+            BLOCK_SIZE,
+        )
+        .expect("sink constructs");
 
         assert_eq!(sink.write_bootstrap().expect("BOT bootstrap"), 0);
         assert_eq!(
@@ -1012,7 +1217,7 @@ fn crash_after_second_object_data_before_filemark_preserves_committed_prefix() {
     let mut commit_calls = 0usize;
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut resumed_sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             rebuild.plan.clone(),
             &rebuild.rebuilt_sidecars,
@@ -1045,6 +1250,7 @@ fn crash_after_second_object_data_before_filemark_preserves_committed_prefix() {
         };
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -1130,8 +1336,14 @@ fn crash_after_second_object_filemark_before_db_commit_preserves_committed_prefi
     let mut crashed_sink_blocks = VecBlockSink::new();
     let committed_sidecar = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut crashed_sink_blocks);
-        let mut sink = ParitySink::new_sidecar_only(&mut raw_sink, scheme(), TAPE_UUID, BLOCK_SIZE)
-            .expect("sink constructs");
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw_sink,
+            fixture_journal(),
+            scheme(),
+            TAPE_UUID,
+            BLOCK_SIZE,
+        )
+        .expect("sink constructs");
 
         assert_eq!(sink.write_bootstrap().expect("BOT bootstrap"), 0);
         assert_eq!(
@@ -1230,7 +1442,7 @@ fn crash_after_second_object_filemark_before_db_commit_preserves_committed_prefi
     let mut commit_calls = 0usize;
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut resumed_sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             rebuild.plan.clone(),
             &rebuild.rebuilt_sidecars,
@@ -1263,6 +1475,7 @@ fn crash_after_second_object_filemark_before_db_commit_preserves_committed_prefi
         };
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -1381,7 +1594,7 @@ fn crash_after_object_db_commit_appends_after_object_and_carries_live_epoch() {
     let mut commit_calls = 0usize;
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             rebuild.plan.clone(),
             &rebuild.rebuilt_sidecars,
@@ -1414,6 +1627,7 @@ fn crash_after_object_db_commit_appends_after_object_and_carries_live_epoch() {
         };
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -1498,8 +1712,14 @@ fn crash_after_sidecar_filemark_before_db_commit_truncates_extra_sidecar() {
     let mut crashed_sink_blocks = VecBlockSink::new();
     let orphan_sidecar = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut crashed_sink_blocks);
-        let mut sink = ParitySink::new_sidecar_only(&mut raw_sink, scheme(), TAPE_UUID, BLOCK_SIZE)
-            .expect("sink constructs");
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw_sink,
+            fixture_journal(),
+            scheme(),
+            TAPE_UUID,
+            BLOCK_SIZE,
+        )
+        .expect("sink constructs");
 
         assert_eq!(sink.write_bootstrap().expect("initial bootstrap"), 0);
         assert_eq!(
@@ -1599,7 +1819,7 @@ fn crash_after_sidecar_filemark_before_db_commit_truncates_extra_sidecar() {
     let mut committed_resume_sidecars = Vec::new();
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut resumed_sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             rebuild.plan.clone(),
             &rebuild.rebuilt_sidecars,
@@ -1651,6 +1871,7 @@ fn crash_after_sidecar_filemark_before_db_commit_truncates_extra_sidecar() {
         };
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -1747,8 +1968,14 @@ fn crash_after_sidecar_db_commit_appends_after_sidecar_and_preserves_partial_sta
     let mut sink_blocks = VecBlockSink::new();
     let committed_sidecar = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut sink_blocks);
-        let mut sink = ParitySink::new_sidecar_only(&mut raw_sink, scheme(), TAPE_UUID, BLOCK_SIZE)
-            .expect("sink constructs");
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw_sink,
+            fixture_journal(),
+            scheme(),
+            TAPE_UUID,
+            BLOCK_SIZE,
+        )
+        .expect("sink constructs");
 
         assert_eq!(sink.write_bootstrap().expect("initial bootstrap"), 0);
         assert_eq!(
@@ -1831,7 +2058,7 @@ fn crash_after_sidecar_db_commit_appends_after_sidecar_and_preserves_partial_sta
     let mut commit_calls = 0usize;
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             rebuild.plan.clone(),
             &rebuild.rebuilt_sidecars,
@@ -1864,6 +2091,7 @@ fn crash_after_sidecar_db_commit_appends_after_sidecar_and_preserves_partial_sta
         };
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -2029,7 +2257,7 @@ fn crash_mid_sidecar_truncates_provisional_file_and_rebuilds_from_catalog_prefix
     let mut committed_resume_sidecars = Vec::new();
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut retried_sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             rebuild.plan.clone(),
             &rebuild.rebuilt_sidecars,
@@ -2090,6 +2318,7 @@ fn crash_mid_sidecar_truncates_provisional_file_and_rebuilds_from_catalog_prefix
         };
         let sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -2181,7 +2410,7 @@ fn crash_after_object_filemark_before_sidecar_cluster_rebuilds_open_epoch() {
     let mut committed_resume_sidecars = Vec::new();
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             rebuild.plan.clone(),
             &rebuild.rebuilt_sidecars,
@@ -2229,6 +2458,7 @@ fn crash_after_object_filemark_before_sidecar_cluster_rebuilds_open_epoch() {
         };
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -2345,7 +2575,7 @@ fn crash_after_first_sidecar_in_cluster_appends_after_committed_sidecar() {
     {
         let mut raw_sink =
             FailAfterFixedBlocksRawSink::new(&mut crashed_sink_blocks, first_sidecar_block_count);
-        let err = emit_resume_rebuilt_sidecars_to_raw(
+        let err = emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             initial_rebuild.plan.clone(),
             &initial_rebuild.rebuilt_sidecars,
@@ -2448,7 +2678,7 @@ fn crash_after_first_sidecar_in_cluster_appends_after_committed_sidecar() {
     let mut committed_after_retry = Vec::new();
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut crashed_sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             retry_rebuild.plan.clone(),
             &retry_rebuild.rebuilt_sidecars,
@@ -2504,6 +2734,7 @@ fn crash_after_first_sidecar_in_cluster_appends_after_committed_sidecar() {
         };
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -2616,7 +2847,7 @@ fn crash_mid_first_sidecar_in_cluster_truncates_to_object_boundary() {
     let mut committed_before_crash = Vec::new();
     {
         let mut raw_sink = FailAfterFixedBlocksRawSink::new(&mut crashed_sink_blocks, 1);
-        let err = emit_resume_rebuilt_sidecars_to_raw(
+        let err = emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             initial_rebuild.plan.clone(),
             &initial_rebuild.rebuilt_sidecars,
@@ -2713,7 +2944,7 @@ fn crash_mid_first_sidecar_in_cluster_truncates_to_object_boundary() {
     let mut committed_after_retry = Vec::new();
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut retried_sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             retry_rebuild.plan.clone(),
             &retry_rebuild.rebuilt_sidecars,
@@ -2798,6 +3029,7 @@ fn crash_mid_first_sidecar_in_cluster_truncates_to_object_boundary() {
         };
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -2888,7 +3120,7 @@ fn crash_on_first_resume_sidecar_filemark_truncates_to_object_boundary() {
     let mut committed_before_crash = Vec::new();
     {
         let mut raw_sink = FailOnNthFilemarkRawSink::new(&mut crashed_sink_blocks, 1);
-        let err = emit_resume_rebuilt_sidecars_to_raw(
+        let err = emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             initial_rebuild.plan.clone(),
             &initial_rebuild.rebuilt_sidecars,
@@ -2995,7 +3227,7 @@ fn crash_on_first_resume_sidecar_filemark_truncates_to_object_boundary() {
     let mut committed_after_retry = Vec::new();
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut retried_sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             retry_rebuild.plan.clone(),
             &retry_rebuild.rebuilt_sidecars,
@@ -3080,6 +3312,7 @@ fn crash_on_first_resume_sidecar_filemark_truncates_to_object_boundary() {
         };
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -3200,7 +3433,7 @@ fn crash_mid_second_sidecar_in_cluster_truncates_to_committed_first_sidecar() {
             &mut crashed_sink_blocks,
             first_sidecar_block_count + 1,
         );
-        let err = emit_resume_rebuilt_sidecars_to_raw(
+        let err = emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             initial_rebuild.plan.clone(),
             &initial_rebuild.rebuilt_sidecars,
@@ -3300,7 +3533,7 @@ fn crash_mid_second_sidecar_in_cluster_truncates_to_committed_first_sidecar() {
     let mut committed_after_retry = Vec::new();
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut retried_sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             retry_rebuild.plan.clone(),
             &retry_rebuild.rebuilt_sidecars,
@@ -3365,6 +3598,7 @@ fn crash_mid_second_sidecar_in_cluster_truncates_to_committed_first_sidecar() {
         };
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -3463,7 +3697,7 @@ fn crash_mid_third_sidecar_in_cluster_truncates_to_committed_second_sidecar() {
             &mut crashed_sink_blocks,
             first_sidecar_block_count + second_sidecar_block_count + 1,
         );
-        let err = emit_resume_rebuilt_sidecars_to_raw(
+        let err = emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             initial_rebuild.plan.clone(),
             &initial_rebuild.rebuilt_sidecars,
@@ -3589,7 +3823,7 @@ fn crash_mid_third_sidecar_in_cluster_truncates_to_committed_second_sidecar() {
     let mut committed_after_retry = Vec::new();
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut retried_sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             retry_rebuild.plan.clone(),
             &retry_rebuild.rebuilt_sidecars,
@@ -3664,6 +3898,7 @@ fn crash_mid_third_sidecar_in_cluster_truncates_to_committed_second_sidecar() {
         };
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -3762,7 +3997,7 @@ fn crash_on_second_resume_sidecar_filemark_truncates_to_committed_first_sidecar(
     let mut committed_before_crash = Vec::new();
     {
         let mut raw_sink = FailOnNthFilemarkRawSink::new(&mut crashed_sink_blocks, 2);
-        let err = emit_resume_rebuilt_sidecars_to_raw(
+        let err = emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             initial_rebuild.plan.clone(),
             &initial_rebuild.rebuilt_sidecars,
@@ -3886,7 +4121,7 @@ fn crash_on_second_resume_sidecar_filemark_truncates_to_committed_first_sidecar(
     let mut committed_after_retry = Vec::new();
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut retried_sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             retry_rebuild.plan.clone(),
             &retry_rebuild.rebuilt_sidecars,
@@ -3967,6 +4202,7 @@ fn crash_on_second_resume_sidecar_filemark_truncates_to_committed_first_sidecar(
         };
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -4057,7 +4293,7 @@ fn crash_on_third_resume_sidecar_filemark_truncates_to_committed_second_sidecar(
     let mut committed_before_crash = Vec::new();
     {
         let mut raw_sink = FailOnNthFilemarkRawSink::new(&mut crashed_sink_blocks, 3);
-        let err = emit_resume_rebuilt_sidecars_to_raw(
+        let err = emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             initial_rebuild.plan.clone(),
             &initial_rebuild.rebuilt_sidecars,
@@ -4192,7 +4428,7 @@ fn crash_on_third_resume_sidecar_filemark_truncates_to_committed_second_sidecar(
     let mut committed_after_retry = Vec::new();
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut retried_sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             retry_rebuild.plan.clone(),
             &retry_rebuild.rebuilt_sidecars,
@@ -4268,6 +4504,7 @@ fn crash_on_third_resume_sidecar_filemark_truncates_to_committed_second_sidecar(
         };
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -4379,7 +4616,7 @@ fn failed_second_resume_sidecar_commit_is_abandoned_on_next_resume() {
     let mut committed_before_failure = Vec::new();
     {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut failed_sink_blocks);
-        let err = emit_resume_rebuilt_sidecars_to_raw(
+        let err = emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             rebuild.plan.clone(),
             &rebuild.rebuilt_sidecars,
@@ -4488,7 +4725,7 @@ fn failed_second_resume_sidecar_commit_is_abandoned_on_next_resume() {
     let mut committed_after_retry = Vec::new();
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut retried_sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             retry_rebuild.plan.clone(),
             &retry_rebuild.rebuilt_sidecars,
@@ -4539,6 +4776,7 @@ fn failed_second_resume_sidecar_commit_is_abandoned_on_next_resume() {
         };
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -4676,7 +4914,7 @@ fn unreadable_resume_rebuild_aborts_then_clean_copy_finishes() {
     let mut committed_resume_sidecars = Vec::new();
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut fallback_sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             rebuild.plan.clone(),
             &rebuild.rebuilt_sidecars,
@@ -4724,6 +4962,7 @@ fn unreadable_resume_rebuild_aborts_then_clean_copy_finishes() {
         };
         let sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -4782,8 +5021,14 @@ fn clean_aligned_resume_emits_no_sidecars_then_writer_appends_next_epoch() {
     let mut sink_blocks = VecBlockSink::new();
     let initial_sidecar = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut sink_blocks);
-        let mut sink = ParitySink::new_sidecar_only(&mut raw_sink, scheme(), TAPE_UUID, BLOCK_SIZE)
-            .expect("sink constructs");
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw_sink,
+            fixture_journal(),
+            scheme(),
+            TAPE_UUID,
+            BLOCK_SIZE,
+        )
+        .expect("sink constructs");
 
         assert_eq!(sink.write_bootstrap().expect("initial bootstrap"), 0);
         assert_eq!(
@@ -4850,7 +5095,7 @@ fn clean_aligned_resume_emits_no_sidecars_then_writer_appends_next_epoch() {
     let mut commit_calls = 0usize;
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             rebuild.plan.clone(),
             &rebuild.rebuilt_sidecars,
@@ -4884,6 +5129,7 @@ fn clean_aligned_resume_emits_no_sidecars_then_writer_appends_next_epoch() {
         };
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -4956,8 +5202,14 @@ fn resume_from_committed_final_bootstrap_appends_after_bootstrap_tail() {
     let mut sink_blocks = VecBlockSink::new();
     {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut sink_blocks);
-        let mut sink = ParitySink::new_sidecar_only(&mut raw_sink, scheme(), TAPE_UUID, BLOCK_SIZE)
-            .expect("sink constructs");
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw_sink,
+            fixture_journal(),
+            scheme(),
+            TAPE_UUID,
+            BLOCK_SIZE,
+        )
+        .expect("sink constructs");
 
         assert_eq!(sink.write_bootstrap().expect("initial bootstrap"), 0);
         assert_eq!(
@@ -5046,7 +5298,7 @@ fn resume_from_committed_final_bootstrap_appends_after_bootstrap_tail() {
     let mut commit_calls = 0usize;
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             rebuild.plan.clone(),
             &rebuild.rebuilt_sidecars,
@@ -5080,6 +5332,7 @@ fn resume_from_committed_final_bootstrap_appends_after_bootstrap_tail() {
         };
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -5165,8 +5418,14 @@ fn catalog_prefix_wins_over_scanned_final_bootstrap_tail_on_resume() {
     let mut sink_blocks = VecBlockSink::new();
     let committed_sidecar = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut sink_blocks);
-        let mut sink = ParitySink::new_sidecar_only(&mut raw_sink, scheme(), TAPE_UUID, BLOCK_SIZE)
-            .expect("sink constructs");
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw_sink,
+            fixture_journal(),
+            scheme(),
+            TAPE_UUID,
+            BLOCK_SIZE,
+        )
+        .expect("sink constructs");
 
         assert_eq!(sink.write_bootstrap().expect("initial bootstrap"), 0);
         assert_eq!(
@@ -5297,7 +5556,7 @@ fn catalog_prefix_wins_over_scanned_final_bootstrap_tail_on_resume() {
     let mut commit_calls = 0usize;
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut append_sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             rebuild.plan.clone(),
             &rebuild.rebuilt_sidecars,
@@ -5331,6 +5590,7 @@ fn catalog_prefix_wins_over_scanned_final_bootstrap_tail_on_resume() {
         };
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -5417,8 +5677,14 @@ fn catalog_claims_missing_sidecar_resume_rejects_short_physical_tape() {
     let mut full_sink_blocks = VecBlockSink::new();
     let committed_sidecar = {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut full_sink_blocks);
-        let mut sink = ParitySink::new_sidecar_only(&mut raw_sink, scheme(), TAPE_UUID, BLOCK_SIZE)
-            .expect("sink constructs");
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw_sink,
+            fixture_journal(),
+            scheme(),
+            TAPE_UUID,
+            BLOCK_SIZE,
+        )
+        .expect("sink constructs");
 
         assert_eq!(sink.write_bootstrap().expect("initial bootstrap"), 0);
         assert_eq!(
@@ -5688,7 +5954,7 @@ fn append_four_block_object_after_final_bootstrap(
     let mut commit_calls = 0usize;
     let resume_result = {
         let mut raw_sink = BlockSinkRawTapeSink::new(sink_blocks);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             rebuild.plan.clone(),
             &rebuild.rebuilt_sidecars,
@@ -5728,6 +5994,7 @@ fn append_four_block_object_after_final_bootstrap(
         };
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme(),
             TAPE_UUID,
             BLOCK_SIZE,
@@ -5784,8 +6051,14 @@ fn repeated_resume_from_final_bootstraps_uses_latest_bootstrap_tail() {
     let mut sink_blocks = VecBlockSink::new();
     {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut sink_blocks);
-        let mut sink = ParitySink::new_sidecar_only(&mut raw_sink, scheme(), TAPE_UUID, BLOCK_SIZE)
-            .expect("sink constructs");
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw_sink,
+            fixture_journal(),
+            scheme(),
+            TAPE_UUID,
+            BLOCK_SIZE,
+        )
+        .expect("sink constructs");
 
         assert_eq!(sink.write_bootstrap().expect("initial bootstrap"), 0);
         assert_eq!(
@@ -5899,8 +6172,14 @@ fn sidecar_writer_output_scans_back_to_final_bootstrap_digest() {
     let mut sink_blocks = VecBlockSink::new();
     {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut sink_blocks);
-        let mut sink = ParitySink::new_sidecar_only(&mut raw_sink, scheme(), TAPE_UUID, BLOCK_SIZE)
-            .expect("sink constructs");
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw_sink,
+            fixture_journal(),
+            scheme(),
+            TAPE_UUID,
+            BLOCK_SIZE,
+        )
+        .expect("sink constructs");
 
         assert_eq!(sink.write_bootstrap().expect("initial bootstrap"), 0);
         assert_eq!(
@@ -5964,8 +6243,14 @@ fn sidecar_only_finish_scans_partial_epoch_without_physical_padding_file() {
     let mut sink_blocks = VecBlockSink::new();
     {
         let mut raw_sink = BlockSinkRawTapeSink::new(&mut sink_blocks);
-        let mut sink = ParitySink::new_sidecar_only(&mut raw_sink, scheme(), TAPE_UUID, BLOCK_SIZE)
-            .expect("sink constructs");
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw_sink,
+            fixture_journal(),
+            scheme(),
+            TAPE_UUID,
+            BLOCK_SIZE,
+        )
+        .expect("sink constructs");
 
         assert_eq!(sink.write_bootstrap().expect("initial bootstrap"), 0);
         assert_eq!(

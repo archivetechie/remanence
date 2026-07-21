@@ -84,12 +84,15 @@ pub use mount::{load_tape_by_uuid, LoadByUuidError};
 pub use pool_write::{
     build_tape_bootstrap, can_read, can_write, check_writability_preconditions,
     lto_generation_from_drive_product, lto_generation_from_voltag, raw_capacity_bytes,
-    seal_decision_after_write, select_tape_in_pool, verify_tape_identity, write_object_to_pool,
-    write_tape_bootstrap, write_to_selected_tape, LtoGen, PoolWriteError,
-    PoolWriteObjectCopyRecord, PoolWriteObjectRecord, PoolWriteRepresentation, PoolWriteResult,
-    SelectTapeError, SelectedTape, StreamedWriteSource, TapeIdentityError, TapePositionAfterWrite,
-    TapeSealReason, TapeUuid, WritabilityError, WriteObjectSource, WriteObjectToPoolRequest,
+    seal_decision_after_write, select_tape_in_pool, select_tape_in_pool_for_write_session,
+    verify_tape_identity, write_object_to_pool_checkpointed, write_tape_bootstrap,
+    write_to_selected_tape_checkpointed, LtoGen, PoolWriteError, PoolWriteObjectCopyRecord,
+    PoolWriteObjectRecord, PoolWriteRepresentation, PoolWriteResult, SelectTapeError, SelectedTape,
+    StreamedWriteSource, TapeIdentityError, TapePositionAfterWrite, TapeSealReason, TapeUuid,
+    WritabilityError, WriteObjectSource, WriteObjectToPoolRequest,
 };
+#[cfg(test)]
+pub use pool_write::{write_object_to_pool, write_to_selected_tape};
 pub use remanence_library::{resolve_load_target, LoadError, LoadPlan};
 pub use tape_init::{
     classify_bot_bytes, classify_bot_from_source, decide_tape_init,
@@ -439,7 +442,6 @@ pub struct ApiState {
     append_ring_bytes: u64,
     append_ring_high_pct: u8,
     append_ring_low_pct: u8,
-    checkpoint_mode: remanence_state::CheckpointMode,
     checkpoint_journal_dir: Arc<PathBuf>,
     checkpoint_max_bytes: u64,
     checkpoint_max_objects: u64,
@@ -489,7 +491,6 @@ impl ApiState {
         state.append_ring_bytes = config.daemon.append_ring_bytes;
         state.append_ring_high_pct = config.daemon.append_ring_high_pct;
         state.append_ring_low_pct = config.daemon.append_ring_low_pct;
-        state.checkpoint_mode = config.daemon.checkpoint_mode;
         state.checkpoint_journal_dir = Arc::new(config.journal.dir.join("checkpoints"));
         state.checkpoint_max_bytes = config.daemon.checkpoint_max_bytes;
         state.checkpoint_max_objects = config.daemon.checkpoint_max_objects;
@@ -549,7 +550,6 @@ impl ApiState {
             append_ring_bytes: remanence_state::DEFAULT_APPEND_RING_BYTES,
             append_ring_high_pct: 90,
             append_ring_low_pct: 25,
-            checkpoint_mode: remanence_state::CheckpointMode::PerObject,
             checkpoint_journal_dir: Arc::new(checkpoint_journal_dir),
             checkpoint_max_bytes: remanence_state::DEFAULT_CHECKPOINT_MAX_BYTES,
             checkpoint_max_objects: remanence_state::DEFAULT_CHECKPOINT_MAX_OBJECTS,
@@ -664,7 +664,6 @@ impl ApiState {
             tape_io: config.tape_io.clone(),
             io_memory: Arc::clone(&io_memory),
             checkpoint_journal_dir: config.journal.dir.join("checkpoints"),
-            checkpoint_mode: config.daemon.checkpoint_mode,
             checkpoint_max_bytes: config.daemon.checkpoint_max_bytes,
             checkpoint_max_objects: config.daemon.checkpoint_max_objects,
             checkpoint_max_age_seconds: config.daemon.checkpoint_max_age_seconds,
@@ -704,7 +703,6 @@ impl ApiState {
         state.append_ring_bytes = config.daemon.append_ring_bytes;
         state.append_ring_high_pct = config.daemon.append_ring_high_pct;
         state.append_ring_low_pct = config.daemon.append_ring_low_pct;
-        state.checkpoint_mode = config.daemon.checkpoint_mode;
         state.checkpoint_journal_dir = Arc::new(config.journal.dir.join("checkpoints"));
         state.checkpoint_max_bytes = config.daemon.checkpoint_max_bytes;
         state.checkpoint_max_objects = config.daemon.checkpoint_max_objects;
@@ -2936,6 +2934,41 @@ impl WriteSessionApi {
             start_digest,
         )
         .await;
+        let append = match append {
+            Ok(mut outcome)
+                if outcome
+                    .record
+                    .append_commit_info
+                    .as_ref()
+                    .is_some_and(|info| {
+                        info.durability == pb::AppendDurability::Written as i32
+                    }) =>
+            {
+                let object_id = outcome.record.object_id.clone();
+                let checkpoint = crate::mount::checkpoint_write_session(
+                    &self.state,
+                    session_id,
+                    crate::write_owner::CheckpointTrigger::Explicit,
+                )
+                .await;
+                match checkpoint {
+                    Ok(checkpoint) => {
+                        outcome.record = checkpoint
+                            .committed_objects
+                            .into_iter()
+                            .find(|record| record.object_id == object_id)
+                            .ok_or_else(|| {
+                                Status::internal(
+                                    "overlap checkpoint omitted the just-written object",
+                                )
+                            })?;
+                        Ok(outcome)
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            other => other,
+        };
         match append {
             Ok(outcome) if outcome.replay => {
                 receive_task.abort();
@@ -6869,6 +6902,9 @@ BCw3Wyv2UWY=
                             },
                     },
                 }],
+                scheme: None,
+                object_tape_file_bundles: Vec::new(),
+                checkpoint_bundle: None,
             })
             .expect("append checkpoint record");
     }
@@ -7162,6 +7198,7 @@ BCw3Wyv2UWY=
                     ],
                     highest_protected_ordinal: 5,
                     total_committed_ordinals: 5,
+                    orphaned_bundles: Vec::new(),
                 },
             )
             .expect("index tape journal");
@@ -8143,7 +8180,7 @@ BCw3Wyv2UWY=
     }
 
     #[test]
-    fn batched_selection_skips_legacy_tape_while_per_object_ranking_is_unchanged() {
+    fn checkpoint_selection_skips_journal_less_legacy_tape() {
         let mut index = test_index();
         project_pool(&mut index, "camera.copy-a");
         project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
@@ -8157,22 +8194,10 @@ BCw3Wyv2UWY=
             &cfg,
             123,
             &HashSet::new(),
-            remanence_state::CheckpointMode::Batched,
             checkpoint_dir.as_path(),
         )
         .expect("batched selection should use the fresh tape");
-        let per_object = crate::pool_write::select_tape_in_pool_for_write_session(
-            &index,
-            &cfg,
-            123,
-            &HashSet::new(),
-            remanence_state::CheckpointMode::PerObject,
-            checkpoint_dir.as_path(),
-        )
-        .expect("per-object selection should retain legacy ranking");
-
         assert_eq!(batched.tape_uuid, SECOND_POOL_WRITE_TAPE_UUID);
-        assert_eq!(per_object.tape_uuid, POOL_WRITE_TAPE_UUID);
     }
 
     #[test]
@@ -8189,7 +8214,6 @@ BCw3Wyv2UWY=
             &pool_config("camera.copy-a"),
             123,
             &HashSet::new(),
-            remanence_state::CheckpointMode::Batched,
             checkpoint_dir.as_path(),
         )
         .expect("checkpoint journal should make a non-fresh tape eligible");
@@ -8198,7 +8222,7 @@ BCw3Wyv2UWY=
     }
 
     #[test]
-    fn batched_selection_reports_every_legacy_candidate_and_adoption_path() {
+    fn checkpoint_selection_reports_every_accept_sealed_legacy_candidate() {
         let mut index = test_index();
         project_pool(&mut index, "camera.copy-a");
         project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
@@ -8212,7 +8236,6 @@ BCw3Wyv2UWY=
             &pool_config("camera.copy-a"),
             123,
             &HashSet::new(),
-            remanence_state::CheckpointMode::Batched,
             checkpoint_dir.as_path(),
         )
         .expect_err("journal-less non-fresh pool must fail before ranking");
@@ -8229,11 +8252,8 @@ BCw3Wyv2UWY=
         assert_eq!(ineligible_candidates.len(), 2);
         assert!(message.contains("RMN004L9"), "{message}");
         assert!(message.contains("RMN005L9"), "{message}");
-        assert!(
-            message.contains("rem tape adopt-checkpoint <barcode>"),
-            "{message}"
-        );
-        assert!(message.contains("Phase 1.5"), "{message}");
+        assert!(message.contains("accept-sealed"), "{message}");
+        assert!(message.contains("re-initialized before reuse"), "{message}");
     }
 
     #[test]
@@ -10238,7 +10258,6 @@ BCw3Wyv2UWY=
             )
             .expect("test I/O memory manager"),
             checkpoint_journal_dir: temp.path().join("checkpoints"),
-            checkpoint_mode: remanence_state::CheckpointMode::PerObject,
             checkpoint_max_bytes: remanence_state::DEFAULT_CHECKPOINT_MAX_BYTES,
             checkpoint_max_objects: remanence_state::DEFAULT_CHECKPOINT_MAX_OBJECTS,
             checkpoint_max_age_seconds: remanence_state::DEFAULT_CHECKPOINT_MAX_AGE_SECONDS,
@@ -11114,6 +11133,143 @@ BCw3Wyv2UWY=
         .expect("committed replay returns success")
         .into_inner();
         assert_eq!(response.object_id, replayed_id.as_bytes());
+        actor.await.expect("actor task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overlap_success_response_waits_for_checkpointed_receipt() {
+        let mut state = ApiState::new(test_index());
+        let session_id = Uuid::new_v4();
+        let bay = 0x0103;
+        let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
+        let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(2);
+        let reservations = Arc::new(std::collections::HashMap::from([(
+            bay,
+            std::sync::atomic::AtomicBool::new(false),
+        )]));
+        let pool = crate::write_owner::DrivePool::new(
+            changer_tx,
+            std::collections::HashMap::from([(bay, drive_tx)]),
+            reservations,
+        );
+        pool.record_session(
+            session_id,
+            crate::write_owner::MountedSession {
+                bay,
+                library_serial: "LIB-A".to_string(),
+                barcode: Some("AOX003L9".to_string()),
+                home_slot: Some(0x0402),
+                tape_uuid: [0xAD; 16],
+                drive_uuid: None,
+            },
+        );
+        state.drive_pool = Some(pool);
+        state.append_staging_mode = remanence_state::AppendStagingMode::Overlap;
+        let ring_bytes = crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
+        state.append_ring_bytes = ring_bytes;
+        state.append_ring_high_pct = 50;
+        state.append_ring_low_pct = 25;
+        state.io_memory = crate::io_memory::IoMemoryReservation::new(ring_bytes).expect("manager");
+
+        let object_id = Uuid::new_v4();
+        let (checkpoint_seen_tx, checkpoint_seen_rx) = tokio::sync::oneshot::channel();
+        let (release_checkpoint_tx, release_checkpoint_rx) = tokio::sync::oneshot::channel();
+        let actor = tokio::spawn(async move {
+            let command = drive_rx.recv().await.expect("append command");
+            let crate::write_owner::DriveCommand::AppendFinish { source, reply, .. } = command
+            else {
+                panic!("expected append command");
+            };
+            let streamed = match source {
+                crate::WriteObjectSource::Streamed(streamed) => streamed,
+                crate::WriteObjectSource::Path(_) => panic!("expected overlap stream"),
+            };
+            let received = tokio::task::spawn_blocking(move || streamed.read_all_for_test())
+                .await
+                .expect("overlap consumer task")
+                .expect("actor consumes overlap stream");
+            assert!(!received.is_empty());
+            let written = pb::ObjectRecord {
+                object_id: object_id.as_bytes().to_vec(),
+                append_commit_info: Some(pb::AppendCommitInfo {
+                    durability: pb::AppendDurability::Written as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            reply
+                .send(Ok(crate::write_owner::AppendFinishOutcome {
+                    record: written,
+                    replay: false,
+                }))
+                .expect("send WRITTEN");
+
+            let command = drive_rx.recv().await.expect("checkpoint command");
+            let crate::write_owner::DriveCommand::Checkpoint { reply, .. } = command else {
+                panic!("overlap must funnel through checkpoint before returning");
+            };
+            checkpoint_seen_tx.send(()).expect("signal checkpoint call");
+            release_checkpoint_rx.await.expect("release checkpoint");
+            let mut checkpointed = pb::ObjectRecord {
+                object_id: object_id.as_bytes().to_vec(),
+                ..Default::default()
+            };
+            checkpointed.append_commit_info = Some(pb::AppendCommitInfo {
+                durability: pb::AppendDurability::Checkpointed as i32,
+                ..Default::default()
+            });
+            reply
+                .expect("explicit checkpoint carries a reply")
+                .send(Ok(crate::write_owner::CheckpointActorReply {
+                    session: pb::WriteSession::default(),
+                    committed_objects: vec![checkpointed],
+                }))
+                .expect("send CHECKPOINTED");
+        });
+
+        let payload = vec![0x6b; crate::append_ring::APPEND_RING_SLAB_BYTES];
+        let digest: [u8; 32] = Sha256::digest(&payload).into();
+        let mut start_message = append_start_message(session_id, payload.len() as u64);
+        let Some(pb::append_object_message::Payload::Start(start_fields)) =
+            start_message.payload.as_mut()
+        else {
+            panic!("start helper must emit Start");
+        };
+        start_fields.expected_content_sha256 = digest.to_vec();
+        start_fields.source_replay_capability = pb::SourceReplayCapability::ReplayFromStart as i32;
+        let messages = vec![
+            Ok(start_message),
+            Ok(append_chunk_message(session_id, payload)),
+            Ok(append_finish_message(session_id, digest)),
+        ];
+        let api = WriteSessionApi { state };
+        let append =
+            tokio::spawn(
+                async move { api.append_object_stream(tokio_stream::iter(messages)).await },
+            );
+        checkpoint_seen_rx
+            .await
+            .expect("overlap issued explicit checkpoint");
+        assert!(
+            !append.is_finished(),
+            "caller response must remain held while durability is only WRITTEN"
+        );
+        release_checkpoint_tx
+            .send(())
+            .expect("release checkpoint reply");
+        let response = append
+            .await
+            .expect("append task")
+            .expect("checkpointed overlap succeeds")
+            .into_inner();
+        assert_eq!(response.object_id, object_id.as_bytes());
+        assert_eq!(
+            response
+                .append_commit_info
+                .expect("checkpoint receipt")
+                .durability,
+            pb::AppendDurability::Checkpointed as i32
+        );
         actor.await.expect("actor task");
     }
 

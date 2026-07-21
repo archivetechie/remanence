@@ -1879,6 +1879,7 @@ dependencies = [
  "reed-solomon-erasure",
  "remanence-crc",
  "remanence-library",
+ "serde",
  "sha2",
  "thiserror 1.0.69",
 ]

@@ -94,8 +94,9 @@ pub use resume::{
     committed_prefix_from_journal, emit_resume_rebuilt_sidecars_to_raw,
     plan_resume_append_from_committed_prefix, plan_resume_append_from_journal,
     rebuild_legacy_forensic_open_epoch_from_committed_prefix,
-    rebuild_open_epoch_from_committed_prefix, ResumeAppendPlan, ResumeAppendResult,
-    ResumeLiveEpochState, ResumeOpenEpochRebuild, ResumeRebuiltSidecar, ResumeSidecarPlan,
+    rebuild_open_epoch_from_committed_prefix, sidecar_directory_from_committed_state,
+    ResumeAppendPlan, ResumeAppendResult, ResumeLiveEpochState, ResumeOpenEpochRebuild,
+    ResumeRebuiltSidecar, ResumeSidecarPlan,
 };
 pub use scan::{acquire_filemark_map, scan_reconstruct_filemark_map, CatalogFilemarkMapInput};
 pub use sidecar::{
@@ -110,8 +111,9 @@ pub use sidecar::{
     SIDECAR_SCHEMA_VERSION,
 };
 pub use sink::{
-    BootstrapObjectRowAdmission, BootstrapPlacementPolicy, CheckpointResult, ObjectCloseResult,
-    ObjectWriteSummary, ParitySink, ResumeWriterSeed, SidecarTapeFile, SidecarWriteSummary,
+    BootstrapObjectRowAdmission, BootstrapPlacementPolicy, CheckpointResult, CloseReason,
+    ObjectCloseResult, ObjectWriteSummary, ParitySink, ParitySinkSessionState, ResumeWriterSeed,
+    SidecarTapeFile, SidecarWriteSummary,
 };
 pub use source::{
     BulkRecoveryPolicy, ObjectParitySource, OpenTrust, ParityAuditHook, RecoveredOrdinalBlock,

@@ -133,6 +133,16 @@ pub struct CheckpointJournalRecord {
     pub block_size: u32,
     /// Replayable projections made durable by this record.
     pub objects: Vec<CheckpointObjectProjection>,
+    /// Parity scheme for parity-protected checkpoint batches. `None` denotes
+    /// the historical parity-off record shape.
+    #[serde(default)]
+    pub scheme: Option<remanence_parity::ParityScheme>,
+    /// Per-object Layer 3c bundles, in the same order as `objects`.
+    #[serde(default)]
+    pub object_tape_file_bundles: Vec<remanence_parity::CommittedBundle>,
+    /// Sidecar/bootstrap bundle emitted by the barrier on parity tapes.
+    #[serde(default)]
+    pub checkpoint_bundle: Option<remanence_parity::CommittedBundle>,
 }
 
 /// Append-only per-tape checkpoint journal.
@@ -344,6 +354,35 @@ fn validate_next_record(
     previous: Option<&CheckpointJournalRecord>,
     record: &CheckpointJournalRecord,
 ) -> Result<(), StateError> {
+    let parity_record = record.scheme.is_some();
+    if let Some(scheme) = &record.scheme {
+        scheme.validate().map_err(|err| {
+            StateError::JournalReplayFailed(format!(
+                "parity checkpoint record carries an invalid scheme: {err}"
+            ))
+        })?;
+    }
+    if previous.is_some_and(|prior| prior.scheme != record.scheme) {
+        return Err(StateError::JournalReplayFailed(
+            "checkpoint parity scheme changed within one tape journal".to_string(),
+        ));
+    }
+    if parity_record
+        && (record.object_tape_file_bundles.len() != record.objects.len()
+            || record.checkpoint_bundle.is_none())
+    {
+        return Err(StateError::JournalReplayFailed(
+            "parity checkpoint record must carry one Layer 3c bundle per object and a barrier bundle"
+                .to_string(),
+        ));
+    }
+    if !parity_record
+        && (!record.object_tape_file_bundles.is_empty() || record.checkpoint_bundle.is_some())
+    {
+        return Err(StateError::JournalReplayFailed(
+            "parity-off checkpoint record carries parity bundle fields".to_string(),
+        ));
+    }
     let expected_ordinal = match previous {
         Some(prior) => prior.ordinal.checked_add(1).ok_or_else(|| {
             StateError::JournalReplayFailed("checkpoint ordinal overflows u64".to_string())
@@ -399,7 +438,7 @@ fn validate_next_record(
         None => 1,
     };
     let mut expected_file = expected_first_file;
-    for projection in &record.objects {
+    for (index, projection) in record.objects.iter().enumerate() {
         if projection.block_size != record.block_size {
             return Err(StateError::JournalReplayFailed(format!(
                 "checkpoint object {} block size {} differs from record block size {}",
@@ -412,10 +451,45 @@ fn validate_next_record(
                 projection.object.object_id
             )));
         }
-        if projection.copy.tape_file_number != expected_file {
+        let object_file = if parity_record {
+            let bundle = &record.object_tape_file_bundles[index];
+            let first = bundle.entries.first().ok_or_else(|| {
+                StateError::JournalReplayFailed(
+                    "parity checkpoint object bundle is empty".to_string(),
+                )
+            })?;
+            if first.kind != remanence_parity::TapeFileKind::Object {
+                return Err(StateError::JournalReplayFailed(
+                    "parity checkpoint object bundle does not start with its object".to_string(),
+                ));
+            }
+            for entry in &bundle.entries {
+                if entry.tape_file_number != expected_file {
+                    return Err(StateError::JournalReplayFailed(format!(
+                        "parity checkpoint bundle uses tape file {}, expected {expected_file}",
+                        entry.tape_file_number
+                    )));
+                }
+                expected_file = expected_file.checked_add(1).ok_or_else(|| {
+                    StateError::JournalReplayFailed(
+                        "checkpoint tape-file number overflows u32".to_string(),
+                    )
+                })?;
+            }
+            first.tape_file_number
+        } else {
+            let object_file = expected_file;
+            expected_file = expected_file.checked_add(1).ok_or_else(|| {
+                StateError::JournalReplayFailed(
+                    "checkpoint object tape-file number overflows u32".to_string(),
+                )
+            })?;
+            object_file
+        };
+        if projection.copy.tape_file_number != object_file {
             return Err(StateError::JournalReplayFailed(format!(
-                "checkpoint object {} uses tape file {}, expected {expected_file}",
-                projection.object.object_id, projection.copy.tape_file_number
+                "checkpoint object {} uses tape file {}, expected {object_file}",
+                projection.object.object_id, projection.copy.tape_file_number,
             )));
         }
         let row = &projection.bootstrap_object_row;
@@ -440,15 +514,36 @@ fn validate_next_record(
                 projection.object.object_id
             )));
         }
-        expected_file = expected_file.checked_add(1).ok_or_else(|| {
-            StateError::JournalReplayFailed(
-                "checkpoint object tape-file number overflows u32".to_string(),
-            )
-        })?;
     }
-    if record.checkpoint_tape_file_number != expected_file {
+    let expected_checkpoint_file = if let Some(bundle) = &record.checkpoint_bundle {
+        let mut bootstrap_file = None;
+        for entry in &bundle.entries {
+            if entry.tape_file_number != expected_file {
+                return Err(StateError::JournalReplayFailed(format!(
+                    "parity checkpoint barrier uses tape file {}, expected {expected_file}",
+                    entry.tape_file_number
+                )));
+            }
+            expected_file = expected_file.checked_add(1).ok_or_else(|| {
+                StateError::JournalReplayFailed(
+                    "checkpoint barrier tape-file number overflows u32".to_string(),
+                )
+            })?;
+            if entry.kind == remanence_parity::TapeFileKind::Bootstrap {
+                bootstrap_file = Some(entry.tape_file_number);
+            }
+        }
+        bootstrap_file.ok_or_else(|| {
+            StateError::JournalReplayFailed(
+                "parity checkpoint barrier bundle has no bootstrap".to_string(),
+            )
+        })?
+    } else {
+        expected_file
+    };
+    if record.checkpoint_tape_file_number != expected_checkpoint_file {
         return Err(StateError::JournalReplayFailed(format!(
-            "checkpoint bootstrap uses tape file {}, expected {expected_file}",
+            "checkpoint bootstrap uses tape file {}, expected {expected_checkpoint_file}",
             record.checkpoint_tape_file_number
         )));
     }
@@ -456,6 +551,14 @@ fn validate_next_record(
         return Err(StateError::JournalReplayFailed(
             "checkpoint block size changed within one tape journal".to_string(),
         ));
+    }
+    if parity_record {
+        if previous.is_some_and(|prior| record.eod_lba <= prior.eod_lba) || record.eod_lba == 0 {
+            return Err(StateError::JournalReplayFailed(
+                "parity checkpoint EOD must advance monotonically".to_string(),
+            ));
+        }
+        return Ok(());
     }
     let prefix_lba = previous.map_or(2, |prior| prior.eod_lba);
     let expected_eod = record
@@ -536,6 +639,9 @@ mod tests {
                     },
                 },
             }],
+            scheme: None,
+            object_tape_file_bundles: Vec::new(),
+            checkpoint_bundle: None,
         }
     }
 
@@ -622,5 +728,28 @@ mod tests {
             .append(&invalid)
             .expect_err("invalid count must reject");
         assert!(err.to_string().contains("committed count"), "{err}");
+    }
+
+    #[test]
+    fn validation_rejects_parity_scheme_change_between_checkpoints() {
+        let tape_uuid = [0x23; 16];
+        let mut previous = record(tape_uuid);
+        previous.scheme = Some(remanence_parity::ParityScheme {
+            id: remanence_parity::SchemeId::new_static("checkpoint-scheme-a"),
+            data_blocks_per_stripe: 4,
+            parity_blocks_per_stripe: 2,
+            stripes_per_neighborhood: 3,
+        });
+        let mut next = second_record(tape_uuid);
+        next.scheme = Some(remanence_parity::ParityScheme {
+            id: remanence_parity::SchemeId::new_static("checkpoint-scheme-b"),
+            data_blocks_per_stripe: 4,
+            parity_blocks_per_stripe: 2,
+            stripes_per_neighborhood: 3,
+        });
+
+        let err = validate_next_record(Some(&previous), &next)
+            .expect_err("one tape checkpoint journal cannot change parity schemes");
+        assert!(err.to_string().contains("scheme changed"), "{err}");
     }
 }

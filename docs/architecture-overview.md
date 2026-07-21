@@ -248,12 +248,13 @@ Idempotency: a repeat of the same `(pool, caller_object_id)` with the
 same content returns the committed copy instead of writing twice;
 different content under a reused id is a conflict. Write sessions have
 no restart/resume contract — `recover_session_id` is rejected as
-unimplemented, unlike the read side below. In batched mode a WRITTEN response
+unimplemented, unlike the read side below. A WRITTEN response
 is advisory and locator-free; callers retain the source until
 `CheckpointSession` returns the committed copy set, and re-send every object
 that was not reported CHECKPOINTED after any session, stream, or daemon loss.
-Each batched barrier writes a non-final no-parity checkpoint bootstrap on tape
-with the authenticated filemark-map prefix and every committed RAO object row,
+Each barrier closes the open parity epoch when present and writes a non-final
+checkpoint bootstrap on tape with the authenticated filemark-map prefix and
+every committed RAO object row,
 then drains deferred drive errors with synchronous `WRITE FILEMARKS(0)` and
 captures `READ POSITION`. The daemon fsyncs that EOD and the replayable batch
 projection to its per-tape checkpoint journal before one SQLite transaction.

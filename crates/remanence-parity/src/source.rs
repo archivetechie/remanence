@@ -9,7 +9,6 @@ use remanence_library::{BlockSource, SpaceKind, SpaceResult, TapeIoError, TapePo
 
 use crate::error::ParityError;
 use crate::filemark_map::{ScopedFilemarkMap, TapeFileKind, TapeFilePosition};
-use crate::mapping::data_shards_per_epoch;
 use crate::model::{
     ParityScheme, RecoveryEvent, RecoveryOutcome, SidecarMetadataHealth,
     SidecarMetadataHealthEvent, StripeAddress, StripePosition,
@@ -497,45 +496,53 @@ impl<'a> ObjectParitySource<'a> {
         }
 
         let stripes_per_epoch = u64::from(self.scheme.stripes_per_neighborhood);
-        let data_shards_per_epoch = data_shards_per_epoch(&self.scheme)?;
-        let first_epoch = start_ordinal / data_shards_per_epoch;
-        let last_epoch = (end_ordinal - 1) / data_shards_per_epoch;
-
-        if first_epoch == last_epoch {
-            let length = end_ordinal
-                .checked_sub(start_ordinal)
-                .ok_or(ParityError::Invariant(
-                    "bulk recovery ordinal range underflows",
-                ))?;
-            return Ok(length.min(stripes_per_epoch));
+        let mut next_uncovered = start_ordinal;
+        let mut affected_stripes = 0u64;
+        for entry in self
+            .scoped_map
+            .map
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == TapeFileKind::ParitySidecar)
+        {
+            let (Some(epoch_start), Some(epoch_end)) = (
+                entry.protected_ordinal_start,
+                entry.protected_ordinal_end_exclusive,
+            ) else {
+                return Err(ParityError::FilemarkMapReconstruct(format!(
+                    "sidecar tape file {} is missing its explicit protected range",
+                    entry.tape_file_number
+                )));
+            };
+            let intersection_start = start_ordinal.max(epoch_start);
+            let intersection_end = end_ordinal.min(epoch_end);
+            if intersection_start >= intersection_end {
+                continue;
+            }
+            if intersection_start != next_uncovered {
+                return Err(ParityError::FilemarkMapReconstruct(format!(
+                    "no contiguous sidecar range covers ordinal {next_uncovered}"
+                )));
+            }
+            let intersection_len =
+                intersection_end
+                    .checked_sub(intersection_start)
+                    .ok_or(ParityError::Invariant(
+                        "bulk recovery sidecar intersection underflows",
+                    ))?;
+            affected_stripes = checked_add(
+                affected_stripes,
+                intersection_len.min(stripes_per_epoch),
+                "bulk recovery stripe count",
+            )?;
+            next_uncovered = intersection_end;
+            if next_uncovered == end_ordinal {
+                return Ok(affected_stripes);
+            }
         }
-
-        let first_epoch_len = data_shards_per_epoch - (start_ordinal % data_shards_per_epoch);
-        let last_epoch_len = ((end_ordinal - 1) % data_shards_per_epoch) + 1;
-        let middle_epochs = last_epoch
-            .checked_sub(first_epoch)
-            .and_then(|epoch_span| epoch_span.checked_sub(1))
-            .ok_or(ParityError::Invariant(
-                "bulk recovery epoch span underflows",
-            ))?;
-
-        let first_epoch_stripes = first_epoch_len.min(stripes_per_epoch);
-        let middle_epoch_stripes = checked_mul(
-            middle_epochs,
-            stripes_per_epoch,
-            "bulk recovery middle stripe count",
-        )?;
-        let last_epoch_stripes = last_epoch_len.min(stripes_per_epoch);
-
-        checked_add(
-            checked_add(
-                first_epoch_stripes,
-                middle_epoch_stripes,
-                "bulk recovery leading stripe count",
-            )?,
-            last_epoch_stripes,
-            "bulk recovery trailing stripe count",
-        )
+        Err(ParityError::FilemarkMapReconstruct(format!(
+            "no contiguous sidecar range covers ordinal {next_uncovered}"
+        )))
     }
 
     fn stripe_recovery_cache_bytes(&self) -> Result<u64, ParityError> {
@@ -672,7 +679,15 @@ impl<'a> ObjectParitySource<'a> {
             })
             .ok()
             .flatten()?;
-        let stripe = crate::mapping::ordinal_to_stripe(ordinal, &self.scheme).ok()?;
+        let sidecar = self.scoped_map.map.entries().iter().find(|entry| {
+            entry.kind == TapeFileKind::ParitySidecar
+                && matches!(
+                    (entry.protected_ordinal_start, entry.protected_ordinal_end_exclusive),
+                    (Some(start), Some(end)) if start <= ordinal && ordinal < end
+                )
+        })?;
+        let stripe =
+            crate::recovery::stripe_for_sidecar_ordinal(sidecar, ordinal, &self.scheme).ok()?;
         let lost = vec![stripe.position];
         Some((stripe, lost))
     }
@@ -1566,7 +1581,7 @@ mod object_source_tests {
     }
 
     #[test]
-    fn affected_stripe_count_uses_epoch_arithmetic_for_offset_object_ranges() {
+    fn affected_stripe_count_uses_explicit_short_epoch_ranges() {
         let scheme = ParityScheme {
             id: SchemeId::new_static("object-source-stripe-count-test"),
             data_blocks_per_stripe: 3,
@@ -1579,6 +1594,9 @@ mod object_source_tests {
             TapeFileMapEntry::bootstrap(0, 1),
             TapeFileMapEntry::object(1, prefix_blocks.len() as u64, 0),
             TapeFileMapEntry::object(2, object_blocks.len() as u64, prefix_blocks.len() as u64),
+            TapeFileMapEntry::parity_sidecar(3, 1, 0, 0, 5),
+            TapeFileMapEntry::parity_sidecar(4, 1, 1, 5, 17),
+            TapeFileMapEntry::parity_sidecar(5, 1, 2, 17, 25),
         ])
         .expect("offset object map validates");
         let scoped = ScopedFilemarkMap::from_catalog(
@@ -1611,8 +1629,8 @@ mod object_source_tests {
         assert_eq!(source.affected_stripe_count(0, 5).unwrap(), 4);
         assert_eq!(source.affected_stripe_count(5, 7).unwrap(), 2);
         assert_eq!(source.affected_stripe_count(5, 9).unwrap(), 4);
-        assert_eq!(source.affected_stripe_count(7, 17).unwrap(), 4);
-        assert_eq!(source.affected_stripe_count(0, 20).unwrap(), 9);
+        assert_eq!(source.affected_stripe_count(7, 17).unwrap(), 8);
+        assert_eq!(source.affected_stripe_count(0, 20).unwrap(), 8);
     }
 
     fn raw_tape(object_blocks: &[Vec<u8>], sidecar_blocks: &[Vec<u8>]) -> RawVec {
