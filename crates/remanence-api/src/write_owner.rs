@@ -7875,6 +7875,84 @@ mod tests {
         append_rx.await.expect("actor test append reply")
     }
 
+    /// Open one parity-off actor session against an already seated test tape.
+    async fn open_actor_test_write_session(
+        drive_tx: &mpsc::Sender<DriveCommand>,
+        pool_cfg: &TapePoolConfig,
+        tape_uuid: TapeUuid,
+        library_serial: &str,
+        barcode: &str,
+        drive_uuid: &[u8],
+        drive_serial: &str,
+    ) -> Uuid {
+        let (open_tx, open_rx) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::OpenWrite {
+                pool_cfg: pool_cfg.clone(),
+                selected: SelectedTape {
+                    pool_id: pool_cfg.id.clone(),
+                    tape_uuid,
+                    block_size: u32::try_from(pool_cfg.block_size_bytes)
+                        .expect("actor test pool block size fits u32"),
+                    parity_config: ParityConfig::None,
+                },
+                needs_drive_load: false,
+                library_serial: library_serial.to_string(),
+                barcode: Some(barcode.to_string()),
+                source_slot: None,
+                drive_uuid: Some(drive_uuid.to_vec()),
+                drive_serial: Some(drive_serial.to_string()),
+                reply: open_tx,
+            })
+            .await
+            .expect("send actor test write open");
+        let session = open_rx
+            .await
+            .expect("actor test write open reply")
+            .expect("open actor test write session");
+        Uuid::from_slice(&session.session_id).expect("actor test write session UUID")
+    }
+
+    /// Explicitly checkpoint an actor test session and return its committed-object set.
+    async fn checkpoint_actor_test_write_session(
+        drive_tx: &mpsc::Sender<DriveCommand>,
+        session_id: Uuid,
+    ) -> CheckpointActorReply {
+        let (checkpoint_tx, checkpoint_rx) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::Checkpoint {
+                session_id,
+                trigger: CheckpointTrigger::Explicit,
+                expected_batch_id: None,
+                reply: Some(checkpoint_tx),
+            })
+            .await
+            .expect("send actor test checkpoint");
+        checkpoint_rx
+            .await
+            .expect("actor test checkpoint reply")
+            .expect("checkpoint actor test write session")
+    }
+
+    /// Close an actor test write session without unloading its seated tape.
+    async fn close_actor_test_write_session(
+        drive_tx: &mpsc::Sender<DriveCommand>,
+        session_id: Uuid,
+    ) -> CloseWriteActorReply {
+        let (close_tx, close_rx) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::Close {
+                session_id,
+                reply: close_tx,
+            })
+            .await
+            .expect("send actor test write close");
+        close_rx
+            .await
+            .expect("actor test write close reply")
+            .expect("close actor test write session")
+    }
+
     #[test]
     fn checkpoint_timer_request_queues_behind_existing_drive_actor_work() {
         let (tx, mut rx) = mpsc::channel(4);
@@ -8419,6 +8497,163 @@ mod tests {
             tape.records.len(),
             "journal EOD names the physical boundary after the checkpoint bootstrap"
         );
+    }
+
+    /// Explicit batch-of-one checkpoints must return catalog-projected copies after reopening a
+    /// new session on the same seated tape; provisional append acknowledgements stay locator-free.
+    #[tokio::test]
+    async fn sequential_batch_of_one_sessions_return_catalog_copies() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-sequential-batch-one")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        let tape_uuid = [0x77; 16];
+        let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+        index
+            .upsert_tape_pool_projection(TapePoolProjectionInput {
+                pool_id: "batch-one-test".to_string(),
+                display_name: None,
+                copy_class: None,
+                content_class: None,
+                created_at_utc: None,
+            })
+            .expect("project pool");
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "CHK003L9".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        index
+            .project_tape_pool_membership(tape_uuid, "batch-one-test")
+            .expect("assign pool");
+        let drive_uuid = index
+            .observe_drive(DriveObservationInput {
+                serial: "DRV-BATCH-ONE".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("LIB-BATCH-ONE".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-07-21T00:00:00Z".to_string()),
+            })
+            .expect("observe drive")
+            .drive_uuid;
+        drop(index);
+
+        let bootstrap = BootstrapPayload {
+            scheme: None,
+            no_parity_flag: true,
+            filemark_map_digest: None,
+            tape_uuid,
+            written_by_version: "test".to_string(),
+            written_at: "2026-07-21T00:00:00Z".to_string(),
+            sequence: 0,
+            block_size_bytes: 4096,
+            drive_compression: false,
+            sidecar_epoch_directory: None,
+            parity_map_reference: None,
+            object_rows: Vec::new(),
+        };
+        let mut bootstrap_block = vec![0u8; 4096];
+        write_bootstrap_block(&bootstrap, &mut bootstrap_block).expect("encode bootstrap");
+        let mut tape = VirtualTape::empty(64 * 1024 * 1024, 4096);
+        tape.records = vec![Record::Block(bootstrap_block), Record::Filemark];
+        tape.written_bytes = 4096;
+        let mut world =
+            VirtualWorld::single_drive("LIB-BATCH-ONE", 0x0100, "DRV-BATCH-ONE", 0x0400, 1);
+        world.put_tape_in_drive(0x0100, "CHK003L9", Some(0x0400), tape);
+        let world = Arc::new(Mutex::new(world));
+        let mut library = open_model_library(Arc::clone(&world));
+        let snapshot = library_snapshot_cell(library.library().clone());
+        let audit_dir = temp.path().join("audit");
+        std::fs::create_dir_all(&audit_dir).expect("create audit dir");
+        let mut cfg = test_write_owner_config(index_path.clone(), audit_dir, &library, snapshot);
+        cfg.checkpoint_journal_dir = temp.path().join("checkpoints");
+        cfg.checkpoint_max_objects = 2;
+        cfg.checkpoint_max_age_seconds = 3600;
+        let library_serial = library.library().serial.clone();
+        let policy = remanence_library::StaticAllowlist::new([library_serial.as_str()]);
+        let drive = library
+            .open_drive(0x0100, &policy)
+            .expect("open model drive");
+        let drive_tx = spawn_drive_actor(0x0100, drive, cfg);
+        let pool_cfg = TapePoolConfig {
+            id: "batch-one-test".to_string(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
+            watermark_low: 0.9,
+            watermark_high: 0.95,
+            block_size_bytes: 4096,
+            min_object_size_bytes: 0,
+        };
+
+        let mut previous_session_id = None;
+        for (session_ordinal, expected_tape_file_number) in [(1u8, 1u64), (2, 3)] {
+            let session_id = open_actor_test_write_session(
+                &drive_tx,
+                &pool_cfg,
+                tape_uuid,
+                library_serial.as_str(),
+                "CHK003L9",
+                &drive_uuid,
+                "DRV-BATCH-ONE",
+            )
+            .await;
+            assert_ne!(Some(session_id), previous_session_id);
+            previous_session_id = Some(session_id);
+            let append = append_actor_test_file(
+                &drive_tx,
+                session_id,
+                temp.path()
+                    .join(format!("batch-one-source-{session_ordinal}.bin")),
+                &format!("payload-{session_ordinal}.bin"),
+                &format!("batch-one-caller-{session_ordinal}"),
+                format!("batch-one payload {session_ordinal}").as_bytes(),
+            )
+            .await;
+            let written_info = append
+                .record
+                .append_commit_info
+                .as_ref()
+                .expect("batch-of-one WRITTEN append info");
+            assert_eq!(
+                written_info.durability,
+                pb::AppendDurability::Written as i32
+            );
+            assert!(append.record.copies.is_empty());
+
+            let checkpoint = checkpoint_actor_test_write_session(&drive_tx, session_id).await;
+            assert_eq!(checkpoint.committed_objects.len(), 1);
+            let committed = &checkpoint.committed_objects[0];
+            assert_eq!(committed.object_id, append.record.object_id);
+            let committed_info = committed
+                .append_commit_info
+                .as_ref()
+                .expect("batch-of-one CHECKPOINTED append info");
+            assert_eq!(
+                committed_info.durability,
+                pb::AppendDurability::Checkpointed as i32
+            );
+            assert_eq!(committed.copies.len(), 1);
+            assert_eq!(committed.copies[0].tape_uuid, tape_uuid);
+            assert_eq!(
+                committed.copies[0].tape_file_number,
+                expected_tape_file_number
+            );
+
+            let closed = close_actor_test_write_session(&drive_tx, session_id).await;
+            assert!(closed.session.checkpointed_objects.is_empty());
+            assert!(closed.session.committed_copies.is_empty());
+        }
     }
 
     struct RangeCatalogFixture {
