@@ -5506,8 +5506,9 @@ mod tests {
         watermark_floor_bytes, AuditActor, AuditEvent, AuditRecord, AuditSubject,
         ForeignArchiveProjectionInput, NativeObjectCopyProjectionInput,
         NativeObjectFileProjectionInput, NativeObjectProjectionInput, PoolSelectionPolicyName,
-        ProvisionTapeInput, SourceLayer, TapeJournalIndexInput, TapePoolProjectionInput,
-        OBJECT_COPY_REPRESENTATION_ENCRYPTED, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+        ProvisionTapeInput, RetireTapeInput, SourceLayer, TapeJournalIndexInput,
+        TapePoolProjectionInput, OBJECT_COPY_REPRESENTATION_ENCRYPTED,
+        OBJECT_COPY_REPRESENTATION_PLAINTEXT,
     };
     use remanence_stream::{restore_object_to_directory, FilesystemRestoreOptions};
     use sha2::{Digest, Sha256};
@@ -6907,6 +6908,203 @@ BCw3Wyv2UWY=
                 checkpoint_bundle: None,
             })
             .expect("append checkpoint record");
+    }
+
+    fn restart_cycle_checkpoint_record(
+        tape_uuid: [u8; 16],
+        ordinal: u64,
+        object_byte: u8,
+        object_tape_file: u32,
+        block_count: u64,
+        total_committed_ordinals: u64,
+    ) -> remanence_state::CheckpointJournalRecord {
+        let object_uuid = Uuid::from_bytes([object_byte; 16]);
+        remanence_state::CheckpointJournalRecord {
+            ordinal,
+            committed_object_count: ordinal,
+            eod_partition: 0,
+            eod_lba: total_committed_ordinals + u64::from(object_tape_file) + ordinal + 3,
+            tape_uuid,
+            batch_id: [0x60 + ordinal as u8; 16],
+            checkpoint_tape_file_number: object_tape_file + 1,
+            block_size: API_SESSION_BLOCK_SIZE,
+            objects: vec![remanence_state::CheckpointObjectProjection {
+                object: NativeObjectProjectionInput {
+                    object_id: object_uuid.to_string(),
+                    caller_object_id: Some(format!("restart-object-{ordinal}")),
+                    body_format: "rao-v1".to_string(),
+                    logical_size_bytes: Some(block_count * u64::from(API_SESSION_BLOCK_SIZE)),
+                    content_hash: Some(vec![object_byte; 32]),
+                    metadata_hash: Some(vec![object_byte.wrapping_add(1); 32]),
+                    created_at_utc: Some(format!("2026-07-21T00:00:0{ordinal}Z")),
+                },
+                files: Vec::new(),
+                copy: NativeObjectCopyProjectionInput {
+                    object_id: object_uuid.to_string(),
+                    tape_uuid,
+                    tape_file_number: object_tape_file,
+                    first_body_lba: 1,
+                    first_parity_data_ordinal: None,
+                    protected_until_ordinal: None,
+                    status: "committed".to_string(),
+                    representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+                    recipient_epoch_ids: None,
+                    metadata_frame_len: None,
+                    plaintext_digest: Some(vec![object_byte.wrapping_add(2); 32]),
+                    stored_digest: Some(vec![object_byte.wrapping_add(2); 32]),
+                },
+                block_size: API_SESSION_BLOCK_SIZE,
+                block_count,
+                fresh_tape: ordinal == 1,
+                total_committed_ordinals,
+                bootstrap_object_row: remanence_state::CheckpointBootstrapObjectRow {
+                    tape_file_number: object_tape_file,
+                    stored_block_count: block_count,
+                    object_id: *object_uuid.as_bytes(),
+                    representation:
+                        remanence_state::CheckpointBootstrapObjectRepresentation::Plaintext {
+                            manifest_first_chunk_lba: 1,
+                            manifest_size_bytes: 1,
+                            manifest_chunk_count: 1,
+                            manifest_sha256: [object_byte.wrapping_add(1); 32],
+                        },
+                },
+            }],
+            scheme: None,
+            object_tape_file_bundles: Vec::new(),
+            checkpoint_bundle: None,
+        }
+    }
+
+    #[test]
+    fn startup_replay_repairs_live_restart_cycle_partial_projection() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-checkpoint-live-restart")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        let checkpoint_dir = temp.path().join("checkpoints");
+        let tape_uuid = [0x91; 16];
+        let mut index = CatalogIndex::open(&index_path).expect("open index");
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "RST001L9".to_string(),
+                block_size: API_SESSION_BLOCK_SIZE,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision restart-cycle tape");
+        let journal = remanence_state::FileCheckpointJournal::open(&checkpoint_dir, tape_uuid)
+            .expect("open checkpoint journal");
+
+        // Append, checkpoint, kill, and restart through the daemon's startup replay helper.
+        let first = restart_cycle_checkpoint_record(tape_uuid, 1, 0x71, 1, 3, 3);
+        journal.append(&first).expect("fsync first checkpoint");
+        replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
+            .expect("project first checkpoint");
+        drop(index);
+        let mut index = CatalogIndex::open(&index_path).expect("restart after first checkpoint");
+        replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
+            .expect("startup replay after first kill");
+
+        // Append again, then preserve the same independently compatible views found in the
+        // field evidence before killing mid-projection: object metadata and the checkpoint
+        // bootstrap are visible, while the copy, object tape-file, and catalog unit are absent.
+        let second = restart_cycle_checkpoint_record(tape_uuid, 2, 0x72, 3, 2, 5);
+        journal.append(&second).expect("fsync second checkpoint");
+        index
+            .upsert_native_object_projection(second.objects[0].object.clone(), &[])
+            .expect("project independently visible object metadata");
+        index
+            .project_committed_tape_file_bundle(
+                TapeJournalIndexInput {
+                    tape_uuid,
+                    block_size: API_SESSION_BLOCK_SIZE,
+                    scheme: None,
+                    journal_offset_bytes: 0,
+                },
+                &CommittedBundle {
+                    kind: CommittedBundleKind::Control,
+                    entries: vec![TapeFileEntry {
+                        tape_file_number: second.checkpoint_tape_file_number,
+                        kind: TapeFileKind::Bootstrap,
+                        block_count: 1,
+                        physical_start_hint: None,
+                        object_id: None,
+                        first_parity_data_ordinal: None,
+                        epoch_id: None,
+                        protected_ordinal_start: None,
+                        protected_ordinal_end_exclusive: None,
+                        canonical_metadata_hash: None,
+                        bootstrap_object_row: None,
+                    }],
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals: second.objects[0].total_committed_ordinals,
+                },
+            )
+            .expect("project independently visible checkpoint bootstrap");
+        drop(index);
+
+        let mut index = CatalogIndex::open(&index_path).expect("restart after projection kill");
+        replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
+            .expect("journal-authoritative startup repair");
+        let second_object_id = second.objects[0].object.object_id.as_str();
+        let copies = index
+            .find_native_object_copies(second_object_id)
+            .expect("query repaired copy");
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].tape_uuid, tape_uuid);
+        assert_eq!(copies[0].tape_file_number, 3);
+        let tape_files = index
+            .list_tape_files(&tape_uuid)
+            .expect("query repaired tape files");
+        assert!(tape_files.iter().any(|entry| {
+            entry.tape_file_number == 3
+                && entry.kind == "object"
+                && entry.object_id.as_deref() == Some(second_object_id)
+        }));
+        assert!(tape_files
+            .iter()
+            .any(|entry| entry.tape_file_number == 4 && entry.kind == "bootstrap"));
+
+        index
+            .retire_tape(RetireTapeInput {
+                tape_uuid,
+                reason: "restart-regression-retire".to_string(),
+            })
+            .expect("retire checkpoint tape");
+        replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
+            .expect("retired copy status is compatible with checkpoint history");
+        assert_eq!(
+            index
+                .find_native_object_copies(second_object_id)
+                .expect("query retired checkpoint copy")[0]
+                .status,
+            "missing"
+        );
+
+        // A genuine contradiction still refuses startup and names the record and both views.
+        let mut divergent_object = second.objects[0].object.clone();
+        divergent_object.content_hash = Some(vec![0xff; 32]);
+        index
+            .upsert_native_object_projection(divergent_object, &[])
+            .expect("seed contradictory SQLite object view");
+        let error = replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
+            .expect_err("contradictory projection must refuse startup");
+        let message = error.message();
+        assert!(
+            message.contains("tape=91919191919191919191919191919191"),
+            "{message}"
+        );
+        assert!(message.contains("ordinal=2"), "{message}");
+        assert!(
+            message.contains("batch=62626262626262626262626262626262"),
+            "{message}"
+        );
+        assert!(message.contains(second_object_id), "{message}");
+        assert!(message.contains("journal="), "{message}");
+        assert!(message.contains("sqlite="), "{message}");
     }
 
     fn project_no_parity_tape_with_block_size(
