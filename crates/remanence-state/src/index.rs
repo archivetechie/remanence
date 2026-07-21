@@ -2808,8 +2808,9 @@ impl CatalogIndex {
 
     /// Atomically replay or project every object in one checkpoint.
     ///
-    /// A fully projected record is idempotent. A partially projected record is
-    /// corruption: checkpoint visibility must never become object-by-object.
+    /// A fully projected record is idempotent. A compatible partial projection
+    /// is repaired from the fsynced journal; only a contradictory SQLite view
+    /// is corruption.
     pub fn project_checkpoint_record(
         &mut self,
         record: &crate::checkpoint::CheckpointJournalRecord,
@@ -2826,6 +2827,13 @@ impl CatalogIndex {
             ));
         }
         let tape_uuid = projections[0].copy.tape_uuid;
+        if record.tape_uuid != tape_uuid {
+            return Err(StateError::IndexCorrupt(format!(
+                "checkpoint record tape {} does not match object tape {}",
+                hex_uuid(record.tape_uuid),
+                hex_uuid(tape_uuid)
+            )));
+        }
         let mut object_ids = HashSet::with_capacity(projections.len());
         for projection in projections {
             if projection.copy.tape_uuid != tape_uuid {
@@ -2846,147 +2854,43 @@ impl CatalogIndex {
                 )));
             }
         }
-        let existing_objects = projections
+        let object_bundles = projections
             .iter()
-            .map(|projection| {
-                self.conn
-                    .query_row(
-                        "select 1 from objects where object_id = ?1",
-                        params![projection.object.object_id.as_str()],
-                        |_| Ok(()),
-                    )
-                    .optional()
-                    .map(|row| row.is_some())
-                    .map_err(|err| sqlite_error("query checkpoint projection replay", err))
+            .enumerate()
+            .map(|(projection_index, projection)| {
+                checkpoint_object_bundle(record, projection_index, projection)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if existing_objects.iter().any(|present| *present) {
-            let exact = projections
-                .iter()
-                .map(|projection| {
-                    let block_count =
-                        u64_to_i64(projection.block_count, "checkpoint object block_count")?;
-                    let copy_visible = self
-                        .conn
-                        .query_row(
-                            "select 1 from object_copies
-                             where object_id = ?1 and tape_uuid = ?2
-                               and tape_file_number = ?3 and status = 'committed'",
-                            params![
-                                projection.object.object_id.as_str(),
-                                projection.copy.tape_uuid.to_vec(),
-                                i64::from(projection.copy.tape_file_number),
-                            ],
-                            |_| Ok(()),
-                        )
-                        .optional()
-                        .map_err(|err| sqlite_error("query checkpoint copy replay", err))?
-                        .is_some();
-                    let tape_file_visible = self
-                        .conn
-                        .query_row(
-                            "select 1 from tape_files
-                             where tape_uuid = ?1 and tape_file_number = ?2
-                               and kind = 'object' and object_id = ?3 and block_count = ?4",
-                            params![
-                                projection.copy.tape_uuid.to_vec(),
-                                i64::from(projection.copy.tape_file_number),
-                                projection.object.object_id.as_str(),
-                                block_count,
-                            ],
-                            |_| Ok(()),
-                        )
-                        .optional()
-                        .map_err(|err| sqlite_error("query checkpoint tape-file replay", err))?
-                        .is_some();
-                    Ok(copy_visible && tape_file_visible)
-                })
-                .collect::<Result<Vec<_>, StateError>>()?;
-            let checkpoint_bootstrap_visible = self
-                .conn
-                .query_row(
-                    "select 1 from tape_files
-                     where tape_uuid = ?1 and tape_file_number = ?2
-                       and kind = 'bootstrap' and block_count = 1",
-                    params![
-                        record.tape_uuid.to_vec(),
-                        i64::from(record.checkpoint_tape_file_number),
-                    ],
-                    |_| Ok(()),
-                )
-                .optional()
-                .map_err(|err| sqlite_error("query checkpoint bootstrap replay", err))?
-                .is_some();
-            if existing_objects.iter().all(|present| *present)
-                && exact.iter().all(|present| *present)
-                && checkpoint_bootstrap_visible
-            {
-                return Ok(());
-            }
-            return Err(StateError::IndexCorrupt(
-                "checkpoint record is partially visible or conflicts with SQLite".to_string(),
-            ));
-        }
+        let checkpoint_bundle = checkpoint_control_bundle(record, projections)?;
+        validate_checkpoint_record_bundle_shape(record, &object_bundles, &checkpoint_bundle)?;
 
         let updated_at = now_utc()?;
         let tx = self
             .conn
             .transaction()
             .map_err(|err| sqlite_error("begin checkpoint batch projection", err))?;
-        for (projection_index, projection) in projections.iter().enumerate() {
+        let replay_plan =
+            inspect_checkpoint_projection_tx(&tx, record, &object_bundles, &checkpoint_bundle)?;
+        if replay_plan == CheckpointReplayPlan::AlreadyProjected {
+            return Ok(());
+        }
+        for (projection, bundle) in projections.iter().zip(&object_bundles) {
             let tape_input = TapeJournalIndexInput {
                 tape_uuid: projection.copy.tape_uuid,
                 block_size: projection.block_size,
                 scheme: record.scheme.clone(),
                 journal_offset_bytes: 0,
             };
-            let bundle = if record.scheme.is_some() {
-                record.object_tape_file_bundles[projection_index].clone()
-            } else {
-                let mut entries = Vec::with_capacity(if projection.fresh_tape { 2 } else { 1 });
-                if projection.fresh_tape {
-                    entries.push(TapeFileEntry {
-                        tape_file_number: 0,
-                        kind: TapeFileKind::Bootstrap,
-                        block_count: 1,
-                        physical_start_hint: None,
-                        object_id: None,
-                        first_parity_data_ordinal: None,
-                        epoch_id: None,
-                        protected_ordinal_start: None,
-                        protected_ordinal_end_exclusive: None,
-                        canonical_metadata_hash: None,
-                        bootstrap_object_row: None,
-                    });
-                }
-                entries.push(TapeFileEntry {
-                    tape_file_number: projection.copy.tape_file_number,
-                    kind: TapeFileKind::Object,
-                    block_count: projection.block_count,
-                    physical_start_hint: None,
-                    object_id: Some(projection.object.object_id.clone()),
-                    first_parity_data_ordinal: None,
-                    epoch_id: None,
-                    protected_ordinal_start: None,
-                    protected_ordinal_end_exclusive: None,
-                    canonical_metadata_hash: None,
-                    bootstrap_object_row: None,
-                });
-                CommittedBundle {
-                    kind: CommittedBundleKind::Object,
-                    entries,
-                    highest_protected_ordinal: 0,
-                    total_committed_ordinals: projection.total_committed_ordinals,
-                }
-            };
-            validate_append_bundle_extension_tx(&tx, &tape_input, &bundle)?;
-            validate_append_object_conflicts_tx(
-                &tx,
-                &tape_input,
-                &bundle,
-                &projection.object,
-                std::slice::from_ref(&projection.copy),
-            )?;
+            if replay_plan == CheckpointReplayPlan::StrictAppend {
+                validate_append_bundle_extension_tx(&tx, &tape_input, bundle)?;
+                validate_append_object_conflicts_tx(
+                    &tx,
+                    &tape_input,
+                    bundle,
+                    &projection.object,
+                    std::slice::from_ref(&projection.copy),
+                )?;
+            }
             let created_at_utc = projection
                 .object
                 .created_at_utc
@@ -2999,57 +2903,31 @@ impl CatalogIndex {
                 std::slice::from_ref(&projection.copy),
                 created_at_utc.as_str(),
             )?;
-            project_committed_tape_file_bundle_tx(&tx, &tape_input, &bundle, updated_at.as_str())?;
+            project_committed_tape_file_bundle_tx(&tx, &tape_input, bundle, updated_at.as_str())?;
         }
-        let total_committed_ordinals = projections
-            .last()
-            .map(|projection| projection.total_committed_ordinals)
-            .ok_or_else(|| {
-                StateError::IndexCorrupt(
-                    "checkpoint record has no final ordinal projection".to_string(),
-                )
-            })?;
         let tape_input = TapeJournalIndexInput {
             tape_uuid: record.tape_uuid,
             block_size: record.block_size,
             scheme: record.scheme.clone(),
             journal_offset_bytes: 0,
         };
-        let bootstrap_bundle =
-            record
-                .checkpoint_bundle
-                .clone()
-                .unwrap_or_else(|| CommittedBundle {
-                    kind: CommittedBundleKind::Control,
-                    entries: vec![TapeFileEntry {
-                        tape_file_number: record.checkpoint_tape_file_number,
-                        kind: TapeFileKind::Bootstrap,
-                        block_count: 1,
-                        physical_start_hint: None,
-                        object_id: None,
-                        first_parity_data_ordinal: None,
-                        epoch_id: None,
-                        protected_ordinal_start: None,
-                        protected_ordinal_end_exclusive: None,
-                        canonical_metadata_hash: None,
-                        bootstrap_object_row: None,
-                    }],
-                    highest_protected_ordinal: 0,
-                    total_committed_ordinals,
-                });
-        if bootstrap_bundle.total_committed_ordinals != total_committed_ordinals {
-            return Err(StateError::IndexCorrupt(
-                "checkpoint barrier bundle ordinal watermark does not match its final object"
-                    .to_string(),
-            ));
-        };
-        validate_checkpoint_control_extension_tx(&tx, &tape_input, &bootstrap_bundle)?;
+        if replay_plan == CheckpointReplayPlan::StrictAppend {
+            validate_checkpoint_control_extension_tx(&tx, &tape_input, &checkpoint_bundle)?;
+        }
         project_committed_tape_file_bundle_tx(
             &tx,
             &tape_input,
-            &bootstrap_bundle,
+            &checkpoint_bundle,
             updated_at.as_str(),
         )?;
+        if replay_plan == CheckpointReplayPlan::RepairRetired {
+            tx.execute(
+                "update object_copies set status = 'missing'
+                 where tape_uuid = ?1 and status = 'committed'",
+                params![record.tape_uuid.to_vec()],
+            )
+            .map_err(|err| sqlite_error("preserve retired checkpoint copy status", err))?;
+        }
         tx.commit()
             .map_err(|err| sqlite_error("commit checkpoint batch projection", err))?;
         Ok(())
@@ -5415,6 +5293,1036 @@ fn insert_native_object_file_projection_tx(
     )
     .map_err(|err| sqlite_error("insert native object file projection", err))?;
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointReplayPlan {
+    AlreadyProjected,
+    StrictAppend,
+    Repair,
+    RepairRetired,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CheckpointObjectView {
+    caller_object_id: Option<String>,
+    body_format: String,
+    logical_size_bytes: Option<i64>,
+    content_hash: Option<Vec<u8>>,
+    content_hash_algorithm: Option<String>,
+    metadata_hash: Option<Vec<u8>>,
+    metadata_hash_algorithm: Option<String>,
+    created_at_utc: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CheckpointObjectFileView {
+    object_id: String,
+    file_id: String,
+    path: String,
+    size_bytes: i64,
+    file_sha256: Vec<u8>,
+    file_digest_algorithm: String,
+    first_chunk_lba: Option<i64>,
+    chunk_count: i64,
+    mtime: Option<String>,
+    executable: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CheckpointObjectCopyView {
+    object_id: String,
+    tape_uuid: Vec<u8>,
+    tape_file_number: i64,
+    first_body_lba: i64,
+    first_parity_data_ordinal: Option<i64>,
+    protected_until_ordinal: Option<i64>,
+    status: String,
+    representation: String,
+    recipient_epoch_ids: Option<String>,
+    metadata_frame_len: Option<i64>,
+    plaintext_digest: Option<Vec<u8>>,
+    plaintext_digest_algorithm: Option<String>,
+    stored_digest: Option<Vec<u8>>,
+    stored_digest_algorithm: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CheckpointTapeFileView {
+    tape_uuid: Vec<u8>,
+    tape_file_number: i64,
+    kind: String,
+    block_count: i64,
+    physical_start_hint: Option<i64>,
+    object_id: Option<String>,
+    first_parity_data_ordinal: Option<i64>,
+    epoch_id: Option<i64>,
+    protected_ordinal_start: Option<i64>,
+    protected_ordinal_end_exclusive: Option<i64>,
+    canonical_metadata_hash: Option<Vec<u8>>,
+    canonical_metadata_hash_algorithm: Option<String>,
+    bundle_uuid: Option<String>,
+    bundle_kind: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CheckpointCatalogUnitView {
+    tape_uuid: Vec<u8>,
+    origin_kind: String,
+    format_id: String,
+    native_object_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CheckpointTapeView {
+    block_size: Option<i64>,
+    scheme_id: Option<String>,
+    data_blocks_per_stripe: Option<i64>,
+    parity_blocks_per_stripe: Option<i64>,
+    stripes_per_neighborhood: Option<i64>,
+    highest_protected_ordinal: i64,
+    total_committed_ordinals: i64,
+    last_committed_tape_file: Option<i64>,
+    state: String,
+}
+
+fn checkpoint_object_bundle(
+    record: &crate::checkpoint::CheckpointJournalRecord,
+    projection_index: usize,
+    projection: &crate::checkpoint::CheckpointObjectProjection,
+) -> Result<CommittedBundle, StateError> {
+    if record.scheme.is_some() {
+        return record
+            .object_tape_file_bundles
+            .get(projection_index)
+            .cloned()
+            .ok_or_else(|| {
+                StateError::IndexCorrupt(format!(
+                    "checkpoint record tape={} ordinal={} has no parity bundle for object index {projection_index}",
+                    hex_uuid(record.tape_uuid),
+                    record.ordinal
+                ))
+            });
+    }
+
+    let mut entries = Vec::with_capacity(if projection.fresh_tape { 2 } else { 1 });
+    if projection.fresh_tape {
+        entries.push(TapeFileEntry {
+            tape_file_number: 0,
+            kind: TapeFileKind::Bootstrap,
+            block_count: 1,
+            physical_start_hint: None,
+            object_id: None,
+            first_parity_data_ordinal: None,
+            epoch_id: None,
+            protected_ordinal_start: None,
+            protected_ordinal_end_exclusive: None,
+            canonical_metadata_hash: None,
+            bootstrap_object_row: None,
+        });
+    }
+    entries.push(TapeFileEntry {
+        tape_file_number: projection.copy.tape_file_number,
+        kind: TapeFileKind::Object,
+        block_count: projection.block_count,
+        physical_start_hint: None,
+        object_id: Some(projection.object.object_id.clone()),
+        first_parity_data_ordinal: None,
+        epoch_id: None,
+        protected_ordinal_start: None,
+        protected_ordinal_end_exclusive: None,
+        canonical_metadata_hash: None,
+        bootstrap_object_row: None,
+    });
+    Ok(CommittedBundle {
+        kind: CommittedBundleKind::Object,
+        entries,
+        highest_protected_ordinal: 0,
+        total_committed_ordinals: projection.total_committed_ordinals,
+    })
+}
+
+fn checkpoint_control_bundle(
+    record: &crate::checkpoint::CheckpointJournalRecord,
+    projections: &[crate::checkpoint::CheckpointObjectProjection],
+) -> Result<CommittedBundle, StateError> {
+    let total_committed_ordinals = projections
+        .last()
+        .map(|projection| projection.total_committed_ordinals)
+        .ok_or_else(|| {
+            StateError::IndexCorrupt(
+                "checkpoint record has no final ordinal projection".to_string(),
+            )
+        })?;
+    let bundle = record
+        .checkpoint_bundle
+        .clone()
+        .unwrap_or_else(|| CommittedBundle {
+            kind: CommittedBundleKind::Control,
+            entries: vec![TapeFileEntry {
+                tape_file_number: record.checkpoint_tape_file_number,
+                kind: TapeFileKind::Bootstrap,
+                block_count: 1,
+                physical_start_hint: None,
+                object_id: None,
+                first_parity_data_ordinal: None,
+                epoch_id: None,
+                protected_ordinal_start: None,
+                protected_ordinal_end_exclusive: None,
+                canonical_metadata_hash: None,
+                bootstrap_object_row: None,
+            }],
+            highest_protected_ordinal: 0,
+            total_committed_ordinals,
+        });
+    if bundle.total_committed_ordinals != total_committed_ordinals {
+        return Err(StateError::IndexCorrupt(format!(
+            "checkpoint record tape={} ordinal={} barrier watermark {} does not match final object watermark {total_committed_ordinals}",
+            hex_uuid(record.tape_uuid),
+            record.ordinal,
+            bundle.total_committed_ordinals
+        )));
+    }
+    Ok(bundle)
+}
+
+fn validate_checkpoint_record_bundle_shape(
+    record: &crate::checkpoint::CheckpointJournalRecord,
+    object_bundles: &[CommittedBundle],
+    checkpoint_bundle: &CommittedBundle,
+) -> Result<(), StateError> {
+    let mut last_new_tape_file: Option<u32> = None;
+    let mut prior_total_committed_ordinals: Option<u64> = None;
+    for (projection, bundle) in record.objects.iter().zip(object_bundles) {
+        if projection.block_size != record.block_size {
+            return Err(StateError::IndexCorrupt(format!(
+                "checkpoint record tape={} ordinal={} object={} block size {} does not match record block size {}",
+                hex_uuid(record.tape_uuid),
+                record.ordinal,
+                projection.object.object_id,
+                projection.block_size,
+                record.block_size
+            )));
+        }
+        if projection.copy.status != "committed" {
+            return Err(StateError::IndexCorrupt(format!(
+                "checkpoint record tape={} ordinal={} object={} has non-committed copy status {:?}",
+                hex_uuid(record.tape_uuid),
+                record.ordinal,
+                projection.object.object_id,
+                projection.copy.status
+            )));
+        }
+        if bundle.kind != CommittedBundleKind::Object {
+            return Err(StateError::IndexCorrupt(format!(
+                "checkpoint record tape={} ordinal={} object={} has non-Object bundle {:?}",
+                hex_uuid(record.tape_uuid),
+                record.ordinal,
+                projection.object.object_id,
+                bundle.kind
+            )));
+        }
+        let bundle_last = validate_dense_bundle_entries(&bundle.entries, record.tape_uuid)?;
+        let bundle_first = bundle.entries.first().ok_or_else(|| {
+            StateError::IndexCorrupt("checkpoint object bundle is empty".to_string())
+        })?;
+        if let Some(last) = last_new_tape_file {
+            let expected = last.checked_add(1).ok_or_else(|| {
+                StateError::IndexCorrupt("checkpoint tape-file number overflows u32".to_string())
+            })?;
+            if bundle_first.tape_file_number != expected {
+                return Err(StateError::IndexCorrupt(format!(
+                    "checkpoint record tape={} ordinal={} has non-contiguous object bundles: expected tape file {expected}, got {}",
+                    hex_uuid(record.tape_uuid),
+                    record.ordinal,
+                    bundle_first.tape_file_number
+                )));
+            }
+        }
+        last_new_tape_file = Some(bundle_last.tape_file_number);
+        let object_entries = bundle
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == TapeFileKind::Object)
+            .collect::<Vec<_>>();
+        if object_entries.len() != 1 {
+            return Err(StateError::IndexCorrupt(format!(
+                "checkpoint record tape={} ordinal={} object={} bundle has {} object entries",
+                hex_uuid(record.tape_uuid),
+                record.ordinal,
+                projection.object.object_id,
+                object_entries.len()
+            )));
+        }
+        let object_entry = object_entries[0];
+        if object_entry.object_id.as_deref() != Some(projection.object.object_id.as_str())
+            || object_entry.tape_file_number != projection.copy.tape_file_number
+            || object_entry.block_count != projection.block_count
+        {
+            return Err(checkpoint_projection_conflict(
+                record,
+                format!("object bundle {}", projection.object.object_id).as_str(),
+                format!(
+                    "object_id={} tape_file={} block_count={}",
+                    projection.object.object_id,
+                    projection.copy.tape_file_number,
+                    projection.block_count
+                ),
+                format!("{object_entry:?}"),
+            ));
+        }
+        if bundle.total_committed_ordinals != projection.total_committed_ordinals {
+            return Err(StateError::IndexCorrupt(format!(
+                "checkpoint record tape={} ordinal={} object={} bundle watermark {} does not match projection watermark {}",
+                hex_uuid(record.tape_uuid),
+                record.ordinal,
+                projection.object.object_id,
+                bundle.total_committed_ordinals,
+                projection.total_committed_ordinals
+            )));
+        }
+        if let Some(prior) = prior_total_committed_ordinals {
+            let expected = prior.checked_add(projection.block_count).ok_or_else(|| {
+                StateError::IndexCorrupt("checkpoint ordinal watermark overflows u64".to_string())
+            })?;
+            if projection.total_committed_ordinals != expected {
+                return Err(StateError::IndexCorrupt(format!(
+                    "checkpoint record tape={} ordinal={} object={} has total committed ordinals {}, expected {expected}",
+                    hex_uuid(record.tape_uuid),
+                    record.ordinal,
+                    projection.object.object_id,
+                    projection.total_committed_ordinals
+                )));
+            }
+        }
+        prior_total_committed_ordinals = Some(projection.total_committed_ordinals);
+        let parsed_object_id =
+            Uuid::parse_str(projection.object.object_id.as_str()).map_err(|err| {
+                StateError::IndexCorrupt(format!(
+                    "checkpoint record tape={} ordinal={} has invalid object UUID {}: {err}",
+                    hex_uuid(record.tape_uuid),
+                    record.ordinal,
+                    projection.object.object_id
+                ))
+            })?;
+        if projection.bootstrap_object_row.tape_file_number != projection.copy.tape_file_number
+            || projection.bootstrap_object_row.stored_block_count != projection.block_count
+            || projection.bootstrap_object_row.object_id != *parsed_object_id.as_bytes()
+        {
+            return Err(checkpoint_projection_conflict(
+                record,
+                format!("bootstrap object row {}", projection.object.object_id).as_str(),
+                format!(
+                    "object_id={} tape_file={} block_count={}",
+                    projection.object.object_id,
+                    projection.copy.tape_file_number,
+                    projection.block_count
+                ),
+                format!("{:?}", projection.bootstrap_object_row),
+            ));
+        }
+        let mut file_ids = HashSet::with_capacity(projection.files.len());
+        for file in &projection.files {
+            if file.object_id != projection.object.object_id
+                || !file_ids.insert(file.file_id.as_str())
+            {
+                return Err(StateError::IndexCorrupt(format!(
+                    "checkpoint record tape={} ordinal={} object={} has mismatched or duplicate member file {}",
+                    hex_uuid(record.tape_uuid),
+                    record.ordinal,
+                    projection.object.object_id,
+                    file.file_id
+                )));
+            }
+        }
+    }
+
+    if checkpoint_bundle.kind != CommittedBundleKind::Control
+        || checkpoint_bundle.entries.len() != 1
+        || checkpoint_bundle.entries[0].kind != TapeFileKind::Bootstrap
+        || checkpoint_bundle.entries[0].block_count != 1
+        || checkpoint_bundle.entries[0].tape_file_number != record.checkpoint_tape_file_number
+    {
+        return Err(StateError::IndexCorrupt(format!(
+            "checkpoint record tape={} ordinal={} has invalid checkpoint control bundle {:?}",
+            hex_uuid(record.tape_uuid),
+            record.ordinal,
+            checkpoint_bundle
+        )));
+    }
+    let expected_checkpoint_file = last_new_tape_file
+        .and_then(|last| last.checked_add(1))
+        .ok_or_else(|| {
+            StateError::IndexCorrupt("checkpoint has no object tape-file prefix".into())
+        })?;
+    if record.checkpoint_tape_file_number != expected_checkpoint_file {
+        return Err(StateError::IndexCorrupt(format!(
+            "checkpoint record tape={} ordinal={} expected checkpoint tape file {expected_checkpoint_file}, got {}",
+            hex_uuid(record.tape_uuid),
+            record.ordinal,
+            record.checkpoint_tape_file_number
+        )));
+    }
+    let expected_highest = object_bundles
+        .last()
+        .map(|bundle| bundle.highest_protected_ordinal)
+        .unwrap_or(0);
+    if checkpoint_bundle.highest_protected_ordinal != expected_highest {
+        return Err(StateError::IndexCorrupt(format!(
+            "checkpoint record tape={} ordinal={} control highest-protected watermark {} does not match object prefix {expected_highest}",
+            hex_uuid(record.tape_uuid),
+            record.ordinal,
+            checkpoint_bundle.highest_protected_ordinal
+        )));
+    }
+    Ok(())
+}
+
+fn inspect_checkpoint_projection_tx(
+    tx: &rusqlite::Transaction<'_>,
+    record: &crate::checkpoint::CheckpointJournalRecord,
+    object_bundles: &[CommittedBundle],
+    checkpoint_bundle: &CommittedBundle,
+) -> Result<CheckpointReplayPlan, StateError> {
+    let mut missing = false;
+    let mut record_component_visible = false;
+    let mut last_committed_tape_file = None;
+    let mut tape_is_retired = false;
+
+    let expected_tape = CheckpointTapeView {
+        block_size: Some(i64::from(record.block_size)),
+        scheme_id: record
+            .scheme
+            .as_ref()
+            .map(|scheme| scheme.id.as_str().to_string()),
+        data_blocks_per_stripe: record
+            .scheme
+            .as_ref()
+            .map(|scheme| i64::from(scheme.data_blocks_per_stripe)),
+        parity_blocks_per_stripe: record
+            .scheme
+            .as_ref()
+            .map(|scheme| i64::from(scheme.parity_blocks_per_stripe)),
+        stripes_per_neighborhood: record
+            .scheme
+            .as_ref()
+            .map(|scheme| i64::from(scheme.stripes_per_neighborhood)),
+        highest_protected_ordinal: u64_to_i64(
+            checkpoint_bundle.highest_protected_ordinal,
+            "checkpoint highest_protected_ordinal",
+        )?,
+        total_committed_ordinals: u64_to_i64(
+            checkpoint_bundle.total_committed_ordinals,
+            "checkpoint total_committed_ordinals",
+        )?,
+        last_committed_tape_file: Some(i64::from(record.checkpoint_tape_file_number)),
+        state: "ready".to_string(),
+    };
+    let actual_tape = tx
+        .query_row(
+            "select block_size, scheme_id, data_blocks_per_stripe,
+                    parity_blocks_per_stripe, stripes_per_neighborhood,
+                    highest_protected_ordinal, total_committed_ordinals,
+                    last_committed_tape_file, state
+             from tapes where tape_uuid = ?1",
+            params![record.tape_uuid.to_vec()],
+            |row| {
+                Ok(CheckpointTapeView {
+                    block_size: row.get(0)?,
+                    scheme_id: row.get(1)?,
+                    data_blocks_per_stripe: row.get(2)?,
+                    parity_blocks_per_stripe: row.get(3)?,
+                    stripes_per_neighborhood: row.get(4)?,
+                    highest_protected_ordinal: row.get(5)?,
+                    total_committed_ordinals: row.get(6)?,
+                    last_committed_tape_file: row.get(7)?,
+                    state: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|err| sqlite_error("inspect checkpoint tape projection", err))?;
+    match actual_tape {
+        Some(actual) => {
+            last_committed_tape_file = actual.last_committed_tape_file;
+            tape_is_retired = actual.state == "retired";
+            let geometry_conflicts = actual.block_size.is_some()
+                && actual.block_size != expected_tape.block_size
+                || optional_projection_conflicts(&expected_tape.scheme_id, &actual.scheme_id)
+                || actual.data_blocks_per_stripe.is_some()
+                    && actual.data_blocks_per_stripe != expected_tape.data_blocks_per_stripe
+                || actual.parity_blocks_per_stripe.is_some()
+                    && actual.parity_blocks_per_stripe != expected_tape.parity_blocks_per_stripe
+                || actual.stripes_per_neighborhood.is_some()
+                    && actual.stripes_per_neighborhood != expected_tape.stripes_per_neighborhood;
+            if geometry_conflicts {
+                return Err(checkpoint_projection_conflict(
+                    record,
+                    "tape geometry",
+                    format!("{expected_tape:?}"),
+                    format!("{actual:?}"),
+                ));
+            }
+            if actual.block_size.is_none()
+                || expected_tape.scheme_id.is_some() && actual.scheme_id.is_none()
+                || expected_tape.data_blocks_per_stripe.is_some()
+                    && actual.data_blocks_per_stripe.is_none()
+                || expected_tape.parity_blocks_per_stripe.is_some()
+                    && actual.parity_blocks_per_stripe.is_none()
+                || expected_tape.stripes_per_neighborhood.is_some()
+                    && actual.stripes_per_neighborhood.is_none()
+                || actual.highest_protected_ordinal < expected_tape.highest_protected_ordinal
+                || actual.total_committed_ordinals < expected_tape.total_committed_ordinals
+                || actual.last_committed_tape_file < expected_tape.last_committed_tape_file
+            {
+                missing = true;
+            }
+        }
+        None => missing = true,
+    }
+
+    for projection in &record.objects {
+        let expected_object = checkpoint_object_view(&projection.object)?;
+        let actual_object = tx
+            .query_row(
+                "select caller_object_id, body_format, logical_size_bytes,
+                        content_hash, content_hash_algorithm,
+                        metadata_hash, metadata_hash_algorithm, created_at_utc
+                 from objects where object_id = ?1",
+                params![projection.object.object_id.as_str()],
+                |row| {
+                    Ok(CheckpointObjectView {
+                        caller_object_id: row.get(0)?,
+                        body_format: row.get(1)?,
+                        logical_size_bytes: row.get(2)?,
+                        content_hash: row.get(3)?,
+                        content_hash_algorithm: row.get(4)?,
+                        metadata_hash: row.get(5)?,
+                        metadata_hash_algorithm: row.get(6)?,
+                        created_at_utc: Some(row.get(7)?),
+                    })
+                },
+            )
+            .optional()
+            .map_err(|err| sqlite_error("inspect checkpoint object projection", err))?;
+        match actual_object {
+            Some(actual) => {
+                let mut comparable_expected = expected_object.clone();
+                if comparable_expected.created_at_utc.is_none() {
+                    comparable_expected.created_at_utc = actual.created_at_utc.clone();
+                }
+                if checkpoint_object_conflicts(&comparable_expected, &actual) {
+                    return Err(checkpoint_projection_conflict(
+                        record,
+                        format!("object {}", projection.object.object_id).as_str(),
+                        format!("{expected_object:?}"),
+                        format!("{actual:?}"),
+                    ));
+                }
+                if comparable_expected != actual {
+                    missing = true;
+                }
+            }
+            None => missing = true,
+        }
+
+        let expected_files = projection
+            .files
+            .iter()
+            .map(checkpoint_object_file_view)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut stmt = tx
+            .prepare(
+                "select object_id, file_id, path, size_bytes, file_sha256,
+                        file_digest_algorithm, first_chunk_lba, chunk_count,
+                        mtime, executable
+                 from object_files where object_id = ?1 order by file_id",
+            )
+            .map_err(|err| sqlite_error("prepare checkpoint object-file inspection", err))?;
+        let actual_files = stmt
+            .query_map(params![projection.object.object_id.as_str()], |row| {
+                Ok(CheckpointObjectFileView {
+                    object_id: row.get(0)?,
+                    file_id: row.get(1)?,
+                    path: row.get(2)?,
+                    size_bytes: row.get(3)?,
+                    file_sha256: row.get(4)?,
+                    file_digest_algorithm: row.get(5)?,
+                    first_chunk_lba: row.get(6)?,
+                    chunk_count: row.get(7)?,
+                    mtime: row.get(8)?,
+                    executable: row.get(9)?,
+                })
+            })
+            .map_err(|err| sqlite_error("query checkpoint object-file inspection", err))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| sqlite_error("read checkpoint object-file inspection", err))?;
+        for actual in &actual_files {
+            let expected = expected_files
+                .iter()
+                .find(|expected| expected.file_id == actual.file_id);
+            if expected != Some(actual) {
+                return Err(checkpoint_projection_conflict(
+                    record,
+                    format!(
+                        "object file {}:{}",
+                        projection.object.object_id, actual.file_id
+                    )
+                    .as_str(),
+                    format!("{expected:?}"),
+                    format!("{actual:?}"),
+                ));
+            }
+        }
+        if actual_files.len() != expected_files.len() {
+            missing = true;
+        }
+
+        let expected_copy = checkpoint_object_copy_view(&projection.copy)?;
+        let actual_copy = tx
+            .query_row(
+                "select object_id, tape_uuid, tape_file_number, first_body_lba,
+                        first_parity_data_ordinal, protected_until_ordinal, status,
+                        representation, recipient_epoch_ids, metadata_frame_len,
+                        plaintext_digest, plaintext_digest_algorithm,
+                        stored_digest, stored_digest_algorithm
+                 from object_copies
+                 where object_id = ?1 and tape_uuid = ?2 and tape_file_number = ?3",
+                params![
+                    projection.copy.object_id.as_str(),
+                    projection.copy.tape_uuid.to_vec(),
+                    i64::from(projection.copy.tape_file_number),
+                ],
+                checkpoint_object_copy_view_from_row,
+            )
+            .optional()
+            .map_err(|err| sqlite_error("inspect checkpoint object-copy projection", err))?;
+        match actual_copy {
+            Some(actual) => {
+                record_component_visible = true;
+                let mut comparable_expected = expected_copy.clone();
+                if tape_is_retired && actual.status == "missing" {
+                    comparable_expected.status = actual.status.clone();
+                }
+                if checkpoint_object_copy_conflicts(&comparable_expected, &actual) {
+                    return Err(checkpoint_projection_conflict(
+                        record,
+                        format!("object copy {}", projection.object.object_id).as_str(),
+                        format!("{expected_copy:?}"),
+                        format!("{actual:?}"),
+                    ));
+                }
+                if actual != comparable_expected {
+                    missing = true;
+                }
+            }
+            None => missing = true,
+        }
+        let conflicting_copy_object = tx
+            .query_row(
+                "select object_id from object_copies
+                 where tape_uuid = ?1 and tape_file_number = ?2 and object_id != ?3
+                 order by object_id limit 1",
+                params![
+                    projection.copy.tape_uuid.to_vec(),
+                    i64::from(projection.copy.tape_file_number),
+                    projection.copy.object_id.as_str(),
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| sqlite_error("inspect checkpoint copy-coordinate conflict", err))?;
+        if let Some(conflicting_object) = conflicting_copy_object {
+            return Err(checkpoint_projection_conflict(
+                record,
+                format!(
+                    "copy coordinate tape file {}",
+                    projection.copy.tape_file_number
+                )
+                .as_str(),
+                format!("object_id={}", projection.copy.object_id),
+                format!("object_id={conflicting_object}"),
+            ));
+        }
+
+        let unit_id = native_catalog_unit_id(
+            projection.object.object_id.as_str(),
+            projection.copy.tape_uuid,
+            projection.copy.tape_file_number,
+        );
+        let expected_unit = CheckpointCatalogUnitView {
+            tape_uuid: projection.copy.tape_uuid.to_vec(),
+            origin_kind: "native_object".to_string(),
+            format_id: projection.object.body_format.clone(),
+            native_object_id: Some(projection.object.object_id.clone()),
+        };
+        let actual_unit = tx
+            .query_row(
+                "select tape_uuid, origin_kind, format_id, native_object_id
+                 from catalog_units where unit_id = ?1",
+                params![unit_id.as_str()],
+                |row| {
+                    Ok(CheckpointCatalogUnitView {
+                        tape_uuid: row.get(0)?,
+                        origin_kind: row.get(1)?,
+                        format_id: row.get(2)?,
+                        native_object_id: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|err| sqlite_error("inspect checkpoint catalog-unit projection", err))?;
+        match actual_unit {
+            Some(actual) => {
+                record_component_visible = true;
+                if actual != expected_unit {
+                    return Err(checkpoint_projection_conflict(
+                        record,
+                        format!("catalog unit {unit_id}").as_str(),
+                        format!("{expected_unit:?}"),
+                        format!("{actual:?}"),
+                    ));
+                }
+            }
+            None => missing = true,
+        }
+    }
+
+    for entry in object_bundles
+        .iter()
+        .flat_map(|bundle| bundle.entries.iter())
+        .chain(checkpoint_bundle.entries.iter())
+    {
+        let expected = checkpoint_tape_file_view(record.tape_uuid, entry)?;
+        let actual = tx
+            .query_row(
+                "select tape_uuid, tape_file_number, kind, block_count,
+                        physical_start_hint, object_id, first_parity_data_ordinal,
+                        epoch_id, protected_ordinal_start,
+                        protected_ordinal_end_exclusive,
+                        canonical_metadata_hash, canonical_metadata_hash_algorithm,
+                        bundle_uuid, bundle_kind
+                 from tape_files where tape_uuid = ?1 and tape_file_number = ?2",
+                params![record.tape_uuid.to_vec(), i64::from(entry.tape_file_number)],
+                checkpoint_tape_file_view_from_row,
+            )
+            .optional()
+            .map_err(|err| sqlite_error("inspect checkpoint tape-file projection", err))?;
+        match actual {
+            Some(actual) => {
+                record_component_visible = true;
+                if checkpoint_tape_file_conflicts(&expected, &actual) {
+                    return Err(checkpoint_projection_conflict(
+                        record,
+                        format!("tape file {}", entry.tape_file_number).as_str(),
+                        format!("{expected:?}"),
+                        format!("{actual:?}"),
+                    ));
+                }
+                if actual != expected {
+                    missing = true;
+                }
+            }
+            None => missing = true,
+        }
+    }
+
+    if !missing {
+        return Ok(CheckpointReplayPlan::AlreadyProjected);
+    }
+    let later_prefix_visible = last_committed_tape_file
+        .is_some_and(|last| last >= i64::from(record.checkpoint_tape_file_number));
+    if record_component_visible || later_prefix_visible {
+        if tape_is_retired {
+            Ok(CheckpointReplayPlan::RepairRetired)
+        } else {
+            Ok(CheckpointReplayPlan::Repair)
+        }
+    } else {
+        Ok(CheckpointReplayPlan::StrictAppend)
+    }
+}
+
+fn checkpoint_object_view(
+    object: &NativeObjectProjectionInput,
+) -> Result<CheckpointObjectView, StateError> {
+    Ok(CheckpointObjectView {
+        caller_object_id: object.caller_object_id.clone(),
+        body_format: object.body_format.clone(),
+        logical_size_bytes: object
+            .logical_size_bytes
+            .map(|value| u64_to_i64(value, "checkpoint logical_size_bytes"))
+            .transpose()?,
+        content_hash: object.content_hash.clone(),
+        content_hash_algorithm: object
+            .content_hash
+            .as_ref()
+            .map(|_| DIGEST_ALGORITHM_SHA256.to_string()),
+        metadata_hash: object.metadata_hash.clone(),
+        metadata_hash_algorithm: object
+            .metadata_hash
+            .as_ref()
+            .map(|_| DIGEST_ALGORITHM_SHA256.to_string()),
+        created_at_utc: object.created_at_utc.clone(),
+    })
+}
+
+fn checkpoint_object_file_view(
+    file: &NativeObjectFileProjectionInput,
+) -> Result<CheckpointObjectFileView, StateError> {
+    Ok(CheckpointObjectFileView {
+        object_id: file.object_id.clone(),
+        file_id: file.file_id.clone(),
+        path: file.path.clone(),
+        size_bytes: u64_to_i64(file.size_bytes, "checkpoint object_files.size_bytes")?,
+        file_sha256: file.file_sha256.clone(),
+        file_digest_algorithm: DIGEST_ALGORITHM_SHA256.to_string(),
+        first_chunk_lba: file
+            .first_chunk_lba
+            .map(|value| u64_to_i64(value, "checkpoint object_files.first_chunk_lba"))
+            .transpose()?,
+        chunk_count: u64_to_i64(file.chunk_count, "checkpoint object_files.chunk_count")?,
+        mtime: file.mtime.clone(),
+        executable: file.executable.map(i64::from),
+    })
+}
+
+fn checkpoint_object_conflicts(
+    expected: &CheckpointObjectView,
+    actual: &CheckpointObjectView,
+) -> bool {
+    optional_projection_conflicts(&expected.caller_object_id, &actual.caller_object_id)
+        || expected.body_format != actual.body_format
+        || optional_projection_conflicts(&expected.logical_size_bytes, &actual.logical_size_bytes)
+        || optional_projection_conflicts(&expected.content_hash, &actual.content_hash)
+        || optional_projection_conflicts(
+            &expected.content_hash_algorithm,
+            &actual.content_hash_algorithm,
+        )
+        || optional_projection_conflicts(&expected.metadata_hash, &actual.metadata_hash)
+        || optional_projection_conflicts(
+            &expected.metadata_hash_algorithm,
+            &actual.metadata_hash_algorithm,
+        )
+        || optional_projection_conflicts(&expected.created_at_utc, &actual.created_at_utc)
+}
+
+fn checkpoint_object_copy_view(
+    copy: &NativeObjectCopyProjectionInput,
+) -> Result<CheckpointObjectCopyView, StateError> {
+    let recipient_epoch_ids = copy
+        .recipient_epoch_ids
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|err| {
+            StateError::IndexMigrationFailed(format!(
+                "serialize checkpoint object-copy recipient epochs: {err}"
+            ))
+        })?;
+    Ok(CheckpointObjectCopyView {
+        object_id: copy.object_id.clone(),
+        tape_uuid: copy.tape_uuid.to_vec(),
+        tape_file_number: i64::from(copy.tape_file_number),
+        first_body_lba: u64_to_i64(copy.first_body_lba, "checkpoint first_body_lba")?,
+        first_parity_data_ordinal: copy
+            .first_parity_data_ordinal
+            .map(|value| u64_to_i64(value, "checkpoint first_parity_data_ordinal"))
+            .transpose()?,
+        protected_until_ordinal: copy
+            .protected_until_ordinal
+            .map(|value| u64_to_i64(value, "checkpoint protected_until_ordinal"))
+            .transpose()?,
+        status: copy.status.clone(),
+        representation: copy.representation.clone(),
+        recipient_epoch_ids,
+        metadata_frame_len: copy
+            .metadata_frame_len
+            .map(|value| u64_to_i64(value, "checkpoint metadata_frame_len"))
+            .transpose()?,
+        plaintext_digest: copy.plaintext_digest.clone(),
+        plaintext_digest_algorithm: copy
+            .plaintext_digest
+            .as_ref()
+            .map(|_| DIGEST_ALGORITHM_SHA256.to_string()),
+        stored_digest: copy.stored_digest.clone(),
+        stored_digest_algorithm: copy
+            .stored_digest
+            .as_ref()
+            .map(|_| DIGEST_ALGORITHM_SHA256.to_string()),
+    })
+}
+
+fn checkpoint_object_copy_view_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<CheckpointObjectCopyView> {
+    Ok(CheckpointObjectCopyView {
+        object_id: row.get(0)?,
+        tape_uuid: row.get(1)?,
+        tape_file_number: row.get(2)?,
+        first_body_lba: row.get(3)?,
+        first_parity_data_ordinal: row.get(4)?,
+        protected_until_ordinal: row.get(5)?,
+        status: row.get(6)?,
+        representation: row.get(7)?,
+        recipient_epoch_ids: row.get(8)?,
+        metadata_frame_len: row.get(9)?,
+        plaintext_digest: row.get(10)?,
+        plaintext_digest_algorithm: row.get(11)?,
+        stored_digest: row.get(12)?,
+        stored_digest_algorithm: row.get(13)?,
+    })
+}
+
+fn checkpoint_object_copy_conflicts(
+    expected: &CheckpointObjectCopyView,
+    actual: &CheckpointObjectCopyView,
+) -> bool {
+    expected.object_id != actual.object_id
+        || expected.tape_uuid != actual.tape_uuid
+        || expected.tape_file_number != actual.tape_file_number
+        || actual.first_body_lba != 0 && expected.first_body_lba != actual.first_body_lba
+        || optional_projection_conflicts(
+            &expected.first_parity_data_ordinal,
+            &actual.first_parity_data_ordinal,
+        )
+        || optional_projection_conflicts(
+            &expected.protected_until_ordinal,
+            &actual.protected_until_ordinal,
+        )
+        || expected.status != actual.status
+        || actual.representation != OBJECT_COPY_REPRESENTATION_UNKNOWN
+            && expected.representation != actual.representation
+        || optional_projection_conflicts(&expected.recipient_epoch_ids, &actual.recipient_epoch_ids)
+        || optional_projection_conflicts(&expected.metadata_frame_len, &actual.metadata_frame_len)
+        || optional_projection_conflicts(&expected.plaintext_digest, &actual.plaintext_digest)
+        || optional_projection_conflicts(
+            &expected.plaintext_digest_algorithm,
+            &actual.plaintext_digest_algorithm,
+        )
+        || optional_projection_conflicts(&expected.stored_digest, &actual.stored_digest)
+        || optional_projection_conflicts(
+            &expected.stored_digest_algorithm,
+            &actual.stored_digest_algorithm,
+        )
+}
+
+fn checkpoint_tape_file_view(
+    tape_uuid: [u8; 16],
+    entry: &TapeFileEntry,
+) -> Result<CheckpointTapeFileView, StateError> {
+    Ok(CheckpointTapeFileView {
+        tape_uuid: tape_uuid.to_vec(),
+        tape_file_number: i64::from(entry.tape_file_number),
+        kind: tape_file_kind(entry.kind).to_string(),
+        block_count: u64_to_i64(entry.block_count, "checkpoint tape_files.block_count")?,
+        physical_start_hint: entry
+            .physical_start_hint
+            .map(|value| u64_to_i64(value, "checkpoint tape_files.physical_start_hint"))
+            .transpose()?,
+        object_id: entry.object_id.clone(),
+        first_parity_data_ordinal: entry
+            .first_parity_data_ordinal
+            .map(|value| u64_to_i64(value, "checkpoint tape_files.first_parity_data_ordinal"))
+            .transpose()?,
+        epoch_id: entry
+            .epoch_id
+            .map(|value| u64_to_i64(value, "checkpoint tape_files.epoch_id"))
+            .transpose()?,
+        protected_ordinal_start: entry
+            .protected_ordinal_start
+            .map(|value| u64_to_i64(value, "checkpoint tape_files.protected_ordinal_start"))
+            .transpose()?,
+        protected_ordinal_end_exclusive: entry
+            .protected_ordinal_end_exclusive
+            .map(|value| {
+                u64_to_i64(
+                    value,
+                    "checkpoint tape_files.protected_ordinal_end_exclusive",
+                )
+            })
+            .transpose()?,
+        canonical_metadata_hash: entry.canonical_metadata_hash.map(|hash| hash.to_vec()),
+        canonical_metadata_hash_algorithm: entry
+            .canonical_metadata_hash
+            .map(|_| DIGEST_ALGORITHM_SHA256.to_string()),
+        bundle_uuid: None,
+        bundle_kind: None,
+    })
+}
+
+fn checkpoint_tape_file_view_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<CheckpointTapeFileView> {
+    Ok(CheckpointTapeFileView {
+        tape_uuid: row.get(0)?,
+        tape_file_number: row.get(1)?,
+        kind: row.get(2)?,
+        block_count: row.get(3)?,
+        physical_start_hint: row.get(4)?,
+        object_id: row.get(5)?,
+        first_parity_data_ordinal: row.get(6)?,
+        epoch_id: row.get(7)?,
+        protected_ordinal_start: row.get(8)?,
+        protected_ordinal_end_exclusive: row.get(9)?,
+        canonical_metadata_hash: row.get(10)?,
+        canonical_metadata_hash_algorithm: row.get(11)?,
+        bundle_uuid: row.get(12)?,
+        bundle_kind: row.get(13)?,
+    })
+}
+
+fn checkpoint_tape_file_conflicts(
+    expected: &CheckpointTapeFileView,
+    actual: &CheckpointTapeFileView,
+) -> bool {
+    expected.tape_uuid != actual.tape_uuid
+        || expected.tape_file_number != actual.tape_file_number
+        || expected.kind != actual.kind
+        || expected.block_count != actual.block_count
+        || optional_projection_conflicts(&expected.physical_start_hint, &actual.physical_start_hint)
+        || optional_projection_conflicts(&expected.object_id, &actual.object_id)
+        || optional_projection_conflicts(
+            &expected.first_parity_data_ordinal,
+            &actual.first_parity_data_ordinal,
+        )
+        || optional_projection_conflicts(&expected.epoch_id, &actual.epoch_id)
+        || optional_projection_conflicts(
+            &expected.protected_ordinal_start,
+            &actual.protected_ordinal_start,
+        )
+        || optional_projection_conflicts(
+            &expected.protected_ordinal_end_exclusive,
+            &actual.protected_ordinal_end_exclusive,
+        )
+        || optional_projection_conflicts(
+            &expected.canonical_metadata_hash,
+            &actual.canonical_metadata_hash,
+        )
+        || optional_projection_conflicts(
+            &expected.canonical_metadata_hash_algorithm,
+            &actual.canonical_metadata_hash_algorithm,
+        )
+        || optional_projection_conflicts(&expected.bundle_uuid, &actual.bundle_uuid)
+        || optional_projection_conflicts(&expected.bundle_kind, &actual.bundle_kind)
+}
+
+fn optional_projection_conflicts<T: PartialEq>(expected: &Option<T>, actual: &Option<T>) -> bool {
+    actual.is_some() && actual != expected
+}
+
+fn checkpoint_projection_conflict(
+    record: &crate::checkpoint::CheckpointJournalRecord,
+    component: &str,
+    journal_view: String,
+    sqlite_view: String,
+) -> StateError {
+    StateError::IndexCorrupt(format!(
+        "checkpoint record tape={} ordinal={} batch={} component={component} conflicts with SQLite: journal={journal_view}; sqlite={sqlite_view}",
+        hex_uuid(record.tape_uuid),
+        record.ordinal,
+        hex_uuid(record.batch_id)
+    ))
 }
 
 fn project_committed_tape_file_bundle_tx(
@@ -13358,6 +14266,83 @@ mod tests {
                     .get::<_, u64>(0))
                 .expect("idempotent object count"),
             2
+        );
+    }
+
+    #[test]
+    fn checkpoint_global_object_does_not_bypass_tape_prefix_validation() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-checkpoint-global-object")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [0x52; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "CHK002L9".to_string(),
+                block_size: 256 * 1024,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision checkpoint tape");
+        let object_uuid = uuid::Uuid::from_bytes([0x73; 16]);
+        let object_id = object_uuid.to_string();
+        let object = append_object_projection(&object_id);
+        index
+            .upsert_native_object_projection(object.clone(), &[])
+            .expect("seed matching global object metadata");
+
+        let record = crate::checkpoint::CheckpointJournalRecord {
+            ordinal: 1,
+            committed_object_count: 1,
+            eod_partition: 0,
+            eod_lba: 8,
+            tape_uuid,
+            batch_id: [0x62; 16],
+            checkpoint_tape_file_number: 4,
+            block_size: 256 * 1024,
+            objects: vec![crate::checkpoint::CheckpointObjectProjection {
+                object,
+                files: Vec::new(),
+                copy: append_copy_projection(&object_id, tape_uuid, 3),
+                block_size: 256 * 1024,
+                block_count: 2,
+                fresh_tape: false,
+                total_committed_ordinals: 2,
+                bootstrap_object_row: crate::checkpoint::CheckpointBootstrapObjectRow {
+                    tape_file_number: 3,
+                    stored_block_count: 2,
+                    object_id: *object_uuid.as_bytes(),
+                    representation:
+                        crate::checkpoint::CheckpointBootstrapObjectRepresentation::Plaintext {
+                            manifest_first_chunk_lba: 1,
+                            manifest_size_bytes: 1,
+                            manifest_chunk_count: 1,
+                            manifest_sha256: [0x33; 32],
+                        },
+                },
+            }],
+            scheme: None,
+            object_tape_file_bundles: Vec::new(),
+            checkpoint_bundle: None,
+        };
+
+        let error = index
+            .project_checkpoint_record(&record)
+            .expect_err("global object visibility must not make a gapped tape append repairable");
+        assert!(
+            error
+                .to_string()
+                .contains("non-contiguous: expected first new tape file 0, got 3"),
+            "{error}"
+        );
+        assert!(
+            index
+                .find_native_object_copies(&object_id)
+                .expect("query object copies")
+                .is_empty(),
+            "refused checkpoint must not publish a copy"
         );
     }
 
