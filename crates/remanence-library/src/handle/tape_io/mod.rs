@@ -2069,6 +2069,39 @@ impl super::DriveHandle {
         }
     }
 
+    /// Issue WRITE FILEMARKS(6) with IMMED=1 for a provisional delimiter.
+    ///
+    /// A successful return means only that the drive accepted the command.
+    /// The next synchronous zero-count WRITE FILEMARKS owns deferred-error
+    /// attribution and establishes the batch durability boundary.
+    pub fn write_filemarks_immediate(&mut self, count: u32) -> Result<(), TapeIoError> {
+        self.ensure_data_command_state_valid(true)?;
+        if count > remanence_scsi::write_filemarks::WRITE_FILEMARKS_6_MAX {
+            return Err(TapeIoError::InvalidRequest(ScsiError::InvalidInput(
+                "write_filemarks_immediate: count exceeds WRITE FILEMARKS(6) 24-bit max",
+            )));
+        }
+        let operation = AuditOp::TapeWriteFilemarks {
+            bay: self.bay_address,
+            count,
+        };
+        let cdb = remanence_scsi::write_filemarks::build_cdb_6_immediate(count);
+        self.fire_tape_started(operation, &cdb);
+        self.transport.set_timeout_for(TimeoutClass::WriteFilemarks);
+        let started = Instant::now();
+        match self.transport.execute_none(&cdb) {
+            Ok(()) => {
+                self.finish_tape_success(operation, started.elapsed());
+                Ok(())
+            }
+            Err(error) => {
+                let mapped = map_scsi(error);
+                self.finish_tape_error(operation, &mapped);
+                Err(mapped)
+            }
+        }
+    }
+
     /// Pipelined-session WRITE FILEMARKS with safety-relevant completion
     /// evidence deferred until the Layer 5 fence callback has completed.
     pub fn write_filemarks_pipelined(

@@ -678,17 +678,30 @@ enum AppendMode {
   APPEND_MODE_SEAL           = 4;
 }
 
+// Object-grain durability. WRITTEN is advisory and must be re-sent after any
+// session/stream failure unless a later response reports CHECKPOINTED.
+enum AppendDurability {
+  APPEND_DURABILITY_UNSPECIFIED  = 0;
+  APPEND_DURABILITY_WRITTEN      = 1;
+  APPEND_DURABILITY_CHECKPOINTED = 2;
+}
+
 message AppendCommitInfo {
   AppendMode append_mode              = 1;
   bytes tape_uuid                     = 2;
   optional string voltag              = 3;
-  uint64 tape_file_number             = 4;
+  optional uint64 tape_file_number    = 4;
   uint64 first_body_lba               = 5;
   optional uint64 position_before_lba = 6;
   optional uint64 position_after_lba  = 7;
   optional uint64 journal_record_ordinal = 8;
   optional uint64 estimated_remaining_bytes = 9;
   optional bool sealed_after_write    = 10;
+  AppendDurability durability         = 11;
+  // Present only for a WRITTEN acknowledgement.
+  bytes batch_id                      = 12;
+  // Session-local provisional ordinal; never a tape-file locator.
+  optional uint64 provisional_ordinal = 13;
 }
 
 // One object's catalog-level record. Body-format-agnostic.
@@ -1004,11 +1017,13 @@ service WriteSessionService {
 
   // Stream one object into the session. The first message in each call must
   // be an AppendObjectStart; subsequent messages are AppendObjectChunk; the
-  // last is AppendObjectFinish. Returns one ObjectRecord describing the
-  // committed object.
+  // last is AppendObjectFinish. In per-object mode the returned ObjectRecord
+  // is CHECKPOINTED. In batched mode it may be a locator-free WRITTEN advisory
+  // acknowledgement; callers must retain and re-send it after any session or
+  // stream failure unless CheckpointSession reports its committed copy.
   rpc AppendObject       (stream AppendObjectMessage) returns (ObjectRecord);
 
-  rpc CheckpointSession  (CheckpointSessionRequest)  returns (WriteSession);
+  rpc CheckpointSession  (CheckpointSessionRequest)  returns (CheckpointSessionResponse);
   rpc CloseWriteSession  (CloseWriteSessionRequest)  returns (WriteSession);
   rpc AbortWriteSession  (AbortWriteSessionRequest)  returns (WriteSession);
   rpc GetWriteSession    (GetWriteSessionRequest)    returns (WriteSession);
@@ -1041,6 +1056,14 @@ message WriteSession {
   TargetKind target_kind      = 10;
   repeated bytes tape_sequence = 11;
   uint32 current_tape_index   = 12;
+  uint64 pending_checkpoint_objects = 13;
+  uint64 pending_checkpoint_bytes = 14;
+  uint64 oldest_pending_age_seconds = 15;
+  google.protobuf.Timestamp checkpoint_deadline = 16;
+  // Durable receipts not previously returned by CheckpointSession. A close
+  // response carries these so close-triggered barriers do not lose locators.
+  repeated ObjectRecord checkpointed_objects = 17;
+  repeated ObjectCopy committed_copies = 18;
 }
 
 message OpenWriteSessionRequest {
@@ -1130,6 +1153,16 @@ message AppendObjectFinish {
 message CheckpointSessionRequest {
   bytes session_id               = 1;
   IdempotencyKey idempotency_key = 2;
+}
+
+message CheckpointSessionResponse {
+  WriteSession session = 1;
+  // Durable objects not previously returned by CheckpointSession, retained
+  // across automatic threshold/timer barriers for caller correlation.
+  repeated ObjectRecord committed_objects = 2;
+  // The corresponding committed-copy set. Callers register copies, enqueue
+  // verification, and release retained source bytes only from this field.
+  repeated ObjectCopy committed_copies = 3;
 }
 
 message CloseWriteSessionRequest {

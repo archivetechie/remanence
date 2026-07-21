@@ -4585,6 +4585,81 @@ fn drive_handle_write_filemarks_zero_count_syncs_buffer_with_immed_clear_cdb() {
     );
 }
 
+#[test]
+fn drive_handle_immediate_filemark_sets_immed_and_does_not_read_position() {
+    let lib = open_drive_test_lib("LIB_WFI1");
+    let policy = StaticAllowlist::new(["LIB_WFI1"]);
+    let (factory, log) = multi_recording_factory(vec![
+        (
+            PathBuf::from("/dev/sg-mock"),
+            vec![changer_inquiry_response(), vpd80_response("LIB_WFI1")],
+        ),
+        (
+            PathBuf::from("/dev/sg-drive-mock"),
+            vec![lto9_inquiry(), vpd80_response("DRV_A")],
+        ),
+    ]);
+    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+
+    {
+        let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+        drive
+            .write_filemarks_immediate(1)
+            .expect("advisory delimiter accepted");
+    }
+
+    let commands = log.borrow();
+    assert!(commands
+        .iter()
+        .any(|cdb| cdb.as_slice() == [0x10, 0x01, 0x00, 0x00, 0x01, 0x00]));
+    assert!(
+        commands.iter().all(|cdb| cdb.first() != Some(&0x34)),
+        "IMMED acknowledgement must not synthesize a durability proof"
+    );
+}
+
+#[test]
+fn deferred_filemark_check_condition_surfaces_at_zero_count_batch_barrier() {
+    let deferred = current_sense(0x03, 0x00, 0x11, 0x00);
+    let (mut drive, commands, _) = open_hot_script_drive(
+        "LIB_WF_DEFERRED",
+        [],
+        [
+            HotWriteScript::Clean,
+            HotWriteScript::CheckCondition(deferred.clone()),
+        ],
+        TapeIoRuntimeConfig::default(),
+    );
+    drive.validated_fixed_block_size = Some(4);
+
+    drive
+        .write_filemarks_immediate(1)
+        .expect("IMMED delimiter is only advisory");
+    let error = drive
+        .write_filemarks(0)
+        .expect_err("deferred CHECK CONDITION must fail the barrier");
+
+    assert!(matches!(
+        error,
+        TapeIoError::CheckCondition(ScsiError::CheckCondition { sense, .. })
+            if sense == deferred
+    ));
+    let filemark_cdbs = commands
+        .lock()
+        .expect("command log")
+        .iter()
+        .filter(|(cdb, _)| cdb[0] == 0x10)
+        .map(|(cdb, _)| cdb.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        filemark_cdbs,
+        vec![
+            vec![0x10, 0x01, 0x00, 0x00, 0x01, 0x00],
+            vec![0x10, 0x00, 0x00, 0x00, 0x00, 0x00],
+        ]
+    );
+}
+
 /// Inject a CHECK CONDITION on the first execute_none for
 /// WRITE FILEMARKS (CDB 0x10), then forward.
 struct FailFirstWfWithCheckCondition<T: SgTransport> {

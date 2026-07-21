@@ -439,6 +439,10 @@ pub struct ApiState {
     append_ring_bytes: u64,
     append_ring_high_pct: u8,
     append_ring_low_pct: u8,
+    checkpoint_mode: remanence_state::CheckpointMode,
+    checkpoint_max_bytes: u64,
+    checkpoint_max_objects: u64,
+    checkpoint_max_age_seconds: u64,
     default_library_serial: Option<Arc<String>>,
     library_snapshot: Option<Arc<RwLock<Arc<LibrarySnapshot>>>>,
     live_status: Arc<LiveStatusState>,
@@ -456,7 +460,11 @@ impl ApiState {
     }
 
     /// Build service state with operator-resolved tape-pool selection config.
-    pub fn new_with_config(index: CatalogIndex, config: &RemConfig) -> Self {
+    pub fn new_with_config(mut index: CatalogIndex, config: &RemConfig) -> Result<Self, Status> {
+        replay_checkpoint_journal_projections(
+            &mut index,
+            config.journal.dir.join("checkpoints").as_path(),
+        )?;
         let index_path = index.path().to_path_buf();
         let pool_configs = config
             .tape_pools
@@ -480,7 +488,11 @@ impl ApiState {
         state.append_ring_bytes = config.daemon.append_ring_bytes;
         state.append_ring_high_pct = config.daemon.append_ring_high_pct;
         state.append_ring_low_pct = config.daemon.append_ring_low_pct;
-        state
+        state.checkpoint_mode = config.daemon.checkpoint_mode;
+        state.checkpoint_max_bytes = config.daemon.checkpoint_max_bytes;
+        state.checkpoint_max_objects = config.daemon.checkpoint_max_objects;
+        state.checkpoint_max_age_seconds = config.daemon.checkpoint_max_age_seconds;
+        Ok(state)
     }
 
     /// Build service state with explicit tape-pool selection config.
@@ -534,6 +546,10 @@ impl ApiState {
             append_ring_bytes: remanence_state::DEFAULT_APPEND_RING_BYTES,
             append_ring_high_pct: 90,
             append_ring_low_pct: 25,
+            checkpoint_mode: remanence_state::CheckpointMode::PerObject,
+            checkpoint_max_bytes: remanence_state::DEFAULT_CHECKPOINT_MAX_BYTES,
+            checkpoint_max_objects: remanence_state::DEFAULT_CHECKPOINT_MAX_OBJECTS,
+            checkpoint_max_age_seconds: remanence_state::DEFAULT_CHECKPOINT_MAX_AGE_SECONDS,
             default_library_serial: None,
             library_snapshot: None,
             live_status: Arc::new(LiveStatusState::new(live_status_interval)),
@@ -604,6 +620,10 @@ impl ApiState {
             library.library(),
             &mut opened_drives,
         )?;
+        replay_checkpoint_journal_projections(
+            &mut index,
+            config.journal.dir.join("checkpoints").as_path(),
+        )?;
         reject_active_tape_io_fences_on_startup(&index)?;
         if opened_drives.is_empty() {
             return Err(Status::failed_precondition(
@@ -619,6 +639,9 @@ impl ApiState {
         let managed_library_serials = drive_managed_library_serials(config);
         let io_memory = crate::io_memory::IoMemoryReservation::new(config.daemon.io_memory_ceiling)
             .map_err(Status::invalid_argument)?;
+        let (timer_park_tx, timer_park_rx) = tokio::sync::mpsc::unbounded_channel();
+        let drive_pool_lifecycle =
+            crate::write_owner::DrivePoolLifecycle::with_timer_park_sender(timer_park_tx);
         let base_cfg = crate::write_owner::WriteOwnerConfig {
             index_path: index_path.clone(),
             report: report.clone(),
@@ -636,6 +659,13 @@ impl ApiState {
             cleaning: config.cleaning.clone(),
             tape_io: config.tape_io.clone(),
             io_memory: Arc::clone(&io_memory),
+            checkpoint_journal_dir: config.journal.dir.join("checkpoints"),
+            checkpoint_mode: config.daemon.checkpoint_mode,
+            checkpoint_max_bytes: config.daemon.checkpoint_max_bytes,
+            checkpoint_max_objects: config.daemon.checkpoint_max_objects,
+            checkpoint_max_age_seconds: config.daemon.checkpoint_max_age_seconds,
+            session_idle_seconds: config.daemon.default_idle_timeout_seconds,
+            lifecycle: Some(drive_pool_lifecycle.clone()),
         };
         let mut drive_txs = HashMap::new();
         for (bay_addr, drive) in opened_drives {
@@ -644,8 +674,12 @@ impl ApiState {
         }
         let changer_tx =
             crate::write_owner::spawn_changer_actor(library.into_changer(), base_cfg.clone());
-        let drive_pool =
-            crate::write_owner::DrivePool::new(changer_tx, drive_txs, reservations.clone());
+        let drive_pool = crate::write_owner::DrivePool::new_with_lifecycle(
+            changer_tx,
+            drive_txs,
+            reservations.clone(),
+            drive_pool_lifecycle,
+        );
         let mut state = Self::new_with_pool_configs_inner(
             index_path.clone(),
             pool_configs,
@@ -666,9 +700,14 @@ impl ApiState {
         state.append_ring_bytes = config.daemon.append_ring_bytes;
         state.append_ring_high_pct = config.daemon.append_ring_high_pct;
         state.append_ring_low_pct = config.daemon.append_ring_low_pct;
+        state.checkpoint_mode = config.daemon.checkpoint_mode;
+        state.checkpoint_max_bytes = config.daemon.checkpoint_max_bytes;
+        state.checkpoint_max_objects = config.daemon.checkpoint_max_objects;
+        state.checkpoint_max_age_seconds = config.daemon.checkpoint_max_age_seconds;
         state.default_library_serial = default_library_serial;
         state.library_snapshot = Some(library_snapshot);
         state.drive_idle_unload_seconds = config.daemon.drive_idle_unload_seconds;
+        crate::mount::spawn_timer_idle_dismount_listener(state.clone(), timer_park_rx);
         state.reconcile_drive_catalog_from_report(config, &report)?;
         state.reconcile_clean_runs_from_report(&report)?;
         crate::mount::register_startup_seated_cartridges(&state, &report);
@@ -1990,6 +2029,26 @@ fn default_audit_dir_for_index(index_path: &Path) -> PathBuf {
     parent.join("audit")
 }
 
+fn replay_checkpoint_journal_projections(
+    index: &mut CatalogIndex,
+    checkpoint_dir: &Path,
+) -> Result<(), Status> {
+    for path in remanence_state::list_checkpoint_journals(checkpoint_dir)
+        .map_err(status_from_state_error)?
+    {
+        let tape_uuid = remanence_state::tape_uuid_from_checkpoint_path(path.as_path())
+            .map_err(status_from_state_error)?;
+        let journal = remanence_state::FileCheckpointJournal::open(checkpoint_dir, tape_uuid)
+            .map_err(status_from_state_error)?;
+        for record in journal.replay().map_err(status_from_state_error)? {
+            index
+                .project_checkpoint_record(&record)
+                .map_err(status_from_state_error)?;
+        }
+    }
+    Ok(())
+}
+
 fn live_status_config_from(config: &remanence_state::LiveStatusConfig) -> Duration {
     parse_simple_duration(config.min_poll_interval.as_str())
         .unwrap_or_else(|| Duration::from_millis(250))
@@ -2563,13 +2622,28 @@ impl pb::write_session_service_server::WriteSessionService for WriteSessionApi {
     async fn checkpoint_session(
         &self,
         request: Request<pb::CheckpointSessionRequest>,
-    ) -> Result<Response<pb::WriteSession>, Status> {
+    ) -> Result<Response<pb::CheckpointSessionResponse>, Status> {
         authorize_request(&request, AuthPermission::Write)?;
         let request = request.into_inner();
         reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "CheckpointSession")?;
-        Err(Status::unimplemented(
-            "CheckpointSession is not wired in this write-session slice",
-        ))
+        let session_id = decode_uuid_bytes(&request.session_id, "session_id")?;
+        let session_id = Uuid::from_bytes(session_id);
+        let checkpoint = crate::mount::checkpoint_write_session(
+            &self.state,
+            session_id,
+            crate::write_owner::CheckpointTrigger::Explicit,
+        )
+        .await?;
+        let committed_copies = checkpoint
+            .committed_objects
+            .iter()
+            .flat_map(|object| object.copies.iter().cloned())
+            .collect();
+        Ok(Response::new(pb::CheckpointSessionResponse {
+            session: Some(checkpoint.session),
+            committed_objects: checkpoint.committed_objects,
+            committed_copies,
+        }))
     }
 
     async fn close_write_session(
@@ -5037,13 +5111,16 @@ fn append_commit_info_from_native_copy(copy: &NativeObjectCopyRecord) -> pb::App
         append_mode: append_mode_for_tape_file_number(tape_file_number) as i32,
         tape_uuid: copy.tape_uuid.clone(),
         voltag: None,
-        tape_file_number,
+        tape_file_number: Some(tape_file_number),
         first_body_lba: copy.first_body_lba,
         position_before_lba: None,
         position_after_lba: None,
         journal_record_ordinal: None,
         estimated_remaining_bytes: None,
         sealed_after_write: None,
+        durability: pb::AppendDurability::Checkpointed as i32,
+        batch_id: Vec::new(),
+        provisional_ordinal: None,
     }
 }
 
@@ -5963,7 +6040,7 @@ mod tests {
             .expect("append commit info from first copy");
         assert_eq!(info.append_mode, pb::AppendMode::Append as i32);
         assert_eq!(info.tape_uuid, TAPE_UUID.to_vec());
-        assert_eq!(info.tape_file_number, 2);
+        assert_eq!(info.tape_file_number, Some(2));
         assert_eq!(info.first_body_lba, 7);
         assert_eq!(info.position_before_lba, None);
         assert_eq!(info.position_after_lba, None);
@@ -9994,6 +10071,13 @@ BCw3Wyv2UWY=
                 remanence_state::DEFAULT_IO_MEMORY_CEILING_BYTES,
             )
             .expect("test I/O memory manager"),
+            checkpoint_journal_dir: temp.path().join("checkpoints"),
+            checkpoint_mode: remanence_state::CheckpointMode::PerObject,
+            checkpoint_max_bytes: remanence_state::DEFAULT_CHECKPOINT_MAX_BYTES,
+            checkpoint_max_objects: remanence_state::DEFAULT_CHECKPOINT_MAX_OBJECTS,
+            checkpoint_max_age_seconds: remanence_state::DEFAULT_CHECKPOINT_MAX_AGE_SECONDS,
+            session_idle_seconds: 1800,
+            lifecycle: None,
         };
         let drive_tx = crate::write_owner::spawn_drive_actor(BAY, drive, owner_config.clone());
         let changer_tx =

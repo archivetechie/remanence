@@ -64,7 +64,8 @@ REM-PARITY 1.0) are specified and implemented. Working today:
 The main gaps, from the code as it stands: authorization is a shallow
 role matrix, the audit-query service is defined but not yet served,
 library import/export (mailslot) handling, library-event streaming, and
-write-session checkpointing/restart all return unimplemented, parity
+write-session restart return unimplemented; batched write checkpoints are
+currently parity-off only, parity
 tapes do not yet support appending further objects after a committed
 session, and hardware soak coverage is still growing.
 

@@ -362,6 +362,20 @@ impl WriteFilemarksOutcome {
         }
     }
 
+    /// Construct a provisional IMMED=1 delimiter outcome from arithmetic.
+    /// This is not a durability proof; a later zero-count barrier must supply
+    /// the device position that becomes authoritative.
+    pub fn from_computed_position(position_after: TapePosition) -> Self {
+        Self {
+            early_warning: false,
+            end_of_medium: false,
+            position_after,
+            position_evidence: PositionAfter::Computed(ComputedPosition::from_position(
+                position_after,
+            )),
+        }
+    }
+
     /// Evidence behind `position_after`.
     pub fn position_evidence(&self) -> PositionAfter {
         self.position_evidence

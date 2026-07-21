@@ -784,7 +784,8 @@ fn checkpoint_resume_rebuilds_open_epoch_and_finish_protects_everything() {
         .map(|seed| fixed_block(seed, block_size))
         .collect::<Vec<_>>();
     let pre_resume_row =
-        BootstrapObjectRow::plaintext(0, pre_checkpoint_blocks.len() as u64, 0, 1, 1, [0x11; 32]);
+        BootstrapObjectRow::plaintext(0, pre_checkpoint_blocks.len() as u64, 0, 1, 1, [0x11; 32])
+            .with_object_id([0x11; 16]);
     let mut raw = RecordingRawTapeSink::default();
     let mut journal = RecordingJournal::new(sample_uuid());
     let checkpoint = {
@@ -922,7 +923,8 @@ fn checkpoint_resume_rebuilds_open_epoch_and_finish_protects_everything() {
             sink.write_block(&fixed_block(seed, block_size))
                 .expect("post-resume object block");
         }
-        let post_resume_row = BootstrapObjectRow::plaintext(2, 7, 0, 1, 1, [0x22; 32]);
+        let post_resume_row =
+            BootstrapObjectRow::plaintext(2, 7, 0, 1, 1, [0x22; 32]).with_object_id([0x22; 16]);
         sink.record_bootstrap_object_row(post_resume_row.clone())
             .expect("post-resume object row records");
         let summary = sink.finish_object().expect("post-resume object closes");
@@ -982,7 +984,7 @@ fn checkpoint_resume_rebuilds_open_epoch_and_finish_protects_everything() {
         final_bootstrap.object_rows,
         vec![
             pre_resume_row,
-            BootstrapObjectRow::plaintext(2, 7, 0, 1, 1, [0x22; 32])
+            BootstrapObjectRow::plaintext(2, 7, 0, 1, 1, [0x22; 32]).with_object_id([0x22; 16])
         ]
     );
 }
@@ -1007,6 +1009,7 @@ fn resume_rejects_object_rows_that_cannot_fit_bootstrap() {
                 1,
                 [tape_file_number as u8; 32],
             )
+            .with_object_id([tape_file_number as u8; 16])
         })
         .collect::<Vec<_>>();
     let append_position = committed_prefix
@@ -5884,14 +5887,17 @@ fn bootstrap_object_row_fit_budget_includes_final_reference_overhead() {
     let mut found_boundary = false;
 
     for tape_file_number in 0..512u32 {
-        rows.push(BootstrapObjectRow::plaintext(
-            tape_file_number,
-            1,
-            0,
-            1,
-            1,
-            [tape_file_number as u8; 32],
-        ));
+        rows.push(
+            BootstrapObjectRow::plaintext(
+                tape_file_number,
+                1,
+                0,
+                1,
+                1,
+                [tape_file_number as u8; 32],
+            )
+            .with_object_id([tape_file_number as u8; 16]),
+        );
         if sink.validate_bootstrap_object_rows_fit(&rows).is_err()
             && legacy_object_rows_fit_without_final_overhead(&sink, &rows).is_ok()
         {
@@ -5923,7 +5929,8 @@ fn begin_object_with_bootstrap_row_admission_rejects_before_raw_write() {
                 1,
                 1,
                 [tape_file_number as u8; 32],
-            );
+            )
+            .with_object_id([tape_file_number as u8; 16]);
             let mut candidate = rows.clone();
             candidate.push(row);
             if sink.validate_bootstrap_object_rows_fit(&candidate).is_err() {
