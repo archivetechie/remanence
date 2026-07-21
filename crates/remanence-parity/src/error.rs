@@ -9,6 +9,7 @@ use remanence_library::TapeIoError;
 use crate::capacity::CapacityReserveCause;
 use crate::journal::JournalError;
 use crate::model::StripeAddress;
+use crate::raw::PhysicalPositionHint;
 
 /// Errors a Layer 3c operation can return.
 #[derive(Debug, thiserror::Error)]
@@ -110,8 +111,14 @@ pub enum ParityError {
     /// A catalog-less scan reconstructed a filemark map whose
     /// canonical projection does not match the selected bootstrap's
     /// digest.
-    #[error("reconstructed filemark map does not match bootstrap digest")]
-    FilemarkMapDigestMismatch,
+    #[error(
+        "reconstructed filemark map does not match bootstrap digest (walk truncation position: {truncation_position:?})"
+    )]
+    FilemarkMapDigestMismatch {
+        /// First structurally incomplete tail position, when validation was
+        /// attempted over a walk that terminated at a truncation signature.
+        truncation_position: Option<PhysicalPositionHint>,
+    },
 
     /// Filemark-map reconstruction or structural validation failed
     /// before digest comparison.
