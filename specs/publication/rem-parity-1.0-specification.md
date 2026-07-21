@@ -104,8 +104,8 @@ priority order:
    them — including the first block of a tape file — never makes an
    unrelated epoch unrecoverable (Sections 12.4, 12.5, 13.3).
 6. **Fail-closed durability.** A tape file either completed its blocks, its
-   synchronous filemark, and its durable off-tape commit record, or it does
-   not exist for recovery purposes (Sections 3.4, 11.1).
+   trailing filemark synchronized to medium, and its durable off-tape commit
+   record, or it does not exist for recovery purposes (Sections 3.4, 11.1).
 7. **Long-term recoverability.** A future implementer holding only this
    document and its static test vectors can read every conformant tape;
    every cryptographic and arithmetic primitive is fully parameterized here.
@@ -199,6 +199,11 @@ A single implementation may fill several roles.
   covered by emitted sidecars. **Total `T`** (`map_total_data_ordinals`):
   ordinals `< T` exist as committed data. Always `W ≤ T`.
 - **Committed**: inside the durable boundary (Section 3.4).
+- **Synchronizing barrier**: a tape I/O operation whose successful
+  completion proves every previously issued block and filemark of the
+  session is on medium (Section 3.5).
+- **Attested prefix**: the leading tape files covered by the
+  highest-authority validating digest record (Section 12.6).
 - **Filemark map**: the tape's structural table of contents — one entry per
   tape file (Section 7).
 - **Sidecar epoch directory**: the per-epoch repair root listing every
@@ -328,13 +333,16 @@ the sidecars emitted at its close MAY be folded into one durable transaction
 never recovery inputs.
 
 Checkpoint bootstraps (Section 8.3) give the committed prefix an on-tape
-counterpart at barrier grain. Tape blocks reach the medium strictly in write
-order, so a bootstrap readable at tape file `F` implies every block and
-filemark of files `0..F` is physically on medium; when its digest record
-validates (Section 12.4) that prefix is additionally structurally proven.
+counterpart at barrier grain. Because the tape I/O layer persists writes in
+submission order (Section 3.5), a bootstrap block readable at tape file `F`
+implies every block and filemark of files `0..F−1`, and the blocks of file
+`F`, were written to the medium; when that bootstrap's digest record
+validates (Section 12.4), its scope is additionally structurally proven.
 Section 12.6 defines what a reader holding only the cartridge may conclude
-from this. The commit definition above is unchanged: the off-tape record
-remains the Writer's sole commit acknowledgment.
+from this. Attestation is not commitment: the off-tape record remains the
+Writer's sole commit acknowledgment, and where off-tape commit records are
+available the committed prefix governs recovery (Sections 13.2, 14) — the
+attested prefix is the cartridge-alone fallback.
 
 ### 3.5. Requirements on the Tape I/O Layer
 
@@ -346,6 +354,14 @@ data [LTO-SCSI]; other transports MUST provide equivalent Filemark and
 EndOfData classification. Implementations MAY track position by
 +1-per-block dead reckoning but MUST resynchronize via a positional query
 (e.g. SCSI READ POSITION) after any boundary or unclassified error.
+
+The tape I/O layer MUST persist blocks and filemarks to medium strictly in
+submission order, and MUST provide a **synchronizing barrier**: an
+operation (e.g. a zero-count synchronous SCSI WRITE FILEMARKS) whose
+successful completion proves that every block and filemark issued before it
+is on medium. A completion-unknown outcome at a barrier MUST be treated as
+barrier failure. On a transport that cannot guarantee ordered persistence,
+the attestation conclusions of Sections 3.4 and 12.6 are void.
 
 ## 4. The Object Contract
 
@@ -1209,7 +1225,9 @@ begin                      (at the durable boundary; dense numbering; one in fli
 → trailing filemark        (immediate or synchronous; same failure rule;
                            EOM here ⇒ abandon — never commit)
 → synchronization proof    (the filemark's synchronous completion, or a
-                           later shared barrier — see below)
+                           later shared barrier — see below; under
+                           deferral, this step and the two after it move
+                           to the barrier for every file it covers)
 → filemark-map push        (the in-memory projected map gains the entry)
 → durable-boundary advance
 → [object close only] emit queued sidecars (each its own write cycle and
@@ -1220,14 +1238,22 @@ begin                      (at the durable boundary; dense numbering; one in fli
 ```
 
 Consecutive cycles MAY defer synchronization to one shared **synchronizing
-barrier** (e.g. a zero-count synchronous filemark command) provided the
-barrier completes before the commit record of any file it covers is written;
-the durable boundary then advances for the whole batch at the barrier, and
-one commit record — or one durable transaction — MAY cover the batch. A
+barrier** (Section 3.5). A barrier covers every tape file written since the
+previous synchronization proof (or since session start); it MUST complete
+before the commit record of any file it covers takes effect. The durable
+boundary then advances for the whole batch at the barrier, and one commit
+record — or one durable transaction — MAY cover the batch. A
 completion-unknown, end-of-medium, or failed outcome at the barrier MUST
-abandon every uncommitted file it would have covered and poison the writer.
-The per-file synchronous filemark of the basic cycle is the one-file case of
-this rule.
+poison the writer, and every file the barrier would have covered remains
+uncommitted. The per-file synchronous filemark of the basic cycle is the
+one-file case of this rule.
+
+A Writer MAY stage durable records for covered-but-unproven files before
+the barrier (the reference journal does — Appendix B.12), but such staged
+records are not commit records: replay MUST disregard any staged record
+not covered by a subsequent durable commit marker written after its
+barrier. A session that ends before a barrier commits nothing since the
+last completed synchronization proof; resume proceeds per Section 14.
 
 The object-close bundle is durable atomically: a crash before the bundle's
 commit record leaves the object *and* the sidecars emitted at its close
@@ -1290,8 +1316,9 @@ an object.
 If an off-tape catalog supplies a map and it validates — the catalog's tape
 UUID matches the identity read from a bootstrap on the mounted tape,
 `W ≤ T`, and the map's sidecar-derived watermark equals its recorded `W` —
-that map is authoritative and no physical walk occurs (confirming the
-tape's identity still requires reading one bootstrap). Otherwise the
+that map is authoritative and no physical walk occurs within its scope
+(confirming the tape's identity still requires reading one bootstrap;
+tail classification beyond the map scope requires walking, Section 12.6). Otherwise the
 Scanner walks the tape from LBA 0.
 
 ### 12.2. The Walk
@@ -1379,31 +1406,59 @@ health is deliberately excluded from the canonical digest so that
 
 ### 12.6. The Tail Beyond the Attested Prefix
 
-The **attested prefix** of a tape is the scope of the newest digest record
-that validates (selection per Section 8.5, validation per Section 12.4; for
-a Scanner seeded by a validated catalog map, Section 12.1, it is that map's
-scope). From the cartridge alone, every tape file falls into exactly one
-class:
+This section defines what a walking Scanner (Section 12.2) may conclude
+from the cartridge alone; its conclusions rest on digest records. A tape
+carrying no digest record anywhere (the no-parity minimum of Section 8.2)
+offers no attestation, and a bare-tape map of it is entirely forensic. A
+Scanner seeded by a validated catalog map (Section 12.1) is outside this
+section: that map's authority is off-tape (Section 16.1) and may
+legitimately extend past the newest on-tape attestation; such a Scanner
+needing tail classification extends the walk beyond the map scope.
+
+The **attested prefix** of a tape is the scope of the highest-authority
+digest record that validates: candidates in descending Section 8.5 order,
+validation and bootstrap re-typing per Section 12.4. The attested prefix
+equals the validated scope of Section 7.4. An attesting bootstrap
+whose own tape file is structurally incomplete (its trailing filemark
+missing) cannot complete its own map entry, so its digest does not
+validate; selection falls to the next candidate. If no digest record
+validates, the attested prefix is empty. From the cartridge alone, every
+tape file then falls into exactly one class:
 
 - **Attested** — within the attested prefix: eligible as recovery input
-  under Sections 12 and 13.
+  under Sections 12 and 13 (attested includes files awaiting Section 13
+  parity repair; Section 13.2's watermark fence still applies to ordinals
+  at or beyond `W`). Attestation proves presence and self-consistent
+  structure, not authenticity (Section 16.1) and not commitment: a crash
+  between a barrier and its commit record can leave an attested batch the
+  Writer never acknowledged (Section 3.4).
 - **Unattested** — beyond the attested prefix but structurally complete
-  (measurable head-to-filemark; the ladder of Section 12.3 still classifies
-  it): it MUST NOT contribute to any map used for recovery and MUST NOT
-  serve as a reconstruction input. A Scanner SHOULD report unattested files
-  (count and positions). An implementation MAY offer explicit opt-in
-  payload-level salvage of unattested object files; salvage MUST occur
-  before any resume, because a Resumer physically supersedes the tail
-  (Section 14), and whether a salvaged payload is usable is the payload
-  format's determination (Section 4.3), not this format's.
-- **Torn** — beyond the attested prefix and structurally incomplete (a
-  missing trailing filemark, a zero-block file, or EOD inside the file): an
-  artifact of an interrupted session; forensic only.
+  (measurable head-to-filemark; the ladder of Section 12.3 still
+  classifies it). A Scanner MUST exclude unattested files from the
+  validated map it reports, and a Recoverer MUST NOT use them as
+  reconstruction inputs. A Scanner SHOULD report unattested files (count
+  and positions). An implementation MAY offer explicit opt-in
+  payload-level salvage of unattested object files — possible only before
+  a resume, since a Resumer physically supersedes the tail (Section 14).
+  Salvage output MUST be identified as salvage, distinct from Recoverer
+  results (Sections 13.5, 15), and is not a recovery input in the sense of
+  Sections 3.4 and 14; whether a salvaged payload is usable is the payload
+  format's determination (Section 4.3), not this format's. Unattested
+  non-object files are excluded from salvage: nothing past the attestation
+  is trusted to describe other files.
+- **Truncated** — beyond the attested prefix and structurally incomplete
+  (a missing trailing filemark, a zero-block file, or EOD inside the
+  file): the physical artifact of an interrupted session; forensic only.
+  (The *torn tail* of Sections 11.1 and 14 is the whole uncommitted tail —
+  it includes Unattested files as well as Truncated ones.)
 
-Every tail state is thus decidable from the cartridge alone. The residual
-ambiguity — whether an unattested file's payload was completely delivered by
-its producer — is exactly the bare-tape cost stated in Appendix B.8, and the
-Writer bounds it with its checkpoint cadence (Section 8.3).
+When the attested prefix is the whole tape (a validating final bootstrap,
+Section 8.3), the Unattested and Truncated classes are empty. Every tail
+state is thus decidable from the cartridge alone. The residual ambiguity —
+whether a file past the newest attestation was ever committed — is exactly
+the bare-tape cost stated in Appendix B.8; a Writer bounds it with its
+checkpoint cadence (Sections 8.3, 11.3), and a Writer that never
+checkpoints leaves the whole tape unattested until `finish()`.
 
 ## 13. Recoverer Obligations
 
@@ -1416,7 +1471,7 @@ ordinals.
 ### 13.2. Fail Before I/O
 
 Before any tape read, the Recoverer MUST reject, as typed refusals distinct
-from recovery failures: ordinals outside the validated prefix scope
+from recovery failures: ordinals outside the validated scope
 (`OutsideValidatedMapPrefix`); ordinals ≥ `W` — the pending epoch, whose
 parity does not exist yet (`UnrecoverablePendingEpoch`); and failed blocks
 or sidecars in tape files outside the durable boundary.
@@ -1923,9 +1978,10 @@ Commit state lives off tape (Section 3.4). A *per-file* marker would have to
 be written after the data it marks — adding a write and a failure mode to
 every file — and would still be unreadable exactly when it matters (torn
 writes). Version 1.0 instead attests at **barrier** grain: each checkpoint
-bootstrap is in effect a batched commit marker, written after everything it
-covers and cryptographically bound to the covered structure by its digest
-record (Section 7.4), amortized across the batch (Section 11.3). A torn tail
+bootstrap is a batched structural attestation, written after everything it
+covers and integrity-bound to the covered structure by its SHA-256 digest
+record (Section 7.4 — self-consistency, not authentication, Section 16.1),
+amortized across the batch (Section 11.1). A torn tail
 is still beyond the durable boundary — invisible to recovery, physically
 superseded on resume. What remains out of scope for bare-tape recovery is
 only the *commitment* of files past the newest attestation; Section 12.6
