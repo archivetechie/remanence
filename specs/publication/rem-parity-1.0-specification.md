@@ -309,9 +309,11 @@ live in sidecar tape files (Section 9), never among the data blocks.
 
 ### 3.4. The Durable Boundary
 
-A tape file is **committed** only when all of the following completed, in
-order: its blocks; its synchronous trailing filemark; and a durable off-tape
-**commit record**. The commit record's format is implementation-defined (a
+A tape file is **committed** only when all of the following hold, in
+order: its blocks and its trailing filemark are written; blocks and filemark
+are **synchronized to medium** — by a synchronous filemark, or by a later
+synchronizing barrier (Section 11.1) completing before the commit record;
+and a durable off-tape **commit record** exists. The commit record's format is implementation-defined (a
 journal, a database row, a replicated log entry); its required content is
 the tape file's filemark-map entry (Section 7.1) plus enough state to seed a
 Resumer (Section 14), and it MUST record both. There is no on-tape commit
@@ -324,6 +326,15 @@ the sidecars emitted at its close MAY be folded into one durable transaction
 (Section 11.1). Readers seeded from a *prefix*-scoped map
 (Section 7.4) MUST treat rows beyond the validated prefix as forensic only —
 never recovery inputs.
+
+Checkpoint bootstraps (Section 8.3) give the committed prefix an on-tape
+counterpart at barrier grain. Tape blocks reach the medium strictly in write
+order, so a bootstrap readable at tape file `F` implies every block and
+filemark of files `0..F` is physically on medium; when its digest record
+validates (Section 12.4) that prefix is additionally structurally proven.
+Section 12.6 defines what a reader holding only the cartridge may conclude
+from this. The commit definition above is unchanged: the off-tape record
+remains the Writer's sole commit acknowledgment.
 
 ### 3.5. Requirements on the Tape I/O Layer
 
@@ -1195,7 +1206,10 @@ cycle:
 ```text
 begin                      (at the durable boundary; dense numbering; one in flight)
 → write blocks             (any short write / EOM / completion-unknown ⇒ abandon)
-→ synchronous filemark     (same failure rule; EOM here ⇒ abandon — never commit)
+→ trailing filemark        (immediate or synchronous; same failure rule;
+                           EOM here ⇒ abandon — never commit)
+→ synchronization proof    (the filemark's synchronous completion, or a
+                           later shared barrier — see below)
 → filemark-map push        (the in-memory projected map gains the entry)
 → durable-boundary advance
 → [object close only] emit queued sidecars (each its own write cycle and
@@ -1204,6 +1218,16 @@ begin                      (at the durable boundary; dense numbering; one in fli
                            one record — or one durable transaction — covers
                            the object and every sidecar emitted at its close)
 ```
+
+Consecutive cycles MAY defer synchronization to one shared **synchronizing
+barrier** (e.g. a zero-count synchronous filemark command) provided the
+barrier completes before the commit record of any file it covers is written;
+the durable boundary then advances for the whole batch at the barrier, and
+one commit record — or one durable transaction — MAY cover the batch. A
+completion-unknown, end-of-medium, or failed outcome at the barrier MUST
+abandon every uncommitted file it would have covered and poison the writer.
+The per-file synchronous filemark of the basic cycle is the one-file case of
+this rule.
 
 The object-close bundle is durable atomically: a crash before the bundle's
 commit record leaves the object *and* the sidecars emitted at its close
@@ -1352,6 +1376,34 @@ At worst the damaged epoch becomes "metadata unavailable"
 (`SidecarMetadataUnavailable`, scoped to that epoch by definition). Copy
 health is deliberately excluded from the canonical digest so that
 *discovering* damage never invalidates the map (Section 7.3).
+
+### 12.6. The Tail Beyond the Attested Prefix
+
+The **attested prefix** of a tape is the scope of the newest digest record
+that validates (selection per Section 8.5, validation per Section 12.4; for
+a Scanner seeded by a validated catalog map, Section 12.1, it is that map's
+scope). From the cartridge alone, every tape file falls into exactly one
+class:
+
+- **Attested** — within the attested prefix: eligible as recovery input
+  under Sections 12 and 13.
+- **Unattested** — beyond the attested prefix but structurally complete
+  (measurable head-to-filemark; the ladder of Section 12.3 still classifies
+  it): it MUST NOT contribute to any map used for recovery and MUST NOT
+  serve as a reconstruction input. A Scanner SHOULD report unattested files
+  (count and positions). An implementation MAY offer explicit opt-in
+  payload-level salvage of unattested object files; salvage MUST occur
+  before any resume, because a Resumer physically supersedes the tail
+  (Section 14), and whether a salvaged payload is usable is the payload
+  format's determination (Section 4.3), not this format's.
+- **Torn** — beyond the attested prefix and structurally incomplete (a
+  missing trailing filemark, a zero-block file, or EOD inside the file): an
+  artifact of an interrupted session; forensic only.
+
+Every tail state is thus decidable from the cartridge alone. The residual
+ambiguity — whether an unattested file's payload was completely delivered by
+its producer — is exactly the bare-tape cost stated in Appendix B.8, and the
+Writer bounds it with its checkpoint cadence (Section 8.3).
 
 ## 13. Recoverer Obligations
 
@@ -1865,15 +1917,19 @@ additionally enable splicing a payload from two part-damaged copies; that
 corner case was deliberately traded for a simpler layout. A future revision
 adding splice recovery is a layout change (new schema version).
 
-### B.8. No on-tape commit marker
+### B.8. No per-file commit marker
 
-Commit state lives off tape (Section 3.4). An on-tape marker would have to
-be written *after* the data it marks — adding a write, a filemark, and a
-new failure mode per file — and would still be unreadable exactly when it
-matters (torn writes). Instead, a torn tail is simply beyond the durable
-boundary: invisible to recovery, physically superseded on resume. The cost
-is that bare-tape recovery of an *uncommitted* tail is out of scope by
-design.
+Commit state lives off tape (Section 3.4). A *per-file* marker would have to
+be written after the data it marks — adding a write and a failure mode to
+every file — and would still be unreadable exactly when it matters (torn
+writes). Version 1.0 instead attests at **barrier** grain: each checkpoint
+bootstrap is in effect a batched commit marker, written after everything it
+covers and cryptographically bound to the covered structure by its digest
+record (Section 7.4), amortized across the batch (Section 11.3). A torn tail
+is still beyond the durable boundary — invisible to recovery, physically
+superseded on resume. What remains out of scope for bare-tape recovery is
+only the *commitment* of files past the newest attestation; Section 12.6
+classifies that tail, and the Writer's checkpoint cadence bounds it.
 
 ### B.9. Content-blind classification
 
