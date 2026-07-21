@@ -1726,6 +1726,52 @@ impl CheckpointBarrierFailure {
     }
 }
 
+/// Rebuild committed-object receipts from the catalog projection made durable by a barrier.
+///
+/// The caller's pre-barrier WRITTEN acknowledgement is deliberately locator-free, while the
+/// pending batch contains pre-projection write results. Reading the durable record's projected
+/// object ids back keeps the CHECKPOINTED response aligned with the catalog's canonical
+/// object/copy protobuf conversion.
+fn checkpointed_objects_from_catalog(
+    index: &CatalogIndex,
+    checkpoint_record: &remanence_state::CheckpointJournalRecord,
+    sealed_after_write: bool,
+) -> Result<Vec<pb::ObjectRecord>, CheckpointBarrierFailure> {
+    checkpoint_record
+        .objects
+        .iter()
+        .map(|projection| {
+            let object_id = projection.object.object_id.as_str();
+            let object = index
+                .get_native_object(object_id)
+                .map_err(|err| {
+                    CheckpointBarrierFailure::after_journal(Status::internal(format!(
+                        "checkpoint is durable but catalog lookup for committed object {object_id} failed: {err}"
+                    )))
+                })?
+                .ok_or_else(|| {
+                    CheckpointBarrierFailure::after_journal(Status::internal(format!(
+                        "checkpoint is durable but committed object {object_id} is absent from the catalog projection"
+                    )))
+                })?;
+            let mut record = crate::object_record_to_proto(object).map_err(|err| {
+                CheckpointBarrierFailure::after_journal(Status::internal(format!(
+                    "checkpoint is durable but committed object {object_id} could not be encoded from the catalog: {}",
+                    err.message()
+                )))
+            })?;
+            let append_info = record.append_commit_info.as_mut().ok_or_else(|| {
+                CheckpointBarrierFailure::after_journal(Status::internal(format!(
+                    "checkpoint is durable but committed object {object_id} has no projected copies"
+                )))
+            })?;
+            append_info.sealed_after_write = Some(sealed_after_write);
+            append_info.durability = pb::AppendDurability::Checkpointed as i32;
+            Ok(record)
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn perform_checkpoint_barrier(
     index: &mut CatalogIndex,
@@ -2013,18 +2059,9 @@ fn perform_checkpoint_barrier(
         journal_projection_ms = crate::diagnostics::duration_ms(journal_projection),
         "remanence_write_diag",
     );
+    let committed_objects = checkpointed_objects_from_catalog(index, &record, sealed_after_write)?;
     Ok(BarrierOutcome {
-        committed_objects: batch
-            .objects
-            .iter()
-            .map(|result| {
-                let mut record = result.object.to_proto();
-                if let Some(info) = record.append_commit_info.as_mut() {
-                    info.sealed_after_write = Some(sealed_after_write);
-                }
-                record
-            })
-            .collect(),
+        committed_objects,
         object_count,
         logical_bytes: batch.logical_bytes,
         filemark_drain,
@@ -8149,14 +8186,26 @@ mod tests {
             .expect("checkpoint reply")
             .expect("checkpoint batch");
         assert_eq!(checkpoint.committed_objects.len(), 1);
+        let checkpointed_object = &checkpoint.committed_objects[0];
         assert_eq!(
-            checkpoint.committed_objects[0]
+            checkpointed_object
                 .append_commit_info
                 .as_ref()
                 .expect("checkpointed append info")
                 .durability,
             pb::AppendDurability::Checkpointed as i32
         );
+        assert_eq!(
+            checkpointed_object
+                .append_commit_info
+                .as_ref()
+                .expect("checkpointed append info")
+                .sealed_after_write,
+            Some(false)
+        );
+        assert_eq!(checkpointed_object.copies.len(), 1);
+        assert_eq!(checkpointed_object.copies[0].tape_uuid, tape_uuid);
+        assert_eq!(checkpointed_object.copies[0].tape_file_number, 1);
         let read_only = CatalogIndex::open_read_only(&index_path).expect("open projection");
         assert!(read_only
             .get_native_object(&object_id)
@@ -8200,6 +8249,17 @@ mod tests {
                 .durability,
             pb::AppendDurability::Checkpointed as i32
         );
+        assert_eq!(
+            third
+                .append_commit_info
+                .as_ref()
+                .expect("threshold CHECKPOINTED info")
+                .sealed_after_write,
+            Some(false)
+        );
+        assert_eq!(third.copies.len(), 1);
+        assert_eq!(third.copies[0].tape_uuid, tape_uuid);
+        assert_eq!(third.copies[0].tape_file_number, 4);
 
         let (receipt_tx, receipt_rx) = oneshot::channel();
         drive_tx
@@ -8219,6 +8279,21 @@ mod tests {
             receipts.committed_objects.len(),
             2,
             "automatic threshold checkpoints retain their full copy set"
+        );
+        let threshold_copy_placements = receipts
+            .committed_objects
+            .iter()
+            .map(|object| {
+                assert_eq!(object.copies.len(), 1);
+                (
+                    object.copies[0].tape_uuid.clone(),
+                    object.copies[0].tape_file_number,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            threshold_copy_placements,
+            vec![(tape_uuid.to_vec(), 3), (tape_uuid.to_vec(), 4)]
         );
         let journal = remanence_state::FileCheckpointJournal::open(
             temp.path().join("checkpoints"),
@@ -8274,6 +8349,8 @@ mod tests {
             fourth.object_id
         );
         assert_eq!(closed.session.committed_copies.len(), 1);
+        assert_eq!(closed.session.committed_copies[0].tape_uuid, tape_uuid);
+        assert_eq!(closed.session.committed_copies[0].tape_file_number, 6);
         let read_only = CatalogIndex::open_read_only(&index_path).expect("open projection");
         assert!(read_only
             .get_native_object(&fourth_object_id)
