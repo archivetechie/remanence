@@ -440,6 +440,7 @@ pub struct ApiState {
     append_ring_high_pct: u8,
     append_ring_low_pct: u8,
     checkpoint_mode: remanence_state::CheckpointMode,
+    checkpoint_journal_dir: Arc<PathBuf>,
     checkpoint_max_bytes: u64,
     checkpoint_max_objects: u64,
     checkpoint_max_age_seconds: u64,
@@ -489,6 +490,7 @@ impl ApiState {
         state.append_ring_high_pct = config.daemon.append_ring_high_pct;
         state.append_ring_low_pct = config.daemon.append_ring_low_pct;
         state.checkpoint_mode = config.daemon.checkpoint_mode;
+        state.checkpoint_journal_dir = Arc::new(config.journal.dir.join("checkpoints"));
         state.checkpoint_max_bytes = config.daemon.checkpoint_max_bytes;
         state.checkpoint_max_objects = config.daemon.checkpoint_max_objects;
         state.checkpoint_max_age_seconds = config.daemon.checkpoint_max_age_seconds;
@@ -527,6 +529,7 @@ impl ApiState {
         live_status_interval: Duration,
     ) -> Self {
         let daemon_epoch = Uuid::new_v4().as_u128() as u64;
+        let checkpoint_journal_dir = default_checkpoint_journal_dir_for_index(index_path.as_path());
         Self {
             index_path: Arc::new(index_path),
             audit_dir: Arc::new(audit_dir),
@@ -547,6 +550,7 @@ impl ApiState {
             append_ring_high_pct: 90,
             append_ring_low_pct: 25,
             checkpoint_mode: remanence_state::CheckpointMode::PerObject,
+            checkpoint_journal_dir: Arc::new(checkpoint_journal_dir),
             checkpoint_max_bytes: remanence_state::DEFAULT_CHECKPOINT_MAX_BYTES,
             checkpoint_max_objects: remanence_state::DEFAULT_CHECKPOINT_MAX_OBJECTS,
             checkpoint_max_age_seconds: remanence_state::DEFAULT_CHECKPOINT_MAX_AGE_SECONDS,
@@ -701,6 +705,7 @@ impl ApiState {
         state.append_ring_high_pct = config.daemon.append_ring_high_pct;
         state.append_ring_low_pct = config.daemon.append_ring_low_pct;
         state.checkpoint_mode = config.daemon.checkpoint_mode;
+        state.checkpoint_journal_dir = Arc::new(config.journal.dir.join("checkpoints"));
         state.checkpoint_max_bytes = config.daemon.checkpoint_max_bytes;
         state.checkpoint_max_objects = config.daemon.checkpoint_max_objects;
         state.checkpoint_max_age_seconds = config.daemon.checkpoint_max_age_seconds;
@@ -2027,6 +2032,13 @@ fn default_audit_dir_for_index(index_path: &Path) -> PathBuf {
             .unwrap_or_else(|| parent.join("audit"));
     }
     parent.join("audit")
+}
+
+fn default_checkpoint_journal_dir_for_index(index_path: &Path) -> PathBuf {
+    index_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("checkpoints")
 }
 
 fn replay_checkpoint_journal_projections(
@@ -6801,6 +6813,66 @@ BCw3Wyv2UWY=
         project_no_parity_tape_with_block_size(index, pool_id, tape_uuid, API_SESSION_BLOCK_SIZE);
     }
 
+    fn append_checkpoint_record(checkpoint_dir: &Path, tape_uuid: [u8; 16]) {
+        let object_uuid = Uuid::from_bytes([0x51; 16]);
+        let journal = remanence_state::FileCheckpointJournal::open(checkpoint_dir, tape_uuid)
+            .expect("open checkpoint journal");
+        journal
+            .append(&remanence_state::CheckpointJournalRecord {
+                ordinal: 1,
+                committed_object_count: 1,
+                eod_partition: 0,
+                eod_lba: 8,
+                tape_uuid,
+                batch_id: [0x42; 16],
+                checkpoint_tape_file_number: 2,
+                block_size: API_SESSION_BLOCK_SIZE,
+                objects: vec![remanence_state::CheckpointObjectProjection {
+                    object: NativeObjectProjectionInput {
+                        object_id: object_uuid.to_string(),
+                        caller_object_id: Some("checkpoint-selection-test".to_string()),
+                        body_format: "rao-v1".to_string(),
+                        logical_size_bytes: Some(1),
+                        content_hash: Some(vec![0x11; 32]),
+                        metadata_hash: Some(vec![0x22; 32]),
+                        created_at_utc: Some("2026-07-21T00:00:00Z".to_string()),
+                    },
+                    files: Vec::new(),
+                    copy: NativeObjectCopyProjectionInput {
+                        object_id: object_uuid.to_string(),
+                        tape_uuid,
+                        tape_file_number: 1,
+                        first_body_lba: 0,
+                        first_parity_data_ordinal: None,
+                        protected_until_ordinal: None,
+                        status: "committed".to_string(),
+                        representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+                        recipient_epoch_ids: None,
+                        metadata_frame_len: None,
+                        plaintext_digest: Some(vec![0x33; 32]),
+                        stored_digest: Some(vec![0x33; 32]),
+                    },
+                    block_size: API_SESSION_BLOCK_SIZE,
+                    block_count: 3,
+                    fresh_tape: true,
+                    total_committed_ordinals: 3,
+                    bootstrap_object_row: remanence_state::CheckpointBootstrapObjectRow {
+                        tape_file_number: 1,
+                        stored_block_count: 3,
+                        object_id: *object_uuid.as_bytes(),
+                        representation:
+                            remanence_state::CheckpointBootstrapObjectRepresentation::Plaintext {
+                                manifest_first_chunk_lba: 1,
+                                manifest_size_bytes: 1,
+                                manifest_chunk_count: 1,
+                                manifest_sha256: [0x44; 32],
+                            },
+                    },
+                }],
+            })
+            .expect("append checkpoint record");
+    }
+
     fn project_no_parity_tape_with_block_size(
         index: &mut CatalogIndex,
         pool_id: &str,
@@ -8068,6 +8140,100 @@ BCw3Wyv2UWY=
         assert_eq!(selected.tape_uuid, POOL_WRITE_TAPE_UUID);
         assert_eq!(selected.block_size, API_SESSION_BLOCK_SIZE);
         assert!(matches!(selected.parity_config, ParityConfig::None));
+    }
+
+    #[test]
+    fn batched_selection_skips_legacy_tape_while_per_object_ranking_is_unchanged() {
+        let mut index = test_index();
+        project_pool(&mut index, "camera.copy-a");
+        project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
+        project_no_parity_tape(&mut index, "camera.copy-a", SECOND_POOL_WRITE_TAPE_UUID);
+        project_no_parity_tape_usage(&mut index, POOL_WRITE_TAPE_UUID, 7);
+        let checkpoint_dir = temp_dir("remanence-batched-selection-mixed");
+        let cfg = pool_config("camera.copy-a");
+
+        let batched = crate::pool_write::select_tape_in_pool_for_write_session(
+            &index,
+            &cfg,
+            123,
+            &HashSet::new(),
+            remanence_state::CheckpointMode::Batched,
+            checkpoint_dir.as_path(),
+        )
+        .expect("batched selection should use the fresh tape");
+        let per_object = crate::pool_write::select_tape_in_pool_for_write_session(
+            &index,
+            &cfg,
+            123,
+            &HashSet::new(),
+            remanence_state::CheckpointMode::PerObject,
+            checkpoint_dir.as_path(),
+        )
+        .expect("per-object selection should retain legacy ranking");
+
+        assert_eq!(batched.tape_uuid, SECOND_POOL_WRITE_TAPE_UUID);
+        assert_eq!(per_object.tape_uuid, POOL_WRITE_TAPE_UUID);
+    }
+
+    #[test]
+    fn batched_selection_accepts_non_fresh_tape_with_checkpoint_journal() {
+        let mut index = test_index();
+        project_pool(&mut index, "camera.copy-a");
+        project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
+        project_no_parity_tape_usage(&mut index, POOL_WRITE_TAPE_UUID, 3);
+        let checkpoint_dir = temp_dir("remanence-batched-selection-journaled");
+        append_checkpoint_record(checkpoint_dir.as_path(), POOL_WRITE_TAPE_UUID);
+
+        let selected = crate::pool_write::select_tape_in_pool_for_write_session(
+            &index,
+            &pool_config("camera.copy-a"),
+            123,
+            &HashSet::new(),
+            remanence_state::CheckpointMode::Batched,
+            checkpoint_dir.as_path(),
+        )
+        .expect("checkpoint journal should make a non-fresh tape eligible");
+
+        assert_eq!(selected.tape_uuid, POOL_WRITE_TAPE_UUID);
+    }
+
+    #[test]
+    fn batched_selection_reports_every_legacy_candidate_and_adoption_path() {
+        let mut index = test_index();
+        project_pool(&mut index, "camera.copy-a");
+        project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
+        project_no_parity_tape(&mut index, "camera.copy-a", SECOND_POOL_WRITE_TAPE_UUID);
+        project_no_parity_tape_usage(&mut index, POOL_WRITE_TAPE_UUID, 3);
+        project_no_parity_tape_usage(&mut index, SECOND_POOL_WRITE_TAPE_UUID, 5);
+        let checkpoint_dir = temp_dir("remanence-batched-selection-ineligible");
+
+        let error = crate::pool_write::select_tape_in_pool_for_write_session(
+            &index,
+            &pool_config("camera.copy-a"),
+            123,
+            &HashSet::new(),
+            remanence_state::CheckpointMode::Batched,
+            checkpoint_dir.as_path(),
+        )
+        .expect_err("journal-less non-fresh pool must fail before ranking");
+        let message = error.to_string();
+
+        let SelectTapeError::NoBatchedEligibleTapes {
+            pool_id,
+            ineligible_candidates,
+        } = error
+        else {
+            panic!("expected batched eligibility error, got {message}");
+        };
+        assert_eq!(pool_id, "camera.copy-a");
+        assert_eq!(ineligible_candidates.len(), 2);
+        assert!(message.contains("RMN004L9"), "{message}");
+        assert!(message.contains("RMN005L9"), "{message}");
+        assert!(
+            message.contains("rem tape adopt-checkpoint <barcode>"),
+            "{message}"
+        );
+        assert!(message.contains("Phase 1.5"), "{message}");
     }
 
     #[test]
