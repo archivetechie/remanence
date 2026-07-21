@@ -26,7 +26,8 @@ pub fn data_shards_per_epoch(scheme: &ParityScheme) -> Result<u64, ParityError> 
 /// Map a global `ParityDataOrdinal` to its epoch-local stripe coordinates.
 ///
 /// [`StripeAddress::neighborhood`] carries the v0.4.4 parity epoch id.
-pub fn ordinal_to_stripe(
+#[cfg(test)]
+pub(crate) fn ordinal_to_stripe(
     ordinal: u64,
     scheme: &ParityScheme,
 ) -> Result<StripeAddress, ParityError> {
@@ -126,7 +127,8 @@ pub fn stripe_data_to_ordinal_in_epoch(
 /// Parity shards are intentionally rejected because they are addressed inside
 /// the sidecar index by `(epoch, stripe_index, parity_index)`, not by the
 /// object-data ordinal stream.
-pub fn stripe_data_to_ordinal(
+#[cfg(test)]
+pub(crate) fn stripe_data_to_ordinal(
     addr: &StripeAddress,
     scheme: &ParityScheme,
 ) -> Result<u64, ParityError> {
