@@ -1115,7 +1115,7 @@ fn decode_entry(value: CborValue) -> Result<TapeFileEntry, JournalError> {
             (10, CborValue::Null) => {}
             (11, CborValue::Null) => {}
             (11, value) => {
-                let row = decode_bootstrap_object_row_cbor(value, None)
+                let row = decode_bootstrap_object_row_cbor(value, None, 2)
                     .map_err(|err| JournalError::Codec(err.to_string()))?;
                 validate_bootstrap_object_row(&row, None)
                     .map_err(|err| JournalError::Codec(err.to_string()))?;
@@ -1263,13 +1263,10 @@ mod tests {
                 {
                     let mut entry =
                         TapeFileEntry::from_map_entry(TapeFileMapEntry::object(0, 3, 0));
-                    entry.bootstrap_object_row = Some(BootstrapObjectRow::encrypted(
-                        0,
-                        3,
-                        vec![[0x24; 16], [0x25; 16]],
-                        66,
-                        207,
-                    ));
+                    entry.bootstrap_object_row = Some(
+                        BootstrapObjectRow::encrypted(0, 3, vec![[0x24; 16], [0x25; 16]], 66, 207)
+                            .with_object_id([0x44; 16]),
+                    );
                     entry
                 },
                 TapeFileEntry {

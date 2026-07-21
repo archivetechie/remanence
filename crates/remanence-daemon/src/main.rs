@@ -57,7 +57,13 @@ async fn main() -> ExitCode {
         }
     };
     let state = if config.daemon.read_only {
-        remanence_api::ApiState::new_with_config(index, &config)
+        match remanence_api::ApiState::new_with_config(index, &config) {
+            Ok(state) => state,
+            Err(error) => {
+                eprintln!("error: replay checkpoint journals: {error}");
+                return ExitCode::from(1);
+            }
+        }
     } else {
         let report = match remanence_library::discover() {
             Ok(report) => report,

@@ -179,7 +179,7 @@ today:
 | `Daemon` | health, version, operation lifecycle (get/list/cancel/watch) |
 | `LibraryService` | inventory, drive stewardship, alarms, live status (incl. an advisory `drive_assignments` projection of the per-bay reservation state, for an external arbitration client — read-only, cannot gate a mount), robotics (move/load/unload); `ImportElement`/`ExportElement` and `StreamLibraryEvents` are defined but return unimplemented |
 | `Catalog` | tapes, pools, tape files, object enumeration, catalog units, reconcile; scoped/paginated enumeration is not wired yet (only the unscoped, unpaginated case works) |
-| `WriteSessionService` | open (pool targets only — drive/tape targets are unimplemented), client-streamed append, close, abort; `CheckpointSession` and write-session restart (`recover_session_id`) both return unimplemented — RM3's app-restart contract below covers reads only |
+| `WriteSessionService` | open (pool targets only — drive/tape targets are unimplemented), client-streamed append, explicit checkpoint, close, abort; opt-in batched durability is parity-off only, and write-session restart (`recover_session_id`) remains unimplemented — RM3's app-restart contract below covers reads only |
 | `ReadSessionService` | open (tape targets only), server-streamed object/file/byte-range reads, close; `OpenReadSession` accepts an optional resume target so a client that lost its session across a restart can reopen against durable coordinates (tape UUID, object/file id, file-boundary offset) instead — see [The read path](#the-read-path) |
 | `Audit` | defined in the proto; not yet served by the daemon (no service impl registered at all) |
 
@@ -248,7 +248,17 @@ Idempotency: a repeat of the same `(pool, caller_object_id)` with the
 same content returns the committed copy instead of writing twice;
 different content under a reused id is a conflict. Write sessions have
 no restart/resume contract — `recover_session_id` is rejected as
-unimplemented, unlike the read side below.
+unimplemented, unlike the read side below. In batched mode a WRITTEN response
+is advisory and locator-free; callers retain the source until
+`CheckpointSession` returns the committed copy set, and re-send every object
+that was not reported CHECKPOINTED after any session, stream, or daemon loss.
+Each batched barrier writes a non-final no-parity checkpoint bootstrap on tape
+with the authenticated filemark-map prefix and every committed RAO object row,
+then drains deferred drive errors with synchronous `WRITE FILEMARKS(0)` and
+captures `READ POSITION`. The daemon fsyncs that EOD and the replayable batch
+projection to its per-tape checkpoint journal before one SQLite transaction.
+Recovery trusts the journal, LOCATEs to its EOD, and overwrites any later
+physical tail; the on-tape bootstrap is the tape-alone recovery copy.
 
 <!-- code-anchor: crates/remanence-api/src/read_core.rs crates/remanence-api/src/write_owner.rs @ 2a20106 -->
 ## The read path

@@ -195,6 +195,12 @@ pub trait BlockSink {
     /// returns only after the marks are committed to media.
     fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError>;
 
+    /// Write advisory object delimiters with WRITE FILEMARKS(6) IMMED=1.
+    /// Durability is established later by a synchronous zero-count barrier.
+    fn write_filemarks_immediate(&mut self, count: u32) -> Result<(), TapeIoError> {
+        self.write_filemarks(count).map(|_| ())
+    }
+
     /// Pipelined-session filemark path. Drive sinks defer safety-relevant
     /// completion evidence until the caller has persisted its fence.
     fn write_filemarks_pipelined(
@@ -216,6 +222,13 @@ pub trait BlockSink {
     /// Pipeline-ordered SPACE(EOD), with safety audit completion deferred.
     fn space_to_end_of_data_pipelined(&mut self) -> Result<TapePosition, TapeIoError> {
         self.space_to_end_of_data()
+    }
+
+    /// Position by absolute logical block address for checkpoint recovery.
+    fn locate(&mut self, _lba: u64) -> Result<TapePosition, TapeIoError> {
+        Err(TapeIoError::OperationFailed(
+            "block sink does not support LOCATE".to_string(),
+        ))
     }
 
     /// Current tape position via READ POSITION long-form.
@@ -492,6 +505,9 @@ impl BlockSink for DriveHandleSink<'_> {
     fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
         self.0.write_filemarks(count)
     }
+    fn write_filemarks_immediate(&mut self, count: u32) -> Result<(), TapeIoError> {
+        self.0.write_filemarks_immediate(count)
+    }
     fn write_filemarks_pipelined(
         &mut self,
         count: u32,
@@ -506,6 +522,9 @@ impl BlockSink for DriveHandleSink<'_> {
             .0
             .space_pipelined(0, SpaceKind::EndOfData)?
             .position_after)
+    }
+    fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
+        self.0.locate(lba)
     }
     fn position(&mut self) -> Result<TapePosition, TapeIoError> {
         self.0.position()
@@ -1015,6 +1034,24 @@ impl BlockSink for VecBlockSink {
             partition: 0,
             beginning_of_partition: self.next_lba == 0,
             end_of_partition: false,
+            block_position_end_of_warning: false,
+        })
+    }
+
+    fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
+        if lba > self.eod_lba {
+            self.next_lba = self.eod_lba;
+            return Err(TapeIoError::OperationFailed(format!(
+                "VecBlockSink LOCATE target {lba} is beyond physical EOD {}",
+                self.eod_lba
+            )));
+        }
+        self.next_lba = lba;
+        Ok(TapePosition {
+            lba,
+            partition: 0,
+            beginning_of_partition: lba == 0,
+            end_of_partition: lba == self.eod_lba,
             block_position_end_of_warning: false,
         })
     }

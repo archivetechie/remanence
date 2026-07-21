@@ -355,14 +355,19 @@ pub fn write_prepared_object_to_parity_from_readers(
     let manifest_first_chunk_lba = layout.manifest.first_chunk_lba.ok_or_else(|| {
         StreamingError::InvalidInput("generated RAO manifest has no body LBA".to_string())
     })?;
-    parity.record_bootstrap_object_row(BootstrapObjectRow::plaintext(
-        opened.0,
-        layout.projected_size_blocks,
-        manifest_first_chunk_lba.0,
-        layout.manifest.size_bytes,
-        layout.manifest.chunk_count,
-        layout.manifest_sha256,
-    ))?;
+    let object_id = uuid::Uuid::parse_str(options.object_id.as_str())
+        .map_err(|err| StreamingError::InvalidInput(format!("invalid RAO object UUID: {err}")))?;
+    parity.record_bootstrap_object_row(
+        BootstrapObjectRow::plaintext(
+            opened.0,
+            layout.projected_size_blocks,
+            manifest_first_chunk_lba.0,
+            layout.manifest.size_bytes,
+            layout.manifest.chunk_count,
+            layout.manifest_sha256,
+        )
+        .with_object_id(*object_id.as_bytes()),
+    )?;
     let object_close = parity.finish_object()?;
     if opened.0 != object_close.tape_file_number {
         return Err(StreamingError::InvalidInput(
@@ -515,6 +520,14 @@ impl<S: BlockSink + ?Sized> BlockSink for ObjectDigestBlockSink<'_, S> {
 
     fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
         self.inner.write_filemarks(count)
+    }
+
+    fn write_filemarks_immediate(&mut self, count: u32) -> Result<(), TapeIoError> {
+        self.inner.write_filemarks_immediate(count)
+    }
+
+    fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
+        self.inner.locate(lba)
     }
 
     fn position(&mut self) -> Result<TapePosition, TapeIoError> {

@@ -270,13 +270,16 @@ fn encrypted_rao_ciphertext_recovers_through_parity_before_keyed_open() {
         report = write_encrypted_rao_object(&mut parity, &opts, &files, &recipients)
             .expect("encrypted RAO writes through parity sink");
         parity
-            .record_bootstrap_object_row(BootstrapObjectRow::encrypted(
-                1,
-                report.envelope.stored_size_blocks,
-                vec![[0x24; 16], [0x25; 16]],
-                report.envelope.metadata_frame_len,
-                report.envelope.header.key_frame_len,
-            ))
+            .record_bootstrap_object_row(
+                BootstrapObjectRow::encrypted(
+                    1,
+                    report.envelope.stored_size_blocks,
+                    vec![[0x24; 16], [0x25; 16]],
+                    report.envelope.metadata_frame_len,
+                    report.envelope.header.key_frame_len,
+                )
+                .with_object_id([0x77; 16]),
+            )
             .expect("encrypted bootstrap row records");
         close = parity.finish_object().expect("parity object closes");
     }

@@ -40,7 +40,7 @@ pub const BOOTSTRAP_SCHEMA_MAJOR: u16 = 1;
 /// versions, and minors `> BOOTSTRAP_SCHEMA_MINOR` written by
 /// newer versions (forward-compatible). Minor bumps add fields
 /// with sensible defaults.
-pub const BOOTSTRAP_SCHEMA_MINOR: u16 = 2;
+pub const BOOTSTRAP_SCHEMA_MINOR: u16 = 3;
 
 /// `flags` bit 0: this tape was written with `--parity none`
 /// and contains no parity blocks. Readers see this bit and
@@ -125,6 +125,8 @@ pub struct BootstrapObjectRow {
     pub tape_file_number: u32,
     /// Number of fixed-size tape blocks occupied by the stored copy.
     pub stored_block_count: u64,
+    /// RAO object UUID. Schema minors 0..=2 may decode this as absent.
+    pub object_id: Option<[u8; 16]>,
     /// Representation-specific recovery anchors for the copy.
     pub representation: BootstrapObjectRepresentation,
 }
@@ -142,6 +144,7 @@ impl BootstrapObjectRow {
         Self {
             tape_file_number,
             stored_block_count,
+            object_id: None,
             representation: BootstrapObjectRepresentation::Plaintext {
                 manifest_first_chunk_lba,
                 manifest_size_bytes,
@@ -162,12 +165,19 @@ impl BootstrapObjectRow {
         Self {
             tape_file_number,
             stored_block_count,
+            object_id: None,
             representation: BootstrapObjectRepresentation::Encrypted {
                 recipient_epoch_ids,
                 metadata_frame_len,
                 key_frame_len,
             },
         }
+    }
+
+    /// Bind this recovery row to the RAO object UUID emitted by Layer 3b.
+    pub fn with_object_id(mut self, object_id: [u8; 16]) -> Self {
+        self.object_id = Some(object_id);
+        self
     }
 }
 
@@ -263,6 +273,15 @@ pub fn write_bootstrap_block(
     if payload.sidecar_epoch_directory.is_some() && payload.parity_map_reference.is_some() {
         return Err(ParityError::Invariant(
             "BootstrapPayload: sidecar_epoch_directory and parity_map_reference are mutually exclusive",
+        ));
+    }
+    if payload
+        .object_rows
+        .iter()
+        .any(|row| row.object_id.is_none())
+    {
+        return Err(ParityError::Invariant(
+            "schema-minor 3 bootstrap object rows require RAO object_id",
         ));
     }
     validate_bootstrap_object_rows(&payload.object_rows, Some(payload.block_size_bytes))?;
@@ -405,7 +424,7 @@ pub fn parse_bootstrap_block(buf: &[u8]) -> Result<BootstrapPayload, ParityError
         )));
     }
 
-    let decoded = decode_cbor_payload(cbor_bytes, no_parity, block_size_bytes)?;
+    let decoded = decode_cbor_payload(cbor_bytes, no_parity, block_size_bytes, minor)?;
 
     // Codex idref=794a16ac Medium: scheme record is optional
     // only when FLAG_NO_PARITY is set. Reject a missing scheme
@@ -805,7 +824,7 @@ fn encode_cbor_payload(payload: &BootstrapPayload) -> Result<Vec<u8>, ParityErro
     }
 
     // Tag 30: RAO-binding object rows. Older readers ignore this unknown key;
-    // schema-minor 2 readers use it for catalog-less object recovery hints.
+    // schema-minor 3 readers also bind every row to its RAO object UUID.
     if !payload.object_rows.is_empty() {
         let rows = payload
             .object_rows
@@ -841,6 +860,7 @@ fn decode_cbor_payload(
     bytes: &[u8],
     no_parity_flag: bool,
     block_size_bytes: u32,
+    schema_minor: u16,
 ) -> Result<DecodedBootstrapCbor, ParityError> {
     let value: CborValue = ciborium::from_reader(bytes)
         .map_err(|e| ParityError::BootstrapParse(format!("CBOR decode failed: {e}")))?;
@@ -902,7 +922,8 @@ fn decode_cbor_payload(
                 parity_map_reference = Some(decode_parity_map_reference_cbor(value)?);
             }
             key if key == i128::from(OBJECT_ROWS_KEY) => {
-                object_rows = decode_bootstrap_object_rows_cbor(value, Some(block_size_bytes))?;
+                object_rows =
+                    decode_bootstrap_object_rows_cbor(value, Some(block_size_bytes), schema_minor)?;
             }
             _ => {
                 // Forward-compatible: ignore unknown integer
@@ -946,6 +967,12 @@ pub(crate) fn encode_bootstrap_object_row_cbor(
             CborValue::Integer(row.stored_block_count.into()),
         ),
     ];
+    if let Some(object_id) = row.object_id {
+        entries.push((
+            CborValue::Integer(4.into()),
+            CborValue::Bytes(object_id.to_vec()),
+        ));
+    }
     match &row.representation {
         BootstrapObjectRepresentation::Plaintext {
             manifest_first_chunk_lba,
@@ -1018,6 +1045,7 @@ pub(crate) fn encode_bootstrap_object_row_cbor(
 pub(crate) fn decode_bootstrap_object_row_cbor(
     value: CborValue,
     block_size_bytes: Option<u32>,
+    schema_minor: u16,
 ) -> Result<BootstrapObjectRow, ParityError> {
     let map = match value {
         CborValue::Map(map) => map,
@@ -1031,6 +1059,7 @@ pub(crate) fn decode_bootstrap_object_row_cbor(
     let mut tape_file_number = None;
     let mut representation = None;
     let mut stored_block_count = None;
+    let mut object_id = None;
     let mut manifest_first_chunk_lba = None;
     let mut manifest_size_bytes = None;
     let mut manifest_chunk_count = None;
@@ -1057,6 +1086,14 @@ pub(crate) fn decode_bootstrap_object_row_cbor(
             (2, CborValue::Text(value)) => representation = Some(value),
             (3, CborValue::Integer(i)) => {
                 stored_block_count = Some(int_to_u64(i, "object_row.stored_block_count")?)
+            }
+            (4, CborValue::Bytes(bytes)) => {
+                object_id = Some(bytes.try_into().map_err(|bytes: Vec<u8>| {
+                    ParityError::BootstrapParse(format!(
+                        "object_row.object_id has length {}, expected 16",
+                        bytes.len()
+                    ))
+                })?)
             }
             (10, CborValue::Integer(i)) => {
                 manifest_first_chunk_lba =
@@ -1110,7 +1147,12 @@ pub(crate) fn decode_bootstrap_object_row_cbor(
     })?;
     let representation = representation
         .ok_or_else(|| ParityError::BootstrapParse("object row missing representation".into()))?;
-    let row = match representation.as_str() {
+    if schema_minor >= 3 && object_id.is_none() {
+        return Err(ParityError::BootstrapParse(
+            "schema-minor 3 object row missing object_id".into(),
+        ));
+    }
+    let mut row = match representation.as_str() {
         "plaintext" => {
             if recipient_epoch_ids.is_some()
                 || metadata_frame_len.is_some()
@@ -1179,6 +1221,7 @@ pub(crate) fn decode_bootstrap_object_row_cbor(
             )))
         }
     };
+    row.object_id = object_id;
     validate_bootstrap_object_row(&row, block_size_bytes)?;
     Ok(row)
 }
@@ -1186,6 +1229,7 @@ pub(crate) fn decode_bootstrap_object_row_cbor(
 fn decode_bootstrap_object_rows_cbor(
     value: CborValue,
     block_size_bytes: Option<u32>,
+    schema_minor: u16,
 ) -> Result<Vec<BootstrapObjectRow>, ParityError> {
     let rows = match value {
         CborValue::Array(rows) => rows,
@@ -1197,7 +1241,7 @@ fn decode_bootstrap_object_rows_cbor(
     };
     let rows = rows
         .into_iter()
-        .map(|row| decode_bootstrap_object_row_cbor(row, block_size_bytes))
+        .map(|row| decode_bootstrap_object_row_cbor(row, block_size_bytes, schema_minor))
         .collect::<Result<Vec<_>, _>>()?;
     validate_bootstrap_object_rows(&rows, block_size_bytes)?;
     Ok(rows)
@@ -1662,8 +1706,9 @@ mod tests {
     fn roundtrip_payload_with_object_rows() {
         let mut payload = sample_payload();
         payload.object_rows = vec![
-            BootstrapObjectRow::plaintext(1, 8, 6, 1234, 1, [0xA1; 32]),
-            BootstrapObjectRow::encrypted(3, 11, vec![[0x24; 16], [0x25; 16]], 66, 207),
+            BootstrapObjectRow::plaintext(1, 8, 6, 1234, 1, [0xA1; 32]).with_object_id([0x11; 16]),
+            BootstrapObjectRow::encrypted(3, 11, vec![[0x24; 16], [0x25; 16]], 66, 207)
+                .with_object_id([0x33; 16]),
         ];
         let mut buf = vec![0xCC; payload.block_size_bytes as usize];
 
@@ -1672,6 +1717,20 @@ mod tests {
 
         assert_eq!(parsed.object_rows, payload.object_rows);
         assert_eq!(parsed, payload);
+    }
+
+    #[test]
+    fn object_row_id_is_required_at_minor_three_but_absent_is_legacy_compatible() {
+        let legacy = BootstrapObjectRow::plaintext(1, 8, 6, 1234, 1, [0xA1; 32]);
+        let encoded = encode_bootstrap_object_row_cbor(&legacy).expect("encode legacy row");
+
+        let decoded = decode_bootstrap_object_row_cbor(encoded.clone(), Some(4096), 2)
+            .expect("minor-two row without object id remains readable");
+        assert_eq!(decoded.object_id, None);
+
+        let err = decode_bootstrap_object_row_cbor(encoded, Some(4096), 3)
+            .expect_err("minor-three row without object id must reject");
+        assert!(err.to_string().contains("missing object_id"), "{err}");
     }
 
     #[test]
@@ -1695,7 +1754,7 @@ mod tests {
             ),
         ]);
 
-        let err = decode_bootstrap_object_row_cbor(row, Some(4096)).unwrap_err();
+        let err = decode_bootstrap_object_row_cbor(row, Some(4096), 2).unwrap_err();
         assert!(
             err.to_string().contains("plaintext manifest anchors"),
             "{err}"
@@ -1723,7 +1782,7 @@ mod tests {
             ),
         ]);
 
-        let err = decode_bootstrap_object_row_cbor(row, Some(4096)).unwrap_err();
+        let err = decode_bootstrap_object_row_cbor(row, Some(4096), 2).unwrap_err();
 
         assert!(
             err.to_string().contains("duplicate object row key"),
@@ -1735,8 +1794,9 @@ mod tests {
     fn writer_rejects_unsorted_object_rows() {
         let mut payload = sample_payload();
         payload.object_rows = vec![
-            BootstrapObjectRow::encrypted(3, 11, vec![[0x24; 16]], 66, 103),
-            BootstrapObjectRow::plaintext(1, 8, 6, 1234, 1, [0xA1; 32]),
+            BootstrapObjectRow::encrypted(3, 11, vec![[0x24; 16]], 66, 103)
+                .with_object_id([0x33; 16]),
+            BootstrapObjectRow::plaintext(1, 8, 6, 1234, 1, [0xA1; 32]).with_object_id([0x11; 16]),
         ];
         let mut buf = vec![0; payload.block_size_bytes as usize];
 
