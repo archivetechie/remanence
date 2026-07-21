@@ -2472,13 +2472,19 @@ impl<'a> ParitySink<'a> {
         }
         let sidecars_emitted = self.emit_pending_sidecars()?;
         let bootstrap_tape_file_number = self.write_bootstrap_with_finality(is_terminal)?;
-        let barrier_outcome = self.backend.write_filemarks(0, false)?;
+        let barrier_outcome = match self.backend.write_filemarks(0, false) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.poisoned = true;
+                return Err(ParityError::TapeIo(err));
+            }
+        };
         self.record_physical_position(barrier_outcome.position_after.lba);
         if barrier_outcome.end_of_medium {
             self.poisoned = true;
-            return Err(ParityError::Invariant(
-                "checkpoint zero-count barrier reached end of medium",
-            ));
+            return Err(ParityError::TapeIo(TapeIoError::HardEndOfMedium {
+                sense: Vec::new(),
+            }));
         }
         let kind = if is_terminal {
             CommittedBundleKind::Finish
