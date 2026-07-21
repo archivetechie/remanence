@@ -238,6 +238,24 @@ fn send_checkpoint_actor_reply(
     }
 }
 
+/// Retain a catalog-replayed object until an explicit checkpoint can claim its durable copy.
+///
+/// A replay has no pending checkpoint batch because its copy was committed by an earlier
+/// session. Append still reports that durable record to the current caller, whose batch contract
+/// releases it only from `CheckpointSession`; coalescing by object id also prevents duplicate
+/// receipts when the same replay arrives before that checkpoint.
+fn retain_replayed_committed_receipt(
+    committed_receipts: &mut Vec<pb::ObjectRecord>,
+    record: &pb::ObjectRecord,
+) {
+    if !committed_receipts
+        .iter()
+        .any(|committed| committed.object_id == record.object_id)
+    {
+        committed_receipts.push(record.clone());
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct CloseWriteActorReply {
     pub(crate) session: pb::WriteSession,
@@ -3553,6 +3571,12 @@ fn handle_drive_open_write(
                             },
                             "remanence_write_diag",
                         );
+                        if replay {
+                            retain_replayed_committed_receipt(
+                                &mut committed_receipts,
+                                &response_record,
+                            );
+                        }
                         let _ = reply.send(Ok(AppendFinishOutcome {
                             record: response_record,
                             replay,
@@ -7913,46 +7937,6 @@ mod tests {
         Uuid::from_slice(&session.session_id).expect("actor test write session UUID")
     }
 
-    /// Explicitly checkpoint an actor test session and return its committed-object set.
-    async fn checkpoint_actor_test_write_session(
-        drive_tx: &mpsc::Sender<DriveCommand>,
-        session_id: Uuid,
-    ) -> CheckpointActorReply {
-        let (checkpoint_tx, checkpoint_rx) = oneshot::channel();
-        drive_tx
-            .send(DriveCommand::Checkpoint {
-                session_id,
-                trigger: CheckpointTrigger::Explicit,
-                expected_batch_id: None,
-                reply: Some(checkpoint_tx),
-            })
-            .await
-            .expect("send actor test checkpoint");
-        checkpoint_rx
-            .await
-            .expect("actor test checkpoint reply")
-            .expect("checkpoint actor test write session")
-    }
-
-    /// Close an actor test write session without unloading its seated tape.
-    async fn close_actor_test_write_session(
-        drive_tx: &mpsc::Sender<DriveCommand>,
-        session_id: Uuid,
-    ) -> CloseWriteActorReply {
-        let (close_tx, close_rx) = oneshot::channel();
-        drive_tx
-            .send(DriveCommand::Close {
-                session_id,
-                reply: close_tx,
-            })
-            .await
-            .expect("send actor test write close");
-        close_rx
-            .await
-            .expect("actor test write close reply")
-            .expect("close actor test write session")
-    }
-
     #[test]
     fn checkpoint_timer_request_queues_behind_existing_drive_actor_work() {
         let (tx, mut rx) = mpsc::channel(4);
@@ -8499,10 +8483,10 @@ mod tests {
         );
     }
 
-    /// Explicit batch-of-one checkpoints must return catalog-projected copies after reopening a
-    /// new session on the same seated tape; provisional append acknowledgements stay locator-free.
+    /// Mount-dispatched explicit checkpoints must return catalog-projected copies after reopening
+    /// a session, including a catalog replay whose append acknowledgement is already durable.
     #[tokio::test]
-    async fn sequential_batch_of_one_sessions_return_catalog_copies() {
+    async fn sequential_sessions_and_replay_return_catalog_copies_through_mount() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-sequential-batch-one")
             .tempdir()
@@ -8595,6 +8579,16 @@ mod tests {
             block_size_bytes: 4096,
             min_object_size_bytes: 0,
         };
+        let (changer_tx, _changer_rx) = mpsc::channel(1);
+        let reservations = Arc::new(HashMap::from([(0x0100, AtomicBool::new(false))]));
+        let pool = DrivePool::new(
+            changer_tx,
+            HashMap::from([(0x0100, drive_tx.clone())]),
+            reservations,
+        );
+        let state_index = CatalogIndex::open(&index_path).expect("open mount test catalog");
+        let mut state = crate::ApiState::new_with_pool_configs(state_index, [pool_cfg.clone()]);
+        state.drive_pool = Some(pool.clone());
 
         let mut previous_session_id = None;
         for (session_ordinal, expected_tape_file_number) in [(1u8, 1u64), (2, 3)] {
@@ -8610,18 +8604,33 @@ mod tests {
             .await;
             assert_ne!(Some(session_id), previous_session_id);
             previous_session_id = Some(session_id);
-            let append = append_actor_test_file(
-                &drive_tx,
+            pool.record_session(
                 session_id,
-                temp.path()
-                    .join(format!("batch-one-source-{session_ordinal}.bin")),
-                &format!("payload-{session_ordinal}.bin"),
-                &format!("batch-one-caller-{session_ordinal}"),
-                format!("batch-one payload {session_ordinal}").as_bytes(),
+                MountedSession {
+                    bay: 0x0100,
+                    library_serial: library_serial.clone(),
+                    barcode: Some("CHK003L9".to_string()),
+                    home_slot: Some(0x0400),
+                    tape_uuid,
+                    drive_uuid: Some(drive_uuid.clone()),
+                },
+            );
+            let source_path = temp
+                .path()
+                .join(format!("batch-one-source-{session_ordinal}.bin"));
+            std::fs::write(&source_path, format!("batch-one payload {session_ordinal}"))
+                .expect("write mount append source");
+            let append = crate::mount::append_finish(
+                &state,
+                session_id,
+                source_path,
+                PathBuf::from(format!("payload-{session_ordinal}.bin")),
+                format!("batch-one-caller-{session_ordinal}"),
+                None,
             )
-            .await;
+            .await
+            .expect("append through mount dispatcher");
             let written_info = append
-                .record
                 .append_commit_info
                 .as_ref()
                 .expect("batch-of-one WRITTEN append info");
@@ -8629,12 +8638,18 @@ mod tests {
                 written_info.durability,
                 pb::AppendDurability::Written as i32
             );
-            assert!(append.record.copies.is_empty());
+            assert!(append.copies.is_empty());
 
-            let checkpoint = checkpoint_actor_test_write_session(&drive_tx, session_id).await;
+            let checkpoint = crate::mount::checkpoint_write_session(
+                &state,
+                session_id,
+                CheckpointTrigger::Explicit,
+            )
+            .await
+            .expect("explicit checkpoint through mount dispatcher");
             assert_eq!(checkpoint.committed_objects.len(), 1);
             let committed = &checkpoint.committed_objects[0];
-            assert_eq!(committed.object_id, append.record.object_id);
+            assert_eq!(committed.object_id, append.object_id);
             let committed_info = committed
                 .append_commit_info
                 .as_ref()
@@ -8650,10 +8665,114 @@ mod tests {
                 expected_tape_file_number
             );
 
-            let closed = close_actor_test_write_session(&drive_tx, session_id).await;
+            let (close_tx, close_rx) = oneshot::channel();
+            drive_tx
+                .send(DriveCommand::Close {
+                    session_id,
+                    reply: close_tx,
+                })
+                .await
+                .expect("send actor test write close");
+            let closed = close_rx
+                .await
+                .expect("actor test write close reply")
+                .expect("close actor test write session");
             assert!(closed.session.checkpointed_objects.is_empty());
             assert!(closed.session.committed_copies.is_empty());
+            pool.forget_session(session_id);
         }
+
+        let replay_session_id = open_actor_test_write_session(
+            &drive_tx,
+            &pool_cfg,
+            tape_uuid,
+            library_serial.as_str(),
+            "CHK003L9",
+            &drive_uuid,
+            "DRV-BATCH-ONE",
+        )
+        .await;
+        pool.record_session(
+            replay_session_id,
+            MountedSession {
+                bay: 0x0100,
+                library_serial,
+                barcode: Some("CHK003L9".to_string()),
+                home_slot: Some(0x0400),
+                tape_uuid,
+                drive_uuid: Some(drive_uuid),
+            },
+        );
+        let replay_source = temp.path().join("batch-one-replay-source.bin");
+        std::fs::write(&replay_source, "batch-one payload 1").expect("write replay source");
+        let replay = crate::mount::append_finish(
+            &state,
+            replay_session_id,
+            replay_source,
+            PathBuf::from("payload-1.bin"),
+            "batch-one-caller-1".to_string(),
+            None,
+        )
+        .await
+        .expect("replay append through mount dispatcher");
+        assert_eq!(
+            replay
+                .append_commit_info
+                .as_ref()
+                .expect("catalog replay append info")
+                .durability,
+            pb::AppendDurability::Checkpointed as i32
+        );
+        assert_eq!(replay.copies.len(), 1);
+        assert_eq!(replay.copies[0].tape_file_number, 1);
+
+        let replay_checkpoint = crate::mount::checkpoint_write_session(
+            &state,
+            replay_session_id,
+            CheckpointTrigger::Explicit,
+        )
+        .await
+        .expect("explicit replay checkpoint through mount dispatcher");
+        assert_eq!(
+            replay_checkpoint.committed_objects.len(),
+            1,
+            "catalog replay must remain claimable by the explicit checkpoint"
+        );
+        assert_eq!(
+            replay_checkpoint.committed_objects[0].object_id,
+            replay.object_id
+        );
+        assert_eq!(replay_checkpoint.committed_objects[0].copies.len(), 1);
+        assert_eq!(
+            replay_checkpoint.committed_objects[0].copies[0].tape_file_number,
+            1
+        );
+
+        let claimed_again = crate::mount::checkpoint_write_session(
+            &state,
+            replay_session_id,
+            CheckpointTrigger::Explicit,
+        )
+        .await
+        .expect("repeat explicit replay checkpoint through mount dispatcher");
+        assert!(
+            claimed_again.committed_objects.is_empty(),
+            "a replay receipt must be returned by exactly one explicit checkpoint"
+        );
+
+        let (close_tx, close_rx) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::Close {
+                session_id: replay_session_id,
+                reply: close_tx,
+            })
+            .await
+            .expect("send replay session close");
+        close_rx
+            .await
+            .expect("replay session close reply")
+            .expect("close replay session");
+        pool.forget_session(replay_session_id);
     }
 
     struct RangeCatalogFixture {
