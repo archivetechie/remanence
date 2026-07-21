@@ -98,7 +98,11 @@ pub use resume::{
     ResumeAppendPlan, ResumeAppendResult, ResumeLiveEpochState, ResumeOpenEpochRebuild,
     ResumeRebuiltSidecar, ResumeSidecarPlan,
 };
-pub use scan::{acquire_filemark_map, scan_reconstruct_filemark_map, CatalogFilemarkMapInput};
+pub use scan::{
+    acquire_filemark_map, acquire_filemark_map_with_report, scan_reconstruct_filemark_map,
+    scan_reconstruct_filemark_map_with_report, CatalogFilemarkMapInput, FilemarkMapScanResult,
+    ScanTailTruncation, ScanTailTruncationKind, ScanWalkResult, UnattestedTapeFile,
+};
 pub use sidecar::{
     classify_sidecar_header_block, crc64_xz, data_shard_crc64, derive_sidecar_footer_magic,
     derive_sidecar_magic, encode_sidecar_index_blocks, encode_sidecar_tape_file,

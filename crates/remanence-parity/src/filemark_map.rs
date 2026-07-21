@@ -628,7 +628,9 @@ impl ScopedFilemarkMap {
             || validated.total_data_ordinals() != digest.map_total_data_ordinals
             || validated.max_sidecar_end_exclusive() != digest.highest_protected_ordinal
         {
-            return Err(ParityError::FilemarkMapDigestMismatch);
+            return Err(ParityError::FilemarkMapDigestMismatch {
+                truncation_position: None,
+            });
         }
 
         let (validated_prefix_tape_files, scope) = if digest.is_final_map {
@@ -1091,7 +1093,7 @@ mod tests {
         let mut bad_digest = digest;
         bad_digest.map_total_data_ordinals += 1;
         let err = ScopedFilemarkMap::validate_against_digest(map, &bad_digest).unwrap_err();
-        assert!(matches!(err, ParityError::FilemarkMapDigestMismatch));
+        assert!(matches!(err, ParityError::FilemarkMapDigestMismatch { .. }));
     }
 
     #[test]

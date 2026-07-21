@@ -39,6 +39,66 @@ pub struct CatalogFilemarkMapInput {
     pub highest_protected_ordinal: u64,
 }
 
+/// Structural signature that terminated a physical tape walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanTailTruncationKind {
+    /// End-of-data was reached before the current file's trailing filemark.
+    MissingTrailingFilemark,
+    /// Filemark spacing measured a file containing no data blocks.
+    ZeroBlockFile,
+    /// A filemark was encountered where the next file's first block belonged.
+    EmptyFile,
+}
+
+/// First structurally incomplete tape file encountered by a physical walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanTailTruncation {
+    /// Dense tape-file number the incomplete file would have occupied.
+    pub tape_file_number: u32,
+    /// Physical start position of the incomplete file.
+    pub position: PhysicalPositionHint,
+    /// Structural signature observed at that position.
+    pub kind: ScanTailTruncationKind,
+}
+
+/// One structurally complete file beyond the digest-attested prefix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnattestedTapeFile {
+    /// Forensic map entry. It is not eligible for recovery input.
+    pub entry: TapeFileMapEntry,
+    /// Physical start position measured by the walk.
+    pub position: PhysicalPositionHint,
+}
+
+/// Tail-aware result of the single physical filemark-map walk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanWalkResult {
+    /// Structurally complete files walked before EOD or truncation.
+    pub map: FilemarkMap,
+    /// First incomplete tail file, when one terminated the walk.
+    pub truncation: Option<ScanTailTruncation>,
+}
+
+/// Digest-validated scan result with an explicit attested/tail boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilemarkMapScanResult {
+    /// Only the digest-attested map prefix reported as validated.
+    pub attested_map: FilemarkMap,
+    /// Recovery scope plus the full complete-file walk for guarded navigation.
+    pub scoped_map: ScopedFilemarkMap,
+    /// Structurally complete files beyond `attested_map`, for reporting only.
+    pub unattested_files: Vec<UnattestedTapeFile>,
+    /// First structurally incomplete tail file, when present.
+    pub truncation: Option<ScanTailTruncation>,
+}
+
+impl FilemarkMapScanResult {
+    /// Number of structurally complete, unattested tail files.
+    pub fn unattested_file_count(&self) -> usize {
+        self.unattested_files.len()
+    }
+}
+
 impl CatalogFilemarkMapInput {
     /// Construct a catalog map input for [`acquire_filemark_map`].
     pub fn new(tape_uuid: [u8; 16], map: FilemarkMap, highest_protected_ordinal: u64) -> Self {
@@ -61,16 +121,28 @@ pub fn acquire_filemark_map(
     authoritative_bootstrap: &BootstrapPayload,
     catalog_map: Option<CatalogFilemarkMapInput>,
 ) -> Result<ScopedFilemarkMap, ParityError> {
+    Ok(acquire_filemark_map_with_report(source, authoritative_bootstrap, catalog_map)?.scoped_map)
+}
+
+/// Acquire a filemark map and retain the scanner's tail classification.
+///
+/// The legacy [`acquire_filemark_map`] wrapper returns only `scoped_map`.
+/// Bare-tape reporting should use this surface so unattested complete files
+/// and a torn final file cannot be mistaken for digest-attested rows.
+pub fn acquire_filemark_map_with_report(
+    source: &mut dyn RawTapeSource,
+    authoritative_bootstrap: &BootstrapPayload,
+    catalog_map: Option<CatalogFilemarkMapInput>,
+) -> Result<FilemarkMapScanResult, ParityError> {
     if !authoritative_bootstrap.no_parity_flag && authoritative_bootstrap.drive_compression {
         return Err(ParityError::DriveCompressionEnabled);
     }
 
     if let Some(catalog) = catalog_map {
         validate_catalog_scope(&catalog, authoritative_bootstrap)?;
-        return Ok(ScopedFilemarkMap::from_catalog(
-            catalog.map,
-            catalog.highest_protected_ordinal,
-        ));
+        let scoped_map =
+            ScopedFilemarkMap::from_catalog(catalog.map, catalog.highest_protected_ordinal);
+        return filemark_map_scan_result(scoped_map, None);
     }
 
     let Some(digest) = authoritative_bootstrap.filemark_map_digest.as_ref() else {
@@ -89,18 +161,74 @@ pub fn acquire_filemark_map(
         authoritative_bootstrap,
         digest,
     ) {
-        Ok(scoped) => Ok(scoped),
+        Ok(scoped) => filemark_map_scan_result(scoped, reconstructed.truncation),
         Err(original_error) => {
-            for tape_file_number in reconstructed.unreadable_one_block_objects {
-                let hypothesis = retype_object_as_bootstrap(&reconstructed.map, tape_file_number)?;
+            for tape_file_number in &reconstructed.unreadable_one_block_objects {
+                let hypothesis = retype_object_as_bootstrap(&reconstructed.map, *tape_file_number)?;
                 if let Ok(scoped) =
                     validate_scan_hypothesis(source, hypothesis, authoritative_bootstrap, digest)
                 {
-                    return Ok(scoped);
+                    return filemark_map_scan_result(scoped, reconstructed.truncation);
                 }
             }
-            Err(original_error)
+            Err(enrich_scan_error_with_truncation(
+                original_error,
+                reconstructed.truncation,
+            ))
         }
+    }
+}
+
+fn filemark_map_scan_result(
+    scoped_map: ScopedFilemarkMap,
+    truncation: Option<ScanTailTruncation>,
+) -> Result<FilemarkMapScanResult, ParityError> {
+    let attested_tape_file_count = scoped_map
+        .validated_prefix_tape_files
+        .unwrap_or(scoped_map.map.tape_file_count());
+    let attested_map = scoped_map
+        .map
+        .truncate_to_tape_files(attested_tape_file_count)?;
+    let tail_start = usize::try_from(attested_tape_file_count)
+        .map_err(|_| filemark_scan_error("attested tape-file count does not fit usize"))?;
+    let mut unattested_files =
+        Vec::with_capacity(scoped_map.map.entries().len().saturating_sub(tail_start));
+    for entry in &scoped_map.map.entries()[tail_start..] {
+        let position = scoped_map.map.physical_position(TapeFilePosition {
+            tape_file_number: entry.tape_file_number,
+            block_within_file: 0,
+        })?;
+        unattested_files.push(UnattestedTapeFile {
+            entry: entry.clone(),
+            position,
+        });
+    }
+    Ok(FilemarkMapScanResult {
+        attested_map,
+        scoped_map,
+        unattested_files,
+        truncation,
+    })
+}
+
+fn enrich_scan_error_with_truncation(
+    error: ParityError,
+    truncation: Option<ScanTailTruncation>,
+) -> ParityError {
+    let Some(truncation) = truncation else {
+        return error;
+    };
+    match error {
+        ParityError::FilemarkMapDigestMismatch { .. } => ParityError::FilemarkMapDigestMismatch {
+            truncation_position: Some(truncation.position),
+        },
+        ParityError::FilemarkMapReconstruct(message) => {
+            ParityError::FilemarkMapReconstruct(format!(
+                "{message}; walk terminated at tape file {} physical LBA {} ({:?})",
+                truncation.tape_file_number, truncation.position.lba, truncation.kind
+            ))
+        }
+        other => other,
     }
 }
 
@@ -165,13 +293,31 @@ pub fn scan_reconstruct_filemark_map(
     tape_uuid: &[u8; 16],
     block_size: u32,
 ) -> Result<FilemarkMap, ParityError> {
-    Ok(scan_reconstruct_filemark_map_with_provenance(source, tape_uuid, block_size)?.map)
+    Ok(scan_reconstruct_filemark_map_with_report(source, tape_uuid, block_size)?.map)
+}
+
+/// Walk structurally complete tape files and report the first torn tail file.
+///
+/// This is the reporting form of [`scan_reconstruct_filemark_map`]; both use
+/// the same walk and classification funnel.
+pub fn scan_reconstruct_filemark_map_with_report(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+) -> Result<ScanWalkResult, ParityError> {
+    let reconstructed =
+        scan_reconstruct_filemark_map_with_provenance(source, tape_uuid, block_size)?;
+    Ok(ScanWalkResult {
+        map: reconstructed.map,
+        truncation: reconstructed.truncation,
+    })
 }
 
 #[derive(Debug)]
 struct ScanReconstruction {
     map: FilemarkMap,
     unreadable_one_block_objects: Vec<u32>,
+    truncation: Option<ScanTailTruncation>,
 }
 
 fn scan_reconstruct_filemark_map_with_provenance(
@@ -192,16 +338,19 @@ fn scan_reconstruct_filemark_map_with_provenance(
     let mut buf = vec![0u8; block_size_usize];
     let mut saw_file = false;
     let mut unreadable_one_block_objects = Vec::new();
+    let mut truncation = None;
 
     loop {
         let file_start = source.position()?;
         match source.read_record(&mut buf) {
             Ok(RawReadOutcome::EndOfData { .. }) => break,
             Ok(RawReadOutcome::Filemark { .. }) => {
-                return Err(filemark_scan_error(format!(
-                    "empty tape file at physical LBA {}",
-                    file_start.lba
-                )));
+                truncation = Some(ScanTailTruncation {
+                    tape_file_number: builder.next_tape_file_number()?,
+                    position: file_start,
+                    kind: ScanTailTruncationKind::EmptyFile,
+                });
+                break;
             }
             Ok(RawReadOutcome::Block { bytes, .. }) if bytes != block_size_usize => {
                 return Err(filemark_scan_error(format!(
@@ -211,7 +360,17 @@ fn scan_reconstruct_filemark_map_with_provenance(
             }
             Ok(RawReadOutcome::Block { .. }) => {
                 let first_block = buf.clone();
-                let measured = measure_current_file(source, file_start)?;
+                let measured = match measure_current_file(source, file_start)? {
+                    MeasureCurrentFileOutcome::Complete(measured) => measured,
+                    MeasureCurrentFileOutcome::Truncated(kind) => {
+                        truncation = Some(ScanTailTruncation {
+                            tape_file_number: builder.next_tape_file_number()?,
+                            position: file_start,
+                            kind,
+                        });
+                        break;
+                    }
+                };
                 append_classified_entry(
                     source,
                     &mut builder,
@@ -226,7 +385,17 @@ fn scan_reconstruct_filemark_map_with_provenance(
             }
             Err(_err) => {
                 source.locate_physical(file_start)?;
-                let measured = measure_current_file(source, file_start)?;
+                let measured = match measure_current_file(source, file_start)? {
+                    MeasureCurrentFileOutcome::Complete(measured) => measured,
+                    MeasureCurrentFileOutcome::Truncated(kind) => {
+                        truncation = Some(ScanTailTruncation {
+                            tape_file_number: builder.next_tape_file_number()?,
+                            position: file_start,
+                            kind,
+                        });
+                        break;
+                    }
+                };
                 let tape_file_number = builder.next_tape_file_number()?;
                 let classified_as_object = append_entry_with_unreadable_head(
                     source,
@@ -245,13 +414,14 @@ fn scan_reconstruct_filemark_map_with_provenance(
         }
     }
 
-    if !saw_file {
+    if !saw_file && truncation.is_none() {
         return Err(filemark_scan_error("scan found no tape files"));
     }
 
     Ok(ScanReconstruction {
         map: builder.build()?,
         unreadable_one_block_objects,
+        truncation,
     })
 }
 
@@ -259,6 +429,12 @@ fn scan_reconstruct_filemark_map_with_provenance(
 struct MeasuredTapeFile {
     block_count: u64,
     position_after: PhysicalPositionHint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MeasureCurrentFileOutcome {
+    Complete(MeasuredTapeFile),
+    Truncated(ScanTailTruncationKind),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -291,13 +467,12 @@ impl From<&SidecarFooter> for SidecarScanClassification {
 fn measure_current_file(
     source: &mut dyn RawTapeSource,
     file_start: PhysicalPositionHint,
-) -> Result<MeasuredTapeFile, ParityError> {
+) -> Result<MeasureCurrentFileOutcome, ParityError> {
     let outcome = source.space_filemarks(1)?;
     if outcome.filemarks_spaced != 1 {
-        return Err(filemark_scan_error(format!(
-            "tape file at physical LBA {} is missing a trailing filemark",
-            file_start.lba
-        )));
+        return Ok(MeasureCurrentFileOutcome::Truncated(
+            ScanTailTruncationKind::MissingTrailingFilemark,
+        ));
     }
 
     let consumed = outcome
@@ -309,15 +484,14 @@ fn measure_current_file(
         .checked_sub(1)
         .ok_or_else(|| filemark_scan_error("scan filemark position underflow"))?;
     if block_count == 0 {
-        return Err(filemark_scan_error(format!(
-            "tape file at physical LBA {} has no data blocks",
-            file_start.lba
-        )));
+        return Ok(MeasureCurrentFileOutcome::Truncated(
+            ScanTailTruncationKind::ZeroBlockFile,
+        ));
     }
-    Ok(MeasuredTapeFile {
+    Ok(MeasureCurrentFileOutcome::Complete(MeasuredTapeFile {
         block_count,
         position_after: outcome.position_after,
-    })
+    }))
 }
 
 fn append_classified_entry(
@@ -1077,6 +1251,40 @@ mod tests {
     }
 
     #[test]
+    fn empty_tail_file_terminates_walk_with_complete_prefix() {
+        let (mut records, expected_map) = fixture_records(false, false);
+        let empty_file_position = PhysicalPositionHint::new(records.len() as u64);
+        records.push(Record::Filemark);
+        let mut source = RecordingRawSource::new(records);
+
+        let walk = scan_reconstruct_filemark_map_with_report(&mut source, &TAPE_UUID, BLOCK_SIZE)
+            .expect("empty tail file terminates rather than aborting the walk");
+
+        assert_eq!(walk.map, expected_map);
+        assert_eq!(
+            walk.truncation,
+            Some(ScanTailTruncation {
+                tape_file_number: expected_map.tape_file_count(),
+                position: empty_file_position,
+                kind: ScanTailTruncationKind::EmptyFile,
+            })
+        );
+    }
+
+    #[test]
+    fn zero_block_measurement_is_a_tail_truncation_signature() {
+        let mut source = RecordingRawSource::new(vec![Record::Filemark]);
+
+        let measured = measure_current_file(&mut source, PhysicalPositionHint::new(0))
+            .expect("zero-block measurement is classified");
+
+        assert_eq!(
+            measured,
+            MeasureCurrentFileOutcome::Truncated(ScanTailTruncationKind::ZeroBlockFile)
+        );
+    }
+
+    #[test]
     fn parity_map_reference_overlay_errors_when_referenced_file_is_missing() {
         let reconstructed = FilemarkMap::new(vec![
             TapeFileMapEntry::bootstrap(0, 1),
@@ -1728,7 +1936,7 @@ mod tests {
         assert_eq!(reconstructed.entries()[2].kind, TapeFileKind::Object);
         assert!(matches!(
             ScopedFilemarkMap::validate_against_digest(reconstructed, &final_digest),
-            Err(ParityError::FilemarkMapDigestMismatch)
+            Err(ParityError::FilemarkMapDigestMismatch { .. })
         ));
 
         let mut source = RecordingRawSource::new(records);
@@ -2221,7 +2429,7 @@ mod tests {
         assert_eq!(reconstructed.entries()[3].kind, TapeFileKind::Object);
         assert!(matches!(
             ScopedFilemarkMap::validate_against_digest(reconstructed, &final_digest),
-            Err(ParityError::FilemarkMapDigestMismatch)
+            Err(ParityError::FilemarkMapDigestMismatch { .. })
         ));
 
         let mut source = RecordingRawSource::new(records);
@@ -2281,7 +2489,7 @@ mod tests {
         assert_ne!(reconstructed, expected_map);
         assert!(matches!(
             ScopedFilemarkMap::validate_against_digest(reconstructed, &final_digest),
-            Err(ParityError::FilemarkMapDigestMismatch)
+            Err(ParityError::FilemarkMapDigestMismatch { .. })
         ));
 
         let mut source = RecordingRawSource::new(records);
@@ -2624,7 +2832,7 @@ mod tests {
         assert_ne!(reconstructed, expected_map);
         let err =
             ScopedFilemarkMap::validate_against_digest(reconstructed, &final_digest).unwrap_err();
-        assert!(matches!(err, ParityError::FilemarkMapDigestMismatch));
+        assert!(matches!(err, ParityError::FilemarkMapDigestMismatch { .. }));
     }
 
     #[test]
@@ -2636,7 +2844,7 @@ mod tests {
         let err = acquire_filemark_map(&mut source, &final_payload, None)
             .expect_err("readable corrupt bootstrap is not eligible for re-typing");
 
-        assert!(matches!(err, ParityError::FilemarkMapDigestMismatch));
+        assert!(matches!(err, ParityError::FilemarkMapDigestMismatch { .. }));
     }
 
     #[test]
@@ -2710,7 +2918,7 @@ mod tests {
         );
         let err =
             ScopedFilemarkMap::validate_against_digest(reconstructed, &final_digest).unwrap_err();
-        assert!(matches!(err, ParityError::FilemarkMapDigestMismatch));
+        assert!(matches!(err, ParityError::FilemarkMapDigestMismatch { .. }));
     }
 
     #[test]
@@ -2748,7 +2956,7 @@ mod tests {
         );
         let err =
             ScopedFilemarkMap::validate_against_digest(reconstructed, &final_digest).unwrap_err();
-        assert!(matches!(err, ParityError::FilemarkMapDigestMismatch));
+        assert!(matches!(err, ParityError::FilemarkMapDigestMismatch { .. }));
     }
 
     #[test]
@@ -2786,7 +2994,7 @@ mod tests {
         );
         let err =
             ScopedFilemarkMap::validate_against_digest(reconstructed, &final_digest).unwrap_err();
-        assert!(matches!(err, ParityError::FilemarkMapDigestMismatch));
+        assert!(matches!(err, ParityError::FilemarkMapDigestMismatch { .. }));
     }
 
     #[test]
@@ -2823,7 +3031,7 @@ mod tests {
         );
         let err =
             ScopedFilemarkMap::validate_against_digest(reconstructed, &final_digest).unwrap_err();
-        assert!(matches!(err, ParityError::FilemarkMapDigestMismatch));
+        assert!(matches!(err, ParityError::FilemarkMapDigestMismatch { .. }));
     }
 
     #[test]
@@ -2860,7 +3068,7 @@ mod tests {
         );
         let err =
             ScopedFilemarkMap::validate_against_digest(reconstructed, &final_digest).unwrap_err();
-        assert!(matches!(err, ParityError::FilemarkMapDigestMismatch));
+        assert!(matches!(err, ParityError::FilemarkMapDigestMismatch { .. }));
     }
 
     #[test]
@@ -2909,7 +3117,7 @@ mod tests {
         );
         let err =
             ScopedFilemarkMap::validate_against_digest(reconstructed, &final_digest).unwrap_err();
-        assert!(matches!(err, ParityError::FilemarkMapDigestMismatch));
+        assert!(matches!(err, ParityError::FilemarkMapDigestMismatch { .. }));
     }
 
     #[test]
@@ -2959,12 +3167,12 @@ mod tests {
         );
         let err =
             ScopedFilemarkMap::validate_against_digest(reconstructed, &final_digest).unwrap_err();
-        assert!(matches!(err, ParityError::FilemarkMapDigestMismatch));
+        assert!(matches!(err, ParityError::FilemarkMapDigestMismatch { .. }));
     }
 
     #[test]
-    fn damaged_final_bootstrap_header_without_trailing_filemark_is_structural_damage() {
-        let (mut records, _expected_map) = fixture_records(false, false);
+    fn damaged_final_bootstrap_without_filemark_terminates_walk_and_invalidates_final_scope() {
+        let (mut records, expected_map) = fixture_records(false, false);
         assert!(matches!(records.pop(), Some(Record::Filemark)));
         let final_bootstrap_lba = records
             .len()
@@ -2980,21 +3188,32 @@ mod tests {
                 panic!("fixture final data record must not be unreadable")
             }
         }
+        let walked_prefix = expected_map
+            .truncate_to_tape_files(expected_map.tape_file_count() - 1)
+            .expect("prefix before torn bootstrap validates structurally");
+        let mut source = RecordingRawSource::new(records.clone());
+        let walk = scan_reconstruct_filemark_map_with_report(&mut source, &TAPE_UUID, BLOCK_SIZE)
+            .expect("tail truncation terminates rather than aborting the walk");
+        assert_eq!(walk.map, walked_prefix);
+        assert_eq!(
+            walk.truncation,
+            Some(ScanTailTruncation {
+                tape_file_number: expected_map.tape_file_count() - 1,
+                position: PhysicalPositionHint::new(final_bootstrap_lba as u64),
+                kind: ScanTailTruncationKind::MissingTrailingFilemark,
+            })
+        );
+
+        let final_payload = bootstrap_payload(expected_map.digest(true).unwrap(), 1);
         let mut source = RecordingRawSource::new(records);
-
-        let err = scan_reconstruct_filemark_map(&mut source, &TAPE_UUID, BLOCK_SIZE)
-            .expect_err("damaged final bootstrap tail without a filemark is structural damage");
-
-        match err {
-            ParityError::FilemarkMapReconstruct(message) => {
-                assert!(message.contains("missing a trailing filemark"), "{message}");
-                assert!(
-                    message.contains(&format!("physical LBA {final_bootstrap_lba}")),
-                    "{message}"
-                );
-            }
-            other => panic!("expected filemark-map reconstruction error, got {other:?}"),
-        }
+        let err = acquire_filemark_map_with_report(&mut source, &final_payload, None)
+            .expect_err("a torn file inside the final digest scope must still fail validation");
+        assert!(matches!(
+            err,
+            ParityError::FilemarkMapDigestMismatch {
+                truncation_position: Some(position),
+            } if position.lba == final_bootstrap_lba as u64
+        ));
     }
 
     #[test]
@@ -3076,7 +3295,7 @@ mod tests {
         let err =
             ScopedFilemarkMap::validate_against_digest(reconstructed, &final_digest).unwrap_err();
         assert!(
-            matches!(err, ParityError::FilemarkMapDigestMismatch),
+            matches!(err, ParityError::FilemarkMapDigestMismatch { .. }),
             "object length drift must be rejected by the final bootstrap digest, not by scan classification"
         );
     }
@@ -3132,7 +3351,7 @@ mod tests {
         let err =
             ScopedFilemarkMap::validate_against_digest(reconstructed, &final_digest).unwrap_err();
         assert!(
-            matches!(err, ParityError::FilemarkMapDigestMismatch),
+            matches!(err, ParityError::FilemarkMapDigestMismatch { .. }),
             "object length drift must be rejected by the final bootstrap digest, not by scan classification"
         );
     }
@@ -3202,7 +3421,7 @@ mod tests {
             let err = ScopedFilemarkMap::validate_against_digest(reconstructed, &final_digest)
                 .unwrap_err();
             assert!(
-                matches!(err, ParityError::FilemarkMapDigestMismatch),
+                matches!(err, ParityError::FilemarkMapDigestMismatch { .. }),
                 "multi-block object length drift in tape file {object_tape_file} must be rejected by the final bootstrap digest"
             );
         }
@@ -3628,8 +3847,8 @@ mod tests {
     }
 
     #[test]
-    fn damaged_sidecar_header_without_trailing_filemark_is_structural_damage() {
-        let (mut records, _expected_map) = fixture_records(false, true);
+    fn damaged_sidecar_without_filemark_terminates_walk_and_invalidates_final_scope() {
+        let (mut records, expected_map) = fixture_records(false, true);
         let removed_suffix = records.split_off(records.len() - 3);
         assert_eq!(
             removed_suffix.len(),
@@ -3639,17 +3858,28 @@ mod tests {
         assert!(matches!(removed_suffix.first(), Some(Record::Filemark)));
         assert!(matches!(removed_suffix.get(1), Some(Record::Block(_))));
         assert!(matches!(removed_suffix.get(2), Some(Record::Filemark)));
+        let mut source = RecordingRawSource::new(records.clone());
+        let walk = scan_reconstruct_filemark_map_with_report(&mut source, &TAPE_UUID, BLOCK_SIZE)
+            .expect("torn sidecar tail terminates rather than aborting the walk");
+        assert_eq!(walk.map.tape_file_count(), 2);
+        assert_eq!(
+            walk.truncation,
+            Some(ScanTailTruncation {
+                tape_file_number: 2,
+                position: PhysicalPositionHint::new(5),
+                kind: ScanTailTruncationKind::MissingTrailingFilemark,
+            })
+        );
+
+        let final_payload = bootstrap_payload(expected_map.digest(true).unwrap(), 1);
         let mut source = RecordingRawSource::new(records);
-
-        let err = scan_reconstruct_filemark_map(&mut source, &TAPE_UUID, BLOCK_SIZE)
-            .expect_err("damaged sidecar tail without a filemark is structural damage");
-
-        match err {
-            ParityError::FilemarkMapReconstruct(message) => {
-                assert!(message.contains("missing a trailing filemark"), "{message}");
-                assert!(message.contains("physical LBA 5"), "{message}");
-            }
-            other => panic!("expected filemark-map reconstruction error, got {other:?}"),
-        }
+        let err = acquire_filemark_map_with_report(&mut source, &final_payload, None)
+            .expect_err("a torn sidecar inside the final digest scope must fail validation");
+        assert!(matches!(
+            err,
+            ParityError::FilemarkMapDigestMismatch {
+                truncation_position: Some(position),
+            } if position.lba == 5
+        ));
     }
 }

@@ -8,16 +8,18 @@ use remanence_parity::bootstrap::{
     parse_bootstrap_block, write_bootstrap_block, BootstrapPayload, ParitySchemeRecord,
 };
 use remanence_parity::{
-    acquire_filemark_map, emit_resume_rebuilt_sidecars_to_raw as emit_resume_sidecars_journaled,
+    acquire_filemark_map, acquire_filemark_map_with_report,
+    emit_resume_rebuilt_sidecars_to_raw as emit_resume_sidecars_journaled,
     rebuild_legacy_forensic_open_epoch_from_committed_prefix,
     rebuild_open_epoch_from_committed_prefix, recover_ordinal_from_sidecar,
-    scan_reconstruct_filemark_map, BlockSinkRawTapeSink, CapacityReserveInput,
-    CatalogFilemarkMapInput, CommittedBundle, CommittedBundleKind, CommittedState, FilemarkMap,
-    JournalError, ObjectParityState, ParityError, ParityScheme, ParitySink, PhysicalPositionHint,
-    RawReadOutcome, RawTapeSink, RawTapeSource, RawWriteOutcome, ResumeLiveEpochState,
-    ResumeWriterSeed, SchemeId, ScopedFilemarkMap, SidecarEpochDirectoryEntry,
-    SpaceFilemarksOutcome, TapeFileJournal, TapeFileKind, TapeFileMapEntry, TapeFilePosition,
-    SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD, SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
+    scan_reconstruct_filemark_map, scan_reconstruct_filemark_map_with_report, BlockSinkRawTapeSink,
+    CapacityReserveInput, CatalogFilemarkMapInput, CommittedBundle, CommittedBundleKind,
+    CommittedState, FilemarkMap, JournalError, ObjectParityState, ParityError, ParityScheme,
+    ParitySink, PhysicalPositionHint, RawReadOutcome, RawTapeSink, RawTapeSource, RawWriteOutcome,
+    ResumeLiveEpochState, ResumeWriterSeed, ScanTailTruncation, ScanTailTruncationKind, SchemeId,
+    ScopedFilemarkMap, SidecarEpochDirectoryEntry, SpaceFilemarksOutcome, TapeFileJournal,
+    TapeFileKind, TapeFileMapEntry, TapeFilePosition, SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD,
+    SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
 };
 
 const BLOCK_SIZE: u32 = 512;
@@ -240,6 +242,28 @@ fn truncate_sink_at_lba(sink: &VecBlockSink, lba: u64) -> VecBlockSink {
     }
     assert_eq!(truncated.next_lba(), lba);
     truncated
+}
+
+fn assert_missing_trailing_filemark_terminates_walk(
+    sink: &VecBlockSink,
+    required_prefix: &FilemarkMap,
+    truncated_file_start: PhysicalPositionHint,
+) {
+    let mut source = RawVecTape::from_sink(sink);
+    let walk = scan_reconstruct_filemark_map_with_report(&mut source, &TAPE_UUID, BLOCK_SIZE)
+        .expect("a missing tail filemark terminates rather than aborting the walk");
+    assert!(
+        walk.map.entries().starts_with(required_prefix.entries()),
+        "the walk must retain at least the complete required prefix"
+    );
+    assert_eq!(
+        walk.truncation,
+        Some(ScanTailTruncation {
+            tape_file_number: walk.map.tape_file_count(),
+            position: truncated_file_start,
+            kind: ScanTailTruncationKind::MissingTrailingFilemark,
+        })
+    );
 }
 
 fn committed_prefix_sidecar_directory_entries(
@@ -607,14 +631,18 @@ fn crash_after_object_data_before_filemark_truncates_partial_file_from_catalog_p
     assert_eq!(crashed_sink_blocks.next_lba(), 6);
 
     let mut physical_scan = RawVecTape::from_sink(&crashed_sink_blocks);
-    let err = scan_reconstruct_filemark_map(&mut physical_scan, &TAPE_UUID, BLOCK_SIZE)
-        .expect_err("partial physical tape file has no trailing filemark");
-    match err {
-        ParityError::FilemarkMapReconstruct(message) => {
-            assert!(message.contains("missing a trailing filemark"), "{message}");
-        }
-        other => panic!("expected filemark-map reconstruction error, got {other:?}"),
-    }
+    let walk =
+        scan_reconstruct_filemark_map_with_report(&mut physical_scan, &TAPE_UUID, BLOCK_SIZE)
+            .expect("partial tail terminates the physical walk");
+    assert_eq!(walk.map, committed_prefix);
+    assert_eq!(
+        walk.truncation,
+        Some(ScanTailTruncation {
+            tape_file_number: 1,
+            position: append_position,
+            kind: ScanTailTruncationKind::MissingTrailingFilemark,
+        })
+    );
     assert_eq!(committed_prefix.total_data_ordinals(), 0);
 
     let mut raw_source = RawVecTape::from_sink(&crashed_sink_blocks);
@@ -751,6 +779,109 @@ fn crash_after_object_data_before_filemark_truncates_partial_file_from_catalog_p
     assert_eq!(scoped.validated_prefix_tape_files, None);
     assert_eq!(scoped.scope.watermark(), 4);
     assert_eq!(scoped.map.total_data_ordinals(), 4);
+}
+
+#[test]
+fn bare_tape_checkpoint_scan_reports_unattested_complete_file_and_torn_tail() {
+    let mut sink_blocks = VecBlockSink::new();
+    let (checkpoint, unattested_tape_file, truncated_tape_file) = {
+        let mut raw_sink = BlockSinkRawTapeSink::new(&mut sink_blocks);
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw_sink,
+            fixture_journal(),
+            scheme(),
+            TAPE_UUID,
+            BLOCK_SIZE,
+        )
+        .expect("checkpoint fixture sink constructs");
+
+        sink.write_bootstrap().expect("BOT bootstrap writes");
+        sink.begin_object_with_capacity_reserve(capacity_input(4))
+            .expect("attested object reserve fits");
+        for seed in 1..=4 {
+            sink.write_block(&object_block(seed))
+                .expect("attested object block writes");
+        }
+        sink.finish_object().expect("attested object closes");
+        let checkpoint = sink
+            .close_open_epoch(remanence_parity::CloseReason::Barrier)
+            .expect("checkpoint edition commits");
+        assert!(!checkpoint.is_terminal);
+
+        let (unattested_tape_file, _) = sink
+            .begin_object_with_capacity_reserve(capacity_input(2))
+            .expect("unattested complete object reserve fits");
+        sink.write_block(&object_block(11))
+            .expect("unattested complete object block 1 writes");
+        sink.write_block(&object_block(12))
+            .expect("unattested complete object block 2 writes");
+        sink.finish_object()
+            .expect("unattested object is structurally complete");
+
+        let (truncated_tape_file, _) = sink
+            .begin_object_with_capacity_reserve(capacity_input_with_current_fill(2, 2))
+            .expect("torn object reserve fits");
+        sink.write_block(&object_block(21))
+            .expect("first torn-object block reaches tape");
+        // Dropping the active session simulates a kill before the trailing
+        // object filemark and before another checkpoint edition.
+        (checkpoint, unattested_tape_file, truncated_tape_file)
+    };
+
+    let mut physical = RawVecTape::from_sink(&sink_blocks);
+    let walk = scan_reconstruct_filemark_map_with_report(&mut physical, &TAPE_UUID, BLOCK_SIZE)
+        .expect("torn tail terminates the physical walk");
+    let checkpoint_position = walk
+        .map
+        .physical_position(TapeFilePosition {
+            tape_file_number: checkpoint.bootstrap_tape_file_number,
+            block_within_file: 0,
+        })
+        .expect("checkpoint bootstrap position computes");
+    let checkpoint_payload = match &physical.records
+        [usize::try_from(checkpoint_position.lba).expect("checkpoint LBA fits usize")]
+    {
+        TapeRecord::Block(block) => {
+            parse_bootstrap_block(block).expect("checkpoint bootstrap parses")
+        }
+        TapeRecord::Filemark => panic!("checkpoint position must contain a bootstrap block"),
+    };
+
+    let mut physical = RawVecTape::from_sink(&sink_blocks);
+    let result = acquire_filemark_map_with_report(&mut physical, &checkpoint_payload, None)
+        .expect("checkpoint digest validates despite later complete and truncated tail files");
+
+    assert_eq!(
+        result.attested_map.tape_file_count(),
+        checkpoint.tape_file_count
+    );
+    assert_eq!(
+        result.scoped_map.validated_prefix_tape_files,
+        Some(checkpoint.tape_file_count)
+    );
+    assert_eq!(result.unattested_file_count(), 1);
+    assert_eq!(
+        result.unattested_files[0].entry.tape_file_number,
+        unattested_tape_file
+    );
+    assert_eq!(result.unattested_files[0].entry.kind, TapeFileKind::Object);
+    assert_eq!(
+        result.scoped_map.map.tape_file_count(),
+        checkpoint.tape_file_count + 1,
+        "the guarded forensic map retains the complete unattested row"
+    );
+    assert_eq!(
+        result.truncation,
+        Some(ScanTailTruncation {
+            tape_file_number: truncated_tape_file,
+            position: result
+                .scoped_map
+                .map
+                .append_position_after_prefix()
+                .expect("torn file begins after the complete walked prefix"),
+            kind: ScanTailTruncationKind::MissingTrailingFilemark,
+        })
+    );
 }
 
 #[test]
@@ -1179,18 +1310,18 @@ fn crash_after_second_object_data_before_filemark_preserves_committed_prefix() {
     assert_eq!(crashed_sink_blocks.next_lba(), append_position.lba + 4);
 
     let mut physical_scan = RawVecTape::from_sink(&crashed_sink_blocks);
-    let err = scan_reconstruct_filemark_map(&mut physical_scan, &TAPE_UUID, BLOCK_SIZE)
-        .expect_err("partial second object must not scan as a committed object");
-    match err {
-        ParityError::FilemarkMapReconstruct(message) => {
-            assert!(message.contains("missing a trailing filemark"), "{message}");
-            assert!(
-                message.contains(&format!("physical LBA {}", append_position.lba)),
-                "{message}"
-            );
-        }
-        other => panic!("expected filemark-map reconstruction error, got {other:?}"),
-    }
+    let walk =
+        scan_reconstruct_filemark_map_with_report(&mut physical_scan, &TAPE_UUID, BLOCK_SIZE)
+            .expect("partial second object terminates the physical walk");
+    assert_eq!(walk.map, committed_prefix);
+    assert_eq!(
+        walk.truncation,
+        Some(ScanTailTruncation {
+            tape_file_number: 3,
+            position: append_position,
+            kind: ScanTailTruncationKind::MissingTrailingFilemark,
+        })
+    );
 
     let mut raw_source = RawVecTape::from_sink(&crashed_sink_blocks);
     let rebuild = rebuild_open_epoch_from_committed_prefix(
@@ -2226,16 +2357,11 @@ fn crash_mid_sidecar_truncates_provisional_file_and_rebuilds_from_catalog_prefix
         append_position.lba + 2
     );
 
-    let mut physical_scan = RawVecTape::from_sink(&physical_with_partial_sidecar);
-    let err = scan_reconstruct_filemark_map(&mut physical_scan, &TAPE_UUID, BLOCK_SIZE)
-        .expect_err("partial sidecar tape file has no trailing filemark");
-    match err {
-        ParityError::FilemarkMapReconstruct(message) => {
-            assert!(message.contains("missing a trailing filemark"), "{message}");
-            assert!(message.contains("physical LBA 7"), "{message}");
-        }
-        other => panic!("expected filemark-map reconstruction error, got {other:?}"),
-    }
+    assert_missing_trailing_filemark_terminates_walk(
+        &physical_with_partial_sidecar,
+        &committed_prefix,
+        append_position,
+    );
 
     let mut resume_source = RawVecTape::from_sink(&physical_with_partial_sidecar);
     let rebuild = rebuild_legacy_forensic_open_epoch_from_committed_prefix(
@@ -2894,19 +3020,11 @@ fn crash_mid_first_sidecar_in_cluster_truncates_to_object_boundary() {
         "the crash fixture must leave exactly the first block of sidecar 1 on tape"
     );
 
-    let mut physical_raw = RawVecTape::from_sink(&crashed_sink_blocks);
-    let err = scan_reconstruct_filemark_map(&mut physical_raw, &TAPE_UUID, BLOCK_SIZE)
-        .expect_err("partial first sidecar must not scan as a committed sidecar");
-    match err {
-        ParityError::FilemarkMapReconstruct(message) => {
-            assert!(message.contains("missing a trailing filemark"), "{message}");
-            assert!(
-                message.contains(&format!("physical LBA {}", retry_append_position.lba)),
-                "{message}"
-            );
-        }
-        other => panic!("expected filemark-map reconstruction error, got {other:?}"),
-    }
+    assert_missing_trailing_filemark_terminates_walk(
+        &crashed_sink_blocks,
+        &committed_prefix,
+        retry_append_position,
+    );
 
     let mut retried_sink_blocks =
         truncate_sink_at_lba(&crashed_sink_blocks, retry_append_position.lba);
@@ -3177,19 +3295,11 @@ fn crash_on_first_resume_sidecar_filemark_truncates_to_object_boundary() {
         );
     }
 
-    let mut physical_raw = RawVecTape::from_sink(&crashed_sink_blocks);
-    let err = scan_reconstruct_filemark_map(&mut physical_raw, &TAPE_UUID, BLOCK_SIZE)
-        .expect_err("first sidecar without filemark must not scan as committed");
-    match err {
-        ParityError::FilemarkMapReconstruct(message) => {
-            assert!(message.contains("missing a trailing filemark"), "{message}");
-            assert!(
-                message.contains(&format!("physical LBA {}", retry_append_position.lba)),
-                "{message}"
-            );
-        }
-        other => panic!("expected filemark-map reconstruction error, got {other:?}"),
-    }
+    assert_missing_trailing_filemark_terminates_walk(
+        &crashed_sink_blocks,
+        &committed_prefix,
+        retry_append_position,
+    );
 
     let mut retried_sink_blocks =
         truncate_sink_at_lba(&crashed_sink_blocks, retry_append_position.lba);
@@ -3483,19 +3593,11 @@ fn crash_mid_second_sidecar_in_cluster_truncates_to_committed_first_sidecar() {
         "the crash fixture must leave exactly the first block of sidecar 2 on tape"
     );
 
-    let mut physical_raw = RawVecTape::from_sink(&crashed_sink_blocks);
-    let err = scan_reconstruct_filemark_map(&mut physical_raw, &TAPE_UUID, BLOCK_SIZE)
-        .expect_err("partial second sidecar must not scan as a committed sidecar");
-    match err {
-        ParityError::FilemarkMapReconstruct(message) => {
-            assert!(message.contains("missing a trailing filemark"), "{message}");
-            assert!(
-                message.contains(&format!("physical LBA {}", retry_append_position.lba)),
-                "{message}"
-            );
-        }
-        other => panic!("expected filemark-map reconstruction error, got {other:?}"),
-    }
+    assert_missing_trailing_filemark_terminates_walk(
+        &crashed_sink_blocks,
+        &committed_prefix,
+        retry_append_position,
+    );
 
     let retry_prefix = FilemarkMap::new(vec![
         TapeFileMapEntry::bootstrap(0, 1),
@@ -3756,19 +3858,11 @@ fn crash_mid_third_sidecar_in_cluster_truncates_to_committed_second_sidecar() {
         "the crash fixture must leave exactly the first block of sidecar 3 on tape"
     );
 
-    let mut physical_raw = RawVecTape::from_sink(&crashed_sink_blocks);
-    let err = scan_reconstruct_filemark_map(&mut physical_raw, &TAPE_UUID, BLOCK_SIZE)
-        .expect_err("partial third sidecar must not scan as a committed sidecar");
-    match err {
-        ParityError::FilemarkMapReconstruct(message) => {
-            assert!(message.contains("missing a trailing filemark"), "{message}");
-            assert!(
-                message.contains(&format!("physical LBA {}", retry_append_position.lba)),
-                "{message}"
-            );
-        }
-        other => panic!("expected filemark-map reconstruction error, got {other:?}"),
-    }
+    assert_missing_trailing_filemark_terminates_walk(
+        &crashed_sink_blocks,
+        &committed_prefix,
+        retry_append_position,
+    );
 
     let retry_prefix = FilemarkMap::new(vec![
         TapeFileMapEntry::bootstrap(0, 1),
@@ -4057,19 +4151,11 @@ fn crash_on_second_resume_sidecar_filemark_truncates_to_committed_first_sidecar(
         );
     }
 
-    let mut physical_raw = RawVecTape::from_sink(&crashed_sink_blocks);
-    let err = scan_reconstruct_filemark_map(&mut physical_raw, &TAPE_UUID, BLOCK_SIZE)
-        .expect_err("second sidecar without filemark must not scan as committed");
-    match err {
-        ParityError::FilemarkMapReconstruct(message) => {
-            assert!(message.contains("missing a trailing filemark"), "{message}");
-            assert!(
-                message.contains(&format!("physical LBA {}", retry_append_position.lba)),
-                "{message}"
-            );
-        }
-        other => panic!("expected filemark-map reconstruction error, got {other:?}"),
-    }
+    assert_missing_trailing_filemark_terminates_walk(
+        &crashed_sink_blocks,
+        &committed_prefix,
+        retry_append_position,
+    );
 
     let retry_prefix = FilemarkMap::new(vec![
         TapeFileMapEntry::bootstrap(0, 1),
@@ -4361,19 +4447,11 @@ fn crash_on_third_resume_sidecar_filemark_truncates_to_committed_second_sidecar(
         );
     }
 
-    let mut physical_raw = RawVecTape::from_sink(&crashed_sink_blocks);
-    let err = scan_reconstruct_filemark_map(&mut physical_raw, &TAPE_UUID, BLOCK_SIZE)
-        .expect_err("third sidecar without filemark must not scan as committed");
-    match err {
-        ParityError::FilemarkMapReconstruct(message) => {
-            assert!(message.contains("missing a trailing filemark"), "{message}");
-            assert!(
-                message.contains(&format!("physical LBA {}", retry_append_position.lba)),
-                "{message}"
-            );
-        }
-        other => panic!("expected filemark-map reconstruction error, got {other:?}"),
-    }
+    assert_missing_trailing_filemark_terminates_walk(
+        &crashed_sink_blocks,
+        &committed_prefix,
+        retry_append_position,
+    );
 
     let retry_prefix = FilemarkMap::new(vec![
         TapeFileMapEntry::bootstrap(0, 1),
@@ -5816,19 +5894,14 @@ fn catalog_claims_object_filemark_resume_rebuild_rejects_short_physical_tape() {
     let short_sink_blocks = truncate_sink_at_lba(&full_sink_blocks, physical_append_position.lba);
     assert_eq!(short_sink_blocks.next_lba(), physical_append_position.lba);
 
-    let mut physical_scan = RawVecTape::from_sink(&short_sink_blocks);
-    let err = scan_reconstruct_filemark_map(&mut physical_scan, &TAPE_UUID, BLOCK_SIZE)
-        .expect_err("object body without trailing filemark must not scan as committed");
-    match err {
-        ParityError::FilemarkMapReconstruct(message) => {
-            assert!(message.contains("missing a trailing filemark"), "{message}");
-            assert!(
-                message.contains(&format!("physical LBA {}", object_start_position.lba)),
-                "{message}"
-            );
-        }
-        other => panic!("expected filemark-map reconstruction error, got {other:?}"),
-    }
+    let physical_prefix = catalog_map
+        .truncate_to_tape_files(1)
+        .expect("BOT-only physical prefix validates");
+    assert_missing_trailing_filemark_terminates_walk(
+        &short_sink_blocks,
+        &physical_prefix,
+        object_start_position,
+    );
 
     let mut raw_source = RawVecTape::from_sink(&short_sink_blocks);
     let err = rebuild_open_epoch_from_committed_prefix(
