@@ -14343,6 +14343,10 @@ mod tests {
                 append_ring_bytes: remanence_state::DEFAULT_APPEND_RING_BYTES,
                 append_ring_high_pct: 90,
                 append_ring_low_pct: 25,
+                checkpoint_mode: remanence_state::CheckpointMode::PerObject,
+                checkpoint_max_bytes: remanence_state::DEFAULT_CHECKPOINT_MAX_BYTES,
+                checkpoint_max_objects: remanence_state::DEFAULT_CHECKPOINT_MAX_OBJECTS,
+                checkpoint_max_age_seconds: remanence_state::DEFAULT_CHECKPOINT_MAX_AGE_SECONDS,
                 default_idle_timeout_seconds: 1800,
                 drive_idle_unload_seconds: remanence_state::DEFAULT_DRIVE_IDLE_UNLOAD_SECONDS,
                 read_only: false,
@@ -16875,19 +16879,15 @@ mod tests {
         assert_eq!(parse_tape_block_size("512K").unwrap(), 512 * 1024);
         assert_eq!(parse_tape_block_size("1MB").unwrap(), 1024 * 1024);
 
-        for (value, expected) in [
-            ("0", "greater than zero"),
-            ("1000", "multiple of 512"),
-            ("17MiB", "no larger than"),
-        ] {
+        for value in ["0", "1000", "384KiB", "17MiB"] {
             let err = parse_tape_block_size(value).expect_err("invalid block size");
-            assert!(err.contains(expected), "{err}");
+            assert!(err.contains("one of 256KiB, 512KiB, or 1MiB"), "{err}");
         }
     }
 
     #[test]
     fn tape_init_block_size_resolution_prefers_override_then_pool_then_default() {
-        let config = tape_init_config_with_pool(384 * 1024);
+        let config = tape_init_config_with_pool(256 * 1024);
 
         assert_eq!(
             resolve_tape_init_block_size(&config, "camera.copy-a", Some(512 * 1024)).unwrap(),
@@ -16895,7 +16895,7 @@ mod tests {
         );
         assert_eq!(
             resolve_tape_init_block_size(&config, "camera.copy-a", None).unwrap(),
-            384 * 1024
+            256 * 1024
         );
         assert_eq!(
             resolve_tape_init_block_size(&config, "missing.pool", None).unwrap(),

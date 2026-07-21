@@ -21,8 +21,12 @@ pub const DEFAULT_READ_RESERVOIR_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub const DEFAULT_RANGED_POSITION_CHECK_BYTES: u64 = 256 * 1024 * 1024;
 /// Default delay before an idle library drive is rewound and unloaded.
 pub const DEFAULT_DRIVE_IDLE_UNLOAD_SECONDS: u64 = 300;
-
-const MAX_TAPE_BLOCK_SIZE_BYTES: u64 = 16 * 1024 * 1024;
+/// Default byte threshold for a batched filemark checkpoint.
+pub const DEFAULT_CHECKPOINT_MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+/// Default object threshold for a batched filemark checkpoint.
+pub const DEFAULT_CHECKPOINT_MAX_OBJECTS: u64 = 200;
+/// Default age threshold for a batched filemark checkpoint.
+pub const DEFAULT_CHECKPOINT_MAX_AGE_SECONDS: u64 = 300;
 
 /// Top-level Remanence daemon configuration.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -94,6 +98,21 @@ pub struct DaemonConfig {
     /// Pause tape submission at this ring occupancy percentage.
     #[serde(default = "default_append_ring_low_pct")]
     pub append_ring_low_pct: u8,
+    /// Object durability policy. Batched mode is admitted only on parity-off pools.
+    #[serde(default)]
+    pub checkpoint_mode: CheckpointMode,
+    /// Maximum pending logical bytes before a batched checkpoint barrier.
+    #[serde(
+        default = "default_checkpoint_max_bytes",
+        deserialize_with = "deserialize_byte_size"
+    )]
+    pub checkpoint_max_bytes: u64,
+    /// Maximum pending objects before a batched checkpoint barrier.
+    #[serde(default = "default_checkpoint_max_objects")]
+    pub checkpoint_max_objects: u64,
+    /// Maximum age of the oldest pending object before a barrier is requested.
+    #[serde(default = "default_checkpoint_max_age_seconds")]
+    pub checkpoint_max_age_seconds: u64,
     /// Default idle timeout for sessions.
     pub default_idle_timeout_seconds: u64,
     /// Delay before a seated cartridge in an idle drive is returned home.
@@ -125,6 +144,17 @@ pub enum AppendStagingMode {
     Serial,
     /// Use a bounded live receive ring when the caller supplies every proof.
     Overlap,
+}
+
+/// Daemon durability policy for pool write sessions.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointMode {
+    /// Preserve the historical synchronous commit after every object.
+    #[default]
+    PerObject,
+    /// Hold parity-off objects in WRITTEN state until a batch barrier succeeds.
+    Batched,
 }
 
 impl DaemonConfig {
@@ -393,6 +423,18 @@ const fn default_drive_idle_unload_seconds() -> u64 {
     DEFAULT_DRIVE_IDLE_UNLOAD_SECONDS
 }
 
+const fn default_checkpoint_max_bytes() -> u64 {
+    DEFAULT_CHECKPOINT_MAX_BYTES
+}
+
+const fn default_checkpoint_max_objects() -> u64 {
+    DEFAULT_CHECKPOINT_MAX_OBJECTS
+}
+
+const fn default_checkpoint_max_age_seconds() -> u64 {
+    DEFAULT_CHECKPOINT_MAX_AGE_SECONDS
+}
+
 /// Layer 3c journal configuration.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -545,6 +587,21 @@ pub fn validate_config(config: &RemConfig) -> Result<(), StateError> {
             "daemon append ring watermarks require 0 < low < high <= 100".to_string(),
         ));
     }
+    if config.daemon.checkpoint_max_bytes == 0 {
+        return Err(StateError::ConfigInvalid(
+            "daemon.checkpoint_max_bytes must be non-zero".to_string(),
+        ));
+    }
+    if config.daemon.checkpoint_max_objects == 0 {
+        return Err(StateError::ConfigInvalid(
+            "daemon.checkpoint_max_objects must be non-zero".to_string(),
+        ));
+    }
+    if config.daemon.checkpoint_max_age_seconds == 0 {
+        return Err(StateError::ConfigInvalid(
+            "daemon.checkpoint_max_age_seconds must be non-zero".to_string(),
+        ));
+    }
     if config
         .daemon
         .spool_tmpfs_ram_budget
@@ -659,16 +716,9 @@ pub fn derive_tape_pool_from_voltag<'a>(
 
 /// Validate a configured fixed tape block size.
 pub fn validate_block_size(block_size_bytes: u64) -> Result<(), String> {
-    if block_size_bytes == 0 {
-        return Err("block_size must be greater than zero".to_string());
-    }
-    if block_size_bytes % 512 != 0 {
-        return Err("block_size must be a multiple of 512 bytes".to_string());
-    }
-    if block_size_bytes > MAX_TAPE_BLOCK_SIZE_BYTES {
-        return Err(format!(
-            "block_size must be no larger than {MAX_TAPE_BLOCK_SIZE_BYTES} bytes"
-        ));
+    const ALLOWED: [u64; 3] = [256 * 1024, 512 * 1024, 1024 * 1024];
+    if !ALLOWED.contains(&block_size_bytes) {
+        return Err("block_size must be one of 256KiB, 512KiB, or 1MiB".to_string());
     }
     Ok(())
 }
@@ -1218,6 +1268,19 @@ client_ca = "/ca"
         assert_eq!(config.daemon.append_ring_bytes, DEFAULT_APPEND_RING_BYTES);
         assert_eq!(config.daemon.append_ring_high_pct, 90);
         assert_eq!(config.daemon.append_ring_low_pct, 25);
+        assert_eq!(config.daemon.checkpoint_mode, CheckpointMode::PerObject);
+        assert_eq!(
+            config.daemon.checkpoint_max_bytes,
+            DEFAULT_CHECKPOINT_MAX_BYTES
+        );
+        assert_eq!(
+            config.daemon.checkpoint_max_objects,
+            DEFAULT_CHECKPOINT_MAX_OBJECTS
+        );
+        assert_eq!(
+            config.daemon.checkpoint_max_age_seconds,
+            DEFAULT_CHECKPOINT_MAX_AGE_SECONDS
+        );
         assert!(config.tape_pools.is_empty());
         assert!(config.tape_pool_rules.is_empty());
         assert_eq!(
@@ -1593,11 +1656,7 @@ min_object_size = "2XB"
 
     #[test]
     fn rejects_invalid_tape_pool_block_sizes() {
-        for (block_size, expected) in [
-            ("0", "greater than zero"),
-            ("1000", "multiple of 512"),
-            ("17MiB", "no larger than"),
-        ] {
+        for block_size in ["0", "384KiB", "17MiB"] {
             let mut text = valid_config();
             text.push_str(&format!(
                 r#"
@@ -1608,7 +1667,34 @@ block_size = {block_size:?}
             ));
 
             let err = parse_config_toml(&text).expect_err("invalid block size must fail");
-            assert!(err.to_string().contains(expected), "{err}");
+            assert!(err.to_string().contains("256KiB, 512KiB, or 1MiB"), "{err}");
+        }
+    }
+
+    #[test]
+    fn parses_batched_checkpoint_policy_and_rejects_zero_limits() {
+        let per_object =
+            parse_config_toml(&with_daemon_lines("checkpoint_mode = \"per_object\"\n"))
+                .expect("explicit per-object checkpoint policy");
+        assert_eq!(per_object.daemon.checkpoint_mode, CheckpointMode::PerObject);
+
+        let config = parse_config_toml(&with_daemon_lines(
+            "checkpoint_mode = \"batched\"\ncheckpoint_max_bytes = \"64GiB\"\ncheckpoint_max_objects = 17\ncheckpoint_max_age_seconds = 42\n",
+        ))
+        .expect("valid batched checkpoint policy");
+        assert_eq!(config.daemon.checkpoint_mode, CheckpointMode::Batched);
+        assert_eq!(config.daemon.checkpoint_max_bytes, 64 * 1024 * 1024 * 1024);
+        assert_eq!(config.daemon.checkpoint_max_objects, 17);
+        assert_eq!(config.daemon.checkpoint_max_age_seconds, 42);
+
+        for line in [
+            "checkpoint_max_bytes = \"0\"",
+            "checkpoint_max_objects = 0",
+            "checkpoint_max_age_seconds = 0",
+        ] {
+            let err = parse_config_toml(&with_daemon_lines(&format!("{line}\n")))
+                .expect_err("zero checkpoint limit must reject");
+            assert!(err.to_string().contains("must be non-zero"), "{err}");
         }
     }
 

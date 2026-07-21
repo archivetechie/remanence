@@ -10,6 +10,7 @@ use remanence_parity::{
     ParityConfig, ParityScheme, TapeFileEntry, TapeFileKind,
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -719,7 +720,7 @@ pub struct NativeObjectFileRecord {
 }
 
 /// Object row supplied by Layer 5 after a native object commit.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct NativeObjectProjectionInput {
     /// Remanence object UUID.
     pub object_id: String,
@@ -738,7 +739,7 @@ pub struct NativeObjectProjectionInput {
 }
 
 /// Object-copy row supplied by Layer 5 after a native object commit.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct NativeObjectCopyProjectionInput {
     /// Remanence object UUID.
     pub object_id: String,
@@ -767,7 +768,7 @@ pub struct NativeObjectCopyProjectionInput {
 }
 
 /// Member-file row supplied by Layer 5 after a native object commit.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct NativeObjectFileProjectionInput {
     /// Remanence object UUID.
     pub object_id: String,
@@ -2803,6 +2804,236 @@ impl CatalogIndex {
         tx.commit()
             .map_err(|err| sqlite_error("commit native object append projection", err))?;
         Ok(report)
+    }
+
+    /// Atomically replay or project every parity-off object in one checkpoint.
+    ///
+    /// A fully projected record is idempotent. A partially projected record is
+    /// corruption: checkpoint visibility must never become object-by-object.
+    pub fn project_checkpoint_record(
+        &mut self,
+        record: &crate::checkpoint::CheckpointJournalRecord,
+    ) -> Result<(), StateError> {
+        let projections = &record.objects;
+        if projections.is_empty() {
+            return Err(StateError::IndexCorrupt(
+                "checkpoint record has no object projections".to_string(),
+            ));
+        }
+        let tape_uuid = projections[0].copy.tape_uuid;
+        let mut object_ids = HashSet::with_capacity(projections.len());
+        for projection in projections {
+            if projection.copy.tape_uuid != tape_uuid {
+                return Err(StateError::IndexCorrupt(
+                    "checkpoint batch spans multiple tape UUIDs".to_string(),
+                ));
+            }
+            if projection.object.object_id != projection.copy.object_id {
+                return Err(StateError::IndexCorrupt(format!(
+                    "checkpoint object {} does not match copy object {}",
+                    projection.object.object_id, projection.copy.object_id
+                )));
+            }
+            if !object_ids.insert(projection.object.object_id.as_str()) {
+                return Err(StateError::IndexCorrupt(format!(
+                    "checkpoint batch repeats object {}",
+                    projection.object.object_id
+                )));
+            }
+        }
+        let existing_objects = projections
+            .iter()
+            .map(|projection| {
+                self.conn
+                    .query_row(
+                        "select 1 from objects where object_id = ?1",
+                        params![projection.object.object_id.as_str()],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map(|row| row.is_some())
+                    .map_err(|err| sqlite_error("query checkpoint projection replay", err))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if existing_objects.iter().any(|present| *present) {
+            let exact = projections
+                .iter()
+                .map(|projection| {
+                    let block_count =
+                        u64_to_i64(projection.block_count, "checkpoint object block_count")?;
+                    let copy_visible = self
+                        .conn
+                        .query_row(
+                            "select 1 from object_copies
+                             where object_id = ?1 and tape_uuid = ?2
+                               and tape_file_number = ?3 and status = 'committed'",
+                            params![
+                                projection.object.object_id.as_str(),
+                                projection.copy.tape_uuid.to_vec(),
+                                i64::from(projection.copy.tape_file_number),
+                            ],
+                            |_| Ok(()),
+                        )
+                        .optional()
+                        .map_err(|err| sqlite_error("query checkpoint copy replay", err))?
+                        .is_some();
+                    let tape_file_visible = self
+                        .conn
+                        .query_row(
+                            "select 1 from tape_files
+                             where tape_uuid = ?1 and tape_file_number = ?2
+                               and kind = 'object' and object_id = ?3 and block_count = ?4",
+                            params![
+                                projection.copy.tape_uuid.to_vec(),
+                                i64::from(projection.copy.tape_file_number),
+                                projection.object.object_id.as_str(),
+                                block_count,
+                            ],
+                            |_| Ok(()),
+                        )
+                        .optional()
+                        .map_err(|err| sqlite_error("query checkpoint tape-file replay", err))?
+                        .is_some();
+                    Ok(copy_visible && tape_file_visible)
+                })
+                .collect::<Result<Vec<_>, StateError>>()?;
+            let checkpoint_bootstrap_visible = self
+                .conn
+                .query_row(
+                    "select 1 from tape_files
+                     where tape_uuid = ?1 and tape_file_number = ?2
+                       and kind = 'bootstrap' and block_count = 1",
+                    params![
+                        record.tape_uuid.to_vec(),
+                        i64::from(record.checkpoint_tape_file_number),
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|err| sqlite_error("query checkpoint bootstrap replay", err))?
+                .is_some();
+            if existing_objects.iter().all(|present| *present)
+                && exact.iter().all(|present| *present)
+                && checkpoint_bootstrap_visible
+            {
+                return Ok(());
+            }
+            return Err(StateError::IndexCorrupt(
+                "checkpoint record is partially visible or conflicts with SQLite".to_string(),
+            ));
+        }
+
+        let updated_at = now_utc()?;
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|err| sqlite_error("begin checkpoint batch projection", err))?;
+        for projection in projections {
+            let tape_input = TapeJournalIndexInput {
+                tape_uuid: projection.copy.tape_uuid,
+                block_size: projection.block_size,
+                scheme: None,
+                journal_offset_bytes: 0,
+            };
+            let mut entries = Vec::with_capacity(if projection.fresh_tape { 2 } else { 1 });
+            if projection.fresh_tape {
+                entries.push(TapeFileEntry {
+                    tape_file_number: 0,
+                    kind: TapeFileKind::Bootstrap,
+                    block_count: 1,
+                    physical_start_hint: None,
+                    object_id: None,
+                    first_parity_data_ordinal: None,
+                    epoch_id: None,
+                    protected_ordinal_start: None,
+                    protected_ordinal_end_exclusive: None,
+                    canonical_metadata_hash: None,
+                    bootstrap_object_row: None,
+                });
+            }
+            entries.push(TapeFileEntry {
+                tape_file_number: projection.copy.tape_file_number,
+                kind: TapeFileKind::Object,
+                block_count: projection.block_count,
+                physical_start_hint: None,
+                object_id: Some(projection.object.object_id.clone()),
+                first_parity_data_ordinal: None,
+                epoch_id: None,
+                protected_ordinal_start: None,
+                protected_ordinal_end_exclusive: None,
+                canonical_metadata_hash: None,
+                bootstrap_object_row: None,
+            });
+            let bundle = CommittedBundle {
+                kind: CommittedBundleKind::Object,
+                entries,
+                highest_protected_ordinal: 0,
+                total_committed_ordinals: projection.total_committed_ordinals,
+            };
+            validate_append_bundle_extension_tx(&tx, &tape_input, &bundle)?;
+            validate_append_object_conflicts_tx(
+                &tx,
+                &tape_input,
+                &bundle,
+                &projection.object,
+                std::slice::from_ref(&projection.copy),
+            )?;
+            let created_at_utc = projection
+                .object
+                .created_at_utc
+                .clone()
+                .unwrap_or_else(|| updated_at.clone());
+            upsert_native_object_projection_tx(
+                &tx,
+                &projection.object,
+                Some(&projection.files),
+                std::slice::from_ref(&projection.copy),
+                created_at_utc.as_str(),
+            )?;
+            project_committed_tape_file_bundle_tx(&tx, &tape_input, &bundle, updated_at.as_str())?;
+        }
+        let total_committed_ordinals = projections
+            .last()
+            .map(|projection| projection.total_committed_ordinals)
+            .ok_or_else(|| {
+                StateError::IndexCorrupt(
+                    "checkpoint record has no final ordinal projection".to_string(),
+                )
+            })?;
+        let tape_input = TapeJournalIndexInput {
+            tape_uuid: record.tape_uuid,
+            block_size: record.block_size,
+            scheme: None,
+            journal_offset_bytes: 0,
+        };
+        let bootstrap_bundle = CommittedBundle {
+            kind: CommittedBundleKind::Control,
+            entries: vec![TapeFileEntry {
+                tape_file_number: record.checkpoint_tape_file_number,
+                kind: TapeFileKind::Bootstrap,
+                block_count: 1,
+                physical_start_hint: None,
+                object_id: None,
+                first_parity_data_ordinal: None,
+                epoch_id: None,
+                protected_ordinal_start: None,
+                protected_ordinal_end_exclusive: None,
+                canonical_metadata_hash: None,
+                bootstrap_object_row: None,
+            }],
+            highest_protected_ordinal: 0,
+            total_committed_ordinals,
+        };
+        validate_checkpoint_control_extension_tx(&tx, &tape_input, &bootstrap_bundle)?;
+        project_committed_tape_file_bundle_tx(
+            &tx,
+            &tape_input,
+            &bootstrap_bundle,
+            updated_at.as_str(),
+        )?;
+        tx.commit()
+            .map_err(|err| sqlite_error("commit checkpoint batch projection", err))?;
+        Ok(())
     }
 
     /// Mark a tape journal as pending because a live append session owns it.
@@ -5391,6 +5622,73 @@ fn validate_append_bundle_extension_tx(
             "append projection for tape {} overlaps existing tape file {}",
             hex_uuid(input.tape_uuid),
             existing
+        )));
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_control_extension_tx(
+    tx: &rusqlite::Transaction<'_>,
+    input: &TapeJournalIndexInput,
+    bundle: &CommittedBundle,
+) -> Result<(), StateError> {
+    if bundle.kind != CommittedBundleKind::Control
+        || bundle.entries.len() != 1
+        || bundle.entries[0].kind != TapeFileKind::Bootstrap
+        || bundle.entries[0].block_count != 1
+    {
+        return Err(StateError::IndexCorrupt(format!(
+            "checkpoint projection for tape {} requires one-block Control bootstrap bundle",
+            hex_uuid(input.tape_uuid)
+        )));
+    }
+    let entry = &bundle.entries[0];
+    let prefix = load_append_projection_prefix_tx(tx, input)?;
+    validate_append_geometry(input, &prefix)?;
+    if prefix.state != "ready" {
+        return Err(StateError::IndexCorrupt(format!(
+            "checkpoint projection refused for tape {} in state {}",
+            hex_uuid(input.tape_uuid),
+            prefix.state
+        )));
+    }
+    let expected_file = prefix
+        .last_committed_tape_file
+        .and_then(|last| last.checked_add(1))
+        .ok_or_else(|| {
+            StateError::IndexCorrupt(format!(
+                "checkpoint projection tape {} has no object prefix or next tape-file number overflows",
+                hex_uuid(input.tape_uuid)
+            ))
+        })?;
+    if entry.tape_file_number != expected_file {
+        return Err(StateError::IndexCorrupt(format!(
+            "checkpoint projection for tape {} is non-contiguous: expected bootstrap tape file {expected_file}, got {}",
+            hex_uuid(input.tape_uuid),
+            entry.tape_file_number
+        )));
+    }
+    if bundle.total_committed_ordinals != prefix.total_committed_ordinals
+        || bundle.highest_protected_ordinal != prefix.highest_protected_ordinal
+    {
+        return Err(StateError::IndexCorrupt(format!(
+            "checkpoint bootstrap for tape {} changed ordinal watermarks",
+            hex_uuid(input.tape_uuid)
+        )));
+    }
+    let overlapping = tx
+        .query_row(
+            "select 1 from tape_files where tape_uuid = ?1 and tape_file_number = ?2",
+            params![input.tape_uuid.to_vec(), i64::from(entry.tape_file_number)],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|err| sqlite_error("query checkpoint bootstrap overlap", err))?;
+    if overlapping.is_some() {
+        return Err(StateError::IndexCorrupt(format!(
+            "checkpoint projection for tape {} overlaps tape file {}",
+            hex_uuid(input.tape_uuid),
+            entry.tape_file_number
         )));
     }
     Ok(())
@@ -12869,6 +13167,135 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_crash_cuts_publish_only_after_fsynced_journal_replay() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-checkpoint-crash-cuts")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [0x51; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "CHK001L9".to_string(),
+                block_size: 256 * 1024,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision checkpoint tape");
+        let object_1 = uuid::Uuid::from_bytes([0x71; 16]);
+        let object_2 = uuid::Uuid::from_bytes([0x72; 16]);
+        let object_1_text = object_1.to_string();
+        let object_2_text = object_2.to_string();
+        let projections = vec![
+            crate::checkpoint::CheckpointObjectProjection {
+                object: append_object_projection(&object_1_text),
+                files: Vec::new(),
+                copy: append_copy_projection(&object_1_text, tape_uuid, 1),
+                block_size: 256 * 1024,
+                block_count: 3,
+                fresh_tape: true,
+                total_committed_ordinals: 3,
+                bootstrap_object_row: crate::checkpoint::CheckpointBootstrapObjectRow {
+                    tape_file_number: 1,
+                    stored_block_count: 3,
+                    object_id: *object_1.as_bytes(),
+                    representation:
+                        crate::checkpoint::CheckpointBootstrapObjectRepresentation::Plaintext {
+                            manifest_first_chunk_lba: 1,
+                            manifest_size_bytes: 1,
+                            manifest_chunk_count: 1,
+                            manifest_sha256: [0x31; 32],
+                        },
+                },
+            },
+            crate::checkpoint::CheckpointObjectProjection {
+                object: append_object_projection(&object_2_text),
+                files: Vec::new(),
+                copy: append_copy_projection(&object_2_text, tape_uuid, 2),
+                block_size: 256 * 1024,
+                block_count: 2,
+                fresh_tape: false,
+                total_committed_ordinals: 5,
+                bootstrap_object_row: crate::checkpoint::CheckpointBootstrapObjectRow {
+                    tape_file_number: 2,
+                    stored_block_count: 2,
+                    object_id: *object_2.as_bytes(),
+                    representation:
+                        crate::checkpoint::CheckpointBootstrapObjectRepresentation::Plaintext {
+                            manifest_first_chunk_lba: 1,
+                            manifest_size_bytes: 1,
+                            manifest_chunk_count: 1,
+                            manifest_sha256: [0x32; 32],
+                        },
+                },
+            },
+        ];
+        let journal = crate::checkpoint::FileCheckpointJournal::open(
+            temp.path().join("checkpoints"),
+            tape_uuid,
+        )
+        .expect("open checkpoint journal");
+
+        // Pre-first-barrier and mid-batch crashes have no journal record, so
+        // neither pending object is visible in the rebuildable projection.
+        assert!(journal.last().expect("empty journal replay").is_none());
+        for projection in &projections {
+            assert!(index
+                .get_native_object(projection.object.object_id.as_str())
+                .expect("query pending object")
+                .is_none());
+        }
+
+        let record = crate::checkpoint::CheckpointJournalRecord {
+            ordinal: 1,
+            committed_object_count: 2,
+            eod_partition: 0,
+            eod_lba: 11,
+            tape_uuid,
+            batch_id: [0x61; 16],
+            checkpoint_tape_file_number: 3,
+            block_size: 256 * 1024,
+            objects: projections,
+        };
+        journal.append(&record).expect("fsync checkpoint record");
+
+        // This is the post-fsync/pre-SQLite cut: replay of the durable record
+        // atomically reconstructs the whole batch.
+        let replayed = journal.last().expect("replay checkpoint").expect("record");
+        index
+            .project_checkpoint_record(&replayed)
+            .expect("project replayed checkpoint");
+        assert_eq!(
+            index
+                .conn
+                .query_row("select count(*) from objects", [], |row| row
+                    .get::<_, u64>(0))
+                .expect("object count"),
+            2
+        );
+        let tape = index
+            .get_tape(&tape_uuid)
+            .expect("query tape")
+            .expect("checkpoint tape");
+        assert_eq!(tape.last_committed_tape_file, Some(3));
+        assert_eq!(tape.total_committed_ordinals, 5);
+
+        // The post-SQLite cut is idempotent when startup replays the journal.
+        index
+            .project_checkpoint_record(&replayed)
+            .expect("idempotent checkpoint replay");
+        assert_eq!(
+            index
+                .conn
+                .query_row("select count(*) from objects", [], |row| row
+                    .get::<_, u64>(0))
+                .expect("idempotent object count"),
+            2
+        );
+    }
+
+    #[test]
     fn strict_append_projection_rejects_non_contiguous_bundle_before_object_rows() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-index")
@@ -13780,13 +14207,16 @@ mod tests {
                         protected_ordinal_start: None,
                         protected_ordinal_end_exclusive: None,
                         canonical_metadata_hash: None,
-                        bootstrap_object_row: Some(BootstrapObjectRow::encrypted(
-                            5,
-                            9,
-                            recipient_epoch_ids.clone(),
-                            66,
-                            207,
-                        )),
+                        bootstrap_object_row: Some(
+                            BootstrapObjectRow::encrypted(
+                                5,
+                                9,
+                                recipient_epoch_ids.clone(),
+                                66,
+                                207,
+                            )
+                            .with_object_id([0x37; 16]),
+                        ),
                     }],
                     highest_protected_ordinal: 26,
                     total_committed_ordinals: 26,

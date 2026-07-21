@@ -58,6 +58,10 @@ string with a suffix: `B`, `KiB`/`K`/`KB`, `MiB`/`M`/`MB`, `GiB`/`G`/`GB`,
 | `spool_dir` | absolute path | `<state_dir>/spool` | Pre-commit append spool. Created with mode `0700` at startup. |
 | `spool_tmpfs_ram_budget` | byte size > 0 | unset | Required acknowledgement when the spool resolves to tmpfs/ramfs. Post-R2, spool growth reserves this fixed budget from the shared `io_memory_ceiling`; runtime `MemAvailable` never clamps or authorizes growth. Must be ≤ `io_memory_ceiling`. |
 | `io_memory_ceiling` | byte size > 0 | `"24GiB"` | Fixed total for ALL pipeline I/O memory: append-spool reservations plus every drive's read reservoir, granted through one atomic permit manager. See the deployment note below. |
+| `checkpoint_mode` | `"per_object"` or `"batched"` | `"per_object"` | Object durability policy. `per_object` preserves the historical synchronous delimiter and immediate catalog commit. `batched` uses advisory delimiters and checkpoint barriers, and is rejected at session admission for parity-enabled pools. |
+| `checkpoint_max_bytes` | byte size > 0 | `"32GiB"` | In batched mode, request a barrier when pending logical bytes reach this limit. |
+| `checkpoint_max_objects` | integer > 0 | `200` | In batched mode, request a barrier when the pending object count reaches this limit. |
+| `checkpoint_max_age_seconds` | integer > 0 | `300` | Server-owned age deadline for an open batch. The timer queues its barrier through the drive actor, so an in-flight object finishes first. |
 | `read_only` | bool | `false` | Reject state-changing operations; skips library discovery and the drive pool at startup. |
 | `socket_path` | absolute path | `<state_dir>/rem.sock` | Unix-domain gRPC socket. Parent directory created `0700`; socket chmod `0660`; connecting peers must be root or the daemon's own user. |
 | `listen` | `host:port` string | unset | TCP listen address for mTLS gRPC. Requires `[daemon.tls]`. |
@@ -156,7 +160,7 @@ pool, and Remanence picks the tape. Pool ids may use letters, digits, and
 | `selection_policy` | string | `"complete-or-fill"` | Within-pool tape choice: `"complete-or-fill"` or `"fill-oldest"`. |
 | `watermark_low` | float | `0.92` | Fill target as a fraction of capacity; a tape at or above it is a candidate for sealing. |
 | `watermark_high` | float | `0.97` | Usable-capacity cap below end-of-media. Must satisfy `0 < low < high <= 1`. |
-| `block_size` | byte size | `262144` (256 KiB) | Fixed tape block size applied when a fresh tape is initialized into this pool. Must be a multiple of 512 and at most 16 MiB. |
+| `block_size` | byte size | `262144` (256 KiB) | Fixed tape block size applied when a fresh tape is initialized into this pool. Must be exactly 256 KiB, 512 KiB, or 1 MiB. |
 | `min_object_size` | byte size | `0` | Minimum object/bundle size the orchestrator promises; checked against the watermark band. |
 
 `[[tape_pool_rules]]` maps barcodes to pools by prefix. Prefixes are ASCII

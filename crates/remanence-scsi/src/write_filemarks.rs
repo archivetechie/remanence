@@ -13,9 +13,10 @@
 //!   rem does not use setmarks — they are a niche SSC feature; LTO
 //!   firmware varies in how it handles them. WSMK=0 always.
 //! - **IMMED**: return as soon as the command starts rather than
-//!   waiting for media commit. rem keeps IMMED=0 because the audit
-//!   log records what hit media, not what the drive accepted into
-//!   its buffer.
+//!   waiting for media commit. Per-object commits and zero-count barriers use
+//!   IMMED=0. Opt-in parity-off checkpoint batches use IMMED=1 only for
+//!   provisional object delimiters; a later synchronous barrier establishes
+//!   durability and owns any deferred error.
 //!
 //! WRITE FILEMARKS(6) carries a 24-bit unsigned count
 //! (max 16,777,215 file marks). No tape rem writes will get close
@@ -44,6 +45,15 @@ pub const WRITE_FILEMARKS_6_MAX: u32 = 0x00FF_FFFF;
 /// Build the 6-byte WRITE FILEMARKS(6) CDB. `count` must fit in
 /// 24 bits unsigned.
 pub fn build_cdb_6(count: u32) -> [u8; 6] {
+    build_cdb_6_with_immed(count, false)
+}
+
+/// Build WRITE FILEMARKS(6) with IMMED set for non-durable delimiters.
+pub fn build_cdb_6_immediate(count: u32) -> [u8; 6] {
+    build_cdb_6_with_immed(count, true)
+}
+
+fn build_cdb_6_with_immed(count: u32, immediate: bool) -> [u8; 6] {
     assert!(
         count <= WRITE_FILEMARKS_6_MAX,
         "WRITE FILEMARKS(6) count {count} exceeds 24-bit max"
@@ -51,7 +61,7 @@ pub fn build_cdb_6(count: u32) -> [u8; 6] {
     let count_be = count.to_be_bytes();
     [
         OPCODE_WRITE_FILEMARKS_6,
-        0x00, // WSMK=0, IMMED=0
+        u8::from(immediate), // WSMK=0, IMMED as requested
         count_be[1],
         count_be[2],
         count_be[3],
@@ -74,6 +84,14 @@ mod tests {
         // SSC allows count=0 (synchronise without writing a mark).
         let cdb = build_cdb_6(0);
         assert_eq!(cdb, [0x10, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn wf6_immediate_sets_only_immed_bit() {
+        assert_eq!(
+            build_cdb_6_immediate(1),
+            [0x10, 0x01, 0x00, 0x00, 0x01, 0x00]
+        );
     }
 
     #[test]

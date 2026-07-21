@@ -181,6 +181,13 @@ async fn open_write_session_reserved(
         select_attempts = select_attempts.saturating_add(1);
         let selected = select_tape_in_pool(&index, &pool_cfg, 0, &pool.mounted_tape_uuids())
             .map_err(crate::write_owner::status_from_select_tape_error)?;
+        if state.checkpoint_mode == remanence_state::CheckpointMode::Batched
+            && !matches!(selected.parity_config, remanence_parity::ParityConfig::None)
+        {
+            return Err(Status::failed_precondition(
+                "daemon.checkpoint_mode=batched is not admitted on parity-enabled pools; Phase 2 owns parity checkpoint composition",
+            ));
+        }
         match pool.reserve_tape(selected.tape_uuid) {
             Ok(reservation) => break (selected, reservation),
             Err(err) if err.code() == tonic::Code::FailedPrecondition => continue,
@@ -486,6 +493,29 @@ pub(crate) async fn get_write_session(
         .send(crate::write_owner::DriveCommand::Get {
             session_id,
             reply: reply_tx,
+        })
+        .await
+        .map_err(|_| Status::internal("drive actor unavailable"))?;
+    reply_rx
+        .await
+        .map_err(|_| Status::internal("drive actor dropped reply"))?
+}
+
+pub(crate) async fn checkpoint_write_session(
+    state: &ApiState,
+    session_id: Uuid,
+    trigger: crate::write_owner::CheckpointTrigger,
+) -> Result<crate::write_owner::CheckpointActorReply, Status> {
+    let pool = state.drive_pool()?.clone();
+    let mounted = pool.session(session_id)?;
+    let drive = pool.drive_tx(mounted.bay)?;
+    let (reply_tx, reply_rx) = oneshot::channel();
+    drive
+        .send(crate::write_owner::DriveCommand::Checkpoint {
+            session_id,
+            trigger,
+            expected_batch_id: None,
+            reply: Some(reply_tx),
         })
         .await
         .map_err(|_| Status::internal("drive actor unavailable"))?;
@@ -962,6 +992,21 @@ fn schedule_idle_dismount(state: ApiState, parked: crate::write_owner::ParkedCar
     });
 }
 
+pub(crate) fn spawn_timer_idle_dismount_listener(
+    state: ApiState,
+    mut parked_rx: tokio::sync::mpsc::UnboundedReceiver<crate::write_owner::ParkedCartridge>,
+) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::error!("cannot start timer-close idle-dismount listener without a Tokio runtime");
+        return;
+    };
+    runtime.spawn(async move {
+        while let Some(parked) = parked_rx.recv().await {
+            schedule_idle_dismount(state.clone(), parked);
+        }
+    });
+}
+
 pub(crate) fn register_startup_seated_cartridges(
     state: &ApiState,
     report: &remanence_library::DiscoveryReport,
@@ -1035,6 +1080,70 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
         .clone();
     drop(snapshot);
     let mut failures = Vec::new();
+    for (_, (session_id, mounted)) in pool.sessions_by_bay() {
+        let drive = match pool.drive_tx(mounted.bay) {
+            Ok(drive) => drive,
+            Err(err) => {
+                failures.push(format!(
+                    "session {session_id}: drive unavailable for shutdown checkpoint: {err}"
+                ));
+                continue;
+            }
+        };
+        let (checkpoint_tx, checkpoint_rx) = oneshot::channel();
+        if drive
+            .send(crate::write_owner::DriveCommand::Checkpoint {
+                session_id,
+                trigger: crate::write_owner::CheckpointTrigger::Shutdown,
+                expected_batch_id: None,
+                reply: Some(checkpoint_tx),
+            })
+            .await
+            .is_err()
+        {
+            failures.push(format!(
+                "session {session_id}: drive actor unavailable for shutdown checkpoint"
+            ));
+            continue;
+        }
+        match checkpoint_rx.await {
+            Ok(Ok(_)) => {
+                let (close_tx, close_rx) = oneshot::channel();
+                if drive
+                    .send(crate::write_owner::DriveCommand::Close {
+                        session_id,
+                        reply: close_tx,
+                    })
+                    .await
+                    .is_err()
+                {
+                    failures.push(format!(
+                        "session {session_id}: drive actor unavailable for shutdown close"
+                    ));
+                    continue;
+                }
+                match close_rx.await {
+                    Ok(Ok(_)) => finish_mounted_session(state, pool, session_id, mounted),
+                    Ok(Err(err)) => failures.push(format!(
+                        "session {session_id}: shutdown close failed: {err}"
+                    )),
+                    Err(_) => failures.push(format!(
+                        "session {session_id}: drive actor dropped shutdown close reply"
+                    )),
+                }
+            }
+            Ok(Err(err)) if err.code() == tonic::Code::FailedPrecondition => {
+                // Read sessions have no checkpoint barrier and remain handled by
+                // the existing open-session shutdown diagnostic below.
+            }
+            Ok(Err(err)) => failures.push(format!(
+                "session {session_id}: shutdown checkpoint failed: {err}"
+            )),
+            Err(_) => failures.push(format!(
+                "session {session_id}: drive actor dropped shutdown checkpoint reply"
+            )),
+        }
+    }
     let mut drive_bays = Vec::new();
     for bay in library_drive_bays {
         if pool.drive_tx(bay.element_address).is_ok() {
