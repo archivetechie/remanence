@@ -65,20 +65,85 @@ use remanence_library::{
 };
 use remanence_parity::bootstrap::{parse_bootstrap_block, write_bootstrap_block};
 use remanence_parity::{
-    emit_resume_rebuilt_sidecars_to_raw, plan_resume_append_from_journal,
-    rebuild_open_epoch_from_committed_prefix, scan_reconstruct_filemark_map, BootstrapPayload,
-    CapacityReserveInput, DriveHandleRawSink, DriveHandleRawSource, FileTapeFileJournal,
-    FilemarkMap, ObjectParitySource, OpenTrust, ParityError, ParityScheme, ParitySchemeRecord,
-    ParitySink, PhysicalPositionHint, RawReadOutcome, RawTapeSink, RawTapeSource, ResumeWriterSeed,
-    SchemeId, ScopedFilemarkMap, SidecarEpochDirectoryEntry, SpaceFilemarksOutcome,
-    TapeFileJournal, TapeFileKind, TapeFileMapEntry, TapeFilePosition,
-    DEFAULT_SCHEME_BLOCK_SIZE_BYTES, SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD,
-    SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
+    emit_resume_rebuilt_sidecars_to_raw as emit_resume_sidecars_journaled,
+    plan_resume_append_from_journal, rebuild_open_epoch_from_committed_prefix,
+    scan_reconstruct_filemark_map, BootstrapPayload, CapacityReserveInput, CommittedBundle,
+    CommittedBundleKind, CommittedState, DriveHandleRawSink, DriveHandleRawSource,
+    FileTapeFileJournal, FilemarkMap, JournalError, ObjectParitySource, OpenTrust, ParityError,
+    ParityScheme, ParitySchemeRecord, ParitySink, PhysicalPositionHint, RawReadOutcome,
+    RawTapeSink, RawTapeSource, ResumeWriterSeed, SchemeId, ScopedFilemarkMap,
+    SidecarEpochDirectoryEntry, SpaceFilemarksOutcome, TapeFileJournal, TapeFileKind,
+    TapeFileMapEntry, TapeFilePosition, DEFAULT_SCHEME_BLOCK_SIZE_BYTES,
+    SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD, SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
 };
 
 const TAPE_UUID: [u8; 16] = [
     0x52, 0x45, 0x4d, 0x51, 0x55, 0x41, 0x44, 0x53, 0x54, 0x4f, 0x52, 0x33, 0x43, 0x00, 0x01, 0x00,
 ];
+
+#[derive(Default)]
+struct FixtureJournal {
+    bundles: Vec<CommittedBundle>,
+}
+
+impl TapeFileJournal for FixtureJournal {
+    fn tape_uuid(&self) -> [u8; 16] {
+        TAPE_UUID
+    }
+
+    fn commit_bundle(&mut self, bundle: &CommittedBundle) -> Result<(), JournalError> {
+        self.bundles.push(bundle.clone());
+        Ok(())
+    }
+
+    fn load_committed(&self) -> Result<CommittedState, JournalError> {
+        let retained_end = self
+            .bundles
+            .iter()
+            .rposition(|bundle| bundle.kind == CommittedBundleKind::CheckpointedThrough)
+            .map_or(0, |index| index + 1);
+        let retained = &self.bundles[..retained_end];
+        let last = retained
+            .iter()
+            .rev()
+            .find(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough);
+        Ok(CommittedState {
+            entries: retained
+                .iter()
+                .filter(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough)
+                .flat_map(|bundle| bundle.entries.iter().cloned())
+                .collect(),
+            highest_protected_ordinal: last.map_or(0, |bundle| bundle.highest_protected_ordinal),
+            total_committed_ordinals: last.map_or(0, |bundle| bundle.total_committed_ordinals),
+            orphaned_bundles: self.bundles[retained_end..].to_vec(),
+        })
+    }
+}
+
+fn fixture_journal() -> &'static mut FixtureJournal {
+    Box::leak(Box::new(FixtureJournal::default()))
+}
+
+fn emit_resume_sidecars_with_fixture_journal<F>(
+    sink: &mut dyn RawTapeSink,
+    plan: remanence_parity::ResumeAppendPlan,
+    rebuilt_sidecars: &[remanence_parity::ResumeRebuiltSidecar],
+    expected_tape_uuid: [u8; 16],
+    commit_sidecar: F,
+) -> Result<remanence_parity::ResumeAppendResult, ParityError>
+where
+    F: FnMut(&remanence_parity::SidecarTapeFile) -> Result<(), ParityError>,
+{
+    let mut journal = FixtureJournal::default();
+    emit_resume_sidecars_journaled(
+        sink,
+        &mut journal,
+        plan,
+        rebuilt_sidecars,
+        expected_tape_uuid,
+        commit_sidecar,
+    )
+}
 
 fn drive_path() -> Option<PathBuf> {
     std::env::var("REM_QUADSTOR_PARITY_DRIVE_PATH")
@@ -338,7 +403,7 @@ fn write_raw_block(sink: &mut dyn RawTapeSink, block: &[u8], label: &str) {
 
 fn write_raw_filemark(sink: &mut dyn RawTapeSink, label: &str) {
     let outcome = sink
-        .write_filemark()
+        .write_filemarks(1, false)
         .unwrap_or_else(|err| panic!("{label}: {err}"));
     assert!(
         !outcome.end_of_medium(),
@@ -588,9 +653,14 @@ fn quadstor_parity_roundtrip() {
 
     {
         let mut raw_sink = DriveHandleRawSink::new(&mut drive);
-        let mut sink =
-            ParitySink::new_sidecar_only(&mut raw_sink, scheme.clone(), TAPE_UUID, block_size)
-                .expect("construct hardware parity sink");
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw_sink,
+            fixture_journal(),
+            scheme.clone(),
+            TAPE_UUID,
+            block_size,
+        )
+        .expect("construct hardware parity sink");
         assert_eq!(sink.write_bootstrap().expect("BOT bootstrap"), 0);
         assert_eq!(
             sink.begin_object_with_capacity_reserve(capacity_input(block_size))
@@ -787,9 +857,14 @@ fn quadstor_parity_recovers_from_injected_read_fault() {
 
     {
         let mut raw_sink = DriveHandleRawSink::new(&mut drive);
-        let mut sink =
-            ParitySink::new_sidecar_only(&mut raw_sink, scheme.clone(), TAPE_UUID, block_size)
-                .expect("construct hardware parity sink");
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw_sink,
+            fixture_journal(),
+            scheme.clone(),
+            TAPE_UUID,
+            block_size,
+        )
+        .expect("construct hardware parity sink");
         assert_eq!(sink.write_bootstrap().expect("BOT bootstrap"), 0);
         assert_eq!(
             sink.begin_object_with_capacity_reserve(capacity_input(block_size))
@@ -899,9 +974,14 @@ fn quadstor_parity_resume_append_roundtrip() {
 
     {
         let mut raw_sink = DriveHandleRawSink::new(&mut drive);
-        let mut sink =
-            ParitySink::new_sidecar_only(&mut raw_sink, scheme.clone(), TAPE_UUID, block_size)
-                .expect("construct first-session hardware parity sink");
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw_sink,
+            fixture_journal(),
+            scheme.clone(),
+            TAPE_UUID,
+            block_size,
+        )
+        .expect("construct first-session hardware parity sink");
         assert_eq!(sink.write_bootstrap().expect("BOT bootstrap"), 0);
         assert_eq!(
             sink.begin_object_with_capacity_reserve(capacity_input(block_size))
@@ -971,6 +1051,7 @@ fn quadstor_parity_resume_append_roundtrip() {
         let mut raw_sink = DriveHandleRawSink::new(&mut drive);
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme.clone(),
             TAPE_UUID,
             block_size,
@@ -1141,7 +1222,7 @@ fn quadstor_parity_resume_rebuilds_open_epoch_then_appends() {
 
     let resume_result = {
         let mut raw_sink = DriveHandleRawSink::new(&mut drive);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             resume.plan.clone(),
             &resume.rebuilt_sidecars,
@@ -1175,6 +1256,7 @@ fn quadstor_parity_resume_rebuilds_open_epoch_then_appends() {
         let mut raw_sink = DriveHandleRawSink::new(&mut drive);
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme.clone(),
             TAPE_UUID,
             block_size,
@@ -1371,7 +1453,7 @@ fn quadstor_parity_resume_rebuilds_multiple_open_epochs_then_appends() {
 
     let resume_result = {
         let mut raw_sink = DriveHandleRawSink::new(&mut drive);
-        emit_resume_rebuilt_sidecars_to_raw(
+        emit_resume_sidecars_with_fixture_journal(
             &mut raw_sink,
             resume.plan.clone(),
             &resume.rebuilt_sidecars,
@@ -1416,6 +1498,7 @@ fn quadstor_parity_resume_rebuilds_multiple_open_epochs_then_appends() {
         let mut raw_sink = DriveHandleRawSink::new(&mut drive);
         let mut sink = ParitySink::new_sidecar_only_from_resume(
             &mut raw_sink,
+            fixture_journal(),
             scheme.clone(),
             TAPE_UUID,
             block_size,

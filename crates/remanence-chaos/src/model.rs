@@ -1931,10 +1931,10 @@ mod l1b_tests {
         StaticAllowlist, TapeIoError,
     };
     use remanence_parity::{
-        scan_reconstruct_filemark_map, CapacityReserveInput, DriveHandleRawSink,
-        DriveHandleRawSource, ObjectParitySource, OpenTrust, ParityAuditHook, ParityError,
-        ParityScheme, ParitySink, RecoveryEvent, RecoveryOutcome, SchemeId, ScopedFilemarkMap,
-        TapeFilePosition,
+        scan_reconstruct_filemark_map, CapacityReserveInput, CommittedBundle, CommittedBundleKind,
+        CommittedState, DriveHandleRawSink, DriveHandleRawSource, JournalError, ObjectParitySource,
+        OpenTrust, ParityAuditHook, ParityError, ParityScheme, ParitySink, RecoveryEvent,
+        RecoveryOutcome, SchemeId, ScopedFilemarkMap, TapeFileJournal, TapeFilePosition,
     };
     use rusqlite::{params, Connection};
     use serde_json::{json, Value};
@@ -1964,6 +1964,46 @@ mod l1b_tests {
     #[derive(Default)]
     struct RecordingHook {
         events: Mutex<Vec<RecoveryEvent>>,
+    }
+
+    #[derive(Default)]
+    struct ModelJournal {
+        bundles: Vec<CommittedBundle>,
+    }
+
+    impl TapeFileJournal for ModelJournal {
+        fn tape_uuid(&self) -> [u8; 16] {
+            TAPE_UUID
+        }
+
+        fn commit_bundle(&mut self, bundle: &CommittedBundle) -> Result<(), JournalError> {
+            self.bundles.push(bundle.clone());
+            Ok(())
+        }
+
+        fn load_committed(&self) -> Result<CommittedState, JournalError> {
+            let retained_end = self
+                .bundles
+                .iter()
+                .rposition(|bundle| bundle.kind == CommittedBundleKind::CheckpointedThrough)
+                .map_or(0, |index| index + 1);
+            let retained = &self.bundles[..retained_end];
+            let last = retained
+                .iter()
+                .rev()
+                .find(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough);
+            Ok(CommittedState {
+                entries: retained
+                    .iter()
+                    .filter(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough)
+                    .flat_map(|bundle| bundle.entries.iter().cloned())
+                    .collect(),
+                highest_protected_ordinal: last
+                    .map_or(0, |bundle| bundle.highest_protected_ordinal),
+                total_committed_ordinals: last.map_or(0, |bundle| bundle.total_committed_ordinals),
+                orphaned_bundles: self.bundles[retained_end..].to_vec(),
+            })
+        }
     }
 
     impl RecordingHook {
@@ -2102,8 +2142,15 @@ mod l1b_tests {
             let mut raw = DriveHandleRawSink::new(&mut drive);
             raw.configure_parity_write_session(BLOCK_SIZE)
                 .expect("configure parity session");
-            let mut sink = ParitySink::new_sidecar_only(&mut raw, scheme(), TAPE_UUID, BLOCK_SIZE)
-                .expect("open parity sink");
+            let mut journal = ModelJournal::default();
+            let mut sink = ParitySink::new_with_journal(
+                &mut raw,
+                &mut journal,
+                scheme(),
+                TAPE_UUID,
+                BLOCK_SIZE,
+            )
+            .expect("open parity sink");
             sink.write_bootstrap().expect("write bootstrap");
             let (tape_file_number, _) = sink
                 .begin_object_with_capacity_reserve(capacity_input(128))

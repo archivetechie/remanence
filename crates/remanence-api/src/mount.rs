@@ -184,17 +184,9 @@ async fn open_write_session_reserved(
             &pool_cfg,
             0,
             &pool.mounted_tape_uuids(),
-            state.checkpoint_mode,
             state.checkpoint_journal_dir.as_path(),
         )
         .map_err(crate::write_owner::status_from_select_tape_error)?;
-        if state.checkpoint_mode == remanence_state::CheckpointMode::Batched
-            && !matches!(selected.parity_config, remanence_parity::ParityConfig::None)
-        {
-            return Err(Status::failed_precondition(
-                "daemon.checkpoint_mode=batched is not admitted on parity-enabled pools; Phase 2 owns parity checkpoint composition",
-            ));
-        }
         match pool.reserve_tape(selected.tape_uuid) {
             Ok(reservation) => break (selected, reservation),
             Err(err) if err.code() == tonic::Code::FailedPrecondition => continue,
@@ -1660,8 +1652,8 @@ mod tests {
         CommittedBundle, CommittedBundleKind, ParityConfig, TapeFileEntry, TapeFileKind,
     };
     use remanence_state::{
-        CheckpointMode, PoolSelectionPolicyName, ProvisionTapeInput, TapeJournalIndexInput,
-        TapePoolConfig, TapePoolProjectionInput,
+        PoolSelectionPolicyName, ProvisionTapeInput, TapeJournalIndexInput, TapePoolConfig,
+        TapePoolProjectionInput,
     };
     use std::path::PathBuf;
 
@@ -1742,7 +1734,6 @@ mod tests {
             &cfg,
             0,
             &HashSet::new(),
-            CheckpointMode::Batched,
             &temp.path().join("checkpoints"),
         )
         .expect("batched selection should choose the loaded fresh tape");
@@ -1760,20 +1751,6 @@ mod tests {
             .expect("already-loaded fresh tape should not require a free bay");
         assert_eq!(mount.bay, 0x0101);
         assert!(!mount.needs_drive_load);
-
-        let per_object = select_tape_in_pool_for_write_session(
-            &index,
-            &cfg,
-            0,
-            &HashSet::new(),
-            CheckpointMode::PerObject,
-            &temp.path().join("checkpoints"),
-        )
-        .expect("per-object ranking should continue to choose the legacy tape");
-        assert_eq!(per_object.tape_uuid, LEGACY_UUID);
-        let error = resolve_actor_mount_from_library(&library, "LEG001L9", &HashSet::new())
-            .expect_err("legacy selection reproduces the occupied-bay failure");
-        assert!(error.message().contains("no free drive bay"), "{error}");
     }
 
     #[test]

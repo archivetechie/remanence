@@ -98,9 +98,6 @@ pub struct DaemonConfig {
     /// Pause tape submission at this ring occupancy percentage.
     #[serde(default = "default_append_ring_low_pct")]
     pub append_ring_low_pct: u8,
-    /// Object durability policy. Batched mode is admitted only on parity-off pools.
-    #[serde(default)]
-    pub checkpoint_mode: CheckpointMode,
     /// Maximum pending logical bytes before a batched checkpoint barrier.
     #[serde(
         default = "default_checkpoint_max_bytes",
@@ -144,17 +141,6 @@ pub enum AppendStagingMode {
     Serial,
     /// Use a bounded live receive ring when the caller supplies every proof.
     Overlap,
-}
-
-/// Daemon durability policy for pool write sessions.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CheckpointMode {
-    /// Preserve the historical synchronous commit after every object.
-    #[default]
-    PerObject,
-    /// Hold parity-off objects in WRITTEN state until a batch barrier succeeds.
-    Batched,
 }
 
 impl DaemonConfig {
@@ -512,6 +498,15 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<RemConfig, StateError> {
 pub fn parse_config_toml(text: &str) -> Result<RemConfig, StateError> {
     let document: toml::Value =
         toml::from_str(text).map_err(|err| StateError::ConfigInvalid(err.to_string()))?;
+    if document
+        .get("daemon")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|daemon| daemon.contains_key("checkpoint_mode"))
+    {
+        return Err(StateError::ConfigInvalid(
+            "checkpoint_mode was removed 2026-07-21; batched is the only mode".to_string(),
+        ));
+    }
     if let Some(tape_io) = document.get("tape_io").and_then(toml::Value::as_table) {
         for removed in ["pipelined_submission", "legacy_single_block"] {
             if tape_io.contains_key(removed) {
@@ -1268,7 +1263,6 @@ client_ca = "/ca"
         assert_eq!(config.daemon.append_ring_bytes, DEFAULT_APPEND_RING_BYTES);
         assert_eq!(config.daemon.append_ring_high_pct, 90);
         assert_eq!(config.daemon.append_ring_low_pct, 25);
-        assert_eq!(config.daemon.checkpoint_mode, CheckpointMode::PerObject);
         assert_eq!(
             config.daemon.checkpoint_max_bytes,
             DEFAULT_CHECKPOINT_MAX_BYTES
@@ -1672,17 +1666,22 @@ block_size = {block_size:?}
     }
 
     #[test]
-    fn parses_batched_checkpoint_policy_and_rejects_zero_limits() {
-        let per_object =
-            parse_config_toml(&with_daemon_lines("checkpoint_mode = \"per_object\"\n"))
-                .expect("explicit per-object checkpoint policy");
-        assert_eq!(per_object.daemon.checkpoint_mode, CheckpointMode::PerObject);
-
+    fn rejects_removed_checkpoint_mode_and_rejects_zero_limits() {
+        for removed in ["per_object", "batched"] {
+            let err = parse_config_toml(&with_daemon_lines(&format!(
+                "checkpoint_mode = {removed:?}\n"
+            )))
+            .expect_err("removed checkpoint mode must reject");
+            assert!(
+                err.to_string()
+                    .contains("checkpoint_mode was removed 2026-07-21; batched is the only mode"),
+                "{err}"
+            );
+        }
         let config = parse_config_toml(&with_daemon_lines(
-            "checkpoint_mode = \"batched\"\ncheckpoint_max_bytes = \"64GiB\"\ncheckpoint_max_objects = 17\ncheckpoint_max_age_seconds = 42\n",
+            "checkpoint_max_bytes = \"64GiB\"\ncheckpoint_max_objects = 17\ncheckpoint_max_age_seconds = 42\n",
         ))
-        .expect("valid batched checkpoint policy");
-        assert_eq!(config.daemon.checkpoint_mode, CheckpointMode::Batched);
+        .expect("valid checkpoint limits");
         assert_eq!(config.daemon.checkpoint_max_bytes, 64 * 1024 * 1024 * 1024);
         assert_eq!(config.daemon.checkpoint_max_objects, 17);
         assert_eq!(config.daemon.checkpoint_max_age_seconds, 42);

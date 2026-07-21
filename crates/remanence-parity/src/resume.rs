@@ -14,6 +14,10 @@ use crate::error::ParityError;
 use crate::filemark_map::{FilemarkMap, TapeFileKind, TapeFileMapEntry};
 use crate::journal::{CommittedState, TapeFileJournal};
 use crate::model::ParityScheme;
+use crate::parity_map::{
+    SidecarEpochDirectoryEntry, SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD,
+    SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
+};
 use crate::raw::{
     PhysicalPositionHint, RawReadOutcome, RawTapeSink, RawTapeSource, RawWriteOutcome,
 };
@@ -53,6 +57,8 @@ pub struct ResumeAppendPlan {
     pub live_epoch_start: u64,
     /// Next object-data ordinal for newly appended object blocks.
     pub next_data_ordinal: u64,
+    /// Bare monotonic id of the live epoch at `live_epoch_start`.
+    pub next_epoch_id: u64,
     /// Full epochs in `[W, T)` that an explicitly scoped legacy/forensic
     /// rebuild must emit as ordinary sidecars. The production v1 append path
     /// rejects committed prefixes whose W/T gap reaches one full epoch.
@@ -75,6 +81,8 @@ pub struct ResumeAppendResult {
     pub live_epoch_start: u64,
     /// Next object-data ordinal for newly appended object blocks.
     pub next_data_ordinal: u64,
+    /// Bare monotonic id of the live epoch at `live_epoch_start`.
+    pub next_epoch_id: u64,
 }
 
 /// Encoded sidecar reconstructed by rereading the committed open epoch.
@@ -97,7 +105,7 @@ pub struct ResumeRebuiltSidecar {
 /// rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResumeLiveEpochState {
-    /// Epoch ID implied by `protected_ordinal_start / (S * k)`.
+    /// Bare monotonic epoch identifier.
     pub epoch_id: u64,
     /// First ordinal in the live epoch.
     pub protected_ordinal_start: u64,
@@ -166,6 +174,7 @@ impl ResumeAppendPlan {
             highest_protected_ordinal: self.highest_protected_ordinal_after_rebuild,
             live_epoch_start: self.live_epoch_start,
             next_data_ordinal: self.next_data_ordinal,
+            next_epoch_id: self.next_epoch_id,
         })
     }
 }
@@ -184,6 +193,62 @@ pub fn committed_prefix_from_journal(
     state.validate_v1_restart_bound(scheme)?;
     let map = state.filemark_map()?;
     Ok((state, map))
+}
+
+/// Rebuild bootstrap sidecar-directory rows from committed journal geometry.
+///
+/// Sidecars store `2H + P + 1` blocks, where `P = S*m`; therefore the
+/// replicated header/index size `H` is recoverable without rereading tape.
+pub fn sidecar_directory_from_committed_state(
+    committed: &CommittedState,
+    scheme: &ParityScheme,
+) -> Result<Vec<SidecarEpochDirectoryEntry>, ParityError> {
+    let parity_blocks = u64::from(scheme.stripes_per_neighborhood)
+        .checked_mul(u64::from(scheme.parity_blocks_per_stripe))
+        .ok_or(ParityError::Invariant(
+            "sidecar parity block count overflows",
+        ))?;
+    committed
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == crate::filemark_map::TapeFileKind::ParitySidecar)
+        .map(|entry| {
+            let replicated_index_blocks = entry
+                .block_count
+                .checked_sub(parity_blocks)
+                .and_then(|value| value.checked_sub(1))
+                .ok_or(ParityError::Invariant("sidecar block geometry underflows"))?;
+            if replicated_index_blocks == 0 || replicated_index_blocks % 2 != 0 {
+                return Err(ParityError::Invariant(
+                    "sidecar block geometry cannot recover replicated index size",
+                ));
+            }
+            Ok(SidecarEpochDirectoryEntry {
+                tape_file_number: entry.tape_file_number,
+                epoch_id: entry
+                    .epoch_id
+                    .ok_or(ParityError::Invariant("journal sidecar missing epoch id"))?,
+                protected_ordinal_start: entry.protected_ordinal_start.ok_or(
+                    ParityError::Invariant("journal sidecar missing protected range start"),
+                )?,
+                protected_ordinal_end_exclusive: entry.protected_ordinal_end_exclusive.ok_or(
+                    ParityError::Invariant("journal sidecar missing protected range end"),
+                )?,
+                sidecar_total_block_count: entry.block_count,
+                sidecar_header_block_count: u32::try_from(replicated_index_blocks / 2).map_err(
+                    |_| ParityError::Invariant("sidecar header block count overflows u32"),
+                )?,
+                parity_shard_block_count: u32::try_from(parity_blocks).map_err(|_| {
+                    ParityError::Invariant("sidecar parity block count overflows u32")
+                })?,
+                canonical_metadata_hash: entry.canonical_metadata_hash.ok_or(
+                    ParityError::Invariant("journal sidecar missing canonical metadata hash"),
+                )?,
+                flags: SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD
+                    | SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
+            })
+        })
+        .collect()
 }
 
 /// Plan resume append directly from a [`TapeFileJournal`].
@@ -255,11 +320,18 @@ fn rebuild_open_epoch_from_plan(
         });
     }
 
+    let rebuilt_epoch_count = u64::try_from(plan.sidecars_to_emit.len())
+        .map_err(|_| resume_error("resume sidecar count does not fit u64"))?;
+    let first_rebuild_epoch_id = plan
+        .next_epoch_id
+        .checked_sub(rebuilt_epoch_count)
+        .ok_or_else(|| resume_error("resume rebuild epoch id underflows"))?;
     let mut accumulator = ResumeEpochAccumulator::new(
         scheme,
         tape_uuid,
         block_size,
         plan.highest_protected_ordinal_before_rebuild,
+        first_rebuild_epoch_id,
     )?;
     for ordinal in plan.highest_protected_ordinal_before_rebuild..plan.next_data_ordinal {
         let block = read_committed_object_block(source, committed_prefix, ordinal, block_size)?;
@@ -285,12 +357,56 @@ fn rebuild_open_epoch_from_plan(
 /// rebuilt sidecars are ordinary sidecar tape files. The `commit_sidecar`
 /// callback is supplied by Layer 5 and must run the same catalog transaction
 /// path used for sidecars emitted during normal object close. It is invoked
-/// only after all sidecar blocks have written, `write_filemark()` has returned,
+/// only after all sidecar blocks have written, the synchronous filemark has returned,
 /// and a post-barrier `position()` capture has succeeded.
 /// `expected_tape_uuid` is used to validate the encoded sidecar bytes before
 /// any write, so a resume helper cannot commit another tape's sidecar.
 pub fn emit_resume_rebuilt_sidecars_to_raw<F>(
     sink: &mut dyn RawTapeSink,
+    journal: &mut dyn TapeFileJournal,
+    plan: ResumeAppendPlan,
+    rebuilt_sidecars: &[ResumeRebuiltSidecar],
+    expected_tape_uuid: [u8; 16],
+    commit_sidecar: F,
+) -> Result<ResumeAppendResult, ParityError>
+where
+    F: FnMut(&SidecarTapeFile) -> Result<(), ParityError>,
+{
+    emit_resume_rebuilt_sidecars_to_raw_inner(
+        sink,
+        Some(journal),
+        plan,
+        rebuilt_sidecars,
+        expected_tape_uuid,
+        commit_sidecar,
+    )
+}
+
+/// Journal-less helper for unit tests of resume failure boundaries.
+#[cfg(test)]
+pub(crate) fn emit_resume_rebuilt_sidecars_to_raw_without_journal<F>(
+    sink: &mut dyn RawTapeSink,
+    plan: ResumeAppendPlan,
+    rebuilt_sidecars: &[ResumeRebuiltSidecar],
+    expected_tape_uuid: [u8; 16],
+    commit_sidecar: F,
+) -> Result<ResumeAppendResult, ParityError>
+where
+    F: FnMut(&SidecarTapeFile) -> Result<(), ParityError>,
+{
+    emit_resume_rebuilt_sidecars_to_raw_inner(
+        sink,
+        None,
+        plan,
+        rebuilt_sidecars,
+        expected_tape_uuid,
+        commit_sidecar,
+    )
+}
+
+fn emit_resume_rebuilt_sidecars_to_raw_inner<F>(
+    sink: &mut dyn RawTapeSink,
+    mut journal: Option<&mut dyn TapeFileJournal>,
     plan: ResumeAppendPlan,
     rebuilt_sidecars: &[ResumeRebuiltSidecar],
     expected_tape_uuid: [u8; 16],
@@ -299,6 +415,14 @@ pub fn emit_resume_rebuilt_sidecars_to_raw<F>(
 where
     F: FnMut(&SidecarTapeFile) -> Result<(), ParityError>,
 {
+    if journal
+        .as_ref()
+        .is_some_and(|journal| journal.tape_uuid() != expected_tape_uuid)
+    {
+        return Err(resume_error(
+            "journal tape UUID does not match resume sidecar tape UUID",
+        ));
+    }
     validate_rebuilt_sidecars(rebuilt_sidecars, &plan.sidecars_to_emit)?;
 
     let start_position = sink.position().map_err(|err| {
@@ -369,6 +493,14 @@ where
         durable_boundary
             .commit_tape_file(TapeFileKind::ParitySidecar, expected_tape_file_number)
             .map_err(resume_boundary_error)?;
+        if let Some(journal) = journal.as_deref_mut() {
+            journal.commit_bundle(&crate::journal::CommittedBundle {
+                kind: crate::journal::CommittedBundleKind::ResumeSidecars,
+                entries: vec![summary.tape_file_entry()],
+                highest_protected_ordinal: summary.protected_ordinal_end_exclusive,
+                total_committed_ordinals: plan.next_data_ordinal,
+            })?;
+        }
         emitted.push(summary);
     }
 
@@ -430,20 +562,15 @@ fn plan_resume_append_from_committed_prefix_with_mode(
         .ok_or_else(|| resume_error("committed prefix has no tape files"))?;
     let append_position = append_position_after_prefix(committed_prefix)?;
     let epoch_data_shards = epoch_data_shards(scheme)?;
-    let highest_before = committed_prefix.max_sidecar_end_exclusive();
     let total_ordinals = committed_prefix.total_data_ordinals();
+    let (highest_before, next_epoch_id) =
+        validate_and_measure_epoch_ranges(committed_prefix, total_ordinals, epoch_data_shards)?;
 
     if highest_before > total_ordinals {
         return Err(resume_error(format!(
             "protection watermark {highest_before} exceeds committed data ordinals {total_ordinals}"
         )));
     }
-    if highest_before < total_ordinals && highest_before % epoch_data_shards != 0 {
-        return Err(resume_error(format!(
-            "open-epoch watermark {highest_before} is not aligned to epoch size {epoch_data_shards}"
-        )));
-    }
-
     let rebuild_data_shards = total_ordinals - highest_before;
     if mode == ResumePlanningMode::V1Committed && rebuild_data_shards >= epoch_data_shards {
         return Err(resume_error(format!(
@@ -464,7 +591,9 @@ fn plan_resume_append_from_committed_prefix_with_mode(
             .checked_add(epoch_data_shards)
             .ok_or_else(|| resume_error("resume sidecar ordinal range overflows"))?;
         sidecars_to_emit.push(ResumeSidecarPlan {
-            epoch_id: start / epoch_data_shards,
+            epoch_id: next_epoch_id
+                .checked_add(offset)
+                .ok_or_else(|| resume_error("resume sidecar epoch id overflows"))?,
             protected_ordinal_start: start,
             protected_ordinal_end_exclusive: end,
         });
@@ -487,8 +616,67 @@ fn plan_resume_append_from_committed_prefix_with_mode(
         highest_protected_ordinal_after_rebuild: highest_after,
         live_epoch_start: highest_after,
         next_data_ordinal: total_ordinals,
+        next_epoch_id: next_epoch_id
+            .checked_add(full_rebuild_epochs)
+            .ok_or_else(|| resume_error("resume live epoch id overflows"))?,
         sidecars_to_emit,
     })
+}
+
+/// Validate the epoch labels and descriptor ranges carried by committed
+/// sidecars, returning `(protected_end, next_epoch_id)` for the open range.
+fn validate_and_measure_epoch_ranges(
+    committed_prefix: &FilemarkMap,
+    total_ordinals: u64,
+    epoch_data_shards: u64,
+) -> Result<(u64, u64), ParityError> {
+    let mut expected_start = 0u64;
+    let mut expected_epoch_id = 0u64;
+    for entry in committed_prefix
+        .entries()
+        .iter()
+        .filter(|entry| entry.kind == TapeFileKind::ParitySidecar)
+    {
+        let epoch_id = entry
+            .epoch_id
+            .ok_or_else(|| resume_error("sidecar is missing epoch id"))?;
+        let start = entry
+            .protected_ordinal_start
+            .ok_or_else(|| resume_error("sidecar is missing protected range start"))?;
+        let end = entry
+            .protected_ordinal_end_exclusive
+            .ok_or_else(|| resume_error("sidecar is missing protected range end"))?;
+        if epoch_id != expected_epoch_id {
+            return Err(resume_error(format!(
+                "sidecar epoch id {epoch_id} is not the expected monotonic id {expected_epoch_id}"
+            )));
+        }
+        if start != expected_start {
+            return Err(resume_error(format!(
+                "sidecar epoch {epoch_id} starts at ordinal {start}, expected contiguous start {expected_start}"
+            )));
+        }
+        if end > total_ordinals {
+            return Err(resume_error(format!(
+                "sidecar epoch {epoch_id} ends at ordinal {end}, beyond committed data ordinals {total_ordinals}"
+            )));
+        }
+        let range_len = end.checked_sub(start).ok_or_else(|| {
+            resume_error(format!(
+                "sidecar epoch {epoch_id} has descending range [{start}, {end})"
+            ))
+        })?;
+        if range_len == 0 || range_len > epoch_data_shards {
+            return Err(resume_error(format!(
+                "sidecar epoch {epoch_id} range length {range_len} is outside 1..={epoch_data_shards}"
+            )));
+        }
+        expected_start = end;
+        expected_epoch_id = expected_epoch_id
+            .checked_add(1)
+            .ok_or_else(|| resume_error("sidecar epoch id overflows"))?;
+    }
+    Ok((expected_start, expected_epoch_id))
 }
 
 fn plan_legacy_forensic_resume_append_from_committed_prefix(
@@ -589,6 +777,7 @@ struct ResumeEpochAccumulator {
     block_size: u32,
     epoch_data_shards: u64,
     expected_next_ordinal: u64,
+    current_epoch_id: u64,
     current_epoch_start: u64,
     current_epoch_data: u64,
     stripe_buffers: Vec<Vec<Vec<u8>>>,
@@ -602,13 +791,9 @@ impl ResumeEpochAccumulator {
         tape_uuid: [u8; 16],
         block_size: u32,
         first_ordinal: u64,
+        first_epoch_id: u64,
     ) -> Result<Self, ParityError> {
         let epoch_data_shards = epoch_data_shards(scheme)?;
-        if first_ordinal % epoch_data_shards != 0 {
-            return Err(resume_error(format!(
-                "resume rebuild starts at ordinal {first_ordinal}, not aligned to epoch size {epoch_data_shards}"
-            )));
-        }
         let codec = ReedSolomonCodec::new(scheme)?;
         let stripe_buffers = (0..scheme.stripes_per_neighborhood)
             .map(|_| Vec::with_capacity(codec.data_blocks()))
@@ -620,6 +805,7 @@ impl ResumeEpochAccumulator {
             block_size,
             epoch_data_shards,
             expected_next_ordinal: first_ordinal,
+            current_epoch_id: first_epoch_id,
             current_epoch_start: first_ordinal,
             current_epoch_data: 0,
             stripe_buffers,
@@ -682,7 +868,7 @@ impl ResumeEpochAccumulator {
         }
 
         let plan = ResumeSidecarPlan {
-            epoch_id: self.current_epoch_start / self.epoch_data_shards,
+            epoch_id: self.current_epoch_id,
             protected_ordinal_start: self.current_epoch_start,
             protected_ordinal_end_exclusive: self
                 .current_epoch_start
@@ -714,6 +900,10 @@ impl ResumeEpochAccumulator {
             .current_epoch_start
             .checked_add(self.epoch_data_shards)
             .ok_or_else(|| resume_error("resume rebuild epoch start overflows"))?;
+        self.current_epoch_id = self
+            .current_epoch_id
+            .checked_add(1)
+            .ok_or_else(|| resume_error("resume rebuild epoch id overflows"))?;
         self.current_epoch_data = 0;
         Ok(())
     }
@@ -725,7 +915,7 @@ impl ResumeEpochAccumulator {
             None
         } else {
             Some(ResumeLiveEpochState {
-                epoch_id: self.current_epoch_start / self.epoch_data_shards,
+                epoch_id: self.current_epoch_id,
                 protected_ordinal_start: self.current_epoch_start,
                 next_data_ordinal: self.expected_next_ordinal,
                 data_blocks_in_epoch: self.current_epoch_data,
@@ -873,7 +1063,7 @@ fn write_rebuilt_sidecar_to_raw(
         }
     }
 
-    let barrier = sink.write_filemark().map_err(|err| {
+    let barrier = sink.write_filemarks(1, false).map_err(|err| {
         resume_error(format!(
             "resume sidecar {tape_file_number} synchronous filemark failed before catalog commit: {err}"
         ))
@@ -1179,7 +1369,11 @@ mod tests {
             })
         }
 
-        fn write_filemark(&mut self) -> Result<RawWriteOutcome, ParityError> {
+        fn write_filemarks(
+            &mut self,
+            _count: u32,
+            _immed: bool,
+        ) -> Result<RawWriteOutcome, ParityError> {
             self.events.borrow_mut().push(RawSinkEvent::WriteFilemark);
             let filemark_index = self.filemark_writes;
             let hit_ew = self.ew_on_filemark == Some(filemark_index);
@@ -1251,6 +1445,7 @@ mod tests {
                 ],
                 highest_protected_ordinal: 4,
                 total_committed_ordinals: 7,
+                orphaned_bundles: Vec::new(),
             },
         };
         let plan = plan_resume_append_from_journal(&ok_journal, &rebuild_scheme())
@@ -1269,11 +1464,34 @@ mod tests {
                 ],
                 highest_protected_ordinal: 0,
                 total_committed_ordinals: 4,
+                orphaned_bundles: Vec::new(),
             },
         };
         let err = plan_resume_append_from_journal(&bad_journal, &rebuild_scheme())
             .expect_err("journal with a full unprotected epoch is rejected");
         assert!(matches!(err, ParityError::ResumeAppend(_)));
+    }
+
+    #[test]
+    fn plan_resume_rejects_sidecar_range_larger_than_scheme_epoch() {
+        let map = FilemarkMap::new(vec![
+            TapeFileMapEntry::bootstrap(0, 1),
+            TapeFileMapEntry::object(1, 5, 0),
+            TapeFileMapEntry::parity_sidecar(2, 1, 0, 0, 5),
+        ])
+        .expect("structural map accepts scheme-independent range metadata");
+
+        let err = plan_resume_append_from_committed_prefix(&map, &rebuild_scheme())
+            .expect_err("scheme-aware resume rejects a sidecar wider than S*k");
+        match err {
+            ParityError::ResumeAppend(message) => {
+                assert!(
+                    message.contains("range length 5 is outside 1..=4"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected resume-append error, got {other:?}"),
+        }
     }
 
     fn block_for_ordinal(ordinal: u64) -> Vec<u8> {
@@ -1539,8 +1757,8 @@ mod tests {
     fn open_epoch_rebuild_accepts_fully_protected_partial_final_sidecar() {
         let map = FilemarkMap::new(vec![
             TapeFileMapEntry::bootstrap(0, 1),
-            TapeFileMapEntry::object(1, 5, 0),
-            TapeFileMapEntry::parity_sidecar(2, 1, 0, 0, 5),
+            TapeFileMapEntry::object(1, 3, 0),
+            TapeFileMapEntry::parity_sidecar(2, 1, 0, 0, 3),
         ])
         .expect("map validates");
         let mut raw = RecordingResumeRawSource::default();
@@ -1554,15 +1772,15 @@ mod tests {
         )
         .expect("nothing to reread");
 
-        assert_eq!(rebuild.plan.highest_protected_ordinal_before_rebuild, 5);
-        assert_eq!(rebuild.plan.next_data_ordinal, 5);
+        assert_eq!(rebuild.plan.highest_protected_ordinal_before_rebuild, 3);
+        assert_eq!(rebuild.plan.next_data_ordinal, 3);
         assert!(rebuild.rebuilt_sidecars.is_empty());
         assert!(rebuild.live_epoch.is_none());
         assert_eq!(
             raw.calls,
             vec![
                 RawCall::Configure(RESUME_TEST_BLOCK_SIZE),
-                RawCall::Locate(10),
+                RawCall::Locate(8),
             ]
         );
     }
@@ -1604,7 +1822,7 @@ mod tests {
         let mut raw_sink = RecordingResumeRawSink::at_position(rebuild.plan.append_position);
         let events = raw_sink.events();
 
-        let result = emit_resume_rebuilt_sidecars_to_raw(
+        let result = emit_resume_rebuilt_sidecars_to_raw_without_journal(
             &mut raw_sink,
             rebuild.plan.clone(),
             &rebuild.rebuilt_sidecars,
@@ -1659,7 +1877,7 @@ mod tests {
             .with_early_warning_on_filemark();
         let events = raw_sink.events();
 
-        let result = emit_resume_rebuilt_sidecars_to_raw(
+        let result = emit_resume_rebuilt_sidecars_to_raw_without_journal(
             &mut raw_sink,
             rebuild.plan.clone(),
             &rebuild.rebuilt_sidecars,
@@ -1708,7 +1926,7 @@ mod tests {
         let mut raw_sink = RecordingResumeRawSink::at_position(rebuild.plan.append_position);
         let events = raw_sink.events();
 
-        let err = emit_resume_rebuilt_sidecars_to_raw(
+        let err = emit_resume_rebuilt_sidecars_to_raw_without_journal(
             &mut raw_sink,
             rebuild.plan.clone(),
             &rebuild.rebuilt_sidecars,
@@ -1774,7 +1992,7 @@ mod tests {
         let events = raw_sink.events();
         let mut commit_attempts = Vec::new();
 
-        let err = emit_resume_rebuilt_sidecars_to_raw(
+        let err = emit_resume_rebuilt_sidecars_to_raw_without_journal(
             &mut raw_sink,
             rebuild.plan,
             &rebuild.rebuilt_sidecars,
@@ -1864,7 +2082,7 @@ mod tests {
             .with_early_warning_on_filemark_index(1);
         let events = raw_sink.events();
 
-        let err = emit_resume_rebuilt_sidecars_to_raw(
+        let err = emit_resume_rebuilt_sidecars_to_raw_without_journal(
             &mut raw_sink,
             rebuild.plan,
             &rebuild.rebuilt_sidecars,
@@ -1960,7 +2178,7 @@ mod tests {
             .with_early_warning_on_filemark_index(1);
         let events = raw_sink.events();
 
-        let result = emit_resume_rebuilt_sidecars_to_raw(
+        let result = emit_resume_rebuilt_sidecars_to_raw_without_journal(
             &mut raw_sink,
             rebuild.plan.clone(),
             &rebuild.rebuilt_sidecars,
@@ -2051,7 +2269,7 @@ mod tests {
             .with_early_warning_on_block(second_sidecar_first_block);
         let events = raw_sink.events();
 
-        let result = emit_resume_rebuilt_sidecars_to_raw(
+        let result = emit_resume_rebuilt_sidecars_to_raw_without_journal(
             &mut raw_sink,
             rebuild.plan.clone(),
             &rebuild.rebuilt_sidecars,
@@ -2132,7 +2350,7 @@ mod tests {
             .with_eom_on_block(1);
         let events = raw_sink.events();
 
-        let err = emit_resume_rebuilt_sidecars_to_raw(
+        let err = emit_resume_rebuilt_sidecars_to_raw_without_journal(
             &mut raw_sink,
             rebuild.plan,
             &rebuild.rebuilt_sidecars,
@@ -2187,7 +2405,7 @@ mod tests {
             .with_eom_on_filemark();
         let events = raw_sink.events();
 
-        let err = emit_resume_rebuilt_sidecars_to_raw(
+        let err = emit_resume_rebuilt_sidecars_to_raw_without_journal(
             &mut raw_sink,
             rebuild.plan,
             &rebuild.rebuilt_sidecars,
@@ -2256,7 +2474,7 @@ mod tests {
             .with_eom_on_filemark_index(1);
         let events = raw_sink.events();
 
-        let err = emit_resume_rebuilt_sidecars_to_raw(
+        let err = emit_resume_rebuilt_sidecars_to_raw_without_journal(
             &mut raw_sink,
             rebuild.plan,
             &rebuild.rebuilt_sidecars,
@@ -2343,7 +2561,7 @@ mod tests {
             .with_eom_on_block(second_sidecar_first_block + 1);
         let events = raw_sink.events();
 
-        let err = emit_resume_rebuilt_sidecars_to_raw(
+        let err = emit_resume_rebuilt_sidecars_to_raw_without_journal(
             &mut raw_sink,
             rebuild.plan,
             &rebuild.rebuilt_sidecars,
@@ -2415,7 +2633,7 @@ mod tests {
             .with_wrong_position_on_call(3);
         let events = raw_sink.events();
 
-        let err = emit_resume_rebuilt_sidecars_to_raw(
+        let err = emit_resume_rebuilt_sidecars_to_raw_without_journal(
             &mut raw_sink,
             rebuild.plan,
             &rebuild.rebuilt_sidecars,
@@ -2470,7 +2688,7 @@ mod tests {
             RecordingResumeRawSink::at_position(rebuild.plan.append_position).with_eom_on_block(0);
         let events = raw_sink.events();
 
-        let err = emit_resume_rebuilt_sidecars_to_raw(
+        let err = emit_resume_rebuilt_sidecars_to_raw_without_journal(
             &mut raw_sink,
             rebuild.plan,
             &rebuild.rebuilt_sidecars,
@@ -2520,7 +2738,7 @@ mod tests {
             .with_eom_on_filemark();
         let events = raw_sink.events();
 
-        let err = emit_resume_rebuilt_sidecars_to_raw(
+        let err = emit_resume_rebuilt_sidecars_to_raw_without_journal(
             &mut raw_sink,
             rebuild.plan,
             &rebuild.rebuilt_sidecars,
@@ -2572,7 +2790,7 @@ mod tests {
         let mut raw_sink = RecordingResumeRawSink::at_position(rebuild.plan.append_position);
         let events = raw_sink.events();
 
-        let err = emit_resume_rebuilt_sidecars_to_raw(
+        let err = emit_resume_rebuilt_sidecars_to_raw_without_journal(
             &mut raw_sink,
             rebuild.plan,
             &rebuild.rebuilt_sidecars,
@@ -2618,7 +2836,7 @@ mod tests {
         let mut raw_sink = RecordingResumeRawSink::at_position(rebuild.plan.append_position);
         let events = raw_sink.events();
 
-        let err = emit_resume_rebuilt_sidecars_to_raw(
+        let err = emit_resume_rebuilt_sidecars_to_raw_without_journal(
             &mut raw_sink,
             rebuild.plan,
             &rebuild.rebuilt_sidecars,
@@ -2657,7 +2875,7 @@ mod tests {
         let mut raw_sink = RecordingResumeRawSink::at_position(rebuild.plan.append_position);
         let events = raw_sink.events();
 
-        let err = emit_resume_rebuilt_sidecars_to_raw(
+        let err = emit_resume_rebuilt_sidecars_to_raw_without_journal(
             &mut raw_sink,
             rebuild.plan,
             &rebuild.rebuilt_sidecars,

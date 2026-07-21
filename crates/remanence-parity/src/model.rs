@@ -6,7 +6,7 @@
 //!
 //! See `docs/layer3c-design.md` for the active v0.4.4 sidecar-only design.
 
-use std::borrow::Cow;
+use serde::{Deserialize, Serialize};
 
 /// Stable identifier for a parity scheme. Format:
 /// `"rs-cauchy-gf256-v1"` for the initial scheme. Once a tape is
@@ -14,21 +14,22 @@ use std::borrow::Cow;
 /// scheme IDs are forever. Algorithm or parameter-range changes
 /// get a new ID; the old scheme stays registered as long as any
 /// tape uses it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct SchemeId(Cow<'static, str>);
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct SchemeId(String);
 
 impl SchemeId {
     /// Construct an ID from a `&'static str` literal (no
     /// allocation). For built-in schemes.
     pub fn new_static(id: &'static str) -> Self {
-        Self(Cow::Borrowed(id))
+        Self(id.to_string())
     }
 
     /// Construct an ID from an owned string. Used when reading
     /// a bootstrap whose scheme ID isn't one of the in-tree
     /// constants.
     pub fn new_owned(id: String) -> Self {
-        Self(Cow::Owned(id))
+        Self(id)
     }
 
     /// The wire-format string. Stable on tape forever.
@@ -45,7 +46,7 @@ impl std::fmt::Display for SchemeId {
 
 /// Parity scheme — the configuration the writer uses and the
 /// bootstrap records on tape.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ParityScheme {
     /// Scheme identifier (see [`SchemeId`]).
     pub id: SchemeId,

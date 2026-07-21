@@ -170,9 +170,8 @@ pub trait RawTapeSource {
 /// This trait is intentionally below the body-facing
 /// [`BlockSink`] surface: Layer 3c owns
 /// physical object, sidecar, bootstrap, and filemark emission. In particular,
-/// [`Self::write_filemark`] is the synchronous durability barrier required by
-/// `docs/layer3c-design.md` §7.7 before Layer 5 may commit a catalog row for
-/// the just-written tape file.
+/// [`Self::write_filemarks`] carries both advisory delimiters and synchronous
+/// zero-count durability barriers.
 ///
 /// Implementations must preserve completion-unknown failures from the tape
 /// transport as `ParityError::TapeIo(TapeIoError::Transport(_))`. Do not wrap
@@ -188,12 +187,12 @@ pub trait RawTapeSink {
     /// alternate variable-block write path.
     fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError>;
 
-    /// Write one filemark as a synchronous durability barrier.
+    /// Issue WRITE FILEMARKS with the supplied count and IMMED bit.
     ///
-    /// Production adapters must use WRITE FILEMARKS with IMMED clear (or the
-    /// equivalent flushing OS operation), so success means all preceding fixed
-    /// blocks of the tape file and the trailing filemark reached the medium.
-    fn write_filemark(&mut self) -> Result<RawWriteOutcome, ParityError>;
+    /// Object/control delimiters use `(1, true)`. A checkpoint barrier uses
+    /// `(0, false)`, whose successful completion proves all preceding writes
+    /// reached the medium without adding another tape-file boundary.
+    fn write_filemarks(&mut self, count: u32, immed: bool) -> Result<RawWriteOutcome, ParityError>;
 
     /// Return the current physical tape position.
     fn position(&mut self) -> Result<PhysicalPositionHint, ParityError>;
@@ -221,8 +220,17 @@ impl RawTapeSink for BlockSinkRawTapeSink<'_> {
         Ok(raw_block_outcome(self.inner.write_block(buf)?))
     }
 
-    fn write_filemark(&mut self) -> Result<RawWriteOutcome, ParityError> {
-        Ok(raw_filemark_outcome(self.inner.write_filemarks(1)?))
+    fn write_filemarks(&mut self, count: u32, immed: bool) -> Result<RawWriteOutcome, ParityError> {
+        if immed {
+            self.inner.write_filemarks_immediate(count)?;
+            Ok(RawWriteOutcome::WroteFilemark {
+                position_after: self.inner.position()?.into(),
+                early_warning: false,
+                end_of_medium: false,
+            })
+        } else {
+            Ok(raw_filemark_outcome(self.inner.write_filemarks(count)?))
+        }
     }
 
     fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
@@ -431,8 +439,25 @@ impl RawTapeSink for DriveHandleRawSink<'_> {
         Ok(raw_unpositioned_block_outcome(outcome, position_after))
     }
 
-    fn write_filemark(&mut self) -> Result<RawWriteOutcome, ParityError> {
-        let outcome = raw_filemark_outcome(self.drive.write_filemarks(1)?);
+    fn write_filemarks(&mut self, count: u32, immed: bool) -> Result<RawWriteOutcome, ParityError> {
+        let outcome = if immed {
+            let position_before = self.current_or_seed_position()?;
+            self.drive.write_filemarks_immediate(count)?;
+            RawWriteOutcome::WroteFilemark {
+                position_after: PhysicalPositionHint {
+                    lba: position_before.lba.checked_add(u64::from(count)).ok_or(
+                        ParityError::Invariant(
+                            "raw sink physical position overflow after immediate filemarks",
+                        ),
+                    )?,
+                    partition: position_before.partition,
+                },
+                early_warning: false,
+                end_of_medium: false,
+            }
+        } else {
+            raw_filemark_outcome(self.drive.write_filemarks(count)?)
+        };
         self.cursor_hint = Some(outcome.position_after());
         Ok(outcome)
     }
@@ -609,7 +634,7 @@ mod compat_tests {
             let block_outcome = raw
                 .write_fixed_block(&[0xAB; 4])
                 .expect("block write succeeds");
-            let filemark_outcome = raw.write_filemark().expect("filemark succeeds");
+            let filemark_outcome = raw.write_filemarks(1, false).expect("filemark succeeds");
             let position = raw.position().expect("position succeeds");
             (block_outcome, filemark_outcome, position)
         };
@@ -920,7 +945,8 @@ mod compat_tests {
         let outcome = {
             let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
             let mut raw = DriveHandleRawSink::new(&mut drive);
-            raw.write_filemark().expect("raw sync filemark succeeds")
+            raw.write_filemarks(1, false)
+                .expect("raw sync filemark succeeds")
         };
 
         assert_eq!(outcome.position_after(), PhysicalPositionHint::new(7_000));
@@ -1075,7 +1101,11 @@ mod compat_tests {
             })
         }
 
-        fn write_filemark(&mut self) -> Result<RawWriteOutcome, ParityError> {
+        fn write_filemarks(
+            &mut self,
+            _count: u32,
+            _immed: bool,
+        ) -> Result<RawWriteOutcome, ParityError> {
             if !self.pending_file_started {
                 return Err(ParityError::Invariant(
                     "filemark barrier requested before a tape file was written",
@@ -1110,7 +1140,7 @@ mod compat_tests {
             other => panic!("expected invariant error, got {other:?}"),
         }
 
-        let barrier = raw.write_filemark().expect("sync filemark");
+        let barrier = raw.write_filemarks(1, false).expect("sync filemark");
         assert_eq!(barrier.position_after(), PhysicalPositionHint::new(2));
         let committed = raw
             .commit_catalog_row()

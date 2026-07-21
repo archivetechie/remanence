@@ -66,6 +66,15 @@ Parity-protected writes require LTO hardware compression disabled on the
 drive; compression would decouple logical block counts from physical
 media, and the stripe geometry is physical.
 
+Checkpoint barriers close the current epoch even when it is short. On a
+parity pool, a batch-of-one workload therefore pays for one short-epoch
+sidecar (up to `m` parity shards per populated stripe), one checkpoint
+edition block, and their filemarks for every object. Its directory grows at
+roughly two rows per object and reaches the inline ceiling about twice as
+soon as a well-batched workload. Heavy sync callers should batch; admission
+reserves worst-case directory and stop headroom, so reaching the ceiling
+seals and rolls placement at a checkpoint instead of failing an open batch.
+
 <!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-format/src/layout.rs crates/remanence-format/src/writer.rs @ 7fb10f8 -->
 ## The stored object: rao-v1
 

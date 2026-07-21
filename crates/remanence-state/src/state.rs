@@ -306,6 +306,13 @@ impl StateHandle {
                 path.display()
             ))
         })?;
+        if !state.orphaned_bundles.is_empty() {
+            tracing::warn!(
+                tape_uuid = %uuid::Uuid::from_bytes(tape_uuid),
+                orphaned_bundle_count = state.orphaned_bundles.len(),
+                "ignored sink-journal bundles beyond the last checkpoint watermark"
+            );
+        }
         let journal_offset_bytes = fs::metadata(&path)
             .map_err(|err| StateError::io_at("stat ingested journal", &path, err))?
             .len();
@@ -368,6 +375,13 @@ impl StateHandle {
                     path.display()
                 ))
             })?;
+            if !state.orphaned_bundles.is_empty() {
+                tracing::warn!(
+                    tape_uuid = %uuid::Uuid::from_bytes(input.tape_uuid),
+                    orphaned_bundle_count = state.orphaned_bundles.len(),
+                    "ignored sink-journal bundles beyond the last checkpoint watermark during rebuild"
+                );
+            }
             inputs.push(RebuildTapeJournalInput { input, state });
         }
         Ok(inputs)

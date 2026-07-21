@@ -189,8 +189,9 @@ A single implementation may fill several roles.
   tape file (Section 4).
 - **Stripe**: one Reed–Solomon codeword: `k` data shards plus `m` parity
   shards, each shard one full block.
-- **Epoch**: one parity protection unit of `S × k` data ordinals; epoch id
-  `= ordinal / (S × k)`.
+- **Epoch**: one parity protection unit covering a non-empty explicit,
+  half-open range of at most `S × k` data ordinals. Epoch ids are bare
+  monotonic counters; they do not encode an ordinal or range.
 - **Shard**: one block in its role as a stripe member (data or parity).
 - **`ParityDataOrdinal` (ordinal)**: the dense index of an object data block
   in the tape's protection stream (Section 3.2).
@@ -202,8 +203,8 @@ A single implementation may fill several roles.
   tape file (Section 7).
 - **Sidecar epoch directory**: the per-epoch repair root listing every
   sidecar's location, range, layout counts, and metadata hash (Section 10).
-- **Implicit zero**: a data position of a final partial epoch beyond the
-  real data — an all-zero shard that is never written to tape
+- **Implicit zero**: a logical data position beyond a short epoch's real
+  data — an all-zero shard that is never written to tape
   (Section 6.4).
 
 ### 2.4. Integer, Byte, and Text Conventions
@@ -287,16 +288,17 @@ damage.
 
 ### 3.3. Ordinal-to-Stripe Mapping
 
-For scheme `(k, m, S)` (Section 6.6), with `E = S × k` data ordinals per
-epoch, ordinal `o` maps to a stripe position as:
+For scheme `(k, m, S)` (Section 6.6), locate the unique sidecar descriptor
+whose explicit range `[start, end)` contains ordinal `o`. Let `E = S × k`
+and `d = o − start`; then:
 
 ```text
-epoch       = o / E
-o_in_epoch  = o mod E
-stripe      = o_in_epoch mod S        (the stripe index varies fastest)
-data_index  = o_in_epoch / S          (0 ≤ data_index < k)
+epoch       = descriptor.epoch_id
+o_in_epoch  = d
+stripe      = d mod S                  (the stripe index varies fastest)
+data_index  = d / S                    (0 ≤ data_index < k)
 
-inverse:  o = epoch·E + data_index·S + stripe
+inverse:  o = start + data_index·S + stripe
 ```
 
 The interleave is essential: `N ≤ S` physically consecutive data blocks
@@ -525,7 +527,7 @@ buffering an epoch (Section 11.2).
 
 ### 6.4. Implicit Zeros
 
-In a final partial epoch, data positions beyond the real data are all-zero
+In a short epoch, logical data positions beyond the real data are all-zero
 shards that are *never written to tape* and never accumulated (an all-zero
 shard contributes nothing to any parity accumulator). The sidecar's
 `real_data_shard_count` versus `logical_shard_count = S × k` tells readers
@@ -794,6 +796,12 @@ checkpoint or `finish()` time is nonconformant. A future minor version MAY
 define an external carrier through an unknown bootstrap key, but readers MUST
 NOT infer such a carrier in version 1.0.
 
+A Writer that reaches this directory ceiling MUST seal at the last durable
+checkpoint boundary and direct subsequent placement to another tape. It MUST
+reserve worst-case row and checkpoint-stop headroom when opening a batch, so
+the ceiling is an admission refusal between batches and never strands an open
+batch after object bytes have moved.
+
 ### 8.3. Placement (Writer)
 
 Two bootstraps are mandatory: sequence 0 at BOT (tape file 0), and a final
@@ -922,10 +930,14 @@ size for sidecars is 0xC0.
 | bs−8 | 8 | block0_crc64 | CRC-64/XZ over bytes 0..block_size−8 |
 
 An epoch protects the half-open ordinal range
-`[protected_ordinal_start, protected_ordinal_end_exclusive)`;
-`protected_ordinal_start` MUST equal `epoch_id × S × k`. For a full epoch
-`real_data_shard_count = S × k`; a smaller value marks the final partial
-epoch, whose missing positions are implicit zeros (Section 6.4).
+`[protected_ordinal_start, protected_ordinal_end_exclusive)`. The first
+epoch starts at ordinal 0; subsequent epoch ranges MUST be contiguous, with
+each start equal to the preceding end. Epoch ids MUST increase by one but
+carry no range arithmetic. `real_data_shard_count` MUST equal
+`protected_ordinal_end_exclusive − protected_ordinal_start`, MUST be in
+`1..=S × k`, and a value below `S × k` marks a short epoch whose missing
+logical positions are implicit zeros (Section 6.4). Short epochs are legal
+at any checkpoint boundary, including mid-tape.
 
 ### 9.3. The Index Entry Stream
 
@@ -1129,8 +1141,11 @@ Each entry:
  9: uint flags}
 ```
 
-Flags: 0x01 = final-partial-epoch; 0x02 = primary-copy-known-good; 0x04 =
-tail-copy-known-good. Unknown flag bits MUST be rejected. Invariants (a
+Flags: 0x01 = `FINAL_PARTIAL_EPOCH`; 0x02 = primary-copy-known-good; 0x04 =
+tail-copy-known-good. `FINAL_PARTIAL_EPOCH` MUST appear only on the short
+epoch emitted by terminal `finish()`; checkpoint-short epochs MUST leave it
+clear. Readers MUST NOT treat an unflagged short epoch as invalid or as an
+unfinished tape. Unknown flag bits MUST be rejected. Invariants (a
 decoder MUST validate all of them on every decode): entries strictly ascending by
 `tape_file_number`, each `< scope_tape_file_count`; non-empty ordinal
 ranges; non-zero block counts; `max(protected_ordinal_end_exclusive)` over
@@ -1210,13 +1225,18 @@ holds `S × m` block-sized accumulators and one CRC per pending data block —
 bounded memory regardless of object sizes. At `S × k` data blocks the epoch
 closes into a **pending** sidecar held in memory or spool; no tape I/O
 occurs mid-object. Pending sidecars are emitted as tape files when the
-current object closes. The final partial epoch, if any, is closed at
-`finish()` with implicit-zero positions (Section 6.4) and **no padding
-blocks written to tape**.
+current object closes. A checkpoint barrier also closes a non-empty short
+epoch, emits its sidecar without `FINAL_PARTIAL_EPOCH`, then writes the
+non-final checkpoint edition. `finish()` performs the same funnel with a
+terminal reason: its short epoch, if any, carries `FINAL_PARTIAL_EPOCH`, and
+the following bootstrap is final. Implicit-zero positions never cause
+padding blocks to be written (Section 6.4).
 
 After each object's close-and-emit bundle, unprotected ordinals MUST number
 fewer than `S × k` — the version-1 bounded-restart rule: at most one open
-epoch ever needs rebuilding (Section 14 step 2).
+epoch ever needs rebuilding (Section 14 step 2). A checkpoint leaves no open
+epoch, so the next epoch starts at the checkpoint's protected end with the
+next monotonic epoch id; checkpoint cadence is independent of `S × k`.
 
 ### 11.3. checkpoint() and finish()
 
@@ -1424,13 +1444,14 @@ the last object, and not at the watermark.
 1. Derive the committed prefix from the off-tape commit records, dropping
    any torn tail, and compute `W` and `T` from it.
 2. Enforce the version-1 bound: `T − W < S × k` (at most one open epoch).
-   `W` MUST be epoch-aligned; `W ≤ T`; and the prefix's final object entry
+   `W ≤ T`; committed sidecar ranges MUST be contiguous from zero through
+   `W`; epoch ids MUST be consecutive; and the prefix's final object entry
    MUST end exactly at `T`. A violation is `ResumeAppend`.
 3. Rebuild the open epoch by **re-reading ordinals `[W, T)` from the
    committed prefix on tape** — a boundary or short read where data is
    expected is fatal — recomputing per-block CRCs and re-accumulating
-   parity. (Under the step-2 bound, `[W, T)` lies strictly inside one
-   epoch; a committed prefix never contains a complete unprotected epoch,
+   parity. (Under the step-2 bound, `[W, T)` is the next open epoch range;
+   a committed prefix never contains a complete unprotected epoch,
    because an object and the sidecars emitted at its close commit as one
    bundle — Section 11.1.)
 4. Write any rebuilt sidecar with the full Section 11.1 cycle, plus one
@@ -1709,10 +1730,11 @@ At the default scheme (k = 128, m = 4, S = 512) with 256 KiB blocks:
   `m = 4` times (Section 3.3).
 - Writer memory: `S × m` accumulators = 512 MiB plus per-block CRCs.
 
-Mapping ordinal `o = 100,000`: `epoch = 100000 / 65536 = 1`;
-`o_in_epoch = 34,464`; `stripe = 34464 mod 512 = 160`;
+Mapping ordinal `o = 100,000` with a covering epoch descriptor
+`epoch_id = 1, range = [65,536, 131,072)`: `o_in_epoch = 34,464`;
+`stripe = 34464 mod 512 = 160`;
 `data_index = 34464 / 512 = 67`. Inverse check:
-`1×65536 + 67×512 + 160 = 100,000`. ✓
+`65,536 + 67×512 + 160 = 100,000`. ✓
 
 ### A.2. Sidecar Index Layout at the Default Geometry
 
@@ -1803,7 +1825,7 @@ and lose data at a fraction of the tolerance.
 
 ### B.3. Implicit zeros instead of padding blocks
 
-A final partial epoch is closed by *declaring* the missing positions
+A short epoch is closed by *declaring* the missing logical positions
 all-zero rather than writing padding blocks. Tape capacity is never spent
 on filler; the sidecar's `real_data_shard_count` tells readers which
 positions are implicit; and the parity arithmetic is unaffected because
@@ -1864,7 +1886,7 @@ need no registered magics with this layer.
 ### B.10. At most one open epoch
 
 The bounded-restart rule (Section 11.2) caps unprotected ordinals below
-`S × k` at every object boundary, so a Resumer rebuilds at most one epoch
+`S × k` at every object boundary, so a Resumer rebuilds at most one open epoch
 by re-reading at most `S × k − 1` blocks (16 GiB at the default geometry).
 Without it, resume cost would grow with the number of epochs left open —
 unbounded re-read of a tape that was supposedly fine.
@@ -1878,6 +1900,14 @@ the tail copy findable without trusting block arithmetic; and the epoch
 directory makes it findable even with the footer gone (Section 13.3). The
 canonical metadata hash is copy-independent, so any surviving copy is
 verifiable against any directory entry.
+
+### B.12. The reference off-tape journal is not a media format
+
+The reference implementation's internal tape-file journal is version 3.
+Version 3 adds a `checkpointed_through` watermark record so replay can
+discard physically written but uncheckpointed orphan bundles and truncate
+them before append. This journal version is deliberately not recorded on
+tape and does not change any REM-PARITY media byte.
 
 ## Appendix C. Open Items Before Freeze (Informative)
 

@@ -44,6 +44,83 @@ pub fn ordinal_to_stripe(
     })
 }
 
+/// Map an ordinal through an explicitly ranged parity epoch.
+///
+/// Epoch identifiers are monotonic labels, not ordinal arithmetic. Callers
+/// must first select the sidecar whose descriptor range contains `ordinal`,
+/// then pass that descriptor's epoch id, start, and real data-shard count here.
+pub fn ordinal_to_stripe_in_epoch(
+    ordinal: u64,
+    epoch_id: u64,
+    protected_ordinal_start: u64,
+    real_data_shard_count: u64,
+    scheme: &ParityScheme,
+) -> Result<StripeAddress, ParityError> {
+    let logical_data_shards = data_shards_per_epoch(scheme)?;
+    if real_data_shard_count == 0 || real_data_shard_count > logical_data_shards {
+        return Err(ParityError::Invariant(
+            "explicit epoch real data-shard count is outside 1..=S*k",
+        ));
+    }
+    let ordinal_in_epoch =
+        ordinal
+            .checked_sub(protected_ordinal_start)
+            .ok_or(ParityError::Invariant(
+                "ordinal precedes explicit epoch protected range",
+            ))?;
+    if ordinal_in_epoch >= real_data_shard_count {
+        return Err(ParityError::Invariant(
+            "ordinal lies outside explicit epoch protected range",
+        ));
+    }
+    let stripes = u64::from(scheme.stripes_per_neighborhood);
+
+    Ok(StripeAddress {
+        neighborhood: epoch_id,
+        stripe_index: (ordinal_in_epoch % stripes) as u32,
+        position: StripePosition::Data {
+            index: (ordinal_in_epoch / stripes) as u16,
+        },
+    })
+}
+
+/// Map epoch-local data coordinates back to an ordinal using the descriptor
+/// range start rather than deriving the start from the epoch id.
+///
+/// The returned ordinal can be beyond the descriptor's real shard count; that
+/// coordinate represents an implicit zero in a short epoch. Callers compare it
+/// with the descriptor end before attempting an object-data read.
+pub fn stripe_data_to_ordinal_in_epoch(
+    addr: &StripeAddress,
+    protected_ordinal_start: u64,
+    scheme: &ParityScheme,
+) -> Result<u64, ParityError> {
+    let stripes = u64::from(scheme.stripes_per_neighborhood);
+    if u64::from(addr.stripe_index) >= stripes {
+        return Err(ParityError::Invariant("stripe_index outside scheme"));
+    }
+    let data_index = match addr.position {
+        StripePosition::Data { index } => {
+            if index >= scheme.data_blocks_per_stripe {
+                return Err(ParityError::Invariant("data index outside scheme"));
+            }
+            u64::from(index)
+        }
+        StripePosition::Parity { .. } => {
+            return Err(ParityError::Invariant("parity shard has no data ordinal"));
+        }
+    };
+
+    protected_ordinal_start
+        .checked_add(
+            data_index
+                .checked_mul(stripes)
+                .and_then(|offset| offset.checked_add(u64::from(addr.stripe_index)))
+                .ok_or(ParityError::Invariant("epoch-local data offset overflows"))?,
+        )
+        .ok_or(ParityError::Invariant("data ordinal overflows"))
+}
+
 /// Reverse [`ordinal_to_stripe`] for a data shard.
 ///
 /// Parity shards are intentionally rejected because they are addressed inside

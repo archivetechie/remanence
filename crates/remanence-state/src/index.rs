@@ -2806,7 +2806,7 @@ impl CatalogIndex {
         Ok(report)
     }
 
-    /// Atomically replay or project every parity-off object in one checkpoint.
+    /// Atomically replay or project every object in one checkpoint.
     ///
     /// A fully projected record is idempotent. A partially projected record is
     /// corruption: checkpoint visibility must never become object-by-object.
@@ -2818,6 +2818,11 @@ impl CatalogIndex {
         if projections.is_empty() {
             return Err(StateError::IndexCorrupt(
                 "checkpoint record has no object projections".to_string(),
+            ));
+        }
+        if record.scheme.is_some() && record.object_tape_file_bundles.len() != projections.len() {
+            return Err(StateError::IndexCorrupt(
+                "parity checkpoint bundle count does not match object projection count".to_string(),
             ));
         }
         let tape_uuid = projections[0].copy.tape_uuid;
@@ -2928,21 +2933,38 @@ impl CatalogIndex {
             .conn
             .transaction()
             .map_err(|err| sqlite_error("begin checkpoint batch projection", err))?;
-        for projection in projections {
+        for (projection_index, projection) in projections.iter().enumerate() {
             let tape_input = TapeJournalIndexInput {
                 tape_uuid: projection.copy.tape_uuid,
                 block_size: projection.block_size,
-                scheme: None,
+                scheme: record.scheme.clone(),
                 journal_offset_bytes: 0,
             };
-            let mut entries = Vec::with_capacity(if projection.fresh_tape { 2 } else { 1 });
-            if projection.fresh_tape {
+            let bundle = if record.scheme.is_some() {
+                record.object_tape_file_bundles[projection_index].clone()
+            } else {
+                let mut entries = Vec::with_capacity(if projection.fresh_tape { 2 } else { 1 });
+                if projection.fresh_tape {
+                    entries.push(TapeFileEntry {
+                        tape_file_number: 0,
+                        kind: TapeFileKind::Bootstrap,
+                        block_count: 1,
+                        physical_start_hint: None,
+                        object_id: None,
+                        first_parity_data_ordinal: None,
+                        epoch_id: None,
+                        protected_ordinal_start: None,
+                        protected_ordinal_end_exclusive: None,
+                        canonical_metadata_hash: None,
+                        bootstrap_object_row: None,
+                    });
+                }
                 entries.push(TapeFileEntry {
-                    tape_file_number: 0,
-                    kind: TapeFileKind::Bootstrap,
-                    block_count: 1,
+                    tape_file_number: projection.copy.tape_file_number,
+                    kind: TapeFileKind::Object,
+                    block_count: projection.block_count,
                     physical_start_hint: None,
-                    object_id: None,
+                    object_id: Some(projection.object.object_id.clone()),
                     first_parity_data_ordinal: None,
                     epoch_id: None,
                     protected_ordinal_start: None,
@@ -2950,25 +2972,12 @@ impl CatalogIndex {
                     canonical_metadata_hash: None,
                     bootstrap_object_row: None,
                 });
-            }
-            entries.push(TapeFileEntry {
-                tape_file_number: projection.copy.tape_file_number,
-                kind: TapeFileKind::Object,
-                block_count: projection.block_count,
-                physical_start_hint: None,
-                object_id: Some(projection.object.object_id.clone()),
-                first_parity_data_ordinal: None,
-                epoch_id: None,
-                protected_ordinal_start: None,
-                protected_ordinal_end_exclusive: None,
-                canonical_metadata_hash: None,
-                bootstrap_object_row: None,
-            });
-            let bundle = CommittedBundle {
-                kind: CommittedBundleKind::Object,
-                entries,
-                highest_protected_ordinal: 0,
-                total_committed_ordinals: projection.total_committed_ordinals,
+                CommittedBundle {
+                    kind: CommittedBundleKind::Object,
+                    entries,
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals: projection.total_committed_ordinals,
+                }
             };
             validate_append_bundle_extension_tx(&tx, &tape_input, &bundle)?;
             validate_append_object_conflicts_tx(
@@ -3003,26 +3012,36 @@ impl CatalogIndex {
         let tape_input = TapeJournalIndexInput {
             tape_uuid: record.tape_uuid,
             block_size: record.block_size,
-            scheme: None,
+            scheme: record.scheme.clone(),
             journal_offset_bytes: 0,
         };
-        let bootstrap_bundle = CommittedBundle {
-            kind: CommittedBundleKind::Control,
-            entries: vec![TapeFileEntry {
-                tape_file_number: record.checkpoint_tape_file_number,
-                kind: TapeFileKind::Bootstrap,
-                block_count: 1,
-                physical_start_hint: None,
-                object_id: None,
-                first_parity_data_ordinal: None,
-                epoch_id: None,
-                protected_ordinal_start: None,
-                protected_ordinal_end_exclusive: None,
-                canonical_metadata_hash: None,
-                bootstrap_object_row: None,
-            }],
-            highest_protected_ordinal: 0,
-            total_committed_ordinals,
+        let bootstrap_bundle =
+            record
+                .checkpoint_bundle
+                .clone()
+                .unwrap_or_else(|| CommittedBundle {
+                    kind: CommittedBundleKind::Control,
+                    entries: vec![TapeFileEntry {
+                        tape_file_number: record.checkpoint_tape_file_number,
+                        kind: TapeFileKind::Bootstrap,
+                        block_count: 1,
+                        physical_start_hint: None,
+                        object_id: None,
+                        first_parity_data_ordinal: None,
+                        epoch_id: None,
+                        protected_ordinal_start: None,
+                        protected_ordinal_end_exclusive: None,
+                        canonical_metadata_hash: None,
+                        bootstrap_object_row: None,
+                    }],
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals,
+                });
+        if bootstrap_bundle.total_committed_ordinals != total_committed_ordinals {
+            return Err(StateError::IndexCorrupt(
+                "checkpoint barrier bundle ordinal watermark does not match its final object"
+                    .to_string(),
+            ));
         };
         validate_checkpoint_control_extension_tx(&tx, &tape_input, &bootstrap_bundle)?;
         project_committed_tape_file_bundle_tx(
@@ -9506,6 +9525,7 @@ mod tests {
             ],
             highest_protected_ordinal: 3,
             total_committed_ordinals: 3,
+            orphaned_bundles: Vec::new(),
         };
         (
             TapeJournalIndexInput {
@@ -9525,6 +9545,47 @@ mod tests {
             scheme: None,
             journal_offset_bytes: 0,
         }
+    }
+
+    #[test]
+    fn committed_state_projection_ignores_watermark_orphans() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index-watermark-orphans-")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let (input, mut state) = rebuild_fixture();
+        state.orphaned_bundles.push(CommittedBundle {
+            kind: CommittedBundleKind::Object,
+            entries: vec![TapeFileEntry {
+                tape_file_number: 5,
+                kind: TapeFileKind::Object,
+                block_count: 1,
+                physical_start_hint: None,
+                object_id: Some("orphan-object".to_string()),
+                first_parity_data_ordinal: Some(3),
+                epoch_id: None,
+                protected_ordinal_start: None,
+                protected_ordinal_end_exclusive: None,
+                canonical_metadata_hash: None,
+                bootstrap_object_row: None,
+            }],
+            highest_protected_ordinal: 3,
+            total_committed_ordinals: 4,
+        });
+        let tape_uuid = input.tape_uuid;
+        index
+            .index_committed_tape_journal(input, &state)
+            .expect("project filtered committed prefix");
+
+        let files = index.list_tape_files(&tape_uuid).expect("list tape files");
+        assert_eq!(files.len(), 4);
+        assert!(files.iter().all(|file| file.tape_file_number != 5));
+        let tape = index
+            .get_tape(&tape_uuid)
+            .expect("query tape")
+            .expect("tape row");
+        assert_eq!(tape.total_committed_ordinals, 3);
     }
 
     fn append_object_projection(object_id: &str) -> NativeObjectProjectionInput {
@@ -9683,6 +9744,7 @@ mod tests {
             }],
             highest_protected_ordinal: 0,
             total_committed_ordinals: 0,
+            orphaned_bundles: Vec::new(),
         }
     }
 
@@ -12438,6 +12500,7 @@ mod tests {
             ],
             highest_protected_ordinal: 3,
             total_committed_ordinals: 3,
+            orphaned_bundles: Vec::new(),
         };
 
         index
@@ -13257,6 +13320,9 @@ mod tests {
             checkpoint_tape_file_number: 3,
             block_size: 256 * 1024,
             objects: projections,
+            scheme: None,
+            object_tape_file_bundles: Vec::new(),
+            checkpoint_bundle: None,
         };
         journal.append(&record).expect("fsync checkpoint record");
 
@@ -14163,6 +14229,7 @@ mod tests {
                     }],
                     highest_protected_ordinal: 26,
                     total_committed_ordinals: 26,
+                    orphaned_bundles: Vec::new(),
                 },
             )
             .expect("index journal without bootstrap object row");
@@ -14220,6 +14287,7 @@ mod tests {
                     }],
                     highest_protected_ordinal: 26,
                     total_committed_ordinals: 26,
+                    orphaned_bundles: Vec::new(),
                 },
             )
             .expect("index journal with encrypted bootstrap object row");

@@ -14343,7 +14343,6 @@ mod tests {
                 append_ring_bytes: remanence_state::DEFAULT_APPEND_RING_BYTES,
                 append_ring_high_pct: 90,
                 append_ring_low_pct: 25,
-                checkpoint_mode: remanence_state::CheckpointMode::PerObject,
                 checkpoint_max_bytes: remanence_state::DEFAULT_CHECKPOINT_MAX_BYTES,
                 checkpoint_max_objects: remanence_state::DEFAULT_CHECKPOINT_MAX_OBJECTS,
                 checkpoint_max_age_seconds: remanence_state::DEFAULT_CHECKPOINT_MAX_AGE_SECONDS,
