@@ -271,6 +271,30 @@ impl RawTapeSink for RecordingRawTapeSink {
     }
 }
 
+#[derive(Debug, Default)]
+struct FailingBarrierRawTapeSink {
+    inner: RecordingRawTapeSink,
+}
+
+impl RawTapeSink for FailingBarrierRawTapeSink {
+    fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
+        self.inner.write_fixed_block(buf)
+    }
+
+    fn write_filemarks(&mut self, count: u32, immed: bool) -> Result<RawWriteOutcome, ParityError> {
+        if count == 0 {
+            return Err(ParityError::TapeIo(TapeIoError::OperationFailed(
+                "injected checkpoint barrier failure".to_string(),
+            )));
+        }
+        self.inner.write_filemarks(count, immed)
+    }
+
+    fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        self.inner.position()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RecordedTapeRecord {
     Block(Vec<u8>),
@@ -776,6 +800,92 @@ fn checkpoint_returns_committed_prefix_summary() {
     assert_eq!(
         journal.bundles[2].kind,
         CommittedBundleKind::CheckpointedThrough
+    );
+}
+
+#[test]
+fn failed_checkpoint_barrier_poisons_without_committing_journal_bundle() {
+    let block_size: u32 = 1024;
+    let mut raw = FailingBarrierRawTapeSink::default();
+    let mut journal = RecordingJournal::new(sample_uuid());
+    {
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw,
+            &mut journal,
+            small_scheme(),
+            sample_uuid(),
+            block_size,
+        )
+        .expect("journaled sink opens");
+
+        let err = sink
+            .close_open_epoch(CloseReason::Barrier)
+            .expect_err("injected checkpoint barrier must fail");
+        match err {
+            ParityError::TapeIo(TapeIoError::OperationFailed(message)) => {
+                assert!(message.contains("injected checkpoint barrier failure"));
+            }
+            other => panic!("expected injected tape-I/O failure, got {other:?}"),
+        }
+        assert!(sink.poisoned, "barrier failure must poison the writer");
+
+        let retry = sink
+            .close_open_epoch(CloseReason::Barrier)
+            .expect_err("poisoned writer must refuse a subsequent checkpoint");
+        match retry {
+            ParityError::Invariant(message) => assert!(message.contains("poisoned"), "{message}"),
+            other => panic!("expected poisoned-writer refusal, got {other:?}"),
+        }
+    }
+
+    assert!(
+        journal.bundles.is_empty(),
+        "a failed barrier must leave no journal bundle or checkpointed-through advance"
+    );
+}
+
+#[test]
+fn checkpoint_barrier_end_of_medium_is_tape_io_and_poisons_without_commit() {
+    let block_size: u32 = 1024;
+    // The checkpoint bootstrap trailing filemark is operation 1; its shared
+    // zero-count synchronizing barrier is operation 2.
+    let mut raw = EwEomTripwireRawTapeSink::on_filemark(2);
+    let mut journal = RecordingJournal::new(sample_uuid());
+    {
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw,
+            &mut journal,
+            small_scheme(),
+            sample_uuid(),
+            block_size,
+        )
+        .expect("journaled sink opens");
+
+        let err = sink
+            .close_open_epoch(CloseReason::Barrier)
+            .expect_err("hard EOM at the checkpoint barrier must fail");
+        assert!(
+            matches!(
+                err,
+                ParityError::TapeIo(TapeIoError::HardEndOfMedium { .. })
+            ),
+            "barrier EOM must retain tape-I/O taxonomy: {err:?}"
+        );
+        assert!(sink.poisoned, "barrier EOM must poison the writer");
+
+        let retry = sink
+            .close_open_epoch(CloseReason::Barrier)
+            .expect_err("poisoned writer must refuse a subsequent checkpoint");
+        match retry {
+            ParityError::Invariant(message) => assert!(message.contains("poisoned"), "{message}"),
+            other => panic!("expected poisoned-writer refusal, got {other:?}"),
+        }
+    }
+
+    assert_eq!(raw.ew_eom_filemarks_seen, vec![2]);
+    assert!(
+        journal.bundles.is_empty(),
+        "barrier EOM must leave no journal bundle or checkpointed-through advance"
     );
 }
 
