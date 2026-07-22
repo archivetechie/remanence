@@ -21,6 +21,9 @@ format specifications — and their plain-language companion — live in
   and their remedies.
 - [reference-glossary.md](reference-glossary.md) — project and tape
   vocabulary.
+- [reference-extended-attributes.md](reference-extended-attributes.md) —
+  what file metadata is preserved, how it is stored, and how it behaves on
+  restore (including the standard-`tar` fallback).
 
 ## Deeper background
 
