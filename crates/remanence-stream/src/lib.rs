@@ -287,6 +287,42 @@ pub struct ArchiveFilesystemRestoreReport {
     pub damages: Vec<DamageRange>,
     /// Source gaps reported by the format driver that are not tied to one file.
     pub archive_gaps: Vec<ArchiveGapRange>,
+    /// Archived xattr names skipped for each entry path; normalized entries
+    /// currently carry no xattr data, so this is empty by construction.
+    pub skipped_xattrs: BTreeMap<String, Vec<String>>,
+    /// Applied xattr names outside `user.` for each entry path; normalized
+    /// entries currently carry no xattr data, so this is empty by construction.
+    pub applied_privileged_xattrs: BTreeMap<String, Vec<String>>,
+}
+
+/// Parse and validate one operator-supplied xattr namespace prefix.
+///
+/// This is the shared clap-facing parser used by every restore binary.
+pub fn parse_xattr_namespace_prefix(prefix: &str) -> Result<String, String> {
+    validate_xattr_namespace_prefix(prefix)
+        .map(|()| prefix.to_string())
+        .map_err(|error| error.to_string())
+}
+
+/// Count the xattr names recorded in a restore report.
+pub fn skipped_xattr_count(skipped: &BTreeMap<String, Vec<String>>) -> usize {
+    skipped
+        .values()
+        .fold(0usize, |total, names| total.saturating_add(names.len()))
+}
+
+/// Build the single warning emitted from a restore report with skipped xattrs.
+pub fn xattr_policy_skip_warning(skipped: &BTreeMap<String, Vec<String>>) -> Option<String> {
+    xattr_policy_skip_warning_for_count(skipped_xattr_count(skipped))
+}
+
+/// Build the single warning emitted when a restore skips a known xattr count.
+pub fn xattr_policy_skip_warning_for_count(skipped_count: usize) -> Option<String> {
+    (skipped_count != 0).then(|| {
+        format!(
+            "{skipped_count} extended attribute(s) skipped by namespace policy; see skipped_xattrs in the report"
+        )
+    })
 }
 
 /// Prepass one regular file and produce a streaming write spec.
@@ -511,6 +547,8 @@ pub fn restore_archive_reader_to_directory(
         bytes_written: sink.bytes_written,
         damages: sink.damages,
         archive_gaps: sink.archive_gaps,
+        skipped_xattrs: BTreeMap::new(),
+        applied_privileged_xattrs: BTreeMap::new(),
     })
 }
 
@@ -691,12 +729,21 @@ struct PlatformXattrSetter;
 #[cfg(unix)]
 impl RestoredXattrSetter for PlatformXattrSetter {
     fn set_path(&mut self, path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
-        xattr::set(path, name, value)
+        set_symlink_xattr_nofollow(path, name, value)
     }
 
     fn set_file(&mut self, file: &File, name: &str, value: &[u8]) -> io::Result<()> {
         file.set_xattr(name, value)
     }
+}
+
+/// Set an xattr on a restored symlink entry itself, never on its target.
+///
+/// `xattr` 1.6.1's path-based `set` is the no-follow operation backed by
+/// `lsetxattr`; the workspace pins that audited behavior at the dependency.
+#[cfg(unix)]
+fn set_symlink_xattr_nofollow(path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
+    xattr::set(path, name, value)
 }
 
 #[cfg(unix)]
@@ -1377,6 +1424,11 @@ impl RemTarEntrySink for FilesystemRestoreSink {
     }
 }
 
+/// Filesystem sink for normalized/deep-recovery archive readers.
+///
+/// [`NormalizedEntry`] deliberately exposes no xattr field, so this sink
+/// applies no attributes by construction. Native RAO restores use the single
+/// xattr-writer funnel in [`apply_restored_xattrs`] instead.
 struct NormalizedFilesystemRestoreSink {
     root: PathBuf,
     options: FilesystemRestoreOptions,
@@ -1390,6 +1442,9 @@ struct NormalizedFilesystemRestoreSink {
 
 impl NormalizedFilesystemRestoreSink {
     fn new(root: &Path, options: FilesystemRestoreOptions) -> Result<Self, StreamingError> {
+        for prefix in &options.xattr_allowed_prefixes {
+            validate_xattr_namespace_prefix(prefix)?;
+        }
         ensure_restore_root(root)?;
         Ok(Self {
             root: root.to_path_buf(),
@@ -2643,13 +2698,14 @@ mod tests {
             fs::read(root.path().join("camera/a.txt")).unwrap(),
             b"payload"
         );
+        assert!(report.skipped_xattrs.is_empty());
+        assert!(report.applied_privileged_xattrs.is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn normalized_and_deep_recovery_entries_carry_no_xattrs_to_apply() {
-        let mut entry = normalized_entry("file-a", "camera/a.txt", EntryKind::RegularFile, Some(1));
-        entry.adapter_state = b"user.remanence_normalized_probe=must-not-apply".to_vec();
+    fn normalized_entry_exposes_no_attribute_data() {
+        let entry = normalized_entry("file-a", "camera/a.txt", EntryKind::RegularFile, Some(1));
+
         let NormalizedEntry {
             file_id: _,
             path: _,
@@ -2657,7 +2713,14 @@ mod tests {
             link_target: _,
             size_bytes: _,
             adapter_state: _,
-        } = &entry;
+        } = entry;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalized_and_deep_recovery_entries_carry_no_xattrs_to_apply() {
+        let mut entry = normalized_entry("file-a", "camera/a.txt", EntryKind::RegularFile, Some(1));
+        entry.adapter_state = b"user.remanence_normalized_probe=must-not-apply".to_vec();
 
         let normalized_root = tempfile::Builder::new()
             .prefix("remanence-normalized-no-xattrs")
@@ -2699,6 +2762,25 @@ mod tests {
         assert_eq!(
             xattr::get(recovery_root.path().join("camera/a.txt"), xattr_name).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn xattr_skip_warning_is_single_and_counted() {
+        assert_eq!(xattr_policy_skip_warning(&BTreeMap::new()), None);
+        let skipped = BTreeMap::from([
+            ("one".to_string(), vec!["system.one".to_string()]),
+            (
+                "two".to_string(),
+                vec!["security.two".to_string(), "trusted.three".to_string()],
+            ),
+        ]);
+        assert_eq!(skipped_xattr_count(&skipped), 3);
+        assert_eq!(
+            xattr_policy_skip_warning(&skipped).as_deref(),
+            Some(
+                "3 extended attribute(s) skipped by namespace policy; see skipped_xattrs in the report"
+            )
         );
     }
 
