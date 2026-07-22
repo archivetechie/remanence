@@ -7,8 +7,8 @@ per-release summaries.
 ## v1.1.0 — 2026-07-22
 
 Batched checkpointing and the field-validated throughput stack. Archived:
-DOI pending (concept DOI
-[10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126)).
+DOI [10.5281/zenodo.21485573](https://doi.org/10.5281/zenodo.21485573)
+(concept DOI [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126)).
 
 - ONE write mode: batched checkpointing is now the only write path, for
   parity and non-parity pools alike. Objects get immediate filemarks;
