@@ -2877,9 +2877,8 @@ blob Literal/Sub/
         fs::write(&non_utf8, b"raw-name").unwrap();
         let xattr_file = source.join("xattr.txt");
         fs::write(&xattr_file, b"xattr").unwrap();
-        if xattr::set(&xattr_file, "user.remanence_test", b"kept").is_err() {
-            return;
-        }
+        xattr::set(&xattr_file, "user.remanence_test", b"kept")
+            .expect("the wrapper fidelity test requires user.* xattr support");
 
         let tar_engine = detect_tar_engine().unwrap();
         let tar_path = temp.path().join("source.remwrap.tar");

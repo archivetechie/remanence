@@ -52,6 +52,15 @@ pub enum StreamingError {
     #[error("invalid streaming input: {0}")]
     InvalidInput(String),
 
+    /// An xattr namespace prefix could broaden the restore allow-list.
+    #[error(
+        "invalid xattr namespace prefix {prefix:?}: expected <name>. with a non-empty name, exactly one trailing dot, and no other dots or control characters"
+    )]
+    InvalidXattrNamespacePrefix {
+        /// Rejected caller-supplied prefix.
+        prefix: String,
+    },
+
     /// Filesystem I/O failed at the named path.
     #[error("{context} at {}: {source}", path.display())]
     Io {
@@ -226,6 +235,28 @@ pub struct FilesystemRestoreReport {
     pub bytes_written: u64,
     /// Archived xattr names skipped for each entry path; values are never reported.
     pub skipped_xattrs: BTreeMap<String, Vec<String>>,
+    /// Applied xattr names outside `user.` for each entry path; values are never reported.
+    pub applied_privileged_xattrs: BTreeMap<String, Vec<String>>,
+}
+
+/// Validate one xattr namespace prefix before it is used for restore matching.
+///
+/// A prefix is exactly one non-empty namespace followed by one dot, such as
+/// `user.` or `security.`. Restricting the shape prevents `starts_with` from
+/// turning short or unterminated prefixes into a broader allow-list.
+pub fn validate_xattr_namespace_prefix(prefix: &str) -> Result<(), StreamingError> {
+    let valid = prefix.strip_suffix('.').is_some_and(|namespace| {
+        !namespace.is_empty()
+            && !namespace.contains('.')
+            && !namespace.chars().any(char::is_control)
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(StreamingError::InvalidXattrNamespacePrefix {
+            prefix: prefix.to_string(),
+        })
+    }
 }
 
 /// Report from scanning a normalized archive reader.
@@ -434,7 +465,7 @@ pub fn restore_object_to_directory<S: BlockSource + ?Sized>(
 ) -> Result<FilesystemRestoreReport, StreamingError> {
     let mut sink = FilesystemRestoreSink::new(destination_root.as_ref(), options)?;
     let stream = stream_rem_tar_object(source, chunk_size, block_count, &mut sink)?;
-    let skipped_xattrs = apply_restored_xattrs(
+    let xattrs = apply_restored_xattrs(
         &sink.root,
         &stream.entries,
         &sink.options.xattr_allowed_prefixes,
@@ -446,7 +477,8 @@ pub fn restore_object_to_directory<S: BlockSource + ?Sized>(
         symlinks_written: sink.symlinks_written,
         hardlinks_written: sink.hardlinks_written,
         bytes_written: sink.bytes_written,
-        skipped_xattrs,
+        skipped_xattrs: xattrs.skipped,
+        applied_privileged_xattrs: xattrs.applied_privileged,
     })
 }
 
@@ -641,12 +673,54 @@ fn file_catalog_projection(
     })
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct XattrRestoreAccounting {
+    skipped: BTreeMap<String, Vec<String>>,
+    applied_privileged: BTreeMap<String, Vec<String>>,
+}
+
+#[cfg(unix)]
+trait RestoredXattrSetter {
+    fn set_path(&mut self, path: &Path, name: &str, value: &[u8]) -> io::Result<()>;
+    fn set_file(&mut self, file: &File, name: &str, value: &[u8]) -> io::Result<()>;
+}
+
+#[cfg(unix)]
+struct PlatformXattrSetter;
+
+#[cfg(unix)]
+impl RestoredXattrSetter for PlatformXattrSetter {
+    fn set_path(&mut self, path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
+        xattr::set(path, name, value)
+    }
+
+    fn set_file(&mut self, file: &File, name: &str, value: &[u8]) -> io::Result<()> {
+        file.set_xattr(name, value)
+    }
+}
+
+#[cfg(unix)]
 fn apply_restored_xattrs(
     root: &Path,
     entries: &[RemTarStreamEntry],
     allowed_prefixes: &[String],
-) -> Result<BTreeMap<String, Vec<String>>, StreamingError> {
-    let mut skipped_xattrs = BTreeMap::new();
+) -> Result<XattrRestoreAccounting, StreamingError> {
+    let mut setter = PlatformXattrSetter;
+    apply_restored_xattrs_with_setter(root, entries, allowed_prefixes, &mut setter)
+}
+
+#[cfg(unix)]
+fn apply_restored_xattrs_with_setter<S: RestoredXattrSetter>(
+    root: &Path,
+    entries: &[RemTarStreamEntry],
+    allowed_prefixes: &[String],
+    setter: &mut S,
+) -> Result<XattrRestoreAccounting, StreamingError> {
+    for prefix in allowed_prefixes {
+        validate_xattr_namespace_prefix(prefix)?;
+    }
+
+    let mut accounting = XattrRestoreAccounting::default();
     for entry in entries {
         if entry.xattrs.is_empty() || entry.path == MANIFEST_PATH {
             continue;
@@ -654,9 +728,10 @@ fn apply_restored_xattrs(
         let mut allowed = Vec::new();
         let mut skipped = Vec::new();
         for (name, value) in &entry.xattrs {
-            if allowed_prefixes
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
+            if restored_xattr_name_is_valid(name)
+                && allowed_prefixes
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
             {
                 allowed.push((name, value));
             } else {
@@ -664,20 +739,25 @@ fn apply_restored_xattrs(
             }
         }
         if allowed.is_empty() {
-            skipped_xattrs.insert(entry.path.clone(), skipped);
+            accounting.skipped.insert(entry.path.clone(), skipped);
             continue;
         }
+        let mut applied_privileged = Vec::new();
         let relative = normalize_archive_path(Path::new(&entry.path))?;
         let (destination, final_component_is_symlink) =
             resolve_restored_entry_path_for_xattrs(root, relative.as_str(), entry)?;
         if entry.entry_type == RemTarEntryType::Symlink {
             for (name, value) in allowed {
-                match xattr::set(&destination, name, value) {
-                    Ok(()) => {}
-                    Err(err) if symlink_xattrs_unsupported(&err) => skipped.push(name.clone()),
-                    Err(err) => {
-                        return Err(io_error("set restore symlink xattr", &destination, err));
+                if restored_xattr_set_applied(
+                    setter.set_path(&destination, name, value),
+                    "set restore symlink xattr",
+                    &destination,
+                )? {
+                    if !name.starts_with("user.") {
+                        applied_privileged.push(name.clone());
                     }
+                } else {
+                    skipped.push(name.clone());
                 }
             }
         } else if final_component_is_symlink {
@@ -686,22 +766,90 @@ fn apply_restored_xattrs(
             let Some(file) = open_restored_xattr_target(&destination)? else {
                 skipped.extend(allowed.into_iter().map(|(name, _)| name.clone()));
                 skipped.sort();
-                skipped_xattrs.insert(entry.path.clone(), skipped);
+                accounting.skipped.insert(entry.path.clone(), skipped);
                 continue;
             };
             for (name, value) in allowed {
-                file.set_xattr(name, value)
-                    .map_err(|err| io_error("set restore xattr", &destination, err))?;
+                if restored_xattr_set_applied(
+                    setter.set_file(&file, name, value),
+                    "set restore xattr",
+                    &destination,
+                )? {
+                    if !name.starts_with("user.") {
+                        applied_privileged.push(name.clone());
+                    }
+                } else {
+                    skipped.push(name.clone());
+                }
             }
         }
         if !skipped.is_empty() {
             skipped.sort();
-            skipped_xattrs.insert(entry.path.clone(), skipped);
+            accounting.skipped.insert(entry.path.clone(), skipped);
+        }
+        if !applied_privileged.is_empty() {
+            applied_privileged.sort();
+            accounting
+                .applied_privileged
+                .insert(entry.path.clone(), applied_privileged);
         }
     }
-    Ok(skipped_xattrs)
+    Ok(accounting)
 }
 
+#[cfg(not(unix))]
+fn apply_restored_xattrs(
+    _root: &Path,
+    entries: &[RemTarStreamEntry],
+    allowed_prefixes: &[String],
+) -> Result<XattrRestoreAccounting, StreamingError> {
+    for prefix in allowed_prefixes {
+        validate_xattr_namespace_prefix(prefix)?;
+    }
+
+    let skipped = entries
+        .iter()
+        .filter(|entry| !entry.xattrs.is_empty() && entry.path != MANIFEST_PATH)
+        .map(|entry| {
+            (
+                entry.path.clone(),
+                entry.xattrs.keys().cloned().collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    Ok(XattrRestoreAccounting {
+        skipped,
+        applied_privileged: BTreeMap::new(),
+    })
+}
+
+#[cfg(unix)]
+fn restored_xattr_name_is_valid(name: &str) -> bool {
+    if name.is_empty() || name.as_bytes().contains(&0) {
+        return false;
+    }
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    if name.len() > 255 {
+        return false;
+    }
+    name.split_once('.')
+        .is_some_and(|(namespace, attribute)| !namespace.is_empty() && !attribute.is_empty())
+}
+
+#[cfg(unix)]
+fn restored_xattr_set_applied(
+    result: io::Result<()>,
+    context: &str,
+    path: &Path,
+) -> Result<bool, StreamingError> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(error) if xattrs_unsupported(&error) => Ok(false),
+        Err(error) => Err(io_error(context, path, error)),
+    }
+}
+
+#[cfg(unix)]
 fn resolve_restored_entry_path_for_xattrs(
     root: &Path,
     relative: &str,
@@ -756,12 +904,9 @@ fn open_restored_xattr_target(path: &Path) -> Result<Option<File>, StreamingErro
 }
 
 #[cfg(unix)]
-fn symlink_xattrs_unsupported(error: &io::Error) -> bool {
-    error.kind() == ErrorKind::Unsupported
-        || matches!(
-            error.raw_os_error(),
-            Some(nix::libc::EPERM) | Some(nix::libc::EOPNOTSUPP)
-        )
+fn xattrs_unsupported(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(nix::libc::EOPNOTSUPP)
+        || error.raw_os_error() == Some(nix::libc::ENOTSUP)
 }
 
 fn attach_object_id_to_bundle(
@@ -1512,6 +1657,42 @@ mod tests {
     const BLOCK_SIZE: u32 = 4096;
     const TAPE_UUID: [u8; 16] = [0x51; 16];
 
+    #[cfg(unix)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TestXattrTarget {
+        Path,
+        File,
+    }
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct ScriptedXattrSetter {
+        errnos: HashMap<String, i32>,
+        calls: Vec<(TestXattrTarget, String)>,
+    }
+
+    #[cfg(unix)]
+    impl ScriptedXattrSetter {
+        fn record(&mut self, target: TestXattrTarget, name: &str) -> io::Result<()> {
+            self.calls.push((target, name.to_string()));
+            match self.errnos.get(name) {
+                Some(errno) => Err(io::Error::from_raw_os_error(*errno)),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl RestoredXattrSetter for ScriptedXattrSetter {
+        fn set_path(&mut self, _path: &Path, name: &str, _value: &[u8]) -> io::Result<()> {
+            self.record(TestXattrTarget::Path, name)
+        }
+
+        fn set_file(&mut self, _file: &File, name: &str, _value: &[u8]) -> io::Result<()> {
+            self.record(TestXattrTarget::File, name)
+        }
+    }
+
     #[derive(Default)]
     struct TestJournal {
         bundles: Vec<CommittedBundle>,
@@ -1867,10 +2048,176 @@ mod tests {
 
         assert_eq!(restore.files_written, 1);
         assert!(restore.skipped_xattrs.is_empty());
+        assert!(restore.applied_privileged_xattrs.is_empty());
         assert_eq!(
             xattr::get(restore_dir.path().join("tagged.txt"), name).unwrap(),
             Some(b"tagged".to_vec())
         );
+    }
+
+    #[test]
+    fn apply_restored_xattrs_validates_every_allowed_prefix() {
+        for invalid in ["security", "s", ".", "", "user..", "user.\u{1}"] {
+            let error = apply_restored_xattrs(Path::new("unused"), &[], &[invalid.to_string()])
+                .expect_err("invalid prefix must be rejected before entries are inspected");
+            assert!(
+                matches!(
+                    error,
+                    StreamingError::InvalidXattrNamespacePrefix { prefix }
+                        if prefix == invalid
+                ),
+                "unexpected error for {invalid:?}"
+            );
+        }
+
+        for valid in ["user.", "security."] {
+            let accounting =
+                apply_restored_xattrs(Path::new("unused"), &[], &[valid.to_string()]).unwrap();
+            assert_eq!(accounting, XattrRestoreAccounting::default());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn applied_privileged_xattrs_are_accounted_without_values() {
+        let root = tempfile::Builder::new()
+            .prefix("remanence-stream-applied-privileged-xattrs")
+            .tempdir()
+            .unwrap();
+        fs::write(root.path().join("tagged.txt"), b"payload").unwrap();
+        let mut entry = stream_entry("tagged.txt", RemTarEntryType::Regular);
+        entry
+            .xattrs
+            .insert("security.ima".to_string(), b"security-secret".to_vec());
+        entry
+            .xattrs
+            .insert("user.x".to_string(), b"user-secret".to_vec());
+        let mut setter = ScriptedXattrSetter::default();
+
+        let accounting = apply_restored_xattrs_with_setter(
+            root.path(),
+            &[entry],
+            &["user.".to_string(), "security.".to_string()],
+            &mut setter,
+        )
+        .unwrap();
+
+        assert!(accounting.skipped.is_empty());
+        assert_eq!(
+            accounting.applied_privileged.get("tagged.txt").unwrap(),
+            &["security.ima"]
+        );
+        assert_eq!(
+            setter.calls,
+            [
+                (TestXattrTarget::File, "security.ima".to_string()),
+                (TestXattrTarget::File, "user.x".to_string()),
+            ]
+        );
+        let report_text = format!("{accounting:?}");
+        assert!(!report_text.contains("security-secret"));
+        assert!(!report_text.contains("user-secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_xattrs_skip_but_permission_denied_fails_for_all_target_types() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::Builder::new()
+            .prefix("remanence-stream-xattr-errno")
+            .tempdir()
+            .unwrap();
+        fs::write(root.path().join("regular.txt"), b"payload").unwrap();
+        symlink("missing-target", root.path().join("link")).unwrap();
+
+        for (path, entry_type, target) in [
+            (
+                "regular.txt",
+                RemTarEntryType::Regular,
+                TestXattrTarget::File,
+            ),
+            ("link", RemTarEntryType::Symlink, TestXattrTarget::Path),
+        ] {
+            let mut entry = stream_entry(path, entry_type);
+            entry
+                .xattrs
+                .insert("security.ima".to_string(), b"value".to_vec());
+            let prefixes = ["security.".to_string()];
+
+            let mut unsupported = ScriptedXattrSetter::default();
+            unsupported
+                .errnos
+                .insert("security.ima".to_string(), nix::libc::EOPNOTSUPP);
+            let accounting = apply_restored_xattrs_with_setter(
+                root.path(),
+                std::slice::from_ref(&entry),
+                &prefixes,
+                &mut unsupported,
+            )
+            .unwrap();
+            assert_eq!(accounting.skipped[path], ["security.ima"]);
+            assert!(accounting.applied_privileged.is_empty());
+            assert_eq!(unsupported.calls, [(target, "security.ima".to_string())]);
+
+            let mut denied = ScriptedXattrSetter::default();
+            denied
+                .errnos
+                .insert("security.ima".to_string(), nix::libc::EPERM);
+            let error =
+                apply_restored_xattrs_with_setter(root.path(), &[entry], &prefixes, &mut denied)
+                    .expect_err("EPERM must surface instead of being classified as unsupported");
+            assert!(
+                matches!(
+                    error,
+                    StreamingError::Io { source, .. }
+                        if source.raw_os_error() == Some(nix::libc::EPERM)
+                ),
+                "unexpected error for {path}"
+            );
+            assert_eq!(denied.calls, [(target, "security.ima".to_string())]);
+        }
+
+        assert!(xattrs_unsupported(&io::Error::from_raw_os_error(
+            nix::libc::EOPNOTSUPP
+        )));
+        assert!(xattrs_unsupported(&io::Error::from_raw_os_error(
+            nix::libc::ENOTSUP
+        )));
+        assert!(!xattrs_unsupported(&io::Error::from_raw_os_error(
+            nix::libc::EPERM
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_xattr_names_never_reach_the_setter() {
+        let malformed = "user.bad\0name";
+        let mut entry = stream_entry("nul.txt", RemTarEntryType::Regular);
+        entry
+            .xattrs
+            .insert(malformed.to_string(), b"must-not-be-set".to_vec());
+        let mut setter = ScriptedXattrSetter::default();
+
+        let accounting = apply_restored_xattrs_with_setter(
+            Path::new("unused"),
+            &[entry],
+            &["user.".to_string()],
+            &mut setter,
+        )
+        .unwrap();
+
+        assert_eq!(accounting.skipped["nul.txt"], [malformed]);
+        assert!(accounting.applied_privileged.is_empty());
+        assert!(setter.calls.is_empty());
+        assert!(!restored_xattr_name_is_valid(""));
+        assert!(!restored_xattr_name_is_valid("user."));
+        assert!(!restored_xattr_name_is_valid("no-namespace"));
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        assert!(!restored_xattr_name_is_valid(&format!(
+            "user.{}",
+            "x".repeat(251)
+        )));
     }
 
     #[cfg(unix)]
@@ -1981,6 +2328,10 @@ mod tests {
             let restore = result.expect("security.* probe succeeded, so restore must apply it");
             assert!(restore.skipped_xattrs.is_empty());
             assert_eq!(
+                restore.applied_privileged_xattrs["security.txt"],
+                [security_name]
+            );
+            assert_eq!(
                 xattr::get(restore_dir.path().join("security.txt"), security_name).unwrap(),
                 Some(b"operator-approved".to_vec())
             );
@@ -2015,9 +2366,11 @@ mod tests {
 
         // Public restore applies xattrs immediately after materialization, so the
         // reachable late-swap shape is exercised directly at the single funnel.
-        let skipped = apply_restored_xattrs(root.path(), &[entry], &["user.".to_string()]).unwrap();
+        let accounting =
+            apply_restored_xattrs(root.path(), &[entry], &["user.".to_string()]).unwrap();
 
-        assert_eq!(skipped["victim.txt"], ["user.no_follow"]);
+        assert_eq!(accounting.skipped["victim.txt"], ["user.no_follow"]);
+        assert!(accounting.applied_privileged.is_empty());
         assert_eq!(xattr::get(&outside_target, "user.no_follow").unwrap(), None);
     }
 
@@ -2043,26 +2396,36 @@ mod tests {
         let (blocks, layout) = rao_blocks_with_payloads(&opts, vec![(spec, Vec::new())]);
         let mut source = VecBlockSource::new(blocks);
 
-        let restore = restore_object_to_directory(
+        let result = restore_object_to_directory(
             &mut source,
             opts.chunk_size,
             layout.projected_size_blocks,
             restore_dir.path(),
             FilesystemRestoreOptions::default(),
-        )
-        .unwrap();
+        );
 
         assert_eq!(
             xattr::get(&outside_target, "user.symlink_test").unwrap(),
             None
         );
         let link = restore_dir.path().join("outside-link");
-        match restore.skipped_xattrs.get("outside-link") {
-            Some(names) => assert_eq!(names, &["user.symlink_test"]),
-            None => assert_eq!(
-                xattr::get(&link, "user.symlink_test").unwrap(),
-                Some(b"link-only".to_vec())
-            ),
+        match result {
+            Ok(restore) => {
+                assert!(restore.applied_privileged_xattrs.is_empty());
+                match restore.skipped_xattrs.get("outside-link") {
+                    Some(names) => assert_eq!(names, &["user.symlink_test"]),
+                    None => assert_eq!(
+                        xattr::get(&link, "user.symlink_test").unwrap(),
+                        Some(b"link-only".to_vec())
+                    ),
+                }
+            }
+            Err(StreamingError::Io {
+                context, source, ..
+            }) if source.raw_os_error() == Some(nix::libc::EPERM) => {
+                assert_eq!(context, "set restore symlink xattr");
+            }
+            Err(error) => panic!("unexpected symlink xattr restore failure: {error}"),
         }
     }
 
@@ -2279,6 +2642,63 @@ mod tests {
         assert_eq!(
             fs::read(root.path().join("camera/a.txt")).unwrap(),
             b"payload"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalized_and_deep_recovery_entries_carry_no_xattrs_to_apply() {
+        let mut entry = normalized_entry("file-a", "camera/a.txt", EntryKind::RegularFile, Some(1));
+        entry.adapter_state = b"user.remanence_normalized_probe=must-not-apply".to_vec();
+        let NormalizedEntry {
+            file_id: _,
+            path: _,
+            kind: _,
+            link_target: _,
+            size_bytes: _,
+            adapter_state: _,
+        } = &entry;
+
+        let normalized_root = tempfile::Builder::new()
+            .prefix("remanence-normalized-no-xattrs")
+            .tempdir()
+            .unwrap();
+        let mut normalized_reader = ScriptedArchiveReader {
+            entries: vec![entry.clone()],
+            damages: vec![],
+            data: vec![("file-a".into(), 0, b"x".to_vec())],
+        };
+        restore_archive_reader_to_directory(
+            &mut normalized_reader,
+            normalized_root.path(),
+            FilesystemRestoreOptions::default(),
+        )
+        .unwrap();
+
+        let recovery_root = tempfile::Builder::new()
+            .prefix("remanence-deep-recovery-no-xattrs")
+            .tempdir()
+            .unwrap();
+        let mut recovery_reader = ScriptedArchiveReader {
+            entries: vec![entry],
+            damages: vec![],
+            data: vec![("file-a".into(), 0, b"x".to_vec())],
+        };
+        recover_archive_reader_to_directory(
+            &mut recovery_reader,
+            recovery_root.path(),
+            RecoveryOptions::new("test-format", "dump:test"),
+        )
+        .unwrap();
+
+        let xattr_name = "user.remanence_normalized_probe";
+        assert_eq!(
+            xattr::get(normalized_root.path().join("camera/a.txt"), xattr_name).unwrap(),
+            None
+        );
+        assert_eq!(
+            xattr::get(recovery_root.path().join("camera/a.txt"), xattr_name).unwrap(),
+            None
         );
     }
 

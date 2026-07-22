@@ -7180,7 +7180,9 @@ pub(crate) fn status_from_pool_write_error(err: PoolWriteError) -> Status {
 
 fn status_from_streaming_error(err: &StreamingError, message: String) -> Status {
     match err {
-        StreamingError::InvalidInput(_) => Status::invalid_argument(message),
+        StreamingError::InvalidInput(_) | StreamingError::InvalidXattrNamespacePrefix { .. } => {
+            Status::invalid_argument(message)
+        }
         StreamingError::Format(format) => status_from_format_error(format, message),
         StreamingError::Parity(parity) => status_from_parity_error(parity, message),
         StreamingError::Io { .. } => Status::internal(message),
@@ -9445,6 +9447,12 @@ mod tests {
             StreamingError::InvalidInput("bad archive path".to_string()),
         ));
         assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
+        let invalid_prefix = status_from_pool_write_error(PoolWriteError::Streaming(
+            StreamingError::InvalidXattrNamespacePrefix {
+                prefix: "s".to_string(),
+            },
+        ));
+        assert_eq!(invalid_prefix.code(), tonic::Code::InvalidArgument);
 
         let exhausted = status_from_pool_write_error(PoolWriteError::Parity(
             ParityError::ObjectTooLargeForEmptyTape {
