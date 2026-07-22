@@ -1606,8 +1606,10 @@ dependencies = [
  "remanence-format",
  "remanence-library",
  "remanence-stream",
+ "serde_json",
  "sha2",
  "tempfile",
+ "xattr",
  "zeroize",
 ]
 
