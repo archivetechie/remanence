@@ -19415,6 +19415,7 @@ blob Project/Render Files/
                 global_pax: BTreeMap::new(),
                 entries: Vec::new(),
                 manifest_cbor: None,
+                object_extensions: BTreeMap::new(),
                 digest_mismatches: Vec::new(),
                 warnings: Vec::new(),
             },
