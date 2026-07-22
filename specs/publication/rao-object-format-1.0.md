@@ -182,6 +182,9 @@ A single implementation may fill several roles.
   (Section 5.7).
 - **Reader**: recovers entries from an object in either representation
   (Sections 4.9, 5.10).
+- **Repacker**: re-emits an object or manifest while preserving its entries (a
+  re-pack that does not re-capture from a source filesystem). Its preservation
+  obligations are stated in Sections 4.7.5 and 10.
 - **Verifier**: validates a complete object end to end, with key material
   when the object is encrypted (Section 7.4).
 - **Keyless Verifier**: validates the public structure of an encrypted object
@@ -345,6 +348,17 @@ Consequences, all normative:
 4. Any stored copy MUST be scrubbable by `stored_digest` alone — no keys,
    no plaintext access, and no format knowledge beyond "a byte string" are
    required of the backend.
+
+Informative: the four digests map to preservation fixity roles —
+`file_sha256` is per-file content fixity (PREMIS bitstream fixity [PREMIS]),
+`manifest_sha256` is structural-index fixity, `plaintext_digest` is
+whole-object (content-plus-structure) fixity (OAIS Fixity Information over the
+Content plus Packaging [OAIS]), and `stored_digest` is per-copy fixity. Because
+`plaintext_digest` covers the manifest, any change to how the object is
+interpreted — a path, an entry type, a link target, chunk geometry, or a
+per-file `file_sha256` — changes `plaintext_digest`. This document commits to
+SHA-256; algorithm agility is out of scope and would be a
+successor-specification concern.
 
 ### 3.4. Representation Detection
 
@@ -867,7 +881,7 @@ encoded sort order):
 | `chunk_size` | unsigned | MUST equal the global `REMANENCE.chunk_size` |
 | `file_entries` | array | One file-entry map per member entry (regular/hardlink/symlink/directory), in archive order |
 | `schema_version` | unsigned | MUST be 1 (`MANIFEST_SCHEMA_VERSION`) |
-| `object_metadata` | map | Reserved; MUST be empty (`{}`) in 1.0 writers |
+| `object_metadata` | map | Empty (`{}`), or the inventory of Section 4.7.6, optionally with an `ext` container (Section 4.7.5) |
 | `caller_object_id` | text | MUST equal the global `REMANENCE.caller_object_id` |
 | `external_references` | array | Reserved; MUST be empty (`[]`) in 1.0 writers |
 
@@ -888,7 +902,7 @@ regular-only objects.
 | `file_sha256` | bytes | Regular entries only: exactly 32 bytes; binary SHA-256 (hex in pax, binary here). A hardlinked name's hash is its primary's, reached via `link_target` |
 | `first_chunk_lba` | unsigned/`null` | Inner `BodyLba`; `null` if and only if `size_bytes` = 0 (so `null` for hardlinks) |
 | `link_target` | text | Symlink entries: the effective target string. Hardlink entries: the primary's in-object path (Section 4.6) |
-| `metadata_preservation_data` | map | Empty, or the xattr container of Section 4.7.3; hardlink entries MUST use an empty map |
+| `metadata_preservation_data` | map | Empty, the xattr container of Section 4.7.3, an `ext` container (Section 4.7.5), or both; hardlink entries MUST use an empty map |
 
 Consumer obligations:
 
@@ -902,10 +916,12 @@ Consumer obligations:
    `caller_object_id`, and `chunk_size` MUST equal the corresponding global
    header values when both are in hand, and no two `file_entries` elements
    may share a `path` or a `file_id`.
-3. A Consumer MUST treat unknown additional keys (top-level or per-entry) and
-   unknown keys within `metadata_preservation_data` as extensions and ignore
-   them. It MUST NOT reject a manifest merely because a reserved map or array
-   is non-empty.
+3. A Consumer MUST treat unknown bare keys (top-level or per-entry, including
+   unknown bare keys within `metadata_preservation_data` and
+   `object_metadata`) as **reserved for future revisions of this document** —
+   ignore them, and do not use them for third-party data (which lives only
+   under `ext`, Section 4.7.5). It MUST NOT reject a manifest merely because a
+   reserved map or array is non-empty.
 4. When both the manifest and the archive entries are available, a Consumer
    SHOULD verify they correspond exactly — same paths, entry types, link
    targets, sizes, hashes where present, and chunk geometry, with no extras on either side (Verifiers MUST;
@@ -923,10 +939,32 @@ An entry's `metadata_preservation_data` MAY contain the following map entry:
 be valid UTF-8 [RFC3629] and MUST NOT contain an ASCII control byte below
 `0x20`; no escaping is defined. A Writer MUST reject a name violating these
 rules.
+The **namespace** of an attribute name is the substring preceding its first
+`.`; a name containing no `.` has no namespace. This document's validity rule
+for names is unchanged (nonempty UTF-8, no ASCII control byte below `0x20`);
+the namespace derivation is a classification rule, not an acceptance rule, and
+does not shrink the set of valid names.
+
+The name is stored in **canonical wire form** as `namespace.name`. This is a
+Writer obligation: a Writer on a platform whose native attribute model differs
+(a separate namespace argument; a flat namespace; case-folding storage) MUST
+map its native namespace to the canonical prefix (for example, a `user.`
+namespace attribute is `user.name`) deterministically and MUST NOT remap one
+namespace onto another. A native attribute a Writer cannot represent with a
+derivable namespace — including a name with no `.`, or one a case-folding
+store cannot round-trip without altering case — is not captured, and its
+omission is reported as ingest policy (Section 4.7 is silent on ingest
+selection; Section 12.10 governs restore, not capture). The canonical name
+bytes are identical across independent Writers for the same native attribute
+on the same platform; whole-manifest byte identity additionally requires
+identical object parameters (Section 1.1 goal 6).
+
 `<value>` is a CBOR byte string containing the raw attribute value without a
 textual encoding. The `xattrs` map follows the deterministic encoding rules of
 Section 4.7.1, including encoded-key ordering and the prohibition on duplicate
-names. Readers MUST ignore unknown keys in `metadata_preservation_data`.
+names. Readers MUST ignore unknown keys in `metadata_preservation_data`
+(reserved for future revisions; third-party data lives under `ext`,
+Section 4.7.5).
 
 An entry with no preserved xattrs MUST carry an empty
 `metadata_preservation_data` map. A hardlink entry MUST carry an empty map;
@@ -943,6 +981,16 @@ integer remains 1. This gate does not depend on encrypted-envelope
 (Section 10).
 
 Which xattrs an ingesting system selects is policy outside this byte format.
+This document defines a **portable core** and an **extension tier**,
+distinguished by what a Restoring Consumer applies by default, not by what is
+carried — both tiers are carried faithfully. The portable core is the `user.`
+attribute namespace, which a Restoring Consumer is permitted to apply by
+default (Section 12.10). Every attribute not in the `user.` namespace and every
+extension (Section 4.7.5) is the extension tier: carried, but on restore
+**carry-only** — applied only when explicit operator policy names it
+(Section 12.10). No registered disposition or external list can cause an
+extension-tier item to be applied by default in version 1.0.
+
 A Reader implementing xattr preservation MUST surface them to its caller. A
 Restoring Consumer MAY reapply attributes, subject to Section 12.10, and MUST
 surface any application failure rather than silently declaring success.
@@ -970,6 +1018,87 @@ entry metadata is covered by the manifest and the whole-object digest. This
 chain provides integrity, not authentication (Section 12.6); for encrypted
 copies the anchor is the envelope's authenticated `plaintext_digest`
 (Section 7.1).
+
+#### 4.7.5. Extension Containers
+
+An entry's `metadata_preservation_data` map and the object-level
+`object_metadata` map (Section 4.7.2) MAY carry a single reserved indirection
+key, `ext`, whose value is a map; a hardlink entry's
+`metadata_preservation_data` MUST remain empty (Section 4.7.3) and MUST NOT
+carry `ext`. A non-map `ext` value makes the manifest nonconformant
+(`ManifestInvalid`). Every bare (non-`ext`) key in these two maps is reserved
+to this specification and its successors; third-party and platform-specific
+data MUST live only under `ext`. (Section 4.7.2 obligation 3 is amended
+accordingly: unknown bare keys are reserved-for-future-use — ignored, not an
+extension point.)
+
+Each member of an `ext` map is one extension, keyed by an **extension name**:
+either a **reverse-DNS name** — lowercase, containing at least one `.`, in a
+domain the author controls (for example `org.example.thing`) — requiring no
+registration; or a **registered short name** — lowercase, hyphen-separated,
+containing no `.` — from the community list (Section 15). The presence of a
+`.` distinguishes the two. A malformed or uppercase extension name is treated
+as unrecognized: it is ignored and carry-only, not a reason to reject the
+object. An `ext` member value MUST use the manifest CBOR profile of
+Section 4.7.1 (definite-length items, the permitted major types only) and
+counts against the Section 4.7.1 depth limit; a non-conforming `ext` value
+makes the whole manifest nonconformant (`Cbor`).
+
+Extension processing is fail-safe, carry-only, and additive:
+
+- A Consumer **recognizes** an extension only if it implements that
+  extension's semantics; knowing an extension's name or any registered
+  disposition is not recognition.
+- A Consumer MUST ignore an `ext` member it does not recognize and MUST NOT
+  reject an object for its presence.
+- A Restoring Consumer MUST NOT apply any extension to system state unless
+  explicit operator policy names it (Section 12.10); in version 1.0 no
+  extension is applied by default. An unrecognized extension is always
+  carry-only.
+- A Repacker (Section 2.2) MUST reproduce the canonical CBOR encoding of every
+  `ext` member it does not recognize unchanged (equivalently: it preserves the
+  decoded value; under Section 4.7.1 the canonical re-encoding is identical).
+  Silently dropping an unrecognized extension is nonconformant.
+- Extensions are **ancillary by definition**: an extension MUST NOT be
+  required to interpret an object's content or structure correctly. A feature
+  a conformant Consumer must understand to read an object is a new stream
+  `format_id` (Section 10), never an extension.
+
+`ext` keys participate in the Section 4.7.1 deterministic ordering; their
+presence changes `manifest_sha256` and `plaintext_digest` as any manifest
+content does. `ext` and `object_metadata` presence do NOT affect
+`REMANENCE.schema_version` (Section 4.7.3): the 1.0/1.1 gate remains keyed
+solely to preserved xattrs.
+
+#### 4.7.6. Object Metadata Inventory
+
+When any entry, or the object itself, carries an attribute outside the `user.`
+namespace or any `ext` member, the object's `object_metadata` map MUST carry an
+inventory so a holder can determine what non-core metadata the object contains
+without decoding `file_entries`. The inventory is a map with exactly these
+keys:
+
+| Key | Type | Value |
+| --- | --- | --- |
+| `attribute_namespaces` | array of text | the set of distinct non-`user.` attribute namespaces (Section 4.7.3) present across all entries, sorted in the order Section 4.7.1 defines for text map keys (encoded length prefix, then key bytes) |
+| `extensions` | array of text | the set of distinct `ext` extension names present across all entries and in `object_metadata`, sorted in the order Section 4.7.1 defines for text map keys (encoded length prefix, then key bytes) |
+
+Both arrays carry names only; attribute values and per-entry detail MUST NOT
+appear. An empty array is omitted (its key absent). For verification, an
+absent inventory key is treated as an empty array; a present empty array is
+accepted (writer determinism is not a read-acceptance rule, Section 4.4.2). An
+object carrying only the portable core and no `ext` MUST leave
+`object_metadata` empty (`{}`). A Consumer MUST treat an unrecognized
+`object_metadata` key as reserved-for-future-use and ignore it (Section 4.7.2
+obligation 3).
+
+**Verifier obligation:** a Verifier (Section 7.4) MUST confirm the inventory
+is exact — `attribute_namespaces` equals the set of non-`user.` namespaces
+actually present, and `extensions` equals the set of `ext` names actually
+present across all entries and in `object_metadata` — and MUST reject a
+mismatch (`ManifestInvalid`). A holder MAY rely on the inventory as a
+disclosure-screening surface only for an object that has passed Verifier
+validation.
 
 ### 4.8. End of Archive
 
@@ -1013,6 +1142,10 @@ object MUST NOT be reported as complete. The writer consumes a block sink that
 reports per-block outcomes; a block write that commits fewer bytes than the
 full block, or reports hard end-of-medium, MUST fail the object
 (`IncompleteBlockWrite`).
+
+A Writer that re-captures an object from a previously restored tree MUST carry
+forward, unchanged, every `ext` member present in the source object's manifest
+that it does not recognize.
 
 **Reader.** A Reader receives a block source positioned at the object's inner
 `BodyLba(0)`, the object's `chunk_size`, and its block count. Two I/O
@@ -1565,7 +1698,8 @@ A Verifier validates one stored copy end to end without extracting it:
   content fields and no `file_sha256`, and resolve to a valid regular-file
   primary (Section 4.6); **symlink/directory entries** carry zero/`null`
   content fields; and `file_entries` lists nothing absent from the archive),
-  final-fill zero check (Section 4.8), and
+  exact `object_metadata` inventory validation (Section 4.7.6), final-fill
+  zero check (Section 4.8), and
   report-all-nonconformities (not first-error-only), plus a `stored_digest`
   comparison against the catalog value when available.
 - **Encrypted copy (keyed)**: Section 5.10 in full (header, metadata, salt
@@ -1682,10 +1816,10 @@ Three independent fields are deliberately not interchangeable:
 1. **Specification version 1.0** identifies this publication. It normatively
    describes every format below; it is not stored in an object.
 2. **Plaintext stream schema version** is the text
-   `REMANENCE.schema_version`: `1.0` when all
-   `metadata_preservation_data` maps are empty and `1.1` when any xattr is
-   present. Both use `REMANENCE.format_id = rao-v1` and manifest integer
-   `schema_version = 1`.
+   `REMANENCE.schema_version`: `1.0` when no xattr is preserved and `1.1` when
+   any xattr is preserved; `ext` containers and the `object_metadata` inventory
+   do not affect the gate. Both use `REMANENCE.format_id = rao-v1` and manifest
+   integer `schema_version = 1`.
 3. **Encrypted-envelope `format_version`** is the byte at header offset
    `0x06`: value `2` identifies HPKE-wrapped-DEK encryption. Value `1` is
    permanently reserved, MUST never be accepted, and MUST never be
@@ -1702,6 +1836,18 @@ For the `RAO1` envelope magic, only the header form in Section 5.2 is valid:
 format value `2`, HPKE wrap suite `0x01`, and a key frame. Unknown format or suite values are hard errors, not
 negotiation. A future envelope change not expressible by ignorable metadata
 requires a new format value or magic and a successor specification.
+
+A Repacker (Section 2.2) MUST reproduce unknown manifest keys and unrecognized
+extension-container members unchanged under the Section 4.7.1 canonical
+encoding; ignore-on-read does not license drop-on-rewrite. For symmetry a
+Repacker MUST likewise re-emit all unknown pax keywords unchanged
+(strengthening the Section 4.4.3 SHOULD to a MUST for the preserving-rewrite
+case). A Repacker that recognizes the `xattrs` map and selectively strips
+attributes is performing a declared policy action, not a transparent rewrite,
+and thereby changes `plaintext_digest`. Because every extension is ancillary
+(Section 4.7.5), a minimal Consumer that ignores all extension data and
+recovers payload bytes and structure remains conformant for the roles it
+claims (Section 14).
 
 ## 11. Errors
 
@@ -1951,6 +2097,14 @@ component; for entries that are symbolic links it MUST use a link-targeting
 interface or skip and report the attribute. Skips are policy outcomes, not
 errors; genuine application failures MUST still surface per Section 4.7.3.
 
+The same disposition governs `ext` extensions (Section 4.7.5): a Restoring
+Consumer applies only the `user.` portable core by default; every non-`user.`
+namespace and every extension — recognized or not — is carried and, when
+reported, reported by name only, and is applied on restore only when explicit
+operator policy names it. No registered disposition applies an extension-tier
+item by default in version 1.0. A Restoring Consumer that reports skipped or
+applied names MUST NOT log their values.
+
 ### 12.11. Envelope Threat Model and Secret Handling
 
 The encrypted-envelope confidentiality claim is time-scoped:
@@ -1977,6 +2131,29 @@ plaintext on suitably protected storage and publish it only after full
 authentication; deletion cannot guarantee erasure on copy-on-write or flash
 media.
 
+### 12.12. Disclosure in Published Plaintext Objects
+
+A plaintext RAO object provides integrity plumbing (Section 12.6), not
+confidentiality: its manifest is readable with any CBOR tool (Section 4.10).
+Publishing a plaintext object discloses, at minimum: every entry path and
+(possibly absolute or dangling) symlink target; the directory tree and
+hardlink topology; file sizes and the file count; `mtime` and `executable`
+values; `file_id`, `object_id`, `caller_object_id`, `write_timestamp`, and
+`chunk_size`; every captured attribute value; and the `object_metadata`
+inventory itself, which names the non-`user.` namespaces and extensions
+present (revealing, for example, macOS or Windows origin). The encrypted
+representation places the manifest inside the encrypted,
+per-chunk-authenticated payload (Sections 5.1, 5.7) and does not have this
+plaintext-disclosure exposure. Reviewing a plaintext object before publication
+is a deployment (workflow) obligation in the sense of Section 7.3; the
+Verifier-validated inventory (Section 4.7.6) is the intended first-pass
+screening surface, but does not itself bound value-level disclosure. The
+standard-tool recovery path (Section 4.10) inherits the host tool's security
+model — it restores symlinks faithfully — and the format's protection there is
+limited to keeping privilege-changing metadata (ownership, setuid/setgid mode,
+extended attributes) in a form no standard `tar` applies to target files; it
+is not a sandbox.
+
 ## 13. Test Vectors
 
 Static test vectors are distributed alongside this specification, each with a
@@ -1987,6 +2164,10 @@ one vector MUST use `DEFAULT_CHUNK_SIZE`.
 
 The authoritative companion archive is `remanence-test-vectors.tar`, SHA-256
 `32fe2a7947b74e5c8abbaad4e83e85f7deebc827d0aa8ccee8197fcc9c6cd6da`.
+The successor authoritative companion archive is
+`remanence-test-vectors.tar`, SHA-256
+`<SUCCESSOR-ARCHIVE-SHA256-TBD>`. All prior entries are byte-identical; only
+additive entries are new.
 Its `MANIFEST.tsv` inventories every contained vector manifest and generated
 artifact, `CHECKSUMS.sha256` authenticates them, and the included `verify.py`
 checks the archive without a source checkout. It contains plaintext and xattr
@@ -2011,7 +2192,15 @@ target, an empty directory, and a hardlink — primary + link — restoring to o
 shared inode); **long link targets** (a symlink and a hardlink whose targets
 exceed 100 bytes, exercising `PAX_LINK_PLACEHOLDER` and pax `linkpath`); and a **canonical-manifest byte-identity vector**
 pinning the exact manifest CBOR bytes and `manifest_sha256` for a fixed input
-set (the cross-implementation determinism gate, Section 4.7.1). For each, the
+set (the cross-implementation determinism gate, Section 4.7.1); a
+**portable-core-only object** (`user.` only, empty `object_metadata`, and
+`REMANENCE.schema_version` pinned); an **object with a non-`user.` attribute
+and a correct inventory**, whose default restore reports it as not applied
+(carry-only) and omits its value from output; an **object with an unknown
+reverse-DNS `ext` member**, for which a minimal Consumer recovers payloads and
+ignores the member and a Repacker reproduces it under canonical encoding; and
+a **combined non-`user.` attribute and `ext` member** with the two-array
+inventory pinned exactly. For each, the
 manifest pins the exact full object byte stream, or for large vectors
 `full_object_sha256` plus either the first object block bytes or
 `first_block_sha256`, `projected_size_blocks`, every entry's
@@ -2186,8 +2375,17 @@ map key; `schema_version` 2; `file_sha256` of wrong length; nesting depth
 exceeding `MANIFEST_MAX_DEPTH`; manifest bytes disagreeing with the anchor;
 manifest `chunk_size` disagreeing with the global header; unknown extra key
 (MUST be accepted); two `file_entries` sharing a `path`; two `file_entries`
-sharing a `file_id`. A restore-report vector reaches EOF without a manifest
-and asserts the typed `MissingManifest` report rather than silent absence.
+sharing a `file_id`. Additive negative vectors cover an inventory that
+disagrees with the entries (a non-`user.` attribute is present but the
+inventory is empty or wrong), which MUST produce `ManifestInvalid`; a
+non-canonical `ext` value, which MUST produce `Cbor`; and a manifest tamper
+with constant payload (a repointed `path`, swapped `file_sha256`, or altered
+`first_chunk_lba`), which pins a distinct `plaintext_digest` and, with an
+anchor present, MUST produce `ManifestDigestMismatch`. Each additive negative
+vector pins the typed Section 11 error name and names the affected digest,
+`plaintext_digest`, which equals `stored_digest` for a plaintext copy. A
+restore-report vector reaches EOF without a manifest and asserts the typed
+`MissingManifest` report rather than silent absence.
 
 **Envelope.** Header: wrong magic; `header_len` ≠ 128; unsupported format
 values (including the permanently reserved value 1); unknown `suite_id`;
@@ -2250,25 +2448,35 @@ Conformance evidence MUST include:
 5. failure without a completion footer on injected size, digest, entropy, and
    I/O failures applicable to the claimed mode;
 6. whole-object keyed verification and keyless structural verification with
-   the claims kept distinct; and
+   the claims kept distinct;
 7. reconstruction of one catalogless encrypted object using only object bytes, a
    matching recipient private key, this specification, and generic
-   cryptographic libraries.
+   cryptographic libraries; and
+8. the applicable portable-core, extension-container, object-inventory,
+   carry-only restore, Repacker-preservation, and manifest-tamper vectors of
+   Section 13.
 
 The archive SHA-256 in Section 13 identifies the frozen vector distribution.
-Changing any valid byte encoding or expected result requires a successor
-specification or an explicitly published erratum.
+Changing an existing entry's byte encoding or expected result requires a
+successor specification or erratum; adding new entries is permitted and
+advances the archive digest.
 
 ## 15. IANA Considerations
 
-This document has no IANA actions. The identifiers this specification
-defines — the `rao-v1` stream format identifier, the `REMANENCE.` pax
-keyword namespace, the `RAO1` envelope magic, `format_version` value 2 (with
-value 1 permanently reserved), the `suite_id` value `0x01`, the
-`wrap_suite` value `0x01`, and the
-`"xattrs"` preservation key — are assigned by this document and governed by
-its versioning rules
-(Section 10); no registry is established or required.
+The identifiers this specification defines — the `rao-v1` stream format
+identifier, the `REMANENCE.` pax keyword namespace, the `RAO1` envelope magic,
+`format_version` value 2 (with value 1 permanently reserved), the `suite_id`
+value `0x01`, the `wrap_suite` value `0x01`, the `"xattrs"` preservation key,
+the `ext` indirection key, and the `object_metadata` inventory keys
+(`attribute_namespaces`, `extensions`) — are assigned by this document and
+governed by its versioning rules (Section 10).
+
+This document establishes no IANA registry. Extension names (Section 4.7.5)
+use permissionless reverse-DNS naming and require no central allocation; a
+community-maintained advisory list MAY record registered short names, but is
+not a precondition for conformance and does not bear on the carry-only restore
+default (Section 12.10). Reverse-DNS extension names apply to manifest
+extension containers only and MUST NOT appear as pax keywords.
 
 ## 16. References
 
@@ -2328,6 +2536,12 @@ its versioning rules
   Luykx, A., and S. Schmieg, "How to Abuse and Fix Authenticated Encryption
   Without Key Commitment", 31st USENIX Security Symposium, 2022,
   <https://www.usenix.org/conference/usenixsecurity22/presentation/albertini>.
+- [PREMIS] — PREMIS Editorial Committee, "PREMIS Data Dictionary for
+  Preservation Metadata", Version 3.0, November 2015, Library of Congress,
+  <https://www.loc.gov/standards/premis/v3/>.
+- [OAIS] — Consultative Committee for Space Data Systems, "Reference Model for
+  an Open Archival Information System (OAIS)", CCSDS 650.0-M-3, Issue 3,
+  December 2024, <https://public.ccsds.org/Pubs/650x0m3.pdf>.
 - [REMANENCE] — "Remanence", the reference implementation of this
   specification: an open archival tape stack (tape library control, tape
   I/O, parity, and this object format),
@@ -2523,6 +2737,12 @@ LOCATE-to-manifest without a catalog; catalog-less recovery decrypts
 sequentially, an acceptable cost over sequential media.
 
 ## Appendix C. Revision History (Informative)
+
+**2026-07-22.** Added the extension-tier / `ext` container (§4.7.5), the
+object metadata inventory (§4.7.6), the carry-only restore default for
+non-`user.` metadata (§12.10), and the plaintext-disclosure considerations
+(§12.12). The set of valid pre-increment objects is unchanged; new objects are
+tolerated by existing Consumers per §4.7.2 obligation 3.
 
 **2026-07-22.** Section 12.10's extended-attribute restore protections
 restored to requirement strength (MUST): namespace allow-list defaulting to
