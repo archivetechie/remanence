@@ -1,0 +1,88 @@
+{
+  "vector_id": "RAO-TV-EXT-MEMBER",
+  "spec_section": "13.1",
+  "status": "pinned-at-generation",
+  "independent_rederivation": "verified by tools/verify_rao_vectors_independent.py",
+  "inputs": {
+    "chunk_size": 4096,
+    "object_id": "00000000-0000-4000-8000-000000000114",
+    "caller_object_id": "rao-tv-ext-member",
+    "write_timestamp": "2026-01-01T00:00:00Z",
+    "metadata_preservation": "minimal",
+    "manifest_file_id": "00000000-0000-4000-8000-000000000114",
+    "extensions": {
+      "org.remanence.publication": 1
+    },
+    "entries": [
+      {
+        "entry_type": "regular",
+        "path": "metadata/extension.txt",
+        "file_id": "00000000-0000-4000-8000-000000000241",
+        "size_bytes": 19,
+        "link_target": null,
+        "mtime": null,
+        "executable": null
+      }
+    ]
+  },
+  "expected": {
+    "schema_version": "1.0",
+    "stored_size_bytes": 12288,
+    "stored_size_blocks": 3,
+    "stored_digest": "65ea7329ebda5438c55f44363e16326f13c29512ba55f43b0b50ab80b894eeb9",
+    "full_object_sha256": "65ea7329ebda5438c55f44363e16326f13c29512ba55f43b0b50ab80b894eeb9",
+    "plaintext_digest": "65ea7329ebda5438c55f44363e16326f13c29512ba55f43b0b50ab80b894eeb9",
+    "first_block_sha256": "1f6e12d1f7cd6f435d28e7ff565f3f4120b181dd08d0e3a5be5dd96aa36e3a4e",
+    "manifest_cbor_len": 442,
+    "manifest_cbor_hex": "a7696f626a6563745f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303131346a6368756e6b5f73697a651910006c66696c655f656e747269657381a86470617468766d657461646174612f657874656e73696f6e2e7478746766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303234316a65786563757461626c65f66a73697a655f6279746573136b6368756e6b5f636f756e74016b66696c655f7368613235365820b5d30a60a8a6d0085418138c3193b2aba723ab78dd306690ab34be83a9103f746f66697273745f6368756e6b5f6c626101781a6d657461646174615f707265736572766174696f6e5f64617461a06e736368656d615f76657273696f6e016f6f626a6563745f6d65746164617461a263657874a178196f72672e72656d616e656e63652e7075626c69636174696f6e016a657874656e73696f6e738178196f72672e72656d616e656e63652e7075626c69636174696f6e7063616c6c65725f6f626a6563745f69647172616f2d74762d6578742d6d656d6265727365787465726e616c5f7265666572656e63657380",
+    "manifest_sha256": "33cc3ac1df7c9ab14c1ecd51dde7c52ae20027ecf33fb565bec87de7b3477212",
+    "file_payloads": [
+      {
+        "path": "metadata/extension.txt",
+        "size_bytes": 19,
+        "sha256": "b5d30a60a8a6d0085418138c3193b2aba723ab78dd306690ab34be83a9103f74"
+      }
+    ],
+    "symlinks": [],
+    "hardlinks": [],
+    "directories": [],
+    "xattrs": [],
+    "extensions": [],
+    "object_metadata": {
+      "extensions": [
+        "org.remanence.publication"
+      ],
+      "ext": {
+        "org.remanence.publication": 1
+      }
+    },
+    "default_restore": {
+      "skipped_xattrs": {},
+      "applied_privileged_xattrs": {},
+      "carried_extensions": [
+        "org.remanence.publication"
+      ],
+      "reported_values": false
+    },
+    "file_layouts": [
+      {
+        "entry_type": "regular",
+        "path": "metadata/extension.txt",
+        "pax_header_offset": 1024,
+        "data_offset": 4096,
+        "first_chunk_lba": 1,
+        "chunk_count": 1,
+        "pad_spaces": 1781
+      }
+    ],
+    "manifest_layout": {
+      "entry_type": "regular",
+      "path": "_remanence/manifest.cbor",
+      "pax_header_offset": 4608,
+      "data_offset": 8192,
+      "first_chunk_lba": 2,
+      "chunk_count": 1,
+      "pad_spaces": 2230
+    }
+  }
+}

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import argparse
+import copy
 import hashlib
 import json
 import os
@@ -15,6 +17,8 @@ import tempfile
 from collections.abc import Callable
 from typing import Any
 
+import verify_rao_vectors_independent as independent
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "specs" / "publication" / "remanence-test-vectors.tar"
@@ -23,6 +27,18 @@ RAO_ENCRYPTED_OBJECTS = (
     "rao-tv-d1-encrypted.rao",
     "rao-tv-e2.rao",
 )
+RAO_INCREMENT_OBJECTS = (
+    "rao-tv-portable-core-only.rao",
+    "rao-tv-nonuser-attribute.rao",
+    "rao-tv-ext-member.rao",
+    "rao-tv-attribute-ext-combined.rao",
+)
+RAO_INCREMENT_FIXTURES = {
+    "rao-tv-portable-core-only.rao": "rao-tv-portable-core-only.json",
+    "rao-tv-nonuser-attribute.rao": "rao-tv-nonuser-attribute.json",
+    "rao-tv-ext-member.rao": "rao-tv-ext-member.json",
+    "rao-tv-attribute-ext-combined.rao": "rao-tv-attribute-ext-combined.json",
+}
 
 
 def sha256(path: pathlib.Path) -> str:
@@ -76,6 +92,11 @@ def verify_encrypted_regeneration(first: pathlib.Path, second: pathlib.Path) -> 
             raise AssertionError(f"{filename} differs across deterministic regenerations")
         if first_bytes != pinned_bytes:
             raise AssertionError(f"{filename} differs from its checked-in pin")
+    for filename in RAO_INCREMENT_OBJECTS:
+        first_bytes = (first / filename).read_bytes()
+        second_bytes = (second / filename).read_bytes()
+        if first_bytes != second_bytes:
+            raise AssertionError(f"{filename} differs across deterministic regenerations")
 
 
 def crc64_xz(data: bytes | bytearray) -> int:
@@ -163,7 +184,178 @@ def semantic_vector(directory: pathlib.Path, metadata: dict[str, Any]) -> None:
     write_json(directory / "expected.json", metadata)
 
 
-def generate_negatives(rem_root: pathlib.Path) -> list[dict[str, Any]]:
+def independent_plaintext_definition(
+    vector_id: str,
+) -> tuple[dict[str, Any], list[independent.FileSpec]]:
+    """Return one fixed independent RAO definition by publication vector ID."""
+    for _filename, candidate_id, options, files in (
+        independent.positive_plaintext_vector_definitions()
+    ):
+        if candidate_id == vector_id:
+            return options, files
+    raise AssertionError(f"independent RAO definition {vector_id!r} is absent")
+
+
+def generate_rao_negatives(rao_root: pathlib.Path) -> list[dict[str, Any]]:
+    """Materialize the revised Section 13.6 manifest-profile negative objects."""
+    negative_root = rao_root / "negative" / "manifest"
+    records: list[dict[str, Any]] = []
+
+    def build_case(
+        vector_id: str,
+        base_vector_id: str,
+        expected_error: str,
+        assertion: str,
+        mutate: Callable[[dict[str, Any], bytes], bytes],
+        external_anchor: bool = False,
+    ) -> tuple[str, str]:
+        options, files = independent_plaintext_definition(base_vector_id)
+        base_bytes, base_layout = independent.build_plaintext(options, files)
+        manifest_value = independent.decode_cbor_exact(base_layout["manifest_cbor"])
+        if not isinstance(manifest_value, dict):
+            raise AssertionError(f"{base_vector_id} manifest is not a map")
+        tampered_manifest = mutate(copy.deepcopy(manifest_value), base_layout["manifest_cbor"])
+        tampered_bytes, tampered_layout = independent.build_plaintext_with_manifest(
+            options,
+            files,
+            tampered_manifest,
+        )
+        original_digest = hashlib.sha256(base_bytes).hexdigest()
+        tampered_digest = hashlib.sha256(tampered_bytes).hexdigest()
+        if original_digest == tampered_digest:
+            raise AssertionError(f"{vector_id} did not change plaintext_digest")
+
+        directory = negative_root / vector_id
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "faulted-object.rao").write_bytes(tampered_bytes)
+        write_json(
+            directory / "input.json",
+            {
+                "base_vector_id": base_vector_id,
+                "base_plaintext_digest": original_digest,
+                "base_manifest_sha256": base_layout["manifest_sha256"].hex(),
+                "constant_payloads": {
+                    spec.path: hashlib.sha256(spec.data).hexdigest()
+                    for spec in files
+                    if spec.entry_type == "regular"
+                },
+                **(
+                    {"external_manifest_anchor": base_layout["manifest_sha256"].hex()}
+                    if external_anchor
+                    else {}
+                ),
+            },
+        )
+        write_json(
+            directory / "expected.json",
+            {
+                "vector_id": vector_id,
+                "category": "manifest",
+                "expected_error": expected_error,
+                "assertion": assertion,
+                "plaintext_digest": tampered_digest,
+                "stored_digest": tampered_digest,
+                "manifest_sha256": tampered_layout["manifest_sha256"].hex(),
+                "payload_bytes_unchanged": True,
+            },
+        )
+        records.append(
+            {
+                "id": vector_id,
+                "category": "negative/manifest",
+                "path": directory,
+            }
+        )
+        return tampered_digest, tampered_layout["manifest_sha256"].hex()
+
+    def inventory_disagrees(manifest: dict[str, Any], _encoded: bytes) -> bytes:
+        manifest["object_metadata"]["attribute_namespaces"] = ["trusted"]
+        return independent.cbor(manifest)
+
+    def ext_is_not_map(manifest: dict[str, Any], _encoded: bytes) -> bytes:
+        manifest["object_metadata"]["ext"] = 1
+        return independent.cbor(manifest)
+
+    def noncanonical_ext_value(_manifest: dict[str, Any], encoded: bytes) -> bytes:
+        member = independent.cbor("org.remanence.publication")
+        canonical = member + b"\x01"
+        replacement = member + b"\x18\x01"
+        if encoded.count(canonical) != 1:
+            raise AssertionError("canonical extension member marker is not unique")
+        return encoded.replace(canonical, replacement, 1)
+
+    build_case(
+        "inventory-disagrees-with-entries",
+        "RAO-TV-NONUSER-ATTRIBUTE",
+        "ManifestInvalid",
+        "object_metadata attribute_namespaces differs from the entry xattr namespace",
+        inventory_disagrees,
+    )
+    build_case(
+        "ext-value-not-map",
+        "RAO-TV-EXT-MEMBER",
+        "ManifestInvalid",
+        "object_metadata ext value is not a map",
+        ext_is_not_map,
+    )
+    build_case(
+        "ext-member-noncanonical-cbor",
+        "RAO-TV-EXT-MEMBER",
+        "Cbor",
+        "ext member integer uses a non-shortest CBOR encoding",
+        noncanonical_ext_value,
+    )
+
+    def repoint_path(manifest: dict[str, Any], _encoded: bytes) -> bytes:
+        manifest["file_entries"][0]["path"] = "manifest/gamma.bin"
+        return independent.cbor(manifest)
+
+    def swap_file_sha256(manifest: dict[str, Any], _encoded: bytes) -> bytes:
+        entries = manifest["file_entries"]
+        entries[0]["file_sha256"], entries[1]["file_sha256"] = (
+            entries[1]["file_sha256"],
+            entries[0]["file_sha256"],
+        )
+        return independent.cbor(manifest)
+
+    def alter_first_chunk_lba(manifest: dict[str, Any], _encoded: bytes) -> bytes:
+        manifest["file_entries"][0]["first_chunk_lba"] += 1
+        return independent.cbor(manifest)
+
+    tamper_digests = {
+        build_case(
+            "manifest-tamper-repointed-path",
+            "RAO-TV-MANIFEST",
+            "ManifestDigestMismatch",
+            "external manifest anchor rejects a repointed path with constant payloads",
+            repoint_path,
+            external_anchor=True,
+        )[0],
+        build_case(
+            "manifest-tamper-swapped-file-sha256",
+            "RAO-TV-MANIFEST",
+            "ManifestDigestMismatch",
+            "external manifest anchor rejects swapped file_sha256 values with constant payloads",
+            swap_file_sha256,
+            external_anchor=True,
+        )[0],
+        build_case(
+            "manifest-tamper-altered-first-chunk-lba",
+            "RAO-TV-MANIFEST",
+            "ManifestDigestMismatch",
+            "external manifest anchor rejects altered first_chunk_lba with constant payloads",
+            alter_first_chunk_lba,
+            external_anchor=True,
+        )[0],
+    }
+    if len(tamper_digests) != 3:
+        raise AssertionError("manifest tamper vectors must have distinct plaintext digests")
+    return records
+
+
+def generate_negatives(
+    rem_root: pathlib.Path, rao_root: pathlib.Path
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     negative_root = rem_root / "negative"
     minimal = rem_root / "positive" / "minimal-image"
     external = rem_root / "positive" / "external-parity-map"
@@ -331,7 +523,7 @@ def generate_negatives(rem_root: pathlib.Path) -> list[dict[str, Any]]:
     semantic("recovery-reconstructed-crc-mismatch", "recovery", {"base": "positive/minimal-image", "failed_ordinal": 0, "expected_data_crc_xor": 1}, "Unrecoverable", "reconstructed bytes fail the pinned data CRC")
     semantic("recovery-pending-epoch", "recovery", {"failed_ordinal": 4, "highest_protected_ordinal": 4}, "UnrecoverablePendingEpoch", "ordinal at the protection watermark is refused before I/O")
     semantic("recovery-outside-prefix", "recovery", {"failed_ordinal": 4, "validated_prefix_ordinals": 4}, "OutsideValidatedMapPrefix", "ordinal outside authenticated prefix is refused before I/O")
-    return records
+    return records, generate_rao_negatives(rao_root)
 
 
 def generate_damage_matrix(rem_root: pathlib.Path) -> list[dict[str, Any]]:
@@ -382,10 +574,183 @@ def generate_damage_matrix(rem_root: pathlib.Path) -> list[dict[str, Any]]:
             },
         )
         records.append({"id": vector_id, "category": "damage-matrix", "path": directory})
+
+    source_directory = (
+        rem_root / "generated-sources" / "multi-parity-map-selection"
+    )
+    selection = json.loads(
+        (source_directory / "selection.json").read_text(encoding="utf-8")
+    )
+    vector_id = "multi-parity-map-selection"
+    directory = damage_root / vector_id
+    directory.mkdir(parents=True, exist_ok=True)
+    tape_files = sorted(source_directory.glob("tape-file-*.bin"))
+    layout = []
+    source_bytes = bytearray()
+    for tape_file_number, source in enumerate(tape_files):
+        data = source.read_bytes()
+        if len(data) % BLOCK_SIZE != 0:
+            raise AssertionError(f"{source.name} is not block aligned")
+        start_block = len(source_bytes) // BLOCK_SIZE
+        block_count = len(data) // BLOCK_SIZE
+        layout.append(
+            {
+                "tape_file_number": tape_file_number,
+                "artifact": source.name,
+                "concatenated_start_block": start_block,
+                "block_count": block_count,
+                "trailing_filemark": True,
+            }
+        )
+        shutil.copyfile(source, directory / source.name)
+        source_bytes.extend(data)
+    damaged_bootstrap = selection["damaged_referencing_bootstrap"]
+    bootstrap_layout = layout[damaged_bootstrap["tape_file_number"]]
+    unreadable_block = (
+        bootstrap_layout["concatenated_start_block"]
+        + damaged_bootstrap["block_index"]
+    )
+    (directory / "source-artifact.bin").write_bytes(source_bytes)
+    write_json(directory / "tape-layout.json", {"tape_files": layout})
+    write_json(
+        directory / "fault-map.json",
+        {
+            "fault_model": "transport-medium-error",
+            "block_size": BLOCK_SIZE,
+            "unreadable_block_indices": [unreadable_block],
+            "unreadable_tape_records": [
+                {
+                    **damaged_bootstrap,
+                    "concatenated_block_index": unreadable_block,
+                }
+            ],
+        },
+    )
+    write_json(
+        directory / "expected.json",
+        {
+            "vector_id": vector_id,
+            "category": "damage-matrix",
+            "expected_outcome": "structural-parity-map-selected",
+            "assertion": "ranking selects sequence 7, tape_file_number 4 wins the equal-key tie with a conflict report, and candidate overlay re-types the damaged referencing bootstrap before digest validation",
+            "whole_tape_failure": False,
+            "no_usable_bootstrap_directory": True,
+            **selection,
+        },
+    )
+    records.append(
+        {"id": vector_id, "category": "damage-matrix", "path": directory}
+    )
+    shutil.rmtree(rem_root / "generated-sources")
     return records
 
 
-def build_vector_index(rem_root: pathlib.Path, records: list[dict[str, Any]]) -> None:
+def verify_existing_parity_pins(rem_root: pathlib.Path) -> None:
+    """Require every previously published parity artifact to remain byte-exact."""
+    with tarfile.open(OUTPUT, mode="r") as archive:
+        for member in archive.getmembers():
+            prefix = "rem-parity-1/"
+            if (
+                not member.isfile()
+                or not member.name.startswith(prefix)
+                or member.name == f"{prefix}vectors.json"
+            ):
+                continue
+            relative = member.name.removeprefix(prefix)
+            generated = rem_root / relative
+            if not generated.is_file():
+                raise AssertionError(
+                    f"previously published parity artifact is absent: {member.name}"
+                )
+            pinned = archive.extractfile(member)
+            if pinned is None:
+                raise AssertionError(f"cannot read pinned parity artifact: {member.name}")
+            if generated.read_bytes() != pinned.read():
+                raise AssertionError(
+                    f"previously published parity artifact changed: {member.name}"
+                )
+
+
+def build_rao_vector_index(
+    rao_root: pathlib.Path, negative_records: list[dict[str, Any]]
+) -> None:
+    """Index the additive RAO metadata positives and executable negatives."""
+    indexed: list[dict[str, Any]] = []
+    for object_name, fixture_name in sorted(RAO_INCREMENT_FIXTURES.items()):
+        object_path = rao_root / "objects" / object_name
+        fixture_path = rao_root / "manifests" / fixture_name
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        expected = fixture["expected"]
+        artifacts = sorted(
+            [
+                {
+                    "path": object_path.relative_to(rao_root).as_posix(),
+                    "size": object_path.stat().st_size,
+                    "sha256": sha256(object_path),
+                },
+                {
+                    "path": fixture_path.relative_to(rao_root).as_posix(),
+                    "size": fixture_path.stat().st_size,
+                    "sha256": sha256(fixture_path),
+                },
+            ],
+            key=lambda item: item["path"],
+        )
+        canonical = "".join(
+            f"{item['sha256']}  {item['path']}\n" for item in artifacts
+        ).encode("utf-8")
+        if expected["full_object_sha256"] != sha256(object_path):
+            raise AssertionError(f"{object_name} fixture does not pin its object bytes")
+        indexed.append(
+            {
+                "id": fixture["vector_id"],
+                "category": "positive",
+                "archive_path": object_path.relative_to(rao_root).as_posix(),
+                "checksum_sha256": hashlib.sha256(canonical).hexdigest(),
+                "artifacts": artifacts,
+                "full_object_sha256": expected["full_object_sha256"],
+                "plaintext_digest": expected["plaintext_digest"],
+                "first_block_sha256": expected["first_block_sha256"],
+                "manifest_sha256": expected["manifest_sha256"],
+                "object_metadata": expected["object_metadata"],
+            }
+        )
+    for record in sorted(negative_records, key=lambda item: item["id"]):
+        checksum, artifacts = artifact_checksum(record["path"])
+        expected = json.loads(
+            (record["path"] / "expected.json").read_text(encoding="utf-8")
+        )
+        indexed.append(
+            {
+                "id": record["id"],
+                "category": record["category"],
+                "archive_path": record["path"].relative_to(rao_root).as_posix(),
+                "checksum_sha256": checksum,
+                "artifacts": artifacts,
+                "expected_error": expected["expected_error"],
+                "plaintext_digest": expected["plaintext_digest"],
+                "stored_digest": expected["stored_digest"],
+                "manifest_sha256": expected["manifest_sha256"],
+            }
+        )
+    write_json(
+        rao_root / "vectors.json",
+        {
+            "vector_set": "RAO-1.0-PUBLICATION-INCREMENT",
+            "spec_section": "13.1 and 13.6",
+            "status": "complete-standalone-distribution",
+            "checksum_definition": "SHA-256 of sorted '<artifact-sha256>  <relative-path>\\n' records within each vector",
+            "vectors": indexed,
+        },
+    )
+
+
+def build_vector_index(
+    rem_root: pathlib.Path,
+    records: list[dict[str, Any]],
+    rao_root: pathlib.Path,
+    rao_negative_records: list[dict[str, Any]],
+) -> None:
     arithmetic = json.loads((rem_root / "vectors.json").read_text(encoding="utf-8"))["arithmetic"]
     indexed = []
     for record in sorted(records, key=lambda item: (item["category"], item["id"])):
@@ -410,9 +775,21 @@ def build_vector_index(rem_root: pathlib.Path, records: list[dict[str, Any]]) ->
             "vectors": indexed,
         },
     )
+    build_rao_vector_index(rao_root, rao_negative_records)
 
 
-def main() -> int:
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--stage-directory",
+        type=pathlib.Path,
+        help="copy the verified tree here and do not regenerate the pinned tar",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
     with tempfile.TemporaryDirectory(prefix="remanence-publication-vectors-") as tmp_name:
         temporary_root = pathlib.Path(tmp_name)
         stage = pathlib.Path(tmp_name) / "remanence-test-vectors"
@@ -442,10 +819,17 @@ def main() -> int:
                 str(stage / "rao" / "objects"),
                 "--encrypted-object-directory",
                 str(encrypted_first),
+                "--rust-object-directory",
+                str(encrypted_first),
             ],
             cwd=ROOT,
             check=True,
         )
+        for filename in RAO_INCREMENT_OBJECTS:
+            shutil.copyfile(
+                encrypted_first / filename,
+                stage / "rao" / "objects" / filename,
+            )
         subprocess.run(
             [
                 "cargo",
@@ -467,9 +851,18 @@ def main() -> int:
             for directory in sorted((rem_root / "positive").iterdir())
             if directory.is_dir()
         ]
-        records.extend(generate_negatives(rem_root))
+        rem_negative_records, rao_negative_records = generate_negatives(
+            rem_root, stage / "rao"
+        )
+        records.extend(rem_negative_records)
         records.extend(generate_damage_matrix(rem_root))
-        build_vector_index(rem_root, records)
+        verify_existing_parity_pins(rem_root)
+        build_vector_index(
+            rem_root,
+            records,
+            stage / "rao",
+            rao_negative_records,
+        )
 
         shutil.copyfile(
             ROOT / "tools" / "verify_publication_test_vectors.py",
@@ -479,6 +872,7 @@ def main() -> int:
             "claim\tentrypoint\tartifacts\n"
             "RAO positive byte identity\tpython3 verify.py\trao/objects/*.rao\n"
             "RAO negative conformance\tpython3 verify.py\trao/manifests/negative-*.json\n"
+            "RAO metadata and extension increment\tpython3 verify.py\trao/vectors.json; rao/negative/manifest/*\n"
             "REM-PARITY positive images\tpython3 verify.py\trem-parity-1/positive/*\n"
             "REM-PARITY negative taxonomy\tpython3 verify.py\trem-parity-1/negative/*/*\n"
             "REM-PARITY damage matrix\tpython3 verify.py\trem-parity-1/damage-matrix/*\n"
@@ -499,6 +893,12 @@ def main() -> int:
         (stage / "CHECKSUMS.sha256").write_text(checksums, encoding="utf-8", newline="\n")
 
         subprocess.run([sys.executable, str(stage / "verify.py"), str(stage)], check=True)
+
+        if args.stage_directory is not None:
+            shutil.copytree(stage, args.stage_directory)
+            checksum, _artifacts = artifact_checksum(args.stage_directory)
+            print(f"{checksum}  {args.stage_directory} (verified staging tree; tar unchanged)")
+            return 0
 
         OUTPUT.parent.mkdir(parents=True, exist_ok=True)
         temporary_output = OUTPUT.with_suffix(".tar.tmp")

@@ -62,23 +62,42 @@ REQUIRED_DAMAGE = {
     "sidecar-footer-and-primary",
     "parity-map-primary",
     "bootstrap-copy",
+    "multi-parity-map-selection",
 }
 REQUIRED_RAO_OBJECTS = {
+    "rao-tv-attribute-ext-combined.rao",
     "rao-tv-boundary.rao",
     "rao-tv-d1-encrypted.rao",
     "rao-tv-d1-plaintext.rao",
     "rao-tv-e2.rao",
+    "rao-tv-ext-member.rao",
     "rao-tv-empty-file.rao",
     "rao-tv-empty.rao",
     "rao-tv-hardlinks.rao",
     "rao-tv-manifest.rao",
     "rao-tv-metadata.rao",
     "rao-tv-nonregular.rao",
+    "rao-tv-nonuser-attribute.rao",
     "rao-tv-one-byte.rao",
     "rao-tv-order.rao",
     "rao-tv-p1.rao",
     "rao-tv-paths.rao",
+    "rao-tv-portable-core-only.rao",
     "rao-tv-xattrs.rao",
+}
+REQUIRED_RAO_INCREMENT = {
+    "RAO-TV-PORTABLE-CORE-ONLY",
+    "RAO-TV-NONUSER-ATTRIBUTE",
+    "RAO-TV-EXT-MEMBER",
+    "RAO-TV-ATTRIBUTE-EXT-COMBINED",
+}
+REQUIRED_RAO_NEGATIVE = {
+    "inventory-disagrees-with-entries": "ManifestInvalid",
+    "ext-value-not-map": "ManifestInvalid",
+    "ext-member-noncanonical-cbor": "Cbor",
+    "manifest-tamper-repointed-path": "ManifestDigestMismatch",
+    "manifest-tamper-swapped-file-sha256": "ManifestDigestMismatch",
+    "manifest-tamper-altered-first-chunk-lba": "ManifestDigestMismatch",
 }
 REQUIRED_KEY_FRAME_CASES = {
     "version-flip",
@@ -172,6 +191,109 @@ def main() -> int:
         rao_root / "objects" / "rao-tv-d1-encrypted.rao"
     ):
         fail("RAO-TV-D1 encrypted stored_digest does not match its pinned object")
+
+    rao_index = load_json(rao_root / "vectors.json")
+    rao_vectors = rao_index.get("vectors")
+    if not isinstance(rao_vectors, list) or not all(
+        isinstance(item, dict) for item in rao_vectors
+    ):
+        fail("rao/vectors.json has no valid vector list")
+    increment = {
+        item.get("id") for item in rao_vectors if item.get("category") == "positive"
+    }
+    if increment != REQUIRED_RAO_INCREMENT:
+        fail(
+            "RAO increment coverage differs: "
+            f"missing={sorted(REQUIRED_RAO_INCREMENT - increment)}, "
+            f"extra={sorted(increment - REQUIRED_RAO_INCREMENT)}"
+        )
+    rao_negative = {
+        item.get("id"): item
+        for item in rao_vectors
+        if item.get("category") == "negative/manifest"
+    }
+    if set(rao_negative) != set(REQUIRED_RAO_NEGATIVE):
+        fail(
+            "RAO manifest-negative coverage differs: "
+            f"missing={sorted(set(REQUIRED_RAO_NEGATIVE) - set(rao_negative))}, "
+            f"extra={sorted(set(rao_negative) - set(REQUIRED_RAO_NEGATIVE))}"
+        )
+    tamper_digests = set()
+    for item in rao_vectors:
+        artifacts = item.get("artifacts")
+        if not isinstance(artifacts, list):
+            fail(f"RAO vector {item.get('id')!r} has no artifacts")
+        canonical = "".join(
+            f"{artifact['sha256']}  {artifact['path']}\n"
+            for artifact in sorted(artifacts, key=lambda value: value["path"])
+        ).encode("utf-8")
+        if hashlib.sha256(canonical).hexdigest() != item.get("checksum_sha256"):
+            fail(f"RAO vector checksum mismatch for {item.get('id')}")
+        vector_root = rao_root
+        if item.get("category") == "negative/manifest":
+            vector_root /= item["archive_path"]
+        for artifact in artifacts:
+            path = vector_root / artifact["path"]
+            if not path.is_file() or sha256(path) != artifact["sha256"]:
+                fail(f"RAO vector artifact mismatch for {item.get('id')}/{artifact['path']}")
+        if item.get("category") == "positive":
+            object_path = rao_root / item["archive_path"]
+            if item.get("full_object_sha256") != sha256(object_path):
+                fail(f"RAO positive {item.get('id')} full_object_sha256 mismatch")
+            if item.get("plaintext_digest") != item.get("full_object_sha256"):
+                fail(f"RAO positive {item.get('id')} plaintext_digest mismatch")
+            if item.get("first_block_sha256") != hashlib.sha256(
+                object_path.read_bytes()[:4096]
+            ).hexdigest():
+                fail(f"RAO positive {item.get('id')} first_block_sha256 mismatch")
+            fixture_artifacts = [
+                artifact
+                for artifact in artifacts
+                if str(artifact.get("path", "")).endswith(".json")
+            ]
+            if len(fixture_artifacts) != 1:
+                fail(f"RAO positive {item.get('id')} does not have one fixture artifact")
+            fixture = load_json(rao_root / fixture_artifacts[0]["path"])
+            fixture_expected = fixture.get("expected")
+            if not isinstance(fixture_expected, dict):
+                fail(f"RAO positive {item.get('id')} fixture lacks expected pins")
+            for field in (
+                "full_object_sha256",
+                "plaintext_digest",
+                "first_block_sha256",
+                "manifest_sha256",
+                "object_metadata",
+            ):
+                if item.get(field) != fixture_expected.get(field):
+                    fail(f"RAO positive {item.get('id')} index disagrees on {field}")
+        elif item.get("category") == "negative/manifest":
+            expected = load_json(vector_root / "expected.json")
+            required_error = REQUIRED_RAO_NEGATIVE[item["id"]]
+            if expected.get("expected_error") != required_error:
+                fail(f"RAO negative {item['id']} has the wrong typed error")
+            for field in (
+                "expected_error",
+                "plaintext_digest",
+                "stored_digest",
+                "manifest_sha256",
+            ):
+                if item.get(field) != expected.get(field):
+                    fail(f"RAO negative {item['id']} index disagrees on {field}")
+            if expected.get("stored_digest") != expected.get("plaintext_digest"):
+                fail(f"RAO negative {item['id']} plaintext stored_digest differs")
+            if expected.get("payload_bytes_unchanged") is not True:
+                fail(f"RAO negative {item['id']} does not pin constant payloads")
+            if item["id"].startswith("manifest-tamper-"):
+                input_value = load_json(vector_root / "input.json")
+                if not isinstance(input_value.get("external_manifest_anchor"), str):
+                    fail(f"RAO tamper {item['id']} lacks its external anchor")
+                if expected.get("plaintext_digest") == input_value.get(
+                    "base_plaintext_digest"
+                ):
+                    fail(f"RAO tamper {item['id']} did not change plaintext_digest")
+                tamper_digests.add(expected.get("plaintext_digest"))
+    if len(tamper_digests) != 3:
+        fail("RAO manifest tamper plaintext digests are not distinct")
     key_frame_negative = load_json(manifests / "negative-key-frame.json")
     if key_frame_negative.get("status") != "complete":
         fail("negative-key-frame.json is not marked complete")
@@ -252,6 +374,71 @@ def main() -> int:
                 fail(f"damage vector {item['id']} has no unreadable blocks")
             if expected.get("whole_tape_failure") is not False:
                 fail(f"damage vector {item['id']} does not rule out whole-tape failure")
+            if item["id"] == "multi-parity-map-selection":
+                layout = load_json(vector_root / "tape-layout.json")
+                tape_files = layout.get("tape_files")
+                if not isinstance(tape_files, list) or len(tape_files) != 8:
+                    fail("multi-parity-map image does not pin eight tape files")
+                parity_maps = [
+                    row
+                    for row in tape_files
+                    if isinstance(row, dict)
+                    and "parity-map" in str(row.get("artifact", ""))
+                ]
+                if len(parity_maps) < 2:
+                    fail("multi-parity-map image has fewer than two parity_map files")
+                if expected.get("no_usable_bootstrap_directory") is not True:
+                    fail("multi-parity-map image does not rule out bootstrap directory use")
+                if expected.get("selected_parity_map_tape_file_number") != 4:
+                    fail("multi-parity-map image selected the wrong tape file")
+                scope = expected.get("selected_scope")
+                if not isinstance(scope, dict) or scope != {
+                    "highest_protected_ordinal": 1,
+                    "is_final_directory": True,
+                    "tape_file_count": 8,
+                    "total_data_ordinals": 2,
+                }:
+                    fail("multi-parity-map selected scope is not pinned exactly")
+                conflict = expected.get("identical_key_report")
+                if not isinstance(conflict, dict) or conflict != {
+                    "candidate_tape_file_numbers": [4, 6],
+                    "chosen_tape_file_number": 4,
+                    "content_disagrees": True,
+                }:
+                    fail("multi-parity-map identical-key report is incomplete")
+                if expected.get("ranking_candidates") != [
+                    {"key": [True, 6, 2], "tape_file_number": 2},
+                    {"key": [True, 7, 2], "tape_file_number": 4},
+                    {"key": [True, 7, 2], "tape_file_number": 6},
+                ]:
+                    fail("multi-parity-map ranking candidates are not pinned exactly")
+                if not isinstance(expected.get("recovered_map_cbor_hex"), str) or not isinstance(
+                    expected.get("recovered_map_sha256"), str
+                ):
+                    fail("multi-parity-map recovered map is not byte-pinned")
+                try:
+                    recovered_map = bytes.fromhex(expected["recovered_map_cbor_hex"])
+                except ValueError:
+                    fail("multi-parity-map recovered map is not valid hex")
+                if hashlib.sha256(recovered_map).hexdigest() != expected[
+                    "recovered_map_sha256"
+                ]:
+                    fail("multi-parity-map recovered map digest does not match its bytes")
+                concatenated = b"".join(
+                    (vector_root / row["artifact"]).read_bytes()
+                    for row in tape_files
+                )
+                if concatenated != source_file.read_bytes():
+                    fail("multi-parity-map source artifact differs from its tape files")
+                unreadable = fault_map.get("unreadable_tape_records")
+                if not isinstance(unreadable, list) or unreadable != [
+                    {
+                        "block_index": 0,
+                        "concatenated_block_index": 13,
+                        "tape_file_number": 7,
+                    }
+                ]:
+                    fail("multi-parity-map fault does not target the referencing bootstrap head")
 
     print(f"PASS: {len(vectors)} REM-PARITY vectors and all archive checksums verified")
     return 0
