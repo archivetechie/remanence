@@ -1,0 +1,86 @@
+{
+  "vector_id": "RAO-TV-PORTABLE-CORE-ONLY",
+  "spec_section": "13.1",
+  "status": "pinned-at-generation",
+  "independent_rederivation": "verified by tools/verify_rao_vectors_independent.py",
+  "inputs": {
+    "chunk_size": 4096,
+    "object_id": "00000000-0000-4000-8000-000000000112",
+    "caller_object_id": "rao-tv-portable-core-only",
+    "write_timestamp": "2026-01-01T00:00:00Z",
+    "metadata_preservation": "minimal",
+    "manifest_file_id": "00000000-0000-4000-8000-000000000112",
+    "entries": [
+      {
+        "entry_type": "regular",
+        "path": "metadata/portable.txt",
+        "file_id": "00000000-0000-4000-8000-000000000221",
+        "size_bytes": 18,
+        "link_target": null,
+        "mtime": null,
+        "executable": null,
+        "xattrs": {
+          "user.comment": "7075626c69636174696f6e2d636f7265"
+        }
+      }
+    ]
+  },
+  "expected": {
+    "schema_version": "1.1",
+    "stored_size_bytes": 12288,
+    "stored_size_blocks": 3,
+    "stored_digest": "bc8bc291f98698121c644eb3a37084b93293760ea9fc201ef4cd3c0ea8231ada",
+    "full_object_sha256": "bc8bc291f98698121c644eb3a37084b93293760ea9fc201ef4cd3c0ea8231ada",
+    "plaintext_digest": "bc8bc291f98698121c644eb3a37084b93293760ea9fc201ef4cd3c0ea8231ada",
+    "first_block_sha256": "07a81b4c51354ad76881e3a155ecd065a59377dbacec040f62b3258c627a7372",
+    "manifest_cbor_len": 416,
+    "manifest_cbor_hex": "a7696f626a6563745f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303131326a6368756e6b5f73697a651910006c66696c655f656e747269657381a86470617468756d657461646174612f706f727461626c652e7478746766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303232316a65786563757461626c65f66a73697a655f6279746573126b6368756e6b5f636f756e74016b66696c655f7368613235365820a8762536e4946c2a554e1450e99beab446d6d4f4ac5c09c3f34c29a0b534da3a6f66697273745f6368756e6b5f6c626101781a6d657461646174615f707265736572766174696f6e5f64617461a166786174747273a16c757365722e636f6d6d656e74507075626c69636174696f6e2d636f72656e736368656d615f76657273696f6e016f6f626a6563745f6d65746164617461a07063616c6c65725f6f626a6563745f6964781972616f2d74762d706f727461626c652d636f72652d6f6e6c797365787465726e616c5f7265666572656e63657380",
+    "manifest_sha256": "3c5d2298d845e6d1ebf9f456dd1bfc30652b62151e9cacfc281be040fd96f4af",
+    "file_payloads": [
+      {
+        "path": "metadata/portable.txt",
+        "size_bytes": 18,
+        "sha256": "a8762536e4946c2a554e1450e99beab446d6d4f4ac5c09c3f34c29a0b534da3a"
+      }
+    ],
+    "symlinks": [],
+    "hardlinks": [],
+    "directories": [],
+    "xattrs": [
+      {
+        "path": "metadata/portable.txt",
+        "xattrs": {
+          "user.comment": "7075626c69636174696f6e2d636f7265"
+        }
+      }
+    ],
+    "extensions": [],
+    "object_metadata": {},
+    "default_restore": {
+      "skipped_xattrs": {},
+      "applied_privileged_xattrs": {},
+      "carried_extensions": [],
+      "reported_values": false
+    },
+    "file_layouts": [
+      {
+        "entry_type": "regular",
+        "path": "metadata/portable.txt",
+        "pax_header_offset": 1024,
+        "data_offset": 4096,
+        "first_chunk_lba": 1,
+        "chunk_count": 1,
+        "pad_spaces": 1782
+      }
+    ],
+    "manifest_layout": {
+      "entry_type": "regular",
+      "path": "_remanence/manifest.cbor",
+      "pax_header_offset": 4608,
+      "data_offset": 8192,
+      "first_chunk_lba": 2,
+      "chunk_count": 1,
+      "pad_spaces": 2230
+    }
+  }
+}

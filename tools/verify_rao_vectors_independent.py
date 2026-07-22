@@ -66,6 +66,12 @@ HPKE_AEAD_ID = 0x0003
 RAO_KEY_FRAME_MIN_LEN = 103
 RAO_KEY_FRAME_MAX_LEN = 4096
 RAO_KEY_FRAME_MAX_SLOTS = 8
+PUBLICATION_INCREMENT_FIXTURES = {
+    "rao-tv-portable-core-only.json",
+    "rao-tv-nonuser-attribute.json",
+    "rao-tv-ext-member.json",
+    "rao-tv-attribute-ext-combined.json",
+}
 
 
 @dataclass
@@ -89,6 +95,7 @@ class FileSpec:
     executable: bool | None = None
     mtime: str | None = None
     xattrs: dict[str, bytes] = field(default_factory=dict)
+    extensions: dict[str, Any] = field(default_factory=dict)
 
     @property
     def size_bytes(self) -> int:
@@ -112,6 +119,7 @@ class FileLayout:
     entry_type: str
     link_target: str | None
     xattrs: dict[str, bytes]
+    extensions: dict[str, Any]
     executable: bool | None
     first_chunk_lba: int | None
     chunk_count: int
@@ -520,6 +528,7 @@ def plan_one_file(chunk_size: int, offset: int, spec: FileSpec, is_manifest: boo
         entry_type=spec.entry_type,
         link_target=spec.link_target,
         xattrs=dict(spec.xattrs),
+        extensions=dict(spec.extensions),
         executable=spec.executable,
         first_chunk_lba=None if spec.size_bytes == 0 else data_offset // chunk_size,
         chunk_count=chunk_count(spec.size_bytes, chunk_size),
@@ -534,6 +543,8 @@ def manifest_entry(layout: FileLayout) -> dict[str, Any]:
     metadata_preservation_data: dict[str, Any] = {}
     if layout.xattrs:
         metadata_preservation_data["xattrs"] = dict(layout.xattrs)
+    if layout.extensions:
+        metadata_preservation_data["ext"] = dict(layout.extensions)
     entry = {
         "chunk_count": layout.chunk_count,
         "executable": layout.executable,
@@ -552,6 +563,41 @@ def manifest_entry(layout: FileLayout) -> dict[str, Any]:
     return entry
 
 
+def xattr_namespace(name: str) -> str | None:
+    """Return the text before the first dot, matching RAO Section 4.7.3."""
+    return name.split(".", 1)[0] if "." in name else None
+
+
+def canonical_text_names(names: set[str]) -> list[str]:
+    """Sort names by their deterministic-CBOR text-key encodings."""
+    return sorted(names, key=cbor)
+
+
+def manifest_object_metadata(
+    options: dict[str, Any], layouts: list[FileLayout]
+) -> dict[str, Any]:
+    """Build the names-only non-core metadata inventory and object ext map."""
+    attribute_namespaces = {
+        namespace
+        for layout in layouts
+        for name in layout.xattrs
+        if (namespace := xattr_namespace(name)) is not None and namespace != "user"
+    }
+    object_extensions = dict(options.get("extensions", {}))
+    extension_names = set(object_extensions)
+    extension_names.update(
+        name for layout in layouts for name in layout.extensions
+    )
+    metadata: dict[str, Any] = {}
+    if attribute_namespaces:
+        metadata["attribute_namespaces"] = canonical_text_names(attribute_namespaces)
+    if extension_names:
+        metadata["extensions"] = canonical_text_names(extension_names)
+    if object_extensions:
+        metadata["ext"] = object_extensions
+    return metadata
+
+
 def encode_manifest(options: dict[str, Any], layouts: list[FileLayout]) -> bytes:
     return cbor(
         {
@@ -560,7 +606,7 @@ def encode_manifest(options: dict[str, Any], layouts: list[FileLayout]) -> bytes
             "external_references": [],
             "file_entries": [manifest_entry(layout) for layout in layouts],
             "object_id": options["object_id"],
-            "object_metadata": {},
+            "object_metadata": manifest_object_metadata(options, layouts),
             "schema_version": 1,
         }
     )
@@ -603,7 +649,12 @@ def append_file_entry(out: bytearray, spec: FileSpec, records: dict[str, str], i
         raise AssertionError(f"unknown vector entry_type {spec.entry_type!r}")
 
 
-def build_plaintext(options: dict[str, Any], files: list[FileSpec]) -> tuple[bytes, dict[str, Any]]:
+def build_plaintext_with_manifest(
+    options: dict[str, Any],
+    files: list[FileSpec],
+    manifest_cbor: bytes | None = None,
+) -> tuple[bytes, dict[str, Any]]:
+    """Build canonical RAO tar bytes, optionally carrying supplied manifest bytes."""
     chunk_size = options["chunk_size"]
     out = bytearray()
     global_body = encode_pax_records(global_pax_records(options, stream_schema_version(files)))
@@ -618,7 +669,8 @@ def build_plaintext(options: dict[str, Any], files: list[FileSpec]) -> tuple[byt
         assert_eq(len(out), next_offset, f"{spec.path} next offset")
         layouts.append(layout)
 
-    manifest_cbor = encode_manifest(options, layouts)
+    if manifest_cbor is None:
+        manifest_cbor = encode_manifest(options, layouts)
     manifest_spec = FileSpec(
         path=MANIFEST_PATH,
         file_id=options["manifest_file_id"],
@@ -637,6 +689,13 @@ def build_plaintext(options: dict[str, Any], files: list[FileSpec]) -> tuple[byt
         "manifest_cbor": manifest_cbor,
         "manifest_sha256": sha256(manifest_cbor),
     }
+
+
+def build_plaintext(
+    options: dict[str, Any], files: list[FileSpec]
+) -> tuple[bytes, dict[str, Any]]:
+    """Build canonical RAO tar bytes and its deterministically encoded manifest."""
+    return build_plaintext_with_manifest(options, files)
 
 
 def hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
@@ -693,6 +752,13 @@ def check_plaintext(vector_id: str, fixture: dict[str, Any], plaintext: bytes, l
     assert_eq(len(layout["manifest_cbor"]), expected["manifest_cbor_len"], f"{vector_id} manifest_cbor_len")
     assert_eq(hx(layout["manifest_cbor"]), expected["manifest_cbor_hex"], f"{vector_id} manifest_cbor_hex")
     assert_eq(hx(layout["manifest_sha256"]), expected["manifest_sha256"], f"{vector_id} manifest_sha256")
+    for digest_field in ("full_object_sha256", "plaintext_digest"):
+        if digest_field in expected:
+            assert_eq(
+                hx(sha256(plaintext)),
+                expected[digest_field],
+                f"{vector_id} {digest_field}",
+            )
 
 
 def check_layouts(vector_id: str, layouts: list[FileLayout], expected_layouts: list[dict[str, Any]]) -> None:
@@ -901,6 +967,67 @@ def positive_plaintext_vector_definitions() -> list[tuple[str, str, dict[str, An
                 ),
             ],
         ),
+        (
+            "rao-tv-portable-core-only.json",
+            "RAO-TV-PORTABLE-CORE-ONLY",
+            vector_options(112, "rao-tv-portable-core-only", "000000000112"),
+            [
+                FileSpec(
+                    "metadata/portable.txt",
+                    "00000000-0000-4000-8000-000000000221",
+                    b"portable metadata\n",
+                    xattrs={"user.comment": b"publication-core"},
+                )
+            ],
+        ),
+        (
+            "rao-tv-nonuser-attribute.json",
+            "RAO-TV-NONUSER-ATTRIBUTE",
+            vector_options(113, "rao-tv-nonuser-attribute", "000000000113"),
+            [
+                FileSpec(
+                    "metadata/security.txt",
+                    "00000000-0000-4000-8000-000000000231",
+                    b"non-user metadata\n",
+                    xattrs={
+                        "security.remanence.test": b"publication-secret-value"
+                    },
+                )
+            ],
+        ),
+        (
+            "rao-tv-ext-member.json",
+            "RAO-TV-EXT-MEMBER",
+            {
+                **vector_options(114, "rao-tv-ext-member", "000000000114"),
+                "extensions": {"org.remanence.publication": 1},
+            },
+            [
+                FileSpec(
+                    "metadata/extension.txt",
+                    "00000000-0000-4000-8000-000000000241",
+                    b"extension metadata\n",
+                )
+            ],
+        ),
+        (
+            "rao-tv-attribute-ext-combined.json",
+            "RAO-TV-ATTRIBUTE-EXT-COMBINED",
+            vector_options(115, "rao-tv-attribute-ext-combined", "000000000115"),
+            [
+                FileSpec(
+                    "metadata/combined.txt",
+                    "00000000-0000-4000-8000-000000000251",
+                    b"combined metadata\n",
+                    xattrs={"trusted.remanence.test": b"carry-only-value"},
+                    extensions={
+                        "org.remanence.entry-metadata": {
+                            "opaque": "carried"
+                        }
+                    },
+                )
+            ],
+        ),
     ]
 
 
@@ -928,6 +1055,8 @@ def input_entry_json(spec: FileSpec) -> dict[str, Any]:
     }
     if spec.xattrs:
         entry["xattrs"] = {name: hx(value) for name, value in spec.xattrs.items()}
+    if spec.extensions:
+        entry["extensions"] = spec.extensions
     return entry
 
 
@@ -942,8 +1071,48 @@ def expected_xattrs(files: list[FileSpec]) -> list[dict[str, Any]]:
     ]
 
 
+def expected_extensions(files: list[FileSpec]) -> list[dict[str, Any]]:
+    return [
+        {"path": spec.path, "extensions": spec.extensions}
+        for spec in files
+        if spec.extensions
+    ]
+
+
+def expected_default_restore(files: list[FileSpec]) -> dict[str, Any]:
+    skipped_xattrs = {
+        spec.path: sorted(
+            name
+            for name in spec.xattrs
+            if xattr_namespace(name) not in {None, "user"}
+        )
+        for spec in files
+        if any(
+            xattr_namespace(name) not in {None, "user"} for name in spec.xattrs
+        )
+    }
+    carried_extensions = canonical_text_names(
+        {
+            name
+            for spec in files
+            for name in spec.extensions
+        }
+    )
+    return {
+        "skipped_xattrs": skipped_xattrs,
+        "applied_privileged_xattrs": {},
+        "carried_extensions": carried_extensions,
+        "reported_values": False,
+    }
+
+
 def fixture_json(vector_id: str, options: dict[str, Any], files: list[FileSpec]) -> dict[str, Any]:
     plaintext, layout = build_plaintext(options, files)
+    object_metadata = manifest_object_metadata(options, layout["files"])
+    default_restore = expected_default_restore(files)
+    default_restore["carried_extensions"] = canonical_text_names(
+        set(default_restore["carried_extensions"]) | set(options.get("extensions", {}))
+    )
     return {
         "vector_id": vector_id,
         "spec_section": "13.1",
@@ -958,6 +1127,8 @@ def fixture_json(vector_id: str, options: dict[str, Any], files: list[FileSpec])
             "stored_size_bytes": len(plaintext),
             "stored_size_blocks": len(plaintext) // options["chunk_size"],
             "stored_digest": hx(sha256(plaintext)),
+            "full_object_sha256": hx(sha256(plaintext)),
+            "plaintext_digest": hx(sha256(plaintext)),
             "first_block_sha256": hx(sha256(plaintext[: options["chunk_size"]])),
             "manifest_cbor_len": len(layout["manifest_cbor"]),
             "manifest_cbor_hex": hx(layout["manifest_cbor"]),
@@ -983,6 +1154,9 @@ def fixture_json(vector_id: str, options: dict[str, Any], files: list[FileSpec])
             ],
             "directories": [spec.path for spec in files if spec.entry_type == "directory"],
             "xattrs": expected_xattrs(files),
+            "extensions": expected_extensions(files),
+            "object_metadata": object_metadata,
+            "default_restore": default_restore,
             "file_layouts": [layout_json(file_layout) for file_layout in layout["files"]],
             "manifest_layout": layout_json(layout["manifest"]),
         },
@@ -1688,6 +1862,16 @@ def check_positive_plaintext_fixture(
     fixture = load(fixture_directory, filename)
     expected = fixture["expected"]
     assert_eq(fixture["vector_id"], vector_id, f"{vector_id} fixture id")
+    assert_eq(
+        fixture["inputs"].get("extensions", {}),
+        options.get("extensions", {}),
+        f"{vector_id} object extensions input",
+    )
+    assert_eq(
+        fixture["inputs"]["entries"],
+        [input_entry_json(spec) for spec in files],
+        f"{vector_id} entry inputs",
+    )
     plaintext, layout = build_plaintext(options, files)
     check_plaintext(vector_id, fixture, plaintext, layout, expected)
     check_layouts(vector_id, layout["files"], expected["file_layouts"])
@@ -1712,6 +1896,29 @@ def check_positive_plaintext_fixture(
     )
     assert_eq(expected.get("directories", []), [spec.path for spec in files if spec.entry_type == "directory"], f"{vector_id} directories")
     assert_eq(expected.get("xattrs", []), expected_xattrs(files), f"{vector_id} xattrs")
+    if "extensions" in expected:
+        assert_eq(
+            expected["extensions"],
+            expected_extensions(files),
+            f"{vector_id} extensions",
+        )
+    if "object_metadata" in expected:
+        assert_eq(
+            expected["object_metadata"],
+            manifest_object_metadata(options, layout["files"]),
+            f"{vector_id} object_metadata",
+        )
+    if "default_restore" in expected:
+        default_restore = expected_default_restore(files)
+        default_restore["carried_extensions"] = canonical_text_names(
+            set(default_restore["carried_extensions"])
+            | set(options.get("extensions", {}))
+        )
+        assert_eq(
+            expected["default_restore"],
+            default_restore,
+            f"{vector_id} default restore report",
+        )
     return PlaintextVector(
         vector_id=vector_id,
         chunk_size=options["chunk_size"],
@@ -1741,6 +1948,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="regenerate the additional RAO 13.1 plaintext fixture JSON files",
     )
     parser.add_argument(
+        "--write-publication-increment-fixtures",
+        action="store_true",
+        help="write only the four RAO metadata/extension publication fixtures",
+    )
+    parser.add_argument(
         "--export-directory",
         type=pathlib.Path,
         help="write the regenerated positive object byte streams to this directory",
@@ -1757,6 +1969,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=FIXTURES / "objects",
         help="directory containing the pinned RAO-TV-E2 and encrypted RAO-TV-D1 objects",
     )
+    parser.add_argument(
+        "--rust-object-directory",
+        type=pathlib.Path,
+        help=(
+            "also require the Rust deterministic exports for the four "
+            "metadata/extension vectors and compare them byte-for-byte"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1771,6 +1991,18 @@ def main(argv: list[str] | None = None) -> int:
                 encoding="utf-8",
             )
         print("wrote additional RAO 13.1 positive plaintext fixtures")
+    if args.write_publication_increment_fixtures:
+        fixture_directory.mkdir(parents=True, exist_ok=True)
+        for filename, vector_id, options, files in positive_plaintext_vector_definitions():
+            if filename not in PUBLICATION_INCREMENT_FIXTURES:
+                continue
+            payload = fixture_json(vector_id, options, files)
+            (fixture_directory / filename).write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+        print("wrote four RAO metadata/extension publication fixtures")
+        return 0
 
     p1 = load(fixture_directory, "rao-tv-p1.json")
     e2 = load(fixture_directory, "rao-tv-e2.json")
@@ -1828,6 +2060,28 @@ def main(argv: list[str] | None = None) -> int:
         )
         for filename, vector_id, options, files in positive_plaintext_vector_definitions()
     ]
+
+    increment_vectors = {
+        vector.vector_id: vector
+        for vector in extra_plaintext_vectors
+        if vector.vector_id
+        in {
+            "RAO-TV-PORTABLE-CORE-ONLY",
+            "RAO-TV-NONUSER-ATTRIBUTE",
+            "RAO-TV-EXT-MEMBER",
+            "RAO-TV-ATTRIBUTE-EXT-COMBINED",
+        }
+    }
+    if args.rust_object_directory is not None:
+        for vector in increment_vectors.values():
+            rust_path = (
+                args.rust_object_directory / f"{vector.vector_id.lower()}.rao"
+            )
+            assert_eq(
+                rust_path.read_bytes(),
+                vector.plaintext,
+                f"{vector.vector_id} Rust deterministic export",
+            )
 
     encrypted_directory = args.encrypted_object_directory
     e2_stored = (encrypted_directory / "rao-tv-e2.rao").read_bytes()
