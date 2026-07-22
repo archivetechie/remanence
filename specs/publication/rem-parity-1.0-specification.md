@@ -218,8 +218,9 @@ All multi-byte integers in sidecar and parity_map structures are
 **little-endian**. The bootstrap header mixes endianness per field — its
 table (Section 8.1) is authoritative, and the mix is deliberate and frozen
 (Appendix B.5). All offsets are zero-based. `KiB` = 2^10 bytes; `MiB` = 2^20
-bytes. Hexadecimal values are prefixed `0x`. Byte ranges written `a..b` are
-half-open (end-exclusive). LBA denotes a logical block address; EOM denotes
+bytes. Hexadecimal values are prefixed `0x`. Ranges written `a..b` — byte ranges
+and the index ranges of Section 6 alike — are half-open (end-exclusive), so
+`0..n` has exactly `n` elements. LBA denotes a logical block address; EOM denotes
 end of medium. SHA-256 is the hash function of [FIPS180-4]. Text fields
 (scheme and format
 identifiers, version strings, timestamps) are UTF-8 [RFC3629]. Arithmetic on values
@@ -490,7 +491,10 @@ All CBOR [RFC8949] payloads in this format are single definite-length,
 integer-keyed maps in RFC 8949 deterministic encoding: shortest-form
 integers and lengths, map keys sorted in ascending order of their
 deterministic encodings, no duplicate keys, no tags, no floats, no
-indefinite-length items. Decoders MUST reject duplicate keys and
+indefinite-length items. The single map MUST occupy its entire declared
+payload extent (for the bootstrap, `cbor_payload_len`, Section 8.1); bytes
+after the map's definite-length encoding, within the declared payload, are a
+nonconformity. Decoders MUST reject duplicate keys and
 non-canonical encoding, and MUST ignore unknown integer keys at every map
 level — that is the format's 1.x extension mechanism: future minor revisions
 add keys; they never change the meaning of existing ones (a change that
