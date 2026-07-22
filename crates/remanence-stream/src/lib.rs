@@ -11,6 +11,7 @@
 
 mod recovery;
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
@@ -33,6 +34,8 @@ use remanence_parity::{
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+#[cfg(unix)]
+use xattr::FileExt;
 
 pub use recovery::{
     recover_archive_reader_to_directory, ArchiveRecoveryReport, RecoveryArchiveGapRecord,
@@ -186,12 +189,24 @@ pub struct StreamingObjectWriteReport {
 }
 
 /// Filesystem restore policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilesystemRestoreOptions {
     /// Replace an existing destination file.
     pub overwrite: bool,
     /// Also restore Remanence's generated manifest file.
     pub include_manifest: bool,
+    /// Xattr namespace prefixes that may be restored.
+    pub xattr_allowed_prefixes: Vec<String>,
+}
+
+impl Default for FilesystemRestoreOptions {
+    fn default() -> Self {
+        Self {
+            overwrite: false,
+            include_manifest: false,
+            xattr_allowed_prefixes: vec!["user.".to_string()],
+        }
+    }
 }
 
 /// Report from streaming an object to a filesystem directory.
@@ -209,6 +224,8 @@ pub struct FilesystemRestoreReport {
     pub hardlinks_written: u64,
     /// User-visible payload bytes written.
     pub bytes_written: u64,
+    /// Archived xattr names skipped for each entry path; values are never reported.
+    pub skipped_xattrs: BTreeMap<String, Vec<String>>,
 }
 
 /// Report from scanning a normalized archive reader.
@@ -417,7 +434,11 @@ pub fn restore_object_to_directory<S: BlockSource + ?Sized>(
 ) -> Result<FilesystemRestoreReport, StreamingError> {
     let mut sink = FilesystemRestoreSink::new(destination_root.as_ref(), options)?;
     let stream = stream_rem_tar_object(source, chunk_size, block_count, &mut sink)?;
-    apply_restored_xattrs(&sink.root, &stream.entries)?;
+    let skipped_xattrs = apply_restored_xattrs(
+        &sink.root,
+        &stream.entries,
+        &sink.options.xattr_allowed_prefixes,
+    )?;
     Ok(FilesystemRestoreReport {
         stream,
         files_written: sink.files_written,
@@ -425,6 +446,7 @@ pub fn restore_object_to_directory<S: BlockSource + ?Sized>(
         symlinks_written: sink.symlinks_written,
         hardlinks_written: sink.hardlinks_written,
         bytes_written: sink.bytes_written,
+        skipped_xattrs,
     })
 }
 
@@ -619,26 +641,72 @@ fn file_catalog_projection(
     })
 }
 
-fn apply_restored_xattrs(root: &Path, entries: &[RemTarStreamEntry]) -> Result<(), StreamingError> {
+fn apply_restored_xattrs(
+    root: &Path,
+    entries: &[RemTarStreamEntry],
+    allowed_prefixes: &[String],
+) -> Result<BTreeMap<String, Vec<String>>, StreamingError> {
+    let mut skipped_xattrs = BTreeMap::new();
     for entry in entries {
         if entry.xattrs.is_empty() || entry.path == MANIFEST_PATH {
             continue;
         }
-        let relative = normalize_archive_path(Path::new(&entry.path))?;
-        let destination = resolve_restored_entry_path_for_xattrs(root, relative.as_str(), entry)?;
+        let mut allowed = Vec::new();
+        let mut skipped = Vec::new();
         for (name, value) in &entry.xattrs {
-            xattr::set(&destination, name, value)
-                .map_err(|err| io_error("set restore xattr", &destination, err))?;
+            if allowed_prefixes
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+            {
+                allowed.push((name, value));
+            } else {
+                skipped.push(name.clone());
+            }
+        }
+        if allowed.is_empty() {
+            skipped_xattrs.insert(entry.path.clone(), skipped);
+            continue;
+        }
+        let relative = normalize_archive_path(Path::new(&entry.path))?;
+        let (destination, final_component_is_symlink) =
+            resolve_restored_entry_path_for_xattrs(root, relative.as_str(), entry)?;
+        if entry.entry_type == RemTarEntryType::Symlink {
+            for (name, value) in allowed {
+                match xattr::set(&destination, name, value) {
+                    Ok(()) => {}
+                    Err(err) if symlink_xattrs_unsupported(&err) => skipped.push(name.clone()),
+                    Err(err) => {
+                        return Err(io_error("set restore symlink xattr", &destination, err));
+                    }
+                }
+            }
+        } else if final_component_is_symlink {
+            skipped.extend(allowed.into_iter().map(|(name, _)| name.clone()));
+        } else {
+            let Some(file) = open_restored_xattr_target(&destination)? else {
+                skipped.extend(allowed.into_iter().map(|(name, _)| name.clone()));
+                skipped.sort();
+                skipped_xattrs.insert(entry.path.clone(), skipped);
+                continue;
+            };
+            for (name, value) in allowed {
+                file.set_xattr(name, value)
+                    .map_err(|err| io_error("set restore xattr", &destination, err))?;
+            }
+        }
+        if !skipped.is_empty() {
+            skipped.sort();
+            skipped_xattrs.insert(entry.path.clone(), skipped);
         }
     }
-    Ok(())
+    Ok(skipped_xattrs)
 }
 
 fn resolve_restored_entry_path_for_xattrs(
     root: &Path,
     relative: &str,
     entry: &RemTarStreamEntry,
-) -> Result<PathBuf, StreamingError> {
+) -> Result<(PathBuf, bool), StreamingError> {
     let parts = normalized_relative_components(relative)?;
     let mut path = root.to_path_buf();
     for part in &parts[..parts.len().saturating_sub(1)] {
@@ -657,6 +725,9 @@ fn resolve_restored_entry_path_for_xattrs(
     }
     let metadata = fs::symlink_metadata(&path)
         .map_err(|err| io_error("stat restore xattr path", &path, err))?;
+    if metadata.file_type().is_symlink() && entry.entry_type != RemTarEntryType::Symlink {
+        return Ok((path, true));
+    }
     let valid = match entry.entry_type {
         RemTarEntryType::Regular | RemTarEntryType::Hardlink => metadata.file_type().is_file(),
         RemTarEntryType::Directory => metadata.file_type().is_dir(),
@@ -669,7 +740,28 @@ fn resolve_restored_entry_path_for_xattrs(
             path.display()
         )));
     }
-    Ok(path)
+    Ok((path, metadata.file_type().is_symlink()))
+}
+
+#[cfg(unix)]
+fn open_restored_xattr_target(path: &Path) -> Result<Option<File>, StreamingError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    apply_restore_open_flags(&mut options);
+    match options.open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(err) if err.raw_os_error() == Some(nix::libc::ELOOP) => Ok(None),
+        Err(err) => Err(io_error("open restore xattr target", path, err)),
+    }
+}
+
+#[cfg(unix)]
+fn symlink_xattrs_unsupported(error: &io::Error) -> bool {
+    error.kind() == ErrorKind::Unsupported
+        || matches!(
+            error.raw_os_error(),
+            Some(nix::libc::EPERM) | Some(nix::libc::EOPNOTSUPP)
+        )
 }
 
 fn attach_object_id_to_bundle(
@@ -1744,9 +1836,8 @@ mod tests {
             .unwrap();
         let probe = restore_dir.path().join("probe");
         fs::write(&probe, b"").unwrap();
-        if xattr::set(&probe, name, b"probe").is_err() {
-            return;
-        }
+        xattr::set(&probe, name, b"probe")
+            .expect("the restore xattr test requires user.* xattr support");
         fs::remove_file(&probe).unwrap();
 
         let mut opts = options();
@@ -1775,10 +1866,204 @@ mod tests {
         .unwrap();
 
         assert_eq!(restore.files_written, 1);
+        assert!(restore.skipped_xattrs.is_empty());
         assert_eq!(
             xattr::get(restore_dir.path().join("tagged.txt"), name).unwrap(),
             Some(b"tagged".to_vec())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_skips_privileged_namespaces_including_security_capability() {
+        let restore_dir = tempfile::Builder::new()
+            .prefix("remanence-stream-restore-xattr-policy")
+            .tempdir()
+            .unwrap();
+        let mut opts = options();
+        opts.chunk_size = 4096;
+        let payload = b"xattr policy payload".to_vec();
+        let mut spec = RemTarFileSpec::new(
+            "tagged.txt",
+            "file-tagged",
+            payload.len() as u64,
+            sha256_array(&payload),
+        );
+        for (name, value) in [
+            ("security.capability", b"capability".as_slice()),
+            ("security.ima", b"ima".as_slice()),
+            ("system.posix_acl_access", b"acl".as_slice()),
+            ("trusted.evil", b"opaque-sensitive-value".as_slice()),
+            ("user.test", b"kept".as_slice()),
+        ] {
+            spec.xattrs.insert(name.to_string(), value.to_vec());
+        }
+        let (blocks, layout) = rao_blocks_with_payloads(&opts, vec![(spec, payload)]);
+        let mut source = VecBlockSource::new(blocks);
+
+        let restore = restore_object_to_directory(
+            &mut source,
+            opts.chunk_size,
+            layout.projected_size_blocks,
+            restore_dir.path(),
+            FilesystemRestoreOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            restore.skipped_xattrs.get("tagged.txt").unwrap(),
+            &[
+                "security.capability",
+                "security.ima",
+                "system.posix_acl_access",
+                "trusted.evil",
+            ]
+        );
+        let restored = restore_dir.path().join("tagged.txt");
+        assert_eq!(
+            xattr::get(&restored, "user.test").unwrap(),
+            Some(b"kept".to_vec())
+        );
+        let archived_names = [
+            "security.capability",
+            "security.ima",
+            "system.posix_acl_access",
+            "trusted.evil",
+            "user.test",
+        ];
+        let restored_archived_names = xattr::list(&restored)
+            .unwrap()
+            .filter_map(|name| name.into_string().ok())
+            .filter(|name| archived_names.contains(&name.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(restored_archived_names, ["user.test"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_security_namespace_opt_in_reaches_the_real_xattr_setter() {
+        let restore_dir = tempfile::Builder::new()
+            .prefix("remanence-stream-restore-security-xattr")
+            .tempdir()
+            .unwrap();
+        let security_name = "security.remanence_test";
+        let probe = restore_dir.path().join("probe");
+        fs::write(&probe, b"").unwrap();
+        let platform_can_set_security_xattrs = xattr::set(&probe, security_name, b"probe").is_ok();
+        fs::remove_file(&probe).unwrap();
+
+        let mut opts = options();
+        opts.chunk_size = 4096;
+        let payload = b"security opt-in payload".to_vec();
+        let mut spec = RemTarFileSpec::new(
+            "security.txt",
+            "file-security",
+            payload.len() as u64,
+            sha256_array(&payload),
+        );
+        spec.xattrs
+            .insert(security_name.to_string(), b"operator-approved".to_vec());
+        let (blocks, layout) = rao_blocks_with_payloads(&opts, vec![(spec, payload)]);
+        let mut source = VecBlockSource::new(blocks);
+        let restore_options = FilesystemRestoreOptions {
+            xattr_allowed_prefixes: vec!["user.".to_string(), "security.".to_string()],
+            ..FilesystemRestoreOptions::default()
+        };
+        let result = restore_object_to_directory(
+            &mut source,
+            opts.chunk_size,
+            layout.projected_size_blocks,
+            restore_dir.path(),
+            restore_options,
+        );
+
+        if platform_can_set_security_xattrs {
+            let restore = result.expect("security.* probe succeeded, so restore must apply it");
+            assert!(restore.skipped_xattrs.is_empty());
+            assert_eq!(
+                xattr::get(restore_dir.path().join("security.txt"), security_name).unwrap(),
+                Some(b"operator-approved".to_vec())
+            );
+        } else {
+            let error = result.expect_err(
+                "without security.* privilege, opt-in must attempt the write and surface failure",
+            );
+            assert!(error.to_string().contains("set restore xattr"), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_xattrs_do_not_follow_a_late_destination_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::Builder::new()
+            .prefix("remanence-stream-xattr-symlink-root")
+            .tempdir()
+            .unwrap();
+        let outside = tempfile::Builder::new()
+            .prefix("remanence-stream-xattr-symlink-outside")
+            .tempdir()
+            .unwrap();
+        let outside_target = outside.path().join("target.txt");
+        fs::write(&outside_target, b"outside").unwrap();
+        symlink(&outside_target, root.path().join("victim.txt")).unwrap();
+        let mut entry = stream_entry("victim.txt", RemTarEntryType::Regular);
+        entry
+            .xattrs
+            .insert("user.no_follow".to_string(), b"must-not-land".to_vec());
+
+        // Public restore applies xattrs immediately after materialization, so the
+        // reachable late-swap shape is exercised directly at the single funnel.
+        let skipped = apply_restored_xattrs(root.path(), &[entry], &["user.".to_string()]).unwrap();
+
+        assert_eq!(skipped["victim.txt"], ["user.no_follow"]);
+        assert_eq!(xattr::get(&outside_target, "user.no_follow").unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_symlink_entry_xattrs_never_reach_its_outside_target() {
+        let restore_dir = tempfile::Builder::new()
+            .prefix("remanence-stream-restore-symlink-xattr")
+            .tempdir()
+            .unwrap();
+        let outside = tempfile::Builder::new()
+            .prefix("remanence-stream-restore-symlink-target")
+            .tempdir()
+            .unwrap();
+        let outside_target = outside.path().join("target.txt");
+        fs::write(&outside_target, b"outside").unwrap();
+        let target = outside_target.to_str().unwrap().to_string();
+        let mut spec = RemTarFileSpec::symlink("outside-link", "link-outside", target);
+        spec.xattrs
+            .insert("user.symlink_test".to_string(), b"link-only".to_vec());
+        let mut opts = options();
+        opts.chunk_size = 4096;
+        let (blocks, layout) = rao_blocks_with_payloads(&opts, vec![(spec, Vec::new())]);
+        let mut source = VecBlockSource::new(blocks);
+
+        let restore = restore_object_to_directory(
+            &mut source,
+            opts.chunk_size,
+            layout.projected_size_blocks,
+            restore_dir.path(),
+            FilesystemRestoreOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            xattr::get(&outside_target, "user.symlink_test").unwrap(),
+            None
+        );
+        let link = restore_dir.path().join("outside-link");
+        match restore.skipped_xattrs.get("outside-link") {
+            Some(names) => assert_eq!(names, &["user.symlink_test"]),
+            None => assert_eq!(
+                xattr::get(&link, "user.symlink_test").unwrap(),
+                Some(b"link-only".to_vec())
+            ),
+        }
     }
 
     #[test]
@@ -1883,6 +2168,7 @@ mod tests {
             FilesystemRestoreOptions {
                 overwrite: true,
                 include_manifest: true,
+                ..FilesystemRestoreOptions::default()
             },
         )
         .unwrap();
@@ -1936,6 +2222,7 @@ mod tests {
             FilesystemRestoreOptions {
                 overwrite: true,
                 include_manifest: true,
+                ..FilesystemRestoreOptions::default()
             },
         )
         .unwrap_err();
@@ -2076,6 +2363,39 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("did not cover declared size 5"));
+    }
+
+    fn stream_entry(path: &str, entry_type: RemTarEntryType) -> RemTarStreamEntry {
+        RemTarStreamEntry {
+            entry_type,
+            path: path.to_string(),
+            size_bytes: 0,
+            link_target: None,
+            first_chunk_lba: None,
+            chunk_count: 0,
+            data_offset: 0,
+            pax_records: BTreeMap::new(),
+            xattrs: BTreeMap::new(),
+        }
+    }
+
+    fn rao_blocks_with_payloads(
+        options: &RemTarObjectOptions,
+        files: Vec<(RemTarFileSpec, Vec<u8>)>,
+    ) -> (Vec<Vec<u8>>, RemTarObjectLayout) {
+        let (specs, payloads): (Vec<_>, Vec<_>) = files.into_iter().unzip();
+        let mut readers = payloads
+            .iter()
+            .map(|payload| io::Cursor::new(payload.as_slice()))
+            .collect::<Vec<_>>();
+        let mut streams = specs
+            .into_iter()
+            .zip(readers.iter_mut())
+            .map(|(spec, reader)| RemTarFileStream::new(spec, reader as &mut dyn Read))
+            .collect::<Vec<_>>();
+        let mut sink = VecBlockSink::new();
+        let layout = write_rem_tar_object_from_readers(&mut sink, options, &mut streams).unwrap();
+        (sink.blocks, layout)
     }
 
     fn options() -> RemTarObjectOptions {
