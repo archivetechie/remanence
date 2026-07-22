@@ -7,8 +7,8 @@ per-release summaries.
 ## v1.1.1 — 2026-07-22
 
 Security hardening of the extended-attribute restore path. Archived: DOI
-pending (concept DOI
-[10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126)).
+[10.5281/zenodo.21488792](https://doi.org/10.5281/zenodo.21488792)
+(concept DOI [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126)).
 
 - Extended-attribute restore is now allow-listed by default to the `user.`
   namespace across every restore surface (`rem archive extract`, `dump`,
