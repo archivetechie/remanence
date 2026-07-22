@@ -1947,6 +1947,11 @@ struct RemArchiveBuildArgs {
     #[arg(long, value_name = "PATH")]
     rules: Option<PathBuf>,
 
+    /// Capture all xattr namespaces except built-in macOS junk. This is not
+    /// portable and is never the default; restore remains namespace-deny by default.
+    #[arg(long, conflicts_with_all = ["rules", "map"])]
+    full_fidelity_xattrs: bool,
+
     /// Classify inputs and emit the clustered ingest report without writing RAO.
     #[arg(long)]
     scan_only: bool,
@@ -2351,6 +2356,7 @@ impl From<RemArchiveBuildArgs> for ArchiveBuildArgs {
             map_sha256: value.map_sha256,
             out: value.out,
             rules: value.rules,
+            full_fidelity_xattrs: value.full_fidelity_xattrs,
             scan_only: value.scan_only,
             manifest_out: value.manifest_out,
             no_index: value.no_index,
@@ -2625,6 +2631,11 @@ struct ArchiveBuildArgs {
     /// Ordered ingest ruleset for blob/exclude policy.
     #[arg(long, value_name = "PATH")]
     rules: Option<PathBuf>,
+
+    /// Capture all xattr namespaces except built-in macOS junk. This is not
+    /// portable and is never the default; restore remains namespace-deny by default.
+    #[arg(long, conflicts_with_all = ["rules", "map"])]
+    full_fidelity_xattrs: bool,
 
     /// Classify inputs and emit the clustered ingest report without writing RAO.
     #[arg(long)]
@@ -10304,6 +10315,11 @@ fn run_archive_build(
 ) -> ExitCode {
     match build_archive_object_file(args) {
         Ok(report) => {
+            if let Some(warning) =
+                archive_ingest::xattr_policy_drop_warning(json_ingest_dropped_xattr_count(&report))
+            {
+                let _ = writeln!(err, "warning: {warning}");
+            }
             let line = serde_json::to_string(&report)
                 .unwrap_or_else(|error| format!("{{\"error\":\"{error}\"}}"));
             let _ = writeln!(out, "{line}");
@@ -10314,6 +10330,14 @@ fn run_archive_build(
             ExitCode::from(1)
         }
     }
+}
+
+fn json_ingest_dropped_xattr_count(report: &Value) -> u64 {
+    report
+        .pointer("/ingest/scan/totals/dropped_xattrs")
+        .or_else(|| report.pointer("/scan/totals/dropped_xattrs"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
 }
 
 fn run_archive_inspect(
@@ -10651,6 +10675,12 @@ struct ArchiveBuildInputFile {
 }
 
 fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
+    if args.full_fidelity_xattrs && args.rules.is_some() {
+        return Err("--full-fidelity-xattrs cannot be combined with --rules".to_string());
+    }
+    if args.full_fidelity_xattrs && args.map.is_some() {
+        return Err("--full-fidelity-xattrs cannot be combined with --map".to_string());
+    }
     if args.map.is_some() {
         if args.scan_only {
             return Err("--map cannot be combined with --scan-only".to_string());
@@ -10691,6 +10721,7 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
         let report = archive_ingest::scan_only_report(
             &args.inputs,
             args.rules.as_deref(),
+            args.full_fidelity_xattrs,
             args.no_index,
             tuning.expect("non-map archive build has scan tuning"),
         )?;
@@ -10737,12 +10768,13 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
         )?),
         _ => None,
     };
-    let materialized = if args.rules.is_some() {
+    let materialized = if map_plan.is_none() {
         Some(archive_ingest::materialize_inputs(
             &args.inputs,
             args.rules.as_deref(),
+            args.full_fidelity_xattrs,
             args.no_index,
-            tuning.expect("rules archive build has scan tuning"),
+            tuning.expect("filesystem archive build has scan tuning"),
         )?)
     } else {
         None
@@ -10750,7 +10782,7 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
     let inputs = match (&map_plan, &materialized) {
         (Some(plan), _) => plan.inputs.clone(),
         (None, Some(plan)) => plan.inputs.clone(),
-        (None, None) => collect_archive_build_inputs(&args.inputs)?,
+        (None, None) => unreachable!("filesystem builds always use the ingest planner"),
     };
     if inputs.is_empty() {
         return Err(if args.map.is_some() {
@@ -12363,16 +12395,11 @@ fn archive_file_report_json(layout: &RemTarFileLayout, input: &ArchiveBuildInput
     report
 }
 
-fn xattrs_report_json(xattrs: &BTreeMap<String, Vec<u8>>) -> Option<BTreeMap<String, String>> {
+fn xattrs_report_json(xattrs: &BTreeMap<String, Vec<u8>>) -> Option<Vec<String>> {
     if xattrs.is_empty() {
         return None;
     }
-    Some(
-        xattrs
-            .iter()
-            .map(|(name, value)| (name.clone(), bytes_to_hex(value)))
-            .collect(),
-    )
+    Some(xattrs.keys().cloned().collect())
 }
 
 fn archive_entry_type_name(entry_type: RemTarEntryType) -> &'static str {
@@ -12382,106 +12409,6 @@ fn archive_entry_type_name(entry_type: RemTarEntryType) -> &'static str {
         RemTarEntryType::Symlink => "symlink",
         RemTarEntryType::Directory => "directory",
     }
-}
-
-fn collect_archive_build_inputs(paths: &[PathBuf]) -> Result<Vec<ArchiveBuildInputFile>, String> {
-    let mut files = Vec::new();
-    for path in paths {
-        let metadata = std::fs::symlink_metadata(path)
-            .map_err(|error| format!("stat input {}: {error}", path.display()))?;
-        if metadata.file_type().is_symlink() {
-            let name = path.file_name().ok_or_else(|| {
-                format!("input symlink {} does not have a file name", path.display())
-            })?;
-            let archive_path = path_component_to_string(name)?;
-            files.push(read_archive_build_symlink(path, archive_path)?);
-        } else if metadata.is_dir() {
-            let added = collect_archive_build_dir(path, path, &mut files)?;
-            if !added {
-                let name = path.file_name().ok_or_else(|| {
-                    format!(
-                        "input directory {} does not have a file name",
-                        path.display()
-                    )
-                })?;
-                let archive_path = format!("{}/", path_component_to_string(name)?);
-                files.push(read_archive_build_directory(path, archive_path)?);
-            }
-        } else if metadata.is_file() {
-            let name = path.file_name().ok_or_else(|| {
-                format!("input file {} does not have a file name", path.display())
-            })?;
-            let archive_path = path_component_to_string(name)?;
-            files.push(read_archive_build_file(path, archive_path)?);
-        } else {
-            return Err(format!(
-                "input {} is not a regular file, symlink, or directory",
-                path.display()
-            ));
-        }
-    }
-    files.sort_by(|a, b| a.archive_path.cmp(&b.archive_path));
-    let mut seen = std::collections::BTreeSet::new();
-    for file in &files {
-        if !seen.insert(file.archive_path.clone()) {
-            return Err(format!("duplicate archive path {:?}", file.archive_path));
-        }
-    }
-    Ok(files)
-}
-
-fn collect_archive_build_dir(
-    root: &Path,
-    dir: &Path,
-    files: &mut Vec<ArchiveBuildInputFile>,
-) -> Result<bool, String> {
-    let mut entries = std::fs::read_dir(dir)
-        .map_err(|error| format!("read directory {}: {error}", dir.display()))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("read directory {}: {error}", dir.display()))?;
-    entries.sort_by_key(|entry| entry.path());
-    if entries.is_empty() {
-        let relative = dir
-            .strip_prefix(root)
-            .map_err(|error| format!("derive archive path for {}: {error}", dir.display()))?;
-        if !relative.as_os_str().is_empty() {
-            let archive_path = format!("{}/", archive_path_from_relative(relative)?);
-            files.push(read_archive_build_directory(dir, archive_path)?);
-            return Ok(true);
-        }
-        return Ok(false);
-    }
-    let mut added_any = false;
-    for entry in entries {
-        let path = entry.path();
-        let metadata = std::fs::symlink_metadata(&path)
-            .map_err(|error| format!("stat input {}: {error}", path.display()))?;
-        if metadata.file_type().is_symlink() {
-            let relative = path
-                .strip_prefix(root)
-                .map_err(|error| format!("derive archive path for {}: {error}", path.display()))?;
-            let archive_path = archive_path_from_relative(relative)?;
-            files.push(read_archive_build_symlink(&path, archive_path)?);
-            added_any = true;
-        } else if metadata.is_dir() {
-            if collect_archive_build_dir(root, &path, files)? {
-                added_any = true;
-            }
-        } else if metadata.is_file() {
-            let relative = path
-                .strip_prefix(root)
-                .map_err(|error| format!("derive archive path for {}: {error}", path.display()))?;
-            let archive_path = archive_path_from_relative(relative)?;
-            files.push(read_archive_build_file(&path, archive_path)?);
-            added_any = true;
-        } else {
-            return Err(format!(
-                "input {} is not a regular file, symlink, or directory",
-                path.display()
-            ));
-        }
-    }
-    Ok(added_any)
 }
 
 fn read_archive_build_file(
@@ -14939,6 +14866,18 @@ mod tests {
     }
 
     #[test]
+    fn archive_build_help_marks_full_fidelity_xattrs_non_portable() {
+        let mut command = Cli::command();
+        let archive = command.find_subcommand_mut("archive").unwrap();
+        let build = archive.find_subcommand_mut("build").unwrap();
+        let help = command_help(build.clone());
+
+        assert!(help.contains("--full-fidelity-xattrs"), "{help}");
+        assert!(help.contains("not portable"), "{help}");
+        assert!(help.contains("never the default"), "{help}");
+    }
+
+    #[test]
     fn rem_archive_help_exposes_daemon_verify_and_hides_direct_mutations() {
         let mut command = Cli::command();
         let archive = command.find_subcommand_mut("archive").unwrap();
@@ -17350,6 +17289,7 @@ mod tests {
             map_sha256: None,
             out: Some(out),
             rules: None,
+            full_fidelity_xattrs: false,
             scan_only: false,
             manifest_out: None,
             no_index: false,
@@ -18832,6 +18772,34 @@ tape_catalog_dir = "{0}/cache/tapes"
     }
 
     #[test]
+    fn archive_build_ingest_funnel_keeps_a_single_empty_input_directory() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-empty-input-directory")
+            .tempdir()
+            .unwrap();
+        let input_dir = temp.path().join("empty-root");
+        fs::create_dir_all(&input_dir).unwrap();
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            input_dir.to_str().unwrap(),
+            "--scan-only",
+        ]);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let report: Value = serde_json::from_str(&stdout).expect("scan report json");
+        assert_eq!(report["scan"]["totals"]["native_entries"], 1);
+        assert_eq!(
+            report["scan"]["clusters"][0]["samples"],
+            json!(["empty-root"])
+        );
+    }
+
+    #[test]
     fn plaintext_locator_scan_resolves_hardlink_pfr_rows() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-cli-rao-hardlink-pfr")
@@ -19237,16 +19205,15 @@ blob Project/Render Files/
         let mut permissions = fs::metadata(&file).unwrap().permissions();
         permissions.set_mode(0o000);
         fs::set_permissions(&file, permissions).unwrap();
-        if fs::File::open(&file).is_ok() {
-            let mut permissions = fs::metadata(&file).unwrap().permissions();
-            permissions.set_mode(0o600);
-            fs::set_permissions(&file, permissions).unwrap();
-            return;
-        }
+        assert!(
+            fs::File::open(&file).is_err(),
+            "scan-only unreadable-input test requires enforced file permissions"
+        );
 
         let report = archive_ingest::scan_only_report(
             std::slice::from_ref(&input_dir),
             None,
+            false,
             false,
             archive_ingest::ScanTuning::default(),
         )
@@ -19261,7 +19228,7 @@ blob Project/Render Files/
 
     #[cfg(unix)]
     #[test]
-    fn archive_build_rules_preserves_small_xattr_natively() {
+    fn archive_build_default_preserves_user_xattr_natively_without_logging_value() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-cli-rao-xattr-native")
             .tempdir()
@@ -19273,8 +19240,6 @@ blob Project/Render Files/
         let xattr_name = "user.remanence_test";
         xattr::set(&xattr_file, xattr_name, b"kept")
             .expect("the native xattr test requires user.* xattr support");
-        let rules = temp.path().join("empty.rules");
-        fs::write(&rules, "").unwrap();
         let out_path = temp.path().join("xattr.rao");
 
         let (code, stdout, stderr) = invoke_without_discovery(&[
@@ -19283,8 +19248,6 @@ blob Project/Render Files/
             "build",
             "--inputs",
             input_dir.to_str().unwrap(),
-            "--rules",
-            rules.to_str().unwrap(),
             "--out",
             out_path.to_str().unwrap(),
             "--chunk-size",
@@ -19309,7 +19272,11 @@ blob Project/Render Files/
             .iter()
             .find(|file| file["path"] == "--xattr.txt")
             .expect("native xattr file");
-        assert_eq!(xattr_entry["xattrs"][xattr_name], bytes_to_hex(b"kept"));
+        assert_eq!(xattr_entry["xattrs"], json!([xattr_name]));
+        assert!(
+            !stdout.contains("kept"),
+            "xattr value leaked into build output"
+        );
 
         let restore_dir = temp.path().join("restore");
         let (code, stdout, stderr) = invoke_without_discovery(&[
@@ -19336,6 +19303,44 @@ blob Project/Render Files/
             xattr::get(restore_dir.join("--xattr.txt"), xattr_name).unwrap(),
             Some(b"kept".to_vec())
         );
+    }
+
+    #[test]
+    fn archive_build_full_fidelity_flag_sets_capture_posture_without_ruleset() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-full-fidelity-xattrs")
+            .tempdir()
+            .unwrap();
+        let input = temp.path().join("input.txt");
+        fs::write(&input, b"full fidelity posture").unwrap();
+        let out_path = temp.path().join("full.rao");
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            input.to_str().unwrap(),
+            "--full-fidelity-xattrs",
+            "--out",
+            out_path.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+            "--object-id",
+            "object-full-xattrs",
+            "--caller-object-id",
+            "caller-full-xattrs",
+            "--manifest-file-id",
+            "manifest-full-xattrs",
+            "--timestamp",
+            "2026-01-01T00:00:00Z",
+        ]);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let report: Value = serde_json::from_str(&stdout).expect("build json");
+        assert_eq!(report["ingest"]["xattr_policy"]["mode"], "full-fidelity");
+        assert!(report["ingest"]["ruleset"].is_null());
     }
 
     #[cfg(unix)]
@@ -19487,9 +19492,16 @@ blob Project/Render Files/
         ]);
 
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
-        assert!(stderr.is_empty(), "{stderr}");
+        assert_eq!(
+            stderr,
+            "warning: 1 extended attribute(s) dropped by capture namespace policy; see dropped_xattrs in the ingest report\n"
+        );
         let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
         assert_eq!(report["ingest"]["scan"]["totals"]["dropped_xattrs"], 1);
+        assert_eq!(
+            report["ingest"]["scan"]["dropped_xattrs"]["drop.txt"],
+            json!([xattr_name])
+        );
         assert!(report["ingest"]["scan"]["xattr_drops"]
             .as_array()
             .unwrap()
@@ -19554,7 +19566,10 @@ blob Project/Render Files/
         ]);
 
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
-        assert!(stderr.is_empty(), "{stderr}");
+        assert_eq!(
+            stderr,
+            "warning: 1 extended attribute(s) dropped by capture namespace policy; see dropped_xattrs in the ingest report\n"
+        );
         let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
         assert_eq!(report["ingest"]["scan"]["totals"]["dropped_xattrs"], 1);
         assert!(report["ingest"]["scan"]["xattr_drops"]
@@ -19632,6 +19647,7 @@ blob Project/Render Files/
             &[temp.path().to_path_buf()],
             Some(&deny),
             false,
+            false,
             archive_ingest::ScanTuning::default()
         )
         .unwrap_err()
@@ -19642,6 +19658,7 @@ blob Project/Render Files/
         assert!(archive_ingest::scan_only_report(
             &[temp.path().to_path_buf()],
             Some(&allow),
+            false,
             false,
             archive_ingest::ScanTuning::default()
         )
