@@ -4,6 +4,49 @@ Notable changes to Remanence and its published formats. The format
 specifications carry their own revision histories; entries here are
 per-release summaries.
 
+## v1.1.0 — 2026-07-22
+
+Batched checkpointing and the field-validated throughput stack. Archived:
+DOI pending (concept DOI
+[10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126)).
+
+- ONE write mode: batched checkpointing is now the only write path, for
+  parity and non-parity pools alike. Objects get immediate filemarks;
+  periodic synchronizing barriers prove durability, write a cumulative
+  on-tape checkpoint bootstrap edition, and advance the commit point.
+  Callers observe WRITTEN → CHECKPOINTED acknowledgment; enumeration
+  never surfaces non-checkpointed objects. The per-object write mode and
+  its configuration key are removed.
+- Parity epochs are explicit ordinal ranges (bare-counter ids); short
+  epochs are legal at any checkpoint boundary; `FINAL_PARTIAL_EPOCH`
+  marks only the terminal epoch. Reconstruction locates sidecars by
+  range containment.
+- The bootstrap directory ceiling is an admission-time refusal with
+  worst-case-row headroom reserved at batch open: a full tape seals at
+  its last checkpoint and placement rolls — never a mid-object failure.
+- Spool overlap (opt-in `append_staging_mode=overlap`): bounded
+  receive-to-tape overlap with an 8 GiB ring; the 64 GiB object-size cap
+  is removed (100 GiB object written end-to-end at rate in field
+  validation).
+- Lazy dismount: session close no longer unloads the drive
+  (close 165 s → 16 ms on iron); idle eviction after
+  `drive_idle_unload_seconds`.
+- Pipelined tape I/O validated on physical LTO-9 (MSL3040 window,
+  2026-07-20/21): sustained ~285 MB/s single-drive feed, ~640 MB/s
+  dual-drive aggregate, 200 MiB/s bit-perfect read-back; ranged-read
+  fast path fixed (6.4 MiB/s → full rate).
+- REM-PARITY 1.0 draft revised (spec Appendix D): normative ordered
+  persistence + synchronizing barrier; batched commit discipline with
+  staged-record semantics; the attested prefix and the bare-tape tail
+  taxonomy (attested / unattested / truncated) with salvage rules;
+  matching reference fixes (barrier failure poisons the writer; the
+  catalog-less scanner tolerates and reports truncated tails instead of
+  aborting).
+- Startup replay repairs partially projected checkpoint records
+  (journal-authoritative); daemon catalog copies are rebuilt from
+  post-projection state so committed-object responses always carry
+  their copies.
+
 ## v1.0.1 — 2026-07-19
 
 Maintenance and capability release. Archived: DOI
