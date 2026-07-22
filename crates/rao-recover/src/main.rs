@@ -130,6 +130,7 @@ fn recover(args: &Args) -> Result<RecoverySummary, String> {
         FilesystemRestoreOptions {
             overwrite: args.overwrite,
             include_manifest: false,
+            ..FilesystemRestoreOptions::default()
         },
     )
     .map_err(|error| format!("restore plaintext members: {error}"))?;
