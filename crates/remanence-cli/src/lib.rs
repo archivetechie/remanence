@@ -767,13 +767,6 @@ fn parse_archive_file_size_bytes(s: &str) -> Result<u64, String> {
     parse_binary_byte_count(s, "file size")
 }
 
-/// Validate one explicit xattr namespace prefix supplied by an operator.
-fn parse_xattr_namespace_prefix(prefix: &str) -> Result<String, String> {
-    remanence_stream::validate_xattr_namespace_prefix(prefix)
-        .map(|()| prefix.to_string())
-        .map_err(|error| error.to_string())
-}
-
 /// Parse a tape-init block size override and apply the same limits as pool config.
 fn parse_tape_block_size(s: &str) -> Result<u64, String> {
     let bytes = parse_binary_byte_count(s, "block size")?;
@@ -2055,10 +2048,11 @@ struct RemArchiveExtractArgs {
     overwrite: bool,
 
     /// Additional xattr namespace prefix to restore; repeatable (`user.` is always allowed).
+    /// Policy skips exit successfully, but emit one stderr warning and are listed in the report.
     #[arg(
         long = "xattr-namespace",
         value_name = "PREFIX",
-        value_parser = parse_xattr_namespace_prefix
+        value_parser = remanence_stream::parse_xattr_namespace_prefix
     )]
     xattr_namespaces: Vec<String>,
 
@@ -2263,6 +2257,15 @@ struct RemArchiveRestoreArgs {
     /// Replace existing destination files.
     #[arg(long)]
     overwrite: bool,
+
+    /// Additional xattr namespace prefix to restore; repeatable (`user.` is always allowed).
+    /// Policy skips exit successfully, but emit one stderr warning and are listed in the report.
+    #[arg(
+        long = "xattr-namespace",
+        value_name = "PREFIX",
+        value_parser = remanence_stream::parse_xattr_namespace_prefix
+    )]
+    xattr_namespaces: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -2477,6 +2480,7 @@ impl From<RemArchiveRestoreArgs> for ArchiveRestoreArgs {
             source: value.source.into(),
             dest: value.dest,
             overwrite: value.overwrite,
+            xattr_namespaces: value.xattr_namespaces,
         }
     }
 }
@@ -2723,10 +2727,11 @@ struct ArchiveExtractArgs {
     overwrite: bool,
 
     /// Additional xattr namespace prefix to restore; repeatable (`user.` is always allowed).
+    /// Policy skips exit successfully, but emit one stderr warning and are listed in the report.
     #[arg(
         long = "xattr-namespace",
         value_name = "PREFIX",
-        value_parser = parse_xattr_namespace_prefix
+        value_parser = remanence_stream::parse_xattr_namespace_prefix
     )]
     xattr_namespaces: Vec<String>,
 
@@ -2932,6 +2937,15 @@ struct ArchiveRestoreArgs {
     /// Replace existing destination files.
     #[arg(long)]
     overwrite: bool,
+
+    /// Additional xattr namespace prefix to restore; repeatable (`user.` is always allowed).
+    /// Policy skips exit successfully, but emit one stderr warning and are listed in the report.
+    #[arg(
+        long = "xattr-namespace",
+        value_name = "PREFIX",
+        value_parser = remanence_stream::parse_xattr_namespace_prefix
+    )]
+    xattr_namespaces: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -10120,14 +10134,11 @@ fn run_archive_dump_command(
             match remanence_stream::restore_archive_reader_to_directory(
                 archive.as_mut(),
                 &args.dest,
-                remanence_stream::FilesystemRestoreOptions {
-                    overwrite: args.overwrite,
-                    include_manifest: false,
-                    ..remanence_stream::FilesystemRestoreOptions::default()
-                },
+                archive_restore_options(args),
             ) {
                 Ok(report) => {
                     print_archive_restore(&report, out);
+                    print_xattr_policy_skip_warning(&report.skipped_xattrs, err);
                     print_damage_list(&report.damages, err);
                     print_archive_gap_list(&report.archive_gaps, err);
                     ExitCode::SUCCESS
@@ -10331,6 +10342,7 @@ fn run_archive_extract(
 ) -> ExitCode {
     match extract_archive_object_file(args) {
         Ok(report) => {
+            print_xattr_policy_skip_warning_count(json_skipped_xattr_count(&report), err);
             let line = serde_json::to_string(&report)
                 .unwrap_or_else(|error| format!("{{\"error\":\"{error}\"}}"));
             let _ = writeln!(out, "{line}");
@@ -10900,13 +10912,26 @@ fn extract_archive_object_file(args: &ArchiveExtractArgs) -> Result<Value, Strin
 fn archive_extract_restore_options(
     args: &ArchiveExtractArgs,
 ) -> remanence_stream::FilesystemRestoreOptions {
+    filesystem_restore_options(args.overwrite, &args.xattr_namespaces)
+}
+
+fn archive_restore_options(
+    args: &ArchiveRestoreArgs,
+) -> remanence_stream::FilesystemRestoreOptions {
+    filesystem_restore_options(args.overwrite, &args.xattr_namespaces)
+}
+
+fn filesystem_restore_options(
+    overwrite: bool,
+    xattr_namespaces: &[String],
+) -> remanence_stream::FilesystemRestoreOptions {
     let mut options = remanence_stream::FilesystemRestoreOptions {
-        overwrite: args.overwrite,
+        overwrite,
         ..remanence_stream::FilesystemRestoreOptions::default()
     };
     options
         .xattr_allowed_prefixes
-        .extend(args.xattr_namespaces.iter().cloned());
+        .extend(xattr_namespaces.iter().cloned());
     options
 }
 
@@ -12956,14 +12981,11 @@ fn run_archive_tape_with_drive(
             let report = remanence_stream::restore_archive_reader_to_directory(
                 archive.as_mut(),
                 &args.dest,
-                remanence_stream::FilesystemRestoreOptions {
-                    overwrite: args.overwrite,
-                    include_manifest: false,
-                    ..remanence_stream::FilesystemRestoreOptions::default()
-                },
+                archive_restore_options(args),
             )
             .map_err(|error| error.to_string())?;
             print_archive_restore(&report, out);
+            print_xattr_policy_skip_warning(&report.skipped_xattrs, err);
             print_damage_list(&report.damages, err);
             print_archive_gap_list(&report.archive_gaps, err);
             Ok(())
@@ -13575,6 +13597,36 @@ fn print_archive_restore(
     let _ = writeln!(out, "bytes-written: {}", report.bytes_written);
     let _ = writeln!(out, "damage-events: {}", report.stream.damage_events);
     let _ = writeln!(out, "archive-gaps: {}", report.stream.archive_gaps);
+    let _ = write!(out, "skipped_xattrs: ");
+    let _ = serde_json::to_writer(&mut *out, &report.skipped_xattrs);
+    let _ = writeln!(out);
+    let _ = write!(out, "applied_privileged_xattrs: ");
+    let _ = serde_json::to_writer(&mut *out, &report.applied_privileged_xattrs);
+    let _ = writeln!(out);
+}
+
+fn json_skipped_xattr_count(report: &Value) -> usize {
+    report
+        .get("skipped_xattrs")
+        .and_then(Value::as_object)
+        .map(|skipped| {
+            skipped.values().fold(0usize, |total, names| {
+                total.saturating_add(names.as_array().map_or(0, Vec::len))
+            })
+        })
+        .unwrap_or(0)
+}
+
+fn print_xattr_policy_skip_warning(skipped: &BTreeMap<String, Vec<String>>, err: &mut dyn Write) {
+    if let Some(warning) = remanence_stream::xattr_policy_skip_warning(skipped) {
+        let _ = writeln!(err, "warning: {warning}");
+    }
+}
+
+fn print_xattr_policy_skip_warning_count(skipped_count: usize, err: &mut dyn Write) {
+    if let Some(warning) = remanence_stream::xattr_policy_skip_warning_for_count(skipped_count) {
+        let _ = writeln!(err, "warning: {warning}");
+    }
 }
 
 fn print_archive_recovery(report: &remanence_stream::ArchiveRecoveryReport, out: &mut dyn Write) {
@@ -14869,6 +14921,24 @@ mod tests {
     }
 
     #[test]
+    fn restore_help_explains_xattr_skip_reporting() {
+        let mut command = Cli::command();
+        let archive = command.find_subcommand_mut("archive").unwrap();
+        let restore = archive.find_subcommand_mut("restore").unwrap();
+        let help = command_help(restore.clone());
+
+        assert!(help.contains("--xattr-namespace <PREFIX>"), "{help}");
+        assert!(help.contains("one stderr warning"), "{help}");
+        assert!(help.contains("listed in the report"), "{help}");
+
+        let mut command = Cli::command();
+        let archive = command.find_subcommand_mut("archive").unwrap();
+        let extract = archive.find_subcommand_mut("extract").unwrap();
+        let help = command_help(extract.clone());
+        assert!(help.contains("one stderr warning"), "{help}");
+    }
+
+    #[test]
     fn rem_archive_help_exposes_daemon_verify_and_hides_direct_mutations() {
         let mut command = Cli::command();
         let archive = command.find_subcommand_mut("archive").unwrap();
@@ -15293,11 +15363,108 @@ mod tests {
             assert!(message.contains(&format!("{invalid:?}")), "{message}");
         }
 
-        assert_eq!(parse_xattr_namespace_prefix("user.").unwrap(), "user.");
         assert_eq!(
-            parse_xattr_namespace_prefix("security.").unwrap(),
+            remanence_stream::parse_xattr_namespace_prefix("user.").unwrap(),
+            "user."
+        );
+        assert_eq!(
+            remanence_stream::parse_xattr_namespace_prefix("security.").unwrap(),
             "security."
         );
+    }
+
+    #[test]
+    fn archive_restore_plumbs_xattr_policy_for_dump_and_tape() {
+        let cli = Cli::parse_from([
+            "rem",
+            "archive",
+            "restore",
+            "--format",
+            "bru",
+            "--dump",
+            "/tmp/archive.bru",
+            "--dest",
+            "/tmp/restored",
+            "--xattr-namespace",
+            "system.",
+        ]);
+        let RemCommand::Archive {
+            command: RemArchiveCommand::Restore(args),
+        } = cli.command
+        else {
+            panic!("expected dump restore command");
+        };
+        let shared: ArchiveRestoreArgs = args.into();
+        assert_eq!(
+            archive_restore_options(&shared).xattr_allowed_prefixes,
+            ["user.", "system."]
+        );
+
+        let cli = DebugCli::parse_from([
+            "rem-debug",
+            "archive",
+            "restore",
+            "--format",
+            "bru",
+            "--tape",
+            "LIB01",
+            "--bay",
+            "0x0100",
+            "--dest",
+            "/tmp/restored",
+            "--xattr-namespace",
+            "system.",
+        ]);
+        let Command::Archive { command } = cli.command else {
+            panic!("expected tape archive command");
+        };
+        let ArchiveCommand::Restore(args) = *command else {
+            panic!("expected tape restore command");
+        };
+        assert_eq!(
+            archive_restore_options(&args).xattr_allowed_prefixes,
+            ["user.", "system."]
+        );
+    }
+
+    #[test]
+    fn archive_restore_report_surfaces_xattr_names_and_warns_once() {
+        let report = remanence_stream::ArchiveFilesystemRestoreReport {
+            stream: remanence_format::StreamReport {
+                entries: 1,
+                bytes: 7,
+                damage_events: 0,
+                archive_gaps: 0,
+            },
+            files_written: 1,
+            directories_seen: 0,
+            bytes_written: 7,
+            damages: Vec::new(),
+            archive_gaps: Vec::new(),
+            skipped_xattrs: BTreeMap::from([(
+                "one.txt".to_string(),
+                vec!["security.selinux".to_string()],
+            )]),
+            applied_privileged_xattrs: BTreeMap::from([(
+                "two.txt".to_string(),
+                vec!["system.remanence_test".to_string()],
+            )]),
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        print_archive_restore(&report, &mut out);
+        print_xattr_policy_skip_warning(&report.skipped_xattrs, &mut err);
+
+        let stdout = String::from_utf8(out).unwrap();
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(stdout.contains("security.selinux"), "{stdout}");
+        assert!(stdout.contains("system.remanence_test"), "{stdout}");
+        assert_eq!(stderr.matches("skipped by namespace policy").count(), 1);
+
+        let mut no_warning = Vec::new();
+        print_xattr_policy_skip_warning(&BTreeMap::new(), &mut no_warning);
+        assert!(no_warning.is_empty());
     }
 
     #[test]
@@ -19221,7 +19388,8 @@ blob Project/Render Files/
         ]);
 
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
-        assert!(stderr.is_empty(), "{stderr}");
+        assert_eq!(stderr.matches("skipped by namespace policy").count(), 1);
+        assert!(stderr.contains("1 extended attribute(s)"), "{stderr}");
         assert!(!stdout.contains("sensitive-marker"));
         let report: Value = serde_json::from_str(&stdout).expect("extract json");
         assert_eq!(
