@@ -2086,6 +2086,10 @@ mod tests {
             sha256_array(&payload),
         );
         spec.xattrs.insert(name.to_string(), b"tagged".to_vec());
+        spec.extensions.insert(
+            "org.example.restore".to_string(),
+            remanence_format::RemTarCborValue::Bytes(b"carry-only".to_vec()),
+        );
         let mut reader = io::Cursor::new(payload);
         let mut streams = [RemTarFileStream::new(spec, &mut reader)];
         let mut sink = VecBlockSink::new();
@@ -2104,6 +2108,10 @@ mod tests {
         assert_eq!(restore.files_written, 1);
         assert!(restore.skipped_xattrs.is_empty());
         assert!(restore.applied_privileged_xattrs.is_empty());
+        assert_eq!(
+            restore.stream.entries[0].extensions["org.example.restore"],
+            remanence_format::RemTarCborValue::Bytes(b"carry-only".to_vec())
+        );
         assert_eq!(
             xattr::get(restore_dir.path().join("tagged.txt"), name).unwrap(),
             Some(b"tagged".to_vec())
@@ -2502,6 +2510,7 @@ mod tests {
             data_offset: 0,
             pax_records: Default::default(),
             xattrs: Default::default(),
+            extensions: Default::default(),
         };
 
         let err = sink.begin_file(&entry).unwrap_err();
@@ -2527,6 +2536,7 @@ mod tests {
             data_offset: 0,
             pax_records: BTreeMap::new(),
             xattrs: Default::default(),
+            extensions: Default::default(),
         };
 
         let err = sink.begin_file(&entry).unwrap_err();
@@ -2555,6 +2565,7 @@ mod tests {
             data_offset: 0,
             pax_records,
             xattrs: Default::default(),
+            extensions: Default::default(),
         };
 
         sink.begin_file(&entry).unwrap();
@@ -2605,6 +2616,7 @@ mod tests {
             data_offset: 0,
             pax_records,
             xattrs: Default::default(),
+            extensions: Default::default(),
         };
 
         let err = sink.begin_file(&entry).unwrap_err();
@@ -2878,6 +2890,7 @@ mod tests {
             data_offset: 0,
             pax_records: BTreeMap::new(),
             xattrs: BTreeMap::new(),
+            extensions: BTreeMap::new(),
         }
     }
 

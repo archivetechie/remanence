@@ -6,7 +6,8 @@ use ciborium::value::Value as CborValue;
 use sha2::{Digest, Sha256};
 
 use crate::error::FormatError;
-use crate::model::{RemTarXattrs, MAX_FILE_ENTRIES};
+use crate::layout::{canonical_text_key, xattr_namespace};
+use crate::model::{RemTarCborValue, RemTarExtensions, RemTarXattrs, MAX_FILE_ENTRIES};
 
 const MANIFEST_MAX_DEPTH: usize = 8;
 
@@ -29,17 +30,28 @@ pub(crate) fn validate_manifest(
     validate_manifest_schema(&value, global_pax, reader_chunk_size)
 }
 
-pub(crate) fn manifest_xattrs_by_path(
+pub(crate) struct EntryPreservationMetadata {
+    pub(crate) xattrs: RemTarXattrs,
+    pub(crate) extensions: RemTarExtensions,
+}
+
+pub(crate) struct ManifestPreservationMetadata {
+    pub(crate) entries: BTreeMap<String, EntryPreservationMetadata>,
+    pub(crate) object_extensions: RemTarExtensions,
+}
+
+pub(crate) fn manifest_preservation_metadata(
     bytes: &[u8],
-) -> Result<BTreeMap<String, RemTarXattrs>, FormatError> {
+) -> Result<ManifestPreservationMetadata, FormatError> {
     validate_manifest_profile(bytes)?;
     let value: CborValue =
         ciborium::from_reader(bytes).map_err(|err| FormatError::cbor(err.to_string()))?;
     let map = value
         .as_map()
         .ok_or_else(|| FormatError::manifest_invalid("top-level manifest item must be a map"))?;
+    let object_extensions = extensions_from_container(required_map(map, "object_metadata")?)?;
     let file_entries = required_array(map, "file_entries")?;
-    let mut out = BTreeMap::new();
+    let mut entries = BTreeMap::new();
     for entry in file_entries {
         let entry = entry
             .as_map()
@@ -47,14 +59,21 @@ pub(crate) fn manifest_xattrs_by_path(
         let path = required_text(entry, "path")?;
         let metadata = required_map(entry, "metadata_preservation_data")?;
         let xattrs = xattrs_from_metadata_preservation_data(metadata)?;
-        if !xattrs.is_empty() {
-            out.insert(path.to_string(), xattrs);
+        let extensions = extensions_from_container(metadata)?;
+        if !xattrs.is_empty() || !extensions.is_empty() {
+            entries.insert(
+                path.to_string(),
+                EntryPreservationMetadata { xattrs, extensions },
+            );
         }
     }
-    Ok(out)
+    Ok(ManifestPreservationMetadata {
+        entries,
+        object_extensions,
+    })
 }
 
-fn validate_manifest_profile(bytes: &[u8]) -> Result<(), FormatError> {
+pub(crate) fn validate_manifest_profile(bytes: &[u8]) -> Result<(), FormatError> {
     let mut decoder = ProfileDecoder::new(bytes);
     decoder.skip_item(1)?;
     if decoder.pos != bytes.len() {
@@ -129,6 +148,10 @@ fn validate_manifest_schema(
             "manifest file_entries exceeds MAX_FILE_ENTRIES",
         ));
     }
+    let object_metadata = required_map(map, "object_metadata")?;
+    let object_extensions = extensions_from_container(object_metadata)?;
+    let mut expected_attribute_namespaces = BTreeSet::new();
+    let mut expected_extensions: BTreeSet<String> = object_extensions.keys().cloned().collect();
     let mut seen_paths = BTreeSet::new();
     let mut seen_file_ids = BTreeSet::new();
     let mut seen_regular_paths = BTreeSet::new();
@@ -148,21 +171,40 @@ fn validate_manifest_schema(
                 "duplicate file_entries file_id {file_id:?}"
             )));
         }
-        if let Some(path) = validate_file_entry(entry, reader_chunk_size, &seen_regular_paths)? {
+        let validated = validate_file_entry(entry, reader_chunk_size, &seen_regular_paths)?;
+        for name in validated.xattrs.keys() {
+            if let Some(namespace) = xattr_namespace(name) {
+                if namespace != "user" {
+                    expected_attribute_namespaces.insert(namespace.to_string());
+                }
+            }
+        }
+        expected_extensions.extend(validated.extensions.keys().cloned());
+        if let Some(path) = validated.regular_path {
             seen_regular_paths.insert(path);
         }
     }
 
-    let _ = required_map(map, "object_metadata")?;
+    validate_inventory(
+        object_metadata,
+        &expected_attribute_namespaces,
+        &expected_extensions,
+    )?;
     let _ = required_array(map, "external_references")?;
     Ok(())
+}
+
+struct ValidatedFileEntry {
+    regular_path: Option<String>,
+    xattrs: RemTarXattrs,
+    extensions: RemTarExtensions,
 }
 
 fn validate_file_entry(
     value: &CborValue,
     reader_chunk_size: usize,
     seen_regular_paths: &BTreeSet<String>,
-) -> Result<Option<String>, FormatError> {
+) -> Result<ValidatedFileEntry, FormatError> {
     let map = value
         .as_map()
         .ok_or_else(|| FormatError::manifest_invalid("file_entries item must be a map"))?;
@@ -195,9 +237,10 @@ fn validate_file_entry(
     let _ = required_bool_or_null(map, "executable")?;
     let metadata = required_map(map, "metadata_preservation_data")?;
     let xattrs = xattrs_from_metadata_preservation_data(metadata)?;
+    let extensions = extensions_from_container(metadata)?;
     let entry_type = optional_text(map, "entry_type")?;
     let link_target = optional_text(map, "link_target")?;
-    match entry_type {
+    let regular_path = match entry_type {
         None => {
             if link_target.is_some() {
                 return Err(FormatError::manifest_invalid(
@@ -212,12 +255,12 @@ fn validate_file_entry(
                     "file_sha256 must be exactly 32 bytes",
                 ));
             }
-            return Ok(Some(path.to_string()));
+            Some(path.to_string())
         }
         Some("hardlink") => {
-            if !xattrs.is_empty() {
+            if !metadata.is_empty() {
                 return Err(FormatError::manifest_invalid(
-                    "hardlink entry must not have xattrs",
+                    "hardlink entry metadata_preservation_data must be empty",
                 ));
             }
             if size_bytes != 0 {
@@ -244,6 +287,7 @@ fn validate_file_entry(
                     target: target.to_string(),
                 });
             }
+            None
         }
         Some("symlink") => {
             if size_bytes != 0 {
@@ -264,6 +308,7 @@ fn validate_file_entry(
                     "symlink entry link_target must not be empty",
                 ));
             }
+            None
         }
         Some("directory") => {
             if size_bytes != 0 {
@@ -281,14 +326,65 @@ fn validate_file_entry(
                     "directory entry must not have link_target",
                 ));
             }
+            None
         }
         Some(other) => {
             return Err(FormatError::manifest_invalid(format!(
                 "entry_type {other:?} is unsupported"
             )));
         }
+    };
+    Ok(ValidatedFileEntry {
+        regular_path,
+        xattrs,
+        extensions,
+    })
+}
+
+fn validate_inventory(
+    object_metadata: &[(CborValue, CborValue)],
+    expected_attribute_namespaces: &BTreeSet<String>,
+    expected_extensions: &BTreeSet<String>,
+) -> Result<(), FormatError> {
+    let actual_attribute_namespaces = inventory_names(object_metadata, "attribute_namespaces")?;
+    let actual_extensions = inventory_names(object_metadata, "extensions")?;
+    let expected_attribute_namespaces = canonical_names(expected_attribute_namespaces);
+    let expected_extensions = canonical_names(expected_extensions);
+    if actual_attribute_namespaces != expected_attribute_namespaces {
+        return Err(FormatError::manifest_invalid(
+            "object_metadata attribute_namespaces inventory does not match file entries",
+        ));
     }
-    Ok(None)
+    if actual_extensions != expected_extensions {
+        return Err(FormatError::manifest_invalid(
+            "object_metadata extensions inventory does not match extension containers",
+        ));
+    }
+    Ok(())
+}
+
+fn inventory_names(map: &[(CborValue, CborValue)], key: &str) -> Result<Vec<String>, FormatError> {
+    let Some(value) = find_key(map, key) else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| FormatError::manifest_invalid(format!("{key} must be an array")))?;
+    values
+        .iter()
+        .map(|value| match value {
+            CborValue::Text(value) => Ok(value.clone()),
+            _ => Err(FormatError::manifest_invalid(format!(
+                "{key} members must be text"
+            ))),
+        })
+        .collect()
+}
+
+fn canonical_names(names: &BTreeSet<String>) -> Vec<String> {
+    let mut names: Vec<String> = names.iter().cloned().collect();
+    names.sort_by_key(|name| canonical_text_key(name));
+    names
 }
 
 fn find_key<'a>(map: &'a [(CborValue, CborValue)], key: &str) -> Option<&'a CborValue> {
@@ -406,6 +502,58 @@ fn xattrs_from_metadata_preservation_data(
         xattrs.insert(name.clone(), value.clone());
     }
     Ok(xattrs)
+}
+
+fn extensions_from_container(
+    map: &[(CborValue, CborValue)],
+) -> Result<RemTarExtensions, FormatError> {
+    let Some(value) = find_key(map, "ext") else {
+        return Ok(BTreeMap::new());
+    };
+    let entries = value
+        .as_map()
+        .ok_or_else(|| FormatError::manifest_invalid("ext must be a map"))?;
+    let mut extensions = BTreeMap::new();
+    for (key, value) in entries {
+        let name = match key {
+            CborValue::Text(name) => name,
+            _ => return Err(FormatError::cbor("extension names must be text")),
+        };
+        extensions.insert(name.clone(), profile_value(value)?);
+    }
+    Ok(extensions)
+}
+
+fn profile_value(value: &CborValue) -> Result<RemTarCborValue, FormatError> {
+    match value {
+        CborValue::Integer(value) => (*value)
+            .try_into()
+            .map(RemTarCborValue::Unsigned)
+            .map_err(|_| FormatError::cbor("extension integer must be unsigned")),
+        CborValue::Bytes(value) => Ok(RemTarCborValue::Bytes(value.clone())),
+        CborValue::Text(value) => Ok(RemTarCborValue::Text(value.clone())),
+        CborValue::Bool(value) => Ok(RemTarCborValue::Bool(*value)),
+        CborValue::Null => Ok(RemTarCborValue::Null),
+        CborValue::Array(values) => values
+            .iter()
+            .map(profile_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map(RemTarCborValue::Array),
+        CborValue::Map(values) => {
+            let mut map = BTreeMap::new();
+            for (key, value) in values {
+                let key = match key {
+                    CborValue::Text(key) => key,
+                    _ => return Err(FormatError::cbor("extension map keys must be text")),
+                };
+                map.insert(key.clone(), profile_value(value)?);
+            }
+            Ok(RemTarCborValue::Map(map))
+        }
+        _ => Err(FormatError::cbor(
+            "extension contains a value outside the manifest profile",
+        )),
+    }
 }
 
 fn optional_bytes<'a>(
@@ -694,12 +842,19 @@ mod tests {
     }
 
     fn manifest_with_file_entries(entries: Vec<Vec<u8>>) -> Vec<u8> {
+        manifest_with_file_entries_and_object_metadata(entries, cbor_map(Vec::new()))
+    }
+
+    fn manifest_with_file_entries_and_object_metadata(
+        entries: Vec<Vec<u8>>,
+        object_metadata: Vec<u8>,
+    ) -> Vec<u8> {
         cbor_map(vec![
             ("object_id", cbor_text("object-1")),
             ("chunk_size", cbor_uint(512)),
             ("file_entries", cbor_array(entries)),
             ("schema_version", cbor_uint(1)),
-            ("object_metadata", cbor_map(Vec::new())),
+            ("object_metadata", object_metadata),
             ("caller_object_id", cbor_text("caller-1")),
             ("external_references", cbor_array(Vec::new())),
         ])
@@ -997,5 +1152,106 @@ mod tests {
                 )]),
             )],
         ));
+    }
+
+    #[test]
+    fn manifest_rejects_inventory_that_disagrees_with_entries() {
+        let entry = regular_file_entry_with(vec![(
+            "metadata_preservation_data",
+            cbor_map(vec![(
+                "xattrs",
+                cbor_map(vec![("security.selinux", cbor_bytes(b"secret"))]),
+            )]),
+        )]);
+        let object_metadata = cbor_map(vec![(
+            "attribute_namespaces",
+            cbor_array(vec![cbor_text("trusted")]),
+        )]);
+        let bytes = manifest_with_file_entries_and_object_metadata(vec![entry], object_metadata);
+        let anchor = sha256_array(&bytes);
+
+        let err = validate_manifest(&bytes, &anchor, &global_pax(), 512).unwrap_err();
+
+        assert!(matches!(err, FormatError::ManifestInvalid(_)), "{err}");
+    }
+
+    #[test]
+    fn manifest_requires_ext_containers_to_be_maps() {
+        let entry = regular_file_entry_with(vec![(
+            "metadata_preservation_data",
+            cbor_map(vec![("ext", cbor_uint(1))]),
+        )]);
+        let bytes = manifest_with_file_entries(vec![entry]);
+        let anchor = sha256_array(&bytes);
+        let err = validate_manifest(&bytes, &anchor, &global_pax(), 512).unwrap_err();
+        assert!(matches!(err, FormatError::ManifestInvalid(_)), "{err}");
+
+        let bytes = manifest_with_file_entries_and_object_metadata(
+            Vec::new(),
+            cbor_map(vec![("ext", cbor_null())]),
+        );
+        let anchor = sha256_array(&bytes);
+        let err = validate_manifest(&bytes, &anchor, &global_pax(), 512).unwrap_err();
+        assert!(matches!(err, FormatError::ManifestInvalid(_)), "{err}");
+    }
+
+    #[test]
+    fn manifest_profile_rejects_noncanonical_ext_member_value() {
+        let extension_name = "org.example.opaque";
+        let mut ext = cbor_type_len(5, 1);
+        ext.extend_from_slice(&cbor_text(extension_name));
+        ext.extend_from_slice(&[0x18, 0x01]);
+        let object_metadata = cbor_map(vec![
+            ("ext", ext),
+            ("extensions", cbor_array(vec![cbor_text(extension_name)])),
+        ]);
+        let bytes = manifest_with_file_entries_and_object_metadata(Vec::new(), object_metadata);
+        let anchor = sha256_array(&bytes);
+
+        let err = validate_manifest(&bytes, &anchor, &global_pax(), 512).unwrap_err();
+
+        assert!(matches!(err, FormatError::Cbor(_)), "{err}");
+    }
+
+    #[test]
+    fn reserved_bare_metadata_keys_and_empty_inventory_arrays_are_accepted() {
+        let entry = regular_file_entry_with(vec![(
+            "metadata_preservation_data",
+            cbor_map(vec![("future_entry_field", cbor_uint(1))]),
+        )]);
+        let object_metadata = cbor_map(vec![
+            ("future_object_field", cbor_bool(true)),
+            ("attribute_namespaces", cbor_array(Vec::new())),
+            ("extensions", cbor_array(Vec::new())),
+        ]);
+        let bytes = manifest_with_file_entries_and_object_metadata(vec![entry], object_metadata);
+        let anchor = sha256_array(&bytes);
+
+        validate_manifest(&bytes, &anchor, &global_pax(), 512).unwrap();
+    }
+
+    #[test]
+    fn malformed_extension_name_is_carry_only_not_invalid() {
+        let extension_name = "Uppercase.Invalid";
+        let entry = regular_file_entry_with(vec![(
+            "metadata_preservation_data",
+            cbor_map(vec![(
+                "ext",
+                cbor_map(vec![(extension_name, cbor_bytes(b"opaque"))]),
+            )]),
+        )]);
+        let object_metadata = cbor_map(vec![(
+            "extensions",
+            cbor_array(vec![cbor_text(extension_name)]),
+        )]);
+        let bytes = manifest_with_file_entries_and_object_metadata(vec![entry], object_metadata);
+        let anchor = sha256_array(&bytes);
+
+        validate_manifest(&bytes, &anchor, &global_pax(), 512).unwrap();
+        let preservation = manifest_preservation_metadata(&bytes).unwrap();
+        assert_eq!(
+            preservation.entries["a.bin"].extensions[extension_name],
+            RemTarCborValue::Bytes(b"opaque".to_vec())
+        );
     }
 }

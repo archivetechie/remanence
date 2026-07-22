@@ -6,9 +6,11 @@ use ciborium::value::Value as CborValue;
 use sha2::{Digest, Sha256};
 
 use crate::error::FormatError;
+use crate::manifest::validate_manifest_profile;
 use crate::model::{
-    BodyLba, RemTarEntryType, RemTarFileLayout, RemTarFileSpec, RemTarObjectOptions, FORMAT_ID,
-    MANIFEST_PATH, MAX_FILE_ENTRIES, SCHEMA_VERSION, SCHEMA_VERSION_XATTRS, TAR_RECORD_SIZE,
+    BodyLba, RemTarCborValue, RemTarEntryType, RemTarExtensions, RemTarFileLayout, RemTarFileSpec,
+    RemTarObjectOptions, FORMAT_ID, MANIFEST_PATH, MAX_FILE_ENTRIES, SCHEMA_VERSION,
+    SCHEMA_VERSION_XATTRS, TAR_RECORD_SIZE,
 };
 use crate::pax::{
     encode_pax_records, round_up_usize, tar_padding_len, validate_chunk_size, with_alignment_pad,
@@ -121,6 +123,7 @@ pub fn plan_rem_tar_object(
         file_sha256: Some(manifest_hash),
         link_target: None,
         xattrs: BTreeMap::new(),
+        extensions: BTreeMap::new(),
         mtime: None,
         executable: Some(false),
     };
@@ -270,6 +273,7 @@ pub(crate) fn plan_one_file(
             file_sha256: spec.file_sha256,
             link_target: spec.link_target.clone(),
             xattrs: spec.xattrs.clone(),
+            extensions: spec.extensions.clone(),
             executable: spec.executable,
             first_chunk_lba: if spec.size_bytes == 0 {
                 None
@@ -309,7 +313,7 @@ pub(crate) fn encode_manifest(
             CborValue::Array(files.iter().map(file_manifest_entry).collect()),
         ),
         ("object_id", CborValue::Text(options.object_id.clone())),
-        ("object_metadata", CborValue::Map(Vec::new())),
+        ("object_metadata", object_metadata(options, files)),
         ("schema_version", CborValue::Integer(1u64.into())),
     ];
     map.sort_by_key(|entry| canonical_text_key(entry.0));
@@ -321,6 +325,7 @@ pub(crate) fn encode_manifest(
     );
     let mut bytes = Vec::new();
     ciborium::into_writer(&value, &mut bytes).map_err(|err| FormatError::cbor(err.to_string()))?;
+    validate_manifest_profile(&bytes)?;
     Ok(bytes)
 }
 
@@ -385,30 +390,120 @@ fn file_manifest_entry(layout: &RemTarFileLayout) -> CborValue {
 }
 
 fn metadata_preservation_data(layout: &RemTarFileLayout) -> CborValue {
-    if layout.xattrs.is_empty() {
+    if layout.xattrs.is_empty() && layout.extensions.is_empty() {
         return CborValue::Map(Vec::new());
     }
 
-    let mut xattr_entries: Vec<(&String, CborValue)> = layout
-        .xattrs
-        .iter()
-        .map(|(name, value)| (name, CborValue::Bytes(value.clone())))
-        .collect();
-    xattr_entries.sort_by_key(|(name, _)| canonical_text_key(name));
-    let xattrs = CborValue::Map(
-        xattr_entries
-            .into_iter()
-            .map(|(name, value)| (CborValue::Text(name.clone()), value))
-            .collect(),
-    );
-
-    let mut map = vec![("xattrs", xattrs)];
+    let mut map = Vec::new();
+    if !layout.xattrs.is_empty() {
+        let mut xattr_entries: Vec<(&String, CborValue)> = layout
+            .xattrs
+            .iter()
+            .map(|(name, value)| (name, CborValue::Bytes(value.clone())))
+            .collect();
+        xattr_entries.sort_by_key(|(name, _)| canonical_text_key(name));
+        let xattrs = CborValue::Map(
+            xattr_entries
+                .into_iter()
+                .map(|(name, value)| (CborValue::Text(name.clone()), value))
+                .collect(),
+        );
+        map.push(("xattrs", xattrs));
+    }
+    if !layout.extensions.is_empty() {
+        map.push(("ext", extension_map(&layout.extensions)));
+    }
     map.sort_by_key(|entry| canonical_text_key(entry.0));
     CborValue::Map(
         map.into_iter()
             .map(|(key, value)| (CborValue::Text(key.to_string()), value))
             .collect(),
     )
+}
+
+fn object_metadata(options: &RemTarObjectOptions, files: &[RemTarFileLayout]) -> CborValue {
+    let mut attribute_namespaces = BTreeSet::new();
+    let mut extension_names = BTreeSet::new();
+    for file in files {
+        for name in file.xattrs.keys() {
+            if let Some(namespace) = xattr_namespace(name) {
+                if namespace != "user" {
+                    attribute_namespaces.insert(namespace.to_string());
+                }
+            }
+        }
+        extension_names.extend(file.extensions.keys().cloned());
+    }
+    extension_names.extend(options.extensions.keys().cloned());
+
+    let mut map = Vec::new();
+    if !attribute_namespaces.is_empty() {
+        map.push((
+            "attribute_namespaces",
+            CborValue::Array(canonical_name_values(attribute_namespaces)),
+        ));
+    }
+    if !extension_names.is_empty() {
+        map.push((
+            "extensions",
+            CborValue::Array(canonical_name_values(extension_names)),
+        ));
+    }
+    if !options.extensions.is_empty() {
+        map.push(("ext", extension_map(&options.extensions)));
+    }
+    map.sort_by_key(|(key, _)| canonical_text_key(key));
+    CborValue::Map(
+        map.into_iter()
+            .map(|(key, value)| (CborValue::Text(key.to_string()), value))
+            .collect(),
+    )
+}
+
+fn canonical_name_values(names: BTreeSet<String>) -> Vec<CborValue> {
+    let mut names: Vec<String> = names.into_iter().collect();
+    names.sort_by_key(|name| canonical_text_key(name));
+    names.into_iter().map(CborValue::Text).collect()
+}
+
+fn extension_map(extensions: &RemTarExtensions) -> CborValue {
+    let mut entries: Vec<(&String, CborValue)> = extensions
+        .iter()
+        .map(|(name, value)| (name, profile_cbor_value(value)))
+        .collect();
+    entries.sort_by_key(|(name, _)| canonical_text_key(name));
+    CborValue::Map(
+        entries
+            .into_iter()
+            .map(|(name, value)| (CborValue::Text(name.clone()), value))
+            .collect(),
+    )
+}
+
+fn profile_cbor_value(value: &RemTarCborValue) -> CborValue {
+    match value {
+        RemTarCborValue::Unsigned(value) => CborValue::Integer((*value).into()),
+        RemTarCborValue::Bytes(value) => CborValue::Bytes(value.clone()),
+        RemTarCborValue::Text(value) => CborValue::Text(value.clone()),
+        RemTarCborValue::Bool(value) => CborValue::Bool(*value),
+        RemTarCborValue::Null => CborValue::Null,
+        RemTarCborValue::Array(values) => {
+            CborValue::Array(values.iter().map(profile_cbor_value).collect())
+        }
+        RemTarCborValue::Map(values) => {
+            let mut entries: Vec<(&String, CborValue)> = values
+                .iter()
+                .map(|(key, value)| (key, profile_cbor_value(value)))
+                .collect();
+            entries.sort_by_key(|(key, _)| canonical_text_key(key));
+            CborValue::Map(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (CborValue::Text(key.clone()), value))
+                    .collect(),
+            )
+        }
+    }
 }
 
 fn validate_options(options: &RemTarObjectOptions) -> Result<(), FormatError> {
@@ -426,7 +521,7 @@ fn validate_options(options: &RemTarObjectOptions) -> Result<(), FormatError> {
     Ok(())
 }
 
-fn canonical_text_key(key: &str) -> Vec<u8> {
+pub(crate) fn canonical_text_key(key: &str) -> Vec<u8> {
     let len = key.len() as u64;
     let mut encoded = Vec::with_capacity(key.len() + 9);
     encode_cbor_major_len(3, len, &mut encoded);
@@ -471,9 +566,9 @@ fn validate_file_spec(spec: &RemTarFileSpec) -> Result<(), FormatError> {
             }
         }
         RemTarEntryType::Hardlink => {
-            if !spec.xattrs.is_empty() {
+            if !spec.xattrs.is_empty() || !spec.extensions.is_empty() {
                 return Err(FormatError::invalid(
-                    "hardlink entry must not have xattrs; metadata resolves through link_target",
+                    "hardlink entry must not have preservation metadata; metadata resolves through link_target",
                 ));
             }
             if spec.size_bytes != 0 {
@@ -555,6 +650,10 @@ fn validate_file_spec(spec: &RemTarFileSpec) -> Result<(), FormatError> {
     }
     validate_canonical_relative_path(&spec.path, spec.entry_type == RemTarEntryType::Directory)?;
     Ok(())
+}
+
+pub(crate) fn xattr_namespace(name: &str) -> Option<&str> {
+    name.split_once('.').map(|(namespace, _)| namespace)
 }
 
 fn validate_pax_mtime(value: &str) -> Result<(), FormatError> {
@@ -648,7 +747,7 @@ fn round_up_u64(value: u64, unit: u64) -> Result<u64, FormatError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::validate_manifest;
+    use crate::manifest::{manifest_preservation_metadata, validate_manifest};
 
     fn options(chunk_size: usize) -> RemTarObjectOptions {
         let mut opts = RemTarObjectOptions::new(
@@ -663,6 +762,26 @@ mod tests {
 
     fn file(path: &str, size: u64) -> RemTarFileSpec {
         RemTarFileSpec::new(path, format!("file-{path}"), size, [0xAB; 32])
+    }
+
+    fn map_field<'a>(value: &'a CborValue, key: &str) -> &'a CborValue {
+        value
+            .as_map()
+            .expect("value is a map")
+            .iter()
+            .find_map(|(candidate, value)| {
+                matches!(candidate, CborValue::Text(candidate) if candidate == key).then_some(value)
+            })
+            .unwrap_or_else(|| panic!("map contains {key:?}"))
+    }
+
+    fn text_array(value: &CborValue) -> Vec<&str> {
+        value
+            .as_array()
+            .expect("value is an array")
+            .iter()
+            .map(|value| value.as_text().expect("array member is text"))
+            .collect()
     }
 
     #[test]
@@ -861,6 +980,116 @@ mod tests {
             )
             .expect("encoded production manifest should validate");
         }
+    }
+
+    #[test]
+    fn manifest_inventory_tracks_extension_tier_names_only() {
+        let opts = options(4096);
+        let mut spec = file("metadata.bin", 1);
+        spec.xattrs
+            .insert("user.comment".to_string(), b"portable-value".to_vec());
+        spec.xattrs.insert(
+            "security.selinux".to_string(),
+            b"nonportable-value".to_vec(),
+        );
+        spec.extensions.insert(
+            "org.example.opaque".to_string(),
+            RemTarCborValue::Map(BTreeMap::from([(
+                "payload".to_string(),
+                RemTarCborValue::Bytes(b"extension-value".to_vec()),
+            )])),
+        );
+
+        let layout = plan_rem_tar_object(&opts, &[spec]).unwrap();
+        let global_pax = global_pax_records(&opts, &layout.schema_version);
+        validate_manifest(
+            &layout.manifest_cbor,
+            &layout.manifest_sha256,
+            &global_pax,
+            opts.chunk_size,
+        )
+        .unwrap();
+        let manifest: CborValue = ciborium::from_reader(layout.manifest_cbor.as_slice()).unwrap();
+        let object_metadata = map_field(&manifest, "object_metadata");
+
+        assert_eq!(layout.schema_version, SCHEMA_VERSION_XATTRS);
+        assert_eq!(
+            text_array(map_field(object_metadata, "attribute_namespaces")),
+            ["security"]
+        );
+        assert_eq!(
+            text_array(map_field(object_metadata, "extensions")),
+            ["org.example.opaque"]
+        );
+        assert_eq!(object_metadata.as_map().unwrap().len(), 2);
+
+        let preservation = manifest_preservation_metadata(&layout.manifest_cbor).unwrap();
+        let entry = &preservation.entries["metadata.bin"];
+        assert_eq!(entry.xattrs["user.comment"], b"portable-value");
+        assert_eq!(entry.xattrs["security.selinux"], b"nonportable-value");
+        assert_eq!(
+            entry.extensions["org.example.opaque"],
+            RemTarCborValue::Map(BTreeMap::from([(
+                "payload".to_string(),
+                RemTarCborValue::Bytes(b"extension-value".to_vec()),
+            )]))
+        );
+    }
+
+    #[test]
+    fn portable_core_leaves_object_metadata_empty_and_extensions_do_not_bump_schema() {
+        let opts = options(4096);
+        let mut core = file("core.bin", 1);
+        core.xattrs
+            .insert("user.comment".to_string(), b"portable".to_vec());
+        let core_layout = plan_rem_tar_object(&opts, &[core]).unwrap();
+        let manifest: CborValue =
+            ciborium::from_reader(core_layout.manifest_cbor.as_slice()).unwrap();
+        assert!(map_field(&manifest, "object_metadata")
+            .as_map()
+            .unwrap()
+            .is_empty());
+
+        let mut extension_only = file("extension.bin", 1);
+        extension_only.extensions.insert(
+            "org.example.opaque".to_string(),
+            RemTarCborValue::Bool(true),
+        );
+        let extension_layout = plan_rem_tar_object(&opts, &[extension_only]).unwrap();
+        assert_eq!(extension_layout.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn decoded_unknown_extensions_reemit_byte_identically() {
+        let mut opts = options(4096);
+        opts.extensions.insert(
+            "org.example.object".to_string(),
+            RemTarCborValue::Array(vec![RemTarCborValue::Unsigned(24), RemTarCborValue::Null]),
+        );
+        let mut spec = file("opaque.bin", 1);
+        spec.extensions.insert(
+            "Uppercase.Invalid".to_string(),
+            RemTarCborValue::Map(BTreeMap::from([(
+                "raw".to_string(),
+                RemTarCborValue::Bytes(vec![0, 1, 2, 3]),
+            )])),
+        );
+        let layout = plan_rem_tar_object(&opts, &[spec]).unwrap();
+        let decoded = manifest_preservation_metadata(&layout.manifest_cbor).unwrap();
+
+        let mut reemit_options = opts.clone();
+        reemit_options.extensions = decoded.object_extensions;
+        let mut reemit_files = layout.files.clone();
+        for file in &mut reemit_files {
+            file.extensions = decoded
+                .entries
+                .get(&file.path)
+                .map(|entry| entry.extensions.clone())
+                .unwrap_or_default();
+        }
+        let reemitted = encode_manifest(&reemit_options, &reemit_files).unwrap();
+
+        assert_eq!(reemitted, layout.manifest_cbor);
     }
 
     #[test]

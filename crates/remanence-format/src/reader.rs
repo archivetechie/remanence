@@ -7,9 +7,10 @@ use remanence_library::BlockRead;
 use sha2::{Digest, Sha256};
 
 use crate::error::{FormatError, FormatGate};
-use crate::manifest::{manifest_xattrs_by_path, validate_manifest};
+use crate::manifest::{manifest_preservation_metadata, validate_manifest};
 use crate::model::{
-    BodyLba, RemTarEntryType, FORMAT_ID, MANIFEST_PATH, SCHEMA_VERSION, TAR_RECORD_SIZE,
+    BodyLba, RemTarEntryType, RemTarExtensions, FORMAT_ID, MANIFEST_PATH, SCHEMA_VERSION,
+    TAR_RECORD_SIZE,
 };
 use crate::pax::{tar_padding_len, validate_chunk_size};
 use crate::tar::{
@@ -65,6 +66,8 @@ pub struct RemTarReadEntry {
     pub link_target: Option<String>,
     /// Preserved extended attributes decoded from the manifest when available.
     pub xattrs: crate::model::RemTarXattrs,
+    /// Carry-only extension members decoded from the manifest when available.
+    pub extensions: RemTarExtensions,
     /// File payload bytes.
     pub data: Vec<u8>,
 }
@@ -90,6 +93,8 @@ pub struct RemTarStreamEntry {
     pub link_target: Option<String>,
     /// Preserved extended attributes decoded from the manifest when available.
     pub xattrs: crate::model::RemTarXattrs,
+    /// Carry-only extension members decoded from the manifest when available.
+    pub extensions: RemTarExtensions,
 }
 
 /// Streaming callbacks for restoring a `rao-v1` object.
@@ -113,6 +118,8 @@ pub struct RemTarStreamReport {
     pub entries: Vec<RemTarStreamEntry>,
     /// Raw generated manifest CBOR bytes, if present.
     pub manifest_cbor: Option<Vec<u8>>,
+    /// Carry-only object-level extension members decoded from the manifest.
+    pub object_extensions: RemTarExtensions,
     /// File digest mismatches observed in [`ReadMode::Salvage`].
     pub digest_mismatches: Vec<RemTarDigestMismatch>,
     /// Non-fatal conformance issues observed in restore mode.
@@ -128,6 +135,8 @@ pub struct RemTarReadObject {
     pub entries: Vec<RemTarReadEntry>,
     /// Raw generated manifest CBOR bytes, if present.
     pub manifest_cbor: Option<Vec<u8>>,
+    /// Carry-only object-level extension members decoded from the manifest.
+    pub object_extensions: RemTarExtensions,
     /// File digest mismatches observed in [`ReadMode::Salvage`].
     pub digest_mismatches: Vec<RemTarDigestMismatch>,
     /// Non-fatal conformance issues observed in restore mode.
@@ -540,6 +549,7 @@ where
                     pax_records: std::mem::take(&mut pending_pax),
                     link_target,
                     xattrs: Default::default(),
+                    extensions: Default::default(),
                 };
                 let mut manifest_data = (entry.path == MANIFEST_PATH).then(Vec::new);
                 let expected_digest =
@@ -594,15 +604,18 @@ where
         chunk_size,
         manifest_sha256,
     )?;
-    if let Some(manifest) = &manifest_cbor {
-        hydrate_stream_entry_xattrs(&mut entries, manifest)?;
-    }
+    let object_extensions = manifest_cbor
+        .as_deref()
+        .map(|manifest| hydrate_stream_entry_metadata(&mut entries, manifest))
+        .transpose()?
+        .unwrap_or_default();
     let warnings = reader_warnings(mode, manifest_cbor.is_some());
 
     Ok(RemTarStreamReport {
         global_pax,
         entries,
         manifest_cbor,
+        object_extensions,
         digest_mismatches,
         warnings,
     })
@@ -721,6 +734,7 @@ fn parse_rem_tar_bytes_with_mode_and_manifest_anchor(
                     pax_records: std::mem::take(&mut pending_pax),
                     link_target,
                     xattrs: Default::default(),
+                    extensions: Default::default(),
                     data,
                 };
                 if entry.entry_type == RemTarEntryType::Regular && entry.path != MANIFEST_PATH {
@@ -750,14 +764,17 @@ fn parse_rem_tar_bytes_with_mode_and_manifest_anchor(
             manifest_sha256,
         )?;
     }
-    if let Some(manifest) = &manifest_cbor {
-        hydrate_read_entry_xattrs(&mut entries, manifest)?;
-    }
+    let object_extensions = manifest_cbor
+        .as_deref()
+        .map(|manifest| hydrate_read_entry_metadata(&mut entries, manifest))
+        .transpose()?
+        .unwrap_or_default();
     let warnings = reader_warnings(mode, manifest_cbor.is_some());
     Ok(RemTarReadObject {
         global_pax,
         entries,
         manifest_cbor,
+        object_extensions,
         digest_mismatches,
         warnings,
     })
@@ -1318,30 +1335,32 @@ fn validate_stream_manifest(
     Ok(())
 }
 
-fn hydrate_stream_entry_xattrs(
+fn hydrate_stream_entry_metadata(
     entries: &mut [RemTarStreamEntry],
     manifest: &[u8],
-) -> Result<(), FormatError> {
-    let mut by_path = manifest_xattrs_by_path(manifest)?;
+) -> Result<RemTarExtensions, FormatError> {
+    let mut metadata = manifest_preservation_metadata(manifest)?;
     for entry in entries {
-        if let Some(xattrs) = by_path.remove(&entry.path) {
-            entry.xattrs = xattrs;
+        if let Some(preservation) = metadata.entries.remove(&entry.path) {
+            entry.xattrs = preservation.xattrs;
+            entry.extensions = preservation.extensions;
         }
     }
-    Ok(())
+    Ok(metadata.object_extensions)
 }
 
-fn hydrate_read_entry_xattrs(
+fn hydrate_read_entry_metadata(
     entries: &mut [RemTarReadEntry],
     manifest: &[u8],
-) -> Result<(), FormatError> {
-    let mut by_path = manifest_xattrs_by_path(manifest)?;
+) -> Result<RemTarExtensions, FormatError> {
+    let mut metadata = manifest_preservation_metadata(manifest)?;
     for entry in entries {
-        if let Some(xattrs) = by_path.remove(&entry.path) {
-            entry.xattrs = xattrs;
+        if let Some(preservation) = metadata.entries.remove(&entry.path) {
+            entry.xattrs = preservation.xattrs;
+            entry.extensions = preservation.extensions;
         }
     }
-    Ok(())
+    Ok(metadata.object_extensions)
 }
 
 fn validate_manifest_entry(

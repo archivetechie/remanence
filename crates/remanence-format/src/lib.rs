@@ -34,9 +34,10 @@ pub use layout::{plan_rem_tar_object, RemTarObjectLayout};
 #[cfg(feature = "fuzzing")]
 pub use manifest::validate_manifest_cbor_for_fuzz;
 pub use model::{
-    BodyLba, MetadataPreservation, RemTarEntryType, RemTarFile, RemTarFileLayout, RemTarFileSpec,
-    RemTarFileStream, RemTarObjectOptions, RemTarXattrs, DEFAULT_CHUNK_SIZE, FORMAT_ID,
-    MANIFEST_PATH, SCHEMA_VERSION, SCHEMA_VERSION_XATTRS, TAR_RECORD_SIZE,
+    BodyLba, MetadataPreservation, RemTarCborValue, RemTarEntryType, RemTarExtensions, RemTarFile,
+    RemTarFileLayout, RemTarFileSpec, RemTarFileStream, RemTarObjectOptions, RemTarXattrs,
+    DEFAULT_CHUNK_SIZE, FORMAT_ID, MANIFEST_PATH, SCHEMA_VERSION, SCHEMA_VERSION_XATTRS,
+    TAR_RECORD_SIZE,
 };
 pub use pfr::{
     plan_plaintext_rao_file_range, read_encrypted_rao_file_range_to_vec, validate_file_range,

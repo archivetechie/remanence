@@ -1763,6 +1763,7 @@ mod tests {
             data_offset: 0,
             pax_records: std::collections::BTreeMap::new(),
             xattrs: std::collections::BTreeMap::new(),
+            extensions: std::collections::BTreeMap::new(),
         }
     }
 
