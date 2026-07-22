@@ -7,8 +7,9 @@ per-release summaries.
 ## v1.2.0 — 2026-07-22
 
 Metadata-preservation model, extension mechanism, and catalog-less recovery
-completeness. Archived: DOI pending (concept DOI
-[10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126)).
+completeness. Archived: DOI
+[10.5281/zenodo.21498153](https://doi.org/10.5281/zenodo.21498153)
+(concept DOI [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126)).
 
 - RAO object format: a **portable core** (`user.` namespace, applied on
   restore by default) and a **carry-only extension tier** (privileged
