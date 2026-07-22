@@ -247,7 +247,11 @@ big-endian (network byte order). Byte offsets are zero-based. `KiB` = 2^10
 bytes; `MiB` = 2^20 bytes. Hexadecimal values are prefixed `0x`. ustar numeric
 fields are ASCII octal (Section 4.3). All other text in the format — pax
 keywords and values, paths, manifest and metadata text strings — is UTF-8
-[RFC3629]; pax keywords are additionally restricted to ASCII. SHA-256 is the
+[RFC3629]; pax keywords are additionally restricted to ASCII. The functions
+`roundup(x, C)` and `roundup512(x)` denote the smallest multiple of `C`
+(respectively 512) that is greater than or equal to `x`; when `x` is already
+a multiple the result is `x` itself. Equivalently,
+`roundup(x, C) = x + ((C − (x mod C)) mod C)`. SHA-256 is the
 hash function of [FIPS180-4]. All derived quantities
 (offsets, frame lengths, chunk counts, block counts) are defined over unsigned
 64-bit arithmetic; implementations MUST use checked arithmetic and MUST NOT
@@ -672,9 +676,10 @@ arbitrary string: it MUST be a canonical relative path (Section 4.6.6) that
 resolves, within the same object, to a **regular-file primary entry appearing
 before** the hardlink entry. Of a set of names sharing one underlying file the
 **primary** is one regular entry that holds the bytes; each other name is a
-hardlink entry. Primary selection MUST be deterministic: the first such name in
-archive order, or — if that one is omitted — the first surviving name; if only
-one name survives it is a plain regular entry (no hardlink entry).
+hardlink entry. Primary selection MUST be deterministic and is defined over the entries
+the object emits: the primary is the first, in archive order, of the set's
+names that the object emits as entries. If the object emits only one name of
+the set, that name is a plain regular entry (no hardlink entry).
 
 #### 4.6.2. Per-Entry Keywords
 
@@ -1426,8 +1431,9 @@ true, and null; negative integers, tags, floats, indefinite forms, and other
 simple values are invalid.
 
 The frame is `ChaCha20-Poly1305(metadata_key, nonce = 12 zero bytes,
-AAD = empty, plaintext = metadata CBOR)`. Its stored length is plaintext
-length plus the 16-byte tag and MUST equal `metadata_frame_len`.
+AAD = empty, plaintext = metadata CBOR)`, stored as the ciphertext immediately
+followed by the 16-byte Poly1305 tag. Its stored length is plaintext length
+plus the 16-byte tag and MUST equal `metadata_frame_len`.
 
 ### 5.7. Payload Frame
 
@@ -1442,7 +1448,8 @@ this 12-byte nonce:
 ```
 
 `final_flag` is `0x01` exactly when `i = N - 1`, otherwise `0x00`. Each stored
-chunk is exactly `C + 16` bytes. The payload-frame length is
+chunk is exactly `C + 16` bytes: the `C` ciphertext bytes immediately followed
+by the 16-byte Poly1305 tag. The payload-frame length is
 `P + 16 * N`. Readers MUST compute finality; they MUST NOT infer it by probing
 or accept a short final chunk.
 
@@ -1585,7 +1592,12 @@ since consecutive chunks are adjacent), authenticates and decrypts each chunk
 with the nonce above, concatenates the plaintexts, and slices the requested
 bytes per Section 6.2. Finality comes from the formula — that is, from the
 authenticated `plaintext_size` — never from probing. A Restorer MUST NOT
-release plaintext from a chunk whose tag failed (Section 5.10). `chunk_count`
+release plaintext from a chunk whose tag failed (Section 5.10). A Restorer MAY
+release each chunk's plaintext as that chunk is authenticated (memory-bounded
+streaming); a chunk whose tag fails MUST abort the range read, and the
+Restorer MUST signal the failure to its Consumer so that an
+already-released, individually-authenticated prefix is never mistaken for a
+complete range. A partial release is not a successful range read. `chunk_count`
 and `F` require the decrypted metadata frame; PFR on an encrypted copy
 therefore requires the key by construction, plus one metadata-frame read. The
 per-file row comes from the catalog; with no catalog, recovery of an encrypted
@@ -2748,9 +2760,9 @@ tolerated by existing Consumers per §4.7.2 obligation 3.
 restored to requirement strength (MUST): namespace allow-list defaulting to
 `user.`, skip-and-report for excluded attributes, and no-follow application.
 These were requirements in the pre-publication draft, were relaxed to
-recommendations on 2026-07-11 to track a then-deficient reference
-implementation, and are restored now that the reference implementation
-enforces them. The change constrains Restoring Consumer behavior only; the
+recommendations during pre-publication drafting to track a then-deficient
+reference implementation, and are restored now that the reference
+implementation enforces them. The change constrains Restoring Consumer behavior only; the
 set of valid RAO objects is unchanged.
 
 Specification Version 1.0 is the first unified publication baseline. It
