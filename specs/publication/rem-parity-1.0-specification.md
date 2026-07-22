@@ -1143,10 +1143,14 @@ Key 7, when present, uses the same [RFC3339] form as bootstrap key 4.
 
 The decoded payload MUST match the header/footer locator fields (UUID,
 sequence, digest, scope) and the payload bytes MUST hash to
-`payload_sha256`. `sequence` is a per-tape monotonic counter over
-parity_map emissions, independent of the bootstrap sequence; readers treat
-it as diagnostic — authority flows from the referencing bootstrap
-(Sections 10.6, 12.4).
+`payload_sha256`. `sequence` is a per-tape counter over parity_map
+emissions, strictly increasing per tape across sessions (a Resumer seeds the
+next value above every parity_map sequence in the committed prefix,
+Section 14), independent of the bootstrap sequence. In the presence of a
+referencing bootstrap readers treat it as diagnostic — authority flows from
+that bootstrap (Sections 10.6, 12.4); in the structurally discovered tier
+(Section 12.4), where no bootstrap is usable, it is an ordering key of the
+Section 12.4 selection.
 
 ### 10.5. The SidecarEpochDirectory (CBOR)
 
@@ -1366,6 +1370,72 @@ priority order: the bootstrap's inline directory (key 20) → the bootstrap's
 SHA-256 and every cross-check; on any failure fall through) → a
 structurally discovered parity_map → none.
 
+**Selecting among structurally discovered parity_maps.** When the overlay
+falls through to structurally discovered parity_map files — no bootstrap
+inline directory and no readable `ParityMapReference` usable over the
+recoverable prefix — and more than one parity_map tape file survives, the
+Scanner selects deterministically.
+
+1. **Integrity gate.** A candidate parity_map is eligible only if: its
+   `tape_uuid` matches the tape identity (Section 12.1); at least one header
+   copy parses with a valid magic and header CRC and satisfies the
+   Section 10.3 locator arithmetic against the measured tape-file length
+   (`M` from `payload_len`/`block_size`; total = `2M+1`; the three start
+   indices); its payload bytes — taken from the copy whose header parsed,
+   falling back to the other copy on a payload-block read failure
+   (Appendix B.7) — hash to the header's `payload_sha256`; and the decoded
+   payload matches the header/footer locator fields (`tape_uuid`,
+   `sequence`, `canonical_map_digest`, the three scope scalars) with the
+   Section 10.5 directory invariants satisfied (Sections 10.4, 10.5, 12.3
+   item 2). Header–footer agreement is required only when the footer block
+   is readable; one valid header copy with an unreadable footer is eligible
+   (the footer is redundancy — Appendix B.7, Section 1.1 goal 5). A
+   candidate failing any condition MUST be discarded.
+
+2. **Walk cross-check.** For each eligible candidate, apply its own
+   `SidecarEpochDirectory` to the walked filemark map as the overlay above
+   does — re-type the directory-listed tape files as sidecars with their
+   epoch and range (block counts MUST match; a directory entry conflicting
+   with a *scanned bootstrap or parity_map* classification is a hard error),
+   re-type every in-scope head-unreadable 1-block tape file the directory
+   does not list as a sidecar as a bootstrap (deterministic given the
+   directory, not the single-candidate search of the re-typing paragraph
+   below), renumber object ordinals, and truncate to
+   `directory_scope_tape_file_count`. A candidate MUST be discarded if the
+   walk yields fewer than `directory_scope_tape_file_count`
+   structurally-complete tape files, or if it declares
+   `is_final_directory = 1` and its scope does not equal the count of
+   structurally-complete tape files. Then recompute the Section 7.3
+   canonical digest and the Section 7.2-derived `T`/`W` over the overlaid,
+   scoped prefix and compare all four values (digest, `tape_file_count`,
+   `total_data_ordinals`, `highest_protected_ordinal`) to the candidate's;
+   discard a candidate whose overlaid projection does not reproduce them. A
+   tape carrying within one scope both a head-damaged 1-block object and a
+   head-damaged bootstrap defeats the deterministic re-typing and its
+   parity_map is discarded — a multi-fault case beyond the Section 1.1
+   goal-5 single-fault contract, failing safe.
+
+3. **Selection.** Among candidates passing steps 1 and 2, the authoritative
+   parity_map is the one with the lexicographically greatest key
+   `(is_final_directory, sequence, directory_scope_total_data_ordinals)` —
+   the parity_map analogue of the Section 8.5 bootstrap key (Section 10.4);
+   the step-2 `is_final_directory` guard makes this key select the largest
+   validated scope. If two candidates share the key, the one with the lowest
+   `tape_file_number` (Section 3.1) is authoritative; two candidates sharing
+   the key but disagreeing on content is a structural inconsistency the
+   Scanner MUST report — the candidate positions, the shared key, and the
+   chosen tape file — while proceeding with the lowest-`tape_file_number`
+   copy.
+
+The Section 12.4-selected parity_map's own digest record is the fencing
+authority for its validated scope (Sections 12.6, 13.2); a bootstrap digest
+record covering a subset of that scope is cross-checked for content
+agreement over its overlapping prefix only, and a disagreement is a hard
+conflict the Scanner reports — never a reason to shrink the parity_map's
+scope. If no candidate passes steps 1 and 2, the overlay is `none` and each
+sidecar retains its scanned classification and range (the fallback of the
+overlay-precedence paragraph above).
+
 The overlay re-types directory-listed tape files as sidecars with their
 epoch and range (block counts MUST match; a directory entry conflicting
 with a *scanned* bootstrap or parity_map classification is a hard error).
@@ -1419,14 +1489,22 @@ section: that map's authority is off-tape (Section 16.1) and may
 legitimately extend past the newest on-tape attestation; such a Scanner
 needing tail classification extends the walk beyond the map scope.
 
-The **attested prefix** of a tape is the scope of the highest-authority
-digest record that validates: candidates in descending Section 8.5 order,
-validation and bootstrap re-typing per Section 12.4. The attested prefix
-equals the validated scope of Section 7.4. An attesting bootstrap
+The **attested prefix** of a tape is the largest validating scope among
+the tape's validating digest records: the bootstrap digest records, ranked
+among themselves in descending Section 8.5 order, and — when no bootstrap
+supplies a directory usable over the recoverable prefix — the
+Section 12.4-selected structurally discovered parity_map digest record; with
+validation and bootstrap re-typing per Section 12.4. A bootstrap digest
+record is higher authority only at equal scope, winning a content tie over
+the same prefix; a smaller-scope bootstrap digest record does not reduce a
+larger validating scope. The attested prefix equals that validated scope of
+Section 7.4; a validating final bootstrap is normally itself the
+largest-scope record. An attesting bootstrap
 whose own tape file is structurally incomplete (its trailing filemark
 missing) cannot complete its own map entry, so its digest does not
 validate; selection falls to the next candidate. If no digest record
-validates, the attested prefix is empty. From the cartridge alone, every
+validates — including, after the Section 12.4 fallback, no structurally
+discovered parity_map — the attested prefix is empty. From the cartridge alone, every
 tape file then falls into exactly one class:
 
 - **Attested** — within the attested prefix: eligible as recovery input
@@ -1575,7 +1653,8 @@ the last object, and not at the watermark.
    verify by a positional query, and seed the writer with: the prefix map;
    the durable boundary; `W`; the next bootstrap sequence, strictly greater
    than every bootstrap sequence in the committed prefix (and at least the
-   count of committed bootstraps); the live open-epoch state, shape- and
+   count of committed bootstraps); the next parity_map sequence, strictly
+   greater than every parity_map sequence in the committed prefix; the live open-epoch state, shape- and
    CRC-revalidated, then re-accumulated; and **directory entries covering
    every committed-prefix sidecar one-for-one**, so every later bootstrap
    or parity_map directory still enumerates pre-crash epochs — the
@@ -2039,12 +2118,15 @@ tape and does not change any REM-PARITY media byte.
 3. **The last-resort full filemark-walk scan** (Section 8.4 step 5) is a
    SHOULD-offer whose operational parameters (geometry hints, abort
    conditions, progress reporting) are not yet specified.
-4. **Overlay tie-breaks.** When several structurally
-   discovered parity_map files survive with no bootstrap reference
-   (Section 12.4), the selection rule among them is not yet specified.
-   Bootstrap re-typing is implemented at SHOULD strength with a damage-matrix
-   vector; promotion to MUST, if desired before freeze, remains a specification
-   policy decision rather than an implementation gap.
+4. **Bootstrap re-typing promotion.** The selection rule among
+   structurally discovered parity_map files is specified in Section 12.4;
+   it needs a multi-parity_map damage-matrix image vector (ranking,
+   `tape_file_number` tiebreak, identical-key report, overlay-then-digest),
+   pinned-at-generation and second-implementation re-derived before freeze
+   (Section 18 criterion 2). Bootstrap re-typing is implemented at SHOULD
+   strength with a damage-matrix vector; promotion to MUST, if desired before
+   freeze, remains a specification policy decision rather than an
+   implementation gap.
 5. **Throughput program.** Accelerated GF(2⁸) and CRC kernels must land and
    be proven byte-identical via the Section 17 vectors (Section 18
    criterion 6) before freeze, so the conformance anchor is generated at
