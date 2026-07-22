@@ -698,6 +698,67 @@ pub fn parse_parity_map_tape_file(
 
     let primary = parse_copy_at(blocks, &footer, ParityMapCopyKind::Primary);
     let tail = parse_copy_at(blocks, &footer, ParityMapCopyKind::Tail);
+    select_parity_map_copy(primary, tail)
+}
+
+/// Parse a replicated parity-map tape file whose individual blocks may be
+/// unreadable.
+///
+/// The measured tape-file length locates both header/payload copies without
+/// relying on the footer. A readable footer remains authoritative redundancy:
+/// it must parse and agree with any accepted header. Payload blocks are never
+/// spliced between copies; each copy is hash-checked independently.
+pub fn parse_parity_map_tape_file_with_unreadable_blocks(
+    blocks: &[Option<Vec<u8>>],
+    expected_tape_uuid: &[u8; 16],
+) -> Result<DecodedParityMapTapeFile, ParityError> {
+    let measured_total = u64::try_from(blocks.len())
+        .map_err(|_| parity_map_parse("parity-map measured block count overflows u64"))?;
+    if measured_total < 3 || measured_total % 2 == 0 {
+        return Err(parity_map_parse(format!(
+            "parity-map measured block count {measured_total} cannot have layout 2M+1"
+        )));
+    }
+    let measured_copy_block_count = (measured_total - 1) / 2;
+    let footer = match blocks.last().and_then(Option::as_ref) {
+        Some(footer_block) => {
+            let footer = parse_parity_map_footer_block(footer_block, expected_tape_uuid)?;
+            if footer.parity_map_total_block_count != measured_total {
+                return Err(parity_map_parse(format!(
+                    "parity-map has {measured_total} blocks, footer expects {}",
+                    footer.parity_map_total_block_count
+                )));
+            }
+            Some(footer)
+        }
+        None => None,
+    };
+
+    let primary = parse_available_copy_at(
+        blocks,
+        0,
+        ParityMapCopyKind::Primary,
+        expected_tape_uuid,
+        measured_total,
+        footer.as_ref(),
+    );
+    let tail_start = usize::try_from(measured_copy_block_count)
+        .map_err(|_| parity_map_parse("parity-map tail copy start overflows usize"))?;
+    let tail = parse_available_copy_at(
+        blocks,
+        tail_start,
+        ParityMapCopyKind::Tail,
+        expected_tape_uuid,
+        measured_total,
+        footer.as_ref(),
+    );
+    select_parity_map_copy(primary, tail)
+}
+
+fn select_parity_map_copy(
+    primary: Result<DecodedParityMapTapeFile, ParityError>,
+    tail: Result<DecodedParityMapTapeFile, ParityError>,
+) -> Result<DecodedParityMapTapeFile, ParityError> {
     match (primary, tail) {
         (Ok(primary), Ok(tail)) => {
             if !parity_map_copies_agree(&primary, &tail) {
@@ -1301,6 +1362,63 @@ fn parse_copy_at(
         )));
     }
     validate_header_matches_footer(&header, footer)?;
+    decode_copy(blocks, start, header)
+}
+
+fn parse_available_copy_at(
+    blocks: &[Option<Vec<u8>>],
+    start: usize,
+    expected_kind: ParityMapCopyKind,
+    expected_tape_uuid: &[u8; 16],
+    measured_total: u64,
+    footer: Option<&ParityMapFooter>,
+) -> Result<DecodedParityMapTapeFile, ParityError> {
+    let header_block = blocks.get(start).and_then(Option::as_ref).ok_or_else(|| {
+        parity_map_parse(format!("parity-map {expected_kind:?} header unreadable"))
+    })?;
+    let header = parse_parity_map_header_block(header_block, expected_tape_uuid)?;
+    if header.copy_kind != expected_kind {
+        return Err(parity_map_parse(format!(
+            "parity-map copy kind {:?} does not match expected {:?}",
+            header.copy_kind, expected_kind
+        )));
+    }
+    if header.parity_map_total_block_count != measured_total {
+        return Err(parity_map_parse(format!(
+            "parity-map has {measured_total} blocks, {expected_kind:?} header expects {}",
+            header.parity_map_total_block_count
+        )));
+    }
+    if let Some(footer) = footer {
+        validate_header_matches_footer(&header, footer)?;
+    }
+
+    let copy_block_count = usize::try_from(header.copy_block_count)
+        .map_err(|_| parity_map_parse("parity-map copy block count overflows usize"))?;
+    let end = start
+        .checked_add(copy_block_count)
+        .ok_or_else(|| parity_map_parse("parity-map copy end overflows"))?;
+    let available = blocks
+        .get(start..end)
+        .ok_or_else(|| parity_map_parse("parity-map copy range outside tape file"))?;
+    let mut copy_blocks = Vec::with_capacity(copy_block_count);
+    for (offset, block) in available.iter().enumerate() {
+        let block = block.as_ref().ok_or_else(|| {
+            parity_map_parse(format!(
+                "parity-map {expected_kind:?} payload block {} unreadable",
+                start + offset
+            ))
+        })?;
+        copy_blocks.push(block.clone());
+    }
+    decode_copy(&copy_blocks, 0, header)
+}
+
+fn decode_copy(
+    blocks: &[Vec<u8>],
+    start: usize,
+    header: ParityMapHeader,
+) -> Result<DecodedParityMapTapeFile, ParityError> {
     let payload_bytes = read_payload_from_copy(blocks, start, &header)?;
     if sha256_array(&payload_bytes) != header.payload_sha256 {
         return Err(parity_map_parse("parity-map payload sha256 mismatch"));
