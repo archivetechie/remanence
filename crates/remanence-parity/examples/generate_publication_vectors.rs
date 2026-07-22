@@ -8,15 +8,19 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use remanence_parity::bootstrap::write_bootstrap_block;
+use remanence_library::TapeIoError;
+use remanence_parity::bootstrap::{write_bootstrap_block, BOOTSTRAP_HEADER_CRC_OFFSET};
 use remanence_parity::codec::ReedSolomonCodec;
 use remanence_parity::{
-    data_shard_crc64, default_scheme, encode_parity_map_tape_file, encode_sidecar_tape_file,
+    acquire_filemark_map_with_report, crc64_xz, data_shard_crc64, default_scheme,
+    encode_parity_map_tape_file, encode_sidecar_tape_file,
     plan_resume_append_from_committed_prefix, BootstrapPayload, FilemarkMap, FilemarkMapDigest,
-    ParityMapPayload, ParityMapReference, ParityScheme, ParitySchemeRecord, SchemeId,
-    SidecarDescriptor, SidecarEpochDirectory, SidecarEpochDirectoryEntry, TapeFileMapEntry,
-    DEFAULT_SCHEME_BLOCK_SIZE_BYTES, SIDECAR_DIRECTORY_FLAG_FINAL_PARTIAL_EPOCH,
-    SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD, SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
+    ParityError, ParityMapContentConflict, ParityMapPayload, ParityMapReference,
+    ParityMapSelectionKey, ParityScheme, ParitySchemeRecord, PhysicalPositionHint, RawReadOutcome,
+    RawTapeSource, SchemeId, SidecarDescriptor, SidecarEpochDirectory, SidecarEpochDirectoryEntry,
+    SpaceFilemarksOutcome, TapeFileMapEntry, DEFAULT_SCHEME_BLOCK_SIZE_BYTES,
+    SIDECAR_DIRECTORY_FLAG_FINAL_PARTIAL_EPOCH, SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD,
+    SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
 };
 use sha2::{Digest, Sha256};
 
@@ -24,6 +28,116 @@ const BLOCK_SIZE: u32 = 4096;
 const TAPE_UUID: [u8; 16] = [0x42; 16];
 const WRITTEN_AT: &str = "2026-01-01T00:00:00Z";
 const WRITTEN_BY: &str = "remanence-publication-vector-1";
+const PINNED_BOOTSTRAP_SCHEMA_MINOR: u16 = 2;
+
+#[derive(Debug)]
+enum ImageRecord {
+    Block(Vec<u8>),
+    Filemark,
+    Unreadable,
+}
+
+#[derive(Debug)]
+struct ImageRawSource {
+    records: Vec<ImageRecord>,
+    cursor: usize,
+}
+
+impl ImageRawSource {
+    fn new(files: &[Vec<Vec<u8>>], unreadable: (usize, usize)) -> Self {
+        let mut records = Vec::new();
+        for (file_number, blocks) in files.iter().enumerate() {
+            for (block_number, block) in blocks.iter().enumerate() {
+                if (file_number, block_number) == unreadable {
+                    records.push(ImageRecord::Unreadable);
+                } else {
+                    records.push(ImageRecord::Block(block.clone()));
+                }
+            }
+            records.push(ImageRecord::Filemark);
+        }
+        Self { records, cursor: 0 }
+    }
+}
+
+impl RawTapeSource for ImageRawSource {
+    fn configure_fixed_block_size(&mut self, block_size: u32) -> Result<(), ParityError> {
+        if block_size != BLOCK_SIZE {
+            return Err(ParityError::Invariant(
+                "publication image configured with the wrong block size",
+            ));
+        }
+        Ok(())
+    }
+
+    fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
+        self.cursor = usize::try_from(hint.lba)
+            .map_err(|_| ParityError::Invariant("publication image LBA does not fit usize"))?
+            .min(self.records.len());
+        Ok(())
+    }
+
+    fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
+        if count < 0 {
+            return Err(ParityError::Invariant(
+                "publication image only spaces filemarks forward",
+            ));
+        }
+        let mut spaced = 0i64;
+        while self.cursor < self.records.len() && spaced < count {
+            if matches!(self.records[self.cursor], ImageRecord::Filemark) {
+                spaced += 1;
+            }
+            self.cursor += 1;
+        }
+        Ok(SpaceFilemarksOutcome {
+            filemarks_spaced: spaced,
+            position_after: PhysicalPositionHint::new(self.cursor as u64),
+            hit_end_of_data: spaced < count,
+        })
+    }
+
+    fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
+        let Some(record) = self.records.get(self.cursor) else {
+            return Ok(RawReadOutcome::EndOfData {
+                position_after: PhysicalPositionHint::new(self.cursor as u64),
+            });
+        };
+        match record {
+            ImageRecord::Block(block) => {
+                if block.len() > buf.len() {
+                    return Err(TapeIoError::ReadBufferTooSmall {
+                        actual: block.len() as u32,
+                        provided: buf.len() as u32,
+                    }
+                    .into());
+                }
+                let bytes = block.len();
+                buf[..bytes].copy_from_slice(block);
+                self.cursor += 1;
+                Ok(RawReadOutcome::Block {
+                    bytes,
+                    position_after: PhysicalPositionHint::new(self.cursor as u64),
+                })
+            }
+            ImageRecord::Filemark => {
+                self.cursor += 1;
+                Ok(RawReadOutcome::Filemark {
+                    position_after: PhysicalPositionHint::new(self.cursor as u64),
+                })
+            }
+            ImageRecord::Unreadable => Err(TapeIoError::ReadBufferTooSmall {
+                actual: BLOCK_SIZE,
+                provided: BLOCK_SIZE / 2,
+            }
+            .into()),
+        }
+    }
+
+    fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        Ok(PhysicalPositionHint::new(self.cursor as u64))
+    }
+}
 
 fn small_scheme() -> ParityScheme {
     ParityScheme {
@@ -162,6 +276,14 @@ fn write_bootstrap(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut block = vec![0u8; payload.block_size_bytes as usize];
     write_bootstrap_block(payload, &mut block)?;
+    // The already-published parity vectors are immutable schema-minor 2
+    // artifacts. Keep their header bytes stable after the production writer
+    // advances; additive vectors below use `bootstrap_block` at the current
+    // schema minor.
+    block[10..12].copy_from_slice(&PINNED_BOOTSTRAP_SCHEMA_MINOR.to_be_bytes());
+    let header_crc = crc64_xz(&block[..BOOTSTRAP_HEADER_CRC_OFFSET]);
+    block[BOOTSTRAP_HEADER_CRC_OFFSET..BOOTSTRAP_HEADER_CRC_OFFSET + 8]
+        .copy_from_slice(&header_crc.to_le_bytes());
     write_block(path, &block)?;
     Ok(())
 }
@@ -454,6 +576,195 @@ fn emit_default_geometry(root: &Path) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+fn synthetic_directory_entry(tape_file_number: u32, epoch_id: u64) -> SidecarEpochDirectoryEntry {
+    SidecarEpochDirectoryEntry {
+        tape_file_number,
+        epoch_id,
+        protected_ordinal_start: 0,
+        protected_ordinal_end_exclusive: 1,
+        sidecar_total_block_count: 1,
+        sidecar_header_block_count: 1,
+        parity_shard_block_count: 1,
+        canonical_metadata_hash: [epoch_id as u8; 32],
+        flags: 0,
+    }
+}
+
+fn encode_selection_parity_map(
+    sequence: u32,
+    directory: SidecarEpochDirectory,
+    canonical_map_digest: [u8; 32],
+    writer_version: &str,
+) -> Result<remanence_parity::EncodedParityMapTapeFile, Box<dyn std::error::Error>> {
+    Ok(encode_parity_map_tape_file(
+        &ParityMapPayload {
+            tape_uuid: TAPE_UUID,
+            sequence,
+            directory,
+            canonical_map_digest,
+            writer_version: Some(writer_version.to_string()),
+            write_timestamp: Some(WRITTEN_AT.to_string()),
+        },
+        BLOCK_SIZE,
+    )?)
+}
+
+fn bootstrap_block(payload: &BootstrapPayload) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut block = vec![0u8; payload.block_size_bytes as usize];
+    write_bootstrap_block(payload, &mut block)?;
+    Ok(block)
+}
+
+fn emit_multi_parity_map_source(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = root
+        .join("generated-sources")
+        .join("multi-parity-map-selection");
+    fs::create_dir_all(&dir)?;
+    let selected_directory = SidecarEpochDirectory {
+        directory_scope_tape_file_count: 8,
+        directory_scope_total_data_ordinals: 2,
+        directory_scope_highest_protected_ordinal: 1,
+        is_final_directory: true,
+        entries: vec![synthetic_directory_entry(1, 11)],
+    };
+    let conflicting_directory = SidecarEpochDirectory {
+        entries: vec![synthetic_directory_entry(3, 22)],
+        ..selected_directory.clone()
+    };
+    let provisional_lower =
+        encode_selection_parity_map(6, selected_directory.clone(), [0; 32], "lower")?;
+    let provisional_selected =
+        encode_selection_parity_map(7, selected_directory.clone(), [0; 32], "selected")?;
+    let provisional_conflict =
+        encode_selection_parity_map(7, conflicting_directory.clone(), [0; 32], "conflict")?;
+    let selected_map = FilemarkMap::new(vec![
+        TapeFileMapEntry::bootstrap(0, 1),
+        TapeFileMapEntry::parity_sidecar(1, 1, 11, 0, 1),
+        TapeFileMapEntry::parity_map(2, provisional_lower.blocks.len() as u64),
+        TapeFileMapEntry::object(3, 1, 0),
+        TapeFileMapEntry::parity_map(4, provisional_selected.blocks.len() as u64),
+        TapeFileMapEntry::object(5, 1, 1),
+        TapeFileMapEntry::parity_map(6, provisional_conflict.blocks.len() as u64),
+        TapeFileMapEntry::bootstrap(7, 1),
+    ])?;
+    let conflicting_map = FilemarkMap::new(vec![
+        TapeFileMapEntry::bootstrap(0, 1),
+        TapeFileMapEntry::object(1, 1, 0),
+        TapeFileMapEntry::parity_map(2, provisional_lower.blocks.len() as u64),
+        TapeFileMapEntry::parity_sidecar(3, 1, 22, 0, 1),
+        TapeFileMapEntry::parity_map(4, provisional_selected.blocks.len() as u64),
+        TapeFileMapEntry::object(5, 1, 1),
+        TapeFileMapEntry::parity_map(6, provisional_conflict.blocks.len() as u64),
+        TapeFileMapEntry::bootstrap(7, 1),
+    ])?;
+    let selected_digest = selected_map.canonical_digest()?;
+    let lower =
+        encode_selection_parity_map(6, selected_directory.clone(), selected_digest, "lower")?;
+    let selected =
+        encode_selection_parity_map(7, selected_directory.clone(), selected_digest, "selected")?;
+    let conflict = encode_selection_parity_map(
+        7,
+        conflicting_directory,
+        conflicting_map.canonical_digest()?,
+        "conflict",
+    )?;
+    if lower.blocks.len() != provisional_lower.blocks.len()
+        || selected.blocks.len() != provisional_selected.blocks.len()
+        || conflict.blocks.len() != provisional_conflict.blocks.len()
+    {
+        return Err("multi-map digest pinning changed a parity_map block count".into());
+    }
+
+    let prefix_map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)])?;
+    let bot_payload = bootstrap_payload(Some(&small_scheme()), Some(prefix_map.digest(false)?), 0);
+    let mut final_payload =
+        bootstrap_payload(Some(&small_scheme()), Some(selected_map.digest(true)?), 1);
+    final_payload.parity_map_reference = Some(ParityMapReference {
+        tape_file_number: 4,
+        block_count: selected.blocks.len() as u64,
+        directory_scope_tape_file_count: 8,
+        directory_scope_total_data_ordinals: 2,
+        directory_scope_highest_protected_ordinal: 1,
+        is_final_directory: true,
+        parity_map_payload_sha256: selected.header.payload_sha256,
+        canonical_map_digest: selected_digest,
+    });
+    let files = vec![
+        vec![bootstrap_block(&bot_payload)?],
+        patterned_blocks(1, 0xB1),
+        lower.blocks.clone(),
+        patterned_blocks(1, 0xB2),
+        selected.blocks.clone(),
+        patterned_blocks(1, 0xB3),
+        conflict.blocks.clone(),
+        vec![bootstrap_block(&final_payload)?],
+    ];
+    let mut source = ImageRawSource::new(&files, (7, 0));
+    let report = acquire_filemark_map_with_report(&mut source, &bot_payload, None)?;
+    if report.scoped_map.map != selected_map {
+        return Err("multi-map scanner did not recover the selected map".into());
+    }
+    let expected_conflict = ParityMapContentConflict {
+        candidate_tape_file_numbers: vec![4, 6],
+        selection_key: ParityMapSelectionKey {
+            is_final_directory: true,
+            sequence: 7,
+            directory_scope_total_data_ordinals: 2,
+        },
+        chosen_tape_file_number: 4,
+    };
+    if report.parity_map_content_conflicts != [expected_conflict] {
+        return Err("multi-map scanner did not report the equal-key conflict".into());
+    }
+
+    let names = [
+        "tape-file-000-bootstrap.bin",
+        "tape-file-001-ambiguous.bin",
+        "tape-file-002-parity-map-lower-rank.bin",
+        "tape-file-003-ambiguous.bin",
+        "tape-file-004-parity-map-selected.bin",
+        "tape-file-005-object.bin",
+        "tape-file-006-parity-map-equal-key.bin",
+        "tape-file-007-referencing-bootstrap.bin",
+    ];
+    for (name, blocks) in names.into_iter().zip(&files) {
+        write_blocks(&dir.join(name), blocks)?;
+    }
+    fs::write(
+        dir.join("selection.json"),
+        format!(
+            concat!(
+                "{{\n",
+                "  \"source_vector_id\": \"multi-parity-map-selection\",\n",
+                "  \"selected_parity_map_tape_file_number\": 4,\n",
+                "  \"selected_scope\": {{\n",
+                "    \"is_final_directory\": true,\n",
+                "    \"tape_file_count\": 8,\n",
+                "    \"total_data_ordinals\": 2,\n",
+                "    \"highest_protected_ordinal\": 1\n",
+                "  }},\n",
+                "  \"ranking_candidates\": [\n",
+                "    {{\"tape_file_number\": 2, \"key\": [true, 6, 2]}},\n",
+                "    {{\"tape_file_number\": 4, \"key\": [true, 7, 2]}},\n",
+                "    {{\"tape_file_number\": 6, \"key\": [true, 7, 2]}}\n",
+                "  ],\n",
+                "  \"identical_key_report\": {{\n",
+                "    \"candidate_tape_file_numbers\": [4, 6],\n",
+                "    \"chosen_tape_file_number\": 4,\n",
+                "    \"content_disagrees\": true\n",
+                "  }},\n",
+                "  \"damaged_referencing_bootstrap\": {{\"tape_file_number\": 7, \"block_index\": 0}},\n",
+                "  \"recovered_map_cbor_hex\": \"{}\",\n",
+                "  \"recovered_map_sha256\": \"{}\"\n",
+                "}}\n"
+            ),
+            hex(&selected_map.canonical_projection_bytes()?),
+            hex(&selected_digest),
+        ),
+    )?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = env::args_os()
         .nth(1)
@@ -470,6 +781,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     emit_checkpoint(&output)?;
     emit_resume(&output)?;
     emit_default_geometry(&output)?;
+    emit_multi_parity_map_source(&output)?;
     Ok(())
 }
 

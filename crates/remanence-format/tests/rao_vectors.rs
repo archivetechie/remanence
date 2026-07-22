@@ -5,10 +5,11 @@ use remanence_aead::{
     DataEncryptionKey, EnvelopeSealOptions, RecipientPrivateKey, RecipientPublicKey, SealOptions,
 };
 use remanence_format::{
-    write_rem_tar_object, write_rem_tar_object_from_readers, MetadataPreservation, RemTarEntryType,
-    RemTarFile, RemTarFileSpec, RemTarFileStream, RemTarObjectOptions,
+    read_rem_tar_object, write_rem_tar_object, write_rem_tar_object_from_readers,
+    MetadataPreservation, RemTarCborValue, RemTarEntryType, RemTarFile, RemTarFileSpec,
+    RemTarFileStream, RemTarObjectOptions,
 };
-use remanence_library::VecBlockSink;
+use remanence_library::{VecBlockSink, VecBlockSource};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -80,6 +81,40 @@ fn fixture_xattrs(value: Option<&Value>) -> BTreeMap<String, Vec<u8>> {
             (name.clone(), hex_to_bytes(hex))
         })
         .collect()
+}
+
+fn fixture_extensions(value: Option<&Value>) -> BTreeMap<String, RemTarCborValue> {
+    let Some(value) = value else {
+        return BTreeMap::new();
+    };
+    value
+        .as_object()
+        .expect("extensions fixture value is an object")
+        .iter()
+        .map(|(name, value)| (name.clone(), fixture_cbor_value(value)))
+        .collect()
+}
+
+fn fixture_cbor_value(value: &Value) -> RemTarCborValue {
+    match value {
+        Value::Null => RemTarCborValue::Null,
+        Value::Bool(value) => RemTarCborValue::Bool(*value),
+        Value::Number(value) => RemTarCborValue::Unsigned(
+            value
+                .as_u64()
+                .expect("extension fixture number is unsigned"),
+        ),
+        Value::String(value) => RemTarCborValue::Text(value.clone()),
+        Value::Array(values) => {
+            RemTarCborValue::Array(values.iter().map(fixture_cbor_value).collect())
+        }
+        Value::Object(values) => RemTarCborValue::Map(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), fixture_cbor_value(value)))
+                .collect(),
+        ),
+    }
 }
 
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
@@ -275,6 +310,65 @@ fn xattr_vector_entries() -> Vec<TestEntry> {
     ]
 }
 
+fn publication_increment_vectors() -> Vec<(&'static str, RemTarObjectOptions, Vec<TestEntry>)> {
+    let portable = vec![TestEntry::regular(
+        "metadata/portable.txt",
+        "00000000-0000-4000-8000-000000000221",
+        b"portable metadata\n".to_vec(),
+    )
+    .with_xattr("user.comment", b"publication-core".to_vec())];
+    let nonuser = vec![TestEntry::regular(
+        "metadata/security.txt",
+        "00000000-0000-4000-8000-000000000231",
+        b"non-user metadata\n".to_vec(),
+    )
+    .with_xattr(
+        "security.remanence.test",
+        b"publication-secret-value".to_vec(),
+    )];
+    let mut extension_options = vector_options(114, "rao-tv-ext-member", "000000000114");
+    extension_options.extensions.insert(
+        "org.remanence.publication".to_string(),
+        RemTarCborValue::Unsigned(1),
+    );
+    let extension = vec![TestEntry::regular(
+        "metadata/extension.txt",
+        "00000000-0000-4000-8000-000000000241",
+        b"extension metadata\n".to_vec(),
+    )];
+    let combined = vec![TestEntry::regular(
+        "metadata/combined.txt",
+        "00000000-0000-4000-8000-000000000251",
+        b"combined metadata\n".to_vec(),
+    )
+    .with_xattr("trusted.remanence.test", b"carry-only-value".to_vec())
+    .with_extension(
+        "org.remanence.entry-metadata",
+        RemTarCborValue::Map(BTreeMap::from([(
+            "opaque".to_string(),
+            RemTarCborValue::Text("carried".to_string()),
+        )])),
+    )];
+    vec![
+        (
+            "rao-tv-portable-core-only.rao",
+            vector_options(112, "rao-tv-portable-core-only", "000000000112"),
+            portable,
+        ),
+        (
+            "rao-tv-nonuser-attribute.rao",
+            vector_options(113, "rao-tv-nonuser-attribute", "000000000113"),
+            nonuser,
+        ),
+        ("rao-tv-ext-member.rao", extension_options, extension),
+        (
+            "rao-tv-attribute-ext-combined.rao",
+            vector_options(115, "rao-tv-attribute-ext-combined", "000000000115"),
+            combined,
+        ),
+    ]
+}
+
 #[derive(Debug, Clone)]
 struct TestEntry {
     entry_type: RemTarEntryType,
@@ -283,6 +377,7 @@ struct TestEntry {
     data: Vec<u8>,
     link_target: Option<String>,
     xattrs: BTreeMap<String, Vec<u8>>,
+    extensions: BTreeMap<String, RemTarCborValue>,
     mtime: Option<String>,
     executable: Option<bool>,
 }
@@ -300,6 +395,7 @@ impl TestEntry {
             data: data.into(),
             link_target: None,
             xattrs: BTreeMap::new(),
+            extensions: BTreeMap::new(),
             mtime: None,
             executable: None,
         }
@@ -317,6 +413,7 @@ impl TestEntry {
             data: Vec::new(),
             link_target: Some(target.into()),
             xattrs: BTreeMap::new(),
+            extensions: BTreeMap::new(),
             mtime: None,
             executable: None,
         }
@@ -334,6 +431,7 @@ impl TestEntry {
             data: Vec::new(),
             link_target: Some(target.into()),
             xattrs: BTreeMap::new(),
+            extensions: BTreeMap::new(),
             mtime: None,
             executable: None,
         }
@@ -347,6 +445,7 @@ impl TestEntry {
             data: Vec::new(),
             link_target: None,
             xattrs: BTreeMap::new(),
+            extensions: BTreeMap::new(),
             mtime: None,
             executable: None,
         }
@@ -354,6 +453,11 @@ impl TestEntry {
 
     fn with_xattr(mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
         self.xattrs.insert(name.into(), value.into());
+        self
+    }
+
+    fn with_extension(mut self, name: impl Into<String>, value: RemTarCborValue) -> Self {
+        self.extensions.insert(name.into(), value);
         self
     }
 
@@ -392,6 +496,7 @@ impl TestEntry {
             RemTarEntryType::Directory => RemTarFileSpec::directory(&self.path, &self.file_id),
         };
         spec.xattrs.clone_from(&self.xattrs);
+        spec.extensions.clone_from(&self.extensions);
         spec.mtime.clone_from(&self.mtime);
         spec.executable = self.executable;
         spec
@@ -561,6 +666,11 @@ fn assert_plaintext_vector_fixture(
         options.manifest_file_id.as_str(),
         str_field(inputs, "manifest_file_id")
     );
+    assert_eq!(
+        options.extensions,
+        fixture_extensions(inputs.get("extensions")),
+        "input object extensions"
+    );
 
     let input_entries = field(inputs, "entries")
         .as_array()
@@ -586,6 +696,12 @@ fn assert_plaintext_vector_fixture(
             entry.xattrs,
             fixture_xattrs(expected_entry.get("xattrs")),
             "input xattrs for {}",
+            entry.path
+        );
+        assert_eq!(
+            entry.extensions,
+            fixture_extensions(expected_entry.get("extensions")),
+            "input extensions for {}",
             entry.path
         );
         assert_json_opt_string(
@@ -726,6 +842,61 @@ fn assert_plaintext_vector_fixture(
     }
 }
 
+fn increment_fixture(filename: &str) -> (&'static str, &'static str) {
+    match filename {
+        "rao-tv-portable-core-only.rao" => (
+            include_str!("../../../fixtures/rao/rao-tv-portable-core-only.json"),
+            "RAO-TV-PORTABLE-CORE-ONLY",
+        ),
+        "rao-tv-nonuser-attribute.rao" => (
+            include_str!("../../../fixtures/rao/rao-tv-nonuser-attribute.json"),
+            "RAO-TV-NONUSER-ATTRIBUTE",
+        ),
+        "rao-tv-ext-member.rao" => (
+            include_str!("../../../fixtures/rao/rao-tv-ext-member.json"),
+            "RAO-TV-EXT-MEMBER",
+        ),
+        "rao-tv-attribute-ext-combined.rao" => (
+            include_str!("../../../fixtures/rao/rao-tv-attribute-ext-combined.json"),
+            "RAO-TV-ATTRIBUTE-EXT-COMBINED",
+        ),
+        other => panic!("unknown publication increment object {other:?}"),
+    }
+}
+
+fn build_increment_object(
+    filename: &str,
+    options: &RemTarObjectOptions,
+    entries: &[TestEntry],
+) -> Vec<u8> {
+    let (fixture_json, vector_id) = increment_fixture(filename);
+    let fixture = fixture(fixture_json);
+    let expected = field(&fixture, "expected");
+    let (layout, bytes) = write_test_object(options, entries);
+
+    assert_eq!(str_field(&fixture, "vector_id"), vector_id);
+    assert_eq!(layout.schema_version, str_field(expected, "schema_version"));
+    assert_eq!(sha256_hex(&bytes), str_field(expected, "stored_digest"));
+    assert_eq!(
+        sha256_hex(&bytes),
+        str_field(expected, "full_object_sha256")
+    );
+    assert_eq!(sha256_hex(&bytes), str_field(expected, "plaintext_digest"));
+    assert_eq!(
+        sha256_hex(&bytes[..options.chunk_size]),
+        str_field(expected, "first_block_sha256")
+    );
+    assert_eq!(
+        hex(&layout.manifest_cbor),
+        str_field(expected, "manifest_cbor_hex")
+    );
+    assert_eq!(
+        hex(&layout.manifest_sha256),
+        str_field(expected, "manifest_sha256")
+    );
+    bytes
+}
+
 #[test]
 fn rao_tv_p1_matches_fixture_manifest() {
     let fixture = fixture(include_str!("../../../fixtures/rao/rao-tv-p1.json"));
@@ -841,11 +1012,24 @@ fn rao_publication_objects_regenerate_byte_exactly() {
         "RAO-TV-D1 encrypted half regenerates byte-exactly"
     );
 
+    let increment_exports: Vec<(&str, Vec<u8>)> = publication_increment_vectors()
+        .into_iter()
+        .map(|(filename, options, entries)| {
+            let first = build_increment_object(filename, &options, &entries);
+            let second = build_increment_object(filename, &options, &entries);
+            assert_eq!(first, second, "{filename} regenerates byte-exactly");
+            (filename, first)
+        })
+        .collect();
+
     if let Some(directory) = std::env::var_os("RAO_VECTOR_EXPORT_DIR") {
         let directory = PathBuf::from(directory);
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join("rao-tv-e2.rao"), &e2_first).unwrap();
         fs::write(directory.join("rao-tv-d1-encrypted.rao"), &d1_first).unwrap();
+        for (filename, bytes) in &increment_exports {
+            fs::write(directory.join(filename), bytes).unwrap();
+        }
     }
 
     assert_eq!(
@@ -1333,6 +1517,48 @@ fn rao_tv_xattrs_matches_fixture_manifest() {
         vector_options(111, "rao-tv-xattrs", "000000000111"),
         xattr_vector_entries(),
     );
+}
+
+#[test]
+fn rao_publication_increment_matches_fixture_manifests() {
+    for (filename, options, entries) in publication_increment_vectors() {
+        let (fixture_json, vector_id) = increment_fixture(filename);
+        assert_plaintext_vector_fixture(fixture_json, vector_id, options, entries);
+    }
+}
+
+#[test]
+fn rao_publication_extension_members_reemit_byte_identically() {
+    for (filename, mut options, entries) in publication_increment_vectors()
+        .into_iter()
+        .filter(|(filename, _, _)| filename.contains("ext"))
+    {
+        let original = build_increment_object(filename, &options, &entries);
+        let mut source = VecBlockSource::new(
+            original
+                .chunks_exact(options.chunk_size)
+                .map(Vec::from)
+                .collect(),
+        );
+        let decoded = read_rem_tar_object(
+            &mut source,
+            options.chunk_size,
+            (original.len() / options.chunk_size) as u64,
+        )
+        .expect("publication extension object reads");
+
+        options.extensions.clone_from(&decoded.object_extensions);
+        let mut reemit_entries = entries;
+        for entry in &mut reemit_entries {
+            let decoded_entry = decoded
+                .entry(&entry.path)
+                .expect("payload entry is present");
+            entry.xattrs.clone_from(&decoded_entry.xattrs);
+            entry.extensions.clone_from(&decoded_entry.extensions);
+        }
+        let (_, reemitted) = write_test_object(&options, &reemit_entries);
+        assert_eq!(reemitted, original, "{filename} canonical re-emission");
+    }
 }
 
 #[test]
