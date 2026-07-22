@@ -4,7 +4,7 @@
 | --- | --- |
 | Status | Publication specification |
 | Version | 1.0 |
-| Date | 2026-07-17 |
+| Date | 2026-07-22 (revised draft; first published 2026-07-17) |
 | Archived release DOI | [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126) |
 | Envelope magic | `RAO1` (encrypted representation) |
 | Stream format identifier | `rao-v1` (plaintext representation) |

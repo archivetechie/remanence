@@ -4,6 +4,32 @@ Notable changes to Remanence and its published formats. The format
 specifications carry their own revision histories; entries here are
 per-release summaries.
 
+## v1.1.1 — 2026-07-22
+
+Security hardening of the extended-attribute restore path. Archived: DOI
+pending (concept DOI
+[10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126)).
+
+- Extended-attribute restore is now allow-listed by default to the `user.`
+  namespace across every restore surface (`rem archive extract`, `dump`,
+  tape-restore, and the `rao-recover` disaster-recovery reader). Privileged
+  namespaces (`security.*`, `system.*`, `trusted.*`) are skipped and
+  reported by name — never applied — unless an operator opts them in with a
+  repeatable `--xattr-namespace` flag. Attribute values are never logged.
+- Attribute writes are no-follow: they never traverse a symbolic link at the
+  final path component, and malformed or over-limit attribute names are
+  rejected before reaching the OS. A genuine application failure is surfaced;
+  only an unsupported-filesystem condition is a benign skip. One stderr
+  warning is emitted per restore when attributes are skipped by policy.
+- Restore reports (including the `rao-recover` summary) list both skipped and
+  applied-privileged attribute names, so an opt-in's effect is auditable and
+  a disaster-recovery restore never silently drops metadata.
+- REM-PARITY companion note: RAO Object Format §12.10 restores the
+  extended-attribute restore protections to requirement (MUST) strength;
+  see the specification's revision history. New `reference-extended-
+  attributes.md` documents capture/restore behavior and the safety of the
+  standard-`tar` recovery path (which cannot reapply attributes).
+
 ## v1.1.0 — 2026-07-22
 
 Batched checkpointing and the field-validated throughput stack. Archived:
