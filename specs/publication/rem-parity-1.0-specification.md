@@ -6,7 +6,7 @@
 | --- | --- |
 | Status | Draft for review |
 | Version | 1.0 |
-| Date | 2026-06-11 |
+| Date | 2026-07-22 (revised draft; first draft 2026-06-11) |
 | Archived release DOI | [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126) |
 | Bootstrap magic | `52 45 4D 00 42 4F 4F 01` (`"REM\0BOO\x01"`, fixed bytes) |
 | Erasure scheme identifier | `rs-cauchy-gf256-v1` |
@@ -2049,6 +2049,27 @@ tape and does not change any REM-PARITY media byte.
    scanner/recovery reader that validates each row against the
    recovered filemark map and emits a catalog-less recovery report for both
    plaintext and encrypted RAO objects, demonstrated before format freeze.
+
+## Appendix D. Revision History (Informative)
+
+- **2026-06-11 — first draft.** Initial publication baseline, archived with
+  release v1.0.0.
+- **2026-07-21 — pre-freeze revisions.** Writer-legal block sizes closed
+  over the discovery-candidate set (Section 8.4); object identity row keys
+  clarified (Section 8.2.1); epochs redefined as explicit ordinal ranges
+  with bare-counter ids (Sections 3.3, 10.5) and short epochs legalized at
+  any checkpoint boundary with `FINAL_PARTIAL_EPOCH` reserved for terminal
+  `finish()` (Sections 10.5, 11.2); the bootstrap directory ceiling made an
+  admission-time refusal with mandatory headroom and seal-at-ceiling
+  (Section 8.2.1); reference journal watermark note (Appendix B.12).
+- **2026-07-22 — tape-alone recovery claims.** Ordered persistence and the
+  synchronizing barrier made normative requirements on the tape I/O layer
+  (Section 3.5); commit discipline extended with batched deferred
+  synchronization and staged-record semantics (Sections 3.4, 11.1); the
+  attested prefix and the bare-tape tail taxonomy
+  (attested / unattested / truncated) specified with salvage rules
+  (Section 12.6); Appendix B.8 reframed from "no on-tape commit marker" to
+  per-file-marker rationale plus barrier-grain structural attestation.
 
 ## Author's Address
 
