@@ -2,20 +2,21 @@
 //!
 //! The scanner walks physical tape files from BOT, reads only the first block
 //! of each file for structural classification, and measures file length by
-//! spacing to the next filemark. Bootstrap and sidecar tape files are accepted
-//! only after their magic plus CRC/header validation succeeds; everything else
-//! is treated as an object candidate and validated later by the bootstrap
-//! filemark-map digest.
+//! spacing to the next filemark. Bootstrap, parity-map, and sidecar tape files
+//! are accepted only after their magic plus CRC/header validation succeeds;
+//! everything else is treated as an object candidate and validated later by an
+//! authoritative bootstrap or structurally selected parity-map digest.
 
 use crate::bootstrap::{has_bootstrap_magic, parse_bootstrap_block, BootstrapPayload};
 use crate::error::ParityError;
 use crate::filemark_map::{
-    FilemarkMap, FilemarkMapBuilder, ScopedFilemarkMap, TapeFileKind, TapeFileMapEntry,
-    TapeFilePosition,
+    FilemarkMap, FilemarkMapBuilder, FilemarkMapDigest, ScopedFilemarkMap, TapeFileKind,
+    TapeFileMapEntry, TapeFilePosition,
 };
 use crate::parity_map::{
-    classify_parity_map_header_block, parse_parity_map_tape_file, ParityMapReference,
-    SidecarEpochDirectory,
+    classify_parity_map_header_block, parse_parity_map_tape_file,
+    parse_parity_map_tape_file_with_unreadable_blocks, DecodedParityMapTapeFile,
+    ParityMapReference, SidecarEpochDirectory,
 };
 use crate::raw::{PhysicalPositionHint, RawReadOutcome, RawTapeSource};
 use crate::sidecar::{
@@ -90,6 +91,8 @@ pub struct FilemarkMapScanResult {
     pub unattested_files: Vec<UnattestedTapeFile>,
     /// First structurally incomplete tail file, when present.
     pub truncation: Option<ScanTailTruncation>,
+    /// Equal-ranking parity-map copies whose validated payloads disagreed.
+    pub parity_map_content_conflicts: Vec<ParityMapContentConflict>,
 }
 
 impl FilemarkMapScanResult {
@@ -97,6 +100,28 @@ impl FilemarkMapScanResult {
     pub fn unattested_file_count(&self) -> usize {
         self.unattested_files.len()
     }
+}
+
+/// Ranking tuple used to select a structurally discovered parity map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParityMapSelectionKey {
+    /// Whether the directory claims the complete structurally walked tape.
+    pub is_final_directory: bool,
+    /// Writer-assigned parity-map sequence.
+    pub sequence: u32,
+    /// Total object-data ordinals in the validated directory scope.
+    pub directory_scope_total_data_ordinals: u64,
+}
+
+/// Non-fatal structural inconsistency between equal-ranking parity maps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParityMapContentConflict {
+    /// Tape-file numbers of the equal-ranking candidates, in ascending order.
+    pub candidate_tape_file_numbers: Vec<u32>,
+    /// Shared ranking tuple.
+    pub selection_key: ParityMapSelectionKey,
+    /// Lowest tape-file number selected as authoritative.
+    pub chosen_tape_file_number: u32,
 }
 
 impl CatalogFilemarkMapInput {
@@ -115,7 +140,8 @@ impl CatalogFilemarkMapInput {
 /// If Layer 5 has a committed catalog map, that catalog path is authoritative
 /// and no physical scan is performed. Otherwise this scans the tape and
 /// validates the reconstructed map against the authoritative bootstrap's
-/// `filemark_map_digest`, preserving intermediate-bootstrap prefix scope.
+/// `filemark_map_digest` or a higher-scope structurally selected parity-map
+/// digest, preserving the selected authority's prefix scope.
 pub fn acquire_filemark_map(
     source: &mut dyn RawTapeSource,
     authoritative_bootstrap: &BootstrapPayload,
@@ -142,7 +168,7 @@ pub fn acquire_filemark_map_with_report(
         validate_catalog_scope(&catalog, authoritative_bootstrap)?;
         let scoped_map =
             ScopedFilemarkMap::from_catalog(catalog.map, catalog.highest_protected_ordinal);
-        return filemark_map_scan_result(scoped_map, None);
+        return filemark_map_scan_result(scoped_map, None, Vec::new());
     }
 
     let Some(digest) = authoritative_bootstrap.filemark_map_digest.as_ref() else {
@@ -158,17 +184,30 @@ pub fn acquire_filemark_map_with_report(
     match validate_scan_hypothesis(
         source,
         reconstructed.map.clone(),
+        &reconstructed.unreadable_one_block_objects,
         authoritative_bootstrap,
         digest,
     ) {
-        Ok(scoped) => filemark_map_scan_result(scoped, reconstructed.truncation),
+        Ok(validated) => filemark_map_scan_result(
+            validated.scoped_map,
+            reconstructed.truncation,
+            validated.parity_map_content_conflicts,
+        ),
         Err(original_error) => {
             for tape_file_number in &reconstructed.unreadable_one_block_objects {
                 let hypothesis = retype_object_as_bootstrap(&reconstructed.map, *tape_file_number)?;
-                if let Ok(scoped) =
-                    validate_scan_hypothesis(source, hypothesis, authoritative_bootstrap, digest)
-                {
-                    return filemark_map_scan_result(scoped, reconstructed.truncation);
+                if let Ok(validated) = validate_scan_hypothesis(
+                    source,
+                    hypothesis,
+                    &reconstructed.unreadable_one_block_objects,
+                    authoritative_bootstrap,
+                    digest,
+                ) {
+                    return filemark_map_scan_result(
+                        validated.scoped_map,
+                        reconstructed.truncation,
+                        validated.parity_map_content_conflicts,
+                    );
                 }
             }
             Err(enrich_scan_error_with_truncation(
@@ -182,6 +221,7 @@ pub fn acquire_filemark_map_with_report(
 fn filemark_map_scan_result(
     scoped_map: ScopedFilemarkMap,
     truncation: Option<ScanTailTruncation>,
+    parity_map_content_conflicts: Vec<ParityMapContentConflict>,
 ) -> Result<FilemarkMapScanResult, ParityError> {
     let attested_tape_file_count = scoped_map
         .validated_prefix_tape_files
@@ -208,6 +248,7 @@ fn filemark_map_scan_result(
         scoped_map,
         unattested_files,
         truncation,
+        parity_map_content_conflicts,
     })
 }
 
@@ -232,15 +273,30 @@ fn enrich_scan_error_with_truncation(
     }
 }
 
+struct ValidatedScanHypothesis {
+    scoped_map: ScopedFilemarkMap,
+    parity_map_content_conflicts: Vec<ParityMapContentConflict>,
+}
+
 fn validate_scan_hypothesis(
     source: &mut dyn RawTapeSource,
     reconstructed: FilemarkMap,
+    unreadable_one_block_objects: &[u32],
     authoritative_bootstrap: &BootstrapPayload,
-    digest: &crate::filemark_map::FilemarkMapDigest,
-) -> Result<ScopedFilemarkMap, ParityError> {
-    let reconstructed =
-        apply_authoritative_directory_overlay(source, reconstructed, authoritative_bootstrap)?;
-    ScopedFilemarkMap::validate_against_digest(reconstructed, digest)
+    digest: &FilemarkMapDigest,
+) -> Result<ValidatedScanHypothesis, ParityError> {
+    let overlay = apply_authoritative_directory_overlay(
+        source,
+        reconstructed,
+        unreadable_one_block_objects,
+        authoritative_bootstrap,
+    )?;
+    let fencing_digest = overlay.fencing_digest.as_ref().unwrap_or(digest);
+    let scoped_map = ScopedFilemarkMap::validate_against_digest(overlay.map, fencing_digest)?;
+    Ok(ValidatedScanHypothesis {
+        scoped_map,
+        parity_map_content_conflicts: overlay.parity_map_content_conflicts,
+    })
 }
 
 fn retype_object_as_bootstrap(
@@ -700,16 +756,60 @@ fn sidecar_header_matches_footer(header: &SidecarHeader, footer: &SidecarFooter)
         && header.canonical_metadata_hash == footer.canonical_metadata_hash
 }
 
+struct AuthoritativeDirectoryOverlay {
+    map: FilemarkMap,
+    fencing_digest: Option<FilemarkMapDigest>,
+    parity_map_content_conflicts: Vec<ParityMapContentConflict>,
+}
+
+struct ValidatedParityMapCandidate {
+    tape_file_number: u32,
+    decoded: DecodedParityMapTapeFile,
+    overlayed_map: FilemarkMap,
+}
+
+impl ValidatedParityMapCandidate {
+    fn selection_key(&self) -> ParityMapSelectionKey {
+        ParityMapSelectionKey {
+            is_final_directory: self.decoded.payload.directory.is_final_directory,
+            sequence: self.decoded.payload.sequence,
+            directory_scope_total_data_ordinals: self
+                .decoded
+                .payload
+                .directory
+                .directory_scope_total_data_ordinals,
+        }
+    }
+
+    fn fencing_digest(&self) -> FilemarkMapDigest {
+        let directory = &self.decoded.payload.directory;
+        FilemarkMapDigest {
+            map_sha256: self.decoded.payload.canonical_map_digest,
+            tape_file_count: directory.directory_scope_tape_file_count,
+            map_total_data_ordinals: directory.directory_scope_total_data_ordinals,
+            highest_protected_ordinal: directory.directory_scope_highest_protected_ordinal,
+            is_final_map: directory.is_final_directory,
+        }
+    }
+}
+
 fn apply_authoritative_directory_overlay(
     source: &mut dyn RawTapeSource,
     reconstructed: FilemarkMap,
+    unreadable_one_block_objects: &[u32],
     authoritative_bootstrap: &BootstrapPayload,
-) -> Result<FilemarkMap, ParityError> {
+) -> Result<AuthoritativeDirectoryOverlay, ParityError> {
     if let Some(directory) = authoritative_bootstrap.sidecar_epoch_directory.as_ref() {
-        return apply_sidecar_directory_overlay(reconstructed, directory, None);
+        return Ok(AuthoritativeDirectoryOverlay {
+            map: apply_sidecar_directory_overlay(reconstructed, directory, None)?,
+            fencing_digest: None,
+            parity_map_content_conflicts: Vec::new(),
+        });
     }
 
-    if let Some(reference) = authoritative_bootstrap.parity_map_reference.as_ref() {
+    let unusable_reference = if let Some(reference) =
+        authoritative_bootstrap.parity_map_reference.as_ref()
+    {
         if let Some(directory) = read_referenced_parity_map_directory(
             source,
             &reconstructed,
@@ -717,12 +817,228 @@ fn apply_authoritative_directory_overlay(
             &authoritative_bootstrap.tape_uuid,
             authoritative_bootstrap.block_size_bytes,
         )? {
-            return apply_sidecar_directory_overlay(reconstructed, &directory, Some(reference));
+            return Ok(AuthoritativeDirectoryOverlay {
+                map: apply_sidecar_directory_overlay(reconstructed, &directory, Some(reference))?,
+                fencing_digest: None,
+                parity_map_content_conflicts: Vec::new(),
+            });
         }
-        return apply_parity_map_reference_structural_overlay(reconstructed, reference);
+        Some(reference)
+    } else {
+        None
+    };
+
+    if let Some(selected) = select_structurally_discovered_parity_map(
+        source,
+        &reconstructed,
+        unreadable_one_block_objects,
+        &authoritative_bootstrap.tape_uuid,
+        authoritative_bootstrap.block_size_bytes,
+    )? {
+        return Ok(selected);
     }
 
-    Ok(reconstructed)
+    if let Some(reference) = unusable_reference {
+        return Ok(AuthoritativeDirectoryOverlay {
+            map: apply_parity_map_reference_structural_overlay(reconstructed, reference)?,
+            fencing_digest: None,
+            parity_map_content_conflicts: Vec::new(),
+        });
+    }
+
+    Ok(AuthoritativeDirectoryOverlay {
+        map: reconstructed,
+        fencing_digest: None,
+        parity_map_content_conflicts: Vec::new(),
+    })
+}
+
+fn select_structurally_discovered_parity_map(
+    source: &mut dyn RawTapeSource,
+    reconstructed: &FilemarkMap,
+    unreadable_one_block_objects: &[u32],
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+) -> Result<Option<AuthoritativeDirectoryOverlay>, ParityError> {
+    let structural_candidates: Vec<_> = reconstructed
+        .entries()
+        .iter()
+        .filter(|entry| entry.kind == TapeFileKind::ParityMap)
+        .collect();
+    if structural_candidates.len() < 2 {
+        return Ok(None);
+    }
+
+    let mut validated_candidates = Vec::new();
+    for entry in structural_candidates {
+        let Some(decoded) = read_structurally_discovered_parity_map(
+            source,
+            reconstructed,
+            entry,
+            tape_uuid,
+            block_size,
+        )?
+        else {
+            continue;
+        };
+        let Some(overlayed_map) = cross_check_structurally_discovered_parity_map(
+            reconstructed,
+            unreadable_one_block_objects,
+            &decoded,
+        )?
+        else {
+            continue;
+        };
+        validated_candidates.push(ValidatedParityMapCandidate {
+            tape_file_number: entry.tape_file_number,
+            decoded,
+            overlayed_map,
+        });
+    }
+    if validated_candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let greatest_key = validated_candidates
+        .iter()
+        .map(ValidatedParityMapCandidate::selection_key)
+        .max_by_key(|key| {
+            (
+                key.is_final_directory,
+                key.sequence,
+                key.directory_scope_total_data_ordinals,
+            )
+        })
+        .expect("non-empty candidate list has a greatest key");
+    let mut tied_indices: Vec<_> = validated_candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            (candidate.selection_key() == greatest_key).then_some(index)
+        })
+        .collect();
+    tied_indices.sort_by_key(|index| validated_candidates[*index].tape_file_number);
+    let chosen_index = tied_indices[0];
+    let chosen_payload = &validated_candidates[chosen_index].decoded.payload_bytes;
+    let content_disagrees = tied_indices
+        .iter()
+        .any(|index| validated_candidates[*index].decoded.payload_bytes != *chosen_payload);
+    let parity_map_content_conflicts = if content_disagrees {
+        vec![ParityMapContentConflict {
+            candidate_tape_file_numbers: tied_indices
+                .iter()
+                .map(|index| validated_candidates[*index].tape_file_number)
+                .collect(),
+            selection_key: greatest_key,
+            chosen_tape_file_number: validated_candidates[chosen_index].tape_file_number,
+        }]
+    } else {
+        Vec::new()
+    };
+
+    let selected = validated_candidates.swap_remove(chosen_index);
+    Ok(Some(AuthoritativeDirectoryOverlay {
+        fencing_digest: Some(selected.fencing_digest()),
+        map: selected.overlayed_map,
+        parity_map_content_conflicts,
+    }))
+}
+
+fn read_structurally_discovered_parity_map(
+    source: &mut dyn RawTapeSource,
+    reconstructed: &FilemarkMap,
+    entry: &TapeFileMapEntry,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+) -> Result<Option<DecodedParityMapTapeFile>, ParityError> {
+    let block_capacity = usize::try_from(entry.block_count).map_err(|_| {
+        filemark_scan_error(format!(
+            "structural parity_map {} block_count {} does not fit usize",
+            entry.tape_file_number, entry.block_count
+        ))
+    })?;
+    let file_start = reconstructed.physical_position(TapeFilePosition {
+        tape_file_number: entry.tape_file_number,
+        block_within_file: 0,
+    })?;
+    let mut blocks = Vec::with_capacity(block_capacity);
+    for block_within_file in 0..entry.block_count {
+        blocks.push(read_optional_fixed_block_at(
+            source,
+            file_start,
+            block_within_file,
+            block_size,
+        )?);
+    }
+    match parse_parity_map_tape_file_with_unreadable_blocks(&blocks, tape_uuid) {
+        Ok(decoded) => Ok(Some(decoded)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn cross_check_structurally_discovered_parity_map(
+    reconstructed: &FilemarkMap,
+    unreadable_one_block_objects: &[u32],
+    decoded: &DecodedParityMapTapeFile,
+) -> Result<Option<FilemarkMap>, ParityError> {
+    let directory = &decoded.payload.directory;
+    let structurally_complete_file_count = reconstructed.tape_file_count();
+    if directory.directory_scope_tape_file_count > structurally_complete_file_count
+        || (directory.is_final_directory
+            && directory.directory_scope_tape_file_count != structurally_complete_file_count)
+    {
+        return Ok(None);
+    }
+
+    let retyped = retype_directory_disambiguated_bootstraps(
+        reconstructed,
+        directory,
+        unreadable_one_block_objects,
+    )?;
+    let overlayed = apply_sidecar_directory_overlay_projection(retyped, directory, None)?;
+    let scoped = overlayed.truncate_to_tape_files(directory.directory_scope_tape_file_count)?;
+    if scoped.canonical_digest()? != decoded.payload.canonical_map_digest
+        || scoped.tape_file_count() != directory.directory_scope_tape_file_count
+        || scoped.total_data_ordinals() != directory.directory_scope_total_data_ordinals
+        || scoped.max_sidecar_end_exclusive() != directory.directory_scope_highest_protected_ordinal
+    {
+        return Ok(None);
+    }
+    Ok(Some(overlayed))
+}
+
+fn retype_directory_disambiguated_bootstraps(
+    reconstructed: &FilemarkMap,
+    directory: &SidecarEpochDirectory,
+    unreadable_one_block_objects: &[u32],
+) -> Result<FilemarkMap, ParityError> {
+    let mut retyped = reconstructed.clone();
+    for tape_file_number in unreadable_one_block_objects {
+        if *tape_file_number >= directory.directory_scope_tape_file_count
+            || directory
+                .entries
+                .iter()
+                .any(|entry| entry.tape_file_number == *tape_file_number)
+        {
+            continue;
+        }
+        let Some(entry) = retyped.entries().get(*tape_file_number as usize) else {
+            continue;
+        };
+        match entry.kind {
+            TapeFileKind::Object => {
+                retyped = retype_object_as_bootstrap(&retyped, *tape_file_number)?;
+            }
+            TapeFileKind::Bootstrap => {}
+            _ => {
+                return Err(filemark_scan_error(format!(
+                    "head-unreadable one-block tape file {tape_file_number} has unexpected {:?} classification",
+                    entry.kind
+                )));
+            }
+        }
+    }
+    Ok(retyped)
 }
 
 fn read_referenced_parity_map_directory(
@@ -869,6 +1185,32 @@ fn apply_sidecar_directory_overlay(
     directory: &SidecarEpochDirectory,
     parity_map_reference: Option<&ParityMapReference>,
 ) -> Result<FilemarkMap, ParityError> {
+    let overlayed =
+        apply_sidecar_directory_overlay_projection(reconstructed, directory, parity_map_reference)?;
+    let scope = overlayed.truncate_to_tape_files(directory.directory_scope_tape_file_count)?;
+    if scope.total_data_ordinals() != directory.directory_scope_total_data_ordinals {
+        return Err(filemark_scan_error(format!(
+            "sidecar directory total ordinals {} do not match overlayed map {}",
+            directory.directory_scope_total_data_ordinals,
+            scope.total_data_ordinals()
+        )));
+    }
+    if scope.max_sidecar_end_exclusive() != directory.directory_scope_highest_protected_ordinal {
+        return Err(filemark_scan_error(format!(
+            "sidecar directory protection watermark {} does not match overlayed map {}",
+            directory.directory_scope_highest_protected_ordinal,
+            scope.max_sidecar_end_exclusive()
+        )));
+    }
+
+    Ok(overlayed)
+}
+
+fn apply_sidecar_directory_overlay_projection(
+    reconstructed: FilemarkMap,
+    directory: &SidecarEpochDirectory,
+    parity_map_reference: Option<&ParityMapReference>,
+) -> Result<FilemarkMap, ParityError> {
     directory.validate()?;
     let scope_len = usize::try_from(directory.directory_scope_tape_file_count).map_err(|_| {
         filemark_scan_error("sidecar directory scope tape-file count does not fit usize")
@@ -967,24 +1309,7 @@ fn apply_sidecar_directory_overlay(
         }
     }
 
-    let overlayed = FilemarkMap::new(overlayed_entries)?;
-    let scope = overlayed.truncate_to_tape_files(directory.directory_scope_tape_file_count)?;
-    if scope.total_data_ordinals() != directory.directory_scope_total_data_ordinals {
-        return Err(filemark_scan_error(format!(
-            "sidecar directory total ordinals {} do not match overlayed map {}",
-            directory.directory_scope_total_data_ordinals,
-            scope.total_data_ordinals()
-        )));
-    }
-    if scope.max_sidecar_end_exclusive() != directory.directory_scope_highest_protected_ordinal {
-        return Err(filemark_scan_error(format!(
-            "sidecar directory protection watermark {} does not match overlayed map {}",
-            directory.directory_scope_highest_protected_ordinal,
-            scope.max_sidecar_end_exclusive()
-        )));
-    }
-
-    Ok(overlayed)
+    FilemarkMap::new(overlayed_entries)
 }
 
 fn validate_catalog_scope(
@@ -1032,9 +1357,10 @@ mod tests {
     };
     use crate::model::{ParityScheme, SchemeId};
     use crate::parity_map::{
-        encode_parity_map_tape_file, ParityMapPayload, ParityMapReference, SidecarEpochDirectory,
-        SidecarEpochDirectoryEntry, PARITY_MAP_HEADER_CRC_OFFSET,
-        SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD, SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
+        encode_parity_map_tape_file, EncodedParityMapTapeFile, ParityMapPayload,
+        ParityMapReference, SidecarEpochDirectory, SidecarEpochDirectoryEntry,
+        PARITY_MAP_HEADER_CRC_OFFSET, SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD,
+        SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
     };
     use crate::recovery::recover_object_block_from_sidecar;
     use crate::sidecar::{
@@ -1551,6 +1877,445 @@ mod tests {
             Record::Filemark,
         ]);
         (records, expected_map)
+    }
+
+    struct StructuralParityMapFixture {
+        records: Vec<Record>,
+        expected_map: FilemarkMap,
+        authoritative_bootstrap: BootstrapPayload,
+        stale_parity_map: EncodedParityMapTapeFile,
+        selected_parity_map: EncodedParityMapTapeFile,
+    }
+
+    fn encode_test_parity_map(
+        sequence: u32,
+        directory: SidecarEpochDirectory,
+        canonical_map_digest: [u8; 32],
+        writer_version: &str,
+    ) -> EncodedParityMapTapeFile {
+        encode_parity_map_tape_file(
+            &ParityMapPayload {
+                tape_uuid: TAPE_UUID,
+                sequence,
+                directory,
+                canonical_map_digest,
+                writer_version: Some(writer_version.to_string()),
+                write_timestamp: None,
+            },
+            BLOCK_SIZE,
+        )
+        .expect("test parity_map encodes")
+    }
+
+    fn plain_structural_parity_map_fixture(
+        unreadable_selected_footer: bool,
+    ) -> StructuralParityMapFixture {
+        let stale_directory = SidecarEpochDirectory {
+            directory_scope_tape_file_count: 3,
+            directory_scope_total_data_ordinals: 2,
+            directory_scope_highest_protected_ordinal: 0,
+            is_final_directory: true,
+            entries: Vec::new(),
+        };
+        let selected_directory = SidecarEpochDirectory {
+            directory_scope_tape_file_count: 6,
+            directory_scope_total_data_ordinals: 3,
+            directory_scope_highest_protected_ordinal: 0,
+            is_final_directory: true,
+            entries: Vec::new(),
+        };
+        let provisional_stale =
+            encode_test_parity_map(99, stale_directory.clone(), [0; 32], "stale");
+        let provisional_selected =
+            encode_test_parity_map(1, selected_directory.clone(), [0; 32], "selected");
+        let expected_map = FilemarkMap::new(vec![
+            TapeFileMapEntry::bootstrap(0, 1),
+            TapeFileMapEntry::object(1, 2, 0),
+            TapeFileMapEntry::parity_map(2, provisional_stale.blocks.len() as u64),
+            TapeFileMapEntry::object(3, 1, 2),
+            TapeFileMapEntry::parity_map(4, provisional_selected.blocks.len() as u64),
+            TapeFileMapEntry::bootstrap(5, 1),
+        ])
+        .expect("structural parity_map fixture map validates");
+        let stale_scope = expected_map
+            .truncate_to_tape_files(stale_directory.directory_scope_tape_file_count)
+            .expect("stale parity_map scope exists");
+        let stale_parity_map = encode_test_parity_map(
+            99,
+            stale_directory,
+            stale_scope.canonical_digest().expect("stale digest builds"),
+            "stale",
+        );
+        let mut selected_parity_map = encode_test_parity_map(
+            1,
+            selected_directory,
+            expected_map
+                .canonical_digest()
+                .expect("selected digest builds"),
+            "selected",
+        );
+        assert_eq!(
+            stale_parity_map.blocks.len(),
+            provisional_stale.blocks.len(),
+            "stale digest replacement must preserve parity_map block count"
+        );
+        assert_eq!(
+            selected_parity_map.blocks.len(),
+            provisional_selected.blocks.len(),
+            "selected digest replacement must preserve parity_map block count"
+        );
+
+        if unreadable_selected_footer {
+            let tail_start = usize::try_from(selected_parity_map.header.tail_copy_start_block)
+                .expect("tail copy start fits usize");
+            selected_parity_map.blocks[tail_start][PARITY_MAP_HEADER_CRC_OFFSET] ^= 0xFF;
+        }
+
+        let prefix_map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)])
+            .expect("prefix map validates");
+        let authoritative_bootstrap =
+            bootstrap_payload(prefix_map.digest(false).expect("prefix digest builds"), 0);
+        let mut records = vec![
+            Record::Block(bootstrap_block_for_payload(&authoritative_bootstrap)),
+            Record::Filemark,
+            Record::Block(block(0xA1)),
+            Record::Block(block(0xA2)),
+            Record::Filemark,
+        ];
+        records.extend(stale_parity_map.blocks.iter().cloned().map(Record::Block));
+        records.extend([
+            Record::Filemark,
+            Record::Block(block(0xA3)),
+            Record::Filemark,
+        ]);
+        for (index, parity_map_block) in selected_parity_map.blocks.iter().cloned().enumerate() {
+            if unreadable_selected_footer && index + 1 == selected_parity_map.blocks.len() {
+                records.push(Record::Unreadable);
+            } else {
+                records.push(Record::Block(parity_map_block));
+            }
+        }
+        records.extend([Record::Filemark, Record::Unreadable, Record::Filemark]);
+
+        StructuralParityMapFixture {
+            records,
+            expected_map,
+            authoritative_bootstrap,
+            stale_parity_map,
+            selected_parity_map,
+        }
+    }
+
+    fn synthetic_directory_entry(
+        tape_file_number: u32,
+        epoch_id: u64,
+    ) -> SidecarEpochDirectoryEntry {
+        SidecarEpochDirectoryEntry {
+            tape_file_number,
+            epoch_id,
+            protected_ordinal_start: 0,
+            protected_ordinal_end_exclusive: 1,
+            sidecar_total_block_count: 1,
+            sidecar_header_block_count: 1,
+            parity_shard_block_count: 1,
+            canonical_metadata_hash: [epoch_id as u8; 32],
+            flags: 0,
+        }
+    }
+
+    fn ambiguous_structural_parity_map_fixture(
+        first_sequence: u32,
+        second_sequence: u32,
+    ) -> (Vec<Record>, FilemarkMap, FilemarkMap, BootstrapPayload) {
+        let first_directory = SidecarEpochDirectory {
+            directory_scope_tape_file_count: 6,
+            directory_scope_total_data_ordinals: 1,
+            directory_scope_highest_protected_ordinal: 1,
+            is_final_directory: true,
+            entries: vec![synthetic_directory_entry(1, 11)],
+        };
+        let second_directory = SidecarEpochDirectory {
+            directory_scope_tape_file_count: 6,
+            directory_scope_total_data_ordinals: 1,
+            directory_scope_highest_protected_ordinal: 1,
+            is_final_directory: true,
+            entries: vec![synthetic_directory_entry(3, 22)],
+        };
+        let provisional_first =
+            encode_test_parity_map(first_sequence, first_directory.clone(), [0; 32], "first");
+        let provisional_second =
+            encode_test_parity_map(second_sequence, second_directory.clone(), [0; 32], "second");
+        let first_map = FilemarkMap::new(vec![
+            TapeFileMapEntry::bootstrap(0, 1),
+            TapeFileMapEntry::parity_sidecar(1, 1, 11, 0, 1),
+            TapeFileMapEntry::parity_map(2, provisional_first.blocks.len() as u64),
+            TapeFileMapEntry::object(3, 1, 0),
+            TapeFileMapEntry::parity_map(4, provisional_second.blocks.len() as u64),
+            TapeFileMapEntry::bootstrap(5, 1),
+        ])
+        .expect("first ambiguous projection validates");
+        let second_map = FilemarkMap::new(vec![
+            TapeFileMapEntry::bootstrap(0, 1),
+            TapeFileMapEntry::object(1, 1, 0),
+            TapeFileMapEntry::parity_map(2, provisional_first.blocks.len() as u64),
+            TapeFileMapEntry::parity_sidecar(3, 1, 22, 0, 1),
+            TapeFileMapEntry::parity_map(4, provisional_second.blocks.len() as u64),
+            TapeFileMapEntry::bootstrap(5, 1),
+        ])
+        .expect("second ambiguous projection validates");
+        let first_parity_map = encode_test_parity_map(
+            first_sequence,
+            first_directory,
+            first_map.canonical_digest().expect("first digest builds"),
+            "first",
+        );
+        let second_parity_map = encode_test_parity_map(
+            second_sequence,
+            second_directory,
+            second_map.canonical_digest().expect("second digest builds"),
+            "second",
+        );
+        assert_eq!(
+            first_parity_map.blocks.len(),
+            provisional_first.blocks.len()
+        );
+        assert_eq!(
+            second_parity_map.blocks.len(),
+            provisional_second.blocks.len()
+        );
+
+        let prefix_map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)])
+            .expect("prefix map validates");
+        let authoritative_bootstrap =
+            bootstrap_payload(prefix_map.digest(false).expect("prefix digest builds"), 0);
+        let mut records = vec![
+            Record::Block(bootstrap_block_for_payload(&authoritative_bootstrap)),
+            Record::Filemark,
+            Record::Block(block(0xB1)),
+            Record::Filemark,
+        ];
+        records.extend(first_parity_map.blocks.into_iter().map(Record::Block));
+        records.extend([
+            Record::Filemark,
+            Record::Block(block(0xB2)),
+            Record::Filemark,
+        ]);
+        records.extend(second_parity_map.blocks.into_iter().map(Record::Block));
+        records.extend([Record::Filemark, Record::Unreadable, Record::Filemark]);
+        (records, first_map, second_map, authoritative_bootstrap)
+    }
+
+    #[test]
+    fn structurally_discovered_parity_map_selects_current_scope_after_overlay_digest() {
+        let fixture = plain_structural_parity_map_fixture(false);
+        let mut walk_source = RecordingRawSource::new(fixture.records.clone());
+        let walked =
+            scan_reconstruct_filemark_map_with_provenance(&mut walk_source, &TAPE_UUID, BLOCK_SIZE)
+                .expect("structural parity_map fixture walks");
+        assert_eq!(walked.map.entries()[2].kind, TapeFileKind::ParityMap);
+        assert_eq!(walked.map.entries()[4].kind, TapeFileKind::ParityMap);
+        assert_eq!(
+            walked.map.entries()[5].kind,
+            TapeFileKind::Object,
+            "the unreadable final bootstrap must initially classify by elimination"
+        );
+        assert_eq!(walked.unreadable_one_block_objects, vec![5]);
+
+        let stale_decoded =
+            parse_parity_map_tape_file(&fixture.stale_parity_map.blocks, &TAPE_UUID)
+                .expect("stale parity_map passes its integrity gate");
+        assert!(
+            cross_check_structurally_discovered_parity_map(
+                &walked.map,
+                &walked.unreadable_one_block_objects,
+                &stale_decoded,
+            )
+            .expect("stale cross-check completes")
+            .is_none(),
+            "a superseded final directory must fail the complete-walk scope guard"
+        );
+
+        let mut source = RecordingRawSource::new(fixture.records);
+        let result =
+            acquire_filemark_map_with_report(&mut source, &fixture.authoritative_bootstrap, None)
+                .expect("the current structural parity_map validates its own scope");
+        assert_eq!(result.scoped_map.map, fixture.expected_map);
+        assert_eq!(result.attested_map, fixture.expected_map);
+        assert_eq!(result.scoped_map.validated_prefix_tape_files, None);
+        assert!(result.unattested_files.is_empty());
+        assert!(result.parity_map_content_conflicts.is_empty());
+    }
+
+    #[test]
+    fn structurally_discovered_parity_map_accepts_valid_header_without_footer() {
+        let mut fixture = plain_structural_parity_map_fixture(true);
+        let tail_start = usize::try_from(fixture.selected_parity_map.header.tail_copy_start_block)
+            .expect("tail copy start fits usize");
+        assert!(
+            crate::parity_map::parse_parity_map_header_block(
+                &fixture.selected_parity_map.blocks[0],
+                &TAPE_UUID,
+            )
+            .is_ok(),
+            "the primary header copy must remain valid"
+        );
+        assert!(
+            crate::parity_map::parse_parity_map_header_block(
+                &fixture.selected_parity_map.blocks[tail_start],
+                &TAPE_UUID,
+            )
+            .is_err(),
+            "the tail header copy must be damaged"
+        );
+        fixture.authoritative_bootstrap.parity_map_reference = Some(ParityMapReference {
+            tape_file_number: 4,
+            block_count: fixture.selected_parity_map.blocks.len() as u64,
+            directory_scope_tape_file_count: 6,
+            directory_scope_total_data_ordinals: 3,
+            directory_scope_highest_protected_ordinal: 0,
+            is_final_directory: true,
+            parity_map_payload_sha256: fixture.selected_parity_map.header.payload_sha256,
+            canonical_map_digest: fixture
+                .expected_map
+                .canonical_digest()
+                .expect("selected digest builds"),
+        });
+
+        let mut source = RecordingRawSource::new(fixture.records);
+        let scoped = acquire_filemark_map(&mut source, &fixture.authoritative_bootstrap, None)
+            .expect("a valid primary copy with an unreadable footer remains eligible");
+        assert_eq!(scoped.map, fixture.expected_map);
+        assert_eq!(scoped.validated_prefix_tape_files, None);
+    }
+
+    #[test]
+    fn structural_parity_map_ranking_prefers_greatest_sequence() {
+        let (records, first_map, second_map, authoritative_bootstrap) =
+            ambiguous_structural_parity_map_fixture(4, 5);
+        assert_ne!(first_map, second_map, "fixture projections must disagree");
+
+        let mut source = RecordingRawSource::new(records);
+        let result = acquire_filemark_map_with_report(&mut source, &authoritative_bootstrap, None)
+            .expect("both parity_maps validate before ranking");
+        assert_eq!(result.scoped_map.map, second_map);
+        assert!(result.parity_map_content_conflicts.is_empty());
+    }
+
+    #[test]
+    fn structural_parity_map_equal_key_uses_lowest_file_and_reports_conflict() {
+        let (records, first_map, second_map, authoritative_bootstrap) =
+            ambiguous_structural_parity_map_fixture(7, 7);
+        assert_ne!(first_map, second_map, "fixture projections must disagree");
+
+        let mut source = RecordingRawSource::new(records);
+        let result = acquire_filemark_map_with_report(&mut source, &authoritative_bootstrap, None)
+            .expect("equal-key content disagreement is non-fatal");
+        assert_eq!(result.scoped_map.map, first_map);
+        assert_eq!(
+            result.parity_map_content_conflicts,
+            vec![ParityMapContentConflict {
+                candidate_tape_file_numbers: vec![2, 4],
+                selection_key: ParityMapSelectionKey {
+                    is_final_directory: true,
+                    sequence: 7,
+                    directory_scope_total_data_ordinals: 1,
+                },
+                chosen_tape_file_number: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn structural_parity_map_selection_isolated_from_damaged_sidecar_metadata() {
+        let object_a = block(0xC1);
+        let object_b = block(0xC2);
+        let sidecar = encode_sidecar_tape_file(
+            &SidecarDescriptor {
+                tape_uuid: TAPE_UUID,
+                epoch_id: 31,
+                k: 2,
+                m: 1,
+                stripes_per_epoch: 1,
+                block_size: BLOCK_SIZE,
+                protected_ordinal_start: 0,
+                protected_ordinal_end_exclusive: 2,
+            },
+            &[block(0xCF)],
+            vec![data_shard_crc64(&object_a), data_shard_crc64(&object_b)],
+        )
+        .expect("sidecar encodes");
+        let directory = SidecarEpochDirectory {
+            directory_scope_tape_file_count: 6,
+            directory_scope_total_data_ordinals: 2,
+            directory_scope_highest_protected_ordinal: 2,
+            is_final_directory: true,
+            entries: vec![sidecar_directory_entry(2, &sidecar)],
+        };
+        let provisional_first = encode_test_parity_map(0, directory.clone(), [0; 32], "first");
+        let provisional_second = encode_test_parity_map(1, directory.clone(), [0; 32], "second");
+        let expected_map = FilemarkMap::new(vec![
+            TapeFileMapEntry::bootstrap(0, 1),
+            TapeFileMapEntry::object(1, 2, 0),
+            TapeFileMapEntry::parity_sidecar(
+                2,
+                sidecar.blocks.len() as u64,
+                sidecar.header.epoch_id,
+                0,
+                2,
+            ),
+            TapeFileMapEntry::parity_map(3, provisional_first.blocks.len() as u64),
+            TapeFileMapEntry::parity_map(4, provisional_second.blocks.len() as u64),
+            TapeFileMapEntry::bootstrap(5, 1),
+        ])
+        .expect("damaged-sidecar expected map validates");
+        let map_digest = expected_map
+            .canonical_digest()
+            .expect("expected map digest builds");
+        let first_parity_map = encode_test_parity_map(0, directory.clone(), map_digest, "first");
+        let second_parity_map = encode_test_parity_map(1, directory, map_digest, "second");
+        assert_eq!(
+            first_parity_map.blocks.len(),
+            provisional_first.blocks.len()
+        );
+        assert_eq!(
+            second_parity_map.blocks.len(),
+            provisional_second.blocks.len()
+        );
+
+        let prefix_map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)])
+            .expect("prefix map validates");
+        let authoritative_bootstrap =
+            bootstrap_payload(prefix_map.digest(false).expect("prefix digest builds"), 0);
+        let mut damaged_sidecar_blocks = sidecar.blocks.clone();
+        corrupt_sidecar_primary_tail_and_footer(&sidecar, &mut damaged_sidecar_blocks);
+        let mut records = vec![
+            Record::Block(bootstrap_block_for_payload(&authoritative_bootstrap)),
+            Record::Filemark,
+            Record::Block(object_a),
+            Record::Block(object_b),
+            Record::Filemark,
+        ];
+        records.extend(damaged_sidecar_blocks.into_iter().map(Record::Block));
+        records.push(Record::Filemark);
+        records.extend(first_parity_map.blocks.into_iter().map(Record::Block));
+        records.push(Record::Filemark);
+        records.extend(second_parity_map.blocks.into_iter().map(Record::Block));
+        records.extend([Record::Filemark, Record::Unreadable, Record::Filemark]);
+
+        let mut walk_source = RecordingRawSource::new(records.clone());
+        let walked = scan_reconstruct_filemark_map(&mut walk_source, &TAPE_UUID, BLOCK_SIZE)
+            .expect("damaged-sidecar fixture walks");
+        assert_eq!(
+            walked.entries()[2].kind,
+            TapeFileKind::Object,
+            "all damaged sidecar metadata copies must defeat structural classification"
+        );
+
+        let mut source = RecordingRawSource::new(records);
+        let scoped = acquire_filemark_map(&mut source, &authoritative_bootstrap, None)
+            .expect("directory overlay keeps sidecar health outside the canonical digest");
+        assert_eq!(scoped.map, expected_map);
+        assert_eq!(scoped.scope.watermark(), 2);
     }
 
     fn multi_epoch_fixture_records(

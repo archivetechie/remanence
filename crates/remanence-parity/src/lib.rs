@@ -75,11 +75,12 @@ pub use model::{
 pub use parity_map::{
     classify_parity_map_header_block, derive_parity_map_magic, encode_parity_map_tape_file,
     parse_parity_map_footer_block, parse_parity_map_header_block, parse_parity_map_tape_file,
-    DecodedParityMapTapeFile, EncodedParityMapTapeFile, ParityMapCopyKind, ParityMapFooter,
-    ParityMapHeader, ParityMapPayload, ParityMapReference, SidecarEpochDirectory,
-    SidecarEpochDirectoryEntry, PARITY_MAP_FOOTER_CRC_OFFSET, PARITY_MAP_FOOTER_LEN,
-    PARITY_MAP_FOOTER_VERSION, PARITY_MAP_FORMAT_ID, PARITY_MAP_HEADER_CRC_OFFSET,
-    PARITY_MAP_HEADER_LEN, PARITY_MAP_SCHEMA_VERSION, SIDECAR_DIRECTORY_FLAG_FINAL_PARTIAL_EPOCH,
+    parse_parity_map_tape_file_with_unreadable_blocks, DecodedParityMapTapeFile,
+    EncodedParityMapTapeFile, ParityMapCopyKind, ParityMapFooter, ParityMapHeader,
+    ParityMapPayload, ParityMapReference, SidecarEpochDirectory, SidecarEpochDirectoryEntry,
+    PARITY_MAP_FOOTER_CRC_OFFSET, PARITY_MAP_FOOTER_LEN, PARITY_MAP_FOOTER_VERSION,
+    PARITY_MAP_FORMAT_ID, PARITY_MAP_HEADER_CRC_OFFSET, PARITY_MAP_HEADER_LEN,
+    PARITY_MAP_SCHEMA_VERSION, SIDECAR_DIRECTORY_FLAG_FINAL_PARTIAL_EPOCH,
     SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD, SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
 };
 pub use raw::{
@@ -101,7 +102,8 @@ pub use resume::{
 pub use scan::{
     acquire_filemark_map, acquire_filemark_map_with_report, scan_reconstruct_filemark_map,
     scan_reconstruct_filemark_map_with_report, CatalogFilemarkMapInput, FilemarkMapScanResult,
-    ScanTailTruncation, ScanTailTruncationKind, ScanWalkResult, UnattestedTapeFile,
+    ParityMapContentConflict, ParityMapSelectionKey, ScanTailTruncation, ScanTailTruncationKind,
+    ScanWalkResult, UnattestedTapeFile,
 };
 pub use sidecar::{
     classify_sidecar_header_block, crc64_xz, data_shard_crc64, derive_sidecar_footer_magic,
