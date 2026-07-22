@@ -26,6 +26,32 @@ pub(crate) const MAX_FILE_ENTRIES: usize = 10_000_000;
 /// Preserved extended attributes keyed by xattr name.
 pub type RemTarXattrs = BTreeMap<String, Vec<u8>>;
 
+/// Extension members keyed by their extension name.
+pub type RemTarExtensions = BTreeMap<String, RemTarCborValue>;
+
+/// A value in the deterministic RAO manifest CBOR profile.
+///
+/// The profile intentionally excludes negative integers, floats, tags, and
+/// maps with non-text keys. Keeping extension data in this restricted type
+/// makes decoded unknown members safe to preserve and canonically re-emit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemTarCborValue {
+    /// An unsigned integer.
+    Unsigned(u64),
+    /// An opaque byte string.
+    Bytes(Vec<u8>),
+    /// A UTF-8 text string.
+    Text(String),
+    /// A Boolean value.
+    Bool(bool),
+    /// The CBOR null value.
+    Null,
+    /// An ordered sequence of profile values.
+    Array(Vec<Self>),
+    /// A map with text keys. Writers encode keys in deterministic CBOR order.
+    Map(BTreeMap<String, Self>),
+}
+
 /// Per-object logical block address. Starts at zero for each object archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BodyLba(pub u64);
@@ -69,6 +95,8 @@ pub struct RemTarObjectOptions {
     pub write_timestamp: String,
     /// UUID-like identifier for the manifest file's own pax metadata.
     pub manifest_file_id: String,
+    /// Object-level extension members carried under `object_metadata.ext`.
+    pub extensions: RemTarExtensions,
 }
 
 impl RemTarObjectOptions {
@@ -88,6 +116,7 @@ impl RemTarObjectOptions {
             encryption: "none".to_string(),
             write_timestamp: write_timestamp.into(),
             manifest_file_id: manifest_file_id.into(),
+            extensions: BTreeMap::new(),
         }
     }
 }
@@ -110,6 +139,8 @@ pub struct RemTarFileSpec {
     pub link_target: Option<String>,
     /// Preserved extended attributes for RAO 1.1 objects.
     pub xattrs: RemTarXattrs,
+    /// Entry-level extension members carried without applying them on restore.
+    pub extensions: RemTarExtensions,
     /// Optional mtime value recorded in pax when supplied.
     pub mtime: Option<String>,
     /// Optional executable flag recorded in Remanence pax metadata.
@@ -132,6 +163,7 @@ impl RemTarFileSpec {
             file_sha256: Some(file_sha256),
             link_target: None,
             xattrs: BTreeMap::new(),
+            extensions: BTreeMap::new(),
             mtime: None,
             executable: None,
         }
@@ -151,6 +183,7 @@ impl RemTarFileSpec {
             file_sha256: None,
             link_target: Some(target.into()),
             xattrs: BTreeMap::new(),
+            extensions: BTreeMap::new(),
             mtime: None,
             executable: None,
         }
@@ -170,6 +203,7 @@ impl RemTarFileSpec {
             file_sha256: None,
             link_target: Some(target.into()),
             xattrs: BTreeMap::new(),
+            extensions: BTreeMap::new(),
             mtime: None,
             executable: None,
         }
@@ -185,6 +219,7 @@ impl RemTarFileSpec {
             file_sha256: None,
             link_target: None,
             xattrs: BTreeMap::new(),
+            extensions: BTreeMap::new(),
             mtime: None,
             executable: None,
         }
@@ -268,6 +303,8 @@ pub struct RemTarFileLayout {
     pub link_target: Option<String>,
     /// Preserved extended attributes for RAO 1.1 objects.
     pub xattrs: RemTarXattrs,
+    /// Entry-level extension members carried without applying them on restore.
+    pub extensions: RemTarExtensions,
     /// Optional executable flag recorded in Remanence pax metadata.
     pub executable: Option<bool>,
     /// First data chunk LBA. Absent for zero-length files.

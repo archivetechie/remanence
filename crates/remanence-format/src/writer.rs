@@ -140,6 +140,7 @@ pub fn write_rem_tar_object<S: BlockSink + ?Sized>(
         file_sha256: Some(layout.manifest_sha256),
         link_target: None,
         xattrs: Default::default(),
+        extensions: Default::default(),
         mtime: None,
         executable: Some(false),
     };
@@ -198,6 +199,7 @@ pub fn write_rem_tar_object_from_readers<S: BlockSink + ?Sized>(
         file_sha256: Some(layout.manifest_sha256),
         link_target: None,
         xattrs: Default::default(),
+        extensions: Default::default(),
         mtime: None,
         executable: Some(false),
     };
@@ -580,6 +582,7 @@ fn file_to_spec(file: &RemTarFile<'_>) -> RemTarFileSpec {
         file_sha256: Some(file_sha256),
         link_target: None,
         xattrs: Default::default(),
+        extensions: Default::default(),
         mtime: file.mtime.map(str::to_string),
         executable: file.executable,
     }
@@ -598,7 +601,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::model::RemTarObjectOptions;
+    use crate::model::{RemTarCborValue, RemTarObjectOptions};
 
     fn options(chunk_size: usize) -> RemTarObjectOptions {
         let mut opts = RemTarObjectOptions::new(
@@ -940,6 +943,46 @@ mod tests {
     }
 
     #[test]
+    fn streaming_writer_round_trips_entry_and_object_extensions() {
+        let mut opts = options(4096);
+        opts.extensions.insert(
+            "org.example.object".to_string(),
+            RemTarCborValue::Text("object-value".to_string()),
+        );
+        let data = b"extension payload".to_vec();
+        let mut spec = file_spec("extended.txt", "file-extended", &data, None, Some(false));
+        spec.extensions.insert(
+            "org.example.entry".to_string(),
+            RemTarCborValue::Array(vec![
+                RemTarCborValue::Bytes(vec![0, 0xff]),
+                RemTarCborValue::Bool(true),
+            ]),
+        );
+        let mut reader = Cursor::new(data.as_slice());
+        let mut streams = [RemTarFileStream::new(spec, &mut reader)];
+        let mut sink = VecBlockSink::new();
+
+        let layout = write_rem_tar_object_from_readers(&mut sink, &opts, &mut streams).unwrap();
+        assert_eq!(layout.schema_version, crate::model::SCHEMA_VERSION);
+        let mut source = VecBlockSource::new(sink.blocks);
+        let read =
+            crate::read_rem_tar_object(&mut source, opts.chunk_size, layout.projected_size_blocks)
+                .unwrap();
+
+        assert_eq!(
+            read.object_extensions["org.example.object"],
+            RemTarCborValue::Text("object-value".to_string())
+        );
+        assert_eq!(
+            read.entry("extended.txt").unwrap().extensions["org.example.entry"],
+            RemTarCborValue::Array(vec![
+                RemTarCborValue::Bytes(vec![0, 0xff]),
+                RemTarCborValue::Bool(true),
+            ])
+        );
+    }
+
+    #[test]
     fn streaming_writer_rejects_short_source() {
         let opts = options(4096);
         let expected = b"abcdefghij".to_vec();
@@ -1111,6 +1154,7 @@ with tarfile.open(sys.argv[1], "r:*") as tf:
             file_sha256: Some(hash),
             link_target: None,
             xattrs: Default::default(),
+            extensions: Default::default(),
             mtime: mtime.map(str::to_string),
             executable,
         }
