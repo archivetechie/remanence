@@ -2175,11 +2175,11 @@ values (e.g. 4096) so full object byte streams are practical to pin; at least
 one vector MUST use `DEFAULT_CHUNK_SIZE`.
 
 The authoritative companion archive is `remanence-test-vectors.tar`, SHA-256
-`32fe2a7947b74e5c8abbaad4e83e85f7deebc827d0aa8ccee8197fcc9c6cd6da`.
-The successor authoritative companion archive is
-`remanence-test-vectors.tar`, SHA-256
-`<SUCCESSOR-ARCHIVE-SHA256-TBD>`. All prior entries are byte-identical; only
-additive entries are new.
+`f4e4331c14e67c059d1292f54e14efd8408c7d41364d2dba7f8e7567aa16c2a6`. This archive supersedes the earlier
+`32fe2a7947b74e5c8abbaad4e83e85f7deebc827d0aa8ccee8197fcc9c6cd6da`: every
+prior entry is byte-identical and only additive entries (the metadata,
+extension-container, object-inventory, and parity tie-break vectors) are
+new.
 Its `MANIFEST.tsv` inventories every contained vector manifest and generated
 artifact, `CHECKSUMS.sha256` authenticates them, and the included `verify.py`
 checks the archive without a source checkout. It contains plaintext and xattr
