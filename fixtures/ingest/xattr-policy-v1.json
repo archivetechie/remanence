@@ -1,0 +1,43 @@
+{
+  "format": "remanence-ingest-xattr-policy-v1",
+  "entry": "metadata-fixture.bin",
+  "xattrs": [
+    {
+      "name": "user.mime_type",
+      "value": "application/x-remanence-golden-secret"
+    },
+    {
+      "name": "security.selinux",
+      "value": "system_u:object_r:remanence_golden_secret_t:s0"
+    },
+    {
+      "name": "trusted.foo",
+      "value": "trusted-golden-secret"
+    },
+    {
+      "name": "system.posix_acl_access",
+      "value": "system-acl-golden-secret"
+    }
+  ],
+  "default": {
+    "kept": ["user.mime_type"],
+    "dropped": [
+      "security.selinux",
+      "system.posix_acl_access",
+      "trusted.foo"
+    ]
+  },
+  "full_fidelity": {
+    "kept": [
+      "security.selinux",
+      "system.posix_acl_access",
+      "trusted.foo",
+      "user.mime_type"
+    ],
+    "dropped": []
+  },
+  "security_widening": {
+    "kept": ["security.selinux", "user.mime_type"],
+    "dropped": ["system.posix_acl_access", "trusted.foo"]
+  }
+}

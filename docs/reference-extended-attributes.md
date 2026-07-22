@@ -35,11 +35,33 @@ RAO manifest; to it, the manifest is simply one extra file in the archive.
 
 ## Capture
 
-At ingest, an operator's ruleset selects which attributes are recorded.
-Attribute selection is a matter of local policy, not of the byte format:
-different institutions preserve different things for good reasons. Consult
-the ingest configuration for the ruleset syntax (`xattr-mode`,
-`xattr-keep`, `xattr-drop`).
+Capture is portable by default. `rem archive build` records attributes in the
+`user.` namespace and drops attributes in every other namespace, including
+`security.*`, `system.*`, and `trusted.*`. Dropped names are listed per entry
+in the ingest report, and one stderr warning gives the total count. Attribute
+values are never included in command output. Six built-in macOS housekeeping
+attributes are always discarded silently, so they do not add report noise.
+
+Attribute selection remains a matter of local policy, not of the byte format.
+An ingest ruleset can widen the portable core with a validated namespace
+prefix:
+
+```text
+xattr-namespace security.
+```
+
+The prefix must be one non-empty namespace followed by a dot. The report's
+`xattr_policy.applied_non_core_namespaces` field records such widening, while
+`scan.captured_non_core_xattrs` lists the captured names per entry. Existing
+exact-name policies remain available through `option xattr-mode denylist` plus
+`xattr-drop`, or `option xattr-mode allowlist` plus `xattr-keep`.
+
+For records mandates that require every available namespace, use either
+`option xattr-mode full-fidelity` in a ruleset or the
+`--full-fidelity-xattrs` build flag without a ruleset. Full-fidelity logical
+capture is explicit, is not portable, and still omits the built-in junk names.
+It does not relax restore policy: privileged namespaces remain denied on
+restore unless the restoring operator opts in.
 
 ## Restore, and why it is cautious by default
 
