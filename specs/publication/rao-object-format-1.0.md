@@ -1940,10 +1940,16 @@ sandboxed.
 
 Preserved xattrs are equally untrusted. Attributes such as Linux
 `security.capability`, `security.*`, `trusted.*`, and POSIX ACL attributes can
-change privilege or access-control state. A Restoring Consumer SHOULD default
-to the `user.` namespace and require explicit operator policy for other
-namespaces. It MUST treat values as opaque bytes. Xattrs on symlinks SHOULD be
-applied, if at all, through an interface that does not follow the link.
+change privilege or access-control state — a restored `security.capability`
+is a privileged binary. A Restoring Consumer MUST restrict applied attributes
+to the `user.` namespace unless explicit operator policy names additional
+namespace prefixes; attributes outside the effective allow-list MUST be
+skipped and reported (names only — values MUST NOT be logged), never applied.
+It MUST treat values as opaque bytes. A Restoring Consumer MUST NOT write an
+attribute through an interface that follows a symbolic link at the final path
+component; for entries that are symbolic links it MUST use a link-targeting
+interface or skip and report the attribute. Skips are policy outcomes, not
+errors; genuine application failures MUST still surface per Section 4.7.3.
 
 ### 12.11. Envelope Threat Model and Secret Handling
 
@@ -2517,6 +2523,15 @@ LOCATE-to-manifest without a catalog; catalog-less recovery decrypts
 sequentially, an acceptable cost over sequential media.
 
 ## Appendix C. Revision History (Informative)
+
+**2026-07-22.** Section 12.10's extended-attribute restore protections
+restored to requirement strength (MUST): namespace allow-list defaulting to
+`user.`, skip-and-report for excluded attributes, and no-follow application.
+These were requirements in the pre-publication draft, were relaxed to
+recommendations on 2026-07-11 to track a then-deficient reference
+implementation, and are restored now that the reference implementation
+enforces them. The change constrains Restoring Consumer behavior only; the
+set of valid RAO objects is unchanged.
 
 Specification Version 1.0 is the first unified publication baseline. It
 consolidates the project's internal base-format revision, its additive xattr
