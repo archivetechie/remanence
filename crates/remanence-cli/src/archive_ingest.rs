@@ -1,9 +1,10 @@
-//! Ingest-policy planning for `rem archive build --rules`.
+//! Ingest-policy planning for `rem archive build`.
 //!
 //! RAO itself only stores normalized entries. This module stays above the
 //! format crate and turns messy filesystem trees into ordinary RAO inputs by
 //! applying ordered blob/exclude rules, creating `.remwrap.tar` payloads with a
-//! mainstream tar engine, and deriving sibling `.remwrap.idx` entries for blobs.
+//! mainstream tar engine, deriving sibling `.remwrap.idx` entries for blobs,
+//! and applying one xattr capture policy to native and wrapped entries.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -64,9 +65,17 @@ pub(crate) struct MaterializedArchiveInputs {
 #[derive(Debug, Serialize)]
 pub(crate) struct IngestReport {
     pub(crate) ruleset: Option<RulesetReport>,
+    pub(crate) xattr_policy: XattrPolicyReport,
     pub(crate) tar_engine: TarEngineReport,
     pub(crate) scan: ScanReport,
     pub(crate) lints: Vec<RulesetLint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct XattrPolicyReport {
+    pub(crate) mode: &'static str,
+    pub(crate) allowed_prefixes: Vec<String>,
+    pub(crate) applied_non_core_namespaces: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -97,6 +106,11 @@ pub(crate) struct RulesetLint {
 pub(crate) struct ScanReport {
     pub(crate) totals: ScanTotals,
     pub(crate) clusters: Vec<ScanCluster>,
+    /// Names dropped by namespace policy for each entry; values are never reported.
+    pub(crate) dropped_xattrs: BTreeMap<String, Vec<String>>,
+    /// Names captured outside `user.` for each entry; values are never reported.
+    pub(crate) captured_non_core_xattrs: BTreeMap<String, Vec<String>>,
+    /// Backward-compatible clustered projection of `dropped_xattrs`.
     pub(crate) xattr_drops: Vec<XattrDropCluster>,
     pub(crate) blob_suggestions: Vec<BlobSuggestion>,
 }
@@ -167,6 +181,8 @@ struct Ruleset {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum XattrMode {
+    PortableCore,
+    FullFidelity,
     Denylist,
     Allowlist,
 }
@@ -174,6 +190,8 @@ enum XattrMode {
 #[derive(Debug, Clone)]
 struct XattrPolicy {
     mode: XattrMode,
+    allowed_prefixes: BTreeSet<String>,
+    operator_prefixes: BTreeSet<String>,
     keep: BTreeSet<String>,
     drop: BTreeSet<String>,
 }
@@ -226,6 +244,8 @@ struct PlannerState {
     manifest_entries: Vec<CustomerManifestEntry>,
     clusters: BTreeMap<(String, String), ClusterAccumulator>,
     xattr_drops: BTreeMap<(String, String, String), ClusterAccumulator>,
+    dropped_xattrs: BTreeMap<String, BTreeSet<String>>,
+    captured_non_core_xattrs: BTreeMap<String, BTreeSet<String>>,
     dir_stats: BTreeMap<String, DirStats>,
     totals: ScanTotals,
     wrapper_counter: u64,
@@ -296,6 +316,7 @@ pub(crate) struct BlobMemberRange {
 pub(crate) fn materialize_inputs(
     input_paths: &[PathBuf],
     rules_path: Option<&Path>,
+    full_fidelity_xattrs: bool,
     no_index: bool,
     tuning: ScanTuning,
 ) -> Result<MaterializedArchiveInputs, String> {
@@ -304,11 +325,7 @@ pub(crate) fn materialize_inputs(
         Some(path) => Some(load_ruleset(path)?),
         None => None,
     };
-    let default_xattr_policy = XattrPolicy::default();
-    let xattr_policy = ruleset
-        .as_ref()
-        .map(|ruleset| &ruleset.xattr_policy)
-        .unwrap_or(&default_xattr_policy);
+    let xattr_policy = selected_xattr_policy(ruleset.as_ref(), full_fidelity_xattrs);
     let tempdir = tempfile::Builder::new()
         .prefix("remanence-remwrap-")
         .tempdir()
@@ -317,7 +334,7 @@ pub(crate) fn materialize_inputs(
     for input in input_paths {
         let context = ProcessContext {
             ruleset: ruleset.as_ref(),
-            xattr_policy,
+            xattr_policy: &xattr_policy,
             tar_engine: &tar_engine,
             tempdir: tempdir.path(),
             no_index,
@@ -351,6 +368,7 @@ pub(crate) fn materialize_inputs(
     };
     let report = IngestReport {
         ruleset: ruleset_report,
+        xattr_policy: xattr_policy.report(),
         tar_engine,
         scan,
         lints,
@@ -366,6 +384,7 @@ pub(crate) fn materialize_inputs(
 pub(crate) fn scan_only_report(
     input_paths: &[PathBuf],
     rules_path: Option<&Path>,
+    full_fidelity_xattrs: bool,
     no_index: bool,
     tuning: ScanTuning,
 ) -> Result<IngestReport, String> {
@@ -374,15 +393,11 @@ pub(crate) fn scan_only_report(
         Some(path) => Some(load_ruleset(path)?),
         None => None,
     };
-    let default_xattr_policy = XattrPolicy::default();
-    let xattr_policy = ruleset
-        .as_ref()
-        .map(|ruleset| &ruleset.xattr_policy)
-        .unwrap_or(&default_xattr_policy);
+    let xattr_policy = selected_xattr_policy(ruleset.as_ref(), full_fidelity_xattrs);
     let mut state = PlannerState::default();
     let context = ProcessContext {
         ruleset: ruleset.as_ref(),
-        xattr_policy,
+        xattr_policy: &xattr_policy,
         tar_engine: &tar_engine,
         tempdir: Path::new(""),
         no_index,
@@ -398,9 +413,19 @@ pub(crate) fn scan_only_report(
     let ruleset_report = ruleset.as_ref().map(|ruleset| ruleset.report.clone());
     Ok(IngestReport {
         ruleset: ruleset_report,
+        xattr_policy: xattr_policy.report(),
         tar_engine,
         scan: state.scan_report(tuning),
         lints,
+    })
+}
+
+/// Build the single warning emitted when capture drops xattrs by policy.
+pub(crate) fn xattr_policy_drop_warning(dropped_count: u64) -> Option<String> {
+    (dropped_count != 0).then(|| {
+        format!(
+            "{dropped_count} extended attribute(s) dropped by capture namespace policy; see dropped_xattrs in the ingest report"
+        )
     })
 }
 
@@ -655,25 +680,40 @@ fn process_dir(
         .map_err(|error| format!("read directory {}: {error}", dir.display()))?;
     entries.sort_by_key(|entry| entry.file_name());
     if entries.is_empty() {
-        if !relative.as_os_str().is_empty() {
-            let archive_path = format!("{}/", archive_path_from_relative(relative)?);
-            state.record_native(&rel_text, 0);
-            state
-                .files
-                .push(read_archive_build_directory(dir, archive_path)?);
-            let metadata = fs::symlink_metadata(dir)
-                .map_err(|error| format!("stat input {}: {error}", dir.display()))?;
-            state.manifest_entries.push(CustomerManifestEntry {
-                path: rel_text,
-                kind: "directory",
-                size_bytes: 0,
-                sha256: None,
-                mtime: metadata_mtime(dir, &metadata)?,
-                wrapper: None,
-            });
-            return Ok(true);
+        let effective_relative = if relative.as_os_str().is_empty() {
+            PathBuf::from(dir.file_name().ok_or_else(|| {
+                format!(
+                    "input directory {} does not have a file name",
+                    dir.display()
+                )
+            })?)
+        } else {
+            relative.to_path_buf()
+        };
+        let effective_text = relative_match_text(&effective_relative);
+        let metadata = fs::symlink_metadata(dir)
+            .map_err(|error| format!("stat input {}: {error}", dir.display()))?;
+        match native_status(dir, &effective_relative, &metadata, context, state)? {
+            NativeStatus::Native { .. } => {
+                let archive_path = format!("{}/", archive_path_from_relative(&effective_relative)?);
+                state.record_native(&effective_text, 0);
+                state
+                    .files
+                    .push(read_archive_build_directory(dir, archive_path)?);
+                state.manifest_entries.push(CustomerManifestEntry {
+                    path: effective_text,
+                    kind: "directory",
+                    size_bytes: 0,
+                    sha256: None,
+                    mtime: metadata_mtime(dir, &metadata)?,
+                    wrapper: None,
+                });
+            }
+            NativeStatus::WrapFallback(reason) => {
+                wrap_leaf(dir, &effective_relative, &metadata, reason, context, state)?;
+            }
         }
-        return Ok(false);
+        return Ok(true);
     }
 
     let mut added_any = false;
@@ -716,11 +756,15 @@ fn scan_dir(
             return Ok(true);
         }
         Decision::Blob { .. } if !relative.as_os_str().is_empty() => {
+            scan_wrapped_xattrs(dir, relative, context.xattr_policy, state)?;
             let (_, bytes) = subtree_count_bytes(dir)?;
             state.record_blob(&rel_text, bytes, "blob-rule");
             return Ok(true);
         }
         Decision::Blob { .. } => {
+            let root_relative =
+                PathBuf::from(dir.file_name().unwrap_or_else(|| OsStr::new("input")));
+            scan_wrapped_xattrs(dir, &root_relative, context.xattr_policy, state)?;
             let (_, bytes) = subtree_count_bytes(dir)?;
             state.record_blob(&rel_text, bytes, "blob-rule");
             return Ok(true);
@@ -734,6 +778,7 @@ fn scan_dir(
         if let NativeStatus::WrapFallback(reason) =
             native_status(dir, relative, &metadata, context, state)?
         {
+            scan_wrapped_xattrs(dir, relative, context.xattr_policy, state)?;
             let (_, bytes) = subtree_count_bytes(dir)?;
             state.record_wrapped(&rel_text, reason, bytes);
             return Ok(true);
@@ -746,11 +791,25 @@ fn scan_dir(
         .map_err(|error| format!("read directory {}: {error}", dir.display()))?;
     entries.sort_by_key(|entry| entry.file_name());
     if entries.is_empty() {
-        if !relative.as_os_str().is_empty() {
-            state.record_native(&rel_text, 0);
-            return Ok(true);
+        let effective_relative = if relative.as_os_str().is_empty() {
+            PathBuf::from(dir.file_name().ok_or_else(|| {
+                format!(
+                    "input directory {} does not have a file name",
+                    dir.display()
+                )
+            })?)
+        } else {
+            relative.to_path_buf()
+        };
+        let effective_text = relative_match_text(&effective_relative);
+        match native_status(dir, &effective_relative, &metadata, context, state)? {
+            NativeStatus::Native { .. } => state.record_native(&effective_text, 0),
+            NativeStatus::WrapFallback(reason) => {
+                scan_wrapped_xattrs(dir, &effective_relative, context.xattr_policy, state)?;
+                state.record_wrapped(&effective_text, reason, 0);
+            }
         }
-        return Ok(false);
+        return Ok(true);
     }
 
     let mut added_any = false;
@@ -792,7 +851,54 @@ fn scan_leaf(
             state.record_native(&rel_text, 0);
         }
         LeafClassification::WrapFallback(reason) => {
+            scan_wrapped_xattrs(path, relative, context.xattr_policy, state)?;
             state.record_wrapped(&rel_text, reason, metadata.len());
+        }
+    }
+    Ok(())
+}
+
+fn scan_wrapped_xattrs(
+    path: &Path,
+    relative: &Path,
+    policy: &XattrPolicy,
+    state: &mut PlannerState,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("stat wrapped input {}: {error}", path.display()))?;
+    if !metadata.file_type().is_symlink() {
+        let names = match xattr::list(path) {
+            Ok(names) => names.collect::<Vec<_>>(),
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => Vec::new(),
+            Err(error) => return Err(format!("list xattrs for {}: {error}", path.display())),
+        };
+        let rel_text = relative_match_text(relative);
+        for name in names {
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            match xattr_policy_decision(name, policy) {
+                XattrPolicyDecision::DropPolicy => state.record_xattr_drop(&rel_text, name),
+                XattrPolicyDecision::KeepNonCore => {
+                    state.record_captured_non_core_xattr(&rel_text, name)
+                }
+                XattrPolicyDecision::DropBuiltinJunk | XattrPolicyDecision::KeepCore => {}
+            }
+        }
+    }
+    if metadata.is_dir() {
+        let mut entries = fs::read_dir(path)
+            .map_err(|error| format!("read wrapped directory {}: {error}", path.display()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("read wrapped directory {}: {error}", path.display()))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            scan_wrapped_xattrs(
+                &entry.path(),
+                &relative.join(entry.file_name()),
+                policy,
+                state,
+            )?;
         }
     }
     Ok(())
@@ -919,6 +1025,9 @@ fn wrap_leaf(
         path.parent().unwrap_or_else(|| Path::new(".")),
         name,
         &tar_path,
+        context.xattr_policy,
+        state,
+        relative.parent().unwrap_or_else(|| Path::new("")),
     )?;
     let (size, hash) = hash_for_manifest(&tar_path)?;
     state.record_wrapped(&rel_text, reason, size);
@@ -952,7 +1061,15 @@ fn materialize_blob(
         WRAP_TAR_SUFFIX
     );
     let tar_path = next_temp_path(context.tempdir, &mut state.wrapper_counter, "blob.tar");
-    create_wrapper_tar(context.tar_engine, root, relative.as_os_str(), &tar_path)?;
+    create_wrapper_tar(
+        context.tar_engine,
+        root,
+        relative.as_os_str(),
+        &tar_path,
+        context.xattr_policy,
+        state,
+        Path::new(""),
+    )?;
     let source_metadata = fs::symlink_metadata(dir)
         .map_err(|error| format!("stat input {}: {error}", dir.display()))?;
     let source_mtime = metadata_mtime(dir, &source_metadata)?;
@@ -983,6 +1100,9 @@ fn materialize_root_blob(
         dir.parent().unwrap_or_else(|| Path::new(".")),
         name,
         &tar_path,
+        context.xattr_policy,
+        state,
+        Path::new(""),
     )?;
     let source_metadata = fs::symlink_metadata(dir)
         .map_err(|error| format!("stat input {}: {error}", dir.display()))?;
@@ -1070,6 +1190,7 @@ fn load_ruleset(path: &Path) -> Result<Ruleset, String> {
         .map_err(|error| format!("ruleset {} must be UTF-8: {error}", path.display()))?;
     let mut case_insensitive = false;
     let mut xattr_policy = XattrPolicy::default();
+    let mut xattr_mode_explicit = false;
     let mut rules = Vec::new();
     for (line_index, original) in text.lines().enumerate() {
         let line_no = line_index + 1;
@@ -1081,6 +1202,8 @@ fn load_ruleset(path: &Path) -> Result<Ruleset, String> {
             let option = option.trim();
             if let Some(mode) = option.strip_prefix("xattr-mode ") {
                 xattr_policy.mode = match mode.trim() {
+                    "portable-core" => XattrMode::PortableCore,
+                    "full-fidelity" => XattrMode::FullFidelity,
                     "denylist" => XattrMode::Denylist,
                     "allowlist" => XattrMode::Allowlist,
                     other => {
@@ -1090,6 +1213,7 @@ fn load_ruleset(path: &Path) -> Result<Ruleset, String> {
                         ))
                     }
                 };
+                xattr_mode_explicit = true;
                 continue;
             }
             match option {
@@ -1113,7 +1237,19 @@ fn load_ruleset(path: &Path) -> Result<Ruleset, String> {
         if let Some(name) = line.strip_prefix("xattr-drop ") {
             let name = name.trim();
             validate_xattr_policy_name(path, line_no, name)?;
+            // Preserve the legacy shorthand: before portable-core became the
+            // default, `xattr-drop NAME` selected the implicit deny-list.
+            if !xattr_mode_explicit && xattr_policy.mode == XattrMode::PortableCore {
+                xattr_policy.mode = XattrMode::Denylist;
+            }
             xattr_policy.drop.insert(name.to_string());
+            continue;
+        }
+        if let Some(prefix) = line.strip_prefix("xattr-namespace ") {
+            let prefix = prefix.trim();
+            let prefix = remanence_stream::parse_xattr_namespace_prefix(prefix)
+                .map_err(|error| format!("{}:{line_no}: {error}", path.display()))?;
+            xattr_policy.add_allowed_prefix(prefix);
             continue;
         }
         if line.starts_with("expect") {
@@ -1183,10 +1319,60 @@ fn load_ruleset(path: &Path) -> Result<Ruleset, String> {
 impl Default for XattrPolicy {
     fn default() -> Self {
         Self {
-            mode: XattrMode::Denylist,
+            mode: XattrMode::PortableCore,
+            allowed_prefixes: BTreeSet::from(["user.".to_string()]),
+            operator_prefixes: BTreeSet::new(),
             keep: BTreeSet::new(),
             drop: BTreeSet::new(),
         }
+    }
+}
+
+impl XattrPolicy {
+    fn add_allowed_prefix(&mut self, prefix: String) {
+        self.allowed_prefixes.insert(prefix.clone());
+        self.operator_prefixes.insert(prefix);
+    }
+
+    fn full_fidelity() -> Self {
+        Self {
+            mode: XattrMode::FullFidelity,
+            ..Self::default()
+        }
+    }
+
+    fn report(&self) -> XattrPolicyReport {
+        let allowed_prefixes = if self.mode == XattrMode::PortableCore {
+            self.allowed_prefixes.iter().cloned().collect()
+        } else {
+            Vec::new()
+        };
+        let applied_non_core_namespaces = self
+            .operator_prefixes
+            .iter()
+            .filter(|prefix| prefix.as_str() != "user.")
+            .cloned()
+            .collect();
+        XattrPolicyReport {
+            mode: match self.mode {
+                XattrMode::PortableCore => "portable-core",
+                XattrMode::FullFidelity => "full-fidelity",
+                XattrMode::Denylist => "denylist",
+                XattrMode::Allowlist => "allowlist",
+            },
+            allowed_prefixes,
+            applied_non_core_namespaces,
+        }
+    }
+}
+
+fn selected_xattr_policy(ruleset: Option<&Ruleset>, full_fidelity_xattrs: bool) -> XattrPolicy {
+    if full_fidelity_xattrs {
+        XattrPolicy::full_fidelity()
+    } else {
+        ruleset
+            .map(|ruleset| ruleset.xattr_policy.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -1213,6 +1399,31 @@ fn validate_xattr_policy(path: &Path, policy: &XattrPolicy) -> Result<(), String
             "{}: xattr-drop requires 'option xattr-mode denylist'",
             path.display()
         )),
+        XattrMode::PortableCore if !policy.keep.is_empty() => Err(format!(
+            "{}: xattr-keep requires 'option xattr-mode allowlist'",
+            path.display()
+        )),
+        XattrMode::PortableCore if !policy.drop.is_empty() => Err(format!(
+            "{}: xattr-drop requires 'option xattr-mode denylist'",
+            path.display()
+        )),
+        XattrMode::FullFidelity
+            if !policy.keep.is_empty()
+                || !policy.drop.is_empty()
+                || !policy.operator_prefixes.is_empty() =>
+        {
+            Err(format!(
+                "{}: full-fidelity xattr mode cannot be combined with xattr-keep, xattr-drop, or xattr-namespace",
+                path.display()
+            ))
+        }
+        XattrMode::Denylist | XattrMode::Allowlist if !policy.operator_prefixes.is_empty() =>
+        {
+            Err(format!(
+                "{}: xattr-namespace requires portable-core xattr mode",
+                path.display()
+            ))
+        }
         _ => Ok(()),
     }
 }
@@ -1491,6 +1702,14 @@ enum XattrCollection {
     Wrap(&'static str),
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum XattrPolicyDecision {
+    DropBuiltinJunk,
+    DropPolicy,
+    KeepCore,
+    KeepNonCore,
+}
+
 fn collect_preserved_xattrs(
     path: &Path,
     rel_text: &str,
@@ -1504,24 +1723,42 @@ fn collect_preserved_xattrs(
         }
         Err(error) => return Err(format!("list xattrs for {}: {error}", path.display())),
     };
-    let mut kept = BTreeMap::new();
-    let mut total_size = 0usize;
+    let mut text_names = Vec::with_capacity(names.len());
     for name in names {
         let Some(name_text) = name.to_str() else {
             return Ok(XattrCollection::Wrap("xattr-name"));
         };
-        if should_drop_xattr(name_text, policy) {
-            let reason = if builtin_junk_xattr(name_text) {
-                "baseline"
-            } else {
-                "policy"
-            };
-            state.record_xattr_drop(rel_text, name_text, reason);
-            continue;
+        text_names.push(name_text.to_string());
+    }
+    collect_preserved_xattr_values(rel_text, policy, state, text_names, |name| {
+        xattr::get(path, name)
+            .map_err(|error| format!("read xattr {name:?} for {}: {error}", path.display()))
+    })
+}
+
+fn collect_preserved_xattr_values<I, F>(
+    rel_text: &str,
+    policy: &XattrPolicy,
+    state: &mut PlannerState,
+    names: I,
+    mut read_value: F,
+) -> Result<XattrCollection, String>
+where
+    I: IntoIterator<Item = String>,
+    F: FnMut(&str) -> Result<Option<Vec<u8>>, String>,
+{
+    let mut kept = BTreeMap::new();
+    let mut total_size = 0usize;
+    for name in names {
+        match xattr_policy_decision(&name, policy) {
+            XattrPolicyDecision::DropBuiltinJunk => continue,
+            XattrPolicyDecision::DropPolicy => {
+                state.record_xattr_drop(rel_text, &name);
+                continue;
+            }
+            XattrPolicyDecision::KeepCore | XattrPolicyDecision::KeepNonCore => {}
         }
-        let Some(value) = xattr::get(path, &name)
-            .map_err(|error| format!("read xattr {name_text:?} for {}: {error}", path.display()))?
-        else {
+        let Some(value) = read_value(&name)? else {
             continue;
         };
         if value.len() > XATTR_SINGLE_VALUE_LIMIT {
@@ -1529,22 +1766,39 @@ fn collect_preserved_xattrs(
         }
         total_size = total_size
             .checked_add(value.len())
-            .ok_or_else(|| format!("xattr total size overflows for {}", path.display()))?;
+            .ok_or_else(|| format!("xattr total size overflows for {rel_text:?}"))?;
         if total_size > XATTR_TOTAL_VALUE_LIMIT {
             return Ok(XattrCollection::Wrap("xattr-large"));
         }
-        kept.insert(name_text.to_string(), value);
+        kept.insert(name, value);
+    }
+    for name in kept.keys() {
+        if xattr_policy_decision(name, policy) == XattrPolicyDecision::KeepNonCore {
+            state.record_captured_non_core_xattr(rel_text, name);
+        }
     }
     Ok(XattrCollection::Preserve(kept))
 }
 
-fn should_drop_xattr(name: &str, policy: &XattrPolicy) -> bool {
+fn xattr_policy_decision(name: &str, policy: &XattrPolicy) -> XattrPolicyDecision {
     if builtin_junk_xattr(name) {
-        return true;
+        return XattrPolicyDecision::DropBuiltinJunk;
     }
-    match policy.mode {
-        XattrMode::Denylist => policy.drop.contains(name),
-        XattrMode::Allowlist => !policy.keep.contains(name),
+    let keep = match policy.mode {
+        XattrMode::PortableCore => policy
+            .allowed_prefixes
+            .iter()
+            .any(|prefix| name.starts_with(prefix)),
+        XattrMode::FullFidelity => true,
+        XattrMode::Denylist => !policy.drop.contains(name),
+        XattrMode::Allowlist => policy.keep.contains(name),
+    };
+    if !keep {
+        XattrPolicyDecision::DropPolicy
+    } else if name.starts_with("user.") {
+        XattrPolicyDecision::KeepCore
+    } else {
+        XattrPolicyDecision::KeepNonCore
     }
 }
 
@@ -1588,6 +1842,9 @@ fn create_wrapper_tar(
     base_dir: &Path,
     member: &OsStr,
     output: &Path,
+    policy: &XattrPolicy,
+    state: &mut PlannerState,
+    report_prefix: &Path,
 ) -> Result<(), String> {
     let command_output = Command::new(&tar_engine.program)
         .arg("-c")
@@ -1611,7 +1868,220 @@ fn create_wrapper_tar(
             String::from_utf8_lossy(&command_output.stderr)
         ));
     }
+    filter_wrapper_tar_xattrs(output, policy, state, report_prefix)
+}
+
+/// Rewrite wrapper pax headers through the same xattr policy as native entries.
+///
+/// Libarchive records each xattr twice (`LIBARCHIVE.xattr.*` and
+/// `SCHILY.xattr.*`). Both representations must be removed together while the
+/// per-entry report counts the logical attribute only once.
+fn filter_wrapper_tar_xattrs(
+    wrapper: &Path,
+    policy: &XattrPolicy,
+    state: &mut PlannerState,
+    report_prefix: &Path,
+) -> Result<(), String> {
+    let parent = wrapper
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut filtered = tempfile::Builder::new()
+        .prefix("remanence-xattr-filter-")
+        .tempfile_in(parent)
+        .map_err(|error| {
+            format!(
+                "create filtered wrapper beside {}: {error}",
+                wrapper.display()
+            )
+        })?;
+    {
+        let mut input = File::open(wrapper).map_err(|error| {
+            format!(
+                "open wrapper {} for xattr filtering: {error}",
+                wrapper.display()
+            )
+        })?;
+        let mut pending_path = None;
+        let mut pending_decisions = BTreeMap::<String, XattrPolicyDecision>::new();
+        loop {
+            let mut header = [0u8; 512];
+            input
+                .read_exact(&mut header)
+                .map_err(|error| format!("read wrapper header {}: {error}", wrapper.display()))?;
+            if header.iter().all(|byte| *byte == 0) {
+                filtered
+                    .write_all(&header)
+                    .map_err(|error| format!("write wrapper terminator: {error}"))?;
+                std::io::copy(&mut input, &mut filtered)
+                    .map_err(|error| format!("copy wrapper terminator padding: {error}"))?;
+                break;
+            }
+
+            let size = parse_tar_size(&header)?;
+            if header[156] == b'x' {
+                let mut data = vec![
+                    0u8;
+                    usize::try_from(size).map_err(|_| {
+                        "pax xattr header is too large for this host"
+                    })?
+                ];
+                input
+                    .read_exact(&mut data)
+                    .map_err(|error| format!("read wrapper pax header: {error}"))?;
+                discard_tar_padding(&mut input, size)?;
+                let mut records = parse_pax_records(&data)?;
+                if let Some(path) = records.get("path") {
+                    pending_path = Some(path.clone());
+                }
+                records.retain(|key, _| {
+                    let Some(name) = pax_xattr_name(key) else {
+                        return true;
+                    };
+                    let decision = xattr_policy_decision(name, policy);
+                    pending_decisions.insert(name.to_string(), decision);
+                    matches!(
+                        decision,
+                        XattrPolicyDecision::KeepCore | XattrPolicyDecision::KeepNonCore
+                    )
+                });
+                if !records.is_empty() {
+                    let filtered_data = encode_pax_records(&records);
+                    set_tar_header_size_and_checksum(&mut header, filtered_data.len() as u64)?;
+                    filtered
+                        .write_all(&header)
+                        .and_then(|()| filtered.write_all(&filtered_data))
+                        .map_err(|error| format!("write filtered wrapper pax header: {error}"))?;
+                    write_tar_padding(&mut filtered, filtered_data.len() as u64)?;
+                }
+                continue;
+            }
+
+            let member_path = pending_path
+                .take()
+                .unwrap_or_else(|| tar_header_path_bytes(&header));
+            let report_path = wrapper_xattr_report_path(report_prefix, &member_path);
+            for (name, decision) in std::mem::take(&mut pending_decisions) {
+                match decision {
+                    XattrPolicyDecision::DropPolicy => state.record_xattr_drop(&report_path, &name),
+                    XattrPolicyDecision::KeepNonCore => {
+                        state.record_captured_non_core_xattr(&report_path, &name)
+                    }
+                    XattrPolicyDecision::DropBuiltinJunk | XattrPolicyDecision::KeepCore => {}
+                }
+            }
+
+            filtered
+                .write_all(&header)
+                .map_err(|error| format!("write filtered wrapper header: {error}"))?;
+            copy_tar_payload_with_padding(&mut input, &mut filtered, size)?;
+        }
+    }
+    filtered
+        .as_file()
+        .sync_all()
+        .map_err(|error| format!("sync filtered wrapper {}: {error}", wrapper.display()))?;
+    filtered.persist(wrapper).map_err(|error| {
+        format!(
+            "publish filtered wrapper {}: {}",
+            wrapper.display(),
+            error.error
+        )
+    })?;
     Ok(())
+}
+
+fn pax_xattr_name(key: &str) -> Option<&str> {
+    key.strip_prefix("LIBARCHIVE.xattr.")
+        .or_else(|| key.strip_prefix("SCHILY.xattr."))
+}
+
+fn wrapper_xattr_report_path(prefix: &Path, member: &[u8]) -> String {
+    let member = escape_member_name(member);
+    let prefix = relative_match_text(prefix);
+    if prefix.is_empty() {
+        member
+    } else {
+        format!("{prefix}/{member}")
+    }
+}
+
+fn encode_pax_records(records: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    for (key, value) in records {
+        let payload_len = key.len() + value.len() + 3;
+        let mut record_len = payload_len + decimal_digits(payload_len);
+        loop {
+            let corrected = payload_len + decimal_digits(record_len);
+            if corrected == record_len {
+                break;
+            }
+            record_len = corrected;
+        }
+        encoded.extend_from_slice(record_len.to_string().as_bytes());
+        encoded.push(b' ');
+        encoded.extend_from_slice(key.as_bytes());
+        encoded.push(b'=');
+        encoded.extend_from_slice(value);
+        encoded.push(b'\n');
+    }
+    encoded
+}
+
+fn decimal_digits(value: usize) -> usize {
+    value.max(1).ilog10() as usize + 1
+}
+
+fn set_tar_header_size_and_checksum(header: &mut [u8; 512], size: u64) -> Result<(), String> {
+    let size_text = format!("{size:011o}");
+    if size_text.len() != 11 {
+        return Err("filtered pax header is too large for the tar size field".to_string());
+    }
+    header[124..136].fill(0);
+    header[124..135].copy_from_slice(size_text.as_bytes());
+    header[148..156].fill(b' ');
+    let checksum = header.iter().map(|byte| u64::from(*byte)).sum::<u64>();
+    let checksum_text = format!("{checksum:06o}\0 ");
+    if checksum_text.len() != 8 {
+        return Err("filtered tar checksum is too large for its field".to_string());
+    }
+    header[148..156].copy_from_slice(checksum_text.as_bytes());
+    Ok(())
+}
+
+fn copy_tar_payload_with_padding(
+    input: &mut File,
+    output: &mut dyn Write,
+    size: u64,
+) -> Result<(), String> {
+    let padded = round_up_512(size)?;
+    let copied = std::io::copy(&mut input.take(padded), output)
+        .map_err(|error| format!("copy wrapper payload: {error}"))?;
+    if copied != padded {
+        return Err(format!(
+            "wrapper payload ended after {copied} bytes; expected {padded}"
+        ));
+    }
+    Ok(())
+}
+
+fn discard_tar_padding(input: &mut File, size: u64) -> Result<(), String> {
+    let padding = round_up_512(size)? - size;
+    let discarded = std::io::copy(&mut input.take(padding), &mut std::io::sink())
+        .map_err(|error| format!("discard wrapper pax padding: {error}"))?;
+    if discarded != padding {
+        return Err("wrapper pax padding ended early".to_string());
+    }
+    Ok(())
+}
+
+fn write_tar_padding(output: &mut dyn Write, size: u64) -> Result<(), String> {
+    const ZEROES: [u8; 512] = [0; 512];
+    let padding = usize::try_from(round_up_512(size)? - size)
+        .map_err(|_| "tar padding is too large for this host")?;
+    output
+        .write_all(&ZEROES[..padding])
+        .map_err(|error| format!("write filtered wrapper padding: {error}"))
 }
 
 fn extract_wrapper_tar(
@@ -2265,17 +2735,32 @@ impl PlannerState {
         }
     }
 
-    fn record_xattr_drop(&mut self, rel_text: &str, name: &str, reason: &str) {
+    fn record_xattr_drop(&mut self, rel_text: &str, name: &str) {
+        if !self
+            .dropped_xattrs
+            .entry(rel_text.to_string())
+            .or_default()
+            .insert(name.to_string())
+        {
+            return;
+        }
         self.totals.dropped_xattrs = self.totals.dropped_xattrs.saturating_add(1);
         let prefix = directory_prefix(rel_text);
         let cluster = self
             .xattr_drops
-            .entry((prefix, name.to_string(), reason.to_string()))
+            .entry((prefix, name.to_string(), "policy".to_string()))
             .or_default();
         cluster.count = cluster.count.saturating_add(1);
         if cluster.samples.len() < DEFAULT_SAMPLES_PER_CLUSTER {
             cluster.samples.push(rel_text.to_string());
         }
+    }
+
+    fn record_captured_non_core_xattr(&mut self, rel_text: &str, name: &str) {
+        self.captured_non_core_xattrs
+            .entry(rel_text.to_string())
+            .or_default()
+            .insert(name.to_string());
     }
 
     fn note_native_hardlink(
@@ -2436,6 +2921,16 @@ impl PlannerState {
         ScanReport {
             totals: self.totals.clone(),
             clusters,
+            dropped_xattrs: self
+                .dropped_xattrs
+                .iter()
+                .map(|(path, names)| (path.clone(), names.iter().cloned().collect()))
+                .collect(),
+            captured_non_core_xattrs: self
+                .captured_non_core_xattrs
+                .iter()
+                .map(|(path, names)| (path.clone(), names.iter().cloned().collect()))
+                .collect(),
             xattr_drops: self
                 .xattr_drops
                 .iter()
@@ -2631,6 +3126,170 @@ fn finalize_sha256_local(hasher: Sha256) -> [u8; 32] {
 mod tests {
     use super::*;
 
+    #[derive(Debug, Deserialize)]
+    struct XattrGoldenFixture {
+        format: String,
+        entry: String,
+        xattrs: Vec<XattrGoldenValue>,
+        default: XattrGoldenExpected,
+        full_fidelity: XattrGoldenExpected,
+        security_widening: XattrGoldenExpected,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct XattrGoldenValue {
+        name: String,
+        value: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct XattrGoldenExpected {
+        kept: Vec<String>,
+        dropped: Vec<String>,
+    }
+
+    fn xattr_golden_fixture() -> XattrGoldenFixture {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/ingest/xattr-policy-v1.json");
+        let bytes = fs::read(&path).expect("read checked-in ingest xattr golden fixture");
+        let fixture: XattrGoldenFixture =
+            serde_json::from_slice(&bytes).expect("parse checked-in ingest xattr golden fixture");
+        assert_eq!(fixture.format, "remanence-ingest-xattr-policy-v1");
+        fixture
+    }
+
+    fn apply_golden_xattr_policy(
+        fixture: &XattrGoldenFixture,
+        policy: &XattrPolicy,
+    ) -> (Vec<String>, ScanReport) {
+        let values = fixture
+            .xattrs
+            .iter()
+            .map(|xattr| (xattr.name.clone(), xattr.value.as_bytes().to_vec()))
+            .collect::<BTreeMap<_, _>>();
+        let mut state = PlannerState::default();
+        let collected = collect_preserved_xattr_values(
+            &fixture.entry,
+            policy,
+            &mut state,
+            values.keys().cloned(),
+            |name| Ok(values.get(name).cloned()),
+        )
+        .expect("filter golden xattrs");
+        let kept = match collected {
+            XattrCollection::Preserve(kept) => kept.keys().cloned().collect(),
+            XattrCollection::Wrap(reason) => panic!("golden xattrs unexpectedly wrapped: {reason}"),
+        };
+        (kept, state.scan_report(ScanTuning::default()))
+    }
+
+    #[test]
+    fn portable_core_xattr_policy_matches_golden_fixture_without_values_in_report() {
+        let fixture = xattr_golden_fixture();
+        let (kept, report) = apply_golden_xattr_policy(&fixture, &XattrPolicy::default());
+
+        assert_eq!(kept, fixture.default.kept);
+        assert_eq!(
+            report.dropped_xattrs[&fixture.entry],
+            fixture.default.dropped
+        );
+        assert_eq!(report.totals.dropped_xattrs, 3);
+        assert!(report.captured_non_core_xattrs.is_empty());
+        let serialized = serde_json::to_string(&report).expect("serialize xattr drop report");
+        for xattr in &fixture.xattrs {
+            assert!(
+                !serialized.contains(&xattr.value),
+                "xattr value leaked into report for {}",
+                xattr.name
+            );
+        }
+    }
+
+    #[test]
+    fn full_fidelity_xattr_policy_matches_golden_fixture() {
+        let fixture = xattr_golden_fixture();
+        let (kept, report) = apply_golden_xattr_policy(&fixture, &XattrPolicy::full_fidelity());
+
+        assert_eq!(kept, fixture.full_fidelity.kept);
+        assert!(fixture.full_fidelity.dropped.is_empty());
+        assert!(report.dropped_xattrs.is_empty());
+        assert_eq!(
+            report.captured_non_core_xattrs[&fixture.entry],
+            vec!["security.selinux", "system.posix_acl_access", "trusted.foo"]
+        );
+    }
+
+    #[test]
+    fn operator_namespace_widening_matches_golden_fixture_and_is_reported() {
+        let fixture = xattr_golden_fixture();
+        let mut policy = XattrPolicy::default();
+        policy.add_allowed_prefix(
+            remanence_stream::parse_xattr_namespace_prefix("security.").unwrap(),
+        );
+        let (kept, report) = apply_golden_xattr_policy(&fixture, &policy);
+
+        assert_eq!(kept, fixture.security_widening.kept);
+        assert_eq!(
+            report.dropped_xattrs[&fixture.entry],
+            fixture.security_widening.dropped
+        );
+        assert_eq!(
+            report.captured_non_core_xattrs[&fixture.entry],
+            ["security.selinux"]
+        );
+        assert_eq!(policy.report().applied_non_core_namespaces, ["security."]);
+    }
+
+    #[test]
+    fn portable_core_drops_security_capability_by_name() {
+        let mut state = PlannerState::default();
+        let collected = collect_preserved_xattr_values(
+            "capability.bin",
+            &XattrPolicy::default(),
+            &mut state,
+            vec!["security.capability".to_string()],
+            |_| panic!("a policy-dropped xattr value must never be read"),
+        )
+        .unwrap();
+
+        assert!(matches!(collected, XattrCollection::Preserve(ref kept) if kept.is_empty()));
+        let report = state.scan_report(ScanTuning::default());
+        assert_eq!(
+            report.dropped_xattrs["capability.bin"],
+            ["security.capability"]
+        );
+    }
+
+    #[test]
+    fn builtin_junk_xattrs_are_silent_in_every_capture_mode() {
+        let names = vec![
+            "com.apple.quarantine",
+            "com.apple.metadata:kMDItemWhereFroms",
+            "com.apple.lastuseddate#PS",
+            "com.apple.FinderInfo",
+            "com.apple.metadata:_kMDItemFinderComment",
+            "com.apple.metadata:kMDItemDownloadedDate",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let mut state = PlannerState::default();
+        let collected = collect_preserved_xattr_values(
+            "macos.bin",
+            &XattrPolicy::full_fidelity(),
+            &mut state,
+            names,
+            |_| panic!("a built-in junk xattr value must never be read"),
+        )
+        .unwrap();
+
+        assert!(matches!(collected, XattrCollection::Preserve(ref kept) if kept.is_empty()));
+        let report = state.scan_report(ScanTuning::default());
+        assert_eq!(report.totals.dropped_xattrs, 0);
+        assert!(report.dropped_xattrs.is_empty());
+        assert!(report.xattr_drops.is_empty());
+    }
+
     #[test]
     fn ruleset_first_match_and_lints_are_reported() {
         let temp = tempfile::Builder::new()
@@ -2670,6 +3329,51 @@ blob Literal/Sub/
             .lints
             .iter()
             .any(|lint| lint.kind == "literal-subpath-unreachable"));
+    }
+
+    #[test]
+    fn ruleset_xattr_modes_preserve_explicit_legacy_modes_and_validate_prefixes() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-xattr-ruleset-modes")
+            .tempdir()
+            .unwrap();
+
+        let portable = temp.path().join("portable.rules");
+        fs::write(&portable, "xattr-namespace security.\n").unwrap();
+        let portable = load_ruleset(&portable).unwrap();
+        assert_eq!(portable.xattr_policy.mode, XattrMode::PortableCore);
+        assert!(portable.xattr_policy.allowed_prefixes.contains("user."));
+        assert!(portable.xattr_policy.allowed_prefixes.contains("security."));
+
+        let full = temp.path().join("full.rules");
+        fs::write(&full, "option xattr-mode full-fidelity\n").unwrap();
+        assert_eq!(
+            load_ruleset(&full).unwrap().xattr_policy.mode,
+            XattrMode::FullFidelity
+        );
+
+        let legacy_deny = temp.path().join("legacy-deny.rules");
+        fs::write(&legacy_deny, "xattr-drop user.noise\n").unwrap();
+        assert_eq!(
+            load_ruleset(&legacy_deny).unwrap().xattr_policy.mode,
+            XattrMode::Denylist
+        );
+
+        let invalid = temp.path().join("invalid-prefix.rules");
+        fs::write(&invalid, "xattr-namespace security\n").unwrap();
+        assert!(load_ruleset(&invalid)
+            .unwrap_err()
+            .contains("invalid xattr namespace prefix"));
+
+        let incompatible = temp.path().join("incompatible-prefix.rules");
+        fs::write(
+            &incompatible,
+            "option xattr-mode full-fidelity\nxattr-namespace user.\n",
+        )
+        .unwrap();
+        assert!(load_ruleset(&incompatible)
+            .unwrap_err()
+            .contains("cannot be combined with"));
     }
 
     #[test]
@@ -2811,7 +3515,16 @@ blob Literal/Sub/
         let tar_engine = detect_tar_engine().unwrap();
 
         let dir_tar = temp.path().join("dir.remwrap.tar");
-        create_wrapper_tar(&tar_engine, &base, OsStr::new("--dash-dir"), &dir_tar).unwrap();
+        create_wrapper_tar(
+            &tar_engine,
+            &base,
+            OsStr::new("--dash-dir"),
+            &dir_tar,
+            &XattrPolicy::default(),
+            &mut PlannerState::default(),
+            Path::new(""),
+        )
+        .unwrap();
         let dir_index = build_wrap_index(&dir_tar, &tar_engine).unwrap();
         assert!(dir_index
             .entries
@@ -2819,7 +3532,16 @@ blob Literal/Sub/
             .any(|entry| entry.path == "--dash-dir/member.txt"));
 
         let file_tar = temp.path().join("file.remwrap.tar");
-        create_wrapper_tar(&tar_engine, &base, OsStr::new("--dash-file.txt"), &file_tar).unwrap();
+        create_wrapper_tar(
+            &tar_engine,
+            &base,
+            OsStr::new("--dash-file.txt"),
+            &file_tar,
+            &XattrPolicy::default(),
+            &mut PlannerState::default(),
+            Path::new(""),
+        )
+        .unwrap();
         let file_index = build_wrap_index(&file_tar, &tar_engine).unwrap();
         assert!(file_index
             .entries
@@ -2844,7 +3566,16 @@ blob Literal/Sub/
 
         let tar_engine = detect_tar_engine().unwrap();
         let tar_path = temp.path().join("raw.remwrap.tar");
-        create_wrapper_tar(&tar_engine, temp.path(), OsStr::new("base"), &tar_path).unwrap();
+        create_wrapper_tar(
+            &tar_engine,
+            temp.path(),
+            OsStr::new("base"),
+            &tar_path,
+            &XattrPolicy::default(),
+            &mut PlannerState::default(),
+            Path::new(""),
+        )
+        .unwrap();
         let index = build_wrap_index(&tar_path, &tar_engine).unwrap();
         let entry = index
             .entries
@@ -2887,6 +3618,9 @@ blob Literal/Sub/
             source.parent().unwrap(),
             source.file_name().unwrap(),
             &tar_path,
+            &XattrPolicy::default(),
+            &mut PlannerState::default(),
+            Path::new(""),
         )
         .unwrap();
 
@@ -2914,6 +3648,59 @@ blob Literal/Sub/
         assert_eq!(
             xattr::get(restored_source.join("xattr.txt"), "user.remanence_test").unwrap(),
             Some(b"kept".to_vec())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_tar_uses_capture_policy_and_reports_names_without_values() {
+        assert!(
+            command_available("bsdtar"),
+            "bsdtar/libarchive is required for wrapper xattr policy tests"
+        );
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-remwrap-xattr-policy")
+            .tempdir()
+            .unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        let tagged = source.join("tagged.txt");
+        fs::write(&tagged, b"wrapper xattr payload").unwrap();
+        let value = b"wrapper-policy-secret-value";
+        xattr::set(&tagged, "user.wrapper_secret", value)
+            .expect("the wrapper xattr policy test requires user.* xattr support");
+        let policy = XattrPolicy {
+            mode: XattrMode::Allowlist,
+            keep: BTreeSet::new(),
+            ..XattrPolicy::default()
+        };
+        let mut state = PlannerState::default();
+        let tar_path = temp.path().join("source.remwrap.tar");
+
+        create_wrapper_tar(
+            &detect_tar_engine().unwrap(),
+            source.parent().unwrap(),
+            source.file_name().unwrap(),
+            &tar_path,
+            &policy,
+            &mut state,
+            Path::new(""),
+        )
+        .unwrap();
+
+        let report = state.scan_report(ScanTuning::default());
+        assert_eq!(
+            report.dropped_xattrs["source/tagged.txt"],
+            ["user.wrapper_secret"]
+        );
+        let tar_bytes = fs::read(&tar_path).unwrap();
+        assert!(!tar_bytes.windows(value.len()).any(|window| window == value));
+        let restore = temp.path().join("restore");
+        fs::create_dir_all(&restore).unwrap();
+        extract_wrapper_tar(&detect_tar_engine().unwrap(), &restore, &tar_path, false).unwrap();
+        assert_eq!(
+            xattr::get(restore.join("source/tagged.txt"), "user.wrapper_secret").unwrap(),
+            None
         );
     }
 }
