@@ -4,6 +4,42 @@ Notable changes to Remanence and its published formats. The format
 specifications carry their own revision histories; entries here are
 per-release summaries.
 
+## v1.2.0 — 2026-07-22
+
+Metadata-preservation model, extension mechanism, and catalog-less recovery
+completeness. Archived: DOI pending (concept DOI
+[10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126)).
+
+- RAO object format: a **portable core** (`user.` namespace, applied on
+  restore by default) and a **carry-only extension tier** (privileged
+  namespaces and registered extensions, applied only under explicit
+  operator policy). New `ext` extension container (reverse-DNS naming,
+  ignore-unknown, preserve-on-rewrite, ancillary-by-definition) and an
+  object-level metadata **inventory** that lets a holder screen what an
+  object discloses without decoding its entries — with a Verifier
+  obligation that the inventory is exact. Attribute names carry a canonical
+  namespace wire form. Ingest now captures the portable core by default and
+  reports dropped namespaces; a full-fidelity opt-in remains.
+- Reference implementation of the above in the object writer/reader, plus a
+  plaintext-disclosure Security Considerations section and preservation-
+  vocabulary labels for the four fixity digests. All additive: existing
+  objects are byte-identical and tolerated by prior readers.
+- REM-PARITY: a deterministic **overlay tie-break** for structurally
+  discovered `parity_map` files during bare-tape recovery (integrity gate →
+  overlay-then-digest walk cross-check → rank by scope), resolving the last
+  open recovery item; the attested prefix is now the largest validating
+  scope. Reference Scanner implementation included.
+- Specification clarity hardenings from external technical review: explicit
+  `roundup()` definition, hardlink-primary selection expressed over emitted
+  entries, AEAD tag-placement made explicit, the partial-file-restore
+  streaming release contract, and CBOR payload-extent rules.
+- Publication test vectors regenerated (archive SHA
+  `f4e4331c14e67c059d1292f54e14efd8408c7d41364d2dba7f8e7567aa16c2a6`,
+  superseding `32fe2a79…`): prior entries byte-identical, additive vectors
+  for the metadata/extension objects, the negative cases, and the
+  multi-`parity_map` tie-break — independently re-derived by a second
+  implementation.
+
 ## v1.1.1 — 2026-07-22
 
 Security hardening of the extended-attribute restore path. Archived: DOI
