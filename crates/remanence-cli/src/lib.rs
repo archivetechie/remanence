@@ -767,6 +767,17 @@ fn parse_archive_file_size_bytes(s: &str) -> Result<u64, String> {
     parse_binary_byte_count(s, "file size")
 }
 
+/// Validate one explicit xattr namespace prefix supplied by an operator.
+fn parse_xattr_namespace_prefix(prefix: &str) -> Result<String, String> {
+    if prefix.is_empty() {
+        return Err("xattr namespace prefix must not be empty".to_string());
+    }
+    if prefix.chars().any(char::is_control) {
+        return Err("xattr namespace prefix must not contain control characters".to_string());
+    }
+    Ok(prefix.to_string())
+}
+
 /// Parse a tape-init block size override and apply the same limits as pool config.
 fn parse_tape_block_size(s: &str) -> Result<u64, String> {
     let bytes = parse_binary_byte_count(s, "block size")?;
@@ -2047,6 +2058,14 @@ struct RemArchiveExtractArgs {
     #[arg(long)]
     overwrite: bool,
 
+    /// Additional xattr namespace prefix to restore; repeatable (`user.` is always allowed).
+    #[arg(
+        long = "xattr-namespace",
+        value_name = "PREFIX",
+        value_parser = parse_xattr_namespace_prefix
+    )]
+    xattr_namespaces: Vec<String>,
+
     /// Keep `.remwrap.tar` and `.remwrap.idx` entries literal instead of unwrapping.
     #[arg(long)]
     no_unwrap: bool,
@@ -2370,6 +2389,7 @@ impl From<RemArchiveExtractArgs> for ArchiveExtractArgs {
             file_size_bytes: value.file_size_bytes,
             range: value.range,
             overwrite: value.overwrite,
+            xattr_namespaces: value.xattr_namespaces,
             no_unwrap: value.no_unwrap,
             blob_entry: value.blob_entry,
             blob_member: value.blob_member,
@@ -2705,6 +2725,14 @@ struct ArchiveExtractArgs {
     /// Replace existing destination files.
     #[arg(long)]
     overwrite: bool,
+
+    /// Additional xattr namespace prefix to restore; repeatable (`user.` is always allowed).
+    #[arg(
+        long = "xattr-namespace",
+        value_name = "PREFIX",
+        value_parser = parse_xattr_namespace_prefix
+    )]
+    xattr_namespaces: Vec<String>,
 
     /// Keep `.remwrap.tar` and `.remwrap.idx` entries literal instead of unwrapping.
     #[arg(long)]
@@ -10099,6 +10127,7 @@ fn run_archive_dump_command(
                 remanence_stream::FilesystemRestoreOptions {
                     overwrite: args.overwrite,
                     include_manifest: false,
+                    ..remanence_stream::FilesystemRestoreOptions::default()
                 },
             ) {
                 Ok(report) => {
@@ -10872,6 +10901,19 @@ fn extract_archive_object_file(args: &ArchiveExtractArgs) -> Result<Value, Strin
     }
 }
 
+fn archive_extract_restore_options(
+    args: &ArchiveExtractArgs,
+) -> remanence_stream::FilesystemRestoreOptions {
+    let mut options = remanence_stream::FilesystemRestoreOptions {
+        overwrite: args.overwrite,
+        ..remanence_stream::FilesystemRestoreOptions::default()
+    };
+    options
+        .xattr_allowed_prefixes
+        .extend(args.xattr_namespaces.iter().cloned());
+    options
+}
+
 fn inspect_plaintext_archive_object_file(path: &Path, chunk_size: usize) -> Result<Value, String> {
     let (object, stored_size_bytes, stored_size_blocks, stored_digest) =
         read_plaintext_archive_object_file(path, chunk_size)?;
@@ -10937,10 +10979,7 @@ fn extract_plaintext_archive_object_file(args: &ArchiveExtractArgs) -> Result<Va
         chunk_size,
         block_count,
         &args.dest,
-        remanence_stream::FilesystemRestoreOptions {
-            overwrite: args.overwrite,
-            include_manifest: false,
-        },
+        archive_extract_restore_options(args),
     )
     .map_err(|error| format!("extract plaintext RAO: {error}"))?;
     let context = ArchiveExtractReportContext {
@@ -11042,10 +11081,7 @@ fn extract_encrypted_archive_object_file(args: &ArchiveExtractArgs) -> Result<Va
         chunk_size,
         block_count,
         &args.dest,
-        remanence_stream::FilesystemRestoreOptions {
-            overwrite: args.overwrite,
-            include_manifest: false,
-        },
+        archive_extract_restore_options(args),
     )
     .map_err(|error| format!("extract encrypted RAO: {error}"))?;
     let context = ArchiveExtractReportContext {
@@ -11962,6 +11998,7 @@ fn archive_extract_report_json(
         "symlinks_written": report.symlinks_written,
         "hardlinks_written": report.hardlinks_written,
         "bytes_written": report.bytes_written,
+        "skipped_xattrs": &report.skipped_xattrs,
     })
 }
 
@@ -12925,6 +12962,7 @@ fn run_archive_tape_with_drive(
                 remanence_stream::FilesystemRestoreOptions {
                     overwrite: args.overwrite,
                     include_manifest: false,
+                    ..remanence_stream::FilesystemRestoreOptions::default()
                 },
             )
             .map_err(|error| error.to_string())?;
@@ -15207,6 +15245,10 @@ mod tests {
             "--chunk-size",
             "4KiB",
             "--overwrite",
+            "--xattr-namespace",
+            "security.",
+            "--xattr-namespace",
+            "trusted.",
         ]);
 
         match cli.command {
@@ -15222,6 +15264,12 @@ mod tests {
                 assert!(args.first_chunk_lba.is_none());
                 assert!(args.file_size_bytes.is_none());
                 assert!(args.range.is_none());
+                assert_eq!(args.xattr_namespaces, ["security.", "trusted."]);
+                let shared: ArchiveExtractArgs = args.into();
+                assert_eq!(
+                    archive_extract_restore_options(&shared).xattr_allowed_prefixes,
+                    ["user.", "security.", "trusted."]
+                );
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -19073,7 +19121,7 @@ blob Project/Render Files/
         assert_eq!(xattr_entry["xattrs"][xattr_name], bytes_to_hex(b"kept"));
 
         let restore_dir = temp.path().join("restore");
-        let (code, _stdout, stderr) = invoke_without_discovery(&[
+        let (code, stdout, stderr) = invoke_without_discovery(&[
             "rem",
             "archive",
             "extract",
@@ -19086,12 +19134,77 @@ blob Project/Render Files/
         ]);
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
         assert!(stderr.is_empty(), "{stderr}");
+        let extract: Value = serde_json::from_str(&stdout).expect("extract json");
+        assert_eq!(extract["skipped_xattrs"], json!({}));
         assert_eq!(
             fs::read(restore_dir.join("--xattr.txt")).unwrap(),
             b"xattr payload"
         );
         assert_eq!(
             xattr::get(restore_dir.join("--xattr.txt"), xattr_name).unwrap(),
+            Some(b"kept".to_vec())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_extract_json_reports_only_skipped_xattr_names() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-xattr-skip-report")
+            .tempdir()
+            .unwrap();
+        let object_path = temp.path().join("xattrs.rao");
+        let restore_dir = temp.path().join("restore");
+        let payload = b"xattr report payload".to_vec();
+        let mut spec = RemTarFileSpec::new(
+            "tagged.txt",
+            "file-tagged",
+            payload.len() as u64,
+            sha256_bytes(&payload),
+        );
+        spec.xattrs
+            .insert("security.ima".to_string(), b"sensitive-marker".to_vec());
+        spec.xattrs
+            .insert("user.remanence_cli".to_string(), b"kept".to_vec());
+        let mut reader = Cursor::new(payload);
+        let mut streams = [RemTarFileStream::new(spec, &mut reader)];
+        let mut sink = remanence_library::VecBlockSink::new();
+        let mut options = RemTarObjectOptions::new(
+            "object-xattr-report",
+            "caller-xattr-report",
+            "2026-01-01T00:00:00Z",
+            "manifest-xattr-report",
+        );
+        options.chunk_size = 4096;
+        write_rem_tar_object_from_readers(&mut sink, &options, &mut streams).unwrap();
+        fs::write(
+            &object_path,
+            sink.blocks.iter().flatten().copied().collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "extract",
+            "--object",
+            object_path.to_str().unwrap(),
+            "--dest",
+            restore_dir.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+        ]);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        assert!(!stdout.contains("sensitive-marker"));
+        let report: Value = serde_json::from_str(&stdout).expect("extract json");
+        assert_eq!(
+            report["skipped_xattrs"]["tagged.txt"],
+            json!(["security.ima"])
+        );
+        assert_eq!(
+            xattr::get(restore_dir.join("tagged.txt"), "user.remanence_cli").unwrap(),
             Some(b"kept".to_vec())
         );
     }
