@@ -769,13 +769,9 @@ fn parse_archive_file_size_bytes(s: &str) -> Result<u64, String> {
 
 /// Validate one explicit xattr namespace prefix supplied by an operator.
 fn parse_xattr_namespace_prefix(prefix: &str) -> Result<String, String> {
-    if prefix.is_empty() {
-        return Err("xattr namespace prefix must not be empty".to_string());
-    }
-    if prefix.chars().any(char::is_control) {
-        return Err("xattr namespace prefix must not contain control characters".to_string());
-    }
-    Ok(prefix.to_string())
+    remanence_stream::validate_xattr_namespace_prefix(prefix)
+        .map(|()| prefix.to_string())
+        .map_err(|error| error.to_string())
 }
 
 /// Parse a tape-init block size override and apply the same limits as pool config.
@@ -11999,6 +11995,7 @@ fn archive_extract_report_json(
         "hardlinks_written": report.hardlinks_written,
         "bytes_written": report.bytes_written,
         "skipped_xattrs": &report.skipped_xattrs,
+        "applied_privileged_xattrs": &report.applied_privileged_xattrs,
     })
 }
 
@@ -15273,6 +15270,34 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn rem_archive_extract_rejects_broad_or_malformed_xattr_prefixes() {
+        for invalid in ["security", "s", ".", "", "user..", "user.\u{1}"] {
+            let error = match Cli::try_parse_from([
+                "rem",
+                "archive",
+                "extract",
+                "--object",
+                "/tmp/object.rao",
+                "--dest",
+                "/tmp/restored",
+                "--xattr-namespace",
+                invalid,
+            ]) {
+                Ok(_) => panic!("xattr prefix {invalid:?} unexpectedly parsed"),
+                Err(error) => error,
+            };
+            let message = error.to_string();
+            assert!(message.contains(&format!("{invalid:?}")), "{message}");
+        }
+
+        assert_eq!(parse_xattr_namespace_prefix("user.").unwrap(), "user.");
+        assert_eq!(
+            parse_xattr_namespace_prefix("security.").unwrap(),
+            "security."
+        );
     }
 
     #[test]
@@ -19079,9 +19104,8 @@ blob Project/Render Files/
         let xattr_file = input_dir.join("--xattr.txt");
         fs::write(&xattr_file, b"xattr payload").unwrap();
         let xattr_name = "user.remanence_test";
-        if xattr::set(&xattr_file, xattr_name, b"kept").is_err() {
-            return;
-        }
+        xattr::set(&xattr_file, xattr_name, b"kept")
+            .expect("the native xattr test requires user.* xattr support");
         let rules = temp.path().join("empty.rules");
         fs::write(&rules, "").unwrap();
         let out_path = temp.path().join("xattr.rao");
@@ -19136,6 +19160,7 @@ blob Project/Render Files/
         assert!(stderr.is_empty(), "{stderr}");
         let extract: Value = serde_json::from_str(&stdout).expect("extract json");
         assert_eq!(extract["skipped_xattrs"], json!({}));
+        assert_eq!(extract["applied_privileged_xattrs"], json!({}));
         assert_eq!(
             fs::read(restore_dir.join("--xattr.txt")).unwrap(),
             b"xattr payload"
@@ -19203,10 +19228,54 @@ blob Project/Render Files/
             report["skipped_xattrs"]["tagged.txt"],
             json!(["security.ima"])
         );
+        assert_eq!(report["applied_privileged_xattrs"], json!({}));
         assert_eq!(
             xattr::get(restore_dir.join("tagged.txt"), "user.remanence_cli").unwrap(),
             Some(b"kept".to_vec())
         );
+    }
+
+    #[test]
+    fn archive_extract_json_reports_applied_privileged_names_without_values() {
+        let report = remanence_stream::FilesystemRestoreReport {
+            stream: remanence_format::RemTarStreamReport {
+                global_pax: BTreeMap::new(),
+                entries: Vec::new(),
+                manifest_cbor: None,
+                digest_mismatches: Vec::new(),
+                warnings: Vec::new(),
+            },
+            files_written: 1,
+            directories_seen: 0,
+            symlinks_written: 0,
+            hardlinks_written: 0,
+            bytes_written: 7,
+            skipped_xattrs: BTreeMap::new(),
+            applied_privileged_xattrs: BTreeMap::from([(
+                "tagged.txt".to_string(),
+                vec!["security.ima".to_string()],
+            )]),
+        };
+        let context = ArchiveExtractReportContext {
+            object: Path::new("object.rao"),
+            dest: Path::new("restore"),
+            representation: "plain",
+            encryption: "none",
+            recipient_epochs: None,
+            chunk_size: 4096,
+            stored_size_bytes: 4096,
+            stored_size_blocks: 1,
+            stored_digest: [0; 32],
+        };
+
+        let json = archive_extract_report_json(&context, &report);
+        assert_eq!(
+            json["applied_privileged_xattrs"]["tagged.txt"],
+            json!(["security.ima"])
+        );
+        let serialized = serde_json::to_string(&json).unwrap();
+        assert!(!serialized.contains("security-secret"));
+        assert!(!serialized.contains("user-secret"));
     }
 
     #[cfg(unix)]
@@ -19221,9 +19290,8 @@ blob Project/Render Files/
         let file = input_dir.join("drop.txt");
         fs::write(&file, b"drop payload").unwrap();
         let xattr_name = "user.remanence_drop";
-        if xattr::set(&file, xattr_name, b"noise").is_err() {
-            return;
-        }
+        xattr::set(&file, xattr_name, b"noise")
+            .expect("the xattr drop test requires user.* xattr support");
         let rules = temp.path().join("drop.rules");
         fs::write(&rules, format!("xattr-drop {xattr_name}\n")).unwrap();
         let out_path = temp.path().join("drop.rao");
@@ -19285,9 +19353,8 @@ blob Project/Render Files/
         fs::create_dir_all(&input_dir).unwrap();
         let file = input_dir.join("allow.txt");
         fs::write(&file, b"allowlist payload").unwrap();
-        if xattr::set(&file, "user.unlisted", b"drop").is_err() {
-            return;
-        }
+        xattr::set(&file, "user.unlisted", b"drop")
+            .expect("the xattr allow-list test requires user.* xattr support");
         let rules = temp.path().join("allow.rules");
         fs::write(
             &rules,
@@ -19331,6 +19398,7 @@ blob Project/Render Files/
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "requires a filesystem that accepts user xattr values larger than 4096 bytes"]
     fn archive_build_rules_wraps_oversized_xattr() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-cli-rao-xattr-large")
@@ -19341,9 +19409,8 @@ blob Project/Render Files/
         let file = input_dir.join("large-xattr.txt");
         fs::write(&file, b"large xattr payload").unwrap();
         let large_xattr = vec![0x55; 4097];
-        if xattr::set(&file, "user.large", &large_xattr).is_err() {
-            return;
-        }
+        xattr::set(&file, "user.large", &large_xattr)
+            .expect("the oversized xattr test requires user.* xattr support");
         let rules = temp.path().join("large.rules");
         fs::write(&rules, "").unwrap();
         let out_path = temp.path().join("large.rao");
