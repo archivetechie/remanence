@@ -7,19 +7,195 @@ use chacha20::{
     ChaCha20,
 };
 use hpke::{
-    aead::ChaCha20Poly1305, kdf::HkdfSha256, kem::X25519HkdfSha256, setup_receiver, setup_sender,
-    Deserializable, Kem as _, OpModeR, OpModeS, Serializable,
+    aead::ChaCha20Poly1305,
+    generic_array::typenum::{Sum, U1024, U192, U32, U96},
+    kdf::HkdfSha256,
+    kem::SharedSecret,
+    setup_receiver, setup_sender, Deserializable, HpkeError, Kem as _, OpModeR, OpModeS,
+    Serializable,
 };
 use rand_core::{CryptoRng, RngCore};
-use zeroize::Zeroize;
+use sha3::{
+    digest::{ExtendableOutput, Update, XofReader},
+    Shake256,
+};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::{RaoAeadError, Result};
-use crate::header::{object_id_field, WRAP_SUITE_HPKE_V1};
+use crate::header::object_id_field;
 use crate::key_frame::{KeyFrame, RecipientSlot};
+use crate::xwing::{
+    self, XWingPublicKey, XWingSeed, XWING_CIPHERTEXT_LEN, XWING_PUBLIC_KEY_LEN, XWING_SEED_LEN,
+};
 
-type Kem = X25519HkdfSha256;
+type Kem = XWingHpkeKem;
 type Kdf = HkdfSha256;
 type Aead = ChaCha20Poly1305;
+
+type XWingHpkePublicKeySize = Sum<U1024, U192>;
+type XWingHpkeEncappedKeySize = Sum<U1024, U96>;
+
+/// Frozen HPKE KEM identifier assigned to X-Wing by
+/// `draft-connolly-cfrg-xwing-kem-10` and the IANA HPKE registry.
+///
+/// This value feeds the RFC 9180 `suite_id` and must never change for RAO 2.0.
+pub const XWING_HPKE_KEM_ID: u16 = 0x647a;
+/// Frozen RFC 9180 suite identifier for X-Wing, HKDF-SHA256, and
+/// ChaCha20-Poly1305: `"HPKE" || 0x647a || 0x0001 || 0x0003`.
+pub const XWING_HPKE_SUITE_ID: &[u8; 10] = b"HPKE\x64\x7a\x00\x01\x00\x03";
+
+// Stage 1c moves this discriminator into the envelope header implementation.
+// Stage 1b uses it only in the unchanged-width HPKE info transcript.
+const WRAP_SUITE_XWING: u8 = 0x02;
+const RECIPIENT_PUBLIC_FILE_FIXED_LEN: usize = 4 + 1 + 16 + 1 + XWING_PUBLIC_KEY_LEN;
+const RECIPIENT_PRIVATE_FILE_FIXED_LEN: usize = 4 + 16 + 1 + XWING_SEED_LEN;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct XWingHpkePublicKey(XWingPublicKey);
+
+#[derive(Clone, PartialEq, Eq)]
+struct XWingHpkePrivateKey([u8; XWING_SEED_LEN]);
+
+impl Zeroize for XWingHpkePrivateKey {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl Drop for XWingHpkePrivateKey {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for XWingHpkePrivateKey {}
+
+#[derive(Clone)]
+struct XWingHpkeEncappedKey([u8; XWING_CIPHERTEXT_LEN]);
+
+struct XWingHpkeKem;
+
+impl Serializable for XWingHpkePublicKey {
+    type OutputSize = XWingHpkePublicKeySize;
+
+    fn write_exact(&self, output: &mut [u8]) {
+        assert_eq!(output.len(), XWING_PUBLIC_KEY_LEN);
+        output.copy_from_slice(self.0.as_bytes());
+    }
+}
+
+impl Deserializable for XWingHpkePublicKey {
+    fn from_bytes(encoded: &[u8]) -> std::result::Result<Self, HpkeError> {
+        let bytes = encoded
+            .try_into()
+            .map_err(|_| HpkeError::IncorrectInputLength(XWING_PUBLIC_KEY_LEN, encoded.len()))?;
+        XWingPublicKey::from_bytes(bytes)
+            .map(Self)
+            .map_err(|_| HpkeError::ValidationError)
+    }
+}
+
+impl Serializable for XWingHpkePrivateKey {
+    type OutputSize = U32;
+
+    fn write_exact(&self, output: &mut [u8]) {
+        assert_eq!(output.len(), XWING_SEED_LEN);
+        output.copy_from_slice(&self.0);
+    }
+}
+
+impl Deserializable for XWingHpkePrivateKey {
+    fn from_bytes(encoded: &[u8]) -> std::result::Result<Self, HpkeError> {
+        encoded
+            .try_into()
+            .map(Self)
+            .map_err(|_| HpkeError::IncorrectInputLength(XWING_SEED_LEN, encoded.len()))
+    }
+}
+
+impl Serializable for XWingHpkeEncappedKey {
+    type OutputSize = XWingHpkeEncappedKeySize;
+
+    fn write_exact(&self, output: &mut [u8]) {
+        assert_eq!(output.len(), XWING_CIPHERTEXT_LEN);
+        output.copy_from_slice(&self.0);
+    }
+}
+
+impl Deserializable for XWingHpkeEncappedKey {
+    fn from_bytes(encoded: &[u8]) -> std::result::Result<Self, HpkeError> {
+        encoded
+            .try_into()
+            .map(Self)
+            .map_err(|_| HpkeError::IncorrectInputLength(XWING_CIPHERTEXT_LEN, encoded.len()))
+    }
+}
+
+impl hpke::Kem for XWingHpkeKem {
+    type PublicKey = XWingHpkePublicKey;
+    type PrivateKey = XWingHpkePrivateKey;
+    type EncappedKey = XWingHpkeEncappedKey;
+    type NSecret = U32;
+
+    const KEM_ID: u16 = XWING_HPKE_KEM_ID;
+
+    fn derive_keypair(ikm: &[u8]) -> (Self::PrivateKey, Self::PublicKey) {
+        // X-Wing draft-10 §5.6 derives its canonical 32-byte seed from
+        // variable-length HPKE IKM with SHAKE256 before running key generation.
+        let mut seed_bytes = Zeroizing::new([0u8; XWING_SEED_LEN]);
+        let mut shake = Shake256::default();
+        shake.update(ikm);
+        shake.finalize_xof().read(&mut seed_bytes[..]);
+
+        let seed = XWingSeed::from_bytes(*seed_bytes);
+        let (public_key, expanded_secret) = xwing::derive_keypair(&seed);
+        drop(expanded_secret);
+        (
+            XWingHpkePrivateKey(*seed_bytes),
+            XWingHpkePublicKey(public_key),
+        )
+    }
+
+    fn sk_to_pk(private_key: &Self::PrivateKey) -> Self::PublicKey {
+        let seed = XWingSeed::from_bytes(private_key.0);
+        let (public_key, expanded_secret) = xwing::derive_keypair(&seed);
+        drop(expanded_secret);
+        XWingHpkePublicKey(public_key)
+    }
+
+    fn encap<R: CryptoRng + RngCore>(
+        recipient_public_key: &Self::PublicKey,
+        sender_identity: Option<(&Self::PrivateKey, &Self::PublicKey)>,
+        rng: &mut R,
+    ) -> std::result::Result<(SharedSecret<Self>, Self::EncappedKey), HpkeError> {
+        if sender_identity.is_some() {
+            return Err(HpkeError::EncapError);
+        }
+        let (encapped_key, mut secret) =
+            xwing::encapsulate(&recipient_public_key.0, rng).map_err(|_| HpkeError::EncapError)?;
+        let mut shared_secret = SharedSecret::<Self>::default();
+        shared_secret.0.copy_from_slice(&secret);
+        secret.zeroize();
+        Ok((shared_secret, XWingHpkeEncappedKey(encapped_key)))
+    }
+
+    fn decap(
+        recipient_private_key: &Self::PrivateKey,
+        sender_identity: Option<&Self::PublicKey>,
+        encapped_key: &Self::EncappedKey,
+    ) -> std::result::Result<SharedSecret<Self>, HpkeError> {
+        if sender_identity.is_some() {
+            return Err(HpkeError::DecapError);
+        }
+        let seed = XWingSeed::from_bytes(recipient_private_key.0);
+        let mut secret =
+            xwing::decapsulate(&seed, &encapped_key.0).map_err(|_| HpkeError::DecapError)?;
+        let mut shared_secret = SharedSecret::<Self>::default();
+        shared_secret.0.copy_from_slice(&secret);
+        secret.zeroize();
+        Ok(shared_secret)
+    }
+}
 
 /// OS-seeded, zeroize-on-drop CSPRNG for arbitrary-length HPKE entropy draws.
 pub(crate) struct EphemeralRng {
@@ -117,8 +293,8 @@ pub struct RecipientPublicKey {
     pub recipient_epoch_id: [u8; 16],
     /// Printable recovery label.
     pub epoch_label: String,
-    /// Serialized X25519 public key.
-    pub public_key: [u8; 32],
+    /// Serialized X-Wing encapsulation key (`ML-KEM-768 ek || X25519 pk`).
+    pub public_key: [u8; XWING_PUBLIC_KEY_LEN],
 }
 
 impl RecipientPublicKey {
@@ -127,7 +303,7 @@ impl RecipientPublicKey {
         validate_label(&self.epoch_label)?;
         <<Kem as hpke::Kem>::PublicKey as Deserializable>::from_bytes(&self.public_key)
             .map_err(|_| RaoAeadError::HpkeFailed)?;
-        let mut out = Vec::with_capacity(54 + self.epoch_label.len());
+        let mut out = Vec::with_capacity(RECIPIENT_PUBLIC_FILE_FIXED_LEN + self.epoch_label.len());
         out.extend_from_slice(b"RAOR");
         out.push(self.slot_index);
         out.extend_from_slice(&self.recipient_epoch_id);
@@ -139,7 +315,7 @@ impl RecipientPublicKey {
 
     /// Parse a complete canonical public-recipient file.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        if bytes.get(..4) != Some(b"RAOR") || bytes.len() < 54 {
+        if bytes.get(..4) != Some(b"RAOR") || bytes.len() < RECIPIENT_PUBLIC_FILE_FIXED_LEN {
             return Err(RaoAeadError::InvalidInput(
                 "invalid RAO recipient public-key file".to_string(),
             ));
@@ -147,7 +323,7 @@ impl RecipientPublicKey {
         let slot_index = bytes[4];
         let recipient_epoch_id = bytes[5..21].try_into().expect("fixed slice");
         let label_len = bytes[21] as usize;
-        let expected = 54usize
+        let expected = RECIPIENT_PUBLIC_FILE_FIXED_LEN
             .checked_add(label_len)
             .ok_or(RaoAeadError::SizeOverflow)?;
         if bytes.len() != expected {
@@ -159,7 +335,7 @@ impl RecipientPublicKey {
             .map_err(|_| RaoAeadError::InvalidInput("invalid recipient label".to_string()))?
             .to_string();
         validate_label(&epoch_label)?;
-        let public_key: [u8; 32] = bytes[22 + label_len..]
+        let public_key: [u8; XWING_PUBLIC_KEY_LEN] = bytes[22 + label_len..]
             .try_into()
             .map_err(|_| RaoAeadError::HpkeFailed)?;
         <<Kem as hpke::Kem>::PublicKey as Deserializable>::from_bytes(&public_key)
@@ -179,15 +355,15 @@ pub struct RecipientPrivateKey {
     pub recipient_epoch_id: [u8; 16],
     /// Printable recovery label.
     pub epoch_label: String,
-    private_key: [u8; 32],
+    private_key: [u8; XWING_SEED_LEN],
 }
 
 impl RecipientPrivateKey {
-    /// Construct a recipient secret from its canonical 32-byte X25519 encoding.
+    /// Construct a recipient secret from its canonical 32-byte X-Wing seed.
     pub fn new(
         recipient_epoch_id: [u8; 16],
         epoch_label: impl Into<String>,
-        private_key: [u8; 32],
+        private_key: [u8; XWING_SEED_LEN],
     ) -> Result<Self> {
         let epoch_label = epoch_label.into();
         validate_label(&epoch_label)?;
@@ -200,7 +376,7 @@ impl RecipientPrivateKey {
         })
     }
 
-    /// Derive the corresponding serialized X25519 public key.
+    /// Derive the corresponding serialized X-Wing public key.
     pub fn public_key(&self, slot_index: u8) -> Result<RecipientPublicKey> {
         let secret =
             <<Kem as hpke::Kem>::PrivateKey as Deserializable>::from_bytes(&self.private_key)
@@ -221,7 +397,7 @@ impl RecipientPrivateKey {
 
     /// Serialize the standalone recovery-key file format (`RAOP`, id, label, secret).
     pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(53 + self.epoch_label.len());
+        let mut out = Vec::with_capacity(RECIPIENT_PRIVATE_FILE_FIXED_LEN + self.epoch_label.len());
         out.extend_from_slice(b"RAOP");
         out.extend_from_slice(&self.recipient_epoch_id);
         out.push(self.epoch_label.len() as u8);
@@ -232,14 +408,14 @@ impl RecipientPrivateKey {
 
     /// Parse a complete canonical recovery-key file.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        if bytes.get(..4) != Some(b"RAOP") || bytes.len() < 53 {
+        if bytes.get(..4) != Some(b"RAOP") || bytes.len() < RECIPIENT_PRIVATE_FILE_FIXED_LEN {
             return Err(RaoAeadError::InvalidInput(
                 "invalid RAO recipient private-key file".to_string(),
             ));
         }
         let recipient_epoch_id = bytes[4..20].try_into().expect("fixed slice");
         let label_len = bytes[20] as usize;
-        let expected = 53usize
+        let expected = RECIPIENT_PRIVATE_FILE_FIXED_LEN
             .checked_add(label_len)
             .ok_or(RaoAeadError::SizeOverflow)?;
         if bytes.len() != expected {
@@ -284,7 +460,7 @@ pub fn wrap_info(
     info[76..92].copy_from_slice(recipient_epoch_id);
     info[92] = slot_index;
     info[93] = 2;
-    info[94] = WRAP_SUITE_HPKE_V1;
+    info[94] = WRAP_SUITE_XWING;
     Ok(info)
 }
 
@@ -378,6 +554,8 @@ fn validate_label(label: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    const RAO_XWING_WRAP_KAT: &str = include_str!("../testdata/xwing-wrap-kat.txt");
+
     struct CountingByteRng {
         byte: u8,
         bytes_generated: usize,
@@ -415,6 +593,22 @@ mod tests {
             .collect()
     }
 
+    fn wrap_kat_field(name: &str) -> Vec<u8> {
+        let prefix = format!("{name}=");
+        let value = RAO_XWING_WRAP_KAT
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("missing X-Wing wrap KAT field {name}"));
+        decode_hex(value)
+    }
+
+    fn wrap_kat_array<const N: usize>(name: &str) -> [u8; N] {
+        let bytes = wrap_kat_field(name);
+        bytes
+            .try_into()
+            .unwrap_or_else(|value: Vec<u8>| panic!("KAT field {name} is {} bytes", value.len()))
+    }
+
     #[test]
     fn info_is_byte_exact_and_fixed_width() {
         let info = wrap_info("obj", &[0x44; 16], 7).unwrap();
@@ -422,7 +616,7 @@ mod tests {
         assert_eq!(&info[12..15], b"obj");
         assert!(info[15..76].iter().all(|byte| *byte == 0));
         assert_eq!(&info[76..92], &[0x44; 16]);
-        assert_eq!(&info[92..], &[7, 2, 1]);
+        assert_eq!(&info[92..], &[7, 2, WRAP_SUITE_XWING]);
     }
 
     #[test]
@@ -451,6 +645,10 @@ mod tests {
         let private = RecipientPrivateKey::new([3; 16], "safe-2026", [7; 32]).unwrap();
         let public = private.public_key(4).unwrap();
         let bytes = public.serialize().unwrap();
+        assert_eq!(
+            bytes.len(),
+            RECIPIENT_PUBLIC_FILE_FIXED_LEN + "safe-2026".len()
+        );
         assert_eq!(RecipientPublicKey::parse(&bytes).unwrap(), public);
     }
 
@@ -469,89 +667,119 @@ mod tests {
             &[9; 32]
         );
         assert!(unwrap_dek(&frame, "object-b", &secret).is_err());
-    }
-
-    #[test]
-    fn rfc_9180_appendix_a2_base_vector_opens() {
-        let private = <<Kem as hpke::Kem>::PrivateKey as Deserializable>::from_bytes(&decode_hex(
-            "8057991eef8f1f1af18f4a9491d16a1ce333f695d4db8e38da75975c4478e0fb",
-        ))
-        .unwrap();
-        let enc = <<Kem as hpke::Kem>::EncappedKey as Deserializable>::from_bytes(&decode_hex(
-            "1afa08d3dec047a643885163f1180476fa7ddb54c6a8029ea33f95796bf2ac4a",
-        ))
-        .unwrap();
-        let info = decode_hex("4f6465206f6e2061204772656369616e2055726e");
-        let aad = decode_hex("436f756e742d30");
-        let ciphertext = decode_hex(concat!(
-            "1c5250d8034ec2b784ba2cfd69dbdb8af406cfe3ff938e131f0def8c8b60b4db",
-            "21993c62ce81883d2dd1b51a28"
-        ));
-        let mut context =
-            setup_receiver::<Aead, Kdf, Kem>(&OpModeR::Base, &private, &enc, &info).unwrap();
-        assert_eq!(
-            context.open(&ciphertext, &aad).unwrap(),
-            b"Beauty is truth, truth beauty"
+        let other_recipient = RecipientPrivateKey::new([3; 16], "safe-2026", [8; 32]).unwrap();
+        assert!(
+            unwrap_dek(&frame, "object-a", &other_recipient).is_err(),
+            "a slot wrapped to one X-Wing seed must reject a transplant to another seed"
         );
     }
 
     #[test]
-    fn rao_wrap_vector_is_byte_exact() {
-        let secret = RecipientPrivateKey::new([3; 16], "safe-2026", [7; 32]).unwrap();
-        let public = secret.public_key(0).unwrap();
-        let expected_public =
-            decode_hex("13be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d");
+    fn many_deterministically_random_recipients_round_trip() {
+        let mut seed_rng = EphemeralRng::from_seed(&[0x91; 32]);
+        let mut encapsulation_rng = EphemeralRng::from_seed(&[0xa2; 32]);
+        let dek = DataEncryptionKey::from_bytes([0x5a; 32]);
+        for case in 0u8..24 {
+            let mut seed = [0u8; XWING_SEED_LEN];
+            seed_rng.fill_bytes(&mut seed);
+            let recipient =
+                RecipientPrivateKey::new([case; 16], format!("recipient-{case}"), seed).unwrap();
+            seed.zeroize();
+            let public = recipient.public_key(case).unwrap();
+            let frame = wrap_dek(
+                &dek,
+                "many-recipient-round-trip",
+                &[public],
+                &mut encapsulation_rng,
+            )
+            .unwrap();
+            assert_eq!(
+                unwrap_dek(&frame, "many-recipient-round-trip", &recipient)
+                    .unwrap()
+                    .as_bytes(),
+                dek.as_bytes(),
+                "X-Wing wrap round trip {case}"
+            );
+        }
+    }
+
+    // RFC 9180 Appendix A.2 exercises DHKEM(X25519) and no longer applies to
+    // RAO's X-Wing-only KEM. This adapter check replaces that legacy fixture.
+    #[test]
+    fn xwing_hpke_adapter_has_frozen_sizes_id_and_derivation() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>(_value: &T) {}
+
+        assert_eq!(Kem::KEM_ID, XWING_HPKE_KEM_ID);
+        assert_eq!(
+            <Kdf as hpke::kdf::Kdf>::KDF_ID,
+            u16::from_be_bytes(XWING_HPKE_SUITE_ID[6..8].try_into().unwrap())
+        );
+        assert_eq!(
+            <Aead as hpke::aead::Aead>::AEAD_ID,
+            u16::from_be_bytes(XWING_HPKE_SUITE_ID[8..10].try_into().unwrap())
+        );
+        assert_eq!(
+            XWING_HPKE_KEM_ID,
+            u16::from_be_bytes(XWING_HPKE_SUITE_ID[4..6].try_into().unwrap())
+        );
+        assert_eq!(
+            <<Kem as hpke::Kem>::PublicKey as Serializable>::size(),
+            XWING_PUBLIC_KEY_LEN
+        );
+        assert_eq!(
+            <<Kem as hpke::Kem>::PrivateKey as Serializable>::size(),
+            XWING_SEED_LEN
+        );
+        assert_eq!(
+            <<Kem as hpke::Kem>::EncappedKey as Serializable>::size(),
+            XWING_CIPHERTEXT_LEN
+        );
+
+        let (private, public) = Kem::derive_keypair(b"variable-length X-Wing HPKE ikm");
+        assert_zeroize_on_drop(&private);
+        assert_eq!(Kem::sk_to_pk(&private), public);
+    }
+
+    #[test]
+    fn rao_xwing_wrap_vector_is_byte_exact() {
+        let seed = wrap_kat_array("seed");
+        let recipient_epoch_id = wrap_kat_array("recipient_epoch_id");
+        let slot_index = wrap_kat_array::<1>("slot_index")[0];
+        let object_id = String::from_utf8(wrap_kat_field("object_id")).unwrap();
+        let secret = RecipientPrivateKey::new(recipient_epoch_id, "safe-2026", seed).unwrap();
+        let public = secret.public_key(slot_index).unwrap();
+        let expected_public = wrap_kat_field("pk");
+        assert_eq!(expected_public.len(), XWING_PUBLIC_KEY_LEN);
         assert_eq!(public.public_key.as_slice(), expected_public);
-        let dek = DataEncryptionKey::from_bytes([9; 32]);
+
+        let dek = DataEncryptionKey::from_bytes(wrap_kat_array("dek"));
+        let encapsulation_randomness = wrap_kat_field("encapsulation_randomness");
+        assert_eq!(encapsulation_randomness.len(), 64);
+        assert!(encapsulation_randomness
+            .iter()
+            .all(|byte| *byte == encapsulation_randomness[0]));
         let mut rng = CountingByteRng {
-            byte: 0x42,
+            byte: encapsulation_randomness[0],
             bytes_generated: 0,
         };
-        let slot = wrap_recipient(&dek, "object-a", &public, &mut rng).unwrap();
-        assert_eq!(rng.bytes_generated, 32, "rust-hpke X25519 entropy draw");
+        let slot = wrap_recipient(&dek, &object_id, &public, &mut rng).unwrap();
         assert_eq!(
-            slot.enc,
-            [
-                0xae, 0x3b, 0xf1, 0xcd, 0x87, 0xc2, 0xd2, 0xed, 0x25, 0xaf, 0x4a, 0x1a, 0x23, 0x9e,
-                0xed, 0x04, 0xa9, 0x90, 0xf0, 0x0e, 0x74, 0x03, 0xe4, 0xc8, 0x06, 0x59, 0x27, 0xde,
-                0x01, 0x0f, 0xd1, 0x7a,
-            ]
+            rng.bytes_generated,
+            encapsulation_randomness.len(),
+            "X-Wing encapsulation entropy draw"
         );
-        assert_eq!(
-            slot.ciphertext,
-            [
-                0xfd, 0x48, 0x22, 0x7f, 0x58, 0xc8, 0xa2, 0xb4, 0xac, 0x3e, 0xb0, 0xb2, 0x24, 0xb1,
-                0x18, 0x5e, 0x85, 0x8c, 0x7a, 0x46, 0x44, 0xf9, 0x6a, 0x70, 0x67, 0xd2, 0xc2, 0xd3,
-                0x2d, 0x1c, 0x67, 0xda, 0xd5, 0x73, 0xcb, 0xa8, 0xd9, 0x4b, 0x66, 0x8c, 0xa2, 0xab,
-                0x98, 0xb6, 0xca, 0x12, 0xa1, 0x8c,
-            ]
-        );
+        let expected_enc = wrap_kat_field("enc");
+        assert_eq!(expected_enc.len(), XWING_CIPHERTEXT_LEN);
+        assert_eq!(slot.enc.as_slice(), expected_enc);
+        let expected_ciphertext = wrap_kat_field("ciphertext");
+        assert_eq!(expected_ciphertext.len(), 48);
+        assert_eq!(slot.ciphertext.as_slice(), expected_ciphertext);
 
-        let (_, derived_ephemeral_public) = Kem::derive_keypair(&[0x42; 32]);
         assert_eq!(
-            derived_ephemeral_public.to_bytes().as_slice(),
-            slot.enc,
-            "the 42-by-32 draw is RFC 9180 DeriveKeyPair input keying material"
+            unwrap_dek(&KeyFrame::new(vec![slot]).unwrap(), &object_id, &secret)
+                .unwrap()
+                .as_bytes(),
+            dek.as_bytes()
         );
-
-        let recipient_public =
-            <<Kem as hpke::Kem>::PublicKey as Deserializable>::from_bytes(&expected_public)
-                .unwrap();
-        let info = wrap_info("object-a", &[3; 16], 0).unwrap();
-        let mut independent_rng = CountingByteRng {
-            byte: 0x42,
-            bytes_generated: 0,
-        };
-        let (independent_enc, mut independent_context) = setup_sender::<Aead, Kdf, Kem, _>(
-            &OpModeS::Base,
-            &recipient_public,
-            &info,
-            &mut independent_rng,
-        )
-        .unwrap();
-        let independent_ciphertext = independent_context.seal(&[9; 32], &[]).unwrap();
-        assert_eq!(independent_rng.bytes_generated, 32);
-        assert_eq!(independent_enc.to_bytes().as_slice(), slot.enc);
-        assert_eq!(independent_ciphertext.as_slice(), slot.ciphertext);
     }
 }
