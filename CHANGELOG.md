@@ -7,7 +7,8 @@ per-release summaries.
 ## v1.3.0 — 2026-07-23
 
 Post-publication hardening from two independent, grounded technical reviews that
-found REM-PARITY not yet freeze-ready. Archived: DOI (pending)
+found REM-PARITY not yet freeze-ready. Archived: DOI
+[10.5281/zenodo.21506676](https://doi.org/10.5281/zenodo.21506676)
 (concept DOI [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126)).
 
 - **License (adoption):** the project is relicensed from AGPL-3.0-or-later to a
