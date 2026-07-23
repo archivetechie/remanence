@@ -59,6 +59,8 @@ toml                = "0.8"
 tower               = "0.5"
 tracing             = "0.1"
 tracing-subscriber  = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+unicase             = "2.9"
+unicode-normalization = "0.1"
 uuid                = { version = "1", features = ["serde", "v4"] }
 # Exact version audited for path-based `set` using no-follow (`lsetxattr`) semantics.
 xattr               = "=1.6.1"
