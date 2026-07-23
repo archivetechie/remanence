@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""Independently re-derive and open the historical RAO 1.0 publication vectors.
+"""Independently re-derive and open RAO publication vectors.
 
 This verifier deliberately avoids the Remanence Rust crates. It rebuilds the
 RAO-TV-P1 and RAO-TV-D1 plaintext tar streams, the additional positive
-plaintext vectors, and deterministic manifest CBOR. It independently opens
-the retired, immutable RAO-TV-E2 and encrypted RAO-TV-D1 objects with generic
-X25519, HKDF-SHA-256, and ChaCha20-Poly1305 primitives, then verifies the
-recovered canonical bytes, plaintext digest, manifest, and per-file digests.
-This archival verifier is not the RAO 2.0 Reader; the current Rust Reader
-rejects these objects because their wrap-suite discriminator is reserved.
+plaintext vectors, and deterministic manifest CBOR. For RAO 2.0 it derives
+X-Wing from ``kyber-py``'s independent ML-KEM-768 implementation plus
+``cryptography`` X25519, implements the draft-10 seed expansion and combiner,
+reproduces both component KATs byte-for-byte, and re-derives the HPKE Base key
+schedule to open every encrypted vector. It retains a read-only path for the
+retired RAO 1.0 X25519 publication pins.
+
+``kyber-py==1.2.0`` is a PyPI-installable educational implementation, not a
+production cryptographic dependency. This verifier pins that version because
+deterministic FIPS 203 operations use its private ``_keygen_internal``,
+``_encaps_internal``, and ``_decaps_internal`` entry points.
 
 With --check-plaintext-interop it also exercises the Section 14 plaintext
 interop gate for the positive plaintext vectors using GNU tar, bsdtar, and
@@ -21,6 +26,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import importlib.metadata
 import io
 import json
 import pathlib
@@ -63,12 +69,24 @@ LABEL_METADATA = b"rao2-metadata-v1"
 LABEL_PAYLOAD = b"rao2-payload-v1"
 WRAP_INFO_PREFIX = b"rao-wrap-v1\0"
 HPKE_VERSION_LABEL = b"HPKE-v1"
-HPKE_KEM_ID = 0x0020
+HPKE_DHKEM_X25519_ID = 0x0020
+HPKE_XWING_ID = 0x647A
 HPKE_KDF_ID = 0x0001
 HPKE_AEAD_ID = 0x0003
-RAO_KEY_FRAME_MIN_LEN = 103
-RAO_KEY_FRAME_MAX_LEN = 4096
+RAO_WRAP_SUITE_X25519 = 0x01
+RAO_WRAP_SUITE_XWING = 0x02
+RAO_KEY_FRAME_MIN_LEN = 1191
+RAO_KEY_FRAME_MAX_LEN = 16384
+RAO1_KEY_FRAME_MIN_LEN = 103
+RAO1_KEY_FRAME_MAX_LEN = 4096
 RAO_KEY_FRAME_MAX_SLOTS = 8
+XWING_PUBLIC_KEY_LEN = 1216
+XWING_CIPHERTEXT_LEN = 1120
+MLKEM768_PUBLIC_KEY_LEN = 1184
+MLKEM768_CIPHERTEXT_LEN = 1088
+XWING_LABEL = b"\\.//^\\"
+KYBER_PY_DISTRIBUTION = "kyber-py"
+KYBER_PY_VERSION = "1.2.0"
 PUBLICATION_INCREMENT_FIXTURES = {
     "rao-tv-portable-core-only.json",
     "rao-tv-nonuser-attribute.json",
@@ -177,6 +195,104 @@ def load(directory: pathlib.Path, name: str) -> dict[str, Any]:
 def assert_eq(actual: Any, expected: Any, label: str) -> None:
     if actual != expected:
         raise AssertionError(f"{label}: got {actual!r}, expected {expected!r}")
+
+
+def ml_kem_768() -> Any:
+    """Return the pinned independent ML-KEM-768 primitive or fail loudly."""
+    try:
+        installed = importlib.metadata.version(KYBER_PY_DISTRIBUTION)
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise RuntimeError(
+            "independent X-Wing verification requires "
+            f"{KYBER_PY_DISTRIBUTION}=={KYBER_PY_VERSION}; install it with "
+            f"`python3 -m pip install {KYBER_PY_DISTRIBUTION}=={KYBER_PY_VERSION}`"
+        ) from exc
+    if installed != KYBER_PY_VERSION:
+        raise RuntimeError(
+            "independent X-Wing verification pins "
+            f"{KYBER_PY_DISTRIBUTION}=={KYBER_PY_VERSION}, found {installed}"
+        )
+    try:
+        from kyber_py.ml_kem import ML_KEM_768
+    except ImportError as exc:
+        raise RuntimeError(
+            f"{KYBER_PY_DISTRIBUTION}=={KYBER_PY_VERSION} is installed "
+            "but kyber_py.ml_kem.ML_KEM_768 is unavailable"
+        ) from exc
+    for method in ("_keygen_internal", "_encaps_internal", "_decaps_internal"):
+        if not callable(getattr(ML_KEM_768, method, None)):
+            raise RuntimeError(
+                f"{KYBER_PY_DISTRIBUTION}=={KYBER_PY_VERSION} lacks {method}"
+            )
+    return ML_KEM_768
+
+
+def x25519_public(private_bytes: bytes) -> bytes:
+    """Derive a canonical raw X25519 public key from 32 private bytes."""
+    private = X25519PrivateKey.from_private_bytes(private_bytes)
+    return private.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+
+
+def xwing_keypair(seed: bytes) -> tuple[bytes, bytes, bytes, bytes]:
+    """Expand one draft-10 seed into pk, ML-KEM dk, X25519 sk, and X25519 pk."""
+    assert_eq(len(seed), 32, "X-Wing seed length")
+    expanded = hashlib.shake_256(seed).digest(96)
+    ek_m, dk_m = ml_kem_768()._keygen_internal(expanded[:32], expanded[32:64])
+    sk_x = expanded[64:96]
+    pk_x = x25519_public(sk_x)
+    public_key = ek_m + pk_x
+    assert_eq(len(public_key), XWING_PUBLIC_KEY_LEN, "X-Wing public-key length")
+    return public_key, dk_m, sk_x, pk_x
+
+
+def xwing_combine(
+    ss_m: bytes,
+    ss_x: bytes,
+    ct_x: bytes,
+    pk_x: bytes,
+) -> bytes:
+    """Apply the frozen draft-10 SHA3-256 X-Wing combiner."""
+    for name, value in (
+        ("ML-KEM shared secret", ss_m),
+        ("X25519 shared secret", ss_x),
+        ("X25519 ciphertext", ct_x),
+        ("X25519 public key", pk_x),
+    ):
+        assert_eq(len(value), 32, f"{name} length")
+    return hashlib.sha3_256(ss_m + ss_x + ct_x + pk_x + XWING_LABEL).digest()
+
+
+def xwing_encapsulate(public_key: bytes, randomness: bytes) -> tuple[bytes, bytes]:
+    """Deterministically encapsulate with independent ML-KEM and X25519 code."""
+    assert_eq(len(public_key), XWING_PUBLIC_KEY_LEN, "X-Wing public-key length")
+    assert_eq(len(randomness), 64, "X-Wing encapsulation randomness length")
+    pk_m = public_key[:MLKEM768_PUBLIC_KEY_LEN]
+    pk_x = public_key[MLKEM768_PUBLIC_KEY_LEN:]
+    ss_m, ct_m = ml_kem_768()._encaps_internal(pk_m, randomness[:32])
+    ephemeral = X25519PrivateKey.from_private_bytes(randomness[32:])
+    ct_x = ephemeral.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    ss_x = ephemeral.exchange(X25519PublicKey.from_public_bytes(pk_x))
+    enc = ct_m + ct_x
+    assert_eq(len(enc), XWING_CIPHERTEXT_LEN, "X-Wing ciphertext length")
+    return enc, xwing_combine(ss_m, ss_x, ct_x, pk_x)
+
+
+def xwing_decapsulate(seed: bytes, enc: bytes) -> tuple[bytes, bytes]:
+    """Decapsulate draft-10 X-Wing and return its shared and public keys."""
+    assert_eq(len(enc), XWING_CIPHERTEXT_LEN, "X-Wing ciphertext length")
+    public_key, dk_m, sk_x, pk_x = xwing_keypair(seed)
+    ss_m = ml_kem_768()._decaps_internal(dk_m, enc[:MLKEM768_CIPHERTEXT_LEN])
+    ct_x = enc[MLKEM768_CIPHERTEXT_LEN:]
+    ss_x = X25519PrivateKey.from_private_bytes(sk_x).exchange(
+        X25519PublicKey.from_public_bytes(ct_x)
+    )
+    return xwing_combine(ss_m, ss_x, ct_x, pk_x), public_key
 
 
 def round_up(value: int, unit: int) -> int:
@@ -1433,10 +1549,17 @@ def parse_encrypted_header(stored: bytes) -> EncryptedHeader:
     if not 17 <= metadata_frame_len <= 16 * 1024 * 1024:
         raise AssertionError(f"metadata frame length is invalid: {metadata_frame_len}")
     wrap_suite = header[56]
-    assert_eq(wrap_suite, 1, "encrypted wrap_suite")
+    # This verifier deliberately retains 0x01 solely to reproduce the retired
+    # RAO 1.0 publication pins. The RAO 2.0 Reader rejects it.
+    if wrap_suite not in (RAO_WRAP_SUITE_X25519, RAO_WRAP_SUITE_XWING):
+        raise AssertionError(f"encrypted wrap_suite is invalid: {wrap_suite}")
     assert_eq(header[57:60], b"\0" * 3, "encrypted reserved")
     key_frame_len = int.from_bytes(header[60:64], "big")
-    if not RAO_KEY_FRAME_MIN_LEN <= key_frame_len <= RAO_KEY_FRAME_MAX_LEN:
+    if wrap_suite == RAO_WRAP_SUITE_XWING:
+        key_frame_bounds = (RAO_KEY_FRAME_MIN_LEN, RAO_KEY_FRAME_MAX_LEN)
+    else:
+        key_frame_bounds = (RAO1_KEY_FRAME_MIN_LEN, RAO1_KEY_FRAME_MAX_LEN)
+    if not key_frame_bounds[0] <= key_frame_len <= key_frame_bounds[1]:
         raise AssertionError(f"encrypted key_frame_len is invalid: {key_frame_len}")
     object_id_field_bytes = header[64:128]
     if object_id_field_bytes == b"\0" * 64:
@@ -1463,8 +1586,26 @@ def parse_encrypted_header(stored: bytes) -> EncryptedHeader:
     )
 
 
-def parse_key_frame(vector_id: str, encoded: bytes) -> list[RecipientSlot]:
-    if not RAO_KEY_FRAME_MIN_LEN <= len(encoded) <= RAO_KEY_FRAME_MAX_LEN:
+def parse_key_frame(
+    vector_id: str,
+    encoded: bytes,
+    wrap_suite: int,
+) -> list[RecipientSlot]:
+    if wrap_suite == RAO_WRAP_SUITE_XWING:
+        minimum, maximum, enc_len = (
+            RAO_KEY_FRAME_MIN_LEN,
+            RAO_KEY_FRAME_MAX_LEN,
+            XWING_CIPHERTEXT_LEN,
+        )
+    elif wrap_suite == RAO_WRAP_SUITE_X25519:
+        minimum, maximum, enc_len = (
+            RAO1_KEY_FRAME_MIN_LEN,
+            RAO1_KEY_FRAME_MAX_LEN,
+            32,
+        )
+    else:
+        raise AssertionError(f"{vector_id}: unsupported wrap suite {wrap_suite}")
+    if not minimum <= len(encoded) <= maximum:
         raise AssertionError(f"{vector_id}: key frame length is outside bounds")
     assert_eq(encoded[:4], b"RAOK", f"{vector_id} key frame magic")
     slot_count = encoded[4]
@@ -1479,7 +1620,7 @@ def parse_key_frame(vector_id: str, encoded: bytes) -> list[RecipientSlot]:
         recipient_epoch_id = encoded[cursor + 1 : cursor + 17]
         label_len = encoded[cursor + 17]
         cursor += 18
-        end = cursor + label_len + 32 + 48
+        end = cursor + label_len + enc_len + 48
         if label_len > 32 or end > len(encoded):
             raise AssertionError(f"{vector_id}: truncated or oversized key-frame slot")
         label_bytes = encoded[cursor : cursor + label_len]
@@ -1487,8 +1628,8 @@ def parse_key_frame(vector_id: str, encoded: bytes) -> list[RecipientSlot]:
             raise AssertionError(f"{vector_id}: invalid key-frame label")
         epoch_label = label_bytes.decode("ascii")
         cursor += label_len
-        enc = encoded[cursor : cursor + 32]
-        cursor += 32
+        enc = encoded[cursor : cursor + enc_len]
+        cursor += enc_len
         ciphertext = encoded[cursor : cursor + 48]
         cursor += 48
         if slots and slot_index <= slots[-1].slot_index:
@@ -1535,51 +1676,17 @@ def hpke_labeled_expand(
     return hkdf_expand(prk, labeled_info, length)
 
 
-def hpke_unwrap_dek(
-    vector_id: str,
-    slot: RecipientSlot,
-    object_id: str,
-    recipient: dict[str, Any],
-) -> tuple[bytes, dict[str, bytes]]:
-    private_bytes = bytes.fromhex(recipient["private_key"])
-    expected_public = bytes.fromhex(recipient["public_key"])
-    private_key = X25519PrivateKey.from_private_bytes(private_bytes)
-    actual_public = private_key.public_key().public_bytes(
-        serialization.Encoding.Raw,
-        serialization.PublicFormat.Raw,
-    )
-    assert_eq(actual_public, expected_public, f"{vector_id} recipient public key")
-    assert_eq(
-        slot.recipient_epoch_id,
-        bytes.fromhex(recipient["recipient_epoch_id"]),
-        f"{vector_id} recipient epoch id",
-    )
-    assert_eq(slot.slot_index, recipient["slot_index"], f"{vector_id} recipient slot")
-    assert_eq(slot.epoch_label, recipient["epoch_label"], f"{vector_id} recipient label")
-
-    kem_suite_id = b"KEM" + HPKE_KEM_ID.to_bytes(2, "big")
-    dh = private_key.exchange(X25519PublicKey.from_public_bytes(slot.enc))
-    kem_context = slot.enc + actual_public
-    eae_prk = hpke_labeled_extract(kem_suite_id, b"", b"eae_prk", dh)
-    shared_secret = hpke_labeled_expand(
-        kem_suite_id,
-        eae_prk,
-        b"shared_secret",
-        kem_context,
-        32,
-    )
-
+def hpke_base_context(
+    shared_secret: bytes,
+    kem_id: int,
+    info: bytes,
+) -> tuple[bytes, bytes]:
+    """Derive the RFC 9180 Base-mode key and nonce for one KEM shared secret."""
     hpke_suite_id = (
         b"HPKE"
-        + HPKE_KEM_ID.to_bytes(2, "big")
+        + kem_id.to_bytes(2, "big")
         + HPKE_KDF_ID.to_bytes(2, "big")
         + HPKE_AEAD_ID.to_bytes(2, "big")
-    )
-    info = (
-        WRAP_INFO_PREFIX
-        + object_id_field(object_id)
-        + slot.recipient_epoch_id
-        + bytes([slot.slot_index, 2, 1])
     )
     psk_id_hash = hpke_labeled_extract(hpke_suite_id, b"", b"psk_id_hash", b"")
     info_hash = hpke_labeled_extract(hpke_suite_id, b"", b"info_hash", info)
@@ -1599,6 +1706,57 @@ def hpke_unwrap_dek(
         key_schedule_context,
         12,
     )
+    return key, base_nonce
+
+
+def hpke_unwrap_dek(
+    vector_id: str,
+    slot: RecipientSlot,
+    object_id: str,
+    recipient: dict[str, Any],
+    wrap_suite: int,
+) -> tuple[bytes, dict[str, bytes]]:
+    private_bytes = bytes.fromhex(recipient["private_key"])
+    expected_public = bytes.fromhex(recipient["public_key"])
+    if wrap_suite == RAO_WRAP_SUITE_XWING:
+        shared_secret, actual_public = xwing_decapsulate(private_bytes, slot.enc)
+        kem_id = HPKE_XWING_ID
+    elif wrap_suite == RAO_WRAP_SUITE_X25519:
+        private_key = X25519PrivateKey.from_private_bytes(private_bytes)
+        actual_public = private_key.public_key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+        kem_id = HPKE_DHKEM_X25519_ID
+        kem_suite_id = b"KEM" + kem_id.to_bytes(2, "big")
+        dh = private_key.exchange(X25519PublicKey.from_public_bytes(slot.enc))
+        kem_context = slot.enc + actual_public
+        eae_prk = hpke_labeled_extract(kem_suite_id, b"", b"eae_prk", dh)
+        shared_secret = hpke_labeled_expand(
+            kem_suite_id,
+            eae_prk,
+            b"shared_secret",
+            kem_context,
+            32,
+        )
+    else:
+        raise AssertionError(f"{vector_id}: unsupported wrap suite {wrap_suite}")
+    assert_eq(actual_public, expected_public, f"{vector_id} recipient public key")
+    assert_eq(
+        slot.recipient_epoch_id,
+        bytes.fromhex(recipient["recipient_epoch_id"]),
+        f"{vector_id} recipient epoch id",
+    )
+    assert_eq(slot.slot_index, recipient["slot_index"], f"{vector_id} recipient slot")
+    assert_eq(slot.epoch_label, recipient["epoch_label"], f"{vector_id} recipient label")
+
+    info = (
+        WRAP_INFO_PREFIX
+        + object_id_field(object_id)
+        + slot.recipient_epoch_id
+        + bytes([slot.slot_index, 2, wrap_suite])
+    )
+    key, base_nonce = hpke_base_context(shared_secret, kem_id, info)
     dek = ChaCha20Poly1305(key).decrypt(base_nonce, slot.ciphertext, b"")
     assert_eq(len(dek), 32, f"{vector_id} unwrapped DEK length")
     return dek, {
@@ -1606,6 +1764,92 @@ def hpke_unwrap_dek(
         "key": key,
         "base_nonce": base_nonce,
     }
+
+
+def load_hex_kat(path: pathlib.Path) -> dict[str, bytes]:
+    """Load a strict name=hex component KAT."""
+    fields: dict[str, bytes] = {}
+    for line_number, line in enumerate(
+        path.read_text(encoding="ascii").splitlines(),
+        start=1,
+    ):
+        if not line or line.startswith("#"):
+            continue
+        if line.count("=") != 1:
+            raise AssertionError(f"{path}:{line_number}: malformed KAT line")
+        name, encoded = line.split("=", 1)
+        if not name or name in fields:
+            raise AssertionError(
+                f"{path}:{line_number}: empty or duplicate KAT field {name!r}"
+            )
+        try:
+            fields[name] = bytes.fromhex(encoded)
+        except ValueError as exc:
+            raise AssertionError(
+                f"{path}:{line_number}: invalid hex for {name}"
+            ) from exc
+    return fields
+
+
+def verify_xwing_kats(kat_directory: pathlib.Path) -> None:
+    """Reproduce draft-10 and RAO wrap KATs with the independent stack."""
+    draft10 = load_hex_kat(kat_directory / "xwing-draft10-kat.txt")
+    public_key, _dk_m, _sk_x, _pk_x = xwing_keypair(draft10["seed"])
+    assert_eq(public_key, draft10["pk"], "draft-10 X-Wing public key")
+    enc, sender_secret = xwing_encapsulate(public_key, draft10["eseed"])
+    assert_eq(enc, draft10["enc"], "draft-10 X-Wing ciphertext")
+    assert_eq(sender_secret, draft10["ss"], "draft-10 X-Wing shared secret")
+    recipient_secret, recipient_public = xwing_decapsulate(
+        draft10["seed"],
+        draft10["enc"],
+    )
+    assert_eq(recipient_public, public_key, "draft-10 decapsulation public key")
+    assert_eq(
+        recipient_secret,
+        draft10["ss"],
+        "draft-10 decapsulation shared secret",
+    )
+
+    wrap = load_hex_kat(kat_directory / "xwing-wrap-kat.txt")
+    public_key, _dk_m, _sk_x, _pk_x = xwing_keypair(wrap["seed"])
+    assert_eq(public_key, wrap["pk"], "RAO X-Wing wrap public key")
+    enc, sender_secret = xwing_encapsulate(
+        public_key,
+        wrap["encapsulation_randomness"],
+    )
+    assert_eq(enc, wrap["enc"], "RAO X-Wing wrap ciphertext")
+    assert_eq(sender_secret, wrap["ss"], "RAO X-Wing wrap shared secret")
+    recipient_secret, recipient_public = xwing_decapsulate(
+        wrap["seed"],
+        wrap["enc"],
+    )
+    assert_eq(recipient_public, public_key, "RAO wrap decapsulation public key")
+    assert_eq(
+        recipient_secret,
+        sender_secret,
+        "RAO wrap decapsulation shared secret",
+    )
+
+    object_id = wrap["object_id"].decode("utf-8")
+    slot_index = int.from_bytes(wrap["slot_index"], "big")
+    assert_eq(len(wrap["slot_index"]), 1, "RAO wrap slot_index length")
+    info = (
+        WRAP_INFO_PREFIX
+        + object_id_field(object_id)
+        + wrap["recipient_epoch_id"]
+        + bytes([slot_index, 2, RAO_WRAP_SUITE_XWING])
+    )
+    key, base_nonce = hpke_base_context(sender_secret, HPKE_XWING_ID, info)
+    dek = ChaCha20Poly1305(key).decrypt(
+        base_nonce,
+        wrap["ciphertext"],
+        b"",
+    )
+    assert_eq(dek, wrap["dek"], "RAO X-Wing wrapped DEK")
+    print(
+        "verified draft-10 X-Wing and deterministic RAO wrap KATs "
+        f"with {KYBER_PY_DISTRIBUTION}=={KYBER_PY_VERSION}"
+    )
 
 
 def validate_encrypted_metadata(vector_id: str, metadata: Any, chunk_size: int) -> tuple[int, bytes]:
@@ -1638,7 +1882,7 @@ def open_encrypted_with_generic_crypto(
     if key_frame_end > len(stored):
         raise AssertionError(f"{vector_id}: encrypted object ends inside key frame")
     key_frame = stored[key_frame_start:key_frame_end]
-    slots = parse_key_frame(vector_id, key_frame)
+    slots = parse_key_frame(vector_id, key_frame, header.wrap_suite)
     recipient_epoch_id = bytes.fromhex(recipient["recipient_epoch_id"])
     matching_slots = [
         slot for slot in slots if slot.recipient_epoch_id == recipient_epoch_id
@@ -1652,6 +1896,7 @@ def open_encrypted_with_generic_crypto(
         matching_slots[0],
         header.object_id,
         recipient,
+        header.wrap_suite,
     )
     assert_eq(dek, expected_dek, f"{vector_id} unwrapped DEK")
     header_hash = sha256(header.bytes + key_frame)
@@ -1714,6 +1959,7 @@ def open_encrypted_with_generic_crypto(
     assert_eq(len(recovered), plaintext_size, f"{vector_id} recovered plaintext_size")
     assert_eq(sha256(recovered), plaintext_digest, f"{vector_id} recovered plaintext_digest")
     actual = {
+        "wrap_suite": header.wrap_suite,
         "plaintext_size": plaintext_size,
         "chunk_count": chunk_total,
         "metadata_plaintext_len": len(metadata_plain),
@@ -1865,6 +2111,125 @@ def check_recovery_vector(
     )
 
 
+def current_xwing_expected(
+    vector_id: str,
+    stored: bytes,
+    inputs: dict[str, Any],
+) -> dict[str, Any]:
+    """Build independently derived fixture pins for one current X-Wing object."""
+    recipients = inputs["recipients"]
+    if not recipients:
+        raise AssertionError(f"{vector_id}: no recipients to pin")
+    expected_dek = bytes.fromhex(inputs["deterministic_dek"])
+    _recovered, header, actual = open_encrypted_with_generic_crypto(
+        vector_id,
+        stored,
+        recipients[0],
+        {},
+        expected_dek,
+    )
+    assert_eq(
+        header.wrap_suite,
+        RAO_WRAP_SUITE_XWING,
+        f"{vector_id} current wrap suite",
+    )
+    key_frame = stored[RAO_HEADER_LEN : RAO_HEADER_LEN + header.key_frame_len]
+    slots = parse_key_frame(vector_id, key_frame, header.wrap_suite)
+    recipients_by_epoch = {
+        bytes.fromhex(recipient["recipient_epoch_id"]): recipient
+        for recipient in recipients
+    }
+    if len(recipients_by_epoch) != len(recipients):
+        raise AssertionError(f"{vector_id}: duplicate fixture recipient epoch")
+
+    slot_pins: list[dict[str, Any]] = []
+    for slot in slots:
+        recipient = recipients_by_epoch.get(slot.recipient_epoch_id)
+        if recipient is None:
+            raise AssertionError(
+                f"{vector_id}: no fixture recipient for slot {slot.slot_index}"
+            )
+        dek, trace = hpke_unwrap_dek(
+            vector_id,
+            slot,
+            header.object_id,
+            recipient,
+            header.wrap_suite,
+        )
+        assert_eq(dek, expected_dek, f"{vector_id} slot {slot.slot_index} DEK")
+        slot_pins.append(
+            {
+                "slot_index": slot.slot_index,
+                "recipient_epoch_id": hx(slot.recipient_epoch_id),
+                "epoch_label": slot.epoch_label,
+                "enc": hx(slot.enc),
+                "wrapped_dek_ciphertext": hx(slot.ciphertext),
+                "hpke_shared_secret": hx(trace["shared_secret"]),
+                "hpke_key": hx(trace["key"]),
+                "hpke_base_nonce": hx(trace["base_nonce"]),
+            }
+        )
+    if len(slot_pins) != len(recipients):
+        raise AssertionError(f"{vector_id}: slot and recipient counts differ")
+    actual["slots"] = slot_pins
+    return actual
+
+
+def write_current_xwing_fixture_pins(
+    fixture_directory: pathlib.Path,
+    object_directory: pathlib.Path,
+) -> None:
+    """Replace staged historical envelope pins with current RAO 2.0 pins."""
+
+    def update_recipients(fixture: dict[str, Any], vector_id: str) -> None:
+        inputs = fixture["inputs"]
+        inputs["recipient_mode"] = "hpke-xwing-draft10"
+        for recipient in inputs["recipients"]:
+            seed = bytes.fromhex(recipient["private_key"])
+            public_key, _dk_m, _sk_x, _pk_x = xwing_keypair(seed)
+            recipient["public_key"] = hx(public_key)
+            recipient["private_key_role"] = "xwing-seed-32"
+        if not inputs["recipients"]:
+            raise AssertionError(f"{vector_id}: no recipient fixture material")
+
+    e2_path = fixture_directory / "rao-tv-e2.json"
+    e2 = load(fixture_directory, "rao-tv-e2.json")
+    e2["status"] = "pinned-at-generation"
+    e2.pop("retirement_note", None)
+    e2["independent_open_rederivation"] = (
+        "verified by tools/verify_rao_vectors_independent.py with "
+        f"{KYBER_PY_DISTRIBUTION}=={KYBER_PY_VERSION}"
+    )
+    update_recipients(e2, "RAO-TV-E2")
+    e2["expected"] = current_xwing_expected(
+        "RAO-TV-E2",
+        (object_directory / "rao-tv-e2.rao").read_bytes(),
+        e2["inputs"],
+    )
+
+    d1_path = fixture_directory / "rao-tv-d1.json"
+    d1 = load(fixture_directory, "rao-tv-d1.json")
+    d1["encrypted_status"] = "pinned-at-generation"
+    d1.pop("encrypted_retirement_note", None)
+    d1["encrypted_expectation"] = (
+        "independently opened and pinned by "
+        "tools/verify_rao_vectors_independent.py"
+    )
+    update_recipients(d1, "RAO-TV-D1 encrypted")
+    d1["expected"]["encrypted"] = current_xwing_expected(
+        "RAO-TV-D1 encrypted",
+        (object_directory / "rao-tv-d1-encrypted.rao").read_bytes(),
+        d1["inputs"],
+    )
+
+    for path, fixture in ((e2_path, e2), (d1_path, d1)):
+        path.write_text(
+            json.dumps(fixture, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+
 def decode_bootstrap_payload(path: pathlib.Path) -> tuple[bytes, dict[int, Any]]:
     """Validate generic bootstrap framing and decode its deterministic CBOR payload."""
     block = path.read_bytes()
@@ -2007,7 +2372,11 @@ def check_cross_layer_binding_and_range_vectors(
     key_frame_start = RAO_HEADER_LEN
     key_frame_end = key_frame_start + header.key_frame_len
     key_frame = stored[key_frame_start:key_frame_end]
-    slots = parse_key_frame("encrypted-last-object-chunk", key_frame)
+    slots = parse_key_frame(
+        "encrypted-last-object-chunk",
+        key_frame,
+        header.wrap_suite,
+    )
     recipient = positive_input["recipient"]
     epoch_id = bytes.fromhex(recipient["recipient_epoch_id"])
     slot = next((candidate for candidate in slots if candidate.recipient_epoch_id == epoch_id), None)
@@ -2018,6 +2387,7 @@ def check_cross_layer_binding_and_range_vectors(
         slot,
         header.object_id,
         recipient,
+        header.wrap_suite,
     )
     assert_eq(
         dek,
@@ -2235,7 +2605,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--encrypted-object-directory",
         type=pathlib.Path,
         default=FIXTURES / "objects",
-        help="directory containing the pinned RAO-TV-E2 and encrypted RAO-TV-D1 objects",
+        help="directory containing the RAO-TV-E2 and encrypted RAO-TV-D1 objects",
+    )
+    parser.add_argument(
+        "--kat-directory",
+        type=pathlib.Path,
+        default=ROOT / "crates" / "remanence-aead" / "testdata",
+        help="directory containing xwing-draft10-kat.txt and xwing-wrap-kat.txt",
     )
     parser.add_argument(
         "--rust-object-directory",
@@ -2258,6 +2634,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    verify_xwing_kats(args.kat_directory)
     fixture_directory = args.fixture_directory
     if args.write_new_plaintext_fixtures:
         for filename, vector_id, options, files in positive_plaintext_vector_definitions():
@@ -2412,9 +2789,10 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     print(
-        "verified RAO-TV-E2 and RAO-TV-D1 encrypted OPEN, RAO-TV-P1 and "
-        "RAO-TV-D1 plaintext, additional RAO positives, and requested "
-        "cross-layer vectors independently"
+        "verified RAO-TV-E2 and RAO-TV-D1 encrypted OPEN (X-Wing or retired "
+        "X25519 as selected by their pins), RAO-TV-P1 and RAO-TV-D1 "
+        "plaintext, additional RAO positives, and requested cross-layer "
+        "vectors independently"
     )
     return 0
 
