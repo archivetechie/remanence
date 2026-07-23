@@ -14,8 +14,8 @@ use remanence_parity::codec::ReedSolomonCodec;
 use remanence_parity::{
     acquire_filemark_map_with_report, crc64_xz, data_shard_crc64, default_scheme,
     encode_parity_map_tape_file, encode_sidecar_tape_file,
-    plan_resume_append_from_committed_prefix, BootstrapPayload, FilemarkMap, FilemarkMapDigest,
-    ParityError, ParityMapContentConflict, ParityMapPayload, ParityMapReference,
+    plan_resume_append_from_committed_prefix, BootstrapObjectRow, BootstrapPayload, FilemarkMap,
+    FilemarkMapDigest, ParityError, ParityMapContentConflict, ParityMapPayload, ParityMapReference,
     ParityMapSelectionKey, ParityScheme, ParitySchemeRecord, PhysicalPositionHint, RawReadOutcome,
     RawTapeSource, SchemeId, SidecarDescriptor, SidecarEpochDirectory, SidecarEpochDirectoryEntry,
     SpaceFilemarksOutcome, TapeFileMapEntry, DEFAULT_SCHEME_BLOCK_SIZE_BYTES,
@@ -29,6 +29,11 @@ const TAPE_UUID: [u8; 16] = [0x42; 16];
 const WRITTEN_AT: &str = "2026-01-01T00:00:00Z";
 const WRITTEN_BY: &str = "remanence-publication-vector-1";
 const PINNED_BOOTSTRAP_SCHEMA_MINOR: u16 = 2;
+const RAO_TV_P1_OBJECT_ID: &str = "00000000-0000-4000-8000-000000000001";
+const RAO_TV_P1_MANIFEST_SHA256: [u8; 32] = [
+    0x81, 0x8e, 0x53, 0x93, 0x62, 0xd6, 0x40, 0x13, 0x4a, 0x44, 0x4e, 0x31, 0xa1, 0xc8, 0x46, 0x0b,
+    0x6b, 0x48, 0xdc, 0x07, 0x66, 0x9d, 0xef, 0x61, 0xe2, 0xf1, 0x66, 0xb7, 0xf4, 0x19, 0xd0, 0x3b,
+];
 
 #[derive(Debug)]
 enum ImageRecord {
@@ -377,6 +382,106 @@ fn emit_final_partial(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn emit_short_epoch(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = image_dir(root, "short-epoch-r-less-than-s")?;
+    let scheme = small_scheme();
+    let object = patterned_blocks(1, 0x61);
+    let sidecar = encode_epoch(&scheme, &object, 0, 0)?;
+    let map = FilemarkMap::new(vec![
+        TapeFileMapEntry::bootstrap(0, 1),
+        TapeFileMapEntry::object(1, 1, 0),
+        TapeFileMapEntry::parity_sidecar(2, sidecar.blocks.len() as u64, 0, 0, 1),
+        TapeFileMapEntry::bootstrap(3, 1),
+    ])?;
+    let mut payload = bootstrap_payload(Some(&scheme), Some(map.digest(true)?), 1);
+    payload.sidecar_epoch_directory = Some(SidecarEpochDirectory {
+        directory_scope_tape_file_count: map.tape_file_count(),
+        directory_scope_total_data_ordinals: 1,
+        directory_scope_highest_protected_ordinal: 1,
+        is_final_directory: true,
+        entries: vec![directory_entry(2, &sidecar, true)],
+    });
+    write_initial_bootstrap(&dir.join("tape-file-000-bootstrap.bin"), &scheme)?;
+    write_blocks(&dir.join("tape-file-001-object.bin"), &object)?;
+    write_blocks(&dir.join("tape-file-002-sidecar.bin"), &sidecar.blocks)?;
+    write_bootstrap(&dir.join("tape-file-003-final-bootstrap.bin"), &payload)?;
+    fs::write(
+        dir.join("expected.json"),
+        format!(
+            concat!(
+                "{{\n",
+                "  \"vector_id\": \"short-epoch-r-less-than-s\",\n",
+                "  \"expected_outcome\": \"recover-with-implicit-zero-shards\",\n",
+                "  \"block_size\": {},\n",
+                "  \"k\": 2,\n",
+                "  \"m\": 2,\n",
+                "  \"S\": 2,\n",
+                "  \"R\": 1,\n",
+                "  \"sidecar_header_block_count\": {},\n",
+                "  \"sidecar_block_count\": {}\n",
+                "}}\n"
+            ),
+            BLOCK_SIZE,
+            sidecar.header.shard_index_block_count,
+            sidecar.blocks.len(),
+        ),
+    )?;
+    Ok(())
+}
+
+fn emit_object_id_36_bootstrap(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = image_dir(root, "object-id-36-bootstrap")?;
+    let source = root
+        .parent()
+        .ok_or("REM-PARITY output directory has no publication-stage parent")?
+        .join("rao")
+        .join("objects")
+        .join("rao-tv-p1.rao");
+    let object = fs::read(&source)?;
+    if object.is_empty() || object.len() % BLOCK_SIZE as usize != 0 {
+        return Err(format!(
+            "{} is not a nonempty block-aligned RAO object",
+            source.display()
+        )
+        .into());
+    }
+    let stored_block_count = u64::try_from(object.len() / BLOCK_SIZE as usize)?;
+    let object_row =
+        BootstrapObjectRow::plaintext(1, stored_block_count, 4, 548, 1, RAO_TV_P1_MANIFEST_SHA256)
+            .with_object_id(RAO_TV_P1_OBJECT_ID.as_bytes().to_vec());
+    let mut payload = bootstrap_payload(None, None, 0);
+    payload.object_rows.push(object_row);
+    write_block(
+        &dir.join("tape-file-000-bootstrap.bin"),
+        &bootstrap_block(&payload)?,
+    )?;
+    fs::write(dir.join("tape-file-001-object.bin"), &object)?;
+    fs::write(
+        dir.join("expected.json"),
+        format!(
+            concat!(
+                "{{\n",
+                "  \"vector_id\": \"object-id-36-bootstrap\",\n",
+                "  \"expected_outcome\": \"bootstrap-object-row-accepted\",\n",
+                "  \"object_id\": \"{}\",\n",
+                "  \"object_id_length\": 36,\n",
+                "  \"stored_block_count\": {},\n",
+                "  \"plaintext_digest\": \"{}\",\n",
+                "  \"manifest_first_chunk_lba\": 4,\n",
+                "  \"manifest_size_bytes\": 548,\n",
+                "  \"manifest_chunk_count\": 1,\n",
+                "  \"manifest_sha256\": \"{}\"\n",
+                "}}\n"
+            ),
+            RAO_TV_P1_OBJECT_ID,
+            stored_block_count,
+            sha256_hex(&object),
+            hex(&RAO_TV_P1_MANIFEST_SHA256),
+        ),
+    )?;
+    Ok(())
+}
+
 fn emit_external_parity_map(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let dir = image_dir(root, "external-parity-map")?;
     let scheme = small_scheme();
@@ -625,10 +730,10 @@ fn emit_multi_parity_map_source(root: &Path) -> Result<(), Box<dyn std::error::E
         directory_scope_total_data_ordinals: 2,
         directory_scope_highest_protected_ordinal: 1,
         is_final_directory: true,
-        entries: vec![synthetic_directory_entry(1, 11)],
+        entries: vec![synthetic_directory_entry(1, 0)],
     };
     let conflicting_directory = SidecarEpochDirectory {
-        entries: vec![synthetic_directory_entry(3, 22)],
+        entries: vec![synthetic_directory_entry(3, 0)],
         ..selected_directory.clone()
     };
     let provisional_lower =
@@ -639,7 +744,7 @@ fn emit_multi_parity_map_source(root: &Path) -> Result<(), Box<dyn std::error::E
         encode_selection_parity_map(7, conflicting_directory.clone(), [0; 32], "conflict")?;
     let selected_map = FilemarkMap::new(vec![
         TapeFileMapEntry::bootstrap(0, 1),
-        TapeFileMapEntry::parity_sidecar(1, 1, 11, 0, 1),
+        TapeFileMapEntry::parity_sidecar(1, 1, 0, 0, 1),
         TapeFileMapEntry::parity_map(2, provisional_lower.blocks.len() as u64),
         TapeFileMapEntry::object(3, 1, 0),
         TapeFileMapEntry::parity_map(4, provisional_selected.blocks.len() as u64),
@@ -651,7 +756,7 @@ fn emit_multi_parity_map_source(root: &Path) -> Result<(), Box<dyn std::error::E
         TapeFileMapEntry::bootstrap(0, 1),
         TapeFileMapEntry::object(1, 1, 0),
         TapeFileMapEntry::parity_map(2, provisional_lower.blocks.len() as u64),
-        TapeFileMapEntry::parity_sidecar(3, 1, 22, 0, 1),
+        TapeFileMapEntry::parity_sidecar(3, 1, 0, 0, 1),
         TapeFileMapEntry::parity_map(4, provisional_selected.blocks.len() as u64),
         TapeFileMapEntry::object(5, 1, 1),
         TapeFileMapEntry::parity_map(6, provisional_conflict.blocks.len() as u64),
@@ -776,6 +881,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     emit_minimal(&output)?;
     emit_final_partial(&output)?;
+    emit_short_epoch(&output)?;
+    emit_object_id_36_bootstrap(&output)?;
     emit_external_parity_map(&output)?;
     emit_no_parity(&output)?;
     emit_checkpoint(&output)?;

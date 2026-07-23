@@ -1873,7 +1873,7 @@ practical to pin; at least one header-level vector MUST use the default
 geometry parameters. Negative vectors contain exactly one fault each.
 
 The companion archive is `remanence-test-vectors.tar`, SHA-256
-`f4e4331c14e67c059d1292f54e14efd8408c7d41364d2dba7f8e7567aa16c2a6`.
+`fa8570d31d3869155c9a2b4322b0846a5f5b2eb845d08c89ab4a78bcbb5e668f`.
 Its `MANIFEST.tsv` inventories every contained vector manifest and generated
 artifact, `CHECKSUMS.sha256` authenticates them, and the included `verify.py`
 checks the archive without a source checkout. The archive is reproducibly
@@ -1896,13 +1896,17 @@ minimal tape image (bootstrap + one object + one sidecar + final bootstrap)
 byte-pinned with its digest chain; a final-partial-epoch image exercising
 implicit zeros; an external parity_map image (inline overflow); a no-parity
 bootstrap; a checkpoint (prefix-digest) image; and a resume round-trip
-image (committed prefix → reopened → appended).
+image (committed prefix → reopened → appended). The suite also includes a
+short epoch with `R = 1 < S = 2`, and a no-parity image whose schema-minor 3
+bootstrap object row carries RAO-TV-P1's 36-byte UUID-string `object_id`
+verbatim.
 
 **Negative vectors (each single-fault).**
 
 - *Bootstrap*: bad magic; schema_major = 2; header-CRC bit flip;
   payload-CRC bit flip; payload truncation; keys 20 and 21 together;
-  `drive_compression = true` with parity; oversize payload.
+  `drive_compression = true` with parity; oversize payload; a 65-byte
+  object-row `object_id` (`BootstrapParse`, object-id length).
 - *Sidecar*: each header constraint of Section 9.2 violated (one vector per
   MUST); an index entry straddling a block's usable area; a spill-block CRC
   flip; nonzero reserved or fill bytes; primary/tail copy disagreement;
@@ -1910,6 +1914,9 @@ image (committed prefix → reopened → appended).
 - *parity_map*: payload SHA-256 mismatch; locator/header disagreement;
   directory invariant violations (unknown flag bit, non-ascending entries,
   watermark mismatch).
+- *SidecarEpochDirectory*: overlapping ranges; gapped ranges; duplicate epoch
+  id; nonzero first protected-range start. Each is a validly framed bootstrap
+  image whose sole semantic fault MUST produce `DirectoryInvalid`.
 - *Digests*: one structural-field flip per digest scalar
   (`tape_file_count`, `map_total_data_ordinals`,
   `highest_protected_ordinal`).
@@ -1926,6 +1933,17 @@ image (committed prefix → reopened → appended).
   scope) — each asserting the specified
   outcome (recovered / copy-health downgrade / one-epoch unavailability),
   never whole-tape failure.
+
+The following boundary-burst rows are normative. A span counts the data
+block, intervening filemark record, sidecar metadata blocks, and parity
+blocks. The pinned small-geometry images use `m = 2`, `S = 2`, and `H = 1`;
+the short row uses `R = 1`.
+
+| Vector | Burst span | Required outcome |
+| --- | --- | --- |
+| `boundary-straddling-burst-m-limit` | `m·S + H + 1 = 6` records, beginning at the full epoch's last data block | recovered; the straddled stripe loses exactly `m = 2` shards |
+| `boundary-straddling-burst-m-plus-one` | `m·S + H + 2 = 7` records at the same boundary | `Unrecoverable { stripe: 1, lost: 3, limit: 2 }` |
+| `short-epoch-boundary-burst-unrecoverable` | `(m−1)·S + R + H + 2 = 6` records, with `R < S` | `Unrecoverable { stripe: 0, lost: 3, limit: 2 }` |
 
 ## 18. Conformance and Freeze Criteria
 

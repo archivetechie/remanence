@@ -17,6 +17,8 @@ REQUIRED_POSITIVE = {
     "checkpoint-prefix",
     "resume-round-trip",
     "default-geometry-header",
+    "short-epoch-r-less-than-s",
+    "object-id-36-bootstrap",
 }
 REQUIRED_NEGATIVE = {
     "bootstrap": {
@@ -24,6 +26,7 @@ REQUIRED_NEGATIVE = {
         "bootstrap-header-crc-bit-flip", "bootstrap-payload-crc-bit-flip",
         "bootstrap-payload-truncation", "bootstrap-inline-and-external-directory",
         "bootstrap-drive-compression-enabled", "bootstrap-oversize-payload",
+        "bootstrap-object-id-65",
     },
     "sidecar": {
         "sidecar-magic", "sidecar-tape-uuid", "sidecar-k-zero", "sidecar-m-zero",
@@ -54,6 +57,12 @@ REQUIRED_NEGATIVE = {
         "recovery-reconstructed-crc-mismatch", "recovery-pending-epoch",
         "recovery-outside-prefix",
     },
+    "directory": {
+        "directory-overlapping-ranges",
+        "directory-gapped-ranges",
+        "directory-duplicate-epoch",
+        "directory-nonzero-first-start",
+    },
 }
 REQUIRED_DAMAGE = {
     "object-head",
@@ -63,6 +72,9 @@ REQUIRED_DAMAGE = {
     "parity-map-primary",
     "bootstrap-copy",
     "multi-parity-map-selection",
+    "boundary-straddling-burst-m-limit",
+    "boundary-straddling-burst-m-plus-one",
+    "short-epoch-boundary-burst-unrecoverable",
 }
 REQUIRED_RAO_OBJECTS = {
     "rao-tv-attribute-ext-combined.rao",
@@ -98,6 +110,13 @@ REQUIRED_RAO_NEGATIVE = {
     "manifest-tamper-repointed-path": "ManifestDigestMismatch",
     "manifest-tamper-swapped-file-sha256": "ManifestDigestMismatch",
     "manifest-tamper-altered-first-chunk-lba": "ManifestDigestMismatch",
+}
+REQUIRED_RAO_RANGE = {
+    "encrypted-last-object-chunk": ("positive/range", "authenticated-range"),
+    "encrypted-last-object-chunk-wrong-finality": (
+        "negative/range",
+        "AeadAuthenticationFailed",
+    ),
 }
 REQUIRED_KEY_FRAME_CASES = {
     "version-flip",
@@ -218,6 +237,17 @@ def main() -> int:
             f"missing={sorted(set(REQUIRED_RAO_NEGATIVE) - set(rao_negative))}, "
             f"extra={sorted(set(rao_negative) - set(REQUIRED_RAO_NEGATIVE))}"
         )
+    rao_ranges = {
+        item.get("id"): item
+        for item in rao_vectors
+        if item.get("category") in {"positive/range", "negative/range"}
+    }
+    if set(rao_ranges) != set(REQUIRED_RAO_RANGE):
+        fail(
+            "RAO range coverage differs: "
+            f"missing={sorted(set(REQUIRED_RAO_RANGE) - set(rao_ranges))}, "
+            f"extra={sorted(set(rao_ranges) - set(REQUIRED_RAO_RANGE))}"
+        )
     tamper_digests = set()
     for item in rao_vectors:
         artifacts = item.get("artifacts")
@@ -230,7 +260,9 @@ def main() -> int:
         if hashlib.sha256(canonical).hexdigest() != item.get("checksum_sha256"):
             fail(f"RAO vector checksum mismatch for {item.get('id')}")
         vector_root = rao_root
-        if item.get("category") == "negative/manifest":
+        if item.get("category") == "negative/manifest" or item.get(
+            "category"
+        ) in {"positive/range", "negative/range"}:
             vector_root /= item["archive_path"]
         for artifact in artifacts:
             path = vector_root / artifact["path"]
@@ -292,6 +324,45 @@ def main() -> int:
                 ):
                     fail(f"RAO tamper {item['id']} did not change plaintext_digest")
                 tamper_digests.add(expected.get("plaintext_digest"))
+        elif item.get("category") in {"positive/range", "negative/range"}:
+            expected = load_json(vector_root / "expected.json")
+            input_value = load_json(vector_root / "input.json")
+            required_category, required_result = REQUIRED_RAO_RANGE[item["id"]]
+            if item.get("category") != required_category:
+                fail(f"RAO range {item['id']} has the wrong category")
+            result = expected.get("expected_outcome", expected.get("expected_error"))
+            if result != required_result:
+                fail(f"RAO range {item['id']} has the wrong expected result")
+            object_chunk_count = expected.get("object_chunk_count")
+            if not isinstance(object_chunk_count, int) or object_chunk_count < 1:
+                fail(f"RAO range {item['id']} has an invalid object chunk count")
+            if (
+                expected.get("first_chunk") != object_chunk_count - 1
+                or expected.get("chunk_count") != 1
+            ):
+                fail(f"RAO range {item['id']} does not cover the final object chunk")
+            if input_value.get("file_chunk_count") != 1:
+                fail(f"RAO range {item['id']} does not pin the one-chunk file view")
+            expected_finality = item.get("category") == "positive/range"
+            if input_value.get("final_flag") is not expected_finality:
+                fail(f"RAO range {item['id']} pins the wrong final_flag")
+            source = rao_root / str(input_value.get("base_artifact"))
+            if (
+                not source.is_file()
+                or sha256(source) != expected.get("source_sha256")
+                or item.get("source_sha256") != expected.get("source_sha256")
+            ):
+                fail(f"RAO range {item['id']} source digest mismatch")
+            d1_plaintext = d1_expected.get("plaintext")
+            if not isinstance(d1_plaintext, dict):
+                fail("RAO-TV-D1 plaintext fixture is malformed")
+            if (
+                expected.get("manifest_sha256")
+                != d1_plaintext.get("manifest_sha256")
+                or expected.get("plaintext_digest")
+                != d1_encrypted.get("plaintext_digest")
+            ):
+                fail(f"RAO range {item['id']} disagrees with RAO-TV-D1 anchors")
     if len(tamper_digests) != 3:
         fail("RAO manifest tamper plaintext digests are not distinct")
     key_frame_negative = load_json(manifests / "negative-key-frame.json")
@@ -362,6 +433,29 @@ def main() -> int:
             for path in vector_root.iterdir()
         ):
             fail(f"negative vector {item['id']} has no deterministic input artifact")
+        if item["id"] == "object-id-36-bootstrap":
+            object_id = expected.get("object_id")
+            bootstrap = vector_root / "tape-file-000-bootstrap.bin"
+            object_path = vector_root / "tape-file-001-object.bin"
+            if (
+                not isinstance(object_id, str)
+                or len(object_id.encode("utf-8")) != 36
+                or bootstrap.read_bytes().count(object_id.encode("utf-8")) != 1
+            ):
+                fail("object-id-36 bootstrap does not carry one exact 36-byte id")
+            if sha256(object_path) != expected.get("plaintext_digest"):
+                fail("object-id-36 bootstrap object digest is not pinned")
+        if item["id"] == "bootstrap-object-id-65":
+            faulted = vector_root / "faulted-bootstrap.bin"
+            if faulted.read_bytes().count(b"x" * 65) != 1:
+                fail("object-id-65 negative does not carry one 65-byte id")
+            if expected.get("expected_error") != "BootstrapParse":
+                fail("object-id-65 negative has the wrong typed error")
+        if item.get("category") == "negative/directory":
+            if expected.get("expected_error") != "DirectoryInvalid":
+                fail(f"directory vector {item['id']} has the wrong typed error")
+            if not (vector_root / "faulted-bootstrap.bin").is_file():
+                fail(f"directory vector {item['id']} lacks its faulted image")
         if item["category"] == "damage-matrix":
             fault_map_file = vector_root / "fault-map.json"
             source_file = vector_root / "source-artifact.bin"
@@ -374,6 +468,48 @@ def main() -> int:
                 fail(f"damage vector {item['id']} has no unreadable blocks")
             if expected.get("whole_tape_failure") is not False:
                 fail(f"damage vector {item['id']} does not rule out whole-tape failure")
+            if "burst_span_records" in expected:
+                geometry = expected.get("geometry")
+                if not isinstance(geometry, dict):
+                    fail(f"damage vector {item['id']} lacks burst geometry")
+                m = geometry.get("m")
+                stripes = geometry.get("S")
+                header_blocks = geometry.get("H")
+                real_data_blocks = geometry.get("R")
+                if not all(
+                    isinstance(value, int) and value > 0
+                    for value in (m, stripes, header_blocks, real_data_blocks)
+                ):
+                    fail(f"damage vector {item['id']} has invalid burst geometry")
+                if item["id"] == "boundary-straddling-burst-m-limit":
+                    required_span = m * stripes + header_blocks + 1
+                    required_lost = m
+                    required_outcome = "recovered"
+                elif item["id"] == "boundary-straddling-burst-m-plus-one":
+                    required_span = m * stripes + header_blocks + 2
+                    required_lost = m + 1
+                    required_outcome = "Unrecoverable"
+                elif item["id"] == "short-epoch-boundary-burst-unrecoverable":
+                    if real_data_blocks >= stripes:
+                        fail("short-epoch burst does not satisfy R < S")
+                    required_span = (
+                        (m - 1) * stripes
+                        + real_data_blocks
+                        + header_blocks
+                        + 2
+                    )
+                    required_lost = m + 1
+                    required_outcome = "Unrecoverable"
+                else:
+                    fail(f"unknown burst damage vector {item['id']}")
+                if (
+                    expected.get("burst_span_records") != required_span
+                    or fault_map.get("burst_span_records") != required_span
+                    or expected.get("lost_count") != required_lost
+                    or expected.get("limit") != m
+                    or expected.get("expected_outcome") != required_outcome
+                ):
+                    fail(f"damage vector {item['id']} has inconsistent burst arithmetic")
             if item["id"] == "multi-parity-map-selection":
                 layout = load_json(vector_root / "tape-layout.json")
                 tape_files = layout.get("tape_files")
