@@ -1303,11 +1303,10 @@ The scalar header is exactly 128 bytes. All integers are unsigned big-endian.
 
 Bytes `0x10..0x20` and `0x39..0x3C` are reserved and MUST be zero.
 `wrap_suite = 0x01`, and `key_frame_len` MUST be between 103 and 4096
-inclusive. Although `103` is the
-smallest syntactically possible one-slot frame, a conforming Sealer emits
-at least two slots, so its emitted minimum is 201 bytes when both labels are
-empty. A zero wrap suite or absent/undersized key frame is not a valid object
-in this specification.
+inclusive. The smallest syntactically possible frame is a one-slot frame at
+`103` bytes; a two-slot frame with both labels empty is 201 bytes. A zero wrap
+suite or absent/undersized key frame is not a valid object in this
+specification.
 
 The `object_id` value is the inner `REMANENCE.object_id`. It contains no NUL,
 is valid UTF-8, and is right-padded with zero bytes. Readers MUST reject an
@@ -1356,10 +1355,18 @@ K = 5 + sum_over_slots(98 + label_len)
 and MUST consume exactly `K` bytes. A Reader MUST reject truncation, trailing
 bytes, a non-increasing or duplicate slot index, a duplicate
 `recipient_epoch_id`, an invalid label, an invalid slot count, or a frame
-outside the header's length bounds. A Sealer MUST emit at least two slots with
-distinct `recipient_epoch_id` values and MUST fail the entire seal if any
-recipient cannot be wrapped. A Reader accepts any structurally valid frame
-with at least one slot. Slot order is the strictly increasing `slot_index`
+outside the header's length bounds. A Sealer MUST emit at least one slot, MUST
+give any two slots distinct `recipient_epoch_id` values, and MUST fail the entire
+seal if any configured recipient cannot be wrapped. A single-recipient object is
+a single point of key loss: if that recipient's key is lost, the object is
+unrecoverable. A Sealer SHOULD therefore ensure single-key-loss survivability for
+objects intended for preservation — either by wrapping to two or more independent
+recipients, or by redundantly custodying the sole recipient's private key (for
+example a threshold or Shamir split, reconstituted by an operational ceremony) —
+and MAY emit a single slot where the deployment's key custody provides that
+survivability by other means. Implementations SHOULD default to emitting at least
+two recipients and require an explicit opt-in to emit a single slot. A Reader
+accepts any structurally valid frame with at least one slot. Slot order is the strictly increasing `slot_index`
 order; callers therefore MUST supply values that serialize in that order.
 
 Wrap suite `0x01` is HPKE Base mode [RFC9180] with
@@ -2202,7 +2209,9 @@ deadline. Merely adding a second, post-quantum recipient slot alongside the
 X25519 slot does **not** help — the weaker slot still unwraps the same DEK
 (weakest-slot property), so a genuine defense requires replacing the KEM or a
 true hybrid. A future minor version is expected to define an X25519 + ML-KEM
-hybrid KEM (FIPS 203; the construction of RFC 9958) as the resealing target;
+hybrid KEM (ML-KEM per FIPS 203, composed with X25519 by a standard hybrid
+construction such as X-Wing [draft-connolly-cfrg-xwing-kem]) as the resealing
+target;
 version 1.0 states the limitation and the resealing obligation but does not yet
 specify the hybrid.
 
@@ -2538,8 +2547,9 @@ Key-frame structure additionally covers slot counts 0 and 9, duplicate slot
 indices, misordered slots, duplicate `recipient_epoch_id` values across
 distinct slots, internal slot truncation, trailing frame bytes, malformed
 `RAOK` magic, malformed encapsulation, and a wrong recipient private key. A
-positive case opens a structurally valid one-slot object, recording the
-policy asymmetry: Sealers MUST emit at least two slots, while Readers accept
+positive case opens a structurally valid one-slot object: a Sealer MAY emit one
+through eight slots (subject to the Section 5.4 single-key-loss survivability
+guidance, with implementations defaulting to at least two), and Readers accept
 one through eight.
 
 ## 14. Conformance
