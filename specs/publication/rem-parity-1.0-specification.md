@@ -9,7 +9,7 @@
 | Date | 2026-07-23 (v1.3.0 hardening increment) |
 | License | CC-BY-4.0 |
 | Concept DOI (all versions) | [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126) |
-| Version DOI (this release) | assigned at release (the concept DOI above always resolves to the latest version) |
+| Version DOI (this release) | [10.5281/zenodo.21506676](https://doi.org/10.5281/zenodo.21506676) |
 | Bootstrap magic | `52 45 4D 00 42 4F 4F 01` (`"REM\0BOO\x01"`, fixed bytes) |
 | Erasure scheme identifier | `rs-cauchy-gf256-v1` |
 | parity_map format identifier | `rem-parity-map-v1` |
