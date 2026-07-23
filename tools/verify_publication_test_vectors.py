@@ -121,6 +121,7 @@ REQUIRED_RAO_RANGE = {
 REQUIRED_KEY_FRAME_CASES = {
     "version-flip",
     "suite-flip",
+    "legacy-x25519-wrap-suite",
     "truncated-key-frame",
     "duplicate-slots",
     "misordered-slots",

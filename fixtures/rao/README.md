@@ -13,6 +13,13 @@ RAO-TV-D1 envelopes with generic X25519, HKDF-SHA-256, and
 ChaCha20-Poly1305 primitives, verifying the recovered canonical bytes,
 `plaintext_digest`, manifest bytes, and every regular-file digest.
 
+The two X25519 envelopes are frozen RAO 1.0 publication records retained only
+for historical reproducibility. They are not migration inputs: the RAO 2.0
+Rust Reader rejects their permanently reserved `wrap_suite = 0x01` with
+`InvalidWrapSuite`, and the RAO 2.0 Sealer has no legacy emission mode. The
+current hybrid-only full-envelope pin is
+`crates/remanence-aead/testdata/deterministic-seal.hex`.
+
 The same verifier carries the Section 14 plaintext-interop gate:
 
 ```sh
@@ -26,10 +33,11 @@ is not installed, `--allow-missing-bsdtar` runs the GNU tar and Python
 `tarfile` portions while making the missing reader explicit.
 
 `rao-tv-e2.json` records the fixed DEK, seeded HPKE entropy input, both
-recipient keypairs as test material, and the complete pinned derivation chain.
-The Rust fixture test generates both encrypted objects twice through
-`seal_deterministic_for_test_vectors` and requires both runs to equal the
-checked-in pins.
+recipient keypairs as test material, and the complete historical derivation
+chain. The publication builder copies these immutable RAO 1.0 encrypted pins
+and verifies them independently; it does not ask the current X-Wing sealer to
+reproduce a forbidden legacy suite. Current RAO 2.0 deterministic sealing is
+covered by the Rust format test and `deterministic-seal.hex`.
 
 Negative-vector manifests with `status: complete` enumerate the Section 13.6
 negative families. The Rust negative-vector tests assert both the exact case

@@ -6,6 +6,7 @@
   "cases": [
     { "id": "version-flip", "operation": "inspect", "expected_error": "UnsupportedFormatVersion" },
     { "id": "suite-flip", "operation": "inspect", "expected_error": "InvalidWrapSuite" },
+    { "id": "legacy-x25519-wrap-suite", "operation": "inspect", "expected_error": "InvalidWrapSuite" },
     { "id": "truncated-key-frame", "operation": "inspect", "expected_error": "UnexpectedEof" },
     { "id": "duplicate-slots", "operation": "inspect", "expected_error": "InvalidKeyFrame" },
     { "id": "misordered-slots", "operation": "inspect", "expected_error": "InvalidKeyFrame" },

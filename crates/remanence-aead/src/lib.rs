@@ -1,12 +1,13 @@
-//! RAO 1.0 AEAD envelope implementation.
+//! RAO 2.0 AEAD envelope implementation.
 //!
 //! This crate absorbs Amber's useful cryptographic construction into
 //! Remanence as the isolated `remanence-aead` boundary. It implements the RAO
-//! encrypted representation from `specs/rao-1.0-specification.md`: the 128-byte
-//! `RAO1` header, deterministic salt derivation, HKDF key split, metadata
-//! frame, age-style ChaCha20-Poly1305 STREAM payload, footer/fill validation,
-//! and keyless inspection geometry. It intentionally contains no legacy AOF1
-//! reader and has no dependency on other Remanence crates.
+//! 2.0 hybrid-only encrypted representation: the 128-byte `RAO1` header,
+//! X-Wing DEK wrapping, deterministic salt derivation, HKDF key split,
+//! metadata frame, age-style ChaCha20-Poly1305 STREAM payload, footer/fill
+//! validation, and keyless inspection geometry. It intentionally contains no
+//! legacy X25519-only or AOF1 reader and has no dependency on other Remanence
+//! crates.
 
 pub mod error;
 pub mod header;
@@ -24,7 +25,7 @@ pub mod xwing;
 pub use error::{RaoAeadError, Result};
 pub use header::{
     RaoHeader, RAO_FOOTER, RAO_HEADER_LEN, RAO_MAX_METADATA_FRAME_LEN, RAO_METADATA_FRAME_MIN_LEN,
-    WRAP_SUITE_HPKE_V1,
+    RAO_WRAP_SUITE_XWING,
 };
 pub use inspect::{inspect_bytes, InspectReport};
 pub use kdf::{

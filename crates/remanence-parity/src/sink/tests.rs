@@ -6306,7 +6306,7 @@ fn checkpoint_batch_headroom_uses_encrypted_max_rows_and_refuses_before_motion()
                     1,
                     (1u8..=8).map(|byte| [byte; 16]).collect(),
                     OBJECT_ROW_METADATA_FRAME_MAX_LEN,
-                    4096,
+                    16_384,
                 )
                 .with_object_id([((index % 255) + 1) as u8; 64]),
             )
