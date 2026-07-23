@@ -501,12 +501,6 @@ fn validate_next_record(
                 projection.object.object_id
             )));
         }
-        uuid::Uuid::parse_str(&projection.object.object_id).map_err(|err| {
-            StateError::JournalReplayFailed(format!(
-                "checkpoint object id {} is not a UUID: {err}",
-                projection.object.object_id
-            ))
-        })?;
         if row.object_id != projection.object.object_id.as_bytes() {
             return Err(StateError::JournalReplayFailed(format!(
                 "checkpoint object {} bootstrap row has a different object_id",
@@ -750,5 +744,19 @@ mod tests {
         let err = validate_next_record(Some(&previous), &next)
             .expect_err("one tape checkpoint journal cannot change parity schemes");
         assert!(err.to_string().contains("scheme changed"), "{err}");
+    }
+
+    #[test]
+    fn validation_accepts_non_uuid_object_id() {
+        // object_id is opaque UTF-8, 1-64 bytes (RAO 4.5.1); the state layer must
+        // not require it to parse as a UUID (task #28 — vestigial UUID guards removed).
+        let tape_uuid = [0x24; 16];
+        let mut rec = record(tape_uuid);
+        let opaque = "accession-2026-0007";
+        rec.objects[0].object.object_id = opaque.to_string();
+        rec.objects[0].copy.object_id = opaque.to_string();
+        rec.objects[0].bootstrap_object_row.object_id = opaque.as_bytes().to_vec();
+
+        validate_next_record(None, &rec).expect("a non-UUID opaque object_id must validate");
     }
 }
