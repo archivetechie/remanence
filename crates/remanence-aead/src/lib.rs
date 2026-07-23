@@ -19,6 +19,7 @@ pub mod range;
 pub mod seal;
 pub mod stream;
 pub mod wrap;
+pub mod xwing;
 
 pub use error::{RaoAeadError, Result};
 pub use header::{
@@ -49,4 +50,9 @@ pub use stream::{
 pub use wrap::{
     unwrap_dek, wrap_dek, wrap_info, DataEncryptionKey, RecipientPrivateKey, RecipientPublicKey,
     WRAP_INFO_LEN, WRAP_INFO_PREFIX,
+};
+pub use xwing::{
+    decapsulate as xwing_decapsulate, derive_keypair as derive_xwing_keypair,
+    encapsulate as xwing_encapsulate, XWingError, XWingExpandedSecret, XWingPublicKey, XWingSeed,
+    XWING_CIPHERTEXT_LEN, XWING_PUBLIC_KEY_LEN, XWING_SEED_LEN, XWING_SHARED_SECRET_LEN,
 };
