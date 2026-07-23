@@ -30,6 +30,7 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any
 
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
@@ -150,6 +151,16 @@ class RecipientSlot:
 
 def sha256(data: bytes) -> bytes:
     return hashlib.sha256(data).digest()
+
+
+def crc64_xz(data: bytes) -> int:
+    """Return the reflected CRC-64/XZ used by bootstrap framing."""
+    crc = 0xFFFFFFFFFFFFFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ (0xC96C5795D7870F42 if crc & 1 else 0)
+    return crc ^ 0xFFFFFFFFFFFFFFFF
 
 
 def hx(data: bytes) -> str:
@@ -1852,6 +1863,261 @@ def check_recovery_vector(
     )
 
 
+def decode_bootstrap_payload(path: pathlib.Path) -> tuple[bytes, dict[int, Any]]:
+    """Validate generic bootstrap framing and decode its deterministic CBOR payload."""
+    block = path.read_bytes()
+    if len(block) < 60:
+        raise AssertionError(f"{path}: bootstrap block is too short")
+    assert_eq(block[:8], b"REM\0BOO\x01", f"{path} bootstrap magic")
+    assert_eq(
+        int.from_bytes(block[0x2C:0x34], "little"),
+        crc64_xz(block[:0x2C]),
+        f"{path} bootstrap header CRC",
+    )
+    payload_len = int.from_bytes(block[0x28:0x2C], "little")
+    payload_end = 52 + payload_len
+    if payload_end + 8 > len(block):
+        raise AssertionError(f"{path}: bootstrap payload extends past the block")
+    payload_bytes = block[52:payload_end]
+    assert_eq(
+        int.from_bytes(block[payload_end : payload_end + 8], "little"),
+        crc64_xz(payload_bytes),
+        f"{path} bootstrap payload CRC",
+    )
+    if block[payload_end + 8 :] != b"\0" * (len(block) - payload_end - 8):
+        raise AssertionError(f"{path}: bootstrap fill is not zero")
+    payload = decode_cbor_exact(payload_bytes)
+    if not isinstance(payload, dict):
+        raise AssertionError(f"{path}: bootstrap payload is not a map")
+    return block, payload
+
+
+def check_cross_layer_binding_and_range_vectors(
+    publication_root: pathlib.Path,
+    p1_plaintext: bytes,
+    p1_layout: dict[str, Any],
+    d1_plaintext: bytes,
+    d1_layout: dict[str, Any],
+    d1_fixture: dict[str, Any],
+) -> None:
+    """Independently verify the C1 bootstrap and M1 final-chunk range vectors."""
+    object_id_root = (
+        publication_root
+        / "rem-parity-1"
+        / "positive"
+        / "object-id-36-bootstrap"
+    )
+    expected = json.loads(
+        (object_id_root / "expected.json").read_text(encoding="utf-8")
+    )
+    object_bytes = (object_id_root / "tape-file-001-object.bin").read_bytes()
+    assert_eq(object_bytes, p1_plaintext, "object-id-36 RAO-TV-P1 bytes")
+    assert_eq(
+        hx(sha256(object_bytes)),
+        expected["plaintext_digest"],
+        "object-id-36 plaintext_digest",
+    )
+    _block, payload = decode_bootstrap_payload(
+        object_id_root / "tape-file-000-bootstrap.bin"
+    )
+    rows = payload.get(30)
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        raise AssertionError("object-id-36 bootstrap does not contain exactly one object row")
+    row = rows[0]
+    object_id = row.get(4)
+    if not isinstance(object_id, bytes):
+        raise AssertionError("object-id-36 bootstrap row key 4 is not bytes")
+    assert_eq(len(object_id), 36, "object-id-36 bootstrap byte length")
+    assert_eq(
+        object_id.decode("utf-8"),
+        expected["object_id"],
+        "object-id-36 bootstrap value",
+    )
+    assert_eq(row.get(3), len(p1_plaintext) // 4096, "object-id-36 stored blocks")
+    assert_eq(
+        row.get(10),
+        p1_layout["manifest"].first_chunk_lba,
+        "object-id-36 manifest first chunk",
+    )
+    assert_eq(
+        row.get(11),
+        len(p1_layout["manifest_cbor"]),
+        "object-id-36 manifest size",
+    )
+    assert_eq(
+        row.get(12),
+        p1_layout["manifest"].chunk_count,
+        "object-id-36 manifest chunk count",
+    )
+    assert_eq(
+        row.get(13),
+        p1_layout["manifest_sha256"],
+        "object-id-36 manifest SHA-256",
+    )
+
+    object_id_65 = (
+        publication_root
+        / "rem-parity-1"
+        / "negative"
+        / "bootstrap"
+        / "bootstrap-object-id-65"
+    )
+    _faulted, faulted_payload = decode_bootstrap_payload(
+        object_id_65 / "faulted-bootstrap.bin"
+    )
+    invalid_id = faulted_payload[30][0][4]
+    assert_eq(len(invalid_id), 65, "object-id-65 negative byte length")
+    if not invalid_id or len(invalid_id) <= 64 or b"\0" in invalid_id:
+        raise AssertionError("object-id-65 negative does not isolate the length fault")
+    object_id_65_expected = json.loads(
+        (object_id_65 / "expected.json").read_text(encoding="utf-8")
+    )
+    assert_eq(
+        object_id_65_expected["expected_error"],
+        "BootstrapParse",
+        "object-id-65 negative error",
+    )
+
+    range_root = publication_root / "rao"
+    positive_root = (
+        range_root / "positive" / "range" / "encrypted-last-object-chunk"
+    )
+    negative_root = (
+        range_root
+        / "negative"
+        / "range"
+        / "encrypted-last-object-chunk-wrong-finality"
+    )
+    positive_input = json.loads(
+        (positive_root / "input.json").read_text(encoding="utf-8")
+    )
+    positive_expected = json.loads(
+        (positive_root / "expected.json").read_text(encoding="utf-8")
+    )
+    negative_input = json.loads(
+        (negative_root / "input.json").read_text(encoding="utf-8")
+    )
+    negative_expected = json.loads(
+        (negative_root / "expected.json").read_text(encoding="utf-8")
+    )
+    stored = (range_root / positive_input["base_artifact"]).read_bytes()
+    header = parse_encrypted_header(stored)
+    key_frame_start = RAO_HEADER_LEN
+    key_frame_end = key_frame_start + header.key_frame_len
+    key_frame = stored[key_frame_start:key_frame_end]
+    slots = parse_key_frame("encrypted-last-object-chunk", key_frame)
+    recipient = positive_input["recipient"]
+    epoch_id = bytes.fromhex(recipient["recipient_epoch_id"])
+    slot = next((candidate for candidate in slots if candidate.recipient_epoch_id == epoch_id), None)
+    if slot is None:
+        raise AssertionError("encrypted-last-object-chunk recipient slot is absent")
+    dek, _trace = hpke_unwrap_dek(
+        "encrypted-last-object-chunk",
+        slot,
+        header.object_id,
+        recipient,
+    )
+    assert_eq(
+        dek,
+        bytes.fromhex(d1_fixture["inputs"]["deterministic_dek"]),
+        "encrypted-last-object-chunk DEK",
+    )
+    header_hash = sha256(header.bytes + key_frame)
+    object_secret = hkdf(
+        header.salt,
+        dek,
+        LABEL_OBJECT + header_hash,
+        32,
+    )
+    metadata_key = hkdf(b"", object_secret, LABEL_METADATA, 32)
+    payload_key = hkdf(b"", object_secret, LABEL_PAYLOAD, 32)
+    metadata_start = key_frame_end
+    metadata_end = metadata_start + header.metadata_frame_len
+    metadata_plain = ChaCha20Poly1305(metadata_key).decrypt(
+        b"\0" * 12,
+        stored[metadata_start:metadata_end],
+        b"",
+    )
+    metadata = decode_cbor_exact(metadata_plain)
+    plaintext_size, plaintext_digest = validate_encrypted_metadata(
+        "encrypted-last-object-chunk",
+        metadata,
+        header.chunk_size,
+    )
+    object_chunk_count = (
+        plaintext_size + header.chunk_size - 1
+    ) // header.chunk_size
+    final_chunk = object_chunk_count - 1
+    assert_eq(
+        final_chunk,
+        positive_expected["first_chunk"],
+        "encrypted-last-object-chunk index",
+    )
+    assert_eq(
+        final_chunk,
+        positive_input["first_inner_chunk"],
+        "encrypted-last-object-chunk inner index",
+    )
+    stored_start = metadata_end + final_chunk * (header.chunk_size + 16)
+    assert_eq(
+        stored_start,
+        positive_input["stored_range_start"],
+        "encrypted-last-object-chunk stored range start",
+    )
+    final_plaintext_len = plaintext_size - final_chunk * header.chunk_size
+    frame = stored[stored_start : stored_start + final_plaintext_len + 16]
+    final_plaintext = ChaCha20Poly1305(payload_key).decrypt(
+        stream_nonce(final_chunk, True),
+        frame,
+        b"",
+    )
+    manifest = d1_layout["manifest_cbor"]
+    assert_eq(
+        bytes.fromhex(positive_expected["manifest_cbor_hex"]),
+        manifest,
+        "encrypted-last-object-chunk expected manifest bytes",
+    )
+    assert_eq(
+        final_plaintext[: len(manifest)],
+        manifest,
+        "encrypted-last-object-chunk manifest bytes",
+    )
+    assert_eq(
+        hx(sha256(manifest)),
+        positive_expected["manifest_sha256"],
+        "encrypted-last-object-chunk manifest SHA-256",
+    )
+    assert_eq(
+        hx(sha256(d1_plaintext)),
+        positive_expected["plaintext_digest"],
+        "encrypted-last-object-chunk rederived plaintext_digest",
+    )
+    assert_eq(
+        plaintext_digest,
+        sha256(d1_plaintext),
+        "encrypted-last-object-chunk authenticated plaintext_digest",
+    )
+    try:
+        ChaCha20Poly1305(payload_key).decrypt(
+            stream_nonce(final_chunk, False),
+            frame,
+            b"",
+        )
+    except InvalidTag:
+        pass
+    else:
+        raise AssertionError(
+            "encrypted-last-object-chunk accepted the non-final AEAD nonce"
+        )
+    assert_eq(positive_input["final_flag"], True, "positive final_flag")
+    assert_eq(negative_input["final_flag"], False, "negative final_flag")
+    assert_eq(
+        negative_expected["expected_error"],
+        "AeadAuthenticationFailed",
+        "negative wrong-finality error",
+    )
+
+
 def check_positive_plaintext_fixture(
     fixture_directory: pathlib.Path,
     filename: str,
@@ -1977,6 +2243,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "metadata/extension vectors and compare them byte-for-byte"
         ),
     )
+    parser.add_argument(
+        "--publication-root",
+        type=pathlib.Path,
+        help=(
+            "also verify the extracted cross-layer bootstrap and "
+            "encrypted final-chunk range vectors"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -2100,6 +2374,15 @@ def main(argv: list[str] | None = None) -> int:
         d1,
         d1["inputs"]["object_id"],
     )
+    if args.publication_root is not None:
+        check_cross_layer_binding_and_range_vectors(
+            args.publication_root,
+            p1_plaintext,
+            p1_layout,
+            d1_plaintext,
+            d1_layout,
+            d1,
+        )
 
     if args.export_directory is not None:
         export_directory = args.export_directory
@@ -2128,7 +2411,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         "verified RAO-TV-E2 and RAO-TV-D1 encrypted OPEN, RAO-TV-P1 and "
-        "RAO-TV-D1 plaintext, and additional RAO positive vectors independently"
+        "RAO-TV-D1 plaintext, additional RAO positives, and requested "
+        "cross-layer vectors independently"
     )
     return 0
 

@@ -1,8 +1,9 @@
 //! Verifies the RAO Section 13 fixture manifests against regenerated objects.
 
 use remanence_aead::{
-    derive_keys, inspect_bytes, open_to_vec, seal_deterministic_for_test_vectors,
-    DataEncryptionKey, EnvelopeSealOptions, RecipientPrivateKey, RecipientPublicKey, SealOptions,
+    cipher_offset, decrypt_chunk, derive_keys, inspect_bytes, open_inner_range_to_vec, open_to_vec,
+    seal_deterministic_for_test_vectors, DataEncryptionKey, EnvelopeSealOptions, RaoAeadError,
+    RecipientPrivateKey, RecipientPublicKey, SealOptions, CHACHA20POLY1305_TAG_LEN,
 };
 use remanence_format::{
     read_rem_tar_object, write_rem_tar_object, write_rem_tar_object_from_readers,
@@ -992,7 +993,7 @@ fn rao_publication_objects_regenerate_byte_exactly() {
     assert_eq!(e2_first, e2_second, "RAO-TV-E2 regenerates byte-exactly");
 
     let d1_plaintext = build_d1_plaintext();
-    let (_, d1_recipients) = d1_recipient_pair();
+    let (d1_primary, d1_recipients) = d1_recipient_pair();
     let d1_first = seal_fixed_vector(
         &d1_plaintext,
         &d1_options(),
@@ -1010,6 +1011,66 @@ fn rao_publication_objects_regenerate_byte_exactly() {
     assert_eq!(
         d1_first, d1_second,
         "RAO-TV-D1 encrypted half regenerates byte-exactly"
+    );
+    let d1_fixture = fixture(include_str!("../../../fixtures/rao/rao-tv-d1.json"));
+    let d1_expected_plaintext = field(field(&d1_fixture, "expected"), "plaintext");
+    let d1_manifest = hex_to_bytes(&str_field(d1_expected_plaintext, "manifest_cbor_hex"));
+    let d1_manifest_layout = field(d1_expected_plaintext, "manifest_layout");
+    let d1_manifest_first_chunk = u64_field(d1_manifest_layout, "first_chunk_lba");
+    let (manifest_range, range_report) = open_inner_range_to_vec(
+        &d1_first,
+        &d1_primary,
+        d1_manifest_first_chunk,
+        0,
+        d1_manifest.len() as u64,
+    )
+    .expect("RAO-TV-D1 manifest range in the final object chunk authenticates");
+    let d1_inspect = inspect_bytes(&d1_first).expect("RAO-TV-D1 encrypted object inspects");
+    assert_eq!(manifest_range, d1_manifest);
+    assert_eq!(
+        range_report.first_chunk,
+        Some(d1_inspect.chunk_count - 1),
+        "RAO-TV-D1 manifest range reaches the true final object chunk"
+    );
+    assert_eq!(range_report.chunk_count, 1);
+
+    let (_, d1_open) = open_to_vec(&d1_first, &d1_primary).expect("RAO-TV-D1 opens");
+    let d1_key_frame = d1_open
+        .key_frame
+        .serialize()
+        .expect("RAO-TV-D1 key frame serializes");
+    let d1_keys = derive_keys(
+        &D1_DEK,
+        &d1_open.header.hkdf_salt,
+        &d1_open
+            .header
+            .header_hash_with_key_frame(&d1_key_frame)
+            .expect("RAO-TV-D1 header hash derives"),
+    )
+    .expect("RAO-TV-D1 payload key derives");
+    let final_chunk_index = d1_inspect.chunk_count - 1;
+    let final_chunk_offset = usize::try_from(
+        cipher_offset(
+            d1_open.header.key_frame_len,
+            d1_open.header.metadata_frame_len,
+            d1_open.header.chunk_size,
+            final_chunk_index,
+        )
+        .expect("RAO-TV-D1 final chunk offset derives"),
+    )
+    .expect("RAO-TV-D1 final chunk offset fits usize");
+    let final_chunk_len = usize::try_from(d1_open.header.chunk_size).unwrap()
+        + usize::try_from(CHACHA20POLY1305_TAG_LEN).unwrap();
+    let wrong_finality = decrypt_chunk(
+        &d1_keys.payload_key,
+        final_chunk_index,
+        false,
+        &d1_first[final_chunk_offset..final_chunk_offset + final_chunk_len],
+    )
+    .expect_err("the final object chunk must reject a non-final AEAD nonce");
+    assert!(
+        matches!(wrong_finality, RaoAeadError::AeadAuthenticationFailed),
+        "expected AeadAuthenticationFailed, got {wrong_finality:?}"
     );
 
     let increment_exports: Vec<(&str, Vec<u8>)> = publication_increment_vectors()

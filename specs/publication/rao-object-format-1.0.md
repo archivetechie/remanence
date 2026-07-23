@@ -2238,11 +2238,13 @@ values (e.g. 4096) so full object byte streams are practical to pin; at least
 one vector MUST use `DEFAULT_CHUNK_SIZE`.
 
 The authoritative companion archive is `remanence-test-vectors.tar`, SHA-256
-`f4e4331c14e67c059d1292f54e14efd8408c7d41364d2dba7f8e7567aa16c2a6`. This archive supersedes the earlier
-`32fe2a7947b74e5c8abbaad4e83e85f7deebc827d0aa8ccee8197fcc9c6cd6da`: every
-prior entry is byte-identical and only additive entries (the metadata,
-extension-container, object-inventory, and parity tie-break vectors) are
-new.
+`fa8570d31d3869155c9a2b4322b0846a5f5b2eb845d08c89ab4a78bcbb5e668f`.
+This archive supersedes
+`f4e4331c14e67c059d1292f54e14efd8408c7d41364d2dba7f8e7567aa16c2a6`.
+Existing RAO object streams remain byte-identical. REM-PARITY sidecar images
+are regenerated for parity-index-major physical placement, and the archive
+adds the object-id binding, directory-negative, boundary-burst, short-epoch,
+and encrypted final-chunk range vectors.
 The authoritative archive digest names this specific version of the frozen
 conformance distribution. Later additive vector entries are versioned
 supplements carrying their own digest; they do not mutate the conformance
@@ -2380,6 +2382,17 @@ seed byte `a7` repeated 32 times, and the two recipient keypairs recorded in
 its manifest. Pinned outputs as in 13.2/13.3
 (digests only for the large streams; exact bytes for header, metadata frame,
 and manifest).
+
+The additive `encrypted-last-object-chunk` range vector uses RAO-TV-D1's
+manifest range: `first_inner_chunk = 3`, `range_start = 0`, and
+`range_len = 351`. Since D1 has `object_chunk_count = 4`, this range covers
+the true final object chunk (`i = object_chunk_count − 1`) and MUST
+authenticate with `final_flag = 1`, reproducing the exact manifest CBOR,
+`manifest_sha256`, and `plaintext_digest`. The paired
+`encrypted-last-object-chunk-wrong-finality` negative applies
+`final_flag = 0` to that same frame and MUST produce
+`AeadAuthenticationFailed`. A Reader MUST derive finality from the
+envelope-wide `object_chunk_count`, not the selected file's `chunk_count`.
 
 ### 13.5. Xattr and HPKE Component Vectors
 
