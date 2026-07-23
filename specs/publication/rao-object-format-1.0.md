@@ -5,7 +5,8 @@
 | Status | Publication specification |
 | Version | 1.0 |
 | Date | 2026-07-22 (v1.2.0 freeze increment) |
-| Archived release DOI | [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126) |
+| Concept DOI (all versions) | [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126) |
+| Version DOI (this release) | assigned at release (the concept DOI above always resolves to the latest version) |
 | Envelope magic | `RAO1` (encrypted representation) |
 | Stream format identifier | `rao-v1` (plaintext representation) |
 | On-tape format version | `2` (HPKE wrapped-DEK envelope) |
@@ -18,6 +19,15 @@ normative fixed point for the format it defines: an implementation is
 validated against this document, not the reverse. It consolidates the base
 container, extended-attribute preservation, and HPKE envelope encryption into
 one independently implementable baseline.
+
+RAO's tape binding depends normatively on the REM-PARITY specification
+([REMPARITY]), which is at `Draft for review` and not yet frozen. That
+dependency is therefore **provisional and version-pinned**: the tape-binding
+clauses of this document (the parity-layer references in Sections 4.9, 8.2, 9,
+12.5) are stable against the specific REM-PARITY revision cited in the
+References, and MAY change when REM-PARITY freezes. The file, object-store, and
+encrypted-envelope portions of this document do not depend on REM-PARITY and are
+not provisional.
 
 ## Abstract
 
@@ -612,7 +622,7 @@ keyword order (Section 4.4.2):
 | `REMANENCE.encryption` | MUST be `none` (Section 4.5.2, Section 10) |
 | `REMANENCE.format_id` | MUST be `rao-v1` |
 | `REMANENCE.metadata_preservation` | One of `minimal`, `archival`, `full` |
-| `REMANENCE.object_id` | Non-empty UTF-8 object identifier (a UUID string in practice; opaque to this format) |
+| `REMANENCE.object_id` | Object identifier of 1–64 non-NUL UTF-8 bytes (a UUID string in practice; opaque to this format). The 1–64-byte bound is uniform across representations — it matches the encrypted envelope field (Section 5.2) and lets the REM-PARITY tape binding ([REMPARITY] bootstrap key 4) carry the identifier verbatim. |
 | `REMANENCE.schema_version` | `<major>.<minor>` decimal text; MUST have major version 1 (Section 10) |
 | `REMANENCE.write_timestamp` | [RFC3339] timestamp of object creation |
 
@@ -1194,9 +1204,21 @@ Procedure:
    have no payload hash of their own; they are verified through the
    manifest/object digest chain (and, for a hardlink, its referential
    integrity — Section 4.6).
-   Partial-range reads cannot verify a whole-file hash; their integrity comes
-   from the parity layer's block CRCs, and range-read implementations MUST say
-   so rather than imply hash-verified content.
+   Partial-range reads cannot verify a whole-file `file_sha256`. Their integrity
+   depends on representation and backend, and a range-read implementation MUST
+   report which of the three it provides rather than imply hash-verified content:
+   (a) a **parity-protected tape** plaintext copy is covered by the parity
+   layer's per-block CRCs ([REMPARITY]) — damage detection, not adversarial
+   authentication (CRC-64 confirms a guessed block); (b) an **encrypted** copy on
+   any backend authenticates every byte range through the per-chunk AEAD tag
+   (Section 6.3): a chunk whose tag fails aborts the range read (Section 5.10),
+   so range reads of the encrypted representation are cryptographically verified
+   end to end; (c) a **plaintext copy on a byte-addressed backend without the
+   parity layer** (a file or object store) has **no per-range integrity by
+   construction** — a verifying range read there requires either the encrypted
+   representation or a whole-file `file_sha256`/`plaintext_digest` check, which
+   reads the whole file. Implementations MUST NOT present case (c) as
+   integrity-verified.
 6. Capture the entry whose effective path is `_remanence/manifest.cbor` as the
    manifest bytes. An object whose EOF is reached with no manifest entry is
    nonconformant: Verifiers MUST reject it (Section 7.4), and a restore-mode
@@ -1583,10 +1605,13 @@ Inner body block `b` is AEAD chunk `b` (Section 5.7). Let
 cipher_offset(b) = F + b × (C + 16)
 cipher_len       = C + 16
 nonce counter    = b
-final_flag       = 0x01 if b == chunk_count − 1, else 0x00
+final_flag       = 0x01 if b == object_chunk_count − 1, else 0x00
 ```
 
-The Restorer fetches each stored range `[cipher_offset(b), cipher_offset(b) +
+Here `object_chunk_count` is the **envelope-wide** chunk count `N` of Section 5.7
+(`N = plaintext_size / chunk_size`), which governs AEAD finality — not the
+per-file `chunk_count` of Section 4.6.4. The Restorer fetches each stored range
+`[cipher_offset(b), cipher_offset(b) +
 C + 16)` for `b` in `b_first ..= b_last` (a single contiguous stored range,
 since consecutive chunks are adjacent), authenticates and decrypts each chunk
 with the nonce above, concatenates the plaintexts, and slices the requested
@@ -1893,6 +1918,8 @@ FileDigestMismatch        delivered payload bytes do not hash to REMANENCE.file_
 Cbor                      manifest is not valid manifest-profile CBOR (Section 4.7.1)
 ManifestInvalid           manifest violates the Section 4.7.2 schema or cross-checks
 ManifestDigestMismatch    manifest bytes do not hash to the anchor digest (Section 4.7.2)
+MissingManifest           object EOF reached with no _remanence/manifest.cbor entry (Section 4.9;
+                          non-fatal warning in restore mode, rejection for a Verifier per 7.4)
 UnsupportedFeature        unknown format_id, schema major mismatch, non-none compression
                           or encryption
 IncompleteBlockWrite      Section 4.9 writer failure
@@ -2013,10 +2040,11 @@ completeness. The off-tape **catalog** holds paths, per-file rows, and digests �
 cleartext metadata about confidential content, protected by the catalog
 system, not by this format. The on-tape **parity-layer bootstrap** is
 deliberately minimal: for encrypted objects it carries only the envelope
-fields of Section 8.2 and no manifest anchors ([REMPARITY]) — `object_id` is
-recovered from the envelope header in stored block 0, not from the bootstrap —
-so the tape itself leaks nothing beyond the Section 5.8 header-and-size
-facts.
+fields of Section 8.2 and no manifest anchors ([REMPARITY]). It MAY carry
+`object_id` ([REMPARITY] bootstrap key 4), which is itself a public envelope
+fact (listed above) and so adds no leakage; the envelope header in stored block 0
+remains the authoritative source of `object_id` for an encrypted object. The tape
+itself therefore leaks nothing beyond the Section 5.8 header-and-size facts.
 
 ### 12.6. Plaintext Copies Are Not Self-Authenticating
 
@@ -2090,8 +2118,24 @@ MUST materialize a hardlink's primary before creating the hardlink (`link(2)`)
 to the already-restored primary. They MUST also prevent the classic archive
 attack where an earlier symlink entry creates `dir -> /outside` and a later
 regular entry writes through `dir/file`.
-Framing-layer acceptance of a path is a necessary check, not a sufficient
-safety claim. Decrypting an envelope grants no exemption: the inner stream is
+
+**Native path-mapping preflight.** Section 4.6.6 makes an entry path a clean
+`/`-separated relative path, but that grammar is validated against POSIX
+semantics only. On a non-POSIX target filesystem the same bytes can denote
+something else: on Windows a component such as `..\outside` embeds a separator
+the RAO grammar never inspected, and a value like `C:\x` or `\\host\share\x` maps
+to a drive-relative or UNC absolute path; case-folding and Unicode normalization
+(e.g. NFC/NFD, or Windows case-insensitivity) can also collapse two
+RAO-distinct entry paths onto one native target. A Restoring Consumer that maps
+entry paths onto a native filesystem MUST therefore, before materializing any
+entry, resolve the entry's native-normalized destination (applying the target's
+separator, case-fold, and Unicode-normalization rules) and MUST reject or report
+— never silently overwrite — any entry whose native destination escapes the
+restore root, resolves to an absolute, drive-relative, or UNC path, or collides
+with a destination already produced by another entry in the same object. This
+preflight is in addition to, not a replacement for, the symlink and traversal
+discipline above. Framing-layer acceptance of a path is a necessary check, not a
+sufficient safety claim. Decrypting an envelope grants no exemption: the inner stream is
 parsed and restored under the same rules. Stock tar extraction has its own
 security model; RAO's standard-tool fallback is faithful, not inherently
 sandboxed.
@@ -2142,6 +2186,23 @@ dumps, or durable plaintext staging. Whole-object recovery SHOULD stage
 plaintext on suitably protected storage and publish it only after full
 authentication; deletion cannot guarantee erasure on copy-on-write or flash
 media.
+
+**Post-quantum confidentiality (a stated limitation).** The version-1 envelope
+wraps DEKs with HPKE over DHKEM(X25519) (Section 5). X25519 key agreement is not
+post-quantum secure: an adversary who records stolen encrypted media today can
+recover the wrapped DEKs once a cryptographically relevant quantum computer
+exists — a *harvest-now, decrypt-later* exposure that is acute precisely because
+archival media is long-lived and confidentiality must hold for decades.
+Deployments holding long-lived secrets under this format MUST treat the
+confidentiality window as bounded and adopt a **resealing policy**: re-encrypt
+affected objects under a post-quantum-secure KEM before a deployment-stated
+deadline. Merely adding a second, post-quantum recipient slot alongside the
+X25519 slot does **not** help — the weaker slot still unwraps the same DEK
+(weakest-slot property), so a genuine defense requires replacing the KEM or a
+true hybrid. A future minor version is expected to define an X25519 + ML-KEM
+hybrid KEM (FIPS 203; the construction of RFC 9958) as the resealing target;
+version 1.0 states the limitation and the resealing obligation but does not yet
+specify the hybrid.
 
 ### 12.12. Disclosure in Published Plaintext Objects
 
