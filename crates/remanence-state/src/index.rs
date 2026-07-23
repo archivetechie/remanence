@@ -5596,14 +5596,6 @@ fn validate_checkpoint_record_bundle_shape(
             }
         }
         prior_total_committed_ordinals = Some(projection.total_committed_ordinals);
-        Uuid::parse_str(projection.object.object_id.as_str()).map_err(|err| {
-            StateError::IndexCorrupt(format!(
-                "checkpoint record tape={} ordinal={} has invalid object UUID {}: {err}",
-                hex_uuid(record.tape_uuid),
-                record.ordinal,
-                projection.object.object_id
-            ))
-        })?;
         if projection.bootstrap_object_row.tape_file_number != projection.copy.tape_file_number
             || projection.bootstrap_object_row.stored_block_count != projection.block_count
             || projection.bootstrap_object_row.object_id != projection.object.object_id.as_bytes()
