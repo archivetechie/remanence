@@ -316,7 +316,10 @@ impl<W: Write> Write for HashingWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{inspect_bytes, open_plaintext_range_to_vec, open_to_vec, RecipientPrivateKey};
+    use crate::{
+        inspect_bytes, open_plaintext_range_to_vec, open_to_vec, RecipientPrivateKey,
+        RAO_HEADER_LEN, RAO_WRAP_SUITE_XWING,
+    };
     use std::io;
 
     fn options(plaintext: &[u8]) -> SealOptions {
@@ -446,6 +449,8 @@ mod tests {
 
         let (sealed, sealed_report) = seal_to_vec(&plaintext, &options).unwrap();
         assert_eq!(sealed_report.header.format_version, 2);
+        assert_eq!(sealed_report.header.wrap_suite, RAO_WRAP_SUITE_XWING);
+        assert_eq!(sealed[0x38], RAO_WRAP_SUITE_XWING);
         assert_eq!(sealed_report.key_frame.slots.len(), 2);
 
         let inspected = inspect_bytes(&sealed).unwrap();
@@ -503,6 +508,66 @@ mod tests {
         assert!(matches!(
             open_to_vec(&changed_label, &safe),
             Err(RaoAeadError::AeadAuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn legacy_wrap_suite_downgrade_is_rejected_and_changes_header_hash_transcript() {
+        let plaintext = vec![0x5a; 512];
+        let recipient = RecipientPrivateKey::new([1; 16], "primary", [7; 32]).unwrap();
+        let options = EnvelopeSealOptions {
+            common: options(&plaintext),
+            allow_single_recipient: true,
+            recipients: vec![recipient.public_key(0).unwrap()],
+        };
+        let dek = [0x44; 32];
+        let mut sealed = Vec::new();
+        let report = seal_deterministic_for_test_vectors(
+            &plaintext[..],
+            &mut sealed,
+            &options,
+            DataEncryptionKey::from_bytes(dek),
+            [0x55; 32],
+        )
+        .unwrap();
+        assert_eq!(report.header.wrap_suite, RAO_WRAP_SUITE_XWING);
+
+        // wrap_suite is not configurable through SealOptions. Even direct
+        // mutation of the public parsed-header model cannot serialize 0x01.
+        let mut forbidden_header = report.header.clone();
+        forbidden_header.wrap_suite = 0x01;
+        assert!(matches!(
+            forbidden_header.serialize(),
+            Err(RaoAeadError::InvalidWrapSuite)
+        ));
+
+        let authenticated_prefix_len = RAO_HEADER_LEN + report.header.key_frame_len as usize;
+        let original_header_hash: [u8; 32] =
+            Sha256::digest(&sealed[..authenticated_prefix_len]).into();
+        let mut downgraded = sealed;
+        downgraded[0x38] = 0x01;
+        let downgraded_header_hash: [u8; 32] =
+            Sha256::digest(&downgraded[..authenticated_prefix_len]).into();
+        assert_ne!(original_header_hash, downgraded_header_hash);
+
+        // The Reader rejects the forbidden suite before key derivation. This
+        // test-only derivation separately confirms the unchanged §5.5 binding:
+        // if the suite gate were bypassed, the altered transcript still
+        // produces keys that cannot authenticate the sealed metadata.
+        let downgraded_keys =
+            crate::derive_keys(&dek, &report.header.hkdf_salt, &downgraded_header_hash).unwrap();
+        let metadata_start = authenticated_prefix_len;
+        let metadata_end = metadata_start + report.header.metadata_frame_len as usize;
+        assert!(matches!(
+            crate::stream::decrypt_metadata(
+                &downgraded_keys.metadata_key,
+                &downgraded[metadata_start..metadata_end],
+            ),
+            Err(RaoAeadError::AeadAuthenticationFailed)
+        ));
+        assert!(matches!(
+            open_to_vec(&downgraded, &recipient),
+            Err(RaoAeadError::InvalidWrapSuite)
         ));
     }
 

@@ -1,9 +1,10 @@
-//! Verifies the RAO Section 13 fixture manifests against regenerated objects.
+//! Verifies current RAO vectors and retired RAO 1.0 publication pins.
 
 use remanence_aead::{
     cipher_offset, decrypt_chunk, derive_keys, inspect_bytes, open_inner_range_to_vec, open_to_vec,
     seal_deterministic_for_test_vectors, DataEncryptionKey, EnvelopeSealOptions, RaoAeadError,
     RecipientPrivateKey, RecipientPublicKey, SealOptions, CHACHA20POLY1305_TAG_LEN,
+    RAO_WRAP_SUITE_XWING,
 };
 use remanence_format::{
     read_rem_tar_object, write_rem_tar_object, write_rem_tar_object_from_readers,
@@ -971,10 +972,7 @@ fn rao_tv_p1_matches_fixture_manifest() {
 }
 
 #[test]
-fn rao_publication_objects_regenerate_byte_exactly() {
-    let e2_fixture = fixture(include_str!("../../../fixtures/rao/rao-tv-e2.json"));
-    let e2_inputs = field(&e2_fixture, "inputs");
-    let e2_expected = field(&e2_fixture, "expected");
+fn rao2_xwing_envelopes_are_deterministic_and_range_safe() {
     let p1_plaintext = build_p1_plaintext();
     let (e2_primary, e2_recipients) = e2_recipient_pair();
     let e2_first = seal_fixed_vector(
@@ -992,6 +990,13 @@ fn rao_publication_objects_regenerate_byte_exactly() {
         E2_HPKE_RNG_SEED,
     );
     assert_eq!(e2_first, e2_second, "RAO-TV-E2 regenerates byte-exactly");
+    let e2_inspect = inspect_bytes(&e2_first).expect("RAO 2.0 E2 envelope inspects");
+    assert_eq!(
+        e2_inspect.header.wrap_suite, RAO_WRAP_SUITE_XWING,
+        "current format integration emits only the X-Wing discriminator"
+    );
+    let (e2_opened, _) = open_to_vec(&e2_first, &e2_primary).expect("RAO 2.0 E2 envelope opens");
+    assert_eq!(e2_opened, p1_plaintext);
 
     let d1_plaintext = build_d1_plaintext();
     let (d1_primary, d1_recipients) = d1_recipient_pair();
@@ -1073,7 +1078,10 @@ fn rao_publication_objects_regenerate_byte_exactly() {
         matches!(wrong_finality, RaoAeadError::AeadAuthenticationFailed),
         "expected AeadAuthenticationFailed, got {wrong_finality:?}"
     );
+}
 
+#[test]
+fn rao_publication_increment_objects_regenerate_byte_exactly() {
     let increment_exports: Vec<(&str, Vec<u8>)> = publication_increment_vectors()
         .into_iter()
         .map(|(filename, options, entries)| {
@@ -1087,135 +1095,58 @@ fn rao_publication_objects_regenerate_byte_exactly() {
     if let Some(directory) = std::env::var_os("RAO_VECTOR_EXPORT_DIR") {
         let directory = PathBuf::from(directory);
         fs::create_dir_all(&directory).unwrap();
-        fs::write(directory.join("rao-tv-e2.rao"), &e2_first).unwrap();
-        fs::write(directory.join("rao-tv-d1-encrypted.rao"), &d1_first).unwrap();
         for (filename, bytes) in &increment_exports {
             fs::write(directory.join(filename), bytes).unwrap();
         }
     }
+}
 
+fn assert_retired_rao1_envelope(filename: &str, expected: &Value) {
+    let bytes = fs::read(fixture_object_path(filename)).expect("retired RAO 1.0 fixture exists");
+    assert_eq!(bytes.len() as u64, u64_field(expected, "stored_size_bytes"));
+    assert_eq!(sha256_hex(&bytes), str_field(expected, "stored_digest"));
     assert_eq!(
-        fs::read(fixture_object_path("rao-tv-e2.rao")).unwrap(),
-        e2_first,
-        "RAO-TV-E2 pinned object"
+        hex(&bytes[..128]),
+        str_field(expected, "header_hex"),
+        "{filename}: historical header remains pinned"
     );
     assert_eq!(
-        fs::read(fixture_object_path("rao-tv-d1-encrypted.rao")).unwrap(),
-        d1_first,
-        "RAO-TV-D1 pinned encrypted object"
+        bytes[0x38], 0x01,
+        "{filename}: fixture is the retired X25519-only representation"
     );
+    assert_eq!(
+        u32::from_be_bytes(bytes[0x3c..0x40].try_into().unwrap()) as u64,
+        u64_field(expected, "key_frame_len")
+    );
+    assert!(matches!(
+        inspect_bytes(&bytes),
+        Err(RaoAeadError::InvalidWrapSuite)
+    ));
+}
 
-    assert_eq!(str_field(e2_inputs, "plaintext_vector"), "RAO-TV-P1");
-    assert_eq!(str_field(e2_inputs, "deterministic_dek"), hex(&E2_DEK));
-    assert_eq!(
-        str_field(e2_inputs, "deterministic_hpke_rng_seed"),
-        hex(&E2_HPKE_RNG_SEED)
-    );
-    let recipients = field(e2_inputs, "recipients");
-    for (index, recipient) in e2_recipients.iter().enumerate() {
-        let expected = item(recipients, index);
-        assert_eq!(
-            u64::from(recipient.slot_index),
-            u64_field(expected, "slot_index")
-        );
-        assert_eq!(
-            hex(&recipient.recipient_epoch_id),
-            str_field(expected, "recipient_epoch_id")
-        );
-        assert_eq!(recipient.epoch_label, str_field(expected, "epoch_label"));
-        assert_eq!(
-            hex(&recipient.public_key),
-            str_field(expected, "public_key")
-        );
-    }
+#[test]
+fn retired_rao1_x25519_envelopes_remain_pinned_and_are_rejected() {
+    let e2 = fixture(include_str!("../../../fixtures/rao/rao-tv-e2.json"));
+    assert_eq!(str_field(&e2, "status"), "historical-rao1-retired");
+    assert_retired_rao1_envelope("rao-tv-e2.rao", field(&e2, "expected"));
 
-    let inspect = inspect_bytes(&e2_first).unwrap();
-    let (opened, open) = open_to_vec(&e2_first, &e2_primary).unwrap();
-    assert_eq!(opened, p1_plaintext);
-    let header_bytes = open.header.serialize().unwrap();
-    let key_frame_bytes = open.key_frame.serialize().unwrap();
-    let header_hash = open
-        .header
-        .header_hash_with_key_frame(&key_frame_bytes)
-        .unwrap();
-    let keys = derive_keys(&E2_DEK, &open.header.hkdf_salt, &header_hash).unwrap();
-    let metadata_plaintext = open.metadata.to_cbor_bytes(open.header.chunk_size).unwrap();
-    let metadata_start = 128usize + key_frame_bytes.len();
-    let metadata_end = metadata_start + open.header.metadata_frame_len as usize;
-    let footer_offset = inspect.footer_offset as usize;
-
+    let d1 = fixture(include_str!("../../../fixtures/rao/rao-tv-d1.json"));
     assert_eq!(
-        inspect.plaintext_size,
-        u64_field(e2_expected, "plaintext_size")
+        str_field(&d1, "encrypted_status"),
+        "historical-rao1-retired"
     );
-    assert_eq!(inspect.chunk_count, u64_field(e2_expected, "chunk_count"));
-    assert_eq!(
-        metadata_plaintext.len() as u64,
-        u64_field(e2_expected, "metadata_plaintext_len")
-    );
-    assert_eq!(
-        hex(&metadata_plaintext),
-        str_field(e2_expected, "metadata_plaintext_hex")
-    );
-    assert_eq!(
-        key_frame_bytes.len() as u64,
-        u64_field(e2_expected, "key_frame_len")
-    );
-    assert_eq!(
-        hex(&key_frame_bytes),
-        str_field(e2_expected, "key_frame_hex")
-    );
-    assert_eq!(hex(&header_bytes), str_field(e2_expected, "header_hex"));
-    assert_eq!(hex(&header_hash), str_field(e2_expected, "header_hash"));
-    assert_eq!(
-        hex(&open.header.hkdf_salt),
-        str_field(e2_expected, "hkdf_salt")
-    );
-    assert_eq!(
-        hex(&keys.object_secret),
-        str_field(e2_expected, "object_secret")
-    );
-    assert_eq!(
-        hex(&keys.metadata_key),
-        str_field(e2_expected, "metadata_key")
-    );
-    assert_eq!(
-        hex(&keys.payload_key),
-        str_field(e2_expected, "payload_key")
-    );
-    assert_eq!(
-        hex(&e2_first[metadata_start..metadata_end]),
-        str_field(e2_expected, "metadata_frame_hex")
-    );
-    assert_eq!(
-        sha256_hex(&e2_first[metadata_end..footer_offset]),
-        str_field(e2_expected, "payload_frame_sha256")
-    );
-    assert_eq!(
-        inspect.footer_offset,
-        u64_field(e2_expected, "footer_offset")
-    );
-    assert_eq!(
-        inspect.stored_size_bytes,
-        u64_field(e2_expected, "stored_size_bytes")
-    );
-    assert_eq!(
-        hex(&inspect.stored_digest),
-        str_field(e2_expected, "stored_digest")
-    );
-    assert_eq!(
-        hex(&open.metadata.plaintext_digest),
-        str_field(e2_expected, "plaintext_digest")
+    assert_retired_rao1_envelope(
+        "rao-tv-d1-encrypted.rao",
+        field(field(&d1, "expected"), "encrypted"),
     );
 }
 
 #[test]
-fn rao_tv_d1_matches_fixture_manifest() {
+fn rao_tv_d1_plaintext_matches_fixture_manifest() {
     let fixture = fixture(include_str!("../../../fixtures/rao/rao-tv-d1.json"));
     let inputs = field(&fixture, "inputs");
     let expected = field(&fixture, "expected");
     let plaintext = field(expected, "plaintext");
-    let encrypted = field(expected, "encrypted");
     let payload: Vec<u8> = (0..262145).map(|i| (i % 256) as u8).collect();
     let files = [RemTarFile {
         path: "v.bin",
@@ -1241,13 +1172,6 @@ fn rao_tv_d1_matches_fixture_manifest() {
         options.manifest_file_id.as_str(),
         str_field(inputs, "manifest_file_id")
     );
-    assert_eq!(str_field(inputs, "recipient_mode"), "hpke-x25519");
-    assert_eq!(str_field(inputs, "deterministic_dek"), hex(&D1_DEK));
-    assert_eq!(
-        str_field(inputs, "deterministic_hpke_rng_seed"),
-        hex(&D1_HPKE_RNG_SEED)
-    );
-
     assert_eq!(
         sha256_hex(&payload),
         str_field(field(plaintext, "file_payload"), "sha256")
@@ -1285,109 +1209,6 @@ fn rao_tv_d1_matches_fixture_manifest() {
     );
     assert_layout(&layout.files[0], field(plaintext, "file_layout"));
     assert_manifest_layout(&layout.manifest, field(plaintext, "manifest_layout"));
-
-    let (primary, recipients) = d1_recipient_pair();
-    let mut plaintext_digest = [0u8; 32];
-    plaintext_digest.copy_from_slice(&Sha256::digest(&bytes));
-    let envelope_options = EnvelopeSealOptions {
-        allow_single_recipient: false,
-        common: SealOptions {
-            chunk_size: options.chunk_size as u32,
-            object_id: options.object_id.clone(),
-            plaintext_size: bytes.len() as u64,
-            plaintext_digest,
-        },
-        recipients,
-    };
-    let mut encrypted_bytes = Vec::new();
-    let report = seal_deterministic_for_test_vectors(
-        Cursor::new(&bytes),
-        &mut encrypted_bytes,
-        &envelope_options,
-        DataEncryptionKey::from_bytes(D1_DEK),
-        D1_HPKE_RNG_SEED,
-    )
-    .unwrap();
-    let inspect = inspect_bytes(&encrypted_bytes).unwrap();
-    let (opened, open) = open_to_vec(&encrypted_bytes, &primary).unwrap();
-    assert_eq!(opened, bytes);
-    let header_bytes = open.header.serialize().unwrap();
-    let key_frame_bytes = open.key_frame.serialize().unwrap();
-    let header_hash = open
-        .header
-        .header_hash_with_key_frame(&key_frame_bytes)
-        .unwrap();
-    let keys = derive_keys(&D1_DEK, &open.header.hkdf_salt, &header_hash).unwrap();
-    let metadata_start = 128usize + key_frame_bytes.len();
-    let metadata_end = metadata_start + open.header.metadata_frame_len as usize;
-    let footer_offset = inspect.footer_offset as usize;
-
-    assert_eq!(
-        inspect.plaintext_size,
-        u64_field(encrypted, "plaintext_size")
-    );
-    assert_eq!(inspect.chunk_count, u64_field(encrypted, "chunk_count"));
-    assert_eq!(
-        report.metadata_plaintext_len,
-        u64_field(encrypted, "metadata_plaintext_len")
-    );
-    assert_eq!(
-        report.metadata_frame_len,
-        u64_field(encrypted, "metadata_frame_len")
-    );
-    assert_eq!(
-        metadata_end as u64,
-        u64_field(encrypted, "payload_frame_start")
-    );
-    assert_eq!(
-        footer_offset as u64 - 1,
-        u64_field(encrypted, "payload_frame_end_inclusive")
-    );
-    assert_eq!(inspect.footer_offset, u64_field(encrypted, "footer_offset"));
-    assert_eq!(
-        inspect.stored_size_bytes,
-        u64_field(encrypted, "stored_size_bytes")
-    );
-    assert_eq!(
-        report.stored_size_blocks,
-        u64_field(encrypted, "stored_size_blocks")
-    );
-    assert_eq!(
-        key_frame_bytes.len() as u64,
-        u64_field(encrypted, "key_frame_len")
-    );
-    assert_eq!(
-        hex(&open.header.hkdf_salt),
-        str_field(encrypted, "hkdf_salt")
-    );
-    assert_eq!(hex(&header_bytes), str_field(encrypted, "header_hex"));
-    assert_eq!(hex(&key_frame_bytes), str_field(encrypted, "key_frame_hex"));
-    assert_eq!(hex(&header_hash), str_field(encrypted, "header_hash"));
-    assert_eq!(
-        hex(&keys.metadata_key),
-        str_field(encrypted, "metadata_key")
-    );
-    assert_eq!(hex(&keys.payload_key), str_field(encrypted, "payload_key"));
-    assert_eq!(
-        hex(&encrypted_bytes[metadata_start..metadata_end]),
-        str_field(encrypted, "metadata_frame_hex")
-    );
-    assert_eq!(
-        sha256_hex(&encrypted_bytes[metadata_end..footer_offset]),
-        str_field(encrypted, "payload_frame_sha256")
-    );
-    assert_eq!(
-        hex(&inspect.stored_digest),
-        str_field(encrypted, "stored_digest")
-    );
-    assert_eq!(
-        hex(&open.metadata.plaintext_digest),
-        str_field(encrypted, "plaintext_digest")
-    );
-    assert_eq!(
-        str_field(plaintext, "stored_digest"),
-        str_field(encrypted, "plaintext_digest")
-    );
 }
 
 #[test]

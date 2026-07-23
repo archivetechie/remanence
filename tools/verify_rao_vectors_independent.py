@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Independently re-derive and open the RAO positive publication vectors.
+"""Independently re-derive and open the historical RAO 1.0 publication vectors.
 
 This verifier deliberately avoids the Remanence Rust crates. It rebuilds the
 RAO-TV-P1 and RAO-TV-D1 plaintext tar streams, the additional positive
 plaintext vectors, and deterministic manifest CBOR. It independently opens
-the pinned RAO-TV-E2 and encrypted RAO-TV-D1 objects with generic X25519,
-HKDF-SHA-256, and ChaCha20-Poly1305 primitives, then verifies the recovered
-canonical bytes, plaintext digest, manifest, and per-file digests.
+the retired, immutable RAO-TV-E2 and encrypted RAO-TV-D1 objects with generic
+X25519, HKDF-SHA-256, and ChaCha20-Poly1305 primitives, then verifies the
+recovered canonical bytes, plaintext digest, manifest, and per-file digests.
+This archival verifier is not the RAO 2.0 Reader; the current Rust Reader
+rejects these objects because their wrap-suite discriminator is reserved.
 
 With --check-plaintext-interop it also exercises the Section 14 plaintext
 interop gate for the positive plaintext vectors using GNU tar, bsdtar, and

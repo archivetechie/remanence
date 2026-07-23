@@ -148,7 +148,7 @@ fn worst_case_bootstrap_object_row(
             stored_block_count,
             (1u8..=8).map(|byte| [byte; 16]).collect(),
             OBJECT_ROW_METADATA_FRAME_MAX_LEN,
-            4096,
+            16_384,
         )
         .with_object_id([0xFF; 64])),
     }

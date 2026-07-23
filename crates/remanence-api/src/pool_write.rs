@@ -17,7 +17,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use remanence_aead::{RecipientPublicKey, SealReport};
+use remanence_aead::{RecipientPublicKey, SealReport, RAO_KEY_FRAME_MAX_LEN};
 use remanence_format::{
     write_encrypted_rao_object_from_readers, write_rem_tar_object_from_readers, RemTarFileLayout,
     RemTarFileSpec, RemTarFileStream, RemTarObjectOptions, FORMAT_ID,
@@ -4425,7 +4425,8 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
                         remanence_state::CheckpointBootstrapObjectRepresentation::Encrypted {
                             recipient_epoch_ids: (1u8..=8).map(|byte| [byte; 16]).collect(),
                             metadata_frame_len: OBJECT_ROW_METADATA_FRAME_MAX_LEN,
-                            key_frame_len: 4096,
+                            key_frame_len: u32::try_from(RAO_KEY_FRAME_MAX_LEN)
+                                .expect("RAO key-frame maximum fits u32"),
                         },
                 });
             }
