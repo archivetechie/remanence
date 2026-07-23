@@ -1,15 +1,21 @@
 //! Canonical RAO wrapped-DEK key-frame codec.
 
 use crate::error::{RaoAeadError, Result};
+use crate::xwing::XWING_CIPHERTEXT_LEN;
 
-/// Maximum key-frame size accepted from an object.
+/// Stage-1b envelope maximum retained until stage 1c raises the header and
+/// parser bound for eight X-Wing slots.
 pub const RAO_KEY_FRAME_MAX_LEN: usize = 4096;
-/// Smallest possible one-slot key frame (with an empty label).
+/// Stage-1b envelope minimum retained until stage 1c updates the header bound.
+///
+/// The X-Wing slot parser still requires its complete fixed-width `enc`, so an
+/// undersized frame cannot parse successfully.
 pub const RAO_KEY_FRAME_MIN_LEN: usize = 5 + 1 + 16 + 1 + 32 + 48;
 /// Maximum number of recipient slots in a key frame.
 pub const RAO_KEY_FRAME_MAX_SLOTS: usize = 8;
 
 const MAGIC: &[u8; 4] = b"RAOK";
+const RECIPIENT_SLOT_FIXED_LEN: usize = 1 + 16 + 1 + XWING_CIPHERTEXT_LEN + 48;
 
 /// One recipient's HPKE-wrapped data-encryption key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,8 +26,8 @@ pub struct RecipientSlot {
     pub recipient_epoch_id: [u8; 16],
     /// Printable-ASCII label used during recovery ceremonies.
     pub epoch_label: String,
-    /// RFC 9180 X25519 encapsulated public key.
-    pub enc: [u8; 32],
+    /// RFC 9180 X-Wing encapsulated key.
+    pub enc: [u8; XWING_CIPHERTEXT_LEN],
     /// Wrapped 32-byte DEK plus a 16-byte AEAD tag.
     pub ciphertext: [u8; 48],
 }
@@ -70,7 +76,7 @@ impl KeyFrame {
             let epoch_label = std::str::from_utf8(label)
                 .map_err(|_| RaoAeadError::InvalidKeyFrame)?
                 .to_owned();
-            let enc = take(bytes, &mut cursor, 32)?
+            let enc = take(bytes, &mut cursor, XWING_CIPHERTEXT_LEN)?
                 .try_into()
                 .map_err(|_| RaoAeadError::InvalidKeyFrame)?;
             let ciphertext = take(bytes, &mut cursor, 48)?
@@ -96,7 +102,7 @@ impl KeyFrame {
         let capacity = 5 + self
             .slots
             .iter()
-            .map(|slot| 98 + slot.epoch_label.len())
+            .map(|slot| RECIPIENT_SLOT_FIXED_LEN + slot.epoch_label.len())
             .sum::<usize>();
         if capacity > RAO_KEY_FRAME_MAX_LEN {
             return Err(RaoAeadError::InvalidKeyFrameLength);
@@ -160,7 +166,7 @@ mod tests {
             slot_index: index,
             recipient_epoch_id: [index; 16],
             epoch_label: label.to_owned(),
-            enc: [index.wrapping_add(1); 32],
+            enc: [index.wrapping_add(1); XWING_CIPHERTEXT_LEN],
             ciphertext: [index.wrapping_add(2); 48],
         }
     }
@@ -169,6 +175,10 @@ mod tests {
     fn byte_exact_round_trip() {
         let frame = KeyFrame::new(vec![slot(0, "safe-2026"), slot(7, "escrow")]).unwrap();
         let bytes = frame.serialize().unwrap();
+        assert_eq!(
+            bytes.len(),
+            5 + 2 * RECIPIENT_SLOT_FIXED_LEN + "safe-2026".len() + "escrow".len()
+        );
         assert_eq!(&bytes[..5], b"RAOK\x02");
         assert_eq!(bytes[5], 0);
         assert_eq!(bytes[22], 9);

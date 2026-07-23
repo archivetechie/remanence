@@ -9,6 +9,7 @@ use remanence_aead::{
     derive_keys, derive_salt, inspect_bytes, open_to_vec, seal_deterministic_for_test_vectors,
     seal_to_vec, DataEncryptionKey, EnvelopeSealOptions, KeyFrame, RaoAeadError, RaoHeader,
     RaoMetadata, RecipientPrivateKey, RecipientPublicKey, RecipientSlot, SealOptions, RAO_FOOTER,
+    XWING_CIPHERTEXT_LEN,
 };
 use remanence_format::{
     plan_rem_tar_object, read_encrypted_rao_object, read_rem_tar_object, stream_rem_tar_object,
@@ -1624,7 +1625,7 @@ fn recipient_slot(index: u8, label: &str) -> RecipientSlot {
         slot_index: index,
         recipient_epoch_id: [index.wrapping_add(1); 16],
         epoch_label: label.to_string(),
-        enc: [index.wrapping_add(2); 32],
+        enc: [index.wrapping_add(2); XWING_CIPHERTEXT_LEN],
         ciphertext: [index.wrapping_add(3); 48],
     }
 }
