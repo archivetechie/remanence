@@ -503,14 +503,16 @@ tape and role — not authentication (Section 16.1).
 
 ### 5.3. Deterministic CBOR
 
-All CBOR [RFC8949] payloads in this format are single definite-length,
+All CBOR frame payloads in this format are single definite-length,
 integer-keyed maps in RFC 8949 deterministic encoding: shortest-form
 integers and lengths, map keys sorted in ascending order of their
 deterministic encodings, no duplicate keys, no tags, no floats, no
-indefinite-length items. The single map MUST occupy its entire declared
-payload extent (for the bootstrap, `cbor_payload_len`, Section 8.1); bytes
-after the map's definite-length encoding, within the declared payload, are a
-nonconformity. Decoders MUST reject duplicate keys and
+indefinite-length items. The Section 7.3 canonical-digest preimage is not a
+frame payload or a map: it applies these canonical-encoding rules to its
+specified array-of-arrays structure. Each payload map MUST occupy its entire
+declared payload extent (for the bootstrap, `cbor_payload_len`, Section 8.1);
+bytes after the map's definite-length encoding, within the declared payload,
+are a nonconformity. Decoders MUST reject duplicate keys and
 non-canonical encoding, and MUST ignore unknown integer keys at every map
 level — that is the format's 1.x extension mechanism: future minor revisions
 add keys; they never change the meaning of existing ones (a change that
@@ -664,8 +666,9 @@ W = max(protected_ordinal_end_exclusive)         over sidecar entries   (0 if no
 ### 7.3. The Canonical Digest
 
 The canonical digest is SHA-256 over the deterministic CBOR encoding
-(Section 5.3 rules, applied to arrays) of an array of per-entry 7-element
-arrays, ascending by tape file number:
+(Section 5.3 canonical-encoding rules, applied to this array structure rather
+than to an integer-keyed map) of an array of per-entry 7-element arrays,
+ascending by tape file number:
 
 ```text
 [tape_file_number, kind_code, block_count,
@@ -1444,6 +1447,11 @@ structural damage; EOD at a file start ends the walk.
    field for field. Classification MAY fall back to footer fields alone if
    the tail copy is unreadable.
 5. **Object, by elimination** — never by reading object content.
+
+In items 2 through 4, a count-mismatch “hard error” is scoped to that rung and
+that tape file's classification: the Scanner reports the failed
+classification and continues the walk with the next tape file. It MUST NOT
+abort the whole walk for that mismatch.
 
 **Unreadable head block:** the Scanner MUST NOT abort. It MUST measure the
 file by filemark spacing, run the footer/tail sidecar probe, and otherwise
