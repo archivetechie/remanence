@@ -1,0 +1,7 @@
+# Independent RAO vector verifier only; never used by Remanence runtime code.
+#
+# kyber-py is pinned because the verifier deliberately uses its deterministic
+# FIPS 203 internal entry points. cryptography supplies stable X25519 and
+# ChaCha20-Poly1305 primitives; version 41 is the oldest locally exercised API.
+cryptography>=41
+kyber-py==1.2.0

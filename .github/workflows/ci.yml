@@ -31,7 +31,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libarchive-tools attr
 
       - name: Install Python verifier dependencies
-        run: python3 -m pip install cryptography
+        run: python3 -m pip install -r tools/requirements-rao-independent.txt
 
       - name: Check formatting
         run: cargo fmt --all --check

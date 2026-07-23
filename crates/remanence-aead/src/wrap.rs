@@ -768,6 +768,8 @@ mod tests {
         let expected_enc = wrap_kat_field("enc");
         assert_eq!(expected_enc.len(), XWING_CIPHERTEXT_LEN);
         assert_eq!(slot.enc.as_slice(), expected_enc);
+        let shared_secret = xwing::decapsulate(&XWingSeed::from_bytes(seed), &slot.enc).unwrap();
+        assert_eq!(shared_secret.as_slice(), wrap_kat_field("ss"));
         let expected_ciphertext = wrap_kat_field("ciphertext");
         assert_eq!(expected_ciphertext.len(), 48);
         assert_eq!(slot.ciphertext.as_slice(), expected_ciphertext);
