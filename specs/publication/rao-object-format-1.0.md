@@ -4,7 +4,7 @@
 | --- | --- |
 | Status | Publication specification |
 | Version | 1.0 |
-| Date | 2026-07-22 (v1.2.0 freeze increment) |
+| Date | 2026-07-23 (v1.3.0 hardening increment) |
 | License | CC-BY-4.0 |
 | Concept DOI (all versions) | [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126) |
 | Version DOI (this release) | assigned at release (the concept DOI above always resolves to the latest version) |

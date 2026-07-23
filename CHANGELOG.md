@@ -4,6 +4,56 @@ Notable changes to Remanence and its published formats. The format
 specifications carry their own revision histories; entries here are
 per-release summaries.
 
+## v1.3.0 — 2026-07-23
+
+Post-publication hardening from two independent, grounded technical reviews that
+found REM-PARITY not yet freeze-ready. Archived: DOI (pending)
+(concept DOI [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126)).
+
+- **License (adoption):** the project is relicensed from AGPL-3.0-or-later to a
+  permissive split — **Apache-2.0** for the Rust reference implementation
+  (`crates/`), **CC-BY-4.0** for the specification prose (`specs/`), and
+  **CC0-1.0** for the conformance vectors (`fixtures/` and the vector archive) so
+  independent implementers may vendor the vectors and quote the specs freely.
+- **REM-PARITY — breaking layout fix (this spec remains `Draft for review`; the
+  change is pre-freeze and pre-production, so no field tapes are affected).**
+  Sidecar parity is now stored **parity-index-major** (§9.1), carrying the data
+  interleave into the parity region so the contiguous-damage guarantee holds
+  **across the data→sidecar boundary** — the prior stripe-major layout let a
+  ~130 MiB boundary-straddling burst defeat a stripe. The guarantee is restated
+  honestly (boundary-crossing included; a short final/checkpoint epoch with
+  `R < S` reduces to `≈ (m−1)·S`), and §17 gains boundary-straddling and
+  short-epoch damage vectors.
+- **REM-PARITY — recovery robustness.** The final full-scope directory must now
+  be written as two physically-separated external `parity_map` copies with a
+  minimum separation, closing an inline-final-bootstrap single point of failure;
+  corrupt-but-parseable copies fall through to the next copy in selection. The
+  `SidecarEpochDirectory` gains normative `[0, W)` partition / `W ≤ T` /
+  consecutive-epoch invariants (`DirectoryInvalid`). Resumer ordering is
+  corrected (position and verify before any write; an incomplete open epoch emits
+  no sidecar). The address space is renamed to logical LBA with its
+  block-to-media rationale; a test-geometry block-size carve-out is stated.
+- **RAO — cross-spec and errata (non-breaking).** `object_id` is reconciled to
+  1–64 bytes across representations and carried verbatim by the parity binding.
+  The recipient policy relaxes from a mandatory two-slot minimum to a
+  single-key-loss **survivability** requirement (two independent recipients *or*
+  redundant custody such as a Shamir split); the reference sealer defaults to ≥2
+  and requires an explicit opt-in for a single slot. Partial-range integrity is
+  scoped by representation and backend (tape parity CRC / any-backend AEAD /
+  none for off-parity plaintext). The §13.5 HPKE component vector is made
+  independently reproducible (recipient key + DeriveKeyPair semantics). A native
+  restore-destination preflight rejects traversal/absolute/UNC paths and
+  case-fold/Unicode collisions in a single restore pass. A post-quantum
+  confidentiality limitation and the operational reality of resealing are
+  documented. DOI roles are labelled correctly (concept vs version).
+- Publication test vectors regenerated (archive SHA
+  `fa8570d31d3869155c9a2b4322b0846a5f5b2eb845d08c89ab4a78bcbb5e668f`,
+  superseding `f4e4331c…`): RAO object streams byte-identical; REM-PARITY
+  sidecars are the exact stripe-major→parity-index-major permutation with their
+  metadata, index, footer, and directory hashes unchanged; new metadata,
+  directory-invalid, object-id, and damage vectors — independently re-derived by
+  a second implementation.
+
 ## v1.2.0 — 2026-07-22
 
 Metadata-preservation model, extension mechanism, and catalog-less recovery
