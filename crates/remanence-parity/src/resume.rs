@@ -22,8 +22,8 @@ use crate::raw::{
     PhysicalPositionHint, RawReadOutcome, RawTapeSink, RawTapeSource, RawWriteOutcome,
 };
 use crate::sidecar::{
-    data_shard_crc64, encode_sidecar_tape_file, parse_sidecar_tape_file, EncodedSidecarTapeFile,
-    SidecarDescriptor,
+    data_shard_crc64, encode_sidecar_tape_file, parity_block_position, parse_sidecar_tape_file,
+    EncodedSidecarTapeFile, SidecarDescriptor,
 };
 use crate::sink::SidecarTapeFile;
 
@@ -1131,17 +1131,26 @@ fn validate_encoded_sidecar_before_write(
             "resume sidecar {tape_file_number} encoded sidecar metadata does not match its block bytes"
         )));
     }
-    let h = usize::try_from(encoded.header.shard_index_block_count)
-        .map_err(|_| resume_error("resume sidecar index block count overflows usize"))?;
-    let p = usize::try_from(encoded.header.parity_block_count)
-        .map_err(|_| resume_error("resume sidecar parity block count overflows usize"))?;
-    let parity_end = h
-        .checked_add(p)
-        .ok_or_else(|| resume_error("resume sidecar parity block range overflows"))?;
-    if decoded.parity_shards.as_slice() != &encoded.blocks[h..parity_end] {
-        return Err(resume_error(format!(
-            "resume sidecar {tape_file_number} decoded parity shards do not match encoded block bytes"
-        )));
+    for (entry, decoded_shard) in decoded
+        .index
+        .parity_entries
+        .iter()
+        .zip(&decoded.parity_shards)
+    {
+        let block_position = usize::try_from(parity_block_position(
+            entry.stripe_index,
+            entry.parity_index,
+            encoded.header.stripes_per_epoch,
+            encoded.header.m,
+            encoded.header.shard_index_block_count,
+        ))
+        .map_err(|_| resume_error("resume sidecar parity block position overflows usize"))?;
+        if decoded_shard != &encoded.blocks[block_position] {
+            return Err(resume_error(format!(
+                "resume sidecar {tape_file_number} decoded parity shard ({}, {}) does not match its encoded block",
+                entry.stripe_index, entry.parity_index
+            )));
+        }
     }
     if encoded.header.epoch_id != rebuilt.plan.epoch_id
         || encoded.header.protected_ordinal_start != rebuilt.plan.protected_ordinal_start

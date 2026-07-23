@@ -5596,18 +5596,17 @@ fn validate_checkpoint_record_bundle_shape(
             }
         }
         prior_total_committed_ordinals = Some(projection.total_committed_ordinals);
-        let parsed_object_id =
-            Uuid::parse_str(projection.object.object_id.as_str()).map_err(|err| {
-                StateError::IndexCorrupt(format!(
-                    "checkpoint record tape={} ordinal={} has invalid object UUID {}: {err}",
-                    hex_uuid(record.tape_uuid),
-                    record.ordinal,
-                    projection.object.object_id
-                ))
-            })?;
+        Uuid::parse_str(projection.object.object_id.as_str()).map_err(|err| {
+            StateError::IndexCorrupt(format!(
+                "checkpoint record tape={} ordinal={} has invalid object UUID {}: {err}",
+                hex_uuid(record.tape_uuid),
+                record.ordinal,
+                projection.object.object_id
+            ))
+        })?;
         if projection.bootstrap_object_row.tape_file_number != projection.copy.tape_file_number
             || projection.bootstrap_object_row.stored_block_count != projection.block_count
-            || projection.bootstrap_object_row.object_id != *parsed_object_id.as_bytes()
+            || projection.bootstrap_object_row.object_id != projection.object.object_id.as_bytes()
         {
             return Err(checkpoint_projection_conflict(
                 record,
@@ -14170,7 +14169,7 @@ mod tests {
                 bootstrap_object_row: crate::checkpoint::CheckpointBootstrapObjectRow {
                     tape_file_number: 1,
                     stored_block_count: 3,
-                    object_id: *object_1.as_bytes(),
+                    object_id: object_1.to_string().into_bytes(),
                     representation:
                         crate::checkpoint::CheckpointBootstrapObjectRepresentation::Plaintext {
                             manifest_first_chunk_lba: 1,
@@ -14191,7 +14190,7 @@ mod tests {
                 bootstrap_object_row: crate::checkpoint::CheckpointBootstrapObjectRow {
                     tape_file_number: 2,
                     stored_block_count: 2,
-                    object_id: *object_2.as_bytes(),
+                    object_id: object_2.to_string().into_bytes(),
                     representation:
                         crate::checkpoint::CheckpointBootstrapObjectRepresentation::Plaintext {
                             manifest_first_chunk_lba: 1,
@@ -14313,7 +14312,7 @@ mod tests {
                 bootstrap_object_row: crate::checkpoint::CheckpointBootstrapObjectRow {
                     tape_file_number: 3,
                     stored_block_count: 2,
-                    object_id: *object_uuid.as_bytes(),
+                    object_id: object_uuid.to_string().into_bytes(),
                     representation:
                         crate::checkpoint::CheckpointBootstrapObjectRepresentation::Plaintext {
                             manifest_first_chunk_lba: 1,

@@ -108,13 +108,13 @@ pub use scan::{
 pub use sidecar::{
     classify_sidecar_header_block, crc64_xz, data_shard_crc64, derive_sidecar_footer_magic,
     derive_sidecar_magic, encode_sidecar_index_blocks, encode_sidecar_tape_file,
-    parity_shard_crc64, parse_sidecar_footer_block, parse_sidecar_header_block,
-    parse_sidecar_index_blocks, parse_sidecar_tape_file, DecodedSidecarIndex,
-    DecodedSidecarTapeFile, EncodedSidecarIndex, EncodedSidecarTapeFile, ParityShardIndexEntry,
-    SidecarCopyKind, SidecarDescriptor, SidecarFooter, SidecarHeader, SidecarIndex,
-    CRC64_XZ_CHECK_VALUE, DATA_CRC_ENTRY_LEN, PARITY_INDEX_ENTRY_LEN, SIDECAR_FOOTER_CRC_OFFSET,
-    SIDECAR_FOOTER_LEN, SIDECAR_FOOTER_VERSION, SIDECAR_HEADER_CRC_OFFSET, SIDECAR_HEADER_LEN,
-    SIDECAR_SCHEMA_VERSION,
+    parity_block_position, parity_shard_crc64, parse_sidecar_footer_block,
+    parse_sidecar_header_block, parse_sidecar_index_blocks, parse_sidecar_tape_file,
+    DecodedSidecarIndex, DecodedSidecarTapeFile, EncodedSidecarIndex, EncodedSidecarTapeFile,
+    ParityShardIndexEntry, SidecarCopyKind, SidecarDescriptor, SidecarFooter, SidecarHeader,
+    SidecarIndex, CRC64_XZ_CHECK_VALUE, DATA_CRC_ENTRY_LEN, PARITY_INDEX_ENTRY_LEN,
+    SIDECAR_FOOTER_CRC_OFFSET, SIDECAR_FOOTER_LEN, SIDECAR_FOOTER_VERSION,
+    SIDECAR_HEADER_CRC_OFFSET, SIDECAR_HEADER_LEN, SIDECAR_SCHEMA_VERSION,
 };
 pub use sink::{
     BootstrapObjectRowAdmission, BootstrapPlacementPolicy, CheckpointResult, CloseReason,

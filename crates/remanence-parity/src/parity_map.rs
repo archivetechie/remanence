@@ -94,55 +94,67 @@ impl SidecarEpochDirectory {
     pub fn validate(&self) -> Result<(), ParityError> {
         if self.directory_scope_highest_protected_ordinal > self.directory_scope_total_data_ordinals
         {
-            return Err(parity_map_parse(
+            return Err(directory_invalid(
                 "directory highest protected ordinal exceeds total data ordinals",
             ));
         }
 
         let mut previous_tape_file_number = None;
-        let mut highest = 0u64;
-        for entry in &self.entries {
+        let mut expected_protected_ordinal_start = 0u64;
+        for (expected_epoch_id, entry) in (0u64..).zip(&self.entries) {
             if entry.tape_file_number >= self.directory_scope_tape_file_count {
-                return Err(parity_map_parse(format!(
+                return Err(directory_invalid(format!(
                     "directory sidecar tape file {} lies outside scope {}",
                     entry.tape_file_number, self.directory_scope_tape_file_count
                 )));
             }
             if previous_tape_file_number.is_some_and(|previous| entry.tape_file_number <= previous)
             {
-                return Err(parity_map_parse(
+                return Err(directory_invalid(
                     "directory sidecar entries must be in ascending tape-file order",
                 ));
             }
             if entry.protected_ordinal_end_exclusive <= entry.protected_ordinal_start {
-                return Err(parity_map_parse(format!(
+                return Err(directory_invalid(format!(
                     "directory sidecar {} has an empty protected range",
                     entry.tape_file_number
+                )));
+            }
+            if entry.protected_ordinal_start != expected_protected_ordinal_start {
+                return Err(directory_invalid(format!(
+                    "directory sidecar {} protected range starts at {}, expected contiguous start {expected_protected_ordinal_start}",
+                    entry.tape_file_number, entry.protected_ordinal_start
+                )));
+            }
+            if entry.epoch_id != expected_epoch_id {
+                return Err(directory_invalid(format!(
+                    "directory sidecar {} has epoch_id {}, expected {expected_epoch_id}",
+                    entry.tape_file_number, entry.epoch_id
                 )));
             }
             if entry.sidecar_total_block_count == 0
                 || entry.sidecar_header_block_count == 0
                 || entry.parity_shard_block_count == 0
             {
-                return Err(parity_map_parse(format!(
+                return Err(directory_invalid(format!(
                     "directory sidecar {} has invalid block counts",
                     entry.tape_file_number
                 )));
             }
             if entry.flags & !KNOWN_DIRECTORY_FLAGS != 0 {
-                return Err(parity_map_parse(format!(
+                return Err(directory_invalid(format!(
                     "directory sidecar {} has unknown flags 0x{:08x}",
                     entry.tape_file_number,
                     entry.flags & !KNOWN_DIRECTORY_FLAGS
                 )));
             }
-            highest = highest.max(entry.protected_ordinal_end_exclusive);
+            expected_protected_ordinal_start = entry.protected_ordinal_end_exclusive;
             previous_tape_file_number = Some(entry.tape_file_number);
         }
 
-        if highest != self.directory_scope_highest_protected_ordinal {
-            return Err(parity_map_parse(format!(
-                "directory highest protected ordinal {} does not match sidecar entries {highest}",
+        if expected_protected_ordinal_start != self.directory_scope_highest_protected_ordinal {
+            return Err(directory_invalid(format!(
+                "directory highest protected ordinal {} does not match partition end {expected_protected_ordinal_start}",
                 self.directory_scope_highest_protected_ordinal
             )));
         }
@@ -1719,6 +1731,10 @@ fn parity_map_parse(message: impl Into<String>) -> ParityError {
     ParityError::ParityMapParse(message.into())
 }
 
+fn directory_invalid(message: impl Into<String>) -> ParityError {
+    ParityError::DirectoryInvalid(message.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1771,6 +1787,14 @@ mod tests {
             writer_version: Some("test-writer".to_string()),
             write_timestamp: Some("2026-05-23T10:00:00Z".to_string()),
         }
+    }
+
+    fn assert_directory_invalid(directory: &SidecarEpochDirectory) {
+        let err = directory.validate().expect_err("directory must be invalid");
+        assert!(
+            matches!(err, ParityError::DirectoryInvalid(_)),
+            "expected DirectoryInvalid, got {err:?}"
+        );
     }
 
     #[test]
@@ -1841,7 +1865,71 @@ mod tests {
         let err = directory.validate().unwrap_err();
 
         assert!(
-            matches!(err, ParityError::ParityMapParse(message) if message.contains("unknown flags"))
+            matches!(err, ParityError::DirectoryInvalid(message) if message.contains("unknown flags"))
         );
+    }
+
+    #[test]
+    fn directory_rejects_overlapping_protected_ranges() {
+        let mut directory = sample_directory();
+        directory.entries[1].protected_ordinal_start = 1;
+
+        assert_directory_invalid(&directory);
+    }
+
+    #[test]
+    fn directory_rejects_gap_between_protected_ranges() {
+        let mut directory = sample_directory();
+        directory.entries[1].protected_ordinal_start = 3;
+
+        assert_directory_invalid(&directory);
+    }
+
+    #[test]
+    fn directory_rejects_duplicate_epoch_id() {
+        let mut directory = sample_directory();
+        directory.entries[1].epoch_id = 0;
+
+        assert_directory_invalid(&directory);
+    }
+
+    #[test]
+    fn directory_rejects_nonzero_first_protected_start() {
+        let mut directory = sample_directory();
+        directory.entries[0].protected_ordinal_start = 1;
+
+        assert_directory_invalid(&directory);
+    }
+
+    #[test]
+    fn directory_rejects_epoch_ids_not_starting_at_zero() {
+        let mut directory = sample_directory();
+        directory.entries[0].epoch_id = 1;
+        directory.entries[1].epoch_id = 2;
+
+        assert_directory_invalid(&directory);
+    }
+
+    #[test]
+    fn directory_allows_unprotected_tail_after_partition_end() {
+        let mut directory = sample_directory();
+        directory.directory_scope_total_data_ordinals = 5;
+
+        directory
+            .validate()
+            .expect("[0, W) partition remains valid when W < T");
+    }
+
+    #[test]
+    fn empty_directory_requires_zero_highest_protected_ordinal() {
+        let mut directory = sample_directory();
+        directory.entries.clear();
+        directory.directory_scope_highest_protected_ordinal = 0;
+        directory
+            .validate()
+            .expect("empty [0, 0) partition is valid");
+
+        directory.directory_scope_highest_protected_ordinal = 1;
+        assert_directory_invalid(&directory);
     }
 }

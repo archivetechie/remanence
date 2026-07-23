@@ -1717,18 +1717,17 @@ mod object_source_tests {
             }
 
             for parity_index in 0..scheme.parity_blocks_per_stripe {
-                let parity_entry_index = usize::try_from(
-                    u64::from(stripe_index) * u64::from(scheme.parity_blocks_per_stripe)
-                        + u64::from(parity_index),
-                )
-                .expect("parity entry index fits usize");
                 let lba = scoped
                     .map
                     .physical_position(TapeFilePosition {
                         tape_file_number: 2,
-                        block_within_file: u64::from(sidecar_header_blocks)
-                            + u64::try_from(parity_entry_index)
-                                .expect("parity entry index fits u64"),
+                        block_within_file: crate::sidecar::parity_block_position(
+                            stripe_index,
+                            parity_index,
+                            scheme.stripes_per_neighborhood,
+                            scheme.parity_blocks_per_stripe,
+                            sidecar_header_blocks,
+                        ),
                     })
                     .expect("media-scale parity peer has a physical position")
                     .lba as usize;
@@ -2789,19 +2788,27 @@ mod object_source_tests {
         }
 
         let sidecar_header_blocks = sidecar.header.shard_index_block_count;
-        for parity_entry_index in 0..sidecar.index.parity_entries.len() {
+        for entry in &sidecar.index.parity_entries {
             let lba = scoped
                 .map
                 .physical_position(TapeFilePosition {
                     tape_file_number: 2,
-                    block_within_file: u64::from(sidecar_header_blocks) + parity_entry_index as u64,
+                    block_within_file: crate::sidecar::parity_block_position(
+                        entry.stripe_index,
+                        entry.parity_index,
+                        sidecar.header.stripes_per_epoch,
+                        sidecar.header.m,
+                        sidecar_header_blocks,
+                    ),
                 })
                 .expect("parity shard has a physical position")
                 .lba as usize;
             assert_eq!(
                 raw.read_lbas.iter().filter(|read| **read == lba).count(),
                 1,
-                "parity peer entry {parity_entry_index} must be read once"
+                "parity peer stripe {} index {} must be read once",
+                entry.stripe_index,
+                entry.parity_index
             );
         }
     }
