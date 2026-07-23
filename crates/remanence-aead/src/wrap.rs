@@ -22,7 +22,7 @@ use sha3::{
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::{RaoAeadError, Result};
-use crate::header::object_id_field;
+use crate::header::{object_id_field, RAO_WRAP_SUITE_XWING};
 use crate::key_frame::{KeyFrame, RecipientSlot};
 use crate::xwing::{
     self, XWingPublicKey, XWingSeed, XWING_CIPHERTEXT_LEN, XWING_PUBLIC_KEY_LEN, XWING_SEED_LEN,
@@ -44,9 +44,6 @@ pub const XWING_HPKE_KEM_ID: u16 = 0x647a;
 /// ChaCha20-Poly1305: `"HPKE" || 0x647a || 0x0001 || 0x0003`.
 pub const XWING_HPKE_SUITE_ID: &[u8; 10] = b"HPKE\x64\x7a\x00\x01\x00\x03";
 
-// Stage 1c moves this discriminator into the envelope header implementation.
-// Stage 1b uses it only in the unchanged-width HPKE info transcript.
-const WRAP_SUITE_XWING: u8 = 0x02;
 const RECIPIENT_PUBLIC_FILE_FIXED_LEN: usize = 4 + 1 + 16 + 1 + XWING_PUBLIC_KEY_LEN;
 const RECIPIENT_PRIVATE_FILE_FIXED_LEN: usize = 4 + 16 + 1 + XWING_SEED_LEN;
 
@@ -460,7 +457,7 @@ pub fn wrap_info(
     info[76..92].copy_from_slice(recipient_epoch_id);
     info[92] = slot_index;
     info[93] = 2;
-    info[94] = WRAP_SUITE_XWING;
+    info[94] = RAO_WRAP_SUITE_XWING;
     Ok(info)
 }
 
@@ -616,7 +613,7 @@ mod tests {
         assert_eq!(&info[12..15], b"obj");
         assert!(info[15..76].iter().all(|byte| *byte == 0));
         assert_eq!(&info[76..92], &[0x44; 16]);
-        assert_eq!(&info[92..], &[7, 2, WRAP_SUITE_XWING]);
+        assert_eq!(&info[92..], &[7, 2, RAO_WRAP_SUITE_XWING]);
     }
 
     #[test]

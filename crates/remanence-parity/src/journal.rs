@@ -1339,7 +1339,7 @@ mod tests {
                     let mut entry =
                         TapeFileEntry::from_map_entry(TapeFileMapEntry::object(0, 3, 0));
                     entry.bootstrap_object_row = Some(
-                        BootstrapObjectRow::encrypted(0, 3, vec![[0x24; 16], [0x25; 16]], 66, 207)
+                        BootstrapObjectRow::encrypted(0, 3, vec![[0x24; 16], [0x25; 16]], 66, 2377)
                             .with_object_id([0x44; 16]),
                     );
                     entry

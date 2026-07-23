@@ -62,8 +62,13 @@ def write_json(path: pathlib.Path, value: Any) -> None:
     )
 
 
-def generate_encrypted_objects(output: pathlib.Path) -> None:
-    """Regenerate the pinned encrypted objects through the Rust deterministic hook."""
+def stage_rao_objects(output: pathlib.Path) -> None:
+    """Copy retired RAO 1.0 pins and regenerate current plaintext increment objects."""
+    output.mkdir(parents=True)
+    pinned = ROOT / "fixtures" / "rao" / "objects"
+    for filename in RAO_ENCRYPTED_OBJECTS:
+        shutil.copyfile(pinned / filename, output / filename)
+
     environment = os.environ.copy()
     environment["RAO_VECTOR_EXPORT_DIR"] = str(output)
     subprocess.run(
@@ -75,7 +80,7 @@ def generate_encrypted_objects(output: pathlib.Path) -> None:
             "remanence-format",
             "--test",
             "rao_vectors",
-            "rao_publication_objects_regenerate_byte_exactly",
+            "rao_publication_increment_objects_regenerate_byte_exactly",
             "--",
             "--exact",
         ],
@@ -85,17 +90,17 @@ def generate_encrypted_objects(output: pathlib.Path) -> None:
     )
 
 
-def verify_encrypted_regeneration(first: pathlib.Path, second: pathlib.Path) -> None:
-    """Require two regenerations and the checked-in pins to be byte-identical."""
+def verify_staged_rao_objects(first: pathlib.Path, second: pathlib.Path) -> None:
+    """Require two staged trees to agree with each other and the archival pins."""
     pinned = ROOT / "fixtures" / "rao" / "objects"
     for filename in RAO_ENCRYPTED_OBJECTS:
         first_bytes = (first / filename).read_bytes()
         second_bytes = (second / filename).read_bytes()
         pinned_bytes = (pinned / filename).read_bytes()
         if first_bytes != second_bytes:
-            raise AssertionError(f"{filename} differs across deterministic regenerations")
+            raise AssertionError(f"{filename} differs across archival staging runs")
         if first_bytes != pinned_bytes:
-            raise AssertionError(f"{filename} differs from its checked-in pin")
+            raise AssertionError(f"{filename} differs from its retired RAO 1.0 pin")
     for filename in RAO_INCREMENT_OBJECTS:
         first_bytes = (first / filename).read_bytes()
         second_bytes = (second / filename).read_bytes()
@@ -1305,11 +1310,11 @@ def main(argv: list[str] | None = None) -> int:
             if source.is_file():
                 shutil.copyfile(source, rem_root / source.name)
 
-        encrypted_first = temporary_root / "rao-encrypted-first"
-        encrypted_second = temporary_root / "rao-encrypted-second"
-        generate_encrypted_objects(encrypted_first)
-        generate_encrypted_objects(encrypted_second)
-        verify_encrypted_regeneration(encrypted_first, encrypted_second)
+        rao_objects_first = temporary_root / "rao-objects-first"
+        rao_objects_second = temporary_root / "rao-objects-second"
+        stage_rao_objects(rao_objects_first)
+        stage_rao_objects(rao_objects_second)
+        verify_staged_rao_objects(rao_objects_first, rao_objects_second)
 
         subprocess.run(
             [
@@ -1318,16 +1323,16 @@ def main(argv: list[str] | None = None) -> int:
                 "--export-directory",
                 str(stage / "rao" / "objects"),
                 "--encrypted-object-directory",
-                str(encrypted_first),
+                str(rao_objects_first),
                 "--rust-object-directory",
-                str(encrypted_first),
+                str(rao_objects_first),
             ],
             cwd=ROOT,
             check=True,
         )
         for filename in RAO_INCREMENT_OBJECTS:
             shutil.copyfile(
-                encrypted_first / filename,
+                rao_objects_first / filename,
                 stage / "rao" / "objects" / filename,
             )
         subprocess.run(

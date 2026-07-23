@@ -9,7 +9,7 @@ use remanence_aead::{
     derive_keys, derive_salt, inspect_bytes, open_to_vec, seal_deterministic_for_test_vectors,
     seal_to_vec, DataEncryptionKey, EnvelopeSealOptions, KeyFrame, RaoAeadError, RaoHeader,
     RaoMetadata, RecipientPrivateKey, RecipientPublicKey, RecipientSlot, SealOptions, RAO_FOOTER,
-    XWING_CIPHERTEXT_LEN,
+    RAO_KEY_FRAME_MAX_LEN, RAO_KEY_FRAME_MIN_LEN, XWING_CIPHERTEXT_LEN,
 };
 use remanence_format::{
     plan_rem_tar_object, read_encrypted_rao_object, read_rem_tar_object, stream_rem_tar_object,
@@ -21,6 +21,8 @@ use remanence_format::{
 use remanence_library::{VecBlockSink, VecBlockSource};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+const RECIPIENT_SLOT_FIXED_LEN: usize = 1 + 16 + 1 + XWING_CIPHERTEXT_LEN + 48;
 
 fn fixture(json: &str) -> Value {
     serde_json::from_str(json).expect("negative fixture manifest is valid JSON")
@@ -1820,15 +1822,16 @@ fn run_key_frame_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
     match id {
         "version-flip" => object[6] = 1,
         "suite-flip" => object[0x38] = 0xff,
+        "legacy-x25519-wrap-suite" => object[0x38] = 0x01,
         "truncated-key-frame" => object.truncate(128 + key_frame_len - 1),
         "duplicate-slots" => {
             let frame = parsed_key_frame(&object);
-            let second_slot = 128 + 5 + 98 + frame.slots[0].epoch_label.len();
+            let second_slot = 128 + 5 + RECIPIENT_SLOT_FIXED_LEN + frame.slots[0].epoch_label.len();
             object[second_slot] = 0;
         }
         "misordered-slots" => {
             let frame = parsed_key_frame(&object);
-            let second_slot = 128 + 5 + 98 + frame.slots[0].epoch_label.len();
+            let second_slot = 128 + 5 + RECIPIENT_SLOT_FIXED_LEN + frame.slots[0].epoch_label.len();
             object[128 + 5] = 2;
             object[second_slot] = 1;
         }
@@ -1837,7 +1840,7 @@ fn run_key_frame_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
             object.insert(128 + key_frame_len, 0);
         }
         "oversize-key-frame" => {
-            object[0x3c..0x40].copy_from_slice(&4097u32.to_be_bytes());
+            object[0x3c..0x40].copy_from_slice(&((RAO_KEY_FRAME_MAX_LEN + 1) as u32).to_be_bytes());
         }
         "key-frame-label-tamper" => {
             let mut frame = parsed_key_frame(&object);
@@ -1869,17 +1872,17 @@ fn run_key_frame_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
         "wrap-suite-zero-nonempty" => object[0x38] = 0,
         "hpke-zero-key-frame-len" => object[0x3c..0x40].copy_from_slice(&0u32.to_be_bytes()),
         "hpke-undersized-key-frame-len" => {
-            object[0x3c..0x40].copy_from_slice(&102u32.to_be_bytes());
+            object[0x3c..0x40].copy_from_slice(&((RAO_KEY_FRAME_MIN_LEN - 1) as u32).to_be_bytes());
         }
         "duplicate-recipient-epoch-id" => {
             let frame = parsed_key_frame(&object);
-            let second_slot = 128 + 5 + 98 + frame.slots[0].epoch_label.len();
+            let second_slot = 128 + 5 + RECIPIENT_SLOT_FIXED_LEN + frame.slots[0].epoch_label.len();
             let first_epoch = object[128 + 6..128 + 22].to_vec();
             object[second_slot + 1..second_slot + 17].copy_from_slice(&first_epoch);
         }
         "internal-slot-truncation" => {
             let frame = parsed_key_frame(&object);
-            let second_slot = 128 + 5 + 98 + frame.slots[0].epoch_label.len();
+            let second_slot = 128 + 5 + RECIPIENT_SLOT_FIXED_LEN + frame.slots[0].epoch_label.len();
             object[second_slot + 17] = 32;
         }
         "nonzero-reserved-key-region" => object[0x10] = 1,
@@ -2090,6 +2093,7 @@ fn key_frame_negative_vectors_match_manifest_errors() {
         &[
             "version-flip",
             "suite-flip",
+            "legacy-x25519-wrap-suite",
             "truncated-key-frame",
             "duplicate-slots",
             "misordered-slots",

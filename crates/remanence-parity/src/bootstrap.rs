@@ -58,8 +58,8 @@ const BOOTSTRAP_PAYLOAD_CRC_LEN: usize = 8;
 const OBJECT_ROWS_KEY: u64 = 30;
 const OBJECT_ROW_METADATA_FRAME_MIN_LEN: u64 = 17;
 const OBJECT_ROW_METADATA_FRAME_MAX_LEN: u64 = 16 * 1024 * 1024;
-const OBJECT_ROW_KEY_FRAME_MIN_LEN: u32 = 103;
-const OBJECT_ROW_KEY_FRAME_MAX_LEN: u32 = 4096;
+const OBJECT_ROW_KEY_FRAME_MIN_LEN: u32 = 1191;
+const OBJECT_ROW_KEY_FRAME_MAX_LEN: u32 = 16_384;
 const OBJECT_ROW_MAX_RECIPIENTS: usize = 8;
 
 /// Decoded bootstrap-block payload.
@@ -1714,7 +1714,7 @@ mod tests {
         let mut payload = sample_payload();
         payload.object_rows = vec![
             BootstrapObjectRow::plaintext(1, 8, 6, 1234, 1, [0xA1; 32]).with_object_id([0x11; 16]),
-            BootstrapObjectRow::encrypted(3, 11, vec![[0x24; 16], [0x25; 16]], 66, 207)
+            BootstrapObjectRow::encrypted(3, 11, vec![[0x24; 16], [0x25; 16]], 66, 2377)
                 .with_object_id([0x33; 16]),
         ];
         let mut buf = vec![0xCC; payload.block_size_bytes as usize];
@@ -1735,7 +1735,7 @@ mod tests {
         payload.object_rows = vec![
             BootstrapObjectRow::plaintext(1, 8, 6, 1234, 1, [0xA1; 32])
                 .with_object_id(uuid_string.clone()),
-            BootstrapObjectRow::encrypted(3, 11, vec![[0x24; 16]], 66, 207)
+            BootstrapObjectRow::encrypted(3, 11, vec![[0x24; 16]], 66, 1191)
                 .with_object_id(max_length_id.clone()),
         ];
         let mut buf = vec![0u8; payload.block_size_bytes as usize];
@@ -1796,7 +1796,7 @@ mod tests {
             (CborValue::Integer(21.into()), CborValue::Integer(66.into())),
             (
                 CborValue::Integer(23.into()),
-                CborValue::Integer(103.into()),
+                CborValue::Integer(1191.into()),
             ),
         ]);
 
@@ -1824,7 +1824,7 @@ mod tests {
             (CborValue::Integer(21.into()), CborValue::Integer(66.into())),
             (
                 CborValue::Integer(23.into()),
-                CborValue::Integer(103.into()),
+                CborValue::Integer(1191.into()),
             ),
         ]);
 
@@ -1840,7 +1840,7 @@ mod tests {
     fn writer_rejects_unsorted_object_rows() {
         let mut payload = sample_payload();
         payload.object_rows = vec![
-            BootstrapObjectRow::encrypted(3, 11, vec![[0x24; 16]], 66, 103)
+            BootstrapObjectRow::encrypted(3, 11, vec![[0x24; 16]], 66, 1191)
                 .with_object_id([0x33; 16]),
             BootstrapObjectRow::plaintext(1, 8, 6, 1234, 1, [0xA1; 32]).with_object_id([0x11; 16]),
         ];

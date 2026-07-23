@@ -1,7 +1,8 @@
 {
   "vector_id": "RAO-TV-E2",
   "spec_section": "13.3",
-  "status": "pinned-at-generation",
+  "status": "historical-rao1-retired",
+  "retirement_note": "Frozen RAO 1.0 X25519-only publication record; RAO 2.0 Readers reject wrap_suite 0x01 and Sealers cannot emit it.",
   "independent_open_rederivation": "verified by tools/verify_rao_vectors_independent.py",
   "inputs": {
     "plaintext_vector": "RAO-TV-P1",

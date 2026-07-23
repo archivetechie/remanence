@@ -3,14 +3,10 @@
 use crate::error::{RaoAeadError, Result};
 use crate::xwing::XWING_CIPHERTEXT_LEN;
 
-/// Stage-1b envelope maximum retained until stage 1c raises the header and
-/// parser bound for eight X-Wing slots.
-pub const RAO_KEY_FRAME_MAX_LEN: usize = 4096;
-/// Stage-1b envelope minimum retained until stage 1c updates the header bound.
-///
-/// The X-Wing slot parser still requires its complete fixed-width `enc`, so an
-/// undersized frame cannot parse successfully.
-pub const RAO_KEY_FRAME_MIN_LEN: usize = 5 + 1 + 16 + 1 + 32 + 48;
+/// Maximum RAO 2.0 key-frame size accepted from an object.
+pub const RAO_KEY_FRAME_MAX_LEN: usize = 16_384;
+/// Smallest RAO 2.0 one-slot X-Wing key frame (with an empty label).
+pub const RAO_KEY_FRAME_MIN_LEN: usize = 5 + 1 + 16 + 1 + XWING_CIPHERTEXT_LEN + 48;
 /// Maximum number of recipient slots in a key frame.
 pub const RAO_KEY_FRAME_MAX_SLOTS: usize = 8;
 
@@ -49,9 +45,10 @@ impl KeyFrame {
 
     /// Parse a complete frame, rejecting truncation, non-canonical order, and trailing bytes.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        if !(RAO_KEY_FRAME_MIN_LEN..=RAO_KEY_FRAME_MAX_LEN).contains(&bytes.len())
-            || bytes.get(..4) != Some(MAGIC)
-        {
+        if !(RAO_KEY_FRAME_MIN_LEN..=RAO_KEY_FRAME_MAX_LEN).contains(&bytes.len()) {
+            return Err(RaoAeadError::InvalidKeyFrameLength);
+        }
+        if bytes.get(..4) != Some(MAGIC) {
             return Err(RaoAeadError::InvalidKeyFrame);
         }
         let count = bytes[4] as usize;
@@ -104,7 +101,7 @@ impl KeyFrame {
             .iter()
             .map(|slot| RECIPIENT_SLOT_FIXED_LEN + slot.epoch_label.len())
             .sum::<usize>();
-        if capacity > RAO_KEY_FRAME_MAX_LEN {
+        if !(RAO_KEY_FRAME_MIN_LEN..=RAO_KEY_FRAME_MAX_LEN).contains(&capacity) {
             return Err(RaoAeadError::InvalidKeyFrameLength);
         }
         let mut out = Vec::with_capacity(capacity);
@@ -173,6 +170,8 @@ mod tests {
 
     #[test]
     fn byte_exact_round_trip() {
+        assert_eq!(RAO_KEY_FRAME_MIN_LEN, 1191);
+        assert_eq!(RAO_KEY_FRAME_MAX_LEN, 16_384);
         let frame = KeyFrame::new(vec![slot(0, "safe-2026"), slot(7, "escrow")]).unwrap();
         let bytes = frame.serialize().unwrap();
         assert_eq!(
@@ -188,7 +187,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_truncation_order_duplicates_trailing_and_oversize() {
+    fn accepts_valid_eight_slot_xwing_frame_within_bounds() {
+        let frame = KeyFrame::new(
+            (0..RAO_KEY_FRAME_MAX_SLOTS)
+                .map(|index| slot(index as u8, &format!("recipient-{index}")))
+                .collect(),
+        )
+        .unwrap();
+        let encoded = frame.serialize().unwrap();
+        assert!((RAO_KEY_FRAME_MIN_LEN..=RAO_KEY_FRAME_MAX_LEN).contains(&encoded.len()));
+        assert_eq!(KeyFrame::parse(&encoded).unwrap(), frame);
+    }
+
+    #[test]
+    fn rejects_truncation_order_duplicates_trailing_and_out_of_bounds_lengths() {
         assert!(KeyFrame::new(vec![slot(1, "a"), slot(1, "b")]).is_err());
         assert!(KeyFrame::new(vec![slot(2, "a"), slot(1, "b")]).is_err());
         let mut duplicate_epoch = slot(2, "b");
@@ -202,6 +214,13 @@ mod tests {
         let mut trailing = bytes;
         trailing.push(0);
         assert!(KeyFrame::parse(&trailing).is_err());
-        assert!(KeyFrame::parse(&vec![0; RAO_KEY_FRAME_MAX_LEN + 1]).is_err());
+        assert!(matches!(
+            KeyFrame::parse(&vec![0; RAO_KEY_FRAME_MIN_LEN - 1]),
+            Err(RaoAeadError::InvalidKeyFrameLength)
+        ));
+        assert!(matches!(
+            KeyFrame::parse(&vec![0; RAO_KEY_FRAME_MAX_LEN + 1]),
+            Err(RaoAeadError::InvalidKeyFrameLength)
+        ));
     }
 }

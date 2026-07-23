@@ -14,8 +14,8 @@ pub const RAO_METADATA_FRAME_MIN_LEN: u64 = 17;
 pub const RAO_FOOTER: &[u8; 16] = b"RAO1_STREAM_END.";
 
 const MAGIC: &[u8; 4] = b"RAO1";
-/// HPKE Base X25519/HKDF-SHA256/ChaCha20-Poly1305 wrapping suite.
-pub const WRAP_SUITE_HPKE_V1: u8 = 1;
+/// RAO 2.0 HPKE Base X-Wing/HKDF-SHA256/ChaCha20-Poly1305 wrapping suite.
+pub const RAO_WRAP_SUITE_XWING: u8 = 0x02;
 const SUITE_ID_HKDF_SHA256_CHACHA20POLY1305: u8 = 0x01;
 const ZERO_16: [u8; 16] = [0; 16];
 
@@ -53,7 +53,7 @@ impl RaoHeader {
             hkdf_salt,
             metadata_frame_len,
             object_id: object_id.into(),
-            wrap_suite: WRAP_SUITE_HPKE_V1,
+            wrap_suite: RAO_WRAP_SUITE_XWING,
             key_frame_len,
         };
         header.validate()?;
@@ -102,6 +102,7 @@ impl RaoHeader {
             return Err(RaoAeadError::ReservedBytesNotZero);
         }
         let wrap_suite = bytes[0x38];
+        validate_wrap_suite(wrap_suite)?;
         let key_frame_len = u32::from_be_bytes(bytes[0x3c..0x40].try_into().expect("fixed slice"));
 
         let object_id = decode_object_id_field(&bytes[0x40..0x80])?;
@@ -168,9 +169,7 @@ impl RaoHeader {
         if self.format_version != 2 {
             return Err(RaoAeadError::UnsupportedFormatVersion);
         }
-        if self.wrap_suite != WRAP_SUITE_HPKE_V1 {
-            return Err(RaoAeadError::InvalidWrapSuite);
-        }
+        validate_wrap_suite(self.wrap_suite)?;
         if !(crate::key_frame::RAO_KEY_FRAME_MIN_LEN..=crate::key_frame::RAO_KEY_FRAME_MAX_LEN)
             .contains(&(self.key_frame_len as usize))
         {
@@ -183,6 +182,16 @@ impl RaoHeader {
         object_id_field(&self.object_id)?;
         Ok(())
     }
+}
+
+fn validate_wrap_suite(wrap_suite: u8) -> Result<()> {
+    if wrap_suite != RAO_WRAP_SUITE_XWING {
+        // 0x01 was the pre-production X25519-only assignment. It is
+        // permanently reserved and intentionally shares the unknown-suite
+        // failure path so neither Readers nor Sealers can negotiate it.
+        return Err(RaoAeadError::InvalidWrapSuite);
+    }
+    Ok(())
 }
 
 /// Validate a RAO body block / AEAD chunk size.
@@ -231,7 +240,14 @@ mod tests {
     use super::*;
 
     fn valid_header() -> RaoHeader {
-        RaoHeader::new_envelope(262_144, [2; 16], 64, "object-1", 103).unwrap()
+        RaoHeader::new_envelope(
+            262_144,
+            [2; 16],
+            64,
+            "object-1",
+            crate::RAO_KEY_FRAME_MIN_LEN as u32,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -257,32 +273,51 @@ mod tests {
         let parsed = RaoHeader::parse(&bytes).unwrap();
         assert_eq!(parsed, header);
         assert_ne!(header.header_hash().unwrap(), [0; 32]);
-        assert_eq!(bytes[0x38], WRAP_SUITE_HPKE_V1);
+        assert_eq!(bytes[0x38], RAO_WRAP_SUITE_XWING);
         assert_eq!(
             u32::from_be_bytes(bytes[0x3c..0x40].try_into().unwrap()),
-            103
+            1191
         );
     }
 
     #[test]
-    fn header_rejects_unsupported_version_and_suite() {
-        let header = RaoHeader::new_envelope(4096, [2; 16], 64, "object-2", 103).unwrap();
+    fn header_rejects_unsupported_version_legacy_and_unknown_wrap_suites() {
+        let header = RaoHeader::new_envelope(
+            4096,
+            [2; 16],
+            64,
+            "object-2",
+            crate::RAO_KEY_FRAME_MIN_LEN as u32,
+        )
+        .unwrap();
         let bytes = header.serialize().unwrap();
         assert_eq!(bytes[0x06], 2);
         assert_eq!(bytes[0x07], 1);
         assert_eq!(&bytes[0x10..0x20], &[0; 16]);
-        assert_eq!(bytes[0x38], WRAP_SUITE_HPKE_V1);
+        assert_eq!(bytes[0x38], RAO_WRAP_SUITE_XWING);
         assert_eq!(&bytes[0x39..0x3c], &[0; 3]);
         assert_eq!(
             u32::from_be_bytes(bytes[0x3c..0x40].try_into().unwrap()),
-            103
+            1191
         );
         assert_eq!(RaoHeader::parse(&bytes).unwrap(), header);
 
-        let mut suite_flip = bytes;
-        suite_flip[0x38] = 0xff;
+        let mut legacy_suite = bytes;
+        legacy_suite[0x38] = 0x01;
         assert!(matches!(
-            RaoHeader::parse(&suite_flip),
+            RaoHeader::parse(&legacy_suite),
+            Err(RaoAeadError::InvalidWrapSuite)
+        ));
+        let mut unknown_suite = bytes;
+        unknown_suite[0x38] = 0xff;
+        assert!(matches!(
+            RaoHeader::parse(&unknown_suite),
+            Err(RaoAeadError::InvalidWrapSuite)
+        ));
+        let mut noncanonical_sealer_header = header.clone();
+        noncanonical_sealer_header.wrap_suite = 0x01;
+        assert!(matches!(
+            noncanonical_sealer_header.serialize(),
             Err(RaoAeadError::InvalidWrapSuite)
         ));
         let mut version_flip = bytes;
@@ -291,6 +326,23 @@ mod tests {
             RaoHeader::parse(&version_flip),
             Err(RaoAeadError::UnsupportedFormatVersion)
         ));
+    }
+
+    #[test]
+    fn header_enforces_xwing_key_frame_bounds() {
+        for invalid in [1190u32, 16_385] {
+            let mut bytes = valid_header().serialize().unwrap();
+            bytes[0x3c..0x40].copy_from_slice(&invalid.to_be_bytes());
+            assert!(matches!(
+                RaoHeader::parse(&bytes),
+                Err(RaoAeadError::InvalidKeyFrameLength)
+            ));
+        }
+
+        for valid in [1191, 16_384] {
+            let header = RaoHeader::new_envelope(512, [3; 16], 17, "bounds", valid).unwrap();
+            assert_eq!(header.key_frame_len, valid);
+        }
     }
 
     #[test]

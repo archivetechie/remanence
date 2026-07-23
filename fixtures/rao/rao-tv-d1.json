@@ -2,8 +2,10 @@
   "vector_id": "RAO-TV-D1",
   "spec_section": "13.4",
   "status": "pinned-at-generation",
+  "encrypted_status": "historical-rao1-retired",
+  "encrypted_retirement_note": "The plaintext vector remains current. Its encrypted half is a frozen RAO 1.0 X25519-only publication record; RAO 2.0 Readers reject wrap_suite 0x01.",
   "plaintext_independent_rederivation": "verified by tools/verify_rao_vectors_independent.py",
-  "encrypted_expectation": "pinned by remanence-aead deterministic envelope test-vector entry point",
+  "encrypted_expectation": "historical RAO 1.0 bytes independently verified by tools/verify_rao_vectors_independent.py",
   "inputs": {
     "chunk_size": 262144,
     "object_id": "00000000-0000-4000-8000-000000000002",
