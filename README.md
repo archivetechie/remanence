@@ -208,4 +208,7 @@ specifications, use DOI
 
 ## License
 
-[AGPL-3.0-or-later](LICENSE).
+The Rust reference implementation is `Apache-2.0`, the specifications are
+`CC-BY-4.0`, and the conformance vectors are `CC0-1.0`. See
+[LICENSING.md](LICENSING.md) for the authoritative path mapping and canonical
+license texts.

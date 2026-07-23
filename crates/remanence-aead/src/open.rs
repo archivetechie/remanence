@@ -200,6 +200,7 @@ mod tests {
         let primary = RecipientPrivateKey::new([1; 16], "primary", [7; 32]).unwrap();
         let recovery = RecipientPrivateKey::new([2; 16], "recovery", [8; 32]).unwrap();
         let options = EnvelopeSealOptions {
+            allow_single_recipient: false,
             common: SealOptions {
                 chunk_size: 512,
                 object_id: "object-1".to_string(),

@@ -51,7 +51,9 @@ pub struct SealReport {
 pub struct EnvelopeSealOptions {
     /// Common framing and plaintext facts.
     pub common: SealOptions,
-    /// At least two distinct-custody recipient epochs in canonical slot order.
+    /// Permit exactly one recipient instead of the safe default of at least two.
+    pub allow_single_recipient: bool,
+    /// Distinct-custody recipient epochs in canonical slot order.
     pub recipients: Vec<RecipientPublicKey>,
 }
 
@@ -97,13 +99,22 @@ where
     validate_chunk_size(options.common.chunk_size)?;
     crate::header::object_id_field(&options.common.object_id)?;
     let chunk = u64::from(options.common.chunk_size);
-    if options.common.plaintext_size == 0
-        || options.common.plaintext_size % chunk != 0
-        || options.recipients.len() < 2
-    {
+    if options.common.plaintext_size == 0 || options.common.plaintext_size % chunk != 0 {
         return Err(RaoAeadError::InvalidInput(
-            "envelope seal requires aligned plaintext and at least two recipients".to_string(),
+            "envelope seal requires non-empty, chunk-aligned plaintext".to_string(),
         ));
+    }
+    match options.recipients.len() {
+        0 => {
+            return Err(RaoAeadError::InvalidInput(
+                "envelope seal requires at least one recipient".to_string(),
+            ))
+        }
+        1 if !options.allow_single_recipient => return Err(RaoAeadError::InvalidInput(
+            "single-recipient envelope seal requires the allow_single_recipient safety override"
+                .to_string(),
+        )),
+        _ => {}
     }
     if options
         .recipients
@@ -338,6 +349,7 @@ mod tests {
         let recovery = RecipientPrivateKey::new([2; 16], "recovery", [8; 32]).unwrap();
         EnvelopeSealOptions {
             common,
+            allow_single_recipient: false,
             recipients: vec![
                 primary.public_key(0).unwrap(),
                 recovery.public_key(1).unwrap(),
@@ -376,6 +388,51 @@ mod tests {
     }
 
     #[test]
+    fn single_recipient_is_rejected_by_default() {
+        let plaintext = vec![0x5a; 512];
+        let recipient = RecipientPrivateKey::new([1; 16], "primary", [7; 32]).unwrap();
+        let options = EnvelopeSealOptions {
+            common: options(&plaintext),
+            allow_single_recipient: false,
+            recipients: vec![recipient.public_key(0).unwrap()],
+        };
+
+        let error = seal_to_vec(&plaintext, &options).unwrap_err();
+        assert!(matches!(error, RaoAeadError::InvalidInput(_)));
+        assert_eq!(
+            error.to_string(),
+            "invalid RAO sealing input: single-recipient envelope seal requires the \
+             allow_single_recipient safety override"
+        );
+    }
+
+    #[test]
+    fn single_recipient_override_seals_and_round_trips() {
+        let plaintext = vec![0x5a; 512];
+        let recipient = RecipientPrivateKey::new([1; 16], "primary", [7; 32]).unwrap();
+        let options = EnvelopeSealOptions {
+            common: options(&plaintext),
+            allow_single_recipient: true,
+            recipients: vec![recipient.public_key(0).unwrap()],
+        };
+
+        let (sealed, sealed_report) = seal_to_vec(&plaintext, &options).unwrap();
+        assert_eq!(sealed_report.key_frame.slots.len(), 1);
+        let (opened, open_report) = open_to_vec(&sealed, &recipient).unwrap();
+        assert_eq!(open_report.key_frame.slots.len(), 1);
+        assert_eq!(opened, plaintext);
+    }
+
+    #[test]
+    fn two_recipients_seal_by_default() {
+        let plaintext = vec![0x5a; 512];
+        let options = envelope_options(options(&plaintext));
+
+        let (_, report) = seal_to_vec(&plaintext, &options).unwrap();
+        assert_eq!(report.key_frame.slots.len(), 2);
+    }
+
+    #[test]
     fn envelope_seal_open_range_and_inspect() {
         let plaintext: Vec<u8> = (0..1536).map(|index| (index % 251) as u8).collect();
         let common = options(&plaintext);
@@ -383,6 +440,7 @@ mod tests {
         let escrow = RecipientPrivateKey::new([0x32; 16], "escrow-2026", [8; 32]).unwrap();
         let options = EnvelopeSealOptions {
             common,
+            allow_single_recipient: false,
             recipients: vec![safe.public_key(0).unwrap(), escrow.public_key(1).unwrap()],
         };
 
@@ -457,6 +515,7 @@ mod tests {
         let duplicate = RecipientPrivateKey::new([1; 16], "safe-copy", [9; 32]).unwrap();
         let options = EnvelopeSealOptions {
             common,
+            allow_single_recipient: false,
             recipients: vec![
                 first.public_key(0).unwrap(),
                 second.public_key(1).unwrap(),
@@ -477,6 +536,7 @@ mod tests {
         let recovery = RecipientPrivateKey::new([0x22; 16], "recovery", [0x32; 32]).unwrap();
         let options = EnvelopeSealOptions {
             common,
+            allow_single_recipient: false,
             recipients: vec![
                 primary.public_key(0).unwrap(),
                 recovery.public_key(1).unwrap(),

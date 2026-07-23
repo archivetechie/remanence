@@ -2127,6 +2127,7 @@ mod tests {
         let mut plaintext_digest = [0u8; 32];
         plaintext_digest.copy_from_slice(&digest);
         let seal_options = EnvelopeSealOptions {
+            allow_single_recipient: false,
             common: SealOptions {
                 chunk_size: opts.chunk_size as u32,
                 object_id: opts.object_id.clone(),
@@ -2183,6 +2184,7 @@ mod tests {
         let mut plaintext_digest = [0u8; 32];
         plaintext_digest.copy_from_slice(&digest);
         let seal_options = EnvelopeSealOptions {
+            allow_single_recipient: false,
             common: SealOptions {
                 chunk_size: opts.chunk_size as u32,
                 object_id: opts.object_id.clone(),

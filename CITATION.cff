@@ -11,7 +11,7 @@ authors:
 version: 1.2.0
 doi: 10.5281/zenodo.21425126
 date-released: 2026-07-22
-license: AGPL-3.0-or-later
+license: Apache-2.0
 repository-code: "https://github.com/archivetechie/remanence"
 url: "https://archivetech.org"
 abstract: >-

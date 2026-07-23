@@ -917,6 +917,7 @@ fn run_inner_case(id: &str) -> Result<(), FormatError> {
     let (recipient, recipients) = recipient_pair();
     let plaintext_digest = sha256_array(&archive.bytes);
     let seal_options = EnvelopeSealOptions {
+        allow_single_recipient: false,
         common: SealOptions {
             chunk_size: archive.chunk_size as u32,
             object_id: header_object_id,
@@ -950,6 +951,7 @@ fn base_envelope() -> (Vec<u8>, RecipientPrivateKey) {
     let plaintext = base_envelope_plaintext();
     let (recipient, recipients) = recipient_pair();
     let options = EnvelopeSealOptions {
+        allow_single_recipient: false,
         common: base_seal_options(&plaintext),
         recipients,
     };
@@ -1401,6 +1403,7 @@ fn non_derived_salt(options: &SealOptions) -> Result<[u8; 16], RaoAeadError> {
 fn build_key_frame(plaintext: &[u8], options: &SealOptions) -> Result<Vec<u8>, RaoAeadError> {
     let (_, recipients) = recipient_pair();
     let envelope_options = EnvelopeSealOptions {
+        allow_single_recipient: false,
         common: options.clone(),
         recipients,
     };
@@ -1562,6 +1565,7 @@ fn run_envelope_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
             seal_to_vec(
                 &plaintext,
                 &EnvelopeSealOptions {
+                    allow_single_recipient: false,
                     common: options,
                     recipients,
                 },
@@ -1583,6 +1587,7 @@ fn run_envelope_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
             seal_to_vec(
                 &plaintext,
                 &EnvelopeSealOptions {
+                    allow_single_recipient: false,
                     common: options,
                     recipients,
                 },
@@ -1663,6 +1668,7 @@ fn deterministic_base_envelope() -> (Vec<u8>, RecipientPrivateKey) {
     let plaintext = base_envelope_plaintext();
     let (recipient, recipients) = recipient_pair();
     let options = EnvelopeSealOptions {
+        allow_single_recipient: false,
         common: base_seal_options(&plaintext),
         recipients,
     };
@@ -1683,6 +1689,7 @@ fn one_slot_readable_envelope() -> (Vec<u8>, RecipientPrivateKey) {
     let options = base_seal_options(&plaintext);
     let (recipient, recipients) = recipient_pair();
     let envelope_options = EnvelopeSealOptions {
+        allow_single_recipient: false,
         common: options.clone(),
         recipients,
     };
@@ -1784,6 +1791,7 @@ fn run_key_frame_case(id: &str, operation: &str) -> Result<(), RaoAeadError> {
         };
         let plaintext = base_envelope_plaintext();
         let options = EnvelopeSealOptions {
+            allow_single_recipient: false,
             common: base_seal_options(&plaintext),
             recipients: writer_recipients(count),
         };

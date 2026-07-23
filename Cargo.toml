@@ -24,7 +24,7 @@ version = "0.0.1"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Remanence contributors"]
-license = "AGPL-3.0-or-later"
+license = "Apache-2.0"
 repository = "https://github.com/archivetechie/remanence"
 readme = "README.md"
 

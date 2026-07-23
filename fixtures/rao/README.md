@@ -35,5 +35,6 @@ Negative-vector manifests with `status: complete` enumerate the Section 13.6
 negative families. The Rust negative-vector tests assert both the exact case
 IDs and the mapped errors or acceptance outcome, so dropping or duplicating a
 required case fails the fixture gate. The one-slot read-acceptance case records
-the intentional policy asymmetry: Sealers emit at least two slots; Readers
-accept any structurally valid frame with at least one.
+the intentional policy asymmetry: Sealers default to at least two slots and
+require an explicit opt-in to emit one; Readers accept any structurally valid
+frame with at least one.

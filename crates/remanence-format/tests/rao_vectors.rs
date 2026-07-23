@@ -197,6 +197,7 @@ fn seal_fixed_vector(
     hpke_rng_seed: [u8; 32],
 ) -> Vec<u8> {
     let envelope_options = EnvelopeSealOptions {
+        allow_single_recipient: false,
         common: SealOptions {
             chunk_size: options.chunk_size as u32,
             object_id: options.object_id.clone(),
@@ -1289,6 +1290,7 @@ fn rao_tv_d1_matches_fixture_manifest() {
     let mut plaintext_digest = [0u8; 32];
     plaintext_digest.copy_from_slice(&Sha256::digest(&bytes));
     let envelope_options = EnvelopeSealOptions {
+        allow_single_recipient: false,
         common: SealOptions {
             chunk_size: options.chunk_size as u32,
             object_id: options.object_id.clone(),
