@@ -7,7 +7,8 @@
 | Status | Draft for review |
 | Version | 1.0 |
 | Date | 2026-07-22 (v1.2.0 freeze increment) |
-| Archived release DOI | [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126) |
+| Concept DOI (all versions) | [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126) |
+| Version DOI (this release) | assigned at release (the concept DOI above always resolves to the latest version) |
 | Bootstrap magic | `52 45 4D 00 42 4F 4F 01` (`"REM\0BOO\x01"`, fixed bytes) |
 | Erasure scheme identifier | `rs-cauchy-gf256-v1` |
 | parity_map format identifier | `rem-parity-map-v1` |
@@ -96,9 +97,14 @@ priority order:
    standard positioning tools (`mt fsf` + read); no parity byte ever appears
    inside an object.
 4. **Bounded damage tolerance with bounded memory.** The default geometry
-   tolerates ~512 MiB of contiguous damage per epoch while the writer holds
-   only `S × m` parity accumulators (~512 MiB at the default geometry),
-   regardless of object sizes.
+   tolerates a contiguous burst of up to `S × m` blocks (~512 MiB) per epoch —
+   **including bursts that straddle the data→sidecar boundary** (Section 9.1,
+   Appendix B.2) — while the writer holds only `S × m` parity accumulators
+   (~512 MiB at the default geometry), regardless of object sizes. A short final
+   or checkpoint epoch that closes fewer than `S` real data blocks (< 128 MiB at
+   the default geometry) has a reduced boundary tolerance of `≈ (m − 1) × S`
+   (~384 MiB), because its data shards sit adjacent to the full parity region
+   (Appendix B.2).
 5. **No circular failure.** The structures that describe the tape are
    replicated and discoverable such that single-block damage to any one of
    them — including the first block of a tape file — never makes an
@@ -276,10 +282,15 @@ damage.
 ### 3.2. Address Spaces
 
 - **`TapeFilePosition`** = `(tape_file_number: u32, block_within_file: u64)`.
-- **Physical LBA** (partition 0): each prior tape file contributes its
-  blocks plus one filemark, so
+- **Logical LBA** (partition 0): the SCSI logical block/object position — *not* a
+  physical media address — where each prior tape file contributes its blocks plus
+  one filemark, so
   `LBA(f, b) = Σ_{g<f}(block_count(g) + 1) + b`. The append point after a
-  committed prefix is `Σ(block_count + 1)` over all committed files.
+  committed prefix is `Σ(block_count + 1)` over all committed files. All damage
+  guarantees in this format are expressed in **logical block erasures** at this
+  position space; their mapping to physical media damage holds only under the
+  block-to-media identity of Section 16.3 (one logical block ⇔ one block's worth
+  of media), which is why drive compression is rejected (Sections 8.4, 11.4).
 - **`ParityDataOrdinal`** (u64): the dense numbering of object data blocks
   only, in tape order, skipping filemarks and all non-object tape files. For
   an object tape file whose first block has ordinal `F`, block `b` of the
@@ -311,7 +322,12 @@ The interleave is essential: `N ≤ S` physically consecutive data blocks
 land in `N` distinct stripes, so contiguous damage of up to `S × m` blocks
 stays within the per-stripe tolerance `m` (Appendix B.2). Parity shards are
 addressed `(epoch, stripe, parity_index)` with `0 ≤ parity_index < m`; they
-live in sidecar tape files (Section 9), never among the data blocks.
+live in sidecar tape files (Section 9), never among the data blocks, and are
+stored **parity-index-major** (Section 9.1) so the same interleave extends into
+the parity region: consecutive parity blocks belong to consecutive stripes. A
+contiguous burst that straddles the data→sidecar boundary therefore spreads
+across stripes on both sides, and the guarantee holds across the boundary, not
+only within object data (Appendix B.2).
 
 ### 3.4. The Durable Boundary
 
@@ -782,7 +798,7 @@ strictly increasing `tape_file_number` order:
 | 1 | uint | REQUIRED | filemark-delimited object `tape_file_number` |
 | 2 | tstr | REQUIRED | representation marker: `"plaintext"` or `"encrypted"` |
 | 3 | uint | REQUIRED | stored block count for the object tape file |
-| 4 | bytes .size 16 | REQUIRED from minor 3 | RAO `object_id` — the identity the archive answers "where is object X" with. Readers of minors ≤ 2 tolerate its absence; a Writer at minor 3 or later MUST emit it. |
+| 4 | bytes, 1–64 | REQUIRED from minor 3 | RAO `object_id` — the identity the archive answers "where is object X" with — carried verbatim as its 1–64 non-NUL bytes (any RAO envelope NUL padding of [RAO] §5.2 stripped). This matches [RAO] `object_id` exactly (opaque UTF-8, 1–64 bytes; capped in [RAO] §4.5.1) with no conversion. Readers of minors ≤ 2 tolerate its absence; a Writer at minor 3 or later MUST emit it. |
 | 10 | uint | plaintext only | `manifest_first_chunk_lba` |
 | 11 | uint | plaintext only | `manifest_size_bytes` |
 | 12 | uint | plaintext only | `manifest_chunk_count` |
@@ -847,6 +863,23 @@ checkpoint bootstraps MUST be written only at object boundaries, and
 sequence numbers MUST strictly increase across all bootstrap copies on one
 tape.
 
+**Final-directory redundancy.** The final full-scope directory (the
+`SidecarEpochDirectory` with `is_final_directory = true` covering the whole
+tape, Section 10.5) MUST survive the loss of any single tape file. A `finish()`
+(Section 11.3) MUST therefore write it as **at least two external full-scope
+`parity_map` tape files** (Section 12.4), physically separated by at least
+`S × m` blocks — the contiguous-damage tolerance of Section 1.1 — and never as
+two adjacent tape files, so that no single tolerated burst can destroy both. The
+final bootstrap MAY additionally carry the directory inline (key 20) or reference
+one of these copies (key 21), but **a single inline or referenced copy MUST NOT
+be the only non-bootstrap copy of the final directory**: were the final bootstrap
+block lost, an inline directory is lost with it, and a lone referenced
+`parity_map` is not reachable — structural discovery (Section 12.4) requires two
+`parity_map` files to select among (a single discovered map yields no overlay).
+Two full-scope `parity_map` copies are recovered by the Section 12.4 tie-break
+whether or not the final bootstrap survives, and their content disagreement, if
+any, is reported rather than silently resolved.
+
 ### 8.4. Discovery (Reader)
 
 A Scanner with no off-tape state proceeds through the following discovery
@@ -870,12 +903,21 @@ When the block size is unknown, the discovery candidates (256 KiB, 512 KiB,
 a parsed bootstrap is accepted only if its `block_size_bytes` equals the
 configured read size.
 
-A conformant Writer MUST use one of the discovery-candidate block sizes.
-This closes the writer-legal set over the discovery set: every conformant
-tape is discoverable from the media alone, with no out-of-band hint. A
+A conformant Writer for production media MUST use one of the discovery-candidate
+block sizes. This closes the writer-legal set over the discovery set: every
+conformant tape is discoverable from the media alone, with no out-of-band hint. A
 Scanner MUST nevertheless accept an operator-supplied block-size hint and
 apply it as a configured read size — the hint path serves damaged-media
 recovery and nonconformant tapes, not Writer freedom.
+
+**Test-geometry carve-out.** Conformance test vectors and other explicitly
+labelled test geometries (Section 10.7) MAY use a smaller block size — the
+published vectors use 4096-byte blocks — to keep the fixtures compact. Such a
+tape records its `block_size_bytes` in the bootstrap like any other and is read
+by supplying that size as a configured read size (the hint path above); it is not
+required to be discoverable from media alone. A block size outside the
+discovery-candidate set does not by itself make a tape nonconformant; only a
+production Writer emitting one does.
 
 Per-block scan rules, applied identically on the known-size and
 candidate-size paths:
@@ -904,6 +946,15 @@ ties keep the earlier find. The selected bootstrap's digest record then
 governs map validation (Section 12.4), and its scheme record pins the
 geometry every sidecar must agree with (Section 13.3).
 
+A bootstrap copy whose frame parses but whose payload fails validation (header
+or digest-record CRC, or the Section 10.5 directory invariants when it carries an
+inline directory) MUST be treated as **not found** for this selection — never
+selected as authoritative on the strength of a parsed frame alone. Selection then
+falls through to the next readable copy and, if none governs the required scope,
+to structural discovery (Section 12.4). This is what lets a lost or corrupt final
+bootstrap fall back to the redundant full-scope `parity_map` copies (Section 8.3)
+rather than pinning recovery to a damaged authority.
+
 ## 9. The Parity Sidecar Tape File
 
 ### 9.1. Structure
@@ -914,13 +965,34 @@ One sidecar is written per parity epoch, in its own tape file of
 
 ```text
 blocks 0 .. H−1          primary header/index copy
-blocks H .. H+P−1        parity shards, stripe-major: shard i  ⇒
-                         stripe = i / m, parity_index = i mod m
+blocks H .. H+P−1        parity shards, parity-index-major: shard i  ⇒
+                         parity_index = i / S, stripe = i mod S
 blocks H+P .. 2H+P−1     tail header/index copy
 block  2H+P              footer locator
 ```
 
-Parity shard blocks are raw blocks with no headers. The tail copy MUST
+The parity shard for `(stripe, parity_index)` occupies the block at
+
+```text
+block(stripe, parity_index) = H + parity_index·S + stripe
+```
+
+using the **recorded scheme `S`** (Section 9.2 header field 0x24) — always the
+constant scheme stripe count, never a per-epoch value, since every sidecar
+carries exactly `P = S × m` parity blocks (Section 9.2) regardless of how many
+data stripes the epoch actually fills. This **parity-index-major** placement
+carries the Section 3.3 data interleave into the parity region: consecutive
+parity blocks belong to consecutive stripes, so a contiguous burst crossing the
+data→sidecar boundary spreads across stripes exactly as it does within the data
+region (Appendix B.2). It is the sole reason the contiguous-damage guarantee of
+Section 1.1 holds across that boundary and not merely within object data.
+
+Parity shard blocks are raw blocks with no headers. Physical block placement is
+determined solely by the locator above from a shard's explicit `(stripe_index,
+parity_index)` fields; it is **independent of the order of that shard's entry in
+the Section 9.3 index stream** (which remains stripe-major). A Reader MUST locate
+a parity shard by computing `block(stripe, parity_index)` from its explicit
+fields, never by the position of its index entry. The tail copy MUST
 carry metadata and index content identical to the primary — only
 `copy_kind` and the recomputed CRCs differ — and when both copies parse,
 readers MUST verify they agree and reject divergence. The minimum block
@@ -1180,11 +1252,28 @@ Flags: 0x01 = `FINAL_PARTIAL_EPOCH`; 0x02 = primary-copy-known-good; 0x04 =
 tail-copy-known-good. `FINAL_PARTIAL_EPOCH` MUST appear only on the short
 epoch emitted by terminal `finish()`; checkpoint-short epochs MUST leave it
 clear. Readers MUST NOT treat an unflagged short epoch as invalid or as an
-unfinished tape. Unknown flag bits MUST be rejected. Invariants (a
-decoder MUST validate all of them on every decode): entries strictly ascending by
-`tape_file_number`, each `< scope_tape_file_count`; non-empty ordinal
-ranges; non-zero block counts; `max(protected_ordinal_end_exclusive)` over
-the entries (0 if none) MUST equal `scope_highest_protected_ordinal`.
+unfinished tape. Unknown flag bits MUST be rejected.
+
+**Invariants (a decoder MUST validate all of them on every decode; any violation
+is `DirectoryInvalid`, Section 15).** These restate at decode time what
+Section 9.2 requires of the on-tape sidecar-header sequence, because a directory
+MAY be trusted without reading those headers (Section 10.1):
+
+- entries strictly ascending by `tape_file_number`, each `< scope_tape_file_count`;
+- non-zero block counts;
+- `scope_highest_protected_ordinal ≤ scope_total_data_ordinals` (the range
+  `[scope_highest_protected_ordinal, scope_total_data_ordinals)` is the tail of
+  committed-but-unprotected ordinals permitted by Section 11.2, and is empty on a
+  `finish()`ed or checkpointed directory);
+- the protected ranges **partition `[0, scope_highest_protected_ordinal)`**:
+  taken in ascending `tape_file_number` order, the first
+  `protected_ordinal_start` is `0`, each entry's `protected_ordinal_start` equals
+  the previous entry's `protected_ordinal_end_exclusive` (contiguous, no gaps and
+  no overlaps), every range is non-empty, and the last
+  `protected_ordinal_end_exclusive` equals `scope_highest_protected_ordinal` (or
+  the directory is empty and `scope_highest_protected_ordinal = 0`);
+- `epoch_id` values are unique and consecutive starting from `0`
+  (`0, 1, …, count−1`), matching the bare monotonic epoch counter of Section 2.3.
 
 ### 10.6. The ParityMapReference (bootstrap key 21)
 
@@ -1643,22 +1732,28 @@ the last object, and not at the watermark.
    a committed prefix never contains a complete unprotected epoch,
    because an object and the sidecars emitted at its close commit as one
    bundle — Section 11.1.)
-4. Write any rebuilt sidecar with the full Section 11.1 cycle, plus one
-   addition: **decode-what-you-wrote** — before writing, the encoded
-   sidecar MUST round-trip through the parser and reproduce the planned
-   header, index, and shard bytes exactly. The off-tape commit for it MUST
-   happen only after its blocks, filemark, and a post-barrier position
-   check all succeed; failure abandons the boundary.
-5. Position to the append point (`Σ(block_count + 1)` over the prefix),
-   verify by a positional query, and seed the writer with: the prefix map;
-   the durable boundary; `W`; the next bootstrap sequence, strictly greater
-   than every bootstrap sequence in the committed prefix (and at least the
-   count of committed bootstraps); the next parity_map sequence, strictly
-   greater than every parity_map sequence in the committed prefix; the live open-epoch state, shape- and
-   CRC-revalidated, then re-accumulated; and **directory entries covering
-   every committed-prefix sidecar one-for-one**, so every later bootstrap
-   or parity_map directory still enumerates pre-crash epochs — the
-   root-of-trust completeness rule.
+4. **Position to the append point (`Σ(block_count + 1)` over the prefix) and
+   verify it by a positional query before writing anything.** The step-3 re-read
+   of `[W, T)` crosses filemarks and tape-file boundaries, after which position
+   MUST be re-synchronised by a positional query (Section 3.5); a write issued at
+   a dead-reckoned, unverified position could land over committed data or short
+   of the append point. No block is written until this verification succeeds.
+5. Seed the writer with: the prefix map; the durable boundary; `W`; the next
+   bootstrap sequence, strictly greater than every bootstrap sequence in the
+   committed prefix (and at least the count of committed bootstraps); the next
+   parity_map sequence, strictly greater than every parity_map sequence in the
+   committed prefix; the live open-epoch state (`[W, T)`, shape- and
+   CRC-revalidated, then re-accumulated) carried as live writer state; and
+   **directory entries covering every committed-prefix sidecar one-for-one**, so
+   every later bootstrap or parity_map directory still enumerates pre-crash
+   epochs — the root-of-trust completeness rule. The incomplete open epoch
+   `[W, T)` MUST NOT be closed or emit a sidecar at resume time: under the step-2
+   bound a committed prefix never contains a complete unprotected epoch, so
+   `[W, T)` is always a partial epoch, re-accumulated into live state, that emits
+   its sidecar only when it later closes through the normal Section 11.1 cycle —
+   whose **decode-what-you-wrote** round-trip (the encoded sidecar MUST re-parse
+   to the planned header, index, and shard bytes before its blocks, filemark, and
+   post-barrier position check commit as one bundle) applies at that close.
 
 Anything physically on tape beyond the committed prefix is superseded by
 the next append and MUST NOT be trusted for recovery.
@@ -1677,6 +1772,7 @@ BootstrapPayloadTooLarge        framed payload cannot fit the block (Section 10.
 SidecarParse                    sidecar structure violates Section 9
 SidecarMetadataUnavailable{epoch_id}   no header/index copy validated (Section 13.3)
 ParityMapParse                  parity_map structure violates Section 10
+DirectoryInvalid                SidecarEpochDirectory violates a Section 10.5 invariant
 SchemeMismatch                  sidecar geometry disagrees with the bootstrap scheme
 FilemarkMapDigestMismatch       recomputed digest or scope scalars disagree (Section 12.4)
 FilemarkMapReconstruct          the walk or overlay could not produce a valid map
@@ -2004,14 +2100,58 @@ contiguous and clean — a tar-based payload remains extractable with `mt` +
 boundaries. The cost, sidecars consuming their own tape files and
 filemarks, is small at archival object sizes.
 
-### B.2. The stripe-major interleave
+### B.2. The interleave (data and parity)
 
 Tape damage is overwhelmingly contiguous (scratches, wraps, edge damage).
-Mapping consecutive ordinals to consecutive *stripes* — rather than filling
-one stripe at a time — converts a contiguous burn of up to `S × m` blocks
-into at most `m` losses per stripe, exactly the code's tolerance. The
-alternative (stripe-fill order) would concentrate a burst into few stripes
+Mapping consecutive *data* ordinals to consecutive *stripes* (Section 3.3) —
+rather than filling one stripe at a time — converts a contiguous burn of up to
+`S × m` blocks into at most `m` losses per stripe, exactly the code's tolerance.
+The alternative (stripe-fill order) would concentrate a burst into few stripes
 and lose data at a fraction of the tolerance.
+
+The parity region carries the same interleave. Parity shards are stored
+**parity-index-major** (Section 9.1): the physical block for `(stripe,
+parity_index)` is `H + parity_index·S + stripe`, so consecutive parity blocks
+belong to consecutive stripes, and a burst inside the parity region loses at
+most one parity shard per stripe per `S` blocks traversed. This is what makes
+the guarantee hold across the **data→sidecar boundary**, not only within object
+data. Worst case, one full-epoch object at default geometry (`k=128, m=4, S=512`,
+`H=3`): a stripe's last data shard sits at LBA `(k−1)·S + s`; its parity shards
+at LBA `E + 1 + H + j·S + s` (the `+1` is the terminating filemark), spaced `S`
+apart and phase-shifted from the data lattice by `1 + H`. Destroying a stripe
+requires erasing `m + 1` of its shards; the shortest contiguous span covering
+its data shard and `m` parity shards is
+
+```text
+span = (m − 1)·S + (S + 1 + H) + 1 = m·S + H + 2 = 2053 blocks ≈ 513 MiB.
+```
+
+That is *longer* than the interior data-only worst case (`m·S + 1 = 2049`
+blocks; a run of `m·S + 1` consecutive data blocks lands `m + 1` shards in one
+stripe), so after this ordering the interior data region — not the boundary — is
+the binding constraint, at exactly `m·S = 2048` blocks = 512 MiB. The `1 + H`
+phase offset raises the boundary threshold; it never subtracts from the
+guarantee.
+
+**Short-epoch residual.** A short final or checkpoint epoch with `R < S` real
+data blocks (Section 6.4 implicit zeros) still writes the full `S × m` parity
+region, but its `R` data shards occupy LBA `0 .. R−1`, adjacent to the parity
+region rather than a full `S·k` run away. Destroying stripe `s < R` (its single
+real data shard at LBA `s` plus its `m` parity shards) needs only
+
+```text
+span = (m − 1)·S + R + H + 2   (≈ 385 MiB at R = 1, m = 4).
+```
+
+Losing that stripe's one real shard and all `m` parity leaves `k − 1` survivors
+(the rest implicit zeros), below the `k` needed. So an epoch closing fewer than
+`S` data blocks has boundary tolerance `≈ (m − 1)·S + R`, floor `≈ (m − 1)·S`
+(~384 MiB) — far above any realistic single media defect and ~380× better than
+the pre-`v1.2` stripe-major parity layout, but below the `m·S` headline. Using a
+per-epoch stripe count in the locator instead of the constant `S` would be
+*worse*, not better: it would re-cluster a short epoch's parity into `m` adjacent
+blocks and collapse tolerance to `≈ m` blocks. The constant-`S` locator is both
+correct and maximally robust.
 
 ### B.3. Implicit zeros instead of padding blocks
 
