@@ -71,7 +71,7 @@ category above — and that's the value.
 | Operator-grade audit log | yes (event hook today; hash-chained log specified) † | no | no | yes | yes |
 | Minimal scope (no scheduler, no retention, no catalog) | yes | yes | yes | no | no |
 | OS-portable architecture (seams for Windows port) | yes | partial | partial | partial | no |
-| Open-source licence | AGPL-3.0-or-later | various | various | AGPL/GPL | no |
+| Open-source licence | Apache-2.0 (code) | various | various | AGPL/GPL | no |
 
 **†** Rows marked with † are properties Remanence is **specified
 to have** in the layered design but that are not yet implemented
@@ -386,15 +386,15 @@ appear:
    itself. The cost model is fundamentally misaligned with
    "write once, hold for decades."
 
-Remanence is AGPL-3.0-or-later. The source is the spec; the
-on-tape format is **specified** (`spec-v0.3.md` §5) and will be
-documented end-to-end when Layer 3b lands; the audit log will be
-text on a disk that the operator owns (Layer 4 — also still to
-land). If the project disappears tomorrow after Layer 3b ships,
-every tape it ever wrote will still be readable with `tar` (for
-the pax-tar format) or with the published CBOR schema (for the
-chunked format). This is the architectural commitment v0.3 of the
-spec carries; v0.0.1 of the binaries is still pre-data-plane.
+Remanence's reference implementation is Apache-2.0, its specifications
+are CC-BY-4.0, and its conformance vectors are CC0-1.0. The source is the
+spec; the on-tape format is **specified** (`spec-v0.3.md` §5) and will be
+documented end-to-end when Layer 3b lands; the audit log will be text on a
+disk that the operator owns (Layer 4 — also still to land). If the project
+disappears tomorrow after Layer 3b ships, every tape it ever wrote will
+still be readable with `tar` (for the pax-tar format) or with the published
+CBOR schema (for the chunked format). This is the architectural commitment
+v0.3 of the spec carries; v0.0.1 of the binaries is still pre-data-plane.
 
 This is not a knock on the proprietary vendors — they have real
 features Remanence does not (full archive workflows, polished

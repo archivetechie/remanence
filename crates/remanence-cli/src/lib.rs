@@ -3974,6 +3974,7 @@ where
         .map_err(|error| format!("rewind secure plaintext staging file: {error}"))?;
 
     let seal_options = EnvelopeSealOptions {
+        allow_single_recipient: false,
         common: SealOptions {
             chunk_size: opened.header.chunk_size,
             object_id: opened.header.object_id.clone(),
@@ -14722,6 +14723,7 @@ mod tests {
         let (source_object, _) = remanence_aead::seal_to_vec(
             &plaintext,
             &EnvelopeSealOptions {
+                allow_single_recipient: false,
                 common: SealOptions {
                     chunk_size: 512,
                     object_id: "reseal-object".to_string(),

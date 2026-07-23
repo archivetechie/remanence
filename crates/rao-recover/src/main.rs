@@ -336,6 +336,7 @@ mod tests {
         let (sealed, _) = seal_to_vec(
             &plaintext,
             &EnvelopeSealOptions {
+                allow_single_recipient: false,
                 common,
                 recipients: vec![safe.public_key(0).unwrap(), escrow.public_key(1).unwrap()],
             },
@@ -434,6 +435,7 @@ mod tests {
         let (sealed, _) = seal_to_vec(
             &plaintext,
             &EnvelopeSealOptions {
+                allow_single_recipient: false,
                 common: SealOptions {
                     chunk_size: 512,
                     object_id: "recovery-xattr-object".to_string(),

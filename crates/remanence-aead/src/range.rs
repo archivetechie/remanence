@@ -432,6 +432,7 @@ mod tests {
         let safe = RecipientPrivateKey::new([1; 16], "safe", [7; 32]).unwrap();
         let escrow = RecipientPrivateKey::new([2; 16], "escrow", [8; 32]).unwrap();
         let options = EnvelopeSealOptions {
+            allow_single_recipient: false,
             common: common.clone(),
             recipients: vec![safe.public_key(0).unwrap(), escrow.public_key(1).unwrap()],
         };
