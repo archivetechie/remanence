@@ -2206,6 +2206,21 @@ hybrid KEM (FIPS 203; the construction of RFC 9958) as the resealing target;
 version 1.0 states the limitation and the resealing obligation but does not yet
 specify the hybrid.
 
+Operationally, resealing is not a lightweight re-wrap. Because Section 5.5 binds
+the entire key frame into the derived AEAD keys, the wrapped DEK cannot be
+replaced in isolation: re-wrapping under a new KEM forces re-deriving the object's
+keys and **re-encrypting the whole object**, which — on append-only media — means
+writing a fresh object to new media. Deployments SHOULD therefore fold resealing
+into the periodic media-refresh (migration) cycle they already run, accepting that
+it transits plaintext on a trusted host and reads and writes the full object. Two
+limits are inherent: resealing protects only media still under the archive's
+control — a copy already exfiltrated retains its original quantum-vulnerable key
+frame and cannot be retroactively protected; and the format's self-describing,
+catalogless-recovery property (the object opens from its own on-media key frame) is
+precisely what makes that key frame the exposure. For genuinely long-secrecy
+holdings, wrapping to a post-quantum (hybrid) KEM at first seal is stronger than
+relying on later resealing.
+
 ### 12.12. Disclosure in Published Plaintext Objects
 
 A plaintext RAO object provides integrity plumbing (Section 12.6), not
