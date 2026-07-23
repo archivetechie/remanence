@@ -285,6 +285,7 @@ fn seal_recipient_envelope<S: BlockSink + ?Sized>(
     }
     let plaintext_digest = sha256_array(&plaintext);
     let seal_options = EnvelopeSealOptions {
+        allow_single_recipient: false,
         common: SealOptions {
             chunk_size,
             object_id: options.object_id.clone(),
