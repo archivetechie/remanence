@@ -887,8 +887,10 @@ by the manifest's declared size, never by counts read from the CBOR stream.
 
 #### 4.7.2. Schema
 
-The top-level item is a map with exactly these seven text keys (shown in
-encoded sort order):
+The top-level item has the following seven required text keys (shown in
+encoded sort order). A 1.0 Writer emits exactly these seven top-level keys; a
+Reader requires all seven and additionally tolerates unknown *bare* keys as
+reserved for future revisions under Consumer obligation 3 below.
 
 | Key | Type | Constraint |
 | --- | --- | --- |
@@ -2241,6 +2243,10 @@ The authoritative companion archive is `remanence-test-vectors.tar`, SHA-256
 prior entry is byte-identical and only additive entries (the metadata,
 extension-container, object-inventory, and parity tie-break vectors) are
 new.
+The authoritative archive digest names this specific version of the frozen
+conformance distribution. Later additive vector entries are versioned
+supplements carrying their own digest; they do not mutate the conformance
+target named by an earlier archive digest.
 Its `MANIFEST.tsv` inventories every contained vector manifest and generated
 artifact, `CHECKSUMS.sha256` authenticates them, and the included `verify.py`
 checks the archive without a source checkout. It contains plaintext and xattr
@@ -2399,7 +2405,16 @@ key-frame, HPKE-tamper, Sealer-slot, and Reader-slot policy matrix described in
 Section 13.6. The implementation's positive
 component vector fixes `object_id = object-a`, epoch id `03` repeated 16
 times, label `safe-2026`, slot 0, DEK `09` repeated 32 times, and a deterministic
-test-only HPKE entropy draw of `42` repeated 32 times. Its exact outputs are:
+test-only HPKE entropy draw of `42` repeated 32 times. The recipient private
+key is the direct 32-byte serialized X25519 private value
+`0707070707070707070707070707070707070707070707070707070707070707`;
+it is not produced by `DeriveKeyPair`. Applying X25519 `sk_to_pk` to that
+private value gives the recipient public key
+`13be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d`.
+The `42`-repeated 32-byte entropy draw is the RFC 9180 Section 7.1.3 input
+keying material `ikm` for the sender's ephemeral
+`DeriveKeyPair(ikm) -> (skE, pkE)` operation; it is not a raw ephemeral
+scalar. Its exact outputs are:
 
 ```text
 key frame =
@@ -2529,10 +2544,11 @@ Conformance evidence MUST include:
    carry-only restore, Repacker-preservation, and manifest-tamper vectors of
    Section 13.
 
-The archive SHA-256 in Section 13 identifies the frozen vector distribution.
-Changing an existing entry's byte encoding or expected result requires a
-successor specification or erratum; adding new entries is permitted and
-advances the archive digest.
+The archive SHA-256 in Section 13 identifies one specific version of the
+frozen vector distribution. Changing an existing entry's byte encoding or
+expected result requires a successor specification or erratum. Additive
+entries are published as versioned supplements carrying their own digest and
+do not mutate the frozen conformance target named by an existing digest.
 
 ## 15. IANA Considerations
 

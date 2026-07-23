@@ -499,6 +499,9 @@ mod tests {
     fn rao_wrap_vector_is_byte_exact() {
         let secret = RecipientPrivateKey::new([3; 16], "safe-2026", [7; 32]).unwrap();
         let public = secret.public_key(0).unwrap();
+        let expected_public =
+            decode_hex("13be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d");
+        assert_eq!(public.public_key.as_slice(), expected_public);
         let dek = DataEncryptionKey::from_bytes([9; 32]);
         let mut rng = CountingByteRng {
             byte: 0x42,
@@ -523,5 +526,32 @@ mod tests {
                 0x98, 0xb6, 0xca, 0x12, 0xa1, 0x8c,
             ]
         );
+
+        let (_, derived_ephemeral_public) = Kem::derive_keypair(&[0x42; 32]);
+        assert_eq!(
+            derived_ephemeral_public.to_bytes().as_slice(),
+            slot.enc,
+            "the 42-by-32 draw is RFC 9180 DeriveKeyPair input keying material"
+        );
+
+        let recipient_public =
+            <<Kem as hpke::Kem>::PublicKey as Deserializable>::from_bytes(&expected_public)
+                .unwrap();
+        let info = wrap_info("object-a", &[3; 16], 0).unwrap();
+        let mut independent_rng = CountingByteRng {
+            byte: 0x42,
+            bytes_generated: 0,
+        };
+        let (independent_enc, mut independent_context) = setup_sender::<Aead, Kdf, Kem, _>(
+            &OpModeS::Base,
+            &recipient_public,
+            &info,
+            &mut independent_rng,
+        )
+        .unwrap();
+        let independent_ciphertext = independent_context.seal(&[9; 32], &[]).unwrap();
+        assert_eq!(independent_rng.bytes_generated, 32);
+        assert_eq!(independent_enc.to_bytes().as_slice(), slot.enc);
+        assert_eq!(independent_ciphertext.as_slice(), slot.ciphertext);
     }
 }

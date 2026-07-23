@@ -34,6 +34,8 @@ use remanence_parity::{
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use unicase::UniCase;
+use unicode_normalization::UnicodeNormalization;
 #[cfg(unix)]
 use xattr::FileExt;
 
@@ -497,7 +499,19 @@ pub fn restore_object_to_directory<S: BlockSource + ?Sized>(
     destination_root: impl AsRef<Path>,
     options: FilesystemRestoreOptions,
 ) -> Result<FilesystemRestoreReport, StreamingError> {
-    let mut sink = FilesystemRestoreSink::new(destination_root.as_ref(), options)?;
+    let destination_root = destination_root.as_ref();
+    let object_start = source.position().map_err(FormatError::from)?;
+    let mut preflight_sink = RestorePreflightSink;
+    let preflight_stream =
+        stream_rem_tar_object(source, chunk_size, block_count, &mut preflight_sink)?;
+    preflight_native_restore_destinations(
+        destination_root,
+        &preflight_stream.entries,
+        options.include_manifest,
+    )?;
+    source.locate(object_start.lba).map_err(FormatError::from)?;
+
+    let mut sink = FilesystemRestoreSink::new(destination_root, options)?;
     let stream = stream_rem_tar_object(source, chunk_size, block_count, &mut sink)?;
     let xattrs = apply_restored_xattrs(
         &sink.root,
@@ -1066,6 +1080,108 @@ fn restore_path_error(path: &Path, message: impl Into<String>) -> FormatError {
     ))
 }
 
+/// One destination resolved by the native restore path mapper.
+struct NativeRestoreDestination {
+    relative: PathBuf,
+    destination: PathBuf,
+    collision_key: Vec<String>,
+}
+
+/// Resolve one RAO entry path using the host platform's native path semantics.
+fn resolve_native_restore_destination(
+    root: &Path,
+    archive_path: &str,
+) -> Result<NativeRestoreDestination, FormatError> {
+    let native_path = Path::new(archive_path);
+    if native_path.as_os_str().is_empty() {
+        return Err(FormatError::invalid_path(
+            "restore path must contain a file name",
+        ));
+    }
+    if native_path.is_absolute() {
+        return Err(FormatError::invalid_path(format!(
+            "restore path {archive_path:?} is absolute"
+        )));
+    }
+
+    let mut relative = PathBuf::new();
+    let mut collision_key = Vec::new();
+    for component in native_path.components() {
+        match component {
+            Component::Normal(part) => {
+                let text = part.to_str().ok_or_else(|| {
+                    FormatError::invalid_path(format!("restore path {archive_path:?} is not UTF-8"))
+                })?;
+                if text.is_empty() {
+                    return Err(FormatError::invalid_path(format!(
+                        "restore path {archive_path:?} contains an empty native component"
+                    )));
+                }
+                relative.push(part);
+                collision_key.push(native_collision_component(text));
+            }
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return Err(FormatError::invalid_path(format!(
+                    "restore path {archive_path:?} is not a normalized native relative path"
+                )));
+            }
+        }
+    }
+    if collision_key.is_empty() {
+        return Err(FormatError::invalid_path(format!(
+            "restore path {archive_path:?} must contain a file name"
+        )));
+    }
+
+    let destination = root.join(&relative);
+    if !destination.starts_with(root) {
+        return Err(FormatError::invalid_path(format!(
+            "restore path {archive_path:?} escapes destination {}",
+            root.display()
+        )));
+    }
+    Ok(NativeRestoreDestination {
+        relative,
+        destination,
+        collision_key,
+    })
+}
+
+/// Produce a conservative native collision key using full case folding and NFD.
+fn native_collision_component(component: &str) -> String {
+    let decomposed = component.nfd().collect::<String>();
+    UniCase::unicode(decomposed)
+        .to_folded_case()
+        .nfd()
+        .collect()
+}
+
+/// Validate every native destination before the restore creates an entry.
+fn preflight_native_restore_destinations(
+    root: &Path,
+    entries: &[RemTarStreamEntry],
+    include_manifest: bool,
+) -> Result<(), FormatError> {
+    let mut destinations = BTreeMap::new();
+    for entry in entries {
+        if entry.path == MANIFEST_PATH && !include_manifest {
+            continue;
+        }
+        let resolved = resolve_native_restore_destination(root, &entry.path)?;
+        if let Some(previous) = destinations.insert(resolved.collision_key, entry.path.as_str()) {
+            return Err(FormatError::invalid_path(format!(
+                "restore entries {previous:?} and {:?} collide after native case folding and Unicode normalization at {}",
+                entry.path,
+                resolved.destination.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn ensure_restore_root(root: &Path) -> Result<(), StreamingError> {
     fs::create_dir_all(root).map_err(|err| io_error("create restore root", root, err))?;
     let metadata =
@@ -1085,15 +1201,17 @@ fn ensure_restore_root(root: &Path) -> Result<(), StreamingError> {
     Ok(())
 }
 
-fn normalized_relative_components(relative: &str) -> Result<Vec<PathBuf>, FormatError> {
+fn normalized_relative_components(relative: impl AsRef<Path>) -> Result<Vec<PathBuf>, FormatError> {
+    let relative = relative.as_ref();
     let mut parts = Vec::new();
-    for component in Path::new(relative).components() {
+    for component in relative.components() {
         match component {
             Component::Normal(part) => parts.push(PathBuf::from(part)),
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 return Err(FormatError::Parse(format!(
-                    "restore path {relative} is not a normalized relative path"
+                    "restore path {} is not a normalized relative path",
+                    relative.display()
                 )));
             }
         }
@@ -1131,7 +1249,10 @@ fn ensure_restore_directory(path: &Path) -> Result<(), FormatError> {
     }
 }
 
-fn create_restore_dirs_secure(root: &Path, relative: &str) -> Result<PathBuf, FormatError> {
+fn create_restore_dirs_secure(
+    root: &Path,
+    relative: impl AsRef<Path>,
+) -> Result<PathBuf, FormatError> {
     let parts = normalized_relative_components(relative)?;
     let mut current = root.to_path_buf();
     for part in parts {
@@ -1141,7 +1262,10 @@ fn create_restore_dirs_secure(root: &Path, relative: &str) -> Result<PathBuf, Fo
     Ok(current)
 }
 
-fn create_restore_parent_dirs_secure(root: &Path, relative: &str) -> Result<PathBuf, FormatError> {
+fn create_restore_parent_dirs_secure(
+    root: &Path,
+    relative: impl AsRef<Path>,
+) -> Result<PathBuf, FormatError> {
     let parts = normalized_relative_components(relative)?;
     let mut destination = root.to_path_buf();
     for part in &parts[..parts.len().saturating_sub(1)] {
@@ -1155,7 +1279,7 @@ fn create_restore_parent_dirs_secure(root: &Path, relative: &str) -> Result<Path
 
 fn resolve_existing_restore_file_secure(
     root: &Path,
-    relative: &str,
+    relative: impl AsRef<Path>,
 ) -> Result<PathBuf, FormatError> {
     let parts = normalized_relative_components(relative)?;
     let mut target = root.to_path_buf();
@@ -1264,6 +1388,23 @@ impl EntryCatalogSink for CollectingCatalogSink {
     }
 }
 
+/// Sink used by the validation pass before any filesystem entry is created.
+struct RestorePreflightSink;
+
+impl RemTarEntrySink for RestorePreflightSink {
+    fn begin_file(&mut self, _entry: &RemTarStreamEntry) -> Result<(), FormatError> {
+        Ok(())
+    }
+
+    fn write_file_data(&mut self, _bytes: &[u8]) -> Result<(), FormatError> {
+        Ok(())
+    }
+
+    fn end_file(&mut self, _entry: &RemTarStreamEntry) -> Result<(), FormatError> {
+        Ok(())
+    }
+}
+
 struct FilesystemRestoreSink {
     root: PathBuf,
     options: FilesystemRestoreOptions,
@@ -1297,13 +1438,13 @@ impl RemTarEntrySink for FilesystemRestoreSink {
             self.current = RestoreTarget::Skip;
             return Ok(());
         }
-        let relative = normalize_archive_path(Path::new(&entry.path)).map_err(|err| {
-            FormatError::Parse(format!("invalid restore path {}: {err}", entry.path))
-        })?;
+        let resolved = resolve_native_restore_destination(&self.root, &entry.path)?;
+        let relative = resolved.relative;
         match entry.entry_type {
             RemTarEntryType::Regular => {
                 let expected_sha256 = expected_file_sha256(entry)?;
-                let destination = create_restore_parent_dirs_secure(&self.root, relative.as_str())?;
+                let destination =
+                    create_restore_parent_dirs_secure(&self.root, relative.as_path())?;
                 let mut options = OpenOptions::new();
                 options.write(true);
                 if self.options.overwrite {
@@ -1324,7 +1465,7 @@ impl RemTarEntrySink for FilesystemRestoreSink {
                 };
             }
             RemTarEntryType::Directory => {
-                create_restore_dirs_secure(&self.root, relative.as_str())?;
+                create_restore_dirs_secure(&self.root, relative.as_path())?;
                 self.directories_seen += 1;
                 self.current = RestoreTarget::Directory;
             }
@@ -1332,12 +1473,12 @@ impl RemTarEntrySink for FilesystemRestoreSink {
                 let target = entry.link_target.as_deref().ok_or_else(|| {
                     FormatError::Parse(format!("restore hardlink {} is missing target", entry.path))
                 })?;
-                let target_relative = normalize_archive_path(Path::new(target)).map_err(|err| {
-                    FormatError::Parse(format!("invalid restore hardlink target {}: {err}", target))
-                })?;
+                let target_relative =
+                    resolve_native_restore_destination(&self.root, target)?.relative;
                 let source =
-                    resolve_existing_restore_file_secure(&self.root, target_relative.as_str())?;
-                let destination = create_restore_parent_dirs_secure(&self.root, relative.as_str())?;
+                    resolve_existing_restore_file_secure(&self.root, target_relative.as_path())?;
+                let destination =
+                    create_restore_parent_dirs_secure(&self.root, relative.as_path())?;
                 prepare_restore_symlink_destination(&destination, self.options.overwrite)?;
                 create_restore_hardlink(&source, &destination)?;
                 self.hardlinks_written += 1;
@@ -1347,7 +1488,8 @@ impl RemTarEntrySink for FilesystemRestoreSink {
                 let target = entry.link_target.as_deref().ok_or_else(|| {
                     FormatError::Parse(format!("restore symlink {} is missing target", entry.path))
                 })?;
-                let destination = create_restore_parent_dirs_secure(&self.root, relative.as_str())?;
+                let destination =
+                    create_restore_parent_dirs_secure(&self.root, relative.as_path())?;
                 prepare_restore_symlink_destination(&destination, self.options.overwrite)?;
                 create_restore_symlink(target, &destination)?;
                 self.symlinks_written += 1;
@@ -2496,7 +2638,139 @@ mod tests {
     }
 
     #[test]
-    fn restore_rejects_paths_that_escape_destination() {
+    fn native_restore_preflight_rejects_case_fold_collisions_before_materializing() {
+        let mut opts = options();
+        opts.chunk_size = 4096;
+        let first = b"first spelling".to_vec();
+        let second = b"second spelling".to_vec();
+        let (blocks, layout) = rao_blocks_with_payloads(
+            &opts,
+            vec![
+                (
+                    RemTarFileSpec::new(
+                        "Photos/Frame.txt",
+                        "case-first",
+                        first.len() as u64,
+                        sha256_array(&first),
+                    ),
+                    first,
+                ),
+                (
+                    RemTarFileSpec::new(
+                        "photos/frame.TXT",
+                        "case-second",
+                        second.len() as u64,
+                        sha256_array(&second),
+                    ),
+                    second,
+                ),
+            ],
+        );
+        let mut source = VecBlockSource::new(blocks);
+        let root = tempfile::Builder::new()
+            .prefix("remanence-stream-native-collision")
+            .tempdir()
+            .unwrap();
+
+        let error = restore_object_to_directory(
+            &mut source,
+            opts.chunk_size,
+            layout.projected_size_blocks,
+            root.path(),
+            FilesystemRestoreOptions::default(),
+        )
+        .expect_err("case-fold collision must fail restore preflight");
+
+        assert!(
+            matches!(
+                &error,
+                StreamingError::Format(FormatError::InvalidPath(message))
+                    if message.contains("collide after native case folding")
+            ),
+            "{error}"
+        );
+        assert!(
+            root.path().read_dir().unwrap().next().is_none(),
+            "preflight failure must occur before any entry is materialized"
+        );
+    }
+
+    #[test]
+    fn native_restore_preflight_rejects_unicode_normalization_collisions() {
+        let entries = [
+            stream_entry("Caf\u{e9}.txt", RemTarEntryType::Regular),
+            stream_entry("Cafe\u{301}.txt", RemTarEntryType::Regular),
+        ];
+
+        let error =
+            preflight_native_restore_destinations(Path::new("restore-root"), &entries, false)
+                .expect_err("NFC/NFD collision must fail restore preflight");
+
+        assert!(
+            matches!(&error, FormatError::InvalidPath(message) if message.contains("collide")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn native_restore_preflight_rejects_absolute_and_escaping_paths() {
+        for path in ["/absolute.txt", "../outside.txt", "safe/../../outside.txt"] {
+            let entries = [stream_entry(path, RemTarEntryType::Regular)];
+            let error =
+                preflight_native_restore_destinations(Path::new("restore-root"), &entries, false)
+                    .expect_err("absolute or escaping native path must fail restore preflight");
+
+            assert!(
+                matches!(&error, FormatError::InvalidPath(_)),
+                "{path}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_restore_preflight_leaves_clean_golden_restore_byte_exact() {
+        let mut opts = options();
+        opts.chunk_size = 4096;
+        let payload = (0..12_345u32)
+            .map(|value| (value.wrapping_mul(17) % 251) as u8)
+            .collect::<Vec<_>>();
+        let (blocks, layout) = rao_blocks_with_payloads(
+            &opts,
+            vec![(
+                RemTarFileSpec::new(
+                    "clean/golden.bin",
+                    "clean-golden",
+                    payload.len() as u64,
+                    sha256_array(&payload),
+                ),
+                payload.clone(),
+            )],
+        );
+        let mut source = VecBlockSource::new(blocks);
+        let root = tempfile::Builder::new()
+            .prefix("remanence-stream-native-clean")
+            .tempdir()
+            .unwrap();
+
+        let report = restore_object_to_directory(
+            &mut source,
+            opts.chunk_size,
+            layout.projected_size_blocks,
+            root.path(),
+            FilesystemRestoreOptions::default(),
+        )
+        .expect("clean restore");
+
+        assert_eq!(report.files_written, 1);
+        assert_eq!(report.bytes_written, payload.len() as u64);
+        assert_eq!(
+            fs::read(root.path().join("clean/golden.bin")).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn restore_sink_rejects_paths_that_escape_destination() {
         let root = tempfile::Builder::new()
             .prefix("remanence-stream-escape")
             .tempdir()
@@ -2518,7 +2792,7 @@ mod tests {
 
         let err = sink.begin_file(&entry).unwrap_err();
 
-        assert!(err.to_string().contains("invalid restore path"));
+        assert!(matches!(&err, FormatError::InvalidPath(_)), "{err}");
     }
 
     #[test]
