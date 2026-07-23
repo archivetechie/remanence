@@ -219,6 +219,63 @@ fn seal_fixed_vector(
     encrypted
 }
 
+fn current_xwing_encrypted_vectors() -> (Vec<u8>, Vec<u8>) {
+    let p1_plaintext = build_p1_plaintext();
+    let (_, e2_recipients) = e2_recipient_pair();
+    let e2_first = seal_fixed_vector(
+        &p1_plaintext,
+        &p1_options(),
+        e2_recipients.clone(),
+        E2_DEK,
+        E2_HPKE_RNG_SEED,
+    );
+    let e2_second = seal_fixed_vector(
+        &p1_plaintext,
+        &p1_options(),
+        e2_recipients,
+        E2_DEK,
+        E2_HPKE_RNG_SEED,
+    );
+    assert_eq!(e2_first, e2_second, "RAO-TV-E2 regenerates byte-exactly");
+
+    let d1_plaintext = build_d1_plaintext();
+    let (_, d1_recipients) = d1_recipient_pair();
+    let d1_first = seal_fixed_vector(
+        &d1_plaintext,
+        &d1_options(),
+        d1_recipients.clone(),
+        D1_DEK,
+        D1_HPKE_RNG_SEED,
+    );
+    let d1_second = seal_fixed_vector(
+        &d1_plaintext,
+        &d1_options(),
+        d1_recipients,
+        D1_DEK,
+        D1_HPKE_RNG_SEED,
+    );
+    assert_eq!(
+        d1_first, d1_second,
+        "RAO-TV-D1 encrypted half regenerates byte-exactly"
+    );
+
+    for (name, bytes) in [("RAO-TV-E2", &e2_first), ("RAO-TV-D1 encrypted", &d1_first)] {
+        let inspected = inspect_bytes(bytes)
+            .unwrap_or_else(|error| panic!("{name} X-Wing envelope inspects: {error}"));
+        assert_eq!(
+            inspected.header.wrap_suite, RAO_WRAP_SUITE_XWING,
+            "{name} emits only the X-Wing discriminator"
+        );
+        assert!(
+            (remanence_aead::RAO_KEY_FRAME_MIN_LEN..=remanence_aead::RAO_KEY_FRAME_MAX_LEN)
+                .contains(&(inspected.header.key_frame_len as usize)),
+            "{name} key frame is inside the RAO 2.0 bounds"
+        );
+    }
+
+    (e2_first, d1_first)
+}
+
 fn fixture_object_path(filename: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/rao/objects")
@@ -974,22 +1031,8 @@ fn rao_tv_p1_matches_fixture_manifest() {
 #[test]
 fn rao2_xwing_envelopes_are_deterministic_and_range_safe() {
     let p1_plaintext = build_p1_plaintext();
-    let (e2_primary, e2_recipients) = e2_recipient_pair();
-    let e2_first = seal_fixed_vector(
-        &p1_plaintext,
-        &p1_options(),
-        e2_recipients.clone(),
-        E2_DEK,
-        E2_HPKE_RNG_SEED,
-    );
-    let e2_second = seal_fixed_vector(
-        &p1_plaintext,
-        &p1_options(),
-        e2_recipients.clone(),
-        E2_DEK,
-        E2_HPKE_RNG_SEED,
-    );
-    assert_eq!(e2_first, e2_second, "RAO-TV-E2 regenerates byte-exactly");
+    let (e2_primary, _) = e2_recipient_pair();
+    let (e2_first, d1_first) = current_xwing_encrypted_vectors();
     let e2_inspect = inspect_bytes(&e2_first).expect("RAO 2.0 E2 envelope inspects");
     assert_eq!(
         e2_inspect.header.wrap_suite, RAO_WRAP_SUITE_XWING,
@@ -999,25 +1042,7 @@ fn rao2_xwing_envelopes_are_deterministic_and_range_safe() {
     assert_eq!(e2_opened, p1_plaintext);
 
     let d1_plaintext = build_d1_plaintext();
-    let (d1_primary, d1_recipients) = d1_recipient_pair();
-    let d1_first = seal_fixed_vector(
-        &d1_plaintext,
-        &d1_options(),
-        d1_recipients.clone(),
-        D1_DEK,
-        D1_HPKE_RNG_SEED,
-    );
-    let d1_second = seal_fixed_vector(
-        &d1_plaintext,
-        &d1_options(),
-        d1_recipients,
-        D1_DEK,
-        D1_HPKE_RNG_SEED,
-    );
-    assert_eq!(
-        d1_first, d1_second,
-        "RAO-TV-D1 encrypted half regenerates byte-exactly"
-    );
+    let (d1_primary, _) = d1_recipient_pair();
     let d1_fixture = fixture(include_str!("../../../fixtures/rao/rao-tv-d1.json"));
     let d1_expected_plaintext = field(field(&d1_fixture, "expected"), "plaintext");
     let d1_manifest = hex_to_bytes(&str_field(d1_expected_plaintext, "manifest_cbor_hex"));
@@ -1040,7 +1065,8 @@ fn rao2_xwing_envelopes_are_deterministic_and_range_safe() {
     );
     assert_eq!(range_report.chunk_count, 1);
 
-    let (_, d1_open) = open_to_vec(&d1_first, &d1_primary).expect("RAO-TV-D1 opens");
+    let (d1_opened, d1_open) = open_to_vec(&d1_first, &d1_primary).expect("RAO-TV-D1 opens");
+    assert_eq!(d1_opened, d1_plaintext);
     let d1_key_frame = d1_open
         .key_frame
         .serialize()
@@ -1081,7 +1107,8 @@ fn rao2_xwing_envelopes_are_deterministic_and_range_safe() {
 }
 
 #[test]
-fn rao_publication_increment_objects_regenerate_byte_exactly() {
+fn rao_publication_objects_regenerate_byte_exactly() {
+    let (e2, d1_encrypted) = current_xwing_encrypted_vectors();
     let increment_exports: Vec<(&str, Vec<u8>)> = publication_increment_vectors()
         .into_iter()
         .map(|(filename, options, entries)| {
@@ -1095,6 +1122,8 @@ fn rao_publication_increment_objects_regenerate_byte_exactly() {
     if let Some(directory) = std::env::var_os("RAO_VECTOR_EXPORT_DIR") {
         let directory = PathBuf::from(directory);
         fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("rao-tv-e2.rao"), e2).unwrap();
+        fs::write(directory.join("rao-tv-d1-encrypted.rao"), d1_encrypted).unwrap();
         for (filename, bytes) in &increment_exports {
             fs::write(directory.join(filename), bytes).unwrap();
         }

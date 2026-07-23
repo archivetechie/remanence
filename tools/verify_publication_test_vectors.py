@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify archive checksums and complete REM-PARITY Section 17 coverage."""
+"""Verify the standalone RAO/REM-PARITY publication archive and coverage."""
 
 from __future__ import annotations
 
@@ -111,6 +111,15 @@ REQUIRED_RAO_NEGATIVE = {
     "manifest-tamper-swapped-file-sha256": "ManifestDigestMismatch",
     "manifest-tamper-altered-first-chunk-lba": "ManifestDigestMismatch",
 }
+REQUIRED_RAO_ENVELOPE_NEGATIVE = {
+    "legacy-x25519-wrap-suite": "InvalidWrapSuite",
+    "key-frame-len-below-minimum": "InvalidKeyFrameLength",
+    "key-frame-len-above-maximum": "InvalidKeyFrameLength",
+}
+REQUIRED_RAO_KATS = {
+    "xwing-draft10-kat.txt",
+    "xwing-wrap-kat.txt",
+}
 REQUIRED_RAO_RANGE = {
     "encrypted-last-object-chunk": ("positive/range", "authenticated-range"),
     "encrypted-last-object-chunk-wrong-finality": (
@@ -173,6 +182,74 @@ def load_json(path: pathlib.Path) -> dict[str, object]:
     return value
 
 
+def kat_fields(path: pathlib.Path) -> dict[str, bytes]:
+    """Parse one strict name=hex KAT document."""
+    fields: dict[str, bytes] = {}
+    for line in path.read_text(encoding="ascii").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        try:
+            name, encoded = line.split("=", 1)
+            value = bytes.fromhex(encoded)
+        except ValueError as error:
+            fail(f"invalid KAT line in {path}: {line!r}: {error}")
+        if not name or name in fields:
+            fail(f"missing or duplicate KAT field name in {path}: {name!r}")
+        fields[name] = value
+    return fields
+
+
+def verify_xwing_key_frame(stored: bytes, label: str) -> None:
+    """Check the fixed X-Wing envelope discriminator, bounds, and slot sizes."""
+    if len(stored) < 128 or stored[:4] != b"RAO1":
+        fail(f"{label} lacks a complete RAO scalar header")
+    if stored[0x38] != 0x02:
+        fail(f"{label} does not carry wrap_suite 0x02")
+    key_frame_len = int.from_bytes(stored[0x3C:0x40], "big")
+    if not 1191 <= key_frame_len <= 16384:
+        fail(f"{label} key_frame_len is outside [1191,16384]")
+    encoded = stored[128 : 128 + key_frame_len]
+    if len(encoded) != key_frame_len or encoded[:4] != b"RAOK":
+        fail(f"{label} has a truncated or malformed key frame")
+    slot_count = encoded[4]
+    if not 1 <= slot_count <= 8:
+        fail(f"{label} has an invalid slot count")
+    cursor = 5
+    for _ in range(slot_count):
+        if cursor + 18 > len(encoded):
+            fail(f"{label} has a truncated slot prefix")
+        label_len = encoded[cursor + 17]
+        cursor += 18
+        end = cursor + label_len + 1120 + 48
+        if label_len > 32 or end > len(encoded):
+            fail(f"{label} does not carry fixed 1120-byte X-Wing enc values")
+        cursor = end
+    if cursor != len(encoded):
+        fail(f"{label} has trailing key-frame bytes")
+
+
+def verify_xwing_recipient_material(fixture: dict[str, object], label: str) -> None:
+    """Require 32-byte seeds and 1216-byte public keys in staged fixtures."""
+    inputs = fixture.get("inputs")
+    recipients = inputs.get("recipients") if isinstance(inputs, dict) else None
+    if not isinstance(recipients, list) or not recipients:
+        fail(f"{label} has no recipient material")
+    for index, recipient in enumerate(recipients):
+        if not isinstance(recipient, dict):
+            fail(f"{label} recipient {index} is malformed")
+        try:
+            seed = bytes.fromhex(str(recipient.get("private_key")))
+            public_key = bytes.fromhex(str(recipient.get("public_key")))
+        except ValueError:
+            fail(f"{label} recipient {index} key material is not hex")
+        if (
+            len(seed) != 32
+            or len(public_key) != 1216
+            or recipient.get("private_key_role") != "xwing-seed-32"
+        ):
+            fail(f"{label} recipient {index} does not carry X-Wing seed/key sizes")
+
+
 def main() -> int:
     root = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(__file__).resolve().parent
     checksums = root / "CHECKSUMS.sha256"
@@ -186,6 +263,12 @@ def main() -> int:
         actual = sha256(path)
         if actual != expected:
             fail(f"checksum mismatch for {relative}: {actual} != {expected}")
+    for relative in (
+        "tools/verify_rao_vectors_independent.py",
+        "tools/requirements-rao-independent.txt",
+    ):
+        if not (root / relative).is_file():
+            fail(f"standalone independent verifier artifact is absent: {relative}")
 
     rao_root = root / "rao"
     rao_objects = {path.name for path in (rao_root / "objects").glob("*.rao")}
@@ -199,20 +282,69 @@ def main() -> int:
     e2 = load_json(manifests / "rao-tv-e2.json")
     if e2.get("vector_id") != "RAO-TV-E2":
         fail("rao-tv-e2.json has the wrong vector_id")
+    if e2.get("status") != "pinned-at-generation":
+        fail("rao-tv-e2.json is not a current generated vector")
+    verify_xwing_recipient_material(e2, "RAO-TV-E2")
     e2_expected = e2.get("expected")
     if not isinstance(e2_expected, dict) or e2_expected.get("stored_digest") != sha256(
         rao_root / "objects" / "rao-tv-e2.rao"
     ):
         fail("RAO-TV-E2 stored_digest does not match its pinned object")
+    verify_xwing_key_frame(
+        (rao_root / "objects" / "rao-tv-e2.rao").read_bytes(),
+        "RAO-TV-E2",
+    )
     d1 = load_json(manifests / "rao-tv-d1.json")
+    if d1.get("encrypted_status") != "pinned-at-generation":
+        fail("rao-tv-d1.json encrypted half is not a current generated vector")
+    verify_xwing_recipient_material(d1, "RAO-TV-D1 encrypted")
     d1_expected = d1.get("expected")
     d1_encrypted = d1_expected.get("encrypted") if isinstance(d1_expected, dict) else None
     if not isinstance(d1_encrypted, dict) or d1_encrypted.get("stored_digest") != sha256(
         rao_root / "objects" / "rao-tv-d1-encrypted.rao"
     ):
         fail("RAO-TV-D1 encrypted stored_digest does not match its pinned object")
+    verify_xwing_key_frame(
+        (rao_root / "objects" / "rao-tv-d1-encrypted.rao").read_bytes(),
+        "RAO-TV-D1 encrypted",
+    )
+
+    kat_root = rao_root / "kats"
+    kat_files = {path.name for path in kat_root.glob("*.txt")}
+    if kat_files != REQUIRED_RAO_KATS:
+        fail(
+            "RAO KAT inventory differs: "
+            f"missing={sorted(REQUIRED_RAO_KATS - kat_files)}, "
+            f"extra={sorted(kat_files - REQUIRED_RAO_KATS)}"
+        )
+    draft10 = kat_fields(kat_root / "xwing-draft10-kat.txt")
+    wrap = kat_fields(kat_root / "xwing-wrap-kat.txt")
+    for name, size in {
+        "seed": 32,
+        "eseed": 64,
+        "ss": 32,
+        "pk": 1216,
+        "enc": 1120,
+    }.items():
+        if len(draft10.get(name, b"")) != size:
+            fail(f"draft-10 X-Wing KAT field {name} is not {size} bytes")
+    for name, size in {
+        "seed": 32,
+        "encapsulation_randomness": 64,
+        "dek": 32,
+        "recipient_epoch_id": 16,
+        "slot_index": 1,
+        "pk": 1216,
+        "enc": 1120,
+        "ss": 32,
+        "ciphertext": 48,
+    }.items():
+        if len(wrap.get(name, b"")) != size:
+            fail(f"RAO X-Wing wrap KAT field {name} is not {size} bytes")
 
     rao_index = load_json(rao_root / "vectors.json")
+    if rao_index.get("vector_set") != "RAO-2.0-PUBLICATION-INCREMENT":
+        fail("rao/vectors.json has the wrong vector_set")
     rao_vectors = rao_index.get("vectors")
     if not isinstance(rao_vectors, list) or not all(
         isinstance(item, dict) for item in rao_vectors
@@ -238,6 +370,17 @@ def main() -> int:
             f"missing={sorted(set(REQUIRED_RAO_NEGATIVE) - set(rao_negative))}, "
             f"extra={sorted(set(rao_negative) - set(REQUIRED_RAO_NEGATIVE))}"
         )
+    rao_envelope_negative = {
+        item.get("id"): item
+        for item in rao_vectors
+        if item.get("category") == "negative/envelope"
+    }
+    if set(rao_envelope_negative) != set(REQUIRED_RAO_ENVELOPE_NEGATIVE):
+        fail(
+            "RAO envelope-negative coverage differs: "
+            f"missing={sorted(set(REQUIRED_RAO_ENVELOPE_NEGATIVE) - set(rao_envelope_negative))}, "
+            f"extra={sorted(set(rao_envelope_negative) - set(REQUIRED_RAO_ENVELOPE_NEGATIVE))}"
+        )
     rao_ranges = {
         item.get("id"): item
         for item in rao_vectors
@@ -261,9 +404,12 @@ def main() -> int:
         if hashlib.sha256(canonical).hexdigest() != item.get("checksum_sha256"):
             fail(f"RAO vector checksum mismatch for {item.get('id')}")
         vector_root = rao_root
-        if item.get("category") == "negative/manifest" or item.get(
-            "category"
-        ) in {"positive/range", "negative/range"}:
+        if item.get("category") in {
+            "negative/manifest",
+            "negative/envelope",
+            "positive/range",
+            "negative/range",
+        }:
             vector_root /= item["archive_path"]
         for artifact in artifacts:
             path = vector_root / artifact["path"]
@@ -325,6 +471,34 @@ def main() -> int:
                 ):
                     fail(f"RAO tamper {item['id']} did not change plaintext_digest")
                 tamper_digests.add(expected.get("plaintext_digest"))
+        elif item.get("category") == "negative/envelope":
+            expected = load_json(vector_root / "expected.json")
+            input_value = load_json(vector_root / "input.json")
+            required_error = REQUIRED_RAO_ENVELOPE_NEGATIVE[item["id"]]
+            faulted = vector_root / "faulted-object.rao"
+            if (
+                expected.get("expected_error") != required_error
+                or item.get("expected_error") != required_error
+                or expected.get("faulted_sha256") != sha256(faulted)
+                or item.get("faulted_sha256") != sha256(faulted)
+            ):
+                fail(f"RAO envelope negative {item['id']} has inconsistent pins")
+            base = rao_root / str(input_value.get("base_artifact"))
+            if (
+                not base.is_file()
+                or input_value.get("base_sha256") != sha256(base)
+            ):
+                fail(f"RAO envelope negative {item['id']} has the wrong base")
+            faulted_bytes = faulted.read_bytes()
+            if item["id"] == "legacy-x25519-wrap-suite":
+                if faulted_bytes[0x38] != 0x01:
+                    fail("legacy wrap-suite negative does not carry 0x01")
+            elif item["id"] == "key-frame-len-below-minimum":
+                if int.from_bytes(faulted_bytes[0x3C:0x40], "big") != 1190:
+                    fail("below-minimum key-frame negative does not carry 1190")
+            elif item["id"] == "key-frame-len-above-maximum":
+                if int.from_bytes(faulted_bytes[0x3C:0x40], "big") != 16385:
+                    fail("above-maximum key-frame negative does not carry 16385")
         elif item.get("category") in {"positive/range", "negative/range"}:
             expected = load_json(vector_root / "expected.json")
             input_value = load_json(vector_root / "input.json")
