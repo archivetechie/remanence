@@ -1119,7 +1119,7 @@ fn resume_rejects_object_rows_that_cannot_fit_bootstrap() {
                 1,
                 [tape_file_number as u8; 32],
             )
-            .with_object_id([tape_file_number as u8; 16])
+            .with_object_id([((tape_file_number % 255) + 1) as u8; 64])
         })
         .collect::<Vec<_>>();
     let append_position = committed_prefix
@@ -6166,7 +6166,7 @@ fn bootstrap_object_row_fit_budget_includes_final_reference_overhead() {
                 1,
                 [tape_file_number as u8; 32],
             )
-            .with_object_id([tape_file_number as u8; 16]),
+            .with_object_id([((tape_file_number % 255) + 1) as u8; 64]),
         );
         if sink.validate_bootstrap_object_rows_fit(&rows).is_err()
             && legacy_object_rows_fit_without_final_overhead(&sink, &rows).is_ok()
@@ -6200,7 +6200,7 @@ fn begin_object_with_bootstrap_row_admission_rejects_before_raw_write() {
                 1,
                 [tape_file_number as u8; 32],
             )
-            .with_object_id([tape_file_number as u8; 16]);
+            .with_object_id([((tape_file_number % 255) + 1) as u8; 64]);
             let mut candidate = rows.clone();
             candidate.push(row);
             if sink.validate_bootstrap_object_rows_fit(&candidate).is_err() {
@@ -6308,7 +6308,7 @@ fn checkpoint_batch_headroom_uses_encrypted_max_rows_and_refuses_before_motion()
                     OBJECT_ROW_METADATA_FRAME_MAX_LEN,
                     4096,
                 )
-                .with_object_id([index as u8; 16]),
+                .with_object_id([((index % 255) + 1) as u8; 64]),
             )
             .expect("reserved encrypted-max row records without a ceiling failure");
             sink.finish_object().expect("reserved object closes");

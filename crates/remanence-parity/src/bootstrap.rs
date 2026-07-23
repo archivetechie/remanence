@@ -126,8 +126,9 @@ pub struct BootstrapObjectRow {
     pub tape_file_number: u32,
     /// Number of fixed-size tape blocks occupied by the stored copy.
     pub stored_block_count: u64,
-    /// RAO object UUID. Schema minors 0..=2 may decode this as absent.
-    pub object_id: Option<[u8; 16]>,
+    /// Verbatim 1–64-byte RAO object identifier. Schema minors 0..=2 may
+    /// decode this as absent.
+    pub object_id: Option<Vec<u8>>,
     /// Representation-specific recovery anchors for the copy.
     pub representation: BootstrapObjectRepresentation,
 }
@@ -175,9 +176,12 @@ impl BootstrapObjectRow {
         }
     }
 
-    /// Bind this recovery row to the RAO object UUID emitted by Layer 3b.
-    pub fn with_object_id(mut self, object_id: [u8; 16]) -> Self {
-        self.object_id = Some(object_id);
+    /// Bind this recovery row to the verbatim RAO object identifier bytes.
+    ///
+    /// The row validator rejects empty, over-64-byte, or NUL-containing
+    /// values before encoding or admission.
+    pub fn with_object_id(mut self, object_id: impl Into<Vec<u8>>) -> Self {
+        self.object_id = Some(object_id.into());
         self
     }
 }
@@ -968,10 +972,10 @@ pub(crate) fn encode_bootstrap_object_row_cbor(
             CborValue::Integer(row.stored_block_count.into()),
         ),
     ];
-    if let Some(object_id) = row.object_id {
+    if let Some(object_id) = row.object_id.as_ref() {
         entries.push((
             CborValue::Integer(4.into()),
-            CborValue::Bytes(object_id.to_vec()),
+            CborValue::Bytes(object_id.clone()),
         ));
     }
     match &row.representation {
@@ -1089,12 +1093,7 @@ pub(crate) fn decode_bootstrap_object_row_cbor(
                 stored_block_count = Some(int_to_u64(i, "object_row.stored_block_count")?)
             }
             (4, CborValue::Bytes(bytes)) => {
-                object_id = Some(bytes.try_into().map_err(|bytes: Vec<u8>| {
-                    ParityError::BootstrapParse(format!(
-                        "object_row.object_id has length {}, expected 16",
-                        bytes.len()
-                    ))
-                })?)
+                object_id = Some(bytes);
             }
             (10, CborValue::Integer(i)) => {
                 manifest_first_chunk_lba =
@@ -1275,6 +1274,13 @@ pub(crate) fn validate_bootstrap_object_row(
         return Err(ParityError::BootstrapParse(
             "object row stored_block_count must be positive".into(),
         ));
+    }
+    if let Some(object_id) = row.object_id.as_ref() {
+        if !(1..=64).contains(&object_id.len()) || object_id.contains(&0) {
+            return Err(ParityError::BootstrapParse(
+                "object row object_id must contain 1..=64 non-NUL bytes".into(),
+            ));
+        }
     }
     match &row.representation {
         BootstrapObjectRepresentation::Plaintext {
@@ -1718,6 +1724,45 @@ mod tests {
 
         assert_eq!(parsed.object_rows, payload.object_rows);
         assert_eq!(parsed, payload);
+    }
+
+    #[test]
+    fn object_row_variable_length_object_ids_round_trip_verbatim() {
+        let uuid_string = b"123e4567-e89b-12d3-a456-426614174000".to_vec();
+        let max_length_id = vec![b'x'; 64];
+        assert_eq!(uuid_string.len(), 36);
+        let mut payload = sample_payload();
+        payload.object_rows = vec![
+            BootstrapObjectRow::plaintext(1, 8, 6, 1234, 1, [0xA1; 32])
+                .with_object_id(uuid_string.clone()),
+            BootstrapObjectRow::encrypted(3, 11, vec![[0x24; 16]], 66, 207)
+                .with_object_id(max_length_id.clone()),
+        ];
+        let mut buf = vec![0u8; payload.block_size_bytes as usize];
+
+        write_bootstrap_block(&payload, &mut buf).expect("variable object ids encode");
+        let parsed = parse_bootstrap_block(&buf).expect("variable object ids decode");
+
+        assert_eq!(parsed.object_rows[0].object_id.as_ref(), Some(&uuid_string));
+        assert_eq!(
+            parsed.object_rows[1].object_id.as_ref(),
+            Some(&max_length_id)
+        );
+    }
+
+    #[test]
+    fn object_row_rejects_object_id_longer_than_64_bytes() {
+        let mut payload = sample_payload();
+        payload.object_rows = vec![BootstrapObjectRow::plaintext(1, 8, 6, 1234, 1, [0xA1; 32])
+            .with_object_id(vec![b'x'; 65])];
+        let mut buf = vec![0u8; payload.block_size_bytes as usize];
+
+        let err = write_bootstrap_block(&payload, &mut buf)
+            .expect_err("65-byte object id must not be encoded");
+
+        assert!(
+            matches!(err, ParityError::BootstrapParse(message) if message.contains("1..=64 non-NUL"))
+        );
     }
 
     #[test]

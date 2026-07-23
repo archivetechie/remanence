@@ -2032,14 +2032,14 @@ mod tests {
             directory_scope_total_data_ordinals: 1,
             directory_scope_highest_protected_ordinal: 1,
             is_final_directory: true,
-            entries: vec![synthetic_directory_entry(1, 11)],
+            entries: vec![synthetic_directory_entry(1, 0)],
         };
         let second_directory = SidecarEpochDirectory {
             directory_scope_tape_file_count: 6,
             directory_scope_total_data_ordinals: 1,
             directory_scope_highest_protected_ordinal: 1,
             is_final_directory: true,
-            entries: vec![synthetic_directory_entry(3, 22)],
+            entries: vec![synthetic_directory_entry(3, 0)],
         };
         let provisional_first =
             encode_test_parity_map(first_sequence, first_directory.clone(), [0; 32], "first");
@@ -2047,7 +2047,7 @@ mod tests {
             encode_test_parity_map(second_sequence, second_directory.clone(), [0; 32], "second");
         let first_map = FilemarkMap::new(vec![
             TapeFileMapEntry::bootstrap(0, 1),
-            TapeFileMapEntry::parity_sidecar(1, 1, 11, 0, 1),
+            TapeFileMapEntry::parity_sidecar(1, 1, 0, 0, 1),
             TapeFileMapEntry::parity_map(2, provisional_first.blocks.len() as u64),
             TapeFileMapEntry::object(3, 1, 0),
             TapeFileMapEntry::parity_map(4, provisional_second.blocks.len() as u64),
@@ -2058,7 +2058,7 @@ mod tests {
             TapeFileMapEntry::bootstrap(0, 1),
             TapeFileMapEntry::object(1, 1, 0),
             TapeFileMapEntry::parity_map(2, provisional_first.blocks.len() as u64),
-            TapeFileMapEntry::parity_sidecar(3, 1, 22, 0, 1),
+            TapeFileMapEntry::parity_sidecar(3, 1, 0, 0, 1),
             TapeFileMapEntry::parity_map(4, provisional_second.blocks.len() as u64),
             TapeFileMapEntry::bootstrap(5, 1),
         ])
@@ -2232,7 +2232,7 @@ mod tests {
         let sidecar = encode_sidecar_tape_file(
             &SidecarDescriptor {
                 tape_uuid: TAPE_UUID,
-                epoch_id: 31,
+                epoch_id: 0,
                 k: 2,
                 m: 1,
                 stripes_per_epoch: 1,

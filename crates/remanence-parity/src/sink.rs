@@ -141,7 +141,7 @@ fn worst_case_bootstrap_object_row(
                 manifest_chunk_count,
                 [0xFF; 32],
             )
-            .with_object_id([0xFF; 16]))
+            .with_object_id([0xFF; 64]))
         }
         BootstrapObjectRowAdmission::EncryptedRao => Ok(BootstrapObjectRow::encrypted(
             tape_file_number,
@@ -150,7 +150,7 @@ fn worst_case_bootstrap_object_row(
             OBJECT_ROW_METADATA_FRAME_MAX_LEN,
             4096,
         )
-        .with_object_id([0xFF; 16])),
+        .with_object_id([0xFF; 64])),
     }
 }
 

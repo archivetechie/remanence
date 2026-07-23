@@ -22,9 +22,9 @@ use crate::mapping::{ordinal_to_stripe_in_epoch, stripe_data_to_ordinal_in_epoch
 use crate::model::{ParityScheme, SidecarMetadataHealth, StripeAddress, StripePosition};
 use crate::raw::{PhysicalPositionHint, RawReadOutcome, RawTapeSource};
 use crate::sidecar::{
-    data_shard_crc64, parity_shard_crc64, parse_sidecar_footer_block, parse_sidecar_header_block,
-    parse_sidecar_index_blocks, DecodedSidecarIndex, ParityShardIndexEntry, SidecarCopyKind,
-    SidecarFooter,
+    data_shard_crc64, parity_block_position, parity_shard_crc64, parse_sidecar_footer_block,
+    parse_sidecar_header_block, parse_sidecar_index_blocks, DecodedSidecarIndex,
+    ParityShardIndexEntry, SidecarCopyKind, SidecarFooter, SidecarHeader,
 };
 
 /// Result of reconstructing one protected object-data block from a sidecar.
@@ -371,23 +371,15 @@ fn recover_ordinal_from_sidecar_inside_boundary(
     for parity_index in 0..m {
         let shard_index = k + parity_index;
         attempted[shard_index] = true;
-        if let Some((entry_index, entry)) = sidecar
-            .index
-            .index
-            .parity_entries
-            .iter()
-            .enumerate()
-            .find(|(_, entry)| {
-                entry.stripe_index == failed_stripe.stripe_index
-                    && entry.parity_index == parity_index as u16
-            })
-        {
+        if let Some(entry) = sidecar.index.index.parity_entries.iter().find(|entry| {
+            entry.stripe_index == failed_stripe.stripe_index
+                && entry.parity_index == parity_index as u16
+        }) {
             shards[shard_index] = read_verified_parity_peer(
                 source,
                 scoped_map,
                 sidecar_entry,
-                sidecar.index.header.shard_index_block_count,
-                entry_index,
+                &sidecar.index.header,
                 entry,
                 block_size,
             )?;
@@ -584,14 +576,13 @@ fn read_bulk_window_peers(
 
         for parity_index in 0..scheme.parity_blocks_per_stripe {
             let parity_entry_index = parity_entry_index(sidecar, *stripe_index, parity_index)?;
-            let block_within_file = u64::from(sidecar.header.shard_index_block_count)
-                .checked_add(
-                    u64::try_from(parity_entry_index)
-                        .map_err(|_| ParityError::Invariant("parity entry index overflows u64"))?,
-                )
-                .ok_or(ParityError::Invariant(
-                    "sidecar parity block offset overflows",
-                ))?;
+            let block_within_file = parity_block_position(
+                *stripe_index,
+                parity_index,
+                sidecar.header.stripes_per_epoch,
+                sidecar.header.m,
+                sidecar.header.shard_index_block_count,
+            );
             let entry = sidecar
                 .index
                 .parity_entries
@@ -1117,18 +1108,17 @@ fn read_verified_parity_peer(
     source: &mut dyn RawTapeSource,
     scoped_map: &ScopedFilemarkMap,
     sidecar_entry: &TapeFileMapEntry,
-    index_block_count: u32,
-    parity_entry_index: usize,
+    header: &SidecarHeader,
     entry: &ParityShardIndexEntry,
     block_size: u32,
 ) -> Result<Option<Vec<u8>>, ParityError> {
-    let parity_offset = u64::try_from(parity_entry_index)
-        .map_err(|_| ParityError::Invariant("parity entry index overflows u64"))?;
-    let block_within_file = u64::from(index_block_count)
-        .checked_add(parity_offset)
-        .ok_or(ParityError::Invariant(
-            "sidecar parity block offset overflows",
-        ))?;
+    let block_within_file = parity_block_position(
+        entry.stripe_index,
+        entry.parity_index,
+        header.stripes_per_epoch,
+        header.m,
+        header.shard_index_block_count,
+    );
     let position = TapeFilePosition {
         tape_file_number: sidecar_entry.tape_file_number,
         block_within_file,
@@ -1887,21 +1877,23 @@ mod tests {
         stripe_index: u32,
         parity_index: u16,
     ) -> usize {
-        let (entry_index, _) = sidecar
+        let entry = sidecar
             .index
             .parity_entries
             .iter()
-            .enumerate()
-            .find(|(_, entry)| {
-                entry.stripe_index == stripe_index && entry.parity_index == parity_index
-            })
+            .find(|entry| entry.stripe_index == stripe_index && entry.parity_index == parity_index)
             .unwrap_or_else(|| {
                 panic!(
                     "sidecar must contain parity shard stripe {stripe_index} parity {parity_index}"
                 )
             });
-        let block_within_file =
-            u64::from(sidecar.header.shard_index_block_count) + u64::try_from(entry_index).unwrap();
+        let block_within_file = parity_block_position(
+            entry.stripe_index,
+            entry.parity_index,
+            sidecar.header.stripes_per_epoch,
+            sidecar.header.m,
+            sidecar.header.shard_index_block_count,
+        );
         let physical = scoped
             .map
             .physical_position(TapeFilePosition {
@@ -4379,7 +4371,13 @@ mod tests {
             .map
             .physical_position(TapeFilePosition {
                 tape_file_number: 2,
-                block_within_file: u64::from(sidecar.header.shard_index_block_count),
+                block_within_file: parity_block_position(
+                    0,
+                    0,
+                    sidecar.header.stripes_per_epoch,
+                    sidecar.header.m,
+                    sidecar.header.shard_index_block_count,
+                ),
             })
             .unwrap();
         damaged_lbas.push(usize::try_from(parity_position.lba).unwrap());
@@ -5865,6 +5863,235 @@ mod tests {
                 assert_eq!(limit, scheme.parity_blocks_per_stripe);
             }
             other => panic!("expected unrecoverable overloaded stripe, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parity_index_major_full_epoch_boundary_burst_threshold() {
+        let scheme = scheme(2, 2, 3);
+        let object_blocks = (1..=6).map(block).collect::<Vec<_>>();
+        let sidecar = sidecar_for_epoch(&scheme, &object_blocks);
+        let scoped = scoped_map(sidecar.blocks.len() as u64, object_blocks.len() as u64);
+        let h = u64::from(sidecar.header.shard_index_block_count);
+        let recoverable_len = u64::from(scheme.parity_blocks_per_stripe)
+            * u64::from(scheme.stripes_per_neighborhood)
+            + h
+            + 1;
+        let unrecoverable_len = recoverable_len + 1;
+        let burst_start_ordinal = u64::from(scheme.data_blocks_per_stripe - 1)
+            * u64::from(scheme.stripes_per_neighborhood);
+        let burst_start = scoped
+            .map
+            .position_for_ordinal(burst_start_ordinal)
+            .and_then(|position| scoped.map.physical_position(position))
+            .expect("full-epoch boundary burst start is mapped")
+            .lba;
+        let recoverable_damage = (burst_start..burst_start + recoverable_len)
+            .map(|lba| lba as usize)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recoverable_damage.last().copied(),
+            Some(parity_lba_for_shard(
+                &scoped,
+                2,
+                &sidecar,
+                scheme.stripes_per_neighborhood - 1,
+                0,
+            )),
+            "recoverable burst ends before parity index 1 returns to stripe 0"
+        );
+
+        for failed_ordinal in burst_start_ordinal..object_blocks.len() as u64 {
+            let mut raw = raw_tape(&object_blocks, &sidecar.blocks);
+            raw.unreadable_lbas = recoverable_damage.clone();
+            let recovered = recover_ordinal_from_sidecar(
+                &mut raw,
+                &scoped,
+                &scheme,
+                TAPE_UUID,
+                BLOCK_SIZE,
+                failed_ordinal,
+            )
+            .unwrap_or_else(|err| {
+                panic!(
+                    "full-epoch boundary burst of m*S+H+1 blocks should recover ordinal {failed_ordinal}: {err}"
+                )
+            });
+            assert_eq!(
+                recovered.recovered_block, object_blocks[failed_ordinal as usize],
+                "full-epoch boundary recovery is byte-identical"
+            );
+        }
+
+        let mut raw = raw_tape(&object_blocks, &sidecar.blocks);
+        raw.unreadable_lbas = (burst_start..burst_start + unrecoverable_len)
+            .map(|lba| lba as usize)
+            .collect();
+        assert_eq!(
+            raw.unreadable_lbas.last().copied(),
+            Some(parity_lba_for_shard(&scoped, 2, &sidecar, 0, 1)),
+            "one additional block loses stripe 0 parity index 1"
+        );
+        let err = recover_ordinal_from_sidecar(
+            &mut raw,
+            &scoped,
+            &scheme,
+            TAPE_UUID,
+            BLOCK_SIZE,
+            burst_start_ordinal,
+        )
+        .expect_err("full-epoch boundary burst of m*S+H+2 blocks overloads stripe 0");
+        assert!(matches!(
+            err,
+            ParityError::Unrecoverable {
+                lost_count: 3,
+                limit: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parity_index_major_short_epoch_boundary_residual() {
+        let scheme = scheme(2, 2, 3);
+        let real_data_shards = 2u64;
+        assert!(
+            real_data_shards < u64::from(scheme.stripes_per_neighborhood),
+            "fixture must be a short epoch with R < S"
+        );
+        let object_blocks = (31..33).map(block).collect::<Vec<_>>();
+        let sidecar = sidecar_for_epoch(&scheme, &object_blocks);
+        let scoped = scoped_map(sidecar.blocks.len() as u64, real_data_shards);
+        let h = u64::from(sidecar.header.shard_index_block_count);
+        let unrecoverable_len = u64::from(scheme.parity_blocks_per_stripe - 1)
+            * u64::from(scheme.stripes_per_neighborhood)
+            + real_data_shards
+            + h
+            + 2;
+        let recoverable_len = unrecoverable_len - 1;
+        let burst_start = scoped
+            .map
+            .position_for_ordinal(0)
+            .and_then(|position| scoped.map.physical_position(position))
+            .expect("short-epoch boundary burst start is mapped")
+            .lba;
+        let recoverable_damage = (burst_start..burst_start + recoverable_len)
+            .map(|lba| lba as usize)
+            .collect::<Vec<_>>();
+
+        for failed_ordinal in 0..real_data_shards {
+            let mut raw = raw_tape(&object_blocks, &sidecar.blocks);
+            raw.unreadable_lbas = recoverable_damage.clone();
+            let recovered = recover_ordinal_from_sidecar(
+                &mut raw,
+                &scoped,
+                &scheme,
+                TAPE_UUID,
+                BLOCK_SIZE,
+                failed_ordinal,
+            )
+            .unwrap_or_else(|err| {
+                panic!(
+                    "short-epoch boundary burst one below the residual should recover ordinal {failed_ordinal}: {err}"
+                )
+            });
+            assert_eq!(
+                recovered.recovered_block, object_blocks[failed_ordinal as usize],
+                "short-epoch boundary recovery is byte-identical"
+            );
+        }
+
+        let mut raw = raw_tape(&object_blocks, &sidecar.blocks);
+        raw.unreadable_lbas = (burst_start..burst_start + unrecoverable_len)
+            .map(|lba| lba as usize)
+            .collect();
+        assert_eq!(
+            raw.unreadable_lbas.last().copied(),
+            Some(parity_lba_for_shard(&scoped, 2, &sidecar, 0, 1)),
+            "the residual threshold reaches stripe 0 parity index 1"
+        );
+        let err =
+            recover_ordinal_from_sidecar(&mut raw, &scoped, &scheme, TAPE_UUID, BLOCK_SIZE, 0)
+                .expect_err("short-epoch residual burst must overload stripe 0");
+        assert!(matches!(
+            err,
+            ParityError::Unrecoverable {
+                lost_count: 3,
+                limit: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parity_index_major_multi_epoch_recovery_round_trip_is_byte_identical() {
+        let scheme = scheme(2, 2, 3);
+        let epoch_data_shards = data_shards_per_epoch(&scheme).unwrap();
+        let second_epoch_real_shards = 2usize;
+        let object_blocks = (71..71 + epoch_data_shards as u8 + second_epoch_real_shards as u8)
+            .map(block)
+            .collect::<Vec<_>>();
+        let epoch_split = epoch_data_shards as usize;
+        let first_sidecar = sidecar_for_epoch_at(&scheme, 0, 0, &object_blocks[..epoch_split]);
+        let second_sidecar =
+            sidecar_for_epoch_at(&scheme, 1, epoch_data_shards, &object_blocks[epoch_split..]);
+        let scoped = scoped_two_epoch_sidecar_map(
+            first_sidecar.blocks.len() as u64,
+            second_sidecar.blocks.len() as u64,
+            object_blocks.len() as u64,
+            epoch_data_shards,
+        );
+
+        for sidecar in [&first_sidecar, &second_sidecar] {
+            let stripe_one_parity_zero = parity_block_position(
+                1,
+                0,
+                sidecar.header.stripes_per_epoch,
+                sidecar.header.m,
+                sidecar.header.shard_index_block_count,
+            ) as usize;
+            let stripe_zero_parity_one = parity_block_position(
+                0,
+                1,
+                sidecar.header.stripes_per_epoch,
+                sidecar.header.m,
+                sidecar.header.shard_index_block_count,
+            ) as usize;
+            assert_eq!(
+                parity_shard_crc64(&sidecar.blocks[stripe_one_parity_zero]),
+                sidecar.index.parity_entries[2].parity_shard_crc64
+            );
+            assert_eq!(
+                parity_shard_crc64(&sidecar.blocks[stripe_zero_parity_one]),
+                sidecar.index.parity_entries[1].parity_shard_crc64
+            );
+            assert_eq!(sidecar.index.parity_entries[1].stripe_index, 0);
+            assert_eq!(sidecar.index.parity_entries[1].parity_index, 1);
+        }
+
+        for failed_ordinal in 0..object_blocks.len() as u64 {
+            let mut raw = raw_tape_two_epoch_sidecars(
+                &object_blocks,
+                &first_sidecar.blocks,
+                &second_sidecar.blocks,
+            );
+            let recovered = recover_ordinal_from_sidecar(
+                &mut raw,
+                &scoped,
+                &scheme,
+                TAPE_UUID,
+                BLOCK_SIZE,
+                failed_ordinal,
+            )
+            .unwrap_or_else(|err| {
+                panic!(
+                    "undamaged multi-epoch recovery should reconstruct ordinal {failed_ordinal}: {err}"
+                )
+            });
+            assert_eq!(
+                recovered.recovered_block, object_blocks[failed_ordinal as usize],
+                "multi-epoch recovery is byte-identical"
+            );
         }
     }
 

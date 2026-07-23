@@ -4420,7 +4420,7 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
                         )
                     })?,
                     stored_block_count: u64::MAX,
-                    object_id: [0xFF; 16],
+                    object_id: vec![0xFF; 64],
                     representation:
                         remanence_state::CheckpointBootstrapObjectRepresentation::Encrypted {
                             recipient_epoch_ids: (1u8..=8).map(|byte| [byte; 16]).collect(),
@@ -4824,7 +4824,7 @@ fn checkpoint_projection_for_no_parity_write(
                 "batched no-parity object is missing its bootstrap recovery row".to_string(),
             )
         })?;
-    let object_id = bootstrap_object_row.object_id.ok_or_else(|| {
+    let object_id = bootstrap_object_row.object_id.clone().ok_or_else(|| {
         PoolWriteError::InvalidInput(
             "batched no-parity bootstrap recovery row is missing object_id".to_string(),
         )
@@ -5232,7 +5232,7 @@ fn planned_checkpoint_bootstrap_row(
     Ok(remanence_state::CheckpointBootstrapObjectRow {
         tape_file_number,
         stored_block_count,
-        object_id: *prepared.object_uuid.as_bytes(),
+        object_id: prepared.options.object_id.as_bytes().to_vec(),
         representation,
     })
 }
@@ -5773,7 +5773,7 @@ fn no_parity_write_report(
                 layout.manifest.chunk_count,
                 layout.manifest_sha256,
             )
-            .with_object_id(*prepared.object_uuid.as_bytes()),
+            .with_object_id(prepared.options.object_id.as_bytes().to_vec()),
         ),
     };
     let object = ObjectCatalogProjection {
@@ -5891,7 +5891,7 @@ fn write_encrypted_object_to_parity(
             encrypted.envelope.metadata_frame_len,
             encrypted.envelope.header.key_frame_len,
         )
-        .with_object_id(*prepared.object_uuid.as_bytes()),
+        .with_object_id(prepared.options.object_id.as_bytes().to_vec()),
     )?;
     let object_close = parity.finish_object()?;
     if opened.0 != object_close.tape_file_number {
@@ -5936,7 +5936,7 @@ fn no_parity_encrypted_write_report(
                 encrypted.envelope.metadata_frame_len,
                 encrypted.envelope.header.key_frame_len,
             )
-            .with_object_id(*prepared.object_uuid.as_bytes()),
+            .with_object_id(prepared.options.object_id.as_bytes().to_vec()),
         ),
     };
     encrypted_write_report(

@@ -98,6 +98,10 @@ pub enum ParityError {
     #[error("parity-map parse error: {0}")]
     ParityMapParse(String),
 
+    /// A sidecar epoch directory violates a required structural invariant.
+    #[error("DirectoryInvalid: {0}")]
+    DirectoryInvalid(String),
+
     /// The bootstrap recorded a parity scheme the running reader
     /// doesn't support.
     #[error("parity scheme mismatch: bootstrap says {tape}, reader expects {expected}")]

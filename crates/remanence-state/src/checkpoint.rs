@@ -26,8 +26,8 @@ pub struct CheckpointBootstrapObjectRow {
     pub tape_file_number: u32,
     /// Number of fixed-size records occupied by the stored copy.
     pub stored_block_count: u64,
-    /// RAO object UUID.
-    pub object_id: [u8; 16],
+    /// Verbatim 1–64-byte RAO object identifier.
+    pub object_id: Vec<u8>,
     /// Representation-specific recovery anchors.
     pub representation: CheckpointBootstrapObjectRepresentation,
 }
@@ -87,7 +87,7 @@ impl CheckpointBootstrapObjectRow {
                 *key_frame_len,
             ),
         };
-        row.with_object_id(self.object_id)
+        row.with_object_id(self.object_id.clone())
     }
 }
 
@@ -501,16 +501,15 @@ fn validate_next_record(
                 projection.object.object_id
             )));
         }
-        let parsed_object_id =
-            uuid::Uuid::parse_str(&projection.object.object_id).map_err(|err| {
-                StateError::JournalReplayFailed(format!(
-                    "checkpoint object id {} is not a UUID: {err}",
-                    projection.object.object_id
-                ))
-            })?;
-        if row.object_id != *parsed_object_id.as_bytes() {
+        uuid::Uuid::parse_str(&projection.object.object_id).map_err(|err| {
+            StateError::JournalReplayFailed(format!(
+                "checkpoint object id {} is not a UUID: {err}",
+                projection.object.object_id
+            ))
+        })?;
+        if row.object_id != projection.object.object_id.as_bytes() {
             return Err(StateError::JournalReplayFailed(format!(
-                "checkpoint object {} bootstrap row has a different object UUID",
+                "checkpoint object {} bootstrap row has a different object_id",
                 projection.object.object_id
             )));
         }
@@ -630,7 +629,7 @@ mod tests {
                 bootstrap_object_row: CheckpointBootstrapObjectRow {
                     tape_file_number: 1,
                     stored_block_count: 3,
-                    object_id: *object_uuid.as_bytes(),
+                    object_id: object_uuid.to_string().into_bytes(),
                     representation: CheckpointBootstrapObjectRepresentation::Plaintext {
                         manifest_first_chunk_lba: 1,
                         manifest_size_bytes: 1,
@@ -660,7 +659,7 @@ mod tests {
         record.objects[0].fresh_tape = false;
         record.objects[0].total_committed_ordinals = 6;
         record.objects[0].bootstrap_object_row.tape_file_number = 3;
-        record.objects[0].bootstrap_object_row.object_id = *object_uuid.as_bytes();
+        record.objects[0].bootstrap_object_row.object_id = object_uuid.to_string().into_bytes();
         record
     }
 
