@@ -439,8 +439,6 @@ pub fn write_prepared_object_to_parity_from_readers(
     let manifest_first_chunk_lba = layout.manifest.first_chunk_lba.ok_or_else(|| {
         StreamingError::InvalidInput("generated RAO manifest has no body LBA".to_string())
     })?;
-    let object_id = uuid::Uuid::parse_str(options.object_id.as_str())
-        .map_err(|err| StreamingError::InvalidInput(format!("invalid RAO object UUID: {err}")))?;
     parity.record_bootstrap_object_row(
         BootstrapObjectRow::plaintext(
             opened.0,
@@ -450,7 +448,7 @@ pub fn write_prepared_object_to_parity_from_readers(
             layout.manifest.chunk_count,
             layout.manifest_sha256,
         )
-        .with_object_id(*object_id.as_bytes()),
+        .with_object_id(options.object_id.as_bytes().to_vec()),
     )?;
     let object_close = parity.finish_object()?;
     if opened.0 != object_close.tape_file_number {
@@ -1941,6 +1939,11 @@ mod tests {
         assert_eq!(
             bootstrap_object_row.stored_block_count,
             report.layout.projected_size_blocks
+        );
+        assert_eq!(
+            bootstrap_object_row.object_id.as_deref(),
+            Some(opts.object_id.as_bytes()),
+            "bootstrap binding carries the RAO object_id string bytes verbatim"
         );
         match &bootstrap_object_row.representation {
             BootstrapObjectRepresentation::Plaintext {

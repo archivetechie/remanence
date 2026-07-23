@@ -6893,7 +6893,7 @@ BCw3Wyv2UWY=
                     bootstrap_object_row: remanence_state::CheckpointBootstrapObjectRow {
                         tape_file_number: 1,
                         stored_block_count: 3,
-                        object_id: *object_uuid.as_bytes(),
+                        object_id: object_uuid.to_string().into_bytes(),
                         representation:
                             remanence_state::CheckpointBootstrapObjectRepresentation::Plaintext {
                                 manifest_first_chunk_lba: 1,
@@ -6960,7 +6960,7 @@ BCw3Wyv2UWY=
                 bootstrap_object_row: remanence_state::CheckpointBootstrapObjectRow {
                     tape_file_number: object_tape_file,
                     stored_block_count: block_count,
-                    object_id: *object_uuid.as_bytes(),
+                    object_id: object_uuid.to_string().into_bytes(),
                     representation:
                         remanence_state::CheckpointBootstrapObjectRepresentation::Plaintext {
                             manifest_first_chunk_lba: 1,

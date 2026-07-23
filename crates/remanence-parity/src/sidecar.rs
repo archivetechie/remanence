@@ -249,7 +249,8 @@ pub struct DecodedSidecarTapeFile {
     pub header: SidecarHeader,
     /// Validated sidecar index entries.
     pub index: SidecarIndex,
-    /// Raw parity shard blocks in `(stripe_index, parity_index)` order.
+    /// Raw parity shards restored to stripe-major index-entry order, regardless
+    /// of their parity-index-major physical block placement.
     pub parity_shards: Vec<Vec<u8>>,
 }
 
@@ -311,11 +312,37 @@ pub fn data_shard_crc64(block: &[u8]) -> u64 {
     crc64_xz(block)
 }
 
+/// Locate a parity shard within its sidecar tape file.
+///
+/// Sidecar index entries remain stripe-major, but physical parity blocks are
+/// parity-index-major. `stripes_per_epoch` is the constant scheme `S` recorded
+/// in the sidecar header, including for short epochs.
+pub fn parity_block_position(
+    stripe_index: u32,
+    parity_index: u16,
+    stripes_per_epoch: u32,
+    parity_blocks_per_stripe: u16,
+    shard_index_block_count: u32,
+) -> u64 {
+    assert!(
+        stripe_index < stripes_per_epoch,
+        "parity stripe index must be below scheme S"
+    );
+    assert!(
+        parity_index < parity_blocks_per_stripe,
+        "parity index must be below scheme m"
+    );
+    u64::from(shard_index_block_count)
+        + u64::from(parity_index) * u64::from(stripes_per_epoch)
+        + u64::from(stripe_index)
+}
+
 /// Encode sidecar header/index blocks from a descriptor and index entries.
 ///
 /// The returned blocks contain block 0 and any spilled index blocks. Raw
 /// parity-shard blocks are intentionally not appended; the caller writes them
-/// after these blocks using the same `(stripe_index, parity_index)` order.
+/// after these blocks using [`parity_block_position`]. The index stream itself
+/// remains in `(stripe_index, parity_index)` order.
 pub fn encode_sidecar_index_blocks(
     descriptor: &SidecarDescriptor,
     index: &SidecarIndex,
@@ -348,7 +375,9 @@ pub fn encode_sidecar_index_blocks(
 ///
 /// The returned `blocks` are ready to write as one filemark-delimited sidecar
 /// tape file: primary header/index block(s), raw parity shard blocks, tail
-/// header/index block(s), then the footer locator. Parity shard CRCs are
+/// header/index block(s), then the footer locator. The supplied shards and
+/// emitted index entries are stripe-major; raw parity blocks are placed
+/// parity-index-major via [`parity_block_position`]. Parity shard CRCs are
 /// computed from the supplied shard bytes and stored in the index.
 pub fn encode_sidecar_tape_file<B: AsRef<[u8]>>(
     descriptor: &SidecarDescriptor,
@@ -388,8 +417,26 @@ pub fn encode_sidecar_tape_file<B: AsRef<[u8]>>(
     let encoded_index = encode_sidecar_index_blocks(descriptor, &index)?;
     let mut blocks = encoded_index.blocks;
     blocks.reserve(parity_shards.len() + encoded_index.header.shard_index_block_count as usize + 1);
-    for shard in parity_shards {
-        blocks.push(shard.as_ref().to_vec());
+    for parity_index in 0..descriptor.m {
+        for stripe_index in 0..descriptor.stripes_per_epoch {
+            let entry_index = usize::try_from(
+                u64::from(stripe_index) * u64::from(descriptor.m) + u64::from(parity_index),
+            )
+            .map_err(|_| sidecar_parse("sidecar parity entry index overflows usize"))?;
+            let block_position = parity_block_position(
+                stripe_index,
+                parity_index,
+                descriptor.stripes_per_epoch,
+                descriptor.m,
+                encoded_index.header.shard_index_block_count,
+            );
+            if block_position != blocks.len() as u64 {
+                return Err(sidecar_parse(
+                    "sidecar parity locator disagrees with physical emission order",
+                ));
+            }
+            blocks.push(parity_shards[entry_index].as_ref().to_vec());
+        }
     }
     let block_size = descriptor.block_size as usize;
     let mut tail_blocks = pack_index_blocks(block_size, &index)?;
@@ -828,7 +875,14 @@ pub fn parse_sidecar_tape_file<B: AsRef<[u8]>>(
     let block_size = decoded.header.block_size as usize;
     let mut parity_shards = Vec::with_capacity(p);
     for (i, entry) in decoded.index.parity_entries.iter().enumerate() {
-        let block_index = h + i;
+        let block_index = usize::try_from(parity_block_position(
+            entry.stripe_index,
+            entry.parity_index,
+            decoded.header.stripes_per_epoch,
+            decoded.header.m,
+            decoded.header.shard_index_block_count,
+        ))
+        .map_err(|_| sidecar_parse("sidecar parity block position overflows usize"))?;
         let shard = blocks[block_index].as_ref();
         if shard.len() != block_size {
             return Err(sidecar_parse(format!(
@@ -1751,8 +1805,31 @@ mod tests {
             .expect("encode full sidecar");
         let expected_blocks = encoded.header.sidecar_total_block_count;
         assert_eq!(encoded.blocks.len(), expected_blocks as usize);
-        let first_parity_block = encoded.header.shard_index_block_count as usize;
-        assert_eq!(encoded.blocks[first_parity_block], parity_shards[0]);
+        let stripe_one_parity_zero = parity_block_position(
+            1,
+            0,
+            desc.stripes_per_epoch,
+            desc.m,
+            encoded.header.shard_index_block_count,
+        ) as usize;
+        let stripe_zero_parity_one = parity_block_position(
+            0,
+            1,
+            desc.stripes_per_epoch,
+            desc.m,
+            encoded.header.shard_index_block_count,
+        ) as usize;
+        assert_eq!(encoded.blocks[stripe_one_parity_zero], parity_shards[2]);
+        assert_eq!(encoded.blocks[stripe_zero_parity_one], parity_shards[1]);
+        assert_eq!(
+            encoded.index.parity_entries[1],
+            ParityShardIndexEntry {
+                stripe_index: 0,
+                parity_index: 1,
+                parity_shard_crc64: parity_shard_crc64(&parity_shards[1]),
+            },
+            "index entries remain stripe-major while physical blocks do not"
+        );
         assert_eq!(
             encoded.index.parity_entries[0].parity_shard_crc64,
             parity_shard_crc64(&parity_shards[0])
@@ -2190,7 +2267,13 @@ mod tests {
         let data_crcs = data_crc64s_for(&desc);
         let mut encoded = encode_sidecar_tape_file(&desc, &parity_shards, data_crcs)
             .expect("encode full sidecar");
-        let first_parity_block = encoded.header.shard_index_block_count as usize;
+        let first_parity_block = parity_block_position(
+            0,
+            0,
+            desc.stripes_per_epoch,
+            desc.m,
+            encoded.header.shard_index_block_count,
+        ) as usize;
         encoded.blocks[first_parity_block][0] ^= 0x01;
 
         let err = parse_sidecar_tape_file(&encoded.blocks, &desc.tape_uuid).unwrap_err();
