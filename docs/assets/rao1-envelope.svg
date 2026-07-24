@@ -37,5 +37,5 @@
   <rect class="rsd" x="120" y="94" width="16" height="12"/>
   <text class="rtd" x="142" y="104">ciphertext — ChaCha20-Poly1305</text>
   <text class="rtd" x="20" y="130">chunk nonces count up and the final byte flags the last chunk, so truncation is always detectable</text>
-  <text class="rtd" x="20" y="146">a fresh DEK is HPKE-wrapped per recipient; header + exact key-frame bytes bind every slot into HKDF-SHA-256 derivation</text>
+  <text class="rtd" x="20" y="146">a fresh DEK is wrapped per recipient via HPKE + the X-Wing hybrid KEM; header + exact key-frame bytes bind every slot into HKDF-SHA-256 derivation</text>
 </svg>
