@@ -6,7 +6,7 @@
       "name": "The ArchiveTech Project"
     }
   ],
-  "description": "Remanence is open Rust infrastructure for writing archives to LTO tape and reading them back decades later: library control, tape I/O, erasure-coded parity, and a self-describing on-tape object format. The repository is the reference implementation of two published specifications: the RAO (Rem Archive Object) Format 1.0 — a constrained POSIX pax tar container with per-file SHA-256 identities, closed-form byte-range addressing, a deterministic CBOR manifest, and an HPKE wrapped-DEK encrypted representation — and the REM-PARITY 1.0 tape format for catalog-less, parity-protected recovery from bare tape. The specifications and their pinned test-vector archive are in specs/publication/. Licensing is a permissive split: the Rust reference implementation is Apache-2.0, the specification prose is CC-BY-4.0, and the conformance test vectors are CC0-1.0.",
+  "description": "Remanence is open Rust infrastructure for writing archives to LTO tape and reading them back decades later: library control, tape I/O, erasure-coded parity, and a self-describing on-tape object format. The repository is the reference implementation of two published specifications: the RAO (Rem Archive Object) Format 2.0 — a constrained POSIX pax tar container with per-file SHA-256 identities, closed-form byte-range addressing, a deterministic CBOR manifest, and a post-quantum encrypted representation (HPKE Base over the X-Wing hybrid KEM: X25519 + ML-KEM-768, per draft-connolly-cfrg-xwing-kem-10; the legacy X25519-only wrap suite is forbidden) — and the REM-PARITY 1.0 tape format for catalog-less, parity-protected recovery from bare tape. The specifications and their pinned test-vector archive are in specs/publication/. Licensing is a permissive split: the Rust reference implementation is Apache-2.0, the specification prose is CC-BY-4.0, and the conformance test vectors are CC0-1.0.",
   "license": "apache-2.0",
   "keywords": [
     "digital preservation",
@@ -15,6 +15,9 @@
     "file format",
     "erasure coding",
     "tar",
-    "HPKE"
+    "HPKE",
+    "post-quantum cryptography",
+    "ML-KEM",
+    "X-Wing"
   ]
 }
