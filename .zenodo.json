@@ -19,5 +19,12 @@
     "post-quantum cryptography",
     "ML-KEM",
     "X-Wing"
+  ],
+  "related_identifiers": [
+    {
+      "relation": "isDocumentedBy",
+      "identifier": "https://archivetech.org",
+      "scheme": "url"
+    }
   ]
 }
