@@ -34,13 +34,10 @@ format specifications — and their plain-language companion — live in
 - [pfr-reference.md](pfr-reference.md) — partial-file restore mechanics.
 - [reference-extract-stream-protocol.md](reference-extract-stream-protocol.md)
   — the ranged-ciphertext extract-stream contract.
-- [cli-design-v0.1.md](cli-design-v0.1.md) — the design record behind the
-  `rem` / `rem-debug` split.
-- [layer5-roadmap.md](layer5-roadmap.md) — daemon surface, slice by slice.
 - [formal-verification-status.md](formal-verification-status.md) — what
   is Lean-proved, and what is deliberately not.
 
-[INDEX.md](INDEX.md) lists every document in this directory with a
-one-line purpose. Internal engineering records (design iterations, review
-transcripts, dispatch records) are kept outside the repository; git
-history preserves everything that ever lived here.
+This page lists every current document in this directory. Internal
+engineering records (design iterations, review transcripts, dispatch
+records) are kept outside the repository; git history preserves
+everything that ever lived here.

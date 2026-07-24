@@ -3,7 +3,7 @@
 Project-internal terms and the tape-industry vocabulary Remanence leans
 on. Definitions reflect what the code does today, not aspirations.
 
-<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-aead/src/header.rs crates/remanence-parity/src/lib.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-aead/src/header.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs crates/remanence-parity/src/lib.rs @ 8de2c46 -->
 ## Formats and objects
 
 **RAO** — Rem Archive Object, the native stored-object format. One RAO
@@ -25,13 +25,25 @@ writer, recovery mode, or CLI flag for it.
 
 **format version 2 (HPKE envelope)** — a RAO1 shape with no shared
 secret: a fresh per-object **data-encryption key (DEK)** is generated
-and wrapped once per recipient with HPKE (RFC 9180, X25519-HKDF-SHA256-
-ChaCha20Poly1305) into a **key frame** (wire tag `RAOK`, 1-8 recipient
-slots accepted by readers) sitting between the header and metadata frame.
-Production sealers require 2-8 distinct recipient epochs. `archive build`,
+and wrapped once per recipient with HPKE (RFC 9180 Base mode, HKDF-
+SHA256, ChaCha20-Poly1305) running the **X-Wing hybrid KEM** (see below)
+into a **key frame** (wire tag `RAOK`, 1-8 recipient slots accepted by
+readers) sitting between the header and metadata frame. Production
+sealers require 2-8 distinct recipient epochs. `archive build`,
 pool-selected `archive write`, and a full `archive reseal` produce it;
 `archive extract`/`restore`/`read`/`verify`, the streaming range commands,
 and `rao-recover` open it with a matching RAOP private key.
+
+**X-Wing hybrid KEM** — the key-encapsulation mechanism (KEM) that wraps
+each recipient's copy of the DEK: ML-KEM-768 (a post-quantum lattice
+scheme, FIPS 203) combined with X25519 (classical elliptic-curve
+Diffie-Hellman) by the combiner in `draft-connolly-cfrg-xwing-kem`,
+plugged into HPKE as KEM id `0x647a`. A recipient's public key (`RAOR`
+file) is a 1216-byte serialized X-Wing encapsulation key; the matching
+private key (`RAOP` file) is a 32-byte seed. Wrap-suite id `0x01`, an
+earlier pre-production X25519-only KEM, is permanently reserved and
+rejected by current readers and sealers alike — every RAO1 object this
+codebase produces or accepts uses the X-Wing hybrid.
 
 **covering range** — the mapping, computed once by `remanence-aead`,
 from a requested plaintext byte range to the smallest span of AEAD

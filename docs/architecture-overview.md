@@ -1,9 +1,7 @@
 # Architecture overview
 
 How the pieces of Remanence fit together, grounded in the code as it is
-today. For byte formats see the [tape layout reference](reference-tape-layout.md);
-for the historical design record see the layer design docs indexed in
-[INDEX.md](INDEX.md).
+today. For byte formats see the [tape layout reference](reference-tape-layout.md).
 
 <!-- code-anchor: Cargo.toml @ 2a20106 -->
 ## The layer model
@@ -90,7 +88,7 @@ of the CLI and API do not pull the legacy BRU reader (that one guards the
 `foreign-bru` feature seam). An external project can build its own layout
 and catalog on the platform crates without inheriting Remanence's formats.
 
-<!-- code-anchor: crates/remanence-format/src/lib.rs crates/remanence-parity/src/lib.rs crates/remanence-aead/src/lib.rs crates/remanence-format-driver/src/lib.rs crates/remanence-stream/src/lib.rs crates/remanence-bru/src/lib.rs crates/remanence-crc/src/lib.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-format/src/lib.rs crates/remanence-parity/src/lib.rs crates/remanence-aead/src/lib.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/header.rs crates/remanence-format-driver/src/lib.rs crates/remanence-stream/src/lib.rs crates/remanence-bru/src/lib.rs crates/remanence-crc/src/lib.rs @ 8de2c46 -->
 ## Layer 3: formats and parity
 
 Six crates share this layer:
@@ -105,11 +103,13 @@ Six crates share this layer:
   format-version-2 envelope (HKDF-SHA-256 key derivation and a
   ChaCha20-Poly1305 STREAM). It generates a fresh per-object
   data-encryption key and wraps a copy of it to each recipient with HPKE
-  (RFC 9180 Base mode,
-  X25519-HKDF-SHA256-ChaCha20Poly1305) in a `RAOK`-tagged key frame
-  between the header and metadata frame. Readers accept 1-8 slots;
-  production sealers require 2-8 distinct epochs. There is no shared
-  secret, and format version 1 is permanently rejected as unsupported.
+  Base mode running the X-Wing hybrid KEM (ML-KEM-768 combined with
+  X25519, per `draft-connolly-cfrg-xwing-kem`; IANA HPKE KEM id `0x647a`)
+  in a `RAOK`-tagged key frame between the header and metadata frame.
+  Readers accept 1-8 slots; production sealers require 2-8 distinct
+  epochs. There is no shared secret. Wrap-suite id `0x01`, the
+  pre-production X25519-only KEM, is permanently reserved and rejected
+  on both read and write, same as format version 1.
   The crate depends on no other Remanence crate, so the envelope is
   auditable on its own. Its whole-object and ranged primitives are
   wrapped by `remanence-format`, which is the funnel used by the CLI,

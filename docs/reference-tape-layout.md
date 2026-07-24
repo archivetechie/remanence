@@ -98,7 +98,7 @@ a promise, it is the format.
 
 *Fig. 2 — A rao-v1 stored object in stream order: identity in the pax global header, one chunk-aligned member per file, the CBOR manifest as the last member, then tar end-of-archive records padded to a chunk multiple.*
 
-<!-- code-anchor: crates/remanence-aead/src/header.rs crates/remanence-aead/src/stream.rs crates/remanence-aead/src/kdf.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-aead/src/header.rs crates/remanence-aead/src/stream.rs crates/remanence-aead/src/kdf.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs @ 8de2c46 -->
 ## The encrypted envelope: RAO1
 
 An encrypted object wraps the same tar byte stream in an AEAD envelope.
@@ -108,16 +108,24 @@ and rejected with `UnsupportedFormatVersion`; there is no compatibility
 reader or writer.
 
 - The fixed plaintext scalar header is 128 bytes. Bytes `0x10..0x20` are
-  reserved and must be zero. Byte `0x38` is wrap-suite id `0x01` (HPKE,
-  RFC 9180 Base mode, X25519-HKDF-SHA256-ChaCha20Poly1305), bytes
-  `0x39..0x3c` are reserved-zero, and `0x3c..0x40` holds the key-frame
-  length.
+  reserved and must be zero. Byte `0x38` is the wrap-suite id, fixed at
+  `0x02` (HPKE, RFC 9180 Base mode, running the X-Wing post-quantum/
+  classical hybrid KEM — ML-KEM-768 combined with X25519 per
+  `draft-connolly-cfrg-xwing-kem`, IANA HPKE KEM id `0x647a` — with
+  HKDF-SHA256 and ChaCha20-Poly1305). Wrap-suite id `0x01`, the
+  pre-production X25519-only KEM, is permanently reserved; both readers
+  and sealers reject it. Bytes `0x39..0x3c` are reserved-zero, and
+  `0x3c..0x40` holds the key-frame length.
 - A plaintext **key frame** follows immediately (wire tag `RAOK`). Readers
   accept 1-8 slots; production sealers require 2-8 distinct recipient
   epochs in ascending slot order. Each slot is
-  `[slot_index][recipient_epoch_id:16][label][enc:32][ciphertext:48]` and
-  carries one HPKE-wrapped copy of the object's freshly generated 32-byte
-  data-encryption key (DEK).
+  `[slot_index][recipient_epoch_id:16][label][enc:1120][ciphertext:48]`
+  and carries one X-Wing-encapsulated copy of the object's freshly
+  generated 32-byte data-encryption key (DEK); the 1120-byte `enc` field
+  is the X-Wing ciphertext, and the 48-byte `ciphertext` field is the DEK
+  itself wrapped under the resulting shared secret (32-byte key plus a
+  16-byte AEAD tag). The key-frame length is bounds-checked to
+  1191-16384 bytes.
 - An authenticated metadata frame, then the payload as an age-style
   STREAM: each chunk is `chunk_size` bytes of ciphertext plus a 16-byte
   tag, with an 11-byte counter nonce whose final byte flags the last

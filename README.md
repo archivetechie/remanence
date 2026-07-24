@@ -23,7 +23,7 @@ reasoning is laid out in [docs/why-remanence.md](docs/why-remanence.md).
 It is developed against a QuadStor virtual tape library and field-tested
 on an HPE MSL3040 with LTO-9 drives.
 
-<!-- code-anchor: Cargo.toml crates proto/layer5.proto @ 2a20106 -->
+<!-- code-anchor: Cargo.toml crates proto/layer5.proto @ 8de2c46 -->
 ## Status
 
 Pre-alpha, version 0.0.1. Interfaces and the gRPC contract may still
@@ -38,8 +38,10 @@ REM-PARITY 1.0) are specified and implemented. Working today:
   watermark-gated host-RAM read reservoir with proof-frontier ranged
   reads, the `rao-v1` object format, the `RAO1` encrypted envelope
   (a fresh per-object key, wrapped to multiple recipient public keys via
-  HPKE, stored in the object's own header), and Reed-Solomon sidecar
-  parity with recovery, resume, and catalog-less scan.
+  HPKE Base mode running the X-Wing post-quantum/classical hybrid KEM —
+  ML-KEM-768 combined with X25519, per `draft-connolly-cfrg-xwing-kem` —
+  stored in the object's own header), and Reed-Solomon sidecar parity
+  with recovery, resume, and catalog-less scan.
 - Layer 4 state: audit log, per-tape journals, and a SQLite catalog that
   is a rebuildable projection, plus media-readiness records and tape-I/O
   fences.
@@ -161,14 +163,14 @@ RAO object files follow the same discipline: they contain only the
 object's stored bytes — tape filemarks, bootstrap rows, and parity
 sidecars are tape-only framing.
 
-<!-- code-anchor: Cargo.toml @ 2a20106 -->
+<!-- code-anchor: Cargo.toml @ 8de2c46 -->
 ## Repository layout
 
 ```text
 crates/remanence-scsi           Layer 1 SCSI CDB/SG_IO primitives
 crates/remanence-library        Layer 2 library model/ops and Layer 3a tape I/O
 crates/remanence-crc            Shared CRC-64/XZ
-crates/remanence-aead           RAO1 encrypted-envelope primitives (HPKE wrapped-DEK)
+crates/remanence-aead           RAO1 encrypted-envelope primitives (X-Wing-hybrid HPKE wrapped-DEK)
 crates/remanence-format-driver  Published format-driver traits
 crates/remanence-format         Native rao-v1 body format
 crates/remanence-bru            Foreign-tape migration: legacy BRU reader (opt-in feature, never in default build)
@@ -181,7 +183,7 @@ crates/remanence-cli            rem and rem-debug binaries
 crates/rao-recover              Standalone catalogless RAO disaster-recovery binary
 crates/remanence-chaos          Fault-injection scaffolding (excluded from CI gates)
 specs/publication/              Published format specifications + test vectors
-docs/                           Guides, references, design records (see INDEX.md)
+docs/                           Guides and references (see docs/README.md)
 proto/                          Layer 5 protobuf contract
 verif/                          Lean/Aeneas proof targets
 fieldtest/                      Physical field-test kit and runbooks
