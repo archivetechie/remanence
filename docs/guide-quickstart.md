@@ -94,16 +94,17 @@ never depends on host state.
 
 *Fig. 1 — The local round trip: build a rao-v1 object from a directory, read it back, and prove the copies identical — the same bytes a tape write stores as the object body.*
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-aead/src/lib.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-aead/src/lib.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/xwing.rs @ 8de2c46 -->
 ## The encrypted variant
 
 The encrypted representation wraps the same tar stream in an
 authenticated ChaCha20-Poly1305 envelope. This is the only encrypted
 representation: every
 object gets a fresh data-encryption key, wrapped separately to each
-recipient with HPKE (RFC 9180 Base mode,
-X25519-HKDF-SHA256-ChaCha20Poly1305). Writers require 2-8 distinct recipient
-epochs in ascending slot order.
+recipient with HPKE (RFC 9180 Base mode, HKDF-SHA256, ChaCha20-Poly1305)
+running the X-Wing post-quantum/classical hybrid KEM (ML-KEM-768
+combined with X25519). Writers require 2-8 distinct recipient epochs in
+ascending slot order.
 
 Remanence consumes canonical RAOR public-key files and RAOP private-key
 files; key-pair provisioning belongs to the custodian/key-registry tooling,
