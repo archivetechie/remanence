@@ -3,6 +3,8 @@
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21425126.svg)](https://doi.org/10.5281/zenodo.21425126)
 
+**Website:** [archivetech.org](https://archivetech.org) — overview, the formats explained, and how to verify them.
+
 Remanence is open Rust infrastructure for writing archives to LTO tape
 and getting them back decades later. It is the mechanism layer of an
 archive system: a daemon and CLIs that discover tape libraries, move
