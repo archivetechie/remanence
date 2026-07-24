@@ -27,7 +27,7 @@ on an HPE MSL3040 with LTO-9 drives.
 ## Status
 
 Pre-alpha, version 0.0.1. Interfaces and the gRPC contract may still
-change before a stable release; the published on-tape formats (RAO 1.0,
+change before a stable release; the published on-tape formats (RAO 2.0,
 REM-PARITY 1.0) are specified and implemented. Working today:
 
 - Layer 1 SCSI primitives and Layer 2 library discovery, identity,
@@ -36,12 +36,13 @@ REM-PARITY 1.0) are specified and implemented. Working today:
   I/O with position proofs (this is now the only write/read path — the
   earlier non-pipelined mode and its config flag are gone), a
   watermark-gated host-RAM read reservoir with proof-frontier ranged
-  reads, the `rao-v1` object format, the `RAO1` encrypted envelope
-  (a fresh per-object key, wrapped to multiple recipient public keys via
-  HPKE Base mode running the X-Wing post-quantum/classical hybrid KEM —
-  ML-KEM-768 combined with X25519, per `draft-connolly-cfrg-xwing-kem` —
-  stored in the object's own header), and Reed-Solomon sidecar parity
-  with recovery, resume, and catalog-less scan.
+  reads, the `rao-v1` object format, the RAO 2.0 encrypted representation
+  using the fixed `RAO1` format-family magic, and Reed-Solomon sidecar
+  parity with recovery, resume, and catalog-less scan. The encrypted
+  representation's fresh per-object key is wrapped to multiple recipients
+  with HPKE Base mode running the X-Wing post-quantum/classical hybrid KEM
+  (ML-KEM-768 combined with X25519, per
+  `draft-connolly-cfrg-xwing-kem-10`) and stored in the object's own header.
 - Layer 4 state: audit log, per-tape journals, and a SQLite catalog that
   is a rebuildable projection, plus media-readiness records and tape-I/O
   fences.
@@ -134,7 +135,7 @@ tape write, is [docs/guide-quickstart.md](docs/guide-quickstart.md).
   a plain-language companion to the specifications: the motivation and
   the design, without the normative terseness.
 - Published format specifications:
-  [RAO Format 1.0](specs/publication/rao-object-format-1.0.md) and
+  [RAO Format 2.0](specs/publication/rao-object-format-1.0.md) and
   [REM-PARITY 1.0](specs/publication/rem-parity-1.0-specification.md),
   with their pinned test-vector archive alongside.
 - [proto/layer5.proto](proto/layer5.proto) — the draft gRPC contract.
@@ -170,7 +171,7 @@ sidecars are tape-only framing.
 crates/remanence-scsi           Layer 1 SCSI CDB/SG_IO primitives
 crates/remanence-library        Layer 2 library model/ops and Layer 3a tape I/O
 crates/remanence-crc            Shared CRC-64/XZ
-crates/remanence-aead           RAO1 encrypted-envelope primitives (X-Wing-hybrid HPKE wrapped-DEK)
+crates/remanence-aead           RAO 2.0 encrypted-representation primitives (fixed RAO1 family magic; X-Wing HPKE wrapped-DEK)
 crates/remanence-format-driver  Published format-driver traits
 crates/remanence-format         Native rao-v1 body format
 crates/remanence-bru            Foreign-tape migration: legacy BRU reader (opt-in feature, never in default build)

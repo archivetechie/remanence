@@ -809,7 +809,7 @@ strictly increasing `tape_file_number` order:
 | 13 | bytes .size 32 | plaintext only | `manifest_sha256` |
 | 21 | uint | encrypted only | RAO encrypted-header `metadata_frame_len`; bounds `[17, 16 MiB]` |
 | 22 | array of bytes .size 16 | encrypted only | RAO key-frame `recipient_epoch_id` values; 1 through 8 distinct nonzero ids |
-| 23 | uint | encrypted only | RAO encrypted-header `key_frame_len`; bounds `[103, 4096]` |
+| 23 | uint | encrypted only | RAO encrypted-header `key_frame_len`; bounds `[1191, 16384]` |
 
 Key 10 (`manifest_first_chunk_lba`) is the zero-based block index, *within
 the object's tape file*, of the first block of the manifest entry's payload —
