@@ -4,9 +4,9 @@ Notable changes to Remanence and its published formats. The format
 specifications carry their own revision histories; entries here are
 per-release summaries.
 
-## RAO 2.0 / v2.0.0 (pending)
+## RAO 2.0 / v2.0.0 — 2026-07-24
 
-Publication pending; RAO 2.0 version DOI pending (concept DOI
+Archived: DOI [10.5281/zenodo.21531003](https://doi.org/10.5281/zenodo.21531003) (concept DOI
 [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126)).
 
 - **Post-quantum encrypted representation:** X-Wing

@@ -7,7 +7,7 @@
 | Date | 2026-07-24 (RAO 2.0 — post-quantum encrypted representation) |
 | License | CC-BY-4.0 |
 | Concept DOI (all versions) | [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126) |
-| Version DOI (this release) | assigned at release |
+| Version DOI (this release) | [10.5281/zenodo.21531003](https://doi.org/10.5281/zenodo.21531003) |
 | Envelope magic | `RAO1` (fixed encrypted-envelope format-family constant) |
 | Stream format identifier | `rao-v1` (plaintext representation) |
 | On-tape format version | `2` (HPKE wrapped-DEK envelope; X-Wing wrap suite `0x02`) |
