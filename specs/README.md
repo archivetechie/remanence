@@ -2,7 +2,7 @@
 
 The published, citable specifications live in [publication/](publication/):
 
-- [rao-object-format-1.0.md](publication/rao-object-format-1.0.md) — the
+- [rao-object-format.md](publication/rao-object-format.md) — the
   **RAO (Rem Archive Object) Format Specification, Version 1.0**: the
   archival object container, its manifest, closed-form byte-range
   addressing, and the encrypted envelope.

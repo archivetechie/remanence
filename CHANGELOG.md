@@ -4,7 +4,7 @@ Notable changes to Remanence and its published formats. The format
 specifications carry their own revision histories; entries here are
 per-release summaries.
 
-## RAO 2.0 / vX.Y.Z (pending)
+## RAO 2.0 / v2.0.0 (pending)
 
 Publication pending; RAO 2.0 version DOI pending (concept DOI
 [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126)).

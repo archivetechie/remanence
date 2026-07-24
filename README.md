@@ -135,7 +135,7 @@ tape write, is [docs/guide-quickstart.md](docs/guide-quickstart.md).
   a plain-language companion to the specifications: the motivation and
   the design, without the normative terseness.
 - Published format specifications:
-  [RAO Format 2.0](specs/publication/rao-object-format-1.0.md) and
+  [RAO Format 2.0](specs/publication/rao-object-format.md) and
   [REM-PARITY 1.0](specs/publication/rem-parity-1.0-specification.md),
   with their pinned test-vector archive alongside.
 - [proto/layer5.proto](proto/layer5.proto) — the draft gRPC contract.

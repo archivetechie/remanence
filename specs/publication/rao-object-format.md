@@ -1499,8 +1499,9 @@ The repository's `xwing-draft10-kat.txt` and `xwing-wrap-kat.txt`, also
 included in the companion vector archive, freeze seed-to-key, encapsulation,
 shared-secret, and HPKE wrapped-DEK bytes. The versioned IETF archive is the
 pinned prose provenance, and the static KATs are the in-repository byte-level
-freeze. A PDF copy is intended for release archival but is not present in
-this repository revision.
+freeze. A copy of the draft-10 text is archived in this repository at
+`specs/publication/provenance/draft-connolly-cfrg-xwing-kem-10.txt`, SHA-256
+`530900ac0519e28eb1ff50bf80ecdb7648add22e500db72b465bab4fb6b6a5ec`.
 
 ### 5.4. Key Inputs and Identification
 

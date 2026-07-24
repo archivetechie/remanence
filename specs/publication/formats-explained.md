@@ -252,6 +252,18 @@ encrypted — separately to each of at least two recipients, and the
 wrapped copies are stored in the object's own header. A recipient is
 simply a keypair, and sealing requires only its public half.
 
+**Locked against tomorrow's computers.** The wrapping that protects each
+object's key is *post-quantum*. A stolen tape is a patient target: an
+adversary who cannot break its encryption today can simply keep it and wait
+for a future quantum computer — the "harvest now, decrypt later" problem,
+which matters far more for an archive meant to stay secret for decades than
+for a fleeting network session. So the key is wrapped with **X-Wing**, a
+hybrid that combines a long-trusted classical algorithm (X25519) with a
+NIST-standardised post-quantum one (ML-KEM-768): an attacker must break
+*both* to recover the key, and it stays safe even if one of the two is ever
+broken. There is exactly one way to encrypt an object, and it is the
+quantum-resistant one — no weaker option exists to choose by mistake.
+
 Three consequences follow, each of them intended:
 
 - **The sealing machine holds no secrets.** Public keys are all that a
