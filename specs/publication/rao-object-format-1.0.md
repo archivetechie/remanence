@@ -1,16 +1,16 @@
-# RAO (Rem Archive Object) Format Specification, Version 1.0
+# RAO (Rem Archive Object) Format Specification, Version 2.0
 
 | | |
 | --- | --- |
 | Status | Publication specification |
-| Version | 1.0 |
-| Date | 2026-07-23 (v1.3.0 hardening increment) |
+| Version | 2.0 |
+| Date | 2026-07-24 (RAO 2.0 — post-quantum encrypted representation) |
 | License | CC-BY-4.0 |
 | Concept DOI (all versions) | [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126) |
-| Version DOI (this release) | [10.5281/zenodo.21506676](https://doi.org/10.5281/zenodo.21506676) |
-| Envelope magic | `RAO1` (encrypted representation) |
+| Version DOI (this release) | assigned at release |
+| Envelope magic | `RAO1` (fixed encrypted-envelope format-family constant) |
 | Stream format identifier | `rao-v1` (plaintext representation) |
-| On-tape format version | `2` (HPKE wrapped-DEK envelope) |
+| On-tape format version | `2` (HPKE wrapped-DEK envelope; X-Wing wrap suite `0x02`) |
 | Default file extension | `.rao` |
 
 ## Status of This Document
@@ -33,15 +33,16 @@ not provisional.
 ## Abstract
 
 This document specifies the Rem Archive Object (RAO) format, specification
-version 1.0: a backend-independent byte format for large archival objects. An RAO object
+version 2.0: a backend-independent byte format for large archival objects. An RAO object
 bundles many named file payloads into one self-describing unit — a constrained
 POSIX pax tar stream carrying per-file SHA-256 identities, closed-form
 byte-range addressing, and a deterministic CBOR manifest — and exists in
 exactly two representations: **plaintext**, the bare container stream,
 extractable by any standard `tar`; and **encrypted**, the same byte stream
-sealed inside a confidential authenticated envelope using an HPKE-wrapped
-per-object data-encryption key, HKDF-SHA-256 key derivation, and a chunked
-ChaCha20-Poly1305 stream construction. Both
+sealed inside a confidential authenticated envelope using an X-Wing
+(X25519 + ML-KEM-768) HPKE-wrapped per-object data-encryption key,
+HKDF-SHA-256 key derivation, and a chunked ChaCha20-Poly1305 stream
+construction. Both
 representations of one object share a logical identity (`plaintext_digest`);
 each stored copy has a physical identity (`stored_digest`) that backends scrub
 without keys. Encryption preserves partial file restore:
@@ -81,7 +82,25 @@ Appendix C. [Revision History (Informative)](#appendix-c-revision-history-inform
 
 ## 1. Introduction
 
-### 1.1. Purpose and Design Goals
+### 1.1. Identifiers and Versioning
+
+Four identifiers that happen to contain `1` or `2` are **orthogonal** and
+MUST NOT be conflated:
+
+1. `RAO1` is the encrypted-envelope format-family magic, a fixed constant,
+   not a version number.
+2. The on-tape header byte `format_version = 2` is the envelope-format
+   version. It remains `2` in RAO 2.0.
+3. The `rao2-*` strings in Section 5.5 are frozen HKDF derivation constants,
+   historically named for `format_version = 2`; they do not name this
+   document's version and remain byte-for-byte unchanged.
+4. RAO **2.0** is the version of this publication and is not stored in an
+   object.
+
+RAO 2.0 changes only the KEM inside the encrypted representation. The `RAO1`
+magic, `format_version`, and `rao2-*` HKDF labels are unchanged.
+
+### 1.2. Purpose and Design Goals
 
 RAO wraps a set of named file payloads into one archival object. The format
 originates in **Remanence**, an open archival tape stack that serves as this
@@ -118,7 +137,7 @@ manifest path (Section 4). RAO's design goals, in priority order:
    plus its static test vectors, and — degraded, plaintext representation
    only — from knowledge of POSIX tar alone.
 
-### 1.2. Two Representations of One Object
+### 1.3. Two Representations of One Object
 
 An RAO object has a single logical form — a self-describing, bundled,
 chunk-aligned pax tar stream (Section 4) — stored in either of two
@@ -135,7 +154,7 @@ encrypted representation adds confidentiality and cryptographic
 authentication while preserving the self-description and closed-form
 byte-range addressing of the plaintext form — *with the key*.
 
-### 1.3. Relationship to Adjacent Components
+### 1.4. Relationship to Adjacent Components
 
 RAO is the archival object format of the Remanence tape stack. It owns one
 thing — the stored bytes of one object — and leaves the rest to the
@@ -154,13 +173,13 @@ components around it:
   recipient epoch identifiers and HPKE-wrapped copies of its DEK, never a
   plaintext key.
 
-### 1.4. Non-Goals
+### 1.5. Non-Goals
 
 RAO performs no compression: the payload workload is already-compressed media,
 and whole-stream compression destroys closed-form range addressing (a later
 member's offset would depend on decompressing earlier bytes). It defines no
 catalog format, no key registry, no network protocol, and no multi-object
-container: one object is one archive is one stored byte string. Version 1.0
+container: one object is one archive is one stored byte string. RAO 2.0
 encodes a faithful tree of files — regular files, hardlinks, symbolic links,
 and (empty) directories. Device nodes, FIFOs, and sockets are excluded on
 principle: they carry no content (they are kernel/runtime handles) and
@@ -245,8 +264,9 @@ A single implementation may fill several roles.
   key frame, metadata frame, payload frame, footer, and final fill (Section 5.1).
 - **Data-encryption key (DEK)**: the fresh 32-byte per-object secret used as
   the root of an encrypted envelope's key schedule.
-- **Recipient epoch**: one X25519 key pair identified by a 16-byte
-  `recipient_epoch_id` and a printable recovery label.
+- **Recipient epoch**: one X-Wing key pair identified by a 16-byte
+  `recipient_epoch_id` and a printable recovery label. Its serialized public
+  key is 1216 bytes; its secret custody form is the 32-byte X-Wing seed.
 - **Deterministic CBOR**: the canonical CBOR encoding rules of Section 4.7.1,
   used in two profiles — the **manifest profile** (text keys; Section 4.7)
   and the **metadata profile** (unsigned-integer keys; Section 5.6).
@@ -263,7 +283,8 @@ keywords and values, paths, manifest and metadata text strings — is UTF-8
 (respectively 512) that is greater than or equal to `x`; when `x` is already
 a multiple the result is `x` itself. Equivalently,
 `roundup(x, C) = x + ((C − (x mod C)) mod C)`. SHA-256 is the
-hash function of [FIPS180-4]. All derived quantities
+hash function of [FIPS180-4]; SHA3-256 and SHAKE256 are the functions of
+[FIPS202]. All derived quantities
 (offsets, frame lengths, chunk counts, block counts) are defined over unsigned
 64-bit arithmetic; implementations MUST use checked arithmetic and MUST NOT
 wrap silently (Section 11). AEAD denotes authenticated encryption with
@@ -293,8 +314,10 @@ pseudorandom function; PFR denotes partial file restore (Section 6).
 | `RAO_HEADER_LEN` | 128 | Envelope plaintext header length in bytes |
 | `RAO_FORMAT_VERSION_HPKE` | 2 | HPKE envelope `format_version` |
 | `RAO_SUITE_HKDF_CHACHA` | `0x01` | `suite_id`: HKDF-SHA-256 + ChaCha20-Poly1305 |
-| `RAO_WRAP_SUITE_HPKE_V1` | `0x01` | HPKE Base wrap suite |
-| `RAO_KEY_FRAME_MAX_LEN` | 4096 | Maximum key-frame length |
+| `RAO_WRAP_SUITE_X25519_RESERVED` | `0x01` | Permanently reserved pre-production X25519-only assignment; forbidden |
+| `RAO_WRAP_SUITE_XWING` | `0x02` | Sole valid wrap suite: HPKE Base with X-Wing |
+| `RAO_KEY_FRAME_MIN_LEN` | 1191 | Minimum one-slot X-Wing key-frame length |
+| `RAO_KEY_FRAME_MAX_LEN` | 16384 | Maximum key-frame length |
 | `RAO_KEY_FRAME_MAX_SLOTS` | 8 | Maximum recipient slots |
 | `RAO_SALT_LEN` | 16 | `hkdf_salt` length in bytes |
 | `RAO_OBJECT_ID_FIELD_LEN` | 64 | Fixed `object_id` header field length in bytes |
@@ -484,7 +507,7 @@ Octal fields are zero-padded ASCII octal terminated by NUL. When parsing,
 Readers MUST stop a numeric field at the first NUL or space, MUST accept
 surrounding ASCII whitespace, and MUST treat an empty field as zero. The
 `uid`, `gid`, ustar `mtime`, `uname`, and `gname` fields carry the fixed
-values above regardless of metadata-preservation tier: RAO 1.0 deliberately
+values above regardless of metadata-preservation tier: RAO 2.0 deliberately
 does not preserve ownership, so a root-run standard `tar` extraction cannot
 apply ownership the format never recorded. Readers MUST ignore these fields.
 
@@ -532,9 +555,9 @@ Readers MUST verify the unsigned checksum and reject a mismatch with
 | NUL (0x00) | Accepted by Readers as a regular file (pre-POSIX compatibility); writers MUST NOT emit it |
 
 Readers MUST reject any other typeflag with `UnsupportedTarTypeflag`. This is
-deliberate: version 1.0's entry set is regular files, hardlinks, symbolic
+deliberate: RAO 2.0's entry set is regular files, hardlinks, symbolic
 links, and directories — a faithful tree of files — and excludes device,
-FIFO, socket, and other special entries (Section 1.4); accepting an
+FIFO, socket, and other special entries (Section 1.5); accepting an
 unsupported typeflag silently would misrepresent an unsupported archive as
 fully restored.
 
@@ -975,7 +998,7 @@ omission is reported as ingest policy (Section 4.7 is silent on ingest
 selection; Section 12.10 governs restore, not capture). The canonical name
 bytes are identical across independent Writers for the same native attribute
 on the same platform; whole-manifest byte identity additionally requires
-identical object parameters (Section 1.1 goal 6).
+identical object parameters (Section 1.2 goal 6).
 
 `<value>` is a CBOR byte string containing the raw attribute value without a
 textual encoding. The `xattrs` map follows the deterministic encoding rules of
@@ -1007,7 +1030,7 @@ default (Section 12.10). Every attribute not in the `user.` namespace and every
 extension (Section 4.7.5) is the extension tier: carried, but on restore
 **carry-only** — applied only when explicit operator policy names it
 (Section 12.10). No registered disposition or external list can cause an
-extension-tier item to be applied by default in version 1.0.
+extension-tier item to be applied by default in RAO 2.0.
 
 A Reader implementing xattr preservation MUST surface them to its caller. A
 Restoring Consumer MAY reapply attributes, subject to Section 12.10, and MUST
@@ -1070,7 +1093,7 @@ Extension processing is fail-safe, carry-only, and additive:
 - A Consumer MUST ignore an `ext` member it does not recognize and MUST NOT
   reject an object for its presence.
 - A Restoring Consumer MUST NOT apply any extension to system state unless
-  explicit operator policy names it (Section 12.10); in version 1.0 no
+  explicit operator policy names it (Section 12.10); in RAO 2.0 no
   extension is applied by default. An unrecognized extension is always
   carry-only.
 - A Repacker (Section 2.2) MUST reproduce the canonical CBOR encoding of every
@@ -1297,17 +1320,20 @@ The scalar header is exactly 128 bytes. All integers are unsigned big-endian.
 | `0x10` | 16 | `reserved` | bytes | Zero |
 | `0x20` | 16 | `hkdf_salt` | bytes | Nonzero salt derived by Section 5.5 |
 | `0x30` | 8 | `metadata_frame_len` | `uint64` | `M`, including the 16-byte tag; 17 through 16777216 |
-| `0x38` | 1 | `wrap_suite` | `uint8` | `0x01` |
+| `0x38` | 1 | `wrap_suite` | `uint8` | `0x02` (X-Wing) |
 | `0x39` | 3 | `reserved` | bytes | Zero |
 | `0x3C` | 4 | `key_frame_len` | `uint32` | Canonical key-frame length `K` |
 | `0x40` | 64 | `object_id` | UTF-8 field | 1–64 non-NUL bytes, then NUL padding |
 
 Bytes `0x10..0x20` and `0x39..0x3C` are reserved and MUST be zero.
-`wrap_suite = 0x01`, and `key_frame_len` MUST be between 103 and 4096
+`wrap_suite = 0x02`, and `key_frame_len` MUST be between 1191 and 16384
 inclusive. The smallest syntactically possible frame is a one-slot frame at
-`103` bytes; a two-slot frame with both labels empty is 201 bytes. A zero wrap
-suite or absent/undersized key frame is not a valid object in this
-specification.
+`1191` bytes; a two-slot frame with both labels empty is 2377 bytes.
+`wrap_suite = 0x02` is the sole valid value. The pre-production X25519-only
+assignment `0x01` is forbidden and permanently reserved: Readers MUST reject
+it with `InvalidWrapSuite`, and Sealers MUST NOT emit it. A zero or unknown
+wrap suite, or an absent or undersized key frame, is not a valid object in
+this specification.
 
 The `object_id` value is the inner `REMANENCE.object_id`. It contains no NUL,
 is valid UTF-8, and is right-padded with zero bytes. Readers MUST reject an
@@ -1316,14 +1342,14 @@ a value longer than 64 bytes. The header's `chunk_size` and `object_id` MUST
 equal the authenticated inner values after opening.
 
 The byte-exact beginning of an envelope header with `chunk_size = 4096`,
-`metadata_frame_len = 64`, `key_frame_len = 103`, object id `object-2`, and
+`metadata_frame_len = 64`, `key_frame_len = 1191`, object id `object-2`, and
 the illustrative salt `02` repeated 16 times is:
 
 ```text
 52 41 4f 31 00 80 02 01 00 00 10 00 00 00 00 00
 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 02 02 02 02 02 02 02 02 02 02 02 02 02 02 02 02
-00 00 00 00 00 00 00 40 01 00 00 00 00 00 00 67
+00 00 00 00 00 00 00 40 02 00 00 00 00 00 04 a7
 6f 62 6a 65 63 74 2d 32 00 ... 00
 ```
 
@@ -1343,14 +1369,14 @@ The key frame begins immediately at byte 128 and occupies exactly
 | repeated | 16 | `recipient_epoch_id` | Opaque epoch identifier |
 | repeated | 1 | `label_len` | 0 through 32 |
 | repeated | `label_len` | `epoch_label` | Bytes `0x20` through `0x7E` only |
-| repeated | 32 | `enc` | X25519 HPKE encapsulated key |
+| repeated | 1120 | `enc` | X-Wing ciphertext: ML-KEM-768 `ct` (1088 bytes) ‖ X25519 `ct_X` (32 bytes) |
 | repeated | 48 | `ciphertext` | Wrapped 32-byte DEK plus 16-byte tag |
 
 Every integer is big-endian; the one-byte integers have no byte-order
 ambiguity. A key frame has length
 
 ```text
-K = 5 + sum_over_slots(98 + label_len)
+K = 5 + sum_over_slots(1186 + label_len)
 ```
 
 and MUST consume exactly `K` bytes. A Reader MUST reject truncation, trailing
@@ -1370,10 +1396,24 @@ two recipients and require an explicit opt-in to emit a single slot. A Reader
 accepts any structurally valid frame with at least one slot. Slot order is the strictly increasing `slot_index`
 order; callers therefore MUST supply values that serialize in that order.
 
-Wrap suite `0x01` is HPKE Base mode [RFC9180] with
-DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, and ChaCha20-Poly1305. The HPKE
+The suite is object-global: every slot in a key frame uses the header's one
+`wrap_suite` value; there is no per-slot suite discriminator. Eight X-Wing
+slots occupy 9493 bytes with empty labels or 9749 bytes with 32-byte labels,
+approximately 9.5 KiB against the 16 KiB key-frame cap. This cost is
+acceptable for tape but material for small objects.
+
+Wrap suite `0x02` is HPKE Base mode [RFC9180] with X-Wing
+[XWING-DRAFT10] — the X25519 [RFC7748] + ML-KEM-768 [FIPS203] hybrid — as
+the KEM, HKDF-SHA256 as the KDF, and ChaCha20-Poly1305 as the AEAD. The HPKE
 plaintext is the 32-byte DEK; HPKE AAD is empty. Each slot uses fresh
-encapsulation randomness. The exact 95-byte HPKE `info` value is:
+encapsulation randomness. The exact RFC 9180 HPKE suite identifier is:
+
+```text
+"HPKE" || 0x647a || 0x0001 || 0x0003
+```
+
+Here `0x647a` is the frozen X-Wing `kem_id`, `0x0001` is HKDF-SHA256, and
+`0x0003` is ChaCha20-Poly1305. The exact 95-byte HPKE `info` value is:
 
 ```text
 "rao-wrap-v1\0"                         12 bytes
@@ -1381,7 +1421,7 @@ encapsulation randomness. The exact 95-byte HPKE `info` value is:
 || recipient_epoch_id                  16 bytes
 || slot_index                            1 byte
 || 0x02                                  1 byte  (format_version)
-|| 0x01                                  1 byte  (wrap_suite)
+|| 0x02                                  1 byte  (wrap_suite)
 ```
 
 For `object_id = "obj"`, epoch id `44` repeated 16 times, and slot 7, it is:
@@ -1389,13 +1429,78 @@ For `object_id = "obj"`, epoch id `44` repeated 16 times, and slot 7, it is:
 ```text
 72 61 6f 2d 77 72 61 70 2d 76 31 00
 6f 62 6a 00 ... 00
-44 44 44 44 44 44 44 44 44 44 44 44 44 44 44 44 07 02 01
+44 44 44 44 44 44 44 44 44 44 44 44 44 44 44 44 07 02 02
 ```
 
 The middle field is exactly 64 bytes. A wrapped DEK is thereby bound to the
 object id, recipient epoch, slot, format version, and wrap suite. A Reader
 selects the slot whose epoch id equals the supplied private key's epoch id;
 absence is a hard recipient-epoch mismatch.
+
+#### 5.3.1. Frozen X-Wing Construction
+
+RAO 2.0 freezes the following byte-level X-Wing construction from
+`draft-connolly-cfrg-xwing-kem-10`; that individual-submission Internet-Draft
+is provenance, not permission to track later revisions.
+
+For a 32-byte seed, compute:
+
+```text
+expanded = SHAKE256(seed, 96)
+d        = expanded[0:32]
+z        = expanded[32:64]
+sk_X     = expanded[64:96]
+```
+
+Run ML-KEM-768 `KeyGen_internal(d, z)` to obtain `(pk_M, sk_M)`, and derive
+`pk_X` from `sk_X` using X25519. The serialized recipient public key and the
+secret custody form are:
+
+```text
+pk   = pk_M || pk_X       # 1184 + 32 = 1216 bytes
+seed                       # 32 bytes
+```
+
+The expanded ML-KEM decapsulation key and `sk_X` are ephemeral and MUST NOT
+replace the 32-byte seed as the secret-at-rest custody unit.
+
+For encapsulation, let `ss_M` and `ct_M` be the ML-KEM-768 outputs, and let
+`ss_X` and `ct_X` be the raw X25519 shared secret and ephemeral public key.
+Serialize:
+
+```text
+enc = ct_M || ct_X        # 1088 + 32 = 1120 bytes
+```
+
+The 32-byte X-Wing shared secret is exactly:
+
+```text
+SHA3-256(ss_M || ss_X || ct_X || pk_X || 0x5c2e2f2f5e5c)
+```
+
+The six-byte final value is the X-Wing label `5c 2e 2f 2f 5e 5c`
+(ASCII `\.//^\`). The ML-KEM ciphertext is deliberately absent from the
+combiner preimage because ML-KEM's Fujisaki–Okamoto transform already binds
+it; `ct_X` and `pk_X` are present because raw X25519 does not provide that
+binding. The resulting 32 bytes feed HPKE as the KEM shared secret. The
+wrapped-DEK ciphertext remains 48 bytes (32-byte DEK plus 16-byte tag).
+
+Draft-10's IANA section writes `25722 = 25519 + 203 = 0x647a (please)`: that
+text is a requested value and is not itself an IANA assignment. As of this
+publication, the IANA HPKE registry also lists `0x647A` for X-Wing, citing an
+earlier draft revision [IANA-HPKE]. RAO nevertheless pins `0x647a` from
+draft-10 as an independent frozen archival decision. If the registry or a
+later X-Wing standard assigns a different value, RAO envelopes continue to
+use `0x647a`; such a difference is a documented divergence, never a silent
+wire change. The draft is an individual submission, not a CFRG working-group
+document.
+
+The repository's `xwing-draft10-kat.txt` and `xwing-wrap-kat.txt`, also
+included in the companion vector archive, freeze seed-to-key, encapsulation,
+shared-secret, and HPKE wrapped-DEK bytes. The versioned IETF archive is the
+pinned prose provenance, and the static KATs are the in-repository byte-level
+freeze. A PDF copy is intended for release archival but is not present in
+this repository revision.
 
 ### 5.4. Key Inputs and Identification
 
@@ -1404,9 +1509,12 @@ every object and wraps it independently to every recipient slot. The Sealer
 MUST obtain both DEK and encapsulation randomness from a fallible,
 operating-system-backed CSPRNG and MUST fail closed if entropy is unavailable.
 Recipient public keys and fingerprints are custody inputs outside this byte
-format. A private key for any epoch named in the frame has unilateral ability
-to decrypt every object wrapped to that epoch; operational threshold ceremonies
-do not change that cryptographic fact.
+format. A recipient public key is the 1216-byte X-Wing serialization
+`pk_M || pk_X`. The corresponding private-key file MUST contain the canonical
+32-byte X-Wing seed, not a persisted expanded ML-KEM decapsulation key. A
+private key for any epoch named in the frame has unilateral ability to decrypt
+every object wrapped to that epoch; operational threshold ceremonies do not
+change that cryptographic fact.
 
 ### 5.5. Salt and Object-Key Derivation
 
@@ -1426,7 +1534,9 @@ derive the salt and MUST NOT accept a caller-supplied value. An opener MUST
 rederive it after metadata authentication and reject a mismatch.
 
 Define `header_hash = SHA-256(exact 128-byte scalar header || exact key
-frame)`.
+frame)`. This mechanism and every `rao2-*` HKDF label below are unchanged
+from the preceding publication; the larger X-Wing key frame simply supplies
+more bytes to the same SHA-256 input.
 
 Then derive three distinct 32-byte keys:
 
@@ -1438,7 +1548,9 @@ payload_key   = HKDF(object_secret, empty, "rao2-payload-v1", 32)
 ```
 
 This binds every scalar-header byte and every key-frame byte through the
-derived AEAD keys. Rewrapping a key frame without resealing metadata
+derived AEAD keys. In particular, `wrap_suite` is authenticated both here,
+inside the scalar header covered by `header_hash`, and in the HPKE `info`
+transcript of Section 5.3. Rewrapping a key frame without resealing metadata
 and payload is therefore impossible and MUST NOT be attempted.
 
 ### 5.6. Metadata Frame
@@ -1858,20 +1970,29 @@ the bootstrap, is:
 
 ## 10. Versioning and Extensibility
 
-Three independent fields are deliberately not interchangeable:
+The identifiers below are deliberately orthogonal and MUST NOT be used as
+proxies for one another:
 
-1. **Specification version 1.0** identifies this publication. It normatively
+1. **Specification version 2.0** identifies this publication. It normatively
    describes every format below; it is not stored in an object.
 2. **Plaintext stream schema version** is the text
    `REMANENCE.schema_version`: `1.0` when no xattr is preserved and `1.1` when
    any xattr is preserved; `ext` containers and the `object_metadata` inventory
    do not affect the gate. Both use `REMANENCE.format_id = rao-v1` and manifest
    integer `schema_version = 1`.
-3. **Encrypted-envelope `format_version`** is the byte at header offset
+3. **Envelope magic `RAO1`** is a fixed format-family constant, not a version.
+4. **Encrypted-envelope `format_version`** is the byte at header offset
    `0x06`: value `2` identifies HPKE-wrapped-DEK encryption. Value `1` is
    permanently reserved, MUST never be accepted, and MUST never be
    reassigned. The field does not indicate the stream schema and is unrelated
    to the decimal specification version.
+5. **The `rao2-*` HKDF labels** in Section 5.5 are frozen derivation constants
+   historically tied to envelope `format_version = 2`. They do not identify
+   specification version 2.0.
+
+RAO 2.0 changes only the encrypted representation's KEM and its resulting key
+frame. It does not change the `RAO1` magic, on-tape `format_version = 2`, or
+the `rao2-*` HKDF labels.
 
 A Reader of `rao-v1` gates on stream-schema major 1 and ignores unknown pax
 keywords, manifest keys, and extension-container keys. Extensions MUST NOT
@@ -1880,9 +2001,11 @@ or encryption gates, or any other rule enforced by this document. Such a
 change requires a new stream `format_id`.
 
 For the `RAO1` envelope magic, only the header form in Section 5.2 is valid:
-format value `2`, HPKE wrap suite `0x01`, and a key frame. Unknown format or suite values are hard errors, not
-negotiation. A future envelope change not expressible by ignorable metadata
-requires a new format value or magic and a successor specification.
+format value `2`, X-Wing HPKE wrap suite `0x02`, and a key frame. Wrap suite
+`0x01` is forbidden and permanently reserved. Unknown or reserved format or
+suite values are hard errors, not negotiation. A future envelope change not
+expressible by ignorable metadata requires a new format value or magic and a
+successor specification.
 
 A Repacker (Section 2.2) MUST reproduce unknown manifest keys and unrecognized
 extension-container members unchanged under the Section 4.7.1 canonical
@@ -1946,7 +2069,8 @@ UnsupportedFormatVersion     format_version is not 2
 InvalidSuite                 suite_id is not 0x01
 InvalidChunkSize             chunk_size is zero or not a multiple of 512
 ReservedBytesNotZero         flags or reserved bytes are nonzero
-InvalidWrapSuite             wrap_suite is not 0x01, including reserved suite 0
+InvalidWrapSuite             wrap_suite is not 0x02, including forbidden
+                             X25519-only suite 0x01 and reserved suite 0
 InvalidKeyFrameLength        key_frame_len violates the version gate or bounds
 InvalidKeyFrame              malformed or non-canonical RAOK frame
 RecipientEpochMismatch       no slot matches the supplied private-key epoch
@@ -2023,6 +2147,15 @@ because the keys differ; intra-object reordering, duplication, or truncation
 fails because the nonce (index, finality) or the missing final chunk fails
 authentication. Re-binding the same facts as AAD would add bytes and a second
 mechanism without adding security.
+
+Downgrade resistance is confirmed, not assumed. `wrap_suite` is authenticated
+twice: it is in the scalar header covered by `header_hash`, which feeds the
+metadata and payload AEAD keys, and it is the final byte of the HPKE `info`
+transcript, which binds the DEK unwrap. Changing `0x02` to the forbidden
+`0x01` is rejected structurally; any hypothetical value accepted under a
+different parser would still alter both cryptographic transcripts. The
+Section 12.7 caveat that a public-key holder can create a new, internally
+consistent object is unrelated to downgrade of an existing object.
 
 ### 12.4. Fail-Closed
 
@@ -2168,7 +2301,7 @@ Consumer applies only the `user.` portable core by default; every non-`user.`
 namespace and every extension — recognized or not — is carried and, when
 reported, reported by name only, and is applied on restore only when explicit
 operator policy names it. No registered disposition applies an extension-tier
-item by default in version 1.0. A Restoring Consumer that reports skipped or
+item by default in RAO 2.0. A Restoring Consumer that reports skipped or
 applied names MUST NOT log their values.
 
 ### 12.11. Envelope Threat Model and Secret Handling
@@ -2197,24 +2330,33 @@ plaintext on suitably protected storage and publish it only after full
 authentication; deletion cannot guarantee erasure on copy-on-write or flash
 media.
 
-**Post-quantum confidentiality (a stated limitation).** The version-1 envelope
-wraps DEKs with HPKE over DHKEM(X25519) (Section 5). X25519 key agreement is not
-post-quantum secure: an adversary who records stolen encrypted media today can
-recover the wrapped DEKs once a cryptographically relevant quantum computer
-exists — a *harvest-now, decrypt-later* exposure that is acute precisely because
-archival media is long-lived and confidentiality must hold for decades.
-Deployments holding long-lived secrets under this format MUST treat the
-confidentiality window as bounded and adopt a **resealing policy**: re-encrypt
-affected objects under a post-quantum-secure KEM before a deployment-stated
-deadline. Merely adding a second, post-quantum recipient slot alongside the
-X25519 slot does **not** help — the weaker slot still unwraps the same DEK
-(weakest-slot property), so a genuine defense requires replacing the KEM or a
-true hybrid. A future minor version is expected to define an X25519 + ML-KEM
-hybrid KEM (ML-KEM per FIPS 203, composed with X25519 by a standard hybrid
-construction such as X-Wing [draft-connolly-cfrg-xwing-kem]) as the resealing
-target;
-version 1.0 states the limitation and the resealing obligation but does not yet
-specify the hybrid.
+**Post-quantum confidentiality.** RAO 2.0 supersedes the RAO 1.0
+X25519-only encrypted representation. X-Wing [XWING-DRAFT10] is the sole wrap
+KEM, and X25519 alone is forbidden. No production RAO 1.0 encrypted object
+was written; any new encrypted object MUST use RAO 2.0. The motivation is
+harvest-now, decrypt-later: an adversary can retain stolen archival media for
+decades and wait for a cryptographically relevant quantum computer. Hybrid
+protection at first seal addresses that exposure while retaining X25519 as a
+classical hedge.
+
+X-Wing satisfies MAL-BIND-K-PK and MAL-BIND-K-CT: even under
+maliciously-generated keys it binds the shared secret both to the recipient
+public key and to the ciphertext. Raw ML-KEM does not provide either
+property. This is material to RAO's multi-recipient key frame, where one DEK
+is independently wrapped to `N` recipient public keys: an attacker must not
+make one shared secret ambiguously attributable to another recipient key or
+encapsulation.
+
+The hybrid has no cryptanalytic security cost relative to X25519 alone under
+the construction's stated assumptions, but it does add ML-KEM, combiner, and
+integration attack surface. The static draft-10 and RAO wrap KATs, the
+formally verified libcrux ML-KEM implementation used by the reference
+implementation [LIBCRUX-MLKEM], and constant-time integration review are
+therefore mandatory reference-release controls. Formal verification covers
+the constituent implementation and does not prove RAO's HPKE `info`, X-Wing
+combiner glue, key-frame serialization, entropy handling, or zeroization;
+those remain separately audited and KAT-gated. Libcrux is an implementation
+choice, not a normative format dependency.
 
 Operationally, resealing is not a lightweight re-wrap. Because Section 5.5 binds
 the entire key frame into the derived AEAD keys, the wrapped DEK cannot be
@@ -2224,12 +2366,12 @@ writing a fresh object to new media. Deployments SHOULD therefore fold resealing
 into the periodic media-refresh (migration) cycle they already run, accepting that
 it transits plaintext on a trusted host and reads and writes the full object. Two
 limits are inherent: resealing protects only media still under the archive's
-control — a copy already exfiltrated retains its original quantum-vulnerable key
-frame and cannot be retroactively protected; and the format's self-describing,
-catalogless-recovery property (the object opens from its own on-media key frame) is
-precisely what makes that key frame the exposure. For genuinely long-secrecy
-holdings, wrapping to a post-quantum (hybrid) KEM at first seal is stronger than
-relying on later resealing.
+control — a legacy RAO 1.0 X25519-only copy already exfiltrated retains its
+original quantum-vulnerable key frame and cannot be retroactively protected;
+and the format's self-describing, catalogless-recovery property (the object
+opens from its own on-media key frame) is precisely what makes that key frame
+the exposure. For genuinely long-secrecy holdings, RAO 2.0's hybrid wrapping
+at first seal is stronger than relying on later resealing.
 
 ### 12.12. Disclosure in Published Plaintext Objects
 
@@ -2263,13 +2405,14 @@ values (e.g. 4096) so full object byte streams are practical to pin; at least
 one vector MUST use `DEFAULT_CHUNK_SIZE`.
 
 The authoritative companion archive is `remanence-test-vectors.tar`, SHA-256
-`fa8570d31d3869155c9a2b4322b0846a5f5b2eb845d08c89ab4a78bcbb5e668f`.
+`7c09f9425a2996daa10cb4766df5b7fb54f562eea33a914d4be0c5013345824f`.
 This archive supersedes
-`f4e4331c14e67c059d1292f54e14efd8408c7d41364d2dba7f8e7567aa16c2a6`.
-Existing RAO object streams remain byte-identical. REM-PARITY sidecar images
-are regenerated for parity-index-major physical placement, and the archive
-adds the object-id binding, directory-negative, boundary-burst, short-epoch,
-and encrypted final-chunk range vectors.
+`fa8570d31d3869155c9a2b4322b0846a5f5b2eb845d08c89ab4a78bcbb5e668f`.
+Plaintext RAO object streams remain byte-identical. The encrypted positive
+objects are regenerated as X-Wing envelopes with `wrap_suite = 0x02`; the
+archive adds the draft-10 X-Wing and deterministic wrapped-DEK KATs, an
+independent X-Wing verifier, and negatives for forbidden `wrap_suite = 0x01`
+and the revised key-frame bounds.
 The authoritative archive digest names this specific version of the frozen
 conformance distribution. Later additive vector entries are versioned
 supplements carrying their own digest; they do not mutate the conformance
@@ -2358,21 +2501,21 @@ complete inputs and derivation chain; the essential fixed inputs are:
 | --- | --- |
 | DEK | byte `7d` repeated 32 times |
 | HPKE RNG seed | byte `c3` repeated 32 times |
-| Slot 0 | index 0; epoch id `61` repeated 16 times; label `archive-2026-01`; private key `51` repeated 32 times; public key `ad908a8a708aca07588cda7c4ed3e44d4966a80a9abb2f1e4bbac53c67414e34` |
-| Slot 1 | index 1; epoch id `62` repeated 16 times; label `recovery-2026-01`; private key `52` repeated 32 times; public key `f68b05ba03f7185e1ba88878682f8dd0b15158f6050889c9481d79c2d7d2fa07` |
+| Slot 0 | index 0; epoch id `61` repeated 16 times; label `archive-2026-01`; 32-byte X-Wing seed `51` repeated; 1216-byte public key pinned in the archive |
+| Slot 1 | index 1; epoch id `62` repeated 16 times; label `recovery-2026-01`; 32-byte X-Wing seed `52` repeated; 1216-byte public key pinned in the archive |
 | Envelope metadata | The four required keys of Section 5.6 |
 
-The private keys, DEK, and seed are public test material, not operational
-examples. Expected geometry is:
+The recipient seeds, DEK, and HPKE RNG seed are public test material, not
+operational examples. Expected geometry is:
 
 | Quantity | Expected value |
 | --- | --- |
 | `plaintext_size` `P` | 20480; `chunk_count` = 5 |
-| Key frame | `K` = 232 bytes; two recipient slots |
+| Key frame | `K` = 2408 bytes; two recipient slots |
 | Metadata plaintext | 50-byte map `{0: 1, 1: 20480, 2: "sha256", 3: <32 digest bytes>}` |
 | `metadata_frame_len` `M` | 66 |
-| Payload frame | bytes 426–20985 (5 chunks × 4112) |
-| `footer_offset` | 20986; footer + 3574 zero-fill bytes |
+| Payload frame | bytes 2602–23161 (5 chunks × 4112) |
+| `footer_offset` | 23162; footer + 1398 zero-fill bytes |
 | `stored_size_bytes` / blocks | 24576 / 6 |
 
 The manifest pins each recipient's `enc`, wrapped-DEK ciphertext, HPKE shared
@@ -2401,10 +2544,13 @@ One vector MUST use `DEFAULT_CHUNK_SIZE`. Inputs: `chunk_size` 262144;
 `00000000-0000-4000-8000-000000000012`, contents 262145 bytes with byte `i` =
 `i mod 256` (expected `file_sha256`
 `c35991ad254f48ff8b02becb9f0cc56581e86a0b477b13e5ebb0030a3b91c848`,
-`chunk_count` 2), represented both as plaintext and as a two-recipient HPKE
-envelope. The encrypted half uses DEK byte `5d` repeated 32 times, HPKE RNG
-seed byte `a7` repeated 32 times, and the two recipient keypairs recorded in
-its manifest. Pinned outputs as in 13.2/13.3
+`chunk_count` 2), represented both as plaintext and as a two-recipient X-Wing
+HPKE envelope. The encrypted half uses DEK byte `5d` repeated 32 times, HPKE
+RNG seed byte `a7` repeated 32 times, and the two recipient X-Wing seed/public
+key pairs recorded in its manifest. Its key frame is 2402 bytes, payload
+frame is bytes 2598–1051237, and `footer_offset` is 1051238. Its metadata
+frame is 68 bytes, and its stored size is 1310720 bytes (5 blocks). Pinned
+outputs as in 13.2/13.3
 (digests only for the large streams; exact bytes for header, metadata frame,
 and manifest).
 
@@ -2419,7 +2565,7 @@ authenticate with `final_flag = 1`, reproducing the exact manifest CBOR,
 `AeadAuthenticationFailed`. A Reader MUST derive finality from the
 envelope-wide `object_chunk_count`, not the selected file's `chunk_count`.
 
-### 13.5. Xattr and HPKE Component Vectors
+### 13.5. Xattr and X-Wing/HPKE Component Vectors
 
 `rao/objects/rao-tv-xattrs.rao` and its manifest pin an xattr round trip. The
 entry `tagged.txt` carries `user.comment` with bytes `62 6c 75 65` (`blue`)
@@ -2440,39 +2586,108 @@ containers as required by Section 4.7.3.
 
 The archive's `negative-key-frame.json` pins the complete header,
 key-frame, HPKE-tamper, Sealer-slot, and Reader-slot policy matrix described in
-Section 13.6. The implementation's positive
-component vector fixes `object_id = object-a`, epoch id `03` repeated 16
-times, label `safe-2026`, slot 0, DEK `09` repeated 32 times, and a deterministic
-test-only HPKE entropy draw of `42` repeated 32 times. The recipient private
-key is the direct 32-byte serialized X25519 private value
-`0707070707070707070707070707070707070707070707070707070707070707`;
-it is not produced by `DeriveKeyPair`. Applying X25519 `sk_to_pk` to that
-private value gives the recipient public key
-`13be4feaeaf204c7fd3358fc9c00721881d174278128227ec674f37f7fe97b6d`.
-The `42`-repeated 32-byte entropy draw is the RFC 9180 Section 7.1.3 input
-keying material `ikm` for the sender's ephemeral
-`DeriveKeyPair(ikm) -> (skE, pkE)` operation; it is not a raw ephemeral
-scalar. Its exact outputs are:
+Section 13.6. The positive component vector in
+`rao/kats/xwing-wrap-kat.txt` fixes `object_id = object-a`, epoch id `03`
+repeated 16 times, label `safe-2026`, slot 0, DEK `09` repeated 32 times, and
+a deterministic test-only 64-byte X-Wing encapsulation-randomness draw of
+`42` repeated. The recipient secret is the 32-byte X-Wing seed `07` repeated;
+its public key is the 1216-byte `ML-KEM-768 ek || X25519 pk`. HPKE uses
+`kem_id = 0x647a` and suite
+`"HPKE" || 0x647a || 0x0001 || 0x0003`. The exact seed-to-wrap chain is:
 
 ```text
-key frame =
-52 41 4f 4b 01 00
-03 03 03 03 03 03 03 03 03 03 03 03 03 03 03 03
-09 73 61 66 65 2d 32 30 32 36
-ae 3b f1 cd 87 c2 d2 ed 25 af 4a 1a 23 9e ed 04
-a9 90 f0 0e 74 03 e4 c8 06 59 27 de 01 0f d1 7a
-fd 48 22 7f 58 c8 a2 b4 ac 3e b0 b2 24 b1 18 5e
-85 8c 7a 46 44 f9 6a 70 67 d2 c2 d3 2d 1c 67 da
-d5 73 cb a8 d9 4b 66 8c a2 ab 98 b6 ca 12 a1 8c
+seed =
+0707070707070707070707070707070707070707070707070707070707070707
 
-enc = ae3bf1cd87c2d2ed25af4a1a239eed04a990f00e7403e4c8065927de010fd17a
-ct  = fd48227f58c8a2b4ac3eb0b224b1185e858c7a4644f96a7067d2c2d32d1c67da
-      d573cba8d94b668ca2ab98b6ca12a18c
+pk =
+0e12760b95266a50a52bc6ba3df697c1261d3ba510987a299a83cc0b9134c2ea
+4ddc47889b72c6dea65b49e066b1a2822f269e8ea904a667cfe6f7035aa83cd9
+c041efc38d23053ea6d754c550cd5d1936d4e74ea047c4dcf757de9550972c82
+abcbad83c32838c18451240c0907a573451dc746bc491c143d14837af83c4f4b
+1f5aaa59bd5a2b03c144ba6ccb445bce2d384ab40823271342128a2b7eb68624
+eba59b3b2b57d9a4ac7b630d063400a275ad71b6b08a8cfe93a64d368cef666a
+4d208b8f39c442400c1a7c4677658576417b5b026d99cb80e01428be00c720e2
+20a2705936a62d6e737900bd8c3d0b464ed7650dd7c84c250dd73c7536abbb40
+13809927ccffa5391bb254294c7be0596dd29aa37445957b2aa88dfc54447894
+773a34e8e87b05520c9c2ab4dfd69cdd9a52c7e9352a3ab94c07a26d468f10b2
+632a6a524e06234fbb2008f17cee6a59efc51b4c483fa5264c9fb325e9d7b9b6
+6c6aae91ba9f9a29743968c5533a3750bb9554223b60c8b964cfa7346948cac1
+000d840488c3d211b4e7d463ddb15551862f01d77e87b60899e25164cccc814c
+aa5c0555f5413ffbdcb5101458a26061560463ab33cc2174c61f5861986b55d6
+206612f386c996561b51b63a11be965a1fae45b251476e96c3864925646b6246
+935bbfa9f4bb39437195c6b98cf81a071a70f26b0ea61628fdbc91ed299b6326
+ce7f220aab6965be645ff7c51248e456adb343f10990243401d8e05ebc48b58d
+2a77b21341ef513e66157b83596f1f447695e8c82279922e15987ab14259157e
+e6e07b5ee28dc41c68dbc14c39131fc7a4ccf6420f65479701413d0eab484bd5
+5dc1669e4e3a3eebcb118c899b2cca6cb2dbacf6f5a717ab0bbaf02141299d32
+c88426aa4866173cc12313f2c52624005e6fe176ac02bf45a9964659020bd03b
+9ddb8a99322b0452a2eddc6ea752473f1c1c9ab051dc1973e81b1e8d74640614
+8a8621575f7c71cd2879350a2970740156c69c9ff4cfe97a3ff0a90f16e90336
+f6825bdb8ba0a3ccb2f181d26cc88605493b442a9d5a9f788895b720516c865d
+575c75276c937e2252a486c90e64b1c115060dacaccc3372d1475c3381098275
+bda23a52083c6e671825e57b40606226247432213988a7672d80ca32a2356e16
+1b5a3d5a218cf0c6788c62b786003154c90312001e73bcfdd3312573504a0c40
+2666620b31606883580ea09f690c0cdd948520b19bab2b30fda60dd903c8b4f0
+1a83238ebda1636c911895480a8e5430da58462455488b71a735ca62c1928722
+d57c3d86ce66760433c15357eba556db67adb16f8a02cd995c2525d21b49a060
+20daaaeaea50d332952f399bdc859574c9c9c6056765d1c257e5a655c9a6c619
+167963afc850027a00730d60b33e2b897e71b56466be0fc98a1c314b67b3bae7
+80a622c58eb05570024c989b286763ba420ef234477c2dd8bc86b9c9adfed5a8
+c7b948b6735bad758c04f08025eb01d217ab9407881878466904b2e4965b2275
+155fd1b8000c7b2983a9e8f87243551dc31b884867b3e9418c1d5196f83b2e7e
+dca55cb21dcee430969366fd02a85debbd759763010cb918b13460c33bda4b43
+c2aaec2b4d19800eb45b65c915f8b969eff9e9e356faea1c9cf69659599b22f5
+7b8184a0ce2e4091f1b4b03b77635cf149b6492cf75d285e028a57744c424673
+
+enc =
+bf1279ec3bc4e262e351f79e8bbc11dd14bcae3d277965dd0eacba4a440aa8d5
+1f8058dbb217a9cb1cb68d2d3b6d2703b581320115e4fdab33353bd2b9704559
+f33878081e7948339c4e2b00cb803824fca917adc2b50f72395e4ed464c5be5b
+8e369ffc7a38a1efbe33949dbc29bce4163956e009e8c6585061fa3512db65c2
+bb0f9aa884418cdeeeb96fce0b6f7fc6bd9e45eae3d2cadccd6afe5cca5c41cb
+fd1b405328a5e073fd8bab1c2242dc4ba2f7d8cac6843f3b1579aba4744582a7
+a5b47d1229dfe612c85ac49fbda7b7ad572fce3a5f4b55f3926aa98634abe8a8
+53a336bf71293589a1320c0e4775e8d25a3ea7216621c722d86f4ad75917b197
+104f99928f00acd2452ccf8cedbaf8d2b6503eb6e3eb5c1c400da755af8fa10d
+e0ee3a5a32a9c33b11897efd9098e696069ccbeb895911e392b7a4719c42edb0
+e469bcb09e928fc69e4b984cb702ace75348099e7542d05cd92412afa349f9b9
+1167dd908160d9b4cd7513acec730d6ef05014658c46020931e8676d0228781c
+4fcabc43e36f19545054e6f3ae4b8cc3abd461953b3bc241c2bdcf7dab2b08ce
+518970379a62e79e23f30a58f6105fbb8ad254e74f8bac4225327981d11e7ced
+740ecf64c746fab754fcd355d0179d49f3a1a025f6cc75797352fb48c3e70a44
+0d23e83924c9386e8997717bbe3d1facad3f8380073b55e8ab5168b574880858
+620164a26201c5f3ca52cc029b39257da4c5a409e83b89a3719df3c8dd0f4b47
+11208ab281e693e29c6c53de7714313d9f933148605d18d077ffb96b5354a44b
+cf20c039b0df8390c13c8fff79417731d1fee63b68710f26ff7d55f4cb448f3f
+7c6b814f7c09f2c6c625a38aba6c34d307ad0c4d60bbeb4444c69a81f0e98f01
+c7250d9ad68e4bcaf00eabd46fc3a81c007d93998645c0e5963062a6687d9fb2
+2b779d0723033bf57ba741b517394b2041eca14d23f082fecaa2e10b2d742a40
+909484cf5c9fb9605628a8ee42f8a868d3a45be9832902662d24065d67593178
+79a9b35dadb0acd0bfa361fc54007ea6e51ff6f8567a358d0504cac74e9909d1
+0453b326b5ce06511915ff6c6fca0d19a8db7708eea829716fc9cd8a6756f169
+d82835ed3a54c66e6eab9f9eaf8ef0ae5c11366e41ac2f2e6f56d7bd66dc1627
+f966d141308fb2400e6adad04deceb4fc9988373a1e7b1073ee2e4a47a7025b8
+f5cd4580f0e7ea4a77470e45c5ed026e2a76b516a57b6eebdbfc1410d95334ba
+0b0c6051d00affb51b24f53cab3c532f01a384f76683b7406572c0781aeea06e
+172d2e252486144e3117262ddacad383e94a7e13b7212b08f6371f5cea4b0ab3
+972af98d87f73ad04fbdd8999b3ddd0a179e6958d295e329d5353d37f910024c
+d932059c43b223834d09f2d0c6ed512a8c8b868d77a2336bb03cc55a97b2b9d7
+65257e8d74aee4fa26e033039b886aaaf7339a39aa6373f2a2205d9c38949e8d
+faa410616dc9a5ec0992ec78186dd31a9439b3c224e155c345d705c60af71e26
+132c442be010fbd57e72603328aa76e71fccc1503aae219327d14d9c9993f472
+
+ss =
+02a10e4fd3ec163886969a62568d8ae183c6db7357936b3197765635a8e7dc67
+
+wrapped DEK ciphertext =
+497931404b12b2e9ac5a8b3ea7bb886699dcfa1ba079a1f9913e95bb1063918a
+a61615979f8ca19c79b5f948dcbd9bcf
 ```
 
-The deterministic entropy source exists only to make this HPKE component
-vector reproducible. Conforming production sealers use OS-backed fresh
-randomness as required by Sections 5.3 and 12.1.
+Concatenate the hex lines within each field; their byte lengths are 32, 1216,
+1120, 32, and 48 respectively. The deterministic entropy source exists only
+to make this X-Wing/HPKE component vector reproducible. Conforming production
+Sealers use OS-backed fresh randomness as required by Sections 5.3 and 12.1.
 
 ### 13.6. Negative Vectors
 
@@ -2517,8 +2732,9 @@ restore-report vector reaches EOF without a manifest and asserts the typed
 values (including the permanently reserved value 1); unknown `suite_id`;
 `chunk_size` 0 and `chunk_size` not a multiple of 512; nonzero `flags`;
 nonzero bytes in either reserved region; unknown or reserved `wrap_suite`;
-suite 0 with a nonempty frame; HPKE suite with zero, undersized, or oversized
-`key_frame_len`; all-zero `hkdf_salt`;
+forbidden X25519-only `wrap_suite = 0x01`; suite 0 with a nonempty frame;
+X-Wing suite with zero, undersized, or oversized `key_frame_len`; all-zero
+`hkdf_salt`;
 all-NUL `object_id` field; interior-NUL `object_id`; non-UTF-8 `object_id`;
 `metadata_frame_len` 16 and `metadata_frame_len` > 16 MiB. Cryptographic
 binding: a flipped salt bit (structurally valid → `AeadAuthenticationFailed`);
@@ -2594,10 +2810,16 @@ do not mutate the frozen conformance target named by an existing digest.
 The identifiers this specification defines — the `rao-v1` stream format
 identifier, the `REMANENCE.` pax keyword namespace, the `RAO1` envelope magic,
 `format_version` value 2 (with value 1 permanently reserved), the `suite_id`
-value `0x01`, the `wrap_suite` value `0x01`, the `"xattrs"` preservation key,
-the `ext` indirection key, and the `object_metadata` inventory keys
+value `0x01`, the `wrap_suite` value `0x02` (with the pre-production
+X25519-only value `0x01` permanently reserved), the `"xattrs"` preservation
+key, the `ext` indirection key, and the `object_metadata` inventory keys
 (`attribute_namespaces`, `extensions`) — are assigned by this document and
 governed by its versioning rules (Section 10).
+
+The HPKE `kem_id` `0x647a` is not assigned by this document. Section 5.3.1
+records both its requested status in draft-10 and its current IANA registry
+status. RAO freezes the value independently for its envelopes and makes no
+IANA request.
 
 This document establishes no IANA registry. Extension names (Section 4.7.5)
 use permissionless reverse-DNS naming and require no central allocation; a
@@ -2628,6 +2850,9 @@ extension containers only and MUST NOT appear as pax keywords.
 - [RFC8439] — Nir, Y. and A. Langley, "ChaCha20 and Poly1305 for IETF
   Protocols", RFC 8439, June 2018,
   <https://www.rfc-editor.org/info/rfc8439>.
+- [RFC7748] — Langley, A., Hamburg, M., and S. Turner, "Elliptic Curves for
+  Security", RFC 7748, January 2016,
+  <https://www.rfc-editor.org/info/rfc7748>.
 - [RFC8949] — Bormann, C. and P. Hoffman, "Concise Binary Object
   Representation (CBOR)", STD 94, RFC 8949, December 2020,
   <https://www.rfc-editor.org/info/rfc8949>.
@@ -2637,6 +2862,14 @@ extension containers only and MUST NOT appear as pax keywords.
 - [FIPS180-4] — National Institute of Standards and Technology, "Secure
   Hash Standard (SHS)", FIPS PUB 180-4, August 2015 (defines SHA-256),
   <https://doi.org/10.6028/NIST.FIPS.180-4>.
+- [FIPS202] — National Institute of Standards and Technology, "SHA-3
+  Standard: Permutation-Based Hash and Extendable-Output Functions",
+  FIPS PUB 202, August 2015 (defines SHA3-256 and SHAKE256),
+  <https://doi.org/10.6028/NIST.FIPS.202>.
+- [FIPS203] — National Institute of Standards and Technology,
+  "Module-Lattice-Based Key-Encapsulation Mechanism Standard", FIPS PUB 203,
+  August 2024 (defines ML-KEM-768),
+  <https://doi.org/10.6028/NIST.FIPS.203>.
 - [POSIX-PAX] — IEEE Std 1003.1-2017 (POSIX.1-2017), Shell and Utilities
   volume, `pax` utility, "pax Interchange Format" (ustar and pax extended
   headers), <https://pubs.opengroup.org/onlinepubs/9699919799/>.
@@ -2647,6 +2880,15 @@ extension containers only and MUST NOT appear as pax keywords.
 
 ### 16.2. Informative References
 
+- [XWING-DRAFT10] — Connolly, D., Schwabe, P., and B. E. Westerbaan,
+  "X-Wing: general-purpose hybrid post-quantum KEM",
+  `draft-connolly-cfrg-xwing-kem-10`, 2 March 2026, individual submission,
+  <https://datatracker.ietf.org/doc/html/draft-connolly-cfrg-xwing-kem-10>.
+- [IANA-HPKE] — Internet Assigned Numbers Authority, "Hybrid Public Key
+  Encryption (HPKE): HPKE KEM Identifiers",
+  <https://www.iana.org/assignments/hpke/hpke.xhtml>.
+- [LIBCRUX-MLKEM] — Cryspen, "Verifying Libcrux's ML-KEM", 30 January 2024,
+  <https://cryspen.com/post/ml-kem-verification/>.
 - [AGE] — Valsorda, F. and B. Cartwright-Cox, "The age file encryption
   format", C2SP (Community Cryptography Specification Project): the payload
   STREAM construction reference (informative provenance; Section 5.7 is
@@ -2717,9 +2959,10 @@ Manifest pax base records (with `executable=false`, `is_manifest=true`,
 
 **RAO-TV-E2.** `P` = 20480, `C` = 4096 → `chunk_count` 5. Metadata plaintext:
 `a4 00 01 01 19 50 00 02 66 ... 03 58 20 ...` = 1 + 2 + 4 + 8 + 35 =
-**50 bytes** → `M` = 66. The two-slot key frame has `K` = 232. Payload frame
-= 20480 + 80 = 20560 bytes at offset 128 + 232 + 66 = 426;
-`footer_offset` = 20986; stored pre-fill length 21002; fill 3574 →
+**50 bytes** → `M` = 66. The two-slot X-Wing key frame has `K` = 2408.
+Payload frame = 20480 + 80 = 20560 bytes at offset
+128 + 2408 + 66 = 2602; `footer_offset` = 23162; stored pre-fill length
+23178; fill 1398 →
 **`stored_size_bytes` 24576 = 6 blocks**. The metadata zero nonce is
 byte-identical to payload chunk 0's nonce here (chunk 0 is non-final, nonce
 `00…00 00`) — exactly the collision that the metadata/payload key separation
@@ -2866,6 +3109,14 @@ sequentially, an acceptable cost over sequential media.
 
 ## Appendix C. Revision History (Informative)
 
+**2026-07-24.** Specification Version 2.0 replaces the pre-production
+X25519-only encrypted representation with the frozen
+`draft-connolly-cfrg-xwing-kem-10` X-Wing construction as the sole wrap KEM.
+It permanently reserves and forbids `wrap_suite = 0x01`, assigns X-Wing
+`wrap_suite = 0x02`, expands the key-frame bounds and recipient fields, and
+regenerates the encrypted vectors. The plaintext representation is unchanged.
+No production RAO 1.0 encrypted object was written.
+
 **2026-07-22.** Added the extension-tier / `ext` container (§4.7.5), the
 object metadata inventory (§4.7.6), the carry-only restore default for
 non-`user.` metadata (§12.10), and the plaintext-disclosure considerations
@@ -2881,10 +3132,11 @@ reference implementation, and are restored now that the reference
 implementation enforces them. The change constrains Restoring Consumer behavior only; the
 set of valid RAO objects is unchanged.
 
-Specification Version 1.0 is the first unified publication baseline. It
+Specification Version 1.0 was the first unified publication baseline. It
 consolidates the project's internal base-format revision, its additive xattr
 revision, and the wrapped-DEK envelope revision. Those earlier documents are
-revision history only; this document is the complete normative specification.
+revision history only; this Version 2.0 document is the complete normative
+specification.
 REM-PARITY remains the separate companion format layer identified by
 [REMPARITY] and is not incorporated here.
 

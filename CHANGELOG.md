@@ -4,6 +4,34 @@ Notable changes to Remanence and its published formats. The format
 specifications carry their own revision histories; entries here are
 per-release summaries.
 
+## RAO 2.0 / vX.Y.Z (pending)
+
+Publication pending; RAO 2.0 version DOI pending (concept DOI
+[10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126)).
+
+- **Post-quantum encrypted representation:** X-Wing
+  (`draft-connolly-cfrg-xwing-kem-10`, X25519 + ML-KEM-768) is now the sole
+  KEM inside the HPKE Base wrapped-DEK construction. `wrap_suite = 0x02` is
+  mandatory; the pre-production X25519-only `0x01` assignment is forbidden,
+  permanently reserved, rejected by Readers, and never emitted by Sealers.
+- **Wire geometry:** each recipient uses a 1216-byte X-Wing public key and a
+  32-byte seed, while each key-frame `enc` grows to 1120 bytes. The
+  `key_frame_len` bounds are now `[1191, 16384]`, with the eight-slot maximum
+  unchanged. The `RAO1` format-family magic, on-tape `format_version = 2`,
+  payload construction, and frozen `rao2-*` HKDF labels are unchanged.
+- **Frozen construction and vectors:** the specification now pins the exact
+  SHAKE256 seed expansion, SHA3-256 X-Wing combiner, HPKE `kem_id`/suite
+  bytes, and component KAT. The regenerated archive SHA-256 is
+  `7c09f9425a2996daa10cb4766df5b7fb54f562eea33a914d4be0c5013345824f`,
+  superseding `fa8570d3…`; encrypted positive vectors are X-Wing envelopes
+  and new negatives reject `wrap_suite = 0x01` and out-of-range key frames.
+- **Forward erratum:** RAO 1.0's encrypted representation is superseded by
+  RAO 2.0 and must not be used for new encrypted objects. No production RAO
+  1.0 encrypted object was written. The RAO 1.0 plaintext record stands
+  unchanged.
+- **Licensing reminder:** the Rust reference implementation remains
+  Apache-2.0, specification prose CC-BY-4.0, and conformance vectors CC0-1.0.
+
 ## v1.3.0 — 2026-07-23
 
 Post-publication hardening from two independent, grounded technical reviews that
