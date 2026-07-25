@@ -100,8 +100,8 @@ Six crates share this layer:
   maps a requested plaintext byte range to the smallest span of AEAD
   chunks that must be fetched and decrypted to serve it.
 - `remanence-aead` is the isolated crypto boundary: the `REMO` encrypted
-  REM-ENCRYPT format-version-1 envelope (HKDF-SHA-256 key derivation and a
-  ChaCha20-Poly1305 STREAM). It generates a fresh per-object
+  REM-ENCRYPT 1.0 envelope with on-tape `format_version = 2` (HKDF-SHA-256
+  key derivation and a ChaCha20-Poly1305 STREAM). It generates a fresh per-object
   data-encryption key and wraps a copy of it to each recipient with HPKE
   Base mode running the X-Wing hybrid KEM (ML-KEM-768 combined with
   X25519, per `draft-connolly-cfrg-xwing-kem`; IANA HPKE KEM id `0x647a`)
@@ -109,7 +109,7 @@ Six crates share this layer:
   Readers accept 1-8 slots; production sealers require 2-8 distinct
   epochs. There is no shared secret. Wrap-suite id `0x01`, the
   pre-production X25519-only KEM, is permanently reserved and rejected
-  on both read and write, same as format version 1.
+  on both read and write, as is reserved format version 1.
   The crate depends on no other Remanence crate, so the envelope is
   auditable on its own. Its whole-object and ranged primitives are
   wrapped by `remanence-format`, which is the funnel used by the CLI,

@@ -101,10 +101,10 @@ a promise, it is the format.
 ## The encrypted envelope: REMO
 
 An encrypted object wraps the same tar byte stream in an AEAD envelope.
-The live REM-ENCRYPT wire format is version 1 only (cipher-suite id `0x01`,
-HKDF-SHA-256 + ChaCha20-Poly1305). Format version 1 is permanently reserved
-and rejected with `UnsupportedFormatVersion`; there is no compatibility
-reader or writer.
+The live REM-ENCRYPT 1.0 wire profile accepts only on-tape
+`format_version = 2` (cipher-suite id `0x01`, HKDF-SHA-256 +
+ChaCha20-Poly1305). Format version 1 is permanently reserved and rejected
+with `UnsupportedFormatVersion`; there is no compatibility reader or writer.
 
 - The fixed plaintext scalar header is 128 bytes. Bytes `0x10..0x20` are
   reserved and must be zero. Byte `0x38` is the wrap-suite id, fixed at

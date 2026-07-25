@@ -16,7 +16,7 @@ pub enum RemObjectAeadError {
     #[error("invalid REM-OBJECT header length")]
     InvalidHeaderLength,
     /// The format version field is not supported for `REMO`.
-    #[error("unsupported REM-OBJECT format version")]
+    #[error("format_version is not 2")]
     UnsupportedFormatVersion,
     /// The suite id is not HKDF-SHA-256 + ChaCha20-Poly1305.
     #[error("invalid REM-OBJECT AEAD suite")]

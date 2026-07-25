@@ -26,7 +26,7 @@
     {
       "id": "unsupported-format-version",
       "operation": "inspect",
-      "fault": "format_version field is 3",
+      "fault": "format_version field is reserved value 1",
       "expected_error": "UnsupportedFormatVersion"
     },
     {

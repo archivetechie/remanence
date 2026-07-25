@@ -62,6 +62,7 @@ TYPE_PAX_EXTENDED = b"x"[0]
 TYPE_PAX_GLOBAL = b"g"[0]
 PAD_KEY = "REMANENCE.pad"
 REM_OBJECT_HEADER_LEN = 128
+REM_OBJECT_FORMAT_VERSION = 2
 REM_OBJECT_FOOTER = b"REMO_STREAM_END."
 LABEL_SALT = b"rem-encrypt-salt-v1"
 LABEL_OBJECT = b"rem-encrypt-object-v1"
@@ -1531,7 +1532,7 @@ def parse_encrypted_header(stored: bytes) -> EncryptedHeader:
     header = stored[:REM_OBJECT_HEADER_LEN]
     assert_eq(header[:4], b"REMO", "encrypted header magic")
     assert_eq(int.from_bytes(header[4:6], "big"), REM_OBJECT_HEADER_LEN, "encrypted header_len")
-    assert_eq(header[6], 1, "encrypted format_version")
+    assert_eq(header[6], REM_OBJECT_FORMAT_VERSION, "encrypted format_version")
     assert_eq(header[7], 1, "encrypted suite_id")
     chunk_size = int.from_bytes(header[8:12], "big")
     if chunk_size <= 0 or chunk_size % TAR_RECORD_SIZE != 0:

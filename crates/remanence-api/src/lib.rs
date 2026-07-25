@@ -9178,7 +9178,7 @@ BCw3Wyv2UWY=
         .expect("decrypt encrypted REM-OBJECT object");
         let restored = opened.object.entry("payload.bin").expect("payload entry");
         assert_eq!(restored.data, payload);
-        assert_eq!(opened.envelope.header.format_version, 1);
+        assert_eq!(opened.envelope.header.format_version, 2);
         assert_eq!(
             opened.envelope.header.metadata_frame_len,
             metadata_frame_len

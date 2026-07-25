@@ -1,7 +1,7 @@
 # `rem archive extract-stream` protocol
 
-Status: current, REM-ENCRYPT format version 1 only (RM0.3a whole-object
-mode; RM3.3 ranged-ciphertext mode)
+Status: current, REM-ENCRYPT 1.0 with on-tape `format_version = 2` only
+(RM0.3a whole-object mode; RM3.3 ranged-ciphertext mode)
 
 ## Invocation
 
