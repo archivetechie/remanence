@@ -1,22 +1,26 @@
 # Why Remanence?
 
 <!-- code-anchor: none -->
-> **Status note (2026-07-07).** This document's *reasoning* still holds,
-> but its implementation-status remarks predate Layers 3–5: the on-tape
-> format, parity, catalog, audit log, and daemon described below as
-> "specified but not built" have since been implemented (the body format
-> shipped as `rem-object-v1` rather than the working names used here), and
-> `spec-v0.3.md` has been superseded. For what exists today, see the
-> [README](../README.md) and the
-> [architecture overview](architecture-overview.md); this file is kept
-> as the positioning record.
+> **Status note (2026-07-25).** Version 1.0.0 is Remanence's first
+> publication release. All five layers are implemented and shipped, including
+> end-to-end tape reads and writes. The released on-tape formats are
+> REM-OBJECT Core Format 1.0 (wire id `rem-object-v1`), REM-ENCRYPT 1.0,
+> and REM-PARITY 1.0; all three are specified, implemented, frozen, and
+> accompanied by pinned test vectors. This document remains the positioning
+> record. For current capability, see the [README](../README.md) and the
+> [architecture overview](architecture-overview.md). The project is still
+> young: it has been validated on one library family and one drive generation,
+> so restore and verify real material on your own hardware before relying on it.
 
 A short positioning document. If you are choosing between Remanence and
 another way of putting data on LTO tape, this explains the trade-offs
 in operator-grade terms — not a marketing pitch, not a spec. The
-formal commitments live in `spec-v0.3.md`; this doc explains the
-*reasoning* behind those commitments by comparing Remanence to the
-alternatives.
+formal format commitments live in the published
+[REM-OBJECT Core Format 1.0](../specs/publication/rem-object-core-format.md),
+[REM-ENCRYPT 1.0](../specs/publication/rem-encrypt-profile.md), and
+[REM-PARITY 1.0](../specs/publication/rem-parity-1.0-specification.md)
+specifications; this doc explains the *reasoning* behind those commitments
+by comparing Remanence to the alternatives.
 
 ---
 
@@ -66,23 +70,12 @@ category above — and that's the value.
 | Completion-unknown handling (transport-error semantics) | yes (`dirty` state machine) | no | no | partial | opaque |
 | Per-operation-class SCSI timeouts | yes | no (single global) | partial | partial | varies |
 | Hot-plug aware (re-derive on udev events) | yes | no | n/a | depends | yes |
-| Unit-testable without hardware | yes (~180 tests) | no | no | partial | no |
-| Data readable in 30 years with standard tools | yes (pax-tar option, specified) † | n/a (raw bytes) | only if LTFS persists | suite-specific | proprietary |
-| Operator-grade audit log | yes (event hook today; hash-chained log specified) † | no | no | yes | yes |
-| Minimal scope (no scheduler, no retention, no catalog) | yes | yes | yes | no | no |
+| Unit-testable without hardware | yes (captured fixtures and virtual media) | no | no | partial | no |
+| Data readable in 30 years with standard tools | yes (plaintext REM-OBJECT is constrained pax tar) | n/a (raw bytes) | only if LTFS persists | suite-specific | proprietary |
+| Operator-grade audit log | yes (hash-chained on-disk log) | no | no | yes | yes |
+| Minimal scope (no scheduler or retention engine) | yes | yes | yes | no | no |
 | OS-portable architecture (seams for Windows port) | yes | partial | partial | partial | no |
 | Open-source licence | Apache-2.0 (code) | various | various | AGPL/GPL | no |
-
-**†** Rows marked with † are properties Remanence is **specified
-to have** in the layered design but that are not yet implemented
-in v0.0.1. The audit-event *hook* is live in Layer 2 today;
-the hash-chained on-disk log is Layer 4, specified but not built.
-The on-tape format trait + built-ins (`pax-tar-v1`,
-`rem-chunked-v1`) are Layer 3b, specified but not built. See
-`spec-v0.3.md` §10 for per-milestone status. v0.0.1's
-demonstrated capability stops at Layer 2 (discovery + state
-changes + hot-plug); the comparison table reflects the
-architectural commitment, not v0.0.1 binaries.
 
 The Remanence column wins on most rows precisely because *the
 alternatives took on more responsibility than the mechanism layer
@@ -236,13 +229,14 @@ are unreachable for automated testing; you ship hope.
 Remanence emits an **audit event** for every state-changing
 operation: `Started` (with the CDB bytes), `Finished` (with the
 outcome — Success / ScsiError / Other), `Warning` (e.g.
-reconciliation observations after a refresh). The hook is live in
-Layer 2 today; the persistent **hash-chained audit log on disk** is
-specified in spec §3.3 / §8.2 and lands in Layer 4 (not yet
-built). The whole stack has ~180 unit tests running against
-captured SCSI response fixtures, so we caught the HPE DVCID
-firmware quirk, the timeout-too-short class of bugs, and several
-others before touching the production chassis.
+reconciliation observations after a refresh). Those events are
+persisted in a **hash-chained audit log on disk**. Per-tape journals
+record durable tape-file commits, and the SQLite catalog is a
+rebuildable projection rather than the only copy of the truth.
+Automated tests run against captured SCSI response fixtures and
+virtual media, so the HPE DVCID firmware quirk, the
+timeout-too-short class of bugs, and several others were caught
+before touching the physical chassis.
 
 ### Summary: when `mt`+`mtx` is still the right tool
 
@@ -286,22 +280,25 @@ In practice, three things:
    exhibit similar variance. For a 30-year archive horizon this
    is a real risk.
 
-Remanence's on-tape format (`spec-v0.3.md` §5) explicitly rejects
-LTFS for these reasons. The architectural commitment (specified
-in spec v0.3 §5, **not yet implemented** as of v0.0.1) is:
-the default body format `rem-chunked-v1` will be a chunked
-container with a documented binary schema, and an alternative
-format `pax-tar-v1` will be offered for maximum portability —
-once Layer 3b ships, a tape written in pax tar will be readable
-in 2070 with any Unix-like system's `tar` command, no specialised
-software required. v0.0.1 does not yet write tape data of any
-kind; spec §10 milestones M3a / M3b track the work.
+Remanence takes a different approach, documented in
+[REM-OBJECT Core Format 1.0](../specs/publication/rem-object-core-format.md).
+There is one object format: `rem-object-v1`, a chunk-aligned,
+constrained POSIX pax tar stream with a deterministic CBOR manifest.
+A plaintext REM-OBJECT remains extractable with a standard pax-aware
+`tar` implementation even if Remanence itself is unavailable. An
+encrypted copy must first be opened according to
+[REM-ENCRYPT 1.0](../specs/publication/rem-encrypt-profile.md);
+the result is that same canonical pax tar stream. On tape,
+[REM-PARITY 1.0](../specs/publication/rem-parity-1.0-specification.md)
+adds Reed-Solomon sidecar parity and catalog-less bootstrap recovery.
+Version 1.0.0 reads and writes this stack end to end; the physical path
+was validated on an HPE MSL3040 library with LTO-9 drives.
 
 If your workflow is "interactive `cp` against a tape," LTFS is
 the right answer today and probably remains the right answer.
 If your workflow is "write irreplaceable data once, retrieve it
-on operator request a decade later," LTFS isn't — and Remanence
-will be once Layer 3b lands.
+on operator request a decade later," LTFS isn't — and that is the
+workflow Remanence is built to serve.
 
 ---
 
@@ -339,22 +336,19 @@ The other costs:
 - **Migration is hard.** Once a petabyte sits in Bareos's format,
   moving to anything else is a multi-month project.
 
-Remanence's architectural commitment (per spec v0.3): own only
-the tape mechanism. Catalog, retention, scheduling, and workflow
-are all the orchestrator's job. The on-tape format is open and
-documented (so a future reader does not need Remanence itself to
-interpret the bytes; see `spec-v0.3.md` §5.8). There is no
-separate database — every tape will self-describe
-(`spec-v0.3.md` §3.3); the disk-side state will be a regenerable
-cache plus an append-only audit log, nothing that needs
-migration.
+Remanence owns only the tape mechanism. Retention, scheduling, and
+workflow are the orchestrator's job. Its SQLite catalog answers the
+mechanism-level questions — which tape holds an object, where its files
+begin, and what was committed — but it is a rebuildable projection, not
+the archive's sole source of truth. Every tape self-describes through
+REM-OBJECT manifests and REM-PARITY bootstraps; per-tape journals and the
+hash-chained audit log record the host-side operational history.
 
-As of v0.0.1 the audit-event hook is live in Layer 2 today; the
-on-tape format, the disk-side cache, and the hash-chained
-on-disk audit log are specified in spec §5 / §3.3 / §8.2 but not
-yet built (M3b + M4 in spec §10). The comparison in this section
-reflects the v0.3 commitment; v0.0.1 binaries can be evaluated
-against the live Layer 2 surface only.
+Version 1.0.0 ships that design across all five layers. The pipelined tape
+I/O path uses a staging ring and device position proofs; the daemon
+exposes catalog, read, write, robotics, and stewardship operations through
+gRPC over a Unix socket or optional mTLS TCP. The implementation reads and
+writes physical tape end to end.
 
 You can stack Remanence under a backup suite if you wanted to,
 treating it as a substrate. We don't expect anyone to actually
@@ -387,14 +381,16 @@ appear:
    "write once, hold for decades."
 
 Remanence's reference implementation is Apache-2.0, its specifications
-are CC-BY-4.0, and its conformance vectors are CC0-1.0. The source is the
-spec; the on-tape format is **specified** (`spec-v0.3.md` §5) and will be
-documented end-to-end when Layer 3b lands; the audit log will be text on a
-disk that the operator owns (Layer 4 — also still to land). If the project
-disappears tomorrow after Layer 3b ships, every tape it ever wrote will
-still be readable with `tar` (for the pax-tar format) or with the published
-CBOR schema (for the chunked format). This is the architectural commitment
-v0.3 of the spec carries; v0.0.1 of the binaries is still pre-data-plane.
+are CC-BY-4.0, and its conformance vectors are CC0-1.0. REM-OBJECT Core
+Format 1.0, REM-ENCRYPT 1.0, and REM-PARITY 1.0 are published, frozen,
+implemented end to end, and pinned by test vectors. If the project
+disappears tomorrow, a plaintext REM-OBJECT remains a constrained pax tar
+archive readable by standard tools. An encrypted object requires a matching
+key and an implementation of the published REM-ENCRYPT profile before the
+same tar stream can be extracted. REM-PARITY documents how to recover object
+bytes from the tape's Reed-Solomon sidecars and bootstrap records without a
+catalog. These are properties of the v1.0.0 release, not promises for a
+future data plane.
 
 This is not a knock on the proprietary vendors — they have real
 features Remanence does not (full archive workflows, polished
@@ -469,11 +465,18 @@ You probably want something else if:
 
 ## Pointers
 
-- `spec-v0.3.md` — the formal specification. Architecture, scope
-  boundary, security model, on-tape format, gRPC service surface.
-- `layer2-design.md`, `layer2b-design.md`, `layer2c-design.md` —
-  the design docs for the layers that are currently implemented.
-- `pfr-reference.md` — partial-file-restore mechanics, including
-  the prior-art comparison with LTFS extents.
+- [REM-OBJECT Core Format 1.0](../specs/publication/rem-object-core-format.md)
+  — the canonical object container, manifest, identity, and range-read rules.
+- [REM-ENCRYPT 1.0](../specs/publication/rem-encrypt-profile.md) — the
+  encrypted representation and its X-Wing hybrid KEM profile (X25519 +
+  ML-KEM-768).
+- [REM-PARITY 1.0](../specs/publication/rem-parity-1.0-specification.md) —
+  the Reed-Solomon tape layout, sidecars, and catalog-less bootstrap recovery.
+- [Architecture overview](architecture-overview.md) — the shipped layer stack,
+  write/read paths, catalog, audit log, journals, and daemon surface.
+- `layer2-design.md`, `layer2b-design.md`, `layer2c-design.md` — the
+  original design documents for the tape-platform layers.
+- `pfr-reference.md` — partial-file-restore mechanics, including the
+  prior-art comparison with LTFS extents.
 - `INSTALL.md` — operator runbook for the dev/reference deployment.
-- `README.md` — quick start.
+- [README](../README.md) — current status and quick start.
