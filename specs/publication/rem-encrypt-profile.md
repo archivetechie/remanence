@@ -7,7 +7,8 @@
 | Identifier | Value | Scope |
 | --- | --- | --- |
 | Document version | 1.0 | This publication only |
-| DOI | assigned at first release | This publication |
+| Concept DOI (all versions) | [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) | This publication |
+| Version DOI (this release) | [10.5281/zenodo.21551571](https://doi.org/10.5281/zenodo.21551571) | This publication |
 | Envelope magic | `REMO` | Frozen four-byte wire constant |
 | Key-frame magic | `REMK` | Frozen four-byte wire constant |
 | On-tape `format_version` | `2` | Encrypted-envelope wire discriminator |
@@ -36,7 +37,8 @@ omits Section 5 (the encrypted representation, owned here).
 | Version | 1.0 |
 | Date | 2026-07-25 |
 | License | CC-BY-4.0 |
-| DOI | assigned at first release |
+| Concept DOI (all versions) | [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) |
+| Version DOI (this release) | [10.5281/zenodo.21551571](https://doi.org/10.5281/zenodo.21551571) |
 
 This document is the publication specification for REM-ENCRYPT. It is the
 normative fixed point for the encrypted representation it defines: an

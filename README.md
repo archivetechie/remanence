@@ -1,7 +1,7 @@
 <!-- code-anchor: none -->
 # Remanence
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21425126.svg)](https://doi.org/10.5281/zenodo.21425126)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21551570.svg)](https://doi.org/10.5281/zenodo.21551570)
 
 **Website:** [archivetech.org](https://archivetech.org) — overview, the formats explained, and how to verify them.
 
@@ -209,7 +209,7 @@ please do not open a public issue for suspected vulnerabilities.
 Release history lives in [CHANGELOG.md](CHANGELOG.md). Released
 versions are archived on Zenodo; to cite the project or the format
 specifications, use DOI
-[10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126) (see
+[10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) (see
 [CITATION.cff](CITATION.cff)).
 
 ## License
