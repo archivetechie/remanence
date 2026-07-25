@@ -1442,7 +1442,7 @@ fn run_envelope_case(id: &str, operation: &str) -> Result<(), RemObjectAeadError
     match id {
         "wrong-magic" => sealed[0] = b'X',
         "header-len-not-128" => sealed[5] = 127,
-        "unsupported-format-version" => sealed[6] = 3,
+        "unsupported-format-version" => sealed[6] = 1,
         "unknown-suite-id" => sealed[7] = 2,
         "chunk-size-zero" => sealed[8..12].copy_from_slice(&0u32.to_be_bytes()),
         "chunk-size-not-multiple-of-512" => sealed[8..12].copy_from_slice(&513u32.to_be_bytes()),
@@ -1822,7 +1822,7 @@ fn run_key_frame_case(id: &str, operation: &str) -> Result<(), RemObjectAeadErro
     let (mut object, recipient) = deterministic_base_envelope();
     let key_frame_len = inspect_bytes(&object)?.header.key_frame_len as usize;
     match id {
-        "version-flip" => object[6] = 2,
+        "version-flip" => object[6] = 1,
         "suite-flip" => object[0x38] = 0xff,
         "reserved-wrap-suite-01" => object[0x38] = 0x01,
         "truncated-key-frame" => object.truncate(128 + key_frame_len - 1),

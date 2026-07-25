@@ -360,7 +360,7 @@ mod tests {
             xattr_namespaces: Vec::new(),
         })
         .unwrap();
-        assert_eq!(summary.format_version, 1);
+        assert_eq!(summary.format_version, 2);
         assert_eq!(fs::read(out.join("member.txt")).unwrap(), payload);
         assert_eq!(fs::read_dir(&out).unwrap().count(), 1);
 
@@ -530,7 +530,7 @@ mod tests {
         let summary = RecoverySummary {
             files_written: 1,
             bytes_written: 7,
-            format_version: 1,
+            format_version: 2,
             object_id: "object".to_string(),
             skipped_xattrs: BTreeMap::from([
                 (

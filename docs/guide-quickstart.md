@@ -301,7 +301,7 @@ rem-debug --allow <SERIAL> archive read \
 ```
 
 The locator JSON emitted by `write` pins the object copy to physical
-media and records `format_version: 1` plus the recipient epochs; `verify`
+media and records `format_version: 2` plus the recipient epochs; `verify`
 streams and authenticates the tape object against a digest without restoring
 anything.
 

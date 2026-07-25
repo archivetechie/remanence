@@ -448,7 +448,7 @@ mod tests {
         };
 
         let (sealed, sealed_report) = seal_to_vec(&plaintext, &options).unwrap();
-        assert_eq!(sealed_report.header.format_version, 1);
+        assert_eq!(sealed_report.header.format_version, 2);
         assert_eq!(sealed_report.header.wrap_suite, REM_OBJECT_WRAP_SUITE_XWING);
         assert_eq!(sealed[0x38], REM_OBJECT_WRAP_SUITE_XWING);
         assert_eq!(sealed_report.key_frame.slots.len(), 2);

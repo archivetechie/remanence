@@ -16,14 +16,15 @@ manifest. Readable with stock `tar`.
 **REMO** — the encrypted representation of an REM-OBJECT object: a 128-byte
 header (magic `REMO`), HKDF-SHA-256 key derivation, and a
 ChaCha20-Poly1305 STREAM over the tar bytes. The accepted representation
-is REM-ENCRYPT format version 1 with an HPKE recipient key frame.
+is REM-ENCRYPT 1.0 with on-tape `format_version = 2` and an HPKE recipient
+key frame.
 
 **format version 1 (reserved)** — a permanently unsupported REMO wire
 version retained only as a reserved version number. Current parsers reject
 it with `UnsupportedFormatVersion`; there is no compatibility reader,
 writer, recovery mode, or CLI flag for it.
 
-**REM-ENCRYPT format version 1 (HPKE envelope)** — a REMO shape with no shared
+**REM-ENCRYPT 1.0 HPKE envelope (`format_version = 2`)** — a REMO shape with no shared
 secret: a fresh per-object **data-encryption key (DEK)** is generated
 and wrapped once per recipient with HPKE (RFC 9180 Base mode, HKDF-
 SHA256, ChaCha20-Poly1305) running the **X-Wing hybrid KEM** (see below)

@@ -4045,7 +4045,7 @@ where
             "chunk_size": report.header.chunk_size,
             "plaintext_digest": bytes_to_hex(&report.plaintext.digest),
             "input_format_version": input_header.format_version,
-            "output_format_version": 1,
+            "output_format_version": 2,
             "recipient_epochs": recipient_epochs_json(&report.key_frame),
             "stored_size_bytes": report.stored_size_bytes,
             "expected_sha256": bytes_to_hex(&report.stored_digest),
@@ -10851,7 +10851,7 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
                 layout: report.plaintext_layout,
                 representation: "encrypted",
                 encryption: "REMO",
-                format_version: Some(1),
+                format_version: Some(2),
                 recipient_epochs: Some(recipient_epochs_json(&report.envelope.key_frame)),
                 stored_digest: report.envelope.stored_digest,
                 plaintext_digest: report.envelope.plaintext.digest,
@@ -14820,7 +14820,7 @@ mod tests {
         );
         assert!(report_err.is_empty());
         let report: Value = serde_json::from_slice(&report_out).unwrap();
-        assert_eq!(report["input_format_version"], 1);
+        assert_eq!(report["input_format_version"], 2);
         assert_eq!(report["verified_after_write"], true);
         assert_eq!(report["object_id"], "reseal-object");
         assert_eq!(report["chunk_size"], 512);
@@ -14831,7 +14831,7 @@ mod tests {
         let (opened, opened_report) =
             remanence_aead::open_to_vec(&resealed, &next_recovery).unwrap();
         assert_eq!(opened, plaintext);
-        assert_eq!(opened_report.header.format_version, 1);
+        assert_eq!(opened_report.header.format_version, 2);
         assert_eq!(opened_report.header.object_id, "reseal-object");
         assert_eq!(opened_report.header.chunk_size, 512);
         assert_eq!(opened_report.metadata.plaintext_digest, digest);
@@ -19880,7 +19880,7 @@ blob Project/Render Files/
         assert_eq!(code, ExitCode::SUCCESS);
         assert!(stderr.is_empty(), "{stderr}");
         let report: Value = serde_json::from_str(&stdout).unwrap();
-        assert_eq!(report["format_version"], 1);
+        assert_eq!(report["format_version"], 2);
         assert_eq!(
             report["recipient_epochs"],
             json!([
@@ -19905,7 +19905,7 @@ blob Project/Render Files/
         assert_eq!(code, ExitCode::SUCCESS);
         assert!(stderr.is_empty(), "{stderr}");
         let inspected: Value = serde_json::from_str(&stdout).unwrap();
-        assert_eq!(inspected["format_version"], 1);
+        assert_eq!(inspected["format_version"], 2);
         assert_eq!(inspected["recipient_epochs"], report["recipient_epochs"]);
 
         let restore_dir = temp.path().join("restore");
@@ -20209,7 +20209,7 @@ blob Project/Render Files/
         assert_eq!(code, ExitCode::SUCCESS);
         assert!(stderr.is_empty(), "{stderr}");
         let build: Value = serde_json::from_str(&stdout).expect("build json");
-        assert_eq!(build["format_version"], 1);
+        assert_eq!(build["format_version"], 2);
 
         let stored = fs::read(&object_path).unwrap();
         let inspected = remanence_aead::inspect_bytes(&stored).unwrap();

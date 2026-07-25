@@ -24,8 +24,9 @@ pub mod xwing;
 
 pub use error::{RemObjectAeadError, Result};
 pub use header::{
-    RemObjectHeader, REM_OBJECT_FOOTER, REM_OBJECT_HEADER_LEN, REM_OBJECT_MAX_METADATA_FRAME_LEN,
-    REM_OBJECT_METADATA_FRAME_MIN_LEN, REM_OBJECT_WRAP_SUITE_XWING,
+    RemObjectHeader, REM_OBJECT_FOOTER, REM_OBJECT_FORMAT_VERSION, REM_OBJECT_HEADER_LEN,
+    REM_OBJECT_MAX_METADATA_FRAME_LEN, REM_OBJECT_METADATA_FRAME_MIN_LEN,
+    REM_OBJECT_WRAP_SUITE_XWING,
 };
 pub use inspect::{inspect_bytes, InspectReport};
 pub use kdf::{

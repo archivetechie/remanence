@@ -6,6 +6,8 @@ use crate::error::{RemObjectAeadError, Result};
 
 /// Length in bytes of a REM-OBJECT encrypted-envelope header.
 pub const REM_OBJECT_HEADER_LEN: usize = 128;
+/// Frozen REM-OBJECT encrypted-envelope wire version; value 1 is reserved.
+pub const REM_OBJECT_FORMAT_VERSION: u8 = 2;
 /// Maximum encrypted metadata frame length, including the AEAD tag.
 pub const REM_OBJECT_MAX_METADATA_FRAME_LEN: u64 = 16 * 1024 * 1024;
 /// Minimum encrypted metadata frame length, including the AEAD tag.
@@ -22,7 +24,7 @@ const ZERO_16: [u8; 16] = [0; 16];
 /// Parsed REM-OBJECT encrypted-envelope header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemObjectHeader {
-    /// Envelope format version (always 1 for accepted objects).
+    /// Envelope format version (always 2 for accepted objects).
     pub format_version: u8,
     /// Object body block size and AEAD plaintext chunk size.
     pub chunk_size: u32,
@@ -48,7 +50,7 @@ impl RemObjectHeader {
         key_frame_len: u32,
     ) -> Result<Self> {
         let header = Self {
-            format_version: 1,
+            format_version: REM_OBJECT_FORMAT_VERSION,
             chunk_size,
             hkdf_salt,
             metadata_frame_len,
@@ -70,7 +72,7 @@ impl RemObjectHeader {
             return Err(RemObjectAeadError::InvalidHeaderLength);
         }
         let format_version = bytes[6];
-        if format_version != 1 {
+        if format_version != REM_OBJECT_FORMAT_VERSION {
             return Err(RemObjectAeadError::UnsupportedFormatVersion);
         }
         if bytes[7] != SUITE_ID_HKDF_SHA256_CHACHA20POLY1305 {
@@ -166,7 +168,7 @@ impl RemObjectHeader {
     /// Validate this header under the frozen envelope-field rules.
     pub fn validate(&self) -> Result<()> {
         validate_chunk_size(self.chunk_size)?;
-        if self.format_version != 1 {
+        if self.format_version != REM_OBJECT_FORMAT_VERSION {
             return Err(RemObjectAeadError::UnsupportedFormatVersion);
         }
         validate_wrap_suite(self.wrap_suite)?;
@@ -259,7 +261,7 @@ mod tests {
         let bytes = header.serialize().unwrap();
         assert_eq!(&bytes[0x00..0x04], b"REMO");
         assert_eq!(u16::from_be_bytes([bytes[0x04], bytes[0x05]]), 128);
-        assert_eq!(bytes[0x06], 1);
+        assert_eq!(bytes[0x06], 2);
         assert_eq!(bytes[0x07], 1);
         assert_eq!(
             u32::from_be_bytes(bytes[0x08..0x0c].try_into().unwrap()),
@@ -294,7 +296,7 @@ mod tests {
         )
         .unwrap();
         let bytes = header.serialize().unwrap();
-        assert_eq!(bytes[0x06], 1);
+        assert_eq!(bytes[0x06], 2);
         assert_eq!(bytes[0x07], 1);
         assert_eq!(&bytes[0x10..0x20], &[0; 16]);
         assert_eq!(bytes[0x38], REM_OBJECT_WRAP_SUITE_XWING);
@@ -324,11 +326,13 @@ mod tests {
             Err(RemObjectAeadError::InvalidWrapSuite)
         ));
         let mut version_flip = bytes;
-        version_flip[6] = 2;
+        version_flip[6] = 1;
+        let error = RemObjectHeader::parse(&version_flip).unwrap_err();
         assert!(matches!(
-            RemObjectHeader::parse(&version_flip),
-            Err(RemObjectAeadError::UnsupportedFormatVersion)
+            &error,
+            RemObjectAeadError::UnsupportedFormatVersion
         ));
+        assert_eq!(error.to_string(), "format_version is not 2");
     }
 
     #[test]

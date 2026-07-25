@@ -9,10 +9,11 @@ per-release summaries.
 - Renamed RAO → REM-OBJECT to avoid collision with the LTO "Recommended
   Access Order" feature. The encryption representation is now the
   separately versioned REM-ENCRYPT profile. On-tape identifiers changed to
-  `rem-object-v1`, envelope magic `REMO`, on-tape `format_version = 1`, and
-  `rem-encrypt-*` HKDF labels. The publication test vectors were regenerated;
-  the new archive SHA-256 is
-  `5069b34931fd1dca69f47db511aebfb8ad08fd6665b49983f4bef1128fde19fd`.
+  `rem-object-v1`, envelope magic `REMO`, and `rem-encrypt-*` HKDF labels.
+  The orthogonal encrypted-envelope `format_version` remains frozen at `2`;
+  value `1` is reserved and rejected. The publication test vectors were
+  regenerated; the new archive SHA-256 is
+  `b9be8760fd4a85a922e5fa8eaf86840eec0719a5407030b9f6a35f0606ea79bd`.
 
 ## REM-ENCRYPT 1.0 / v2.0.0 — 2026-07-24
 
@@ -32,7 +33,7 @@ Archived: DOI [10.5281/zenodo.21531003](https://doi.org/10.5281/zenodo.21531003)
 - **Frozen construction and vectors:** the specification now pins the exact
   SHAKE256 seed expansion, SHA3-256 X-Wing combiner, HPKE `kem_id`/suite
   bytes, and component KAT. The regenerated archive SHA-256 is
-  `5069b34931fd1dca69f47db511aebfb8ad08fd6665b49983f4bef1128fde19fd`,
+  `b9be8760fd4a85a922e5fa8eaf86840eec0719a5407030b9f6a35f0606ea79bd`,
   superseding `fa8570d3…`; encrypted positive vectors are X-Wing envelopes
   and new negatives reject `wrap_suite = 0x01` and out-of-range key frames.
 - **Forward erratum:** the pre-production encrypted representation is

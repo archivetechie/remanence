@@ -174,7 +174,7 @@ reader.
 | Operation | Seal/open key input | Result |
 |---|---|---|
 | `archive build`, `archive write` | no recipient flags | Plaintext `rem-object-v1` body. |
-| `archive build`, `archive write` | `--recipient <REMR>` repeated 2-8 times | REM-ENCRYPT format version 1. Epoch ids must be distinct and slot order ascending. |
+| `archive build`, `archive write` | `--recipient <REMR>` repeated 2-8 times | REM-ENCRYPT 1.0 with on-tape `format_version = 2`. Epoch ids must be distinct and slot order ascending. |
 | `archive reseal` | one matching `--private-key <REMP>` plus one `--recipient` list containing 2-8 new REMR files | Full re-seal for recipient rotation. |
 | `archive inspect`, `archive export-object` | none | Keyless envelope inspection, or opaque stored-byte export. |
 | `archive extract`, `restore`, `archive read`, `archive verify` | `--private-key <REMP>` for encrypted input | The private key's epoch id selects its matching key-frame slot. |
@@ -189,21 +189,21 @@ flags are not compatibility aliases; Clap rejects them.
 as `{"epoch_id":"<32 lowercase hex>","label":"<epoch label>"}`.
 
 - An encrypted `archive build` report has `representation: "encrypted"`,
-  `encryption: "REMO"`, `format_version: 1`, `recipient_epochs`, stored and
+  `encryption: "REMO"`, `format_version: 2`, `recipient_epochs`, stored and
   plaintext digests/sizes, manifest digest, and file layout. The plaintext
   form uses `format_version: null` and `recipient_epochs: null`.
 - Encrypted `archive inspect` is explicitly keyless (`keyed: false`) and
   reports the object id, format version, recipients, salt, prefix geometry,
   stored digest/size, and plaintext size/chunk count. It does not claim to
   expose the encrypted manifest.
-- `archive reseal` reports `input_format_version: 1`,
-  `output_format_version: 1`, the new `recipient_epochs`, plaintext and
+- `archive reseal` reports `input_format_version: 2`,
+  `output_format_version: 2`, the new `recipient_epochs`, plaintext and
   published stored digests, sizes, and `verified_after_write: true`.
 - Encrypted local-extract reports and tape-write locators carry
   `recipient_epochs`. Direct tape read/verify receipts keep their existing
   payload byte/hash fields; recipient provenance remains in the locator and
   catalog. Whole-object `extract-stream` additionally reports
-  `format_version: 1`; ranged mode reports the recipients parsed from the
+  `format_version: 2`; ranged mode reports the recipients parsed from the
   authenticated prefix and the authenticated-chunk/stored-range geometry.
 
 <!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/lib.rs @ 2a20106 -->
