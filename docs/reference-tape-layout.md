@@ -2,9 +2,10 @@
 
 What a Remanence-written cartridge physically contains, as the code writes
 it today. Byte-level detail lives in the published specifications —
-[REM-OBJECT](../specs/publication/rao-object-format.md) and
-[REM-PARITY 1.0](../specs/publication/rem-parity-1.0-specification.md) — this page is
-the orientation layer above them.
+[REM-OBJECT Core](../specs/publication/rem-object-core-format.md),
+[REM-ENCRYPT](../specs/publication/rem-encrypt-profile.md), and
+[REM-PARITY 1.0](../specs/publication/rem-parity-1.0-specification.md) — this
+page is the orientation layer above them.
 
 The design goal behind all of it: a tape must be readable with no access
 to Remanence's host state. Everything the catalog knows is either written
