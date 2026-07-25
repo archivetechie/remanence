@@ -19,6 +19,12 @@ This document's version does not name any on-tape value. The
 indicator. REM-ENCRYPT independently defines the encrypted representation
 and its wire discriminators.
 
+REM-OBJECT Core and REM-ENCRYPT share one section skeleton, so the two can be
+read side by side: where a top-level number is absent from one document, the
+other owns it. This document omits Section 5 (the encrypted representation,
+owned by REM-ENCRYPT); REM-ENCRYPT omits Sections 4, 9, and 14 (the plaintext
+representation, the parity relationship, and conformance, owned here).
+
 **Status of This Document**
 
 | | |
@@ -1722,6 +1728,11 @@ ecbf48e48cc11a78b9d6ae9dd7b5e938724ebdb39834a70f17bde17d3eb133da`;
 and `plaintext_digest = stored_digest =
 d59a4a3e4cf2c447c8ed402b109fbb4060ca84dc5b1cebbdc3acb8ca62d8888c`.
 Exact bytes are pinned in the companion archive.
+
+### 13.3. Encrypted-Object Vectors
+
+The vectors for encrypted objects — positive, component, range, and negative —
+are owned by REM-ENCRYPT §13 and are not restated here.
 
 ### 13.4. REM-OBJECT-TV-D1 — Default Chunk Size
 

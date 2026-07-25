@@ -22,6 +22,12 @@ document version 1.0 is independent of the frozen on-tape
 wire discriminators, and derivation labels in this document are wire
 constants, not document-version indicators.
 
+REM-ENCRYPT and REM-OBJECT Core share one section skeleton, so the two can be
+read side by side: where a top-level number is absent from one document, the
+other owns it. This document omits Sections 4, 9, and 14 (the plaintext
+representation, the parity relationship, and conformance, owned by Core); Core
+omits Section 5 (the encrypted representation, owned here).
+
 ### 1.2. Status of This Document
 
 | | |
@@ -728,10 +734,10 @@ unless it also changes the canonical plaintext object.
 
 ## 11. Errors
 
-Core §11 owns the general requirements that I/O failures remain
-distinguishable from format violations and that byte-reachable code never
-panic, crash, or allocate unboundedly. Core §12.9's hostile-input obligations
-apply to all envelope parsing.
+Core §11 owns the requirement that I/O failures remain distinguishable from
+format violations; Core §12.9 owns the requirement that byte-reachable code
+never panics, crashes, or allocates unboundedly. Both apply to all envelope
+parsing.
 
 ### 11.2. Envelope Errors
 
@@ -825,10 +831,10 @@ sizes, member count, manifest content, or payload bytes.
 
 The off-tape catalog contains cleartext paths, per-file rows, and digests.
 Core §12.6 owns this catalog trust domain and its external-anchor obligation.
-The on-tape REM-PARITY bootstrap is deliberately minimal: it carries the
-public fields described by Section 8.2 and MUST NOT carry manifest anchors for
-an encrypted copy. This is the single confidentiality rationale for that
-structural rule.
+The on-tape REM-PARITY bootstrap for an encrypted copy is deliberately
+minimal: it carries only public fields and, per Core §8.2, omits manifest
+anchors. This is the single confidentiality rationale for that structural
+rule.
 
 Deployments that treat object existence, identifier, or approximate size as
 sensitive must add policy above this format. REM-ENCRYPT defines no payload
