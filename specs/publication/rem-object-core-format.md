@@ -7,7 +7,8 @@
 | Identifier | Value | Scope |
 | --- | --- | --- |
 | Document version | 1.0 | This publication only |
-| DOI | assigned at first release | This publication |
+| Concept DOI (all versions) | [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) | This publication |
+| Version DOI (this release) | [10.5281/zenodo.21551571](https://doi.org/10.5281/zenodo.21551571) | This publication |
 | Stream format identifier | `rem-object-v1` | Frozen plaintext-stream wire constant |
 | Stream schema version | `1.0` without preserved xattrs; `1.1` with preserved xattrs | `REMANENCE.schema_version` |
 | Manifest schema version | `1` | Manifest CBOR field |
@@ -33,7 +34,8 @@ representation, the parity relationship, and conformance, owned here).
 | Version | 1.0 |
 | Date | 2026-07-25 |
 | License | CC-BY-4.0 |
-| DOI | assigned at first release |
+| Concept DOI (all versions) | [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) |
+| Version DOI (this release) | [10.5281/zenodo.21551571](https://doi.org/10.5281/zenodo.21551571) |
 
 This document is the publication specification for the REM-OBJECT Core
 Format. It is the normative fixed point for the durable canonical object: an
