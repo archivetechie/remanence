@@ -502,13 +502,13 @@ But worth understanding for the orchestrator's benefit:
   LTO-8/earlier.
 
 For rem this is a future opt-in feature, not a transparent
-optimisation. The v0.3 contract (`docs/spec-v0.3.md` §3.2, §7.2, §9.0)
-is strict: Layer 3a does not queue or reorder, and individual
-`ReadRange` calls execute in the order the caller issues them. If
-oRAO ever becomes relevant (LTO-9 full-height bays added, or LTO-10
-brings oRAO to half-height), it will land as a **new explicit RPC**
-— `ReadService.BatchReadRange` per spec §9.0 — that the orchestrator
-opts into for a batch of read targets against one session. Inside
+optimisation. The read contract is strict: the read path does not
+queue or reorder, and individual `ReadRange` calls execute in the
+order the caller issues them. If oRAO ever becomes relevant (LTO-9
+full-height bays added, or LTO-10 brings oRAO to half-height), it
+will land as a **new explicit RPC** — `ReadService.BatchReadRange` —
+that the orchestrator opts into for a batch of read targets against
+one session. Inside
 that RPC, rem can submit the batch to the drive via `Receive
 Recommended Access Order` and stream results back in drive-
 recommended order. Callers of plain `ReadRange` retain the strict
