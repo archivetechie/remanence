@@ -29,10 +29,10 @@ const TAPE_UUID: [u8; 16] = [0x42; 16];
 const WRITTEN_AT: &str = "2026-01-01T00:00:00Z";
 const WRITTEN_BY: &str = "remanence-publication-vector-1";
 const PINNED_BOOTSTRAP_SCHEMA_MINOR: u16 = 2;
-const RAO_TV_P1_OBJECT_ID: &str = "00000000-0000-4000-8000-000000000001";
-const RAO_TV_P1_MANIFEST_SHA256: [u8; 32] = [
-    0x81, 0x8e, 0x53, 0x93, 0x62, 0xd6, 0x40, 0x13, 0x4a, 0x44, 0x4e, 0x31, 0xa1, 0xc8, 0x46, 0x0b,
-    0x6b, 0x48, 0xdc, 0x07, 0x66, 0x9d, 0xef, 0x61, 0xe2, 0xf1, 0x66, 0xb7, 0xf4, 0x19, 0xd0, 0x3b,
+const REM_OBJECT_TV_P1_OBJECT_ID: &str = "00000000-0000-4000-8000-000000000001";
+const REM_OBJECT_TV_P1_MANIFEST_SHA256: [u8; 32] = [
+    0xec, 0xbf, 0x48, 0xe4, 0x8c, 0xc1, 0x1a, 0x78, 0xb9, 0xd6, 0xae, 0x9d, 0xd7, 0xb5, 0xe9, 0x38,
+    0x72, 0x4e, 0xbd, 0xb3, 0x98, 0x34, 0xa7, 0x0f, 0x17, 0xbd, 0xe1, 0x7d, 0x3e, 0xb1, 0x33, 0xda,
 ];
 
 #[derive(Debug)]
@@ -434,21 +434,27 @@ fn emit_object_id_36_bootstrap(root: &Path) -> Result<(), Box<dyn std::error::Er
     let source = root
         .parent()
         .ok_or("REM-PARITY output directory has no publication-stage parent")?
-        .join("rao")
+        .join("rem-object")
         .join("objects")
-        .join("rao-tv-p1.rao");
+        .join("rem-object-tv-p1.rem-object");
     let object = fs::read(&source)?;
     if object.is_empty() || object.len() % BLOCK_SIZE as usize != 0 {
         return Err(format!(
-            "{} is not a nonempty block-aligned RAO object",
+            "{} is not a nonempty block-aligned REM-OBJECT object",
             source.display()
         )
         .into());
     }
     let stored_block_count = u64::try_from(object.len() / BLOCK_SIZE as usize)?;
-    let object_row =
-        BootstrapObjectRow::plaintext(1, stored_block_count, 4, 548, 1, RAO_TV_P1_MANIFEST_SHA256)
-            .with_object_id(RAO_TV_P1_OBJECT_ID.as_bytes().to_vec());
+    let object_row = BootstrapObjectRow::plaintext(
+        1,
+        stored_block_count,
+        4,
+        554,
+        1,
+        REM_OBJECT_TV_P1_MANIFEST_SHA256,
+    )
+    .with_object_id(REM_OBJECT_TV_P1_OBJECT_ID.as_bytes().to_vec());
     let mut payload = bootstrap_payload(None, None, 0);
     payload.object_rows.push(object_row);
     write_block(
@@ -468,15 +474,15 @@ fn emit_object_id_36_bootstrap(root: &Path) -> Result<(), Box<dyn std::error::Er
                 "  \"stored_block_count\": {},\n",
                 "  \"plaintext_digest\": \"{}\",\n",
                 "  \"manifest_first_chunk_lba\": 4,\n",
-                "  \"manifest_size_bytes\": 548,\n",
+                "  \"manifest_size_bytes\": 554,\n",
                 "  \"manifest_chunk_count\": 1,\n",
                 "  \"manifest_sha256\": \"{}\"\n",
                 "}}\n"
             ),
-            RAO_TV_P1_OBJECT_ID,
+            REM_OBJECT_TV_P1_OBJECT_ID,
             stored_block_count,
             sha256_hex(&object),
-            hex(&RAO_TV_P1_MANIFEST_SHA256),
+            hex(&REM_OBJECT_TV_P1_MANIFEST_SHA256),
         ),
     )?;
     Ok(())

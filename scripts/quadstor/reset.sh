@@ -1,5 +1,5 @@
 #!/bin/bash
-# Reset the QuadStor virtual library: delete all vcartridges + the VTL, then re-create them.
+# Reset the Quadstor virtual library: delete all vcartridges + the VTL, then re-create them.
 # Leaves device definitions and the backing disk intact (those are slow to set up).
 #
 # Use when you want a clean library to play with but don't want to wait for the

@@ -1,0 +1,27 @@
+[package]
+name        = "rem-recover"
+description = "Small standalone catalogless disaster-recovery tool for REM-OBJECT objects."
+version     .workspace = true
+edition     .workspace = true
+rust-version.workspace = true
+authors     .workspace = true
+license = "Apache-2.0"
+repository  .workspace = true
+
+[dependencies]
+remanence-aead    = { path = "../remanence-aead" }
+remanence-format  = { path = "../remanence-format" }
+remanence-library = { path = "../remanence-library" }
+remanence-stream  = { path = "../remanence-stream" }
+clap              = { workspace = true }
+serde_json        = { workspace = true }
+tempfile          = { workspace = true }
+zeroize           = { workspace = true }
+
+[dev-dependencies]
+sha2 = { workspace = true }
+xattr = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"

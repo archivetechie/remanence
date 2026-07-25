@@ -1,6 +1,6 @@
 //! Bounded live append receive ring.
 //!
-//! The async gRPC receiver fills fixed-size slabs while the synchronous RAO
+//! The async gRPC receiver fills fixed-size slabs while the synchronous REM-OBJECT
 //! writer consumes them through [`Read`]. One daemon-wide memory permit is
 //! held for the ring's configured lifetime; slab slots recycle without
 //! accumulating one permit per incoming chunk.
@@ -289,7 +289,7 @@ impl AppendRingProducer {
     }
 }
 
-/// Synchronous consumer half used as the RAO file reader.
+/// Synchronous consumer half used as the REM-OBJECT file reader.
 pub(crate) struct AppendRingConsumer {
     rx: mpsc::Receiver<RingMessage>,
     recycled_tx: mpsc::UnboundedSender<Vec<u8>>,

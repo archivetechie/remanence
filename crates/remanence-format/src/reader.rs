@@ -1,4 +1,4 @@
-//! Reader and forward-scan parser for `rao-v1` objects.
+//! Reader and forward-scan parser for `rem-object-v1` objects.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,7 +17,7 @@ use crate::tar::{
     TYPE_DIRECTORY, TYPE_HARDLINK, TYPE_PAX_EXTENDED, TYPE_PAX_GLOBAL, TYPE_REGULAR, TYPE_SYMLINK,
 };
 
-/// Reader integrity mode for `rao-v1` objects.
+/// Reader integrity mode for `rem-object-v1` objects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReadMode {
     /// Verify every complete regular-file payload and fail on mismatch.
@@ -38,14 +38,14 @@ pub struct RemTarDigestMismatch {
     pub actual: String,
 }
 
-/// Non-fatal conformance issue reported by a restore-mode RAO reader.
+/// Non-fatal conformance issue reported by a restore-mode REM-OBJECT reader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemTarReadWarning {
     /// Tar EOF was reached without the required final manifest entry.
     MissingManifest,
 }
 
-/// One entry recovered from a `rao-v1` object.
+/// One entry recovered from a `rem-object-v1` object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemTarReadEntry {
     /// Entry kind encoded by the tar typeflag.
@@ -97,7 +97,7 @@ pub struct RemTarStreamEntry {
     pub extensions: RemTarExtensions,
 }
 
-/// Streaming callbacks for restoring a `rao-v1` object.
+/// Streaming callbacks for restoring a `rem-object-v1` object.
 pub trait RemTarEntrySink {
     /// Called after the entry header has been parsed, before payload bytes.
     fn begin_file(&mut self, entry: &RemTarStreamEntry) -> Result<(), FormatError>;
@@ -126,7 +126,7 @@ pub struct RemTarStreamReport {
     pub warnings: Vec<RemTarReadWarning>,
 }
 
-/// Parsed `rao-v1` object archive.
+/// Parsed `rem-object-v1` object archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemTarReadObject {
     /// Global pax records in effect for the object.
@@ -143,12 +143,12 @@ pub struct RemTarReadObject {
     pub warnings: Vec<RemTarReadWarning>,
 }
 
-/// Parsed encrypted RAO object and authenticated envelope report.
+/// Parsed encrypted REM-OBJECT object and authenticated envelope report.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EncryptedRaoReadObject {
-    /// Decrypted and parsed canonical plaintext RAO object.
+pub struct EncryptedRemObjectReadObject {
+    /// Decrypted and parsed canonical plaintext REM-OBJECT object.
     pub object: RemTarReadObject,
-    /// RAO envelope report from keyed open.
+    /// REM-OBJECT envelope report from keyed open.
     pub envelope: OpenReport,
 }
 
@@ -233,14 +233,14 @@ pub fn read_rem_tar_object_with_mode_and_manifest_anchor<S: BlockRead + ?Sized>(
     parse_rem_tar_bytes_with_mode_and_manifest_anchor(&archive, chunk_size, mode, manifest_sha256)
 }
 
-/// Read, decrypt, and parse one recipient-envelope RAO object.
-pub fn read_encrypted_rao_object<S: BlockRead + ?Sized>(
+/// Read, decrypt, and parse one recipient-envelope REM-OBJECT object.
+pub fn read_encrypted_rem_object<S: BlockRead + ?Sized>(
     source: &mut S,
     chunk_size: usize,
     block_count: u64,
     recipient: &RecipientPrivateKey,
-) -> Result<EncryptedRaoReadObject, FormatError> {
-    read_encrypted_rao_object_with_mode(
+) -> Result<EncryptedRemObjectReadObject, FormatError> {
+    read_encrypted_rem_object_with_mode(
         source,
         chunk_size,
         block_count,
@@ -249,15 +249,15 @@ pub fn read_encrypted_rao_object<S: BlockRead + ?Sized>(
     )
 }
 
-/// Read a recipient-envelope RAO object with an explicit integrity mode.
-pub fn read_encrypted_rao_object_with_mode<S: BlockRead + ?Sized>(
+/// Read a recipient-envelope REM-OBJECT object with an explicit integrity mode.
+pub fn read_encrypted_rem_object_with_mode<S: BlockRead + ?Sized>(
     source: &mut S,
     chunk_size: usize,
     block_count: u64,
     recipient: &RecipientPrivateKey,
     mode: ReadMode,
-) -> Result<EncryptedRaoReadObject, FormatError> {
-    read_encrypted_rao_object_with_mode_and_manifest_anchor(
+) -> Result<EncryptedRemObjectReadObject, FormatError> {
+    read_encrypted_rem_object_with_mode_and_manifest_anchor(
         source,
         chunk_size,
         block_count,
@@ -267,15 +267,15 @@ pub fn read_encrypted_rao_object_with_mode<S: BlockRead + ?Sized>(
     )
 }
 
-/// Read a recipient-envelope RAO object with an external manifest anchor.
-pub fn read_encrypted_rao_object_with_manifest_anchor<S: BlockRead + ?Sized>(
+/// Read a recipient-envelope REM-OBJECT object with an external manifest anchor.
+pub fn read_encrypted_rem_object_with_manifest_anchor<S: BlockRead + ?Sized>(
     source: &mut S,
     chunk_size: usize,
     block_count: u64,
     recipient: &RecipientPrivateKey,
     manifest_sha256: Option<[u8; 32]>,
-) -> Result<EncryptedRaoReadObject, FormatError> {
-    read_encrypted_rao_object_with_mode_and_manifest_anchor(
+) -> Result<EncryptedRemObjectReadObject, FormatError> {
+    read_encrypted_rem_object_with_mode_and_manifest_anchor(
         source,
         chunk_size,
         block_count,
@@ -285,15 +285,15 @@ pub fn read_encrypted_rao_object_with_manifest_anchor<S: BlockRead + ?Sized>(
     )
 }
 
-/// Read a recipient-envelope RAO object with explicit mode and manifest anchor.
-pub fn read_encrypted_rao_object_with_mode_and_manifest_anchor<S: BlockRead + ?Sized>(
+/// Read a recipient-envelope REM-OBJECT object with explicit mode and manifest anchor.
+pub fn read_encrypted_rem_object_with_mode_and_manifest_anchor<S: BlockRead + ?Sized>(
     source: &mut S,
     chunk_size: usize,
     block_count: u64,
     recipient: &RecipientPrivateKey,
     mode: ReadMode,
     manifest_sha256: Option<[u8; 32]>,
-) -> Result<EncryptedRaoReadObject, FormatError> {
+) -> Result<EncryptedRemObjectReadObject, FormatError> {
     validate_chunk_size(chunk_size)?;
     let encrypted = read_object_bytes(source, chunk_size, block_count)?;
     let (plaintext, envelope) = open_to_vec(&encrypted, recipient)?;
@@ -306,7 +306,7 @@ fn parse_opened_encrypted_object(
     chunk_size: usize,
     mode: ReadMode,
     manifest_sha256: Option<[u8; 32]>,
-) -> Result<EncryptedRaoReadObject, FormatError> {
+) -> Result<EncryptedRemObjectReadObject, FormatError> {
     let header_chunk_size = usize::try_from(envelope.header.chunk_size)
         .map_err(|_| FormatError::unsupported_feature("encrypted header chunk_size too large"))?;
     if header_chunk_size != chunk_size {
@@ -317,7 +317,7 @@ fn parse_opened_encrypted_object(
     }
     if plaintext.len() % chunk_size != 0 {
         return Err(FormatError::parse(
-            "decrypted RAO plaintext is not chunk aligned",
+            "decrypted REM-OBJECT plaintext is not chunk aligned",
         ));
     }
     let plaintext_block_count = u64::try_from(plaintext.len() / chunk_size)
@@ -349,10 +349,10 @@ fn parse_opened_encrypted_object(
     }
     if plaintext_block_count == 0 {
         return Err(FormatError::parse(
-            "decrypted RAO plaintext has zero blocks",
+            "decrypted REM-OBJECT plaintext has zero blocks",
         ));
     }
-    Ok(EncryptedRaoReadObject { object, envelope })
+    Ok(EncryptedRemObjectReadObject { object, envelope })
 }
 
 fn map_inner_plaintext_error(error: FormatError, header_object_id: &str) -> FormatError {
@@ -1182,7 +1182,7 @@ fn validate_global_contract_once(
         if encryption != "none" {
             return Err(FormatError::unsupported_format_gate(
                 FormatGate::Encryption,
-                format!("inner RAO stream encryption must be \"none\", got {encryption:?}"),
+                format!("inner REM-OBJECT stream encryption must be \"none\", got {encryption:?}"),
             ));
         }
     }
@@ -1459,7 +1459,7 @@ mod tests {
     use super::*;
     use crate::tar::encode_header;
     use crate::{
-        write_encrypted_rao_object, write_rem_tar_object, RemTarFile, RemTarObjectOptions,
+        write_encrypted_rem_object, write_rem_tar_object, RemTarFile, RemTarObjectOptions,
         FORMAT_ID,
     };
 
@@ -1521,7 +1521,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "remanence-format-{test_name}-{}-{nanos}.rao",
+            "remanence-format-{test_name}-{}-{nanos}.rem-object",
             std::process::id()
         ))
     }
@@ -1849,7 +1849,7 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_rao_round_trips_through_file_block_adapters() {
+    fn plaintext_rem_object_round_trips_through_file_block_adapters() {
         let opts = options(4096);
         let files = [
             RemTarFile {
@@ -1955,7 +1955,7 @@ mod tests {
         }];
         let mut sink = VecBlockSink::new();
         let layout = write_rem_tar_object(&mut sink, &opts, &files).unwrap();
-        replace_once_in_blocks(&mut sink.blocks, b"rao-v1", b"rao-v0");
+        replace_once_in_blocks(&mut sink.blocks, b"rem-object-v1", b"rem-object-v0");
         let mut source = VecBlockSource::new(sink.blocks);
 
         let err = read_rem_tar_object(&mut source, opts.chunk_size, layout.projected_size_blocks)
@@ -1974,7 +1974,7 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_rao_round_trips_and_keyless_inspect_hides_inner_names() {
+    fn encrypted_rem_object_round_trips_and_keyless_inspect_hides_inner_names() {
         let opts = options(4096);
         let files = [
             RemTarFile {
@@ -1995,7 +1995,7 @@ mod tests {
         let (primary, recipients) = recipient_pair();
         let mut sink = VecBlockSink::new();
         let write_report =
-            write_encrypted_rao_object(&mut sink, &opts, &files, &recipients).unwrap();
+            write_encrypted_rem_object(&mut sink, &opts, &files, &recipients).unwrap();
         let encrypted: Vec<u8> = sink.blocks.iter().flatten().copied().collect();
 
         let inspected = inspect_bytes(&encrypted).unwrap();
@@ -2010,7 +2010,7 @@ mod tests {
         assert!(!contains_bytes(&encrypted, MANIFEST_PATH.as_bytes()));
 
         let mut source = VecBlockSource::new(sink.blocks);
-        let read = read_encrypted_rao_object(
+        let read = read_encrypted_rem_object(
             &mut source,
             opts.chunk_size,
             write_report.envelope.stored_size_blocks,
@@ -2034,7 +2034,7 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_rao_round_trips_through_file_block_adapters() {
+    fn encrypted_rem_object_round_trips_through_file_block_adapters() {
         let opts = options(4096);
         let files = [
             RemTarFile {
@@ -2056,7 +2056,7 @@ mod tests {
         let path = temp_object_path("encrypted");
         let write_report = {
             let mut sink = FileBlockSink::create_truncate(&path, opts.chunk_size).unwrap();
-            let report = write_encrypted_rao_object(&mut sink, &opts, &files, &recipients).unwrap();
+            let report = write_encrypted_rem_object(&mut sink, &opts, &files, &recipients).unwrap();
             sink.flush().unwrap();
             report
         };
@@ -2071,7 +2071,7 @@ mod tests {
         );
         let block_count = source.block_count();
         let read =
-            read_encrypted_rao_object(&mut source, opts.chunk_size, block_count, &primary).unwrap();
+            read_encrypted_rem_object(&mut source, opts.chunk_size, block_count, &primary).unwrap();
         assert_eq!(read.object.entry("a.txt").unwrap().data, b"hello");
         assert_eq!(
             read.object.entry("secret/name.bin").unwrap().data,
@@ -2081,7 +2081,7 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_rao_wrong_key_fails_before_inner_plaintext_parse() {
+    fn encrypted_rem_object_wrong_key_fails_before_inner_plaintext_parse() {
         let opts = options(4096);
         let files = [RemTarFile {
             path: "a.txt",
@@ -2093,10 +2093,10 @@ mod tests {
         let (_primary, recipients) = recipient_pair();
         let wrong_key = RecipientPrivateKey::new([0x33; 16], "wrong-2026", [0x43; 32]).unwrap();
         let mut sink = VecBlockSink::new();
-        let report = write_encrypted_rao_object(&mut sink, &opts, &files, &recipients).unwrap();
+        let report = write_encrypted_rem_object(&mut sink, &opts, &files, &recipients).unwrap();
         let mut source = VecBlockSource::new(sink.blocks);
 
-        let err = read_encrypted_rao_object(
+        let err = read_encrypted_rem_object(
             &mut source,
             opts.chunk_size,
             report.envelope.stored_size_blocks,
@@ -2108,7 +2108,7 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_rao_rejects_inner_payload_digest_mismatch() {
+    fn encrypted_rem_object_rejects_inner_payload_digest_mismatch() {
         let opts = options(4096);
         let files = [RemTarFile {
             path: "a.txt",
@@ -2144,7 +2144,7 @@ mod tests {
                 .collect(),
         );
 
-        let err = read_encrypted_rao_object(
+        let err = read_encrypted_rem_object(
             &mut source,
             opts.chunk_size,
             report.stored_size_blocks,
@@ -2162,7 +2162,7 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_rao_maps_inner_format_gate_without_string_matching() {
+    fn encrypted_rem_object_maps_inner_format_gate_without_string_matching() {
         let opts = options(4096);
         let files = [RemTarFile {
             path: "a.txt",
@@ -2201,7 +2201,7 @@ mod tests {
                 .collect(),
         );
 
-        let err = read_encrypted_rao_object(
+        let err = read_encrypted_rem_object(
             &mut source,
             opts.chunk_size,
             report.stored_size_blocks,

@@ -8,6 +8,6 @@ list and checksum; the archive also contains `verify.py`, so checking the
 distribution does not require a Remanence source checkout.
 
 Positive image bytes are emitted through the production Rust codecs and resume
-planner used by the crate tests. The publication archive also carries the RAO
+planner used by the crate tests. The publication archive also carries the REM-OBJECT
 byte streams and negative-vector manifests needed to exercise the
 payload-format side of the combined specification packet.

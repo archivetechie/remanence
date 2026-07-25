@@ -53,15 +53,15 @@ const OBJECT_ROW_METADATA_FRAME_MAX_LEN: u64 = 16 * 1024 * 1024;
 /// Representation class for pre-write bootstrap object-row admission.
 ///
 /// The actual row is still recorded after object bytes are written, when
-/// representation-specific anchors are known. This value lets RAO writers
+/// representation-specific anchors are known. This value lets REM-OBJECT writers
 /// reserve worst-case key-30 row space before the first object block reaches
 /// tape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootstrapObjectRowAdmission {
-    /// A plaintext RAO row carrying manifest location, size, count, and digest.
-    PlaintextRao,
-    /// An encrypted RAO row carrying only envelope-visible key id and metadata length.
-    EncryptedRao,
+    /// A plaintext REM-OBJECT row carrying manifest location, size, count, and digest.
+    PlaintextRemObject,
+    /// An encrypted REM-OBJECT row carrying only envelope-visible key id and metadata length.
+    EncryptedRemObject,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,7 +121,7 @@ fn worst_case_bootstrap_object_row(
         ));
     }
     match admission {
-        BootstrapObjectRowAdmission::PlaintextRao => {
+        BootstrapObjectRowAdmission::PlaintextRemObject => {
             let max_chunks_by_capacity = u64::MAX / u64::from(block_size_bytes);
             let manifest_chunk_count = stored_block_count.min(max_chunks_by_capacity);
             let manifest_first_chunk_lba =
@@ -143,7 +143,7 @@ fn worst_case_bootstrap_object_row(
             )
             .with_object_id([0xFF; 64]))
         }
-        BootstrapObjectRowAdmission::EncryptedRao => Ok(BootstrapObjectRow::encrypted(
+        BootstrapObjectRowAdmission::EncryptedRemObject => Ok(BootstrapObjectRow::encrypted(
             tape_file_number,
             stored_block_count,
             (1u8..=8).map(|byte| [byte; 16]).collect(),
@@ -190,7 +190,7 @@ fn checkpoint_batch_candidate_rows(
                     "checkpoint row reservation tape-file number overflows",
                 ))?;
         candidate_rows.push(worst_case_bootstrap_object_row(
-            BootstrapObjectRowAdmission::EncryptedRao,
+            BootstrapObjectRowAdmission::EncryptedRemObject,
             tape_file_number,
             u64::MAX,
             block_size_bytes,
@@ -901,7 +901,7 @@ pub struct ParitySink<'a> {
     /// a parity_map control file.
     sidecar_directory_entries: Vec<SidecarEpochDirectoryEntry>,
 
-    /// RAO-binding object rows to include in subsequent checkpoint/final
+    /// REM-OBJECT-binding object rows to include in subsequent checkpoint/final
     /// bootstrap payloads.
     bootstrap_object_rows: Vec<BootstrapObjectRow>,
 
@@ -1636,7 +1636,7 @@ impl<'a> ParitySink<'a> {
     /// Evaluate the capacity reserve and prove a worst-case bootstrap object
     /// row for this representation will still fit before beginning the object.
     ///
-    /// RAO integrations that will later call
+    /// REM-OBJECT integrations that will later call
     /// [`Self::record_bootstrap_object_row`] use this pre-write gate to meet
     /// the key-30 bootstrap admission rule. The exact row is still checked at
     /// record time after the object body has been produced.
@@ -1823,7 +1823,7 @@ impl<'a> ParitySink<'a> {
 
     /// Attach the higher-layer bootstrap row for the active object.
     ///
-    /// Layer 3c never parses object bytes, so RAO-specific manifest/envelope
+    /// Layer 3c never parses object bytes, so REM-OBJECT-specific manifest/envelope
     /// anchors must be supplied by the body-format layer after it has written
     /// the object bytes and before [`Self::finish_object`] emits any
     /// object-boundary checkpoint bootstrap.

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Full teardown of the QuadStor virtual library setup, in reverse order:
+# Full teardown of the Quadstor virtual library setup, in reverse order:
 # - delete vcartridges
 # - delete the VTL
 # - remove the backing disk from the pool
@@ -7,7 +7,7 @@
 # - disable the systemd loop unit
 # - (optionally) remove the device defs
 #
-# Leaves QuadStor itself (the .deb) installed. To uninstall, see INSTALL.md.
+# Leaves Quadstor itself (the .deb) installed. To uninstall, see INSTALL.md.
 #
 # Usage:  sudo scripts-relative: scripts/quadstor/teardown.sh
 #         sudo scripts-relative: scripts/quadstor/teardown.sh --keep-backing
@@ -44,7 +44,7 @@ else
     log "no VTL '$VTL_NAME' present"
 fi
 
-# 2. Remove the LV from QuadStor's pool (setup added LV_PATH, not LOOP_DEV).
+# 2. Remove the LV from Quadstor's pool (setup added LV_PATH, not LOOP_DEV).
 if disk_configured "$LV_PATH"; then
     log "removing $LV_PATH from pool '$POOL_NAME'"
     "$BDCONFIG" -x -d "$LV_PATH" || true

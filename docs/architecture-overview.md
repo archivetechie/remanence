@@ -15,8 +15,8 @@ Layer 5   remanence-api, remanence-daemon, remanence-cli
           gRPC services, drive actors, sessions, operator CLIs
 Layer 4   remanence-state
           config, state lock, audit log, rebuildable SQLite catalog
-Layer 3   remanence-format (3b: rao-v1 body)   remanence-parity (3c: parity)
-          + remanence-aead (RAO1 HPKE envelope), remanence-format-driver (traits),
+Layer 3   remanence-format (3b: rem-object-v1 body)   remanence-parity (3c: parity)
+          + remanence-aead (REMO HPKE envelope), remanence-format-driver (traits),
             remanence-bru (legacy reader), remanence-stream (composition)
 Layer 2   remanence-library
           discovery, identity, policy-gated handles, robotics, tape I/O
@@ -29,10 +29,10 @@ Layers 3b and 3c are siblings, not stacked: both build on the
 body blocks; the parity layer owns the physical tape layout around them
 (bootstraps, filemarks, sidecars).
 
-One crate sits outside the stack by design: `crates/rao-recover` is a
+One crate sits outside the stack by design: `crates/rem-recover` is a
 standalone disaster-recovery binary that links `remanence-aead`,
 `remanence-format`, `remanence-library`, and `remanence-stream` directly,
-skipping Layers 4 and 5 entirely. It exists so an encrypted RAO envelope can be
+skipping Layers 4 and 5 entirely. It exists so an encrypted REM-OBJECT envelope can be
 decrypted and restored with nothing but the object bytes and one matching
 recipient private key — no daemon, no catalog, no config file — for the
 scenario where the rest of the stack is unavailable or untrusted.
@@ -79,7 +79,7 @@ state machine) and the udev hot-plug watcher also live here.
 ### The platform seam
 
 `remanence-scsi` and `remanence-library` are the reusable tape-platform
-crates, and they are format-free by contract: no RAO, parity, catalog, or
+crates, and they are format-free by contract: no REM-OBJECT, parity, catalog, or
 daemon knowledge below this seam. The contract is enforced twice in the
 tree: a manifest-parsing test asserts that `remanence-scsi` and
 `remanence-aead` depend on no internal crate and that `remanence-library`
@@ -93,19 +93,19 @@ and catalog on the platform crates without inheriting Remanence's formats.
 
 Six crates share this layer:
 
-- `remanence-format` implements `rao-v1`, the native body format: one pax
+- `remanence-format` implements `rem-object-v1`, the native body format: one pax
   tar archive per stored object, chunk-aligned, self-describing, with a
   trailing CBOR manifest. It also implements partial-file reads that skip
   directly to a member's blocks, and a "covering range" computation that
   maps a requested plaintext byte range to the smallest span of AEAD
   chunks that must be fetched and decrypted to serve it.
-- `remanence-aead` is the isolated crypto boundary: the `RAO1` encrypted
-  format-version-2 envelope (HKDF-SHA-256 key derivation and a
+- `remanence-aead` is the isolated crypto boundary: the `REMO` encrypted
+  REM-ENCRYPT format-version-1 envelope (HKDF-SHA-256 key derivation and a
   ChaCha20-Poly1305 STREAM). It generates a fresh per-object
   data-encryption key and wraps a copy of it to each recipient with HPKE
   Base mode running the X-Wing hybrid KEM (ML-KEM-768 combined with
   X25519, per `draft-connolly-cfrg-xwing-kem`; IANA HPKE KEM id `0x647a`)
-  in a `RAOK`-tagged key frame between the header and metadata frame.
+  in a `REMK`-tagged key frame between the header and metadata frame.
   Readers accept 1-8 slots; production sealers require 2-8 distinct
   epochs. There is no shared secret. Wrap-suite id `0x01`, the
   pre-production X25519-only KEM, is permanently reserved and rejected
@@ -113,7 +113,7 @@ Six crates share this layer:
   The crate depends on no other Remanence crate, so the envelope is
   auditable on its own. Its whole-object and ranged primitives are
   wrapped by `remanence-format`, which is the funnel used by the CLI,
-  API, and `rao-recover`.
+  API, and `rem-recover`.
 - `remanence-parity` owns the physical tape layout: bootstrap blocks,
   filemark discipline, Reed-Solomon sidecar parity, resume, and the
   catalog-less scan that reconstructs a tape's structure from the media
@@ -133,10 +133,10 @@ Six crates share this layer:
 
 `archive build` and pool-selected `archive write` produce the encrypted
 representation when given
-2-8 ordered `--recipient` RAOR files; omitting recipients keeps the body
+2-8 ordered `--recipient` REMR files; omitting recipients keeps the body
 plaintext. `archive reseal` performs a full re-seal to rotate recipients. Whole,
-streaming, and ranged opens use a RAOP `--private-key`; its epoch id selects
-the matching key-frame slot. `rao-recover` provides the same encrypted open without
+streaming, and ranged opens use a REMP `--private-key`; its epoch id selects
+the matching key-frame slot. `rem-recover` provides the same encrypted open without
 the daemon, catalog, or config.
 
 <!-- code-anchor: crates/remanence-state/src/lib.rs crates/remanence-state/src/state.rs @ 2a20106 -->
@@ -222,7 +222,7 @@ What happens when an orchestrator writes an object:
    against the received bytes before anything touches tape. On startup,
    `rem-daemon` deletes its own daemon-owned leftover spool files from a
    prior unclean exit before resolving the budget.
-4. The object is laid out as a plaintext `rao-v1` body or sealed as a
+4. The object is laid out as a plaintext `rem-object-v1` body or sealed as a
    recipient envelope, then
    written through the parity sink. Tape I/O itself is pipelined: a
    fixed pool of page-aligned staging-ring buffers (`tape_io.staging_ring_buffers`,
@@ -254,7 +254,7 @@ is advisory and locator-free; callers retain the source until
 that was not reported CHECKPOINTED after any session, stream, or daemon loss.
 Each barrier closes the open parity epoch when present and writes a non-final
 checkpoint bootstrap on tape with the authenticated filemark-map prefix and
-every committed RAO object row,
+every committed REM-OBJECT object row,
 then drains deferred drive errors with synchronous `WRITE FILEMARKS(0)` and
 captures `READ POSITION`. The daemon fsyncs that EOD and the replayable batch
 projection to its per-tape checkpoint journal before one SQLite transaction.

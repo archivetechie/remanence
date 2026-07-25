@@ -148,9 +148,9 @@ for d in "${FILTERED[@]}"; do
     # ---- changer-specific: READ ELEMENT STATUS with DVCID + VOLTAG -
     if [[ "$kind" == "changer" ]]; then
         # Two CDB variants. The "safe" form (256 elements, 64 KB alloc) works
-        # on every library we've tested including QuadStor. The "big" form
+        # on every library we've tested including Quadstor. The "big" form
         # mirrors the original plan.txt CDB and gives the real MSL3040 room
-        # to return larger payloads if its firmware uses them; QuadStor
+        # to return larger payloads if its firmware uses them; Quadstor
         # refuses it with a CHECK CONDITION which we tolerate.
         #
         # CDB layout (SMC-3 §6.13):

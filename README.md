@@ -22,15 +22,15 @@ copy of the truth, and when the hardware leaves the software uncertain
 about physical state, the software stops rather than guesses. The
 reasoning is laid out in [docs/why-remanence.md](docs/why-remanence.md).
 
-It is developed against a QuadStor virtual tape library and field-tested
+It is developed against a Quadstor virtual tape library and field-tested
 on an HPE MSL3040 with LTO-9 drives.
 
 <!-- code-anchor: Cargo.toml crates proto/layer5.proto @ 8de2c46 -->
 ## Status
 
 Pre-alpha, version 0.0.1. Interfaces and the gRPC contract may still
-change before a stable release; the published on-tape formats (RAO 2.0,
-REM-PARITY 1.0) are specified and implemented. Working today:
+change before a stable release; REM-OBJECT, its REM-ENCRYPT profile, and
+REM-PARITY 1.0 are specified and implemented. Working today:
 
 - Layer 1 SCSI primitives and Layer 2 library discovery, identity,
   robotics, and hot-plug watching, with per-library allowlisting.
@@ -38,8 +38,8 @@ REM-PARITY 1.0) are specified and implemented. Working today:
   I/O with position proofs (this is now the only write/read path — the
   earlier non-pipelined mode and its config flag are gone), a
   watermark-gated host-RAM read reservoir with proof-frontier ranged
-  reads, the `rao-v1` object format, the RAO 2.0 encrypted representation
-  using the fixed `RAO1` format-family magic, and Reed-Solomon sidecar
+  reads, the `rem-object-v1` object format, the REM-ENCRYPT 1.0 encrypted representation
+  using the fixed `REMO` format-family magic, and Reed-Solomon sidecar
   parity with recovery, resume, and catalog-less scan. The encrypted
   representation's fresh per-object key is wrapped to multiple recipients
   with HPKE Base mode running the X-Wing post-quantum/classical hybrid KEM
@@ -57,10 +57,10 @@ REM-PARITY 1.0) are specified and implemented. Working today:
   mTLS TCP.
 - Operator CLIs: `rem` and `rem-debug`, including the destructive-safety
   gauntlet for tape initialization, media-readiness quarantine tooling,
-  local RAO object build/inspect/extract that needs no hardware, and a
+  local REM-OBJECT build/inspect/extract that needs no hardware, and a
   ranged-ciphertext `extract-stream`/`covering-range` pair for bounded,
   memory-cheap partial reads of an object already fetched locally. A
-  standalone `rao-recover` binary decrypts archive objects with no
+  standalone `rem-recover` binary decrypts archive objects with no
   daemon, catalog, or config file at all — the disaster-recovery path of
   last resort.
 - Chaos fault-injection for tests, and Lean/Aeneas proofs over the
@@ -83,9 +83,9 @@ Rust 1.85+, Linux. No system dependencies for the default build:
 cargo build --release
 ```
 
-yields `target/release/{rem,rem-debug,rem-daemon,rao-recover}`. `rem`
+yields `target/release/{rem,rem-debug,rem-daemon,rem-recover}`. `rem`
 and `rem-debug` are two binaries built from the same crate (operator vs.
-break-glass direct-hardware CLI); `rao-recover` is its own crate with no
+break-glass direct-hardware CLI); `rem-recover` is its own crate with no
 dependency on the daemon, catalog, or config file. Optional features:
 `remanence-cli/linux-udev` (hot-plug `rem watch`; needs `pkg-config` +
 `libudev-dev`) and `remanence-cli/foreign-bru` (legacy BRU commands).
@@ -107,13 +107,13 @@ environment variables documented in their test modules.
 The native object format works against local files, no tape required:
 
 ```sh
-rem archive build --inputs some-directory --out demo.rao
-rem archive inspect --object demo.rao
-rem archive extract --object demo.rao --dest restored
+rem archive build --inputs some-directory --out demo.rem-object
+rem archive inspect --object demo.rem-object
+rem archive extract --object demo.rem-object --dest restored
 ```
 
-`demo.rao` is a chunk-aligned POSIX pax tar stream — `bsdtar -tf
-demo.rao` lists your files — and it is byte-for-byte what a tape write
+`demo.rem-object` is a chunk-aligned POSIX pax tar stream — `bsdtar -tf
+demo.rem-object` lists your files — and it is byte-for-byte what a tape write
 stores as the object body. The full walkthrough, from local round trip
 to library discovery, daemon setup, tape initialization, and a first
 tape write, is [docs/guide-quickstart.md](docs/guide-quickstart.md).
@@ -137,7 +137,7 @@ tape write, is [docs/guide-quickstart.md](docs/guide-quickstart.md).
   a plain-language companion to the specifications: the motivation and
   the design, without the normative terseness.
 - Published format specifications:
-  [RAO Format 2.0](specs/publication/rao-object-format.md) and
+  [REM-OBJECT Format](specs/publication/rao-object-format.md) and
   [REM-PARITY 1.0](specs/publication/rem-parity-1.0-specification.md),
   with their pinned test-vector archive alongside.
 - [proto/layer5.proto](proto/layer5.proto) — the draft gRPC contract.
@@ -156,13 +156,13 @@ migration tooling is something you ask for.
 ## Platform crate contract
 
 `remanence-scsi` and `remanence-library` are the reusable tape-platform
-crates, and they are format-free: no RAO, parity, catalog, or daemon
+crates, and they are format-free: no REM-OBJECT, parity, catalog, or daemon
 knowledge lives below that seam. `remanence-scsi` depends on no other
 Remanence crate, and `remanence-library` depends only on
 `remanence-scsi`. A manifest dependency-guard test enforces the
 boundary, so external tools can build their own layout and catalog on
 the platform crates without pulling in the bundled formats. Portable
-RAO object files follow the same discipline: they contain only the
+REM-OBJECT files follow the same discipline: they contain only the
 object's stored bytes — tape filemarks, bootstrap rows, and parity
 sidecars are tape-only framing.
 
@@ -173,9 +173,9 @@ sidecars are tape-only framing.
 crates/remanence-scsi           Layer 1 SCSI CDB/SG_IO primitives
 crates/remanence-library        Layer 2 library model/ops and Layer 3a tape I/O
 crates/remanence-crc            Shared CRC-64/XZ
-crates/remanence-aead           RAO 2.0 encrypted-representation primitives (fixed RAO1 family magic; X-Wing HPKE wrapped-DEK)
+crates/remanence-aead           REM-ENCRYPT 1.0 encrypted-representation primitives (fixed REMO family magic; X-Wing HPKE wrapped-DEK)
 crates/remanence-format-driver  Published format-driver traits
-crates/remanence-format         Native rao-v1 body format
+crates/remanence-format         Native rem-object-v1 body format
 crates/remanence-bru            Foreign-tape migration: legacy BRU reader (opt-in feature, never in default build)
 crates/remanence-parity         Layer 3c sidecar parity and recovery
 crates/remanence-stream         Restore/recovery streaming composition
@@ -183,7 +183,7 @@ crates/remanence-state          Layer 4 catalog, audit, config, lock
 crates/remanence-api            Layer 5 gRPC service implementations
 crates/remanence-daemon         rem-daemon service host
 crates/remanence-cli            rem and rem-debug binaries
-crates/rao-recover              Standalone catalogless RAO disaster-recovery binary
+crates/rem-recover       Standalone catalogless REM-OBJECT disaster-recovery binary
 crates/remanence-chaos          Fault-injection scaffolding (excluded from CI gates)
 specs/publication/              Published format specifications + test vectors
 docs/                           Guides and references (see docs/README.md)
@@ -191,7 +191,7 @@ proto/                          Layer 5 protobuf contract
 verif/                          Lean/Aeneas proof targets
 fieldtest/                      Physical field-test kit and runbooks
 fixtures/                       Captured hardware/SCSI fixtures
-fuzz/                           RAO fuzz targets
+fuzz/                           REM-OBJECT fuzz targets
 ```
 
 ![Workspace crate map: layer 5 cli, api, daemon over layer 4 state over layer 3 format, aead, parity, format-driver over layer 2 library over layer 1 scsi, with the format-free platform seam between layers 3 and 2](docs/assets/layer-map.svg)

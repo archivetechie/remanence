@@ -18,7 +18,7 @@ use crate::{
 
 const CHECKPOINT_JOURNAL_SUFFIX: &str = ".remcheckpoint";
 
-/// Stable journal representation of one RAO recovery row carried by an
+/// Stable journal representation of one REM-OBJECT recovery row carried by an
 /// on-tape checkpoint bootstrap.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CheckpointBootstrapObjectRow {
@@ -26,7 +26,7 @@ pub struct CheckpointBootstrapObjectRow {
     pub tape_file_number: u32,
     /// Number of fixed-size records occupied by the stored copy.
     pub stored_block_count: u64,
-    /// Verbatim 1–64-byte RAO object identifier.
+    /// Verbatim 1–64-byte REM-OBJECT object identifier.
     pub object_id: Vec<u8>,
     /// Representation-specific recovery anchors.
     pub representation: CheckpointBootstrapObjectRepresentation,
@@ -36,7 +36,7 @@ pub struct CheckpointBootstrapObjectRow {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum CheckpointBootstrapObjectRepresentation {
-    /// Plaintext RAO manifest anchors.
+    /// Plaintext REM-OBJECT manifest anchors.
     Plaintext {
         /// Object-local body LBA of the manifest payload.
         manifest_first_chunk_lba: u64,
@@ -47,7 +47,7 @@ pub enum CheckpointBootstrapObjectRepresentation {
         /// SHA-256 digest of the manifest CBOR.
         manifest_sha256: [u8; 32],
     },
-    /// Encrypted RAO envelope anchors.
+    /// Encrypted REM-OBJECT envelope anchors.
     Encrypted {
         /// Recipient epoch identifiers in the key frame.
         recipient_epoch_ids: Vec<[u8; 16]>,
@@ -108,7 +108,7 @@ pub struct CheckpointObjectProjection {
     pub fresh_tape: bool,
     /// Cumulative committed object-data ordinals after this object.
     pub total_committed_ordinals: u64,
-    /// RAO recovery row emitted in every later checkpoint bootstrap.
+    /// REM-OBJECT recovery row emitted in every later checkpoint bootstrap.
     pub bootstrap_object_row: CheckpointBootstrapObjectRow,
 }
 
@@ -595,7 +595,7 @@ mod tests {
                 object: NativeObjectProjectionInput {
                     object_id: object_uuid.to_string(),
                     caller_object_id: Some("checkpoint-test".to_string()),
-                    body_format: "rao-v1".to_string(),
+                    body_format: "rem-object-v1".to_string(),
                     logical_size_bytes: Some(1),
                     content_hash: Some(vec![0x11; 32]),
                     metadata_hash: Some(vec![0x22; 32]),
@@ -748,7 +748,7 @@ mod tests {
 
     #[test]
     fn validation_accepts_non_uuid_object_id() {
-        // object_id is opaque UTF-8, 1-64 bytes (RAO 4.5.1); the state layer must
+        // object_id is opaque UTF-8, 1-64 bytes (REM-OBJECT 4.5.1); the state layer must
         // not require it to parse as a UUID (task #28 — vestigial UUID guards removed).
         let tape_uuid = [0x24; 16];
         let mut rec = record(tape_uuid);

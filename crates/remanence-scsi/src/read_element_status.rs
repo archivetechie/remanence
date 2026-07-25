@@ -42,7 +42,7 @@
 //!
 //! Build the CDB with [`build_cdb`]. The recommended "safe" arguments
 //! ([`SAFE_NUM_ELEMENTS`], [`SAFE_ALLOC_LEN`]) work on every device tested
-//! including QuadStor. Real HPE firmware also accepts the larger plan-doc
+//! including Quadstor. Real HPE firmware also accepts the larger plan-doc
 //! variant (`0xFFFF` elements, ~16 MB alloc).
 
 use crate::error::ScsiError;
@@ -51,7 +51,7 @@ use crate::error::ScsiError;
 pub const OPCODE: u8 = 0xB8;
 
 /// Conservative element-count for **single-chassis development** use.
-/// Sufficient for QuadStor (49 elements) and a single-module MSL3040
+/// Sufficient for Quadstor (49 elements) and a single-module MSL3040
 /// (≈49 elements), but **insufficient** for a fully populated 7-module
 /// MSL3040 stack (up to ≈300 elements). Production discovery (Layer 2)
 /// uses [`FULL_NUM_ELEMENTS`] together with a two-phase allocation
@@ -580,7 +580,7 @@ mod tests {
     use super::*;
 
     // Fixtures captured 2026-05-16:
-    //   quadstor-msl-g3.bin            — QuadStor RES without identifier descriptors
+    //   quadstor-msl-g3.bin            — Quadstor RES without identifier descriptors
     //   quadstor-msl-g3-dvcid.bin      — same target, DVCID=1 + CurData=1 → +identifier
     //   real-msl3040.bin               — real HPE MSL3040 (43 elements, no DVCID)
     //   real-msl3040-dvcid.bin         — real HPE MSL3040, element_type=4 +
@@ -801,14 +801,14 @@ mod tests {
     fn extracts_drive_serials_from_dvcid_block() {
         // dt_only probe → only data-transfer elements requested,
         // CurData=1+DVCID=1 → identifier descriptors emitted in the fixture.
-        let r = parse(QUADSTOR_DVCID).expect("parse QuadStor DVCID fixture");
+        let r = parse(QUADSTOR_DVCID).expect("parse Quadstor DVCID fixture");
         let drives: Vec<_> = r.by_type(ElementType::DataTransfer).collect();
         assert_eq!(
             drives.len(),
             4,
             "fixture is element_type=4 (data-transfer only)"
         );
-        // QuadStor's mainlib drive serials from VPD 0x80 — proves the
+        // Quadstor's mainlib drive serials from VPD 0x80 — proves the
         // RES-side and INQUIRY-side mappings agree.
         let serials: Vec<&str> = drives
             .iter()
@@ -822,8 +822,8 @@ mod tests {
 
     #[test]
     fn parses_quadstor_msl_g3() {
-        let r = parse(QUADSTOR).expect("parse QuadStor RES");
-        // QuadStor: 1 robot + 4 drives + 40 slots + 4 IE = 49 elements.
+        let r = parse(QUADSTOR).expect("parse Quadstor RES");
+        // Quadstor: 1 robot + 4 drives + 40 slots + 4 IE = 49 elements.
         assert_eq!(r.num_elements, 49);
         assert_eq!(r.elements.len(), 49);
 
@@ -837,7 +837,7 @@ mod tests {
         assert_eq!(slots.len(), 40);
         assert_eq!(ieports.len(), 4);
 
-        // No tape loaded in the QuadStor library: every drive should be empty.
+        // No tape loaded in the Quadstor library: every drive should be empty.
         assert!(drives.iter().all(|d| !d.full));
     }
 

@@ -1,6 +1,6 @@
 [package]
 name        = "remanence-aead"
-description = "RAO 1.0 AEAD envelope: header, HKDF, metadata, STREAM payload, and keyless inspection."
+description = "REM-OBJECT 1.0 AEAD envelope: header, HKDF, metadata, STREAM payload, and keyless inspection."
 version     .workspace = true
 edition     .workspace = true
 rust-version.workspace = true

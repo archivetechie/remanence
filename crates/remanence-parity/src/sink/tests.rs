@@ -940,7 +940,7 @@ fn checkpoint_resume_rebuilds_open_epoch_and_finish_protects_everything() {
         .expect("journaled sink opens");
         sink.begin_object_with_capacity_reserve_and_bootstrap_object_row(
             capacity_input_with_block_size(pre_checkpoint_blocks.len() as u64, 10_000, block_size),
-            BootstrapObjectRowAdmission::PlaintextRao,
+            BootstrapObjectRowAdmission::PlaintextRemObject,
         )
         .expect("pre-checkpoint object reserve fits");
         for block in &pre_checkpoint_blocks {
@@ -1031,7 +1031,7 @@ fn checkpoint_resume_rebuilds_open_epoch_and_finish_protects_everything() {
                 block_size,
                 sink.data_blocks_in_neighborhood(),
             ),
-            BootstrapObjectRowAdmission::PlaintextRao,
+            BootstrapObjectRowAdmission::PlaintextRemObject,
         )
         .expect("post-resume object reserve fits");
         for seed in 6..=12 {
@@ -6231,7 +6231,7 @@ fn begin_object_with_bootstrap_row_admission_rejects_before_raw_write() {
         let err = sink
             .begin_object_with_capacity_reserve_and_bootstrap_object_row(
                 capacity_input_with_block_size(1, 10_000, block_size),
-                BootstrapObjectRowAdmission::PlaintextRao,
+                BootstrapObjectRowAdmission::PlaintextRemObject,
             )
             .expect_err("bootstrap row admission should reject before object start");
 
@@ -6295,7 +6295,7 @@ fn checkpoint_batch_headroom_uses_encrypted_max_rows_and_refuses_before_motion()
             let (tape_file_number, _) = sink
                 .begin_object_with_capacity_reserve_and_bootstrap_object_row(
                     capacity_input_with_current_fill(1, 100_000, block_size, current_fill),
-                    BootstrapObjectRowAdmission::EncryptedRao,
+                    BootstrapObjectRowAdmission::EncryptedRemObject,
                 )
                 .expect("reserved object admits");
             sink.write_block(&fixed_block(index as u8, block_size))

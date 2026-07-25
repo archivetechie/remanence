@@ -31,7 +31,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libarchive-tools attr
 
       - name: Install Python verifier dependencies
-        run: python3 -m pip install -r tools/requirements-rao-independent.txt
+        run: python3 -m pip install -r tools/requirements-rem-object-independent.txt
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -52,8 +52,8 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --exclude remanence-chaos
 
-      - name: Verify RAO vectors and plaintext interop
-        run: python3 tools/verify_rao_vectors_independent.py --check-plaintext-interop
+      - name: Verify REM-OBJECT vectors and plaintext interop
+        run: python3 tools/verify_rem_object_vectors_independent.py --check-plaintext-interop
 
   fuzz-corpus-replay:
     name: scheduled fuzz corpus replay
@@ -72,11 +72,11 @@ jobs:
       - name: Replay committed fuzz corpora
         run: |
           for target in \
-            rao_envelope_header \
-            rao_envelope_metadata_cbor \
-            rao_manifest_cbor \
-            rao_plaintext_tar_loop \
-            rao_whole_object_open_verify
+            rem_object_envelope_header \
+            rem_object_envelope_metadata_cbor \
+            rem_object_manifest_cbor \
+            rem_object_plaintext_tar_loop \
+            rem_object_whole_object_open_verify
           do
             cargo fuzz run "$target" -- -runs=0
           done

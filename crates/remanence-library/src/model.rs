@@ -855,7 +855,7 @@ mod tests {
         );
     }
 
-    /// Build a DeviceCaptures from the QuadStor DVCID fixture — only
+    /// Build a DeviceCaptures from the Quadstor DVCID fixture — only
     /// element-status is exercised here; INQUIRY/VPD are stubs since the
     /// from_captures logic only reads serial + designator.
     fn quadstor_dvcid_captures() -> DeviceCaptures {
@@ -869,7 +869,7 @@ mod tests {
                 .unwrap()
                 .as_str()
                 .to_string(),
-            device_id: None, // QuadStor VPD 0x83 fixture not staged in tree
+            device_id: None, // Quadstor VPD 0x83 fixture not staged in tree
             element_status: remanence_scsi::read_element_status::parse(RES).unwrap(),
             changer_sg: PathBuf::from("/dev/sg4"),
             changer_sysfs: PathBuf::from("/sys/class/scsi_device/10:0:0:0"),

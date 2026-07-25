@@ -1,27 +1,29 @@
-//! Whole-object keyed opening for encrypted RAO envelopes.
+//! Whole-object keyed opening for encrypted REM-OBJECT envelopes.
 
 use std::io::{Read, Write};
 
 use sha2::{Digest, Sha256};
 
-use crate::error::{RaoAeadError, Result};
-use crate::header::{validate_metadata_frame_len, RaoHeader, RAO_FOOTER, RAO_HEADER_LEN};
-use crate::metadata::RaoMetadata;
+use crate::error::{RemObjectAeadError, Result};
+use crate::header::{
+    validate_metadata_frame_len, RemObjectHeader, REM_OBJECT_FOOTER, REM_OBJECT_HEADER_LEN,
+};
+use crate::metadata::RemObjectMetadata;
 use crate::stream::{
     decrypt_chunk, decrypt_metadata, finalize_sha256, payload_frame_len, round_up, PlaintextStats,
     CHACHA20POLY1305_TAG_LEN,
 };
 use crate::wrap::{unwrap_dek, RecipientPrivateKey};
 
-/// Report returned after successfully opening a RAO encrypted object.
+/// Report returned after successfully opening a REM-OBJECT encrypted object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenReport {
     /// Parsed plaintext header.
-    pub header: RaoHeader,
+    pub header: RemObjectHeader,
     /// Parsed key frame.
     pub key_frame: crate::KeyFrame,
     /// Decrypted metadata.
-    pub metadata: RaoMetadata,
+    pub metadata: RemObjectMetadata,
     /// Stored object byte length consumed.
     pub stored_size_bytes: u64,
     /// Plaintext stats observed while decrypting.
@@ -34,9 +36,9 @@ pub fn open<R: Read, W: Write>(
     mut output: W,
     recipient: &RecipientPrivateKey,
 ) -> Result<OpenReport> {
-    let mut header_bytes = [0u8; RAO_HEADER_LEN];
+    let mut header_bytes = [0u8; REM_OBJECT_HEADER_LEN];
     read_exact(&mut input, &mut header_bytes)?;
-    let header = RaoHeader::parse(&header_bytes)?;
+    let header = RemObjectHeader::parse(&header_bytes)?;
     validate_metadata_frame_len(header.metadata_frame_len)?;
     let mut key_frame_bytes = vec![0u8; header.key_frame_len as usize];
     read_exact(&mut input, &mut key_frame_bytes)?;
@@ -48,11 +50,11 @@ pub fn open<R: Read, W: Write>(
         &header.header_hash_with_key_frame(&key_frame_bytes)?,
     )?;
     let metadata_frame_len = usize::try_from(header.metadata_frame_len)
-        .map_err(|_| RaoAeadError::MetadataFrameLengthInvalid)?;
+        .map_err(|_| RemObjectAeadError::MetadataFrameLengthInvalid)?;
     let mut metadata_frame = vec![0u8; metadata_frame_len];
     read_exact(&mut input, &mut metadata_frame)?;
     let metadata_plaintext = decrypt_metadata(&keys.metadata_key, &metadata_frame)?;
-    let metadata = RaoMetadata::from_cbor_bytes(&metadata_plaintext, header.chunk_size)?;
+    let metadata = RemObjectMetadata::from_cbor_bytes(&metadata_plaintext, header.chunk_size)?;
     let expected_salt = crate::kdf::derive_salt(
         dek.as_bytes(),
         &header.object_id_field()?,
@@ -60,29 +62,29 @@ pub fn open<R: Read, W: Write>(
         &metadata_plaintext,
     )?;
     if expected_salt != header.hkdf_salt {
-        return Err(RaoAeadError::SaltDerivationMismatch);
+        return Err(RemObjectAeadError::SaltDerivationMismatch);
     }
     let plaintext_stats = decrypt_payload(&mut input, &mut output, &header, &metadata, &keys)?;
     if plaintext_stats.size != metadata.plaintext_size {
-        return Err(RaoAeadError::PlaintextSizeMismatch);
+        return Err(RemObjectAeadError::PlaintextSizeMismatch);
     }
     if plaintext_stats.digest != metadata.plaintext_digest {
-        return Err(RaoAeadError::PlaintextDigestMismatch);
+        return Err(RemObjectAeadError::PlaintextDigestMismatch);
     }
     read_footer(&mut input)?;
     let payload_len = payload_frame_len(metadata.plaintext_size, header.chunk_size)?;
-    let footer_end = (RAO_HEADER_LEN as u64)
+    let footer_end = (REM_OBJECT_HEADER_LEN as u64)
         .checked_add(u64::from(header.key_frame_len))
         .and_then(|value| value.checked_add(header.metadata_frame_len))
         .and_then(|value| value.checked_add(payload_len))
-        .and_then(|value| value.checked_add(RAO_FOOTER.len() as u64))
-        .ok_or(RaoAeadError::SizeOverflow)?;
+        .and_then(|value| value.checked_add(REM_OBJECT_FOOTER.len() as u64))
+        .ok_or(RemObjectAeadError::SizeOverflow)?;
     let stored_size_bytes = round_up(footer_end, u64::from(header.chunk_size))?;
     read_zero_fill(
         &mut input,
         stored_size_bytes
             .checked_sub(footer_end)
-            .ok_or(RaoAeadError::SizeOverflow)?,
+            .ok_or(RemObjectAeadError::SizeOverflow)?,
     )?;
     ensure_eof(&mut input)?;
     Ok(OpenReport {
@@ -104,17 +106,17 @@ pub fn open_to_vec(input: &[u8], recipient: &RecipientPrivateKey) -> Result<(Vec
 fn decrypt_payload<R: Read, W: Write>(
     input: &mut R,
     output: &mut W,
-    header: &RaoHeader,
-    metadata: &RaoMetadata,
+    header: &RemObjectHeader,
+    metadata: &RemObjectMetadata,
     keys: &crate::kdf::DerivedKeys,
 ) -> Result<PlaintextStats> {
     let chunk_count = metadata.plaintext_size / u64::from(header.chunk_size);
     let stored_chunk_len = usize::try_from(
         u64::from(header.chunk_size)
             .checked_add(CHACHA20POLY1305_TAG_LEN)
-            .ok_or(RaoAeadError::SizeOverflow)?,
+            .ok_or(RemObjectAeadError::SizeOverflow)?,
     )
-    .map_err(|_| RaoAeadError::SizeOverflow)?;
+    .map_err(|_| RemObjectAeadError::SizeOverflow)?;
     let mut encrypted = vec![0u8; stored_chunk_len];
     let mut hasher = Sha256::new();
     let mut count = 0u64;
@@ -124,13 +126,13 @@ fn decrypt_payload<R: Read, W: Write>(
         let final_chunk = index + 1 == chunk_count;
         let plaintext = decrypt_chunk(&keys.payload_key, index, final_chunk, &encrypted)?;
         if plaintext.len() != header.chunk_size as usize {
-            return Err(RaoAeadError::AeadAuthenticationFailed);
+            return Err(RemObjectAeadError::AeadAuthenticationFailed);
         }
         output.write_all(&plaintext)?;
         hasher.update(&plaintext);
         count = count
             .checked_add(u64::from(header.chunk_size))
-            .ok_or(RaoAeadError::PlaintextSizeMismatch)?;
+            .ok_or(RemObjectAeadError::PlaintextSizeMismatch)?;
     }
 
     Ok(PlaintextStats {
@@ -140,10 +142,10 @@ fn decrypt_payload<R: Read, W: Write>(
 }
 
 fn read_footer<R: Read>(input: &mut R) -> Result<()> {
-    let mut footer = [0u8; RAO_FOOTER.len()];
+    let mut footer = [0u8; REM_OBJECT_FOOTER.len()];
     read_exact(input, &mut footer)?;
-    if &footer != RAO_FOOTER {
-        return Err(RaoAeadError::InvalidFooter);
+    if &footer != REM_OBJECT_FOOTER {
+        return Err(RemObjectAeadError::InvalidFooter);
     }
     Ok(())
 }
@@ -155,7 +157,7 @@ fn read_zero_fill<R: Read>(input: &mut R, fill_len: u64) -> Result<()> {
         let take = remaining.min(buf.len() as u64) as usize;
         read_exact(input, &mut buf[..take])?;
         if buf[..take].iter().any(|byte| *byte != 0) {
-            return Err(RaoAeadError::FillNotZero);
+            return Err(RemObjectAeadError::FillNotZero);
         }
         remaining -= take as u64;
     }
@@ -167,9 +169,9 @@ fn ensure_eof<R: Read>(input: &mut R) -> Result<()> {
     loop {
         match input.read(&mut byte) {
             Ok(0) => return Ok(()),
-            Ok(_) => return Err(RaoAeadError::TrailingData),
+            Ok(_) => return Err(RemObjectAeadError::TrailingData),
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(err) => return Err(RaoAeadError::Io(err)),
+            Err(err) => return Err(RemObjectAeadError::Io(err)),
         }
     }
 }
@@ -183,9 +185,9 @@ fn read_exact<R: Read>(input: &mut R, buf: &mut [u8]) -> Result<()> {
 fn read_exact_missing_final<R: Read>(input: &mut R, buf: &mut [u8]) -> Result<()> {
     input.read_exact(buf).map_err(|err| {
         if err.kind() == std::io::ErrorKind::UnexpectedEof {
-            RaoAeadError::MissingFinalChunk
+            RemObjectAeadError::MissingFinalChunk
         } else {
-            RaoAeadError::Io(err)
+            RemObjectAeadError::Io(err)
         }
     })
 }
@@ -221,7 +223,7 @@ mod tests {
         let wrong = RecipientPrivateKey::new([3; 16], "wrong", [9; 32]).unwrap();
         assert!(matches!(
             open_to_vec(&sealed, &wrong),
-            Err(RaoAeadError::RecipientEpochMismatch)
+            Err(RemObjectAeadError::RecipientEpochMismatch)
         ));
     }
 
@@ -231,7 +233,7 @@ mod tests {
         sealed.truncate(sealed.len() - 512);
         assert!(matches!(
             open_to_vec(&sealed, &primary),
-            Err(RaoAeadError::MissingFinalChunk | RaoAeadError::InvalidFooter)
+            Err(RemObjectAeadError::MissingFinalChunk | RemObjectAeadError::InvalidFooter)
         ));
     }
 }

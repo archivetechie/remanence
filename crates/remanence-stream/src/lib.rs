@@ -5,7 +5,7 @@
 //! first real write/restore surface:
 //!
 //! - prepass regular files into [`remanence_format::RemTarFileSpec`] values;
-//! - stream those files through `rao-v1` and [`remanence_parity::ParitySink`];
+//! - stream those files through `rem-object-v1` and [`remanence_parity::ParitySink`];
 //! - return catalog/audit projection rows for Layer 4/5 to commit atomically;
 //! - stream an object-local block source back to a filesystem destination.
 
@@ -83,7 +83,7 @@ pub enum StreamingError {
     Parity(#[from] ParityError),
 }
 
-/// One regular file prepared for a streaming `rao-v1` write.
+/// One regular file prepared for a streaming `rem-object-v1` write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedFile {
     /// Source path that will be opened again for the write pass.
@@ -97,7 +97,7 @@ pub struct PreparedFile {
 pub struct StreamingObjectPlan {
     /// File specs in write order.
     pub file_specs: Vec<RemTarFileSpec>,
-    /// Exact `rao-v1` layout projected by Layer 3b.
+    /// Exact `rem-object-v1` layout projected by Layer 3b.
     pub layout: RemTarObjectLayout,
 }
 
@@ -112,7 +112,7 @@ pub struct ObjectCatalogProjection {
     pub body_format: String,
     /// Sum of payload file sizes, excluding the generated manifest.
     pub logical_size_bytes: u64,
-    /// SHA-256 of the generated `rao-v1` manifest CBOR bytes.
+    /// SHA-256 of the generated `rem-object-v1` manifest CBOR bytes.
     pub manifest_sha256: [u8; 32],
 }
 
@@ -156,7 +156,7 @@ pub struct ObjectCopyProjection {
     pub protected_until_ordinal: Option<u64>,
     /// Object-level parity state at that watermark, absent for no-parity copies.
     pub parity_state: Option<ObjectParityState>,
-    /// SHA-256 of the canonical plaintext RAO object bytes.
+    /// SHA-256 of the canonical plaintext REM-OBJECT object bytes.
     pub plaintext_digest: [u8; 32],
     /// SHA-256 of the stored representation bytes for this copy.
     pub stored_digest: [u8; 32],
@@ -377,7 +377,7 @@ pub fn plan_prepared_object(
     Ok(StreamingObjectPlan { file_specs, layout })
 }
 
-/// Write prepared files as one `rao-v1` object through a parity sink.
+/// Write prepared files as one `rem-object-v1` object through a parity sink.
 ///
 /// The caller supplies `reserve` after applying its current tape-capacity
 /// model. This function verifies that the reserve's projected object block
@@ -433,13 +433,13 @@ pub fn write_prepared_object_to_parity_from_readers(
 
     let opened = parity.begin_object_with_capacity_reserve_and_bootstrap_object_row(
         reserve,
-        BootstrapObjectRowAdmission::PlaintextRao,
+        BootstrapObjectRowAdmission::PlaintextRemObject,
     )?;
     let mut object_sink = ObjectDigestBlockSink::new(parity);
     let layout = write_rem_tar_object_from_readers(&mut object_sink, options, &mut streams)?;
     let object_digest = object_sink.finish_digest();
     let manifest_first_chunk_lba = layout.manifest.first_chunk_lba.ok_or_else(|| {
-        StreamingError::InvalidInput("generated RAO manifest has no body LBA".to_string())
+        StreamingError::InvalidInput("generated REM-OBJECT manifest has no body LBA".to_string())
     })?;
     parity.record_bootstrap_object_row(
         BootstrapObjectRow::plaintext(
@@ -566,7 +566,7 @@ fn validate_reserve(
     }
     if reserve.block_size_bytes != options.chunk_size as u64 {
         return Err(StreamingError::InvalidInput(format!(
-            "capacity reserve block size {} does not match RAO chunk size {}",
+            "capacity reserve block size {} does not match REM-OBJECT chunk size {}",
             reserve.block_size_bytes, options.chunk_size
         )));
     }
@@ -1076,7 +1076,7 @@ struct NativeRestoreDestination {
     collision_key: Vec<String>,
 }
 
-/// Resolve one RAO entry path using the host platform's native path semantics.
+/// Resolve one REM-OBJECT entry path using the host platform's native path semantics.
 fn resolve_native_restore_destination(
     root: &Path,
     archive_path: &str,
@@ -1551,7 +1551,7 @@ impl RemTarEntrySink for FilesystemRestoreSink {
 /// Filesystem sink for normalized/deep-recovery archive readers.
 ///
 /// [`NormalizedEntry`] deliberately exposes no xattr field, so this sink
-/// applies no attributes by construction. Native RAO restores use the single
+/// applies no attributes by construction. Native REM-OBJECT restores use the single
 /// xattr-writer funnel in [`apply_restored_xattrs`] instead.
 struct NormalizedFilesystemRestoreSink {
     root: PathBuf,
@@ -1925,7 +1925,7 @@ mod tests {
     }
 
     #[test]
-    fn path_and_live_reader_emit_identical_rao_bytes_and_catalog_projection() {
+    fn path_and_live_reader_emit_identical_rem_object_bytes_and_catalog_projection() {
         let source_dir = tempfile::Builder::new()
             .prefix("remanence-stream-equivalence")
             .tempdir()
@@ -2069,7 +2069,7 @@ mod tests {
         assert_eq!(
             bootstrap_object_row.object_id.as_deref(),
             Some(opts.object_id.as_bytes()),
-            "bootstrap binding carries the RAO object_id string bytes verbatim"
+            "bootstrap binding carries the REM-OBJECT object_id string bytes verbatim"
         );
         match &bootstrap_object_row.representation {
             BootstrapObjectRepresentation::Plaintext {
@@ -2437,7 +2437,7 @@ mod tests {
         ] {
             spec.xattrs.insert(name.to_string(), value.to_vec());
         }
-        let (blocks, layout) = rao_blocks_with_payloads(&opts, vec![(spec, payload)]);
+        let (blocks, layout) = rem_object_blocks_with_payloads(&opts, vec![(spec, payload)]);
         let mut source = VecBlockSource::new(blocks);
 
         let restore = restore_object_to_directory(
@@ -2502,7 +2502,7 @@ mod tests {
         );
         spec.xattrs
             .insert(security_name.to_string(), b"operator-approved".to_vec());
-        let (blocks, layout) = rao_blocks_with_payloads(&opts, vec![(spec, payload)]);
+        let (blocks, layout) = rem_object_blocks_with_payloads(&opts, vec![(spec, payload)]);
         let mut source = VecBlockSource::new(blocks);
         let restore_options = FilesystemRestoreOptions {
             xattr_allowed_prefixes: vec!["user.".to_string(), "security.".to_string()],
@@ -2585,7 +2585,7 @@ mod tests {
             .insert("user.symlink_test".to_string(), b"link-only".to_vec());
         let mut opts = options();
         opts.chunk_size = 4096;
-        let (blocks, layout) = rao_blocks_with_payloads(&opts, vec![(spec, Vec::new())]);
+        let (blocks, layout) = rem_object_blocks_with_payloads(&opts, vec![(spec, Vec::new())]);
         let mut source = VecBlockSource::new(blocks);
 
         let result = restore_object_to_directory(
@@ -2627,7 +2627,7 @@ mod tests {
         opts.chunk_size = 4096;
         let first = b"first spelling".to_vec();
         let second = b"second spelling".to_vec();
-        let (blocks, layout) = rao_blocks_with_payloads(
+        let (blocks, layout) = rem_object_blocks_with_payloads(
             &opts,
             vec![
                 (
@@ -2689,7 +2689,7 @@ mod tests {
         opts.chunk_size = 4096;
         let first = b"NFC spelling".to_vec();
         let second = b"NFD spelling".to_vec();
-        let (blocks, layout) = rao_blocks_with_payloads(
+        let (blocks, layout) = rem_object_blocks_with_payloads(
             &opts,
             vec![
                 (
@@ -2751,15 +2751,19 @@ mod tests {
         ] {
             let mut opts = options();
             opts.chunk_size = 4096;
-            let (blocks, layout) = rao_blocks_with_payloads(
+            let (blocks, layout) = rem_object_blocks_with_payloads(
                 &opts,
                 vec![(
                     RemTarFileSpec::new(valid_path, "invalid-path", 0, sha256_array(b"")),
                     Vec::new(),
                 )],
             );
-            let blocks =
-                replace_first_rao_pax_path(blocks, opts.chunk_size, valid_path, invalid_path);
+            let blocks = replace_first_rem_object_pax_path(
+                blocks,
+                opts.chunk_size,
+                valid_path,
+                invalid_path,
+            );
             let mut source = VecBlockSource::new(blocks);
             let root = tempfile::Builder::new()
                 .prefix("remanence-stream-native-invalid-path")
@@ -2798,7 +2802,7 @@ mod tests {
         ] {
             let mut opts = options();
             opts.chunk_size = 4096;
-            let (blocks, layout) = rao_blocks_with_payloads(
+            let (blocks, layout) = rem_object_blocks_with_payloads(
                 &opts,
                 vec![(
                     RemTarFileSpec::new(invalid_path, "windows-invalid-path", 0, sha256_array(b"")),
@@ -2838,7 +2842,7 @@ mod tests {
         let payload = (0..12_345u32)
             .map(|value| (value.wrapping_mul(17) % 251) as u8)
             .collect::<Vec<_>>();
-        let (blocks, layout) = rao_blocks_with_payloads(
+        let (blocks, layout) = rem_object_blocks_with_payloads(
             &opts,
             vec![(
                 RemTarFileSpec::new(
@@ -3297,7 +3301,7 @@ mod tests {
         }
     }
 
-    fn rao_blocks_with_payloads(
+    fn rem_object_blocks_with_payloads(
         options: &RemTarObjectOptions,
         files: Vec<(RemTarFileSpec, Vec<u8>)>,
     ) -> (Vec<Vec<u8>>, RemTarObjectLayout) {
@@ -3317,7 +3321,7 @@ mod tests {
     }
 
     /// Replace one same-length pax path so invalid reader inputs use the public restore funnel.
-    fn replace_first_rao_pax_path(
+    fn replace_first_rem_object_pax_path(
         blocks: Vec<Vec<u8>>,
         chunk_size: usize,
         original: &str,
@@ -3330,7 +3334,7 @@ mod tests {
         );
         assert!(
             blocks.iter().all(|block| block.len() == chunk_size),
-            "RAO fixture blocks must all match chunk_size"
+            "REM-OBJECT fixture blocks must all match chunk_size"
         );
         let mut bytes = blocks.into_iter().flatten().collect::<Vec<_>>();
         let needle = format!("path={original}\n");

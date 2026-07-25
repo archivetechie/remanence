@@ -1,4 +1,4 @@
-//! Cross-layer smoke tests for composing Layer 3b `rao-v1` with the
+//! Cross-layer smoke tests for composing Layer 3b `rem-object-v1` with the
 //! Layer 3c sidecar-only parity sink.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -6,8 +6,8 @@ use std::io::Cursor;
 
 use remanence_aead::RecipientPrivateKey;
 use remanence_format::{
-    plan_rem_tar_object, read_encrypted_rao_file_range_to_vec, read_encrypted_rao_object,
-    read_rem_tar_object, stream_rem_tar_object, write_encrypted_rao_object, write_rem_tar_object,
+    plan_rem_tar_object, read_encrypted_rem_object, read_encrypted_rem_object_file_range_to_vec,
+    read_rem_tar_object, stream_rem_tar_object, write_encrypted_rem_object, write_rem_tar_object,
     write_rem_tar_object_from_readers, FormatError, RemTarEntrySink, RemTarFile, RemTarFileSpec,
     RemTarFileStream, RemTarObjectOptions, RemTarStreamEntry,
 };
@@ -107,7 +107,7 @@ fn rem_tar_writer_composes_with_parity_sink_and_reads_back_object_blocks() {
             1
         );
         layout = write_rem_tar_object(&mut parity, &opts, &files)
-            .expect("RAO writes through parity sink");
+            .expect("REM-OBJECT writes through parity sink");
         close = parity.finish_object().expect("parity object closes");
     }
 
@@ -124,7 +124,7 @@ fn rem_tar_writer_composes_with_parity_sink_and_reads_back_object_blocks() {
     let object_blocks = tape.blocks[object_start..object_end].to_vec();
     let mut source = VecBlockSource::new(object_blocks);
     let read = read_rem_tar_object(&mut source, opts.chunk_size, layout.projected_size_blocks)
-        .expect("RAO reads object blocks after 3c write");
+        .expect("REM-OBJECT reads object blocks after 3c write");
 
     assert_eq!(
         read.entry("camera/a.txt").unwrap().data,
@@ -179,7 +179,7 @@ fn streaming_rem_tar_roundtrips_through_parity_object_source() {
             1
         );
         layout = write_rem_tar_object_from_readers(&mut parity, &opts, &mut streams)
-            .expect("streaming RAO writes through parity sink");
+            .expect("streaming REM-OBJECT writes through parity sink");
         close = parity.finish_object().expect("parity object closes");
     }
 
@@ -213,7 +213,7 @@ fn streaming_rem_tar_roundtrips_through_parity_object_source() {
         layout.projected_size_blocks,
         &mut restored,
     )
-    .expect("streaming RAO restores through ObjectParitySource");
+    .expect("streaming REM-OBJECT restores through ObjectParitySource");
 
     assert_eq!(restored.data.get("camera/a.txt").unwrap(), &camera);
     assert_eq!(restored.data.get("empty.bin").unwrap(), &empty);
@@ -244,7 +244,7 @@ fn streaming_rem_tar_roundtrips_through_parity_object_source() {
 }
 
 #[test]
-fn encrypted_rao_ciphertext_recovers_through_parity_before_keyed_open() {
+fn encrypted_rem_object_ciphertext_recovers_through_parity_before_keyed_open() {
     let opts = options();
     let primary = RecipientPrivateKey::new([0x24; 16], "archive-primary", [0x42; 32])
         .expect("primary recipient key");
@@ -274,7 +274,7 @@ fn encrypted_rao_ciphertext_recovers_through_parity_before_keyed_open() {
     ];
 
     let mut planning_sink = VecBlockSink::new();
-    let planned_report = write_encrypted_rao_object(&mut planning_sink, &opts, &files, &recipients)
+    let planned_report = write_encrypted_rem_object(&mut planning_sink, &opts, &files, &recipients)
         .expect("encrypted planning fixture writes without parity");
     let planned_ciphertext = planning_sink
         .blocks
@@ -282,7 +282,7 @@ fn encrypted_rao_ciphertext_recovers_through_parity_before_keyed_open() {
         .flatten()
         .copied()
         .collect::<Vec<_>>();
-    let pfr = read_encrypted_rao_file_range_to_vec(
+    let pfr = read_encrypted_rem_object_file_range_to_vec(
         &planned_ciphertext,
         &recovery,
         planned_report.plaintext_layout.files[0].first_chunk_lba,
@@ -307,14 +307,14 @@ fn encrypted_rao_ciphertext_recovers_through_parity_before_keyed_open() {
             parity
                 .begin_object_with_capacity_reserve_and_bootstrap_object_row(
                     capacity_input(planned_report.envelope.stored_size_blocks),
-                    BootstrapObjectRowAdmission::EncryptedRao,
+                    BootstrapObjectRowAdmission::EncryptedRemObject,
                 )
                 .expect("object reserve fits")
                 .0,
             1
         );
-        report = write_encrypted_rao_object(&mut parity, &opts, &files, &recipients)
-            .expect("encrypted RAO writes through parity sink");
+        report = write_encrypted_rem_object(&mut parity, &opts, &files, &recipients)
+            .expect("encrypted REM-OBJECT writes through parity sink");
         parity
             .record_bootstrap_object_row(
                 BootstrapObjectRow::encrypted(
@@ -394,7 +394,7 @@ fn encrypted_rao_ciphertext_recovers_through_parity_before_keyed_open() {
     let object_end = object_start + usize::try_from(report.envelope.stored_size_blocks).unwrap();
     let tampered_object_blocks = damaged_blocks[object_start..object_end].to_vec();
     let mut tampered_source = VecBlockSource::new(tampered_object_blocks);
-    read_encrypted_rao_object(
+    read_encrypted_rem_object(
         &mut tampered_source,
         opts.chunk_size,
         report.envelope.stored_size_blocks,
@@ -416,7 +416,7 @@ fn encrypted_rao_ciphertext_recovers_through_parity_before_keyed_open() {
     .expect("object parity source opens");
     let recovered = object_source
         .recover_block_at(target_body_lba)
-        .expect("ciphertext block recovers without a RAO key");
+        .expect("ciphertext block recovers without a REM-OBJECT key");
     assert_eq!(recovered, tape.blocks[target_block_index]);
 
     let mut physical = PhysicalVecTapeSource::from_sink_blocks(&tape, damaged_blocks)
@@ -431,7 +431,7 @@ fn encrypted_rao_ciphertext_recovers_through_parity_before_keyed_open() {
         OpenTrust::RequireValidated,
     )
     .expect("object parity source opens for keyed read");
-    let read = read_encrypted_rao_object(
+    let read = read_encrypted_rem_object(
         &mut object_source,
         opts.chunk_size,
         report.envelope.stored_size_blocks,

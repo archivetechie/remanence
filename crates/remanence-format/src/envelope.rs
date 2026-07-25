@@ -1,4 +1,4 @@
-//! RAO encrypted-stream funnel for format and CLI callers.
+//! REM-OBJECT encrypted-stream funnel for format and CLI callers.
 //!
 //! These functions deliberately contain no cryptographic construction or
 //! framing logic. They keep callers at the body-format boundary while
@@ -13,8 +13,8 @@ use remanence_aead::{
 
 use crate::FormatError;
 
-/// Seal canonical RAO plaintext as a recipient envelope.
-pub fn seal_envelope_rao_stream<R: Read, W: Write>(
+/// Seal canonical REM-OBJECT plaintext as a recipient envelope.
+pub fn seal_envelope_rem_object_stream<R: Read, W: Write>(
     plaintext: R,
     output: W,
     options: &EnvelopeSealOptions,
@@ -22,8 +22,8 @@ pub fn seal_envelope_rao_stream<R: Read, W: Write>(
     remanence_aead::seal(plaintext, output, options).map_err(Into::into)
 }
 
-/// Open a recipient envelope to canonical RAO plaintext.
-pub fn open_envelope_rao_stream<R: Read, W: Write>(
+/// Open a recipient envelope to canonical REM-OBJECT plaintext.
+pub fn open_envelope_rem_object_stream<R: Read, W: Write>(
     input: R,
     output: W,
     recipient: &RecipientPrivateKey,
@@ -32,7 +32,7 @@ pub fn open_envelope_rao_stream<R: Read, W: Write>(
 }
 
 /// Authenticate an envelope prefix and map a plaintext range to stored bytes.
-pub fn covering_envelope_rao_stored_range(
+pub fn covering_envelope_rem_object_stored_range(
     authenticated_prefix: &[u8],
     recipient: &RecipientPrivateKey,
     plaintext_start: u64,
@@ -48,7 +48,7 @@ pub fn covering_envelope_rao_stored_range(
 }
 
 /// Open a plaintext range from bounded covering ciphertext frames.
-pub fn open_envelope_rao_range_from_reader<R: Read + ?Sized, W: Write + ?Sized>(
+pub fn open_envelope_rem_object_range_from_reader<R: Read + ?Sized, W: Write + ?Sized>(
     authenticated_prefix: &[u8],
     ranged_input: &mut R,
     stored_range_start: u64,

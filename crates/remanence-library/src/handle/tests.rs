@@ -6172,7 +6172,7 @@ fn ie_endpoint_move_marks_snapshot_dirty() {
     // Move slot → IE port. The CDB succeeded, but per the §7.10
     // live finding, IE-port destinations are vendor-specific:
     // HPE physical libraries park the cartridge in the IE port,
-    // QuadStor's VTL vaults the cartridge immediately (IE port
+    // Quadstor's VTL vaults the cartridge immediately (IE port
     // returns to empty). We can't trust the snapshot patch, so
     // is_dirty must be set on success when either endpoint is
     // an IE port.
@@ -6194,7 +6194,7 @@ fn ie_endpoint_move_marks_snapshot_dirty() {
 
     // Snapshot was still patched (slot empty, IE full) — that
     // matches HPE behavior. But is_dirty=true because the patch
-    // may not match QuadStor or other vendors.
+    // may not match Quadstor or other vendors.
     assert!(!handle.library().slots[0].full);
     assert!(handle.library().ie_ports[0].full);
     assert!(

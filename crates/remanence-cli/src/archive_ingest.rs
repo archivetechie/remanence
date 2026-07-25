@@ -1,7 +1,7 @@
 //! Ingest-policy planning for `rem archive build`.
 //!
-//! RAO itself only stores normalized entries. This module stays above the
-//! format crate and turns messy filesystem trees into ordinary RAO inputs by
+//! REM-OBJECT itself only stores normalized entries. This module stays above the
+//! format crate and turns messy filesystem trees into ordinary REM-OBJECT inputs by
 //! applying ordered blob/exclude rules, creating `.remwrap.tar` payloads with a
 //! mainstream tar engine, deriving sibling `.remwrap.idx` entries for blobs,
 //! and applying one xattr capture policy to native and wrapped entries.

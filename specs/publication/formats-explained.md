@@ -1,6 +1,6 @@
 # The Remanence Formats, Explained
 
-*A companion to the RAO Format Specification and the REM-PARITY Tape Format
+*A companion to the REM-OBJECT Format Specification and the REM-PARITY Tape Format
 Specification. This document is informative: it explains what the formats do
 and why they are shaped the way they are, in plain language. The
 specifications remain the only normative documents — where this text and a
@@ -175,7 +175,7 @@ one can prove rather than something one must hope.
 
 ## 5. A tour of one archive object
 
-An RAO object ("Rem Archive Object") bundles a set of files — typically
+A REM-OBJECT bundles a set of files — typically
 the contents of one camera card or one submission — into a single unit.
 
 **Bundling exists for a practical reason: tape performs well only when it
@@ -435,7 +435,7 @@ is precisely the point.
 
 ## 11. Where to go from here
 
-- **The RAO Format Specification** — the normative definition of the
+- **The REM-OBJECT Format Specification** — the normative definition of the
   archive object: container, manifest, encryption envelope, range
   addressing, test vectors, conformance.
 - **The REM-PARITY Tape Format Specification** — the normative definition
@@ -446,7 +446,7 @@ is precisely the point.
 
 ## 12. A note on maturity
 
-The reference implementation was developed against a QuadStor virtual
+The reference implementation was developed against a Quadstor virtual
 tape library and field-tested on an HPE MSL3040 tape library with LTO-9
 drives. That is real hardware, but it is one library family and one drive
 generation — a young footprint for formats that speak of decades.

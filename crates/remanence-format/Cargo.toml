@@ -1,6 +1,6 @@
 [package]
 name        = "remanence-format"
-description = "Layer 3b — Remanence body formats, including rao-v1."
+description = "Layer 3b — Remanence body formats, including rem-object-v1."
 version     .workspace = true
 edition     .workspace = true
 rust-version.workspace = true

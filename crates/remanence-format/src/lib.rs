@@ -1,7 +1,7 @@
 //! Layer 3b — pluggable tape body formats for Remanence.
 //!
-//! This crate starts with `rao-v1`, the default body format in
-//! `docs/spec-v0.4.md` §8.  A `rao-v1` object is a complete POSIX
+//! This crate starts with `rem-object-v1`, the default body format in
+//! `docs/spec-v0.4.md` §8.  A `rem-object-v1` object is a complete POSIX
 //! pax tar archive in one tape file, streamed through
 //! [`remanence_library::BlockSink`].  The implementation keeps the
 //! body-format layer independent of Layer 3c: callers compose it with
@@ -26,8 +26,8 @@ pub mod tar;
 pub mod writer;
 
 pub use envelope::{
-    covering_envelope_rao_stored_range, open_envelope_rao_range_from_reader,
-    open_envelope_rao_stream, seal_envelope_rao_stream,
+    covering_envelope_rem_object_stored_range, open_envelope_rem_object_range_from_reader,
+    open_envelope_rem_object_stream, seal_envelope_rem_object_stream,
 };
 pub use error::{FormatError, FormatGate};
 pub use layout::{plan_rem_tar_object, RemTarObjectLayout};
@@ -40,16 +40,16 @@ pub use model::{
     TAR_RECORD_SIZE,
 };
 pub use pfr::{
-    plan_plaintext_rao_file_range, read_encrypted_rao_file_range_to_vec, validate_file_range,
-    EncryptedRaoFileRange, PlaintextRaoFileRangePlan,
+    plan_plaintext_rem_object_file_range, read_encrypted_rem_object_file_range_to_vec,
+    validate_file_range, EncryptedRemObjectFileRange, PlaintextRemObjectFileRangePlan,
 };
 pub use reader::{
-    read_encrypted_rao_object, read_encrypted_rao_object_with_manifest_anchor,
-    read_encrypted_rao_object_with_mode, read_encrypted_rao_object_with_mode_and_manifest_anchor,
+    read_encrypted_rem_object, read_encrypted_rem_object_with_manifest_anchor,
+    read_encrypted_rem_object_with_mode, read_encrypted_rem_object_with_mode_and_manifest_anchor,
     read_rem_tar_object, read_rem_tar_object_with_manifest_anchor, read_rem_tar_object_with_mode,
     read_rem_tar_object_with_mode_and_manifest_anchor, stream_rem_tar_object,
     stream_rem_tar_object_with_manifest_anchor, stream_rem_tar_object_with_mode,
-    stream_rem_tar_object_with_mode_and_manifest_anchor, EncryptedRaoReadObject, ReadMode,
+    stream_rem_tar_object_with_mode_and_manifest_anchor, EncryptedRemObjectReadObject, ReadMode,
     RemTarDigestMismatch, RemTarEntrySink, RemTarReadEntry, RemTarReadObject, RemTarReadWarning,
     RemTarStreamEntry, RemTarStreamReport,
 };
@@ -61,6 +61,6 @@ pub use remanence_format_driver::{
     SourceRequirement, StreamReport,
 };
 pub use writer::{
-    write_encrypted_rao_object, write_encrypted_rao_object_from_readers, write_rem_tar_object,
-    write_rem_tar_object_from_readers, BodyBlockWriter, EncryptedRaoWriteReport,
+    write_encrypted_rem_object, write_encrypted_rem_object_from_readers, write_rem_tar_object,
+    write_rem_tar_object_from_readers, BodyBlockWriter, EncryptedRemObjectWriteReport,
 };

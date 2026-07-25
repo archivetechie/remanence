@@ -213,7 +213,7 @@ fn trim_ascii_right(buf: &[u8]) -> &str {
 mod tests {
     use super::*;
 
-    // QuadStor virtual library (akash) — what's in the dev environment.
+    // Quadstor virtual library (akash) — what's in the dev environment.
     const DRIVE_LTO9: &[u8] = include_bytes!("../../../fixtures/inquiry/drive1-lto9.bin");
     const CHANGER_MSL: &[u8] = include_bytes!("../../../fixtures/inquiry/changer-msl-g3.bin");
     // Real HP MSL3040 + real Ultrium 7/9 drives, captured from datamover.

@@ -1,4 +1,4 @@
-//! RAO HPKE Base wrapping for per-object data-encryption keys.
+//! REM-OBJECT HPKE Base wrapping for per-object data-encryption keys.
 
 use std::fmt;
 
@@ -21,8 +21,8 @@ use sha3::{
 };
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::error::{RaoAeadError, Result};
-use crate::header::{object_id_field, RAO_WRAP_SUITE_XWING};
+use crate::error::{RemObjectAeadError, Result};
+use crate::header::{object_id_field, REM_OBJECT_WRAP_SUITE_XWING};
 use crate::key_frame::{KeyFrame, RecipientSlot};
 use crate::xwing::{
     self, XWingPublicKey, XWingSeed, XWING_CIPHERTEXT_LEN, XWING_PUBLIC_KEY_LEN, XWING_SEED_LEN,
@@ -38,7 +38,7 @@ type XWingHpkeEncappedKeySize = Sum<U1024, U96>;
 /// Frozen HPKE KEM identifier assigned to X-Wing by
 /// `draft-connolly-cfrg-xwing-kem-10` and the IANA HPKE registry.
 ///
-/// This value feeds the RFC 9180 `suite_id` and must never change for RAO 2.0.
+/// This value feeds the RFC 9180 `suite_id` and must never change for REM-ENCRYPT 1.0.
 pub const XWING_HPKE_KEM_ID: u16 = 0x647a;
 /// Frozen RFC 9180 suite identifier for X-Wing, HKDF-SHA256, and
 /// ChaCha20-Poly1305: `"HPKE" || 0x647a || 0x0001 || 0x0003`.
@@ -204,7 +204,7 @@ impl EphemeralRng {
         let mut seed = [0u8; 32];
         if getrandom::fill(&mut seed).is_err() {
             seed.zeroize();
-            return Err(RaoAeadError::EntropyUnavailable);
+            return Err(RemObjectAeadError::EntropyUnavailable);
         }
         let inner = Self::from_seed(&seed);
         seed.zeroize();
@@ -243,9 +243,9 @@ impl RngCore for EphemeralRng {
 impl CryptoRng for EphemeralRng {}
 
 /// Frozen prefix in the fixed-width HPKE info transcript.
-pub const WRAP_INFO_PREFIX: &[u8; 12] = b"rao-wrap-v1\0";
+pub const WRAP_INFO_PREFIX: &[u8; 20] = b"rem-encrypt-wrap-v1\0";
 /// Exact length of the HPKE info transcript.
-pub const WRAP_INFO_LEN: usize = 95;
+pub const WRAP_INFO_LEN: usize = 103;
 
 /// Fresh per-object 256-bit data-encryption key.
 pub struct DataEncryptionKey([u8; 32]);
@@ -254,7 +254,7 @@ impl DataEncryptionKey {
     /// Generate a DEK directly from the fallible operating-system CSPRNG.
     pub fn generate() -> Result<Self> {
         let mut bytes = [0u8; 32];
-        getrandom::fill(&mut bytes).map_err(|_| RaoAeadError::EntropyUnavailable)?;
+        getrandom::fill(&mut bytes).map_err(|_| RemObjectAeadError::EntropyUnavailable)?;
         Ok(Self(bytes))
     }
 
@@ -295,13 +295,13 @@ pub struct RecipientPublicKey {
 }
 
 impl RecipientPublicKey {
-    /// Serialize the canonical public-recipient file (`RAOR`, slot, id, label, public key).
+    /// Serialize the canonical public-recipient file (`REMR`, slot, id, label, public key).
     pub fn serialize(&self) -> Result<Vec<u8>> {
         validate_label(&self.epoch_label)?;
         <<Kem as hpke::Kem>::PublicKey as Deserializable>::from_bytes(&self.public_key)
-            .map_err(|_| RaoAeadError::HpkeFailed)?;
+            .map_err(|_| RemObjectAeadError::HpkeFailed)?;
         let mut out = Vec::with_capacity(RECIPIENT_PUBLIC_FILE_FIXED_LEN + self.epoch_label.len());
-        out.extend_from_slice(b"RAOR");
+        out.extend_from_slice(b"REMR");
         out.push(self.slot_index);
         out.extend_from_slice(&self.recipient_epoch_id);
         out.push(self.epoch_label.len() as u8);
@@ -312,9 +312,9 @@ impl RecipientPublicKey {
 
     /// Parse a complete canonical public-recipient file.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        if bytes.get(..4) != Some(b"RAOR") || bytes.len() < RECIPIENT_PUBLIC_FILE_FIXED_LEN {
-            return Err(RaoAeadError::InvalidInput(
-                "invalid RAO recipient public-key file".to_string(),
+        if bytes.get(..4) != Some(b"REMR") || bytes.len() < RECIPIENT_PUBLIC_FILE_FIXED_LEN {
+            return Err(RemObjectAeadError::InvalidInput(
+                "invalid REM-OBJECT recipient public-key file".to_string(),
             ));
         }
         let slot_index = bytes[4];
@@ -322,21 +322,21 @@ impl RecipientPublicKey {
         let label_len = bytes[21] as usize;
         let expected = RECIPIENT_PUBLIC_FILE_FIXED_LEN
             .checked_add(label_len)
-            .ok_or(RaoAeadError::SizeOverflow)?;
+            .ok_or(RemObjectAeadError::SizeOverflow)?;
         if bytes.len() != expected {
-            return Err(RaoAeadError::InvalidInput(
-                "invalid RAO recipient public-key file length".to_string(),
+            return Err(RemObjectAeadError::InvalidInput(
+                "invalid REM-OBJECT recipient public-key file length".to_string(),
             ));
         }
         let epoch_label = std::str::from_utf8(&bytes[22..22 + label_len])
-            .map_err(|_| RaoAeadError::InvalidInput("invalid recipient label".to_string()))?
+            .map_err(|_| RemObjectAeadError::InvalidInput("invalid recipient label".to_string()))?
             .to_string();
         validate_label(&epoch_label)?;
         let public_key: [u8; XWING_PUBLIC_KEY_LEN] = bytes[22 + label_len..]
             .try_into()
-            .map_err(|_| RaoAeadError::HpkeFailed)?;
+            .map_err(|_| RemObjectAeadError::HpkeFailed)?;
         <<Kem as hpke::Kem>::PublicKey as Deserializable>::from_bytes(&public_key)
-            .map_err(|_| RaoAeadError::HpkeFailed)?;
+            .map_err(|_| RemObjectAeadError::HpkeFailed)?;
         Ok(Self {
             slot_index,
             recipient_epoch_id,
@@ -365,7 +365,7 @@ impl RecipientPrivateKey {
         let epoch_label = epoch_label.into();
         validate_label(&epoch_label)?;
         <<Kem as hpke::Kem>::PrivateKey as Deserializable>::from_bytes(&private_key)
-            .map_err(|_| RaoAeadError::HpkeFailed)?;
+            .map_err(|_| RemObjectAeadError::HpkeFailed)?;
         Ok(Self {
             recipient_epoch_id,
             epoch_label,
@@ -377,13 +377,13 @@ impl RecipientPrivateKey {
     pub fn public_key(&self, slot_index: u8) -> Result<RecipientPublicKey> {
         let secret =
             <<Kem as hpke::Kem>::PrivateKey as Deserializable>::from_bytes(&self.private_key)
-                .map_err(|_| RaoAeadError::HpkeFailed)?;
+                .map_err(|_| RemObjectAeadError::HpkeFailed)?;
         let public = Kem::sk_to_pk(&secret);
         let public_key = public
             .to_bytes()
             .as_slice()
             .try_into()
-            .map_err(|_| RaoAeadError::HpkeFailed)?;
+            .map_err(|_| RemObjectAeadError::HpkeFailed)?;
         Ok(RecipientPublicKey {
             slot_index,
             recipient_epoch_id: self.recipient_epoch_id,
@@ -392,10 +392,10 @@ impl RecipientPrivateKey {
         })
     }
 
-    /// Serialize the standalone recovery-key file format (`RAOP`, id, label, secret).
+    /// Serialize the standalone recovery-key file format (`REMP`, id, label, secret).
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(RECIPIENT_PRIVATE_FILE_FIXED_LEN + self.epoch_label.len());
-        out.extend_from_slice(b"RAOP");
+        out.extend_from_slice(b"REMP");
         out.extend_from_slice(&self.recipient_epoch_id);
         out.push(self.epoch_label.len() as u8);
         out.extend_from_slice(self.epoch_label.as_bytes());
@@ -405,26 +405,26 @@ impl RecipientPrivateKey {
 
     /// Parse a complete canonical recovery-key file.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        if bytes.get(..4) != Some(b"RAOP") || bytes.len() < RECIPIENT_PRIVATE_FILE_FIXED_LEN {
-            return Err(RaoAeadError::InvalidInput(
-                "invalid RAO recipient private-key file".to_string(),
+        if bytes.get(..4) != Some(b"REMP") || bytes.len() < RECIPIENT_PRIVATE_FILE_FIXED_LEN {
+            return Err(RemObjectAeadError::InvalidInput(
+                "invalid REM-OBJECT recipient private-key file".to_string(),
             ));
         }
         let recipient_epoch_id = bytes[4..20].try_into().expect("fixed slice");
         let label_len = bytes[20] as usize;
         let expected = RECIPIENT_PRIVATE_FILE_FIXED_LEN
             .checked_add(label_len)
-            .ok_or(RaoAeadError::SizeOverflow)?;
+            .ok_or(RemObjectAeadError::SizeOverflow)?;
         if bytes.len() != expected {
-            return Err(RaoAeadError::InvalidInput(
-                "invalid RAO recipient private-key file length".to_string(),
+            return Err(RemObjectAeadError::InvalidInput(
+                "invalid REM-OBJECT recipient private-key file length".to_string(),
             ));
         }
         let epoch_label = std::str::from_utf8(&bytes[21..21 + label_len])
-            .map_err(|_| RaoAeadError::InvalidInput("invalid recipient label".to_string()))?;
+            .map_err(|_| RemObjectAeadError::InvalidInput("invalid recipient label".to_string()))?;
         let private_key = bytes[21 + label_len..]
             .try_into()
-            .map_err(|_| RaoAeadError::HpkeFailed)?;
+            .map_err(|_| RemObjectAeadError::HpkeFailed)?;
         Self::new(recipient_epoch_id, epoch_label, private_key)
     }
 }
@@ -445,19 +445,19 @@ impl fmt::Debug for RecipientPrivateKey {
     }
 }
 
-/// Build the frozen 95-byte `rao-wrap-v1` HPKE info transcript.
+/// Build the frozen 103-byte `rem-encrypt-wrap-v1` HPKE info transcript.
 pub fn wrap_info(
     object_id: &str,
     recipient_epoch_id: &[u8; 16],
     slot_index: u8,
 ) -> Result<[u8; WRAP_INFO_LEN]> {
     let mut info = [0u8; WRAP_INFO_LEN];
-    info[..12].copy_from_slice(WRAP_INFO_PREFIX);
-    info[12..76].copy_from_slice(&object_id_field(object_id)?);
-    info[76..92].copy_from_slice(recipient_epoch_id);
-    info[92] = slot_index;
-    info[93] = 2;
-    info[94] = RAO_WRAP_SUITE_XWING;
+    info[..20].copy_from_slice(WRAP_INFO_PREFIX);
+    info[20..84].copy_from_slice(&object_id_field(object_id)?);
+    info[84..100].copy_from_slice(recipient_epoch_id);
+    info[100] = slot_index;
+    info[101] = 1;
+    info[102] = REM_OBJECT_WRAP_SUITE_XWING;
     Ok(info)
 }
 
@@ -484,17 +484,17 @@ fn wrap_recipient<R: CryptoRng + RngCore>(
     validate_label(&recipient.epoch_label)?;
     let public =
         <<Kem as hpke::Kem>::PublicKey as Deserializable>::from_bytes(&recipient.public_key)
-            .map_err(|_| RaoAeadError::HpkeFailed)?;
+            .map_err(|_| RemObjectAeadError::HpkeFailed)?;
     let info = wrap_info(
         object_id,
         &recipient.recipient_epoch_id,
         recipient.slot_index,
     )?;
     let (enc, mut context) = setup_sender::<Aead, Kdf, Kem, _>(&OpModeS::Base, &public, &info, rng)
-        .map_err(|_| RaoAeadError::HpkeFailed)?;
+        .map_err(|_| RemObjectAeadError::HpkeFailed)?;
     let ciphertext = context
         .seal(dek.as_bytes(), &[])
-        .map_err(|_| RaoAeadError::HpkeFailed)?;
+        .map_err(|_| RemObjectAeadError::HpkeFailed)?;
     Ok(RecipientSlot {
         slot_index: recipient.slot_index,
         recipient_epoch_id: recipient.recipient_epoch_id,
@@ -503,10 +503,10 @@ fn wrap_recipient<R: CryptoRng + RngCore>(
             .to_bytes()
             .as_slice()
             .try_into()
-            .map_err(|_| RaoAeadError::HpkeFailed)?,
+            .map_err(|_| RemObjectAeadError::HpkeFailed)?,
         ciphertext: ciphertext
             .try_into()
-            .map_err(|_| RaoAeadError::HpkeFailed)?,
+            .map_err(|_| RemObjectAeadError::HpkeFailed)?,
     })
 }
 
@@ -520,29 +520,29 @@ pub fn unwrap_dek(
         .slots
         .iter()
         .find(|slot| slot.recipient_epoch_id == recipient.recipient_epoch_id)
-        .ok_or(RaoAeadError::RecipientEpochMismatch)?;
+        .ok_or(RemObjectAeadError::RecipientEpochMismatch)?;
     let secret =
         <<Kem as hpke::Kem>::PrivateKey as Deserializable>::from_bytes(&recipient.private_key)
-            .map_err(|_| RaoAeadError::HpkeFailed)?;
+            .map_err(|_| RemObjectAeadError::HpkeFailed)?;
     let enc = <<Kem as hpke::Kem>::EncappedKey as Deserializable>::from_bytes(&slot.enc)
-        .map_err(|_| RaoAeadError::HpkeFailed)?;
+        .map_err(|_| RemObjectAeadError::HpkeFailed)?;
     let info = wrap_info(object_id, &slot.recipient_epoch_id, slot.slot_index)?;
     let mut context = setup_receiver::<Aead, Kdf, Kem>(&OpModeR::Base, &secret, &enc, &info)
-        .map_err(|_| RaoAeadError::HpkeFailed)?;
+        .map_err(|_| RemObjectAeadError::HpkeFailed)?;
     let mut plaintext = context
         .open(&slot.ciphertext, &[])
-        .map_err(|_| RaoAeadError::HpkeFailed)?;
+        .map_err(|_| RemObjectAeadError::HpkeFailed)?;
     let bytes = plaintext
         .as_slice()
         .try_into()
-        .map_err(|_| RaoAeadError::HpkeFailed)?;
+        .map_err(|_| RemObjectAeadError::HpkeFailed)?;
     plaintext.zeroize();
     Ok(DataEncryptionKey::from_bytes(bytes))
 }
 
 fn validate_label(label: &str) -> Result<()> {
     if label.len() > 32 || !label.as_bytes().iter().all(|b| (0x20..=0x7e).contains(b)) {
-        return Err(RaoAeadError::InvalidKeyFrame);
+        return Err(RemObjectAeadError::InvalidKeyFrame);
     }
     Ok(())
 }
@@ -551,7 +551,7 @@ fn validate_label(label: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    const RAO_XWING_WRAP_KAT: &str = include_str!("../testdata/xwing-wrap-kat.txt");
+    const REM_OBJECT_XWING_WRAP_KAT: &str = include_str!("../testdata/xwing-wrap-kat.txt");
 
     struct CountingByteRng {
         byte: u8,
@@ -592,7 +592,7 @@ mod tests {
 
     fn wrap_kat_field(name: &str) -> Vec<u8> {
         let prefix = format!("{name}=");
-        let value = RAO_XWING_WRAP_KAT
+        let value = REM_OBJECT_XWING_WRAP_KAT
             .lines()
             .find_map(|line| line.strip_prefix(&prefix))
             .unwrap_or_else(|| panic!("missing X-Wing wrap KAT field {name}"));
@@ -609,11 +609,11 @@ mod tests {
     #[test]
     fn info_is_byte_exact_and_fixed_width() {
         let info = wrap_info("obj", &[0x44; 16], 7).unwrap();
-        assert_eq!(&info[..12], b"rao-wrap-v1\0");
-        assert_eq!(&info[12..15], b"obj");
-        assert!(info[15..76].iter().all(|byte| *byte == 0));
-        assert_eq!(&info[76..92], &[0x44; 16]);
-        assert_eq!(&info[92..], &[7, 2, RAO_WRAP_SUITE_XWING]);
+        assert_eq!(&info[..20], b"rem-encrypt-wrap-v1\0");
+        assert_eq!(&info[20..23], b"obj");
+        assert!(info[23..84].iter().all(|byte| *byte == 0));
+        assert_eq!(&info[84..100], &[0x44; 16]);
+        assert_eq!(&info[100..], &[7, 1, REM_OBJECT_WRAP_SUITE_XWING]);
     }
 
     #[test]
@@ -701,7 +701,7 @@ mod tests {
     }
 
     // RFC 9180 Appendix A.2 exercises DHKEM(X25519) and no longer applies to
-    // RAO's X-Wing-only KEM. This adapter check replaces that legacy fixture.
+    // REM-OBJECT's X-Wing-only KEM. This adapter check freezes the current profile.
     #[test]
     fn xwing_hpke_adapter_has_frozen_sizes_id_and_derivation() {
         fn assert_zeroize_on_drop<T: ZeroizeOnDrop>(_value: &T) {}
@@ -738,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn rao_xwing_wrap_vector_is_byte_exact() {
+    fn rem_object_xwing_wrap_vector_is_byte_exact() {
         let seed = wrap_kat_array("seed");
         let recipient_epoch_id = wrap_kat_array("recipient_epoch_id");
         let slot_index = wrap_kat_array::<1>("slot_index")[0];

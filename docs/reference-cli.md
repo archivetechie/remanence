@@ -5,7 +5,7 @@
 
 Remanence ships two command-line tools built from `crates/remanence-cli`,
 the daemon binary from `crates/remanence-daemon`, and a standalone
-disaster-recovery binary from its own crate `crates/rao-recover`:
+disaster-recovery binary from its own crate `crates/rem-recover`:
 
 - **`rem`** is the operator CLI. It talks to a running `rem-daemon` over
   gRPC for daemon-backed commands, and works directly against local state
@@ -22,11 +22,11 @@ disaster-recovery binary from its own crate `crates/rao-recover`:
 - **`rem-daemon`** is the long-running Layer 5 service. It takes only
   `--config <PATH>` (default `/etc/rem/config.toml`) and `--socket <PATH>`
   (overrides the config's socket path).
-- **`rao-recover`** is a small, standalone catalogless disaster-recovery
-  tool — see [`rao-recover`: standalone recovery](#rao-recover-standalone-recovery)
+- **`rem-recover`** is a small, standalone catalogless disaster-recovery
+  tool — see [`rem-recover`: standalone recovery](#rem-recover-standalone-recovery)
   below. It shares no code path with the daemon or the CLI's `--allow`
   gauntlet: it doesn't touch tape, the catalog, or a config file at all,
-  only a RAO object file already sitting on disk.
+  only a REM-OBJECT object file already sitting on disk.
 
 `rem` and `rem-debug` are two separate binaries built from the same
 `remanence-cli` crate — not aliases of one binary — sharing one large
@@ -98,7 +98,7 @@ All of these speak gRPC to `rem-daemon` and take `--endpoint` and `--json`.
 | `rem catalog tape <TAPE_UUID>` | One tape's catalog record. |
 | `rem catalog tape-files <TAPE_UUID>` | Tape files recorded for one tape. |
 | `rem catalog pools` / `rem catalog pool <POOL_ID>` | Tape pool definitions and membership. |
-| `rem catalog units [--origin all\|native\|foreign]` | Catalog units across native RAO objects and foreign (scanned legacy) archives. |
+| `rem catalog units [--origin all\|native\|foreign]` | Catalog units across native REM-OBJECT objects and foreign (scanned legacy) archives. |
 | `rem catalog unit <UNIT_ID>` / `rem catalog entries <UNIT_ID>` | One unit, or the entries inside it. |
 | `rem top [--once] [--json]` | Live TUI over daemon state; `--once` takes a single snapshot. |
 | `rem alarms [--all]` / `rem alarms ack <CONDITION_KEY>` | List standing alarms (with `--all`, cleared ones too) or acknowledge one. |
@@ -144,19 +144,19 @@ each initialization must pass.
 <!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/archive_ingest.rs crates/remanence-cli/src/archive_map.rs crates/remanence-aead/src/wrap.rs @ 8de2c46 -->
 ## Archive objects (local, no tape)
 
-`rem archive` builds and reads portable RAO object files on local disk.
+`rem archive` builds and reads portable REM-OBJECT object files on local disk.
 None of these touch tape; they are the easiest way to exercise the format.
 
 | Command | What it does |
 |---|---|
-| `rem archive capabilities` | Print a one-line JSON list of this build's RAO capabilities (e.g. `rao-envelope`, `wrap-suite-hpke-v1`, `ranged-ciphertext-extract`) with zero hardware discovery. `wrap-suite-hpke-v1` names the HPKE Base-mode construction; the KEM it runs is the X-Wing hybrid (see [reference-tape-layout.md](reference-tape-layout.md#the-encrypted-envelope-rao1)), not a plain X25519 KEM despite the string. Useful for scripts probing what a given binary supports before calling it. |
-| `rem archive build --inputs <PATH>... --out <FILE> [--recipient <RAOR>]...` | Build a portable object and print a JSON build report. Capture keeps `user.*` xattrs by default, reports other dropped names per entry, and emits one warning with the drop count. `--full-fidelity-xattrs` is the explicit non-portable keep-all opt-in and cannot be combined with `--rules` or `--map`. Omitting `--recipient` writes the plaintext `rao-v1` body. Repeating it 2-8 times with distinct epochs in ascending slot order writes the HPKE envelope; the presence of recipients is the encryption switch. `--map`/`--source-root`/`--map-sha256` accept a planner-emitted source map instead of `--inputs`. `--scan-only` classifies inputs and reports without writing. `--rules` applies an ingest ruleset; `--manifest-out` (requires `--rules`) writes the member manifest JSON. |
-| `rem archive reseal --object <FILE> --private-key <RAOP> --recipient <RAOR> <RAOR>... --out <FILE> [--staging-dir <DIR>]` | Open one envelope with a matching recipient private key and fully re-seal the same authenticated plaintext to a new ordered set of 2-8 distinct recipients. Unlike build/write's repeatable flag, reseal takes its 2-8 paths as one `--recipient` value list. It verifies the new stored digest before an atomic no-replace publish; staging happens next to the destination unless `--staging-dir` is supplied. Input and output are both encrypted envelopes. |
+| `rem archive capabilities` | Print a one-line JSON list of this build's REM-OBJECT capabilities (e.g. `rem-object-envelope`, `wrap-suite-hpke-v1`, `ranged-ciphertext-extract`) with zero hardware discovery. `wrap-suite-hpke-v1` names the HPKE Base-mode construction; the KEM it runs is the X-Wing hybrid (see [reference-tape-layout.md](reference-tape-layout.md#the-encrypted-envelope-remo)), not a plain X25519 KEM despite the string. Useful for scripts probing what a given binary supports before calling it. |
+| `rem archive build --inputs <PATH>... --out <FILE> [--recipient <REMR>]...` | Build a portable object and print a JSON build report. Capture keeps `user.*` xattrs by default, reports other dropped names per entry, and emits one warning with the drop count. `--full-fidelity-xattrs` is the explicit non-portable keep-all opt-in and cannot be combined with `--rules` or `--map`. Omitting `--recipient` writes the plaintext `rem-object-v1` body. Repeating it 2-8 times with distinct epochs in ascending slot order writes the HPKE envelope; the presence of recipients is the encryption switch. `--map`/`--source-root`/`--map-sha256` accept a planner-emitted source map instead of `--inputs`. `--scan-only` classifies inputs and reports without writing. `--rules` applies an ingest ruleset; `--manifest-out` (requires `--rules`) writes the member manifest JSON. |
+| `rem archive reseal --object <FILE> --private-key <REMP> --recipient <REMR> <REMR>... --out <FILE> [--staging-dir <DIR>]` | Open one envelope with a matching recipient private key and fully re-seal the same authenticated plaintext to a new ordered set of 2-8 distinct recipients. Unlike build/write's repeatable flag, reseal takes its 2-8 paths as one `--recipient` value list. It verifies the new stored digest before an atomic no-replace publish; staging happens next to the destination unless `--staging-dir` is supplied. Input and output are both encrypted envelopes. |
 | `rem archive inspect --object <FILE>` | Inspect a plaintext body or parse and validate an envelope header/key frame without a key. Encrypted output reports `format_version` and `recipient_epochs`; it cannot expose encrypted manifest members. |
-| `rem archive extract --object <FILE> --dest <DIR> [--private-key <RAOP>]` | Extract a whole object. `--private-key` is required for an encrypted object and rejected for plaintext. `--path` plus `--range <START:LEN>` extracts a member byte range; `--blob-entry`/`--blob-member` restores a single member from a blob wrapper. |
-| `rem archive extract-stream --private-key <RAOP> [--range <START:LEN> --authenticated-prefix <FILE> --stored-range-start <BYTE>]` | Stream-decrypt an envelope from stdin to stdout with per-chunk authentication and bounded memory. With the three ranged flags together, re-authenticate the header/key-frame/metadata prefix and decrypt only the covering ciphertext frames beginning at `--stored-range-start`. |
-| `rem archive covering-range --private-key <RAOP> --object-id <ID> --file-id <ID> --range <START:LEN>` | Authenticate an envelope header/key-frame/metadata prefix from stdin and print the smallest covering stored-ciphertext range (`stored_range_start`, `stored_range_len`, `first_chunk`, `chunk_count`). See [`reference-extract-stream-protocol.md`](reference-extract-stream-protocol.md). |
-| `rem restore --object <FILE> --dest <DIR> [--private-key <RAOP>]` | Top-level native-restore alias with the same key contract as `extract`. |
+| `rem archive extract --object <FILE> --dest <DIR> [--private-key <REMP>]` | Extract a whole object. `--private-key` is required for an encrypted object and rejected for plaintext. `--path` plus `--range <START:LEN>` extracts a member byte range; `--blob-entry`/`--blob-member` restores a single member from a blob wrapper. |
+| `rem archive extract-stream --private-key <REMP> [--range <START:LEN> --authenticated-prefix <FILE> --stored-range-start <BYTE>]` | Stream-decrypt an envelope from stdin to stdout with per-chunk authentication and bounded memory. With the three ranged flags together, re-authenticate the header/key-frame/metadata prefix and decrypt only the covering ciphertext frames beginning at `--stored-range-start`. |
+| `rem archive covering-range --private-key <REMP> --object-id <ID> --file-id <ID> --range <START:LEN>` | Authenticate an envelope header/key-frame/metadata prefix from stdin and print the smallest covering stored-ciphertext range (`stored_range_start`, `stored_range_len`, `first_chunk`, `chunk_count`). See [`reference-extract-stream-protocol.md`](reference-extract-stream-protocol.md). |
+| `rem restore --object <FILE> --dest <DIR> [--private-key <REMP>]` | Top-level native-restore alias with the same key contract as `extract`. |
 | `rem archive list` | List native objects from the local catalog (no tape access). |
 | `rem archive probe --format bru --dump <FILE>` | Identify a legacy archive dump without streaming it. |
 | `rem archive scan --format bru --dump <FILE>` | Catalog entries from a legacy dump. |
@@ -173,12 +173,12 @@ reader.
 
 | Operation | Seal/open key input | Result |
 |---|---|---|
-| `archive build`, `archive write` | no recipient flags | Plaintext `rao-v1` body. |
-| `archive build`, `archive write` | `--recipient <RAOR>` repeated 2-8 times | Encrypted format version 2. Epoch ids must be distinct and slot order ascending. |
-| `archive reseal` | one matching `--private-key <RAOP>` plus one `--recipient` list containing 2-8 new RAOR files | Full re-seal for recipient rotation. |
+| `archive build`, `archive write` | no recipient flags | Plaintext `rem-object-v1` body. |
+| `archive build`, `archive write` | `--recipient <REMR>` repeated 2-8 times | REM-ENCRYPT format version 1. Epoch ids must be distinct and slot order ascending. |
+| `archive reseal` | one matching `--private-key <REMP>` plus one `--recipient` list containing 2-8 new REMR files | Full re-seal for recipient rotation. |
 | `archive inspect`, `archive export-object` | none | Keyless envelope inspection, or opaque stored-byte export. |
-| `archive extract`, `restore`, `archive read`, `archive verify` | `--private-key <RAOP>` for encrypted input | The private key's epoch id selects its matching key-frame slot. |
-| `archive extract-stream`, `archive covering-range` | `--private-key <RAOP>` | Encrypted streaming or bounded ranged open. |
+| `archive extract`, `restore`, `archive read`, `archive verify` | `--private-key <REMP>` for encrypted input | The private key's epoch id selects its matching key-frame slot. |
+| `archive extract-stream`, `archive covering-range` | `--private-key <REMP>` | Encrypted streaming or bounded ranged open. |
 
 The retired `--encrypt`, `--key-file`, `--key-id`, and `--registry-key`
 flags are not compatibility aliases; Clap rejects them.
@@ -189,21 +189,21 @@ flags are not compatibility aliases; Clap rejects them.
 as `{"epoch_id":"<32 lowercase hex>","label":"<epoch label>"}`.
 
 - An encrypted `archive build` report has `representation: "encrypted"`,
-  `encryption: "RAO1"`, `format_version: 2`, `recipient_epochs`, stored and
+  `encryption: "REMO"`, `format_version: 1`, `recipient_epochs`, stored and
   plaintext digests/sizes, manifest digest, and file layout. The plaintext
   form uses `format_version: null` and `recipient_epochs: null`.
 - Encrypted `archive inspect` is explicitly keyless (`keyed: false`) and
   reports the object id, format version, recipients, salt, prefix geometry,
   stored digest/size, and plaintext size/chunk count. It does not claim to
   expose the encrypted manifest.
-- `archive reseal` reports `input_format_version: 2`,
-  `output_format_version: 2`, the new `recipient_epochs`, plaintext and
+- `archive reseal` reports `input_format_version: 1`,
+  `output_format_version: 1`, the new `recipient_epochs`, plaintext and
   published stored digests, sizes, and `verified_after_write: true`.
 - Encrypted local-extract reports and tape-write locators carry
   `recipient_epochs`. Direct tape read/verify receipts keep their existing
   payload byte/hash fields; recipient provenance remains in the locator and
   catalog. Whole-object `extract-stream` additionally reports
-  `format_version: 2`; ranged mode reports the recipients parsed from the
+  `format_version: 1`; ranged mode reports the recipients parsed from the
   authenticated prefix and the authenticated-chunk/stored-range geometry.
 
 <!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/lib.rs @ 2a20106 -->
@@ -227,10 +227,10 @@ journals):
 
 | Command | What it does |
 |---|---|
-| `rem-debug archive write --library <SERIAL> --file <PATH> --pool <POOL> [--recipient <RAOR>]... [--json]` | Write one local file to a pool-selected tape. Repeating `--recipient` 2-8 times writes the encrypted envelope; omitting it writes plaintext. The locator includes `format_version` and `recipient_epochs`. |
-| `rem-debug archive read --library <SERIAL> --locator <JSON> --out <PATH> [--private-key <RAOP>]` | Read an object by locator; an encrypted copy requires the matching private key. |
+| `rem-debug archive write --library <SERIAL> --file <PATH> --pool <POOL> [--recipient <REMR>]... [--json]` | Write one local file to a pool-selected tape. Repeating `--recipient` 2-8 times writes the encrypted envelope; omitting it writes plaintext. The locator includes `format_version` and `recipient_epochs`. |
+| `rem-debug archive read --library <SERIAL> --locator <JSON> --out <PATH> [--private-key <REMP>]` | Read an object by locator; an encrypted copy requires the matching private key. |
 | `rem-debug archive export-object ...` | Export the complete stored object bytes (including envelope) by locator. |
-| `rem-debug archive verify --locator <JSON> --expected-sha256 <HEX> [--private-key <RAOP>]` | Stream and hash an object on tape against an expected digest, restoring nothing; encrypted copies require the matching private key. |
+| `rem-debug archive verify --locator <JSON> --expected-sha256 <HEX> [--private-key <REMP>]` | Stream and hash an object on tape against an expected digest, restoring nothing; encrypted copies require the matching private key. |
 | `rem-debug archive probe/scan/restore/recover --tape <SERIAL> --bay <BAY> [--rewind]` | Run the foreign-format driver directly against a mounted tape instead of a dump file. |
 | `rem-debug tape alerts --bay <BAY>` | Read the loaded drive's TapeAlert LOG SENSE page directly. |
 
@@ -253,17 +253,17 @@ catalog projection from the audit log and per-tape journals. This is the
 recovery path that makes the SQLite file a disposable cache rather than a
 single point of failure.
 
-<!-- code-anchor: crates/rao-recover/src/main.rs @ 2a20106 -->
-## `rao-recover`: standalone recovery
+<!-- code-anchor: crates/rem-recover/src/main.rs @ 2a20106 -->
+## `rem-recover`: standalone recovery
 
-`rao-recover` is a separate crate and binary (`crates/rao-recover`), not
+`rem-recover` is a separate crate and binary (`crates/rem-recover`), not
 part of `remanence-cli`. It exists for the case where the rest of the
 stack — daemon, catalog, config file — is unavailable, untrusted, or
-simply not worth standing up: given one RAO object file and a key, it
+simply not worth standing up: given one REM-OBJECT object file and a key, it
 recovers plaintext members with nothing else.
 
 ```
-rao-recover --object <FILE> --private-key <RAOP> --out <DIR>
+rem-recover --object <FILE> --private-key <REMP> --out <DIR>
             [--staging-dir <DIR>] [--overwrite]
 ```
 

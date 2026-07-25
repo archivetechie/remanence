@@ -27,7 +27,7 @@ docs/reference/posix/*.html
 # Local SCSI dump captured during hardware work; keep curated references under docs/.
 lto.txt
 
-# QuadStor patch artifacts (the live tree under /quadstorvtl is not in this repo)
+# Quadstor patch artifacts (the live tree under /quadstorvtl is not in this repo)
 patches/**/originals/
 
 # Fixtures: keep .bin / .txt; ignore any captured personal traces

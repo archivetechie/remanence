@@ -23,7 +23,7 @@ use remanence_api::{
     PoolWriteResult, TapeIdentityError, TapeUuid, WriteObjectToPoolRequest,
 };
 use remanence_format::{
-    read_encrypted_rao_object_with_manifest_anchor, RemTarReadObject, MANIFEST_PATH,
+    read_encrypted_rem_object_with_manifest_anchor, RemTarReadObject, MANIFEST_PATH,
 };
 use remanence_library::{
     BlockSize, BlockSource, DriveHandleSink, DriveHandleSource, SpaceKind, StaticAllowlist,
@@ -53,7 +53,7 @@ pub struct ArchiveWriteArgs {
     pub archive_path: Option<PathBuf>,
     /// Opaque caller/orchestrator object id (optional; default: new UUID).
     pub caller_object_id: Option<String>,
-    /// Canonical RAOR recipient public-key files.
+    /// Canonical REMR recipient public-key files.
     pub recipients: Vec<PathBuf>,
     /// Emit locator JSON to stdout instead of human-readable form.
     pub json_output: bool,
@@ -400,7 +400,7 @@ fn print_locator_json_with_recipients(
     let object_id = Uuid::from_bytes(object.object_id).to_string();
     let content_sha256_hex = bytes_to_hex(&object.content_sha256);
     let encryption = if copy.representation == OBJECT_COPY_REPRESENTATION_ENCRYPTED {
-        "RAO1"
+        "REMO"
     } else {
         "none"
     };
@@ -415,7 +415,7 @@ fn print_locator_json_with_recipients(
         "caller_object_id": object.caller_object_id,
         "content_sha256": content_sha256_hex,
         "pool_id": pool_id,
-        "body_format": "rao-v1",
+        "body_format": "rem-object-v1",
         "representation": copy.representation.as_str(),
         "encryption": encryption,
         "format_version": (copy.representation == OBJECT_COPY_REPRESENTATION_ENCRYPTED)
@@ -457,7 +457,7 @@ fn print_locator_human(object: &PoolWriteObjectRecord, pool_id: &str, out: &mut 
     let object_id = Uuid::from_bytes(object.object_id).to_string();
     let content_sha256_hex = bytes_to_hex(&object.content_sha256);
     let encryption = if copy.representation == OBJECT_COPY_REPRESENTATION_ENCRYPTED {
-        "RAO1"
+        "REMO"
     } else {
         "none"
     };
@@ -476,7 +476,7 @@ fn print_locator_human(object: &PoolWriteObjectRecord, pool_id: &str, out: &mut 
     let _ = writeln!(out, "  caller_obj_id:  {}", object.caller_object_id);
     let _ = writeln!(out, "  content_sha256: {content_sha256_hex}");
     let _ = writeln!(out, "  logical_bytes:  {}", object.logical_size_bytes);
-    let _ = writeln!(out, "  body_format:    rao-v1");
+    let _ = writeln!(out, "  body_format:    rem-object-v1");
     let _ = writeln!(out, "  representation: {}", copy.representation);
     let _ = writeln!(out, "  encryption:     {encryption}");
     if let Some(recipient_epoch_ids) = &copy.recipient_epoch_ids {
@@ -537,7 +537,7 @@ pub struct ArchiveReadArgs {
     pub locator: String,
     /// Destination path for the restored payload bytes.
     pub out: PathBuf,
-    /// Canonical RAOP private-key file for encrypted object copies.
+    /// Canonical REMP private-key file for encrypted object copies.
     pub private_key: Option<PathBuf>,
     /// Path to config file.
     pub config: PathBuf,
@@ -563,7 +563,7 @@ pub struct ArchiveVerifyArgs {
     pub locator: String,
     /// Expected payload SHA-256, hex (the catalog's recorded asset hash).
     pub expected_sha256: String,
-    /// Canonical RAOP private-key file for encrypted object copies.
+    /// Canonical REMP private-key file for encrypted object copies.
     pub private_key: Option<PathBuf>,
     /// Path to config file.
     pub config: PathBuf,
@@ -940,7 +940,7 @@ fn stream_tape_object<W: Write + Send>(
                     let _ = writeln!(err, "error: space to object tape file: {error}");
                     return Err(ExitCode::from(1));
                 }
-                read_encrypted_rao_object_with_manifest_anchor(
+                read_encrypted_rem_object_with_manifest_anchor(
                     &mut source,
                     mounted.plan.block_size_bytes as usize,
                     mounted.plan.block_count,
@@ -949,7 +949,7 @@ fn stream_tape_object<W: Write + Send>(
                 )
             }
             .map_err(|error| {
-                let _ = writeln!(err, "error: open encrypted RAO: {error}");
+                let _ = writeln!(err, "error: open encrypted REM-OBJECT: {error}");
                 ExitCode::from(1)
             })?;
             let opened_recipient_epoch_ids = opened
@@ -962,14 +962,14 @@ fn stream_tape_object<W: Write + Send>(
             if Some(opened_recipient_epoch_ids) != mounted.plan.recipient_epoch_ids {
                 let _ = writeln!(
                     err,
-                    "error: encrypted RAO recipient epochs differ from catalog"
+                    "error: encrypted REM-OBJECT recipient epochs differ from catalog"
                 );
                 return Err(ExitCode::from(1));
             }
             if Some(opened.envelope.header.metadata_frame_len) != mounted.plan.metadata_frame_len {
                 let _ = writeln!(
                     err,
-                    "error: encrypted RAO metadata_frame_len differs from catalog"
+                    "error: encrypted REM-OBJECT metadata_frame_len differs from catalog"
                 );
                 return Err(ExitCode::from(1));
             }
@@ -1516,7 +1516,7 @@ mod tests {
             "caller_object_id":"c-1",
             "content_sha256":"0000000000000000000000000000000000000000000000000000000000000000",
             "pool_id":"scenario-a",
-            "body_format":"rao-v1"
+            "body_format":"rem-object-v1"
         }"#;
         let loc = super::decode_locator(raw).expect("decode");
         assert_eq!(
@@ -1776,7 +1776,7 @@ mod tests {
             caller_object_id: "caller-123".to_string(),
             content_sha256: sha256,
             logical_size_bytes: 12345,
-            body_format: "rao-v1".to_string(),
+            body_format: "rem-object-v1".to_string(),
             created_at_utc: "2026-05-29T00:00:00Z".to_string(),
             copies: vec![PoolWriteObjectCopyRecord {
                 tape_uuid: tape_uuid_bytes,
@@ -1826,7 +1826,7 @@ mod tests {
         assert_eq!(parsed["tape_file_number"].as_u64().unwrap(), 1);
         assert_eq!(parsed["first_body_lba"].as_u64().unwrap(), 2);
         assert_eq!(parsed["pool_id"].as_str().unwrap(), "scenario-a");
-        assert_eq!(parsed["body_format"].as_str().unwrap(), "rao-v1");
+        assert_eq!(parsed["body_format"].as_str().unwrap(), "rem-object-v1");
         assert_eq!(parsed["representation"].as_str().unwrap(), "plaintext");
         assert_eq!(parsed["encryption"].as_str().unwrap(), "none");
         assert!(parsed["format_version"].is_null());

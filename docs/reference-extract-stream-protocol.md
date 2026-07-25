@@ -1,6 +1,6 @@
 # `rem archive extract-stream` protocol
 
-Status: current, RAO encrypted format version 2 only (RM0.3a whole-object
+Status: current, REM-ENCRYPT format version 1 only (RM0.3a whole-object
 mode; RM3.3 ranged-ciphertext mode)
 
 ## Invocation
@@ -12,20 +12,20 @@ rem archive extract-stream --private-key PATH --range START:LEN \
   --authenticated-prefix PATH --stored-range-start BYTE
 ```
 
-`PATH` is a canonical RAOP recipient private-key file, using the same contract
-as encrypted `rem archive extract`. The RAOP record carries its recipient
+`PATH` is a canonical REMP recipient private-key file, using the same contract
+as encrypted `rem archive extract`. The REMP record carries its recipient
 epoch id and label; opening selects the key-frame slot with that epoch id and
 fails closed when the object has no match. There is no registry-key fallback
 or alternate key source.
 
 ## Whole-object streams
 
-- **stdin:** exactly one complete encrypted RAO1 stored-object byte string,
+- **stdin:** exactly one complete encrypted REMO stored-object byte string,
   from its 128-byte scalar header through the recipient key frame,
   authenticated metadata/payload, completion footer, and zero fill. Trailing
   bytes are an error. Input is consumed sequentially; the helper does not seek.
 - **stdout:** decrypted canonical plaintext bytes only. Without `--range`,
-  this is the complete plaintext RAO object. With `--range`, this is the
+  this is the complete plaintext REM-OBJECT object. With `--range`, this is the
   absolute plaintext interval `[START, START + LEN)`. The helper still
   consumes and validates the entire encrypted object. No JSON, progress, or
   diagnostics are written to stdout.
@@ -50,7 +50,7 @@ exits successfully.
 - `0`: the complete encrypted object, including final-chunk nonce finality,
   footer, fill, EOF, plaintext size, and plaintext digest, validated; stdout
   flushed; the success JSON line was written to stderr.
-- `1`: private-key, epoch-selection, RAO validation/authentication,
+- `1`: private-key, epoch-selection, REM-OBJECT validation/authentication,
   truncation, range, stdin-read, or stdout-write/flush failure. Any stdout is
   only the already-authenticated prefix or selected bytes described above and
   must not be committed.
@@ -60,7 +60,7 @@ exits successfully.
 
 The helper passes stdin and stdout through the `remanence-format` envelope
 funnel, which delegates to `remanence_aead::open`. The opener reads one stored
-payload chunk, authenticates it with the RAO STREAM nonce/finality logic, then
+payload chunk, authenticates it with the REM-OBJECT STREAM nonce/finality logic, then
 writes the corresponding plaintext chunk. A blocking stdout write therefore
 backpressures further stdin reads. Memory is bounded by the key frame, AEAD
 metadata frame, and a small constant number of chunk-sized buffers; it does
@@ -72,7 +72,7 @@ RM0.3b must feed. Tar member selection by path is not part of RM0.3a.
 
 ## RM3.3 covering-range query
 
-`archive covering-range` reads exactly the RAO scalar header, required key
+`archive covering-range` reads exactly the REM-OBJECT scalar header, required key
 frame, and metadata frame from stdin. It selects the matching recipient epoch,
 authenticates that prefix with the unwrapped DEK, and emits one JSON line on
 stdout. The storage `object_id` and caller's `file_id` are opaque and echoed

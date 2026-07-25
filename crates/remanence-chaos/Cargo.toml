@@ -1,6 +1,6 @@
 [package]
 name        = "remanence-chaos"
-description = "Phase B QuadStor chaos adapter transport for Remanence."
+description = "Phase B Quadstor chaos adapter transport for Remanence."
 version     .workspace = true
 edition     .workspace = true
 rust-version.workspace = true

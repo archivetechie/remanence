@@ -1,12 +1,12 @@
-//! RAO 2.0 AEAD envelope implementation.
+//! REM-ENCRYPT 1.0 AEAD envelope implementation.
 //!
 //! This crate absorbs Amber's useful cryptographic construction into
-//! Remanence as the isolated `remanence-aead` boundary. It implements the RAO
-//! 2.0 hybrid-only encrypted representation: the 128-byte `RAO1` header,
+//! Remanence as the isolated `remanence-aead` boundary. It implements the
+//! REM-ENCRYPT 1.0 hybrid-only encrypted representation: the 128-byte `REMO` header,
 //! X-Wing DEK wrapping, deterministic salt derivation, HKDF key split,
 //! metadata frame, age-style ChaCha20-Poly1305 STREAM payload, footer/fill
-//! validation, and keyless inspection geometry. It intentionally contains no
-//! legacy X25519-only or AOF1 reader and has no dependency on other Remanence
+//! validation, and keyless inspection geometry. It accepts only the X-Wing
+//! profile and has no dependency on other Remanence
 //! crates.
 
 pub mod error;
@@ -22,19 +22,20 @@ pub mod stream;
 pub mod wrap;
 pub mod xwing;
 
-pub use error::{RaoAeadError, Result};
+pub use error::{RemObjectAeadError, Result};
 pub use header::{
-    RaoHeader, RAO_FOOTER, RAO_HEADER_LEN, RAO_MAX_METADATA_FRAME_LEN, RAO_METADATA_FRAME_MIN_LEN,
-    RAO_WRAP_SUITE_XWING,
+    RemObjectHeader, REM_OBJECT_FOOTER, REM_OBJECT_HEADER_LEN, REM_OBJECT_MAX_METADATA_FRAME_LEN,
+    REM_OBJECT_METADATA_FRAME_MIN_LEN, REM_OBJECT_WRAP_SUITE_XWING,
 };
 pub use inspect::{inspect_bytes, InspectReport};
 pub use kdf::{
     derive_keys, derive_salt, DerivedKeys, LABEL_METADATA, LABEL_OBJECT, LABEL_PAYLOAD, LABEL_SALT,
 };
 pub use key_frame::{
-    KeyFrame, RecipientSlot, RAO_KEY_FRAME_MAX_LEN, RAO_KEY_FRAME_MAX_SLOTS, RAO_KEY_FRAME_MIN_LEN,
+    KeyFrame, RecipientSlot, REM_OBJECT_KEY_FRAME_MAX_LEN, REM_OBJECT_KEY_FRAME_MAX_SLOTS,
+    REM_OBJECT_KEY_FRAME_MIN_LEN,
 };
-pub use metadata::RaoMetadata;
+pub use metadata::RemObjectMetadata;
 pub use open::{open, open_to_vec, OpenReport};
 pub use range::{
     covering_stored_range, open_inner_range_to_vec, open_plaintext_range_from_reader,

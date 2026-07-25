@@ -3,7 +3,7 @@
 //! The CLI still owns the hardware orchestration for `rem-debug archive read`
 //! and `verify`, while the daemon session owner owns the mounted drive for
 //! `ReadSessionService`. Both paths use this module to position to a native
-//! object tape file and stream the single RAO payload entry without
+//! object tape file and stream the single REM-OBJECT payload entry without
 //! materializing the object in memory.
 
 use std::collections::VecDeque;
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use remanence_format::{
     model::{BodyLba, MANIFEST_PATH},
-    plan_plaintext_rao_file_range, stream_rem_tar_object_with_manifest_anchor, FormatError,
+    plan_plaintext_rem_object_file_range, stream_rem_tar_object_with_manifest_anchor, FormatError,
     RemTarEntrySink, RemTarStreamEntry,
 };
 #[cfg(test)]
@@ -1274,7 +1274,7 @@ pub(crate) fn read_plaintext_file_range_with_pipeline<W: Write + Send + ?Sized>(
 ) -> Result<(), FormatError> {
     let chunk_size_bytes = u64::try_from(request.block_size)
         .map_err(|_| FormatError::invalid("block size does not fit u64"))?;
-    let plan = plan_plaintext_rao_file_range(
+    let plan = plan_plaintext_rem_object_file_range(
         request.first_chunk_lba,
         request.file_size_bytes,
         chunk_size_bytes,
@@ -1399,7 +1399,7 @@ fn position_plaintext_file_range(
 
 /// Streaming sink that captures the single non-manifest payload entry.
 ///
-/// The RAO object contains a generated manifest plus one payload file for
+/// The REM-OBJECT object contains a generated manifest plus one payload file for
 /// the S5a restore surface. This sink skips the manifest, writes payload bytes
 /// to `out`, and hashes the bytes as they pass through.
 pub struct CapturePayloadSink<W: Write> {

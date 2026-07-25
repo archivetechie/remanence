@@ -16,43 +16,43 @@ remanence-library = { path = "../crates/remanence-library" }
 sha2 = "0.10"
 
 [[bin]]
-name = "rao_envelope_header"
-path = "fuzz_targets/rao_envelope_header.rs"
+name = "rem_object_envelope_header"
+path = "fuzz_targets/rem_object_envelope_header.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "rao_envelope_metadata_cbor"
-path = "fuzz_targets/rao_envelope_metadata_cbor.rs"
+name = "rem_object_envelope_metadata_cbor"
+path = "fuzz_targets/rem_object_envelope_metadata_cbor.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "rao_manifest_cbor"
-path = "fuzz_targets/rao_manifest_cbor.rs"
+name = "rem_object_manifest_cbor"
+path = "fuzz_targets/rem_object_manifest_cbor.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "rao_plaintext_tar_loop"
-path = "fuzz_targets/rao_plaintext_tar_loop.rs"
+name = "rem_object_plaintext_tar_loop"
+path = "fuzz_targets/rem_object_plaintext_tar_loop.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "rao_whole_object_open_verify"
-path = "fuzz_targets/rao_whole_object_open_verify.rs"
+name = "rem_object_whole_object_open_verify"
+path = "fuzz_targets/rem_object_whole_object_open_verify.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "rao_key_frame"
-path = "fuzz_targets/rao_key_frame.rs"
+name = "rem_object_key_frame"
+path = "fuzz_targets/rem_object_key_frame.rs"
 test = false
 doc = false
 bench = false

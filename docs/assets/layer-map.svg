@@ -30,10 +30,10 @@
   <text class="rtg" x="20" y="186">LAYER 3</text>
   <rect class="rs" x="100" y="160" width="150" height="44"/>
   <text class="rt" x="175" y="179" text-anchor="middle">remanence-format</text>
-  <text class="rtd" x="175" y="194" text-anchor="middle">rao-v1 body</text>
+  <text class="rtd" x="175" y="194" text-anchor="middle">rem-object-v1 body</text>
   <rect class="rs" x="258" y="160" width="130" height="44"/>
   <text class="rt" x="323" y="179" text-anchor="middle">remanence-aead</text>
-  <text class="rtd" x="323" y="194" text-anchor="middle">RAO1 envelope</text>
+  <text class="rtd" x="323" y="194" text-anchor="middle">REMO envelope</text>
   <rect class="rs" x="396" y="160" width="170" height="44"/>
   <text class="rt" x="481" y="179" text-anchor="middle">remanence-parity</text>
   <text class="rtd" x="481" y="194" text-anchor="middle">bootstrap · filemarks · RS parity</text>

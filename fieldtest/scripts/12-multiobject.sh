@@ -82,7 +82,7 @@ for idx in range(count):
             remaining -= n
 PY
 
-  local object="$workdir/multi.rao" build_report
+  local object="$workdir/multi.rem-object" build_report
   build_report="$(fieldtest_artifact_path "$SCRIPT_NAME" build "$stamp")"
   mapfile -t inputs < <(find "$workdir/inputs" -maxdepth 1 -type f | sort)
   if ! fieldtest_capture_json "$build_report" "$(fieldtest_rem_bin)" archive build --inputs "${inputs[@]}" --out "$object"; then
@@ -98,7 +98,7 @@ PY
     exit 1
   fi
 
-  local restored="$workdir/restored.rao"
+  local restored="$workdir/restored.rem-object"
   if ! fieldtest_capture_io_json "$workdir/read.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator")" --out "$restored"; then
     fieldtest_evidence_record "$SCRIPT_NAME" read FAIL "multiobject daemon read failed" "$workdir/read.json"
     exit 1

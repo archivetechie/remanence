@@ -1,7 +1,7 @@
 //! Source-map frontend for `rem archive build --map`.
 //!
 //! The source map is a trusted planner's byte-for-byte member contract for a
-//! RAO archive build. This module validates that contract, anchors every source
+//! REM-OBJECT archive build. This module validates that contract, anchors every source
 //! file under a canonical root, and then produces the same regular-file build
 //! inputs used by the existing archive writer.
 

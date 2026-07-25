@@ -1,6 +1,6 @@
 //! Pool-targeted object write core for the Phase 1 non-hardware path.
 //!
-//! This module composes Layer 4 catalog state, Layer 3b `rao-v1`
+//! This module composes Layer 4 catalog state, Layer 3b `rem-object-v1`
 //! streaming, Layer 3c parity, and the existing in-memory-compatible
 //! `BlockSink` adapter. It intentionally contains the tape-selection boundary
 //! so the later policy workstream can replace that one function without
@@ -17,9 +17,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use remanence_aead::{RecipientPublicKey, SealReport, RAO_KEY_FRAME_MAX_LEN};
+use remanence_aead::{RecipientPublicKey, SealReport, REM_OBJECT_KEY_FRAME_MAX_LEN};
 use remanence_format::{
-    write_encrypted_rao_object_from_readers, write_rem_tar_object_from_readers, RemTarFileLayout,
+    write_encrypted_rem_object_from_readers, write_rem_tar_object_from_readers, RemTarFileLayout,
     RemTarFileSpec, RemTarFileStream, RemTarObjectOptions, FORMAT_ID,
 };
 use remanence_library::{
@@ -70,12 +70,12 @@ const OBJECT_ROW_METADATA_FRAME_MAX_LEN: u64 = 16 * 1024 * 1024;
 /// Binary UUID used for physical tape identifiers and object identifiers.
 pub type TapeUuid = [u8; 16];
 
-/// Stored RAO representation requested for a pool write.
+/// Stored REM-OBJECT representation requested for a pool write.
 #[derive(Clone, Debug)]
 pub enum PoolWriteRepresentation {
-    /// Store the canonical plaintext `rao-v1` tar/PAX object.
+    /// Store the canonical plaintext `rem-object-v1` tar/PAX object.
     Plaintext,
-    /// Store the RAO1 encrypted representation.
+    /// Store the REMO encrypted representation.
     Encrypted {
         /// Public recipient epochs to which the per-object DEK is wrapped.
         recipients: Vec<RecipientPublicKey>,
@@ -165,14 +165,14 @@ impl WriteObjectSource {
     }
 }
 
-/// Inputs for writing one regular file as one `rao-v1` object to a pool.
+/// Inputs for writing one regular file as one `rem-object-v1` object to a pool.
 #[derive(Debug)]
 pub struct WriteObjectToPoolRequest {
     /// Pool requested by the caller.
     pub pool_id: String,
     /// Completed path or live bounded-ring consumer.
     pub source: WriteObjectSource,
-    /// UTF-8 relative path to record inside the `rao-v1` object.
+    /// UTF-8 relative path to record inside the `rem-object-v1` object.
     pub archive_path: PathBuf,
     /// Opaque caller/orchestrator object id.
     pub caller_object_id: String,
@@ -191,7 +191,7 @@ pub struct PoolWriteObjectRecord {
     pub caller_object_id: String,
     /// SHA-256 of the source payload bytes.
     pub content_sha256: [u8; 32],
-    /// Logical payload bytes, excluding generated `rao-v1` metadata.
+    /// Logical payload bytes, excluding generated `rem-object-v1` metadata.
     pub logical_size_bytes: u64,
     /// Body format id.
     pub body_format: String,
@@ -270,13 +270,13 @@ pub struct PoolWriteObjectCopyRecord {
     pub first_body_lba: u64,
     /// Pool requested and snapshotted for the write.
     pub pool_id: String,
-    /// Stored RAO representation: `plaintext` or `encrypted`.
+    /// Stored REM-OBJECT representation: `plaintext` or `encrypted`.
     pub representation: String,
     /// Lowercase 32-hex recipient epoch ids for encrypted copies.
     pub recipient_epoch_ids: Option<Vec<String>>,
-    /// Encrypted RAO metadata frame length.
+    /// Encrypted REM-OBJECT metadata frame length.
     pub metadata_frame_len: Option<u64>,
-    /// SHA-256 of the canonical plaintext RAO object bytes.
+    /// SHA-256 of the canonical plaintext REM-OBJECT object bytes.
     pub plaintext_digest: Option<[u8; 32]>,
     /// SHA-256 of the stored representation bytes.
     pub stored_digest: Option<[u8; 32]>,
@@ -4425,8 +4425,8 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
                         remanence_state::CheckpointBootstrapObjectRepresentation::Encrypted {
                             recipient_epoch_ids: (1u8..=8).map(|byte| [byte; 16]).collect(),
                             metadata_frame_len: OBJECT_ROW_METADATA_FRAME_MAX_LEN,
-                            key_frame_len: u32::try_from(RAO_KEY_FRAME_MAX_LEN)
-                                .expect("RAO key-frame maximum fits u32"),
+                            key_frame_len: u32::try_from(REM_OBJECT_KEY_FRAME_MAX_LEN)
+                                .expect("REM-OBJECT key-frame maximum fits u32"),
                         },
                 });
             }
@@ -5207,7 +5207,7 @@ fn planned_checkpoint_bootstrap_row(
                 .first_chunk_lba
                 .ok_or_else(|| {
                     PoolWriteError::InvalidInput(
-                        "planned no-parity RAO manifest has no body LBA".to_string(),
+                        "planned no-parity REM-OBJECT manifest has no body LBA".to_string(),
                     )
                 })?
                 .0;
@@ -5515,7 +5515,7 @@ fn seal_prepared_object(
     for (file, reader) in prepared.files.iter().zip(readers.iter_mut()) {
         streams.push(RemTarFileStream::new(file.spec.clone(), reader));
     }
-    let report = write_encrypted_rao_object_from_readers(
+    let report = write_encrypted_rem_object_from_readers(
         &mut encrypted_sink,
         &prepared.options,
         &mut streams,
@@ -5530,12 +5530,13 @@ fn seal_prepared_object(
     }
     let envelope = report.envelope;
     let sealed = flatten_blocks(encrypted_sink.blocks, prepared.options.chunk_size)?;
-    let block_count = u64::try_from(sealed.len() / prepared.options.chunk_size)
-        .map_err(|_| PoolWriteError::InvalidInput("sealed RAO block count overflow".to_string()))?;
+    let block_count = u64::try_from(sealed.len() / prepared.options.chunk_size).map_err(|_| {
+        PoolWriteError::InvalidInput("sealed REM-OBJECT block count overflow".to_string())
+    })?;
     if sealed.len() % prepared.options.chunk_size != 0 || block_count != envelope.stored_size_blocks
     {
         return Err(PoolWriteError::InvalidInput(
-            "sealed RAO bytes do not match envelope block count".to_string(),
+            "sealed REM-OBJECT bytes do not match envelope block count".to_string(),
         ));
     }
     Ok(PreparedEncryptedPoolObject {
@@ -5554,7 +5555,7 @@ fn flatten_blocks(blocks: Vec<Vec<u8>>, block_size: usize) -> Result<Vec<u8>, Po
     for block in blocks {
         if block.len() != block_size {
             return Err(PoolWriteError::InvalidInput(format!(
-                "RAO block length {} does not match chunk size {block_size}",
+                "REM-OBJECT block length {} does not match chunk size {block_size}",
                 block.len()
             )));
         }
@@ -5579,7 +5580,7 @@ fn write_fixed_blocks(
 ) -> Result<u64, PoolWriteError> {
     if bytes.len() % block_size != 0 {
         return Err(PoolWriteError::InvalidInput(
-            "stored RAO bytes are not block aligned".to_string(),
+            "stored REM-OBJECT bytes are not block aligned".to_string(),
         ));
     }
     let mut blocks = 0u64;
@@ -5766,7 +5767,7 @@ fn no_parity_write_report(
                     .first_chunk_lba
                     .ok_or_else(|| {
                         PoolWriteError::InvalidInput(
-                            "generated no-parity RAO manifest has no body LBA".to_string(),
+                            "generated no-parity REM-OBJECT manifest has no body LBA".to_string(),
                         )
                     })?
                     .0,
@@ -5872,7 +5873,7 @@ fn write_encrypted_object_to_parity(
             encrypted.envelope.stored_size_blocks,
             current_epoch_fill_blocks,
         ),
-        BootstrapObjectRowAdmission::EncryptedRao,
+        BootstrapObjectRowAdmission::EncryptedRemObject,
     )?;
     let blocks_written = write_fixed_blocks(
         parity,
@@ -5881,7 +5882,7 @@ fn write_encrypted_object_to_parity(
     )?;
     if blocks_written != encrypted.envelope.stored_size_blocks {
         return Err(PoolWriteError::InvalidInput(
-            "encrypted RAO write count differs from envelope".to_string(),
+            "encrypted REM-OBJECT write count differs from envelope".to_string(),
         ));
     }
     parity.record_bootstrap_object_row(

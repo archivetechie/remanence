@@ -1,6 +1,6 @@
 //! Operator-path smoke test for the supported load -> drive-pinned verify
 //! composition. The ignored test is intentionally strict when selected: all
-//! required QuadStor/daemon coordinates must be supplied, and failures panic.
+//! required Quadstor/daemon coordinates must be supplied, and failures panic.
 
 use std::process::Command;
 
@@ -9,7 +9,7 @@ fn required(name: &str) -> String {
 }
 
 #[test]
-#[ignore = "requires a configured rem-daemon and safe QuadStor VTL cartridge"]
+#[ignore = "requires a configured rem-daemon and safe Quadstor VTL cartridge"]
 fn rem_load_then_drive_pinned_verify_roundtrips() {
     let endpoint = required("REM_QUADSTOR_CROSS_DRIVE_ENDPOINT");
     let library = required("REM_QUADSTOR_CROSS_DRIVE_LIBRARY");

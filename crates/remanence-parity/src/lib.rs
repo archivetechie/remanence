@@ -209,7 +209,7 @@ pub const DEFAULT_SCHEME_BLOCK_SIZE_BYTES: u32 = 256 * 1024;
 /// Default parity scheme for a known tape block size.
 ///
 /// Layer 3c v0.4.4 makes `S` block-size-aware so the contiguous-loss
-/// tolerance `S * m * block_size` stays near 512 MiB. At rao-v1's
+/// tolerance `S * m * block_size` stays near 512 MiB. At rem-object-v1's
 /// 256 KiB default this yields RS(128, 4), `S = 512`; at 1 MiB it yields
 /// `S = 128`, matching the legacy geometry.
 pub fn default_scheme_for_block_size(block_size_bytes: u32) -> ParityScheme {
@@ -234,7 +234,7 @@ pub fn conservative_scheme_for_block_size(block_size_bytes: u32) -> ParityScheme
     }
 }
 
-/// Default parity scheme for new rao-v1 tapes.
+/// Default parity scheme for new rem-object-v1 tapes.
 ///
 /// Compatibility helper for callers that do not yet pass block size through
 /// the configuration path. Uses [`DEFAULT_SCHEME_BLOCK_SIZE_BYTES`]; callers
@@ -243,7 +243,7 @@ pub fn default_scheme() -> ParityScheme {
     default_scheme_for_block_size(DEFAULT_SCHEME_BLOCK_SIZE_BYTES)
 }
 
-/// Conservative parity scheme for new rao-v1 tapes.
+/// Conservative parity scheme for new rem-object-v1 tapes.
 ///
 /// Compatibility helper for callers that do not yet pass block size through
 /// the configuration path. Uses [`DEFAULT_SCHEME_BLOCK_SIZE_BYTES`]; callers

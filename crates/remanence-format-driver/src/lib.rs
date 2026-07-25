@@ -1,6 +1,6 @@
 //! Generic format-driver traits for native and foreign archive formats.
 //!
-//! `rao-v1` has concrete reader/writer functions in `remanence-format`. These
+//! `rem-object-v1` has concrete reader/writer functions in `remanence-format`. These
 //! traits describe the wider registry boundary: Remanence registers executable
 //! format drivers, not just declarative field schemas. Native formats consume
 //! object-local block streams, while foreign legacy formats may need physical
@@ -11,7 +11,7 @@ use std::io::Read;
 use remanence_library::{BlockSink, BlockSource, PhysicalTapeSource, TapeIoError};
 use thiserror::Error;
 
-/// RAO gate whose failure can be named across nested plaintext/envelope checks.
+/// REM-OBJECT gate whose failure can be named across nested plaintext/envelope checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormatGate {
     /// The `REMANENCE.format_id` value is missing or unsupported.
@@ -30,15 +30,15 @@ pub enum FormatGate {
 #[derive(Debug, Error)]
 pub enum FormatError {
     /// The caller supplied invalid object or file metadata.
-    #[error("invalid RAO input: {0}")]
+    #[error("invalid REM-OBJECT input: {0}")]
     InvalidInput(String),
 
     /// Layout math overflowed or could not satisfy a required invariant.
-    #[error("RAO layout error: {0}")]
+    #[error("REM-OBJECT layout error: {0}")]
     Layout(String),
 
     /// The object archive is malformed or unsupported.
-    #[error("RAO parse error: {0}")]
+    #[error("REM-OBJECT parse error: {0}")]
     Parse(String),
 
     /// A tar header checksum does not match the stored checksum.
@@ -57,7 +57,7 @@ pub enum FormatError {
         typeflag: u8,
     },
 
-    /// A regular-file payload did not start on a RAO chunk boundary.
+    /// A regular-file payload did not start on a REM-OBJECT chunk boundary.
     #[error("file data for {path} is not chunk aligned at offset {data_offset}")]
     ChunkAlignmentViolation {
         /// Entry path after applying pax path overrides.
@@ -76,7 +76,7 @@ pub enum FormatError {
     },
 
     /// A reader-side effective path violates the canonical relative-path rules.
-    #[error("invalid RAO path: {0}")]
+    #[error("invalid REM-OBJECT path: {0}")]
     InvalidPath(String),
 
     /// A hardlink target is absent, not a regular primary, or appears later.
@@ -104,7 +104,7 @@ pub enum FormatError {
     #[error("manifest digest does not match anchor")]
     ManifestDigestMismatch,
 
-    /// The manifest decoded but violates the RAO manifest schema.
+    /// The manifest decoded but violates the REM-OBJECT manifest schema.
     #[error("manifest schema invalid: {0}")]
     ManifestInvalid(String),
 
@@ -119,8 +119,8 @@ pub enum FormatError {
         actual: String,
     },
 
-    /// A decrypted inner RAO stream disagrees with the authenticated envelope.
-    #[error("inner RAO object mismatch at {gate:?}: {message}")]
+    /// A decrypted inner REM-OBJECT stream disagrees with the authenticated envelope.
+    #[error("inner REM-OBJECT object mismatch at {gate:?}: {message}")]
     InnerObjectMismatch {
         /// Structured gate that failed.
         gate: FormatGate,
@@ -128,9 +128,9 @@ pub enum FormatError {
         message: String,
     },
 
-    /// The RAO encrypted envelope failed to seal, open, or inspect.
-    #[error("RAO AEAD envelope failed: {0}")]
-    Aead(#[from] remanence_aead::RaoAeadError),
+    /// The REM-OBJECT encrypted envelope failed to seal, open, or inspect.
+    #[error("REM-OBJECT AEAD envelope failed: {0}")]
+    Aead(#[from] remanence_aead::RemObjectAeadError),
 
     /// The requested operation is not supported by this format driver.
     #[error("unsupported format operation: {0}")]
@@ -140,7 +140,7 @@ pub enum FormatError {
     #[error("unsupported format feature: {0}")]
     UnsupportedFeature(String),
 
-    /// The archive failed a named RAO format gate.
+    /// The archive failed a named REM-OBJECT format gate.
     #[error("unsupported format feature: {message}")]
     UnsupportedFormatGate {
         /// Structured gate that failed.
@@ -322,7 +322,7 @@ pub struct FormatCapabilities {
 }
 
 impl FormatCapabilities {
-    /// Capabilities currently implemented by the native `rao-v1`
+    /// Capabilities currently implemented by the native `rem-object-v1`
     /// code paths. Keep this honest: indexed/range restore and
     /// driver-level verify need a concrete `NativeBodyFormat` adapter
     /// before they can be advertised here.

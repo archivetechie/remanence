@@ -80,9 +80,9 @@ main() {
   stamp="$(fieldtest_timestamp_id)"
   workdir="$(mktemp -d "$(fieldtest_spool_dir)/bench-read-${stamp}.XXXXXX")"
   source="$workdir/read-source.bin"
-  object="$workdir/read-object.rao"
+  object="$workdir/read-object.rem-object"
   locator="$workdir/locator.json"
-  restored="$workdir/restored.rao"
+  restored="$workdir/restored.rem-object"
   make_payload "$source" "$size_bytes"
   if ! fieldtest_capture_json "$workdir/build.json" "$(fieldtest_rem_bin)" archive build --inputs "$source" --out "$object"; then
     fieldtest_evidence_record "$SCRIPT_NAME" build FAIL "archive build failed for read benchmark" "$workdir/build.json"
