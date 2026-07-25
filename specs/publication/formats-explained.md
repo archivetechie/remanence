@@ -1,10 +1,10 @@
 # The Remanence Formats, Explained
 
-*A companion to the REM-OBJECT Format Specification and the REM-PARITY Tape Format
-Specification. This document is informative: it explains what the formats do
-and why they are shaped the way they are, in plain language. The
-specifications remain the only normative documents — where this text and a
-specification disagree, the specification wins.*
+*A companion to REM-OBJECT Core Format 1.0, REM-ENCRYPT 1.0, and the
+REM-PARITY Tape Format Specification. This document is informative: it
+explains what the formats do and why they are shaped the way they are, in
+plain language. The specifications remain the only normative documents—where
+this text and a specification disagree, the specification wins.*
 
 ---
 
@@ -178,6 +178,16 @@ one can prove rather than something one must hope.
 A REM-OBJECT bundles a set of files — typically
 the contents of one camera card or one submission — into a single unit.
 
+**Three names describe three jobs.** REM-OBJECT Core defines the durable
+archive itself: the tar framing, manifest, file identities, block addresses,
+and the frozen stream identifier `rem-object-v1`. REM-ENCRYPT defines the
+optional confidential wrapper around those exact bytes; its leading magic is
+`REMO`. REM-PARITY defines how stored object bytes are laid out and repaired
+on tape. All three documents are versioned independently. Their 1.0 document
+versions do not rename a wire value: in particular, REM-ENCRYPT keeps the
+frozen on-tape `format_version = 2`, while value 1 remains forbidden. Both
+plaintext and encrypted files conventionally use `.rem-object`.
+
 **Bundling exists for a practical reason: tape performs well only when it
 streams.** A tape drive is very good at one thing, which is writing large
 amounts of data in one continuous motion. Ask it instead to handle a
@@ -238,6 +248,11 @@ burned. It is a curious feature of the situation that the lock, meant as
 a protection, is the one part of the system capable of destroying
 everything it protects. For that reason the encrypted representation is
 designed around key custody first and cryptography second.
+
+The separation is editorially deliberate too. The long-lived archive
+structure belongs to REM-OBJECT Core; the cryptographic construction belongs
+to REM-ENCRYPT, so changing cryptographic guidance does not force a change to
+the durable object format.
 
 **The envelope.** An encrypted object is the identical plaintext stream —
 manifest and all — sealed inside an authenticated envelope. Nothing about
@@ -389,8 +404,10 @@ rather than aspirational:
 - **Pinned test vectors.** A published archive of test inputs and
   expected outputs, byte-exact, covering the container, the manifest, the
   envelope, partial-range reads, and dozens of malformed-input cases with
-  their required error classifications. The archive's SHA-256 is printed
-  in the specifications, and its regeneration is deterministic.
+  their required error classifications. The archive is
+  `remanence-test-vectors.tar`, SHA-256
+  `b9be8760fd4a85a922e5fa8eaf86840eec0719a5407030b9f6a35f0606ea79bd`,
+  and its regeneration is deterministic.
 - **An independent second implementation.** The vector archive is
   verified by a from-scratch Python program that shares no code with the
   reference implementation. It re-derives the cryptography from the
@@ -435,9 +452,12 @@ is precisely the point.
 
 ## 11. Where to go from here
 
-- **The REM-OBJECT Format Specification** — the normative definition of the
-  archive object: container, manifest, encryption envelope, range
-  addressing, test vectors, conformance.
+- **REM-OBJECT Core Format 1.0** — the normative definition of the durable
+  archive object: container, manifest, identities, range addressing,
+  plaintext vectors, and general conformance.
+- **REM-ENCRYPT 1.0** — the normative definition of the encrypted
+  representation: envelope, key recovery, encrypted range reads, envelope
+  vectors, and cryptographic security rules.
 - **The REM-PARITY Tape Format Specification** — the normative definition
   of the on-tape layout: bootstrap, parity, recovery procedures.
 - **The reference implementation** — the Remanence project, an open Rust

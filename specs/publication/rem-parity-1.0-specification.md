@@ -140,7 +140,7 @@ from parity — all without reading a single byte of object content.
 
 ### 1.3. Relationship to Adjacent Components
 
-- **Object formats above** (e.g. [RAO]) define the bytes inside object tape
+- **Object formats above** (e.g. [REMOBJECT]) define the bytes inside object tape
   files; this format treats them as opaque fixed blocks (Section 4).
 - **The tape I/O layer below** provides fixed-block reads and writes,
   filemarks, positioning, and boundary classification; Section 3.5 states
@@ -239,7 +239,7 @@ read from tape MUST be checked; overflow is rejection, never wraparound
 | Constant | Value |
 | --- | --- |
 | `BOOTSTRAP_MAGIC` | `52 45 4D 00 42 4F 4F 01` (`"REM\0BOO\x01"`, fixed bytes) |
-| `BOOTSTRAP_SCHEMA_MAJOR` / `MINOR` | 1 / 2 (minor 2 added RAO object rows, key 30; Section 8.2.1) |
+| `BOOTSTRAP_SCHEMA_MAJOR` / `MINOR` | 1 / 2 (minor 2 added REM-OBJECT object rows, key 30; Section 8.2.1) |
 | `BOOTSTRAP_HEADER_LEN` | 0x34 |
 | `FLAG_NO_PARITY` | bit 0 of the bootstrap flags |
 | `MAX_BOOTSTRAP_SCAN_BLOCKS` | 1024 |
@@ -450,13 +450,13 @@ A payload format carried as REM-PARITY objects:
 
 ### 4.4. Payload Format Bindings (Informative)
 
-**Rem Archive Objects [RAO].** An RAO object meets the contract by
+**REM-OBJECT [REMOBJECT].** A REM-OBJECT meets the contract by
 construction: its stored bytes are an exact positive multiple of the
 object's `chunk_size` in both representations (plaintext and encrypted);
-with the tape block size equal to `chunk_size`, one RAO body block is one
+with the tape block size equal to `chunk_size`, one REM-OBJECT body block is one
 tape block. Parity is computed over stored bytes — ciphertext when
 the object is encrypted — so damaged encrypted objects are repaired keyless
-and decryption is retried on the recovered bytes.
+and opening under [REMENCRYPT] is retried on the recovered bytes.
 
 **Plain tar.** A POSIX tar archive zero-padded to a block multiple meets the
 contract: it is self-framing (tar end-of-archive records), self-describing,
@@ -782,7 +782,7 @@ A single integer-keyed map (Section 5.3):
 | 5 | bool | REQUIRED (a Writer MUST write it); readers MUST treat absence as false | `drive_compression` — effective hardware compression at session open. `true` on a parity bootstrap MUST be rejected (Sections 8.4, 11.4) |
 | 20 | map | OPTIONAL | inline sidecar epoch directory (Section 10.5) |
 | 21 | map | OPTIONAL | `ParityMapReference` (Section 10.6) |
-| 30 | array of maps | OPTIONAL | RAO object rows (Section 8.2.1) |
+| 30 | array of maps | OPTIONAL | REM-OBJECT object rows (Section 8.2.1) |
 
 Keys 20 and 21 are mutually exclusive; both present is a parse error. A
 **no-parity bootstrap** (flag bit 0 set) marks a tape written without parity
@@ -792,7 +792,7 @@ scheme record's `scheme_id` MUST be `rs-cauchy-gf256-v1` and `(k, m, S)`
 MUST satisfy Section 6.6 validity. Unknown keys are ignored at every level
 (Section 5.3). Writers SHOULD populate keys 3 and 4; absence is conformant.
 
-### 8.2.1. RAO Object Rows
+### 8.2.1. REM-OBJECT Object Rows
 
 Key 30, when present, is an array of integer-keyed object row maps in
 strictly increasing `tape_file_number` order:
@@ -802,23 +802,23 @@ strictly increasing `tape_file_number` order:
 | 1 | uint | REQUIRED | filemark-delimited object `tape_file_number` |
 | 2 | tstr | REQUIRED | representation marker: `"plaintext"` or `"encrypted"` |
 | 3 | uint | REQUIRED | stored block count for the object tape file |
-| 4 | bytes, 1–64 | REQUIRED from minor 3 | RAO `object_id` — the identity the archive answers "where is object X" with — carried verbatim as its 1–64 non-NUL bytes (any RAO envelope NUL padding of [RAO] §5.2 stripped). This matches [RAO] `object_id` exactly (opaque UTF-8, 1–64 bytes; capped in [RAO] §4.5.1) with no conversion. Readers of minors ≤ 2 tolerate its absence; a Writer at minor 3 or later MUST emit it. |
+| 4 | bytes, 1–64 | REQUIRED from minor 3 | REM-OBJECT `object_id` — the identity the archive answers "where is object X" with — carried verbatim as its 1–64 non-NUL bytes (any REM-ENCRYPT envelope NUL padding from [REMENCRYPT] §5.2 stripped). This matches [REMOBJECT] §4.5.1 exactly: opaque UTF-8, 1–64 bytes, with no conversion. Readers of minors ≤ 2 tolerate its absence; a Writer at minor 3 or later MUST emit it. |
 | 10 | uint | plaintext only | `manifest_first_chunk_lba` |
 | 11 | uint | plaintext only | `manifest_size_bytes` |
 | 12 | uint | plaintext only | `manifest_chunk_count` |
 | 13 | bytes .size 32 | plaintext only | `manifest_sha256` |
-| 21 | uint | encrypted only | RAO encrypted-header `metadata_frame_len`; bounds `[17, 16 MiB]` |
-| 22 | array of bytes .size 16 | encrypted only | RAO key-frame `recipient_epoch_id` values; 1 through 8 distinct nonzero ids |
-| 23 | uint | encrypted only | RAO encrypted-header `key_frame_len`; bounds `[1191, 16384]` |
+| 21 | uint | encrypted only | REM-ENCRYPT header `metadata_frame_len`; bounds `[17, 16 MiB]` |
+| 22 | array of bytes .size 16 | encrypted only | REM-ENCRYPT key-frame `recipient_epoch_id` values; 1 through 8 distinct nonzero ids |
+| 23 | uint | encrypted only | REM-ENCRYPT header `key_frame_len`; bounds `[1191, 16384]` |
 
 Key 10 (`manifest_first_chunk_lba`) is the zero-based block index, *within
 the object's tape file*, of the first block of the manifest entry's payload —
-an RAO inner `BodyLba`, not a Section 3.2 physical LBA; one RAO body block is
+a REM-OBJECT inner `BodyLba`, not a Section 3.2 physical LBA; one REM-OBJECT body block is
 one tape block (Section 4.4). Key 11 is the manifest's payload byte length,
 key 12 its block count, and key 13 the SHA-256 of its CBOR bytes. Key 21 is the
-RAO encrypted-envelope header's `metadata_frame_len`; key 22 records the
+REM-ENCRYPT header's `metadata_frame_len`; key 22 records the
 recipient epoch ids present in its key frame; key 23 is the header's
-`key_frame_len`. Their semantics and bounds are defined by [RAO], which is a
+`key_frame_len`. Their semantics and bounds are defined by [REMENCRYPT], which is a
 normative reference for implementations of key 30.
 
 Plaintext rows MUST carry keys 10–13 and MUST NOT carry keys 21–23.
@@ -831,7 +831,7 @@ MUST match the structural filemark-map row for key 1.
 
 The row set is prefix-scoped exactly like the bootstrap digest. A checkpoint
 bootstrap that carries key 30 MUST include one row for every object tape file
-in that checkpoint's digest scope, and — for a Writer that implements RAO
+in that checkpoint's digest scope, and — for a Writer that implements REM-OBJECT
 object rows — the final bootstrap MUST include one
 row for every committed object tape file in the final digest scope. A resumed
 Writer MUST preserve rows for the committed prefix and append rows for new
@@ -839,7 +839,7 @@ objects; it MUST NOT emit a later authoritative bootstrap that silently drops
 previously committed object rows.
 
 Version 1.0 defines no external overflow carrier for key-30 rows. Therefore a
-Writer that implements RAO object rows MUST perform admission control before
+Writer that implements REM-OBJECT object rows MUST perform admission control before
 starting a new object and MUST reject the write if the resulting mandatory
 row set could not fit in every subsequent bootstrap payload that must carry
 it. The rejection happens before object bytes are written; failing only at
@@ -1848,21 +1848,21 @@ object's block count, the write timeline (bootstrap timestamps and
 sequences), and per-block CRC-64 values of stored bytes. An unkeyed CRC of
 a stored block can confirm a guessed block's content; deployments for which
 payload confidentiality matters SHOULD store objects in an encrypted
-representation (for example, [RAO] encrypted objects), making every stored
+representation (for example, [REMENCRYPT] envelopes), making every stored
 block — and therefore every CRC and parity computation — a function of
 ciphertext.
 
 Bootstrap key 30 (Section 8.2.1) is the designated bounded surface for
-payload-binding object rows. A plaintext RAO row exposes manifest location,
+payload-binding object rows. A plaintext REM-OBJECT row exposes manifest location,
 manifest size, manifest chunk count, and manifest digest; this is acceptable
-because plaintext RAO objects are not confidential against a tape reader.
-An encrypted RAO row exposes only recipient epoch ids, `metadata_frame_len`,
-and `key_frame_len`, all already plaintext in the RAO encrypted envelope
+because plaintext REM-OBJECT objects are not confidential against a tape reader.
+An encrypted REM-OBJECT row exposes only recipient epoch ids, `metadata_frame_len`,
+and `key_frame_len`, all already plaintext in the REM-ENCRYPT envelope
 stored in the same tape file. The encrypted row MUST NOT carry plaintext
 manifest anchors
 (`manifest_first_chunk_lba`, `manifest_size_bytes`, `manifest_chunk_count`,
 or `manifest_sha256`), because those values describe confidential inner
-content and would add leakage beyond the RAO envelope.
+content and would add leakage beyond the REM-ENCRYPT envelope.
 
 ## 17. Test Vectors
 
@@ -1874,7 +1874,7 @@ practical to pin; at least one header-level vector MUST use the default
 geometry parameters. Negative vectors contain exactly one fault each.
 
 The companion archive is `remanence-test-vectors.tar`, SHA-256
-`fa8570d31d3869155c9a2b4322b0846a5f5b2eb845d08c89ab4a78bcbb5e668f`.
+`b9be8760fd4a85a922e5fa8eaf86840eec0719a5407030b9f6a35f0606ea79bd`.
 Its `MANIFEST.tsv` inventories every contained vector manifest and generated
 artifact, `CHECKSUMS.sha256` authenticates them, and the included `verify.py`
 checks the archive without a source checkout. The archive is reproducibly
@@ -1899,7 +1899,7 @@ implicit zeros; an external parity_map image (inline overflow); a no-parity
 bootstrap; a checkpoint (prefix-digest) image; and a resume round-trip
 image (committed prefix → reopened → appended). The suite also includes a
 short epoch with `R = 1 < S = 2`, and a no-parity image whose schema-minor 3
-bootstrap object row carries RAO-TV-P1's 36-byte UUID-string `object_id`
+bootstrap object row carries REM-OBJECT-TV-P1's 36-byte UUID-string `object_id`
 verbatim.
 
 **Negative vectors (each single-fault).**
@@ -2009,15 +2009,15 @@ governed by its versioning rules; no registry is established or required.
 - [FIPS180-4] — National Institute of Standards and Technology, "Secure
   Hash Standard (SHS)", FIPS PUB 180-4, August 2015 (defines SHA-256),
   <https://doi.org/10.6028/NIST.FIPS.180-4>.
+- [REMOBJECT] — "REM-OBJECT Core Format 1.0", companion specification: the
+  reference payload format and plaintext object-row semantics.
+- [REMENCRYPT] — "REM-ENCRYPT 1.0", companion specification: encrypted
+  representation and encrypted object-row field semantics.
 
 CRC-64/XZ is fully parameterized in Section 5.1; no external reference is
 required to implement it.
 
 ### 20.2. Informative References
-
-- [RAO] — "Rem Archive Object (RAO) Format, Version 1.0", companion
-  specification published alongside this document: the reference payload
-  format of Section 4.4.
 - [LTO-SCSI] — International Business Machines Corporation, "IBM LTO
   Ultrium Tape Drive SCSI Reference", document GA32-0928: fixed-block I/O,
   sense data formats, and boundary classification for the Section 3.5 I/O
@@ -2301,7 +2301,7 @@ tape and does not change any REM-PARITY media byte.
 6. **Key-30 recovery tooling.** Bootstrap object rows (Section 8.2.1) need a
    scanner/recovery reader that validates each row against the
    recovered filemark map and emits a catalog-less recovery report for both
-   plaintext and encrypted RAO objects, demonstrated before format freeze.
+   plaintext and encrypted REM-OBJECT objects, demonstrated before format freeze.
 
 ## Appendix D. Revision History (Informative)
 

@@ -1,67 +1,70 @@
-# RAO (Rem Archive Object) Format Specification, Version 2.0
+# REM-OBJECT Core Format 1.0
+
+## 1. Introduction
+
+### 1.1. Identifiers and Versioning
+
+| Identifier | Value | Scope |
+| --- | --- | --- |
+| Document version | 1.0 | This publication only |
+| DOI | assigned at first release | This publication |
+| Stream format identifier | `rem-object-v1` | Frozen plaintext-stream wire constant |
+| Stream schema version | `1.0` without preserved xattrs; `1.1` with preserved xattrs | `REMANENCE.schema_version` |
+| Manifest schema version | `1` | Manifest CBOR field |
+| Representations | `plaintext`, `encrypted` | Per-copy catalog value |
+| Default file extension | `.rem-object` | Both stored representations |
+
+This document's version does not name any on-tape value. The
+`rem-object-v1` identifier is a frozen wire constant, not a document-version
+indicator. REM-ENCRYPT independently defines the encrypted representation
+and its wire discriminators.
+
+**Status of This Document**
 
 | | |
 | --- | --- |
 | Status | Publication specification |
-| Version | 2.0 |
-| Date | 2026-07-24 (RAO 2.0 — post-quantum encrypted representation) |
+| Version | 1.0 |
+| Date | 2026-07-25 |
 | License | CC-BY-4.0 |
-| Concept DOI (all versions) | [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126) |
-| Version DOI (this release) | [10.5281/zenodo.21531003](https://doi.org/10.5281/zenodo.21531003) |
-| Envelope magic | `RAO1` (fixed encrypted-envelope format-family constant) |
-| Stream format identifier | `rao-v1` (plaintext representation) |
-| On-tape format version | `2` (HPKE wrapped-DEK envelope; X-Wing wrap suite `0x02`) |
-| Default file extension | `.rao` |
+| DOI | assigned at first release |
 
-## Status of This Document
+This document is the publication specification for the REM-OBJECT Core
+Format. It is the normative fixed point for the durable canonical object: an
+implementation is validated against this document, not the reverse.
 
-This document is the publication specification for the RAO format. It is the
-normative fixed point for the format it defines: an implementation is
-validated against this document, not the reverse. It consolidates the base
-container, extended-attribute preservation, and HPKE envelope encryption into
-one independently implementable baseline.
-
-RAO's tape binding depends normatively on the REM-PARITY specification
+The tape binding depends normatively on the REM-PARITY specification
 ([REMPARITY]), which is at `Draft for review` and not yet frozen. That
 dependency is therefore **provisional and version-pinned**: the tape-binding
 clauses of this document (the parity-layer references in Sections 4.9, 8.2, 9,
-12.5) are stable against the specific REM-PARITY revision cited in the
-References, and MAY change when REM-PARITY freezes. The file, object-store, and
-encrypted-envelope portions of this document do not depend on REM-PARITY and are
-not provisional.
+12.6) are stable against the specific REM-PARITY revision cited in the
+References, and MAY change when REM-PARITY freezes. The file and object-store
+bindings do not depend on REM-PARITY and are not provisional.
 
-## Abstract
+**Abstract**
 
-This document specifies the Rem Archive Object (RAO) format, specification
-version 2.0: a backend-independent byte format for large archival objects. An RAO object
-bundles many named file payloads into one self-describing unit — a constrained
-POSIX pax tar stream carrying per-file SHA-256 identities, closed-form
-byte-range addressing, and a deterministic CBOR manifest — and exists in
-exactly two representations: **plaintext**, the bare container stream,
-extractable by any standard `tar`; and **encrypted**, the same byte stream
-sealed inside a confidential authenticated envelope using an X-Wing
-(X25519 + ML-KEM-768) HPKE-wrapped per-object data-encryption key,
-HKDF-SHA-256 key derivation, and a chunked ChaCha20-Poly1305 stream
-construction. Both
-representations of one object share a logical identity (`plaintext_digest`);
-each stored copy has a physical identity (`stored_digest`) that backends scrub
-without keys. Encryption preserves partial file restore:
-authenticated-encryption (AEAD) chunks coincide
-one-to-one with the object's body blocks, so a per-file block index addresses
-ciphertext by closed-form arithmetic. The format is designed for single-pass
-writing, byte-stable fanout to tape, disk, and object storage, parity
-protection over stored bytes, and long-term recovery from this document and
-its static test vectors alone. Canonical plaintext construction is
-deterministic; every encrypted seal uses fresh randomness and therefore
-normally produces different envelope bytes.
+This document specifies REM-OBJECT Core Format 1.0: a backend-independent byte
+format for large archival objects. A REM-OBJECT bundles named file payloads
+into one self-describing unit—a constrained POSIX pax tar stream carrying
+per-file SHA-256 identities, closed-form byte-range addressing, and a
+deterministic CBOR manifest. The canonical object may be stored directly as
+the **plaintext** representation or sealed inside the authenticated,
+confidential wrapper defined by REM-ENCRYPT.
 
-## Table of Contents
+Both representations share the logical identity `plaintext_digest`; each
+stored copy has a representation-independent physical identity,
+`stored_digest`, that backends can scrub without interpreting the bytes. The
+format is designed for single-pass writing, byte-stable fanout to tape, disk,
+and object storage, parity protection over stored bytes, and long-term
+recovery from this document and its static test vectors. Canonical plaintext
+construction is deterministic.
+
+**Table of Contents**
 
 1. [Introduction](#1-introduction)
 2. [Conventions and Terminology](#2-conventions-and-terminology)
 3. [Object Model](#3-object-model)
 4. [Plaintext Representation](#4-plaintext-representation)
-5. [Encrypted Representation](#5-encrypted-representation)
 6. [Partial File Restore](#6-partial-file-restore)
 7. [Digests, Integrity, and the Verification Chain](#7-digests-integrity-and-the-verification-chain)
 8. [Storage Bindings and Backend Independence](#8-storage-bindings-and-backend-independence)
@@ -76,41 +79,19 @@ normally produces different envelope bytes.
 
 Appendix A. [Worked Example (Informative)](#appendix-a-worked-example-informative)
 Appendix B. [Design Rationale (Informative)](#appendix-b-design-rationale-informative)
-Appendix C. [Revision History (Informative)](#appendix-c-revision-history-informative)
-
 ---
-
-## 1. Introduction
-
-### 1.1. Identifiers and Versioning
-
-Four identifiers that happen to contain `1` or `2` are **orthogonal** and
-MUST NOT be conflated:
-
-1. `RAO1` is the encrypted-envelope format-family magic, a fixed constant,
-   not a version number.
-2. The on-tape header byte `format_version = 2` is the envelope-format
-   version. It remains `2` in RAO 2.0.
-3. The `rao2-*` strings in Section 5.5 are frozen HKDF derivation constants,
-   historically named for `format_version = 2`; they do not name this
-   document's version and remain byte-for-byte unchanged.
-4. RAO **2.0** is the version of this publication and is not stored in an
-   object.
-
-RAO 2.0 changes only the KEM inside the encrypted representation. The `RAO1`
-magic, `format_version`, and `rao2-*` HKDF labels are unchanged.
 
 ### 1.2. Purpose and Design Goals
 
-RAO wraps a set of named file payloads into one archival object. The format
+REM-OBJECT wraps a set of named file payloads into one archival object. The format
 originates in **Remanence**, an open archival tape stack that serves as this
 specification's reference implementation [REMANENCE]. This document
 specifies the format completely, so that it stands alone from any
 implementation; the name survives in the format itself only as fixed wire
 identifiers — the `REMANENCE.` vendor-keyword namespace and the `_remanence/`
-manifest path (Section 4). RAO's design goals, in priority order:
+manifest path (Section 4). REM-OBJECT's design goals, in priority order:
 
-1. **Plaintext longevity comes first.** A plaintext RAO object is a
+1. **Plaintext longevity comes first.** A plaintext REM-OBJECT object is a
    fully valid POSIX pax tar archive. A standard pax-aware `tar` extracts
    every payload byte-correct with no Remanence software present.
 2. **Self-description.** Every object carries its own per-file index (the
@@ -120,48 +101,46 @@ manifest path (Section 4). RAO's design goals, in priority order:
 3. **Closed-form byte-range addressing (partial file restore, PFR).** Any byte range of any member
    file maps to stored byte ranges by arithmetic alone, in **both**
    representations. No scanning, no decompression, no whole-object read.
-4. **Confidential encryption as a mode, not a fork.** The encrypted
-   representation seals the *identical* plaintext byte stream — manifest
-   included — inside an authenticated envelope. Nothing about the object's
-   contents, filenames, or structure is visible without the key; a small
-   plaintext header carries only what key recovery and keyless scrubbing
-   need.
+4. **An encrypted representation without a format fork.** REM-ENCRYPT seals
+   the identical canonical byte stream, manifest included, without changing
+   the Core object model.
 5. **Separation of identities.** The logical plaintext identity
    (`plaintext_digest`) is distinct from the physical stored identity
    (`stored_digest`); backends scrub by the latter without keys.
 6. **Deterministic canonical plaintext representation.** Given identical
    inputs and options, every conformant Builder produces the identical
-   plaintext stream. Encrypted envelopes intentionally vary because every
-   seal uses a fresh DEK and fresh HPKE encapsulation randomness.
+   plaintext stream.
 7. **Long-term recoverability.** The format is recoverable from this document
    plus its static test vectors, and — degraded, plaintext representation
    only — from knowledge of POSIX tar alone.
 
 ### 1.3. Two Representations of One Object
 
-An RAO object has a single logical form — a self-describing, bundled,
+A REM-OBJECT has a single logical form — a self-describing, bundled,
 chunk-aligned pax tar stream (Section 4) — stored in either of two
 representations:
 
 - **plaintext**: the bare stream, byte-for-byte; self-describing in the
   clear and extractable by commodity `tar`.
-- **encrypted**: that identical stream sealed inside a confidential,
-  authenticated envelope (Section 5).
+- **encrypted**: that identical stream sealed inside the REM-ENCRYPT
+  envelope.
 
 Both representations of one object wrap the identical canonical bytes and
 therefore share one logical identity (`plaintext_digest`, Section 3.3). The
-encrypted representation adds confidentiality and cryptographic
-authentication while preserving the self-description and closed-form
-byte-range addressing of the plaintext form — *with the key*.
+REM-ENCRYPT provides confidentiality and authentication while preserving
+self-description and closed-form range addressing after opening.
 
 ### 1.4. Relationship to Adjacent Components
 
-RAO is the archival object format of the Remanence tape stack. It owns one
+REM-OBJECT is the archival object format of the Remanence tape stack. It owns one
 thing — the stored bytes of one object — and leaves the rest to the
 components around it:
 
-- **RAO owns** the stored bytes of one object: tar framing, alignment, vendor
-  keywords, the manifest, and the encryption envelope.
+- **REM-OBJECT Core owns** the canonical object bytes: tar framing,
+  alignment, vendor keywords, manifest, identities, and
+  representation-independent storage obligations.
+- **REM-ENCRYPT owns** the optional encrypted wrapper around those canonical
+  bytes.
 - **The parity layer** [REMPARITY] owns everything outside the object's
   stored bytes on tape: the tape filemark terminating the object's tape file,
   parity sidecars, block-level CRCs, the beginning-of-tape (BOT) bootstrap,
@@ -169,26 +148,22 @@ components around it:
   ciphertext when the object is encrypted (Section 9).
 - **The catalog and restore orchestration** above the format own catalogs,
   object selection, restore policy, and restore-time path sanitization.
-- **Key custody is external** (Section 5.3). An encrypted object carries
-  recipient epoch identifiers and HPKE-wrapped copies of its DEK, never a
-  plaintext key.
 
 ### 1.5. Non-Goals
 
-RAO performs no compression: the payload workload is already-compressed media,
+REM-OBJECT performs no compression: the payload workload is already-compressed media,
 and whole-stream compression destroys closed-form range addressing (a later
 member's offset would depend on decompressing earlier bytes). It defines no
 catalog format, no key registry, no network protocol, and no multi-object
-container: one object is one archive is one stored byte string. RAO 2.0
+container: one object is one archive is one stored byte string. This format
 encodes a faithful tree of files — regular files, hardlinks, symbolic links,
 and (empty) directories. Device nodes, FIFOs, and sockets are excluded on
 principle: they carry no content (they are kernel/runtime handles) and
 materializing them on restore is a hazard, so a conformant reader rejects
 their typeflags (Section 4.3.4). Ownership is deliberately not preserved
 (Section 4.3.1); selected POSIX extended attributes are preserved as specified
-in Section 4.7.3.
-Re-keying an encrypted object without rewriting its payload bytes is not
-supported (Section 12.8).
+in Section 4.7.3. Encryption policy and key custody are outside this
+document; see REM-ENCRYPT §1.
 
 ## 2. Conventions and Terminology
 
@@ -203,24 +178,19 @@ when, and only when, they appear in all capitals, as shown here.
 
 A single implementation may fill several roles.
 
-- **Writer**: produces RAO objects. Comprises the **Builder** (produces the
-  canonical plaintext stream; Section 4.9) and the **Sealer** (produces the
-  encrypted representation; Section 5.9).
+- **Writer / Builder**: produces the canonical plaintext object (Section
+  4.9). REM-ENCRYPT defines the Sealer role for encrypted copies.
 - **Planner**: computes a plaintext object's exact layout and block count
-  without payload bytes (Section 4.9). Planning determinism extends to the
-  envelope: the encrypted stored size is a closed form of the plaintext size
-  (Section 5.7).
-- **Reader**: recovers entries from an object in either representation
-  (Sections 4.9, 5.10).
+  without payload bytes (Section 4.9).
+- **Reader**: recovers entries from the canonical object (Section 4.9).
+  REM-ENCRYPT defines how an encrypted copy is opened first.
 - **Repacker**: re-emits an object or manifest while preserving its entries (a
   re-pack that does not re-capture from a source filesystem). Its preservation
   obligations are stated in Sections 4.7.5 and 10.
-- **Verifier**: validates a complete object end to end, with key material
-  when the object is encrypted (Section 7.4).
-- **Keyless Verifier**: validates the public structure of an encrypted object
-  and computes `stored_digest` without key material (Section 5.10).
-- **Restorer**: maps payload byte ranges to stored byte ranges for partial
-  file restore, in either representation (Section 6).
+- **Verifier**: validates a complete canonical object end to end (Section
+  7.4). REM-ENCRYPT adds keyed and keyless encrypted-copy profiles.
+- **Restorer**: maps payload byte ranges to inner ranges (Section 6).
+  REM-ENCRYPT maps those ranges through encrypted copies.
 - **Scanner**: walks a *plaintext* object using only POSIX tar knowledge —
   the degraded long-term fallback (Section 4.10). Scanners are not required
   to implement this document. No scanner role exists for the encrypted
@@ -231,17 +201,16 @@ A single implementation may fill several roles.
 
 ### 2.3. Definitions
 
-- **Object**: one RAO archive; the unit of write, commit, replication, and
+- **Object**: one REM-OBJECT archive; the unit of write, commit, replication, and
   restore.
 - **Canonical plaintext object / inner stream**: the complete plaintext
-  representation byte string of an object (Section 3.1). The encrypted
-  representation's AEAD payload is exactly this byte string.
+  representation byte string of an object (Section 3.1). REM-ENCRYPT seals
+  exactly this byte string.
 - **Representation**: one of `plaintext` or `encrypted` (Section 3.2). Two
   stored copies of one object may use different representations.
 - **Body block / chunk**: a fixed-size block of `chunk_size` bytes; the unit
-  of I/O, alignment, addressing, and (in the encrypted representation) AEAD
-  chunking. "Chunk" is used for addressing, "block" for I/O; they are
-  synonyms.
+  of I/O, alignment, and addressing. "Chunk" is used for addressing and
+  "block" for I/O; they are synonyms.
 - **`chunk_size` (C)**: the per-object body-block size. A positive multiple
   of 512; default 262144 (256 KiB). One value per object, shared by both
   representations of that object.
@@ -256,40 +225,27 @@ A single implementation may fill several roles.
   one object.
 - **Stored `BodyLba`**: zero-based index of a `chunk_size` block within the
   *stored* bytes of one copy. For a plaintext copy, stored `BodyLba` equals
-  inner `BodyLba`. For an encrypted copy the two spaces differ; Section 6.4
-  defines the mapping.
+  inner `BodyLba`. REM-ENCRYPT §6.4 defines the encrypted mapping.
 - **Stored bytes**: the exact bytes of one stored copy, from byte 0 through
   the final byte of its final block. `stored_digest` is defined over these.
-- **Envelope**: the encrypted representation's framing — plaintext header,
-  key frame, metadata frame, payload frame, footer, and final fill (Section 5.1).
-- **Data-encryption key (DEK)**: the fresh 32-byte per-object secret used as
-  the root of an encrypted envelope's key schedule.
-- **Recipient epoch**: one X-Wing key pair identified by a 16-byte
-  `recipient_epoch_id` and a printable recovery label. Its serialized public
-  key is 1216 bytes; its secret custody form is the 32-byte X-Wing seed.
 - **Deterministic CBOR**: the canonical CBOR encoding rules of Section 4.7.1,
-  used in two profiles — the **manifest profile** (text keys; Section 4.7)
-  and the **metadata profile** (unsigned-integer keys; Section 5.6).
+  used by the manifest.
 
 ### 2.4. Integer, Byte, and Text Conventions
 
-All fixed-width integers in the envelope header are unsigned and encoded
-big-endian (network byte order). Byte offsets are zero-based. `KiB` = 2^10
-bytes; `MiB` = 2^20 bytes. Hexadecimal values are prefixed `0x`. ustar numeric
-fields are ASCII octal (Section 4.3). All other text in the format — pax
-keywords and values, paths, manifest and metadata text strings — is UTF-8
+Byte offsets are zero-based. `KiB` = 2^10 bytes; `MiB` = 2^20 bytes.
+Hexadecimal values are prefixed `0x`. ustar numeric fields are ASCII octal
+(Section 4.3). All other text in the Core format—pax keywords and values,
+paths, and manifest text strings—is UTF-8
 [RFC3629]; pax keywords are additionally restricted to ASCII. The functions
 `roundup(x, C)` and `roundup512(x)` denote the smallest multiple of `C`
 (respectively 512) that is greater than or equal to `x`; when `x` is already
 a multiple the result is `x` itself. Equivalently,
-`roundup(x, C) = x + ((C − (x mod C)) mod C)`. SHA-256 is the
-hash function of [FIPS180-4]; SHA3-256 and SHAKE256 are the functions of
-[FIPS202]. All derived quantities
+`roundup(x, C) = x + ((C − (x mod C)) mod C)`. SHA-256 is the hash
+function of [FIPS180-4]. All derived quantities
 (offsets, frame lengths, chunk counts, block counts) are defined over unsigned
 64-bit arithmetic; implementations MUST use checked arithmetic and MUST NOT
-wrap silently (Section 11). AEAD denotes authenticated encryption with
-associated data; AAD denotes an AEAD's associated data; PRF denotes a
-pseudorandom function; PFR denotes partial file restore (Section 6).
+wrap silently (Section 11). PFR denotes partial file restore (Section 6).
 
 ### 2.5. Constants
 
@@ -297,7 +253,7 @@ pseudorandom function; PFR denotes partial file restore (Section 6).
 | --- | --- | --- |
 | `TAR_RECORD_SIZE` | 512 | POSIX tar record size in bytes |
 | `DEFAULT_CHUNK_SIZE` | 262144 (256 KiB) | Default body-block size |
-| `STREAM_FORMAT_ID` | `rao-v1` | Value of the global `REMANENCE.format_id` keyword |
+| `STREAM_FORMAT_ID` | `rem-object-v1` | Value of the global `REMANENCE.format_id` keyword |
 | `STREAM_SCHEMA_VERSION` | `1.0` without preserved xattrs; `1.1` with any preserved xattrs | Value of the global `REMANENCE.schema_version` keyword |
 | `MANIFEST_PATH` | `_remanence/manifest.cbor` | Manifest entry path |
 | `RESERVED_PREFIX` | `_remanence` | Reserved path namespace (Section 4.6) |
@@ -310,35 +266,12 @@ pseudorandom function; PFR denotes partial file restore (Section 6).
 | `MANIFEST_SCHEMA_VERSION` | 1 | Manifest CBOR `schema_version` integer (Section 4.7) |
 | `MAX_FILE_ENTRIES` | 10000000 | Maximum member entries per object (Section 4.7) |
 | `MANIFEST_MAX_DEPTH` | 8 | Maximum manifest CBOR nesting depth (Section 4.7) |
-| `RAO_MAGIC` | `RAO1` (`0x52 0x41 0x4F 0x31`) | Envelope magic |
-| `RAO_HEADER_LEN` | 128 | Envelope plaintext header length in bytes |
-| `RAO_FORMAT_VERSION_HPKE` | 2 | HPKE envelope `format_version` |
-| `RAO_SUITE_HKDF_CHACHA` | `0x01` | `suite_id`: HKDF-SHA-256 + ChaCha20-Poly1305 |
-| `RAO_WRAP_SUITE_X25519_RESERVED` | `0x01` | Permanently reserved pre-production X25519-only assignment; forbidden |
-| `RAO_WRAP_SUITE_XWING` | `0x02` | Sole valid wrap suite: HPKE Base with X-Wing |
-| `RAO_KEY_FRAME_MIN_LEN` | 1191 | Minimum one-slot X-Wing key-frame length |
-| `RAO_KEY_FRAME_MAX_LEN` | 16384 | Maximum key-frame length |
-| `RAO_KEY_FRAME_MAX_SLOTS` | 8 | Maximum recipient slots |
-| `RAO_SALT_LEN` | 16 | `hkdf_salt` length in bytes |
-| `RAO_OBJECT_ID_FIELD_LEN` | 64 | Fixed `object_id` header field length in bytes |
-| `RAO_TAG_LEN` | 16 | Poly1305 tag length in bytes |
-| `RAO_NONCE_LEN` | 12 | ChaCha20-Poly1305 nonce length in bytes |
-| `RAO_KEY_LEN` | 32 | Derived AEAD key length in bytes |
-| `RAO_MAX_METADATA_FRAME_LEN` | 16777216 (16 MiB) | Maximum envelope metadata frame length |
-| `RAO_MAX_CBOR_NESTING_DEPTH` | 32 | Maximum envelope metadata nesting depth |
-| `RAO_MAX_METADATA_ITEMS` | 65536 | Maximum envelope metadata data-item count |
-| `RAO_FOOTER` | `RAO1_STREAM_END.` | 16-byte completion footer (Section 5.8); hex `52 41 4F 31 5F 53 54 52 45 41 4D 5F 45 4E 44 2E` |
-| `LABEL_SALT` | `rao2-salt-v1` | Salt-derivation info label, 12 ASCII bytes |
-| `LABEL_OBJECT` | `rao2-object-v1` | Object-secret info label, 14 ASCII bytes |
-| `LABEL_METADATA` | `rao2-metadata-v1` | Metadata-key info label, 16 ASCII bytes |
-| `LABEL_PAYLOAD` | `rao2-payload-v1` | Payload-key info label, 15 ASCII bytes |
-| `WRAP_INFO_PREFIX` | `rao-wrap-v1` followed by NUL | 12-byte HPKE info prefix |
 
 ## 3. Object Model
 
 ### 3.1. The Canonical Plaintext Object
 
-Every RAO object has exactly one **canonical plaintext form**: the complete
+Every REM-OBJECT object has exactly one **canonical plaintext form**: the complete
 stream byte string defined in Section 4 — global pax header, aligned payload
 entries, manifest entry, tar EOF, and final zero fill. Its length is always a
 positive exact multiple of `chunk_size` (Section 4.8). All logical properties
@@ -351,7 +284,7 @@ therefore identical across representations.
 | Representation | Stored bytes | Confidentiality |
 | --- | --- | --- |
 | `plaintext` | The canonical plaintext object, verbatim | None; self-describing in the clear; `tar`-extractable |
-| `encrypted` | The Section 5 envelope: plaintext header ‖ key frame ‖ encrypted metadata frame ‖ chunked AEAD ciphertext of the canonical plaintext object ‖ footer ‖ zero fill | Confidential and authenticated; self-describing **with the key**; opaque without it |
+| `encrypted` | The REM-ENCRYPT envelope: an authenticated, confidential wrapper sealing the canonical plaintext object (see REM-ENCRYPT §5) | Confidential and authenticated; self-describing after opening; opaque without a key |
 
 There is no third representation: the plaintext representation is the bare
 container stream itself, preserving standard-`tar` extractability, and the
@@ -366,7 +299,7 @@ Section 3.3 hold.
 | --- | --- | --- | --- |
 | `file_sha256` | One regular member file's exact payload bytes | Entry pax header + manifest | Plaintext copies: yes. Encrypted copies: no |
 | `manifest_sha256` | The manifest entry's CBOR bytes | Manifest pax header; for plaintext copies also the parity-layer bootstrap and catalog (Section 8.2) | Plaintext copies: yes. Encrypted copies: no |
-| `plaintext_digest` | The **complete canonical plaintext object** bytes | Encrypted copies: inside the authenticated metadata frame (Section 5.6). All copies: catalog | No (for encrypted copies) |
+| `plaintext_digest` | The **complete canonical plaintext object** bytes | Encrypted copies: carried in the REM-ENCRYPT envelope. All copies: catalog | No (for encrypted copies) |
 | `stored_digest` | The **complete stored bytes** of one copy, byte 0 through the final fill byte | External only: catalog / master index (never in-band) | **Yes** — the keyless scrub anchor |
 
 Consequences, all normative:
@@ -400,17 +333,12 @@ successor-specification concern.
 
 ### 3.4. Representation Detection
 
-For a whole-object input of unknown representation, a Reader MUST decide as
-follows, examining the first bytes:
-
-1. Bytes 0–3 equal `RAO_MAGIC` (`RAO1`) → encrypted representation
-   (Section 5).
-2. Otherwise → attempt the plaintext representation: the input must begin
-   with a valid ustar header record, typeflag `g` (Section 4.5), and its
-   global header must pass the `REMANENCE.format_id = rao-v1` gate
-   (Section 4.5.2). A conformant plaintext object's first record is the
-   global pax header, whose ustar name (`GlobalHead.0/PaxHeaders/remanence`)
-   cannot collide with the magic.
+For a whole-object input of unknown representation, a Reader first applies
+REM-ENCRYPT §3.2. Otherwise it attempts the plaintext representation: the
+input must begin with a valid ustar header record, typeflag `g` (Section 4.5),
+and its global header must pass the
+`REMANENCE.format_id = rem-object-v1` gate (Section 4.5.2). A conformant
+plaintext object's first record is the global pax header.
 
 This rule is for self-identification and tooling convenience; a deployment's
 catalog records each copy's representation, and readers SHOULD cross-check
@@ -428,7 +356,7 @@ extractable by any pax-aware tool, which simply ignores the vendor keywords
 
 ### 4.1. Frame Sequence
 
-A plaintext RAO object is a byte string with the following layout, where every
+A plaintext REM-OBJECT object is a byte string with the following layout, where every
 frame boundary falls on a 512-byte record boundary:
 
 ```text
@@ -459,10 +387,9 @@ The object byte stream is written as consecutive fixed-size body blocks of
 exactly `chunk_size` bytes. `chunk_size` MUST be a positive multiple of 512.
 On tape `chunk_size` MUST equal the fixed tape block size of the containing
 tape file (Section 8.2); one body block is one tape block. The plaintext
-representation defines no maximum; the envelope header encodes `chunk_size`
-as a 32-bit field, so an object stored in the encrypted representation is
-bounded to `chunk_size` ≤ 2^32 − 512 (Section 5.2). Operational bounds come
-from drive block-size limits.
+representation defines no maximum. REM-ENCRYPT §5.2 defines the additional
+bound for an encrypted copy. Operational bounds come from drive block-size
+limits.
 
 The total object length is always an exact multiple of `chunk_size`
 (Section 4.8), and the object's block count is knowable before any payload
@@ -474,7 +401,7 @@ boundaries (Section 4.1, Section 8.2).
 
 ### 4.3. The ustar Record Subset
 
-RAO emits POSIX ustar headers [POSIX-PAX] restricted as specified here.
+REM-OBJECT emits POSIX ustar headers [POSIX-PAX] restricted as specified here.
 Readers MUST validate the checksum of every non-zero header record
 (Section 4.3.3); the reader-ignored fields are governed by the rules of
 Section 4.3.2.
@@ -507,7 +434,7 @@ Octal fields are zero-padded ASCII octal terminated by NUL. When parsing,
 Readers MUST stop a numeric field at the first NUL or space, MUST accept
 surrounding ASCII whitespace, and MUST treat an empty field as zero. The
 `uid`, `gid`, ustar `mtime`, `uname`, and `gname` fields carry the fixed
-values above regardless of metadata-preservation tier: RAO 2.0 deliberately
+values above regardless of metadata-preservation tier: this specification deliberately
 does not preserve ownership, so a root-run standard `tar` extraction cannot
 apply ownership the format never recorded. Readers MUST ignore these fields.
 
@@ -555,7 +482,7 @@ Readers MUST verify the unsigned checksum and reject a mismatch with
 | NUL (0x00) | Accepted by Readers as a regular file (pre-POSIX compatibility); writers MUST NOT emit it |
 
 Readers MUST reject any other typeflag with `UnsupportedTarTypeflag`. This is
-deliberate: RAO 2.0's entry set is regular files, hardlinks, symbolic
+deliberate: the Core entry set is regular files, hardlinks, symbolic
 links, and directories — a faithful tree of files — and excludes device,
 FIFO, socket, and other special entries (Section 1.5); accepting an
 unsupported typeflag silently would misrepresent an unsupported archive as
@@ -644,9 +571,9 @@ keyword order (Section 4.4.2):
 | `REMANENCE.caller_object_id` | Non-empty opaque UTF-8; identifier assigned by the archiving system above this format |
 | `REMANENCE.chunk_size` | Decimal `chunk_size` in bytes; on tape this MUST equal the containing tape file's block size (Sections 4.2, 8.2) |
 | `REMANENCE.encryption` | MUST be `none` (Section 4.5.2, Section 10) |
-| `REMANENCE.format_id` | MUST be `rao-v1` |
+| `REMANENCE.format_id` | MUST be `rem-object-v1` |
 | `REMANENCE.metadata_preservation` | One of `minimal`, `archival`, `full` |
-| `REMANENCE.object_id` | Object identifier of 1–64 non-NUL UTF-8 bytes (a UUID string in practice; opaque to this format). The 1–64-byte bound is uniform across representations — it matches the encrypted envelope field (Section 5.2) and lets the REM-PARITY tape binding ([REMPARITY] bootstrap key 4) carry the identifier verbatim. |
+| `REMANENCE.object_id` | Object identifier of 1–64 non-NUL UTF-8 bytes (a UUID string in practice; opaque to this format). The bound is intrinsic because the representation-independent REM-PARITY bootstrap ([REMPARITY] key 4) carries the identifier verbatim. |
 | `REMANENCE.schema_version` | `<major>.<minor>` decimal text; MUST have major version 1 (Section 10) |
 | `REMANENCE.write_timestamp` | [RFC3339] timestamp of object creation |
 
@@ -655,7 +582,7 @@ keyword order (Section 4.4.2):
 Before delivering any entry, a Reader MUST verify on the accumulated global
 records:
 
-1. `REMANENCE.format_id` is present and equals `rao-v1` (`UnsupportedFeature`
+1. `REMANENCE.format_id` is present and equals `rem-object-v1` (`UnsupportedFeature`
    otherwise; a missing key is `Parse`).
 2. `REMANENCE.schema_version` is present and its major component (the decimal
    text before the first `.`, or the whole value if no `.`) parses as an
@@ -664,7 +591,7 @@ records:
 3. If `REMANENCE.encryption` is present, it equals `none`
    (`UnsupportedFeature` otherwise). This is a refusal gate: a Reader that
    ignored it could restore ciphertext as content under a future revision.
-   Confidentiality is provided exclusively by the Section 5 envelope *around*
+   Confidentiality is provided exclusively by the REM-ENCRYPT envelope around
    the stream, never flagged inside it.
 4. If `REMANENCE.chunk_size` is present, it equals the externally supplied
    `chunk_size` (`ChunkSizeMismatch` otherwise). A mismatch means the object
@@ -698,7 +625,7 @@ Each entry is, in order:
 For symbolic links, Writers MUST store the target in ustar `linkname` when it
 fits in 100 bytes; otherwise they MUST store it in pax `linkpath` and store
 `PAX_LINK_PLACEHOLDER` (`remanence/pax-linkpath`) in `linkname`. A symlink target is an opaque UTF-8 OS string, not
-an RAO path: it MAY be absolute, contain `..`, or be dangling. For directories,
+a REM-OBJECT path: it MAY be absolute, contain `..`, or be dangling. For directories,
 Writers SHOULD emit entries only for directories that cannot be inferred from
 child paths, i.e. empty directories; directory paths MUST end in `/`.
 
@@ -876,7 +803,7 @@ direct LOCATE-to-manifest reading without scanning the archive.
 #### 4.7.1. Deterministic CBOR
 
 A manifest is a single CBOR [RFC8949] data item in the **manifest profile** of
-RAO's deterministic CBOR. **Item repertoire** — each item MUST be one of:
+REM-OBJECT's deterministic CBOR. **Item repertoire** — each item MUST be one of:
 
 | Major type | Permitted |
 | --- | --- |
@@ -952,6 +879,9 @@ Consumer obligations:
    available, or — self-consistency only — the manifest entry's own pax
    `REMANENCE.file_sha256` (`ManifestDigestMismatch` on failure). An
    unverified manifest is untrusted input from removable media.
+   For encrypted copies this obligation is discharged by the envelope's
+   authenticated whole-object digest as specified by REM-ENCRYPT §7.1;
+   external manifest anchors are required for plaintext copies only.
 2. A Consumer MUST reject a manifest violating the type or value constraints
    above (`ManifestInvalid`), including the cross-checks: `object_id`,
    `caller_object_id`, and `chunk_size` MUST equal the corresponding global
@@ -1010,15 +940,14 @@ Section 4.7.5).
 An entry with no preserved xattrs MUST carry an empty
 `metadata_preservation_data` map. A hardlink entry MUST carry an empty map;
 the shared file's restored xattrs come from the regular-file primary named by
-`link_target`. Ownership, ACLs as a separate RAO semantic, and mode bits beyond
+`link_target`. Ownership, ACLs as a separate REM-OBJECT semantic, and mode bits beyond
 `executable` remain outside this format. `mtime` is already represented by the
 pax `mtime` keyword.
 
 A Writer that emits no preserved xattrs anywhere MUST set
 `REMANENCE.schema_version = 1.0`. A Writer that emits at least one preserved
 xattr MUST set it to `1.1`. In both cases the manifest CBOR `schema_version`
-integer remains 1. This gate does not depend on encrypted-envelope
-`format_version`; the stream and envelope version axes are independent
+integer remains 1. This gate is independent of REM-ENCRYPT versioning
 (Section 10).
 
 Which xattrs an ingesting system selects is policy outside this byte format.
@@ -1030,7 +959,7 @@ default (Section 12.10). Every attribute not in the `user.` namespace and every
 extension (Section 4.7.5) is the extension tier: carried, but on restore
 **carry-only** — applied only when explicit operator policy names it
 (Section 12.10). No registered disposition or external list can cause an
-extension-tier item to be applied by default in RAO 2.0.
+extension-tier item to be applied by default in this specification.
 
 A Reader implementing xattr preservation MUST surface them to its caller. A
 Restoring Consumer MAY reapply attributes, subject to Section 12.10, and MUST
@@ -1056,9 +985,8 @@ For regular entries, pax `REMANENCE.file_sha256` keywords duplicate the
 manifest hashes as a within-stream cross-check, allowing per-file verification
 even when the manifest's blocks are damaged (and vice versa). Non-regular
 entry metadata is covered by the manifest and the whole-object digest. This
-chain provides integrity, not authentication (Section 12.6); for encrypted
-copies the anchor is the envelope's authenticated `plaintext_digest`
-(Section 7.1).
+chain provides integrity, not authentication (Section 12.6); the anchor for
+encrypted copies is defined by REM-ENCRYPT §7.1.
 
 #### 4.7.5. Extension Containers
 
@@ -1093,7 +1021,7 @@ Extension processing is fail-safe, carry-only, and additive:
 - A Consumer MUST ignore an `ext` member it does not recognize and MUST NOT
   reject an object for its presence.
 - A Restoring Consumer MUST NOT apply any extension to system state unless
-  explicit operator policy names it (Section 12.10); in RAO 2.0 no
+  explicit operator policy names it (Section 12.10); in this specification no
   extension is applied by default. An unrecognized extension is always
   carry-only.
 - A Repacker (Section 2.2) MUST reproduce the canonical CBOR encoding of every
@@ -1235,11 +1163,9 @@ Procedure:
    report which of the three it provides rather than imply hash-verified content:
    (a) a **parity-protected tape** plaintext copy is covered by the parity
    layer's per-block CRCs ([REMPARITY]) — damage detection, not adversarial
-   authentication (CRC-64 confirms a guessed block); (b) an **encrypted** copy on
-   any backend authenticates every byte range through the per-chunk AEAD tag
-   (Section 6.3): a chunk whose tag fails aborts the range read (Section 5.10),
-   so range reads of the encrypted representation are cryptographically verified
-   end to end; (c) a **plaintext copy on a byte-addressed backend without the
+   authentication (CRC-64 confirms a guessed block); (b) an **encrypted** copy
+   follows the authenticated range-read rules of REM-ENCRYPT §6.3; (c) a
+   **plaintext copy on a byte-addressed backend without the
    parity layer** (a file or object store) has **no per-range integrity by
    construction** — a verifying range read there requires either the encrypted
    representation or a whole-file `file_sha256`/`plaintext_digest` check, which
@@ -1275,400 +1201,13 @@ directories, and also writes one extra file `_remanence/manifest.cbor`. Unknown
 only header size, never content; the manifest decodes with any generic CBOR
 tool into self-describingly-named text fields. Stock tar faithfully restores
 absolute or dangling symlinks too; that fidelity is correct but not a safety
-claim (Section 12.10). With all RAO-specific metadata lost, a Scanner can still
+claim (Section 12.10). With all REM-OBJECT-specific metadata lost, a Scanner can still
 walk the archive using only tar rules — header, `size`, `roundup512(size)`,
 repeat — recovering payload bytes, hardlink relationships, symlink targets,
 directory entries, and names; it loses only chunk addressing (irrelevant when scanning) and
 verification (recoverable from the manifest if its blocks survive).
 Conformance requires demonstrated extraction equality by GNU tar, bsdtar, and
 Python `tarfile` (Section 14).
-
-## 5. Encrypted Representation
-
-### 5.1. Frame Sequence and Version Gate
-
-An encrypted RAO object has one layout:
-
-```text
-scalar header (128) || key frame (K) || metadata frame (M) ||
-payload chunks || footer (16) || zero fill
-```
-
-The header, key frame, footer, and fill are plaintext. The metadata frame
-and payload chunks are ChaCha20-Poly1305 ciphertext. The payload plaintext is
-the complete canonical object of Section 4, manifest included. Total stored
-length MUST be a positive multiple of `chunk_size`.
-
-`format_version` is an on-tape field, not this document's version. A Reader
-MUST accept only value 2 and requires a matching recipient private key. It
-MUST NOT attempt another key mode after any parse, key-resolution, unwrap, or
-authentication failure. Value 1 is permanently reserved as stated in
-Section 10.
-
-### 5.2. Scalar Header
-
-The scalar header is exactly 128 bytes. All integers are unsigned big-endian.
-
-| Offset | Length | Name | Type | Required value or meaning |
-| --- | ---: | --- | --- | --- |
-| `0x00` | 4 | `magic` | ASCII | `RAO1` |
-| `0x04` | 2 | `header_len` | `uint16` | 128 |
-| `0x06` | 1 | `format_version` | `uint8` | 2 |
-| `0x07` | 1 | `suite_id` | `uint8` | `0x01` (HKDF-SHA-256 and ChaCha20-Poly1305) |
-| `0x08` | 4 | `chunk_size` | `uint32` | Positive multiple of 512; equal to the inner stream value |
-| `0x0C` | 4 | `flags` | `uint32` | Zero |
-| `0x10` | 16 | `reserved` | bytes | Zero |
-| `0x20` | 16 | `hkdf_salt` | bytes | Nonzero salt derived by Section 5.5 |
-| `0x30` | 8 | `metadata_frame_len` | `uint64` | `M`, including the 16-byte tag; 17 through 16777216 |
-| `0x38` | 1 | `wrap_suite` | `uint8` | `0x02` (X-Wing) |
-| `0x39` | 3 | `reserved` | bytes | Zero |
-| `0x3C` | 4 | `key_frame_len` | `uint32` | Canonical key-frame length `K` |
-| `0x40` | 64 | `object_id` | UTF-8 field | 1–64 non-NUL bytes, then NUL padding |
-
-Bytes `0x10..0x20` and `0x39..0x3C` are reserved and MUST be zero.
-`wrap_suite = 0x02`, and `key_frame_len` MUST be between 1191 and 16384
-inclusive. The smallest syntactically possible frame is a one-slot frame at
-`1191` bytes; a two-slot frame with both labels empty is 2377 bytes.
-`wrap_suite = 0x02` is the sole valid value. The pre-production X25519-only
-assignment `0x01` is forbidden and permanently reserved: Readers MUST reject
-it with `InvalidWrapSuite`, and Sealers MUST NOT emit it. A zero or unknown
-wrap suite, or an absent or undersized key frame, is not a valid object in
-this specification.
-
-The `object_id` value is the inner `REMANENCE.object_id`. It contains no NUL,
-is valid UTF-8, and is right-padded with zero bytes. Readers MUST reject an
-all-zero field, an interior NUL followed by a nonzero byte, invalid UTF-8, or
-a value longer than 64 bytes. The header's `chunk_size` and `object_id` MUST
-equal the authenticated inner values after opening.
-
-The byte-exact beginning of an envelope header with `chunk_size = 4096`,
-`metadata_frame_len = 64`, `key_frame_len = 1191`, object id `object-2`, and
-the illustrative salt `02` repeated 16 times is:
-
-```text
-52 41 4f 31 00 80 02 01 00 00 10 00 00 00 00 00
-00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-02 02 02 02 02 02 02 02 02 02 02 02 02 02 02 02
-00 00 00 00 00 00 00 40 02 00 00 00 00 00 04 a7
-6f 62 6a 65 63 74 2d 32 00 ... 00
-```
-
-The final line occupies the 64-byte `object_id` field. The repeated salt is a
-layout illustration, not a derived conformance value.
-
-### 5.3. The Key Frame and HPKE Wrapping
-
-The key frame begins immediately at byte 128 and occupies exactly
-`key_frame_len` bytes. Its canonical grammar is:
-
-| Relative offset | Length | Field | Constraint |
-| --- | ---: | --- | --- |
-| `0` | 4 | magic | ASCII `RAOK` (`52 41 4f 4b`) |
-| `4` | 1 | `slot_count` | 1 through 8 |
-| repeated | 1 | `slot_index` | Strictly increasing across slots |
-| repeated | 16 | `recipient_epoch_id` | Opaque epoch identifier |
-| repeated | 1 | `label_len` | 0 through 32 |
-| repeated | `label_len` | `epoch_label` | Bytes `0x20` through `0x7E` only |
-| repeated | 1120 | `enc` | X-Wing ciphertext: ML-KEM-768 `ct` (1088 bytes) ‖ X25519 `ct_X` (32 bytes) |
-| repeated | 48 | `ciphertext` | Wrapped 32-byte DEK plus 16-byte tag |
-
-Every integer is big-endian; the one-byte integers have no byte-order
-ambiguity. A key frame has length
-
-```text
-K = 5 + sum_over_slots(1186 + label_len)
-```
-
-and MUST consume exactly `K` bytes. A Reader MUST reject truncation, trailing
-bytes, a non-increasing or duplicate slot index, a duplicate
-`recipient_epoch_id`, an invalid label, an invalid slot count, or a frame
-outside the header's length bounds. A Sealer MUST emit at least one slot, MUST
-give any two slots distinct `recipient_epoch_id` values, and MUST fail the entire
-seal if any configured recipient cannot be wrapped. A single-recipient object is
-a single point of key loss: if that recipient's key is lost, the object is
-unrecoverable. A Sealer SHOULD therefore ensure single-key-loss survivability for
-objects intended for preservation — either by wrapping to two or more independent
-recipients, or by redundantly custodying the sole recipient's private key (for
-example a threshold or Shamir split, reconstituted by an operational ceremony) —
-and MAY emit a single slot where the deployment's key custody provides that
-survivability by other means. Implementations SHOULD default to emitting at least
-two recipients and require an explicit opt-in to emit a single slot. A Reader
-accepts any structurally valid frame with at least one slot. Slot order is the strictly increasing `slot_index`
-order; callers therefore MUST supply values that serialize in that order.
-
-The suite is object-global: every slot in a key frame uses the header's one
-`wrap_suite` value; there is no per-slot suite discriminator. Eight X-Wing
-slots occupy 9493 bytes with empty labels or 9749 bytes with 32-byte labels,
-approximately 9.5 KiB against the 16 KiB key-frame cap. This cost is
-acceptable for tape but material for small objects.
-
-Wrap suite `0x02` is HPKE Base mode [RFC9180] with X-Wing
-[XWING-DRAFT10] — the X25519 [RFC7748] + ML-KEM-768 [FIPS203] hybrid — as
-the KEM, HKDF-SHA256 as the KDF, and ChaCha20-Poly1305 as the AEAD. The HPKE
-plaintext is the 32-byte DEK; HPKE AAD is empty. Each slot uses fresh
-encapsulation randomness. The exact RFC 9180 HPKE suite identifier is:
-
-```text
-"HPKE" || 0x647a || 0x0001 || 0x0003
-```
-
-Here `0x647a` is the frozen X-Wing `kem_id`, `0x0001` is HKDF-SHA256, and
-`0x0003` is ChaCha20-Poly1305. The exact 95-byte HPKE `info` value is:
-
-```text
-"rao-wrap-v1\0"                         12 bytes
-|| object_id_field                      64 bytes
-|| recipient_epoch_id                  16 bytes
-|| slot_index                            1 byte
-|| 0x02                                  1 byte  (format_version)
-|| 0x02                                  1 byte  (wrap_suite)
-```
-
-For `object_id = "obj"`, epoch id `44` repeated 16 times, and slot 7, it is:
-
-```text
-72 61 6f 2d 77 72 61 70 2d 76 31 00
-6f 62 6a 00 ... 00
-44 44 44 44 44 44 44 44 44 44 44 44 44 44 44 44 07 02 02
-```
-
-The middle field is exactly 64 bytes. A wrapped DEK is thereby bound to the
-object id, recipient epoch, slot, format version, and wrap suite. A Reader
-selects the slot whose epoch id equals the supplied private key's epoch id;
-absence is a hard recipient-epoch mismatch.
-
-#### 5.3.1. Frozen X-Wing Construction
-
-RAO 2.0 freezes the following byte-level X-Wing construction from
-`draft-connolly-cfrg-xwing-kem-10`; that individual-submission Internet-Draft
-is provenance, not permission to track later revisions.
-
-For a 32-byte seed, compute:
-
-```text
-expanded = SHAKE256(seed, 96)
-d        = expanded[0:32]
-z        = expanded[32:64]
-sk_X     = expanded[64:96]
-```
-
-Run ML-KEM-768 `KeyGen_internal(d, z)` to obtain `(pk_M, sk_M)`, and derive
-`pk_X` from `sk_X` using X25519. The serialized recipient public key and the
-secret custody form are:
-
-```text
-pk   = pk_M || pk_X       # 1184 + 32 = 1216 bytes
-seed                       # 32 bytes
-```
-
-The expanded ML-KEM decapsulation key and `sk_X` are ephemeral and MUST NOT
-replace the 32-byte seed as the secret-at-rest custody unit.
-
-For encapsulation, let `ss_M` and `ct_M` be the ML-KEM-768 outputs, and let
-`ss_X` and `ct_X` be the raw X25519 shared secret and ephemeral public key.
-Serialize:
-
-```text
-enc = ct_M || ct_X        # 1088 + 32 = 1120 bytes
-```
-
-The 32-byte X-Wing shared secret is exactly:
-
-```text
-SHA3-256(ss_M || ss_X || ct_X || pk_X || 0x5c2e2f2f5e5c)
-```
-
-The six-byte final value is the X-Wing label `5c 2e 2f 2f 5e 5c`
-(ASCII `\.//^\`). The ML-KEM ciphertext is deliberately absent from the
-combiner preimage because ML-KEM's Fujisaki–Okamoto transform already binds
-it; `ct_X` and `pk_X` are present because raw X25519 does not provide that
-binding. The resulting 32 bytes feed HPKE as the KEM shared secret. The
-wrapped-DEK ciphertext remains 48 bytes (32-byte DEK plus 16-byte tag).
-
-Draft-10's IANA section writes `25722 = 25519 + 203 = 0x647a (please)`: that
-text is a requested value and is not itself an IANA assignment. As of this
-publication, the IANA HPKE registry also lists `0x647A` for X-Wing, citing an
-earlier draft revision [IANA-HPKE]. RAO nevertheless pins `0x647a` from
-draft-10 as an independent frozen archival decision. If the registry or a
-later X-Wing standard assigns a different value, RAO envelopes continue to
-use `0x647a`; such a difference is a documented divergence, never a silent
-wire change. The draft is an individual submission, not a CFRG working-group
-document.
-
-The repository's `xwing-draft10-kat.txt` and `xwing-wrap-kat.txt`, also
-included in the companion vector archive, freeze seed-to-key, encapsulation,
-shared-secret, and HPKE wrapped-DEK bytes. The versioned IETF archive is the
-pinned prose provenance, and the static KATs are the in-repository byte-level
-freeze. A copy of the draft-10 text is archived in this repository at
-`specs/publication/provenance/draft-connolly-cfrg-xwing-kem-10.txt`, SHA-256
-`530900ac0519e28eb1ff50bf80ecdb7648add22e500db72b465bab4fb6b6a5ec`.
-
-### 5.4. Key Inputs and Identification
-
-The Sealer generates a fresh uniformly random 32-byte DEK for
-every object and wraps it independently to every recipient slot. The Sealer
-MUST obtain both DEK and encapsulation randomness from a fallible,
-operating-system-backed CSPRNG and MUST fail closed if entropy is unavailable.
-Recipient public keys and fingerprints are custody inputs outside this byte
-format. A recipient public key is the 1216-byte X-Wing serialization
-`pk_M || pk_X`. The corresponding private-key file MUST contain the canonical
-32-byte X-Wing seed, not a persisted expanded ML-KEM decapsulation key. A
-private key for any epoch named in the frame has unilateral ability to decrypt
-every object wrapped to that epoch; operational threshold ceremonies do not
-change that cryptographic fact.
-
-### 5.5. Salt and Object-Key Derivation
-
-`HKDF(ikm, salt, info, len)` means HKDF-Extract followed by HKDF-Expand as in
-[RFC5869]. `SHA-256` is [FIPS180-4]. Let `metadata_hash` be SHA-256 of the
-canonical metadata plaintext and `object_id_field` the exact 64 header bytes.
-For the first `ctr` in `0x00..=0xFF` whose output is nonzero, derive:
-
-```text
-hkdf_salt = HKDF(DEK, empty,
-  "rao2-salt-v1" || ctr || object_id_field || plaintext_digest || metadata_hash,
-  16)
-```
-
-The one-byte `ctr` follows the ASCII label with no separator. A Sealer MUST
-derive the salt and MUST NOT accept a caller-supplied value. An opener MUST
-rederive it after metadata authentication and reject a mismatch.
-
-Define `header_hash = SHA-256(exact 128-byte scalar header || exact key
-frame)`. This mechanism and every `rao2-*` HKDF label below are unchanged
-from the preceding publication; the larger X-Wing key frame simply supplies
-more bytes to the same SHA-256 input.
-
-Then derive three distinct 32-byte keys:
-
-```text
-object_secret = HKDF(DEK, hkdf_salt,
-                     "rao2-object-v1" || header_hash, 32)
-metadata_key  = HKDF(object_secret, empty, "rao2-metadata-v1", 32)
-payload_key   = HKDF(object_secret, empty, "rao2-payload-v1", 32)
-```
-
-This binds every scalar-header byte and every key-frame byte through the
-derived AEAD keys. In particular, `wrap_suite` is authenticated both here,
-inside the scalar header covered by `header_hash`, and in the HPKE `info`
-transcript of Section 5.3. Rewrapping a key frame without resealing metadata
-and payload is therefore impossible and MUST NOT be attempted.
-
-### 5.6. Metadata Frame
-
-The metadata plaintext is one deterministic-CBOR [RFC8949] map using
-unsigned-integer keys. The writer form has exactly four entries:
-
-| Key | Value |
-| ---: | --- |
-| 0 | unsigned integer `1` (`metadata_version`) |
-| 1 | positive `plaintext_size`, an exact multiple of `chunk_size` |
-| 2 | text `sha256` |
-| 3 | 32-byte `plaintext_digest` |
-
-The keys are encoded in ascending deterministic order, using shortest-form
-integer and length encodings. A Reader MAY skip unknown keys but MUST enforce
-canonical map ordering, unique keys, valid UTF-8, a maximum nesting depth of
-32, and at most 65536 decoded items. It MUST reject missing or invalid required
-fields and trailing bytes. The accepted CBOR repertoire is unsigned integers,
-definite byte/text strings, definite arrays/maps, and simple values false,
-true, and null; negative integers, tags, floats, indefinite forms, and other
-simple values are invalid.
-
-The frame is `ChaCha20-Poly1305(metadata_key, nonce = 12 zero bytes,
-AAD = empty, plaintext = metadata CBOR)`, stored as the ciphertext immediately
-followed by the 16-byte Poly1305 tag. Its stored length is plaintext length
-plus the 16-byte tag and MUST equal `metadata_frame_len`.
-
-### 5.7. Payload Frame
-
-Let `P = plaintext_size` and `C = chunk_size`. Both are authenticated through
-the metadata and header-bound key schedule. `P` is positive and exactly
-divisible by `C`; therefore `N = P / C` full plaintext chunks are emitted.
-Chunk `i`, for `0 <= i < N`, is encrypted with `payload_key`, empty AAD, and
-this 12-byte nonce:
-
-```text
-00 00 00 || uint64_be(i) || final_flag
-```
-
-`final_flag` is `0x01` exactly when `i = N - 1`, otherwise `0x00`. Each stored
-chunk is exactly `C + 16` bytes: the `C` ciphertext bytes immediately followed
-by the 16-byte Poly1305 tag. The payload-frame length is
-`P + 16 * N`. Readers MUST compute finality; they MUST NOT infer it by probing
-or accept a short final chunk.
-
-### 5.8. Footer, Fill, and Geometry
-
-The completion footer is the literal 16 bytes:
-
-```text
-ASCII: RAO1_STREAM_END.
-hex:   52 41 4f 31 5f 53 54 52 45 41 4d 5f 45 4e 44 2e
-```
-
-It follows the last payload chunk. Zero bytes then fill through the next
-`C`-byte boundary. The fill is part of the stored bytes and `stored_digest`.
-Let `K` be the header's key-frame length:
-
-```text
-payload_len       = P + 16 * (P / C)
-footer_offset     = 128 + K + M + payload_len
-stored_size       = roundup(footer_offset + 16, C)
-cipher_offset(i)  = 128 + K + M + i * (C + 16)
-```
-
-Given only stored size and the public header, a Keyless Verifier computes:
-
-```text
-N = floor((stored_size - 128 - K - M - 16) / (C + 16))
-footer_offset = 128 + K + M + N * (C + 16)
-```
-
-It MUST additionally require `N > 0`, `stored_size mod C = 0`,
-`roundup(footer_offset + 16, C) = stored_size`, the footer at that exact
-offset, and all remaining bytes zero. These checks validate geometry and
-completion but do not authenticate the object.
-
-### 5.9. Sealing
-
-A Sealer MUST perform the following logical sequence, using checked
-arithmetic throughout:
-
-1. Validate `C`, `P`, `object_id`, expected digest, and recipient set.
-2. Construct the canonical metadata plaintext.
-3. Generate the DEK, derive the salt, wrap the DEK to every configured
-   recipient, and serialize the canonical key frame.
-4. Serialize the final scalar header, including `M`, salt, wrap suite, and
-   `K`.
-5. Hash the scalar header plus key frame; derive the object, metadata, and
-   payload keys.
-6. Emit header, key frame, encrypted metadata, and every encrypted
-   full payload chunk while recomputing plaintext size and SHA-256.
-7. Reject any expected/observed size or digest mismatch and reject source
-   bytes beyond `P`.
-8. Emit the footer and zero fill. A failed seal MUST NOT be represented as a
-   completed object.
-
-### 5.10. Opening, Recovery, and Keyless Inspection
-
-A keyed Reader MUST parse the scalar header, require format value 2, read and
-canonically parse the key frame, select the slot matching the supplied epoch
-id, and unwrap the DEK using Section 5.3. It then derives the
-keys, authenticates and parses metadata, rederives the salt, decrypts exactly
-`N` chunks, verifies plaintext size and SHA-256, verifies the footer and zero
-fill, and requires end of input. It MUST release no unauthenticated chunk.
-
-After whole-object authentication, a recovery implementation SHOULD validate
-the inner RAO stream and MUST compare its `REMANENCE.object_id` with the scalar
-header before publishing restored members. Catalogless recovery is possible:
-an object plus one matching recipient private key is sufficient. Recovery
-output SHOULD be staged and published only after complete success.
-
-A Keyless Verifier MAY parse the header and key frame, compute
-`stored_digest`, and validate Section 5.8 geometry, footer, and fill. It MUST
-describe this result as public structural consistency, not cryptographic
-authenticity or provenance.
 
 ## 6. Partial File Restore
 
@@ -1678,8 +1217,9 @@ arithmetic. The per-file index — `first_chunk_lba` (an inner `BodyLba`) and
 both representations** of an object, because both wrap the same canonical
 bytes. Catalog per-file rows therefore need to be stored once per object, not
 per copy. Restorers MUST treat plaintext offsets (inner `BodyLba`, file byte
-ranges) as the source of truth and MUST NOT make ciphertext offsets canonical;
-stored offsets are derived, reproducible from this section.
+ranges) as the source of truth and MUST NOT make representation-specific
+stored offsets canonical; stored offsets are reproducible from this section
+(plaintext) and REM-ENCRYPT §6.3 (ciphertext).
 
 **Hardlinks.** A hardlink entry has `size_bytes = 0` and `first_chunk_lba`
 `null` (Section 4.7.2); it stores none of its own content. PFR on a hardlinked
@@ -1719,75 +1259,25 @@ bytes, with unrelated stream bytes after them (Section 4.6.4) — trim by `Z`,
 never by block boundaries. For a **plaintext copy** this is the whole
 computation: inner blocks are stored blocks; read them and trim.
 
-### 6.3. Ciphertext Mapping (Encrypted Representation)
-
-Inner body block `b` is AEAD chunk `b` (Section 5.7). Let
-`K = key_frame_len` and `F = 128 + K + metadata_frame_len`:
-
-```text
-cipher_offset(b) = F + b × (C + 16)
-cipher_len       = C + 16
-nonce counter    = b
-final_flag       = 0x01 if b == object_chunk_count − 1, else 0x00
-```
-
-Here `object_chunk_count` is the **envelope-wide** chunk count `N` of Section 5.7
-(`N = plaintext_size / chunk_size`), which governs AEAD finality — not the
-per-file `chunk_count` of Section 4.6.4. The Restorer fetches each stored range
-`[cipher_offset(b), cipher_offset(b) +
-C + 16)` for `b` in `b_first ..= b_last` (a single contiguous stored range,
-since consecutive chunks are adjacent), authenticates and decrypts each chunk
-with the nonce above, concatenates the plaintexts, and slices the requested
-bytes per Section 6.2. Finality comes from the formula — that is, from the
-authenticated `plaintext_size` — never from probing. A Restorer MUST NOT
-release plaintext from a chunk whose tag failed (Section 5.10). A Restorer MAY
-release each chunk's plaintext as that chunk is authenticated (memory-bounded
-streaming); a chunk whose tag fails MUST abort the range read, and the
-Restorer MUST signal the failure to its Consumer so that an
-already-released, individually-authenticated prefix is never mistaken for a
-complete range. A partial release is not a successful range read. `chunk_count`
-and `F` require the decrypted metadata frame; PFR on an encrypted copy
-therefore requires the key by construction, plus one metadata-frame read. The
-per-file row comes from the catalog; with no catalog, recovery of an encrypted
-copy decrypts the inner stream sequentially until the manifest — the final
-entry — is parsed, because encrypted bootstrap rows deliberately carry no
-manifest anchor (Section 8.2); PFR against the freshly recovered manifest then
-proceeds by this same mapping.
-
 ### 6.4. Stored-Block Mapping (Tape and Block-Addressed Backends)
 
-On a byte-addressed backend (file, object store with range reads), the
-Section 6.3 stored byte range is fetched directly. On tape, the stored copy is
-one tape file of fixed blocks of size `C` (Section 8.2), addressed by stored
-`BodyLba`. A stored byte range `[a, a + l)` maps to stored blocks:
+On a byte-addressed backend, a stored byte range is fetched directly. On a
+fixed-block backend, including the tape binding of Section 8.2, a non-empty
+stored byte range `[a, a + l)` maps to:
 
 ```text
 first_stored_block = floor(a / C)
 last_stored_block  = floor((a + l − 1) / C)
 ```
 
-Because each stored chunk is `C + 16` bytes, the ciphertext of one inner block
-spans at most `ceil((C + 16) / C) + 1 = 3` consecutive stored blocks, and a
-run of `k` consecutive chunks occupies one contiguous stored-block range of at
-most `k + ceil(16 × k / C) + 1` blocks — `k + 2` whenever `16 × k ≤ C` (the
-16-byte-per-chunk tag slip is why stored `BodyLba` ≠
-inner `BodyLba` for encrypted copies). This bounded, contiguous read
-amplification is the accepted cost of keeping the stored stream block-uniform;
-the rationale and the rejected alternative are in Appendix B.
-
 ## 7. Digests, Integrity, and the Verification Chain
 
 ### 7.1. The Chain of Trust
 
 ```text
-off-tape catalog                      on-tape parity-layer bootstrap row
-(stored_digest + plaintext_digest     (plaintext copies: manifest location +
- per copy — Section 12.5 trust         manifest_sha256; encrypted copies:
- domain)                               the Section 8.2 envelope fields only)
-        │  externally anchored; the bootstrap is parity-protected on tape
-        ▼
-[encrypted copies] envelope: header-bound derived keys → authenticated metadata frame
-        │            (plaintext_size, plaintext_digest) → per-chunk Poly1305 tags
+external catalog / plaintext bootstrap anchor
+(stored_digest, plaintext_digest, manifest location + manifest_sha256)
+        │
         ▼
 canonical plaintext object ── byte-verified by plaintext_digest
         │
@@ -1803,14 +1293,9 @@ payload bytes ── byte-verified by file_sha256
 ```
 
 The pax `REMANENCE.file_sha256` keywords duplicate the manifest hashes as a
-within-stream cross-check. For an encrypted copy, the decrypted manifest's
-anchor is the authenticated `plaintext_digest`, which covers every canonical
-byte including the manifest; the Section 4.7.2 anchor-digest obligation is
-satisfied by it (with the manifest entry's own pax `REMANENCE.file_sha256` as
-the within-stream self-consistency check) — external manifest anchors exist
-for plaintext copies only (Section 8.2). What the chain does **not** provide is
-covered in Sections 12.6 (no self-authentication of plaintext copies) and 12.7
-(non-committing AEAD).
+within-stream cross-check. This plaintext chain provides integrity, not
+authentication (Section 12.6). Encrypted copies add an authenticated envelope
+layer (REM-ENCRYPT §7.1).
 
 ### 7.2. Write-Path Verification (No Extra Reads)
 
@@ -1826,10 +1311,8 @@ writer — the chain costs hash arithmetic, never an additional read pass:
 2. **Canonical stream, at build.** The Builder computes `plaintext_digest`
    (= the plaintext copy's `stored_digest`) over its own emitted byte stream,
    and reports it with the layout for cataloging.
-3. **Envelope, at seal.** The Sealer recomputes size and digest of the bytes
-   actually sealed and fails — footer unwritten — on mismatch (Section 5.9
-   step 7). It computes the encrypted copy's `stored_digest` over its own
-   emitted bytes.
+
+REM-ENCRYPT §7.2 specifies the additional encrypted write-path discharge.
 
 ### 7.3. Post-Write Re-Verification (Deployment Obligation)
 
@@ -1837,9 +1320,9 @@ After each copy is written, and before that copy is recorded durable, the
 deployment is expected to re-read the copy via the object read path and
 re-verify it —
 for a full verification, every **regular** member's `file_sha256` plus the
-Section 7.4 non-regular correspondence and hardlink referential checks (which
-transitively exercise the envelope on encrypted copies); at minimum, the copy's
-`stored_digest`. This is a media/transmission guard, deliberately distinct
+Section 7.4 non-regular correspondence and hardlink referential checks; at
+minimum, the copy's `stored_digest`. REM-ENCRYPT §7.3 defines the corresponding
+encrypted-copy procedure. This is a media/transmission guard, deliberately distinct
 from the Section 7.2 build checks: it is the one intentional extra read in the
 pipeline, and it is a *deployment* (workflow) obligation rather than a property
 of the bytes — a conformant Verifier (Section 7.4) is the tool that discharges
@@ -1847,9 +1330,10 @@ it.
 
 ### 7.4. Verifier Profile
 
-A Verifier validates one stored copy end to end without extracting it:
+A Verifier reports all nonconformities, not first-error-only, in every
+representation.
 
-- **Plaintext copy**: the full restore-mode read of Section 4.9 with every
+A Core Verifier performs the full restore-mode read of Section 4.9 with every
   regular entry's digest checked, manifest anchor-digest and schema validation
   (Section 4.7.2), manifest-vs-archive correspondence (every member entry
   appears in `file_entries` with matching `path` and `entry_type`; **regular
@@ -1859,20 +1343,11 @@ A Verifier validates one stored copy end to end without extracting it:
   primary (Section 4.6); **symlink/directory entries** carry zero/`null`
   content fields; and `file_entries` lists nothing absent from the archive),
   exact `object_metadata` inventory validation (Section 4.7.6), final-fill
-  zero check (Section 4.8), and
-  report-all-nonconformities (not first-error-only), plus a `stored_digest`
+  zero check (Section 4.8), plus a `stored_digest`
   comparison against the catalog value when available.
-- **Encrypted copy (keyed)**: Section 5.10 in full (header, metadata, salt
-  derivation, every chunk tag, plaintext size+digest, footer, fill, inner
-  cross-checks), with the recovered inner stream verified as above, plus the
-  `stored_digest` comparison.
-- **Encrypted copy (keyless)**: Section 5.10 — structure plus `stored_digest`;
-  explicitly not an authentication claim.
 
-A successful keyed verification means: every payload byte hashes to its
-declared identity, the object's self-description is complete and consistent,
-and (encrypted) every stored chunk authenticates under the object's derived
-keys.
+REM-ENCRYPT §7.4 defines the keyed and keyless encrypted-copy profiles and
+requires the recovered inner stream to pass this Core profile.
 
 ### 7.5. Scrub
 
@@ -1885,14 +1360,13 @@ operate on stored bytes and are representation-agnostic.
 
 ### 8.1. The Byte-Format Contract
 
-An RAO object in either representation is a byte string. Any conformant tool
+A REM-OBJECT in either representation is a byte string. Any conformant tool
 can produce it; any backend can store it; `stored_digest` is computed over the
 identical bytes everywhere ("byte-stable fanout"). A backend needs no keys, no
 plaintext access, and no format knowledge to store, replicate, compare, or
 scrub a copy. Backends SHOULD record per copy: location, representation,
-`stored_digest`, `stored_size_bytes`/block count, `chunk_size`,
-`format_version`, `metadata_frame_len`, `key_frame_len`, and the recipient
-epoch ids actually present.
+`stored_digest`, `stored_size_bytes`/block count, and `chunk_size`.
+REM-ENCRYPT §8.1 specifies additional records for encrypted copies.
 
 ### 8.2. Tape Binding
 
@@ -1908,28 +1382,20 @@ object's stored bytes on any backend.
 Bootstrap rows differ by representation, deliberately. A **plaintext**
 object's row carries the manifest anchors (`manifest_first_chunk_lba` — an
 inner `BodyLba` — `manifest_size_bytes`, `manifest_chunk_count`,
-`manifest_sha256`). An **encrypted** object's row carries no manifest anchors
-— only the public envelope geometry and recipient epochs; [REMPARITY] states this as a
-normative rule of its bootstrap rows, and a Writer producing the tape
-binding MUST honor it. Manifest size and location are
-structural facts about confidential content — manifest size correlates
-directly with member count — and the bootstrap is plaintext on the very tape
-the envelope protects; the envelope's authenticated metadata already anchors
-the manifest more strongly than an external digest could (Section 7.1).
-The exact bootstrap encoding belongs to the REM-PARITY specification and is
-not duplicated here. Catalogless recovery begins with stored block 0: it
-reveals `object_id`, format version, and the length of the adjacent key frame,
-from which recipient epochs are read. With the corresponding key, the full self-describing object — the manifest located by sequential
-decryption rather than by anchor — is recovered, an acceptable cost on a recovery path over
-sequential media. Plaintext objects remain fully recoverable keyless
-(Section 4.10).
+`manifest_sha256`). An **encrypted** object's row MUST NOT carry those
+manifest anchors. [REMPARITY] owns the exact row schema, and a Writer
+producing the tape binding MUST honor it.
+
+An encrypted object's catalogless recovery uses its own envelope header and
+key frame (REM-ENCRYPT §5.10). REM-ENCRYPT §12.5 owns the confidentiality
+rationale. Plaintext objects remain fully recoverable keyless (Section 4.10).
 
 ### 8.3. File Binding
 
-The stored bytes as one regular file; RECOMMENDED extension `.rao` for both
+The stored bytes as one regular file; RECOMMENDED extension `.rem-object` for both
 representations (Section 3.4 disambiguates). Writers MUST follow a durable
 commitment protocol: write to an exclusively-created temporary path (e.g.
-`name.rao.partial`), flush and fsync the file before renaming to the final
+`name.rem-object.partial`), flush and fsync the file before renaming to the final
 path, and fsync the containing directory before reporting success. A rename
 without prior synchronization can leave the final name referring to
 incompletely persisted data after a crash. Partial outputs SHOULD be deleted
@@ -1940,7 +1406,8 @@ or quarantined and MUST NOT be referenced by any durable catalog.
 The stored bytes as one object/blob, `stored_digest` recorded as integrity
 metadata, uploaded with whatever integrity the store offers (e.g. checksum
 headers), and verified by digest after upload (Section 7.3). Ranged reads
-(Section 6.3) make PFR efficient without downloading whole objects. The
+(Section 6.2 and REM-ENCRYPT §6.3) make PFR efficient without downloading
+whole objects. The
 encrypted representation is the intended cloud copy; storing plaintext copies
 on shared infrastructure is a deployment policy question, not a format one.
 
@@ -1949,64 +1416,46 @@ on shared infrastructure is a deployment policy question, not a format one.
 The parity layer [REMPARITY] protects tape-resident stored blocks with
 Reed-Solomon parity, block CRCs, parity-epoch sidecar tape files, a filemark
 map, and the replicated BOT bootstrap. **The parity construction and geometry
-are independent of this document**; what RAO relies on, and what it adds to
+are independent of this document**; what REM-OBJECT relies on, and what it adds to
 the bootstrap, is:
 
 1. **Parity is computed over stored bytes** — the ciphertext, when the copy is
    encrypted. The order is: build → (seal) → parity. The parity layer protects
    bytes regardless of content and needs no keys, ever; recovery of damaged
    blocks of an encrypted object proceeds keyless, after which decryption is
-   retried on the recovered stored bytes (Section 5.10 fail-closed rule).
+   retried on the recovered stored bytes (REM-ENCRYPT §12.4 fail-closed
+   rule).
 2. Within one object's tape file there are no parity or bootstrap blocks; the
    object's stored blocks are contiguous (stored `BodyLba` 0..N−1). Parity
    epochs span objects; sidecars land between tape files. None of this is
    visible in, or part of, the object's stored bytes.
 3. An object is *committed* when the parity layer's durable object-commit
    operation completes ([REMPARITY]); neither representation defines an
-   in-band commit marker (the envelope footer detects incomplete writes; it
-   is not a commit barrier).
-4. The bootstrap row carries, per encrypted object, the public envelope fields
-   required by Section 8.2 and never manifest anchors. This is an additive bootstrap
-   schema requirement, not a change to the parity construction.
+   in-band commit marker. REM-ENCRYPT completion framing is not a commit
+   barrier.
+4. **Informative:** [REMPARITY] defines the encrypted-object bootstrap schema,
+   while Section 8.2 states the Core Writer obligation. This relationship is
+   additive and does not change the parity construction.
 
 ## 10. Versioning and Extensibility
 
-The identifiers below are deliberately orthogonal and MUST NOT be used as
-proxies for one another:
+Document version 1.0, stream format identifier `rem-object-v1`, textual stream
+schema version, and manifest schema integer are independent axes and MUST NOT
+be used as proxies for one another. This document's version is not stored in
+an object.
 
-1. **Specification version 2.0** identifies this publication. It normatively
-   describes every format below; it is not stored in an object.
-2. **Plaintext stream schema version** is the text
-   `REMANENCE.schema_version`: `1.0` when no xattr is preserved and `1.1` when
-   any xattr is preserved; `ext` containers and the `object_metadata` inventory
-   do not affect the gate. Both use `REMANENCE.format_id = rao-v1` and manifest
-   integer `schema_version = 1`.
-3. **Envelope magic `RAO1`** is a fixed format-family constant, not a version.
-4. **Encrypted-envelope `format_version`** is the byte at header offset
-   `0x06`: value `2` identifies HPKE-wrapped-DEK encryption. Value `1` is
-   permanently reserved, MUST never be accepted, and MUST never be
-   reassigned. The field does not indicate the stream schema and is unrelated
-   to the decimal specification version.
-5. **The `rao2-*` HKDF labels** in Section 5.5 are frozen derivation constants
-   historically tied to envelope `format_version = 2`. They do not identify
-   specification version 2.0.
+`REMANENCE.schema_version` is `1.0` when no xattr is preserved and `1.1`
+when any xattr is preserved. Extension containers and the `object_metadata`
+inventory do not affect this gate. Both stream-schema values use
+`REMANENCE.format_id = rem-object-v1` and manifest
+`schema_version = 1`.
 
-RAO 2.0 changes only the encrypted representation's KEM and its resulting key
-frame. It does not change the `RAO1` magic, on-tape `format_version = 2`, or
-the `rao2-*` HKDF labels.
-
-A Reader of `rao-v1` gates on stream-schema major 1 and ignores unknown pax
+A Reader of `rem-object-v1` gates on stream-schema major 1 and ignores unknown pax
 keywords, manifest keys, and extension-container keys. Extensions MUST NOT
 change an existing field's meaning, alignment, entry semantics, compression
 or encryption gates, or any other rule enforced by this document. Such a
-change requires a new stream `format_id`.
-
-For the `RAO1` envelope magic, only the header form in Section 5.2 is valid:
-format value `2`, X-Wing HPKE wrap suite `0x02`, and a key frame. Wrap suite
-`0x01` is forbidden and permanently reserved. Unknown or reserved format or
-suite values are hard errors, not negotiation. A future envelope change not
-expressible by ignorable metadata requires a new format value or magic and a
-successor specification.
+change requires a new stream `format_id`. REM-ENCRYPT §10 independently owns
+encrypted-envelope versioning and registries.
 
 A Repacker (Section 2.2) MUST reproduce unknown manifest keys and unrecognized
 extension-container members unchanged under the Section 4.7.1 canonical
@@ -2025,9 +1474,8 @@ claims (Section 14).
 Implementations SHOULD expose typed errors equivalent to the taxonomy below.
 Names are normative for the test-vector manifests (Section 13); surface syntax
 is not. I/O failures MUST remain distinguishable from format violations so
-callers can tell storage problems from invalid objects. Code paths reachable
-from object bytes MUST NOT panic, crash, or allocate unboundedly
-(Section 12.9).
+callers can tell storage problems from invalid objects. Section 12.9 governs
+hostile-input behavior.
 
 ### 11.1. Plaintext-Stream Errors
 
@@ -2061,177 +1509,30 @@ SourceIo                  payload source read failure (not a format violation)
 TapeIo                    block sink/source failure (not a format violation)
 ```
 
-### 11.2. Envelope Errors (Encrypted Representation)
-
-```text
-InvalidMagicBytes            input does not begin with RAO1
-InvalidHeaderLength          header_len field is not 128
-UnsupportedFormatVersion     format_version is not 2
-InvalidSuite                 suite_id is not 0x01
-InvalidChunkSize             chunk_size is zero or not a multiple of 512
-ReservedBytesNotZero         flags or reserved bytes are nonzero
-InvalidWrapSuite             wrap_suite is not 0x02, including forbidden
-                             X25519-only suite 0x01 and reserved suite 0
-InvalidKeyFrameLength        key_frame_len violates the version gate or bounds
-InvalidKeyFrame              malformed or non-canonical RAOK frame
-RecipientEpochMismatch       no slot matches the supplied private-key epoch
-HpkeFailed                   HPKE key parsing, setup, wrap, or unwrap failed
-EntropyUnavailable           OS-backed randomness could not be obtained
-InvalidSalt                  all-zero hkdf_salt
-SaltDerivationMismatch       header hkdf_salt differs from Section 5.5 derivation
-InvalidObjectIdField         object_id field all-NUL, interior NUL, or invalid
-                             UTF-8 (reader-side; a >64-byte object_id is
-                             rejected at sealing time as InvalidInput, 5.2)
-MetadataFrameLengthInvalid   metadata_frame_len outside [17, 16 MiB]
-UnexpectedEof                declared header, metadata frame, footer, or fill bytes missing
-MissingFinalChunk            EOF within the payload frame before an authenticated final chunk
-AeadAuthenticationFailed     metadata or chunk tag verification failed
-InvalidCborEncoding          metadata frame plaintext is not valid metadata-profile CBOR (5.6)
-MissingRequiredMetadataField required metadata key absent
-InvalidMetadataField         metadata key wrong type/value; plaintext_size zero, not a
-                             multiple of chunk_size, or implying overflow
-PlaintextDigestMismatch      computed canonical-bytes digest differs from plaintext_digest
-PlaintextSizeMismatch        computed canonical-bytes size differs from plaintext_size
-InvalidFooter                bytes at footer_offset are not the footer
-FillNotZero                  nonzero byte in the post-footer fill
-TrailingData                 bytes beyond stored_size_bytes in a whole-object input
-InnerObjectMismatch          decrypted stream's object_id / chunk_size / format gates
-                             disagree with the envelope header (Section 5.10)
-InvalidInput                 sealing input violates Section 5.9 step 1 (writer-side)
-Io                           underlying I/O failure that is not a format violation
-```
-
-The recommended detection orders are Section 5.2 (header) and Section 5.10
-(whole object). For multi-fault inputs any applicable error is conformant;
-test vectors are single-fault by construction (Section 13).
-
 ## 12. Security Considerations
-
-### 12.1. Per-Object Key Uniqueness Is Structural
-
-Every seal MUST use a fresh uniformly random 32-byte DEK and fresh HPKE
-encapsulation randomness for every recipient, following [RFC9180] Section
-9.2.3. Entropy failure is fatal. The DEK feeds both the salt derivation and
-the header-bound key schedule, so independent seals of identical canonical
-bytes produce independent envelope keys and normally different stored bytes.
-
-Within one envelope, `header_hash` binds the complete scalar header and key
-frame, including `object_id`, recipient slots, encapsulations, and wrapped-DEK
-ciphertexts. The derived salt also binds `object_id`, `plaintext_digest`, and
-the metadata hash. Reusing an `object_id` is still forbidden by the object
-model, but it does not collapse distinct seals onto one key because their
-DEKs are independently random. The remaining catastrophic cases require a
-DEK collision, a primitive break, or a defective entropy source; the Sealer's
-fail-closed obligation is therefore part of nonce safety, not merely an
-availability policy.
-
-The deterministic entry point used to generate Section 13 vectors injects a
-fixed DEK and seeded encapsulation stream solely for reproducible conformance
-artifacts. It is not a production sealing mode; production callers MUST use
-operating-system entropy as required by Section 5.4.
-
-### 12.2. Key Separation Is Required for Nonce Safety
-
-The metadata nonce (12 zero bytes) is byte-identical to the nonce of a
-non-final payload chunk 0. The construction is safe only because
-`metadata_key` ≠ `payload_key`. Any change that unifies the keys converts this
-coincidence into real nonce reuse. A future revision MUST NOT merge the
-metadata and payload keys.
-
-### 12.3. Binding Without AAD
-
-Both AEADs use empty AAD. Object identity and chunk position are bound
-structurally: the scalar header and the complete key frame are bound
-through `header_hash` in the key derivation, and the chunk
-index and finality are bound through the nonce. Cross-object splicing fails
-because the keys differ; intra-object reordering, duplication, or truncation
-fails because the nonce (index, finality) or the missing final chunk fails
-authentication. Re-binding the same facts as AAD would add bytes and a second
-mechanism without adding security.
-
-Downgrade resistance is confirmed, not assumed. `wrap_suite` is authenticated
-twice: it is in the scalar header covered by `header_hash`, which feeds the
-metadata and payload AEAD keys, and it is the final byte of the HPKE `info`
-transcript, which binds the DEK unwrap. Changing `0x02` to the forbidden
-`0x01` is rejected structurally; any hypothetical value accepted under a
-different parser would still alter both cryptographic transcripts. The
-Section 12.7 caveat that a public-key holder can create a new, internally
-consistent object is unrelated to downgrade of an existing object.
-
-### 12.4. Fail-Closed
-
-A failed chunk or metadata tag MUST stop processing without releasing that
-chunk's plaintext (Sections 5.10, 6.3); a failed seal MUST NOT produce a footer
-(Section 5.9); a parity or CRC failure on stored blocks is repaired by the
-parity layer before decryption is retried. Partial plaintext is never emitted
-as success; streamed output is not valid until the whole-object open succeeds.
-
-### 12.5. Confidentiality Boundary and Size Leakage
-
-An encrypted copy reveals, by design: that it is an RAO object; the format and
-suites; `chunk_size`; recipient epoch ids and labels; the
-salt; public frame lengths; `object_id`; and its stored length — from which the
-**exact** `plaintext_size` and `chunk_count` are derivable by the Section 5.8
-arithmetic. Encryption hides content, never size. It reveals no filenames,
-member sizes or count, manifest content, or payload bytes. Deployments for
-which the object's existence, identifier, or approximate size is itself
-sensitive must handle that above the format (padding payloads before building,
-opaque object naming); RAO defines no padding mechanism.
-
-Two adjacent systems hold facts about encrypted objects in the clear and are
-separate trust domains, out of scope of the format but identified here for
-completeness. The off-tape **catalog** holds paths, per-file rows, and digests —
-cleartext metadata about confidential content, protected by the catalog
-system, not by this format. The on-tape **parity-layer bootstrap** is
-deliberately minimal: for encrypted objects it carries only the envelope
-fields of Section 8.2 and no manifest anchors ([REMPARITY]). It MAY carry
-`object_id` ([REMPARITY] bootstrap key 4), which is itself a public envelope
-fact (listed above) and so adds no leakage; the envelope header in stored block 0
-remains the authoritative source of `object_id` for an encrypted object. The tape
-itself therefore leaks nothing beyond the Section 5.8 header-and-size facts.
 
 ### 12.6. Plaintext Copies Are Not Self-Authenticating
 
-A plaintext RAO object provides integrity plumbing, not authentication: an
+A plaintext REM-OBJECT object provides integrity plumbing, not authentication: an
 attacker who can rewrite the medium can rewrite payloads, pax hashes, and the
 manifest consistently. A lone plaintext object whose hashes verify internally
 proves only self-consistency. The trust anchor is external — the catalog's
 `stored_digest` and, on tape, the bootstrap's parity-protected
 `manifest_sha256` (plaintext rows, Section 8.2). Encrypted copies are
-cryptographically authenticated under keys derived from the wrapped DEK —
-subject to Section 12.7.
+authenticated as specified by REM-ENCRYPT, subject to its
+non-committing-AEAD caveat (REM-ENCRYPT §12.7).
 
-### 12.7. Non-Committing AEAD
-
-ChaCha20-Poly1305 is not key-committing: a party holding multiple candidate
-keys can in principle construct equivocal ciphertext [AEAD-COMMIT]
-[PART-ORACLE]. `stored_digest` does not prevent this because equivocation uses
-one byte string. RAO therefore claims confidentiality and self-consistency,
-not writer identity or provenance. The complete recipient frame is bound, but
-possession of recipient public keys still permits fabrication of a new
-internally valid object. Deployments requiring provenance need an independently
-authenticated or signed external manifest.
-
-### 12.8. Key Rotation and Epoch Longevity
-
-Recipient rotation affects newly sealed objects. Because the key frame is
-included in `header_hash`, rewrapping without resealing is forbidden. An epoch
-private key MUST NOT be destroyed while any live object's key frame references
-it. The `reseal` operation opens an existing envelope with a matching
-private key and seals the identical canonical bytes to a new recipient set;
-it is therefore a full re-seal, not a key-frame rewrite. Re-sealing
-preserves `object_id`, `chunk_size`, the canonical bytes, and
-`plaintext_digest`, but uses a fresh DEK and salt and changes the encrypted
-stored bytes and `stored_digest`.
+The off-tape catalog is a separate trust domain: it holds external anchors and
+may hold cleartext paths and per-file rows even when a stored copy is
+encrypted. Protecting catalog confidentiality, integrity, and provenance is a
+deployment obligation outside this byte format. REM-ENCRYPT §12.5 states the
+encrypted-copy public-facts and bootstrap-minimality consequences.
 
 ### 12.9. Hostile-Input Posture
 
 Stored bytes come off removable media and networks and MUST be treated as
-untrusted in both representations. Every parse decision is bounded: the header
-is fixed-size with frozen fields; the metadata frame is length-bounded
-(16 MiB) with CBOR depth/item limits enforced incrementally; payload
-processing uses constant memory per chunk; all arithmetic is checked. In the
-plaintext stream, the ustar header record is checksummed, pax record lengths
+untrusted in both representations. In the plaintext stream, the ustar header
+record is checksummed, pax record lengths
 are validated against the remaining header payload, payload sizes are
 validated against the remaining declared blocks before allocation (streaming
 readers allocate O(1)), and `chunk_size`/block count arrive from the
@@ -2241,9 +1542,10 @@ streaming Readers are immune by construction and are the production path.
 Reader implementations MUST NOT panic, crash, or invoke undefined behavior on
 any byte sequence, SHOULD enforce this mechanically (no `unwrap`/unchecked
 indexing/unchecked arithmetic on reachable paths; forbid `unsafe` where
-practical), and SHOULD validate it with coverage-guided fuzzing of the header
-parser, both CBOR decoders, the record loop, and whole-object open/verify
-(Section 14).
+practical), and SHOULD validate it with coverage-guided fuzzing. Core fuzz
+targets are the record loop, manifest CBOR decoder, and whole-object
+open/verify for plaintext inputs. REM-ENCRYPT §12.9 owns the envelope fuzz
+targets and envelope-specific bounds.
 
 ### 12.10. Path Traversal
 
@@ -2267,10 +1569,10 @@ regular entry writes through `dir/file`.
 `/`-separated relative path, but that grammar is validated against POSIX
 semantics only. On a non-POSIX target filesystem the same bytes can denote
 something else: on Windows a component such as `..\outside` embeds a separator
-the RAO grammar never inspected, and a value like `C:\x` or `\\host\share\x` maps
+the REM-OBJECT grammar never inspected, and a value like `C:\x` or `\\host\share\x` maps
 to a drive-relative or UNC absolute path; case-folding and Unicode normalization
 (e.g. NFC/NFD, or Windows case-insensitivity) can also collapse two
-RAO-distinct entry paths onto one native target. A Restoring Consumer that maps
+REM-OBJECT-distinct entry paths onto one native target. A Restoring Consumer that maps
 entry paths onto a native filesystem MUST therefore, before materializing any
 entry, resolve the entry's native-normalized destination (applying the target's
 separator, case-fold, and Unicode-normalization rules) and MUST reject or report
@@ -2279,9 +1581,10 @@ restore root, resolves to an absolute, drive-relative, or UNC path, or collides
 with a destination already produced by another entry in the same object. This
 preflight is in addition to, not a replacement for, the symlink and traversal
 discipline above. Framing-layer acceptance of a path is a necessary check, not a
-sufficient safety claim. Decrypting an envelope grants no exemption: the inner stream is
-parsed and restored under the same rules. Stock tar extraction has its own
-security model; RAO's standard-tool fallback is faithful, not inherently
+sufficient safety claim. An inner stream recovered through REM-ENCRYPT is
+parsed and restored under these same rules (REM-ENCRYPT §5.10). Stock tar
+extraction has its own
+security model; REM-OBJECT's standard-tool fallback is faithful, not inherently
 sandboxed.
 
 Preserved xattrs are equally untrusted. Attributes such as Linux
@@ -2302,81 +1605,12 @@ Consumer applies only the `user.` portable core by default; every non-`user.`
 namespace and every extension — recognized or not — is carried and, when
 reported, reported by name only, and is applied on restore only when explicit
 operator policy names it. No registered disposition applies an extension-tier
-item by default in RAO 2.0. A Restoring Consumer that reports skipped or
+item by default in this specification. A Restoring Consumer that reports skipped or
 applied names MUST NOT log their values.
-
-### 12.11. Envelope Threat Model and Secret Handling
-
-The encrypted-envelope confidentiality claim is time-scoped:
-
-| Attacker capability | Can read or do | Cannot read, assuming uncompromised primitives and custody |
-| --- | --- | --- |
-| Steals only object media | Public header/key-frame facts and exact size | Metadata and payload |
-| Compromises the sealing host at time T | Host plaintext; in-memory keys; objects being or later sealed while compromise persists; substitute future recipient keys if pinning also fails | Earlier objects whose DEKs and recipient private keys are absent |
-| Holds one recipient private key | Every object wrapped to that epoch | Objects not wrapped to that epoch |
-| Holds only recipient public keys | Create new internally valid objects; observe public facts | Existing-object plaintext |
-
-The last row is why catalogless recovery establishes confidentiality and
-self-consistency, not provenance. Recipient public keys MUST be pinned by an
-independent custody process if key substitution is in scope. At least two
-distinct-custody recipients reduce loss risk but do not impose a cryptographic
-threshold: either private key decrypts alone.
-
-Implementations SHOULD keep DEKs, derived keys, recipient private
-keys, HPKE ephemeral secrets, and RNG state in non-cloneable or otherwise
-minimally copied containers and MUST zeroize mutable secret buffers promptly
-after use. Secrets MUST NOT appear in logs, diagnostics, command lines, core
-dumps, or durable plaintext staging. Whole-object recovery SHOULD stage
-plaintext on suitably protected storage and publish it only after full
-authentication; deletion cannot guarantee erasure on copy-on-write or flash
-media.
-
-**Post-quantum confidentiality.** RAO 2.0 supersedes the RAO 1.0
-X25519-only encrypted representation. X-Wing [XWING-DRAFT10] is the sole wrap
-KEM, and X25519 alone is forbidden. No production RAO 1.0 encrypted object
-was written; any new encrypted object MUST use RAO 2.0. The motivation is
-harvest-now, decrypt-later: an adversary can retain stolen archival media for
-decades and wait for a cryptographically relevant quantum computer. Hybrid
-protection at first seal addresses that exposure while retaining X25519 as a
-classical hedge.
-
-X-Wing satisfies MAL-BIND-K-PK and MAL-BIND-K-CT: even under
-maliciously-generated keys it binds the shared secret both to the recipient
-public key and to the ciphertext. Raw ML-KEM does not provide either
-property. This is material to RAO's multi-recipient key frame, where one DEK
-is independently wrapped to `N` recipient public keys: an attacker must not
-make one shared secret ambiguously attributable to another recipient key or
-encapsulation.
-
-The hybrid has no cryptanalytic security cost relative to X25519 alone under
-the construction's stated assumptions, but it does add ML-KEM, combiner, and
-integration attack surface. The static draft-10 and RAO wrap KATs, the
-formally verified libcrux ML-KEM implementation used by the reference
-implementation [LIBCRUX-MLKEM], and constant-time integration review are
-therefore mandatory reference-release controls. Formal verification covers
-the constituent implementation and does not prove RAO's HPKE `info`, X-Wing
-combiner glue, key-frame serialization, entropy handling, or zeroization;
-those remain separately audited and KAT-gated. Libcrux is an implementation
-choice, not a normative format dependency.
-
-Operationally, resealing is not a lightweight re-wrap. Because Section 5.5 binds
-the entire key frame into the derived AEAD keys, the wrapped DEK cannot be
-replaced in isolation: re-wrapping under a new KEM forces re-deriving the object's
-keys and **re-encrypting the whole object**, which — on append-only media — means
-writing a fresh object to new media. Deployments SHOULD therefore fold resealing
-into the periodic media-refresh (migration) cycle they already run, accepting that
-it transits plaintext on a trusted host and reads and writes the full object. Two
-limits are inherent: resealing protects only media still under the archive's
-control — a legacy RAO 1.0 X25519-only copy already exfiltrated retains its
-original quantum-vulnerable key frame and cannot be retroactively protected;
-and the format's self-describing, catalogless-recovery property (the object
-opens from its own on-media key frame) is precisely what makes that key frame
-the exposure. For genuinely long-secrecy holdings, RAO 2.0's hybrid wrapping
-at first seal is stronger than relying on later resealing.
 
 ### 12.12. Disclosure in Published Plaintext Objects
 
-A plaintext RAO object provides integrity plumbing (Section 12.6), not
+A plaintext REM-OBJECT object provides integrity plumbing (Section 12.6), not
 confidentiality: its manifest is readable with any CBOR tool (Section 4.10).
 Publishing a plaintext object discloses, at minimum: every entry path and
 (possibly absolute or dangling) symlink target; the directory tree and
@@ -2385,8 +1619,8 @@ values; `file_id`, `object_id`, `caller_object_id`, `write_timestamp`, and
 `chunk_size`; every captured attribute value; and the `object_metadata`
 inventory itself, which names the non-`user.` namespaces and extensions
 present (revealing, for example, macOS or Windows origin). The encrypted
-representation places the manifest inside the encrypted,
-per-chunk-authenticated payload (Sections 5.1, 5.7) and does not have this
+representation seals the manifest inside the REM-ENCRYPT envelope and does
+not have this
 plaintext-disclosure exposure. Reviewing a plaintext object before publication
 is a deployment (workflow) obligation in the sense of Section 7.3; the
 Verifier-validated inventory (Section 4.7.6) is the intended first-pass
@@ -2406,14 +1640,7 @@ values (e.g. 4096) so full object byte streams are practical to pin; at least
 one vector MUST use `DEFAULT_CHUNK_SIZE`.
 
 The authoritative companion archive is `remanence-test-vectors.tar`, SHA-256
-`7c09f9425a2996daa10cb4766df5b7fb54f562eea33a914d4be0c5013345824f`.
-This archive supersedes
-`fa8570d31d3869155c9a2b4322b0846a5f5b2eb845d08c89ab4a78bcbb5e668f`.
-Plaintext RAO object streams remain byte-identical. The encrypted positive
-objects are regenerated as X-Wing envelopes with `wrap_suite = 0x02`; the
-archive adds the draft-10 X-Wing and deterministic wrapped-DEK KATs, an
-independent X-Wing verifier, and negatives for forbidden `wrap_suite = 0x01`
-and the revised key-frame bounds.
+`b9be8760fd4a85a922e5fa8eaf86840eec0719a5407030b9f6a35f0606ea79bd`.
 The authoritative archive digest names this specific version of the frozen
 conformance distribution. Later additive vector entries are versioned
 supplements carrying their own digest; they do not mutate the conformance
@@ -2421,8 +1648,8 @@ target named by an earlier archive digest.
 Its `MANIFEST.tsv` inventories every contained vector manifest and generated
 artifact, `CHECKSUMS.sha256` authenticates them, and the included `verify.py`
 checks the archive without a source checkout. It contains plaintext and xattr
-positive objects, HPKE-envelope positive objects, and envelope negative
-manifests. The archive's checksums, rather than abbreviated values
+positive objects and plaintext negative manifests. REM-ENCRYPT §13 owns the
+envelope vectors in the same archive. The archive's checksums, rather than abbreviated values
 in this prose, are the byte-identity authority. Payload digests are
 independently checkable with `sha256sum`.
 
@@ -2457,7 +1684,7 @@ manifest pins the exact full object byte stream, or for large vectors
 `(pax_header_offset, data_offset, first_chunk_lba, chunk_count, pad_spaces)`,
 the manifest CBOR bytes, and `manifest_sha256`.
 
-### 13.2. RAO-TV-P1 — Plaintext Object
+### 13.2. REM-OBJECT-TV-P1 — Plaintext Object
 
 Inputs (complete):
 
@@ -2465,13 +1692,13 @@ Inputs (complete):
 | --- | --- |
 | `chunk_size` | 4096 |
 | `object_id` | `00000000-0000-4000-8000-000000000001` |
-| `caller_object_id` | `rao-tv-1` |
+| `caller_object_id` | `rem-object-tv-1` |
 | `write_timestamp` | `2026-01-01T00:00:00Z` |
 | `metadata_preservation` | `minimal` |
 | `manifest_file_id` | `00000000-0000-4000-8000-0000000000ff` |
 | File 0 | `path` = `a/hello.txt`, `file_id` = `00000000-0000-4000-8000-000000000010`, no `mtime`, no `executable` |
-| File 0 contents | The 26 ASCII bytes `hello, rem archive object` + LF |
-| File 0 expected `file_sha256` | `0ea7e9ec3396345c15ef4edf44e91d8cf184feb303ba992b38d65f71dcac37e2` |
+| File 0 contents | The 18 ASCII bytes `hello, rem-object` + LF |
+| File 0 expected `file_sha256` | `f3daa1e791237b4fc5586b0a1a6eefdfb98e0821ff5cef14819f38b9fc4c1a5f` |
 | File 1 | `path` = `b/pattern.bin`, `file_id` = `00000000-0000-4000-8000-000000000011`, no `mtime`, no `executable` |
 | File 1 contents | 5000 bytes; byte `i` = `i mod 256`, `i` = 0…4999 |
 | File 1 expected `file_sha256` | `8026e5c96cf1e502c8deb3e89f8b8bc342f5039b871911a92eb10edf9c6542d3` |
@@ -2485,90 +1712,38 @@ Expected layout (derivable; the full derivation is worked in Appendix A):
 | File 0: `first_chunk_lba`, `chunk_count` | 1, 1 (data at byte 4096) |
 | File 1: pax record at offset | 4608; pad record `2320 REMANENCE.pad=` + 2300 spaces + LF |
 | File 1: `first_chunk_lba`, `chunk_count` | 2, 2 (data at byte 8192) |
-| Manifest: pax record at offset | 13312; manifest CBOR size 548 bytes |
+| Manifest: pax record at offset | 13312; manifest CBOR size 554 bytes |
 | Manifest: `first_chunk_lba`, `chunk_count` | 4, 1 (data at byte 16384) |
 | Tar EOF at | 17408; `total_size_bytes` = 20480; `projected_size_blocks` = 5 |
 
 Pinned outputs: the exact full object byte stream; the manifest CBOR bytes;
-`manifest_sha256`; `plaintext_digest` = `stored_digest`. Exact values are
-pinned in the companion archive.
+`manifest_sha256 =
+ecbf48e48cc11a78b9d6ae9dd7b5e938724ebdb39834a70f17bde17d3eb133da`;
+and `plaintext_digest = stored_digest =
+d59a4a3e4cf2c447c8ed402b109fbb4060ca84dc5b1cebbdc3acb8ca62d8888c`.
+Exact bytes are pinned in the companion archive.
 
-### 13.3. RAO-TV-E2 — Encrypted Twin of RAO-TV-P1
-
-RAO-TV-E2 seals the exact RAO-TV-P1 canonical bytes. Its manifest records the
-complete inputs and derivation chain; the essential fixed inputs are:
-
-| Input | Value |
-| --- | --- |
-| DEK | byte `7d` repeated 32 times |
-| HPKE RNG seed | byte `c3` repeated 32 times |
-| Slot 0 | index 0; epoch id `61` repeated 16 times; label `archive-2026-01`; 32-byte X-Wing seed `51` repeated; 1216-byte public key pinned in the archive |
-| Slot 1 | index 1; epoch id `62` repeated 16 times; label `recovery-2026-01`; 32-byte X-Wing seed `52` repeated; 1216-byte public key pinned in the archive |
-| Envelope metadata | The four required keys of Section 5.6 |
-
-The recipient seeds, DEK, and HPKE RNG seed are public test material, not
-operational examples. Expected geometry is:
-
-| Quantity | Expected value |
-| --- | --- |
-| `plaintext_size` `P` | 20480; `chunk_count` = 5 |
-| Key frame | `K` = 2408 bytes; two recipient slots |
-| Metadata plaintext | 50-byte map `{0: 1, 1: 20480, 2: "sha256", 3: <32 digest bytes>}` |
-| `metadata_frame_len` `M` | 66 |
-| Payload frame | bytes 2602–23161 (5 chunks × 4112) |
-| `footer_offset` | 23162; footer + 1398 zero-fill bytes |
-| `stored_size_bytes` / blocks | 24576 / 6 |
-
-The manifest pins each recipient's `enc`, wrapped-DEK ciphertext, HPKE shared
-secret, HPKE AEAD key and base nonce; the metadata plaintext and hash; derived
-`hkdf_salt` (`ctr = 0x00`), `object_secret`, `metadata_key`, and `payload_key`;
-the exact header, key frame, metadata frame, and `header_hash`; payload-frame
-SHA-256; `stored_digest`; and `plaintext_digest`. Required equality: the
-`plaintext_digest` MUST equal RAO-TV-P1's `stored_digest`.
-
-The reference generator calls `seal_deterministic_for_test_vectors` with the
-fixed DEK and seed, generates the object twice, and requires byte equality
-with `rao/objects/rao-tv-e2.rao`. This deterministic-generation hook exists
-solely to reproduce conformance artifacts. Production sealing uses a fresh
-DEK and operating-system-backed HPKE randomness as required by Section 5.4.
-The independent verifier implements only the OPEN direction from this prose
-using generic cryptographic primitives; it unwraps both slots and verifies the
-canonical bytes, metadata digest, manifest, and per-file digests.
-
-### 13.4. RAO-TV-D1 — Default Chunk Size
+### 13.4. REM-OBJECT-TV-D1 — Default Chunk Size
 
 One vector MUST use `DEFAULT_CHUNK_SIZE`. Inputs: `chunk_size` 262144;
 `object_id` `00000000-0000-4000-8000-000000000002`; `caller_object_id`
-`rao-tv-d1`; `write_timestamp` `2026-01-01T00:00:00Z`;
+`rem-object-tv-d1`; `write_timestamp` `2026-01-01T00:00:00Z`;
 `metadata_preservation` `minimal`; `manifest_file_id`
 `00000000-0000-4000-8000-0000000000fe`; one file `v.bin`, `file_id`
 `00000000-0000-4000-8000-000000000012`, contents 262145 bytes with byte `i` =
 `i mod 256` (expected `file_sha256`
 `c35991ad254f48ff8b02becb9f0cc56581e86a0b477b13e5ebb0030a3b91c848`,
-`chunk_count` 2), represented both as plaintext and as a two-recipient X-Wing
-HPKE envelope. The encrypted half uses DEK byte `5d` repeated 32 times, HPKE
-RNG seed byte `a7` repeated 32 times, and the two recipient X-Wing seed/public
-key pairs recorded in its manifest. Its key frame is 2402 bytes, payload
-frame is bytes 2598–1051237, and `footer_offset` is 1051238. Its metadata
-frame is 68 bytes, and its stored size is 1310720 bytes (5 blocks). Pinned
-outputs as in 13.2/13.3
-(digests only for the large streams; exact bytes for header, metadata frame,
-and manifest).
+`chunk_count` 2). The plaintext object is 1048576 bytes (4 blocks);
+its manifest is 358 bytes at inner `BodyLba` 3;
+`manifest_sha256 =
+2e2de7f397bcf83237edf308432c4bff0a7922150177851749666e35fe660599`;
+and `stored_digest = plaintext_digest =
+5d07a7aca146a80dfae22f06de976924a6f5c95aceff119b057894a3ab8e1bf5`.
+REM-ENCRYPT §13.2 specifies the encrypted copy.
 
-The additive `encrypted-last-object-chunk` range vector uses RAO-TV-D1's
-manifest range: `first_inner_chunk = 3`, `range_start = 0`, and
-`range_len = 351`. Since D1 has `object_chunk_count = 4`, this range covers
-the true final object chunk (`i = object_chunk_count − 1`) and MUST
-authenticate with `final_flag = 1`, reproducing the exact manifest CBOR,
-`manifest_sha256`, and `plaintext_digest`. The paired
-`encrypted-last-object-chunk-wrong-finality` negative applies
-`final_flag = 0` to that same frame and MUST produce
-`AeadAuthenticationFailed`. A Reader MUST derive finality from the
-envelope-wide `object_chunk_count`, not the selected file's `chunk_count`.
+### 13.5. Xattr Vectors
 
-### 13.5. Xattr and X-Wing/HPKE Component Vectors
-
-`rao/objects/rao-tv-xattrs.rao` and its manifest pin an xattr round trip. The
+`rem-object/objects/rem-object-tv-xattrs.rem-object` and its manifest pin an xattr round trip. The
 entry `tagged.txt` carries `user.comment` with bytes `62 6c 75 65` (`blue`)
 and `user.remanence.color` with bytes `01 02 ff`; the global stream schema is
 `1.1`. Its entry container is equivalent to:
@@ -2584,111 +1759,6 @@ The `plain.txt` entry carries an empty container. The companion manifest pins
 the exact deterministic CBOR, layout, `manifest_sha256`, and
 `stored_digest`. The no-xattr writer path remains schema `1.0` and emits empty
 containers as required by Section 4.7.3.
-
-The archive's `negative-key-frame.json` pins the complete header,
-key-frame, HPKE-tamper, Sealer-slot, and Reader-slot policy matrix described in
-Section 13.6. The positive component vector in
-`rao/kats/xwing-wrap-kat.txt` fixes `object_id = object-a`, epoch id `03`
-repeated 16 times, label `safe-2026`, slot 0, DEK `09` repeated 32 times, and
-a deterministic test-only 64-byte X-Wing encapsulation-randomness draw of
-`42` repeated. The recipient secret is the 32-byte X-Wing seed `07` repeated;
-its public key is the 1216-byte `ML-KEM-768 ek || X25519 pk`. HPKE uses
-`kem_id = 0x647a` and suite
-`"HPKE" || 0x647a || 0x0001 || 0x0003`. The exact seed-to-wrap chain is:
-
-```text
-seed =
-0707070707070707070707070707070707070707070707070707070707070707
-
-pk =
-0e12760b95266a50a52bc6ba3df697c1261d3ba510987a299a83cc0b9134c2ea
-4ddc47889b72c6dea65b49e066b1a2822f269e8ea904a667cfe6f7035aa83cd9
-c041efc38d23053ea6d754c550cd5d1936d4e74ea047c4dcf757de9550972c82
-abcbad83c32838c18451240c0907a573451dc746bc491c143d14837af83c4f4b
-1f5aaa59bd5a2b03c144ba6ccb445bce2d384ab40823271342128a2b7eb68624
-eba59b3b2b57d9a4ac7b630d063400a275ad71b6b08a8cfe93a64d368cef666a
-4d208b8f39c442400c1a7c4677658576417b5b026d99cb80e01428be00c720e2
-20a2705936a62d6e737900bd8c3d0b464ed7650dd7c84c250dd73c7536abbb40
-13809927ccffa5391bb254294c7be0596dd29aa37445957b2aa88dfc54447894
-773a34e8e87b05520c9c2ab4dfd69cdd9a52c7e9352a3ab94c07a26d468f10b2
-632a6a524e06234fbb2008f17cee6a59efc51b4c483fa5264c9fb325e9d7b9b6
-6c6aae91ba9f9a29743968c5533a3750bb9554223b60c8b964cfa7346948cac1
-000d840488c3d211b4e7d463ddb15551862f01d77e87b60899e25164cccc814c
-aa5c0555f5413ffbdcb5101458a26061560463ab33cc2174c61f5861986b55d6
-206612f386c996561b51b63a11be965a1fae45b251476e96c3864925646b6246
-935bbfa9f4bb39437195c6b98cf81a071a70f26b0ea61628fdbc91ed299b6326
-ce7f220aab6965be645ff7c51248e456adb343f10990243401d8e05ebc48b58d
-2a77b21341ef513e66157b83596f1f447695e8c82279922e15987ab14259157e
-e6e07b5ee28dc41c68dbc14c39131fc7a4ccf6420f65479701413d0eab484bd5
-5dc1669e4e3a3eebcb118c899b2cca6cb2dbacf6f5a717ab0bbaf02141299d32
-c88426aa4866173cc12313f2c52624005e6fe176ac02bf45a9964659020bd03b
-9ddb8a99322b0452a2eddc6ea752473f1c1c9ab051dc1973e81b1e8d74640614
-8a8621575f7c71cd2879350a2970740156c69c9ff4cfe97a3ff0a90f16e90336
-f6825bdb8ba0a3ccb2f181d26cc88605493b442a9d5a9f788895b720516c865d
-575c75276c937e2252a486c90e64b1c115060dacaccc3372d1475c3381098275
-bda23a52083c6e671825e57b40606226247432213988a7672d80ca32a2356e16
-1b5a3d5a218cf0c6788c62b786003154c90312001e73bcfdd3312573504a0c40
-2666620b31606883580ea09f690c0cdd948520b19bab2b30fda60dd903c8b4f0
-1a83238ebda1636c911895480a8e5430da58462455488b71a735ca62c1928722
-d57c3d86ce66760433c15357eba556db67adb16f8a02cd995c2525d21b49a060
-20daaaeaea50d332952f399bdc859574c9c9c6056765d1c257e5a655c9a6c619
-167963afc850027a00730d60b33e2b897e71b56466be0fc98a1c314b67b3bae7
-80a622c58eb05570024c989b286763ba420ef234477c2dd8bc86b9c9adfed5a8
-c7b948b6735bad758c04f08025eb01d217ab9407881878466904b2e4965b2275
-155fd1b8000c7b2983a9e8f87243551dc31b884867b3e9418c1d5196f83b2e7e
-dca55cb21dcee430969366fd02a85debbd759763010cb918b13460c33bda4b43
-c2aaec2b4d19800eb45b65c915f8b969eff9e9e356faea1c9cf69659599b22f5
-7b8184a0ce2e4091f1b4b03b77635cf149b6492cf75d285e028a57744c424673
-
-enc =
-bf1279ec3bc4e262e351f79e8bbc11dd14bcae3d277965dd0eacba4a440aa8d5
-1f8058dbb217a9cb1cb68d2d3b6d2703b581320115e4fdab33353bd2b9704559
-f33878081e7948339c4e2b00cb803824fca917adc2b50f72395e4ed464c5be5b
-8e369ffc7a38a1efbe33949dbc29bce4163956e009e8c6585061fa3512db65c2
-bb0f9aa884418cdeeeb96fce0b6f7fc6bd9e45eae3d2cadccd6afe5cca5c41cb
-fd1b405328a5e073fd8bab1c2242dc4ba2f7d8cac6843f3b1579aba4744582a7
-a5b47d1229dfe612c85ac49fbda7b7ad572fce3a5f4b55f3926aa98634abe8a8
-53a336bf71293589a1320c0e4775e8d25a3ea7216621c722d86f4ad75917b197
-104f99928f00acd2452ccf8cedbaf8d2b6503eb6e3eb5c1c400da755af8fa10d
-e0ee3a5a32a9c33b11897efd9098e696069ccbeb895911e392b7a4719c42edb0
-e469bcb09e928fc69e4b984cb702ace75348099e7542d05cd92412afa349f9b9
-1167dd908160d9b4cd7513acec730d6ef05014658c46020931e8676d0228781c
-4fcabc43e36f19545054e6f3ae4b8cc3abd461953b3bc241c2bdcf7dab2b08ce
-518970379a62e79e23f30a58f6105fbb8ad254e74f8bac4225327981d11e7ced
-740ecf64c746fab754fcd355d0179d49f3a1a025f6cc75797352fb48c3e70a44
-0d23e83924c9386e8997717bbe3d1facad3f8380073b55e8ab5168b574880858
-620164a26201c5f3ca52cc029b39257da4c5a409e83b89a3719df3c8dd0f4b47
-11208ab281e693e29c6c53de7714313d9f933148605d18d077ffb96b5354a44b
-cf20c039b0df8390c13c8fff79417731d1fee63b68710f26ff7d55f4cb448f3f
-7c6b814f7c09f2c6c625a38aba6c34d307ad0c4d60bbeb4444c69a81f0e98f01
-c7250d9ad68e4bcaf00eabd46fc3a81c007d93998645c0e5963062a6687d9fb2
-2b779d0723033bf57ba741b517394b2041eca14d23f082fecaa2e10b2d742a40
-909484cf5c9fb9605628a8ee42f8a868d3a45be9832902662d24065d67593178
-79a9b35dadb0acd0bfa361fc54007ea6e51ff6f8567a358d0504cac74e9909d1
-0453b326b5ce06511915ff6c6fca0d19a8db7708eea829716fc9cd8a6756f169
-d82835ed3a54c66e6eab9f9eaf8ef0ae5c11366e41ac2f2e6f56d7bd66dc1627
-f966d141308fb2400e6adad04deceb4fc9988373a1e7b1073ee2e4a47a7025b8
-f5cd4580f0e7ea4a77470e45c5ed026e2a76b516a57b6eebdbfc1410d95334ba
-0b0c6051d00affb51b24f53cab3c532f01a384f76683b7406572c0781aeea06e
-172d2e252486144e3117262ddacad383e94a7e13b7212b08f6371f5cea4b0ab3
-972af98d87f73ad04fbdd8999b3ddd0a179e6958d295e329d5353d37f910024c
-d932059c43b223834d09f2d0c6ed512a8c8b868d77a2336bb03cc55a97b2b9d7
-65257e8d74aee4fa26e033039b886aaaf7339a39aa6373f2a2205d9c38949e8d
-faa410616dc9a5ec0992ec78186dd31a9439b3c224e155c345d705c60af71e26
-132c442be010fbd57e72603328aa76e71fccc1503aae219327d14d9c9993f472
-
-ss =
-02a10e4fd3ec163886969a62568d8ae183c6db7357936b3197765635a8e7dc67
-
-wrapped DEK ciphertext =
-497931404b12b2e9ac5a8b3ea7bb886699dcfa1ba079a1f9913e95bb1063918a
-a61615979f8ca19c79b5f948dcbd9bcf
-```
-
-Concatenate the hex lines within each field; their byte lengths are 32, 1216,
-1120, 32, and 48 respectively. The deterministic entropy source exists only
-to make this X-Wing/HPKE component vector reproducible. Conforming production
-Sealers use OS-backed fresh randomness as required by Sections 5.3 and 12.1.
 
 ### 13.6. Negative Vectors
 
@@ -2729,74 +1799,27 @@ vector pins the typed Section 11 error name and names the affected digest,
 restore-report vector reaches EOF without a manifest and asserts the typed
 `MissingManifest` report rather than silent absence.
 
-**Envelope.** Header: wrong magic; `header_len` ≠ 128; unsupported format
-values (including the permanently reserved value 1); unknown `suite_id`;
-`chunk_size` 0 and `chunk_size` not a multiple of 512; nonzero `flags`;
-nonzero bytes in either reserved region; unknown or reserved `wrap_suite`;
-forbidden X25519-only `wrap_suite = 0x01`; suite 0 with a nonempty frame;
-X-Wing suite with zero, undersized, or oversized `key_frame_len`; all-zero
-`hkdf_salt`;
-all-NUL `object_id` field; interior-NUL `object_id`; non-UTF-8 `object_id`;
-`metadata_frame_len` 16 and `metadata_frame_len` > 16 MiB. Cryptographic
-binding: a flipped salt bit (structurally valid → `AeadAuthenticationFailed`);
-a structurally valid key-frame label, encapsulation, wrapped-DEK ciphertext,
-slot insertion, or slot removal tamper; a
-flipped ciphertext bit in chunk 1; chunks 1 and 2 transposed; wrong final flag
-(a 6th chunk appended / final chunk re-sealed non-final); sealed metadata
-deliberately misstating `plaintext_digest` (opens MUST fail
-`PlaintextDigestMismatch`); an object sealed under an arbitrary (non-derived)
-header salt, otherwise self-consistent (keyed open MUST fail
-`SaltDerivationMismatch`). Metadata: each metadata-profile repertoire
-violation (float, tag, indefinite length, duplicate key, non-shortest
-encoding); missing key 1; `metadata_version` 2; `plaintext_size` not a
-multiple of `chunk_size`; `plaintext_size` 0; overflow-implying
-`plaintext_size`. Framing: EOF inside the metadata frame; EOF mid-chunk;
-payload absent after metadata (`MissingFinalChunk`); footer bytes wrong at the
-correct offset; one nonzero fill byte (`FillNotZero`); bytes appended past the
-fill (`TrailingData` from keyed open/verify; the keyless classification of the
-same input is advisory — Section 5.8). Inner cross-checks (defective-sealer
-harness): inner `object_id` differing from the header; inner `chunk_size`
-differing; inner `REMANENCE.encryption` ≠ `none` (`InnerObjectMismatch`).
-Writer-side: sealing input with `P` not a multiple of `C`; `object_id` > 64
-bytes; recipient counts 0, 1, and greater than 8; duplicate epoch ids;
-non-canonical slot order; or entropy failure.
-
-Key-frame structure additionally covers slot counts 0 and 9, duplicate slot
-indices, misordered slots, duplicate `recipient_epoch_id` values across
-distinct slots, internal slot truncation, trailing frame bytes, malformed
-`RAOK` magic, malformed encapsulation, and a wrong recipient private key. A
-positive case opens a structurally valid one-slot object: a Sealer MAY emit one
-through eight slots (subject to the Section 5.4 single-key-loss survivability
-guidance, with implementations defaulting to at least two), and Readers accept
-one through eight.
-
 ## 14. Conformance
 
 An implementation conforms only for the roles it claims. A conforming Writer
-implements the canonical stream and every feature it emits. A conforming
-encrypted Sealer and Reader MUST implement the complete format-2 header,
-key-frame, HPKE, key schedule, and mode-separation rules. A Reader MAY decline xattr restore,
-but it MUST preserve file-byte recovery, ignore the extension safely, and
-report that the attributes were not applied.
+implements the canonical stream and every feature it emits. A Reader MAY
+decline xattr restore, but it MUST preserve file-byte recovery, ignore the
+extension safely, and report that the attributes were not applied. An
+implementation claiming an encrypted role also conforms to REM-ENCRYPT and
+its Section 13 vectors.
 
 Conformance evidence MUST include:
 
 1. byte-exact agreement with the applicable positive objects and manifests in
    the Section 13 archive;
 2. the applicable typed rejects in the negative manifests, including the
-   key-frame set;
+   Core manifest and plaintext-stream sets;
 3. GNU tar, bsdtar, and Python `tarfile` extraction equality for plaintext
    objects;
-4. authenticated range recovery across a chunk boundary and in the final
-   encrypted chunk;
-5. failure without a completion footer on injected size, digest, entropy, and
-   I/O failures applicable to the claimed mode;
-6. whole-object keyed verification and keyless structural verification with
-   the claims kept distinct;
-7. reconstruction of one catalogless encrypted object using only object bytes, a
-   matching recipient private key, this specification, and generic
-   cryptographic libraries; and
-8. the applicable portable-core, extension-container, object-inventory,
+4. plaintext range recovery across a chunk boundary;
+5. failure without reporting a completed object on injected size, digest, and
+   I/O failures; and
+6. the applicable portable-core, extension-container, object-inventory,
    carry-only restore, Repacker-preservation, and manifest-tamper vectors of
    Section 13.
 
@@ -2808,19 +1831,11 @@ do not mutate the frozen conformance target named by an existing digest.
 
 ## 15. IANA Considerations
 
-The identifiers this specification defines — the `rao-v1` stream format
-identifier, the `REMANENCE.` pax keyword namespace, the `RAO1` envelope magic,
-`format_version` value 2 (with value 1 permanently reserved), the `suite_id`
-value `0x01`, the `wrap_suite` value `0x02` (with the pre-production
-X25519-only value `0x01` permanently reserved), the `"xattrs"` preservation
-key, the `ext` indirection key, and the `object_metadata` inventory keys
+The identifiers this specification defines—the `rem-object-v1` stream format
+identifier, the `REMANENCE.` pax keyword namespace, the `"xattrs"`
+preservation key, the `ext` indirection key, and the `object_metadata` inventory keys
 (`attribute_namespaces`, `extensions`) — are assigned by this document and
 governed by its versioning rules (Section 10).
-
-The HPKE `kem_id` `0x647a` is not assigned by this document. Section 5.3.1
-records both its requested status in draft-10 and its current IANA registry
-status. RAO freezes the value independently for its envelopes and makes no
-IANA request.
 
 This document establishes no IANA registry. Extension names (Section 4.7.5)
 use permissionless reverse-DNS naming and require no central allocation; a
@@ -2845,32 +1860,12 @@ extension containers only and MUST NOT appear as pax keywords.
 - [RFC3629] — Yergeau, F., "UTF-8, a transformation format of ISO 10646",
   STD 63, RFC 3629, November 2003,
   <https://www.rfc-editor.org/info/rfc3629>.
-- [RFC5869] — Krawczyk, H. and P. Eronen, "HMAC-based Extract-and-Expand
-  Key Derivation Function (HKDF)", RFC 5869, May 2010,
-  <https://www.rfc-editor.org/info/rfc5869>.
-- [RFC8439] — Nir, Y. and A. Langley, "ChaCha20 and Poly1305 for IETF
-  Protocols", RFC 8439, June 2018,
-  <https://www.rfc-editor.org/info/rfc8439>.
-- [RFC7748] — Langley, A., Hamburg, M., and S. Turner, "Elliptic Curves for
-  Security", RFC 7748, January 2016,
-  <https://www.rfc-editor.org/info/rfc7748>.
 - [RFC8949] — Bormann, C. and P. Hoffman, "Concise Binary Object
   Representation (CBOR)", STD 94, RFC 8949, December 2020,
   <https://www.rfc-editor.org/info/rfc8949>.
-- [RFC9180] — Barnes, R., Bhargavan, K., Lipp, B., and C. Wood, "Hybrid
-  Public Key Encryption", RFC 9180, February 2022,
-  <https://www.rfc-editor.org/info/rfc9180>.
 - [FIPS180-4] — National Institute of Standards and Technology, "Secure
   Hash Standard (SHS)", FIPS PUB 180-4, August 2015 (defines SHA-256),
   <https://doi.org/10.6028/NIST.FIPS.180-4>.
-- [FIPS202] — National Institute of Standards and Technology, "SHA-3
-  Standard: Permutation-Based Hash and Extendable-Output Functions",
-  FIPS PUB 202, August 2015 (defines SHA3-256 and SHAKE256),
-  <https://doi.org/10.6028/NIST.FIPS.202>.
-- [FIPS203] — National Institute of Standards and Technology,
-  "Module-Lattice-Based Key-Encapsulation Mechanism Standard", FIPS PUB 203,
-  August 2024 (defines ML-KEM-768),
-  <https://doi.org/10.6028/NIST.FIPS.203>.
 - [POSIX-PAX] — IEEE Std 1003.1-2017 (POSIX.1-2017), Shell and Utilities
   volume, `pax` utility, "pax Interchange Format" (ustar and pax extended
   headers), <https://pubs.opengroup.org/onlinepubs/9699919799/>.
@@ -2878,35 +1873,11 @@ extension containers only and MUST NOT appear as pax keywords.
   companion specification published alongside this document: the parity
   layer of Sections 8.2 and 9. Normative only for implementations of the
   Section 8.2 tape binding.
+- [REMENCRYPT] — "REM-ENCRYPT 1.0", companion specification defining the
+  encrypted representation named by this document.
 
 ### 16.2. Informative References
 
-- [XWING-DRAFT10] — Connolly, D., Schwabe, P., and B. E. Westerbaan,
-  "X-Wing: general-purpose hybrid post-quantum KEM",
-  `draft-connolly-cfrg-xwing-kem-10`, 2 March 2026, individual submission,
-  <https://datatracker.ietf.org/doc/html/draft-connolly-cfrg-xwing-kem-10>.
-- [IANA-HPKE] — Internet Assigned Numbers Authority, "Hybrid Public Key
-  Encryption (HPKE): HPKE KEM Identifiers",
-  <https://www.iana.org/assignments/hpke/hpke.xhtml>.
-- [LIBCRUX-MLKEM] — Cryspen, "Verifying Libcrux's ML-KEM", 30 January 2024,
-  <https://cryspen.com/post/ml-kem-verification/>.
-- [AGE] — Valsorda, F. and B. Cartwright-Cox, "The age file encryption
-  format", C2SP (Community Cryptography Specification Project): the payload
-  STREAM construction reference (informative provenance; Section 5.7 is
-  self-contained), <https://c2sp.org/age>.
-- [RFC2104] — Krawczyk, H., Bellare, M., and R. Canetti, "HMAC:
-  Keyed-Hashing for Message Authentication", RFC 2104, February 1997,
-  <https://www.rfc-editor.org/info/rfc2104>.
-- [RFC8446] — Rescorla, E., "The Transport Layer Security (TLS) Protocol
-  Version 1.3", RFC 8446, August 2018,
-  <https://www.rfc-editor.org/info/rfc8446>.
-- [PART-ORACLE] — Len, J., Grubbs, P., and T. Ristenpart, "Partitioning
-  Oracle Attacks", 30th USENIX Security Symposium, 2021,
-  <https://www.usenix.org/conference/usenixsecurity21/presentation/len>.
-- [AEAD-COMMIT] — Albertini, A., Duong, T., Gueron, S., Kölbl, S.,
-  Luykx, A., and S. Schmieg, "How to Abuse and Fix Authenticated Encryption
-  Without Key Commitment", 31st USENIX Security Symposium, 2022,
-  <https://www.usenix.org/conference/usenixsecurity22/presentation/albertini>.
 - [PREMIS] — PREMIS Editorial Committee, "PREMIS Data Dictionary for
   Preservation Metadata", Version 3.0, November 2015, Library of Congress,
   <https://www.loc.gov/standards/premis/v3/>.
@@ -2922,84 +1893,34 @@ extension containers only and MUST NOT appear as pax keywords.
 
 ## Appendix A. Worked Example (Informative)
 
-This appendix derives the Section 13.2/13.3 expected values, exercising the
-alignment equation, the manifest sizing, and the envelope geometry. It is
-informative; the frozen companion archive is the conformance authority.
+This appendix summarizes the Section 13.2 alignment result. The frozen
+companion archive is the byte-level conformance authority.
 
-**RAO-TV-P1, `chunk_size` = 4096.** The global pax body's eight records
-(Section 4.5.1 keywords with the TV-P1 values, `format_id` = `rao-v1`) measure
-39 + 29 + 29 + 30 + 43 + 60 + 32 + 50 = 312 bytes, padding to 512; with its
-`g` record the global header occupies bytes 0–1023.
+For REM-OBJECT-TV-P1 with `chunk_size = 4096`, the global header occupies
+bytes 0–1023. File 0's pax record begins at 1024; its 1792-space
+`REMANENCE.pad` value places the 18-byte payload at byte 4096
+(`BodyLba` 1). File 1's pax record begins at 4608; its 2300-space pad places
+the 5000-byte payload at byte 8192 (`BodyLba` 2).
 
-*File 0* (`a/hello.txt`, 26 bytes): base pax records — `chunk_count` 27,
-`compression` 30, `file_id` 58, `file_sha256` 90, `path` 20, `size` 11 — total
-236 bytes. Pax record offset `O` = 1024; the alignment equation
-`O + 512 + R + 512 ≡ 0 (mod 4096)` gives `R ≡ 2048`; minimum-pad payload
-236 + 18 = 254 rounds to 512 (wrong residue), so the target is `R` = 2048 and
-the pad record is `1812 REMANENCE.pad=` + 1792 spaces + LF (1812 = 4 digits +
-1 space + 13 keyword + 1 `=` + 1792 + 1 LF; the fixed point holds). Pax
-payload 236 + 1812 = 2048 exactly; the ustar header ends at
-1024 + 512 + 2048 + 512 = 4096. Data at `BodyLba` 1; 26 bytes + record padding
-ends the entry at 4608.
-
-*File 1* (`b/pattern.bin`, 5000 bytes): base records 27 + 30 + 58 + 90 + 22 +
-13 = 240. `O` = 4608 → `R ≡ 2560 (mod 4096)` → `R` = 2560; pad record
-`2320 REMANENCE.pad=` + 2300 spaces + LF; data at 8192 (`BodyLba` 2),
-`chunk_count` 2; entry ends at 13312 (5000 bytes pad to 5120).
-
-*Manifest*: deterministic-CBOR sizes — top-level overhead 1; `object_id` 48;
-`chunk_size` 14; `file_entries` 13 + 1 + (194 + 197); `schema_version` 16;
-`object_metadata` 17; `caller_object_id` 26; `external_references` 21 — total
-**548 bytes** (file-entry maps: 194 and 197 bytes respectively, with
-`size_bytes` 26 encoding as `0x18 0x1a` and 5000 as `0x19 0x13 0x88`).
-Manifest pax base records (with `executable=false`, `is_manifest=true`,
-`path` 33, `size` 12) total 310; `O` = 13312 → `R ≡ 2048` → pad record
-`1738 REMANENCE.pad=` + 1718 spaces + LF; manifest data at 16384 (`BodyLba` 4),
-548 bytes padding to 17408. Tar EOF (1024 bytes) ends at 18432; zero fill to
-**20480 = 5 blocks**.
-
-**RAO-TV-E2.** `P` = 20480, `C` = 4096 → `chunk_count` 5. Metadata plaintext:
-`a4 00 01 01 19 50 00 02 66 ... 03 58 20 ...` = 1 + 2 + 4 + 8 + 35 =
-**50 bytes** → `M` = 66. The two-slot X-Wing key frame has `K` = 2408.
-Payload frame = 20480 + 80 = 20560 bytes at offset
-128 + 2408 + 66 = 2602; `footer_offset` = 23162; stored pre-fill length
-23178; fill 1398 →
-**`stored_size_bytes` 24576 = 6 blocks**. The metadata zero nonce is
-byte-identical to payload chunk 0's nonce here (chunk 0 is non-final, nonce
-`00…00 00`) — exactly the collision that the metadata/payload key separation
-renders harmless (Sections 5.6, 12.2).
+The manifest pax record begins at 13312. Its 1718-space pad places the
+554-byte deterministic-CBOR payload at byte 16384 (`BodyLba` 4). Tar EOF
+begins at 17408 and ends at 18432; final fill produces
+`total_size_bytes = 20480`, or five blocks.
 
 ## Appendix B. Design Rationale (Informative)
 
 This appendix records the reasoning behind non-obvious decisions, so future
 revisions do not silently reverse them.
 
-### B.1. AEAD chunk size equals the body block
-
-The AEAD plaintext chunk size is the object's `chunk_size` `C`, not a separate
-constant. Because the canonical object's length is always an exact multiple of
-`C` (the final zero fill guarantees it), plaintext chunk `i` coincides exactly
-with inner body block `i`, so the per-file `BodyLba` index addresses
-ciphertext with no second offset grid and no short-final-chunk cases. Tape
-reads are block-granular anyway, so sub-block AEAD chunks would buy nothing on
-the primary backend while multiplying per-chunk tag/nonce bookkeeping; tag
-overhead is negligible (16/262144 ≈ 0.006%). Accepted cost: ciphertext chunks
-are `C + 16` bytes and so do not land tape-block-aligned — one inner block's
-ciphertext spans up to 3 stored blocks (Section 6.4) — and a byte-addressed
-range fetch reads whole `C + 16` chunks. The alternative of `C − 16` plaintext
-chunks (block-aligned ciphertext, misaligned plaintext) was rejected: it
-destroys the 1:1 block↔chunk identity that keeps PFR arithmetic and parity
-reasoning simple.
-
-### B.2. Encryption is an envelope, never an in-stream flag
+### B.1. Encryption Is an Envelope, Never an In-Stream Flag
 
 `REMANENCE.encryption` is permanently `none`; confidentiality is the
-Section 5 envelope *around* the stream. Flagging encryption inside the global
+REM-ENCRYPT envelope around the stream. Flagging encryption inside the global
 header would break the shared `plaintext_digest` (the two copies' canonical
 bytes would differ), break standard-`tar` extractability of the plaintext
 copy, and place the marker inside the very bytes it claims are encrypted.
 
-### B.3. Two identities: logical and physical
+### B.2. Two Identities: Logical and Physical
 
 `plaintext_digest` (SHA-256 of the complete canonical object) is the logical
 identity, shared by a plaintext and an encrypted copy of one object;
@@ -3011,135 +1932,20 @@ once, fan out"); rebuilding from the same inputs with a new `object_id`,
 timestamp, or `chunk_size` yields a new object, and per-file `file_sha256` is
 the cross-rebuild invariant.
 
-### B.4. Full final chunks only
-
-`plaintext_size` is a positive exact multiple of `C`, every AEAD chunk is
-exactly `C` bytes, and a canonical object is never empty (it always contains
-at least the global header, manifest, and EOF). The age-style STREAM
-construction is used unchanged; RAO objects simply occupy the subset of its
-inputs where the final chunk is full. This removes short-final-chunk and
-empty-payload special cases from the PFR and verification paths.
-
-### B.5. The manifest is confidential in the encrypted representation
-
-Encrypting the whole canonical stream, manifest included, means an encrypted
-object leaks no filenames, sizes, count, or structure (Section 12.5).
-Self-description holds *with the key*; keyless operation keeps exactly the
-scrub/inventory surface of the plaintext header. A cleartext manifest beside
-encrypted payloads was rejected: filenames, sizes, and counts are routinely
-sensitive precisely for the copies that leave the operator's custody, and
-keyless rebuild paths remain available wherever a catalog or a plaintext
-representation of the object exists.
-
-### B.6. Stored bytes are a block multiple; the fill is inside them
-
-An encrypted object's stored bytes include zero fill from the footer to the
-next `C` multiple, covered by `stored_digest` and parity. This gives
-byte-stable fanout (one byte string, identical on tape, disk, and object
-store, with one `stored_digest`), uniform block geometry for parity, no
-backend-specific framing, and — because chunk counts are spaced `C + 16` apart
-while the fill absorbs at most `C − 1` — a keyless-derivable geometry that
-turns footer verification into an exact positional check (Section 5.8). Bytes
-beyond `stored_size_bytes` are rejected (`TrailingData`).
-
-### B.7. Two metadata layers, two CBOR profiles
-
-The **manifest** (manifest-profile CBOR, text keys, inside the canonical
-bytes) is the object's per-file index and is consequently encrypted in the
-encrypted representation. The **envelope metadata frame** (metadata-profile
-CBOR, integer keys) carries only what decryption itself needs
-(`plaintext_size`, `plaintext_digest`). They are not merged: folding per-file
-metadata into the envelope frame would move the index outside the
-self-describing object and bloat a frame whose smallness bounds hostile input.
-Both profiles use deterministic-CBOR validation (Sections 4.7.1 and 5.6).
-
-### B.8. Empty AAD
-
-Both AEADs use empty AAD because the bindings are already structural: the
-scalar header and the key frame are bound through `header_hash` in
-the key derivation, and chunk index and finality are
-bound through the nonce. Re-binding the same facts as AAD would add bytes and
-a second mechanism without adding security.
-
-### B.9. `stored_digest` is external
+### B.3. `stored_digest` Is External
 
 A digest over the complete stored bytes cannot live inside them, and a
-truncated in-band variant would be a second, weaker integrity story. The
-header field that *serves* keyless scrubbing is `object_id` — it lets a
-scrubber look up the trusted external digest. Keyless scrub = external
+truncated in-band variant would be a second, weaker integrity story. A
+cataloged `object_id` lets a scrubber look up the trusted external digest.
+Keyless scrub = external
 `stored_digest` + (on tape) the parity layer's block CRCs.
 
-### B.10. No unencrypted envelope
+### B.4. No Unencrypted Envelope
 
 The plaintext representation is the bare canonical stream, not a stream inside
-an unencrypted header/footer. Such a wrapper would break standard-`tar`
+an extra wrapper. Such a wrapper would break standard-`tar`
 extractability — the plaintext copy's reason to exist — in exchange for
 framing the stream already provides (self-description, digests).
-
-### B.11. Derived salts, not random salts
-
-`hkdf_salt` is derived from the per-object DEK, object identifier, content
-digest, and metadata bytes (Section 5.5), never drawn directly from a random
-number generator. The envelope is nevertheless deliberately randomized by
-its fresh DEK and HPKE encapsulations, while the salt remains reproducibly
-derived once that DEK is known. This separates the entropy input from the
-wire salt and binds the salt to the object facts authenticated on open.
-
-### B.12. Envelope metadata is fixed and bound into the salt
-
-If variable optional metadata existed, resealing the same object with
-different metadata of the same encoded length could reproduce the same
-`metadata_key` while the zero metadata nonce encrypted a *different* plaintext
-— the nonce reuse [RFC8439] forbids. Two layers prevent this: the current
-format defines no optional metadata keys (the frame is a deterministic
-function of the canonical object), and SHA-256 of the metadata plaintext is bound into the
-salt derivation and verified on every keyed open, so a future metadata
-extension — or a defective sealer — cannot reach the reused-nonce state in a
-readable object.
-
-### B.13. Bootstrap manifest anchors are plaintext-copy-only
-
-An encrypted object's on-tape bootstrap row carries no manifest anchors
-(location, size, count, digest): manifest size correlates directly with member
-count, and the bootstrap is plaintext on the same tape the envelope protects.
-The integrity anchor for a decrypted manifest is the envelope's authenticated
-`plaintext_digest`, which covers the manifest and every other canonical byte —
-stronger than an external digest. What is forfeited is direct
-LOCATE-to-manifest without a catalog; catalog-less recovery decrypts
-sequentially, an acceptable cost over sequential media.
-
-## Appendix C. Revision History (Informative)
-
-**2026-07-24.** Specification Version 2.0 replaces the pre-production
-X25519-only encrypted representation with the frozen
-`draft-connolly-cfrg-xwing-kem-10` X-Wing construction as the sole wrap KEM.
-It permanently reserves and forbids `wrap_suite = 0x01`, assigns X-Wing
-`wrap_suite = 0x02`, expands the key-frame bounds and recipient fields, and
-regenerates the encrypted vectors. The plaintext representation is unchanged.
-No production RAO 1.0 encrypted object was written.
-
-**2026-07-22.** Added the extension-tier / `ext` container (§4.7.5), the
-object metadata inventory (§4.7.6), the carry-only restore default for
-non-`user.` metadata (§12.10), and the plaintext-disclosure considerations
-(§12.12). The set of valid pre-increment objects is unchanged; new objects are
-tolerated by existing Consumers per §4.7.2 obligation 3.
-
-**2026-07-22.** Section 12.10's extended-attribute restore protections
-restored to requirement strength (MUST): namespace allow-list defaulting to
-`user.`, skip-and-report for excluded attributes, and no-follow application.
-These were requirements in the pre-publication draft, were relaxed to
-recommendations during pre-publication drafting to track a then-deficient
-reference implementation, and are restored now that the reference
-implementation enforces them. The change constrains Restoring Consumer behavior only; the
-set of valid RAO objects is unchanged.
-
-Specification Version 1.0 was the first unified publication baseline. It
-consolidates the project's internal base-format revision, its additive xattr
-revision, and the wrapped-DEK envelope revision. Those earlier documents are
-revision history only; this Version 2.0 document is the complete normative
-specification.
-REM-PARITY remains the separate companion format layer identified by
-[REMPARITY] and is not incorporated here.
 
 ## Author's Address
 
