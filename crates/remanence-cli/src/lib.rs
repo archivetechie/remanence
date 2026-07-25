@@ -52,8 +52,8 @@ use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use remanence_aead::{
-    header::object_id_field, inspect_bytes, EnvelopeSealOptions, RaoHeader, RecipientPublicKey,
-    SealOptions, RAO_HEADER_LEN,
+    header::object_id_field, inspect_bytes, EnvelopeSealOptions, RecipientPublicKey,
+    RemObjectHeader, SealOptions, REM_OBJECT_HEADER_LEN,
 };
 use remanence_api::pb;
 #[cfg(feature = "foreign-bru")]
@@ -517,7 +517,7 @@ enum RemCommand {
         command: RemArchiveCommand,
     },
 
-    /// Restore a native RAO object into a directory.
+    /// Restore a native REM-OBJECT object into a directory.
     Restore(RemArchiveExtractArgs),
 
     /// Development-only hardware helpers.
@@ -735,7 +735,7 @@ fn parse_record_size(s: &str) -> Result<usize, String> {
     usize::try_from(bytes).map_err(|_| format!("record size {s:?} is too large for this host"))
 }
 
-/// Parse an RAO archive build chunk size.
+/// Parse an REM-OBJECT archive build chunk size.
 fn parse_archive_chunk_size(s: &str) -> Result<usize, String> {
     let bytes = parse_binary_byte_count(s, "chunk size")?;
     if bytes == 0 {
@@ -1857,16 +1857,16 @@ enum RemArchiveCommand {
     /// Re-seal one recipient envelope to a new recipient set.
     Reseal(ArchiveResealArgs),
 
-    /// Build a portable RAO object file from local inputs.
+    /// Build a portable REM-OBJECT object file from local inputs.
     Build(RemArchiveBuildArgs),
 
-    /// Inspect a portable RAO object file.
+    /// Inspect a portable REM-OBJECT object file.
     Inspect(RemArchiveInspectArgs),
 
-    /// Extract a portable RAO object file into a directory.
+    /// Extract a portable REM-OBJECT object file into a directory.
     Extract(RemArchiveExtractArgs),
 
-    /// Decrypt an encrypted RAO object from stdin to stdout.
+    /// Decrypt an encrypted REM-OBJECT object from stdin to stdout.
     #[command(name = "extract-stream")]
     ExtractStream(RemArchiveExtractStreamArgs),
 
@@ -1934,7 +1934,7 @@ struct RemArchiveBuildArgs {
     #[arg(long = "map-sha256", value_name = "HEX", requires = "map")]
     map_sha256: Option<String>,
 
-    /// Output RAO object file.
+    /// Output REM-OBJECT object file.
     #[arg(
         long,
         value_name = "PATH",
@@ -1952,7 +1952,7 @@ struct RemArchiveBuildArgs {
     #[arg(long, conflicts_with_all = ["rules", "map"])]
     full_fidelity_xattrs: bool,
 
-    /// Classify inputs and emit the clustered ingest report without writing RAO.
+    /// Classify inputs and emit the clustered ingest report without writing REM-OBJECT.
     #[arg(long)]
     scan_only: bool,
 
@@ -1976,11 +1976,11 @@ struct RemArchiveBuildArgs {
     #[arg(long, value_name = "COUNT", default_value = "10000")]
     sanity_ceiling_count: u64,
 
-    /// Canonical RAOR recipient public-key file; repeat 2 to 8 times.
-    #[arg(long = "recipient", value_name = "RAOR")]
+    /// Canonical REMR recipient public-key file; repeat 2 to 8 times.
+    #[arg(long = "recipient", value_name = "REMR")]
     recipients: Vec<PathBuf>,
 
-    /// Object id to record in the RAO global header (default: fresh UUID).
+    /// Object id to record in the REM-OBJECT global header (default: fresh UUID).
     #[arg(long, value_name = "ID")]
     object_id: Option<String>,
 
@@ -1996,7 +1996,7 @@ struct RemArchiveBuildArgs {
     #[arg(long, value_name = "RFC3339")]
     timestamp: Option<String>,
 
-    /// RAO object block/chunk size.
+    /// REM-OBJECT object block/chunk size.
     #[arg(long, value_name = "BYTES", value_parser = parse_archive_chunk_size, default_value = "256KiB")]
     chunk_size: usize,
 }
@@ -2004,11 +2004,11 @@ struct RemArchiveBuildArgs {
 /// Arguments for `rem archive inspect`.
 #[derive(Args, Debug)]
 struct RemArchiveInspectArgs {
-    /// Input RAO object file.
+    /// Input REM-OBJECT object file.
     #[arg(long, value_name = "PATH")]
     object: PathBuf,
 
-    /// RAO object block/chunk size for plaintext objects.
+    /// REM-OBJECT object block/chunk size for plaintext objects.
     #[arg(long, value_name = "BYTES", value_parser = parse_archive_chunk_size, default_value = "256KiB")]
     chunk_size: usize,
 }
@@ -2016,7 +2016,7 @@ struct RemArchiveInspectArgs {
 /// Arguments for `rem archive extract`.
 #[derive(Args, Debug)]
 struct RemArchiveExtractArgs {
-    /// Input RAO object file.
+    /// Input REM-OBJECT object file.
     #[arg(long, value_name = "PATH")]
     object: PathBuf,
 
@@ -2024,16 +2024,16 @@ struct RemArchiveExtractArgs {
     #[arg(long, value_name = "DIR")]
     dest: PathBuf,
 
-    /// RAO object block/chunk size for plaintext objects.
+    /// REM-OBJECT object block/chunk size for plaintext objects.
     #[arg(long, value_name = "BYTES", value_parser = parse_archive_chunk_size, default_value = "256KiB")]
     chunk_size: usize,
 
-    /// Canonical RAOP private-key file. Required for encrypted objects.
+    /// Canonical REMP private-key file. Required for encrypted objects.
     #[arg(long, value_name = "PATH")]
     private_key: Option<PathBuf>,
 
     /// Archive member path for byte-range extraction.
-    #[arg(long = "path", value_name = "RAO_PATH")]
+    #[arg(long = "path", value_name = "REM_OBJECT_PATH")]
     path: Option<String>,
 
     /// First object-local BodyLba for --path, from the build report or catalog row.
@@ -2065,8 +2065,12 @@ struct RemArchiveExtractArgs {
     #[arg(long)]
     no_unwrap: bool,
 
-    /// RAO blob wrapper entry to use for single-member restore.
-    #[arg(long = "blob-entry", value_name = "RAO_PATH", requires = "blob_member")]
+    /// REM-OBJECT blob wrapper entry to use for single-member restore.
+    #[arg(
+        long = "blob-entry",
+        value_name = "REM_OBJECT_PATH",
+        requires = "blob_member"
+    )]
     blob_entry: Option<String>,
 
     /// Member path inside --blob-entry to restore.
@@ -2077,7 +2081,7 @@ struct RemArchiveExtractArgs {
 /// Arguments for `rem archive extract-stream`.
 #[derive(Args, Debug)]
 struct RemArchiveExtractStreamArgs {
-    /// Canonical RAOP private-key file used to decrypt the envelope.
+    /// Canonical REMP private-key file used to decrypt the envelope.
     #[arg(long, value_name = "PATH")]
     private_key: Option<PathBuf>,
 
@@ -2107,7 +2111,7 @@ struct RemArchiveExtractStreamArgs {
 /// Arguments for `rem archive covering-range`.
 #[derive(Args, Debug)]
 struct RemArchiveCoveringRangeArgs {
-    /// Canonical RAOP private-key file used to authenticate the envelope.
+    /// Canonical REMP private-key file used to authenticate the envelope.
     #[arg(long, value_name = "PATH")]
     private_key: Option<PathBuf>,
 
@@ -2147,8 +2151,8 @@ struct RemArchiveWriteArgs {
     #[arg(long, value_name = "ID")]
     caller_object_id: Option<String>,
 
-    /// Canonical RAOR recipient public-key file; repeat 2 to 8 times.
-    #[arg(long = "recipient", value_name = "RAOR")]
+    /// Canonical REMR recipient public-key file; repeat 2 to 8 times.
+    #[arg(long = "recipient", value_name = "REMR")]
     recipients: Vec<PathBuf>,
 
     /// Emit the locator as one JSON line to stdout (seam contract §4).
@@ -2175,7 +2179,7 @@ struct RemArchiveReadArgs {
     #[arg(long, value_name = "PATH")]
     out: PathBuf,
 
-    /// Canonical RAOP private-key file. Required for encrypted copies.
+    /// Canonical REMP private-key file. Required for encrypted copies.
     #[arg(long, value_name = "PATH")]
     private_key: Option<PathBuf>,
 
@@ -2520,16 +2524,16 @@ enum ArchiveCommand {
     /// Fully re-seal one recipient envelope to a new recipient set.
     Reseal(ArchiveResealArgs),
 
-    /// Build a portable RAO object file from local inputs.
+    /// Build a portable REM-OBJECT object file from local inputs.
     Build(ArchiveBuildArgs),
 
-    /// Inspect a portable RAO object file.
+    /// Inspect a portable REM-OBJECT object file.
     Inspect(ArchiveInspectArgs),
 
-    /// Extract a portable RAO object file into a directory.
+    /// Extract a portable REM-OBJECT object file into a directory.
     Extract(ArchiveExtractArgs),
 
-    /// Decrypt an encrypted RAO object from stdin to stdout.
+    /// Decrypt an encrypted REM-OBJECT object from stdin to stdout.
     #[command(name = "extract-stream")]
     ExtractStream(ArchiveExtractStreamArgs),
 
@@ -2569,15 +2573,15 @@ enum ArchiveCommand {
 /// Arguments for `rem archive reseal`.
 #[derive(Args, Debug)]
 struct ArchiveResealArgs {
-    /// Existing complete encrypted RAO object.
+    /// Existing complete encrypted REM-OBJECT object.
     #[arg(long, value_name = "PATH")]
     object: PathBuf,
 
-    /// Canonical RAOP private-key file used to open the input object.
+    /// Canonical REMP private-key file used to open the input object.
     #[arg(long, value_name = "PATH")]
     private_key: PathBuf,
 
-    /// Canonical RAOR recipient public-key files, in ascending slot order.
+    /// Canonical REMR recipient public-key files, in ascending slot order.
     #[arg(long = "recipient", value_name = "PATH", num_args = 2..=8)]
     recipients: Vec<PathBuf>,
 
@@ -2619,7 +2623,7 @@ struct ArchiveBuildArgs {
     #[arg(long = "map-sha256", value_name = "HEX", requires = "map")]
     map_sha256: Option<String>,
 
-    /// Output RAO object file.
+    /// Output REM-OBJECT object file.
     #[arg(
         long,
         value_name = "PATH",
@@ -2637,7 +2641,7 @@ struct ArchiveBuildArgs {
     #[arg(long, conflicts_with_all = ["rules", "map"])]
     full_fidelity_xattrs: bool,
 
-    /// Classify inputs and emit the clustered ingest report without writing RAO.
+    /// Classify inputs and emit the clustered ingest report without writing REM-OBJECT.
     #[arg(long)]
     scan_only: bool,
 
@@ -2661,11 +2665,11 @@ struct ArchiveBuildArgs {
     #[arg(long, value_name = "COUNT", default_value = "10000")]
     sanity_ceiling_count: u64,
 
-    /// Canonical RAOR recipient public-key file; repeat 2 to 8 times.
-    #[arg(long = "recipient", value_name = "RAOR")]
+    /// Canonical REMR recipient public-key file; repeat 2 to 8 times.
+    #[arg(long = "recipient", value_name = "REMR")]
     recipients: Vec<PathBuf>,
 
-    /// Object id to record in the RAO global header (default: fresh UUID).
+    /// Object id to record in the REM-OBJECT global header (default: fresh UUID).
     #[arg(long, value_name = "ID")]
     object_id: Option<String>,
 
@@ -2681,7 +2685,7 @@ struct ArchiveBuildArgs {
     #[arg(long, value_name = "RFC3339")]
     timestamp: Option<String>,
 
-    /// RAO object block/chunk size.
+    /// REM-OBJECT object block/chunk size.
     #[arg(long, value_name = "BYTES", value_parser = parse_archive_chunk_size, default_value = "256KiB")]
     chunk_size: usize,
 }
@@ -2689,11 +2693,11 @@ struct ArchiveBuildArgs {
 /// Arguments for the shared `archive inspect` command.
 #[derive(Args, Debug)]
 struct ArchiveInspectArgs {
-    /// Input RAO object file.
+    /// Input REM-OBJECT object file.
     #[arg(long, value_name = "PATH")]
     object: PathBuf,
 
-    /// RAO object block/chunk size for plaintext objects.
+    /// REM-OBJECT object block/chunk size for plaintext objects.
     #[arg(long, value_name = "BYTES", value_parser = parse_archive_chunk_size, default_value = "256KiB")]
     chunk_size: usize,
 }
@@ -2701,7 +2705,7 @@ struct ArchiveInspectArgs {
 /// Arguments for the shared `archive extract` command.
 #[derive(Args, Debug)]
 struct ArchiveExtractArgs {
-    /// Input RAO object file.
+    /// Input REM-OBJECT object file.
     #[arg(long, value_name = "PATH")]
     object: PathBuf,
 
@@ -2709,16 +2713,16 @@ struct ArchiveExtractArgs {
     #[arg(long, value_name = "DIR")]
     dest: PathBuf,
 
-    /// RAO object block/chunk size for plaintext objects.
+    /// REM-OBJECT object block/chunk size for plaintext objects.
     #[arg(long, value_name = "BYTES", value_parser = parse_archive_chunk_size, default_value = "256KiB")]
     chunk_size: usize,
 
-    /// Canonical RAOP private-key file. Required for encrypted objects.
+    /// Canonical REMP private-key file. Required for encrypted objects.
     #[arg(long, value_name = "PATH")]
     private_key: Option<PathBuf>,
 
     /// Archive member path for byte-range extraction.
-    #[arg(long = "path", value_name = "RAO_PATH")]
+    #[arg(long = "path", value_name = "REM_OBJECT_PATH")]
     path: Option<String>,
 
     /// First object-local BodyLba for --path, from the build report or catalog row.
@@ -2750,8 +2754,12 @@ struct ArchiveExtractArgs {
     #[arg(long)]
     no_unwrap: bool,
 
-    /// RAO blob wrapper entry to use for single-member restore.
-    #[arg(long = "blob-entry", value_name = "RAO_PATH", requires = "blob_member")]
+    /// REM-OBJECT blob wrapper entry to use for single-member restore.
+    #[arg(
+        long = "blob-entry",
+        value_name = "REM_OBJECT_PATH",
+        requires = "blob_member"
+    )]
     blob_entry: Option<String>,
 
     /// Member path inside --blob-entry to restore.
@@ -2762,7 +2770,7 @@ struct ArchiveExtractArgs {
 /// Arguments for the shared `archive extract-stream` command.
 #[derive(Args, Debug)]
 struct ArchiveExtractStreamArgs {
-    /// Canonical RAOP private-key file used to decrypt the envelope.
+    /// Canonical REMP private-key file used to decrypt the envelope.
     #[arg(long, value_name = "PATH")]
     private_key: Option<PathBuf>,
 
@@ -2792,7 +2800,7 @@ struct ArchiveExtractStreamArgs {
 /// Arguments for the shared `archive covering-range` command.
 #[derive(Args, Debug)]
 struct ArchiveCoveringRangeArgs {
-    /// Canonical RAOP private-key file used to authenticate the envelope.
+    /// Canonical REMP private-key file used to authenticate the envelope.
     #[arg(long, value_name = "PATH")]
     private_key: Option<PathBuf>,
 
@@ -2833,8 +2841,8 @@ struct ArchiveWriteArgs {
     #[arg(long, value_name = "ID")]
     caller_object_id: Option<String>,
 
-    /// Canonical RAOR recipient public-key file; repeat 2 to 8 times.
-    #[arg(long = "recipient", value_name = "RAOR")]
+    /// Canonical REMR recipient public-key file; repeat 2 to 8 times.
+    #[arg(long = "recipient", value_name = "REMR")]
     recipients: Vec<PathBuf>,
 
     /// Emit the locator as one JSON line to stdout (seam contract §4).
@@ -2861,7 +2869,7 @@ struct ArchiveReadArgs {
     #[arg(long, value_name = "PATH")]
     out: PathBuf,
 
-    /// Canonical RAOP private-key file. Required for encrypted copies.
+    /// Canonical REMP private-key file. Required for encrypted copies.
     #[arg(long, value_name = "PATH")]
     private_key: Option<PathBuf>,
 
@@ -2905,7 +2913,7 @@ struct ArchiveVerifyArgs {
     #[arg(long, value_name = "HEX")]
     expected_sha256: String,
 
-    /// Canonical RAOP private-key file. Required for encrypted copies.
+    /// Canonical REMP private-key file. Required for encrypted copies.
     #[arg(long, value_name = "PATH")]
     private_key: Option<PathBuf>,
 
@@ -3630,7 +3638,7 @@ where
                         .map(|()| {
                             // Don't promise the cartridge is parked in
                             // an IE element — vendors differ (HPE parks
-                            // visibly, QuadStor vaults). The
+                            // visibly, Quadstor vaults). The
                             // dirty-snapshot recovery hint that follows
                             // tells the operator how to confirm.
                             format!("export issued for slot 0x{slot:04x}")
@@ -3823,7 +3831,7 @@ where
 fn run_archive_capabilities(out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let capabilities = json!({
         "capabilities": [
-            "rao-envelope",
+            "rem-object-envelope",
             "wrap-suite-hpke-v1",
             "ranged-ciphertext-extract"
         ]
@@ -3941,11 +3949,11 @@ where
     }
     let mut encrypted = File::open(&args.object)
         .map_err(|error| format!("open encrypted object {}: {error}", args.object.display()))?;
-    let mut header_bytes = [0u8; RAO_HEADER_LEN];
+    let mut header_bytes = [0u8; REM_OBJECT_HEADER_LEN];
     encrypted
         .read_exact(&mut header_bytes)
         .map_err(|error| format!("read encrypted object header: {error}"))?;
-    let input_header = RaoHeader::parse(&header_bytes)
+    let input_header = RemObjectHeader::parse(&header_bytes)
         .map_err(|error| format!("parse encrypted object header: {error}"))?;
     encrypted
         .seek(SeekFrom::Start(0))
@@ -3962,7 +3970,7 @@ where
         .unwrap_or_else(|| Path::new("."));
     let mut plaintext = SecurePlaintextStage::new_in(staging_dir)?;
     let private_key = read_private_key_file(&args.private_key)?;
-    let opened = remanence_format::open_envelope_rao_stream(
+    let opened = remanence_format::open_envelope_rem_object_stream(
         &mut encrypted,
         plaintext.as_file_mut(),
         &private_key,
@@ -3996,7 +4004,7 @@ where
         .create_new(true)
         .open(&temp)
         .map_err(|error| format!("create {}: {error}", temp.display()))?;
-    let report = match remanence_format::seal_envelope_rao_stream(
+    let report = match remanence_format::seal_envelope_rem_object_stream(
         plaintext.as_file_mut(),
         &mut file,
         &seal_options,
@@ -4037,7 +4045,7 @@ where
             "chunk_size": report.header.chunk_size,
             "plaintext_digest": bytes_to_hex(&report.plaintext.digest),
             "input_format_version": input_header.format_version,
-            "output_format_version": 2,
+            "output_format_version": 1,
             "recipient_epochs": recipient_epochs_json(&report.key_frame),
             "stored_size_bytes": report.stored_size_bytes,
             "expected_sha256": bytes_to_hex(&report.stored_digest),
@@ -10303,10 +10311,10 @@ fn format_unavailable_error(format: ArchiveFormat) -> FormatError {
     ))
 }
 
-/// Build a portable RAO object file from local filesystem inputs.
+/// Build a portable REM-OBJECT object file from local filesystem inputs.
 ///
-/// This is the local-file half of the RAO work order: it writes exactly one
-/// RAO object byte string to `--out` using the same `BlockSink` contract as
+/// This is the local-file half of the REM-OBJECT work order: it writes exactly one
+/// REM-OBJECT object byte string to `--out` using the same `BlockSink` contract as
 /// tape writers, but without tape-only filemarks, bootstrap rows, or parity
 /// sidecars.
 fn run_archive_build(
@@ -10380,14 +10388,14 @@ fn run_archive_extract(
     }
 }
 
-/// Read exactly the bounded header/key-frame/metadata prefix from an RAO stream.
-fn read_rao_authenticated_prefix(input: &mut dyn Read) -> Result<Vec<u8>, String> {
-    let mut header_bytes = [0u8; RAO_HEADER_LEN];
+/// Read exactly the bounded header/key-frame/metadata prefix from an REM-OBJECT stream.
+fn read_rem_object_authenticated_prefix(input: &mut dyn Read) -> Result<Vec<u8>, String> {
+    let mut header_bytes = [0u8; REM_OBJECT_HEADER_LEN];
     input
         .read_exact(&mut header_bytes)
-        .map_err(|error| format!("read encrypted RAO header: {error}"))?;
-    let header = RaoHeader::parse(&header_bytes)
-        .map_err(|error| format!("parse encrypted RAO header: {error}"))?;
+        .map_err(|error| format!("read encrypted REM-OBJECT header: {error}"))?;
+    let header = RemObjectHeader::parse(&header_bytes)
+        .map_err(|error| format!("parse encrypted REM-OBJECT header: {error}"))?;
     let remaining_len = usize::try_from(header.key_frame_len)
         .ok()
         .and_then(|key_len| {
@@ -10395,36 +10403,38 @@ fn read_rao_authenticated_prefix(input: &mut dyn Read) -> Result<Vec<u8>, String
                 .ok()
                 .and_then(|metadata_len| key_len.checked_add(metadata_len))
         })
-        .ok_or_else(|| "encrypted RAO prefix length is too large for this host".to_string())?;
-    let total_len = RAO_HEADER_LEN
+        .ok_or_else(|| {
+            "encrypted REM-OBJECT prefix length is too large for this host".to_string()
+        })?;
+    let total_len = REM_OBJECT_HEADER_LEN
         .checked_add(remaining_len)
-        .ok_or_else(|| "encrypted RAO prefix length overflows".to_string())?;
+        .ok_or_else(|| "encrypted REM-OBJECT prefix length overflows".to_string())?;
     let mut prefix = Vec::new();
     prefix
         .try_reserve_exact(total_len)
-        .map_err(|_| "cannot allocate bounded encrypted RAO prefix".to_string())?;
+        .map_err(|_| "cannot allocate bounded encrypted REM-OBJECT prefix".to_string())?;
     prefix.extend_from_slice(&header_bytes);
     prefix.resize(total_len, 0);
     input
-        .read_exact(&mut prefix[RAO_HEADER_LEN..])
-        .map_err(|error| format!("read encrypted RAO authenticated prefix: {error}"))?;
+        .read_exact(&mut prefix[REM_OBJECT_HEADER_LEN..])
+        .map_err(|error| format!("read encrypted REM-OBJECT authenticated prefix: {error}"))?;
     Ok(prefix)
 }
 
 fn recipient_epochs_from_prefix_json(prefix: &[u8]) -> Result<Vec<Value>, String> {
-    let header_bytes: [u8; RAO_HEADER_LEN] = prefix
-        .get(..RAO_HEADER_LEN)
-        .ok_or_else(|| "authenticated prefix is missing the RAO header".to_string())?
+    let header_bytes: [u8; REM_OBJECT_HEADER_LEN] = prefix
+        .get(..REM_OBJECT_HEADER_LEN)
+        .ok_or_else(|| "authenticated prefix is missing the REM-OBJECT header".to_string())?
         .try_into()
-        .map_err(|_| "authenticated prefix is missing the RAO header".to_string())?;
-    let header = RaoHeader::parse(&header_bytes)
+        .map_err(|_| "authenticated prefix is missing the REM-OBJECT header".to_string())?;
+    let header = RemObjectHeader::parse(&header_bytes)
         .map_err(|error| format!("parse authenticated prefix header: {error}"))?;
-    let key_frame_end = RAO_HEADER_LEN
+    let key_frame_end = REM_OBJECT_HEADER_LEN
         .checked_add(header.key_frame_len as usize)
         .ok_or_else(|| "authenticated prefix key-frame length overflows".to_string())?;
     let frame = remanence_aead::KeyFrame::parse(
         prefix
-            .get(RAO_HEADER_LEN..key_frame_end)
+            .get(REM_OBJECT_HEADER_LEN..key_frame_end)
             .ok_or_else(|| "authenticated prefix is missing the key frame".to_string())?,
     )
     .map_err(|error| format!("parse authenticated prefix key frame: {error}"))?;
@@ -10440,14 +10450,14 @@ fn run_archive_covering_range(
 ) -> ExitCode {
     let result = (|| -> Result<Value, String> {
         let key = encrypted_stream_key(args.private_key.as_deref())?;
-        let prefix = read_rao_authenticated_prefix(input)?;
-        let plan = remanence_format::covering_envelope_rao_stored_range(
+        let prefix = read_rem_object_authenticated_prefix(input)?;
+        let plan = remanence_format::covering_envelope_rem_object_stored_range(
             &prefix,
             &key,
             args.range.start,
             args.range.len,
         )
-        .map_err(|error| format!("authenticate and map encrypted RAO range: {error}"))?;
+        .map_err(|error| format!("authenticate and map encrypted REM-OBJECT range: {error}"))?;
         let stored_range_end = plan
             .stored_range_start
             .and_then(|start| start.checked_add(plan.stored_range_len));
@@ -10485,7 +10495,7 @@ fn run_archive_covering_range(
     }
 }
 
-/// Decrypt one complete or explicitly ranged encrypted RAO stream to `out`.
+/// Decrypt one complete or explicitly ranged encrypted REM-OBJECT stream to `out`.
 ///
 /// `remanence_aead::open` authenticates each payload chunk before invoking the
 /// writer. The optional writer below only slices that already-authenticated
@@ -10509,8 +10519,8 @@ fn run_archive_extract_stream(
                     prefix_path.display()
                 )
             })?;
-            let prefix = read_rao_authenticated_prefix(&mut prefix_file)?;
-            let report = remanence_format::open_envelope_rao_range_from_reader(
+            let prefix = read_rem_object_authenticated_prefix(&mut prefix_file)?;
+            let report = remanence_format::open_envelope_rem_object_range_from_reader(
                 &prefix,
                 input,
                 stored_range_start,
@@ -10519,7 +10529,7 @@ fn run_archive_extract_stream(
                 range.start,
                 range.len,
             )
-            .map_err(|error| format!("decrypt ranged RAO stream: {error}"))?;
+            .map_err(|error| format!("decrypt ranged REM-OBJECT stream: {error}"))?;
             out.flush()
                 .map_err(|error| format!("flush plaintext stdout: {error}"))?;
             return Ok(json!({
@@ -10547,8 +10557,9 @@ fn run_archive_extract_stream(
                 .checked_add(range.len)
                 .ok_or_else(|| "--range arithmetic overflow".to_string())?;
             let mut selected = PlaintextRangeWriter::new(out, range.start, requested_end);
-            let report = remanence_format::open_envelope_rao_stream(input, &mut selected, &key)
-                .map_err(|error| format!("decrypt RAO stream: {error}"))?;
+            let report =
+                remanence_format::open_envelope_rem_object_stream(input, &mut selected, &key)
+                    .map_err(|error| format!("decrypt REM-OBJECT stream: {error}"))?;
             selected
                 .flush()
                 .map_err(|error| format!("flush plaintext stdout: {error}"))?;
@@ -10560,8 +10571,8 @@ fn run_archive_extract_stream(
             }
             (report, selected.bytes_written())
         } else {
-            let report = remanence_format::open_envelope_rao_stream(input, &mut *out, &key)
-                .map_err(|error| format!("decrypt RAO stream: {error}"))?;
+            let report = remanence_format::open_envelope_rem_object_stream(input, &mut *out, &key)
+                .map_err(|error| format!("decrypt REM-OBJECT stream: {error}"))?;
             out.flush()
                 .map_err(|error| format!("flush plaintext stdout: {error}"))?;
             let size = report.plaintext.size;
@@ -10758,7 +10769,7 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     if !args.recipients.is_empty() {
         object_id_field(&object_id)
-            .map_err(|error| format!("--object-id is invalid for encrypted RAO: {error}"))?;
+            .map_err(|error| format!("--object-id is invalid for encrypted REM-OBJECT: {error}"))?;
     }
 
     let map_plan = match (&args.map, &args.source_root) {
@@ -10827,20 +10838,20 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
             let recipients = read_recipient_public_key_files(&args.recipients)?;
             let mut readers = open_archive_build_readers(&inputs)?;
             let mut streams = archive_build_streams(&inputs, &mut readers);
-            let report = remanence_format::write_encrypted_rao_object_from_readers(
+            let report = remanence_format::write_encrypted_rem_object_from_readers(
                 &mut sink,
                 &options,
                 &mut streams,
                 &recipients,
             )
-            .map_err(|error| format!("write encrypted RAO: {error}"))?;
+            .map_err(|error| format!("write encrypted REM-OBJECT: {error}"))?;
             sink.sync_all()
                 .map_err(|error| format!("sync {}: {error}", temp_path.display()))?;
             Ok(ArchiveBuildResult {
                 layout: report.plaintext_layout,
                 representation: "encrypted",
-                encryption: "RAO1",
-                format_version: Some(2),
+                encryption: "REMO",
+                format_version: Some(1),
                 recipient_epochs: Some(recipient_epochs_json(&report.envelope.key_frame)),
                 stored_digest: report.envelope.stored_digest,
                 plaintext_digest: report.envelope.plaintext.digest,
@@ -10851,7 +10862,7 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
             let mut readers = open_archive_build_readers(&inputs)?;
             let mut streams = archive_build_streams(&inputs, &mut readers);
             let layout = write_rem_tar_object_from_readers(&mut sink, &options, &mut streams)
-                .map_err(|error| format!("write plaintext RAO: {error}"))?;
+                .map_err(|error| format!("write plaintext REM-OBJECT: {error}"))?;
             sink.sync_all()
                 .map_err(|error| format!("sync {}: {error}", temp_path.display()))?;
             let stored_digest = sha256_file(&temp_path)?;
@@ -10936,7 +10947,7 @@ fn extract_archive_object_file(args: &ArchiveExtractArgs) -> Result<Value, Strin
         extract_encrypted_archive_object_file(args)
     } else {
         if args.private_key.is_some() {
-            return Err("--private-key is only valid for encrypted RAO objects".to_string());
+            return Err("--private-key is only valid for encrypted REM-OBJECT objects".to_string());
         }
         extract_plaintext_archive_object_file(args)
     }
@@ -10983,8 +10994,8 @@ fn inspect_plaintext_archive_object_file(path: &Path, chunk_size: usize) -> Resu
 
 fn inspect_encrypted_archive_object_file(path: &Path) -> Result<Value, String> {
     let encrypted = read_archive_object_bytes(path)?;
-    let inspected =
-        inspect_bytes(&encrypted).map_err(|error| format!("inspect encrypted RAO: {error}"))?;
+    let inspected = inspect_bytes(&encrypted)
+        .map_err(|error| format!("inspect encrypted REM-OBJECT: {error}"))?;
     Ok(encrypted_archive_keyless_json(path, &inspected))
 }
 
@@ -11016,7 +11027,7 @@ fn extract_plaintext_archive_object_file(args: &ArchiveExtractArgs) -> Result<Va
     }
     if let Some(range) = range {
         let object = read_rem_tar_object(&mut source, chunk_size, block_count)
-            .map_err(|error| format!("read plaintext RAO: {error}"))?;
+            .map_err(|error| format!("read plaintext REM-OBJECT: {error}"))?;
         let member_path = range_path.expect("range request has member path");
         return extract_plaintext_archive_range_file(
             args,
@@ -11035,7 +11046,7 @@ fn extract_plaintext_archive_object_file(args: &ArchiveExtractArgs) -> Result<Va
         &args.dest,
         archive_extract_restore_options(args),
     )
-    .map_err(|error| format!("extract plaintext RAO: {error}"))?;
+    .map_err(|error| format!("extract plaintext REM-OBJECT: {error}"))?;
     let context = ArchiveExtractReportContext {
         object: path,
         dest: &args.dest,
@@ -11056,7 +11067,7 @@ fn encrypted_stream_key(
     private_key: Option<&Path>,
 ) -> Result<remanence_aead::RecipientPrivateKey, String> {
     private_key
-        .ok_or_else(|| "encrypted RAO operation requires --private-key".to_string())
+        .ok_or_else(|| "encrypted REM-OBJECT operation requires --private-key".to_string())
         .and_then(read_private_key_file)
 }
 
@@ -11071,8 +11082,9 @@ fn open_encrypted_archive_bytes(
     key: &remanence_aead::RecipientPrivateKey,
 ) -> Result<(Vec<u8>, remanence_aead::OpenReport), String> {
     let mut plaintext = Vec::new();
-    let envelope = remanence_format::open_envelope_rao_stream(encrypted, &mut plaintext, key)
-        .map_err(|error| format!("open encrypted RAO: {error}"))?;
+    let envelope =
+        remanence_format::open_envelope_rem_object_stream(encrypted, &mut plaintext, key)
+            .map_err(|error| format!("open encrypted REM-OBJECT: {error}"))?;
     Ok((plaintext, envelope))
 }
 
@@ -11083,8 +11095,8 @@ fn read_encrypted_archive_file_range(
     file_size_bytes: u64,
     range_start: u64,
     range_len: u64,
-) -> Result<remanence_format::EncryptedRaoFileRange, FormatError> {
-    remanence_format::read_encrypted_rao_file_range_to_vec(
+) -> Result<remanence_format::EncryptedRemObjectFileRange, FormatError> {
+    remanence_format::read_encrypted_rem_object_file_range_to_vec(
         encrypted,
         key,
         first_chunk_lba,
@@ -11110,8 +11122,8 @@ fn extract_encrypted_archive_object_file(args: &ArchiveExtractArgs) -> Result<Va
         );
     }
     let encrypted = read_archive_object_bytes(&args.object)?;
-    let inspected =
-        inspect_bytes(&encrypted).map_err(|error| format!("inspect encrypted RAO: {error}"))?;
+    let inspected = inspect_bytes(&encrypted)
+        .map_err(|error| format!("inspect encrypted REM-OBJECT: {error}"))?;
     let key = encrypted_archive_key(args)?;
     let (plaintext, envelope) = open_encrypted_archive_bytes(&encrypted, &key)?;
     if envelope.header != inspected.header {
@@ -11124,7 +11136,7 @@ fn extract_encrypted_archive_object_file(args: &ArchiveExtractArgs) -> Result<Va
         u64::try_from(blocks.len()).map_err(|_| "plaintext block count overflow".to_string())?;
     let mut parse_source = VecBlockSource::new(blocks.clone());
     let inner = read_rem_tar_object(&mut parse_source, chunk_size, block_count)
-        .map_err(|error| format!("parse decrypted RAO: {error}"))?;
+        .map_err(|error| format!("parse decrypted REM-OBJECT: {error}"))?;
     let inner_object_id = required_global_pax(&inner, "REMANENCE.object_id")?;
     if inner_object_id != envelope.header.object_id {
         return Err("decrypted inner object_id does not match encrypted header".to_string());
@@ -11137,12 +11149,12 @@ fn extract_encrypted_archive_object_file(args: &ArchiveExtractArgs) -> Result<Va
         &args.dest,
         archive_extract_restore_options(args),
     )
-    .map_err(|error| format!("extract encrypted RAO: {error}"))?;
+    .map_err(|error| format!("extract encrypted REM-OBJECT: {error}"))?;
     let context = ArchiveExtractReportContext {
         object: &args.object,
         dest: &args.dest,
         representation: "encrypted",
-        encryption: "RAO1",
+        encryption: "REMO",
         recipient_epochs: Some(recipient_epochs_json(&inspected.key_frame)),
         chunk_size,
         stored_size_bytes: inspected.stored_size_bytes,
@@ -11173,8 +11185,8 @@ fn attach_unwrap_report(
 
 fn extract_encrypted_blob_member_file(args: &ArchiveExtractArgs) -> Result<Value, String> {
     let encrypted = read_archive_object_bytes(&args.object)?;
-    let inspected =
-        inspect_bytes(&encrypted).map_err(|error| format!("inspect encrypted RAO: {error}"))?;
+    let inspected = inspect_bytes(&encrypted)
+        .map_err(|error| format!("inspect encrypted REM-OBJECT: {error}"))?;
     let key = encrypted_archive_key(args)?;
     let (plaintext, envelope) = open_encrypted_archive_bytes(&encrypted, &key)?;
     if envelope.header != inspected.header {
@@ -11182,11 +11194,11 @@ fn extract_encrypted_blob_member_file(args: &ArchiveExtractArgs) -> Result<Value
     }
     let chunk_size = usize::try_from(inspected.header.chunk_size)
         .map_err(|_| "encrypted header chunk_size is too large for this host".to_string())?;
-    let scan = scan_rao_entry_locators_from_bytes(&plaintext, chunk_size)?;
+    let scan = scan_rem_object_entry_locators_from_bytes(&plaintext, chunk_size)?;
     let inner_object_id = scan
         .global_pax
         .get("REMANENCE.object_id")
-        .ok_or_else(|| "decrypted RAO is missing REMANENCE.object_id".to_string())?;
+        .ok_or_else(|| "decrypted REM-OBJECT is missing REMANENCE.object_id".to_string())?;
     if inner_object_id != &envelope.header.object_id {
         return Err("decrypted inner object_id does not match encrypted header".to_string());
     }
@@ -11197,7 +11209,7 @@ fn extract_encrypted_blob_member_file(args: &ArchiveExtractArgs) -> Result<Value
         &scan,
         BlobMemberExtractContext {
             representation: "encrypted",
-            encryption: "RAO1",
+            encryption: "REMO",
             recipient_epochs: Some(recipient_epochs_json(&inspected.key_frame)),
             chunk_size,
             stored_size_bytes: inspected.stored_size_bytes,
@@ -11244,7 +11256,7 @@ struct BlobMemberExtractReportContext<'a> {
 fn blob_member_extract_report_json(context: &BlobMemberExtractReportContext<'_>) -> Value {
     json!({
         "mode": "blob-member",
-        "range_method": "rao-entry-range",
+        "range_method": "rem-object-entry-range",
         "object": context.object,
         "dest": context.dest,
         "output": context.output,
@@ -11286,16 +11298,17 @@ fn extract_plaintext_blob_member_file(
         .blob_member
         .as_deref()
         .ok_or_else(|| "--blob-entry requires --blob-member".to_string())?;
-    let scan = scan_plaintext_rao_entry_locators(&args.object, context.chunk_size)?;
+    let scan = scan_plaintext_rem_object_entry_locators(&args.object, context.chunk_size)?;
     let idx_path = archive_ingest::remwrap_index_path(blob_entry)?;
     let idx_entry = require_regular_locator(&scan, &idx_path)?;
     let blob = require_regular_locator(&scan, blob_entry)?;
     let idx_bytes =
-        read_plaintext_rao_entry_range(&args.object, idx_entry, 0, idx_entry.size_bytes)?;
+        read_plaintext_rem_object_entry_range(&args.object, idx_entry, 0, idx_entry.size_bytes)?;
     verify_locator_sha256(idx_entry, &idx_bytes, &idx_path)?;
     let member =
         archive_ingest::resolve_blob_member_from_index(&idx_bytes, &idx_path, member_path)?;
-    let bytes = read_plaintext_rao_entry_range(&args.object, blob, member.offset, member.length)?;
+    let bytes =
+        read_plaintext_rem_object_entry_range(&args.object, blob, member.offset, member.length)?;
     archive_ingest::verify_blob_member_bytes(member_path, member.sha256.as_deref(), &bytes)?;
     let output = write_blob_member_output(&args.dest, member_path, &bytes, args.overwrite)?;
     Ok(blob_member_extract_report_json(
@@ -11332,7 +11345,7 @@ fn extract_encrypted_blob_member_range_file(
     args: &ArchiveExtractArgs,
     encrypted: &[u8],
     key: &remanence_aead::RecipientPrivateKey,
-    scan: &RaoLocatorScan,
+    scan: &RemObjectLocatorScan,
     context: BlobMemberExtractContext,
 ) -> Result<Value, String> {
     let blob_entry = args
@@ -11355,7 +11368,7 @@ fn extract_encrypted_blob_member_range_file(
         0,
         idx_entry.size_bytes,
     )
-    .map_err(|error| format!("extract encrypted RAO blob index range: {error}"))?;
+    .map_err(|error| format!("extract encrypted REM-OBJECT blob index range: {error}"))?;
     verify_locator_sha256(idx_entry, &idx_range.bytes, &idx_path)?;
     let member =
         archive_ingest::resolve_blob_member_from_index(&idx_range.bytes, &idx_path, member_path)?;
@@ -11367,7 +11380,7 @@ fn extract_encrypted_blob_member_range_file(
         member.offset,
         member.length,
     )
-    .map_err(|error| format!("extract encrypted RAO blob member range: {error}"))?;
+    .map_err(|error| format!("extract encrypted REM-OBJECT blob member range: {error}"))?;
     archive_ingest::verify_blob_member_bytes(
         member_path,
         member.sha256.as_deref(),
@@ -11402,13 +11415,13 @@ fn extract_encrypted_blob_member_range_file(
 }
 
 #[derive(Debug, Clone)]
-struct RaoLocatorScan {
+struct RemObjectLocatorScan {
     global_pax: BTreeMap<String, String>,
-    entries: Vec<RaoEntryLocator>,
+    entries: Vec<RemObjectEntryLocator>,
 }
 
 #[derive(Debug, Clone)]
-struct RaoEntryLocator {
+struct RemObjectEntryLocator {
     path: String,
     entry_type: RemTarEntryType,
     size_bytes: u64,
@@ -11418,33 +11431,33 @@ struct RaoEntryLocator {
     file_sha256: Option<String>,
 }
 
-fn scan_plaintext_rao_entry_locators(
+fn scan_plaintext_rem_object_entry_locators(
     object: &Path,
     chunk_size: usize,
-) -> Result<RaoLocatorScan, String> {
+) -> Result<RemObjectLocatorScan, String> {
     let mut file =
         File::open(object).map_err(|error| format!("open {}: {error}", object.display()))?;
-    scan_rao_entry_locators(&mut file, chunk_size)
+    scan_rem_object_entry_locators(&mut file, chunk_size)
 }
 
-fn scan_rao_entry_locators_from_bytes(
+fn scan_rem_object_entry_locators_from_bytes(
     bytes: &[u8],
     chunk_size: usize,
-) -> Result<RaoLocatorScan, String> {
+) -> Result<RemObjectLocatorScan, String> {
     let mut cursor = Cursor::new(bytes);
-    scan_rao_entry_locators(&mut cursor, chunk_size)
+    scan_rem_object_entry_locators(&mut cursor, chunk_size)
 }
 
-fn scan_rao_entry_locators<R: Read + Seek>(
+fn scan_rem_object_entry_locators<R: Read + Seek>(
     reader: &mut R,
     chunk_size: usize,
-) -> Result<RaoLocatorScan, String> {
+) -> Result<RemObjectLocatorScan, String> {
     if chunk_size == 0 {
-        return Err("RAO chunk size must be nonzero".to_string());
+        return Err("REM-OBJECT chunk size must be nonzero".to_string());
     }
     reader
         .seek(SeekFrom::Start(0))
-        .map_err(|error| format!("seek RAO object start: {error}"))?;
+        .map_err(|error| format!("seek REM-OBJECT object start: {error}"))?;
     let mut offset = 0u64;
     let mut global_pax = BTreeMap::new();
     let mut pending_pax = BTreeMap::new();
@@ -11453,10 +11466,10 @@ fn scan_rao_entry_locators<R: Read + Seek>(
         let mut header = [0u8; 512];
         reader
             .read_exact(&mut header)
-            .map_err(|error| format!("read RAO tar header at byte {offset}: {error}"))?;
+            .map_err(|error| format!("read REM-OBJECT tar header at byte {offset}: {error}"))?;
         offset = offset
             .checked_add(512)
-            .ok_or_else(|| "RAO tar offset overflow".to_string())?;
+            .ok_or_else(|| "REM-OBJECT tar offset overflow".to_string())?;
         if header.iter().all(|byte| *byte == 0) {
             break;
         }
@@ -11474,7 +11487,7 @@ fn scan_rao_entry_locators<R: Read + Seek>(
                 seek_forward(reader, padding)?;
                 offset = offset
                     .checked_add(round_up_512_local(header_size)?)
-                    .ok_or_else(|| "RAO tar offset overflow".to_string())?;
+                    .ok_or_else(|| "REM-OBJECT tar offset overflow".to_string())?;
             }
             b'0' | 0 | b'1' | b'2' | b'5' => {
                 let entry_type = match header[156] {
@@ -11483,7 +11496,7 @@ fn scan_rao_entry_locators<R: Read + Seek>(
                     b'2' => RemTarEntryType::Symlink,
                     b'5' => RemTarEntryType::Directory,
                     other => {
-                        return Err(format!("unsupported RAO tar typeflag {other}"));
+                        return Err(format!("unsupported REM-OBJECT tar typeflag {other}"));
                     }
                 };
                 let path = pending_pax
@@ -11497,11 +11510,13 @@ fn scan_rao_entry_locators<R: Read + Seek>(
                     None => header_size,
                 };
                 if entry_type != RemTarEntryType::Regular && size != 0 {
-                    return Err(format!("non-regular RAO entry {path:?} has size {size}"));
+                    return Err(format!(
+                        "non-regular REM-OBJECT entry {path:?} has size {size}"
+                    ));
                 }
                 if size > 0 && offset % chunk_size as u64 != 0 {
                     return Err(format!(
-                        "RAO entry {path:?} payload starts at unaligned offset {offset}"
+                        "REM-OBJECT entry {path:?} payload starts at unaligned offset {offset}"
                     ));
                 }
                 let link_target = if matches!(
@@ -11513,7 +11528,7 @@ fn scan_rao_entry_locators<R: Read + Seek>(
                         .cloned()
                         .unwrap_or_else(|| local_tar_header_linkname(&header));
                     if target.is_empty() {
-                        return Err(format!("RAO link entry {path:?} is missing target"));
+                        return Err(format!("REM-OBJECT link entry {path:?} is missing target"));
                     }
                     Some(target)
                 } else {
@@ -11521,17 +11536,17 @@ fn scan_rao_entry_locators<R: Read + Seek>(
                 };
                 if entry_type == RemTarEntryType::Hardlink {
                     let target = link_target.as_deref().expect("hardlink target was set");
-                    let target_is_primary = entries.iter().any(|entry: &RaoEntryLocator| {
+                    let target_is_primary = entries.iter().any(|entry: &RemObjectEntryLocator| {
                         entry.entry_type == RemTarEntryType::Regular && entry.path == target
                     });
                     if !target_is_primary {
                         return Err(format!(
-                            "RAO hardlink {path:?} target {target:?} is not a preceding regular entry"
+                            "REM-OBJECT hardlink {path:?} target {target:?} is not a preceding regular entry"
                         ));
                     }
                 }
                 let file_sha256 = pending_pax.get("REMANENCE.file_sha256").cloned();
-                entries.push(RaoEntryLocator {
+                entries.push(RemObjectEntryLocator {
                     path,
                     entry_type,
                     size_bytes: size,
@@ -11544,36 +11559,36 @@ fn scan_rao_entry_locators<R: Read + Seek>(
                 seek_forward(reader, skip)?;
                 offset = offset
                     .checked_add(skip)
-                    .ok_or_else(|| "RAO tar offset overflow".to_string())?;
+                    .ok_or_else(|| "REM-OBJECT tar offset overflow".to_string())?;
                 pending_pax.clear();
             }
             other => {
-                return Err(format!("unsupported RAO tar typeflag {other}"));
+                return Err(format!("unsupported REM-OBJECT tar typeflag {other}"));
             }
         }
     }
-    Ok(RaoLocatorScan {
+    Ok(RemObjectLocatorScan {
         global_pax,
         entries,
     })
 }
 
 fn require_regular_locator<'a>(
-    scan: &'a RaoLocatorScan,
+    scan: &'a RemObjectLocatorScan,
     path: &str,
-) -> Result<&'a RaoEntryLocator, String> {
+) -> Result<&'a RemObjectEntryLocator, String> {
     let entry = scan
         .entries
         .iter()
         .find(|entry| entry.path == path)
-        .ok_or_else(|| format!("RAO entry {path:?} not found"))?;
+        .ok_or_else(|| format!("REM-OBJECT entry {path:?} not found"))?;
     match entry.entry_type {
         RemTarEntryType::Regular => Ok(entry),
         RemTarEntryType::Hardlink => {
             let target = entry
                 .link_target
                 .as_deref()
-                .ok_or_else(|| format!("RAO hardlink {path:?} is missing link_target"))?;
+                .ok_or_else(|| format!("REM-OBJECT hardlink {path:?} is missing link_target"))?;
             let primary = scan
                 .entries
                 .iter()
@@ -11581,20 +11596,22 @@ fn require_regular_locator<'a>(
                     candidate.path == target && candidate.entry_type == RemTarEntryType::Regular
                 })
                 .ok_or_else(|| {
-                    format!("RAO hardlink {path:?} target {target:?} is not a regular primary")
+                    format!(
+                        "REM-OBJECT hardlink {path:?} target {target:?} is not a regular primary"
+                    )
                 })?;
             Ok(primary)
         }
         _ => Err(format!(
-            "RAO entry {path:?} is {}, not regular",
+            "REM-OBJECT entry {path:?} is {}, not regular",
             archive_entry_type_name(entry.entry_type)
         )),
     }
 }
 
-fn read_plaintext_rao_entry_range(
+fn read_plaintext_rem_object_entry_range(
     object: &Path,
-    entry: &RaoEntryLocator,
+    entry: &RemObjectEntryLocator,
     range_start: u64,
     range_len: u64,
 ) -> Result<Vec<u8>, String> {
@@ -11602,43 +11619,50 @@ fn read_plaintext_rao_entry_range(
     let byte_offset = entry
         .data_offset
         .checked_add(range_start)
-        .ok_or_else(|| format!("RAO range for {:?} overflows", entry.path))?;
+        .ok_or_else(|| format!("REM-OBJECT range for {:?} overflows", entry.path))?;
     let len = usize::try_from(range_len)
-        .map_err(|_| format!("RAO range for {:?} is too large", entry.path))?;
+        .map_err(|_| format!("REM-OBJECT range for {:?} is too large", entry.path))?;
     let mut file =
         File::open(object).map_err(|error| format!("open {}: {error}", object.display()))?;
     file.seek(SeekFrom::Start(byte_offset))
         .map_err(|error| format!("seek {} to byte {byte_offset}: {error}", object.display()))?;
     let mut bytes = vec![0u8; len];
     file.read_exact(&mut bytes)
-        .map_err(|error| format!("read RAO range for {:?}: {error}", entry.path))?;
+        .map_err(|error| format!("read REM-OBJECT range for {:?}: {error}", entry.path))?;
     Ok(bytes)
 }
 
 fn validate_blob_entry_range(
-    entry: &RaoEntryLocator,
+    entry: &RemObjectEntryLocator,
     range_start: u64,
     range_len: u64,
 ) -> Result<(), String> {
     let range_end = range_start
         .checked_add(range_len)
-        .ok_or_else(|| format!("RAO range for {:?} overflows", entry.path))?;
+        .ok_or_else(|| format!("REM-OBJECT range for {:?} overflows", entry.path))?;
     if range_len == 0 {
         if range_start > entry.size_bytes {
-            return Err(format!("empty RAO range starts past {:?}", entry.path));
+            return Err(format!(
+                "empty REM-OBJECT range starts past {:?}",
+                entry.path
+            ));
         }
     } else if range_end > entry.size_bytes {
-        return Err(format!("RAO range extends past {:?}", entry.path));
+        return Err(format!("REM-OBJECT range extends past {:?}", entry.path));
     }
     Ok(())
 }
 
-fn verify_locator_sha256(entry: &RaoEntryLocator, bytes: &[u8], label: &str) -> Result<(), String> {
+fn verify_locator_sha256(
+    entry: &RemObjectEntryLocator,
+    bytes: &[u8],
+    label: &str,
+) -> Result<(), String> {
     if let Some(expected) = &entry.file_sha256 {
         let actual = bytes_to_hex(&sha256_bytes(bytes));
         if &actual != expected {
             return Err(format!(
-                "RAO entry {label:?} digest mismatch: expected {expected}, got {actual}"
+                "REM-OBJECT entry {label:?} digest mismatch: expected {expected}, got {actual}"
             ));
         }
     }
@@ -11777,7 +11801,7 @@ fn extract_plaintext_archive_range_file(
 ) -> Result<Value, String> {
     let entry = object
         .entry(member_path)
-        .ok_or_else(|| format!("plaintext RAO member {member_path:?} not found"))?;
+        .ok_or_else(|| format!("plaintext REM-OBJECT member {member_path:?} not found"))?;
     let entry = match entry.entry_type {
         RemTarEntryType::Regular => entry,
         RemTarEntryType::Hardlink => {
@@ -11840,21 +11864,22 @@ fn extract_encrypted_archive_range_file(
     member_path: &str,
     range: ArchiveByteRange,
 ) -> Result<Value, String> {
-    let file_size_bytes = args
-        .file_size_bytes
-        .ok_or_else(|| "encrypted RAO range extract requires --file-size-bytes".to_string())?;
+    let file_size_bytes = args.file_size_bytes.ok_or_else(|| {
+        "encrypted REM-OBJECT range extract requires --file-size-bytes".to_string()
+    })?;
     let first_chunk_lba = match args.first_chunk_lba {
         Some(lba) => Some(BodyLba(lba)),
         None if range.len == 0 => None,
         None => {
             return Err(
-                "non-empty encrypted RAO range extract requires --first-chunk-lba".to_string(),
+                "non-empty encrypted REM-OBJECT range extract requires --first-chunk-lba"
+                    .to_string(),
             )
         }
     };
     let encrypted = read_archive_object_bytes(&args.object)?;
-    let inspected =
-        inspect_bytes(&encrypted).map_err(|error| format!("inspect encrypted RAO: {error}"))?;
+    let inspected = inspect_bytes(&encrypted)
+        .map_err(|error| format!("inspect encrypted REM-OBJECT: {error}"))?;
     let key = encrypted_archive_key(args)?;
     let range_result = read_encrypted_archive_file_range(
         &encrypted,
@@ -11864,7 +11889,7 @@ fn extract_encrypted_archive_range_file(
         range.start,
         range.len,
     )
-    .map_err(|error| format!("extract encrypted RAO range: {error}"))?;
+    .map_err(|error| format!("extract encrypted REM-OBJECT range: {error}"))?;
     let output =
         write_archive_range_output(&args.dest, member_path, &range_result.bytes, args.overwrite)?;
     let context = ArchiveRangeExtractReportContext {
@@ -11873,7 +11898,7 @@ fn extract_encrypted_archive_range_file(
         output: &output,
         member_path,
         representation: "encrypted",
-        encryption: "RAO1",
+        encryption: "REMO",
         recipient_epochs: Some(recipient_epochs_json(&inspected.key_frame)),
         chunk_size: usize::try_from(inspected.header.chunk_size)
             .map_err(|_| "encrypted header chunk_size is too large for this host".to_string())?,
@@ -11916,7 +11941,7 @@ fn read_plaintext_archive_object_file(
     let block_count = source.block_count();
     let stored_size_bytes = source.len_bytes();
     let object = read_rem_tar_object(&mut source, chunk_size, block_count)
-        .map_err(|error| format!("read plaintext RAO: {error}"))?;
+        .map_err(|error| format!("read plaintext REM-OBJECT: {error}"))?;
     let stored_digest = sha256_file(path)?;
     Ok((object, stored_size_bytes, block_count, stored_digest))
 }
@@ -11930,16 +11955,16 @@ fn archive_object_is_encrypted(path: &Path) -> Result<bool, String> {
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic)
         .map_err(|error| format!("read {} magic: {error}", path.display()))?;
-    Ok(&magic == b"RAO1")
+    Ok(&magic == b"REMO")
 }
 
 fn plaintext_blocks_from_bytes(bytes: &[u8], chunk_size: usize) -> Result<Vec<Vec<u8>>, String> {
     if bytes.is_empty() {
-        return Err("decrypted plaintext RAO is empty".to_string());
+        return Err("decrypted plaintext REM-OBJECT is empty".to_string());
     }
     if bytes.len() % chunk_size != 0 {
         return Err(format!(
-            "decrypted plaintext RAO size {} is not a multiple of chunk size {chunk_size}",
+            "decrypted plaintext REM-OBJECT size {} is not a multiple of chunk size {chunk_size}",
             bytes.len()
         ));
     }
@@ -11981,7 +12006,7 @@ fn plaintext_archive_inspect_json(
 fn encrypted_archive_keyless_json(path: &Path, report: &remanence_aead::InspectReport) -> Value {
     json!({
         "representation": "encrypted",
-        "encryption": "RAO1",
+        "encryption": "REMO",
         "keyed": false,
         "object": path,
         "object_id": report.header.object_id,
@@ -12306,7 +12331,7 @@ fn required_global_pax<'a>(object: &'a RemTarReadObject, key: &str) -> Result<&'
         .global_pax
         .get(key)
         .map(String::as_str)
-        .ok_or_else(|| format!("decrypted RAO is missing global pax key {key}"))
+        .ok_or_else(|| format!("decrypted REM-OBJECT is missing global pax key {key}"))
 }
 
 struct ArchiveBuildResult {
@@ -12650,7 +12675,7 @@ fn temporary_archive_output_path(out: &Path) -> PathBuf {
     let file_name = out
         .file_name()
         .and_then(|value| value.to_str())
-        .unwrap_or("archive.rao");
+        .unwrap_or("archive.rem-object");
     let tmp_name = format!(".{file_name}.tmp.{}", std::process::id());
     out.with_file_name(tmp_name)
 }
@@ -12661,7 +12686,7 @@ struct SecurePlaintextStage(tempfile::NamedTempFile);
 impl SecurePlaintextStage {
     fn new_in(directory: &Path) -> Result<Self, String> {
         tempfile::Builder::new()
-            .prefix(".rao-plaintext.")
+            .prefix(".rem-object-plaintext.")
             .tempfile_in(directory)
             .map(Self)
             .map_err(|error| {
@@ -13306,7 +13331,7 @@ enum DirtyReason {
     /// phase failed.
     PartialFailure,
     /// An op succeeded but touched an IE port, where vendor behavior
-    /// diverges (HPE parks visibly in the IE element, QuadStor
+    /// diverges (HPE parks visibly in the IE element, Quadstor
     /// vaults to a hidden pool). The snapshot's IE-full/empty bits
     /// can't be trusted without a rescan.
     VendorSemantics,
@@ -14701,7 +14726,7 @@ mod tests {
         assert_eq!(
             value["capabilities"],
             json!([
-                "rao-envelope",
+                "rem-object-envelope",
                 "wrap-suite-hpke-v1",
                 "ranged-ciphertext-extract"
             ])
@@ -14740,11 +14765,11 @@ mod tests {
         let next_recovery =
             remanence_aead::RecipientPrivateKey::new([4; 16], "next-escrow", [10; 32]).unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let object = temp.path().join("object-encrypted.rao");
-        let source_private_path = temp.path().join("source-safe.raop");
-        let next_primary_path = temp.path().join("next-safe.raor");
-        let next_recovery_path = temp.path().join("next-escrow.raor");
-        let output = temp.path().join("object-resealed.rao");
+        let object = temp.path().join("object-encrypted.rem-object");
+        let source_private_path = temp.path().join("source-safe.remp");
+        let next_primary_path = temp.path().join("next-safe.remr");
+        let next_recovery_path = temp.path().join("next-escrow.remr");
+        let output = temp.path().join("object-resealed.rem-object");
         let staging = temp.path().join("plaintext-staging");
         fs::create_dir(&staging).unwrap();
         fs::write(&object, source_object).unwrap();
@@ -14772,7 +14797,7 @@ mod tests {
         let failure = run_archive_reseal_with(&args, &mut failure_out, &mut failure_err, |args| {
             reseal_archive_object_with_verifier(args, |path, expected| {
                 let mut bytes = fs::read(path).map_err(|error| error.to_string())?;
-                bytes[RAO_HEADER_LEN] ^= 0x80;
+                bytes[REM_OBJECT_HEADER_LEN] ^= 0x80;
                 fs::write(path, bytes).map_err(|error| error.to_string())?;
                 let actual = sha256_file(path)?;
                 if actual != expected {
@@ -14795,7 +14820,7 @@ mod tests {
         );
         assert!(report_err.is_empty());
         let report: Value = serde_json::from_slice(&report_out).unwrap();
-        assert_eq!(report["input_format_version"], 2);
+        assert_eq!(report["input_format_version"], 1);
         assert_eq!(report["verified_after_write"], true);
         assert_eq!(report["object_id"], "reseal-object");
         assert_eq!(report["chunk_size"], 512);
@@ -14806,7 +14831,7 @@ mod tests {
         let (opened, opened_report) =
             remanence_aead::open_to_vec(&resealed, &next_recovery).unwrap();
         assert_eq!(opened, plaintext);
-        assert_eq!(opened_report.header.format_version, 2);
+        assert_eq!(opened_report.header.format_version, 1);
         assert_eq!(opened_report.header.object_id, "reseal-object");
         assert_eq!(opened_report.header.chunk_size, 512);
         assert_eq!(opened_report.metadata.plaintext_digest, digest);
@@ -15192,7 +15217,7 @@ mod tests {
             "/tmp/input-a",
             "/tmp/input-b",
             "--out",
-            "/tmp/object.rao",
+            "/tmp/object.rem-object",
             "--chunk-size",
             "4KiB",
         ]);
@@ -15205,7 +15230,7 @@ mod tests {
                     args.inputs,
                     vec![PathBuf::from("/tmp/input-a"), PathBuf::from("/tmp/input-b")]
                 );
-                assert_eq!(args.out, Some(PathBuf::from("/tmp/object.rao")));
+                assert_eq!(args.out, Some(PathBuf::from("/tmp/object.rem-object")));
                 assert_eq!(args.chunk_size, 4096);
                 assert!(args.rules.is_none());
                 assert!(!args.scan_only);
@@ -15224,7 +15249,7 @@ mod tests {
             "archive",
             "inspect",
             "--object",
-            "/tmp/object.rao",
+            "/tmp/object.rem-object",
             "--chunk-size",
             "4KiB",
         ]);
@@ -15233,7 +15258,7 @@ mod tests {
             RemCommand::Archive {
                 command: RemArchiveCommand::Inspect(args),
             } => {
-                assert_eq!(args.object, PathBuf::from("/tmp/object.rao"));
+                assert_eq!(args.object, PathBuf::from("/tmp/object.rem-object"));
                 assert_eq!(args.chunk_size, 4096);
             }
             other => panic!("unexpected command: {other:?}"),
@@ -15247,7 +15272,7 @@ mod tests {
             "archive",
             "extract",
             "--object",
-            "/tmp/object.rao",
+            "/tmp/object.rem-object",
             "--dest",
             "/tmp/restored",
             "--chunk-size",
@@ -15263,7 +15288,7 @@ mod tests {
             RemCommand::Archive {
                 command: RemArchiveCommand::Extract(args),
             } => {
-                assert_eq!(args.object, PathBuf::from("/tmp/object.rao"));
+                assert_eq!(args.object, PathBuf::from("/tmp/object.rem-object"));
                 assert_eq!(args.dest, PathBuf::from("/tmp/restored"));
                 assert_eq!(args.chunk_size, 4096);
                 assert!(args.overwrite);
@@ -15291,7 +15316,7 @@ mod tests {
                 "archive",
                 "extract",
                 "--object",
-                "/tmp/object.rao",
+                "/tmp/object.rem-object",
                 "--dest",
                 "/tmp/restored",
                 "--xattr-namespace",
@@ -15415,11 +15440,11 @@ mod tests {
             "archive",
             "extract",
             "--object",
-            "/tmp/object.rao",
+            "/tmp/object.rem-object",
             "--dest",
             "/tmp/restored",
             "--private-key",
-            "/tmp/primary.raop",
+            "/tmp/primary.remp",
             "--path",
             "nested/big.bin",
             "--first-chunk-lba",
@@ -15434,7 +15459,7 @@ mod tests {
             RemCommand::Archive {
                 command: RemArchiveCommand::Extract(args),
             } => {
-                assert_eq!(args.private_key, Some(PathBuf::from("/tmp/primary.raop")));
+                assert_eq!(args.private_key, Some(PathBuf::from("/tmp/primary.remp")));
                 assert_eq!(args.path.as_deref(), Some("nested/big.bin"));
                 assert_eq!(args.first_chunk_lba, Some(17));
                 assert_eq!(args.file_size_bytes, Some(2048));
@@ -15457,7 +15482,7 @@ mod tests {
             "archive",
             "extract-stream",
             "--private-key",
-            "/tmp/primary.raop",
+            "/tmp/primary.remp",
             "--range",
             "511:514",
         ]);
@@ -15466,7 +15491,7 @@ mod tests {
             RemCommand::Archive {
                 command: RemArchiveCommand::ExtractStream(args),
             } => {
-                assert_eq!(args.private_key, Some(PathBuf::from("/tmp/primary.raop")));
+                assert_eq!(args.private_key, Some(PathBuf::from("/tmp/primary.remp")));
                 assert_eq!(
                     args.range,
                     Some(ArchiveByteRange {
@@ -15496,9 +15521,9 @@ mod tests {
             "--caller-object-id",
             "caller-1",
             "--recipient",
-            "/tmp/primary.raor",
+            "/tmp/primary.remr",
             "--recipient",
-            "/tmp/recovery.raor",
+            "/tmp/recovery.remr",
             "--json",
             "--config",
             "/tmp/rem.toml",
@@ -15516,8 +15541,8 @@ mod tests {
                 assert_eq!(
                     args.recipients,
                     vec![
-                        PathBuf::from("/tmp/primary.raor"),
-                        PathBuf::from("/tmp/recovery.raor")
+                        PathBuf::from("/tmp/primary.remr"),
+                        PathBuf::from("/tmp/recovery.remr")
                     ]
                 );
                 assert!(args.json);
@@ -15578,7 +15603,7 @@ mod tests {
             "--locator",
             "{}",
             "--out",
-            "/tmp/object.rao",
+            "/tmp/object.rem-object",
             "--config",
             "/tmp/config.toml",
         ]);
@@ -17257,9 +17282,9 @@ mod tests {
             [recovery_id.wrapping_add(0x20); 32],
         )
         .unwrap();
-        let primary_public_path = root.join(format!("{prefix}-primary.raor"));
-        let recovery_public_path = root.join(format!("{prefix}-recovery.raor"));
-        let primary_private_path = root.join(format!("{prefix}-primary.raop"));
+        let primary_public_path = root.join(format!("{prefix}-primary.remr"));
+        let recovery_public_path = root.join(format!("{prefix}-recovery.remr"));
+        let primary_private_path = root.join(format!("{prefix}-primary.remp"));
         fs::write(
             &primary_public_path,
             primary.public_key(0).unwrap().serialize().unwrap(),
@@ -17828,14 +17853,14 @@ tape_catalog_dir = "{0}/cache/tapes"
     #[test]
     fn archive_build_plaintext_bypasses_discovery_and_round_trips() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-build-plain")
+            .prefix("remanence-cli-rem-object-build-plain")
             .tempdir()
             .unwrap();
         let input_dir = temp.path().join("inputs");
         fs::create_dir_all(input_dir.join("nested")).unwrap();
         fs::write(input_dir.join("alpha.txt"), b"alpha\n").unwrap();
         fs::write(input_dir.join("nested/beta.bin"), [0xB7u8; 6000]).unwrap();
-        let out_path = temp.path().join("plain.rao");
+        let out_path = temp.path().join("plain.rem-object");
 
         let (code, stdout, stderr) = invoke_without_discovery(&[
             "rem",
@@ -17864,7 +17889,7 @@ tape_catalog_dir = "{0}/cache/tapes"
         let report: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is json");
         assert_eq!(report["object_id"], "object-plain");
         assert_eq!(report["caller_object_id"], "caller-plain");
-        assert_eq!(report["body_format"], "rao-v1");
+        assert_eq!(report["body_format"], "rem-object-v1");
         assert_eq!(report["representation"], "plaintext");
         assert_eq!(report["encryption"], "none");
         assert_eq!(report["chunk_size"], 4096);
@@ -17885,7 +17910,7 @@ tape_catalog_dir = "{0}/cache/tapes"
         assert_eq!(read.entry("alpha.txt").unwrap().data, b"alpha\n");
         assert_eq!(read.entry("nested/beta.bin").unwrap().data, &[0xB7u8; 6000]);
 
-        let second_out_path = temp.path().join("plain-second.rao");
+        let second_out_path = temp.path().join("plain-second.rem-object");
         let (code, _stdout, stderr) = invoke_without_discovery(&[
             "rem",
             "archive",
@@ -17916,7 +17941,7 @@ tape_catalog_dir = "{0}/cache/tapes"
     #[test]
     fn archive_build_map_round_trips_preserves_order_and_reports_ids() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-build-map")
+            .prefix("remanence-cli-rem-object-build-map")
             .tempdir()
             .unwrap();
         let source_root = temp.path().join("source");
@@ -17954,7 +17979,7 @@ tape_catalog_dir = "{0}/cache/tapes"
         ];
         let map_hash = write_source_map(&map_path, &rows);
         let map_hash_arg = format!("{map_hash}  source-map.tsv");
-        let out_path = temp.path().join("map.rao");
+        let out_path = temp.path().join("map.rem-object");
         let manifest_path = temp.path().join("map-manifest.json");
 
         let (code, stdout, stderr) = invoke_without_discovery(&[
@@ -18039,7 +18064,7 @@ tape_catalog_dir = "{0}/cache/tapes"
     #[test]
     fn archive_build_map_rejects_malformed_rows_and_duplicate_paths() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-map-malformed")
+            .prefix("remanence-cli-rem-object-map-malformed")
             .tempdir()
             .unwrap();
         let source_root = temp.path().join("source");
@@ -18085,7 +18110,7 @@ tape_catalog_dir = "{0}/cache/tapes"
 
         for (name, map_text, expected) in cases {
             let map_path = temp.path().join(format!("{name}.tsv"));
-            let out_path = temp.path().join(format!("{name}.rao"));
+            let out_path = temp.path().join(format!("{name}.rem-object"));
             fs::write(&map_path, map_text).unwrap();
 
             let (code, stdout, stderr) = invoke_without_discovery(&[
@@ -18141,7 +18166,7 @@ tape_catalog_dir = "{0}/cache/tapes"
         ];
         for (name, map_bytes, expected) in byte_cases {
             let map_path = temp.path().join(format!("{name}.tsv"));
-            let out_path = temp.path().join(format!("{name}.rao"));
+            let out_path = temp.path().join(format!("{name}.rem-object"));
             fs::write(&map_path, map_bytes).unwrap();
 
             let (code, stdout, stderr) = invoke_without_discovery(&[
@@ -18172,7 +18197,7 @@ tape_catalog_dir = "{0}/cache/tapes"
     #[test]
     fn archive_build_map_rejects_raw_archive_paths_without_normalizing() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-map-paths")
+            .prefix("remanence-cli-rem-object-map-paths")
             .tempdir()
             .unwrap();
         let source_root = temp.path().join("source");
@@ -18187,7 +18212,7 @@ tape_catalog_dir = "{0}/cache/tapes"
 
         for (index, archive_path) in bad_paths.iter().enumerate() {
             let map_path = temp.path().join(format!("bad-path-{index}.tsv"));
-            let out_path = temp.path().join(format!("bad-path-{index}.rao"));
+            let out_path = temp.path().join(format!("bad-path-{index}.rem-object"));
             fs::write(
                 &map_path,
                 format!(
@@ -18220,7 +18245,7 @@ tape_catalog_dir = "{0}/cache/tapes"
     #[test]
     fn archive_build_map_rejects_source_escape_and_relative_source() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-map-source")
+            .prefix("remanence-cli-rem-object-map-source")
             .tempdir()
             .unwrap();
         let source_root = temp.path().join("source");
@@ -18252,7 +18277,7 @@ tape_catalog_dir = "{0}/cache/tapes"
         ];
         for (name, map_text, expected) in cases {
             let map_path = temp.path().join(format!("{name}.tsv"));
-            let out_path = temp.path().join(format!("{name}.rao"));
+            let out_path = temp.path().join(format!("{name}.rem-object"));
             fs::write(&map_path, map_text).unwrap();
             let (code, stdout, stderr) = invoke_without_discovery(&[
                 "rem",
@@ -18278,7 +18303,7 @@ tape_catalog_dir = "{0}/cache/tapes"
     #[test]
     fn archive_build_map_rejects_symlink_escape_before_reading() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-map-symlink")
+            .prefix("remanence-cli-rem-object-map-symlink")
             .tempdir()
             .unwrap();
         let source_root = temp.path().join("source");
@@ -18299,7 +18324,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             ),
         )
         .unwrap();
-        let out_path = temp.path().join("symlink.rao");
+        let out_path = temp.path().join("symlink.rem-object");
 
         let (code, stdout, stderr) = invoke_without_discovery(&[
             "rem",
@@ -18324,11 +18349,11 @@ tape_catalog_dir = "{0}/cache/tapes"
     #[test]
     fn archive_build_map_rejects_guard_errors_before_tsv_read() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-map-guards")
+            .prefix("remanence-cli-rem-object-map-guards")
             .tempdir()
             .unwrap();
         let missing_map = temp.path().join("missing.tsv");
-        let out_path = temp.path().join("missing.rao");
+        let out_path = temp.path().join("missing.rem-object");
 
         let args = default_map_archive_args(missing_map.clone(), None, out_path.clone());
         let error = build_archive_object_file(&args).unwrap_err();
@@ -18377,7 +18402,7 @@ tape_catalog_dir = "{0}/cache/tapes"
     #[test]
     fn archive_build_map_sha256_mismatch_fails_before_source_validation() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-map-mapsha")
+            .prefix("remanence-cli-rem-object-map-mapsha")
             .tempdir()
             .unwrap();
         let source_root = temp.path().join("source");
@@ -18393,7 +18418,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             ),
         )
         .unwrap();
-        let out_path = temp.path().join("mapsha.rao");
+        let out_path = temp.path().join("mapsha.rem-object");
 
         let (code, stdout, stderr) = invoke_without_discovery(&[
             "rem",
@@ -18421,7 +18446,7 @@ tape_catalog_dir = "{0}/cache/tapes"
     #[test]
     fn archive_build_map_rejects_size_and_payload_hash_mismatches_closed() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-map-mismatch")
+            .prefix("remanence-cli-rem-object-map-mismatch")
             .tempdir()
             .unwrap();
         let source_root = temp.path().join("source");
@@ -18433,7 +18458,7 @@ tape_catalog_dir = "{0}/cache/tapes"
         let hash = bytes_to_hex(&sha256_bytes(payload));
 
         let size_map = temp.path().join("size.tsv");
-        let size_out = temp.path().join("size.rao");
+        let size_out = temp.path().join("size.rem-object");
         fs::write(
             &size_map,
             format!(
@@ -18461,7 +18486,7 @@ tape_catalog_dir = "{0}/cache/tapes"
         assert!(!size_out.exists());
 
         let hash_map = temp.path().join("hash.tsv");
-        let hash_out = temp.path().join("hash.rao");
+        let hash_out = temp.path().join("hash.rem-object");
         fs::write(
             &hash_map,
             format!(
@@ -18493,7 +18518,7 @@ tape_catalog_dir = "{0}/cache/tapes"
     #[test]
     fn archive_build_map_encrypted_round_trips() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-map-encrypted")
+            .prefix("remanence-cli-rem-object-map-encrypted")
             .tempdir()
             .unwrap();
         let source_root = temp.path().join("source");
@@ -18511,7 +18536,7 @@ tape_catalog_dir = "{0}/cache/tapes"
         write_source_map(&map_path, &rows);
         let (primary, primary_public, recovery_public, primary_private) =
             write_test_recipient_files(temp.path(), "map", 0x5a);
-        let out_path = temp.path().join("map-encrypted.rao");
+        let out_path = temp.path().join("map-encrypted.rem-object");
 
         let (code, stdout, stderr) = invoke_without_discovery(&[
             "rem",
@@ -18548,7 +18573,7 @@ tape_catalog_dir = "{0}/cache/tapes"
         let mut source = remanence_library::FileBlockSource::open(&out_path, 4096).unwrap();
         let block_count = source.block_count();
         let read =
-            remanence_format::read_encrypted_rao_object(&mut source, 4096, block_count, &primary)
+            remanence_format::read_encrypted_rem_object(&mut source, 4096, block_count, &primary)
                 .unwrap();
         assert_eq!(read.object.entry("secret.txt").unwrap().data, payload);
 
@@ -18574,7 +18599,7 @@ tape_catalog_dir = "{0}/cache/tapes"
     #[test]
     fn archive_build_map_is_byte_reproducible_with_pinned_ids() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-map-repro")
+            .prefix("remanence-cli-rem-object-map-repro")
             .tempdir()
             .unwrap();
         let source_root = temp.path().join("source");
@@ -18586,8 +18611,8 @@ tape_catalog_dir = "{0}/cache/tapes"
         let rows: Vec<(&str, &Path, &[u8], &str)> =
             vec![("asset.bin", source_path.as_path(), &payload[..], "asset-id")];
         write_source_map(&map_path, &rows);
-        let first_out = temp.path().join("first.rao");
-        let second_out = temp.path().join("second.rao");
+        let first_out = temp.path().join("first.rem-object");
+        let second_out = temp.path().join("second.rem-object");
 
         for out_path in [&first_out, &second_out] {
             let (code, _stdout, stderr) = invoke_without_discovery(&[
@@ -18625,7 +18650,7 @@ tape_catalog_dir = "{0}/cache/tapes"
     #[test]
     fn archive_build_plaintext_preserves_symlinks_and_empty_directories() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-build-nonregular")
+            .prefix("remanence-cli-rem-object-build-nonregular")
             .tempdir()
             .unwrap();
         let input_dir = temp.path().join("inputs");
@@ -18633,7 +18658,7 @@ tape_catalog_dir = "{0}/cache/tapes"
         fs::write(input_dir.join("target.txt"), b"target").unwrap();
         std::os::unix::fs::symlink("target.txt", input_dir.join("latest")).unwrap();
         std::os::unix::fs::symlink("missing.txt", input_dir.join("dangling")).unwrap();
-        let out_path = temp.path().join("nonregular.rao");
+        let out_path = temp.path().join("nonregular.rem-object");
 
         let (code, stdout, stderr) = invoke_without_discovery(&[
             "rem",
@@ -18804,10 +18829,10 @@ tape_catalog_dir = "{0}/cache/tapes"
     #[test]
     fn plaintext_locator_scan_resolves_hardlink_pfr_rows() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-hardlink-pfr")
+            .prefix("remanence-cli-rem-object-hardlink-pfr")
             .tempdir()
             .unwrap();
-        let object_path = temp.path().join("hardlinks.rao");
+        let object_path = temp.path().join("hardlinks.rem-object");
         let primary = b"shared hardlink payload".to_vec();
         let mut primary_reader = Cursor::new(primary.as_slice());
         let mut hardlink_reader = io::empty();
@@ -18838,7 +18863,7 @@ tape_catalog_dir = "{0}/cache/tapes"
         let bytes = sink.blocks.iter().flatten().copied().collect::<Vec<_>>();
         fs::write(&object_path, &bytes).unwrap();
 
-        let scan = scan_rao_entry_locators_from_bytes(&bytes, 4096).unwrap();
+        let scan = scan_rem_object_entry_locators_from_bytes(&bytes, 4096).unwrap();
         let hardlink = scan
             .entries
             .iter()
@@ -18851,14 +18876,14 @@ tape_catalog_dir = "{0}/cache/tapes"
         let resolved = require_regular_locator(&scan, "links/copy.txt").unwrap();
         assert_eq!(resolved.path, "primary.txt");
         assert_eq!(resolved.size_bytes, primary.len() as u64);
-        let bytes = read_plaintext_rao_entry_range(&object_path, resolved, 7, 8).unwrap();
+        let bytes = read_plaintext_rem_object_entry_range(&object_path, resolved, 7, 8).unwrap();
         assert_eq!(bytes, b"hardlink");
     }
 
     #[test]
     fn archive_build_with_rules_blobs_indexes_manifests_and_unwraps() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-build-rules")
+            .prefix("remanence-cli-rem-object-build-rules")
             .tempdir()
             .unwrap();
         let input_dir = temp.path().join("inputs");
@@ -18880,7 +18905,7 @@ blob Project/Render Files/
 ",
         )
         .unwrap();
-        let out_path = temp.path().join("rules.rao");
+        let out_path = temp.path().join("rules.rem-object");
         let manifest_path = temp.path().join("customer-manifest.json");
 
         let (code, stdout, stderr) = invoke_without_discovery(&[
@@ -19022,7 +19047,7 @@ blob Project/Render Files/
         assert!(stderr.is_empty(), "{stderr}");
         let member: serde_json::Value = serde_json::from_str(&stdout).expect("member json");
         assert_eq!(member["mode"], "blob-member");
-        assert_eq!(member["range_method"], "rao-entry-range");
+        assert_eq!(member["range_method"], "rem-object-entry-range");
         assert_eq!(member["idx_entry"], "Project/Render Files.remwrap.idx");
         assert_eq!(member["blob_range_len"], 12);
         assert!(member["blob_first_chunk_lba"].is_number());
@@ -19039,7 +19064,7 @@ blob Project/Render Files/
     #[test]
     fn archive_build_rules_scan_only_does_not_require_out() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-scan-only")
+            .prefix("remanence-cli-rem-object-scan-only")
             .tempdir()
             .unwrap();
         let input_dir = temp.path().join("inputs");
@@ -19066,13 +19091,13 @@ blob Project/Render Files/
         let report: serde_json::Value = serde_json::from_str(&stdout).expect("scan json");
         assert_eq!(report["ruleset"]["name"], "scan");
         assert_eq!(report["scan"]["totals"]["blob_entries"], 1);
-        assert!(!temp.path().join("archive.rao").exists());
+        assert!(!temp.path().join("archive.rem-object").exists());
     }
 
     #[test]
     fn archive_build_scan_only_accepts_inputs_without_rules() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-scan-only-no-rules")
+            .prefix("remanence-cli-rem-object-scan-only-no-rules")
             .tempdir()
             .unwrap();
         let input_dir = temp.path().join("inputs");
@@ -19100,7 +19125,7 @@ blob Project/Render Files/
     #[test]
     fn archive_build_rules_scan_only_matches_build_verdicts() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-scan-parity")
+            .prefix("remanence-cli-rem-object-scan-parity")
             .tempdir()
             .unwrap();
         let input_dir = temp.path().join("inputs");
@@ -19123,7 +19148,7 @@ blob Project/Render Files/
         assert_eq!(format!("{scan_code:?}"), format!("{:?}", ExitCode::SUCCESS));
         assert!(scan_stderr.is_empty(), "{scan_stderr}");
 
-        let out_path = temp.path().join("scan-parity.rao");
+        let out_path = temp.path().join("scan-parity.rem-object");
         let (build_code, build_stdout, build_stderr) = invoke_without_discovery(&[
             "rem",
             "archive",
@@ -19197,7 +19222,7 @@ blob Project/Render Files/
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-scan-nohash")
+            .prefix("remanence-cli-rem-object-scan-nohash")
             .tempdir()
             .unwrap();
         let input_dir = temp.path().join("inputs");
@@ -19232,7 +19257,7 @@ blob Project/Render Files/
     #[test]
     fn archive_build_default_preserves_user_xattr_natively_without_logging_value() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-xattr-native")
+            .prefix("remanence-cli-rem-object-xattr-native")
             .tempdir()
             .unwrap();
         let input_dir = temp.path().join("inputs");
@@ -19242,7 +19267,7 @@ blob Project/Render Files/
         let xattr_name = "user.remanence_test";
         xattr::set(&xattr_file, xattr_name, b"kept")
             .expect("the native xattr test requires user.* xattr support");
-        let out_path = temp.path().join("xattr.rao");
+        let out_path = temp.path().join("xattr.rem-object");
 
         let (code, stdout, stderr) = invoke_without_discovery(&[
             "rem",
@@ -19315,7 +19340,7 @@ blob Project/Render Files/
             .unwrap();
         let input = temp.path().join("input.txt");
         fs::write(&input, b"full fidelity posture").unwrap();
-        let out_path = temp.path().join("full.rao");
+        let out_path = temp.path().join("full.rem-object");
 
         let (code, stdout, stderr) = invoke_without_discovery(&[
             "rem",
@@ -19352,7 +19377,7 @@ blob Project/Render Files/
             .prefix("remanence-cli-xattr-skip-report")
             .tempdir()
             .unwrap();
-        let object_path = temp.path().join("xattrs.rao");
+        let object_path = temp.path().join("xattrs.rem-object");
         let restore_dir = temp.path().join("restore");
         let payload = b"xattr report payload".to_vec();
         let mut spec = RemTarFileSpec::new(
@@ -19433,7 +19458,7 @@ blob Project/Render Files/
             )]),
         };
         let context = ArchiveExtractReportContext {
-            object: Path::new("object.rao"),
+            object: Path::new("object.rem-object"),
             dest: Path::new("restore"),
             representation: "plain",
             encryption: "none",
@@ -19458,7 +19483,7 @@ blob Project/Render Files/
     #[test]
     fn archive_build_rules_drop_xattrs_without_schema_bump() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-xattr-drop")
+            .prefix("remanence-cli-rem-object-xattr-drop")
             .tempdir()
             .unwrap();
         let input_dir = temp.path().join("inputs");
@@ -19470,7 +19495,7 @@ blob Project/Render Files/
             .expect("the xattr drop test requires user.* xattr support");
         let rules = temp.path().join("drop.rules");
         fs::write(&rules, format!("xattr-drop {xattr_name}\n")).unwrap();
-        let out_path = temp.path().join("drop.rao");
+        let out_path = temp.path().join("drop.rem-object");
 
         let (code, stdout, stderr) = invoke_without_discovery(&[
             "rem",
@@ -19510,7 +19535,7 @@ blob Project/Render Files/
             .unwrap()
             .iter()
             .any(|cluster| cluster["name"] == xattr_name && cluster["reason"] == "policy"));
-        let scan = scan_plaintext_rao_entry_locators(&out_path, 4096).unwrap();
+        let scan = scan_plaintext_rem_object_entry_locators(&out_path, 4096).unwrap();
         assert_eq!(
             scan.global_pax
                 .get("REMANENCE.schema_version")
@@ -19529,7 +19554,7 @@ blob Project/Render Files/
     #[test]
     fn archive_build_rules_allowlist_drops_unlisted_xattr() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-xattr-allowlist")
+            .prefix("remanence-cli-rem-object-xattr-allowlist")
             .tempdir()
             .unwrap();
         let input_dir = temp.path().join("inputs");
@@ -19544,7 +19569,7 @@ blob Project/Render Files/
             "option xattr-mode allowlist\nxattr-keep user.kept\n",
         )
         .unwrap();
-        let out_path = temp.path().join("allow.rao");
+        let out_path = temp.path().join("allow.rem-object");
 
         let (code, stdout, stderr) = invoke_without_discovery(&[
             "rem",
@@ -19587,7 +19612,7 @@ blob Project/Render Files/
     #[ignore = "requires a filesystem that accepts user xattr values larger than 4096 bytes"]
     fn archive_build_rules_wraps_oversized_xattr() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-xattr-large")
+            .prefix("remanence-cli-rem-object-xattr-large")
             .tempdir()
             .unwrap();
         let input_dir = temp.path().join("inputs");
@@ -19599,7 +19624,7 @@ blob Project/Render Files/
             .expect("the oversized xattr test requires user.* xattr support");
         let rules = temp.path().join("large.rules");
         fs::write(&rules, "").unwrap();
-        let out_path = temp.path().join("large.rao");
+        let out_path = temp.path().join("large.rem-object");
 
         let (code, stdout, stderr) = invoke_without_discovery(&[
             "rem",
@@ -19675,7 +19700,7 @@ blob Project/Render Files/
         use std::os::unix::fs::MetadataExt;
 
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-hardlink")
+            .prefix("remanence-cli-rem-object-hardlink")
             .tempdir()
             .unwrap();
         let input_dir = temp.path().join("inputs");
@@ -19688,7 +19713,7 @@ blob Project/Render Files/
         .unwrap();
         let rules = temp.path().join("empty.rules");
         fs::write(&rules, "").unwrap();
-        let out_path = temp.path().join("hardlinks.rao");
+        let out_path = temp.path().join("hardlinks.rem-object");
 
         let (code, stdout, stderr) = invoke_without_discovery(&[
             "rem",
@@ -19749,7 +19774,7 @@ blob Project/Render Files/
     #[test]
     fn archive_build_rules_hardlink_primary_falls_back_after_exclusion() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-hardlink-excluded-primary")
+            .prefix("remanence-cli-rem-object-hardlink-excluded-primary")
             .tempdir()
             .unwrap();
         let input_dir = temp.path().join("inputs");
@@ -19762,7 +19787,7 @@ blob Project/Render Files/
         .unwrap();
         let rules = temp.path().join("exclude.rules");
         fs::write(&rules, "exclude links/a-primary.bin\n").unwrap();
-        let out_path = temp.path().join("hardlink-excluded-primary.rao");
+        let out_path = temp.path().join("hardlink-excluded-primary.rem-object");
 
         let (code, stdout, stderr) = invoke_without_discovery(&[
             "rem",
@@ -19801,7 +19826,7 @@ blob Project/Render Files/
     #[test]
     fn archive_build_recipient_envelope_reports_inspects_and_extracts() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-build-envelope")
+            .prefix("remanence-cli-rem-object-build-envelope")
             .tempdir()
             .unwrap();
         let input_dir = temp.path().join("inputs");
@@ -19812,9 +19837,9 @@ blob Project/Render Files/
             remanence_aead::RecipientPrivateKey::new([0x24; 16], "primary", [0x42; 32]).unwrap();
         let recovery =
             remanence_aead::RecipientPrivateKey::new([0x25; 16], "recovery", [0x43; 32]).unwrap();
-        let primary_public_path = temp.path().join("primary.raor");
-        let recovery_public_path = temp.path().join("recovery.raor");
-        let primary_private_path = temp.path().join("primary.raop");
+        let primary_public_path = temp.path().join("primary.remr");
+        let recovery_public_path = temp.path().join("recovery.remr");
+        let primary_private_path = temp.path().join("primary.remp");
         fs::write(
             &primary_public_path,
             primary.public_key(0).unwrap().serialize().unwrap(),
@@ -19826,7 +19851,7 @@ blob Project/Render Files/
         )
         .unwrap();
         fs::write(&primary_private_path, primary.serialize()).unwrap();
-        let out_path = temp.path().join("encrypted.rao");
+        let out_path = temp.path().join("encrypted.rem-object");
 
         let (code, stdout, stderr) = invoke_without_discovery(&[
             "rem",
@@ -19855,7 +19880,7 @@ blob Project/Render Files/
         assert_eq!(code, ExitCode::SUCCESS);
         assert!(stderr.is_empty(), "{stderr}");
         let report: Value = serde_json::from_str(&stdout).unwrap();
-        assert_eq!(report["format_version"], 2);
+        assert_eq!(report["format_version"], 1);
         assert_eq!(
             report["recipient_epochs"],
             json!([
@@ -19880,7 +19905,7 @@ blob Project/Render Files/
         assert_eq!(code, ExitCode::SUCCESS);
         assert!(stderr.is_empty(), "{stderr}");
         let inspected: Value = serde_json::from_str(&stdout).unwrap();
-        assert_eq!(inspected["format_version"], 2);
+        assert_eq!(inspected["format_version"], 1);
         assert_eq!(inspected["recipient_epochs"], report["recipient_epochs"]);
 
         let restore_dir = temp.path().join("restore");
@@ -19908,7 +19933,7 @@ blob Project/Render Files/
     #[test]
     fn archive_build_encrypted_rules_blob_member_uses_ranged_pfr() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-encrypted-blob")
+            .prefix("remanence-cli-rem-object-encrypted-blob")
             .tempdir()
             .unwrap();
         let input_dir = temp.path().join("inputs");
@@ -19918,7 +19943,7 @@ blob Project/Render Files/
         fs::write(&rules, "blob Blob/\n").unwrap();
         let (_primary, primary_public, recovery_public, primary_private) =
             write_test_recipient_files(temp.path(), "blob", 0x24);
-        let out_path = temp.path().join("encrypted-blob.rao");
+        let out_path = temp.path().join("encrypted-blob.rem-object");
 
         let (code, _stdout, stderr) = invoke_without_discovery(&[
             "rem",
@@ -19969,9 +19994,9 @@ blob Project/Render Files/
         let member: serde_json::Value =
             serde_json::from_str(&stdout).expect("encrypted member json");
         assert_eq!(member["mode"], "blob-member");
-        assert_eq!(member["range_method"], "rao-entry-range");
+        assert_eq!(member["range_method"], "rem-object-entry-range");
         assert_eq!(member["representation"], "encrypted");
-        assert_eq!(member["encryption"], "RAO1");
+        assert_eq!(member["encryption"], "REMO");
         assert_eq!(member["idx_entry"], "Blob.remwrap.idx");
         assert_eq!(
             member["blob_range_len"],
@@ -19990,7 +20015,7 @@ blob Project/Render Files/
     #[test]
     fn archive_build_encrypted_rejects_overlong_object_id_before_output() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-build-encrypted-long-object-id")
+            .prefix("remanence-cli-rem-object-build-encrypted-long-object-id")
             .tempdir()
             .unwrap();
         let input_dir = temp.path().join("inputs");
@@ -19998,7 +20023,7 @@ blob Project/Render Files/
         fs::write(input_dir.join("secret.txt"), b"classified payload").unwrap();
         let (_primary, primary_public, recovery_public, _primary_private) =
             write_test_recipient_files(temp.path(), "long-id", 0x42);
-        let out_path = temp.path().join("encrypted.rao");
+        let out_path = temp.path().join("encrypted.rem-object");
         let object_id = "x".repeat(65);
         let argv = vec![
             "rem".to_string(),
@@ -20024,7 +20049,7 @@ blob Project/Render Files/
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
         assert!(stdout.is_empty(), "{stdout}");
         assert!(
-            stderr.contains("--object-id is invalid for encrypted RAO"),
+            stderr.contains("--object-id is invalid for encrypted REM-OBJECT"),
             "{stderr}"
         );
         assert!(
@@ -20036,7 +20061,7 @@ blob Project/Render Files/
     #[test]
     fn archive_extract_encrypted_range_uses_covering_chunks_only() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-rao-range-encrypted")
+            .prefix("remanence-cli-rem-object-range-encrypted")
             .tempdir()
             .unwrap();
         let input_dir = temp.path().join("inputs");
@@ -20045,7 +20070,7 @@ blob Project/Render Files/
         fs::write(input_dir.join("big.bin"), &payload).unwrap();
         let (primary, primary_public, recovery_public, primary_private) =
             write_test_recipient_files(temp.path(), "range", 0x52);
-        let out_path = temp.path().join("encrypted-range.rao");
+        let out_path = temp.path().join("encrypted-range.rem-object");
 
         let (code, stdout, stderr) = invoke_without_discovery(&[
             "rem",
@@ -20094,7 +20119,7 @@ blob Project/Render Files/
         let mut full_source = remanence_library::FileBlockSource::open(&out_path, 512).unwrap();
         let full_blocks = full_source.block_count();
         assert!(
-            remanence_format::read_encrypted_rao_object(
+            remanence_format::read_encrypted_rem_object(
                 &mut full_source,
                 512,
                 full_blocks,
@@ -20156,7 +20181,7 @@ blob Project/Render Files/
         fs::write(input_dir.join("small.bin"), vec![0x5a; 900]).unwrap();
         let (_primary, primary_public, recovery_public, primary_private) =
             write_test_recipient_files(temp.path(), "cover", 0x62);
-        let object_path = temp.path().join("covering-range.rao");
+        let object_path = temp.path().join("covering-range.rem-object");
 
         let (code, stdout, stderr) = invoke_without_discovery(&[
             "rem",
@@ -20184,11 +20209,11 @@ blob Project/Render Files/
         assert_eq!(code, ExitCode::SUCCESS);
         assert!(stderr.is_empty(), "{stderr}");
         let build: Value = serde_json::from_str(&stdout).expect("build json");
-        assert_eq!(build["format_version"], 2);
+        assert_eq!(build["format_version"], 1);
 
         let stored = fs::read(&object_path).unwrap();
         let inspected = remanence_aead::inspect_bytes(&stored).unwrap();
-        let authenticated_prefix_len = RAO_HEADER_LEN
+        let authenticated_prefix_len = REM_OBJECT_HEADER_LEN
             + inspected.header.key_frame_len as usize
             + inspected.header.metadata_frame_len as usize;
         let mut stdin_prefix = &stored[..authenticated_prefix_len];

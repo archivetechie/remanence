@@ -54,7 +54,7 @@ mod tests {
 
     #[test]
     fn builds_quadstor_layout_bay_to_slot() {
-        // QuadStor uses drive bay 0x0100..0x0103, slot 0x0400..0x0427.
+        // Quadstor uses drive bay 0x0100..0x0103, slot 0x0400..0x0427.
         // Round-trip: bay 0x0100 back to slot 0x0400.
         let cdb = build_cdb(0x0000, 0x0100, 0x0400, false);
         assert_eq!(

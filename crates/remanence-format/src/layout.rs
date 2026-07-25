@@ -1,4 +1,4 @@
-//! Counting-mode `rao-v1` layout planner.
+//! Counting-mode `rem-object-v1` layout planner.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,7 +17,7 @@ use crate::pax::{
 };
 use crate::tar::is_portable_ustar_linkname;
 
-/// Complete planned layout for one `rao-v1` object.
+/// Complete planned layout for one `rem-object-v1` object.
 #[derive(Debug, Clone)]
 pub struct RemTarObjectLayout {
     /// Object identifier copied from the global pax header.
@@ -26,7 +26,7 @@ pub struct RemTarObjectLayout {
     pub caller_object_id: String,
     /// Body block size in bytes.
     pub chunk_size: usize,
-    /// Effective RAO stream schema version written in the global pax header.
+    /// Effective REM-OBJECT stream schema version written in the global pax header.
     pub schema_version: String,
     /// Total archive byte length after the final fixed-block zero fill.
     pub total_size_bytes: u64,
@@ -44,7 +44,7 @@ pub struct RemTarObjectLayout {
     pub global_pax_body_len: usize,
 }
 
-/// Plan a `rao-v1` object using the same pax sizing/alignment rules the
+/// Plan a `rem-object-v1` object using the same pax sizing/alignment rules the
 /// writer uses.
 pub fn plan_rem_tar_object(
     options: &RemTarObjectOptions,
@@ -514,7 +514,7 @@ fn validate_options(options: &RemTarObjectOptions) -> Result<(), FormatError> {
     validate_non_empty("manifest_file_id", &options.manifest_file_id)?;
     if options.encryption != "none" {
         return Err(FormatError::unsupported_feature(format!(
-            "inner RAO stream encryption must be \"none\", got {:?}",
+            "inner REM-OBJECT stream encryption must be \"none\", got {:?}",
             options.encryption
         )));
     }
@@ -806,7 +806,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "invalid RAO input: caller_object_id must not be empty"
+            "invalid REM-OBJECT input: caller_object_id must not be empty"
         );
     }
 

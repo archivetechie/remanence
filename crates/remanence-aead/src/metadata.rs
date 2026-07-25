@@ -1,6 +1,6 @@
-//! RAO encrypted metadata schema and deterministic-CBOR validation.
+//! REM-OBJECT encrypted metadata schema and deterministic-CBOR validation.
 
-use crate::error::{RaoAeadError, Result};
+use crate::error::{RemObjectAeadError, Result};
 use crate::header::validate_chunk_size;
 use crate::stream::CHACHA20POLY1305_TAG_LEN;
 
@@ -12,16 +12,16 @@ const KEY_PLAINTEXT_DIGEST: u64 = 3;
 const MAX_DEPTH: usize = 32;
 const MAX_ITEMS: usize = 65_536;
 
-/// Decrypted RAO metadata fields required by version 1.
+/// Decrypted REM-OBJECT metadata fields required by version 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RaoMetadata {
+pub struct RemObjectMetadata {
     /// Length of the canonical plaintext object in bytes.
     pub plaintext_size: u64,
     /// SHA-256 of the canonical plaintext object.
     pub plaintext_digest: [u8; 32],
 }
 
-impl RaoMetadata {
+impl RemObjectMetadata {
     /// Construct metadata and validate the size against `chunk_size`.
     pub fn new(plaintext_size: u64, plaintext_digest: [u8; 32], chunk_size: u32) -> Result<Self> {
         let metadata = Self {
@@ -53,7 +53,7 @@ impl RaoMetadata {
         let mut decoder = Decoder::new(bytes);
         let metadata = decoder.decode_metadata_map(chunk_size)?;
         if decoder.pos != bytes.len() {
-            return Err(RaoAeadError::InvalidCborEncoding);
+            return Err(RemObjectAeadError::InvalidCborEncoding);
         }
         Ok(metadata)
     }
@@ -63,15 +63,15 @@ impl RaoMetadata {
         validate_chunk_size(chunk_size)?;
         let chunk = u64::from(chunk_size);
         if self.plaintext_size == 0 || self.plaintext_size % chunk != 0 {
-            return Err(RaoAeadError::InvalidMetadataField);
+            return Err(RemObjectAeadError::InvalidMetadataField);
         }
         let chunk_count = self.plaintext_size / chunk;
         let tag_bytes = CHACHA20POLY1305_TAG_LEN
             .checked_mul(chunk_count)
-            .ok_or(RaoAeadError::InvalidMetadataField)?;
+            .ok_or(RemObjectAeadError::InvalidMetadataField)?;
         self.plaintext_size
             .checked_add(tag_bytes)
-            .ok_or(RaoAeadError::InvalidMetadataField)?;
+            .ok_or(RemObjectAeadError::InvalidMetadataField)?;
         Ok(())
     }
 }
@@ -125,15 +125,16 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    fn decode_metadata_map(&mut self, chunk_size: u32) -> Result<RaoMetadata> {
+    fn decode_metadata_map(&mut self, chunk_size: u32) -> Result<RemObjectMetadata> {
         self.bump_item()?;
         let (major, len, _key_encoding) = self.read_type_len()?;
         if major != 5 {
-            return Err(RaoAeadError::InvalidCborEncoding);
+            return Err(RemObjectAeadError::InvalidCborEncoding);
         }
-        let len_usize = usize::try_from(len).map_err(|_| RaoAeadError::InvalidCborEncoding)?;
+        let len_usize =
+            usize::try_from(len).map_err(|_| RemObjectAeadError::InvalidCborEncoding)?;
         if len_usize > MAX_ITEMS {
-            return Err(RaoAeadError::InvalidCborEncoding);
+            return Err(RemObjectAeadError::InvalidCborEncoding);
         }
 
         let mut prev_key = None::<Vec<u8>>;
@@ -147,7 +148,7 @@ impl<'a> Decoder<'a> {
             let key = self.decode_top_level_key()?;
             let key_bytes = self.bytes[key_start..self.pos].to_vec();
             if prev_key.as_ref().is_some_and(|prev| prev >= &key_bytes) {
-                return Err(RaoAeadError::InvalidCborEncoding);
+                return Err(RemObjectAeadError::InvalidCborEncoding);
             }
             prev_key = Some(key_bytes);
 
@@ -160,7 +161,7 @@ impl<'a> Decoder<'a> {
                 KEY_PLAINTEXT_DIGEST => {
                     let bytes = self.decode_bytes()?;
                     if bytes.len() != 32 {
-                        return Err(RaoAeadError::InvalidMetadataField);
+                        return Err(RemObjectAeadError::InvalidMetadataField);
                     }
                     let mut digest = [0u8; 32];
                     digest.copy_from_slice(bytes);
@@ -170,15 +171,18 @@ impl<'a> Decoder<'a> {
             }
         }
 
-        if metadata_version.ok_or(RaoAeadError::MissingRequiredMetadataField)? != 1 {
-            return Err(RaoAeadError::InvalidMetadataField);
+        if metadata_version.ok_or(RemObjectAeadError::MissingRequiredMetadataField)? != 1 {
+            return Err(RemObjectAeadError::InvalidMetadataField);
         }
-        if plaintext_digest_alg.ok_or(RaoAeadError::MissingRequiredMetadataField)? != "sha256" {
-            return Err(RaoAeadError::InvalidMetadataField);
+        if plaintext_digest_alg.ok_or(RemObjectAeadError::MissingRequiredMetadataField)? != "sha256"
+        {
+            return Err(RemObjectAeadError::InvalidMetadataField);
         }
-        let metadata = RaoMetadata {
-            plaintext_size: plaintext_size.ok_or(RaoAeadError::MissingRequiredMetadataField)?,
-            plaintext_digest: plaintext_digest.ok_or(RaoAeadError::MissingRequiredMetadataField)?,
+        let metadata = RemObjectMetadata {
+            plaintext_size: plaintext_size
+                .ok_or(RemObjectAeadError::MissingRequiredMetadataField)?,
+            plaintext_digest: plaintext_digest
+                .ok_or(RemObjectAeadError::MissingRequiredMetadataField)?,
         };
         metadata.validate(chunk_size)?;
         Ok(metadata)
@@ -188,7 +192,7 @@ impl<'a> Decoder<'a> {
         self.bump_item()?;
         let (major, value, _encoding) = self.read_type_len()?;
         if major != 0 {
-            return Err(RaoAeadError::InvalidCborEncoding);
+            return Err(RemObjectAeadError::InvalidCborEncoding);
         }
         Ok(value)
     }
@@ -197,7 +201,7 @@ impl<'a> Decoder<'a> {
         self.bump_item()?;
         let (major, value, _encoding) = self.read_type_len()?;
         if major != 0 {
-            return Err(RaoAeadError::InvalidMetadataField);
+            return Err(RemObjectAeadError::InvalidMetadataField);
         }
         Ok(value)
     }
@@ -206,7 +210,7 @@ impl<'a> Decoder<'a> {
         self.bump_item()?;
         let (major, len, _encoding) = self.read_type_len()?;
         if major != 2 {
-            return Err(RaoAeadError::InvalidMetadataField);
+            return Err(RemObjectAeadError::InvalidMetadataField);
         }
         self.take_len(len)
     }
@@ -215,15 +219,15 @@ impl<'a> Decoder<'a> {
         self.bump_item()?;
         let (major, len, _encoding) = self.read_type_len()?;
         if major != 3 {
-            return Err(RaoAeadError::InvalidMetadataField);
+            return Err(RemObjectAeadError::InvalidMetadataField);
         }
         let bytes = self.take_len(len)?;
-        std::str::from_utf8(bytes).map_err(|_| RaoAeadError::InvalidCborEncoding)
+        std::str::from_utf8(bytes).map_err(|_| RemObjectAeadError::InvalidCborEncoding)
     }
 
     fn skip_item(&mut self, depth: usize) -> Result<()> {
         if depth > MAX_DEPTH {
-            return Err(RaoAeadError::InvalidCborEncoding);
+            return Err(RemObjectAeadError::InvalidCborEncoding);
         }
         self.bump_item()?;
         let (major, len, _encoding) = self.read_type_len()?;
@@ -237,7 +241,7 @@ impl<'a> Decoder<'a> {
                 let bytes = self.take_len(len)?;
                 std::str::from_utf8(bytes)
                     .map(|_| ())
-                    .map_err(|_| RaoAeadError::InvalidCborEncoding)
+                    .map_err(|_| RemObjectAeadError::InvalidCborEncoding)
             }
             4 => {
                 for _ in 0..len {
@@ -252,7 +256,7 @@ impl<'a> Decoder<'a> {
                     self.skip_item(depth + 1)?;
                     let key_bytes = self.bytes[key_start..self.pos].to_vec();
                     if prev_key.as_ref().is_some_and(|prev| prev >= &key_bytes) {
-                        return Err(RaoAeadError::InvalidCborEncoding);
+                        return Err(RemObjectAeadError::InvalidCborEncoding);
                     }
                     prev_key = Some(key_bytes);
                     self.skip_item(depth + 1)?;
@@ -261,9 +265,9 @@ impl<'a> Decoder<'a> {
             }
             7 => match len {
                 20..=22 => Ok(()),
-                _ => Err(RaoAeadError::InvalidCborEncoding),
+                _ => Err(RemObjectAeadError::InvalidCborEncoding),
             },
-            _ => Err(RaoAeadError::InvalidCborEncoding),
+            _ => Err(RemObjectAeadError::InvalidCborEncoding),
         }
     }
 
@@ -277,7 +281,7 @@ impl<'a> Decoder<'a> {
             24 => {
                 let value = u64::from(self.take_one()?);
                 if value < 24 {
-                    return Err(RaoAeadError::InvalidCborEncoding);
+                    return Err(RemObjectAeadError::InvalidCborEncoding);
                 }
                 value
             }
@@ -285,7 +289,7 @@ impl<'a> Decoder<'a> {
                 let bytes = self.take_array::<2>()?;
                 let value = u64::from(u16::from_be_bytes(bytes));
                 if value <= 0xff {
-                    return Err(RaoAeadError::InvalidCborEncoding);
+                    return Err(RemObjectAeadError::InvalidCborEncoding);
                 }
                 value
             }
@@ -293,18 +297,18 @@ impl<'a> Decoder<'a> {
                 let bytes = self.take_array::<4>()?;
                 let value = u64::from(u32::from_be_bytes(bytes));
                 if value <= 0xffff {
-                    return Err(RaoAeadError::InvalidCborEncoding);
+                    return Err(RemObjectAeadError::InvalidCborEncoding);
                 }
                 value
             }
             27 => {
                 let value = u64::from_be_bytes(self.take_array::<8>()?);
                 if value <= 0xffff_ffff {
-                    return Err(RaoAeadError::InvalidCborEncoding);
+                    return Err(RemObjectAeadError::InvalidCborEncoding);
                 }
                 value
             }
-            _ => return Err(RaoAeadError::InvalidCborEncoding),
+            _ => return Err(RemObjectAeadError::InvalidCborEncoding),
         };
         Ok((major, value, self.bytes[start..self.pos].to_vec()))
     }
@@ -313,23 +317,23 @@ impl<'a> Decoder<'a> {
         self.items = self
             .items
             .checked_add(1)
-            .ok_or(RaoAeadError::InvalidCborEncoding)?;
+            .ok_or(RemObjectAeadError::InvalidCborEncoding)?;
         if self.items > MAX_ITEMS {
-            return Err(RaoAeadError::InvalidCborEncoding);
+            return Err(RemObjectAeadError::InvalidCborEncoding);
         }
         Ok(())
     }
 
     fn take_len(&mut self, len: u64) -> Result<&'a [u8]> {
-        let len = usize::try_from(len).map_err(|_| RaoAeadError::InvalidCborEncoding)?;
+        let len = usize::try_from(len).map_err(|_| RemObjectAeadError::InvalidCborEncoding)?;
         let end = self
             .pos
             .checked_add(len)
-            .ok_or(RaoAeadError::InvalidCborEncoding)?;
+            .ok_or(RemObjectAeadError::InvalidCborEncoding)?;
         let bytes = self
             .bytes
             .get(self.pos..end)
-            .ok_or(RaoAeadError::UnexpectedEof)?;
+            .ok_or(RemObjectAeadError::UnexpectedEof)?;
         self.pos = end;
         Ok(bytes)
     }
@@ -345,7 +349,7 @@ impl<'a> Decoder<'a> {
         let byte = *self
             .bytes
             .get(self.pos)
-            .ok_or(RaoAeadError::UnexpectedEof)?;
+            .ok_or(RemObjectAeadError::UnexpectedEof)?;
         self.pos += 1;
         Ok(byte)
     }
@@ -357,11 +361,11 @@ mod tests {
 
     #[test]
     fn metadata_encodes_expected_v1_shape() {
-        let metadata = RaoMetadata::new(262_144, [0x44; 32], 262_144).unwrap();
+        let metadata = RemObjectMetadata::new(262_144, [0x44; 32], 262_144).unwrap();
         let bytes = metadata.to_cbor_bytes(262_144).unwrap();
         assert_eq!(bytes[0], 0xa4);
         assert_eq!(&bytes[1..4], &[0x00, 0x01, 0x01]);
-        let parsed = RaoMetadata::from_cbor_bytes(&bytes, 262_144).unwrap();
+        let parsed = RemObjectMetadata::from_cbor_bytes(&bytes, 262_144).unwrap();
         assert_eq!(parsed, metadata);
     }
 
@@ -369,8 +373,8 @@ mod tests {
     fn metadata_rejects_noncanonical_integer() {
         let bytes = [0xa1, 0x18, 0x00, 0x01];
         assert!(matches!(
-            RaoMetadata::from_cbor_bytes(&bytes, 512),
-            Err(RaoAeadError::InvalidCborEncoding)
+            RemObjectMetadata::from_cbor_bytes(&bytes, 512),
+            Err(RemObjectAeadError::InvalidCborEncoding)
         ));
     }
 
@@ -378,8 +382,8 @@ mod tests {
     fn metadata_rejects_duplicate_or_unsorted_keys() {
         let bytes = [0xa2, 0x00, 0x01, 0x00, 0x01];
         assert!(matches!(
-            RaoMetadata::from_cbor_bytes(&bytes, 512),
-            Err(RaoAeadError::InvalidCborEncoding)
+            RemObjectMetadata::from_cbor_bytes(&bytes, 512),
+            Err(RemObjectAeadError::InvalidCborEncoding)
         ));
     }
 
@@ -392,7 +396,7 @@ mod tests {
         bytes.extend_from_slice(&[0x03, 0x58, 0x20]);
         bytes.extend_from_slice(&[0x44; 32]);
         bytes.extend_from_slice(&[0x04, 0x83, 0x20, 0xf5, 0xf6]);
-        let parsed = RaoMetadata::from_cbor_bytes(&bytes, 512).unwrap();
+        let parsed = RemObjectMetadata::from_cbor_bytes(&bytes, 512).unwrap();
         assert_eq!(parsed.plaintext_size, 512);
         assert_eq!(parsed.plaintext_digest, [0x44; 32]);
     }
@@ -400,12 +404,12 @@ mod tests {
     #[test]
     fn metadata_rejects_bad_plaintext_size() {
         assert!(matches!(
-            RaoMetadata::new(1, [0; 32], 512),
-            Err(RaoAeadError::InvalidMetadataField)
+            RemObjectMetadata::new(1, [0; 32], 512),
+            Err(RemObjectAeadError::InvalidMetadataField)
         ));
         assert!(matches!(
-            RaoMetadata::new(u64::MAX - 511, [0; 32], 512),
-            Err(RaoAeadError::InvalidMetadataField)
+            RemObjectMetadata::new(u64::MAX - 511, [0; 32], 512),
+            Err(RemObjectAeadError::InvalidMetadataField)
         ));
     }
 }

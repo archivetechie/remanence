@@ -28,7 +28,7 @@
 //! ### Local file object adapters
 //!
 //! [`FileBlockSink`] / [`FileBlockSource`] adapt a local file as one
-//! fixed-block object byte string. They are for portable RAO object files:
+//! fixed-block object byte string. They are for portable REM-OBJECT object files:
 //! no tape filemarks, bootstrap, or REM-PARITY sidecars are represented in
 //! the file. Those structures stay on tape; the file contains only the
 //! object's stored bytes.
@@ -1541,7 +1541,7 @@ mod tests {
     #[test]
     fn file_sink_and_source_round_trip_fixed_blocks() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("object.rao");
+        let path = dir.path().join("object.rem-object");
         let mut sink = FileBlockSink::create(&path, 4).expect("create sink");
 
         let first = sink.write_block(&[1, 2, 3, 4]).expect("write first");
@@ -1571,7 +1571,7 @@ mod tests {
     #[test]
     fn file_sink_rejects_partial_blocks_without_writing() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("object.rao");
+        let path = dir.path().join("object.rem-object");
         let mut sink = FileBlockSink::create(&path, 4).expect("create sink");
 
         let err = sink.write_block(&[1, 2, 3]).expect_err("short write");
@@ -1584,7 +1584,7 @@ mod tests {
     #[test]
     fn file_source_rejects_unaligned_file_length() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("bad.rao");
+        let path = dir.path().join("bad.rem-object");
         fs::write(&path, [1, 2, 3]).unwrap();
 
         let err = FileBlockSource::open(&path, 4).expect_err("unaligned length");
@@ -1594,7 +1594,7 @@ mod tests {
     #[test]
     fn file_source_read_buffer_too_small_consumes_block() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("object.rao");
+        let path = dir.path().join("object.rem-object");
         fs::write(&path, [1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
         let mut source = FileBlockSource::open(&path, 4).expect("open source");
         let mut small = [0u8; 2];
@@ -1619,7 +1619,7 @@ mod tests {
     #[test]
     fn file_source_locate_and_space_match_dense_object_lbas() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("object.rao");
+        let path = dir.path().join("object.rem-object");
         fs::write(&path, [0u8; 12]).unwrap();
         let mut source = FileBlockSource::open(&path, 4).expect("open source");
 
@@ -1639,7 +1639,7 @@ mod tests {
     #[test]
     fn file_sink_rejects_nonzero_filemarks() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("object.rao");
+        let path = dir.path().join("object.rem-object");
         let mut sink = FileBlockSink::create(&path, 4).expect("create sink");
 
         let zero = sink.write_filemarks(0).expect("zero filemarks");

@@ -56,7 +56,7 @@ Medium:   BOT bootstrap uuid X
           → identity check: expected X, found X ✓ writes succeed
 ```
 
-Then you rebuild the QuadStor VTL. The virtual cartridges come back
+Then you rebuild the Quadstor VTL. The virtual cartridges come back
 **blank** — or get re-initialized in some scenario, gaining a fresh
 bootstrap with uuid **Y**. The catalog, of course, was not consulted:
 

@@ -1,16 +1,16 @@
-//! Keyless encrypted RAO inspection and geometry validation.
+//! Keyless encrypted REM-OBJECT inspection and geometry validation.
 
 use sha2::{Digest, Sha256};
 
-use crate::error::{RaoAeadError, Result};
-use crate::header::{RaoHeader, RAO_FOOTER, RAO_HEADER_LEN};
+use crate::error::{RemObjectAeadError, Result};
+use crate::header::{RemObjectHeader, REM_OBJECT_FOOTER, REM_OBJECT_HEADER_LEN};
 use crate::stream::round_up;
 
-/// Keyless report over an encrypted RAO object.
+/// Keyless report over an encrypted REM-OBJECT object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectReport {
     /// Parsed plaintext header.
-    pub header: RaoHeader,
+    pub header: RemObjectHeader,
     /// Parsed canonical key frame.
     pub key_frame: crate::KeyFrame,
     /// Total stored input size.
@@ -25,34 +25,35 @@ pub struct InspectReport {
     pub footer_offset: u64,
 }
 
-/// Inspect and verify non-authenticating encrypted RAO geometry without a key.
+/// Inspect and verify non-authenticating encrypted REM-OBJECT geometry without a key.
 pub fn inspect_bytes(bytes: &[u8]) -> Result<InspectReport> {
-    let header_bytes: [u8; RAO_HEADER_LEN] = bytes
-        .get(..RAO_HEADER_LEN)
-        .ok_or(RaoAeadError::UnexpectedEof)?
+    let header_bytes: [u8; REM_OBJECT_HEADER_LEN] = bytes
+        .get(..REM_OBJECT_HEADER_LEN)
+        .ok_or(RemObjectAeadError::UnexpectedEof)?
         .try_into()
-        .map_err(|_| RaoAeadError::UnexpectedEof)?;
-    let header = RaoHeader::parse(&header_bytes)?;
+        .map_err(|_| RemObjectAeadError::UnexpectedEof)?;
+    let header = RemObjectHeader::parse(&header_bytes)?;
     let key_frame_len = u64::from(header.key_frame_len);
-    let key_frame_end = RAO_HEADER_LEN
+    let key_frame_end = REM_OBJECT_HEADER_LEN
         .checked_add(header.key_frame_len as usize)
-        .ok_or(RaoAeadError::SizeOverflow)?;
+        .ok_or(RemObjectAeadError::SizeOverflow)?;
     let key_frame = crate::KeyFrame::parse(
         bytes
-            .get(RAO_HEADER_LEN..key_frame_end)
-            .ok_or(RaoAeadError::UnexpectedEof)?,
+            .get(REM_OBJECT_HEADER_LEN..key_frame_end)
+            .ok_or(RemObjectAeadError::UnexpectedEof)?,
     )?;
-    let stored_size_bytes = u64::try_from(bytes.len()).map_err(|_| RaoAeadError::SizeOverflow)?;
+    let stored_size_bytes =
+        u64::try_from(bytes.len()).map_err(|_| RemObjectAeadError::SizeOverflow)?;
     if stored_size_bytes % u64::from(header.chunk_size) != 0 {
-        return Err(RaoAeadError::TrailingData);
+        return Err(RemObjectAeadError::TrailingData);
     }
     if stored_size_bytes
-        < RAO_HEADER_LEN as u64
+        < REM_OBJECT_HEADER_LEN as u64
             + key_frame_len
-            + RAO_FOOTER.len() as u64
+            + REM_OBJECT_FOOTER.len() as u64
             + header.metadata_frame_len
     {
-        return Err(RaoAeadError::UnexpectedEof);
+        return Err(RemObjectAeadError::UnexpectedEof);
     }
 
     let digest = Sha256::digest(bytes);
@@ -61,44 +62,45 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<InspectReport> {
 
     let stride = u64::from(header.chunk_size)
         .checked_add(16)
-        .ok_or(RaoAeadError::SizeOverflow)?;
+        .ok_or(RemObjectAeadError::SizeOverflow)?;
     let numerator = stored_size_bytes
-        .checked_sub(RAO_HEADER_LEN as u64)
+        .checked_sub(REM_OBJECT_HEADER_LEN as u64)
         .and_then(|value| value.checked_sub(key_frame_len))
-        .and_then(|value| value.checked_sub(RAO_FOOTER.len() as u64))
+        .and_then(|value| value.checked_sub(REM_OBJECT_FOOTER.len() as u64))
         .and_then(|value| value.checked_sub(header.metadata_frame_len))
-        .ok_or(RaoAeadError::UnexpectedEof)?;
+        .ok_or(RemObjectAeadError::UnexpectedEof)?;
     let chunk_count = numerator / stride;
     if chunk_count == 0 {
-        return Err(RaoAeadError::UnexpectedEof);
+        return Err(RemObjectAeadError::UnexpectedEof);
     }
     let plaintext_size = chunk_count
         .checked_mul(u64::from(header.chunk_size))
-        .ok_or(RaoAeadError::SizeOverflow)?;
-    let footer_offset = (RAO_HEADER_LEN as u64)
+        .ok_or(RemObjectAeadError::SizeOverflow)?;
+    let footer_offset = (REM_OBJECT_HEADER_LEN as u64)
         .checked_add(key_frame_len)
         .and_then(|value| value.checked_add(header.metadata_frame_len))
         .and_then(|value| value.checked_add(chunk_count.checked_mul(stride)?))
-        .ok_or(RaoAeadError::SizeOverflow)?;
+        .ok_or(RemObjectAeadError::SizeOverflow)?;
     let expected_size = round_up(
         footer_offset
-            .checked_add(RAO_FOOTER.len() as u64)
-            .ok_or(RaoAeadError::SizeOverflow)?,
+            .checked_add(REM_OBJECT_FOOTER.len() as u64)
+            .ok_or(RemObjectAeadError::SizeOverflow)?,
         u64::from(header.chunk_size),
     )?;
     if expected_size != stored_size_bytes {
-        return Err(RaoAeadError::TrailingData);
+        return Err(RemObjectAeadError::TrailingData);
     }
 
-    let footer_start = usize::try_from(footer_offset).map_err(|_| RaoAeadError::SizeOverflow)?;
+    let footer_start =
+        usize::try_from(footer_offset).map_err(|_| RemObjectAeadError::SizeOverflow)?;
     let footer_end = footer_start
-        .checked_add(RAO_FOOTER.len())
-        .ok_or(RaoAeadError::SizeOverflow)?;
-    if bytes.get(footer_start..footer_end) != Some(&RAO_FOOTER[..]) {
-        return Err(RaoAeadError::InvalidFooter);
+        .checked_add(REM_OBJECT_FOOTER.len())
+        .ok_or(RemObjectAeadError::SizeOverflow)?;
+    if bytes.get(footer_start..footer_end) != Some(&REM_OBJECT_FOOTER[..]) {
+        return Err(RemObjectAeadError::InvalidFooter);
     }
     if bytes[footer_end..].iter().any(|byte| *byte != 0) {
-        return Err(RaoAeadError::FillNotZero);
+        return Err(RemObjectAeadError::FillNotZero);
     }
 
     Ok(InspectReport {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the standalone RAO/REM-PARITY publication archive and coverage."""
+"""Verify the standalone REM-OBJECT/REM-PARITY publication archive and coverage."""
 
 from __future__ import annotations
 
@@ -76,34 +76,34 @@ REQUIRED_DAMAGE = {
     "boundary-straddling-burst-m-plus-one",
     "short-epoch-boundary-burst-unrecoverable",
 }
-REQUIRED_RAO_OBJECTS = {
-    "rao-tv-attribute-ext-combined.rao",
-    "rao-tv-boundary.rao",
-    "rao-tv-d1-encrypted.rao",
-    "rao-tv-d1-plaintext.rao",
-    "rao-tv-e2.rao",
-    "rao-tv-ext-member.rao",
-    "rao-tv-empty-file.rao",
-    "rao-tv-empty.rao",
-    "rao-tv-hardlinks.rao",
-    "rao-tv-manifest.rao",
-    "rao-tv-metadata.rao",
-    "rao-tv-nonregular.rao",
-    "rao-tv-nonuser-attribute.rao",
-    "rao-tv-one-byte.rao",
-    "rao-tv-order.rao",
-    "rao-tv-p1.rao",
-    "rao-tv-paths.rao",
-    "rao-tv-portable-core-only.rao",
-    "rao-tv-xattrs.rao",
+REQUIRED_REM_OBJECT_OBJECTS = {
+    "rem-object-tv-attribute-ext-combined.rem-object",
+    "rem-object-tv-boundary.rem-object",
+    "rem-object-tv-d1-encrypted.rem-object",
+    "rem-object-tv-d1-plaintext.rem-object",
+    "rem-object-tv-e2.rem-object",
+    "rem-object-tv-ext-member.rem-object",
+    "rem-object-tv-empty-file.rem-object",
+    "rem-object-tv-empty.rem-object",
+    "rem-object-tv-hardlinks.rem-object",
+    "rem-object-tv-manifest.rem-object",
+    "rem-object-tv-metadata.rem-object",
+    "rem-object-tv-nonregular.rem-object",
+    "rem-object-tv-nonuser-attribute.rem-object",
+    "rem-object-tv-one-byte.rem-object",
+    "rem-object-tv-order.rem-object",
+    "rem-object-tv-p1.rem-object",
+    "rem-object-tv-paths.rem-object",
+    "rem-object-tv-portable-core-only.rem-object",
+    "rem-object-tv-xattrs.rem-object",
 }
-REQUIRED_RAO_INCREMENT = {
-    "RAO-TV-PORTABLE-CORE-ONLY",
-    "RAO-TV-NONUSER-ATTRIBUTE",
-    "RAO-TV-EXT-MEMBER",
-    "RAO-TV-ATTRIBUTE-EXT-COMBINED",
+REQUIRED_REM_OBJECT_INCREMENT = {
+    "REM-OBJECT-TV-PORTABLE-CORE-ONLY",
+    "REM-OBJECT-TV-NONUSER-ATTRIBUTE",
+    "REM-OBJECT-TV-EXT-MEMBER",
+    "REM-OBJECT-TV-ATTRIBUTE-EXT-COMBINED",
 }
-REQUIRED_RAO_NEGATIVE = {
+REQUIRED_REM_OBJECT_NEGATIVE = {
     "inventory-disagrees-with-entries": "ManifestInvalid",
     "ext-value-not-map": "ManifestInvalid",
     "ext-member-noncanonical-cbor": "Cbor",
@@ -111,16 +111,16 @@ REQUIRED_RAO_NEGATIVE = {
     "manifest-tamper-swapped-file-sha256": "ManifestDigestMismatch",
     "manifest-tamper-altered-first-chunk-lba": "ManifestDigestMismatch",
 }
-REQUIRED_RAO_ENVELOPE_NEGATIVE = {
-    "legacy-x25519-wrap-suite": "InvalidWrapSuite",
+REQUIRED_REM_OBJECT_ENVELOPE_NEGATIVE = {
+    "reserved-wrap-suite-01": "InvalidWrapSuite",
     "key-frame-len-below-minimum": "InvalidKeyFrameLength",
     "key-frame-len-above-maximum": "InvalidKeyFrameLength",
 }
-REQUIRED_RAO_KATS = {
+REQUIRED_REM_OBJECT_KATS = {
     "xwing-draft10-kat.txt",
     "xwing-wrap-kat.txt",
 }
-REQUIRED_RAO_RANGE = {
+REQUIRED_REM_OBJECT_RANGE = {
     "encrypted-last-object-chunk": ("positive/range", "authenticated-range"),
     "encrypted-last-object-chunk-wrong-finality": (
         "negative/range",
@@ -130,7 +130,7 @@ REQUIRED_RAO_RANGE = {
 REQUIRED_KEY_FRAME_CASES = {
     "version-flip",
     "suite-flip",
-    "legacy-x25519-wrap-suite",
+    "reserved-wrap-suite-01",
     "truncated-key-frame",
     "duplicate-slots",
     "misordered-slots",
@@ -201,15 +201,15 @@ def kat_fields(path: pathlib.Path) -> dict[str, bytes]:
 
 def verify_xwing_key_frame(stored: bytes, label: str) -> None:
     """Check the fixed X-Wing envelope discriminator, bounds, and slot sizes."""
-    if len(stored) < 128 or stored[:4] != b"RAO1":
-        fail(f"{label} lacks a complete RAO scalar header")
+    if len(stored) < 128 or stored[:4] != b"REMO":
+        fail(f"{label} lacks a complete REM-OBJECT scalar header")
     if stored[0x38] != 0x02:
         fail(f"{label} does not carry wrap_suite 0x02")
     key_frame_len = int.from_bytes(stored[0x3C:0x40], "big")
     if not 1191 <= key_frame_len <= 16384:
         fail(f"{label} key_frame_len is outside [1191,16384]")
     encoded = stored[128 : 128 + key_frame_len]
-    if len(encoded) != key_frame_len or encoded[:4] != b"RAOK":
+    if len(encoded) != key_frame_len or encoded[:4] != b"REMK":
         fail(f"{label} has a truncated or malformed key frame")
     slot_count = encoded[4]
     if not 1 <= slot_count <= 8:
@@ -264,58 +264,58 @@ def main() -> int:
         if actual != expected:
             fail(f"checksum mismatch for {relative}: {actual} != {expected}")
     for relative in (
-        "tools/verify_rao_vectors_independent.py",
-        "tools/requirements-rao-independent.txt",
+        "tools/verify_rem_object_vectors_independent.py",
+        "tools/requirements-rem-object-independent.txt",
     ):
         if not (root / relative).is_file():
             fail(f"standalone independent verifier artifact is absent: {relative}")
 
-    rao_root = root / "rao"
-    rao_objects = {path.name for path in (rao_root / "objects").glob("*.rao")}
-    if rao_objects != REQUIRED_RAO_OBJECTS:
+    rem_object_root = root / "rem-object"
+    rem_object_objects = {path.name for path in (rem_object_root / "objects").glob("*.rem-object")}
+    if rem_object_objects != REQUIRED_REM_OBJECT_OBJECTS:
         fail(
-            "RAO object inventory differs: "
-            f"missing={sorted(REQUIRED_RAO_OBJECTS - rao_objects)}, "
-            f"extra={sorted(rao_objects - REQUIRED_RAO_OBJECTS)}"
+            "REM-OBJECT object inventory differs: "
+            f"missing={sorted(REQUIRED_REM_OBJECT_OBJECTS - rem_object_objects)}, "
+            f"extra={sorted(rem_object_objects - REQUIRED_REM_OBJECT_OBJECTS)}"
         )
-    manifests = rao_root / "manifests"
-    e2 = load_json(manifests / "rao-tv-e2.json")
-    if e2.get("vector_id") != "RAO-TV-E2":
-        fail("rao-tv-e2.json has the wrong vector_id")
+    manifests = rem_object_root / "manifests"
+    e2 = load_json(manifests / "rem-object-tv-e2.json")
+    if e2.get("vector_id") != "REM-OBJECT-TV-E2":
+        fail("rem-object-tv-e2.json has the wrong vector_id")
     if e2.get("status") != "pinned-at-generation":
-        fail("rao-tv-e2.json is not a current generated vector")
-    verify_xwing_recipient_material(e2, "RAO-TV-E2")
+        fail("rem-object-tv-e2.json is not a current generated vector")
+    verify_xwing_recipient_material(e2, "REM-OBJECT-TV-E2")
     e2_expected = e2.get("expected")
     if not isinstance(e2_expected, dict) or e2_expected.get("stored_digest") != sha256(
-        rao_root / "objects" / "rao-tv-e2.rao"
+        rem_object_root / "objects" / "rem-object-tv-e2.rem-object"
     ):
-        fail("RAO-TV-E2 stored_digest does not match its pinned object")
+        fail("REM-OBJECT-TV-E2 stored_digest does not match its pinned object")
     verify_xwing_key_frame(
-        (rao_root / "objects" / "rao-tv-e2.rao").read_bytes(),
-        "RAO-TV-E2",
+        (rem_object_root / "objects" / "rem-object-tv-e2.rem-object").read_bytes(),
+        "REM-OBJECT-TV-E2",
     )
-    d1 = load_json(manifests / "rao-tv-d1.json")
+    d1 = load_json(manifests / "rem-object-tv-d1.json")
     if d1.get("encrypted_status") != "pinned-at-generation":
-        fail("rao-tv-d1.json encrypted half is not a current generated vector")
-    verify_xwing_recipient_material(d1, "RAO-TV-D1 encrypted")
+        fail("rem-object-tv-d1.json encrypted half is not a current generated vector")
+    verify_xwing_recipient_material(d1, "REM-OBJECT-TV-D1 encrypted")
     d1_expected = d1.get("expected")
     d1_encrypted = d1_expected.get("encrypted") if isinstance(d1_expected, dict) else None
     if not isinstance(d1_encrypted, dict) or d1_encrypted.get("stored_digest") != sha256(
-        rao_root / "objects" / "rao-tv-d1-encrypted.rao"
+        rem_object_root / "objects" / "rem-object-tv-d1-encrypted.rem-object"
     ):
-        fail("RAO-TV-D1 encrypted stored_digest does not match its pinned object")
+        fail("REM-OBJECT-TV-D1 encrypted stored_digest does not match its pinned object")
     verify_xwing_key_frame(
-        (rao_root / "objects" / "rao-tv-d1-encrypted.rao").read_bytes(),
-        "RAO-TV-D1 encrypted",
+        (rem_object_root / "objects" / "rem-object-tv-d1-encrypted.rem-object").read_bytes(),
+        "REM-OBJECT-TV-D1 encrypted",
     )
 
-    kat_root = rao_root / "kats"
+    kat_root = rem_object_root / "kats"
     kat_files = {path.name for path in kat_root.glob("*.txt")}
-    if kat_files != REQUIRED_RAO_KATS:
+    if kat_files != REQUIRED_REM_OBJECT_KATS:
         fail(
-            "RAO KAT inventory differs: "
-            f"missing={sorted(REQUIRED_RAO_KATS - kat_files)}, "
-            f"extra={sorted(kat_files - REQUIRED_RAO_KATS)}"
+            "REM-OBJECT KAT inventory differs: "
+            f"missing={sorted(REQUIRED_REM_OBJECT_KATS - kat_files)}, "
+            f"extra={sorted(kat_files - REQUIRED_REM_OBJECT_KATS)}"
         )
     draft10 = kat_fields(kat_root / "xwing-draft10-kat.txt")
     wrap = kat_fields(kat_root / "xwing-wrap-kat.txt")
@@ -340,70 +340,70 @@ def main() -> int:
         "ciphertext": 48,
     }.items():
         if len(wrap.get(name, b"")) != size:
-            fail(f"RAO X-Wing wrap KAT field {name} is not {size} bytes")
+            fail(f"REM-OBJECT X-Wing wrap KAT field {name} is not {size} bytes")
 
-    rao_index = load_json(rao_root / "vectors.json")
-    if rao_index.get("vector_set") != "RAO-2.0-PUBLICATION-INCREMENT":
-        fail("rao/vectors.json has the wrong vector_set")
-    rao_vectors = rao_index.get("vectors")
-    if not isinstance(rao_vectors, list) or not all(
-        isinstance(item, dict) for item in rao_vectors
+    rem_object_index = load_json(rem_object_root / "vectors.json")
+    if rem_object_index.get("vector_set") != "REM-OBJECT-2.0-PUBLICATION-INCREMENT":
+        fail("rem_object/vectors.json has the wrong vector_set")
+    rem_object_vectors = rem_object_index.get("vectors")
+    if not isinstance(rem_object_vectors, list) or not all(
+        isinstance(item, dict) for item in rem_object_vectors
     ):
-        fail("rao/vectors.json has no valid vector list")
+        fail("rem_object/vectors.json has no valid vector list")
     increment = {
-        item.get("id") for item in rao_vectors if item.get("category") == "positive"
+        item.get("id") for item in rem_object_vectors if item.get("category") == "positive"
     }
-    if increment != REQUIRED_RAO_INCREMENT:
+    if increment != REQUIRED_REM_OBJECT_INCREMENT:
         fail(
-            "RAO increment coverage differs: "
-            f"missing={sorted(REQUIRED_RAO_INCREMENT - increment)}, "
-            f"extra={sorted(increment - REQUIRED_RAO_INCREMENT)}"
+            "REM-OBJECT increment coverage differs: "
+            f"missing={sorted(REQUIRED_REM_OBJECT_INCREMENT - increment)}, "
+            f"extra={sorted(increment - REQUIRED_REM_OBJECT_INCREMENT)}"
         )
-    rao_negative = {
+    rem_object_negative = {
         item.get("id"): item
-        for item in rao_vectors
+        for item in rem_object_vectors
         if item.get("category") == "negative/manifest"
     }
-    if set(rao_negative) != set(REQUIRED_RAO_NEGATIVE):
+    if set(rem_object_negative) != set(REQUIRED_REM_OBJECT_NEGATIVE):
         fail(
-            "RAO manifest-negative coverage differs: "
-            f"missing={sorted(set(REQUIRED_RAO_NEGATIVE) - set(rao_negative))}, "
-            f"extra={sorted(set(rao_negative) - set(REQUIRED_RAO_NEGATIVE))}"
+            "REM-OBJECT manifest-negative coverage differs: "
+            f"missing={sorted(set(REQUIRED_REM_OBJECT_NEGATIVE) - set(rem_object_negative))}, "
+            f"extra={sorted(set(rem_object_negative) - set(REQUIRED_REM_OBJECT_NEGATIVE))}"
         )
-    rao_envelope_negative = {
+    rem_object_envelope_negative = {
         item.get("id"): item
-        for item in rao_vectors
+        for item in rem_object_vectors
         if item.get("category") == "negative/envelope"
     }
-    if set(rao_envelope_negative) != set(REQUIRED_RAO_ENVELOPE_NEGATIVE):
+    if set(rem_object_envelope_negative) != set(REQUIRED_REM_OBJECT_ENVELOPE_NEGATIVE):
         fail(
-            "RAO envelope-negative coverage differs: "
-            f"missing={sorted(set(REQUIRED_RAO_ENVELOPE_NEGATIVE) - set(rao_envelope_negative))}, "
-            f"extra={sorted(set(rao_envelope_negative) - set(REQUIRED_RAO_ENVELOPE_NEGATIVE))}"
+            "REM-OBJECT envelope-negative coverage differs: "
+            f"missing={sorted(set(REQUIRED_REM_OBJECT_ENVELOPE_NEGATIVE) - set(rem_object_envelope_negative))}, "
+            f"extra={sorted(set(rem_object_envelope_negative) - set(REQUIRED_REM_OBJECT_ENVELOPE_NEGATIVE))}"
         )
-    rao_ranges = {
+    rem_object_ranges = {
         item.get("id"): item
-        for item in rao_vectors
+        for item in rem_object_vectors
         if item.get("category") in {"positive/range", "negative/range"}
     }
-    if set(rao_ranges) != set(REQUIRED_RAO_RANGE):
+    if set(rem_object_ranges) != set(REQUIRED_REM_OBJECT_RANGE):
         fail(
-            "RAO range coverage differs: "
-            f"missing={sorted(set(REQUIRED_RAO_RANGE) - set(rao_ranges))}, "
-            f"extra={sorted(set(rao_ranges) - set(REQUIRED_RAO_RANGE))}"
+            "REM-OBJECT range coverage differs: "
+            f"missing={sorted(set(REQUIRED_REM_OBJECT_RANGE) - set(rem_object_ranges))}, "
+            f"extra={sorted(set(rem_object_ranges) - set(REQUIRED_REM_OBJECT_RANGE))}"
         )
     tamper_digests = set()
-    for item in rao_vectors:
+    for item in rem_object_vectors:
         artifacts = item.get("artifacts")
         if not isinstance(artifacts, list):
-            fail(f"RAO vector {item.get('id')!r} has no artifacts")
+            fail(f"REM-OBJECT vector {item.get('id')!r} has no artifacts")
         canonical = "".join(
             f"{artifact['sha256']}  {artifact['path']}\n"
             for artifact in sorted(artifacts, key=lambda value: value["path"])
         ).encode("utf-8")
         if hashlib.sha256(canonical).hexdigest() != item.get("checksum_sha256"):
-            fail(f"RAO vector checksum mismatch for {item.get('id')}")
-        vector_root = rao_root
+            fail(f"REM-OBJECT vector checksum mismatch for {item.get('id')}")
+        vector_root = rem_object_root
         if item.get("category") in {
             "negative/manifest",
             "negative/envelope",
@@ -414,28 +414,28 @@ def main() -> int:
         for artifact in artifacts:
             path = vector_root / artifact["path"]
             if not path.is_file() or sha256(path) != artifact["sha256"]:
-                fail(f"RAO vector artifact mismatch for {item.get('id')}/{artifact['path']}")
+                fail(f"REM-OBJECT vector artifact mismatch for {item.get('id')}/{artifact['path']}")
         if item.get("category") == "positive":
-            object_path = rao_root / item["archive_path"]
+            object_path = rem_object_root / item["archive_path"]
             if item.get("full_object_sha256") != sha256(object_path):
-                fail(f"RAO positive {item.get('id')} full_object_sha256 mismatch")
+                fail(f"REM-OBJECT positive {item.get('id')} full_object_sha256 mismatch")
             if item.get("plaintext_digest") != item.get("full_object_sha256"):
-                fail(f"RAO positive {item.get('id')} plaintext_digest mismatch")
+                fail(f"REM-OBJECT positive {item.get('id')} plaintext_digest mismatch")
             if item.get("first_block_sha256") != hashlib.sha256(
                 object_path.read_bytes()[:4096]
             ).hexdigest():
-                fail(f"RAO positive {item.get('id')} first_block_sha256 mismatch")
+                fail(f"REM-OBJECT positive {item.get('id')} first_block_sha256 mismatch")
             fixture_artifacts = [
                 artifact
                 for artifact in artifacts
                 if str(artifact.get("path", "")).endswith(".json")
             ]
             if len(fixture_artifacts) != 1:
-                fail(f"RAO positive {item.get('id')} does not have one fixture artifact")
-            fixture = load_json(rao_root / fixture_artifacts[0]["path"])
+                fail(f"REM-OBJECT positive {item.get('id')} does not have one fixture artifact")
+            fixture = load_json(rem_object_root / fixture_artifacts[0]["path"])
             fixture_expected = fixture.get("expected")
             if not isinstance(fixture_expected, dict):
-                fail(f"RAO positive {item.get('id')} fixture lacks expected pins")
+                fail(f"REM-OBJECT positive {item.get('id')} fixture lacks expected pins")
             for field in (
                 "full_object_sha256",
                 "plaintext_digest",
@@ -444,12 +444,12 @@ def main() -> int:
                 "object_metadata",
             ):
                 if item.get(field) != fixture_expected.get(field):
-                    fail(f"RAO positive {item.get('id')} index disagrees on {field}")
+                    fail(f"REM-OBJECT positive {item.get('id')} index disagrees on {field}")
         elif item.get("category") == "negative/manifest":
             expected = load_json(vector_root / "expected.json")
-            required_error = REQUIRED_RAO_NEGATIVE[item["id"]]
+            required_error = REQUIRED_REM_OBJECT_NEGATIVE[item["id"]]
             if expected.get("expected_error") != required_error:
-                fail(f"RAO negative {item['id']} has the wrong typed error")
+                fail(f"REM-OBJECT negative {item['id']} has the wrong typed error")
             for field in (
                 "expected_error",
                 "plaintext_digest",
@@ -457,40 +457,40 @@ def main() -> int:
                 "manifest_sha256",
             ):
                 if item.get(field) != expected.get(field):
-                    fail(f"RAO negative {item['id']} index disagrees on {field}")
+                    fail(f"REM-OBJECT negative {item['id']} index disagrees on {field}")
             if expected.get("stored_digest") != expected.get("plaintext_digest"):
-                fail(f"RAO negative {item['id']} plaintext stored_digest differs")
+                fail(f"REM-OBJECT negative {item['id']} plaintext stored_digest differs")
             if expected.get("payload_bytes_unchanged") is not True:
-                fail(f"RAO negative {item['id']} does not pin constant payloads")
+                fail(f"REM-OBJECT negative {item['id']} does not pin constant payloads")
             if item["id"].startswith("manifest-tamper-"):
                 input_value = load_json(vector_root / "input.json")
                 if not isinstance(input_value.get("external_manifest_anchor"), str):
-                    fail(f"RAO tamper {item['id']} lacks its external anchor")
+                    fail(f"REM-OBJECT tamper {item['id']} lacks its external anchor")
                 if expected.get("plaintext_digest") == input_value.get(
                     "base_plaintext_digest"
                 ):
-                    fail(f"RAO tamper {item['id']} did not change plaintext_digest")
+                    fail(f"REM-OBJECT tamper {item['id']} did not change plaintext_digest")
                 tamper_digests.add(expected.get("plaintext_digest"))
         elif item.get("category") == "negative/envelope":
             expected = load_json(vector_root / "expected.json")
             input_value = load_json(vector_root / "input.json")
-            required_error = REQUIRED_RAO_ENVELOPE_NEGATIVE[item["id"]]
-            faulted = vector_root / "faulted-object.rao"
+            required_error = REQUIRED_REM_OBJECT_ENVELOPE_NEGATIVE[item["id"]]
+            faulted = vector_root / "faulted-object.rem-object"
             if (
                 expected.get("expected_error") != required_error
                 or item.get("expected_error") != required_error
                 or expected.get("faulted_sha256") != sha256(faulted)
                 or item.get("faulted_sha256") != sha256(faulted)
             ):
-                fail(f"RAO envelope negative {item['id']} has inconsistent pins")
-            base = rao_root / str(input_value.get("base_artifact"))
+                fail(f"REM-OBJECT envelope negative {item['id']} has inconsistent pins")
+            base = rem_object_root / str(input_value.get("base_artifact"))
             if (
                 not base.is_file()
                 or input_value.get("base_sha256") != sha256(base)
             ):
-                fail(f"RAO envelope negative {item['id']} has the wrong base")
+                fail(f"REM-OBJECT envelope negative {item['id']} has the wrong base")
             faulted_bytes = faulted.read_bytes()
-            if item["id"] == "legacy-x25519-wrap-suite":
+            if item["id"] == "reserved-wrap-suite-01":
                 if faulted_bytes[0x38] != 0x01:
                     fail("legacy wrap-suite negative does not carry 0x01")
             elif item["id"] == "key-frame-len-below-minimum":
@@ -502,44 +502,44 @@ def main() -> int:
         elif item.get("category") in {"positive/range", "negative/range"}:
             expected = load_json(vector_root / "expected.json")
             input_value = load_json(vector_root / "input.json")
-            required_category, required_result = REQUIRED_RAO_RANGE[item["id"]]
+            required_category, required_result = REQUIRED_REM_OBJECT_RANGE[item["id"]]
             if item.get("category") != required_category:
-                fail(f"RAO range {item['id']} has the wrong category")
+                fail(f"REM-OBJECT range {item['id']} has the wrong category")
             result = expected.get("expected_outcome", expected.get("expected_error"))
             if result != required_result:
-                fail(f"RAO range {item['id']} has the wrong expected result")
+                fail(f"REM-OBJECT range {item['id']} has the wrong expected result")
             object_chunk_count = expected.get("object_chunk_count")
             if not isinstance(object_chunk_count, int) or object_chunk_count < 1:
-                fail(f"RAO range {item['id']} has an invalid object chunk count")
+                fail(f"REM-OBJECT range {item['id']} has an invalid object chunk count")
             if (
                 expected.get("first_chunk") != object_chunk_count - 1
                 or expected.get("chunk_count") != 1
             ):
-                fail(f"RAO range {item['id']} does not cover the final object chunk")
+                fail(f"REM-OBJECT range {item['id']} does not cover the final object chunk")
             if input_value.get("file_chunk_count") != 1:
-                fail(f"RAO range {item['id']} does not pin the one-chunk file view")
+                fail(f"REM-OBJECT range {item['id']} does not pin the one-chunk file view")
             expected_finality = item.get("category") == "positive/range"
             if input_value.get("final_flag") is not expected_finality:
-                fail(f"RAO range {item['id']} pins the wrong final_flag")
-            source = rao_root / str(input_value.get("base_artifact"))
+                fail(f"REM-OBJECT range {item['id']} pins the wrong final_flag")
+            source = rem_object_root / str(input_value.get("base_artifact"))
             if (
                 not source.is_file()
                 or sha256(source) != expected.get("source_sha256")
                 or item.get("source_sha256") != expected.get("source_sha256")
             ):
-                fail(f"RAO range {item['id']} source digest mismatch")
+                fail(f"REM-OBJECT range {item['id']} source digest mismatch")
             d1_plaintext = d1_expected.get("plaintext")
             if not isinstance(d1_plaintext, dict):
-                fail("RAO-TV-D1 plaintext fixture is malformed")
+                fail("REM-OBJECT-TV-D1 plaintext fixture is malformed")
             if (
                 expected.get("manifest_sha256")
                 != d1_plaintext.get("manifest_sha256")
                 or expected.get("plaintext_digest")
                 != d1_encrypted.get("plaintext_digest")
             ):
-                fail(f"RAO range {item['id']} disagrees with RAO-TV-D1 anchors")
+                fail(f"REM-OBJECT range {item['id']} disagrees with REM-OBJECT-TV-D1 anchors")
     if len(tamper_digests) != 3:
-        fail("RAO manifest tamper plaintext digests are not distinct")
+        fail("REM-OBJECT manifest tamper plaintext digests are not distinct")
     key_frame_negative = load_json(manifests / "negative-key-frame.json")
     if key_frame_negative.get("status") != "complete":
         fail("negative-key-frame.json is not marked complete")

@@ -30,9 +30,9 @@ soak_loop() {
       continue
     fi
     source="$workdir/soak-$count.bin"
-    object="$workdir/soak-$count.rao"
+    object="$workdir/soak-$count.rem-object"
     locator="$workdir/soak-$count.json"
-    restore="$workdir/restore-$count.rao"
+    restore="$workdir/restore-$count.rem-object"
     python3 - "$source" 268435456 <<'PY'
 import os,sys
 from pathlib import Path

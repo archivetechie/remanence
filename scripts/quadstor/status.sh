@@ -1,5 +1,5 @@
 #!/bin/bash
-# Show the current state of the QuadStor VTL on akash.
+# Show the current state of the Quadstor VTL on akash.
 # Safe to run any time; makes no changes.
 #
 # Usage:  sudo scripts-relative: scripts/quadstor/status.sh

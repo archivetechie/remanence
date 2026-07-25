@@ -1,0 +1,1861 @@
+/- Specification theorems for REM-OBJECT manifest writer-schema core extractions
+   (SPEC.md M1-M9).
+
+   This file targets the Aeneas-generated definitions in `RemObjectManifest.Funs`.
+   It proves that a valid one-regular-file manifest validates, encodes to the
+   required writer schema, and decodes back to the same manifest core. It also
+   proves a bounded five-entry manifest core covering a nonempty regular file
+   with one xattr, an empty regular file, a hardlink to the prior regular file,
+   a symlink, and a directory. The Rust `drift_guard` test ties this
+   proof-facing scalar extraction back to production
+   `crates/remanence-format/src/{layout,manifest}.rs`.
+
+   Scope: this proof models writer-schema, planner-fold, and membership-bridge
+   cores, not
+   production CBOR bytes, `Vec`/`String`, UTF-8 decoding, tar/pax layout,
+   hashing, arbitrary xattr maps, global-pax cross-checking, real Rust `Vec`
+   iteration, or standard-library `BTreeSet` internals. -/
+import RemObjectManifest.Funs
+
+open Aeneas Aeneas.Std Result
+
+namespace RemObjectManifest
+
+def ChunkGranularity : Nat := 512
+
+def chunkCountSpec (sizeBytes : Std.U64) (chunkSize : Std.U64) : Nat :=
+  if sizeBytes.val = 0 then
+    0
+  else
+    (sizeBytes.val - 1) / chunkSize.val + 1
+
+def RegularFileCoreValid (file : RegularFileCore) (chunkSize : Std.U64) : Prop :=
+  chunkSize.val ≠ 0 ∧
+  chunkSize.val % ChunkGranularity = 0 ∧
+  file.path_id.val ≠ 0 ∧
+  file.file_id.val ≠ 0 ∧
+  file.executable_tag.val ≤ 2 ∧
+  (file.size_bytes.val = 0 →
+    file.first_chunk_lba_present = false ∧ file.first_chunk_lba.val = 0) ∧
+  (file.size_bytes.val ≠ 0 → file.first_chunk_lba_present = true) ∧
+  chunkCountSpec file.size_bytes chunkSize < 2 ^ 64
+
+def ManifestCoreValid (manifest : ManifestCore) : Prop :=
+  manifest.object_id.val ≠ 0 ∧
+  RegularFileCoreValid manifest.file manifest.chunk_size
+
+def richToRegular (file : RichRegularFileCore) : RegularFileCore :=
+  {
+    path_id := file.path_id,
+    file_id := file.file_id,
+    size_bytes := file.size_bytes,
+    file_sha256 := file.file_sha256,
+    first_chunk_lba_present := file.first_chunk_lba_present,
+    first_chunk_lba := file.first_chunk_lba,
+    executable_tag := file.executable_tag
+  }
+
+def RichRegularFileCoreValid (file : RichRegularFileCore)
+    (chunkSize : Std.U64) : Prop :=
+  RegularFileCoreValid (richToRegular file) chunkSize ∧
+  (file.xattr_present = true → file.xattr_name_id.val ≠ 0) ∧
+  (file.xattr_present = false →
+    file.xattr_name_id.val = 0 ∧
+    file.xattr_value_len.val = 0 ∧
+    file.xattr_value_id.val = 0)
+
+def HardlinkEntryCoreValid (entry : HardlinkEntryCore) : Prop :=
+  entry.path_id.val ≠ 0 ∧
+  entry.file_id.val ≠ 0 ∧
+  entry.link_target_path_id.val ≠ 0 ∧
+  entry.executable_tag.val ≤ 2
+
+def SymlinkEntryCoreValid (entry : SymlinkEntryCore) : Prop :=
+  entry.path_id.val ≠ 0 ∧
+  entry.file_id.val ≠ 0 ∧
+  entry.link_target_id.val ≠ 0 ∧
+  entry.executable_tag.val ≤ 2
+
+def DirectoryEntryCoreValid (entry : DirectoryEntryCore) : Prop :=
+  entry.path_id.val ≠ 0 ∧
+  entry.file_id.val ≠ 0 ∧
+  entry.executable_tag.val ≤ 2
+
+def ManifestEntriesCoreValid (manifest : ManifestEntriesCore) : Prop :=
+  manifest.chunk_size.val ≠ 0 ∧
+  manifest.chunk_size.val % ChunkGranularity = 0 ∧
+  manifest.object_id.val ≠ 0 ∧
+  manifest.nonempty_regular.size_bytes.val ≠ 0 ∧
+  manifest.empty_regular.size_bytes.val = 0 ∧
+  RichRegularFileCoreValid manifest.nonempty_regular manifest.chunk_size ∧
+  RichRegularFileCoreValid manifest.empty_regular manifest.chunk_size ∧
+  HardlinkEntryCoreValid manifest.hardlink ∧
+  SymlinkEntryCoreValid manifest.symlink ∧
+  DirectoryEntryCoreValid manifest.directory ∧
+  manifest.hardlink.link_target_path_id =
+    manifest.nonempty_regular.path_id
+
+def Distinct5Core (first second third fourth fifth : Std.U64) : Prop :=
+  first ≠ second ∧
+  first ≠ third ∧
+  first ≠ fourth ∧
+  first ≠ fifth ∧
+  second ≠ third ∧
+  second ≠ fourth ∧
+  second ≠ fifth ∧
+  third ≠ fourth ∧
+  third ≠ fifth ∧
+  fourth ≠ fifth
+
+def ManifestArrayCoreValid (manifest : ManifestEntriesCore) : Prop :=
+  manifest.chunk_size.val ≠ 0 ∧
+  manifest.chunk_size.val % ChunkGranularity = 0 ∧
+  manifest.object_id.val ≠ 0 ∧
+  manifest.nonempty_regular.size_bytes.val ≠ 0 ∧
+  manifest.empty_regular.size_bytes.val = 0 ∧
+  RichRegularFileCoreValid manifest.nonempty_regular manifest.chunk_size ∧
+  RichRegularFileCoreValid manifest.empty_regular manifest.chunk_size ∧
+  HardlinkEntryCoreValid manifest.hardlink ∧
+  SymlinkEntryCoreValid manifest.symlink ∧
+  DirectoryEntryCoreValid manifest.directory ∧
+  Distinct5Core
+    manifest.nonempty_regular.path_id
+    manifest.empty_regular.path_id
+    manifest.hardlink.path_id
+    manifest.symlink.path_id
+    manifest.directory.path_id ∧
+  Distinct5Core
+    manifest.nonempty_regular.file_id
+    manifest.empty_regular.file_id
+    manifest.hardlink.file_id
+    manifest.symlink.file_id
+    manifest.directory.file_id ∧
+  (manifest.hardlink.link_target_path_id =
+      manifest.nonempty_regular.path_id ∨
+    manifest.hardlink.link_target_path_id =
+      manifest.empty_regular.path_id)
+
+def PlannerEntryCoreValid (entry : PlannerEntryCore) : Prop :=
+  entry.local_entry_valid = true ∧
+  entry.path_id.val ≠ 0 ∧
+  entry.file_id.val ≠ 0 ∧
+  (
+    (entry.entry_type = PLANNER_ENTRY_REGULAR ∧
+      entry.link_target_path_id.val = 0) ∨
+    (entry.entry_type = PLANNER_ENTRY_HARDLINK ∧
+      entry.link_target_path_id.val ≠ 0 ∧
+      entry.hardlink_target_seen_regular_before = true) ∨
+    (entry.entry_type = PLANNER_ENTRY_SYMLINK ∧
+      entry.link_target_path_id.val ≠ 0) ∨
+    (entry.entry_type = PLANNER_ENTRY_DIRECTORY ∧
+      entry.link_target_path_id.val = 0)
+  )
+
+def PlannerEntryOfSourceFacts
+    (source : PlannerSourceEntryCore)
+    (facts : PlannerMembershipFactsCore) : PlannerEntryCore :=
+  {
+    entry_type := source.entry_type,
+    path_id := source.path_id,
+    file_id := source.file_id,
+    link_target_path_id := source.link_target_path_id,
+    local_entry_valid := source.local_entry_valid,
+    path_seen_before := facts.path_seen_before,
+    file_id_seen_before := facts.file_id_seen_before,
+    hardlink_target_seen_regular_before :=
+      facts.hardlink_target_seen_regular_before
+  }
+
+def PlannerSourceEntryCoreValid
+    (source : PlannerSourceEntryCore)
+    (facts : PlannerMembershipFactsCore) : Prop :=
+  PlannerEntryCoreValid (PlannerEntryOfSourceFacts source facts)
+
+def InsertMembershipCoreValid (seenBefore inserted : Bool) : Prop :=
+  (seenBefore = false ∧ inserted = true) ∨
+  (seenBefore = true ∧ inserted = false)
+
+def PlannerMembershipFactsCoreValid
+    (source : PlannerSourceEntryCore)
+    (facts : PlannerMembershipFactsCore) : Prop :=
+  InsertMembershipCoreValid facts.path_seen_before facts.path_inserted ∧
+  InsertMembershipCoreValid facts.file_id_seen_before facts.file_id_inserted ∧
+  (
+    (source.entry_type = PLANNER_ENTRY_REGULAR ∧
+      facts.regular_path_seen_before = false ∧
+      facts.regular_path_inserted = true) ∨
+    (source.entry_type ≠ PLANNER_ENTRY_REGULAR ∧
+      facts.regular_path_inserted = false)
+  )
+
+def PlannerStepCoreValid
+    (state : PlannerFoldStateCore) (entry : PlannerEntryCore) : Prop :=
+  PlannerEntryCoreValid entry ∧
+  entry.path_seen_before = false ∧
+  entry.file_id_seen_before = false ∧
+  state.accepted_count.val + 1 < 2 ^ 64 ∧
+  (entry.entry_type = PLANNER_ENTRY_REGULAR →
+    state.regular_seen_count.val + 1 < 2 ^ 64)
+
+def plannerFoldCore :
+    PlannerFoldStateCore → List PlannerEntryCore → Option PlannerFoldStateCore
+| state, [] => some state
+| state, entry :: tail =>
+    match planner_fold_step_core state entry with
+    | ok (.Ok next) => plannerFoldCore next tail
+    | _ => none
+
+def PlannerFoldTraceValid :
+    PlannerFoldStateCore → List PlannerEntryCore → Prop
+| _, [] => True
+| state, entry :: tail =>
+    PlannerStepCoreValid state entry ∧
+    ∀ next,
+      planner_fold_step_core state entry = ok (.Ok next) →
+        PlannerFoldTraceValid next tail
+
+def PlannerMembershipStepCoreValid
+    (state : PlannerFoldStateCore)
+    (source : PlannerSourceEntryCore)
+    (facts : PlannerMembershipFactsCore) : Prop :=
+  PlannerSourceEntryCoreValid source facts ∧
+  PlannerMembershipFactsCoreValid source facts ∧
+  facts.path_seen_before = false ∧
+  facts.file_id_seen_before = false ∧
+  state.accepted_count.val + 1 < 2 ^ 64 ∧
+  (source.entry_type = PLANNER_ENTRY_REGULAR →
+    state.regular_seen_count.val + 1 < 2 ^ 64)
+
+structure PlannerMembershipTraceEntry where
+  source : PlannerSourceEntryCore
+  facts : PlannerMembershipFactsCore
+
+def plannerMembershipFoldCore :
+    PlannerFoldStateCore →
+    List PlannerMembershipTraceEntry →
+    Option PlannerFoldStateCore
+| state, [] => some state
+| state, entry :: tail =>
+    match planner_fold_step_from_membership_core
+        state entry.source entry.facts with
+    | ok (.Ok next) => plannerMembershipFoldCore next tail
+    | _ => none
+
+def PlannerMembershipFoldTraceValid :
+    PlannerFoldStateCore → List PlannerMembershipTraceEntry → Prop
+| _, [] => True
+| state, entry :: tail =>
+    PlannerMembershipStepCoreValid state entry.source entry.facts ∧
+    ∀ next,
+      planner_fold_step_from_membership_core state entry.source entry.facts =
+        ok (.Ok next) →
+        PlannerMembershipFoldTraceValid next tail
+
+def RichRegularFileWireOfCore (file : RichRegularFileCore)
+    (count : Std.U64) : RichRegularFileWireCore :=
+  {
+    map_len := FILE_ENTRY_REGULAR_MAP_LEN,
+    key_path := FILE_KEY_PATH,
+    path_id := file.path_id,
+    key_file_id := FILE_KEY_FILE_ID,
+    file_id := file.file_id,
+    key_executable := FILE_KEY_EXECUTABLE,
+    executable_tag := file.executable_tag,
+    key_size_bytes := FILE_KEY_SIZE_BYTES,
+    size_bytes := file.size_bytes,
+    key_chunk_count := FILE_KEY_CHUNK_COUNT,
+    chunk_count := count,
+    key_file_sha256 := FILE_KEY_FILE_SHA256,
+    file_sha256_len := DIGEST_BYTE_LEN,
+    file_sha256 := file.file_sha256,
+    key_first_chunk_lba := FILE_KEY_FIRST_CHUNK_LBA,
+    first_chunk_lba_is_null := (¬ file.first_chunk_lba_present),
+    first_chunk_lba := file.first_chunk_lba,
+    key_metadata_preservation_data :=
+      FILE_KEY_METADATA_PRESERVATION_DATA,
+    metadata_preservation_data_map_len :=
+      if file.xattr_present then
+        METADATA_PRESERVATION_XATTRS_MAP_LEN
+      else
+        METADATA_PRESERVATION_EMPTY_MAP_LEN,
+    metadata_key_xattrs :=
+      if file.xattr_present then METADATA_KEY_XATTRS else 0#u64,
+    xattrs_map_len :=
+      if file.xattr_present then XATTRS_ONE_ENTRY_LEN else 0#u64,
+    xattr_name_id := file.xattr_name_id,
+    xattr_value_len := file.xattr_value_len,
+    xattr_value_id := file.xattr_value_id
+  }
+
+lemma u64_eq_zero_of_val_zero (x : Std.U64) (h : x.val = 0) : x = 0#u64 := by
+  apply UScalar.eq_imp
+  simpa using h
+
+lemma u64_ne_zero_of_val_ne_zero (x : Std.U64) (h : x.val ≠ 0) :
+    x ≠ 0#u64 := by
+  intro hx
+  apply h
+  rw [hx]
+  rfl
+
+lemma u64_checked_add_some_of_sum_lt (a b : Std.U64)
+    (h : a.val + b.val < 2 ^ 64) :
+    ∃ sum, U64.checked_add a b = some sum ∧ sum.val = a.val + b.val := by
+  have hspec := U64.checked_add_bv_spec a b
+  cases hadd : U64.checked_add a b with
+  | none =>
+      simp [hadd, U64.max, U64.numBits] at hspec
+      omega
+  | some sum =>
+      simp [hadd, U64.max, U64.numBits] at hspec
+      exact ⟨sum, rfl, hspec.2.1⟩
+
+lemma u64_checked_add_none_of_sum_ge (a b : Std.U64)
+    (h : 2 ^ 64 ≤ a.val + b.val) :
+    U64.checked_add a b = none := by
+  have hspec := U64.checked_add_bv_spec a b
+  cases hadd : U64.checked_add a b with
+  | none => rfl
+  | some sum =>
+      simp [hadd, U64.max, U64.numBits] at hspec
+      omega
+
+lemma checked_add_ok (a b : Std.U64) (h : a.val + b.val < 2 ^ 64) :
+    ∃ sum, checked_add a b = ok (.Ok sum) ∧ sum.val = a.val + b.val := by
+  rcases u64_checked_add_some_of_sum_lt a b h with ⟨sum, hadd, hval⟩
+  refine ⟨sum, ?_, hval⟩
+  unfold checked_add
+  simp [lift, hadd]
+
+theorem checked_add_rejects_overflow (a b : Std.U64)
+    (h : 2 ^ 64 ≤ a.val + b.val) :
+    checked_add a b = ok (.Err RemObjectManifestError.InvalidManifestField) := by
+  have hadd := u64_checked_add_none_of_sum_ge a b h
+  unfold checked_add
+  simp [lift, hadd]
+
+lemma u64_div_ok_val (x y : Std.U64) (hy : y.val ≠ 0) :
+    ∃ z, x / y = ok z ∧ z.val = x.val / y.val := by
+  have hspec := U64.div_spec x (y := y) hy
+  cases hdiv : x / y with
+  | ok z =>
+      simp [hdiv] at hspec
+      exact ⟨z, rfl, hspec⟩
+  | fail e =>
+      simp [hdiv] at hspec
+  | div =>
+      simp [hdiv] at hspec
+
+lemma u64_rem_ok_val (x y : Std.U64) (hy : y.val ≠ 0) :
+    ∃ z, x % y = ok z ∧ z.val = x.val % y.val := by
+  have hspec := U64.rem_spec x (y := y) hy
+  cases hrem : x % y with
+  | ok z =>
+      simp [hrem] at hspec
+      exact ⟨z, rfl, hspec⟩
+  | fail e =>
+      simp [hrem] at hspec
+  | div =>
+      simp [hrem] at hspec
+
+lemma u64_sub_ok_val (x y : Std.U64) (h : y.val ≤ x.val) :
+    ∃ z, x - y = ok z ∧ z.val = x.val - y.val := by
+  have hspec := U64.sub_spec (x := x) (y := y) h
+  cases hsub : x - y with
+  | ok z =>
+      simp [hsub] at hspec
+      exact ⟨z, rfl, hspec.1⟩
+  | fail e =>
+      simp [hsub] at hspec
+  | div =>
+      simp [hsub] at hspec
+
+lemma granularity_val : CHUNK_SIZE_GRANULARITY.val = ChunkGranularity := by
+  simp [CHUNK_SIZE_GRANULARITY, ChunkGranularity]
+
+lemma executable_true_val : EXECUTABLE_TRUE.val = 2 := by
+  simp [EXECUTABLE_TRUE]
+
+theorem validate_chunk_size_success (chunkSize : Std.U64)
+    (hpos : chunkSize.val ≠ 0)
+    (hgran : chunkSize.val % ChunkGranularity = 0) :
+    validate_chunk_size chunkSize = ok (.Ok ()) := by
+  have hChunkNe := u64_ne_zero_of_val_ne_zero chunkSize hpos
+  have hGranNz : CHUNK_SIZE_GRANULARITY.val ≠ 0 := by
+    simp [CHUNK_SIZE_GRANULARITY]
+  rcases u64_rem_ok_val chunkSize CHUNK_SIZE_GRANULARITY hGranNz with
+    ⟨rem, hrem, hremVal⟩
+  have hremZero : rem = 0#u64 := by
+    apply u64_eq_zero_of_val_zero
+    rw [hremVal, granularity_val]
+    exact hgran
+  unfold validate_chunk_size
+  simp [hChunkNe, hrem, hremZero]
+
+theorem validate_chunk_size_rejects_zero :
+    validate_chunk_size 0#u64 =
+      ok (.Err RemObjectManifestError.InvalidChunkSize) := by
+  unfold validate_chunk_size
+  simp
+
+theorem validate_chunk_size_rejects_non_multiple (chunkSize : Std.U64)
+    (hpos : chunkSize.val ≠ 0)
+    (hgran : chunkSize.val % ChunkGranularity ≠ 0) :
+    validate_chunk_size chunkSize =
+      ok (.Err RemObjectManifestError.InvalidChunkSize) := by
+  have hChunkNe := u64_ne_zero_of_val_ne_zero chunkSize hpos
+  have hGranNz : CHUNK_SIZE_GRANULARITY.val ≠ 0 := by
+    simp [CHUNK_SIZE_GRANULARITY]
+  rcases u64_rem_ok_val chunkSize CHUNK_SIZE_GRANULARITY hGranNz with
+    ⟨rem, hrem, hremVal⟩
+  have hremValNe : rem.val ≠ 0 := by
+    intro hz
+    apply hgran
+    rw [hremVal, granularity_val] at hz
+    simpa using hz
+  unfold validate_chunk_size
+  simp [hChunkNe, hrem, hremValNe]
+
+theorem chunk_count_core_success (sizeBytes chunkSize : Std.U64)
+    (hChunkNz : chunkSize.val ≠ 0)
+    (hChunkGran : chunkSize.val % ChunkGranularity = 0)
+    (hNoOverflow : chunkCountSpec sizeBytes chunkSize < 2 ^ 64) :
+    ∃ count,
+      chunk_count_core sizeBytes chunkSize = ok (.Ok count) ∧
+      count.val = chunkCountSpec sizeBytes chunkSize := by
+  have hChunk := validate_chunk_size_success chunkSize hChunkNz hChunkGran
+  by_cases hSizeZero : sizeBytes.val = 0
+  · have hSizeEq : sizeBytes = 0#u64 :=
+      u64_eq_zero_of_val_zero sizeBytes hSizeZero
+    refine ⟨0#u64, ?_, ?_⟩
+    · unfold chunk_count_core
+      simp [hChunk, core.result.Result.Insts.CoreOpsTry.branch, hSizeEq]
+    · simp [chunkCountSpec, hSizeZero]
+  · have hSizeNe : sizeBytes ≠ 0#u64 :=
+      u64_ne_zero_of_val_ne_zero sizeBytes hSizeZero
+    have hOneLe : (1#u64).val ≤ sizeBytes.val := by
+      norm_num
+      omega
+    rcases u64_sub_ok_val sizeBytes 1#u64 hOneLe with
+      ⟨minusOne, hsub, hminusVal⟩
+    rcases u64_div_ok_val minusOne chunkSize hChunkNz with
+      ⟨chunksMinusOne, hdiv, hchunksVal⟩
+    have hAddInput : chunksMinusOne.val + (1#u64).val < 2 ^ 64 := by
+      rw [hchunksVal, hminusVal]
+      simp
+      simpa [chunkCountSpec, hSizeZero] using hNoOverflow
+    rcases checked_add_ok chunksMinusOne 1#u64 hAddInput with
+      ⟨count, hcount, hcountVal⟩
+    refine ⟨count, ?_, ?_⟩
+    · unfold chunk_count_core
+      simp [hChunk, core.result.Result.Insts.CoreOpsTry.branch, hSizeNe, hsub,
+        hdiv, hcount]
+    · rw [hcountVal, hchunksVal, hminusVal]
+      simp [chunkCountSpec, hSizeZero]
+
+theorem validate_regular_file_core_success (file : RegularFileCore)
+    (chunkSize : Std.U64) (hvalid : RegularFileCoreValid file chunkSize) :
+    validate_regular_file_core file chunkSize = ok (.Ok ()) := by
+  rcases hvalid with
+    ⟨hChunkNz, hChunkGran, hPathNz, hFileNz, hExec, hZeroShape,
+      hNonzeroShape, hCountNoOverflow⟩
+  have hChunk := validate_chunk_size_success chunkSize hChunkNz hChunkGran
+  have hPathNe := u64_ne_zero_of_val_ne_zero file.path_id hPathNz
+  have hFileNe := u64_ne_zero_of_val_ne_zero file.file_id hFileNz
+  have hExecNotGt : ¬ file.executable_tag > EXECUTABLE_TRUE := by
+    intro hgt
+    have hv : EXECUTABLE_TRUE.val < file.executable_tag.val := by scalar_tac
+    rw [executable_true_val] at hv
+    omega
+  rcases chunk_count_core_success file.size_bytes chunkSize hChunkNz hChunkGran
+      hCountNoOverflow with
+    ⟨count, hcount, _hcountVal⟩
+  by_cases hSizeZero : file.size_bytes.val = 0
+  · have hSizeEq : file.size_bytes = 0#u64 :=
+      u64_eq_zero_of_val_zero file.size_bytes hSizeZero
+    rcases hZeroShape hSizeZero with ⟨hPresent, hFirstZeroVal⟩
+    have hFirstEq : file.first_chunk_lba = 0#u64 :=
+      u64_eq_zero_of_val_zero file.first_chunk_lba hFirstZeroVal
+    have hcountZero : chunk_count_core 0#u64 chunkSize = ok (.Ok count) := by
+      simpa [hSizeEq] using hcount
+    unfold validate_regular_file_core
+    simp [hChunk, core.result.Result.Insts.CoreOpsTry.branch, hPathNe, hFileNe,
+      hExecNotGt, hcountZero, hSizeEq, hPresent, hFirstEq]
+  · have hSizeNe : file.size_bytes ≠ 0#u64 :=
+      u64_ne_zero_of_val_ne_zero file.size_bytes hSizeZero
+    have hPresent := hNonzeroShape hSizeZero
+    unfold validate_regular_file_core
+    simp [hChunk, core.result.Result.Insts.CoreOpsTry.branch, hPathNe, hFileNe,
+      hExecNotGt, hcount, hSizeNe, hPresent]
+
+theorem validate_regular_file_core_rejects_zero_path
+    (file : RegularFileCore) (chunkSize : Std.U64)
+    (hChunkNz : chunkSize.val ≠ 0)
+    (hChunkGran : chunkSize.val % ChunkGranularity = 0)
+    (hPath : file.path_id = 0#u64) :
+    validate_regular_file_core file chunkSize =
+      ok (.Err RemObjectManifestError.InvalidManifestField) := by
+  have hChunk := validate_chunk_size_success chunkSize hChunkNz hChunkGran
+  unfold validate_regular_file_core
+  simp [hChunk, core.result.Result.Insts.CoreOpsTry.branch, hPath]
+
+theorem validate_regular_file_core_rejects_bad_executable
+    (file : RegularFileCore) (chunkSize : Std.U64)
+    (hChunkNz : chunkSize.val ≠ 0)
+    (hChunkGran : chunkSize.val % ChunkGranularity = 0)
+    (hPathNz : file.path_id.val ≠ 0)
+    (hFileNz : file.file_id.val ≠ 0)
+    (hExec : 2 < file.executable_tag.val) :
+    validate_regular_file_core file chunkSize =
+      ok (.Err RemObjectManifestError.InvalidManifestField) := by
+  have hChunk := validate_chunk_size_success chunkSize hChunkNz hChunkGran
+  have hPathNe := u64_ne_zero_of_val_ne_zero file.path_id hPathNz
+  have hFileNe := u64_ne_zero_of_val_ne_zero file.file_id hFileNz
+  have hgt : file.executable_tag > EXECUTABLE_TRUE := by
+    have hgt2 : file.executable_tag > 2#u8 := by scalar_tac
+    simpa [EXECUTABLE_TRUE] using hgt2
+  unfold validate_regular_file_core
+  simp [hChunk, core.result.Result.Insts.CoreOpsTry.branch, hPathNe, hFileNe,
+    hgt]
+
+theorem validate_regular_file_core_rejects_zero_size_with_lba
+    (file : RegularFileCore) (chunkSize : Std.U64)
+    (hvalid : RegularFileCoreValid
+      { file with first_chunk_lba_present := false, first_chunk_lba := 0#u64 }
+      chunkSize)
+    (hSize : file.size_bytes.val = 0)
+    (hPresent : file.first_chunk_lba_present = true) :
+    validate_regular_file_core file chunkSize =
+      ok (.Err RemObjectManifestError.InvalidManifestField) := by
+  rcases hvalid with
+    ⟨hChunkNz, hChunkGran, hPathNz, hFileNz, hExec, _hZeroShape,
+      _hNonzeroShape, hCountNoOverflow⟩
+  have hChunk := validate_chunk_size_success chunkSize hChunkNz hChunkGran
+  have hPathNz' : file.path_id.val ≠ 0 := by simpa using hPathNz
+  have hFileNz' : file.file_id.val ≠ 0 := by simpa using hFileNz
+  have hExec' : file.executable_tag.val ≤ 2 := by simpa using hExec
+  have hPathNe := u64_ne_zero_of_val_ne_zero file.path_id hPathNz'
+  have hFileNe := u64_ne_zero_of_val_ne_zero file.file_id hFileNz'
+  have hExecNotGt : ¬ file.executable_tag > EXECUTABLE_TRUE := by
+    intro hgt
+    have hv : EXECUTABLE_TRUE.val < file.executable_tag.val := by scalar_tac
+    rw [executable_true_val] at hv
+    omega
+  have hSizeEq : file.size_bytes = 0#u64 :=
+    u64_eq_zero_of_val_zero file.size_bytes hSize
+  have hCountNoOverflow' :
+      chunkCountSpec file.size_bytes chunkSize < 2 ^ 64 := by
+    simp [chunkCountSpec, hSize] at hCountNoOverflow ⊢
+  rcases chunk_count_core_success file.size_bytes chunkSize hChunkNz hChunkGran
+      hCountNoOverflow' with
+    ⟨count, hcount, _⟩
+  have hcountZero : chunk_count_core 0#u64 chunkSize = ok (.Ok count) := by
+    simpa [hSizeEq] using hcount
+  unfold validate_regular_file_core
+  simp [hChunk, core.result.Result.Insts.CoreOpsTry.branch, hPathNe, hFileNe,
+    hExecNotGt, hcountZero, hSizeEq, hPresent]
+
+theorem validate_manifest_core_success (manifest : ManifestCore)
+    (hvalid : ManifestCoreValid manifest) :
+    validate_manifest_core manifest = ok (.Ok ()) := by
+  rcases hvalid with ⟨hObjectNz, hFileValid⟩
+  rcases hFileValid with
+    ⟨hChunkNz, hChunkGran, hPathNz, hFileNz, hExec, hZeroShape,
+      hNonzeroShape, hCountNoOverflow⟩
+  have hChunk := validate_chunk_size_success manifest.chunk_size hChunkNz hChunkGran
+  have hObjectNe := u64_ne_zero_of_val_ne_zero manifest.object_id hObjectNz
+  have hFileValidate := validate_regular_file_core_success manifest.file
+    manifest.chunk_size
+    ⟨hChunkNz, hChunkGran, hPathNz, hFileNz, hExec, hZeroShape,
+      hNonzeroShape, hCountNoOverflow⟩
+  unfold validate_manifest_core
+  simp [hChunk, core.result.Result.Insts.CoreOpsTry.branch, hObjectNe,
+    hFileValidate]
+
+theorem encode_regular_file_core_emits_writer_schema (file : RegularFileCore)
+    (chunkSize : Std.U64) (hvalid : RegularFileCoreValid file chunkSize) :
+    ∃ wire,
+      encode_regular_file_core file chunkSize = ok (.Ok wire) ∧
+      wire.map_len = FILE_ENTRY_REGULAR_MAP_LEN ∧
+      wire.key_path = FILE_KEY_PATH ∧
+      wire.path_id = file.path_id ∧
+      wire.key_file_id = FILE_KEY_FILE_ID ∧
+      wire.file_id = file.file_id ∧
+      wire.key_executable = FILE_KEY_EXECUTABLE ∧
+      wire.executable_tag = file.executable_tag ∧
+      wire.key_size_bytes = FILE_KEY_SIZE_BYTES ∧
+      wire.size_bytes = file.size_bytes ∧
+      wire.key_chunk_count = FILE_KEY_CHUNK_COUNT ∧
+      wire.chunk_count.val = chunkCountSpec file.size_bytes chunkSize ∧
+      wire.key_file_sha256 = FILE_KEY_FILE_SHA256 ∧
+      wire.file_sha256_len = DIGEST_BYTE_LEN ∧
+      wire.file_sha256 = file.file_sha256 ∧
+      wire.key_first_chunk_lba = FILE_KEY_FIRST_CHUNK_LBA ∧
+      wire.first_chunk_lba_is_null = (¬ file.first_chunk_lba_present) ∧
+      wire.first_chunk_lba = file.first_chunk_lba ∧
+      wire.key_metadata_preservation_data =
+        FILE_KEY_METADATA_PRESERVATION_DATA ∧
+      wire.metadata_preservation_data_empty = true := by
+  rcases hvalid with
+    ⟨hChunkNz, hChunkGran, hPathNz, hFileNz, hExec, hZeroShape,
+      hNonzeroShape, hCountNoOverflow⟩
+  have hvalid' : RegularFileCoreValid file chunkSize :=
+    ⟨hChunkNz, hChunkGran, hPathNz, hFileNz, hExec, hZeroShape,
+      hNonzeroShape, hCountNoOverflow⟩
+  have hvalidate := validate_regular_file_core_success file chunkSize hvalid'
+  rcases chunk_count_core_success file.size_bytes chunkSize hChunkNz hChunkGran
+      hCountNoOverflow with
+    ⟨count, hcount, hcountVal⟩
+  unfold encode_regular_file_core
+  simp [hvalidate, core.result.Result.Insts.CoreOpsTry.branch, hcount,
+    hcountVal]
+
+theorem encode_manifest_core_emits_writer_schema (manifest : ManifestCore)
+    (hvalid : ManifestCoreValid manifest) :
+    ∃ wire,
+      encode_manifest_core manifest = ok (.Ok wire) ∧
+      wire.root_map_len = ROOT_MAP_LEN ∧
+      wire.key_object_id = ROOT_KEY_OBJECT_ID ∧
+      wire.object_id = manifest.object_id ∧
+      wire.key_chunk_size = ROOT_KEY_CHUNK_SIZE ∧
+      wire.chunk_size = manifest.chunk_size ∧
+      wire.key_file_entries = ROOT_KEY_FILE_ENTRIES ∧
+      wire.file_entries_len = FILE_ENTRIES_LEN_ONE ∧
+      wire.file.map_len = FILE_ENTRY_REGULAR_MAP_LEN ∧
+      wire.key_schema_version = ROOT_KEY_SCHEMA_VERSION ∧
+      wire.schema_version = SCHEMA_VERSION ∧
+      wire.key_object_metadata = ROOT_KEY_OBJECT_METADATA ∧
+      wire.object_metadata_empty = true ∧
+      wire.key_caller_object_id = ROOT_KEY_CALLER_OBJECT_ID ∧
+      wire.caller_object_id = manifest.caller_object_id ∧
+      wire.key_external_references = ROOT_KEY_EXTERNAL_REFERENCES ∧
+      wire.external_references_empty = true ∧
+      wire.trailing_data = false := by
+  rcases hvalid with ⟨hObjectNz, hFileValid⟩
+  have hvalid' : ManifestCoreValid manifest := ⟨hObjectNz, hFileValid⟩
+  have hvalidate := validate_manifest_core_success manifest hvalid'
+  rcases encode_regular_file_core_emits_writer_schema manifest.file
+      manifest.chunk_size hFileValid with
+    ⟨fileWire, hfileEncode, hfileMap, _⟩
+  unfold encode_manifest_core
+  simp [hvalidate, core.result.Result.Insts.CoreOpsTry.branch, hfileEncode,
+    hfileMap]
+
+theorem decode_encode_regular_file_core_round_trip (file : RegularFileCore)
+    (chunkSize : Std.U64) (hvalid : RegularFileCoreValid file chunkSize) :
+    ∃ wire,
+      encode_regular_file_core file chunkSize = ok (.Ok wire) ∧
+      decode_regular_file_core wire chunkSize = ok (.Ok file) := by
+  rcases hvalid with
+    ⟨hChunkNz, hChunkGran, hPathNz, hFileNz, hExec, hZeroShape,
+      hNonzeroShape, hCountNoOverflow⟩
+  have hvalid' : RegularFileCoreValid file chunkSize :=
+    ⟨hChunkNz, hChunkGran, hPathNz, hFileNz, hExec, hZeroShape,
+      hNonzeroShape, hCountNoOverflow⟩
+  have hvalidate := validate_regular_file_core_success file chunkSize hvalid'
+  rcases chunk_count_core_success file.size_bytes chunkSize hChunkNz hChunkGran
+      hCountNoOverflow with
+    ⟨count, hcount, hcountVal⟩
+  refine ⟨{
+    map_len := FILE_ENTRY_REGULAR_MAP_LEN,
+    key_path := FILE_KEY_PATH,
+    path_id := file.path_id,
+    key_file_id := FILE_KEY_FILE_ID,
+    file_id := file.file_id,
+    key_executable := FILE_KEY_EXECUTABLE,
+    executable_tag := file.executable_tag,
+    key_size_bytes := FILE_KEY_SIZE_BYTES,
+    size_bytes := file.size_bytes,
+    key_chunk_count := FILE_KEY_CHUNK_COUNT,
+    chunk_count := count,
+    key_file_sha256 := FILE_KEY_FILE_SHA256,
+    file_sha256_len := DIGEST_BYTE_LEN,
+    file_sha256 := file.file_sha256,
+    key_first_chunk_lba := FILE_KEY_FIRST_CHUNK_LBA,
+    first_chunk_lba_is_null := (¬ file.first_chunk_lba_present),
+    first_chunk_lba := file.first_chunk_lba,
+    key_metadata_preservation_data := FILE_KEY_METADATA_PRESERVATION_DATA,
+    metadata_preservation_data_empty := true
+  }, ?_, ?_⟩
+  · unfold encode_regular_file_core
+    simp [hvalidate, core.result.Result.Insts.CoreOpsTry.branch, hcount]
+  · by_cases hSizeZero : file.size_bytes.val = 0
+    · have hSizeEq : file.size_bytes = 0#u64 :=
+        u64_eq_zero_of_val_zero file.size_bytes hSizeZero
+      rcases hZeroShape hSizeZero with ⟨hPresent, hFirstZeroVal⟩
+      have hFirstEq : file.first_chunk_lba = 0#u64 :=
+        u64_eq_zero_of_val_zero file.first_chunk_lba hFirstZeroVal
+      have hcountZero : chunk_count_core 0#u64 chunkSize = ok (.Ok count) := by
+        simpa [hSizeEq] using hcount
+      have hfileZero :
+          {
+            path_id := file.path_id,
+            file_id := file.file_id,
+            size_bytes := 0#u64,
+            file_sha256 := file.file_sha256,
+            first_chunk_lba_present := false,
+            first_chunk_lba := 0#u64,
+            executable_tag := file.executable_tag
+          } = file := by
+        cases file
+        simp_all
+      have hvalidateZero :
+          validate_regular_file_core
+            {
+              path_id := file.path_id,
+              file_id := file.file_id,
+              size_bytes := 0#u64,
+              file_sha256 := file.file_sha256,
+              first_chunk_lba_present := false,
+              first_chunk_lba := 0#u64,
+              executable_tag := file.executable_tag
+            } chunkSize = ok (.Ok ()) := by
+        rw [hfileZero]
+        exact hvalidate
+      unfold decode_regular_file_core
+      simp [hcountZero, hcountVal, hSizeEq, hPresent, hfileZero, hvalidate,
+        core.result.Result.Insts.CoreOpsTry.branch]
+    · have hSizeNe : file.size_bytes ≠ 0#u64 :=
+        u64_ne_zero_of_val_ne_zero file.size_bytes hSizeZero
+      have hPresent := hNonzeroShape hSizeZero
+      have hfilePresent :
+          {
+            path_id := file.path_id,
+            file_id := file.file_id,
+            size_bytes := file.size_bytes,
+            file_sha256 := file.file_sha256,
+            first_chunk_lba_present := true,
+            first_chunk_lba := file.first_chunk_lba,
+            executable_tag := file.executable_tag
+          } = file := by
+        cases file
+        simp_all
+      have hvalidatePresent :
+          validate_regular_file_core
+            {
+              path_id := file.path_id,
+              file_id := file.file_id,
+              size_bytes := file.size_bytes,
+              file_sha256 := file.file_sha256,
+              first_chunk_lba_present := true,
+              first_chunk_lba := file.first_chunk_lba,
+              executable_tag := file.executable_tag
+            } chunkSize = ok (.Ok ()) := by
+        rw [hfilePresent]
+        exact hvalidate
+      unfold decode_regular_file_core
+      simp [hcount, hcountVal, hSizeNe, hPresent, hfilePresent,
+        hvalidate,
+        core.result.Result.Insts.CoreOpsTry.branch]
+
+theorem decode_encode_manifest_core_round_trip (manifest : ManifestCore)
+    (hvalid : ManifestCoreValid manifest) :
+    ∃ wire,
+      encode_manifest_core manifest = ok (.Ok wire) ∧
+      decode_manifest_core wire manifest.chunk_size = ok (.Ok manifest) := by
+  rcases hvalid with ⟨hObjectNz, hFileValid⟩
+  have hvalid' : ManifestCoreValid manifest := ⟨hObjectNz, hFileValid⟩
+  have hvalidate := validate_manifest_core_success manifest hvalid'
+  rcases decode_encode_regular_file_core_round_trip manifest.file
+      manifest.chunk_size hFileValid with
+    ⟨fileWire, hfileEncode, hfileDecode⟩
+  refine ⟨{
+    root_map_len := ROOT_MAP_LEN,
+    key_object_id := ROOT_KEY_OBJECT_ID,
+    object_id := manifest.object_id,
+    key_chunk_size := ROOT_KEY_CHUNK_SIZE,
+    chunk_size := manifest.chunk_size,
+    key_file_entries := ROOT_KEY_FILE_ENTRIES,
+    file_entries_len := FILE_ENTRIES_LEN_ONE,
+    file := fileWire,
+    key_schema_version := ROOT_KEY_SCHEMA_VERSION,
+    schema_version := SCHEMA_VERSION,
+    key_object_metadata := ROOT_KEY_OBJECT_METADATA,
+    object_metadata_empty := true,
+    key_caller_object_id := ROOT_KEY_CALLER_OBJECT_ID,
+    caller_object_id := manifest.caller_object_id,
+    key_external_references := ROOT_KEY_EXTERNAL_REFERENCES,
+    external_references_empty := true,
+    trailing_data := false
+  }, ?_, ?_⟩
+  · unfold encode_manifest_core
+    simp [hvalidate, core.result.Result.Insts.CoreOpsTry.branch, hfileEncode]
+  · unfold decode_manifest_core
+    simp [hfileDecode, hvalidate, core.result.Result.Insts.CoreOpsTry.branch]
+
+theorem decode_manifest_core_rejects_trailing_data
+    (wire : ManifestWireCore) (readerChunkSize : Std.U64)
+    (h : wire.trailing_data = true) :
+    decode_manifest_core wire readerChunkSize =
+      ok (.Err RemObjectManifestError.InvalidCborEncoding) := by
+  unfold decode_manifest_core
+  simp [h]
+
+theorem decode_manifest_core_rejects_missing_required_shape
+    (wire : ManifestWireCore) (readerChunkSize : Std.U64)
+    (htrail : wire.trailing_data = false)
+    (hlen : wire.root_map_len ≠ ROOT_MAP_LEN) :
+    decode_manifest_core wire readerChunkSize =
+      ok (.Err RemObjectManifestError.MissingRequiredManifestField) := by
+  unfold decode_manifest_core
+  simp [htrail, hlen]
+
+theorem decode_manifest_core_rejects_wrong_root_key
+    (wire : ManifestWireCore) (readerChunkSize : Std.U64)
+    (htrail : wire.trailing_data = false)
+    (hlen : wire.root_map_len = ROOT_MAP_LEN)
+    (hkey : wire.key_object_id ≠ ROOT_KEY_OBJECT_ID) :
+    decode_manifest_core wire readerChunkSize =
+      ok (.Err RemObjectManifestError.InvalidCborEncoding) := by
+  unfold decode_manifest_core
+  simp [htrail, hlen, hkey]
+
+theorem decode_manifest_core_rejects_wrong_schema_version
+    (wire : ManifestWireCore) (readerChunkSize : Std.U64)
+    (htrail : wire.trailing_data = false)
+    (hlen : wire.root_map_len = ROOT_MAP_LEN)
+    (hkey0 : wire.key_object_id = ROOT_KEY_OBJECT_ID)
+    (hkey1 : wire.key_chunk_size = ROOT_KEY_CHUNK_SIZE)
+    (hkey2 : wire.key_file_entries = ROOT_KEY_FILE_ENTRIES)
+    (hkey3 : wire.key_schema_version = ROOT_KEY_SCHEMA_VERSION)
+    (hkey4 : wire.key_object_metadata = ROOT_KEY_OBJECT_METADATA)
+    (hkey5 : wire.key_caller_object_id = ROOT_KEY_CALLER_OBJECT_ID)
+    (hkey6 : wire.key_external_references = ROOT_KEY_EXTERNAL_REFERENCES)
+    (hversion : wire.schema_version ≠ SCHEMA_VERSION) :
+    decode_manifest_core wire readerChunkSize =
+      ok (.Err RemObjectManifestError.InvalidManifestField) := by
+  unfold decode_manifest_core
+  simp [htrail, hlen, hkey0, hkey1, hkey2, hkey3, hkey4, hkey5, hkey6,
+    hversion]
+
+theorem decode_manifest_core_rejects_chunk_size_mismatch
+    (wire : ManifestWireCore) (readerChunkSize : Std.U64)
+    (htrail : wire.trailing_data = false)
+    (hlen : wire.root_map_len = ROOT_MAP_LEN)
+    (hkey0 : wire.key_object_id = ROOT_KEY_OBJECT_ID)
+    (hkey1 : wire.key_chunk_size = ROOT_KEY_CHUNK_SIZE)
+    (hkey2 : wire.key_file_entries = ROOT_KEY_FILE_ENTRIES)
+    (hkey3 : wire.key_schema_version = ROOT_KEY_SCHEMA_VERSION)
+    (hkey4 : wire.key_object_metadata = ROOT_KEY_OBJECT_METADATA)
+    (hkey5 : wire.key_caller_object_id = ROOT_KEY_CALLER_OBJECT_ID)
+    (hkey6 : wire.key_external_references = ROOT_KEY_EXTERNAL_REFERENCES)
+    (hversion : wire.schema_version = SCHEMA_VERSION)
+    (hchunk : wire.chunk_size ≠ readerChunkSize) :
+    decode_manifest_core wire readerChunkSize =
+      ok (.Err RemObjectManifestError.InvalidManifestField) := by
+  unfold decode_manifest_core
+  simp [htrail, hlen, hkey0, hkey1, hkey2, hkey3, hkey4, hkey5, hkey6,
+    hversion, hchunk]
+
+theorem decode_manifest_core_rejects_wrong_file_count
+    (wire : ManifestWireCore) (readerChunkSize : Std.U64)
+    (htrail : wire.trailing_data = false)
+    (hlen : wire.root_map_len = ROOT_MAP_LEN)
+    (hkey0 : wire.key_object_id = ROOT_KEY_OBJECT_ID)
+    (hkey1 : wire.key_chunk_size = ROOT_KEY_CHUNK_SIZE)
+    (hkey2 : wire.key_file_entries = ROOT_KEY_FILE_ENTRIES)
+    (hkey3 : wire.key_schema_version = ROOT_KEY_SCHEMA_VERSION)
+    (hkey4 : wire.key_object_metadata = ROOT_KEY_OBJECT_METADATA)
+    (hkey5 : wire.key_caller_object_id = ROOT_KEY_CALLER_OBJECT_ID)
+    (hkey6 : wire.key_external_references = ROOT_KEY_EXTERNAL_REFERENCES)
+    (hversion : wire.schema_version = SCHEMA_VERSION)
+    (hchunk : wire.chunk_size = readerChunkSize)
+    (hcount : wire.file_entries_len ≠ FILE_ENTRIES_LEN_ONE) :
+    decode_manifest_core wire readerChunkSize =
+      ok (.Err RemObjectManifestError.InvalidManifestField) := by
+  unfold decode_manifest_core
+  simp [htrail, hlen, hkey0, hkey1, hkey2, hkey3, hkey4, hkey5, hkey6,
+    hversion, hchunk, hcount]
+
+theorem decode_regular_file_core_rejects_wrong_file_shape
+    (wire : RegularFileWireCore) (chunkSize : Std.U64)
+    (hlen : wire.map_len ≠ FILE_ENTRY_REGULAR_MAP_LEN) :
+    decode_regular_file_core wire chunkSize =
+      ok (.Err RemObjectManifestError.MissingRequiredManifestField) := by
+  unfold decode_regular_file_core
+  simp [hlen]
+
+theorem decode_regular_file_core_rejects_wrong_digest_len
+    (wire : RegularFileWireCore) (chunkSize : Std.U64)
+    (hlen : wire.map_len = FILE_ENTRY_REGULAR_MAP_LEN)
+    (hkey0 : wire.key_path = FILE_KEY_PATH)
+    (hkey1 : wire.key_file_id = FILE_KEY_FILE_ID)
+    (hkey2 : wire.key_executable = FILE_KEY_EXECUTABLE)
+    (hkey3 : wire.key_size_bytes = FILE_KEY_SIZE_BYTES)
+    (hkey4 : wire.key_chunk_count = FILE_KEY_CHUNK_COUNT)
+    (hkey5 : wire.key_file_sha256 = FILE_KEY_FILE_SHA256)
+    (hkey6 : wire.key_first_chunk_lba = FILE_KEY_FIRST_CHUNK_LBA)
+    (hkey7 : wire.key_metadata_preservation_data =
+      FILE_KEY_METADATA_PRESERVATION_DATA)
+    (hdigest : wire.file_sha256_len ≠ DIGEST_BYTE_LEN) :
+    decode_regular_file_core wire chunkSize =
+      ok (.Err RemObjectManifestError.InvalidManifestField) := by
+  unfold decode_regular_file_core
+  simp [hlen, hkey0, hkey1, hkey2, hkey3, hkey4, hkey5, hkey6, hkey7, hdigest]
+
+theorem decode_regular_file_core_rejects_wrong_chunk_count
+    (wire : RegularFileWireCore) (chunkSize expected : Std.U64)
+    (hshape :
+      wire.map_len = FILE_ENTRY_REGULAR_MAP_LEN ∧
+      wire.key_path = FILE_KEY_PATH ∧
+      wire.key_file_id = FILE_KEY_FILE_ID ∧
+      wire.key_executable = FILE_KEY_EXECUTABLE ∧
+      wire.key_size_bytes = FILE_KEY_SIZE_BYTES ∧
+      wire.key_chunk_count = FILE_KEY_CHUNK_COUNT ∧
+      wire.key_file_sha256 = FILE_KEY_FILE_SHA256 ∧
+      wire.key_first_chunk_lba = FILE_KEY_FIRST_CHUNK_LBA ∧
+      wire.key_metadata_preservation_data =
+        FILE_KEY_METADATA_PRESERVATION_DATA ∧
+      wire.file_sha256_len = DIGEST_BYTE_LEN ∧
+      wire.metadata_preservation_data_empty = true)
+    (hcount : chunk_count_core wire.size_bytes chunkSize = ok (.Ok expected))
+    (hbad : wire.chunk_count ≠ expected) :
+    decode_regular_file_core wire chunkSize =
+      ok (.Err RemObjectManifestError.InvalidManifestField) := by
+  rcases hshape with
+    ⟨hlen, hkey0, hkey1, hkey2, hkey3, hkey4, hkey5, hkey6, hkey7,
+      hdigest, hmetadata⟩
+  have hbadVal : wire.chunk_count.val ≠ expected.val := by
+    intro hv
+    apply hbad
+    apply UScalar.eq_imp
+    exact hv
+  unfold decode_regular_file_core
+  simp [hlen, hkey0, hkey1, hkey2, hkey3, hkey4, hkey5, hkey6, hkey7,
+    hdigest, hmetadata, hcount, core.result.Result.Insts.CoreOpsTry.branch,
+    hbadVal]
+
+theorem decode_regular_file_core_rejects_zero_size_nonnull_lba
+    (wire : RegularFileWireCore) (chunkSize expected : Std.U64)
+    (hshape :
+      wire.map_len = FILE_ENTRY_REGULAR_MAP_LEN ∧
+      wire.key_path = FILE_KEY_PATH ∧
+      wire.key_file_id = FILE_KEY_FILE_ID ∧
+      wire.key_executable = FILE_KEY_EXECUTABLE ∧
+      wire.key_size_bytes = FILE_KEY_SIZE_BYTES ∧
+      wire.key_chunk_count = FILE_KEY_CHUNK_COUNT ∧
+      wire.key_file_sha256 = FILE_KEY_FILE_SHA256 ∧
+      wire.key_first_chunk_lba = FILE_KEY_FIRST_CHUNK_LBA ∧
+      wire.key_metadata_preservation_data =
+        FILE_KEY_METADATA_PRESERVATION_DATA ∧
+      wire.file_sha256_len = DIGEST_BYTE_LEN ∧
+      wire.metadata_preservation_data_empty = true)
+    (hcount : chunk_count_core wire.size_bytes chunkSize = ok (.Ok expected))
+    (hcountEq : wire.chunk_count = expected)
+    (hsize : wire.size_bytes = 0#u64)
+    (hlba : wire.first_chunk_lba_is_null = false) :
+    decode_regular_file_core wire chunkSize =
+      ok (.Err RemObjectManifestError.InvalidManifestField) := by
+  rcases hshape with
+    ⟨hlen, hkey0, hkey1, hkey2, hkey3, hkey4, hkey5, hkey6, hkey7,
+      hdigest, hmetadata⟩
+  have hcountZero : chunk_count_core 0#u64 chunkSize = ok (.Ok expected) := by
+    simpa [hsize] using hcount
+  unfold decode_regular_file_core
+  simp [hlen, hkey0, hkey1, hkey2, hkey3, hkey4, hkey5, hkey6, hkey7,
+    hdigest, hmetadata, hcountZero, core.result.Result.Insts.CoreOpsTry.branch,
+    hcountEq, hsize, hlba]
+
+lemma regular_file_from_rich_ok (file : RichRegularFileCore) :
+    regular_file_from_rich file = ok (richToRegular file) := by
+  unfold regular_file_from_rich richToRegular
+  simp
+
+theorem validate_rich_regular_file_core_success
+    (file : RichRegularFileCore) (chunkSize : Std.U64)
+    (hvalid : RichRegularFileCoreValid file chunkSize) :
+    validate_rich_regular_file_core file chunkSize = ok (.Ok ()) := by
+  rcases hvalid with ⟨hRegular, hXattrPresent, hXattrAbsent⟩
+  have hfrom := regular_file_from_rich_ok file
+  have hregular := validate_regular_file_core_success
+    (richToRegular file) chunkSize hRegular
+  unfold validate_rich_regular_file_core
+  cases hx : file.xattr_present
+  · rcases hXattrAbsent hx with ⟨hNameZero, hLenZero, hValueZero⟩
+    have hNameEq := u64_eq_zero_of_val_zero file.xattr_name_id hNameZero
+    have hLenEq := u64_eq_zero_of_val_zero file.xattr_value_len hLenZero
+    have hValueEq := u64_eq_zero_of_val_zero file.xattr_value_id hValueZero
+    simp [hfrom, hregular, core.result.Result.Insts.CoreOpsTry.branch,
+      hNameEq, hLenEq, hValueEq]
+  · have hNameNz := hXattrPresent hx
+    have hNameNe := u64_ne_zero_of_val_ne_zero file.xattr_name_id hNameNz
+    simp [hfrom, hregular, core.result.Result.Insts.CoreOpsTry.branch,
+      hNameNe]
+
+theorem validate_hardlink_entry_core_success (entry : HardlinkEntryCore)
+    (hvalid : HardlinkEntryCoreValid entry) :
+    validate_hardlink_entry_core entry = ok (.Ok ()) := by
+  rcases hvalid with ⟨hPathNz, hFileNz, hTargetNz, hExec⟩
+  have hPathNe := u64_ne_zero_of_val_ne_zero entry.path_id hPathNz
+  have hFileNe := u64_ne_zero_of_val_ne_zero entry.file_id hFileNz
+  have hTargetNe :=
+    u64_ne_zero_of_val_ne_zero entry.link_target_path_id hTargetNz
+  have hExecNotGt : ¬ entry.executable_tag > EXECUTABLE_TRUE := by
+    intro hgt
+    have hv : EXECUTABLE_TRUE.val < entry.executable_tag.val := by
+      scalar_tac
+    rw [executable_true_val] at hv
+    omega
+  unfold validate_hardlink_entry_core
+  simp [hPathNe, hFileNe, hTargetNe, hExecNotGt]
+
+theorem validate_symlink_entry_core_success (entry : SymlinkEntryCore)
+    (hvalid : SymlinkEntryCoreValid entry) :
+    validate_symlink_entry_core entry = ok (.Ok ()) := by
+  rcases hvalid with ⟨hPathNz, hFileNz, hTargetNz, hExec⟩
+  have hPathNe := u64_ne_zero_of_val_ne_zero entry.path_id hPathNz
+  have hFileNe := u64_ne_zero_of_val_ne_zero entry.file_id hFileNz
+  have hTargetNe := u64_ne_zero_of_val_ne_zero entry.link_target_id hTargetNz
+  have hExecNotGt : ¬ entry.executable_tag > EXECUTABLE_TRUE := by
+    intro hgt
+    have hv : EXECUTABLE_TRUE.val < entry.executable_tag.val := by
+      scalar_tac
+    rw [executable_true_val] at hv
+    omega
+  unfold validate_symlink_entry_core
+  simp [hPathNe, hFileNe, hTargetNe, hExecNotGt]
+
+theorem validate_directory_entry_core_success (entry : DirectoryEntryCore)
+    (hvalid : DirectoryEntryCoreValid entry) :
+    validate_directory_entry_core entry = ok (.Ok ()) := by
+  rcases hvalid with ⟨hPathNz, hFileNz, hExec⟩
+  have hPathNe := u64_ne_zero_of_val_ne_zero entry.path_id hPathNz
+  have hFileNe := u64_ne_zero_of_val_ne_zero entry.file_id hFileNz
+  have hExecNotGt : ¬ entry.executable_tag > EXECUTABLE_TRUE := by
+    intro hgt
+    have hv : EXECUTABLE_TRUE.val < entry.executable_tag.val := by
+      scalar_tac
+    rw [executable_true_val] at hv
+    omega
+  unfold validate_directory_entry_core
+  simp [hPathNe, hFileNe, hExecNotGt]
+
+theorem validate_manifest_entries_core_success
+    (manifest : ManifestEntriesCore)
+    (hvalid : ManifestEntriesCoreValid manifest) :
+    validate_manifest_entries_core manifest = ok (.Ok ()) := by
+  rcases hvalid with
+    ⟨hChunkNz, hChunkGran, hObjectNz, hNonempty, hEmpty, hNonemptyValid,
+      hEmptyValid, hHardlinkValid, hSymlinkValid, hDirectoryValid, hTarget⟩
+  have hChunk :=
+    validate_chunk_size_success manifest.chunk_size hChunkNz hChunkGran
+  have hObjectNe := u64_ne_zero_of_val_ne_zero manifest.object_id hObjectNz
+  have hNonemptyNe :=
+    u64_ne_zero_of_val_ne_zero manifest.nonempty_regular.size_bytes hNonempty
+  have hEmptyEq :=
+    u64_eq_zero_of_val_zero manifest.empty_regular.size_bytes hEmpty
+  have hNonemptyValidate :=
+    validate_rich_regular_file_core_success manifest.nonempty_regular
+      manifest.chunk_size hNonemptyValid
+  have hEmptyValidate :=
+    validate_rich_regular_file_core_success manifest.empty_regular
+      manifest.chunk_size hEmptyValid
+  have hHardlinkValidate :=
+    validate_hardlink_entry_core_success manifest.hardlink hHardlinkValid
+  have hSymlinkValidate :=
+    validate_symlink_entry_core_success manifest.symlink hSymlinkValid
+  have hDirectoryValidate :=
+    validate_directory_entry_core_success manifest.directory hDirectoryValid
+  unfold validate_manifest_entries_core
+  simp [hChunk, core.result.Result.Insts.CoreOpsTry.branch, hObjectNe,
+    hNonemptyNe, hEmptyEq, hNonemptyValidate, hEmptyValidate,
+    hHardlinkValidate, hSymlinkValidate, hDirectoryValidate, hTarget]
+
+theorem validate_manifest_entries_core_rejects_bad_hardlink_target
+    (manifest : ManifestEntriesCore)
+    (hChunkNz : manifest.chunk_size.val ≠ 0)
+    (hChunkGran : manifest.chunk_size.val % ChunkGranularity = 0)
+    (hObjectNz : manifest.object_id.val ≠ 0)
+    (hNonempty : manifest.nonempty_regular.size_bytes.val ≠ 0)
+    (hEmpty : manifest.empty_regular.size_bytes.val = 0)
+    (hNonemptyValid :
+      RichRegularFileCoreValid manifest.nonempty_regular manifest.chunk_size)
+    (hEmptyValid :
+      RichRegularFileCoreValid manifest.empty_regular manifest.chunk_size)
+    (hHardlinkValid : HardlinkEntryCoreValid manifest.hardlink)
+    (hSymlinkValid : SymlinkEntryCoreValid manifest.symlink)
+    (hDirectoryValid : DirectoryEntryCoreValid manifest.directory)
+    (hbad : manifest.hardlink.link_target_path_id ≠
+      manifest.nonempty_regular.path_id) :
+    validate_manifest_entries_core manifest =
+      ok (.Err RemObjectManifestError.InvalidManifestField) := by
+  have hChunk :=
+    validate_chunk_size_success manifest.chunk_size hChunkNz hChunkGran
+  have hObjectNe := u64_ne_zero_of_val_ne_zero manifest.object_id hObjectNz
+  have hNonemptyNe :=
+    u64_ne_zero_of_val_ne_zero manifest.nonempty_regular.size_bytes hNonempty
+  have hEmptyEq :=
+    u64_eq_zero_of_val_zero manifest.empty_regular.size_bytes hEmpty
+  have hNonemptyValidate :=
+    validate_rich_regular_file_core_success manifest.nonempty_regular
+      manifest.chunk_size hNonemptyValid
+  have hEmptyValidate :=
+    validate_rich_regular_file_core_success manifest.empty_regular
+      manifest.chunk_size hEmptyValid
+  have hHardlinkValidate :=
+    validate_hardlink_entry_core_success manifest.hardlink hHardlinkValid
+  have hSymlinkValidate :=
+    validate_symlink_entry_core_success manifest.symlink hSymlinkValid
+  have hDirectoryValidate :=
+    validate_directory_entry_core_success manifest.directory hDirectoryValid
+  unfold validate_manifest_entries_core
+  simp [hChunk, core.result.Result.Insts.CoreOpsTry.branch, hObjectNe,
+    hNonemptyNe, hEmptyEq, hNonemptyValidate, hEmptyValidate,
+    hHardlinkValidate, hSymlinkValidate, hDirectoryValidate, hbad]
+
+theorem decode_encode_hardlink_entry_core_round_trip
+    (entry : HardlinkEntryCore)
+    (hvalid : HardlinkEntryCoreValid entry) :
+    ∃ wire,
+      encode_hardlink_entry_core entry = ok (.Ok wire) ∧
+      decode_hardlink_entry_core wire = ok (.Ok entry) := by
+  have hvalidate := validate_hardlink_entry_core_success entry hvalid
+  refine ⟨{
+    map_len := FILE_ENTRY_LINK_MAP_LEN,
+    key_path := LINK_KEY_PATH,
+    path_id := entry.path_id,
+    key_file_id := LINK_KEY_FILE_ID,
+    file_id := entry.file_id,
+    key_entry_type := LINK_KEY_ENTRY_TYPE,
+    entry_type := ENTRY_TYPE_HARDLINK,
+    key_executable := LINK_KEY_EXECUTABLE,
+    executable_tag := entry.executable_tag,
+    key_size_bytes := LINK_KEY_SIZE_BYTES,
+    size_bytes := 0#u64,
+    key_chunk_count := LINK_KEY_CHUNK_COUNT,
+    chunk_count := 0#u64,
+    key_link_target := LINK_KEY_LINK_TARGET,
+    link_target_id := entry.link_target_path_id,
+    key_first_chunk_lba := LINK_KEY_FIRST_CHUNK_LBA,
+    first_chunk_lba_is_null := true,
+    key_metadata_preservation_data := LINK_KEY_METADATA_PRESERVATION_DATA,
+    metadata_preservation_data_empty := true,
+    file_sha256_present := false
+  }, ?_, ?_⟩
+  · unfold encode_hardlink_entry_core
+    simp [hvalidate, core.result.Result.Insts.CoreOpsTry.branch]
+  · unfold decode_hardlink_entry_core
+    simp [hvalidate, core.result.Result.Insts.CoreOpsTry.branch]
+
+theorem decode_encode_symlink_entry_core_round_trip
+    (entry : SymlinkEntryCore)
+    (hvalid : SymlinkEntryCoreValid entry) :
+    ∃ wire,
+      encode_symlink_entry_core entry = ok (.Ok wire) ∧
+      decode_symlink_entry_core wire = ok (.Ok entry) := by
+  have hvalidate := validate_symlink_entry_core_success entry hvalid
+  refine ⟨{
+    map_len := FILE_ENTRY_LINK_MAP_LEN,
+    key_path := LINK_KEY_PATH,
+    path_id := entry.path_id,
+    key_file_id := LINK_KEY_FILE_ID,
+    file_id := entry.file_id,
+    key_entry_type := LINK_KEY_ENTRY_TYPE,
+    entry_type := ENTRY_TYPE_SYMLINK,
+    key_executable := LINK_KEY_EXECUTABLE,
+    executable_tag := entry.executable_tag,
+    key_size_bytes := LINK_KEY_SIZE_BYTES,
+    size_bytes := 0#u64,
+    key_chunk_count := LINK_KEY_CHUNK_COUNT,
+    chunk_count := 0#u64,
+    key_link_target := LINK_KEY_LINK_TARGET,
+    link_target_id := entry.link_target_id,
+    key_first_chunk_lba := LINK_KEY_FIRST_CHUNK_LBA,
+    first_chunk_lba_is_null := true,
+    key_metadata_preservation_data := LINK_KEY_METADATA_PRESERVATION_DATA,
+    metadata_preservation_data_empty := true,
+    file_sha256_present := false
+  }, ?_, ?_⟩
+  · unfold encode_symlink_entry_core
+    simp [hvalidate, core.result.Result.Insts.CoreOpsTry.branch]
+  · unfold decode_symlink_entry_core
+    simp [hvalidate, core.result.Result.Insts.CoreOpsTry.branch]
+
+theorem decode_encode_directory_entry_core_round_trip
+    (entry : DirectoryEntryCore)
+    (hvalid : DirectoryEntryCoreValid entry) :
+    ∃ wire,
+      encode_directory_entry_core entry = ok (.Ok wire) ∧
+      decode_directory_entry_core wire = ok (.Ok entry) := by
+  have hvalidate := validate_directory_entry_core_success entry hvalid
+  refine ⟨{
+    map_len := FILE_ENTRY_DIRECTORY_MAP_LEN,
+    key_path := DIRECTORY_KEY_PATH,
+    path_id := entry.path_id,
+    key_file_id := DIRECTORY_KEY_FILE_ID,
+    file_id := entry.file_id,
+    key_entry_type := DIRECTORY_KEY_ENTRY_TYPE,
+    entry_type := ENTRY_TYPE_DIRECTORY,
+    key_executable := DIRECTORY_KEY_EXECUTABLE,
+    executable_tag := entry.executable_tag,
+    key_size_bytes := DIRECTORY_KEY_SIZE_BYTES,
+    size_bytes := 0#u64,
+    key_chunk_count := DIRECTORY_KEY_CHUNK_COUNT,
+    chunk_count := 0#u64,
+    key_first_chunk_lba := DIRECTORY_KEY_FIRST_CHUNK_LBA,
+    first_chunk_lba_is_null := true,
+    key_metadata_preservation_data :=
+      DIRECTORY_KEY_METADATA_PRESERVATION_DATA,
+    metadata_preservation_data_empty := true,
+    file_sha256_present := false,
+    link_target_present := false
+  }, ?_, ?_⟩
+  · unfold encode_directory_entry_core
+    simp [hvalidate, core.result.Result.Insts.CoreOpsTry.branch]
+  · unfold decode_directory_entry_core
+    simp [hvalidate, core.result.Result.Insts.CoreOpsTry.branch]
+
+theorem decode_encode_rich_regular_file_core_round_trip
+    (file : RichRegularFileCore) (chunkSize : Std.U64)
+    (hvalid : RichRegularFileCoreValid file chunkSize) :
+    ∃ wire,
+      encode_rich_regular_file_core file chunkSize = ok (.Ok wire) ∧
+      decode_rich_regular_file_core wire chunkSize = ok (.Ok file) := by
+  rcases hvalid with ⟨hRegular, hXattrPresent, hXattrAbsent⟩
+  rcases hRegular with
+    ⟨hChunkNz, hChunkGran, hPathNz, hFileNz, hExec, hZeroShape,
+      hNonzeroShape, hCountNoOverflow⟩
+  have hZeroShapeFile :
+      file.size_bytes.val = 0 →
+        file.first_chunk_lba_present = false ∧ file.first_chunk_lba.val = 0 := by
+    intro h
+    simpa [richToRegular] using hZeroShape h
+  have hNonzeroShapeFile :
+      file.size_bytes.val ≠ 0 → file.first_chunk_lba_present = true := by
+    intro h
+    simpa [richToRegular] using hNonzeroShape h
+  have hCountNoOverflowFile :
+      chunkCountSpec file.size_bytes chunkSize < 2 ^ 64 := by
+    simpa [richToRegular] using hCountNoOverflow
+  have hvalid' : RichRegularFileCoreValid file chunkSize :=
+    ⟨⟨hChunkNz, hChunkGran, hPathNz, hFileNz, hExec, hZeroShape,
+      hNonzeroShape, hCountNoOverflow⟩, hXattrPresent, hXattrAbsent⟩
+  have hvalidate :=
+    validate_rich_regular_file_core_success file chunkSize hvalid'
+  rcases chunk_count_core_success file.size_bytes chunkSize hChunkNz hChunkGran
+      hCountNoOverflowFile with
+    ⟨count, hcount, hcountVal⟩
+  refine ⟨RichRegularFileWireOfCore file count, ?_, ?_⟩
+  · unfold encode_rich_regular_file_core RichRegularFileWireOfCore
+    cases hx : file.xattr_present <;>
+      simp [hvalidate, core.result.Result.Insts.CoreOpsTry.branch, hcount]
+  · cases hx : file.xattr_present
+    · rcases hXattrAbsent hx with ⟨hNameZero, hLenZero, hValueZero⟩
+      have hNameEq := u64_eq_zero_of_val_zero file.xattr_name_id hNameZero
+      have hLenEq := u64_eq_zero_of_val_zero file.xattr_value_len hLenZero
+      have hValueEq := u64_eq_zero_of_val_zero file.xattr_value_id hValueZero
+      by_cases hSizeZero : file.size_bytes.val = 0
+      · have hSizeEq : file.size_bytes = 0#u64 :=
+          u64_eq_zero_of_val_zero file.size_bytes hSizeZero
+        rcases hZeroShapeFile hSizeZero with ⟨hPresent, hFirstZeroVal⟩
+        have hFirstEq : file.first_chunk_lba = 0#u64 :=
+          u64_eq_zero_of_val_zero file.first_chunk_lba hFirstZeroVal
+        have hcountZero : chunk_count_core 0#u64 chunkSize =
+            ok (.Ok count) := by
+          simpa [hSizeEq] using hcount
+        have hfileZero :
+            {
+              path_id := file.path_id,
+              file_id := file.file_id,
+              size_bytes := 0#u64,
+              file_sha256 := file.file_sha256,
+              first_chunk_lba_present := false,
+              first_chunk_lba := 0#u64,
+              executable_tag := file.executable_tag,
+              xattr_present := false,
+              xattr_name_id := 0#u64,
+              xattr_value_len := 0#u64,
+              xattr_value_id := 0#u64
+            } = file := by
+          cases file
+          simp_all
+        unfold decode_rich_regular_file_core RichRegularFileWireOfCore
+        simp [hx, hcountZero, hcountVal, hSizeEq, hPresent,
+          hNameEq, hLenEq, hValueEq, hfileZero, hvalidate,
+          core.result.Result.Insts.CoreOpsTry.branch]
+      · have hSizeNe : file.size_bytes ≠ 0#u64 :=
+          u64_ne_zero_of_val_ne_zero file.size_bytes hSizeZero
+        have hPresent := hNonzeroShapeFile hSizeZero
+        have hfilePresent :
+            {
+              path_id := file.path_id,
+              file_id := file.file_id,
+              size_bytes := file.size_bytes,
+              file_sha256 := file.file_sha256,
+              first_chunk_lba_present := true,
+              first_chunk_lba := file.first_chunk_lba,
+              executable_tag := file.executable_tag,
+              xattr_present := false,
+              xattr_name_id := 0#u64,
+              xattr_value_len := 0#u64,
+              xattr_value_id := 0#u64
+            } = file := by
+          cases file
+          simp_all
+        unfold decode_rich_regular_file_core RichRegularFileWireOfCore
+        simp [hx, hcount, hcountVal, hSizeNe, hPresent, hNameEq, hLenEq,
+          hValueEq, hfilePresent, hvalidate,
+          core.result.Result.Insts.CoreOpsTry.branch]
+    · have hNameNz := hXattrPresent hx
+      have hNameNe := u64_ne_zero_of_val_ne_zero file.xattr_name_id hNameNz
+      by_cases hSizeZero : file.size_bytes.val = 0
+      · have hSizeEq : file.size_bytes = 0#u64 :=
+          u64_eq_zero_of_val_zero file.size_bytes hSizeZero
+        rcases hZeroShapeFile hSizeZero with ⟨hPresent, hFirstZeroVal⟩
+        have hFirstEq : file.first_chunk_lba = 0#u64 :=
+          u64_eq_zero_of_val_zero file.first_chunk_lba hFirstZeroVal
+        have hcountZero : chunk_count_core 0#u64 chunkSize =
+            ok (.Ok count) := by
+          simpa [hSizeEq] using hcount
+        have hfileZero :
+            {
+              path_id := file.path_id,
+              file_id := file.file_id,
+              size_bytes := 0#u64,
+              file_sha256 := file.file_sha256,
+              first_chunk_lba_present := false,
+              first_chunk_lba := 0#u64,
+              executable_tag := file.executable_tag,
+              xattr_present := true,
+              xattr_name_id := file.xattr_name_id,
+              xattr_value_len := file.xattr_value_len,
+              xattr_value_id := file.xattr_value_id
+            } = file := by
+          cases file
+          simp_all
+        unfold decode_rich_regular_file_core RichRegularFileWireOfCore
+        simp [hx, hcountZero, hcountVal, hSizeEq, hPresent,
+          hNameNe, hfileZero, hvalidate,
+          core.result.Result.Insts.CoreOpsTry.branch,
+          METADATA_PRESERVATION_XATTRS_MAP_LEN,
+          METADATA_PRESERVATION_EMPTY_MAP_LEN, METADATA_KEY_XATTRS,
+          XATTRS_ONE_ENTRY_LEN]
+      · have hSizeNe : file.size_bytes ≠ 0#u64 :=
+          u64_ne_zero_of_val_ne_zero file.size_bytes hSizeZero
+        have hPresent := hNonzeroShapeFile hSizeZero
+        have hfilePresent :
+            {
+              path_id := file.path_id,
+              file_id := file.file_id,
+              size_bytes := file.size_bytes,
+              file_sha256 := file.file_sha256,
+              first_chunk_lba_present := true,
+              first_chunk_lba := file.first_chunk_lba,
+              executable_tag := file.executable_tag,
+              xattr_present := true,
+              xattr_name_id := file.xattr_name_id,
+              xattr_value_len := file.xattr_value_len,
+              xattr_value_id := file.xattr_value_id
+            } = file := by
+          cases file
+          simp_all
+        unfold decode_rich_regular_file_core RichRegularFileWireOfCore
+        simp [hx, hcount, hcountVal, hSizeNe, hPresent, hNameNe, hfilePresent,
+          hvalidate,
+          core.result.Result.Insts.CoreOpsTry.branch,
+          METADATA_PRESERVATION_XATTRS_MAP_LEN,
+          METADATA_PRESERVATION_EMPTY_MAP_LEN, METADATA_KEY_XATTRS,
+          XATTRS_ONE_ENTRY_LEN]
+
+/-- Bounded multi-entry manifest theorem.
+
+    This covers the fixed writer order modeled by `ManifestEntriesCore`:
+    nonempty regular file with one xattr, empty regular file, hardlink,
+    symlink, and directory. The hardlink target is required to equal the
+    preceding regular file path id, modeling the production "seen regular
+    paths" check without proving arbitrary `Vec` traversal. -/
+theorem decode_encode_manifest_entries_core_round_trip
+    (manifest : ManifestEntriesCore)
+    (hvalid : ManifestEntriesCoreValid manifest) :
+    ∃ wire,
+      encode_manifest_entries_core manifest = ok (.Ok wire) ∧
+      decode_manifest_entries_core wire manifest.chunk_size =
+        ok (.Ok manifest) := by
+  rcases hvalid with
+    ⟨hChunkNz, hChunkGran, hObjectNz, hNonempty, hEmpty, hNonemptyValid,
+      hEmptyValid, hHardlinkValid, hSymlinkValid, hDirectoryValid, hTarget⟩
+  have hvalid' : ManifestEntriesCoreValid manifest :=
+    ⟨hChunkNz, hChunkGran, hObjectNz, hNonempty, hEmpty, hNonemptyValid,
+      hEmptyValid, hHardlinkValid, hSymlinkValid, hDirectoryValid, hTarget⟩
+  have hvalidate :=
+    validate_manifest_entries_core_success manifest hvalid'
+  rcases decode_encode_rich_regular_file_core_round_trip
+      manifest.nonempty_regular manifest.chunk_size hNonemptyValid with
+    ⟨nonemptyWire, hNonemptyEncode, hNonemptyDecode⟩
+  rcases decode_encode_rich_regular_file_core_round_trip
+      manifest.empty_regular manifest.chunk_size hEmptyValid with
+    ⟨emptyWire, hEmptyEncode, hEmptyDecode⟩
+  rcases decode_encode_hardlink_entry_core_round_trip
+      manifest.hardlink hHardlinkValid with
+    ⟨hardlinkWire, hHardlinkEncode, hHardlinkDecode⟩
+  rcases decode_encode_symlink_entry_core_round_trip
+      manifest.symlink hSymlinkValid with
+    ⟨symlinkWire, hSymlinkEncode, hSymlinkDecode⟩
+  rcases decode_encode_directory_entry_core_round_trip
+      manifest.directory hDirectoryValid with
+    ⟨directoryWire, hDirectoryEncode, hDirectoryDecode⟩
+  refine ⟨{
+    root_map_len := ROOT_MAP_LEN,
+    key_object_id := ROOT_KEY_OBJECT_ID,
+    object_id := manifest.object_id,
+    key_chunk_size := ROOT_KEY_CHUNK_SIZE,
+    chunk_size := manifest.chunk_size,
+    key_file_entries := ROOT_KEY_FILE_ENTRIES,
+    file_entries_len := FILE_ENTRIES_LEN_BOUNDED,
+    nonempty_regular := nonemptyWire,
+    empty_regular := emptyWire,
+    hardlink := hardlinkWire,
+    symlink := symlinkWire,
+    directory := directoryWire,
+    key_schema_version := ROOT_KEY_SCHEMA_VERSION,
+    schema_version := SCHEMA_VERSION,
+    key_object_metadata := ROOT_KEY_OBJECT_METADATA,
+    object_metadata_empty := true,
+    key_caller_object_id := ROOT_KEY_CALLER_OBJECT_ID,
+    caller_object_id := manifest.caller_object_id,
+    key_external_references := ROOT_KEY_EXTERNAL_REFERENCES,
+    external_references_empty := true,
+    trailing_data := false
+  }, ?_, ?_⟩
+  · unfold encode_manifest_entries_core
+    simp [hvalidate, core.result.Result.Insts.CoreOpsTry.branch,
+      hNonemptyEncode, hEmptyEncode, hHardlinkEncode, hSymlinkEncode,
+      hDirectoryEncode]
+  · unfold decode_manifest_entries_core
+    simp [hNonemptyDecode, hEmptyDecode, hHardlinkDecode, hSymlinkDecode,
+      hDirectoryDecode, hvalidate, core.result.Result.Insts.CoreOpsTry.branch]
+
+theorem distinct5_core_success
+    (first second third fourth fifth : Std.U64)
+    (hvalid : Distinct5Core first second third fourth fifth) :
+    distinct5_core first second third fourth fifth = ok (.Ok ()) := by
+  rcases hvalid with
+    ⟨h12, h13, h14, h15, h23, h24, h25, h34, h35, h45⟩
+  unfold distinct5_core
+  simp [h12, h13, h14, h15, h23, h24, h25, h34, h35, h45]
+
+theorem distinct5_core_rejects_first_pair
+    (first second third fourth fifth : Std.U64)
+    (hdup : first = second) :
+    distinct5_core first second third fourth fifth =
+      ok (.Err RemObjectManifestError.InvalidManifestField) := by
+  unfold distinct5_core
+  simp [hdup]
+
+theorem distinct5_core_rejects_fourth_fifth
+    (first second third fourth fifth : Std.U64)
+    (hprefix :
+      first ≠ second ∧ first ≠ third ∧ first ≠ fourth ∧ first ≠ fifth ∧
+      second ≠ third ∧ second ≠ fourth ∧ second ≠ fifth ∧
+      third ≠ fourth ∧ third ≠ fifth)
+    (hdup : fourth = fifth) :
+    distinct5_core first second third fourth fifth =
+      ok (.Err RemObjectManifestError.InvalidManifestField) := by
+  rcases hprefix with
+    ⟨h12, h13, h14, h15, h23, h24, h25, h34, h35⟩
+  unfold distinct5_core
+  simp [h12, h13, h15, h23, h25, h35, hdup]
+
+theorem hardlink_target_seen_regular_prefix_two_core_success
+    (target firstRegular secondRegular : Std.U64)
+    (hseen : target = firstRegular ∨ target = secondRegular) :
+    hardlink_target_seen_regular_prefix_two_core target firstRegular
+      secondRegular = ok (.Ok ()) := by
+  unfold hardlink_target_seen_regular_prefix_two_core
+  rcases hseen with hfirst | hsecond
+  · simp [hfirst]
+  · by_cases hfirst : target = firstRegular
+    · simp [hfirst]
+    · simp [hsecond]
+
+theorem hardlink_target_seen_regular_prefix_two_core_rejects_unseen
+    (target firstRegular secondRegular : Std.U64)
+    (hfirst : target ≠ firstRegular)
+    (hsecond : target ≠ secondRegular) :
+    hardlink_target_seen_regular_prefix_two_core target firstRegular
+      secondRegular =
+        ok (.Err RemObjectManifestError.InvalidManifestField) := by
+  unfold hardlink_target_seen_regular_prefix_two_core
+  simp [hfirst, hsecond]
+
+theorem validate_planner_entry_core_success
+    (entry : PlannerEntryCore)
+    (hvalid : PlannerEntryCoreValid entry) :
+    validate_planner_entry_core entry = ok (.Ok ()) := by
+  rcases hvalid with ⟨hLocal, hPathNz, hFileNz, hKind⟩
+  have hPathNe := u64_ne_zero_of_val_ne_zero entry.path_id hPathNz
+  have hFileNe := u64_ne_zero_of_val_ne_zero entry.file_id hFileNz
+  unfold validate_planner_entry_core
+  rcases hKind with hRegular | hHardlink | hSymlink | hDirectory
+  · rcases hRegular with ⟨hType, hTargetZeroVal⟩
+    have hTargetEq :=
+      u64_eq_zero_of_val_zero entry.link_target_path_id hTargetZeroVal
+    simp [hLocal, hPathNe, hFileNe, hType, hTargetEq]
+  · rcases hHardlink with ⟨hType, hTargetNz, hSeen⟩
+    have hTargetNe :=
+      u64_ne_zero_of_val_ne_zero entry.link_target_path_id hTargetNz
+    have hNotRegular : entry.entry_type ≠ PLANNER_ENTRY_REGULAR := by
+      intro hRegular
+      have hEq : PLANNER_ENTRY_HARDLINK = PLANNER_ENTRY_REGULAR := by
+        rw [← hType, hRegular]
+      unfold PLANNER_ENTRY_HARDLINK PLANNER_ENTRY_REGULAR at hEq
+      simp at hEq
+    unfold PLANNER_ENTRY_REGULAR PLANNER_ENTRY_HARDLINK PLANNER_ENTRY_SYMLINK
+      PLANNER_ENTRY_DIRECTORY at *
+    simp [hLocal, hPathNe, hFileNe, hType, hTargetNe, hSeen]
+  · rcases hSymlink with ⟨hType, hTargetNz⟩
+    have hTargetNe :=
+      u64_ne_zero_of_val_ne_zero entry.link_target_path_id hTargetNz
+    have hNotRegular : entry.entry_type ≠ PLANNER_ENTRY_REGULAR := by
+      intro hRegular
+      have hEq : PLANNER_ENTRY_SYMLINK = PLANNER_ENTRY_REGULAR := by
+        rw [← hType, hRegular]
+      unfold PLANNER_ENTRY_SYMLINK PLANNER_ENTRY_REGULAR at hEq
+      simp at hEq
+    have hNotHardlink : entry.entry_type ≠ PLANNER_ENTRY_HARDLINK := by
+      intro hHardlink
+      have hEq : PLANNER_ENTRY_SYMLINK = PLANNER_ENTRY_HARDLINK := by
+        rw [← hType, hHardlink]
+      unfold PLANNER_ENTRY_SYMLINK PLANNER_ENTRY_HARDLINK at hEq
+      simp at hEq
+    unfold PLANNER_ENTRY_REGULAR PLANNER_ENTRY_HARDLINK PLANNER_ENTRY_SYMLINK
+      PLANNER_ENTRY_DIRECTORY at *
+    simp [hLocal, hPathNe, hFileNe, hType, hTargetNe]
+  · rcases hDirectory with ⟨hType, hTargetZeroVal⟩
+    have hTargetEq :=
+      u64_eq_zero_of_val_zero entry.link_target_path_id hTargetZeroVal
+    have hNotRegular : entry.entry_type ≠ PLANNER_ENTRY_REGULAR := by
+      intro hRegular
+      have hEq : PLANNER_ENTRY_DIRECTORY = PLANNER_ENTRY_REGULAR := by
+        rw [← hType, hRegular]
+      unfold PLANNER_ENTRY_DIRECTORY PLANNER_ENTRY_REGULAR at hEq
+      simp at hEq
+    have hNotHardlink : entry.entry_type ≠ PLANNER_ENTRY_HARDLINK := by
+      intro hHardlink
+      have hEq : PLANNER_ENTRY_DIRECTORY = PLANNER_ENTRY_HARDLINK := by
+        rw [← hType, hHardlink]
+      unfold PLANNER_ENTRY_DIRECTORY PLANNER_ENTRY_HARDLINK at hEq
+      simp at hEq
+    have hNotSymlink : entry.entry_type ≠ PLANNER_ENTRY_SYMLINK := by
+      intro hSymlink
+      have hEq : PLANNER_ENTRY_DIRECTORY = PLANNER_ENTRY_SYMLINK := by
+        rw [← hType, hSymlink]
+      unfold PLANNER_ENTRY_DIRECTORY PLANNER_ENTRY_SYMLINK at hEq
+      simp at hEq
+    unfold PLANNER_ENTRY_REGULAR PLANNER_ENTRY_HARDLINK PLANNER_ENTRY_SYMLINK
+      PLANNER_ENTRY_DIRECTORY at *
+    simp [hLocal, hPathNe, hFileNe, hType, hTargetEq]
+
+theorem planner_fold_step_core_success
+    (state : PlannerFoldStateCore)
+    (entry : PlannerEntryCore)
+    (hvalid : PlannerStepCoreValid state entry) :
+    ∃ next,
+      planner_fold_step_core state entry = ok (.Ok next) ∧
+      next.accepted_count.val = state.accepted_count.val + 1 ∧
+      (entry.entry_type = PLANNER_ENTRY_REGULAR →
+        next.regular_seen_count.val = state.regular_seen_count.val + 1) ∧
+      (entry.entry_type ≠ PLANNER_ENTRY_REGULAR →
+        next.regular_seen_count = state.regular_seen_count) := by
+  rcases hvalid with
+    ⟨hEntry, hPathSeen, hFileSeen, hAcceptedLt, hRegularLt⟩
+  have hEntryValidate := validate_planner_entry_core_success entry hEntry
+  have hPathSeenFalse : entry.path_seen_before = false := hPathSeen
+  have hFileSeenFalse : entry.file_id_seen_before = false := hFileSeen
+  rcases checked_add_ok state.accepted_count 1#u64 hAcceptedLt with
+    ⟨acceptedCount, hAcceptedAdd, hAcceptedVal⟩
+  by_cases hRegular : entry.entry_type = PLANNER_ENTRY_REGULAR
+  · rcases checked_add_ok state.regular_seen_count 1#u64
+        (hRegularLt hRegular) with
+      ⟨regularCount, hRegularAdd, hRegularVal⟩
+    refine ⟨{
+      accepted_count := acceptedCount,
+      regular_seen_count := regularCount
+    }, ?_, ?_, ?_, ?_⟩
+    · unfold planner_fold_step_core
+      simp [hEntryValidate, core.result.Result.Insts.CoreOpsTry.branch,
+        hPathSeenFalse, hFileSeenFalse, hAcceptedAdd, hRegular, hRegularAdd]
+    · exact hAcceptedVal
+    · intro _
+      exact hRegularVal
+    · intro hNot
+      contradiction
+  · refine ⟨{
+      accepted_count := acceptedCount,
+      regular_seen_count := state.regular_seen_count
+    }, ?_, ?_, ?_, ?_⟩
+    · unfold planner_fold_step_core
+      simp [hEntryValidate, core.result.Result.Insts.CoreOpsTry.branch,
+        hPathSeenFalse, hFileSeenFalse, hAcceptedAdd, hRegular]
+    · exact hAcceptedVal
+    · intro hReg
+      contradiction
+    · intro _
+      rfl
+
+/-- `BTreeSet::insert` returns true exactly when the value was not already
+    present. This proof-facing scalar contract is the membership bridge used by
+    the planner extraction. -/
+theorem validate_insert_membership_core_success
+    (seenBefore inserted : Bool)
+    (hvalid : InsertMembershipCoreValid seenBefore inserted) :
+    validate_insert_membership_core seenBefore inserted = ok (.Ok ()) := by
+  rcases hvalid with hNew | hDuplicate
+  · rcases hNew with ⟨hSeen, hInserted⟩
+    unfold validate_insert_membership_core
+    simp [hSeen, hInserted]
+  · rcases hDuplicate with ⟨hSeen, hInserted⟩
+    unfold validate_insert_membership_core
+    simp [hSeen, hInserted]
+
+theorem validate_planner_membership_facts_core_success
+    (source : PlannerSourceEntryCore)
+    (facts : PlannerMembershipFactsCore)
+    (hvalid : PlannerMembershipFactsCoreValid source facts) :
+    validate_planner_membership_facts_core source facts = ok (.Ok ()) := by
+  rcases hvalid with ⟨hPath, hFile, hRegularFacts⟩
+  have hPathValidate :=
+    validate_insert_membership_core_success
+      facts.path_seen_before facts.path_inserted hPath
+  have hFileValidate :=
+    validate_insert_membership_core_success
+      facts.file_id_seen_before facts.file_id_inserted hFile
+  unfold validate_planner_membership_facts_core
+  by_cases hRegular : source.entry_type = PLANNER_ENTRY_REGULAR
+  · rcases hRegularFacts with hRegularCase | hNonRegularCase
+    · rcases hRegularCase with
+        ⟨_, hRegularSeen, hRegularInserted⟩
+      have hRegularValidateClean :
+          validate_insert_membership_core false true = ok (.Ok ()) := by
+        unfold validate_insert_membership_core
+        simp
+      simp [hPathValidate, hFileValidate, hRegular,
+        hRegularSeen, hRegularInserted, hRegularValidateClean,
+        core.result.Result.Insts.CoreOpsTry.branch]
+    · rcases hNonRegularCase with ⟨hNotRegular, _⟩
+      contradiction
+  · rcases hRegularFacts with hRegularCase | hNonRegularCase
+    · rcases hRegularCase with ⟨hIsRegular, _⟩
+      contradiction
+    · rcases hNonRegularCase with ⟨_, hRegularInserted⟩
+      simp [hPathValidate, hFileValidate, hRegular, hRegularInserted,
+        core.result.Result.Insts.CoreOpsTry.branch]
+
+theorem planner_entry_from_membership_core_success
+    (source : PlannerSourceEntryCore)
+    (facts : PlannerMembershipFactsCore)
+    (hvalid : PlannerMembershipFactsCoreValid source facts) :
+    planner_entry_from_membership_core source facts =
+      ok (.Ok (PlannerEntryOfSourceFacts source facts)) := by
+  have hFactsValidate :=
+    validate_planner_membership_facts_core_success source facts hvalid
+  unfold planner_entry_from_membership_core PlannerEntryOfSourceFacts
+  simp [hFactsValidate, core.result.Result.Insts.CoreOpsTry.branch]
+
+theorem planner_fold_step_from_membership_core_success
+    (state : PlannerFoldStateCore)
+    (source : PlannerSourceEntryCore)
+    (facts : PlannerMembershipFactsCore)
+    (hvalid : PlannerMembershipStepCoreValid state source facts) :
+    ∃ next,
+      planner_fold_step_from_membership_core state source facts =
+        ok (.Ok next) ∧
+      next.accepted_count.val = state.accepted_count.val + 1 ∧
+      (source.entry_type = PLANNER_ENTRY_REGULAR →
+        next.regular_seen_count.val = state.regular_seen_count.val + 1) ∧
+      (source.entry_type ≠ PLANNER_ENTRY_REGULAR →
+        next.regular_seen_count = state.regular_seen_count) := by
+  rcases hvalid with
+    ⟨hSource, hFacts, hPathSeen, hFileSeen, hAcceptedLt, hRegularLt⟩
+  have hEntryFrom :=
+    planner_entry_from_membership_core_success source facts hFacts
+  have hStep :
+      PlannerStepCoreValid state (PlannerEntryOfSourceFacts source facts) := by
+    unfold PlannerStepCoreValid PlannerEntryOfSourceFacts
+    exact ⟨hSource, hPathSeen, hFileSeen, hAcceptedLt, hRegularLt⟩
+  rcases planner_fold_step_core_success
+      state (PlannerEntryOfSourceFacts source facts) hStep with
+    ⟨next, hNext, hAccepted, hRegular, hNonRegular⟩
+  refine ⟨next, ?_, hAccepted, ?_, ?_⟩
+  · unfold planner_fold_step_from_membership_core
+    simp [hEntryFrom, hNext, core.result.Result.Insts.CoreOpsTry.branch]
+  · intro hReg
+    exact hRegular hReg
+  · intro hNotReg
+    exact hNonRegular hNotReg
+
+/-- Arbitrary manifest-planner fold theorem.
+
+    The Rust extraction exposes the production loop as a generated fold step.
+    This Lean fold ranges over an arbitrary list of entry summaries and proves
+    that any trace whose every generated step is valid reaches a final state.
+    The set-membership facts (`path_seen_before`, `file_id_seen_before`, and
+    `hardlink_target_seen_regular_before`) are the abstracted `BTreeSet`
+    lookups from `plan_rem_tar_object`. -/
+theorem planner_fold_core_success_arbitrary
+    (state : PlannerFoldStateCore)
+    (entries : List PlannerEntryCore)
+    (hvalid : PlannerFoldTraceValid state entries) :
+    ∃ final, plannerFoldCore state entries = some final := by
+  induction entries generalizing state with
+  | nil =>
+      exact ⟨state, rfl⟩
+  | cons entry tail ih =>
+      rcases hvalid with ⟨hStep, hTail⟩
+      rcases planner_fold_step_core_success state entry hStep with
+        ⟨next, hNext, _, _, _⟩
+      rcases ih next (hTail next hNext) with ⟨final, hFinal⟩
+      refine ⟨final, ?_⟩
+      unfold plannerFoldCore
+      simp [hNext, hFinal]
+
+/-- Arbitrary manifest-planner membership bridge theorem.
+
+    Each element carries a production-source entry plus the scalar membership
+    facts corresponding to the planner's `BTreeSet` contains/insert results.
+    If every generated step satisfies that membership contract and the planner
+    validity checks, the membership bridge reaches a final fold state for an
+    arbitrary list of entries. -/
+theorem planner_membership_fold_core_success_arbitrary
+    (state : PlannerFoldStateCore)
+    (entries : List PlannerMembershipTraceEntry)
+    (hvalid : PlannerMembershipFoldTraceValid state entries) :
+    ∃ final, plannerMembershipFoldCore state entries = some final := by
+  induction entries generalizing state with
+  | nil =>
+      exact ⟨state, rfl⟩
+  | cons entry tail ih =>
+      rcases hvalid with ⟨hStep, hTail⟩
+      rcases planner_fold_step_from_membership_core_success
+          state entry.source entry.facts hStep with
+        ⟨next, hNext, _, _, _⟩
+      rcases ih next (hTail next hNext) with ⟨final, hFinal⟩
+      refine ⟨final, ?_⟩
+      unfold plannerMembershipFoldCore
+      simp [hNext, hFinal]
+
+theorem validate_manifest_array_core_success
+    (manifest : ManifestEntriesCore)
+    (hvalid : ManifestArrayCoreValid manifest) :
+    validate_manifest_array_core manifest = ok (.Ok ()) := by
+  rcases hvalid with
+    ⟨hChunkNz, hChunkGran, hObjectNz, hNonempty, hEmpty, hNonemptyValid,
+      hEmptyValid, hHardlinkValid, hSymlinkValid, hDirectoryValid,
+      hDistinctPaths, hDistinctFiles, hTargetSeen⟩
+  have hChunk :=
+    validate_chunk_size_success manifest.chunk_size hChunkNz hChunkGran
+  have hObjectNe := u64_ne_zero_of_val_ne_zero manifest.object_id hObjectNz
+  have hNonemptyNe :=
+    u64_ne_zero_of_val_ne_zero manifest.nonempty_regular.size_bytes hNonempty
+  have hEmptyEq :=
+    u64_eq_zero_of_val_zero manifest.empty_regular.size_bytes hEmpty
+  have hNonemptyValidate :=
+    validate_rich_regular_file_core_success manifest.nonempty_regular
+      manifest.chunk_size hNonemptyValid
+  have hEmptyValidate :=
+    validate_rich_regular_file_core_success manifest.empty_regular
+      manifest.chunk_size hEmptyValid
+  have hHardlinkValidate :=
+    validate_hardlink_entry_core_success manifest.hardlink hHardlinkValid
+  have hSymlinkValidate :=
+    validate_symlink_entry_core_success manifest.symlink hSymlinkValid
+  have hDirectoryValidate :=
+    validate_directory_entry_core_success manifest.directory hDirectoryValid
+  have hPathDistinct :=
+    distinct5_core_success
+      manifest.nonempty_regular.path_id
+      manifest.empty_regular.path_id
+      manifest.hardlink.path_id
+      manifest.symlink.path_id
+      manifest.directory.path_id
+      hDistinctPaths
+  have hFileDistinct :=
+    distinct5_core_success
+      manifest.nonempty_regular.file_id
+      manifest.empty_regular.file_id
+      manifest.hardlink.file_id
+      manifest.symlink.file_id
+      manifest.directory.file_id
+      hDistinctFiles
+  have hTarget :=
+    hardlink_target_seen_regular_prefix_two_core_success
+      manifest.hardlink.link_target_path_id
+      manifest.nonempty_regular.path_id
+      manifest.empty_regular.path_id
+      hTargetSeen
+  unfold validate_manifest_array_core
+  simp [hChunk, core.result.Result.Insts.CoreOpsTry.branch, hObjectNe,
+    hNonemptyNe, hEmptyEq, hNonemptyValidate, hEmptyValidate,
+    hHardlinkValidate, hSymlinkValidate, hDirectoryValidate, hPathDistinct,
+    hFileDistinct, hTarget]
+
+/-- Fixed-capacity array/fold theorem.
+
+    This extends the bounded entry theorem with path/file-id distinctness and
+    a two-regular-prefix model of production hardlink target accumulation.
+    It still does not prove arbitrary `Vec` traversal or production `BTreeSet`
+    internals. -/
+theorem decode_encode_manifest_array_core_round_trip
+    (manifest : ManifestEntriesCore)
+    (hvalid : ManifestArrayCoreValid manifest) :
+    ∃ wire,
+      encode_manifest_array_core manifest = ok (.Ok wire) ∧
+      decode_manifest_array_core wire manifest.chunk_size =
+        ok (.Ok manifest) := by
+  rcases hvalid with
+    ⟨hChunkNz, hChunkGran, hObjectNz, hNonempty, hEmpty, hNonemptyValid,
+      hEmptyValid, hHardlinkValid, hSymlinkValid, hDirectoryValid,
+      hDistinctPaths, hDistinctFiles, hTargetSeen⟩
+  have hvalid' : ManifestArrayCoreValid manifest :=
+    ⟨hChunkNz, hChunkGran, hObjectNz, hNonempty, hEmpty, hNonemptyValid,
+      hEmptyValid, hHardlinkValid, hSymlinkValid, hDirectoryValid,
+      hDistinctPaths, hDistinctFiles, hTargetSeen⟩
+  have hvalidate :=
+    validate_manifest_array_core_success manifest hvalid'
+  rcases decode_encode_rich_regular_file_core_round_trip
+      manifest.nonempty_regular manifest.chunk_size hNonemptyValid with
+    ⟨nonemptyWire, hNonemptyEncode, hNonemptyDecode⟩
+  rcases decode_encode_rich_regular_file_core_round_trip
+      manifest.empty_regular manifest.chunk_size hEmptyValid with
+    ⟨emptyWire, hEmptyEncode, hEmptyDecode⟩
+  rcases decode_encode_hardlink_entry_core_round_trip
+      manifest.hardlink hHardlinkValid with
+    ⟨hardlinkWire, hHardlinkEncode, hHardlinkDecode⟩
+  rcases decode_encode_symlink_entry_core_round_trip
+      manifest.symlink hSymlinkValid with
+    ⟨symlinkWire, hSymlinkEncode, hSymlinkDecode⟩
+  rcases decode_encode_directory_entry_core_round_trip
+      manifest.directory hDirectoryValid with
+    ⟨directoryWire, hDirectoryEncode, hDirectoryDecode⟩
+  refine ⟨{
+    root_map_len := ROOT_MAP_LEN,
+    key_object_id := ROOT_KEY_OBJECT_ID,
+    object_id := manifest.object_id,
+    key_chunk_size := ROOT_KEY_CHUNK_SIZE,
+    chunk_size := manifest.chunk_size,
+    key_file_entries := ROOT_KEY_FILE_ENTRIES,
+    file_entries_len := FILE_ENTRIES_LEN_BOUNDED,
+    nonempty_regular := nonemptyWire,
+    empty_regular := emptyWire,
+    hardlink := hardlinkWire,
+    symlink := symlinkWire,
+    directory := directoryWire,
+    key_schema_version := ROOT_KEY_SCHEMA_VERSION,
+    schema_version := SCHEMA_VERSION,
+    key_object_metadata := ROOT_KEY_OBJECT_METADATA,
+    object_metadata_empty := true,
+    key_caller_object_id := ROOT_KEY_CALLER_OBJECT_ID,
+    caller_object_id := manifest.caller_object_id,
+    key_external_references := ROOT_KEY_EXTERNAL_REFERENCES,
+    external_references_empty := true,
+    trailing_data := false
+  }, ?_, ?_⟩
+  · unfold encode_manifest_array_core
+    simp [hvalidate, core.result.Result.Insts.CoreOpsTry.branch,
+      hNonemptyEncode, hEmptyEncode, hHardlinkEncode, hSymlinkEncode,
+      hDirectoryEncode]
+  · unfold decode_manifest_array_core
+    simp [hNonemptyDecode, hEmptyDecode, hHardlinkDecode, hSymlinkDecode,
+      hDirectoryDecode, hvalidate, core.result.Result.Insts.CoreOpsTry.branch]
+
+end RemObjectManifest

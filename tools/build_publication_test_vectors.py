@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the deterministic standalone RAO/REM-PARITY publication archive."""
+"""Build the deterministic standalone REM-OBJECT/REM-PARITY publication archive."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import tempfile
 from collections.abc import Callable
 from typing import Any
 
-import verify_rao_vectors_independent as independent
+import verify_rem_object_vectors_independent as independent
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -27,25 +27,25 @@ BOOTSTRAP_HEADER_SIZE = 52
 PRE_B1_ARCHIVE_SHA256 = (
     "f4e4331c14e67c059d1292f54e14efd8408c7d41364d2dba7f8e7567aa16c2a6"
 )
-RAO_ENCRYPTED_OBJECTS = (
-    "rao-tv-d1-encrypted.rao",
-    "rao-tv-e2.rao",
+REM_OBJECT_ENCRYPTED_OBJECTS = (
+    "rem-object-tv-d1-encrypted.rem-object",
+    "rem-object-tv-e2.rem-object",
 )
-RAO_KAT_FILES = (
+REM_OBJECT_KAT_FILES = (
     "xwing-draft10-kat.txt",
     "xwing-wrap-kat.txt",
 )
-RAO_INCREMENT_OBJECTS = (
-    "rao-tv-portable-core-only.rao",
-    "rao-tv-nonuser-attribute.rao",
-    "rao-tv-ext-member.rao",
-    "rao-tv-attribute-ext-combined.rao",
+REM_OBJECT_INCREMENT_OBJECTS = (
+    "rem-object-tv-portable-core-only.rem-object",
+    "rem-object-tv-nonuser-attribute.rem-object",
+    "rem-object-tv-ext-member.rem-object",
+    "rem-object-tv-attribute-ext-combined.rem-object",
 )
-RAO_INCREMENT_FIXTURES = {
-    "rao-tv-portable-core-only.rao": "rao-tv-portable-core-only.json",
-    "rao-tv-nonuser-attribute.rao": "rao-tv-nonuser-attribute.json",
-    "rao-tv-ext-member.rao": "rao-tv-ext-member.json",
-    "rao-tv-attribute-ext-combined.rao": "rao-tv-attribute-ext-combined.json",
+REM_OBJECT_INCREMENT_FIXTURES = {
+    "rem-object-tv-portable-core-only.rem-object": "rem-object-tv-portable-core-only.json",
+    "rem-object-tv-nonuser-attribute.rem-object": "rem-object-tv-nonuser-attribute.json",
+    "rem-object-tv-ext-member.rem-object": "rem-object-tv-ext-member.json",
+    "rem-object-tv-attribute-ext-combined.rem-object": "rem-object-tv-attribute-ext-combined.json",
 }
 
 
@@ -66,11 +66,11 @@ def write_json(path: pathlib.Path, value: Any) -> None:
     )
 
 
-def generate_rao_objects(output: pathlib.Path) -> None:
+def generate_rem_object_objects(output: pathlib.Path) -> None:
     """Regenerate current X-Wing envelopes and plaintext increment objects."""
     output.mkdir(parents=True)
     environment = os.environ.copy()
-    environment["RAO_VECTOR_EXPORT_DIR"] = str(output)
+    environment["REM_OBJECT_VECTOR_EXPORT_DIR"] = str(output)
     subprocess.run(
         [
             "cargo",
@@ -79,8 +79,8 @@ def generate_rao_objects(output: pathlib.Path) -> None:
             "-p",
             "remanence-format",
             "--test",
-            "rao_vectors",
-            "rao_publication_objects_regenerate_byte_exactly",
+            "rem_object_vectors",
+            "rem_object_publication_objects_regenerate_byte_exactly",
             "--",
             "--exact",
         ],
@@ -90,30 +90,30 @@ def generate_rao_objects(output: pathlib.Path) -> None:
     )
 
 
-def verify_regenerated_rao_objects(first: pathlib.Path, second: pathlib.Path) -> None:
+def verify_regenerated_rem_object_objects(first: pathlib.Path, second: pathlib.Path) -> None:
     """Require two Rust exports to agree and carry the frozen X-Wing framing."""
-    for filename in (*RAO_ENCRYPTED_OBJECTS, *RAO_INCREMENT_OBJECTS):
+    for filename in (*REM_OBJECT_ENCRYPTED_OBJECTS, *REM_OBJECT_INCREMENT_OBJECTS):
         first_bytes = (first / filename).read_bytes()
         second_bytes = (second / filename).read_bytes()
         if first_bytes != second_bytes:
             raise AssertionError(f"{filename} differs across deterministic regenerations")
-    for filename in RAO_ENCRYPTED_OBJECTS:
+    for filename in REM_OBJECT_ENCRYPTED_OBJECTS:
         stored = (first / filename).read_bytes()
-        if len(stored) < independent.RAO_HEADER_LEN:
+        if len(stored) < independent.REM_OBJECT_HEADER_LEN:
             raise AssertionError(f"{filename} is shorter than its scalar header")
-        if stored[0x38] != independent.RAO_WRAP_SUITE_XWING:
+        if stored[0x38] != independent.REM_OBJECT_WRAP_SUITE_XWING:
             raise AssertionError(f"{filename} does not carry wrap_suite 0x02")
         key_frame_len = int.from_bytes(stored[0x3C:0x40], "big")
         if not (
-            independent.RAO_KEY_FRAME_MIN_LEN
+            independent.REM_OBJECT_KEY_FRAME_MIN_LEN
             <= key_frame_len
-            <= independent.RAO_KEY_FRAME_MAX_LEN
+            <= independent.REM_OBJECT_KEY_FRAME_MAX_LEN
         ):
             raise AssertionError(f"{filename} has an out-of-range key frame")
         slots = independent.parse_key_frame(
             filename,
-            stored[independent.RAO_HEADER_LEN : independent.RAO_HEADER_LEN + key_frame_len],
-            independent.RAO_WRAP_SUITE_XWING,
+            stored[independent.REM_OBJECT_HEADER_LEN : independent.REM_OBJECT_HEADER_LEN + key_frame_len],
+            independent.REM_OBJECT_WRAP_SUITE_XWING,
         )
         if not slots or any(
             len(slot.enc) != independent.XWING_CIPHERTEXT_LEN for slot in slots
@@ -121,11 +121,11 @@ def verify_regenerated_rao_objects(first: pathlib.Path, second: pathlib.Path) ->
             raise AssertionError(f"{filename} does not contain 1120-byte X-Wing enc values")
 
 
-def stage_rao_kats(output: pathlib.Path) -> None:
+def stage_rem_object_kats(output: pathlib.Path) -> None:
     """Copy the frozen component and wrap KATs into the standalone archive."""
     output.mkdir(parents=True)
     testdata = ROOT / "crates" / "remanence-aead" / "testdata"
-    for filename in RAO_KAT_FILES:
+    for filename in REM_OBJECT_KAT_FILES:
         shutil.copyfile(testdata / filename, output / filename)
 
 
@@ -247,18 +247,18 @@ def semantic_vector(directory: pathlib.Path, metadata: dict[str, Any]) -> None:
 def independent_plaintext_definition(
     vector_id: str,
 ) -> tuple[dict[str, Any], list[independent.FileSpec]]:
-    """Return one fixed independent RAO definition by publication vector ID."""
+    """Return one fixed independent REM-OBJECT definition by publication vector ID."""
     for _filename, candidate_id, options, files in (
         independent.positive_plaintext_vector_definitions()
     ):
         if candidate_id == vector_id:
             return options, files
-    raise AssertionError(f"independent RAO definition {vector_id!r} is absent")
+    raise AssertionError(f"independent REM-OBJECT definition {vector_id!r} is absent")
 
 
-def generate_rao_negatives(rao_root: pathlib.Path) -> list[dict[str, Any]]:
+def generate_rem_object_negatives(rem_object_root: pathlib.Path) -> list[dict[str, Any]]:
     """Materialize the revised Section 13.6 manifest-profile negative objects."""
-    negative_root = rao_root / "negative" / "manifest"
+    negative_root = rem_object_root / "negative" / "manifest"
     records: list[dict[str, Any]] = []
 
     def build_case(
@@ -287,7 +287,7 @@ def generate_rao_negatives(rao_root: pathlib.Path) -> list[dict[str, Any]]:
 
         directory = negative_root / vector_id
         directory.mkdir(parents=True, exist_ok=True)
-        (directory / "faulted-object.rao").write_bytes(tampered_bytes)
+        (directory / "faulted-object.rem-object").write_bytes(tampered_bytes)
         write_json(
             directory / "input.json",
             {
@@ -346,21 +346,21 @@ def generate_rao_negatives(rao_root: pathlib.Path) -> list[dict[str, Any]]:
 
     build_case(
         "inventory-disagrees-with-entries",
-        "RAO-TV-NONUSER-ATTRIBUTE",
+        "REM-OBJECT-TV-NONUSER-ATTRIBUTE",
         "ManifestInvalid",
         "object_metadata attribute_namespaces differs from the entry xattr namespace",
         inventory_disagrees,
     )
     build_case(
         "ext-value-not-map",
-        "RAO-TV-EXT-MEMBER",
+        "REM-OBJECT-TV-EXT-MEMBER",
         "ManifestInvalid",
         "object_metadata ext value is not a map",
         ext_is_not_map,
     )
     build_case(
         "ext-member-noncanonical-cbor",
-        "RAO-TV-EXT-MEMBER",
+        "REM-OBJECT-TV-EXT-MEMBER",
         "Cbor",
         "ext member integer uses a non-shortest CBOR encoding",
         noncanonical_ext_value,
@@ -385,7 +385,7 @@ def generate_rao_negatives(rao_root: pathlib.Path) -> list[dict[str, Any]]:
     tamper_digests = {
         build_case(
             "manifest-tamper-repointed-path",
-            "RAO-TV-MANIFEST",
+            "REM-OBJECT-TV-MANIFEST",
             "ManifestDigestMismatch",
             "external manifest anchor rejects a repointed path with constant payloads",
             repoint_path,
@@ -393,7 +393,7 @@ def generate_rao_negatives(rao_root: pathlib.Path) -> list[dict[str, Any]]:
         )[0],
         build_case(
             "manifest-tamper-swapped-file-sha256",
-            "RAO-TV-MANIFEST",
+            "REM-OBJECT-TV-MANIFEST",
             "ManifestDigestMismatch",
             "external manifest anchor rejects swapped file_sha256 values with constant payloads",
             swap_file_sha256,
@@ -401,7 +401,7 @@ def generate_rao_negatives(rao_root: pathlib.Path) -> list[dict[str, Any]]:
         )[0],
         build_case(
             "manifest-tamper-altered-first-chunk-lba",
-            "RAO-TV-MANIFEST",
+            "REM-OBJECT-TV-MANIFEST",
             "ManifestDigestMismatch",
             "external manifest anchor rejects altered first_chunk_lba with constant payloads",
             alter_first_chunk_lba,
@@ -413,45 +413,45 @@ def generate_rao_negatives(rao_root: pathlib.Path) -> list[dict[str, Any]]:
     return records
 
 
-def generate_rao_envelope_negatives(rao_root: pathlib.Path) -> list[dict[str, Any]]:
-    """Materialize RAO 2.0 discriminator and key-frame-bound failures."""
-    base = rao_root / "objects" / "rao-tv-e2.rao"
+def generate_rem_object_envelope_negatives(rem_object_root: pathlib.Path) -> list[dict[str, Any]]:
+    """Materialize REM-ENCRYPT 1.0 discriminator and key-frame-bound failures."""
+    base = rem_object_root / "objects" / "rem-object-tv-e2.rem-object"
     base_bytes = base.read_bytes()
     base_digest = hashlib.sha256(base_bytes).hexdigest()
-    if base_bytes[0x38] != independent.RAO_WRAP_SUITE_XWING:
-        raise AssertionError("RAO-TV-E2 is not an X-Wing envelope")
+    if base_bytes[0x38] != independent.REM_OBJECT_WRAP_SUITE_XWING:
+        raise AssertionError("REM-OBJECT-TV-E2 is not an X-Wing envelope")
 
     records: list[dict[str, Any]] = []
     cases = (
         (
-            "legacy-x25519-wrap-suite",
+            "reserved-wrap-suite-01",
             "InvalidWrapSuite",
             "set wrap_suite to the permanently reserved X25519-only value 0x01",
             0x38,
-            bytes([independent.RAO_WRAP_SUITE_X25519]),
-            {"offset": 0x38, "value": independent.RAO_WRAP_SUITE_X25519},
+            b"\x01",
+            {"offset": 0x38, "value": 0x01},
         ),
         (
             "key-frame-len-below-minimum",
             "InvalidKeyFrameLength",
-            "set key_frame_len to 1190, below the inclusive RAO 2.0 minimum 1191",
+            "set key_frame_len to 1190, below the inclusive REM-ENCRYPT 1.0 minimum 1191",
             0x3C,
-            (independent.RAO_KEY_FRAME_MIN_LEN - 1).to_bytes(4, "big"),
+            (independent.REM_OBJECT_KEY_FRAME_MIN_LEN - 1).to_bytes(4, "big"),
             {
                 "offset": 0x3C,
-                "value": independent.RAO_KEY_FRAME_MIN_LEN - 1,
+                "value": independent.REM_OBJECT_KEY_FRAME_MIN_LEN - 1,
                 "encoding": "u32be",
             },
         ),
         (
             "key-frame-len-above-maximum",
             "InvalidKeyFrameLength",
-            "set key_frame_len to 16385, above the inclusive RAO 2.0 maximum 16384",
+            "set key_frame_len to 16385, above the inclusive REM-ENCRYPT 1.0 maximum 16384",
             0x3C,
-            (independent.RAO_KEY_FRAME_MAX_LEN + 1).to_bytes(4, "big"),
+            (independent.REM_OBJECT_KEY_FRAME_MAX_LEN + 1).to_bytes(4, "big"),
             {
                 "offset": 0x3C,
-                "value": independent.RAO_KEY_FRAME_MAX_LEN + 1,
+                "value": independent.REM_OBJECT_KEY_FRAME_MAX_LEN + 1,
                 "encoding": "u32be",
             },
         ),
@@ -461,13 +461,13 @@ def generate_rao_envelope_negatives(rao_root: pathlib.Path) -> list[dict[str, An
         faulted[offset : offset + len(replacement)] = replacement
         if faulted == base_bytes:
             raise AssertionError(f"{vector_id} did not change its base object")
-        directory = rao_root / "negative" / "envelope" / vector_id
+        directory = rem_object_root / "negative" / "envelope" / vector_id
         directory.mkdir(parents=True, exist_ok=True)
-        (directory / "faulted-object.rao").write_bytes(faulted)
+        (directory / "faulted-object.rem-object").write_bytes(faulted)
         write_json(
             directory / "input.json",
             {
-                "base_artifact": "objects/rao-tv-e2.rao",
+                "base_artifact": "objects/rem-object-tv-e2.rem-object",
                 "base_sha256": base_digest,
                 "mutation": mutation,
             },
@@ -492,20 +492,20 @@ def generate_rao_envelope_negatives(rao_root: pathlib.Path) -> list[dict[str, An
     return records
 
 
-def generate_rao_range_vectors(rao_root: pathlib.Path) -> list[dict[str, Any]]:
+def generate_rem_object_range_vectors(rem_object_root: pathlib.Path) -> list[dict[str, Any]]:
     """Describe the authenticated range that covers D1's true final object chunk."""
     fixture = json.loads(
-        (rao_root / "manifests" / "rao-tv-d1.json").read_text(encoding="utf-8")
+        (rem_object_root / "manifests" / "rem-object-tv-d1.json").read_text(encoding="utf-8")
     )
     plaintext = fixture["expected"]["plaintext"]
     encrypted = fixture["expected"]["encrypted"]
     manifest = plaintext["manifest_layout"]
-    object_path = rao_root / "objects" / "rao-tv-d1-encrypted.rao"
+    object_path = rem_object_root / "objects" / "rem-object-tv-d1-encrypted.rem-object"
     chunk_size = fixture["inputs"]["chunk_size"]
     object_chunk_count = encrypted["chunk_count"]
     first_chunk = manifest["first_chunk_lba"]
     if first_chunk != object_chunk_count - 1:
-        raise AssertionError("RAO-TV-D1 manifest is not in the final object chunk")
+        raise AssertionError("REM-OBJECT-TV-D1 manifest is not in the final object chunk")
     stored_range_start = (
         128
         + encrypted["key_frame_len"]
@@ -514,7 +514,7 @@ def generate_rao_range_vectors(rao_root: pathlib.Path) -> list[dict[str, Any]]:
     )
     source_sha256 = sha256(object_path)
     common_input = {
-        "base_artifact": "objects/rao-tv-d1-encrypted.rao",
+        "base_artifact": "objects/rem-object-tv-d1-encrypted.rem-object",
         "source_sha256": source_sha256,
         "recipient": fixture["inputs"]["recipients"][0],
         "first_inner_chunk": first_chunk,
@@ -549,7 +549,7 @@ def generate_rao_range_vectors(rao_root: pathlib.Path) -> list[dict[str, Any]]:
             {"expected_error": "AeadAuthenticationFailed"},
         ),
     ):
-        directory = rao_root / category / vector_id
+        directory = rem_object_root / category / vector_id
         semantic_vector(
             directory,
             {
@@ -571,7 +571,7 @@ def generate_rao_range_vectors(rao_root: pathlib.Path) -> list[dict[str, Any]]:
 
 
 def generate_negatives(
-    rem_root: pathlib.Path, rao_root: pathlib.Path
+    rem_root: pathlib.Path, rem_object_root: pathlib.Path
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     negative_root = rem_root / "negative"
     minimal = rem_root / "positive" / "minimal-image"
@@ -855,7 +855,7 @@ def generate_negatives(
     semantic("recovery-reconstructed-crc-mismatch", "recovery", {"base": "positive/minimal-image", "failed_ordinal": 0, "expected_data_crc_xor": 1}, "Unrecoverable", "reconstructed bytes fail the pinned data CRC")
     semantic("recovery-pending-epoch", "recovery", {"failed_ordinal": 4, "highest_protected_ordinal": 4}, "UnrecoverablePendingEpoch", "ordinal at the protection watermark is refused before I/O")
     semantic("recovery-outside-prefix", "recovery", {"failed_ordinal": 4, "validated_prefix_ordinals": 4}, "OutsideValidatedMapPrefix", "ordinal outside authenticated prefix is refused before I/O")
-    return records, generate_rao_negatives(rao_root)
+    return records, generate_rem_object_negatives(rem_object_root)
 
 
 def generate_damage_matrix(rem_root: pathlib.Path) -> list[dict[str, Any]]:
@@ -1248,27 +1248,27 @@ def verify_existing_parity_pins(rem_root: pathlib.Path) -> None:
                         )
 
 
-def build_rao_vector_index(
-    rao_root: pathlib.Path,
+def build_rem_object_vector_index(
+    rem_object_root: pathlib.Path,
     negative_records: list[dict[str, Any]],
     range_records: list[dict[str, Any]],
 ) -> None:
-    """Index the additive RAO metadata positives and executable negatives."""
+    """Index the additive REM-OBJECT metadata positives and executable negatives."""
     indexed: list[dict[str, Any]] = []
-    for object_name, fixture_name in sorted(RAO_INCREMENT_FIXTURES.items()):
-        object_path = rao_root / "objects" / object_name
-        fixture_path = rao_root / "manifests" / fixture_name
+    for object_name, fixture_name in sorted(REM_OBJECT_INCREMENT_FIXTURES.items()):
+        object_path = rem_object_root / "objects" / object_name
+        fixture_path = rem_object_root / "manifests" / fixture_name
         fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
         expected = fixture["expected"]
         artifacts = sorted(
             [
                 {
-                    "path": object_path.relative_to(rao_root).as_posix(),
+                    "path": object_path.relative_to(rem_object_root).as_posix(),
                     "size": object_path.stat().st_size,
                     "sha256": sha256(object_path),
                 },
                 {
-                    "path": fixture_path.relative_to(rao_root).as_posix(),
+                    "path": fixture_path.relative_to(rem_object_root).as_posix(),
                     "size": fixture_path.stat().st_size,
                     "sha256": sha256(fixture_path),
                 },
@@ -1284,7 +1284,7 @@ def build_rao_vector_index(
             {
                 "id": fixture["vector_id"],
                 "category": "positive",
-                "archive_path": object_path.relative_to(rao_root).as_posix(),
+                "archive_path": object_path.relative_to(rem_object_root).as_posix(),
                 "checksum_sha256": hashlib.sha256(canonical).hexdigest(),
                 "artifacts": artifacts,
                 "full_object_sha256": expected["full_object_sha256"],
@@ -1302,7 +1302,7 @@ def build_rao_vector_index(
         item = {
             "id": record["id"],
             "category": record["category"],
-            "archive_path": record["path"].relative_to(rao_root).as_posix(),
+            "archive_path": record["path"].relative_to(rem_object_root).as_posix(),
             "checksum_sha256": checksum,
             "artifacts": artifacts,
             "expected_error": expected["expected_error"],
@@ -1325,7 +1325,7 @@ def build_rao_vector_index(
             {
                 "id": record["id"],
                 "category": record["category"],
-                "archive_path": record["path"].relative_to(rao_root).as_posix(),
+                "archive_path": record["path"].relative_to(rem_object_root).as_posix(),
                 "checksum_sha256": checksum,
                 "artifacts": artifacts,
                 **(
@@ -1342,9 +1342,9 @@ def build_rao_vector_index(
             }
         )
     write_json(
-        rao_root / "vectors.json",
+        rem_object_root / "vectors.json",
         {
-            "vector_set": "RAO-2.0-PUBLICATION-INCREMENT",
+            "vector_set": "REM-OBJECT-2.0-PUBLICATION-INCREMENT",
             "spec_section": "13.1 and 13.6",
             "status": "complete-standalone-distribution",
             "checksum_definition": "SHA-256 of sorted '<artifact-sha256>  <relative-path>\\n' records within each vector",
@@ -1356,9 +1356,9 @@ def build_rao_vector_index(
 def build_vector_index(
     rem_root: pathlib.Path,
     records: list[dict[str, Any]],
-    rao_root: pathlib.Path,
-    rao_negative_records: list[dict[str, Any]],
-    rao_range_records: list[dict[str, Any]],
+    rem_object_root: pathlib.Path,
+    rem_object_negative_records: list[dict[str, Any]],
+    rem_object_range_records: list[dict[str, Any]],
 ) -> None:
     arithmetic = json.loads((rem_root / "vectors.json").read_text(encoding="utf-8"))["arithmetic"]
     indexed = []
@@ -1384,7 +1384,7 @@ def build_vector_index(
             "vectors": indexed,
         },
     )
-    build_rao_vector_index(rao_root, rao_negative_records, rao_range_records)
+    build_rem_object_vector_index(rem_object_root, rem_object_negative_records, rem_object_range_records)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -1402,38 +1402,38 @@ def main(argv: list[str] | None = None) -> int:
     with tempfile.TemporaryDirectory(prefix="remanence-publication-vectors-") as tmp_name:
         temporary_root = pathlib.Path(tmp_name)
         stage = pathlib.Path(tmp_name) / "remanence-test-vectors"
-        (stage / "rao" / "manifests").mkdir(parents=True)
-        (stage / "rao" / "objects").mkdir(parents=True)
-        stage_rao_kats(stage / "rao" / "kats")
+        (stage / "rem-object" / "manifests").mkdir(parents=True)
+        (stage / "rem-object" / "objects").mkdir(parents=True)
+        stage_rem_object_kats(stage / "rem-object" / "kats")
         rem_root = stage / "rem-parity-1"
         rem_root.mkdir(parents=True)
 
-        for source in sorted((ROOT / "fixtures" / "rao").glob("*")):
+        for source in sorted((ROOT / "fixtures" / "rem-object").glob("*")):
             if source.is_file():
-                shutil.copyfile(source, stage / "rao" / "manifests" / source.name)
+                shutil.copyfile(source, stage / "rem-object" / "manifests" / source.name)
         for source in sorted((ROOT / "fixtures" / "rem-parity-1").glob("*")):
             if source.is_file():
                 shutil.copyfile(source, rem_root / source.name)
 
-        rao_objects_first = temporary_root / "rao-objects-first"
-        rao_objects_second = temporary_root / "rao-objects-second"
-        generate_rao_objects(rao_objects_first)
-        generate_rao_objects(rao_objects_second)
-        verify_regenerated_rao_objects(rao_objects_first, rao_objects_second)
+        rem_object_objects_first = temporary_root / "rem-object-objects-first"
+        rem_object_objects_second = temporary_root / "rem-object-objects-second"
+        generate_rem_object_objects(rem_object_objects_first)
+        generate_rem_object_objects(rem_object_objects_second)
+        verify_regenerated_rem_object_objects(rem_object_objects_first, rem_object_objects_second)
         independent.write_current_xwing_fixture_pins(
-            stage / "rao" / "manifests",
-            rao_objects_first,
+            stage / "rem-object" / "manifests",
+            rem_object_objects_first,
         )
         first_envelope_pins = {
-            filename: (stage / "rao" / "manifests" / filename).read_bytes()
-            for filename in ("rao-tv-e2.json", "rao-tv-d1.json")
+            filename: (stage / "rem-object" / "manifests" / filename).read_bytes()
+            for filename in ("rem-object-tv-e2.json", "rem-object-tv-d1.json")
         }
         independent.write_current_xwing_fixture_pins(
-            stage / "rao" / "manifests",
-            rao_objects_first,
+            stage / "rem-object" / "manifests",
+            rem_object_objects_first,
         )
         for filename, first_pin in first_envelope_pins.items():
-            if (stage / "rao" / "manifests" / filename).read_bytes() != first_pin:
+            if (stage / "rem-object" / "manifests" / filename).read_bytes() != first_pin:
                 raise AssertionError(
                     f"{filename} differs across independent pinning runs"
                 )
@@ -1441,17 +1441,17 @@ def main(argv: list[str] | None = None) -> int:
         subprocess.run(
             [
                 sys.executable,
-                str(ROOT / "tools" / "verify_rao_vectors_independent.py"),
+                str(ROOT / "tools" / "verify_rem_object_vectors_independent.py"),
                 "--export-directory",
-                str(stage / "rao" / "objects"),
+                str(stage / "rem-object" / "objects"),
                 "--fixture-directory",
-                str(stage / "rao" / "manifests"),
+                str(stage / "rem-object" / "manifests"),
                 "--encrypted-object-directory",
-                str(rao_objects_first),
+                str(rem_object_objects_first),
                 "--kat-directory",
-                str(stage / "rao" / "kats"),
+                str(stage / "rem-object" / "kats"),
                 "--rust-object-directory",
-                str(rao_objects_first),
+                str(rem_object_objects_first),
             ],
             cwd=ROOT,
             check=True,
@@ -1477,22 +1477,22 @@ def main(argv: list[str] | None = None) -> int:
             for directory in sorted((rem_root / "positive").iterdir())
             if directory.is_dir()
         ]
-        rem_negative_records, rao_negative_records = generate_negatives(
-            rem_root, stage / "rao"
+        rem_negative_records, rem_object_negative_records = generate_negatives(
+            rem_root, stage / "rem-object"
         )
-        rao_negative_records.extend(
-            generate_rao_envelope_negatives(stage / "rao")
+        rem_object_negative_records.extend(
+            generate_rem_object_envelope_negatives(stage / "rem-object")
         )
-        rao_range_records = generate_rao_range_vectors(stage / "rao")
+        rem_object_range_records = generate_rem_object_range_vectors(stage / "rem-object")
         records.extend(rem_negative_records)
         records.extend(generate_damage_matrix(rem_root))
         verify_existing_parity_pins(rem_root)
         build_vector_index(
             rem_root,
             records,
-            stage / "rao",
-            rao_negative_records,
-            rao_range_records,
+            stage / "rem-object",
+            rem_object_negative_records,
+            rem_object_range_records,
         )
 
         shutil.copyfile(
@@ -1501,21 +1501,21 @@ def main(argv: list[str] | None = None) -> int:
         )
         (stage / "tools").mkdir()
         shutil.copyfile(
-            ROOT / "tools" / "verify_rao_vectors_independent.py",
-            stage / "tools" / "verify_rao_vectors_independent.py",
+            ROOT / "tools" / "verify_rem_object_vectors_independent.py",
+            stage / "tools" / "verify_rem_object_vectors_independent.py",
         )
         shutil.copyfile(
-            ROOT / "tools" / "requirements-rao-independent.txt",
-            stage / "tools" / "requirements-rao-independent.txt",
+            ROOT / "tools" / "requirements-rem-object-independent.txt",
+            stage / "tools" / "requirements-rem-object-independent.txt",
         )
         claims = (
             "claim\tentrypoint\tartifacts\n"
-            "RAO positive byte identity\tpython3 verify.py\trao/objects/*.rao\n"
-            "RAO negative conformance\tpython3 verify.py\trao/manifests/negative-*.json\n"
-            "RAO X-Wing independent OPEN and KATs\tpython3 tools/verify_rao_vectors_independent.py --fixture-directory rao/manifests --encrypted-object-directory rao/objects --kat-directory rao/kats --publication-root .\trao/kats/*.txt; rao/objects/rao-tv-e2.rao; rao/objects/rao-tv-d1-encrypted.rao\n"
-            "RAO envelope discriminator and length negatives\tpython3 verify.py\trao/negative/envelope/*\n"
-            "RAO metadata and extension increment\tpython3 verify.py\trao/vectors.json; rao/negative/manifest/*\n"
-            "RAO encrypted final-chunk range\tpython3 verify.py\trao/positive/range/*; rao/negative/range/*\n"
+            "REM-OBJECT positive byte identity\tpython3 verify.py\trem-object/objects/*.rem-object\n"
+            "REM-OBJECT negative conformance\tpython3 verify.py\trem-object/manifests/negative-*.json\n"
+            "REM-OBJECT X-Wing independent OPEN and KATs\tpython3 tools/verify_rem_object_vectors_independent.py --fixture-directory rem-object/manifests --encrypted-object-directory rem-object/objects --kat-directory rem-object/kats --publication-root .\trem-object/kats/*.txt; rem-object/objects/rem-object-tv-e2.rem-object; rem-object/objects/rem-object-tv-d1-encrypted.rem-object\n"
+            "REM-OBJECT envelope discriminator and length negatives\tpython3 verify.py\trem-object/negative/envelope/*\n"
+            "REM-OBJECT metadata and extension increment\tpython3 verify.py\trem-object/vectors.json; rem-object/negative/manifest/*\n"
+            "REM-OBJECT encrypted final-chunk range\tpython3 verify.py\trem-object/positive/range/*; rem-object/negative/range/*\n"
             "REM-PARITY positive images\tpython3 verify.py\trem-parity-1/positive/*\n"
             "REM-PARITY negative taxonomy\tpython3 verify.py\trem-parity-1/negative/*/*\n"
             "REM-PARITY damage matrix\tpython3 verify.py\trem-parity-1/damage-matrix/*\n"
@@ -1539,13 +1539,13 @@ def main(argv: list[str] | None = None) -> int:
         subprocess.run(
             [
                 sys.executable,
-                str(stage / "tools" / "verify_rao_vectors_independent.py"),
+                str(stage / "tools" / "verify_rem_object_vectors_independent.py"),
                 "--fixture-directory",
-                str(stage / "rao" / "manifests"),
+                str(stage / "rem-object" / "manifests"),
                 "--encrypted-object-directory",
-                str(stage / "rao" / "objects"),
+                str(stage / "rem-object" / "objects"),
                 "--kat-directory",
-                str(stage / "rao" / "kats"),
+                str(stage / "rem-object" / "kats"),
                 "--publication-root",
                 str(stage),
             ],

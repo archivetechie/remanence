@@ -872,7 +872,7 @@ for lib in libraries:
     vendor = (lib.get("vendor") or "").strip()
     product = (lib.get("product") or "").strip()
     revision = (lib.get("revision") or "").strip()
-    if vendor == "QuadStor" and product == "MSL G3 Series" and revision == "D.00":
+    if vendor == "Quadstor" and product == "MSL G3 Series" and revision == "D.00":
         print("vtl")
         raise SystemExit(0)
 print("real")
@@ -1175,7 +1175,7 @@ EOF
 set -euo pipefail
 if [[ "${1:-}" == libraries && "${2:-}" == --json ]]; then
   cat <<'JSON'
-{"libraries":[{"serial":"LIBMAIN","product":"MSL G3 Series","revision":"D.00","vendor":"QuadStor","drive_count":2,"slot_count":4,"loaded_slot_count":1,"ie_port_count":0}]}
+{"libraries":[{"serial":"LIBMAIN","product":"MSL G3 Series","revision":"D.00","vendor":"Quadstor","drive_count":2,"slot_count":4,"loaded_slot_count":1,"ie_port_count":0}]}
 JSON
   exit 0
 fi

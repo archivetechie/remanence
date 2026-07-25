@@ -1,28 +1,28 @@
-//! RAO 128-byte plaintext scalar envelope header.
+//! REM-OBJECT 128-byte plaintext scalar envelope header.
 
 use sha2::{Digest, Sha256};
 
-use crate::error::{RaoAeadError, Result};
+use crate::error::{RemObjectAeadError, Result};
 
-/// Length in bytes of a RAO encrypted-envelope header.
-pub const RAO_HEADER_LEN: usize = 128;
+/// Length in bytes of a REM-OBJECT encrypted-envelope header.
+pub const REM_OBJECT_HEADER_LEN: usize = 128;
 /// Maximum encrypted metadata frame length, including the AEAD tag.
-pub const RAO_MAX_METADATA_FRAME_LEN: u64 = 16 * 1024 * 1024;
+pub const REM_OBJECT_MAX_METADATA_FRAME_LEN: u64 = 16 * 1024 * 1024;
 /// Minimum encrypted metadata frame length, including the AEAD tag.
-pub const RAO_METADATA_FRAME_MIN_LEN: u64 = 17;
-/// Completion footer for a successfully sealed encrypted RAO object.
-pub const RAO_FOOTER: &[u8; 16] = b"RAO1_STREAM_END.";
+pub const REM_OBJECT_METADATA_FRAME_MIN_LEN: u64 = 17;
+/// Completion footer for a successfully sealed encrypted REM-OBJECT object.
+pub const REM_OBJECT_FOOTER: &[u8; 16] = b"REMO_STREAM_END.";
 
-const MAGIC: &[u8; 4] = b"RAO1";
-/// RAO 2.0 HPKE Base X-Wing/HKDF-SHA256/ChaCha20-Poly1305 wrapping suite.
-pub const RAO_WRAP_SUITE_XWING: u8 = 0x02;
+const MAGIC: &[u8; 4] = b"REMO";
+/// REM-ENCRYPT 1.0 HPKE Base X-Wing/HKDF-SHA256/ChaCha20-Poly1305 wrapping suite.
+pub const REM_OBJECT_WRAP_SUITE_XWING: u8 = 0x02;
 const SUITE_ID_HKDF_SHA256_CHACHA20POLY1305: u8 = 0x01;
 const ZERO_16: [u8; 16] = [0; 16];
 
-/// Parsed RAO encrypted-envelope header.
+/// Parsed REM-OBJECT encrypted-envelope header.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RaoHeader {
-    /// Envelope format version (always 2 for accepted objects).
+pub struct RemObjectHeader {
+    /// Envelope format version (always 1 for accepted objects).
     pub format_version: u8,
     /// Object body block size and AEAD plaintext chunk size.
     pub chunk_size: u32,
@@ -30,7 +30,7 @@ pub struct RaoHeader {
     pub hkdf_salt: [u8; 16],
     /// Encrypted metadata frame length, including its 16-byte AEAD tag.
     pub metadata_frame_len: u64,
-    /// Inner canonical RAO object id.
+    /// Inner canonical REM-OBJECT object id.
     pub object_id: String,
     /// DEK wrapping suite.
     pub wrap_suite: u8,
@@ -38,7 +38,7 @@ pub struct RaoHeader {
     pub key_frame_len: u32,
 }
 
-impl RaoHeader {
+impl RemObjectHeader {
     /// Construct and validate an envelope-mode scalar header.
     pub fn new_envelope(
         chunk_size: u32,
@@ -48,12 +48,12 @@ impl RaoHeader {
         key_frame_len: u32,
     ) -> Result<Self> {
         let header = Self {
-            format_version: 2,
+            format_version: 1,
             chunk_size,
             hkdf_salt,
             metadata_frame_len,
             object_id: object_id.into(),
-            wrap_suite: RAO_WRAP_SUITE_XWING,
+            wrap_suite: REM_OBJECT_WRAP_SUITE_XWING,
             key_frame_len,
         };
         header.validate()?;
@@ -61,30 +61,30 @@ impl RaoHeader {
     }
 
     /// Parse a serialized 128-byte header.
-    pub fn parse(bytes: &[u8; RAO_HEADER_LEN]) -> Result<Self> {
+    pub fn parse(bytes: &[u8; REM_OBJECT_HEADER_LEN]) -> Result<Self> {
         if &bytes[0..4] != MAGIC {
-            return Err(RaoAeadError::InvalidMagicBytes);
+            return Err(RemObjectAeadError::InvalidMagicBytes);
         }
         let header_len = u16::from_be_bytes([bytes[4], bytes[5]]);
-        if header_len != RAO_HEADER_LEN as u16 {
-            return Err(RaoAeadError::InvalidHeaderLength);
+        if header_len != REM_OBJECT_HEADER_LEN as u16 {
+            return Err(RemObjectAeadError::InvalidHeaderLength);
         }
         let format_version = bytes[6];
-        if format_version != 2 {
-            return Err(RaoAeadError::UnsupportedFormatVersion);
+        if format_version != 1 {
+            return Err(RemObjectAeadError::UnsupportedFormatVersion);
         }
         if bytes[7] != SUITE_ID_HKDF_SHA256_CHACHA20POLY1305 {
-            return Err(RaoAeadError::InvalidSuite);
+            return Err(RemObjectAeadError::InvalidSuite);
         }
 
         let chunk_size = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
         let flags = u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
         if flags != 0 {
-            return Err(RaoAeadError::ReservedBytesNotZero);
+            return Err(RemObjectAeadError::ReservedBytesNotZero);
         }
 
         if bytes[0x10..0x20].iter().any(|byte| *byte != 0) {
-            return Err(RaoAeadError::ReservedBytesNotZero);
+            return Err(RemObjectAeadError::ReservedBytesNotZero);
         }
         let mut hkdf_salt = [0u8; 16];
         hkdf_salt.copy_from_slice(&bytes[0x20..0x30]);
@@ -99,7 +99,7 @@ impl RaoHeader {
             bytes[0x37],
         ]);
         if bytes[0x39..0x3c].iter().any(|byte| *byte != 0) {
-            return Err(RaoAeadError::ReservedBytesNotZero);
+            return Err(RemObjectAeadError::ReservedBytesNotZero);
         }
         let wrap_suite = bytes[0x38];
         validate_wrap_suite(wrap_suite)?;
@@ -119,13 +119,13 @@ impl RaoHeader {
         Ok(header)
     }
 
-    /// Serialize this header in canonical big-endian RAO wire form.
-    pub fn serialize(&self) -> Result<[u8; RAO_HEADER_LEN]> {
+    /// Serialize this header in canonical big-endian REM-OBJECT wire form.
+    pub fn serialize(&self) -> Result<[u8; REM_OBJECT_HEADER_LEN]> {
         self.validate()?;
 
-        let mut bytes = [0u8; RAO_HEADER_LEN];
+        let mut bytes = [0u8; REM_OBJECT_HEADER_LEN];
         bytes[0..4].copy_from_slice(MAGIC);
-        bytes[4..6].copy_from_slice(&(RAO_HEADER_LEN as u16).to_be_bytes());
+        bytes[4..6].copy_from_slice(&(REM_OBJECT_HEADER_LEN as u16).to_be_bytes());
         bytes[6] = self.format_version;
         bytes[7] = SUITE_ID_HKDF_SHA256_CHACHA20POLY1305;
         bytes[8..12].copy_from_slice(&self.chunk_size.to_be_bytes());
@@ -150,7 +150,7 @@ impl RaoHeader {
     /// SHA-256 of the exact scalar header followed by its key frame.
     pub fn header_hash_with_key_frame(&self, key_frame: &[u8]) -> Result<[u8; 32]> {
         if key_frame.len() != self.key_frame_len as usize {
-            return Err(RaoAeadError::InvalidKeyFrameLength);
+            return Err(RemObjectAeadError::InvalidKeyFrameLength);
         }
         let mut hasher = Sha256::new();
         hasher.update(self.serialize()?);
@@ -166,17 +166,18 @@ impl RaoHeader {
     /// Validate this header under the frozen envelope-field rules.
     pub fn validate(&self) -> Result<()> {
         validate_chunk_size(self.chunk_size)?;
-        if self.format_version != 2 {
-            return Err(RaoAeadError::UnsupportedFormatVersion);
+        if self.format_version != 1 {
+            return Err(RemObjectAeadError::UnsupportedFormatVersion);
         }
         validate_wrap_suite(self.wrap_suite)?;
-        if !(crate::key_frame::RAO_KEY_FRAME_MIN_LEN..=crate::key_frame::RAO_KEY_FRAME_MAX_LEN)
+        if !(crate::key_frame::REM_OBJECT_KEY_FRAME_MIN_LEN
+            ..=crate::key_frame::REM_OBJECT_KEY_FRAME_MAX_LEN)
             .contains(&(self.key_frame_len as usize))
         {
-            return Err(RaoAeadError::InvalidKeyFrameLength);
+            return Err(RemObjectAeadError::InvalidKeyFrameLength);
         }
         if self.hkdf_salt == ZERO_16 {
-            return Err(RaoAeadError::InvalidSalt);
+            return Err(RemObjectAeadError::InvalidSalt);
         }
         validate_metadata_frame_len(self.metadata_frame_len)?;
         object_id_field(&self.object_id)?;
@@ -185,27 +186,29 @@ impl RaoHeader {
 }
 
 fn validate_wrap_suite(wrap_suite: u8) -> Result<()> {
-    if wrap_suite != RAO_WRAP_SUITE_XWING {
+    if wrap_suite != REM_OBJECT_WRAP_SUITE_XWING {
         // 0x01 was the pre-production X25519-only assignment. It is
         // permanently reserved and intentionally shares the unknown-suite
         // failure path so neither Readers nor Sealers can negotiate it.
-        return Err(RaoAeadError::InvalidWrapSuite);
+        return Err(RemObjectAeadError::InvalidWrapSuite);
     }
     Ok(())
 }
 
-/// Validate a RAO body block / AEAD chunk size.
+/// Validate a REM-OBJECT body block / AEAD chunk size.
 pub fn validate_chunk_size(chunk_size: u32) -> Result<()> {
     if chunk_size == 0 || chunk_size % 512 != 0 {
-        return Err(RaoAeadError::InvalidChunkSize);
+        return Err(RemObjectAeadError::InvalidChunkSize);
     }
     Ok(())
 }
 
 /// Validate an encrypted metadata frame length.
 pub fn validate_metadata_frame_len(metadata_frame_len: u64) -> Result<()> {
-    if !(RAO_METADATA_FRAME_MIN_LEN..=RAO_MAX_METADATA_FRAME_LEN).contains(&metadata_frame_len) {
-        return Err(RaoAeadError::MetadataFrameLengthInvalid);
+    if !(REM_OBJECT_METADATA_FRAME_MIN_LEN..=REM_OBJECT_MAX_METADATA_FRAME_LEN)
+        .contains(&metadata_frame_len)
+    {
+        return Err(RemObjectAeadError::MetadataFrameLengthInvalid);
     }
     Ok(())
 }
@@ -214,7 +217,7 @@ pub fn validate_metadata_frame_len(metadata_frame_len: u64) -> Result<()> {
 pub fn object_id_field(object_id: &str) -> Result<[u8; 64]> {
     let bytes = object_id.as_bytes();
     if bytes.is_empty() || bytes.len() > 64 || bytes.contains(&0) {
-        return Err(RaoAeadError::InvalidObjectIdField);
+        return Err(RemObjectAeadError::InvalidObjectIdField);
     }
     let mut field = [0u8; 64];
     field[..bytes.len()].copy_from_slice(bytes);
@@ -228,24 +231,24 @@ fn decode_object_id_field(field: &[u8]) -> Result<String> {
         .position(|byte| *byte == 0)
         .unwrap_or(field.len());
     if end == 0 || field[end..].iter().any(|byte| *byte != 0) {
-        return Err(RaoAeadError::InvalidObjectIdField);
+        return Err(RemObjectAeadError::InvalidObjectIdField);
     }
     std::str::from_utf8(&field[..end])
         .map(|value| value.to_string())
-        .map_err(|_| RaoAeadError::InvalidObjectIdField)
+        .map_err(|_| RemObjectAeadError::InvalidObjectIdField)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn valid_header() -> RaoHeader {
-        RaoHeader::new_envelope(
+    fn valid_header() -> RemObjectHeader {
+        RemObjectHeader::new_envelope(
             262_144,
             [2; 16],
             64,
             "object-1",
-            crate::RAO_KEY_FRAME_MIN_LEN as u32,
+            crate::REM_OBJECT_KEY_FRAME_MIN_LEN as u32,
         )
         .unwrap()
     }
@@ -254,9 +257,9 @@ mod tests {
     fn header_round_trips_and_matches_offsets() {
         let header = valid_header();
         let bytes = header.serialize().unwrap();
-        assert_eq!(&bytes[0x00..0x04], b"RAO1");
+        assert_eq!(&bytes[0x00..0x04], b"REMO");
         assert_eq!(u16::from_be_bytes([bytes[0x04], bytes[0x05]]), 128);
-        assert_eq!(bytes[0x06], 2);
+        assert_eq!(bytes[0x06], 1);
         assert_eq!(bytes[0x07], 1);
         assert_eq!(
             u32::from_be_bytes(bytes[0x08..0x0c].try_into().unwrap()),
@@ -270,10 +273,10 @@ mod tests {
         );
         assert_eq!(&bytes[0x40..0x48], b"object-1");
 
-        let parsed = RaoHeader::parse(&bytes).unwrap();
+        let parsed = RemObjectHeader::parse(&bytes).unwrap();
         assert_eq!(parsed, header);
         assert_ne!(header.header_hash().unwrap(), [0; 32]);
-        assert_eq!(bytes[0x38], RAO_WRAP_SUITE_XWING);
+        assert_eq!(bytes[0x38], REM_OBJECT_WRAP_SUITE_XWING);
         assert_eq!(
             u32::from_be_bytes(bytes[0x3c..0x40].try_into().unwrap()),
             1191
@@ -281,50 +284,50 @@ mod tests {
     }
 
     #[test]
-    fn header_rejects_unsupported_version_legacy_and_unknown_wrap_suites() {
-        let header = RaoHeader::new_envelope(
+    fn header_rejects_unsupported_version_reserved_and_unknown_wrap_suites() {
+        let header = RemObjectHeader::new_envelope(
             4096,
             [2; 16],
             64,
             "object-2",
-            crate::RAO_KEY_FRAME_MIN_LEN as u32,
+            crate::REM_OBJECT_KEY_FRAME_MIN_LEN as u32,
         )
         .unwrap();
         let bytes = header.serialize().unwrap();
-        assert_eq!(bytes[0x06], 2);
+        assert_eq!(bytes[0x06], 1);
         assert_eq!(bytes[0x07], 1);
         assert_eq!(&bytes[0x10..0x20], &[0; 16]);
-        assert_eq!(bytes[0x38], RAO_WRAP_SUITE_XWING);
+        assert_eq!(bytes[0x38], REM_OBJECT_WRAP_SUITE_XWING);
         assert_eq!(&bytes[0x39..0x3c], &[0; 3]);
         assert_eq!(
             u32::from_be_bytes(bytes[0x3c..0x40].try_into().unwrap()),
             1191
         );
-        assert_eq!(RaoHeader::parse(&bytes).unwrap(), header);
+        assert_eq!(RemObjectHeader::parse(&bytes).unwrap(), header);
 
-        let mut legacy_suite = bytes;
-        legacy_suite[0x38] = 0x01;
+        let mut reserved_suite = bytes;
+        reserved_suite[0x38] = 0x01;
         assert!(matches!(
-            RaoHeader::parse(&legacy_suite),
-            Err(RaoAeadError::InvalidWrapSuite)
+            RemObjectHeader::parse(&reserved_suite),
+            Err(RemObjectAeadError::InvalidWrapSuite)
         ));
         let mut unknown_suite = bytes;
         unknown_suite[0x38] = 0xff;
         assert!(matches!(
-            RaoHeader::parse(&unknown_suite),
-            Err(RaoAeadError::InvalidWrapSuite)
+            RemObjectHeader::parse(&unknown_suite),
+            Err(RemObjectAeadError::InvalidWrapSuite)
         ));
         let mut noncanonical_sealer_header = header.clone();
         noncanonical_sealer_header.wrap_suite = 0x01;
         assert!(matches!(
             noncanonical_sealer_header.serialize(),
-            Err(RaoAeadError::InvalidWrapSuite)
+            Err(RemObjectAeadError::InvalidWrapSuite)
         ));
         let mut version_flip = bytes;
-        version_flip[6] = 1;
+        version_flip[6] = 2;
         assert!(matches!(
-            RaoHeader::parse(&version_flip),
-            Err(RaoAeadError::UnsupportedFormatVersion)
+            RemObjectHeader::parse(&version_flip),
+            Err(RemObjectAeadError::UnsupportedFormatVersion)
         ));
     }
 
@@ -334,13 +337,13 @@ mod tests {
             let mut bytes = valid_header().serialize().unwrap();
             bytes[0x3c..0x40].copy_from_slice(&invalid.to_be_bytes());
             assert!(matches!(
-                RaoHeader::parse(&bytes),
-                Err(RaoAeadError::InvalidKeyFrameLength)
+                RemObjectHeader::parse(&bytes),
+                Err(RemObjectAeadError::InvalidKeyFrameLength)
             ));
         }
 
         for valid in [1191, 16_384] {
-            let header = RaoHeader::new_envelope(512, [3; 16], 17, "bounds", valid).unwrap();
+            let header = RemObjectHeader::new_envelope(512, [3; 16], 17, "bounds", valid).unwrap();
             assert_eq!(header.key_frame_len, valid);
         }
     }
@@ -349,15 +352,15 @@ mod tests {
     fn object_id_rejects_empty_long_and_interior_nul() {
         assert!(matches!(
             object_id_field(""),
-            Err(RaoAeadError::InvalidObjectIdField)
+            Err(RemObjectAeadError::InvalidObjectIdField)
         ));
         assert!(matches!(
             object_id_field(&"x".repeat(65)),
-            Err(RaoAeadError::InvalidObjectIdField)
+            Err(RemObjectAeadError::InvalidObjectIdField)
         ));
         assert!(matches!(
             object_id_field("x\0y"),
-            Err(RaoAeadError::InvalidObjectIdField)
+            Err(RemObjectAeadError::InvalidObjectIdField)
         ));
     }
 
@@ -366,15 +369,15 @@ mod tests {
         let mut bytes = valid_header().serialize().unwrap();
         bytes[0] = b'A';
         assert!(matches!(
-            RaoHeader::parse(&bytes),
-            Err(RaoAeadError::InvalidMagicBytes)
+            RemObjectHeader::parse(&bytes),
+            Err(RemObjectAeadError::InvalidMagicBytes)
         ));
 
         let mut bytes = valid_header().serialize().unwrap();
         bytes[0x10] = 1;
         assert!(matches!(
-            RaoHeader::parse(&bytes),
-            Err(RaoAeadError::ReservedBytesNotZero)
+            RemObjectHeader::parse(&bytes),
+            Err(RemObjectAeadError::ReservedBytesNotZero)
         ));
     }
 }

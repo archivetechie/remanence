@@ -113,7 +113,7 @@ pub struct BootstrapPayload {
     pub sidecar_epoch_directory: Option<SidecarEpochDirectory>,
     /// Reference to an external `parity_map` tape file carrying the directory.
     pub parity_map_reference: Option<ParityMapReference>,
-    /// Optional RAO-binding per-object rows carried by checkpoint/final
+    /// Optional REM-OBJECT-binding per-object rows carried by checkpoint/final
     /// bootstraps. The parity layer treats object bytes as opaque; higher
     /// layers supply these rows when they have representation-specific anchors.
     pub object_rows: Vec<BootstrapObjectRow>,
@@ -126,7 +126,7 @@ pub struct BootstrapObjectRow {
     pub tape_file_number: u32,
     /// Number of fixed-size tape blocks occupied by the stored copy.
     pub stored_block_count: u64,
-    /// Verbatim 1–64-byte RAO object identifier. Schema minors 0..=2 may
+    /// Verbatim 1–64-byte REM-OBJECT object identifier. Schema minors 0..=2 may
     /// decode this as absent.
     pub object_id: Option<Vec<u8>>,
     /// Representation-specific recovery anchors for the copy.
@@ -134,7 +134,7 @@ pub struct BootstrapObjectRow {
 }
 
 impl BootstrapObjectRow {
-    /// Construct a plaintext RAO object row with manifest anchors.
+    /// Construct a plaintext REM-OBJECT object row with manifest anchors.
     pub fn plaintext(
         tape_file_number: u32,
         stored_block_count: u64,
@@ -156,7 +156,7 @@ impl BootstrapObjectRow {
         }
     }
 
-    /// Construct an encrypted RAO object row with envelope fields only.
+    /// Construct an encrypted REM-OBJECT object row with envelope fields only.
     pub fn encrypted(
         tape_file_number: u32,
         stored_block_count: u64,
@@ -176,7 +176,7 @@ impl BootstrapObjectRow {
         }
     }
 
-    /// Bind this recovery row to the verbatim RAO object identifier bytes.
+    /// Bind this recovery row to the verbatim REM-OBJECT object identifier bytes.
     ///
     /// The row validator rejects empty, over-64-byte, or NUL-containing
     /// values before encoding or admission.
@@ -189,7 +189,7 @@ impl BootstrapObjectRow {
 /// Representation-specific payload for one bootstrap object row.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum BootstrapObjectRepresentation {
-    /// Plaintext RAO representation: bootstrap row carries manifest anchors.
+    /// Plaintext REM-OBJECT representation: bootstrap row carries manifest anchors.
     Plaintext {
         /// Object-local body LBA of the generated manifest.
         manifest_first_chunk_lba: u64,
@@ -200,12 +200,12 @@ pub enum BootstrapObjectRepresentation {
         /// SHA-256 digest of the manifest CBOR bytes.
         manifest_sha256: [u8; 32],
     },
-    /// Encrypted RAO representation: bootstrap row carries envelope fields
+    /// Encrypted REM-OBJECT representation: bootstrap row carries envelope fields
     /// only and deliberately omits plaintext manifest anchors.
     Encrypted {
         /// Recipient epoch ids from the key-frame slots.
         recipient_epoch_ids: Vec<[u8; 16]>,
-        /// RAO encrypted metadata frame length.
+        /// REM-OBJECT encrypted metadata frame length.
         metadata_frame_len: u64,
         /// Serialized key-frame length.
         key_frame_len: u32,
@@ -286,7 +286,7 @@ pub fn write_bootstrap_block(
         .any(|row| row.object_id.is_none())
     {
         return Err(ParityError::Invariant(
-            "schema-minor 3 bootstrap object rows require RAO object_id",
+            "schema-minor 3 bootstrap object rows require REM-OBJECT object_id",
         ));
     }
     validate_bootstrap_object_rows(&payload.object_rows, Some(payload.block_size_bytes))?;
@@ -828,8 +828,8 @@ fn encode_cbor_payload(payload: &BootstrapPayload) -> Result<Vec<u8>, ParityErro
         ));
     }
 
-    // Tag 30: RAO-binding object rows. Older readers ignore this unknown key;
-    // schema-minor 3 readers also bind every row to its RAO object UUID.
+    // Tag 30: REM-OBJECT-binding object rows. Older readers ignore this unknown key;
+    // schema-minor 3 readers also bind every row to its REM-OBJECT object UUID.
     if !payload.object_rows.is_empty() {
         let rows = payload
             .object_rows
@@ -1343,14 +1343,14 @@ pub(crate) fn validate_bootstrap_object_row(
                 .contains(metadata_frame_len)
             {
                 return Err(ParityError::BootstrapParse(
-                    "encrypted object row metadata_frame_len is outside RAO bounds".into(),
+                    "encrypted object row metadata_frame_len is outside REM-OBJECT bounds".into(),
                 ));
             }
             if !(OBJECT_ROW_KEY_FRAME_MIN_LEN..=OBJECT_ROW_KEY_FRAME_MAX_LEN)
                 .contains(key_frame_len)
             {
                 return Err(ParityError::BootstrapParse(
-                    "encrypted object row key_frame_len is outside RAO bounds".into(),
+                    "encrypted object row key_frame_len is outside REM-OBJECT bounds".into(),
                 ));
             }
         }

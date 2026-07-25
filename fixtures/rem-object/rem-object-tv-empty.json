@@ -1,0 +1,50 @@
+{
+  "vector_id": "REM-OBJECT-TV-EMPTY",
+  "spec_section": "13.1",
+  "status": "pinned-at-generation",
+  "independent_rederivation": "verified by tools/verify_rem_object_vectors_independent.py",
+  "inputs": {
+    "chunk_size": 4096,
+    "object_id": "00000000-0000-4000-8000-000000000101",
+    "caller_object_id": "rem-object-tv-empty",
+    "write_timestamp": "2026-01-01T00:00:00Z",
+    "metadata_preservation": "minimal",
+    "manifest_file_id": "00000000-0000-4000-8000-000000000101",
+    "entries": []
+  },
+  "expected": {
+    "schema_version": "1.0",
+    "stored_size_bytes": 8192,
+    "stored_size_blocks": 2,
+    "stored_digest": "1bcff39903c0d7dcf7db5540e15da7158f04bab7db4b5b069d3dd8c634205c31",
+    "full_object_sha256": "1bcff39903c0d7dcf7db5540e15da7158f04bab7db4b5b069d3dd8c634205c31",
+    "plaintext_digest": "1bcff39903c0d7dcf7db5540e15da7158f04bab7db4b5b069d3dd8c634205c31",
+    "first_block_sha256": "99648c727392c587443e1de90ec6e3325575175c8019e72d281dedb210948b99",
+    "manifest_cbor_len": 168,
+    "manifest_cbor_hex": "a7696f626a6563745f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303130316a6368756e6b5f73697a651910006c66696c655f656e7472696573806e736368656d615f76657273696f6e016f6f626a6563745f6d65746164617461a07063616c6c65725f6f626a6563745f69647372656d2d6f626a6563742d74762d656d7074797365787465726e616c5f7265666572656e63657380",
+    "manifest_sha256": "4938bd0e7f71aee0d4e1140b0666435d3a73611069ce055c682861458f7e5914",
+    "file_payloads": [],
+    "symlinks": [],
+    "hardlinks": [],
+    "directories": [],
+    "xattrs": [],
+    "extensions": [],
+    "object_metadata": {},
+    "default_restore": {
+      "skipped_xattrs": {},
+      "applied_privileged_xattrs": {},
+      "carried_extensions": [],
+      "reported_values": false
+    },
+    "file_layouts": [],
+    "manifest_layout": {
+      "entry_type": "regular",
+      "path": "_remanence/manifest.cbor",
+      "pax_header_offset": 1024,
+      "data_offset": 4096,
+      "first_chunk_lba": 1,
+      "chunk_count": 1,
+      "pad_spaces": 1718
+    }
+  }
+}

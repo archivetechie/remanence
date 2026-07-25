@@ -6,43 +6,43 @@ on. Definitions reflect what the code does today, not aspirations.
 <!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-aead/src/header.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs crates/remanence-parity/src/lib.rs @ 8de2c46 -->
 ## Formats and objects
 
-**RAO** — Rem Archive Object, the native stored-object format. One RAO
-object holds many files. Published as the RAO 1.0/1.1 specifications.
+**REM-OBJECT** — REM-OBJECT, the native stored-object format. One REM-OBJECT
+object holds many files. Published as the REM-OBJECT 1.0/1.1 specifications.
 
-**rao-v1** — the plaintext RAO body: a POSIX pax tar archive with
+**rem-object-v1** — the plaintext REM-OBJECT body: a POSIX pax tar archive with
 `REMANENCE.*` pax headers, chunk-aligned members, and a trailing CBOR
 manifest. Readable with stock `tar`.
 
-**RAO1** — the encrypted representation of an RAO object: a 128-byte
-header (magic `RAO1`), HKDF-SHA-256 key derivation, and a
+**REMO** — the encrypted representation of an REM-OBJECT object: a 128-byte
+header (magic `REMO`), HKDF-SHA-256 key derivation, and a
 ChaCha20-Poly1305 STREAM over the tar bytes. The accepted representation
-is format version 2 with an HPKE recipient key frame.
+is REM-ENCRYPT format version 1 with an HPKE recipient key frame.
 
-**format version 1 (reserved)** — a permanently unsupported RAO1 wire
+**format version 1 (reserved)** — a permanently unsupported REMO wire
 version retained only as a reserved version number. Current parsers reject
 it with `UnsupportedFormatVersion`; there is no compatibility reader,
 writer, recovery mode, or CLI flag for it.
 
-**format version 2 (HPKE envelope)** — a RAO1 shape with no shared
+**REM-ENCRYPT format version 1 (HPKE envelope)** — a REMO shape with no shared
 secret: a fresh per-object **data-encryption key (DEK)** is generated
 and wrapped once per recipient with HPKE (RFC 9180 Base mode, HKDF-
 SHA256, ChaCha20-Poly1305) running the **X-Wing hybrid KEM** (see below)
-into a **key frame** (wire tag `RAOK`, 1-8 recipient slots accepted by
+into a **key frame** (wire tag `REMK`, 1-8 recipient slots accepted by
 readers) sitting between the header and metadata frame. Production
 sealers require 2-8 distinct recipient epochs. `archive build`,
 pool-selected `archive write`, and a full `archive reseal` produce it;
 `archive extract`/`restore`/`read`/`verify`, the streaming range commands,
-and `rao-recover` open it with a matching RAOP private key.
+and `rem-recover` open it with a matching REMP private key.
 
 **X-Wing hybrid KEM** — the key-encapsulation mechanism (KEM) that wraps
 each recipient's copy of the DEK: ML-KEM-768 (a post-quantum lattice
 scheme, FIPS 203) combined with X25519 (classical elliptic-curve
 Diffie-Hellman) by the combiner in `draft-connolly-cfrg-xwing-kem`,
-plugged into HPKE as KEM id `0x647a`. A recipient's public key (`RAOR`
+plugged into HPKE as KEM id `0x647a`. A recipient's public key (`REMR`
 file) is a 1216-byte serialized X-Wing encapsulation key; the matching
-private key (`RAOP` file) is a 32-byte seed. Wrap-suite id `0x01`, an
+private key (`REMP` file) is a 32-byte seed. Wrap-suite id `0x01`, an
 earlier pre-production X25519-only KEM, is permanently reserved and
-rejected by current readers and sealers alike — every RAO1 object this
+rejected by current readers and sealers alike — every REMO object this
 codebase produces or accepts uses the X-Wing hybrid.
 
 **covering range** — the mapping, computed once by `remanence-aead`,
@@ -73,11 +73,11 @@ plus m parity blocks; a neighborhood is S consecutive stripes whose
 parity lands in one sidecar.
 
 **chunk size / block size** — the fixed transfer unit, 256 KiB by
-default. The RAO chunk size aligns member data inside an object; the
+default. The REM-OBJECT chunk size aligns member data inside an object; the
 tape block size is the fixed SCSI block recorded in the bootstrap.
 
 **manifest** — the deterministic CBOR member index written as the last
-entry of every RAO object (`_remanence/manifest.cbor`).
+entry of every REM-OBJECT object (`_remanence/manifest.cbor`).
 
 **blob wrapper** — an ingest artifact: a dense subtree of non-compliant
 files packed into a `.remwrap.tar` member (with a generated
@@ -122,7 +122,7 @@ same caller id are idempotent; different content under a reused id is a
 conflict.
 
 **catalog unit** — one enumerable archive in the catalog, either
-*native* (an RAO object Remanence wrote) or *foreign* (a scanned legacy
+*native* (an REM-OBJECT object Remanence wrote) or *foreign* (a scanned legacy
 archive such as a BRU tape).
 
 **operation** — a daemon-tracked long-running action with a UUID,
@@ -292,7 +292,7 @@ identical UAs become terminal.
 **SG_IO / sg device** — the Linux generic SCSI ioctl and the `/dev/sgN`
 nodes Remanence issues commands through.
 
-**VTL** — virtual tape library, software emulating a chassis (QuadStor
+**VTL** — virtual tape library, software emulating a chassis (Quadstor
 in this project's development setup).
 
 **Miria** — the commercial archive product whose tape role Remanence is

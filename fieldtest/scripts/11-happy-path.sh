@@ -97,9 +97,9 @@ main() {
   [[ "${REMFIELD_ENV:-unknown}" == vtl ]] && size_gb="${FIELD_HAPPY_GB_VTL:-0.25}"
   stamp="$(fieldtest_timestamp_id)"
   workdir="$(mktemp -d "$(fieldtest_spool_dir)/happy-${stamp}.XXXXXX")"
-  object_plain="$workdir/plain.rao"
+  object_plain="$workdir/plain.rem-object"
   manifest_plain="$workdir/plain-manifest.json"
-  restored_plain="$workdir/restored.rao"
+  restored_plain="$workdir/restored.rem-object"
   range_dir="$workdir/range"
   generate_inputs "$workdir/inputs" "$size_gb"
   build_object "$object_plain" "$manifest_plain" "$workdir/inputs"
@@ -141,7 +141,7 @@ from pathlib import Path
 import os, sys
 Path(sys.argv[1]).write_bytes(os.urandom(32))
 PY
-  encrypted_object="$workdir/encrypted.rao"
+  encrypted_object="$workdir/encrypted.rem-object"
   encrypted_manifest="$workdir/encrypted-manifest.json"
   build_object "$encrypted_object" "$encrypted_manifest" "$workdir/inputs" "$key_file"
   encrypted_sha="$(sha256_file "$encrypted_object")"
@@ -150,7 +150,7 @@ PY
     fieldtest_evidence_record "$SCRIPT_NAME" write-encrypted FAIL "daemon write failed for encrypted object" "$encrypted_locator"
     exit 1
   fi
-  restored_encrypted="$workdir/restored-encrypted.rao"
+  restored_encrypted="$workdir/restored-encrypted.rem-object"
   if ! fieldtest_capture_io_json "$workdir/read-encrypted.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$encrypted_locator")" --out "$restored_encrypted"; then
     fieldtest_evidence_record "$SCRIPT_NAME" read-encrypted FAIL "daemon read failed for encrypted object" "$workdir/read-encrypted.json"
     exit 1
@@ -163,11 +163,11 @@ PY
 
   local verify_json
   verify_json="$workdir/verify.json"
-  if ! fieldtest_capture_io_json "$verify_json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator_plain")" --out "$workdir/verify-restored.rao"; then
+  if ! fieldtest_capture_io_json "$verify_json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator_plain")" --out "$workdir/verify-restored.rem-object"; then
     fieldtest_evidence_record "$SCRIPT_NAME" verify FAIL "daemon verify read failed for plaintext object" "$verify_json"
     exit 1
   fi
-  if [[ "$(sha256_file "$workdir/verify-restored.rao")" != "$object_sha" ]]; then
+  if [[ "$(sha256_file "$workdir/verify-restored.rem-object")" != "$object_sha" ]]; then
     fieldtest_evidence_record "$SCRIPT_NAME" verify FAIL "daemon verify read SHA mismatch" "$verify_json"
     exit 1
   fi

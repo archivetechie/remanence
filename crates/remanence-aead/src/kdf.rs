@@ -1,4 +1,4 @@
-//! RAO envelope HKDF-SHA-256 key derivation from a per-object DEK.
+//! REM-OBJECT envelope HKDF-SHA-256 key derivation from a per-object DEK.
 
 use std::fmt;
 
@@ -6,18 +6,18 @@ use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
-use crate::error::{RaoAeadError, Result};
+use crate::error::{RemObjectAeadError, Result};
 
 /// Salt derivation HKDF info label.
-pub const LABEL_SALT: &[u8] = b"rao2-salt-v1";
+pub const LABEL_SALT: &[u8] = b"rem-encrypt-salt-v1";
 /// Object-secret HKDF info label.
-pub const LABEL_OBJECT: &[u8] = b"rao2-object-v1";
+pub const LABEL_OBJECT: &[u8] = b"rem-encrypt-object-v1";
 /// Metadata-key HKDF info label.
-pub const LABEL_METADATA: &[u8] = b"rao2-metadata-v1";
+pub const LABEL_METADATA: &[u8] = b"rem-encrypt-metadata-v1";
 /// Payload-key HKDF info label.
-pub const LABEL_PAYLOAD: &[u8] = b"rao2-payload-v1";
+pub const LABEL_PAYLOAD: &[u8] = b"rem-encrypt-payload-v1";
 
-/// Derived RAO object, metadata, and payload keys.
+/// Derived REM-OBJECT object, metadata, and payload keys.
 pub struct DerivedKeys {
     /// Header-bound object secret.
     pub object_secret: [u8; 32],
@@ -79,12 +79,12 @@ fn derive_salt_bytes(
         let mut salt = [0u8; 16];
         Hkdf::<Sha256>::new(Some(&[]), ikm)
             .expand(&info, &mut salt)
-            .map_err(|_| RaoAeadError::KdfExpansionFailed)?;
+            .map_err(|_| RemObjectAeadError::KdfExpansionFailed)?;
         if salt != [0; 16] {
             return Ok(salt);
         }
     }
-    Err(RaoAeadError::InvalidSalt)
+    Err(RemObjectAeadError::InvalidSalt)
 }
 
 /// Derive the three distinct envelope keys from a DEK and header-plus-frame hash.
@@ -113,15 +113,15 @@ fn derive_keys_bytes(
     let mut object_secret = [0u8; 32];
     Hkdf::<Sha256>::new(Some(salt), ikm)
         .expand(&object_info, &mut object_secret)
-        .map_err(|_| RaoAeadError::KdfExpansionFailed)?;
+        .map_err(|_| RemObjectAeadError::KdfExpansionFailed)?;
     let mut metadata_key = [0u8; 32];
     Hkdf::<Sha256>::new(Some(&[]), &object_secret)
         .expand(metadata_label, &mut metadata_key)
-        .map_err(|_| RaoAeadError::KdfExpansionFailed)?;
+        .map_err(|_| RemObjectAeadError::KdfExpansionFailed)?;
     let mut payload_key = [0u8; 32];
     Hkdf::<Sha256>::new(Some(&[]), &object_secret)
         .expand(payload_label, &mut payload_key)
-        .map_err(|_| RaoAeadError::KdfExpansionFailed)?;
+        .map_err(|_| RemObjectAeadError::KdfExpansionFailed)?;
     Ok(DerivedKeys {
         object_secret,
         metadata_key,

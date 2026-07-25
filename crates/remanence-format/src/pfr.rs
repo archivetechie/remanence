@@ -1,7 +1,7 @@
-//! Partial-file restore helpers for `rao-v1` copies.
+//! Partial-file restore helpers for `rem-object-v1` copies.
 //!
 //! This module bridges catalog file rows (`first_chunk_lba`, `size_bytes`) to
-//! the plaintext block planner or RAO encrypted-envelope range opener. It
+//! the plaintext block planner or REM-OBJECT encrypted-envelope range opener. It
 //! keeps file-range validation in the body-format layer while delegating
 //! authentication and decryption to `remanence-aead`.
 
@@ -14,16 +14,16 @@ use crate::model::BodyLba;
 
 /// Bytes and envelope-range metadata returned by encrypted file PFR.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EncryptedRaoFileRange {
+pub struct EncryptedRemObjectFileRange {
     /// Requested plaintext file bytes.
     pub bytes: Vec<u8>,
     /// Authenticated envelope range report.
     pub envelope: RangeOpenReport,
 }
 
-/// Object-local block plan for plaintext RAO file PFR.
+/// Object-local block plan for plaintext REM-OBJECT file PFR.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaintextRaoFileRangePlan {
+pub struct PlaintextRemObjectFileRangePlan {
     /// First object-local body block to read.
     pub first_body_lba: BodyLba,
     /// Number of object blocks that cover the requested range.
@@ -34,19 +34,19 @@ pub struct PlaintextRaoFileRangePlan {
     pub range_len: u64,
 }
 
-/// Plan the object-local blocks covering a plaintext RAO member-file byte range.
+/// Plan the object-local blocks covering a plaintext REM-OBJECT member-file byte range.
 ///
 /// `first_chunk_lba` and `file_size_bytes` are the per-file manifest/catalog
 /// values. `range_start` and `range_len` address bytes within that member file.
 /// Empty-but-valid ranges return `Ok(None)` because no object blocks need to be
 /// read.
-pub fn plan_plaintext_rao_file_range(
+pub fn plan_plaintext_rem_object_file_range(
     first_chunk_lba: Option<BodyLba>,
     file_size_bytes: u64,
     chunk_size_bytes: u64,
     range_start: u64,
     range_len: u64,
-) -> Result<Option<PlaintextRaoFileRangePlan>, FormatError> {
+) -> Result<Option<PlaintextRemObjectFileRangePlan>, FormatError> {
     if chunk_size_bytes == 0 {
         return Err(FormatError::invalid("chunk_size_bytes must be nonzero"));
     }
@@ -71,7 +71,7 @@ pub fn plan_plaintext_rao_file_range(
         .checked_add(first_relative_block)
         .map(BodyLba)
         .ok_or_else(|| FormatError::invalid("file range body LBA overflow"))?;
-    Ok(Some(PlaintextRaoFileRangePlan {
+    Ok(Some(PlaintextRemObjectFileRangePlan {
         first_body_lba,
         block_count,
         first_block_offset: range_start % chunk_size_bytes,
@@ -79,19 +79,19 @@ pub fn plan_plaintext_rao_file_range(
     }))
 }
 
-/// Read and authenticate a member-file byte range from an encrypted RAO object.
+/// Read and authenticate a member-file byte range from an encrypted REM-OBJECT object.
 ///
 /// `first_chunk_lba` and `file_size_bytes` are the per-file row values from
 /// the manifest or catalog. `range_start` and `range_len` address bytes within
 /// that member file, not the whole canonical plaintext object.
-pub fn read_encrypted_rao_file_range_to_vec(
+pub fn read_encrypted_rem_object_file_range_to_vec(
     encrypted: &[u8],
     recipient: &RecipientPrivateKey,
     first_chunk_lba: Option<BodyLba>,
     file_size_bytes: u64,
     range_start: u64,
     range_len: u64,
-) -> Result<EncryptedRaoFileRange, FormatError> {
+) -> Result<EncryptedRemObjectFileRange, FormatError> {
     validate_file_range(file_size_bytes, range_start, range_len)?;
     if range_len == 0 {
         let (bytes, envelope) = if let Some(first_chunk_lba) = first_chunk_lba {
@@ -99,7 +99,7 @@ pub fn read_encrypted_rao_file_range_to_vec(
         } else {
             open_plaintext_range_to_vec(encrypted, recipient, 0, 0)?
         };
-        return Ok(EncryptedRaoFileRange { bytes, envelope });
+        return Ok(EncryptedRemObjectFileRange { bytes, envelope });
     }
     let first_chunk_lba = first_chunk_lba.ok_or_else(|| {
         FormatError::invalid("non-empty encrypted file range requires first_chunk_lba")
@@ -111,7 +111,7 @@ pub fn read_encrypted_rao_file_range_to_vec(
         range_start,
         range_len,
     )?;
-    Ok(EncryptedRaoFileRange { bytes, envelope })
+    Ok(EncryptedRemObjectFileRange { bytes, envelope })
 }
 
 /// Validate a member-file byte range.
@@ -140,13 +140,13 @@ pub fn validate_file_range(
 #[cfg(test)]
 mod tests {
     use remanence_aead::{
-        cipher_offset, open_to_vec, RaoAeadError, RecipientPrivateKey, RecipientPublicKey,
+        cipher_offset, open_to_vec, RecipientPrivateKey, RecipientPublicKey, RemObjectAeadError,
         CHACHA20POLY1305_TAG_LEN,
     };
     use remanence_library::VecBlockSink;
 
     use super::*;
-    use crate::{write_encrypted_rao_object, RemTarFile, RemTarObjectOptions};
+    use crate::{write_encrypted_rem_object, RemTarFile, RemTarObjectOptions};
 
     fn recipient_pair() -> (RecipientPrivateKey, Vec<RecipientPublicKey>) {
         let primary = RecipientPrivateKey::new([0x31; 16], "primary-2026", [0x41; 32]).unwrap();
@@ -184,7 +184,7 @@ mod tests {
         }];
         let (primary, recipients) = recipient_pair();
         let mut sink = VecBlockSink::new();
-        let report = write_encrypted_rao_object(&mut sink, &opts, &files, &recipients).unwrap();
+        let report = write_encrypted_rem_object(&mut sink, &opts, &files, &recipients).unwrap();
         let first_chunk_lba = report.plaintext_layout.files[0].first_chunk_lba;
         let key_frame_len = report.envelope.header.key_frame_len;
         let metadata_frame_len = report.envelope.header.metadata_frame_len;
@@ -205,7 +205,7 @@ mod tests {
         let (encrypted, payload, recipient, first_chunk_lba, chunk_size, _, _metadata_len) =
             encrypted_object();
 
-        let range = read_encrypted_rao_file_range_to_vec(
+        let range = read_encrypted_rem_object_file_range_to_vec(
             &encrypted,
             &recipient,
             first_chunk_lba,
@@ -241,7 +241,7 @@ mod tests {
         let chunk_size_u32 = u32::try_from(chunk_size).unwrap();
         let stored_chunk_len = chunk_size + CHACHA20POLY1305_TAG_LEN;
 
-        let boundary = read_encrypted_rao_file_range_to_vec(
+        let boundary = read_encrypted_rem_object_file_range_to_vec(
             &encrypted,
             &recipient,
             Some(first_chunk_lba),
@@ -270,7 +270,7 @@ mod tests {
 
         let final_range_len = 100u64;
         let final_range_start = payload.len() as u64 - final_range_len;
-        let final_chunk_range = read_encrypted_rao_file_range_to_vec(
+        let final_chunk_range = read_encrypted_rem_object_file_range_to_vec(
             &encrypted,
             &recipient,
             Some(first_chunk_lba),
@@ -331,9 +331,9 @@ mod tests {
 
         assert!(matches!(
             open_to_vec(&encrypted, &recipient),
-            Err(RaoAeadError::AeadAuthenticationFailed)
+            Err(RemObjectAeadError::AeadAuthenticationFailed)
         ));
-        let range = read_encrypted_rao_file_range_to_vec(
+        let range = read_encrypted_rem_object_file_range_to_vec(
             &encrypted,
             &recipient,
             Some(first_chunk_lba),
@@ -362,7 +362,7 @@ mod tests {
                 as usize;
         encrypted[requested_chunk_offset] ^= 0x40;
 
-        let err = read_encrypted_rao_file_range_to_vec(
+        let err = read_encrypted_rem_object_file_range_to_vec(
             &encrypted,
             &recipient,
             Some(first_chunk_lba),
@@ -373,7 +373,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            FormatError::Aead(RaoAeadError::AeadAuthenticationFailed)
+            FormatError::Aead(RemObjectAeadError::AeadAuthenticationFailed)
         ));
     }
 
@@ -383,7 +383,8 @@ mod tests {
             encrypted_object();
 
         let range =
-            read_encrypted_rao_file_range_to_vec(&encrypted, &recipient, None, 0, 0, 0).unwrap();
+            read_encrypted_rem_object_file_range_to_vec(&encrypted, &recipient, None, 0, 0, 0)
+                .unwrap();
 
         assert!(range.bytes.is_empty());
         assert_eq!(range.envelope.plaintext_len, 0);
@@ -397,7 +398,7 @@ mod tests {
             encrypted_object();
         let first_chunk_lba = first_chunk_lba.unwrap();
 
-        let range = read_encrypted_rao_file_range_to_vec(
+        let range = read_encrypted_rem_object_file_range_to_vec(
             &encrypted,
             &recipient,
             Some(first_chunk_lba),
@@ -418,11 +419,12 @@ mod tests {
 
     #[test]
     fn plaintext_file_range_plan_maps_span_to_body_blocks() {
-        let plan = plan_plaintext_rao_file_range(Some(BodyLba(8)), 1400, 512, 400, 500).unwrap();
+        let plan =
+            plan_plaintext_rem_object_file_range(Some(BodyLba(8)), 1400, 512, 400, 500).unwrap();
 
         assert_eq!(
             plan,
-            Some(PlaintextRaoFileRangePlan {
+            Some(PlaintextRemObjectFileRangePlan {
                 first_body_lba: BodyLba(8),
                 block_count: 2,
                 first_block_offset: 400,
@@ -433,11 +435,12 @@ mod tests {
 
     #[test]
     fn plaintext_file_range_plan_skips_blocks_before_range() {
-        let plan = plan_plaintext_rao_file_range(Some(BodyLba(8)), 1400, 512, 800, 300).unwrap();
+        let plan =
+            plan_plaintext_rem_object_file_range(Some(BodyLba(8)), 1400, 512, 800, 300).unwrap();
 
         assert_eq!(
             plan,
-            Some(PlaintextRaoFileRangePlan {
+            Some(PlaintextRemObjectFileRangePlan {
                 first_body_lba: BodyLba(9),
                 block_count: 2,
                 first_block_offset: 288,
@@ -449,15 +452,15 @@ mod tests {
     #[test]
     fn plaintext_file_range_plan_accepts_empty_range_without_lba() {
         assert_eq!(
-            plan_plaintext_rao_file_range(None, 0, 512, 0, 0).unwrap(),
+            plan_plaintext_rem_object_file_range(None, 0, 512, 0, 0).unwrap(),
             None
         );
     }
 
     #[test]
     fn plaintext_file_range_plan_rejects_past_eof_range() {
-        let err =
-            plan_plaintext_rao_file_range(Some(BodyLba(8)), 1400, 512, 1300, 101).unwrap_err();
+        let err = plan_plaintext_rem_object_file_range(Some(BodyLba(8)), 1400, 512, 1300, 101)
+            .unwrap_err();
 
         assert!(matches!(err, FormatError::InvalidInput(_)));
     }

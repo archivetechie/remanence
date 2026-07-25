@@ -173,7 +173,7 @@ pub enum ParityError {
     },
 
     /// The object cannot fit on an empty tape even before considering the
-    /// current tape's remaining capacity. RAO objects do not span tapes;
+    /// current tape's remaining capacity. REM-OBJECT objects do not span tapes;
     /// callers must split the object upstream.
     #[error("object too large for an empty tape: {projected_object_blocks} body blocks, empty tape holds {empty_tape_usable_blocks} usable blocks, reserve {required_reserve_blocks} blocks; split upstream")]
     ObjectTooLargeForEmptyTape {

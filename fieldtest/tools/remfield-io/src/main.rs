@@ -545,7 +545,7 @@ async fn open_write_session(
                 mount_if_needed: true,
             },
         )),
-        body_format: "rao-v1".to_string(),
+        body_format: "rem-object-v1".to_string(),
         idempotency_key: None,
         recover_session_id: Vec::new(),
     };
@@ -1526,7 +1526,7 @@ mod tests {
             caller_object_id: "caller-object".to_string(),
             content_sha256: vec![0x22; 32],
             logical_size_bytes: 64,
-            body_format: "rao-v1".to_string(),
+            body_format: "rem-object-v1".to_string(),
             caller_metadata: Default::default(),
             created_at: None,
             content_digest: Some(pb::Digest {
@@ -1618,7 +1618,7 @@ mod tests {
             caller_object_id: "batch-7".to_string(),
             content_sha256: vec![0x33; 32],
             logical_size_bytes: 1024 * 1024,
-            body_format: "rao-v1".to_string(),
+            body_format: "rem-object-v1".to_string(),
             caller_metadata: Default::default(),
             created_at: None,
             content_digest: Some(pb::Digest {

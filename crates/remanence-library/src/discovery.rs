@@ -226,7 +226,7 @@ fn probe_changer<T: SgTransport>(
 /// two-phase allocation pattern: 8-byte header to learn `byte_count`,
 /// then a sized second call. Falls back to a 1 MiB allocation if the
 /// 8-byte probe is rejected. This is what works on HPE MSL3040
-/// firmware 3350 and QuadStor.
+/// firmware 3350 and Quadstor.
 ///
 /// **If the primary call leaves any DataTransfer bay without a drive
 /// serial** — including the *partial* case where some bays have inline
@@ -512,14 +512,14 @@ mod tests {
     use crate::transport::FixtureTransport;
     use std::collections::HashMap;
 
-    // Build the full set of canned bytes a single QuadStor /dev/sg*
+    // Build the full set of canned bytes a single Quadstor /dev/sg*
     // would return during discovery: standard INQUIRY, VPD 0x80,
     // VPD 0x83, then the two RES calls (8-byte probe, then full read).
 
     fn quadstor_changer_responses() -> Vec<Vec<u8>> {
         let std_inq: &[u8] = include_bytes!("../../../fixtures/inquiry/changer-msl-g3.bin");
         let vpd_80: &[u8] = include_bytes!("../../../fixtures/vpd-80/changer-msl-g3.bin");
-        // We don't have an in-tree QuadStor VPD 0x83 fixture — for the
+        // We don't have an in-tree Quadstor VPD 0x83 fixture — for the
         // test it's enough that VPD 0x83 fails gracefully (the warning
         // path is exercised). Push a malformed page-mismatch response.
         let vpd_83_dummy = vec![0x08, 0x00, 0x00, 0x00];
@@ -630,7 +630,7 @@ mod tests {
 
     #[test]
     fn quadstor_no_dvcid_walks_ladder_and_emits_drive_mapping_unavailable() {
-        // The in-tree QuadStor RES fixture was captured *without* the
+        // The in-tree Quadstor RES fixture was captured *without* the
         // CurData bit so it has no DVCID identifier descriptors. This
         // test exercises the negative path: full DVCID ladder
         // (drives-only retries) consumed, emits
@@ -934,7 +934,7 @@ mod tests {
     #[test]
     fn no_state_changing_cdbs_during_discovery() {
         // Capture every CDB that discovery issues against a single
-        // QuadStor /dev/sg4 changer probe, and assert none of them are
+        // Quadstor /dev/sg4 changer probe, and assert none of them are
         // state-changing opcodes (the spec v0.2 §8.2 / layer2-design
         // §6 safety requirement).
         use crate::transport::RecordingLog;

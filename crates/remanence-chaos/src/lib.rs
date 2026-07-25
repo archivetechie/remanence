@@ -1,10 +1,10 @@
-//! Phase B QuadStor chaos adapter for Remanence.
+//! Phase B Quadstor chaos adapter for Remanence.
 //!
 //! This crate implements a transport-level fault adapter for the Remanence SCSI
 //! path. `qschaos` Phase A arms scenarios into SQLite; [`ChaosTransport`] reads
 //! that state, wraps any [`SgTransport`], injects the L1a command-level fault
 //! set, and appends one JSONL event per intercepted command. It deliberately
-//! does not talk to QuadStor or `/dev/sg*`; Phase B tests run over
+//! does not talk to Quadstor or `/dev/sg*`; Phase B tests run over
 //! `FixtureTransport`.
 
 use std::collections::{BTreeSet, HashSet};

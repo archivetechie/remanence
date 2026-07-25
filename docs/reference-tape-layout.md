@@ -2,9 +2,8 @@
 
 What a Remanence-written cartridge physically contains, as the code writes
 it today. Byte-level detail lives in the published specifications —
-[RAO 1.0](../specs/rao-1.0-specification.md),
-[RAO 1.1](../specs/rao-1.1-specification.md), and
-[REM-PARITY 1.0](../specs/rem-parity-1.0-specification.md) — this page is
+[REM-OBJECT](../specs/publication/rao-object-format.md) and
+[REM-PARITY 1.0](../specs/publication/rem-parity-1.0-specification.md) — this page is
 the orientation layer above them.
 
 The design goal behind all of it: a tape must be readable with no access
@@ -28,7 +27,7 @@ on tape): `Object` (0), `ParitySidecar` (1), `Bootstrap` (2), and
   is in the bootstrap, a reader never needs MODE SENSE state to start; a
   scan just probes the candidate block sizes (256 KiB, 512 KiB, 1 MiB) at
   BOT.
-- **Object** tape files contain only body-format blocks (a stored RAO
+- **Object** tape files contain only body-format blocks (a stored REM-OBJECT
   object). The parity layer owns every filemark; body formats cannot emit
   them.
 - **Parity sidecar** tape files carry the Reed-Solomon parity shards and
@@ -76,10 +75,10 @@ reserves worst-case directory and stop headroom, so reaching the ceiling
 seals and rolls placement at a checkpoint instead of failing an open batch.
 
 <!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-format/src/layout.rs crates/remanence-format/src/writer.rs @ 7fb10f8 -->
-## The stored object: rao-v1
+## The stored object: rem-object-v1
 
 A plaintext stored object is a POSIX pax tar archive — the format id is
-`rao-v1`, schema version `1.0` (`1.1` when per-entry xattrs are present).
+`rem-object-v1`, schema version `1.0` (`1.1` when per-entry xattrs are present).
 There is no custom binary header: identity travels in a pax global
 extended header with `REMANENCE.*` keys (`format_id`, `schema_version`,
 `object_id`, `caller_object_id`, `chunk_size`, `encryption`,
@@ -89,20 +88,20 @@ so that every member's data starts on a chunk boundary (default chunk
 size 262144 bytes). The last member is a deterministic CBOR manifest at
 `_remanence/manifest.cbor`, followed by tar end-of-archive records.
 
-The consequence worth stating plainly: a plaintext rao-v1 object is
+The consequence worth stating plainly: a plaintext rem-object-v1 object is
 extractable with stock `tar` on any Unix system, with the Remanence
 metadata visible as pax headers. The 30-year-readability property is not
 a promise, it is the format.
 
-![rao-v1 stored object layout: pax global header, chunk-aligned members, trailing CBOR manifest, tar end-of-archive records and zero fill](assets/rao-v1-object.svg)
+![rem-object-v1 stored object layout: pax global header, chunk-aligned members, trailing CBOR manifest, tar end-of-archive records and zero fill](assets/rem-object-v1-object.svg)
 
-*Fig. 2 — A rao-v1 stored object in stream order: identity in the pax global header, one chunk-aligned member per file, the CBOR manifest as the last member, then tar end-of-archive records padded to a chunk multiple.*
+*Fig. 2 — A rem-object-v1 stored object in stream order: identity in the pax global header, one chunk-aligned member per file, the CBOR manifest as the last member, then tar end-of-archive records padded to a chunk multiple.*
 
 <!-- code-anchor: crates/remanence-aead/src/header.rs crates/remanence-aead/src/stream.rs crates/remanence-aead/src/kdf.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs @ 8de2c46 -->
-## The encrypted envelope: RAO1
+## The encrypted envelope: REMO
 
 An encrypted object wraps the same tar byte stream in an AEAD envelope.
-The live wire format is version 2 only (cipher-suite id `0x01`,
+The live REM-ENCRYPT wire format is version 1 only (cipher-suite id `0x01`,
 HKDF-SHA-256 + ChaCha20-Poly1305). Format version 1 is permanently reserved
 and rejected with `UnsupportedFormatVersion`; there is no compatibility
 reader or writer.
@@ -116,7 +115,7 @@ reader or writer.
   pre-production X25519-only KEM, is permanently reserved; both readers
   and sealers reject it. Bytes `0x39..0x3c` are reserved-zero, and
   `0x3c..0x40` holds the key-frame length.
-- A plaintext **key frame** follows immediately (wire tag `RAOK`). Readers
+- A plaintext **key frame** follows immediately (wire tag `REMK`). Readers
   accept 1-8 slots; production sealers require 2-8 distinct recipient
   epochs in ascending slot order. Each slot is
   `[slot_index][recipient_epoch_id:16][label][enc:1120][ciphertext:48]`
@@ -132,23 +131,23 @@ reader or writer.
   chunk (computed against the whole object's chunk count, so a partial
   ranged read still nonces correctly). Truncation is therefore
   detectable.
-- A 16-byte plaintext footer, `RAO1_STREAM_END.`, then zero-fill to a
+- A 16-byte plaintext footer, `REMO_STREAM_END.`, then zero-fill to a
   chunk-size multiple.
 
-![RAO1 encrypted envelope: plaintext 128-byte header and recipient key frame, encrypted metadata frame, tagged ciphertext chunks, plaintext footer, zero fill](assets/rao1-envelope.svg)
+![REMO encrypted envelope: plaintext 128-byte header and recipient key frame, encrypted metadata frame, tagged ciphertext chunks, plaintext footer, zero fill](assets/rem-encrypt-envelope.svg)
 
-*Fig. 3 — The encrypted RAO1 envelope around the same tar stream. The scalar header,
+*Fig. 3 — The encrypted REMO envelope around the same tar stream. The scalar header,
 recipient key frame, footer, and fill are plaintext framing; metadata and
 payload chunks are ChaCha20-Poly1305 ciphertext. The key frame is bound into
 key derivation, so changing any slot invalidates authentication.*
 
-The envelope has no shared root key. Its labels (`rao2-salt-v1` and siblings)
+The envelope has no shared root key. Its labels (`rem-encrypt-salt-v1` and siblings)
 derive from the per-object DEK, and the derivation hash covers the scalar
 header plus the exact key-frame bytes. `archive build` and pool writes seal
 directly to recipients, while `archive reseal` performs a full re-seal to a
-new recipient set. CLI open/read/verify paths and standalone `rao-recover`
-select a slot using the RAOP private key's epoch id; see the [CLI
-reference](reference-cli.md#rao-recover-standalone-recovery).
+new recipient set. CLI open/read/verify paths and standalone `rem-recover`
+select a slot using the REMP private key's epoch id; see the [CLI
+reference](reference-cli.md#rem-recover-standalone-recovery).
 
 <!-- code-anchor: crates/remanence-parity/src/bootstrap.rs crates/remanence-state/src/index.rs @ 7fb10f8 -->
 ## Tape identity

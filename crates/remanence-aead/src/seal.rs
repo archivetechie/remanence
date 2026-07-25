@@ -1,18 +1,18 @@
-//! Whole-object RAO encrypted sealing.
+//! Whole-object REM-OBJECT encrypted sealing.
 
 use std::io::{Read, Write};
 
 use sha2::{Digest, Sha256};
 
-use crate::error::{RaoAeadError, Result};
-use crate::header::{validate_chunk_size, RaoHeader, RAO_FOOTER};
-use crate::metadata::RaoMetadata;
+use crate::error::{RemObjectAeadError, Result};
+use crate::header::{validate_chunk_size, RemObjectHeader, REM_OBJECT_FOOTER};
+use crate::metadata::RemObjectMetadata;
 use crate::stream::{
     encrypt_chunk, encrypt_metadata, finalize_sha256, stored_size_from_parts, PlaintextStats,
 };
 use crate::wrap::{wrap_dek, DataEncryptionKey, EphemeralRng, RecipientPublicKey};
 
-/// Inputs to the RAO sealer.
+/// Inputs to the REM-OBJECT sealer.
 #[derive(Debug, Clone)]
 pub struct SealOptions {
     /// Body block size and AEAD plaintext chunk size.
@@ -29,7 +29,7 @@ pub struct SealOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealReport {
     /// Serialized header used for this object.
-    pub header: RaoHeader,
+    pub header: RemObjectHeader,
     /// Parsed key frame.
     pub key_frame: crate::KeyFrame,
     /// Metadata plaintext size before the AEAD tag.
@@ -57,7 +57,7 @@ pub struct EnvelopeSealOptions {
     pub recipients: Vec<RecipientPublicKey>,
 }
 
-/// Seal a canonical plaintext RAO object as an HPKE envelope.
+/// Seal a canonical plaintext REM-OBJECT object as an HPKE envelope.
 pub fn seal<R: Read, W: Write>(
     plaintext: R,
     output: W,
@@ -100,17 +100,17 @@ where
     crate::header::object_id_field(&options.common.object_id)?;
     let chunk = u64::from(options.common.chunk_size);
     if options.common.plaintext_size == 0 || options.common.plaintext_size % chunk != 0 {
-        return Err(RaoAeadError::InvalidInput(
+        return Err(RemObjectAeadError::InvalidInput(
             "envelope seal requires non-empty, chunk-aligned plaintext".to_string(),
         ));
     }
     match options.recipients.len() {
         0 => {
-            return Err(RaoAeadError::InvalidInput(
+            return Err(RemObjectAeadError::InvalidInput(
                 "envelope seal requires at least one recipient".to_string(),
             ))
         }
-        1 if !options.allow_single_recipient => return Err(RaoAeadError::InvalidInput(
+        1 if !options.allow_single_recipient => return Err(RemObjectAeadError::InvalidInput(
             "single-recipient envelope seal requires the allow_single_recipient safety override"
                 .to_string(),
         )),
@@ -126,12 +126,12 @@ where
                 .any(|earlier| earlier.recipient_epoch_id == recipient.recipient_epoch_id)
         })
     {
-        return Err(RaoAeadError::InvalidInput(
+        return Err(RemObjectAeadError::InvalidInput(
             "recipient epochs must be distinct".to_string(),
         ));
     }
 
-    let metadata = RaoMetadata::new(
+    let metadata = RemObjectMetadata::new(
         options.common.plaintext_size,
         options.common.plaintext_digest,
         options.common.chunk_size,
@@ -139,7 +139,7 @@ where
     let metadata_plaintext = metadata.to_cbor_bytes(options.common.chunk_size)?;
     let metadata_frame_len = (metadata_plaintext.len() as u64)
         .checked_add(16)
-        .ok_or(RaoAeadError::SizeOverflow)?;
+        .ok_or(RemObjectAeadError::SizeOverflow)?;
     let object_id_field = crate::header::object_id_field(&options.common.object_id)?;
     let salt = crate::kdf::derive_salt(
         dek.as_bytes(),
@@ -149,9 +149,9 @@ where
     )?;
     let key_frame = wrap_dek(dek, &options.common.object_id, &options.recipients, rng)?;
     let key_frame_bytes = key_frame.serialize()?;
-    let key_frame_len =
-        u32::try_from(key_frame_bytes.len()).map_err(|_| RaoAeadError::InvalidKeyFrameLength)?;
-    let header = RaoHeader::new_envelope(
+    let key_frame_len = u32::try_from(key_frame_bytes.len())
+        .map_err(|_| RemObjectAeadError::InvalidKeyFrameLength)?;
+    let header = RemObjectHeader::new_envelope(
         options.common.chunk_size,
         salt,
         metadata_frame_len,
@@ -172,13 +172,13 @@ where
     let plaintext_stats =
         encrypt_payload(&mut plaintext, &mut hashing_output, &options.common, &keys)?;
     if plaintext_stats.size != options.common.plaintext_size {
-        return Err(RaoAeadError::PlaintextSizeMismatch);
+        return Err(RemObjectAeadError::PlaintextSizeMismatch);
     }
     if plaintext_stats.digest != options.common.plaintext_digest {
-        return Err(RaoAeadError::PlaintextDigestMismatch);
+        return Err(RemObjectAeadError::PlaintextDigestMismatch);
     }
     ensure_eof(&mut plaintext)?;
-    hashing_output.write_all(RAO_FOOTER)?;
+    hashing_output.write_all(REM_OBJECT_FOOTER)?;
     let stored_size_bytes = stored_size_from_parts(
         options.common.chunk_size,
         key_frame_len,
@@ -187,11 +187,11 @@ where
     )?;
     let fill_len = stored_size_bytes
         .checked_sub(hashing_output.count)
-        .ok_or(RaoAeadError::SizeOverflow)?;
+        .ok_or(RemObjectAeadError::SizeOverflow)?;
     write_zero_fill(&mut hashing_output, fill_len)?;
     let (_, stored_len, stored_digest) = hashing_output.finish();
     if stored_len != stored_size_bytes {
-        return Err(RaoAeadError::SizeOverflow);
+        return Err(RemObjectAeadError::SizeOverflow);
     }
     Ok(SealReport {
         header,
@@ -222,7 +222,7 @@ fn encrypt_payload<R: Read, W: Write>(
     keys: &crate::kdf::DerivedKeys,
 ) -> Result<PlaintextStats> {
     let chunk_size =
-        usize::try_from(options.chunk_size).map_err(|_| RaoAeadError::InvalidChunkSize)?;
+        usize::try_from(options.chunk_size).map_err(|_| RemObjectAeadError::InvalidChunkSize)?;
     let chunk_count = options.plaintext_size / u64::from(options.chunk_size);
     let mut hasher = Sha256::new();
     let mut count = 0u64;
@@ -233,7 +233,7 @@ fn encrypt_payload<R: Read, W: Write>(
         hasher.update(&buf);
         count = count
             .checked_add(u64::from(options.chunk_size))
-            .ok_or(RaoAeadError::PlaintextSizeMismatch)?;
+            .ok_or(RemObjectAeadError::PlaintextSizeMismatch)?;
         let final_chunk = index + 1 == chunk_count;
         let encrypted = encrypt_chunk(&keys.payload_key, index, final_chunk, &buf)?;
         output.write_all(&encrypted)?;
@@ -250,9 +250,9 @@ fn ensure_eof<R: Read>(reader: &mut R) -> Result<()> {
     loop {
         match reader.read(&mut byte) {
             Ok(0) => return Ok(()),
-            Ok(_) => return Err(RaoAeadError::PlaintextSizeMismatch),
+            Ok(_) => return Err(RemObjectAeadError::PlaintextSizeMismatch),
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(err) => return Err(RaoAeadError::Io(err)),
+            Err(err) => return Err(RemObjectAeadError::Io(err)),
         }
     }
 }
@@ -318,7 +318,7 @@ mod tests {
     use super::*;
     use crate::{
         inspect_bytes, open_plaintext_range_to_vec, open_to_vec, RecipientPrivateKey,
-        RAO_HEADER_LEN, RAO_WRAP_SUITE_XWING,
+        REM_OBJECT_HEADER_LEN, REM_OBJECT_WRAP_SUITE_XWING,
     };
     use std::io;
 
@@ -341,8 +341,8 @@ mod tests {
     fn assert_no_footer(output: &[u8]) {
         assert!(
             !output
-                .windows(RAO_FOOTER.len())
-                .any(|window| window == RAO_FOOTER),
+                .windows(REM_OBJECT_FOOTER.len())
+                .any(|window| window == REM_OBJECT_FOOTER),
             "failed seal wrote the completion footer"
         );
     }
@@ -401,10 +401,10 @@ mod tests {
         };
 
         let error = seal_to_vec(&plaintext, &options).unwrap_err();
-        assert!(matches!(error, RaoAeadError::InvalidInput(_)));
+        assert!(matches!(error, RemObjectAeadError::InvalidInput(_)));
         assert_eq!(
             error.to_string(),
-            "invalid RAO sealing input: single-recipient envelope seal requires the \
+            "invalid REM-OBJECT sealing input: single-recipient envelope seal requires the \
              allow_single_recipient safety override"
         );
     }
@@ -448,9 +448,9 @@ mod tests {
         };
 
         let (sealed, sealed_report) = seal_to_vec(&plaintext, &options).unwrap();
-        assert_eq!(sealed_report.header.format_version, 2);
-        assert_eq!(sealed_report.header.wrap_suite, RAO_WRAP_SUITE_XWING);
-        assert_eq!(sealed[0x38], RAO_WRAP_SUITE_XWING);
+        assert_eq!(sealed_report.header.format_version, 1);
+        assert_eq!(sealed_report.header.wrap_suite, REM_OBJECT_WRAP_SUITE_XWING);
+        assert_eq!(sealed[0x38], REM_OBJECT_WRAP_SUITE_XWING);
         assert_eq!(sealed_report.key_frame.slots.len(), 2);
 
         let inspected = inspect_bytes(&sealed).unwrap();
@@ -481,7 +481,7 @@ mod tests {
         unrequested_chunk_corrupt[third_chunk] ^= 0x80;
         assert!(matches!(
             open_to_vec(&unrequested_chunk_corrupt, &safe),
-            Err(RaoAeadError::AeadAuthenticationFailed)
+            Err(RemObjectAeadError::AeadAuthenticationFailed)
         ));
         let (first_chunk_only, partial_report) =
             open_plaintext_range_to_vec(&unrequested_chunk_corrupt, &safe, 0, 512).unwrap();
@@ -491,28 +491,28 @@ mod tests {
         let wrong_epoch = RecipientPrivateKey::new([0x33; 16], "wrong", [9; 32]).unwrap();
         assert!(matches!(
             open_to_vec(&sealed, &wrong_epoch),
-            Err(RaoAeadError::RecipientEpochMismatch)
+            Err(RemObjectAeadError::RecipientEpochMismatch)
         ));
 
         let mut malformed_encapsulation = sealed.clone();
-        let first_enc = crate::RAO_HEADER_LEN + 5 + 1 + 16 + 1 + "safe-2026".len();
+        let first_enc = crate::REM_OBJECT_HEADER_LEN + 5 + 1 + 16 + 1 + "safe-2026".len();
         malformed_encapsulation[first_enc..first_enc + 32].fill(0);
         assert!(matches!(
             open_to_vec(&malformed_encapsulation, &safe),
-            Err(RaoAeadError::HpkeFailed)
+            Err(RemObjectAeadError::HpkeFailed)
         ));
 
         let mut changed_label = sealed;
-        let first_label = crate::RAO_HEADER_LEN + 5 + 1 + 16 + 1;
+        let first_label = crate::REM_OBJECT_HEADER_LEN + 5 + 1 + 16 + 1;
         changed_label[first_label] = b'S';
         assert!(matches!(
             open_to_vec(&changed_label, &safe),
-            Err(RaoAeadError::AeadAuthenticationFailed)
+            Err(RemObjectAeadError::AeadAuthenticationFailed)
         ));
     }
 
     #[test]
-    fn legacy_wrap_suite_downgrade_is_rejected_and_changes_header_hash_transcript() {
+    fn reserved_wrap_suite_downgrade_is_rejected_and_changes_header_hash_transcript() {
         let plaintext = vec![0x5a; 512];
         let recipient = RecipientPrivateKey::new([1; 16], "primary", [7; 32]).unwrap();
         let options = EnvelopeSealOptions {
@@ -530,7 +530,7 @@ mod tests {
             [0x55; 32],
         )
         .unwrap();
-        assert_eq!(report.header.wrap_suite, RAO_WRAP_SUITE_XWING);
+        assert_eq!(report.header.wrap_suite, REM_OBJECT_WRAP_SUITE_XWING);
 
         // wrap_suite is not configurable through SealOptions. Even direct
         // mutation of the public parsed-header model cannot serialize 0x01.
@@ -538,10 +538,10 @@ mod tests {
         forbidden_header.wrap_suite = 0x01;
         assert!(matches!(
             forbidden_header.serialize(),
-            Err(RaoAeadError::InvalidWrapSuite)
+            Err(RemObjectAeadError::InvalidWrapSuite)
         ));
 
-        let authenticated_prefix_len = RAO_HEADER_LEN + report.header.key_frame_len as usize;
+        let authenticated_prefix_len = REM_OBJECT_HEADER_LEN + report.header.key_frame_len as usize;
         let original_header_hash: [u8; 32] =
             Sha256::digest(&sealed[..authenticated_prefix_len]).into();
         let mut downgraded = sealed;
@@ -563,11 +563,11 @@ mod tests {
                 &downgraded_keys.metadata_key,
                 &downgraded[metadata_start..metadata_end],
             ),
-            Err(RaoAeadError::AeadAuthenticationFailed)
+            Err(RemObjectAeadError::AeadAuthenticationFailed)
         ));
         assert!(matches!(
             open_to_vec(&downgraded, &recipient),
-            Err(RaoAeadError::InvalidWrapSuite)
+            Err(RemObjectAeadError::InvalidWrapSuite)
         ));
     }
 
@@ -589,7 +589,7 @@ mod tests {
         };
         assert!(matches!(
             seal_to_vec(&plaintext, &options),
-            Err(RaoAeadError::InvalidInput(_))
+            Err(RemObjectAeadError::InvalidInput(_))
         ));
     }
 
@@ -640,7 +640,7 @@ mod tests {
                 &mut digest_mismatch_output,
                 &bad_digest_options,
             ),
-            Err(RaoAeadError::PlaintextDigestMismatch)
+            Err(RemObjectAeadError::PlaintextDigestMismatch)
         ));
         assert_no_footer(&digest_mismatch_output);
 
@@ -653,14 +653,14 @@ mod tests {
                 &mut size_mismatch_output,
                 &options,
             ),
-            Err(RaoAeadError::PlaintextSizeMismatch)
+            Err(RemObjectAeadError::PlaintextSizeMismatch)
         ));
         assert_no_footer(&size_mismatch_output);
 
         let mut failing_output = FailAfterWriter::new(256);
         assert!(matches!(
             seal(plaintext.as_slice(), &mut failing_output, &options),
-            Err(RaoAeadError::Io(_))
+            Err(RemObjectAeadError::Io(_))
         ));
         assert_no_footer(&failing_output.bytes);
     }
@@ -672,7 +672,7 @@ mod tests {
         plaintext.push(1);
         assert!(matches!(
             seal_to_vec(&plaintext, &options),
-            Err(RaoAeadError::PlaintextSizeMismatch)
+            Err(RemObjectAeadError::PlaintextSizeMismatch)
         ));
     }
 }

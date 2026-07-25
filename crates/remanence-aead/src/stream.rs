@@ -1,4 +1,4 @@
-//! ChaCha20-Poly1305 STREAM helpers for RAO payload and metadata frames.
+//! ChaCha20-Poly1305 STREAM helpers for REM-OBJECT payload and metadata frames.
 
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
@@ -6,8 +6,8 @@ use chacha20poly1305::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::error::{RaoAeadError, Result};
-use crate::header::{RAO_FOOTER, RAO_HEADER_LEN};
+use crate::error::{RemObjectAeadError, Result};
+use crate::header::{REM_OBJECT_FOOTER, REM_OBJECT_HEADER_LEN};
 
 /// ChaCha20-Poly1305 authentication tag length.
 pub const CHACHA20POLY1305_TAG_LEN: u64 = 16;
@@ -31,7 +31,7 @@ pub fn encrypt_metadata(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
                 aad: &[],
             },
         )
-        .map_err(|_| RaoAeadError::AeadAuthenticationFailed)
+        .map_err(|_| RemObjectAeadError::AeadAuthenticationFailed)
 }
 
 /// Decrypt one metadata frame with zero nonce and empty AAD.
@@ -44,10 +44,10 @@ pub fn decrypt_metadata(key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>> {
                 aad: &[],
             },
         )
-        .map_err(|_| RaoAeadError::AeadAuthenticationFailed)
+        .map_err(|_| RemObjectAeadError::AeadAuthenticationFailed)
 }
 
-/// Encrypt one full RAO STREAM payload chunk.
+/// Encrypt one full REM-OBJECT STREAM payload chunk.
 pub fn encrypt_chunk(
     key: &[u8; 32],
     counter: u64,
@@ -62,10 +62,10 @@ pub fn encrypt_chunk(
                 aad: &[],
             },
         )
-        .map_err(|_| RaoAeadError::AeadAuthenticationFailed)
+        .map_err(|_| RemObjectAeadError::AeadAuthenticationFailed)
 }
 
-/// Decrypt one full RAO STREAM payload chunk.
+/// Decrypt one full REM-OBJECT STREAM payload chunk.
 pub fn decrypt_chunk(
     key: &[u8; 32],
     counter: u64,
@@ -80,10 +80,10 @@ pub fn decrypt_chunk(
                 aad: &[],
             },
         )
-        .map_err(|_| RaoAeadError::AeadAuthenticationFailed)
+        .map_err(|_| RemObjectAeadError::AeadAuthenticationFailed)
 }
 
-/// RAO STREAM nonce: 11-byte big-endian counter plus final flag.
+/// REM-OBJECT STREAM nonce: 11-byte big-endian counter plus final flag.
 pub fn stream_nonce(counter: u64, final_chunk: bool) -> [u8; 12] {
     let mut nonce = [0u8; 12];
     nonce[3..11].copy_from_slice(&counter.to_be_bytes());
@@ -95,7 +95,7 @@ pub fn stream_nonce(counter: u64, final_chunk: bool) -> [u8; 12] {
 pub fn chunk_count(plaintext_size: u64, chunk_size: u32) -> Result<u64> {
     let chunk = u64::from(chunk_size);
     if chunk == 0 || plaintext_size == 0 || plaintext_size % chunk != 0 {
-        return Err(RaoAeadError::InvalidMetadataField);
+        return Err(RemObjectAeadError::InvalidMetadataField);
     }
     Ok(plaintext_size / chunk)
 }
@@ -107,9 +107,9 @@ pub fn payload_frame_len(plaintext_size: u64, chunk_size: u32) -> Result<u64> {
         .checked_add(
             CHACHA20POLY1305_TAG_LEN
                 .checked_mul(chunks)
-                .ok_or(RaoAeadError::SizeOverflow)?,
+                .ok_or(RemObjectAeadError::SizeOverflow)?,
         )
-        .ok_or(RaoAeadError::SizeOverflow)
+        .ok_or(RemObjectAeadError::SizeOverflow)
 }
 
 /// Compute padded stored size with the plaintext key frame.
@@ -120,12 +120,12 @@ pub fn stored_size_from_parts(
     plaintext_size: u64,
 ) -> Result<u64> {
     let payload_len = payload_frame_len(plaintext_size, chunk_size)?;
-    let footer_end = (RAO_HEADER_LEN as u64)
+    let footer_end = (REM_OBJECT_HEADER_LEN as u64)
         .checked_add(u64::from(key_frame_len))
         .and_then(|value| value.checked_add(metadata_frame_len))
         .and_then(|value| value.checked_add(payload_len))
-        .and_then(|value| value.checked_add(RAO_FOOTER.len() as u64))
-        .ok_or(RaoAeadError::SizeOverflow)?;
+        .and_then(|value| value.checked_add(REM_OBJECT_FOOTER.len() as u64))
+        .ok_or(RemObjectAeadError::SizeOverflow)?;
     round_up(footer_end, u64::from(chunk_size))
 }
 
@@ -138,12 +138,12 @@ pub fn cipher_offset(
 ) -> Result<u64> {
     let stride = u64::from(chunk_size)
         .checked_add(CHACHA20POLY1305_TAG_LEN)
-        .ok_or(RaoAeadError::SizeOverflow)?;
-    (RAO_HEADER_LEN as u64)
+        .ok_or(RemObjectAeadError::SizeOverflow)?;
+    (REM_OBJECT_HEADER_LEN as u64)
         .checked_add(u64::from(key_frame_len))
         .and_then(|value| value.checked_add(metadata_frame_len))
         .and_then(|base| base.checked_add(b.checked_mul(stride)?))
-        .ok_or(RaoAeadError::SizeOverflow)
+        .ok_or(RemObjectAeadError::SizeOverflow)
 }
 
 pub(crate) fn finalize_sha256(hasher: Sha256) -> [u8; 32] {
@@ -155,7 +155,7 @@ pub(crate) fn finalize_sha256(hasher: Sha256) -> [u8; 32] {
 
 pub(crate) fn round_up(value: u64, multiple: u64) -> Result<u64> {
     if multiple == 0 {
-        return Err(RaoAeadError::SizeOverflow);
+        return Err(RemObjectAeadError::SizeOverflow);
     }
     let remainder = value % multiple;
     if remainder == 0 {
@@ -163,7 +163,7 @@ pub(crate) fn round_up(value: u64, multiple: u64) -> Result<u64> {
     } else {
         value
             .checked_add(multiple - remainder)
-            .ok_or(RaoAeadError::SizeOverflow)
+            .ok_or(RemObjectAeadError::SizeOverflow)
     }
 }
 
@@ -189,11 +189,11 @@ mod tests {
         assert_eq!(chunk_count(1024, 512).unwrap(), 2);
         assert!(matches!(
             chunk_count(513, 512),
-            Err(RaoAeadError::InvalidMetadataField)
+            Err(RemObjectAeadError::InvalidMetadataField)
         ));
         assert!(matches!(
             chunk_count(0, 512),
-            Err(RaoAeadError::InvalidMetadataField)
+            Err(RemObjectAeadError::InvalidMetadataField)
         ));
     }
 
@@ -205,7 +205,7 @@ mod tests {
         assert_eq!(decrypt_chunk(&key, 0, true, &encrypted).unwrap(), chunk);
         assert!(matches!(
             decrypt_chunk(&key, 0, false, &encrypted),
-            Err(RaoAeadError::AeadAuthenticationFailed)
+            Err(RemObjectAeadError::AeadAuthenticationFailed)
         ));
     }
 }

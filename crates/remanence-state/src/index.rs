@@ -26,11 +26,11 @@ pub const SCHEMA_VERSION: u32 = 14;
 /// Digest algorithm emitted by the current catalog writers.
 pub const DIGEST_ALGORITHM_SHA256: &str = "sha256";
 const LEGACY_TAPE_POOL_MEMBERSHIPS_TABLE: &str = concat!("tape_pool_", "memberships");
-/// Catalog value for an unencrypted RAO copy row.
+/// Catalog value for an unencrypted REM-OBJECT copy row.
 pub const OBJECT_COPY_REPRESENTATION_PLAINTEXT: &str = "plaintext";
-/// Catalog value for an encrypted RAO copy row.
+/// Catalog value for an encrypted REM-OBJECT copy row.
 pub const OBJECT_COPY_REPRESENTATION_ENCRYPTED: &str = "encrypted";
-/// Catalog value for journal-discovered object copies whose RAO envelope row is unavailable.
+/// Catalog value for journal-discovered object copies whose REM-OBJECT envelope row is unavailable.
 pub const OBJECT_COPY_REPRESENTATION_UNKNOWN: &str = "unknown";
 
 /// Typed owner for the rebuildable SQLite catalog projection.
@@ -678,13 +678,13 @@ pub struct NativeObjectCopyRecord {
     pub status: String,
     /// Pool of the tape when this copy was committed, if assigned.
     pub pool_id: Option<String>,
-    /// RAO representation stored in this copy: `plaintext`, `encrypted`, or `unknown`.
+    /// REM-OBJECT representation stored in this copy: `plaintext`, `encrypted`, or `unknown`.
     pub representation: String,
     /// Lowercase 32-hex recipient epoch ids for encrypted copies.
     pub recipient_epoch_ids: Option<Vec<String>>,
-    /// Encrypted RAO metadata frame length.
+    /// Encrypted REM-OBJECT metadata frame length.
     pub metadata_frame_len: Option<u64>,
-    /// SHA-256 of the canonical plaintext RAO object bytes.
+    /// SHA-256 of the canonical plaintext REM-OBJECT object bytes.
     pub plaintext_digest: Option<Vec<u8>>,
     /// Algorithm naming the plaintext digest when present.
     pub plaintext_digest_algorithm: Option<String>,
@@ -755,13 +755,13 @@ pub struct NativeObjectCopyProjectionInput {
     pub protected_until_ordinal: Option<u64>,
     /// Projected copy status.
     pub status: String,
-    /// RAO representation stored in this copy: `plaintext` or `encrypted`.
+    /// REM-OBJECT representation stored in this copy: `plaintext` or `encrypted`.
     pub representation: String,
     /// Lowercase 32-hex recipient epoch ids for encrypted copies.
     pub recipient_epoch_ids: Option<Vec<String>>,
-    /// Encrypted RAO metadata frame length.
+    /// Encrypted REM-OBJECT metadata frame length.
     pub metadata_frame_len: Option<u64>,
-    /// SHA-256 of the canonical plaintext RAO object bytes.
+    /// SHA-256 of the canonical plaintext REM-OBJECT object bytes.
     pub plaintext_digest: Option<Vec<u8>>,
     /// SHA-256 of the stored representation bytes for this copy.
     pub stored_digest: Option<Vec<u8>>,
@@ -10491,7 +10491,7 @@ mod tests {
         NativeObjectProjectionInput {
             object_id: object_id.to_string(),
             caller_object_id: Some(format!("caller-{object_id}")),
-            body_format: "rao-v1".to_string(),
+            body_format: "rem-object-v1".to_string(),
             logical_size_bytes: Some(42),
             content_hash: Some(vec![0x41; 32]),
             metadata_hash: Some(vec![0x42; 32]),
@@ -10990,7 +10990,7 @@ mod tests {
                 NativeObjectProjectionInput {
                     object_id: "object-foreign-pool".to_string(),
                     caller_object_id: Some("caller-foreign-pool".to_string()),
-                    body_format: "rao-v1".to_string(),
+                    body_format: "rem-object-v1".to_string(),
                     logical_size_bytes: Some(42),
                     content_hash: Some(vec![1u8; 32]),
                     metadata_hash: Some(vec![2u8; 32]),
@@ -14533,7 +14533,7 @@ mod tests {
                    object_id, caller_object_id, body_format, logical_size_bytes,
                    content_hash, metadata_hash, created_at_utc
                  )
-                 values('append-duplicate', 'caller-old', 'rao-v1', 1, null, null,
+                 values('append-duplicate', 'caller-old', 'rem-object-v1', 1, null, null,
                         '2026-07-05T11:00:00Z')",
                 [],
             )
@@ -14698,7 +14698,7 @@ mod tests {
                 NativeObjectProjectionInput {
                     object_id: object_id.to_string(),
                     caller_object_id: Some("caller-atomic".to_string()),
-                    body_format: "rao-v1".to_string(),
+                    body_format: "rem-object-v1".to_string(),
                     logical_size_bytes: Some(42),
                     content_hash: Some(vec![1u8; 32]),
                     metadata_hash: Some(vec![2u8; 32]),
@@ -14787,7 +14787,7 @@ mod tests {
                 NativeObjectProjectionInput {
                     object_id: "object-1".to_string(),
                     caller_object_id: Some("caller-1".to_string()),
-                    body_format: "rao-v1".to_string(),
+                    body_format: "rem-object-v1".to_string(),
                     logical_size_bytes: Some(42),
                     content_hash: Some(vec![1u8; 32]),
                     metadata_hash: Some(vec![2u8; 32]),
@@ -14814,7 +14814,7 @@ mod tests {
         assert_eq!(objects.len(), 1);
         assert_eq!(objects[0].object_id, "object-1");
         assert_eq!(objects[0].caller_object_id.as_deref(), Some("caller-1"));
-        assert_eq!(objects[0].body_format, "rao-v1");
+        assert_eq!(objects[0].body_format, "rem-object-v1");
         assert_eq!(objects[0].logical_size_bytes, Some(42));
         assert_eq!(
             objects[0].content_hash_algorithm.as_deref(),
@@ -14893,7 +14893,7 @@ mod tests {
             .expect("list catalog units");
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].origin_kind, "native_object");
-        assert_eq!(units[0].format_id, "rao-v1");
+        assert_eq!(units[0].format_id, "rem-object-v1");
         assert_eq!(units[0].native_object_id.as_deref(), Some("object-1"));
         assert_eq!(units[0].tape_uuid, tape_uuid.to_vec());
         assert_eq!(
@@ -14986,7 +14986,7 @@ mod tests {
                     NativeObjectProjectionInput {
                         object_id: object_id.to_string(),
                         caller_object_id: Some("shared-caller".to_string()),
-                        body_format: "rao-v1".to_string(),
+                        body_format: "rem-object-v1".to_string(),
                         logical_size_bytes: Some(42),
                         content_hash: Some(vec![hash_byte; 32]),
                         metadata_hash: Some(vec![0x44; 32]),
@@ -15055,7 +15055,7 @@ mod tests {
                 NativeObjectProjectionInput {
                     object_id: object_id.to_string(),
                     caller_object_id: Some("caller-encrypted".to_string()),
-                    body_format: "rao-v1".to_string(),
+                    body_format: "rem-object-v1".to_string(),
                     logical_size_bytes: Some(4096),
                     content_hash: Some(vec![0x11u8; 32]),
                     metadata_hash: None,
@@ -15317,7 +15317,7 @@ mod tests {
                 NativeObjectProjectionInput {
                     object_id: "object-1".to_string(),
                     caller_object_id: None,
-                    body_format: "rao-v1".to_string(),
+                    body_format: "rem-object-v1".to_string(),
                     logical_size_bytes: Some(99),
                     content_hash: None,
                     metadata_hash: None,
@@ -15346,7 +15346,7 @@ mod tests {
                 .expect("get refreshed unit")
                 .expect("unit exists")
                 .format_id,
-            "rao-v1"
+            "rem-object-v1"
         );
     }
 

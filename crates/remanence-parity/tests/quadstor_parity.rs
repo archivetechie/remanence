@@ -1,7 +1,7 @@
-//! Layer 3c Step 11.18 — QuadStor VTL parity smoke tests.
+//! Layer 3c Step 11.18 — Quadstor VTL parity smoke tests.
 //!
 //! `#[ignore]`-gated by default. Runs only when env vars point
-//! at a QuadStor VTL drive that's safe to write to.
+//! at a Quadstor VTL drive that's safe to write to.
 //!
 //! ## Env vars
 //!
@@ -48,7 +48,7 @@
 //! `ObjectParitySource`
 //! reconstructs the protected block from the sidecar.
 //! This is deliberately destructive and should be run only on a
-//! scratch QuadStor cartridge.
+//! scratch Quadstor cartridge.
 //!
 //! The injected failure is above the SCSI sense-code layer: it uses the
 //! existing completion-unknown transport-error recovery path instead of
@@ -397,7 +397,7 @@ fn write_raw_block(sink: &mut dyn RawTapeSink, block: &[u8], label: &str) {
         .unwrap_or_else(|err| panic!("{label}: {err}"));
     assert!(
         !outcome.end_of_medium(),
-        "{label}: unexpected end-of-medium on QuadStor scratch tape"
+        "{label}: unexpected end-of-medium on Quadstor scratch tape"
     );
 }
 
@@ -407,7 +407,7 @@ fn write_raw_filemark(sink: &mut dyn RawTapeSink, label: &str) {
         .unwrap_or_else(|err| panic!("{label}: {err}"));
     assert!(
         !outcome.end_of_medium(),
-        "{label}: unexpected end-of-medium on QuadStor scratch tape"
+        "{label}: unexpected end-of-medium on Quadstor scratch tape"
     );
 }
 
@@ -644,10 +644,10 @@ fn quadstor_parity_roundtrip() {
     }
     let mut handle = library
         .open(&policy)
-        .expect("open selected QuadStor library for state-changing parity smoke");
+        .expect("open selected Quadstor library for state-changing parity smoke");
     let mut drive = handle
         .open_drive(bay_address, &policy)
-        .expect("open selected QuadStor drive");
+        .expect("open selected Quadstor drive");
     let original_config = configure_parity_write_session(&mut drive, block_size, "parity smoke");
     drive.rewind().expect("rewind before destructive write");
 
@@ -747,10 +747,10 @@ fn quadstor_parity_journaled_session() {
     }
     let mut handle = library
         .open(&policy)
-        .expect("open selected QuadStor library for journaled parity smoke");
+        .expect("open selected Quadstor library for journaled parity smoke");
     let mut drive = handle
         .open_drive(bay_address, &policy)
-        .expect("open selected QuadStor drive");
+        .expect("open selected Quadstor drive");
     let original_config = configure_parity_write_session(&mut drive, block_size, "journaled smoke");
     drive.rewind().expect("rewind before destructive write");
 
@@ -848,10 +848,10 @@ fn quadstor_parity_recovers_from_injected_read_fault() {
     }
     let mut handle = library
         .open(&policy)
-        .expect("open selected QuadStor library for recovery smoke");
+        .expect("open selected Quadstor library for recovery smoke");
     let mut drive = handle
         .open_drive(bay_address, &policy)
-        .expect("open selected QuadStor drive");
+        .expect("open selected Quadstor drive");
     let original_config = configure_parity_write_session(&mut drive, block_size, "recovery smoke");
     drive.rewind().expect("rewind before destructive write");
 
@@ -965,10 +965,10 @@ fn quadstor_parity_resume_append_roundtrip() {
     }
     let mut handle = library
         .open(&policy)
-        .expect("open selected QuadStor library for state-changing append smoke");
+        .expect("open selected Quadstor library for state-changing append smoke");
     let mut drive = handle
         .open_drive(bay_address, &policy)
-        .expect("open selected QuadStor drive");
+        .expect("open selected Quadstor drive");
     let original_config = configure_parity_write_session(&mut drive, block_size, "append smoke");
     drive.rewind().expect("rewind before destructive write");
 
@@ -1164,10 +1164,10 @@ fn quadstor_parity_resume_rebuilds_open_epoch_then_appends() {
     }
     let mut handle = library
         .open(&policy)
-        .expect("open selected QuadStor library for W<T resume smoke");
+        .expect("open selected Quadstor library for W<T resume smoke");
     let mut drive = handle
         .open_drive(bay_address, &policy)
-        .expect("open selected QuadStor drive");
+        .expect("open selected Quadstor drive");
     let original_config =
         configure_parity_write_session(&mut drive, block_size, "W<T resume smoke");
     drive
@@ -1381,10 +1381,10 @@ fn quadstor_parity_resume_rebuilds_multiple_open_epochs_then_appends() {
     }
     let mut handle = library
         .open(&policy)
-        .expect("open selected QuadStor library for multi-epoch W<T resume smoke");
+        .expect("open selected Quadstor library for multi-epoch W<T resume smoke");
     let mut drive = handle
         .open_drive(bay_address, &policy)
-        .expect("open selected QuadStor drive");
+        .expect("open selected Quadstor drive");
     let original_config =
         configure_parity_write_session(&mut drive, block_size, "multi-epoch W<T resume smoke");
     drive

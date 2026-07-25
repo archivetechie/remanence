@@ -2171,7 +2171,7 @@ mod l1b_tests {
                 executable: Some(false),
             }];
             let layout =
-                write_rem_tar_object(&mut sink, &options, &files).expect("write RAO object");
+                write_rem_tar_object(&mut sink, &options, &files).expect("write REM-OBJECT object");
             let summary = sink.finish_object().expect("finish object");
             assert_eq!(summary.tape_file_number, tape_file_number);
             assert_eq!(summary.data_block_count, layout.projected_size_blocks);

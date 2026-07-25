@@ -24,8 +24,8 @@ cargo build --release
 
 That produces four binaries under `target/release/`: `rem` (operator
 CLI), `rem-debug` (break-glass CLI), `rem-daemon` (the service), and
-`rao-recover` (a standalone catalogless disaster-recovery tool — see the
-[CLI reference](reference-cli.md#rao-recover-standalone-recovery)).
+`rem-recover` (a standalone catalogless disaster-recovery tool — see the
+[CLI reference](reference-cli.md#rem-recover-standalone-recovery)).
 
 Two optional cargo features widen the surface:
 
@@ -58,10 +58,10 @@ head -c 100000 /dev/urandom > demo/src/photos/img001.raw
 cd demo
 ```
 
-Build a RAO object:
+Build a REM-OBJECT object:
 
 ```sh
-rem archive build --inputs src --out demo.rao
+rem archive build --inputs src --out demo.rem-object
 ```
 
 The command prints a JSON build report: the object id, the chunk size
@@ -72,27 +72,27 @@ store; every field in it is also recoverable from the object itself.
 Inspect the object without extracting it:
 
 ```sh
-rem archive inspect --object demo.rao
+rem archive inspect --object demo.rem-object
 ```
 
 Then restore and compare:
 
 ```sh
-rem archive extract --object demo.rao --dest restored
+rem archive extract --object demo.rem-object --dest restored
 diff -r src restored && echo identical
 ```
 
-Two properties worth noticing. First, `demo.rao` is a valid POSIX pax tar
-stream padded to fixed-size chunks — `bsdtar -tf demo.rao` lists your
+Two properties worth noticing. First, `demo.rem-object` is a valid POSIX pax tar
+stream padded to fixed-size chunks — `bsdtar -tf demo.rem-object` lists your
 files plus a `_remanence/manifest.cbor` index entry. A tape written by
 Remanence holds exactly these bytes as its object body, which is the
 30-year-readability story: no Remanence software is needed to get the
 data back. Second, every file's SHA-256 travels with it, so verification
 never depends on host state.
 
-![Local round trip: rem archive build turns src/ into demo.rao, rem archive extract restores it, diff -r confirms the copies are byte-identical, and rem archive inspect reads the object in place](assets/local-roundtrip.svg)
+![Local round trip: rem archive build turns src/ into demo.rem-object, rem archive extract restores it, diff -r confirms the copies are byte-identical, and rem archive inspect reads the object in place](assets/local-roundtrip.svg)
 
-*Fig. 1 — The local round trip: build a rao-v1 object from a directory, read it back, and prove the copies identical — the same bytes a tape write stores as the object body.*
+*Fig. 1 — The local round trip: build a rem-object-v1 object from a directory, read it back, and prove the copies identical — the same bytes a tape write stores as the object body.*
 
 <!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-aead/src/lib.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/xwing.rs @ 8de2c46 -->
 ## The encrypted variant
@@ -106,46 +106,46 @@ running the X-Wing post-quantum/classical hybrid KEM (ML-KEM-768
 combined with X25519). Writers require 2-8 distinct recipient epochs in
 ascending slot order.
 
-Remanence consumes canonical RAOR public-key files and RAOP private-key
+Remanence consumes canonical REMR public-key files and REMP private-key
 files; key-pair provisioning belongs to the custodian/key-registry tooling,
-not this CLI. Assuming two custodians supplied `primary.raor` and
-`recovery.raor`, build the encrypted object directly:
+not this CLI. Assuming two custodians supplied `primary.remr` and
+`recovery.remr`, build the encrypted object directly:
 
 ```sh
-rem archive build --inputs src --out demo-enc.rao \
-    --recipient primary.raor --recipient recovery.raor
-rem archive inspect --object demo-enc.rao
-rem archive extract --object demo-enc.rao --dest restored-enc \
-    --private-key primary.raop
+rem archive build --inputs src --out demo-enc.rem-object \
+    --recipient primary.remr --recipient recovery.remr
+rem archive inspect --object demo-enc.rem-object
+rem archive extract --object demo-enc.rem-object --dest restored-enc \
+    --private-key primary.remp
 diff -r src restored-enc && echo identical
 ```
 
 `inspect` needs no key. It validates the envelope header and key frame and reports
 the ordered `recipient_epochs`, but cannot expose the encrypted manifest.
-The matching RAOP file selects its epoch's slot during open.
+The matching REMP file selects its epoch's slot during open.
 
 To rotate recipients, open the existing encrypted object with one current private
 key and reseal it to a new 2-8-recipient set:
 
 ```sh
-rem archive reseal --object demo-enc.rao --private-key primary.raop \
-    --recipient primary-rotated.raor recovery.raor \
-    --out demo-rotated.rao
+rem archive reseal --object demo-enc.rem-object --private-key primary.remp \
+    --recipient primary-rotated.remr recovery.remr \
+    --out demo-rotated.rem-object
 ```
 
 `reseal` performs a full re-seal: it verifies the new stored digest before
 publishing and never overwrites an existing output. It always emits an encrypted
 envelope.
 
-For catalogless disaster recovery, use the standalone `rao-recover` binary
+For catalogless disaster recovery, use the standalone `rem-recover` binary
 with any matching recipient private key:
 
 ```sh
-rao-recover --object demo-enc.rao --private-key recovery.raop --out recovered
+rem-recover --object demo-enc.rem-object --private-key recovery.remp --out recovered
 diff -r src recovered && echo identical
 ```
 
-`rao-recover` needs no daemon, catalog, or config file — it's the
+`rem-recover` needs no daemon, catalog, or config file — it's the
 disaster-recovery path of last resort. For streaming and partial retrieval,
 `archive extract-stream` and `archive covering-range` use the same
 `--private-key` epoch-selection contract.
@@ -154,7 +154,7 @@ disaster-recovery path of last resort. For streaming and partial retrieval,
 ## Talking to a library (requires hardware)
 
 From here on you need a tape library — a real chassis or a virtual one
-(the project develops against QuadStor VTL). Two host-side gates must be
+(the project develops against Quadstor VTL). Two host-side gates must be
 open before any SCSI command works:
 
 1. Your user must be in the `tape` group (this gates opening
@@ -287,21 +287,21 @@ the command line. Note the `--allow` flag: every state-changing
 ```sh
 rem-debug --allow <SERIAL> archive write \
     --library <SERIAL> --pool demo --file /path/to/payload.bin --json \
-    --recipient primary.raor --recipient recovery.raor \
+    --recipient primary.remr --recipient recovery.remr \
     > locator.json
 
 rem-debug --allow <SERIAL> archive verify \
     --library <SERIAL> --locator "$(cat locator.json)" \
-    --private-key primary.raop \
+    --private-key primary.remp \
     --expected-sha256 "$(sha256sum /path/to/payload.bin | cut -d' ' -f1)"
 
 rem-debug --allow <SERIAL> archive read \
     --library <SERIAL> --locator "$(cat locator.json)" --out restored.bin \
-    --private-key primary.raop
+    --private-key primary.remp
 ```
 
 The locator JSON emitted by `write` pins the object copy to physical
-media and records `format_version: 2` plus the recipient epochs; `verify`
+media and records `format_version: 1` plus the recipient epochs; `verify`
 streams and authenticates the tape object against a digest without restoring
 anything.
 

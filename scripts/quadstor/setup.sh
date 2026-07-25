@@ -1,12 +1,12 @@
 #!/bin/bash
-# Set up a QuadStor virtual tape library matching the Remanence dev target:
+# Set up a Quadstor virtual tape library matching the Remanence dev target:
 # - HP MSL G3 Series changer
 # - 4 × HPE LTO-9 drives
 # - 40 storage slots
 # - 4 import/export ports
 # - 10 virtual LTO-9 cartridges
-# Backing storage: sparse file → loopback → LVM PV/VG/LV → QuadStor.
-# (QuadStor accepts LVM volumes — it rejects raw loop/dm-linear/scsi_debug.)
+# Backing storage: sparse file → loopback → LVM PV/VG/LV → Quadstor.
+# (Quadstor accepts LVM volumes — it rejects raw loop/dm-linear/scsi_debug.)
 #
 # Idempotent. Safe to re-run after a partial setup.
 #
@@ -21,9 +21,9 @@ source "$DIR/common.sh"
 
 need_sudo
 
-log "QuadStor VTL setup starting (VTL='$VTL_NAME', $DRIVE_COUNT × $DRIVE_DEF, ${SLOT_COUNT} slots)"
+log "Quadstor VTL setup starting (VTL='$VTL_NAME', $DRIVE_COUNT × $DRIVE_DEF, ${SLOT_COUNT} slots)"
 
-# --- 1. Ensure QuadStor service is up --------------------------------
+# --- 1. Ensure Quadstor service is up --------------------------------
 if ! systemctl is-active --quiet quadstorvtl; then
     log "quadstorvtl service not running — starting it"
     systemctl start quadstorvtl
@@ -101,7 +101,7 @@ if [[ ! -f "$SYSTEMD_UNIT" ]]; then
     log "installing systemd unit to reattach loop + activate LVM on boot"
     cat >"$SYSTEMD_UNIT" <<EOF
 [Unit]
-Description=Attach QuadStor backing loopback + LVM
+Description=Attach Quadstor backing loopback + LVM
 DefaultDependencies=no
 Before=quadstorvtl.service
 After=local-fs.target lvm2-monitor.service
@@ -119,7 +119,7 @@ EOF
     systemctl enable quadstor-loop.service >/dev/null
 fi
 
-# --- 4. Add the LV to QuadStor's pool --------------------------------
+# --- 4. Add the LV to Quadstor's pool --------------------------------
 if disk_configured "$LV_PATH"; then
     log "LV $LV_PATH already in pool '$POOL_NAME'"
 else
@@ -128,7 +128,7 @@ else
     "$BDCONFIG" -a -d "$LV_PATH" -g "$POOL_NAME"
 fi
 
-# --- 5. Wait for QuadStor's disk init to finish ----------------------
+# --- 5. Wait for Quadstor's disk init to finish ----------------------
 # Init speed ~150 MB/s. A 100G LV takes ~11 min the first time.
 # Subsequent runs find Status=Active and skip the wait immediately.
 log "waiting for disk init (status: 'Active' when done)…"

@@ -5,7 +5,7 @@
 > but its implementation-status remarks predate Layers 3–5: the on-tape
 > format, parity, catalog, audit log, and daemon described below as
 > "specified but not built" have since been implemented (the body format
-> shipped as `rao-v1` rather than the working names used here), and
+> shipped as `rem-object-v1` rather than the working names used here), and
 > `spec-v0.3.md` has been superseded. For what exists today, see the
 > [README](../README.md) and the
 > [architecture overview](architecture-overview.md); this file is kept

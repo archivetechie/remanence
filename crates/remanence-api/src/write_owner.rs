@@ -7130,7 +7130,7 @@ fn session_proto(input: WriteSessionProtoInput<'_>) -> pb::WriteSession {
         session_id: input.session_id.as_bytes().to_vec(),
         tape_uuid: input.tape_uuid.to_vec(),
         drive_element_address: u32::from(input.drive_element_address),
-        body_format: "rao-v1".to_string(),
+        body_format: "rem-object-v1".to_string(),
         state: input.state as i32,
         objects_committed: input.objects_committed,
         bytes_committed: input.bytes_committed,
@@ -7231,8 +7231,8 @@ mod tests {
     use remanence_aead::RecipientPrivateKey;
     use remanence_chaos::model::{ModelTransport, Record, VirtualTape, VirtualWorld};
     use remanence_format::{
-        read_encrypted_rao_file_range_to_vec, write_encrypted_rao_object, write_rem_tar_object,
-        RemTarFile, RemTarObjectLayout, RemTarObjectOptions,
+        read_encrypted_rem_object_file_range_to_vec, write_encrypted_rem_object,
+        write_rem_tar_object, RemTarFile, RemTarObjectLayout, RemTarObjectOptions,
     };
     use remanence_library::{
         DriveBay, ElementLayout, FixtureTransport, IdentitySource, InstalledDrive, Library,
@@ -8462,7 +8462,7 @@ mod tests {
             assert_eq!(
                 payload.object_rows.len() as u64,
                 record.committed_object_count,
-                "checkpoint bootstrap carries every committed-prefix RAO row"
+                "checkpoint bootstrap carries every committed-prefix REM-OBJECT row"
             );
             assert!(payload
                 .object_rows
@@ -8798,7 +8798,7 @@ mod tests {
     fn cataloged_payload_fixture(payload: &[u8]) -> RangeCatalogFixture {
         let opts = range_options(512);
         let files = [RemTarFile {
-            path: "payload.rao",
+            path: "payload.rem-object",
             file_id: "payload-file",
             data: payload,
             mtime: Some("0"),
@@ -8827,7 +8827,7 @@ mod tests {
                 NativeObjectProjectionInput {
                     object_id: RANGE_OBJECT_ID.to_string(),
                     caller_object_id: Some("caller-range".to_string()),
-                    body_format: "rao-v1".to_string(),
+                    body_format: "rem-object-v1".to_string(),
                     logical_size_bytes: Some(payload.len() as u64),
                     content_hash: payload_layout.file_sha256.map(|hash| hash.to_vec()),
                     metadata_hash: None,
@@ -8836,7 +8836,7 @@ mod tests {
                 &[NativeObjectFileProjectionInput {
                     object_id: RANGE_OBJECT_ID.to_string(),
                     file_id: "payload-file".to_string(),
-                    path: "payload.rao".to_string(),
+                    path: "payload.rem-object".to_string(),
                     size_bytes: payload.len() as u64,
                     file_sha256: payload_layout
                         .file_sha256
@@ -10502,7 +10502,7 @@ mod tests {
             recovery.public_key(1).unwrap(),
         ];
         let mut encrypted_sink = VecBlockSink::new();
-        let encrypted_report = write_encrypted_rao_object(
+        let encrypted_report = write_encrypted_rem_object(
             &mut encrypted_sink,
             &encrypted_opts,
             &encrypted_files,
@@ -10510,7 +10510,7 @@ mod tests {
         )
         .expect("write encrypted payload");
         let encrypted_payload: Vec<u8> = encrypted_sink.blocks.iter().flatten().copied().collect();
-        assert_eq!(&encrypted_payload[0..4], b"RAO1");
+        assert_eq!(&encrypted_payload[0..4], b"REMO");
 
         let fixture = cataloged_payload_fixture(&encrypted_payload);
         let header = stream_fixture_range(&fixture, "", 0, 64)
@@ -10523,7 +10523,7 @@ mod tests {
             .expect("opaque encrypted payload");
         assert_eq!(opaque, encrypted_payload);
 
-        let opened = read_encrypted_rao_file_range_to_vec(
+        let opened = read_encrypted_rem_object_file_range_to_vec(
             &opaque,
             &primary,
             encrypted_report.plaintext_layout.files[0].first_chunk_lba,

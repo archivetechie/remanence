@@ -1,5 +1,5 @@
 #!/bin/bash
-# Shared config for Remanence's QuadStor VTL helper scripts.
+# Shared config for Remanence's Quadstor VTL helper scripts.
 # Source this from setup.sh / reset.sh / teardown.sh / status.sh.
 
 set -euo pipefail
@@ -21,8 +21,8 @@ CART_PREFIX="${CART_PREFIX:-RMN001}"
 CART_COUNT="${CART_COUNT:-10}"             # number of vcartridges to add
 
 # --- Backing storage -------------------------------------------------
-# We back QuadStor with an LVM logical volume sitting on top of a loopback
-# file. QuadStor's daemon rejects raw loop / dm-linear / scsi_debug devices
+# We back Quadstor with an LVM logical volume sitting on top of a loopback
+# file. Quadstor's daemon rejects raw loop / dm-linear / scsi_debug devices
 # but explicitly accepts LVM volumes (per its own docs), so the LV is the
 # minimum-friction path that needs no external disk.
 BACKING_DIR="${BACKING_DIR:-/var/lib/quadstor-backing}"
@@ -30,9 +30,9 @@ BACKING_FILE="${BACKING_FILE:-$BACKING_DIR/main.img}"
 BACKING_SIZE_GB="${BACKING_SIZE_GB:-100}"  # sparse — actual disk use scales with vtape writes
 LVM_VG="${LVM_VG:-qsvg}"
 LVM_LV="${LVM_LV:-qslv}"
-LV_PATH="/dev/mapper/${LVM_VG}-${LVM_LV}"   # canonical path QuadStor wants
+LV_PATH="/dev/mapper/${LVM_VG}-${LVM_LV}"   # canonical path Quadstor wants
 
-# --- QuadStor binaries -----------------------------------------------
+# --- Quadstor binaries -----------------------------------------------
 QS_BIN=/quadstorvtl/bin
 DEVICEDEF="$QS_BIN/devicedef"
 SPCONFIG="$QS_BIN/spconfig"
@@ -46,7 +46,7 @@ die() { log "ERROR: $*" >&2; exit 1; }
 
 need_sudo() {
     if [[ $EUID -ne 0 ]]; then
-        die "run with sudo (some QuadStor binaries need root)"
+        die "run with sudo (some Quadstor binaries need root)"
     fi
 }
 
@@ -65,7 +65,7 @@ vtl_exists() {
     "$VTCONFIG" -l 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$1"
 }
 
-# Is disk $1 already configured in QuadStor?
+# Is disk $1 already configured in Quadstor?
 disk_configured() {
     "$BDCONFIG" -l -c 2>/dev/null | grep -qE "(^|[[:space:]])$1([[:space:]]|$)"
 }

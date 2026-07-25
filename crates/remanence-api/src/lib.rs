@@ -2578,11 +2578,11 @@ impl pb::write_session_service_server::WriteSessionService for WriteSessionApi {
             ));
         }
         let body_format = if request.body_format.trim().is_empty() {
-            "rao-v1".to_string()
+            "rem-object-v1".to_string()
         } else {
             request.body_format.trim().to_string()
         };
-        if body_format != "rao-v1" {
+        if body_format != "rem-object-v1" {
             return Err(Status::unimplemented(format!(
                 "write body format {body_format} is not wired in this slice"
             )));
@@ -5488,7 +5488,7 @@ mod tests {
     use remanence_chaos::model::{
         DeviceRole, ModelTransport, Record as VirtualRecord, VirtualTape, VirtualWorld,
     };
-    use remanence_format::{read_encrypted_rao_object, read_rem_tar_object};
+    use remanence_format::{read_encrypted_rem_object, read_rem_tar_object};
     use remanence_library::scsi::{DeviceType, Inquiry};
     use remanence_library::{
         BlockSink, DiscoveryReport, DriveBay, ElementLayout, IdentitySource, IePort,
@@ -6052,7 +6052,7 @@ mod tests {
         let record = NativeObjectRecord {
             object_id: OBJECT_ID_TEXT.to_string(),
             caller_object_id: Some("caller-object".to_string()),
-            body_format: "rao-v1".to_string(),
+            body_format: "rem-object-v1".to_string(),
             logical_size_bytes: Some(456),
             content_hash: Some(vec![0x33; 32]),
             content_hash_algorithm: Some(remanence_state::DIGEST_ALGORITHM_SHA256.to_string()),
@@ -6129,7 +6129,7 @@ mod tests {
             caller_object_id: String::new(),
             content_sha256: vec![0x11; 32],
             logical_size_bytes: 10,
-            body_format: "rao-v1".to_string(),
+            body_format: "rem-object-v1".to_string(),
             caller_metadata: Default::default(),
             created_at: None,
             copies: Vec::new(),
@@ -6246,7 +6246,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn overlap_receiver_preserves_bytes_and_accepts_only_the_binding_digest() {
         let session_id = Uuid::new_v4();
-        let payload = b"receiver and RAO writer observe the same plaintext".to_vec();
+        let payload = b"receiver and REM-OBJECT writer observe the same plaintext".to_vec();
         let digest: [u8; 32] = Sha256::digest(&payload).into();
         let capacity = crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
         let manager = crate::io_memory::IoMemoryReservation::new(capacity).expect("manager");
@@ -6865,7 +6865,7 @@ BCw3Wyv2UWY=
                     object: NativeObjectProjectionInput {
                         object_id: object_uuid.to_string(),
                         caller_object_id: Some("checkpoint-selection-test".to_string()),
-                        body_format: "rao-v1".to_string(),
+                        body_format: "rem-object-v1".to_string(),
                         logical_size_bytes: Some(1),
                         content_hash: Some(vec![0x11; 32]),
                         metadata_hash: Some(vec![0x22; 32]),
@@ -6932,7 +6932,7 @@ BCw3Wyv2UWY=
                 object: NativeObjectProjectionInput {
                     object_id: object_uuid.to_string(),
                     caller_object_id: Some(format!("restart-object-{ordinal}")),
-                    body_format: "rao-v1".to_string(),
+                    body_format: "rem-object-v1".to_string(),
                     logical_size_bytes: Some(block_count * u64::from(API_SESSION_BLOCK_SIZE)),
                     content_hash: Some(vec![object_byte; 32]),
                     metadata_hash: Some(vec![object_byte.wrapping_add(1); 32]),
@@ -7405,7 +7405,7 @@ BCw3Wyv2UWY=
                 NativeObjectProjectionInput {
                     object_id: OBJECT_ID_TEXT.to_string(),
                     caller_object_id: Some("caller-1".to_string()),
-                    body_format: "rao-v1".to_string(),
+                    body_format: "rem-object-v1".to_string(),
                     logical_size_bytes: Some(17),
                     content_hash: Some(vec![7u8; 32]),
                     metadata_hash: None,
@@ -7444,7 +7444,7 @@ BCw3Wyv2UWY=
                 NativeObjectProjectionInput {
                     object_id: OBJECT_ID_TEXT.to_string(),
                     caller_object_id: Some("caller-1".to_string()),
-                    body_format: "rao-v1".to_string(),
+                    body_format: "rem-object-v1".to_string(),
                     logical_size_bytes: Some(17),
                     content_hash: Some(vec![7u8; 32]),
                     metadata_hash: None,
@@ -8712,7 +8712,7 @@ BCw3Wyv2UWY=
         assert_eq!(result.object.caller_object_id, "caller-pool-core");
         assert_eq!(result.object.content_sha256.to_vec(), expected_hash);
         assert_eq!(result.object.logical_size_bytes, payload.len() as u64);
-        assert_eq!(result.object.body_format, "rao-v1");
+        assert_eq!(result.object.body_format, "rem-object-v1");
         assert_eq!(result.object.copies.len(), 1);
         let copy = &result.object.copies[0];
         assert_eq!(copy.tape_uuid, POOL_WRITE_TAPE_UUID);
@@ -8848,7 +8848,7 @@ BCw3Wyv2UWY=
             API_SESSION_BLOCK_SIZE as usize,
             result.expect_write_report().layout.projected_size_blocks,
         )
-        .expect("read no-parity RAO object");
+        .expect("read no-parity REM-OBJECT object");
         assert_eq!(
             read.entry("payload.bin").expect("payload entry").data,
             payload
@@ -9169,16 +9169,16 @@ BCw3Wyv2UWY=
             usize::try_from(result.expect_write_report().object_close.data_block_count)
                 .expect("stored block count fits usize");
         let mut source = VecBlockSource::new(tape_sink.blocks[1..1 + stored_block_count].to_vec());
-        let opened = read_encrypted_rao_object(
+        let opened = read_encrypted_rem_object(
             &mut source,
             API_SESSION_BLOCK_SIZE as usize,
             result.expect_write_report().object_close.data_block_count,
             &primary_key,
         )
-        .expect("decrypt encrypted RAO object");
+        .expect("decrypt encrypted REM-OBJECT object");
         let restored = opened.object.entry("payload.bin").expect("payload entry");
         assert_eq!(restored.data, payload);
-        assert_eq!(opened.envelope.header.format_version, 2);
+        assert_eq!(opened.envelope.header.format_version, 1);
         assert_eq!(
             opened.envelope.header.metadata_frame_len,
             metadata_frame_len
@@ -9272,7 +9272,7 @@ BCw3Wyv2UWY=
     }
 
     #[test]
-    fn pool_write_uses_selected_tape_block_size_as_rao_chunk_size() {
+    fn pool_write_uses_selected_tape_block_size_as_rem_object_chunk_size() {
         const CUSTOM_BLOCK_SIZE: u32 = 8192;
 
         let mut plaintext_index = test_index();
@@ -9340,7 +9340,7 @@ BCw3Wyv2UWY=
                 .object_close
                 .data_block_count,
         )
-        .expect("read plaintext custom-block RAO object");
+        .expect("read plaintext custom-block REM-OBJECT object");
         assert_eq!(
             plaintext_read
                 .global_pax
@@ -9411,7 +9411,7 @@ BCw3Wyv2UWY=
         .expect("encrypted object block count fits usize");
         let mut encrypted_source =
             VecBlockSource::new(encrypted_sink.blocks[1..1 + encrypted_block_count].to_vec());
-        let opened = read_encrypted_rao_object(
+        let opened = read_encrypted_rem_object(
             &mut encrypted_source,
             CUSTOM_BLOCK_SIZE as usize,
             encrypted
@@ -9420,7 +9420,7 @@ BCw3Wyv2UWY=
                 .data_block_count,
             &primary_key,
         )
-        .expect("decrypt encrypted custom-block RAO object");
+        .expect("decrypt encrypted custom-block REM-OBJECT object");
         assert_eq!(opened.envelope.header.chunk_size, CUSTOM_BLOCK_SIZE);
         assert_eq!(
             opened
@@ -9807,7 +9807,7 @@ BCw3Wyv2UWY=
             API_SESSION_BLOCK_SIZE as usize,
             second.expect_write_report().layout.projected_size_blocks,
         )
-        .expect("read appended no-parity RAO object");
+        .expect("read appended no-parity REM-OBJECT object");
         assert_eq!(
             read.entry("second.bin").expect("second entry").data,
             second_payload
@@ -10048,7 +10048,7 @@ BCw3Wyv2UWY=
 
         assert_eq!(
             error.to_string(),
-            "invalid RAO input: caller_object_id must not be empty"
+            "invalid REM-OBJECT input: caller_object_id must not be empty"
         );
         assert!(tape_sink.blocks.is_empty());
         assert!(tape_sink.filemarks.is_empty());
@@ -11200,7 +11200,7 @@ BCw3Wyv2UWY=
                                 caller_object_id: "caller-object".to_string(),
                                 content_sha256: vec![0x11; 32],
                                 logical_size_bytes: 8,
-                                body_format: "rao-v1".to_string(),
+                                body_format: "rem-object-v1".to_string(),
                                 caller_metadata: Default::default(),
                                 created_at: None,
                                 copies: Vec::new(),
@@ -11218,7 +11218,7 @@ BCw3Wyv2UWY=
 
         let spool_path = temp.path().join("spool.bin");
         std::fs::write(&spool_path, b"spool").expect("write spool");
-        let archive_path = temp.path().join("archive.rao");
+        let archive_path = temp.path().join("archive.rem-object");
 
         let record = crate::mount::append_finish(
             &state,
@@ -11287,7 +11287,7 @@ BCw3Wyv2UWY=
                     caller_object_id: "caller-object".to_string(),
                     content_sha256: vec![0x11; 32],
                     logical_size_bytes: 2 * ring_bytes,
-                    body_format: "rao-v1".to_string(),
+                    body_format: "rem-object-v1".to_string(),
                     caller_metadata: Default::default(),
                     created_at: None,
                     copies: Vec::new(),
@@ -11529,7 +11529,7 @@ BCw3Wyv2UWY=
         .into_inner();
         assert_eq!(tapes.tapes.len(), 1);
         assert_eq!(tapes.tapes[0].tape_uuid, TAPE_UUID.to_vec());
-        assert_eq!(tapes.tapes[0].body_format, "rao-v1");
+        assert_eq!(tapes.tapes[0].body_format, "rem-object-v1");
         assert_eq!(tapes.tapes[0].block_size_bytes, 4096);
         assert_eq!(tapes.tapes[0].last_committed_tape_file, 7);
         assert_eq!(tapes.tapes[0].state, pb::tape::State::TapeStateReady as i32);
@@ -11707,7 +11707,7 @@ BCw3Wyv2UWY=
             .expect("object record");
         assert_eq!(first.object_id, object_uuid().as_bytes().to_vec());
         assert_eq!(first.caller_object_id, "caller-1");
-        assert_eq!(first.body_format, "rao-v1");
+        assert_eq!(first.body_format, "rem-object-v1");
         assert_eq!(first.logical_size_bytes, 17);
         assert_eq!(first.content_sha256, vec![7u8; 32]);
         assert_eq!(first.copies.len(), 1);
@@ -11785,7 +11785,7 @@ BCw3Wyv2UWY=
                 NativeObjectProjectionInput {
                     object_id: second_object_id,
                     caller_object_id: Some("caller-2".to_string()),
-                    body_format: "rao-v1".to_string(),
+                    body_format: "rem-object-v1".to_string(),
                     logical_size_bytes: Some(17),
                     content_hash: Some(vec![7u8; 32]),
                     metadata_hash: None,
@@ -11835,7 +11835,7 @@ BCw3Wyv2UWY=
                         required_pool_id: "camera.copy-b".to_string(),
                     },
                 )),
-                body_format: "rao-v1".to_string(),
+                body_format: "rem-object-v1".to_string(),
                 idempotency_key: None,
                 recover_session_id: Vec::new(),
             }),
@@ -11890,7 +11890,7 @@ BCw3Wyv2UWY=
                         mount_if_needed: true,
                     },
                 )),
-                body_format: "rao-v1".to_string(),
+                body_format: "rem-object-v1".to_string(),
                 idempotency_key: None,
                 recover_session_id: Vec::new(),
             }),
@@ -12277,7 +12277,7 @@ BCw3Wyv2UWY=
             unit.origin_kind,
             pb::CatalogUnitOriginKind::NativeObject as i32
         );
-        assert_eq!(unit.format_id, "rao-v1");
+        assert_eq!(unit.format_id, "rem-object-v1");
         assert!(matches!(
             unit.origin,
             Some(pb::catalog_unit::Origin::Native(

@@ -1,0 +1,65 @@
+{
+  "vector_id": "REM-OBJECT-TV-P1",
+  "spec_section": "13.2",
+  "status": "pinned-at-generation",
+  "independent_rederivation": "verified by tools/verify_rem_object_vectors_independent.py",
+  "inputs": {
+    "chunk_size": 4096,
+    "object_id": "00000000-0000-4000-8000-000000000001",
+    "caller_object_id": "rem-object-tv-1",
+    "write_timestamp": "2026-01-01T00:00:00Z",
+    "metadata_preservation": "minimal",
+    "manifest_file_id": "00000000-0000-4000-8000-0000000000ff"
+  },
+  "expected": {
+    "chunk_size": 4096,
+    "stored_size_bytes": 20480,
+    "stored_size_blocks": 5,
+    "stored_digest": "d59a4a3e4cf2c447c8ed402b109fbb4060ca84dc5b1cebbdc3acb8ca62d8888c",
+    "first_block_sha256": "7904a13388c76470227af99800856dfa5fbdd52cb81261cfb82ca0bc67a75fe8",
+    "manifest_cbor_len": 554,
+    "manifest_cbor_hex": "a7696f626a6563745f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303030316a6368756e6b5f73697a651910006c66696c655f656e747269657382a864706174686b612f68656c6c6f2e7478746766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303031306a65786563757461626c65f66a73697a655f6279746573126b6368756e6b5f636f756e74016b66696c655f7368613235365820f3daa1e791237b4fc5586b0a1a6eefdfb98e0821ff5cef14819f38b9fc4c1a5f6f66697273745f6368756e6b5f6c626101781a6d657461646174615f707265736572766174696f6e5f64617461a0a864706174686d622f7061747465726e2e62696e6766696c655f6964782430303030303030302d303030302d343030302d383030302d3030303030303030303031316a65786563757461626c65f66a73697a655f62797465731913886b6368756e6b5f636f756e74026b66696c655f73686132353658208026e5c96cf1e502c8deb3e89f8b8bc342f5039b871911a92eb10edf9c6542d36f66697273745f6368756e6b5f6c626102781a6d657461646174615f707265736572766174696f6e5f64617461a06e736368656d615f76657273696f6e016f6f626a6563745f6d65746164617461a07063616c6c65725f6f626a6563745f69646f72656d2d6f626a6563742d74762d317365787465726e616c5f7265666572656e63657380",
+    "manifest_sha256": "ecbf48e48cc11a78b9d6ae9dd7b5e938724ebdb39834a70f17bde17d3eb133da",
+    "file_payloads": [
+      {
+        "path": "a/hello.txt",
+        "size_bytes": 18,
+        "sha256": "f3daa1e791237b4fc5586b0a1a6eefdfb98e0821ff5cef14819f38b9fc4c1a5f"
+      },
+      {
+        "path": "b/pattern.bin",
+        "size_bytes": 5000,
+        "sha256": "8026e5c96cf1e502c8deb3e89f8b8bc342f5039b871911a92eb10edf9c6542d3"
+      }
+    ],
+    "file_layouts": [
+      {
+        "entry_type": "regular",
+        "path": "a/hello.txt",
+        "pax_header_offset": 1024,
+        "data_offset": 4096,
+        "first_chunk_lba": 1,
+        "chunk_count": 1,
+        "pad_spaces": 1792
+      },
+      {
+        "entry_type": "regular",
+        "path": "b/pattern.bin",
+        "pax_header_offset": 4608,
+        "data_offset": 8192,
+        "first_chunk_lba": 2,
+        "chunk_count": 2,
+        "pad_spaces": 2300
+      }
+    ],
+    "manifest_layout": {
+      "entry_type": "regular",
+      "path": "_remanence/manifest.cbor",
+      "pax_header_offset": 13312,
+      "data_offset": 16384,
+      "first_chunk_lba": 4,
+      "chunk_count": 1,
+      "pad_spaces": 1718
+    }
+  }
+}

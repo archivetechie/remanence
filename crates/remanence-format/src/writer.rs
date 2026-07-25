@@ -1,4 +1,4 @@
-//! Streaming writer for `rao-v1` objects.
+//! Streaming writer for `rem-object-v1` objects.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -23,10 +23,10 @@ use crate::tar::{
     TYPE_PAX_EXTENDED, TYPE_PAX_GLOBAL,
 };
 
-/// Report for writing an encrypted RAO object.
+/// Report for writing an encrypted REM-OBJECT object.
 #[derive(Debug, Clone)]
-pub struct EncryptedRaoWriteReport {
-    /// Layout of the authenticated canonical plaintext RAO stream.
+pub struct EncryptedRemObjectWriteReport {
+    /// Layout of the authenticated canonical plaintext REM-OBJECT stream.
     pub plaintext_layout: RemTarObjectLayout,
     /// Envelope report for the stored encrypted bytes.
     pub envelope: SealReport,
@@ -117,7 +117,7 @@ impl<'a, S: BlockSink + ?Sized> BodyBlockWriter<'a, S> {
     }
 }
 
-/// Write a complete `rao-v1` archive body to `sink`.
+/// Write a complete `rem-object-v1` archive body to `sink`.
 pub fn write_rem_tar_object<S: BlockSink + ?Sized>(
     sink: &mut S,
     options: &RemTarObjectOptions,
@@ -164,7 +164,7 @@ pub fn write_rem_tar_object<S: BlockSink + ?Sized>(
     Ok(layout)
 }
 
-/// Write a complete `rao-v1` archive body from streaming file sources.
+/// Write a complete `rem-object-v1` archive body from streaming file sources.
 ///
 /// Each input supplies precomputed metadata and a [`Read`] implementation.
 /// This lets callers perform the required size/hash pass before tape admission,
@@ -223,16 +223,16 @@ pub fn write_rem_tar_object_from_readers<S: BlockSink + ?Sized>(
     Ok(layout)
 }
 
-/// Write a complete recipient-envelope RAO object to `sink`.
+/// Write a complete recipient-envelope REM-OBJECT object to `sink`.
 ///
 /// Canonical archive construction remains in this crate while all encrypted
 /// framing and cryptography are delegated to `remanence-aead`.
-pub fn write_encrypted_rao_object<S: BlockSink + ?Sized>(
+pub fn write_encrypted_rem_object<S: BlockSink + ?Sized>(
     sink: &mut S,
     options: &RemTarObjectOptions,
     files: &[RemTarFile<'_>],
     recipients: &[RecipientPublicKey],
-) -> Result<EncryptedRaoWriteReport, FormatError> {
+) -> Result<EncryptedRemObjectWriteReport, FormatError> {
     let chunk_size = validate_recipient_envelope_preconditions(options)?;
     let mut plaintext_sink = VecBlockSink::new();
     let plaintext_layout = write_rem_tar_object(&mut plaintext_sink, options, files)?;
@@ -247,13 +247,13 @@ pub fn write_encrypted_rao_object<S: BlockSink + ?Sized>(
     )
 }
 
-/// Write a complete recipient-envelope RAO object from streaming sources.
-pub fn write_encrypted_rao_object_from_readers<S: BlockSink + ?Sized>(
+/// Write a complete recipient-envelope REM-OBJECT object from streaming sources.
+pub fn write_encrypted_rem_object_from_readers<S: BlockSink + ?Sized>(
     sink: &mut S,
     options: &RemTarObjectOptions,
     files: &mut [RemTarFileStream<'_>],
     recipients: &[RecipientPublicKey],
-) -> Result<EncryptedRaoWriteReport, FormatError> {
+) -> Result<EncryptedRemObjectWriteReport, FormatError> {
     let chunk_size = validate_recipient_envelope_preconditions(options)?;
     let mut plaintext_sink = VecBlockSink::new();
     let plaintext_layout = write_rem_tar_object_from_readers(&mut plaintext_sink, options, files)?;
@@ -275,7 +275,7 @@ fn seal_recipient_envelope<S: BlockSink + ?Sized>(
     chunk_size: u32,
     plaintext_layout: RemTarObjectLayout,
     plaintext: Vec<u8>,
-) -> Result<EncryptedRaoWriteReport, FormatError> {
+) -> Result<EncryptedRemObjectWriteReport, FormatError> {
     if plaintext.len() as u64 != plaintext_layout.total_size_bytes {
         return Err(FormatError::layout(format!(
             "plaintext byte length {} does not match layout {}",
@@ -302,7 +302,7 @@ fn seal_recipient_envelope<S: BlockSink + ?Sized>(
             envelope.stored_size_blocks
         )));
     }
-    Ok(EncryptedRaoWriteReport {
+    Ok(EncryptedRemObjectWriteReport {
         plaintext_layout,
         envelope,
     })
@@ -314,7 +314,7 @@ fn validate_recipient_envelope_preconditions(
     crate::pax::validate_chunk_size(options.chunk_size)?;
     object_id_field(&options.object_id)?;
     u32::try_from(options.chunk_size)
-        .map_err(|_| FormatError::invalid("chunk_size does not fit RAO header uint32"))
+        .map_err(|_| FormatError::invalid("chunk_size does not fit REM-OBJECT header uint32"))
 }
 
 fn write_global_header<S: BlockSink + ?Sized>(
@@ -1032,11 +1032,11 @@ mod tests {
         }];
         let mut sink = VecBlockSink::new();
 
-        let err = write_encrypted_rao_object(&mut sink, &opts, &files, &recipients).unwrap_err();
+        let err = write_encrypted_rem_object(&mut sink, &opts, &files, &recipients).unwrap_err();
 
         assert!(matches!(
             err,
-            FormatError::Aead(remanence_aead::RaoAeadError::InvalidObjectIdField)
+            FormatError::Aead(remanence_aead::RemObjectAeadError::InvalidObjectIdField)
         ));
         assert!(
             sink.blocks.is_empty(),
@@ -1060,7 +1060,7 @@ mod tests {
         )];
         let mut streaming_sink = VecBlockSink::new();
 
-        let err = write_encrypted_rao_object_from_readers(
+        let err = write_encrypted_rem_object_from_readers(
             &mut streaming_sink,
             &opts,
             &mut streams,
@@ -1070,7 +1070,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            FormatError::Aead(remanence_aead::RaoAeadError::InvalidObjectIdField)
+            FormatError::Aead(remanence_aead::RemObjectAeadError::InvalidObjectIdField)
         ));
         assert!(
             streaming_sink.blocks.is_empty(),

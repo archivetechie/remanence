@@ -511,7 +511,7 @@ mod tests {
         assert!((s.parity_over_data_ratio() - 0.03125).abs() < 1e-9);
         assert!((s.parity_fraction_of_total_written() - (4.0 / 132.0)).abs() < 1e-9);
         // S × m = 512 × 4 = 2,048 blocks contiguous damage tolerance
-        // at rao-v1's 256 KiB default block size (~512 MiB).
+        // at rem-object-v1's 256 KiB default block size (~512 MiB).
         assert_eq!(s.contiguous_damage_threshold(), 2_048);
     }
 

@@ -1,15 +1,15 @@
-//! Public value types for `rao-v1`.
+//! Public value types for `rem-object-v1`.
 
 use std::collections::BTreeMap;
 
 /// POSIX tar records are always 512 bytes.
 pub const TAR_RECORD_SIZE: usize = 512;
 
-/// Default `rao-v1` chunk / body block size.
+/// Default `rem-object-v1` chunk / body block size.
 pub const DEFAULT_CHUNK_SIZE: usize = 256 * 1024;
 
 /// Format identifier recorded in global pax headers.
-pub const FORMAT_ID: &str = "rao-v1";
+pub const FORMAT_ID: &str = "rem-object-v1";
 
 /// Schema version recorded in global pax headers.
 pub const SCHEMA_VERSION: &str = "1.0";
@@ -17,10 +17,10 @@ pub const SCHEMA_VERSION: &str = "1.0";
 /// Schema version recorded when a v1.1 additive feature is used.
 pub const SCHEMA_VERSION_XATTRS: &str = "1.1";
 
-/// The manifest path inside every `rao-v1` object.
+/// The manifest path inside every `rem-object-v1` object.
 pub const MANIFEST_PATH: &str = "_remanence/manifest.cbor";
 
-/// Maximum manifest `file_entries` array length accepted by the RAO profile.
+/// Maximum manifest `file_entries` array length accepted by the REM-OBJECT profile.
 pub(crate) const MAX_FILE_ENTRIES: usize = 10_000_000;
 
 /// Preserved extended attributes keyed by xattr name.
@@ -29,7 +29,7 @@ pub type RemTarXattrs = BTreeMap<String, Vec<u8>>;
 /// Extension members keyed by their extension name.
 pub type RemTarExtensions = BTreeMap<String, RemTarCborValue>;
 
-/// A value in the deterministic RAO manifest CBOR profile.
+/// A value in the deterministic REM-OBJECT manifest CBOR profile.
 ///
 /// The profile intentionally excludes negative integers, floats, tags, and
 /// maps with non-text keys. Keeping extension data in this restricted type
@@ -77,7 +77,7 @@ impl MetadataPreservation {
     }
 }
 
-/// Object-level options for a `rao-v1` archive.
+/// Object-level options for a `rem-object-v1` archive.
 #[derive(Debug, Clone)]
 pub struct RemTarObjectOptions {
     /// Remanence object UUID as text.
@@ -100,7 +100,7 @@ pub struct RemTarObjectOptions {
 }
 
 impl RemTarObjectOptions {
-    /// Construct options with the default `rao-v1` chunk size and
+    /// Construct options with the default `rem-object-v1` chunk size and
     /// archival metadata preservation.
     pub fn new(
         object_id: impl Into<String>,
@@ -137,7 +137,7 @@ pub struct RemTarFileSpec {
     pub file_sha256: Option<[u8; 32]>,
     /// Link target. Present only for symbolic-link and hardlink entries.
     pub link_target: Option<String>,
-    /// Preserved extended attributes for RAO 1.1 objects.
+    /// Preserved extended attributes for REM-OBJECT 1.1 objects.
     pub xattrs: RemTarXattrs,
     /// Entry-level extension members carried without applying them on restore.
     pub extensions: RemTarExtensions,
@@ -226,7 +226,7 @@ impl RemTarFileSpec {
     }
 }
 
-/// RAO entry kind.
+/// REM-OBJECT entry kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemTarEntryType {
     /// Regular file with byte payload.
@@ -235,7 +235,7 @@ pub enum RemTarEntryType {
     Hardlink,
     /// Symbolic link with a target string and no payload.
     Symlink,
-    /// Directory entry with no payload. RAO writers emit these for empty dirs.
+    /// Directory entry with no payload. REM-OBJECT writers emit these for empty dirs.
     Directory,
 }
 
@@ -301,7 +301,7 @@ pub struct RemTarFileLayout {
     pub file_sha256: Option<[u8; 32]>,
     /// Link target. Present only for symbolic-link and hardlink entries.
     pub link_target: Option<String>,
-    /// Preserved extended attributes for RAO 1.1 objects.
+    /// Preserved extended attributes for REM-OBJECT 1.1 objects.
     pub xattrs: RemTarXattrs,
     /// Entry-level extension members carried without applying them on restore.
     pub extensions: RemTarExtensions,

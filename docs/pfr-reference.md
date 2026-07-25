@@ -2,8 +2,8 @@
 
 **Status:** Working reference, not a specification. Written during the
 format's design phase, and some of it predates the shipped names — the
-design-phase "rem-chunked-v1" became the `rao-v1` object format defined by
-the published RAO Format Specification (`specs/publication/`). Where this
+design-phase "rem-chunked-v1" became the `rem-object-v1` object format defined by
+the published REM-OBJECT Format Specification (`specs/publication/`). Where this
 document and the published specification disagree, the specification wins;
 this document exists to explain the drive mechanics and arithmetic behind
 the format's range-addressing design.

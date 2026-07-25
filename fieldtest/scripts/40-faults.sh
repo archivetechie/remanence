@@ -60,7 +60,7 @@ default_fault_bytes() {
 
 write_fixture_object() {
   local workdir="$1" size_bytes="$2" pool="${3:-fieldtest-a}"
-  local source="$workdir/source.bin" object="$workdir/object.rao" locator="$workdir/locator.json"
+  local source="$workdir/source.bin" object="$workdir/object.rem-object" locator="$workdir/locator.json"
   mkdir -p "$workdir"
   make_payload "$source" "$size_bytes"
   fieldtest_capture_json "$workdir/build.json" "$(fieldtest_rem_bin)" archive build --inputs "$source" --out "$object" >&2
@@ -89,9 +89,9 @@ kill_mid_write() {
   kill -9 "$daemon_pid" || true
   wait "$writer_pid" || true
   "$(fieldtest_script_dir)/03-bringup.sh" >/dev/null 2>&1 || true
-  fieldtest_capture_io_json "$workdir/write-result.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator")" --out "$workdir/write-result.rao" || true
+  fieldtest_capture_io_json "$workdir/write-result.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator")" --out "$workdir/write-result.rem-object" || true
   local b_restored b_read_json
-  b_restored="$workdir/fieldtest-b-prefix-restored.rao"
+  b_restored="$workdir/fieldtest-b-prefix-restored.rem-object"
   b_read_json="$workdir/fieldtest-b-prefix-read.json"
   if ! fieldtest_capture_io_json "$b_read_json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$b_locator")" --out "$b_restored"; then
     fieldtest_evidence_record "$SCRIPT_NAME" kill-mid-write FAIL "committed fieldtest-b prefix object was not readable after killed append" "$b_read_json"
@@ -117,7 +117,7 @@ rebuild_catalog() {
   cp -a -- "$(fieldtest_state_dir)" "$workdir/state-snapshot"
   fieldtest_capture_text "$workdir/rebuild.txt" "$(fieldtest_rem_bin)" rebuild-catalog-from-journals --config "$(fieldtest_config_path)"
   "$(fieldtest_script_dir)/03-bringup.sh" >/dev/null 2>&1 || true
-  local restored="$workdir/restored.rao"
+  local restored="$workdir/restored.rem-object"
   fieldtest_capture_io_json "$workdir/read.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator")" --out "$restored"
   fieldtest_capture_json "$workdir/history.json" "$(fieldtest_rem_bin)" drive --endpoint "$(fieldtest_rem_endpoint)" history "$serial" --events --snapshots --json
   fieldtest_evidence_record "$SCRIPT_NAME" rebuild PASS "catalog rebuilt from journals and a pre-rebuild object was restored" "$workdir/rebuild.txt"

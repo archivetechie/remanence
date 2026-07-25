@@ -1,8 +1,8 @@
-//! Layer 3a Step 9.8 — QuadStor VTL smoke test.
+//! Layer 3a Step 9.8 — Quadstor VTL smoke test.
 //!
 //! `#[ignore]`-gated by default. Runs only when:
 //!
-//! - On a Linux host that can open `/dev/sg*` for the QuadStor
+//! - On a Linux host that can open `/dev/sg*` for the Quadstor
 //!   VTL.
 //! - The user has set env vars pointing at the test drive's SCSI
 //!   generic path and (for the round-trip variant) at a loaded
@@ -109,7 +109,7 @@ fn quadstor_basic_smoke() {
     };
     let mut t = open_transport(&path);
 
-    // 1. REWIND. The QuadStor VTL accepts REWIND even with no
+    // 1. REWIND. The Quadstor VTL accepts REWIND even with no
     // tape (it's a virtual drive); on a hardware drive this would
     // need a loaded cartridge.
     t.set_timeout_for(TimeoutClass::Rewind);

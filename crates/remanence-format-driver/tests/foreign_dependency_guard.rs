@@ -1,6 +1,6 @@
 //! Dependency guard for the published format-driver boundary.
 //!
-//! Core RAO and streaming crates must not depend on concrete legacy or foreign
+//! Core REM-OBJECT and streaming crates must not depend on concrete legacy or foreign
 //! archive implementations. Optional plugin edges are allowed only at API/CLI
 //! dispatch layers.
 

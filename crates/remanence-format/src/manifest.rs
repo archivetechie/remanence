@@ -1,4 +1,4 @@
-//! RAO manifest-profile CBOR validation and schema checks.
+//! REM-OBJECT manifest-profile CBOR validation and schema checks.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -82,10 +82,10 @@ pub(crate) fn validate_manifest_profile(bytes: &[u8]) -> Result<(), FormatError>
     Ok(())
 }
 
-/// Validate only the RAO manifest deterministic-CBOR profile.
+/// Validate only the REM-OBJECT manifest deterministic-CBOR profile.
 ///
 /// This is exposed solely for the in-tree coverage-guided fuzz harness named
-/// by RAO 1.0 Section 14.8. Production readers validate both the profile and
+/// by REM-OBJECT 1.0 Section 14.8. Production readers validate both the profile and
 /// the manifest schema through `validate_manifest`.
 #[cfg(feature = "fuzzing")]
 pub fn validate_manifest_cbor_for_fuzz(bytes: &[u8]) -> Result<(), FormatError> {
@@ -739,8 +739,10 @@ mod tests {
     use serde_json::Value;
 
     fn fixture() -> Value {
-        serde_json::from_str(include_str!("../../../fixtures/rao/negative-manifest.json"))
-            .expect("manifest negative fixture is valid JSON")
+        serde_json::from_str(include_str!(
+            "../../../fixtures/rem-object/negative-manifest.json"
+        ))
+        .expect("manifest negative fixture is valid JSON")
     }
 
     fn cases(fixture: &Value) -> &[Value] {

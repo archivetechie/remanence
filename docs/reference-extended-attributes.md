@@ -1,15 +1,15 @@
 # Extended attributes and file metadata
 
-This reference explains what file metadata Remanence preserves in a RAO
+This reference explains what file metadata Remanence preserves in a REM-OBJECT
 object, how that metadata is stored, and — importantly — how it behaves on
 restore, including the case where an archive is recovered decades later with
-nothing but a standard `tar`. The normative rules live in the RAO Object
+nothing but a standard `tar`. The normative rules live in the REM-OBJECT Object
 Format specification (§4.3, §4.7.3, §4.10, §12.10); this document is the
 operator's companion to them.
 
 ## What is preserved, and what is deliberately not
 
-A RAO object faithfully preserves each file's **content**, its **path**,
+A REM-OBJECT object faithfully preserves each file's **content**, its **path**,
 **entry type** (regular file, symlink, hardlink, directory), **symlink
 target**, and — as the one permission fact treated as content — the
 **executable bit**. Optionally it preserves **mtime** and **extended
@@ -31,7 +31,7 @@ per-entry `metadata_preservation_data` map — **not** as pax
 `SCHILY.xattr.*` extended-header records. This is a deliberate and
 consequential choice, and it is what makes the standard-tool recovery path
 (below) safe by construction. A generic tar reader has no knowledge of the
-RAO manifest; to it, the manifest is simply one extra file in the archive.
+REM-OBJECT manifest; to it, the manifest is simply one extra file in the archive.
 
 ## Capture
 
@@ -109,7 +109,7 @@ Remanence binary at all — **does not reapply any extended attribute.** Such
 a recovery restores the file bytes, the directory structure, symlinks and
 hardlinks, and writes the manifest as one ordinary file
 (`_remanence/manifest.cbor`) containing the attribute data as inert bytes,
-applied to nothing. A `security.capability` in a RAO object cannot be
+applied to nothing. A `security.capability` in a REM-OBJECT object cannot be
 reconstituted by `tar`, even with `tar --xattrs`, because there is no
 attribute record in the tar stream for it to find. Combined with the
 exclusion of ownership and setuid/setgid mode bits, the standard-tool path
@@ -126,5 +126,5 @@ Preserved metadata is stored in the clear inside a plaintext object's
 manifest, readable with any CBOR tool. Attribute values, symlink targets,
 and absolute paths can disclose information about the originating system.
 Before publishing a plaintext archive, review what its objects carry.
-Encrypted RAO objects place the manifest inside the authenticated,
+Encrypted REM-OBJECT objects place the manifest inside the authenticated,
 encrypted frame and do not have this exposure.

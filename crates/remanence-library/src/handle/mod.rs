@@ -345,7 +345,7 @@ pub(crate) fn lock_drive_shared(shared: &Arc<Mutex<DriveShared>>) -> MutexGuard<
 ///   was applied; the next phase didn't run.
 /// - [`Self::VendorSemantics`] — a single CDB *succeeded*, but the
 ///   post-state depends on vendor flavor (the IE-port case: HPE
-///   parks visibly, QuadStor vaults). The snapshot's IE-full /
+///   parks visibly, Quadstor vaults). The snapshot's IE-full /
 ///   slot-full bits can't be trusted without re-reading.
 /// - [`Self::CompletionUnknown`] — a state-changing CDB *failed*
 ///   with a completion-ambiguous transport error (driver timeout,
@@ -680,7 +680,7 @@ impl ChangerHandle {
     /// have moved partway. **Dirty-state on success:** when either
     /// endpoint is an IE port, `is_dirty()` is `true` with cause
     /// [`DirtyCause::VendorSemantics`] (HPE parks visibly,
-    /// QuadStor vaults — the snapshot patch may not match
+    /// Quadstor vaults — the snapshot patch may not match
     /// reality). See `docs/layer2b-design.md` §5.1.
     ///
     /// [`is_dirty()`]: Self::is_dirty
@@ -774,7 +774,7 @@ impl ChangerHandle {
                 ops::apply_planned_move(&mut self.library, &plan);
                 // IE-port endpoints make the patch vendor-specific:
                 // HPE physical libraries park the cartridge in the IE
-                // port (snapshot is correct), QuadStor's VTL vaults
+                // port (snapshot is correct), Quadstor's VTL vaults
                 // the cartridge immediately (IE port returns to
                 // empty). The MOVE MEDIUM CDB succeeded either way,
                 // but the snapshot patch may not reflect reality.

@@ -1,4 +1,4 @@
-//! Minimal tar header encoding used by `rao-v1`.
+//! Minimal tar header encoding used by `rem-object-v1`.
 
 use crate::error::FormatError;
 use crate::model::TAR_RECORD_SIZE;

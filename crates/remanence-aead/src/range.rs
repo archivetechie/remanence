@@ -1,4 +1,4 @@
-//! Keyed partial-range opening for encrypted RAO envelopes.
+//! Keyed partial-range opening for encrypted REM-OBJECT envelopes.
 //!
 //! The functions here implement the Section 6 ciphertext mapping: decrypt the
 //! authenticated metadata frame, map plaintext body chunks to stored
@@ -7,9 +7,9 @@
 //! not whole-object authentication: corruption in an unrelated payload frame
 //! does not invalidate an otherwise authenticated returned range.
 
-use crate::error::{RaoAeadError, Result};
-use crate::header::{RaoHeader, RAO_HEADER_LEN};
-use crate::metadata::RaoMetadata;
+use crate::error::{RemObjectAeadError, Result};
+use crate::header::{RemObjectHeader, REM_OBJECT_HEADER_LEN};
+use crate::metadata::RemObjectMetadata;
 use crate::stream::{cipher_offset, decrypt_chunk, decrypt_metadata, CHACHA20POLY1305_TAG_LEN};
 use std::io::{Read, Write};
 
@@ -17,9 +17,9 @@ use std::io::{Read, Write};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RangeOpenReport {
     /// Parsed plaintext header.
-    pub header: RaoHeader,
+    pub header: RemObjectHeader,
     /// Decrypted metadata.
-    pub metadata: RaoMetadata,
+    pub metadata: RemObjectMetadata,
     /// Absolute byte offset in the canonical plaintext object.
     pub plaintext_start: u64,
     /// Number of plaintext bytes returned.
@@ -43,9 +43,9 @@ pub struct RangeOpenReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoveringStoredRange {
     /// Parsed and authenticated envelope header.
-    pub header: RaoHeader,
+    pub header: RemObjectHeader,
     /// Decrypted and authenticated envelope metadata.
-    pub metadata: RaoMetadata,
+    pub metadata: RemObjectMetadata,
     /// Requested absolute plaintext start.
     pub plaintext_start: u64,
     /// Requested plaintext length.
@@ -78,7 +78,7 @@ pub fn open_plaintext_range_to_vec(
     )
 }
 
-/// Open an envelope range relative to an inner RAO body block.
+/// Open an envelope range relative to an inner REM-OBJECT body block.
 pub fn open_inner_range_to_vec(
     input: &[u8],
     recipient: &crate::RecipientPrivateKey,
@@ -90,7 +90,7 @@ pub fn open_inner_range_to_vec(
     let absolute_start = first_inner_chunk
         .checked_mul(u64::from(header.chunk_size))
         .and_then(|value| value.checked_add(range_start))
-        .ok_or(RaoAeadError::SizeOverflow)?;
+        .ok_or(RemObjectAeadError::SizeOverflow)?;
     open_plaintext_range_from_slice_with_context(
         input,
         header,
@@ -137,8 +137,8 @@ pub fn open_plaintext_range_from_reader<R: Read + ?Sized, W: Write + ?Sized>(
 
 fn open_plaintext_range_from_slice_with_context(
     input: &[u8],
-    header: RaoHeader,
-    metadata: RaoMetadata,
+    header: RemObjectHeader,
+    metadata: RemObjectMetadata,
     keys: crate::kdf::DerivedKeys,
     plaintext_start: u64,
     plaintext_len: u64,
@@ -149,13 +149,14 @@ fn open_plaintext_range_from_slice_with_context(
     };
     let stored_range_end = stored_range_start
         .checked_add(geometry.stored_range_len)
-        .ok_or(RaoAeadError::SizeOverflow)?;
+        .ok_or(RemObjectAeadError::SizeOverflow)?;
     let stored_start =
-        usize::try_from(stored_range_start).map_err(|_| RaoAeadError::SizeOverflow)?;
-    let stored_end = usize::try_from(stored_range_end).map_err(|_| RaoAeadError::SizeOverflow)?;
+        usize::try_from(stored_range_start).map_err(|_| RemObjectAeadError::SizeOverflow)?;
+    let stored_end =
+        usize::try_from(stored_range_end).map_err(|_| RemObjectAeadError::SizeOverflow)?;
     let encrypted_range = input
         .get(stored_start..stored_end)
-        .ok_or(RaoAeadError::UnexpectedEof)?;
+        .ok_or(RemObjectAeadError::UnexpectedEof)?;
     let mut ranged_input = std::io::Cursor::new(encrypted_range);
     let mut bytes = Vec::new();
     let report = open_plaintext_range_from_reader_with_context(
@@ -172,8 +173,8 @@ fn open_plaintext_range_from_slice_with_context(
 }
 
 fn range_geometry(
-    header: RaoHeader,
-    metadata: RaoMetadata,
+    header: RemObjectHeader,
+    metadata: RemObjectMetadata,
     plaintext_start: u64,
     plaintext_len: u64,
 ) -> Result<CoveringStoredRange> {
@@ -196,10 +197,10 @@ fn range_geometry(
     let chunk_count = last_chunk
         .checked_sub(first_chunk)
         .and_then(|value| value.checked_add(1))
-        .ok_or(RaoAeadError::SizeOverflow)?;
+        .ok_or(RemObjectAeadError::SizeOverflow)?;
     let stored_chunk_len = chunk_size
         .checked_add(CHACHA20POLY1305_TAG_LEN)
-        .ok_or(RaoAeadError::SizeOverflow)?;
+        .ok_or(RemObjectAeadError::SizeOverflow)?;
     let stored_range_start = cipher_offset(
         header.key_frame_len,
         header.metadata_frame_len,
@@ -213,7 +214,7 @@ fn range_geometry(
         last_chunk,
     )?
     .checked_add(stored_chunk_len)
-    .ok_or(RaoAeadError::SizeOverflow)?;
+    .ok_or(RemObjectAeadError::SizeOverflow)?;
     Ok(CoveringStoredRange {
         header,
         metadata,
@@ -224,7 +225,7 @@ fn range_geometry(
         stored_range_start: Some(stored_range_start),
         stored_range_len: stored_range_end
             .checked_sub(stored_range_start)
-            .ok_or(RaoAeadError::SizeOverflow)?,
+            .ok_or(RemObjectAeadError::SizeOverflow)?,
     })
 }
 
@@ -233,8 +234,8 @@ fn open_plaintext_range_from_reader_with_context<R: Read + ?Sized, W: Write + ?S
     ranged_input: &mut R,
     stored_range_start: u64,
     output: &mut W,
-    header: RaoHeader,
-    metadata: RaoMetadata,
+    header: RemObjectHeader,
+    metadata: RemObjectMetadata,
     keys: crate::kdf::DerivedKeys,
     plaintext_start: u64,
     plaintext_len: u64,
@@ -244,24 +245,27 @@ fn open_plaintext_range_from_reader_with_context<R: Read + ?Sized, W: Write + ?S
         return Ok(geometry.into());
     };
     if stored_range_start != expected_stored_start {
-        return Err(RaoAeadError::InvalidInput(format!(
+        return Err(RemObjectAeadError::InvalidInput(format!(
             "ranged input starts at stored byte {stored_range_start}, expected {expected_stored_start}"
         )));
     }
 
     let chunk_size = u64::from(geometry.header.chunk_size);
-    let chunk_size_usize = usize::try_from(chunk_size).map_err(|_| RaoAeadError::SizeOverflow)?;
+    let chunk_size_usize =
+        usize::try_from(chunk_size).map_err(|_| RemObjectAeadError::SizeOverflow)?;
     let stored_chunk_len = usize::try_from(
         chunk_size
             .checked_add(CHACHA20POLY1305_TAG_LEN)
-            .ok_or(RaoAeadError::SizeOverflow)?,
+            .ok_or(RemObjectAeadError::SizeOverflow)?,
     )
-    .map_err(|_| RaoAeadError::SizeOverflow)?;
+    .map_err(|_| RemObjectAeadError::SizeOverflow)?;
     let object_chunk_count = geometry.metadata.plaintext_size / chunk_size;
-    let first_chunk = geometry.first_chunk.ok_or(RaoAeadError::SizeOverflow)?;
+    let first_chunk = geometry
+        .first_chunk
+        .ok_or(RemObjectAeadError::SizeOverflow)?;
     let requested_end = plaintext_start
         .checked_add(plaintext_len)
-        .ok_or(RaoAeadError::SizeOverflow)?;
+        .ok_or(RemObjectAeadError::SizeOverflow)?;
     let mut encrypted = vec![0u8; stored_chunk_len];
 
     for offset in 0..geometry.chunk_count {
@@ -270,7 +274,7 @@ fn open_plaintext_range_from_reader_with_context<R: Read + ?Sized, W: Write + ?S
             .map_err(crate::error::map_read_exact_error)?;
         let chunk_index = first_chunk
             .checked_add(offset)
-            .ok_or(RaoAeadError::SizeOverflow)?;
+            .ok_or(RemObjectAeadError::SizeOverflow)?;
         let plaintext = decrypt_chunk(
             &keys.payload_key,
             chunk_index,
@@ -278,20 +282,20 @@ fn open_plaintext_range_from_reader_with_context<R: Read + ?Sized, W: Write + ?S
             &encrypted,
         )?;
         if plaintext.len() != chunk_size_usize {
-            return Err(RaoAeadError::AeadAuthenticationFailed);
+            return Err(RemObjectAeadError::AeadAuthenticationFailed);
         }
         let chunk_start = chunk_index
             .checked_mul(chunk_size)
-            .ok_or(RaoAeadError::SizeOverflow)?;
+            .ok_or(RemObjectAeadError::SizeOverflow)?;
         let chunk_end = chunk_start
             .checked_add(chunk_size)
-            .ok_or(RaoAeadError::SizeOverflow)?;
+            .ok_or(RemObjectAeadError::SizeOverflow)?;
         let selected_start = chunk_start.max(plaintext_start);
         let selected_end = chunk_end.min(requested_end);
         let local_start = usize::try_from(selected_start - chunk_start)
-            .map_err(|_| RaoAeadError::SizeOverflow)?;
-        let local_end =
-            usize::try_from(selected_end - chunk_start).map_err(|_| RaoAeadError::SizeOverflow)?;
+            .map_err(|_| RemObjectAeadError::SizeOverflow)?;
+        let local_end = usize::try_from(selected_end - chunk_start)
+            .map_err(|_| RemObjectAeadError::SizeOverflow)?;
         output.write_all(&plaintext[local_start..local_end])?;
     }
     Ok(geometry.into())
@@ -315,21 +319,21 @@ impl From<CoveringStoredRange> for RangeOpenReport {
 fn open_authenticated_metadata(
     input: &[u8],
     recipient: &crate::RecipientPrivateKey,
-) -> Result<(RaoHeader, RaoMetadata, crate::kdf::DerivedKeys)> {
-    let header_bytes: [u8; RAO_HEADER_LEN] = input
-        .get(..RAO_HEADER_LEN)
-        .ok_or(RaoAeadError::UnexpectedEof)?
+) -> Result<(RemObjectHeader, RemObjectMetadata, crate::kdf::DerivedKeys)> {
+    let header_bytes: [u8; REM_OBJECT_HEADER_LEN] = input
+        .get(..REM_OBJECT_HEADER_LEN)
+        .ok_or(RemObjectAeadError::UnexpectedEof)?
         .try_into()
-        .map_err(|_| RaoAeadError::UnexpectedEof)?;
-    let header = RaoHeader::parse(&header_bytes)?;
+        .map_err(|_| RemObjectAeadError::UnexpectedEof)?;
+    let header = RemObjectHeader::parse(&header_bytes)?;
     let key_frame_len =
-        usize::try_from(header.key_frame_len).map_err(|_| RaoAeadError::SizeOverflow)?;
-    let key_frame_end = RAO_HEADER_LEN
+        usize::try_from(header.key_frame_len).map_err(|_| RemObjectAeadError::SizeOverflow)?;
+    let key_frame_end = REM_OBJECT_HEADER_LEN
         .checked_add(key_frame_len)
-        .ok_or(RaoAeadError::SizeOverflow)?;
+        .ok_or(RemObjectAeadError::SizeOverflow)?;
     let key_frame_bytes = input
-        .get(RAO_HEADER_LEN..key_frame_end)
-        .ok_or(RaoAeadError::UnexpectedEof)?;
+        .get(REM_OBJECT_HEADER_LEN..key_frame_end)
+        .ok_or(RemObjectAeadError::UnexpectedEof)?;
     let key_frame = crate::KeyFrame::parse(key_frame_bytes)?;
     let dek = crate::unwrap_dek(&key_frame, &header.object_id, recipient)?;
     let keys = crate::derive_keys(
@@ -339,15 +343,15 @@ fn open_authenticated_metadata(
     )?;
 
     let metadata_frame_len =
-        usize::try_from(header.metadata_frame_len).map_err(|_| RaoAeadError::SizeOverflow)?;
+        usize::try_from(header.metadata_frame_len).map_err(|_| RemObjectAeadError::SizeOverflow)?;
     let metadata_end = key_frame_end
         .checked_add(metadata_frame_len)
-        .ok_or(RaoAeadError::SizeOverflow)?;
+        .ok_or(RemObjectAeadError::SizeOverflow)?;
     let metadata_frame = input
         .get(key_frame_end..metadata_end)
-        .ok_or(RaoAeadError::UnexpectedEof)?;
+        .ok_or(RemObjectAeadError::UnexpectedEof)?;
     let metadata_plaintext = decrypt_metadata(&keys.metadata_key, metadata_frame)?;
-    let metadata = RaoMetadata::from_cbor_bytes(&metadata_plaintext, header.chunk_size)?;
+    let metadata = RemObjectMetadata::from_cbor_bytes(&metadata_plaintext, header.chunk_size)?;
     let expected_salt = crate::derive_salt(
         dek.as_bytes(),
         &header.object_id_field()?,
@@ -355,25 +359,25 @@ fn open_authenticated_metadata(
         &metadata_plaintext,
     )?;
     if expected_salt != header.hkdf_salt {
-        return Err(RaoAeadError::SaltDerivationMismatch);
+        return Err(RemObjectAeadError::SaltDerivationMismatch);
     }
     Ok((header, metadata, keys))
 }
 
 fn validate_range(start: u64, len: u64, plaintext_size: u64) -> Result<u64> {
     let end = start.checked_add(len).ok_or_else(|| {
-        RaoAeadError::InvalidInput("plaintext range arithmetic overflow".to_string())
+        RemObjectAeadError::InvalidInput("plaintext range arithmetic overflow".to_string())
     })?;
     if len == 0 {
         if start > plaintext_size {
-            return Err(RaoAeadError::InvalidInput(
+            return Err(RemObjectAeadError::InvalidInput(
                 "empty plaintext range starts past object end".to_string(),
             ));
         }
         return Ok(end);
     }
     if end > plaintext_size {
-        return Err(RaoAeadError::InvalidInput(
+        return Err(RemObjectAeadError::InvalidInput(
             "plaintext range extends past object end".to_string(),
         ));
     }
@@ -390,8 +394,8 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::io::Read;
 
-    fn prefix_len(header: &RaoHeader) -> usize {
-        RAO_HEADER_LEN + header.key_frame_len as usize + header.metadata_frame_len as usize
+    fn prefix_len(header: &RemObjectHeader) -> usize {
+        REM_OBJECT_HEADER_LEN + header.key_frame_len as usize + header.metadata_frame_len as usize
     }
 
     struct CountingReader<'a> {
@@ -531,7 +535,7 @@ mod tests {
         bad_prefix[0x20] ^= 0x80;
         assert!(matches!(
             covering_stored_range(&bad_prefix, &root, 512, 64),
-            Err(RaoAeadError::AeadAuthenticationFailed)
+            Err(RemObjectAeadError::AeadAuthenticationFailed)
         ));
 
         let prefix = &sealed[..prefix_end];
@@ -551,7 +555,7 @@ mod tests {
                 512,
                 64,
             ),
-            Err(RaoAeadError::AeadAuthenticationFailed)
+            Err(RemObjectAeadError::AeadAuthenticationFailed)
         ));
         assert!(output.is_empty());
     }
@@ -606,7 +610,7 @@ mod tests {
 
         assert!(matches!(
             open_to_vec(&sealed, &root),
-            Err(RaoAeadError::AeadAuthenticationFailed)
+            Err(RemObjectAeadError::AeadAuthenticationFailed)
         ));
         let (range, _report) = open_plaintext_range_to_vec(&sealed, &root, 0, 512).unwrap();
         assert_eq!(range, plaintext[..512]);
@@ -627,7 +631,7 @@ mod tests {
 
         assert!(matches!(
             open_plaintext_range_to_vec(&sealed, &root, 512, 128),
-            Err(RaoAeadError::AeadAuthenticationFailed)
+            Err(RemObjectAeadError::AeadAuthenticationFailed)
         ));
     }
 
@@ -654,7 +658,7 @@ mod tests {
         requested_tamper[chunk_zero] ^= 0x80;
         assert!(matches!(
             open_plaintext_range_to_vec(&requested_tamper, &safe, 0, 128),
-            Err(RaoAeadError::AeadAuthenticationFailed)
+            Err(RemObjectAeadError::AeadAuthenticationFailed)
         ));
 
         let mut unrelated_tamper = sealed;
@@ -666,7 +670,7 @@ mod tests {
     #[test]
     fn ranged_open_rejects_key_frame_tamper_outside_requested_payload() {
         let (mut sealed, _plaintext, safe, _) = sealed();
-        sealed[RAO_HEADER_LEN + 6] ^= 0x80;
+        sealed[REM_OBJECT_HEADER_LEN + 6] ^= 0x80;
         assert!(open_plaintext_range_to_vec(&sealed, &safe, 0, 128).is_err());
     }
 

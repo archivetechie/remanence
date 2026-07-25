@@ -1,16 +1,16 @@
-//! Canonical RAO wrapped-DEK key-frame codec.
+//! Canonical REM-OBJECT wrapped-DEK key-frame codec.
 
-use crate::error::{RaoAeadError, Result};
+use crate::error::{RemObjectAeadError, Result};
 use crate::xwing::XWING_CIPHERTEXT_LEN;
 
-/// Maximum RAO 2.0 key-frame size accepted from an object.
-pub const RAO_KEY_FRAME_MAX_LEN: usize = 16_384;
-/// Smallest RAO 2.0 one-slot X-Wing key frame (with an empty label).
-pub const RAO_KEY_FRAME_MIN_LEN: usize = 5 + 1 + 16 + 1 + XWING_CIPHERTEXT_LEN + 48;
+/// Maximum REM-ENCRYPT 1.0 key-frame size accepted from an object.
+pub const REM_OBJECT_KEY_FRAME_MAX_LEN: usize = 16_384;
+/// Smallest REM-ENCRYPT 1.0 one-slot X-Wing key frame (with an empty label).
+pub const REM_OBJECT_KEY_FRAME_MIN_LEN: usize = 5 + 1 + 16 + 1 + XWING_CIPHERTEXT_LEN + 48;
 /// Maximum number of recipient slots in a key frame.
-pub const RAO_KEY_FRAME_MAX_SLOTS: usize = 8;
+pub const REM_OBJECT_KEY_FRAME_MAX_SLOTS: usize = 8;
 
-const MAGIC: &[u8; 4] = b"RAOK";
+const MAGIC: &[u8; 4] = b"REMK";
 const RECIPIENT_SLOT_FIXED_LEN: usize = 1 + 16 + 1 + XWING_CIPHERTEXT_LEN + 48;
 
 /// One recipient's HPKE-wrapped data-encryption key.
@@ -28,7 +28,7 @@ pub struct RecipientSlot {
     pub ciphertext: [u8; 48],
 }
 
-/// Canonically ordered RAO recipient slots.
+/// Canonically ordered REM-OBJECT recipient slots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyFrame {
     /// Recipient slots in strictly ascending slot-index order.
@@ -45,15 +45,15 @@ impl KeyFrame {
 
     /// Parse a complete frame, rejecting truncation, non-canonical order, and trailing bytes.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        if !(RAO_KEY_FRAME_MIN_LEN..=RAO_KEY_FRAME_MAX_LEN).contains(&bytes.len()) {
-            return Err(RaoAeadError::InvalidKeyFrameLength);
+        if !(REM_OBJECT_KEY_FRAME_MIN_LEN..=REM_OBJECT_KEY_FRAME_MAX_LEN).contains(&bytes.len()) {
+            return Err(RemObjectAeadError::InvalidKeyFrameLength);
         }
         if bytes.get(..4) != Some(MAGIC) {
-            return Err(RaoAeadError::InvalidKeyFrame);
+            return Err(RemObjectAeadError::InvalidKeyFrame);
         }
         let count = bytes[4] as usize;
-        if !(1..=RAO_KEY_FRAME_MAX_SLOTS).contains(&count) {
-            return Err(RaoAeadError::InvalidKeyFrame);
+        if !(1..=REM_OBJECT_KEY_FRAME_MAX_SLOTS).contains(&count) {
+            return Err(RemObjectAeadError::InvalidKeyFrame);
         }
         let mut cursor = 5usize;
         let mut slots = Vec::with_capacity(count);
@@ -61,24 +61,24 @@ impl KeyFrame {
             let slot_index = take(bytes, &mut cursor, 1)?[0];
             let recipient_epoch_id = take(bytes, &mut cursor, 16)?
                 .try_into()
-                .map_err(|_| RaoAeadError::InvalidKeyFrame)?;
+                .map_err(|_| RemObjectAeadError::InvalidKeyFrame)?;
             let label_len = take(bytes, &mut cursor, 1)?[0] as usize;
             if label_len > 32 {
-                return Err(RaoAeadError::InvalidKeyFrame);
+                return Err(RemObjectAeadError::InvalidKeyFrame);
             }
             let label = take(bytes, &mut cursor, label_len)?;
             if !label.iter().all(|b| (0x20..=0x7e).contains(b)) {
-                return Err(RaoAeadError::InvalidKeyFrame);
+                return Err(RemObjectAeadError::InvalidKeyFrame);
             }
             let epoch_label = std::str::from_utf8(label)
-                .map_err(|_| RaoAeadError::InvalidKeyFrame)?
+                .map_err(|_| RemObjectAeadError::InvalidKeyFrame)?
                 .to_owned();
             let enc = take(bytes, &mut cursor, XWING_CIPHERTEXT_LEN)?
                 .try_into()
-                .map_err(|_| RaoAeadError::InvalidKeyFrame)?;
+                .map_err(|_| RemObjectAeadError::InvalidKeyFrame)?;
             let ciphertext = take(bytes, &mut cursor, 48)?
                 .try_into()
-                .map_err(|_| RaoAeadError::InvalidKeyFrame)?;
+                .map_err(|_| RemObjectAeadError::InvalidKeyFrame)?;
             slots.push(RecipientSlot {
                 slot_index,
                 recipient_epoch_id,
@@ -88,7 +88,7 @@ impl KeyFrame {
             });
         }
         if cursor != bytes.len() {
-            return Err(RaoAeadError::InvalidKeyFrame);
+            return Err(RemObjectAeadError::InvalidKeyFrame);
         }
         Self::new(slots)
     }
@@ -101,8 +101,8 @@ impl KeyFrame {
             .iter()
             .map(|slot| RECIPIENT_SLOT_FIXED_LEN + slot.epoch_label.len())
             .sum::<usize>();
-        if !(RAO_KEY_FRAME_MIN_LEN..=RAO_KEY_FRAME_MAX_LEN).contains(&capacity) {
-            return Err(RaoAeadError::InvalidKeyFrameLength);
+        if !(REM_OBJECT_KEY_FRAME_MIN_LEN..=REM_OBJECT_KEY_FRAME_MAX_LEN).contains(&capacity) {
+            return Err(RemObjectAeadError::InvalidKeyFrameLength);
         }
         let mut out = Vec::with_capacity(capacity);
         out.extend_from_slice(MAGIC);
@@ -119,8 +119,8 @@ impl KeyFrame {
     }
 
     fn validate(&self) -> Result<()> {
-        if !(1..=RAO_KEY_FRAME_MAX_SLOTS).contains(&self.slots.len()) {
-            return Err(RaoAeadError::InvalidKeyFrame);
+        if !(1..=REM_OBJECT_KEY_FRAME_MAX_SLOTS).contains(&self.slots.len()) {
+            return Err(RemObjectAeadError::InvalidKeyFrame);
         }
         let mut previous = None;
         for (index, slot) in self.slots.iter().enumerate() {
@@ -135,7 +135,7 @@ impl KeyFrame {
                     .iter()
                     .all(|b| (0x20..=0x7e).contains(b))
             {
-                return Err(RaoAeadError::InvalidKeyFrame);
+                return Err(RemObjectAeadError::InvalidKeyFrame);
             }
             previous = Some(slot.slot_index);
         }
@@ -146,10 +146,10 @@ impl KeyFrame {
 fn take<'a>(bytes: &'a [u8], cursor: &mut usize, len: usize) -> Result<&'a [u8]> {
     let end = cursor
         .checked_add(len)
-        .ok_or(RaoAeadError::InvalidKeyFrame)?;
+        .ok_or(RemObjectAeadError::InvalidKeyFrame)?;
     let value = bytes
         .get(*cursor..end)
-        .ok_or(RaoAeadError::InvalidKeyFrame)?;
+        .ok_or(RemObjectAeadError::InvalidKeyFrame)?;
     *cursor = end;
     Ok(value)
 }
@@ -170,15 +170,15 @@ mod tests {
 
     #[test]
     fn byte_exact_round_trip() {
-        assert_eq!(RAO_KEY_FRAME_MIN_LEN, 1191);
-        assert_eq!(RAO_KEY_FRAME_MAX_LEN, 16_384);
+        assert_eq!(REM_OBJECT_KEY_FRAME_MIN_LEN, 1191);
+        assert_eq!(REM_OBJECT_KEY_FRAME_MAX_LEN, 16_384);
         let frame = KeyFrame::new(vec![slot(0, "safe-2026"), slot(7, "escrow")]).unwrap();
         let bytes = frame.serialize().unwrap();
         assert_eq!(
             bytes.len(),
             5 + 2 * RECIPIENT_SLOT_FIXED_LEN + "safe-2026".len() + "escrow".len()
         );
-        assert_eq!(&bytes[..5], b"RAOK\x02");
+        assert_eq!(&bytes[..5], b"REMK\x02");
         assert_eq!(bytes[5], 0);
         assert_eq!(bytes[22], 9);
         assert_eq!(&bytes[23..32], b"safe-2026");
@@ -189,13 +189,15 @@ mod tests {
     #[test]
     fn accepts_valid_eight_slot_xwing_frame_within_bounds() {
         let frame = KeyFrame::new(
-            (0..RAO_KEY_FRAME_MAX_SLOTS)
+            (0..REM_OBJECT_KEY_FRAME_MAX_SLOTS)
                 .map(|index| slot(index as u8, &format!("recipient-{index}")))
                 .collect(),
         )
         .unwrap();
         let encoded = frame.serialize().unwrap();
-        assert!((RAO_KEY_FRAME_MIN_LEN..=RAO_KEY_FRAME_MAX_LEN).contains(&encoded.len()));
+        assert!(
+            (REM_OBJECT_KEY_FRAME_MIN_LEN..=REM_OBJECT_KEY_FRAME_MAX_LEN).contains(&encoded.len())
+        );
         assert_eq!(KeyFrame::parse(&encoded).unwrap(), frame);
     }
 
@@ -215,12 +217,12 @@ mod tests {
         trailing.push(0);
         assert!(KeyFrame::parse(&trailing).is_err());
         assert!(matches!(
-            KeyFrame::parse(&vec![0; RAO_KEY_FRAME_MIN_LEN - 1]),
-            Err(RaoAeadError::InvalidKeyFrameLength)
+            KeyFrame::parse(&vec![0; REM_OBJECT_KEY_FRAME_MIN_LEN - 1]),
+            Err(RemObjectAeadError::InvalidKeyFrameLength)
         ));
         assert!(matches!(
-            KeyFrame::parse(&vec![0; RAO_KEY_FRAME_MAX_LEN + 1]),
-            Err(RaoAeadError::InvalidKeyFrameLength)
+            KeyFrame::parse(&vec![0; REM_OBJECT_KEY_FRAME_MAX_LEN + 1]),
+            Err(RemObjectAeadError::InvalidKeyFrameLength)
         ));
     }
 }

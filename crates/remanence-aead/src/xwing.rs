@@ -1,10 +1,10 @@
-//! Frozen X-Wing KEM primitive for RAO 2.0.
+//! Frozen X-Wing KEM primitive for REM-ENCRYPT 1.0.
 //!
 //! This module implements only the byte-level glue from
 //! `draft-connolly-cfrg-xwing-kem-10`: SHAKE256 seed expansion and the
 //! SHA3-256 combiner over vetted ML-KEM-768 and X25519 implementations. It
 //! does not implement either constituent primitive and is intentionally
-//! independent of RAO envelope framing.
+//! independent of REM-OBJECT envelope framing.
 
 use std::fmt;
 
@@ -125,7 +125,7 @@ impl fmt::Debug for XWingPublicKey {
 /// Ephemeral expanded X-Wing decapsulation material.
 ///
 /// The ML-KEM decapsulation key and X25519 private key are wiped on drop.
-/// RAO persists only [`XWingSeed`], never this expanded form.
+/// REM-OBJECT persists only [`XWingSeed`], never this expanded form.
 #[must_use = "expanded X-Wing secret material should be used or dropped promptly"]
 pub struct XWingExpandedSecret {
     mlkem_private_key: [u8; MLKEM768_PRIVATE_KEY_LEN],

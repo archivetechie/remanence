@@ -4,7 +4,17 @@ Notable changes to Remanence and its published formats. The format
 specifications carry their own revision histories; entries here are
 per-release summaries.
 
-## RAO 2.0 / v2.0.0 — 2026-07-24
+## Unreleased — 2026-07-25
+
+- Renamed RAO → REM-OBJECT to avoid collision with the LTO "Recommended
+  Access Order" feature. The encryption representation is now the
+  separately versioned REM-ENCRYPT profile. On-tape identifiers changed to
+  `rem-object-v1`, envelope magic `REMO`, on-tape `format_version = 1`, and
+  `rem-encrypt-*` HKDF labels. The publication test vectors were regenerated;
+  the new archive SHA-256 is
+  `5069b34931fd1dca69f47db511aebfb8ad08fd6665b49983f4bef1128fde19fd`.
+
+## REM-ENCRYPT 1.0 / v2.0.0 — 2026-07-24
 
 Archived: DOI [10.5281/zenodo.21531003](https://doi.org/10.5281/zenodo.21531003) (concept DOI
 [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126)).
@@ -17,18 +27,17 @@ Archived: DOI [10.5281/zenodo.21531003](https://doi.org/10.5281/zenodo.21531003)
 - **Wire geometry:** each recipient uses a 1216-byte X-Wing public key and a
   32-byte seed, while each key-frame `enc` grows to 1120 bytes. The
   `key_frame_len` bounds are now `[1191, 16384]`, with the eight-slot maximum
-  unchanged. The `RAO1` format-family magic, on-tape `format_version = 2`,
-  payload construction, and frozen `rao2-*` HKDF labels are unchanged.
+  unchanged. The clean-break wire identifiers are recorded in the
+  2026-07-25 entry above.
 - **Frozen construction and vectors:** the specification now pins the exact
   SHAKE256 seed expansion, SHA3-256 X-Wing combiner, HPKE `kem_id`/suite
   bytes, and component KAT. The regenerated archive SHA-256 is
-  `7c09f9425a2996daa10cb4766df5b7fb54f562eea33a914d4be0c5013345824f`,
+  `5069b34931fd1dca69f47db511aebfb8ad08fd6665b49983f4bef1128fde19fd`,
   superseding `fa8570d3…`; encrypted positive vectors are X-Wing envelopes
   and new negatives reject `wrap_suite = 0x01` and out-of-range key frames.
-- **Forward erratum:** RAO 1.0's encrypted representation is superseded by
-  RAO 2.0 and must not be used for new encrypted objects. No production RAO
-  1.0 encrypted object was written. The RAO 1.0 plaintext record stands
-  unchanged.
+- **Forward erratum:** the pre-production encrypted representation is
+  superseded by REM-ENCRYPT 1.0 and must not be used for new encrypted
+  objects. No production object used the superseded representation.
 - **Licensing reminder:** the Rust reference implementation remains
   Apache-2.0, specification prose CC-BY-4.0, and conformance vectors CC0-1.0.
 
@@ -62,7 +71,7 @@ found REM-PARITY not yet freeze-ready. Archived: DOI
   corrected (position and verify before any write; an incomplete open epoch emits
   no sidecar). The address space is renamed to logical LBA with its
   block-to-media rationale; a test-geometry block-size carve-out is stated.
-- **RAO — cross-spec and errata (non-breaking).** `object_id` is reconciled to
+- **REM-OBJECT — cross-spec and errata (non-breaking).** `object_id` is reconciled to
   1–64 bytes across representations and carried verbatim by the parity binding.
   The recipient policy relaxes from a mandatory two-slot minimum to a
   single-key-loss **survivability** requirement (two independent recipients *or*
@@ -77,7 +86,7 @@ found REM-PARITY not yet freeze-ready. Archived: DOI
   documented. DOI roles are labelled correctly (concept vs version).
 - Publication test vectors regenerated (archive SHA
   `fa8570d31d3869155c9a2b4322b0846a5f5b2eb845d08c89ab4a78bcbb5e668f`,
-  superseding `f4e4331c…`): RAO object streams byte-identical; REM-PARITY
+  superseding `f4e4331c…`): REM-OBJECT object streams byte-identical; REM-PARITY
   sidecars are the exact stripe-major→parity-index-major permutation with their
   metadata, index, footer, and directory hashes unchanged; new metadata,
   directory-invalid, object-id, and damage vectors — independently re-derived by
@@ -90,7 +99,7 @@ completeness. Archived: DOI
 [10.5281/zenodo.21498153](https://doi.org/10.5281/zenodo.21498153)
 (concept DOI [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126)).
 
-- RAO object format: a **portable core** (`user.` namespace, applied on
+- REM-OBJECT object format: a **portable core** (`user.` namespace, applied on
   restore by default) and a **carry-only extension tier** (privileged
   namespaces and registered extensions, applied only under explicit
   operator policy). New `ext` extension container (reverse-DNS naming,
@@ -128,7 +137,7 @@ Security hardening of the extended-attribute restore path. Archived: DOI
 
 - Extended-attribute restore is now allow-listed by default to the `user.`
   namespace across every restore surface (`rem archive extract`, `dump`,
-  tape-restore, and the `rao-recover` disaster-recovery reader). Privileged
+  tape-restore, and the `rem-recover` disaster-recovery reader). Privileged
   namespaces (`security.*`, `system.*`, `trusted.*`) are skipped and
   reported by name — never applied — unless an operator opts them in with a
   repeatable `--xattr-namespace` flag. Attribute values are never logged.
@@ -137,10 +146,10 @@ Security hardening of the extended-attribute restore path. Archived: DOI
   rejected before reaching the OS. A genuine application failure is surfaced;
   only an unsupported-filesystem condition is a benign skip. One stderr
   warning is emitted per restore when attributes are skipped by policy.
-- Restore reports (including the `rao-recover` summary) list both skipped and
+- Restore reports (including the `rem-recover` summary) list both skipped and
   applied-privileged attribute names, so an opt-in's effect is auditable and
   a disaster-recovery restore never silently drops metadata.
-- REM-PARITY companion note: RAO Object Format §12.10 restores the
+- REM-PARITY companion note: REM-OBJECT Object Format §12.10 restores the
   extended-attribute restore protections to requirement (MUST) strength;
   see the specification's revision history. New `reference-extended-
   attributes.md` documents capture/restore behavior and the safety of the
@@ -223,7 +232,7 @@ First publication release. Archived: DOI
 [10.5281/zenodo.21425127](https://doi.org/10.5281/zenodo.21425127)
 (concept DOI [10.5281/zenodo.21425126](https://doi.org/10.5281/zenodo.21425126)).
 
-- **RAO Format Specification 1.0** (`specs/publication/`): the archival
+- **REM-OBJECT Format Specification 1.0** (`specs/publication/`): the archival
   object format — a byte-deterministic, chunk-aligned POSIX pax tar
   container with per-file SHA-256 identities, a CBOR manifest, closed-form
   byte-range addressing, and an encrypted representation sealing each
@@ -242,7 +251,7 @@ First publication release. Archived: DOI
 - Reference implementation: library discovery and robotics, pipelined
   fixed-block tape I/O, the object and parity formats, a rebuildable
   SQLite catalog, a gRPC daemon, operator CLIs, and the standalone
-  `rao-recover` disaster-recovery binary.
+  `rem-recover` disaster-recovery binary.
 
 The implementation itself remains pre-alpha (0.0.x): interfaces may
 change; the published on-tape formats are stable as specified.
