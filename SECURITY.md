@@ -22,9 +22,9 @@ you prefer otherwise.
 
 ## Scope notes
 
-- The project is pre-production (no stable release yet); there are no
+- The project is young and pre-production in maturity; there are no
   supported-version windows — reports are assessed against the current
-  `main`.
+  `main` and the latest 1.0 release.
 - The published specifications have their own security-considerations
   sections. Ambiguities or weaknesses in the *specifications* are security
   reports too, and in some ways the more important kind: implementations

@@ -28,9 +28,13 @@ on an HPE MSL3040 with LTO-9 drives.
 <!-- code-anchor: Cargo.toml crates proto/layer5.proto @ 8de2c46 -->
 ## Status
 
-Pre-alpha, version 0.0.1. Interfaces and the gRPC contract may still
-change before a stable release; REM-OBJECT, its REM-ENCRYPT profile, and
-REM-PARITY 1.0 are specified and implemented. Working today:
+Version 1.0.0 — first publication release. The on-tape formats are frozen:
+REM-OBJECT, its REM-ENCRYPT profile, and REM-PARITY 1.0 are specified,
+implemented, and pinned by test vectors, so a tape written today reads back
+unchanged. The daemon and gRPC control surfaces are released but may still
+evolve. The project is young — built against one library family and one drive
+generation — so restore and verify real material from your own hardware before
+relying on it. Working today:
 
 - Layer 1 SCSI primitives and Layer 2 library discovery, identity,
   robotics, and hot-plug watching, with per-library allowlisting.

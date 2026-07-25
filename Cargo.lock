@@ -2020,7 +2020,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rem-recover"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "clap",
  "remanence-aead",
@@ -2036,7 +2036,7 @@ dependencies = [
 
 [[package]]
 name = "remanence-aead"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "chacha20 0.9.1",
  "chacha20poly1305",
@@ -2055,7 +2055,7 @@ dependencies = [
 
 [[package]]
 name = "remanence-api"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "ciborium",
  "hyper-util",
@@ -2094,7 +2094,7 @@ dependencies = [
 
 [[package]]
 name = "remanence-bru"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "remanence-format-driver",
  "remanence-library",
@@ -2102,7 +2102,7 @@ dependencies = [
 
 [[package]]
 name = "remanence-chaos"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "remanence-api",
  "remanence-format",
@@ -2120,7 +2120,7 @@ dependencies = [
 
 [[package]]
 name = "remanence-cli"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "ciborium",
  "clap",
@@ -2151,11 +2151,11 @@ dependencies = [
 
 [[package]]
 name = "remanence-crc"
-version = "0.0.1"
+version = "1.0.0"
 
 [[package]]
 name = "remanence-daemon"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "base64",
  "clap",
@@ -2176,7 +2176,7 @@ dependencies = [
 
 [[package]]
 name = "remanence-format"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "ciborium",
  "remanence-aead",
@@ -2191,7 +2191,7 @@ dependencies = [
 
 [[package]]
 name = "remanence-format-driver"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "remanence-aead",
  "remanence-library",
@@ -2201,7 +2201,7 @@ dependencies = [
 
 [[package]]
 name = "remanence-library"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "futures-util",
  "libc",
@@ -2215,7 +2215,7 @@ dependencies = [
 
 [[package]]
 name = "remanence-parity"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "ciborium",
  "hmac",
@@ -2230,7 +2230,7 @@ dependencies = [
 
 [[package]]
 name = "remanence-scsi"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "nix",
@@ -2239,7 +2239,7 @@ dependencies = [
 
 [[package]]
 name = "remanence-state"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "ciborium",
  "nix",
@@ -2260,7 +2260,7 @@ dependencies = [
 
 [[package]]
 name = "remanence-stream"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "nix",
  "remanence-format",
