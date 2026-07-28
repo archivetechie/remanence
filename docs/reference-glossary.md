@@ -59,6 +59,7 @@ Published as the REM-PARITY 1.0 specification.
 **bootstrap** — the self-description block a tape carries at LBA 0 (and
 at intervals down the tape): tape UUID, block size, parity scheme,
 filemark-map digest. What makes a tape readable without the catalog.
+Sequence 0 at BOT doubles as the volume label.
 
 **parity sidecar** — a tape file of Reed-Solomon parity shards covering
 the data blocks written since the previous sidecar.
@@ -270,6 +271,12 @@ enter and leave the chassis.
 
 **voltag** — volume tag, the barcode on a cartridge as reported by the
 library's scanner. A label, not an identity.
+
+**volume label** — the identifying record traditional tape systems write
+first on a cartridge (the ANSI VOL1 record, the LTFS volume label).
+Remanence has no separate label structure; the sequence-0 bootstrap at
+BOT carries that role, and then grows into a recovery index as copies
+repeat down the tape. See **bootstrap**.
 
 **BOT / EOM** — beginning of tape / end of media.
 

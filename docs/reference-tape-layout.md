@@ -27,7 +27,12 @@ on tape): `Object` (0), `ParitySidecar` (1), `Bootstrap` (2), and
   map, a sequence number, and the writer version. Because the block size
   is in the bootstrap, a reader never needs MODE SENSE state to start; a
   scan just probes the candidate block sizes (256 KiB, 512 KiB, 1 MiB) at
-  BOT.
+  BOT. Copy 0 doubles as Remanence's volume label, the role a VOL1
+  record or the LTFS volume label plays elsewhere: identity and read
+  parameters, first thing on the tape. Unlike those labels it is not
+  written once and left behind — the copies repeating down the tape are
+  checkpoints of what has been written so far, so the label grows into a
+  recovery index over the tape's life.
 - **Object** tape files contain only body-format blocks (a stored REM-OBJECT
   object). The parity layer owns every filemark; body formats cannot emit
   them.
