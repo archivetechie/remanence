@@ -29,6 +29,9 @@ format specifications — and their plain-language companion — live in
 
 - [why-remanence.md](why-remanence.md) — the project's rationale and the
   bets behind the design.
+- [why-sg-passthrough.md](why-sg-passthrough.md) — why the stack
+  bypasses the kernel `st` driver and `mt`/`mtx`, told through two
+  classic failures of the conventional stack.
 - [tape-identity-lifecycle-explainer.md](tape-identity-lifecycle-explainer.md)
   — how a cartridge acquires and keeps its identity.
 - [pfr-reference.md](pfr-reference.md) — partial-file restore mechanics.
