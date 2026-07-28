@@ -282,6 +282,19 @@ repeat down the tape. See **bootstrap**.
 
 **filemark** — the on-tape separator between tape files.
 
+**st driver / mt** — the Linux kernel tape driver (`/dev/st*`,
+`/dev/nst*`) and its command-line tool; the conventional way to operate
+a drive. Remanence bypasses it — see
+[why-sg-passthrough.md](why-sg-passthrough.md).
+
+**mtx** — the classic command-line medium-changer tool. It names drives
+by element address, with no join to the st driver's device files; the
+gap is described in [why-sg-passthrough.md](why-sg-passthrough.md).
+
+**SG_IO** — the Linux ioctl that passes a raw SCSI CDB to a device
+through its `/dev/sg*` node and returns status and sense data.
+Remanence's only transport, for drives and changers alike.
+
 **VPD page 0x80** — the SCSI vital-product-data page carrying a device's
 serial number; the basis of all identity joins.
 
