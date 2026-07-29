@@ -1,0 +1,145 @@
+rem-parity EXTENDED fuzz campaign — 20260729T175459Z
+seconds/target=21600 procs/target=3
+rss_limit_mb=4096 case_timeout_s=30
+targets run CONCURRENTLY; each target's processes share its corpus dir
+
+=== corpus BEFORE ===
+rem_parity_bootstrap_parse=509
+rem_parity_sidecar_parse=48
+rem_parity_map_parse=115
+rem_parity_scan_walk=1818
+
+launched 12 fuzz processes at 17:54:59Z
+
+processes exiting nonzero: 0
+(a crash, hang, or OOM makes libFuzzer exit nonzero and leaves a
+ reproducer under fuzz/artifacts/ — check there if this is not 0)
+
+=== corpus AFTER ===
+rem_parity_bootstrap_parse=4042
+rem_parity_sidecar_parse=294
+rem_parity_map_parse=169
+rem_parity_scan_walk=3543
+
+=== per-target final stats ===
+--- rem_parity_bootstrap_parse ---
+Done 2831715985 runs in 21601 second(s)
+stat::number_of_executed_units: 2831715985
+stat::average_exec_per_sec:     131091
+stat::new_units_added:          2174
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              667
+Done 2866929008 runs in 21601 second(s)
+stat::number_of_executed_units: 2866929008
+stat::average_exec_per_sec:     132722
+stat::new_units_added:          2046
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              610
+Done 2775155216 runs in 21601 second(s)
+stat::number_of_executed_units: 2775155216
+stat::average_exec_per_sec:     128473
+stat::new_units_added:          2130
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              633
+corpus_files=4042
+--- rem_parity_sidecar_parse ---
+Done 1367034563 runs in 21601 second(s)
+stat::number_of_executed_units: 1367034563
+stat::average_exec_per_sec:     63285
+stat::new_units_added:          142
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              763
+Done 1349594156 runs in 21601 second(s)
+stat::number_of_executed_units: 1349594156
+stat::average_exec_per_sec:     62478
+stat::new_units_added:          122
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              787
+Done 1362094664 runs in 21601 second(s)
+stat::number_of_executed_units: 1362094664
+stat::average_exec_per_sec:     63057
+stat::new_units_added:          195
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              795
+corpus_files=294
+--- rem_parity_map_parse ---
+Done 837702593 runs in 21601 second(s)
+stat::number_of_executed_units: 837702593
+stat::average_exec_per_sec:     38780
+stat::new_units_added:          21
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              479
+Done 839036280 runs in 21601 second(s)
+stat::number_of_executed_units: 839036280
+stat::average_exec_per_sec:     38842
+stat::new_units_added:          15
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              479
+Done 834677448 runs in 21601 second(s)
+stat::number_of_executed_units: 834677448
+stat::average_exec_per_sec:     38640
+stat::new_units_added:          18
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              477
+corpus_files=169
+--- rem_parity_scan_walk ---
+Done 95430055 runs in 21601 second(s)
+stat::number_of_executed_units: 95430055
+stat::average_exec_per_sec:     4417
+stat::new_units_added:          605
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              441
+Done 91980326 runs in 21601 second(s)
+stat::number_of_executed_units: 91980326
+stat::average_exec_per_sec:     4258
+stat::new_units_added:          606
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              440
+Done 94842452 runs in 21601 second(s)
+stat::number_of_executed_units: 94842452
+stat::average_exec_per_sec:     4390
+stat::new_units_added:          536
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              440
+corpus_files=3543
+
+=== artifacts (crashes/hangs/OOM reproducers) ===
+none
+
+=== corpus replay (final coverage; determinism check only) ===
+--- rem_parity_bootstrap_parse ---
+#4043	INITED cov: 1056 ft: 3659 corp: 463/97Kb exec/s: 0 rss: 118Mb
+#4043	DONE   cov: 1056 ft: 3659 corp: 463/97Kb lim: 572 exec/s: 0 rss: 118Mb
+Done 4043 runs in 0 second(s)
+stat::number_of_executed_units: 4043
+stat::average_exec_per_sec:     0
+stat::new_units_added:          0
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              118
+--- rem_parity_sidecar_parse ---
+#295	INITED cov: 241 ft: 405 corp: 51/15907b exec/s: 0 rss: 47Mb
+#295	DONE   cov: 241 ft: 405 corp: 51/15907b lim: 1281 exec/s: 0 rss: 47Mb
+Done 295 runs in 0 second(s)
+stat::number_of_executed_units: 295
+stat::average_exec_per_sec:     0
+stat::new_units_added:          0
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              47
+--- rem_parity_map_parse ---
+#170	INITED cov: 244 ft: 406 corp: 45/16Kb exec/s: 0 rss: 47Mb
+#170	DONE   cov: 244 ft: 406 corp: 45/16Kb lim: 1473 exec/s: 0 rss: 47Mb
+Done 170 runs in 0 second(s)
+stat::number_of_executed_units: 170
+stat::average_exec_per_sec:     0
+stat::new_units_added:          0
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              47
+--- rem_parity_scan_walk ---
+#3544	INITED cov: 539 ft: 2770 corp: 261/38Kb exec/s: 3544 rss: 446Mb
+#3544	DONE   cov: 539 ft: 2770 corp: 261/38Kb lim: 2066 exec/s: 3544 rss: 446Mb
+Done 3544 runs in 1 second(s)
+stat::number_of_executed_units: 3544
+stat::average_exec_per_sec:     3544
+stat::new_units_added:          0
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              446
