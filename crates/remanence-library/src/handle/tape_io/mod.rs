@@ -3077,10 +3077,10 @@ fn build_compression_param_list(cfg: &TapeConfig) -> Vec<u8> {
 }
 
 /// Informational EOM signal extracted from CHECK CONDITION sense
-/// after a WRITE near end-of-medium. `early_warning` mirrors the
-/// EOM bit in sense byte 2 (the drive is past the EW point);
-/// `end_of_medium` is set when sense key is `VOLUME OVERFLOW`
-/// (0x0D) — the drive will refuse further writes.
+/// after a WRITE near end-of-medium. `early_warning` mirrors the decoded
+/// EOM flag (the drive is past the EW point); `end_of_medium` is set when
+/// sense key is `VOLUME OVERFLOW` (0x0D) — the drive will refuse further
+/// writes.
 struct WriteEomSignal {
     early_warning: bool,
     end_of_medium: bool,
@@ -3091,13 +3091,12 @@ struct WriteEomSignal {
 /// indicates "write completed but tape is filling up"; returns
 /// `None` for real errors (caller maps via `map_scsi`).
 ///
-/// Per IBM LTO SCSI Reference: near-EOM WRITEs raise CHECK
-/// CONDITION with sense byte 2 EOM bit set and sense key in
-/// {0 NO_SENSE — approaching EOM (EW), 0x0D VOLUME_OVERFLOW —
-/// tape full}. The block has been committed.
+/// Per IBM LTO SCSI Reference: near-EOM WRITEs raise CHECK CONDITION with
+/// EOM set and sense key in {0 NO_SENSE — approaching EOM (EW),
+/// 0x0D VOLUME_OVERFLOW — tape full}. The block has been committed.
 fn write_eom_signal(sense: &[u8]) -> Option<WriteEomSignal> {
     let decoded = decode_sense(sense)?;
-    if !decoded.is_fixed_format() || !decoded.eom {
+    if decoded.is_deferred() || !decoded.eom {
         return None;
     }
     if decoded.ili || decoded.filemark {
@@ -3120,7 +3119,7 @@ fn read_filemark_signal(sense: &[u8]) -> bool {
     let Some(decoded) = decode_sense(sense) else {
         return false;
     };
-    decoded.is_fixed_format()
+    !decoded.is_deferred()
         && decoded.valid
         && decoded.filemark
         && !decoded.ili
