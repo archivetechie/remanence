@@ -32,6 +32,9 @@ const REM_OBJECT_TV_P1_MANIFEST_SHA256: [u8; 32] = [
     0xec, 0xbf, 0x48, 0xe4, 0x8c, 0xc1, 0x1a, 0x78, 0xb9, 0xd6, 0xae, 0x9d, 0xd7, 0xb5, 0xe9, 0x38,
     0x72, 0x4e, 0xbd, 0xb3, 0x98, 0x34, 0xa7, 0x0f, 0x17, 0xbd, 0xe1, 0x7d, 0x3e, 0xb1, 0x33, 0xda,
 ];
+const REM_OBJECT_TV_E2_METADATA_FRAME_LEN: u64 = 66;
+const REM_OBJECT_TV_E2_KEY_FRAME_LEN: u32 = 2408;
+const REM_OBJECT_TV_E2_RECIPIENT_EPOCH_IDS: [[u8; 16]; 2] = [[0x61; 16], [0x62; 16]];
 
 fn small_scheme() -> ParityScheme {
     ParityScheme {
@@ -372,6 +375,183 @@ fn emit_object_id_36_bootstrap(root: &Path) -> Result<(), Box<dyn std::error::Er
             stored_block_count,
             sha256_hex(&object),
             hex(&REM_OBJECT_TV_P1_MANIFEST_SHA256),
+        ),
+    )?;
+    Ok(())
+}
+
+fn read_publication_object(
+    root: &Path,
+    filename: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let source = root
+        .parent()
+        .ok_or("REM-PARITY output directory has no publication-stage parent")?
+        .join("rem-object")
+        .join("objects")
+        .join(filename);
+    let object = fs::read(&source)?;
+    if object.is_empty() || object.len() % BLOCK_SIZE as usize != 0 {
+        return Err(format!(
+            "{} is not a nonempty block-aligned REM-OBJECT object",
+            source.display()
+        )
+        .into());
+    }
+    Ok(object)
+}
+
+fn emit_attested_key_30_image(
+    root: &Path,
+    id: &str,
+    object: &[u8],
+    object_row: BootstrapObjectRow,
+) -> Result<([u8; 32], usize), Box<dyn std::error::Error>> {
+    let stored_block_count = u64::try_from(object.len() / BLOCK_SIZE as usize)?;
+    if object_row.tape_file_number != 1 || object_row.stored_block_count != stored_block_count {
+        return Err("key-30 object row does not match tape-file 1 geometry".into());
+    }
+    let dir = image_dir(root, id)?;
+    let scheme = partial_scheme();
+    let object_blocks = object
+        .chunks_exact(BLOCK_SIZE as usize)
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    let sidecar = encode_epoch(&scheme, &object_blocks, 0, 0)?;
+    let map = FilemarkMap::new(vec![
+        TapeFileMapEntry::bootstrap(0, 1),
+        TapeFileMapEntry::object(1, stored_block_count, 0),
+        TapeFileMapEntry::parity_sidecar(2, sidecar.blocks.len() as u64, 0, 0, stored_block_count),
+        TapeFileMapEntry::bootstrap(3, 1),
+    ])?;
+    let prefix_map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)])?;
+    let initial_payload = bootstrap_payload(Some(&scheme), Some(prefix_map.digest(false)?), 0);
+    write_block(
+        &dir.join("tape-file-000-bootstrap.bin"),
+        &bootstrap_block(&initial_payload)?,
+    )?;
+    fs::write(dir.join("tape-file-001-object.bin"), object)?;
+    write_blocks(&dir.join("tape-file-002-sidecar.bin"), &sidecar.blocks)?;
+
+    let mut final_payload = bootstrap_payload(Some(&scheme), Some(map.digest(true)?), 1);
+    final_payload.sidecar_epoch_directory = Some(SidecarEpochDirectory {
+        directory_scope_tape_file_count: map.tape_file_count(),
+        directory_scope_total_data_ordinals: stored_block_count,
+        directory_scope_highest_protected_ordinal: stored_block_count,
+        is_final_directory: true,
+        entries: vec![directory_entry(2, &sidecar, true)],
+    });
+    final_payload.object_rows.push(object_row);
+    write_block(
+        &dir.join("tape-file-003-final-bootstrap.bin"),
+        &bootstrap_block(&final_payload)?,
+    )?;
+    Ok((map.canonical_digest()?, sidecar.blocks.len()))
+}
+
+fn emit_key_30_plaintext_attested(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let id = "key-30-plaintext-attested";
+    let object = read_publication_object(root, "rem-object-tv-p1.rem-object")?;
+    let stored_block_count = u64::try_from(object.len() / BLOCK_SIZE as usize)?;
+    let row = BootstrapObjectRow::plaintext(
+        1,
+        stored_block_count,
+        4,
+        554,
+        1,
+        REM_OBJECT_TV_P1_MANIFEST_SHA256,
+    )
+    .with_object_id(REM_OBJECT_TV_P1_OBJECT_ID.as_bytes().to_vec());
+    let (map_digest, sidecar_block_count) = emit_attested_key_30_image(root, id, &object, row)?;
+    fs::write(
+        root.join("positive").join(id).join("expected.json"),
+        format!(
+            concat!(
+                "{{\n",
+                "  \"vector_id\": \"{}\",\n",
+                "  \"expected_outcome\": \"attested-manifest-verified\",\n",
+                "  \"representation\": \"plaintext\",\n",
+                "  \"object_id\": \"{}\",\n",
+                "  \"object_id_length\": 36,\n",
+                "  \"stored_block_count\": {},\n",
+                "  \"manifest_first_chunk_lba\": 4,\n",
+                "  \"manifest_size_bytes\": 554,\n",
+                "  \"manifest_chunk_count\": 1,\n",
+                "  \"manifest_sha256\": \"{}\",\n",
+                "  \"plaintext_digest\": \"{}\",\n",
+                "  \"map_sha256\": \"{}\",\n",
+                "  \"attested_scope_tape_file_count\": 4,\n",
+                "  \"sidecar_block_count\": {}\n",
+                "}}\n"
+            ),
+            id,
+            REM_OBJECT_TV_P1_OBJECT_ID,
+            stored_block_count,
+            hex(&REM_OBJECT_TV_P1_MANIFEST_SHA256),
+            sha256_hex(&object),
+            hex(&map_digest),
+            sidecar_block_count,
+        ),
+    )?;
+    Ok(())
+}
+
+fn emit_key_30_encrypted_attested(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let id = "key-30-encrypted-attested";
+    let object = read_publication_object(root, "rem-object-tv-e2.rem-object")?;
+    let metadata_frame_len = object
+        .get(0x30..0x38)
+        .and_then(|value| value.try_into().ok())
+        .map(u64::from_be_bytes)
+        .ok_or("REM-OBJECT-TV-E2 has no complete metadata-frame length")?;
+    let key_frame_len = object
+        .get(0x3c..0x40)
+        .and_then(|value| value.try_into().ok())
+        .map(u32::from_be_bytes)
+        .ok_or("REM-OBJECT-TV-E2 has no complete key-frame length")?;
+    if metadata_frame_len != REM_OBJECT_TV_E2_METADATA_FRAME_LEN
+        || key_frame_len != REM_OBJECT_TV_E2_KEY_FRAME_LEN
+    {
+        return Err("REM-OBJECT-TV-E2 envelope lengths differ from its pinned key-30 row".into());
+    }
+    let stored_block_count = u64::try_from(object.len() / BLOCK_SIZE as usize)?;
+    let row = BootstrapObjectRow::encrypted(
+        1,
+        stored_block_count,
+        REM_OBJECT_TV_E2_RECIPIENT_EPOCH_IDS.to_vec(),
+        metadata_frame_len,
+        key_frame_len,
+    )
+    .with_object_id(REM_OBJECT_TV_P1_OBJECT_ID.as_bytes().to_vec());
+    let (map_digest, sidecar_block_count) = emit_attested_key_30_image(root, id, &object, row)?;
+    fs::write(
+        root.join("positive").join(id).join("expected.json"),
+        format!(
+            concat!(
+                "{{\n",
+                "  \"vector_id\": \"{}\",\n",
+                "  \"expected_outcome\": \"attested-envelope-consistent\",\n",
+                "  \"representation\": \"encrypted\",\n",
+                "  \"object_id\": \"{}\",\n",
+                "  \"object_id_length\": 36,\n",
+                "  \"stored_block_count\": {},\n",
+                "  \"recipient_epoch_ids\": [\"{}\", \"{}\"],\n",
+                "  \"metadata_frame_len\": {},\n",
+                "  \"key_frame_len\": {},\n",
+                "  \"map_sha256\": \"{}\",\n",
+                "  \"attested_scope_tape_file_count\": 4,\n",
+                "  \"sidecar_block_count\": {}\n",
+                "}}\n"
+            ),
+            id,
+            REM_OBJECT_TV_P1_OBJECT_ID,
+            stored_block_count,
+            hex(&REM_OBJECT_TV_E2_RECIPIENT_EPOCH_IDS[0]),
+            hex(&REM_OBJECT_TV_E2_RECIPIENT_EPOCH_IDS[1]),
+            metadata_frame_len,
+            key_frame_len,
+            hex(&map_digest),
+            sidecar_block_count,
         ),
     )?;
     Ok(())
@@ -782,6 +962,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     emit_final_partial(&output)?;
     emit_short_epoch(&output)?;
     emit_object_id_36_bootstrap(&output)?;
+    emit_key_30_plaintext_attested(&output)?;
+    emit_key_30_encrypted_attested(&output)?;
     emit_external_parity_map(&output)?;
     emit_no_parity(&output)?;
     emit_checkpoint(&output)?;

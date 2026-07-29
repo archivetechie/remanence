@@ -49,9 +49,9 @@ class RemParityRederivationTests(unittest.TestCase):
             with tarfile.open(ARCHIVE, mode="r") as archive:
                 archive.extractall(root, filter="data")
             summary = rederive_publication_vectors(root)
-        self.assertEqual(summary.shards, (63, 63))
-        self.assertEqual(summary.crcs, (112, 112))
-        self.assertEqual(summary.digests, (54, 54))
+        self.assertEqual(summary.shards, (93, 93))
+        self.assertEqual(summary.crcs, (153, 153))
+        self.assertEqual(summary.digests, (64, 64))
 
     def test_parity_mutation_is_a_hard_failure(self) -> None:
         """A changed pinned parity byte raises instead of being accepted or skipped."""

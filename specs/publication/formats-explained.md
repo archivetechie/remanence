@@ -406,7 +406,7 @@ rather than aspirational:
   envelope, partial-range reads, and dozens of malformed-input cases with
   their required error classifications. The archive is
   `remanence-test-vectors.tar`, SHA-256
-  `b9be8760fd4a85a922e5fa8eaf86840eec0719a5407030b9f6a35f0606ea79bd`,
+  `77be73e780e9ff2c265c8357b6ba684b4c69800213820ae1331850f742b1d83d`,
   and its regeneration is deterministic.
 - **An independent second implementation.** The vector archive is
   verified by a from-scratch Python program that shares no code with the

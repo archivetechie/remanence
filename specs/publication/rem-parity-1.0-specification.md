@@ -1925,7 +1925,7 @@ practical to pin; at least one header-level vector MUST use the default
 geometry parameters. Negative vectors contain exactly one fault each.
 
 The companion archive is `remanence-test-vectors.tar`, SHA-256
-`b9be8760fd4a85a922e5fa8eaf86840eec0719a5407030b9f6a35f0606ea79bd`.
+`77be73e780e9ff2c265c8357b6ba684b4c69800213820ae1331850f742b1d83d`.
 Its `MANIFEST.tsv` inventories every contained vector manifest and generated
 artifact, `CHECKSUMS.sha256` authenticates them, and the included `verify.py`
 checks the archive without a source checkout. The archive is reproducibly

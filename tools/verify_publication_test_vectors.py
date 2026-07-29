@@ -25,6 +25,8 @@ REQUIRED_POSITIVE = {
     "default-geometry-header",
     "short-epoch-r-less-than-s",
     "object-id-36-bootstrap",
+    "key-30-plaintext-attested",
+    "key-30-encrypted-attested",
 }
 REQUIRED_NEGATIVE = {
     "bootstrap": {
@@ -270,6 +272,7 @@ def verify_tree(root: pathlib.Path, rederive_parity: bool) -> int:
         if actual != expected:
             fail(f"checksum mismatch for {relative}: {actual} != {expected}")
     for relative in (
+        "tools/rem_parity_rederive.py",
         "tools/verify_rem_object_vectors_independent.py",
         "tools/requirements-rem-object-independent.txt",
     ):
@@ -626,6 +629,33 @@ def verify_tree(root: pathlib.Path, rederive_parity: bool) -> int:
                 fail("object-id-36 bootstrap does not carry one exact 36-byte id")
             if sha256(object_path) != expected.get("plaintext_digest"):
                 fail("object-id-36 bootstrap object digest is not pinned")
+        if item["id"] in {
+            "key-30-plaintext-attested",
+            "key-30-encrypted-attested",
+        }:
+            object_id = expected.get("object_id")
+            final_bootstrap = vector_root / "tape-file-003-final-bootstrap.bin"
+            object_path = vector_root / "tape-file-001-object.bin"
+            source_name = (
+                "rem-object-tv-p1.rem-object"
+                if item["id"] == "key-30-plaintext-attested"
+                else "rem-object-tv-e2.rem-object"
+            )
+            expected_outcome = (
+                "attested-manifest-verified"
+                if item["id"] == "key-30-plaintext-attested"
+                else "attested-envelope-consistent"
+            )
+            if (
+                not isinstance(object_id, str)
+                or len(object_id.encode("utf-8")) != 36
+                or final_bootstrap.read_bytes().count(object_id.encode("utf-8")) != 1
+                or expected.get("expected_outcome") != expected_outcome
+                or expected.get("attested_scope_tape_file_count") != 4
+                or object_path.read_bytes()
+                != (rem_object_root / "objects" / source_name).read_bytes()
+            ):
+                fail(f"{item['id']} is not the pinned attested key-30 image")
         if item["id"] == "bootstrap-object-id-65":
             faulted = vector_root / "faulted-bootstrap.bin"
             if faulted.read_bytes().count(b"x" * 65) != 1:

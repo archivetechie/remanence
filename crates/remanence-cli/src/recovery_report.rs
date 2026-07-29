@@ -975,6 +975,8 @@ mod tests {
 
     const OBJECT_ID_IMAGE: &str = "rem-parity-1/positive/object-id-36-bootstrap";
     const MINIMAL_IMAGE: &str = "rem-parity-1/positive/minimal-image";
+    const KEY_30_PLAINTEXT_IMAGE: &str = "rem-parity-1/positive/key-30-plaintext-attested";
+    const KEY_30_ENCRYPTED_IMAGE: &str = "rem-parity-1/positive/key-30-encrypted-attested";
     const ENCRYPTED_OBJECT: &str = "rem-object/objects/rem-object-tv-e2.rem-object";
     const ENCRYPTED_MANIFEST: &str = "rem-object/manifests/rem-object-tv-e2.json";
 
@@ -1086,6 +1088,39 @@ mod tests {
             Value::String("00000000-0000-4000-8000-000000000001".to_string())
         );
         assert_eq!(object.object_id_encoding, "utf8");
+    }
+
+    fn assert_attested_key_30_image(image: &str, representation: &str, verification_status: &str) {
+        let temp = extract_archive_entries(&[image]);
+        let report = image_report(&temp.path().join(image));
+        assert!(report.success);
+        assert_eq!(report.scan.bootstrap_generation_used, 1);
+        assert_eq!(report.scan.bootstrap_tape_file_number, Some(3));
+        assert_eq!(report.scan.overlay_source, "bootstrap_inline_directory");
+        assert_eq!(report.scan.recovered_scope_tape_file_count, 4);
+        assert!(report.scan.damaged_regions.is_empty());
+        assert_eq!(report.totals.objects_seen, 1);
+        assert_eq!(report.totals.map_agreeing, 1);
+        assert_eq!(report.totals.verified, 1);
+        assert_eq!(report.totals.failed, 0);
+        let object = &report.objects[0];
+        assert_eq!(object.representation, representation);
+        assert_eq!(object.map_status, "map_agrees");
+        assert_eq!(object.verification_status, verification_status);
+        assert_eq!(
+            object.object_id,
+            Value::String("00000000-0000-4000-8000-000000000001".to_string())
+        );
+    }
+
+    #[test]
+    fn parity_protected_plaintext_key_30_image_is_attested_and_green() {
+        assert_attested_key_30_image(KEY_30_PLAINTEXT_IMAGE, "plaintext", "manifest_verified");
+    }
+
+    #[test]
+    fn encrypted_key_30_image_is_attested_and_green() {
+        assert_attested_key_30_image(KEY_30_ENCRYPTED_IMAGE, "encrypted", "envelope_consistent");
     }
 
     #[test]
