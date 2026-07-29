@@ -13,6 +13,7 @@ libfuzzer-sys = "0.4"
 remanence-aead = { path = "../crates/remanence-aead" }
 remanence-format = { path = "../crates/remanence-format", features = ["fuzzing"] }
 remanence-library = { path = "../crates/remanence-library" }
+remanence-parity  = { path = "../crates/remanence-parity" }
 sha2 = "0.10"
 
 [[bin]]
@@ -53,6 +54,34 @@ bench = false
 [[bin]]
 name = "rem_object_key_frame"
 path = "fuzz_targets/rem_object_key_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rem_parity_bootstrap_parse"
+path = "fuzz_targets/rem_parity_bootstrap_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rem_parity_sidecar_parse"
+path = "fuzz_targets/rem_parity_sidecar_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rem_parity_map_parse"
+path = "fuzz_targets/rem_parity_map_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rem_parity_scan_walk"
+path = "fuzz_targets/rem_parity_scan_walk.rs"
 test = false
 doc = false
 bench = false
