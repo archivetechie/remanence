@@ -1,0 +1,3 @@
+hmac_label_sidecar="REM\x00PAR\x01"
+hmac_label_footer="REM\x00PARFOOT\x01"
+uuid_seed="rem-fuzz-tape-01"

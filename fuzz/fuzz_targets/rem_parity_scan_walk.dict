@@ -1,0 +1,3 @@
+bootstrap_magic="REM\x00BOO\x01"
+filemark_tag="\x00\x00"
+unreadable_tag="\x01\x00"
