@@ -1,0 +1,32 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.52s
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.22s
+     Running `fuzz/target/x86_64-unknown-linux-gnu/release/rem_parity_sidecar_parse -artifact_prefix=/home/swami/remanence/fuzz/artifacts/rem_parity_sidecar_parse/ -max_total_time=40 -rss_limit_mb=4096 -timeout=30 -print_final_stats=1 -dict=/home/swami/remanence/fuzz/fuzz_targets/rem_parity_sidecar_parse.dict /home/swami/remanence/fuzz/corpus/rem_parity_sidecar_parse`
+Dictionary: 3 entries
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 3734265693
+INFO: Loaded 1 modules   (2924 inline 8-bit counters): 2924 [0x5c5d7d9ec790, 0x5c5d7d9ed2fc), 
+INFO: Loaded 1 PC tables (2924 PCs): 2924 [0x5c5d7d9ed300,0x5c5d7d9f89c0), 
+INFO:       48 files found in /home/swami/remanence/fuzz/corpus/rem_parity_sidecar_parse
+INFO: -max_len is not provided; libFuzzer will not generate inputs larger than 28673 bytes
+INFO: seed corpus: files: 48 min: 1b max: 28673b total: 34599b rss: 47Mb
+#49	INITED cov: 231 ft: 353 corp: 39/4939b exec/s: 0 rss: 47Mb
+#262144	pulse  cov: 231 ft: 353 corp: 39/4939b lim: 2859 exec/s: 87381 rss: 278Mb
+#524288	pulse  cov: 231 ft: 353 corp: 39/4939b lim: 5470 exec/s: 104857 rss: 470Mb
+#1048576	pulse  cov: 231 ft: 353 corp: 39/4939b lim: 10690 exec/s: 95325 rss: 473Mb
+#2097152	pulse  cov: 231 ft: 353 corp: 39/4939b lim: 21144 exec/s: 99864 rss: 473Mb
+#4081289	DONE   cov: 231 ft: 353 corp: 39/4939b lim: 28673 exec/s: 99543 rss: 474Mb
+Done 4081289 runs in 41 second(s)
+stat::number_of_executed_units: 4081289
+stat::average_exec_per_sec:     99543
+stat::new_units_added:          0
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              474

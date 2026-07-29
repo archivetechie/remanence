@@ -1,0 +1,68 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.79s
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.46s
+     Running `fuzz/target/x86_64-unknown-linux-gnu/release/rem_parity_map_parse -artifact_prefix=/home/swami/remanence/fuzz/artifacts/rem_parity_map_parse/ -max_total_time=21600 -rss_limit_mb=4096 -timeout=30 -print_final_stats=1 -dict=/home/swami/remanence/fuzz/fuzz_targets/rem_parity_map_parse.dict /home/swami/remanence/fuzz/corpus/rem_parity_map_parse`
+Dictionary: 3 entries
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 1838511393
+INFO: Loaded 1 modules   (5689 inline 8-bit counters): 5689 [0x61eb55bafbd0, 0x61eb55bb1209), 
+INFO: Loaded 1 PC tables (5689 PCs): 5689 [0x61eb55bb1210,0x61eb55bc75a0), 
+INFO:      115 files found in /home/swami/remanence/fuzz/corpus/rem_parity_map_parse
+INFO: -max_len is not provided; libFuzzer will not generate inputs larger than 57345 bytes
+INFO: seed corpus: files: 115 min: 1b max: 57345b total: 222564b rss: 46Mb
+#116	INITED cov: 244 ft: 406 corp: 45/16Kb exec/s: 0 rss: 46Mb
+#131072	pulse  cov: 244 ft: 406 corp: 45/16Kb lim: 2768 exec/s: 43690 rss: 320Mb
+#262144	pulse  cov: 244 ft: 406 corp: 45/16Kb lim: 4077 exec/s: 37449 rss: 457Mb
+#524288	pulse  cov: 244 ft: 406 corp: 45/16Kb lim: 6691 exec/s: 40329 rss: 462Mb
+#1048576	pulse  cov: 244 ft: 406 corp: 45/16Kb lim: 11908 exec/s: 43690 rss: 462Mb
+#2097152	pulse  cov: 244 ft: 406 corp: 45/16Kb lim: 22357 exec/s: 41943 rss: 462Mb
+#4194304	pulse  cov: 244 ft: 406 corp: 45/16Kb lim: 43258 exec/s: 41120 rss: 462Mb
+#5917053	REDUCE cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 45168 rss: 462Mb L: 184/1473 MS: 2 ChangeBit-EraseBytes-
+#8388608	pulse  cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 45839 rss: 464Mb
+#16777216	pulse  cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 45100 rss: 466Mb
+#19534250	REDUCE cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 44497 rss: 466Mb L: 184/1473 MS: 4 EraseBytes-ChangeByte-ManualDict-ChangeBinInt- DE: "rem-fuzz-tape-01"-
+#23085711	REDUCE cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 43722 rss: 469Mb L: 187/1473 MS: 2 EraseBytes-ChangeBinInt-
+#28551094	REDUCE cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 44750 rss: 470Mb L: 192/1473 MS: 2 EraseBytes-ChangeBinInt-
+#33554432	pulse  cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 45652 rss: 471Mb
+#40261017	REDUCE cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 44784 rss: 471Mb L: 186/1473 MS: 2 EraseBytes-ChangeBinInt-
+#48292086	REDUCE cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 44964 rss: 472Mb L: 206/1473 MS: 2 EraseBytes-CMP- DE: "\316\000\000\000\000\000\000\000"-
+#58476903	REDUCE cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 45295 rss: 472Mb L: 185/1473 MS: 5 ChangeBit-ChangeBit-ChangeBit-ChangeBinInt-EraseBytes-
+#67108864	pulse  cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 44888 rss: 473Mb
+#74996057	REDUCE cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 44667 rss: 473Mb L: 194/1473 MS: 3 EraseBytes-ChangeBinInt-ChangeBinInt-
+#134217728	pulse  cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 44237 rss: 474Mb
+#173594905	REDUCE cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 43453 rss: 475Mb L: 192/1473 MS: 3 EraseBytes-ManualDict-ChangeBit- DE: "rem-parity-map-v1"-
+#184966098	REDUCE cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 43246 rss: 475Mb L: 195/1473 MS: 2 EraseBytes-ChangeBit-
+#227185114	REDUCE cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 42424 rss: 475Mb L: 184/1473 MS: 2 EraseBytes-ChangeBinInt-
+#246031858	REDUCE cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 42499 rss: 475Mb L: 186/1473 MS: 2 EraseBytes-ChangeBinInt-
+#268435456	pulse  cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 41884 rss: 475Mb
+#318586806	REDUCE cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 41166 rss: 475Mb L: 184/1473 MS: 3 CopyPart-EraseBytes-ChangeBinInt-
+#319024867	REDUCE cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 41159 rss: 475Mb L: 185/1473 MS: 5 ManualDict-ChangeByte-InsertByte-ChangeBinInt-EraseBytes- DE: "rem-parity-map-v1"-
+#412509850	REDUCE cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 40899 rss: 476Mb L: 185/1473 MS: 3 CMP-ShuffleBytes-EraseBytes- DE: "\271\000\000\000"-
+#420596385	REDUCE cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 40846 rss: 476Mb L: 185/1473 MS: 4 CMP-EraseBytes-PersAutoDict-InsertByte- DE: "\3409\225\227"-"\271\000\000\000"-
+#424399957	REDUCE cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 40803 rss: 476Mb L: 185/1473 MS: 2 EraseBytes-PersAutoDict- DE: "\271\000\000\000"-
+#425872341	REDUCE cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 40780 rss: 477Mb L: 185/1473 MS: 4 EraseBytes-ChangeBit-PersAutoDict-ManualDict- DE: "\271\000\000\000"-"rem-parity-map-v1"-
+#459102394	REDUCE cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 40538 rss: 477Mb L: 190/1473 MS: 3 ChangeBinInt-EraseBytes-ChangeBinInt-
+#475796738	REDUCE cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 40359 rss: 477Mb L: 185/1473 MS: 3 ChangeBit-EraseBytes-PersAutoDict- DE: "\271\000\000\000"-
+#527466552	REDUCE cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 39781 rss: 478Mb L: 184/1473 MS: 2 ChangeBit-EraseBytes-
+#536870912	pulse  cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 39727 rss: 478Mb
+#837702593	DONE   cov: 244 ft: 406 corp: 45/16Kb lim: 57345 exec/s: 38780 rss: 479Mb
+###### Recommended dictionary. ######
+"\316\000\000\000\000\000\000\000" # Uses: 18189372
+"\271\000\000\000" # Uses: 6949991
+"\3409\225\227" # Uses: 6793218
+###### End of recommended dictionary. ######
+Done 837702593 runs in 21601 second(s)
+stat::number_of_executed_units: 837702593
+stat::average_exec_per_sec:     38780
+stat::new_units_added:          21
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              479

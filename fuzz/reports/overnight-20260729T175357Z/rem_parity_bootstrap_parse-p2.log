@@ -1,0 +1,56 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.56s
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.27s
+     Running `fuzz/target/x86_64-unknown-linux-gnu/release/rem_parity_bootstrap_parse -artifact_prefix=/home/swami/remanence/fuzz/artifacts/rem_parity_bootstrap_parse/ -max_total_time=40 -rss_limit_mb=4096 -timeout=30 -print_final_stats=1 -dict=/home/swami/remanence/fuzz/fuzz_targets/rem_parity_bootstrap_parse.dict /home/swami/remanence/fuzz/corpus/rem_parity_bootstrap_parse`
+Dictionary: 5 entries
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 3812749636
+INFO: Loaded 1 modules   (5764 inline 8-bit counters): 5764 [0x59d6f85c7f50, 0x59d6f85c95d4), 
+INFO: Loaded 1 PC tables (5764 PCs): 5764 [0x59d6f85c95d8,0x59d6f85dfe18), 
+INFO:      481 files found in /home/swami/remanence/fuzz/corpus/rem_parity_bootstrap_parse
+INFO: -max_len is not provided; libFuzzer will not generate inputs larger than 4096 bytes
+INFO: seed corpus: files: 481 min: 1b max: 4096b total: 125457b rss: 46Mb
+#482	INITED cov: 907 ft: 2468 corp: 233/45Kb exec/s: 0 rss: 53Mb
+#524288	pulse  cov: 907 ft: 2468 corp: 233/45Kb lim: 4096 exec/s: 262144 rss: 372Mb
+#673981	REDUCE cov: 907 ft: 2468 corp: 233/45Kb lim: 4096 exec/s: 224660 rss: 440Mb L: 257/316 MS: 1 EraseBytes-
+#1013714	REDUCE cov: 907 ft: 2468 corp: 233/45Kb lim: 4096 exec/s: 253428 rss: 449Mb L: 193/316 MS: 2 ShuffleBytes-EraseBytes-
+#1048576	pulse  cov: 907 ft: 2468 corp: 233/45Kb lim: 4096 exec/s: 209715 rss: 449Mb
+#1886962	RELOAD cov: 908 ft: 2469 corp: 234/45Kb lim: 4096 exec/s: 209662 rss: 449Mb
+#1950423	REDUCE cov: 908 ft: 2469 corp: 234/45Kb lim: 4096 exec/s: 216713 rss: 449Mb L: 201/316 MS: 1 EraseBytes-
+#2047484	REDUCE cov: 908 ft: 2469 corp: 234/45Kb lim: 4096 exec/s: 227498 rss: 449Mb L: 192/316 MS: 1 EraseBytes-
+#2097152	pulse  cov: 908 ft: 2469 corp: 234/45Kb lim: 4096 exec/s: 233016 rss: 449Mb
+#2340518	RELOAD cov: 908 ft: 2477 corp: 235/46Kb lim: 4096 exec/s: 212774 rss: 449Mb
+#2959898	REDUCE cov: 908 ft: 2477 corp: 235/46Kb lim: 4096 exec/s: 227684 rss: 449Mb L: 286/316 MS: 1 EraseBytes-
+#3077767	REDUCE cov: 908 ft: 2477 corp: 235/46Kb lim: 4096 exec/s: 219840 rss: 449Mb L: 193/316 MS: 2 ChangeByte-EraseBytes-
+#3126993	REDUCE cov: 908 ft: 2477 corp: 235/46Kb lim: 4096 exec/s: 223356 rss: 449Mb L: 260/316 MS: 1 EraseBytes-
+#3700136	REDUCE cov: 908 ft: 2477 corp: 235/46Kb lim: 4096 exec/s: 217655 rss: 449Mb L: 192/316 MS: 1 EraseBytes-
+#4125942	RELOAD cov: 908 ft: 2480 corp: 236/46Kb lim: 4096 exec/s: 217154 rss: 449Mb
+#4194304	pulse  cov: 908 ft: 2480 corp: 236/46Kb lim: 4096 exec/s: 220752 rss: 449Mb
+#4678576	NEW    cov: 908 ft: 2484 corp: 237/46Kb lim: 4096 exec/s: 222789 rss: 449Mb L: 371/371 MS: 3 ChangeBinInt-InsertRepeatedBytes-CMP- DE: "\330\303bN\005\332\233\343"-
+#4679772	REDUCE cov: 908 ft: 2484 corp: 237/46Kb lim: 4096 exec/s: 222846 rss: 449Mb L: 298/316 MS: 1 EraseBytes-
+#4733388	REDUCE cov: 908 ft: 2484 corp: 237/46Kb lim: 4096 exec/s: 225399 rss: 449Mb L: 282/316 MS: 1 EraseBytes-
+#4877260	REDUCE cov: 908 ft: 2484 corp: 237/46Kb lim: 4096 exec/s: 221693 rss: 449Mb L: 255/316 MS: 1 EraseBytes-
+#5033012	REDUCE cov: 908 ft: 2484 corp: 237/46Kb lim: 4096 exec/s: 218826 rss: 451Mb L: 269/316 MS: 1 EraseBytes-
+#5239964	REDUCE cov: 908 ft: 2484 corp: 237/46Kb lim: 4096 exec/s: 218331 rss: 454Mb L: 272/316 MS: 1 EraseBytes-
+#5586403	REDUCE cov: 908 ft: 2484 corp: 237/46Kb lim: 4096 exec/s: 223456 rss: 455Mb L: 258/316 MS: 1 EraseBytes-
+#6333287	REDUCE cov: 908 ft: 2484 corp: 237/46Kb lim: 4096 exec/s: 218389 rss: 455Mb L: 265/316 MS: 2 EraseBytes-PersAutoDict- DE: "\330\303bN\005\332\233\343"-
+#8388608	pulse  cov: 908 ft: 2484 corp: 237/46Kb lim: 4096 exec/s: 220752 rss: 455Mb
+#8895511	DONE   cov: 908 ft: 2484 corp: 237/46Kb lim: 4096 exec/s: 216963 rss: 455Mb
+###### Recommended dictionary. ######
+"\330\303bN\005\332\233\343" # Uses: 342626
+###### End of recommended dictionary. ######
+Done 8895511 runs in 41 second(s)
+stat::number_of_executed_units: 8895511
+stat::average_exec_per_sec:     216963
+stat::new_units_added:          16
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              455

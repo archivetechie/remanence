@@ -1,0 +1,54 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.49s
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.20s
+     Running `fuzz/target/x86_64-unknown-linux-gnu/release/rem_parity_scan_walk -artifact_prefix=/home/swami/remanence/fuzz/artifacts/rem_parity_scan_walk/ -max_total_time=40 -rss_limit_mb=4096 -timeout=30 -print_final_stats=1 -dict=/home/swami/remanence/fuzz/fuzz_targets/rem_parity_scan_walk.dict /home/swami/remanence/fuzz/corpus/rem_parity_scan_walk`
+Dictionary: 3 entries
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 3690536897
+INFO: Loaded 1 modules   (9187 inline 8-bit counters): 9187 [0x5a0b26a760d0, 0x5a0b26a784b3), 
+INFO: Loaded 1 PC tables (9187 PCs): 9187 [0x5a0b26a784b8,0x5a0b26a9c2e8), 
+INFO:     1782 files found in /home/swami/remanence/fuzz/corpus/rem_parity_scan_walk
+INFO: -max_len is not provided; libFuzzer will not generate inputs larger than 4096 bytes
+INFO: seed corpus: files: 1782 min: 1b max: 2080b total: 453747b rss: 46Mb
+#1783	INITED cov: 539 ft: 2762 corp: 249/38Kb exec/s: 0 rss: 433Mb
+#16384	pulse  cov: 539 ft: 2762 corp: 249/38Kb lim: 2220 exec/s: 8192 rss: 438Mb
+#32768	pulse  cov: 539 ft: 2762 corp: 249/38Kb lim: 2385 exec/s: 6553 rss: 440Mb
+#35944	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 2407 exec/s: 5990 rss: 440Mb L: 44/2066 MS: 1 EraseBytes-
+#37740	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 2418 exec/s: 6290 rss: 440Mb L: 380/2066 MS: 1 EraseBytes-
+#38525	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 2418 exec/s: 6420 rss: 440Mb L: 22/2066 MS: 5 CopyPart-EraseBytes-ChangeByte-ChangeBinInt-ChangeBit-
+#58986	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 2616 exec/s: 6554 rss: 440Mb L: 425/2066 MS: 2 CopyPart-EraseBytes-
+#62883	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 2649 exec/s: 6288 rss: 440Mb L: 18/2066 MS: 1 EraseBytes-
+#65485	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 2671 exec/s: 6548 rss: 440Mb L: 344/2066 MS: 2 ChangeBit-EraseBytes-
+#65536	pulse  cov: 539 ft: 2762 corp: 249/38Kb lim: 2671 exec/s: 6553 rss: 440Mb
+#90050	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 2913 exec/s: 6432 rss: 440Mb L: 424/2066 MS: 3 ChangeBinInt-CopyPart-EraseBytes-
+#121339	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 3221 exec/s: 6066 rss: 440Mb L: 43/2066 MS: 2 ManualDict-EraseBytes- DE: "\000\000"-
+#124843	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 3254 exec/s: 6242 rss: 440Mb L: 1718/2066 MS: 2 EraseBytes-CopyPart-
+#126244	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 3265 exec/s: 6011 rss: 440Mb L: 423/2066 MS: 1 EraseBytes-
+#127576	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 3276 exec/s: 6075 rss: 440Mb L: 248/2066 MS: 2 ChangeBit-EraseBytes-
+#130425	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 3298 exec/s: 6210 rss: 440Mb L: 310/2066 MS: 4 EraseBytes-ChangeBinInt-EraseBytes-InsertRepeatedBytes-
+#131072	pulse  cov: 539 ft: 2762 corp: 249/38Kb lim: 3298 exec/s: 5957 rss: 440Mb
+#135651	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 3342 exec/s: 6165 rss: 440Mb L: 24/2066 MS: 1 EraseBytes-
+#139696	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 3375 exec/s: 6073 rss: 440Mb L: 520/2066 MS: 5 ChangeASCIIInt-ChangeBinInt-ShuffleBytes-ShuffleBytes-EraseBytes-
+#142732	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 3397 exec/s: 6205 rss: 440Mb L: 366/2066 MS: 1 EraseBytes-
+#146004	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 3419 exec/s: 6083 rss: 440Mb L: 21/2066 MS: 1 EraseBytes-
+#170268	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 3650 exec/s: 6081 rss: 440Mb L: 140/2066 MS: 2 ChangeByte-EraseBytes-
+#180857	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 3749 exec/s: 6028 rss: 440Mb L: 70/2066 MS: 1 EraseBytes-
+#183254	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 3771 exec/s: 5911 rss: 440Mb L: 26/2066 MS: 2 CrossOver-EraseBytes-
+#195578	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 3892 exec/s: 5926 rss: 440Mb L: 28/2066 MS: 3 ChangeByte-ShuffleBytes-EraseBytes-
+#198329	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 3914 exec/s: 6009 rss: 440Mb L: 42/2066 MS: 1 EraseBytes-
+#226526	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 4096 exec/s: 5961 rss: 440Mb L: 138/2066 MS: 2 EraseBytes-InsertByte-
+#229483	REDUCE cov: 539 ft: 2762 corp: 249/38Kb lim: 4096 exec/s: 5884 rss: 440Mb L: 360/2066 MS: 2 ChangeBinInt-EraseBytes-
+#240573	DONE   cov: 539 ft: 2762 corp: 249/38Kb lim: 4096 exec/s: 5867 rss: 440Mb
+Done 240573 runs in 41 second(s)
+stat::number_of_executed_units: 240573
+stat::average_exec_per_sec:     5867
+stat::new_units_added:          23
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              440
