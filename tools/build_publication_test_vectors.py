@@ -1508,6 +1508,10 @@ def main(argv: list[str] | None = None) -> int:
             ROOT / "tools" / "requirements-rem-object-independent.txt",
             stage / "tools" / "requirements-rem-object-independent.txt",
         )
+        shutil.copyfile(
+            ROOT / "tools" / "rem_parity_rederive.py",
+            stage / "tools" / "rem_parity_rederive.py",
+        )
         claims = (
             "claim\tentrypoint\tartifacts\n"
             "REM-OBJECT positive byte identity\tpython3 verify.py\trem-object/objects/*.rem-object\n"
@@ -1517,6 +1521,8 @@ def main(argv: list[str] | None = None) -> int:
             "REM-OBJECT metadata and extension increment\tpython3 verify.py\trem-object/vectors.json; rem-object/negative/manifest/*\n"
             "REM-OBJECT encrypted final-chunk range\tpython3 verify.py\trem-object/positive/range/*; rem-object/negative/range/*\n"
             "REM-PARITY positive images\tpython3 verify.py\trem-parity-1/positive/*\n"
+            "REM-PARITY attested key-30 tape images\tpython3 verify.py\trem-parity-1/positive/key-30-plaintext-attested/*; rem-parity-1/positive/key-30-encrypted-attested/*\n"
+            "REM-PARITY independent specification re-derivation\tpython3 verify.py --rederive-parity\trem-parity-1/positive/*; rem-parity-1/damage-matrix/*; tools/rem_parity_rederive.py\n"
             "REM-PARITY negative taxonomy\tpython3 verify.py\trem-parity-1/negative/*/*\n"
             "REM-PARITY damage matrix\tpython3 verify.py\trem-parity-1/damage-matrix/*\n"
         )

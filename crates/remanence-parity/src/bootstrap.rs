@@ -1025,6 +1025,10 @@ pub(crate) fn encode_bootstrap_object_row_cbor(
             );
             entries.extend([
                 (
+                    CborValue::Integer(21.into()),
+                    CborValue::Integer((*metadata_frame_len).into()),
+                ),
+                (
                     CborValue::Integer(22.into()),
                     CborValue::Array(
                         recipient_epoch_ids
@@ -1032,10 +1036,6 @@ pub(crate) fn encode_bootstrap_object_row_cbor(
                             .map(|epoch_id| CborValue::Bytes(epoch_id.to_vec()))
                             .collect(),
                     ),
-                ),
-                (
-                    CborValue::Integer(21.into()),
-                    CborValue::Integer((*metadata_frame_len).into()),
                 ),
                 (
                     CborValue::Integer(23.into()),
@@ -1724,6 +1724,28 @@ mod tests {
 
         assert_eq!(parsed.object_rows, payload.object_rows);
         assert_eq!(parsed, payload);
+    }
+
+    #[test]
+    fn encrypted_object_row_writer_uses_deterministic_cbor_key_order() {
+        let row = BootstrapObjectRow::encrypted(1, 6, vec![[0x24; 16]], 66, 1191)
+            .with_object_id([0x33; 16]);
+        let encoded = encode_bootstrap_object_row_cbor(&row).expect("encrypted row encodes");
+        let CborValue::Map(entries) = encoded else {
+            panic!("encrypted object row must encode as a CBOR map");
+        };
+        let keys = entries
+            .into_iter()
+            .map(|(key, _value)| key)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            keys,
+            [1, 2, 3, 4, 21, 22, 23]
+                .into_iter()
+                .map(|key| CborValue::Integer(key.into()))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

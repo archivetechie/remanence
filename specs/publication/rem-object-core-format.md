@@ -1648,7 +1648,7 @@ values (e.g. 4096) so full object byte streams are practical to pin; at least
 one vector MUST use `DEFAULT_CHUNK_SIZE`.
 
 The authoritative companion archive is `remanence-test-vectors.tar`, SHA-256
-`b9be8760fd4a85a922e5fa8eaf86840eec0719a5407030b9f6a35f0606ea79bd`.
+`77be73e780e9ff2c265c8357b6ba684b4c69800213820ae1331850f742b1d83d`.
 The authoritative archive digest names this specific version of the frozen
 conformance distribution. Later additive vector entries are versioned
 supplements carrying their own digest; they do not mutate the conformance

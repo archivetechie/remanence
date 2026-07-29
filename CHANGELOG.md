@@ -25,6 +25,6 @@ open tape-archive format it writes. Archived: concept DOI
   an independent Python reader written from the specification text alone
   reproduces every vector, including malformed inputs and their required errors.
   The archive SHA-256 is
-  `b9be8760fd4a85a922e5fa8eaf86840eec0719a5407030b9f6a35f0606ea79bd`.
+  `77be73e780e9ff2c265c8357b6ba684b4c69800213820ae1331850f742b1d83d`.
 - **Licensing** — the Rust reference implementation is Apache-2.0, the
   specification prose CC-BY-4.0, and the conformance vectors CC0-1.0.

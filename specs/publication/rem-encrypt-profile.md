@@ -914,7 +914,7 @@ SHOULD combine resealing with planned media migration.
 
 The authoritative companion archive is `remanence-test-vectors.tar`,
 SHA-256
-`b9be8760fd4a85a922e5fa8eaf86840eec0719a5407030b9f6a35f0606ea79bd`.
+`77be73e780e9ff2c265c8357b6ba684b4c69800213820ae1331850f742b1d83d`.
 Its `MANIFEST.tsv` inventories every vector manifest and artifact,
 `CHECKSUMS.sha256` authenticates them, and `verify.py` checks the archive
 without a source checkout. Exact byte strings and digests in the archive,
