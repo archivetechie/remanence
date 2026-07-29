@@ -1,0 +1,127 @@
+rem-parity fuzz campaign — 20260729T081732Z
+seconds/target=3600 rss_limit_mb=4096 case_timeout_s=30
+=== rem_parity_bootstrap_parse: campaign ===
+"0\253\275\347\206m}W" # Uses: 45623
+"\256oxt\204\255\210O" # Uses: 45151
+"\337\007\3373n.\272[" # Uses: 41974
+"7\340\274\025\255\351\366\334" # Uses: 41736
+"z\325\247]\021\367t\316" # Uses: 40977
+"\000\000" # Uses: 39385
+".\364\276S>\227S\213" # Uses: 39358
+"\244;\276\310\311\335A\370" # Uses: 39629
+"\034\2257Q\357R\001n" # Uses: 38793
+"\240#_\235\203h:\201" # Uses: 37754
+"K~\275\211\367\342\304\250" # Uses: 37388
+"\033\322m$\311W(\177" # Uses: 36739
+"Io\244\255Y~\\]" # Uses: 31508
+"{\000\000\000" # Uses: 31056
+"\377-G\210\216u+\244" # Uses: 31467
+"\031W\200\205\355\007\022\375" # Uses: 22591
+"g\271\366K[B\253\264" # Uses: 16710
+"t*\335\366\220\032{U" # Uses: 13983
+"\336\212\342q\275\203\366@" # Uses: 4287
+###### End of recommended dictionary. ######
+stat::number_of_executed_units: 988034816
+stat::average_exec_per_sec:     274377
+stat::new_units_added:          1473
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              577
+=== rem_parity_bootstrap_parse: corpus replay (final coverage) ===
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 1391948908
+INFO: Loaded 1 modules   (5764 inline 8-bit counters): 5764 [0x5c5f3073af50, 0x5c5f3073c5d4), 
+INFO: Loaded 1 PC tables (5764 PCs): 5764 [0x5c5f3073c5d8,0x5c5f30752e18), 
+INFO:      388 files found in /home/swami/remanence/fuzz/corpus/rem_parity_bootstrap_parse
+INFO: -max_len is not provided; libFuzzer will not generate inputs larger than 4096 bytes
+INFO: seed corpus: files: 388 min: 1b max: 4096b total: 106172b rss: 47Mb
+#389	INITED cov: 903 ft: 2443 corp: 235/45Kb exec/s: 0 rss: 51Mb
+#389	DONE   cov: 903 ft: 2443 corp: 235/45Kb lim: 316 exec/s: 0 rss: 51Mb
+Done 389 runs in 0 second(s)
+stat::number_of_executed_units: 389
+stat::average_exec_per_sec:     0
+stat::new_units_added:          0
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              51
+corpus_files=388
+=== rem_parity_sidecar_parse: campaign ===
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.06s
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.07s
+     Running `fuzz/target/x86_64-unknown-linux-gnu/release/rem_parity_sidecar_parse -artifact_prefix=/home/swami/remanence/fuzz/artifacts/rem_parity_sidecar_parse/ -max_total_time=3600 -rss_limit_mb=4096 -timeout=30 -print_final_stats=1 -verbosity=0 -dict=/home/swami/remanence/fuzz/fuzz_targets/rem_parity_sidecar_parse.dict /home/swami/remanence/fuzz/corpus/rem_parity_sidecar_parse`
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO:       25 files found in /home/swami/remanence/fuzz/corpus/rem_parity_sidecar_parse
+INFO: -max_len is not provided; libFuzzer will not generate inputs larger than 28673 bytes
+INFO: seed corpus: files: 25 min: 1b max: 28673b total: 31343b rss: 47Mb
+	NEW_FUNC[1/2]: 0x5ab0dba6a350  (/home/swami/remanence/fuzz/target/x86_64-unknown-linux-gnu/release/rem_parity_sidecar_parse+0x144350) (BuildId: 240df6d3f2fc43e4e986cbd4cbe3d568a8443a6f)
+	NEW_FUNC[2/2]: 0x5ab0dba7c650  (/home/swami/remanence/fuzz/target/x86_64-unknown-linux-gnu/release/rem_parity_sidecar_parse+0x156650) (BuildId: 240df6d3f2fc43e4e986cbd4cbe3d568a8443a6f)
+	NEW_FUNC[1/1]: 0x5ab0dba6e230  (/home/swami/remanence/fuzz/target/x86_64-unknown-linux-gnu/release/rem_parity_sidecar_parse+0x148230) (BuildId: 240df6d3f2fc43e4e986cbd4cbe3d568a8443a6f)
+###### Recommended dictionary. ######
+"\324\012\030\206\344qx\365" # Uses: 5494621
+"\201\000\000\000\000\000\000\000" # Uses: 5494432
+"\337\327\005f\240\304aO" # Uses: 5415049
+###### End of recommended dictionary. ######
+stat::number_of_executed_units: 401702624
+stat::average_exec_per_sec:     111553
+stat::new_units_added:          104
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              522
+=== rem_parity_sidecar_parse: corpus replay (final coverage) ===
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 4044339490
+INFO: Loaded 1 modules   (2924 inline 8-bit counters): 2924 [0x5a13134e3790, 0x5a13134e42fc), 
+INFO: Loaded 1 PC tables (2924 PCs): 2924 [0x5a13134e4300,0x5a13134ef9c0), 
+INFO:       48 files found in /home/swami/remanence/fuzz/corpus/rem_parity_sidecar_parse
+INFO: -max_len is not provided; libFuzzer will not generate inputs larger than 28673 bytes
+INFO: seed corpus: files: 48 min: 1b max: 28673b total: 34599b rss: 47Mb
+#49	INITED cov: 231 ft: 353 corp: 38/4810b exec/s: 0 rss: 47Mb
+#49	DONE   cov: 231 ft: 353 corp: 38/4810b lim: 257 exec/s: 0 rss: 47Mb
+Done 49 runs in 0 second(s)
+stat::number_of_executed_units: 49
+stat::average_exec_per_sec:     0
+stat::new_units_added:          0
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              47
+corpus_files=48
+=== rem_parity_map_parse: campaign ===
+"\016\000\000\000\000\000\000\000" # Uses: 448290
+"\003\000" # Uses: 461981
+"A\324\376\002\260\000\000\000" # Uses: 447597
+"\377\377\377\337\002\367\272\255" # Uses: 447638
+"\356\357\357\357" # Uses: 451357
+"\000\007" # Uses: 459676
+"\001]" # Uses: 458220
+"4\000\000\000\000\000\000\000" # Uses: 444017
+"\000\000\000\000\000\000\000\001" # Uses: 435333
+"O\000\000\000\000\000\000\000" # Uses: 432541
+"\377\230" # Uses: 446045
+"\036\000\000\000\000\000\000\000" # Uses: 428011
+"\377\267" # Uses: 439076
+"\271\000\000\000" # Uses: 421384
+"\000\000\000\000\000\000\004J" # Uses: 409990
+"\377\377\377\377\377\377\377\016" # Uses: 407722
+"\000\000\000\000\000\000\000\017" # Uses: 406572
+"dpau" # Uses: 400978
+"\000\000\000\000\000\000\000\000" # Uses: 360997
+###### End of recommended dictionary. ######
+stat::number_of_executed_units: 273077255
+stat::average_exec_per_sec:     75833
+stat::new_units_added:          551
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              613
+=== rem_parity_map_parse: corpus replay (final coverage) ===
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 2775615673
+INFO: Loaded 1 modules   (5689 inline 8-bit counters): 5689 [0x592cd4b26bd0, 0x592cd4b28209), 
+INFO: Loaded 1 PC tables (5689 PCs): 5689 [0x592cd4b28210,0x592cd4b3e5a0), 
+INFO:      115 files found in /home/swami/remanence/fuzz/corpus/rem_parity_map_parse
+INFO: -max_len is not provided; libFuzzer will not generate inputs larger than 57345 bytes
+INFO: seed corpus: files: 115 min: 1b max: 57345b total: 222564b rss: 47Mb
+#116	INITED cov: 244 ft: 406 corp: 48/18Kb exec/s: 0 rss: 47Mb
+#116	DONE   cov: 244 ft: 406 corp: 48/18Kb lim: 1473 exec/s: 0 rss: 47Mb
+Done 116 runs in 0 second(s)
+stat::number_of_executed_units: 116
+stat::average_exec_per_sec:     0
+stat::new_units_added:          0
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              47
+corpus_files=115
+=== rem_parity_scan_walk: campaign ===

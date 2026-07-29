@@ -1,0 +1,45 @@
+rem-parity fuzz campaign — scan_walk completion leg 20260729T112713Z
+(bootstrap/sidecar/map legs completed in rem-parity-campaign-20260729T081732Z.txt)
+=== rem_parity_scan_walk: campaign ===
+INFO: -max_len is not provided; libFuzzer will not generate inputs larger than 4096 bytes
+INFO: seed corpus: files: 861 min: 1b max: 2080b total: 195051b rss: 47Mb
+###### Recommended dictionary. ######
+"\000\000\000\000" # Uses: 118337
+"\001\000\000\003" # Uses: 119139
+"\000\000\000\000\000\000\000\200" # Uses: 115560
+"\000\000\000\000\000\000\000\000" # Uses: 114636
+"\377\377\377\377\377\377\377\243" # Uses: 115207
+"\377\377\377\377" # Uses: 108930
+"\007\000\000\000" # Uses: 103422
+"\001\000\000\000\000\000\000\000" # Uses: 103658
+"\376\377\377\377\377\377\377\377" # Uses: 101865
+"\001\000\020\000" # Uses: 88193
+"\013\000\000\000\000\000\000\000" # Uses: 82514
+"\377\377" # Uses: 80917
+"\003\000\000\000" # Uses: 60325
+"\000\000\000\000\000\000\000\010" # Uses: 58555
+"4\000\000\000\000\000\000\000" # Uses: 51118
+"\377\377\377\377\377\377\377\012" # Uses: 43809
+###### End of recommended dictionary. ######
+stat::number_of_executed_units: 21551386
+stat::average_exec_per_sec:     5984
+stat::new_units_added:          946
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              433
+=== rem_parity_scan_walk: corpus replay ===
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 2417616295
+INFO: Loaded 1 modules   (9187 inline 8-bit counters): 9187 [0x5e215a23b0d0, 0x5e215a23d4b3), 
+INFO: Loaded 1 PC tables (9187 PCs): 9187 [0x5e215a23d4b8,0x5e215a2612e8), 
+INFO:     1782 files found in /home/swami/remanence/fuzz/corpus/rem_parity_scan_walk
+INFO: -max_len is not provided; libFuzzer will not generate inputs larger than 4096 bytes
+INFO: seed corpus: files: 1782 min: 1b max: 2080b total: 453747b rss: 47Mb
+#1783	INITED cov: 539 ft: 2762 corp: 253/38Kb exec/s: 0 rss: 433Mb
+#1783	DONE   cov: 539 ft: 2762 corp: 253/38Kb lim: 2066 exec/s: 0 rss: 433Mb
+Done 1783 runs in 0 second(s)
+stat::number_of_executed_units: 1783
+stat::average_exec_per_sec:     0
+stat::new_units_added:          0
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              433
+corpus_files=1782
