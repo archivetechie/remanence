@@ -386,6 +386,8 @@ fn gf_mul_slice_xor(coefficient: u8, input: &[u8], output: &mut [u8]) {
 mod tests {
     use super::*;
     use crate::model::SchemeId;
+    use remanence_crc::crc64_xz;
+    use sha2::{Digest, Sha256};
 
     fn small_scheme() -> ParityScheme {
         ParityScheme {
@@ -478,6 +480,83 @@ mod tests {
             }
         }
         parity
+    }
+
+    fn bitwise_gf_pow(mut value: u8, mut exponent: u16) -> u8 {
+        let mut result = 1u8;
+        while exponent > 0 {
+            if exponent & 1 == 1 {
+                result = gf_mul_bitwise(result, value);
+            }
+            value = gf_mul_bitwise(value, value);
+            exponent >>= 1;
+        }
+        result
+    }
+
+    fn bitwise_gf_inv(value: u8) -> u8 {
+        assert_ne!(value, 0, "zero has no GF inverse");
+        bitwise_gf_pow(value, 254)
+    }
+
+    fn bitwise_appendix_a_encode(data: &[Vec<u8>], m: usize) -> Vec<Vec<u8>> {
+        let k = data.len();
+        let block_size = data.first().map_or(0, Vec::len);
+        assert!(k + m <= 255, "GF(2^8) supports at most 255 Cauchy seeds");
+        assert!(
+            data.iter().all(|block| block.len() == block_size),
+            "test data must use homogeneous block sizes"
+        );
+
+        let mut parity = vec![vec![0u8; block_size]; m];
+        for (parity_index, out) in parity.iter_mut().enumerate() {
+            for (data_index, shard) in data.iter().enumerate() {
+                let coefficient = bitwise_gf_inv((k + parity_index) as u8 ^ data_index as u8);
+                for (out_byte, data_byte) in out.iter_mut().zip(shard) {
+                    *out_byte ^= gf_mul_bitwise(coefficient, *data_byte);
+                }
+            }
+        }
+        parity
+    }
+
+    fn crc64_xz_bitwise_definition(bytes: &[u8]) -> u64 {
+        const REFLECTED_POLYNOMIAL: u64 = 0xc96c_5795_d787_0f42;
+
+        let mut crc = u64::MAX;
+        for &byte in bytes {
+            crc ^= u64::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ REFLECTED_POLYNOMIAL
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        crc ^ u64::MAX
+    }
+
+    fn assert_crc64_paths(input: &[u8], expected: u64) {
+        assert_eq!(
+            crc64_xz_bitwise_definition(input),
+            expected,
+            "bitwise CRC-64/XZ definition diverged"
+        );
+        assert_eq!(
+            crc64_xz(input),
+            expected,
+            "production CRC-64/XZ table path diverged"
+        );
+    }
+
+    fn shard_digest(shards: &[Vec<u8>]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        for shard in shards {
+            hasher.update((shard.len() as u64).to_le_bytes());
+            hasher.update(shard);
+        }
+        hasher.finalize().into()
     }
 
     fn combinations_of_size(n: usize, size: usize) -> Vec<Vec<usize>> {
@@ -783,24 +862,46 @@ mod tests {
     }
 
     #[test]
-    fn appendix_a_gf_inverses_match_design() {
+    fn freeze_c6_gf_table_matches_section_6_1_bitwise_definition_exhaustively() {
+        for a in u8::MIN..=u8::MAX {
+            for b in u8::MIN..=u8::MAX {
+                assert_eq!(
+                    gf_mul(a, b),
+                    gf_mul_bitwise(a, b),
+                    "GF multiplication mismatch for a={a:#04x}, b={b:#04x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn freeze_c6_section_6_8_vectors_match_bitwise_and_table_paths() {
+        let expected_generator = vec![vec![0x8e, 0xf4], vec![0xf4, 0x8e]];
+        assert_eq!(bitwise_gf_inv(0x02), 0x8e);
+        assert_eq!(bitwise_gf_inv(0x03), 0xf4);
         assert_eq!(gf_inv(0x02).unwrap(), 0x8e);
         assert_eq!(gf_inv(0x03).unwrap(), 0xf4);
-    }
 
-    #[test]
-    fn appendix_a_generator_and_encoding_vector_match_design() {
+        let bitwise_generator = vec![
+            vec![bitwise_gf_inv(0x02), bitwise_gf_inv(0x03)],
+            vec![bitwise_gf_inv(0x03), bitwise_gf_inv(0x02)],
+        ];
+        assert_eq!(bitwise_generator, expected_generator);
+
         let codec = ReedSolomonCodec::new(&appendix_scheme()).unwrap();
-        assert_eq!(codec.generator, vec![vec![0x8e, 0xf4], vec![0xf4, 0x8e]]);
+        assert_eq!(codec.generator, expected_generator);
 
         let data = vec![vec![0x01, 0x02, 0x03, 0x04], vec![0x10, 0x20, 0x30, 0x40]];
-        let parity = codec.encode(&data).unwrap();
-        assert_eq!(parity[0], vec![0x75, 0xea, 0x9f, 0xc9]);
-        assert_eq!(parity[1], vec![0xfc, 0xe5, 0x19, 0xd7]);
+        let expected_parity = vec![vec![0x75, 0xea, 0x9f, 0xc9], vec![0xfc, 0xe5, 0x19, 0xd7]];
+        let bitwise_parity = bitwise_appendix_a_encode(&data, 2);
+        assert_eq!(bitwise_parity, expected_parity);
+
+        let table_parity = codec.encode(&data).unwrap();
+        assert_eq!(table_parity, expected_parity);
     }
 
     #[test]
-    fn appendix_a_reconstruction_vector_recovers_d1_from_d0_and_p0() {
+    fn freeze_c6_section_6_8_reconstruction_recovers_d1_from_d0_and_p0() {
         let codec = ReedSolomonCodec::new(&appendix_scheme()).unwrap();
         let data = vec![vec![0x01, 0x02, 0x03, 0x04], vec![0x10, 0x20, 0x30, 0x40]];
         let parity = codec.encode(&data).unwrap();
@@ -811,6 +912,51 @@ mod tests {
         assert_eq!(shards[0].as_ref().unwrap(), &data[0]);
         assert_eq!(shards[1].as_ref().unwrap(), &data[1]);
         assert_eq!(shards[3].as_ref().unwrap(), &parity[1]);
+    }
+
+    #[test]
+    fn freeze_c6_crc64_xz_matches_section_5_1_and_published_fixture_vectors() {
+        assert_crc64_paths(b"123456789", 0x995d_c9bb_df19_39fa);
+        assert_crc64_paths(b"", 0x0000_0000_0000_0000);
+
+        // This row is also recorded in the published archive's
+        // rem-parity-1/vectors.json arithmetic fixture.
+        assert_crc64_paths(&[0x00], 0x1fad_a173_6467_3f59);
+        assert_crc64_paths(&[0xff], 0xff00_0000_0000_0000);
+
+        let all_zero = vec![0x00; 256 * 1024];
+        let all_ff = vec![0xff; 256 * 1024];
+        assert_crc64_paths(&all_zero, 0x261b_df3d_2998_38fc);
+        assert_crc64_paths(&all_ff, 0x5543_3dd0_f389_08ba);
+    }
+
+    #[test]
+    fn freeze_c6_table_encode_and_reconstruct_match_bitwise_digests() {
+        let codec = ReedSolomonCodec::new(&small_scheme()).unwrap();
+        let data = deterministic_random_data(codec.data_blocks(), 257, 0xc618_6000_5eed_f00d);
+        let bitwise_parity = bitwise_appendix_a_encode(&data, codec.parity_blocks());
+        let expected_encode_digest = shard_digest(&bitwise_parity);
+
+        let table_parity = codec.encode(&data).expect("table encode succeeds");
+        assert_eq!(shard_digest(&table_parity), expected_encode_digest);
+
+        let mut bitwise_complete = data.clone();
+        bitwise_complete.extend(bitwise_parity);
+        let expected_reconstruction_digest = shard_digest(&bitwise_complete);
+
+        let mut table_shards = data.into_iter().map(Some).collect::<Vec<_>>();
+        table_shards.extend(table_parity.into_iter().map(Some));
+        table_shards[1] = None;
+        table_shards[codec.data_blocks()] = None;
+        codec
+            .reconstruct(&mut table_shards)
+            .expect("table reconstruction succeeds");
+        let reconstructed = table_shards
+            .into_iter()
+            .map(|shard| shard.expect("all erased shards reconstructed"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(shard_digest(&reconstructed), expected_reconstruction_digest);
     }
 
     #[test]

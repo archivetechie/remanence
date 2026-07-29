@@ -477,6 +477,37 @@ fn current_test_sense(key: u8, flags: u8, asc: u8, ascq: u8) -> Vec<u8> {
     sense
 }
 
+fn current_descriptor_test_sense(
+    key: u8,
+    flags: u8,
+    asc: u8,
+    ascq: u8,
+    information_valid: bool,
+) -> Vec<u8> {
+    let mut sense = vec![0u8; 24];
+    sense[0] = 0x72;
+    sense[1] = key & 0x0f;
+    sense[2] = asc;
+    sense[3] = ascq;
+    sense[7] = 16;
+    sense[8..20].copy_from_slice(&[
+        0x00,
+        0x0a,
+        if information_valid { 0x80 } else { 0x00 },
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+    ]);
+    sense[20..24].copy_from_slice(&[0x04, 0x02, 0x00, flags]);
+    sense
+}
+
 #[test]
 fn write_eom_signal_early_warning_on_no_sense_plus_eom() {
     let s = eom_sense(0x00);
@@ -512,10 +543,12 @@ fn write_eom_signal_returns_none_for_hard_error_keys() {
 }
 
 #[test]
-fn write_eom_signal_returns_none_for_descriptor_sense() {
-    let mut s = vec![0u8; 16];
-    s[0] = 0x72;
-    assert!(write_eom_signal(&s).is_none());
+fn write_eom_signal_accepts_current_descriptor_eom() {
+    let sense = current_descriptor_test_sense(0x00, 0x40, 0x00, 0x00, false);
+    let signal = write_eom_signal(&sense).expect("descriptor EOM reaches the shared classifier");
+
+    assert!(signal.early_warning);
+    assert!(!signal.end_of_medium);
 }
 
 #[test]
@@ -523,6 +556,10 @@ fn write_eom_signal_returns_none_for_deferred_sense() {
     let mut s = eom_sense(0x00);
     s[0] = 0x71;
     assert!(write_eom_signal(&s).is_none());
+
+    let mut descriptor = current_descriptor_test_sense(0x00, 0x40, 0x00, 0x00, false);
+    descriptor[0] = 0x73;
+    assert!(write_eom_signal(&descriptor).is_none());
 }
 
 #[test]
@@ -601,12 +638,14 @@ fn read_filemark_signal_requires_valid_bit() {
 }
 
 #[test]
-fn read_filemark_signal_returns_none_for_descriptor_sense() {
-    let mut sense = vec![0u8; 16];
-    sense[0] = 0x72;
-    sense[1] = 0x00;
-    sense[2] = 0x00;
-    sense[3] = 0x01;
+fn read_filemark_signal_detects_valid_current_descriptor_filemark() {
+    let sense = current_descriptor_test_sense(0x00, 0x80, 0x00, 0x01, true);
+    assert!(read_filemark_signal(&sense));
+}
+
+#[test]
+fn read_filemark_signal_requires_valid_information_descriptor() {
+    let sense = current_descriptor_test_sense(0x00, 0x80, 0x00, 0x01, false);
     assert!(!read_filemark_signal(&sense));
 }
 
