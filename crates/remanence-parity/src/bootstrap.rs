@@ -18,6 +18,7 @@
 use remanence_library::{scsi::decode_sense, TapeIoError};
 use serde::{Deserialize, Serialize};
 
+use crate::cbor::IntegerMapKeyTracker;
 use crate::error::ParityError;
 use crate::filemark_map::FilemarkMapDigest;
 use crate::parity_map::{
@@ -886,13 +887,12 @@ fn decode_cbor_payload(
     let mut sidecar_epoch_directory: Option<SidecarEpochDirectory> = None;
     let mut parity_map_reference: Option<ParityMapReference> = None;
     let mut object_rows = Vec::new();
+    let mut key_order = IntegerMapKeyTracker::default();
 
     for (key, value) in map {
-        let key_i = match key {
-            CborValue::Integer(i) => i,
-            _ => continue, // ignore unknown / future tstr keys
-        };
-        let key_i: i128 = key_i.into();
+        let key_i = key_order
+            .next(key, "bootstrap payload")
+            .map_err(ParityError::BootstrapParse)?;
         match key_i {
             1 => {
                 scheme_record = Some(decode_scheme_record(value, no_parity_flag)?);
@@ -1072,18 +1072,12 @@ pub(crate) fn decode_bootstrap_object_row_cbor(
     let mut recipient_epoch_ids = None;
     let mut metadata_frame_len = None;
     let mut key_frame_len = None;
-    let mut seen_integer_keys = std::collections::BTreeSet::new();
+    let mut key_order = IntegerMapKeyTracker::default();
 
     for (key, value) in map {
-        let key_i: i128 = match key {
-            CborValue::Integer(i) => i.into(),
-            _ => continue,
-        };
-        if !seen_integer_keys.insert(key_i) {
-            return Err(ParityError::BootstrapParse(format!(
-                "duplicate object row key {key_i}"
-            )));
-        }
+        let key_i = key_order
+            .next(key, "bootstrap object row")
+            .map_err(ParityError::BootstrapParse)?;
         match (key_i, value) {
             (1, CborValue::Integer(i)) => {
                 tape_file_number = Some(int_to_u32(i, "object_row.tape_file_number")?)
@@ -1398,12 +1392,12 @@ fn decode_filemark_map_digest(value: CborValue) -> Result<FilemarkMapDigest, Par
     let mut map_total_data_ordinals: Option<u64> = None;
     let mut highest_protected_ordinal: Option<u64> = None;
     let mut is_final_map: Option<bool> = None;
+    let mut key_order = IntegerMapKeyTracker::default();
 
     for (key, value) in map {
-        let key_i: i128 = match key {
-            CborValue::Integer(i) => i.into(),
-            _ => continue,
-        };
+        let key_i = key_order
+            .next(key, "filemark map digest")
+            .map_err(ParityError::BootstrapParse)?;
         match (key_i, value) {
             (1, CborValue::Bytes(bytes)) => {
                 map_sha256 = Some(bytes.try_into().map_err(|bytes: Vec<u8>| {
@@ -1465,12 +1459,12 @@ fn decode_scheme_record(
     let mut k: Option<u16> = None;
     let mut m: Option<u16> = None;
     let mut s: Option<u32> = None;
+    let mut key_order = IntegerMapKeyTracker::default();
 
     for (key, value) in map {
-        let key_i: i128 = match key {
-            CborValue::Integer(i) => i.into(),
-            _ => continue,
-        };
+        let key_i = key_order
+            .next(key, "scheme record")
+            .map_err(ParityError::BootstrapParse)?;
         match (key_i, value) {
             (1, CborValue::Text(t)) => id = Some(t),
             (2, CborValue::Integer(i)) => k = Some(int_to_u16(i, "data_blocks_per_stripe")?),
@@ -1516,11 +1510,56 @@ fn int_to_u64(i: ciborium::value::Integer, field: &str) -> Result<u64, ParityErr
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::Path;
+    use std::process::Command;
+
     use super::*;
     use crate::parity_map::{
-        ParityMapReference, SidecarEpochDirectory, SidecarEpochDirectoryEntry,
-        SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD, SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
+        parse_parity_map_tape_file, ParityMapReference, SidecarEpochDirectory,
+        SidecarEpochDirectoryEntry, SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD,
+        SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
     };
+
+    const PUBLICATION_POSITIVE_PREFIX: &str = "rem-parity-1/positive/";
+
+    fn publication_archive_path() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../specs/publication/remanence-test-vectors.tar")
+    }
+
+    fn publication_archive_members() -> Vec<String> {
+        let output = Command::new("tar")
+            .arg("-tf")
+            .arg(publication_archive_path())
+            .output()
+            .expect("tar is required to list the pinned publication archive");
+        assert!(
+            output.status.success(),
+            "tar must list the pinned publication archive: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("publication archive member names are UTF-8")
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn read_publication_archive_member(member: &str) -> Vec<u8> {
+        let output = Command::new("tar")
+            .arg("-xOf")
+            .arg(publication_archive_path())
+            .arg(member)
+            .output()
+            .expect("tar is required to read the pinned publication archive");
+        assert!(
+            output.status.success(),
+            "tar must read pinned publication member {member}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
 
     fn sample_digest() -> FilemarkMapDigest {
         FilemarkMapDigest {
@@ -1611,6 +1650,42 @@ mod tests {
         buf
     }
 
+    fn transpose_first_two_cbor_map_entries(value: CborValue) -> CborValue {
+        let CborValue::Map(mut entries) = value else {
+            panic!("test value must be a CBOR map");
+        };
+        assert!(entries.len() >= 2, "test map needs two entries");
+        entries.swap(0, 1);
+        CborValue::Map(entries)
+    }
+
+    fn append_unknown_cbor_map_key(value: CborValue) -> CborValue {
+        let CborValue::Map(mut entries) = value else {
+            panic!("test value must be a CBOR map");
+        };
+        entries.push((CborValue::Integer(99.into()), CborValue::Null));
+        CborValue::Map(entries)
+    }
+
+    fn decode_bootstrap_payload_value(
+        value: &CborValue,
+    ) -> Result<DecodedBootstrapCbor, ParityError> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(value, &mut bytes).expect("test CBOR value encodes");
+        decode_cbor_payload(&bytes, false, 1_048_576, BOOTSTRAP_SCHEMA_MINOR)
+    }
+
+    fn assert_bootstrap_key_order_error(error: ParityError, key: i128, previous: i128) {
+        let ParityError::BootstrapParse(message) = error else {
+            panic!("expected bootstrap parse error, got {error:?}");
+        };
+        assert!(message.contains(&format!("key {key}")), "{message}");
+        assert!(
+            message.contains(&format!("after key {previous}")),
+            "{message}"
+        );
+    }
+
     #[test]
     fn roundtrip_default_payload() {
         // Sample payload's block_size_bytes is 1 MiB; the
@@ -1621,6 +1696,183 @@ mod tests {
         assert!(written > BOOTSTRAP_HEADER_LEN);
         let parsed = parse_bootstrap_block(&buf[..]).expect("parse ok");
         assert_eq!(parsed, payload);
+    }
+
+    #[test]
+    fn every_published_positive_cbor_frame_still_decodes() {
+        let members = publication_archive_members();
+        let positive_vectors = members
+            .iter()
+            .filter_map(|member| {
+                member
+                    .strip_prefix(PUBLICATION_POSITIVE_PREFIX)
+                    .and_then(|relative| relative.split('/').next())
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !positive_vectors.is_empty(),
+            "publication archive must contain positive REM-PARITY vectors"
+        );
+
+        let bootstrap_members = members
+            .iter()
+            .filter(|member| {
+                member.starts_with(PUBLICATION_POSITIVE_PREFIX) && member.ends_with("bootstrap.bin")
+            })
+            .collect::<Vec<_>>();
+        let mut vector_geometry = BTreeMap::new();
+        let mut decoded_vectors = BTreeSet::new();
+        for member in bootstrap_members {
+            let bytes = read_publication_archive_member(member);
+            let payload = parse_bootstrap_block(&bytes)
+                .unwrap_or_else(|error| panic!("pinned {member} must decode: {error}"));
+            let vector = member
+                .strip_prefix(PUBLICATION_POSITIVE_PREFIX)
+                .and_then(|relative| relative.split('/').next())
+                .expect("positive bootstrap member has a vector directory");
+            decoded_vectors.insert(vector.to_string());
+            if let Some((tape_uuid, block_size)) = vector_geometry.insert(
+                vector.to_string(),
+                (payload.tape_uuid, payload.block_size_bytes),
+            ) {
+                assert_eq!(tape_uuid, payload.tape_uuid, "{member} tape UUID");
+                assert_eq!(block_size, payload.block_size_bytes, "{member} block size");
+            }
+        }
+        assert_eq!(
+            decoded_vectors, positive_vectors,
+            "every positive REM-PARITY vector must contain a decodable bootstrap"
+        );
+
+        let parity_map_members = members
+            .iter()
+            .filter(|member| {
+                member.starts_with(PUBLICATION_POSITIVE_PREFIX)
+                    && member.ends_with("parity-map.bin")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !parity_map_members.is_empty(),
+            "publication archive must exercise a parity-map CBOR payload"
+        );
+        for member in parity_map_members {
+            let vector = member
+                .strip_prefix(PUBLICATION_POSITIVE_PREFIX)
+                .and_then(|relative| relative.split('/').next())
+                .expect("positive parity-map member has a vector directory");
+            let (tape_uuid, block_size) = vector_geometry
+                .get(vector)
+                .expect("parity-map vector has decoded bootstrap geometry");
+            let bytes = read_publication_archive_member(member);
+            let block_size = usize::try_from(*block_size).expect("block size fits usize");
+            assert_eq!(
+                bytes.len() % block_size,
+                0,
+                "pinned {member} contains whole fixed blocks"
+            );
+            let blocks = bytes
+                .chunks_exact(block_size)
+                .map(<[u8]>::to_vec)
+                .collect::<Vec<_>>();
+            parse_parity_map_tape_file(&blocks, tape_uuid)
+                .unwrap_or_else(|error| panic!("pinned {member} must decode: {error}"));
+        }
+    }
+
+    #[test]
+    fn bootstrap_payload_map_enforces_order_and_ignores_ordered_unknown_key() {
+        let canonical_bytes = encode_cbor_payload(&sample_payload()).expect("payload encodes");
+        let canonical: CborValue =
+            ciborium::from_reader(canonical_bytes.as_slice()).expect("payload value decodes");
+
+        decode_bootstrap_payload_value(&canonical).expect("canonical payload map decodes");
+
+        let transposed = transpose_first_two_cbor_map_entries(canonical.clone());
+        let error = decode_bootstrap_payload_value(&transposed)
+            .expect_err("transposed payload keys must reject");
+        assert_bootstrap_key_order_error(error, 1, 2);
+
+        let extended = append_unknown_cbor_map_key(canonical);
+        decode_bootstrap_payload_value(&extended).expect("ordered unknown payload key is ignored");
+    }
+
+    #[test]
+    fn scheme_record_map_enforces_order_and_ignores_ordered_unknown_key() {
+        let canonical = CborValue::Map(vec![
+            (
+                CborValue::Integer(1.into()),
+                CborValue::Text("rs-cauchy-gf256-v1".to_string()),
+            ),
+            (CborValue::Integer(2.into()), CborValue::Integer(2.into())),
+            (CborValue::Integer(3.into()), CborValue::Integer(1.into())),
+            (CborValue::Integer(4.into()), CborValue::Integer(2.into())),
+        ]);
+
+        decode_scheme_record(canonical.clone(), false).expect("canonical scheme map decodes");
+
+        let transposed = transpose_first_two_cbor_map_entries(canonical.clone());
+        let error = decode_scheme_record(transposed, false)
+            .expect_err("transposed scheme keys must reject");
+        assert_bootstrap_key_order_error(error, 1, 2);
+
+        let extended = append_unknown_cbor_map_key(canonical);
+        decode_scheme_record(extended, false).expect("ordered unknown scheme key is ignored");
+    }
+
+    #[test]
+    fn filemark_digest_map_enforces_order_and_ignores_ordered_unknown_key() {
+        let digest = sample_payload()
+            .filemark_map_digest
+            .expect("sample payload has a digest");
+        let canonical = encode_filemark_map_digest(&digest);
+
+        assert_eq!(
+            decode_filemark_map_digest(canonical.clone()).expect("canonical digest map decodes"),
+            digest
+        );
+
+        let transposed = transpose_first_two_cbor_map_entries(canonical.clone());
+        let error =
+            decode_filemark_map_digest(transposed).expect_err("transposed digest keys must reject");
+        assert_bootstrap_key_order_error(error, 1, 2);
+
+        let extended = append_unknown_cbor_map_key(canonical);
+        assert_eq!(
+            decode_filemark_map_digest(extended).expect("ordered unknown digest key is ignored"),
+            digest
+        );
+    }
+
+    #[test]
+    fn object_row_map_enforces_order_and_ignores_ordered_unknown_key() {
+        let row = BootstrapObjectRow::encrypted(1, 6, vec![[0x24; 16]], 66, 1191)
+            .with_object_id([0x33; 16]);
+        let canonical = encode_bootstrap_object_row_cbor(&row).expect("object row encodes");
+
+        assert_eq!(
+            decode_bootstrap_object_row_cbor(
+                canonical.clone(),
+                Some(4096),
+                BOOTSTRAP_SCHEMA_MINOR,
+            )
+            .expect("canonical object row decodes"),
+            row
+        );
+
+        let transposed = transpose_first_two_cbor_map_entries(canonical.clone());
+        let error =
+            decode_bootstrap_object_row_cbor(transposed, Some(4096), BOOTSTRAP_SCHEMA_MINOR)
+                .expect_err("transposed object-row keys must reject");
+        assert_bootstrap_key_order_error(error, 1, 2);
+
+        let extended = append_unknown_cbor_map_key(canonical);
+        assert_eq!(
+            decode_bootstrap_object_row_cbor(extended, Some(4096), BOOTSTRAP_SCHEMA_MINOR,)
+                .expect("ordered unknown object-row key is ignored"),
+            row
+        );
     }
 
     #[test]
@@ -1811,11 +2063,11 @@ mod tests {
             ),
             (CborValue::Integer(3.into()), CborValue::Integer(4.into())),
             (CborValue::Integer(10.into()), CborValue::Integer(2.into())),
+            (CborValue::Integer(21.into()), CborValue::Integer(66.into())),
             (
                 CborValue::Integer(22.into()),
                 CborValue::Array(vec![CborValue::Bytes(vec![0x24; 16])]),
             ),
-            (CborValue::Integer(21.into()), CborValue::Integer(66.into())),
             (
                 CborValue::Integer(23.into()),
                 CborValue::Integer(1191.into()),
@@ -1852,10 +2104,7 @@ mod tests {
 
         let err = decode_bootstrap_object_row_cbor(row, Some(4096), 2).unwrap_err();
 
-        assert!(
-            err.to_string().contains("duplicate object row key"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("duplicate CBOR map key"), "{err}");
     }
 
     #[test]
