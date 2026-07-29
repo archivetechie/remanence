@@ -890,7 +890,7 @@ A Scanner with no off-tape state proceeds through the following discovery
 strategies in order, stopping at the first bootstrap found. Strategies 1
 and 4 are REQUIRED, as is strategy 2 whenever hints are available;
 strategy 3 is OPTIONAL; a Scanner SHOULD offer strategy 5 as an explicit
-opt-in.
+per-invocation opt-in (Section 8.4.1).
 
 1. **Beginning of tape (BOT)** (LBA 0) — always.
 2. **Hint positions** supplied out of band (catalog, journal, medium
@@ -899,8 +899,8 @@ opt-in.
    marks of a total-size hint).
 4. **A bounded forward scan** from each candidate position, of up to
    `MAX_BOOTSTRAP_SCAN_BLOCKS` (1024) blocks.
-5. As a last resort, an explicit opt-in full
-   filemark-walk scan of the tape.
+5. As a last resort, an explicit per-invocation opt-in full
+   filemark-walk scan of the tape (Section 8.4.1).
 
 When the block size is unknown, the discovery candidates (256 KiB, 512 KiB,
 1 MiB) MUST each be applied as a real drive reconfiguration before reading;
@@ -935,6 +935,51 @@ candidate-size paths:
 6. Any other transport error: the Scanner MUST abort discovery.
 7. `drive_compression = true` on a parity bootstrap: the implementation
    MUST abort discovery and reject the tape (Sections 11.4, 16.3).
+
+#### 8.4.1. The Last-Resort Filemark Walk (Strategy 5)
+
+Strategy 5 exists for the tape whose bootstrap population is entirely
+unreadable by strategies 1–4. The walk itself is not a new mechanism: it
+follows the Section 12 scan-walk and per-block rules unchanged, executed
+without a discovered bootstrap, collecting bootstrap candidates as it goes —
+by magic probe at each readable tape-file head, while head-unreadable
+1-block tape files remain bootstrap candidates through Section 12.4
+re-typing — together with structurally discovered parity_map files. Its
+results enter the ordinary Section 12.4 overlay and validation with no
+separate acceptance path. This section specifies only the walk's operational
+envelope.
+
+- **Opt-in.** The walk MUST NOT run without an explicit per-invocation
+  opt-in; a persistent configuration default is not sufficient. It traverses
+  the entire medium and can take hours; a Scanner MUST NOT fall through to it
+  silently after strategy 4.
+- **Geometry hints.** A Scanner MUST accept optional hints supplied out of
+  band (catalog, journal, medium auxiliary memory, operator): block size,
+  expected tape-file count, expected capacity. A block-size hint makes the
+  size known and is applied as a configured read size under the Section 8.4
+  hint path, suppressing candidate rotation. A Scanner MAY use the count and
+  capacity hints to compute progress estimates. Hints MUST NOT cause any tape
+  file to be skipped.
+- **Progress.** The Scanner MUST report progress at least once per tape file
+  crossed: the current tape-file ordinal, the current position as a logical
+  block address (with partition where applicable), the bootstrap and
+  parity_map candidates found so far, and elapsed time. A walk that emits no
+  progress is nonconformant even if it terminates correctly.
+- **Abort.** The walk MUST be abortable between tape files. On abort the
+  Scanner MUST report the extent walked (the last tape-file ordinal crossed),
+  the candidates found, and the drive's best-known position — or state
+  explicitly that position is indeterminate when the drive cannot report one.
+  An operator who aborts is planning a next step and needs to know where the
+  head is.
+- **Positioning-failure bound.** During a Strategy-5 walk, inter-file
+  positioning commands (SPACE, LOCATE issued between tape files) are governed
+  by this bullet and are exempt from Section 8.4 per-block rule 6; read
+  errors remain governed by the per-block rules unchanged. After
+  `WALK_MAX_CONSECUTIVE_POSITIONING_FAILURES` (8) consecutive positioning
+  failures the walk MUST stop and report rather than continue commanding
+  motion against a medium or drive that is refusing it.
+- **Termination.** The walk ends at EOD. Encountering EOM first is reported
+  as truncation and feeds the Section 12.6 tail taxonomy unchanged.
 
 ### 8.5. Authoritative Selection
 
@@ -1549,19 +1594,25 @@ scoped prefix and compare the digest and all three scalars. A mismatch is
 fatal to that map — not to the tape: a different bootstrap copy may carry a
 usable scope.
 
-Before declaring `FilemarkMapDigestMismatch`, a Scanner SHOULD attempt
-**bootstrap re-typing**: a destroyed bootstrap block is structurally
+Before declaring `FilemarkMapDigestMismatch`, a Scanner MUST attempt
+**bootstrap re-typing** (satisfied trivially when no candidate exists): a destroyed bootstrap block is structurally
 indistinguishable from a 1-block object with an unreadable head, so for
 each 1-block tape file classified as an object by elimination because its
 head block was unreadable, re-hypothesize its kind as Bootstrap (block
 count 1, no ordinal), renumber the object ordinals, and revalidate;
 accept the first hypothesis whose digest and scope scalars validate. The
-hypothesis space is bounded by the number of unreadable 1-block files. The
-reference Scanner tests candidates one at a time in ascending tape-file order;
-it does not re-type readable corrupt headers, genuine readable 1-block
-objects, or combinations of candidates. Each hypothesis is passed through the
-same directory overlay, ordinal renumbering, digest, and scope-scalar checks as
-the original scan.
+hypothesis space is bounded by the number of unreadable 1-block files.
+Candidates MUST be tested one at a time in ascending tape-file order, one
+hypothesis active at a time. Only a 1-block tape file whose head block was
+unreadable is a candidate: a Scanner MUST NOT hypothesize a file whose head
+block read successfully — whatever that block's parse or CRC outcome — and
+MUST NOT test a hypothesis that re-types more than one file simultaneously.
+Each hypothesis is passed through the same directory overlay, ordinal
+renumbering, digest, and scope-scalar checks as the original scan. This
+requirement is deliberate: without re-typing, single-block damage to a
+checkpoint bootstrap would produce divergent recovery outcomes between
+implementations, and the Section 12.5 isolation guarantee would depend on
+optional behaviour.
 Without re-typing, single-block damage to a checkpoint bootstrap would
 invalidate every digest scope covering it, defeating the isolation goal
 of Section 12.5.
@@ -2284,7 +2335,8 @@ tape and does not change any REM-PARITY media byte.
    that gap is a freeze item.
 3. **The last-resort full filemark-walk scan** (Section 8.4 step 5) is a
    SHOULD-offer whose operational parameters (geometry hints, abort
-   conditions, progress reporting) are not yet specified.
+   conditions, progress reporting) are not yet specified (resolved —
+   Section 8.4.1, this revision).
 4. **Bootstrap re-typing promotion.** The selection rule among
    structurally discovered parity_map files is specified in Section 12.4;
    it needs a multi-parity_map damage-matrix image vector (ranking,
@@ -2293,7 +2345,10 @@ tape and does not change any REM-PARITY media byte.
    (Section 18 criterion 2). Bootstrap re-typing is implemented at SHOULD
    strength with a damage-matrix vector; promotion to MUST, if desired before
    freeze, remains a specification policy decision rather than an
-   implementation gap.
+   implementation gap (resolved — promoted to MUST in Section 12.4, this
+   revision; the multi-parity-map damage-matrix vector is present in the
+   published archive under
+   `rem-parity-1/damage-matrix/multi-parity-map-selection/`).
 5. **Throughput program.** Accelerated GF(2⁸) and CRC kernels must land and
    be proven byte-identical via the Section 17 vectors (Section 18
    criterion 6) before freeze, so the conformance anchor is generated at
@@ -2323,6 +2378,12 @@ tape and does not change any REM-PARITY media byte.
   (attested / unattested / truncated) specified with salvage rules
   (Section 12.6); Appendix B.8 reframed from "no on-tape commit marker" to
   per-file-marker rationale plus barrier-grain structural attestation.
+- **2026-07-29 — pre-freeze revisions II.** Last-resort filemark-walk
+  operational envelope specified (Section 8.4.1), with inter-file
+  positioning explicitly exempted from the Section 8.4 rule-6 abort;
+  bootstrap re-typing promoted from SHOULD to MUST with operational candidate
+  criteria (Section 12.4) — reader-obligation changes with no effect on the
+  set of valid tapes; Appendix C items 3 and 4 resolved.
 
 ## Author's Address
 
