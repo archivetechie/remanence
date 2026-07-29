@@ -1190,6 +1190,34 @@ fn lto9_inquiry() -> Vec<u8> {
     include_bytes!("../../../../fixtures/inquiry/drive1-lto9.bin").to_vec()
 }
 
+#[test]
+fn standalone_drive_open_validates_explicit_sequential_device() {
+    let transport = FixtureTransport::new()
+        .with_responses(vec![lto9_inquiry(), vpd80_response("DRV_STANDALONE")]);
+    let drive = DriveHandle::open_standalone_with_transport(
+        Path::new("/dev/sg-standalone"),
+        Box::new(transport),
+    )
+    .expect("explicit sequential-access device opens");
+    assert_eq!(drive.drive().serial, "DRV_STANDALONE");
+    assert_eq!(
+        drive.drive().sg_path.as_deref(),
+        Some(Path::new("/dev/sg-standalone"))
+    );
+    assert_eq!(drive.library_serial(), "standalone:/dev/sg-standalone");
+}
+
+#[test]
+fn standalone_drive_open_rejects_non_tape_device() {
+    let transport = FixtureTransport::new().with_responses(vec![changer_inquiry_response()]);
+    let error = DriveHandle::open_standalone_with_transport(
+        Path::new("/dev/sg-changer"),
+        Box::new(transport),
+    )
+    .expect_err("explicit non-tape device must be refused");
+    assert!(matches!(error, OpenError::IdentityChanged { .. }));
+}
+
 #[cfg(target_os = "linux")]
 struct FailTurWithCheckCondition<T> {
     inner: T,

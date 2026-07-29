@@ -7,7 +7,9 @@
 //! everything else is treated as an object candidate and validated later by an
 //! authoritative bootstrap or structurally selected parity-map digest.
 
-use crate::bootstrap::{has_bootstrap_magic, parse_bootstrap_block, BootstrapPayload};
+use crate::bootstrap::{
+    bootstrap_scope_key, has_bootstrap_magic, parse_bootstrap_block, BootstrapPayload,
+};
 use crate::error::ParityError;
 use crate::filemark_map::{
     FilemarkMap, FilemarkMapBuilder, FilemarkMapDigest, ScopedFilemarkMap, TapeFileKind,
@@ -78,6 +80,70 @@ pub struct ScanWalkResult {
     pub map: FilemarkMap,
     /// First incomplete tail file, when one terminated the walk.
     pub truncation: Option<ScanTailTruncation>,
+    /// Valid bootstrap copies encountered and structurally classified by the
+    /// walk, in physical tape-file order.
+    pub bootstrap_candidates: Vec<ScanBootstrapCandidate>,
+    /// Physical damage encountered by the scanner itself.
+    pub damaged_regions: Vec<ScanDamagedRegion>,
+    unreadable_one_block_objects: Vec<u32>,
+}
+
+impl ScanWalkResult {
+    /// Select the authoritative bootstrap using Section 8.5's scope key.
+    pub fn authoritative_bootstrap(&self) -> Option<&ScanBootstrapCandidate> {
+        self.bootstrap_candidates.iter().reduce(|best, candidate| {
+            if bootstrap_scope_key(&candidate.payload) > bootstrap_scope_key(&best.payload) {
+                candidate
+            } else {
+                best
+            }
+        })
+    }
+}
+
+/// One valid bootstrap copy encountered during the structural walk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanBootstrapCandidate {
+    /// Dense tape-file number containing the bootstrap.
+    pub tape_file_number: u32,
+    /// Fully parsed bootstrap payload.
+    pub payload: BootstrapPayload,
+}
+
+/// Scanner-observed physical damage category.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanDamageKind {
+    /// The first block of a measured tape file was unreadable.
+    UnreadableTapeFileHead,
+}
+
+/// One contiguous damaged region encountered by the structural scanner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanDamagedRegion {
+    /// First damaged physical position.
+    pub start: PhysicalPositionHint,
+    /// Number of consecutive blocks represented by this entry.
+    pub block_count: u64,
+    /// Scanner operation that encountered the damage.
+    pub kind: ScanDamageKind,
+}
+
+/// Source that supplied structural-kind overlay information.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanOverlaySource {
+    /// No overlay was required; the structural walk supplied the map.
+    StructuralWalk,
+    /// A catalog supplied the complete map.
+    Catalog,
+    /// The authoritative bootstrap's inline epoch directory supplied it.
+    BootstrapInlineDirectory,
+    /// A bootstrap-referenced parity-map payload supplied it.
+    ReferencedParityMap,
+    /// Redundant structurally discovered parity-map files supplied it.
+    StructurallySelectedParityMap,
+    /// An unreadable referenced parity-map was projected from its bootstrap
+    /// locator only.
+    ParityMapReferenceProjection,
 }
 
 /// Digest-validated scan result with an explicit attested/tail boundary.
@@ -93,6 +159,12 @@ pub struct FilemarkMapScanResult {
     pub truncation: Option<ScanTailTruncation>,
     /// Equal-ranking parity-map copies whose validated payloads disagreed.
     pub parity_map_content_conflicts: Vec<ParityMapContentConflict>,
+    /// Bootstrap sequence whose scope governed map validation.
+    pub authoritative_bootstrap_sequence: u32,
+    /// Source of any structural-kind overlay applied before digest validation.
+    pub overlay_source: ScanOverlaySource,
+    /// Physical damage encountered by the underlying structural scan.
+    pub damaged_regions: Vec<ScanDamagedRegion>,
 }
 
 impl FilemarkMapScanResult {
@@ -168,19 +240,46 @@ pub fn acquire_filemark_map_with_report(
         validate_catalog_scope(&catalog, authoritative_bootstrap)?;
         let scoped_map =
             ScopedFilemarkMap::from_catalog(catalog.map, catalog.highest_protected_ordinal);
-        return filemark_map_scan_result(scoped_map, None, Vec::new());
+        return filemark_map_scan_result(
+            scoped_map,
+            None,
+            Vec::new(),
+            authoritative_bootstrap.sequence,
+            ScanOverlaySource::Catalog,
+            Vec::new(),
+        );
     }
 
+    if authoritative_bootstrap.filemark_map_digest.is_none() {
+        return Err(filemark_scan_error(
+            "authoritative bootstrap does not carry a filemark-map digest",
+        ));
+    }
+    let reconstructed = scan_reconstruct_filemark_map_with_report(
+        source,
+        &authoritative_bootstrap.tape_uuid,
+        authoritative_bootstrap.block_size_bytes,
+    )?;
+    validate_scan_reconstruction_with_report(source, authoritative_bootstrap, reconstructed)
+}
+
+/// Validate one already-completed structural scan against a bootstrap scope.
+///
+/// Catalog-less report consumers call the structural scan once, select the
+/// authoritative bootstrap from its candidates, and pass that same walk here.
+/// This preserves the scanner's unreadable-head provenance for bootstrap
+/// re-typing and applies the existing directory-overlay and digest funnel
+/// without a second physical tape walk.
+pub fn validate_scan_reconstruction_with_report(
+    source: &mut dyn RawTapeSource,
+    authoritative_bootstrap: &BootstrapPayload,
+    reconstructed: ScanWalkResult,
+) -> Result<FilemarkMapScanResult, ParityError> {
     let Some(digest) = authoritative_bootstrap.filemark_map_digest.as_ref() else {
         return Err(filemark_scan_error(
             "authoritative bootstrap does not carry a filemark-map digest",
         ));
     };
-    let reconstructed = scan_reconstruct_filemark_map_with_provenance(
-        source,
-        &authoritative_bootstrap.tape_uuid,
-        authoritative_bootstrap.block_size_bytes,
-    )?;
     match validate_scan_hypothesis(
         source,
         reconstructed.map.clone(),
@@ -192,6 +291,9 @@ pub fn acquire_filemark_map_with_report(
             validated.scoped_map,
             reconstructed.truncation,
             validated.parity_map_content_conflicts,
+            authoritative_bootstrap.sequence,
+            validated.overlay_source,
+            reconstructed.damaged_regions,
         ),
         Err(original_error) => {
             for tape_file_number in &reconstructed.unreadable_one_block_objects {
@@ -207,6 +309,9 @@ pub fn acquire_filemark_map_with_report(
                         validated.scoped_map,
                         reconstructed.truncation,
                         validated.parity_map_content_conflicts,
+                        authoritative_bootstrap.sequence,
+                        validated.overlay_source,
+                        reconstructed.damaged_regions,
                     );
                 }
             }
@@ -222,6 +327,9 @@ fn filemark_map_scan_result(
     scoped_map: ScopedFilemarkMap,
     truncation: Option<ScanTailTruncation>,
     parity_map_content_conflicts: Vec<ParityMapContentConflict>,
+    authoritative_bootstrap_sequence: u32,
+    overlay_source: ScanOverlaySource,
+    damaged_regions: Vec<ScanDamagedRegion>,
 ) -> Result<FilemarkMapScanResult, ParityError> {
     let attested_tape_file_count = scoped_map
         .validated_prefix_tape_files
@@ -249,6 +357,9 @@ fn filemark_map_scan_result(
         unattested_files,
         truncation,
         parity_map_content_conflicts,
+        authoritative_bootstrap_sequence,
+        overlay_source,
+        damaged_regions,
     })
 }
 
@@ -276,6 +387,7 @@ fn enrich_scan_error_with_truncation(
 struct ValidatedScanHypothesis {
     scoped_map: ScopedFilemarkMap,
     parity_map_content_conflicts: Vec<ParityMapContentConflict>,
+    overlay_source: ScanOverlaySource,
 }
 
 fn validate_scan_hypothesis(
@@ -296,6 +408,7 @@ fn validate_scan_hypothesis(
     Ok(ValidatedScanHypothesis {
         scoped_map,
         parity_map_content_conflicts: overlay.parity_map_content_conflicts,
+        overlay_source: overlay.source,
     })
 }
 
@@ -366,6 +479,9 @@ pub fn scan_reconstruct_filemark_map_with_report(
     Ok(ScanWalkResult {
         map: reconstructed.map,
         truncation: reconstructed.truncation,
+        bootstrap_candidates: reconstructed.bootstrap_candidates,
+        damaged_regions: reconstructed.damaged_regions,
+        unreadable_one_block_objects: reconstructed.unreadable_one_block_objects,
     })
 }
 
@@ -374,6 +490,8 @@ struct ScanReconstruction {
     map: FilemarkMap,
     unreadable_one_block_objects: Vec<u32>,
     truncation: Option<ScanTailTruncation>,
+    bootstrap_candidates: Vec<ScanBootstrapCandidate>,
+    damaged_regions: Vec<ScanDamagedRegion>,
 }
 
 fn scan_reconstruct_filemark_map_with_provenance(
@@ -395,6 +513,8 @@ fn scan_reconstruct_filemark_map_with_provenance(
     let mut saw_file = false;
     let mut unreadable_one_block_objects = Vec::new();
     let mut truncation = None;
+    let mut bootstrap_candidates = Vec::new();
+    let mut damaged_regions = Vec::new();
 
     loop {
         let file_start = source.position()?;
@@ -427,7 +547,7 @@ fn scan_reconstruct_filemark_map_with_provenance(
                         break;
                     }
                 };
-                append_classified_entry(
+                if let Some(candidate) = append_classified_entry(
                     source,
                     &mut builder,
                     &first_block,
@@ -435,11 +555,18 @@ fn scan_reconstruct_filemark_map_with_provenance(
                     block_size,
                     file_start,
                     measured.block_count,
-                )?;
+                )? {
+                    bootstrap_candidates.push(candidate);
+                }
                 source.locate_physical(measured.position_after)?;
                 saw_file = true;
             }
             Err(_err) => {
+                damaged_regions.push(ScanDamagedRegion {
+                    start: file_start,
+                    block_count: 1,
+                    kind: ScanDamageKind::UnreadableTapeFileHead,
+                });
                 source.locate_physical(file_start)?;
                 let measured = match measure_current_file(source, file_start)? {
                     MeasureCurrentFileOutcome::Complete(measured) => measured,
@@ -478,6 +605,8 @@ fn scan_reconstruct_filemark_map_with_provenance(
         map: builder.build()?,
         unreadable_one_block_objects,
         truncation,
+        bootstrap_candidates,
+        damaged_regions,
     })
 }
 
@@ -558,18 +687,22 @@ fn append_classified_entry(
     block_size: u32,
     file_start: PhysicalPositionHint,
     block_count: u64,
-) -> Result<(), ParityError> {
+) -> Result<Option<ScanBootstrapCandidate>, ParityError> {
     if has_bootstrap_magic(block0) {
         match parse_bootstrap_block(block0) {
             Ok(payload) => {
-                if payload.block_size_bytes == block_size {
+                if payload.block_size_bytes == block_size && payload.tape_uuid == *tape_uuid {
                     if block_count != 1 {
                         return Err(filemark_scan_error(format!(
                             "bootstrap tape file has block_count {block_count}, expected 1"
                         )));
                     }
+                    let tape_file_number = builder.next_tape_file_number()?;
                     builder.push_bootstrap()?;
-                    return Ok(());
+                    return Ok(Some(ScanBootstrapCandidate {
+                        tape_file_number,
+                        payload,
+                    }));
                 }
             }
             Err(ParityError::DriveCompressionEnabled) => {
@@ -588,7 +721,7 @@ fn append_classified_entry(
             )));
         }
         builder.push_parity_map(block_count)?;
-        return Ok(());
+        return Ok(None);
     }
 
     if let Ok(Some(header)) = classify_sidecar_header_block(block0, tape_uuid) {
@@ -605,7 +738,7 @@ fn append_classified_entry(
             header.protected_ordinal_start,
             header.protected_ordinal_end_exclusive,
         )?;
-        return Ok(());
+        return Ok(None);
     }
 
     if let Some(header) =
@@ -617,11 +750,11 @@ fn append_classified_entry(
             header.protected_ordinal_start,
             header.protected_ordinal_end_exclusive,
         )?;
-        return Ok(());
+        return Ok(None);
     }
 
     builder.push_object(block_count)?;
-    Ok(())
+    Ok(None)
 }
 
 fn append_entry_with_unreadable_head(
@@ -760,6 +893,7 @@ struct AuthoritativeDirectoryOverlay {
     map: FilemarkMap,
     fencing_digest: Option<FilemarkMapDigest>,
     parity_map_content_conflicts: Vec<ParityMapContentConflict>,
+    source: ScanOverlaySource,
 }
 
 struct ValidatedParityMapCandidate {
@@ -804,6 +938,7 @@ fn apply_authoritative_directory_overlay(
             map: apply_sidecar_directory_overlay(reconstructed, directory, None)?,
             fencing_digest: None,
             parity_map_content_conflicts: Vec::new(),
+            source: ScanOverlaySource::BootstrapInlineDirectory,
         });
     }
 
@@ -821,6 +956,7 @@ fn apply_authoritative_directory_overlay(
                 map: apply_sidecar_directory_overlay(reconstructed, &directory, Some(reference))?,
                 fencing_digest: None,
                 parity_map_content_conflicts: Vec::new(),
+                source: ScanOverlaySource::ReferencedParityMap,
             });
         }
         Some(reference)
@@ -843,6 +979,7 @@ fn apply_authoritative_directory_overlay(
             map: apply_parity_map_reference_structural_overlay(reconstructed, reference)?,
             fencing_digest: None,
             parity_map_content_conflicts: Vec::new(),
+            source: ScanOverlaySource::ParityMapReferenceProjection,
         });
     }
 
@@ -850,6 +987,7 @@ fn apply_authoritative_directory_overlay(
         map: reconstructed,
         fencing_digest: None,
         parity_map_content_conflicts: Vec::new(),
+        source: ScanOverlaySource::StructuralWalk,
     })
 }
 
@@ -941,6 +1079,7 @@ fn select_structurally_discovered_parity_map(
         fencing_digest: Some(selected.fencing_digest()),
         map: selected.overlayed_map,
         parity_map_content_conflicts,
+        source: ScanOverlaySource::StructurallySelectedParityMap,
     }))
 }
 
@@ -2561,12 +2700,17 @@ mod tests {
         let final_digest = expected_map.digest(true).unwrap();
         let mut source = RecordingRawSource::new(records);
 
-        let reconstructed =
-            scan_reconstruct_filemark_map(&mut source, &TAPE_UUID, BLOCK_SIZE).unwrap();
+        let scan =
+            scan_reconstruct_filemark_map_with_report(&mut source, &TAPE_UUID, BLOCK_SIZE).unwrap();
 
-        assert_eq!(reconstructed, expected_map);
-        let scoped =
-            ScopedFilemarkMap::validate_against_digest(reconstructed, &final_digest).unwrap();
+        assert_eq!(scan.map, expected_map);
+        let authoritative = scan
+            .authoritative_bootstrap()
+            .expect("fixture scan retains bootstrap candidates");
+        assert_eq!(authoritative.tape_file_number, 3);
+        assert_eq!(authoritative.payload.sequence, 1);
+        assert!(scan.damaged_regions.is_empty());
+        let scoped = ScopedFilemarkMap::validate_against_digest(scan.map, &final_digest).unwrap();
         assert_eq!(scoped.validated_prefix_tape_files, None);
         assert_eq!(scoped.scope.watermark(), 2);
         assert_eq!(
@@ -2586,11 +2730,19 @@ mod tests {
         records[2] = Record::Unreadable;
         let mut source = RecordingRawSource::new(records);
 
-        let reconstructed =
-            scan_reconstruct_filemark_map(&mut source, &TAPE_UUID, BLOCK_SIZE).unwrap();
+        let scan =
+            scan_reconstruct_filemark_map_with_report(&mut source, &TAPE_UUID, BLOCK_SIZE).unwrap();
 
-        assert_eq!(reconstructed, expected_map);
-        ScopedFilemarkMap::validate_against_digest(reconstructed, &final_digest).unwrap();
+        assert_eq!(scan.map, expected_map);
+        assert_eq!(
+            scan.damaged_regions,
+            [ScanDamagedRegion {
+                start: PhysicalPositionHint::new(2),
+                block_count: 1,
+                kind: ScanDamageKind::UnreadableTapeFileHead,
+            }]
+        );
+        ScopedFilemarkMap::validate_against_digest(scan.map, &final_digest).unwrap();
     }
 
     #[test]
@@ -3349,12 +3501,16 @@ mod tests {
         let final_payload = bootstrap_payload(expected_map.digest(true).unwrap(), 1);
         let mut source = RecordingRawSource::new(records);
 
-        let scoped =
-            acquire_filemark_map(&mut source, &final_payload, None).expect("scan validates");
+        let report = acquire_filemark_map_with_report(&mut source, &final_payload, None)
+            .expect("scan validates");
+        let scoped = report.scoped_map;
 
         assert_eq!(scoped.map, expected_map);
         assert_eq!(scoped.validated_prefix_tape_files, None);
         assert_eq!(scoped.scope.watermark(), 2);
+        assert_eq!(report.authoritative_bootstrap_sequence, 1);
+        assert_eq!(report.overlay_source, ScanOverlaySource::StructuralWalk);
+        assert!(report.damaged_regions.is_empty());
     }
 
     #[test]

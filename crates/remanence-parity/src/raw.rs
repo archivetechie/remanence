@@ -7,6 +7,10 @@
 //! fixed-block size, locate to a physical address, read records, and space
 //! filemarks. This module is the v0.4.4 bridge for those operations.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+
 #[cfg(target_os = "linux")]
 use remanence_library::scsi::decode_sense;
 use remanence_library::{
@@ -163,6 +167,338 @@ pub trait RawTapeSource {
 
     /// Return the current physical tape position.
     fn position(&mut self) -> Result<PhysicalPositionHint, ParityError>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImageRecord {
+    Block {
+        tape_file_index: usize,
+        block_within_file: u64,
+        byte_offset: usize,
+    },
+    Filemark,
+}
+
+/// Raw tape source backed by the publication-vector image-directory layout.
+///
+/// Each `tape-file-NNN-*.bin` file is one filemark-delimited tape file. The
+/// adapter inserts a logical filemark after every image file and exposes the
+/// same physical-position operations used by hardware scanning, so consumers
+/// exercise the production scanner rather than a directory-specific parser.
+#[derive(Debug)]
+pub struct ImageDirectoryRawSource {
+    directory: Option<PathBuf>,
+    tape_files: Vec<Vec<u8>>,
+    candidate_block_sizes: Vec<u32>,
+    records: Vec<ImageRecord>,
+    cursor: usize,
+    configured_block_size: Option<u32>,
+    unreadable_blocks: BTreeSet<(usize, u64)>,
+}
+
+impl ImageDirectoryRawSource {
+    /// Open a directory containing dense `tape-file-NNN-*.bin` image files.
+    pub fn open(directory: impl AsRef<Path>) -> Result<Self, ParityError> {
+        let directory = directory.as_ref();
+        let entries = fs::read_dir(directory).map_err(|error| {
+            image_source_error(format!(
+                "read image directory {}: {error}",
+                directory.display()
+            ))
+        })?;
+        let mut numbered = BTreeMap::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                image_source_error(format!(
+                    "read image directory entry in {}: {error}",
+                    directory.display()
+                ))
+            })?;
+            let file_type = entry.file_type().map_err(|error| {
+                image_source_error(format!(
+                    "inspect image entry {}: {error}",
+                    entry.path().display()
+                ))
+            })?;
+            if !file_type.is_file() {
+                continue;
+            }
+            let Some(tape_file_number) = image_tape_file_number(&entry.file_name()) else {
+                continue;
+            };
+            if numbered.insert(tape_file_number, entry.path()).is_some() {
+                return Err(image_source_error(format!(
+                    "image directory {} contains duplicate tape file number {tape_file_number}",
+                    directory.display()
+                )));
+            }
+        }
+        if numbered.is_empty() {
+            return Err(image_source_error(format!(
+                "image directory {} contains no tape-file-NNN-*.bin files",
+                directory.display()
+            )));
+        }
+
+        let mut tape_files = Vec::with_capacity(numbered.len());
+        let mut candidate_block_sizes = Vec::new();
+        for (expected, (number, path)) in numbered.into_iter().enumerate() {
+            let expected = u32::try_from(expected)
+                .map_err(|_| image_source_error("image tape-file count exceeds u32::MAX"))?;
+            if number != expected {
+                return Err(image_source_error(format!(
+                    "image tape-file numbering is not dense: expected {expected}, found {number}"
+                )));
+            }
+            let bytes = fs::read(&path).map_err(|error| {
+                image_source_error(format!("read image tape file {}: {error}", path.display()))
+            })?;
+            if bytes.is_empty() {
+                return Err(image_source_error(format!(
+                    "image tape file {} is empty",
+                    path.display()
+                )));
+            }
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("bootstrap"))
+            {
+                if let Ok(size) = u32::try_from(bytes.len()) {
+                    candidate_block_sizes.push(size);
+                }
+            }
+            tape_files.push(bytes);
+        }
+        candidate_block_sizes.sort_unstable();
+        candidate_block_sizes.dedup();
+        if candidate_block_sizes.is_empty() {
+            return Err(image_source_error(format!(
+                "image directory {} has no bootstrap-named tape file from which to infer block size",
+                directory.display()
+            )));
+        }
+
+        Ok(Self {
+            directory: Some(directory.to_path_buf()),
+            tape_files,
+            candidate_block_sizes,
+            records: Vec::new(),
+            cursor: 0,
+            configured_block_size: None,
+            unreadable_blocks: BTreeSet::new(),
+        })
+    }
+
+    /// Construct the same adapter from already-separated tape-file bytes.
+    ///
+    /// Publication-vector generation uses this constructor to self-check
+    /// staged bytes through the same record engine as directory consumers.
+    pub fn from_tape_files(tape_files: Vec<Vec<u8>>, block_size: u32) -> Result<Self, ParityError> {
+        if tape_files.is_empty() {
+            return Err(image_source_error("image contains no tape files"));
+        }
+        if block_size == 0 {
+            return Err(image_source_error("image block size is zero"));
+        }
+        if tape_files.iter().any(Vec::is_empty) {
+            return Err(image_source_error("image contains an empty tape file"));
+        }
+        Ok(Self {
+            directory: None,
+            tape_files,
+            candidate_block_sizes: vec![block_size],
+            records: Vec::new(),
+            cursor: 0,
+            configured_block_size: None,
+            unreadable_blocks: BTreeSet::new(),
+        })
+    }
+
+    /// Candidate fixed-block sizes inferred from bootstrap-named image files.
+    pub fn candidate_block_sizes(&self) -> &[u32] {
+        &self.candidate_block_sizes
+    }
+
+    /// Number of physical records, including synthetic trailing filemarks.
+    ///
+    /// This becomes available after fixed-block configuration.
+    pub fn physical_record_count(&self) -> Option<u64> {
+        self.configured_block_size
+            .and_then(|_| u64::try_from(self.records.len()).ok())
+    }
+
+    /// Mark one image block as unreadable for deterministic fault injection.
+    ///
+    /// This is used by immutable-vector tests to model transport medium errors
+    /// without rewriting or regenerating the pinned artifact bytes.
+    pub fn mark_unreadable(
+        &mut self,
+        tape_file_number: u32,
+        block_within_file: u64,
+    ) -> Result<(), ParityError> {
+        let tape_file_index = usize::try_from(tape_file_number)
+            .map_err(|_| image_source_error("image tape-file number does not fit usize"))?;
+        if tape_file_index >= self.tape_files.len() {
+            return Err(image_source_error(format!(
+                "image tape file {tape_file_number} does not exist"
+            )));
+        }
+        self.unreadable_blocks
+            .insert((tape_file_index, block_within_file));
+        Ok(())
+    }
+
+    fn rebuild_records(&mut self, block_size: u32) -> Result<(), ParityError> {
+        let block_size = usize::try_from(block_size)
+            .map_err(|_| image_source_error("image block size does not fit usize"))?;
+        let mut records = Vec::new();
+        for (tape_file_index, bytes) in self.tape_files.iter().enumerate() {
+            if bytes.len() % block_size != 0 {
+                let location = self.directory.as_ref().map_or_else(
+                    || "in-memory image".to_string(),
+                    |path| path.display().to_string(),
+                );
+                return Err(image_source_error(format!(
+                    "image tape file {tape_file_index} in {location} has {} bytes, not a multiple of block size {block_size}",
+                    bytes.len()
+                )));
+            }
+            for block_index in 0..(bytes.len() / block_size) {
+                records.push(ImageRecord::Block {
+                    tape_file_index,
+                    block_within_file: u64::try_from(block_index)
+                        .map_err(|_| image_source_error("image block index exceeds u64::MAX"))?,
+                    byte_offset: block_index
+                        .checked_mul(block_size)
+                        .ok_or_else(|| image_source_error("image byte offset overflows"))?,
+                });
+            }
+            records.push(ImageRecord::Filemark);
+        }
+        self.records = records;
+        self.cursor = 0;
+        Ok(())
+    }
+}
+
+impl RawTapeSource for ImageDirectoryRawSource {
+    fn configure_fixed_block_size(&mut self, block_size: u32) -> Result<(), ParityError> {
+        if block_size == 0 {
+            return Err(ParityError::Invariant("fixed block size is zero"));
+        }
+        if self.configured_block_size != Some(block_size) {
+            self.rebuild_records(block_size)?;
+            self.configured_block_size = Some(block_size);
+        }
+        Ok(())
+    }
+
+    fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
+        if hint.partition != 0 {
+            return Err(image_source_error(format!(
+                "image source does not contain partition {}",
+                hint.partition
+            )));
+        }
+        self.cursor = usize::try_from(hint.lba)
+            .map_err(|_| image_source_error("image LBA does not fit usize"))?
+            .min(self.records.len());
+        Ok(())
+    }
+
+    fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
+        if count < 0 {
+            return Err(image_source_error(
+                "image source supports forward filemark spacing only",
+            ));
+        }
+        let mut spaced = 0i64;
+        while self.cursor < self.records.len() && spaced < count {
+            if self.records[self.cursor] == ImageRecord::Filemark {
+                spaced += 1;
+            }
+            self.cursor += 1;
+        }
+        Ok(SpaceFilemarksOutcome {
+            filemarks_spaced: spaced,
+            position_after: PhysicalPositionHint::new(self.cursor as u64),
+            hit_end_of_data: spaced < count,
+        })
+    }
+
+    fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
+        let Some(record) = self.records.get(self.cursor).copied() else {
+            return Ok(RawReadOutcome::EndOfData {
+                position_after: PhysicalPositionHint::new(self.cursor as u64),
+            });
+        };
+        match record {
+            ImageRecord::Filemark => {
+                self.cursor += 1;
+                Ok(RawReadOutcome::Filemark {
+                    position_after: PhysicalPositionHint::new(self.cursor as u64),
+                })
+            }
+            ImageRecord::Block {
+                tape_file_index,
+                block_within_file,
+                byte_offset,
+            } => {
+                let block_size = usize::try_from(
+                    self.configured_block_size
+                        .ok_or_else(|| image_source_error("image block size is not configured"))?,
+                )
+                .map_err(|_| image_source_error("image block size does not fit usize"))?;
+                if self
+                    .unreadable_blocks
+                    .contains(&(tape_file_index, block_within_file))
+                {
+                    return Err(TapeIoError::OperationFailed(format!(
+                        "simulated unreadable image tape file {tape_file_index} block {block_within_file}"
+                    ))
+                    .into());
+                }
+                if buf.len() < block_size {
+                    return Err(TapeIoError::ReadBufferTooSmall {
+                        actual: u32::try_from(block_size).unwrap_or(u32::MAX),
+                        provided: u32::try_from(buf.len()).unwrap_or(u32::MAX),
+                    }
+                    .into());
+                }
+                let end = byte_offset
+                    .checked_add(block_size)
+                    .ok_or_else(|| image_source_error("image block end overflows"))?;
+                let block = self.tape_files[tape_file_index]
+                    .get(byte_offset..end)
+                    .ok_or_else(|| image_source_error("image block lies outside tape file"))?;
+                buf[..block_size].copy_from_slice(block);
+                self.cursor += 1;
+                Ok(RawReadOutcome::Block {
+                    bytes: block_size,
+                    position_after: PhysicalPositionHint::new(self.cursor as u64),
+                })
+            }
+        }
+    }
+
+    fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        Ok(PhysicalPositionHint::new(self.cursor as u64))
+    }
+}
+
+fn image_tape_file_number(name: &std::ffi::OsStr) -> Option<u32> {
+    let name = name.to_str()?;
+    let remainder = name.strip_prefix("tape-file-")?;
+    let (number, suffix) = remainder.split_once('-')?;
+    if number.is_empty() || !suffix.ends_with(".bin") {
+        return None;
+    }
+    number.parse().ok()
+}
+
+fn image_source_error(message: impl Into<String>) -> ParityError {
+    ParityError::FilemarkMapReconstruct(message.into())
 }
 
 /// Raw physical-tape WRITE access used by Layer 3c.
