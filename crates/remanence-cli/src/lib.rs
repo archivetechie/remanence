@@ -86,6 +86,7 @@ use zeroize::Zeroize;
 
 mod archive_ingest;
 mod archive_map;
+mod freeze_drill;
 mod pool_ops;
 mod recovery_report;
 #[cfg(feature = "tui")]
@@ -204,6 +205,9 @@ fn rem_debug_only_reason(cmd: &Command) -> Option<&'static str> {
         | Command::Lock { .. }
         | Command::Unlock { .. } => Some("direct local SCSI mutation"),
         Command::Dev { .. } => Some("development direct tape helper"),
+        Command::Tape {
+            command: TapeCommand::FreezeDrill(_),
+        } => Some("destructive direct tape freeze drill"),
         Command::Archive { command } if command.tape_target().is_some() => {
             Some("direct local tape archive access")
         }
@@ -1420,6 +1424,9 @@ enum TapeCommand {
     /// Emit a catalog-less key-30 object recovery report.
     RecoveryReport(TapeRecoveryReportArgs),
 
+    /// Run one destructive §18.4 fault-injected scratch-tape round-trip.
+    FreezeDrill(TapeFreezeDrillArgs),
+
     /// Read the loaded drive's TapeAlert LOG SENSE page.
     Alerts(TapeAlertsArgs),
 
@@ -1444,12 +1451,86 @@ impl TapeCommand {
     fn validate_before_discovery(&self) -> Result<(), String> {
         match self {
             Self::RecoveryReport(args) => args.validate_before_discovery(),
+            Self::FreezeDrill(args) => args.validate_before_discovery(),
             Self::Alerts(args) => args.validate_before_discovery(),
             Self::Init(args) => args.validate_before_discovery(),
             Self::WaitReady(args) => args.validate_before_discovery(),
             Self::Quarantine { command } => command.validate_before_discovery(),
             Self::Retire(args) => args.validate_before_discovery(),
         }
+    }
+}
+
+#[derive(Args, Debug)]
+struct TapeFreezeDrillArgs {
+    /// Explicit SG tape-drive device containing the mounted scratch tape.
+    #[arg(long, value_name = "/dev/sgN")]
+    device: PathBuf,
+
+    /// Fixed tape block size for this drill invocation.
+    #[arg(long, value_enum)]
+    block_size: freeze_drill::FreezeDrillBlockSize,
+
+    /// Deterministic payload volume in MiB across the drill objects.
+    #[arg(long, default_value_t = 512)]
+    data_mib: u64,
+
+    /// Read-side medium-error arrangement to inject.
+    #[arg(long, value_enum)]
+    damage_plan: freeze_drill::DamagePlan,
+
+    /// Permit a scratch-tape overwrite when BOT cannot be read.
+    #[arg(long)]
+    yes_i_know_scratch: bool,
+
+    /// Destination for the stable JSON drill report.
+    #[arg(long, value_name = "PATH.json")]
+    report: PathBuf,
+}
+
+impl TapeFreezeDrillArgs {
+    fn validate_before_discovery(&self) -> Result<(), String> {
+        fs::metadata(&self.device).map_err(|error| {
+            format!(
+                "inspect freeze-drill device {}: {error}",
+                self.device.display()
+            )
+        })?;
+        if self.data_mib == 0 {
+            return Err("tape freeze-drill --data-mib must be greater than zero".to_string());
+        }
+        if self.report == self.device {
+            return Err("tape freeze-drill --report must not name the tape device".to_string());
+        }
+        match fs::metadata(&self.report) {
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(format!(
+                    "tape freeze-drill --report {} exists and is not a regular file",
+                    self.report.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "inspect tape freeze-drill report {}: {error}",
+                    self.report.display()
+                ));
+            }
+        }
+        if let Some(parent) = self
+            .report
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            if !parent.is_dir() {
+                return Err(format!(
+                    "tape freeze-drill report parent {} is not a directory",
+                    parent.display()
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -3492,6 +3573,20 @@ where
                 );
             }
             return run_direct_device_recovery_report(args, out, err);
+        }
+        if let TapeCommand::FreezeDrill(args) = command {
+            return freeze_drill::run_live(
+                freeze_drill::LiveDrillRequest {
+                    device: &args.device,
+                    block_size: args.block_size.bytes(),
+                    data_mib: args.data_mib,
+                    damage_plan: args.damage_plan,
+                    unreadable_bot_ack: args.yes_i_know_scratch,
+                    report_path: &args.report,
+                },
+                out,
+                err,
+            );
         }
         // These tape subcommands are catalog + audit only — no SCSI, no
         // library allowlist — so they bypass discovery entirely (like the
@@ -7276,6 +7371,9 @@ fn run_tape_command(
     match command {
         TapeCommand::RecoveryReport(_) => {
             unreachable!("tape recovery report dispatched pre-discovery")
+        }
+        TapeCommand::FreezeDrill(_) => {
+            unreachable!("tape freeze-drill dispatched pre-discovery")
         }
         TapeCommand::Alerts(args) => run_tape_alerts(report, args, out, err),
         TapeCommand::Init(args) => run_tape_init(report, args, out, err),
