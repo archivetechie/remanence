@@ -154,6 +154,49 @@ impl FaultEngine {
                 scenario,
                 fired_once: HashSet::new(),
                 pending_ua: None,
+                observed_medium_error_lbas: BTreeSet::new(),
+            })),
+        })
+    }
+
+    /// Build an in-process scenario that persistently returns MEDIUM ERROR for
+    /// reads beginning at any of the supplied physical LBAs.
+    ///
+    /// This is the programmatic counterpart of a Phase A SQLite scenario for
+    /// callers, such as the freeze drill, that derive fault locations from the
+    /// tape they just wrote. The resulting engine still flows through
+    /// [`ChaosTransport`] and the normal MED-01 sense construction.
+    pub fn for_read_medium_errors(lbas: impl IntoIterator<Item = u64>) -> Result<Self, ChaosError> {
+        let conn = Connection::open_in_memory().map_err(|source| ChaosError::StateRead {
+            path: PathBuf::from("<in-memory-medium-error-plan>"),
+            source,
+        })?;
+        let faults = lbas
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .zip(1_i64..)
+            .map(|(lba, id)| Fault {
+                id,
+                catalogue_id: "MED-01".to_string(),
+                target: json!({}),
+                trigger: json!({"op": "read", "lba": lba}),
+                action: json!({}),
+                scope: "persistent".to_string(),
+            })
+            .collect();
+        Ok(Self {
+            inner: Arc::new(Mutex::new(FaultEngineInner {
+                conn,
+                log_file: None,
+                scenario: Some(Scenario {
+                    id: "freeze-drill-medium-errors".to_string(),
+                    seed: "remanence-freeze-drill-v1".to_string(),
+                    faults,
+                }),
+                fired_once: HashSet::new(),
+                pending_ua: None,
+                observed_medium_error_lbas: BTreeSet::new(),
             })),
         })
     }
@@ -172,6 +215,15 @@ impl FaultEngine {
             .scenario
             .as_ref()
             .map(|scenario| scenario.id.clone())
+    }
+
+    /// Return the physical read LBAs at which this engine has injected MED-01.
+    pub fn observed_medium_error_lbas(&self) -> BTreeSet<u64> {
+        self.inner
+            .lock()
+            .expect("chaos engine lock")
+            .observed_medium_error_lbas
+            .clone()
     }
 
     fn pre_call_decision(
@@ -196,6 +248,11 @@ impl FaultEngine {
             })?;
         if is_one_shot_fault(&fault) {
             inner.fired_once.insert(fault.id);
+        }
+        if fault.catalogue_id == "MED-01" {
+            if let Some(lba) = command.lba {
+                inner.observed_medium_error_lbas.insert(lba);
+            }
         }
         Some(CheckConditionDecision {
             scenario,
@@ -932,6 +989,7 @@ struct FaultEngineInner {
     scenario: Option<Scenario>,
     fired_once: HashSet<i64>,
     pending_ua: Option<PendingUa>,
+    observed_medium_error_lbas: BTreeSet<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -2771,6 +2829,28 @@ mod tests {
             .execute_in(&[0x34, 0x06, 0, 0, 0, 0, 0, 0, 0, 0], &mut buf)
             .unwrap();
         assert_eq!(transport.current_lba, Some(333));
+    }
+
+    #[test]
+    fn programmatic_medium_error_plan_is_persistent_and_observable() {
+        let engine = FaultEngine::for_read_medium_errors([42]).unwrap();
+        let mut transport = ChaosTransport::new(
+            FixtureTransport::new(),
+            engine.clone(),
+            DeviceCtx::new().with_drive_id("drive1"),
+        );
+        transport.execute_none(&locate16(42)).unwrap();
+        let mut block = [0u8; 512];
+        for _ in 0..2 {
+            let err = transport.execute_in(&read6(512), &mut block).unwrap_err();
+            let ScsiError::CheckCondition { sense, .. } = err else {
+                panic!("programmatic MED-01 must return CHECK CONDITION");
+            };
+            assert_eq!(sense[2] & 0x0f, 0x03);
+            assert_eq!(sense[12], 0x11);
+            assert_eq!(sense[13], 0x00);
+        }
+        assert_eq!(engine.observed_medium_error_lbas(), BTreeSet::from([42]));
     }
 
     fn chaos_fixture(state_path: &Path, ctx: DeviceCtx) -> ChaosTransport<FixtureTransport> {
