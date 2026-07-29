@@ -31,6 +31,7 @@
 
 pub mod bootstrap;
 pub mod capacity;
+mod cbor;
 pub mod codec;
 mod durable;
 pub mod error;

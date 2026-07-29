@@ -24,6 +24,7 @@ use crate::bootstrap::{
     decode_bootstrap_object_row_cbor, encode_bootstrap_object_row_cbor,
     validate_bootstrap_object_row, BootstrapObjectRow,
 };
+use crate::cbor::IntegerMapKeyTracker;
 use crate::error::ParityError;
 use crate::filemark_map::{FilemarkMap, TapeFileKind, TapeFileMapEntry};
 use crate::mapping::data_shards_per_epoch;
@@ -1042,9 +1043,9 @@ fn decode_bundle(bytes: &[u8]) -> Result<CommittedBundle, JournalError> {
     let mut entries = None;
     let mut highest_protected_ordinal = None;
     let mut total_committed_ordinals = None;
-    let mut seen_keys = Vec::new();
+    let mut key_order = IntegerMapKeyTracker::default();
     for (key, value) in map {
-        let key = decode_map_key(key, &mut seen_keys, "bundle")?;
+        let key = key_order.next(key, "bundle").map_err(JournalError::Codec)?;
         match (key, value) {
             (1, CborValue::Integer(value)) => {
                 kind = Some(kind_from_code(cbor_u64(value, "kind")?)?)
@@ -1152,9 +1153,11 @@ fn decode_entry(value: CborValue) -> Result<TapeFileEntry, JournalError> {
     let mut protected_ordinal_end_exclusive = None;
     let mut canonical_metadata_hash = None;
     let mut bootstrap_object_row = None;
-    let mut seen_keys = Vec::new();
+    let mut key_order = IntegerMapKeyTracker::default();
     for (key, value) in map {
-        let key = decode_map_key(key, &mut seen_keys, "journal entry")?;
+        let key = key_order
+            .next(key, "journal entry")
+            .map_err(JournalError::Codec)?;
         match (key, value) {
             (1, CborValue::Integer(value)) => {
                 tape_file_number = Some(cbor_u32(value, "tape_file_number")?)
@@ -1212,38 +1215,6 @@ fn decode_entry(value: CborValue) -> Result<TapeFileEntry, JournalError> {
         canonical_metadata_hash,
         bootstrap_object_row,
     })
-}
-
-fn decode_map_key(
-    key: CborValue,
-    seen_keys: &mut Vec<i128>,
-    context: &str,
-) -> Result<i128, JournalError> {
-    let CborValue::Integer(key) = key else {
-        return Err(JournalError::Codec(format!(
-            "{context} contains non-integer CBOR map key"
-        )));
-    };
-    let key: i128 = key.into();
-    if key <= 0 {
-        return Err(JournalError::Codec(format!(
-            "{context} contains non-positive CBOR map key {key}"
-        )));
-    }
-    if seen_keys.contains(&key) {
-        return Err(JournalError::Codec(format!(
-            "{context} contains duplicate CBOR map key {key}"
-        )));
-    }
-    if let Some(previous) = seen_keys.last() {
-        if key <= *previous {
-            return Err(JournalError::Codec(format!(
-                "{context} CBOR map keys are not in canonical order: {key} after {previous}"
-            )));
-        }
-    }
-    seen_keys.push(key);
-    Ok(key)
 }
 
 fn optional_u64(value: Option<u64>) -> CborValue {
@@ -1363,6 +1334,40 @@ mod tests {
         }
     }
 
+    fn transpose_first_two_cbor_map_entries(value: CborValue) -> CborValue {
+        let CborValue::Map(mut entries) = value else {
+            panic!("test value must be a CBOR map");
+        };
+        assert!(entries.len() >= 2, "test map needs two entries");
+        entries.swap(0, 1);
+        CborValue::Map(entries)
+    }
+
+    fn append_unknown_cbor_map_key(value: CborValue) -> CborValue {
+        let CborValue::Map(mut entries) = value else {
+            panic!("test value must be a CBOR map");
+        };
+        entries.push((CborValue::Integer(99.into()), CborValue::Null));
+        CborValue::Map(entries)
+    }
+
+    fn decode_bundle_value(value: &CborValue) -> Result<CommittedBundle, JournalError> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(value, &mut bytes).expect("test CBOR value encodes");
+        decode_bundle(&bytes)
+    }
+
+    fn assert_journal_key_order_error(error: JournalError, key: i128, previous: i128) {
+        let JournalError::Codec(message) = error else {
+            panic!("expected journal codec error, got {error:?}");
+        };
+        assert!(message.contains(&format!("key {key}")), "{message}");
+        assert!(
+            message.contains(&format!("after key {previous}")),
+            "{message}"
+        );
+    }
+
     fn commit_sample_checkpoint(journal: &mut FileTapeFileJournal) {
         journal
             .commit_bundle(&sample_bundle())
@@ -1370,6 +1375,51 @@ mod tests {
         journal
             .commit_bundle(&sample_checkpoint())
             .expect("commit checkpoint watermark");
+    }
+
+    #[test]
+    fn journal_bundle_map_enforces_order_and_ignores_ordered_unknown_key() {
+        let bundle = sample_bundle();
+        let canonical_bytes = encode_bundle(&bundle).expect("bundle encodes");
+        let canonical: CborValue =
+            ciborium::from_reader(canonical_bytes.as_slice()).expect("bundle value decodes");
+
+        assert_eq!(
+            decode_bundle_value(&canonical).expect("canonical bundle map decodes"),
+            bundle
+        );
+
+        let transposed = transpose_first_two_cbor_map_entries(canonical.clone());
+        let error =
+            decode_bundle_value(&transposed).expect_err("transposed bundle keys must reject");
+        assert_journal_key_order_error(error, 1, 2);
+
+        let extended = append_unknown_cbor_map_key(canonical);
+        assert_eq!(
+            decode_bundle_value(&extended).expect("ordered unknown bundle key is ignored"),
+            bundle
+        );
+    }
+
+    #[test]
+    fn journal_entry_map_enforces_order_and_ignores_ordered_unknown_key() {
+        let entry = sample_bundle().entries.remove(0);
+        let canonical = encode_entry(&entry).expect("journal entry encodes");
+
+        assert_eq!(
+            decode_entry(canonical.clone()).expect("canonical journal entry decodes"),
+            entry
+        );
+
+        let transposed = transpose_first_two_cbor_map_entries(canonical.clone());
+        let error = decode_entry(transposed).expect_err("transposed entry keys must reject");
+        assert_journal_key_order_error(error, 1, 2);
+
+        let extended = append_unknown_cbor_map_key(canonical);
+        assert_eq!(
+            decode_entry(extended).expect("ordered unknown journal-entry key is ignored"),
+            entry
+        );
     }
 
     fn small_scheme() -> ParityScheme {

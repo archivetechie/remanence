@@ -10,6 +10,7 @@ use ciborium::value::Value as CborValue;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
+use crate::cbor::IntegerMapKeyTracker;
 use crate::error::ParityError;
 use crate::sidecar::crc64_xz;
 
@@ -834,11 +835,11 @@ pub(crate) fn decode_sidecar_epoch_directory_cbor(
     let mut directory_scope_highest_protected_ordinal = None;
     let mut is_final_directory = None;
     let mut entries = None;
+    let mut key_order = IntegerMapKeyTracker::default();
     for (key, value) in map {
-        let key_i: i128 = match key {
-            CborValue::Integer(i) => i.into(),
-            _ => continue,
-        };
+        let key_i = key_order
+            .next(key, "sidecar epoch directory")
+            .map_err(parity_map_parse)?;
         match (key_i, value) {
             (1, CborValue::Integer(i)) => {
                 directory_scope_tape_file_count =
@@ -938,12 +939,12 @@ pub(crate) fn decode_parity_map_reference_cbor(
     let mut is_final_directory = None;
     let mut parity_map_payload_sha256 = None;
     let mut canonical_map_digest = None;
+    let mut key_order = IntegerMapKeyTracker::default();
 
     for (key, value) in map {
-        let key_i: i128 = match key {
-            CborValue::Integer(i) => i.into(),
-            _ => continue,
-        };
+        let key_i = key_order
+            .next(key, "parity-map reference")
+            .map_err(parity_map_parse)?;
         match (key_i, value) {
             (1, CborValue::Integer(i)) => {
                 tape_file_number = Some(cbor_int_to_u32(i, "tape_file_number")?)
@@ -1057,11 +1058,11 @@ fn decode_sidecar_epoch_directory_entry_cbor(
     let mut parity_shard_block_count = None;
     let mut canonical_metadata_hash = None;
     let mut flags = None;
+    let mut key_order = IntegerMapKeyTracker::default();
     for (key, value) in map {
-        let key_i: i128 = match key {
-            CborValue::Integer(i) => i.into(),
-            _ => continue,
-        };
+        let key_i = key_order
+            .next(key, "sidecar directory entry")
+            .map_err(parity_map_parse)?;
         match (key_i, value) {
             (1, CborValue::Integer(i)) => {
                 tape_file_number = Some(cbor_int_to_u32(i, "tape_file_number")?)
@@ -1169,11 +1170,11 @@ fn decode_parity_map_payload(bytes: &[u8]) -> Result<ParityMapPayload, ParityErr
     let mut canonical_map_digest = None;
     let mut writer_version = None;
     let mut write_timestamp = None;
+    let mut key_order = IntegerMapKeyTracker::default();
     for (key, value) in map {
-        let key_i: i128 = match key {
-            CborValue::Integer(i) => i.into(),
-            _ => continue,
-        };
+        let key_i = key_order
+            .next(key, "parity-map payload")
+            .map_err(parity_map_parse)?;
         match (key_i, value) {
             (1, CborValue::Text(value)) => format_id = Some(value),
             (2, CborValue::Bytes(bytes)) => tape_uuid = Some(bytes_to_16(bytes, "tape_uuid")?),
@@ -1789,6 +1790,53 @@ mod tests {
         }
     }
 
+    fn sample_reference() -> ParityMapReference {
+        ParityMapReference {
+            tape_file_number: 4,
+            block_count: 7,
+            directory_scope_tape_file_count: 5,
+            directory_scope_total_data_ordinals: 4,
+            directory_scope_highest_protected_ordinal: 4,
+            is_final_directory: true,
+            parity_map_payload_sha256: [0x44; 32],
+            canonical_map_digest: [0x55; 32],
+        }
+    }
+
+    fn transpose_first_two_cbor_map_entries(value: CborValue) -> CborValue {
+        let CborValue::Map(mut entries) = value else {
+            panic!("test value must be a CBOR map");
+        };
+        assert!(entries.len() >= 2, "test map needs two entries");
+        entries.swap(0, 1);
+        CborValue::Map(entries)
+    }
+
+    fn append_unknown_cbor_map_key(value: CborValue) -> CborValue {
+        let CborValue::Map(mut entries) = value else {
+            panic!("test value must be a CBOR map");
+        };
+        entries.push((CborValue::Integer(99.into()), CborValue::Null));
+        CborValue::Map(entries)
+    }
+
+    fn decode_parity_map_payload_value(value: &CborValue) -> Result<ParityMapPayload, ParityError> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(value, &mut bytes).expect("test CBOR value encodes");
+        decode_parity_map_payload(&bytes)
+    }
+
+    fn assert_parity_map_key_order_error(error: ParityError, key: i128, previous: i128) {
+        let ParityError::ParityMapParse(message) = error else {
+            panic!("expected parity-map parse error, got {error:?}");
+        };
+        assert!(message.contains(&format!("key {key}")), "{message}");
+        assert!(
+            message.contains(&format!("after key {previous}")),
+            "{message}"
+        );
+    }
+
     fn assert_directory_invalid(directory: &SidecarEpochDirectory) {
         let err = directory.validate().expect_err("directory must be invalid");
         assert!(
@@ -1805,6 +1853,103 @@ mod tests {
 
         assert_eq!(decoded, directory);
         assert!(directory.encoded_len().unwrap() > 0);
+    }
+
+    #[test]
+    fn sidecar_directory_map_enforces_order_and_ignores_ordered_unknown_key() {
+        let directory = sample_directory();
+        let canonical = encode_sidecar_epoch_directory_cbor(&directory).expect("directory encodes");
+
+        assert_eq!(
+            decode_sidecar_epoch_directory_cbor(canonical.clone())
+                .expect("canonical directory map decodes"),
+            directory
+        );
+
+        let transposed = transpose_first_two_cbor_map_entries(canonical.clone());
+        let error = decode_sidecar_epoch_directory_cbor(transposed)
+            .expect_err("transposed directory keys must reject");
+        assert_parity_map_key_order_error(error, 1, 2);
+
+        let extended = append_unknown_cbor_map_key(canonical);
+        assert_eq!(
+            decode_sidecar_epoch_directory_cbor(extended)
+                .expect("ordered unknown directory key is ignored"),
+            directory
+        );
+    }
+
+    #[test]
+    fn parity_map_reference_map_enforces_order_and_ignores_ordered_unknown_key() {
+        let reference = sample_reference();
+        let canonical = encode_parity_map_reference_cbor(&reference);
+
+        assert_eq!(
+            decode_parity_map_reference_cbor(canonical.clone())
+                .expect("canonical parity-map reference decodes"),
+            reference
+        );
+
+        let transposed = transpose_first_two_cbor_map_entries(canonical.clone());
+        let error = decode_parity_map_reference_cbor(transposed)
+            .expect_err("transposed reference keys must reject");
+        assert_parity_map_key_order_error(error, 1, 2);
+
+        let extended = append_unknown_cbor_map_key(canonical);
+        assert_eq!(
+            decode_parity_map_reference_cbor(extended)
+                .expect("ordered unknown parity-map reference key is ignored"),
+            reference
+        );
+    }
+
+    #[test]
+    fn sidecar_directory_entry_map_enforces_order_and_ignores_ordered_unknown_key() {
+        let entry = sample_directory().entries.remove(0);
+        let canonical = encode_sidecar_epoch_directory_entry_cbor(&entry);
+
+        assert_eq!(
+            decode_sidecar_epoch_directory_entry_cbor(canonical.clone())
+                .expect("canonical directory entry decodes"),
+            entry
+        );
+
+        let transposed = transpose_first_two_cbor_map_entries(canonical.clone());
+        let error = decode_sidecar_epoch_directory_entry_cbor(transposed)
+            .expect_err("transposed directory-entry keys must reject");
+        assert_parity_map_key_order_error(error, 1, 2);
+
+        let extended = append_unknown_cbor_map_key(canonical);
+        assert_eq!(
+            decode_sidecar_epoch_directory_entry_cbor(extended)
+                .expect("ordered unknown directory-entry key is ignored"),
+            entry
+        );
+    }
+
+    #[test]
+    fn parity_map_payload_map_enforces_order_and_ignores_ordered_unknown_key() {
+        let payload = sample_payload();
+        let canonical_bytes = encode_parity_map_payload(&payload).expect("payload encodes");
+        let canonical: CborValue =
+            ciborium::from_reader(canonical_bytes.as_slice()).expect("payload value decodes");
+
+        assert_eq!(
+            decode_parity_map_payload_value(&canonical).expect("canonical payload map decodes"),
+            payload
+        );
+
+        let transposed = transpose_first_two_cbor_map_entries(canonical.clone());
+        let error = decode_parity_map_payload_value(&transposed)
+            .expect_err("transposed payload keys must reject");
+        assert_parity_map_key_order_error(error, 1, 2);
+
+        let extended = append_unknown_cbor_map_key(canonical);
+        assert_eq!(
+            decode_parity_map_payload_value(&extended)
+                .expect("ordered unknown payload key is ignored"),
+            payload
+        );
     }
 
     #[test]
