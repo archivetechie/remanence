@@ -3,10 +3,16 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import pathlib
 import sys
+import tarfile
+import tempfile
+
+
+sys.dont_write_bytecode = True
 
 
 REQUIRED_POSITIVE = {
@@ -250,8 +256,8 @@ def verify_xwing_recipient_material(fixture: dict[str, object], label: str) -> N
             fail(f"{label} recipient {index} does not carry X-Wing seed/key sizes")
 
 
-def main() -> int:
-    root = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(__file__).resolve().parent
+def verify_tree(root: pathlib.Path, rederive_parity: bool) -> int:
+    """Verify one extracted publication tree, including independent parity."""
     checksums = root / "CHECKSUMS.sha256"
     if not checksums.is_file():
         fail("CHECKSUMS.sha256 is absent")
@@ -751,8 +757,124 @@ def main() -> int:
                 ]:
                     fail("multi-parity-map fault does not target the referencing bootstrap head")
 
+    if rederive_parity:
+        module_directory = pathlib.Path(__file__).resolve().parent
+        if not (module_directory / "rem_parity_rederive.py").is_file():
+            module_directory /= "tools"
+        if not (module_directory / "rem_parity_rederive.py").is_file():
+            fail("independent REM-PARITY re-derivation module is absent")
+        sys.path.insert(0, str(module_directory))
+        try:
+            from rem_parity_rederive import (
+                RederivationError,
+                rederive_publication_vectors,
+            )
+        except ImportError as error:
+            fail(f"cannot import independent REM-PARITY verifier: {error}")
+        try:
+            summary = rederive_publication_vectors(root)
+        except (OSError, ValueError, KeyError, TypeError, RederivationError) as error:
+            fail(f"independent REM-PARITY re-derivation mismatch: {error}")
+        finally:
+            sys.path.pop(0)
+        for line in summary.report_lines():
+            print(line)
+
     print(f"PASS: {len(vectors)} REM-PARITY vectors and all archive checksums verified")
     return 0
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    """Parse the standalone verifier command line."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "publication",
+        nargs="?",
+        type=pathlib.Path,
+        help=(
+            "extracted publication root or remanence-test-vectors.tar; "
+            "defaults to the bundled tree or repository archive"
+        ),
+    )
+    parity = parser.add_mutually_exclusive_group()
+    parity.add_argument(
+        "--rederive-parity",
+        dest="rederive_parity",
+        action="store_true",
+        default=True,
+        help="independently re-derive REM-PARITY pins (default)",
+    )
+    parity.add_argument(
+        "--no-rederive-parity",
+        dest="rederive_parity",
+        action="store_false",
+        help="run structural/checksum verification without parity re-derivation",
+    )
+    return parser.parse_args(argv)
+
+
+def _default_publication_path() -> pathlib.Path:
+    """Select the bundled tree or the checkout's published tar archive."""
+    script_directory = pathlib.Path(__file__).resolve().parent
+    if (script_directory / "CHECKSUMS.sha256").is_file():
+        return script_directory
+    archive = (
+        script_directory.parent
+        / "specs"
+        / "publication"
+        / "remanence-test-vectors.tar"
+    )
+    if archive.is_file():
+        return archive
+    fail("no publication root or remanence-test-vectors.tar was supplied")
+    raise AssertionError("unreachable")
+
+
+def _extract_archive(archive_path: pathlib.Path, destination: pathlib.Path) -> pathlib.Path:
+    """Extract a publication tar after rejecting links and unsafe member paths."""
+    try:
+        with tarfile.open(archive_path, mode="r:*") as archive:
+            members = archive.getmembers()
+            for member in members:
+                relative = pathlib.PurePosixPath(member.name)
+                if (
+                    relative.is_absolute()
+                    or ".." in relative.parts
+                    or not (member.isfile() or member.isdir())
+                ):
+                    fail(f"unsafe archive member {member.name!r}")
+            archive.extractall(destination, members=members)
+    except (OSError, tarfile.TarError) as error:
+        fail(f"cannot extract {archive_path}: {error}")
+    if (destination / "CHECKSUMS.sha256").is_file():
+        return destination
+    roots = [
+        child
+        for child in destination.iterdir()
+        if child.is_dir() and (child / "CHECKSUMS.sha256").is_file()
+    ]
+    if len(roots) != 1:
+        fail(f"{archive_path} does not contain one publication root")
+    return roots[0]
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Resolve a tree or tar input and run the complete verifier."""
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    publication = (
+        args.publication.resolve()
+        if args.publication is not None
+        else _default_publication_path()
+    )
+    if publication.is_dir():
+        return verify_tree(publication, args.rederive_parity)
+    if not publication.is_file():
+        fail(f"publication path does not exist: {publication}")
+    with tempfile.TemporaryDirectory(
+        prefix="remanence-publication-verify-"
+    ) as temporary_name:
+        root = _extract_archive(publication, pathlib.Path(temporary_name))
+        return verify_tree(root, args.rederive_parity)
 
 
 if __name__ == "__main__":
