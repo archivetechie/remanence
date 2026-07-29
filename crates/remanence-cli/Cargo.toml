@@ -22,9 +22,11 @@ remanence-aead    = { path = "../remanence-aead" }
 remanence-chaos   = { path = "../remanence-chaos" }
 remanence-format  = { path = "../remanence-format" }
 remanence-library = { path = "../remanence-library" }
+remanence-parity  = { path = "../remanence-parity" }
 remanence-state   = { path = "../remanence-state" }
 remanence-stream  = { path = "../remanence-stream" }
 remanence-api     = { path = "../remanence-api" }
+base64            = { workspace = true }
 crossterm         = { version = "0.28", optional = true }
 ciborium          = { workspace = true }
 clap              = { workspace = true }

@@ -87,6 +87,7 @@ use zeroize::Zeroize;
 mod archive_ingest;
 mod archive_map;
 mod pool_ops;
+mod recovery_report;
 #[cfg(feature = "tui")]
 mod top;
 
@@ -1416,6 +1417,9 @@ impl From<RemTapeCommand> for TapeCommand {
 
 #[derive(Subcommand, Debug)]
 enum TapeCommand {
+    /// Emit a catalog-less key-30 object recovery report.
+    RecoveryReport(TapeRecoveryReportArgs),
+
     /// Read the loaded drive's TapeAlert LOG SENSE page.
     Alerts(TapeAlertsArgs),
 
@@ -1439,12 +1443,32 @@ enum TapeCommand {
 impl TapeCommand {
     fn validate_before_discovery(&self) -> Result<(), String> {
         match self {
+            Self::RecoveryReport(args) => args.validate_before_discovery(),
             Self::Alerts(args) => args.validate_before_discovery(),
             Self::Init(args) => args.validate_before_discovery(),
             Self::WaitReady(args) => args.validate_before_discovery(),
             Self::Quarantine { command } => command.validate_before_discovery(),
             Self::Retire(args) => args.validate_before_discovery(),
         }
+    }
+}
+
+#[derive(Args, Debug)]
+struct TapeRecoveryReportArgs {
+    /// Published-layout image directory or discovered `/dev/sgN` drive path.
+    #[arg(value_name = "SOURCE")]
+    source: PathBuf,
+
+    /// Emit the stable machine-readable report instead of human rendering.
+    #[arg(long)]
+    json: bool,
+}
+
+impl TapeRecoveryReportArgs {
+    fn validate_before_discovery(&self) -> Result<(), String> {
+        fs::metadata(&self.source)
+            .map(|_| ())
+            .map_err(|error| format!("inspect recovery source {}: {error}", self.source.display()))
     }
 }
 
@@ -3457,6 +3481,17 @@ where
         if let Err(error) = command.validate_before_discovery() {
             let _ = writeln!(err, "error: {error}");
             return ExitCode::from(1);
+        }
+        if let TapeCommand::RecoveryReport(args) = command {
+            if args.source.is_dir() {
+                return recovery_report::run_image_recovery_report(
+                    &args.source,
+                    args.json,
+                    out,
+                    err,
+                );
+            }
+            return run_direct_device_recovery_report(args, out, err);
         }
         // These tape subcommands are catalog + audit only — no SCSI, no
         // library allowlist — so they bypass discovery entirely (like the
@@ -7239,6 +7274,9 @@ fn run_tape_command(
     err: &mut dyn Write,
 ) -> ExitCode {
     match command {
+        TapeCommand::RecoveryReport(_) => {
+            unreachable!("tape recovery report dispatched pre-discovery")
+        }
         TapeCommand::Alerts(args) => run_tape_alerts(report, args, out, err),
         TapeCommand::Init(args) => run_tape_init(report, args, out, err),
         TapeCommand::WaitReady(args) => run_tape_wait_ready(report, args, out, err),
@@ -7247,6 +7285,49 @@ fn run_tape_command(
         }
         TapeCommand::Retire(_) => unreachable!("tape retire dispatched pre-discovery"),
     }
+}
+
+/// Open an explicitly supplied SG tape drive and run the raw recovery scan.
+#[cfg(target_os = "linux")]
+fn run_direct_device_recovery_report(
+    args: &TapeRecoveryReportArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let mut drive = match remanence_library::DriveHandle::open_standalone(&args.source) {
+        Ok(drive) => drive,
+        Err(error) => {
+            let _ = writeln!(
+                err,
+                "error: open recovery drive {}: {error}",
+                args.source.display()
+            );
+            print_setcap_hint_if_error_text_matches(&error.to_string(), err);
+            return ExitCode::from(1);
+        }
+    };
+    let mut source = remanence_parity::DriveHandleRawSource::new(&mut drive);
+    recovery_report::run_raw_recovery_report(
+        &mut source,
+        remanence_parity::DEFAULT_BOOTSTRAP_CANDIDATE_BLOCK_SIZES,
+        args.json,
+        out,
+        err,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_direct_device_recovery_report(
+    args: &TapeRecoveryReportArgs,
+    _out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let _ = writeln!(
+        err,
+        "error: recovery device {} requires Linux SG_IO access",
+        args.source.display()
+    );
+    ExitCode::from(1)
 }
 
 fn run_tape_alerts(

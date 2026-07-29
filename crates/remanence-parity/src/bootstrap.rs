@@ -651,7 +651,7 @@ fn choose_wider_map_scope(a: BootstrapPayload, b: BootstrapPayload) -> Bootstrap
     }
 }
 
-fn bootstrap_scope_key(payload: &BootstrapPayload) -> (bool, u32, u64) {
+pub(crate) fn bootstrap_scope_key(payload: &BootstrapPayload) -> (bool, u32, u64) {
     let digest = payload.filemark_map_digest.as_ref();
     (
         digest.map(|d| d.is_final_map).unwrap_or(false),

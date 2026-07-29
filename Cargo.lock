@@ -2122,6 +2122,7 @@ dependencies = [
 name = "remanence-cli"
 version = "1.0.0"
 dependencies = [
+ "base64",
  "ciborium",
  "clap",
  "crossterm",
@@ -2134,6 +2135,7 @@ dependencies = [
  "remanence-chaos",
  "remanence-format",
  "remanence-library",
+ "remanence-parity",
  "remanence-state",
  "remanence-stream",
  "serde",

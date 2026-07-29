@@ -85,8 +85,8 @@ pub use parity_map::{
 };
 pub use raw::{
     BlockSinkRawTapeSink, BlockSourceRawTapeSource, DriveHandleRawSink, DriveHandleRawSource,
-    PhysicalPositionHint, RawReadOutcome, RawTapeSink, RawTapeSource, RawWriteOutcome,
-    SpaceFilemarksOutcome, TapeGeometryHint,
+    ImageDirectoryRawSource, PhysicalPositionHint, RawReadOutcome, RawTapeSink, RawTapeSource,
+    RawWriteOutcome, SpaceFilemarksOutcome, TapeGeometryHint,
 };
 pub use recovery::{
     recover_object_block_from_sidecar, recover_ordinal_from_sidecar, SidecarRecoveryResult,
@@ -101,9 +101,11 @@ pub use resume::{
 };
 pub use scan::{
     acquire_filemark_map, acquire_filemark_map_with_report, scan_reconstruct_filemark_map,
-    scan_reconstruct_filemark_map_with_report, CatalogFilemarkMapInput, FilemarkMapScanResult,
-    ParityMapContentConflict, ParityMapSelectionKey, ScanTailTruncation, ScanTailTruncationKind,
-    ScanWalkResult, UnattestedTapeFile,
+    scan_reconstruct_filemark_map_with_report, validate_scan_reconstruction_with_report,
+    CatalogFilemarkMapInput, FilemarkMapScanResult, ParityMapContentConflict,
+    ParityMapSelectionKey, ScanBootstrapCandidate, ScanDamageKind, ScanDamagedRegion,
+    ScanOverlaySource, ScanTailTruncation, ScanTailTruncationKind, ScanWalkResult,
+    UnattestedTapeFile,
 };
 pub use sidecar::{
     classify_sidecar_header_block, crc64_xz, data_shard_crc64, derive_sidecar_footer_magic,

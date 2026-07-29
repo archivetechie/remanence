@@ -1661,6 +1661,93 @@ impl std::fmt::Debug for DriveHandle {
 }
 
 impl DriveHandle {
+    /// Open an explicitly named Linux SG tape drive without a changer handle.
+    ///
+    /// This is a break-glass read/recovery surface for callers that already
+    /// possess a device path. It validates that the path still identifies a
+    /// sequential-access device before constructing the normal Layer 3a
+    /// handle; no library snapshot, catalog identity, or changer state is
+    /// consulted. Normal managed operations should continue to use
+    /// [`LibraryHandle::open_drive`].
+    #[cfg(target_os = "linux")]
+    pub fn open_standalone(path: &Path) -> Result<Self, OpenError> {
+        use crate::transport::LinuxSgTransport;
+
+        let transport = LinuxSgTransport::open_rw(path)
+            .map(|transport| Box::new(transport) as Box<dyn SgTransport>)
+            .map_err(|error| OpenError::DeviceUnavailable {
+                path: path.to_path_buf(),
+                cause: IoErrorKind::from(&error),
+            })?;
+        Self::open_standalone_with_transport(path, transport)
+    }
+
+    /// Testable transport-injected form of [`Self::open_standalone`].
+    pub fn open_standalone_with_transport(
+        path: &Path,
+        mut transport: Box<dyn SgTransport>,
+    ) -> Result<Self, OpenError> {
+        let inquiry = revalidate_inquiry(transport.as_mut())?;
+        if !matches!(inquiry.device_type, DeviceType::SequentialAccess) {
+            return Err(OpenError::IdentityChanged {
+                path: path.to_path_buf(),
+                expected: "sequential-access tape device".to_string(),
+                actual: None,
+            });
+        }
+        let serial =
+            revalidate_serial(transport.as_mut())?.unwrap_or_else(|| path.display().to_string());
+        let tape_io = TapeIoRuntimeConfig::default();
+        let requested_batch_blocks = tape_io
+            .write_batch_blocks
+            .max(tape_io.read_batch_blocks)
+            .max(1);
+        let requested_reserved_size_bytes =
+            requested_batch_blocks.saturating_mul(DEFAULT_TAPE_IO_RECORD_BYTES_FOR_RESERVED_BUFFER);
+        let sg_reserved_size_bytes =
+            transport.configure_reserved_buffer(requested_reserved_size_bytes)?;
+        let effective_write_batch_blocks = effective_batch_blocks_from_reserved(
+            sg_reserved_size_bytes,
+            DEFAULT_TAPE_IO_RECORD_BYTES_FOR_RESERVED_BUFFER,
+            tape_io.write_batch_blocks,
+        );
+        let effective_read_batch_blocks = effective_batch_blocks_from_reserved(
+            sg_reserved_size_bytes,
+            DEFAULT_TAPE_IO_RECORD_BYTES_FOR_RESERVED_BUFFER,
+            tape_io.read_batch_blocks,
+        );
+        Ok(Self {
+            bay_address: 0,
+            drive: InstalledDrive {
+                serial,
+                identity_source: IdentitySource::Derived,
+                vendor: None,
+                product: None,
+                revision: None,
+                sg_path: Some(path.to_path_buf()),
+                sysfs_path: None,
+            },
+            library_serial: format!("standalone:{}", path.display()),
+            transport,
+            max_write_block_size_bytes: None,
+            position_known: true,
+            expected_position: None,
+            bytes_since_position_check: 0,
+            position_check_bytes: tape_io.position_check_bytes,
+            staging_ring_buffers: tape_io.staging_ring_buffers,
+            requested_write_batch_blocks: tape_io.write_batch_blocks.max(1),
+            requested_read_batch_blocks: tape_io.read_batch_blocks.max(1),
+            effective_write_batch_blocks,
+            effective_read_batch_blocks,
+            sg_reserved_size_bytes,
+            pipeline_diagnostics: PipelineDiagnostics::default(),
+            pending_pipeline_audits: Vec::new(),
+            validated_fixed_block_size: None,
+            mode_reverification_required: None,
+            shared: Arc::new(Mutex::new(DriveShared::default())),
+        })
+    }
+
     /// The bay address this drive sits in (the changer element
     /// address that addresses this drive).
     pub fn bay_address(&self) -> u16 {

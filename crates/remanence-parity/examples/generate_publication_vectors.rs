@@ -8,19 +8,17 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use remanence_library::TapeIoError;
 use remanence_parity::bootstrap::{write_bootstrap_block, BOOTSTRAP_HEADER_CRC_OFFSET};
 use remanence_parity::codec::ReedSolomonCodec;
 use remanence_parity::{
     acquire_filemark_map_with_report, crc64_xz, data_shard_crc64, default_scheme,
     encode_parity_map_tape_file, encode_sidecar_tape_file,
     plan_resume_append_from_committed_prefix, BootstrapObjectRow, BootstrapPayload, FilemarkMap,
-    FilemarkMapDigest, ParityError, ParityMapContentConflict, ParityMapPayload, ParityMapReference,
-    ParityMapSelectionKey, ParityScheme, ParitySchemeRecord, PhysicalPositionHint, RawReadOutcome,
-    RawTapeSource, SchemeId, SidecarDescriptor, SidecarEpochDirectory, SidecarEpochDirectoryEntry,
-    SpaceFilemarksOutcome, TapeFileMapEntry, DEFAULT_SCHEME_BLOCK_SIZE_BYTES,
-    SIDECAR_DIRECTORY_FLAG_FINAL_PARTIAL_EPOCH, SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD,
-    SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
+    FilemarkMapDigest, ImageDirectoryRawSource, ParityMapContentConflict, ParityMapPayload,
+    ParityMapReference, ParityMapSelectionKey, ParityScheme, ParitySchemeRecord, SchemeId,
+    SidecarDescriptor, SidecarEpochDirectory, SidecarEpochDirectoryEntry, TapeFileMapEntry,
+    DEFAULT_SCHEME_BLOCK_SIZE_BYTES, SIDECAR_DIRECTORY_FLAG_FINAL_PARTIAL_EPOCH,
+    SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD, SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
 };
 use sha2::{Digest, Sha256};
 
@@ -34,115 +32,6 @@ const REM_OBJECT_TV_P1_MANIFEST_SHA256: [u8; 32] = [
     0xec, 0xbf, 0x48, 0xe4, 0x8c, 0xc1, 0x1a, 0x78, 0xb9, 0xd6, 0xae, 0x9d, 0xd7, 0xb5, 0xe9, 0x38,
     0x72, 0x4e, 0xbd, 0xb3, 0x98, 0x34, 0xa7, 0x0f, 0x17, 0xbd, 0xe1, 0x7d, 0x3e, 0xb1, 0x33, 0xda,
 ];
-
-#[derive(Debug)]
-enum ImageRecord {
-    Block(Vec<u8>),
-    Filemark,
-    Unreadable,
-}
-
-#[derive(Debug)]
-struct ImageRawSource {
-    records: Vec<ImageRecord>,
-    cursor: usize,
-}
-
-impl ImageRawSource {
-    fn new(files: &[Vec<Vec<u8>>], unreadable: (usize, usize)) -> Self {
-        let mut records = Vec::new();
-        for (file_number, blocks) in files.iter().enumerate() {
-            for (block_number, block) in blocks.iter().enumerate() {
-                if (file_number, block_number) == unreadable {
-                    records.push(ImageRecord::Unreadable);
-                } else {
-                    records.push(ImageRecord::Block(block.clone()));
-                }
-            }
-            records.push(ImageRecord::Filemark);
-        }
-        Self { records, cursor: 0 }
-    }
-}
-
-impl RawTapeSource for ImageRawSource {
-    fn configure_fixed_block_size(&mut self, block_size: u32) -> Result<(), ParityError> {
-        if block_size != BLOCK_SIZE {
-            return Err(ParityError::Invariant(
-                "publication image configured with the wrong block size",
-            ));
-        }
-        Ok(())
-    }
-
-    fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
-        self.cursor = usize::try_from(hint.lba)
-            .map_err(|_| ParityError::Invariant("publication image LBA does not fit usize"))?
-            .min(self.records.len());
-        Ok(())
-    }
-
-    fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
-        if count < 0 {
-            return Err(ParityError::Invariant(
-                "publication image only spaces filemarks forward",
-            ));
-        }
-        let mut spaced = 0i64;
-        while self.cursor < self.records.len() && spaced < count {
-            if matches!(self.records[self.cursor], ImageRecord::Filemark) {
-                spaced += 1;
-            }
-            self.cursor += 1;
-        }
-        Ok(SpaceFilemarksOutcome {
-            filemarks_spaced: spaced,
-            position_after: PhysicalPositionHint::new(self.cursor as u64),
-            hit_end_of_data: spaced < count,
-        })
-    }
-
-    fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
-        let Some(record) = self.records.get(self.cursor) else {
-            return Ok(RawReadOutcome::EndOfData {
-                position_after: PhysicalPositionHint::new(self.cursor as u64),
-            });
-        };
-        match record {
-            ImageRecord::Block(block) => {
-                if block.len() > buf.len() {
-                    return Err(TapeIoError::ReadBufferTooSmall {
-                        actual: block.len() as u32,
-                        provided: buf.len() as u32,
-                    }
-                    .into());
-                }
-                let bytes = block.len();
-                buf[..bytes].copy_from_slice(block);
-                self.cursor += 1;
-                Ok(RawReadOutcome::Block {
-                    bytes,
-                    position_after: PhysicalPositionHint::new(self.cursor as u64),
-                })
-            }
-            ImageRecord::Filemark => {
-                self.cursor += 1;
-                Ok(RawReadOutcome::Filemark {
-                    position_after: PhysicalPositionHint::new(self.cursor as u64),
-                })
-            }
-            ImageRecord::Unreadable => Err(TapeIoError::ReadBufferTooSmall {
-                actual: BLOCK_SIZE,
-                provided: BLOCK_SIZE / 2,
-            }
-            .into()),
-        }
-    }
-
-    fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
-        Ok(PhysicalPositionHint::new(self.cursor as u64))
-    }
-}
 
 fn small_scheme() -> ParityScheme {
     ParityScheme {
@@ -810,7 +699,11 @@ fn emit_multi_parity_map_source(root: &Path) -> Result<(), Box<dyn std::error::E
         conflict.blocks.clone(),
         vec![bootstrap_block(&final_payload)?],
     ];
-    let mut source = ImageRawSource::new(&files, (7, 0));
+    let mut source = ImageDirectoryRawSource::from_tape_files(
+        files.iter().map(|blocks| blocks.concat()).collect(),
+        BLOCK_SIZE,
+    )?;
+    source.mark_unreadable(7, 0)?;
     let report = acquire_filemark_map_with_report(&mut source, &bot_payload, None)?;
     if report.scoped_map.map != selected_map {
         return Err("multi-map scanner did not recover the selected map".into());
