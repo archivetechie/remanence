@@ -1,0 +1,76 @@
+{
+  "report_version": 1,
+  "tape_uuid": "524d444c-3121-4a3f-be0f-82988dc40335",
+  "block_size_bytes": 1048576,
+  "data_mib": 512,
+  "data_bytes": 536870912,
+  "damage_plan": "combined",
+  "faulted_blocks": [
+    {
+      "lba": 262,
+      "role": "sidecar_head"
+    },
+    {
+      "lba": 778,
+      "role": "checkpoint_bootstrap"
+    },
+    {
+      "lba": 781,
+      "role": "object_span"
+    },
+    {
+      "lba": 782,
+      "role": "object_span"
+    },
+    {
+      "lba": 783,
+      "role": "object_span"
+    },
+    {
+      "lba": 784,
+      "role": "object_span"
+    }
+  ],
+  "observed_fault_lbas": [
+    262,
+    778,
+    781,
+    782,
+    783,
+    784
+  ],
+  "scan": {
+    "bootstrap_generation_used": 2,
+    "bootstrap_tape_file_number": 6,
+    "overlay_source": "bootstrap_inline_directory",
+    "retyping_performed": true,
+    "damaged_regions": [
+      {
+        "start_lba": 262,
+        "block_count": 1,
+        "kind": "unreadable_tape_file_head"
+      },
+      {
+        "start_lba": 778,
+        "block_count": 1,
+        "kind": "unreadable_tape_file_head"
+      }
+    ]
+  },
+  "blocks_reconstructed": 4,
+  "objects": {
+    "total": 2,
+    "verified": 2,
+    "failed": 0,
+    "failures": []
+  },
+  "expectations_met": true,
+  "expectation_failures": [],
+  "wall_clock_ms": {
+    "write": 7569,
+    "damage": 0,
+    "recovery": 1509,
+    "total": 9079
+  },
+  "success": true
+}
