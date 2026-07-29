@@ -11,7 +11,7 @@ REM_BIN ?= target/debug/rem
 SETCAP ?= setcap
 SUDO ?= sudo
 
-.PHONY: rem-dev rem-dev-setcap rem-dev-libraries proof-inventory publication-test-vectors
+.PHONY: rem-dev rem-dev-setcap rem-dev-libraries proof-inventory publication-test-vectors verify-publication-test-vectors
 
 rem-dev: rem-dev-setcap
 
@@ -32,3 +32,6 @@ proof-inventory:
 
 publication-test-vectors:
 	python3 tools/build_publication_test_vectors.py
+
+verify-publication-test-vectors:
+	python3 tools/verify_publication_test_vectors.py
