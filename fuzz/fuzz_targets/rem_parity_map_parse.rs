@@ -6,8 +6,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use remanence_parity::{
-    classify_parity_map_header_block, parse_parity_map_footer_block,
-    parse_parity_map_header_block, parse_parity_map_tape_file,
+    classify_parity_map_header_block, parse_parity_map_footer_block, parse_parity_map_header_block,
+    parse_parity_map_tape_file,
 };
 
 const TAPE_UUID: [u8; 16] = *b"rem-fuzz-tape-01";

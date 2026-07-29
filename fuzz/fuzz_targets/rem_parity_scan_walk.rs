@@ -8,12 +8,12 @@
 //! allocation — never recovery success.
 
 use libfuzzer_sys::fuzz_target;
+use remanence_library::TapeIoError;
+use remanence_parity::error::ParityError;
 use remanence_parity::{
     derive_parity_map_magic, derive_sidecar_magic, scan_reconstruct_filemark_map_with_report,
     PhysicalPositionHint, RawReadOutcome, RawTapeSource, SpaceFilemarksOutcome,
 };
-use remanence_parity::error::ParityError;
-use remanence_library::TapeIoError;
 use std::collections::BTreeSet;
 
 const BLOCK_SIZE: u32 = 4096;
