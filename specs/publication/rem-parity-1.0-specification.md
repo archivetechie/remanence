@@ -4,9 +4,9 @@
 
 | | |
 | --- | --- |
-| Status | Draft for review |
+| Status | Final |
 | Version | 1.0 |
-| Date | 2026-07-25 |
+| Date | 2026-07-31 |
 | License | CC-BY-4.0 |
 | Concept DOI (all versions) | [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) |
 | Version DOI (this release) | [10.5281/zenodo.21551571](https://doi.org/10.5281/zenodo.21551571) |
@@ -16,16 +16,18 @@
 
 ## Status of This Document
 
-This document is a draft specification, published for review. It is the
-normative fixed point for the format it defines: an implementation is
-validated against this document, not the reverse. The arithmetic test vectors
-in this document (CRC, Reed–Solomon, canonical digest) are normative now and
-independently re-derivable from this document alone; the image-level vectors
-of Section 17 are *pinned-at-generation*, and producing them is a criterion
-for declaring this specification final (Section 18). Specification-level
-items still open before that point are collected in Appendix C. After freeze,
-no normative change is permitted other than errata that do not change the set
-of valid tapes; any other change produces a new major version.
+This document is final. It is the normative fixed point for the format it
+defines: an implementation is validated against this document, not the
+reverse. The arithmetic test vectors in this document (CRC, Reed–Solomon,
+canonical digest) are normative and independently re-derivable from this
+document alone; the image-level vectors of Section 17 are
+*pinned-at-generation*.
+
+The conformance and freeze criteria this specification sets for itself in
+Section 18 are discharged, and the specification-level items collected in
+Appendix C are closed. No normative change is now permitted other than errata
+that do not change the set of valid tapes; any other change produces a new
+major version.
 
 ## Abstract
 

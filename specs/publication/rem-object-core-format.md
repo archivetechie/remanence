@@ -42,12 +42,11 @@ Format. It is the normative fixed point for the durable canonical object: an
 implementation is validated against this document, not the reverse.
 
 The tape binding depends normatively on the REM-PARITY specification
-([REMPARITY]), which is at `Draft for review` and not yet frozen. That
-dependency is therefore **provisional and version-pinned**: the tape-binding
-clauses of this document (the parity-layer references in Sections 4.9, 8.2, 9,
-12.6) are stable against the specific REM-PARITY revision cited in the
-References, and MAY change when REM-PARITY freezes. The file and object-store
-bindings do not depend on REM-PARITY and are not provisional.
+([REMPARITY]), which is now final. That dependency is therefore fixed: the
+tape-binding clauses of this document (the parity-layer references in Sections
+4.9, 8.2, 9, 12.6) are stable against the REM-PARITY revision cited in the
+References, and change only under the errata rule that governs both
+documents. The file and object-store bindings do not depend on REM-PARITY.
 
 **Abstract**
 

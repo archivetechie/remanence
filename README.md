@@ -32,13 +32,11 @@ on an HPE MSL3040 with LTO-9 drives.
 <!-- code-anchor: Cargo.toml crates proto/layer5.proto @ 8de2c46 -->
 ## Status
 
-Version 1.0.0 — first publication release. REM-OBJECT and its REM-ENCRYPT
-profile are frozen: specified, implemented, and pinned by test vectors, so a
-tape written today reads back unchanged. REM-PARITY 1.0 is published as a
-draft for review — implemented and pinned by test vectors, with its
-conformance and freeze criteria stated in the specification (§18); parity
-details may still change until those gates complete, so treat parity-protected
-tapes written today as evaluation media. The daemon and gRPC control surfaces are released but may still
+Version 1.0.0 — first publication release. REM-OBJECT, its REM-ENCRYPT
+profile, and REM-PARITY 1.0 are all frozen: specified, implemented, and pinned
+by test vectors, so a tape written today reads back unchanged. REM-PARITY's
+conformance and freeze criteria (§18) are discharged and its Appendix C items
+closed. The daemon and gRPC control surfaces are released but may still
 evolve. The project is young — built against one library family and one drive
 generation — so restore and verify real material from your own hardware before
 relying on it. Working today:
