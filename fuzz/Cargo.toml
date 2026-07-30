@@ -66,6 +66,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "rem_parity_bootstrap_structured"
+path = "fuzz_targets/rem_parity_bootstrap_structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "rem_parity_sidecar_parse"
 path = "fuzz_targets/rem_parity_sidecar_parse.rs"
 test = false

@@ -27,6 +27,29 @@ head -c 4096 "$MIN/tape-file-003-final-bootstrap.bin" > "$TMP/boot3"
 seed rem_parity_bootstrap_parse "$TMP/boot0" minimal-boot0
 seed rem_parity_bootstrap_parse "$TMP/boot3" minimal-boot3
 
+# Structure-aware bootstrap target: its input describes a block rather than
+# being one, so seeds are in that description format. The valuable seed is a
+# real pinned CBOR payload in raw-passthrough mode — because the harness
+# recomputes both CRCs, mutations of it stay framing-valid and land in the
+# decoder instead of dying at the integrity check.
+python3 - "$MIN/tape-file-000-bootstrap.bin" "$TMP/structured-raw" "$TMP/structured-built" <<'PY'
+import struct, sys
+src, raw_out, built_out = sys.argv[1], sys.argv[2], sys.argv[3]
+blk = open(src, "rb").read()
+payload_len = struct.unpack_from("<I", blk, 40)[0]
+payload = blk[0x34 : 0x34 + payload_len]
+minor = blk[10:12]
+block_size = blk[32:36]
+sequence = blk[36:40]
+uuid = blk[16:32]
+# control bit1 set = raw-payload mode; header description mirrors the vector.
+open(raw_out, "wb").write(b"\x02" + minor + block_size + sequence + uuid + payload)
+# control 0 = structured-payload mode; give the builder real bytes to chew on.
+open(built_out, "wb").write(b"\x00" + minor + block_size + sequence + uuid + payload[:256])
+PY
+seed rem_parity_bootstrap_structured "$TMP/structured-raw" minimal-boot0-raw
+seed rem_parity_bootstrap_structured "$TMP/structured-built" minimal-boot0-built
+
 # Sidecar parser: whole sidecar tape file (block-count prefix byte 0x06 = 7 blocks).
 printf '\x06' | cat - "$MIN/tape-file-002-sidecar.bin" > "$TMP/sidecar-seed"
 seed rem_parity_sidecar_parse "$TMP/sidecar-seed" minimal-sidecar
@@ -51,6 +74,6 @@ PY
 seed rem_parity_scan_walk "$TMP/walk-seed" structured-walk
 
 echo "seeded:"
-for t in rem_parity_bootstrap_parse rem_parity_sidecar_parse rem_parity_map_parse rem_parity_scan_walk; do
+for t in rem_parity_bootstrap_parse rem_parity_bootstrap_structured rem_parity_sidecar_parse rem_parity_map_parse rem_parity_scan_walk; do
   echo "  $t: $(ls "$ROOT/fuzz/corpus/$t" | wc -l) file(s)"
 done
