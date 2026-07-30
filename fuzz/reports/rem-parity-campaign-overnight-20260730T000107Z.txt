@@ -1,0 +1,18 @@
+rem-parity EXTENDED fuzz campaign — 20260730T000107Z
+seconds/target=14400 procs/target=6
+rss_limit_mb=4096 case_timeout_s=30
+targets run CONCURRENTLY; each target's processes share its corpus dir
+
+=== corpus BEFORE ===
+rem_parity_bootstrap_parse=4042
+
+launched 6 fuzz processes at 00:01:07Z
+
+processes exiting nonzero: 0
+(a crash, hang, or OOM makes libFuzzer exit nonzero and leaves a
+ reproducer under fuzz/artifacts/ — check there if this is not 0)
+
+=== corpus AFTER ===
+rem_parity_bootstrap_parse=6082
+
+=== per-target final stats ===
