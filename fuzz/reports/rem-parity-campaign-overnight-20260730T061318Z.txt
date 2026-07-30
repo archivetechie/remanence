@@ -7,3 +7,65 @@ targets run CONCURRENTLY; each target's processes share its corpus dir
 rem_parity_bootstrap_structured=1541
 
 launched 6 fuzz processes at 06:13:18Z
+
+processes exiting nonzero: 0
+(a crash, hang, or OOM makes libFuzzer exit nonzero and leaves a
+ reproducer under fuzz/artifacts/ — check there if this is not 0)
+
+=== corpus AFTER ===
+rem_parity_bootstrap_structured=36842
+
+=== per-target final stats ===
+--- rem_parity_bootstrap_structured ---
+Done 362217988 runs in 28801 second(s)
+stat::number_of_executed_units: 362217988
+stat::average_exec_per_sec:     12576
+stat::new_units_added:          6126
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              8510
+Done 358047077 runs in 28801 second(s)
+stat::number_of_executed_units: 358047077
+stat::average_exec_per_sec:     12431
+stat::new_units_added:          6163
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              9185
+Done 344812792 runs in 28801 second(s)
+stat::number_of_executed_units: 344812792
+stat::average_exec_per_sec:     11972
+stat::new_units_added:          6217
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              9075
+Done 357499258 runs in 28801 second(s)
+stat::number_of_executed_units: 357499258
+stat::average_exec_per_sec:     12412
+stat::new_units_added:          6206
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              8866
+Done 352849653 runs in 28801 second(s)
+stat::number_of_executed_units: 352849653
+stat::average_exec_per_sec:     12251
+stat::new_units_added:          6311
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              9151
+Done 541874355 runs in 28801 second(s)
+stat::number_of_executed_units: 541874355
+stat::average_exec_per_sec:     18814
+stat::new_units_added:          5317
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              6933
+corpus_files=36842
+
+=== artifacts (crashes/hangs/OOM reproducers) ===
+-rw-rw-r-- 1 swami swami    0 Jul 30 11:02 /home/swami/remanence/fuzz/artifacts/rem_parity_bootstrap_structured/oom-da39a3ee5e6b4b0d3255bfef95601890afd80709
+-rw-rw-r-- 1 swami swami 2231 Jul 30 11:19 /home/swami/remanence/fuzz/artifacts/rem_parity_bootstrap_structured/README.md
+
+=== corpus replay (final coverage; determinism check only) ===
+--- rem_parity_bootstrap_structured ---
+#36843	INITED cov: 1670 ft: 6364 corp: 1658/210Kb exec/s: 4093 rss: 792Mb
+#36843	DONE   cov: 1670 ft: 6364 corp: 1658/210Kb lim: 3925 exec/s: 4093 rss: 792Mb
+Done 36843 runs in 9 second(s)
+stat::number_of_executed_units: 36843
+stat::average_exec_per_sec:     4093
+stat::new_units_added:          0
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              792
