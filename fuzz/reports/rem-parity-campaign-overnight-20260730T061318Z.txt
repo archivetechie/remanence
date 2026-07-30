@@ -1,0 +1,9 @@
+rem-parity EXTENDED fuzz campaign — 20260730T061318Z
+seconds/target=28800 procs/target=6
+rss_limit_mb=12288 case_timeout_s=30
+targets run CONCURRENTLY; each target's processes share its corpus dir
+
+=== corpus BEFORE ===
+rem_parity_bootstrap_structured=1541
+
+launched 6 fuzz processes at 06:13:18Z
