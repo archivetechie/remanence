@@ -1,0 +1,5 @@
+bootstrap_magic="REM\x00BOO\x01"
+cbor_map_small="\xa5"
+cbor_bytes16="\x50"
+cbor_uint32="\x1a"
+cbor_array="\x85"

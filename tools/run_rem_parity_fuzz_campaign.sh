@@ -14,6 +14,7 @@ CASE_TIMEOUT_S="${FUZZ_CASE_TIMEOUT_S:-30}"
 
 targets=(
   rem_parity_bootstrap_parse
+  rem_parity_bootstrap_structured
   rem_parity_sidecar_parse
   rem_parity_map_parse
   rem_parity_scan_walk

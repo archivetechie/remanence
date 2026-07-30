@@ -28,12 +28,20 @@ PROCS_PER_TARGET="${2:-3}"
 RSS_LIMIT_MB="${FUZZ_RSS_LIMIT_MB:-4096}"
 CASE_TIMEOUT_S="${FUZZ_CASE_TIMEOUT_S:-30}"
 
-targets=(
-  rem_parity_bootstrap_parse
-  rem_parity_sidecar_parse
-  rem_parity_map_parse
-  rem_parity_scan_walk
-)
+# FUZZ_TARGETS narrows the run to a subset (space-separated). Used to give a
+# single unsaturated target a focused campaign without re-running the three
+# that already went flat.
+if [[ -n "${FUZZ_TARGETS:-}" ]]; then
+    read -r -a targets <<<"$FUZZ_TARGETS"
+else
+    targets=(
+      rem_parity_bootstrap_parse
+      rem_parity_bootstrap_structured
+      rem_parity_sidecar_parse
+      rem_parity_map_parse
+      rem_parity_scan_walk
+    )
+fi
 
 cd "$ROOT"
 
