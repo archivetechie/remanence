@@ -48,3 +48,13 @@ fieldtest/tools/remfield-io/target/
 CLAUDE.md
 AGENTS.md
 .claude/
+
+# Fuzz campaign corpus growth. The deterministic seeds are reproducible from
+# the pinned vector archive via tools/seed_rem_parity_fuzz_corpora.sh; the
+# millions of mutants a campaign accumulates are not worth carrying in a
+# specification repository (the 2026-07-30 structured campaign alone grew the
+# corpus to 150 MB across ~27,000 files, and every campaign adds more).
+# Campaign EVIDENCE lives in fuzz/reports/, which is committed: parameters,
+# execution counts, coverage before/after, and any artifact analysis.
+# Files already tracked before this rule stay tracked; this stops the growth.
+fuzz/corpus/

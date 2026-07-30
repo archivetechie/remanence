@@ -1,0 +1,108 @@
+rem-parity EXTENDED fuzz campaign — 20260730T034622Z
+seconds/target=7200 procs/target=4
+rss_limit_mb=4096 case_timeout_s=30
+targets run CONCURRENTLY; each target's processes share its corpus dir
+
+=== corpus BEFORE ===
+rem_parity_bootstrap_structured=1429
+
+launched 4 fuzz processes at 03:46:23Z
+
+processes exiting nonzero: 1
+(a crash, hang, or OOM makes libFuzzer exit nonzero and leaves a
+ reproducer under fuzz/artifacts/ — check there if this is not 0)
+
+=== corpus AFTER ===
+rem_parity_bootstrap_structured=26340
+
+=== per-target final stats ===
+--- rem_parity_bootstrap_structured ---
+Done 224291861 runs in 7201 second(s)
+stat::number_of_executed_units: 224291861
+stat::average_exec_per_sec:     31147
+stat::new_units_added:          6313
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              1963
+Done 120299437 runs in 7201 second(s)
+stat::number_of_executed_units: 120299437
+stat::average_exec_per_sec:     16705
+stat::new_units_added:          5803
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              3077
+stat::number_of_executed_units: 58085182
+stat::average_exec_per_sec:     9088
+stat::new_units_added:          8290
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              4097
+Done 125547682 runs in 7201 second(s)
+stat::number_of_executed_units: 125547682
+stat::average_exec_per_sec:     17434
+stat::new_units_added:          6109
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              3134
+corpus_files=26340
+
+=== artifacts (crashes/hangs/OOM reproducers) ===
+-rw-rw-r-- 1 swami swami 0 Jul 30 11:02 /home/swami/remanence/fuzz/artifacts/rem_parity_bootstrap_structured/oom-da39a3ee5e6b4b0d3255bfef95601890afd80709
+
+=== corpus replay (final coverage; determinism check only) ===
+--- rem_parity_bootstrap_structured ---
+#26341	INITED cov: 1573 ft: 6048 corp: 1541/192Kb exec/s: 5268 rss: 674Mb
+#26341	DONE   cov: 1573 ft: 6048 corp: 1541/192Kb lim: 3743 exec/s: 5268 rss: 674Mb
+Done 26341 runs in 5 second(s)
+stat::number_of_executed_units: 26341
+stat::average_exec_per_sec:     5268
+stat::new_units_added:          0
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              674
+
+=== ANALYSIS OF THE OOM ARTIFACT (added 2026-07-30) ===
+
+One of the four processes exited nonzero, writing
+fuzz/artifacts/rem_parity_bootstrap_structured/oom-da39a3ee5e6b4b0d3255bfef95601890afd80709
+(fuzz/artifacts is gitignored, so it is not in the repository).
+
+It is NOT a defect in the parser. Evidence:
+
+  ==375142== ERROR: libFuzzer: out-of-memory (used: 4097Mb; limit: 4096Mb)
+  Live Heap Allocations: 33,262,999 bytes in 31,061 chunks;
+    quarantined: 38,476,190 bytes in 371,807 chunks;
+    3,073,771 other chunks; total chunks: 3,476,639
+  21,233,984 byte(s) (63%) in 1 allocation(s)
+      #1 ... /lib/x86_64-linux-gnu/libstdc++.so.6+0xbb903
+
+  1. The artifact is ZERO BYTES — its name is the SHA-1 of the empty string.
+     Re-running the target on it executes in 0 ms and exits cleanly, so it
+     does not reproduce.
+  2. Live heap at the moment of the OOM was ~33 MB against an RSS of 4,097 MB.
+     Nothing in the target was holding memory.
+  3. The dominant single allocation (63%) arrives through libstdc++
+     operator new -- libFuzzer's own C++ machinery -- not through the Rust
+     parser under test.
+  4. RSS sat at exactly 4,092 MB for many thousands of iterations before
+     tipping one megabyte over: slow accumulation across 58 million
+     executions in one long-lived process (ASan quarantine plus libFuzzer
+     corpus/feature bookkeeping over a corpus that grew past 26,000 files),
+     not a per-input blow-up.
+
+The empty input is recorded merely because it is what the process held when
+the ceiling was crossed, which is why the reproducer is meaningless.
+
+Consequence for the runner, not for the format: any fixed RSS ceiling is
+eventually reached by a long single-process run over a large shared corpus.
+The runner's default ceiling was raised to 12 GiB so that a genuine unbounded
+allocation in the target is what trips it. A future OOM artifact that is
+NON-EMPTY and REPRODUCIBLE is a real finding and must be treated as one.
+
+=== NOTE ON THE COMPANION RAW-TARGET CAMPAIGN 20260730T000107Z ===
+
+That report is truncated at "per-target final stats" because the runner script
+was edited in place while it was executing, and bash reads scripts
+incrementally. The fuzzing itself completed normally (6 processes, exit 0, no
+artifacts); only the report-writing step died. Reconstructed from the
+per-process logs under fuzz/reports/overnight-20260730T000107Z/:
+
+  processes: 6
+  total executions: 16,459,705,736 over 14,400 s (~190,492 exec/s each)
+  corpus: 4,042 -> 6,082 files (3,139 new units)
+  final coverage: 1,135 edges, 3,988 features
