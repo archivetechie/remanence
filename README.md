@@ -1,6 +1,8 @@
 <!-- code-anchor: none -->
 # Remanence
 
+**Open-source LTO tape archival software for Linux**
+
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21551570.svg)](https://doi.org/10.5281/zenodo.21551570)
 
 **Website:** [archivetech.org](https://archivetech.org) — overview, the formats explained, and how to verify them.
