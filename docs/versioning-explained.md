@@ -111,15 +111,14 @@ Errata change the third number of the version: 1.0.0 becomes 1.0.1, then
 because page 40 had a misprint. Nobody's house is affected; no inspector
 changes their checklist.
 
-There is one special case, which we state openly because hiding it would be
-worse. If the *policy text itself* — the very rules this page describes —
-contains a mistake, the correction is published as an erratum and flagged in
-the revision history as a **policy correction**. This happened once already:
-the first published revision contained a sentence that accidentally forbade
-the middle kind of change described next, contradicting the format's own
-extension machinery two sections later. A policy that cannot correct its own
-wording would be frozen together with its mistakes, so the escape hatch is
-written down, narrow, and every use of it is labelled.
+There is one special case, stated openly. If the *policy text itself* —
+the very rules this page describes — needs correcting, the correction is
+published as an erratum and flagged in the revision history as a **policy
+correction**. A policy that cannot correct its own wording would be frozen
+together with any defect in it, so the escape hatch is written down, kept
+narrow, and every use of it is labelled where anyone can see it — the
+revision histories show exactly when the rules themselves were touched, and
+why.
 
 ### Minor revisions — adding, carefully
 
@@ -327,14 +326,18 @@ somewhere, and here there is none.
 
 What we offer instead of authority is checkability. The promises are narrow
 enough to test: the conformance vectors are published and pinned by
-checksum; the arithmetic in the specifications can be re-derived from the
-text alone; and the repository runs an automated consistency check on every
-change to the documents themselves — the policy text must remain identical
-across all three, version numbers must agree with themselves, revision
+checksum, and the arithmetic in the specifications can be re-derived from
+the text alone, so the central claims never rest on trusting us.
+
+The documents themselves are held to the same standard. Prose that must
+stay consistent across three specifications will drift if consistency
+depends on care alone — that is true of documentation everywhere — so it
+does not depend on care here. An automated check runs on every change to
+the documents: the change policy must read identically in all three,
+every version number in a document must agree with itself, revision
 histories must stay in order, and every registry reference must resolve.
-Several of those rules exist because we made exactly those mistakes while
-writing the policy, and the check now makes them impossible to repeat
-silently.
+If any of that slips, the build fails before a reader ever sees the
+inconsistency.
 
 ## In plain terms
 
