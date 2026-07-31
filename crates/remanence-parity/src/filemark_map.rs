@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::ParityError;
+use crate::parity_map::SidecarEpochDirectory;
 use crate::raw::PhysicalPositionHint;
 
 /// Digest payload stored in bootstrap CBOR for validating a filemark-map
@@ -597,6 +598,12 @@ pub struct ScopedFilemarkMap {
     pub validated_prefix_tape_files: Option<u32>,
     /// Recovery scope carried by the catalog or bootstrap digest.
     pub scope: MapScope,
+    /// Authoritative sidecar epoch directory, when one was available from the
+    /// bootstrap. REM-PARITY 13.3 step 3 uses it to locate and validate a
+    /// sidecar's tail metadata copy when both the primary header and the footer
+    /// are lost; without it that rescue is not possible and the epoch is
+    /// declared metadata-unavailable.
+    pub sidecar_directory: Option<SidecarEpochDirectory>,
 }
 
 impl ScopedFilemarkMap {
@@ -609,7 +616,16 @@ impl ScopedFilemarkMap {
             scope: MapScope::Complete {
                 highest_protected_ordinal,
             },
+            sidecar_directory: None,
         }
+    }
+
+    /// Attach the authoritative sidecar epoch directory, enabling the
+    /// REM-PARITY 13.3 step 3 tail rescue.
+    #[must_use]
+    pub fn with_sidecar_directory(mut self, directory: Option<SidecarEpochDirectory>) -> Self {
+        self.sidecar_directory = directory;
+        self
     }
 
     /// Validate a scan-reconstructed map against a bootstrap digest.
@@ -654,6 +670,7 @@ impl ScopedFilemarkMap {
             map: full_map,
             validated_prefix_tape_files,
             scope,
+            sidecar_directory: None,
         })
     }
 

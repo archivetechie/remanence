@@ -2928,6 +2928,7 @@ mod object_source_tests {
                 map_total_data_ordinals: 2,
                 highest_protected_ordinal: 2,
             },
+            sidecar_directory: None,
         };
         let mut records = Vec::new();
         records.push(Record::Block(vec![0xB0; BLOCK_SIZE as usize]));
