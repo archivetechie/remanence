@@ -822,6 +822,7 @@ fn recover_and_verify(
                 block_count: region.block_count,
                 kind: match region.kind {
                     ScanDamageKind::UnreadableTapeFileHead => "unreadable_tape_file_head",
+                    ScanDamageKind::ClassificationCountMismatch => "classification_count_mismatch",
                 },
             })
             .collect(),

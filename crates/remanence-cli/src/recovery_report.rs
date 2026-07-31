@@ -66,6 +66,7 @@ impl From<ScanDamagedRegion> for RecoveryDamageRegion {
             block_count: value.block_count,
             kind: match value.kind {
                 ScanDamageKind::UnreadableTapeFileHead => "unreadable_tape_file_head",
+                ScanDamageKind::ClassificationCountMismatch => "classification_count_mismatch",
             },
         }
     }
