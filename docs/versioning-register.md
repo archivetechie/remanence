@@ -288,6 +288,9 @@ documents and published artifacts themselves.
   section — the subject of [versioning-explained.md](versioning-explained.md).
   Titles and filenames carry the major line only; each revision is
   archived under the document's own concept DOI with a per-revision DOI;
+  a new major version, being a separate document, opens a new concept DOI
+  series and cites its predecessor, so "latest revision" never crosses a
+  compatibility break;
   each document's Revision History appendix records every change and its
   kind.
 

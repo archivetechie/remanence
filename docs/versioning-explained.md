@@ -287,8 +287,12 @@ wrote it is gone. What happens?
    scientific journals. A DOI is like an ISBN that also promises the
    content is stored, unchanged, by an archival service. Each document has
    one DOI naming the document as a whole (all revisions) and one per
-   revision. The 2050 reader resolves the DOI and holds the exact frozen
-   text.
+   revision. A new major version, being a separate document, starts a
+   separate DOI series of its own — deliberately, so that someone holding a
+   generation-1 tape who follows the generation-1 document's DOI always
+   lands on text that governs their tape, and is never silently redirected
+   across a compatibility break. The 2050 reader resolves the DOI and holds
+   the exact frozen text.
 5. The specification, by design, contains everything needed to verify the
    tape's mathematics from the text alone, and the published test vectors
    let them check their tools against known-good material. None of this
