@@ -2512,7 +2512,7 @@ Entries are newest first. Each carries: date · version · kind
 conformance. Draft-era milestones predate publication under a DOI and are
 marked `[draft]`.
 
-- **2026-07-31 — 1.0.1 — erratum, including a flagged policy correction.**
+- **2026-07-31 — 1.0.1 — [published] erratum, including a flagged policy correction.**
   Status of This Document rewritten around three ordered classification
   questions (invalidate → major; earlier readers cannot cleanly refuse →
   major; obligations or registry assignment → minor under three conditions;
@@ -2536,15 +2536,15 @@ marked `[draft]`.
   false "Version DOI (this release)" row removed. No tape becomes valid or
   invalid; the only implementation-visible additions state what the
   reference implementation and pinned vectors already do.
-- **2026-07-25 — 1.0.0 — [published] first publication.** Archived with
-  software release v1.0.0 (Zenodo concept DOI 10.5281/zenodo.21551570);
-  the permanent 1.0 anchor.
 - **2026-07-29 — [draft] pre-freeze revisions II.** Last-resort
   filemark-walk operational envelope specified (Section 8.4.1), with
   inter-file positioning exempted from the Section 8.4 rule-6 abort;
   bootstrap re-typing promoted from SHOULD to MUST with operational
   candidate criteria (Section 12.4) — reader-obligation changes with no
   effect on the set of valid tapes; Appendix C items 3 and 4 resolved.
+- **2026-07-25 — 1.0.0 — [published] first publication.** Archived with
+  software release v1.0.0 (Zenodo concept DOI 10.5281/zenodo.21551570);
+  the permanent 1.0 anchor.
 - **2026-07-22 — [draft] tape-alone recovery claims.** Ordered persistence
   and the synchronizing barrier made normative on the tape I/O layer
   (Section 3.5); commit discipline extended with batched deferred
