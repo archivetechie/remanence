@@ -3,7 +3,7 @@
 
 This module is intentionally a specification-only implementation.  It uses
 only Python's standard library and follows the wire definitions in
-``rem-parity-1.0-specification.md``: bit-serial GF(2^8) arithmetic, the fixed
+``rem-parity-1-specification.md``: bit-serial GF(2^8) arithmetic, the fixed
 Cauchy seed partition, CRC-64/XZ, deterministic CBOR for canonical filemark
 maps, sidecar indices, bootstrap digest records, and parity-map digest fields.
 It does not import or inspect Remanence's Rust implementation.

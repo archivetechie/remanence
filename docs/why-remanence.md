@@ -18,7 +18,7 @@ in operator-grade terms — not a marketing pitch, not a spec. The
 formal format commitments live in the published
 [REM-OBJECT Core Format 1.0](../specs/publication/rem-object-core-format.md),
 [REM-ENCRYPT 1.0](../specs/publication/rem-encrypt-profile.md), and
-[REM-PARITY 1.0](../specs/publication/rem-parity-1.0-specification.md)
+[REM-PARITY 1.0](../specs/publication/rem-parity-1-specification.md)
 specifications; this doc explains the *reasoning* behind those commitments
 by comparing Remanence to the alternatives.
 
@@ -289,7 +289,7 @@ A plaintext REM-OBJECT remains extractable with a standard pax-aware
 encrypted copy must first be opened according to
 [REM-ENCRYPT 1.0](../specs/publication/rem-encrypt-profile.md);
 the result is that same canonical pax tar stream. On tape,
-[REM-PARITY 1.0](../specs/publication/rem-parity-1.0-specification.md)
+[REM-PARITY 1.0](../specs/publication/rem-parity-1-specification.md)
 adds Reed-Solomon sidecar parity and catalog-less bootstrap recovery.
 Version 1.0.0 reads and writes this stack end to end; the physical path
 was validated on an HPE MSL3040 library with LTO-9 drives.
@@ -470,7 +470,7 @@ You probably want something else if:
 - [REM-ENCRYPT 1.0](../specs/publication/rem-encrypt-profile.md) — the
   encrypted representation and its X-Wing hybrid KEM profile (X25519 +
   ML-KEM-768).
-- [REM-PARITY 1.0](../specs/publication/rem-parity-1.0-specification.md) —
+- [REM-PARITY 1.0](../specs/publication/rem-parity-1-specification.md) —
   the Reed-Solomon tape layout, sidecars, and catalog-less bootstrap recovery.
 - [Architecture overview](architecture-overview.md) — the shipped layer stack,
   write/read paths, catalog, audit log, journals, and daemon surface.
