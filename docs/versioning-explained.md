@@ -312,8 +312,8 @@ obligations — assign nothing at all.
 ## The found-cartridge walkthrough
 
 Put it all together with the scenario the formats are designed around: a
-cartridge surfaces ten years on. The organisation that wrote it has
-dissolved, its archive system is decommissioned, and its catalog is gone.
+few cartridges turn up that were never migrated with the rest. The archive
+system that wrote them was retired years ago, and nobody kept its catalog.
 What happens?
 
 1. The reader software — built from whatever revision is then current —
