@@ -147,6 +147,14 @@ def main() -> int:
             if bad in t:
                 fail(f"{n}: non-canonical citation form {bad!r}")
 
+    # 6b. Revision histories strictly newest-first.
+    for n, t in corpus.items():
+        for m in re.finditer(r"^## Appendix [A-Z]\. Revision History.*?(?=^## |\Z)",
+                             t, re.M | re.S):
+            dates = re.findall(r"^- \*\*(\d{4}-\d{2}-\d{2})", m.group(0), re.M)
+            if dates != sorted(dates, reverse=True):
+                fail(f"{n}: revision history not newest-first: {dates}")
+
     # 6. Appendix references resolve.
     for n, t in corpus.items():
         have = set(re.findall(r"^## Appendix ([A-Z])\.", t, re.M))
