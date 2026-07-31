@@ -2578,6 +2578,21 @@ governs only the revisions that follow the first published one.
   requirement for structural discovery, both of which the reference Scanner
   already applied.
 
+  **If you implemented from the review draft, re-check two things.** First,
+  Sections 2.5, 5.2 and 10.3 described a `PARITY_MAP_FOOTER_MAGIC_LABEL`
+  (`"REM\0PMAPFOOT\x01"`) as the derivation for the `parity_map` footer
+  locator's magic. No such label exists: the footer carries the *header's*
+  magic, `HMAC(tape_uuid, PARITY_MAP_MAGIC_LABEL)[0..8]`, on every published
+  artifact and in every implementation, and it is distinguished from a header
+  by its position and by `copy_kind`. An implementation built from the draft
+  computes eight wrong bytes and rejects every conformant `parity_map` tape
+  file, so this correction restores interoperability rather than removing it.
+  Second, the minimum sidecar block size is 0xD0, not 0xC0: sizes 0xC0 through
+  0xCF satisfy the header-plus-CRC floor but cannot pack even one index entry,
+  and Section 9.4's algorithm now carries the rejection that makes this
+  explicit. No tape byte and no published vector changed for either
+  correction.
+
   **Implementation conformance.** A line-by-line audit of this document against
   the reference implementation, the pinned vectors, the repository
   documentation and the project website found six divergences, all of which
