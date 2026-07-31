@@ -31,8 +31,8 @@ PUB = ROOT / "specs" / "publication"
 
 SPECS = {
     "rem-parity-1-specification.md": {"line": "1.0", "noun": "tape"},
-    "rem-object-core-format.md": {"line": "1.0", "noun": "object"},
-    "rem-encrypt-profile.md": {"line": "1.0", "noun": "encrypted object"},
+    "rem-object-core-1-specification.md": {"line": "1.0", "noun": "object"},
+    "rem-encrypt-1-specification.md": {"line": "1.0", "noun": "encrypted object"},
 }
 COMPANION = "formats-explained.md"
 
@@ -40,8 +40,8 @@ COMPANION = "formats-explained.md"
 # pages are on the release checklist, not reachable from this repo).
 SHA_SITES = [
     "specs/publication/rem-parity-1-specification.md",
-    "specs/publication/rem-object-core-format.md",
-    "specs/publication/rem-encrypt-profile.md",
+    "specs/publication/rem-object-core-1-specification.md",
+    "specs/publication/rem-encrypt-1-specification.md",
     "specs/publication/formats-explained.md",
     "CHANGELOG.md",
 ]

@@ -2,10 +2,10 @@
 
 The published, citable specifications live in [publication/](publication/):
 
-- [rem-object-core-format.md](publication/rem-object-core-format.md) — the
+- [rem-object-core-1-specification.md](publication/rem-object-core-1-specification.md) — the
   **REM-OBJECT Core Format 1.0** specification: the archival object
   container, its manifest, and closed-form byte-range addressing.
-- [rem-encrypt-profile.md](publication/rem-encrypt-profile.md) — the
+- [rem-encrypt-1-specification.md](publication/rem-encrypt-1-specification.md) — the
   **REM-ENCRYPT 1.0** specification: the encrypted envelope around a
   canonical REM-OBJECT.
 - [rem-parity-1-specification.md](publication/rem-parity-1-specification.md)

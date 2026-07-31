@@ -151,8 +151,8 @@ tape write, is [docs/guide-quickstart.md](docs/guide-quickstart.md).
   a plain-language companion to the specifications: the motivation and
   the design, without the normative terseness.
 - Published format specifications:
-  [REM-OBJECT Core Format 1.0](specs/publication/rem-object-core-format.md),
-  [REM-ENCRYPT 1.0](specs/publication/rem-encrypt-profile.md), and
+  [REM-OBJECT Core Format 1.0](specs/publication/rem-object-core-1-specification.md),
+  [REM-ENCRYPT 1.0](specs/publication/rem-encrypt-1-specification.md), and
   [REM-PARITY 1.0](specs/publication/rem-parity-1-specification.md), with
   their pinned test-vector archive alongside.
 - [proto/layer5.proto](proto/layer5.proto) — the draft gRPC contract.
