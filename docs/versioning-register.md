@@ -319,14 +319,12 @@ documents and published artifacts themselves.
 
 ## One habit that keeps this page honest
 
-Several of the mistakes this register exists to prevent were made while
-writing the policy itself — a constants table left saying `1 / 2` when the
-writer emitted 3, one file carrying two different version numbers, a
-Status section contradicting a later section of the same document. The
-repository therefore runs `tools/check_spec_versioning.py` on every
-verification pass: it checks that the policy text is identical across the
-three specifications, that every version number in a document agrees with
+A register like this is only useful while it agrees with the documents it
+summarises, and agreement maintained by hand does not last. The repository
+therefore runs `tools/check_spec_versioning.py` on every verification
+pass: it checks that the change policy reads identically across the three
+specifications, that every version number in a document agrees with
 itself, that the pinned archive digest matches at every place that quotes
 it, that revision histories stay in order, and that references resolve.
-When this register and the specifications drift, the build says so before
-a reader has to.
+When the specifications and their surrounding pages drift, the build says
+so before a reader has to.
