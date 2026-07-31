@@ -14,7 +14,7 @@ this text and a specification disagree, the specification wins.*
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719163](https://doi.org/10.5281/zenodo.21719163) |
 
-**This is a review draft**, published alongside the specifications it accompanies and not yet frozen; the freeze date will be announced on the project site.
+**This is a review draft**, published alongside the specifications it accompanies. Comments close on 30 April 2027 and the documents freeze on 31 July 2027.
 
 This companion is versioned and archived like the specifications it
 accompanies, so that a citation of it names immutable text; its version
