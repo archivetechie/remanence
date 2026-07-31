@@ -34,8 +34,8 @@ omits Section 5 (the encrypted representation, owned here).
 | | |
 | --- | --- |
 | Status | Publication specification |
-| Version | 1.0 |
-| Date | 2026-07-25 |
+| Version | 1.0.1 |
+| Date | 2026-07-31 |
 | License | CC-BY-4.0 |
 | Concept DOI (all versions) | [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) |
 | Version DOI (this release) | [10.5281/zenodo.21551571](https://doi.org/10.5281/zenodo.21551571) |
@@ -46,9 +46,17 @@ implementation is validated against this document, not the reverse.
 
 No standards body has reviewed or adopted it. It was written by the same
 people who wrote the implementation, so the stability of this document is our
-own undertaking rather than anyone else's approval. We will not make a
-normative change to it. We will correct errata that do not alter which
-encrypted objects are valid. Anything beyond that takes a new major version.
+own undertaking rather than anyone else's approval.
+
+Revisions come in three kinds. Errata (1.0.1, 1.0.2 and so on) correct wording
+and resolve ambiguities the way conformant implementations already behave, so
+nothing an implementation does has to change. Minor revisions (1.1, 1.2 and so
+on) add optional keys and nothing else, so every encrypted object written under
+an earlier 1.x stays valid and a reader built from an earlier 1.x still reads
+the newer ones. A new major version (2.0) is required for anything that changes
+the meaning of an existing field, removes one, or could stop an existing
+encrypted object being read; that takes a separate document. Each published
+revision is archived with its own DOI under the concept DOI above.
 
 REM-ENCRYPT depends normatively on REM-OBJECT Core Format 1.0
 ([REMOBJECT]), which defines the canonical plaintext object sealed by this
