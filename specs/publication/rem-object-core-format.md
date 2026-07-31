@@ -64,7 +64,7 @@ by three questions, asked in order.
    permitted only if all three of the following hold: every object written
    under an earlier revision of this major remains valid; a reader built
    from an earlier revision still reads correctly every object that uses
-   only the features defined at or before that revision; and on a object
+   only the features defined at or before that revision; and on an object
    that uses a feature it does not implement, that reader identifies the
    object and refuses it with a typed error naming the unimplemented value —
    it never misreads, and never mistakes the object for damage. A minor

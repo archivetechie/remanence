@@ -2536,6 +2536,9 @@ marked `[draft]`.
   false "Version DOI (this release)" row removed. No tape becomes valid or
   invalid; the only implementation-visible additions state what the
   reference implementation and pinned vectors already do.
+- **2026-07-25 — 1.0.0 — [published] first publication.** Archived with
+  software release v1.0.0 (Zenodo concept DOI 10.5281/zenodo.21551570);
+  the permanent 1.0 anchor.
 - **2026-07-29 — [draft] pre-freeze revisions II.** Last-resort
   filemark-walk operational envelope specified (Section 8.4.1), with
   inter-file positioning exempted from the Section 8.4 rule-6 abort;
@@ -2557,9 +2560,6 @@ marked `[draft]`.
   (Sections 3.3, 10.5, 11.2); the bootstrap directory ceiling made an
   admission-time refusal with mandatory headroom and seal-at-ceiling
   (Section 8.2.1); reference journal watermark note (Appendix B.12).
-- **2026-07-25 — 1.0.0 — [published] first publication.** Archived with
-  software release v1.0.0 (Zenodo concept DOI 10.5281/zenodo.21551570);
-  the permanent 1.0 anchor.
 - **2026-06-11 — [draft] first draft.** Initial working baseline.
 
 ## Author's Address
