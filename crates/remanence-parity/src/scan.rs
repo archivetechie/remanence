@@ -115,6 +115,11 @@ pub struct ScanBootstrapCandidate {
 pub enum ScanDamageKind {
     /// The first block of a measured tape file was unreadable.
     UnreadableTapeFileHead,
+    /// A tape file carried a recognisable structural header whose recorded
+    /// block count disagreed with the measured length of the file, so the
+    /// classification rung was abandoned and the file fell through to the next
+    /// rung (REM-PARITY 12.3). The walk continues; the failure is reported.
+    ClassificationCountMismatch,
 }
 
 /// One contiguous damaged region encountered by the structural scanner.
@@ -555,6 +560,7 @@ fn scan_reconstruct_filemark_map_with_provenance(
                     block_size,
                     file_start,
                     measured.block_count,
+                    &mut damaged_regions,
                 )? {
                     bootstrap_candidates.push(candidate);
                 }
@@ -587,6 +593,7 @@ fn scan_reconstruct_filemark_map_with_provenance(
                     block_size,
                     file_start,
                     measured.block_count,
+                    &mut damaged_regions,
                 )?;
                 if measured.block_count == 1 && classified_as_object {
                     unreadable_one_block_objects.push(tape_file_number);
@@ -679,6 +686,7 @@ fn measure_current_file(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_classified_entry(
     source: &mut dyn RawTapeSource,
     builder: &mut FilemarkMapBuilder,
@@ -687,15 +695,27 @@ fn append_classified_entry(
     block_size: u32,
     file_start: PhysicalPositionHint,
     block_count: u64,
+    damaged_regions: &mut Vec<ScanDamagedRegion>,
 ) -> Result<Option<ScanBootstrapCandidate>, ParityError> {
+    // REM-PARITY 12.3: a count mismatch at a classification rung abandons that
+    // rung for this tape file only. It MUST NOT abort the walk — the catalog-less
+    // reader needs the rest of the map, and the bootstrap re-typing and
+    // parity_map overlay rescues (12.4) run only after the walk completes.
+    let note_count_mismatch = |damaged_regions: &mut Vec<ScanDamagedRegion>| {
+        damaged_regions.push(ScanDamagedRegion {
+            start: file_start,
+            block_count,
+            kind: ScanDamageKind::ClassificationCountMismatch,
+        });
+    };
     if has_bootstrap_magic(block0) {
         match parse_bootstrap_block(block0) {
             Ok(payload) => {
                 if payload.block_size_bytes == block_size && payload.tape_uuid == *tape_uuid {
                     if block_count != 1 {
-                        return Err(filemark_scan_error(format!(
-                            "bootstrap tape file has block_count {block_count}, expected 1"
-                        )));
+                        note_count_mismatch(damaged_regions);
+                        builder.push_object(block_count)?;
+                        return Ok(None);
                     }
                     let tape_file_number = builder.next_tape_file_number()?;
                     builder.push_bootstrap()?;
@@ -715,10 +735,9 @@ fn append_classified_entry(
     if let Ok(Some(header)) = classify_parity_map_header_block(block0, tape_uuid) {
         let expected = header.parity_map_total_block_count;
         if block_count != expected {
-            return Err(filemark_scan_error(format!(
-                "parity-map sequence {} has block_count {block_count}, expected {expected}",
-                header.sequence
-            )));
+            note_count_mismatch(damaged_regions);
+            builder.push_object(block_count)?;
+            return Ok(None);
         }
         builder.push_parity_map(block_count)?;
         return Ok(None);
@@ -727,10 +746,9 @@ fn append_classified_entry(
     if let Ok(Some(header)) = classify_sidecar_header_block(block0, tape_uuid) {
         let expected = header.sidecar_total_block_count;
         if block_count != expected {
-            return Err(filemark_scan_error(format!(
-                "sidecar epoch {} has block_count {block_count}, expected {expected}",
-                header.epoch_id
-            )));
+            note_count_mismatch(damaged_regions);
+            builder.push_object(block_count)?;
+            return Ok(None);
         }
         builder.push_parity_sidecar(
             block_count,
@@ -741,9 +759,14 @@ fn append_classified_entry(
         return Ok(None);
     }
 
-    if let Some(header) =
-        classify_sidecar_from_footer_tail(source, file_start, tape_uuid, block_size, block_count)?
-    {
+    if let Some(header) = classify_sidecar_from_footer_tail(
+        source,
+        file_start,
+        tape_uuid,
+        block_size,
+        block_count,
+        damaged_regions,
+    )? {
         builder.push_parity_sidecar(
             block_count,
             header.epoch_id,
@@ -764,10 +787,16 @@ fn append_entry_with_unreadable_head(
     block_size: u32,
     file_start: PhysicalPositionHint,
     block_count: u64,
+    damaged_regions: &mut Vec<ScanDamagedRegion>,
 ) -> Result<bool, ParityError> {
-    if let Some(header) =
-        classify_sidecar_from_footer_tail(source, file_start, tape_uuid, block_size, block_count)?
-    {
+    if let Some(header) = classify_sidecar_from_footer_tail(
+        source,
+        file_start,
+        tape_uuid,
+        block_size,
+        block_count,
+        damaged_regions,
+    )? {
         builder.push_parity_sidecar(
             block_count,
             header.epoch_id,
@@ -787,6 +816,7 @@ fn classify_sidecar_from_footer_tail(
     tape_uuid: &[u8; 16],
     block_size: u32,
     block_count: u64,
+    damaged_regions: &mut Vec<ScanDamagedRegion>,
 ) -> Result<Option<SidecarScanClassification>, ParityError> {
     let Some(footer_block) =
         read_optional_fixed_block_at(source, file_start, block_count - 1, block_size)?
@@ -798,10 +828,14 @@ fn classify_sidecar_from_footer_tail(
         Err(_) => return Ok(None),
     };
     if footer.sidecar_total_block_count != block_count {
-        return Err(filemark_scan_error(format!(
-            "sidecar footer epoch {} has block_count {block_count}, expected {}",
-            footer.epoch_id, footer.sidecar_total_block_count
-        )));
+        // REM-PARITY 12.3: report and fall through to the next rung, rather than
+        // abandoning the whole walk over one tape file's disagreement.
+        damaged_regions.push(ScanDamagedRegion {
+            start: file_start,
+            block_count,
+            kind: ScanDamageKind::ClassificationCountMismatch,
+        });
+        return Ok(None);
     }
 
     match read_tail_sidecar_header(source, file_start, tape_uuid, block_size, &footer)? {
@@ -4137,36 +4171,38 @@ mod tests {
         ));
     }
 
+    /// REM-PARITY 12.3 rung 1: a bootstrap-magic tape file that does not measure
+    /// exactly one block fails that rung and falls through, rather than aborting.
+    /// Inside a digest scope the tape is refused anyway — by a digest mismatch
+    /// rather than by silence — but a file in the Section 12.6 unattested tail no
+    /// longer destroys the attested prefix with it.
     #[test]
     fn valid_bootstrap_with_extra_block_is_structural_damage() {
         let (mut records, expected_map) = fixture_records(false, false);
-        let final_bootstrap = expected_map
+        let bootstrap = &expected_map.entries()[3];
+        assert_eq!(bootstrap.kind, TapeFileKind::Bootstrap);
+        let bootstrap_block = expected_map
             .physical_position(TapeFilePosition {
-                tape_file_number: 3,
+                tape_file_number: bootstrap.tape_file_number,
                 block_within_file: 0,
             })
-            .expect("final bootstrap has a physical position");
-        let final_filemark_index = usize::try_from(final_bootstrap.lba + 1)
-            .expect("final bootstrap filemark index fits usize");
-        assert!(matches!(
-            records.get(final_filemark_index),
-            Some(Record::Filemark)
-        ));
-        records.insert(final_filemark_index, Record::Block(block(0xEE)));
+            .expect("bootstrap block has a physical position");
+        let insert_at =
+            usize::try_from(bootstrap_block.lba).expect("bootstrap block index fits usize") + 1;
+        records.insert(insert_at, Record::Block(vec![0xDD; BLOCK_SIZE as usize]));
         let mut source = RecordingRawSource::new(records);
 
-        let err = scan_reconstruct_filemark_map(&mut source, &TAPE_UUID, BLOCK_SIZE)
-            .expect_err("a parseable bootstrap must still be a one-block tape file");
+        let report = scan_reconstruct_filemark_map_with_report(&mut source, &TAPE_UUID, BLOCK_SIZE)
+            .expect("a count mismatch must not abort the walk");
 
-        match err {
-            ParityError::FilemarkMapReconstruct(message) => {
-                assert!(
-                    message.contains("bootstrap tape file has block_count 2, expected 1"),
-                    "{message}"
-                );
-            }
-            other => panic!("expected filemark-map reconstruction error, got {other:?}"),
-        }
+        assert!(
+            report
+                .damaged_regions
+                .iter()
+                .any(|region| region.kind == ScanDamageKind::ClassificationCountMismatch),
+            "the abandoned classification must be reported: {:?}",
+            report.damaged_regions
+        );
     }
 
     #[test]
@@ -4421,6 +4457,12 @@ mod tests {
         }
     }
 
+    /// REM-PARITY 12.3: a sidecar header whose recorded total disagrees with the
+    /// measured tape-file length abandons that classification rung for this file
+    /// only. The walk completes, the disagreement is reported, and the file falls
+    /// through to the object rung — where the canonical digest then refuses it.
+    /// Before this was fixed the whole walk aborted, so one damaged sidecar
+    /// anywhere on a cartridge destroyed the entire catalog-less map.
     #[test]
     fn valid_sidecar_header_with_truncated_file_is_structural_damage() {
         let (mut records, expected_map) = fixture_records(false, false);
@@ -4442,68 +4484,52 @@ mod tests {
         assert!(matches!(removed, Record::Block(_)));
         let mut source = RecordingRawSource::new(records);
 
-        let err = scan_reconstruct_filemark_map(&mut source, &TAPE_UUID, BLOCK_SIZE)
-            .expect_err("a valid sidecar header must match the measured tape-file length");
+        let report = scan_reconstruct_filemark_map_with_report(&mut source, &TAPE_UUID, BLOCK_SIZE)
+            .expect("a count mismatch must not abort the walk");
 
-        match err {
-            ParityError::FilemarkMapReconstruct(message) => {
-                assert!(
-                    message.contains("sidecar epoch 0 has block_count"),
-                    "{message}"
-                );
-                assert!(
-                    message.contains(&format!("expected {}", sidecar.block_count)),
-                    "{message}"
-                );
-            }
-            other => panic!("expected filemark-map reconstruction error, got {other:?}"),
-        }
+        assert!(
+            report
+                .damaged_regions
+                .iter()
+                .any(|region| region.kind == ScanDamageKind::ClassificationCountMismatch),
+            "the abandoned classification must be reported: {:?}",
+            report.damaged_regions
+        );
+        assert_eq!(
+            report.map.entries()[2].kind,
+            TapeFileKind::Object,
+            "a sidecar that fails classification falls through to the object rung"
+        );
     }
 
+    /// As above, with the file measuring one block longer than its header records.
     #[test]
     fn valid_sidecar_header_with_extra_block_is_structural_damage() {
         let (mut records, expected_map) = fixture_records(false, false);
         let sidecar = &expected_map.entries()[2];
         assert_eq!(sidecar.kind, TapeFileKind::ParitySidecar);
-        assert!(
-            sidecar.block_count > 0,
-            "fixture sidecar must have a trailing filemark target"
-        );
         let last_sidecar_block = expected_map
             .physical_position(TapeFilePosition {
                 tape_file_number: sidecar.tape_file_number,
                 block_within_file: sidecar.block_count - 1,
             })
             .expect("sidecar last block has a physical position");
-        let sidecar_filemark_index =
-            usize::try_from(last_sidecar_block.lba + 1).expect("sidecar filemark index fits usize");
-        assert!(matches!(
-            records.get(sidecar_filemark_index),
-            Some(Record::Filemark)
-        ));
-        records.insert(sidecar_filemark_index, Record::Block(block(0xDD)));
+        let insert_at =
+            usize::try_from(last_sidecar_block.lba).expect("sidecar block index fits usize") + 1;
+        records.insert(insert_at, Record::Block(vec![0xDD; BLOCK_SIZE as usize]));
         let mut source = RecordingRawSource::new(records);
 
-        let err = scan_reconstruct_filemark_map(&mut source, &TAPE_UUID, BLOCK_SIZE)
-            .expect_err("a valid sidecar header must reject extra physical blocks");
+        let report = scan_reconstruct_filemark_map_with_report(&mut source, &TAPE_UUID, BLOCK_SIZE)
+            .expect("a count mismatch must not abort the walk");
 
-        match err {
-            ParityError::FilemarkMapReconstruct(message) => {
-                assert!(
-                    message.contains("sidecar epoch 0 has block_count"),
-                    "{message}"
-                );
-                assert!(
-                    message.contains(&format!(
-                        "block_count {}, expected {}",
-                        sidecar.block_count + 1,
-                        sidecar.block_count
-                    )),
-                    "{message}"
-                );
-            }
-            other => panic!("expected filemark-map reconstruction error, got {other:?}"),
-        }
+        assert!(
+            report
+                .damaged_regions
+                .iter()
+                .any(|region| region.kind == ScanDamageKind::ClassificationCountMismatch),
+            "the abandoned classification must be reported: {:?}",
+            report.damaged_regions
+        );
     }
 
     #[test]
