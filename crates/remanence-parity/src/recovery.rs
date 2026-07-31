@@ -2318,10 +2318,11 @@ mod tests {
             .expect("sidecar has a footer block");
         {
             let footer = &mut sidecar_blocks[footer_index];
-            let bogus_total = u64::from(sidecar.blocks.len() as u64) + 7;
+            let bogus_total = sidecar.blocks.len() as u64 + 7;
             footer[0x40..0x48].copy_from_slice(&bogus_total.to_le_bytes());
             let crc = remanence_crc::crc64_xz(&footer[..crate::sidecar::SIDECAR_FOOTER_CRC_OFFSET]);
-            footer[crate::sidecar::SIDECAR_FOOTER_CRC_OFFSET..crate::sidecar::SIDECAR_FOOTER_CRC_OFFSET + 8]
+            footer[crate::sidecar::SIDECAR_FOOTER_CRC_OFFSET
+                ..crate::sidecar::SIDECAR_FOOTER_CRC_OFFSET + 8]
                 .copy_from_slice(&crc.to_le_bytes());
         }
 
@@ -2357,7 +2358,7 @@ mod tests {
             BLOCK_SIZE,
             2,
         )
-            .expect_err("a geometry disagreement must be refused");
+        .expect_err("a geometry disagreement must be refused");
         assert!(
             matches!(err, ParityError::SchemeMismatch { .. }),
             "expected SchemeMismatch, got {err:?}"
