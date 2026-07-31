@@ -47,11 +47,12 @@ pinned, so what is under review is not whether the design works but whether
 implementation built from these words alone should produce the published
 vectors, and where it would not, the text is wrong and we want to know.
 
-The documents will be frozen after the review period, at which point the
-finality promise below takes effect and the change policy governs every
-revision after it. **The freeze date will be announced on the project site and
-in this section.** Comments and defect reports are raised as issues on the
-project repository.
+**Comments close on 30 April 2027, and the documents freeze on 31 July 2027**,
+one year after publication. On that date the finality promise below takes
+effect and the change policy governs every revision after it. The three months
+between the two dates exist so that changes made in response to review are
+published as such, and visible, before the text is fixed. Comments and defect
+reports are raised as issues on the project repository.
 
 This document is the publication specification for REM-ENCRYPT. It is the
 normative fixed point for the encrypted representation it defines: an
