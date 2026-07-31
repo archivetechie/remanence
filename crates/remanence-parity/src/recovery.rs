@@ -925,10 +925,16 @@ fn read_and_parse_sidecar_index(
         }
     };
     if sidecar_entry.block_count != footer.sidecar_total_block_count {
-        return Err(ParityError::SidecarParse(format!(
-            "sidecar map block_count {} does not match footer total {}",
-            sidecar_entry.block_count, footer.sidecar_total_block_count
-        )));
+        // REM-PARITY 13.3 step 2: a footer that parses but contradicts the map
+        // entry is treated as an invalid footer, not as a hard stop — the same
+        // fall-through the unreadable and unparseable branches above take.
+        return read_primary_sidecar_index_without_footer(
+            source,
+            scoped_map,
+            sidecar_entry,
+            tape_uuid,
+            block_size,
+        );
     }
 
     let primary = read_sidecar_index_copy(
@@ -1165,22 +1171,47 @@ fn validate_sidecar_for_recovery(
             sidecar.header.real_data_shard_count
         )));
     }
+    // REM-PARITY 13.3: the acquired index is pinned against the bootstrap scheme
+    // record and the map entry's ordinal range; disagreement is `SchemeMismatch`.
+    // These are structurally valid metadata that disagrees, not a decode failure,
+    // so they do not raise `SidecarParse`.
     if sidecar_entry.protected_ordinal_start != Some(sidecar.header.protected_ordinal_start)
         || sidecar_entry.protected_ordinal_end_exclusive
             != Some(sidecar.header.protected_ordinal_end_exclusive)
     {
-        return Err(ParityError::SidecarParse(
-            "sidecar header protected range does not match filemark map entry".to_string(),
-        ));
+        return Err(ParityError::SchemeMismatch {
+            tape: format!(
+                "ordinals {}..{}",
+                sidecar.header.protected_ordinal_start,
+                sidecar.header.protected_ordinal_end_exclusive
+            ),
+            expected: format!(
+                "ordinals {:?}..{:?}",
+                sidecar_entry.protected_ordinal_start,
+                sidecar_entry.protected_ordinal_end_exclusive
+            ),
+        });
     }
     if sidecar.header.k != scheme.data_blocks_per_stripe
         || sidecar.header.m != scheme.parity_blocks_per_stripe
         || sidecar.header.stripes_per_epoch != scheme.stripes_per_neighborhood
         || sidecar.header.block_size != block_size
     {
-        return Err(ParityError::SidecarParse(
-            "sidecar scheme or block size does not match recovery scheme".to_string(),
-        ));
+        return Err(ParityError::SchemeMismatch {
+            tape: format!(
+                "k={} m={} S={} block_size={}",
+                sidecar.header.k,
+                sidecar.header.m,
+                sidecar.header.stripes_per_epoch,
+                sidecar.header.block_size
+            ),
+            expected: format!(
+                "k={} m={} S={} block_size={block_size}",
+                scheme.data_blocks_per_stripe,
+                scheme.parity_blocks_per_stripe,
+                scheme.stripes_per_neighborhood
+            ),
+        });
     }
     Ok(())
 }
@@ -2263,6 +2294,73 @@ mod tests {
         assert_eq!(
             recovered.sidecar_metadata_health,
             SidecarMetadataHealth::TailCopyLost
+        );
+    }
+
+    /// REM-PARITY 13.3 step 2: a footer that parses cleanly but disagrees with
+    /// the map entry is invalid evidence, not a hard stop. Before this was fixed
+    /// the disagreement returned `SidecarParse` and abandoned an epoch whose
+    /// primary header was intact — while the two sibling branches (unreadable
+    /// footer block, unparseable footer) already fell back correctly.
+    ///
+    /// The footer's `sidecar_total_block_count` is rewritten and its CRC
+    /// recomputed, so the footer parses and is self-consistent yet contradicts
+    /// both the map entry and the primary header.
+    #[test]
+    fn sidecar_footer_contradicting_map_entry_falls_back_to_primary_header_copy() {
+        let scheme = scheme(2, 1, 2);
+        let object_blocks = vec![block(1), block(2), block(3), block(4)];
+        let sidecar = sidecar_for_epoch(&scheme, &object_blocks);
+        let mut sidecar_blocks = sidecar.blocks.clone();
+        let footer_index = sidecar_blocks
+            .len()
+            .checked_sub(1)
+            .expect("sidecar has a footer block");
+        {
+            let footer = &mut sidecar_blocks[footer_index];
+            let bogus_total = u64::from(sidecar.blocks.len() as u64) + 7;
+            footer[0x40..0x48].copy_from_slice(&bogus_total.to_le_bytes());
+            let crc = remanence_crc::crc64_xz(&footer[..crate::sidecar::SIDECAR_FOOTER_CRC_OFFSET]);
+            footer[crate::sidecar::SIDECAR_FOOTER_CRC_OFFSET..crate::sidecar::SIDECAR_FOOTER_CRC_OFFSET + 8]
+                .copy_from_slice(&crc.to_le_bytes());
+        }
+
+        let scoped = scoped_map(sidecar_blocks.len() as u64, object_blocks.len() as u64);
+        let mut raw = raw_tape(&object_blocks, &sidecar_blocks);
+        let recovered =
+            recover_ordinal_from_sidecar(&mut raw, &scoped, &scheme, TAPE_UUID, BLOCK_SIZE, 2)
+                .expect("a parsing footer that contradicts the map must fall back to the primary");
+
+        assert_eq!(recovered.recovered_block, object_blocks[2]);
+    }
+
+    /// REM-PARITY 13.3: an acquired index that disagrees with the bootstrap
+    /// scheme record raises `SchemeMismatch`, not `SidecarParse` — the metadata
+    /// is structurally valid, it simply describes a different geometry.
+    #[test]
+    fn sidecar_geometry_disagreement_raises_scheme_mismatch() {
+        let on_tape = scheme(2, 1, 2);
+        // A reader whose parity width differs from the sidecar written on tape.
+        // `k` and `S` are held equal so the ordinal-range invariants still pass
+        // and the disagreement reaches the Section 13.3 pinning check.
+        let reader_scheme = scheme(2, 2, 2);
+        let object_blocks = vec![block(1), block(2), block(3), block(4)];
+        let sidecar = sidecar_for_epoch(&on_tape, &object_blocks);
+        let scoped = scoped_map(sidecar.blocks.len() as u64, object_blocks.len() as u64);
+        let mut raw = raw_tape(&object_blocks, &sidecar.blocks);
+
+        let err = recover_ordinal_from_sidecar(
+            &mut raw,
+            &scoped,
+            &reader_scheme,
+            TAPE_UUID,
+            BLOCK_SIZE,
+            2,
+        )
+            .expect_err("a geometry disagreement must be refused");
+        assert!(
+            matches!(err, ParityError::SchemeMismatch { .. }),
+            "expected SchemeMismatch, got {err:?}"
         );
     }
 
