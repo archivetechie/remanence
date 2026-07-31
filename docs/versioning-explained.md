@@ -58,7 +58,8 @@ legal. This is the promise that makes the format archival at all.
 
 **Promise two: newer readers read older tapes.** Software built from any
 future revision of the specification will read every tape written under any
-earlier revision, correctly. A 2040 inspector understands a 1990 house.
+earlier revision, correctly. An inspector trained on this year's code
+still understands last decade's house.
 
 **Promise three: older readers are never fooled by newer tapes.** This one
 is subtler, and it is where most format policies go wrong, so it deserves a
@@ -308,15 +309,22 @@ tape, and it writes itself into the registry row when it does. Most
 revisions of a document — every erratum, and any minor that only adjusts
 obligations — assign nothing at all.
 
-## The find-a-tape-in-2050 walkthrough
+## The found-cartridge walkthrough: ten years on
 
-Put it all together with the scenario the formats are designed around: a
-labelled-but-undocumented cartridge surfaces in 2050. The organisation that
-wrote it is gone. What happens?
+Put it all together with the scenario the formats are designed around. A
+word first about the timescale, because it is easy to exaggerate: tape
+drives read only a generation or two back, so in practice archives migrate
+to fresh media every several years, and a cartridge much older than a
+decade is a hardware-procurement problem before it is a format problem.
+The scenario that actually matters is nearer and more ordinary — a
+cartridge surfaces eight or ten years on, within the window a drive can
+still read, but the organisation that wrote it has dissolved, its archive
+system is decommissioned, and its catalog is gone. That combination
+arrives well inside a decade all the time. What happens?
 
-1. The reader software — built from whatever revision is current in
-   2050 — loads the tape and finds a bootstrap block. Promise two says
-   this works regardless of how old the tape is.
+1. The reader software — built from whatever revision is then current —
+   loads the tape and finds a bootstrap block. Promise two says this works
+   regardless of which revision wrote the tape.
 2. The bootstrap announces the tape's structure, and its wire numbers
    announce the feature generations in use. The reader either understands
    everything (and reads the tape), or names precisely what it lacks.
@@ -332,7 +340,7 @@ wrote it is gone. What happens?
    separate DOI series of its own — deliberately, so that someone holding a
    generation-1 tape who follows the generation-1 document's DOI always
    lands on text that governs their tape, and is never silently redirected
-   across a compatibility break. The 2050 reader resolves the DOI and holds
+   across a compatibility break. The reader resolves the DOI and holds
    the exact frozen text.
 5. The specification, by design, contains everything needed to verify the
    tape's mathematics from the text alone, and the published test vectors
