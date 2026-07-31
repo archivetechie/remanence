@@ -1265,7 +1265,23 @@ the revisions that follow the first published one.
   2026-07-25, this revision replaces the draft Status text with the shared
   three-question change policy, records the per-document concept and
   revision DOIs (the earlier deposit was a software release, and its DOI is
-  now carried as an informative row only), gives every Section 10 registry a Defined-by column and an unassigned-value retrieval note, fixes the Section 10.1 self-reference, adds the pinned-provenance and supersession note to the X-Wing citation, and adds the worked classifications and the vectors-are-anchors rule.
+  now carried as an informative row only), gives every Section 10 registry a
+  Defined-by column and an unassigned-value retrieval note, fixes the
+  Section 10.1 self-reference, adds the pinned-provenance and supersession note
+  to the X-Wing citation, and adds the worked classifications and the
+  vectors-are-anchors rule. It also corrects the Section 13.2 range vector's
+  `range_len` from 351 to 358, the length of the manifest that range covers.
+
+  **If you implemented from the review draft, re-check one thing.** The
+  Section 5.3 HPKE `info` transcript printed `0x02` at offset 101 and labelled
+  it `(format_version)`. The byte is `0x01`, and it is not the envelope
+  `format_version` at all — it is a frozen constant naming the generation of
+  the transcript, matching the `v1` of the `rem-encrypt-wrap-v1` prefix. Every
+  sealed object and the published wrap known-answer test bind `0x01`. An
+  implementation built from the draft's value derives a different HPKE key
+  schedule and cannot unwrap a DEK from any conformant object; it could never
+  have interoperated, so this correction restores interoperability rather than
+  removing it. No sealed object or published vector changed.
 - **2026-07-25 — [draft] review draft published.** The document as it then
   stood was distributed inside software release v1.0.0
   (Zenodo 10.5281/zenodo.21551571, software concept DOI
