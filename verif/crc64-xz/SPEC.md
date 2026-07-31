@@ -3,7 +3,7 @@
 Target: `crates/remanence-crc/src/lib.rs`, the shared CRC implementation used
 by parity sidecars and the append-only audit log.
 
-CRC-64/XZ parameters, as specified by `specs/rem-parity-1.0-specification.md`
+CRC-64/XZ parameters, as specified by `specs/rem-parity-1-specification.md`
 Section 5.1:
 
 - width 64

@@ -8,7 +8,7 @@ The published, citable specifications live in [publication/](publication/):
 - [rem-encrypt-profile.md](publication/rem-encrypt-profile.md) — the
   **REM-ENCRYPT 1.0** specification: the encrypted envelope around a
   canonical REM-OBJECT.
-- [rem-parity-1.0-specification.md](publication/rem-parity-1.0-specification.md)
+- [rem-parity-1-specification.md](publication/rem-parity-1-specification.md)
   — the **REM-PARITY Tape Format Specification, Version 1.0**: on-tape
   layout, sidecar parity, bootstrap blocks, and catalog-less recovery.
 - [formats-explained.md](publication/formats-explained.md) — the
