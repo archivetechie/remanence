@@ -16,8 +16,8 @@ A short positioning document. If you are choosing between Remanence and
 another way of putting data on LTO tape, this explains the trade-offs
 in operator-grade terms — not a marketing pitch, not a spec. The
 formal format commitments live in the published
-[REM-OBJECT Core Format 1.0](../specs/publication/rem-object-core-format.md),
-[REM-ENCRYPT 1.0](../specs/publication/rem-encrypt-profile.md), and
+[REM-OBJECT Core Format 1.0](../specs/publication/rem-object-core-1-specification.md),
+[REM-ENCRYPT 1.0](../specs/publication/rem-encrypt-1-specification.md), and
 [REM-PARITY 1.0](../specs/publication/rem-parity-1-specification.md)
 specifications; this doc explains the *reasoning* behind those commitments
 by comparing Remanence to the alternatives.
@@ -281,13 +281,13 @@ In practice, three things:
    is a real risk.
 
 Remanence takes a different approach, documented in
-[REM-OBJECT Core Format 1.0](../specs/publication/rem-object-core-format.md).
+[REM-OBJECT Core Format 1.0](../specs/publication/rem-object-core-1-specification.md).
 There is one object format: `rem-object-v1`, a chunk-aligned,
 constrained POSIX pax tar stream with a deterministic CBOR manifest.
 A plaintext REM-OBJECT remains extractable with a standard pax-aware
 `tar` implementation even if Remanence itself is unavailable. An
 encrypted copy must first be opened according to
-[REM-ENCRYPT 1.0](../specs/publication/rem-encrypt-profile.md);
+[REM-ENCRYPT 1.0](../specs/publication/rem-encrypt-1-specification.md);
 the result is that same canonical pax tar stream. On tape,
 [REM-PARITY 1.0](../specs/publication/rem-parity-1-specification.md)
 adds Reed-Solomon sidecar parity and catalog-less bootstrap recovery.
@@ -465,9 +465,9 @@ You probably want something else if:
 
 ## Pointers
 
-- [REM-OBJECT Core Format 1.0](../specs/publication/rem-object-core-format.md)
+- [REM-OBJECT Core Format 1.0](../specs/publication/rem-object-core-1-specification.md)
   — the canonical object container, manifest, identity, and range-read rules.
-- [REM-ENCRYPT 1.0](../specs/publication/rem-encrypt-profile.md) — the
+- [REM-ENCRYPT 1.0](../specs/publication/rem-encrypt-1-specification.md) — the
   encrypted representation and its X-Wing hybrid KEM profile (X25519 +
   ML-KEM-768).
 - [REM-PARITY 1.0](../specs/publication/rem-parity-1-specification.md) —
