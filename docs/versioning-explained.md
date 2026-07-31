@@ -234,6 +234,48 @@ Format", file `rem-parity-1-specification.md`), so filenames never churn
 with small revisions; the full three-part number lives in the document's
 own header table.
 
+## The test vectors — evidence that never moves
+
+Alongside the specifications we publish **test vectors**: a pinned archive
+of worked examples. It contains complete miniature tape images — healthy
+ones, and ones with deliberate damage at recorded positions — together
+with the answers a correct implementation must produce for each: what is
+recovered, what is reported, which checksums result. This is what
+"conformant" means in practice. It is not our opinion of your software; it
+is whether your software, given these inputs, produces these answers.
+
+The archive is published with a checksum of its own, and every document
+that relies on it quotes that checksum. Anyone can therefore confirm they
+hold exactly the material the specifications mean — not a near copy, not a
+newer copy, the bytes themselves.
+
+Vectors get one rule of their own, and it is the strictest in the whole
+policy: **a published vector archive is never changed and never replaced.**
+It is the permanent evidence of what its revision meant. If a later
+revision could quietly amend the worked examples, then "conformant" would
+quietly change meaning with it, and every implementation ever tested
+against the old examples would hold a claim that no longer says anything.
+So the rule runs one way only: a future revision that needs new examples —
+say, for a newly assigned feature — publishes an *additional* archive with
+its own checksum and cites it separately. The old archive keeps anchoring
+the old revision, forever, and nothing that quotes its checksum ever needs
+updating.
+
+The same rule settles disagreements. When an implementation and a vector
+disagree, the vector wins — unless the *specification text* is shown to
+contradict the vector, in which case something deeper is wrong and the
+revision process above decides what kind of correction is required. What
+is never done is "fixing" a vector to match the software that failed it.
+An anchor you may drag when it inconveniences you is not an anchor.
+
+One consequence is worth knowing so it does not look like an error: a
+vector archive can legitimately contain examples with different wire
+values — the current archive holds bootstrap images at feature generations
+2 and 3, because the format advanced while the examples were being
+generated. Each is a correct example of what it shows. The registry, not
+the archive, says which values are current
+([the register](versioning-register.md) lists every one).
+
 ## The tape does not know which document wrote it — on purpose
 
 Here is the part that surprises people, and the reason it should not.
