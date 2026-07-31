@@ -221,10 +221,12 @@ To report a security issue, especially anything affecting the encryption
 envelope or the integrity guarantees, see [SECURITY.md](SECURITY.md);
 please do not open a public issue for suspected vulnerabilities.
 Release history lives in [CHANGELOG.md](CHANGELOG.md). Released
-versions are archived on Zenodo; to cite the project or the format
-specifications, use DOI
+versions are archived on Zenodo. To cite the software, use its concept DOI
 [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) (see
-[CITATION.cff](CITATION.cff)).
+[CITATION.cff](CITATION.cff)). To cite a *format*, use that document's own
+concept DOI, named in the document's Status section — the specifications are
+deposited separately from the code, so that a citation of the format names an
+immutable text rather than a software release.
 
 ## License
 

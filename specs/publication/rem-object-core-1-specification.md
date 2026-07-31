@@ -31,7 +31,7 @@ representation, the parity relationship, and conformance, owned here).
 | | |
 | --- | --- |
 | Status | Publication specification |
-| Version | 1.0.1 |
+| Version | 1.0.0 |
 | Date | 2026-07-31 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719158](https://doi.org/10.5281/zenodo.21719158) |
@@ -88,8 +88,9 @@ format (informative): a new optional `REMANENCE.*` keyword, manifest key, or
 extension-container member — minor; a change to any existing field's
 meaning, or a new stream `format_id` — major. To identify what defines an
 object in hand: read `REMANENCE.format_id`, `REMANENCE.schema_version` and
-the manifest `schema_version` (Section 10 names each value's defining
-revision); every revision of this document is retrievable through the
+the manifest `schema_version` (Section 10 names the defining revision of
+each value it assigns; every value assigned so far was assigned by document
+1.0); every revision of this document is retrievable through the
 concept DOI above. Which revision wrote an object is not recorded in it and
 is not needed for reading. The Section 13 conformance vectors are anchors of
 the revision that generated them; a future revision that needs new vectors
@@ -125,24 +126,27 @@ construction is deterministic.
 
 **Table of Contents**
 
-1. [Introduction](#1-introduction)
-2. [Conventions and Terminology](#2-conventions-and-terminology)
-3. [Object Model](#3-object-model)
-4. [Plaintext Representation](#4-plaintext-representation)
-6. [Partial File Restore](#6-partial-file-restore)
-7. [Digests, Integrity, and the Verification Chain](#7-digests-integrity-and-the-verification-chain)
-8. [Storage Bindings and Backend Independence](#8-storage-bindings-and-backend-independence)
-9. [Relationship to the Parity Layer](#9-relationship-to-the-parity-layer)
-10. [Versioning and Extensibility](#10-versioning-and-extensibility)
-11. [Errors](#11-errors)
-12. [Security Considerations](#12-security-considerations)
-13. [Test Vectors](#13-test-vectors)
-14. [Conformance](#14-conformance)
-15. [IANA Considerations](#15-iana-considerations)
-16. [References](#16-references)
+- 1\. [Introduction](#1-introduction)
+- 2\. [Conventions and Terminology](#2-conventions-and-terminology)
+- 3\. [Object Model](#3-object-model)
+- 4\. [Plaintext Representation](#4-plaintext-representation)
+- 5\. *(Encrypted Representation — owned by REM-ENCRYPT; see Section 1.1)*
+- 6\. [Partial File Restore](#6-partial-file-restore)
+- 7\. [Digests, Integrity, and the Verification Chain](#7-digests-integrity-and-the-verification-chain)
+- 8\. [Storage Bindings and Backend Independence](#8-storage-bindings-and-backend-independence)
+- 9\. [Relationship to the Parity Layer](#9-relationship-to-the-parity-layer)
+- 10\. [Versioning and Extensibility](#10-versioning-and-extensibility)
+- 11\. [Errors](#11-errors)
+- 12\. [Security Considerations](#12-security-considerations)
+- 13\. [Test Vectors](#13-test-vectors)
+- 14\. [Conformance](#14-conformance)
+- 15\. [IANA Considerations](#15-iana-considerations)
+- 16\. [References](#16-references)
+- Appendix A. [Worked Example (Informative)](#appendix-a-worked-example-informative)
+- Appendix B. [Design Rationale (Informative)](#appendix-b-design-rationale-informative)
+- Appendix C. [Revision History (Informative)](#appendix-c-revision-history-informative)
+- [Author's Address](#authors-address)
 
-Appendix A. [Worked Example (Informative)](#appendix-a-worked-example-informative)
-Appendix B. [Design Rationale (Informative)](#appendix-b-design-rationale-informative)
 ---
 
 ### 1.2. Purpose and Design Goals
@@ -191,7 +195,7 @@ representations:
 
 Both representations of one object wrap the identical canonical bytes and
 therefore share one logical identity (`plaintext_digest`, Section 3.3). The
-REM-ENCRYPT provides confidentiality and authentication while preserving
+REM-ENCRYPT profile provides confidentiality and authentication while preserving
 self-description and closed-form range addressing after opening.
 
 ### 1.4. Relationship to Adjacent Components
@@ -1002,8 +1006,9 @@ names. Readers MUST ignore unknown keys in `metadata_preservation_data`
 (reserved for future revisions; third-party data lives under `ext`,
 Section 4.7.5).
 
-An entry with no preserved xattrs MUST carry an empty
-`metadata_preservation_data` map. A hardlink entry MUST carry an empty map;
+An entry with no preserved xattrs MUST NOT carry an `xattrs` key. An entry
+with neither preserved xattrs nor an extension container (Section 4.7.5)
+MUST carry an empty `metadata_preservation_data` map. A hardlink entry MUST carry an empty map;
 the shared file's restored xattrs come from the regular-file primary named by
 `link_target`. Ownership, ACLs as a separate REM-OBJECT semantic, and mode bits beyond
 `executable` remain outside this format. `mtime` is already represented by the
@@ -1302,8 +1307,10 @@ hardlink row (`null`/`0`) cannot support conformant restore of that name.
 
 ### 6.1. Range Validation
 
-Given a file with size `Z` and a requested range `[s, s + n)`: if `n = 0` the
-result is the empty range set. Otherwise the Restorer MUST validate
+Given a file with size `Z` and a requested range `[s, s + n)`: if `n = 0`
+the result is the empty range set, provided `s` is itself within the file
+(`s ≤ Z`); a zero-length request at an out-of-range offset is rejected like
+any other out-of-range request. Otherwise the Restorer MUST validate
 `s + n ≤ Z` with checked arithmetic before applying any formula below; the
 formulas are defined only for validated, non-empty ranges.
 
@@ -1747,7 +1754,7 @@ a **combined non-`user.` attribute and `ext` member** with the two-array
 inventory pinned exactly. For each, the
 manifest pins the exact full object byte stream, or for large vectors
 `full_object_sha256` plus either the first object block bytes or
-`first_block_sha256`, `projected_size_blocks`, every entry's
+`first_block_sha256`, `stored_size_blocks`, every entry's
 `(pax_header_offset, data_offset, first_chunk_lba, chunk_count, pad_spaces)`,
 the manifest CBOR bytes, and `manifest_sha256`.
 
@@ -1946,16 +1953,16 @@ extension containers only and MUST NOT appear as pax keywords.
 - [REMPARITY] — "Rem Tape Parity (REM-PARITY) Format", Version 1.0 or any
   later 1.x revision (interchangeable for this document's purposes by
   REM-PARITY's own change policy); this revision was published against
-  REM-PARITY 1.0.1. Companion specification: the parity layer of Sections
+  REM-PARITY 1.0.0. Companion specification: the parity layer of Sections
   8.2 and 9. Normative only for implementations of the Section 8.2 tape
   binding.
-- [REMENCRYPT] — "REM-ENCRYPT", Version 1.0 or any later 1.x revision (published against 1.0.1), companion specification defining the
+- [REMENCRYPT] — "REM-ENCRYPT", Version 1.0 or any later 1.x revision (published against 1.0.0), companion specification defining the
   encrypted representation named by this document.
 
 ### 16.2. Informative References
 
 - [PREMIS] — PREMIS Editorial Committee, "PREMIS Data Dictionary for
-  Preservation Metadata", Version 3.0, November 2015, Library of Congress,
+  Preservation Metadata", Version 3.0, June 2015, Library of Congress,
   <https://www.loc.gov/standards/premis/v3/>.
 - [OAIS] — Consultative Committee for Space Data Systems, "Reference Model for
   an Open Archival Information System (OAIS)", CCSDS 650.0-M-3, Issue 3,
@@ -2023,22 +2030,29 @@ an extra wrapper. Such a wrapper would break standard-`tar`
 extractability — the plaintext copy's reason to exist — in exchange for
 framing the stream already provides (self-description, digests).
 
+## Appendix C. Revision History (Informative)
+
+Entries are newest first: date · version · kind (erratum / minor / major) ·
+effect on conformance. Milestones that predate the first published revision
+are marked `[draft]`; the change policy of the Status section governs only
+the revisions that follow the first published one.
+
+- **2026-07-31 — 1.0.0 — first published revision.** The specification is
+  final as of this revision, and the change policy in the Status section
+  governs everything after it. Relative to the review draft published on
+  2026-07-25, this revision replaces the draft Status text with the shared
+  three-question change policy, records the per-document concept and
+  revision DOIs (the earlier deposit was a software release, and its DOI is
+  now carried as an informative row only), restates the dependency on REM-PARITY as stability against the 1.x line, reclassifies Section 14's vector-change rule from erratum to revision, de-couples the Section 4.4.3 and Section 10 wording from document minors, warns explicitly against confusing the stream-schema numeral with the document version, and adds the worked classifications, the bytes-to-defining-revision lookup paragraph and the vectors-are-anchors rule.
+- **2026-07-25 — [draft] review draft published.** The document as it then
+  stood was distributed inside software release v1.0.0
+  (Zenodo 10.5281/zenodo.21551571, software concept DOI
+  10.5281/zenodo.21551570) as a working draft published for review, not as a
+  revision of a frozen format.
+
 ## Author's Address
 
 The ArchiveTech Project
 Website: https://archivetech.org
 Email: specs@archivetech.org
 Reference implementation: https://github.com/archivetechie/remanence
-
-## Appendix C. Revision History (Informative)
-
-Entries are newest first: date · version · kind (erratum / minor / major) ·
-effect on conformance.
-
-- **2026-07-31 — 1.0.1 — erratum, including a flagged policy correction.** The previous Status text permitted minors to "add optional keys and nothing else", narrower than Section 10's own extension machinery; the shared policy widens it, and that widening is the policy correction. Status of This Document rewritten to the
-  shared three-question change policy (see Status); DOI rows corrected — the
-  software deposit's DOI is informative, and the false "Version DOI (this
-  release)" row removed; dependency on REM-PARITY restated as stability against the 1.x line; Section 14's vector-change rule reclassified from erratum to revision; the Section 4.4.3 and Section 10 wording de-coupled from document minors, with the stream-schema/document-version numeral collision warned against explicitly. No object becomes valid or invalid and no
-  implementation obligation changes.
-- **2026-07-25 — 1.0.0 — first publication.** Archived with software release
-  v1.0.0 (Zenodo concept DOI 10.5281/zenodo.21551570).

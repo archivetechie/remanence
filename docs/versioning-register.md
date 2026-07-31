@@ -41,9 +41,10 @@ documents and published artifacts themselves.
   a revision counter and **not** the document's version.
 - **Where.** Two bytes at offset 0x0A of every bootstrap block. Normative:
   REM-PARITY §8.1; its registry is §8.1.1.
-- **Current values.** The registry assigns: `2` — object rows carry no
-  `object_id` requirement; `3` (current) — `object_id` is required in every
-  object row. Published test vectors legitimately carry both, because the
+- **Current values.** The registry assigns: `0`–`1` — historic
+  pre-publication values, absent from the published vectors; `2` — object
+  rows carry no `object_id` requirement; `3` (current) — `object_id` is
+  required in every object row. Published test vectors legitimately carry both, because the
   field advanced while they were generated; all are conformant.
 - **Unknown value.** Readers accept any value. This is safe because
   unknown bootstrap payload keys are ignorable by rule (§5.3), so a
@@ -76,8 +77,10 @@ documents and published artifacts themselves.
   identity, and so on). The set of assigned numbers is a vocabulary that
   can grow.
 - **Where.** REM-PARITY §8.2.1.
-- **Current values.** Keys 1–4, 10–13, 21–23, 30 are assigned; key 4
-  (`object_id`) is required from `schema_minor` 3.
+- **Current values.** Row keys 1–4, 10–13 and 21–23 are assigned; key 4
+  (`object_id`) is required from `schema_minor` 3. (Key 30 is not a row key:
+  it is the bootstrap *payload* key of §8.2 that carries the array of these
+  rows.)
 - **Unknown value.** Readers MUST ignore unknown integer keys — this is
   the format's main extension mechanism.
 - **How it changes.** A minor revision may assign new keys. A new key MUST
@@ -117,7 +120,8 @@ documents and published artifacts themselves.
 
 - **What it is.** Every structure announces itself with magic bytes, and
   each magic ends in a version byte: `"REM\0BOO\x01"`, `"REM\0PAR\x01"`,
-  `"REM\0PARFOOT\x01"`, `"REM\0PMAP\x01"`, `"REM\0PMAPFOOT\x01"`.
+  `"REM\0PARFOOT\x01"` and `"REM\0PMAP\x01"`. The sidecar has distinct
+  header and footer labels; the parity map has one label for both.
 - **Where.** REM-PARITY §2.5. Sidecar and parity-map magics are further
   keyed to the individual tape by HMAC, so structures cannot migrate
   between tapes.
@@ -285,8 +289,9 @@ documents and published artifacts themselves.
 
 - **What.** Three normative specifications and one informative companion,
   each independently versioned major.minor.errata.
-- **Current.** REM-PARITY 1.0.1, REM-OBJECT Core 1.0.1, REM-ENCRYPT
-  1.0.1, companion 1.0.1.
+- **Current.** REM-PARITY 1.0.0, REM-OBJECT Core 1.0.0, REM-ENCRYPT 1.0.0,
+  companion 1.0.0 — the first published revisions; earlier public text was a
+  review draft.
 - **How they change.** The three-question policy in each document's Status
   section — the subject of [versioning-explained.md](versioning-explained.md).
   Titles and filenames carry the major line only; each revision is

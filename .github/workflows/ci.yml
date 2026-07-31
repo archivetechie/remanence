@@ -55,6 +55,11 @@ jobs:
       - name: Verify REM-OBJECT vectors and plaintext interop
         run: python3 tools/verify_rem_object_vectors_independent.py --check-plaintext-interop
 
+      - name: Verify publication vectors and specification consistency
+        run: |
+          python3 tools/verify_publication_test_vectors.py
+          python3 tools/check_spec_versioning.py
+
   fuzz-corpus-replay:
     name: scheduled fuzz corpus replay
     runs-on: ubuntu-latest

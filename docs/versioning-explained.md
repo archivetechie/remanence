@@ -223,9 +223,9 @@ apply to the tapes written under it.
 
 Every document's version has three parts, always: **major.minor.errata**.
 
-- **1.0.0** — the first published revision of the 1.0 line.
-- **1.0.1** — the same rules, better text. (This is where the documents
-  stand today.)
+- **1.0.0** — the first published revision of the 1.0 line. (This is where
+  the documents stand today.)
+- **1.0.1** — the same rules, better text.
 - **1.1.0** — the format gained something, under the three conditions.
 - **2.0.0** — a different format, in a separate document, coexisting with
   version 1 rather than replacing it.
@@ -318,7 +318,7 @@ the archive, says which values are current
 Here is the part that surprises people, and the reason it should not.
 
 Nothing on a tape records "I was written under specification revision
-1.0.1." We considered it, and rejected it, for a simple reason: **you never
+1.0.0." We considered it, and rejected it, for a simple reason: **you never
 need it to read the tape.** Promise two says any future reader reads any
 older tape, and the conditions on minor revisions say any older reader
 handles any newer tape correctly or refuses it cleanly by feature name. In
@@ -379,7 +379,7 @@ What happens?
 
 Step 4 is also why the specifications are archived *separately* from the
 software. The code is useful; but the promise is carried by the documents,
-and they get their own permanent records so that citing "REM-PARITY 1.0.1"
+and they get their own permanent records so that citing "REM-PARITY 1.0.0"
 means one exact, immutable text.
 
 ## Why three documents, and how they refer to each other
@@ -392,7 +392,7 @@ They do cite each other, and the citations are written to survive
 revisions. Each reference says, in effect: "version 1.0 *or any later 1.x
 revision* — interchangeable for our purposes, because of the promises
 above — and for the record, this text was published against revision
-1.0.1." The first half means a small revision in one document never forces
+1.0.0." The first half means a small revision in one document never forces
 paper churn in the other two. The second half preserves the historical
 fact of exactly which text sat beside which.
 

@@ -91,7 +91,7 @@ and catalog on the platform crates without inheriting Remanence's formats.
 <!-- code-anchor: crates/remanence-format/src/lib.rs crates/remanence-parity/src/lib.rs crates/remanence-aead/src/lib.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/header.rs crates/remanence-format-driver/src/lib.rs crates/remanence-stream/src/lib.rs crates/remanence-bru/src/lib.rs crates/remanence-crc/src/lib.rs @ 8de2c46 -->
 ## Layer 3: formats and parity
 
-Six crates share this layer:
+Seven crates share this layer:
 
 - `remanence-format` implements `rem-object-v1`, the native body format: one pax
   tar archive per stored object, chunk-aligned, self-describing, with a
@@ -147,7 +147,7 @@ operator config, an advisory state lock, the append-only audit log, and
 the SQLite catalog. The catalog is explicitly a projection —
 `rebuild_index_from_journals` replays the audit log and per-tape
 journals to regenerate it, and opening it read-only refuses to migrate.
-Schema version 12 today, tracked in SQLite's `user_version`, with tables
+Schema version 14 today, tracked in SQLite's `user_version`, with tables
 for tapes, pools, tape files, objects/copies/files, catalog units,
 sessions, operations, idempotency keys, media-readiness records,
 tape-I/O fences, and the drive-stewardship set (drives, events, health
