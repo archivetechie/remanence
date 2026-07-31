@@ -5,7 +5,7 @@
 | | |
 | --- | --- |
 | Status | Final |
-| Version | 1.0 |
+| Version | 1.0.1 |
 | Date | 2026-07-31 |
 | License | CC-BY-4.0 |
 | Concept DOI (all versions) | [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) |
@@ -24,11 +24,32 @@ implementation, so "final" here is our own undertaking and not anyone else's
 approval. That is worth saying plainly, because the word usually implies a
 committee somewhere, and in this case there is none.
 
-The undertaking is deliberately narrow, so that it can be checked. We will not
-make a normative change to this document. We will correct errata that do not
-alter which tapes are valid. Anything beyond that takes a new major version and
-a new document. A tape written against this specification will therefore still
-be read correctly by an implementation built from any later revision of it.
+The undertaking is deliberately narrow, so that it can be checked. Revisions of
+this document come in three kinds, and only the first two can happen under
+version 1.
+
+**Errata — 1.0.1, 1.0.2 and so on.** Typos, dead cross-references, and
+clarifications that resolve an ambiguity the way conformant implementations
+already behave. Nothing an implementation does has to change, and no tape
+becomes newly valid or newly invalid.
+
+**Minor revisions — 1.1, 1.2 and so on.** These add optional integer keys under
+the extension rule of Section 5.3, and nothing else. Every tape written under an
+earlier 1.x stays valid, and a reader built from an earlier 1.x still reads the
+newer tapes correctly, because unknown keys are ignored. We set `schema_minor`
+to the document's minor version so that a tape records which revision wrote it;
+readers are not required to look at it.
+
+**A new major version — 2.0.** Anything that changes the meaning of an existing
+field, removes one, or could stop an existing tape being read. That takes a new
+`schema_major` or new magic and a separate document. Tapes written under version
+1 keep working with version 1 readers; the two formats simply coexist.
+
+A tape written against this specification will therefore still be read correctly
+by an implementation built from any later revision of it.
+
+Errata are raised as issues on the project repository. Each published revision is
+archived with its own DOI under the concept DOI above and recorded in Appendix D.
 
 The conformance and freeze criteria set out in Section 18 are discharged, and
 the items collected in Appendix C are closed. This document remains the
@@ -2371,6 +2392,14 @@ tape and does not change any REM-PARITY media byte.
    plaintext and encrypted REM-OBJECT objects, demonstrated before format freeze.
 
 ## Appendix D. Revision History (Informative)
+
+- **2026-07-31 — 1.0.1, first erratum.** Status of This Document rewritten:
+  states that no standards body has reviewed or adopted this specification, and
+  sets out the three kinds of revision permitted (errata, minor additions under
+  the Section 5.3 extension rule, new major version). The previous wording
+  forbade any normative change under version 1, which contradicted Section 5.3's
+  1.x extension mechanism. Editorial only; the set of valid tapes is unchanged
+  and no implementation obligation is added or removed.
 
 - **2026-06-11 — first draft.** Initial publication baseline, archived with
   release v1.0.0.
