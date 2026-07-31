@@ -2649,12 +2649,12 @@ governs only the revisions that follow the first published one.
   bootstrap re-typing promoted from SHOULD to MUST with operational
   candidate criteria (Section 12.4) — reader-obligation changes with no
   effect on the set of valid tapes; Appendix C items 3 and 4 resolved.
-- **2026-07-25 — [draft] review draft published.** The document as it then
-  stood — marked "Draft for review", dated 2026-06-11 — was distributed
-  inside software release v1.0.0 (Zenodo 10.5281/zenodo.21551571, under the
-  software concept DOI 10.5281/zenodo.21551570). It was a working draft
-  published for review, not a revision of a frozen format, and it named
-  Section 18 as the criteria still to be met. The vector archive current at
+- **2026-07-25 — pre-release copy.** A copy of this document, marked "Draft
+  for review" and dated 2026-06-11, was distributed inside software release
+  v1.0.0 (Zenodo 10.5281/zenodo.21551571, a *software* record). It was not
+  deposited or citable as a document, carried no DOI of its own, and was
+  reachable only by unpacking the source archive. It named Section 18 as the
+  criteria still to be met. The vector archive current at
   that time was `b9be8760…`; the archive pinned by the first published
   revision is `77be73e7…`, which adds the REM-OBJECT object-row vectors and
   the independent re-derivation tool without altering any pre-existing

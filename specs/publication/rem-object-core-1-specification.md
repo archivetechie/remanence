@@ -31,7 +31,7 @@ representation, the parity relationship, and conformance, owned here).
 | | |
 | --- | --- |
 | Status | Review draft |
-| Version | 1.0.1-draft.1 |
+| Version | 1.0.0-draft.1 |
 | Date | 2026-07-31 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719158](https://doi.org/10.5281/zenodo.21719158) |
@@ -2049,23 +2049,25 @@ framing the stream already provides (self-description, digests).
 Entries are newest first: date · version · kind (erratum / minor / major) ·
 effect on conformance.
 
-- **2026-07-31 — 1.0.1-draft.1 — review draft of an erratum.** Published for
-  public review; not yet frozen. Relative to version 1.0 this revision
-  introduces the Status section's change policy — which version 1.0 did not
-  carry in any form — records the per-document concept DOI (version 1.0 was
-  distributed inside a software release, whose DOI identified the software),
-  adds this revision history, and restates the dependency on REM-PARITY as stability against the 1.x line, reclassifies Section 14's vector-change rule from erratum to revision, de-couples the Section 4.4.3 and Section 10 wording from document minors, warns explicitly against confusing the stream-schema numeral with the document version, narrows the Section 4.7.3 empty-map requirement so it no longer forbids the extension container its own schema permits, rebuilds the Table of Contents so a renderer cannot silently renumber it around the deliberate Section 5 gap, and adds the worked classifications, the bytes-to-defining-revision lookup paragraph and the vectors-are-anchors rule.
+- **2026-07-31 — 1.0.0-draft.1 — review draft.** The first revision of this
+  document published under its own identifier, and the first offered for public
+  review. Comments close 30 April 2027; the document freezes 31 July 2027.
 
-  No object written under version 1.0 is affected, and no published vector
-  changed. The corrections restore agreement between this text and the
-  implementation and vectors it describes; where they touch a wire statement,
-  the statement as published could not be satisfied by any implementation that
-  also read a conformant object, so no conformant implementation loses
-  anything.
-- **2026-07-25 — 1.0 — published.** Distributed as a publication specification
-  inside software release v1.0.0 (Zenodo 10.5281/zenodo.21551571, software
-  concept DOI 10.5281/zenodo.21551570). It carried no change policy, no
-  revision history and no DOI of its own.
+  Text substantially the same as the copy distributed on 2026-07-25 (below),
+  with these changes: it introduces the Status section's change policy — which
+  the earlier copy did not carry in any form — records this document's concept
+  DOI, adds this revision history, and restates the dependency on REM-PARITY as stability against the 1.x line, reclassifies Section 14's vector-change rule from erratum to revision, de-couples the Section 4.4.3 and Section 10 wording from document minors, warns explicitly against confusing the stream-schema numeral with the document version, narrows the Section 4.7.3 empty-map requirement so it no longer forbids the extension container its own schema permits, rebuilds the Table of Contents so a renderer cannot silently renumber it around the deliberate Section 5 gap, and adds the worked classifications, the bytes-to-defining-revision lookup paragraph and the vectors-are-anchors rule.
+
+  No object written against the earlier copy is affected, and no published
+  vector changed. Where a correction touches a wire statement, the statement as
+  written could not be satisfied by any implementation that also read a
+  conformant object, so no conformant implementation loses anything.
+- **2026-07-25 — pre-release copy.** A copy of this document was distributed
+  inside software release v1.0.0 (Zenodo 10.5281/zenodo.21551571, a *software*
+  record). It was not deposited or citable as a document: it carried no DOI of
+  its own — its metadata table read "DOI: assigned at first release" — no
+  change policy and no revision history, and it was reachable only by
+  unpacking the source archive.
 
 ## Author's Address
 
