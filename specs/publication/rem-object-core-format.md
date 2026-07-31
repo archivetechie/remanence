@@ -7,6 +7,7 @@
 | Identifier | Value | Scope |
 | --- | --- | --- |
 | Document version | 1.0 | This publication only |
+| Concept DOI (all revisions of this document) | [10.5281/zenodo.21719158](https://doi.org/10.5281/zenodo.21719158) | This publication |
 | Reference implementation DOI (informative) | [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) | Software deposit, Apache-2.0 |
 | Stream format identifier | `rem-object-v1` | Frozen plaintext-stream wire constant |
 | Stream schema version | `1.0` without preserved xattrs; `1.1` with preserved xattrs | `REMANENCE.schema_version` |
@@ -33,6 +34,8 @@ representation, the parity relationship, and conformance, owned here).
 | Version | 1.0.1 |
 | Date | 2026-07-31 |
 | License | CC-BY-4.0 |
+| Concept DOI (all revisions of this document) | [10.5281/zenodo.21719158](https://doi.org/10.5281/zenodo.21719158) |
+| DOI of this revision | [10.5281/zenodo.21719159](https://doi.org/10.5281/zenodo.21719159) |
 | Reference implementation (informative) | Zenodo concept DOI [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) — software deposit, Apache-2.0 |
 
 This document is the publication specification for the REM-OBJECT Core
@@ -79,6 +82,19 @@ Version numbers are always three-part. The Identifiers table at the head of
 this document names the major.minor line; the Version row in this section is
 the full revision. Section 10 owns the wire-versioning machinery — the stream `format_id`, the `REMANENCE.schema_version` feature gate, and the manifest schema integer; this policy defers to it and does not paraphrase it. Every published revision of this document is
 archived with its own DOI and recorded in the Revision History appendix.
+
+For orientation, the classifications most likely to be proposed for this
+format (informative): a new optional `REMANENCE.*` keyword, manifest key, or
+extension-container member — minor; a change to any existing field's
+meaning, or a new stream `format_id` — major. To identify what defines an
+object in hand: read `REMANENCE.format_id`, `REMANENCE.schema_version` and
+the manifest `schema_version` (Section 10 names each value's defining
+revision); every revision of this document is retrievable through the
+concept DOI above. Which revision wrote an object is not recorded in it and
+is not needed for reading. The Section 13 conformance vectors are anchors of
+the revision that generated them; a future revision that needs new vectors
+publishes its own archive and cites it by name, DOI and digest, and never
+re-pins an earlier one.
 
 The tape binding depends normatively on the REM-PARITY specification
 ([REMPARITY]), which is final. The tape-binding clauses of this document
@@ -1933,7 +1949,7 @@ extension containers only and MUST NOT appear as pax keywords.
   REM-PARITY 1.0.1. Companion specification: the parity layer of Sections
   8.2 and 9. Normative only for implementations of the Section 8.2 tape
   binding.
-- [REMENCRYPT] — "REM-ENCRYPT 1.0", companion specification defining the
+- [REMENCRYPT] — "REM-ENCRYPT", Version 1.0 or any later 1.x revision (published against 1.0.1), companion specification defining the
   encrypted representation named by this document.
 
 ### 16.2. Informative References
@@ -2019,7 +2035,7 @@ Reference implementation: https://github.com/archivetechie/remanence
 Entries are newest first: date · version · kind (erratum / minor / major) ·
 effect on conformance.
 
-- **2026-07-31 — 1.0.1 — erratum.** Status of This Document rewritten to the
+- **2026-07-31 — 1.0.1 — erratum, including a flagged policy correction.** The previous Status text permitted minors to "add optional keys and nothing else", narrower than Section 10's own extension machinery; the shared policy widens it, and that widening is the policy correction. Status of This Document rewritten to the
   shared three-question change policy (see Status); DOI rows corrected — the
   software deposit's DOI is informative, and the false "Version DOI (this
   release)" row removed; dependency on REM-PARITY restated as stability against the 1.x line; Section 14's vector-change rule reclassified from erratum to revision; the Section 4.4.3 and Section 10 wording de-coupled from document minors, with the stream-schema/document-version numeral collision warned against explicitly. No object becomes valid or invalid and no
