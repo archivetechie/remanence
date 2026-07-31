@@ -75,9 +75,9 @@ There are three possibilities, and only two are acceptable:
    format is deliberately built to make it possible: most new features are
    carried in places old readers are instructed to ignore.
 2. The old reader cannot use the tape — but it says so clearly: "this tape
-   uses feature such-and-such, which I do not implement; obtain newer
-   software." The person standing at the drive knows exactly what is wrong
-   and exactly what to do.
+   uses feature number 2, which I do not implement; obtain newer software."
+   The person standing at the drive knows exactly what is wrong and exactly
+   what to do.
 3. The old reader gets confused. It misreads the tape, or worse, reports
    that the tape is blank or damaged when it is actually fine.
 
@@ -137,9 +137,25 @@ A minor revision is allowed only if:
    software. New software must not sprinkle tapes with things that break
    old readers for no reason.
 3. **When an older reader does meet a feature it lacks, it recognises the
-   situation and refuses cleanly** — with an error that names the missing
-   feature — rather than misreading anything or mistaking the tape for a
-   damaged one. Outcome two from the story above, never outcome three.
+   situation and refuses cleanly** — with an error that names the
+   unimplemented value it found — rather than misreading anything or
+   mistaking the tape for a damaged one. Outcome two from the story above,
+   never outcome three.
+
+A fair question at this point: how can old software name a feature that did
+not exist when the software was written? It cannot, and it does not need
+to. What the format fixes in advance is not the features but the *places
+where feature numbers live* — a handful of fields at known positions, set
+aside on day one. An old reader always knows where to look and what kind of
+number it is looking at, even when it has never seen the particular value.
+So it reports the number: "algorithm 2, not implemented here." The number
+alone is enough, because every specification carries a registry — a
+permanent table mapping each value ever assigned to its meaning and to the
+document revision that defined it. The software names the number; the
+registry, looked up later by a person, turns the number into a name. This
+is also the real reason the block-size case (below) must be a major: a tape
+at an unknown block size offers the old reader no field it can read at all,
+so there is no number to report, and no clean refusal is possible.
 
 Two real examples show how these conditions decide cases that look similar
 on the surface but are opposites underneath.
