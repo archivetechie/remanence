@@ -304,6 +304,7 @@ mod tests {
                 map_total_data_ordinals: 4,
                 highest_protected_ordinal: 4,
             },
+            sidecar_directory: None,
         };
         let boundary = DurableBoundaryState::from_scoped_map(&scoped)
             .expect("prefix boundary derives from scoped map");
@@ -325,6 +326,7 @@ mod tests {
                 map_total_data_ordinals: 0,
                 highest_protected_ordinal: 0,
             },
+            sidecar_directory: None,
         };
         let zero_boundary = DurableBoundaryState::from_scoped_map(&zero_prefix)
             .expect("zero prefix derives an empty durable boundary");

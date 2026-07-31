@@ -243,8 +243,12 @@ pub fn acquire_filemark_map_with_report(
 
     if let Some(catalog) = catalog_map {
         validate_catalog_scope(&catalog, authoritative_bootstrap)?;
+        // REM-PARITY 13.3 step 3 needs the authoritative directory to place the
+        // tail-copy read; it comes from the same validated bootstrap that
+        // authorised this scope.
         let scoped_map =
-            ScopedFilemarkMap::from_catalog(catalog.map, catalog.highest_protected_ordinal);
+            ScopedFilemarkMap::from_catalog(catalog.map, catalog.highest_protected_ordinal)
+                .with_sidecar_directory(authoritative_bootstrap.sidecar_epoch_directory.clone());
         return filemark_map_scan_result(
             scoped_map,
             None,
@@ -409,7 +413,8 @@ fn validate_scan_hypothesis(
         authoritative_bootstrap,
     )?;
     let fencing_digest = overlay.fencing_digest.as_ref().unwrap_or(digest);
-    let scoped_map = ScopedFilemarkMap::validate_against_digest(overlay.map, fencing_digest)?;
+    let scoped_map = ScopedFilemarkMap::validate_against_digest(overlay.map, fencing_digest)?
+        .with_sidecar_directory(overlay.sidecar_directory);
     Ok(ValidatedScanHypothesis {
         scoped_map,
         parity_map_content_conflicts: overlay.parity_map_content_conflicts,
@@ -928,6 +933,9 @@ struct AuthoritativeDirectoryOverlay {
     fencing_digest: Option<FilemarkMapDigest>,
     parity_map_content_conflicts: Vec<ParityMapContentConflict>,
     source: ScanOverlaySource,
+    /// The directory this overlay was built from, when there was one. Carried
+    /// so the recovery path can run the REM-PARITY 13.3 step 3 tail rescue.
+    sidecar_directory: Option<SidecarEpochDirectory>,
 }
 
 struct ValidatedParityMapCandidate {
@@ -973,6 +981,7 @@ fn apply_authoritative_directory_overlay(
             fencing_digest: None,
             parity_map_content_conflicts: Vec::new(),
             source: ScanOverlaySource::BootstrapInlineDirectory,
+            sidecar_directory: Some(directory.clone()),
         });
     }
 
@@ -991,6 +1000,7 @@ fn apply_authoritative_directory_overlay(
                 fencing_digest: None,
                 parity_map_content_conflicts: Vec::new(),
                 source: ScanOverlaySource::ReferencedParityMap,
+                sidecar_directory: Some(directory.clone()),
             });
         }
         Some(reference)
@@ -1014,6 +1024,8 @@ fn apply_authoritative_directory_overlay(
             fencing_digest: None,
             parity_map_content_conflicts: Vec::new(),
             source: ScanOverlaySource::ParityMapReferenceProjection,
+            // A reference whose target could not be read yields no directory.
+            sidecar_directory: None,
         });
     }
 
@@ -1022,6 +1034,7 @@ fn apply_authoritative_directory_overlay(
         fencing_digest: None,
         parity_map_content_conflicts: Vec::new(),
         source: ScanOverlaySource::StructuralWalk,
+        sidecar_directory: None,
     })
 }
 
@@ -1111,6 +1124,7 @@ fn select_structurally_discovered_parity_map(
     let selected = validated_candidates.swap_remove(chosen_index);
     Ok(Some(AuthoritativeDirectoryOverlay {
         fencing_digest: Some(selected.fencing_digest()),
+        sidecar_directory: Some(selected.decoded.payload.directory.clone()),
         map: selected.overlayed_map,
         parity_map_content_conflicts,
         source: ScanOverlaySource::StructurallySelectedParityMap,

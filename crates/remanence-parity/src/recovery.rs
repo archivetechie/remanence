@@ -903,7 +903,7 @@ fn read_and_parse_sidecar_index(
     ) {
         Ok(block) => block,
         Err(_err) => {
-            return read_primary_sidecar_index_without_footer(
+            return read_sidecar_index_without_footer(
                 source,
                 scoped_map,
                 sidecar_entry,
@@ -915,7 +915,7 @@ fn read_and_parse_sidecar_index(
     let footer = match parse_sidecar_footer_block(&footer_block, tape_uuid) {
         Ok(footer) => footer,
         Err(_err) => {
-            return read_primary_sidecar_index_without_footer(
+            return read_sidecar_index_without_footer(
                 source,
                 scoped_map,
                 sidecar_entry,
@@ -928,7 +928,7 @@ fn read_and_parse_sidecar_index(
         // REM-PARITY 13.3 step 2: a footer that parses but contradicts the map
         // entry is treated as an invalid footer, not as a hard stop — the same
         // fall-through the unreadable and unparseable branches above take.
-        return read_primary_sidecar_index_without_footer(
+        return read_sidecar_index_without_footer(
             source,
             scoped_map,
             sidecar_entry,
@@ -969,10 +969,148 @@ fn read_and_parse_sidecar_index(
             index: tail,
             metadata_health: SidecarMetadataHealth::PrimaryHeaderLost,
         }),
-        (Err(_primary_err), Err(_tail_err)) => Err(ParityError::SidecarMetadataUnavailable {
+        // REM-PARITY 13.3 step 4: metadata-unavailable only when no header/index
+        // copy can be validated. With both copies unreadable through the footer's
+        // own locators, the directory is the last witness that can place a read.
+        (Err(_primary_err), Err(_tail_err)) => rescue_tail_sidecar_index_with_directory(
+            source,
+            scoped_map,
+            sidecar_entry,
+            tape_uuid,
+            block_size,
+        )
+        .map_err(|_| ParityError::SidecarMetadataUnavailable {
             epoch_id: footer.epoch_id,
         }),
     }
+}
+
+/// Acquire a sidecar index when the footer is unusable.
+///
+/// REM-PARITY 13.3: the primary header copy is tried first; if it cannot be
+/// read or validated, step 3's directory-assisted tail rescue locates the tail
+/// metadata copy from the authoritative sidecar epoch directory. The epoch is
+/// declared metadata-unavailable only when no header/index copy can be
+/// validated (step 4).
+fn read_sidecar_index_without_footer(
+    source: &mut dyn RawTapeSource,
+    scoped_map: &ScopedFilemarkMap,
+    sidecar_entry: &TapeFileMapEntry,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+) -> Result<SidecarIndexRead, ParityError> {
+    let primary_err = match read_primary_sidecar_index_without_footer(
+        source,
+        scoped_map,
+        sidecar_entry,
+        tape_uuid,
+        block_size,
+    ) {
+        Ok(read) => return Ok(read),
+        Err(err) => err,
+    };
+    match rescue_tail_sidecar_index_with_directory(
+        source,
+        scoped_map,
+        sidecar_entry,
+        tape_uuid,
+        block_size,
+    ) {
+        Ok(read) => Ok(read),
+        // The rescue is only available when a directory is present and agrees;
+        // when it is not, the primary attempt's error is the honest answer.
+        Err(_) => Err(primary_err),
+    }
+}
+
+/// REM-PARITY 13.3 step 3. The directory records, per sidecar, the total block
+/// count, the header/index copy block count `H` and the canonical metadata hash
+/// shared by both copies. The tail copy begins at block `H`, so the directory
+/// both locates it and supplies the hash that validates it — which is what makes
+/// the rescue possible with the primary header and the footer both gone.
+fn rescue_tail_sidecar_index_with_directory(
+    source: &mut dyn RawTapeSource,
+    scoped_map: &ScopedFilemarkMap,
+    sidecar_entry: &TapeFileMapEntry,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+) -> Result<SidecarIndexRead, ParityError> {
+    let directory = scoped_map
+        .sidecar_directory
+        .as_ref()
+        .ok_or_else(|| sidecar_metadata_unavailable_from_map_entry(sidecar_entry))?;
+    let entry = directory
+        .entries
+        .iter()
+        .find(|entry| entry.tape_file_number == sidecar_entry.tape_file_number)
+        .ok_or_else(|| sidecar_metadata_unavailable_from_map_entry(sidecar_entry))?;
+
+    // The directory is an independent witness, so it must agree with the map
+    // before it is trusted to place a read.
+    if entry.sidecar_total_block_count != sidecar_entry.block_count {
+        return Err(ParityError::SidecarParse(format!(
+            "sidecar directory total {} does not match map block_count {}",
+            entry.sidecar_total_block_count, sidecar_entry.block_count
+        )));
+    }
+    let h = u64::from(entry.sidecar_header_block_count);
+    let parity = u64::from(entry.parity_shard_block_count);
+    if h == 0 {
+        return Err(ParityError::SidecarParse(
+            "sidecar directory records a zero header block count".into(),
+        ));
+    }
+    // Section 9.1 layout: primary 0..H-1, parity shards H..H+P-1, tail copy
+    // H+P..2H+P-1, footer at 2H+P. The directory carries both H and P, which is
+    // what lets the tail be located with the primary header and footer gone.
+    let tail_start = h
+        .checked_add(parity)
+        .ok_or(ParityError::Invariant("sidecar tail copy start overflows"))?;
+    let tail_end = tail_start
+        .checked_add(h)
+        .ok_or(ParityError::Invariant("sidecar tail copy range overflows"))?;
+    let expected_total = tail_end
+        .checked_add(1)
+        .ok_or(ParityError::Invariant("sidecar total overflows"))?;
+    if expected_total != sidecar_entry.block_count {
+        return Err(ParityError::SidecarParse(format!(
+            "sidecar directory geometry 2H+P+1 = {expected_total} does not match \
+             map block_count {}",
+            sidecar_entry.block_count
+        )));
+    }
+
+    let mut blocks = Vec::with_capacity(entry.sidecar_header_block_count as usize);
+    for offset in 0..h {
+        blocks.push(read_sidecar_block(
+            source,
+            scoped_map,
+            sidecar_entry,
+            tail_start + offset,
+            block_size,
+        )?);
+    }
+    let decoded = parse_sidecar_index_blocks(&blocks, tape_uuid)?;
+    if decoded.header.copy_kind != SidecarCopyKind::Tail {
+        return Err(ParityError::SidecarParse(
+            "sidecar tail rescue decoded a non-tail copy".into(),
+        ));
+    }
+    if decoded.header.canonical_metadata_hash != entry.canonical_metadata_hash {
+        return Err(ParityError::SidecarParse(
+            "sidecar tail copy metadata hash does not match the directory".into(),
+        ));
+    }
+    if decoded.header.sidecar_total_block_count != sidecar_entry.block_count {
+        return Err(ParityError::SidecarParse(format!(
+            "sidecar tail copy total {} does not match map block_count {}",
+            decoded.header.sidecar_total_block_count, sidecar_entry.block_count
+        )));
+    }
+    Ok(SidecarIndexRead {
+        index: decoded,
+        metadata_health: SidecarMetadataHealth::PrimaryHeaderLost,
+    })
 }
 
 fn read_primary_sidecar_index_without_footer(
@@ -2270,6 +2408,58 @@ mod tests {
             err,
             ParityError::SidecarMetadataUnavailable { epoch_id: 0 }
         ));
+    }
+
+    /// REM-PARITY 13.3 step 3: with the primary header and the footer both lost,
+    /// the authoritative sidecar epoch directory locates the tail metadata copy
+    /// (it begins at block H) and supplies the canonical metadata hash that
+    /// validates it. Before this was implemented the epoch was declared
+    /// metadata-unavailable while a perfectly good tail copy sat on the tape —
+    /// which is the behaviour the published `sidecar-footer-and-primary`
+    /// damage-matrix vector asserts must not happen.
+    #[test]
+    fn sidecar_primary_and_footer_damage_is_rescued_by_the_directory() {
+        let scheme = scheme(2, 1, 2);
+        let object_blocks = vec![block(1), block(2), block(3), block(4)];
+        let sidecar = sidecar_for_epoch(&scheme, &object_blocks);
+        let mut sidecar_blocks = sidecar.blocks.clone();
+        sidecar_blocks[0][0] ^= 0xFF; // primary header copy
+        let footer_index = sidecar_blocks
+            .len()
+            .checked_sub(1)
+            .expect("sidecar has a footer block");
+        sidecar_blocks[footer_index][0] ^= 0xFF; // footer
+
+        let directory = crate::parity_map::SidecarEpochDirectory {
+            directory_scope_tape_file_count: 3,
+            directory_scope_total_data_ordinals: object_blocks.len() as u64,
+            directory_scope_highest_protected_ordinal: object_blocks.len() as u64 - 1,
+            is_final_directory: true,
+            entries: vec![crate::parity_map::SidecarEpochDirectoryEntry {
+                tape_file_number: 2,
+                epoch_id: sidecar.header.epoch_id,
+                protected_ordinal_start: sidecar.header.protected_ordinal_start,
+                protected_ordinal_end_exclusive: sidecar.header.protected_ordinal_end_exclusive,
+                sidecar_total_block_count: sidecar.blocks.len() as u64,
+                sidecar_header_block_count: sidecar.header.shard_index_block_count,
+                parity_shard_block_count: sidecar.header.parity_block_count,
+                canonical_metadata_hash: sidecar.header.canonical_metadata_hash,
+                flags: 0,
+            }],
+        };
+
+        let scoped = scoped_map(sidecar_blocks.len() as u64, object_blocks.len() as u64)
+            .with_sidecar_directory(Some(directory));
+        let mut raw = raw_tape(&object_blocks, &sidecar_blocks);
+        let recovered =
+            recover_ordinal_from_sidecar(&mut raw, &scoped, &scheme, TAPE_UUID, BLOCK_SIZE, 2)
+                .expect("the directory must rescue the tail metadata copy");
+
+        assert_eq!(recovered.recovered_block, object_blocks[2]);
+        assert_eq!(
+            recovered.sidecar_metadata_health,
+            SidecarMetadataHealth::PrimaryHeaderLost
+        );
     }
 
     #[test]
@@ -3898,6 +4088,7 @@ mod tests {
                 map_total_data_ordinals: 2,
                 highest_protected_ordinal: 2,
             },
+            sidecar_directory: None,
         };
         let mut raw = RawVec::new(Vec::new());
 
@@ -3935,6 +4126,7 @@ mod tests {
                 map_total_data_ordinals: protected,
                 highest_protected_ordinal: protected,
             },
+            sidecar_directory: None,
         };
         let mut raw = raw_tape(&object_blocks, &sidecar.blocks);
 
@@ -3983,6 +4175,7 @@ mod tests {
                 map_total_data_ordinals: committed_object_blocks.len() as u64,
                 highest_protected_ordinal: protected,
             },
+            sidecar_directory: None,
         };
         let suffix_peer_lbas = object_lbas_for_ordinals(&scoped, &[1, 2]);
         let mut raw = RawVec::new(records_for_object_sidecar_then_object(
@@ -4048,6 +4241,7 @@ mod tests {
                 map_total_data_ordinals: committed_object_blocks.len() as u64,
                 highest_protected_ordinal: protected,
             },
+            sidecar_directory: None,
         };
         let committed_peer_lba = object_lbas_for_ordinals(&scoped, &[1])
             .pop()
@@ -4121,6 +4315,7 @@ mod tests {
                 map_total_data_ordinals: committed_object_blocks.len() as u64,
                 highest_protected_ordinal: protected,
             },
+            sidecar_directory: None,
         };
         let committed_peer_lba = object_lbas_for_ordinals(&scoped, &[1])
             .pop()
@@ -4203,6 +4398,7 @@ mod tests {
                 map_total_data_ordinals: committed_object_blocks.len() as u64,
                 highest_protected_ordinal: protected,
             },
+            sidecar_directory: None,
         };
         let failed_ordinal = 1;
         let committed_same_stripe_peer_ordinal = 3;
