@@ -44,6 +44,12 @@ This document is the publication specification for REM-ENCRYPT. It is the
 normative fixed point for the encrypted representation it defines: an
 implementation is validated against this document, not the reverse.
 
+No standards body has reviewed or adopted it. It was written by the same
+people who wrote the implementation, so the stability of this document is our
+own undertaking rather than anyone else's approval. We will not make a
+normative change to it. We will correct errata that do not alter which
+encrypted objects are valid. Anything beyond that takes a new major version.
+
 REM-ENCRYPT depends normatively on REM-OBJECT Core Format 1.0
 ([REMOBJECT]), which defines the canonical plaintext object sealed by this
 profile. Its tape binding also depends on REM-PARITY 1.0 ([REMPARITY]).
