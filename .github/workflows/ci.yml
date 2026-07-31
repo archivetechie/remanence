@@ -60,6 +60,9 @@ jobs:
           python3 tools/verify_publication_test_vectors.py
           python3 tools/check_spec_versioning.py
 
+      - name: Execute the published damage matrix against the Recoverer
+        run: cargo test -p remanence-parity --test publication_damage_matrix
+
   fuzz-corpus-replay:
     name: scheduled fuzz corpus replay
     runs-on: ubuntu-latest

@@ -2080,7 +2080,9 @@ a manifest recording inputs, the expected values, and — for negative
 vectors — the expected Section 15 error name. Vectors use small geometries
 (e.g. k = 2, m = 2, S = 2, 4 KiB blocks) so complete tape images are
 practical to pin; at least one header-level vector MUST use the default
-geometry parameters. Negative vectors contain exactly one fault each.
+geometry parameters. Negative vectors contain exactly one fault each; the
+damage-matrix cells carry one fault except the sidecar footer-and-primary
+cell, which carries two by construction.
 
 The companion archive is `remanence-test-vectors.tar`, SHA-256
 `77be73e780e9ff2c265c8357b6ba684b4c69800213820ae1331850f742b1d83d`.
@@ -2136,7 +2138,8 @@ carrying REM-OBJECT-TV-P1's 36-byte UUID-string `object_id`.
   reconstructed-block CRC mismatch; a pending-epoch refusal; an
   outside-prefix refusal.
 - *Damage matrix*: for the minimal image (and the external parity_map image
-  for the parity_map-primary cell), single-block damage at each of —
+  for the parity_map-primary cell), damage — single-block except where noted
+  — at each of —
   the object's head block; the sidecar primary header; the sidecar footer;
   the sidecar footer **and** primary (directory-assisted tail rescue); the
   parity_map primary; one bootstrap copy (exercising the Section 12.4
@@ -2171,7 +2174,7 @@ The criteria were:
    role — Writer, Scanner, Recoverer, Resumer, Verifier — with no known
    divergences from this document.
 2. The Section 17 fixtures are present in the companion archive and pass, including the
-   single-block damage matrix and the byte-pinned minimal tape image. Every
+   damage matrix and the byte-pinned minimal tape image. Every
    **[pinned-at-generation]** value is independently re-derived by a second
    implementation (different language or library) before freezing, so a
    reference-implementation bug cannot be frozen into the conformance
@@ -2574,6 +2577,39 @@ governs only the revisions that follow the first published one.
   the `ParityMapReference`-locator precedence tier and the two-candidate
   requirement for structural discovery, both of which the reference Scanner
   already applied.
+
+  **Implementation conformance.** A line-by-line audit of this document against
+  the reference implementation, the pinned vectors, the repository
+  documentation and the project website found six divergences, all of which
+  were resolved by correcting the implementation — this text was not weakened
+  anywhere. The Scanner no longer aborts a whole catalog-less walk when one
+  tape file's recorded block count disagrees with its measured length
+  (Section 12.3); a sidecar footer that parses but contradicts the map entry
+  now falls back to the primary header rather than stopping (Section 13.3
+  step 2); directory-assisted tail rescue is implemented, so an epoch is
+  declared metadata-unavailable only when no header/index copy can be
+  validated (Section 13.3 steps 3 and 4); geometry and ordinal-range
+  disagreements raise `SchemeMismatch` as this document specifies rather than
+  a generic parse error; and the REM-OBJECT manifest depth bound is enforced
+  through map values as well as arrays. A gate was added that applies each
+  damage-matrix cell's recorded faults to the pinned image and drives the real
+  recovery path, which is what the earlier tooling never did.
+
+  Two further behaviours were examined and judged conformant rather than
+  divergent, and are recorded here so the discharge of criterion 1 is not
+  asserted over unexamined ground. First, the bulk region-recovery entry point
+  abandons a whole multi-epoch request when one epoch is metadata-unavailable;
+  Section 12.5's guarantee is that damage to one sidecar's metadata must not
+  degrade *recovery of any other epoch*, and it holds — the per-ordinal and
+  per-block paths, which are what the read path uses, recover every other
+  epoch normally. The all-or-nothing contract of the bulk call is an
+  interface shape, not a recovery-model divergence, and it has no consumer
+  outside the parity crate today. Second, Section 8.2 requires a parity
+  bootstrap's `scheme_id` to be `rs-cauchy-gf256-v1`; the Reader does not
+  reject an unrecognised value at parse time, but refuses cleanly at use time
+  with `SchemeMismatch`, naming the scheme found and the scheme expected. The
+  requirement binds what a conformant Writer may record; the Reader's
+  obligation is to refuse legibly, which it does.
 
 - **2026-07-29 — [draft] pre-freeze revisions II.** Last-resort
   filemark-walk operational envelope specified (Section 8.4.1), with
