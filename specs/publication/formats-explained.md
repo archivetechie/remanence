@@ -12,6 +12,8 @@ this text and a specification disagree, the specification wins.*
 | Version | 1.0.1 |
 | Date | 2026-07-31 |
 | License | CC-BY-4.0 |
+| Concept DOI (all revisions of this document) | [10.5281/zenodo.21719163](https://doi.org/10.5281/zenodo.21719163) |
+| DOI of this revision | [10.5281/zenodo.21719164](https://doi.org/10.5281/zenodo.21719164) |
 
 This companion is versioned and archived like the specifications it
 accompanies, so that a citation of it names immutable text; its version

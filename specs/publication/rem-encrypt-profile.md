@@ -7,6 +7,7 @@
 | Identifier | Value | Scope |
 | --- | --- | --- |
 | Document version | 1.0 | This publication only |
+| Concept DOI (all revisions of this document) | [10.5281/zenodo.21719161](https://doi.org/10.5281/zenodo.21719161) | This publication |
 | Reference implementation DOI (informative) | [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) | Software deposit, Apache-2.0 |
 | Envelope magic | `REMO` | Frozen four-byte wire constant |
 | Key-frame magic | `REMK` | Frozen four-byte wire constant |
@@ -36,6 +37,8 @@ omits Section 5 (the encrypted representation, owned here).
 | Version | 1.0.1 |
 | Date | 2026-07-31 |
 | License | CC-BY-4.0 |
+| Concept DOI (all revisions of this document) | [10.5281/zenodo.21719161](https://doi.org/10.5281/zenodo.21719161) |
+| DOI of this revision | [10.5281/zenodo.21719162](https://doi.org/10.5281/zenodo.21719162) |
 | Reference implementation (informative) | Zenodo concept DOI [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) — software deposit, Apache-2.0 |
 
 This document is the publication specification for REM-ENCRYPT. It is the
@@ -82,6 +85,15 @@ Version numbers are always three-part. The Identifiers table at the head of
 this document names the major.minor line; the Version row in this section is
 the full revision. Section 10 owns the wire-versioning machinery — the `format_version`, `suite_id` and `wrap_suite` registries and their assignment policy; this policy defers to it and does not paraphrase it. A registry assignment under Section 10.4 is a minor revision: an earlier reader identifies the envelope and refuses it with the typed error the registry names, which satisfies the third condition above. Every published revision of this document is
 archived with its own DOI and recorded in the Revision History appendix.
+
+For orientation, the classifications most likely to be proposed for this
+profile (informative): a new `suite_id` or `wrap_suite` assignment — minor,
+with the mandatory compatibility-impact statement; a new optional envelope
+metadata key — minor; a new `format_version` — major, by the discriminator
+rule. The conformance vectors covering this profile are anchors of the
+revision that generated them; a future revision that needs new vectors
+publishes its own archive and cites it by name, DOI and digest, and never
+re-pins an earlier one.
 
 REM-ENCRYPT depends normatively on REM-OBJECT Core Format 1.0
 ([REMOBJECT]), which defines the canonical plaintext object sealed by this
@@ -728,11 +740,11 @@ section, then obtain software implementing the named value.
 
 `format_version` is the byte at scalar-header offset `0x06`.
 
-| Value | Status | Meaning |
-| ---: | --- | --- |
-| `1` | reserved / permanently forbidden | MUST never be accepted or reassigned |
-| `2` | **current** | The envelope defined by this document |
-| all others | unassigned | Hard error |
+| Value | Status | Defined by | Meaning |
+| ---: | --- | --- | --- |
+| `1` | reserved / permanently forbidden | REM-ENCRYPT 1.0 | MUST never be accepted or reassigned |
+| `2` | **current** | REM-ENCRYPT 1.0 | The envelope defined by this document |
+| all others | unassigned | a future revision | Hard error |
 
 An unsupported value produces `UnsupportedFormatVersion`.
 
@@ -740,10 +752,10 @@ An unsupported value produces `UnsupportedFormatVersion`.
 
 `suite_id` is the AEAD/KDF discriminator at offset `0x07`.
 
-| Value | Status | Meaning |
-| ---: | --- | --- |
-| `0x01` | **current** | HKDF-SHA-256 + ChaCha20-Poly1305 |
-| all others | unassigned | Hard error |
+| Value | Status | Defined by | Meaning |
+| ---: | --- | --- | --- |
+| `0x01` | **current** | REM-ENCRYPT 1.0 | HKDF-SHA-256 + ChaCha20-Poly1305 |
+| all others | unassigned | a future revision | Hard error |
 
 A future AEAD or KDF migration receives a new `suite_id`. An unassigned value
 produces `InvalidSuite`.
@@ -752,13 +764,13 @@ produces `InvalidSuite`.
 
 `wrap_suite` is the KEM discriminator at offset `0x38`.
 
-| Value | Status | KEM |
-| ---: | --- | --- |
-| `0x00` | reserved / invalid | — |
-| `0x01` | **permanently forbidden** | Legacy X25519-only assignment; pre-production and never shipped |
-| `0x02` | **current** | X-Wing from `draft-connolly-cfrg-xwing-kem-10` |
-| `0x03` | reserved | A future X-Wing construction that differs on the wire from draft-10 |
-| all others | unassigned | — |
+| Value | Status | Defined by | KEM |
+| ---: | --- | --- | --- |
+| `0x00` | reserved / invalid | REM-ENCRYPT 1.0 | — |
+| `0x01` | **permanently forbidden** | REM-ENCRYPT 1.0 | Legacy X25519-only assignment; pre-production and never shipped |
+| `0x02` | **current** | REM-ENCRYPT 1.0 | X-Wing from `draft-connolly-cfrg-xwing-kem-10` |
+| `0x03` | reserved | REM-ENCRYPT 1.0 (consumable by a future revision) | A future X-Wing construction that differs on the wire from draft-10 |
+| all others | unassigned | a future revision | — |
 
 Per Section 5.3.1, a wire-identical final X-Wing RFC keeps `0x02`; only its
 provenance citation changes. Value `0x03` is consumed only if the final
@@ -1104,10 +1116,10 @@ part of suite `0x02`; this document makes no IANA request.
 ### 16.1. Normative References
 
 - [REMOBJECT] — "REM-OBJECT Core Format", Version 1.0 or any later 1.x
-  revision; this revision was published against REM-OBJECT 1.0.1.
+  revision; this revision was published against REM-OBJECT 1.0.1 (DOI of that revision in its Status section).
   Companion specification.
 - [REMPARITY] — "Rem Tape Parity (REM-PARITY) Format", Version 1.0 or any
-  later 1.x revision; this revision was published against REM-PARITY 1.0.1.
+  later 1.x revision; this revision was published against REM-PARITY 1.0.1 (DOI of that revision in its Status section).
   Companion specification; normative for the tape binding.
 - [RFC2119] — Bradner, S., "Key words for use in RFCs to Indicate
   Requirement Levels", BCP 14, RFC 2119, March 1997,
@@ -1247,7 +1259,7 @@ Reference implementation: https://github.com/archivetechie/remanence
 Entries are newest first: date · version · kind (erratum / minor / major) ·
 effect on conformance.
 
-- **2026-07-31 — 1.0.1 — erratum.** Status of This Document rewritten to the
+- **2026-07-31 — 1.0.1 — erratum, including a flagged policy correction.** The previous Status text permitted minors to "add optional keys and nothing else", narrower than §10.4's own registry mechanism; the shared policy widens it, and that widening is the policy correction. Status of This Document rewritten to the
   shared three-question change policy (see Status); DOI rows corrected — the
   software deposit's DOI is informative, and the false "Version DOI (this
   release)" row removed; registry preamble gains defining-revision attribution and the unassigned-value retrieval note; the Section 10.1 self-reference fixed; the X-Wing citation gains its pinned-provenance and supersession note. No object becomes valid or invalid and no

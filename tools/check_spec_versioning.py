@@ -97,9 +97,12 @@ def main() -> int:
             fail(f"{name}: Version {v!r} is not three-part")
         elif not v.startswith(meta["line"] + "."):
             fail(f"{name}: Version {v} does not extend the {meta['line']} line")
-        for dm in re.finditer(r"^\| Document version \| (\S+) \|", t, re.M):
-            if dm.group(1) != meta["line"]:
-                fail(f"{name}: Identifiers 'Document version' {dm.group(1)} != line {meta['line']}")
+        dvs = re.findall(r"^\| Document version \| (\S+) \|", t, re.M)
+        if not dvs:
+            fail(f"{name}: no 'Document version' (line) row")
+        for dv in dvs:
+            if dv != meta["line"]:
+                fail(f"{name}: Identifiers 'Document version' {dv} != line {meta['line']}")
 
     # 2. Policy core identical modulo substitutions.
     cores = {n: policy_core(t, SPECS[n]["noun"]) for n, t in texts.items()}

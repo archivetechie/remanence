@@ -5,9 +5,12 @@
 | | |
 | --- | --- |
 | Status | Final |
+| Document version | 1.0 |
 | Version | 1.0.1 |
 | Date | 2026-07-31 |
 | License | CC-BY-4.0 |
+| Concept DOI (all revisions of this document) | [10.5281/zenodo.21719156](https://doi.org/10.5281/zenodo.21719156) |
+| DOI of this revision | [10.5281/zenodo.21719157](https://doi.org/10.5281/zenodo.21719157) |
 | Reference implementation (informative) | Zenodo concept DOI [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) — software deposit, Apache-2.0 |
 | Bootstrap magic | `52 45 4D 00 42 4F 4F 01` (`"REM\0BOO\x01"`, fixed bytes) |
 | Erasure scheme identifier | `rs-cauchy-gf256-v1` |
@@ -855,11 +858,11 @@ This is the one deliberate exception to the Section 16.2 verify-zero rule.
 
 #### 8.1.1. Schema Minor Registry
 
-`schema_minor` counts revisions of the on-tape bootstrap format. It is not
-this document's version number, no arithmetic relates the two, and most
-revisions of this document assign no new value: a value is assigned only
-when a wire-visible change warrants signaling, by the document revision that
-defines the change.
+`schema_minor` names generations of the bootstrap wire format. It is not a
+revision counter and not this document's version number: no arithmetic
+relates it to anything, most revisions of this document assign no new value,
+and a value is assigned only when a wire-visible change warrants signaling,
+by the document revision that defines the change.
 
 | `schema_minor` | Status | Defined by | Wire meaning |
 | ---: | --- | --- | --- |
@@ -874,6 +877,11 @@ Individual payload rules MAY be gated on the value, as key 4 is; the gate
 travels with the row that defines it. A writer SHOULD emit the current
 value. The published vector archive contains images at both 2 and 3,
 generated as the field advanced; all are conformant anchors of revision 1.0.
+An unassigned value is not an error here: Section 5.3's ignore-unknown rule
+means a reader reads through newer bootstrap revisions, satisfying the
+change policy's second condition outright. The refuse-with-typed-error
+condition governs formats that gate reading on a registry, which the
+bootstrap does not.
 
 To identify what defines a tape in hand: read `schema_major` and
 `schema_minor` from any bootstrap (Section 8.1) — each assigned value's
@@ -2126,8 +2134,9 @@ These criteria gated the freeze of this specification; all of them hold, as
 recorded in the freeze record and the Revision History appendix. After
 freeze, revisions are governed by the change policy in the Status of This
 Document section: errata and conforming minor revisions are permitted, and
-anything that would invalidate an existing tape or leave an earlier reader
-unable to identify and cleanly refuse a newer one is a new major version.
+anything that would invalidate an existing tape, change the meaning of
+anything already written, or leave an earlier reader unable to identify and
+cleanly refuse a newer one is a new major version.
 The criteria were:
 
 1. At least one complete implementation implements this document in every
@@ -2187,9 +2196,9 @@ governed by its versioning rules; no registry is established or required.
 - [FIPS180-4] — National Institute of Standards and Technology, "Secure
   Hash Standard (SHS)", FIPS PUB 180-4, August 2015 (defines SHA-256),
   <https://doi.org/10.6028/NIST.FIPS.180-4>.
-- [REMOBJECT] — "REM-OBJECT Core Format", Version 1.0 or any later 1.x revision (published against 1.0.1), companion specification: the
+- [REMOBJECT] — "REM-OBJECT Core Format", Version 1.0 or any later 1.x revision (published against 1.0.1, DOI of that revision in its Status section), companion specification: the
   reference payload format and plaintext object-row semantics.
-- [REMENCRYPT] — "REM-ENCRYPT", Version 1.0 or any later 1.x revision (published against 1.0.1), companion specification: encrypted
+- [REMENCRYPT] — "REM-ENCRYPT", Version 1.0 or any later 1.x revision (published against 1.0.1, DOI of that revision in its Status section), companion specification: encrypted
   representation and encrypted object-row field semantics.
 
 CRC-64/XZ is fully parameterized in Section 5.1; no external reference is
@@ -2452,8 +2461,7 @@ tape and does not change any REM-PARITY media byte.
 ## Appendix C. Open Items Before Freeze (Informative; all resolved)
 
 Every item below was closed before the freeze; the parenthetical notes name
-the resolutions. The freeze record referenced from the Revision History
-carries the full evidence.
+the resolutions, and the Revision History appendix records when.
 
 1. **Pinned-at-generation image vectors** (Section 17). The byte-level tape
    images and their digest chains must be generated, independently
@@ -2549,8 +2557,10 @@ marked `[draft]`.
   (Sections 3.3, 10.5, 11.2); the bootstrap directory ceiling made an
   admission-time refusal with mandatory headroom and seal-at-ceiling
   (Section 8.2.1); reference journal watermark note (Appendix B.12).
-- **2026-06-11 — [draft] first draft.** Initial publication baseline,
-  archived with software release v1.0.0.
+- **2026-07-25 — 1.0.0 — [published] first publication.** Archived with
+  software release v1.0.0 (Zenodo concept DOI 10.5281/zenodo.21551570);
+  the permanent 1.0 anchor.
+- **2026-06-11 — [draft] first draft.** Initial working baseline.
 
 ## Author's Address
 
