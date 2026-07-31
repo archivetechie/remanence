@@ -309,18 +309,12 @@ tape, and it writes itself into the registry row when it does. Most
 revisions of a document — every erratum, and any minor that only adjusts
 obligations — assign nothing at all.
 
-## The found-cartridge walkthrough: ten years on
+## The found-cartridge walkthrough
 
-Put it all together with the scenario the formats are designed around. A
-word first about the timescale, because it is easy to exaggerate: tape
-drives read only a generation or two back, so in practice archives migrate
-to fresh media every several years, and a cartridge much older than a
-decade is a hardware-procurement problem before it is a format problem.
-The scenario that actually matters is nearer and more ordinary — a
-cartridge surfaces eight or ten years on, within the window a drive can
-still read, but the organisation that wrote it has dissolved, its archive
-system is decommissioned, and its catalog is gone. That combination
-arrives well inside a decade all the time. What happens?
+Put it all together with the scenario the formats are designed around: a
+cartridge surfaces ten years on. The organisation that wrote it has
+dissolved, its archive system is decommissioned, and its catalog is gone.
+What happens?
 
 1. The reader software — built from whatever revision is then current —
    loads the tape and finds a bootstrap block. Promise two says this works
