@@ -279,6 +279,20 @@ year's issue rather than rewriting it. A visibly wrong vector on the
 record is harmless; a silently repaired one would put every past
 conformance claim in doubt.
 
+Does correcting an example strip conformance from software that passed the
+old one? No, because conformance was never to the examples. It is to the
+text of a named revision; the examples are how you test it, and a
+defective example means the test was faulty, not the definition. Software
+that followed the text was conformant all along — it had been failing a
+broken test — and software that matched the defective answer never was:
+the correction exposes that rather than causing it, and the revision
+history names the entry so anyone can check whether a past validation
+leaned on it. Where the old answer was defensible because the text itself
+was ambiguous, that is handled as an ambiguity, not a defect — the
+clarifying revision changes an obligation, so it is at least a minor, and
+a claim of conformance to the earlier revision remains true as a statement
+about that revision.
+
 One consequence is worth knowing so it does not look like an error: a
 vector archive can legitimately contain examples with different wire
 values — the current archive holds bootstrap images at feature generations
