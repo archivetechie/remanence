@@ -7,8 +7,7 @@
 | Identifier | Value | Scope |
 | --- | --- | --- |
 | Document version | 1.0 | This publication only |
-| Concept DOI (all versions) | [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) | This publication |
-| Version DOI (this release) | [10.5281/zenodo.21551571](https://doi.org/10.5281/zenodo.21551571) | This publication |
+| Reference implementation DOI (informative) | [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) | Software deposit, Apache-2.0 |
 | Stream format identifier | `rem-object-v1` | Frozen plaintext-stream wire constant |
 | Stream schema version | `1.0` without preserved xattrs; `1.1` with preserved xattrs | `REMANENCE.schema_version` |
 | Manifest schema version | `1` | Manifest CBOR field |
@@ -34,8 +33,7 @@ representation, the parity relationship, and conformance, owned here).
 | Version | 1.0.1 |
 | Date | 2026-07-31 |
 | License | CC-BY-4.0 |
-| Concept DOI (all versions) | [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) |
-| Version DOI (this release) | [10.5281/zenodo.21551571](https://doi.org/10.5281/zenodo.21551571) |
+| Reference implementation (informative) | Zenodo concept DOI [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) — software deposit, Apache-2.0 |
 
 This document is the publication specification for the REM-OBJECT Core
 Format. It is the normative fixed point for the durable canonical object: an
@@ -45,22 +43,51 @@ No standards body has reviewed or adopted it. It was written by the same
 people who wrote the implementation, so the stability of this document is our
 own undertaking rather than anyone else's approval.
 
-Revisions come in three kinds. Errata (1.0.1, 1.0.2 and so on) correct wording
-and resolve ambiguities the way conformant implementations already behave, so
-nothing an implementation does has to change. Minor revisions (1.1, 1.2 and so
-on) add optional keys under the extension rule of Section 10 and nothing else, so every objects written under an
-earlier 1.x stays valid and a reader built from an earlier 1.x still reads the
-newer ones. A new major version (2.0) is required for anything that changes the
-meaning of an existing field, removes one, or could stop an existing object
-being read; that takes a separate document. Each published revision is archived
-with its own DOI under the concept DOI above.
+**Deciding what a change is.** Every revision of this document is classified
+by three questions, asked in order.
+
+1. Does any existing object become invalid, or does the meaning of anything
+   already written change? Then it is a **new major version**: a new stream `format_id` (`rem-object-v2`), and a
+   separate document. Objects written under this major keep working with
+   readers of this major; the two formats coexist. An implementation MAY
+   implement two majors at once; it then conforms to each major for the
+   artifacts that major governs, and a reader-acceptance clause of an
+   earlier major constrains only artifacts written under it.
+2. Does a reader conforming only to an earlier revision lose the ability to
+   identify a newer object and refuse it cleanly? Then it is also a
+   **major**.
+3. Does anything an implementation must do change, or is a registry value
+   assigned? Then it is a **minor revision** (1.1.0, 1.2.0, …), and it is
+   permitted only if all three of the following hold: every object written
+   under an earlier revision of this major remains valid; a reader built
+   from an earlier revision still reads correctly every object that uses
+   only the features defined at or before that revision; and on a object
+   that uses a feature it does not implement, that reader identifies the
+   object and refuses it with a typed error naming the unimplemented value —
+   it never misreads, and never mistakes the object for damage. A minor
+   revision whose new value earlier readers must refuse MUST say so in its
+   revision-history entry.
+
+Anything else — wording, typographical errors, dead cross-references, and
+clarifications that resolve an ambiguity the way conformant implementations
+already behave — is an **erratum** (1.0.1, 1.0.2, …). An erratum changes no
+obligation and no valid object. One exception is named openly: a correction
+to this change-policy text itself is published as an erratum and flagged as
+a policy correction in the revision history.
+
+Version numbers are always three-part. The Identifiers table at the head of
+this document names the major.minor line; the Version row in this section is
+the full revision. Section 10 owns the wire-versioning machinery — the stream `format_id`, the `REMANENCE.schema_version` feature gate, and the manifest schema integer; this policy defers to it and does not paraphrase it. Every published revision of this document is
+archived with its own DOI and recorded in the Revision History appendix.
 
 The tape binding depends normatively on the REM-PARITY specification
-([REMPARITY]), which is now final. That dependency is therefore fixed: the
-tape-binding clauses of this document (the parity-layer references in Sections
-4.9, 8.2, 9, 12.6) are stable against the REM-PARITY revision cited in the
-References, and change only under the errata rule that governs both
-documents. The file and object-store bindings do not depend on REM-PARITY.
+([REMPARITY]), which is final. The tape-binding clauses of this document
+(the parity-layer references in Sections 4.9, 8.2, 9, 12.6) are stable
+against every 1.x revision of REM-PARITY, because a REM-PARITY minor
+revision cannot invalidate a tape or leave an earlier reader unable to read
+one. A writer obligation added by a later REM-PARITY 1.x binds a Writer
+claiming that revision; it does not change this document's clauses. The
+file and object-store bindings do not depend on REM-PARITY.
 
 **Abstract**
 
@@ -552,7 +579,8 @@ obligation, not a read-acceptance rule.
 #### 4.4.3. Unknown Keywords
 
 Readers MUST ignore unknown keywords, including unknown `REMANENCE.*` keywords
-(this is how 1.x minor revisions extend the format, Section 10), and SHOULD
+(this is the format's extension mechanism — a future revision of this
+document may assign new keywords, Section 10), and SHOULD
 preserve them when re-emitting metadata. Unknown keywords MUST NOT alter
 payload framing or interpretation.
 
@@ -1466,7 +1494,9 @@ be used as proxies for one another. This document's version is not stored in
 an object.
 
 `REMANENCE.schema_version` is `1.0` when no xattr is preserved and `1.1`
-when any xattr is preserved. Extension containers and the `object_metadata`
+when any xattr is preserved. Both values are defined by document 1.0. The
+numeral is a feature gate, not a document version: a future revision 1.1 of
+this document would not imply stream-schema `1.1`, nor the reverse. Extension containers and the `object_metadata`
 inventory do not affect this gate. Both stream-schema values use
 `REMANENCE.format_id = rem-object-v1` and manifest
 `schema_version = 1`.
@@ -1851,7 +1881,9 @@ Conformance evidence MUST include:
 
 The archive SHA-256 in Section 13 identifies one specific version of the
 frozen vector distribution. Changing an existing entry's byte encoding or
-expected result requires a successor specification or erratum. Additive
+expected result requires a revision classified under the Status policy — a
+minor revision at least, a new major if any previously valid object is
+affected; an erratum may not alter any entry. Additive
 entries are published as versioned supplements carrying their own digest and
 do not mutate the frozen conformance target named by an existing digest.
 
@@ -1895,10 +1927,12 @@ extension containers only and MUST NOT appear as pax keywords.
 - [POSIX-PAX] — IEEE Std 1003.1-2017 (POSIX.1-2017), Shell and Utilities
   volume, `pax` utility, "pax Interchange Format" (ustar and pax extended
   headers), <https://pubs.opengroup.org/onlinepubs/9699919799/>.
-- [REMPARITY] — "Rem Tape Parity (REM-PARITY) Format, Version 1.0",
-  companion specification published alongside this document: the parity
-  layer of Sections 8.2 and 9. Normative only for implementations of the
-  Section 8.2 tape binding.
+- [REMPARITY] — "Rem Tape Parity (REM-PARITY) Format", Version 1.0 or any
+  later 1.x revision (interchangeable for this document's purposes by
+  REM-PARITY's own change policy); this revision was published against
+  REM-PARITY 1.0.1. Companion specification: the parity layer of Sections
+  8.2 and 9. Normative only for implementations of the Section 8.2 tape
+  binding.
 - [REMENCRYPT] — "REM-ENCRYPT 1.0", companion specification defining the
   encrypted representation named by this document.
 
@@ -1979,3 +2013,16 @@ The ArchiveTech Project
 Website: https://archivetech.org
 Email: specs@archivetech.org
 Reference implementation: https://github.com/archivetechie/remanence
+
+## Appendix C. Revision History (Informative)
+
+Entries are newest first: date · version · kind (erratum / minor / major) ·
+effect on conformance.
+
+- **2026-07-31 — 1.0.1 — erratum.** Status of This Document rewritten to the
+  shared three-question change policy (see Status); DOI rows corrected — the
+  software deposit's DOI is informative, and the false "Version DOI (this
+  release)" row removed; dependency on REM-PARITY restated as stability against the 1.x line; Section 14's vector-change rule reclassified from erratum to revision; the Section 4.4.3 and Section 10 wording de-coupled from document minors, with the stream-schema/document-version numeral collision warned against explicitly. No object becomes valid or invalid and no
+  implementation obligation changes.
+- **2026-07-25 — 1.0.0 — first publication.** Archived with software release
+  v1.0.0 (Zenodo concept DOI 10.5281/zenodo.21551570).

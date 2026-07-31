@@ -7,8 +7,7 @@
 | Identifier | Value | Scope |
 | --- | --- | --- |
 | Document version | 1.0 | This publication only |
-| Concept DOI (all versions) | [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) | This publication |
-| Version DOI (this release) | [10.5281/zenodo.21551571](https://doi.org/10.5281/zenodo.21551571) | This publication |
+| Reference implementation DOI (informative) | [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) | Software deposit, Apache-2.0 |
 | Envelope magic | `REMO` | Frozen four-byte wire constant |
 | Key-frame magic | `REMK` | Frozen four-byte wire constant |
 | On-tape `format_version` | `2` | Encrypted-envelope wire discriminator |
@@ -37,8 +36,7 @@ omits Section 5 (the encrypted representation, owned here).
 | Version | 1.0.1 |
 | Date | 2026-07-31 |
 | License | CC-BY-4.0 |
-| Concept DOI (all versions) | [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) |
-| Version DOI (this release) | [10.5281/zenodo.21551571](https://doi.org/10.5281/zenodo.21551571) |
+| Reference implementation (informative) | Zenodo concept DOI [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) — software deposit, Apache-2.0 |
 
 This document is the publication specification for REM-ENCRYPT. It is the
 normative fixed point for the encrypted representation it defines: an
@@ -48,15 +46,42 @@ No standards body has reviewed or adopted it. It was written by the same
 people who wrote the implementation, so the stability of this document is our
 own undertaking rather than anyone else's approval.
 
-Revisions come in three kinds. Errata (1.0.1, 1.0.2 and so on) correct wording
-and resolve ambiguities the way conformant implementations already behave, so
-nothing an implementation does has to change. Minor revisions (1.1, 1.2 and so
-on) add optional keys and nothing else, so every encrypted object written under
-an earlier 1.x stays valid and a reader built from an earlier 1.x still reads
-the newer ones. A new major version (2.0) is required for anything that changes
-the meaning of an existing field, removes one, or could stop an existing
-encrypted object being read; that takes a separate document. Each published
-revision is archived with its own DOI under the concept DOI above.
+**Deciding what a change is.** Every revision of this document is classified
+by three questions, asked in order.
+
+1. Does any existing encrypted object become invalid, or does the meaning of anything
+   already written change? Then it is a **new major version**: a new envelope `format_version`, and a
+   separate document. Encrypted objects written under this major keep working with
+   readers of this major; the two formats coexist. An implementation MAY
+   implement two majors at once; it then conforms to each major for the
+   artifacts that major governs, and a reader-acceptance clause of an
+   earlier major constrains only artifacts written under it.
+2. Does a reader conforming only to an earlier revision lose the ability to
+   identify a newer encrypted object and refuse it cleanly? Then it is also a
+   **major**.
+3. Does anything an implementation must do change, or is a registry value
+   assigned? Then it is a **minor revision** (1.1.0, 1.2.0, …), and it is
+   permitted only if all three of the following hold: every encrypted object written
+   under an earlier revision of this major remains valid; a reader built
+   from an earlier revision still reads correctly every encrypted object that uses
+   only the features defined at or before that revision; and on a encrypted object
+   that uses a feature it does not implement, that reader identifies the
+   encrypted object and refuses it with a typed error naming the unimplemented value —
+   it never misreads, and never mistakes the encrypted object for damage. A minor
+   revision whose new value earlier readers must refuse MUST say so in its
+   revision-history entry.
+
+Anything else — wording, typographical errors, dead cross-references, and
+clarifications that resolve an ambiguity the way conformant implementations
+already behave — is an **erratum** (1.0.1, 1.0.2, …). An erratum changes no
+obligation and no valid encrypted object. One exception is named openly: a correction
+to this change-policy text itself is published as an erratum and flagged as
+a policy correction in the revision history.
+
+Version numbers are always three-part. The Identifiers table at the head of
+this document names the major.minor line; the Version row in this section is
+the full revision. Section 10 owns the wire-versioning machinery — the `format_version`, `suite_id` and `wrap_suite` registries and their assignment policy; this policy defers to it and does not paraphrase it. A registry assignment under Section 10.4 is a minor revision: an earlier reader identifies the envelope and refuses it with the typed error the registry names, which satisfies the third condition above. Every published revision of this document is
+archived with its own DOI and recorded in the Revision History appendix.
 
 REM-ENCRYPT depends normatively on REM-OBJECT Core Format 1.0
 ([REMOBJECT]), which defines the canonical plaintext object sealed by this
@@ -226,8 +251,8 @@ MUST be a positive multiple of `chunk_size`.
 `format_version` is an on-tape field, not this document's version. A Reader
 MUST accept only value `2` and requires a matching recipient private key. It
 MUST NOT attempt another key mode after any parse, key-resolution, unwrap, or
-authentication failure. Value `1` is permanently reserved as stated in
-Section 10.
+authentication failure. Value `1` is permanently reserved, as this registry
+records.
 
 ### 5.2. Scalar Header
 
@@ -693,7 +718,11 @@ media and avoids exposing confidential inner structure.
 
 Document version, Core stream schema, envelope `format_version`, `suite_id`,
 and `wrap_suite` are independent axes and MUST NOT be used as proxies for one
-another.
+another. Every value in the registries below was assigned by document 1.0;
+each future assignment names its defining revision here. An unassigned value
+met in the wild indicates an object written under a later revision of this
+document — retrieve the current revision via the concept DOI in the Status
+section, then obtain software implementing the named value.
 
 ### 10.1. `format_version` Registry
 
@@ -1074,9 +1103,12 @@ part of suite `0x02`; this document makes no IANA request.
 
 ### 16.1. Normative References
 
-- [REMOBJECT] — "REM-OBJECT Core Format 1.0", companion specification.
-- [REMPARITY] — "Rem Tape Parity (REM-PARITY) Format, Version 1.0",
-  companion specification; normative for the tape binding.
+- [REMOBJECT] — "REM-OBJECT Core Format", Version 1.0 or any later 1.x
+  revision; this revision was published against REM-OBJECT 1.0.1.
+  Companion specification.
+- [REMPARITY] — "Rem Tape Parity (REM-PARITY) Format", Version 1.0 or any
+  later 1.x revision; this revision was published against REM-PARITY 1.0.1.
+  Companion specification; normative for the tape binding.
 - [RFC2119] — Bradner, S., "Key words for use in RFCs to Indicate
   Requirement Levels", BCP 14, RFC 2119, March 1997,
   <https://www.rfc-editor.org/info/rfc2119>.
@@ -1116,7 +1148,12 @@ part of suite `0x02`; this document makes no IANA request.
 - [XWING-DRAFT10] — Connolly, D., Schwabe, P., and B. E. Westerbaan,
   "X-Wing: general-purpose hybrid post-quantum KEM",
   `draft-connolly-cfrg-xwing-kem-10`, 2 March 2026,
-  <https://datatracker.ietf.org/doc/html/draft-connolly-cfrg-xwing-kem-10>.
+  <https://datatracker.ietf.org/doc/html/draft-connolly-cfrg-xwing-kem-10>;
+  a copy is pinned in this repository's `specs/publication/provenance/`.
+  Internet-Drafts expire: if a wire-identical RFC supersedes the draft,
+  `wrap_suite 0x02` is retained (Section 10.3) and this citation is updated
+  by an erratum; a construction that differs on the wire consumes the
+  reserved `0x03` through a minor revision instead.
 - [AEAD-COMMIT] — Albertini, A., et al., "How to Abuse and Fix
   Authenticated Encryption Without Key Commitment", USENIX Security 2022,
   <https://www.usenix.org/conference/usenixsecurity22/presentation/albertini>.
@@ -1204,3 +1241,16 @@ The ArchiveTech Project
 Website: https://archivetech.org
 Email: specs@archivetech.org
 Reference implementation: https://github.com/archivetechie/remanence
+
+## Appendix C. Revision History (Informative)
+
+Entries are newest first: date · version · kind (erratum / minor / major) ·
+effect on conformance.
+
+- **2026-07-31 — 1.0.1 — erratum.** Status of This Document rewritten to the
+  shared three-question change policy (see Status); DOI rows corrected — the
+  software deposit's DOI is informative, and the false "Version DOI (this
+  release)" row removed; registry preamble gains defining-revision attribution and the unassigned-value retrieval note; the Section 10.1 self-reference fixed; the X-Wing citation gains its pinned-provenance and supersession note. No object becomes valid or invalid and no
+  implementation obligation changes.
+- **2026-07-25 — 1.0.0 — first publication.** Archived with software release
+  v1.0.0 (Zenodo concept DOI 10.5281/zenodo.21551570).

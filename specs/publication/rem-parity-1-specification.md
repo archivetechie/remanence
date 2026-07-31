@@ -8,58 +8,104 @@
 | Version | 1.0.1 |
 | Date | 2026-07-31 |
 | License | CC-BY-4.0 |
-| Concept DOI (all versions) | [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) |
-| Version DOI (this release) | [10.5281/zenodo.21551571](https://doi.org/10.5281/zenodo.21551571) |
+| Reference implementation (informative) | Zenodo concept DOI [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) — software deposit, Apache-2.0 |
 | Bootstrap magic | `52 45 4D 00 42 4F 4F 01` (`"REM\0BOO\x01"`, fixed bytes) |
 | Erasure scheme identifier | `rs-cauchy-gf256-v1` |
 | parity_map format identifier | `rem-parity-map-v1` |
 
 ## Status of This Document
 
-This document is final. We do not intend to change it.
+The format this document defines is final. No tape it validates will ever be
+invalidated, no reader guarantee will be withdrawn, and the discovery
+guarantee of Section 8.4 stands for the life of `schema_major` 1. The
+document itself may still be revised, in exactly the three ways set out
+below.
 
 No standards body has reviewed or adopted it. There is no ISO number, no RFC,
 no SNIA endorsement. It was written by the same people who wrote the
-implementation, so "final" here is our own undertaking and not anyone else's
-approval. That is worth saying plainly, because the word usually implies a
-committee somewhere, and in this case there is none.
+implementation, so the finality above is our own undertaking and not anyone
+else's approval. That is worth saying plainly, because such words usually
+imply a committee somewhere, and in this case there is none.
 
-The undertaking is deliberately narrow, so that it can be checked. Revisions of
-this document come in three kinds, and only the first two can happen under
-version 1.
+The document's version, the bootstrap's `schema_major` and `schema_minor`
+(Section 8.1), REM-OBJECT's `REMANENCE.schema_version` (a text feature gate)
+and manifest `schema_version` (an integer), and REM-ENCRYPT's registries are
+independent axes. None is a proxy for another, and no arithmetic relates
+them. In particular, `schema_minor` is not this document's version number;
+Section 8.1.1 is its registry.
 
-**Errata — 1.0.1, 1.0.2 and so on.** Typos, dead cross-references, and
+**Deciding what a change is.** Every revision of this document is classified
+by three questions, asked in order.
+
+1. Does any existing tape become invalid, or does the meaning of anything
+   already written change? Then it is a **new major version**: a new
+   `schema_major` or new magic, and a separate document. Tapes written under
+   this major keep working with readers of this major; the two formats
+   coexist. An implementation MAY implement two majors at once; it then
+   conforms to each major for the artifacts that major governs, and a
+   reader-acceptance clause of an earlier major constrains only artifacts
+   written under it.
+2. Does a reader conforming only to an earlier revision lose the ability to
+   identify a newer tape and refuse it cleanly? Then it is also a **major**.
+   (This is why the discovery-candidate block sizes of Section 8.4 are
+   frozen for the life of `schema_major` 1: a scanner that cannot rotate to
+   a tape's block size does not fail with a diagnosis — it reports no
+   bootstrap at all, which is indistinguishable from a blank or destroyed
+   medium.)
+3. Does anything an implementation must do change, or is a registry value
+   assigned? Then it is a **minor revision** (1.1.0, 1.2.0, …), and it is
+   permitted only if all three of the following hold: every tape written
+   under an earlier revision of this major remains valid; a reader built
+   from an earlier revision still reads correctly every tape that uses only
+   the features defined at or before that revision; and on a tape that uses
+   a feature it does not implement, that reader identifies the tape and
+   refuses it with a typed error naming the unimplemented value — it never
+   misreads, and never mistakes the tape for damage. A minor revision whose
+   new value earlier readers must refuse MUST say so in its revision-history
+   entry.
+
+Anything else — wording, typographical errors, dead cross-references, and
 clarifications that resolve an ambiguity the way conformant implementations
-already behave. Nothing an implementation does has to change, and no tape
-becomes newly valid or newly invalid.
+already behave — is an **erratum** (1.0.1, 1.0.2, …). An erratum changes no
+obligation and no valid tape. One exception is named openly: a correction to
+this change-policy text itself is published as an erratum and flagged as a
+policy correction in the revision history, because the alternative — a
+policy that cannot correct its own wording — would freeze its mistakes.
 
-**Minor revisions — 1.1, 1.2 and so on.** A minor revision may make any change
-that leaves every tape written under an earlier 1.x valid, and leaves a reader
-built from an earlier 1.x still able to read the newer tapes correctly. In
-practice that means adding optional integer keys under the extension rule of
-Section 5.3, and it may also add obligations on writers, since a writer
-obligation cannot invalidate a tape that already exists. Each minor revision
-increments `schema_minor` and adds a row to the table in Section 8.1.
+Version numbers are always three-part. The Identifiers table at the head of
+this document names the major.minor line; the Version row in this section is
+the full revision.
 
-**A new major version — 2.0.** Anything that changes the meaning of an existing
-field, removes one, or could stop an existing tape being read. That takes a new
-`schema_major` or new magic and a separate document. Tapes written under version
-1 keep working with version 1 readers; the two formats simply coexist.
+For orientation, the classifications of the changes most likely to be
+proposed (informative): a new optional bootstrap key — minor; a new damage
+plan in the drill tooling — erratum or minor, by whether an obligation
+moves; a new writer-legal block size — major, by question 2; a new
+`schema_major` or magic — major, by definition.
 
-A tape written against this specification will therefore still be read correctly
-by an implementation built from any later revision of it.
+The image-level vectors of Section 17 are conformance anchors of the
+revision under which they were generated; a later revision does not make
+them retrospectively non-conformant, and never re-pins them. A future
+revision that needs new vectors publishes its own archive alongside this
+one and cites it separately.
 
-Errata are raised as issues on the project repository. Each published revision is
-archived with its own DOI under the concept DOI above and recorded in Appendix D.
+A tape written against this specification will therefore still be read
+correctly by an implementation built from any later revision of it. A reader
+does not need to know which revision wrote a tape in order to read it; the
+Revision History appendix exists so that anyone can recover what a given
+revision's text said, not to identify writers.
 
-The conformance and freeze criteria set out in Section 18 are discharged, and
-the items collected in Appendix C are closed. This document remains the
+Errata are raised as issues on the project repository. Every published
+revision of this document is archived with its own DOI and recorded in the
+Revision History appendix.
+
+The conformance and freeze criteria set out in Section 18 are discharged,
+and the items collected in Appendix C are closed. This document remains the
 normative fixed point for the format: an implementation is validated against
 it, not the reverse. The arithmetic test vectors here (CRC, Reed–Solomon,
-canonical digest) are normative and can be re-derived from this text alone; the
-image-level vectors of Section 17 are *pinned-at-generation*, and the archive
-holding them is published with a checksum so you can confirm you have the same
-bytes we do.
+canonical digest) are normative and can be re-derived from this text alone;
+the image-level vectors of Section 17 are *pinned-at-generation*, and the
+archive holding them is published with a checksum so you can confirm you
+have the same bytes we do.
 
 ## Abstract
 
@@ -273,7 +319,7 @@ read from tape MUST be checked; overflow is rejection, never wraparound
 | Constant | Value |
 | --- | --- |
 | `BOOTSTRAP_MAGIC` | `52 45 4D 00 42 4F 4F 01` (`"REM\0BOO\x01"`, fixed bytes) |
-| `BOOTSTRAP_SCHEMA_MAJOR` / `MINOR` | 1 / 2 (minor 2 added REM-OBJECT object rows, key 30; Section 8.2.1) |
+| `BOOTSTRAP_SCHEMA_MAJOR` / `MINOR` | 1 / 3 — the reference writer's current values, not a conformance bound; see the Section 8.1.1 registry |
 | `BOOTSTRAP_HEADER_LEN` | 0x34 |
 | `FLAG_NO_PARITY` | bit 0 of the bootstrap flags |
 | `MAX_BOOTSTRAP_SCAN_BLOCKS` | 1024 |
@@ -549,9 +595,13 @@ declared payload extent (for the bootstrap, `cbor_payload_len`, Section 8.1);
 bytes after the map's definite-length encoding, within the declared payload,
 are a nonconformity. Decoders MUST reject duplicate keys and
 non-canonical encoding, and MUST ignore unknown integer keys at every map
-level — that is the format's 1.x extension mechanism: future minor revisions
-add keys; they never change the meaning of existing ones (a change that
-would, requires a new schema version or magic). Allocation while decoding
+level — that is the format's extension mechanism: a future revision of this
+document may assign new keys; it never changes the meaning of existing ones
+(a change that would, requires a new schema version or magic). An assigned
+key MUST NOT alter an existing field's meaning, the recovery outcome of any
+tape written without it, or any other rule this document enforces; an
+extension that would is a new major version, because an earlier reader
+ignoring the key would recover different results with no wire signal. Allocation while decoding
 MUST be bounded by the physically measured byte length of the input, never
 by counts read from the CBOR stream (Section 16.2).
 
@@ -779,8 +829,8 @@ A bootstrap tape file is exactly one block:
 | --- | ---: | --- | --- | --- |
 | 0x00 | 8 | magic | fixed bytes | `BOOTSTRAP_MAGIC` |
 | 0x08 | 2 | schema_major | **u16 BE** | MUST be 1; readers reject ≠ 1 |
-| 0x0A | 2 | schema_minor | **u16 BE** | readers accept any value (Section 8.1.1) |
-| 0x0C | 4 | flags | **u32 BE** | bit 0 = no-parity; all other bits MUST be 0 |
+| 0x0A | 2 | schema_minor | **u16 BE** | registry in Section 8.1.1; readers accept any value; payload rules MAY gate on it |
+| 0x0C | 4 | flags | **u32 BE** | bit 0 = no-parity; writers MUST zero all other bits; readers MUST ignore bits they do not recognise. A future flag may therefore carry only semantics an earlier reader can safely ignore; anything stronger requires a new `schema_major` |
 | 0x10 | 16 | tape_uuid | raw bytes | the tape's identity (16 opaque bytes; RECOMMENDED a version-4 UUID [RFC9562], unique per tape); the HMAC key of Section 5.2 |
 | 0x20 | 4 | block_size_bytes | **u32 BE** | MUST equal the size of the block it was read with |
 | 0x24 | 4 | sequence | **u32 BE** | 0 at BOT; strictly increasing across all copies |
@@ -803,30 +853,36 @@ discovery (Section 8.4) and classification (Section 12.3) — MUST NOT depend
 on the fill, so a damaged fill byte cannot cost the tape its entry point.
 This is the one deliberate exception to the Section 16.2 verify-zero rule.
 
-#### 8.1.1. Schema Minor Values (Informative)
+#### 8.1.1. Schema Minor Registry
 
-`schema_minor` counts revisions of the on-tape format. It is not this
-document's version number, and no arithmetic relates the two: an erratum
-changes no bytes on tape and so does not change `schema_minor`, and the wire
-format had already been revised several times before this document was first
-published.
+`schema_minor` counts revisions of the on-tape bootstrap format. It is not
+this document's version number, no arithmetic relates the two, and most
+revisions of this document assign no new value: a value is assigned only
+when a wire-visible change warrants signaling, by the document revision that
+defines the change.
 
-Readers accept any value. That is what makes the format forward compatible: a
-reader built against an older revision meets a higher `schema_minor`, ignores
-the keys it does not recognise (Section 5.3), and reads the tape correctly.
+| `schema_minor` | Status | Defined by | Wire meaning |
+| ---: | --- | --- | --- |
+| 0–1 | historic | pre-publication drafts | development-era values; absent from the published vectors |
+| 2 | historic | REM-PARITY 1.0 | object rows carry no `object_id` requirement (key 4 optional) |
+| 3 | **current** | REM-PARITY 1.0 | `object_id` (key 4) REQUIRED in every object row (Section 8.2.1) |
+| ≥ 4 | unassigned | a future revision of this document | a value here indicates a tape written under a later revision; retrieve the current revision via this document's concept DOI |
 
-This specification places no constraint on the value a writer emits, and it is
-worth recording why, because the obvious rule is not available. The pinned
-vectors of Section 17 were generated across a period in which the field was
-advanced twice: bootstrap images in the published archive carry `2` or `3`
-depending on when they were produced, and both are conformant under version
-1.0. Requiring a single value now would make most of this specification's own
-normative vectors non-conformant, which is a worse outcome than a field whose
-1.0-era values are simply documented.
+Readers accept any value in the fixed frame — that is deliberate, and unlike
+`format_version` in REM-ENCRYPT, whose unassigned values are hard errors.
+Individual payload rules MAY be gated on the value, as key 4 is; the gate
+travels with the row that defines it. A writer SHOULD emit the current
+value. The published vector archive contains images at both 2 and 3,
+generated as the field advanced; all are conformant anchors of revision 1.0.
 
-A reader wanting to know which implementation revision wrote a tape should
-treat `schema_minor` as a hint and rely on the object rows and manifests for
-anything load-bearing.
+To identify what defines a tape in hand: read `schema_major` and
+`schema_minor` from any bootstrap (Section 8.1) — each assigned value's
+defining revision is named in this registry; read the object rows for the
+identities and geometry of what is stored (Section 8.2.1). Every revision of
+this document is retrievable through its concept DOI. Which revision *wrote*
+the tape is not recorded on the wire and is not needed for reading; treat
+`schema_minor` as provenance only where this registry gives it a wire
+meaning.
 
 ### 8.2. CBOR Payload
 
@@ -861,7 +917,7 @@ strictly increasing `tape_file_number` order:
 | 1 | uint | REQUIRED | filemark-delimited object `tape_file_number` |
 | 2 | tstr | REQUIRED | representation marker: `"plaintext"` or `"encrypted"` |
 | 3 | uint | REQUIRED | stored block count for the object tape file |
-| 4 | bytes, 1–64 | REQUIRED from minor 3 | REM-OBJECT `object_id` — the identity the archive answers "where is object X" with — carried verbatim as its 1–64 non-NUL bytes (any REM-ENCRYPT envelope NUL padding from [REMENCRYPT] §5.2 stripped). This matches [REMOBJECT] §4.5.1 exactly: opaque UTF-8, 1–64 bytes, with no conversion. Readers of minors ≤ 2 tolerate its absence; a Writer at minor 3 or later MUST emit it. |
+| 4 | bytes, 1–64 | REQUIRED from minor 3 | REM-OBJECT `object_id` — the identity the archive answers "where is object X" with — carried verbatim as its 1–64 non-NUL bytes (any REM-ENCRYPT envelope NUL padding from [REMENCRYPT] §5.2 stripped). This matches [REMOBJECT] §4.5.1 exactly: opaque UTF-8, 1–64 bytes, with no conversion. Readers of minors ≤ 2 tolerate its absence; a Writer at minor 3 or later MUST emit it, and a Reader MUST reject an object row lacking it when `schema_minor` ≥ 3 (exercised by the `bootstrap-object-id-65` negative vector). |
 | 10 | uint | plaintext only | `manifest_first_chunk_lba` |
 | 11 | uint | plaintext only | `manifest_size_bytes` |
 | 12 | uint | plaintext only | `manifest_chunk_count` |
@@ -897,14 +953,18 @@ Writer MUST preserve rows for the committed prefix and append rows for new
 objects; it MUST NOT emit a later authoritative bootstrap that silently drops
 previously committed object rows.
 
-Version 1.0 defines no external overflow carrier for key-30 rows. Therefore a
+No revision of this document has defined an external overflow carrier for
+key-30 rows, and a future revision that defines one MUST signal it with a
+new `schema_minor` value (Section 8.1.1), so that an earlier reader meets a
+registry value rather than silently under-reporting the tape's contents.
+Therefore a
 Writer that implements REM-OBJECT object rows MUST perform admission control before
 starting a new object and MUST reject the write if the resulting mandatory
 row set could not fit in every subsequent bootstrap payload that must carry
 it. The rejection happens before object bytes are written; failing only at
 checkpoint or `finish()` time is nonconformant. A future minor version MAY
 define an external carrier through an unknown bootstrap key, but readers MUST
-NOT infer such a carrier in version 1.0.
+NOT infer such a carrier under any `schema_minor` value this document defines.
 
 A Writer that reaches this directory ceiling MUST seal at the last durable
 checkpoint boundary and direct subsequent placement to another tape. It MUST
@@ -968,7 +1028,11 @@ configured read size.
 
 A conformant Writer for production media MUST use one of the discovery-candidate
 block sizes. This closes the writer-legal set over the discovery set: every
-conformant tape is discoverable from the media alone, with no out-of-band hint. A
+conformant tape is discoverable from the media alone, with no out-of-band
+hint. The discovery-candidate set is frozen for the life of `schema_major`
+1; extending it is a new major version, because a Scanner conforming to an
+earlier revision cannot distinguish a tape at an unrotated block size from
+an empty medium. A
 Scanner MUST nevertheless accept an operator-supplied block-size hint and
 apply it as a configured read size — the hint path serves damaged-media
 recovery and nonconformant tapes, not Writer freedom.
@@ -2058,9 +2122,13 @@ the short row uses `R = 1`.
 
 ## 18. Conformance and Freeze Criteria
 
-This specification is a draft until all of the following hold; after
-freeze, no normative change is permitted other than errata that do not
-change the set of valid tapes (anything else is version 2):
+These criteria gated the freeze of this specification; all of them hold, as
+recorded in the freeze record and the Revision History appendix. After
+freeze, revisions are governed by the change policy in the Status of This
+Document section: errata and conforming minor revisions are permitted, and
+anything that would invalidate an existing tape or leave an earlier reader
+unable to identify and cleanly refuse a newer one is a new major version.
+The criteria were:
 
 1. At least one complete implementation implements this document in every
    role — Writer, Scanner, Recoverer, Resumer, Verifier — with no known
@@ -2119,9 +2187,9 @@ governed by its versioning rules; no registry is established or required.
 - [FIPS180-4] — National Institute of Standards and Technology, "Secure
   Hash Standard (SHS)", FIPS PUB 180-4, August 2015 (defines SHA-256),
   <https://doi.org/10.6028/NIST.FIPS.180-4>.
-- [REMOBJECT] — "REM-OBJECT Core Format 1.0", companion specification: the
+- [REMOBJECT] — "REM-OBJECT Core Format", Version 1.0 or any later 1.x revision (published against 1.0.1), companion specification: the
   reference payload format and plaintext object-row semantics.
-- [REMENCRYPT] — "REM-ENCRYPT 1.0", companion specification: encrypted
+- [REMENCRYPT] — "REM-ENCRYPT", Version 1.0 or any later 1.x revision (published against 1.0.1), companion specification: encrypted
   representation and encrypted object-row field semantics.
 
 CRC-64/XZ is fully parameterized in Section 5.1; no external reference is
@@ -2381,17 +2449,25 @@ discard physically written but uncheckpointed orphan bundles and truncate
 them before append. This journal version is deliberately not recorded on
 tape and does not change any REM-PARITY media byte.
 
-## Appendix C. Open Items Before Freeze (Informative)
+## Appendix C. Open Items Before Freeze (Informative; all resolved)
+
+Every item below was closed before the freeze; the parenthetical notes name
+the resolutions. The freeze record referenced from the Revision History
+carries the full evidence.
 
 1. **Pinned-at-generation image vectors** (Section 17). The byte-level tape
    images and their digest chains must be generated, independently
    re-derived by a second implementation, and frozen into the test-vector
-   distribution (Section 18 criterion 2).
+   distribution (Section 18 criterion 2) (resolved — archive published and
+   re-pinned once at SHA `77be73e7…`; independently re-derived by the
+   spec-only Python tool, which the archive itself now carries).
 2. **Descriptor-format sense classification.** Section 3.5 requires
    filemark/EOD boundary classification for both fixed- and
    descriptor-format SCSI sense; an implementation that classifies
    filemarks from fixed-format sense only does not yet meet it, and closing
-   that gap is a freeze item.
+   that gap is a freeze item (resolved — descriptor-format sense classified
+   through the same classifiers as fixed-format; unit-tested over synthetic
+   descriptor buffers).
 3. **The last-resort full filemark-walk scan** (Section 8.4 step 5) is a
    SHOULD-offer whose operational parameters (geometry hints, abort
    conditions, progress reporting) are not yet specified (resolved —
@@ -2411,51 +2487,70 @@ tape and does not change any REM-PARITY media byte.
 5. **Throughput program.** Accelerated GF(2⁸) and CRC kernels must land and
    be proven byte-identical via the Section 17 vectors (Section 18
    criterion 6) before freeze, so the conformance anchor is generated at
-   production speed and layout.
+   production speed and layout (resolved — attestation tests tie the
+   table-based GF(2⁸) path to the bitwise definitions exhaustively over all
+   65,536 operand pairs, and CRC-64/XZ to its published check value).
 6. **Key-30 recovery tooling.** Bootstrap object rows (Section 8.2.1) need a
    scanner/recovery reader that validates each row against the
    recovered filemark map and emits a catalog-less recovery report for both
-   plaintext and encrypted REM-OBJECT objects, demonstrated before format freeze.
+   plaintext and encrypted REM-OBJECT objects, demonstrated before format
+   freeze (resolved — `rem-debug tape recovery-report`; the archive carries
+   parity-protected plaintext and encrypted key-30 vectors exercising it).
 
 ## Appendix D. Revision History (Informative)
 
-- **2026-07-31 — 1.0.1, first erratum.** Status of This Document rewritten:
-  states that no standards body has reviewed or adopted this specification, and
-  sets out the three kinds of revision permitted. The previous wording forbade
-  any normative change under version 1, which contradicted Section 5.3's 1.x
-  extension mechanism. The minor-revision rule is stated as an outcome test — a
-  minor revision may make any change that leaves every earlier tape valid and
-  every earlier reader working — rather than as a list of permitted mechanisms.
-  Section 8.1.1 added, recording that `schema_minor` counts on-tape format
-  revisions rather than document versions, that the published vectors carry
-  both `2` and `3` under version 1.0, and that no writer constraint is imposed
-  for that reason. Editorial only; the set of valid tapes is unchanged and no
-  implementation obligation is added or removed.
+Entries are newest first. Each carries: date · version · kind
+(erratum / minor / major / draft milestone) · what changed and its effect on
+conformance. Draft-era milestones predate publication under a DOI and are
+marked `[draft]`.
 
-- **2026-06-11 — first draft.** Initial publication baseline, archived with
-  release v1.0.0.
-- **2026-07-21 — pre-freeze revisions.** Writer-legal block sizes closed
-  over the discovery-candidate set (Section 8.4); object identity row keys
-  clarified (Section 8.2.1); epochs redefined as explicit ordinal ranges
-  with bare-counter ids (Sections 3.3, 10.5) and short epochs legalized at
-  any checkpoint boundary with `FINAL_PARTIAL_EPOCH` reserved for terminal
-  `finish()` (Sections 10.5, 11.2); the bootstrap directory ceiling made an
-  admission-time refusal with mandatory headroom and seal-at-ceiling
-  (Section 8.2.1); reference journal watermark note (Appendix B.12).
-- **2026-07-22 — tape-alone recovery claims.** Ordered persistence and the
-  synchronizing barrier made normative requirements on the tape I/O layer
+- **2026-07-31 — 1.0.1 — erratum, including a flagged policy correction.**
+  Status of This Document rewritten around three ordered classification
+  questions (invalidate → major; earlier readers cannot cleanly refuse →
+  major; obligations or registry assignment → minor under three conditions;
+  otherwise erratum), with the axis-independence principle stated and the
+  worked classifications listed. Section 18's preamble corrected — it still
+  said "no normative change … other than errata … anything else is version
+  2", which forbade the minor tier the Status section defines; this is the
+  policy correction, flagged as such under the policy's own carve-out.
+  Section 8.1.1 rewritten as the schema-minor registry (Defined-by and wire
+  meanings; 2 = `object_id` optional, 3 = `object_id` required), replacing
+  both the "no arithmetic" note and the stale `1 / 2` in Section 2.5.
+  Reader obligation at `schema_minor` ≥ 3 stated in Section 8.2.1, matching
+  the reference implementation and the `bootstrap-object-id-65` negative
+  vector. Reader rule for unrecognised `flags` bits stated (ignore),
+  matching the reference implementation. Section 5.3 gains the
+  semantics-freeze rule including recovery outcomes. The key-30
+  overflow-carrier prohibition re-anchored from "version 1.0" to the
+  registry mechanism. Section 8.4's discovery-candidate set declared frozen
+  for the life of `schema_major` 1. Appendix C items annotated resolved.
+  DOI table corrected: the software deposit's DOI is informative and the
+  false "Version DOI (this release)" row removed. No tape becomes valid or
+  invalid; the only implementation-visible additions state what the
+  reference implementation and pinned vectors already do.
+- **2026-07-29 — [draft] pre-freeze revisions II.** Last-resort
+  filemark-walk operational envelope specified (Section 8.4.1), with
+  inter-file positioning exempted from the Section 8.4 rule-6 abort;
+  bootstrap re-typing promoted from SHOULD to MUST with operational
+  candidate criteria (Section 12.4) — reader-obligation changes with no
+  effect on the set of valid tapes; Appendix C items 3 and 4 resolved.
+- **2026-07-22 — [draft] tape-alone recovery claims.** Ordered persistence
+  and the synchronizing barrier made normative on the tape I/O layer
   (Section 3.5); commit discipline extended with batched deferred
   synchronization and staged-record semantics (Sections 3.4, 11.1); the
-  attested prefix and the bare-tape tail taxonomy
-  (attested / unattested / truncated) specified with salvage rules
-  (Section 12.6); Appendix B.8 reframed from "no on-tape commit marker" to
-  per-file-marker rationale plus barrier-grain structural attestation.
-- **2026-07-29 — pre-freeze revisions II.** Last-resort filemark-walk
-  operational envelope specified (Section 8.4.1), with inter-file
-  positioning explicitly exempted from the Section 8.4 rule-6 abort;
-  bootstrap re-typing promoted from SHOULD to MUST with operational candidate
-  criteria (Section 12.4) — reader-obligation changes with no effect on the
-  set of valid tapes; Appendix C items 3 and 4 resolved.
+  attested prefix and the bare-tape tail taxonomy specified with salvage
+  rules (Section 12.6); Appendix B.8 reframed to per-file-marker rationale
+  plus barrier-grain structural attestation.
+- **2026-07-21 — [draft] pre-freeze revisions.** Writer-legal block sizes
+  closed over the discovery-candidate set (Section 8.4); object identity
+  row keys clarified (Section 8.2.1); epochs redefined as explicit ordinal
+  ranges with bare-counter ids and short epochs legalized at any checkpoint
+  boundary with `FINAL_PARTIAL_EPOCH` reserved for terminal `finish()`
+  (Sections 3.3, 10.5, 11.2); the bootstrap directory ceiling made an
+  admission-time refusal with mandatory headroom and seal-at-ceiling
+  (Section 8.2.1); reference journal watermark note (Appendix B.12).
+- **2026-06-11 — [draft] first draft.** Initial publication baseline,
+  archived with software release v1.0.0.
 
 ## Author's Address
 

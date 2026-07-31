@@ -35,3 +35,7 @@ publication-test-vectors:
 
 verify-publication-test-vectors:
 	python3 tools/verify_publication_test_vectors.py
+	python3 tools/check_spec_versioning.py
+
+check-spec-versioning:
+	python3 tools/check_spec_versioning.py
