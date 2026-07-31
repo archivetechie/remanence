@@ -1,10 +1,22 @@
 # The Remanence Formats, Explained
 
-*A companion to REM-OBJECT Core Format 1.0, REM-ENCRYPT 1.0, and the
-REM-PARITY Tape Format Specification. This document is informative: it
+*A companion to REM-OBJECT Core Format 1.0, REM-ENCRYPT 1.0, and the Rem
+Tape Parity (REM-PARITY) Format 1.0. This document is informative: it
 explains what the formats do and why they are shaped the way they are, in
 plain language. The specifications remain the only normative documents—where
 this text and a specification disagree, the specification wins.*
+
+| | |
+| --- | --- |
+| Status | Informative companion |
+| Version | 1.0.1 |
+| Date | 2026-07-31 |
+| License | CC-BY-4.0 |
+
+This companion is versioned and archived like the specifications it
+accompanies, so that a citation of it names immutable text; its version
+numbers follow the same three-part convention, and its revisions are errata
+unless a specification revision obliges more.
 
 ---
 
@@ -458,7 +470,7 @@ is precisely the point.
 - **REM-ENCRYPT 1.0** — the normative definition of the encrypted
   representation: envelope, key recovery, encrypted range reads, envelope
   vectors, and cryptographic security rules.
-- **The REM-PARITY Tape Format Specification** — the normative definition
+- **Rem Tape Parity (REM-PARITY) Format 1.0** — the normative definition
   of the on-tape layout: bootstrap, parity, recovery procedures.
 - **The reference implementation** — the Remanence project, an open Rust
   tape archival stack that produces and consumes these formats:
