@@ -55,11 +55,14 @@ documents and published artifacts themselves.
 
 ### 3. The bootstrap block — `flags`
 
-- **What it is.** A 32-bit field of on/off switches. One is assigned:
-  bit 0 means "this tape was deliberately written without parity."
+- **What it is.** A field of 32 on/off switches. One switch is assigned —
+  the lowest-order bit: switched on (1), it means "this tape was
+  deliberately written without parity"; switched off (0), the usual case,
+  parity is present.
 - **Where.** Offset 0x0C of every bootstrap block. Normative: REM-PARITY
-  §8.1.
-- **Current values.** Bit 0 assigned; all other bits are written as zero.
+  §8.1; the constant is defined in §2.5.
+- **Current values.** One switch assigned; the other 31 are written as
+  zero.
 - **Unknown value.** Readers MUST ignore flag bits they do not recognise.
 - **How it changes.** Because old readers ignore unknown bits, a future
   flag may only carry a meaning that is safe for an old reader to ignore.
