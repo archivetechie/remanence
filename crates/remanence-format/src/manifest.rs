@@ -591,14 +591,17 @@ impl<'a> ProfileDecoder<'a> {
     }
 
     fn skip_item(&mut self, depth: usize) -> Result<(), FormatError> {
-        if depth > MANIFEST_MAX_DEPTH {
-            return Err(FormatError::cbor("manifest nesting depth exceeds limit"));
-        }
         let (major, len, _encoding) = self.read_type_len()?;
         self.skip_item_payload(depth, major, len)
     }
 
     fn skip_item_payload(&mut self, depth: usize, major: u8, len: u64) -> Result<(), FormatError> {
+        // The single depth bound for the whole profile. It lives here, not in
+        // `skip_item`, because `skip_map` recurses into map *values* through this
+        // function directly; guarding only `skip_item` left map nesting unbounded.
+        if depth > MANIFEST_MAX_DEPTH {
+            return Err(FormatError::cbor("manifest nesting depth exceeds limit"));
+        }
         match major {
             0 => Ok(()),
             2 => {
@@ -1255,5 +1258,48 @@ mod tests {
             preservation.entries["a.bin"].extensions[extension_name],
             RemTarCborValue::Bytes(b"opaque".to_vec())
         );
+    }
+
+    /// The profile's depth bound must apply to map values, not only to items
+    /// reached through `skip_item`. A chain of N nested single-entry maps used
+    /// as a top-level key's value reaches max depth N+2: the top-level map is
+    /// depth 1, each nested map adds one, and the primitive leaf is checked too.
+    /// So a 6-chain reaches depth 8 (the limit, accepted) and a 7-chain reaches
+    /// depth 9 (rejected). Before the bound was hoisted into `skip_item_payload`,
+    /// every one of these was accepted regardless of length.
+    fn nested_map_chain(chain_len: usize) -> Vec<u8> {
+        let mut nested = vec![0xf6]; // null leaf
+        for _ in 0..chain_len {
+            nested = cbor_map(vec![("k", nested)]);
+        }
+        base_manifest_with(512, vec![("zzzzzzzzzzzzzzzzzzzz", nested)])
+    }
+
+    #[test]
+    fn manifest_map_nesting_at_max_depth_is_accepted() {
+        // 6 nested maps => max depth 8 == MANIFEST_MAX_DEPTH.
+        validate_manifest_profile(&nested_map_chain(6))
+            .expect("a map chain reaching exactly MANIFEST_MAX_DEPTH must be accepted");
+    }
+
+    #[test]
+    fn manifest_map_nesting_beyond_max_depth_is_rejected() {
+        // 7 nested maps => max depth 9 > MANIFEST_MAX_DEPTH.
+        let err = validate_manifest_profile(&nested_map_chain(7))
+            .expect_err("a map chain exceeding MANIFEST_MAX_DEPTH must be rejected");
+        assert!(
+            format!("{err}").contains("nesting depth"),
+            "expected the depth bound to reject it, got: {err}"
+        );
+    }
+
+    #[test]
+    fn manifest_deep_map_nesting_is_rejected_at_every_length_beyond_max() {
+        for chain_len in 7..12 {
+            assert!(
+                validate_manifest_profile(&nested_map_chain(chain_len)).is_err(),
+                "map chain of {chain_len} must be rejected"
+            );
+        }
     }
 }
