@@ -6,8 +6,11 @@ per-release summaries.
 
 ## v1.0.0 — 2026-07-25
 
-First publication release of the Remanence reference implementation and the
-open tape-archive format it writes. Archived: concept DOI
+First release of the Remanence reference implementation, distributed with the
+format documents as a **review draft** (they were marked "Draft for review";
+the specifications reached their first published revision on 2026-07-31 and
+are deposited separately — see each document's Status section). Archived:
+concept DOI
 [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570), version DOI
 [10.5281/zenodo.21551571](https://doi.org/10.5281/zenodo.21551571).
 
@@ -24,7 +27,11 @@ open tape-archive format it writes. Archived: concept DOI
 - **Verification** — a pinned test-vector archive accompanies the specifications;
   an independent Python reader written from the specification text alone
   reproduces every vector, including malformed inputs and their required errors.
-  The archive SHA-256 is
-  `77be73e780e9ff2c265c8357b6ba684b4c69800213820ae1331850f742b1d83d`.
+  The archive current at this release was
+  `b9be8760…`; the archive pinned by the specifications' first published
+  revision is
+  `77be73e780e9ff2c265c8357b6ba684b4c69800213820ae1331850f742b1d83d`, which
+  adds the REM-OBJECT object-row vectors and the independent re-derivation
+  tool without altering any pre-existing member.
 - **Licensing** — the Rust reference implementation is Apache-2.0, the
   specification prose CC-BY-4.0, and the conformance vectors CC0-1.0.
