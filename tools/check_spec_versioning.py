@@ -79,6 +79,7 @@ def policy_core(text: str, noun: str) -> str:
     # PARITY carries an extra example sentence inside question 2; strip
     # parentheticals so per-document examples are permitted.
     core = re.sub(r"\([^)]*\)", " ", core)
+    core = re.sub(r"\ban ARTIFACT", "a ARTIFACT", core)
     return re.sub(r"\s+", " ", core).strip()
 
 

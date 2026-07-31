@@ -67,7 +67,7 @@ by three questions, asked in order.
    permitted only if all three of the following hold: every encrypted object written
    under an earlier revision of this major remains valid; a reader built
    from an earlier revision still reads correctly every encrypted object that uses
-   only the features defined at or before that revision; and on a encrypted object
+   only the features defined at or before that revision; and on an encrypted object
    that uses a feature it does not implement, that reader identifies the
    encrypted object and refuses it with a typed error naming the unimplemented value —
    it never misreads, and never mistakes the encrypted object for damage. A minor
