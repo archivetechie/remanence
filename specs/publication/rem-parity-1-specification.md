@@ -1204,7 +1204,7 @@ size for sidecars is 0xC0.
 | 0x78 | 8 | footer_block_index u64 | MUST = 2H + P |
 | 0x80 | 2 | copy_kind u16 | 1 = primary, 2 = tail |
 | 0x82 | 2 | reserved | MUST be 0 |
-| 0x84 | 4 | copy_generation u32 | MUST be 0 in version 1 |
+| 0x84 | 4 | copy_generation u32 | MUST be 0 while sidecar `schema_version` = 1 |
 | 0x88 | 32 | canonical_metadata_hash | Section 9.5 |
 | 0xA8 | 8 | reserved u64 | MUST be 0 |
 | 0xB0 | 8 | header_crc64 | CRC-64/XZ over bytes 0x00..0xB0 |

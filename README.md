@@ -142,6 +142,11 @@ tape write, is [docs/guide-quickstart.md](docs/guide-quickstart.md).
   fences, and permissions.
 - [Glossary](docs/reference-glossary.md) — project terms and tape
   vocabulary.
+- [How the formats change — and what never does](docs/versioning-explained.md)
+  — the versioning and revision policy, in plain language.
+- [The versioning register](docs/versioning-register.md) — every versioned
+  component of the system, one entry each: current values, unknown-value
+  behaviour, and how each ever changes.
 - [The formats, explained](specs/publication/formats-explained.md) —
   a plain-language companion to the specifications: the motivation and
   the design, without the normative terseness.
