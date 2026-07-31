@@ -8,6 +8,7 @@ precedence over a broader one.
 | `crates/**` | `Apache-2.0` | [`LICENSE-APACHE-2.0`](LICENSE-APACHE-2.0) |
 | `fieldtest/tools/remfield-io/**` | `Apache-2.0` | [`LICENSE-APACHE-2.0`](LICENSE-APACHE-2.0) |
 | `specs/**` | `CC-BY-4.0` | [`LICENSE-CC-BY-4.0`](LICENSE-CC-BY-4.0) |
+| `specs/publication/provenance/**` | (third party) | Vendored IETF Internet-Drafts, under IETF Trust BCP 78/79 — not covered by this repository's licenses |
 | `specs/publication/remanence-test-vectors.tar` | `CC0-1.0` | [`LICENSE-CC0-1.0`](LICENSE-CC0-1.0) |
 | `fixtures/**` | `CC0-1.0` | [`LICENSE-CC0-1.0`](LICENSE-CC0-1.0) |
 

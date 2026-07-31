@@ -6,7 +6,7 @@
 | --- | --- |
 | Status | Final |
 | Document version | 1.0 |
-| Version | 1.0.1 |
+| Version | 1.0.0 |
 | Date | 2026-07-31 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719156](https://doi.org/10.5281/zenodo.21719156) |
@@ -76,8 +76,8 @@ policy correction in the revision history, because the alternative — a
 policy that cannot correct its own wording — would freeze its mistakes.
 
 Version numbers are always three-part. The Identifiers table at the head of
-this document names the major.minor line; the Version row in this section is
-the full revision.
+this document carries both: its `Document version` row names the major.minor
+line, and its `Version` row is the full revision.
 
 For orientation, the classifications of the changes most likely to be
 proposed (informative): a new optional bootstrap key — minor; a new damage
@@ -154,9 +154,11 @@ damaged block is the first block of the very file that describes it.
 19. [IANA Considerations](#19-iana-considerations)
 20. [References](#20-references)
 
-Appendix A. [Worked Examples (Informative)](#appendix-a-worked-examples-informative)
-Appendix B. [Design Rationale (Informative)](#appendix-b-design-rationale-informative)
-Appendix C. [Open Items Before Freeze (Informative)](#appendix-c-open-items-before-freeze-informative)
+Appendix A. [Worked Examples (Informative)](#appendix-a-worked-examples-informative)  
+Appendix B. [Design Rationale (Informative)](#appendix-b-design-rationale-informative)  
+Appendix C. [Open Items Before Freeze (Informative; all resolved)](#appendix-c-open-items-before-freeze-informative-all-resolved)  
+Appendix D. [Revision History (Informative)](#appendix-d-revision-history-informative)  
+[Author's Address](#authors-address)
 
 ---
 
@@ -322,7 +324,8 @@ read from tape MUST be checked; overflow is rejection, never wraparound
 | Constant | Value |
 | --- | --- |
 | `BOOTSTRAP_MAGIC` | `52 45 4D 00 42 4F 4F 01` (`"REM\0BOO\x01"`, fixed bytes) |
-| `BOOTSTRAP_SCHEMA_MAJOR` / `MINOR` | 1 / 3 — the reference writer's current values, not a conformance bound; see the Section 8.1.1 registry |
+| `BOOTSTRAP_SCHEMA_MAJOR` | 1 — normative: readers MUST reject any other value (Section 8.1) |
+| `BOOTSTRAP_SCHEMA_MINOR` | 3 — the reference writer's current value, not a conformance bound; see the Section 8.1.1 registry |
 | `BOOTSTRAP_HEADER_LEN` | 0x34 |
 | `FLAG_NO_PARITY` | bit 0 of the bootstrap flags |
 | `MAX_BOOTSTRAP_SCAN_BLOCKS` | 1024 |
@@ -330,7 +333,6 @@ read from tape MUST be checked; overflow is rejection, never wraparound
 | `SIDECAR_MAGIC_LABEL` | `"REM\0PAR\x01"` (8 bytes: `52 45 4D 00 50 41 52 01`) |
 | `SIDECAR_FOOTER_MAGIC_LABEL` | `"REM\0PARFOOT\x01"` (12 bytes: `52 45 4D 00 50 41 52 46 4F 4F 54 01`) |
 | `PARITY_MAP_MAGIC_LABEL` | `"REM\0PMAP\x01"` (9 bytes: `52 45 4D 00 50 4D 41 50 01`) |
-| `PARITY_MAP_FOOTER_MAGIC_LABEL` | `"REM\0PMAPFOOT\x01"` (13 bytes: `52 45 4D 00 50 4D 41 50 46 4F 4F 54 01`) |
 | `SIDECAR_SCHEMA_VERSION` | 1 |
 | `SIDECAR_HEADER_LEN` / header CRC offset | 0xB8 / 0xB0 |
 | `SIDECAR_FOOTER_LEN` / footer CRC offset | 0x80 / 0x78 |
@@ -343,7 +345,7 @@ read from tape MUST be checked; overflow is rejection, never wraparound
 | Default scheme | k = 128, m = 4, S = 512 at 256 KiB blocks (Section 6.6) |
 | `SIDECAR_METADATA_HASH_DOMAIN` | `"remanence-sidecar-metadata-v1"` (29 ASCII bytes) |
 | Tape-file kind codes | Object = 0, ParitySidecar = 1, Bootstrap = 2, ParityMap = 3 |
-| Minimum block sizes | bootstrap frame 0x3C; parity_map 0xB8; sidecar 0xC0 |
+| Minimum block sizes | bootstrap frame 0x3C; parity_map 0xB8; sidecar 0xD0 |
 
 ## 3. Tape Model and Address Spaces
 
@@ -579,7 +581,12 @@ tape identity from the bootstrap, `LABEL` is the role's ASCII label from
 Section 2.5 (label bytes exactly as listed, including the embedded NUL and
 trailing 0x01; no terminator added), and `[0..8]` takes the first 8 bytes of
 the 32-byte MAC. The label bytes never appear on tape. Each block role has a
-distinct label (sidecar header vs footer; parity_map header vs footer). The
+distinct label, with one deliberate exception: the sidecar header and footer
+carry distinct labels, while the `parity_map` header and footer share
+`PARITY_MAP_MAGIC_LABEL` — a `parity_map` footer is identified by its
+position (the last block of the file) and by `copy_kind` being reserved-zero
+where a header carries 1 or 2, so magic equality across all three blocks of
+the file is itself part of the locator check (Section 10.3). The
 bootstrap magic alone is a fixed byte string, because the reader does not
 yet know the tape UUID when it searches for a bootstrap (Section 8.1).
 Derived magics are an *identity* mechanism — these blocks belong to this
@@ -590,8 +597,9 @@ tape and role — not authentication (Section 16.1).
 All CBOR frame payloads in this format are single definite-length,
 integer-keyed maps in RFC 8949 deterministic encoding: shortest-form
 integers and lengths, map keys sorted in ascending order of their
-deterministic encodings, no duplicate keys, no tags, no floats, no
-indefinite-length items. The Section 7.3 canonical-digest preimage is not a
+deterministic encodings — compared first by encoded length, then
+lexicographically by encoded bytes, as [RFC8949] Section 4.2.1 specifies —
+no duplicate keys, no tags, no floats, no indefinite-length items. The Section 7.3 canonical-digest preimage is not a
 frame payload or a map: it applies these canonical-encoding rules to its
 specified array-of-arrays structure. Each payload map MUST occupy its entire
 declared payload extent (for the bootstrap, `cbor_payload_len`, Section 8.1);
@@ -710,7 +718,7 @@ verify-after-reconstruction anchors (Section 13.4, 13.5).
 ### 6.8. Normative Vectors
 
 ```text
-gf_inv(0x02) = 0x8E      gf_inv(0x03) = 0xF4
+inv(0x02) = 0x8E         inv(0x03) = 0xF4
 
 k = 2, m = 2  ⇒  G = [[0x8E, 0xF4],
                       [0xF4, 0x8E]]
@@ -909,13 +917,13 @@ A single integer-keyed map (Section 5.3):
 
 Keys 20 and 21 are mutually exclusive; both present is a parse error. A
 **no-parity bootstrap** (flag bit 0 set) marks a tape written without parity
-protection; it MAY omit everything except the fixed frame, and readers MUST
-NOT require the scheme or digest records on it. For a parity bootstrap the
+protection; it MAY omit the scheme record (key 1) and the digest record
+(key 2), and readers MUST NOT require those records on it. For a parity bootstrap the
 scheme record's `scheme_id` MUST be `rs-cauchy-gf256-v1` and `(k, m, S)`
 MUST satisfy Section 6.6 validity. Unknown keys are ignored at every level
 (Section 5.3). Writers SHOULD populate keys 3 and 4; absence is conformant.
 
-### 8.2.1. REM-OBJECT Object Rows
+#### 8.2.1. REM-OBJECT Object Rows
 
 Key 30, when present, is an array of integer-keyed object row maps in
 strictly increasing `tape_file_number` order:
@@ -925,7 +933,7 @@ strictly increasing `tape_file_number` order:
 | 1 | uint | REQUIRED | filemark-delimited object `tape_file_number` |
 | 2 | tstr | REQUIRED | representation marker: `"plaintext"` or `"encrypted"` |
 | 3 | uint | REQUIRED | stored block count for the object tape file |
-| 4 | bytes, 1–64 | REQUIRED from minor 3 | REM-OBJECT `object_id` — the identity the archive answers "where is object X" with — carried verbatim as its 1–64 non-NUL bytes (any REM-ENCRYPT envelope NUL padding from [REMENCRYPT] §5.2 stripped). This matches [REMOBJECT] §4.5.1 exactly: opaque UTF-8, 1–64 bytes, with no conversion. Readers of minors ≤ 2 tolerate its absence; a Writer at minor 3 or later MUST emit it, and a Reader MUST reject an object row lacking it when `schema_minor` ≥ 3 (exercised by the `bootstrap-object-id-65` negative vector). |
+| 4 | bytes, 1–64 | REQUIRED from minor 3 | REM-OBJECT `object_id` — the identity the archive answers "where is object X" with — carried verbatim as its 1–64 non-NUL bytes, a bound exercised by the `bootstrap-object-id-65` negative vector (any REM-ENCRYPT envelope NUL padding from [REMENCRYPT] §5.2 stripped). This matches [REMOBJECT] §4.5.1 exactly: opaque UTF-8, 1–64 bytes, with no conversion. Readers of minors ≤ 2 tolerate its absence; a Writer at minor 3 or later MUST emit it, and a Reader MUST reject an object row lacking it when `schema_minor` ≥ 3 — a rule the reference implementation enforces, not yet anchored by a negative vector. |
 | 10 | uint | plaintext only | `manifest_first_chunk_lba` |
 | 11 | uint | plaintext only | `manifest_size_bytes` |
 | 12 | uint | plaintext only | `manifest_chunk_count` |
@@ -942,13 +950,16 @@ assignment; unknown keys are ignored).
 
 Key 10 (`manifest_first_chunk_lba`) is the zero-based block index, *within
 the object's tape file*, of the first block of the manifest entry's payload —
-a REM-OBJECT inner `BodyLba`, not a Section 3.2 physical LBA; one REM-OBJECT body block is
+a REM-OBJECT inner `BodyLba`, not a Section 3.2 Logical LBA; one REM-OBJECT body block is
 one tape block (Section 4.4). Key 11 is the manifest's payload byte length,
 key 12 its block count, and key 13 the SHA-256 of its CBOR bytes. Key 21 is the
 REM-ENCRYPT header's `metadata_frame_len`; key 22 records the
 recipient epoch ids present in its key frame; key 23 is the header's
-`key_frame_len`. Their semantics and bounds are defined by [REMENCRYPT], which is a
-normative reference for implementations of key 30.
+`key_frame_len`. The semantics of these three keys, and the key 21 and key 23
+bounds, are defined by [REMENCRYPT], which is a normative reference for
+implementations of key 30; the requirement that key 22's `recipient_epoch_id`
+values be distinct and nonzero is imposed by this document, for the benefit of
+a catalog-less scan that must tell recipient slots apart.
 
 Plaintext rows MUST carry keys 10–13 and MUST NOT carry keys 21–23.
 Encrypted rows MUST carry keys 21–23 and MUST NOT carry keys 10–13. For
@@ -969,8 +980,10 @@ previously committed object rows.
 
 No revision of this document has defined an external overflow carrier for
 key-30 rows, and a future revision that defines one MUST signal it with a
-new `schema_minor` value (Section 8.1.1), so that an earlier reader meets a
-registry value rather than silently under-reporting the tape's contents.
+new `schema_minor` value (Section 8.1.1), so that a tape carrying an
+external carrier is identifiable as such — without that signal an earlier
+reader would report fewer objects than the tape holds, with nothing on the
+wire to distinguish that from a tape that genuinely holds fewer.
 Therefore a
 Writer that implements REM-OBJECT object rows MUST perform admission control before
 starting a new object and MUST reject the write if the resulting mandatory
@@ -999,23 +1012,6 @@ normative; this format constrains only their observable consequences:
 checkpoint bootstraps MUST be written only at object boundaries, and
 sequence numbers MUST strictly increase across all bootstrap copies on one
 tape.
-
-**Final-directory redundancy.** The final full-scope directory (the
-`SidecarEpochDirectory` with `is_final_directory = true` covering the whole
-tape, Section 10.5) MUST survive the loss of any single tape file. A `finish()`
-(Section 11.3) MUST therefore write it as **at least two external full-scope
-`parity_map` tape files** (Section 12.4), physically separated by at least
-`S × m` blocks — the contiguous-damage tolerance of Section 1.1 — and never as
-two adjacent tape files, so that no single tolerated burst can destroy both. The
-final bootstrap MAY additionally carry the directory inline (key 20) or reference
-one of these copies (key 21), but **a single inline or referenced copy MUST NOT
-be the only non-bootstrap copy of the final directory**: were the final bootstrap
-block lost, an inline directory is lost with it, and a lone referenced
-`parity_map` is not reachable — structural discovery (Section 12.4) requires two
-`parity_map` files to select among (a single discovered map yields no overlay).
-Two full-scope `parity_map` copies are recovered by the Section 12.4 tie-break
-whether or not the final bootstrap survives, and their content disagreement, if
-any, is reported rather than silently resolved.
 
 ### 8.4. Discovery (Reader)
 
@@ -1053,7 +1049,9 @@ recovery and nonconformant tapes, not Writer freedom.
 
 **Test-geometry carve-out.** Conformance test vectors and other explicitly
 labelled test geometries (Section 10.7) MAY use a smaller block size — the
-published vectors use 4096-byte blocks — to keep the fixtures compact. Such a
+published image vectors use 4096-byte blocks, except the mandatory
+default-geometry header vector at 256 KiB (Section 17) — to keep the
+fixtures compact. Such a
 tape records its `block_size_bytes` in the bootstrap like any other and is read
 by supplying that size as a configured read size (the hint path above); it is not
 required to be discoverable from media alone. A block size outside the
@@ -1132,14 +1130,14 @@ ties keep the earlier find. The selected bootstrap's digest record then
 governs map validation (Section 12.4), and its scheme record pins the
 geometry every sidecar must agree with (Section 13.3).
 
-A bootstrap copy whose frame parses but whose payload fails validation (header
-or digest-record CRC, or the Section 10.5 directory invariants when it carries an
-inline directory) MUST be treated as **not found** for this selection — never
+A bootstrap copy whose frame parses but whose payload fails validation (the
+payload CRC of Section 8.1, or the Section 10.5 directory invariants when it
+carries an inline directory) MUST be treated as **not found** for this selection — never
 selected as authoritative on the strength of a parsed frame alone. Selection then
 falls through to the next readable copy and, if none governs the required scope,
-to structural discovery (Section 12.4). This is what lets a lost or corrupt final
-bootstrap fall back to the redundant full-scope `parity_map` copies (Section 8.3)
-rather than pinning recovery to a damaged authority.
+to structural discovery (Section 12.4). This is what lets a lost or corrupt
+final bootstrap fall back to whatever `parity_map` tape files survive on the
+medium, rather than pinning recovery to a damaged authority.
 
 ## 9. The Parity Sidecar Tape File
 
@@ -1182,7 +1180,8 @@ fields, never by the position of its index entry. The tail copy MUST
 carry metadata and index content identical to the primary — only
 `copy_kind` and the recomputed CRCs differ — and when both copies parse,
 readers MUST verify they agree and reject divergence. The minimum block
-size for sidecars is 0xC0.
+size for sidecars is 0xD0 — block 0 must hold the 0xB8-byte header, at least
+one 16-byte parity index entry, and the trailing 8-byte CRC.
 
 ### 9.2. The Header Block (block 0 of each copy) — all little-endian
 
@@ -1263,6 +1262,8 @@ inline = unset
 for each entry e in stream order (parity entries, then data-CRC entries):
     len = 16 if e is a parity entry else 8
     if offset + len > limit:
+        if offset == (0xB8 if blocks == 1 else 0):
+            reject: block_size cannot hold a len-byte index entry
         if blocks == 1 and inline is unset:  inline = offset − 0xB8
         blocks += 1
         offset  = 0                      (spill blocks: entries start at 0)
@@ -1272,9 +1273,12 @@ if inline is unset:  inline = offset − 0xB8
 H = blocks
 ```
 
-A block size too small to hold a single 16-byte entry in a spill block
-(or the header plus trailing CRC) is invalid for sidecars (minimum 0xC0,
-Section 2.5). A worked computation at the default geometry is in
+A block size too small to hold a single 16-byte entry — in block 0 after the
+header, or in a spill block — is invalid for sidecars (minimum 0xD0,
+Section 2.5). Because every sidecar carries at least one parity entry
+(Section 9.2 requires `S` and `m` to be non-zero), sizes 0xC0 through 0xCF
+satisfy the header-plus-CRC floor but still cannot pack the index, and are
+rejected by the guard above. A worked computation at the default geometry is in
 Appendix A.2.
 
 ### 9.5. The Canonical Metadata Hash
@@ -1357,7 +1361,7 @@ file) share one fixed 0xB8-byte region layout:
 
 | Offset | Len | Field | Header | Footer |
 | --- | ---: | --- | --- | --- |
-| 0x00 | 8 | magic | HMAC(tape_uuid, `PARITY_MAP_MAGIC_LABEL`)[0..8] | HMAC(tape_uuid, `PARITY_MAP_FOOTER_MAGIC_LABEL`)[0..8] |
+| 0x00 | 8 | magic | HMAC(tape_uuid, `PARITY_MAP_MAGIC_LABEL`)[0..8] | same — the footer deliberately shares the header magic (Section 5.2); it is distinguished by position and by `copy_kind` |
 | 0x08 | 2 | version u16 | schema_version, MUST be 1 | footer_version, MUST be 1 |
 | 0x0A | 2 | copy_kind u16 / reserved | 1 = primary, 2 = tail | reserved, MUST be 0 |
 | 0x0C | 4 | reserved u32 | MUST be 0 | MUST be 0 |
@@ -1378,6 +1382,7 @@ file) share one fixed 0xB8-byte region layout:
 | 0xA0 | 8 | tail_copy_start_block u64 | MUST = M | same |
 | 0xA8 | 8 | footer_block_index u64 | MUST = 2M | same |
 | 0xB0 | 8 | crc64 | CRC-64/XZ over bytes 0x00..0xB0 | same |
+| 0xB8… | | zero fill to block end | MUST be zero | same |
 
 Readers MUST validate the locator arithmetic (`M` from `payload_len` and
 `block_size`; total = 2M + 1; the three start indices) and reject
@@ -1546,9 +1551,10 @@ bounded-restart rule.
 
 Failure at any step MUST abandon the in-flight file (the boundary rolls
 back) and **poison the writer**: a poisoned writer refuses every subsequent
-operation on the session. One exception: a block-write failure whose
-completion state is *known* (the failed block consumed no position) MAY
-leave the writer usable; a completion-unknown failure MUST poison. The
+operation on the session. One exception: a write failure — of a block or of
+a filemark — whose completion state is *known* (the failed write consumed no
+position) MAY leave the writer usable; a completion-unknown failure MUST
+poison. The
 watermark `W` advances only after a sidecar's boundary commit.
 
 ### 11.2. Epochs and Sidecars
@@ -1614,7 +1620,8 @@ structural damage; EOD at a file start ends the walk.
 ### 12.3. The Classification Ladder (in order)
 
 1. **Bootstrap**: the fixed magic matches, the full frame parses, the
-   frame's `block_size_bytes` equals the read size, and the file measures
+   frame's `block_size_bytes` equals the read size, the payload's
+   `tape_uuid` equals the tape identity of Section 12.1, and the file measures
    exactly 1 block.
 2. **parity_map**: the primary header parses (per-tape derived magic); the
    measured block count MUST equal the header's
@@ -1645,10 +1652,26 @@ have classified the file.
 ### 12.4. Overlay and Validation
 
 After the walk, the Scanner applies the authoritative directory overlay, in
-priority order: the bootstrap's inline directory (key 20) → the bootstrap's
-`ParityMapReference` (key 21: read the referenced file, verify the payload
-SHA-256 and every cross-check; on any failure fall through) → a
-structurally discovered parity_map → none.
+priority order:
+
+1. the bootstrap's inline directory (key 20);
+2. the bootstrap's `ParityMapReference` (key 21): read the referenced file,
+   verify the payload SHA-256 and every cross-check; on any failure fall
+   through;
+3. the `ParityMapReference`'s locator alone, when the referenced file itself
+   could not be read or verified: the reference still names a tape file
+   number and block count, so the Scanner re-types that tape file as a
+   `parity_map` in the reconstructed map — provided the reference's
+   `block_count` equals the scanned length of that tape file and the scanned
+   classification is `Object` or `ParityMap`; a disagreement on either is a
+   hard error, not a fall-through;
+4. a structurally discovered parity_map;
+5. none.
+
+Structural discovery at step 4 requires **two or more** surviving
+`parity_map` tape files to select among: a single discovered map yields no
+overlay, because there is nothing to cross-check it against and no
+tie-break to apply.
 
 **Selecting among structurally discovered parity_maps.** When the overlay
 falls through to structurally discovered parity_map files — no bootstrap
@@ -1749,10 +1772,8 @@ renumbering, digest, and scope-scalar checks as the original scan. This
 requirement is deliberate: without re-typing, single-block damage to a
 checkpoint bootstrap would produce divergent recovery outcomes between
 implementations, and the Section 12.5 isolation guarantee would depend on
-optional behaviour.
-Without re-typing, single-block damage to a checkpoint bootstrap would
-invalidate every digest scope covering it, defeating the isolation goal
-of Section 12.5.
+optional behaviour: single-block damage would invalidate every digest scope
+covering that bootstrap.
 
 ### 12.5. Epoch Isolation
 
@@ -2080,15 +2101,16 @@ generated, independently re-derived, then frozen (Section 18 criterion 2).
 **Positive vectors.** The Section 6.8 codec values plus full-stripe
 reconstruction for every erasure pattern up to `m`; the Section 5.1 CRC
 values; the Section 5.2 derived magics for a pinned sample `tape_uuid`; the
-Section 7.3 digest vector plus one multi-epoch map; a complete
+Section 7.3 digest vector; a complete
 minimal tape image (bootstrap + one object + one sidecar + final bootstrap)
 byte-pinned with its digest chain; a final-partial-epoch image exercising
 implicit zeros; an external parity_map image (inline overflow); a no-parity
 bootstrap; a checkpoint (prefix-digest) image; and a resume round-trip
 image (committed prefix → reopened → appended). The suite also includes a
-short epoch with `R = 1 < S = 2`, and a no-parity image whose schema-minor 3
-bootstrap object row carries REM-OBJECT-TV-P1's 36-byte UUID-string `object_id`
-verbatim.
+short epoch with `R = 1 < S = 2`, and two parity-protected images whose
+schema-minor 3 bootstrap object rows carry REM-OBJECT `object_id` values
+verbatim — one plaintext, one encrypted — alongside a no-parity image
+carrying REM-OBJECT-TV-P1's 36-byte UUID-string `object_id`.
 
 **Negative vectors (each single-fault).**
 
@@ -2131,13 +2153,13 @@ the short row uses `R = 1`.
 | Vector | Burst span | Required outcome |
 | --- | --- | --- |
 | `boundary-straddling-burst-m-limit` | `m·S + H + 1 = 6` records, beginning at the full epoch's last data block | recovered; the straddled stripe loses exactly `m = 2` shards |
-| `boundary-straddling-burst-m-plus-one` | `m·S + H + 2 = 7` records at the same boundary | `Unrecoverable { stripe: 1, lost: 3, limit: 2 }` |
-| `short-epoch-boundary-burst-unrecoverable` | `(m−1)·S + R + H + 2 = 6` records, with `R < S` | `Unrecoverable { stripe: 0, lost: 3, limit: 2 }` |
+| `boundary-straddling-burst-m-plus-one` | `m·S + H + 2 = 7` records at the same boundary | `Unrecoverable { stripe: 1, lost_count: 3, limit: 2 }` |
+| `short-epoch-boundary-burst-unrecoverable` | `(m−1)·S + R + H + 2 = 6` records, with `R < S` | `Unrecoverable { stripe: 0, lost_count: 3, limit: 2 }` |
 
 ## 18. Conformance and Freeze Criteria
 
 These criteria gated the freeze of this specification; all of them hold, as
-recorded in the freeze record and the Revision History appendix. After
+recorded in the Revision History appendix. After
 freeze, revisions are governed by the change policy in the Status of This
 Document section: errata and conforming minor revisions are permitted, and
 anything that would invalidate an existing tape, change the meaning of
@@ -2202,9 +2224,9 @@ governed by its versioning rules; no registry is established or required.
 - [FIPS180-4] — National Institute of Standards and Technology, "Secure
   Hash Standard (SHS)", FIPS PUB 180-4, August 2015 (defines SHA-256),
   <https://doi.org/10.6028/NIST.FIPS.180-4>.
-- [REMOBJECT] — "REM-OBJECT Core Format", Version 1.0 or any later 1.x revision (published against 1.0.1, DOI of that revision in its Status section), companion specification: the
+- [REMOBJECT] — "REM-OBJECT Core Format", Version 1.0 or any later 1.x revision (published against 1.0.0, DOI of that revision in its Status section), companion specification: the
   reference payload format and plaintext object-row semantics.
-- [REMENCRYPT] — "REM-ENCRYPT", Version 1.0 or any later 1.x revision (published against 1.0.1, DOI of that revision in its Status section), companion specification: encrypted
+- [REMENCRYPT] — "REM-ENCRYPT", Version 1.0 or any later 1.x revision (published against 1.0.0, DOI of that revision in its Status section), companion specification: encrypted
   representation and encrypted object-row field semantics.
 
 CRC-64/XZ is fully parameterized in Section 5.1; no external reference is
@@ -2485,7 +2507,7 @@ the resolutions, and the Revision History appendix records when.
 3. **The last-resort full filemark-walk scan** (Section 8.4 step 5) is a
    SHOULD-offer whose operational parameters (geometry hints, abort
    conditions, progress reporting) are not yet specified (resolved —
-   Section 8.4.1, this revision).
+   Section 8.4.1, added 2026-07-29).
 4. **Bootstrap re-typing promotion.** The selection rule among
    structurally discovered parity_map files is specified in Section 12.4;
    it needs a multi-parity_map damage-matrix image vector (ranking,
@@ -2495,8 +2517,8 @@ the resolutions, and the Revision History appendix records when.
    strength with a damage-matrix vector; promotion to MUST, if desired before
    freeze, remains a specification policy decision rather than an
    implementation gap (resolved — promoted to MUST in Section 12.4, this
-   revision; the multi-parity-map damage-matrix vector is present in the
-   published archive under
+   revision (2026-07-29); the multi-parity-map damage-matrix vector is
+   present in the published archive under
    `rem-parity-1/damage-matrix/multi-parity-map-selection/`).
 5. **Throughput program.** Accelerated GF(2⁸) and CRC kernels must land and
    be proven byte-identical via the Section 17 vectors (Section 18
@@ -2515,42 +2537,61 @@ the resolutions, and the Revision History appendix records when.
 
 Entries are newest first. Each carries: date · version · kind
 (erratum / minor / major / draft milestone) · what changed and its effect on
-conformance. Draft-era milestones predate publication under a DOI and are
-marked `[draft]`.
+conformance. Milestones that predate the first published revision are marked
+`[draft]`; they were reached in public working drafts, not in published
+revisions of this specification, and the change policy of the Status section
+governs only the revisions that follow the first published one.
 
-- **2026-07-31 — 1.0.1 — [published] erratum, including a flagged policy correction.**
-  Status of This Document rewritten around three ordered classification
-  questions (invalidate → major; earlier readers cannot cleanly refuse →
-  major; obligations or registry assignment → minor under three conditions;
-  otherwise erratum), with the axis-independence principle stated and the
-  worked classifications listed. Section 18's preamble corrected — it still
-  said "no normative change … other than errata … anything else is version
-  2", which forbade the minor tier the Status section defines; this is the
-  policy correction, flagged as such under the policy's own carve-out.
-  Section 8.1.1 rewritten as the schema-minor registry (Defined-by and wire
-  meanings; 2 = `object_id` optional, 3 = `object_id` required), replacing
-  both the "no arithmetic" note and the stale `1 / 2` in Section 2.5.
-  Reader obligation at `schema_minor` ≥ 3 stated in Section 8.2.1, matching
-  the reference implementation and the `bootstrap-object-id-65` negative
-  vector. Reader rule for unrecognised `flags` bits stated (ignore),
-  matching the reference implementation. Section 5.3 gains the
-  semantics-freeze rule including recovery outcomes. The key-30
-  overflow-carrier prohibition re-anchored from "version 1.0" to the
-  registry mechanism. Section 8.4's discovery-candidate set declared frozen
-  for the life of `schema_major` 1. Appendix C items annotated resolved.
-  DOI table corrected: the software deposit's DOI is informative and the
-  false "Version DOI (this release)" row removed. No tape becomes valid or
-  invalid; the only implementation-visible additions state what the
-  reference implementation and pinned vectors already do.
+- **2026-07-31 — 1.0.0 — first published revision.** The specification is
+  final as of this revision, and the change policy in the Status section
+  governs everything after it. This revision discharges the Section 18
+  criteria and closes the Appendix C items; it is the point at which the
+  format is frozen, not a revision of an already-frozen format.
+
+  Relative to the review draft published on 2026-07-25 (see below), this
+  revision: replaces the draft Status text with the three-question change
+  policy (invalidate or change meaning → major; earlier readers cannot
+  identify and cleanly refuse → major; obligations or registry assignment →
+  minor under three conditions; otherwise erratum), and states the
+  axis-independence principle and the worked classifications; rewrites
+  Section 18's preamble, which described the document as a draft and
+  permitted only errata after freeze; rewrites Section 8.1.1 as the
+  schema-minor registry (Defined-by and wire meanings: 2 = `object_id`
+  optional, 3 = `object_id` required) and corrects the stale `1 / 3` pair in
+  Section 2.5; states the Reader obligation at `schema_minor` ≥ 3 in
+  Section 8.2.1 and the reader rule for unrecognised `flags` bits, both
+  matching the reference implementation; adds the semantics-freeze rule to
+  Section 5.3; re-anchors the key-30 overflow-carrier prohibition from the
+  document version to the registry mechanism; declares the Section 8.4
+  discovery-candidate set frozen for the life of `schema_major` 1; corrects
+  the parity_map footer magic in Sections 2.5, 5.2 and 10.3, which described
+  a `PARITY_MAP_FOOTER_MAGIC_LABEL` that appears in no implementation and on
+  no tape — the footer shares the header's magic; corrects the minimum
+  sidecar block size from 0xC0 to 0xD0 in Sections 2.5, 9.1 and 9.4 and adds
+  the index-packing rejection the Section 9.4 pseudocode omitted; removes an
+  unimplementable final-directory redundancy requirement from Section 8.3
+  that contradicted Sections 10.1, 10.7 and 11.3; and records in Section 12.4
+  the `ParityMapReference`-locator precedence tier and the two-candidate
+  requirement for structural discovery, both of which the reference Scanner
+  already applied.
+
 - **2026-07-29 — [draft] pre-freeze revisions II.** Last-resort
   filemark-walk operational envelope specified (Section 8.4.1), with
   inter-file positioning exempted from the Section 8.4 rule-6 abort;
   bootstrap re-typing promoted from SHOULD to MUST with operational
   candidate criteria (Section 12.4) — reader-obligation changes with no
   effect on the set of valid tapes; Appendix C items 3 and 4 resolved.
-- **2026-07-25 — 1.0.0 — [published] first publication.** Archived with
-  software release v1.0.0 (Zenodo concept DOI 10.5281/zenodo.21551570);
-  the permanent 1.0 anchor.
+- **2026-07-25 — [draft] review draft published.** The document as it then
+  stood — marked "Draft for review", dated 2026-06-11 — was distributed
+  inside software release v1.0.0 (Zenodo 10.5281/zenodo.21551571, under the
+  software concept DOI 10.5281/zenodo.21551570). It was a working draft
+  published for review, not a revision of a frozen format, and it named
+  Section 18 as the criteria still to be met. The vector archive current at
+  that time was `b9be8760…`; the archive pinned by the first published
+  revision is `77be73e7…`, which adds the REM-OBJECT object-row vectors and
+  the independent re-derivation tool without altering any pre-existing
+  member. The never-re-pin rule of the Status section binds published
+  revisions and does not reach back into the draft era.
 - **2026-07-22 — [draft] tape-alone recovery claims.** Ordered persistence
   and the synchronizing barrier made normative on the tape I/O layer
   (Section 3.5); commit discipline extended with batched deferred

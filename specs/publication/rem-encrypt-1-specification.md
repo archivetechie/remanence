@@ -34,7 +34,7 @@ omits Section 5 (the encrypted representation, owned here).
 | | |
 | --- | --- |
 | Status | Publication specification |
-| Version | 1.0.1 |
+| Version | 1.0.0 |
 | Date | 2026-07-31 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719161](https://doi.org/10.5281/zenodo.21719161) |
@@ -83,7 +83,7 @@ a policy correction in the revision history.
 
 Version numbers are always three-part. The Identifiers table at the head of
 this document names the major.minor line; the Version row in this section is
-the full revision. Section 10 owns the wire-versioning machinery — the `format_version`, `suite_id` and `wrap_suite` registries and their assignment policy; this policy defers to it and does not paraphrase it. A registry assignment under Section 10.4 is a minor revision: an earlier reader identifies the envelope and refuses it with the typed error the registry names, which satisfies the third condition above. Every published revision of this document is
+the full revision. Section 10 owns the wire-versioning machinery — the `format_version`, `suite_id` and `wrap_suite` registries and their assignment policy; this policy defers to it and does not paraphrase it. A `suite_id` or `wrap_suite` assignment under Section 10.4 is a minor revision: an earlier reader identifies the envelope and refuses it with the typed error the registry names, which satisfies the third condition above. A new `format_version` is not a registry assignment in that sense — it replaces the envelope itself, and is a major under question 1. Every published revision of this document is
 archived with its own DOI and recorded in the Revision History appendix.
 
 For orientation, the classifications most likely to be proposed for this
@@ -360,12 +360,17 @@ The exact 103-byte HPKE `info` value is:
 || object_id_field                      64 bytes
 || recipient_epoch_id                  16 bytes
 || slot_index                            1 byte
-|| 0x02                                  1 byte  (format_version)
+|| 0x01                                  1 byte  (wrap-info generation)
 || 0x02                                  1 byte  (wrap_suite)
 ```
 
-This binds the wrapped DEK to the object id, recipient epoch, slot, format
-version, and wrap suite. A Reader selects the slot whose epoch id equals the
+The byte at offset 101 is a frozen constant naming the generation of this
+transcript, matching the `v1` of the `rem-encrypt-wrap-v1` prefix. It is not
+the envelope `format_version` (which is 2, Section 10.1) and does not track
+it; a future transcript layout would take a new prefix and a new value here.
+
+This binds the wrapped DEK to the object id, recipient epoch, slot, and wrap
+suite. A Reader selects the slot whose epoch id equals the
 supplied private key's epoch id; absence is a hard mismatch.
 
 #### 5.3.1. Frozen X-Wing Construction
@@ -744,7 +749,7 @@ section, then obtain software implementing the named value.
 | ---: | --- | --- | --- |
 | `1` | reserved / permanently forbidden | REM-ENCRYPT 1.0 | MUST never be accepted or reassigned |
 | `2` | **current** | REM-ENCRYPT 1.0 | The envelope defined by this document |
-| all others | unassigned | a future revision | Hard error |
+| all others | unassigned | a future major (a separate document) | Hard error |
 
 An unsupported value produces `UnsupportedFormatVersion`.
 
@@ -1033,7 +1038,7 @@ Core D1 object.
 
 The additive `encrypted-last-object-chunk` range vector uses
 REM-OBJECT-TV-D1's manifest range: `first_inner_chunk = 3`,
-`range_start = 0`, and `range_len = 351`. Since D1 has
+`range_start = 0`, and `range_len = 358`. Since D1 has
 `object_chunk_count = 4`, this range covers the true final object chunk
 (`i = object_chunk_count - 1`) and MUST authenticate with `final_flag = 1`,
 reproducing the exact manifest CBOR, `manifest_sha256`, and
@@ -1116,10 +1121,10 @@ part of suite `0x02`; this document makes no IANA request.
 ### 16.1. Normative References
 
 - [REMOBJECT] — "REM-OBJECT Core Format", Version 1.0 or any later 1.x
-  revision; this revision was published against REM-OBJECT 1.0.1 (DOI of that revision in its Status section).
+  revision; this revision was published against REM-OBJECT 1.0.0 (DOI of that revision in its Status section).
   Companion specification.
 - [REMPARITY] — "Rem Tape Parity (REM-PARITY) Format", Version 1.0 or any
-  later 1.x revision; this revision was published against REM-PARITY 1.0.1 (DOI of that revision in its Status section).
+  later 1.x revision; this revision was published against REM-PARITY 1.0.0 (DOI of that revision in its Status section).
   Companion specification; normative for the tape binding.
 - [RFC2119] — Bradner, S., "Key words for use in RFCs to Indicate
   Requirement Levels", BCP 14, RFC 2119, March 1997,
@@ -1247,22 +1252,29 @@ Manifest geometry correlates with member count and is confidential. The
 authenticated whole-object digest already anchors the decrypted manifest.
 Catalogless recovery trades direct manifest positioning for sequential open.
 
+## Appendix C. Revision History (Informative)
+
+Entries are newest first: date · version · kind (erratum / minor / major) ·
+effect on conformance. Milestones that predate the first published revision
+are marked `[draft]`; the change policy of the Status section governs only
+the revisions that follow the first published one.
+
+- **2026-07-31 — 1.0.0 — first published revision.** The specification is
+  final as of this revision, and the change policy in the Status section
+  governs everything after it. Relative to the review draft published on
+  2026-07-25, this revision replaces the draft Status text with the shared
+  three-question change policy, records the per-document concept and
+  revision DOIs (the earlier deposit was a software release, and its DOI is
+  now carried as an informative row only), gives every Section 10 registry a Defined-by column and an unassigned-value retrieval note, fixes the Section 10.1 self-reference, adds the pinned-provenance and supersession note to the X-Wing citation, and adds the worked classifications and the vectors-are-anchors rule.
+- **2026-07-25 — [draft] review draft published.** The document as it then
+  stood was distributed inside software release v1.0.0
+  (Zenodo 10.5281/zenodo.21551571, software concept DOI
+  10.5281/zenodo.21551570) as a working draft published for review, not as a
+  revision of a frozen format.
+
 ## Author's Address
 
 The ArchiveTech Project
 Website: https://archivetech.org
 Email: specs@archivetech.org
 Reference implementation: https://github.com/archivetechie/remanence
-
-## Appendix C. Revision History (Informative)
-
-Entries are newest first: date · version · kind (erratum / minor / major) ·
-effect on conformance.
-
-- **2026-07-31 — 1.0.1 — erratum, including a flagged policy correction.** The previous Status text permitted minors to "add optional keys and nothing else", narrower than §10.4's own registry mechanism; the shared policy widens it, and that widening is the policy correction. Status of This Document rewritten to the
-  shared three-question change policy (see Status); DOI rows corrected — the
-  software deposit's DOI is informative, and the false "Version DOI (this
-  release)" row removed; registry preamble gains defining-revision attribution and the unassigned-value retrieval note; the Section 10.1 self-reference fixed; the X-Wing citation gains its pinned-provenance and supersession note. No object becomes valid or invalid and no
-  implementation obligation changes.
-- **2026-07-25 — 1.0.0 — first publication.** Archived with software release
-  v1.0.0 (Zenodo concept DOI 10.5281/zenodo.21551570).

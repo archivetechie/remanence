@@ -223,5 +223,4 @@ Tape recycling outside Remanence (for example re-creating a virtual
 cartridge with the same barcode) can leave the catalog's tape identity
 out of step with the UUID written at the beginning of tape. The retire
 and rebind machinery exists (`rem tape retire`); the automated
-reconciliation is still open work. Details and current status:
-[tape-recycle-identity-reconciliation-concern.md](tape-recycle-identity-reconciliation-concern.md).
+reconciliation is still open work.

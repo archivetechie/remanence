@@ -7,7 +7,9 @@ on. Definitions reflect what the code does today, not aspirations.
 ## Formats and objects
 
 **REM-OBJECT** — REM-OBJECT, the native stored-object format. One REM-OBJECT
-object holds many files. Published as the REM-OBJECT 1.0/1.1 specifications.
+object holds many files. Specified by REM-OBJECT Core Format 1.0; the
+`1.0`/`1.1` pair that appears on the wire is the stream-schema feature gate
+(`REMANENCE.schema_version`), not a pair of documents.
 
 **rem-object-v1** — the plaintext REM-OBJECT body: a POSIX pax tar archive with
 `REMANENCE.*` pax headers, chunk-aligned members, and a trailing CBOR

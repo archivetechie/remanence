@@ -9,7 +9,7 @@ this text and a specification disagree, the specification wins.*
 | | |
 | --- | --- |
 | Status | Informative companion |
-| Version | 1.0.1 |
+| Version | 1.0.0 |
 | Date | 2026-07-31 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719163](https://doi.org/10.5281/zenodo.21719163) |
@@ -500,3 +500,13 @@ is exactly the moment to build the habit.
 
 *Author: The ArchiveTech Project — <https://archivetech.org> —
 specs@archivetech.org*
+
+## Revision History (Informative)
+
+- **2026-07-31 — 1.0.0 — first published revision.** First publication of
+  this companion as a separately deposited, separately versioned document.
+  It follows the same three-part version convention as the specifications it
+  accompanies; because it is informative, its revisions never change any
+  conformance obligation.
+- **2026-07-25 — [draft] review draft.** Distributed inside software release
+  v1.0.0 as part of the review draft, without its own version or deposit.
