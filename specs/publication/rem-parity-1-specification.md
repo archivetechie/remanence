@@ -4,13 +4,12 @@
 
 | | |
 | --- | --- |
-| Status | Final |
+| Status | Review draft |
 | Document version | 1.0 |
-| Version | 1.0.0 |
+| Version | 1.0.0-draft.1 |
 | Date | 2026-07-31 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719156](https://doi.org/10.5281/zenodo.21719156) |
-| DOI of this revision | [10.5281/zenodo.21719157](https://doi.org/10.5281/zenodo.21719157) |
 | Reference implementation (informative) | Zenodo concept DOI [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) — software deposit, Apache-2.0 |
 | Bootstrap magic | `52 45 4D 00 42 4F 4F 01` (`"REM\0BOO\x01"`, fixed bytes) |
 | Erasure scheme identifier | `rs-cauchy-gf256-v1` |
@@ -18,11 +17,24 @@
 
 ## Status of This Document
 
-The format this document defines is final. No tape it validates will ever be
-invalidated, no reader guarantee will be withdrawn, and the discovery
-guarantee of Section 8.4 stands for the life of `schema_major` 1. The
-document itself may still be revised, in exactly the three ways set out
-below.
+**This is a review draft.** It is published for public review and is not yet
+frozen. The format it describes is implemented and its conformance vectors are
+pinned, so what is under review is not whether the design works but whether
+*this text describes it correctly and completely* — an independent
+implementation built from these words alone should produce the published
+vectors, and where it would not, the text is wrong and we want to know.
+
+The documents will be frozen after the review period, at which point the
+finality promise below takes effect and the change policy governs every
+revision after it. **The freeze date will be announced on the project site and
+in this section.** Comments and defect reports are raised as issues on the
+project repository.
+
+On freezing, the format this document defines becomes final: no tape it
+validates will ever be invalidated, no reader guarantee will be withdrawn, and
+the discovery guarantee of Section 8.4 will stand for the life of
+`schema_major` 1. The document itself may still be revised even then, in
+exactly the three ways set out below.
 
 No standards body has reviewed or adopted it. There is no ISO number, no RFC,
 no SNIA endorsement. It was written by the same people who wrote the
@@ -75,7 +87,7 @@ this change-policy text itself is published as an erratum and flagged as a
 policy correction in the revision history, because the alternative — a
 policy that cannot correct its own wording — would freeze its mistakes.
 
-Version numbers are always three-part. The Identifiers table at the head of
+Version numbers are always three-part. A revision published for review before it is frozen carries a `-draft.N` suffix on that three-part core; it names the revision it anticipates and orders before it. The Identifiers table at the head of
 this document carries both: its `Document version` row names the major.minor
 line, and its `Version` row is the full revision.
 
@@ -101,8 +113,10 @@ Errata are raised as issues on the project repository. Every published
 revision of this document is archived with its own DOI and recorded in the
 Revision History appendix.
 
-The conformance and freeze criteria set out in Section 18 are discharged,
-and the items collected in Appendix C are closed. This document remains the
+Every conformance and freeze criterion set out in Section 18 is satisfied and
+the items collected in Appendix C are closed; the criteria are formally
+discharged when this document is frozen, and the review period exists so that
+anyone can test that claim before it is made permanent. This document remains the
 normative fixed point for the format: an implementation is validated against
 it, not the reverse. The arithmetic test vectors here (CRC, Reed–Solomon,
 canonical digest) are normative and can be re-derived from this text alone;
@@ -2161,9 +2175,10 @@ the short row uses `R = 1`.
 
 ## 18. Conformance and Freeze Criteria
 
-These criteria gated the freeze of this specification; all of them hold, as
-recorded in the Revision History appendix. After
-freeze, revisions are governed by the change policy in the Status of This
+These criteria gate the freeze of this specification. All of them are
+satisfied as of this review draft, with the evidence recorded in the Revision
+History appendix; they are formally discharged when the document is frozen.
+After freeze, revisions are governed by the change policy in the Status of This
 Document section: errata and conforming minor revisions are permitted, and
 anything that would invalidate an existing tape, change the meaning of
 anything already written, or leave an earlier reader unable to identify and
@@ -2545,11 +2560,12 @@ conformance. Milestones that predate the first published revision are marked
 revisions of this specification, and the change policy of the Status section
 governs only the revisions that follow the first published one.
 
-- **2026-07-31 — 1.0.0 — first published revision.** The specification is
-  final as of this revision, and the change policy in the Status section
-  governs everything after it. This revision discharges the Section 18
-  criteria and closes the Appendix C items; it is the point at which the
-  format is frozen, not a revision of an already-frozen format.
+- **2026-07-31 — 1.0.0-draft.1 — review draft.** Published for public review;
+  not yet frozen. On freezing this becomes version 1.0.0, the first published
+  revision, and the change policy in the Status section governs everything
+  after it. This revision closes the Appendix C items and satisfies the
+  Section 18 criteria; the criteria are formally discharged at freeze, not by
+  this draft.
 
   Relative to the review draft published on 2026-07-25 (see below), this
   revision: replaces the draft Status text with the three-question change

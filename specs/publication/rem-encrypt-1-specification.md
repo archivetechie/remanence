@@ -33,13 +33,25 @@ omits Section 5 (the encrypted representation, owned here).
 
 | | |
 | --- | --- |
-| Status | Publication specification |
-| Version | 1.0.0 |
+| Status | Review draft |
+| Version | 1.0.1-draft.1 |
 | Date | 2026-07-31 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719161](https://doi.org/10.5281/zenodo.21719161) |
-| DOI of this revision | [10.5281/zenodo.21719162](https://doi.org/10.5281/zenodo.21719162) |
 | Reference implementation (informative) | Zenodo concept DOI [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) — software deposit, Apache-2.0 |
+
+**This is a review draft.** It is published for public review and is not yet
+frozen. The format it describes is implemented and its conformance vectors are
+pinned, so what is under review is not whether the design works but whether
+*this text describes it correctly and completely* — an independent
+implementation built from these words alone should produce the published
+vectors, and where it would not, the text is wrong and we want to know.
+
+The documents will be frozen after the review period, at which point the
+finality promise below takes effect and the change policy governs every
+revision after it. **The freeze date will be announced on the project site and
+in this section.** Comments and defect reports are raised as issues on the
+project repository.
 
 This document is the publication specification for REM-ENCRYPT. It is the
 normative fixed point for the encrypted representation it defines: an
@@ -81,7 +93,7 @@ obligation and no valid encrypted object. One exception is named openly: a corre
 to this change-policy text itself is published as an erratum and flagged as
 a policy correction in the revision history.
 
-Version numbers are always three-part. The Identifiers table at the head of
+Version numbers are always three-part. A revision published for review before it is frozen carries a `-draft.N` suffix on that three-part core; it names the revision it anticipates and orders before it. The Identifiers table at the head of
 this document names the major.minor line; the Version row in this section is
 the full revision. Section 10 owns the wire-versioning machinery — the `format_version`, `suite_id` and `wrap_suite` registries and their assignment policy; this policy defers to it and does not paraphrase it. A `suite_id` or `wrap_suite` assignment under Section 10.4 is a minor revision: an earlier reader identifies the envelope and refuses it with the typed error the registry names, which satisfies the third condition above. A new `format_version` is not a registry assignment in that sense — it replaces the envelope itself, and is a major under question 1. Every published revision of this document is
 archived with its own DOI and recorded in the Revision History appendix.
@@ -1255,38 +1267,25 @@ Catalogless recovery trades direct manifest positioning for sequential open.
 ## Appendix C. Revision History (Informative)
 
 Entries are newest first: date · version · kind (erratum / minor / major) ·
-effect on conformance. Milestones that predate the first published revision
-are marked `[draft]`; the change policy of the Status section governs only
-the revisions that follow the first published one.
+effect on conformance.
 
-- **2026-07-31 — 1.0.0 — first published revision.** The specification is
-  final as of this revision, and the change policy in the Status section
-  governs everything after it. Relative to the review draft published on
-  2026-07-25, this revision replaces the draft Status text with the shared
-  three-question change policy, records the per-document concept and
-  revision DOIs (the earlier deposit was a software release, and its DOI is
-  now carried as an informative row only), gives every Section 10 registry a
-  Defined-by column and an unassigned-value retrieval note, fixes the
-  Section 10.1 self-reference, adds the pinned-provenance and supersession note
-  to the X-Wing citation, and adds the worked classifications and the
-  vectors-are-anchors rule. It also corrects the Section 13.2 range vector's
-  `range_len` from 351 to 358, the length of the manifest that range covers.
+- **2026-07-31 — 1.0.1-draft.1 — review draft of an erratum.** Published for
+  public review; not yet frozen. Relative to version 1.0 this revision
+  introduces the Status section's change policy — which version 1.0 did not
+  carry in any form — records the per-document concept DOI (version 1.0 was
+  distributed inside a software release, whose DOI identified the software),
+  adds this revision history, and gives every Section 10 registry a Defined-by column and an unassigned-value retrieval note, fixes the Section 10.1 self-reference, adds the pinned-provenance and supersession note to the X-Wing citation, corrects the Section 13.2 range vector's `range_len` from 351 to 358, and adds the worked classifications and the vectors-are-anchors rule.
 
-  **If you implemented from the review draft, re-check one thing.** The
-  Section 5.3 HPKE `info` transcript printed `0x02` at offset 101 and labelled
-  it `(format_version)`. The byte is `0x01`, and it is not the envelope
-  `format_version` at all — it is a frozen constant naming the generation of
-  the transcript, matching the `v1` of the `rem-encrypt-wrap-v1` prefix. Every
-  sealed object and the published wrap known-answer test bind `0x01`. An
-  implementation built from the draft's value derives a different HPKE key
-  schedule and cannot unwrap a DEK from any conformant object; it could never
-  have interoperated, so this correction restores interoperability rather than
-  removing it. No sealed object or published vector changed.
-- **2026-07-25 — [draft] review draft published.** The document as it then
-  stood was distributed inside software release v1.0.0
-  (Zenodo 10.5281/zenodo.21551571, software concept DOI
-  10.5281/zenodo.21551570) as a working draft published for review, not as a
-  revision of a frozen format.
+  No object written under version 1.0 is affected, and no published vector
+  changed. The corrections restore agreement between this text and the
+  implementation and vectors it describes; where they touch a wire statement,
+  the statement as published could not be satisfied by any implementation that
+  also read a conformant object, so no conformant implementation loses
+  anything.
+- **2026-07-25 — 1.0 — published.** Distributed as a publication specification
+  inside software release v1.0.0 (Zenodo 10.5281/zenodo.21551571, software
+  concept DOI 10.5281/zenodo.21551570). It carried no change policy, no
+  revision history and no DOI of its own.
 
 ## Author's Address
 

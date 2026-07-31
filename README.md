@@ -32,7 +32,9 @@ on an HPE MSL3040 with LTO-9 drives.
 <!-- code-anchor: Cargo.toml crates proto/layer5.proto @ 8de2c46 -->
 ## Status
 
-Version 1.0.0 — first publication release. REM-OBJECT, its REM-ENCRYPT
+Version 1.0.0 — first software release. The format documents are currently
+review drafts, open for comment (see each document's Status section).
+REM-OBJECT, its REM-ENCRYPT
 profile, and REM-PARITY 1.0 are all frozen: specified, implemented, and pinned
 by test vectors, so a tape written today reads back unchanged. REM-PARITY's
 conformance and freeze criteria (§18) are discharged and its Appendix C items
