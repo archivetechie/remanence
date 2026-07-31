@@ -41,6 +41,12 @@ This document is the publication specification for the REM-OBJECT Core
 Format. It is the normative fixed point for the durable canonical object: an
 implementation is validated against this document, not the reverse.
 
+No standards body has reviewed or adopted it. It was written by the same
+people who wrote the implementation, so the stability of this document is our
+own undertaking rather than anyone else's approval. We will not make a
+normative change to it. We will correct errata that do not alter which objects
+are valid. Anything beyond that takes a new major version.
+
 The tape binding depends normatively on the REM-PARITY specification
 ([REMPARITY]), which is now final. That dependency is therefore fixed: the
 tape-binding clauses of this document (the parity-layer references in Sections

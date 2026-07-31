@@ -16,18 +16,28 @@
 
 ## Status of This Document
 
-This document is final. It is the normative fixed point for the format it
-defines: an implementation is validated against this document, not the
-reverse. The arithmetic test vectors in this document (CRC, Reed–Solomon,
-canonical digest) are normative and independently re-derivable from this
-document alone; the image-level vectors of Section 17 are
-*pinned-at-generation*.
+This document is final. We do not intend to change it.
 
-The conformance and freeze criteria this specification sets for itself in
-Section 18 are discharged, and the specification-level items collected in
-Appendix C are closed. No normative change is now permitted other than errata
-that do not change the set of valid tapes; any other change produces a new
-major version.
+No standards body has reviewed or adopted it. There is no ISO number, no RFC,
+no SNIA endorsement. It was written by the same people who wrote the
+implementation, so "final" here is our own undertaking and not anyone else's
+approval. That is worth saying plainly, because the word usually implies a
+committee somewhere, and in this case there is none.
+
+The undertaking is deliberately narrow, so that it can be checked. We will not
+make a normative change to this document. We will correct errata that do not
+alter which tapes are valid. Anything beyond that takes a new major version and
+a new document. A tape written against this specification will therefore still
+be read correctly by an implementation built from any later revision of it.
+
+The conformance and freeze criteria set out in Section 18 are discharged, and
+the items collected in Appendix C are closed. This document remains the
+normative fixed point for the format: an implementation is validated against
+it, not the reverse. The arithmetic test vectors here (CRC, Reed–Solomon,
+canonical digest) are normative and can be re-derived from this text alone; the
+image-level vectors of Section 17 are *pinned-at-generation*, and the archive
+holding them is published with a checksum so you can confirm you have the same
+bytes we do.
 
 ## Abstract
 
