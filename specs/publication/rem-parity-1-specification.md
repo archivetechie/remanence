@@ -934,6 +934,12 @@ strictly increasing `tape_file_number` order:
 | 22 | array of bytes .size 16 | encrypted only | REM-ENCRYPT key-frame `recipient_epoch_id` values; 1 through 8 distinct nonzero ids |
 | 23 | uint | encrypted only | REM-ENCRYPT header `key_frame_len`; bounds `[1191, 16384]` |
 
+Row keys are integer field names, unrelated to value sizes or positions.
+They are grouped — 1–4 identity, 10–13 plaintext-only, 21–23 encrypted-only
+— and the gaps between groups are unassigned space reserved so a future
+revision can place a new field beside its relatives (Section 5.3 governs
+assignment; unknown keys are ignored).
+
 Key 10 (`manifest_first_chunk_lba`) is the zero-based block index, *within
 the object's tape file*, of the first block of the manifest entry's payload —
 a REM-OBJECT inner `BodyLba`, not a Section 3.2 physical LBA; one REM-OBJECT body block is
