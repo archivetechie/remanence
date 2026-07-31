@@ -33,12 +33,13 @@ clarifications that resolve an ambiguity the way conformant implementations
 already behave. Nothing an implementation does has to change, and no tape
 becomes newly valid or newly invalid.
 
-**Minor revisions — 1.1, 1.2 and so on.** These add optional integer keys under
-the extension rule of Section 5.3, and nothing else. Every tape written under an
-earlier 1.x stays valid, and a reader built from an earlier 1.x still reads the
-newer tapes correctly, because unknown keys are ignored. We set `schema_minor`
-to the document's minor version so that a tape records which revision wrote it;
-readers are not required to look at it.
+**Minor revisions — 1.1, 1.2 and so on.** A minor revision may make any change
+that leaves every tape written under an earlier 1.x valid, and leaves a reader
+built from an earlier 1.x still able to read the newer tapes correctly. In
+practice that means adding optional integer keys under the extension rule of
+Section 5.3, and it may also add obligations on writers, since a writer
+obligation cannot invalidate a tape that already exists. Each minor revision
+increments `schema_minor` and adds a row to the table in Section 8.1.
 
 **A new major version — 2.0.** Anything that changes the meaning of an existing
 field, removes one, or could stop an existing tape being read. That takes a new
@@ -778,7 +779,7 @@ A bootstrap tape file is exactly one block:
 | --- | ---: | --- | --- | --- |
 | 0x00 | 8 | magic | fixed bytes | `BOOTSTRAP_MAGIC` |
 | 0x08 | 2 | schema_major | **u16 BE** | MUST be 1; readers reject ≠ 1 |
-| 0x0A | 2 | schema_minor | **u16 BE** | readers accept any value |
+| 0x0A | 2 | schema_minor | **u16 BE** | readers accept any value (Section 8.1.1) |
 | 0x0C | 4 | flags | **u32 BE** | bit 0 = no-parity; all other bits MUST be 0 |
 | 0x10 | 16 | tape_uuid | raw bytes | the tape's identity (16 opaque bytes; RECOMMENDED a version-4 UUID [RFC9562], unique per tape); the HMAC key of Section 5.2 |
 | 0x20 | 4 | block_size_bytes | **u32 BE** | MUST equal the size of the block it was read with |
@@ -801,6 +802,31 @@ nonzero fill as a nonconformity, but bootstrap *acceptance* — during
 discovery (Section 8.4) and classification (Section 12.3) — MUST NOT depend
 on the fill, so a damaged fill byte cannot cost the tape its entry point.
 This is the one deliberate exception to the Section 16.2 verify-zero rule.
+
+#### 8.1.1. Schema Minor Values (Informative)
+
+`schema_minor` counts revisions of the on-tape format. It is not this
+document's version number, and no arithmetic relates the two: an erratum
+changes no bytes on tape and so does not change `schema_minor`, and the wire
+format had already been revised several times before this document was first
+published.
+
+Readers accept any value. That is what makes the format forward compatible: a
+reader built against an older revision meets a higher `schema_minor`, ignores
+the keys it does not recognise (Section 5.3), and reads the tape correctly.
+
+This specification places no constraint on the value a writer emits, and it is
+worth recording why, because the obvious rule is not available. The pinned
+vectors of Section 17 were generated across a period in which the field was
+advanced twice: bootstrap images in the published archive carry `2` or `3`
+depending on when they were produced, and both are conformant under version
+1.0. Requiring a single value now would make most of this specification's own
+normative vectors non-conformant, which is a worse outcome than a field whose
+1.0-era values are simply documented.
+
+A reader wanting to know which implementation revision wrote a tape should
+treat `schema_minor` as a hint and rely on the object rows and manifests for
+anything load-bearing.
 
 ### 8.2. CBOR Payload
 
@@ -2395,11 +2421,16 @@ tape and does not change any REM-PARITY media byte.
 
 - **2026-07-31 — 1.0.1, first erratum.** Status of This Document rewritten:
   states that no standards body has reviewed or adopted this specification, and
-  sets out the three kinds of revision permitted (errata, minor additions under
-  the Section 5.3 extension rule, new major version). The previous wording
-  forbade any normative change under version 1, which contradicted Section 5.3's
-  1.x extension mechanism. Editorial only; the set of valid tapes is unchanged
-  and no implementation obligation is added or removed.
+  sets out the three kinds of revision permitted. The previous wording forbade
+  any normative change under version 1, which contradicted Section 5.3's 1.x
+  extension mechanism. The minor-revision rule is stated as an outcome test — a
+  minor revision may make any change that leaves every earlier tape valid and
+  every earlier reader working — rather than as a list of permitted mechanisms.
+  Section 8.1.1 added, recording that `schema_minor` counts on-tape format
+  revisions rather than document versions, that the published vectors carry
+  both `2` and `3` under version 1.0, and that no writer constraint is imposed
+  for that reason. Editorial only; the set of valid tapes is unchanged and no
+  implementation obligation is added or removed.
 
 - **2026-06-11 — first draft.** Initial publication baseline, archived with
   release v1.0.0.
