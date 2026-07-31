@@ -197,10 +197,13 @@ refusing.
 
 The policy's answer to such changes is blunt: they do not modify the
 existing format at all. They create a **new format that lives alongside the
-old one**, with its own specification document, its own name on the wire,
-and its own version numbering starting again at 1.0.0. The old
-specification remains in force, permanently, for every tape written under
-it. In the analogy: you do not amend the timber-frame building code to
+old one**, with its own specification document and its own marks on the
+wire. The family name stays, and the version count continues: the new
+document begins at 2.0.0, and the major number travels with the name
+everywhere — in the title, in the filename, in the archive record, and in
+the wire marks themselves — so the two documents can never be confused.
+The old specification remains in force, permanently, for every tape
+written under it. In the analogy: you do not amend the timber-frame building code to
 cover steel high-rises; you write a steel code, and both codes stay on the
 shelf, each governing its own buildings.
 
