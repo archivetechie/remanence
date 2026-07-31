@@ -269,6 +269,16 @@ revision process above decides what kind of correction is required. What
 is never done is "fixing" a vector to match the software that failed it.
 An anchor you may drag when it inconveniences you is not an anchor.
 
+And if a published example itself turns out to be wrong — the recorded
+answer does not follow from the specification text? The archive still does
+not change. The text, not the example, is the fixed point. A revision
+records the defective entry in its revision history and publishes a
+corrected example in its own archive; the wrong entry stays where it is,
+marked superseded, the way a journal publishes a correction citing last
+year's issue rather than rewriting it. A visibly wrong vector on the
+record is harmless; a silently repaired one would put every past
+conformance claim in doubt.
+
 One consequence is worth knowing so it does not look like an error: a
 vector archive can legitimately contain examples with different wire
 values — the current archive holds bootstrap images at feature generations
