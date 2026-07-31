@@ -94,8 +94,11 @@ def main() -> int:
             fail(f"{name}: no Status Version row")
             continue
         v = m.group(1)
-        if not re.fullmatch(r"\d+\.\d+\.\d+", v):
-            fail(f"{name}: Version {v!r} is not three-part")
+        # A three-part core, optionally carrying a pre-publication suffix
+        # (-draft.N), which orders before the release it anticipates.
+        if not re.fullmatch(r"\d+\.\d+\.\d+(-draft\.\d+)?", v):
+            fail(f"{name}: Version {v!r} is not a three-part version, "
+                 "optionally suffixed -draft.N")
         elif not v.startswith(meta["line"] + "."):
             fail(f"{name}: Version {v} does not extend the {meta['line']} line")
         dvs = re.findall(r"^\| Document version \| (\S+) \|", t, re.M)

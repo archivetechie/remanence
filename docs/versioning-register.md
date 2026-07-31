@@ -289,9 +289,13 @@ documents and published artifacts themselves.
 
 - **What.** Three normative specifications and one informative companion,
   each independently versioned major.minor.errata.
-- **Current.** REM-PARITY 1.0.0, REM-OBJECT Core 1.0.0, REM-ENCRYPT 1.0.0,
-  companion 1.0.0 — the first published revisions; earlier public text was a
-  review draft.
+- **Current.** All four are **review drafts**, open for comment and not yet
+  frozen: REM-PARITY 1.0.0-draft.1, REM-OBJECT Core 1.0.1-draft.1,
+  REM-ENCRYPT 1.0.1-draft.1, companion 1.0.0-draft.1. The numbers differ
+  because the histories differ — REM-OBJECT and REM-ENCRYPT were published at
+  version 1.0 on 2026-07-25 and these drafts anticipate an erratum to it,
+  while REM-PARITY's 2026-07-25 predecessor was itself marked a draft. That
+  asymmetry is the independent-versioning rule working as intended.
 - **How they change.** The three-question policy in each document's Status
   section — the subject of [versioning-explained.md](versioning-explained.md).
   Titles and filenames carry the major line only; each revision is

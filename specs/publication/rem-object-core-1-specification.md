@@ -30,13 +30,25 @@ representation, the parity relationship, and conformance, owned here).
 
 | | |
 | --- | --- |
-| Status | Publication specification |
-| Version | 1.0.0 |
+| Status | Review draft |
+| Version | 1.0.1-draft.1 |
 | Date | 2026-07-31 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719158](https://doi.org/10.5281/zenodo.21719158) |
-| DOI of this revision | [10.5281/zenodo.21719159](https://doi.org/10.5281/zenodo.21719159) |
 | Reference implementation (informative) | Zenodo concept DOI [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) — software deposit, Apache-2.0 |
+
+**This is a review draft.** It is published for public review and is not yet
+frozen. The format it describes is implemented and its conformance vectors are
+pinned, so what is under review is not whether the design works but whether
+*this text describes it correctly and completely* — an independent
+implementation built from these words alone should produce the published
+vectors, and where it would not, the text is wrong and we want to know.
+
+The documents will be frozen after the review period, at which point the
+finality promise below takes effect and the change policy governs every
+revision after it. **The freeze date will be announced on the project site and
+in this section.** Comments and defect reports are raised as issues on the
+project repository.
 
 This document is the publication specification for the REM-OBJECT Core
 Format. It is the normative fixed point for the durable canonical object: an
@@ -78,7 +90,7 @@ obligation and no valid object. One exception is named openly: a correction
 to this change-policy text itself is published as an erratum and flagged as
 a policy correction in the revision history.
 
-Version numbers are always three-part. The Identifiers table at the head of
+Version numbers are always three-part. A revision published for review before it is frozen carries a `-draft.N` suffix on that three-part core; it names the revision it anticipates and orders before it. The Identifiers table at the head of
 this document names the major.minor line; the Version row in this section is
 the full revision. Section 10 owns the wire-versioning machinery — the stream `format_id`, the `REMANENCE.schema_version` feature gate, and the manifest schema integer; this policy defers to it and does not paraphrase it. Every published revision of this document is
 archived with its own DOI and recorded in the Revision History appendix.
@@ -98,7 +110,8 @@ publishes its own archive and cites it by name, DOI and digest, and never
 re-pins an earlier one.
 
 The tape binding depends normatively on the REM-PARITY specification
-([REMPARITY]), which is final. The tape-binding clauses of this document
+([REMPARITY]), which is under review alongside this document. The
+tape-binding clauses of this document
 (the parity-layer references in Sections 4.9, 8.2, 9, 12.6) are stable
 against every 1.x revision of REM-PARITY, because a REM-PARITY minor
 revision cannot invalidate a tape or leave an earlier reader unable to read
@@ -2033,22 +2046,25 @@ framing the stream already provides (self-description, digests).
 ## Appendix C. Revision History (Informative)
 
 Entries are newest first: date · version · kind (erratum / minor / major) ·
-effect on conformance. Milestones that predate the first published revision
-are marked `[draft]`; the change policy of the Status section governs only
-the revisions that follow the first published one.
+effect on conformance.
 
-- **2026-07-31 — 1.0.0 — first published revision.** The specification is
-  final as of this revision, and the change policy in the Status section
-  governs everything after it. Relative to the review draft published on
-  2026-07-25, this revision replaces the draft Status text with the shared
-  three-question change policy, records the per-document concept and
-  revision DOIs (the earlier deposit was a software release, and its DOI is
-  now carried as an informative row only), restates the dependency on REM-PARITY as stability against the 1.x line, reclassifies Section 14's vector-change rule from erratum to revision, de-couples the Section 4.4.3 and Section 10 wording from document minors, warns explicitly against confusing the stream-schema numeral with the document version, and adds the worked classifications, the bytes-to-defining-revision lookup paragraph and the vectors-are-anchors rule.
-- **2026-07-25 — [draft] review draft published.** The document as it then
-  stood was distributed inside software release v1.0.0
-  (Zenodo 10.5281/zenodo.21551571, software concept DOI
-  10.5281/zenodo.21551570) as a working draft published for review, not as a
-  revision of a frozen format.
+- **2026-07-31 — 1.0.1-draft.1 — review draft of an erratum.** Published for
+  public review; not yet frozen. Relative to version 1.0 this revision
+  introduces the Status section's change policy — which version 1.0 did not
+  carry in any form — records the per-document concept DOI (version 1.0 was
+  distributed inside a software release, whose DOI identified the software),
+  adds this revision history, and restates the dependency on REM-PARITY as stability against the 1.x line, reclassifies Section 14's vector-change rule from erratum to revision, de-couples the Section 4.4.3 and Section 10 wording from document minors, warns explicitly against confusing the stream-schema numeral with the document version, narrows the Section 4.7.3 empty-map requirement so it no longer forbids the extension container its own schema permits, rebuilds the Table of Contents so a renderer cannot silently renumber it around the deliberate Section 5 gap, and adds the worked classifications, the bytes-to-defining-revision lookup paragraph and the vectors-are-anchors rule.
+
+  No object written under version 1.0 is affected, and no published vector
+  changed. The corrections restore agreement between this text and the
+  implementation and vectors it describes; where they touch a wire statement,
+  the statement as published could not be satisfied by any implementation that
+  also read a conformant object, so no conformant implementation loses
+  anything.
+- **2026-07-25 — 1.0 — published.** Distributed as a publication specification
+  inside software release v1.0.0 (Zenodo 10.5281/zenodo.21551571, software
+  concept DOI 10.5281/zenodo.21551570). It carried no change policy, no
+  revision history and no DOI of its own.
 
 ## Author's Address
 

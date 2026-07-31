@@ -8,12 +8,13 @@ this text and a specification disagree, the specification wins.*
 
 | | |
 | --- | --- |
-| Status | Informative companion |
-| Version | 1.0.0 |
+| Status | Review draft (informative companion) |
+| Version | 1.0.0-draft.1 |
 | Date | 2026-07-31 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719163](https://doi.org/10.5281/zenodo.21719163) |
-| DOI of this revision | [10.5281/zenodo.21719164](https://doi.org/10.5281/zenodo.21719164) |
+
+**This is a review draft**, published alongside the specifications it accompanies and not yet frozen; the freeze date will be announced on the project site.
 
 This companion is versioned and archived like the specifications it
 accompanies, so that a citation of it names immutable text; its version
@@ -503,10 +504,9 @@ specs@archivetech.org*
 
 ## Revision History (Informative)
 
-- **2026-07-31 — 1.0.0 — first published revision.** First publication of
-  this companion as a separately deposited, separately versioned document.
-  It follows the same three-part version convention as the specifications it
-  accompanies; because it is informative, its revisions never change any
-  conformance obligation.
-- **2026-07-25 — [draft] review draft.** Distributed inside software release
-  v1.0.0 as part of the review draft, without its own version or deposit.
+- **2026-07-31 — 1.0.0-draft.1 — review draft.** First revision of this
+  companion to carry a version, a status and a DOI of its own. Published for
+  public review; not yet frozen. Because it is informative, its revisions never
+  change any conformance obligation.
+- **2026-07-25 — unversioned.** Distributed inside software release v1.0.0
+  without version, status or deposit metadata.
