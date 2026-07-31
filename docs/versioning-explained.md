@@ -293,6 +293,18 @@ clarifying revision changes an obligation, so it is at least a minor, and
 a claim of conformance to the earlier revision remains true as a statement
 about that revision.
 
+Gaps in coverage are the simplest case of all. If we later realise the
+examples never tested some behaviour, the fix is purely additive: a
+supplement archive with new examples and its own checksum, cited by the
+revision that adds it, while everything already published stays untouched.
+If the untested behaviour was already required by the text, nothing any
+implementation must do has changed — the test simply exists now — so the
+supplement rides with an erratum. If writing the test shows the text never
+actually decided the behaviour, that is an ambiguity to settle, and at
+least a minor. Either way, an implementation that fails a new test was
+already failing the text; the gap was hiding it, which is exactly why
+filling gaps is when quiet defects tend to surface.
+
 One consequence is worth knowing so it does not look like an error: a
 vector archive can legitimately contain examples with different wire
 values — the current archive holds bootstrap images at feature generations
