@@ -62,6 +62,17 @@ No standards body has reviewed or adopted it. It was written by the same
 people who wrote the implementation, so the stability of this document is our
 own undertaking rather than anyone else's approval.
 
+**Which copy governs.** The normative text of this document is the revision
+deposited under the concept DOI above. Every other copy — in the project
+repository, inside a Remanence source release, on a mirror, or printed — is a
+convenience copy. A copy carrying the same version string as a deposited
+revision is byte-identical to it or it is defective; where they differ, the
+deposit governs. A version string is never reused for different bytes, so
+naming a version names one exact text no matter which copy you hold. The
+reference implementation is informative: where it and this document disagree,
+this document is the fixed point (Section 18, criterion 1), and the divergence
+is a defect in the implementation.
+
 **Deciding what a change is.** Every revision of this document is classified
 by three questions, asked in order.
 

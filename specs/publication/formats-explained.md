@@ -16,6 +16,11 @@ this text and a specification disagree, the specification wins.*
 
 **This is a review draft**, published alongside the specifications it accompanies. Comments close on 30 April 2027 and the documents freeze on 31 July 2027.
 
+**Which copy governs.** The text of this companion is the revision deposited
+under the concept DOI above; every other copy is a convenience copy, and a copy
+carrying the same version string is byte-identical to it or defective. Where
+this companion and a specification disagree, the specification governs.
+
 This companion is versioned and archived like the specifications it
 accompanies, so that a citation of it names immutable text; its version
 numbers follow the same three-part convention, and its revisions are errata

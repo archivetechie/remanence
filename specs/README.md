@@ -21,3 +21,21 @@ The specifications are the normative fixed points for the formats:
 implementations are validated against these documents, not the reverse.
 Earlier internal revisions and review records are preserved in git
 history, not in the working tree.
+
+## Which copy governs
+
+The documents in this directory are the working copies from which each revision
+is prepared. The **normative** text of a published revision is the copy
+deposited under that document's concept DOI, named in its Status section.
+
+The two can differ legitimately — that is how the next revision is written — but
+never under the same name: a version string is never reused for different bytes.
+`DEPOSITED.sha256` records the digest published for each deposited revision, and
+`tools/check_spec_versioning.py` fails the build if a document's current version
+string appears there and its bytes have since changed. So if a copy anywhere
+claims version X, it is byte-identical to the deposit of version X or it is
+defective.
+
+A copy found inside a Remanence source release is a convenience copy under the
+same rule. It is deliberately shipped rather than replaced with a pointer,
+because a reader unpacking an archive offline needs the text itself.
