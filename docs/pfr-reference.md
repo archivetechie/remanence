@@ -44,11 +44,12 @@ PFR is enabled by three things LTO actually exposes via SCSI:
 
 A fourth optional accelerator exists on LTO-9 only:
 
-4. **oRAO (open Recommended Access Order).** The application submits a
-   batch of LBAs the drive should visit; the drive returns a reordered
-   list optimised for the serpentine track layout. Used by orchestrators
-   doing bulk multi-file restore, not by single-range PFR. (LTO-9
-   full-height only; not in half-height drives.)
+4. **RAO (Recommended Access Order).** The application submits a batch
+   of segments — each a partition, a start and an *end* block — and the
+   drive returns them reordered for the serpentine track layout. Used
+   for bulk multi-target restore, not by single-range PFR. Available on
+   LTO-9 and later full-height drives only, so rem does not use it and
+   computes the order itself instead; see §8.
 
 ### 2.1 The LOCATE BLOCK command
 
@@ -111,7 +112,8 @@ orchestrator should plan against:
 | BOT → middle (average locate) | ~60 s | similar | IBM-documented. |
 | End-to-end (BOT → EOT) | ~100–102 s | similar | Tape is ~1 km of physical media. |
 | Typical inter-file seek | 10–100 s | 10–100 s | Depends on distance + drive thermal calibration state. |
-| With oRAO (LTO-9 batch) | n/a | 30–70% reduction | Per CERN testing. Up to 73% on first-byte time per IBM. |
+| With ordered access (batch) | applies | ~50% reduction | Per CERN testing, for recalls under 500 targets. |
+| Reposition after a stop | 2.50 s mean | similar | HP LTO-6 technical reference. ~750 MB of foregone streaming at 300 MB/s. |
 
 **Practical rule of thumb:** a cold byte-range PFR on an already-loaded
 tape costs **one LOCATE (~30–60 s typical, up to ~100 s worst case)
@@ -125,8 +127,10 @@ Two corollaries:
 - **PFR is fast-ish only if the tape is already loaded.** For an
   orchestrator restoring from cold storage, queue depth matters more
   than individual-range latency.
-- **Batching wins.** Restoring 100 byte-ranges from one tape in oRAO
-  order is dramatically faster than 100 separate PFR calls.
+- **Batching wins.** Restoring 100 byte-ranges from one tape in a
+  planned order is dramatically faster than 100 separate PFR calls —
+  partly from shorter travel, and partly from avoiding the 2.5 s
+  reposition that each stop between calls invites.
 
 ### 2.4 File marks
 
@@ -485,34 +489,84 @@ per-block > 1.
 
 ---
 
-## 8. oRAO and batch restore
+## 8. Read ordering and batch restore
 
-oRAO is not a PFR feature — it's a multi-file restore accelerator.
-But worth understanding for the orchestrator's benefit:
+Ordering is not a PFR feature in itself — it is a multi-target restore
+accelerator. It matters here because PFR is what turns a restore from a
+few large objects into many small scattered ranges, which is the case
+where ordering begins to pay.
 
-- The application sends the drive a list of (file_id, partition,
-  start_lba) tuples it wants to read.
-- The drive returns the same list reordered by tape-traversal-
-  efficient order (taking serpentine track wrap into account).
-- The application then reads in that order; the drive's internal
-  predictive seek minimises wasted motion.
-- Quoted gains: 30–70% positioning reduction (CERN), up to 73%
-  first-byte-time reduction (IBM).
-- LTO-9 full-height only. Not available on LTO-9 half-height or
-  LTO-8/earlier.
+### 8.1 What the drive feature does
 
-For rem this is a future opt-in feature, not a transparent
-optimisation. The read contract is strict: the read path does not
-queue or reorder, and individual `ReadRange` calls execute in the
-order the caller issues them. If oRAO ever becomes relevant (LTO-9
-full-height bays added, or LTO-10 brings oRAO to half-height), it
-will land as a **new explicit RPC** — `ReadService.BatchReadRange` —
-that the orchestrator opts into for a batch of read targets against
-one session. Inside
-that RPC, rem can submit the batch to the drive via `Receive
-Recommended Access Order` and stream results back in drive-
-recommended order. Callers of plain `ReadRange` retain the strict
-no-reorder contract regardless.
+Tape drives from LTO-9 onward offer Recommended Access Order (RAO). The
+application sends the drive a list of the segments it wants, and the
+drive returns the same list sorted to minimise total positioning time.
+
+Each segment is a *User Data Segment*, described by a partition number,
+a **beginning** logical object identifier and an **ending** logical
+object identifier. Both ends are required. The drive rejects a descriptor
+whose end precedes its beginning, and the reason both are needed is
+visible in what the drive returns: its estimated locate time is measured
+from the *end* of the previous segment to the *beginning* of the next.
+The cost of reading B after A depends on where A finishes, because that
+is where the head is left — and on serpentine media a long segment may
+finish on a different wrap, travelling in the opposite direction.
+
+Published gains are substantial: CERN measured positioning reductions
+around 50% for recalls of fewer than 500 files.
+
+### 8.2 Why rem does not use it
+
+RAO is available on **LTO-9 and later full-height drives only**. It is
+not available on LTO-9 half-height, nor on LTO-8 or earlier. The
+reference LTFS driver encodes the same restriction.
+
+rem therefore computes the order itself, from the cartridge's format
+geometry and the block ranges in its own catalog. This requires no SCSI
+command and no drive: the wrap layout of a cartridge is fixed by its
+generation and format, and the number of blocks in a wrap follows from
+the block size the volume was written with. Ordering is consequently
+available on every generation rem supports, not only on hardware that
+happens to offer the drive feature.
+
+Volumes written with drive compression enabled are excluded, because the
+number of blocks in a wrap then depends on how well each wrap's contents
+compressed, which cannot be computed from anything recorded.
+
+### 8.3 The read contract
+
+The read contract is strict and unchanged. The read path does not queue
+or reorder, and individual `ReadObjectRange` and `ReadFile` calls execute
+in the order the caller issues them, one target per call.
+
+Ordering is offered as advice: rem is asked for a good order, and the
+caller then issues its own reads in whatever order it chooses. A plan
+that has gone stale is suboptimal, never incorrect, so no session or
+validity window attaches to it.
+
+### 8.4 Batched execution — planned, not yet built
+
+A future `ReadService.BatchReadRange` RPC will accept a batch of read
+targets against one session and stream the results back. It is worth
+recording why, because the reason is not the drive feature above.
+
+When a drive stops streaming it must halt, back up and resume. The HP
+LTO-6 technical reference gives the mean cost of that reposition as
+**2.50 seconds**, against an average random access time of 50 seconds.
+At 300 MB/s a reposition is roughly 750 MB of foregone streaming, which
+means two targets closer together than that are cheaper to read straight
+through — gap included and discarded — than to stop between. A caller
+issuing one call per target invites a reposition between every one.
+
+Batching wins nothing by overlapping work; a drive has one head and
+cannot seek while reading. What it wins is the elimination of stops, and
+the ability to coalesce near-adjacent ranges into one contiguous read.
+Whether to read through a gap or stop and relocate depends on the block
+distance and the drive's reposition cost, so it is a decision only rem
+can make.
+
+Callers of plain `ReadObjectRange` retain the strict no-reorder contract
+regardless.
 
 ---
 
@@ -629,8 +683,10 @@ Concretely, what the format spec needs to say:
    only means one trip to the catalog block to get all PFR addresses
    for the tape. Lean: both. Catalog has all per-tape indexes; each
    object also embeds its own at object start for resilience.
-2. **`oRAO` integration timeline.** Worth wiring into the batch-
-   restore API or defer until real demand? Lean: defer.
+2. **Batched execution timeline.** Resolved: the drive-native RAO path
+   is not pursued, since it requires full-height LTO-9. rem computes
+   the order itself. A batching `BatchReadRange` RPC is planned but
+   deferred behind the ordering work; see §8.4.
 3. **Maximum chunk_size.** Hardware reports a max via the **READ
    BLOCK LIMITS** response (IBM LTO SCSI Reference §5.2.17.1 /
    Table 78), **not** MODE SENSE. There are two distinct values:
