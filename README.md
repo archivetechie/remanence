@@ -78,12 +78,16 @@ relying on it. Working today:
   parity and format cores (`verif/`).
 
 The main gaps, from the code as it stands: authorization is a shallow
-role matrix, the audit-query service is defined but not yet served,
-library import/export (mailslot) handling, library-event streaming, and
-write-session restart return unimplemented; batched write checkpoints are
-currently parity-off only, parity
-tapes do not yet support appending further objects after a committed
-session, and hardware soak coverage is still growing.
+role matrix, with no scope below the role — no per-pool, per-tape, or
+per-object narrowing. Library import/export (mailslot) handling,
+library-event streaming, and write-session restart return unimplemented,
+as do drive-targeted and tape-targeted write sessions and every
+caller-supplied `idempotency_key` (write-session replay detection does
+not use that field). Appending to a committed parity tape is reached
+only through a write session; the single-object path still refuses it.
+Hardware soak coverage is still growing: the format and parity cores are
+exercised against a virtual library on every run, but time on physical
+LTO-9 iron is episodic rather than continuous.
 
 <!-- code-anchor: Cargo.toml @ 2a20106 -->
 ## Build
