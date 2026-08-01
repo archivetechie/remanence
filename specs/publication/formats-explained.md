@@ -9,7 +9,7 @@ this text and a specification disagree, the specification wins.*
 | | |
 | --- | --- |
 | Status | Informative companion |
-| Version | 1.0.0-draft.1 |
+| Version | 1.0 |
 | Date | 2026-07-31 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719163](https://doi.org/10.5281/zenodo.21719163) |
@@ -30,11 +30,15 @@ carrying the same version string is byte-identical to it or defective. Where
 this companion and a specification disagree, the specification governs.
 
 It is versioned and deposited nonetheless, so that a citation of it names one
-exact text. The version number simply increments; it carries none of the
+exact text. Its version has two components and neither carries the
 erratum / minor / major meaning the specifications' numbers carry, because that
 classification describes changes to obligations and this document imposes none.
-The one rule it does share with its siblings is that a version string is never
-reused for different bytes.
+The first component is the generation of the formats explained here; it changes
+only when a format is superseded by a new one beside it. The second is this
+companion's own revision, incremented on every republication — so there is never
+a question of which component to advance. The date above tells you how current a
+copy is. The one rule this document does share with its siblings is that a
+version string is never reused for different bytes.
 
 ---
 
@@ -541,8 +545,8 @@ re-deposited on its own schedule.
 
 ## Revision History (Informative)
 
-- **2026-07-31 — 1.0.0-draft.1.** First revision of this companion to carry a
-  version, a status and a DOI of its own. Published alongside the first review
-  drafts of the specifications it explains.
+- **2026-07-31 — 1.0.** First revision of this companion to carry a version, a
+  status and a DOI of its own. Published alongside the first review drafts of the
+  specifications it explains.
 - **2026-07-25 — unversioned.** Distributed inside software release v1.0.0
   without version, status or deposit metadata.
