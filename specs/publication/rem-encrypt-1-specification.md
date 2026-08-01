@@ -51,8 +51,10 @@ vectors, and where it would not, the text is wrong and we want to know.
 one year after publication. On that date the finality promise below takes
 effect and the change policy governs every revision after it. The three months
 between the two dates exist so that changes made in response to review are
-published as such, and visible, before the text is fixed. Comments and defect
-reports are raised as issues on the project repository.
+published as such, and visible, before the text is fixed. Comments and defect reports are raised as issues on the project repository.
+Before reporting, check the live list of known items at
+<https://archivetech.org/spec/issues> — it is current, whereas the Open Items
+appendix of this document is only a snapshot taken when this revision was fixed.
 
 This document is the publication specification for REM-ENCRYPT. It is the
 normative fixed point for the encrypted representation it defines: an
@@ -1300,6 +1302,37 @@ effect on conformance.
   its own — its metadata table read "DOI: assigned at first release" — no
   change policy and no revision history, and it was reachable only by
   unpacking the source archive.
+
+## Appendix D. Open Items (Informative)
+
+**This list is a snapshot**, taken when this revision was fixed. It is not
+updated afterwards: the bytes of a published revision are immutable and their
+digest is cited elsewhere. Items raised after this date are recorded in the
+live list at **<https://archivetech.org/spec/issues>**, which is current —
+consult it before reporting anything, and expect it to hold more than appears
+here. The next revision carries a new snapshot, and its revision-history entry
+says which items it resolved.
+
+Listing an item here is not a commitment to act on it. An item marked
+*accepted* will be addressed in a future revision; *deferred* means we judge it
+real but not yet ripe; *declined* means we considered it and decided against,
+with the reason given so the decision can be argued with rather than merely
+discovered. Comment is invited on everything, and most of all on the items
+marked so.
+
+
+**RE-1 · An independent implementation from the prose alone · open, and the
+review we most want.** The claim that an implementation built from this text
+alone interoperates with the published vectors has not been tested outside the
+project. For this document that includes the HPKE transcript and the key
+schedule, where a divergence produces objects nobody else can open.
+
+**RE-2 · The X-Wing draft dependency · open, monitored.** This document pins
+`draft-connolly-cfrg-xwing-kem-10`, an Internet-Draft. Section 10.3 already
+states the intended handling: a wire-identical final RFC keeps `wrap_suite`
+`0x02` and changes only the citation, while a construction differing on the wire
+consumes the reserved `0x03`. No action is required until the draft advances.
+
 
 ## Author's Address
 

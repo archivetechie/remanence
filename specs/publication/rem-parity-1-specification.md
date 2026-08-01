@@ -28,8 +28,10 @@ vectors, and where it would not, the text is wrong and we want to know.
 one year after publication. On that date the finality promise below takes
 effect and the change policy governs every revision after it. The three months
 between the two dates exist so that changes made in response to review are
-published as such, and visible, before the text is fixed. Comments and defect
-reports are raised as issues on the project repository.
+published as such, and visible, before the text is fixed. Comments and defect reports are raised as issues on the project repository.
+Before reporting, check the live list of known items at
+<https://archivetech.org/spec/issues> — it is current, whereas the Open Items
+appendix of this document is only a snapshot taken when this revision was fixed.
 
 On freezing, the format this document defines becomes final: no tape it
 validates will ever be invalidated, no reader guarantee will be withdrawn, and
@@ -182,8 +184,9 @@ damaged block is the first block of the very file that describes it.
 
 Appendix A. [Worked Examples (Informative)](#appendix-a-worked-examples-informative)  
 Appendix B. [Design Rationale (Informative)](#appendix-b-design-rationale-informative)  
-Appendix C. [Open Items Before Freeze (Informative; all resolved)](#appendix-c-open-items-before-freeze-informative-all-resolved)  
+Appendix C. [Open Items Closed Before Publication (Informative)](#appendix-c-open-items-closed-before-publication-informative)  
 Appendix D. [Revision History (Informative)](#appendix-d-revision-history-informative)  
+Appendix E. [Open Items (Informative)](#appendix-e-open-items-informative)  
 [Author's Address](#authors-address)
 
 ---
@@ -2516,7 +2519,7 @@ discard physically written but uncheckpointed orphan bundles and truncate
 them before append. This journal version is deliberately not recorded on
 tape and does not change any REM-PARITY media byte.
 
-## Appendix C. Open Items Before Freeze (Informative; all resolved)
+## Appendix C. Open Items Closed Before Publication (Informative)
 
 Every item below was closed before the freeze; the parenthetical notes name
 the resolutions, and the Revision History appendix records when.
@@ -2687,6 +2690,61 @@ governs only the revisions that follow the first published one.
   admission-time refusal with mandatory headroom and seal-at-ceiling
   (Section 8.2.1); reference journal watermark note (Appendix B.12).
 - **2026-06-11 — [draft] first draft.** Initial working baseline.
+
+## Appendix E. Open Items (Informative)
+
+**This list is a snapshot**, taken when this revision was fixed. It is not
+updated afterwards: the bytes of a published revision are immutable and their
+digest is cited elsewhere. Items raised after this date are recorded in the
+live list at **<https://archivetech.org/spec/issues>**, which is current —
+consult it before reporting anything, and expect it to hold more than appears
+here. The next revision carries a new snapshot, and its revision-history entry
+says which items it resolved.
+
+Listing an item here is not a commitment to act on it. An item marked
+*accepted* will be addressed in a future revision; *deferred* means we judge it
+real but not yet ripe; *declined* means we considered it and decided against,
+with the reason given so the decision can be argued with rather than merely
+discovered. Comment is invited on everything, and most of all on the items
+marked so.
+
+
+**RP-1 · Retrieval pointer on the medium · accepted in principle, design open.**
+Nothing on a tape says where to obtain this document. A finder holds eight magic
+bytes and must already know what they mean, and Section 8.1.1's promise that
+every revision is retrievable through its concept DOI is of no use to someone
+who does not have the DOI. The proposal is to assign bootstrap payload key 6
+(currently unassigned) as an OPTIONAL text string carrying a fixed,
+printable-ASCII pointer, inert to every Reader decision. Measured cost is at
+most one object row against the Section 8.2.1 ceiling. *Comment invited on
+whether the value should be a constant fixed by this document or writer-chosen,
+on what it should contain, and on whether a pointer on the medium is worth a
+wire assignment at all.*
+
+**RP-2 · Bounds on writer-supplied text · accepted.** Keys 3 and 4 are
+writer-chosen text with no length bound and no charset restriction in this
+document or in the reference decoder. A hostile tape can therefore carry
+arbitrary control bytes in the first human-readable text a diagnostic tool
+prints. A future revision will bound their length and restrict them to
+printable US-ASCII, and state what a Reader must do with a value that violates
+either. No conformant tape is affected.
+
+**RP-3 · An embedded copy of the specification · deferred.** A pointer tells a
+finder where the document is; carrying the document itself would not depend on
+anything outside the cartridge. This is a materially larger change — a reserved
+object identity, a Section 12 classification rule, Section 8.2.1 row accounting
+— and it complements RP-1 rather than replacing it, because Section 12.3 rung 5
+classifies unrecognised tape files by elimination and never by reading content,
+so an embedded document is invisible to a finder who does not already know to
+look. *Comment invited on whether this is worth its cost.*
+
+**RP-4 · An independent implementation from the prose alone · open, and the
+review we most want.** The central claim of this document is that an
+implementation built from its text alone reproduces the published vectors.
+Nobody outside the project has tested that. If you build even a partial reader
+and it disagrees with the vectors, that disagreement is the most valuable
+report this window can receive.
+
 
 ## Author's Address
 

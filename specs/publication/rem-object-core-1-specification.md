@@ -48,8 +48,10 @@ vectors, and where it would not, the text is wrong and we want to know.
 one year after publication. On that date the finality promise below takes
 effect and the change policy governs every revision after it. The three months
 between the two dates exist so that changes made in response to review are
-published as such, and visible, before the text is fixed. Comments and defect
-reports are raised as issues on the project repository.
+published as such, and visible, before the text is fixed. Comments and defect reports are raised as issues on the project repository.
+Before reporting, check the live list of known items at
+<https://archivetech.org/spec/issues> — it is current, whereas the Open Items
+appendix of this document is only a snapshot taken when this revision was fixed.
 
 This document is the publication specification for the REM-OBJECT Core
 Format. It is the normative fixed point for the durable canonical object: an
@@ -170,6 +172,7 @@ construction is deterministic.
 - Appendix A. [Worked Example (Informative)](#appendix-a-worked-example-informative)
 - Appendix B. [Design Rationale (Informative)](#appendix-b-design-rationale-informative)
 - Appendix C. [Revision History (Informative)](#appendix-c-revision-history-informative)
+- Appendix D. [Open Items (Informative)](#appendix-d-open-items-informative)
 - [Author's Address](#authors-address)
 
 ---
@@ -2079,6 +2082,37 @@ effect on conformance.
   its own — its metadata table read "DOI: assigned at first release" — no
   change policy and no revision history, and it was reachable only by
   unpacking the source archive.
+
+## Appendix D. Open Items (Informative)
+
+**This list is a snapshot**, taken when this revision was fixed. It is not
+updated afterwards: the bytes of a published revision are immutable and their
+digest is cited elsewhere. Items raised after this date are recorded in the
+live list at **<https://archivetech.org/spec/issues>**, which is current —
+consult it before reporting anything, and expect it to hold more than appears
+here. The next revision carries a new snapshot, and its revision-history entry
+says which items it resolved.
+
+Listing an item here is not a commitment to act on it. An item marked
+*accepted* will be addressed in a future revision; *deferred* means we judge it
+real but not yet ripe; *declined* means we considered it and decided against,
+with the reason given so the decision can be argued with rather than merely
+discovered. Comment is invited on everything, and most of all on the items
+marked so.
+
+
+**RO-1 · An independent implementation from the prose alone · open, and the
+review we most want.** The central claim of this document is that an
+implementation built from its text alone reproduces the published vectors.
+Nobody outside the project has tested that. A disagreement between your reader
+and the vectors is the most valuable report this window can receive.
+
+**RO-2 · An embedded copy of the specification on tape · deferred.** Carrying
+the specification as an object on the medium it describes would remove the
+dependency on an external retrieval path. It would require a reserved object
+identity in this document and classification support in REM-PARITY; it is
+recorded there as RP-3. *Comment invited.*
+
 
 ## Author's Address
 
