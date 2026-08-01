@@ -1,0 +1,27 @@
+# Digests of specification revisions AS DEPOSITED.
+#
+# Each line records the exact bytes published under a document's DOI for one
+# version string. Written at deposit time, never edited afterwards: a published
+# revision is immutable, so its digest is too.
+#
+# The rule this file enforces, checked by tools/check_spec_versioning.py on every
+# verification pass:
+#
+#     If a document's current version string appears here, the file in this
+#     repository MUST hash to the digest recorded for it. Otherwise the version
+#     string MUST be bumped.
+#
+# In other words a version string is never reused for different bytes. The
+# repository copy may legitimately run ahead of the deposited copy — that is how
+# the next revision is prepared — but it must then carry the next version
+# string, so "the 1.0.0-draft.1 text" can only ever mean one sequence of bytes
+# no matter which copy you are holding.
+#
+# That is what makes the precedence rule in each document's Status section
+# mechanically checkable rather than a promise: the deposit governs, and if a
+# copy claims the same version string, it is either identical or the build fails.
+#
+# Format:  <filename>  <version>  <sha256>
+#
+# No revision has been deposited yet. Entries appear here when the Zenodo
+# deposits are published.

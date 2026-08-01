@@ -18,10 +18,15 @@ Checked:
   5. Cross-reference titles use the canonical citation forms.
   6. Every "Appendix X" reference inside a document resolves to an appendix
      heading that exists in that document.
+  7. No version string is reused for different bytes: if a document's current
+     version appears in DEPOSITED.sha256, the repository copy must hash to the
+     digest recorded there. This is what makes each document's "the deposited
+     revision governs" rule mechanically checkable rather than a promise.
 
 Exit 0 clean; exit 1 with findings on stderr.
 """
 
+import hashlib
 import re
 import sys
 import pathlib
@@ -164,6 +169,52 @@ def main() -> int:
         for ref in set(re.findall(r"Appendix ([A-Z])(?:[ .,;)]|$)", t)):
             if ref not in have:
                 fail(f"{n}: reference to Appendix {ref} but no such appendix")
+
+    # 7. A version string is never reused for different bytes.
+    #
+    # The repository copy may legitimately be ahead of the deposited copy — that
+    # is how the next revision is prepared — but then it must carry the next
+    # version string. So a given version string identifies one sequence of bytes
+    # whether you are holding the deposit, the repository, or a copy unpacked
+    # from a source release years later.
+    deposited_path = PUB / "DEPOSITED.sha256"
+    deposited: dict[tuple[str, str], str] = {}
+    if deposited_path.is_file():
+        for lineno, line in enumerate(deposited_path.read_text().splitlines(), 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) != 3:
+                fail(f"DEPOSITED.sha256 line {lineno}: expected "
+                     f"'<filename> <version> <sha256>', got {line!r}")
+                continue
+            name, version, digest = parts
+            if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                fail(f"DEPOSITED.sha256 line {lineno}: {digest!r} is not a sha256")
+                continue
+            if (name, version) in deposited and deposited[(name, version)] != digest:
+                fail(f"DEPOSITED.sha256: {name} {version} recorded twice with "
+                     "different digests — a published revision is immutable")
+            deposited[(name, version)] = digest
+
+    for name in list(SPECS) + [COMPANION]:
+        path = PUB / name
+        if not path.is_file():
+            continue
+        text = path.read_text()
+        m = re.search(r"^\| Version \| (\S+) \|", text, re.M)
+        if not m:
+            continue
+        version = m.group(1)
+        recorded = deposited.get((name, version))
+        if recorded is None:
+            continue  # not yet deposited: an unreleased revision in preparation
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual != recorded:
+            fail(f"{name}: version {version} was deposited as {recorded[:16]}… but the "
+                 f"repository copy hashes to {actual[:16]}… — a published revision is "
+                 "immutable, so bump the version string instead of editing it")
 
     if findings:
         print(f"check_spec_versioning: {len(findings)} finding(s)", file=sys.stderr)
