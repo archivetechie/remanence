@@ -1,30 +1,40 @@
 # The Remanence Formats, Explained
 
-*A companion to REM-OBJECT Core Format 1.0, REM-ENCRYPT 1.0, and the Rem
-Tape Parity (REM-PARITY) Format 1.0. This document is informative: it
+*A companion to the REM-OBJECT Core Format, REM-ENCRYPT and Rem Tape Parity
+(REM-PARITY) specifications, 1.x. This document is informative: it
 explains what the formats do and why they are shaped the way they are, in
 plain language. The specifications remain the only normative documents—where
 this text and a specification disagree, the specification wins.*
 
 | | |
 | --- | --- |
-| Status | Review draft (informative companion) |
+| Status | Informative companion |
 | Version | 1.0.0-draft.1 |
 | Date | 2026-07-31 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719163](https://doi.org/10.5281/zenodo.21719163) |
 
-**This is a review draft**, published alongside the specifications it accompanies. Comments close on 30 April 2027 and the documents freeze on 31 July 2027.
+**This companion does not freeze.** The specifications it explains are review
+drafts that will be frozen on 31 July 2027; this document is not one of them and
+is not bound by their change policy. Nothing conforms to it, no implementation is
+validated against it, and no tape carries a value it defines — so it has no
+obligations to hold still for, and freezing it would only commit us never to
+explain something better. It tracks the specifications and is revised whenever a
+passage can be made clearer or a specification moves. If something here is
+confusing or wrong, that is worth reporting exactly as a specification defect is:
+see <https://archivetech.org/spec/issues>.
 
 **Which copy governs.** The text of this companion is the revision deposited
 under the concept DOI above; every other copy is a convenience copy, and a copy
 carrying the same version string is byte-identical to it or defective. Where
 this companion and a specification disagree, the specification governs.
 
-This companion is versioned and archived like the specifications it
-accompanies, so that a citation of it names immutable text; its version
-numbers follow the same three-part convention, and its revisions are errata
-unless a specification revision obliges more.
+It is versioned and deposited nonetheless, so that a citation of it names one
+exact text. The version number simply increments; it carries none of the
+erratum / minor / major meaning the specifications' numbers carry, because that
+classification describes changes to obligations and this document imposes none.
+The one rule it does share with its siblings is that a version string is never
+reused for different bytes.
 
 ---
 
@@ -524,13 +534,15 @@ with the reason given so the decision can be argued with rather than merely
 discovered. Comment is invited on everything, and most of all on the items
 marked so.
 
-This companion carries no open items of its own; it follows the specifications it explains.
+This companion carries no open items of its own; it follows the specifications
+it explains. Because it does not freeze, a correction to it does not wait for a
+revision cycle — report a confusing or wrong passage and it can be fixed and
+re-deposited on its own schedule.
 
 ## Revision History (Informative)
 
-- **2026-07-31 — 1.0.0-draft.1 — review draft.** First revision of this
-  companion to carry a version, a status and a DOI of its own. Published for
-  public review; not yet frozen. Because it is informative, its revisions never
-  change any conformance obligation.
+- **2026-07-31 — 1.0.0-draft.1.** First revision of this companion to carry a
+  version, a status and a DOI of its own. Published alongside the first review
+  drafts of the specifications it explains.
 - **2026-07-25 — unversioned.** Distributed inside software release v1.0.0
   without version, status or deposit metadata.
