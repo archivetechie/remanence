@@ -507,6 +507,25 @@ is exactly the moment to build the habit.
 *Author: The ArchiveTech Project — <https://archivetech.org> —
 specs@archivetech.org*
 
+## Open Items (Informative)
+
+**This list is a snapshot**, taken when this revision was fixed. It is not
+updated afterwards: the bytes of a published revision are immutable and their
+digest is cited elsewhere. Items raised after this date are recorded in the
+live list at **<https://archivetech.org/spec/issues>**, which is current —
+consult it before reporting anything, and expect it to hold more than appears
+here. The next revision carries a new snapshot, and its revision-history entry
+says which items it resolved.
+
+Listing an item here is not a commitment to act on it. An item marked
+*accepted* will be addressed in a future revision; *deferred* means we judge it
+real but not yet ripe; *declined* means we considered it and decided against,
+with the reason given so the decision can be argued with rather than merely
+discovered. Comment is invited on everything, and most of all on the items
+marked so.
+
+This companion carries no open items of its own; it follows the specifications it explains.
+
 ## Revision History (Informative)
 
 - **2026-07-31 — 1.0.0-draft.1 — review draft.** First revision of this
