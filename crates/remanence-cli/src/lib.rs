@@ -7,10 +7,10 @@
 //! rem libraries                       # list every library on the host
 //! rem library <serial>                # focused view of one library
 //! rem library <serial> --slots        # plus per-slot detail
-//! rem archive probe --format bru --dump <path.bru>
-//! rem archive scan --format bru --dump <path.bru>
-//! rem archive restore --format bru --dump <path.bru> --dest <dir>
-//! rem archive recover --format bru --dump <path.bru> --dest <dir>
+//! rem archive probe --format <adapter> --dump <path>
+//! rem archive scan --format <adapter> --dump <path>
+//! rem archive restore --format <adapter> --dump <path> --dest <dir>
+//! rem archive recover --format <adapter> --dump <path> --dest <dir>
 //! ```
 //!
 //! Break-glass direct hardware surface:
@@ -24,8 +24,8 @@
 //! rem-debug rescan  <serial>
 //! rem-debug lock    <serial>      # PREVENT MEDIUM REMOVAL
 //! rem-debug unlock  <serial>      # ALLOW MEDIUM REMOVAL
-//! rem-debug archive scan --format bru --tape <serial> --bay 0x0100 --rewind
-//! rem-debug dev write-dump-to-tape --dump <path.bru> --tape <serial> --bay 0x0100 \
+//! rem-debug archive scan --format <adapter> --tape <serial> --bay 0x0100 --rewind
+//! rem-debug dev write-dump-to-tape --dump <path> --tape <serial> --bay 0x0100 \
 //!   --i-understand-this-overwrites-the-loaded-tape
 //! ```
 //!
@@ -48,6 +48,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -56,10 +57,6 @@ use remanence_aead::{
     RemObjectHeader, SealOptions, REM_OBJECT_HEADER_LEN,
 };
 use remanence_api::pb;
-#[cfg(feature = "foreign-bru")]
-use remanence_bru::{BruFormat, BRU_BLOCK_SIZE};
-#[cfg(all(target_os = "linux", feature = "foreign-bru"))]
-use remanence_format::ForeignTapeFormat;
 use remanence_format::{
     read_rem_tar_object, write_rem_tar_object_from_readers, ArchiveGapCause, ArchiveGapRange,
     ArchiveReader, BodyLba, DamageRange, DamageStatus, EntryKind, FormatError, ProbeConfidence,
@@ -67,6 +64,7 @@ use remanence_format::{
     RemTarObjectLayout, RemTarObjectOptions, RemTarReadObject, SourceRequirement, FORMAT_ID,
     MANIFEST_PATH,
 };
+use remanence_format_driver::{ForeignFormatAdapter, ForeignFormatRegistry};
 #[cfg(target_os = "linux")]
 use remanence_library::DriveHandlePhysicalSource;
 use remanence_library::{
@@ -101,8 +99,6 @@ const MEDIA_CONDITIONING_STEADY_POLL: StdDuration = StdDuration::from_secs(60);
 const CONDITIONAL_LOAD_SETTLE: StdDuration = StdDuration::from_millis(0);
 #[cfg(not(test))]
 const CONDITIONAL_LOAD_SETTLE: StdDuration = StdDuration::from_secs(1);
-#[cfg(not(feature = "foreign-bru"))]
-const BRU_BLOCK_SIZE: usize = 2048;
 
 #[cfg(target_os = "linux")]
 type CliTransportFactory =
@@ -1899,9 +1895,9 @@ impl TapeRetireArgs {
 
 #[derive(Subcommand, Debug)]
 enum DevCommand {
-    /// Destructively write a BRU dump file to the loaded tape in a drive bay.
+    /// Destructively write a raw dump file to the loaded tape in a drive bay.
     WriteDumpToTape {
-        /// Path to a BRU dump file.
+        /// Path to a raw dump file.
         #[arg(long, value_name = "PATH")]
         dump: PathBuf,
 
@@ -2348,7 +2344,7 @@ struct RemArchiveListArgs {
 #[derive(Args, Debug)]
 struct RemArchiveInputArgs {
     /// Archive format driver.
-    #[arg(long, value_enum)]
+    #[arg(long, value_name = "ID")]
     format: ArchiveFormat,
 
     #[command(flatten)]
@@ -2358,7 +2354,7 @@ struct RemArchiveInputArgs {
 #[derive(Args, Debug)]
 struct RemArchiveRestoreArgs {
     /// Archive format driver.
-    #[arg(long, value_enum)]
+    #[arg(long, value_name = "ID")]
     format: ArchiveFormat,
 
     #[command(flatten)]
@@ -2385,7 +2381,7 @@ struct RemArchiveRestoreArgs {
 #[derive(Args, Debug)]
 struct RemArchiveRecoverArgs {
     /// Archive format driver.
-    #[arg(long, value_enum)]
+    #[arg(long, value_name = "ID")]
     format: ArchiveFormat,
 
     #[command(flatten)]
@@ -3038,7 +3034,7 @@ struct ArchiveListArgs {
 #[derive(Args, Debug)]
 struct ArchiveInputArgs {
     /// Archive format driver.
-    #[arg(long, value_enum)]
+    #[arg(long, value_name = "ID")]
     format: ArchiveFormat,
 
     #[command(flatten)]
@@ -3048,7 +3044,7 @@ struct ArchiveInputArgs {
 #[derive(Args, Debug)]
 struct ArchiveRestoreArgs {
     /// Archive format driver.
-    #[arg(long, value_enum)]
+    #[arg(long, value_name = "ID")]
     format: ArchiveFormat,
 
     #[command(flatten)]
@@ -3075,7 +3071,7 @@ struct ArchiveRestoreArgs {
 #[derive(Args, Debug)]
 struct ArchiveRecoverArgs {
     /// Archive format driver.
-    #[arg(long, value_enum)]
+    #[arg(long, value_name = "ID")]
     format: ArchiveFormat,
 
     #[command(flatten)]
@@ -3116,10 +3112,19 @@ struct ArchiveSourceArgs {
     rewind: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum ArchiveFormat {
-    /// BRU/BRU-PE legacy archive.
-    Bru,
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ArchiveFormat(String);
+
+impl std::str::FromStr for ArchiveFormat {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("archive format id cannot be empty".to_string());
+        }
+        Ok(Self(value.to_string()))
+    }
 }
 
 impl ArchiveCommand {
@@ -3191,11 +3196,11 @@ impl ArchiveCommand {
         }
     }
 
-    fn format(&self) -> ArchiveFormat {
+    fn format(&self) -> &ArchiveFormat {
         match self {
-            Self::Probe(args) | Self::Scan(args) => args.format,
-            Self::Restore(args) => args.format,
-            Self::Recover(args) => args.format,
+            Self::Probe(args) | Self::Scan(args) => &args.format,
+            Self::Restore(args) => &args.format,
+            Self::Recover(args) => &args.format,
             Self::Build(_) => panic!("ArchiveCommand::Build has no format"),
             Self::Capabilities => panic!("ArchiveCommand::Capabilities has no format"),
             Self::Reseal(_) => panic!("ArchiveCommand::Reseal has no format"),
@@ -3242,27 +3247,29 @@ enum ArchiveSourceSelection<'a> {
 }
 
 impl ArchiveFormat {
-    fn cli_name(self) -> &'static str {
-        match self {
-            Self::Bru => "bru",
-        }
-    }
-
-    fn driver_id(self) -> &'static str {
-        match self {
-            Self::Bru => "remanence-bru",
-        }
+    fn cli_name(&self) -> &str {
+        self.0.as_str()
     }
 }
 
 pub fn main_entry() -> ExitCode {
+    main_entry_with_registry(ForeignFormatRegistry::default())
+}
+
+/// Run the operator CLI with the foreign formats linked by a distribution.
+pub fn main_entry_with_registry(registry: ForeignFormatRegistry) -> ExitCode {
     let cli = Cli::parse();
-    run_cli(cli.into(), CliMode::Rem)
+    run_cli(cli.into(), CliMode::Rem, registry)
 }
 
 pub fn debug_main_entry() -> ExitCode {
+    debug_main_entry_with_registry(ForeignFormatRegistry::default())
+}
+
+/// Run the break-glass CLI with the foreign formats linked by a distribution.
+pub fn debug_main_entry_with_registry(registry: ForeignFormatRegistry) -> ExitCode {
     let cli = DebugCli::parse();
-    run_cli(cli.into(), CliMode::Debug)
+    run_cli(cli.into(), CliMode::Debug, registry)
 }
 
 #[cfg(target_os = "linux")]
@@ -3356,7 +3363,7 @@ fn chaos_io_error(error: remanence_chaos::ChaosError) -> IoErrorKind {
     }
 }
 
-fn run_cli(cli: ParsedCli, mode: CliMode) -> ExitCode {
+fn run_cli(cli: ParsedCli, mode: CliMode, registry: ForeignFormatRegistry) -> ExitCode {
     #[cfg(target_os = "linux")]
     let discover_fn = move || {
         if mode == CliMode::Debug {
@@ -3381,7 +3388,15 @@ fn run_cli(cli: ParsedCli, mode: CliMode) -> ExitCode {
     let mut input = stdin.lock();
     let mut out = stdout.lock();
     let mut err = stderr.lock();
-    run_with_mode(cli, mode, discover_fn, &mut input, &mut out, &mut err)
+    run_with_mode(
+        cli,
+        mode,
+        discover_fn,
+        &mut input,
+        &mut out,
+        &mut err,
+        &registry,
+    )
 }
 
 /// Core entry-point — generic over the discovery function and the
@@ -3401,6 +3416,7 @@ where
         &mut io::empty(),
         out,
         err,
+        &ForeignFormatRegistry::default(),
     )
 }
 
@@ -3416,6 +3432,7 @@ where
         &mut io::empty(),
         out,
         err,
+        &ForeignFormatRegistry::default(),
     )
 }
 
@@ -3426,6 +3443,7 @@ fn run_with_mode<F>(
     input: &mut dyn Read,
     out: &mut dyn Write,
     err: &mut dyn Write,
+    registry: &ForeignFormatRegistry,
 ) -> ExitCode
 where
     F: FnOnce() -> Result<DiscoveryReport, DiscoveryError>,
@@ -3635,7 +3653,7 @@ where
             return run_archive_covering_range(args, input, out, err);
         }
         if command.is_dump_command() {
-            return run_archive_dump_command(command, out, err);
+            return run_archive_dump_command(command, registry, out, err);
         }
         // `archive list` is a catalog read — no SCSI, so bypass discovery
         // entirely (like rebuild-catalog-from-journals above).
@@ -3945,7 +3963,15 @@ where
                     err,
                 );
             }
-            return run_archive_tape_command(&report, command, &allow, &allow_derived, out, err);
+            return run_archive_tape_command(
+                &report,
+                command,
+                registry,
+                &allow,
+                &allow_derived,
+                out,
+                err,
+            );
         }
         Command::Dev { command } => {
             return run_dev_command(&report, &command, &allow, &allow_derived, out, err);
@@ -10141,11 +10167,6 @@ fn validate_dev_record_size(record_size: usize) -> Result<(), String> {
             "record size {record_size} exceeds WRITE(6) transfer limit {MAX_SCSI_VARIABLE_WRITE_BYTES}"
         ));
     }
-    if record_size % BRU_BLOCK_SIZE != 0 {
-        return Err(format!(
-            "record size {record_size} must be a multiple of BRU block size {BRU_BLOCK_SIZE}"
-        ));
-    }
     Ok(())
 }
 
@@ -10172,12 +10193,6 @@ fn write_dump_to_loaded_tape(
     if dump_len == 0 {
         return Err("dump file is empty".to_string());
     }
-    if dump_len % BRU_BLOCK_SIZE as u64 != 0 {
-        return Err(format!(
-            "dump length {dump_len} is not a multiple of BRU block size {BRU_BLOCK_SIZE}"
-        ));
-    }
-
     let current_config = drive.read_config().map_err(|error| error.to_string())?;
     if record_size > current_config.max_block_size_bytes as usize {
         return Err(format!(
@@ -10220,11 +10235,6 @@ fn write_dump_to_loaded_tape(
         if filled == 0 {
             break;
         }
-        if filled % BRU_BLOCK_SIZE != 0 {
-            return Err(format!(
-                "final record length {filled} is not a multiple of BRU block size {BRU_BLOCK_SIZE}"
-            ));
-        }
         let outcome = drive
             .write_block(&buffer[..filled])
             .map_err(|error| error.to_string())?;
@@ -10262,6 +10272,7 @@ fn write_dump_to_loaded_tape(
 
 fn run_archive_dump_command(
     command: &ArchiveCommand,
+    registry: &ForeignFormatRegistry,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
@@ -10276,7 +10287,7 @@ fn run_archive_dump_command(
                 Ok(reader) => reader,
                 Err(code) => return code,
             };
-            match probe_dump_archive(format, &mut reader) {
+            match probe_dump_archive(registry, format, &mut reader) {
                 Ok(probe) => {
                     print_probe(&probe, out);
                     ExitCode::SUCCESS
@@ -10296,7 +10307,7 @@ fn run_archive_dump_command(
                 Ok(reader) => reader,
                 Err(code) => return code,
             };
-            let mut archive = match open_dump_archive(format, reader) {
+            let mut archive = match open_dump_archive(registry, format, reader) {
                 Ok(archive) => archive,
                 Err(error) => {
                     let _ = writeln!(err, "error: {error}");
@@ -10323,7 +10334,7 @@ fn run_archive_dump_command(
                 Ok(reader) => reader,
                 Err(code) => return code,
             };
-            let mut archive = match open_dump_archive(format, reader) {
+            let mut archive = match open_dump_archive(registry, format, reader) {
                 Ok(archive) => archive,
                 Err(error) => {
                     let _ = writeln!(err, "error: {error}");
@@ -10357,7 +10368,7 @@ fn run_archive_dump_command(
                 Ok(reader) => reader,
                 Err(code) => return code,
             };
-            let mut archive = match open_dump_archive(format, reader) {
+            let mut archive = match open_dump_archive(registry, format, reader) {
                 Ok(archive) => archive,
                 Err(error) => {
                     let _ = writeln!(err, "error: {error}");
@@ -10365,10 +10376,18 @@ fn run_archive_dump_command(
                 }
             };
             let source = format!("dump:{}", path.display());
+            let driver_id =
+                match resolve_foreign_format(registry, format, SourceRequirement::ByteStreamDump) {
+                    Ok(adapter) => adapter.id(),
+                    Err(error) => {
+                        let _ = writeln!(err, "error: {error}");
+                        return ExitCode::from(1);
+                    }
+                };
             match remanence_stream::recover_archive_reader_to_directory(
                 archive.as_mut(),
                 &args.dest,
-                remanence_stream::RecoveryOptions::new(format.driver_id(), source),
+                remanence_stream::RecoveryOptions::new(driver_id, source),
             ) {
                 Ok(report) => {
                     print_archive_recovery(&report, out);
@@ -10437,7 +10456,7 @@ fn dump_path<'a>(source: &'a ArchiveSourceArgs, err: &mut dyn Write) -> Result<&
 
 fn open_dump_reader(
     path: &Path,
-    format: ArchiveFormat,
+    format: &ArchiveFormat,
     err: &mut dyn Write,
 ) -> Result<BufReader<File>, ExitCode> {
     File::open(path).map(BufReader::new).map_err(|error| {
@@ -10452,42 +10471,42 @@ fn open_dump_reader(
 }
 
 fn probe_dump_archive(
-    format: ArchiveFormat,
+    registry: &ForeignFormatRegistry,
+    format: &ArchiveFormat,
     reader: &mut BufReader<File>,
 ) -> Result<ProbeResult, FormatError> {
-    match format {
-        #[cfg(feature = "foreign-bru")]
-        ArchiveFormat::Bru => BruFormat.probe_dump(reader),
-        #[cfg(not(feature = "foreign-bru"))]
-        ArchiveFormat::Bru => {
-            let _ = reader;
-            Err(format_unavailable_error(format))
-        }
-    }
+    resolve_foreign_format(registry, format, SourceRequirement::ByteStreamDump)?.probe_dump(reader)
 }
 
 fn open_dump_archive(
-    format: ArchiveFormat,
-    reader: BufReader<File>,
+    registry: &ForeignFormatRegistry,
+    format: &ArchiveFormat,
+    mut reader: BufReader<File>,
 ) -> Result<Box<dyn ArchiveReader>, FormatError> {
-    match format {
-        #[cfg(feature = "foreign-bru")]
-        ArchiveFormat::Bru => Ok(Box::new(BruFormat.open_dump_reader(reader))),
-        #[cfg(not(feature = "foreign-bru"))]
-        ArchiveFormat::Bru => {
-            drop(reader);
-            Err(format_unavailable_error(format))
-        }
-    }
+    let adapter = resolve_foreign_format(registry, format, SourceRequirement::ByteStreamDump)?;
+    let probe = adapter.probe_dump(&mut reader)?;
+    ensure_probe_matches(format, &probe).map_err(FormatError::parse)?;
+    adapter.open_dump_reader(Box::new(reader), &probe.adapter_state)
 }
 
-#[cfg(not(feature = "foreign-bru"))]
-fn format_unavailable_error(format: ArchiveFormat) -> FormatError {
-    FormatError::unsupported(format!(
-        "format {} ({}) is not available in this build",
-        format.cli_name(),
-        format.driver_id()
-    ))
+fn resolve_foreign_format(
+    registry: &ForeignFormatRegistry,
+    format: &ArchiveFormat,
+    source: SourceRequirement,
+) -> Result<Arc<dyn ForeignFormatAdapter>, FormatError> {
+    let adapter = registry.get(format.cli_name()).ok_or_else(|| {
+        FormatError::unsupported(format!(
+            "foreign format {} is not registered in this distribution",
+            format.cli_name()
+        ))
+    })?;
+    if !adapter.supported_sources().contains(&source) {
+        return Err(FormatError::unsupported(format!(
+            "format {} does not support the requested source",
+            adapter.id()
+        )));
+    }
+    Ok(adapter)
 }
 
 /// Build a portable REM-OBJECT object file from local filesystem inputs.
@@ -12993,6 +13012,7 @@ fn finalize_sha256(hasher: Sha256) -> [u8; 32] {
 fn run_archive_tape_command(
     report: &DiscoveryReport,
     command: &ArchiveCommand,
+    registry: &ForeignFormatRegistry,
     allow: &[String],
     allow_derived: &[String],
     out: &mut dyn Write,
@@ -13022,13 +13042,14 @@ fn run_archive_tape_command(
     for s in allow_derived {
         policy = policy.with_derived_allowed(s.clone());
     }
-    open_and_run_archive_tape(lib, command, &policy, out, err, report)
+    open_and_run_archive_tape(lib, command, registry, &policy, out, err, report)
 }
 
 #[cfg(target_os = "linux")]
 fn open_and_run_archive_tape(
     lib: &Library,
     command: &ArchiveCommand,
+    registry: &ForeignFormatRegistry,
     policy: &dyn remanence_library::AccessPolicy,
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -13057,7 +13078,7 @@ fn open_and_run_archive_tape(
         if rewind {
             drive.rewind().map_err(|error| error.to_string())?;
         }
-        run_archive_tape_with_drive(command, &mut drive, out, err)
+        run_archive_tape_with_drive(command, registry, &mut drive, out, err)
     })();
 
     match result {
@@ -13085,13 +13106,15 @@ fn open_and_run_archive_tape(
 #[cfg(target_os = "linux")]
 fn run_archive_tape_with_drive(
     command: &ArchiveCommand,
+    registry: &ForeignFormatRegistry,
     drive: &mut remanence_library::DriveHandle,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<(), String> {
     let format = command.format();
     let mut source = DriveHandlePhysicalSource::new(drive);
-    let probe = probe_tape_archive(format, &mut source).map_err(|error| error.to_string())?;
+    let probe =
+        probe_tape_archive(registry, format, &mut source).map_err(|error| error.to_string())?;
     match command {
         ArchiveCommand::Probe(_) => {
             print_probe(&probe, out);
@@ -13099,7 +13122,7 @@ fn run_archive_tape_with_drive(
         }
         ArchiveCommand::Scan(_) => {
             ensure_probe_matches(format, &probe)?;
-            let mut archive = open_tape_archive(format, &mut source, &probe)
+            let mut archive = open_tape_archive(registry, format, &mut source, &probe)
                 .map_err(|error| error.to_string())?;
             let report = remanence_stream::scan_archive_reader(archive.as_mut())
                 .map_err(|error| error.to_string())?;
@@ -13108,7 +13131,7 @@ fn run_archive_tape_with_drive(
         }
         ArchiveCommand::Restore(args) => {
             ensure_probe_matches(format, &probe)?;
-            let mut archive = open_tape_archive(format, &mut source, &probe)
+            let mut archive = open_tape_archive(registry, format, &mut source, &probe)
                 .map_err(|error| error.to_string())?;
             let report = remanence_stream::restore_archive_reader_to_directory(
                 archive.as_mut(),
@@ -13124,7 +13147,7 @@ fn run_archive_tape_with_drive(
         }
         ArchiveCommand::Recover(args) => {
             ensure_probe_matches(format, &probe)?;
-            let mut archive = open_tape_archive(format, &mut source, &probe)
+            let mut archive = open_tape_archive(registry, format, &mut source, &probe)
                 .map_err(|error| error.to_string())?;
             let source_description = match args.source.selection() {
                 Ok(ArchiveSourceSelection::Tape { serial, bay, .. }) => {
@@ -13133,10 +13156,14 @@ fn run_archive_tape_with_drive(
                 Ok(ArchiveSourceSelection::Dump(_)) => "tape:<internal-dispatch-error>".to_string(),
                 Err(error) => return Err(error),
             };
+            let driver_id =
+                resolve_foreign_format(registry, format, SourceRequirement::PhysicalTapeRecords)
+                    .map_err(|error| error.to_string())?
+                    .id();
             let report = remanence_stream::recover_archive_reader_to_directory(
                 archive.as_mut(),
                 &args.dest,
-                remanence_stream::RecoveryOptions::new(format.driver_id(), source_description),
+                remanence_stream::RecoveryOptions::new(driver_id, source_description),
             )
             .map_err(|error| error.to_string())?;
             print_archive_recovery(&report, out);
@@ -13185,42 +13212,30 @@ fn run_archive_tape_with_drive(
 
 #[cfg(target_os = "linux")]
 fn probe_tape_archive(
-    format: ArchiveFormat,
+    registry: &ForeignFormatRegistry,
+    format: &ArchiveFormat,
     source: &mut dyn remanence_library::PhysicalTapeSource,
 ) -> Result<ProbeResult, FormatError> {
-    match format {
-        #[cfg(feature = "foreign-bru")]
-        ArchiveFormat::Bru => BruFormat.probe(source),
-        #[cfg(not(feature = "foreign-bru"))]
-        ArchiveFormat::Bru => {
-            let _ = source;
-            Err(format_unavailable_error(format))
-        }
-    }
+    resolve_foreign_format(registry, format, SourceRequirement::PhysicalTapeRecords)?
+        .probe_tape(source)
 }
 
 #[cfg(target_os = "linux")]
 fn open_tape_archive<'a>(
-    format: ArchiveFormat,
+    registry: &ForeignFormatRegistry,
+    format: &ArchiveFormat,
     source: &'a mut dyn remanence_library::PhysicalTapeSource,
     probe: &ProbeResult,
 ) -> Result<Box<dyn ArchiveReader + 'a>, FormatError> {
-    match format {
-        #[cfg(feature = "foreign-bru")]
-        ArchiveFormat::Bru => BruFormat.open_tape_reader(source, probe),
-        #[cfg(not(feature = "foreign-bru"))]
-        ArchiveFormat::Bru => {
-            let _ = source;
-            let _ = probe;
-            Err(format_unavailable_error(format))
-        }
-    }
+    resolve_foreign_format(registry, format, SourceRequirement::PhysicalTapeRecords)?
+        .open_tape_reader(source, probe)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn open_and_run_archive_tape(
     _lib: &Library,
     _command: &ArchiveCommand,
+    _registry: &ForeignFormatRegistry,
     _policy: &dyn remanence_library::AccessPolicy,
     _out: &mut dyn Write,
     err: &mut dyn Write,
@@ -13234,10 +13249,10 @@ fn open_and_run_archive_tape(
     ExitCode::from(1)
 }
 
-fn ensure_probe_matches(format: ArchiveFormat, probe: &ProbeResult) -> Result<(), String> {
+fn ensure_probe_matches(format: &ArchiveFormat, probe: &ProbeResult) -> Result<(), String> {
     match probe.confidence {
         ProbeConfidence::NoMatch => Err(format!(
-            "{} probe returned no match at this tape position",
+            "{} probe returned no match at this source position",
             format.cli_name()
         )),
         ProbeConfidence::Possible | ProbeConfidence::Probable | ProbeConfidence::Certain => Ok(()),
@@ -15525,9 +15540,9 @@ mod tests {
             "archive",
             "restore",
             "--format",
-            "bru",
+            "legacy-example",
             "--dump",
-            "/tmp/archive.bru",
+            "/tmp/archive.bin",
             "--dest",
             "/tmp/restored",
             "--xattr-namespace",
@@ -15550,7 +15565,7 @@ mod tests {
             "archive",
             "restore",
             "--format",
-            "bru",
+            "legacy-example",
             "--tape",
             "LIB01",
             "--bay",
@@ -17132,7 +17147,7 @@ mod tests {
             "archive",
             "probe",
             "--format",
-            "bru",
+            "legacy-example",
             "--tape",
             "LIB_TAPE_01",
             "--bay",
@@ -17163,7 +17178,7 @@ mod tests {
             "dev",
             "write-dump-to-tape",
             "--dump",
-            "/tmp/fixture.bru",
+            "/tmp/fixture.bin",
             "--tape",
             "LIB_DEV_01",
             "--bay",
@@ -17225,7 +17240,7 @@ mod tests {
             "dev",
             "write-dump-to-tape",
             "--dump",
-            "/tmp/fixture.bru",
+            "/tmp/fixture.bin",
             "--tape",
             "LIB_DEV_01",
             "--bay",
@@ -17967,66 +17982,173 @@ tape_catalog_dir = "{0}/cache/tapes"
         );
     }
 
-    #[cfg(feature = "foreign-bru")]
     #[test]
-    fn archive_probe_dump_bypasses_discovery() {
+    fn archive_probe_dump_reports_unregistered_format_in_core_distribution() {
         let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-bru-probe")
+            .prefix("remanence-cli-adapter-unavailable")
             .tempdir()
             .unwrap();
-        let dump = temp.path().join("fixture.bru");
-        fs::write(&dump, archive_block()).unwrap();
-        let cli = Cli::parse_from([
-            "rem",
-            "archive",
-            "probe",
-            "--format",
-            "bru",
-            "--dump",
-            dump.to_str().unwrap(),
-        ]);
-        let mut out = Vec::<u8>::new();
-        let mut err = Vec::<u8>::new();
-
-        let code = run(
-            cli,
-            move || -> Result<DiscoveryReport, DiscoveryError> {
-                panic!("discover_fn must not be called for archive dump probe")
-            },
-            &mut out,
-            &mut err,
-        );
-
-        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
-        let stdout = String::from_utf8(out).unwrap();
-        assert!(stdout.contains("format: remanence-bru"));
-        assert!(stdout.contains("confidence: certain"));
-        assert!(stdout.contains("source: byte-stream-dump"));
-        assert!(err.is_empty());
-    }
-
-    #[cfg(not(feature = "foreign-bru"))]
-    #[test]
-    fn archive_probe_dump_reports_unavailable_without_bru_plugin() {
-        let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-bru-unavailable")
-            .tempdir()
-            .unwrap();
-        let dump = temp.path().join("fixture.bru");
-        fs::write(&dump, archive_block()).unwrap();
+        let dump = temp.path().join("fixture.archive");
+        fs::write(&dump, b"fixture").unwrap();
         let (code, stdout, stderr) = invoke_without_discovery(&[
             "rem",
             "archive",
             "probe",
             "--format",
-            "bru",
+            "legacy-example",
             "--dump",
             dump.to_str().unwrap(),
         ]);
 
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
         assert!(stdout.is_empty());
-        assert!(stderr.contains("format bru (remanence-bru) is not available in this build"));
+        assert!(
+            stderr.contains("foreign format legacy-example is not registered in this distribution")
+        );
+    }
+
+    struct StatefulDumpAdapter;
+
+    impl remanence_format::FormatDescriptor for StatefulDumpAdapter {
+        fn id(&self) -> &'static str {
+            "stateful-test"
+        }
+
+        fn version(&self) -> &'static str {
+            "test"
+        }
+
+        fn source_requirement(&self) -> SourceRequirement {
+            SourceRequirement::ByteStreamDump
+        }
+
+        fn capabilities(&self) -> remanence_format::FormatCapabilities {
+            remanence_format::FormatCapabilities {
+                catalog_scan: true,
+                ..remanence_format::FormatCapabilities::default()
+            }
+        }
+    }
+
+    impl ForeignFormatAdapter for StatefulDumpAdapter {
+        fn aliases(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn supported_sources(&self) -> &'static [SourceRequirement] {
+            &[SourceRequirement::ByteStreamDump]
+        }
+
+        fn probe_dump(
+            &self,
+            source: &mut dyn remanence_format_driver::ReadSeek,
+        ) -> Result<ProbeResult, FormatError> {
+            let start = source
+                .stream_position()
+                .map_err(|error| FormatError::source_io("recording probe position", error))?;
+            let mut marker = [0u8; 1];
+            source
+                .read_exact(&mut marker)
+                .map_err(|error| FormatError::source_io("reading probe marker", error))?;
+            source
+                .seek(SeekFrom::Start(start))
+                .map_err(|error| FormatError::source_io("restoring probe position", error))?;
+            Ok(ProbeResult {
+                format_id: "stateful-test".to_string(),
+                confidence: if marker == [b'f'] {
+                    ProbeConfidence::Certain
+                } else {
+                    ProbeConfidence::NoMatch
+                },
+                source_requirement: SourceRequirement::ByteStreamDump,
+                adapter_state: b"probe-state".to_vec(),
+            })
+        }
+
+        fn open_dump_reader<'a>(
+            &self,
+            mut source: Box<dyn remanence_format_driver::ReadSeek + 'a>,
+            adapter_state: &[u8],
+        ) -> Result<Box<dyn ArchiveReader + 'a>, FormatError> {
+            if adapter_state != b"probe-state" {
+                return Err(FormatError::invalid("probe state was not forwarded"));
+            }
+            let position = source
+                .stream_position()
+                .map_err(|error| FormatError::source_io("checking open position", error))?;
+            if position != 0 {
+                return Err(FormatError::invalid("probe did not restore dump position"));
+            }
+            Ok(Box::new(EmptyArchiveReader))
+        }
+    }
+
+    struct EmptyArchiveReader;
+
+    impl ArchiveReader for EmptyArchiveReader {
+        fn scan(
+            &mut self,
+            _sink: &mut dyn remanence_format::EntryCatalogSink,
+        ) -> Result<remanence_format::ScanReport, FormatError> {
+            Ok(remanence_format::ScanReport::default())
+        }
+
+        fn stream_all(
+            &mut self,
+            _sink: &mut dyn remanence_format::ArchiveEventSink,
+        ) -> Result<remanence_format::StreamReport, FormatError> {
+            Ok(remanence_format::StreamReport::default())
+        }
+
+        fn stream_file(
+            &mut self,
+            _file_id: &remanence_format::FileId,
+            _sink: &mut dyn remanence_format::FileDataSink,
+        ) -> Result<remanence_format::FileStreamReport, FormatError> {
+            Err(FormatError::unsupported("not used by this test"))
+        }
+    }
+
+    #[test]
+    fn archive_dump_open_forwards_probe_state_and_restored_source() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-adapter-state")
+            .tempdir()
+            .unwrap();
+        let dump = temp.path().join("fixture.archive");
+        fs::write(&dump, b"fixture").unwrap();
+        let mut registry = ForeignFormatRegistry::new();
+        registry.register(Arc::new(StatefulDumpAdapter)).unwrap();
+        let reader = BufReader::new(File::open(&dump).unwrap());
+
+        open_dump_archive(
+            &registry,
+            &ArchiveFormat("stateful-test".to_string()),
+            reader,
+        )
+        .expect("stateful adapter opens after probe state is forwarded");
+    }
+
+    #[test]
+    fn archive_dump_open_rejects_probe_no_match() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-adapter-no-match")
+            .tempdir()
+            .unwrap();
+        let dump = temp.path().join("fixture.archive");
+        fs::write(&dump, b"wrong-format").unwrap();
+        let mut registry = ForeignFormatRegistry::new();
+        registry.register(Arc::new(StatefulDumpAdapter)).unwrap();
+        let reader = BufReader::new(File::open(&dump).unwrap());
+
+        let error = open_dump_archive(
+            &registry,
+            &ArchiveFormat("stateful-test".to_string()),
+            reader,
+        )
+        .err()
+        .expect("a no-match probe must reject scan, restore, and recovery opens");
+        assert!(error.to_string().contains("probe returned no match"));
     }
 
     #[test]
@@ -20420,6 +20542,7 @@ blob Project/Render Files/
             &mut stdin_prefix,
             &mut out,
             &mut err,
+            &ForeignFormatRegistry::default(),
         );
 
         assert_eq!(code, ExitCode::SUCCESS);
@@ -20444,147 +20567,6 @@ blob Project/Render Files/
             report["stored_range_start"].as_u64().unwrap()
                 + report["stored_range_len"].as_u64().unwrap()
         );
-    }
-
-    #[cfg(feature = "foreign-bru")]
-    #[test]
-    fn archive_scan_dump_prints_catalog_entries() {
-        let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-bru-scan")
-            .tempdir()
-            .unwrap();
-        let dump = temp.path().join("fixture.bru");
-        let bytes = [
-            archive_block().as_slice(),
-            file_header_block("camera/a.txt", 3, b"abc").as_slice(),
-        ]
-        .concat();
-        fs::write(&dump, bytes).unwrap();
-        let cli = Cli::parse_from([
-            "rem",
-            "archive",
-            "scan",
-            "--format",
-            "bru",
-            "--dump",
-            dump.to_str().unwrap(),
-        ]);
-        let mut out = Vec::<u8>::new();
-        let mut err = Vec::<u8>::new();
-
-        let code = run(
-            cli,
-            move || -> Result<DiscoveryReport, DiscoveryError> {
-                panic!("discover_fn must not be called for archive dump scan")
-            },
-            &mut out,
-            &mut err,
-        );
-
-        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
-        let stdout = String::from_utf8(out).unwrap();
-        assert!(stdout.contains("entries: 1"));
-        assert!(stdout.contains("damage-events: 0"));
-        assert!(stdout.contains("bru:1\tregular\t3\tcamera/a.txt"));
-        assert!(err.is_empty());
-    }
-
-    #[cfg(feature = "foreign-bru")]
-    #[test]
-    fn archive_restore_dump_writes_filesystem_output() {
-        let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-bru-restore")
-            .tempdir()
-            .unwrap();
-        let dump = temp.path().join("fixture.bru");
-        let restore = temp.path().join("restore");
-        let bytes = [
-            archive_block().as_slice(),
-            file_header_block("camera/a.txt", 3, b"abc").as_slice(),
-        ]
-        .concat();
-        fs::write(&dump, bytes).unwrap();
-        let cli = Cli::parse_from([
-            "rem",
-            "archive",
-            "restore",
-            "--format",
-            "bru",
-            "--dump",
-            dump.to_str().unwrap(),
-            "--dest",
-            restore.to_str().unwrap(),
-        ]);
-        let mut out = Vec::<u8>::new();
-        let mut err = Vec::<u8>::new();
-
-        let code = run(
-            cli,
-            move || -> Result<DiscoveryReport, DiscoveryError> {
-                panic!("discover_fn must not be called for archive dump restore")
-            },
-            &mut out,
-            &mut err,
-        );
-
-        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
-        assert_eq!(fs::read(restore.join("camera/a.txt")).unwrap(), b"abc");
-        let stdout = String::from_utf8(out).unwrap();
-        assert!(stdout.contains("files-written: 1"));
-        assert!(stdout.contains("bytes-written: 3"));
-        assert!(err.is_empty());
-    }
-
-    #[cfg(feature = "foreign-bru")]
-    #[test]
-    fn archive_recover_dump_writes_sparse_output_and_manifest() {
-        let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-bru-recover")
-            .tempdir()
-            .unwrap();
-        let dump = temp.path().join("fixture.bru");
-        let restore = temp.path().join("recover");
-        let bytes = [
-            archive_block().as_slice(),
-            file_header_block("camera/a.txt", 3, b"abc").as_slice(),
-        ]
-        .concat();
-        fs::write(&dump, bytes).unwrap();
-        let cli = Cli::parse_from([
-            "rem",
-            "archive",
-            "recover",
-            "--format",
-            "bru",
-            "--dump",
-            dump.to_str().unwrap(),
-            "--dest",
-            restore.to_str().unwrap(),
-        ]);
-        let mut out = Vec::<u8>::new();
-        let mut err = Vec::<u8>::new();
-
-        let code = run(
-            cli,
-            move || -> Result<DiscoveryReport, DiscoveryError> {
-                panic!("discover_fn must not be called for archive dump recover")
-            },
-            &mut out,
-            &mut err,
-        );
-
-        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
-        assert_eq!(fs::read(restore.join("camera/a.txt")).unwrap(), b"abc");
-        let manifest = restore.join(".remanence/recovery.jsonl");
-        assert!(manifest.exists());
-        let manifest_text = fs::read_to_string(manifest).unwrap();
-        assert!(manifest_text.contains("\"kind\":\"file\""));
-        assert!(manifest_text.contains("\"status\":\"complete\""));
-        let stdout = String::from_utf8(out).unwrap();
-        assert!(stdout.contains("files-seen: 1"));
-        assert!(stdout.contains("statuses: complete=1 partial=0 missing=0 skipped=0"));
-        assert!(stdout.contains("recovery\tbru:1\tcomplete\t3"));
-        assert!(err.is_empty());
     }
 
     #[test]
@@ -21186,89 +21168,5 @@ blob Project/Render Files/
         assert!(err.contains("no library with serial \"MISSING\""));
         assert!(err.contains("warnings (1):"));
         assert!(err.contains("FREE"));
-    }
-
-    const BRU_BLOCK_SIZE: usize = 2048;
-    const CHKSUM_OFFSET: usize = 0x080;
-    const CHKSUM_SIZE: usize = 8;
-    const CHKSUM_PLACEHOLDER: &[u8; CHKSUM_SIZE] = b"       0";
-    const MAGIC_OFFSET: usize = 0x0B0;
-    const MAGIC_SIZE: usize = 4;
-    const MAGIC_ARCHIVE_HEADER: u64 = 0x1234;
-    #[cfg(feature = "foreign-bru")]
-    const MAGIC_FILE_HEADER: u64 = 0x2345;
-    const ARTIME_OFFSET: usize = 0x098;
-    const BUFSIZE_OFFSET: usize = 0x0A0;
-    const RELEASE_MINOR_OFFSET: usize = 0x0B8;
-    const RELEASE_MAJOR_OFFSET: usize = 0x0BC;
-    const VARIANT_OFFSET: usize = 0x0C0;
-    const ARCHIVE_ID_LOW_OFFSET: usize = 0x0D8;
-    const LABEL_OFFSET: usize = 0x1D0;
-    #[cfg(feature = "foreign-bru")]
-    const FILE_PATH_OFFSET: usize = 0x000;
-    #[cfg(feature = "foreign-bru")]
-    const INLINE_DATA_LEN_OFFSET: usize = 0x0DC;
-    #[cfg(feature = "foreign-bru")]
-    const INLINE_DATA_OFFSET: usize = 0x400;
-    #[cfg(feature = "foreign-bru")]
-    const ST_MODE_OFFSET: usize = 0x180;
-    #[cfg(feature = "foreign-bru")]
-    const ST_SIZE_OFFSET: usize = 0x1B8;
-    #[cfg(feature = "foreign-bru")]
-    const S_IFREG: u64 = 0x8000;
-
-    fn put_ascii(block: &mut [u8; BRU_BLOCK_SIZE], offset: usize, text: &str) {
-        block[offset..offset + text.len()].copy_from_slice(text.as_bytes());
-    }
-
-    fn put_hex(block: &mut [u8; BRU_BLOCK_SIZE], offset: usize, size: usize, value: u64) {
-        put_ascii(block, offset, &format!("{value:0size$x}"));
-    }
-
-    fn bru_checksum(block: &[u8; BRU_BLOCK_SIZE]) -> u32 {
-        let mut sums = [0u32; 4];
-        for (index, byte) in block.iter().enumerate() {
-            let value = if (CHKSUM_OFFSET..CHKSUM_OFFSET + CHKSUM_SIZE).contains(&index) {
-                CHKSUM_PLACEHOLDER[index - CHKSUM_OFFSET]
-            } else {
-                *byte
-            };
-            sums[index % 4] = sums[index % 4].wrapping_add(value as u32);
-        }
-        ((sums[0] & 0xff) << 24)
-            | ((sums[1] & 0xff) << 16)
-            | ((sums[2] & 0xff) << 8)
-            | (sums[3] & 0xff)
-    }
-
-    fn finalize_block(mut block: [u8; BRU_BLOCK_SIZE]) -> [u8; BRU_BLOCK_SIZE] {
-        let checksum = bru_checksum(&block);
-        put_ascii(&mut block, CHKSUM_OFFSET, &format!("{checksum:08x}"));
-        block
-    }
-
-    fn archive_block() -> [u8; BRU_BLOCK_SIZE] {
-        let mut block = [0; BRU_BLOCK_SIZE];
-        put_hex(&mut block, MAGIC_OFFSET, MAGIC_SIZE, MAGIC_ARCHIVE_HEADER);
-        put_hex(&mut block, ARTIME_OFFSET, 8, 0x4DE47D26);
-        put_hex(&mut block, BUFSIZE_OFFSET, 8, 1024 * 1024);
-        put_hex(&mut block, RELEASE_MINOR_OFFSET, 4, 17);
-        put_hex(&mut block, RELEASE_MAJOR_OFFSET, 4, 1);
-        put_hex(&mut block, VARIANT_OFFSET, 4, 0);
-        put_hex(&mut block, ARCHIVE_ID_LOW_OFFSET, 4, 0x61A8);
-        put_ascii(&mut block, LABEL_OFFSET, "TEST");
-        finalize_block(block)
-    }
-
-    #[cfg(feature = "foreign-bru")]
-    fn file_header_block(path: &str, size: u64, inline: &[u8]) -> [u8; BRU_BLOCK_SIZE] {
-        let mut block = [0; BRU_BLOCK_SIZE];
-        put_ascii(&mut block, FILE_PATH_OFFSET, path);
-        put_hex(&mut block, MAGIC_OFFSET, MAGIC_SIZE, MAGIC_FILE_HEADER);
-        put_hex(&mut block, INLINE_DATA_LEN_OFFSET, 4, inline.len() as u64);
-        put_hex(&mut block, ST_MODE_OFFSET, 8, S_IFREG | 0o644);
-        put_hex(&mut block, ST_SIZE_OFFSET, 8, size);
-        block[INLINE_DATA_OFFSET..INLINE_DATA_OFFSET + inline.len()].copy_from_slice(inline);
-        finalize_block(block)
     }
 }

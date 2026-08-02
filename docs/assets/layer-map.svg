@@ -54,5 +54,5 @@
   <text class="rtd" x="420" y="342" text-anchor="middle">CDB construction · SG_IO transport · response parsing</text>
   <text class="rtd" x="20" y="372">amber: the crates that define the bytes on tape. format and parity are siblings — neither depends on the other;</text>
   <text class="rtd" x="20" y="388">both write tape through layer 2's BlockSink / BlockSource traits, composed above by remanence-stream and the daemon.</text>
-  <text class="rtd" x="20" y="404">also at layer 3: remanence-stream (restore composition), remanence-bru (feature-gated legacy reader), remanence-crc (CRC-64/XZ).</text>
+  <text class="rtd" x="20" y="404">also at layer 3: remanence-stream (restore composition), remanence-format-driver (adapter registry), remanence-crc (CRC-64/XZ).</text>
 </svg>

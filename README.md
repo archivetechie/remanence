@@ -103,7 +103,11 @@ and `rem-debug` are two binaries built from the same crate (operator vs.
 break-glass direct-hardware CLI); `rem-recover` is its own crate with no
 dependency on the daemon, catalog, or config file. Optional features:
 `remanence-cli/linux-udev` (hot-plug `rem watch`; needs `pkg-config` +
-`libudev-dev`) and `remanence-cli/foreign-bru` (legacy BRU commands).
+`libudev-dev`). Foreign-format readers are deliberately not included in
+the core workspace or binaries; separately versioned distributions can link
+adapters through the published registry contract. The auxiliary
+[`remanence-adaptors`](https://github.com/archivetechie/remanence-adaptors)
+repository is one such distribution, not part of the Remanence core release.
 
 Tests and lints, as CI runs them:
 
@@ -142,6 +146,8 @@ tape write, is [docs/guide-quickstart.md](docs/guide-quickstart.md).
   `rem-daemon` surfaces.
 - [Configuration reference](docs/reference-configuration.md) — every
   config key, default, and environment variable.
+- [Foreign-format adapter reference](docs/reference-foreign-format-adapters.md)
+  — the read-only registry boundary and distribution model.
 - [Tape layout reference](docs/reference-tape-layout.md) — what is
   physically on a cartridge.
 - [Troubleshooting](docs/guide-troubleshooting.md) — failure modes,
@@ -166,13 +172,11 @@ tape write, is [docs/guide-quickstart.md](docs/guide-quickstart.md).
 <!-- code-anchor: crates/remanence-library/tests/platform_dependency_guard.rs @ 7fb10f8 -->
 ## Migrating foreign tapes
 
-`crates/remanence-bru` reads tapes written by the legacy BRU backup tool.
-It is auxiliary migration tooling for the narrow audience holding
-BRU-written cartridges, and it is **never part of the default build or
-the core binaries** — nothing links it unless you opt in with
-`cargo build --features remanence-cli/foreign-bru`. Further foreign-format
-readers will follow the same rule: the archival core stays lean, and
-migration tooling is something you ask for.
+Core Remanence publishes a read-only adapter registry but includes no concrete
+foreign-format parser. A separate distribution can link the formats needed for
+a particular migration while retaining the same normalized scan, restore,
+recovery, and catalog surfaces. See the
+[foreign-format adapter reference](docs/reference-foreign-format-adapters.md).
 
 ## Platform crate contract
 
@@ -195,9 +199,8 @@ crates/remanence-scsi           Layer 1 SCSI CDB/SG_IO primitives
 crates/remanence-library        Layer 2 library model/ops and Layer 3a tape I/O
 crates/remanence-crc            Shared CRC-64/XZ
 crates/remanence-aead           REM-ENCRYPT 1.0 encrypted-representation primitives (fixed REMO family magic; X-Wing HPKE wrapped-DEK)
-crates/remanence-format-driver  Published format-driver traits
+crates/remanence-format-driver  Published format-driver traits and foreign-adapter registry
 crates/remanence-format         Native rem-object-v1 body format
-crates/remanence-bru            Foreign-tape migration: legacy BRU reader (opt-in feature, never in default build)
 crates/remanence-parity         Layer 3c sidecar parity and recovery
 crates/remanence-stream         Restore/recovery streaming composition
 crates/remanence-state          Layer 4 catalog, audit, config, lock

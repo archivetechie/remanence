@@ -16,14 +16,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use ciborium::value::Value as CborValue;
-#[cfg(feature = "foreign-bru")]
-use remanence_bru::BruFormat;
-#[cfg(feature = "foreign-bru")]
-use remanence_format::error::FormatError;
-#[cfg(feature = "foreign-bru")]
-use remanence_format::{
-    ArchiveGapCause, ArchiveGapRange, ArchiveReader, DamageRange, DamageStatus, EntryCatalogSink,
-    EntryKind, NormalizedEntry,
+use remanence_format_driver::{
+    ArchiveGapCause, ArchiveGapRange, DamageRange, DamageStatus, EntryCatalogSink, EntryKind,
+    ForeignFormatRegistry, FormatError, NormalizedEntry, ScanIntegrityBasis, SourceRequirement,
 };
 use remanence_state::{
     AlarmRecord, AuditActor, AuditEvent, AuditEventRecord, AuditRecord, AuditSubject, CatalogIndex,
@@ -454,6 +449,7 @@ pub struct ApiState {
     daemon_version: String,
     api_version: String,
     rust_target: String,
+    foreign_formats: ForeignFormatRegistry,
 }
 
 impl ApiState {
@@ -562,7 +558,14 @@ impl ApiState {
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             api_version: "v1-draft".to_string(),
             rust_target: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
+            foreign_formats: ForeignFormatRegistry::default(),
         }
+    }
+
+    /// Attach the read-only foreign formats linked by this distribution.
+    pub fn with_foreign_formats(mut self, registry: ForeignFormatRegistry) -> Self {
+        self.foreign_formats = registry;
+        self
     }
 
     /// Build service state with a live changer/drive actor pool.
@@ -2553,7 +2556,8 @@ impl pb::catalog_server::Catalog for CatalogService {
             .get_catalog_unit(unit_id.as_str())
             .map_err(|err| Status::internal(err.to_string()))?
             .ok_or_else(|| Status::not_found("catalog unit not found"))?;
-        blocking_status(move || list_entries_for_unit(unit)).await
+        let foreign_formats = self.state.foreign_formats.clone();
+        blocking_status(move || list_entries_for_unit(unit, &foreign_formats)).await
     }
 }
 
@@ -5221,55 +5225,56 @@ fn catalog_unit_to_proto(record: CatalogUnitRecord) -> Result<pb::CatalogUnit, S
 
 fn list_entries_for_unit(
     unit: CatalogUnitRecord,
+    foreign_formats: &ForeignFormatRegistry,
 ) -> Result<Response<pb::ListEntriesInUnitResponse>, Status> {
     if unit.origin_kind != "foreign_archive" {
         return Err(Status::unimplemented(
             "native unit entry listing is not wired in this slice",
         ));
     }
-    if unit.format_id != "remanence-bru" {
+    let adapter = foreign_formats
+        .get(unit.format_id.as_str())
+        .ok_or_else(|| {
+            Status::unimplemented(format!(
+                "foreign format {} is not registered in this distribution",
+                unit.format_id
+            ))
+        })?;
+    let source_kind = unit
+        .source_kind
+        .as_deref()
+        .ok_or_else(|| Status::internal("foreign catalog unit missing source_kind"))?;
+    if source_kind != "byte_stream_dump"
+        || !adapter
+            .supported_sources()
+            .contains(&SourceRequirement::ByteStreamDump)
+    {
         return Err(Status::unimplemented(format!(
-            "catalog entry listing for {} is not wired in this slice",
-            unit.format_id
+            "foreign source kind {source_kind} is not supported by {}",
+            adapter.id()
         )));
     }
-    #[cfg(feature = "foreign-bru")]
-    {
-        let source_kind = unit
-            .source_kind
-            .as_deref()
-            .ok_or_else(|| Status::internal("foreign catalog unit missing source_kind"))?;
-        if source_kind != "byte_stream_dump" {
-            return Err(Status::unimplemented(format!(
-                "foreign source kind {source_kind} is not wired in this slice"
-            )));
-        }
-        let source_id = unit
-            .source_id
-            .as_deref()
-            .ok_or_else(|| Status::internal("foreign catalog unit missing source_id"))?;
-        let file = std::fs::File::open(source_id)
-            .map_err(|err| Status::internal(format!("open foreign dump source: {err}")))?;
-        let mut reader = BruFormat.open_dump_reader(file);
-        let mut collector = CatalogEntryCollector::new(encode_text_id(unit.unit_id.as_str()));
-        reader
-            .scan(&mut collector)
-            .map_err(|err| Status::internal(format!("scan foreign archive: {err}")))?;
-        Ok(Response::new(pb::ListEntriesInUnitResponse {
-            entries: collector.entries,
-            next_page_token: None,
-            archive_gaps: collector.archive_gaps,
-        }))
-    }
-    #[cfg(not(feature = "foreign-bru"))]
-    {
-        Err(Status::unimplemented(
-            "format remanence-bru is not available in this build",
-        ))
-    }
+    let source_id = unit
+        .source_id
+        .as_deref()
+        .ok_or_else(|| Status::internal("foreign catalog unit missing source_id"))?;
+    let file = std::fs::File::open(source_id)
+        .map_err(|err| Status::internal(format!("open foreign dump source: {err}")))?;
+    let mut reader = adapter
+        .open_dump_reader(Box::new(file), &unit.adapter_state)
+        .map_err(|err| Status::internal(format!("open foreign archive: {err}")))?;
+    let mut collector = CatalogEntryCollector::new(encode_text_id(unit.unit_id.as_str()));
+    let scan = reader
+        .scan(&mut collector)
+        .map_err(|err| Status::internal(format!("scan foreign archive: {err}")))?;
+    collector.set_integrity_basis(catalog_integrity_basis(scan.integrity_basis));
+    Ok(Response::new(pb::ListEntriesInUnitResponse {
+        entries: collector.entries,
+        next_page_token: None,
+        archive_gaps: collector.archive_gaps,
+    }))
 }
 
-#[cfg(feature = "foreign-bru")]
 struct CatalogEntryCollector {
     unit_id: Vec<u8>,
     entries: Vec<pb::CatalogEntry>,
@@ -5278,7 +5283,6 @@ struct CatalogEntryCollector {
     pending_states: std::collections::HashMap<String, pb::CatalogEntryState>,
 }
 
-#[cfg(feature = "foreign-bru")]
 impl CatalogEntryCollector {
     fn new(unit_id: Vec<u8>) -> Self {
         Self {
@@ -5297,9 +5301,14 @@ impl CatalogEntryCollector {
             self.pending_states.insert(file_id.to_string(), state);
         }
     }
+
+    fn set_integrity_basis(&mut self, basis: pb::IntegrityBasis) {
+        for entry in &mut self.entries {
+            entry.integrity_basis = basis as i32;
+        }
+    }
 }
 
-#[cfg(feature = "foreign-bru")]
 impl EntryCatalogSink for CatalogEntryCollector {
     fn entry(&mut self, entry: &NormalizedEntry) -> Result<(), FormatError> {
         let file_id = entry.file_id.as_str().to_string();
@@ -5312,6 +5321,7 @@ impl EntryCatalogSink for CatalogEntryCollector {
             self.unit_id.clone(),
             entry,
             state,
+            pb::IntegrityBasis::Unknown,
         ));
         Ok(())
     }
@@ -5331,11 +5341,20 @@ impl EntryCatalogSink for CatalogEntryCollector {
     }
 }
 
-#[cfg(feature = "foreign-bru")]
+fn catalog_integrity_basis(basis: ScanIntegrityBasis) -> pb::IntegrityBasis {
+    match basis {
+        ScanIntegrityBasis::Unknown => pb::IntegrityBasis::Unknown,
+        ScanIntegrityBasis::ContentHash => pb::IntegrityBasis::ContentHash,
+        ScanIntegrityBasis::FormatChecksum => pb::IntegrityBasis::FormatChecksum,
+        ScanIntegrityBasis::ParityConsistency => pb::IntegrityBasis::ParityConsistency,
+    }
+}
+
 fn normalized_entry_to_proto(
     unit_id: Vec<u8>,
     entry: &NormalizedEntry,
     state: pb::CatalogEntryState,
+    integrity_basis: pb::IntegrityBasis,
 ) -> pb::CatalogEntry {
     pb::CatalogEntry {
         unit_id,
@@ -5345,11 +5364,10 @@ fn normalized_entry_to_proto(
         size_bytes: entry.size_bytes,
         mtime: None,
         state: state as i32,
-        integrity_basis: pb::IntegrityBasis::FormatChecksum as i32,
+        integrity_basis: integrity_basis as i32,
     }
 }
 
-#[cfg(feature = "foreign-bru")]
 fn catalog_entry_kind(kind: EntryKind) -> pb::CatalogEntryKind {
     match kind {
         EntryKind::RegularFile => pb::CatalogEntryKind::RegularFile,
@@ -5360,7 +5378,6 @@ fn catalog_entry_kind(kind: EntryKind) -> pb::CatalogEntryKind {
     }
 }
 
-#[cfg(feature = "foreign-bru")]
 fn catalog_entry_state_for_damage(status: DamageStatus) -> pb::CatalogEntryState {
     match status {
         DamageStatus::ChecksumFailed | DamageStatus::ReadError => pb::CatalogEntryState::Damaged,
@@ -5369,7 +5386,6 @@ fn catalog_entry_state_for_damage(status: DamageStatus) -> pb::CatalogEntryState
     }
 }
 
-#[cfg(feature = "foreign-bru")]
 fn archive_gap_to_proto(unit_id: Vec<u8>, range: &ArchiveGapRange) -> pb::ArchiveGap {
     pb::ArchiveGap {
         unit_id,
@@ -5379,7 +5395,6 @@ fn archive_gap_to_proto(unit_id: Vec<u8>, range: &ArchiveGapRange) -> pb::Archiv
     }
 }
 
-#[cfg(feature = "foreign-bru")]
 fn archive_gap_cause(cause: ArchiveGapCause) -> pb::ArchiveGapCause {
     match cause {
         ArchiveGapCause::UnrecognizedData => pb::ArchiveGapCause::UnrecognizedData,
@@ -5483,12 +5498,14 @@ mod tests {
 
     use ciborium::value::Value as CborValue;
     use remanence_aead::{RecipientPrivateKey, RecipientPublicKey};
-    #[cfg(feature = "foreign-bru")]
-    use remanence_bru::{bru_checksum, BRU_BLOCK_SIZE};
     use remanence_chaos::model::{
         DeviceRole, ModelTransport, Record as VirtualRecord, VirtualTape, VirtualWorld,
     };
     use remanence_format::{read_encrypted_rem_object, read_rem_tar_object};
+    use remanence_format_driver::{
+        ArchiveEventSink, ArchiveReader, FileDataSink, FileId, FileStreamReport,
+        ForeignFormatAdapter, FormatCapabilities, FormatDescriptor, ScanReport, StreamReport,
+    };
     use remanence_library::scsi::{DeviceType, Inquiry};
     use remanence_library::{
         BlockSink, DiscoveryReport, DriveBay, ElementLayout, IdentitySource, IePort,
@@ -5830,43 +5847,6 @@ mod tests {
         );
         assert_eq!(transport.transport_class.as_deref(), Some("unknown"));
     }
-
-    #[cfg(feature = "foreign-bru")]
-    const CHKSUM_OFFSET: usize = 0x080;
-    #[cfg(feature = "foreign-bru")]
-    const MAGIC_OFFSET: usize = 0x0B0;
-    #[cfg(feature = "foreign-bru")]
-    const MAGIC_SIZE: usize = 4;
-    #[cfg(feature = "foreign-bru")]
-    const MAGIC_ARCHIVE_HEADER: u64 = 0x1234;
-    #[cfg(feature = "foreign-bru")]
-    const MAGIC_FILE_HEADER: u64 = 0x2345;
-    #[cfg(feature = "foreign-bru")]
-    const ARTIME_OFFSET: usize = 0x098;
-    #[cfg(feature = "foreign-bru")]
-    const BUFSIZE_OFFSET: usize = 0x0A0;
-    #[cfg(feature = "foreign-bru")]
-    const RELEASE_MINOR_OFFSET: usize = 0x0B8;
-    #[cfg(feature = "foreign-bru")]
-    const RELEASE_MAJOR_OFFSET: usize = 0x0BC;
-    #[cfg(feature = "foreign-bru")]
-    const VARIANT_OFFSET: usize = 0x0C0;
-    #[cfg(feature = "foreign-bru")]
-    const ARCHIVE_ID_LOW_OFFSET: usize = 0x0D8;
-    #[cfg(feature = "foreign-bru")]
-    const LABEL_OFFSET: usize = 0x1D0;
-    #[cfg(feature = "foreign-bru")]
-    const FILE_PATH_OFFSET: usize = 0x000;
-    #[cfg(feature = "foreign-bru")]
-    const INLINE_DATA_LEN_OFFSET: usize = 0x0DC;
-    #[cfg(feature = "foreign-bru")]
-    const INLINE_DATA_OFFSET: usize = 0x400;
-    #[cfg(feature = "foreign-bru")]
-    const ST_MODE_OFFSET: usize = 0x180;
-    #[cfg(feature = "foreign-bru")]
-    const ST_SIZE_OFFSET: usize = 0x1B8;
-    #[cfg(feature = "foreign-bru")]
-    const S_IFREG: u64 = 0x8000;
 
     struct WarningCaptureSubscriber {
         messages: Arc<Mutex<Vec<String>>>,
@@ -7880,97 +7860,120 @@ BCw3Wyv2UWY=
         ApiState::new(index)
     }
 
-    #[cfg(feature = "foreign-bru")]
-    fn foreign_bru_state() -> (ApiState, String, String) {
-        foreign_bru_state_with_gap(false)
+    #[derive(Debug)]
+    struct TestForeignAdapter;
+
+    impl FormatDescriptor for TestForeignAdapter {
+        fn id(&self) -> &'static str {
+            "test-foreign-v1"
+        }
+
+        fn version(&self) -> &'static str {
+            "test"
+        }
+
+        fn source_requirement(&self) -> SourceRequirement {
+            SourceRequirement::ByteStreamDump
+        }
+
+        fn capabilities(&self) -> FormatCapabilities {
+            FormatCapabilities {
+                catalog_scan: true,
+                ..FormatCapabilities::default()
+            }
+        }
     }
 
-    #[cfg(feature = "foreign-bru")]
-    fn foreign_bru_state_with_gap(include_gap: bool) -> (ApiState, String, String) {
+    impl ForeignFormatAdapter for TestForeignAdapter {
+        fn aliases(&self) -> &'static [&'static str] {
+            &["test-foreign"]
+        }
+
+        fn supported_sources(&self) -> &'static [SourceRequirement] {
+            &[SourceRequirement::ByteStreamDump]
+        }
+
+        fn open_dump_reader<'a>(
+            &self,
+            _source: Box<dyn remanence_format_driver::ReadSeek + 'a>,
+            adapter_state: &[u8],
+        ) -> Result<Box<dyn ArchiveReader + 'a>, FormatError> {
+            if adapter_state != b"test-resume-state" {
+                return Err(FormatError::invalid("missing persisted adapter state"));
+            }
+            Ok(Box::new(TestForeignReader))
+        }
+    }
+
+    struct TestForeignReader;
+
+    impl ArchiveReader for TestForeignReader {
+        fn scan(&mut self, sink: &mut dyn EntryCatalogSink) -> Result<ScanReport, FormatError> {
+            sink.entry(&NormalizedEntry {
+                file_id: FileId::from("test:1"),
+                path: "camera/a.txt".to_string(),
+                kind: EntryKind::RegularFile,
+                link_target: None,
+                size_bytes: Some(3),
+                adapter_state: Vec::new(),
+            })?;
+            sink.archive_gap(&ArchiveGapRange {
+                source_start: 8,
+                source_end: 16,
+                cause: ArchiveGapCause::UnrecognizedData,
+                adapter_state: Vec::new(),
+            })?;
+            Ok(ScanReport {
+                entries: 1,
+                damage_events: 0,
+                archive_gaps: 1,
+                integrity_basis: ScanIntegrityBasis::Unknown,
+            })
+        }
+
+        fn stream_all(
+            &mut self,
+            _sink: &mut dyn ArchiveEventSink,
+        ) -> Result<StreamReport, FormatError> {
+            Err(FormatError::unsupported("test adapter is scan-only"))
+        }
+
+        fn stream_file(
+            &mut self,
+            _file_id: &FileId,
+            _sink: &mut dyn FileDataSink,
+        ) -> Result<FileStreamReport, FormatError> {
+            Err(FormatError::unsupported("test adapter is scan-only"))
+        }
+    }
+
+    fn foreign_test_state() -> (tempfile::TempDir, ApiState, String) {
+        let temp = tempfile::tempdir().expect("create foreign fixture directory");
+        let source = temp.path().join("fixture.bin");
+        std::fs::write(&source, b"test").expect("write foreign fixture");
         let mut index = test_index();
-        let dump_path = write_bru_dump(include_gap);
-        let source_id = dump_path.to_string_lossy().to_string();
         let unit_id = index
             .upsert_foreign_archive_projection(ForeignArchiveProjectionInput {
                 tape_uuid: Vec::new(),
-                format_id: "remanence-bru".to_string(),
-                scan_id: "scan-bru-1".to_string(),
+                format_id: "test-foreign-v1".to_string(),
+                scan_id: "scan-test-1".to_string(),
                 source_kind: "byte_stream_dump".to_string(),
-                source_id: source_id.clone(),
+                source_id: source.to_string_lossy().into_owned(),
                 confidence: "high".to_string(),
                 entry_count: 1,
-                damage_event_count: if include_gap { 1 } else { 0 },
-                adapter_state: vec![0x42],
+                damage_event_count: 1,
+                adapter_state: b"test-resume-state".to_vec(),
                 last_scan_at_utc: Some("2026-05-28T13:15:00Z".to_string()),
                 created_at_utc: Some("2026-05-28T13:15:01Z".to_string()),
             })
-            .expect("project foreign BRU unit");
-        (ApiState::new(index), unit_id, source_id)
-    }
-
-    #[cfg(feature = "foreign-bru")]
-    fn write_bru_dump(include_gap: bool) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("remanence-api-bru-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create BRU fixture dir");
-        let path = dir.join("fixture.bru");
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&archive_block());
-        if include_gap {
-            bytes.extend_from_slice(&unrecognized_block());
-        }
-        bytes.extend_from_slice(&file_header_block("camera/a.txt", 3, b"abc"));
-        std::fs::write(&path, bytes).expect("write BRU fixture");
-        path
-    }
-
-    #[cfg(feature = "foreign-bru")]
-    fn put_ascii(block: &mut [u8; BRU_BLOCK_SIZE], offset: usize, text: &str) {
-        block[offset..offset + text.len()].copy_from_slice(text.as_bytes());
-    }
-
-    #[cfg(feature = "foreign-bru")]
-    fn put_hex(block: &mut [u8; BRU_BLOCK_SIZE], offset: usize, size: usize, value: u64) {
-        put_ascii(block, offset, &format!("{value:0size$x}"));
-    }
-
-    #[cfg(feature = "foreign-bru")]
-    fn finalize_block(mut block: [u8; BRU_BLOCK_SIZE]) -> [u8; BRU_BLOCK_SIZE] {
-        let checksum = bru_checksum(&block);
-        put_ascii(&mut block, CHKSUM_OFFSET, &format!("{checksum:08x}"));
-        block
-    }
-
-    #[cfg(feature = "foreign-bru")]
-    fn archive_block() -> [u8; BRU_BLOCK_SIZE] {
-        let mut block = [0; BRU_BLOCK_SIZE];
-        put_hex(&mut block, MAGIC_OFFSET, MAGIC_SIZE, MAGIC_ARCHIVE_HEADER);
-        put_hex(&mut block, ARTIME_OFFSET, 8, 0x4DE47D26);
-        put_hex(&mut block, BUFSIZE_OFFSET, 8, 1024 * 1024);
-        put_hex(&mut block, RELEASE_MINOR_OFFSET, 4, 17);
-        put_hex(&mut block, RELEASE_MAJOR_OFFSET, 4, 1);
-        put_hex(&mut block, VARIANT_OFFSET, 4, 0);
-        put_hex(&mut block, ARCHIVE_ID_LOW_OFFSET, 4, 0x61A8);
-        put_ascii(&mut block, LABEL_OFFSET, "TEST");
-        finalize_block(block)
-    }
-
-    #[cfg(feature = "foreign-bru")]
-    fn unrecognized_block() -> [u8; BRU_BLOCK_SIZE] {
-        let mut block = [0; BRU_BLOCK_SIZE];
-        put_hex(&mut block, MAGIC_OFFSET, MAGIC_SIZE, 0x9999);
-        finalize_block(block)
-    }
-
-    #[cfg(feature = "foreign-bru")]
-    fn file_header_block(path: &str, size: u64, inline: &[u8]) -> [u8; BRU_BLOCK_SIZE] {
-        let mut block = [0; BRU_BLOCK_SIZE];
-        put_ascii(&mut block, FILE_PATH_OFFSET, path);
-        put_hex(&mut block, MAGIC_OFFSET, MAGIC_SIZE, MAGIC_FILE_HEADER);
-        put_hex(&mut block, INLINE_DATA_LEN_OFFSET, 4, inline.len() as u64);
-        put_hex(&mut block, ST_MODE_OFFSET, 8, S_IFREG | 0o644);
-        put_hex(&mut block, ST_SIZE_OFFSET, 8, size);
-        block[INLINE_DATA_OFFSET..INLINE_DATA_OFFSET + inline.len()].copy_from_slice(inline);
-        finalize_block(block)
+            .expect("project foreign unit");
+        let mut registry = ForeignFormatRegistry::new();
+        registry.register(Arc::new(TestForeignAdapter)).unwrap();
+        (
+            temp,
+            ApiState::new(index).with_foreign_formats(registry),
+            unit_id,
+        )
     }
 
     fn audit_record(
@@ -12310,43 +12313,10 @@ BCw3Wyv2UWY=
         assert_eq!(err.code(), tonic::Code::Unimplemented);
     }
 
-    #[cfg(feature = "foreign-bru")]
     #[tokio::test]
-    async fn foreign_bru_dump_unit_lists_normalized_entries() {
-        let (state, unit_id, source_id) = foreign_bru_state();
+    async fn foreign_unit_uses_registered_adapter_for_normalized_entries() {
+        let (_temp, state, unit_id) = foreign_test_state();
         let service = state.catalog_service();
-        let mut stream = pb::catalog_server::Catalog::enumerate_units(
-            &service,
-            Request::new(pb::EnumerateUnitsRequest {
-                scope: Some(pb::enumerate_units_request::Scope::All(())),
-                origin_filter: pb::CatalogUnitOriginFilter::ForeignArchives as i32,
-                refresh_from_source: false,
-            }),
-        )
-        .await
-        .expect("enumerate foreign units")
-        .into_inner();
-
-        let unit = stream
-            .next()
-            .await
-            .expect("one foreign unit")
-            .expect("foreign unit");
-        assert_eq!(unit.unit_id, unit_id.as_bytes().to_vec());
-        assert_eq!(
-            unit.origin_kind,
-            pb::CatalogUnitOriginKind::ForeignArchive as i32
-        );
-        assert_eq!(unit.format_id, "remanence-bru");
-        let Some(pb::catalog_unit::Origin::Foreign(summary)) = unit.origin else {
-            panic!("foreign summary expected");
-        };
-        assert_eq!(summary.scan_id, b"scan-bru-1".to_vec());
-        assert_eq!(summary.source_kind, "byte_stream_dump");
-        assert_eq!(summary.source_id, source_id);
-        assert_eq!(summary.entry_count, 1);
-        assert_eq!(summary.damage_event_count, 0);
-        assert!(stream.next().await.is_none());
 
         let entries = pb::catalog_server::Catalog::list_entries_in_unit(
             &service,
@@ -12360,6 +12330,7 @@ BCw3Wyv2UWY=
         .await
         .expect("list foreign unit entries")
         .into_inner();
+
         assert_eq!(entries.entries.len(), 1);
         assert_eq!(entries.entries[0].path, "camera/a.txt");
         assert_eq!(
@@ -12368,61 +12339,24 @@ BCw3Wyv2UWY=
         );
         assert_eq!(entries.entries[0].size_bytes, Some(3));
         assert_eq!(
-            entries.entries[0].state,
-            pb::CatalogEntryState::Complete as i32
-        );
-        assert_eq!(
             entries.entries[0].integrity_basis,
-            pb::IntegrityBasis::FormatChecksum as i32
+            pb::IntegrityBasis::Unknown as i32
         );
-        assert!(entries.archive_gaps.is_empty());
-    }
-
-    #[cfg(feature = "foreign-bru")]
-    #[tokio::test]
-    async fn foreign_bru_dump_unit_surfaces_archive_gaps() {
-        let (state, unit_id, _source_id) = foreign_bru_state_with_gap(true);
-        let service = state.catalog_service();
-
-        let entries = pb::catalog_server::Catalog::list_entries_in_unit(
-            &service,
-            Request::new(pb::ListEntriesInUnitRequest {
-                unit_id: unit_id.as_bytes().to_vec(),
-                page_token: None,
-                page_size: 0,
-                refresh_from_source: false,
-            }),
-        )
-        .await
-        .expect("list foreign unit entries")
-        .into_inner();
-
-        assert_eq!(entries.entries.len(), 1);
-        assert_eq!(entries.entries[0].path, "camera/a.txt");
         assert_eq!(entries.archive_gaps.len(), 1);
-        assert_eq!(entries.archive_gaps[0].unit_id, unit_id.as_bytes().to_vec());
-        assert_eq!(entries.archive_gaps[0].source_start, BRU_BLOCK_SIZE as u64);
-        assert_eq!(
-            entries.archive_gaps[0].source_end,
-            (BRU_BLOCK_SIZE * 2) as u64
-        );
-        assert_eq!(
-            entries.archive_gaps[0].cause,
-            pb::ArchiveGapCause::UnrecognizedData as i32
-        );
+        assert_eq!(entries.archive_gaps[0].source_start, 8);
+        assert_eq!(entries.archive_gaps[0].source_end, 16);
     }
 
-    #[cfg(not(feature = "foreign-bru"))]
     #[tokio::test]
-    async fn foreign_bru_dump_unit_reports_unavailable_without_plugin() {
+    async fn foreign_unit_reports_unregistered_format_in_core_distribution() {
         let mut index = test_index();
         let unit_id = index
             .upsert_foreign_archive_projection(ForeignArchiveProjectionInput {
                 tape_uuid: Vec::new(),
-                format_id: "remanence-bru".to_string(),
-                scan_id: "scan-bru-1".to_string(),
+                format_id: "legacy-example-v1".to_string(),
+                scan_id: "scan-example-1".to_string(),
                 source_kind: "byte_stream_dump".to_string(),
-                source_id: "/nonexistent/fixture.bru".to_string(),
+                source_id: "/nonexistent/fixture.archive".to_string(),
                 confidence: "high".to_string(),
                 entry_count: 0,
                 damage_event_count: 0,
@@ -12430,7 +12364,7 @@ BCw3Wyv2UWY=
                 last_scan_at_utc: Some("2026-05-28T13:15:00Z".to_string()),
                 created_at_utc: Some("2026-05-28T13:15:01Z".to_string()),
             })
-            .expect("project foreign BRU unit");
+            .expect("project foreign unit");
         let service = ApiState::new(index).catalog_service();
 
         let error = pb::catalog_server::Catalog::list_entries_in_unit(
@@ -12443,11 +12377,11 @@ BCw3Wyv2UWY=
             }),
         )
         .await
-        .expect_err("BRU plugin is unavailable by default");
+        .expect_err("core distribution has an empty foreign-format registry");
 
         assert_eq!(error.code(), tonic::Code::Unimplemented);
         assert!(error
             .message()
-            .contains("format remanence-bru is not available in this build"));
+            .contains("foreign format legacy-example-v1 is not registered in this distribution"));
     }
 }

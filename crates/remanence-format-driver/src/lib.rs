@@ -6,7 +6,9 @@
 //! object-local block streams, while foreign legacy formats may need physical
 //! tape records before they can expose normalized archive events.
 
-use std::io::Read;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Seek};
+use std::sync::Arc;
 
 use remanence_library::{BlockSink, BlockSource, PhysicalTapeSource, TapeIoError};
 use thiserror::Error;
@@ -412,6 +414,24 @@ pub enum DamageStatus {
     Unsupported,
 }
 
+/// Integrity evidence established while scanning normalized entries.
+///
+/// This reports work actually performed by the scan. It is deliberately
+/// separate from [`FormatCapabilities::verify`], which only says that a
+/// driver is capable of verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanIntegrityBasis {
+    /// The scan did not establish an integrity basis for its entries.
+    #[default]
+    Unknown,
+    /// The scan verified a content hash for each reported entry.
+    ContentHash,
+    /// The scan checked the foreign format's own checksums.
+    FormatChecksum,
+    /// The scan established parity consistency.
+    ParityConsistency,
+}
+
 /// Non-fatal damage or provenance event for one file range.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DamageRange {
@@ -505,6 +525,8 @@ pub struct ScanReport {
     pub damage_events: u64,
     /// Number of non-fatal source gaps not attributable to one file.
     pub archive_gaps: u64,
+    /// Integrity evidence actually established during this scan.
+    pub integrity_basis: ScanIntegrityBasis,
 }
 
 /// Summary returned after streaming an archive.
@@ -624,7 +646,11 @@ pub trait NativeBodyFormat: FormatDescriptor {
     ) -> Result<Box<dyn ArchiveWriter + 'a>, FormatError>;
 }
 
-/// Driver for read-only legacy or foreign tape formats.
+/// Specialized physical-tape driver retained for source compatibility.
+///
+/// New auxiliary distributions should implement [`ForeignFormatAdapter`],
+/// which can describe dump-only, tape-only, or dual-source readers and can be
+/// stored in [`ForeignFormatRegistry`].
 pub trait ForeignTapeFormat: FormatDescriptor {
     /// Probe a physical tape stream for this format.
     fn probe(&self, source: &mut dyn PhysicalTapeSource) -> Result<ProbeResult, FormatError>;
@@ -637,9 +663,220 @@ pub trait ForeignTapeFormat: FormatDescriptor {
     ) -> Result<Box<dyn ArchiveReader + 'a>, FormatError>;
 }
 
+/// Seekable byte input accepted by foreign-format dump probes.
+///
+/// This trait exists so registry-dispatched adapters can accept a seekable
+/// source without making [`ForeignFormatAdapter`] generic and therefore
+/// unusable as a trait object.
+pub trait ReadSeek: Read + Seek {}
+
+impl<T: Read + Seek + ?Sized> ReadSeek for T {}
+
+/// Object-safe boundary implemented by auxiliary, read-only format adapters.
+///
+/// The Remanence core owns this contract and the registry. Concrete foreign
+/// formats live outside the core repository and are linked into a distribution
+/// that explicitly registers them.
+pub trait ForeignFormatAdapter: FormatDescriptor + Send + Sync {
+    /// Short operator-facing names accepted in addition to [`FormatDescriptor::id`].
+    fn aliases(&self) -> &'static [&'static str];
+
+    /// Source kinds this adapter can read.
+    fn supported_sources(&self) -> &'static [SourceRequirement];
+
+    /// Probe a seekable archive dump and restore its original stream position.
+    ///
+    /// Callers pass the returned opaque `adapter_state` back to
+    /// [`ForeignFormatAdapter::open_dump_reader`].
+    fn probe_dump(&self, _source: &mut dyn ReadSeek) -> Result<ProbeResult, FormatError> {
+        Err(FormatError::unsupported(format!(
+            "format {} does not support byte-stream dumps",
+            self.id()
+        )))
+    }
+
+    /// Open a normalized reader over an archive dump.
+    fn open_dump_reader<'a>(
+        &self,
+        _source: Box<dyn ReadSeek + 'a>,
+        _adapter_state: &[u8],
+    ) -> Result<Box<dyn ArchiveReader + 'a>, FormatError> {
+        Err(FormatError::unsupported(format!(
+            "format {} does not support byte-stream dumps",
+            self.id()
+        )))
+    }
+
+    /// Probe physical tape records.
+    fn probe_tape(&self, _source: &mut dyn PhysicalTapeSource) -> Result<ProbeResult, FormatError> {
+        Err(FormatError::unsupported(format!(
+            "format {} does not support physical tape records",
+            self.id()
+        )))
+    }
+
+    /// Open a normalized reader over physical tape records.
+    fn open_tape_reader<'a>(
+        &self,
+        _source: &'a mut dyn PhysicalTapeSource,
+        _probe: &ProbeResult,
+    ) -> Result<Box<dyn ArchiveReader + 'a>, FormatError> {
+        Err(FormatError::unsupported(format!(
+            "format {} does not support physical tape records",
+            self.id()
+        )))
+    }
+}
+
+/// Registration failures that would make format dispatch ambiguous.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum FormatRegistryError {
+    /// A stable format identifier is empty or contains surrounding whitespace.
+    #[error("invalid foreign-format id {0:?}")]
+    InvalidId(String),
+
+    /// An operator-facing alias is empty or contains surrounding whitespace.
+    #[error("invalid foreign-format alias {0:?}")]
+    InvalidAlias(String),
+
+    /// Two adapters claim the same stable identifier.
+    #[error("foreign-format id {0:?} is already registered")]
+    DuplicateId(String),
+
+    /// An id or alias would resolve to two different adapters.
+    #[error("foreign-format name {0:?} is already registered")]
+    DuplicateName(String),
+}
+
+/// Explicit registry of foreign-format adapters linked into one distribution.
+///
+/// [`Default`] is intentionally empty. Core Remanence binaries therefore ship
+/// with no foreign formats unless a separate distribution constructs and passes
+/// a populated registry.
+#[derive(Clone, Default)]
+pub struct ForeignFormatRegistry {
+    adapters: BTreeMap<String, Arc<dyn ForeignFormatAdapter>>,
+    names: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for ForeignFormatRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ForeignFormatRegistry")
+            .field("format_ids", &self.adapters.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl ForeignFormatRegistry {
+    /// Create an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register one adapter and all of its aliases.
+    pub fn register(
+        &mut self,
+        adapter: Arc<dyn ForeignFormatAdapter>,
+    ) -> Result<(), FormatRegistryError> {
+        let id = validate_registry_name(adapter.id(), true)?;
+        if self.adapters.contains_key(id) {
+            return Err(FormatRegistryError::DuplicateId(id.to_string()));
+        }
+
+        let mut names = Vec::with_capacity(adapter.aliases().len() + 1);
+        names.push(id);
+        for alias in adapter.aliases() {
+            names.push(validate_registry_name(alias, false)?);
+        }
+        let mut unique_names = BTreeSet::new();
+        for name in &names {
+            if !unique_names.insert(*name) || self.names.contains_key(*name) {
+                return Err(FormatRegistryError::DuplicateName((*name).to_string()));
+            }
+        }
+
+        let id = id.to_string();
+        self.adapters.insert(id.clone(), adapter);
+        for name in names {
+            self.names.insert(name.to_string(), id.clone());
+        }
+        Ok(())
+    }
+
+    /// Resolve a stable id or operator-facing alias.
+    pub fn get(&self, name: &str) -> Option<Arc<dyn ForeignFormatAdapter>> {
+        let id = self.names.get(name)?;
+        self.adapters.get(id).cloned()
+    }
+
+    /// Return adapters in stable-id order.
+    pub fn adapters(&self) -> impl Iterator<Item = Arc<dyn ForeignFormatAdapter>> + '_ {
+        self.adapters.values().cloned()
+    }
+
+    /// Number of registered adapters.
+    pub fn len(&self) -> usize {
+        self.adapters.len()
+    }
+
+    /// Whether no foreign formats are registered.
+    pub fn is_empty(&self) -> bool {
+        self.adapters.is_empty()
+    }
+}
+
+fn validate_registry_name(
+    name: &'static str,
+    is_id: bool,
+) -> Result<&'static str, FormatRegistryError> {
+    if name.is_empty() || name.trim() != name {
+        return Err(if is_id {
+            FormatRegistryError::InvalidId(name.to_string())
+        } else {
+            FormatRegistryError::InvalidAlias(name.to_string())
+        });
+    }
+    Ok(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct TestAdapter {
+        id: &'static str,
+        aliases: &'static [&'static str],
+    }
+
+    impl FormatDescriptor for TestAdapter {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn version(&self) -> &'static str {
+            "test"
+        }
+
+        fn source_requirement(&self) -> SourceRequirement {
+            SourceRequirement::PhysicalTapeRecords
+        }
+
+        fn capabilities(&self) -> FormatCapabilities {
+            FormatCapabilities::default()
+        }
+    }
+
+    impl ForeignFormatAdapter for TestAdapter {
+        fn aliases(&self) -> &'static [&'static str] {
+            self.aliases
+        }
+
+        fn supported_sources(&self) -> &'static [SourceRequirement] {
+            &[SourceRequirement::PhysicalTapeRecords]
+        }
+    }
 
     #[test]
     fn rem_tar_v1_capabilities_do_not_advertise_unwired_driver_features() {
@@ -652,5 +889,45 @@ mod tests {
         assert!(!capabilities.indexed_file_restore);
         assert!(!capabilities.range_read);
         assert!(!capabilities.verify);
+    }
+
+    #[test]
+    fn foreign_registry_is_empty_by_default_and_resolves_id_and_alias() {
+        let mut registry = ForeignFormatRegistry::default();
+        assert!(registry.is_empty());
+
+        registry
+            .register(Arc::new(TestAdapter {
+                id: "example-v1",
+                aliases: &["example"],
+            }))
+            .unwrap();
+
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.get("example-v1").unwrap().id(), "example-v1");
+        assert_eq!(registry.get("example").unwrap().id(), "example-v1");
+        assert!(registry.get("missing").is_none());
+    }
+
+    #[test]
+    fn foreign_registry_rejects_ambiguous_names_without_partial_registration() {
+        let mut registry = ForeignFormatRegistry::default();
+        registry
+            .register(Arc::new(TestAdapter {
+                id: "first-v1",
+                aliases: &["shared"],
+            }))
+            .unwrap();
+
+        let error = registry
+            .register(Arc::new(TestAdapter {
+                id: "second-v1",
+                aliases: &["shared"],
+            }))
+            .unwrap_err();
+
+        assert_eq!(error, FormatRegistryError::DuplicateName("shared".into()));
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get("second-v1").is_none());
     }
 }

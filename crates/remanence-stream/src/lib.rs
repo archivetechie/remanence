@@ -3469,6 +3469,7 @@ mod tests {
                 entries: self.entries.len() as u64,
                 damage_events: self.damages.len() as u64,
                 archive_gaps: 0,
+                integrity_basis: Default::default(),
             })
         }
 

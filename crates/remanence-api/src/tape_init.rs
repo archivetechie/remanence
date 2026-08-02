@@ -290,10 +290,6 @@ pub fn decide_tape_init(
 pub enum FormatId {
     /// Remanence bootstrap tape file.
     RemanenceBootstrap,
-    /// Legacy Remanence BRU archive format.
-    LegacyBru,
-    /// Legacy tar archive format.
-    LegacyTar,
 }
 
 impl FormatId {
@@ -301,21 +297,16 @@ impl FormatId {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::RemanenceBootstrap => "remanence-bootstrap",
-            Self::LegacyBru => "remanence-bru",
-            Self::LegacyTar => "legacy-tar",
         }
     }
 }
 
-/// Sniff a BOT block for a known Remanence or legacy format signature.
+/// Sniff a BOT block for a known native Remanence signature.
 ///
-/// The legacy BRU/tar hooks intentionally return `None` until their format
-/// crates expose byte-slice sniffers; they are still represented here so the
-/// registry shape is explicit.
+/// Foreign formats are probed through the auxiliary adapter registry against a
+/// physical source; they are not hard-coded into tape initialization.
 pub fn sniff(bot_bytes: &[u8]) -> Option<FormatId> {
     sniff_remanence_bootstrap(bot_bytes)
-        .or_else(|| sniff_legacy_bru(bot_bytes))
-        .or_else(|| sniff_legacy_tar(bot_bytes))
 }
 
 /// Classify readable BOT bytes for init. Blank and read-error states must come
@@ -609,14 +600,6 @@ fn sniff_remanence_bootstrap(bot_bytes: &[u8]) -> Option<FormatId> {
     parse_bootstrap_block(bot_bytes)
         .ok()
         .map(|_| FormatId::RemanenceBootstrap)
-}
-
-fn sniff_legacy_bru(_bot_bytes: &[u8]) -> Option<FormatId> {
-    None
-}
-
-fn sniff_legacy_tar(_bot_bytes: &[u8]) -> Option<FormatId> {
-    None
 }
 
 fn geometry_from_bootstrap(payload: &BootstrapPayload) -> TapeInitGeometry {

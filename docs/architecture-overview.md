@@ -17,7 +17,7 @@ Layer 4   remanence-state
           config, state lock, audit log, rebuildable SQLite catalog
 Layer 3   remanence-format (3b: rem-object-v1 body)   remanence-parity (3c: parity)
           + remanence-aead (REMO HPKE envelope), remanence-format-driver (traits),
-            remanence-bru (legacy reader), remanence-stream (composition)
+            remanence-stream (composition)
 Layer 2   remanence-library
           discovery, identity, policy-gated handles, robotics, tape I/O
 Layer 1   remanence-scsi
@@ -83,15 +83,15 @@ crates, and they are format-free by contract: no REM-OBJECT, parity, catalog, or
 daemon knowledge below this seam. The contract is enforced twice in the
 tree: a manifest-parsing test asserts that `remanence-scsi` and
 `remanence-aead` depend on no internal crate and that `remanence-library`
-depends only on `remanence-scsi`; and CI asserts that the default builds
-of the CLI and API do not pull the legacy BRU reader (that one guards the
-`foreign-bru` feature seam). An external project can build its own layout
-and catalog on the platform crates without inheriting Remanence's formats.
+depends only on `remanence-scsi`; and a second dependency guard asserts that
+the entire core workspace contains no concrete foreign-format adapter. An
+external project can build its own layout and catalog on the platform crates
+without inheriting Remanence's formats.
 
-<!-- code-anchor: crates/remanence-format/src/lib.rs crates/remanence-parity/src/lib.rs crates/remanence-aead/src/lib.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/header.rs crates/remanence-format-driver/src/lib.rs crates/remanence-stream/src/lib.rs crates/remanence-bru/src/lib.rs crates/remanence-crc/src/lib.rs @ 8de2c46 -->
+<!-- code-anchor: crates/remanence-format/src/lib.rs crates/remanence-parity/src/lib.rs crates/remanence-aead/src/lib.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/header.rs crates/remanence-format-driver/src/lib.rs crates/remanence-stream/src/lib.rs crates/remanence-crc/src/lib.rs @ b1c79a8 -->
 ## Layer 3: formats and parity
 
-Seven crates share this layer:
+Six crates share this layer:
 
 - `remanence-format` implements `rem-object-v1`, the native body format: one pax
   tar archive per stored object, chunk-aligned, self-describing, with a
@@ -119,11 +119,10 @@ Seven crates share this layer:
   catalog-less scan that reconstructs a tape's structure from the media
   alone. On clean reads it is transparent; on medium errors it
   reconstructs missing blocks.
-- `remanence-format-driver` publishes the driver traits (probe, scan,
-  restore, recover) that native and foreign formats implement.
-- `remanence-bru` is the one foreign driver so far: a read-only reader
-  for legacy BRU/BRU-PE archives, used for migrating old tapes. It is
-  feature-gated (`foreign-bru`) and excluded from default builds.
+- `remanence-format-driver` publishes the normalized reader traits and the
+  explicit registry used by auxiliary, read-only foreign-format adapters.
+  The default registry is empty; concrete adapters and adapter-enabled
+  binaries live in separately versioned distributions outside this workspace.
 - `remanence-stream` composes 3b and 3c for whole-file workflows:
   prepass local files, stream them through format plus parity, project
   catalog rows, and restore objects back to a directory (including

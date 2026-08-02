@@ -27,12 +27,14 @@ CLI), `rem-debug` (break-glass CLI), `rem-daemon` (the service), and
 `rem-recover` (a standalone catalogless disaster-recovery tool — see the
 [CLI reference](reference-cli.md#rem-recover-standalone-recovery)).
 
-Two optional cargo features widen the surface:
+One optional cargo feature widens the core surface:
 
 - `--features remanence-cli/linux-udev` enables `rem watch` (hot-plug
   events); it needs the `pkg-config` and `libudev-dev` system packages.
-- `--features remanence-cli/foreign-bru` compiles in the legacy BRU
-  archive reader and its `--format bru` commands.
+
+Foreign-format adapters are separate distributions rather than Cargo features
+of the core repository. See the
+[foreign-format adapter reference](reference-foreign-format-adapters.md).
 
 To run the test suite the way CI does:
 
@@ -185,7 +187,7 @@ rem library <SERIAL> --slots
 Both commands take `--json` for scripting. Discovery is read-only: it
 issues INQUIRY, VPD, and READ ELEMENT STATUS, and moves nothing.
 
-<!-- code-anchor: crates/remanence-daemon/src/main.rs crates/remanence-state/src/config.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-state/src/config.rs @ b1c79a8 -->
 ## Running the daemon (requires hardware)
 
 The daemon needs a config file. A minimal one, using `/var/lib/rem` for

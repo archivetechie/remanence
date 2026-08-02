@@ -2065,9 +2065,9 @@ dependencies = [
  "prost-derive",
  "prost-types",
  "remanence-aead",
- "remanence-bru",
  "remanence-chaos",
  "remanence-format",
+ "remanence-format-driver",
  "remanence-library",
  "remanence-parity",
  "remanence-scsi",
@@ -2090,14 +2090,6 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "x509-parser",
-]
-
-[[package]]
-name = "remanence-bru"
-version = "1.0.0"
-dependencies = [
- "remanence-format-driver",
- "remanence-library",
 ]
 
 [[package]]
@@ -2131,9 +2123,9 @@ dependencies = [
  "ratatui",
  "remanence-aead",
  "remanence-api",
- "remanence-bru",
  "remanence-chaos",
  "remanence-format",
+ "remanence-format-driver",
  "remanence-library",
  "remanence-parity",
  "remanence-state",
@@ -2165,6 +2157,7 @@ dependencies = [
  "nix",
  "prost-types",
  "remanence-api",
+ "remanence-format-driver",
  "remanence-library",
  "remanence-state",
  "tempfile",

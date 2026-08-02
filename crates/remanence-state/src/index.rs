@@ -795,7 +795,7 @@ pub struct NativeObjectFileProjectionInput {
 pub struct ForeignArchiveProjectionInput {
     /// Optional tape UUID when the source is a physical cartridge.
     pub tape_uuid: Vec<u8>,
-    /// Format identifier, such as `remanence-bru`.
+    /// Stable foreign-format adapter identifier.
     pub format_id: String,
     /// Stable scan id assigned by the caller/daemon.
     pub scan_id: String,
@@ -15361,10 +15361,10 @@ mod tests {
         let unit_id = index
             .upsert_foreign_archive_projection(ForeignArchiveProjectionInput {
                 tape_uuid: Vec::new(),
-                format_id: "remanence-bru".to_string(),
+                format_id: "legacy-example-v1".to_string(),
                 scan_id: "scan-1".to_string(),
                 source_kind: "byte_stream_dump".to_string(),
-                source_id: "dump:/tmp/archive.bru".to_string(),
+                source_id: "dump:/tmp/archive.bin".to_string(),
                 confidence: "high".to_string(),
                 entry_count: 3,
                 damage_event_count: 1,
@@ -15380,10 +15380,10 @@ mod tests {
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].unit_id, unit_id);
         assert_eq!(units[0].origin_kind, "foreign_archive");
-        assert_eq!(units[0].format_id, "remanence-bru");
+        assert_eq!(units[0].format_id, "legacy-example-v1");
         assert_eq!(units[0].scan_id.as_deref(), Some("scan-1"));
         assert_eq!(units[0].source_kind.as_deref(), Some("byte_stream_dump"));
-        assert_eq!(units[0].source_id.as_deref(), Some("dump:/tmp/archive.bru"));
+        assert_eq!(units[0].source_id.as_deref(), Some("dump:/tmp/archive.bin"));
         assert_eq!(units[0].confidence.as_deref(), Some("high"));
         assert_eq!(units[0].entry_count, Some(3));
         assert_eq!(units[0].damage_event_count, Some(1));

@@ -19,7 +19,9 @@ use tokio_stream::wrappers::{TcpListenerStream, UnixListenerStream};
 use tokio_stream::StreamExt;
 use tonic::transport::Server;
 
+mod entry;
 mod tls;
+pub use entry::main_entry_with_registry;
 pub use tls::{load_server_tls, TlsConfigError, TlsListener};
 
 const H2_INITIAL_STREAM_WINDOW_BYTES: u32 = 4 * 1024 * 1024;
