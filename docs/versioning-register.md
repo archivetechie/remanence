@@ -289,17 +289,13 @@ documents and published artifacts themselves.
 
 - **What.** Three normative specifications and one informative companion,
   each independently versioned major.minor.errata.
-- **Current.** The three specifications are **review drafts**, open for
-  comment until 30 April 2027 and freezing 31 July 2027. REM-PARITY is at
-  1.0.0-draft.2, which resolved Appendix E item RP-2; REM-OBJECT and
-  REM-ENCRYPT are at 1.0.0-draft.1. The companion is not a review draft and
-  does not freeze; it carries a two-component version, currently 1.0, and
-  tracks the specifications. Copies of these documents circulated earlier
-  inside a software release, without DOIs of their own and reachable only by
-  unpacking the source archive; these are the first revisions published as
-  documents. The three specifications version independently, and already do:
-  they were published together on 31 July 2026 at the same version string and
-  went out of step two days later.
+- **Current.** All four are **review drafts** at 1.0.0-draft.1, open for
+  comment until 30 April 2027 and freezing 31 July 2027. Copies of these
+  documents circulated earlier inside a software release, without DOIs of
+  their own and reachable only by unpacking the source archive; these are the
+  first revisions published as documents. The documents version independently
+  from here, so their numbers may diverge later even though they start
+  together.
 - **How they change.** The three-question policy in each document's Status
   section — the subject of [versioning-explained.md](versioning-explained.md).
   Titles and filenames carry the major line only; each revision is

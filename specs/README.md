@@ -22,6 +22,16 @@ implementations are validated against these documents, not the reverse.
 Earlier internal revisions and review records are preserved in git
 history, not in the working tree.
 
+## Revisions being prepared
+
+[in-progress/](in-progress/) holds the next revision of a document while it is
+being assembled. Nothing there is normative, and a revision is not published
+every time an item closes — resolutions accumulate until there are enough to
+warrant a revision and a deposit. Keeping them out of `publication/` is what
+lets a reader open that directory and trust that everything in it is current.
+See [in-progress/README.md](in-progress/README.md) for what is currently being
+prepared.
+
 ## Which copy governs
 
 The documents in this directory are the working copies from which each revision

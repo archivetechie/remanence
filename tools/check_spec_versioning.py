@@ -22,6 +22,10 @@ Checked:
      version appears in DEPOSITED.sha256, the repository copy must hash to the
      digest recorded there. This is what makes each document's "the deposited
      revision governs" rule mechanically checkable rather than a promise.
+  8. A revision being prepared in specs/in-progress/ is a second copy of a
+     document in the same repository, which is precisely the drift hazard this
+     linter was written for. It is held to the same structural rules as the
+     published copy, and must strictly supersede it.
 
 Exit 0 clean; exit 1 with findings on stderr.
 """
@@ -65,6 +69,16 @@ findings: list[str] = []
 
 def fail(msg: str) -> None:
     findings.append(msg)
+
+
+def version_key(v: str):
+    """Order version strings. A -draft.N orders before the release it anticipates."""
+    m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-draft\.(\d+))?", v)
+    if not m:
+        return (0, 0, 0, 0)
+    major, minor, patch, draft = m.groups()
+    return (int(major), int(minor), int(patch),
+            int(draft) if draft is not None else float("inf"))
 
 
 def policy_core(text: str, noun: str) -> str:
@@ -215,6 +229,60 @@ def main() -> int:
             fail(f"{name}: version {version} was deposited as {recorded[:16]}… but the "
                  f"repository copy hashes to {actual[:16]}… — a published revision is "
                  "immutable, so bump the version string instead of editing it")
+
+    # 8. Revisions in preparation.
+    #
+    # specs/in-progress/ holds the next revision of a document while it is being
+    # assembled, so that publication/ can be trusted to hold only what governs.
+    # Two copies of one document in one repository is the drift hazard this
+    # linter exists for, so the preparing copy is checked like the published one
+    # and must strictly supersede it.
+    wip = ROOT / "specs" / "in-progress"
+    if wip.is_dir():
+        for path in sorted(wip.glob("*.md")):
+            name = path.name
+            if name == "README.md":
+                continue
+            if name not in SPECS and name != COMPANION:
+                fail(f"in-progress/{name}: not a known specification document")
+                continue
+            wtext = path.read_text()
+            wm = re.search(r"^\| Version \| (\S+) \|", wtext, re.M)
+            if not wm:
+                fail(f"in-progress/{name}: no Status Version row")
+                continue
+            wv = wm.group(1)
+            if not re.fullmatch(r"\d+\.\d+\.\d+(-draft\.\d+)?", wv):
+                fail(f"in-progress/{name}: Version {wv!r} is not a three-part "
+                     "version, optionally suffixed -draft.N")
+                continue
+            if name in SPECS and not wv.startswith(SPECS[name]["line"] + "."):
+                fail(f"in-progress/{name}: Version {wv} does not extend the "
+                     f"{SPECS[name]['line']} line")
+            pub_path = PUB / name
+            if pub_path.is_file():
+                pm = re.search(r"^\| Version \| (\S+) \|", pub_path.read_text(), re.M)
+                if pm and version_key(wv) <= version_key(pm.group(1)):
+                    fail(f"in-progress/{name}: Version {wv} does not supersede the "
+                         f"published {pm.group(1)} — a copy here is the NEXT revision")
+            if name in SPECS:
+                wcore = policy_core(wtext, SPECS[name]["noun"])
+                if not wcore:
+                    fail(f"in-progress/{name}: change-policy core not found")
+                elif cores.get(ref_name) and wcore != cores[ref_name]:
+                    fail(f"in-progress/{name}: change-policy core diverges from the "
+                         f"published {ref_name}")
+            have = set(re.findall(r"^## Appendix ([A-Z])\.", wtext, re.M))
+            for ref in set(re.findall(r"Appendix ([A-Z])(?:[ .,;)]|$)", wtext)):
+                if ref not in have:
+                    fail(f"in-progress/{name}: reference to Appendix {ref} but no "
+                         "such appendix")
+            for m in re.finditer(r"^## Appendix [A-Z]\. Revision History.*?(?=^## |\Z)",
+                                 wtext, re.M | re.S):
+                dates = re.findall(r"^- \*\*(\d{4}-\d{2}-\d{2})", m.group(0), re.M)
+                if dates != sorted(dates, reverse=True):
+                    fail(f"in-progress/{name}: revision history not newest-first: "
+                         f"{dates}")
 
     if findings:
         print(f"check_spec_versioning: {len(findings)} finding(s)", file=sys.stderr)
