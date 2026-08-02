@@ -33,6 +33,7 @@ pub mod bootstrap;
 pub mod capacity;
 mod cbor;
 pub mod codec;
+mod diagnostic_text;
 mod durable;
 pub mod error;
 pub mod filemark_map;
@@ -58,6 +59,7 @@ pub use bootstrap::{
 pub use capacity::{
     CapacityReserveCause, CapacityReserveInput, CapacityReserveRemedy, CapacityReserveReport,
 };
+pub use diagnostic_text::escape_member_name;
 pub use error::ParityError;
 pub use filemark_map::{
     BootstrapMapCommit, FilemarkMap, FilemarkMapBuilder, FilemarkMapDigest, MapScope,
