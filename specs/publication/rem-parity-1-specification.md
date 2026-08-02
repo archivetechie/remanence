@@ -1439,11 +1439,16 @@ A single integer-keyed map (Section 5.3):
  3: uint  sequence,
  4: map   SidecarEpochDirectory          (Section 10.5),
  5: bytes .size 32   canonical_map_digest,
- 6: ?tstr writer_version,
- 7: ?tstr write_timestamp}
+ 6: ?tstr writer_version,                 (≤ 128 bytes, printable US-ASCII)
+ 7: ?tstr write_timestamp}                (≤ 64 bytes, RFC3339)
 ```
 
-Key 7, when present, uses the same [RFC3339] form as bootstrap key 4.
+Keys 6 and 7 are the parity_map's counterparts to bootstrap keys 3 and 4,
+and carry the same obligations: key 6 is at most 128 bytes of printable
+US-ASCII, key 7 at most 64 bytes of [RFC3339] `date-time`, a value violating
+either is treated by a Reader exactly as that key's absence and is never
+grounds to refuse the parity_map, and neither is rendered unescaped
+(Section 8.2).
 
 The decoded payload MUST match the header/footer locator fields (UUID,
 sequence, digest, scope) and the payload bytes MUST hash to
@@ -2598,7 +2603,12 @@ governs only the revisions that follow the first published one.
   US-ASCII and key 4 to 64 bytes of [RFC3339] `date-time`, states the Reader's
   obligation to treat a violating value as absent, and requires escaping
   wherever either value is rendered; Section 16.2 records the same bound among
-  its hostile-input posture. No tape written under draft.1 becomes invalid and
+  its hostile-input posture. Section 10.4 carries the same obligations to the
+  parity_map payload's keys 6 and 7, which are the same two diagnostic fields
+  in the other structure that holds them. RP-2 as raised named only the
+  bootstrap keys; bounding one pair and leaving the other unbounded would have
+  closed the item without closing the hazard. No tape written under draft.1
+  becomes invalid and
   no Reader outcome changes: both keys were already OPTIONAL, so the treatment
   a violating value now receives is the treatment every conformant Reader
   already gave their absence. Were this a published revision rather than a
