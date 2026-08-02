@@ -1,6 +1,6 @@
 # CLI reference
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/main.rs crates/remanence-cli/src/rem_debug.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/main.rs crates/remanence-cli/src/rem_debug.rs @ 96a400d6 -->
 ## The binaries
 
 Remanence ships two command-line tools built from `crates/remanence-cli`,
