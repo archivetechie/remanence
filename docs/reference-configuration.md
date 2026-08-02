@@ -58,6 +58,10 @@ string with a suffix: `B`, `KiB`/`K`/`KB`, `MiB`/`M`/`MB`, `GiB`/`G`/`GB`,
 | `spool_dir` | absolute path | `<state_dir>/spool` | Pre-commit append spool. Created with mode `0700` at startup. |
 | `spool_tmpfs_ram_budget` | byte size > 0 | unset | Required acknowledgement when the spool resolves to tmpfs/ramfs. Post-R2, spool growth reserves this fixed budget from the shared `io_memory_ceiling`; runtime `MemAvailable` never clamps or authorizes growth. Must be ≤ `io_memory_ceiling`. |
 | `io_memory_ceiling` | byte size > 0 | `"24GiB"` | Fixed total for ALL pipeline I/O memory: append-spool reservations plus every drive's read reservoir, granted through one atomic permit manager. See the deployment note below. |
+| `append_staging_mode` | `"serial"` \| `"overlap"` | `"serial"` | `"serial"` spools an entire object to disk before any of it reaches tape (the write path described below). `"overlap"` is an opt-in v0.1 rollout that admits an append into a shared ring buffer before the whole object has landed; a per-append is only eligible when the caller attests `source_replay_capability = REPLAY_FROM_START` (it can replay its source from byte zero after an interrupted overlap append) alongside a declared size and a binding content digest. |
+| `append_ring_bytes` | byte size > 0 | `"8GiB"` | Shared ring-buffer size for `"overlap"` mode. |
+| `append_ring_high_pct` | integer 1..=100 | `90` | Overlap-ring occupancy percentage that pauses further admission. |
+| `append_ring_low_pct` | integer 1..=99 | `25` | Overlap-ring occupancy percentage that resumes admission after draining. |
 | `checkpoint_max_bytes` | byte size > 0 | `"32GiB"` | Request the single checkpoint barrier when pending logical bytes reach this limit. |
 | `checkpoint_max_objects` | integer > 0 | `200` | Request the single checkpoint barrier when the pending object count reaches this limit. |
 | `checkpoint_max_age_seconds` | integer > 0 | `300` | Server-owned age deadline for an open batch. The timer queues its barrier through the drive actor, so an in-flight object finishes first. |
@@ -130,7 +134,7 @@ park-indefinitely-for-slow-but-alive-clients policy coherent; it is
 verified by the half-open-while-parked integration test required by the
 TIO-6 design (§10).
 
-<!-- code-anchor: crates/remanence-state/src/config.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs @ f643f8c2 -->
 ## `[[libraries]]`
 
 An array of tables, one per tape library the daemon may operate. This is the
@@ -147,7 +151,7 @@ but never mutated. Serials must be non-empty and unique.
 serial = "DEC91001xx"
 ```
 
-<!-- code-anchor: crates/remanence-state/src/config.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs @ f643f8c2 -->
 ## `[[tape_pools]]` and `[[tape_pool_rules]]`
 
 Tape pools group cartridges for write targeting; a write session names a
@@ -180,7 +184,7 @@ prefix = "RMA"
 pool_id = "archive-a"
 ```
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/lib.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/lib.rs @ f643f8c2 -->
 ## `[drives]`
 
 Drive-stewardship settings. The whole section is optional.
@@ -217,7 +221,7 @@ Serves `rem top` and the live-status RPC. Optional.
 | `foreign_changer_poll` | duration string | `"60s"` | Inventory poll cadence for foreign changers while live-status clients are active. |
 | `foreign_poll_lease` | duration string | `"5m"` | How recently a client must have polled to count as active. |
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-library/src/handle/mod.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-library/src/handle/mod.rs @ f643f8c2 -->
 ## `[tape_io]`
 
 Tape I/O batching and staging-ring settings. Optional. Fixed-block pipelined
@@ -245,7 +249,7 @@ actually starts (`"read reservoir N bytes is smaller than minimum pool M
 bytes"`) — a config that passes validation can still refuse the first
 read if these two settings are mismatched.
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-state/src/paths.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-state/src/paths.rs @ f643f8c2 -->
 ## `[journal]`, `[audit]`, `[index]`, `[cache]` (required)
 
 These four sections place the durable state. They are deliberately
@@ -280,7 +284,7 @@ the config file.
 Hardware integration tests read additional `REM_QUADSTOR_*` variables; they
 are documented in the test modules and are never read by production code.
 
-<!-- code-anchor: crates/remanence-state/src/paths.rs crates/remanence-state/src/lock.rs crates/remanence-daemon/src/lib.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-state/src/paths.rs crates/remanence-state/src/lock.rs crates/remanence-daemon/src/lib.rs @ f643f8c2 -->
 ## What ends up on disk
 
 For the minimal config above, a running daemon owns:

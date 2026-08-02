@@ -1,6 +1,6 @@
 # CLI reference
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/main.rs crates/remanence-cli/src/rem_debug.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/main.rs crates/remanence-cli/src/rem_debug.rs @ f643f8c2 -->
 ## The binaries
 
 Remanence ships two command-line tools built from `crates/remanence-cli`,
@@ -49,7 +49,7 @@ Conventions shared across both CLIs:
 Both binaries print full usage with `--help` at every level; this page is a
 map, not a substitute for it.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-library/src/handle/tape_io/readiness.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-library/src/handle/tape_io/readiness.rs @ f643f8c2 -->
 ## Exit codes
 
 Most subcommands exit 0 on success and 1 on failure (2 appears for a few
@@ -72,7 +72,7 @@ finer taxonomy so scripts can branch on what the drive reported:
 The `--json` output carries the same decoding in structured form
 (`recommended_next_command`, `operator_action` fields).
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ f643f8c2 -->
 ## Discovery and hot-plug
 
 | Command | What it does |
@@ -85,7 +85,7 @@ Discovery is read-only but still issues SCSI commands, so it needs the
 `tape` group and `CAP_SYS_RAWIO` (see the [quickstart](guide-quickstart.md)
 and [troubleshooting](guide-troubleshooting.md)).
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ f643f8c2 -->
 ## Daemon queries
 
 All of these speak gRPC to `rem-daemon` and take `--endpoint` and `--json`.
@@ -108,7 +108,7 @@ projection (per-bay busy/idle state, keyed `(library_serial, bay)`) for
 an external arbitration client — `rem top` does not currently render
 this field; it's wire-only today.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ f643f8c2 -->
 ## Drive stewardship
 
 Drive-fleet management through the daemon. A drive is addressed by serial
@@ -124,7 +124,7 @@ or UUID.
 | `rem drive annotate <DRIVE> ...` | Record purchase date, warranty, cost, and notes. |
 | `rem drive retire <DRIVE> --reason <TEXT> --i-understand-fleet-removal-is-permanent` | Permanently remove a drive from the managed fleet. |
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ f643f8c2 -->
 ## Tape lifecycle
 
 These run against the local config/state (not the daemon) and drive real
@@ -206,7 +206,7 @@ as `{"epoch_id":"<32 lowercase hex>","label":"<epoch label>"}`.
   `format_version: 2`; ranged mode reports the recipients parsed from the
   authenticated prefix and the authenticated-chunk/stored-range geometry.
 
-<!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/lib.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/lib.rs @ f643f8c2 -->
 ## rem-debug extras
 
 Everything above exists in `rem-debug` too. What `rem-debug` adds:
@@ -245,7 +245,7 @@ The `--allow-derived <SERIAL>` flag additionally permits operating drive
 bays whose identity was derived rather than read from the device; it must
 be a subset of `--allow`.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ f643f8c2 -->
 ## Catalog rebuild
 
 `rem rebuild-catalog-from-journals [--config <PATH>]` rebuilds the SQLite
@@ -253,7 +253,7 @@ catalog projection from the audit log and per-tape journals. This is the
 recovery path that makes the SQLite file a disposable cache rather than a
 single point of failure.
 
-<!-- code-anchor: crates/rem-recover/src/main.rs @ 2a20106 -->
+<!-- code-anchor: crates/rem-recover/src/main.rs @ f643f8c2 -->
 ## `rem-recover`: standalone recovery
 
 `rem-recover` is a separate crate and binary (`crates/rem-recover`), not

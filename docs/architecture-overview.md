@@ -3,7 +3,7 @@
 How the pieces of Remanence fit together, grounded in the code as it is
 today. For byte formats see the [tape layout reference](reference-tape-layout.md).
 
-<!-- code-anchor: Cargo.toml @ 2a20106 -->
+<!-- code-anchor: Cargo.toml @ f643f8c2 -->
 ## The layer model
 
 Remanence is organized as a strict stack. Each layer only knows about the
@@ -41,7 +41,7 @@ scenario where the rest of the stack is unavailable or untrusted.
 
 *Fig. 1 — The workspace as a strict stack: each layer depends only on the one below it, and the format-defining crates sit directly above the format-free platform seam.*
 
-<!-- code-anchor: crates/remanence-scsi/src/lib.rs crates/remanence-library/src/lib.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-scsi/src/lib.rs crates/remanence-library/src/lib.rs @ f643f8c2 -->
 ## Layers 1 and 2: the tape platform
 
 `remanence-scsi` is the leaf crate: it builds CDBs, dispatches them
@@ -75,7 +75,7 @@ issue LOCATE, SPACE, or READ POSITION by type; a compile-fail test
 enforces this. Readiness classification (bootstrap validation, media
 state machine) and the udev hot-plug watcher also live here.
 
-<!-- code-anchor: crates/remanence-library/tests/platform_dependency_guard.rs .github/workflows/ci.yml @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-library/tests/platform_dependency_guard.rs .github/workflows/ci.yml @ f643f8c2 -->
 ### The platform seam
 
 `remanence-scsi` and `remanence-library` are the reusable tape-platform
@@ -88,7 +88,7 @@ the entire core workspace contains no concrete foreign-format adapter. An
 external project can build its own layout and catalog on the platform crates
 without inheriting Remanence's formats.
 
-<!-- code-anchor: crates/remanence-format/src/lib.rs crates/remanence-parity/src/lib.rs crates/remanence-aead/src/lib.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/header.rs crates/remanence-format-driver/src/lib.rs crates/remanence-stream/src/lib.rs crates/remanence-crc/src/lib.rs @ b1c79a8 -->
+<!-- code-anchor: crates/remanence-format/src/lib.rs crates/remanence-parity/src/lib.rs crates/remanence-aead/src/lib.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/header.rs crates/remanence-format-driver/src/lib.rs crates/remanence-stream/src/lib.rs crates/remanence-crc/src/lib.rs @ f643f8c2 -->
 ## Layer 3: formats and parity
 
 Six crates share this layer:
@@ -138,7 +138,7 @@ streaming, and ranged opens use a REMP `--private-key`; its epoch id selects
 the matching key-frame slot. `rem-recover` provides the same encrypted open without
 the daemon, catalog, or config.
 
-<!-- code-anchor: crates/remanence-state/src/lib.rs crates/remanence-state/src/state.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-state/src/lib.rs crates/remanence-state/src/state.rs @ f643f8c2 -->
 ## Layer 4: state
 
 `remanence-state` holds everything the daemon remembers: the validated
@@ -165,12 +165,12 @@ reused). Two daemons configured with different socket paths but the same
 `state_dir` are not stopped from both starting — this is a known gap,
 not a documented safety property.
 
-<!-- code-anchor: proto/layer5.proto crates/remanence-api/src/lib.rs crates/remanence-daemon/src/lib.rs @ 2a20106 -->
+<!-- code-anchor: proto/layer5.proto crates/remanence-api/src/lib.rs crates/remanence-daemon/src/lib.rs @ f643f8c2 -->
 ## Layer 5: daemon and API
 
 The gRPC contract (package `remanence.api.v1`, defined in
 `proto/layer5.proto`) is still an implementation draft with no
-wire-stability promise. `rem-daemon` serves five of its six services
+wire-stability promise. `rem-daemon` serves all six of its services
 today:
 
 | Service | Surface |
@@ -180,7 +180,7 @@ today:
 | `Catalog` | tapes, pools, tape files, object enumeration, catalog units, reconcile; scoped/paginated enumeration is not wired yet (only the unscoped, unpaginated case works) |
 | `WriteSessionService` | open (pool targets only — drive/tape targets are unimplemented), client-streamed append, explicit checkpoint, close, abort; opt-in batched durability is parity-off only, and write-session restart (`recover_session_id`) remains unimplemented — RM3's app-restart contract below covers reads only |
 | `ReadSessionService` | open (tape targets only), server-streamed object/file/byte-range reads, close; `OpenReadSession` accepts an optional resume target so a client that lost its session across a restart can reopen against durable coordinates (tape UUID, object/file id, file-boundary offset) instead — see [The read path](#the-read-path) |
-| `Audit` | defined in the proto; not yet served by the daemon (no service impl registered at all) |
+| `Audit` | registered on both the Unix socket and mTLS TCP listeners; its one RPC, `QueryAudit`, streams the append-only audit log back incrementally paged |
 
 Transports: a Unix socket (peer-uid gated to root or the daemon user,
 mode 0660, with 4 MiB HTTP/2 flow-control windows and a 30s/20s
@@ -201,7 +201,7 @@ drives run in parallel.
 
 *Fig. 2 — Layer 5 topology: clients reach `rem-daemon` over the unix socket or mTLS TCP, every RPC passes the default-deny role check, and one actor per mounted drive serializes hardware access; `rem-debug` keeps an allowlist-gated direct SCSI path for break-glass work.*
 
-<!-- code-anchor: crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/index.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/index.rs @ f643f8c2 -->
 ## The write path
 
 What happens when an orchestrator writes an object:
@@ -220,7 +220,12 @@ What happens when an orchestrator writes an object:
    `MemAvailable`. The daemon verifies the caller's declared SHA-256
    against the received bytes before anything touches tape. On startup,
    `rem-daemon` deletes its own daemon-owned leftover spool files from a
-   prior unclean exit before resolving the budget.
+   prior unclean exit before resolving the budget. This full-spool
+   behavior is `[daemon] append_staging_mode = "serial"`, the default;
+   an opt-in `"overlap"` mode admits an append into a shared ring buffer
+   before the whole object has landed, gated on the caller attesting it
+   can replay its source from byte zero — see the [configuration
+   reference](reference-configuration.md) for the admission knobs.
 4. The object is laid out as a plaintext `rem-object-v1` body or sealed as a
    recipient envelope, then
    written through the parity sink. Tape I/O itself is pipelined: a
@@ -260,7 +265,7 @@ projection to its per-tape checkpoint journal before one SQLite transaction.
 Recovery trusts the journal, LOCATEs to its EOD, and overwrites any later
 physical tail; the on-tape bootstrap is the tape-alone recovery copy.
 
-<!-- code-anchor: crates/remanence-api/src/read_core.rs crates/remanence-api/src/write_owner.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-api/src/read_core.rs crates/remanence-api/src/write_owner.rs @ f643f8c2 -->
 ## The read path
 
 `OpenReadSession` resolves the object to a tape, mounts it, and
@@ -324,7 +329,7 @@ pair does locally, decoupled from any gRPC read session.
   not what to archive or when. Retention, scheduling, and workflow belong
   to the orchestrator calling the API.
 
-<!-- code-anchor: crates/remanence-chaos/src/lib.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-chaos/src/lib.rs @ f643f8c2 -->
 ## Testing infrastructure
 
 `remanence-chaos` wraps any SCSI transport with scenario-driven fault

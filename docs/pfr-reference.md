@@ -517,6 +517,12 @@ around 50% for recalls of fewer than 500 files.
 
 ### 8.2 Why rem does not use it
 
+**Not yet built.** As of this writing there is no `READ END OF WRAP
+POSITION` implementation anywhere in `remanence-scsi`, and no wrap-order
+computation or cache in the write or read path — same status as the
+batched RPC in §8.4. The rest of this section describes the intended
+design and the reasoning that shaped it, not shipped behavior.
+
 RAO is available on **LTO-9 and later full-height drives only**. It is
 not available on LTO-9 half-height, nor on LTO-8 or earlier. The
 reference LTFS driver encodes the same restriction.

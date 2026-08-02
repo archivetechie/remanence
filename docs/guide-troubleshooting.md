@@ -5,7 +5,7 @@ recurring theme: when the stack cannot prove what state the hardware is in,
 it stops and says so rather than guessing. Most of what looks like an outage
 is a fence doing its job.
 
-<!-- code-anchor: crates/remanence-library/src/error.rs crates/remanence-cli/src/lib.rs crates/remanence-scsi/src/error.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-library/src/error.rs crates/remanence-cli/src/lib.rs crates/remanence-scsi/src/error.rs @ f643f8c2 -->
 ## Discovery finds no libraries
 
 `rem libraries` reporting `no tape libraries reachable on this host` has
@@ -42,7 +42,7 @@ For the daemon under systemd, grant the capability in the unit instead:
 check that `/dev/sg*` nodes exist at all (no HBA, no VTL, or the module
 is not loaded).
 
-<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-cli/src/lib.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-cli/src/lib.rs @ f643f8c2 -->
 ## Media-readiness fences and quarantine
 
 Remanence classifies TEST UNIT READY results into an explicit readiness
@@ -91,7 +91,7 @@ The `--ack` text is recorded. The fence is deliberately annoying: its
 whole purpose is that nobody writes to a tape whose state was last seen
 mid-uncertainty.
 
-<!-- code-anchor: crates/remanence-library/src/handle/mod.rs crates/remanence-library/src/handle/tape_io/mod.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-library/src/handle/mod.rs crates/remanence-library/src/handle/tape_io/mod.rs @ f643f8c2 -->
 ## Dirty snapshots and completion-unknown
 
 For every state-changing SCSI command, Remanence distinguishes "the device
@@ -147,7 +147,7 @@ socket path (`AddrInUse` if something is already listening there). Two
 daemons pointed at the same `state_dir` with *different* `socket_path`s
 will both start — this is a known gap, not a safety net you can rely on.
 
-<!-- code-anchor: crates/remanence-api/src/pool_write.rs crates/remanence-parity/src/error.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-api/src/pool_write.rs crates/remanence-parity/src/error.rs @ f643f8c2 -->
 ## Writes are refused
 
 Pool writes fail closed on a set of preconditions. The common refusals:
@@ -175,6 +175,11 @@ Pool writes fail closed on a set of preconditions. The common refusals:
 - `staging ring accounting imbalance` — an internal invariant violation
   in the pipelined write path (allocated/returned buffer counts don't
   match at transfer end); treat as a bug report, not an operator action.
+- `selected tape sealed at the checkpoint boundary; reopen against the
+  pool to roll placement` — not a failure: a batched-durability session's
+  tape was sealed at a checkpoint barrier, so this session can no longer
+  append to it. Open a new write session against the pool; placement
+  rolls to the next tape automatically.
 
 <!-- code-anchor: crates/remanence-daemon/src/entry.rs @ 2830f1c -->
 ## Reading the logs
@@ -207,6 +212,7 @@ Strings worth grepping for, mapped to the sections above:
 | `startup blocked by active tape-I/O fence` | interrupted write before restart |
 | `transport error (completion unknown)` | dirty snapshot; rescan |
 | `write session poisoned by a failed append` | session-level write poison; open a new session |
+| `sealed at the checkpoint boundary` | tape sealed at a checkpoint barrier; open a new session against the pool |
 | `has insecure permissions` | TLS key mode |
 | `read-only mode` | daemon started with `read_only = true` |
 | `remanence_read_diag` (as `target`) | read-pipeline reservoir/backpressure diagnostics, see above |

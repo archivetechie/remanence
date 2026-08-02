@@ -138,9 +138,12 @@ What it buys, in exchange:
   cannot arise.
 - **Errors with their meaning intact.** Failures arrive as SCSI sense
   data and are classified as such, rather than surfacing as an `EIO`
-  stripped of everything the drive actually said.
+  stripped of everything the drive actually said. Remanence classifies
+  sense in both fixed format (`0x70`/`0x71`) and descriptor format
+  (`0x72`/`0x73`), so a host or drive configured either way still yields
+  correctly-classified end-of-medium and filemark signals.
 
 For where the transport sits in the crate stack, see the
 [architecture overview](architecture-overview.md).
 
-<!-- code-anchor: crates/remanence-scsi/src/locate.rs crates/remanence-library/src/handle/tape_io/mod.rs crates/remanence-library/src/discovery.rs @ a119b67 -->
+<!-- code-anchor: crates/remanence-scsi/src/locate.rs crates/remanence-library/src/handle/tape_io/mod.rs crates/remanence-library/src/discovery.rs @ f643f8c2 -->
