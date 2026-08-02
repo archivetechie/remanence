@@ -158,6 +158,7 @@ None of these touch tape; they are the easiest way to exercise the format.
 | `rem archive covering-range --private-key <REMP> --object-id <ID> --file-id <ID> --range <START:LEN>` | Authenticate an envelope header/key-frame/metadata prefix from stdin and print the smallest covering stored-ciphertext range (`stored_range_start`, `stored_range_len`, `first_chunk`, `chunk_count`). See [`reference-extract-stream-protocol.md`](reference-extract-stream-protocol.md). |
 | `rem restore --object <FILE> --dest <DIR> [--private-key <REMP>]` | Top-level native-restore alias with the same key contract as `extract`. |
 | `rem archive list` | List native objects from the local catalog (no tape access). |
+| `rem archive formats` | Print JSON describing the foreign-format adapters linked into this binary; stock Remanence returns an empty list. |
 | `rem archive probe --format <ID> --dump <FILE>` | Ask a registered foreign-format adapter to identify a dump without streaming it. |
 | `rem archive scan --format <ID> --dump <FILE>` | Catalog normalized entries from a foreign-format dump. |
 | `rem archive restore --format <ID> --dump <FILE> --dest <DIR> [--overwrite]` | Restore a foreign-format dump into a directory. |
