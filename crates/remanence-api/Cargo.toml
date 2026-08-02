@@ -14,8 +14,8 @@ prost.workspace = true
 prost-derive.workspace = true
 prost-types.workspace = true
 remanence-aead = { path = "../remanence-aead" }
-remanence-bru = { path = "../remanence-bru", optional = true }
 remanence-format = { path = "../remanence-format" }
+remanence-format-driver = { path = "../remanence-format-driver" }
 remanence-library = { path = "../remanence-library" }
 remanence-parity = { path = "../remanence-parity" }
 remanence-scsi = { path = "../remanence-scsi" }
@@ -44,7 +44,6 @@ tonic-prost-build.workspace = true
 
 [features]
 default = []
-foreign-bru = ["dep:remanence-bru"]
 
 [dev-dependencies]
 remanence-chaos = { path = "../remanence-chaos" }

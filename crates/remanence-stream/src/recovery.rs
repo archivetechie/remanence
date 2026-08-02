@@ -36,7 +36,7 @@ const MAX_EAGER_RECOVERY_SET_LEN_BYTES: u64 = 64 * 1024 * 1024;
 pub struct RecoveryOptions {
     /// Format identifier recorded in the manifest.
     pub format_id: String,
-    /// Human-readable source description, such as `dump:/path/archive.bru`.
+    /// Human-readable source description, such as `dump:/path/archive.bin`.
     pub source: String,
 }
 
@@ -1157,6 +1157,7 @@ mod tests {
                 entries: self.entries.len() as u64,
                 damage_events: self.damages.len() as u64,
                 archive_gaps: self.gaps.len() as u64,
+                integrity_basis: Default::default(),
             })
         }
 

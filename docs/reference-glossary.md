@@ -88,9 +88,9 @@ files packed into a `.remwrap.tar` member (with a generated
 `.remwrap.idx` sibling index) instead of thousands of individual
 entries.
 
-**BRU** — Backup and Restore Utility, a legacy Unix archive format.
-Remanence reads BRU/BRU-PE dumps through the `bru` foreign-format driver
-for migrating old archives; it never writes them.
+**foreign-format adapter** — an auxiliary, read-only parser linked into a
+separate Remanence distribution. Core Remanence owns the normalized reader and
+registry contract but ships with an empty registry and no concrete adapters.
 
 <!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/pool_write.rs crates/remanence-state/src/index.rs @ 2a20106 -->
 ## Catalog and daemon
@@ -126,8 +126,8 @@ same caller id are idempotent; different content under a reused id is a
 conflict.
 
 **catalog unit** — one enumerable archive in the catalog, either
-*native* (an REM-OBJECT object Remanence wrote) or *foreign* (a scanned legacy
-archive such as a BRU tape).
+*native* (an REM-OBJECT object Remanence wrote) or *foreign* (an archive
+scanned through a registered auxiliary adapter).
 
 **operation** — a daemon-tracked long-running action with a UUID,
 queryable and cancellable via `rem op`.

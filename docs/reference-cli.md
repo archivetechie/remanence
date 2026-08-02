@@ -158,16 +158,15 @@ None of these touch tape; they are the easiest way to exercise the format.
 | `rem archive covering-range --private-key <REMP> --object-id <ID> --file-id <ID> --range <START:LEN>` | Authenticate an envelope header/key-frame/metadata prefix from stdin and print the smallest covering stored-ciphertext range (`stored_range_start`, `stored_range_len`, `first_chunk`, `chunk_count`). See [`reference-extract-stream-protocol.md`](reference-extract-stream-protocol.md). |
 | `rem restore --object <FILE> --dest <DIR> [--private-key <REMP>]` | Top-level native-restore alias with the same key contract as `extract`. |
 | `rem archive list` | List native objects from the local catalog (no tape access). |
-| `rem archive probe --format bru --dump <FILE>` | Identify a legacy archive dump without streaming it. |
-| `rem archive scan --format bru --dump <FILE>` | Catalog entries from a legacy dump. |
-| `rem archive restore --format bru --dump <FILE> --dest <DIR> [--overwrite]` | Restore a legacy dump into a directory. |
-| `rem archive recover --format bru --dump <FILE> --dest <DIR>` | Best-effort recovery of a damaged dump into sparse partial files. |
+| `rem archive probe --format <ID> --dump <FILE>` | Ask a registered foreign-format adapter to identify a dump without streaming it. |
+| `rem archive scan --format <ID> --dump <FILE>` | Catalog normalized entries from a foreign-format dump. |
+| `rem archive restore --format <ID> --dump <FILE> --dest <DIR> [--overwrite]` | Restore a foreign-format dump into a directory. |
+| `rem archive recover --format <ID> --dump <FILE> --dest <DIR>` | Best-effort recovery of a damaged dump into sparse partial files. |
 
-The only foreign format driver today is `bru` (BRU/BRU-PE legacy
-archives). It is not in the default build: the `--format bru` commands
-exist only in binaries built with `--features remanence-cli/foreign-bru`,
-and CI guards that the default dependency graph stays free of the legacy
-reader.
+These commands are generic, but the stock Remanence binaries register no
+foreign formats and fail closed with a “not registered in this distribution”
+error. An adapter distribution supplies the accepted IDs and parser code; see
+the [foreign-format adapter reference](reference-foreign-format-adapters.md).
 
 ### Encryption flag matrix
 
@@ -231,7 +230,7 @@ journals):
 | `rem-debug archive read --library <SERIAL> --locator <JSON> --out <PATH> [--private-key <REMP>]` | Read an object by locator; an encrypted copy requires the matching private key. |
 | `rem-debug archive export-object ...` | Export the complete stored object bytes (including envelope) by locator. |
 | `rem-debug archive verify --locator <JSON> --expected-sha256 <HEX> [--private-key <REMP>]` | Stream and hash an object on tape against an expected digest, restoring nothing; encrypted copies require the matching private key. |
-| `rem-debug archive probe/scan/restore/recover --tape <SERIAL> --bay <BAY> [--rewind]` | Run the foreign-format driver directly against a mounted tape instead of a dump file. |
+| `rem-debug archive probe/scan/restore/recover --format <ID> --tape <SERIAL> --bay <BAY> [--rewind]` | Run a registered foreign-format adapter directly against a mounted tape instead of a dump file. |
 | `rem-debug tape alerts --bay <BAY>` | Read the loaded drive's TapeAlert LOG SENSE page directly. |
 
 Destructive maintenance:
@@ -239,7 +238,7 @@ Destructive maintenance:
 | Command | What it does |
 |---|---|
 | `rem-debug catalog reset --i-understand-this-erases-the-catalog` | Destructively reset local catalog state from the configured paths. |
-| `rem-debug dev write-dump-to-tape --dump <PATH> --tape <SERIAL> --bay <BAY> --i-understand-this-overwrites-the-loaded-tape` | Overwrite the loaded scratch tape with a BRU dump (test fixture setup). |
+| `rem-debug dev write-dump-to-tape --dump <PATH> --tape <SERIAL> --bay <BAY> --i-understand-this-overwrites-the-loaded-tape` | Overwrite the loaded scratch tape with raw dump bytes (test fixture setup). |
 
 The `--allow-derived <SERIAL>` flag additionally permits operating drive
 bays whose identity was derived rather than read from the device; it must
