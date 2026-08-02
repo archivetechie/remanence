@@ -6,8 +6,8 @@
 | --- | --- |
 | Status | Review draft |
 | Document version | 1.0 |
-| Version | 1.0.0-draft.1 |
-| Date | 2026-07-31 |
+| Version | 1.0.0-draft.2 |
+| Date | 2026-08-02 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719156](https://doi.org/10.5281/zenodo.21719156) |
 | Reference implementation (informative) | Zenodo concept DOI [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) — software deposit, Apache-2.0 |
@@ -937,8 +937,8 @@ A single integer-keyed map (Section 5.3):
 | ---: | --- | --- | --- |
 | 1 | map | REQUIRED unless no-parity | scheme record: `{1: tstr scheme_id, 2: uint k, 3: uint m, 4: uint S}` |
 | 2 | map | REQUIRED unless no-parity | digest record: `{1: bytes .size 32 sha256, 2: uint tape_file_count, 3: uint map_total_data_ordinals, 4: uint highest_protected_ordinal, 5: bool is_final_map}` — all five REQUIRED when the map is present |
-| 3 | tstr | OPTIONAL | writer version (diagnostic) |
-| 4 | tstr | OPTIONAL | [RFC3339] write timestamp |
+| 3 | tstr, ≤ 128 bytes | REQUIRED (a Writer MUST write it); readers MUST tolerate absence | writing-implementation identity; printable US-ASCII only |
+| 4 | tstr, ≤ 64 bytes | OPTIONAL | [RFC3339] write timestamp |
 | 5 | bool | REQUIRED (a Writer MUST write it); readers MUST treat absence as false | `drive_compression` — effective hardware compression at session open. `true` on a parity bootstrap MUST be rejected (Sections 8.4, 11.4) |
 | 20 | map | OPTIONAL | inline sidecar epoch directory (Section 10.5) |
 | 21 | map | OPTIONAL | `ParityMapReference` (Section 10.6) |
@@ -951,6 +951,37 @@ protection; it MAY omit the scheme record (key 1) and the digest record
 scheme record's `scheme_id` MUST be `rs-cauchy-gf256-v1` and `(k, m, S)`
 MUST satisfy Section 6.6 validity. Unknown keys are ignored at every level
 (Section 5.3). Writers SHOULD populate keys 3 and 4; absence is conformant.
+
+No Reader decision defined by this document depends on key 3 or key 4. They
+exist for a different reader: the person holding a cartridge that does not
+decode as this document says it should. A tape is produced by an
+implementation, not by a specification, and implementations have defects. When
+the bytes and this document disagree, the only thing that resolves the
+disagreement is knowing which software wrote them, so that its behaviour at
+that version can be established. Key 3 is that record. It is required for the
+same reason a conformance claim is not a substitute for it: the claim states
+an intention, and the tape is the result.
+
+A Writer MUST emit key 3, as at most 128 bytes drawn from printable US-ASCII
+(`0x20`–`0x7E`), identifying the software that wrote the bootstrap. It SHOULD
+take the form `<implementation>/<version>`, optionally followed by a space and
+a parenthesised build identifier — for example
+`remanence/1.0.0 (v1.0.0-12-g874b111)`. The implementation part names the
+software, not the format: two conformant implementations of this document will
+not agree on it, and are not expected to. A Writer SHOULD emit key 4, as at
+most 64 bytes forming a valid [RFC3339] `date-time`.
+
+A Reader MUST tolerate the absence of either key, and MUST treat a value
+violating either rule exactly as it treats that key's absence, for every
+purpose. It MUST NOT refuse the bootstrap, the tape file, or the tape on
+account of either. A Reader that renders either value MUST escape it, so that
+no part of it can be interpreted as a control or formatting instruction by
+whatever receives the output.
+
+The reader obligations above are what every conformant Reader already does
+with an absent key, so requiring key 3 of Writers costs earlier tapes nothing:
+a tape written without it, or by an implementation that predates this rule,
+remains valid and fully readable.
 
 #### 8.2.1. REM-OBJECT Object Rows
 
@@ -1427,11 +1458,19 @@ A single integer-keyed map (Section 5.3):
  3: uint  sequence,
  4: map   SidecarEpochDirectory          (Section 10.5),
  5: bytes .size 32   canonical_map_digest,
- 6: ?tstr writer_version,
- 7: ?tstr write_timestamp}
+ 6: ?tstr writer_version,                 (≤ 128 bytes, printable US-ASCII)
+ 7: ?tstr write_timestamp}                (≤ 64 bytes, RFC3339)
 ```
 
-Key 7, when present, uses the same [RFC3339] form as bootstrap key 4.
+Keys 6 and 7 are the parity_map's counterparts to bootstrap keys 3 and 4, and
+carry the same obligations (Section 8.2). A Writer MUST emit key 6, at most
+128 bytes of printable US-ASCII, in the same form and for the same reason as
+bootstrap key 3 — a parity_map is written by software too, and may be written
+by a different version of it than the bootstrap it accompanies. A Writer
+SHOULD emit key 7, at most 64 bytes of [RFC3339] `date-time`. A Reader MUST
+tolerate the absence of either, MUST treat a violating value exactly as that
+key's absence, MUST NOT refuse the parity_map on account of either, and MUST
+escape either before rendering it.
 
 The decoded payload MUST match the header/footer locator fields (UUID,
 sequence, digest, scope) and the payload bytes MUST hash to
@@ -2063,7 +2102,13 @@ allocation or seek it would drive; all arithmetic on tape-derived values is
 checked; reserved fields and declared zero-fill MUST be verified zero
 (misuse of reserved space is nonconformance, and silent acceptance would
 foreclose 1.x extensions; the sole exception is the bootstrap's trailing
-fill, which is excluded from acceptance decisions — Section 8.1); CBOR decoding enforces the Section 5.3 subset.
+fill, which is excluded from acceptance decisions — Section 8.1); CBOR decoding enforces the Section 5.3 subset; writer-supplied diagnostic text
+(bootstrap keys 3 and 4) is bounded in length and charset, and a value
+violating either bound is treated as absent and never rendered unescaped
+(Section 8.2). The reason for that last bound is that those two fields are
+the first human-readable text a diagnostic tool prints from an unknown
+cartridge. The operator reading them is deciding whether the cartridge is
+damaged or hostile, and the text is chosen by whoever wrote the tape.
 Implementations SHOULD fuzz the bootstrap, sidecar, and parity_map parsers
 and the scan walk (Section 18).
 
@@ -2575,6 +2620,34 @@ conformance. Milestones that predate the first published revision are marked
 revisions of this specification, and the change policy of the Status section
 governs only the revisions that follow the first published one.
 
+- **2026-08-02 — 1.0.0-draft.2 — review draft.** Resolves Appendix E item
+  RP-2. Section 8.2 now bounds bootstrap key 3 to 128 bytes of printable
+  US-ASCII and key 4 to 64 bytes of [RFC3339] `date-time`, states the Reader's
+  obligation to treat a violating value as absent, and requires escaping
+  wherever either value is rendered; Section 16.2 records the same bound among
+  its hostile-input posture. Section 10.4 carries the same obligations to the
+  parity_map payload's keys 6 and 7, which are the same two fields in the other
+  structure that holds them. RP-2 as raised named only the bootstrap keys;
+  bounding one pair and leaving the other unbounded would have closed the item
+  without closing the hazard.
+
+  This revision also promotes key 3 (and its parity_map counterpart, key 6)
+  from OPTIONAL to a Writer MUST, and recommends a matchable
+  `<implementation>/<version>` form. RP-2 treated both keys as disposable
+  diagnostics. That was wrong about key 3: a tape is produced by an
+  implementation and not by a specification, so when a cartridge does not
+  decode as this document says it should, the identity of the writing software
+  is the only thing that resolves the disagreement — and free text nobody can
+  match to a release does not do that job. Readers still tolerate absence, so
+  no earlier tape and no other implementation's tape is affected. No tape
+  written under draft.1 becomes invalid and
+  no Reader outcome changes: both keys were already OPTIONAL, so the treatment
+  a violating value now receives is the treatment every conformant Reader
+  already gave their absence. Were this a published revision rather than a
+  review draft, it would classify as a minor revision under question 3 of the
+  Status section's change policy. No pinned vector is affected, and the
+  vectors already satisfy the new Writer rule; `schema_minor` is untouched.
+
 - **2026-07-31 — 1.0.0-draft.1 — review draft.** Published for public review;
   not yet frozen. On freezing this becomes version 1.0.0, the first published
   revision, and the change policy in the Status section governs everything
@@ -2720,14 +2793,6 @@ most one object row against the Section 8.2.1 ceiling. *Comment invited on
 whether the value should be a constant fixed by this document or writer-chosen,
 on what it should contain, and on whether a pointer on the medium is worth a
 wire assignment at all.*
-
-**RP-2 · Bounds on writer-supplied text · accepted.** Keys 3 and 4 are
-writer-chosen text with no length bound and no charset restriction in this
-document or in the reference decoder. A hostile tape can therefore carry
-arbitrary control bytes in the first human-readable text a diagnostic tool
-prints. A future revision will bound their length and restrict them to
-printable US-ASCII, and state what a Reader must do with a value that violates
-either. No conformant tape is affected.
 
 **RP-3 · An embedded copy of the specification · deferred.** A pointer tells a
 finder where the document is; carrying the document itself would not depend on
