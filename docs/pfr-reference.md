@@ -521,17 +521,39 @@ RAO is available on **LTO-9 and later full-height drives only**. It is
 not available on LTO-9 half-height, nor on LTO-8 or earlier. The
 reference LTFS driver encodes the same restriction.
 
-rem therefore computes the order itself, from the cartridge's format
-geometry and the block ranges in its own catalog. This requires no SCSI
-command and no drive: the wrap layout of a cartridge is fixed by its
-generation and format, and the number of blocks in a wrap follows from
-the block size the volume was written with. Ordering is consequently
-available on every generation rem supports, not only on hardware that
-happens to offer the drive feature.
+rem therefore computes the order itself, from the cartridge's real wrap
+boundaries and the block ranges the caller supplies.
 
-Volumes written with drive compression enabled are excluded, because the
-number of blocks in a wrap then depends on how well each wrap's contents
-compressed, which cannot be computed from anything recorded.
+Those boundaries come from `READ END OF WRAP POSITION` (`A3h/1Fh/45h`,
+long form), which reports the last logical object on every wrap holding
+user data. It is a different command from the Recommended Access Order
+feature above, and is supported from LTO-7 onward including half-height
+drives. rem reads it once per cartridge and caches the result; the map is
+re-derivable from the medium at any time, so caching it costs nothing if
+lost. In practice it is read at the end of a write session, while the
+cartridge is still loaded.
+
+An earlier revision of this section described deriving wrap boundaries
+arithmetically from each generation's published capacity, needing no SCSI
+command at all. That approach was abandoned, and the reason is worth
+recording because the arithmetic version was appealing. Published
+capacity is not exact — IBM gives two figures per generation, 12,000 and
+11,600 GB for LTO-8, and directs system designs to read application
+design capacity at runtime rather than rely on the nominal number. The
+resulting error is not proportional: wrap parity decides whether a block
+sits near or far along its wrap, so an error large enough to shift the
+wrap index by one places that block at the opposite end of the cartridge.
+Simulation against ascending block order showed ordering to be 67–88%
+better with exact boundaries, no better than ascending at 1% capacity
+error, and *worse than not ordering at all* at 3.3%.
+
+Ordering is therefore available on LTO-7 and later. LTO-6 and earlier
+predate the command; for those, rem reports the volume unsupported rather
+than ordering on an approximation known to be worse than doing nothing.
+
+Volumes written with drive compression enabled are also excluded, because
+the number of blocks in a wrap then depends on how well each wrap's
+contents compressed, which cannot be computed from anything recorded.
 
 ### 8.3 The read contract
 
