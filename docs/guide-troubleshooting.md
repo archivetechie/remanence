@@ -112,7 +112,7 @@ poison the write transfer or the whole write session. All three are
 independent "don't trust what you can't prove" mechanisms at different
 layers — seeing one does not imply the others tripped too.
 
-<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-daemon/src/tls.rs crates/remanence-state/src/error.rs crates/remanence-state/src/config.rs @ b1c79a8 -->
+<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-daemon/src/tls.rs crates/remanence-state/src/error.rs crates/remanence-state/src/config.rs @ 2830f1c -->
 ## The daemon refuses to start
 
 `rem-daemon` checks its world in order and exits 1 with a specific
@@ -176,7 +176,7 @@ Pool writes fail closed on a set of preconditions. The common refusals:
   in the pipelined write path (allocated/returned buffer counts don't
   match at transfer end); treat as a bug report, not an operator action.
 
-<!-- code-anchor: crates/remanence-daemon/src/entry.rs @ b1c79a8 -->
+<!-- code-anchor: crates/remanence-daemon/src/entry.rs @ 2830f1c -->
 ## Reading the logs
 
 The daemon logs JSON to stderr, one flattened object per event, filtered

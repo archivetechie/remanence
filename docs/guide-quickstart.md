@@ -187,7 +187,7 @@ rem library <SERIAL> --slots
 Both commands take `--json` for scripting. Discovery is read-only: it
 issues INQUIRY, VPD, and READ ELEMENT STATUS, and moves nothing.
 
-<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-state/src/config.rs @ b1c79a8 -->
+<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-state/src/config.rs @ 2830f1c -->
 ## Running the daemon (requires hardware)
 
 The daemon needs a config file. A minimal one, using `/var/lib/rem` for
