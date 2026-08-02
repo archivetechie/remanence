@@ -19,6 +19,10 @@ use remanence_library::{scsi::decode_sense, TapeIoError};
 use serde::{Deserialize, Serialize};
 
 use crate::cbor::IntegerMapKeyTracker;
+use crate::diagnostic_text::{
+    escape_member_name, log_ignored_diagnostic_text, validate_write_timestamp,
+    validate_writer_version,
+};
 use crate::error::ParityError;
 use crate::filemark_map::FilemarkMapDigest;
 use crate::parity_map::{
@@ -91,10 +95,11 @@ pub struct BootstrapPayload {
     pub filemark_map_digest: Option<FilemarkMapDigest>,
     /// Tape UUID (16 bytes, UUIDv4).
     pub tape_uuid: [u8; 16],
-    /// rem software version string that wrote this tape.
+    /// rem software version string that wrote this tape. Use
+    /// [`Self::escaped_written_by_version`] for display.
     pub written_by_version: String,
     /// RFC3339 timestamp of when this bootstrap copy was
-    /// written.
+    /// written. Use [`Self::escaped_written_at`] for display.
     pub written_at: String,
     /// Bootstrap sequence number (0 at LBA 0; subsequent
     /// copies increment).
@@ -118,6 +123,18 @@ pub struct BootstrapPayload {
     /// bootstraps. The parity layer treats object bytes as opaque; higher
     /// layers supply these rows when they have representation-specific anchors.
     pub object_rows: Vec<BootstrapObjectRow>,
+}
+
+impl BootstrapPayload {
+    /// Return the writer version escaped for a human-readable output channel.
+    pub fn escaped_written_by_version(&self) -> String {
+        escape_member_name(self.written_by_version.as_bytes())
+    }
+
+    /// Return the write timestamp escaped for a human-readable output channel.
+    pub fn escaped_written_at(&self) -> String {
+        escape_member_name(self.written_at.as_bytes())
+    }
 }
 
 /// One object row carried in a bootstrap payload's object directory.
@@ -788,6 +805,11 @@ fn encode_cbor_payload(payload: &BootstrapPayload) -> Result<Vec<u8>, ParityErro
 
     // Tag 3: software version. Omitted if empty.
     if !payload.written_by_version.is_empty() {
+        validate_writer_version(&payload.written_by_version).map_err(|violated_bound| {
+            ParityError::BootstrapParse(format!(
+                "bootstrap payload key 3 violates {violated_bound}"
+            ))
+        })?;
         entries.push((
             CborValue::Integer(3.into()),
             CborValue::Text(payload.written_by_version.clone()),
@@ -796,6 +818,11 @@ fn encode_cbor_payload(payload: &BootstrapPayload) -> Result<Vec<u8>, ParityErro
 
     // Tag 4: write timestamp. Omitted if empty.
     if !payload.written_at.is_empty() {
+        validate_write_timestamp(&payload.written_at).map_err(|violated_bound| {
+            ParityError::BootstrapParse(format!(
+                "bootstrap payload key 4 violates {violated_bound}"
+            ))
+        })?;
         entries.push((
             CborValue::Integer(4.into()),
             CborValue::Text(payload.written_at.clone()),
@@ -902,12 +929,28 @@ fn decode_cbor_payload(
             }
             3 => {
                 if let CborValue::Text(s) = value {
-                    written_by_version = s;
+                    match validate_writer_version(&s) {
+                        Ok(()) => written_by_version = s,
+                        Err(violated_bound) => log_ignored_diagnostic_text(
+                            "bootstrap payload",
+                            3,
+                            "writer_version",
+                            violated_bound,
+                        ),
+                    }
                 }
             }
             4 => {
                 if let CborValue::Text(s) = value {
-                    written_at = s;
+                    match validate_write_timestamp(&s) {
+                        Ok(()) => written_at = s,
+                        Err(violated_bound) => log_ignored_diagnostic_text(
+                            "bootstrap payload",
+                            4,
+                            "write_timestamp",
+                            violated_bound,
+                        ),
+                    }
                 }
             }
             5 => match value {
@@ -1675,6 +1718,37 @@ mod tests {
         decode_cbor_payload(&bytes, false, 1_048_576, BOOTSTRAP_SCHEMA_MINOR)
     }
 
+    fn replace_bootstrap_text_key(block: &mut [u8], key: i128, replacement: &str) {
+        let old_cbor_len = u32::from_le_bytes(block[40..44].try_into().unwrap()) as usize;
+        let old_cbor = &block[BOOTSTRAP_HEADER_LEN..BOOTSTRAP_HEADER_LEN + old_cbor_len];
+        let mut value: CborValue = ciborium::from_reader(old_cbor).expect("bootstrap CBOR decodes");
+        let CborValue::Map(entries) = &mut value else {
+            panic!("bootstrap CBOR must be a map");
+        };
+        let entry = entries
+            .iter_mut()
+            .find(|(candidate, _)| {
+                matches!(candidate, CborValue::Integer(value) if i128::from(*value) == key)
+            })
+            .unwrap_or_else(|| panic!("bootstrap CBOR must contain key {key}"));
+        entry.1 = CborValue::Text(replacement.to_string());
+
+        let mut new_cbor = Vec::new();
+        ciborium::into_writer(&value, &mut new_cbor).expect("modified bootstrap CBOR encodes");
+        let new_cbor_len: u32 = new_cbor.len().try_into().expect("CBOR length fits u32");
+        let cbor_end = BOOTSTRAP_HEADER_LEN + new_cbor.len();
+        let crc_end = cbor_end + BOOTSTRAP_PAYLOAD_CRC_LEN;
+        assert!(crc_end <= block.len(), "modified bootstrap fits block");
+
+        block[40..44].copy_from_slice(&new_cbor_len.to_le_bytes());
+        let header_crc = crc64_xz(&block[..BOOTSTRAP_HEADER_CRC_OFFSET]);
+        block[44..52].copy_from_slice(&header_crc.to_le_bytes());
+        block[BOOTSTRAP_HEADER_LEN..cbor_end].copy_from_slice(&new_cbor);
+        let payload_crc = crc64_xz(&new_cbor);
+        block[cbor_end..crc_end].copy_from_slice(&payload_crc.to_le_bytes());
+        block[crc_end..].fill(0);
+    }
+
     fn assert_bootstrap_key_order_error(error: ParityError, key: i128, previous: i128) {
         let ParityError::BootstrapParse(message) = error else {
             panic!("expected bootstrap parse error, got {error:?}");
@@ -1696,6 +1770,71 @@ mod tests {
         assert!(written > BOOTSTRAP_HEADER_LEN);
         let parsed = parse_bootstrap_block(&buf[..]).expect("parse ok");
         assert_eq!(parsed, payload);
+    }
+
+    #[test]
+    fn bootstrap_writer_rejects_invalid_diagnostic_text() {
+        for invalid_version in ["v".repeat(129), "writer\x1b[2J".to_string()] {
+            let mut payload = sample_payload();
+            payload.written_by_version = invalid_version;
+            let mut block = vec![0u8; payload.block_size_bytes as usize];
+            let error = write_bootstrap_block(&payload, &mut block)
+                .expect_err("invalid bootstrap key 3 must not be written");
+            assert!(
+                matches!(&error, ParityError::BootstrapParse(message) if message.contains("key 3")),
+                "unexpected error: {error:?}"
+            );
+        }
+
+        for invalid_timestamp in ["x".repeat(65), "2026-01-01\x1b".to_string()] {
+            let mut payload = sample_payload();
+            payload.written_at = invalid_timestamp;
+            let mut block = vec![0u8; payload.block_size_bytes as usize];
+            let error = write_bootstrap_block(&payload, &mut block)
+                .expect_err("invalid bootstrap key 4 must not be written");
+            assert!(
+                matches!(&error, ParityError::BootstrapParse(message) if message.contains("key 4")),
+                "unexpected error: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_reader_treats_invalid_writer_version_as_absent() {
+        let payload = sample_payload();
+        let mut block = vec![0u8; payload.block_size_bytes as usize];
+        write_bootstrap_block(&payload, &mut block).expect("valid bootstrap writes");
+        replace_bootstrap_text_key(&mut block, 3, "writer\x1b[2J");
+
+        let decoded = parse_bootstrap_block(&block)
+            .expect("invalid diagnostic key 3 must not invalidate bootstrap");
+        let mut expected = payload;
+        expected.written_by_version.clear();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn bootstrap_reader_treats_invalid_write_timestamp_as_absent() {
+        let payload = sample_payload();
+        let mut block = vec![0u8; payload.block_size_bytes as usize];
+        write_bootstrap_block(&payload, &mut block).expect("valid bootstrap writes");
+        replace_bootstrap_text_key(&mut block, 4, "not a timestamp");
+
+        let decoded = parse_bootstrap_block(&block)
+            .expect("invalid diagnostic key 4 must not invalidate bootstrap");
+        let mut expected = payload;
+        expected.written_at.clear();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn bootstrap_diagnostic_rendering_escapes_terminal_controls() {
+        let mut payload = sample_payload();
+        payload.written_by_version = "writer\x1b[2J".to_string();
+
+        let rendered = payload.escaped_written_by_version();
+        assert_eq!(rendered, "writer\\x1b[2J");
+        assert!(!rendered.as_bytes().contains(&0x1b));
     }
 
     #[test]

@@ -11,6 +11,10 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 use crate::cbor::IntegerMapKeyTracker;
+use crate::diagnostic_text::{
+    escape_member_name, log_ignored_diagnostic_text, validate_write_timestamp,
+    validate_writer_version,
+};
 use crate::error::ParityError;
 use crate::sidecar::crc64_xz;
 
@@ -229,10 +233,28 @@ pub struct ParityMapPayload {
     pub directory: SidecarEpochDirectory,
     /// Canonical filemark-map digest for this directory scope.
     pub canonical_map_digest: [u8; 32],
-    /// Optional writer version string.
+    /// Optional writer version string. Use [`Self::escaped_writer_version`]
+    /// for display.
     pub writer_version: Option<String>,
-    /// Optional write timestamp string.
+    /// Optional write timestamp string. Use [`Self::escaped_write_timestamp`]
+    /// for display.
     pub write_timestamp: Option<String>,
+}
+
+impl ParityMapPayload {
+    /// Return the writer version escaped for a human-readable output channel.
+    pub fn escaped_writer_version(&self) -> Option<String> {
+        self.writer_version
+            .as_deref()
+            .map(|value| escape_member_name(value.as_bytes()))
+    }
+
+    /// Return the write timestamp escaped for a human-readable output channel.
+    pub fn escaped_write_timestamp(&self) -> Option<String> {
+        self.write_timestamp
+            .as_deref()
+            .map(|value| escape_member_name(value.as_bytes()))
+    }
 }
 
 /// Header/payload copy identity for replicated parity-map metadata.
@@ -1138,12 +1160,22 @@ fn encode_parity_map_payload(payload: &ParityMapPayload) -> Result<Vec<u8>, Pari
         ),
     ];
     if let Some(version) = payload.writer_version.as_ref() {
+        validate_writer_version(version).map_err(|violated_bound| {
+            parity_map_parse(format!(
+                "parity-map payload key 6 violates {violated_bound}"
+            ))
+        })?;
         entries.push((
             CborValue::Integer(6.into()),
             CborValue::Text(version.clone()),
         ));
     }
     if let Some(timestamp) = payload.write_timestamp.as_ref() {
+        validate_write_timestamp(timestamp).map_err(|violated_bound| {
+            parity_map_parse(format!(
+                "parity-map payload key 7 violates {violated_bound}"
+            ))
+        })?;
         entries.push((
             CborValue::Integer(7.into()),
             CborValue::Text(timestamp.clone()),
@@ -1183,8 +1215,24 @@ fn decode_parity_map_payload(bytes: &[u8]) -> Result<ParityMapPayload, ParityErr
             (5, CborValue::Bytes(bytes)) => {
                 canonical_map_digest = Some(bytes_to_32(bytes, "canonical_map_digest")?)
             }
-            (6, CborValue::Text(value)) => writer_version = Some(value),
-            (7, CborValue::Text(value)) => write_timestamp = Some(value),
+            (6, CborValue::Text(value)) => match validate_writer_version(&value) {
+                Ok(()) => writer_version = Some(value),
+                Err(violated_bound) => log_ignored_diagnostic_text(
+                    "parity-map payload",
+                    6,
+                    "writer_version",
+                    violated_bound,
+                ),
+            },
+            (7, CborValue::Text(value)) => match validate_write_timestamp(&value) {
+                Ok(()) => write_timestamp = Some(value),
+                Err(violated_bound) => log_ignored_diagnostic_text(
+                    "parity-map payload",
+                    7,
+                    "write_timestamp",
+                    violated_bound,
+                ),
+            },
             _ => {}
         }
     }
@@ -1826,6 +1874,19 @@ mod tests {
         decode_parity_map_payload(&bytes)
     }
 
+    fn replace_parity_map_text_key(value: &mut CborValue, key: i128, replacement: &str) {
+        let CborValue::Map(entries) = value else {
+            panic!("parity-map CBOR must be a map");
+        };
+        let entry = entries
+            .iter_mut()
+            .find(|(candidate, _)| {
+                matches!(candidate, CborValue::Integer(value) if i128::from(*value) == key)
+            })
+            .unwrap_or_else(|| panic!("parity-map CBOR must contain key {key}"));
+        entry.1 = CborValue::Text(replacement.to_string());
+    }
+
     fn assert_parity_map_key_order_error(error: ParityError, key: i128, previous: i128) {
         let ParityError::ParityMapParse(message) = error else {
             panic!("expected parity-map parse error, got {error:?}");
@@ -1950,6 +2011,73 @@ mod tests {
                 .expect("ordered unknown payload key is ignored"),
             payload
         );
+    }
+
+    #[test]
+    fn parity_map_writer_rejects_invalid_diagnostic_text() {
+        for invalid_version in ["v".repeat(129), "writer\x1b[2J".to_string()] {
+            let mut payload = sample_payload();
+            payload.writer_version = Some(invalid_version);
+            let error = encode_parity_map_tape_file(&payload, BLOCK_SIZE)
+                .expect_err("invalid parity-map key 6 must not be written");
+            assert!(
+                matches!(&error, ParityError::ParityMapParse(message) if message.contains("key 6")),
+                "unexpected error: {error:?}"
+            );
+        }
+
+        for invalid_timestamp in ["x".repeat(65), "2026-01-01\x1b".to_string()] {
+            let mut payload = sample_payload();
+            payload.write_timestamp = Some(invalid_timestamp);
+            let error = encode_parity_map_tape_file(&payload, BLOCK_SIZE)
+                .expect_err("invalid parity-map key 7 must not be written");
+            assert!(
+                matches!(&error, ParityError::ParityMapParse(message) if message.contains("key 7")),
+                "unexpected error: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parity_map_reader_treats_invalid_writer_version_as_absent() {
+        let payload = sample_payload();
+        let canonical_bytes = encode_parity_map_payload(&payload).expect("payload encodes");
+        let mut value: CborValue =
+            ciborium::from_reader(canonical_bytes.as_slice()).expect("payload value decodes");
+        replace_parity_map_text_key(&mut value, 6, "writer\x1b[2J");
+
+        let decoded = decode_parity_map_payload_value(&value)
+            .expect("invalid diagnostic key 6 must not invalidate parity-map payload");
+        let mut expected = payload;
+        expected.writer_version = None;
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn parity_map_reader_treats_invalid_write_timestamp_as_absent() {
+        let payload = sample_payload();
+        let canonical_bytes = encode_parity_map_payload(&payload).expect("payload encodes");
+        let mut value: CborValue =
+            ciborium::from_reader(canonical_bytes.as_slice()).expect("payload value decodes");
+        replace_parity_map_text_key(&mut value, 7, "not a timestamp");
+
+        let decoded = decode_parity_map_payload_value(&value)
+            .expect("invalid diagnostic key 7 must not invalidate parity-map payload");
+        let mut expected = payload;
+        expected.write_timestamp = None;
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn parity_map_diagnostic_rendering_escapes_terminal_controls() {
+        let mut payload = sample_payload();
+        payload.writer_version = Some("writer\x1b[2J".to_string());
+
+        let rendered = payload
+            .escaped_writer_version()
+            .expect("writer version is present");
+        assert_eq!(rendered, "writer\\x1b[2J");
+        assert!(!rendered.as_bytes().contains(&0x1b));
     }
 
     #[test]

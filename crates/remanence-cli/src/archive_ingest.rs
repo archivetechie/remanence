@@ -25,6 +25,8 @@ use tempfile::TempDir;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use remanence_parity::escape_member_name;
+
 use crate::{
     archive_path_from_relative, bytes_to_hex, path_component_to_string,
     read_archive_build_directory, read_archive_build_file, read_archive_build_file_with_xattrs,
@@ -2495,62 +2497,6 @@ fn nul_trim_bytes(bytes: &[u8]) -> Vec<u8> {
         .position(|byte| *byte == 0)
         .unwrap_or(bytes.len());
     bytes[..end].to_vec()
-}
-
-pub(crate) fn escape_member_name(bytes: &[u8]) -> String {
-    let mut out = String::new();
-    let mut cursor = 0usize;
-    while cursor < bytes.len() {
-        match std::str::from_utf8(&bytes[cursor..]) {
-            Ok(valid) => {
-                escape_valid_member_name_chunk(valid, &mut out);
-                break;
-            }
-            Err(error) => {
-                let valid_up_to = error.valid_up_to();
-                if valid_up_to > 0 {
-                    let valid = std::str::from_utf8(&bytes[cursor..cursor + valid_up_to])
-                        .expect("valid_up_to returned valid UTF-8 prefix");
-                    escape_valid_member_name_chunk(valid, &mut out);
-                    cursor += valid_up_to;
-                }
-                if let Some(error_len) = error.error_len() {
-                    for byte in &bytes[cursor..cursor + error_len] {
-                        push_hex_escape(&mut out, *byte);
-                    }
-                    cursor += error_len;
-                } else {
-                    for byte in &bytes[cursor..] {
-                        push_hex_escape(&mut out, *byte);
-                    }
-                    break;
-                }
-            }
-        }
-    }
-    out
-}
-
-fn escape_valid_member_name_chunk(valid: &str, out: &mut String) {
-    for ch in valid.chars() {
-        if ch == '\\' {
-            out.push_str("\\\\");
-        } else if matches!(ch, '\u{0}'..='\u{1f}' | '\u{7f}') {
-            for byte in ch.to_string().as_bytes() {
-                push_hex_escape(out, *byte);
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-}
-
-fn push_hex_escape(out: &mut String, byte: u8) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    out.push('\\');
-    out.push('x');
-    out.push(char::from(HEX[(byte >> 4) as usize]));
-    out.push(char::from(HEX[(byte & 0x0f) as usize]));
 }
 
 pub(crate) fn decode_member_name(value: &str) -> Result<Vec<u8>, String> {
