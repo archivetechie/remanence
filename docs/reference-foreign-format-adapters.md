@@ -12,6 +12,8 @@ archive events, the object-safe adapter trait, and `ForeignFormatRegistry`.
 The stock `rem`, `rem-debug`, and `rem-daemon` binaries construct an empty
 registry. They therefore accept the generic `--format <ID>` syntax but reject
 every foreign ID as unregistered.
+`rem archive formats` prints the registry linked into the CLI distribution as
+JSON; stock Remanence reports an empty `foreign_formats` array.
 
 Concrete parsers are not core crates or optional core features. A separate
 distribution selects adapter crates at compile time, registers them, and calls

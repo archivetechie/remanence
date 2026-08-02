@@ -1955,6 +1955,9 @@ enum RemArchiveCommand {
     /// Print machine-readable archive feature capabilities.
     Capabilities,
 
+    /// List foreign formats linked into this binary distribution.
+    Formats,
+
     /// Re-seal one recipient envelope to a new recipient set.
     Reseal(ArchiveResealArgs),
 
@@ -2431,6 +2434,7 @@ impl RemArchiveCommand {
                 };
             }
             Self::Capabilities => ArchiveCommand::Capabilities,
+            Self::Formats => ArchiveCommand::Formats,
             Self::Reseal(args) => ArchiveCommand::Reseal(args),
             Self::Build(args) => ArchiveCommand::Build(args.into()),
             Self::Inspect(args) => ArchiveCommand::Inspect(args.into()),
@@ -2621,6 +2625,9 @@ impl From<RemArchiveSourceArgs> for ArchiveSourceArgs {
 enum ArchiveCommand {
     /// Print machine-readable archive feature capabilities.
     Capabilities,
+
+    /// List foreign formats linked into this binary distribution.
+    Formats,
 
     /// Fully re-seal one recipient envelope to a new recipient set.
     Reseal(ArchiveResealArgs),
@@ -3131,6 +3138,7 @@ impl ArchiveCommand {
     fn tape_target(&self) -> Option<&str> {
         match self {
             Self::Capabilities
+            | Self::Formats
             | Self::Reseal(_)
             | Self::Build(_)
             | Self::Inspect(_)
@@ -3153,6 +3161,7 @@ impl ArchiveCommand {
         match self {
             Self::Build(_)
             | Self::Capabilities
+            | Self::Formats
             | Self::Reseal(_)
             | Self::Inspect(_)
             | Self::Extract(_)
@@ -3177,6 +3186,7 @@ impl ArchiveCommand {
             Self::Recover(args) => &args.source,
             Self::Build(_) => panic!("ArchiveCommand::Build has no dump/tape source"),
             Self::Capabilities => panic!("ArchiveCommand::Capabilities has no dump/tape source"),
+            Self::Formats => panic!("ArchiveCommand::Formats has no dump/tape source"),
             Self::Reseal(_) => panic!("ArchiveCommand::Reseal has no dump/tape source"),
             Self::Inspect(_) => panic!("ArchiveCommand::Inspect has no dump/tape source"),
             Self::Extract(_) => panic!("ArchiveCommand::Extract has no dump/tape source"),
@@ -3203,6 +3213,7 @@ impl ArchiveCommand {
             Self::Recover(args) => &args.format,
             Self::Build(_) => panic!("ArchiveCommand::Build has no format"),
             Self::Capabilities => panic!("ArchiveCommand::Capabilities has no format"),
+            Self::Formats => panic!("ArchiveCommand::Formats has no format"),
             Self::Reseal(_) => panic!("ArchiveCommand::Reseal has no format"),
             Self::Inspect(_) => panic!("ArchiveCommand::Inspect has no format"),
             Self::Extract(_) => panic!("ArchiveCommand::Extract has no format"),
@@ -3634,6 +3645,9 @@ where
         if matches!(command, ArchiveCommand::Capabilities) {
             return run_archive_capabilities(out, err);
         }
+        if matches!(command, ArchiveCommand::Formats) {
+            return run_archive_formats(registry, out, err);
+        }
         if let ArchiveCommand::Reseal(args) = command {
             return run_archive_reseal(args, out, err);
         }
@@ -3998,6 +4012,40 @@ fn run_archive_capabilities(out: &mut dyn Write, err: &mut dyn Write) -> ExitCod
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             let _ = writeln!(err, "error: write archive capabilities: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_archive_formats(
+    registry: &ForeignFormatRegistry,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let formats = registry
+        .adapters()
+        .map(|adapter| {
+            let sources = adapter
+                .supported_sources()
+                .iter()
+                .copied()
+                .map(source_requirement_text)
+                .collect::<Vec<_>>();
+            json!({
+                "id": adapter.id(),
+                "version": adapter.version(),
+                "aliases": adapter.aliases(),
+                "sources": sources,
+            })
+        })
+        .collect::<Vec<_>>();
+    let response = json!({"foreign_formats": formats});
+    match serde_json::to_writer(&mut *out, &response)
+        .and_then(|()| writeln!(out).map_err(serde_json::Error::io))
+    {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            let _ = writeln!(err, "error: write archive formats: {error}");
             ExitCode::from(1)
         }
     }
@@ -10407,6 +10455,9 @@ fn run_archive_dump_command(
         ArchiveCommand::Capabilities => {
             unreachable!("archive capabilities dispatched before the dump handler")
         }
+        ArchiveCommand::Formats => {
+            unreachable!("archive formats dispatched before the dump handler")
+        }
         ArchiveCommand::Reseal(_) => {
             unreachable!("archive reseal dispatched before the dump handler")
         }
@@ -13177,6 +13228,9 @@ fn run_archive_tape_with_drive(
         ArchiveCommand::Capabilities => {
             unreachable!("archive capabilities dispatched before the tape archive handler")
         }
+        ArchiveCommand::Formats => {
+            unreachable!("archive formats dispatched before the tape archive handler")
+        }
         ArchiveCommand::Reseal(_) => {
             unreachable!("archive reseal dispatched before the tape archive handler")
         }
@@ -14924,6 +14978,51 @@ mod tests {
                 "wrap-suite-hpke-v1",
                 "ranged-ciphertext-extract"
             ])
+        );
+    }
+
+    #[test]
+    fn archive_formats_reports_the_exact_linked_registry_without_discovery() {
+        let cli = Cli::try_parse_from(["rem", "archive", "formats"]).unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(
+            cli,
+            || panic!("archive formats must not perform hardware discovery"),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(err.is_empty());
+        let value: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value, json!({"foreign_formats": []}));
+
+        let cli = Cli::try_parse_from(["rem", "archive", "formats"]).unwrap();
+        let mut registry = ForeignFormatRegistry::new();
+        registry.register(Arc::new(StatefulDumpAdapter)).unwrap();
+        out.clear();
+        let code = run_with_mode(
+            cli.into(),
+            CliMode::Rem,
+            || panic!("archive formats must not perform hardware discovery"),
+            &mut io::empty(),
+            &mut out,
+            &mut err,
+            &registry,
+        );
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(err.is_empty());
+        let value: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "foreign_formats": [{
+                    "id": "stateful-test",
+                    "version": "test",
+                    "aliases": [],
+                    "sources": ["byte-stream-dump"]
+                }]
+            })
         );
     }
 
