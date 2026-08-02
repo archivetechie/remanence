@@ -1,6 +1,6 @@
 # Configuration reference
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-daemon/src/entry.rs @ b1c79a8 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-daemon/src/entry.rs @ 2830f1c -->
 ## The config file
 
 Remanence reads a single TOML file. There is no config-file search path and
@@ -47,7 +47,7 @@ string with a suffix: `B`, `KiB`/`K`/`KB`, `MiB`/`M`/`MB`, `GiB`/`G`/`GB`,
 `TiB`/`T`/`TB`, `PiB`/`P`/`PB`. Every suffix is a power of 1024 — `KB` means
 1024 bytes here, not 1000.
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-daemon/src/entry.rs crates/remanence-daemon/src/tls.rs @ b1c79a8 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-daemon/src/entry.rs crates/remanence-daemon/src/tls.rs @ 2830f1c -->
 ## `[daemon]` (required)
 
 | Key | Type | Default | Meaning |
@@ -262,7 +262,7 @@ minimal config above puts them there.
 | `index.sqlite_path` | absolute path | required | The SQLite catalog projection file. The filename is yours to choose; `rem-state.sqlite` is the conventional name. This file is a rebuildable cache — see `rem rebuild-catalog-from-journals`. |
 | `cache.tape_catalog_dir` | absolute path | required | Directory of per-tape catalog cache files. |
 
-<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-chaos/src/lib.rs crates/remanence-state/src/audit.rs @ b1c79a8 -->
+<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-chaos/src/lib.rs crates/remanence-state/src/audit.rs @ 2830f1c -->
 ## Environment variables
 
 Remanence reads very little from the environment; configuration belongs in
