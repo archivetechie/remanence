@@ -12,7 +12,7 @@ to Remanence's host state. Everything the catalog knows is either written
 to the tape itself or rebuildable from journals; the SQLite index is a
 cache, never the truth.
 
-<!-- code-anchor: crates/remanence-parity/src/filemark_map.rs crates/remanence-parity/src/sink.rs crates/remanence-parity/src/bootstrap.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-parity/src/filemark_map.rs crates/remanence-parity/src/sink.rs crates/remanence-parity/src/bootstrap.rs @ f643f8c2 -->
 ## Tape files and filemarks
 
 A cartridge is a sequence of tape files separated by filemarks, written in
@@ -32,7 +32,14 @@ on tape): `Object` (0), `ParitySidecar` (1), `Bootstrap` (2), and
   parameters, first thing on the tape. Unlike those labels it is not
   written once and left behind — the copies repeating down the tape are
   checkpoints of what has been written so far, so the label grows into a
-  recovery index over the tape's life.
+  recovery index over the tape's life. Checkpoint and final bootstraps
+  also carry a directory of REM-OBJECT-bound recovery rows: each row
+  binds a stored object's tape-file number to its verbatim REM-OBJECT
+  `object_id` and representation-specific recovery anchors (plaintext:
+  manifest LBA, size, and SHA-256; encrypted: recipient epoch IDs and
+  frame lengths), letting a reader locate and re-verify an individual
+  object without the SQLite catalog — the basis of `rem-debug tape
+  recovery-report`.
 - **Object** tape files contain only body-format blocks (a stored REM-OBJECT
   object). The parity layer owns every filemark; body formats cannot emit
   them.
@@ -52,7 +59,7 @@ HMAC-SHA-256 keyed by the tape UUID, so blocks from one tape cannot
 masquerade as another's. All parity-layer structures carry CRC-64/XZ
 checksums.
 
-<!-- code-anchor: crates/remanence-parity/src/lib.rs crates/remanence-parity/src/sidecar.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-parity/src/lib.rs crates/remanence-parity/src/sidecar.rs @ f643f8c2 -->
 ## Parity scheme
 
 Erasure coding is Reed-Solomon over GF(2^8) with a Cauchy matrix; the
@@ -80,7 +87,7 @@ soon as a well-batched workload. Heavy sync callers should batch; admission
 reserves worst-case directory and stop headroom, so reaching the ceiling
 seals and rolls placement at a checkpoint instead of failing an open batch.
 
-<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-format/src/layout.rs crates/remanence-format/src/writer.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-format/src/layout.rs crates/remanence-format/src/writer.rs @ f643f8c2 -->
 ## The stored object: rem-object-v1
 
 A plaintext stored object is a POSIX pax tar archive — the format id is
@@ -103,7 +110,7 @@ a promise, it is the format.
 
 *Fig. 2 — A rem-object-v1 stored object in stream order: identity in the pax global header, one chunk-aligned member per file, the CBOR manifest as the last member, then tar end-of-archive records padded to a chunk multiple.*
 
-<!-- code-anchor: crates/remanence-aead/src/header.rs crates/remanence-aead/src/stream.rs crates/remanence-aead/src/kdf.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs @ 8de2c46 -->
+<!-- code-anchor: crates/remanence-aead/src/header.rs crates/remanence-aead/src/stream.rs crates/remanence-aead/src/kdf.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs @ f643f8c2 -->
 ## The encrypted envelope: REMO
 
 An encrypted object wraps the same tar byte stream in an AEAD envelope.
@@ -155,7 +162,7 @@ new recipient set. CLI open/read/verify paths and standalone `rem-recover`
 select a slot using the REMP private key's epoch id; see the [CLI
 reference](reference-cli.md#rem-recover-standalone-recovery).
 
-<!-- code-anchor: crates/remanence-parity/src/bootstrap.rs crates/remanence-state/src/index.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-parity/src/bootstrap.rs crates/remanence-state/src/index.rs @ f643f8c2 -->
 ## Tape identity
 
 A tape's durable identity is the 16-byte UUID in its bootstrap at BOT,
@@ -168,7 +175,7 @@ recycle-skew issue when something outside Remanence rewrites a cartridge
 under an existing barcode (see
 [troubleshooting](guide-troubleshooting.md#known-open-issue)).
 
-<!-- code-anchor: crates/remanence-state/src/index.rs crates/remanence-state/src/paths.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-state/src/index.rs crates/remanence-state/src/paths.rs @ f643f8c2 -->
 ## On disk: the rebuildable state
 
 The host-side state, for completeness (paths are operator-configured; see
@@ -178,10 +185,11 @@ the [configuration reference](reference-configuration.md)):
   disk-side record of what was committed to each tape.
 - **Audit segments** (daily `.remaudit` files) — append-only record of
   every state-changing operation, fsynced by default.
-- **SQLite index** — schema version 12, tracked via `PRAGMA
-  user_version`, with tables for tapes, pools, tape files, objects and
-  copies, catalog units, sessions, operations, idempotency keys, media
-  readiness, tape-I/O fences, drives, cleaning runs, and alarms. It is a
+- **SQLite index** — schema version 14, tracked via `PRAGMA
+  user_version`, with tables for tapes, pools, tape files, objects,
+  copies, files, catalog units, sessions, operations, idempotency keys,
+  media-readiness records, tape-I/O fences, and the drive-stewardship set
+  (drives, events, health snapshots, cleaning runs, alarms). It is a
   projection: `rem rebuild-catalog-from-journals` regenerates it from the
   journals and audit log.
 - **Per-tape catalog caches** — regenerable per-tape files under the

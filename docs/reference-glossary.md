@@ -3,7 +3,7 @@
 Project-internal terms and the tape-industry vocabulary Remanence leans
 on. Definitions reflect what the code does today, not aspirations.
 
-<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-aead/src/header.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs crates/remanence-parity/src/lib.rs @ 8de2c46 -->
+<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-aead/src/header.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs crates/remanence-parity/src/lib.rs @ f643f8c2 -->
 ## Formats and objects
 
 **REM-OBJECT** — REM-OBJECT, the native stored-object format. One REM-OBJECT
@@ -92,7 +92,7 @@ entries.
 separate Remanence distribution. Core Remanence owns the normalized reader and
 registry contract but ships with an empty registry and no concrete adapters.
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/pool_write.rs crates/remanence-state/src/index.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/pool_write.rs crates/remanence-state/src/index.rs @ f643f8c2 -->
 ## Catalog and daemon
 
 **catalog** — the queryable model of what is on which tape. The durable
@@ -176,7 +176,12 @@ budget (see **I/O memory ceiling** below).
 drive UUID, health snapshots, TapeAlert polling, cleaning runs, history,
 annotation, retirement.
 
-<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-library/src/handle/mod.rs crates/remanence-state/src/index.rs @ 2a20106 -->
+**alarm** — a standing, catalog-persisted condition raised against a
+drive, tape, or library resource (for example a repeated cleaning
+failure or a fenced tape awaiting release) until an operator
+acknowledges or clears it. Listed and acknowledged with `rem alarms`.
+
+<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-library/src/handle/mod.rs crates/remanence-state/src/index.rs @ f643f8c2 -->
 ## Safety machinery
 
 **allowlist** — the explicit list of library serials a process may

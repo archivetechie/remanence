@@ -29,7 +29,7 @@ reasoning is laid out in [docs/why-remanence.md](docs/why-remanence.md).
 It is developed against a Quadstor virtual tape library and field-tested
 on an HPE MSL3040 with LTO-9 drives.
 
-<!-- code-anchor: Cargo.toml crates proto/layer5.proto @ 8de2c46 -->
+<!-- code-anchor: Cargo.toml crates proto/layer5.proto @ f643f8c2 -->
 ## Status
 
 Version 1.0.0 — first software release. The format documents are currently
@@ -89,7 +89,7 @@ Hardware soak coverage is still growing: the format and parity cores are
 exercised against a virtual library on every run, but time on physical
 LTO-9 iron is episodic rather than continuous.
 
-<!-- code-anchor: Cargo.toml @ 2a20106 -->
+<!-- code-anchor: Cargo.toml @ f643f8c2 -->
 ## Build
 
 Rust 1.85+, Linux. No system dependencies for the default build:
@@ -120,7 +120,7 @@ cargo test --workspace --exclude remanence-chaos
 Hardware-touching tests are ignored by default and opt in via
 environment variables documented in their test modules.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 2a20106 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ f643f8c2 -->
 ## Quickstart
 
 The native object format works against local files, no tape required:
@@ -169,7 +169,7 @@ tape write, is [docs/guide-quickstart.md](docs/guide-quickstart.md).
   their pinned test-vector archive alongside.
 - [proto/layer5.proto](proto/layer5.proto) — the draft gRPC contract.
 
-<!-- code-anchor: crates/remanence-library/tests/platform_dependency_guard.rs @ 7fb10f8 -->
+<!-- code-anchor: crates/remanence-library/tests/platform_dependency_guard.rs @ f643f8c2 -->
 ## Migrating foreign tapes
 
 Core Remanence publishes a read-only adapter registry but includes no concrete
@@ -191,7 +191,7 @@ REM-OBJECT files follow the same discipline: they contain only the
 object's stored bytes — tape filemarks, bootstrap rows, and parity
 sidecars are tape-only framing.
 
-<!-- code-anchor: Cargo.toml @ 8de2c46 -->
+<!-- code-anchor: Cargo.toml @ f643f8c2 -->
 ## Repository layout
 
 ```text
