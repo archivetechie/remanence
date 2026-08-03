@@ -9,6 +9,8 @@ format specifications — and their plain-language companion — live in
 
 - [guide-quickstart.md](guide-quickstart.md) — runnable walkthrough from
   build to first tape write.
+- [status.md](status.md) — what works today, what does not, and how
+  mature each part is.
 - [architecture-overview.md](architecture-overview.md) — crate stack,
   write/read data flow, invariants.
 - [reference-cli.md](reference-cli.md) — `rem`, `rem-debug`,

@@ -1,14 +1,16 @@
 # Why Remanence?
 
 <!-- code-anchor: none -->
-> **Status note (2026-07-25).** Version 1.0.0 is Remanence's first
+> **Status note (2026-08-03).** Version 1.0.0 is Remanence's first
 > publication release. All five layers are implemented and shipped, including
 > end-to-end tape reads and writes. The released on-tape formats are
 > REM-OBJECT Core Format 1.0 (wire id `rem-object-v1`), REM-ENCRYPT 1.0,
-> and REM-PARITY 1.0; all three are specified, implemented, frozen, and
-> accompanied by pinned test vectors. This document remains the positioning
-> record. For current capability, see the [README](../README.md) and the
-> [architecture overview](architecture-overview.md). The project is still
+> and REM-PARITY 1.0; all three are specified, implemented, and accompanied by
+> pinned test vectors. Their specifications are **review drafts, not frozen**:
+> they freeze on 31 July 2027, and the durability guarantees described below
+> take effect then rather than now. This document remains the positioning
+> record. For current capability and limitations, see the
+> [README](../README.md) and [status.md](status.md). The project is still
 > young: it has been validated on one library family and one drive generation,
 > so restore and verify real material on your own hardware before relying on it.
 
@@ -382,8 +384,9 @@ appear:
 
 Remanence's reference implementation is Apache-2.0, its specifications
 are CC-BY-4.0, and its conformance vectors are CC0-1.0. REM-OBJECT Core
-Format 1.0, REM-ENCRYPT 1.0, and REM-PARITY 1.0 are published, frozen,
-implemented end to end, and pinned by test vectors. If the project
+Format 1.0, REM-ENCRYPT 1.0, and REM-PARITY 1.0 are published, implemented
+end to end, and pinned by test vectors — as review drafts that freeze on
+31 July 2027, not as final documents. If the project
 disappears tomorrow, a plaintext REM-OBJECT remains a constrained pax tar
 archive readable by standard tools. An encrypted object requires a matching
 key and an implementation of the published REM-ENCRYPT profile before the

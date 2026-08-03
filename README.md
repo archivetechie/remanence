@@ -29,65 +29,25 @@ reasoning is laid out in [docs/why-remanence.md](docs/why-remanence.md).
 It is developed against a Quadstor virtual tape library and field-tested
 on an HPE MSL3040 with LTO-9 drives.
 
-<!-- code-anchor: Cargo.toml crates proto/layer5.proto @ f643f8c2 -->
+<!-- code-anchor: none -->
 ## Status
 
-Version 1.0.0 — first software release. The format documents are currently
-review drafts, open for comment (see each document's Status section).
-REM-OBJECT, its REM-ENCRYPT
-profile, and REM-PARITY 1.0 are all frozen: specified, implemented, and pinned
-by test vectors, so a tape written today reads back unchanged. REM-PARITY's
-conformance and freeze criteria (§18) are discharged and its Appendix C items
-closed. The daemon and gRPC control surfaces are released but may still
-evolve. The project is young — built against one library family and one drive
-generation — so restore and verify real material from your own hardware before
-relying on it. Working today:
+Version 1.0.0, the first software release. The three on-tape formats are
+specified, implemented, and pinned by test vectors that ship with the source.
 
-- Layer 1 SCSI primitives and Layer 2 library discovery, identity,
-  robotics, and hot-plug watching, with per-library allowlisting.
-- Layer 3 end to end: pipelined, staging-ring-backed fixed-block tape
-  I/O with position proofs (this is now the only write/read path — the
-  earlier non-pipelined mode and its config flag are gone), a
-  watermark-gated host-RAM read reservoir with proof-frontier ranged
-  reads, the `rem-object-v1` object format, the REM-ENCRYPT 1.0 encrypted representation
-  using the fixed `REMO` format-family magic, and Reed-Solomon sidecar
-  parity with recovery, resume, and catalog-less scan. The encrypted
-  representation's fresh per-object key is wrapped to multiple recipients
-  with HPKE Base mode running the X-Wing post-quantum/classical hybrid KEM
-  (ML-KEM-768 combined with X25519, per
-  `draft-connolly-cfrg-xwing-kem-10`) and stored in the object's own header.
-- Layer 4 state: audit log, per-tape journals, and a SQLite catalog that
-  is a rebuildable projection, plus media-readiness records and tape-I/O
-  fences.
-- Layer 5 daemon: catalog queries, pool-targeted idempotent write
-  sessions, object/file/byte-range read sessions with an app-restart
-  cold-resume contract (tape-identity check + device position proof),
-  an advisory per-drive assignment projection for external arbitration,
-  operations with cancellation, library inspection and robotics, drive
-  stewardship, alarms, live status, over a Unix socket and optional
-  mTLS TCP.
-- Operator CLIs: `rem` and `rem-debug`, including the destructive-safety
-  gauntlet for tape initialization, media-readiness quarantine tooling,
-  local REM-OBJECT build/inspect/extract that needs no hardware, and a
-  ranged-ciphertext `extract-stream`/`covering-range` pair for bounded,
-  memory-cheap partial reads of an object already fetched locally. A
-  standalone `rem-recover` binary decrypts archive objects with no
-  daemon, catalog, or config file at all — the disaster-recovery path of
-  last resort.
-- Chaos fault-injection for tests, and Lean/Aeneas proofs over the
-  parity and format cores (`verif/`).
+Their specifications are published as review drafts. What is under review is
+whether the documents describe the formats correctly and completely, not
+whether the design works — but the documents are not final until they freeze on
+31 July 2027, and the guarantee that no tape a format validates will ever be
+invalidated begins then rather than now. Until then a review finding could
+still change what goes on tape, so treat material written during the window as
+re-writable rather than final. The daemon and its gRPC control surface are
+released but may also still change.
 
-The main gaps, from the code as it stands: authorization is a shallow
-role matrix, with no scope below the role — no per-pool, per-tape, or
-per-object narrowing. Library import/export (mailslot) handling,
-library-event streaming, and write-session restart return unimplemented,
-as do drive-targeted and tape-targeted write sessions and every
-caller-supplied `idempotency_key` (write-session replay detection does
-not use that field). Appending to a committed parity tape is reached
-only through a write session; the single-object path still refuses it.
-Hardware soak coverage is still growing: the format and parity cores are
-exercised against a virtual library on every run, but time on physical
-LTO-9 iron is episodic rather than continuous.
+The project is young, and has run on a narrow range of hardware. Restore and
+verify real material on your own equipment before you rely on it.
+
+[docs/status.md](docs/status.md) sets out what works today and what does not.
 
 <!-- code-anchor: Cargo.toml @ f643f8c2 -->
 ## Build
@@ -98,16 +58,11 @@ Rust 1.85+, Linux. No system dependencies for the default build:
 cargo build --release
 ```
 
-yields `target/release/{rem,rem-debug,rem-daemon,rem-recover}`. `rem`
-and `rem-debug` are two binaries built from the same crate (operator vs.
-break-glass direct-hardware CLI); `rem-recover` is its own crate with no
-dependency on the daemon, catalog, or config file. Optional features:
-`remanence-cli/linux-udev` (hot-plug `rem watch`; needs `pkg-config` +
-`libudev-dev`). Foreign-format readers are deliberately not included in
-the core workspace or binaries; separately versioned distributions can link
-adapters through the published registry contract. The auxiliary
-[`remanence-adaptors`](https://github.com/archivetechie/remanence-adaptors)
-repository is one such distribution, not part of the Remanence core release.
+yields `target/release/{rem,rem-debug,rem-daemon,rem-recover}`. `rem` is the
+operator CLI and `rem-debug` the break-glass one that talks to hardware
+directly; `rem-recover` is a separate crate that depends on neither the daemon
+nor the catalog. One optional feature, `remanence-cli/linux-udev`, adds
+hot-plug watching and needs `pkg-config` and `libudev-dev`.
 
 Tests and lints, as CI runs them:
 
@@ -140,6 +95,8 @@ tape write, is [docs/guide-quickstart.md](docs/guide-quickstart.md).
 ## Documentation
 
 - [Quickstart](docs/guide-quickstart.md) — runnable walkthrough.
+- [Status](docs/status.md) — what works today, what does not, and how
+  mature each part is.
 - [Architecture overview](docs/architecture-overview.md) — the layer
   stack, write/read paths, and design invariants.
 - [CLI reference](docs/reference-cli.md) — the `rem`, `rem-debug`, and
