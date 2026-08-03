@@ -110,10 +110,11 @@ ascending slot order.
 
 Remanence consumes canonical REMR public-key files and REMP private-key
 files; key-pair provisioning belongs to the custodian/key-registry tooling,
-not this CLI. A registry that already holds a canonical REMP seed can ask
-Remanence to derive its matching REMR record with `rem archive recipient
-derive`; `rem archive recipient inspect` validates a supplied REMR record.
-Neither command generates or prints a private seed. Assuming two custodians supplied `primary.remr` and
+not this CLI. A registry can materialize its persistent raw 32-byte seed as a
+temporary canonical REMP file, then ask Remanence to derive the matching REMR
+record with `rem archive recipient derive`; `rem archive recipient inspect`
+validates a supplied REMR record. Neither command generates or prints a
+private seed. Assuming two custodians supplied `primary.remr` and
 `recovery.remr`, build the encrypted object directly:
 
 ```sh

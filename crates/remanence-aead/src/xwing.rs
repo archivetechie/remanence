@@ -99,6 +99,7 @@ impl XWingPublicKey {
     /// Parse and validate a serialized X-Wing encapsulation key.
     pub fn from_bytes(bytes: [u8; XWING_PUBLIC_KEY_LEN]) -> Result<Self, XWingError> {
         validate_mlkem_public_key(&bytes)?;
+        validate_x25519_public_key(&bytes)?;
         Ok(Self(bytes))
     }
 
@@ -283,6 +284,24 @@ fn validate_mlkem_public_key(public_key: &[u8; XWING_PUBLIC_KEY_LEN]) -> Result<
         Ok(())
     } else {
         Err(XWingError::InvalidPublicKey)
+    }
+}
+
+fn validate_x25519_public_key(public_key: &[u8; XWING_PUBLIC_KEY_LEN]) -> Result<(), XWingError> {
+    let bytes: [u8; X25519_KEY_LEN] = public_key[MLKEM768_PUBLIC_KEY_LEN..]
+        .try_into()
+        .expect("fixed public key");
+    // A fixed nonzero scalar is sufficient to detect every low-order public
+    // input: all such inputs produce the all-zero shared secret for every
+    // clamped X25519 scalar. No secret material is involved in this check.
+    let validation_secret = X25519Secret::from([0x42; X25519_KEY_LEN]);
+    if validation_secret
+        .diffie_hellman(&X25519PublicKey::from(bytes))
+        .was_contributory()
+    {
+        Ok(())
+    } else {
+        Err(XWingError::NonContributoryKeyAgreement)
     }
 }
 
@@ -486,11 +505,8 @@ mod tests {
 
         let mut invalid_public_bytes = public_key.to_bytes();
         invalid_public_bytes[MLKEM768_PUBLIC_KEY_LEN..].fill(0);
-        let invalid_public =
-            XWingPublicKey::from_bytes(invalid_public_bytes).expect("ML-KEM key remains valid");
-        let mut rng = FixedRng::new(decode_kat::<XWING_ENCAPSULATION_RANDOMNESS_LEN>("eseed"));
         assert_eq!(
-            encapsulate(&invalid_public, &mut rng),
+            XWingPublicKey::from_bytes(invalid_public_bytes),
             Err(XWingError::NonContributoryKeyAgreement)
         );
 
