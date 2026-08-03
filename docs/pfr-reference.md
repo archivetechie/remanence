@@ -534,10 +534,19 @@ Those boundaries come from `READ END OF WRAP POSITION` (`A3h/1Fh/45h`,
 long form), which reports the last logical object on every wrap holding
 user data. It is a different command from the Recommended Access Order
 feature above, and is supported from LTO-7 onward including half-height
-drives. rem reads it once per cartridge and caches the result; the map is
-re-derivable from the medium at any time, so caching it costs nothing if
-lost. In practice it is read at the end of a write session, while the
-cartridge is still loaded.
+drives. rem reads it once per load and caches the result.
+
+The timing matters, and it is dictated by the standard rather than
+chosen. The command's return data "is valid at load" and "becomes stale
+on any write operation", and nothing in the standard says re-issuing it
+refreshes anything. The drive takes the snapshot when the cartridge
+loads; a write invalidates it for the remainder of that load. So rem
+harvests **after load and before any write**, and a volume written during
+a load stays uncalibrated until its next load. A restore from a cartridge
+in the same load it was written in therefore gets no ordering benefit.
+
+Losing the cache costs one command at the next load, since the map is
+re-derivable from the medium.
 
 An earlier revision of this section described deriving wrap boundaries
 arithmetically from each generation's published capacity, needing no SCSI
