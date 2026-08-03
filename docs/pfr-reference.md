@@ -549,9 +549,21 @@ design capacity at runtime rather than rely on the nominal number. The
 resulting error is not proportional: wrap parity decides whether a block
 sits near or far along its wrap, so an error large enough to shift the
 wrap index by one places that block at the opposite end of the cartridge.
-Simulation against ascending block order showed ordering to be 67–88%
-better with exact boundaries, no better than ascending at 1% capacity
-error, and *worse than not ordering at all* at 3.3%.
+Simulation against ascending block order showed ordering to be 67–82%
+better with exact boundaries. With approximate boundaries the result
+depends on how the targets are spread, and the difference is large enough
+that an unqualified statement would be wrong: for targets spread across
+the cartridge, and for many targets spread across several distant
+clusters, a 1% capacity error leaves ordering no better than ascending
+and a 3.3% error leaves it *worse than not ordering at all*. For a small
+number of targets concentrated in one region the approximation still
+helps — around 35% better at 1% error — because a small region spans few
+wraps and the parity is rarely wrong within it.
+
+The numbers above come from a model, not from a drive. They compare
+orderings under a cost model built from published figures, so they
+establish sensitivity to geometry error rather than the throughput a
+real restore would see.
 
 Ordering is therefore available on LTO-7 and later. LTO-6 and earlier
 predate the command; for those, rem reports the volume unsupported rather
