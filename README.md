@@ -1,5 +1,5 @@
 <!-- code-anchor: none -->
-# Remanence — Open-Source LTO Tape Archival Software
+# Remanence: Open-Source LTO Tape Archival Software
 
 Self-describing, catalog-rebuildable tape archives with optional 
 encryption, erasure-coded media recovery, and partial-file restore. 
