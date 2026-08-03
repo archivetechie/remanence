@@ -141,7 +141,7 @@ each initialization must pass.
 | `rem tape quarantine release <ID> --ack <TEXT> [--after-settled-inventory]` | Release a fence after operator root-cause acknowledgement. |
 | `rem tape retire <TARGET> --reason <TEXT> --i-understand-copies-become-unreadable [--dry-run]` | Permanently retire a tape identity in the local catalog. Every copy on that tape becomes unreadable through the catalog. |
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/archive_ingest.rs crates/remanence-cli/src/archive_map.rs crates/remanence-aead/src/wrap.rs @ 96a400d6 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/archive_ingest.rs crates/remanence-cli/src/archive_map.rs crates/remanence-aead/src/wrap.rs @ ac3ff8bf -->
 ## Archive objects (local, no tape)
 
 `rem archive` builds and reads portable REM-OBJECT object files on local disk.

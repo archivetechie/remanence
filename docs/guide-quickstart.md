@@ -96,7 +96,7 @@ never depends on host state.
 
 *Fig. 1 — The local round trip: build a rem-object-v1 object from a directory, read it back, and prove the copies identical — the same bytes a tape write stores as the object body.*
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-aead/src/lib.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/xwing.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-aead/src/lib.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/xwing.rs @ ac3ff8bf -->
 ## The encrypted variant
 
 The encrypted representation wraps the same tar stream in an
