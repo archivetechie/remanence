@@ -51,10 +51,12 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use remanence_aead::{
-    header::object_id_field, inspect_bytes, EnvelopeSealOptions, RecipientPublicKey,
-    RemObjectHeader, SealOptions, REM_OBJECT_HEADER_LEN,
+    header::object_id_field, inspect_bytes, EnvelopeSealOptions, RecipientPrivateKey,
+    RecipientPublicKey, RemObjectHeader, SealOptions, REM_OBJECT_HEADER_LEN,
 };
 use remanence_api::pb;
 use remanence_format::{
@@ -1958,6 +1960,13 @@ enum RemArchiveCommand {
     /// List foreign formats linked into this binary distribution.
     Formats,
 
+    /// Derive or inspect canonical REM-ENCRYPT recipient-key files.
+    Recipient {
+        /// Recipient-key operation to run.
+        #[command(subcommand)]
+        command: ArchiveRecipientCommand,
+    },
+
     /// Re-seal one recipient envelope to a new recipient set.
     Reseal(ArchiveResealArgs),
 
@@ -2435,6 +2444,7 @@ impl RemArchiveCommand {
             }
             Self::Capabilities => ArchiveCommand::Capabilities,
             Self::Formats => ArchiveCommand::Formats,
+            Self::Recipient { command } => ArchiveCommand::Recipient { command },
             Self::Reseal(args) => ArchiveCommand::Reseal(args),
             Self::Build(args) => ArchiveCommand::Build(args.into()),
             Self::Inspect(args) => ArchiveCommand::Inspect(args.into()),
@@ -2629,6 +2639,13 @@ enum ArchiveCommand {
     /// List foreign formats linked into this binary distribution.
     Formats,
 
+    /// Derive or inspect canonical REM-ENCRYPT recipient-key files.
+    Recipient {
+        /// Recipient-key operation to run.
+        #[command(subcommand)]
+        command: ArchiveRecipientCommand,
+    },
+
     /// Fully re-seal one recipient envelope to a new recipient set.
     Reseal(ArchiveResealArgs),
 
@@ -2676,6 +2693,33 @@ enum ArchiveCommand {
 
     /// List native objects from the local catalog (no tape access).
     List(ArchiveListArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum ArchiveRecipientCommand {
+    /// Derive a canonical REMR public file from a canonical REMP private file.
+    Derive(ArchiveRecipientDeriveArgs),
+
+    /// Parse and validate a canonical REMR public file.
+    Inspect(ArchiveRecipientInspectArgs),
+}
+
+#[derive(Args, Debug)]
+struct ArchiveRecipientDeriveArgs {
+    /// Canonical REMP private-key file containing the X-Wing seed.
+    #[arg(long, value_name = "REMP")]
+    private_key: PathBuf,
+
+    /// Recipient slot index to encode in the derived REMR file.
+    #[arg(long, value_name = "0..255")]
+    slot_index: u8,
+}
+
+#[derive(Args, Debug)]
+struct ArchiveRecipientInspectArgs {
+    /// Canonical REMR public-key file to parse and validate.
+    #[arg(long, value_name = "REMR")]
+    public_key: PathBuf,
 }
 
 /// Arguments for `rem archive reseal`.
@@ -3139,6 +3183,7 @@ impl ArchiveCommand {
         match self {
             Self::Capabilities
             | Self::Formats
+            | Self::Recipient { .. }
             | Self::Reseal(_)
             | Self::Build(_)
             | Self::Inspect(_)
@@ -3162,6 +3207,7 @@ impl ArchiveCommand {
             Self::Build(_)
             | Self::Capabilities
             | Self::Formats
+            | Self::Recipient { .. }
             | Self::Reseal(_)
             | Self::Inspect(_)
             | Self::Extract(_)
@@ -3187,6 +3233,9 @@ impl ArchiveCommand {
             Self::Build(_) => panic!("ArchiveCommand::Build has no dump/tape source"),
             Self::Capabilities => panic!("ArchiveCommand::Capabilities has no dump/tape source"),
             Self::Formats => panic!("ArchiveCommand::Formats has no dump/tape source"),
+            Self::Recipient { .. } => {
+                panic!("ArchiveCommand::Recipient has no dump/tape source")
+            }
             Self::Reseal(_) => panic!("ArchiveCommand::Reseal has no dump/tape source"),
             Self::Inspect(_) => panic!("ArchiveCommand::Inspect has no dump/tape source"),
             Self::Extract(_) => panic!("ArchiveCommand::Extract has no dump/tape source"),
@@ -3214,6 +3263,7 @@ impl ArchiveCommand {
             Self::Build(_) => panic!("ArchiveCommand::Build has no format"),
             Self::Capabilities => panic!("ArchiveCommand::Capabilities has no format"),
             Self::Formats => panic!("ArchiveCommand::Formats has no format"),
+            Self::Recipient { .. } => panic!("ArchiveCommand::Recipient has no format"),
             Self::Reseal(_) => panic!("ArchiveCommand::Reseal has no format"),
             Self::Inspect(_) => panic!("ArchiveCommand::Inspect has no format"),
             Self::Extract(_) => panic!("ArchiveCommand::Extract has no format"),
@@ -3648,6 +3698,9 @@ where
         if matches!(command, ArchiveCommand::Formats) {
             return run_archive_formats(registry, out, err);
         }
+        if let ArchiveCommand::Recipient { command } = command {
+            return run_archive_recipient(command, out, err);
+        }
         if let ArchiveCommand::Reseal(args) = command {
             return run_archive_reseal(args, out, err);
         }
@@ -4049,6 +4102,75 @@ fn run_archive_formats(
             ExitCode::from(1)
         }
     }
+}
+
+fn run_archive_recipient(
+    command: &ArchiveRecipientCommand,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let result = match command {
+        ArchiveRecipientCommand::Derive(args) => derive_recipient_report(args),
+        ArchiveRecipientCommand::Inspect(args) => inspect_recipient_report(args),
+    };
+    let report = match result {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = writeln!(err, "error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match serde_json::to_writer(&mut *out, &report)
+        .and_then(|()| writeln!(out).map_err(serde_json::Error::io))
+    {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            let _ = writeln!(err, "error: write recipient-key report: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn derive_recipient_report(args: &ArchiveRecipientDeriveArgs) -> Result<Value, String> {
+    let mut private_bytes = fs::read(&args.private_key).map_err(|error| {
+        format!(
+            "read recipient private-key file {}: {error}",
+            args.private_key.display()
+        )
+    })?;
+    let private_result = RecipientPrivateKey::parse(&private_bytes)
+        .map_err(|error| format!("parse recipient private-key file: {error}"));
+    private_bytes.zeroize();
+    let private = private_result?;
+    let public = private
+        .public_key(args.slot_index)
+        .map_err(|error| format!("derive recipient public key: {error}"))?;
+    let canonical = public
+        .serialize()
+        .map_err(|error| format!("serialize recipient public-key file: {error}"))?;
+    Ok(json!({
+        "canonical_public_key_base64": BASE64_STANDARD.encode(canonical),
+        "epoch_label": public.epoch_label,
+        "recipient_epoch_id": bytes_to_hex(&public.recipient_epoch_id),
+        "slot_index": public.slot_index,
+    }))
+}
+
+fn inspect_recipient_report(args: &ArchiveRecipientInspectArgs) -> Result<Value, String> {
+    let bytes = fs::read(&args.public_key).map_err(|error| {
+        format!(
+            "read recipient public-key file {}: {error}",
+            args.public_key.display()
+        )
+    })?;
+    let public = RecipientPublicKey::parse(&bytes)
+        .map_err(|error| format!("parse recipient public-key file: {error}"))?;
+    Ok(json!({
+        "epoch_label": public.epoch_label,
+        "public_key_bytes": public.public_key.len(),
+        "recipient_epoch_id": bytes_to_hex(&public.recipient_epoch_id),
+        "slot_index": public.slot_index,
+    }))
 }
 
 fn run_archive_reseal(
@@ -10458,6 +10580,9 @@ fn run_archive_dump_command(
         ArchiveCommand::Formats => {
             unreachable!("archive formats dispatched before the dump handler")
         }
+        ArchiveCommand::Recipient { .. } => {
+            unreachable!("archive recipient dispatched before the dump handler")
+        }
         ArchiveCommand::Reseal(_) => {
             unreachable!("archive reseal dispatched before the dump handler")
         }
@@ -13231,6 +13356,9 @@ fn run_archive_tape_with_drive(
         ArchiveCommand::Formats => {
             unreachable!("archive formats dispatched before the tape archive handler")
         }
+        ArchiveCommand::Recipient { .. } => {
+            unreachable!("archive recipient dispatched before the tape archive handler")
+        }
         ArchiveCommand::Reseal(_) => {
             unreachable!("archive reseal dispatched before the tape archive handler")
         }
@@ -14979,6 +15107,129 @@ mod tests {
                 "ranged-ciphertext-extract"
             ])
         );
+    }
+
+    #[test]
+    fn archive_recipient_derives_and_inspects_canonical_xwing_public_key() {
+        let root = tempfile::tempdir().unwrap();
+        let private = RecipientPrivateKey::new([0x41; 16], "archive", [0x51; 32]).unwrap();
+        let private_path = root.path().join("archive.remp");
+        fs::write(&private_path, private.serialize()).unwrap();
+
+        let cli = Cli::try_parse_from([
+            "rem",
+            "archive",
+            "recipient",
+            "derive",
+            "--private-key",
+            private_path.to_str().unwrap(),
+            "--slot-index",
+            "0",
+        ])
+        .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(
+            cli,
+            || panic!("recipient derivation must not perform hardware discovery"),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(err.is_empty());
+        let report: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(report["recipient_epoch_id"], "41".repeat(16));
+        assert_eq!(report["epoch_label"], "archive");
+        assert_eq!(report["slot_index"], 0);
+        let public_bytes = BASE64_STANDARD
+            .decode(report["canonical_public_key_base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            public_bytes,
+            private.public_key(0).unwrap().serialize().unwrap()
+        );
+
+        let public_path = root.path().join("archive.remr");
+        fs::write(&public_path, public_bytes).unwrap();
+        let debug_cli = DebugCli::try_parse_from([
+            "rem-debug",
+            "archive",
+            "recipient",
+            "inspect",
+            "--public-key",
+            public_path.to_str().unwrap(),
+        ])
+        .unwrap();
+        out.clear();
+        let code = run_debug(
+            debug_cli,
+            || panic!("recipient inspection must not perform hardware discovery"),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(err.is_empty());
+        let report: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(report["recipient_epoch_id"], "41".repeat(16));
+        assert_eq!(report["epoch_label"], "archive");
+        assert_eq!(report["slot_index"], 0);
+        assert_eq!(report["public_key_bytes"], 1216);
+    }
+
+    #[test]
+    fn archive_recipient_rejects_legacy_and_malformed_key_files() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy_private = root.path().join("legacy.raop");
+        fs::write(&legacy_private, b"RAOP legacy X25519 material").unwrap();
+        let cli = Cli::try_parse_from([
+            "rem",
+            "archive",
+            "recipient",
+            "derive",
+            "--private-key",
+            legacy_private.to_str().unwrap(),
+            "--slot-index",
+            "0",
+        ])
+        .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(
+            cli,
+            || panic!("recipient rejection must not perform hardware discovery"),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, ExitCode::from(1));
+        assert!(out.is_empty());
+        let error = String::from_utf8(err).unwrap();
+        assert!(error.contains("invalid REM-OBJECT recipient private-key file"));
+        assert!(!error.contains("legacy X25519 material"));
+
+        let malformed_public = root.path().join("malformed.remr");
+        fs::write(&malformed_public, b"REMR").unwrap();
+        let cli = Cli::try_parse_from([
+            "rem",
+            "archive",
+            "recipient",
+            "inspect",
+            "--public-key",
+            malformed_public.to_str().unwrap(),
+        ])
+        .unwrap();
+        out.clear();
+        let mut err = Vec::new();
+        let code = run(
+            cli,
+            || panic!("recipient rejection must not perform hardware discovery"),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, ExitCode::from(1));
+        assert!(out.is_empty());
+        assert!(String::from_utf8(err)
+            .unwrap()
+            .contains("invalid REM-OBJECT recipient public-key file"));
     }
 
     #[test]
