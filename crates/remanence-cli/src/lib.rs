@@ -15230,6 +15230,35 @@ mod tests {
         assert!(String::from_utf8(err)
             .unwrap()
             .contains("invalid REM-OBJECT recipient public-key file"));
+
+        let private = RecipientPrivateKey::new([0x41; 16], "archive", [0x51; 32]).unwrap();
+        let mut unusable_public = private.public_key(0).unwrap().serialize().unwrap();
+        let x25519_offset = unusable_public.len() - 32;
+        unusable_public[x25519_offset..].fill(0);
+        let unusable_public_path = root.path().join("non-contributory.remr");
+        fs::write(&unusable_public_path, unusable_public).unwrap();
+        let cli = Cli::try_parse_from([
+            "rem",
+            "archive",
+            "recipient",
+            "inspect",
+            "--public-key",
+            unusable_public_path.to_str().unwrap(),
+        ])
+        .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(
+            cli,
+            || panic!("recipient rejection must not perform hardware discovery"),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, ExitCode::from(1));
+        assert!(out.is_empty());
+        assert!(String::from_utf8(err)
+            .unwrap()
+            .contains("parse recipient public-key file"));
     }
 
     #[test]
