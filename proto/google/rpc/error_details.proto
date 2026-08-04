@@ -1,0 +1,30 @@
+// Vendored subset of googleapis' google/rpc/error_details.proto, unchanged
+// in package, message, field names and numbers
+// (https://github.com/googleapis/googleapis/blob/master/google/rpc/error_details.proto).
+//
+// Only `BadRequest` is declared: it is the one detail type the Remanence
+// API emits (PlanBatchRead names malformed-request offenders by target
+// index through it, per design-read-ordering.md §9). Omitting the sibling
+// detail messages and the later-added FieldViolation reason/localization
+// fields is wire-compatible with the canonical definition.
+
+syntax = "proto3";
+
+package google.rpc;
+
+// Describes violations in a client request. This error type focuses on the
+// syntactic aspects of the request.
+message BadRequest {
+  // A message type used to describe a single bad request field.
+  message FieldViolation {
+    // A path that leads to a field in the request body, e.g.
+    // "targets[3].end_block".
+    string field = 1;
+
+    // A description of why the request element is bad.
+    string description = 2;
+  }
+
+  // Describes all violations in a client request.
+  repeated FieldViolation field_violations = 1;
+}
