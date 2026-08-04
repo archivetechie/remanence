@@ -9061,6 +9061,66 @@ BCw3Wyv2UWY=
     }
 
     #[test]
+    fn fresh_tape_first_object_span_excludes_bootstrap_prefix_and_trailing_filemark() {
+        // The panel's named fixture, no-parity flavor: the fresh-tape
+        // bootstrap prefix (bootstrap block at LBA 0 + its filemark at 1)
+        // precedes the first object's start and is excluded at capture, so
+        // the object's span is [2, 2 + block_count) — exclusive — with the
+        // trailing filemark at 2 + block_count outside the span.
+        let mut index = test_index();
+        project_pool(&mut index, "scenario-a");
+        project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
+        let source_dir = temp_dir("remanence-api-fresh-span-src");
+        let source_path = source_dir.join("payload.bin");
+        std::fs::write(&source_path, b"fresh tape span payload").expect("write source payload");
+        let mut tape_sink = VecBlockSink::new();
+        let cfg = pool_config("scenario-a");
+
+        let result = write_object_to_pool(
+            &mut index,
+            &mut tape_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source: crate::WriteObjectSource::Path(source_path),
+                archive_path: "payload.bin".into(),
+                caller_object_id: "caller-fresh-span".to_string(),
+                expected_content_sha256: None,
+                representation: PoolWriteRepresentation::Plaintext,
+            },
+        )
+        .expect("write no-parity object");
+
+        let report = result.expect_write_report();
+        let entries = &report.catalog.tape_file_bundle.entries;
+        assert_eq!(entries.len(), 2, "fresh tape: bootstrap prefix + object");
+        let bootstrap = &entries[0];
+        assert_eq!(bootstrap.kind, remanence_parity::TapeFileKind::Bootstrap);
+        assert_eq!(
+            bootstrap.physical_start_hint,
+            Some(0),
+            "the fresh-tape bootstrap prefix starts at BOT — Some(0), a valid position, not absent"
+        );
+        let object = &entries[1];
+        assert_eq!(object.kind, remanence_parity::TapeFileKind::Object);
+        assert_eq!(
+            object.physical_start_hint,
+            Some(2),
+            "the first object's start sits after the bootstrap prefix, never at 0"
+        );
+        assert_eq!(object.block_count, report.layout.projected_size_blocks);
+        // Exclusive span: the trailing filemark at start + block_count is
+        // outside it, so the position after that filemark is one more.
+        let span_end_exclusive = object.physical_start_hint.expect("captured") + object.block_count;
+        assert_eq!(
+            report.object_close.filemark_outcome.position_after.lba,
+            span_end_exclusive + 1,
+            "start + block_count addresses the trailing filemark, outside the span"
+        );
+        assert_eq!(report.object_close.physical_start_lba, Some(2));
+    }
+
+    #[test]
     fn no_parity_stored_images_cross_read_between_serial_and_batched_paths() {
         let source_dir = temp_dir("remanence-api-cross-version-src");
         let source_path = source_dir.join("payload.bin");
