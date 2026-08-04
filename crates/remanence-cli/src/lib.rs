@@ -87,6 +87,7 @@ use zeroize::Zeroize;
 mod archive_ingest;
 mod archive_map;
 mod freeze_drill;
+mod get;
 mod pool_ops;
 mod put;
 mod recovery_report;
@@ -213,6 +214,7 @@ fn rem_debug_only_reason(cmd: &Command) -> Option<&'static str> {
         Command::Libraries { .. }
         | Command::Library { .. }
         | Command::PutClient(_)
+        | Command::GetClient(_)
         | Command::Watch { .. }
         | Command::RebuildCatalogFromJournals { .. }
         | Command::Catalog { .. }
@@ -239,6 +241,7 @@ fn rem_only_reason(cmd: &Command) -> Option<&'static str> {
         | Command::DriveClient { .. }
         | Command::AlarmsClient { .. }
         | Command::PutClient(_)
+        | Command::GetClient(_)
         | Command::Top { .. }
         | Command::TapeAlertsAlias { .. }
         | Command::ArchiveVerifyClient { .. } => Some("daemon client commands"),
@@ -519,6 +522,9 @@ enum RemCommand {
     /// Archive local files onto tape through the daemon write path.
     Put(put::PutArgs),
 
+    /// Restore an object from tape through the daemon read path.
+    Get(get::GetArgs),
+
     /// Probe, catalog, or restore a dump archive through a format driver.
     Archive {
         /// Archive operation to run.
@@ -639,6 +645,7 @@ impl From<RemCommand> for Command {
                 },
             },
             RemCommand::Put(args) => Self::PutClient(args),
+            RemCommand::Get(args) => Self::GetClient(args),
             RemCommand::Archive { command } => command.into_command(),
             RemCommand::Restore(args) => Self::Archive {
                 command: Box::new(ArchiveCommand::Extract(args.into())),
@@ -672,6 +679,7 @@ fn state_changing_target(cmd: &Command) -> Option<&str> {
         Command::Libraries { .. }
         | Command::Library { .. }
         | Command::PutClient(_)
+        | Command::GetClient(_)
         | Command::Watch { .. }
         | Command::RebuildCatalogFromJournals { .. }
         | Command::Catalog { .. }
@@ -1125,6 +1133,10 @@ enum Command {
     /// Archive local files onto tape through the daemon write path.
     #[command(name = "put-client", hide = true)]
     PutClient(put::PutArgs),
+
+    /// Restore an object from tape through the daemon read path.
+    #[command(name = "get-client", hide = true)]
+    GetClient(get::GetArgs),
 
     /// Probe, catalog, or restore an archive through a format driver.
     Archive {
@@ -3547,6 +3559,7 @@ where
 
     match &cli.command {
         Command::PutClient(args) => return put::run_put_command(args, out, err),
+        Command::GetClient(args) => return get::run_get_command(args, out, err),
         Command::DaemonClient {
             endpoint,
             json,
@@ -3773,6 +3786,7 @@ where
     let allow_derived = cli.allow_derived.clone();
     match cli.command {
         Command::PutClient(_) => unreachable!("daemon put dispatched pre-discovery"),
+        Command::GetClient(_) => unreachable!("daemon get dispatched pre-discovery"),
         Command::Libraries { json } => {
             if json {
                 print_libraries_json(&report, out);
