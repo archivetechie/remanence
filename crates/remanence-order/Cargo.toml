@@ -1,0 +1,19 @@
+[package]
+name        = "remanence-order"
+description = "Pure batch read-ordering planner for serpentine tape: structural geometry, REOWP wrap-map interpretation, positioning cost model, and a deterministic solver."
+version     .workspace = true
+edition     .workspace = true
+rust-version.workspace = true
+authors     .workspace = true
+license = "Apache-2.0"
+repository  .workspace = true
+
+# Deliberately empty. This crate is pure: no I/O, no async, no SCSI, no
+# database, and no dependency on remanence-library, remanence-state or
+# remanence-scsi. If a change here seems to need one of those, the change
+# is wrong — see design-read-ordering.md §4.3 and prompt P1.
+[dependencies]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
