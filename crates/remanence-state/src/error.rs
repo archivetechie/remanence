@@ -83,6 +83,10 @@ pub enum StateError {
     /// Startup lacks permission to create or protect state files.
     #[error("permission denied: {0}")]
     PermissionDenied(String),
+    /// The durable calibration-control journal is corrupt, or one of
+    /// its fail-closed allocators is exhausted.
+    #[error("calibration control: {0}")]
+    CalibrationControlCorrupt(String),
 }
 
 struct IoPathSuffix<'a>(Option<&'a Path>);

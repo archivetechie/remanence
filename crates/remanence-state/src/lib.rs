@@ -7,6 +7,7 @@
 
 pub mod adapters;
 pub mod audit;
+pub mod calibration;
 pub mod checkpoint;
 pub mod config;
 pub mod error;
@@ -25,6 +26,10 @@ pub use adapters::{
 pub use audit::{
     AuditActor, AuditEvent, AuditEventRecord, AuditReceipt, AuditRecord, AuditSink, AuditSubject,
     FileAuditLog, SourceLayer,
+};
+pub use calibration::{
+    CalibrationControlStore, HarvestRefusal, HarvestTransition, VolumeCalibrationRow,
+    VolumeCalibrationState, VolumeMediaWriteFence, WritePathTrust, CALIBRATION_CONTROL_FILENAME,
 };
 pub use checkpoint::{
     list_checkpoint_journals, tape_uuid_from_checkpoint_path,
@@ -53,10 +58,11 @@ pub use index::{
     NativeObjectFileProjectionInput, NativeObjectFileRecord, NativeObjectProjectionInput,
     NativeObjectRecord, OperationRecord, ProvisionTapeInput, RebuildReport,
     RebuildTapeJournalInput, RestartOperation, RestartSession, RetireDriveOutcome, RetireTapeInput,
-    RetireTapeOutcome, TapeFileRecord, TapeIoFenceInput, TapeIoFenceRecord, TapeJournalIndexInput,
-    TapeJournalIndexReport, TapeKindFilter, TapePoolProjectionInput, TapePoolRecord, TapeRecord,
-    DIGEST_ALGORITHM_SHA256, OBJECT_COPY_REPRESENTATION_ENCRYPTED,
-    OBJECT_COPY_REPRESENTATION_PLAINTEXT, OBJECT_COPY_REPRESENTATION_UNKNOWN, SCHEMA_VERSION,
+    RetireTapeOutcome, StoredWrapDescriptor, TapeFileRecord, TapeIoFenceInput, TapeIoFenceRecord,
+    TapeJournalIndexInput, TapeJournalIndexReport, TapeKindFilter, TapePoolProjectionInput,
+    TapePoolRecord, TapeRecord, WrapMapCacheRecord, DIGEST_ALGORITHM_SHA256,
+    OBJECT_COPY_REPRESENTATION_ENCRYPTED, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+    OBJECT_COPY_REPRESENTATION_UNKNOWN, SCHEMA_VERSION,
 };
 pub use lock::StateLockGuard;
 pub use paths::StatePaths;
