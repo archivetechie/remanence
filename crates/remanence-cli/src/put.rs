@@ -479,7 +479,7 @@ fn walk_dir(
 /// and `.` components drop, `..` is refused outright — a member path that
 /// escapes its root is exactly the restore-time surprise this tool exists to
 /// prevent.
-fn archive_path_for(path: &Path, stripped_absolute: &mut bool) -> Result<String, String> {
+pub(crate) fn archive_path_for(path: &Path, stripped_absolute: &mut bool) -> Result<String, String> {
     use std::path::Component;
     let mut parts = Vec::new();
     for component in path.components() {

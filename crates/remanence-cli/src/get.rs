@@ -2,15 +2,21 @@
 //!
 //! The operator counterpart of `rem put`: it locates the object in the
 //! daemon's catalog, opens a read session pinned to the copy's tape (the
-//! daemon mounts it if needed), streams the stored bytes to a local spool
-//! file, proves the spooled bytes against the catalog digest, and then
-//! restores members through exactly the extraction machinery `rem restore`
-//! uses on local object files. There is deliberately no second extraction
-//! path: `get` fetches, and the one existing restore funnel interprets.
+//! daemon mounts it if needed), and restores the object's members through
+//! the daemon's member-level read API — the daemon resolves the object
+//! format server-side and streams each member's payload bytes, so there is
+//! no client-side format interpretation and no second extraction path.
 //!
-//! The spool is the recovery point: if extraction fails (wrong key, bad
-//! member path), the verified spool file is kept and named, so the fix
-//! costs a re-run of extraction, never a re-read of tape.
+//! Every member is proven before it is published: bytes stream to a
+//! temporary file, are hashed as they land, and only rename into place when
+//! the hash matches the catalog's per-file sha256. A mismatch keeps the
+//! temporary file for forensics and refuses — the two honest explanations
+//! (a damaged/suspect copy, or an encrypted-at-rest object whose ciphertext
+//! this command does not decrypt) are both named.
+//!
+//! Member paths come from the catalog and are sanitized with the same rules
+//! `rem put` applies on the way in: `..` refuses, absolute prefixes strip.
+//! A restore must never write outside `--dest`, whatever the catalog says.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -25,17 +31,13 @@ use uuid::Uuid;
 
 use remanence_api::pb;
 
-use crate::put::{format_bytes, format_uuid, hex, wait_before_open_retry};
+use crate::put::{archive_path_for, format_bytes, format_uuid, hex, wait_before_open_retry};
 use crate::{
-    connect_daemon, daemon_runtime, extract_archive_object_file, finish_daemon_client_result,
-    parse_archive_byte_range, status_error, ArchiveByteRange, ArchiveExtractArgs,
-    DaemonClientError, DEFAULT_DAEMON_ENDPOINT,
+    connect_daemon, daemon_runtime, finish_daemon_client_result, status_error, DaemonClientError,
+    DEFAULT_DAEMON_ENDPOINT,
 };
 
 const DEFAULT_GET_STREAM_CHUNK_BYTES: u32 = 1_048_576;
-// Fallback object block/chunk grid when the catalog cannot say (mirrors
-// `rem restore`'s default). The real grid is derived from the copy's tape.
-const FALLBACK_EXTRACT_CHUNK_SIZE: usize = 256 * 1024;
 
 /// Arguments for `rem get`.
 #[derive(Args, Debug)]
@@ -63,46 +65,13 @@ pub(crate) struct GetArgs {
     #[arg(long, value_name = "UUID")]
     tape: Option<String>,
 
-    /// Canonical REMP private-key file. Required for encrypted objects.
-    #[arg(long, value_name = "PATH")]
-    private_key: Option<PathBuf>,
-
-    /// Archive member path for byte-range extraction (forwarded to the
-    /// restore funnel).
+    /// Restore only the member with this archive path.
     #[arg(long = "path", value_name = "REM_OBJECT_PATH")]
     member_path: Option<String>,
-
-    /// Member byte range to extract, formatted as start:length.
-    #[arg(long, value_name = "START:LEN", value_parser = parse_archive_byte_range)]
-    range: Option<ArchiveByteRange>,
-
-    /// First object-local BodyLba for --path, from the receipt or catalog.
-    #[arg(long = "first-chunk-lba", value_name = "LBA")]
-    first_chunk_lba: Option<u64>,
-
-    /// Full member size for --path, from the receipt or catalog.
-    #[arg(long = "file-size-bytes", value_name = "BYTES")]
-    file_size_bytes: Option<u64>,
 
     /// Replace existing destination files.
     #[arg(long)]
     overwrite: bool,
-
-    /// Keep `.remwrap.tar` and `.remwrap.idx` entries literal instead of
-    /// unwrapping.
-    #[arg(long)]
-    no_unwrap: bool,
-
-    /// Object block/chunk grid for extraction. Default: the block size the
-    /// catalog records for the copy's tape, which is the grid the daemon
-    /// wrote the object on.
-    #[arg(long, value_name = "BYTES")]
-    chunk_size: Option<usize>,
-
-    /// Directory for the tape-read spool file (default: `.rem-get-spool`
-    /// under --dest).
-    #[arg(long, value_name = "DIR")]
-    spool_dir: Option<PathBuf>,
 
     /// Suggested read-stream chunk size in bytes.
     #[arg(long, default_value_t = DEFAULT_GET_STREAM_CHUNK_BYTES, value_name = "BYTES")]
@@ -131,6 +100,13 @@ pub(crate) fn run_get_command(
     finish_daemon_client_result(result, args.json, err)
 }
 
+struct RestoredMember {
+    archive_path: String,
+    dest_path: PathBuf,
+    size_bytes: u64,
+    sha256: String,
+}
+
 async fn get(
     args: &GetArgs,
     out: &mut dyn Write,
@@ -140,7 +116,7 @@ async fn get(
         .await
         .map_err(DaemonClientError::from)?;
 
-    // Locate the object and pick its copy.
+    // Locate the object, its copy, and its member list.
     let mut catalog = pb::catalog_client::CatalogClient::new(channel.clone());
     let key = object_key(args)?;
     let record = catalog
@@ -157,42 +133,36 @@ async fn get(
         .into_inner();
     let copy = pick_copy(&record, args.tape.as_deref())?;
     let object_uuid = format_uuid(&record.object_id);
-    // The extraction grid is the tape's block size: the daemon wrote the
-    // object gridded on it, and extraction addressed on any other grid fails.
-    let chunk_size = match args.chunk_size {
-        Some(chunk_size) => chunk_size,
-        None => match catalog
-            .get_tape(pb::GetTapeRequest {
-                tape_uuid: copy.tape_uuid.clone(),
-            })
-            .await
-        {
-            Ok(response) => match usize::try_from(response.into_inner().block_size_bytes) {
-                Ok(block_size) if block_size > 0 => block_size,
-                _ => FALLBACK_EXTRACT_CHUNK_SIZE,
-            },
-            Err(status) => {
-                let _ = writeln!(
-                    err,
-                    "warning: could not read the tape's block size ({}); \
-                     assuming {FALLBACK_EXTRACT_CHUNK_SIZE} — pass --chunk-size \
-                     if extraction fails",
-                    status.message(),
-                );
-                FALLBACK_EXTRACT_CHUNK_SIZE
-            }
-        },
-    };
+    let files = catalog
+        .list_files_in_object(pb::ListFilesInObjectRequest {
+            object_id: record.object_id.clone(),
+            page_token: None,
+            page_size: 0,
+        })
+        .await
+        .map_err(status_error)?
+        .into_inner()
+        .files;
+    if files.is_empty() {
+        return Err(DaemonClientError::client(format!(
+            "object {object_uuid} has no cataloged members to restore",
+        )));
+    }
+    let files = filter_members(files, args.member_path.as_deref())?;
+
+    let total_bytes: u64 = files.iter().map(|file| file.size_bytes).sum();
     let _ = writeln!(
         err,
-        "reading object {} ({}) from tape {} file {}",
+        "restoring {} member{} ({}) of object {} from tape {} file {}",
+        files.len(),
+        if files.len() == 1 { "" } else { "s" },
+        format_bytes(total_bytes),
         object_uuid,
-        format_bytes(record.logical_size_bytes),
         format_uuid(&copy.tape_uuid),
         copy.tape_file_number,
     );
 
-    // Open the read session pinned to that copy's tape; the daemon mounts it
+    // Open the read session pinned to the copy's tape; the daemon mounts it
     // if needed, and a media-readiness fence is watched to completion.
     let mut read_client =
         pb::read_session_service_client::ReadSessionServiceClient::new(channel.clone());
@@ -223,26 +193,18 @@ async fn get(
         Err(status) => return Err(status_error(status)),
     };
 
-    // Stream the stored bytes to the spool, hashing as they land.
-    let spool_dir = args
-        .spool_dir
-        .clone()
-        .unwrap_or_else(|| args.dest.join(".rem-get-spool"));
-    std::fs::create_dir_all(&spool_dir).map_err(|error| {
-        DaemonClientError::client(format!("create {}: {error}", spool_dir.display()))
-    })?;
-    let spool_path = spool_dir.join(format!("get-{object_uuid}.rem"));
-    let read_started = Instant::now();
-    let read_result = stream_object_to_spool(
+    // Restore members one by one; always attempt to close the session
+    // afterwards. A close failure after good reads costs nothing (the daemon
+    // reaps the session), so it warns instead of failing the restore.
+    let restore_result = restore_members(
         &mut read_client,
         &session.session_id,
-        &record.object_id,
-        args.stream_chunk_bytes,
-        &spool_path,
+        &record,
+        &files,
+        args,
+        err,
     )
     .await;
-    // Always try to close; a close failure after a good read costs the
-    // operator nothing (the daemon reaps the session), so it warns.
     if let Err(status) = read_client
         .close_read_session(pb::CloseReadSessionRequest {
             session_id: session.session_id.clone(),
@@ -256,70 +218,7 @@ async fn get(
             status.message(),
         );
     }
-    let (body_bytes, body_sha256) = read_result?;
-    let elapsed = read_started.elapsed().as_secs_f64();
-    let rate = if elapsed > 0.0 {
-        body_bytes as f64 / elapsed / (1024.0 * 1024.0)
-    } else {
-        0.0
-    };
-    let _ = writeln!(
-        err,
-        "read {} off tape at {:.0} MiB/s",
-        format_bytes(body_bytes),
-        rate,
-    );
-
-    // Prove the spooled bytes before interpreting them. The stored digest is
-    // the on-tape representation's hash (what we just streamed); the content
-    // digest covers the same bytes for plaintext objects.
-    let verification = verify_body_digest(&record, copy, &body_sha256);
-    if let DigestVerification::Mismatch { expected, source } = &verification {
-        return Err(DaemonClientError::client(format!(
-            "object {object_uuid} read from tape {} hashed {body_sha256}, but the \
-             catalog {source} says {expected}; the spool is kept at {} — do not \
-             trust it, and treat the copy as suspect (re-read or scrub)",
-            format_uuid(&copy.tape_uuid),
-            spool_path.display(),
-        )));
-    }
-    if matches!(verification, DigestVerification::Unavailable) {
-        let _ = writeln!(
-            err,
-            "warning: the catalog carries no digest for this object; the \
-             spooled bytes could not be independently verified",
-        );
-    }
-
-    // Restore through the same funnel `rem restore` uses on local files.
-    let extract_args = ArchiveExtractArgs {
-        object: spool_path.clone(),
-        dest: args.dest.clone(),
-        chunk_size,
-        private_key: args.private_key.clone(),
-        path: args.member_path.clone(),
-        first_chunk_lba: args.first_chunk_lba,
-        file_size_bytes: args.file_size_bytes,
-        range: args.range,
-        overwrite: args.overwrite,
-        xattr_namespaces: Vec::new(),
-        no_unwrap: args.no_unwrap,
-        blob_entry: None,
-        blob_member: None,
-    };
-    let restore_report = match extract_archive_object_file(&extract_args) {
-        Ok(report) => report,
-        Err(error) => {
-            return Err(DaemonClientError::client(format!(
-                "the object was read and verified, but extraction failed: {error}; \
-                 the verified spool is kept at {} — fix the extraction inputs and \
-                 re-run `rem restore --object` on it instead of re-reading tape",
-                spool_path.display(),
-            )));
-        }
-    };
-    let _ = std::fs::remove_file(&spool_path);
-    let _ = std::fs::remove_dir(&spool_dir); // only removes it when empty
+    let restored = restore_result?;
 
     if args.json {
         let receipt = serde_json::json!({
@@ -328,28 +227,202 @@ async fn get(
             "tape_uuid": format_uuid(&copy.tape_uuid),
             "tape_file_number": copy.tape_file_number,
             "pool_id": copy.pool_id,
-            "body_bytes": body_bytes,
-            "body_sha256": body_sha256,
-            "digest_verified": matches!(verification, DigestVerification::Verified),
             "dest": args.dest.display().to_string(),
-            "restore": restore_report,
+            "digest_verified": true,
+            "members": restored.iter().map(|member| {
+                serde_json::json!({
+                    "archive_path": member.archive_path,
+                    "restored_to": member.dest_path.display().to_string(),
+                    "size_bytes": member.size_bytes,
+                    "sha256": member.sha256,
+                })
+            }).collect::<Vec<_>>(),
         });
         writeln!(out, "{receipt}").map_err(|error| DaemonClientError::client(error.to_string()))
     } else {
+        for member in &restored {
+            writeln!(
+                out,
+                "{}  {}  sha256 {}  → {}",
+                member.archive_path,
+                format_bytes(member.size_bytes),
+                &member.sha256[..12],
+                member.dest_path.display(),
+            )
+            .map_err(|error| DaemonClientError::client(error.to_string()))?;
+        }
         writeln!(
             out,
-            "object {} restored into {} ({}{})",
+            "object {} restored into {} ({} member{}, {}, all digests verified)",
             object_uuid,
             args.dest.display(),
-            format_bytes(body_bytes),
-            if matches!(verification, DigestVerification::Verified) {
-                ", digest verified"
-            } else {
-                ", digest UNVERIFIED"
-            },
+            restored.len(),
+            if restored.len() == 1 { "" } else { "s" },
+            format_bytes(total_bytes),
         )
         .map_err(|error| DaemonClientError::client(error.to_string()))
     }
+}
+
+async fn restore_members(
+    client: &mut pb::read_session_service_client::ReadSessionServiceClient<Channel>,
+    session_id: &[u8],
+    record: &pb::ObjectRecord,
+    files: &[pb::FileRecord],
+    args: &GetArgs,
+    err: &mut dyn Write,
+) -> Result<Vec<RestoredMember>, DaemonClientError> {
+    let mut restored = Vec::with_capacity(files.len());
+    for file in files {
+        // Catalog-supplied path: sanitize with put's own rules before it may
+        // touch the filesystem. A restore never writes outside --dest.
+        let mut stripped = false;
+        let safe_path = archive_path_for(std::path::Path::new(&file.path), &mut stripped)
+            .map_err(|error| {
+                DaemonClientError::client(format!(
+                    "refusing member with unsafe archive path: {error}"
+                ))
+            })?;
+        let dest_path = args.dest.join(&safe_path);
+        if dest_path.exists() && !args.overwrite {
+            return Err(DaemonClientError::client(format!(
+                "{} already exists; pass --overwrite to replace it",
+                dest_path.display(),
+            )));
+        }
+        if let Some(parent) = dest_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                DaemonClientError::client(format!("create {}: {error}", parent.display()))
+            })?;
+        }
+
+        let started = Instant::now();
+        let (bytes, actual_sha256, tmp_path) = stream_member(
+            client,
+            session_id,
+            &record.object_id,
+            file,
+            &dest_path,
+            args.stream_chunk_bytes,
+        )
+        .await?;
+
+        let expected = hex(&file.file_sha256);
+        if !expected.is_empty() && expected != actual_sha256 {
+            return Err(DaemonClientError::client(format!(
+                "member {} read from tape hashed {actual_sha256}, but the \
+                 catalog says {expected}; the partial restore is kept at {} — \
+                 either the copy is damaged (treat it as suspect: re-read or \
+                 scrub) or this object is encrypted at rest, whose ciphertext \
+                 this command does not decrypt",
+                file.path,
+                tmp_path.display(),
+            )));
+        }
+        if expected.is_empty() {
+            let _ = writeln!(
+                err,
+                "warning: the catalog has no digest for member {}; restored \
+                 bytes could not be independently verified",
+                file.path,
+            );
+        }
+        std::fs::rename(&tmp_path, &dest_path).map_err(|error| {
+            DaemonClientError::client(format!(
+                "install {} over {}: {error}",
+                tmp_path.display(),
+                dest_path.display(),
+            ))
+        })?;
+        let elapsed = started.elapsed().as_secs_f64();
+        let rate = if elapsed > 0.0 {
+            bytes as f64 / elapsed / (1024.0 * 1024.0)
+        } else {
+            0.0
+        };
+        let _ = writeln!(
+            err,
+            "  {} ({}) verified at {:.0} MiB/s",
+            safe_path,
+            format_bytes(bytes),
+            rate,
+        );
+        restored.push(RestoredMember {
+            archive_path: safe_path,
+            dest_path,
+            size_bytes: bytes,
+            sha256: actual_sha256,
+        });
+    }
+    Ok(restored)
+}
+
+/// Stream one member to `<dest>.rem-get-tmp`, hashing as bytes land. The
+/// caller renames into place only after the digest verifies; on a transport
+/// error the temporary file is removed (nothing was proven about it).
+async fn stream_member(
+    client: &mut pb::read_session_service_client::ReadSessionServiceClient<Channel>,
+    session_id: &[u8],
+    object_id: &[u8],
+    file: &pb::FileRecord,
+    dest_path: &std::path::Path,
+    stream_chunk_bytes: u32,
+) -> Result<(u64, String, PathBuf), DaemonClientError> {
+    let tmp_path = dest_path.with_extension("rem-get-tmp");
+    let mut output = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .await
+        .map_err(|error| {
+            DaemonClientError::client(format!(
+                "create {}: {error} (a leftover from a failed run? inspect, \
+                 then remove it)",
+                tmp_path.display(),
+            ))
+        })?;
+    let mut stream = client
+        .read_file(pb::ReadFileRequest {
+            session_id: session_id.to_vec(),
+            object_id: object_id.to_vec(),
+            file_id: file.file_id.clone(),
+            stream_chunk_bytes,
+        })
+        .await
+        .map_err(status_error)?
+        .into_inner();
+    let mut hasher = Sha256::new();
+    let mut bytes = 0_u64;
+    loop {
+        let chunk = match stream.message().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(status) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(status_error(status));
+            }
+        };
+        if chunk.data.is_empty() {
+            continue;
+        }
+        if let Err(error) = output.write_all(&chunk.data).await {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(DaemonClientError::client(format!(
+                "write {}: {error}",
+                tmp_path.display(),
+            )));
+        }
+        hasher.update(&chunk.data);
+        bytes = bytes.saturating_add(chunk.data.len() as u64);
+    }
+    if let Err(error) = output.flush().await {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(DaemonClientError::client(format!(
+            "flush {}: {error}",
+            tmp_path.display(),
+        )));
+    }
+    Ok((bytes, hex(&hasher.finalize()), tmp_path))
 }
 
 fn selector_name(args: &GetArgs) -> &'static str {
@@ -427,111 +500,27 @@ fn pick_copy<'a>(
     }
 }
 
-async fn stream_object_to_spool(
-    client: &mut pb::read_session_service_client::ReadSessionServiceClient<Channel>,
-    session_id: &[u8],
-    object_id: &[u8],
-    stream_chunk_bytes: u32,
-    spool_path: &std::path::Path,
-) -> Result<(u64, String), DaemonClientError> {
-    let mut spool = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(spool_path)
-        .await
-        .map_err(|error| {
-            DaemonClientError::client(format!(
-                "create spool {}: {error} (a leftover spool from a failed run? \
-                 inspect it, then remove it)",
-                spool_path.display(),
-            ))
-        })?;
-    let mut stream = client
-        .read_object_range(pb::ReadObjectRangeRequest {
-            session_id: session_id.to_vec(),
-            object_id: object_id.to_vec(),
-            file_id: Vec::new(),
-            start_byte: 0,
-            end_byte: 0,
-            stream_chunk_bytes,
-        })
-        .await
-        .map_err(status_error)?
-        .into_inner();
-    let mut hasher = Sha256::new();
-    let mut bytes = 0_u64;
-    loop {
-        let chunk = match stream.message().await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => break,
-            Err(status) => {
-                let _ = std::fs::remove_file(spool_path);
-                return Err(status_error(status));
+fn filter_members(
+    files: Vec<pb::FileRecord>,
+    member_path: Option<&str>,
+) -> Result<Vec<pb::FileRecord>, DaemonClientError> {
+    match member_path {
+        None => Ok(files),
+        Some(wanted) => {
+            let available: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
+            let selected: Vec<pb::FileRecord> = files
+                .into_iter()
+                .filter(|file| file.path == wanted)
+                .collect();
+            if selected.is_empty() {
+                return Err(DaemonClientError::client(format!(
+                    "no member with path {wanted:?}; members are: {}",
+                    available.join(", "),
+                )));
             }
-        };
-        if chunk.data.is_empty() {
-            continue;
-        }
-        if let Err(error) = spool.write_all(&chunk.data).await {
-            let _ = std::fs::remove_file(spool_path);
-            return Err(DaemonClientError::client(format!(
-                "write spool {}: {error}",
-                spool_path.display(),
-            )));
-        }
-        hasher.update(&chunk.data);
-        bytes = bytes.saturating_add(chunk.data.len() as u64);
-    }
-    if let Err(error) = spool.flush().await {
-        let _ = std::fs::remove_file(spool_path);
-        return Err(DaemonClientError::client(format!(
-            "flush spool {}: {error}",
-            spool_path.display(),
-        )));
-    }
-    Ok((bytes, hex(&hasher.finalize())))
-}
-
-enum DigestVerification {
-    Verified,
-    Unavailable,
-    Mismatch {
-        expected: String,
-        source: &'static str,
-    },
-}
-
-/// Compare the streamed bytes against the catalog's claim. The per-copy
-/// stored digest describes exactly the representation on tape, so it wins;
-/// the object content digest covers the same bytes for plaintext objects.
-fn verify_body_digest(
-    record: &pb::ObjectRecord,
-    copy: &pb::ObjectCopy,
-    body_sha256: &str,
-) -> DigestVerification {
-    let candidates = [
-        (
-            "stored digest",
-            copy.stored_digest
-                .as_ref()
-                .filter(|digest| digest.algorithm == "sha256")
-                .map(|digest| hex(&digest.value)),
-        ),
-        (
-            "content digest",
-            (!record.content_sha256.is_empty()).then(|| hex(&record.content_sha256)),
-        ),
-    ];
-    for (source, expected) in candidates {
-        if let Some(expected) = expected {
-            return if expected == body_sha256 {
-                DigestVerification::Verified
-            } else {
-                DigestVerification::Mismatch { expected, source }
-            };
+            Ok(selected)
         }
     }
-    DigestVerification::Unavailable
 }
 
 #[cfg(test)]
@@ -546,33 +535,17 @@ mod tests {
 
     #[test]
     fn object_key_selects_by_uuid_caller_id_and_sha256() {
-        let base = GetArgs {
-            object: Uuid::from_bytes([1; 16]).to_string(),
-            dest: PathBuf::from("/tmp/x"),
-            caller_id: false,
-            sha256: false,
-            tape: None,
-            private_key: None,
-            member_path: None,
-            range: None,
-            first_chunk_lba: None,
-            file_size_bytes: None,
-            overwrite: false,
-            no_unwrap: false,
-            chunk_size: None,
-            spool_dir: None,
-            stream_chunk_bytes: DEFAULT_GET_STREAM_CHUNK_BYTES,
-            no_wait: true,
-            endpoint: String::new(),
-            json: true,
-        };
+        let base = get_args(
+            Uuid::from_bytes([1; 16]).to_string(),
+            PathBuf::from("/tmp/x"),
+            String::new(),
+        );
         assert!(matches!(
             object_key(&base).unwrap(),
             pb::get_object_request::Key::ObjectId(_)
         ));
 
-        let mut caller = GetArgs { ..base };
-        caller.object = "ingest-4711".to_string();
+        let mut caller = get_args("ingest-4711".to_string(), PathBuf::from("/tmp/x"), String::new());
         caller.caller_id = true;
         assert!(matches!(
             object_key(&caller).unwrap(),
@@ -614,28 +587,40 @@ mod tests {
         assert_eq!(pinned.tape_file_number, 8);
         let error = pick_copy(&record, Some(&Uuid::from_bytes([7; 16]).to_string())).unwrap_err();
         assert!(error.message.contains("no copy on tape"), "{}", error.message);
+    }
 
-        let empty = pb::ObjectRecord {
-            object_id: Uuid::from_bytes([9; 16]).as_bytes().to_vec(),
+    #[test]
+    fn filter_members_selects_and_reports_available() {
+        let file = |path: &str| pb::FileRecord {
+            path: path.to_string(),
             ..Default::default()
         };
-        assert!(pick_copy(&empty, None)
-            .unwrap_err()
-            .message
-            .contains("no cataloged copies"));
+        let files = vec![file("a.bin"), file("nested/b.bin")];
+        assert_eq!(filter_members(files.clone(), None).unwrap().len(), 2);
+        let one = filter_members(files.clone(), Some("nested/b.bin")).unwrap();
+        assert_eq!(one.len(), 1);
+        let error = filter_members(files, Some("missing")).unwrap_err();
+        assert!(error.message.contains("a.bin"), "{}", error.message);
     }
 
     // -- fake daemon --------------------------------------------------------
 
+    struct FakeMember {
+        record: pb::FileRecord,
+        payload: Vec<u8>,
+    }
+
     struct FakeObjectStore {
         record: pb::ObjectRecord,
-        body: Vec<u8>,
+        members: Vec<FakeMember>,
     }
 
     struct FakeCatalog(Arc<FakeObjectStore>);
     struct FakeReadSessions(Arc<FakeObjectStore>);
 
     const FAKE_READ_SESSION: [u8; 16] = [4; 16];
+    const OBJECT_ID: [u8; 16] = [8; 16];
+    const TAPE_ID: [u8; 16] = [6; 16];
 
     type ChunkStream =
         Pin<Box<dyn tokio_stream::Stream<Item = Result<pb::BytesChunk, Status>> + Send>>;
@@ -656,6 +641,22 @@ mod tests {
             }
         }
 
+        async fn list_files_in_object(
+            &self,
+            request: Request<pb::ListFilesInObjectRequest>,
+        ) -> Result<Response<pb::ListFilesInObjectResponse>, Status> {
+            assert_eq!(request.into_inner().object_id, self.0.record.object_id);
+            Ok(Response::new(pb::ListFilesInObjectResponse {
+                files: self
+                    .0
+                    .members
+                    .iter()
+                    .map(|member| member.record.clone())
+                    .collect(),
+                next_page_token: None,
+            }))
+        }
+
         async fn list_tapes(
             &self,
             _request: Request<pb::ListTapesRequest>,
@@ -664,17 +665,9 @@ mod tests {
         }
         async fn get_tape(
             &self,
-            request: Request<pb::GetTapeRequest>,
+            _request: Request<pb::GetTapeRequest>,
         ) -> Result<Response<pb::Tape>, Status> {
-            // The extraction grid derives from here: the fake's body is
-            // built on a 4096 grid, so a hardcoded-grid regression fails.
-            assert_eq!(request.into_inner().tape_uuid, [6; 16].to_vec());
-            Ok(Response::new(pb::Tape {
-                tape_uuid: [6; 16].to_vec(),
-                voltag: "GETT01L9".to_string(),
-                block_size_bytes: 4096,
-                ..Default::default()
-            }))
+            Err(Status::unimplemented("not needed"))
         }
         async fn list_tape_files(
             &self,
@@ -712,12 +705,6 @@ mod tests {
             &self,
             _request: Request<pb::ReconcileTapeRequest>,
         ) -> Result<Response<pb::OperationRef>, Status> {
-            Err(Status::unimplemented("not needed"))
-        }
-        async fn list_files_in_object(
-            &self,
-            _request: Request<pb::ListFilesInObjectRequest>,
-        ) -> Result<Response<pb::ListFilesInObjectResponse>, Status> {
             Err(Status::unimplemented("not needed"))
         }
         async fn get_file(
@@ -759,7 +746,7 @@ mod tests {
                     assert!(target.mount_if_needed);
                     assert_eq!(
                         target.tape_uuid,
-                        self.0.record.copies[0].tape_uuid,
+                        TAPE_ID.to_vec(),
                         "read session must pin the copy's tape",
                     );
                 }
@@ -791,15 +778,26 @@ mod tests {
         type ReadObjectRangeStream = ChunkStream;
         async fn read_object_range(
             &self,
-            request: Request<pb::ReadObjectRangeRequest>,
+            _request: Request<pb::ReadObjectRangeRequest>,
         ) -> Result<Response<Self::ReadObjectRangeStream>, Status> {
+            Err(Status::unimplemented("get uses member-level ReadFile"))
+        }
+
+        type ReadFileStream = ChunkStream;
+        async fn read_file(
+            &self,
+            request: Request<pb::ReadFileRequest>,
+        ) -> Result<Response<Self::ReadFileStream>, Status> {
             let request = request.into_inner();
             assert_eq!(request.session_id, FAKE_READ_SESSION.to_vec());
-            assert_eq!(request.object_id, self.0.record.object_id);
-            assert_eq!((request.start_byte, request.end_byte), (0, 0));
-            let chunks: Vec<Result<pb::BytesChunk, Status>> = self
+            let member = self
                 .0
-                .body
+                .members
+                .iter()
+                .find(|member| member.record.file_id == request.file_id)
+                .ok_or_else(|| Status::not_found("no such member"))?;
+            let chunks: Vec<Result<pb::BytesChunk, Status>> = member
+                .payload
                 .chunks(1024)
                 .map(|chunk| {
                     Ok(pb::BytesChunk {
@@ -810,50 +808,39 @@ mod tests {
                 .collect();
             Ok(Response::new(Box::pin(tokio_stream::iter(chunks))))
         }
+    }
 
-        type ReadFileStream = ChunkStream;
-        async fn read_file(
-            &self,
-            _request: Request<pb::ReadFileRequest>,
-        ) -> Result<Response<Self::ReadFileStream>, Status> {
-            Err(Status::unimplemented("not needed"))
+    fn member(path: &str, file_id: [u8; 16], payload: &[u8], truthful: bool) -> FakeMember {
+        let digest: [u8; 32] = Sha256::digest(payload).into();
+        FakeMember {
+            record: pb::FileRecord {
+                object_id: OBJECT_ID.to_vec(),
+                file_id: file_id.to_vec(),
+                path: path.to_string(),
+                size_bytes: payload.len() as u64,
+                file_sha256: if truthful {
+                    digest.to_vec()
+                } else {
+                    vec![0x13; 32]
+                },
+                ..Default::default()
+            },
+            payload: payload.to_vec(),
         }
     }
 
-    /// Build a real plaintext REM-OBJECT body holding one member, so the
-    /// extraction leg runs the genuine restore funnel, not a mock.
-    fn build_body(member_path: &str, payload: &[u8]) -> Vec<u8> {
-        use remanence_format::{RemTarFile, RemTarObjectOptions};
-        let mut opts = RemTarObjectOptions::new(
-            "11111111-2222-3333-4444-555555555555",
-            "get-test-caller",
-            "2026-08-04T00:00:00Z",
-            "66666666-7777-8888-9999-aaaaaaaaaaaa",
-        );
-        opts.chunk_size = 4096;
-        let files = [RemTarFile {
-            path: member_path,
-            file_id: "member-1",
-            data: payload,
-            mtime: Some("0"),
-            executable: Some(false),
-        }];
-        let mut sink = remanence_library::VecBlockSink::new();
-        remanence_format::write_rem_tar_object(&mut sink, &opts, &files)
-            .expect("write test object");
-        sink.blocks.concat()
-    }
-
-    fn store(body: Vec<u8>, content_sha256: Vec<u8>) -> Arc<FakeObjectStore> {
+    fn store(members: Vec<FakeMember>) -> Arc<FakeObjectStore> {
         Arc::new(FakeObjectStore {
             record: pb::ObjectRecord {
-                object_id: Uuid::from_bytes([8; 16]).as_bytes().to_vec(),
+                object_id: OBJECT_ID.to_vec(),
                 caller_object_id: "get-test-caller".to_string(),
-                content_sha256,
-                logical_size_bytes: body.len() as u64,
+                logical_size_bytes: members
+                    .iter()
+                    .map(|member| member.payload.len() as u64)
+                    .sum(),
                 body_format: "rem-object-v1".to_string(),
                 copies: vec![pb::ObjectCopy {
-                    tape_uuid: [6; 16].to_vec(),
+                    tape_uuid: TAPE_ID.to_vec(),
                     tape_file_number: 42,
                     pool_id: "solo".to_string(),
                     ..Default::default()
@@ -861,7 +848,7 @@ mod tests {
                 caller_metadata: HashMap::new(),
                 ..Default::default()
             },
-            body,
+            members,
         })
     }
 
@@ -901,15 +888,8 @@ mod tests {
             caller_id: false,
             sha256: false,
             tape: None,
-            private_key: None,
             member_path: None,
-            range: None,
-            first_chunk_lba: None,
-            file_size_bytes: None,
             overwrite: false,
-            no_unwrap: false,
-            chunk_size: None,
-            spool_dir: None,
             stream_chunk_bytes: 4096,
             no_wait: true,
             endpoint,
@@ -930,43 +910,44 @@ mod tests {
     }
 
     #[test]
-    fn get_restores_a_member_and_verifies_the_digest() {
-        let payload = b"the get roundtrip payload".repeat(64);
-        let body = build_body("photos/pic.bin", &payload);
-        let body_digest: [u8; 32] = Sha256::digest(&body).into();
-        let store = store(body, body_digest.to_vec());
-        let (endpoint, _runtime, _dir) = serve_fake(store.clone());
+    fn get_restores_members_and_verifies_each_digest() {
+        let alpha = b"the get roundtrip payload".repeat(64);
+        let beta = b"nested member payload".repeat(32);
+        let store = store(vec![
+            member("alpha.bin", [1; 16], &alpha, true),
+            member("nested/beta.bin", [2; 16], &beta, true),
+        ]);
+        let (endpoint, _runtime, _dir) = serve_fake(store);
 
         let dest = tempfile::tempdir().unwrap();
         let args = get_args(
-            Uuid::from_bytes([8; 16]).to_string(),
+            Uuid::from_bytes(OBJECT_ID).to_string(),
             dest.path().to_path_buf(),
             endpoint,
         );
         let (result, out, err) = run_get_blocking(&args);
         assert!(result.is_ok(), "{result:?}\nstderr: {err}");
 
-        let restored = dest.path().join("photos/pic.bin");
-        let bytes = std::fs::read(&restored).expect("restored member exists");
-        assert_eq!(bytes, payload, "restored bytes must equal the original");
-
+        assert_eq!(std::fs::read(dest.path().join("alpha.bin")).unwrap(), alpha);
+        assert_eq!(
+            std::fs::read(dest.path().join("nested/beta.bin")).unwrap(),
+            beta
+        );
         let receipt: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(receipt["digest_verified"], true);
+        assert_eq!(receipt["members"].as_array().unwrap().len(), 2);
         assert_eq!(receipt["tape_file_number"], 42);
-        // Spool cleaned up on success.
-        assert!(!dest.path().join(".rem-get-spool").exists());
     }
 
     #[test]
-    fn get_refuses_a_digest_mismatch_and_keeps_the_spool() {
+    fn get_refuses_a_digest_mismatch_and_keeps_the_partial() {
         let payload = b"tampered payload".repeat(32);
-        let body = build_body("data.bin", &payload);
-        let store = store(body, vec![0x13; 32]); // catalog claims a different hash
-        let (endpoint, _runtime, _dir) = serve_fake(store.clone());
+        let store = store(vec![member("data.bin", [1; 16], &payload, false)]);
+        let (endpoint, _runtime, _dir) = serve_fake(store);
 
         let dest = tempfile::tempdir().unwrap();
         let args = get_args(
-            Uuid::from_bytes([8; 16]).to_string(),
+            Uuid::from_bytes(OBJECT_ID).to_string(),
             dest.path().to_path_buf(),
             endpoint,
         );
@@ -978,18 +959,62 @@ mod tests {
             "mismatch must name the expected digest: {}",
             error.message
         );
-        // Nothing restored, spool kept for forensics.
+        assert!(
+            error.message.contains("encrypted at rest"),
+            "mismatch must name the encrypted possibility: {}",
+            error.message
+        );
+        // Not published; the unverified bytes stay in the tmp for forensics.
         assert!(!dest.path().join("data.bin").exists());
-        assert!(dest
-            .path()
-            .join(".rem-get-spool")
-            .join(format!("get-{}.rem", Uuid::from_bytes([8; 16])))
-            .exists());
+        assert!(dest.path().join("data.rem-get-tmp").exists());
+    }
+
+    #[test]
+    fn get_refuses_traversal_member_paths_from_the_catalog() {
+        let payload = b"evil".to_vec();
+        let store = store(vec![member("../escape.bin", [1; 16], &payload, true)]);
+        let (endpoint, _runtime, _dir) = serve_fake(store);
+
+        let parent = tempfile::tempdir().unwrap();
+        let dest = parent.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let args = get_args(
+            Uuid::from_bytes(OBJECT_ID).to_string(),
+            dest.clone(),
+            endpoint,
+        );
+        let (result, _out, _err) = run_get_blocking(&args);
+        let error = result.unwrap_err();
+        assert!(error.message.contains("unsafe archive path"), "{}", error.message);
+        assert!(!parent.path().join("escape.bin").exists());
+    }
+
+    #[test]
+    fn get_filters_members_by_path() {
+        let alpha = b"alpha".repeat(16);
+        let beta = b"beta".repeat(16);
+        let store = store(vec![
+            member("alpha.bin", [1; 16], &alpha, true),
+            member("beta.bin", [2; 16], &beta, true),
+        ]);
+        let (endpoint, _runtime, _dir) = serve_fake(store);
+
+        let dest = tempfile::tempdir().unwrap();
+        let mut args = get_args(
+            Uuid::from_bytes(OBJECT_ID).to_string(),
+            dest.path().to_path_buf(),
+            endpoint,
+        );
+        args.member_path = Some("beta.bin".to_string());
+        let (result, _out, err) = run_get_blocking(&args);
+        assert!(result.is_ok(), "{result:?}\nstderr: {err}");
+        assert!(dest.path().join("beta.bin").exists());
+        assert!(!dest.path().join("alpha.bin").exists());
     }
 
     #[test]
     fn get_reports_not_found_with_the_selector() {
-        let store = store(Vec::new(), Vec::new());
+        let store = store(vec![member("x.bin", [1; 16], b"x", true)]);
         let (endpoint, _runtime, _dir) = serve_fake(store);
         let dest = tempfile::tempdir().unwrap();
         let args = get_args(
