@@ -472,7 +472,7 @@ fn walk_dir(
 /// and `.` components drop, `..` is refused outright — a member path that
 /// escapes its root is exactly the restore-time surprise this tool exists to
 /// prevent.
-fn archive_path_for(path: &Path, stripped_absolute: &mut bool) -> Result<String, String> {
+pub(crate) fn archive_path_for(path: &Path, stripped_absolute: &mut bool) -> Result<String, String> {
     use std::path::Component;
     let mut parts = Vec::new();
     for component in path.components() {
@@ -663,7 +663,7 @@ async fn open_write_session(
 /// names a media-readiness operation means a tape load is in flight — watch it
 /// to completion, then retry once. A busy drive bay gets one short retry.
 /// Anything else is a real error.
-async fn wait_before_open_retry(
+pub(crate) async fn wait_before_open_retry(
     channel: Channel,
     status: &tonic::Status,
     err: &mut dyn Write,
@@ -963,6 +963,7 @@ fn print_receipt(
                     "object_id": format_uuid(&object.object_id),
                     "size_bytes": object.logical_size_bytes,
                     "content_sha256": hex(&object.content_sha256),
+                    "body_format": object.body_format,
                     "copies": object.copies.iter().map(|copy| {
                         serde_json::json!({
                             "tape_uuid": format_uuid(&copy.tape_uuid),
@@ -971,6 +972,11 @@ fn print_receipt(
                             // an unknown label is not a UUID-shaped string.
                             "voltag": voltags.get(&copy.tape_uuid),
                             "tape_file_number": copy.tape_file_number,
+                            // Together with tape_uuid/tape_file_number and the
+                            // object identity above, this makes each copy a
+                            // complete canonical locator: the same fields the
+                            // catalog and the daemon read path key on.
+                            "first_body_lba": copy.first_body_lba,
                             "pool_id": copy.pool_id,
                         })
                     }).collect::<Vec<_>>(),
@@ -1020,17 +1026,17 @@ fn print_receipt(
     }
 }
 
-fn format_uuid(bytes: &[u8]) -> String {
+pub(crate) fn format_uuid(bytes: &[u8]) -> String {
     Uuid::from_slice(bytes)
         .map(|uuid| uuid.to_string())
         .unwrap_or_else(|_| hex(bytes))
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub(crate) fn format_bytes(bytes: u64) -> String {
     const UNITS: [(&str, u64); 4] = [
         ("GiB", 1 << 30),
         ("MiB", 1 << 20),
@@ -1232,6 +1238,7 @@ mod tests {
                 content_sha256: digest.to_vec(),
                 logical_size_bytes: size,
                 caller_metadata,
+                body_format: "rem-object-v1".to_string(),
                 ..Default::default()
             };
             self.0.records.lock().unwrap().push(record.clone());
@@ -1256,6 +1263,7 @@ mod tests {
                     copies: vec![pb::ObjectCopy {
                         tape_uuid: FAKE_TAPE.to_vec(),
                         tape_file_number: 100 + index as u64,
+                        first_body_lba: 7 * index as u64,
                         pool_id: "solo".to_string(),
                         ..Default::default()
                     }],
@@ -1381,9 +1389,12 @@ mod tests {
         assert_eq!(receipt["objects_committed"], 2);
         for (index, object) in objects.iter().enumerate() {
             assert!(object["archive_path"].as_str().unwrap().ends_with(".txt"));
+            assert_eq!(object["body_format"], "rem-object-v1");
             let copy = &object["copies"][0];
             assert_eq!(copy["pool_id"], "solo");
             assert_eq!(copy["tape_file_number"], 100 + index as u64);
+            // The receipt copy must be a complete canonical locator.
+            assert_eq!(copy["first_body_lba"], 7 * index as u64);
         }
         // The fake hashed what it received and asserted it matched the
         // client's declared digest, so a passing run proves byte fidelity.
