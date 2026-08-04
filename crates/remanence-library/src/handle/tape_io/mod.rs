@@ -746,6 +746,94 @@ impl super::DriveHandle {
         })
     }
 
+    /// Issue READ END OF WRAP POSITION (`A3h/1Fh/45h`, long form) and
+    /// parse the response — the wrap-map harvest read (design
+    /// `design-read-ordering.md` §6.5).
+    ///
+    /// Read-direction only; issuing it never modifies media or drive
+    /// state. The returned data is the drive's **load snapshot**: valid
+    /// at load, stale after any write in the same load, and not
+    /// refreshed by re-issuing the command. Harvest timing and cache
+    /// lifecycle live in the calibration layer above; this method does
+    /// nothing about them.
+    ///
+    /// Error mapping, load-bearing for the §6.5 transitions:
+    /// - [`TapeIoError::CheckCondition`] — the drive rejected the
+    ///   command (the runtime unsupported-format path);
+    /// - [`TapeIoError::Transport`] — completion unknown;
+    /// - [`TapeIoError::MalformedResponse`] — the CDB succeeded but the
+    ///   response bytes failed wire validation.
+    ///
+    /// The latter two are the "transport or parse failure" arm: the
+    /// layer above leaves the volume uncalibrated rather than serving
+    /// an old map.
+    pub fn read_end_of_wrap_position(
+        &mut self,
+    ) -> Result<remanence_scsi::read_end_of_wrap_position::EndOfWrapPositions, TapeIoError> {
+        use remanence_scsi::read_end_of_wrap_position as reowp;
+        let op = AuditOp::TapeReadWrapPositions {
+            bay: self.bay_address,
+        };
+        let cdb = reowp::build_cdb(reowp::ALLOC_LEN);
+        self.fire_tape_started(op, &cdb);
+
+        let started = Instant::now();
+        self.transport.set_timeout_for(TimeoutClass::TapeStatus);
+        let mut buf = vec![0u8; reowp::ALLOC_LEN as usize];
+        match self.transport.execute_in(&cdb, &mut buf) {
+            Ok(outcome) => {
+                let bytes = (outcome.bytes_transferred as usize).min(buf.len());
+                match reowp::parse_response(&buf[..bytes]) {
+                    Ok(positions) => {
+                        self.finish_tape_success(op, started.elapsed());
+                        Ok(positions)
+                    }
+                    Err(err) => {
+                        let err = TapeIoError::MalformedResponse(err);
+                        self.finish_tape_error(op, &err);
+                        Err(err)
+                    }
+                }
+            }
+            Err(e) => {
+                let mapped = map_scsi(e);
+                self.finish_tape_error(op, &mapped);
+                Err(mapped)
+            }
+        }
+    }
+
+    /// Probe REPORT SUPPORTED OPERATION CODES for READ END OF WRAP
+    /// POSITION support (`A3h/001Fh`).
+    ///
+    /// The design detects REOWP capability by this probe rather than an
+    /// INQUIRY-derived generation table, so a drive that surprises us
+    /// degrades instead of erroring. The probe keys on `(A3h, 001Fh)` —
+    /// RSOC has no room for the `45h` qualifier, so a drive that
+    /// affirms the pair but still rejects the qualifier at runtime is
+    /// handled by [`Self::read_end_of_wrap_position`]'s rejection path.
+    ///
+    /// Like TEST UNIT READY, this pure capability query fires no audit
+    /// events.
+    pub fn probe_read_end_of_wrap_position_support(
+        &mut self,
+    ) -> Result<remanence_scsi::report_supported_opcodes::OpcodeSupport, TapeIoError> {
+        use remanence_scsi::read_end_of_wrap_position as reowp;
+        use remanence_scsi::report_supported_opcodes as rsoc;
+        const PROBE_ALLOC_LEN: u32 = 64;
+        let cdb = reowp::capability_probe_cdb(PROBE_ALLOC_LEN);
+        self.transport.set_timeout_for(TimeoutClass::TapeStatus);
+        let mut buf = [0u8; PROBE_ALLOC_LEN as usize];
+        match self.transport.execute_in(&cdb, &mut buf) {
+            Ok(outcome) => {
+                let bytes = (outcome.bytes_transferred as usize).min(buf.len());
+                rsoc::parse_one_command_response(&buf[..bytes])
+                    .map_err(TapeIoError::MalformedResponse)
+            }
+            Err(e) => Err(map_scsi(e)),
+        }
+    }
+
     /// Issue TEST UNIT READY as a read-only liveness probe.
     pub fn test_unit_ready(&mut self) -> Result<(), TapeIoError> {
         let cdb = [0u8; 6];

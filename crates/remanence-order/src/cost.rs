@@ -148,7 +148,11 @@ pub fn reversal_ns(priors: &CostPriors, from: TapeDirection, to: TapeDirection) 
 /// Full hop cost from one physical position to another — the §7.1 sum.
 pub fn hop_ns(priors: &CostPriors, from: &PhysicalPosition, to: &PhysicalPosition) -> ElapsedNs {
     ElapsedNs(priors.fixed_overhead_ns)
-        .saturating_add(longitudinal_ns(priors, from.physical_lpos, to.physical_lpos))
+        .saturating_add(longitudinal_ns(
+            priors,
+            from.physical_lpos,
+            to.physical_lpos,
+        ))
         .saturating_add(wrap_reposition_ns(
             priors,
             from.wrap_index,

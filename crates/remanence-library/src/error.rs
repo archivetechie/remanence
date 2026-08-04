@@ -766,6 +766,13 @@ pub enum AuditOp {
         /// Drive bay address whose drive received MODE SELECT.
         bay: u16,
     },
+    /// Layer 3a: READ END OF WRAP POSITION (long form) on a tape
+    /// drive — the wrap-map harvest read. Read-only; never marks the
+    /// snapshot dirty on successful completion.
+    TapeReadWrapPositions {
+        /// Drive bay address whose drive received the command.
+        bay: u16,
+    },
 }
 
 /// What [`AuditEvent::Finished`] carries.

@@ -35,8 +35,8 @@ pub use cost::{
     PhysicalPosition, PUBLISHED_PRIORS,
 };
 pub use geometry::{
-    band_rank, lookup_geometry, GeometryLookup, StructuralRow, UnsupportedRow, BAND_LAYOUT,
-    STRUCTURAL_TABLE, UNSUPPORTED_TABLE,
+    band_rank, lookup_geometry, lookup_media_code, GeometryLookup, MediaCodeRow, StructuralRow,
+    UnsupportedRow, BAND_LAYOUT, MEDIA_CODE_TABLE, STRUCTURAL_TABLE, UNSUPPORTED_TABLE,
 };
 pub use planner::{
     physical_position, plan, Objective, Plan, PlanError, PlanInput, PlannedHop, PositionError,

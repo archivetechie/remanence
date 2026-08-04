@@ -215,6 +215,101 @@ pub fn lookup_geometry(cartridge_generation: &str, recording_format: &str) -> Ge
     GeometryLookup::Absent
 }
 
+/// One row of the canonical §6.3 media-code table: the two-character
+/// barcode suffix and the canonical geometry key it resolves to. WORM
+/// codes normalise to the structural row of the corresponding data
+/// medium.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MediaCodeRow {
+    /// The two-character barcode suffix, e.g. `"L8"`, `"LY"`.
+    pub media_code: &'static str,
+    /// Canonical cartridge generation, e.g. `"LTO-8"`.
+    pub cartridge_generation: &'static str,
+    /// Canonical recording format, e.g. `"L8"`.
+    pub recording_format: &'static str,
+}
+
+/// The canonical media-code table — design §6.3. `M8` is deliberately
+/// absent: it is recognised but unsupported and is answered by
+/// [`lookup_media_code`] directly, not by a canonical pair, because
+/// no adjudicated geometry exists to name.
+///
+/// Sources: IBM TS4500 "LTO bar code labels" for `LX`, `LY`, `LZ`;
+/// IBM TS4300 "Bar code label" Table 2 for `LA`, `PA`, `LH`.
+pub const MEDIA_CODE_TABLE: [MediaCodeRow; 10] = [
+    MediaCodeRow {
+        media_code: "L7",
+        cartridge_generation: "LTO-7",
+        recording_format: "L7",
+    },
+    MediaCodeRow {
+        media_code: "LX",
+        cartridge_generation: "LTO-7",
+        recording_format: "L7",
+    },
+    MediaCodeRow {
+        media_code: "L8",
+        cartridge_generation: "LTO-8",
+        recording_format: "L8",
+    },
+    MediaCodeRow {
+        media_code: "LY",
+        cartridge_generation: "LTO-8",
+        recording_format: "L8",
+    },
+    MediaCodeRow {
+        media_code: "L9",
+        cartridge_generation: "LTO-9",
+        recording_format: "L9",
+    },
+    MediaCodeRow {
+        media_code: "LZ",
+        cartridge_generation: "LTO-9",
+        recording_format: "L9",
+    },
+    MediaCodeRow {
+        media_code: "LA",
+        cartridge_generation: "LTO-10",
+        recording_format: "LA",
+    },
+    MediaCodeRow {
+        media_code: "LH",
+        cartridge_generation: "LTO-10",
+        recording_format: "LA",
+    },
+    MediaCodeRow {
+        media_code: "PA",
+        cartridge_generation: "LTO-10",
+        recording_format: "PA",
+    },
+    MediaCodeRow {
+        media_code: "M8",
+        cartridge_generation: "M8",
+        recording_format: "M8",
+    },
+];
+
+/// Resolve a two-character media code (the barcode's suffix) through
+/// the canonical §6.3 table and the structural table in one step.
+///
+/// - A supported code returns its canonical pair and structural row.
+/// - `M8` is **recognised but unsupported** (design §6.3): the caller
+///   can tell "we know this code and refuse it" apart from "we have
+///   never heard of it".
+/// - Any other code is `Absent`.
+///
+/// Matching is exact and case-sensitive, like [`lookup_geometry`];
+/// the caller normalises. Callers holding a full `voltag` should pass
+/// its last two characters.
+pub fn lookup_media_code(media_code: &str) -> GeometryLookup {
+    for row in &MEDIA_CODE_TABLE {
+        if row.media_code == media_code {
+            return lookup_geometry(row.cartridge_generation, row.recording_format);
+        }
+    }
+    GeometryLookup::Absent
+}
+
 /// Physical order of logical bands across the width of the tape —
 /// design §6.4. `BAND_LAYOUT[rank] == logical_band`: physical rank 0 is
 /// occupied by logical band 3, rank 1 by band 1, rank 2 by band 0 and
