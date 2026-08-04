@@ -282,13 +282,18 @@ can take an hour or more. `rem tape wait-ready --wait` polls until the
 medium is genuinely usable, and its defaults (2.5h timeout, 30s
 interval) are sized for exactly this.
 
-<!-- code-anchor: crates/remanence-cli/src/rem_debug.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/put.rs @ 836da0af -->
 ## First write to tape (requires hardware, writes to media)
 
-The daemon's write path is a gRPC session for orchestrators; for a
-first hands-on write, `rem-debug` drives the same pool machinery from
-the command line. Note the `--allow` flag: every state-changing
-`rem-debug` command must name the library it may touch.
+With a running daemon, the normal write is one command — `rem put
+/path/to/files --pool demo` — which goes through the daemon's session
+machinery with its pool policy, fences, and checkpoint durability (see
+the [CLI reference](reference-cli.md#writing-to-tape)). This
+walkthrough instead uses `rem-debug`, which drives the same pool
+machinery directly against hardware without a daemon — useful for a
+first hands-on write, at the cost of the break-glass gauntlet. Note the
+`--allow` flag: every state-changing `rem-debug` command must name the
+library it may touch.
 
 ```sh
 rem-debug --allow <SERIAL> archive write \

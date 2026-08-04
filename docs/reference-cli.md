@@ -141,6 +141,44 @@ each initialization must pass.
 | `rem tape quarantine release <ID> --ack <TEXT> [--after-settled-inventory]` | Release a fence after operator root-cause acknowledgement. |
 | `rem tape retire <TARGET> --reason <TEXT> --i-understand-copies-become-unreadable [--dry-run]` | Permanently retire a tape identity in the local catalog. Every copy on that tape becomes unreadable through the catalog. |
 
+<!-- code-anchor: crates/remanence-cli/src/put.rs @ 836da0af -->
+## Writing to tape
+
+`rem put` archives local files onto tape through the daemon — the same
+Layer 5 write-session path the orchestrator uses, so pool policy,
+capacity reserve, media-readiness fences, and checkpoint durability
+apply unchanged. There is deliberately no daemon-less write path: a put
+that bypassed the daemon would also bypass every safety the daemon
+exists to enforce. It takes `--endpoint` and `--json` like the other
+daemon-backed commands.
+
+One input file becomes one object whose single member carries the file's
+archive path; directories are walked recursively, `tar`-style, one
+object per file. Archive-path collisions, `..` components, and non-UTF-8
+paths are refused; non-regular files are skipped with a warning.
+
+| Command | What it does |
+|---|---|
+| `rem put <PATH>... [--pool <POOL_ID>] [--library <SERIAL>]` | Write each input file as one object to a tape pool. With no `--pool` and exactly one configured pool, that pool is used; with several, the choice is real policy and must be explicit. The daemon picks the tape by the pool's selection policy, mounts it into a free drive as needed, and seals tapes by watermark. If the open is fenced by a media-readiness operation (a cold tape load), put watches it to completion and retries once. |
+| `rem put <PATH>... --tape <UUID> --pool <POOL_ID>` | Pin a specific cartridge instead of letting pool policy choose. `--pool` is the mandatory guard: the pool you believe that tape belongs to. Pinning replaces pool *selection*, never *admission* — the tape still passes every pool-mode eligibility check (data kind, lifecycle state, block size, io fences, checkpoint-batch eligibility), and a pool mismatch is a refusal naming both pools, because pools carry copy-class segregation and a silent cross-pool write is policy corruption. A cartridge that was never initialized has no UUID to pin: tape identity is minted by `rem tape init`. |
+| `rem put ... [--id <ID>] [--meta <KEY=VALUE>]...` | Caller identity and opaque metadata recorded in the catalog. `--id` needs exactly one input file; the default caller id is the member's archive path. The `path` metadata key is reserved (it carries the archive path). |
+| `rem put ... [--chunk-bytes <BYTES>] [--no-wait]` | Append stream chunk size (default 1 MiB), and `--no-wait` to fail fast instead of watching a media-readiness load. |
+
+The receipt is committed state, not hope: it is built from the daemon's
+checkpoint barrier — with a catalog lookup for objects an automatic
+checkpoint committed earlier — never from the append acknowledgement
+alone. When some object cannot be verified committed, the confirmed
+receipts still print, the exit is nonzero, and the message distinguishes
+"commit state unknown" (a lookup failed) from "no committed copy" (the
+daemon says it is not on tape). A failed append aborts the whole batch,
+and the error states what the abort actually achieved — including the
+case where the abort itself failed and the session remains recoverable.
+
+`--drive` (write to whatever cartridge a named drive currently holds) is
+declared but not wired; the daemon rejects it. Targeting a tape with no
+pool assignment is likewise declared (`allow_unpooled` in the API) and
+rejected until a workflow needs it.
+
 <!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/archive_ingest.rs crates/remanence-cli/src/archive_map.rs crates/remanence-aead/src/wrap.rs @ ac3ff8bf -->
 ## Archive objects (local, no tape)
 
