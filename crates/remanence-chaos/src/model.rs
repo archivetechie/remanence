@@ -633,6 +633,47 @@ impl ModelTransport {
         copy_response(buf, &rp_long_response(flags, 0, self.position))
     }
 
+    /// MAINTENANCE IN: the RSOC one_command probe (`A3h/0Ch`) and READ END
+    /// OF WRAP POSITION long form (`A3h/1Fh/45h`).
+    ///
+    /// The model affirms REOWP support and answers the harvest with a
+    /// single-wrap map whose EOD position is the loaded tape's record
+    /// count — a minimal but §6.4-valid geometry (one EOD wrap with a
+    /// positive span), enough for load-harvest tests to calibrate a
+    /// volume against the model without real wrap physics.
+    fn maintenance_in(&self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+        let service_action = cdb.get(1).copied().unwrap_or(0) & 0x1F;
+        match service_action {
+            // REPORT SUPPORTED OPERATION CODES, one_command format:
+            // SUPPORT 011b (supported per the standard), 12-byte CDB usage.
+            0x0C => {
+                self.drive_bay()?;
+                let mut response = vec![0x00, 0b011, 0x00, 0x0C];
+                response.extend_from_slice(&[0u8; 12]);
+                copy_response(buf, &response)
+            }
+            // READ END OF WRAP POSITION, long form: header (2-byte data
+            // length + 2 reserved) then one 12-byte descriptor for wrap 0
+            // of partition 0 ending at the tape's current record count.
+            0x1F => {
+                let mut world = self.world.lock().expect("virtual world lock");
+                let end_loi = self
+                    .with_loaded_tape(&mut world, |tape| Ok((tape.records.len() as u64).max(1)))?;
+                let mut response = Vec::with_capacity(16);
+                response.extend_from_slice(&14u16.to_be_bytes()); // 2 reserved + 12
+                response.extend_from_slice(&[0x00, 0x00]);
+                response.extend_from_slice(&0u16.to_be_bytes()); // wrap 0
+                response.extend_from_slice(&0u16.to_be_bytes()); // partition 0
+                response.extend_from_slice(&[0x00, 0x00]); // reserved
+                response.extend_from_slice(&end_loi.to_be_bytes()[2..8]);
+                copy_response(buf, &response)
+            }
+            _ => Err(ScsiError::InvalidInput(
+                "unsupported MAINTENANCE IN service action",
+            )),
+        }
+    }
+
     fn log_sense(&self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
         let bay = self.drive_bay()?;
         let page_code = cdb.get(2).copied().unwrap_or(0) & 0x3f;
@@ -1077,6 +1118,7 @@ impl SgTransport for ModelTransport {
             Some(0x1a) => self.mode_sense(buf),
             Some(0x34) => self.read_position(buf),
             Some(0x4d) => self.log_sense(cdb, buf),
+            Some(0xa3) => self.maintenance_in(cdb, buf),
             Some(0xb8) => {
                 self.ensure_changer()?;
                 let world = self.world.lock().expect("virtual world lock");
