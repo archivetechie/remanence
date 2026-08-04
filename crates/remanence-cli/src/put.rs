@@ -110,8 +110,8 @@ pub(crate) fn run_put_command(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    let result = daemon_runtime()
-        .and_then(|runtime| runtime.block_on(async { put(args, out, err).await }));
+    let result =
+        daemon_runtime().and_then(|runtime| runtime.block_on(async { put(args, out, err).await }));
     finish_daemon_client_result(result, args.json, err)
 }
 
@@ -176,10 +176,7 @@ impl PutTarget {
             Self::Tape {
                 tape_uuid,
                 required_pool_id,
-            } => format!(
-                "tape {} (pool {required_pool_id})",
-                format_uuid(tape_uuid)
-            ),
+            } => format!("tape {} (pool {required_pool_id})", format_uuid(tape_uuid)),
             Self::Drive { element, .. } => format!("drive 0x{element:04x}"),
         }
     }
@@ -226,9 +223,8 @@ async fn put(
         target.describe(),
     );
 
-    let mut client = pb::write_session_service_client::WriteSessionServiceClient::new(
-        channel.clone(),
-    );
+    let mut client =
+        pb::write_session_service_client::WriteSessionServiceClient::new(channel.clone());
     let session_id =
         open_write_session(channel.clone(), &mut client, &target, args.no_wait, err).await?;
 
@@ -401,8 +397,8 @@ fn collect_inputs(paths: &[PathBuf], warnings: &mut Vec<String>) -> Result<Vec<P
     let mut inputs = Vec::new();
     let mut stripped_absolute = false;
     for path in paths {
-        let metadata = std::fs::metadata(path)
-            .map_err(|error| format!("stat {}: {error}", path.display()))?;
+        let metadata =
+            std::fs::metadata(path).map_err(|error| format!("stat {}: {error}", path.display()))?;
         if metadata.is_file() {
             inputs.push(PutInput {
                 fs_path: path.clone(),
@@ -466,10 +462,7 @@ fn walk_dir(
                 size_bytes: metadata.len(),
             });
         } else {
-            warnings.push(format!(
-                "skipping {}: not a regular file",
-                path.display()
-            ));
+            warnings.push(format!("skipping {}: not a regular file", path.display()));
         }
     }
     Ok(())
@@ -552,14 +545,14 @@ async fn resolve_target(args: &PutArgs, channel: Channel) -> Result<PutTarget, D
         });
     }
     if let Some(element) = args.drive {
-        let library_uuid =
-            resolve_library_uuid(channel, args.library.as_deref(), true).await?;
+        let library_uuid = resolve_library_uuid(channel, args.library.as_deref(), true).await?;
         return Ok(PutTarget::Drive {
             library_uuid,
             element,
         });
     }
-    let library_uuid = resolve_library_uuid(channel.clone(), args.library.as_deref(), false).await?;
+    let library_uuid =
+        resolve_library_uuid(channel.clone(), args.library.as_deref(), false).await?;
     let pool_id = match &args.pool {
         Some(pool) => pool.trim().to_string(),
         None => {
@@ -744,10 +737,7 @@ async fn wait_for_media_readiness_operation(
             .get("state")
             .map(String::as_str)
             .unwrap_or("unknown");
-        let _ = writeln!(
-            err,
-            "media readiness operation {operation_id}: {readiness}"
-        );
+        let _ = writeln!(err, "media readiness operation {operation_id}: {readiness}");
         match state {
             pb::OperationState::Succeeded => return Ok(()),
             pb::OperationState::Failed
@@ -884,9 +874,9 @@ async fn append_one(
     });
 
     let append = client.append_object(ReceiverStream::new(rx)).await;
-    let sender_result = sender
-        .await
-        .map_err(|error| DaemonClientError::client(format!("append sender task failed: {error}")))?;
+    let sender_result = sender.await.map_err(|error| {
+        DaemonClientError::client(format!("append sender task failed: {error}"))
+    })?;
     // When the server rejects the stream early, the sender sees a closed
     // channel; the server's status is the real error, so prefer it.
     match (append, sender_result) {
@@ -1019,7 +1009,11 @@ fn print_receipt(
             "session {} closed: {} object{}, {} committed",
             format_uuid(&session.session_id),
             session.objects_committed,
-            if session.objects_committed == 1 { "" } else { "s" },
+            if session.objects_committed == 1 {
+                ""
+            } else {
+                "s"
+            },
             format_bytes(session.bytes_committed),
         )
         .map_err(|error| error.to_string())
@@ -1108,7 +1102,9 @@ mod tests {
         let mut warnings = Vec::new();
         let inputs = collect_inputs(std::slice::from_ref(&file), &mut warnings).unwrap();
         assert!(!inputs[0].archive_path.starts_with('/'));
-        assert!(warnings.iter().any(|warning| warning.contains("leading '/'")));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("leading '/'")));
     }
 
     #[test]
@@ -1120,11 +1116,15 @@ mod tests {
 
     #[test]
     fn parse_meta_rejects_reserved_and_duplicate_keys() {
-        assert!(parse_meta(&["path=x".to_string()]).unwrap_err().contains("reserved"));
+        assert!(parse_meta(&["path=x".to_string()])
+            .unwrap_err()
+            .contains("reserved"));
         assert!(parse_meta(&["k=1".to_string(), "k=2".to_string()])
             .unwrap_err()
             .contains("twice"));
-        assert!(parse_meta(&["novalue".to_string()]).unwrap_err().contains("key=value"));
+        assert!(parse_meta(&["novalue".to_string()])
+            .unwrap_err()
+            .contains("key=value"));
         let meta = parse_meta(&["k=v=w".to_string()]).unwrap();
         assert_eq!(meta["k"], "v=w");
     }
@@ -1324,9 +1324,11 @@ mod tests {
         };
         runtime.spawn(
             tonic::transport::Server::builder()
-                .add_service(pb::write_session_service_server::WriteSessionServiceServer::new(
-                    FakeWriteSessions(state),
-                ))
+                .add_service(
+                    pb::write_session_service_server::WriteSessionServiceServer::new(
+                        FakeWriteSessions(state),
+                    ),
+                )
                 .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(listener)),
         );
         (format!("unix:{}", socket.display()), runtime, dir)
@@ -1397,14 +1399,18 @@ mod tests {
         }
         let uuid = Uuid::from_bytes([3; 16]).to_string();
         // Without --pool the parse must fail: the guard is mandatory.
-        let error = <Harness as clap::Parser>::try_parse_from([
-            "put", "--tape", &uuid, "some-file",
-        ])
-        .expect_err("--tape without --pool must not parse");
+        let error =
+            <Harness as clap::Parser>::try_parse_from(["put", "--tape", &uuid, "some-file"])
+                .expect_err("--tape without --pool must not parse");
         assert!(error.to_string().contains("--pool"), "{error}");
         // With the guard it parses.
         let parsed = <Harness as clap::Parser>::try_parse_from([
-            "put", "--tape", &uuid, "--pool", "camera", "some-file",
+            "put",
+            "--tape",
+            &uuid,
+            "--pool",
+            "camera",
+            "some-file",
         ])
         .expect("--tape with --pool parses");
         assert_eq!(parsed.args.pool.as_deref(), Some("camera"));

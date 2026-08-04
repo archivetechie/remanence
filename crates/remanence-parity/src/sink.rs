@@ -489,6 +489,12 @@ pub struct SidecarWriteSummary {
     pub final_partial_epoch: bool,
     /// Outcome of the sidecar's synchronous trailing filemark write.
     pub filemark_outcome: WriteFilemarksOutcome,
+    /// Volume-global LBA of block 0 of this sidecar tape file. The sidecar
+    /// occupies `[start, start + block_count)`, exclusive; its trailing
+    /// filemark at `start + block_count` is outside the span. Dead-reckoned
+    /// at file begin; the covering barrier's device-proved position
+    /// transitively validates it.
+    pub physical_start_lba: Option<u64>,
 }
 
 /// Result of closing the currently active object tape file.
@@ -517,6 +523,13 @@ pub struct ObjectWriteSummary {
     /// Higher-layer bootstrap object row attached to this object close, if
     /// supplied before [`ParitySink::finish_object`].
     pub bootstrap_object_row: Option<BootstrapObjectRow>,
+    /// Volume-global LBA of block 0 of this object tape file. The file
+    /// occupies `[start, start + block_count)`, exclusive; the trailing
+    /// filemark at `start + block_count` is outside the span; on a fresh
+    /// tape the bootstrap prefix precedes this start and is excluded at
+    /// capture. Dead-reckoned at file begin; the covering barrier's
+    /// device-proved position transitively validates it.
+    pub physical_start_lba: Option<u64>,
 }
 
 impl ObjectWriteSummary {
@@ -535,6 +548,7 @@ impl ObjectWriteSummary {
             self.first_parity_data_ordinal,
         ));
         object_entry.bootstrap_object_row = self.bootstrap_object_row.clone();
+        object_entry.physical_start_hint = self.physical_start_lba;
         entries.push(object_entry);
         entries.extend(
             self.sidecars_emitted
@@ -558,7 +572,7 @@ impl SidecarWriteSummary {
             tape_file_number: self.tape_file_number,
             kind: TapeFileKind::ParitySidecar,
             block_count: self.block_count,
-            physical_start_hint: None,
+            physical_start_hint: self.physical_start_lba,
             object_id: None,
             first_parity_data_ordinal: None,
             epoch_id: Some(self.epoch_id),
@@ -643,6 +657,7 @@ pub struct ParitySinkSessionState {
     bootstrap_placement_policy: Option<BootstrapPlacementPolicy>,
     bootstrap_placement_state: BootstrapPlacementState,
     last_physical_lba: u64,
+    tape_file_start_lbas: BTreeMap<u32, u64>,
     reserved_bootstrap_object_row_slots: u64,
 }
 
@@ -939,6 +954,14 @@ pub struct ParitySink<'a> {
     /// accounting.
     last_physical_lba: u64,
 
+    /// Volume-global LBA of block 0 for every tape file begun by this
+    /// logical session, keyed by tape-file number. Captured from
+    /// [`Self::last_physical_lba`] at each file's begin — the position after
+    /// the previous file's trailing filemark IS the new file's block 0.
+    /// Files committed before this session (a resumed prefix) are absent,
+    /// never guessed.
+    tape_file_start_lbas: BTreeMap<u32, u64>,
+
     /// Worst-case directory rows reserved by the actor at batch admission.
     reserved_bootstrap_object_row_slots: u64,
 }
@@ -981,6 +1004,7 @@ impl<'a> ParitySink<'a> {
             bootstrap_placement_policy: self.bootstrap_placement_policy,
             bootstrap_placement_state: self.bootstrap_placement_state,
             last_physical_lba: self.last_physical_lba,
+            tape_file_start_lbas: self.tape_file_start_lbas,
             reserved_bootstrap_object_row_slots: self.reserved_bootstrap_object_row_slots,
         })
     }
@@ -1034,6 +1058,7 @@ impl<'a> ParitySink<'a> {
             bootstrap_placement_policy: state.bootstrap_placement_policy,
             bootstrap_placement_state: state.bootstrap_placement_state,
             last_physical_lba: state.last_physical_lba,
+            tape_file_start_lbas: state.tape_file_start_lbas,
             reserved_bootstrap_object_row_slots: state.reserved_bootstrap_object_row_slots,
         })
     }
@@ -1308,6 +1333,7 @@ impl<'a> ParitySink<'a> {
             bootstrap_placement_policy: None,
             bootstrap_placement_state: BootstrapPlacementState::default(),
             last_physical_lba: 0,
+            tape_file_start_lbas: BTreeMap::new(),
             reserved_bootstrap_object_row_slots: 0,
         })
     }
@@ -1799,6 +1825,7 @@ impl<'a> ParitySink<'a> {
             highest_protected_ordinal: self.highest_protected_ordinal,
             control_tape_files_emitted,
             bootstrap_object_row,
+            physical_start_lba: self.tape_file_start_lba(object.tape_file_number),
         };
         if let Err(err) = self.commit_journal_map_range(
             CommittedBundleKind::Object,
@@ -2172,6 +2199,7 @@ impl<'a> ParitySink<'a> {
         let bootstrap_start_lba = self.last_physical_lba;
         self.durable_boundary
             .begin_tape_file(TapeFileKind::Bootstrap, tape_file_number)?;
+        self.note_tape_file_start(tape_file_number);
         let mut buf = vec![0u8; self.block_size_bytes as usize];
         if let Err(err) = write_bootstrap_block(&payload, &mut buf) {
             self.poisoned = true;
@@ -2249,6 +2277,7 @@ impl<'a> ParitySink<'a> {
         }
         self.durable_boundary
             .begin_tape_file(TapeFileKind::ParityMap, tape_file_number)?;
+        self.note_tape_file_start(tape_file_number);
         for block in blocks {
             self.write_control_block(TapeFileKind::ParityMap, tape_file_number, block)?;
         }
@@ -2605,6 +2634,7 @@ impl<'a> ParitySink<'a> {
         entry: &TapeFileMapEntry,
     ) -> Result<TapeFileEntry, ParityError> {
         let mut journal_entry = TapeFileEntry::from_map_entry(entry.clone());
+        journal_entry.physical_start_hint = self.tape_file_start_lba(entry.tape_file_number);
         if entry.kind == TapeFileKind::ParityMap {
             journal_entry.canonical_metadata_hash = Some(
                 self.control_metadata_hashes
@@ -2991,6 +3021,7 @@ impl<'a> ParitySink<'a> {
         let tape_file_number = self.filemark_map.next_tape_file_number()?;
         self.durable_boundary
             .begin_tape_file(TapeFileKind::ParitySidecar, tape_file_number)?;
+        self.note_tape_file_start(tape_file_number);
 
         for block in &encoded.blocks {
             let outcome = match self.backend.write_block(block) {
@@ -3116,6 +3147,7 @@ impl<'a> ParitySink<'a> {
             final_partial_epoch: sidecar.is_terminal
                 && encoded.header.real_data_shard_count < encoded.header.logical_shard_count,
             filemark_outcome,
+            physical_start_lba: self.tape_file_start_lba(entry.tape_file_number),
         };
         self.sidecar_directory_entries
             .push(sidecar_summary_to_directory_entry(&summary));
@@ -3181,6 +3213,7 @@ impl<'a> ParitySink<'a> {
         let tape_file_number = self.filemark_map.next_tape_file_number()?;
         self.durable_boundary
             .begin_tape_file(TapeFileKind::Object, tape_file_number)?;
+        self.note_tape_file_start(tape_file_number);
         self.early_warning_reserve = Some(EarlyWarningReserveState::new(input, report));
         self.pending_bootstrap_object_row = None;
         self.active_object = Some(ActiveObject {
@@ -3216,6 +3249,23 @@ impl<'a> ParitySink<'a> {
 
     fn record_physical_position(&mut self, position_after_lba: u64) {
         self.last_physical_lba = position_after_lba;
+    }
+
+    /// Capture the volume-global LBA of block 0 of a tape file that is about
+    /// to receive its first write. At every file begin the physical cursor
+    /// sits just past the previous file's trailing filemark (or at BOT on a
+    /// fresh tape), which IS the new file's block 0. Dead-reckoned; the
+    /// covering barrier's device-proved position transitively validates it.
+    fn note_tape_file_start(&mut self, tape_file_number: u32) {
+        self.tape_file_start_lbas
+            .insert(tape_file_number, self.last_physical_lba);
+    }
+
+    /// Captured start LBA for a tape file begun by this logical session.
+    /// Absent for prefix files committed before this session — absent, never
+    /// guessed.
+    fn tape_file_start_lba(&self, tape_file_number: u32) -> Option<u64> {
+        self.tape_file_start_lbas.get(&tape_file_number).copied()
     }
 
     fn validate_v1_post_object_bundle_bound(
