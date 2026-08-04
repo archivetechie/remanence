@@ -38,6 +38,7 @@ sha2              = { workspace = true }
 tempfile          = { workspace = true }
 time              = { workspace = true }
 tokio             = { workspace = true }
+tokio-stream      = { workspace = true, features = ["net"] }
 tonic             = { workspace = true }
 uuid              = { workspace = true }
 xattr             = { workspace = true }
@@ -46,7 +47,6 @@ ratatui           = { version = "0.29", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio-stream = { workspace = true, features = ["net"] }
 
 [features]
 default = ["tui"]

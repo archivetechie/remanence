@@ -1074,7 +1074,7 @@ message OpenWriteSessionRequest {
     TapeTarget    tape_target  = 2;
     TapePoolTarget pool_target  = 6;
   }
-  string body_format             = 3; // "rem-tar-v1" by default
+  string body_format             = 3; // "rem-object-v1" by default (the only wired format)
   IdempotencyKey idempotency_key = 4;
   // Recover an existing orphaned session by id (no new session created).
   bytes recover_session_id       = 5;
