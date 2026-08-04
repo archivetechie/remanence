@@ -171,20 +171,17 @@ pub(crate) fn harvest_and_install_calibration(
     // (4) Capability probe. Only an explicit "not supported" answer
     // short-circuits; an indeterminate or failed probe degrades to
     // the runtime-rejection path below rather than guessing.
-    match drive.probe_read_end_of_wrap_position_support() {
-        Ok(support)
-            if support == remanence_scsi::report_supported_opcodes::OpcodeSupport::NotSupported =>
-        {
-            let detail = "drive reports READ END OF WRAP POSITION unsupported (RSOC)".to_string();
-            return match store.record_unsupported_format(tape_uuid) {
-                Ok(generation) => HarvestOutcome::UnsupportedFormat {
-                    calibration_generation: generation,
-                    detail,
-                },
-                Err(err) => store_unavailable(err),
-            };
-        }
-        Ok(_) | Err(_) => {}
+    if let Ok(remanence_scsi::report_supported_opcodes::OpcodeSupport::NotSupported) =
+        drive.probe_read_end_of_wrap_position_support()
+    {
+        let detail = "drive reports READ END OF WRAP POSITION unsupported (RSOC)".to_string();
+        return match store.record_unsupported_format(tape_uuid) {
+            Ok(generation) => HarvestOutcome::UnsupportedFormat {
+                calibration_generation: generation,
+                detail,
+            },
+            Err(err) => store_unavailable(err),
+        };
     }
 
     // (5) The harvest read.
@@ -291,7 +288,10 @@ fn store_unavailable(err: StateError) -> HarvestOutcome {
     }
 }
 
-fn media_code_of(barcode: &str) -> Option<&str> {
+/// The barcode's two-character media-code suffix, or `None` when the
+/// barcode is too short or not ASCII. One rule, shared by the load
+/// harvest and the `PlanBatchRead` cartridge-fact resolution.
+pub(crate) fn media_code_of(barcode: &str) -> Option<&str> {
     let trimmed = barcode.trim();
     if trimmed.len() < 2 || !trimmed.is_ascii() {
         return None;
@@ -311,10 +311,6 @@ fn now_rfc3339_or_epoch() -> String {
 /// gap is a per-target property of a *valid, served* map, surfaced by
 /// `WrapMap::locate` / the planner as a `CoverageError` against
 /// `mapped_extent_lba`, and never by this enum.
-// The serve path is consumed by P5's PlanBatchRead handler; until
-// that lands it is exercised by the calibration lifecycle tests, so
-// the lib target sees it as unused.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WrapMapServeRefusal {
     /// The control row is `UnsupportedFormat` for the current load.
@@ -336,7 +332,6 @@ pub(crate) enum WrapMapServeRefusal {
 }
 
 /// Result of asking for a volume's servable wrap map.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum WrapMapServeOutcome {
     /// The map may be used for planning. Coverage of individual
@@ -346,7 +341,10 @@ pub(crate) enum WrapMapServeOutcome {
         /// descriptors at serve time (wrap starts are derived here,
         /// never stored).
         map: WrapMap,
-        /// Epoch the map is bound to.
+        /// Epoch the map is bound to. Asserted by the lifecycle
+        /// tests; the RPC serve path does not re-check it because
+        /// `is_map_servable` already did, inside this function.
+        #[allow(dead_code)]
         write_epoch: u64,
         /// Generation for calibration-derived caching.
         calibration_generation: u64,
@@ -371,7 +369,6 @@ pub(crate) enum WrapMapServeOutcome {
 /// [`CalibrationControlStore::is_map_servable`], which itself routes
 /// through `remanence_library::wrap_map_is_servable` — one predicate,
 /// not a reimplementation.
-#[allow(dead_code)]
 pub(crate) fn servable_wrap_map(
     index: &CatalogIndex,
     store: &CalibrationControlStore,
