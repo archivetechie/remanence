@@ -100,7 +100,8 @@ pub struct Plan {
     /// Sum of every hop estimate plus the terminal hop when present.
     /// Transfer time is never included.
     pub estimated_total_ns: ElapsedNs,
-    /// True when any planned target's position used the estimated
+    /// True when any planned target's position — or a supplied start or
+    /// end position that a hop was costed against — used the estimated
     /// EOD-wrap denominator, or when the completed spans are highly
     /// dispersed (§6.4). Means "some estimate was used", not "something
     /// went wrong".
@@ -279,26 +280,34 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
     }
 
     // Positions. An absent start means the load point: block zero, which
-    // every valid map covers.
-    let start_pos = match physical_position(map, geometry, input.start_block.unwrap_or(0)) {
-        Ok((p, _)) => p,
-        Err(PositionError::OutOfCoverage {
-            block_lba,
-            mapped_extent_lba,
-        }) => {
-            return Err(PlanError::StartOutOfCoverage {
+    // every valid map covers. A position in the EOD wrap depends on the
+    // estimated denominator exactly as a target does (§6.4), so the
+    // uses-EOD flags are kept, not discarded — but the start position's
+    // flag only counts when some hop is actually costed from it.
+    let (start_pos, start_uses_eod) =
+        match physical_position(map, geometry, input.start_block.unwrap_or(0)) {
+            Ok((p, uses_eod)) => (p, uses_eod),
+            Err(PositionError::OutOfCoverage {
                 block_lba,
                 mapped_extent_lba,
-            })
-        }
-        Err(PositionError::GeometryInvalid { detail }) => {
-            return Err(PlanError::GeometryInvalid { detail })
-        }
-    };
+            }) => {
+                return Err(PlanError::StartOutOfCoverage {
+                    block_lba,
+                    mapped_extent_lba,
+                })
+            }
+            Err(PositionError::GeometryInvalid { detail }) => {
+                return Err(PlanError::GeometryInvalid { detail })
+            }
+        };
+    let mut end_uses_eod = false;
     let end_pos = match input.end_block {
         None => None,
         Some(block) => match physical_position(map, geometry, block) {
-            Ok((p, _)) => Some(p),
+            Ok((p, uses_eod)) => {
+                end_uses_eod = uses_eod;
+                Some(p)
+            }
             Err(PositionError::OutOfCoverage {
                 block_lba,
                 mapped_extent_lba,
@@ -313,6 +322,9 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
             }
         },
     };
+    // The start position feeds an estimate whenever any hop leaves it —
+    // the first target's hop, or the degenerate zero-target terminal hop.
+    let start_feeds_an_estimate = !input.targets.is_empty() || end_pos.is_some();
 
     let mut starts = Vec::with_capacity(input.targets.len());
     let mut ends = Vec::with_capacity(input.targets.len());
@@ -402,7 +414,10 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
         hops,
         terminal_ns,
         estimated_total_ns: ElapsedNs(u64::try_from(total).unwrap_or(u64::MAX)),
-        uses_estimated_eod_geometry: any_target_uses_eod || map.completed_spans_highly_dispersed(),
+        uses_estimated_eod_geometry: any_target_uses_eod
+            || (start_feeds_an_estimate && start_uses_eod)
+            || end_uses_eod
+            || map.completed_spans_highly_dispersed(),
     })
 }
 

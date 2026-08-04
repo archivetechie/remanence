@@ -109,6 +109,9 @@ pub async fn serve(
                     tcp_state.read_session_service(),
                 ),
             )
+            .add_service(pb::read_plan_service_server::ReadPlanServiceServer::new(
+                tcp_state.read_plan_service(),
+            ))
             .add_service(pb::audit_server::AuditServer::new(
                 tcp_state.audit_service(),
             ))
@@ -150,6 +153,9 @@ pub async fn serve(
                     unix_state.read_session_service(),
                 ),
             )
+            .add_service(pb::read_plan_service_server::ReadPlanServiceServer::new(
+                unix_state.read_plan_service(),
+            ))
             .add_service(pb::audit_server::AuditServer::new(
                 unix_state.audit_service(),
             ))

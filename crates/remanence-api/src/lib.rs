@@ -41,6 +41,13 @@ pub mod pb {
     tonic::include_proto!("remanence.api.v1");
 }
 
+/// Vendored `google.rpc` rich-error detail types (see `proto/google/rpc/`),
+/// carried in the `grpc-status-details-bin` trailer of malformed-request
+/// errors so a caller can recover the offending target index structurally.
+pub mod pb_rpc {
+    tonic::include_proto!("google.rpc");
+}
+
 /// Default maximum bytes admitted into one append spool reservation.
 pub const APPEND_SPOOL_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
@@ -73,6 +80,7 @@ mod operations;
 mod pool_selection;
 mod pool_write;
 pub mod read_core;
+mod read_plan;
 mod tape_init;
 mod write_owner;
 
@@ -90,6 +98,7 @@ pub use pool_write::{
 };
 #[cfg(test)]
 pub use pool_write::{write_object_to_pool, write_to_selected_tape};
+pub use read_plan::ReadPlanApi;
 pub use remanence_library::{resolve_load_target, LoadError, LoadPlan};
 pub use tape_init::{
     classify_bot_bytes, classify_bot_from_source, decide_tape_init,
@@ -779,6 +788,13 @@ impl ApiState {
     /// Return the read-session service implementation.
     pub fn read_session_service(&self) -> ReadSessionApi {
         ReadSessionApi {
+            state: self.clone(),
+        }
+    }
+
+    /// Return the read-plan service implementation (`PlanBatchRead`).
+    pub fn read_plan_service(&self) -> ReadPlanApi {
+        ReadPlanApi {
             state: self.clone(),
         }
     }

@@ -5,7 +5,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_client(true)
         .build_server(true)
-        .compile_protos(&["../../proto/layer5.proto"], &["../../proto"])?;
+        .compile_protos(
+            &[
+                "../../proto/layer5.proto",
+                "../../proto/google/rpc/status.proto",
+                "../../proto/google/rpc/error_details.proto",
+            ],
+            &["../../proto"],
+        )?;
 
     Ok(())
 }
