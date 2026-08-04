@@ -16,6 +16,9 @@
 //! end-to-end. Subsequent steps add
 //! `locate`/`space`/`read_block`/`write_block`/etc.
 
+/// The media-dispatch gate and pre-dispatch write fence (design
+/// `design-read-ordering.md` §6.5 / D4b).
+pub mod media_gate;
 pub mod model;
 /// Media readiness classification for TEST UNIT READY probes.
 pub mod readiness;
@@ -38,6 +41,11 @@ use super::{
 use crate::error::{AuditEvent, AuditOp, AuditOutcome};
 use crate::transport::TimeoutClass;
 
+use media_gate::MediaDispatchError;
+pub use media_gate::{
+    wrap_map_is_servable, InMemoryCalibrationControl, MediaWriteFence, MediaWriteFenceError,
+    NoCalibrationControl,
+};
 pub use model::{
     BlockSize, ComputedPosition, DevicePositionProof, PipelinedReadDiagnostics,
     PipelinedWriteDiagnostics, PositionAfter, ReadBatchOutcome, ReadBuffer, ReadBufferHandoff,
@@ -247,6 +255,16 @@ pub enum TapeIoError {
     /// violation, etc.). Caller reads sense for specifics.
     #[error("data protect: {0}")]
     DataProtect(ScsiError),
+
+    /// The pre-dispatch media-write fence could not durably advance
+    /// the loaded volume's `write_epoch`, so the media-modifying CDB
+    /// was refused before dispatch (design `design-read-ordering.md`
+    /// §6.5). **No command reached the drive**: position and mode
+    /// state are unchanged, the snapshot stays clean, and this is not
+    /// a completion-unknown signal. Retrying the write re-runs the
+    /// fence.
+    #[error("media-write fence refused dispatch (CDB not sent): {0}")]
+    WriteFenceNotDurable(media_gate::MediaWriteFenceError),
 }
 
 /// Cumulative drive error counters from LOG SENSE pages 02h and 03h.
@@ -622,7 +640,7 @@ impl super::DriveHandle {
 
         self.transport.set_timeout_for(TimeoutClass::Rewind);
         let started = Instant::now();
-        match self.transport.execute_none(&cdb) {
+        match self.transport.execute_none_nonmedia(&cdb) {
             Ok(()) => {
                 self.record_device_position(TapePosition {
                     lba: 0,
@@ -732,7 +750,7 @@ impl super::DriveHandle {
     pub fn test_unit_ready(&mut self) -> Result<(), TapeIoError> {
         let cdb = [0u8; 6];
         self.transport.set_timeout_for(TimeoutClass::TapeStatus);
-        self.transport.execute_none(&cdb).map_err(map_scsi)
+        self.transport.execute_none_nonmedia(&cdb).map_err(map_scsi)
     }
 
     /// Issue TEST UNIT READY and classify media readiness without sending any
@@ -740,7 +758,7 @@ impl super::DriveHandle {
     pub fn probe_media_readiness(&mut self, family: MediaFamily) -> MediaReadiness {
         let cdb = [0u8; 6];
         self.transport.set_timeout_for(TimeoutClass::TapeStatus);
-        match self.transport.execute_none(&cdb) {
+        match self.transport.execute_none_nonmedia(&cdb) {
             Ok(()) => MediaReadiness::Ready,
             Err(err) => classify_media_readiness_error(err, family),
         }
@@ -870,7 +888,7 @@ impl super::DriveHandle {
 
         self.transport.set_timeout_for(TimeoutClass::Positioning);
         let started = Instant::now();
-        let result = self.transport.execute_none(&cdb);
+        let result = self.transport.execute_none_nonmedia(&cdb);
         match result {
             Ok(()) => match self.read_position_inline() {
                 Ok(pos) => {
@@ -975,7 +993,7 @@ impl super::DriveHandle {
 
         self.transport.set_timeout_for(TimeoutClass::Positioning);
         let started = Instant::now();
-        let result = self.transport.execute_none(cdb);
+        let result = self.transport.execute_none_nonmedia(cdb);
 
         // Detect "spaced to boundary" early-stop. Per SSC-5 §6.10 the
         // drive raises CHECK CONDITION (key = NO SENSE 0 or BLANK
@@ -1088,7 +1106,17 @@ impl super::DriveHandle {
         self.fire_tape_started(op, &cdb);
         self.transport.set_timeout_for(TimeoutClass::TapeIo);
         let started = Instant::now();
-        let result = self.transport.execute_out(&cdb, buf);
+        let result = match self.transport.dispatch_media_out(&cdb, buf) {
+            Ok(outcome) => Ok(outcome),
+            Err(MediaDispatchError::NotDispatched(err)) => {
+                // The media gate refused pre-dispatch (fence not
+                // durable): no CDB was issued, physical state is
+                // unchanged. Pair the started audit and stop.
+                self.finish_tape_error(op, &err);
+                return Err(err);
+            }
+            Err(MediaDispatchError::Scsi(err)) => Err(err),
+        };
 
         match result {
             Ok(_) => {
@@ -1289,7 +1317,17 @@ impl super::DriveHandle {
         self.pipeline_diagnostics
             .first_submit
             .get_or_insert(ioctl_started);
-        let result = self.transport.execute_out(cdb, buf);
+        let result = match self.transport.dispatch_media_out(cdb, buf) {
+            Ok(outcome) => Ok(outcome),
+            Err(MediaDispatchError::NotDispatched(err)) => {
+                // The media gate refused pre-dispatch (fence not
+                // durable): no ioctl happened, so no pipeline
+                // accounting and — like the pre-dispatch validation
+                // failures above — no audit events on this path.
+                return Err(err);
+            }
+            Err(MediaDispatchError::Scsi(err)) => Err(err),
+        };
         let completed_at = Instant::now();
         self.record_pipeline_ioctl(ioctl_started, completed_at);
 
@@ -1804,7 +1842,15 @@ impl super::DriveHandle {
 
         self.transport.set_timeout_for(TimeoutClass::TapeIo);
         let started = Instant::now();
-        let result = self.transport.execute_out(&cdb, buf);
+        let result = match self.transport.dispatch_media_out(&cdb, buf) {
+            Ok(outcome) => Ok(outcome),
+            Err(MediaDispatchError::NotDispatched(err)) => {
+                // Fence refused pre-dispatch: no CDB was issued.
+                self.finish_tape_error(op, &err);
+                return Err(err);
+            }
+            Err(MediaDispatchError::Scsi(err)) => Err(err),
+        };
 
         match result {
             Ok(outcome) => {
@@ -1918,7 +1964,15 @@ impl super::DriveHandle {
 
         self.transport.set_timeout_for(TimeoutClass::TapeIo);
         let started = Instant::now();
-        let result = self.transport.execute_out(&cdb, buf);
+        let result = match self.transport.dispatch_media_out(&cdb, buf) {
+            Ok(outcome) => Ok(outcome),
+            Err(MediaDispatchError::NotDispatched(err)) => {
+                // Fence refused pre-dispatch: no CDB was issued.
+                self.finish_tape_error(op, &err);
+                return Err(err);
+            }
+            Err(MediaDispatchError::Scsi(err)) => Err(err),
+        };
 
         match result {
             Ok(outcome) => {
@@ -2015,7 +2069,15 @@ impl super::DriveHandle {
 
         self.transport.set_timeout_for(TimeoutClass::WriteFilemarks);
         let started = Instant::now();
-        let result = self.transport.execute_none(&cdb);
+        let result = match self.transport.dispatch_media_none(&cdb) {
+            Ok(()) => Ok(()),
+            Err(MediaDispatchError::NotDispatched(err)) => {
+                // Fence refused pre-dispatch: no CDB was issued.
+                self.finish_tape_error(op, &err);
+                return Err(err);
+            }
+            Err(MediaDispatchError::Scsi(err)) => Err(err),
+        };
         match result {
             Ok(()) => match self.read_position_inline() {
                 Ok(pos) => {
@@ -2089,12 +2151,17 @@ impl super::DriveHandle {
         self.fire_tape_started(operation, &cdb);
         self.transport.set_timeout_for(TimeoutClass::WriteFilemarks);
         let started = Instant::now();
-        match self.transport.execute_none(&cdb) {
+        match self.transport.dispatch_media_none(&cdb) {
             Ok(()) => {
                 self.finish_tape_success(operation, started.elapsed());
                 Ok(())
             }
-            Err(error) => {
+            Err(MediaDispatchError::NotDispatched(err)) => {
+                // Fence refused pre-dispatch: no CDB was issued.
+                self.finish_tape_error(operation, &err);
+                Err(err)
+            }
+            Err(MediaDispatchError::Scsi(error)) => {
                 let mapped = map_scsi(error);
                 self.finish_tape_error(operation, &mapped);
                 Err(mapped)
@@ -2122,7 +2189,18 @@ impl super::DriveHandle {
         self.fire_tape_started(operation, &cdb);
         self.transport.set_timeout_for(TimeoutClass::WriteFilemarks);
         let started = Instant::now();
-        match self.transport.execute_none(&cdb) {
+        let result = match self.transport.dispatch_media_none(&cdb) {
+            Ok(()) => Ok(()),
+            Err(MediaDispatchError::NotDispatched(err)) => {
+                // Fence refused pre-dispatch: no CDB was issued, so
+                // there is no completion evidence to defer. Pair the
+                // started audit immediately and stop.
+                self.finish_tape_error(operation, &err);
+                return Err(err);
+            }
+            Err(MediaDispatchError::Scsi(err)) => Err(err),
+        };
+        match result {
             Ok(()) => match self.read_position_inline() {
                 Ok(position) => {
                     self.finish_tape_success(operation, started.elapsed());
@@ -2365,7 +2443,19 @@ impl super::DriveHandle {
 
         self.transport.set_timeout_for(TimeoutClass::ModeConfig);
         let started = Instant::now();
-        let result = self.transport.execute_out(&cdb, &param_list);
+        // MODE SELECT routes through the media gate as a
+        // write-direction CDB, but the gate classifies it
+        // configuration-only: it never modifies recorded media, so it
+        // must not trip the write fence (the parity read/recovery
+        // path sets block size through here).
+        let result = match self.transport.dispatch_media_out(&cdb, &param_list) {
+            Ok(outcome) => Ok(outcome),
+            Err(MediaDispatchError::NotDispatched(err)) => {
+                self.finish_tape_error(op, &err);
+                return Err(err);
+            }
+            Err(MediaDispatchError::Scsi(err)) => Err(err),
+        };
         match result {
             Ok(_) => {
                 if self.mode_reverification_required.is_none() {
@@ -2385,6 +2475,30 @@ impl super::DriveHandle {
         }
     }
 
+    /// Install the durable calibration-control fence for the current
+    /// load (design `design-read-ordering.md` §6.5). The layer that
+    /// harvests the wrap map at load binds the loaded volume's
+    /// durable control row to a [`MediaWriteFence`] and installs it
+    /// here — Layer 3a never learns a `tape_uuid`. Installation
+    /// re-arms the once-per-load flag, so the first media-modifying
+    /// CDB after installation advances the epoch even if this handle
+    /// already wrote under a previous fence.
+    ///
+    /// Until this is called, the default [`NoCalibrationControl`]
+    /// fence is installed; see its docs for why that is sound before
+    /// a harvest has happened.
+    pub fn install_media_write_fence(&mut self, fence: Box<dyn MediaWriteFence>) {
+        self.transport.install_media_write_fence(fence);
+    }
+
+    /// Whether the media-write fence has run — and therefore a
+    /// media-modifying CDB has been handed to the transport — in the
+    /// current load. Startup/orphan recovery uses this to decide
+    /// whether a load may have modified media.
+    pub fn media_write_fenced_this_load(&self) -> bool {
+        self.transport.media_write_fenced_this_load()
+    }
+
     fn mark_position_unknown(&mut self) {
         self.position_known = false;
         self.expected_position = None;
@@ -2395,6 +2509,11 @@ impl super::DriveHandle {
         if let Some(block_size) = self.validated_fixed_block_size.take() {
             self.mode_reverification_required = Some(block_size);
         }
+        // A reset may sit on a load boundary (power cycle, medium
+        // change). Re-arm the media-write fence: the next
+        // media-modifying CDB re-advances the epoch — false
+        // invalidation at worst, never a missed one.
+        self.transport.reset_media_write_fence_for_load_boundary();
     }
 
     fn ensure_data_command_state_valid(
@@ -3187,5 +3306,7 @@ fn units_traversed_from_space_residual(count: i64, residual: i64) -> i64 {
     }
 }
 
+#[cfg(test)]
+mod media_gate_tests;
 #[cfg(test)]
 mod tests;
