@@ -179,6 +179,32 @@ declared but not wired; the daemon rejects it. Targeting a tape with no
 pool assignment is likewise declared (`allow_unpooled` in the API) and
 rejected until a workflow needs it.
 
+<!-- code-anchor: crates/remanence-cli/src/get.rs @ 7bb2dca1 -->
+## Restoring from tape
+
+`rem get` is put's counterpart: it restores an object's members from tape
+through the daemon read path. The daemon resolves the object format
+server-side and streams each member's payload bytes, so there is no
+client-side format interpretation. Every member is proven before it is
+published: bytes stream to a temporary file, are hashed as they land, and
+only rename into place when the hash matches the catalog's per-file
+sha256.
+
+| Command | What it does |
+|---|---|
+| `rem get <OBJECT> --dest <DIR> [--overwrite]` | Restore all members of an object into a directory. OBJECT is an object UUID by default; `--caller-id` selects by the caller id recorded at put time, `--sha256` by content hash. The daemon mounts the copy's tape as needed, and a media-readiness fence is watched to completion (`--no-wait` fails fast). |
+| `rem get <OBJECT> --dest <DIR> --tape <UUID>` | Read from the copy on a specific tape instead of the first cataloged copy — for exercising a particular cartridge, or steering away from one. |
+| `rem get <OBJECT> --dest <DIR> --path <MEMBER>` | Restore only the named member. |
+
+On a digest mismatch nothing is published: the temporary file is kept for
+forensics and the error names both hashes and both honest explanations —
+a damaged copy (treat it as suspect: re-read or scrub), or an
+encrypted-at-rest object whose ciphertext this command does not decrypt
+(restore those via the spooled-object path: `rem archive` tooling with
+the private key). Member paths from the catalog are sanitized with the
+same rules put applies on ingest — `..` refuses, absolute prefixes strip
+— so a restore never writes outside `--dest`, whatever the catalog says.
+
 <!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/archive_ingest.rs crates/remanence-cli/src/archive_map.rs crates/remanence-aead/src/wrap.rs @ ac3ff8bf -->
 ## Archive objects (local, no tape)
 
