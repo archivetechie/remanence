@@ -299,6 +299,11 @@ impl PoolWriteObjectCopyRecord {
                 algorithm: remanence_state::DIGEST_ALGORITHM_SHA256.to_string(),
                 value: value.to_vec(),
             }),
+            // The write acknowledgement does not consult the copy→tape-file
+            // join; the span is served by the catalog read APIs. Absent =
+            // unknown here, honestly, never a guessed zero.
+            global_start_block: None,
+            global_end_block: None,
         }
     }
 }
