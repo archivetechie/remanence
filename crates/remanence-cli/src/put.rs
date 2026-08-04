@@ -670,7 +670,7 @@ async fn open_write_session(
 /// names a media-readiness operation means a tape load is in flight — watch it
 /// to completion, then retry once. A busy drive bay gets one short retry.
 /// Anything else is a real error.
-async fn wait_before_open_retry(
+pub(crate) async fn wait_before_open_retry(
     channel: Channel,
     status: &tonic::Status,
     err: &mut dyn Write,
@@ -1032,17 +1032,17 @@ fn print_receipt(
     }
 }
 
-fn format_uuid(bytes: &[u8]) -> String {
+pub(crate) fn format_uuid(bytes: &[u8]) -> String {
     Uuid::from_slice(bytes)
         .map(|uuid| uuid.to_string())
         .unwrap_or_else(|_| hex(bytes))
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub(crate) fn format_bytes(bytes: u64) -> String {
     const UNITS: [(&str, u64); 4] = [
         ("GiB", 1 << 30),
         ("MiB", 1 << 20),
