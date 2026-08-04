@@ -21,12 +21,13 @@ use remanence_format_driver::{
     ForeignFormatRegistry, FormatError, NormalizedEntry, ScanIntegrityBasis, SourceRequirement,
 };
 use remanence_state::{
-    AlarmRecord, AuditActor, AuditEvent, AuditEventRecord, AuditRecord, AuditSubject, CatalogIndex,
-    CatalogUnitFilter, CatalogUnitRecord, DriveCorrelationRollupRecord, DriveHealthSnapshotInput,
-    DriveHealthSnapshotRecord, FileAuditLog, MediaReadinessOperationRecord,
-    MediaReadinessTransitionInput, NativeObjectCopyRecord, NativeObjectFileRecord,
-    NativeObjectRecord, OperationRecord, RemConfig, SourceLayer, StateError, TapeFileRecord,
-    TapeIoConfig, TapePoolConfig, TapePoolRecord, TapeRecord,
+    AlarmRecord, AuditActor, AuditEvent, AuditEventRecord, AuditRecord, AuditSubject,
+    CalibrationControlStore, CatalogIndex, CatalogUnitFilter, CatalogUnitRecord,
+    DriveCorrelationRollupRecord, DriveHealthSnapshotInput, DriveHealthSnapshotRecord,
+    FileAuditLog, MediaReadinessOperationRecord, MediaReadinessTransitionInput,
+    NativeObjectCopyRecord, NativeObjectFileRecord, NativeObjectRecord, OperationRecord, RemConfig,
+    SourceLayer, StateError, TapeFileRecord, TapeIoConfig, TapePoolConfig, TapePoolRecord,
+    TapeRecord,
 };
 use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
@@ -63,6 +64,7 @@ pub async fn connect_unix(socket_path: PathBuf) -> Result<Channel, tonic::transp
 pub use remanence_parity::ParityConfig;
 
 mod append_ring;
+mod calibration;
 mod diagnostics;
 mod io_memory;
 mod library;
@@ -450,6 +452,10 @@ pub struct ApiState {
     api_version: String,
     rust_target: String,
     foreign_formats: ForeignFormatRegistry,
+    /// Durable calibration-control store handle (wrap-map read
+    /// ordering, design-read-ordering.md §§4.3/6.5). One instance per
+    /// process; clones share state.
+    calibration_store: CalibrationControlStore,
 }
 
 impl ApiState {
@@ -471,6 +477,7 @@ impl ApiState {
             .into_iter()
             .map(|pool| (pool.id.trim().to_string(), pool))
             .collect();
+        let calibration_store = open_calibration_store_for_config(config)?;
         let mut state = Self::new_with_pool_configs_inner(
             index_path,
             pool_configs,
@@ -482,6 +489,7 @@ impl ApiState {
             config.audit.fsync,
             Arc::new(std::sync::Mutex::new(())),
             live_status_config_from(&config.livestatus),
+            calibration_store,
         );
         state.append_staging_mode = config.daemon.append_staging_mode;
         state.append_ring_bytes = config.daemon.append_ring_bytes;
@@ -505,6 +513,9 @@ impl ApiState {
             .map(|pool| (pool.id.trim().to_string(), pool))
             .collect();
         let audit_dir = default_audit_dir_for_index(index_path.as_path());
+        let calibration_store =
+            CalibrationControlStore::open(default_calibration_dir_for_index(index_path.as_path()))
+                .expect("open calibration-control store beside the index");
         Self::new_with_pool_configs_inner(
             index_path,
             pool_configs,
@@ -513,9 +524,11 @@ impl ApiState {
             false,
             Arc::new(std::sync::Mutex::new(())),
             live_status_config_from(&remanence_state::LiveStatusConfig::default()),
+            calibration_store,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_pool_configs_inner(
         index_path: PathBuf,
         pool_configs: HashMap<String, TapePoolConfig>,
@@ -524,6 +537,7 @@ impl ApiState {
         audit_fsync: bool,
         audit_append_lock: Arc<std::sync::Mutex<()>>,
         live_status_interval: Duration,
+        calibration_store: CalibrationControlStore,
     ) -> Self {
         let daemon_epoch = Uuid::new_v4().as_u128() as u64;
         let checkpoint_journal_dir = default_checkpoint_journal_dir_for_index(index_path.as_path());
@@ -559,7 +573,13 @@ impl ApiState {
             api_version: "v1-draft".to_string(),
             rust_target: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
             foreign_formats: ForeignFormatRegistry::default(),
+            calibration_store,
         }
+    }
+
+    /// Durable calibration-control store handle (cloneable).
+    pub(crate) fn calibration_store(&self) -> &CalibrationControlStore {
+        &self.calibration_store
     }
 
     /// Attach the read-only foreign formats linked by this distribution.
@@ -649,6 +669,7 @@ impl ApiState {
         let (timer_park_tx, timer_park_rx) = tokio::sync::mpsc::unbounded_channel();
         let drive_pool_lifecycle =
             crate::write_owner::DrivePoolLifecycle::with_timer_park_sender(timer_park_tx);
+        let calibration_store = open_calibration_store_for_config(config)?;
         let base_cfg = crate::write_owner::WriteOwnerConfig {
             index_path: index_path.clone(),
             report: report.clone(),
@@ -672,6 +693,7 @@ impl ApiState {
             checkpoint_max_age_seconds: config.daemon.checkpoint_max_age_seconds,
             session_idle_seconds: config.daemon.default_idle_timeout_seconds,
             lifecycle: Some(drive_pool_lifecycle.clone()),
+            calibration_store: calibration_store.clone(),
         };
         let mut drive_txs = HashMap::new();
         for (bay_addr, drive) in opened_drives {
@@ -697,6 +719,7 @@ impl ApiState {
             config.audit.fsync,
             audit_append_lock,
             live_status_config_from(&config.livestatus),
+            calibration_store,
         );
         state.drive_pool = Some(drive_pool.clone());
         state.spool_dir = Some(Arc::new(spool_dir));
@@ -2040,6 +2063,36 @@ fn default_checkpoint_journal_dir_for_index(index_path: &Path) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("checkpoints")
+}
+
+/// Derive the calibration-control directory for index-only (test)
+/// constructors, mirroring [`default_audit_dir_for_index`]: when the
+/// index sits in the conventional `state_dir/index/`, the store lives
+/// at `state_dir/calibration/` — the same directory the config-driven
+/// path derives.
+fn default_calibration_dir_for_index(index_path: &Path) -> PathBuf {
+    let Some(parent) = index_path.parent() else {
+        return PathBuf::from("calibration");
+    };
+    if parent.file_name().and_then(|name| name.to_str()) == Some("index") {
+        return parent
+            .parent()
+            .map(|state_dir| state_dir.join("calibration"))
+            .unwrap_or_else(|| parent.join("calibration"));
+    }
+    parent.join("calibration")
+}
+
+/// Open the durable calibration-control store where `StatePaths`
+/// places it — one derivation rule, owned by `remanence-state`, not
+/// re-derived here.
+fn open_calibration_store_for_config(
+    config: &RemConfig,
+) -> Result<CalibrationControlStore, Status> {
+    let calibration_dir =
+        remanence_state::StatePaths::from_config(Path::new(""), config).calibration_dir;
+    CalibrationControlStore::open(calibration_dir)
+        .map_err(|err| Status::internal(format!("open calibration-control store: {err}")))
 }
 
 fn replay_checkpoint_journal_projections(
@@ -10464,6 +10517,7 @@ BCw3Wyv2UWY=
             checkpoint_max_age_seconds: remanence_state::DEFAULT_CHECKPOINT_MAX_AGE_SECONDS,
             session_idle_seconds: 1800,
             lifecycle: None,
+            calibration_store: state.calibration_store().clone(),
         };
         let drive_tx = crate::write_owner::spawn_drive_actor(BAY, drive, owner_config.clone());
         let changer_tx =

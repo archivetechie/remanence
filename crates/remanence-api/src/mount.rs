@@ -1040,6 +1040,29 @@ pub(crate) fn register_startup_seated_cartridges(
                 .as_ref()
                 .and_then(|barcode| voltags.get(barcode))
                 .and_then(|bytes| <[u8; 16]>::try_from(bytes.as_slice()).ok());
+            // Design §6.5, startup/orphan-recovery row: a cartridge
+            // already seated when the daemon starts is a load this
+            // process never harvested — sessions can open on it with
+            // no fresh mount, so no load harvest will run and no real
+            // fence gets installed for it. Its fence state is
+            // therefore uncertain, and the uncertainty is resolved as
+            // false invalidation: durably advance the epoch and leave
+            // the volume uncalibrated until a genuine next-load
+            // harvest. An old cached map can then never be served for
+            // it, whatever happens during this load.
+            if let Some(tape_uuid) = tape_uuid {
+                if let Err(err) = state
+                    .calibration_store()
+                    .record_possible_write_recovery(tape_uuid)
+                {
+                    tracing::warn!(
+                        target: "remanence_calibration",
+                        tape_uuid = %Uuid::from_bytes(tape_uuid),
+                        error = %err,
+                        "startup seated-cartridge calibration invalidation failed"
+                    );
+                }
+            }
             let parked = pool.park_cartridge(crate::write_owner::SeatedCartridge {
                 bay: bay.element_address,
                 library_serial: library.serial.clone(),
