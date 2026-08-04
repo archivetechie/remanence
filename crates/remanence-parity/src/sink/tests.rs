@@ -741,6 +741,62 @@ fn journaled_sink_commits_object_bundle_as_one_record() {
 }
 
 #[test]
+fn fresh_tape_first_object_span_starts_after_bootstrap_prefix() {
+    // The panel's named fixture: on a fresh tape every wrong reading of the
+    // row sentence is silently wrong. The BOT bootstrap prefix (tape file 0)
+    // occupies [0, 1) with its trailing filemark at 1, so the first object's
+    // span starts at 2 — the prefix is excluded at capture — and the object
+    // occupies [start, start + block_count), exclusive: the trailing
+    // filemark at start + block_count is outside the span.
+    let block_size: u32 = 1024;
+    let mut raw = RecordingRawTapeSink::default();
+    let mut journal = RecordingJournal::new(sample_uuid());
+    {
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw,
+            &mut journal,
+            small_scheme(),
+            sample_uuid(),
+            block_size,
+        )
+        .expect("journaled sink opens");
+        assert_eq!(sink.write_bootstrap().expect("BOT bootstrap"), 0);
+        start_object(&mut sink, 12, block_size);
+        for i in 0..12 {
+            sink.write_block(&fixed_block(i + 1, block_size))
+                .expect("object block writes");
+        }
+        sink.finish_object().expect("object closes");
+    }
+
+    let bootstrap = &journal.bundles[0].entries[0];
+    assert_eq!(bootstrap.kind, TapeFileKind::Bootstrap);
+    assert_eq!(
+        bootstrap.physical_start_hint,
+        Some(0),
+        "the fresh-tape bootstrap prefix itself starts at BOT"
+    );
+
+    let bundle = &journal.bundles[1];
+    let object = &bundle.entries[0];
+    assert_eq!(object.kind, TapeFileKind::Object);
+    assert_eq!(
+        object.physical_start_hint,
+        Some(2),
+        "the first object's start sits after the bootstrap prefix (block 0 + filemark), never at 0"
+    );
+    let span_end_exclusive = object.physical_start_hint.expect("captured") + object.block_count;
+    let sidecar = &bundle.entries[1];
+    assert_eq!(sidecar.kind, TapeFileKind::ParitySidecar);
+    assert_eq!(
+        sidecar.physical_start_hint,
+        Some(span_end_exclusive + 1),
+        "the next tape file begins one PAST the object's trailing filemark, \
+         so start + block_count addresses the filemark — outside the span"
+    );
+}
+
+#[test]
 fn journaled_write_bootstrap_commits_control_bundle() {
     let block_size: u32 = 1024;
     let mut raw = RecordingRawTapeSink::default();
@@ -5896,6 +5952,7 @@ fn sidecar_only_from_resume_appends_after_committed_resume_sidecars() {
             false,
             physical_to_tape_position(first_resume_sidecar_append),
         ),
+        physical_start_lba: None,
     };
     let second_resume_sidecar = SidecarTapeFile {
         tape_file_number: 4,
@@ -5912,6 +5969,7 @@ fn sidecar_only_from_resume_appends_after_committed_resume_sidecars() {
             false,
             physical_to_tape_position(committed_append),
         ),
+        physical_start_lba: None,
     };
     let resume_result = ResumeAppendResult {
         append_after_tape_file_number: 2,

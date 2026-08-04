@@ -1564,6 +1564,8 @@ mod tests {
             plaintext_digest_algorithm: Some("sha256".to_string()),
             stored_digest: Some(vec![0x51; 32]),
             stored_digest_algorithm: Some("sha256".to_string()),
+            global_start_block: None,
+            global_end_block: None,
         }
     }
 

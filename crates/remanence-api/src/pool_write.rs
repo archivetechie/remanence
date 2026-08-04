@@ -299,6 +299,11 @@ impl PoolWriteObjectCopyRecord {
                 algorithm: remanence_state::DIGEST_ALGORITHM_SHA256.to_string(),
                 value: value.to_vec(),
             }),
+            // The write acknowledgement does not consult the copy→tape-file
+            // join; the span is served by the catalog read APIs. Absent =
+            // unknown here, honestly, never a guessed zero.
+            global_start_block: None,
+            global_end_block: None,
         }
     }
 }
@@ -791,6 +796,26 @@ impl NoParityAppendContext {
             .checked_add(object_blocks)
             .ok_or_else(|| {
                 PoolWriteError::InvalidInput("no-parity committed ordinal overflow".to_string())
+            })
+    }
+
+    /// Volume-global LBA of block 0 of the object tape file this append
+    /// writes. The object occupies `[start, start + block_count)`,
+    /// exclusive; the trailing filemark at `start + block_count` is outside
+    /// the span; on a fresh tape the bootstrap prefix (bootstrap block plus
+    /// its trailing filemark) precedes this start and is excluded at
+    /// capture. Dead-reckoned; the covering barrier's device-proved
+    /// position transitively validates the arithmetic.
+    fn object_start_lba(self) -> Result<u64, PoolWriteError> {
+        let fresh_prefix_records = if self.fresh_tape {
+            NO_PARITY_BOOTSTRAP_BLOCKS + 1 // bootstrap block + its trailing filemark
+        } else {
+            0
+        };
+        self.expected_append_lba()?
+            .checked_add(fresh_prefix_records)
+            .ok_or_else(|| {
+                PoolWriteError::InvalidInput("no-parity object start LBA overflows u64".to_string())
             })
     }
 }
@@ -5776,15 +5801,12 @@ fn write_object_delimiter(
         PoolWriteDurability::PerObject => Ok(sink.write_filemarks(1)?),
         PoolWriteDurability::Batched(_) => {
             sink.write_filemarks_immediate(1)?;
-            let fresh_prefix_records = if append.fresh_tape {
-                NO_PARITY_BOOTSTRAP_BLOCKS + 1 // bootstrap block + its trailing filemark
-            } else {
-                0
-            };
+            // The object occupies [start, start + object_blocks); its
+            // trailing filemark sits at start + object_blocks, and the
+            // position after that filemark is one more.
             let position_after_lba = append
-                .expected_append_lba()?
-                .checked_add(fresh_prefix_records)
-                .and_then(|lba| lba.checked_add(object_blocks))
+                .object_start_lba()?
+                .checked_add(object_blocks)
                 .and_then(|lba| lba.checked_add(1))
                 .ok_or_else(|| {
                     PoolWriteError::InvalidInput(
@@ -5884,6 +5906,7 @@ fn no_parity_write_report(
             no_parity_file_catalog_projection(&prepared.options.object_id, file, prepared_file)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let object_start_lba = append.object_start_lba()?;
     let object_close = ObjectWriteSummary {
         tape_file_number: append.tape_file_number,
         first_parity_data_ordinal: 0,
@@ -5912,6 +5935,7 @@ fn no_parity_write_report(
             )
             .with_object_id(prepared.options.object_id.as_bytes().to_vec()),
         ),
+        physical_start_lba: Some(object_start_lba),
     };
     let object = ObjectCatalogProjection {
         object_id: prepared.options.object_id.clone(),
@@ -5937,7 +5961,8 @@ fn no_parity_write_report(
             tape_file_number: 0,
             kind: TapeFileKind::Bootstrap,
             block_count: 1,
-            physical_start_hint: None,
+            // A fresh tape's bootstrap prefix starts at BOT by definition.
+            physical_start_hint: Some(0),
             object_id: None,
             first_parity_data_ordinal: None,
             epoch_id: None,
@@ -5951,7 +5976,7 @@ fn no_parity_write_report(
         tape_file_number: object_close.tape_file_number,
         kind: TapeFileKind::Object,
         block_count: layout.projected_size_blocks,
-        physical_start_hint: None,
+        physical_start_hint: Some(object_start_lba),
         object_id: Some(prepared.options.object_id.clone()),
         first_parity_data_ordinal: None,
         epoch_id: None,
@@ -6075,6 +6100,7 @@ fn no_parity_encrypted_write_report(
             )
             .with_object_id(prepared.options.object_id.as_bytes().to_vec()),
         ),
+        physical_start_lba: Some(append.object_start_lba()?),
     };
     encrypted_write_report(
         tape_uuid,
@@ -6185,7 +6211,8 @@ fn encrypted_write_report(
                 tape_file_number: 0,
                 kind: TapeFileKind::Bootstrap,
                 block_count: 1,
-                physical_start_hint: None,
+                // A fresh tape's bootstrap prefix starts at BOT by definition.
+                physical_start_hint: Some(0),
                 object_id: None,
                 first_parity_data_ordinal: None,
                 epoch_id: None,
@@ -6199,7 +6226,7 @@ fn encrypted_write_report(
             tape_file_number: object_close.tape_file_number,
             kind: TapeFileKind::Object,
             block_count: encrypted.envelope.stored_size_blocks,
-            physical_start_hint: None,
+            physical_start_hint: object_close.physical_start_lba,
             object_id: Some(prepared.options.object_id.clone()),
             first_parity_data_ordinal: None,
             epoch_id: None,
@@ -8748,7 +8775,11 @@ mod tests {
         }
     }
 
-    fn admit(fixture: &PinnedFixture, tape_uuid: TapeUuid, guard: &str) -> Result<SelectedTape, PinnedTapeError> {
+    fn admit(
+        fixture: &PinnedFixture,
+        tape_uuid: TapeUuid,
+        guard: &str,
+    ) -> Result<SelectedTape, PinnedTapeError> {
         admit_pinned_tape_for_write_session(
             &fixture.index,
             tape_uuid,

@@ -1098,6 +1098,21 @@ fn write_rebuilt_sidecar_to_raw(
         )));
     }
 
+    // The sidecar occupies `[start, start + block_count)`, exclusive, with
+    // its trailing filemark at `start + block_count`. This function wrote
+    // exactly `block_count` blocks plus one filemark, and the post-filemark
+    // position was captured from the device above, so the file's block 0 is
+    // that proved position minus (block_count + 1).
+    let physical_start_lba = captured_position
+        .lba
+        .checked_sub(encoded.blocks.len() as u64 + 1);
+    if physical_start_lba.is_none() {
+        return Err(resume_error(format!(
+            "resume sidecar {tape_file_number} post-filemark LBA {} is before its own span",
+            captured_position.lba
+        )));
+    }
+
     Ok(SidecarTapeFile {
         tape_file_number,
         epoch_id: rebuilt.plan.epoch_id,
@@ -1114,6 +1129,7 @@ fn write_rebuilt_sidecar_to_raw(
             end_of_medium,
             physical_to_tape_position(captured_position),
         ),
+        physical_start_lba,
     })
 }
 
@@ -1550,6 +1566,7 @@ mod tests {
             canonical_metadata_hash: [0xA5; 32],
             final_partial_epoch: false,
             filemark_outcome: outcome(u64::from(tape_file_number) + 100),
+            physical_start_lba: None,
         }
     }
 
