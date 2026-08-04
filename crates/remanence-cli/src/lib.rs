@@ -88,6 +88,7 @@ mod archive_ingest;
 mod archive_map;
 mod freeze_drill;
 mod pool_ops;
+mod put;
 mod recovery_report;
 #[cfg(feature = "tui")]
 mod top;
@@ -211,6 +212,7 @@ fn rem_debug_only_reason(cmd: &Command) -> Option<&'static str> {
         }
         Command::Libraries { .. }
         | Command::Library { .. }
+        | Command::PutClient(_)
         | Command::Watch { .. }
         | Command::RebuildCatalogFromJournals { .. }
         | Command::Catalog { .. }
@@ -236,6 +238,7 @@ fn rem_only_reason(cmd: &Command) -> Option<&'static str> {
         | Command::AuditClient { .. }
         | Command::DriveClient { .. }
         | Command::AlarmsClient { .. }
+        | Command::PutClient(_)
         | Command::Top { .. }
         | Command::TapeAlertsAlias { .. }
         | Command::ArchiveVerifyClient { .. } => Some("daemon client commands"),
@@ -513,6 +516,9 @@ enum RemCommand {
         command: RemTapeCommand,
     },
 
+    /// Archive local files onto tape through the daemon write path.
+    Put(put::PutArgs),
+
     /// Probe, catalog, or restore a dump archive through a format driver.
     Archive {
         /// Archive operation to run.
@@ -632,6 +638,7 @@ impl From<RemCommand> for Command {
                     command: other.into(),
                 },
             },
+            RemCommand::Put(args) => Self::PutClient(args),
             RemCommand::Archive { command } => command.into_command(),
             RemCommand::Restore(args) => Self::Archive {
                 command: Box::new(ArchiveCommand::Extract(args.into())),
@@ -658,8 +665,13 @@ fn state_changing_target(cmd: &Command) -> Option<&str> {
         | Command::Unlock { serial } => Some(serial.as_str()),
         Command::Archive { command } => command.tape_target(),
         Command::Dev { command } => Some(command.tape_target()),
+        // `put` writes, but through the daemon, which owns its own admission
+        // control (pool policy, fences, destructive-safety gauntlets). The
+        // `--allow` gate covers direct SCSI mutation only, like the other
+        // daemon-client commands.
         Command::Libraries { .. }
         | Command::Library { .. }
+        | Command::PutClient(_)
         | Command::Watch { .. }
         | Command::RebuildCatalogFromJournals { .. }
         | Command::Catalog { .. }
@@ -1109,6 +1121,10 @@ enum Command {
         #[command(subcommand)]
         command: TapeCommand,
     },
+
+    /// Archive local files onto tape through the daemon write path.
+    #[command(name = "put-client", hide = true)]
+    PutClient(put::PutArgs),
 
     /// Probe, catalog, or restore an archive through a format driver.
     Archive {
@@ -3530,6 +3546,7 @@ where
     }
 
     match &cli.command {
+        Command::PutClient(args) => return put::run_put_command(args, out, err),
         Command::DaemonClient {
             endpoint,
             json,
@@ -3755,6 +3772,7 @@ where
     let allow = cli.allow.clone();
     let allow_derived = cli.allow_derived.clone();
     match cli.command {
+        Command::PutClient(_) => unreachable!("daemon put dispatched pre-discovery"),
         Command::Libraries { json } => {
             if json {
                 print_libraries_json(&report, out);
