@@ -124,9 +124,15 @@ pub fn matrices(
     let starts: Vec<_> = targets.iter().map(|t| pos(t.start_block)).collect();
     let ends: Vec<_> = targets.iter().map(|t| pos(t.end_block)).collect();
     let n = targets.len();
-    let m0: Vec<u64> = (0..n).map(|j| hop_ns(priors, &start, &starts[j]).0).collect();
+    let m0: Vec<u64> = (0..n)
+        .map(|j| hop_ns(priors, &start, &starts[j]).0)
+        .collect();
     let m: Vec<Vec<u64>> = (0..n)
-        .map(|i| (0..n).map(|j| hop_ns(priors, &ends[i], &starts[j]).0).collect())
+        .map(|i| {
+            (0..n)
+                .map(|j| hop_ns(priors, &ends[i], &starts[j]).0)
+                .collect()
+        })
         .collect();
     let term = end_block.map(|e| {
         let ep = pos(e);
@@ -181,7 +187,16 @@ fn dfs(
     for j in 0..n {
         if !used[j] {
             used[j] = true;
-            dfs(j, depth + 1, acc + u128::from(m[current][j]), n, m, term, used, best);
+            dfs(
+                j,
+                depth + 1,
+                acc + u128::from(m[current][j]),
+                n,
+                m,
+                term,
+                used,
+                best,
+            );
             used[j] = false;
         }
     }

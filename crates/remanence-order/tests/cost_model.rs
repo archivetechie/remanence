@@ -38,7 +38,10 @@ fn longitudinal_component_is_monotone_in_distance() {
     let mut prev = ElapsedNs::ZERO;
     for k in 1..=100i128 {
         let c = longitudinal_ns(p, at(0, 1), at(k, 100));
-        assert!(c > prev, "longitudinal cost must grow with distance (k={k})");
+        assert!(
+            c > prev,
+            "longitudinal cost must grow with distance (k={k})"
+        );
         prev = c;
     }
     // Full traverse costs the full published figure.
@@ -140,8 +143,7 @@ fn hop_cost_is_the_component_sum() {
     // from lpos = 100/1000; to: reverse wrap, frac 100/1000 -> lpos 900/1000.
     // longitudinal: 99e9 * 800/1000 = 79.2e9; wrap change: 0.3e9 + 1 *
     // 0.8e9 + 1.5e9; reversal: 2.5e9; fixed 0.5e9.
-    let expected = 79_200_000_000 + 300_000_000 + 800_000_000 + 1_500_000_000
-        + 2_500_000_000
-        + 500_000_000;
+    let expected =
+        79_200_000_000 + 300_000_000 + 800_000_000 + 1_500_000_000 + 2_500_000_000 + 500_000_000;
     assert_eq!(hop_ns(p, &from, &to).0, expected);
 }

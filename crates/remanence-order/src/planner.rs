@@ -223,10 +223,12 @@ pub fn physical_position(
     geometry: &StructuralRow,
     block_lba: u64,
 ) -> Result<(PhysicalPosition, bool), PositionError> {
-    let pos = map.locate(block_lba).map_err(|e| PositionError::OutOfCoverage {
-        block_lba: e.block_lba,
-        mapped_extent_lba: e.mapped_extent_lba,
-    })?;
+    let pos = map
+        .locate(block_lba)
+        .map_err(|e| PositionError::OutOfCoverage {
+            block_lba: e.block_lba,
+            mapped_extent_lba: e.mapped_extent_lba,
+        })?;
     if geometry.wraps_per_band == 0 {
         return Err(PositionError::GeometryInvalid {
             detail: "wraps_per_band is zero",
@@ -344,9 +346,15 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
 
     // Cost matrices. m0[j]: start -> start of j. m[i][j]: end of i ->
     // start of j. term[i]: end of i -> end position.
-    let m0: Vec<u64> = (0..n).map(|j| hop_ns(priors, &start_pos, &starts[j]).0).collect();
+    let m0: Vec<u64> = (0..n)
+        .map(|j| hop_ns(priors, &start_pos, &starts[j]).0)
+        .collect();
     let m: Vec<Vec<u64>> = (0..n)
-        .map(|i| (0..n).map(|j| hop_ns(priors, &ends[i], &starts[j]).0).collect())
+        .map(|i| {
+            (0..n)
+                .map(|j| hop_ns(priors, &ends[i], &starts[j]).0)
+                .collect()
+        })
         .collect();
     let term: Option<Vec<u64>> = end_pos
         .as_ref()
@@ -362,7 +370,11 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
     let mut hops = Vec::with_capacity(n);
     let mut total: u128 = 0;
     for (k, &idx) in order.iter().enumerate() {
-        let ns = if k == 0 { m0[idx] } else { m[order[k - 1]][idx] };
+        let ns = if k == 0 {
+            m0[idx]
+        } else {
+            m[order[k - 1]][idx]
+        };
         total += u128::from(ns);
         hops.push(PlannedHop {
             target_index: idx,
@@ -390,8 +402,7 @@ pub fn plan(input: &PlanInput<'_>) -> Result<Plan, PlanError> {
         hops,
         terminal_ns,
         estimated_total_ns: ElapsedNs(u64::try_from(total).unwrap_or(u64::MAX)),
-        uses_estimated_eod_geometry: any_target_uses_eod
-            || map.completed_spans_highly_dispersed(),
+        uses_estimated_eod_geometry: any_target_uses_eod || map.completed_spans_highly_dispersed(),
     })
 }
 
@@ -451,13 +462,7 @@ fn nearest_neighbour(
 /// 2-opt and Or-opt improvement, first-improvement order, strict
 /// integer decrease only — deterministic. When `pinned` the first
 /// element never moves (the `MIN_TIME_TO_FIRST` remainder optimisation).
-fn improve(
-    order: &mut Vec<usize>,
-    m0: &[u64],
-    m: &[Vec<u64>],
-    term: Option<&[u64]>,
-    pinned: bool,
-) {
+fn improve(order: &mut Vec<usize>, m0: &[u64], m: &[Vec<u64>], term: Option<&[u64]>, pinned: bool) {
     let n = order.len();
     let lo = usize::from(pinned);
     let mut best = route_cost(order, m0, m, term);
@@ -525,9 +530,7 @@ fn solve(
             // Reach the first target quickly: the cheapest first hop,
             // lowest index on a tie. Then optimise the remainder —
             // terminal hop included — with the first pinned.
-            let first = (0..n)
-                .min_by_key(|&j| (m0[j], j))
-                .expect("n >= 2 in solve");
+            let first = (0..n).min_by_key(|&j| (m0[j], j)).expect("n >= 2 in solve");
             let mut order = nearest_neighbour(m0, m, n, Some(first));
             improve(&mut order, m0, m, term, true);
             order

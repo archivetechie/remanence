@@ -848,3 +848,176 @@ fn parse_mode_sense_round_trips_with_builder() {
     assert!(!parsed.write_protected);
     assert_eq!(parsed.worm, WormMediaState::Unknown);
 }
+
+// ---------------------------------------------------------------------
+//  READ END OF WRAP POSITION — the wrap-map harvest read (P4)
+// ---------------------------------------------------------------------
+
+mod reowp_drive_surface {
+    use std::path::Path;
+
+    use remanence_scsi::read_end_of_wrap_position as reowp;
+    use remanence_scsi::report_supported_opcodes::OpcodeSupport;
+    use remanence_scsi::ScsiError;
+
+    use crate::handle::tape_io::TapeIoError;
+    use crate::handle::DriveHandle;
+    use crate::transport::{FixtureTransport, SgTransport, TransferOutcome};
+
+    fn lto9_inquiry() -> Vec<u8> {
+        include_bytes!("../../../../../fixtures/inquiry/drive1-lto9.bin").to_vec()
+    }
+
+    fn vpd80_response(serial: &str) -> Vec<u8> {
+        let bytes = serial.as_bytes();
+        let mut v = vec![0x08u8, 0x80, 0x00, bytes.len() as u8];
+        v.extend_from_slice(bytes);
+        v
+    }
+
+    fn drive_with_responses(responses: Vec<Vec<u8>>) -> DriveHandle {
+        let mut fixture =
+            FixtureTransport::new().with_responses([lto9_inquiry(), vpd80_response("DRV_REOWP")]);
+        for response in responses {
+            fixture.push_response(response);
+        }
+        DriveHandle::open_standalone_with_transport(
+            Path::new("/dev/sg-reowp-test"),
+            Box::new(fixture),
+        )
+        .expect("standalone drive opens over fixture transport")
+    }
+
+    /// A three-wrap long-form response: two completed wraps and the
+    /// EOD wrap, using the documented wrap 0/1 end LOIs from the real
+    /// LTO-8 capture.
+    fn three_wrap_response() -> Vec<u8> {
+        let descriptors: [(u16, u64); 3] = [(0, 207_516), (1, 415_522), (2, 500_000)];
+        let data_len = 2 + descriptors.len() * reowp::DESCRIPTOR_LEN;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(data_len as u16).to_be_bytes());
+        buf.extend_from_slice(&[0x00, 0x00]);
+        for (wrap, end_loi) in descriptors {
+            buf.extend_from_slice(&wrap.to_be_bytes());
+            buf.extend_from_slice(&0u16.to_be_bytes()); // partition 0
+            buf.extend_from_slice(&[0x00, 0x00]); // reserved
+            buf.extend_from_slice(&end_loi.to_be_bytes()[2..8]);
+        }
+        buf
+    }
+
+    #[test]
+    fn read_end_of_wrap_position_issues_the_long_form_cdb_and_parses() {
+        let mut drive = drive_with_responses(vec![three_wrap_response()]);
+        let positions = drive
+            .read_end_of_wrap_position()
+            .expect("harvest read parses");
+        assert_eq!(positions.descriptors().len(), 3);
+        assert_eq!(positions.completed_wraps().len(), 2);
+        let eod = positions.eod_wrap().expect("EOD wrap present");
+        assert_eq!(eod.wrap_number, 2);
+        assert_eq!(eod.end_loi, 500_000);
+    }
+
+    #[test]
+    fn read_end_of_wrap_position_maps_drive_rejection_to_check_condition() {
+        // ILLEGAL REQUEST / INVALID COMMAND OPERATION CODE — how a
+        // drive without the command rejects it. The §6.5 runtime
+        // unsupported-format arm keys on this CheckCondition mapping.
+        struct RejectReowp {
+            inner: FixtureTransport,
+        }
+        impl SgTransport for RejectReowp {
+            fn execute_in(
+                &mut self,
+                cdb: &[u8],
+                buf: &mut [u8],
+            ) -> Result<TransferOutcome, ScsiError> {
+                if cdb.first() == Some(&0xA3) {
+                    let mut sense = vec![0u8; 32];
+                    sense[0] = 0x70;
+                    sense[2] = 0x05; // ILLEGAL REQUEST
+                    sense[7] = 24;
+                    sense[12] = 0x20; // INVALID COMMAND OPERATION CODE
+                    return Err(ScsiError::CheckCondition {
+                        sense,
+                        bytes_transferred: 0,
+                    });
+                }
+                self.inner.execute_in(cdb, buf)
+            }
+            fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
+                self.inner.execute_none(cdb)
+            }
+            fn execute_out(
+                &mut self,
+                cdb: &[u8],
+                buf: &[u8],
+            ) -> Result<TransferOutcome, ScsiError> {
+                self.inner.execute_out(cdb, buf)
+            }
+        }
+
+        let transport = RejectReowp {
+            inner: FixtureTransport::new()
+                .with_responses([lto9_inquiry(), vpd80_response("DRV_REOWP")]),
+        };
+        let mut drive = DriveHandle::open_standalone_with_transport(
+            Path::new("/dev/sg-reowp-reject"),
+            Box::new(transport),
+        )
+        .expect("standalone drive opens");
+
+        let err = drive
+            .read_end_of_wrap_position()
+            .expect_err("rejection surfaces");
+        assert!(
+            matches!(err, TapeIoError::CheckCondition(_)),
+            "drive rejection must map to CheckCondition, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn read_end_of_wrap_position_maps_malformed_bytes_to_malformed_response() {
+        // Declared length that does not describe whole descriptors —
+        // the CDB succeeded but the payload is unusable. This is the
+        // parse-failure arm of the §6.5 uncalibrated transition, and
+        // it must be distinguishable from CheckCondition.
+        let mut ragged = three_wrap_response();
+        ragged[0..2].copy_from_slice(&13u16.to_be_bytes());
+        let mut drive = drive_with_responses(vec![ragged]);
+        let err = drive
+            .read_end_of_wrap_position()
+            .expect_err("ragged payload rejected");
+        assert!(
+            matches!(err, TapeIoError::MalformedResponse(_)),
+            "expected MalformedResponse, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn probe_reports_supported_and_not_supported_answers() {
+        // RSOC one_command response: 4-byte header (byte 1 = SUPPORT),
+        // 12-byte CDB usage data.
+        fn rsoc_response(support: u8) -> Vec<u8> {
+            let mut buf = vec![0x00, support, 0x00, 0x0C];
+            buf.extend_from_slice(&[0u8; 12]);
+            buf
+        }
+
+        let mut drive = drive_with_responses(vec![rsoc_response(0b011)]);
+        assert_eq!(
+            drive
+                .probe_read_end_of_wrap_position_support()
+                .expect("probe parses"),
+            OpcodeSupport::Supported
+        );
+
+        let mut drive = drive_with_responses(vec![rsoc_response(0b001)]);
+        let support = drive
+            .probe_read_end_of_wrap_position_support()
+            .expect("probe parses");
+        assert_eq!(support, OpcodeSupport::NotSupported);
+        assert!(!support.is_supported());
+    }
+}

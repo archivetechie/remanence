@@ -116,16 +116,25 @@ impl fmt::Display for WrapMapError {
                 write!(f, "no partition-zero REOWP descriptors")
             }
             WrapMapError::FirstWrapNotZero { found } => {
-                write!(f, "first partition-zero descriptor reports wrap {found}, not wrap 0")
+                write!(
+                    f,
+                    "first partition-zero descriptor reports wrap {found}, not wrap 0"
+                )
             }
             WrapMapError::NonContiguousWrapNumbers { expected, found } => {
-                write!(f, "non-contiguous wrap numbers: expected {expected}, found {found}")
+                write!(
+                    f,
+                    "non-contiguous wrap numbers: expected {expected}, found {found}"
+                )
             }
             WrapMapError::EndLoiOverflow { wrap } => {
                 write!(f, "end_loi + 1 overflows u64 at wrap {wrap}")
             }
             WrapMapError::NonPositiveCompletedSpan { wrap } => {
-                write!(f, "completed wrap {wrap} has end_loi before its derived start")
+                write!(
+                    f,
+                    "completed wrap {wrap} has end_loi before its derived start"
+                )
             }
             WrapMapError::NonPositiveEodSpan {
                 eod_wrap_start,
@@ -234,7 +243,9 @@ impl WrapMap {
             let expected = i as u32;
             if d.wrap_number != expected {
                 return Err(if i == 0 {
-                    WrapMapError::FirstWrapNotZero { found: d.wrap_number }
+                    WrapMapError::FirstWrapNotZero {
+                        found: d.wrap_number,
+                    }
                 } else {
                     WrapMapError::NonContiguousWrapNumbers {
                         expected,

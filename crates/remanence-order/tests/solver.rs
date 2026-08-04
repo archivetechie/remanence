@@ -6,8 +6,8 @@
 mod common;
 
 use common::{
-    exhaustive_optimal, matrices, min_first_hop_set, random_targets, synthetic_geometry,
-    uniform_map, jitter_map, SplitMix64,
+    exhaustive_optimal, jitter_map, matrices, min_first_hop_set, random_targets,
+    synthetic_geometry, uniform_map, SplitMix64,
 };
 use remanence_order::{
     hop_ns, lookup_geometry, physical_position, plan, GeometryLookup, Objective, Plan, PlanError,
@@ -78,7 +78,10 @@ fn assert_estimates_describe_order(
     match (end_block, plan.terminal_ns) {
         (Some(e), Some(term)) => {
             let expected = hop_ns(&PUBLISHED_PRIORS, &current, &pos(e));
-            assert_eq!(term, expected, "terminal hop must be costed from the last end");
+            assert_eq!(
+                term, expected,
+                "terminal hop must be costed from the last end"
+            );
             total += u128::from(expected.0);
         }
         (None, None) => {}
@@ -103,7 +106,9 @@ fn assert_estimates_describe_order(
 #[test]
 fn solver_within_bound_of_exhaustive_optimum_up_to_ten_targets() {
     let geom = lookup_geometry("LTO-9", "L9");
-    let GeometryLookup::Supported(geom) = geom else { panic!("LTO-9 supported") };
+    let GeometryLookup::Supported(geom) = geom else {
+        panic!("LTO-9 supported")
+    };
     for n in 2..=10usize {
         let seeds = if n >= 9 { 3 } else { 6 };
         for seed in 0..seeds {
@@ -115,8 +120,16 @@ fn solver_within_bound_of_exhaustive_optimum_up_to_ten_targets() {
             };
             let extent = map.mapped_extent_lba();
             let targets = random_targets(&mut rng, n, extent);
-            let start = if seed % 3 == 0 { None } else { Some(rng.below(extent)) };
-            let end = if seed % 2 == 1 { Some(rng.below(extent)) } else { None };
+            let start = if seed % 3 == 0 {
+                None
+            } else {
+                Some(rng.below(extent))
+            };
+            let end = if seed % 2 == 1 {
+                Some(rng.below(extent))
+            } else {
+                None
+            };
 
             for objective in [Objective::MinTotalTime, Objective::MinTimeToFirst] {
                 let p = run_plan(geom, &map, &targets, objective, start, end);
@@ -168,14 +181,27 @@ fn start_position_is_respected() {
     let map = uniform_map(6, 1000, 500);
     let geom = &synthetic_geometry(2);
     let targets = [
-        ReadTarget { start_block: 100, end_block: 120 },  // wrap 0
-        ReadTarget { start_block: 4500, end_block: 4520 }, // wrap 4
+        ReadTarget {
+            start_block: 100,
+            end_block: 120,
+        }, // wrap 0
+        ReadTarget {
+            start_block: 4500,
+            end_block: 4520,
+        }, // wrap 4
     ];
     // From the load point the wrap-0 target is first.
     let from_load = run_plan(geom, &map, &targets, Objective::MinTimeToFirst, None, None);
     assert_eq!(order_of(&from_load)[0], 0);
     // From mid-tape next to the wrap-4 target, that target is first.
-    let from_mid = run_plan(geom, &map, &targets, Objective::MinTimeToFirst, Some(4400), None);
+    let from_mid = run_plan(
+        geom,
+        &map,
+        &targets,
+        Objective::MinTimeToFirst,
+        Some(4400),
+        None,
+    );
     assert_eq!(order_of(&from_mid)[0], 1);
     // The first hop is costed from the supplied start, exactly.
     let pos = |b: u64| physical_position(&map, geom, b).unwrap().0;
@@ -191,9 +217,18 @@ fn end_position_terminal_hop_counts_under_both_objectives() {
     let map = uniform_map(6, 1000, 500);
     let geom = &synthetic_geometry(2);
     let targets = [
-        ReadTarget { start_block: 10, end_block: 20 },
-        ReadTarget { start_block: 2200, end_block: 2260 },
-        ReadTarget { start_block: 3800, end_block: 3810 },
+        ReadTarget {
+            start_block: 10,
+            end_block: 20,
+        },
+        ReadTarget {
+            start_block: 2200,
+            end_block: 2260,
+        },
+        ReadTarget {
+            start_block: 3800,
+            end_block: 3810,
+        },
     ];
     for objective in [Objective::MinTotalTime, Objective::MinTimeToFirst] {
         let without = run_plan(geom, &map, &targets, objective, None, None);
@@ -201,7 +236,9 @@ fn end_position_terminal_hop_counts_under_both_objectives() {
         assert_estimates_describe_order(&without, geom, &map, &targets, None, None);
 
         let with = run_plan(geom, &map, &targets, objective, None, Some(30));
-        let term = with.terminal_ns.expect("terminal hop present when end_block is");
+        let term = with
+            .terminal_ns
+            .expect("terminal hop present when end_block is");
         assert!(term.0 > 0);
         assert_estimates_describe_order(&with, geom, &map, &targets, None, Some(30));
         assert!(
@@ -225,16 +262,41 @@ fn end_position_terminal_hop_counts_under_both_objectives() {
     // end, A-then-B wins because finishing on B avoids a full
     // wrap-and-reversal terminal leg.
     let turn_map = WrapMap::from_descriptors(&[
-        ReowpDescriptor { partition: 0, wrap_number: 0, end_loi: 7999 },
-        ReowpDescriptor { partition: 0, wrap_number: 1, end_loi: 15999 },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 0,
+            end_loi: 7999,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 1,
+            end_loi: 15999,
+        },
     ])
     .unwrap();
-    let a = ReadTarget { start_block: 100, end_block: 15900 }; // ends on reverse wrap 1
-    let b = ReadTarget { start_block: 200, end_block: 210 }; // short, wrap 0
+    let a = ReadTarget {
+        start_block: 100,
+        end_block: 15900,
+    }; // ends on reverse wrap 1
+    let b = ReadTarget {
+        start_block: 200,
+        end_block: 210,
+    }; // short, wrap 0
     let two = [a, b];
     let without = run_plan(geom, &turn_map, &two, Objective::MinTotalTime, None, None);
-    let with_end = run_plan(geom, &turn_map, &two, Objective::MinTotalTime, None, Some(208));
-    assert_eq!(order_of(&without), vec![1, 0], "without an end position B-then-A wins");
+    let with_end = run_plan(
+        geom,
+        &turn_map,
+        &two,
+        Objective::MinTotalTime,
+        None,
+        Some(208),
+    );
+    assert_eq!(
+        order_of(&without),
+        vec![1, 0],
+        "without an end position B-then-A wins"
+    );
     assert_eq!(
         order_of(&with_end),
         vec![0, 1],
@@ -248,7 +310,10 @@ fn end_position_terminal_hop_counts_under_both_objectives() {
 fn zero_and_one_target_plans() {
     let map = uniform_map(4, 1000, 500);
     let geom = &synthetic_geometry(1);
-    let one = [ReadTarget { start_block: 700, end_block: 720 }];
+    let one = [ReadTarget {
+        start_block: 700,
+        end_block: 720,
+    }];
     let p = run_plan(geom, &map, &one, Objective::MinTotalTime, None, None);
     assert_eq!(order_of(&p), vec![0]);
     assert_estimates_describe_order(&p, geom, &map, &one, None, None);
@@ -257,7 +322,14 @@ fn zero_and_one_target_plans() {
     let p0 = run_plan(geom, &map, &none, Objective::MinTotalTime, None, None);
     assert!(p0.hops.is_empty());
     assert_eq!(p0.estimated_total_ns.0, 0);
-    let p0e = run_plan(geom, &map, &none, Objective::MinTotalTime, Some(100), Some(900));
+    let p0e = run_plan(
+        geom,
+        &map,
+        &none,
+        Objective::MinTotalTime,
+        Some(100),
+        Some(900),
+    );
     let pos = |b: u64| physical_position(&map, geom, b).unwrap().0;
     let expected = hop_ns(&PUBLISHED_PRIORS, &pos(100), &pos(900));
     assert_eq!(p0e.terminal_ns, Some(expected));
@@ -279,20 +351,49 @@ fn zero_and_one_target_plans() {
 fn objectives_differ_on_the_two_target_counterexample() {
     // One completed wrap of 10,000 blocks; both targets on forward wrap 0.
     let map = WrapMap::from_descriptors(&[
-        ReowpDescriptor { partition: 0, wrap_number: 0, end_loi: 9999 },
-        ReowpDescriptor { partition: 0, wrap_number: 1, end_loi: 15000 },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 0,
+            end_loi: 9999,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 1,
+            end_loi: 15000,
+        },
     ])
     .unwrap();
     let geom = &synthetic_geometry(1);
-    let a = ReadTarget { start_block: 1, end_block: 100 };
-    let b = ReadTarget { start_block: 2, end_block: 2 };
+    let a = ReadTarget {
+        start_block: 1,
+        end_block: 100,
+    };
+    let b = ReadTarget {
+        start_block: 2,
+        end_block: 2,
+    };
     let targets = [a, b];
 
-    let ttf = run_plan(geom, &map, &targets, Objective::MinTimeToFirst, Some(0), None);
+    let ttf = run_plan(
+        geom,
+        &map,
+        &targets,
+        Objective::MinTimeToFirst,
+        Some(0),
+        None,
+    );
     let total = run_plan(geom, &map, &targets, Objective::MinTotalTime, Some(0), None);
 
-    assert_eq!(order_of(&ttf), vec![0, 1], "MIN_TIME_TO_FIRST takes A first");
-    assert_eq!(order_of(&total), vec![1, 0], "MIN_TOTAL_TIME takes B then A");
+    assert_eq!(
+        order_of(&ttf),
+        vec![0, 1],
+        "MIN_TIME_TO_FIRST takes A first"
+    );
+    assert_eq!(
+        order_of(&total),
+        vec![1, 0],
+        "MIN_TOTAL_TIME takes B then A"
+    );
     assert_ne!(
         order_of(&ttf),
         order_of(&total),
@@ -312,11 +413,26 @@ fn objectives_differ_on_the_two_target_counterexample() {
 fn no_completed_wrap_order_is_invariant_under_denominator() {
     let geom = &synthetic_geometry(1);
     let targets = [
-        ReadTarget { start_block: 100, end_block: 150 },
-        ReadTarget { start_block: 2000, end_block: 2100 },
-        ReadTarget { start_block: 700, end_block: 750 },
-        ReadTarget { start_block: 4000, end_block: 4100 },
-        ReadTarget { start_block: 1500, end_block: 1600 },
+        ReadTarget {
+            start_block: 100,
+            end_block: 150,
+        },
+        ReadTarget {
+            start_block: 2000,
+            end_block: 2100,
+        },
+        ReadTarget {
+            start_block: 700,
+            end_block: 750,
+        },
+        ReadTarget {
+            start_block: 4000,
+            end_block: 4100,
+        },
+        ReadTarget {
+            start_block: 1500,
+            end_block: 1600,
+        },
     ];
     // Two single-wrap maps: same written data, different observed spans,
     // hence different (but both positive) denominators.
@@ -361,30 +477,78 @@ fn uses_estimated_eod_geometry_flag() {
     // Well-behaved map: completed spans tight, EOD wrap 3.
     let map = uniform_map(4, 1000, 500);
     let completed_only = [
-        ReadTarget { start_block: 100, end_block: 150 },
-        ReadTarget { start_block: 2200, end_block: 2300 },
+        ReadTarget {
+            start_block: 100,
+            end_block: 150,
+        },
+        ReadTarget {
+            start_block: 2200,
+            end_block: 2300,
+        },
     ];
-    let p = run_plan(geom, &map, &completed_only, Objective::MinTotalTime, None, None);
-    assert!(!p.uses_estimated_eod_geometry, "no EOD target, no dispersion: flag clear");
+    let p = run_plan(
+        geom,
+        &map,
+        &completed_only,
+        Objective::MinTotalTime,
+        None,
+        None,
+    );
+    assert!(
+        !p.uses_estimated_eod_geometry,
+        "no EOD target, no dispersion: flag clear"
+    );
 
     let with_eod = [
-        ReadTarget { start_block: 100, end_block: 150 },
-        ReadTarget { start_block: 3100, end_block: 3150 }, // inside EOD wrap 3
+        ReadTarget {
+            start_block: 100,
+            end_block: 150,
+        },
+        ReadTarget {
+            start_block: 3100,
+            end_block: 3150,
+        }, // inside EOD wrap 3
     ];
     let p = run_plan(geom, &map, &with_eod, Objective::MinTotalTime, None, None);
-    assert!(p.uses_estimated_eod_geometry, "an EOD-wrap target sets the flag");
+    assert!(
+        p.uses_estimated_eod_geometry,
+        "an EOD-wrap target sets the flag"
+    );
 
     // Highly dispersed completed spans set the flag even when every
     // target is on a completed wrap.
     let dispersed = WrapMap::from_descriptors(&[
-        ReowpDescriptor { partition: 0, wrap_number: 0, end_loi: 499 },
-        ReowpDescriptor { partition: 0, wrap_number: 1, end_loi: 1499 },
-        ReowpDescriptor { partition: 0, wrap_number: 2, end_loi: 3099 },
-        ReowpDescriptor { partition: 0, wrap_number: 3, end_loi: 3600 },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 0,
+            end_loi: 499,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 1,
+            end_loi: 1499,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 2,
+            end_loi: 3099,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 3,
+            end_loi: 3600,
+        },
     ])
     .unwrap();
     assert!(dispersed.completed_spans_highly_dispersed());
-    let p = run_plan(geom, &dispersed, &completed_only, Objective::MinTotalTime, None, None);
+    let p = run_plan(
+        geom,
+        &dispersed,
+        &completed_only,
+        Objective::MinTotalTime,
+        None,
+        None,
+    );
     assert!(
         p.uses_estimated_eod_geometry,
         "high dispersion marks the volume's EOD estimate unreliable"
@@ -425,10 +589,22 @@ fn degenerate_partially_written_tape() {
     // 5 wraps: 4 completed, EOD wrap 4 written 300 of ~1000.
     let map = uniform_map(5, 1000, 300);
     let targets = [
-        ReadTarget { start_block: 50, end_block: 80 },
-        ReadTarget { start_block: 4100, end_block: 4150 }, // EOD wrap
-        ReadTarget { start_block: 2500, end_block: 2550 },
-        ReadTarget { start_block: 3999, end_block: 3999 }, // last completed block
+        ReadTarget {
+            start_block: 50,
+            end_block: 80,
+        },
+        ReadTarget {
+            start_block: 4100,
+            end_block: 4150,
+        }, // EOD wrap
+        ReadTarget {
+            start_block: 2500,
+            end_block: 2550,
+        },
+        ReadTarget {
+            start_block: 3999,
+            end_block: 3999,
+        }, // last completed block
     ];
     let p = run_plan(geom, &map, &targets, Objective::MinTotalTime, None, None);
     assert_permutation(&order_of(&p), targets.len());
@@ -461,7 +637,10 @@ fn degenerate_lto7_like_and_lto9_like() {
         let (m0, m, term) = matrices(&map, geom, &PUBLISHED_PRIORS, &targets, None, None);
         let firsts: Vec<usize> = (0..targets.len()).collect();
         let optimal = exhaustive_optimal(&m0, &m, term.as_deref(), &firsts);
-        assert!(got * OPTIMALITY_BOUND_DEN <= optimal * OPTIMALITY_BOUND_NUM, "{gen}");
+        assert!(
+            got * OPTIMALITY_BOUND_DEN <= optimal * OPTIMALITY_BOUND_NUM,
+            "{gen}"
+        );
     }
 }
 
@@ -475,8 +654,14 @@ fn target_end_before_start_is_rejected() {
     let map = uniform_map(4, 1000, 500);
     let geom = &synthetic_geometry(1);
     let targets = [
-        ReadTarget { start_block: 10, end_block: 20 },
-        ReadTarget { start_block: 500, end_block: 400 },
+        ReadTarget {
+            start_block: 10,
+            end_block: 20,
+        },
+        ReadTarget {
+            start_block: 500,
+            end_block: 400,
+        },
     ];
     let err = plan(&PlanInput {
         geometry: geom,
@@ -509,23 +694,48 @@ fn coverage_failures_name_the_offender() {
         end_block: None,
     };
 
-    let targets = [ReadTarget { start_block: 3400, end_block: extent }];
-    let err = plan(&PlanInput { targets: &targets, ..base }).unwrap_err();
+    let targets = [ReadTarget {
+        start_block: 3400,
+        end_block: extent,
+    }];
+    let err = plan(&PlanInput {
+        targets: &targets,
+        ..base
+    })
+    .unwrap_err();
     assert_eq!(
         err,
-        PlanError::TargetOutOfCoverage { index: 0, block_lba: extent, mapped_extent_lba: extent }
+        PlanError::TargetOutOfCoverage {
+            index: 0,
+            block_lba: extent,
+            mapped_extent_lba: extent
+        }
     );
 
-    let err = plan(&PlanInput { start_block: Some(extent), ..base }).unwrap_err();
+    let err = plan(&PlanInput {
+        start_block: Some(extent),
+        ..base
+    })
+    .unwrap_err();
     assert_eq!(
         err,
-        PlanError::StartOutOfCoverage { block_lba: extent, mapped_extent_lba: extent }
+        PlanError::StartOutOfCoverage {
+            block_lba: extent,
+            mapped_extent_lba: extent
+        }
     );
 
-    let err = plan(&PlanInput { end_block: Some(extent + 7), ..base }).unwrap_err();
+    let err = plan(&PlanInput {
+        end_block: Some(extent + 7),
+        ..base
+    })
+    .unwrap_err();
     assert_eq!(
         err,
-        PlanError::EndOutOfCoverage { block_lba: extent + 7, mapped_extent_lba: extent }
+        PlanError::EndOutOfCoverage {
+            block_lba: extent + 7,
+            mapped_extent_lba: extent
+        }
     );
 }
 
@@ -535,7 +745,10 @@ fn coverage_failures_name_the_offender() {
 fn map_exceeding_geometry_is_rejected() {
     let map = uniform_map(6, 1000, 500);
     let geom = &synthetic_geometry(1); // 4 wraps only
-    let targets = [ReadTarget { start_block: 10, end_block: 20 }];
+    let targets = [ReadTarget {
+        start_block: 10,
+        end_block: 20,
+    }];
     let err = plan(&PlanInput {
         geometry: geom,
         map: &map,
@@ -546,7 +759,13 @@ fn map_exceeding_geometry_is_rejected() {
         end_block: None,
     })
     .unwrap_err();
-    assert_eq!(err, PlanError::MapExceedsGeometry { map_wraps: 6, geometry_wraps: 4 });
+    assert_eq!(
+        err,
+        PlanError::MapExceedsGeometry {
+            map_wraps: 6,
+            geometry_wraps: 4
+        }
+    );
 }
 
 /// A geometry row with zero wraps-per-band cannot band-classify
@@ -557,7 +776,10 @@ fn zero_wraps_per_band_is_rejected() {
     let mut geom = synthetic_geometry(1);
     geom.wraps_per_band = 0;
     geom.wraps = 4; // keep the wrap-count gate out of the way
-    let targets = [ReadTarget { start_block: 10, end_block: 20 }];
+    let targets = [ReadTarget {
+        start_block: 10,
+        end_block: 20,
+    }];
     let err = plan(&PlanInput {
         geometry: &geom,
         map: &map,
