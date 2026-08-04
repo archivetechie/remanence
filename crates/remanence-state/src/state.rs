@@ -13,6 +13,7 @@ use time::Duration;
 use crate::audit::{
     AuditActor, AuditEvent, AuditEventRecord, AuditSink, AuditSubject, FileAuditLog, SourceLayer,
 };
+use crate::calibration::CalibrationControlStore;
 use crate::config::{load_config, validate_trusted_volume_paths, RemConfig};
 use crate::error::StateError;
 use crate::index::{
@@ -32,6 +33,7 @@ pub struct StateHandle {
     _lock: StateLockGuard,
     audit: FileAuditLog,
     index: CatalogIndex,
+    calibration: CalibrationControlStore,
 }
 
 /// Non-fatal configuration condition observed while opening state.
@@ -101,6 +103,7 @@ impl StateHandle {
         let mut index = CatalogIndex::open(&paths.sqlite_path)?;
         let config_warnings = project_configured_tape_pools(&mut index, &config)?;
         index.reconcile_cleaning_prefixes(&config.cleaning.voltag_prefixes)?;
+        let calibration = CalibrationControlStore::open(&paths.calibration_dir)?;
         Ok(Self {
             paths,
             config,
@@ -108,6 +111,7 @@ impl StateHandle {
             _lock: lock,
             audit,
             index,
+            calibration,
         })
     }
 
@@ -122,7 +126,18 @@ impl StateHandle {
         reset_directory_contents(&paths.journal_dir)?;
         reset_directory_contents(&paths.tape_cache_dir)?;
         remove_sqlite_file_and_sidecars(&paths.sqlite_path)?;
+        // `paths.calibration_dir` is deliberately NOT reset. The
+        // calibration-control store is durable across catalog reset
+        // (design-read-ordering.md §4.3): its generation allocator
+        // must never restart, or a generation could be re-issued
+        // after reset and resurrect a caller-cached negative. The
+        // wrap-map *projection* died with the SQLite file above; the
+        // eviction transitions below uncalibrate every known volume
+        // with fresh generations, so nothing servable survives while
+        // the allocator's history does.
         ensure_state_directories(&paths)?;
+        let calibration = CalibrationControlStore::open(&paths.calibration_dir)?;
+        calibration.record_all_maps_evicted("catalog_reset")?;
         let mut index = CatalogIndex::open(&paths.sqlite_path)?;
         let _config_warnings = project_configured_tape_pools(&mut index, &config)?;
         index.reconcile_cleaning_prefixes(&config.cleaning.voltag_prefixes)?;
@@ -154,6 +169,13 @@ impl StateHandle {
         &mut self.index
     }
 
+    /// Return the durable calibration-control store (cloneable
+    /// handle). This is the authority on wrap-map servability; it
+    /// survives projection rebuild and catalog reset.
+    pub fn calibration_control(&self) -> &CalibrationControlStore {
+        &self.calibration
+    }
+
     /// Replay the authoritative audit log into SQLite-derived projections.
     pub fn replay_audit_projection(&mut self) -> Result<AuditReplayReport, StateError> {
         let records = FileAuditLog::replay(&self.paths.audit_dir)?;
@@ -164,8 +186,18 @@ impl StateHandle {
     pub fn rebuild_index_from_journals(&mut self) -> Result<RebuildReport, StateError> {
         let audit_records = FileAuditLog::replay(&self.paths.audit_dir)?;
         let tape_journals = self.load_tape_journal_rebuild_inputs()?;
-        self.index
-            .rebuild_from_authoritative_sources(&audit_records, &tape_journals)
+        let report = self
+            .index
+            .rebuild_from_authoritative_sources(&audit_records, &tape_journals)?;
+        // Rebuild cleared the wrap_maps projection (design §6.5:
+        // "catalog projection rebuild → UNCALIBRATED for every
+        // evicted map; control rows and allocator remain"). Record
+        // the matching durable transitions so every volume carries a
+        // fresh generation and stays uncalibrated until its next
+        // load harvest.
+        self.calibration
+            .record_all_maps_evicted("projection_rebuild")?;
+        Ok(report)
     }
 
     /// Run startup replay and mark non-terminal prior work as lost by restart.
@@ -439,6 +471,22 @@ impl StateHandle {
         let sessions = self.index.non_terminal_sessions()?;
         let count = sessions.len() as u64;
         for session in sessions {
+            // A write session that was non-terminal when the process
+            // died may have dispatched a media-modifying CDB whose
+            // fence state is now uncertain. The design's §6.5 startup
+            // row resolves that uncertainty as false invalidation:
+            // durably advance the epoch and leave the volume
+            // uncalibrated until a fresh load harvest. Read sessions
+            // dispatch nothing media-modifying and are left alone.
+            if session.session_kind == "write" {
+                if let Some(tape_uuid) = session
+                    .tape_uuid
+                    .as_deref()
+                    .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+                {
+                    self.calibration.record_possible_write_recovery(tape_uuid)?;
+                }
+            }
             let mut detail = BTreeMap::new();
             detail.insert(
                 "session_kind".to_string(),
@@ -529,6 +577,7 @@ fn ensure_state_directories(paths: &StatePaths) -> Result<(), StateError> {
         create_private_dir(parent)?;
     }
     create_private_dir(&paths.tape_cache_dir)?;
+    create_private_dir(&paths.calibration_dir)?;
     Ok(())
 }
 
@@ -675,7 +724,7 @@ mod tests {
 
     use super::*;
     use crate::config::parse_config_toml;
-    use crate::index::TapeKindFilter;
+    use crate::index::{StoredWrapDescriptor, TapeKindFilter, WrapMapCacheRecord};
 
     fn config_text(root: &Path) -> String {
         format!(
@@ -1331,5 +1380,335 @@ pool_id = "camera.copy-a"
                     Some(CborValue::Text(value)) if value == "daemon_restart"
                 )
         }));
+    }
+
+    // -----------------------------------------------------------------
+    //  Wrap-map cache and calibration lifecycle (design §§4.3, 6.5)
+    // -----------------------------------------------------------------
+
+    fn wrap_map_record(
+        tape_uuid: [u8; 16],
+        write_epoch: u64,
+        generation: u64,
+    ) -> WrapMapCacheRecord {
+        WrapMapCacheRecord {
+            tape_uuid,
+            descriptors: vec![
+                StoredWrapDescriptor {
+                    partition: 0,
+                    wrap_number: 0,
+                    end_loi: 207_516,
+                },
+                StoredWrapDescriptor {
+                    partition: 0,
+                    wrap_number: 1,
+                    end_loi: 415_522,
+                },
+                StoredWrapDescriptor {
+                    partition: 0,
+                    wrap_number: 2,
+                    end_loi: 500_000,
+                },
+            ],
+            mapped_extent_lba: 500_000,
+            write_epoch,
+            calibration_generation: generation,
+            harvested_at_utc: "2026-08-04T00:00:00Z".to_string(),
+        }
+    }
+
+    /// The cache stores raw descriptors and `mapped_extent_lba`
+    /// separately, round-trips them exactly, and eviction of a single
+    /// row works. No wrap start ever enters storage.
+    #[test]
+    fn wrap_map_cache_round_trips_raw_descriptors() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-state-wrapmap")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).expect("write config");
+        let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+        let tape_uuid = [0x42u8; 16];
+
+        let record = wrap_map_record(tape_uuid, 3, 17);
+        handle
+            .catalog_index()
+            .upsert_wrap_map(&record)
+            .expect("upsert wrap map");
+        let fetched = handle
+            .catalog_index()
+            .get_wrap_map(&tape_uuid)
+            .expect("get wrap map")
+            .expect("row present");
+        assert_eq!(fetched, record, "raw descriptors round-trip unchanged");
+
+        // Replacement at the next load harvest overwrites in place.
+        let extended = wrap_map_record(tape_uuid, 4, 21);
+        handle
+            .catalog_index()
+            .upsert_wrap_map(&extended)
+            .expect("replace wrap map");
+        let fetched = handle
+            .catalog_index()
+            .get_wrap_map(&tape_uuid)
+            .expect("get wrap map")
+            .expect("row present");
+        assert_eq!(fetched.write_epoch, 4);
+
+        assert!(handle
+            .catalog_index()
+            .delete_wrap_map(&tape_uuid)
+            .expect("delete"));
+        assert!(handle
+            .catalog_index()
+            .get_wrap_map(&tape_uuid)
+            .expect("get after delete")
+            .is_none());
+        assert!(
+            !handle
+                .catalog_index()
+                .delete_wrap_map(&tape_uuid)
+                .expect("second delete"),
+            "eviction is idempotent"
+        );
+    }
+
+    /// §6.5 "catalog projection rebuild" row: rebuild evicts the map
+    /// table, the control rows and allocator remain, and every volume
+    /// is uncalibrated under a fresh generation.
+    #[test]
+    fn projection_rebuild_evicts_wrap_maps_and_uncalibrates() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-state-rebuild-maps")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).expect("write config");
+        let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+        let tape_uuid = [0x43u8; 16];
+
+        let transition = handle
+            .calibration_control()
+            .record_harvest_success(tape_uuid, 0)
+            .expect("calibrate");
+        let crate::calibration::HarvestTransition::Calibrated {
+            write_epoch,
+            calibration_generation,
+        } = transition
+        else {
+            panic!("expected calibration, got {transition:?}");
+        };
+        handle
+            .catalog_index()
+            .upsert_wrap_map(&wrap_map_record(
+                tape_uuid,
+                write_epoch,
+                calibration_generation,
+            ))
+            .expect("store map");
+        assert!(handle
+            .calibration_control()
+            .is_map_servable(tape_uuid, write_epoch));
+
+        handle.rebuild_index_from_journals().expect("rebuild");
+
+        assert!(
+            handle
+                .catalog_index()
+                .get_wrap_map(&tape_uuid)
+                .expect("get after rebuild")
+                .is_none(),
+            "rebuild evicts the wrap-map projection rather than preserving it"
+        );
+        let row = handle.calibration_control().row(tape_uuid);
+        assert_eq!(
+            row.state,
+            crate::calibration::VolumeCalibrationState::Uncalibrated,
+            "the volume is uncalibrated until its next load harvest"
+        );
+        assert_eq!(row.write_epoch, write_epoch, "the epoch survives rebuild");
+        assert!(
+            row.calibration_generation > calibration_generation,
+            "eviction stamped a fresh generation"
+        );
+        assert!(!handle
+            .calibration_control()
+            .is_map_servable(tape_uuid, write_epoch));
+    }
+
+    /// §6.5 "catalog reset" row plus the §4.3 monotonicity claim: the
+    /// reset evicts every map and uncalibrates every volume, while the
+    /// calibration-control store — including the generation allocator —
+    /// survives in `state_dir/calibration/`, so no generation issued
+    /// before the reset is ever issued again after it.
+    #[test]
+    fn catalog_reset_evicts_maps_and_never_reissues_generations() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-state-reset-maps")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).expect("write config");
+        let tape_uuid = [0x44u8; 16];
+
+        let (pre_reset_generation, map_epoch) = {
+            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            let transition = handle
+                .calibration_control()
+                .record_harvest_success(tape_uuid, 0)
+                .expect("calibrate");
+            let crate::calibration::HarvestTransition::Calibrated {
+                write_epoch,
+                calibration_generation,
+            } = transition
+            else {
+                panic!("expected calibration, got {transition:?}");
+            };
+            handle
+                .catalog_index()
+                .upsert_wrap_map(&wrap_map_record(
+                    tape_uuid,
+                    write_epoch,
+                    calibration_generation,
+                ))
+                .expect("store map");
+            (calibration_generation, write_epoch)
+        };
+
+        StateHandle::reset_catalog_from_config_file(&config_path).expect("reset catalog");
+
+        // The calibration store's journal survived the reset in place.
+        assert!(temp
+            .path()
+            .join("calibration")
+            .join(crate::calibration::CALIBRATION_CONTROL_FILENAME)
+            .is_file());
+
+        let mut handle = StateHandle::open_from_config_file(&config_path).expect("reopen");
+        assert!(
+            handle
+                .catalog_index()
+                .get_wrap_map(&tape_uuid)
+                .expect("get after reset")
+                .is_none(),
+            "reset evicts the wrap-map projection"
+        );
+        let row = handle.calibration_control().row(tape_uuid);
+        assert_eq!(
+            row.state,
+            crate::calibration::VolumeCalibrationState::Uncalibrated
+        );
+        assert!(
+            row.calibration_generation > pre_reset_generation,
+            "the reset's eviction transition allocated a fresh generation"
+        );
+        assert!(!handle
+            .calibration_control()
+            .is_map_servable(tape_uuid, map_epoch));
+
+        // The allocator never dips below its pre-reset high-water
+        // mark: the very next generation issued for ANY volume is
+        // strictly greater than everything issued before the reset.
+        let fresh = handle
+            .calibration_control()
+            .record_harvest_failure([0x55u8; 16])
+            .expect("post-reset transition");
+        assert!(
+            fresh > pre_reset_generation,
+            "a generation issued before the reset is never reissued after it"
+        );
+    }
+
+    /// §6.5 startup/orphan-recovery row: a write session that was
+    /// non-terminal when the process died leaves its volume invalid —
+    /// epoch durably advanced, uncalibrated — until a fresh load
+    /// harvest. A lost read session does not.
+    #[test]
+    fn startup_replay_invalidates_possibly_written_volumes() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-state-startup-cal")
+            .tempdir()
+            .expect("temp dir");
+        let config = parse_config_toml(&config_text(temp.path())).expect("config");
+        let paths = StatePaths::from_config(temp.path().join("config.toml"), &config);
+        let write_tape = [0x66u8; 16];
+        let read_tape = [0x77u8; 16];
+        let write_session = Uuid::from_u128(0x71);
+        let read_session = Uuid::from_u128(0x72);
+
+        let (write_map_epoch, read_map_epoch) = {
+            let mut handle =
+                StateHandle::open_with_config(paths.clone(), config.clone()).expect("open");
+            for (session_id, kind, tape) in [
+                (write_session, "write", write_tape),
+                (read_session, "read", read_tape),
+            ] {
+                handle
+                    .audit()
+                    .append(AuditEventRecord {
+                        actor: AuditActor::User("alice".to_string()),
+                        source_layer: SourceLayer::Layer5,
+                        operation_id: None,
+                        session_id: Some(session_id),
+                        idempotency_key: None,
+                        event: AuditEvent::SessionOpened,
+                        subject: AuditSubject {
+                            kind: kind.to_string(),
+                            id: Some(session_id.to_string()),
+                        },
+                        detail: BTreeMap::from([
+                            (
+                                "session_kind".to_string(),
+                                CborValue::Text(kind.to_string()),
+                            ),
+                            ("tape_uuid".to_string(), CborValue::Bytes(tape.to_vec())),
+                        ]),
+                    })
+                    .expect("append session opened");
+            }
+            let mut epochs = Vec::new();
+            for tape in [write_tape, read_tape] {
+                let transition = handle
+                    .calibration_control()
+                    .record_harvest_success(tape, 0)
+                    .expect("calibrate");
+                let crate::calibration::HarvestTransition::Calibrated { write_epoch, .. } =
+                    transition
+                else {
+                    panic!("expected calibration");
+                };
+                epochs.push(write_epoch);
+            }
+            (epochs[0], epochs[1])
+        };
+
+        // The process "dies" (handle dropped) and a new one replays.
+        let mut handle = StateHandle::open_with_config(paths, config).expect("reopen");
+        let report = handle.startup_replay().expect("startup replay");
+        assert_eq!(report.lost_sessions_marked, 2);
+
+        let write_row = handle.calibration_control().row(write_tape);
+        assert_eq!(
+            write_row.write_epoch,
+            write_map_epoch + 1,
+            "possibly-written volume's epoch durably advanced"
+        );
+        assert_eq!(
+            write_row.state,
+            crate::calibration::VolumeCalibrationState::Uncalibrated
+        );
+        assert!(
+            !handle
+                .calibration_control()
+                .is_map_servable(write_tape, write_map_epoch),
+            "invalid until a fresh load harvest"
+        );
+
+        let read_row = handle.calibration_control().row(read_tape);
+        assert_eq!(
+            read_row.write_epoch, read_map_epoch,
+            "a lost read session dispatches nothing media-modifying and is not invalidated"
+        );
     }
 }

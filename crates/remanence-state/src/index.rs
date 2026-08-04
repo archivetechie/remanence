@@ -21,7 +21,7 @@ use crate::config::{derive_tape_pool_from_voltag, TapePoolRuleConfig};
 use crate::error::StateError;
 
 /// Current Layer 4 SQLite schema version.
-pub const SCHEMA_VERSION: u32 = 14;
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// Digest algorithm emitted by the current catalog writers.
 pub const DIGEST_ALGORITHM_SHA256: &str = "sha256";
@@ -389,6 +389,45 @@ pub struct TapeIoFenceRecord {
     pub updated_at_utc: String,
     /// Operator release acknowledgment.
     pub release_ack: Option<String>,
+}
+
+/// One raw REOWP wrap descriptor exactly as harvested — design
+/// `design-read-ordering.md` §6.4. The cache stores these unchanged;
+/// wrap starts are derived at planning time, and no synthetic EOD
+/// boundary is ever materialised into this list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredWrapDescriptor {
+    /// Tape partition the descriptor reports on.
+    pub partition: u32,
+    /// Wrap the descriptor reports on.
+    pub wrap_number: u32,
+    /// End logical object identifier: inclusive for completed wraps,
+    /// EOD's exclusive position for the wrap holding EOD.
+    pub end_loi: u64,
+}
+
+/// One volume's cached wrap map — an **evicted projection** (§4.3):
+/// catalog rebuild and catalog reset both discard the `wrap_maps`
+/// table, and a fresh load harvest lazily rebuilds it. Validity is
+/// governed by the durable calibration-control store, not by this
+/// row: serving requires `write_epoch` equality with the control row
+/// plus a `Calibrated` state there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WrapMapCacheRecord {
+    /// Volume the map belongs to.
+    pub tape_uuid: [u8; 16],
+    /// Raw descriptors exactly as harvested.
+    pub descriptors: Vec<StoredWrapDescriptor>,
+    /// Exclusive coverage bound — the EOD descriptor's `end_loi`,
+    /// stored separately from any wrap start (§6.4). The only value
+    /// coverage-gap checks may use.
+    pub mapped_extent_lba: u64,
+    /// Durable write epoch the map was harvested under.
+    pub write_epoch: u64,
+    /// Calibration generation stamped at the harvest transition.
+    pub calibration_generation: u64,
+    /// When the harvest happened (RFC 3339 UTC).
+    pub harvested_at_utc: String,
 }
 
 /// Non-terminal session found during startup replay.
@@ -1217,6 +1256,101 @@ impl CatalogIndex {
             .map_err(|err| sqlite_error("record tape io fence", err))?;
         self.tape_io_fence_by_quarantine_id(quarantine_id.as_str())?
             .ok_or_else(|| StateError::IndexCorrupt("tape-I/O fence vanished".into()))
+    }
+
+    /// Store (or replace) a volume's cached wrap map — the evicted
+    /// projection built by the load harvest. The raw descriptors are
+    /// stored exactly as harvested; nothing here validates them,
+    /// because the harvest layer already ran the descriptors through
+    /// `WrapMap::from_descriptors` before recording the calibrated
+    /// transition this row is stamped with.
+    pub fn upsert_wrap_map(&mut self, record: &WrapMapCacheRecord) -> Result<(), StateError> {
+        let descriptors_json = serde_json::to_string(&record.descriptors).map_err(|err| {
+            StateError::IndexCorrupt(format!("encode wrap-map descriptors: {err}"))
+        })?;
+        self.conn
+            .execute(
+                "insert into wrap_maps(
+                   tape_uuid, descriptors_json, mapped_extent_lba,
+                   write_epoch, calibration_generation, harvested_at_utc
+                 )
+                 values(?1, ?2, ?3, ?4, ?5, ?6)
+                 on conflict(tape_uuid) do update set
+                   descriptors_json = excluded.descriptors_json,
+                   mapped_extent_lba = excluded.mapped_extent_lba,
+                   write_epoch = excluded.write_epoch,
+                   calibration_generation = excluded.calibration_generation,
+                   harvested_at_utc = excluded.harvested_at_utc",
+                params![
+                    record.tape_uuid.as_slice(),
+                    descriptors_json.as_str(),
+                    record.mapped_extent_lba,
+                    record.write_epoch,
+                    record.calibration_generation,
+                    record.harvested_at_utc.as_str(),
+                ],
+            )
+            .map_err(|err| sqlite_error("upsert wrap map", err))?;
+        Ok(())
+    }
+
+    /// Fetch a volume's cached wrap map, if one is present. Presence
+    /// is not validity: the caller must check the durable
+    /// calibration-control row before serving.
+    pub fn get_wrap_map(
+        &self,
+        tape_uuid: &[u8; 16],
+    ) -> Result<Option<WrapMapCacheRecord>, StateError> {
+        let row = self
+            .conn
+            .query_row(
+                "select descriptors_json, mapped_extent_lba, write_epoch,
+                        calibration_generation, harvested_at_utc
+                 from wrap_maps where tape_uuid = ?1",
+                params![tape_uuid.as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, u64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|err| sqlite_error("query wrap map", err))?;
+        let Some((descriptors_json, mapped_extent_lba, write_epoch, generation, harvested)) = row
+        else {
+            return Ok(None);
+        };
+        let descriptors: Vec<StoredWrapDescriptor> = serde_json::from_str(&descriptors_json)
+            .map_err(|err| {
+                StateError::IndexCorrupt(format!("decode wrap-map descriptors: {err}"))
+            })?;
+        Ok(Some(WrapMapCacheRecord {
+            tape_uuid: *tape_uuid,
+            descriptors,
+            mapped_extent_lba,
+            write_epoch,
+            calibration_generation: generation,
+            harvested_at_utc: harvested,
+        }))
+    }
+
+    /// Evict one volume's cached wrap map. Returns whether a row
+    /// existed. The durable calibration-control transition that
+    /// accompanies eviction is the caller's responsibility — the
+    /// projection cannot reach across erasure classes.
+    pub fn delete_wrap_map(&mut self, tape_uuid: &[u8; 16]) -> Result<bool, StateError> {
+        let changed = self
+            .conn
+            .execute(
+                "delete from wrap_maps where tape_uuid = ?1",
+                params![tape_uuid.as_slice()],
+            )
+            .map_err(|err| sqlite_error("delete wrap map", err))?;
+        Ok(changed > 0)
     }
 
     /// List active tape-I/O fences.
@@ -4859,6 +4993,12 @@ fn clear_rebuildable_tables(tx: &rusqlite::Transaction<'_>) -> Result<(), StateE
         "operations",
         "sessions",
         "ingested_sources",
+        // The wrap-map cache is an evicted projection (design
+        // §6.5): rebuild discards it rather than preserving or
+        // replaying it, and the next load harvest rebuilds it. Its
+        // validity control rows live in the durable calibration
+        // store, which rebuild does not touch.
+        "wrap_maps",
     ] {
         tx.execute(&format!("delete from {table}"), [])
             .map_err(|err| sqlite_error("clear rebuildable projection table", err))?;
@@ -10012,6 +10152,15 @@ create index if not exists tape_io_fences_active_tape_idx
 create index if not exists tape_io_fences_active_barcode_idx
   on tape_io_fences(barcode, state, updated_at_utc)
   where state = 'active' and barcode is not null;
+
+create table if not exists wrap_maps(
+  tape_uuid blob primary key,
+  descriptors_json text not null,
+  mapped_extent_lba integer not null,
+  write_epoch integer not null,
+  calibration_generation integer not null,
+  harvested_at_utc text not null
+);
 
 create table if not exists sessions(
   session_id text primary key,
