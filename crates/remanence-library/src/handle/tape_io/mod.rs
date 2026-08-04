@@ -3309,4 +3309,6 @@ fn units_traversed_from_space_residual(count: i64, residual: i64) -> i64 {
 }
 
 #[cfg(test)]
+mod media_gate_tests;
+#[cfg(test)]
 mod tests;
