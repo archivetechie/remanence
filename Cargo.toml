@@ -11,6 +11,7 @@ members = [
     "crates/remanence-parity",
     "crates/remanence-state",
     "crates/remanence-stream",
+    "crates/remanence-order",
     "crates/remanence-api",
     "crates/remanence-cli",
     "crates/remanence-daemon",
