@@ -41,6 +41,13 @@ pub mod pb {
     tonic::include_proto!("remanence.api.v1");
 }
 
+/// Vendored `google.rpc` rich-error detail types (see `proto/google/rpc/`),
+/// carried in the `grpc-status-details-bin` trailer of malformed-request
+/// errors so a caller can recover the offending target index structurally.
+pub mod pb_rpc {
+    tonic::include_proto!("google.rpc");
+}
+
 /// Default maximum bytes admitted into one append spool reservation.
 pub const APPEND_SPOOL_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 

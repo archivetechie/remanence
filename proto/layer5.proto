@@ -1286,6 +1286,117 @@ message BytesChunk {
 }
 
 // =============================================================================
+// READ PLAN SERVICE — batch read ordering over one volume.
+//
+// Contract of record: design-read-ordering.md §§9 and 11 (private journal).
+// The RPC accepts targets to *reason about*: it requires no read session,
+// performs no tape motion, and returns an ordering with per-hop positioning
+// estimates. The read surface (ReadSessionService) is unchanged — callers
+// issue their own reads, one per call, in the order returned. The plan is
+// advice, not a contract: reads address data by object identifier and byte
+// range, never by block number, so an outdated plan is suboptimal, never
+// incorrect.
+//
+// Unavailability is a normal, cacheable result, not an RPC error. Only
+// malformed requests are errors (INVALID_ARGUMENT), carrying a
+// google.rpc.BadRequest detail that names the offending target by its index
+// in `targets` — `tag` is opaque bytes and may not be printable.
+// =============================================================================
+
+service ReadPlanService {
+  rpc PlanBatchRead (PlanBatchReadRequest) returns (PlanBatchReadResponse);
+}
+
+message ReadTarget {                 // shared with future BatchReadRange
+  uint32 partition        = 1;
+  uint64 start_block      = 2;
+  uint64 end_block        = 3;       // required; must be >= start_block
+  bytes  tag              = 4;       // opaque; echoed back
+}
+
+enum PlanObjective {
+  OBJECTIVE_UNSPECIFIED = 0;         // treated as MIN_TOTAL_TIME
+  MIN_TOTAL_TIME        = 1;
+  MIN_TIME_TO_FIRST     = 2;
+}
+
+enum CompressionState {
+  COMPRESSION_UNSPECIFIED = 0;       // NOT a synonym for disabled
+  COMPRESSION_DISABLED    = 1;
+  COMPRESSION_ENABLED     = 2;
+}
+
+message CartridgeFacts {
+  string           cartridge_generation = 1;  // e.g. "LTO-7"; empty = derive from voltag
+  string           recording_format     = 2;  // e.g. "L7", "M8"
+  string           voltag               = 3;  // barcode; resolve by the canonical §6.3 table
+  uint64           block_size_bytes     = 4;
+  CompressionState compression          = 5;
+  uint64           written_extent_lba   = 6;  // exclusive; last written block + 1
+}
+// Note: no capacity field. Wrap boundaries come from the cached REOWP map
+// (§6.5), not from arithmetic over a published capacity. Generation and
+// format are still needed, but only to look up bands and wraps-per-band
+// for the second-order band-step cost term (§6.3).
+
+message StartPosition {
+  uint32 partition = 1;              // MUST be 0 in v1
+  uint64 block     = 2;
+}
+
+message PlanBatchReadRequest {
+  CartridgeFacts       cartridge       = 1;
+  repeated ReadTarget  targets         = 2;
+  PlanObjective        objective       = 3;
+  StartPosition        start_position  = 4;   // absent = load point, see §8.3
+  StartPosition        end_position    = 5;   // absent = no terminal position
+  bytes                tape_uuid       = 6;   // required; exactly 16 bytes; per-volume map key
+}
+
+enum PlanStatus {
+  PLAN_STATUS_UNSPECIFIED              = 0;   // sentinel; never emitted
+  OK                                   = 1;
+  DEGRADED_ASCENDING_FALLBACK          = 2;
+  UNAVAILABLE_UNKNOWN_BLOCK_SIZE       = 3;
+  UNAVAILABLE_COMPRESSION_ENABLED      = 4;
+  UNAVAILABLE_UNKNOWN_COMPRESSION      = 5;   // caller left it UNSPECIFIED
+  UNAVAILABLE_UNSUPPORTED_FORMAT       = 6;   // known row, marked unsupported
+  UNAVAILABLE_UNKNOWN_FORMAT           = 7;   // no row for this key
+  UNAVAILABLE_UNKNOWN_EXTENT           = 8;   // written_extent_lba absent or zero
+  UNAVAILABLE_UNCALIBRATED             = 9;   // no map, or write-epoch mismatch
+  UNAVAILABLE_MAP_STALE                = 10;  // coverage gap beyond mapped_extent_lba only
+}
+
+enum CostModelBasis {
+  COST_MODEL_BASIS_UNSPECIFIED = 0;
+  PRIORS                       = 1;
+  FITTED                       = 2;
+}
+
+message PlannedHop {
+  ReadTarget target                 = 1;
+  uint64     estimated_locate_ns    = 2;      // from previous target's end
+}
+
+message ResolvedGeometryKey {
+  string cartridge_generation = 1;
+  string recording_format     = 2;
+}
+
+message PlanBatchReadResponse {
+  PlanStatus           status                = 1;
+  string               detail                = 2;   // human; never parsed
+  repeated PlannedHop  hops                  = 3;   // ordered; empty unless OK or DEGRADED
+  uint64               estimated_total_ns    = 4;
+  CostModelBasis       cost_model_basis      = 5;
+  ResolvedGeometryKey  resolved_key          = 6;   // both halves, not one
+  bool                 format_disagreement   = 7;   // diagnostic only; see below
+  uint32               max_targets           = 8;   // always MAX_TARGETS (2730)
+  uint64               calibration_generation = 9;  // key for calibration-derived negatives
+  bool                 uses_estimated_eod_geometry = 10;
+}
+
+// =============================================================================
 // AUDIT SERVICE — read-only audit log queries.
 //
 // The append-only audit log is daemon-authoritative (layer4 addendum §5).
