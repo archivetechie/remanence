@@ -643,6 +643,14 @@ message Tape {
   // Current operator/orchestrator pool assignment. Empty means unassigned.
   string pool_id               = 11;
   repeated DriveCorrelationRollup correlation_rollups = 12;
+  // Written extent: the maximum barrier-proved EOD LBA over this volume's
+  // checkpoint records — a measurement that covers trailing sidecars,
+  // parity maps and checkpoint files by construction, never a rollup over
+  // object commits. Exclusive: last written block + 1. Absent = no barrier
+  // has proved one; absent is never zero, and 0 is never a stand-in for
+  // unknown (the block_size_bytes 0-as-unknown precedent is exactly the
+  // conflation this field avoids).
+  optional uint64 written_extent_lba = 13;
 }
 
 // A daemon-local tape eligibility group. Sutradhara decides the policy that maps
@@ -745,6 +753,14 @@ message ObjectCopy {
   string pool_id               = 6;
   Digest plaintext_digest      = 7;
   Digest stored_digest         = 8;
+  // Volume-global block span of this copy's tape file, projected through
+  // the copy→tape-file join. The copy occupies
+  // [global_start_block, global_end_block), exclusive; the trailing
+  // filemark at global_end_block is outside the span. Both fields are
+  // present together or absent together. Absent = the tape file predates
+  // span capture — absent is never zero, and block 0 is a valid start.
+  optional uint64 global_start_block = 9;
+  optional uint64 global_end_block   = 10;
 }
 
 // A single payload file inside an object (rem-tar-v1: one pax entry).

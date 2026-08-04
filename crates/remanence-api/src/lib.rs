@@ -5125,6 +5125,8 @@ fn tape_to_proto(record: TapeRecord) -> pb::Tape {
         updated_at: timestamp_from_rfc3339(record.updated_at_utc.as_str()),
         pool_id: record.pool_id.unwrap_or_default(),
         correlation_rollups: Vec::new(),
+        // Barrier-proved measurement; absent stays absent on the wire.
+        written_extent_lba: record.written_extent_lba,
     }
 }
 
@@ -5273,6 +5275,11 @@ fn object_copy_to_proto(copy: &NativeObjectCopyRecord) -> pb::ObjectCopy {
             copy.stored_digest_algorithm.clone(),
             copy.stored_digest.clone(),
         ),
+        // The span through the copy→tape-file join. Absent stays absent on
+        // the wire (proto3 optional): a copy whose tape file predates span
+        // capture is unknown, never zero.
+        global_start_block: copy.global_start_block,
+        global_end_block: copy.global_end_block,
     }
 }
 
@@ -6196,6 +6203,8 @@ mod tests {
                 ),
                 stored_digest: Some(vec![0x33; 32]),
                 stored_digest_algorithm: Some(remanence_state::DIGEST_ALGORITHM_SHA256.to_string()),
+                global_start_block: None,
+                global_end_block: None,
             }],
         };
 
@@ -6227,6 +6236,54 @@ mod tests {
                 .map(|digest| digest.value.as_slice()),
             Some(&[0x33; 32][..])
         );
+    }
+
+    #[test]
+    fn wire_span_and_extent_keep_absent_distinguishable_from_zero() {
+        // Proto3 optional: absent = unknown, never guessed, never defaulted.
+        // Block 0 is a valid position, so Some(0) must survive the wire as
+        // present-zero — distinguishable from absent.
+        let mut copy_record = NativeObjectCopyRecord {
+            object_id: OBJECT_ID_TEXT.to_string(),
+            tape_uuid: TAPE_UUID.to_vec(),
+            tape_file_number: 1,
+            first_body_lba: 0,
+            first_parity_data_ordinal: None,
+            protected_until_ordinal: None,
+            status: "committed".to_string(),
+            pool_id: None,
+            representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+            recipient_epoch_ids: None,
+            metadata_frame_len: None,
+            plaintext_digest: None,
+            plaintext_digest_algorithm: None,
+            stored_digest: None,
+            stored_digest_algorithm: None,
+            global_start_block: None,
+            global_end_block: None,
+        };
+        let absent = object_copy_to_proto(&copy_record);
+        assert_eq!(absent.global_start_block, None);
+        assert_eq!(absent.global_end_block, None);
+
+        copy_record.global_start_block = Some(0);
+        copy_record.global_end_block = Some(3);
+        let present = object_copy_to_proto(&copy_record);
+        assert_eq!(
+            present.global_start_block,
+            Some(0),
+            "a span starting at block 0 is present-zero, not absent"
+        );
+        assert_eq!(present.global_end_block, Some(3));
+        assert_ne!(present.global_start_block, absent.global_start_block);
+
+        let mut tape_record = writable_tape_record();
+        assert_eq!(tape_record.written_extent_lba, None);
+        let absent_tape = tape_to_proto(tape_record.clone());
+        assert_eq!(absent_tape.written_extent_lba, None);
+        tape_record.written_extent_lba = Some(11);
+        let present_tape = tape_to_proto(tape_record);
+        assert_eq!(present_tape.written_extent_lba, Some(11));
     }
 
     #[test]
@@ -7322,6 +7379,7 @@ BCw3Wyv2UWY=
             stripes_per_neighborhood: None,
             last_committed_tape_file: None,
             total_committed_ordinals: 0,
+            written_extent_lba: None,
             state: "ready".to_string(),
             updated_at_utc: "2026-05-29T00:00:00Z".to_string(),
         }
@@ -9058,6 +9116,79 @@ BCw3Wyv2UWY=
         assert_eq!(committed.copies.len(), 1);
         assert_eq!(committed.copies[0].first_parity_data_ordinal, None);
         assert_eq!(committed.copies[0].protected_until_ordinal, None);
+    }
+
+    #[test]
+    fn fresh_tape_first_object_span_excludes_bootstrap_prefix_and_trailing_filemark() {
+        // The panel's named fixture, no-parity flavor: the fresh-tape
+        // bootstrap prefix (bootstrap block at LBA 0 + its filemark at 1)
+        // precedes the first object's start and is excluded at capture, so
+        // the object's span is [2, 2 + block_count) — exclusive — with the
+        // trailing filemark at 2 + block_count outside the span.
+        let mut index = test_index();
+        project_pool(&mut index, "scenario-a");
+        project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
+        let source_dir = temp_dir("remanence-api-fresh-span-src");
+        let source_path = source_dir.join("payload.bin");
+        std::fs::write(&source_path, b"fresh tape span payload").expect("write source payload");
+        let mut tape_sink = VecBlockSink::new();
+        let cfg = pool_config("scenario-a");
+
+        let result = write_object_to_pool(
+            &mut index,
+            &mut tape_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source: crate::WriteObjectSource::Path(source_path),
+                archive_path: "payload.bin".into(),
+                caller_object_id: "caller-fresh-span".to_string(),
+                expected_content_sha256: None,
+                representation: PoolWriteRepresentation::Plaintext,
+            },
+        )
+        .expect("write no-parity object");
+
+        let report = result.expect_write_report();
+        let entries = &report.catalog.tape_file_bundle.entries;
+        assert_eq!(entries.len(), 2, "fresh tape: bootstrap prefix + object");
+        let bootstrap = &entries[0];
+        assert_eq!(bootstrap.kind, remanence_parity::TapeFileKind::Bootstrap);
+        assert_eq!(
+            bootstrap.physical_start_hint,
+            Some(0),
+            "the fresh-tape bootstrap prefix starts at BOT — Some(0), a valid position, not absent"
+        );
+        let object = &entries[1];
+        assert_eq!(object.kind, remanence_parity::TapeFileKind::Object);
+        assert_eq!(
+            object.physical_start_hint,
+            Some(2),
+            "the first object's start sits after the bootstrap prefix, never at 0"
+        );
+        assert_eq!(object.block_count, report.layout.projected_size_blocks);
+        // Exclusive span: the trailing filemark at start + block_count is
+        // outside it, so the position after that filemark is one more.
+        let span_end_exclusive = object.physical_start_hint.expect("captured") + object.block_count;
+        assert_eq!(
+            report.object_close.filemark_outcome.position_after.lba,
+            span_end_exclusive + 1,
+            "start + block_count addresses the trailing filemark, outside the span"
+        );
+        assert_eq!(report.object_close.physical_start_lba, Some(2));
+
+        // The catalog read path serves the same span through the
+        // copy→tape-file join — the fact the wire fields project.
+        let committed = index
+            .get_native_object(result.object.object_id_text().as_str())
+            .expect("query committed object")
+            .expect("committed object exists");
+        assert_eq!(committed.copies.len(), 1);
+        assert_eq!(committed.copies[0].global_start_block, Some(2));
+        assert_eq!(
+            committed.copies[0].global_end_block,
+            Some(span_end_exclusive)
+        );
     }
 
     #[test]

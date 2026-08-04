@@ -1555,6 +1555,123 @@ mod tests {
     }
 
     #[test]
+    fn file_journal_round_trips_populated_physical_start_hint() {
+        // Block 0 is a valid position: Some(0) must survive as Some(0), and
+        // a record journalled without the hint must read back as absent —
+        // never zero, never defaulted.
+        let path = temp_journal_path("hint-roundtrip");
+        let tape_uuid = [0x45; 16];
+        let scheme = default_scheme();
+        let mut bundle = sample_bundle();
+        bundle.entries[0].physical_start_hint = Some(0);
+        bundle.entries[1].physical_start_hint = Some(4);
+        {
+            let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+                &path,
+                tape_uuid,
+                256 * 1024,
+                scheme.clone(),
+            )
+            .expect("open journal");
+            journal
+                .commit_bundle(&bundle)
+                .expect("commit hinted bundle");
+            journal
+                .commit_bundle(&sample_checkpoint())
+                .expect("commit checkpoint watermark");
+        }
+
+        let state = FileTapeFileJournal::open_without_volume_check_for_tests(
+            &path,
+            tape_uuid,
+            256 * 1024,
+            scheme,
+        )
+        .expect("reopen journal")
+        .load_committed()
+        .expect("load committed");
+        assert_eq!(
+            state.entries[0].physical_start_hint,
+            Some(0),
+            "block 0 is a valid captured position and must not collapse to absent"
+        );
+        assert_eq!(state.entries[1].physical_start_hint, Some(4));
+        assert_eq!(state.entries, bundle.entries);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pre_hint_journal_records_read_as_absent_not_zero() {
+        // Records journalled before the hint was populated carry CBOR key 4
+        // as Null. They must decode to None — absent, not zero.
+        let legacy = sample_bundle();
+        assert!(legacy
+            .entries
+            .iter()
+            .all(|entry| entry.physical_start_hint.is_none()));
+        let decoded = decode_bundle(&encode_bundle(&legacy).expect("legacy bundle encodes"))
+            .expect("legacy bundle decodes");
+        for entry in &decoded.entries {
+            assert_eq!(
+                entry.physical_start_hint, None,
+                "an absent hint must never materialise as Some(0)"
+            );
+        }
+    }
+
+    #[test]
+    fn to_map_entry_drops_hint_and_canonical_digest_is_unchanged() {
+        // REM-PARITY §7.1: the span rides the journal record only. The
+        // map-entry field set and the seven-element canonical digest array
+        // must be byte-identical with the hint populated and absent —
+        // otherwise bootstrap digests change, which is an on-tape break.
+        let without_hint = sample_bundle();
+        let mut with_hint = sample_bundle();
+        with_hint.entries[0].physical_start_hint = Some(2);
+        with_hint.entries[1].physical_start_hint = Some(9);
+
+        for (hinted, bare) in with_hint.entries.iter().zip(without_hint.entries.iter()) {
+            assert_eq!(
+                hinted.to_map_entry(),
+                bare.to_map_entry(),
+                "to_map_entry must keep dropping the hint"
+            );
+        }
+
+        let map_with_hint = FilemarkMap::new(
+            with_hint
+                .entries
+                .iter()
+                .map(TapeFileEntry::to_map_entry)
+                .collect(),
+        )
+        .expect("hinted entries build a valid map");
+        let map_without_hint = FilemarkMap::new(
+            without_hint
+                .entries
+                .iter()
+                .map(TapeFileEntry::to_map_entry)
+                .collect(),
+        )
+        .expect("bare entries build a valid map");
+        assert_eq!(
+            map_with_hint
+                .canonical_projection_bytes()
+                .expect("hinted canonical projection encodes"),
+            map_without_hint
+                .canonical_projection_bytes()
+                .expect("bare canonical projection encodes"),
+            "the §7.1 seven-element canonical projection must be byte-identical"
+        );
+        assert_eq!(
+            map_with_hint.canonical_digest().expect("hinted digest"),
+            map_without_hint.canonical_digest().expect("bare digest"),
+            "bootstrap digests must not move when the hint is populated"
+        );
+    }
+
+    #[test]
     fn file_journal_rejects_compression_enabled_header() {
         let path = temp_journal_path("compression-enabled-header");
         let tape_uuid = [0x43; 16];
