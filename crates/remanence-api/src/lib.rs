@@ -80,6 +80,7 @@ mod operations;
 mod pool_selection;
 mod pool_write;
 pub mod read_core;
+mod read_plan;
 mod tape_init;
 mod write_owner;
 
@@ -97,6 +98,7 @@ pub use pool_write::{
 };
 #[cfg(test)]
 pub use pool_write::{write_object_to_pool, write_to_selected_tape};
+pub use read_plan::ReadPlanApi;
 pub use remanence_library::{resolve_load_target, LoadError, LoadPlan};
 pub use tape_init::{
     classify_bot_bytes, classify_bot_from_source, decide_tape_init,
@@ -786,6 +788,13 @@ impl ApiState {
     /// Return the read-session service implementation.
     pub fn read_session_service(&self) -> ReadSessionApi {
         ReadSessionApi {
+            state: self.clone(),
+        }
+    }
+
+    /// Return the read-plan service implementation (`PlanBatchRead`).
+    pub fn read_plan_service(&self) -> ReadPlanApi {
+        ReadPlanApi {
             state: self.clone(),
         }
     }
