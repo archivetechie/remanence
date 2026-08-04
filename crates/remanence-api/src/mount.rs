@@ -142,16 +142,55 @@ pub fn load_tape_by_uuid(
         .map_err(|err| LoadByUuidError::OpenDriveFailed { bay, cause: err })
 }
 
+/// Write-session target: pool-mode selection or an operator-pinned tape.
+///
+/// Both variants converge on the same reserve → mount → drive-actor open
+/// path below; pinning changes only tape *selection* and never bypasses
+/// *admission* (writability, fences, batch eligibility), media readiness,
+/// BOT identity proof, or session audit recording. The pinned variant's
+/// pool guard is validated in [`admit_pinned_tape_for_write_session`]:
+/// pools carry copy-class segregation, so a guard mismatch is a refusal.
+#[derive(Clone, Debug)]
+pub(crate) enum WriteSessionTarget {
+    Pool {
+        pool_id: String,
+    },
+    PinnedTape {
+        tape_uuid: TapeUuid,
+        required_pool_id: String,
+    },
+}
+
+impl WriteSessionTarget {
+    fn pool_id(&self) -> &str {
+        match self {
+            Self::Pool { pool_id } => pool_id,
+            Self::PinnedTape {
+                required_pool_id, ..
+            } => required_pool_id,
+        }
+    }
+
+    fn kind(&self) -> pb::write_session::TargetKind {
+        match self {
+            Self::Pool { .. } => pb::write_session::TargetKind::WriteSessionTargetKindPool,
+            Self::PinnedTape { .. } => {
+                pb::write_session::TargetKind::WriteSessionTargetKindPinnedTape
+            }
+        }
+    }
+}
+
 pub(crate) async fn open_write_session(
     state: &ApiState,
-    pool_id: String,
+    target: WriteSessionTarget,
     library_serial: String,
 ) -> Result<pb::WriteSession, Status> {
     let state = state.clone();
     await_critical_task(
         "open_write_session",
         tokio::spawn(
-            async move { open_write_session_critical(state, pool_id, library_serial).await },
+            async move { open_write_session_critical(state, target, library_serial).await },
         ),
     )
     .await
@@ -159,38 +198,59 @@ pub(crate) async fn open_write_session(
 
 async fn open_write_session_critical(
     state: ApiState,
-    pool_id: String,
+    target: WriteSessionTarget,
     library_serial: String,
 ) -> Result<pb::WriteSession, Status> {
     let pool = state.drive_pool()?.clone();
-    open_write_session_reserved(&state, &pool, pool_id, library_serial).await
+    open_write_session_reserved(&state, &pool, target, library_serial).await
 }
 
 async fn open_write_session_reserved(
     state: &ApiState,
     pool: &crate::write_owner::DrivePool,
-    pool_id: String,
+    target: WriteSessionTarget,
     library_serial: String,
 ) -> Result<pb::WriteSession, Status> {
-    let pool_cfg = state.pool_config(&pool_id)?;
+    let pool_cfg = state.pool_config(target.pool_id())?;
     let index = CatalogIndex::open_read_only(state.index_path.as_ref())
         .map_err(|err| Status::internal(err.to_string()))?;
     let select_started = Instant::now();
     let mut select_attempts = 0u64;
-    let (selected, _tape_reservation) = loop {
-        select_attempts = select_attempts.saturating_add(1);
-        let selected = select_tape_in_pool_for_write_session(
-            &index,
-            &pool_cfg,
-            0,
-            &pool.mounted_tape_uuids(),
-            state.checkpoint_journal_dir.as_path(),
-        )
-        .map_err(crate::write_owner::status_from_select_tape_error)?;
-        match pool.reserve_tape(selected.tape_uuid) {
-            Ok(reservation) => break (selected, reservation),
-            Err(err) if err.code() == tonic::Code::FailedPrecondition => continue,
-            Err(err) => return Err(err),
+    let (selected, _tape_reservation) = match &target {
+        WriteSessionTarget::Pool { .. } => loop {
+            select_attempts = select_attempts.saturating_add(1);
+            let selected = select_tape_in_pool_for_write_session(
+                &index,
+                &pool_cfg,
+                0,
+                &pool.mounted_tape_uuids(),
+                state.checkpoint_journal_dir.as_path(),
+            )
+            .map_err(crate::write_owner::status_from_select_tape_error)?;
+            match pool.reserve_tape(selected.tape_uuid) {
+                Ok(reservation) => break (selected, reservation),
+                Err(err) if err.code() == tonic::Code::FailedPrecondition => continue,
+                Err(err) => return Err(err),
+            }
+        },
+        WriteSessionTarget::PinnedTape {
+            tape_uuid,
+            required_pool_id,
+        } => {
+            select_attempts = 1;
+            let selected = crate::pool_write::admit_pinned_tape_for_write_session(
+                &index,
+                *tape_uuid,
+                required_pool_id,
+                &pool_cfg,
+                state.checkpoint_journal_dir.as_path(),
+            )
+            .map_err(crate::write_owner::status_from_pinned_tape_error)?;
+            // Unlike pool mode, a reservation conflict is terminal: there is
+            // no other tape to fall back to, and the conflicting session
+            // already owns the one the caller pinned.
+            let reservation = pool.reserve_tape(selected.tape_uuid)?;
+            (selected, reservation)
         }
     };
     let select_elapsed = select_started.elapsed();
@@ -215,6 +275,7 @@ async fn open_write_session_reserved(
             .send(crate::write_owner::DriveCommand::OpenWrite {
                 pool_cfg,
                 selected,
+                target_kind: target.kind(),
                 needs_drive_load: mount.needs_drive_load,
                 library_serial: mount.library_serial.clone(),
                 barcode: mount.barcode.clone(),

@@ -2664,25 +2664,44 @@ impl pb::write_session_service_server::WriteSessionService for WriteSessionApi {
             .target
             .ok_or_else(|| Status::invalid_argument("missing write-session target"))?
         {
-            pb::open_write_session_request::Target::PoolTarget(target) => target,
-            pb::open_write_session_request::Target::DriveTarget(_)
-            | pb::open_write_session_request::Target::TapeTarget(_) => {
+            pb::open_write_session_request::Target::PoolTarget(target) => {
+                if target.pool_id.trim().is_empty() {
+                    return Err(Status::invalid_argument("pool_id must not be empty"));
+                }
+                if !target.mount_if_needed {
+                    return Err(Status::invalid_argument(
+                        "pool-target write sessions require mount_if_needed=true in this slice",
+                    ));
+                }
+                let library_serial = self.library_serial_for_pool_target(&target)?;
+                let session = crate::mount::open_write_session(
+                    &self.state,
+                    crate::mount::WriteSessionTarget::Pool {
+                        pool_id: target.pool_id,
+                    },
+                    library_serial,
+                )
+                .await?;
+                return Ok(Response::new(session));
+            }
+            pb::open_write_session_request::Target::TapeTarget(target) => target,
+            pb::open_write_session_request::Target::DriveTarget(_) => {
                 return Err(Status::unimplemented(
-                    "only pool-target write sessions are wired in this slice",
+                    "drive-target write sessions are not wired in this slice",
                 ));
             }
         };
-        if target.pool_id.trim().is_empty() {
-            return Err(Status::invalid_argument("pool_id must not be empty"));
-        }
-        if !target.mount_if_needed {
-            return Err(Status::invalid_argument(
-                "pool-target write sessions require mount_if_needed=true in this slice",
-            ));
-        }
-        let library_serial = self.library_serial_for_pool_target(&target)?;
-        let session =
-            crate::mount::open_write_session(&self.state, target.pool_id, library_serial).await?;
+        let (tape_uuid, required_pool_id) = validate_tape_target_shape(&target)?;
+        let library_serial = self.default_library_serial_for_write_target("tape")?;
+        let session = crate::mount::open_write_session(
+            &self.state,
+            crate::mount::WriteSessionTarget::PinnedTape {
+                tape_uuid,
+                required_pool_id,
+            },
+            library_serial,
+        )
+        .await?;
         Ok(Response::new(session))
     }
 
@@ -3080,6 +3099,21 @@ impl WriteSessionApi {
                 Err(actor_status)
             }
         }
+    }
+
+    /// Library for a write target that carries no library constraint of its
+    /// own (the tape target): the config must name exactly one.
+    fn default_library_serial_for_write_target(&self, target_kind: &str) -> Result<String, Status> {
+        self.state
+            .default_library_serial
+            .as_ref()
+            .map(|serial| serial.as_str().to_string())
+            .ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "{target_kind}-target write sessions require the config to \
+                     name exactly one library"
+                ))
+            })
     }
 
     fn library_serial_for_pool_target(
@@ -3960,6 +3994,42 @@ fn overlap_append_eligible(
         && start_digest.is_some()
         && start.source_replay_capability == pb::SourceReplayCapability::ReplayFromStart as i32
         && start.body_format_manifest.is_empty()
+}
+
+/// Request-shape validation for a pinned-tape write target.
+///
+/// The pool guard is mandatory: pinning replaces pool *selection*, never
+/// *admission*, and pools carry copy-class segregation — so the caller must
+/// state which pool it believes the tape belongs to. Whether the guard is
+/// *true* is checked later against the catalog (mount admission); this layer
+/// only refuses requests that decline to state an intent at all.
+fn validate_tape_target_shape(target: &pb::TapeTarget) -> Result<([u8; 16], String), Status> {
+    let tape_uuid = decode_uuid_bytes(&target.tape_uuid, "tape_uuid")?;
+    let required_pool_id = target.required_pool_id.trim().to_string();
+    if target.allow_unpooled {
+        if !required_pool_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "allow_unpooled and required_pool_id are mutually exclusive",
+            ));
+        }
+        return Err(Status::unimplemented(
+            "unpooled tape targets are not wired in this slice; assign the \
+             tape to a pool first",
+        ));
+    }
+    if required_pool_id.is_empty() {
+        return Err(Status::invalid_argument(
+            "tape-target write sessions require required_pool_id naming the \
+             tape's pool (pools carry copy-class segregation; the guard makes \
+             the caller's intent checkable)",
+        ));
+    }
+    if !target.mount_if_needed {
+        return Err(Status::invalid_argument(
+            "tape-target write sessions require mount_if_needed=true in this slice",
+        ));
+    }
+    Ok((tape_uuid, required_pool_id))
 }
 
 fn archive_path_from_start(start: &pb::AppendObjectStart) -> PathBuf {
@@ -6157,6 +6227,48 @@ mod tests {
                 .map(|digest| digest.value.as_slice()),
             Some(&[0x33; 32][..])
         );
+    }
+
+    #[test]
+    fn tape_target_shape_requires_the_pool_guard() {
+        let base = pb::TapeTarget {
+            tape_uuid: Uuid::from_bytes([9; 16]).as_bytes().to_vec(),
+            mount_if_needed: true,
+            required_pool_id: "camera.copy-a".to_string(),
+            allow_unpooled: false,
+        };
+
+        let (tape_uuid, pool) = validate_tape_target_shape(&base).expect("valid shape");
+        assert_eq!(tape_uuid, [9; 16]);
+        assert_eq!(pool, "camera.copy-a");
+
+        // No guard at all: the caller must state an intent.
+        let mut no_guard = base.clone();
+        no_guard.required_pool_id = String::new();
+        let status = validate_tape_target_shape(&no_guard).unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("required_pool_id"), "{status}");
+
+        // allow_unpooled alongside a guard is contradictory.
+        let mut both = base.clone();
+        both.allow_unpooled = true;
+        let status = validate_tape_target_shape(&both).unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("mutually exclusive"), "{status}");
+
+        // allow_unpooled alone is honest but not wired yet.
+        let mut unpooled = base.clone();
+        unpooled.required_pool_id = String::new();
+        unpooled.allow_unpooled = true;
+        let status = validate_tape_target_shape(&unpooled).unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
+
+        // mount_if_needed=false is not wired in this slice.
+        let mut no_mount = base.clone();
+        no_mount.mount_if_needed = false;
+        let status = validate_tape_target_shape(&no_mount).unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("mount_if_needed"), "{status}");
     }
 
     #[test]
@@ -11896,7 +12008,11 @@ BCw3Wyv2UWY=
     }
 
     #[tokio::test]
-    async fn write_session_tape_target_is_unimplemented_in_s4a() {
+    async fn write_session_tape_target_is_wired_and_shape_validated() {
+        // The tape-target arm is wired (no longer Unimplemented); its shape
+        // validation runs before any catalog or hardware access, so a
+        // mount_if_needed=false request fails with InvalidArgument even on a
+        // state with no drive pool.
         let service = empty_pool_state().write_session_service();
         let err = pb::write_session_service_server::WriteSessionService::open_write_session(
             &service,
@@ -11906,6 +12022,7 @@ BCw3Wyv2UWY=
                         tape_uuid: TAPE_UUID.to_vec(),
                         mount_if_needed: false,
                         required_pool_id: "camera.copy-b".to_string(),
+                        allow_unpooled: false,
                     },
                 )),
                 body_format: "rem-object-v1".to_string(),
@@ -11914,7 +12031,31 @@ BCw3Wyv2UWY=
             }),
         )
         .await
-        .expect_err("tape target is out of scope for S4a");
+        .expect_err("shape validation refuses mount_if_needed=false");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("mount_if_needed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn write_session_drive_target_stays_unimplemented() {
+        let service = empty_pool_state().write_session_service();
+        let err = pb::write_session_service_server::WriteSessionService::open_write_session(
+            &service,
+            Request::new(pb::OpenWriteSessionRequest {
+                target: Some(pb::open_write_session_request::Target::DriveTarget(
+                    pb::DriveTarget {
+                        library_uuid: Vec::new(),
+                        drive_element_address: 0x0100,
+                        required_pool_id: String::new(),
+                    },
+                )),
+                body_format: "rem-object-v1".to_string(),
+                idempotency_key: None,
+                recover_session_id: Vec::new(),
+            }),
+        )
+        .await
+        .expect_err("drive target is out of scope for this slice");
         assert_eq!(err.code(), tonic::Code::Unimplemented);
     }
 
@@ -11984,6 +12125,7 @@ BCw3Wyv2UWY=
                         tape_uuid: TAPE_UUID.to_vec(),
                         mount_if_needed: true,
                         required_pool_id: "camera.copy-a".to_string(),
+                        allow_unpooled: false,
                     },
                 )),
                 idempotency_key: None,
