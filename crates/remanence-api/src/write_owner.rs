@@ -9704,6 +9704,207 @@ mod tests {
         assert_eq!(rows[1].session_id.as_deref(), Some(read_session.as_str()));
     }
 
+    /// Build a virtual world with one drive holding a seated no-parity tape
+    /// whose BOT bootstrap matches `tape_uuid`, provisioned in the catalog
+    /// under `voltag`. Returns everything a read-open harvest test needs.
+    #[allow(clippy::type_complexity)]
+    fn read_harvest_world(
+        temp: &tempfile::TempDir,
+        tape_uuid: [u8; 16],
+        voltag: &str,
+    ) -> (
+        std::path::PathBuf,
+        remanence_state::CalibrationControlStore,
+        mpsc::Sender<DriveCommand>,
+        String,
+        String,
+    ) {
+        let index_path = temp.path().join("rem-state.sqlite");
+        let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: voltag.to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        drop(index);
+
+        let bootstrap = BootstrapPayload {
+            scheme: None,
+            no_parity_flag: true,
+            filemark_map_digest: None,
+            tape_uuid,
+            written_by_version: "test".to_string(),
+            written_at: "2026-08-04T00:00:00Z".to_string(),
+            sequence: 0,
+            block_size_bytes: 4096,
+            drive_compression: false,
+            sidecar_epoch_directory: None,
+            parity_map_reference: None,
+            object_rows: Vec::new(),
+        };
+        let mut bootstrap_block = vec![0u8; 4096];
+        write_bootstrap_block(&bootstrap, &mut bootstrap_block).expect("encode bootstrap");
+        let mut tape = VirtualTape::empty(64 * 1024 * 1024, 4096);
+        tape.records = vec![
+            Record::Block(bootstrap_block),
+            Record::Filemark,
+            Record::Filemark,
+        ];
+        tape.written_bytes = 4096;
+        let mut world =
+            VirtualWorld::single_drive("LIB-READ-HARVEST", 0x0100, "DRV-READ-HARVEST", 0x0400, 1);
+        world.put_tape_in_drive(0x0100, voltag, Some(0x0400), tape);
+        let world = Arc::new(Mutex::new(world));
+        let mut library = open_model_library(Arc::clone(&world));
+        let snapshot = library_snapshot_cell(library.library().clone());
+        let audit_dir = temp.path().join("audit");
+        std::fs::create_dir_all(&audit_dir).expect("create audit dir");
+        let cfg = test_write_owner_config(index_path.clone(), audit_dir, &library, snapshot);
+        let calibration_store = cfg.calibration_store.clone();
+        let serial = library.library().serial.clone();
+        let policy = remanence_library::StaticAllowlist::new([serial.as_str()]);
+        let drive = library
+            .open_drive(0x0100, &policy)
+            .expect("open model drive");
+        let drive_tx = spawn_drive_actor(0x0100, drive, cfg);
+        (
+            index_path,
+            calibration_store,
+            drive_tx,
+            serial,
+            voltag.to_string(),
+        )
+    }
+
+    async fn open_read_on_fresh_mount(
+        drive_tx: &mpsc::Sender<DriveCommand>,
+        tape_uuid: [u8; 16],
+        serial: &str,
+        barcode: &str,
+    ) -> pb::ReadSession {
+        let (open_read_tx, open_read_rx) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::OpenRead {
+                tape_uuid,
+                needs_drive_load: true,
+                library_serial: serial.to_string(),
+                barcode: Some(barcode.to_string()),
+                source_slot: None,
+                drive_uuid: None,
+                drive_serial: Some("DRV-READ-HARVEST".to_string()),
+                resume_target: None,
+                daemon_epoch: 1,
+                reply: open_read_tx,
+            })
+            .await
+            .expect("send read open");
+        open_read_rx
+            .await
+            .expect("read open reply")
+            .expect("open read session")
+    }
+
+    /// The prompt's read-mount harvest fixture: a tape mounted purely to
+    /// read — no write session anywhere — calibrates the volume, asserted
+    /// through `servable_wrap_map`. Without the read-side harvest a
+    /// restore-only workload would leave every volume permanently
+    /// uncalibrated.
+    #[tokio::test]
+    async fn read_only_mount_harvest_calibrates_the_volume() {
+        use crate::calibration::{servable_wrap_map, WrapMapServeOutcome};
+
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-read-mount-harvest")
+            .tempdir()
+            .expect("tempdir");
+        let tape_uuid = [0x79; 16];
+        let (index_path, store, drive_tx, serial, voltag) =
+            read_harvest_world(&temp, tape_uuid, "RDH001L9");
+        assert_eq!(
+            store.row(tape_uuid).state,
+            remanence_state::VolumeCalibrationState::Uncalibrated,
+            "no history before the read mount"
+        );
+        assert_eq!(store.row(tape_uuid).calibration_generation, 0);
+
+        let session = open_read_on_fresh_mount(&drive_tx, tape_uuid, &serial, &voltag).await;
+        let session_id = Uuid::from_slice(&session.session_id).expect("read session UUID");
+
+        // The read-only mount harvested: the volume is durably calibrated
+        // and its map is servable for planning.
+        let row = store.row(tape_uuid);
+        assert_eq!(
+            row.state,
+            remanence_state::VolumeCalibrationState::Calibrated,
+            "the read mount's load harvest calibrated the volume"
+        );
+        assert!(row.calibration_generation > 0);
+        let index = CatalogIndex::open(&index_path).expect("reopen catalog");
+        match servable_wrap_map(&index, &store, tape_uuid).expect("serve") {
+            WrapMapServeOutcome::Servable { map, .. } => {
+                assert_eq!(map.wrap_count(), 1);
+                assert!(map.mapped_extent_lba() > 0);
+            }
+            other => panic!("read-only mount must leave a servable map, got {other:?}"),
+        }
+        drop(index);
+
+        let (close_tx, close_rx) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::CloseRead {
+                session_id,
+                reply: close_tx,
+            })
+            .await
+            .expect("send read close");
+        close_rx
+            .await
+            .expect("read close reply")
+            .expect("close read session");
+    }
+
+    /// The failure half of the same placement rule: when the harvest cannot
+    /// calibrate (a recognised-but-unsupported format — REOWP is never even
+    /// issued), no harvest outcome fails the open. The session opens, reads
+    /// can proceed, and the volume is honestly not servable.
+    #[tokio::test]
+    async fn read_open_succeeds_when_the_harvest_cannot_calibrate() {
+        use crate::calibration::{servable_wrap_map, WrapMapServeOutcome, WrapMapServeRefusal};
+
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-read-mount-unsupported")
+            .tempdir()
+            .expect("tempdir");
+        let tape_uuid = [0x7A; 16];
+        // M8 is recognised but unsupported (conflicting published geometry).
+        let (index_path, store, drive_tx, serial, voltag) =
+            read_harvest_world(&temp, tape_uuid, "RDH002M8");
+
+        let session = open_read_on_fresh_mount(&drive_tx, tape_uuid, &serial, &voltag).await;
+        assert!(
+            !session.session_id.is_empty(),
+            "no harvest outcome fails the open"
+        );
+
+        let row = store.row(tape_uuid);
+        assert_eq!(
+            row.state,
+            remanence_state::VolumeCalibrationState::UnsupportedFormat,
+            "the refusal is recorded durably, not silently dropped"
+        );
+        let index = CatalogIndex::open(&index_path).expect("reopen catalog");
+        match servable_wrap_map(&index, &store, tape_uuid).expect("serve") {
+            WrapMapServeOutcome::NotServable { refusal, .. } => {
+                assert_eq!(refusal, WrapMapServeRefusal::UnsupportedFormat);
+            }
+            other => panic!("unsupported format must not serve a map, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn induced_append_and_read_failures_persist_session_snapshots() {
         let temp = tempfile::Builder::new()
