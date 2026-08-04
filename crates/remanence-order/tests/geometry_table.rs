@@ -145,7 +145,8 @@ fn unsupported_is_distinguishable_from_absent() {
         match lookup_geometry(gen, fmt) {
             GeometryLookup::Unsupported(row) => {
                 assert!(
-                    row.reason.contains("Conflicting published structural geometry"),
+                    row.reason
+                        .contains("Conflicting published structural geometry"),
                     "M8 reason missing for ({gen}, {fmt})"
                 );
             }
