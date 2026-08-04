@@ -555,6 +555,76 @@ fn uses_estimated_eod_geometry_flag() {
     );
 }
 
+/// A supplied start or end position in the EOD wrap depends on the
+/// estimated denominator exactly as a target does (§6.4), so it sets the
+/// flag even when every target sits on a completed wrap.
+#[test]
+fn uses_estimated_eod_geometry_flag_for_supplied_positions() {
+    let geom = &synthetic_geometry(2);
+    let map = uniform_map(4, 1000, 500); // EOD wrap 3 starts at 3000
+    let completed_only = [
+        ReadTarget {
+            start_block: 100,
+            end_block: 150,
+        },
+        ReadTarget {
+            start_block: 2200,
+            end_block: 2300,
+        },
+    ];
+
+    // Supplied start position inside the EOD wrap.
+    let p = run_plan(
+        geom,
+        &map,
+        &completed_only,
+        Objective::MinTotalTime,
+        Some(3100),
+        None,
+    );
+    assert!(
+        p.uses_estimated_eod_geometry,
+        "a supplied start position in the EOD wrap sets the flag"
+    );
+
+    // Supplied end position inside the EOD wrap.
+    let p = run_plan(
+        geom,
+        &map,
+        &completed_only,
+        Objective::MinTotalTime,
+        None,
+        Some(3100),
+    );
+    assert!(
+        p.uses_estimated_eod_geometry,
+        "a supplied end position in the EOD wrap sets the flag"
+    );
+
+    // Both positions on completed wraps: still clear.
+    let p = run_plan(
+        geom,
+        &map,
+        &completed_only,
+        Objective::MinTotalTime,
+        Some(500),
+        Some(2600),
+    );
+    assert!(
+        !p.uses_estimated_eod_geometry,
+        "positions on completed wraps leave the flag clear"
+    );
+
+    // Zero targets with an EOD-wrap end position: the only estimate is
+    // the start-to-end terminal hop, and it used the EOD denominator.
+    let p = run_plan(geom, &map, &[], Objective::MinTotalTime, None, Some(3100));
+    assert!(p.terminal_ns.is_some());
+    assert!(
+        p.uses_estimated_eod_geometry,
+        "the zero-target terminal hop into the EOD wrap sets the flag"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Degenerate geometries.
 // ---------------------------------------------------------------------
