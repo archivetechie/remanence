@@ -21,7 +21,7 @@ use crate::config::{derive_tape_pool_from_voltag, TapePoolRuleConfig};
 use crate::error::StateError;
 
 /// Current Layer 4 SQLite schema version.
-pub const SCHEMA_VERSION: u32 = 15;
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// Digest algorithm emitted by the current catalog writers.
 pub const DIGEST_ALGORITHM_SHA256: &str = "sha256";
@@ -731,6 +731,15 @@ pub struct NativeObjectCopyRecord {
     pub stored_digest: Option<Vec<u8>>,
     /// Algorithm naming the stored digest when present.
     pub stored_digest_algorithm: Option<String>,
+    /// Volume-global LBA of block 0 of this copy's tape file, projected
+    /// through the copy→tape-file join. The copy occupies
+    /// `[global_start_block, global_end_block)`, exclusive; the trailing
+    /// filemark is outside the span. Absent when the tape file predates
+    /// span capture — absent is never zero, and block 0 is a valid start.
+    pub global_start_block: Option<u64>,
+    /// Exclusive end of the copy's span: `global_start_block + block_count`.
+    /// Present exactly when `global_start_block` is.
+    pub global_end_block: Option<u64>,
 }
 
 /// Native object member-file row for catalog-backed partial-file restore.
@@ -886,6 +895,12 @@ pub struct TapeRecord {
     pub last_committed_tape_file: Option<u64>,
     /// Total committed object-data ordinals on this tape.
     pub total_committed_ordinals: u64,
+    /// Written extent: the maximum barrier-proved EOD LBA over this
+    /// volume's checkpoint records — a measurement covering trailing
+    /// sidecars, parity maps and checkpoint files by construction, never a
+    /// rollup over object commits. Absent when no barrier has proved one;
+    /// absent is never zero.
+    pub written_extent_lba: Option<u64>,
     /// Projection state.
     pub state: String,
     /// Last projection update timestamp.
@@ -3006,6 +3021,13 @@ impl CatalogIndex {
         let replay_plan =
             inspect_checkpoint_projection_tx(&tx, record, &object_bundles, &checkpoint_bundle)?;
         if replay_plan == CheckpointReplayPlan::AlreadyProjected {
+            // The record's tape files are already projected, but the
+            // written-extent column is monotonic-max over barrier-proved
+            // EOD measurements and must still cover this record (a rebuilt
+            // or migrated row may not carry it yet).
+            project_tape_written_extent_tx(&tx, record.tape_uuid, record.eod_lba)?;
+            tx.commit()
+                .map_err(|err| sqlite_error("commit checkpoint extent projection", err))?;
             return Ok(());
         }
         for (projection, bundle) in projections.iter().zip(&object_bundles) {
@@ -3054,6 +3076,12 @@ impl CatalogIndex {
             &checkpoint_bundle,
             updated_at.as_str(),
         )?;
+        // The written extent is the max barrier-proved eod_lba over the
+        // volume's checkpoint records — a measurement taken after the
+        // barrier, so trailing sidecars, parity maps and checkpoint files
+        // are inside it by construction. It is updated after the bundle
+        // projection has upserted the tape row.
+        project_tape_written_extent_tx(&tx, record.tape_uuid, record.eod_lba)?;
         if replay_plan == CheckpointReplayPlan::RepairRetired {
             tx.execute(
                 "update object_copies set status = 'missing'
@@ -3646,7 +3674,7 @@ impl CatalogIndex {
                     block_size, scheme_id,
                     data_blocks_per_stripe, parity_blocks_per_stripe,
                     stripes_per_neighborhood, last_committed_tape_file,
-                    total_committed_ordinals, state, updated_at_utc
+                    total_committed_ordinals, written_extent_lba, state, updated_at_utc
              from tapes{where_clause}
              order by hex(tapes.tape_uuid)"
         );
@@ -3791,7 +3819,7 @@ impl CatalogIndex {
                         block_size, scheme_id,
                         data_blocks_per_stripe, parity_blocks_per_stripe,
                         stripes_per_neighborhood, last_committed_tape_file,
-                        total_committed_ordinals, state, updated_at_utc
+                        total_committed_ordinals, written_extent_lba, state, updated_at_utc
                  from tapes
                  where tapes.tape_uuid = ?1",
             )
@@ -3832,7 +3860,7 @@ impl CatalogIndex {
                         block_size, scheme_id,
                         data_blocks_per_stripe, parity_blocks_per_stripe,
                         stripes_per_neighborhood, last_committed_tape_file,
-                        total_committed_ordinals, state, updated_at_utc
+                        total_committed_ordinals, written_extent_lba, state, updated_at_utc
                  from tapes
                  where tapes.voltag = ?1",
             )
@@ -3991,10 +4019,14 @@ impl CatalogIndex {
                         object_copies.plaintext_digest,
                         object_copies.plaintext_digest_algorithm,
                         object_copies.stored_digest,
-                        object_copies.stored_digest_algorithm
+                        object_copies.stored_digest_algorithm,
+                        tf.physical_start_hint, tf.block_count
                  from objects
                  left join object_copies
                    on object_copies.object_id = objects.object_id
+                 left join tape_files tf
+                   on tf.tape_uuid = object_copies.tape_uuid
+                  and tf.tape_file_number = object_copies.tape_file_number
                  order by objects.created_at_utc, objects.object_id,
                           hex(object_copies.tape_uuid),
                           object_copies.tape_file_number",
@@ -4230,15 +4262,19 @@ impl CatalogIndex {
         let mut stmt = self
             .conn
             .prepare(
-                "select object_id, tape_uuid, tape_file_number,
-                        first_body_lba, first_parity_data_ordinal,
-                        protected_until_ordinal, status, pool_id,
-                        representation, recipient_epoch_ids, metadata_frame_len,
-                        plaintext_digest, plaintext_digest_algorithm,
-                        stored_digest, stored_digest_algorithm
-                 from object_copies
-                 where object_id = ?1
-                 order by hex(tape_uuid), tape_file_number",
+                "select oc.object_id, oc.tape_uuid, oc.tape_file_number,
+                        oc.first_body_lba, oc.first_parity_data_ordinal,
+                        oc.protected_until_ordinal, oc.status, oc.pool_id,
+                        oc.representation, oc.recipient_epoch_ids, oc.metadata_frame_len,
+                        oc.plaintext_digest, oc.plaintext_digest_algorithm,
+                        oc.stored_digest, oc.stored_digest_algorithm,
+                        tf.physical_start_hint, tf.block_count
+                 from object_copies oc
+                 left join tape_files tf
+                   on tf.tape_uuid = oc.tape_uuid
+                  and tf.tape_file_number = oc.tape_file_number
+                 where oc.object_id = ?1
+                 order by hex(oc.tape_uuid), oc.tape_file_number",
             )
             .map_err(|err| sqlite_error("prepare native object copy query", err))?;
         let mut rows = stmt
@@ -4292,14 +4328,18 @@ impl CatalogIndex {
         let mut stmt = self
             .conn
             .prepare(
-                "select object_id, tape_uuid, tape_file_number,
-                        first_body_lba, first_parity_data_ordinal,
-                        protected_until_ordinal, status, pool_id,
-                        representation, recipient_epoch_ids, metadata_frame_len,
-                        plaintext_digest, plaintext_digest_algorithm,
-                        stored_digest, stored_digest_algorithm
-                 from object_copies
-                 order by object_id, hex(tape_uuid), tape_file_number",
+                "select oc.object_id, oc.tape_uuid, oc.tape_file_number,
+                        oc.first_body_lba, oc.first_parity_data_ordinal,
+                        oc.protected_until_ordinal, oc.status, oc.pool_id,
+                        oc.representation, oc.recipient_epoch_ids, oc.metadata_frame_len,
+                        oc.plaintext_digest, oc.plaintext_digest_algorithm,
+                        oc.stored_digest, oc.stored_digest_algorithm,
+                        tf.physical_start_hint, tf.block_count
+                 from object_copies oc
+                 left join tape_files tf
+                   on tf.tape_uuid = oc.tape_uuid
+                  and tf.tape_file_number = oc.tape_file_number
+                 order by oc.object_id, hex(oc.tape_uuid), oc.tape_file_number",
             )
             .map_err(|err| sqlite_error("prepare all native object copy query", err))?;
         let mut rows = stmt
@@ -5551,7 +5591,8 @@ fn checkpoint_object_bundle(
             tape_file_number: 0,
             kind: TapeFileKind::Bootstrap,
             block_count: 1,
-            physical_start_hint: None,
+            // A fresh tape's bootstrap prefix starts at BOT by definition.
+            physical_start_hint: Some(0),
             object_id: None,
             first_parity_data_ordinal: None,
             epoch_id: None,
@@ -5565,7 +5606,7 @@ fn checkpoint_object_bundle(
         tape_file_number: projection.copy.tape_file_number,
         kind: TapeFileKind::Object,
         block_count: projection.block_count,
-        physical_start_hint: None,
+        physical_start_hint: Some(no_parity_checkpoint_object_start(record, projection_index)?),
         object_id: Some(projection.object.object_id.clone()),
         first_parity_data_ordinal: None,
         epoch_id: None,
@@ -5582,6 +5623,57 @@ fn checkpoint_object_bundle(
     })
 }
 
+/// Start LBA of a parity-off checkpoint record's on-tape bootstrap file,
+/// derived from the record's barrier-proved `eod_lba`: the bootstrap is one
+/// block plus its trailing filemark, so it starts two records before EOD.
+fn no_parity_checkpoint_bootstrap_start(
+    record: &crate::checkpoint::CheckpointJournalRecord,
+) -> Result<u64, StateError> {
+    record.eod_lba.checked_sub(2).ok_or_else(|| {
+        StateError::IndexCorrupt(format!(
+            "checkpoint record tape={} ordinal={} eod_lba {} cannot cover its checkpoint bootstrap",
+            hex_uuid(record.tape_uuid),
+            record.ordinal,
+            record.eod_lba
+        ))
+    })
+}
+
+/// Volume-global LBA of block 0 of one object tape file in a parity-off
+/// checkpoint record, derived backward from the barrier-proved `eod_lba`.
+///
+/// The record's structural layout is validated at journal append/replay
+/// time: each object occupies `[start, start + block_count)`, exclusive,
+/// with its trailing filemark at `start + block_count`, and the record
+/// closes with the checkpoint bootstrap plus its filemark. Walking backward
+/// from the measured EOD therefore reproduces exactly the dead-reckoned
+/// starts the write path captured forward — the same barrier proves both —
+/// so a checkpoint replay agrees with the live projection by construction.
+fn no_parity_checkpoint_object_start(
+    record: &crate::checkpoint::CheckpointJournalRecord,
+    projection_index: usize,
+) -> Result<u64, StateError> {
+    let mut cursor = no_parity_checkpoint_bootstrap_start(record)?;
+    for projection in record.objects[projection_index..].iter().rev() {
+        let file_records = projection.block_count.checked_add(1).ok_or_else(|| {
+            StateError::IndexCorrupt(format!(
+                "checkpoint record tape={} ordinal={} object block span overflows u64",
+                hex_uuid(record.tape_uuid),
+                record.ordinal
+            ))
+        })?;
+        cursor = cursor.checked_sub(file_records).ok_or_else(|| {
+            StateError::IndexCorrupt(format!(
+                "checkpoint record tape={} ordinal={} eod_lba {} does not cover its object spans",
+                hex_uuid(record.tape_uuid),
+                record.ordinal,
+                record.eod_lba
+            ))
+        })?;
+    }
+    Ok(cursor)
+}
+
 fn checkpoint_control_bundle(
     record: &crate::checkpoint::CheckpointJournalRecord,
     projections: &[crate::checkpoint::CheckpointObjectProjection],
@@ -5594,16 +5686,15 @@ fn checkpoint_control_bundle(
                 "checkpoint record has no final ordinal projection".to_string(),
             )
         })?;
-    let bundle = record
-        .checkpoint_bundle
-        .clone()
-        .unwrap_or_else(|| CommittedBundle {
+    let bundle = match record.checkpoint_bundle.clone() {
+        Some(bundle) => bundle,
+        None => CommittedBundle {
             kind: CommittedBundleKind::Control,
             entries: vec![TapeFileEntry {
                 tape_file_number: record.checkpoint_tape_file_number,
                 kind: TapeFileKind::Bootstrap,
                 block_count: 1,
-                physical_start_hint: None,
+                physical_start_hint: Some(no_parity_checkpoint_bootstrap_start(record)?),
                 object_id: None,
                 first_parity_data_ordinal: None,
                 epoch_id: None,
@@ -5614,7 +5705,8 @@ fn checkpoint_control_bundle(
             }],
             highest_protected_ordinal: 0,
             total_committed_ordinals,
-        });
+        },
+    };
     if bundle.total_committed_ordinals != total_committed_ordinals {
         return Err(StateError::IndexCorrupt(format!(
             "checkpoint record tape={} ordinal={} barrier watermark {} does not match final object watermark {total_committed_ordinals}",
@@ -8162,6 +8254,27 @@ fn table_count(tx: &rusqlite::Transaction<'_>, table: &str) -> Result<u64, State
     Ok(count)
 }
 
+/// Materialise the tape's written extent as the monotonic max of
+/// barrier-proved checkpoint EOD measurements. The column stays absent
+/// until the first barrier proves an extent — absent is never zero — and
+/// never moves backward, so replaying an older checkpoint record cannot
+/// shrink it.
+fn project_tape_written_extent_tx(
+    tx: &rusqlite::Transaction<'_>,
+    tape_uuid: [u8; 16],
+    eod_lba: u64,
+) -> Result<(), StateError> {
+    let eod_lba = u64_to_i64(eod_lba, "checkpoint eod_lba")?;
+    tx.execute(
+        "update tapes
+         set written_extent_lba = max(coalesce(written_extent_lba, 0), ?2)
+         where tape_uuid = ?1",
+        params![tape_uuid.to_vec(), eod_lba],
+    )
+    .map_err(|err| sqlite_error("project tape written extent", err))?;
+    Ok(())
+}
+
 fn insert_tape_file(
     tx: &rusqlite::Transaction<'_>,
     tape_uuid: [u8; 16],
@@ -8817,6 +8930,25 @@ fn native_object_copy_from_row(
         stored_digest_algorithm.as_deref(),
         "object_copies.stored_digest",
     )?;
+    // The span, through the copy→tape-file join. Both fields are present
+    // exactly when the joined tape file carries a captured start; an
+    // absent hint stays absent — never zero, never guessed.
+    let global_start_block = opt_i64_to_u64(
+        row_get(row, 15, "tape_files.physical_start_hint")?,
+        "physical_start_hint",
+    )?;
+    let joined_block_count = opt_i64_to_u64(
+        row_get(row, 16, "tape_files.block_count")?,
+        "tape_files.block_count",
+    )?;
+    let global_end_block = match (global_start_block, joined_block_count) {
+        (Some(start), Some(block_count)) => {
+            Some(start.checked_add(block_count).ok_or_else(|| {
+                StateError::IndexCorrupt("object copy span end overflows u64".to_string())
+            })?)
+        }
+        _ => None,
+    };
     Ok(NativeObjectCopyRecord {
         object_id: row_get(row, 0, "object_copies.object_id")?,
         tape_uuid: row_get(row, 1, "object_copies.tape_uuid")?,
@@ -8852,6 +8984,8 @@ fn native_object_copy_from_row(
         plaintext_digest_algorithm,
         stored_digest,
         stored_digest_algorithm,
+        global_start_block,
+        global_end_block,
     })
 }
 
@@ -8916,6 +9050,22 @@ fn native_object_copy_from_join_row(
         stored_digest_algorithm.as_deref(),
         "object_copies.stored_digest",
     )?;
+    let global_start_block = opt_i64_to_u64(
+        row_get(row, offset + 15, "tape_files.physical_start_hint")?,
+        "physical_start_hint",
+    )?;
+    let joined_block_count = opt_i64_to_u64(
+        row_get(row, offset + 16, "tape_files.block_count")?,
+        "tape_files.block_count",
+    )?;
+    let global_end_block = match (global_start_block, joined_block_count) {
+        (Some(start), Some(block_count)) => {
+            Some(start.checked_add(block_count).ok_or_else(|| {
+                StateError::IndexCorrupt("object copy span end overflows u64".to_string())
+            })?)
+        }
+        _ => None,
+    };
     Ok(Some(NativeObjectCopyRecord {
         object_id,
         tape_uuid: row_get(row, offset + 1, "object_copies.tape_uuid")?,
@@ -8951,6 +9101,8 @@ fn native_object_copy_from_join_row(
         plaintext_digest_algorithm,
         stored_digest,
         stored_digest_algorithm,
+        global_start_block,
+        global_end_block,
     }))
 }
 
@@ -9003,8 +9155,12 @@ fn tape_from_row(row: &rusqlite::Row<'_>) -> Result<TapeRecord, StateError> {
             row_get(row, 11, "tapes.total_committed_ordinals")?,
             "total_committed_ordinals",
         )?,
-        state: row_get(row, 12, "tapes.state")?,
-        updated_at_utc: row_get(row, 13, "tapes.updated_at_utc")?,
+        written_extent_lba: opt_i64_to_u64(
+            row_get(row, 12, "tapes.written_extent_lba")?,
+            "written_extent_lba",
+        )?,
+        state: row_get(row, 13, "tapes.state")?,
+        updated_at_utc: row_get(row, 14, "tapes.updated_at_utc")?,
     })
 }
 
@@ -9769,6 +9925,12 @@ fn migrate(conn: &Connection) -> Result<(), StateError> {
     ensure_column(conn, "catalog_units", "source_id", "source_id text")?;
     ensure_column(conn, "tapes", "pool_id", "pool_id text")?;
     ensure_column(conn, "tapes", "kind", "kind text not null default 'data'")?;
+    ensure_column(
+        conn,
+        "tapes",
+        "written_extent_lba",
+        "written_extent_lba integer",
+    )?;
     ensure_column(conn, "tapes", "cleaning_uses", "cleaning_uses integer")?;
     ensure_column(conn, "tapes", "cleaning_state", "cleaning_state text")?;
     ensure_column(conn, "sessions", "drive_uuid", "drive_uuid blob")?;
@@ -9929,6 +10091,7 @@ create table if not exists tapes(
   highest_protected_ordinal integer not null default 0,
   total_committed_ordinals integer not null default 0,
   last_committed_tape_file integer,
+  written_extent_lba integer,
   state text not null,
   updated_at_utc text not null
 );
@@ -14406,6 +14569,366 @@ mod tests {
                     .get::<_, u64>(0))
                 .expect("idempotent object count"),
             2
+        );
+
+        // The panel's rebuild-agreement fixture, parity-off flavor: the
+        // spans synthesised from the record's barrier-proved eod_lba must
+        // equal the forward dead-reckoned layout. Structural layout of this
+        // record: bootstrap [0,1) fm@1, object-1 [2,5) fm@5, object-2 [6,8)
+        // fm@8, checkpoint bootstrap [9,10) fm@10, eod 11.
+        let spans: Vec<(i64, Option<i64>)> = {
+            let mut stmt = index
+                .conn
+                .prepare(
+                    "select tape_file_number, physical_start_hint
+                     from tape_files where tape_uuid = ?1
+                     order by tape_file_number",
+                )
+                .expect("prepare span query");
+            let rows = stmt
+                .query_map(params![tape_uuid.to_vec()], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .expect("query spans");
+            rows.collect::<Result<_, _>>().expect("collect spans")
+        };
+        assert_eq!(
+            spans,
+            vec![(0, Some(0)), (1, Some(2)), (2, Some(6)), (3, Some(9))],
+            "checkpoint replay derives the forward layout backward from the barrier-proved EOD"
+        );
+        // The per-copy wire span, through the copy→tape-file join.
+        let copies = index
+            .find_native_object_copies(&object_1_text)
+            .expect("query object-1 copies");
+        assert_eq!(copies[0].global_start_block, Some(2));
+        assert_eq!(
+            copies[0].global_end_block,
+            Some(5),
+            "span end is exclusive: the trailing filemark at 5 is outside"
+        );
+        let copies = index
+            .find_native_object_copies(&object_2_text)
+            .expect("query object-2 copies");
+        assert_eq!(copies[0].global_start_block, Some(6));
+        assert_eq!(copies[0].global_end_block, Some(8));
+        // The written extent is the barrier measurement itself.
+        let tape = index
+            .get_tape(&tape_uuid)
+            .expect("query tape")
+            .expect("tape row");
+        assert_eq!(tape.written_extent_lba, Some(11));
+    }
+
+    #[test]
+    fn checkpoint_replay_agrees_with_live_span_projection_and_repairs_pre_hint_rows() {
+        // The panel's named fixture: bare rebuild (the live forward-computed
+        // bundle) and rebuild-plus-checkpoint-replay (backward-derived from
+        // the barrier-proved EOD) yield the same spans; rows projected
+        // before the hint existed read as absent — not zero — and a replay
+        // repairs them to the same values, never to conflicting ones.
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-span-agreement")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [0x53; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "SPN001L9".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision no-parity tape");
+
+        // Live projection as an OLD build journalled it: hints absent.
+        index
+            .project_native_object_append_commit(
+                append_object_projection("span-object"),
+                &[],
+                &[append_copy_projection("span-object", tape_uuid, 1)],
+                no_parity_append_input(tape_uuid),
+                &CommittedBundle {
+                    kind: CommittedBundleKind::Object,
+                    entries: vec![
+                        append_bootstrap_entry(),
+                        append_object_entry("span-object", 1, 3),
+                    ],
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals: 3,
+                },
+            )
+            .expect("seed pre-hint append prefix");
+        let copies = index
+            .find_native_object_copies("span-object")
+            .expect("query pre-hint copies");
+        assert_eq!(
+            (copies[0].global_start_block, copies[0].global_end_block),
+            (None, None),
+            "a record journalled before the hint existed reads as absent, not zero"
+        );
+        let tape = index
+            .get_tape(&tape_uuid)
+            .expect("query tape")
+            .expect("tape row");
+        assert_eq!(
+            tape.written_extent_lba, None,
+            "no barrier has proved an extent yet; absent is never zero"
+        );
+
+        // Checkpoint replay covering the same commit. Layout: bootstrap
+        // [0,1) fm@1, object [2,5) fm@5, checkpoint bootstrap [6,7) fm@7,
+        // eod 8. The synthesised spans must agree with the forward layout —
+        // a divergent Some-vs-Some pair would raise a projection conflict.
+        let object_projection = crate::checkpoint::CheckpointObjectProjection {
+            object: append_object_projection("span-object"),
+            files: Vec::new(),
+            copy: append_copy_projection("span-object", tape_uuid, 1),
+            block_size: 4096,
+            block_count: 3,
+            fresh_tape: true,
+            total_committed_ordinals: 3,
+            bootstrap_object_row: crate::checkpoint::CheckpointBootstrapObjectRow {
+                tape_file_number: 1,
+                stored_block_count: 3,
+                object_id: b"span-object".to_vec(),
+                representation:
+                    crate::checkpoint::CheckpointBootstrapObjectRepresentation::Plaintext {
+                        manifest_first_chunk_lba: 1,
+                        manifest_size_bytes: 1,
+                        manifest_chunk_count: 1,
+                        manifest_sha256: [0x34; 32],
+                    },
+            },
+        };
+        let record = crate::checkpoint::CheckpointJournalRecord {
+            ordinal: 1,
+            committed_object_count: 1,
+            eod_partition: 0,
+            eod_lba: 8,
+            tape_uuid,
+            batch_id: [0x63; 16],
+            checkpoint_tape_file_number: 2,
+            block_size: 4096,
+            objects: vec![object_projection],
+            scheme: None,
+            object_tape_file_bundles: Vec::new(),
+            checkpoint_bundle: None,
+        };
+        index
+            .project_checkpoint_record(&record)
+            .expect("replay repairs pre-hint rows without conflicting");
+
+        let copies = index
+            .find_native_object_copies("span-object")
+            .expect("query repaired copies");
+        assert_eq!(copies[0].global_start_block, Some(2));
+        assert_eq!(copies[0].global_end_block, Some(5));
+        let checkpoint_hint: Option<i64> = index
+            .conn
+            .query_row(
+                "select physical_start_hint from tape_files
+                 where tape_uuid = ?1 and tape_file_number = 2",
+                params![tape_uuid.to_vec()],
+                |row| row.get(0),
+            )
+            .expect("checkpoint bootstrap hint");
+        assert_eq!(checkpoint_hint, Some(6));
+
+        // A NEW build's live projection carries the same forward values, so
+        // replaying the checkpoint on top of it is a clean no-op — the two
+        // derivations agree by construction.
+        index
+            .project_checkpoint_record(&record)
+            .expect("hinted rows and synthesised spans agree");
+        let copies = index
+            .find_native_object_copies("span-object")
+            .expect("query stable copies");
+        assert_eq!(copies[0].global_start_block, Some(2));
+        assert_eq!(copies[0].global_end_block, Some(5));
+    }
+
+    #[test]
+    fn written_extent_is_the_barrier_measurement_not_an_object_rollup() {
+        // The panel's named fixture: a parity tape whose record carries a
+        // trailing sidecar and checkpoint files. The extent must equal the
+        // barrier-proved eod_lba — which covers them — while a rollup over
+        // object commits would systematically understate it.
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-extent-measurement")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [0x54; 16];
+        let scheme = provision_scheme();
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "EXT001L9".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::Scheme(scheme.clone()),
+                force: false,
+            })
+            .expect("provision parity tape");
+        assert_eq!(
+            index
+                .get_tape(&tape_uuid)
+                .expect("query tape")
+                .expect("tape row")
+                .written_extent_lba,
+            None,
+            "no barrier has proved an extent yet"
+        );
+
+        // Physical layout: bootstrap [0,1) fm@1, object [2,6) fm@6, sidecar
+        // [7,9) fm@9, checkpoint bootstrap [10,11) fm@11. The barrier
+        // measured EOD 11; the object rollup would say 4.
+        let object_bundle = CommittedBundle {
+            kind: CommittedBundleKind::Object,
+            entries: vec![
+                TapeFileEntry {
+                    tape_file_number: 0,
+                    kind: TapeFileKind::Bootstrap,
+                    block_count: 1,
+                    physical_start_hint: Some(0),
+                    object_id: None,
+                    first_parity_data_ordinal: None,
+                    epoch_id: None,
+                    protected_ordinal_start: None,
+                    protected_ordinal_end_exclusive: None,
+                    canonical_metadata_hash: None,
+                    bootstrap_object_row: None,
+                },
+                TapeFileEntry {
+                    tape_file_number: 1,
+                    kind: TapeFileKind::Object,
+                    block_count: 4,
+                    physical_start_hint: Some(2),
+                    object_id: Some("extent-object".to_string()),
+                    first_parity_data_ordinal: Some(0),
+                    epoch_id: None,
+                    protected_ordinal_start: None,
+                    protected_ordinal_end_exclusive: None,
+                    canonical_metadata_hash: None,
+                    bootstrap_object_row: None,
+                },
+                TapeFileEntry {
+                    tape_file_number: 2,
+                    kind: TapeFileKind::ParitySidecar,
+                    block_count: 2,
+                    physical_start_hint: Some(7),
+                    object_id: None,
+                    first_parity_data_ordinal: None,
+                    epoch_id: Some(0),
+                    protected_ordinal_start: Some(0),
+                    protected_ordinal_end_exclusive: Some(4),
+                    canonical_metadata_hash: Some([0x66; 32]),
+                    bootstrap_object_row: None,
+                },
+            ],
+            highest_protected_ordinal: 4,
+            total_committed_ordinals: 4,
+        };
+        let checkpoint_bundle = CommittedBundle {
+            kind: CommittedBundleKind::Control,
+            entries: vec![TapeFileEntry {
+                tape_file_number: 3,
+                kind: TapeFileKind::Bootstrap,
+                block_count: 1,
+                physical_start_hint: Some(10),
+                object_id: None,
+                first_parity_data_ordinal: None,
+                epoch_id: None,
+                protected_ordinal_start: None,
+                protected_ordinal_end_exclusive: None,
+                canonical_metadata_hash: None,
+                bootstrap_object_row: None,
+            }],
+            highest_protected_ordinal: 4,
+            total_committed_ordinals: 4,
+        };
+        let record = crate::checkpoint::CheckpointJournalRecord {
+            ordinal: 1,
+            committed_object_count: 1,
+            eod_partition: 0,
+            eod_lba: 11,
+            tape_uuid,
+            batch_id: [0x64; 16],
+            checkpoint_tape_file_number: 3,
+            block_size: 4096,
+            objects: vec![crate::checkpoint::CheckpointObjectProjection {
+                object: append_object_projection("extent-object"),
+                files: Vec::new(),
+                copy: NativeObjectCopyProjectionInput {
+                    first_parity_data_ordinal: Some(0),
+                    protected_until_ordinal: Some(4),
+                    ..append_copy_projection("extent-object", tape_uuid, 1)
+                },
+                block_size: 4096,
+                block_count: 4,
+                fresh_tape: true,
+                total_committed_ordinals: 4,
+                bootstrap_object_row: crate::checkpoint::CheckpointBootstrapObjectRow {
+                    tape_file_number: 1,
+                    stored_block_count: 4,
+                    object_id: b"extent-object".to_vec(),
+                    representation:
+                        crate::checkpoint::CheckpointBootstrapObjectRepresentation::Plaintext {
+                            manifest_first_chunk_lba: 1,
+                            manifest_size_bytes: 1,
+                            manifest_chunk_count: 1,
+                            manifest_sha256: [0x35; 32],
+                        },
+                },
+            }],
+            scheme: Some(scheme),
+            object_tape_file_bundles: vec![object_bundle],
+            checkpoint_bundle: Some(checkpoint_bundle),
+        };
+        index
+            .project_checkpoint_record(&record)
+            .expect("project parity checkpoint record");
+
+        let object_rollup: i64 = index
+            .conn
+            .query_row(
+                "select sum(block_count) from tape_files
+                 where tape_uuid = ?1 and kind = 'object'",
+                params![tape_uuid.to_vec()],
+                |row| row.get(0),
+            )
+            .expect("object rollup");
+        assert_eq!(object_rollup, 4);
+        let tape = index
+            .get_tape(&tape_uuid)
+            .expect("query tape")
+            .expect("tape row");
+        assert_eq!(
+            tape.written_extent_lba,
+            Some(11),
+            "the extent is the barrier-proved measurement"
+        );
+        assert_ne!(
+            tape.written_extent_lba,
+            Some(object_rollup as u64),
+            "an object-commit rollup would understate the extent past trailing \
+             sidecars and checkpoint files"
+        );
+
+        // Monotonic and idempotent: replaying the same record cannot move
+        // the extent, in either direction.
+        index
+            .project_checkpoint_record(&record)
+            .expect("idempotent parity replay");
+        assert_eq!(
+            index
+                .get_tape(&tape_uuid)
+                .expect("query tape")
+                .expect("tape row")
+                .written_extent_lba,
+            Some(11)
         );
     }
 

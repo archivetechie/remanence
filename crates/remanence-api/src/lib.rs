@@ -6196,6 +6196,8 @@ mod tests {
                 ),
                 stored_digest: Some(vec![0x33; 32]),
                 stored_digest_algorithm: Some(remanence_state::DIGEST_ALGORITHM_SHA256.to_string()),
+                global_start_block: None,
+                global_end_block: None,
             }],
         };
 
@@ -7322,6 +7324,7 @@ BCw3Wyv2UWY=
             stripes_per_neighborhood: None,
             last_committed_tape_file: None,
             total_committed_ordinals: 0,
+            written_extent_lba: None,
             state: "ready".to_string(),
             updated_at_utc: "2026-05-29T00:00:00Z".to_string(),
         }
