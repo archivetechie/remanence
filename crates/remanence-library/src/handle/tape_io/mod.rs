@@ -41,11 +41,11 @@ use super::{
 use crate::error::{AuditEvent, AuditOp, AuditOutcome};
 use crate::transport::TimeoutClass;
 
+use media_gate::MediaDispatchError;
 pub use media_gate::{
     wrap_map_is_servable, InMemoryCalibrationControl, MediaWriteFence, MediaWriteFenceError,
     NoCalibrationControl,
 };
-use media_gate::MediaDispatchError;
 pub use model::{
     BlockSize, ComputedPosition, DevicePositionProof, PipelinedReadDiagnostics,
     PipelinedWriteDiagnostics, PositionAfter, ReadBatchOutcome, ReadBuffer, ReadBufferHandoff,
@@ -750,9 +750,7 @@ impl super::DriveHandle {
     pub fn test_unit_ready(&mut self) -> Result<(), TapeIoError> {
         let cdb = [0u8; 6];
         self.transport.set_timeout_for(TimeoutClass::TapeStatus);
-        self.transport
-            .execute_none_nonmedia(&cdb)
-            .map_err(map_scsi)
+        self.transport.execute_none_nonmedia(&cdb).map_err(map_scsi)
     }
 
     /// Issue TEST UNIT READY and classify media readiness without sending any

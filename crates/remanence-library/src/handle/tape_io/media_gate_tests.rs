@@ -69,9 +69,7 @@ fn seeded_fixture(rp_count: usize) -> FixtureTransport {
 /// Open a standalone DriveHandle over `transport`, install a fresh
 /// in-memory calibration control as the fence, and hand back the
 /// observation clone.
-fn fenced_drive_over(
-    transport: Box<dyn SgTransport>,
-) -> (DriveHandle, InMemoryCalibrationControl) {
+fn fenced_drive_over(transport: Box<dyn SgTransport>) -> (DriveHandle, InMemoryCalibrationControl) {
     let mut drive =
         DriveHandle::open_standalone_with_transport(Path::new("/dev/sg-fence-test"), transport)
             .expect("standalone drive opens over fixture transport");
@@ -131,7 +129,11 @@ fn write_block_fences_once_per_load_not_once_per_command() {
     drive.write_block(&payload).expect("first write");
     drive.write_block(&payload).expect("second write");
 
-    assert_eq!(control.fence_transactions(), 1, "one epoch advance per load");
+    assert_eq!(
+        control.fence_transactions(),
+        1,
+        "one epoch advance per load"
+    );
     assert_eq!(control.write_epoch(), 1);
     assert_eq!(opcode_count(&log, 0x0A), 2, "both WRITEs dispatched");
     assert!(drive.media_write_fenced_this_load());
@@ -239,7 +241,9 @@ fn cross_path_writes_in_one_load_share_one_epoch_advance() {
     let buf = vec![0u8; 512];
     drive.write_block(&payload).expect("write_block");
     drive.write_filemarks(1).expect("write_filemarks");
-    drive.write_block_batch(&buf, 512).expect("write_block_batch");
+    drive
+        .write_block_batch(&buf, 512)
+        .expect("write_block_batch");
 
     assert_eq!(
         control.fence_transactions(),
@@ -368,7 +372,11 @@ fn failed_durable_transaction_refuses_the_pipelined_path_too() {
         .write_block_batch_pipelined(&buf, 512, &cdb)
         .expect_err("pipelined write must be refused");
     assert!(matches!(err, TapeIoError::WriteFenceNotDurable(_)));
-    assert_eq!(opcode_count(&log, 0x0A), 0, "no WRITE reached the transport");
+    assert_eq!(
+        opcode_count(&log, 0x0A),
+        0,
+        "no WRITE reached the transport"
+    );
     assert_eq!(control.fence_transactions(), 0);
 }
 
@@ -473,7 +481,10 @@ fn map_with_mismatched_write_epoch_is_never_served_after_a_write() {
         !wrap_map_is_servable(map_epoch, control.write_epoch()),
         "after the fence, the pre-write map's epoch no longer matches and it is never served"
     );
-    assert!(!control.is_calibrated(), "fence marked the volume uncalibrated");
+    assert!(
+        !control.is_calibrated(),
+        "fence marked the volume uncalibrated"
+    );
     assert_eq!(
         control.calibration_generation(),
         1,
@@ -626,7 +637,12 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
             .iter()
             .find(|(suffix, _)| normalized.ends_with(suffix))
         {
-            Some((_, DispatchPolicy::AllowAny(_))) => {}
+            Some((_, DispatchPolicy::AllowAny(why))) => {
+                assert!(
+                    !why.is_empty(),
+                    "every allowlisted dispatch file needs a recorded justification"
+                );
+            }
             Some((
                 suffix,
                 DispatchPolicy::Exact {

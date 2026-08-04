@@ -449,12 +449,12 @@ impl MediaFencedTransport {
         data_out: Option<&[u8]>,
     ) -> Result<Option<TransferOutcome>, MediaDispatchError> {
         let Some(class) = classify_write_direction_cdb(cdb) else {
-            return Err(MediaDispatchError::NotDispatched(TapeIoError::InvalidRequest(
-                ScsiError::InvalidInput(
+            return Err(MediaDispatchError::NotDispatched(
+                TapeIoError::InvalidRequest(ScsiError::InvalidInput(
                     "media-dispatch gate refused an unclassified write-direction CDB; \
                      classify the opcode in the gate before dispatching it",
-                ),
-            )));
+                )),
+            ));
         };
         // Phase sanity: WRITE(6)/MODE SELECT(6) carry a data-out
         // phase; WRITE FILEMARKS(6) has no data phase.
@@ -464,11 +464,11 @@ impl MediaFencedTransport {
             _ => false,
         };
         if !phase_valid {
-            return Err(MediaDispatchError::NotDispatched(TapeIoError::InvalidRequest(
-                ScsiError::InvalidInput(
+            return Err(MediaDispatchError::NotDispatched(
+                TapeIoError::InvalidRequest(ScsiError::InvalidInput(
                     "media-dispatch gate refused a CDB whose data phase does not match its opcode",
-                ),
-            )));
+                )),
+            ));
         }
 
         if class == WriteDirectionClass::MediaModifying && !self.fenced_this_load {
@@ -688,7 +688,11 @@ mod tests {
             fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
                 self.inner.execute_none(cdb)
             }
-            fn execute_out(&mut self, cdb: &[u8], buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
+            fn execute_out(
+                &mut self,
+                cdb: &[u8],
+                buf: &[u8],
+            ) -> Result<TransferOutcome, ScsiError> {
                 if let Some(sense) = self.sense.take() {
                     return Err(ScsiError::CheckCondition {
                         sense,
@@ -713,8 +717,15 @@ mod tests {
             .dispatch_media_out(&[0x0A, 0, 0, 0, 1, 0], &[0u8; 1])
             .expect_err("UA surfaces as a dispatch error");
         assert!(matches!(err, MediaDispatchError::Scsi(_)));
-        assert_eq!(control.fence_transactions(), 1, "epoch advanced pre-dispatch");
-        assert!(!transport.media_write_fenced_this_load(), "UA cleared the flag");
+        assert_eq!(
+            control.fence_transactions(),
+            1,
+            "epoch advanced pre-dispatch"
+        );
+        assert!(
+            !transport.media_write_fenced_this_load(),
+            "UA cleared the flag"
+        );
 
         // Next write re-fences.
         transport
