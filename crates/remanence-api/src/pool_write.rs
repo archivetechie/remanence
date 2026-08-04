@@ -913,6 +913,141 @@ pub fn select_tape_in_pool_for_write_session(
     }
 }
 
+/// Why an operator-pinned tape cannot open a write session.
+///
+/// Pinning replaces pool *selection*, never *admission*: every check that
+/// makes a tape a valid pool-mode candidate still gates here, plus the
+/// mandatory pool guard. Pools carry copy-class segregation, so a silent
+/// cross-pool write is policy corruption — a guard mismatch is a refusal
+/// that names both pools, never a warning.
+#[derive(Debug, Error)]
+pub enum PinnedTapeError {
+    /// No catalog row exists for the pinned UUID. An uninitialized cartridge
+    /// has no tape UUID at all (identity is minted by tape init), so this
+    /// also covers "that tape was never initialized".
+    #[error("tape {tape_uuid} is not in the catalog; an uninitialized cartridge has no tape UUID — run `rem tape init` first")]
+    UnknownTape {
+        /// The pinned tape UUID.
+        tape_uuid: Uuid,
+    },
+    /// The pinned tape is not a data tape (e.g. a cleaning cartridge).
+    #[error("tape {tape_uuid} is a {kind} tape, not a data tape")]
+    NotADataTape {
+        /// The pinned tape UUID.
+        tape_uuid: Uuid,
+        /// Catalog tape kind.
+        kind: String,
+    },
+    /// The tape's catalog pool assignment does not match the caller's guard.
+    #[error("tape {tape_uuid} is assigned to pool {}, not the required pool {required_pool_id}; pools carry copy-class segregation, so the guard must name the tape's actual pool", actual_pool_id.as_deref().unwrap_or("(none)"))]
+    PoolGuardMismatch {
+        /// The pinned tape UUID.
+        tape_uuid: Uuid,
+        /// Pool the caller claimed the tape belongs to.
+        required_pool_id: String,
+        /// Pool the catalog actually assigns the tape to, if any.
+        actual_pool_id: Option<String>,
+    },
+    /// The tape fails the same hard writability preconditions pool-mode
+    /// candidates must pass (lifecycle state, geometry, capacity, parity
+    /// append rules, pool block size).
+    #[error("tape {tape_uuid} is not writable: {reason}")]
+    NotWritable {
+        /// The pinned tape UUID.
+        tape_uuid: Uuid,
+        /// The failed precondition.
+        reason: WritabilityError,
+    },
+    /// A media-readiness quarantine or io fence blocks this tape.
+    #[error("tape {tape_uuid} is fenced by quarantine {quarantine_id}: {reason}")]
+    Fenced {
+        /// The pinned tape UUID.
+        tape_uuid: Uuid,
+        /// Owning quarantine id.
+        quarantine_id: String,
+        /// Fence reason.
+        reason: String,
+    },
+    /// The tape carries committed data but no adopted checkpoint journal, so
+    /// batched append positioning would be unsafe — the same rule pool-mode
+    /// candidates must pass.
+    #[error("tape {tape_uuid} carries committed data but no adopted checkpoint journal; batched append positioning would be unsafe")]
+    NotBatchEligible {
+        /// The pinned tape UUID.
+        tape_uuid: Uuid,
+    },
+    /// UUID/geometry projection failure (shared with pool selection).
+    #[error(transparent)]
+    Select(#[from] SelectTapeError),
+    /// Catalog access failure.
+    #[error(transparent)]
+    State(#[from] remanence_state::StateError),
+}
+
+/// Admit one operator-pinned tape for a write session.
+///
+/// `pool_cfg` is the configuration of `required_pool_id`, resolved by the
+/// caller; guard-shape validation (empty guard, allow_unpooled semantics)
+/// happens before config resolution and therefore also caller-side.
+pub fn admit_pinned_tape_for_write_session(
+    state: &CatalogIndex,
+    tape_uuid: TapeUuid,
+    required_pool_id: &str,
+    pool_cfg: &TapePoolConfig,
+    checkpoint_journal_dir: &Path,
+) -> Result<SelectedTape, PinnedTapeError> {
+    let uuid_text = Uuid::from_bytes(tape_uuid);
+    let tape = state
+        .get_tape(&tape_uuid)?
+        .ok_or(PinnedTapeError::UnknownTape {
+            tape_uuid: uuid_text,
+        })?;
+    if tape.kind != "data" {
+        return Err(PinnedTapeError::NotADataTape {
+            tape_uuid: uuid_text,
+            kind: tape.kind.clone(),
+        });
+    }
+    let actual_pool = tape
+        .pool_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|pool| !pool.is_empty());
+    if actual_pool != Some(required_pool_id) {
+        return Err(PinnedTapeError::PoolGuardMismatch {
+            tape_uuid: uuid_text,
+            required_pool_id: required_pool_id.to_string(),
+            actual_pool_id: actual_pool.map(str::to_string),
+        });
+    }
+    if let Err(reason) = check_writability_preconditions(&tape, 0)
+        .and_then(|_| check_pool_block_size_precondition(&tape, pool_cfg))
+    {
+        return Err(PinnedTapeError::NotWritable {
+            tape_uuid: uuid_text,
+            reason,
+        });
+    }
+    let conflicts = state.tape_io_admission_conflicts(&tape_uuid, tape.voltag.as_deref())?;
+    if let Some(conflict) = conflicts.first() {
+        return Err(PinnedTapeError::Fenced {
+            tape_uuid: uuid_text,
+            quarantine_id: conflict.quarantine_id.clone(),
+            reason: conflict.reason.clone(),
+        });
+    }
+    let fresh = tape.total_committed_ordinals == 0 && tape.last_committed_tape_file.is_none();
+    if !fresh {
+        let checkpoint_journal_tapes = checkpoint_journal_tape_uuids(checkpoint_journal_dir)?;
+        if !tape_carries_checkpoint(checkpoint_journal_dir, &checkpoint_journal_tapes, tape_uuid)? {
+            return Err(PinnedTapeError::NotBatchEligible {
+                tape_uuid: uuid_text,
+            });
+        }
+    }
+    Ok(selected_tape_from_record(tape, required_pool_id)?)
+}
+
 /// Select an eligible tape from a pool using a caller-supplied pure policy.
 ///
 /// This is the narrow integration adapter for the current non-hardware path:
@@ -8544,5 +8679,254 @@ mod tests {
         assert!(!can_write(LtoGen::Lto8, LtoGen::Lto6));
         assert!(!can_write(LtoGen::Lto9, LtoGen::Lto7));
         assert!(!can_write(LtoGen::Lto9, LtoGen::M8));
+    }
+
+    // -- pinned-tape admission matrix ---------------------------------------
+    //
+    // Pinning replaces selection, never admission: these tests pin the
+    // refusals. The batch-eligibility branch (committed tape without an
+    // adopted checkpoint journal) reuses the same helpers the pool-mode
+    // selection tests already exercise and needs a written tape to stage, so
+    // it is not duplicated here.
+
+    struct PinnedFixture {
+        index: CatalogIndex,
+        pool_cfg: TapePoolConfig,
+        journal_dir: std::path::PathBuf,
+        _temp: tempfile::TempDir,
+    }
+
+    const PINNED_POOL: &str = "camera.copy-a";
+    const PINNED_TAPE: TapeUuid = [0x5a; 16];
+
+    fn pinned_fixture() -> PinnedFixture {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-pinned-admission-")
+            .tempdir()
+            .expect("tempdir");
+        let mut index =
+            CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open catalog");
+        index
+            .upsert_tape_pool_projection(remanence_state::TapePoolProjectionInput {
+                pool_id: PINNED_POOL.to_string(),
+                display_name: None,
+                copy_class: Some("copy-a".to_string()),
+                content_class: Some("camera".to_string()),
+                created_at_utc: None,
+            })
+            .expect("project pool");
+        index
+            .provision_tape(remanence_state::ProvisionTapeInput {
+                tape_uuid: PINNED_TAPE,
+                voltag: "PIN001L9".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        index
+            .project_tape_pool_membership(PINNED_TAPE, PINNED_POOL)
+            .expect("project membership");
+        let pool_cfg = TapePoolConfig {
+            id: PINNED_POOL.to_string(),
+            display_name: None,
+            copy_class: Some("copy-a".to_string()),
+            content_class: Some("camera".to_string()),
+            selection_policy: Default::default(),
+            watermark_low: 0.98,
+            watermark_high: 1.0,
+            block_size_bytes: 4096,
+            min_object_size_bytes: 0,
+        };
+        let journal_dir = temp.path().join("checkpoint-journals");
+        std::fs::create_dir_all(&journal_dir).expect("journal dir");
+        PinnedFixture {
+            index,
+            pool_cfg,
+            journal_dir,
+            _temp: temp,
+        }
+    }
+
+    fn admit(fixture: &PinnedFixture, tape_uuid: TapeUuid, guard: &str) -> Result<SelectedTape, PinnedTapeError> {
+        admit_pinned_tape_for_write_session(
+            &fixture.index,
+            tape_uuid,
+            guard,
+            &fixture.pool_cfg,
+            &fixture.journal_dir,
+        )
+    }
+
+    #[test]
+    fn pinned_admission_accepts_matching_pooled_tape() {
+        let fixture = pinned_fixture();
+        let selected = admit(&fixture, PINNED_TAPE, PINNED_POOL).expect("admit pinned tape");
+        assert_eq!(selected.tape_uuid, PINNED_TAPE);
+        assert_eq!(selected.pool_id, PINNED_POOL);
+        assert_eq!(selected.block_size, 4096);
+    }
+
+    #[test]
+    fn pinned_admission_refuses_unknown_tape() {
+        let fixture = pinned_fixture();
+        let error = admit(&fixture, [0x77; 16], PINNED_POOL).unwrap_err();
+        assert!(
+            matches!(error, PinnedTapeError::UnknownTape { .. }),
+            "{error}"
+        );
+        // The message must teach the uninitialized-cartridge case.
+        assert!(error.to_string().contains("rem tape init"), "{error}");
+    }
+
+    #[test]
+    fn pinned_admission_refuses_pool_guard_mismatch_naming_both_pools() {
+        let fixture = pinned_fixture();
+        let error = admit(&fixture, PINNED_TAPE, "offsite.copy-b").unwrap_err();
+        match &error {
+            PinnedTapeError::PoolGuardMismatch {
+                required_pool_id,
+                actual_pool_id,
+                ..
+            } => {
+                assert_eq!(required_pool_id, "offsite.copy-b");
+                assert_eq!(actual_pool_id.as_deref(), Some(PINNED_POOL));
+            }
+            other => panic!("expected PoolGuardMismatch, got {other}"),
+        }
+        let message = error.to_string();
+        assert!(message.contains("offsite.copy-b"), "{message}");
+        assert!(message.contains(PINNED_POOL), "{message}");
+    }
+
+    #[test]
+    fn pinned_admission_refuses_unpooled_tape_under_a_guard() {
+        let fixture = pinned_fixture();
+        let unpooled: TapeUuid = [0x5b; 16];
+        {
+            let mut index =
+                CatalogIndex::open(fixture._temp.path().join("rem-state.sqlite")).expect("reopen");
+            index
+                .provision_tape(remanence_state::ProvisionTapeInput {
+                    tape_uuid: unpooled,
+                    voltag: "PIN002L9".to_string(),
+                    block_size: 4096,
+                    parity: ParityConfig::None,
+                    force: false,
+                })
+                .expect("provision unpooled tape");
+        }
+        let fresh =
+            CatalogIndex::open(fixture._temp.path().join("rem-state.sqlite")).expect("reopen");
+        let error = admit_pinned_tape_for_write_session(
+            &fresh,
+            unpooled,
+            PINNED_POOL,
+            &fixture.pool_cfg,
+            &fixture.journal_dir,
+        )
+        .unwrap_err();
+        match &error {
+            PinnedTapeError::PoolGuardMismatch { actual_pool_id, .. } => {
+                assert_eq!(actual_pool_id, &None);
+            }
+            other => panic!("expected PoolGuardMismatch, got {other}"),
+        }
+    }
+
+    #[test]
+    fn pinned_admission_refuses_cleaning_cartridge() {
+        let fixture = pinned_fixture();
+        let cleaning = {
+            let mut index =
+                CatalogIndex::open(fixture._temp.path().join("rem-state.sqlite")).expect("reopen");
+            let record = index
+                .ensure_cleaning_cartridge("CLN901L9")
+                .expect("cleaning cartridge");
+            let mut uuid = [0u8; 16];
+            uuid.copy_from_slice(&record.tape_uuid);
+            // A cleaning cartridge must refuse even if someone projected it
+            // into the guarded pool.
+            index
+                .project_tape_pool_membership(uuid, PINNED_POOL)
+                .expect("project cleaning membership");
+            uuid
+        };
+        let fresh =
+            CatalogIndex::open(fixture._temp.path().join("rem-state.sqlite")).expect("reopen");
+        let error = admit_pinned_tape_for_write_session(
+            &fresh,
+            cleaning,
+            PINNED_POOL,
+            &fixture.pool_cfg,
+            &fixture.journal_dir,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, PinnedTapeError::NotADataTape { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn pinned_admission_refuses_sealed_tape() {
+        let fixture = pinned_fixture();
+        {
+            let mut index =
+                CatalogIndex::open(fixture._temp.path().join("rem-state.sqlite")).expect("reopen");
+            index.seal_tape(PINNED_TAPE).expect("seal tape");
+        }
+        let fresh =
+            CatalogIndex::open(fixture._temp.path().join("rem-state.sqlite")).expect("reopen");
+        let error = admit_pinned_tape_for_write_session(
+            &fresh,
+            PINNED_TAPE,
+            PINNED_POOL,
+            &fixture.pool_cfg,
+            &fixture.journal_dir,
+        )
+        .unwrap_err();
+        match &error {
+            PinnedTapeError::NotWritable { reason, .. } => {
+                assert!(
+                    matches!(reason, WritabilityError::NotReady { .. }),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected NotWritable, got {other}"),
+        }
+    }
+
+    #[test]
+    fn pinned_admission_refuses_fenced_tape() {
+        let fixture = pinned_fixture();
+        {
+            let mut index =
+                CatalogIndex::open(fixture._temp.path().join("rem-state.sqlite")).expect("reopen");
+            index
+                .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+                    tape_uuid: PINNED_TAPE,
+                    barcode: Some("PIN001L9".to_string()),
+                    reason: "partial_batch".to_string(),
+                    evidence_json: None,
+                })
+                .expect("record fence");
+        }
+        let fresh =
+            CatalogIndex::open(fixture._temp.path().join("rem-state.sqlite")).expect("reopen");
+        let error = admit_pinned_tape_for_write_session(
+            &fresh,
+            PINNED_TAPE,
+            PINNED_POOL,
+            &fixture.pool_cfg,
+            &fixture.journal_dir,
+        )
+        .unwrap_err();
+        match &error {
+            PinnedTapeError::Fenced { reason, .. } => {
+                assert_eq!(reason, "partial_batch");
+            }
+            other => panic!("expected Fenced, got {other}"),
+        }
     }
 }

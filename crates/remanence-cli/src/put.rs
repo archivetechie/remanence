@@ -55,14 +55,15 @@ pub(crate) struct PutArgs {
     paths: Vec<PathBuf>,
 
     /// Target tape pool id. When omitted and exactly one pool is configured,
-    /// that pool is used.
-    #[arg(long, value_name = "POOL_ID", conflicts_with_all = ["tape", "drive"])]
+    /// that pool is used. With --tape it is the mandatory pool guard: the
+    /// pool you believe that tape belongs to.
+    #[arg(long, value_name = "POOL_ID", conflicts_with = "drive")]
     pool: Option<String>,
 
-    /// Target tape UUID. The daemon mounts it into a free drive if needed.
-    /// (The daemon currently wires pool targets only and rejects this at
-    /// open; the flag is ahead of that slice.)
-    #[arg(long, value_name = "UUID", conflicts_with = "drive")]
+    /// Pin a specific tape by UUID; the daemon mounts it into a free drive
+    /// if needed. Requires --pool naming the tape's pool — pinning replaces
+    /// pool selection, never admission, and a pool mismatch is a refusal.
+    #[arg(long, value_name = "UUID", conflicts_with = "drive", requires = "pool")]
     tape: Option<String>,
 
     /// Target drive element address (accepts `0x0100` or decimal). Writes to
@@ -124,9 +125,18 @@ struct PutInput {
 
 /// The resolved write target, one-to-one with the proto `oneof`.
 enum PutTarget {
-    Pool { pool_id: String, library_uuid: Vec<u8> },
-    Tape { tape_uuid: Vec<u8> },
-    Drive { library_uuid: Vec<u8>, element: u16 },
+    Pool {
+        pool_id: String,
+        library_uuid: Vec<u8>,
+    },
+    Tape {
+        tape_uuid: Vec<u8>,
+        required_pool_id: String,
+    },
+    Drive {
+        library_uuid: Vec<u8>,
+        element: u16,
+    },
 }
 
 impl PutTarget {
@@ -140,13 +150,15 @@ impl PutTarget {
                 library_uuid: library_uuid.clone(),
                 mount_if_needed: true,
             }),
-            Self::Tape { tape_uuid } => {
-                pb::open_write_session_request::Target::TapeTarget(pb::TapeTarget {
-                    tape_uuid: tape_uuid.clone(),
-                    mount_if_needed: true,
-                    required_pool_id: String::new(),
-                })
-            }
+            Self::Tape {
+                tape_uuid,
+                required_pool_id,
+            } => pb::open_write_session_request::Target::TapeTarget(pb::TapeTarget {
+                tape_uuid: tape_uuid.clone(),
+                mount_if_needed: true,
+                required_pool_id: required_pool_id.clone(),
+                allow_unpooled: false,
+            }),
             Self::Drive {
                 library_uuid,
                 element,
@@ -161,7 +173,13 @@ impl PutTarget {
     fn describe(&self) -> String {
         match self {
             Self::Pool { pool_id, .. } => format!("pool {pool_id}"),
-            Self::Tape { tape_uuid } => format!("tape {}", format_uuid(tape_uuid)),
+            Self::Tape {
+                tape_uuid,
+                required_pool_id,
+            } => format!(
+                "tape {} (pool {required_pool_id})",
+                format_uuid(tape_uuid)
+            ),
             Self::Drive { element, .. } => format!("drive 0x{element:04x}"),
         }
     }
@@ -521,8 +539,16 @@ async fn resolve_target(args: &PutArgs, channel: Channel) -> Result<PutTarget, D
     if let Some(tape) = &args.tape {
         let tape_uuid = Uuid::parse_str(tape.trim())
             .map_err(|error| DaemonClientError::client(format!("--tape {tape:?}: {error}")))?;
+        // clap enforces `requires = "pool"`; the expect documents the invariant.
+        let required_pool_id = args
+            .pool
+            .as_deref()
+            .expect("clap requires --pool with --tape")
+            .trim()
+            .to_string();
         return Ok(PutTarget::Tape {
             tape_uuid: tape_uuid.as_bytes().to_vec(),
+            required_pool_id,
         });
     }
     if let Some(element) = args.drive {
@@ -1128,6 +1154,9 @@ mod tests {
         /// Checkpoint omits objects whose caller id contains this marker,
         /// simulating an earlier auto-checkpoint having committed them.
         checkpoint_omits_containing: Option<String>,
+        /// When set, open must arrive as a TapeTarget with this uuid+guard
+        /// (instead of the default pool-target assertion).
+        expect_tape_target: Option<(Vec<u8>, String)>,
     }
 
     struct FakeWriteSessions(Arc<FakeState>);
@@ -1143,12 +1172,21 @@ mod tests {
         ) -> Result<Response<pb::WriteSession>, Status> {
             let request = request.into_inner();
             assert_eq!(request.body_format, "rem-object-v1");
-            match request.target {
-                Some(pb::open_write_session_request::Target::PoolTarget(target)) => {
+            match (&self.0.expect_tape_target, request.target) {
+                (None, Some(pb::open_write_session_request::Target::PoolTarget(target))) => {
                     assert_eq!(target.pool_id, "solo");
                     assert!(target.mount_if_needed);
                 }
-                other => panic!("unexpected target {other:?}"),
+                (
+                    Some((tape_uuid, guard)),
+                    Some(pb::open_write_session_request::Target::TapeTarget(target)),
+                ) => {
+                    assert_eq!(&target.tape_uuid, tape_uuid);
+                    assert_eq!(&target.required_pool_id, guard);
+                    assert!(target.mount_if_needed);
+                    assert!(!target.allow_unpooled);
+                }
+                (expected, other) => panic!("unexpected target {other:?} (expected {expected:?})"),
             }
             Ok(Response::new(pb::WriteSession {
                 session_id: FAKE_SESSION.to_vec(),
@@ -1348,6 +1386,53 @@ mod tests {
         // The fake hashed what it received and asserted it matched the
         // client's declared digest, so a passing run proves byte fidelity.
         assert!(!state.aborted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn tape_flag_requires_the_pool_guard() {
+        #[derive(clap::Parser, Debug)]
+        struct Harness {
+            #[command(flatten)]
+            args: PutArgs,
+        }
+        let uuid = Uuid::from_bytes([3; 16]).to_string();
+        // Without --pool the parse must fail: the guard is mandatory.
+        let error = <Harness as clap::Parser>::try_parse_from([
+            "put", "--tape", &uuid, "some-file",
+        ])
+        .expect_err("--tape without --pool must not parse");
+        assert!(error.to_string().contains("--pool"), "{error}");
+        // With the guard it parses.
+        let parsed = <Harness as clap::Parser>::try_parse_from([
+            "put", "--tape", &uuid, "--pool", "camera", "some-file",
+        ])
+        .expect("--tape with --pool parses");
+        assert_eq!(parsed.args.pool.as_deref(), Some("camera"));
+    }
+
+    #[test]
+    fn put_pins_a_tape_with_the_pool_guard() {
+        let tape_uuid = Uuid::from_bytes([3; 16]);
+        let state = Arc::new(FakeState {
+            expect_tape_target: Some((tape_uuid.as_bytes().to_vec(), "solo".to_string())),
+            ..FakeState::default()
+        });
+        let (endpoint, _runtime, _dir) = serve_fake(state.clone());
+
+        let data_dir = tempfile::tempdir().unwrap();
+        touch(&data_dir.path().join("in/a.txt"), b"pinned payload");
+        let mut args = put_args(vec![data_dir.path().join("in")], endpoint);
+        args.tape = Some(tape_uuid.to_string());
+
+        let (result, out, err) = run_put_blocking(&args);
+        assert!(result.is_ok(), "{result:?}\nstderr: {err}");
+        let receipt: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(receipt["objects"].as_array().unwrap().len(), 1);
+        assert!(
+            receipt["target"].as_str().unwrap().contains("pool solo"),
+            "{}",
+            receipt["target"]
+        );
     }
 
     #[test]

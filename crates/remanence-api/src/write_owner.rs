@@ -114,6 +114,7 @@ pub(crate) enum DriveCommand {
     OpenWrite {
         pool_cfg: TapePoolConfig,
         selected: SelectedTape,
+        target_kind: pb::write_session::TargetKind,
         needs_drive_load: bool,
         library_serial: String,
         barcode: Option<String>,
@@ -971,6 +972,7 @@ fn drive_loop(
             DriveCommand::OpenWrite {
                 pool_cfg,
                 selected,
+                target_kind,
                 needs_drive_load,
                 library_serial,
                 barcode,
@@ -989,6 +991,7 @@ fn drive_loop(
                 OpenWriteActorRequest {
                     pool_cfg,
                     selected,
+                    target_kind,
                     needs_drive_load,
                     library_serial,
                     barcode,
@@ -1147,6 +1150,7 @@ fn drain_failed_drive_commands(mut rx: mpsc::Receiver<DriveCommand>, message: St
 struct OpenWriteActorRequest {
     pool_cfg: TapePoolConfig,
     selected: SelectedTape,
+    target_kind: pb::write_session::TargetKind,
     needs_drive_load: bool,
     library_serial: String,
     barcode: Option<String>,
@@ -3024,6 +3028,7 @@ struct CloseWriteActorInput<'a> {
     snapshot_misses: &'a mut u32,
     session_id: Uuid,
     tape_uuid: TapeUuid,
+    target_kind: pb::write_session::TargetKind,
     library_serial: &'a str,
     bay: u16,
     objects_committed: u64,
@@ -3057,6 +3062,7 @@ fn close_write_actor(input: CloseWriteActorInput<'_>) -> Result<CloseWriteActorR
     let mut session = session_proto(WriteSessionProtoInput {
         session_id: input.session_id,
         tape_uuid: &input.tape_uuid,
+        target_kind: input.target_kind,
         state: input.state,
         objects_committed: input.objects_committed,
         bytes_committed: input.bytes_committed,
@@ -3108,6 +3114,7 @@ fn handle_drive_open_write(
     let OpenWriteActorRequest {
         pool_cfg,
         selected,
+        target_kind,
         needs_drive_load,
         library_serial,
         barcode,
@@ -3257,6 +3264,7 @@ fn handle_drive_open_write(
     let open_reply = session_proto(WriteSessionProtoInput {
         session_id,
         tape_uuid: &tape_uuid,
+        target_kind,
         state: pb::write_session::State::WriteSessionStateOpen,
         objects_committed,
         bytes_committed,
@@ -3733,6 +3741,7 @@ fn handle_drive_open_write(
                         let session = session_proto(WriteSessionProtoInput {
                             session_id,
                             tape_uuid: &tape_uuid,
+                            target_kind,
                             state: pb::write_session::State::WriteSessionStateCheckpointed,
                             objects_committed,
                             bytes_committed,
@@ -3856,6 +3865,7 @@ fn handle_drive_open_write(
                         let session = session_proto(WriteSessionProtoInput {
                             session_id,
                             tape_uuid: &tape_uuid,
+                            target_kind,
                             state: pb::write_session::State::WriteSessionStateCheckpointed,
                             objects_committed,
                             bytes_committed,
@@ -3908,6 +3918,7 @@ fn handle_drive_open_write(
                     snapshot_misses,
                     session_id,
                     tape_uuid,
+                    target_kind,
                     library_serial: library_serial.as_str(),
                     bay,
                     objects_committed,
@@ -4015,6 +4026,7 @@ fn handle_drive_open_write(
                     snapshot_misses,
                     session_id,
                     tape_uuid,
+                    target_kind,
                     library_serial: library_serial.as_str(),
                     bay,
                     objects_committed,
@@ -4053,6 +4065,7 @@ fn handle_drive_open_write(
                     snapshot_misses,
                     session_id,
                     tape_uuid,
+                    target_kind,
                     library_serial: library_serial.as_str(),
                     bay,
                     objects_committed,
@@ -4082,6 +4095,7 @@ fn handle_drive_open_write(
                     Ok(session_proto(WriteSessionProtoInput {
                         session_id,
                         tape_uuid: &tape_uuid,
+                        target_kind,
                         state: if pending_batch.is_none() && last_checkpoint_at_utc.is_some() {
                             pb::write_session::State::WriteSessionStateCheckpointed
                         } else {
@@ -7196,6 +7210,7 @@ fn read_session_proto(
 struct WriteSessionProtoInput<'a> {
     session_id: Uuid,
     tape_uuid: &'a TapeUuid,
+    target_kind: pb::write_session::TargetKind,
     state: pb::write_session::State,
     objects_committed: u64,
     bytes_committed: u64,
@@ -7225,7 +7240,7 @@ fn session_proto(input: WriteSessionProtoInput<'_>) -> pb::WriteSession {
         last_checkpoint_at: input
             .last_checkpoint_at_utc
             .and_then(timestamp_from_rfc3339),
-        target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool as i32,
+        target_kind: input.target_kind as i32,
         tape_sequence: vec![input.tape_uuid.to_vec()],
         current_tape_index: 0,
         pending_checkpoint_objects: input
@@ -7289,6 +7304,21 @@ fn status_from_parity_error(err: &ParityError, message: String) -> Status {
         | ParityError::ObjectTooLargeForEmptyTape { .. }
         | ParityError::BootstrapPayloadTooLarge { .. } => Status::resource_exhausted(message),
         _ => Status::internal(message),
+    }
+}
+
+pub(crate) fn status_from_pinned_tape_error(err: crate::pool_write::PinnedTapeError) -> Status {
+    use crate::pool_write::PinnedTapeError;
+    let message = err.to_string();
+    match err {
+        PinnedTapeError::UnknownTape { .. } => Status::not_found(message),
+        PinnedTapeError::NotADataTape { .. }
+        | PinnedTapeError::PoolGuardMismatch { .. }
+        | PinnedTapeError::NotWritable { .. }
+        | PinnedTapeError::Fenced { .. }
+        | PinnedTapeError::NotBatchEligible { .. } => Status::failed_precondition(message),
+        PinnedTapeError::Select(err) => status_from_select_tape_error(err),
+        PinnedTapeError::State(state) => status_from_state_error(state),
     }
 }
 
@@ -8013,6 +8043,7 @@ mod tests {
                         .expect("actor test pool block size fits u32"),
                     parity_config: ParityConfig::None,
                 },
+                target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
                 needs_drive_load: false,
                 library_serial: library_serial.to_string(),
                 barcode: Some(barcode.to_string()),
@@ -8242,6 +8273,7 @@ mod tests {
                     block_size: 4096,
                     parity_config: ParityConfig::None,
                 },
+                target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
                 needs_drive_load: false,
                 library_serial: serial,
                 barcode: Some("CHK002L9".to_string()),
@@ -8256,6 +8288,11 @@ mod tests {
             .await
             .expect("open reply")
             .expect("open batched session");
+        // The session reports the target kind it was opened with.
+        assert_eq!(
+            session.target_kind,
+            pb::write_session::TargetKind::WriteSessionTargetKindPool as i32
+        );
         let session_id = Uuid::from_slice(&session.session_id).expect("session UUID");
 
         let written = append_actor_test_file(
@@ -9334,6 +9371,7 @@ mod tests {
         let write = session_proto(WriteSessionProtoInput {
             session_id,
             tape_uuid: &tape_uuid,
+            target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
             state: pb::write_session::State::WriteSessionStateOpen,
             objects_committed: 0,
             bytes_committed: 0,
@@ -9822,6 +9860,7 @@ mod tests {
                     block_size: 4096,
                     parity_config: ParityConfig::None,
                 },
+                target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
                 needs_drive_load: false,
                 library_serial: serial,
                 barcode: Some("FAIL002L9".to_string()),

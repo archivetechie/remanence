@@ -1091,8 +1091,18 @@ message TapeTarget {
   bytes tape_uuid              = 1;
   // If true and no drive currently holds this tape, daemon mounts it.
   bool mount_if_needed         = 2;
-  // Optional guard: if set, the tape must currently be assigned to this pool.
+  // Pool guard. For WRITE sessions it is mandatory: pinning a tape replaces
+  // pool *selection*, never *admission* — the caller must name the pool it
+  // believes the tape belongs to, and a mismatch is a refusal. Pools carry
+  // copy-class segregation, so a silent cross-pool write is policy
+  // corruption; the guard makes the caller's intent checkable. For READ
+  // sessions the guard remains an optional constraint (reading does not
+  // move data between pools).
   string required_pool_id      = 3;
+  // Write sessions only: explicit acknowledgment for targeting a tape with
+  // no pool assignment. Mutually exclusive with required_pool_id. (Not
+  // wired yet: servers currently reject it as unimplemented.)
+  bool allow_unpooled          = 4;
 }
 
 message TapePoolTarget {
