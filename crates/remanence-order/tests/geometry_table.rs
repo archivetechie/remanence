@@ -1,7 +1,8 @@
 //! Acceptance tests for the §6.3 structural table and band layout.
 
 use remanence_order::{
-    band_rank, lookup_geometry, GeometryLookup, BAND_LAYOUT, STRUCTURAL_TABLE, UNSUPPORTED_TABLE,
+    band_rank, lookup_geometry, lookup_media_code, GeometryLookup, BAND_LAYOUT, MEDIA_CODE_TABLE,
+    STRUCTURAL_TABLE, UNSUPPORTED_TABLE,
 };
 
 /// The §6.3 identity holds for every row: `bands * wraps_per_band *
@@ -144,7 +145,8 @@ fn unsupported_is_distinguishable_from_absent() {
         match lookup_geometry(gen, fmt) {
             GeometryLookup::Unsupported(row) => {
                 assert!(
-                    row.reason.contains("Conflicting published structural geometry"),
+                    row.reason
+                        .contains("Conflicting published structural geometry"),
                     "M8 reason missing for ({gen}, {fmt})"
                 );
             }
@@ -189,6 +191,59 @@ fn unsupported_is_distinguishable_from_absent() {
     for row in &UNSUPPORTED_TABLE {
         assert!(!row.reason.is_empty());
         assert!(!row.source.is_empty());
+    }
+}
+
+/// Every supported media code in the canonical §6.3 table resolves to
+/// its stated geometry key; WORM codes normalise to the data medium's
+/// structural row; `M8` is recognised but unsupported; an unrecognised
+/// suffix is Absent.
+#[test]
+fn media_code_table_resolves_to_the_stated_geometry_keys() {
+    let expectations = [
+        ("L7", "LTO-7", "L7"),
+        ("LX", "LTO-7", "L7"),
+        ("L8", "LTO-8", "L8"),
+        ("LY", "LTO-8", "L8"),
+        ("L9", "LTO-9", "L9"),
+        ("LZ", "LTO-9", "L9"),
+        ("LA", "LTO-10", "LA"),
+        ("LH", "LTO-10", "LA"),
+        ("PA", "LTO-10", "PA"),
+    ];
+    for (code, gen, fmt) in expectations {
+        match lookup_media_code(code) {
+            GeometryLookup::Supported(row) => {
+                assert_eq!(row.cartridge_generation, gen, "media code {code}");
+                assert_eq!(row.recording_format, fmt, "media code {code}");
+            }
+            other => panic!("media code {code} resolved to {other:?}, expected Supported"),
+        }
+    }
+    // M8 is recognised but unsupported — distinguishable from Absent.
+    match lookup_media_code("M8") {
+        GeometryLookup::Unsupported(row) => {
+            assert_eq!(row.cartridge_generation, "M8");
+        }
+        other => panic!("M8 resolved to {other:?}, expected Unsupported"),
+    }
+    // Unrecognised suffixes are Absent, including case mismatches —
+    // the caller normalises, this table does not guess.
+    for code in ["LB", "l8", "XX", "", "L", "L8 "] {
+        assert_eq!(
+            lookup_media_code(code),
+            GeometryLookup::Absent,
+            "media code {code:?} should be Absent"
+        );
+    }
+    // Every table row round-trips through lookup_media_code without
+    // inventing a pair the structural tables cannot answer.
+    for row in &MEDIA_CODE_TABLE {
+        assert!(
+            !matches!(lookup_media_code(row.media_code), GeometryLookup::Absent),
+            "canonical media code {} must resolve",
+            row.media_code
+        );
     }
 }
 

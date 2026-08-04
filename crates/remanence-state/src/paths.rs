@@ -19,6 +19,13 @@ pub struct StatePaths {
     pub sqlite_path: PathBuf,
     /// Directory containing per-tape catalog caches.
     pub tape_cache_dir: PathBuf,
+    /// Directory holding the durable calibration-control store
+    /// (design-read-ordering.md §4.3). Deliberately derived from
+    /// `state_dir` and **not** cleared by catalog reset: the
+    /// `calibration_generation` allocator inside must never restart,
+    /// or a generation could be re-issued and resurrect a cached
+    /// negative.
+    pub calibration_dir: PathBuf,
 }
 
 impl StatePaths {
@@ -31,6 +38,7 @@ impl StatePaths {
             journal_dir: config.journal.dir.clone(),
             sqlite_path: config.index.sqlite_path.clone(),
             tape_cache_dir: config.cache.tape_catalog_dir.clone(),
+            calibration_dir: config.daemon.state_dir.join("calibration"),
         }
     }
 
@@ -63,6 +71,7 @@ mod tests {
             journal_dir: "/tmp/rem/journals".into(),
             sqlite_path: "/tmp/rem/index/rem-state.sqlite".into(),
             tape_cache_dir: "/tmp/rem/cache/tapes".into(),
+            calibration_dir: "/tmp/rem/calibration".into(),
         };
 
         assert_eq!(

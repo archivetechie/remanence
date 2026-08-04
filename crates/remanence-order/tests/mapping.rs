@@ -61,8 +61,14 @@ fn physical_lpos_on_both_sides_of_every_wrap_boundary() {
         } else {
             Ratio::ONE // reverse wrap starts at the far end
         };
-        assert_eq!(last_before.physical_lpos, expected_before, "wrap {w} left side");
-        assert_eq!(first_after.physical_lpos, expected_after, "wrap {w} right side");
+        assert_eq!(
+            last_before.physical_lpos, expected_before,
+            "wrap {w} left side"
+        );
+        assert_eq!(
+            first_after.physical_lpos, expected_after,
+            "wrap {w} right side"
+        );
 
         // Boundary-adjacent blocks are physically adjacent: 1/span apart.
         let gap = last_before
@@ -105,7 +111,11 @@ fn bands_fill_numerically_and_band0_sits_at_rank_2() {
         .iter()
         .map(|w| w / wpb)
         .collect();
-    assert_eq!(fill, [0, 0, 1, 1, 2, 2, 3, 3], "bands must fill numerically");
+    assert_eq!(
+        fill,
+        [0, 0, 1, 1, 2, 2, 3, 3],
+        "bands must fill numerically"
+    );
     // Layout: a separate lookup, not the fill order.
     assert_eq!(band_rank(0), Some(2), "band 0 sits at physical rank 2");
     assert_eq!(
@@ -128,10 +138,26 @@ fn bands_fill_numerically_and_band0_sits_at_rank_2() {
 #[test]
 fn wrap_starts_derive_from_inclusive_ends() {
     let descriptors = [
-        ReowpDescriptor { partition: 0, wrap_number: 0, end_loi: 999 },
-        ReowpDescriptor { partition: 0, wrap_number: 1, end_loi: 2199 }, // span 1200
-        ReowpDescriptor { partition: 0, wrap_number: 2, end_loi: 2999 }, // span 800
-        ReowpDescriptor { partition: 0, wrap_number: 3, end_loi: 3500 }, // EOD position
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 0,
+            end_loi: 999,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 1,
+            end_loi: 2199,
+        }, // span 1200
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 2,
+            end_loi: 2999,
+        }, // span 800
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 3,
+            end_loi: 3500,
+        }, // EOD position
     ];
     let map = WrapMap::from_descriptors(&descriptors).unwrap();
     assert_eq!(map.wrap_starts(), &[0, 1000, 2200, 3000]);
@@ -150,7 +176,10 @@ fn wrap_starts_derive_from_inclusive_ends() {
 /// whole covered range, uniform and jittered maps both.
 #[test]
 fn binary_search_matches_linear_reference() {
-    for map in [uniform_map(7, 137, 60), common::jitter_map(9, 200, 90, 0xB0A7)] {
+    for map in [
+        uniform_map(7, 137, 60),
+        common::jitter_map(9, 200, 90, 0xB0A7),
+    ] {
         let starts = map.wrap_starts();
         for block in 0..map.mapped_extent_lba() {
             let expected = starts
@@ -168,10 +197,26 @@ fn binary_search_matches_linear_reference() {
 #[test]
 fn non_zero_partition_descriptors_are_ignored() {
     let descriptors = [
-        ReowpDescriptor { partition: 1, wrap_number: 0, end_loi: 77 },
-        ReowpDescriptor { partition: 0, wrap_number: 0, end_loi: 999 },
-        ReowpDescriptor { partition: 1, wrap_number: 1, end_loi: 555 },
-        ReowpDescriptor { partition: 0, wrap_number: 1, end_loi: 1500 },
+        ReowpDescriptor {
+            partition: 1,
+            wrap_number: 0,
+            end_loi: 77,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 0,
+            end_loi: 999,
+        },
+        ReowpDescriptor {
+            partition: 1,
+            wrap_number: 1,
+            end_loi: 555,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 1,
+            end_loi: 1500,
+        },
     ];
     let map = WrapMap::from_descriptors(&descriptors).unwrap();
     assert_eq!(map.wrap_count(), 2);
@@ -211,11 +256,31 @@ fn eod_wrap_uses_median_completed_span_denominator() {
     // Completed spans 1000, 1200, 800, 1100 -> sorted [800, 1000, 1100,
     // 1200], lower median = element (4-1)/2 = index 1 = 1000.
     let descriptors = [
-        ReowpDescriptor { partition: 0, wrap_number: 0, end_loi: 999 },
-        ReowpDescriptor { partition: 0, wrap_number: 1, end_loi: 2199 },
-        ReowpDescriptor { partition: 0, wrap_number: 2, end_loi: 2999 },
-        ReowpDescriptor { partition: 0, wrap_number: 3, end_loi: 4099 },
-        ReowpDescriptor { partition: 0, wrap_number: 4, end_loi: 4600 }, // EOD
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 0,
+            end_loi: 999,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 1,
+            end_loi: 2199,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 2,
+            end_loi: 2999,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 3,
+            end_loi: 4099,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 4,
+            end_loi: 4600,
+        }, // EOD
     ];
     let map = WrapMap::from_descriptors(&descriptors).unwrap();
     let den = map.eod_denominator();
@@ -252,7 +317,11 @@ fn lower_median_is_the_lower_central_element() {
 /// denominator, with basis and a zero sample count saying so.
 #[test]
 fn no_completed_wrap_uses_observed_span() {
-    let descriptors = [ReowpDescriptor { partition: 0, wrap_number: 0, end_loi: 5000 }];
+    let descriptors = [ReowpDescriptor {
+        partition: 0,
+        wrap_number: 0,
+        end_loi: 5000,
+    }];
     let map = WrapMap::from_descriptors(&descriptors).unwrap();
     let den = map.eod_denominator();
     assert_eq!(den.basis, EodDenominatorBasis::EodObservedSpan);
@@ -273,8 +342,16 @@ fn eod_overshoot_beyond_median_is_exact_not_clamped() {
     // Completed wrap span 1000; EOD wrap 1 (reverse) written to 4999,
     // i.e. 3999 blocks against a denominator of 1000.
     let descriptors = [
-        ReowpDescriptor { partition: 0, wrap_number: 0, end_loi: 999 },
-        ReowpDescriptor { partition: 0, wrap_number: 1, end_loi: 4999 },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 0,
+            end_loi: 999,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 1,
+            end_loi: 4999,
+        },
     ];
     let map = WrapMap::from_descriptors(&descriptors).unwrap();
     assert_eq!(map.eod_denominator().span_lba, 1000);
@@ -300,10 +377,26 @@ fn dispersion_threshold_is_strict_integer_comparison() {
     // spans [500, 1000, 1600]: median 1000, deviations [500, 0, 600],
     // MAD 500 -> 50000 > 5000: dispersed.
     let dispersed = WrapMap::from_descriptors(&[
-        ReowpDescriptor { partition: 0, wrap_number: 0, end_loi: 499 },
-        ReowpDescriptor { partition: 0, wrap_number: 1, end_loi: 1499 },
-        ReowpDescriptor { partition: 0, wrap_number: 2, end_loi: 3099 },
-        ReowpDescriptor { partition: 0, wrap_number: 3, end_loi: 3600 },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 0,
+            end_loi: 499,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 1,
+            end_loi: 1499,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 2,
+            end_loi: 3099,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 3,
+            end_loi: 3600,
+        },
     ])
     .unwrap();
     assert!(dispersed.completed_spans_highly_dispersed());
@@ -311,20 +404,52 @@ fn dispersion_threshold_is_strict_integer_comparison() {
     // spans [950, 1000, 1050]: median 1000, deviations [50, 0, 50],
     // MAD 50 -> 5000 == 5000: exactly at the threshold, NOT dispersed.
     let boundary = WrapMap::from_descriptors(&[
-        ReowpDescriptor { partition: 0, wrap_number: 0, end_loi: 949 },
-        ReowpDescriptor { partition: 0, wrap_number: 1, end_loi: 1949 },
-        ReowpDescriptor { partition: 0, wrap_number: 2, end_loi: 2999 },
-        ReowpDescriptor { partition: 0, wrap_number: 3, end_loi: 3500 },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 0,
+            end_loi: 949,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 1,
+            end_loi: 1949,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 2,
+            end_loi: 2999,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 3,
+            end_loi: 3500,
+        },
     ])
     .unwrap();
     assert!(!boundary.completed_spans_highly_dispersed());
 
     // Near-uniform spans: not dispersed.
     let tight = WrapMap::from_descriptors(&[
-        ReowpDescriptor { partition: 0, wrap_number: 0, end_loi: 999 },
-        ReowpDescriptor { partition: 0, wrap_number: 1, end_loi: 2000 },
-        ReowpDescriptor { partition: 0, wrap_number: 2, end_loi: 2999 },
-        ReowpDescriptor { partition: 0, wrap_number: 3, end_loi: 3400 },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 0,
+            end_loi: 999,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 1,
+            end_loi: 2000,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 2,
+            end_loi: 2999,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 3,
+            end_loi: 3400,
+        },
     ])
     .unwrap();
     assert!(!tight.completed_spans_highly_dispersed());
@@ -353,7 +478,11 @@ fn no_partition_zero_descriptors_is_rejected() {
         WrapMap::from_descriptors(&[]),
         Err(WrapMapError::NoPartitionZeroDescriptors)
     );
-    let only_p1 = [ReowpDescriptor { partition: 1, wrap_number: 0, end_loi: 100 }];
+    let only_p1 = [ReowpDescriptor {
+        partition: 1,
+        wrap_number: 0,
+        end_loi: 100,
+    }];
     assert_eq!(
         WrapMap::from_descriptors(&only_p1),
         Err(WrapMapError::NoPartitionZeroDescriptors)
@@ -365,8 +494,16 @@ fn no_partition_zero_descriptors_is_rejected() {
 #[test]
 fn first_descriptor_must_report_wrap_zero() {
     let descriptors = [
-        ReowpDescriptor { partition: 0, wrap_number: 1, end_loi: 999 },
-        ReowpDescriptor { partition: 0, wrap_number: 2, end_loi: 1999 },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 1,
+            end_loi: 999,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 2,
+            end_loi: 1999,
+        },
     ];
     assert_eq!(
         WrapMap::from_descriptors(&descriptors),
@@ -379,30 +516,71 @@ fn first_descriptor_must_report_wrap_zero() {
 #[test]
 fn non_contiguous_wrap_numbers_are_rejected() {
     let gap = [
-        ReowpDescriptor { partition: 0, wrap_number: 0, end_loi: 999 },
-        ReowpDescriptor { partition: 0, wrap_number: 2, end_loi: 2999 },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 0,
+            end_loi: 999,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 2,
+            end_loi: 2999,
+        },
     ];
     assert_eq!(
         WrapMap::from_descriptors(&gap),
-        Err(WrapMapError::NonContiguousWrapNumbers { expected: 1, found: 2 })
+        Err(WrapMapError::NonContiguousWrapNumbers {
+            expected: 1,
+            found: 2
+        })
     );
     let dup = [
-        ReowpDescriptor { partition: 0, wrap_number: 0, end_loi: 999 },
-        ReowpDescriptor { partition: 0, wrap_number: 0, end_loi: 1999 },
-        ReowpDescriptor { partition: 0, wrap_number: 1, end_loi: 2999 },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 0,
+            end_loi: 999,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 0,
+            end_loi: 1999,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 1,
+            end_loi: 2999,
+        },
     ];
     assert_eq!(
         WrapMap::from_descriptors(&dup),
-        Err(WrapMapError::NonContiguousWrapNumbers { expected: 1, found: 0 })
+        Err(WrapMapError::NonContiguousWrapNumbers {
+            expected: 1,
+            found: 0
+        })
     );
     let reordered = [
-        ReowpDescriptor { partition: 0, wrap_number: 0, end_loi: 999 },
-        ReowpDescriptor { partition: 0, wrap_number: 2, end_loi: 2999 },
-        ReowpDescriptor { partition: 0, wrap_number: 1, end_loi: 1999 },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 0,
+            end_loi: 999,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 2,
+            end_loi: 2999,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 1,
+            end_loi: 1999,
+        },
     ];
     assert_eq!(
         WrapMap::from_descriptors(&reordered),
-        Err(WrapMapError::NonContiguousWrapNumbers { expected: 1, found: 2 })
+        Err(WrapMapError::NonContiguousWrapNumbers {
+            expected: 1,
+            found: 2
+        })
     );
 }
 
@@ -412,8 +590,16 @@ fn non_contiguous_wrap_numbers_are_rejected() {
 #[test]
 fn end_loi_overflow_rejects_the_harvest() {
     let descriptors = [
-        ReowpDescriptor { partition: 0, wrap_number: 0, end_loi: u64::MAX },
-        ReowpDescriptor { partition: 0, wrap_number: 1, end_loi: 100 },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 0,
+            end_loi: u64::MAX,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 1,
+            end_loi: 100,
+        },
     ];
     assert_eq!(
         WrapMap::from_descriptors(&descriptors),
@@ -426,9 +612,21 @@ fn end_loi_overflow_rejects_the_harvest() {
 #[test]
 fn non_positive_completed_span_is_rejected() {
     let descriptors = [
-        ReowpDescriptor { partition: 0, wrap_number: 0, end_loi: 999 },
-        ReowpDescriptor { partition: 0, wrap_number: 1, end_loi: 500 }, // before start 1000
-        ReowpDescriptor { partition: 0, wrap_number: 2, end_loi: 3000 },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 0,
+            end_loi: 999,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 1,
+            end_loi: 500,
+        }, // before start 1000
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 2,
+            end_loi: 3000,
+        },
     ];
     assert_eq!(
         WrapMap::from_descriptors(&descriptors),
@@ -440,8 +638,16 @@ fn non_positive_completed_span_is_rejected() {
 #[test]
 fn single_block_completed_wrap_is_valid() {
     let descriptors = [
-        ReowpDescriptor { partition: 0, wrap_number: 0, end_loi: 0 }, // span 1
-        ReowpDescriptor { partition: 0, wrap_number: 1, end_loi: 10 },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 0,
+            end_loi: 0,
+        }, // span 1
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 1,
+            end_loi: 10,
+        },
     ];
     let map = WrapMap::from_descriptors(&descriptors).unwrap();
     assert_eq!(map.completed_spans(), &[1]);
@@ -453,25 +659,51 @@ fn single_block_completed_wrap_is_valid() {
 #[test]
 fn non_positive_eod_span_is_rejected() {
     let at_start = [
-        ReowpDescriptor { partition: 0, wrap_number: 0, end_loi: 999 },
-        ReowpDescriptor { partition: 0, wrap_number: 1, end_loi: 1000 }, // == start
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 0,
+            end_loi: 999,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 1,
+            end_loi: 1000,
+        }, // == start
     ];
     assert_eq!(
         WrapMap::from_descriptors(&at_start),
-        Err(WrapMapError::NonPositiveEodSpan { eod_wrap_start: 1000, mapped_extent_lba: 1000 })
+        Err(WrapMapError::NonPositiveEodSpan {
+            eod_wrap_start: 1000,
+            mapped_extent_lba: 1000
+        })
     );
     let before_start = [
-        ReowpDescriptor { partition: 0, wrap_number: 0, end_loi: 999 },
-        ReowpDescriptor { partition: 0, wrap_number: 1, end_loi: 42 },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 0,
+            end_loi: 999,
+        },
+        ReowpDescriptor {
+            partition: 0,
+            wrap_number: 1,
+            end_loi: 42,
+        },
     ];
     assert!(matches!(
         WrapMap::from_descriptors(&before_start),
         Err(WrapMapError::NonPositiveEodSpan { .. })
     ));
     // Degenerate single-wrap map with EOD at zero: no positive span.
-    let empty_volume = [ReowpDescriptor { partition: 0, wrap_number: 0, end_loi: 0 }];
+    let empty_volume = [ReowpDescriptor {
+        partition: 0,
+        wrap_number: 0,
+        end_loi: 0,
+    }];
     assert_eq!(
         WrapMap::from_descriptors(&empty_volume),
-        Err(WrapMapError::NonPositiveEodSpan { eod_wrap_start: 0, mapped_extent_lba: 0 })
+        Err(WrapMapError::NonPositiveEodSpan {
+            eod_wrap_start: 0,
+            mapped_extent_lba: 0
+        })
     );
 }

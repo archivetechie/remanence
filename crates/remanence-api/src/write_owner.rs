@@ -710,6 +710,11 @@ pub(crate) struct WriteOwnerConfig {
     pub checkpoint_max_age_seconds: u64,
     pub session_idle_seconds: u64,
     pub lifecycle: Option<DrivePoolLifecycle>,
+    /// Durable calibration-control store for the wrap-map read
+    /// ordering lifecycle (design-read-ordering.md §6.5). The drive
+    /// actors run the load harvest against it at session open when
+    /// the open freshly mounted the cartridge.
+    pub calibration_store: remanence_state::CalibrationControlStore,
 }
 
 pub(crate) struct ExclusiveGuard {
@@ -3145,6 +3150,16 @@ fn handle_drive_open_write(
         let _ = reply.send(Err(status));
         return;
     }
+    // Load-time wrap-map harvest + fence install, one act (design
+    // §6.5): only when this open freshly mounted the cartridge — a
+    // session on an already-seated tape is the same load, and
+    // re-issuing REOWP mid-load would return a snapshot a write may
+    // already have invalidated. Runs after identity is proven (the
+    // fence binds this tape_uuid) and before any media-modifying CDB
+    // of the load can dispatch.
+    if needs_drive_load {
+        run_load_calibration_harvest(index, drive, cfg, &tape_uuid, barcode.as_deref());
+    }
     tracing::info!(
         target: "remanence_write_diag",
         phase = "drive_open_actor",
@@ -4208,6 +4223,73 @@ fn append_tape_io_fence_evidence(
     Ok(())
 }
 
+/// Run the load-time wrap-map harvest for a freshly mounted cartridge
+/// (design §6.5): install the volume's real media-write fence and
+/// harvest REOWP in one act, via
+/// `calibration::harvest_and_install_calibration`. Ordering is an
+/// optimisation, so no harvest outcome fails the session open; the
+/// result is durably recorded in the calibration store and logged
+/// here. The one exception is enforced elsewhere: once the fence is
+/// installed, a write whose durable epoch advance cannot be recorded
+/// is refused by the media gate itself.
+fn run_load_calibration_harvest(
+    index: &mut CatalogIndex,
+    drive: &mut DriveHandle,
+    cfg: &WriteOwnerConfig,
+    tape_uuid: &TapeUuid,
+    barcode: Option<&str>,
+) {
+    use crate::calibration::HarvestOutcome;
+    let outcome = crate::calibration::harvest_and_install_calibration(
+        drive,
+        index,
+        &cfg.calibration_store,
+        *tape_uuid,
+        barcode,
+    );
+    let tape = Uuid::from_bytes(*tape_uuid);
+    match outcome {
+        HarvestOutcome::Calibrated {
+            write_epoch,
+            calibration_generation,
+            wrap_count,
+        } => tracing::info!(
+            target: "remanence_calibration",
+            tape_uuid = %tape,
+            write_epoch,
+            calibration_generation,
+            wrap_count,
+            "wrap-map harvest calibrated the volume"
+        ),
+        HarvestOutcome::UnsupportedFormat {
+            calibration_generation,
+            detail,
+        } => tracing::info!(
+            target: "remanence_calibration",
+            tape_uuid = %tape,
+            calibration_generation,
+            detail = detail.as_str(),
+            "wrap-map harvest: unsupported format for this load"
+        ),
+        HarvestOutcome::Uncalibrated {
+            calibration_generation,
+            detail,
+        } => tracing::warn!(
+            target: "remanence_calibration",
+            tape_uuid = %tape,
+            calibration_generation,
+            detail = detail.as_str(),
+            "wrap-map harvest left the volume uncalibrated"
+        ),
+        HarvestOutcome::StoreUnavailable { detail } => tracing::warn!(
+            target: "remanence_calibration",
+            tape_uuid = %tape,
+            detail = detail.as_str(),
+            "calibration store unavailable during load harvest; volume state unchanged"
+        ),
+    }
+}
+
 fn prepare_drive_for_write(
     drive: &mut DriveHandle,
     tape_uuid: &TapeUuid,
@@ -4422,6 +4504,11 @@ fn handle_drive_open_read(
             None
         }
     };
+    // Load-time wrap-map harvest + fence install (design §6.5); same
+    // rule as the write path: fresh mount only, after identity.
+    if needs_drive_load {
+        run_load_calibration_harvest(index, drive, cfg, &tape_uuid, barcode.as_deref());
+    }
     let opened_at_utc = now_rfc3339().unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
     if let Err(status) = record_session_event(
         index,
@@ -7838,6 +7925,10 @@ mod tests {
             checkpoint_max_age_seconds: remanence_state::DEFAULT_CHECKPOINT_MAX_AGE_SECONDS,
             session_idle_seconds: 1800,
             lifecycle: None,
+            calibration_store: remanence_state::CalibrationControlStore::open(
+                std::env::temp_dir().join(format!("rem-calibration-tests-{}", Uuid::new_v4())),
+            )
+            .expect("open test calibration store"),
         }
     }
 
@@ -9128,6 +9219,10 @@ mod tests {
             checkpoint_max_age_seconds: remanence_state::DEFAULT_CHECKPOINT_MAX_AGE_SECONDS,
             session_idle_seconds: 1800,
             lifecycle: None,
+            calibration_store: remanence_state::CalibrationControlStore::open(
+                temp.path().join("calibration"),
+            )
+            .expect("open test calibration store"),
         };
         let actor = spawn_changer_actor(changer, cfg);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();

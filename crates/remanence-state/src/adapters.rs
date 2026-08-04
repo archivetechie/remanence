@@ -97,6 +97,8 @@ pub enum Layer2AuditOpTag {
     TapeReadConfig,
     /// Tape configuration write.
     TapeWriteConfig,
+    /// SSC READ END OF WRAP POSITION (wrap-map harvest read).
+    TapeReadWrapPositions,
 }
 
 impl Layer2AuditOpTag {
@@ -124,6 +126,7 @@ impl Layer2AuditOpTag {
             Self::TapeWriteFilemarks => "tape_write_filemarks",
             Self::TapeReadConfig => "tape_read_config",
             Self::TapeWriteConfig => "tape_write_config",
+            Self::TapeReadWrapPositions => "tape_read_wrap_positions",
         }
     }
 
@@ -151,6 +154,7 @@ impl Layer2AuditOpTag {
             LibraryAuditOp::TapeWriteFilemarks { .. } => Self::TapeWriteFilemarks,
             LibraryAuditOp::TapeReadConfig { .. } => Self::TapeReadConfig,
             LibraryAuditOp::TapeWriteConfig { .. } => Self::TapeWriteConfig,
+            LibraryAuditOp::TapeReadWrapPositions { .. } => Self::TapeReadWrapPositions,
         }
     }
 }
@@ -703,7 +707,8 @@ fn add_library_operation_detail(
         | LibraryAuditOp::TapeReadPosition { bay }
         | LibraryAuditOp::TapeReadAlerts { bay }
         | LibraryAuditOp::TapeReadConfig { bay }
-        | LibraryAuditOp::TapeWriteConfig { bay } => {
+        | LibraryAuditOp::TapeWriteConfig { bay }
+        | LibraryAuditOp::TapeReadWrapPositions { bay } => {
             uint(detail, "bay_element", u64::from(bay));
         }
         LibraryAuditOp::TapeLocate { bay, lba } => {

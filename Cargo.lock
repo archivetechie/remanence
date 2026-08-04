@@ -2069,6 +2069,7 @@ dependencies = [
  "remanence-format",
  "remanence-format-driver",
  "remanence-library",
+ "remanence-order",
  "remanence-parity",
  "remanence-scsi",
  "remanence-state",
