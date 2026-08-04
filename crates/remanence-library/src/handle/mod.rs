@@ -1064,7 +1064,7 @@ impl LibraryHandle {
             bay_address,
             drive: installed_clone,
             library_serial,
-            transport,
+            transport: tape_io::media_gate::MediaFencedTransport::new(transport),
             max_write_block_size_bytes: None,
             position_known: true,
             expected_position: None,
@@ -1580,9 +1580,13 @@ pub struct DriveHandle {
     drive: InstalledDrive,
     /// Library this drive belongs to. Carried for audit context.
     library_serial: String,
-    /// Open transport to the drive's `/dev/sgN`. Same kind of
-    /// boxed-dyn shape as `LibraryHandle::transport`.
-    transport: Box<dyn SgTransport>,
+    /// Open transport to the drive's `/dev/sgN`, wrapped in the
+    /// media-dispatch gate: write-direction CDBs are only reachable
+    /// through [`tape_io::media_gate::MediaFencedTransport`]'s single
+    /// gate function, which runs the pre-dispatch media-write fence
+    /// (design `design-read-ordering.md` §6.5 / D4b). The raw
+    /// [`SgTransport`] is private to that module by construction.
+    transport: tape_io::media_gate::MediaFencedTransport,
     /// Drive-reported variable WRITE block limit, populated by
     /// `read_config()` from READ BLOCK LIMITS and reused when the
     /// drive later rejects a WRITE with INVALID FIELD IN CDB.
@@ -1631,7 +1635,7 @@ impl std::fmt::Debug for DriveHandle {
             .field("bay_address", &self.bay_address)
             .field("drive", &self.drive)
             .field("library_serial", &self.library_serial)
-            .field("transport", &"<dyn SgTransport>")
+            .field("transport", &self.transport)
             .field(
                 "max_write_block_size_bytes",
                 &self.max_write_block_size_bytes,
@@ -1728,7 +1732,7 @@ impl DriveHandle {
                 sysfs_path: None,
             },
             library_serial: format!("standalone:{}", path.display()),
-            transport,
+            transport: tape_io::media_gate::MediaFencedTransport::new(transport),
             max_write_block_size_bytes: None,
             position_known: true,
             expected_position: None,
@@ -1873,13 +1877,22 @@ impl DriveHandle {
             },
         );
 
+        // Any SSC LOAD/UNLOAD attempt is a load boundary for the
+        // media-write fence: after it, the mounted volume may differ,
+        // so the next media-modifying CDB must re-advance the durable
+        // write epoch. Cleared before dispatch — a failed attempt may
+        // still have moved the medium (completion unknown), and an
+        // extra epoch advance is harmless false invalidation while a
+        // missed one is the silent stale-map failure.
+        self.transport.reset_media_write_fence_for_load_boundary();
+
         // SSC LOAD/UNLOAD on an LTO drive includes mechanical
         // unload + tape positioning; LOAD from cold can take
         // multiple minutes. Allow the 10-minute window so a
         // healthy operation isn't torn down by SG_IO timeout.
         self.transport.set_timeout_for(TimeoutClass::LoadUnload);
         let started = Instant::now();
-        let result = self.transport.execute_none(&cdb);
+        let result = self.transport.execute_none_nonmedia(&cdb);
         match result {
             Ok(()) => {
                 let duration = started.elapsed();
