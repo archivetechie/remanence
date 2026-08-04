@@ -60,11 +60,15 @@ pub(crate) struct PutArgs {
     pool: Option<String>,
 
     /// Target tape UUID. The daemon mounts it into a free drive if needed.
+    /// (The daemon currently wires pool targets only and rejects this at
+    /// open; the flag is ahead of that slice.)
     #[arg(long, value_name = "UUID", conflicts_with = "drive")]
     tape: Option<String>,
 
     /// Target drive element address (accepts `0x0100` or decimal). Writes to
-    /// whatever tape that drive currently holds.
+    /// whatever tape that drive currently holds. (The daemon currently wires
+    /// pool targets only and rejects this at open; the flag is ahead of that
+    /// slice.)
     #[arg(long, value_name = "ELEMENT", value_parser = parse_element_addr)]
     drive: Option<u16>,
 
