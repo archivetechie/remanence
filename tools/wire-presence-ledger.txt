@@ -16,3 +16,24 @@
 #
 # 353 fields are currently UNEXAMINED. That number is the work, and it is meant to
 # be visible.
+
+# ---------------------------------------------------------------------------
+# Drive area, decided 2026-08-06. Derivation for catalog-backed messages is the
+# `drives` / `drive_health_snapshots` schema: NOT NULL means the value is always
+# known, so the field stays plain. Where the schema says nullable, the field is
+# `optional` and does not appear here.
+# ---------------------------------------------------------------------------
+DriveCatalogEntry.drive_uuid       primary key of the drives table; a row cannot exist without one
+DriveCatalogEntry.identity_source  drives.identity_source is NOT NULL; every row records how identity was established
+DriveCatalogEntry.actionable       drives.actionable is NOT NULL DEFAULT 1; always a decided boolean
+DriveCatalogEntry.managed          drives.managed is NOT NULL
+DriveCatalogEntry.state            drives.state is NOT NULL DEFAULT 'active'
+DriveCatalogEntry.cleaning_due     drives.cleaning_due is NOT NULL DEFAULT 'none'; 'none' is a value, not an absence
+DriveCatalogEntry.fenced           drives.fenced is NOT NULL DEFAULT 0
+DriveHealthSnapshot.snapshot_id    primary key; a snapshot cannot exist without one
+DriveHealthSnapshot.drive_uuid     NOT NULL; a snapshot is always of a specific drive
+DriveHealthSnapshot.trigger        NOT NULL; whoever took the snapshot knows why they took it
+Slot.element_address               the address IS the slot's identity; a slot with no address is not a slot
+PortalSlot.element_address         as Slot.element_address
+DriveAssignment.library_serial     an assignment is always to a named library
+DriveAssignment.bay                an assignment is always to a specific bay

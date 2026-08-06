@@ -4982,7 +4982,7 @@ fn run_drive_client_command(
                         state
                             .slots
                             .iter()
-                            .find(|slot| slot.voltag == barcode)
+                            .find(|slot| slot.voltag.as_deref() == Some(barcode))
                             .map(|slot| slot.element_address)
                             .ok_or_else(|| {
                                 DaemonClientError::client(format!(
@@ -5743,9 +5743,12 @@ fn print_drive_snapshot(
         "snapshot {}  trigger={}  flags={}  write_uncorrected={}  read_uncorrected={}",
         at,
         snapshot.trigger,
-        snapshot.tape_alert_flags,
-        snapshot.write_errors_uncorrected,
-        snapshot.read_errors_uncorrected
+        // "0 uncorrected errors" is a drive in good health. "-" is a drive
+        // whose log pages could not be read. An operator deciding whether to
+        // trust a drive needs those to look different on the line.
+        or_dash(snapshot.tape_alert_flags.as_deref()),
+        or_dash_display(snapshot.write_errors_uncorrected),
+        or_dash_display(snapshot.read_errors_uncorrected)
     );
     Ok(())
 }
@@ -5827,18 +5830,30 @@ fn print_alarm_list(
     Ok(())
 }
 
+/// Render an optional string, or the dash that stands for "not known".
+fn or_dash(value: Option<&str>) -> &str {
+    value.unwrap_or("-")
+}
+
+/// Render an optional number, or a dash. Deliberately NOT `unwrap_or(0)`:
+/// zero is a measurement and absence is not.
+fn or_dash_display<T: std::fmt::Display>(value: Option<T>) -> String {
+    value.map_or_else(|| "-".to_string(), |value| value.to_string())
+}
+
 fn print_drive_line(drive: &pb::DriveCatalogEntry, out: &mut dyn Write) {
     let uuid = bytes_to_uuid_text(&drive.drive_uuid);
-    let serial = if drive.serial.is_empty() {
-        "unattributed (pre-stewardship)"
-    } else {
-        drive.serial.as_str()
-    };
+    // This label already existed, and it was already the right words -- the
+    // catalog has always had drives whose serial nobody recorded. It just had
+    // to guess from an empty string that that was the case. Now it is told.
+    let serial = drive
+        .serial
+        .as_deref()
+        .unwrap_or("unattributed (pre-stewardship)");
     let label = if drive.managed == "foreign" {
-        if drive.last_library_serial.is_empty() {
-            format!("[foreign] {serial}")
-        } else {
-            format!("[foreign: {}] {serial}", drive.last_library_serial)
+        match drive.last_library_serial.as_deref() {
+            None => format!("[foreign] {serial}"),
+            Some(library_serial) => format!("[foreign: {library_serial}] {serial}"),
         }
     } else {
         serial.to_string()
@@ -6207,12 +6222,15 @@ fn drive_event_json(event: &pb::DriveHistoryEvent) -> Value {
 }
 
 fn drive_snapshot_json(snapshot: &pb::DriveHealthSnapshot) -> Value {
-    let session_id = if snapshot.session_uuid.len() == 16 {
-        Some(bytes_to_uuid_text(&snapshot.session_uuid))
-    } else if snapshot.session_id.is_empty() {
+    let session_id = if snapshot.session_uuid.as_ref().is_some_and(|id| id.len() == 16) {
+        snapshot
+            .session_uuid
+            .as_deref()
+            .map(bytes_to_uuid_text)
+    } else if snapshot.session_id.is_none() {
         None
     } else {
-        Some(snapshot.session_id.clone())
+        snapshot.session_id.clone()
     };
     json!({
         "snapshot_id": snapshot.snapshot_id,
@@ -6251,37 +6269,22 @@ fn drive_live_json(drive: &pb::Drive) -> Value {
         "host_device_path": drive.host_device_path,
         "vendor": drive.vendor,
         "product": drive.product,
-        "loaded_tape_uuid": if drive.loaded_tape_uuid.is_empty() {
-            Value::Null
-        } else {
-            Value::String(bytes_to_uuid_text(&drive.loaded_tape_uuid))
-        },
-        "loaded_tape_barcode": if drive.loaded_tape_barcode.is_empty() {
-            Value::Null
-        } else {
-            Value::String(drive.loaded_tape_barcode.clone())
-        },
+        // `json!` renders None as null, so absence now reaches the JSON output
+        // correctly without any of these hand-written guards. The four fields
+        // below used to need one each; the rest of this object silently did not
+        // have one, and printed 0 for values nobody had determined.
+        "loaded_tape_uuid": drive.loaded_tape_uuid.as_deref().map(bytes_to_uuid_text),
+        "loaded_tape_barcode": drive.loaded_tape_barcode,
         "mount_age_seconds": drive.mount_age_seconds,
         "status": drive_status_name(drive.status),
-        // Null, not "", when the catalog holds no row for this bay — matching
-        // loaded_tape_uuid, loaded_tape_barcode and session_id nearby. An empty
-        // string reads as a value; null reads as "not known".
-        "drive_uuid": if drive.drive_uuid.is_empty() {
-            Value::Null
-        } else {
-            Value::String(bytes_to_uuid_text(&drive.drive_uuid))
-        },
+        "drive_uuid": drive.drive_uuid.as_deref().map(bytes_to_uuid_text),
         "catalog_state": drive_catalog_state_name(drive.catalog_state),
         "cleaning_due": drive.cleaning_due,
         "fenced": drive.fenced,
         "lifetime_read_bytes": drive.lifetime_read_bytes,
         "lifetime_write_bytes": drive.lifetime_write_bytes,
         "counter_epoch": drive.counter_epoch,
-        "session_id": if drive.session_id.is_empty() {
-            Value::Null
-        } else {
-            Value::String(bytes_to_uuid_text(&drive.session_id))
-        },
+        "session_id": drive.session_id.as_deref().map(bytes_to_uuid_text),
         "active_alert_names": drive.active_alert_names,
         "tape_io": {
             "staging_ring_buffers": drive.tape_io_staging_ring_buffers,
@@ -6313,22 +6316,14 @@ fn library_state_json(state: &pb::LibraryState) -> Value {
             json!({
                 "element_address": slot.element_address,
                 "voltag": slot.voltag,
-                "tape_uuid": if slot.tape_uuid.is_empty() {
-                    Value::Null
-                } else {
-                    Value::String(bytes_to_uuid_text(&slot.tape_uuid))
-                },
+                "tape_uuid": slot.tape_uuid.as_deref().map(bytes_to_uuid_text),
             })
         }).collect::<Vec<_>>(),
         "import_export_ports": state.import_export_ports.iter().map(|port| {
             json!({
                 "element_address": port.element_address,
                 "voltag": port.voltag,
-                "tape_uuid": if port.tape_uuid.is_empty() {
-                    Value::Null
-                } else {
-                    Value::String(bytes_to_uuid_text(&port.tape_uuid))
-                },
+                "tape_uuid": port.tape_uuid.as_deref().map(bytes_to_uuid_text),
             })
         }).collect::<Vec<_>>(),
         "last_inventory_at": timestamp_value(state.last_inventory_at.as_ref()),
@@ -6372,22 +6367,26 @@ fn print_live_status_text(
         let managed = library.managed.as_str();
         let _ = writeln!(out, "library {serial} [{managed}]");
         for drive in &library.drives {
-            let tape = drive.loaded_tape_barcode.as_str();
-            let tape = if tape.is_empty() { "-" } else { tape };
+            let tape = or_dash(drive.loaded_tape_barcode.as_deref());
             let _ = writeln!(
                 out,
-                "  bay {bay:04x} serial={serial} tape_barcode={tape} mount_age_s={mount_age} state={state} read={read} write={write} epoch={epoch} ring={ring} gap_p95_us={gap_p95} feed_window_Bps={window_feed} feed_session_avg_Bps={session_feed}",
-                bay = drive.element_address,
-                serial = drive.drive_serial,
+                "  bay {bay} serial={serial} tape_barcode={tape} mount_age_s={mount_age} state={state} read={read} write={write} epoch={epoch} ring={ring} gap_p95_us={gap_p95} feed_window_Bps={window_feed} feed_session_avg_Bps={session_feed}",
+                // Every one of these is a dash when it was never determined.
+                // This line is the one an operator pastes into a bug report, so
+                // it is the last place that should round "unknown" down to 0.
+                bay = drive
+                    .element_address
+                    .map_or_else(|| "----".to_string(), |bay| format!("{bay:04x}")),
+                serial = or_dash(drive.drive_serial.as_deref()),
                 state = drive_status_name(drive.status),
-                read = drive.lifetime_read_bytes,
-                write = drive.lifetime_write_bytes,
-                epoch = drive.counter_epoch,
-                ring = drive.tape_io_staging_ring_buffers,
-                gap_p95 = drive.tape_io_gap_p95_us,
-                window_feed = drive.tape_io_window_feed_bytes_per_second,
-                session_feed = drive.tape_io_effective_feed_bytes_per_second,
-                mount_age = drive.mount_age_seconds,
+                read = or_dash_display(drive.lifetime_read_bytes),
+                write = or_dash_display(drive.lifetime_write_bytes),
+                epoch = or_dash_display(drive.counter_epoch),
+                ring = or_dash_display(drive.tape_io_staging_ring_buffers),
+                gap_p95 = or_dash_display(drive.tape_io_gap_p95_us),
+                window_feed = or_dash_display(drive.tape_io_window_feed_bytes_per_second),
+                session_feed = or_dash_display(drive.tape_io_effective_feed_bytes_per_second),
+                mount_age = or_dash_display(drive.mount_age_seconds),
             );
         }
     }
@@ -16447,35 +16446,35 @@ mod tests {
                     library_uuid: Uuid::from_u128(1).as_bytes().to_vec(),
                 }),
                 drives: vec![pb::Drive {
-                    element_address: 0x0100,
-                    drive_serial: "DRV-01".to_string(),
-                    host_device_path: "/dev/sg1".to_string(),
-                    vendor: "HPE".to_string(),
-                    product: "LTO".to_string(),
-                    loaded_tape_uuid: Uuid::from_u128(2).as_bytes().to_vec(),
+                    element_address: Some(0x0100),
+                    drive_serial: Some("DRV-01".to_string()),
+                    host_device_path: Some("/dev/sg1".to_string()),
+                    vendor: Some("HPE".to_string()),
+                    product: Some("LTO".to_string()),
+                    loaded_tape_uuid: Some(Uuid::from_u128(2).as_bytes().to_vec()),
                     status: pb::drive::Status::DriveStatusCleaning as i32,
-                    drive_uuid: Uuid::from_u128(3).as_bytes().to_vec(),
-                    cleaning_due: "now".to_string(),
-                    fenced: true,
-                    lifetime_read_bytes: 1_048_576,
-                    lifetime_write_bytes: 2_097_152,
-                    counter_epoch: 42,
-                    session_id: Uuid::from_u128(4).as_bytes().to_vec(),
+                    drive_uuid: Some(Uuid::from_u128(3).as_bytes().to_vec()),
+                    cleaning_due: Some("now".to_string()),
+                    fenced: Some(true),
+                    lifetime_read_bytes: Some(1_048_576),
+                    lifetime_write_bytes: Some(2_097_152),
+                    counter_epoch: Some(42),
+                    session_id: Some(Uuid::from_u128(4).as_bytes().to_vec()),
                     active_alert_names: vec!["cleaning".to_string()],
-                    tape_io_staging_ring_buffers: 4,
-                    tape_io_effective_batch_blocks: 16,
-                    tape_io_gap_p95_us: 250,
-                    tape_io_cadence_us: 1_100,
-                    tape_io_effective_feed_bytes_per_second: 300_000_000,
-                    loaded_tape_barcode: "CLN001".to_string(),
-                    mount_age_seconds: 83,
-                    tape_io_window_feed_bytes_per_second: 304_000_000,
+                    tape_io_staging_ring_buffers: Some(4),
+                    tape_io_effective_batch_blocks: Some(16),
+                    tape_io_gap_p95_us: Some(250),
+                    tape_io_cadence_us: Some(1_100),
+                    tape_io_effective_feed_bytes_per_second: Some(300_000_000),
+                    loaded_tape_barcode: Some("CLN001".to_string()),
+                    mount_age_seconds: Some(83),
+                    tape_io_window_feed_bytes_per_second: Some(304_000_000),
                     ..Default::default()
                 }],
                 slots: vec![pb::Slot {
                     element_address: 0x0200,
-                    voltag: "CLN001".to_string(),
-                    tape_uuid: Uuid::from_u128(2).as_bytes().to_vec(),
+                    voltag: Some("CLN001".to_string()),
+                    tape_uuid: Some(Uuid::from_u128(2).as_bytes().to_vec()),
                 }],
                 import_export_ports: Vec::new(),
                 last_inventory_at: Some(prost_types::Timestamp {
@@ -16608,7 +16607,7 @@ mod tests {
                 "DRV123",
                 Some(pb::DriveCatalogEntry {
                     drive_uuid: resolved.clone(),
-                    serial: "DRV123".to_string(),
+                    serial: Some("DRV123".to_string()),
                     actionable: true,
                     ..Default::default()
                 }),
@@ -16621,7 +16620,7 @@ mod tests {
             "DUPSER",
             Some(pb::DriveCatalogEntry {
                 drive_uuid: Uuid::new_v4().as_bytes().to_vec(),
-                serial: "DUPSER".to_string(),
+                serial: Some("DUPSER".to_string()),
                 actionable: false,
                 ..Default::default()
             }),
