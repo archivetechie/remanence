@@ -369,27 +369,37 @@ impl LiveStatusState {
     }
 
     fn observe_mount_at(&self, library_serial: &str, drive: &mut pb::Drive, now: Instant) {
-        let key = (library_serial.to_string(), drive.element_address);
+        // A mount observation is keyed by bay. Without one there is nothing to
+        // key, and nothing to say about how long anything has been seated.
+        let Some(element_address) = drive.element_address else {
+            drive.mount_age_seconds = None;
+            return;
+        };
+        let key = (library_serial.to_string(), element_address);
         let mut observations = self
             .mount_observations
             .lock()
             .unwrap_or_else(|err| err.into_inner());
-        if drive.loaded_tape_barcode.is_empty() {
+        // No barcode means nothing seated, or a label that could not be read.
+        // Either way there is no mount to age, so the age is absent rather than
+        // zero -- zero would mean "seated just now", which is a real state this
+        // used to be indistinguishable from.
+        let Some(barcode) = drive.loaded_tape_barcode.clone() else {
             observations.remove(&key);
-            drive.mount_age_seconds = 0;
+            drive.mount_age_seconds = None;
             return;
-        }
+        };
         let observation = observations.entry(key).or_insert_with(|| MountObservation {
-            barcode: drive.loaded_tape_barcode.clone(),
+            barcode: barcode.clone(),
             seated_at: now,
         });
-        if observation.barcode != drive.loaded_tape_barcode {
+        if observation.barcode != barcode {
             *observation = MountObservation {
-                barcode: drive.loaded_tape_barcode.clone(),
+                barcode,
                 seated_at: now,
             };
         }
-        drive.mount_age_seconds = now.duration_since(observation.seated_at).as_secs();
+        drive.mount_age_seconds = Some(now.duration_since(observation.seated_at).as_secs());
     }
 
     fn counter_epoch(daemon_epoch: u64, drive_uuid: &[u8]) -> u64 {
@@ -1031,8 +1041,14 @@ impl ApiState {
             for drive in state.drives.iter_mut() {
                 self.live_status
                     .observe_mount(library.serial.as_str(), drive);
-                let bay = u16::try_from(drive.element_address)
-                    .map_err(|_| Status::invalid_argument("drive element address overflows u16"))?;
+                let bay = drive
+                    .element_address
+                    .ok_or_else(|| Status::internal("changer-projected drive has no bay"))
+                    .and_then(|address| {
+                        u16::try_from(address).map_err(|_| {
+                            Status::invalid_argument("drive element address overflows u16")
+                        })
+                    })?;
                 // Every arm is handled explicitly. The bug this replaces was a
                 // missing `else`: an unresolved bay kept the zero-seeded row and
                 // reported an empty identity as though it were a value.
@@ -1161,8 +1177,14 @@ impl ApiState {
                 continue;
             }
             for drive in &library_state.drives {
-                let bay = u16::try_from(drive.element_address)
-                    .map_err(|_| Status::invalid_argument("drive element address overflows u16"))?;
+                let bay = drive
+                    .element_address
+                    .ok_or_else(|| Status::internal("changer-projected drive has no bay"))
+                    .and_then(|address| {
+                        u16::try_from(address).map_err(|_| {
+                            Status::invalid_argument("drive element address overflows u16")
+                        })
+                    })?;
                 let is_busy = busy_bays.contains(&bay);
                 let session = if is_busy {
                     sessions_by_bay
@@ -1180,12 +1202,13 @@ impl ApiState {
                     } else {
                         pb::drive_assignment::State::DriveAssignmentStateIdle as i32
                     },
-                    current_session_id: session
-                        .map(|(session_id, _)| session_id.as_bytes().to_vec())
-                        .unwrap_or_default(),
+                    // Absent means idle, not "session zero".
+                    current_session_id: session.map(|(session_id, _)| session_id.as_bytes().to_vec()),
+                    // Prefer the session's tape; fall back to whatever the
+                    // changer saw seated. If neither knows, say so.
                     loaded_tape_uuid: session
                         .map(|(_, mounted)| mounted.tape_uuid.to_vec())
-                        .unwrap_or_else(|| drive.loaded_tape_uuid.clone()),
+                        .or_else(|| drive.loaded_tape_uuid.clone()),
                 });
             }
         }
@@ -1203,14 +1226,15 @@ impl ApiState {
         open_session_id: Option<&Vec<u8>>,
     ) {
         let drive_uuid = record.drive_uuid.clone();
-        drive.drive_uuid = drive_uuid.clone();
-        drive.cleaning_due = if record.managed == "foreign" {
+        drive.drive_uuid = Some(drive_uuid.clone());
+        drive.cleaning_due = Some(if record.managed == "foreign" {
             "none".to_string()
         } else {
             record.cleaning_due.clone()
-        };
-        drive.fenced = record.fenced;
-        drive.session_id = open_session_id.cloned().unwrap_or_default();
+        });
+        drive.fenced = Some(record.fenced);
+        // Absent means no open session, which is not session zero.
+        drive.session_id = open_session_id.cloned();
         drive.active_alert_names = if cleaning_active {
             vec!["cleaning".to_string()]
         } else {
@@ -1219,46 +1243,59 @@ impl ApiState {
         self.enrich_live_counters(drive);
         if cleaning_active {
             drive.status = pb::drive::Status::DriveStatusCleaning as i32;
-        } else if drive.fenced || record.fenced {
+        } else if drive.fenced.unwrap_or(false) || record.fenced {
             drive.status = pb::drive::Status::DriveStatusFenced as i32;
         }
     }
 
+    /// Fill in live counters and transfer telemetry, where they exist.
+    ///
+    /// Note what this function does NOT have: an `else`. When no counters are
+    /// registered for a drive, every telemetry field is simply left as the
+    /// projection set it. That used to be zero, so a drive nobody was measuring
+    /// reported perfect numbers -- a 0us I/O gap, a flawless cadence -- and an
+    /// operator had no way to tell a well-behaved idle drive from one that was
+    /// never instrumented. The missing `else` was invisible precisely because
+    /// the value it failed to write was already a plausible value.
+    ///
+    /// Now the projection leaves `None`, so the same missing branch reports
+    /// "not measured", which is what was true all along.
     fn enrich_live_counters(&self, drive: &mut pb::Drive) {
-        if drive.drive_uuid.is_empty() {
+        let Some(drive_uuid) = drive.drive_uuid.clone() else {
             return;
-        }
+        };
         let counters = self
             .live_status
             .drive_counters
             .read()
             .unwrap_or_else(|err| err.into_inner())
-            .get(&drive.drive_uuid)
+            .get(&drive_uuid)
             .cloned();
-        drive.counter_epoch = counters.as_ref().map_or_else(
-            || LiveStatusState::counter_epoch(self.daemon_epoch, drive.drive_uuid.as_slice()),
+        drive.counter_epoch = Some(counters.as_ref().map_or_else(
+            || LiveStatusState::counter_epoch(self.daemon_epoch, drive_uuid.as_slice()),
             |counters| counters.counter_epoch,
-        );
+        ));
         if let Some(counters) = counters {
-            drive.lifetime_read_bytes = counters.read_bytes.load(Ordering::Relaxed);
-            drive.lifetime_write_bytes = counters.write_bytes.load(Ordering::Relaxed);
-            drive.tape_io_staging_ring_buffers = counters
+            drive.lifetime_read_bytes = Some(counters.read_bytes.load(Ordering::Relaxed));
+            drive.lifetime_write_bytes = Some(counters.write_bytes.load(Ordering::Relaxed));
+            drive.tape_io_staging_ring_buffers = Some(counters
                 .tape_io_staging_ring_buffers
-                .load(Ordering::Relaxed) as u32;
-            drive.tape_io_effective_batch_blocks = counters
+                .load(Ordering::Relaxed) as u32);
+            drive.tape_io_effective_batch_blocks = Some(counters
                 .tape_io_effective_batch_blocks
-                .load(Ordering::Relaxed) as u32;
-            drive.tape_io_gap_p50_us = counters.tape_io_gap_p50_us.load(Ordering::Relaxed);
-            drive.tape_io_gap_p95_us = counters.tape_io_gap_p95_us.load(Ordering::Relaxed);
-            drive.tape_io_gap_max_us = counters.tape_io_gap_max_us.load(Ordering::Relaxed);
-            drive.tape_io_ioctl_p50_us = counters.tape_io_ioctl_p50_us.load(Ordering::Relaxed);
-            drive.tape_io_ioctl_p95_us = counters.tape_io_ioctl_p95_us.load(Ordering::Relaxed);
-            drive.tape_io_ioctl_max_us = counters.tape_io_ioctl_max_us.load(Ordering::Relaxed);
-            drive.tape_io_cadence_us = counters.tape_io_cadence_us.load(Ordering::Relaxed);
-            drive.tape_io_effective_feed_bytes_per_second = counters
+                .load(Ordering::Relaxed) as u32);
+            drive.tape_io_gap_p50_us = Some(counters.tape_io_gap_p50_us.load(Ordering::Relaxed));
+            drive.tape_io_gap_p95_us = Some(counters.tape_io_gap_p95_us.load(Ordering::Relaxed));
+            drive.tape_io_gap_max_us = Some(counters.tape_io_gap_max_us.load(Ordering::Relaxed));
+            drive.tape_io_ioctl_p50_us = Some(counters.tape_io_ioctl_p50_us.load(Ordering::Relaxed));
+            drive.tape_io_ioctl_p95_us = Some(counters.tape_io_ioctl_p95_us.load(Ordering::Relaxed));
+            drive.tape_io_ioctl_max_us = Some(counters.tape_io_ioctl_max_us.load(Ordering::Relaxed));
+            drive.tape_io_cadence_us = Some(counters.tape_io_cadence_us.load(Ordering::Relaxed));
+            drive.tape_io_effective_feed_bytes_per_second = Some(counters
                 .tape_io_effective_feed_bytes_per_second
-                .load(Ordering::Relaxed);
-            drive.tape_io_window_feed_bytes_per_second = counters.window_feed_bytes_per_second();
+                .load(Ordering::Relaxed));
+            drive.tape_io_window_feed_bytes_per_second =
+                Some(counters.window_feed_bytes_per_second());
         }
     }
 
@@ -5792,22 +5829,28 @@ mod tests {
         let state = LiveStatusState::new(Duration::from_secs(1));
         let started_at = Instant::now();
         let mut drive = pb::Drive {
-            element_address: 0x0100,
-            loaded_tape_barcode: "A00001L9".to_string(),
+            element_address: Some(0x0100),
+            loaded_tape_barcode: Some("A00001L9".to_string()),
             ..pb::Drive::default()
         };
 
         state.observe_mount_at("mainlib", &mut drive, started_at);
         state.observe_mount_at("mainlib", &mut drive, started_at + Duration::from_secs(83));
-        assert_eq!(drive.mount_age_seconds, 83);
+        assert_eq!(drive.mount_age_seconds, Some(83));
 
-        drive.loaded_tape_barcode = "A00002L9".to_string();
+        // A different barcode is a NEW mount, seated just now: age zero, and
+        // zero here is a real measurement of a real cartridge.
+        drive.loaded_tape_barcode = Some("A00002L9".to_string());
         state.observe_mount_at("mainlib", &mut drive, started_at + Duration::from_secs(84));
-        assert_eq!(drive.mount_age_seconds, 0);
+        assert_eq!(drive.mount_age_seconds, Some(0));
 
-        drive.loaded_tape_barcode.clear();
+        // An empty bay has no mount, so it has no age. This used to assert 0,
+        // which made an empty bay indistinguishable from a cartridge that had
+        // just been seated -- the two lines above and below reported the same
+        // number for opposite situations.
+        drive.loaded_tape_barcode = None;
         state.observe_mount_at("mainlib", &mut drive, started_at + Duration::from_secs(85));
-        assert_eq!(drive.mount_age_seconds, 0);
+        assert_eq!(drive.mount_age_seconds, None);
     }
     const SECOND_POOL_WRITE_TAPE_UUID: [u8; 16] = [5u8; 16];
     const API_SESSION_BLOCK_SIZE: u32 = 4096;

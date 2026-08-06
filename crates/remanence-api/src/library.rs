@@ -57,13 +57,19 @@ pub(crate) fn drive_status(bay: &DriveBay, busy: bool) -> pb::drive::Status {
     }
 }
 
-fn joined_tape_uuid(voltag: &Option<String>, voltags: &HashMap<String, Vec<u8>>) -> Vec<u8> {
+/// Join a changer-reported voltag to a catalogued tape UUID.
+///
+/// Returns `None` when there is no cartridge, when the voltag is blank, or when
+/// the catalog holds no tape under it. Those are all "no identity available",
+/// which is what the caller must be told -- previously this returned an empty
+/// vector for every one of them, and an empty vector is also what a caller sees
+/// for a cartridge whose identity simply was not looked up.
+fn joined_tape_uuid(voltag: &Option<String>, voltags: &HashMap<String, Vec<u8>>) -> Option<Vec<u8>> {
     voltag
         .as_deref()
         .map(str::trim)
         .filter(|voltag| !voltag.is_empty())
         .and_then(|voltag| voltags.get(voltag).cloned())
-        .unwrap_or_default()
 }
 
 pub(crate) fn project_drive(
@@ -76,21 +82,18 @@ pub(crate) fn project_drive(
     let busy = busy_bays.contains(&bay.element_address);
     let fenced = fenced_bays.contains(&bay.element_address);
     pb::Drive {
-        element_address: u32::from(bay.element_address),
-        drive_serial: installed
-            .map(|drive| drive.serial.clone())
-            .unwrap_or_default(),
+        // Known here, because the changer just told us: the bay, whether it is
+        // fenced, and whatever a host-side INQUIRY managed to resolve.
+        element_address: Some(u32::from(bay.element_address)),
+        drive_serial: installed.map(|drive| drive.serial.clone()),
         host_device_path: installed
             .and_then(|drive| drive.sg_path.as_ref())
-            .map(|path| path.display().to_string())
-            .unwrap_or_default(),
-        vendor: installed
-            .and_then(|drive| drive.vendor.clone())
-            .unwrap_or_default(),
-        product: installed
-            .and_then(|drive| drive.product.clone())
-            .unwrap_or_default(),
+            .map(|path| path.display().to_string()),
+        vendor: installed.and_then(|drive| drive.vendor.clone()),
+        product: installed.and_then(|drive| drive.product.clone()),
         loaded_tape_uuid: joined_tape_uuid(&bay.loaded_tape, voltags),
+        loaded_tape_barcode: bay.loaded_tape.clone(),
+        fenced: Some(fenced),
         status: if fenced {
             pb::drive::Status::DriveStatusFenced
         } else {
@@ -100,35 +103,49 @@ pub(crate) fn project_drive(
         // the catalog knows who lives in it, and the join happens later. The
         // state below says which answer the join got, so an absent identity is
         // never mistaken for an empty one.
-        drive_uuid: Vec::new(),
+        drive_uuid: None,
         catalog_state: pb::DriveCatalogState::Uncatalogued as i32,
-        cleaning_due: String::new(),
-        fenced,
-        lifetime_read_bytes: 0,
-        lifetime_write_bytes: 0,
-        counter_epoch: 0,
-        session_id: Vec::new(),
+
+        // NOT DETERMINED AT THIS LAYER. This function projects what the CHANGER
+        // reports; catalog history and transfer telemetry arrive later, from
+        // other sources, and may never arrive at all.
+        //
+        // These were previously seeded with 0 and an empty string. That is the
+        // single most misleading thing this file has ever done: a drive that had
+        // never been asked about its lifetime bytes reported having written
+        // zero, and a bay with no transfer in progress reported a flawless 0us
+        // I/O gap. Nothing downstream could tell those apart from real readings,
+        // and nothing downstream was at fault for failing to.
+        //
+        // `None` says the only true thing: nobody has asked yet.
+        cleaning_due: None,
+        lifetime_read_bytes: None,
+        lifetime_write_bytes: None,
+        counter_epoch: None,
+        session_id: None,
         active_alert_names: Vec::new(),
-        tape_io_staging_ring_buffers: 0,
-        tape_io_effective_batch_blocks: 0,
-        tape_io_gap_p50_us: 0,
-        tape_io_gap_p95_us: 0,
-        tape_io_gap_max_us: 0,
-        tape_io_ioctl_p50_us: 0,
-        tape_io_ioctl_p95_us: 0,
-        tape_io_ioctl_max_us: 0,
-        tape_io_cadence_us: 0,
-        tape_io_effective_feed_bytes_per_second: 0,
-        loaded_tape_barcode: bay.loaded_tape.clone().unwrap_or_default(),
-        mount_age_seconds: 0,
-        tape_io_window_feed_bytes_per_second: 0,
+        mount_age_seconds: None,
+        tape_io_staging_ring_buffers: None,
+        tape_io_effective_batch_blocks: None,
+        tape_io_gap_p50_us: None,
+        tape_io_gap_p95_us: None,
+        tape_io_gap_max_us: None,
+        tape_io_ioctl_p50_us: None,
+        tape_io_ioctl_p95_us: None,
+        tape_io_ioctl_max_us: None,
+        tape_io_cadence_us: None,
+        tape_io_effective_feed_bytes_per_second: None,
+        tape_io_window_feed_bytes_per_second: None,
     }
 }
 
 pub(crate) fn project_slot(slot: &Slot, voltags: &HashMap<String, Vec<u8>>) -> pb::Slot {
     pb::Slot {
         element_address: u32::from(slot.element_address),
-        voltag: slot.cartridge.clone().unwrap_or_default(),
+        // Absent means the slot is empty, or holds a cartridge whose label the
+        // changer could not read. Both are "no barcode available"; neither is a
+        // cartridge whose barcode is the empty string.
+        voltag: slot.cartridge.clone(),
         tape_uuid: joined_tape_uuid(&slot.cartridge, voltags),
     }
 }
@@ -136,7 +153,7 @@ pub(crate) fn project_slot(slot: &Slot, voltags: &HashMap<String, Vec<u8>>) -> p
 pub(crate) fn project_portal(port: &IePort, voltags: &HashMap<String, Vec<u8>>) -> pb::PortalSlot {
     pb::PortalSlot {
         element_address: u32::from(port.element_address),
-        voltag: port.cartridge.clone().unwrap_or_default(),
+        voltag: port.cartridge.clone(),
         tape_uuid: joined_tape_uuid(&port.cartridge, voltags),
         last_direction: pb::portal_slot::Direction::PortalDirectionUnspecified as i32,
     }
@@ -215,32 +232,49 @@ fn fenced_drive_bays(index: &CatalogIndex, library_serial: &str) -> Result<HashS
 fn drive_record_to_proto(record: DriveRecord) -> pb::DriveCatalogEntry {
     pb::DriveCatalogEntry {
         drive_uuid: record.drive_uuid,
-        serial: record.serial,
+        // INTERIM DECODE. `drives.serial` is nullable, but DriveRecord.serial is
+        // a String documented as "may be empty" -- the absence is destroyed at
+        // the SQL read layer, upstream of here. Empty genuinely is this field's
+        // encoding of absent (remanence-cli and index.rs both test for it), so
+        // decoding it back is faithful rather than a guess: a drive reporting an
+        // empty serial is a drive reporting no serial.
+        //
+        // The real fix is DriveRecord.serial: Option<String>, which removes the
+        // convention instead of decoding it. Next step in this arc.
+        serial: Some(record.serial).filter(|serial| !serial.is_empty()),
         identity_source: record.identity_source,
         actionable: record.actionable,
-        vendor: record.vendor.unwrap_or_default(),
-        product: record.product.unwrap_or_default(),
-        firmware_rev: record.firmware_rev.unwrap_or_default(),
+        // The record already carries these as Option, straight from nullable
+        // columns. They used to be flattened here, at the last possible moment
+        // before the wire -- the absence survived storage and retrieval intact
+        // and was destroyed on the way out.
+        vendor: record.vendor,
+        product: record.product,
+        firmware_rev: record.firmware_rev,
         managed: record.managed,
         state: record.state,
         cleaning_due: record.cleaning_due,
         fenced: record.fenced,
         first_seen_utc: crate::timestamp_from_rfc3339(record.first_seen_utc.as_str()),
         last_seen_utc: crate::timestamp_from_rfc3339(record.last_seen_utc.as_str()),
-        last_library_serial: record.last_library_serial.unwrap_or_default(),
+        last_library_serial: record.last_library_serial,
+        // NOTE: a None here means either "never seen in a library" or "the
+        // stored bay number would not fit a u32", and those are not the same
+        // fact -- the second is corrupt data, not an absence. Separating them
+        // needs an error path this projection does not have; tracked as
+        // remaining work rather than silently widened here.
         last_element_address: record
             .last_element_address
-            .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or_default(),
-        purchase_date: record.purchase_date.unwrap_or_default(),
-        warranty_until: record.warranty_until.unwrap_or_default(),
-        cost: record.cost.unwrap_or_default(),
-        notes: record.notes.unwrap_or_default(),
+            .and_then(|value| u32::try_from(value).ok()),
+        purchase_date: record.purchase_date,
+        warranty_until: record.warranty_until,
+        cost: record.cost,
+        notes: record.notes,
         retired_at_utc: record
             .retired_at_utc
             .as_deref()
             .and_then(crate::timestamp_from_rfc3339),
-        retire_reason: record.retire_reason.unwrap_or_default(),
+        retire_reason: record.retire_reason,
         correlation_rollups: Vec::new(),
     }
 }
@@ -278,32 +312,30 @@ fn drive_snapshot_to_proto(record: DriveHealthSnapshotRecord) -> pb::DriveHealth
         .session_id
         .as_deref()
         .and_then(|session_id| uuid::Uuid::parse_str(session_id).ok())
-        .map(|session_id| session_id.as_bytes().to_vec())
-        .unwrap_or_default();
+        .map(|session_id| session_id.as_bytes().to_vec());
     pb::DriveHealthSnapshot {
         snapshot_id: u64::try_from(record.snapshot_id).unwrap_or_default(),
         drive_uuid: record.drive_uuid,
         at_utc: crate::timestamp_from_rfc3339(record.at_utc.as_str()),
         trigger: record.trigger,
-        session_id: record.session_id.unwrap_or_default(),
-        tape_alert_flags: record.tape_alert_flags.unwrap_or_default(),
+        session_id: record.session_id,
+        tape_alert_flags: record.tape_alert_flags,
+        // Zero corrected errors is a fine drive. An unreadable log page is a
+        // drive nobody can vouch for. These four used to report the second as
+        // the first, which is the most flattering possible way to be wrong.
         write_errors_corrected: record
             .write_errors_corrected
-            .and_then(|value| u64::try_from(value).ok())
-            .unwrap_or_default(),
+            .and_then(|value| u64::try_from(value).ok()),
         write_errors_uncorrected: record
             .write_errors_uncorrected
-            .and_then(|value| u64::try_from(value).ok())
-            .unwrap_or_default(),
+            .and_then(|value| u64::try_from(value).ok()),
         read_errors_corrected: record
             .read_errors_corrected
-            .and_then(|value| u64::try_from(value).ok())
-            .unwrap_or_default(),
+            .and_then(|value| u64::try_from(value).ok()),
         read_errors_uncorrected: record
             .read_errors_uncorrected
-            .and_then(|value| u64::try_from(value).ok())
-            .unwrap_or_default(),
-        raw_pages: record.raw_pages.unwrap_or_default(),
+            .and_then(|value| u64::try_from(value).ok()),
+        raw_pages: record.raw_pages,
         session_uuid,
     }
 }
@@ -1218,8 +1250,8 @@ mod tests {
             raw_pages: None,
         });
 
-        assert_eq!(snapshot.session_uuid, session_id.as_bytes());
-        assert_eq!(snapshot.session_id, session_id.to_string());
+        assert_eq!(snapshot.session_uuid, Some(session_id.as_bytes().to_vec()));
+        assert_eq!(snapshot.session_id, Some(session_id.to_string()));
     }
 
     fn mk_library() -> Library {
@@ -1394,10 +1426,10 @@ mod tests {
         voltags.insert("S30002L9".to_string(), vec![9u8; 16]);
         assert_eq!(
             joined_tape_uuid(&Some("S30002L9".to_string()), &voltags),
-            vec![9u8; 16]
+            Some(vec![9u8; 16])
         );
-        assert!(joined_tape_uuid(&Some("NOPE".to_string()), &voltags).is_empty());
-        assert!(joined_tape_uuid(&None, &voltags).is_empty());
+        assert!(joined_tape_uuid(&Some("NOPE".to_string()), &voltags).is_none());
+        assert!(joined_tape_uuid(&None, &voltags).is_none());
     }
 
     #[test]
@@ -1417,17 +1449,17 @@ mod tests {
             "DEC418146K_LL02"
         );
         assert_eq!(state.drives.len(), 1);
-        assert_eq!(state.drives[0].loaded_tape_uuid, vec![9u8; 16]);
-        assert_eq!(state.drives[0].loaded_tape_barcode, "S30002L9");
+        assert_eq!(state.drives[0].loaded_tape_uuid, Some(vec![9u8; 16]));
+        assert_eq!(state.drives[0].loaded_tape_barcode.as_deref(), Some("S30002L9"));
         assert_eq!(
             state.drives[0].status,
             pb::drive::Status::DriveStatusLoaded as i32
         );
         assert_eq!(state.slots.len(), 1);
-        assert_eq!(state.slots[0].voltag, "CLNU01L9");
-        assert_eq!(state.slots[0].tape_uuid, vec![7u8; 16]);
+        assert_eq!(state.slots[0].voltag.as_deref(), Some("CLNU01L9"));
+        assert_eq!(state.slots[0].tape_uuid, Some(vec![7u8; 16]));
         assert_eq!(state.import_export_ports.len(), 1);
-        assert!(state.import_export_ports[0].tape_uuid.is_empty());
+        assert!(state.import_export_ports[0].tape_uuid.is_none());
         assert_eq!(
             state.import_export_ports[0].last_direction,
             pb::portal_slot::Direction::PortalDirectionUnspecified as i32
@@ -1467,7 +1499,7 @@ mod tests {
             state.drives[0].status,
             pb::drive::Status::DriveStatusFenced as i32
         );
-        assert!(state.drives[0].fenced);
+        assert_eq!(state.drives[0].fenced, Some(true));
     }
 
     #[test]
@@ -1499,7 +1531,7 @@ mod tests {
             !debug.to_ascii_lowercase().contains("exception"),
             "daemon proto state must not expose RES exception evidence: {debug}"
         );
-        assert_eq!(state.drives[0].element_address, 1);
+        assert_eq!(state.drives[0].element_address, Some(1));
         assert_eq!(state.slots[0].element_address, 0x03e9);
         assert_eq!(state.import_export_ports[0].element_address, 0x10);
     }
@@ -1543,7 +1575,7 @@ mod tests {
         );
         assert_eq!(response.drives.len(), 1);
         assert_eq!(response.slots.len(), 1);
-        assert!(response.drives[0].loaded_tape_uuid.is_empty());
+        assert!(response.drives[0].loaded_tape_uuid.is_none());
         assert_eq!(response.last_inventory_at.expect("timestamp").seconds, 0);
     }
 
@@ -1898,19 +1930,19 @@ mod tests {
         assert_eq!(library.managed, "rem");
         assert_eq!(library.drives.len(), 1);
         let drive = &library.drives[0];
-        assert_eq!(drive.drive_uuid, drive_uuid);
-        assert_eq!(drive.lifetime_read_bytes, 1_024);
-        assert_eq!(drive.lifetime_write_bytes, 2_048);
+        assert_eq!(drive.drive_uuid.as_deref(), Some(drive_uuid.as_slice()));
+        assert_eq!(drive.lifetime_read_bytes, Some(1_024));
+        assert_eq!(drive.lifetime_write_bytes, Some(2_048));
         assert_eq!(drive.status, pb::drive::Status::DriveStatusCleaning as i32);
         assert_eq!(drive.active_alert_names, vec!["cleaning".to_string()]);
-        assert_ne!(drive.counter_epoch, 0);
-        assert_eq!(drive.tape_io_staging_ring_buffers, 4);
-        assert_eq!(drive.tape_io_effective_batch_blocks, 16);
-        assert_eq!(drive.tape_io_gap_p95_us, 250);
-        assert_eq!(drive.tape_io_cadence_us, 1_100);
-        assert_eq!(drive.tape_io_effective_feed_bytes_per_second, 300_000_000);
-        assert_eq!(drive.loaded_tape_barcode, "S30002L9");
-        assert!(drive.tape_io_window_feed_bytes_per_second > 0);
+        assert!(drive.counter_epoch.is_some_and(|epoch| epoch != 0));
+        assert_eq!(drive.tape_io_staging_ring_buffers, Some(4));
+        assert_eq!(drive.tape_io_effective_batch_blocks, Some(16));
+        assert_eq!(drive.tape_io_gap_p95_us, Some(250));
+        assert_eq!(drive.tape_io_cadence_us, Some(1_100));
+        assert_eq!(drive.tape_io_effective_feed_bytes_per_second, Some(300_000_000));
+        assert_eq!(drive.loaded_tape_barcode.as_deref(), Some("S30002L9"));
+        assert!(drive.tape_io_window_feed_bytes_per_second > Some(0));
 
         state.record_drive_write_bytes(Some(drive_uuid.as_slice()), 4_096);
         let cached = state
@@ -1920,8 +1952,8 @@ mod tests {
             .expect("cached live status")
             .into_inner();
         let cached_drive = &cached.libraries[0].drives[0];
-        assert_eq!(cached_drive.lifetime_write_bytes, 6_144);
-        assert!(cached_drive.tape_io_window_feed_bytes_per_second > 0);
+        assert_eq!(cached_drive.lifetime_write_bytes, Some(6_144));
+        assert!(cached_drive.tape_io_window_feed_bytes_per_second > Some(0));
     }
 
     #[tokio::test]
@@ -1945,12 +1977,12 @@ mod tests {
         let assignment = &idle.drive_assignments[0];
         assert_eq!(assignment.library_serial, "DEC418146K_LL02");
         assert_eq!(assignment.bay, 1);
-        assert_eq!(assignment.drive_uuid, drive_uuid);
+        assert_eq!(assignment.drive_uuid.as_deref(), Some(drive_uuid.as_slice()));
         assert_eq!(
             assignment.state,
             pb::drive_assignment::State::DriveAssignmentStateIdle as i32
         );
-        assert!(assignment.current_session_id.is_empty());
+        assert!(assignment.current_session_id.is_none());
 
         let _reservation = pool.reserve_drive(1).expect("reserve bay for live session");
         let session_id = Uuid::new_v4();
@@ -1978,8 +2010,8 @@ mod tests {
             assignment.state,
             pb::drive_assignment::State::DriveAssignmentStateActive as i32
         );
-        assert_eq!(assignment.current_session_id, session_id.as_bytes());
-        assert_eq!(assignment.loaded_tape_uuid, tape_uuid.as_bytes());
+        assert_eq!(assignment.current_session_id, Some(session_id.as_bytes().to_vec()));
+        assert_eq!(assignment.loaded_tape_uuid, Some(tape_uuid.as_bytes().to_vec()));
 
         let second = pool
             .reserve_drive(1)
@@ -2006,7 +2038,7 @@ mod tests {
 
         let drive = &response.libraries[0].drives[0];
         assert_eq!(drive.status, pb::drive::Status::DriveStatusFenced as i32);
-        assert!(drive.fenced);
+        assert_eq!(drive.fenced, Some(true));
     }
 
     #[tokio::test]
@@ -2039,8 +2071,8 @@ mod tests {
             .drives[0]
             .counter_epoch;
 
-        assert_ne!(first_epoch, 0);
-        assert_ne!(second_epoch, 0);
+        assert!(first_epoch.is_some_and(|epoch| epoch != 0));
+        assert!(second_epoch.is_some_and(|epoch| epoch != 0));
         assert_ne!(first_epoch, second_epoch);
     }
 
@@ -2071,7 +2103,7 @@ mod tests {
         let drive = &response.libraries[0].drives[0];
 
         assert_eq!(
-            drive.drive_uuid, drive_uuid,
+            drive.drive_uuid, Some(drive_uuid),
             "a retired drive that is still installed must keep its identity"
         );
         assert_eq!(
@@ -2096,7 +2128,7 @@ mod tests {
             .into_inner();
         let drive = &response.libraries[0].drives[0];
 
-        assert!(drive.drive_uuid.is_empty());
+        assert!(drive.drive_uuid.is_none());
         assert_eq!(
             drive.catalog_state,
             pb::DriveCatalogState::Uncatalogued as i32,

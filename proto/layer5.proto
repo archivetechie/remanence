@@ -252,14 +252,33 @@ enum DriveCatalogState {
   DRIVE_CATALOG_STATE_AMBIGUOUS   = 4;
 }
 
+// A live report about one drive bay, as the daemon currently understands it.
+//
+// Almost every field here is `optional`, and that is the honest shape: this
+// message is an OBSERVATION, and each part of the observation is separately
+// capable of failing. The changer reports a bay; a host-side INQUIRY supplies
+// the identity; the catalog supplies the history; the transfer engine supplies
+// the telemetry. Any of those can be unavailable while the others succeed.
+//
+// The cost of getting this wrong is on record. `drive_serial` was a plain
+// string, so a bay whose identity lookup failed reported an empty serial --
+// indistinguishable from a bay with no drive in it. That defect took a month to
+// find, because every layer above faithfully passed on a value that was never
+// true. The rule now is the plain one: if a value can be unknown, it is
+// `optional`; if it must always be known, it is not.
+//
+// Telemetry deserves a specific note. A gap of 0us is an excellent measurement.
+// No measurement at all is not a measurement of zero. When these were plain,
+// an idle drive and a perfectly-performing drive produced identical bytes.
 message Drive {
-  uint32 element_address  = 1;  // library-reported drive bay
-  string drive_serial     = 2;  // joined from host-side INQUIRY
-  string host_device_path = 3;  // e.g., /dev/sg7
-  string vendor           = 4;
-  string product          = 5;
-  // Loaded tape (UUID); empty if drive is idle.
-  bytes  loaded_tape_uuid = 6;
+  optional uint32 element_address  = 1;  // library-reported bay; absent for a drive the changer cannot see
+  optional string drive_serial     = 2;  // joined from host-side INQUIRY; absent when the join fails
+  optional string host_device_path = 3;  // e.g., /dev/sg7; absent when no host device is matched
+  optional string vendor           = 4;  // from INQUIRY
+  optional string product          = 5;  // from INQUIRY
+  // Loaded tape (UUID). Absent means either no cartridge or a cartridge whose
+  // identity could not be read -- `status` distinguishes those.
+  optional bytes  loaded_tape_uuid = 6;
   enum Status {
     DRIVE_STATUS_UNSPECIFIED   = 0;
     DRIVE_STATUS_IDLE          = 1;
@@ -269,65 +288,77 @@ message Drive {
     DRIVE_STATUS_CLEANING      = 5;
     DRIVE_STATUS_FENCED        = 6;
   }
-  Status status           = 7;
-  // Catalog identity. Empty ONLY when catalog_state is UNCATALOGUED, i.e. the
+  Status status           = 7;           // always known: UNSPECIFIED already says "unknown"
+  // Catalog identity. Absent ONLY when catalog_state is UNCATALOGUED, i.e. the
   // changer reports a bay for which the drive catalog holds no row at all.
   // A retired drive keeps its identity and is reported with catalog_state
-  // RETIRED; consumers must not infer absence of a drive from an empty value.
-  bytes  drive_uuid       = 8;
-  string cleaning_due     = 9;
-  bool   fenced           = 10;
-  uint64 lifetime_read_bytes = 11;
-  uint64 lifetime_write_bytes = 12;
-  uint64 counter_epoch    = 13;
-  bytes  session_id       = 14;
+  // RETIRED; consumers must not infer absence of a drive from an absent value.
+  optional bytes  drive_uuid       = 8;
+  optional string cleaning_due     = 9;
+  optional bool   fenced           = 10;  // unknown for a bay with no catalog row
+  optional uint64 lifetime_read_bytes = 11;   // 0 bytes is a real answer for a new drive
+  optional uint64 lifetime_write_bytes = 12;  // 0 bytes is a real answer for a new drive
+  optional uint64 counter_epoch    = 13;
+  optional bytes  session_id       = 14;  // absent when the drive is not in a session
   repeated string active_alert_names = 15;
   reserved 16;
   reserved "tape_io_pipelined_submission";
-  uint32 tape_io_staging_ring_buffers = 17;
-  uint32 tape_io_effective_batch_blocks = 18;
-  uint64 tape_io_gap_p50_us = 19;
-  uint64 tape_io_gap_p95_us = 20;
-  uint64 tape_io_gap_max_us = 21;
-  uint64 tape_io_ioctl_p50_us = 22;
-  uint64 tape_io_ioctl_p95_us = 23;
-  uint64 tape_io_ioctl_max_us = 24;
-  uint64 tape_io_cadence_us = 25;
+  optional uint32 tape_io_staging_ring_buffers = 17;
+  optional uint32 tape_io_effective_batch_blocks = 18;
+  optional uint64 tape_io_gap_p50_us = 19;
+  optional uint64 tape_io_gap_p95_us = 20;
+  optional uint64 tape_io_gap_max_us = 21;
+  optional uint64 tape_io_ioctl_p50_us = 22;
+  optional uint64 tape_io_ioctl_p95_us = 23;
+  optional uint64 tape_io_ioctl_max_us = 24;
+  optional uint64 tape_io_cadence_us = 25;
   // Cumulative average over the current/most recently published transfer.
-  uint64 tape_io_effective_feed_bytes_per_second = 26;
-  // Changer-reported seated cartridge barcode; empty when no cartridge is loaded.
-  string loaded_tape_barcode = 27;
-  // Seconds since this daemon first observed the current barcode seated in this bay.
-  uint64 mount_age_seconds = 28;
+  optional uint64 tape_io_effective_feed_bytes_per_second = 26;
+  // Changer-reported seated cartridge barcode. Absent means either no cartridge
+  // or a cartridge whose label could not be read.
+  optional string loaded_tape_barcode = 27;
+  // Seconds since this daemon first observed the current barcode seated in this
+  // bay. Absent when nothing is seated, or when the daemon has not observed the
+  // seating -- a fresh mount reads 0, which is why absence must be separable.
+  optional uint64 mount_age_seconds = 28;
   // Combined read/write byte rate over the daemon's rolling ~5 second window.
-  uint64 tape_io_window_feed_bytes_per_second = 29;
+  optional uint64 tape_io_window_feed_bytes_per_second = 29;
   // How the drive catalog answered for this bay. Present on every row, so a
-  // consumer never has to infer catalog state from an empty identity.
-  DriveCatalogState catalog_state = 30;
+  // consumer never has to infer catalog state from an absent identity.
+  DriveCatalogState catalog_state = 30;   // always known: UNSPECIFIED already says "unknown"
 }
 
+// A row of the drive catalog. Field presence here MIRRORS the nullability of
+// the `drives` table, column for column: a column declared NOT NULL is a plain
+// field, a nullable column is `optional`. That is not a convention, it is the
+// only honest mapping — a plain field promises the value is always known, and
+// the proto has no business promising what the storage does not.
+//
+// tools/wire_presence_census.py records the verdict per field; the derivation
+// is the schema itself, so a future column that gains or loses NOT NULL must
+// move its field with it.
 message DriveCatalogEntry {
-  bytes drive_uuid = 1;
-  string serial = 2;
-  string identity_source = 3;
-  bool actionable = 4;
-  string vendor = 5;
-  string product = 6;
-  string firmware_rev = 7;
-  string managed = 8;
-  string state = 9;
-  string cleaning_due = 10;
-  bool fenced = 11;
+  bytes drive_uuid = 1;                    // primary key: always known
+  optional string serial = 2;              // drives.serial is nullable: INQUIRY can fail
+  string identity_source = 3;              // NOT NULL
+  bool actionable = 4;                     // NOT NULL DEFAULT 1
+  optional string vendor = 5;              // nullable
+  optional string product = 6;             // nullable
+  optional string firmware_rev = 7;        // nullable
+  string managed = 8;                      // NOT NULL
+  string state = 9;                        // NOT NULL DEFAULT 'active'
+  string cleaning_due = 10;                // NOT NULL DEFAULT 'none'
+  bool fenced = 11;                        // NOT NULL DEFAULT 0
   google.protobuf.Timestamp first_seen_utc = 12;
   google.protobuf.Timestamp last_seen_utc = 13;
-  string last_library_serial = 14;
-  uint32 last_element_address = 15;
-  string purchase_date = 16;
-  string warranty_until = 17;
-  string cost = 18;
-  string notes = 19;
+  optional string last_library_serial = 14;   // nullable: never seen in a library
+  optional uint32 last_element_address = 15;  // nullable; bay 0 is also a real bay
+  optional string purchase_date = 16;      // nullable: operator-supplied, often absent
+  optional string warranty_until = 17;     // nullable
+  optional string cost = 18;               // nullable
+  optional string notes = 19;              // nullable
   google.protobuf.Timestamp retired_at_utc = 20;
-  string retire_reason = 21;
+  optional string retire_reason = 21;      // nullable: set only on retirement
   repeated DriveCorrelationRollup correlation_rollups = 22;
 }
 
@@ -357,22 +388,29 @@ message DriveHistoryEvent {
   string detail = 8;
 }
 
+// Presence mirrors `drive_health_snapshots` nullability, as for DriveCatalogEntry.
+//
+// The four error counters matter most here: zero corrected errors is a real and
+// good reading, and "the log page could not be read" is a completely different
+// fact about the drive. Collapsing the second into the first reports a healthy
+// drive when what actually happened is that nobody could tell.
 message DriveHealthSnapshot {
-  uint64 snapshot_id = 1;
-  bytes drive_uuid = 2;
-  google.protobuf.Timestamp at_utc = 3;
-  string trigger = 4;
+  uint64 snapshot_id = 1;                  // primary key: always known
+  bytes drive_uuid = 2;                    // NOT NULL
+  google.protobuf.Timestamp at_utc = 3;    // NOT NULL
+  string trigger = 4;                      // NOT NULL
   // Deprecated canonical UUID text retained for compatibility.
-  string session_id = 5;
-  string tape_alert_flags = 6;
-  uint64 write_errors_corrected = 7;
-  uint64 write_errors_uncorrected = 8;
-  uint64 read_errors_corrected = 9;
-  uint64 read_errors_uncorrected = 10;
-  string raw_pages = 11;
+  optional string session_id = 5;          // nullable: snapshot need not be in a session
+  optional string tape_alert_flags = 6;    // nullable: log-page read can fail
+  optional uint64 write_errors_corrected = 7;    // nullable; 0 errors is a real reading
+  optional uint64 write_errors_uncorrected = 8;  // nullable
+  optional uint64 read_errors_corrected = 9;     // nullable
+  optional uint64 read_errors_uncorrected = 10;  // nullable
+  optional string raw_pages = 11;          // nullable
   // Canonical 16-byte UUID form shared with Drive.session_id and
-  // DriveAssignment.current_session_id.
-  bytes session_uuid = 12;
+  // DriveAssignment.current_session_id. Derived from session_id, so it is
+  // absent exactly when that is.
+  optional bytes session_uuid = 12;
 }
 
 message Alarm {
@@ -491,7 +529,7 @@ message DriveAssignment {
   string library_serial = 1;
   uint32 bay = 2;
   // Operator-legibility hint only; not an arbitration key.
-  bytes drive_uuid = 3;
+  optional bytes drive_uuid = 3;
   enum State {
     DRIVE_ASSIGNMENT_STATE_UNSPECIFIED = 0;
     DRIVE_ASSIGNMENT_STATE_IDLE = 1;
@@ -499,9 +537,9 @@ message DriveAssignment {
   }
   State state = 4;
   // Empty during reservation/mount transitions and non-session operations.
-  bytes current_session_id = 5;
+  optional bytes current_session_id = 5;
   // Empty when no cataloged tape is known to be loaded in this bay.
-  bytes loaded_tape_uuid = 6;
+  optional bytes loaded_tape_uuid = 6;
 }
 
 message GetLiveStatusResponse {
@@ -517,15 +555,15 @@ message GetLiveStatusResponse {
 message Slot {
   uint32 element_address  = 1;
   // Voltag (operator-visible cartridge label). Empty if slot is empty.
-  string voltag           = 2;
+  optional string voltag           = 2;
   // Remanence UUID for the cartridge in this slot. Empty if slot is empty.
-  bytes  tape_uuid        = 3;
+  optional bytes  tape_uuid        = 3;
 }
 
 message PortalSlot {
   uint32 element_address  = 1;
-  string voltag           = 2;
-  bytes  tape_uuid        = 3;
+  optional string voltag           = 2;
+  optional bytes  tape_uuid        = 3;
   enum Direction {
     PORTAL_DIRECTION_UNSPECIFIED = 0;
     PORTAL_DIRECTION_IMPORT      = 1;

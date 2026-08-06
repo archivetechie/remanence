@@ -260,29 +260,33 @@ fn render_pinned_band(frame: &mut Frame<'_>, area: Rect, state: &TopState) {
                 .drives
                 .iter()
                 .map(|drive| {
-                    let barcode = if drive.loaded_tape_barcode.is_empty() {
-                        "-"
-                    } else {
-                        drive.loaded_tape_barcode.as_str()
-                    };
                     let badges = drive_badges(drive);
                     Row::new(vec![
-                        Cell::from(format!("{:04x}", drive.element_address)),
-                        Cell::from(drive.drive_serial.clone()),
-                        Cell::from(barcode.to_string()),
+                        Cell::from(
+                            drive
+                                .element_address
+                                .map_or_else(|| DASH.to_string(), |bay| format!("{bay:04x}")),
+                        ),
+                        Cell::from(drive.drive_serial.clone().unwrap_or_else(|| DASH.to_string())),
+                        Cell::from(
+                            drive
+                                .loaded_tape_barcode
+                                .clone()
+                                .unwrap_or_else(|| DASH.to_string()),
+                        ),
                         Cell::from(mount_age_label(drive)),
                         Cell::from(format!(
                             "{} {}",
                             drive_state_glyph(drive.status),
                             drive_status_name(drive.status)
                         )),
-                        Cell::from(format!(
-                            "{:.1}",
-                            drive.tape_io_window_feed_bytes_per_second as f64 / 1_048_576.0
-                        )),
-                        Cell::from(format!(
-                            "{:.1}",
-                            drive.tape_io_effective_feed_bytes_per_second as f64 / 1_048_576.0
+                        // A drive nobody is measuring shows a dash, not 0.0.
+                        // Those are different facts and an operator scanning
+                        // this table for a stalled transfer needs to see which
+                        // one they are looking at.
+                        Cell::from(mib_per_second(drive.tape_io_window_feed_bytes_per_second)),
+                        Cell::from(mib_per_second(
+                            drive.tape_io_effective_feed_bytes_per_second,
                         )),
                         Cell::from(badges),
                     ])
@@ -349,16 +353,10 @@ fn render_slot_grid(frame: &mut Frame<'_>, area: Rect, state: &TopState) {
                 lines.push(Line::from(format!(
                     "{:04x}  {}  {}",
                     slot.element_address,
-                    if slot.voltag.is_empty() {
-                        "-"
-                    } else {
-                        slot.voltag.as_str()
-                    },
-                    if slot.tape_uuid.is_empty() {
-                        "-".to_string()
-                    } else {
-                        bytes_to_uuid_text(&slot.tape_uuid)
-                    }
+                    slot.voltag.as_deref().unwrap_or(DASH),
+                    slot.tape_uuid
+                        .as_deref()
+                        .map_or_else(|| DASH.to_string(), bytes_to_uuid_text)
                 )));
             }
             lines
@@ -406,14 +404,30 @@ fn drive_state_glyph(value: i32) -> &'static str {
     }
 }
 
+/// What an unknown value looks like in every table this file draws.
+#[cfg(feature = "tui")]
+const DASH: &str = "-";
+
+/// Render a byte rate in MiB/s, or a dash when the rate was never measured.
+#[cfg(feature = "tui")]
+fn mib_per_second(bytes_per_second: Option<u64>) -> String {
+    bytes_per_second.map_or_else(
+        || DASH.to_string(),
+        |rate| format!("{:.1}", rate as f64 / 1_048_576.0),
+    )
+}
+
 #[cfg(feature = "tui")]
 fn drive_badges(drive: &pb::Drive) -> String {
     let mut badges = Vec::new();
-    if drive.fenced {
+    if drive.fenced.unwrap_or(false) {
         badges.push("fenced");
     }
-    if !drive.cleaning_due.is_empty() && drive.cleaning_due != "none" {
-        badges.push(drive.cleaning_due.as_str());
+    // An unknown cleaning schedule earns no badge: a badge is an assertion, and
+    // "nobody asked the catalog" is not something to assert on a status line.
+    let cleaning_due = drive.cleaning_due.as_deref().unwrap_or("none");
+    if !cleaning_due.is_empty() && cleaning_due != "none" {
+        badges.push(cleaning_due);
     }
     badges.extend(drive.active_alert_names.iter().map(String::as_str));
     if badges.is_empty() {
@@ -425,10 +439,12 @@ fn drive_badges(drive: &pb::Drive) -> String {
 
 #[cfg(feature = "tui")]
 fn mount_age_label(drive: &pb::Drive) -> String {
-    if drive.loaded_tape_barcode.is_empty() {
-        return "-".to_string();
-    }
-    let seconds = drive.mount_age_seconds;
+    // Absent barcode: nothing seated, so nothing to age. Absent age with a
+    // barcode present: something IS seated but this daemon did not see it
+    // arrive -- also a dash, because any number here would be invented.
+    let Some(seconds) = drive.mount_age_seconds else {
+        return DASH.to_string();
+    };
     if seconds < 60 {
         format!("{seconds}s")
     } else if seconds < 3_600 {
@@ -456,31 +472,31 @@ mod tests {
                     library_uuid: Uuid::from_u128(1).as_bytes().to_vec(),
                 }),
                 drives: vec![pb::Drive {
-                    element_address: 0x0100,
-                    drive_serial: "DRV-01".to_string(),
-                    host_device_path: "/dev/sg1".to_string(),
-                    vendor: "HPE".to_string(),
-                    product: "LTO".to_string(),
-                    loaded_tape_uuid: Uuid::from_u128(2).as_bytes().to_vec(),
+                    element_address: Some(0x0100),
+                    drive_serial: Some("DRV-01".to_string()),
+                    host_device_path: Some("/dev/sg1".to_string()),
+                    vendor: Some("HPE".to_string()),
+                    product: Some("LTO".to_string()),
+                    loaded_tape_uuid: Some(Uuid::from_u128(2).as_bytes().to_vec()),
                     status: pb::drive::Status::DriveStatusCleaning as i32,
-                    drive_uuid: Uuid::from_u128(3).as_bytes().to_vec(),
-                    cleaning_due: "now".to_string(),
-                    fenced: true,
-                    lifetime_read_bytes: 1_048_576,
-                    lifetime_write_bytes: 2_097_152,
-                    counter_epoch: 42,
-                    session_id: Uuid::from_u128(4).as_bytes().to_vec(),
+                    drive_uuid: Some(Uuid::from_u128(3).as_bytes().to_vec()),
+                    cleaning_due: Some("now".to_string()),
+                    fenced: Some(true),
+                    lifetime_read_bytes: Some(1_048_576),
+                    lifetime_write_bytes: Some(2_097_152),
+                    counter_epoch: Some(42),
+                    session_id: Some(Uuid::from_u128(4).as_bytes().to_vec()),
                     active_alert_names: vec!["cleaning".to_string()],
-                    loaded_tape_barcode: "CLN001".to_string(),
-                    mount_age_seconds: 83,
-                    tape_io_window_feed_bytes_per_second: 304 * 1024 * 1024,
-                    tape_io_effective_feed_bytes_per_second: 13 * 1024 * 1024,
+                    loaded_tape_barcode: Some("CLN001".to_string()),
+                    mount_age_seconds: Some(83),
+                    tape_io_window_feed_bytes_per_second: Some(304 * 1024 * 1024),
+                    tape_io_effective_feed_bytes_per_second: Some(13 * 1024 * 1024),
                     ..Default::default()
                 }],
                 slots: vec![pb::Slot {
                     element_address: 0x0200,
-                    voltag: "CLN001".to_string(),
-                    tape_uuid: Uuid::from_u128(2).as_bytes().to_vec(),
+                    voltag: Some("CLN001".to_string()),
+                    tape_uuid: Some(Uuid::from_u128(2).as_bytes().to_vec()),
                 }],
                 import_export_ports: Vec::new(),
                 last_inventory_at: Some(prost_types::Timestamp {
