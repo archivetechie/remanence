@@ -467,6 +467,24 @@ pub struct ApiState {
     calibration_store: CalibrationControlStore,
 }
 
+/// How the drive catalog answered for a changer-reported bay.
+///
+/// The variants exist so a caller cannot silently skip the "no answer" case:
+/// the previous code returned `Option<DriveRecord>` and simply did nothing on
+/// `None`, which left the projected row carrying an empty identity that looked
+/// like a value.
+enum BayResolution {
+    /// One active catalog row claims the bay.
+    Resolved(remanence_state::DriveRecord),
+    /// The bay's only claimant is retired. Identity is known; the drive is
+    /// excluded from every selection path by `state`.
+    Retired(remanence_state::DriveRecord),
+    /// The changer reports the bay; the catalog holds no row for it.
+    Uncatalogued,
+    /// More than one row claims the bay. The chosen row is the preferred one.
+    Ambiguous(remanence_state::DriveRecord),
+}
+
 impl ApiState {
     /// Build service state around an already-opened rebuildable catalog index.
     pub fn new(index: CatalogIndex) -> Self {
@@ -874,21 +892,49 @@ impl ApiState {
         Ok(drive.map(|drive| drive.drive_uuid))
     }
 
-    fn drive_record_at_bay(
+    /// What the drive catalog knows about the drive occupying a changer bay.
+    ///
+    /// Retired rows are deliberately included. A retired drive is still bolted
+    /// into the library and still reported by the changer, so excluding it from
+    /// the lookup does not make it disappear — it makes it appear as a row with
+    /// no identity, which is strictly worse than reporting it as retired.
+    /// Exclusion from *use* is enforced where it belongs, in mount resolution
+    /// and in `get_actionable_drive_at`, both of which gate on `state`.
+    fn resolve_drive_at_bay(
         &self,
         library_serial: &str,
         bay: u16,
-    ) -> Result<Option<remanence_state::DriveRecord>, Status> {
+    ) -> Result<BayResolution, Status> {
         let index = self.index()?;
-        let drive = index
-            .list_drives(true, false)
+        let mut claimants: Vec<remanence_state::DriveRecord> = index
+            .list_drives(true, true)
             .map_err(status_from_state_error)?
             .into_iter()
-            .find(|drive| {
+            .filter(|drive| {
                 drive.last_library_serial.as_deref() == Some(library_serial)
                     && drive.last_element_address == Some(i64::from(bay))
-            });
-        Ok(drive)
+            })
+            .collect();
+        if claimants.is_empty() {
+            return Ok(BayResolution::Uncatalogued);
+        }
+        // Prefer an active row, then the most recently seen: a bay reclaimed by
+        // a replacement drive should report the replacement, not its predecessor.
+        claimants.sort_by(|a, b| {
+            let active = |d: &remanence_state::DriveRecord| d.state == "active";
+            active(b)
+                .cmp(&active(a))
+                .then_with(|| b.last_seen_utc.cmp(&a.last_seen_utc))
+        });
+        let ambiguous = claimants.len() > 1;
+        let chosen = claimants.swap_remove(0);
+        if ambiguous {
+            return Ok(BayResolution::Ambiguous(chosen));
+        }
+        if chosen.state == "retired" {
+            return Ok(BayResolution::Retired(chosen));
+        }
+        Ok(BayResolution::Resolved(chosen))
     }
 
     fn library_is_managed(&self, library_serial: &str) -> bool {
@@ -987,14 +1033,44 @@ impl ApiState {
                     .observe_mount(library.serial.as_str(), drive);
                 let bay = u16::try_from(drive.element_address)
                     .map_err(|_| Status::invalid_argument("drive element address overflows u16"))?;
-                let record = self.drive_record_at_bay(library.serial.as_str(), bay)?;
-                if let Some(record) = record {
-                    self.enrich_live_drive(
-                        drive,
-                        &record,
-                        active_clean_run_drive_uuids.contains(&record.drive_uuid),
-                        open_session_by_drive.get(&record.drive_uuid),
-                    );
+                // Every arm is handled explicitly. The bug this replaces was a
+                // missing `else`: an unresolved bay kept the zero-seeded row and
+                // reported an empty identity as though it were a value.
+                match self.resolve_drive_at_bay(library.serial.as_str(), bay)? {
+                    BayResolution::Resolved(record) => {
+                        self.enrich_live_drive(
+                            drive,
+                            &record,
+                            active_clean_run_drive_uuids.contains(&record.drive_uuid),
+                            open_session_by_drive.get(&record.drive_uuid),
+                        );
+                        drive.catalog_state = pb::DriveCatalogState::Cataloged as i32;
+                    }
+                    BayResolution::Retired(record) => {
+                        // Identity and history are reported so the operator can
+                        // see WHICH drive is retired in a bay that is still
+                        // physically occupied. Selection paths gate on state, so
+                        // reporting it here cannot cause it to be used.
+                        self.enrich_live_drive(
+                            drive,
+                            &record,
+                            active_clean_run_drive_uuids.contains(&record.drive_uuid),
+                            open_session_by_drive.get(&record.drive_uuid),
+                        );
+                        drive.catalog_state = pb::DriveCatalogState::Retired as i32;
+                    }
+                    BayResolution::Ambiguous(record) => {
+                        self.enrich_live_drive(
+                            drive,
+                            &record,
+                            active_clean_run_drive_uuids.contains(&record.drive_uuid),
+                            open_session_by_drive.get(&record.drive_uuid),
+                        );
+                        drive.catalog_state = pb::DriveCatalogState::Ambiguous as i32;
+                    }
+                    BayResolution::Uncatalogued => {
+                        drive.catalog_state = pb::DriveCatalogState::Uncatalogued as i32;
+                    }
                 }
             }
             libraries.push(state);

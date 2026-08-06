@@ -96,7 +96,12 @@ pub(crate) fn project_drive(
         } else {
             drive_status(bay, busy)
         } as i32,
+        // Every row is born without catalog identity: the changer knows the bay,
+        // the catalog knows who lives in it, and the join happens later. The
+        // state below says which answer the join got, so an absent identity is
+        // never mistaken for an empty one.
         drive_uuid: Vec::new(),
+        catalog_state: pb::DriveCatalogState::Uncatalogued as i32,
         cleaning_due: String::new(),
         fenced,
         lifetime_read_bytes: 0,
@@ -1984,6 +1989,103 @@ mod tests {
         assert_ne!(first_epoch, 0);
         assert_ne!(second_epoch, 0);
         assert_ne!(first_epoch, second_epoch);
+    }
+
+    /// A drive that is retired but still bolted into the library keeps its
+    /// identity in live status and is reported as retired.
+    ///
+    /// This is the TOPX.1 defect. The catalog lookup used to exclude retired
+    /// rows, and the caller had no branch for "no row found", so the projected
+    /// drive kept its zero-seeded identity and the operator saw a nameless row
+    /// with no explanation — permanently, since nothing un-retires a drive.
+    #[tokio::test]
+    async fn live_status_reports_a_retired_drive_with_its_identity() {
+        let mut index = test_index();
+        let drive_uuid = observe_test_drive(&mut index, "DRV-RETIRED", "DvcidAndInquiry", 1);
+        index
+            .retire_drive(drive_uuid.as_slice(), "panel test")
+            .expect("retire")
+            .expect("drive exists");
+
+        let mut state = state_with_snapshot();
+        state.index_path = Arc::new(index.path().to_path_buf());
+        let response = state
+            .library_service()
+            .get_live_status(Request::new(pb::GetLiveStatusRequest {}))
+            .await
+            .expect("live status")
+            .into_inner();
+        let drive = &response.libraries[0].drives[0];
+
+        assert_eq!(
+            drive.drive_uuid, drive_uuid,
+            "a retired drive that is still installed must keep its identity"
+        );
+        assert_eq!(
+            drive.catalog_state,
+            pb::DriveCatalogState::Retired as i32,
+            "and must be reported as retired rather than left unexplained"
+        );
+    }
+
+    /// A bay the changer reports but the catalog has never seen is reported as
+    /// uncatalogued, not as a drive whose identity happens to be empty.
+    #[tokio::test]
+    async fn live_status_marks_an_uncatalogued_bay() {
+        let index = test_index();
+        let mut state = state_with_snapshot();
+        state.index_path = Arc::new(index.path().to_path_buf());
+        let response = state
+            .library_service()
+            .get_live_status(Request::new(pb::GetLiveStatusRequest {}))
+            .await
+            .expect("live status")
+            .into_inner();
+        let drive = &response.libraries[0].drives[0];
+
+        assert!(drive.drive_uuid.is_empty());
+        assert_eq!(
+            drive.catalog_state,
+            pb::DriveCatalogState::Uncatalogued as i32,
+            "an empty identity must be explained by the catalog state beside it"
+        );
+    }
+
+    /// Reinstatement returns a retired drive to service and is auditable.
+    #[tokio::test]
+    async fn reinstate_returns_a_retired_drive_to_service() {
+        let mut index = test_index();
+        let drive_uuid = observe_test_drive(&mut index, "DRV-BACK", "DvcidAndInquiry", 1);
+        index
+            .retire_drive(drive_uuid.as_slice(), "retired in error")
+            .expect("retire")
+            .expect("drive exists");
+
+        let outcome = index
+            .reinstate_drive(drive_uuid.as_slice(), "returned to the fleet")
+            .expect("reinstate")
+            .expect("drive exists");
+        assert!(outcome.newly_reinstated);
+        assert_eq!(outcome.drive.state, "active");
+        assert!(
+            outcome.drive.retired_at_utc.is_none(),
+            "a reinstated drive must not still carry a retirement timestamp"
+        );
+
+        // Idempotent: reinstating an active drive is a no-op, not an error.
+        let again = index
+            .reinstate_drive(drive_uuid.as_slice(), "again")
+            .expect("reinstate")
+            .expect("drive exists");
+        assert!(!again.newly_reinstated);
+
+        let events = index
+            .list_drive_events(drive_uuid.as_slice())
+            .expect("events");
+        assert!(
+            events.iter().any(|e| e.event_kind == "reinstated"),
+            "reinstatement must leave an audit trail: {events:?}"
+        );
     }
 
     #[tokio::test]

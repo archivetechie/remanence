@@ -6216,7 +6216,15 @@ fn drive_live_json(drive: &pb::Drive) -> Value {
         },
         "mount_age_seconds": drive.mount_age_seconds,
         "status": drive_status_name(drive.status),
-        "drive_uuid": bytes_to_uuid_text(&drive.drive_uuid),
+        // Null, not "", when the catalog holds no row for this bay — matching
+        // loaded_tape_uuid, loaded_tape_barcode and session_id nearby. An empty
+        // string reads as a value; null reads as "not known".
+        "drive_uuid": if drive.drive_uuid.is_empty() {
+            Value::Null
+        } else {
+            Value::String(bytes_to_uuid_text(&drive.drive_uuid))
+        },
+        "catalog_state": drive_catalog_state_name(drive.catalog_state),
         "cleaning_due": drive.cleaning_due,
         "fenced": drive.fenced,
         "lifetime_read_bytes": drive.lifetime_read_bytes,
@@ -6454,6 +6462,17 @@ fn tape_state_name(value: i32) -> &'static str {
         2 => "ready",
         3 => "degraded",
         4 => "failed",
+        _ => "unspecified",
+    }
+}
+
+/// Wire enum -> the operator-facing word for how the drive catalog answered.
+fn drive_catalog_state_name(value: i32) -> &'static str {
+    match pb::DriveCatalogState::try_from(value) {
+        Ok(pb::DriveCatalogState::Cataloged) => "cataloged",
+        Ok(pb::DriveCatalogState::Retired) => "retired",
+        Ok(pb::DriveCatalogState::Uncatalogued) => "uncatalogued",
+        Ok(pb::DriveCatalogState::Ambiguous) => "ambiguous",
         _ => "unspecified",
     }
 }
