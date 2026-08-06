@@ -1341,9 +1341,16 @@ service ReadSessionService {
 }
 
 message ReadSession {
-  bytes session_id           = 1;
-  bytes tape_uuid            = 2;
-  uint32 drive_element_address = 3;
+  bytes session_id           = 1;  // primary key, always known
+  // A read session can be opened against a DRIVE rather than a named tape --
+  // "read whatever is seated here" -- so the volume's identity need not be
+  // known at open, and may stay unknown for an unidentified or foreign tape.
+  // Absent is a session reading a volume it cannot yet name, not a session
+  // with no volume.
+  optional bytes tape_uuid   = 2;
+  // Nullable in `sessions`: a session opened against a TapeTarget exists before
+  // the volume is mounted, so it holds no bay yet. Bay 0 is a real bay.
+  optional uint32 drive_element_address = 3;
   enum State {
     READ_SESSION_STATE_UNSPECIFIED = 0;
     READ_SESSION_STATE_OPEN        = 1;

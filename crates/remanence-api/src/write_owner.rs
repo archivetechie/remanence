@@ -7197,8 +7197,11 @@ fn read_session_proto(
 ) -> pb::ReadSession {
     pb::ReadSession {
         session_id: session_id.as_bytes().to_vec(),
-        tape_uuid: tape_uuid.to_vec(),
-        drive_element_address: u32::from(drive_element_address),
+        // This projection is handed both values by its caller, so Some is the
+        // truth here. The presence exists for callers further up that open a
+        // session against a drive rather than a named volume.
+        tape_uuid: Some(tape_uuid.to_vec()),
+        drive_element_address: Some(u32::from(drive_element_address)),
         state: state as i32,
         opened_at: timestamp_from_rfc3339(opened_at_utc),
         position_proof: position_after_lba
@@ -9396,7 +9399,7 @@ mod tests {
         );
 
         assert_eq!(write.drive_element_address, Some(0x0100));
-        assert_eq!(read.drive_element_address, 0x0101);
+        assert_eq!(read.drive_element_address, Some(0x0101));
         assert_eq!(read.daemon_epoch, 7);
     }
 

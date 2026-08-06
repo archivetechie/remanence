@@ -10799,8 +10799,8 @@ BCw3Wyv2UWY=
                     reply
                         .send(Ok(pb::ReadSession {
                             session_id: session_id.as_bytes().to_vec(),
-                            tape_uuid: TAPE_UUID.to_vec(),
-                            drive_element_address: 1,
+                            tape_uuid: Some(TAPE_UUID.to_vec()),
+                            drive_element_address: Some(1),
                             state: pb::read_session::State::ReadSessionStateOpen as i32,
                             opened_at: Some(prost_types::Timestamp {
                                 seconds: 0,
@@ -10823,8 +10823,8 @@ BCw3Wyv2UWY=
         .expect("open read session on loaded drive")
         .into_inner();
 
-        assert_eq!(opened.tape_uuid, TAPE_UUID);
-        assert_eq!(opened.drive_element_address, 1);
+        assert_eq!(opened.tape_uuid.as_deref(), Some(TAPE_UUID.as_slice()));
+        assert_eq!(opened.drive_element_address, Some(1));
         actor.await.expect("mock drive actor joins");
     }
 
@@ -10930,8 +10930,8 @@ BCw3Wyv2UWY=
         .expect("open read session through real drive actor")
         .into_inner();
 
-        assert_eq!(opened.tape_uuid, TAPE_UUID);
-        assert_eq!(opened.drive_element_address, u32::from(BAY));
+        assert_eq!(opened.tape_uuid.as_deref(), Some(TAPE_UUID.as_slice()));
+        assert_eq!(opened.drive_element_address, Some(u32::from(BAY)));
         let drive_opcodes = world
             .lock()
             .expect("virtual world lock")
