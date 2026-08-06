@@ -698,16 +698,33 @@ service Catalog {
   rpc ListEntriesInUnit (ListEntriesInUnitRequest) returns (ListEntriesInUnitResponse);
 }
 
+// Presence mirrors the `tapes` table, column for column, as for the drive
+// messages. Nearly every column there is nullable, and for good reason: a tape
+// can be known to exist -- inventoried from a barcode -- long before anything
+// has read its format, its block size or its parity scheme.
+//
+// Field 13 below already said this, and named the precedent it was avoiding:
+// block_size_bytes used 0 for unknown. That is now fixed rather than worked
+// around, so the warning in its comment no longer describes live behaviour.
 message Tape {
-  bytes tape_uuid              = 1;
-  string voltag                = 2;
-  string body_format           = 3; // "rem-tar-v1", "tar-legacy", "bru", ...
-  uint64 block_size_bytes      = 4;
-  // Parity scheme summary (per layer4 addendum tapes table).
-  uint32 data_blocks_per_stripe   = 5;
-  uint32 parity_blocks_per_stripe = 6;
-  uint32 stripes_per_neighborhood = 7;
-  uint64 last_committed_tape_file = 8;
+  bytes tape_uuid              = 1;  // primary key: always known
+  optional string voltag       = 2;  // tapes.voltag is nullable
+  // "rem-tar-v1", "tar-legacy", "bru", ... Absent until something has read the
+  // volume far enough to say; an inventoried tape has a barcode and no format.
+  optional string body_format  = 3;
+  // Absent means nobody has read the volume's block size. It is never zero: a
+  // zero block size is not a tape, and treating unknown as 0 is precisely the
+  // conflation field 13 was written to avoid.
+  optional uint64 block_size_bytes = 4;
+  // Parity scheme summary (per layer4 addendum tapes table). All three columns
+  // are nullable and are absent together on an unscanned volume; an unprotected
+  // tape is a scheme that says so, not a scheme of zero parity blocks.
+  optional uint32 data_blocks_per_stripe   = 5;
+  optional uint32 parity_blocks_per_stripe = 6;
+  optional uint32 stripes_per_neighborhood = 7;
+  // Absent means no tape file has been committed, which is not the same as
+  // having committed tape file 0 -- the first one.
+  optional uint64 last_committed_tape_file = 8;
   enum State {
     TAPE_STATE_UNSPECIFIED = 0;
     TAPE_STATE_INVENTORIED = 1; // known but not yet catalog-scanned
@@ -716,18 +733,16 @@ message Tape {
     TAPE_STATE_FAILED      = 4;
     TAPE_STATE_SEALED      = 5;
   }
-  State state                  = 9;
+  State state                  = 9;  // NOT NULL; UNSPECIFIED already says "unknown"
   google.protobuf.Timestamp updated_at = 10;
-  // Current operator/orchestrator pool assignment. Empty means unassigned.
-  string pool_id               = 11;
+  // Current operator/orchestrator pool assignment. Absent means unassigned.
+  optional string pool_id      = 11;
   repeated DriveCorrelationRollup correlation_rollups = 12;
   // Written extent: the maximum barrier-proved EOD LBA over this volume's
   // checkpoint records — a measurement that covers trailing sidecars,
   // parity maps and checkpoint files by construction, never a rollup over
   // object commits. Exclusive: last written block + 1. Absent = no barrier
-  // has proved one; absent is never zero, and 0 is never a stand-in for
-  // unknown (the block_size_bytes 0-as-unknown precedent is exactly the
-  // conflation this field avoids).
+  // has proved one; absent is never zero.
   optional uint64 written_extent_lba = 13;
 }
 

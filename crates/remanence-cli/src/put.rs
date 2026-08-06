@@ -933,8 +933,8 @@ async fn resolve_voltags(
                 .await
             {
                 let tape = response.into_inner();
-                if !tape.voltag.is_empty() {
-                    voltags.insert(copy.tape_uuid.clone(), tape.voltag);
+                if let Some(voltag) = tape.voltag {
+                    voltags.insert(copy.tape_uuid.clone(), voltag);
                 }
             }
         }

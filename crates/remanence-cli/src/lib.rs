@@ -4826,7 +4826,7 @@ async fn resolve_tape_uuid_arg(
         .tapes;
     tapes
         .into_iter()
-        .find(|tape| tape.voltag == arg)
+        .find(|tape| tape.voltag.as_deref() == Some(arg))
         .map(|tape| tape.tape_uuid)
         .ok_or_else(|| {
             DaemonClientError::client(format!("tape {arg:?} not found by UUID or voltag"))
@@ -5647,14 +5647,17 @@ fn print_tape_list(
 
 fn print_tape_line(tape: &pb::Tape, out: &mut dyn Write) {
     let tape_uuid = bytes_to_uuid_text(&tape.tape_uuid);
-    let voltag = dash_if_empty(&tape.voltag);
-    let pool = dash_if_empty(&tape.pool_id);
+    let voltag = or_dash(tape.voltag.as_deref());
+    let pool = or_dash(tape.pool_id.as_deref());
     let _ = writeln!(
         out,
         "{tape_uuid}  {voltag}  {}  state={}  pool={pool}  last_file={}",
-        tape.body_format,
+        // A tape nobody has read yet has no body format and no committed tape
+        // file. It used to print an empty format and last_file=0 -- which reads
+        // as "tape file 0 is committed", the first one, rather than "none are".
+        or_dash(tape.body_format.as_deref()),
         tape_state_name(tape.state),
-        tape.last_committed_tape_file
+        or_dash_display(tape.last_committed_tape_file)
     );
 }
 
