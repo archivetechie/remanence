@@ -14,8 +14,10 @@
 #
 # Nested message fields are written with their full path, e.g. Outer.Inner.field.
 #
-# 353 fields are currently UNEXAMINED. That number is the work, and it is meant to
-# be visible.
+# The count of fields still UNEXAMINED is the work, and it is meant to be visible.
+# It is not repeated here, because a hand-kept number rots: this line used to say
+# 353 while the census said 252. Run `python3 tools/wire_presence_census.py` for
+# the live figure, or count tools/wire-presence-baseline.txt.
 
 # ---------------------------------------------------------------------------
 # Drive area, decided 2026-08-06. Derivation for catalog-backed messages is the
@@ -52,7 +54,7 @@ Tape.tape_uuid                primary key of the tapes table
 # WriteSession is live in-memory state, so the derivation is the session's own
 # lifecycle rather than column nullability.
 WriteSession.session_id       primary key; a session cannot exist without one
-WriteSession.body_format      fixed when the session opens and required by OpenWriteSessionRequest
+WriteSession.body_format      resolved when the session opens -- the caller's, or the daemon default it declined to name -- so a session always has one
 WriteSession.objects_committed a live session is counting; zero at open is a real count, never unknown
 WriteSession.bytes_committed  as objects_committed
 WriteSession.current_tape_index an index into tape_sequence, always positioned somewhere
@@ -60,3 +62,15 @@ WriteSession.pending_checkpoint_objects a counter the session maintains; zero me
 WriteSession.pending_checkpoint_bytes as pending_checkpoint_objects
 ReadSession.session_id        primary key; a session cannot exist without one
 ReadSession.daemon_epoch      minted with the session by the daemon that created it
+
+# Write-session lifecycle requests, decided 2026-08-06. The rule inverts for a
+# request: the CALLER supplies the value, so a required parameter stays plain
+# and an absent one is a rejected request, not an Option the server has to
+# interpret. That is only true if the server actually rejects it, so each of
+# these was read against its handler rather than assumed. Every session_id
+# below reaches decode_uuid_bytes (lib.rs), which refuses anything that is not
+# exactly 16 bytes -- empty included -- with INVALID_ARGUMENT.
+CheckpointSessionRequest.session_id  refused by decode_uuid_bytes; you cannot checkpoint an unnamed session
+CloseWriteSessionRequest.session_id  refused by decode_uuid_bytes
+AbortWriteSessionRequest.session_id  refused by decode_uuid_bytes
+GetWriteSessionRequest.session_id    refused by decode_uuid_bytes

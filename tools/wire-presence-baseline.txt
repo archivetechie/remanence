@@ -5,8 +5,6 @@
 # new field belongs in the contract with its presence already decided.
 #
 # Regenerate with: python3 tools/wire_presence_census.py --write-baseline
-AbortWriteSessionRequest.reason
-AbortWriteSessionRequest.session_id
 AckAlarmRequest.condition_key
 Alarm.acked_by
 Alarm.alarm_id
@@ -62,11 +60,9 @@ CatalogEntry.unit_id
 CatalogUnit.format_id
 CatalogUnit.tape_uuid
 CatalogUnit.unit_id
-CheckpointSessionRequest.session_id
 CleanDriveRequest.allow_derived_identity
 CleanDriveRequest.drive_uuid
 CloseReadSessionRequest.session_id
-CloseWriteSessionRequest.session_id
 ComponentHealth.component
 ComponentHealth.other_status
 DevicePositionProof.position_after_lba
@@ -128,7 +124,6 @@ GetOperationRequest.operation_id
 GetReadSessionRequest.session_id
 GetTapePoolRequest.pool_id
 GetTapeRequest.tape_uuid
-GetWriteSessionRequest.session_id
 HealthResponse.ComponentsEntry.key
 HealthResponse.ComponentsEntry.value
 HealthResponse.detail
@@ -178,8 +173,6 @@ ObjectCopy.tape_file_number
 ObjectCopy.tape_uuid
 ObjectRecord.CallerMetadataEntry.key
 ObjectRecord.CallerMetadataEntry.value
-OpenWriteSessionRequest.body_format
-OpenWriteSessionRequest.recover_session_id
 OperationRef.operation_id
 OperationStatus.ProgressEntry.key
 OperationStatus.ProgressEntry.value

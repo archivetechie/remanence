@@ -1201,10 +1201,16 @@ message OpenWriteSessionRequest {
     TapeTarget    tape_target  = 2;
     TapePoolTarget pool_target  = 6;
   }
-  string body_format             = 3; // "rem-object-v1" by default (the only wired format)
+  // Absent means "no preference, use the daemon's default" -- the only wired
+  // format, rem-object-v1. Present-and-empty is a caller that named no format
+  // at all, which is a malformed request rather than a request for the
+  // default, and is refused.
+  optional string body_format    = 3;
   IdempotencyKey idempotency_key = 4;
   // Recover an existing orphaned session by id (no new session created).
-  bytes recover_session_id       = 5;
+  // Absent is an ordinary open; an id is only ever present because the caller
+  // is resuming something.
+  optional bytes recover_session_id = 5;
 }
 
 message DriveTarget {
@@ -1310,7 +1316,11 @@ message CloseWriteSessionRequest {
 message AbortWriteSessionRequest {
   bytes session_id               = 1;
   IdempotencyKey idempotency_key = 2;
-  string reason                  = 3;
+  // Why the caller is abandoning the session. Absent means the caller gave no
+  // reason -- an abort with no explanation is a normal thing for a client that
+  // is itself dying, and is not the same as one that explained itself with an
+  // empty string.
+  optional string reason         = 3;
 }
 
 message GetWriteSessionRequest { bytes session_id = 1; }
