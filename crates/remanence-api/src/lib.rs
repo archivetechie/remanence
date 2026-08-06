@@ -1203,7 +1203,8 @@ impl ApiState {
                         pb::drive_assignment::State::DriveAssignmentStateIdle as i32
                     },
                     // Absent means idle, not "session zero".
-                    current_session_id: session.map(|(session_id, _)| session_id.as_bytes().to_vec()),
+                    current_session_id: session
+                        .map(|(session_id, _)| session_id.as_bytes().to_vec()),
                     // Prefer the session's tape; fall back to whatever the
                     // changer saw seated. If neither knows, say so.
                     loaded_tape_uuid: session
@@ -1278,22 +1279,31 @@ impl ApiState {
         if let Some(counters) = counters {
             drive.lifetime_read_bytes = Some(counters.read_bytes.load(Ordering::Relaxed));
             drive.lifetime_write_bytes = Some(counters.write_bytes.load(Ordering::Relaxed));
-            drive.tape_io_staging_ring_buffers = Some(counters
-                .tape_io_staging_ring_buffers
-                .load(Ordering::Relaxed) as u32);
-            drive.tape_io_effective_batch_blocks = Some(counters
-                .tape_io_effective_batch_blocks
-                .load(Ordering::Relaxed) as u32);
+            drive.tape_io_staging_ring_buffers = Some(
+                counters
+                    .tape_io_staging_ring_buffers
+                    .load(Ordering::Relaxed) as u32,
+            );
+            drive.tape_io_effective_batch_blocks = Some(
+                counters
+                    .tape_io_effective_batch_blocks
+                    .load(Ordering::Relaxed) as u32,
+            );
             drive.tape_io_gap_p50_us = Some(counters.tape_io_gap_p50_us.load(Ordering::Relaxed));
             drive.tape_io_gap_p95_us = Some(counters.tape_io_gap_p95_us.load(Ordering::Relaxed));
             drive.tape_io_gap_max_us = Some(counters.tape_io_gap_max_us.load(Ordering::Relaxed));
-            drive.tape_io_ioctl_p50_us = Some(counters.tape_io_ioctl_p50_us.load(Ordering::Relaxed));
-            drive.tape_io_ioctl_p95_us = Some(counters.tape_io_ioctl_p95_us.load(Ordering::Relaxed));
-            drive.tape_io_ioctl_max_us = Some(counters.tape_io_ioctl_max_us.load(Ordering::Relaxed));
+            drive.tape_io_ioctl_p50_us =
+                Some(counters.tape_io_ioctl_p50_us.load(Ordering::Relaxed));
+            drive.tape_io_ioctl_p95_us =
+                Some(counters.tape_io_ioctl_p95_us.load(Ordering::Relaxed));
+            drive.tape_io_ioctl_max_us =
+                Some(counters.tape_io_ioctl_max_us.load(Ordering::Relaxed));
             drive.tape_io_cadence_us = Some(counters.tape_io_cadence_us.load(Ordering::Relaxed));
-            drive.tape_io_effective_feed_bytes_per_second = Some(counters
-                .tape_io_effective_feed_bytes_per_second
-                .load(Ordering::Relaxed));
+            drive.tape_io_effective_feed_bytes_per_second = Some(
+                counters
+                    .tape_io_effective_feed_bytes_per_second
+                    .load(Ordering::Relaxed),
+            );
             drive.tape_io_window_feed_bytes_per_second =
                 Some(counters.window_feed_bytes_per_second());
         }
