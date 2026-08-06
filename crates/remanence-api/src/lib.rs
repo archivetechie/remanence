@@ -2963,7 +2963,7 @@ impl WriteSessionApi {
                 ));
             }
         };
-        if !start.body_format_manifest.is_empty() {
+        if start.body_format_manifest.is_some() {
             return Err(Status::unimplemented(
                 "body_format_manifest is not wired in this write-session slice",
             ));
@@ -2971,7 +2971,7 @@ impl WriteSessionApi {
         let session_id = decode_uuid_bytes(&start.session_id, "session_id")?;
         let session_id = Uuid::from_bytes(session_id);
         let start_digest = expected_content_digest(
-            &start.expected_content_sha256,
+            start.expected_content_sha256.as_deref(),
             start.expected_content_digest.as_ref(),
         )?;
         let overlap_eligible = overlap_append_eligible(
@@ -3043,7 +3043,7 @@ impl WriteSessionApi {
         let finish =
             finish.ok_or_else(|| Status::invalid_argument("append stream must end with Finish"))?;
         let finish_digest = expected_content_digest(
-            &finish.expected_content_sha256,
+            finish.expected_content_sha256.as_deref(),
             finish.expected_content_digest.as_ref(),
         )?;
         if start_digest.is_some() && finish_digest.is_some() && start_digest != finish_digest {
@@ -3108,14 +3108,18 @@ impl WriteSessionApi {
     where
         S: Stream<Item = Result<pb::AppendObjectMessage, Status>> + Unpin + Send + 'static,
     {
+        // Overlap holds the stream to the declared size byte for byte, so it is
+        // only ever entered with one; overlap_append_eligible is the guard.
+        let declared_size_bytes = start
+            .declared_size_bytes
+            .expect("overlap eligibility requires a declared size");
         let (producer, consumer, control) = crate::append_ring::create_append_ring(
             &self.state.io_memory,
             self.state.append_ring_bytes,
             self.state.append_ring_high_pct,
             self.state.append_ring_low_pct,
-            start.declared_size_bytes,
+            declared_size_bytes,
         )?;
-        let declared_size_bytes = start.declared_size_bytes;
         let receive_control = Arc::clone(&control);
         let receive_task = tokio::spawn(receive_overlap_messages(
             stream,
@@ -3385,7 +3389,7 @@ where
             )));
         }
         let finish_digest = expected_content_digest(
-            &finish.expected_content_sha256,
+            finish.expected_content_sha256.as_deref(),
             finish.expected_content_digest.as_ref(),
         )?;
         if finish_digest.is_some_and(|digest| digest != start_digest) {
@@ -4088,16 +4092,18 @@ fn ensure_same_session(value: &[u8], expected: Uuid) -> Result<(), Status> {
 }
 
 fn expected_content_digest(
-    legacy_sha256: &[u8],
+    legacy_sha256: Option<&[u8]>,
     digest: Option<&pb::Digest>,
 ) -> Result<Option<[u8; 32]>, Status> {
-    let legacy = if legacy_sha256.is_empty() {
-        None
-    } else {
-        Some(legacy_sha256.try_into().map_err(|_| {
-            Status::invalid_argument("expected_content_sha256 must be 32 bytes when supplied")
-        })?)
-    };
+    // Supplied-and-empty is not "no digest": it is a caller that meant to bind
+    // this append to a hash and sent nothing to bind it to.
+    let legacy = legacy_sha256
+        .map(|value| {
+            value.try_into().map_err(|_| {
+                Status::invalid_argument("expected_content_sha256 must be 32 bytes when supplied")
+            })
+        })
+        .transpose()?;
     let paired = digest
         .map(|digest| {
             if digest.algorithm != remanence_state::DIGEST_ALGORITHM_SHA256 {
@@ -4125,10 +4131,15 @@ fn overlap_append_eligible(
 ) -> bool {
     mode == remanence_state::AppendStagingMode::Overlap
         && !start.caller_object_id.trim().is_empty()
-        && start.declared_size_bytes != 0
+        // An exact size, because the overlap receive path holds the stream to
+        // it byte for byte. A declared zero is an empty object, which has
+        // nothing to overlap; absent is a caller that does not know.
+        && start.declared_size_bytes.is_some_and(|size| size != 0)
         && start_digest.is_some()
         && start.source_replay_capability == pb::SourceReplayCapability::ReplayFromStart as i32
-        && start.body_format_manifest.is_empty()
+        // Supplying an empty manifest is still supplying one, and manifests
+        // are unwired -- so only their absence is eligible.
+        && start.body_format_manifest.is_none()
 }
 
 /// Request-shape validation for a pinned-tape write target.
@@ -4211,12 +4222,14 @@ fn ensure_unpaged(page_token: Option<&pb::PageToken>, page_size: u32) -> Result<
     Ok(())
 }
 
-fn append_spool_cap(declared_size_bytes: u64) -> u64 {
-    if declared_size_bytes == 0 {
-        crate::write_owner::SPOOL_MAX_BYTES
-    } else {
-        declared_size_bytes.min(crate::write_owner::SPOOL_MAX_BYTES)
-    }
+/// Absent means the caller does not know the size, so the spool gets the full
+/// cap. A declared size is a ceiling the caller has asked to be held to --
+/// including a declared zero, which used to be indistinguishable from "unknown"
+/// and silently bought the largest spool we allow.
+fn append_spool_cap(declared_size_bytes: Option<u64>) -> u64 {
+    declared_size_bytes.map_or(crate::write_owner::SPOOL_MAX_BYTES, |declared| {
+        declared.min(crate::write_owner::SPOOL_MAX_BYTES)
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6290,9 +6303,9 @@ mod tests {
                     session_id: session_id.as_bytes().to_vec(),
                     caller_object_id: "caller-object".to_string(),
                     caller_metadata: HashMap::new(),
-                    declared_size_bytes,
-                    body_format_manifest: Vec::new(),
-                    expected_content_sha256: Vec::new(),
+                    declared_size_bytes: Some(declared_size_bytes),
+                    body_format_manifest: None,
+                    expected_content_sha256: None,
                     source_replay_capability: pb::SourceReplayCapability::Unspecified as i32,
                     expected_content_digest: None,
                 },
@@ -6316,7 +6329,7 @@ mod tests {
             payload: Some(pb::append_object_message::Payload::Finish(
                 pb::AppendObjectFinish {
                     session_id: session_id.as_bytes().to_vec(),
-                    expected_content_sha256: digest.to_vec(),
+                    expected_content_sha256: Some(digest.to_vec()),
                     expected_content_digest: None,
                 },
             )),
@@ -6521,10 +6534,20 @@ mod tests {
 
     #[test]
     fn append_spool_cap_clamps_client_declared_size() {
-        assert_eq!(append_spool_cap(0), crate::write_owner::SPOOL_MAX_BYTES);
-        assert_eq!(append_spool_cap(1024), 1024);
         assert_eq!(
-            append_spool_cap(u64::MAX),
+            append_spool_cap(None),
+            crate::write_owner::SPOOL_MAX_BYTES,
+            "an undeclared size buys the full spool"
+        );
+        assert_eq!(
+            append_spool_cap(Some(0)),
+            0,
+            "a declared empty object is held to its own declaration, not \
+             silently given the largest spool we allow"
+        );
+        assert_eq!(append_spool_cap(Some(1024)), 1024);
+        assert_eq!(
+            append_spool_cap(Some(u64::MAX)),
             crate::write_owner::SPOOL_MAX_BYTES
         );
     }
@@ -6536,9 +6559,9 @@ mod tests {
             session_id: Uuid::new_v4().as_bytes().to_vec(),
             caller_object_id: "caller-object".into(),
             caller_metadata: HashMap::new(),
-            declared_size_bytes: 123,
-            body_format_manifest: Vec::new(),
-            expected_content_sha256: digest.to_vec(),
+            declared_size_bytes: Some(123),
+            body_format_manifest: None,
+            expected_content_sha256: Some(digest.to_vec()),
             source_replay_capability: pb::SourceReplayCapability::ReplayFromStart as i32,
             expected_content_digest: None,
         };
@@ -6556,10 +6579,22 @@ mod tests {
         let mut missing_id = eligible.clone();
         missing_id.caller_object_id.clear();
         let mut unknown_size = eligible.clone();
-        unknown_size.declared_size_bytes = 0;
+        unknown_size.declared_size_bytes = None;
+        // Distinct from the above: the caller knows the size and it is zero.
+        // There is nothing to overlap, but it is not an unknown.
+        let mut declared_empty = eligible.clone();
+        declared_empty.declared_size_bytes = Some(0);
+        let mut supplied_manifest = eligible.clone();
+        supplied_manifest.body_format_manifest = Some(Vec::new());
         let mut no_replay = eligible.clone();
         no_replay.source_replay_capability = pb::SourceReplayCapability::Unspecified as i32;
-        for fallback in [&missing_id, &unknown_size, &no_replay] {
+        for fallback in [
+            &missing_id,
+            &unknown_size,
+            &declared_empty,
+            &supplied_manifest,
+            &no_replay,
+        ] {
             assert!(!overlap_append_eligible(
                 remanence_state::AppendStagingMode::Overlap,
                 fallback,
@@ -6581,11 +6616,11 @@ mod tests {
             value: digest.to_vec(),
         };
         assert_eq!(
-            expected_content_digest(&[], Some(&paired)).expect("paired digest"),
+            expected_content_digest(None, Some(&paired)).expect("paired digest"),
             Some(digest)
         );
         assert_eq!(
-            expected_content_digest(&digest, Some(&paired)).expect("matching mirrors"),
+            expected_content_digest(Some(&digest), Some(&paired)).expect("matching mirrors"),
             Some(digest)
         );
 
@@ -6594,7 +6629,7 @@ mod tests {
             value: vec![0x46; 32],
         };
         assert_eq!(
-            expected_content_digest(&digest, Some(&mismatch))
+            expected_content_digest(Some(&digest), Some(&mismatch))
                 .expect_err("mismatched mirrors")
                 .code(),
             tonic::Code::InvalidArgument
@@ -6604,7 +6639,7 @@ mod tests {
             value: vec![0x45; 64],
         };
         assert_eq!(
-            expected_content_digest(&[], Some(&unsupported))
+            expected_content_digest(None, Some(&unsupported))
                 .expect_err("unsupported digest algorithm")
                 .code(),
             tonic::Code::InvalidArgument
@@ -11814,7 +11849,7 @@ BCw3Wyv2UWY=
         else {
             panic!("start helper must emit Start");
         };
-        start_fields.expected_content_sha256 = digest.to_vec();
+        start_fields.expected_content_sha256 = Some(digest.to_vec());
         start_fields.source_replay_capability = pb::SourceReplayCapability::ReplayFromStart as i32;
         let messages = vec![
             Ok(start_message),
@@ -11940,7 +11975,7 @@ BCw3Wyv2UWY=
         else {
             panic!("start helper must emit Start");
         };
-        start_fields.expected_content_sha256 = digest.to_vec();
+        start_fields.expected_content_sha256 = Some(digest.to_vec());
         start_fields.source_replay_capability = pb::SourceReplayCapability::ReplayFromStart as i32;
         let messages = vec![
             Ok(start_message),

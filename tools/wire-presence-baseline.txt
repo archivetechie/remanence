@@ -23,17 +23,6 @@ AnnotateDriveRequest.warranty_until
 AppendCommitInfo.batch_id
 AppendCommitInfo.first_body_lba
 AppendCommitInfo.tape_uuid
-AppendObjectChunk.data
-AppendObjectChunk.session_id
-AppendObjectFinish.expected_content_sha256
-AppendObjectFinish.session_id
-AppendObjectStart.CallerMetadataEntry.key
-AppendObjectStart.CallerMetadataEntry.value
-AppendObjectStart.body_format_manifest
-AppendObjectStart.caller_object_id
-AppendObjectStart.declared_size_bytes
-AppendObjectStart.expected_content_sha256
-AppendObjectStart.session_id
 ArchiveGap.source_end
 ArchiveGap.source_start
 ArchiveGap.unit_id
