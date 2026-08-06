@@ -545,6 +545,15 @@ pub struct RetireDriveOutcome {
     pub drive: DriveRecord,
 }
 
+/// Outcome of returning a retired drive to service.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReinstateDriveOutcome {
+    /// False when the drive was already active.
+    pub newly_reinstated: bool,
+    /// Stored row after applying the request.
+    pub drive: DriveRecord,
+}
+
 /// One observational drive-history event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(missing_docs)]
@@ -2775,6 +2784,78 @@ impl CatalogIndex {
             .ok_or_else(|| StateError::IndexCorrupt("retired drive is missing".to_string()))?;
         Ok(Some(RetireDriveOutcome {
             newly_retired: true,
+            drive,
+        }))
+    }
+
+    /// Return a retired drive to service.
+    ///
+    /// Retirement is a catalog judgement, not a physical fact: a drive can be
+    /// retired in error, or retired and then genuinely returned to the fleet.
+    /// Reinstatement is the audited way back. It clears the retirement
+    /// timestamp and reason so the row cannot later be read as both retired and
+    /// active, and records a `reinstated` event carrying the operator's reason
+    /// alongside the retirement it reverses.
+    ///
+    /// It does not restore `actionable` or clear `fenced`: those are separate
+    /// judgements with their own gates, and a reinstated drive that is still
+    /// fenced remains correctly unusable.
+    pub fn reinstate_drive(
+        &mut self,
+        drive_uuid: &[u8],
+        reason: &str,
+    ) -> Result<Option<ReinstateDriveOutcome>, StateError> {
+        let Some(before) = self.get_drive_by_uuid(drive_uuid)? else {
+            return Ok(None);
+        };
+        if before.state != "retired" {
+            return Ok(Some(ReinstateDriveOutcome {
+                newly_reinstated: false,
+                drive: before,
+            }));
+        }
+        let now = now_utc()?;
+        let detail = format!(
+            "reinstated: {}; reversing retirement: {}",
+            reason.trim(),
+            before
+                .retire_reason
+                .as_deref()
+                .unwrap_or("(no reason recorded)")
+        );
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|err| sqlite_error("begin reinstate drive", err))?;
+        tx.execute(
+            "update drives
+             set state = 'active',
+                 retired_at_utc = null,
+                 retire_reason = null,
+                 last_seen_utc = ?2
+             where drive_uuid = ?1",
+            params![drive_uuid, now],
+        )
+        .map_err(|err| sqlite_error("reinstate drive", err))?;
+        insert_drive_event_tx(
+            &tx,
+            DriveEventInsert {
+                drive_uuid,
+                event_kind: "reinstated",
+                at_utc: now.as_str(),
+                library_serial: before.last_library_serial.as_deref(),
+                element_address: before.last_element_address,
+                tape_uuid: None,
+                detail: Some(detail.as_str()),
+            },
+        )?;
+        tx.commit()
+            .map_err(|err| sqlite_error("commit reinstate drive", err))?;
+        let drive = self
+            .get_drive_by_uuid(drive_uuid)?
+            .ok_or_else(|| StateError::IndexCorrupt("reinstated drive is missing".to_string()))?;
+        Ok(Some(ReinstateDriveOutcome {
+            newly_reinstated: true,
             drive,
         }))
     }

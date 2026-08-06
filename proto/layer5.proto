@@ -233,6 +233,24 @@ message LibraryState {
   string managed           = 6; // "rem" or "foreign" for drive-stewardship views.
 }
 
+// How the drive catalog answered when the live-status projection looked up the
+// drive occupying a changer-reported bay.
+enum DriveCatalogState {
+  DRIVE_CATALOG_STATE_UNSPECIFIED = 0;
+  // An active catalog row was found; drive_uuid and the catalog-derived fields
+  // are populated.
+  DRIVE_CATALOG_STATE_CATALOGED   = 1;
+  // The bay's only catalog row is retired. Identity is still reported, and the
+  // drive is excluded from mount resolution and every selection path.
+  DRIVE_CATALOG_STATE_RETIRED     = 2;
+  // The changer reports this bay but the catalog holds no row for it. Identity
+  // and every catalog-derived field are absent, not zero.
+  DRIVE_CATALOG_STATE_UNCATALOGUED = 3;
+  // More than one catalog row claims this bay. The reported identity is the
+  // most recently seen active row; the condition needs operator attention.
+  DRIVE_CATALOG_STATE_AMBIGUOUS   = 4;
+}
+
 message Drive {
   uint32 element_address  = 1;  // library-reported drive bay
   string drive_serial     = 2;  // joined from host-side INQUIRY
@@ -251,6 +269,10 @@ message Drive {
     DRIVE_STATUS_FENCED        = 6;
   }
   Status status           = 7;
+  // Catalog identity. Empty ONLY when catalog_state is UNCATALOGUED, i.e. the
+  // changer reports a bay for which the drive catalog holds no row at all.
+  // A retired drive keeps its identity and is reported with catalog_state
+  // RETIRED; consumers must not infer absence of a drive from an empty value.
   bytes  drive_uuid       = 8;
   string cleaning_due     = 9;
   bool   fenced           = 10;
@@ -278,6 +300,9 @@ message Drive {
   uint64 mount_age_seconds = 28;
   // Combined read/write byte rate over the daemon's rolling ~5 second window.
   uint64 tape_io_window_feed_bytes_per_second = 29;
+  // How the drive catalog answered for this bay. Present on every row, so a
+  // consumer never has to infer catalog state from an empty identity.
+  DriveCatalogState catalog_state = 30;
 }
 
 message DriveCatalogEntry {

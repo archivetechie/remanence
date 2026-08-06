@@ -277,8 +277,8 @@ async fn restore_members(
         // Catalog-supplied path: sanitize with put's own rules before it may
         // touch the filesystem. A restore never writes outside --dest.
         let mut stripped = false;
-        let safe_path = archive_path_for(std::path::Path::new(&file.path), &mut stripped)
-            .map_err(|error| {
+        let safe_path =
+            archive_path_for(std::path::Path::new(&file.path), &mut stripped).map_err(|error| {
                 DaemonClientError::client(format!(
                     "refusing member with unsafe archive path: {error}"
                 ))
@@ -545,7 +545,11 @@ mod tests {
             pb::get_object_request::Key::ObjectId(_)
         ));
 
-        let mut caller = get_args("ingest-4711".to_string(), PathBuf::from("/tmp/x"), String::new());
+        let mut caller = get_args(
+            "ingest-4711".to_string(),
+            PathBuf::from("/tmp/x"),
+            String::new(),
+        );
         caller.caller_id = true;
         assert!(matches!(
             object_key(&caller).unwrap(),
@@ -586,7 +590,11 @@ mod tests {
         let pinned = pick_copy(&record, Some(&Uuid::from_bytes([2; 16]).to_string())).unwrap();
         assert_eq!(pinned.tape_file_number, 8);
         let error = pick_copy(&record, Some(&Uuid::from_bytes([7; 16]).to_string())).unwrap_err();
-        assert!(error.message.contains("no copy on tape"), "{}", error.message);
+        assert!(
+            error.message.contains("no copy on tape"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]
@@ -985,7 +993,11 @@ mod tests {
         );
         let (result, _out, _err) = run_get_blocking(&args);
         let error = result.unwrap_err();
-        assert!(error.message.contains("unsafe archive path"), "{}", error.message);
+        assert!(
+            error.message.contains("unsafe archive path"),
+            "{}",
+            error.message
+        );
         assert!(!parent.path().join("escape.bin").exists());
     }
 
@@ -1024,7 +1036,11 @@ mod tests {
         );
         let (result, _out, _err) = run_get_blocking(&args);
         let error = result.unwrap_err();
-        assert!(error.message.contains("by object UUID"), "{}", error.message);
+        assert!(
+            error.message.contains("by object UUID"),
+            "{}",
+            error.message
+        );
         assert!(error.message.contains("not found"), "{}", error.message);
     }
 }
