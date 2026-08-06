@@ -1510,7 +1510,9 @@ fn enrich_actor_mount_from_catalog(
         .map_err(status_from_state_error)?
     {
         mount.drive_uuid = Some(drive.drive_uuid);
-        mount.drive_serial = Some(drive.serial);
+        // Already an Option on the mount; it just used to be filled from a
+        // String that was sometimes empty, so "no serial" arrived as Some("").
+        mount.drive_serial = drive.serial;
     }
     Ok(())
 }

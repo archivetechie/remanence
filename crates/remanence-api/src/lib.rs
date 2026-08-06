@@ -1634,7 +1634,7 @@ fn touch_managed_drive_heartbeats(
             if let Err(err) = drive_pool.heartbeat_drive(bay, drive.drive_uuid.clone()) {
                 tracing::warn!(
                     "managed drive heartbeat skipped for {}: {err}",
-                    drive.serial
+                    drive.serial.as_deref().unwrap_or("<no serial>")
                 );
             }
         }
@@ -1732,13 +1732,13 @@ fn poll_foreign_drive_counters_once_with_reader(
                 );
                 continue;
             };
-            if drive.serial.as_str() != installed_serial {
+            if drive.serial.as_deref() != Some(installed_serial) {
                 tracing::warn!(
                     "skipping foreign drive counter attribution for bay serial mismatch library_serial={} element_address={} observed_serial={} catalog_serial={}",
                     library.serial,
                     bay.element_address,
                     installed_serial,
-                    drive.serial
+                    drive.serial.as_deref().unwrap_or("<no serial>")
                 );
                 continue;
             }
@@ -2114,7 +2114,11 @@ pub(crate) fn drive_health_audit_detail(
         .get_drive_by_uuid(snapshot.drive_uuid.as_slice())
         .map_err(status_from_state_error)?
     {
-        detail.insert("drive_serial".to_string(), CborValue::Text(drive.serial));
+        // Only assert a serial when there is one. An absent key is not the
+        // same claim as a key whose value is the empty string.
+        if let Some(serial) = drive.serial {
+            detail.insert("drive_serial".to_string(), CborValue::Text(serial));
+        }
         detail.insert("managed".to_string(), CborValue::Text(drive.managed));
         for (key, value) in [
             ("vendor", drive.vendor.as_ref()),
@@ -8064,8 +8068,8 @@ BCw3Wyv2UWY=
             .get_actionable_drive_at("d2lib", 0x0101)
             .expect("lookup target bay")
             .expect("target bay drive");
-        assert_eq!(other_drive.serial, "FOREIGN_A");
-        assert_eq!(target_drive.serial, "FOREIGN_B");
+        assert_eq!(other_drive.serial.as_deref(), Some("FOREIGN_A"));
+        assert_eq!(target_drive.serial.as_deref(), Some("FOREIGN_B"));
         drop(index);
 
         let drives_cfg = remanence_state::DrivesConfig {
