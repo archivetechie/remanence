@@ -807,13 +807,19 @@ message AppendCommitInfo {
 
 // One object's catalog-level record. Body-format-agnostic.
 message ObjectRecord {
-  bytes object_id              = 1;  // Remanence-assigned UUID
-  string caller_object_id      = 2;  // opaque string from orchestrator (§4.2)
+  bytes object_id              = 1;  // primary key: always known
+  // Nullable in `objects`: the orchestrator need not supply one, and absent is
+  // not the same as an orchestrator that supplied an empty string.
+  optional string caller_object_id = 2;  // opaque string from orchestrator (§4.2)
   // The logical-asset identity Sutradhara keys on. For rem-tar-v1 this is the
   // canonical manifest_sha256 / content hash of the object's contents.
-  bytes content_sha256         = 3;
-  uint64 logical_size_bytes    = 4;
-  string body_format           = 5;
+  // Nullable: an object catalogued before its content was hashed has none, and
+  // the objects_content_hash_idx index is explicitly partial on `is not null`.
+  optional bytes content_sha256 = 3;
+  // Nullable. A zero-byte object is a real and perfectly ordinary object, so
+  // zero cannot double as "size not recorded".
+  optional uint64 logical_size_bytes = 4;
+  optional string body_format  = 5;  // nullable: derived from the body, once read
   // Caller-supplied opaque metadata (per §4.2). Free-form key/value.
   map<string, string> caller_metadata = 6;
   google.protobuf.Timestamp created_at = 7;
@@ -865,8 +871,11 @@ message FileRecord {
   uint64 size_bytes            = 4;
   bytes  file_sha256           = 5;
   // BodyLba within the object where this file's data starts (rem-tar-v1
-  // chunk-aligned start).
-  uint64 first_chunk_body_lba  = 6;
+  // chunk-aligned start). The only nullable column in `object_files`: LBA 0 is
+  // a real and common address -- the very start of the body -- so it cannot
+  // also stand for "not recorded". Every other field here is NOT NULL, because
+  // a catalogued file genuinely does know its own path, size and digest.
+  optional uint64 first_chunk_body_lba = 6;
   uint32 chunk_count           = 7;
   // Algorithm-aware mirror of file_sha256. During the compatibility window
   // servers populate both fields with the same SHA-256 value.

@@ -965,7 +965,9 @@ fn print_receipt(
                     "caller_object_id": object.caller_object_id,
                     "object_id": format_uuid(&object.object_id),
                     "size_bytes": object.logical_size_bytes,
-                    "content_sha256": hex(&object.content_sha256),
+                    // null when the object has no recorded content hash --
+                    // not the hex of an empty byte string, which is "".
+                    "content_sha256": object.content_sha256.as_deref().map(hex),
                     "body_format": object.body_format,
                     "copies": object.copies.iter().map(|copy| {
                         serde_json::json!({
@@ -1237,11 +1239,11 @@ mod tests {
             assert_eq!(expected, digest.to_vec(), "client-declared digest mismatch");
             let record = pb::ObjectRecord {
                 object_id: Uuid::new_v4().as_bytes().to_vec(),
-                caller_object_id,
-                content_sha256: digest.to_vec(),
-                logical_size_bytes: size,
+                caller_object_id: Some(caller_object_id),
+                content_sha256: Some(digest.to_vec()),
+                logical_size_bytes: Some(size),
                 caller_metadata,
-                body_format: "rem-object-v1".to_string(),
+                body_format: Some("rem-object-v1".to_string()),
                 ..Default::default()
             };
             self.0.records.lock().unwrap().push(record.clone());
@@ -1260,7 +1262,12 @@ mod tests {
                     self.0
                         .checkpoint_omits_containing
                         .as_ref()
-                        .is_none_or(|marker| !record.caller_object_id.contains(marker.as_str()))
+                        .is_none_or(|marker| {
+                            !record
+                                .caller_object_id
+                                .as_deref()
+                                .is_some_and(|id| id.contains(marker.as_str()))
+                        })
                 })
                 .map(|(index, record)| pb::ObjectRecord {
                     copies: vec![pb::ObjectCopy {
@@ -1292,7 +1299,7 @@ mod tests {
             Ok(Response::new(pb::WriteSession {
                 session_id: FAKE_SESSION.to_vec(),
                 objects_committed: records.len() as u64,
-                bytes_committed: records.iter().map(|r| r.logical_size_bytes).sum(),
+                bytes_committed: records.iter().map(|r| r.logical_size_bytes).sum::<Option<u64>>().unwrap_or_default(),
                 ..Default::default()
             }))
         }
