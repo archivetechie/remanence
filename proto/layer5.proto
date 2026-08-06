@@ -1148,10 +1148,15 @@ service WriteSessionService {
 }
 
 message WriteSession {
-  bytes session_id           = 1; // UUID
-  bytes tape_uuid            = 2;
-  uint32 drive_element_address = 3;
-  string body_format         = 4;
+  bytes session_id           = 1; // UUID; primary key, always known
+  // sessions.tape_uuid is nullable, and for a good reason: a pool-targeted
+  // session exists before a tape has been selected for it. Absent means no
+  // volume chosen yet, which is a normal state, not a missing one.
+  optional bytes tape_uuid   = 2;
+  // sessions.drive_bay is nullable: a session can be open without currently
+  // holding a drive. Bay 0 is a real bay, so zero cannot also mean "none".
+  optional uint32 drive_element_address = 3;
+  string body_format         = 4;  // fixed when the session opens; always known
   enum State {
     WRITE_SESSION_STATE_UNSPECIFIED = 0;
     WRITE_SESSION_STATE_OPEN        = 1;
@@ -1176,7 +1181,11 @@ message WriteSession {
   uint32 current_tape_index   = 12;
   uint64 pending_checkpoint_objects = 13;
   uint64 pending_checkpoint_bytes = 14;
-  uint64 oldest_pending_age_seconds = 15;
+  // Age of the oldest object still awaiting a checkpoint. Absent when nothing
+  // is pending -- which is not the same as something pending for zero seconds,
+  // the state of every object the instant it is written. Same conflation as
+  // Drive.mount_age_seconds had.
+  optional uint64 oldest_pending_age_seconds = 15;
   google.protobuf.Timestamp checkpoint_deadline = 16;
   // Durable receipts not previously returned by CheckpointSession. A close
   // response carries these so close-triggered barriers do not lose locators.

@@ -261,13 +261,3 @@ UnloadDriveRequest.library_uuid
 VersionResponse.api_version
 VersionResponse.daemon_version
 VersionResponse.rust_target
-WriteSession.body_format
-WriteSession.bytes_committed
-WriteSession.current_tape_index
-WriteSession.drive_element_address
-WriteSession.objects_committed
-WriteSession.oldest_pending_age_seconds
-WriteSession.pending_checkpoint_bytes
-WriteSession.pending_checkpoint_objects
-WriteSession.session_id
-WriteSession.tape_uuid

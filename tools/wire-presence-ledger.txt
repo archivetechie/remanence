@@ -47,3 +47,14 @@ FileRecord.size_bytes         object_files.size_bytes is NOT NULL; the writer me
 FileRecord.file_sha256        object_files.file_sha256 is NOT NULL; computed during the write that catalogued it
 FileRecord.chunk_count        object_files.chunk_count is NOT NULL
 Tape.tape_uuid                primary key of the tapes table
+
+# Sessions area, decided 2026-08-06. The `sessions` table is thin -- most of
+# WriteSession is live in-memory state, so the derivation is the session's own
+# lifecycle rather than column nullability.
+WriteSession.session_id       primary key; a session cannot exist without one
+WriteSession.body_format      fixed when the session opens and required by OpenWriteSessionRequest
+WriteSession.objects_committed a live session is counting; zero at open is a real count, never unknown
+WriteSession.bytes_committed  as objects_committed
+WriteSession.current_tape_index an index into tape_sequence, always positioned somewhere
+WriteSession.pending_checkpoint_objects a counter the session maintains; zero means zero pending
+WriteSession.pending_checkpoint_bytes as pending_checkpoint_objects
