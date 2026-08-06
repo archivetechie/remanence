@@ -122,7 +122,8 @@ or UUID.
 | `rem drive alerts <DRIVE>` | Active TapeAlert flags. (`rem tape alerts` is a deprecated alias.) |
 | `rem drive poll <DRIVE>` / `rem drive clean <DRIVE>` | Poll health now, or run a cleaning cycle now. |
 | `rem drive annotate <DRIVE> ...` | Record purchase date, warranty, cost, and notes. |
-| `rem drive retire <DRIVE> --reason <TEXT> --i-understand-fleet-removal-is-permanent` | Permanently remove a drive from the managed fleet. |
+| `rem drive retire <DRIVE> --reason <TEXT>` | Remove a drive from the managed fleet. A retired drive keeps its identity and still appears in `rem top` marked retired, but is excluded from every selection and mount path. Reversible with `reinstate`. |
+| `rem drive reinstate <DRIVE> --reason <TEXT>` | Return a retired drive to service. Records the reason alongside the retirement it reverses. Does not clear `fenced` or restore `actionable` — those are separate judgements. |
 
 <!-- code-anchor: crates/remanence-cli/src/lib.rs @ f643f8c2 -->
 ## Tape lifecycle

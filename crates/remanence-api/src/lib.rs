@@ -3640,6 +3640,7 @@ fn audit_event_name(event: &AuditEvent) -> &'static str {
         AuditEvent::TapePoolAssigned => "TapePoolAssigned",
         AuditEvent::TapeSealed => "TapeSealed",
         AuditEvent::DriveRetired => "DriveRetired",
+        AuditEvent::DriveReinstated => "DriveReinstated",
         AuditEvent::DriveAnnotated => "DriveAnnotated",
         AuditEvent::DriveCleaned => "DriveCleaned",
         AuditEvent::CleaningCartridgeExpired => "CleaningCartridgeExpired",

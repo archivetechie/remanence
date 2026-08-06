@@ -132,6 +132,8 @@ pub enum AuditEvent {
     TapeSealed,
     /// A drive was permanently removed from the managed fleet.
     DriveRetired,
+    /// A retired drive was returned to service.
+    DriveReinstated,
     /// Operator metadata was attached to a drive.
     DriveAnnotated,
     /// A drive completed a verified cleaning cycle.
@@ -1255,6 +1257,7 @@ impl AuditEvent {
             AuditEvent::TapePoolAssigned => "TapePoolAssigned",
             AuditEvent::TapeSealed => "TapeSealed",
             AuditEvent::DriveRetired => "DriveRetired",
+            AuditEvent::DriveReinstated => "DriveReinstated",
             AuditEvent::DriveAnnotated => "DriveAnnotated",
             AuditEvent::DriveCleaned => "DriveCleaned",
             AuditEvent::CleaningCartridgeExpired => "CleaningCartridgeExpired",
@@ -1302,6 +1305,7 @@ impl AuditEvent {
             "TapePoolAssigned" => Ok(Self::TapePoolAssigned),
             "TapeSealed" => Ok(Self::TapeSealed),
             "DriveRetired" => Ok(Self::DriveRetired),
+            "DriveReinstated" => Ok(Self::DriveReinstated),
             "DriveAnnotated" => Ok(Self::DriveAnnotated),
             "DriveCleaned" => Ok(Self::DriveCleaned),
             "CleaningCartridgeExpired" => Ok(Self::CleaningCartridgeExpired),
