@@ -64,7 +64,10 @@ pub(crate) fn drive_status(bay: &DriveBay, busy: bool) -> pb::drive::Status {
 /// which is what the caller must be told -- previously this returned an empty
 /// vector for every one of them, and an empty vector is also what a caller sees
 /// for a cartridge whose identity simply was not looked up.
-fn joined_tape_uuid(voltag: &Option<String>, voltags: &HashMap<String, Vec<u8>>) -> Option<Vec<u8>> {
+fn joined_tape_uuid(
+    voltag: &Option<String>,
+    voltags: &HashMap<String, Vec<u8>>,
+) -> Option<Vec<u8>> {
     voltag
         .as_deref()
         .map(str::trim)
@@ -1441,7 +1444,10 @@ mod tests {
         );
         assert_eq!(state.drives.len(), 1);
         assert_eq!(state.drives[0].loaded_tape_uuid, Some(vec![9u8; 16]));
-        assert_eq!(state.drives[0].loaded_tape_barcode.as_deref(), Some("S30002L9"));
+        assert_eq!(
+            state.drives[0].loaded_tape_barcode.as_deref(),
+            Some("S30002L9")
+        );
         assert_eq!(
             state.drives[0].status,
             pb::drive::Status::DriveStatusLoaded as i32
@@ -1931,7 +1937,10 @@ mod tests {
         assert_eq!(drive.tape_io_effective_batch_blocks, Some(16));
         assert_eq!(drive.tape_io_gap_p95_us, Some(250));
         assert_eq!(drive.tape_io_cadence_us, Some(1_100));
-        assert_eq!(drive.tape_io_effective_feed_bytes_per_second, Some(300_000_000));
+        assert_eq!(
+            drive.tape_io_effective_feed_bytes_per_second,
+            Some(300_000_000)
+        );
         assert_eq!(drive.loaded_tape_barcode.as_deref(), Some("S30002L9"));
         assert!(drive.tape_io_window_feed_bytes_per_second > Some(0));
 
@@ -1968,7 +1977,10 @@ mod tests {
         let assignment = &idle.drive_assignments[0];
         assert_eq!(assignment.library_serial, "DEC418146K_LL02");
         assert_eq!(assignment.bay, 1);
-        assert_eq!(assignment.drive_uuid.as_deref(), Some(drive_uuid.as_slice()));
+        assert_eq!(
+            assignment.drive_uuid.as_deref(),
+            Some(drive_uuid.as_slice())
+        );
         assert_eq!(
             assignment.state,
             pb::drive_assignment::State::DriveAssignmentStateIdle as i32
@@ -2001,8 +2013,14 @@ mod tests {
             assignment.state,
             pb::drive_assignment::State::DriveAssignmentStateActive as i32
         );
-        assert_eq!(assignment.current_session_id, Some(session_id.as_bytes().to_vec()));
-        assert_eq!(assignment.loaded_tape_uuid, Some(tape_uuid.as_bytes().to_vec()));
+        assert_eq!(
+            assignment.current_session_id,
+            Some(session_id.as_bytes().to_vec())
+        );
+        assert_eq!(
+            assignment.loaded_tape_uuid,
+            Some(tape_uuid.as_bytes().to_vec())
+        );
 
         let second = pool
             .reserve_drive(1)
@@ -2094,7 +2112,8 @@ mod tests {
         let drive = &response.libraries[0].drives[0];
 
         assert_eq!(
-            drive.drive_uuid, Some(drive_uuid),
+            drive.drive_uuid,
+            Some(drive_uuid),
             "a retired drive that is still installed must keep its identity"
         );
         assert_eq!(

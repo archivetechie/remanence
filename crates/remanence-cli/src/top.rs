@@ -267,7 +267,12 @@ fn render_pinned_band(frame: &mut Frame<'_>, area: Rect, state: &TopState) {
                                 .element_address
                                 .map_or_else(|| DASH.to_string(), |bay| format!("{bay:04x}")),
                         ),
-                        Cell::from(drive.drive_serial.clone().unwrap_or_else(|| DASH.to_string())),
+                        Cell::from(
+                            drive
+                                .drive_serial
+                                .clone()
+                                .unwrap_or_else(|| DASH.to_string()),
+                        ),
                         Cell::from(
                             drive
                                 .loaded_tape_barcode

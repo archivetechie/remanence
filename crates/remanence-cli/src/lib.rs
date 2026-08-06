@@ -6231,11 +6231,12 @@ fn drive_event_json(event: &pb::DriveHistoryEvent) -> Value {
 }
 
 fn drive_snapshot_json(snapshot: &pb::DriveHealthSnapshot) -> Value {
-    let session_id = if snapshot.session_uuid.as_ref().is_some_and(|id| id.len() == 16) {
-        snapshot
-            .session_uuid
-            .as_deref()
-            .map(bytes_to_uuid_text)
+    let session_id = if snapshot
+        .session_uuid
+        .as_ref()
+        .is_some_and(|id| id.len() == 16)
+    {
+        snapshot.session_uuid.as_deref().map(bytes_to_uuid_text)
     } else if snapshot.session_id.is_none() {
         None
     } else {

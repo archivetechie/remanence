@@ -1299,7 +1299,11 @@ mod tests {
             Ok(Response::new(pb::WriteSession {
                 session_id: FAKE_SESSION.to_vec(),
                 objects_committed: records.len() as u64,
-                bytes_committed: records.iter().map(|r| r.logical_size_bytes).sum::<Option<u64>>().unwrap_or_default(),
+                bytes_committed: records
+                    .iter()
+                    .map(|r| r.logical_size_bytes)
+                    .sum::<Option<u64>>()
+                    .unwrap_or_default(),
                 ..Default::default()
             }))
         }

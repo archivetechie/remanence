@@ -7251,13 +7251,13 @@ fn session_proto(input: WriteSessionProtoInput<'_>) -> pb::WriteSession {
             .map_or(0, |batch| batch.objects.len() as u64),
         pending_checkpoint_bytes: input.pending_batch.map_or(0, |batch| batch.logical_bytes),
         // `.map`, not `.map_or(0, ..)`: no pending batch means there is no
-            // oldest pending object to have an age. Zero is what an object that
-            // arrived this instant reports, so the old default made "nothing
-            // waiting" and "something waiting, just now" identical -- and those
-            // are opposite answers to "is this session behind on checkpoints?".
-            oldest_pending_age_seconds: input
-                .pending_batch
-                .map(|batch| batch.opened_at.elapsed().as_secs()),
+        // oldest pending object to have an age. Zero is what an object that
+        // arrived this instant reports, so the old default made "nothing
+        // waiting" and "something waiting, just now" identical -- and those
+        // are opposite answers to "is this session behind on checkpoints?".
+        oldest_pending_age_seconds: input
+            .pending_batch
+            .map(|batch| batch.opened_at.elapsed().as_secs()),
         checkpoint_deadline,
         checkpointed_objects: Vec::new(),
         committed_copies: Vec::new(),
