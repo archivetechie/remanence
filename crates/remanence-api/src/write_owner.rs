@@ -174,6 +174,10 @@ pub(crate) enum DriveCommand {
     },
     Abort {
         session_id: Uuid,
+        /// The caller's stated reason, when it gave one. Absent is an abort
+        /// with no explanation -- common from a client that is itself dying --
+        /// and is recorded as the absence of the audit key, not as "".
+        reason: Option<String>,
         reply: oneshot::Sender<Result<CloseWriteActorReply, Status>>,
     },
     Get {
@@ -1182,6 +1186,9 @@ struct SessionAuditInput {
     drive_bay: Option<u16>,
     drive_uuid: Option<Vec<u8>>,
     drive_serial: Option<String>,
+    /// Only ever set for an aborted write session, and only when the caller
+    /// supplied one.
+    abort_reason: Option<String>,
 }
 
 fn record_session_event(
@@ -1227,6 +1234,9 @@ fn record_session_event(
     }
     if let Some(drive_serial) = input.drive_serial {
         detail.insert("drive_serial".to_string(), CborValue::Text(drive_serial));
+    }
+    if let Some(abort_reason) = input.abort_reason {
+        detail.insert("abort_reason".to_string(), CborValue::Text(abort_reason));
     }
     let mut audit = FileAuditLog::open(cfg.audit_dir.as_path(), cfg.audit_fsync)
         .map_err(crate::status_from_state_error)?;
@@ -3038,6 +3048,8 @@ struct CloseWriteActorInput<'a> {
     state: pb::write_session::State,
     append_commit_diagnostics: crate::pool_write::AppendCommitDiagnostics,
     checkpointed_objects: &'a [pb::ObjectRecord],
+    /// Set only on the abort path, and only when the caller gave a reason.
+    abort_reason: Option<String>,
 }
 
 fn close_write_actor(input: CloseWriteActorInput<'_>) -> Result<CloseWriteActorReply, Status> {
@@ -3090,6 +3102,7 @@ fn close_write_actor(input: CloseWriteActorInput<'_>) -> Result<CloseWriteActorR
             drive_bay: Some(input.bay),
             drive_uuid: input.drive_uuid.clone(),
             drive_serial: input.drive_serial.clone(),
+            abort_reason: input.abort_reason,
         },
     )?;
     diagnostics.session_audit_projection = audit_started.elapsed();
@@ -3256,6 +3269,7 @@ fn handle_drive_open_write(
             drive_bay: Some(bay),
             drive_uuid: drive_uuid.clone(),
             drive_serial: drive_serial.clone(),
+            abort_reason: None,
         },
     ) {
         let _ = reply.send(Err(status));
@@ -3928,6 +3942,7 @@ fn handle_drive_open_write(
                     state: pb::write_session::State::WriteSessionStateClosed,
                     append_commit_diagnostics,
                     checkpointed_objects: &committed_receipts,
+                    abort_reason: None,
                 });
                 if let Err(err) = result {
                     tracing::error!(session_id = %session_id, error = %err, "idle checkpoint close failed");
@@ -4036,6 +4051,7 @@ fn handle_drive_open_write(
                     state: pb::write_session::State::WriteSessionStateClosed,
                     append_commit_diagnostics,
                     checkpointed_objects: &committed_receipts,
+                    abort_reason: None,
                 });
                 match result {
                     Ok(result) => {
@@ -4050,6 +4066,7 @@ fn handle_drive_open_write(
             }
             DriveCommand::Abort {
                 session_id: requested,
+                reason,
                 reply,
             } => {
                 if requested != session_id {
@@ -4075,6 +4092,7 @@ fn handle_drive_open_write(
                     state: pb::write_session::State::WriteSessionStateAborted,
                     append_commit_diagnostics,
                     checkpointed_objects: &committed_receipts,
+                    abort_reason: reason,
                 });
                 match result {
                     Ok(result) => {
@@ -4536,6 +4554,7 @@ fn handle_drive_open_read(
             drive_bay: Some(bay),
             drive_uuid: drive_uuid.clone(),
             drive_serial: drive_serial.clone(),
+            abort_reason: None,
         },
     ) {
         let _ = reply.send(Err(status));
@@ -4696,6 +4715,7 @@ fn handle_drive_open_read(
                             drive_bay: Some(bay),
                             drive_uuid: drive_uuid.clone(),
                             drive_serial: drive_serial.clone(),
+                            abort_reason: None,
                         },
                     ) {
                         let _ = reply.send(Err(err));
@@ -7447,6 +7467,82 @@ mod tests {
         let medium_error = load_check_condition(0x03, 0x11, 0x00);
         assert!(
             retryable_readiness_from_load_error(&medium_error, MediaFamily::Lto9OrLater).is_none()
+        );
+    }
+
+    /// The abort reason is the caller's only account of why a session died,
+    /// and until now the server read it off the request and dropped it. It now
+    /// reaches the session audit record -- and an abort with no reason leaves
+    /// the key out rather than writing an empty string, so a later reader can
+    /// tell "the caller said nothing" from "the caller said nothing useful".
+    #[test]
+    fn abort_reason_reaches_the_session_audit_record_only_when_given() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-abort-reason-audit-")
+            .tempdir()
+            .expect("tempdir");
+        let mut index =
+            CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open test index");
+        let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+            "LIB-ABORT-REASON",
+            0x0100,
+            "DRV-ABORT-REASON",
+            0x0400,
+            1,
+        )));
+        let library = open_model_library(Arc::clone(&world));
+        let snapshot = library_snapshot_cell(library.library().clone());
+        let audit_dir = temp.path().join("audit");
+        std::fs::create_dir_all(&audit_dir).expect("create audit dir");
+        let cfg = test_write_owner_config(
+            temp.path().join("rem-state.sqlite"),
+            audit_dir.clone(),
+            &library,
+            snapshot,
+        );
+
+        let explained = Uuid::new_v4();
+        let silent = Uuid::new_v4();
+        for (session_id, abort_reason) in [
+            (explained, Some("rem put: append failed".to_string())),
+            (silent, None),
+        ] {
+            record_session_event(
+                &mut index,
+                &cfg,
+                SessionAuditInput {
+                    session_id,
+                    session_kind: "write",
+                    event: AuditEvent::SessionClosed,
+                    tape_uuid: None,
+                    library_serial: None,
+                    drive_bay: None,
+                    drive_uuid: None,
+                    drive_serial: None,
+                    abort_reason,
+                },
+            )
+            .expect("record session event");
+        }
+
+        let records = FileAuditLog::replay(audit_dir.as_path()).expect("replay session audit");
+        let detail_for = |session_id: Uuid| {
+            records
+                .iter()
+                .find(|record| record.session_id == Some(session_id))
+                .unwrap_or_else(|| panic!("no audit record for session {session_id}"))
+                .detail
+                .clone()
+        };
+
+        assert_eq!(
+            detail_for(explained).get("abort_reason"),
+            Some(&CborValue::Text("rem put: append failed".to_string())),
+            "a stated reason must survive to the audit record"
+        );
+        assert!(
+            !detail_for(silent).contains_key("abort_reason"),
+            "an abort with no reason must leave the key out, not record an empty one"
         );
     }
 

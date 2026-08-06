@@ -2772,15 +2772,21 @@ impl pb::write_session_service_server::WriteSessionService for WriteSessionApi {
         authorize_request(&request, AuthPermission::Write)?;
         let request = request.into_inner();
         reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "OpenWriteSession")?;
-        if !request.recover_session_id.is_empty() {
+        if request.recover_session_id.is_some() {
             return Err(Status::unimplemented(
                 "recover_session_id is not wired in this write-session slice",
             ));
         }
-        let body_format = if request.body_format.trim().is_empty() {
-            "rem-object-v1".to_string()
-        } else {
-            request.body_format.trim().to_string()
+        // Absent asks for the daemon's default. A caller that supplied the
+        // field and left it blank named no format, which is malformed.
+        let body_format = match request.body_format {
+            None => "rem-object-v1".to_string(),
+            Some(format) if format.trim().is_empty() => {
+                return Err(Status::invalid_argument(
+                    "body_format must name a format when supplied; omit it for the default",
+                ));
+            }
+            Some(format) => format.trim().to_string(),
         };
         if body_format != "rem-object-v1" {
             return Err(Status::unimplemented(format!(
@@ -2897,7 +2903,8 @@ impl pb::write_session_service_server::WriteSessionService for WriteSessionApi {
         reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "AbortWriteSession")?;
         let session_id = decode_uuid_bytes(&request.session_id, "session_id")?;
         let session_id = Uuid::from_bytes(session_id);
-        let session = crate::mount::abort_write_session(&self.state, session_id).await?;
+        let session =
+            crate::mount::abort_write_session(&self.state, session_id, request.reason).await?;
         Ok(Response::new(session))
     }
 
@@ -6979,9 +6986,9 @@ BCw3Wyv2UWY=
         let service = ApiState::new(test_index()).write_session_service();
         let mut request = Request::new(pb::OpenWriteSessionRequest {
             target: None,
-            body_format: String::new(),
+            body_format: None,
             idempotency_key: None,
-            recover_session_id: Vec::new(),
+            recover_session_id: None,
         });
         request
             .metadata_mut()
@@ -7028,16 +7035,57 @@ BCw3Wyv2UWY=
             &service,
             Request::new(pb::OpenWriteSessionRequest {
                 target: None,
-                body_format: String::new(),
+                body_format: None,
                 idempotency_key: Some(pb::IdempotencyKey {
                     value: Uuid::new_v4().as_bytes().to_vec(),
                 }),
-                recover_session_id: Vec::new(),
+                recover_session_id: None,
             }),
         )
         .await
         .expect_err("non-enforced idempotency key must fail before dispatch");
         assert_eq!(err.code(), tonic::Code::Unimplemented);
+    }
+
+    /// An absent body_format asks for the daemon default; a present but blank
+    /// one names no format and is malformed. Before the field carried presence
+    /// these were the same request on the wire.
+    #[tokio::test]
+    async fn write_session_separates_absent_body_format_from_a_blank_one() {
+        let service = ApiState::new(test_index()).write_session_service();
+        let open = |body_format| {
+            pb::write_session_service_server::WriteSessionService::open_write_session(
+                &service,
+                Request::new(pb::OpenWriteSessionRequest {
+                    target: None,
+                    body_format,
+                    idempotency_key: None,
+                    recover_session_id: None,
+                }),
+            )
+        };
+
+        let absent = open(None)
+            .await
+            .expect_err("no target, so the open fails either way");
+        assert_eq!(
+            absent.code(),
+            tonic::Code::InvalidArgument,
+            "absent body_format must take the default and fall through to the target check"
+        );
+        assert!(
+            absent.message().contains("target"),
+            "absent body_format must not itself be the complaint: {absent}"
+        );
+
+        let blank = open(Some("   ".to_string()))
+            .await
+            .expect_err("a blank body_format is malformed");
+        assert_eq!(blank.code(), tonic::Code::InvalidArgument);
+        assert!(
+            blank.message().contains("body_format"),
+            "a supplied-but-blank body_format must be refused by name: {blank}"
+        );
     }
 
     #[test]
@@ -12299,9 +12347,9 @@ BCw3Wyv2UWY=
                         allow_unpooled: false,
                     },
                 )),
-                body_format: "rem-object-v1".to_string(),
+                body_format: Some("rem-object-v1".to_string()),
                 idempotency_key: None,
-                recover_session_id: Vec::new(),
+                recover_session_id: None,
             }),
         )
         .await
@@ -12323,9 +12371,9 @@ BCw3Wyv2UWY=
                         required_pool_id: String::new(),
                     },
                 )),
-                body_format: "rem-object-v1".to_string(),
+                body_format: Some("rem-object-v1".to_string()),
                 idempotency_key: None,
-                recover_session_id: Vec::new(),
+                recover_session_id: None,
             }),
         )
         .await
@@ -12378,9 +12426,9 @@ BCw3Wyv2UWY=
                         mount_if_needed: true,
                     },
                 )),
-                body_format: "rem-object-v1".to_string(),
+                body_format: Some("rem-object-v1".to_string()),
                 idempotency_key: None,
-                recover_session_id: Vec::new(),
+                recover_session_id: None,
             }),
         )
         .await

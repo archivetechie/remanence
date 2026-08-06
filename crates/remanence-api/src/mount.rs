@@ -584,29 +584,46 @@ pub(crate) async fn checkpoint_write_session(
         .map_err(|_| Status::internal("drive actor dropped reply"))?
 }
 
+/// How a write session is being ended. An abort carries the caller's reason
+/// when it gave one; a close cannot carry one, which is why this is an enum
+/// and not the `abort: bool` plus a reason field it replaced.
+pub(crate) enum SessionDisposition {
+    Close,
+    Abort { reason: Option<String> },
+}
+
+impl SessionDisposition {
+    fn is_abort(&self) -> bool {
+        matches!(self, SessionDisposition::Abort { .. })
+    }
+}
+
 pub(crate) async fn close_write_session(
     state: &ApiState,
     session_id: Uuid,
 ) -> Result<pb::WriteSession, Status> {
-    close_write_like(state, session_id, false).await
+    close_write_like(state, session_id, SessionDisposition::Close).await
 }
 
 pub(crate) async fn abort_write_session(
     state: &ApiState,
     session_id: Uuid,
+    reason: Option<String>,
 ) -> Result<pb::WriteSession, Status> {
-    close_write_like(state, session_id, true).await
+    close_write_like(state, session_id, SessionDisposition::Abort { reason }).await
 }
 
 async fn close_write_like(
     state: &ApiState,
     session_id: Uuid,
-    abort: bool,
+    disposition: SessionDisposition,
 ) -> Result<pb::WriteSession, Status> {
     let state = state.clone();
     await_critical_task(
         "close_write_session",
-        tokio::spawn(async move { close_write_like_critical(state, session_id, abort).await }),
+        tokio::spawn(
+            async move { close_write_like_critical(state, session_id, disposition).await },
+        ),
     )
     .await
 }
@@ -614,8 +631,9 @@ async fn close_write_like(
 async fn close_write_like_critical(
     state: ApiState,
     session_id: Uuid,
-    abort: bool,
+    disposition: SessionDisposition,
 ) -> Result<pb::WriteSession, Status> {
+    let abort = disposition.is_abort();
     let pool = state.drive_pool()?.clone();
     let mounted = pool.session(session_id)?;
     let drive = pool.drive_tx(mounted.bay)?;
@@ -623,10 +641,11 @@ async fn close_write_like_critical(
     let close_started = Instant::now();
     let actor_close_started = Instant::now();
     ensure_mounted_session_media_readiness_admitted(&state, "close session", &mounted)?;
-    if abort {
+    if let SessionDisposition::Abort { reason } = disposition {
         drive
             .send(crate::write_owner::DriveCommand::Abort {
                 session_id,
+                reason,
                 reply: reply_tx,
             })
             .await

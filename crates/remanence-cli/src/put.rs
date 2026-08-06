@@ -643,9 +643,9 @@ async fn open_write_session(
 ) -> Result<Vec<u8>, DaemonClientError> {
     let request = || pb::OpenWriteSessionRequest {
         target: Some(target.to_proto()),
-        body_format: "rem-object-v1".to_string(),
+        body_format: Some("rem-object-v1".to_string()),
         idempotency_key: None,
-        recover_session_id: Vec::new(),
+        recover_session_id: None,
     };
     match client.open_write_session(request()).await {
         Ok(response) => Ok(response.into_inner().session_id),
@@ -774,7 +774,7 @@ async fn abort_write_session(
         .abort_write_session(pb::AbortWriteSessionRequest {
             session_id: session_id.to_vec(),
             idempotency_key: None,
-            reason: "rem put: append failed, aborting the batch".to_string(),
+            reason: Some("rem put: append failed, aborting the batch".to_string()),
         })
         .await
     {
@@ -1182,7 +1182,7 @@ mod tests {
             request: Request<pb::OpenWriteSessionRequest>,
         ) -> Result<Response<pb::WriteSession>, Status> {
             let request = request.into_inner();
-            assert_eq!(request.body_format, "rem-object-v1");
+            assert_eq!(request.body_format.as_deref(), Some("rem-object-v1"));
             match (&self.0.expect_tape_target, request.target) {
                 (None, Some(pb::open_write_session_request::Target::PoolTarget(target))) => {
                     assert_eq!(target.pool_id, "solo");
@@ -1310,8 +1310,15 @@ mod tests {
 
         async fn abort_write_session(
             &self,
-            _request: Request<pb::AbortWriteSessionRequest>,
+            request: Request<pb::AbortWriteSessionRequest>,
         ) -> Result<Response<pb::WriteSession>, Status> {
+            // `rem put` always knows why it is aborting, so the reason must be
+            // present on the wire rather than defaulted to an empty string.
+            let reason = request.into_inner().reason;
+            assert!(
+                reason.as_deref().is_some_and(|reason| !reason.is_empty()),
+                "rem put must state its abort reason, got {reason:?}"
+            );
             if self.0.fail_abort {
                 return Err(Status::unavailable("injected abort failure"));
             }
