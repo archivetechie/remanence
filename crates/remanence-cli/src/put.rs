@@ -825,11 +825,14 @@ async fn append_one(
             payload: Some(pb::append_object_message::Payload::Start(
                 pb::AppendObjectStart {
                     session_id: session_id_owned.clone(),
+                    // `rem put` names the object (the archive path when the
+                    // operator gave no --id), knows the size it stat'ed,
+                    // hashes, and supplies no manifest.
                     caller_object_id,
                     caller_metadata,
-                    declared_size_bytes,
-                    body_format_manifest: Vec::new(),
-                    expected_content_sha256: content_sha256.to_vec(),
+                    declared_size_bytes: Some(declared_size_bytes),
+                    body_format_manifest: None,
+                    expected_content_sha256: Some(content_sha256.to_vec()),
                     expected_content_digest: Some(digest.clone()),
                     source_replay_capability: pb::SourceReplayCapability::ReplayFromStart as i32,
                 },
@@ -866,7 +869,7 @@ async fn append_one(
             payload: Some(pb::append_object_message::Payload::Finish(
                 pb::AppendObjectFinish {
                     session_id: session_id_owned,
-                    expected_content_sha256: content_sha256.to_vec(),
+                    expected_content_sha256: Some(content_sha256.to_vec()),
                     expected_content_digest: Some(digest),
                 },
             )),
@@ -1214,7 +1217,9 @@ mod tests {
             let mut caller_metadata = HashMap::new();
             let mut hasher = Sha256::new();
             let mut size = 0_u64;
-            let mut expected = Vec::new();
+            // `rem put` always hashes before it sends, so the fake holds it to
+            // a digest actually being present rather than to an empty vec.
+            let mut expected = None;
             while let Some(message) = stream.message().await? {
                 match message.payload.unwrap() {
                     pb::append_object_message::Payload::Start(start) => {
@@ -1236,7 +1241,11 @@ mod tests {
                 }
             }
             let digest: [u8; 32] = hasher.finalize().into();
-            assert_eq!(expected, digest.to_vec(), "client-declared digest mismatch");
+            assert_eq!(
+                expected,
+                Some(digest.to_vec()),
+                "client-declared digest mismatch"
+            );
             let record = pb::ObjectRecord {
                 object_id: Uuid::new_v4().as_bytes().to_vec(),
                 caller_object_id: Some(caller_object_id),

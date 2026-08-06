@@ -1259,19 +1259,30 @@ enum SourceReplayCapability {
 
 message AppendObjectStart {
   bytes session_id                    = 1;
-  string caller_object_id             = 2; // §4.2 orchestrator opaque id
+  // §4.2 orchestrator opaque id. REQUIRED, and plain for that reason: an
+  // append that names no object is refused (rem-object layout admission,
+  // "caller_object_id must not be empty", surfaced as INVALID_ARGUMENT), so
+  // absence here is a rejected request rather than a value the daemon has to
+  // interpret. `objects.caller_object_id` is nullable and no writer fills it
+  // with NULL; see tools/wire-presence-ledger.txt for that mismatch.
+  string caller_object_id             = 2;
   map<string, string> caller_metadata = 3; // §4.2 opaque metadata
-  // Optional: declared size_bytes for capacity-reserve planning (rem-tar-v1
-  // §9.1 P1 projected_size_blocks). If unknown, daemon estimates.
-  uint64 declared_size_bytes          = 4;
+  // Declared size for capacity-reserve planning (rem-tar-v1 §9.1 P1
+  // projected_size_blocks). Absent means the caller does not know, and the
+  // daemon estimates. Zero is a declaration that the object is empty, which is
+  // an ordinary object -- the same reason ObjectRecord.size_bytes is optional.
+  optional uint64 declared_size_bytes = 4;
   // For rem-tar-v1: pre-supplied per-file manifest (paths, sizes, hashes,
   // optional pre-computed file_sha256). The writer validates and writes
   // accordingly. The exact shape is body-format-specific; this draft leaves
-  // it as a serialized blob owned by the format adapter.
-  bytes body_format_manifest          = 5;
+  // it as a serialized blob owned by the format adapter. Absent means the
+  // caller supplied no manifest.
+  optional bytes body_format_manifest = 5;
   // Binding payload digest used for overlap admission. New clients mirror
-  // this value in AppendObjectFinish during the compatibility window.
-  bytes expected_content_sha256       = 6;
+  // this value in AppendObjectFinish during the compatibility window. Absent
+  // means the caller pre-computed no digest, so there is nothing to bind
+  // against; it is not a digest of no bytes.
+  optional bytes expected_content_sha256 = 6;
   // Whether the caller retains immutable source bytes and can replay them
   // from byte zero after an interrupted overlap append.
   SourceReplayCapability source_replay_capability = 7;
@@ -1287,8 +1298,8 @@ message AppendObjectChunk {
 message AppendObjectFinish {
   bytes session_id = 1;
   // If client pre-computed the object's content_sha256, daemon validates
-  // before committing.
-  bytes expected_content_sha256 = 2;
+  // before committing. Absent means it computed none.
+  optional bytes expected_content_sha256 = 2;
   // Algorithm-aware mirror of expected_content_sha256.
   Digest expected_content_digest = 3;
 }

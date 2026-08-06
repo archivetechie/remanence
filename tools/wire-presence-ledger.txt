@@ -74,3 +74,25 @@ CheckpointSessionRequest.session_id  refused by decode_uuid_bytes; you cannot ch
 CloseWriteSessionRequest.session_id  refused by decode_uuid_bytes
 AbortWriteSessionRequest.session_id  refused by decode_uuid_bytes
 GetWriteSessionRequest.session_id    refused by decode_uuid_bytes
+
+# The append stream, decided 2026-08-06. Same rule as above, same method: read
+# against the handler.
+#
+# caller_object_id is the one worth writing down at length, because the schema
+# argues the other way and the schema loses. `objects.caller_object_id` is
+# nullable and its index is partial on `is not null`, which reads as a column
+# expecting absence -- so this field looks like it should be optional. It is
+# not: an append that names no object is refused before any tape I/O, by
+# rem-object layout admission ("caller_object_id must not be empty",
+# remanence-format/src/layout.rs, surfaced as INVALID_ARGUMENT), and the body
+# format's manifest requires the key outright (manifest.rs `required_text`).
+# No writer in the tree produces a NULL caller_object_id. The nullable column
+# is the thing that is out of step, not the wire field; recorded in STANDING
+# rather than papered over here.
+AppendObjectStart.session_id                  refused by decode_uuid_bytes
+AppendObjectStart.caller_object_id            required; an unnamed object is refused at layout admission, so absence is a rejected request
+AppendObjectStart.CallerMetadataEntry.key     a map entry exists because the caller inserted it; the key is what it inserted it under
+AppendObjectStart.CallerMetadataEntry.value   an empty value is a value the caller chose to store, and a map has no third state
+AppendObjectChunk.session_id                  refused by decode_uuid_bytes via ensure_same_session
+AppendObjectChunk.data                        a chunk carries the bytes it carries; zero bytes is an empty chunk, never an unknown one
+AppendObjectFinish.session_id                 refused by decode_uuid_bytes via ensure_same_session
