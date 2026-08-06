@@ -213,10 +213,6 @@ ReadResumeTarget.file_boundary_byte_offset
 ReadResumeTarget.file_id
 ReadResumeTarget.object_id
 ReadResumeTarget.tape_uuid
-ReadSession.daemon_epoch
-ReadSession.drive_element_address
-ReadSession.session_id
-ReadSession.tape_uuid
 ReadTarget.end_block
 ReadTarget.partition
 ReadTarget.start_block

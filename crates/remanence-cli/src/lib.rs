@@ -5179,10 +5179,16 @@ fn run_archive_verify_client(
                 .await
                 .map_err(status_error)?
                 .into_inner();
-            if session.tape_uuid.as_slice() != locator.tape_uuid {
+            // An unidentified volume must NOT satisfy this check. It guards a
+            // restore against reading the wrong tape, so "I cannot tell which
+            // tape this is" has to fail exactly as a known-wrong tape does.
+            if session.tape_uuid.as_deref() != Some(locator.tape_uuid.as_slice()) {
                 let original = DaemonClientError::client(format!(
                     "drive 0x{drive:04x} contains tape {}, but locator requires {}",
-                    bytes_to_uuid_text(&session.tape_uuid),
+                    session
+                        .tape_uuid
+                        .as_deref()
+                        .map_or_else(|| "<unidentified>".to_string(), bytes_to_uuid_text),
                     Uuid::from_bytes(locator.tape_uuid),
                 ));
                 let _ = client

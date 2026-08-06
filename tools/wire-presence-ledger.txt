@@ -58,3 +58,5 @@ WriteSession.bytes_committed  as objects_committed
 WriteSession.current_tape_index an index into tape_sequence, always positioned somewhere
 WriteSession.pending_checkpoint_objects a counter the session maintains; zero means zero pending
 WriteSession.pending_checkpoint_bytes as pending_checkpoint_objects
+ReadSession.session_id        primary key; a session cannot exist without one
+ReadSession.daemon_epoch      minted with the session by the daemon that created it
