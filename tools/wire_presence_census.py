@@ -38,10 +38,28 @@ one line per field with the reason. It is a record of decisions taken, not a
 list of permitted exceptions: a field is in it because someone looked, and the
 reason is there to be argued with.
 
+THE GATE
+--------
+`--check` fails on any unexamined field, which is the end state. Until then
+`--check-baseline` is what CI runs: it fails only on fields that are unexamined
+AND absent from tools/wire-presence-baseline.txt.
+
+That makes it a ratchet rather than a wall. The 266 fields nobody has looked at
+yet do not block unrelated work, but a NEW field lands outside the baseline and
+fails immediately -- so the debt can shrink and can never grow. Fixing a field
+means deleting its baseline line, and the gate then refuses to let it regress:
+a field that leaves the baseline can never quietly re-enter it.
+
+The baseline is a debt register, not a permission list. Nothing should ever be
+added to it by hand. `--write-baseline` regenerates it, and the gate rejects a
+regeneration that grew.
+
 Usage:
     python3 tools/wire_presence_census.py            # summary
     python3 tools/wire_presence_census.py --list     # every field and verdict
-    python3 tools/wire_presence_census.py --check    # exit 1 on UNEXAMINED
+    python3 tools/wire_presence_census.py --check    # exit 1 on any UNEXAMINED
+    python3 tools/wire_presence_census.py --check-baseline   # exit 1 on NEW unexamined
+    python3 tools/wire_presence_census.py --write-baseline   # regenerate (must not grow)
 """
 
 from __future__ import annotations
@@ -52,6 +70,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 LEDGER = ROOT / "tools" / "wire-presence-ledger.txt"
+BASELINE = ROOT / "tools" / "wire-presence-baseline.txt"
 
 # FieldDescriptorProto.type values we treat as presence-less scalars in proto3.
 SCALAR_TYPES = {
@@ -106,6 +125,16 @@ def load_ledger() -> dict[str, str]:
     return out
 
 
+def read_baseline() -> set[str]:
+    if not BASELINE.is_file():
+        return set()
+    return {
+        line.strip()
+        for line in BASELINE.read_text().splitlines()
+        if line.strip() and not line.startswith("#")
+    }
+
+
 def walk(fds, prefix_files=("layer5.proto",)):
     """Yield (qualified_name, field) for every field of every message, nested included."""
     def walk_message(msg, path):
@@ -141,6 +170,10 @@ def main() -> int:
     ap.add_argument("--list", action="store_true", help="print every field and verdict")
     ap.add_argument("--check", action="store_true", help="exit 1 if any field is UNEXAMINED")
     ap.add_argument("--unexamined", action="store_true", help="print only unexamined fields")
+    ap.add_argument("--check-baseline", action="store_true",
+                    help="exit 1 only for unexamined fields absent from the baseline")
+    ap.add_argument("--write-baseline", action="store_true",
+                    help="regenerate the baseline; refuses to grow it")
     args = ap.parse_args()
 
     fds = load_descriptor(find_descriptor())
@@ -167,6 +200,60 @@ def main() -> int:
     for kind in ("optional", "enum", "repeated", "message", "decided-plain", "UNEXAMINED"):
         if kind in counts:
             print(f"  {counts[kind]:4}  {kind}")
+
+    unexamined_keys = {key for key, _, kind, _ in rows if kind == "UNEXAMINED"}
+
+    if args.write_baseline:
+        previous = read_baseline()
+        added = unexamined_keys - previous
+        if previous and added:
+            print(
+                f"refusing to grow the baseline by {len(added)} field(s):\n  "
+                + "\n  ".join(sorted(added))
+                + "\n\nThe baseline is a debt register. A field is added to it only by "
+                "being added to the contract without a presence verdict, which is what "
+                "the gate exists to prevent. Give these fields a verdict instead.",
+                file=sys.stderr,
+            )
+            return 1
+        BASELINE.write_text(
+            "# Fields that had no presence verdict when the gate went in.\n"
+            "#\n"
+            "# A debt register, not a permission list. This file may only ever shrink:\n"
+            "# delete a line when the field gets a verdict. Never add one by hand -- a\n"
+            "# new field belongs in the contract with its presence already decided.\n"
+            "#\n"
+            "# Regenerate with: python3 tools/wire_presence_census.py --write-baseline\n"
+            + "".join(f"{key}\n" for key in sorted(unexamined_keys))
+        )
+        print(f"baseline written: {len(unexamined_keys)} field(s)")
+        if previous:
+            print(f"  {len(previous - unexamined_keys)} field(s) resolved since last time")
+        return 0
+
+    if args.check_baseline:
+        baseline = read_baseline()
+        new_debt = sorted(unexamined_keys - baseline)
+        resolved = sorted(baseline - unexamined_keys)
+        if new_debt:
+            print(
+                f"\n{len(new_debt)} field(s) entered the contract with no presence "
+                "verdict:\n  " + "\n  ".join(new_debt)
+                + "\n\nEvery field must say whether its value can be unknown. Declare it "
+                "`optional`, give the enum an UNSPECIFIED member, or record in "
+                f"{LEDGER.name} why zero is the honest answer for it.\n"
+                "Do NOT add these to the baseline -- it exists to bound work that "
+                "predates the gate, not to absorb new work.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"\ngate: no new unexamined fields ({len(baseline)} pre-existing)")
+        if resolved:
+            print(
+                f"  {len(resolved)} baseline field(s) now resolved -- drop them with "
+                "--write-baseline"
+            )
+        return 0
 
     unexamined = counts.get("UNEXAMINED", 0)
     if args.check and unexamined:
