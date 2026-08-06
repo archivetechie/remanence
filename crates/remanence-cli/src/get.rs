@@ -841,12 +841,14 @@ mod tests {
         Arc::new(FakeObjectStore {
             record: pb::ObjectRecord {
                 object_id: OBJECT_ID.to_vec(),
-                caller_object_id: "get-test-caller".to_string(),
-                logical_size_bytes: members
-                    .iter()
-                    .map(|member| member.payload.len() as u64)
-                    .sum(),
-                body_format: "rem-object-v1".to_string(),
+                caller_object_id: Some("get-test-caller".to_string()),
+                logical_size_bytes: Some(
+                    members
+                        .iter()
+                        .map(|member| member.payload.len() as u64)
+                        .sum(),
+                ),
+                body_format: Some("rem-object-v1".to_string()),
                 copies: vec![pb::ObjectCopy {
                     tape_uuid: TAPE_ID.to_vec(),
                     tape_file_number: 42,

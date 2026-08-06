@@ -37,3 +37,13 @@ Slot.element_address               the address IS the slot's identity; a slot wi
 PortalSlot.element_address         as Slot.element_address
 DriveAssignment.library_serial     an assignment is always to a named library
 DriveAssignment.bay                an assignment is always to a specific bay
+
+# Objects area, decided 2026-08-06. Derived from `objects` / `object_files`.
+ObjectRecord.object_id        primary key of the objects table
+FileRecord.object_id          object_files.object_id is NOT NULL, half the primary key
+FileRecord.file_id            object_files.file_id is NOT NULL, the other half
+FileRecord.path               object_files.path is NOT NULL; a catalogued file always has one
+FileRecord.size_bytes         object_files.size_bytes is NOT NULL; the writer measured it to catalog it
+FileRecord.file_sha256        object_files.file_sha256 is NOT NULL; computed during the write that catalogued it
+FileRecord.chunk_count        object_files.chunk_count is NOT NULL
+Tape.tape_uuid                primary key of the tapes table

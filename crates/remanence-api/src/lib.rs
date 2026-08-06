@@ -5334,7 +5334,7 @@ fn native_object_file_to_proto(record: NativeObjectFileRecord) -> Result<pb::Fil
         path: record.path,
         size_bytes: record.size_bytes,
         file_sha256: record.file_sha256,
-        first_chunk_body_lba: record.first_chunk_lba.unwrap_or_default(),
+        first_chunk_body_lba: record.first_chunk_lba,
         chunk_count: u32::try_from(record.chunk_count)
             .map_err(|_| Status::internal("object file chunk_count does not fit u32"))?,
         file_digest,
@@ -5363,10 +5363,15 @@ fn object_record_to_proto(record: NativeObjectRecord) -> Result<pb::ObjectRecord
         catalog_digest_to_proto(record.metadata_hash_algorithm, record.metadata_hash);
     Ok(pb::ObjectRecord {
         object_id: encode_uuid_text(record.object_id.as_str())?,
-        caller_object_id: record.caller_object_id.unwrap_or_default(),
-        content_sha256: record.content_hash.unwrap_or_default(),
-        logical_size_bytes: record.logical_size_bytes.unwrap_or_default(),
-        body_format: record.body_format,
+        caller_object_id: record.caller_object_id,
+        content_sha256: record.content_hash,
+        logical_size_bytes: record.logical_size_bytes,
+        // NOTE: `objects.body_format` is nullable, but this record type carries
+        // it as a plain String -- the same upstream flattening DriveRecord.serial
+        // had. Every other field on this projection is now honest; making this
+        // one honest means fixing the record, which is the remaining piece of
+        // this area rather than something to paper over here.
+        body_format: Some(record.body_format),
         caller_metadata: std::collections::HashMap::new(),
         created_at: timestamp_from_rfc3339(record.created_at_utc.as_str()),
         copies: record.copies.iter().map(object_copy_to_proto).collect(),
@@ -6472,10 +6477,10 @@ mod tests {
 
         let record = pb::ObjectRecord {
             object_id: Uuid::nil().as_bytes().to_vec(),
-            caller_object_id: String::new(),
-            content_sha256: vec![0x11; 32],
-            logical_size_bytes: 10,
-            body_format: "rem-object-v1".to_string(),
+            caller_object_id: Some(String::new()),
+            content_sha256: Some(vec![0x11; 32]),
+            logical_size_bytes: Some(10),
+            body_format: Some("rem-object-v1".to_string()),
             caller_metadata: Default::default(),
             created_at: None,
             copies: Vec::new(),
@@ -11641,10 +11646,10 @@ BCw3Wyv2UWY=
                         let _ = reply.send(Ok(crate::write_owner::AppendFinishOutcome {
                             record: pb::ObjectRecord {
                                 object_id: Uuid::nil().to_string().into_bytes(),
-                                caller_object_id: "caller-object".to_string(),
-                                content_sha256: vec![0x11; 32],
-                                logical_size_bytes: 8,
-                                body_format: "rem-object-v1".to_string(),
+                                caller_object_id: Some("caller-object".to_string()),
+                                content_sha256: Some(vec![0x11; 32]),
+                                logical_size_bytes: Some(8),
+                                body_format: Some("rem-object-v1".to_string()),
                                 caller_metadata: Default::default(),
                                 created_at: None,
                                 copies: Vec::new(),
@@ -11675,7 +11680,7 @@ BCw3Wyv2UWY=
         .await
         .expect("append finish");
 
-        assert_eq!(record.logical_size_bytes, 8);
+        assert_eq!(record.logical_size_bytes, Some(8));
         let counter = state.drive_counters(&drive_uuid);
         assert_eq!(counter.write_bytes(), 8);
 
@@ -11728,10 +11733,10 @@ BCw3Wyv2UWY=
             let _ = reply.send(Ok(crate::write_owner::AppendFinishOutcome {
                 record: pb::ObjectRecord {
                     object_id: replayed_id.as_bytes().to_vec(),
-                    caller_object_id: "caller-object".to_string(),
-                    content_sha256: vec![0x11; 32],
-                    logical_size_bytes: 2 * ring_bytes,
-                    body_format: "rem-object-v1".to_string(),
+                    caller_object_id: Some("caller-object".to_string()),
+                    content_sha256: Some(vec![0x11; 32]),
+                    logical_size_bytes: Some(2 * ring_bytes),
+                    body_format: Some("rem-object-v1".to_string()),
                     caller_metadata: Default::default(),
                     created_at: None,
                     copies: Vec::new(),
@@ -12102,7 +12107,7 @@ BCw3Wyv2UWY=
                 .map(|digest| digest.value.as_slice()),
             Some(&[7u8; 32][..])
         );
-        assert_eq!(file.first_chunk_body_lba, 2);
+        assert_eq!(file.first_chunk_body_lba, Some(2));
         assert_eq!(file.chunk_count, 1);
 
         let by_path = pb::catalog_server::Catalog::get_file(
@@ -12150,10 +12155,10 @@ BCw3Wyv2UWY=
             .expect("one object")
             .expect("object record");
         assert_eq!(first.object_id, object_uuid().as_bytes().to_vec());
-        assert_eq!(first.caller_object_id, "caller-1");
-        assert_eq!(first.body_format, "rem-object-v1");
-        assert_eq!(first.logical_size_bytes, 17);
-        assert_eq!(first.content_sha256, vec![7u8; 32]);
+        assert_eq!(first.caller_object_id.as_deref(), Some("caller-1"));
+        assert_eq!(first.body_format.as_deref(), Some("rem-object-v1"));
+        assert_eq!(first.logical_size_bytes, Some(17));
+        assert_eq!(first.content_sha256, Some(vec![7u8; 32]));
         assert_eq!(first.copies.len(), 1);
         assert_eq!(first.copies[0].pool_id, "camera.copy-a");
         assert!(stream.next().await.is_none());

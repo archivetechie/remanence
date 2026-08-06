@@ -207,10 +207,10 @@ impl PoolWriteObjectRecord {
         let append_commit_info = self.copies.first().map(append_commit_info_from_pool_copy);
         pb::ObjectRecord {
             object_id: self.object_id.to_vec(),
-            caller_object_id: self.caller_object_id.clone(),
-            content_sha256: self.content_sha256.to_vec(),
-            logical_size_bytes: self.logical_size_bytes,
-            body_format: self.body_format.clone(),
+            caller_object_id: Some(self.caller_object_id.clone()),
+            content_sha256: Some(self.content_sha256.to_vec()),
+            logical_size_bytes: Some(self.logical_size_bytes),
+            body_format: Some(self.body_format.clone()),
             caller_metadata: Default::default(),
             created_at: timestamp_from_rfc3339(self.created_at_utc.as_str()),
             copies: self
