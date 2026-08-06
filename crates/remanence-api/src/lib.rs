@@ -5232,16 +5232,20 @@ pub(crate) fn operation_state(value: &str) -> pb::OperationState {
 fn tape_to_proto(record: TapeRecord) -> pb::Tape {
     pb::Tape {
         tape_uuid: record.tape_uuid,
-        voltag: record.voltag.unwrap_or_default(),
-        body_format: record.body_format.unwrap_or_default(),
-        block_size_bytes: record.block_size.unwrap_or_default(),
-        data_blocks_per_stripe: record.data_blocks_per_stripe.unwrap_or_default(),
-        parity_blocks_per_stripe: record.parity_blocks_per_stripe.unwrap_or_default(),
-        stripes_per_neighborhood: record.stripes_per_neighborhood.unwrap_or_default(),
-        last_committed_tape_file: record.last_committed_tape_file.unwrap_or_default(),
+        // The record already carries all of these as Option, from nullable
+        // columns. The line below for written_extent_lba was the only one that
+        // let the absence through -- every other field flattened it here, one
+        // line away, and the comment on that field explained why it must not.
+        voltag: record.voltag,
+        body_format: record.body_format,
+        block_size_bytes: record.block_size,
+        data_blocks_per_stripe: record.data_blocks_per_stripe,
+        parity_blocks_per_stripe: record.parity_blocks_per_stripe,
+        stripes_per_neighborhood: record.stripes_per_neighborhood,
+        last_committed_tape_file: record.last_committed_tape_file,
         state: tape_state(record.state.as_str()) as i32,
         updated_at: timestamp_from_rfc3339(record.updated_at_utc.as_str()),
-        pool_id: record.pool_id.unwrap_or_default(),
+        pool_id: record.pool_id,
         correlation_rollups: Vec::new(),
         // Barrier-proved measurement; absent stays absent on the wire.
         written_extent_lba: record.written_extent_lba,
@@ -11969,11 +11973,11 @@ BCw3Wyv2UWY=
         .into_inner();
         assert_eq!(tapes.tapes.len(), 1);
         assert_eq!(tapes.tapes[0].tape_uuid, TAPE_UUID.to_vec());
-        assert_eq!(tapes.tapes[0].body_format, "rem-object-v1");
-        assert_eq!(tapes.tapes[0].block_size_bytes, 4096);
-        assert_eq!(tapes.tapes[0].last_committed_tape_file, 7);
+        assert_eq!(tapes.tapes[0].body_format.as_deref(), Some("rem-object-v1"));
+        assert_eq!(tapes.tapes[0].block_size_bytes, Some(4096));
+        assert_eq!(tapes.tapes[0].last_committed_tape_file, Some(7));
         assert_eq!(tapes.tapes[0].state, pb::tape::State::TapeStateReady as i32);
-        assert_eq!(tapes.tapes[0].pool_id, "camera.copy-a");
+        assert_eq!(tapes.tapes[0].pool_id.as_deref(), Some("camera.copy-a"));
 
         let filtered_tapes = pb::catalog_server::Catalog::list_tapes(
             &service,
