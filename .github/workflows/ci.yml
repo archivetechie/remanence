@@ -63,6 +63,12 @@ jobs:
       - name: Execute the published damage matrix against the Recoverer
         run: cargo test -p remanence-parity --test publication_damage_matrix
 
+      # Census only for now: reports how many wire fields have no presence
+      # verdict, without failing on them. It becomes --check once the ledger
+      # is complete; failing today would only block every unrelated change.
+      - name: Wire-presence census
+        run: python3 -m pip install --quiet protobuf && python3 tools/wire_presence_census.py
+
   fuzz-corpus-replay:
     name: scheduled fuzz corpus replay
     runs-on: ubuntu-latest

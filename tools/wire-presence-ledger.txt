@@ -1,0 +1,18 @@
+# Presence verdicts for Layer 5 wire fields whose zero value is the honest answer.
+#
+# One line per field:  <Message.field>  <reason the zero value is genuinely correct>
+#
+# This is a record of DECISIONS TAKEN, not a list of permitted exceptions. A field
+# appears here because someone examined it and concluded that zero, empty or false
+# is a truthful value for it — not because flattening it was convenient. The reason
+# is written down so it can be argued with later.
+#
+# Every other field must be one of: declared `optional`, an enum carrying its own
+# *_UNSPECIFIED = 0, a repeated field, or a submessage. Anything else reads as
+# UNEXAMINED in `tools/wire_presence_census.py`, which is the honest state for a
+# field nobody has yet considered.
+#
+# Nested message fields are written with their full path, e.g. Outer.Inner.field.
+#
+# 353 fields are currently UNEXAMINED. That number is the work, and it is meant to
+# be visible.
