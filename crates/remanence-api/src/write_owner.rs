@@ -7230,8 +7230,8 @@ fn session_proto(input: WriteSessionProtoInput<'_>) -> pb::WriteSession {
     });
     pb::WriteSession {
         session_id: input.session_id.as_bytes().to_vec(),
-        tape_uuid: input.tape_uuid.to_vec(),
-        drive_element_address: u32::from(input.drive_element_address),
+        tape_uuid: Some(input.tape_uuid.to_vec()),
+        drive_element_address: Some(u32::from(input.drive_element_address)),
         body_format: "rem-object-v1".to_string(),
         state: input.state as i32,
         objects_committed: input.objects_committed,
@@ -7247,9 +7247,14 @@ fn session_proto(input: WriteSessionProtoInput<'_>) -> pb::WriteSession {
             .pending_batch
             .map_or(0, |batch| batch.objects.len() as u64),
         pending_checkpoint_bytes: input.pending_batch.map_or(0, |batch| batch.logical_bytes),
-        oldest_pending_age_seconds: input
-            .pending_batch
-            .map_or(0, |batch| batch.opened_at.elapsed().as_secs()),
+        // `.map`, not `.map_or(0, ..)`: no pending batch means there is no
+            // oldest pending object to have an age. Zero is what an object that
+            // arrived this instant reports, so the old default made "nothing
+            // waiting" and "something waiting, just now" identical -- and those
+            // are opposite answers to "is this session behind on checkpoints?".
+            oldest_pending_age_seconds: input
+                .pending_batch
+                .map(|batch| batch.opened_at.elapsed().as_secs()),
         checkpoint_deadline,
         checkpointed_objects: Vec::new(),
         committed_copies: Vec::new(),
@@ -9390,7 +9395,7 @@ mod tests {
             7,
         );
 
-        assert_eq!(write.drive_element_address, 0x0100);
+        assert_eq!(write.drive_element_address, Some(0x0100));
         assert_eq!(read.drive_element_address, 0x0101);
         assert_eq!(read.daemon_epoch, 7);
     }
