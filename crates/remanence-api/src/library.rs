@@ -715,11 +715,9 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         let actor = crate::authorize_request(&request, crate::AuthPermission::Lifecycle)?;
         let request = request.into_inner();
         crate::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
-        if !request.i_understand_fleet_removal_is_permanent {
-            return Err(Status::failed_precondition(
-                "RetireDrive requires i_understand_fleet_removal_is_permanent=true",
-            ));
-        }
+        // Retirement no longer carries a permanence acknowledgement: it is
+        // reversible through ReinstateDrive. The reason remains mandatory —
+        // it is what the audit trail and the reinstatement record cite.
         if request.reason.trim().is_empty() {
             return Err(Status::invalid_argument("reason must not be empty"));
         }
@@ -760,6 +758,46 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         Ok(Response::new(pb::RetireDriveResponse {
             drive: Some(drive_record_to_proto(outcome.drive)),
             newly_retired: outcome.newly_retired,
+        }))
+    }
+
+    async fn reinstate_drive(
+        &self,
+        request: Request<pb::ReinstateDriveRequest>,
+    ) -> Result<Response<pb::ReinstateDriveResponse>, Status> {
+        let actor = crate::authorize_request(&request, crate::AuthPermission::Lifecycle)?;
+        let request = request.into_inner();
+        crate::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
+        if request.reason.trim().is_empty() {
+            return Err(Status::invalid_argument("reason must not be empty"));
+        }
+        let mut index = self.state.index_write()?;
+        let drive = index
+            .get_drive_by_uuid(&request.drive_uuid)
+            .map_err(crate::status_from_state_error)?
+            .ok_or_else(|| Status::not_found("drive not found"))?;
+        ensure_mutable_drive(&drive, request.allow_derived_identity)?;
+        let outcome = index
+            .reinstate_drive(&request.drive_uuid, request.reason.as_str())
+            .map_err(crate::status_from_state_error)?
+            .ok_or_else(|| Status::not_found("drive not found"))?;
+        if outcome.newly_reinstated {
+            let mut detail = BTreeMap::new();
+            detail.insert(
+                "drive_uuid".to_string(),
+                CborValue::Bytes(request.drive_uuid.clone()),
+            );
+            detail.insert("reason".to_string(), CborValue::Text(request.reason));
+            self.state.record_drive_audit(
+                actor,
+                remanence_state::AuditEvent::DriveReinstated,
+                request.drive_uuid.as_slice(),
+                detail,
+            )?;
+        }
+        Ok(Response::new(pb::ReinstateDriveResponse {
+            drive: Some(drive_record_to_proto(outcome.drive)),
+            newly_reinstated: outcome.newly_reinstated,
         }))
     }
 
@@ -1706,20 +1744,37 @@ mod tests {
         assert!(err.message().contains("Derived"));
     }
 
+    /// The permanence acknowledgement is gone — retirement is reversible — but
+    /// the reason is not: it is what the audit trail and any later
+    /// reinstatement record cite.
     #[tokio::test]
-    async fn retire_drive_rejects_missing_ack_before_lookup() {
+    async fn retire_drive_rejects_empty_reason_before_lookup() {
         let err = ApiState::new(test_index())
             .library_service()
             .retire_drive(Request::new(pb::RetireDriveRequest {
                 drive_uuid: Uuid::new_v4().as_bytes().to_vec(),
-                reason: "removed from fleet".to_string(),
-                i_understand_fleet_removal_is_permanent: false,
+                reason: "   ".to_string(),
                 allow_derived_identity: false,
             }))
             .await
-            .expect_err("missing ack must reject");
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert!(err.message().contains("i_understand"));
+            .expect_err("an empty reason must reject");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("reason"));
+    }
+
+    #[tokio::test]
+    async fn reinstate_drive_rejects_empty_reason_before_lookup() {
+        let err = ApiState::new(test_index())
+            .library_service()
+            .reinstate_drive(Request::new(pb::ReinstateDriveRequest {
+                drive_uuid: Uuid::new_v4().as_bytes().to_vec(),
+                reason: String::new(),
+                allow_derived_identity: false,
+            }))
+            .await
+            .expect_err("an empty reason must reject");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("reason"));
     }
 
     #[tokio::test]
@@ -1731,7 +1786,6 @@ mod tests {
             .retire_drive(Request::new(pb::RetireDriveRequest {
                 drive_uuid,
                 reason: "removed from fleet".to_string(),
-                i_understand_fleet_removal_is_permanent: true,
                 allow_derived_identity: false,
             }))
             .await
@@ -1758,7 +1812,6 @@ mod tests {
             .retire_drive(Request::new(pb::RetireDriveRequest {
                 drive_uuid,
                 reason: "removed from fleet".to_string(),
-                i_understand_fleet_removal_is_permanent: true,
                 allow_derived_identity: false,
             }))
             .await

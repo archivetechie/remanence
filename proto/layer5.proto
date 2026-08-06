@@ -192,6 +192,7 @@ service LibraryService {
   rpc GetDriveHistory   (GetDriveHistoryRequest)      returns (GetDriveHistoryResponse);
   rpc AnnotateDrive     (AnnotateDriveRequest)        returns (DriveCatalogEntry);
   rpc RetireDrive       (RetireDriveRequest)          returns (RetireDriveResponse);
+  rpc ReinstateDrive    (ReinstateDriveRequest)       returns (ReinstateDriveResponse);
   rpc PollDrive         (PollDriveRequest)            returns (DriveHealthSnapshot);
   rpc CleanDrive        (CleanDriveRequest)           returns (OperationRef);
   // Resume an existing durable media-readiness fence in place. Progress is
@@ -431,8 +432,22 @@ message AnnotateDriveRequest {
 message RetireDriveRequest {
   bytes drive_uuid = 1;
   string reason = 2;
-  bool i_understand_fleet_removal_is_permanent = 3;
+  // 3 held an acknowledgement that fleet removal was permanent. It is not:
+  // ReinstateDrive returns a retired drive to service.
+  reserved 3;
+  reserved "i_understand_fleet_removal_is_permanent";
   bool allow_derived_identity = 4;
+}
+
+message ReinstateDriveRequest {
+  bytes drive_uuid = 1;
+  string reason = 2;
+  bool allow_derived_identity = 3;
+}
+
+message ReinstateDriveResponse {
+  DriveCatalogEntry drive = 1;
+  bool newly_reinstated = 2;
 }
 
 message RetireDriveResponse {

@@ -1293,8 +1293,11 @@ enum DriveClientCommand {
     /// Annotate one drive.
     Annotate(DriveAnnotateArgs),
 
-    /// Permanently remove one drive from the managed fleet.
+    /// Remove one drive from the managed fleet. Reversible with `reinstate`.
     Retire(DriveRetireArgs),
+
+    /// Return a retired drive to service.
+    Reinstate(DriveReinstateArgs),
 
     /// Poll one drive now.
     Poll {
@@ -1385,9 +1388,18 @@ struct DriveRetireArgs {
     /// Operator-supplied reason.
     #[arg(long)]
     reason: String,
-    /// Required server-side acknowledgement.
-    #[arg(long = "i-understand-fleet-removal-is-permanent")]
-    i_understand_fleet_removal_is_permanent: bool,
+    /// Permit mutation of a Derived-identity row.
+    #[arg(long)]
+    allow_derived_identity: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+struct DriveReinstateArgs {
+    /// Drive serial or UUID.
+    drive: String,
+    /// Operator-supplied reason, recorded beside the retirement it reverses.
+    #[arg(long)]
+    reason: String,
     /// Permit mutation of a Derived-identity row.
     #[arg(long)]
     allow_derived_identity: bool,
@@ -5067,14 +5079,26 @@ fn run_drive_client_command(
                         .retire_drive(pb::RetireDriveRequest {
                             drive_uuid,
                             reason: args.reason.clone(),
-                            i_understand_fleet_removal_is_permanent: args
-                                .i_understand_fleet_removal_is_permanent,
                             allow_derived_identity: args.allow_derived_identity,
                         })
                         .await
                         .map_err(status_error)?
                         .into_inner();
                     print_drive_retire(response, json_output, out).map_err(DaemonClientError::from)
+                }
+                DriveClientCommand::Reinstate(args) => {
+                    let drive_uuid = resolve_drive_uuid_arg(&mut client, &args.drive).await?;
+                    let response = client
+                        .reinstate_drive(pb::ReinstateDriveRequest {
+                            drive_uuid,
+                            reason: args.reason.clone(),
+                            allow_derived_identity: args.allow_derived_identity,
+                        })
+                        .await
+                        .map_err(status_error)?
+                        .into_inner();
+                    print_drive_reinstate(response, json_output, out)
+                        .map_err(DaemonClientError::from)
                 }
                 DriveClientCommand::Poll { drive } => {
                     let snapshot = client
@@ -5746,6 +5770,29 @@ fn print_drive_retire(
         print_drive_line(drive, out);
     }
     let _ = writeln!(out, "newly_retired: {}", response.newly_retired);
+    Ok(())
+}
+
+fn print_drive_reinstate(
+    response: pb::ReinstateDriveResponse,
+    json_output: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    if json_output {
+        return print_json_envelope(
+            "rem.drive.reinstate.v1",
+            "item",
+            json!({
+                "drive": response.drive.as_ref().map(drive_json),
+                "newly_reinstated": response.newly_reinstated
+            }),
+            out,
+        );
+    }
+    if let Some(drive) = response.drive.as_ref() {
+        print_drive_line(drive, out);
+    }
+    let _ = writeln!(out, "newly_reinstated: {}", response.newly_reinstated);
     Ok(())
 }
 
