@@ -63,11 +63,12 @@ jobs:
       - name: Execute the published damage matrix against the Recoverer
         run: cargo test -p remanence-parity --test publication_damage_matrix
 
-      # Census only for now: reports how many wire fields have no presence
-      # verdict, without failing on them. It becomes --check once the ledger
-      # is complete; failing today would only block every unrelated change.
-      - name: Wire-presence census
-        run: python3 -m pip install --quiet protobuf && python3 tools/wire_presence_census.py
+      # A ratchet, not a wall. Fails only on fields that entered the contract
+      # WITHOUT a presence verdict -- the ones that predate the gate are listed
+      # in tools/wire-presence-baseline.txt and do not block unrelated work.
+      # The debt can shrink and cannot grow. Becomes --check when it hits zero.
+      - name: Wire-presence gate
+        run: python3 -m pip install --quiet protobuf && python3 tools/wire_presence_census.py --check-baseline
 
   fuzz-corpus-replay:
     name: scheduled fuzz corpus replay
