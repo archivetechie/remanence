@@ -453,8 +453,13 @@ pub struct RestartSession {
 pub struct DriveRecord {
     /// Daemon-assigned surrogate identity.
     pub drive_uuid: Vec<u8>,
-    /// Device-reported serial claim. May be empty.
-    pub serial: String,
+    /// Device-reported serial claim, absent when the device did not report one.
+    ///
+    /// `drives.serial` is nullable and always was. This used to be a `String`
+    /// documented as "may be empty", which meant every reader had to know that
+    /// empty meant absent -- and two of them did, testing for it by hand, while
+    /// the wire format flattened it and lost the distinction entirely.
+    pub serial: Option<String>,
     /// Exact discovery identity source string.
     pub identity_source: String,
     /// Whether this row may participate in attribution and mutation.
@@ -2572,11 +2577,17 @@ impl CatalogIndex {
             return self.clear_alarm(condition_key.as_str());
         }
 
-        let drive_label = if drive.serial.trim().is_empty() {
-            hex_uuid_from_slice(drive_uuid)
-        } else {
-            drive.serial.clone()
-        };
+        // This fallback was always right; it just had to infer the absence from
+        // an empty string. Now it is told.
+        let serial = drive
+            .serial
+            .as_deref()
+            .map(str::trim)
+            .filter(|serial| !serial.is_empty());
+        let drive_label = serial.map_or_else(
+            || hex_uuid_from_slice(drive_uuid),
+            |serial| serial.to_string(),
+        );
         let library = drive
             .last_library_serial
             .as_deref()
@@ -2589,9 +2600,14 @@ impl CatalogIndex {
             "[]"
         };
         let detail = format!(
-            "{{\"drive_uuid\":\"{}\",\"serial\":\"{}\",\"library_serial\":\"{}\",\"flags\":{},\"message\":\"{}\"}}",
+            "{{\"drive_uuid\":\"{}\",\"serial\":{},\"library_serial\":\"{}\",\"flags\":{},\"message\":\"{}\"}}",
             json_escape_text(&hex_uuid_from_slice(drive_uuid)),
-            json_escape_text(&drive.serial),
+            // null, not "": an alarm that names no serial is an alarm about a
+            // drive whose serial nobody knows, which is worth being able to see.
+            serial.map_or_else(
+                || "null".to_string(),
+                |serial| format!("\"{}\"", json_escape_text(serial)),
+            ),
             json_escape_text(library),
             flags_json,
             json_escape_text(&message)
@@ -9258,7 +9274,13 @@ const DRIVE_SELECT_SQL_WITH_WHERE_UUID: &str = concat!(
 fn drive_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DriveRecord> {
     Ok(DriveRecord {
         drive_uuid: row.get(0)?,
-        serial: row.get(1)?,
+        // Normalise at the boundary: the column is nullable, and rows written
+        // before this change store an empty string rather than NULL for an
+        // unreported serial. Both mean the same thing, and nothing above this
+        // line should have to know that there were ever two spellings.
+        serial: row
+            .get::<_, Option<String>>(1)?
+            .filter(|serial| !serial.is_empty()),
         identity_source: row.get(2)?,
         actionable: row.get::<_, i64>(3)? != 0,
         vendor: row.get(4)?,

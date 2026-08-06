@@ -232,16 +232,7 @@ fn fenced_drive_bays(index: &CatalogIndex, library_serial: &str) -> Result<HashS
 fn drive_record_to_proto(record: DriveRecord) -> pb::DriveCatalogEntry {
     pb::DriveCatalogEntry {
         drive_uuid: record.drive_uuid,
-        // INTERIM DECODE. `drives.serial` is nullable, but DriveRecord.serial is
-        // a String documented as "may be empty" -- the absence is destroyed at
-        // the SQL read layer, upstream of here. Empty genuinely is this field's
-        // encoding of absent (remanence-cli and index.rs both test for it), so
-        // decoding it back is faithful rather than a guess: a drive reporting an
-        // empty serial is a drive reporting no serial.
-        //
-        // The real fix is DriveRecord.serial: Option<String>, which removes the
-        // convention instead of decoding it. Next step in this arc.
-        serial: Some(record.serial).filter(|serial| !serial.is_empty()),
+        serial: record.serial,
         identity_source: record.identity_source,
         actionable: record.actionable,
         // The record already carries these as Option, straight from nullable
