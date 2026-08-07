@@ -1,8 +1,11 @@
 # Why Remanence?
 
 <!-- code-anchor: none -->
-> **Status note (2026-08-03).** Version 1.0.0 is Remanence's first
-> publication release. All five layers are implemented and shipped, including
+> **Status note (2026-08-07).** Remanence is **alpha software at v0.1.0**. It
+> was first published as v1.0.0 on 25 July 2026 and renumbered downward on
+> 7 August 2026: the implementation has not had the operational testing that a
+> 1.0 claims. The format versions below are unaffected and stay at 1.0.
+> All five layers are implemented and shipped, including
 > end-to-end tape reads and writes. The released on-tape formats are
 > REM-OBJECT Core Format 1.0 (wire id `rem-object-v1`), REM-ENCRYPT 1.0,
 > and REM-PARITY 1.0; all three are specified, implemented, and accompanied by
@@ -293,7 +296,7 @@ encrypted copy must first be opened according to
 the result is that same canonical pax tar stream. On tape,
 [REM-PARITY 1.0](../specs/publication/rem-parity-1-specification.md)
 adds Reed-Solomon sidecar parity and catalog-less bootstrap recovery.
-Version 1.0.0 reads and writes this stack end to end; the physical path
+Version 0.1.0 reads and writes this stack end to end; the physical path
 was validated on an HPE MSL3040 library with LTO-9 drives.
 
 If your workflow is "interactive `cp` against a tape," LTFS is
@@ -346,7 +349,7 @@ the archive's sole source of truth. Every tape self-describes through
 REM-OBJECT manifests and REM-PARITY bootstraps; per-tape journals and the
 hash-chained audit log record the host-side operational history.
 
-Version 1.0.0 ships that design across all five layers. The pipelined tape
+Version 0.1.0 ships that design across all five layers. The pipelined tape
 I/O path uses a staging ring and device position proofs; the daemon
 exposes catalog, read, write, robotics, and stewardship operations through
 gRPC over a Unix socket or optional mTLS TCP. The implementation reads and
@@ -392,7 +395,7 @@ archive readable by standard tools. An encrypted object requires a matching
 key and an implementation of the published REM-ENCRYPT profile before the
 same tar stream can be extracted. REM-PARITY documents how to recover object
 bytes from the tape's Reed-Solomon sidecars and bootstrap records without a
-catalog. These are properties of the v1.0.0 release, not promises for a
+catalog. These are properties of the v0.1.0 release, not promises for a
 future data plane.
 
 This is not a knock on the proprietary vendors — they have real

@@ -320,7 +320,7 @@ documents and published artifacts themselves.
 ### 20. The software
 
 - **What.** The reference implementation, released under its own semantic
-  version (currently 1.0.0) and archived in its own Zenodo record
+  version (currently 0.1.0, alpha) and archived in its own Zenodo record
   (concept DOI 10.5281/zenodo.21551570, Apache-2.0).
 - **How it relates.** Deliberately, not at all: software versions and
   document versions move independently. The software's job is to conform

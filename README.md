@@ -1,6 +1,15 @@
 <!-- code-anchor: none -->
 # Remanence: Open-Source LTO Tape Archival Software
 
+> **Alpha software (v0.1.0).** The implementation has not had enough
+> operational testing to be trusted with material you cannot afford to lose.
+> Expect defects and breaking changes. Do not use it as the only copy of
+> anything. See [Status](#status).
+>
+> The three **format specifications** are a separate matter: they are at
+> version 1.0, pinned by test vectors, and independently reimplemented. The
+> alpha label applies to this software, not to the formats it writes.
+
 Self-describing, catalog-rebuildable tape archives with optional 
 encryption, erasure-coded media recovery, and partial-file restore. 
 Designed for standards-based linear tape and currently validated on LTO.
@@ -32,8 +41,18 @@ on an HPE MSL3040 with LTO-9 drives.
 <!-- code-anchor: none -->
 ## Status
 
-Version 1.0.0, the first software release. The three on-tape formats are
-specified, implemented, and pinned by test vectors that ship with the source.
+**Version 0.1.0 — alpha.** This software was first published as v1.0.0 on
+25 July 2026. That number claimed more maturity than the implementation has
+earned, so it was withdrawn and renumbered on 7 August 2026. Nothing about the
+code got worse; the label was wrong and has been corrected. The v1.0.0 tag and
+its Zenodo deposit remain in place, marked as superseded, because the format
+specifications cite them and an archiving project should correct its claims in
+public rather than erase them.
+
+The three on-tape formats are specified, implemented, and pinned by test
+vectors that ship with the source. **Their version numbers are unchanged and
+remain at 1.0** — they are versioned independently of this software, and the
+renumbering above says nothing about them.
 
 Their specifications are published as review drafts. What is under review is
 whether the documents describe the formats correctly and completely, not
