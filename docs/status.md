@@ -8,6 +8,12 @@ rather than capabilities.
 
 ## The short version
 
+**This is alpha software, v0.1.0.** It was published as v1.0.0 in July 2026 and
+renumbered downward on 7 August 2026 because that number overstated how much
+operational testing the implementation had had. Treat it accordingly: do not
+make it the only copy of anything. The format specifications are versioned
+separately and stay at 1.0.
+
 The parts that put bytes on tape and get them back are the mature parts. A tape
 written today can be recovered without the catalog, without the daemon, and
 without a configuration file. The parts that are still moving are the control
