@@ -44,6 +44,47 @@ pub const PARITY_MAP_FOOTER_LEN: usize = 0xB8;
 /// Byte offset of the footer CRC-64/XZ field.
 pub const PARITY_MAP_FOOTER_CRC_OFFSET: usize = 0xB0;
 
+/// Maximum bytes charged for the non-directory-row portion of one canonical
+/// parity-map CBOR payload.
+///
+/// The bound includes the largest CBOR container heads, all seven root keys,
+/// the fixed format/tape/digest fields, u64-width numeric fields, and the
+/// maximum accepted writer-version and timestamp strings.  It deliberately
+/// remains valid when the draft's remaining u32 structural fields widen to
+/// u64.
+pub const PARITY_MAP_CBOR_FIXED_UPPER_BOUND_BYTES: u64 = 325;
+
+/// Maximum bytes charged for the directory envelope apart from its rows.
+pub const PARITY_MAP_CBOR_DIRECTORY_FIXED_UPPER_BOUND_BYTES: u64 = 43;
+
+/// Maximum canonical CBOR bytes charged for one sidecar-directory row.
+/// All eight numeric values are charged at their nine-byte u64 encoding; the
+/// ninth value is the two-byte byte-string head plus its 32-byte digest.
+pub const PARITY_MAP_CBOR_DIRECTORY_ENTRY_UPPER_BOUND_BYTES: u64 = 116;
+
+/// Return a checked allocation-free bound for the canonical directory value.
+pub fn parity_map_directory_len_upper_bound(
+    directory_entry_count: u64,
+) -> Result<u64, ParityError> {
+    let rows = directory_entry_count
+        .checked_mul(PARITY_MAP_CBOR_DIRECTORY_ENTRY_UPPER_BOUND_BYTES)
+        .ok_or_else(|| parity_map_parse("parity-map directory byte bound overflows u64"))?;
+    PARITY_MAP_CBOR_DIRECTORY_FIXED_UPPER_BOUND_BYTES
+        .checked_add(rows)
+        .ok_or_else(|| parity_map_parse("parity-map directory envelope overflows u64"))
+}
+
+/// Return a checked allocation-free upper bound for the canonical parity-map
+/// payload produced for `directory_entry_count` sidecars.
+pub fn parity_map_payload_len_upper_bound(directory_entry_count: u64) -> Result<u64, ParityError> {
+    let rows = directory_entry_count
+        .checked_mul(PARITY_MAP_CBOR_DIRECTORY_ENTRY_UPPER_BOUND_BYTES)
+        .ok_or_else(|| parity_map_parse("parity-map directory byte bound overflows u64"))?;
+    PARITY_MAP_CBOR_FIXED_UPPER_BOUND_BYTES
+        .checked_add(rows)
+        .ok_or_else(|| parity_map_parse("parity-map payload byte bound overflows u64"))
+}
+
 /// Directory flag: this sidecar protects a final partial epoch.
 pub const SIDECAR_DIRECTORY_FLAG_FINAL_PARTIAL_EPOCH: u32 = 0x01;
 
@@ -1811,6 +1852,54 @@ mod tests {
             writer_version: Some("test-writer".to_string()),
             write_timestamp: Some("2026-05-23T10:00:00Z".to_string()),
         }
+    }
+
+    #[test]
+    fn allocation_free_payload_bound_dominates_canonical_encoder() {
+        let mut payload = sample_payload();
+        payload.sequence = u32::MAX;
+        payload.writer_version = Some("v".repeat(128));
+        payload.write_timestamp = Some("2026-05-23T10:00:00.123456789+05:30".to_string());
+
+        let encoded = encode_parity_map_payload(&payload).expect("payload encodes");
+        let bound = parity_map_payload_len_upper_bound(payload.directory.entries.len() as u64)
+            .expect("bound is finite");
+        assert!(encoded.len() as u64 <= bound, "{} > {bound}", encoded.len());
+    }
+
+    #[test]
+    fn directory_row_bound_dominates_all_current_field_widths() {
+        let row = SidecarEpochDirectoryEntry {
+            tape_file_number: u32::MAX,
+            epoch_id: u64::MAX,
+            protected_ordinal_start: u64::MAX,
+            protected_ordinal_end_exclusive: u64::MAX,
+            sidecar_total_block_count: u64::MAX,
+            sidecar_header_block_count: u32::MAX,
+            parity_shard_block_count: u32::MAX,
+            canonical_metadata_hash: [0xff; 32],
+            flags: u32::MAX,
+        };
+        let mut encoded = Vec::new();
+        ciborium::into_writer(
+            &encode_sidecar_epoch_directory_entry_cbor(&row),
+            &mut encoded,
+        )
+        .expect("maximum-width row encodes");
+        assert!(
+            encoded.len() as u64 <= PARITY_MAP_CBOR_DIRECTORY_ENTRY_UPPER_BOUND_BYTES,
+            "{} > {}",
+            encoded.len(),
+            PARITY_MAP_CBOR_DIRECTORY_ENTRY_UPPER_BOUND_BYTES
+        );
+    }
+
+    #[test]
+    fn payload_bound_checks_row_multiplication_overflow() {
+        let overflowing_rows = u64::MAX / PARITY_MAP_CBOR_DIRECTORY_ENTRY_UPPER_BOUND_BYTES + 1;
+        let error = parity_map_payload_len_upper_bound(overflowing_rows)
+            .expect_err("row-byte multiplication must not wrap");
+        assert!(error.to_string().contains("overflows u64"));
     }
 
     fn sample_reference() -> ParityMapReference {

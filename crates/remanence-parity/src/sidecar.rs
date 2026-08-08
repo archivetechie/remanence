@@ -41,6 +41,149 @@ pub const PARITY_INDEX_ENTRY_LEN: usize = 16;
 /// Byte length of one packed data-shard CRC entry.
 pub const DATA_CRC_ENTRY_LEN: usize = 8;
 
+/// Allocation-free scalar layout for one sidecar header/index copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SidecarIndexCapacityLayout {
+    /// Exact header/index block count for one metadata copy.
+    pub block_count: u64,
+    /// Exact entry bytes stored after the fixed header in block zero.
+    pub inline_entry_bytes: u64,
+}
+
+/// Calculate the exact packed sidecar index geometry without iterating over or
+/// allocating entries.
+///
+/// The format writes 16-byte parity entries followed by 8-byte data-CRC
+/// entries, and no entry may cross the trailing eight-byte CRC region of a
+/// block.  Both the encoder and pre-write capacity projection use this scalar
+/// implementation.
+pub fn checked_sidecar_index_capacity_layout(
+    block_size: u64,
+    parity_entry_count: u64,
+    data_crc_entry_count: u64,
+) -> Result<SidecarIndexCapacityLayout, ParityError> {
+    let header_len = u64::try_from(SIDECAR_HEADER_LEN)
+        .map_err(|_| sidecar_parse("sidecar header length overflows u64"))?;
+    let trailing_crc_len = 8u64;
+    let minimum_block_size = header_len
+        .checked_add(trailing_crc_len)
+        .ok_or_else(|| sidecar_parse("sidecar minimum block size overflows u64"))?;
+    if block_size < minimum_block_size {
+        return Err(sidecar_parse(
+            "sidecar block_size smaller than header plus trailing CRC",
+        ));
+    }
+
+    let spill_capacity = block_size - trailing_crc_len;
+    let first_capacity = spill_capacity - header_len;
+    let initial = IndexPackingState {
+        block_count: 1,
+        remaining_bytes: first_capacity,
+        inline_entry_bytes: 0,
+        current_block_is_empty: true,
+    };
+    let after_parity = pack_index_segment(
+        initial,
+        spill_capacity,
+        parity_entry_count,
+        u64::try_from(PARITY_INDEX_ENTRY_LEN)
+            .map_err(|_| sidecar_parse("parity index entry length overflows u64"))?,
+    )?;
+    let after_data = pack_index_segment(
+        after_parity,
+        spill_capacity,
+        data_crc_entry_count,
+        u64::try_from(DATA_CRC_ENTRY_LEN)
+            .map_err(|_| sidecar_parse("data CRC entry length overflows u64"))?,
+    )?;
+    Ok(SidecarIndexCapacityLayout {
+        block_count: after_data.block_count,
+        inline_entry_bytes: after_data.inline_entry_bytes,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct IndexPackingState {
+    block_count: u64,
+    remaining_bytes: u64,
+    inline_entry_bytes: u64,
+    current_block_is_empty: bool,
+}
+
+fn pack_index_segment(
+    state: IndexPackingState,
+    spill_capacity: u64,
+    entry_count: u64,
+    entry_len: u64,
+) -> Result<IndexPackingState, ParityError> {
+    if entry_count == 0 {
+        return Ok(state);
+    }
+    if entry_len == 0 || spill_capacity / entry_len == 0 {
+        return Err(sidecar_parse(
+            "sidecar block_size cannot hold a complete index entry",
+        ));
+    }
+
+    let entries_here = entry_count.min(state.remaining_bytes / entry_len);
+    if entries_here == 0 && state.current_block_is_empty {
+        return Err(sidecar_parse(format!(
+            "sidecar block_size cannot hold a {entry_len}-byte index entry"
+        )));
+    }
+    let bytes_here = entries_here
+        .checked_mul(entry_len)
+        .ok_or_else(|| sidecar_parse("sidecar packed entry bytes overflow u64"))?;
+    let remaining_count = entry_count - entries_here;
+    let remaining_bytes = state.remaining_bytes - bytes_here;
+    let inline_entry_bytes = if state.block_count == 1 {
+        state
+            .inline_entry_bytes
+            .checked_add(bytes_here)
+            .ok_or_else(|| sidecar_parse("sidecar inline index bytes overflow u64"))?
+    } else {
+        state.inline_entry_bytes
+    };
+    if remaining_count == 0 {
+        return Ok(IndexPackingState {
+            block_count: state.block_count,
+            remaining_bytes,
+            inline_entry_bytes,
+            current_block_is_empty: false,
+        });
+    }
+
+    let entries_per_spill = spill_capacity / entry_len;
+    let complete_spill_blocks = remaining_count / entries_per_spill;
+    let partial_spill_block = u64::from(remaining_count % entries_per_spill != 0);
+    let added_blocks = complete_spill_blocks
+        .checked_add(partial_spill_block)
+        .ok_or_else(|| sidecar_parse("sidecar added index blocks overflow u64"))?;
+    let block_count = state
+        .block_count
+        .checked_add(added_blocks)
+        .ok_or_else(|| sidecar_parse("sidecar index block count overflows u64"))?;
+    let entries_before_last = added_blocks
+        .checked_sub(1)
+        .and_then(|blocks| blocks.checked_mul(entries_per_spill))
+        .ok_or_else(|| sidecar_parse("sidecar last-block entry offset overflows u64"))?;
+    let entries_in_last = remaining_count
+        .checked_sub(entries_before_last)
+        .ok_or_else(|| sidecar_parse("sidecar last-block entry count underflows"))?;
+    let bytes_in_last = entries_in_last
+        .checked_mul(entry_len)
+        .ok_or_else(|| sidecar_parse("sidecar last-block entry bytes overflow u64"))?;
+    let remaining_bytes = spill_capacity
+        .checked_sub(bytes_in_last)
+        .ok_or_else(|| sidecar_parse("sidecar last-block remaining bytes underflow"))?;
+    Ok(IndexPackingState {
+        block_count,
+        remaining_bytes,
+        inline_entry_bytes,
+        current_block_is_empty: false,
+    })
+}
+
 const SIDECAR_MAGIC_MESSAGE: &[u8] = b"REM\x00PAR\x01";
 const SIDECAR_FOOTER_MAGIC_MESSAGE: &[u8] = b"REM\x00PARFOOT\x01";
 const SIDECAR_METADATA_HASH_DOMAIN: &[u8] = b"remanence-sidecar-metadata-v1";
@@ -1469,44 +1612,16 @@ fn compute_index_layout(
     parity_count: usize,
     data_count: usize,
 ) -> Result<(u32, u32), ParityError> {
-    if block_size < SIDECAR_HEADER_LEN + 8 {
-        return Err(sidecar_parse(
-            "sidecar block_size smaller than header plus trailing CRC",
-        ));
-    }
-    let limit = block_size - 8;
-    let mut block_index = 0usize;
-    let mut offset = SIDECAR_HEADER_LEN;
-    let mut inline = 0usize;
-
-    for kind in entry_kinds(parity_count, data_count) {
-        let len = entry_len(kind);
-        if len > limit {
-            return Err(sidecar_parse(format!(
-                "sidecar block_size {block_size} cannot hold a {len}-byte index entry"
-            )));
-        }
-        if offset + len > limit {
-            if offset == block_start(block_index) {
-                return Err(sidecar_parse(format!(
-                    "sidecar block_size {block_size} cannot hold a {len}-byte index entry"
-                )));
-            }
-            if block_index == 0 {
-                inline = offset - SIDECAR_HEADER_LEN;
-            }
-            block_index += 1;
-            offset = 0;
-        }
-        offset += len;
-    }
-    if block_index == 0 {
-        inline = offset - SIDECAR_HEADER_LEN;
-    }
-
-    let h = u32::try_from(block_index + 1)
+    let layout = checked_sidecar_index_capacity_layout(
+        u64::try_from(block_size).map_err(|_| sidecar_parse("sidecar block size overflows u64"))?,
+        u64::try_from(parity_count)
+            .map_err(|_| sidecar_parse("sidecar parity entry count overflows u64"))?,
+        u64::try_from(data_count)
+            .map_err(|_| sidecar_parse("sidecar data CRC count overflows u64"))?,
+    )?;
+    let h = u32::try_from(layout.block_count)
         .map_err(|_| sidecar_parse("sidecar index block count overflows u32"))?;
-    let inline = u32::try_from(inline)
+    let inline = u32::try_from(layout.inline_entry_bytes)
         .map_err(|_| sidecar_parse("sidecar inline index byte count overflows u32"))?;
     Ok((h, inline))
 }
@@ -1624,6 +1739,87 @@ fn sidecar_parse(message: impl Into<String>) -> ParityError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reference_index_layout(
+        block_size: usize,
+        parity_count: usize,
+        data_count: usize,
+    ) -> Result<(u32, u32), ParityError> {
+        if block_size < SIDECAR_HEADER_LEN + 8 {
+            return Err(sidecar_parse(
+                "sidecar block_size smaller than header plus trailing CRC",
+            ));
+        }
+        let limit = block_size - 8;
+        let mut block_index = 0usize;
+        let mut offset = SIDECAR_HEADER_LEN;
+        let mut inline = 0usize;
+        for kind in entry_kinds(parity_count, data_count) {
+            let len = entry_len(kind);
+            if len > limit {
+                return Err(sidecar_parse("index entry exceeds block payload"));
+            }
+            if offset + len > limit {
+                if offset == block_start(block_index) {
+                    return Err(sidecar_parse("index entry does not fit an empty block"));
+                }
+                if block_index == 0 {
+                    inline = offset - SIDECAR_HEADER_LEN;
+                }
+                block_index += 1;
+                offset = 0;
+            }
+            offset += len;
+        }
+        if block_index == 0 {
+            inline = offset - SIDECAR_HEADER_LEN;
+        }
+        Ok(((block_index + 1) as u32, inline as u32))
+    }
+
+    #[test]
+    fn scalar_capacity_layout_matches_entry_packing_at_boundaries() {
+        for block_size in [191usize, 192, 200, 256, 512, 256 * 1024] {
+            for parity_count in 0..80usize {
+                for data_count in 0..80usize {
+                    let expected = reference_index_layout(block_size, parity_count, data_count);
+                    let actual = checked_sidecar_index_capacity_layout(
+                        block_size as u64,
+                        parity_count as u64,
+                        data_count as u64,
+                    )
+                    .map(|layout| {
+                        (
+                            u32::try_from(layout.block_count).unwrap(),
+                            u32::try_from(layout.inline_entry_bytes).unwrap(),
+                        )
+                    });
+                    assert_eq!(
+                        actual.is_ok(),
+                        expected.is_ok(),
+                        "result mismatch for B={block_size}, P={parity_count}, D={data_count}"
+                    );
+                    if let (Ok(actual), Ok(expected)) = (actual, expected) {
+                        assert_eq!(
+                            actual, expected,
+                            "layout mismatch for B={block_size}, P={parity_count}, D={data_count}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_capacity_layout_pins_default_256k_profile() {
+        let layout = checked_sidecar_index_capacity_layout(256 * 1024, 512 * 4, 512 * 128)
+            .expect("default profile must have a finite index layout");
+        assert_eq!(layout.block_count, 3);
+        assert_eq!(
+            layout.inline_entry_bytes,
+            256 * 1024 - 8 - SIDECAR_HEADER_LEN as u64
+        );
+    }
 
     fn sample_uuid() -> [u8; 16] {
         [

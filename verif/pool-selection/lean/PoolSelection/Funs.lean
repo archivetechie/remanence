@@ -16,28 +16,105 @@ set_option maxRecDepth 2048
 namespace PoolSelection
 
 /-- [pool_selection_verif::{impl core::clone::Clone for pool_selection_verif::TapeFitState}::clone]:
-    Source: 'src/lib.rs', lines 14:9-14:14
+    Source: 'src/lib.rs', lines 16:9-16:14
     Visibility: public -/
 def TapeFitState.Insts.CoreCloneClone.clone
   (self : TapeFitState) : Result TapeFitState := do
   ok self
 
 /-- Trait implementation: [pool_selection_verif::{impl core::clone::Clone for pool_selection_verif::TapeFitState}]
-    Source: 'src/lib.rs', lines 14:9-14:14 -/
+    Source: 'src/lib.rs', lines 16:9-16:14 -/
 @[reducible]
 def TapeFitState.Insts.CoreCloneClone : core.clone.Clone TapeFitState := {
   clone := TapeFitState.Insts.CoreCloneClone.clone
 }
 
 /-- Trait implementation: [pool_selection_verif::{impl core::marker::Copy for pool_selection_verif::TapeFitState}]
-    Source: 'src/lib.rs', lines 14:16-14:20 -/
+    Source: 'src/lib.rs', lines 16:16-16:20 -/
 @[reducible]
 def TapeFitState.Insts.CoreMarkerCopy : core.marker.Copy TapeFitState := {
   cloneInst := TapeFitState.Insts.CoreCloneClone
 }
 
+/-- [pool_selection_verif::{impl core::clone::Clone for pool_selection_verif::AdmissionDisposition}::clone]:
+    Source: 'src/lib.rs', lines 27:9-27:14
+    Visibility: public -/
+def AdmissionDisposition.Insts.CoreCloneClone.clone
+  (self : AdmissionDisposition) : Result AdmissionDisposition := do
+  ok self
+
+/-- Trait implementation: [pool_selection_verif::{impl core::clone::Clone for pool_selection_verif::AdmissionDisposition}]
+    Source: 'src/lib.rs', lines 27:9-27:14 -/
+@[reducible]
+def AdmissionDisposition.Insts.CoreCloneClone : core.clone.Clone
+  AdmissionDisposition := {
+  clone := AdmissionDisposition.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [pool_selection_verif::{impl core::marker::Copy for pool_selection_verif::AdmissionDisposition}]
+    Source: 'src/lib.rs', lines 27:16-27:20 -/
+@[reducible]
+def AdmissionDisposition.Insts.CoreMarkerCopy : core.marker.Copy
+  AdmissionDisposition := {
+  cloneInst := AdmissionDisposition.Insts.CoreCloneClone
+}
+
+/-- [pool_selection_verif::{impl core::clone::Clone for pool_selection_verif::CapacityAdmissionInput}::clone]:
+    Source: 'src/lib.rs', lines 36:9-36:14
+    Visibility: public -/
+def CapacityAdmissionInput.Insts.CoreCloneClone.clone
+  (self : CapacityAdmissionInput) : Result CapacityAdmissionInput := do
+  ok self
+
+/-- Trait implementation: [pool_selection_verif::{impl core::clone::Clone for pool_selection_verif::CapacityAdmissionInput}]
+    Source: 'src/lib.rs', lines 36:9-36:14 -/
+@[reducible]
+def CapacityAdmissionInput.Insts.CoreCloneClone : core.clone.Clone
+  CapacityAdmissionInput := {
+  clone := CapacityAdmissionInput.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [pool_selection_verif::{impl core::marker::Copy for pool_selection_verif::CapacityAdmissionInput}]
+    Source: 'src/lib.rs', lines 36:16-36:20 -/
+@[reducible]
+def CapacityAdmissionInput.Insts.CoreMarkerCopy : core.marker.Copy
+  CapacityAdmissionInput := {
+  cloneInst := CapacityAdmissionInput.Insts.CoreCloneClone
+}
+
+/-- [pool_selection_verif::capacity_admission_disposition]:
+    Source: 'src/lib.rs', lines 47:0-75:1
+    Visibility: public -/
+def capacity_admission_disposition
+  (input : CapacityAdmissionInput) : Result AdmissionDisposition := do
+  if input.low_watermark_blocks > input.high_watermark_blocks
+  then ok AdmissionDisposition.RejectInvalidCapacityPolicy
+  else
+    if input.high_watermark_blocks > input.capacity_blocks
+    then ok AdmissionDisposition.RejectInvalidCapacityPolicy
+    else
+      let o ←
+        lift (U64.checked_add input.current_used_blocks
+          input.object_commit_charge_blocks)
+      match o with
+      | none => ok AdmissionDisposition.FinalizePrefixAndRetry
+      | some value =>
+        if value > input.high_watermark_blocks
+        then ok AdmissionDisposition.FinalizePrefixAndRetry
+        else
+          let o1 ← lift (U64.checked_add value input.close_bound_blocks)
+          match o1 with
+          | none => ok AdmissionDisposition.FinalizePrefixAndRetry
+          | some value1 =>
+            if value1 > input.capacity_blocks
+            then ok AdmissionDisposition.FinalizePrefixAndRetry
+            else
+              if value < input.low_watermark_blocks
+              then ok AdmissionDisposition.AdmitRemainOpen
+              else ok AdmissionDisposition.AdmitThenFinalize
+
 /-- [pool_selection_verif::loaded_key]:
-    Source: 'src/lib.rs', lines 25:0-31:1
+    Source: 'src/lib.rs', lines 77:0-83:1
     Visibility: public -/
 def loaded_key (candidate : TapeFitState) : Result Std.U8 := do
   if candidate.already_loaded
@@ -45,7 +122,7 @@ def loaded_key (candidate : TapeFitState) : Result Std.U8 := do
   else ok 1#u8
 
 /-- [pool_selection_verif::fits]:
-    Source: 'src/lib.rs', lines 33:0-38:1
+    Source: 'src/lib.rs', lines 85:0-90:1
     Visibility: public -/
 def fits
   (candidate : TapeFitState) (projected_footprint : Std.U64) :
@@ -57,7 +134,7 @@ def fits
   | some remaining => ok (remaining >= projected_footprint)
 
 /-- [pool_selection_verif::completes_tape]:
-    Source: 'src/lib.rs', lines 40:0-42:1
+    Source: 'src/lib.rs', lines 92:0-94:1
     Visibility: public -/
 def completes_tape
   (candidate : TapeFitState) (projected_footprint : Std.U64) :
@@ -68,7 +145,7 @@ def completes_tape
   ok (i >= candidate.low_bytes)
 
 /-- [pool_selection_verif::leftover_after_write]:
-    Source: 'src/lib.rs', lines 44:0-49:1
+    Source: 'src/lib.rs', lines 96:0-101:1
     Visibility: public -/
 def leftover_after_write
   (candidate : TapeFitState) (projected_footprint : Std.U64) :
@@ -80,7 +157,7 @@ def leftover_after_write
   ok (core.num.U64.saturating_sub i projected_footprint)
 
 /-- [pool_selection_verif::complete_or_fill_completing_precedes_or_ties]:
-    Source: 'src/lib.rs', lines 51:0-82:1
+    Source: 'src/lib.rs', lines 103:0-134:1
     Visibility: public -/
 def complete_or_fill_completing_precedes_or_ties
   (left : TapeFitState) (right : TapeFitState) (projected_footprint : Std.U64)
@@ -111,7 +188,7 @@ def complete_or_fill_completing_precedes_or_ties
             else ok (left.tape_uuid <= right.tape_uuid)
 
 /-- [pool_selection_verif::complete_or_fill_fill_precedes_or_ties]:
-    Source: 'src/lib.rs', lines 84:0-102:1
+    Source: 'src/lib.rs', lines 136:0-154:1
     Visibility: public -/
 def complete_or_fill_fill_precedes_or_ties
   (left : TapeFitState) (right : TapeFitState) : Result Bool := do
@@ -131,7 +208,7 @@ def complete_or_fill_fill_precedes_or_ties
         else ok (left.tape_uuid <= right.tape_uuid)
 
 /-- [pool_selection_verif::fill_oldest_precedes_or_ties]:
-    Source: 'src/lib.rs', lines 104:0-122:1
+    Source: 'src/lib.rs', lines 156:0-174:1
     Visibility: public -/
 def fill_oldest_precedes_or_ties
   (left : TapeFitState) (right : TapeFitState) : Result Bool := do

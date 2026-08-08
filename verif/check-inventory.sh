@@ -86,6 +86,9 @@ if ((${#proof_crates[@]} == 0)); then
     exit 1
 fi
 
+run_in_dir "fresh Charon+Aeneas generated-Lean comparison" "$ROOT_DIR" \
+    bash "$VERIF_DIR/check-generated-lean.sh"
+
 for crate_dir in "${proof_crates[@]}"; do
     crate_name="$(basename "$crate_dir")"
 

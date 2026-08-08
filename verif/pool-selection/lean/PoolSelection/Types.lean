@@ -15,7 +15,7 @@ set_option maxRecDepth 2048
 namespace PoolSelection
 
 /-- [pool_selection_verif::TapeFitState]
-    Source: 'src/lib.rs', lines 16:0-23:1
+    Source: 'src/lib.rs', lines 18:0-25:1
     Visibility: public -/
 structure TapeFitState where
   tape_uuid : Std.U64
@@ -24,5 +24,26 @@ structure TapeFitState where
   used_bytes : Std.U64
   usable_bytes : Std.U64
   low_bytes : Std.U64
+
+/-- [pool_selection_verif::AdmissionDisposition]
+    Source: 'src/lib.rs', lines 29:0-34:1
+    Visibility: public -/
+@[discriminant isize]
+inductive AdmissionDisposition where
+| AdmitRemainOpen : AdmissionDisposition
+| AdmitThenFinalize : AdmissionDisposition
+| FinalizePrefixAndRetry : AdmissionDisposition
+| RejectInvalidCapacityPolicy : AdmissionDisposition
+
+/-- [pool_selection_verif::CapacityAdmissionInput]
+    Source: 'src/lib.rs', lines 38:0-45:1
+    Visibility: public -/
+structure CapacityAdmissionInput where
+  current_used_blocks : Std.U64
+  object_commit_charge_blocks : Std.U64
+  close_bound_blocks : Std.U64
+  capacity_blocks : Std.U64
+  low_watermark_blocks : Std.U64
+  high_watermark_blocks : Std.U64
 
 end PoolSelection

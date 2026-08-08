@@ -9,3 +9,6 @@ description = "Standalone extraction of remanence parity capacity reserve arithm
 [workspace]
 
 [dependencies]
+
+[dev-dependencies]
+remanence-parity = { path = "../../crates/remanence-parity" }
