@@ -83,6 +83,8 @@ impl RawReadOutcome {
 pub enum RawWriteOutcome {
     /// A fixed-size data block was written.
     WroteBlock {
+        /// Bytes physically credited by the underlying write completion.
+        bytes_written: u32,
         /// Physical position immediately after the block.
         position_after: PhysicalPositionHint,
         /// True when the drive reported programmable early warning.
@@ -761,7 +763,28 @@ impl<'a> DriveHandleRawSink<'a> {
 impl RawTapeSink for DriveHandleRawSink<'_> {
     fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
         let position_before = self.current_or_seed_position()?;
-        let outcome = self.drive.write_block_unpositioned(buf)?;
+        let outcome = match self.drive.write_block_unpositioned(buf) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.cursor_hint = None;
+                return Err(err.into());
+            }
+        };
+        let requested_bytes = u32::try_from(buf.len())
+            .map_err(|_| ParityError::Invariant("raw fixed-block write length exceeds u32"))?;
+        if outcome.bytes_written != requested_bytes {
+            self.cursor_hint = None;
+            return Err(ParityError::TapeIo(
+                TapeIoError::PartialBatchUncommittable {
+                    requested_records: 1,
+                    written_records: u32::from(outcome.bytes_written >= requested_bytes),
+                    requested_bytes: u64::from(requested_bytes),
+                    written_bytes: u64::from(outcome.bytes_written),
+                    end_of_medium: outcome.end_of_medium,
+                    sense: None,
+                },
+            ));
+        }
         let position_after = PhysicalPositionHint {
             lba: position_before
                 .lba
@@ -878,6 +901,7 @@ impl RawTapeSource for DriveHandleRawSource<'_> {
 
 fn raw_block_outcome(outcome: WriteOutcome) -> RawWriteOutcome {
     RawWriteOutcome::WroteBlock {
+        bytes_written: outcome.bytes_written,
         position_after: outcome.position_after.into(),
         early_warning: outcome.early_warning,
         end_of_medium: outcome.end_of_medium,
@@ -889,6 +913,7 @@ fn raw_unpositioned_block_outcome(
     position_after: PhysicalPositionHint,
 ) -> RawWriteOutcome {
     RawWriteOutcome::WroteBlock {
+        bytes_written: outcome.bytes_written,
         position_after,
         early_warning: outcome.early_warning,
         end_of_medium: outcome.end_of_medium,
@@ -955,11 +980,68 @@ mod compat_tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
+    use remanence_library::transport::{TimeoutClass, TransferOutcome};
     use remanence_library::{
         DriveBay, ElementLayout, FixtureTransport, IdentitySource, IePort, InstalledDrive,
         IoErrorKind, Library, RecordingLog, RecordingTransport, SgTransport, Slot, StaticAllowlist,
         VecBlockSink, VecBlockSource, VecBlockSourceCall,
     };
+
+    type TestTransportFactory = Box<dyn FnMut(&Path) -> Result<Box<dyn SgTransport>, IoErrorKind>>;
+
+    struct ShortFirstWriteTransport {
+        inner: FixtureTransport,
+        bytes_transferred: u32,
+        write_returned_short: bool,
+    }
+
+    impl ShortFirstWriteTransport {
+        fn new(inner: FixtureTransport, bytes_transferred: u32) -> Self {
+            Self {
+                inner,
+                bytes_transferred,
+                write_returned_short: false,
+            }
+        }
+    }
+
+    impl SgTransport for ShortFirstWriteTransport {
+        fn execute_in(
+            &mut self,
+            cdb: &[u8],
+            buf: &mut [u8],
+        ) -> Result<TransferOutcome, remanence_library::ScsiError> {
+            self.inner.execute_in(cdb, buf)
+        }
+
+        fn execute_none(&mut self, cdb: &[u8]) -> Result<(), remanence_library::ScsiError> {
+            SgTransport::execute_none(&mut self.inner, cdb)
+        }
+
+        fn execute_out(
+            &mut self,
+            cdb: &[u8],
+            buf: &[u8],
+        ) -> Result<TransferOutcome, remanence_library::ScsiError> {
+            if cdb.first() == Some(&0x0A) && !self.write_returned_short {
+                self.write_returned_short = true;
+                self.inner.cdb_log.push(cdb.to_vec());
+                return Ok(TransferOutcome::clean(self.bytes_transferred));
+            }
+            SgTransport::execute_out(&mut self.inner, cdb, buf)
+        }
+
+        fn set_timeout_for(&mut self, class: TimeoutClass) {
+            self.inner.set_timeout_for(class);
+        }
+
+        fn configure_reserved_buffer(
+            &mut self,
+            requested_bytes: u32,
+        ) -> Result<u32, remanence_library::ScsiError> {
+            self.inner.configure_reserved_buffer(requested_bytes)
+        }
+    }
 
     #[test]
     fn block_sink_adapter_writes_single_filemark_boundary() {
@@ -978,6 +1060,7 @@ mod compat_tests {
         assert_eq!(
             block_outcome,
             RawWriteOutcome::WroteBlock {
+                bytes_written: 4,
                 position_after: PhysicalPositionHint::new(1),
                 early_warning: false,
                 end_of_medium: false,
@@ -995,6 +1078,60 @@ mod compat_tests {
         assert_eq!(sink.blocks, vec![vec![0xAB; 4]]);
         assert_eq!(sink.filemarks, vec![1]);
         assert_eq!(sink.next_lba(), 2);
+    }
+
+    #[test]
+    fn block_sink_adapter_preserves_nonexact_physical_byte_count() {
+        struct NonExactBlockSink {
+            inner: VecBlockSink,
+            reported_bytes: u32,
+        }
+
+        impl BlockSink for NonExactBlockSink {
+            fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
+                let outcome = self.inner.write_block(buf)?;
+                Ok(WriteOutcome::from_computed_position(
+                    self.reported_bytes,
+                    outcome.early_warning,
+                    outcome.end_of_medium,
+                    outcome.position_after,
+                ))
+            }
+
+            fn write_filemarks(
+                &mut self,
+                count: u32,
+            ) -> Result<WriteFilemarksOutcome, TapeIoError> {
+                self.inner.write_filemarks(count)
+            }
+
+            fn position(&mut self) -> Result<TapePosition, TapeIoError> {
+                self.inner.position()
+            }
+        }
+
+        for reported_bytes in [3, 5] {
+            let mut sink = NonExactBlockSink {
+                inner: VecBlockSink::new(),
+                reported_bytes,
+            };
+            let outcome = {
+                let mut raw = BlockSinkRawTapeSink::new(&mut sink);
+                raw.write_fixed_block(&[0xAB; 4])
+                    .expect("compatibility adapter returns the physical outcome")
+            };
+
+            assert!(matches!(
+                outcome,
+                RawWriteOutcome::WroteBlock {
+                    bytes_written,
+                    position_after,
+                    early_warning: false,
+                    end_of_medium: false,
+                } if bytes_written == reported_bytes
+                    && position_after == PhysicalPositionHint::new(1)
+            ));
+        }
     }
 
     fn vpd80_response(serial: &str) -> Vec<u8> {
@@ -1106,16 +1243,15 @@ mod compat_tests {
             .into_iter()
             .map(|(path, responses)| (path, FixtureTransport::new().with_responses(responses)))
             .collect();
-        let factory: Box<dyn FnMut(&Path) -> Result<Box<dyn SgTransport>, IoErrorKind>> =
-            Box::new(move |path: &Path| {
-                let inner = bag.remove(path).ok_or_else(|| IoErrorKind {
-                    kind: "NotFound",
-                    message: format!("no fixture transport seeded for {path:?}"),
-                    raw_os_error: None,
-                })?;
-                let wrapped = RecordingTransport::with_log(inner, log_cl.clone());
-                Ok(Box::new(wrapped) as Box<dyn SgTransport>)
-            });
+        let factory: TestTransportFactory = Box::new(move |path: &Path| {
+            let inner = bag.remove(path).ok_or_else(|| IoErrorKind {
+                kind: "NotFound",
+                message: format!("no fixture transport seeded for {path:?}"),
+                raw_os_error: None,
+            })?;
+            let wrapped = RecordingTransport::with_log(inner, log_cl.clone());
+            Ok(Box::new(wrapped) as Box<dyn SgTransport>)
+        });
         (factory, log)
     }
 
@@ -1354,6 +1490,74 @@ mod compat_tests {
     }
 
     #[test]
+    fn drive_handle_raw_sink_rejects_short_write_and_discards_cursor_hint() {
+        let lib = open_drive_test_lib("LIB_RAW_WR02");
+        let policy = StaticAllowlist::new(["LIB_RAW_WR02"]);
+        let log = RecordingLog::new();
+        let log_cl = log.clone();
+        let mut transports: HashMap<PathBuf, Box<dyn SgTransport>> =
+            HashMap::from([
+                (
+                    PathBuf::from("/dev/sg-mock"),
+                    Box::new(FixtureTransport::new().with_responses([
+                        changer_inquiry_response(),
+                        vpd80_response("LIB_RAW_WR02"),
+                    ])) as Box<dyn SgTransport>,
+                ),
+                (
+                    PathBuf::from("/dev/sg-drive-mock"),
+                    Box::new(ShortFirstWriteTransport::new(
+                        FixtureTransport::new().with_responses([
+                            lto9_inquiry_response(),
+                            vpd80_response("DRV_A"),
+                            read_position_long_response(0, 0, 10),
+                            read_position_long_response(0, 0, 50),
+                        ]),
+                        1023,
+                    )) as Box<dyn SgTransport>,
+                ),
+            ]);
+        let factory: TestTransportFactory = Box::new(move |path: &Path| {
+            let inner = transports.remove(path).ok_or_else(|| IoErrorKind {
+                kind: "NotFound",
+                message: format!("no fixture transport seeded for {path:?}"),
+                raw_os_error: None,
+            })?;
+            Ok(Box::new(RecordingTransport::with_log(
+                inner,
+                log_cl.clone(),
+            )))
+        });
+        let mut handle = lib.open_with(&policy, factory).expect("library opens");
+
+        let position_after_failure = {
+            let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+            let mut raw = DriveHandleRawSink::new(&mut drive);
+            let err = raw
+                .write_fixed_block(&[0xAA; 1024])
+                .expect_err("short physical completion must fail");
+            assert!(matches!(
+                err,
+                ParityError::TapeIo(TapeIoError::PartialBatchUncommittable {
+                    requested_records: 1,
+                    written_records: 0,
+                    requested_bytes: 1024,
+                    written_bytes: 1023,
+                    ..
+                })
+            ));
+            raw.position()
+                .expect("position after failure must query the drive again")
+        };
+
+        assert_eq!(position_after_failure, PhysicalPositionHint::new(50));
+        let log = log.borrow();
+        assert_eq!(log.iter().filter(|cdb| cdb[0] == 0x34).count(), 2);
+        assert_eq!(log.iter().filter(|cdb| cdb[0] == 0x0A).count(), 1);
+        assert!(!handle.is_dirty());
+    }
+
+    #[test]
     fn drive_handle_raw_source_seeds_position_once_for_sequential_block_reads() {
         let lib = open_drive_test_lib("LIB_RAW_RD01");
         let policy = StaticAllowlist::new(["LIB_RAW_RD01"]);
@@ -1426,11 +1630,12 @@ mod compat_tests {
     }
 
     impl RawTapeSink for DurabilityMockRawTapeSink {
-        fn write_fixed_block(&mut self, _buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
+        fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
             self.position += 1;
             self.pending_file_started = true;
             self.barrier_ready = false;
             Ok(RawWriteOutcome::WroteBlock {
+                bytes_written: u32::try_from(buf.len()).expect("test block length fits u32"),
                 position_after: PhysicalPositionHint::new(self.position),
                 early_warning: false,
                 end_of_medium: false,

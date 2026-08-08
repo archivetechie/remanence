@@ -1048,7 +1048,17 @@ fn write_rebuilt_sidecar_to_raw(
                 "resume sidecar {tape_file_number} block {block_index} write failed before filemark: {err}"
             ))
         })? {
-            RawWriteOutcome::WroteBlock { end_of_medium, .. } => {
+            RawWriteOutcome::WroteBlock {
+                bytes_written,
+                end_of_medium,
+                ..
+            } => {
+                if bytes_written as usize != block.len() {
+                    return Err(resume_error(format!(
+                        "resume sidecar {tape_file_number} block {block_index} completed with {bytes_written} bytes, expected {}; filemark and catalog commit are forbidden",
+                        block.len()
+                    )));
+                }
                 if end_of_medium {
                     return Err(resume_error(format!(
                         "resume sidecar {tape_file_number} block {block_index} reached end-of-medium before filemark; catalog commit is forbidden"
@@ -1236,6 +1246,7 @@ mod tests {
         block_writes: usize,
         eom_on_block: Option<usize>,
         ew_on_block: Option<usize>,
+        reported_bytes_on_block: Option<(usize, u32)>,
         filemark_writes: usize,
         eom_on_filemark: Option<usize>,
         ew_on_filemark: Option<usize>,
@@ -1283,6 +1294,7 @@ mod tests {
                 block_writes: 0,
                 eom_on_block: None,
                 ew_on_block: None,
+                reported_bytes_on_block: None,
                 filemark_writes: 0,
                 eom_on_filemark: None,
                 ew_on_filemark: None,
@@ -1301,6 +1313,11 @@ mod tests {
 
         fn with_early_warning_on_block(mut self, block_index: usize) -> Self {
             self.ew_on_block = Some(block_index);
+            self
+        }
+
+        fn with_reported_bytes_on_block(mut self, block_index: usize, bytes: u32) -> Self {
+            self.reported_bytes_on_block = Some((block_index, bytes));
             self
         }
 
@@ -1385,9 +1402,17 @@ mod tests {
             if hit_ew {
                 self.ew_blocks_seen.push(self.block_writes);
             }
+            let bytes_written = self
+                .reported_bytes_on_block
+                .filter(|(block_index, _)| *block_index == self.block_writes)
+                .map_or_else(
+                    || u32::try_from(buf.len()).expect("test block length fits u32"),
+                    |(_, bytes)| bytes,
+                );
             self.block_writes += 1;
             self.cursor += 1;
             Ok(RawWriteOutcome::WroteBlock {
+                bytes_written,
                 position_after: PhysicalPositionHint::new(self.cursor),
                 early_warning: hit_ew,
                 end_of_medium: hit_eom,
@@ -2746,6 +2771,58 @@ mod tests {
                 RawSinkEvent::WriteBlock(RESUME_TEST_BLOCK_SIZE as usize),
             ]
         );
+    }
+
+    #[test]
+    fn emit_resume_rebuilt_sidecars_forbids_commit_on_nonexact_block_write() {
+        for reported_bytes in [RESUME_TEST_BLOCK_SIZE - 1, RESUME_TEST_BLOCK_SIZE + 1] {
+            let map = resume_test_map();
+            let mut raw_source = raw_source_for_resume_map(&map, 4, 10);
+            let rebuild = rebuild_legacy_forensic_open_epoch_from_committed_prefix(
+                &mut raw_source,
+                &map,
+                &rebuild_scheme(),
+                [0x33; 16],
+                RESUME_TEST_BLOCK_SIZE,
+            )
+            .expect("resume rebuild succeeds");
+            let mut raw_sink = RecordingResumeRawSink::at_position(rebuild.plan.append_position)
+                .with_reported_bytes_on_block(0, reported_bytes);
+            let events = raw_sink.events();
+
+            let err = emit_resume_rebuilt_sidecars_to_raw_without_journal(
+                &mut raw_sink,
+                rebuild.plan,
+                &rebuild.rebuilt_sidecars,
+                [0x33; 16],
+                |sidecar| {
+                    events.borrow_mut().push(RawSinkEvent::Commit(
+                        sidecar.tape_file_number,
+                        sidecar.filemark_outcome.position_after.lba,
+                    ));
+                    Ok(())
+                },
+            )
+            .expect_err("nonexact resume block must stop before filemark and commit");
+
+            match err {
+                ParityError::ResumeAppend(message) => {
+                    assert!(message.contains("completed with"), "{message}");
+                    assert!(
+                        message.contains("filemark and catalog commit are forbidden"),
+                        "{message}"
+                    );
+                }
+                other => panic!("expected resume append error, got {other:?}"),
+            }
+            assert_eq!(
+                &*events.borrow(),
+                &[
+                    RawSinkEvent::Position(16),
+                    RawSinkEvent::WriteBlock(RESUME_TEST_BLOCK_SIZE as usize),
+                ]
+            );
+        }
     }
 
     #[test]

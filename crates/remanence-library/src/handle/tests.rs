@@ -3143,6 +3143,106 @@ fn fixed_batch_good_short_residual_is_uncommittable_before_cursor_advance() {
 }
 
 #[test]
+fn unpositioned_write_rejects_nonexact_bytes_before_success_audit() {
+    let config = TapeIoRuntimeConfig::default();
+    for (serial, script, expect_sense, reported_bytes) in [
+        (
+            "LIB_SHORT_GOOD_UNPOSITIONED",
+            HotWriteScript::CleanWithBytes(15),
+            false,
+            15,
+        ),
+        (
+            "LIB_SHORT_EW_UNPOSITIONED",
+            HotWriteScript::CheckConditionWithBytes(current_sense(0x00, 0x40, 0, 0), 15),
+            true,
+            15,
+        ),
+        (
+            "LIB_OVERLONG_GOOD_UNPOSITIONED",
+            HotWriteScript::CleanWithBytes(17),
+            false,
+            17,
+        ),
+        (
+            "LIB_OVERLONG_EW_UNPOSITIONED",
+            HotWriteScript::CheckConditionWithBytes(current_sense(0x00, 0x40, 0, 0), 17),
+            true,
+            17,
+        ),
+    ] {
+        let (mut drive, _, audit) = open_hot_script_drive(serial, [], [script], config);
+        let error = drive
+            .write_block_unpositioned(&[0xA5; 16])
+            .expect_err("nonexact unpositioned completion must fail");
+
+        match error {
+            TapeIoError::PartialBatchUncommittable {
+                requested_records,
+                written_records,
+                requested_bytes,
+                written_bytes,
+                end_of_medium,
+                sense,
+            } => {
+                assert_eq!(requested_records, 1);
+                assert_eq!(written_records, u32::from(reported_bytes >= 16));
+                assert_eq!(requested_bytes, 16);
+                assert_eq!(written_bytes, reported_bytes);
+                assert!(!end_of_medium);
+                assert_eq!(sense.is_some(), expect_sense);
+            }
+            other => panic!("expected partial completion error, got {other:?}"),
+        }
+        assert!(drive.expected_position.is_none());
+        assert!(!drive.position_known);
+        let events = audit.lock().expect("audit events");
+        assert!(matches!(
+            events.as_slice(),
+            [
+                CapturedEvent::Started {
+                    op: AuditOp::TapeWrite { len: 16, .. },
+                    ..
+                },
+                CapturedEvent::FinishedScsiError {
+                    op: AuditOp::TapeWrite { len: 16, .. },
+                    summary,
+                },
+            ] if summary.contains("partial fixed batch uncommittable")
+        ));
+    }
+
+    let (mut drive, _, audit) = open_hot_script_drive(
+        "LIB_FULL_EW_UNPOSITIONED",
+        [],
+        [HotWriteScript::CheckConditionWithBytes(
+            current_sense(0x00, 0x40, 0, 0),
+            16,
+        )],
+        config,
+    );
+    let outcome = drive
+        .write_block_unpositioned(&[0x5A; 16])
+        .expect("full-byte early warning remains successful");
+    assert_eq!(outcome.bytes_written, 16);
+    assert!(outcome.early_warning);
+    assert!(!outcome.end_of_medium);
+    assert!(matches!(
+        audit.lock().expect("audit events").as_slice(),
+        [
+            CapturedEvent::Started {
+                op: AuditOp::TapeWrite { len: 16, .. },
+                ..
+            },
+            CapturedEvent::FinishedSuccess {
+                op: AuditOp::TapeWrite { len: 16, .. },
+                ..
+            },
+        ]
+    ));
+}
+
+#[test]
 fn recovered_error_matrix_preserves_current_success_and_rejects_terminal_or_deferred() {
     let config = TapeIoRuntimeConfig {
         write_batch_blocks: 4,

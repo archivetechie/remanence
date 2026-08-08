@@ -3,6 +3,10 @@ use crate::filemark_map::TapeFileMapEntry;
 use crate::model::SchemeId;
 use crate::raw::{RawReadOutcome, RawTapeSource, SpaceFilemarksOutcome};
 
+fn block_len_u32(buf: &[u8]) -> u32 {
+    u32::try_from(buf.len()).expect("test block length fits u32")
+}
+
 fn small_scheme() -> ParityScheme {
     // k=4, m=2, S=3 → 12 data slots (3 stripes × 4 data rows)
     // then 6 parity slots per neighborhood (Step 11.8 emits).
@@ -193,6 +197,7 @@ impl RawTapeSink for EwEomTripwireRawTapeSink {
         }
         self.cursor += 1;
         Ok(RawWriteOutcome::WroteBlock {
+            bytes_written: block_len_u32(buf),
             position_after: PhysicalPositionHint::new(self.cursor),
             early_warning: ew_eom,
             end_of_medium: ew_eom,
@@ -241,6 +246,7 @@ impl RawTapeSink for RecordingRawTapeSink {
         self.blocks.push(buf.to_vec());
         self.cursor += 1;
         Ok(RawWriteOutcome::WroteBlock {
+            bytes_written: block_len_u32(buf),
             position_after: PhysicalPositionHint::new(self.cursor),
             early_warning: false,
             end_of_medium: false,
@@ -268,6 +274,59 @@ impl RawTapeSink for RecordingRawTapeSink {
     fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
         self.events.push(RawSinkEvent::Position);
         Ok(PhysicalPositionHint::new(self.cursor))
+    }
+}
+
+#[derive(Debug)]
+struct NonExactRawTapeSink {
+    inner: RecordingRawTapeSink,
+    report_on_block: usize,
+    reported_bytes: u32,
+    block_calls: usize,
+}
+
+impl NonExactRawTapeSink {
+    fn new(report_on_block: usize, reported_bytes: u32) -> Self {
+        Self {
+            inner: RecordingRawTapeSink::default(),
+            report_on_block,
+            reported_bytes,
+            block_calls: 0,
+        }
+    }
+}
+
+impl RawTapeSink for NonExactRawTapeSink {
+    fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
+        self.block_calls += 1;
+        match self.inner.write_fixed_block(buf)? {
+            RawWriteOutcome::WroteBlock {
+                bytes_written,
+                position_after,
+                early_warning,
+                end_of_medium,
+            } => Ok(RawWriteOutcome::WroteBlock {
+                bytes_written: if self.block_calls == self.report_on_block {
+                    self.reported_bytes
+                } else {
+                    bytes_written
+                },
+                position_after,
+                early_warning,
+                end_of_medium,
+            }),
+            RawWriteOutcome::WroteFilemark { .. } => Err(ParityError::Invariant(
+                "recording block sink returned a filemark outcome",
+            )),
+        }
+    }
+
+    fn write_filemarks(&mut self, count: u32, immed: bool) -> Result<RawWriteOutcome, ParityError> {
+        self.inner.write_filemarks(count, immed)
+    }
+
+    fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        self.inner.position()
     }
 }
 
@@ -496,6 +555,7 @@ impl RawTapeSink for EarlyWarningRawTapeSink {
         self.blocks.push(buf.to_vec());
         self.cursor += 1;
         Ok(RawWriteOutcome::WroteBlock {
+            bytes_written: block_len_u32(buf),
             position_after: PhysicalPositionHint::new(self.cursor),
             early_warning,
             end_of_medium: false,
@@ -532,12 +592,13 @@ struct FailingRawTapeSink {
 }
 
 impl RawTapeSink for FailingRawTapeSink {
-    fn write_fixed_block(&mut self, _buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
+    fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
         if let Some(err) = self.block_error.take() {
             return Err(err);
         }
         self.cursor += 1;
         Ok(RawWriteOutcome::WroteBlock {
+            bytes_written: block_len_u32(buf),
             position_after: PhysicalPositionHint::new(self.cursor),
             early_warning: false,
             end_of_medium: false,
@@ -820,6 +881,112 @@ fn journaled_write_bootstrap_commits_control_bundle() {
     assert_eq!(bundle.total_committed_ordinals, 0);
     assert_eq!(bundle.entries.len(), 1);
     assert_eq!(bundle.entries[0].kind, TapeFileKind::Bootstrap);
+}
+
+#[test]
+fn nonexact_control_block_forbids_filemark_and_journal_commit() {
+    let block_size: u32 = 1024;
+    for reported_bytes in [block_size - 1, block_size + 1] {
+        let mut raw = NonExactRawTapeSink::new(1, reported_bytes);
+        let mut journal = RecordingJournal::new(sample_uuid());
+        {
+            let mut sink = ParitySink::new_with_journal(
+                &mut raw,
+                &mut journal,
+                small_scheme(),
+                sample_uuid(),
+                block_size,
+            )
+            .expect("journaled sink opens");
+            let error = sink
+                .write_bootstrap()
+                .expect_err("nonexact bootstrap block must fail before its filemark");
+            assert!(error
+                .to_string()
+                .contains("control block write completed with a nonexact byte count"));
+            assert!(sink.poisoned);
+        }
+
+        assert_eq!(
+            raw.inner.events,
+            vec![RawSinkEvent::WriteBlock(block_size as usize)]
+        );
+        assert!(journal.bundles.is_empty());
+    }
+}
+
+#[test]
+fn nonexact_object_block_poisoning_precedes_parity_accounting() {
+    let block_size: u32 = 32;
+    for reported_bytes in [block_size - 1, block_size + 1] {
+        let mut raw = NonExactRawTapeSink::new(1, reported_bytes);
+        let mut sink =
+            ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
+                .expect("sidecar-only sink opens");
+        start_object(&mut sink, 1, block_size);
+
+        let error = sink
+            .write_block(&fixed_block(0xA5, block_size))
+            .expect_err("nonexact object block must fail");
+        assert!(error
+            .to_string()
+            .contains("object data block write completed with a nonexact byte count"));
+        assert!(sink.poisoned);
+        assert_eq!(sink.active_object_blocks_written(), Some(0));
+        assert_eq!(sink.data_blocks_in_neighborhood(), 0);
+        drop(sink);
+        assert_eq!(
+            raw.inner.events,
+            vec![RawSinkEvent::WriteBlock(block_size as usize)]
+        );
+    }
+}
+
+#[test]
+fn nonexact_sidecar_block_forbids_sidecar_filemark_and_bundle_commit() {
+    let block_size: u32 = 1024;
+    let data_blocks = 12usize;
+    for reported_bytes in [block_size - 1, block_size + 1] {
+        let mut raw = NonExactRawTapeSink::new(data_blocks + 1, reported_bytes);
+        let mut journal = RecordingJournal::new(sample_uuid());
+        {
+            let mut sink = ParitySink::new_with_journal(
+                &mut raw,
+                &mut journal,
+                small_scheme(),
+                sample_uuid(),
+                block_size,
+            )
+            .expect("journaled sink opens");
+            start_object(&mut sink, data_blocks as u64, block_size);
+            for value in 0..data_blocks {
+                sink.write_block(&fixed_block(value as u8, block_size))
+                    .expect("object data block writes exactly");
+            }
+            let error = sink
+                .finish_object()
+                .expect_err("nonexact sidecar block must fail before sidecar filemark");
+            assert!(
+                error
+                    .to_string()
+                    .contains("sidecar block write completed with a nonexact byte count"),
+                "{error}"
+            );
+            assert!(sink.poisoned);
+        }
+
+        assert_eq!(raw.block_calls, data_blocks + 1);
+        assert_eq!(
+            raw.inner
+                .events
+                .iter()
+                .filter(|event| matches!(event, RawSinkEvent::WriteFilemark))
+                .count(),
+            1,
+            "only the object delimiter may precede the failed sidecar block"
+        );
+        assert!(journal.bundles.is_empty());
+    }
 }
 
 #[test]
@@ -1986,6 +2153,7 @@ fn sidecar_filemark_early_warning_does_not_mask_later_object_data_eom() {
             }
             self.cursor += 1;
             Ok(RawWriteOutcome::WroteBlock {
+                bytes_written: block_len_u32(buf),
                 position_after: PhysicalPositionHint::new(self.cursor),
                 early_warning: false,
                 end_of_medium,
@@ -2144,6 +2312,7 @@ fn sidecar_filemark_early_warning_does_not_mask_later_object_filemark_eom() {
             self.block_count += 1;
             self.cursor += 1;
             Ok(RawWriteOutcome::WroteBlock {
+                bytes_written: block_len_u32(buf),
                 position_after: PhysicalPositionHint::new(self.cursor),
                 early_warning: false,
                 end_of_medium: false,
@@ -2307,6 +2476,7 @@ fn sidecar_filemark_early_warning_does_not_mask_later_sidecar_body_eom() {
             }
             self.cursor += 1;
             Ok(RawWriteOutcome::WroteBlock {
+                bytes_written: block_len_u32(buf),
                 position_after: PhysicalPositionHint::new(self.cursor),
                 early_warning: false,
                 end_of_medium,
@@ -2477,6 +2647,7 @@ fn sidecar_filemark_early_warning_does_not_mask_later_sidecar_filemark_eom() {
             self.block_count += 1;
             self.cursor += 1;
             Ok(RawWriteOutcome::WroteBlock {
+                bytes_written: block_len_u32(buf),
                 position_after: PhysicalPositionHint::new(self.cursor),
                 early_warning: false,
                 end_of_medium: false,
@@ -2709,6 +2880,7 @@ impl RawTapeSink for SidecarBodyEwThenLaterEomRawTapeSink {
         }
         self.cursor += 1;
         Ok(RawWriteOutcome::WroteBlock {
+            bytes_written: block_len_u32(buf),
             position_after: PhysicalPositionHint::new(self.cursor),
             early_warning,
             end_of_medium,
@@ -3202,6 +3374,7 @@ fn sidecar_body_early_warning_does_not_mask_later_sidecar_filemark_eom() {
             }
             self.cursor += 1;
             Ok(RawWriteOutcome::WroteBlock {
+                bytes_written: block_len_u32(buf),
                 position_after: PhysicalPositionHint::new(self.cursor),
                 early_warning,
                 end_of_medium: false,
@@ -4136,6 +4309,7 @@ fn sidecar_body_eom_bypasses_runtime_reserve_predicate_when_ew_cofires() {
             }
             self.cursor += 1;
             Ok(RawWriteOutcome::WroteBlock {
+                bytes_written: block_len_u32(buf),
                 position_after: PhysicalPositionHint::new(self.cursor),
                 early_warning: ew_eom,
                 end_of_medium: ew_eom,
@@ -4421,6 +4595,7 @@ fn sidecar_only_rejects_eom_on_object_data_before_filemark_or_map_commit() {
             self.events.push(RawSinkEvent::WriteBlock(buf.len()));
             self.cursor += 1;
             Ok(RawWriteOutcome::WroteBlock {
+                bytes_written: block_len_u32(buf),
                 position_after: PhysicalPositionHint::new(self.cursor),
                 early_warning: false,
                 end_of_medium: true,
@@ -4511,6 +4686,7 @@ fn sidecar_only_prior_early_warning_does_not_mask_later_object_data_eom_abort() 
             self.block_count += 1;
             self.cursor += 1;
             Ok(RawWriteOutcome::WroteBlock {
+                bytes_written: block_len_u32(buf),
                 position_after: PhysicalPositionHint::new(self.cursor),
                 early_warning: self.block_count == 1,
                 end_of_medium: self.block_count == 2,
@@ -4619,6 +4795,7 @@ fn sidecar_only_prior_early_warning_does_not_mask_object_filemark_eom_abort() {
             }
             self.cursor += 1;
             Ok(RawWriteOutcome::WroteBlock {
+                bytes_written: block_len_u32(buf),
                 position_after: PhysicalPositionHint::new(self.cursor),
                 early_warning,
                 end_of_medium: false,
@@ -4717,6 +4894,7 @@ fn finish_object_rejects_eom_on_object_filemark_before_map_commit() {
             self.events.push(RawSinkEvent::WriteBlock(buf.len()));
             self.cursor += 1;
             Ok(RawWriteOutcome::WroteBlock {
+                bytes_written: block_len_u32(buf),
                 position_after: PhysicalPositionHint::new(self.cursor),
                 early_warning: false,
                 end_of_medium: false,
@@ -4802,6 +4980,7 @@ fn finish_object_rejects_eom_on_sidecar_filemark_before_map_commit() {
             self.events.push(RawSinkEvent::WriteBlock(buf.len()));
             self.cursor += 1;
             Ok(RawWriteOutcome::WroteBlock {
+                bytes_written: block_len_u32(buf),
                 position_after: PhysicalPositionHint::new(self.cursor),
                 early_warning: false,
                 end_of_medium: false,
@@ -4907,6 +5086,7 @@ fn finish_object_rejects_sidecar_block_eom_even_when_early_warning_cofires() {
             }
             self.cursor += 1;
             Ok(RawWriteOutcome::WroteBlock {
+                bytes_written: block_len_u32(buf),
                 position_after: PhysicalPositionHint::new(self.cursor),
                 early_warning: ew_eom,
                 end_of_medium: ew_eom,
@@ -5005,6 +5185,7 @@ fn finish_object_rejects_sidecar_filemark_eom_even_when_early_warning_cofires() 
             self.events.push(RawSinkEvent::WriteBlock(buf.len()));
             self.cursor += 1;
             Ok(RawWriteOutcome::WroteBlock {
+                bytes_written: block_len_u32(buf),
                 position_after: PhysicalPositionHint::new(self.cursor),
                 early_warning: false,
                 end_of_medium: false,
@@ -5176,6 +5357,7 @@ impl RawTapeSink for BootstrapEomRawTapeSink {
         }
         self.cursor += 1;
         Ok(RawWriteOutcome::WroteBlock {
+            bytes_written: block_len_u32(buf),
             position_after: PhysicalPositionHint::new(self.cursor),
             early_warning,
             end_of_medium: self.eom_on_block == Some(self.block_count),

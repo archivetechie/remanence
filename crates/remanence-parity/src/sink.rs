@@ -342,14 +342,13 @@ struct ParitySinkBackend<'a>(&'a mut dyn RawTapeSink);
 
 impl ParitySinkBackend<'_> {
     fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
-        let bytes_written = u32::try_from(buf.len())
-            .map_err(|_| invalid_input("RawTapeSink fixed-block write length exceeds u32"))?;
         match self
             .0
             .write_fixed_block(buf)
             .map_err(parity_error_to_tape_io)?
         {
             RawWriteOutcome::WroteBlock {
+                bytes_written,
                 position_after,
                 early_warning,
                 end_of_medium,
@@ -2347,15 +2346,15 @@ impl<'a> ParitySink<'a> {
                 ));
             }
         };
-        self.record_physical_position(outcome.position_after.lba);
         if outcome.bytes_written as usize != block.len() {
             self.poisoned = true;
             return Err(self.abandon_tape_file_boundary_or(
                 kind,
                 tape_file_number,
-                ParityError::Invariant("control block write completed short"),
+                ParityError::Invariant("control block write completed with a nonexact byte count"),
             ));
         }
+        self.record_physical_position(outcome.position_after.lba);
         if outcome.end_of_medium {
             self.poisoned = true;
             let message = match kind {
@@ -3035,15 +3034,17 @@ impl<'a> ParitySink<'a> {
                     ));
                 }
             };
-            self.record_physical_position(outcome.position_after.lba);
             if outcome.bytes_written as usize != block.len() {
                 self.poisoned = true;
                 return Err(self.abandon_tape_file_boundary_or(
                     TapeFileKind::ParitySidecar,
                     tape_file_number,
-                    ParityError::Invariant("sidecar block write completed short"),
+                    ParityError::Invariant(
+                        "sidecar block write completed with a nonexact byte count",
+                    ),
                 ));
             }
+            self.record_physical_position(outcome.position_after.lba);
             if outcome.end_of_medium {
                 self.poisoned = true;
                 return Err(self.abandon_tape_file_boundary_or(
@@ -3385,22 +3386,24 @@ impl<'a> BlockSink for ParitySink<'a> {
         let data_outcome = match self.backend.write_block(buf) {
             Ok(o) => o,
             Err(e) => {
-                if e.is_completion_unknown() {
+                if e.is_completion_unknown()
+                    || matches!(e, TapeIoError::PartialBatchUncommittable { .. })
+                {
                     self.poisoned = true;
                     return Err(self.abandon_active_object_boundary_or_tape_io(e));
                 }
                 return Err(e);
             }
         };
-        self.record_physical_position(data_outcome.position_after.lba);
-        if (data_outcome.bytes_written as usize) < buf.len() {
+        if data_outcome.bytes_written as usize != buf.len() {
             self.poisoned = true;
             return Err(
                 self.abandon_active_object_boundary_or_tape_io(invalid_input(
-                    "ParitySink: object data block write completed short before trailing filemark",
+                    "ParitySink: object data block write completed with a nonexact byte count before trailing filemark",
                 )),
             );
         }
+        self.record_physical_position(data_outcome.position_after.lba);
         if data_outcome.end_of_medium {
             self.poisoned = true;
             return Err(self.abandon_active_object_boundary_or_tape_io(invalid_input(
