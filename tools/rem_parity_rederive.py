@@ -35,6 +35,7 @@ PARITY_MAP_FORMAT_ID = "rem-parity-map-v1"
 GF_REDUCTION_POLYNOMIAL = 0x11D
 CRC64_XZ_REFLECTED_POLYNOMIAL = 0xC96C5795D7870F42
 MASK64 = (1 << 64) - 1
+UINT32_MAX = (1 << 32) - 1
 TAPE_FILE_PATTERN = re.compile(
     r"^(?:committed-|appended-)?tape-file-(\d+)-.+\.bin$"
 )
@@ -53,6 +54,11 @@ def _require(condition: bool, message: str) -> None:
 def _match(label: str, actual: object, expected: object) -> None:
     if actual != expected:
         raise RederivationError(f"{label}: re-derived {actual!r} != pinned {expected!r}")
+
+
+def _is_uint(value: object, maximum: int = MASK64) -> bool:
+    """Return whether ``value`` is a non-boolean integer in the wire domain."""
+    return type(value) is int and 0 <= value <= maximum
 
 
 def _u16(data: bytes, offset: int) -> int:
@@ -556,22 +562,24 @@ def _parse_digest(value: object, label: str) -> DigestRecord:
         f"{label}: digest SHA-256 is not 32 bytes",
     )
     _require(
-        all(
-            isinstance(item, int) and item >= 0
-            for item in (
-                digest.tape_file_count,
-                digest.total_data_ordinals,
-                digest.highest_protected_ordinal,
-            )
-        )
+        _is_uint(digest.tape_file_count, UINT32_MAX)
+        and _is_uint(digest.total_data_ordinals)
+        and _is_uint(digest.highest_protected_ordinal)
         and isinstance(digest.is_final, bool),
-        f"{label}: digest scope fields are malformed",
+        f"{label}: digest scope fields are malformed or out of range",
     )
     return digest
 
 
 def _parse_directory(value: object, label: str) -> tuple[DirectoryEntry, ...]:
     _require(isinstance(value, dict), f"{label}: directory is not a map")
+    _require(
+        _is_uint(value.get(1), UINT32_MAX)
+        and _is_uint(value.get(2))
+        and _is_uint(value.get(3))
+        and isinstance(value.get(4), bool),
+        f"{label}: directory scope fields are malformed or out of range",
+    )
     rows = value.get(5)
     _require(isinstance(rows, list), f"{label}: directory entries are not an array")
     result: list[DirectoryEntry] = []
@@ -589,20 +597,15 @@ def _parse_directory(value: object, label: str) -> tuple[DirectoryEntry, ...]:
             flags=row.get(9),  # type: ignore[arg-type]
         )
         _require(
-            all(
-                isinstance(item, int) and item >= 0
-                for item in (
-                    entry.tape_file_number,
-                    entry.epoch_id,
-                    entry.start,
-                    entry.end,
-                    entry.sidecar_blocks,
-                    entry.header_blocks,
-                    entry.parity_blocks,
-                    entry.flags,
-                )
-            ),
-            f"{label}: directory row {index} has malformed integers",
+            _is_uint(entry.tape_file_number, UINT32_MAX)
+            and _is_uint(entry.epoch_id)
+            and _is_uint(entry.start)
+            and _is_uint(entry.end)
+            and _is_uint(entry.sidecar_blocks)
+            and _is_uint(entry.header_blocks, UINT32_MAX)
+            and _is_uint(entry.parity_blocks, UINT32_MAX)
+            and _is_uint(entry.flags, UINT32_MAX),
+            f"{label}: directory row {index} has malformed or out-of-range integers",
         )
         _require(
             isinstance(entry.metadata_hash, bytes) and len(entry.metadata_hash) == 32,
@@ -610,6 +613,58 @@ def _parse_directory(value: object, label: str) -> tuple[DirectoryEntry, ...]:
         )
         result.append(entry)
     return tuple(result)
+
+
+def _parse_parity_map_reference(value: object, label: str) -> int:
+    _require(isinstance(value, dict), f"{label}: parity-map reference malformed")
+    _require(
+        _is_uint(value.get(1), UINT32_MAX)
+        and _is_uint(value.get(2))
+        and _is_uint(value.get(3), UINT32_MAX)
+        and _is_uint(value.get(4))
+        and _is_uint(value.get(5))
+        and isinstance(value.get(6), bool)
+        and isinstance(value.get(7), bytes)
+        and len(value[7]) == 32
+        and isinstance(value.get(8), bytes)
+        and len(value[8]) == 32,
+        f"{label}: parity-map reference fields are malformed or out of range",
+    )
+    return value[1]
+
+
+def _parse_bootstrap_object_rows(value: object, label: str) -> None:
+    _require(isinstance(value, list), f"{label}: object rows are not an array")
+    for index, row in enumerate(value):
+        _require(isinstance(row, dict), f"{label}: object row {index} is not a map")
+        representation = row.get(2)
+        common_fields_valid = (
+            _is_uint(row.get(1), UINT32_MAX)
+            and _is_uint(row.get(3))
+            and (4 not in row or isinstance(row[4], bytes))
+        )
+        if representation == "plaintext":
+            representation_fields_valid = (
+                _is_uint(row.get(10))
+                and _is_uint(row.get(11))
+                and _is_uint(row.get(12))
+                and isinstance(row.get(13), bytes)
+                and len(row[13]) == 32
+            )
+        elif representation == "encrypted":
+            epoch_ids = row.get(22)
+            representation_fields_valid = (
+                _is_uint(row.get(21))
+                and isinstance(epoch_ids, list)
+                and all(isinstance(epoch_id, bytes) and len(epoch_id) == 16 for epoch_id in epoch_ids)
+                and _is_uint(row.get(23), UINT32_MAX)
+            )
+        else:
+            representation_fields_valid = False
+        _require(
+            common_fields_valid and representation_fields_valid,
+            f"{label}: object row {index} fields are malformed or out of range",
+        )
 
 
 def parse_bootstrap(data: bytes, label: str) -> Bootstrap:
@@ -635,12 +690,9 @@ def parse_bootstrap(data: bytes, label: str) -> Bootstrap:
     directory = _parse_directory(payload[20], label) if 20 in payload else None
     reference: int | None = None
     if 21 in payload:
-        _require(isinstance(payload[21], dict), f"{label}: parity-map reference malformed")
-        reference = payload[21].get(1)
-        _require(
-            isinstance(reference, int) and reference >= 0,
-            f"{label}: parity-map reference file number malformed",
-        )
+        reference = _parse_parity_map_reference(payload[21], label)
+    if 30 in payload:
+        _parse_bootstrap_object_rows(payload[30], label)
     return Bootstrap(
         block_size=block_size,
         tape_uuid=tape_uuid,
