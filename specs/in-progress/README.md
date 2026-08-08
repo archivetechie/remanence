@@ -41,7 +41,7 @@ way — see the Status section of the document in question.
 
 | Document | Preparing | Published | Items closed in the preparing copy |
 | --- | --- | --- | --- |
-| REM-PARITY | 1.0.0-draft.2 | 1.0.0-draft.1 | RP-2 — length and charset bounds on writer-supplied text (§8.2, §10.4, §16.2) |
+| REM-PARITY | 1.0.0-draft.3 | 1.0.0-draft.1 | RP-2 — length and charset bounds on writer-supplied text (§8.2, §10.4, §16.2); durable multi-record commit-authority agreement and committed-prefix clarification (§3.1, §3.4, §14, Appendix B.12) |
 
 REM-OBJECT and REM-ENCRYPT have no revision in preparation; their published
 copies are current.

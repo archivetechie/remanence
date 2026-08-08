@@ -175,14 +175,18 @@ recycle-skew issue when something outside Remanence rewrites a cartridge
 under an existing barcode (see
 [troubleshooting](guide-troubleshooting.md#known-open-issue)).
 
-<!-- code-anchor: crates/remanence-state/src/index.rs crates/remanence-state/src/paths.rs @ f643f8c2 -->
-## On disk: the rebuildable state
+<!-- code-anchor: crates/remanence-state/src/index.rs crates/remanence-state/src/paths.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ c802887b -->
+## On disk: durable records and rebuildable state
 
 The host-side state, for completeness (paths are operator-configured; see
 the [configuration reference](reference-configuration.md)):
 
-- **Per-tape journals** (`<tape-uuid>.remjournal`) — the durable
-  disk-side record of what was committed to each tape.
+- **Parity tape-file journals** (`<tape-uuid>.remjournal`) — the Layer 3c
+  record of tape-file entries, parity state, and checkpoint watermarks for
+  parity-enabled tapes.
+- **Per-tape checkpoint journals**
+  (`checkpoints/<tape-uuid>.remcheckpoint`) — fsynced checkpoint histories with
+  the barrier-proved physical EOD and replayable catalog projection.
 - **Audit segments** (daily `.remaudit` files) — append-only record of
   every state-changing operation, fsynced by default.
 - **SQLite index** — schema version 14, tracked via `PRAGMA
@@ -194,3 +198,10 @@ the [configuration reference](reference-configuration.md)):
   journals and audit log.
 - **Per-tape catalog caches** — regenerable per-tape files under the
   configured cache directory.
+
+For parity tapes, the tape-file journal and checkpoint journal are both
+required resume authority. Replay first discards Layer 3c bundles beyond its
+last checkpoint watermark; before positioning for append, Remanence requires
+the remaining complete checkpointed histories to agree. A missing,
+differently advanced, or conflicting checkpointed history fails closed.
+SQLite and the per-tape catalog caches are projections, not commit authority.
