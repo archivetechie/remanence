@@ -98,6 +98,19 @@ pub enum ParityError {
     #[error("parity-map parse error: {0}")]
     ParityMapParse(String),
 
+    /// Checked `copy 1 + copy 2 + footer` geometry is invalid or overflows.
+    #[error("{structure} replicated-control layout error: {message}")]
+    ReplicatedControlLayout {
+        /// Control-file format whose geometry was being calculated.
+        structure: &'static str,
+        /// Exact failed invariant or arithmetic boundary.
+        message: String,
+    },
+
+    /// Tape-index snapshot framing, source, or integrity validation failed.
+    #[error("tape-index snapshot error: {0}")]
+    TapeIndexSnapshot(String),
+
     /// A sidecar epoch directory violates a required structural invariant.
     #[error("DirectoryInvalid: {0}")]
     DirectoryInvalid(String),

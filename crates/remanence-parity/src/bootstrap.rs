@@ -1307,19 +1307,33 @@ pub(crate) fn validate_bootstrap_object_row(
     row: &BootstrapObjectRow,
     block_size_bytes: Option<u32>,
 ) -> Result<(), ParityError> {
-    if row.stored_block_count == 0 {
+    validate_object_recovery_row_fields(
+        row.stored_block_count,
+        row.object_id.as_deref(),
+        &row.representation,
+        block_size_bytes,
+    )
+}
+
+pub(crate) fn validate_object_recovery_row_fields(
+    stored_block_count: u64,
+    object_id: Option<&[u8]>,
+    representation: &BootstrapObjectRepresentation,
+    block_size_bytes: Option<u32>,
+) -> Result<(), ParityError> {
+    if stored_block_count == 0 {
         return Err(ParityError::BootstrapParse(
             "object row stored_block_count must be positive".into(),
         ));
     }
-    if let Some(object_id) = row.object_id.as_ref() {
+    if let Some(object_id) = object_id {
         if !(1..=64).contains(&object_id.len()) || object_id.contains(&0) {
             return Err(ParityError::BootstrapParse(
                 "object row object_id must contain 1..=64 non-NUL bytes".into(),
             ));
         }
     }
-    match &row.representation {
+    match representation {
         BootstrapObjectRepresentation::Plaintext {
             manifest_first_chunk_lba,
             manifest_size_bytes,
@@ -1336,7 +1350,7 @@ pub(crate) fn validate_bootstrap_object_row(
                 .ok_or_else(|| {
                     ParityError::BootstrapParse("plaintext manifest chunk range overflows".into())
                 })?;
-            if manifest_end > row.stored_block_count {
+            if manifest_end > stored_block_count {
                 return Err(ParityError::BootstrapParse(
                     "plaintext manifest chunk range exceeds stored block count".into(),
                 ));

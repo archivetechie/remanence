@@ -16,6 +16,9 @@ use crate::diagnostic_text::{
     validate_writer_version,
 };
 use crate::error::ParityError;
+use crate::replicated_control::{
+    checked_replicated_control_layout, validate_replicated_control_layout,
+};
 use crate::sidecar::crc64_xz;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -431,39 +434,36 @@ pub fn encode_parity_map_tape_file(
             "parity-map directory total ordinals precede protection watermark",
         ));
     }
-    let block_size_usize = validate_block_size(block_size)?;
+    validate_block_size(block_size)?;
     let payload_bytes = encode_parity_map_payload(payload)?;
     let payload_sha256 = sha256_array(&payload_bytes);
-    let copy_bytes_len = PARITY_MAP_HEADER_LEN
-        .checked_add(payload_bytes.len())
-        .ok_or_else(|| parity_map_parse("parity-map copy length overflows"))?;
-    let copy_block_count_usize = copy_bytes_len.div_ceil(block_size_usize);
-    let copy_block_count = u64::try_from(copy_block_count_usize)
-        .map_err(|_| parity_map_parse("parity-map copy block count overflows u64"))?;
-    let tail_copy_start_block = copy_block_count;
-    let footer_block_index = copy_block_count
-        .checked_mul(2)
-        .ok_or_else(|| parity_map_parse("parity-map footer block index overflows"))?;
-    let total_block_count = footer_block_index
-        .checked_add(1)
-        .ok_or_else(|| parity_map_parse("parity-map total block count overflows"))?;
+    let payload_len = u64::try_from(payload_bytes.len())
+        .map_err(|_| parity_map_parse("parity-map payload length overflows u64"))?;
+    let shared_layout = checked_replicated_control_layout(
+        u64::from(block_size),
+        u64::try_from(PARITY_MAP_HEADER_LEN)
+            .map_err(|_| parity_map_parse("parity-map header length overflows u64"))?,
+        payload_len,
+        "parity-map",
+    )
+    .map_err(|error| parity_map_parse(error.to_string()))?;
 
     let layout = ParityMapLayout {
         block_size,
-        payload_len: payload_bytes.len() as u64,
+        payload_len,
         payload_sha256,
-        copy_block_count,
-        parity_map_total_block_count: total_block_count,
-        primary_copy_start_block: 0,
-        tail_copy_start_block,
-        footer_block_index,
+        copy_block_count: shared_layout.copy_block_count,
+        parity_map_total_block_count: shared_layout.total_block_count,
+        primary_copy_start_block: shared_layout.primary_copy_start_block,
+        tail_copy_start_block: shared_layout.tail_copy_start_block,
+        footer_block_index: shared_layout.footer_block_index,
     };
 
     let primary_header = build_header(payload, ParityMapCopyKind::Primary, layout)?;
     let tail_header = build_header(payload, ParityMapCopyKind::Tail, layout)?;
 
     let mut blocks = Vec::with_capacity(
-        usize::try_from(total_block_count)
+        usize::try_from(shared_layout.total_block_count)
             .map_err(|_| parity_map_parse("parity-map total block count overflows usize"))?,
     );
     blocks.extend(pack_copy_blocks(&primary_header, &payload_bytes)?);
@@ -1624,45 +1624,20 @@ fn validate_locator_counts(
     tail_copy_start_block: u64,
     footer_block_index: u64,
 ) -> Result<(), ParityError> {
-    let block_size = u64::try_from(validate_block_size(block_size)?)
-        .map_err(|_| parity_map_parse("parity-map block size overflows u64"))?;
-    let required_copy_bytes = u64::try_from(PARITY_MAP_HEADER_LEN)
-        .map_err(|_| parity_map_parse("header length overflows u64"))?
-        .checked_add(payload_len)
-        .ok_or_else(|| parity_map_parse("parity-map required copy bytes overflow"))?;
-    let expected_copy_blocks = required_copy_bytes.div_ceil(block_size);
-    if copy_block_count != expected_copy_blocks {
-        return Err(parity_map_parse(format!(
-            "parity-map copy_block_count {copy_block_count} != expected {expected_copy_blocks}"
-        )));
-    }
-    if primary_copy_start_block != 0 {
-        return Err(parity_map_parse(
-            "parity-map primary copy must start at block 0",
-        ));
-    }
-    if tail_copy_start_block != copy_block_count {
-        return Err(parity_map_parse(format!(
-            "parity-map tail copy starts at {tail_copy_start_block}, expected {copy_block_count}"
-        )));
-    }
-    let expected_footer = copy_block_count
-        .checked_mul(2)
-        .ok_or_else(|| parity_map_parse("parity-map expected footer index overflows"))?;
-    if footer_block_index != expected_footer {
-        return Err(parity_map_parse(format!(
-            "parity-map footer index {footer_block_index} != expected {expected_footer}"
-        )));
-    }
-    let expected_total = expected_footer
-        .checked_add(1)
-        .ok_or_else(|| parity_map_parse("parity-map expected total overflows"))?;
-    if total_block_count != expected_total {
-        return Err(parity_map_parse(format!(
-            "parity-map total block count {total_block_count} != expected {expected_total}"
-        )));
-    }
-    Ok(())
+    validate_block_size(block_size)?;
+    validate_replicated_control_layout(
+        u64::from(block_size),
+        u64::try_from(PARITY_MAP_HEADER_LEN)
+            .map_err(|_| parity_map_parse("parity-map header length overflows u64"))?,
+        payload_len,
+        copy_block_count,
+        total_block_count,
+        primary_copy_start_block,
+        tail_copy_start_block,
+        footer_block_index,
+        "parity-map",
+    )
+    .map_err(|error| parity_map_parse(error.to_string()))
 }
 
 fn validate_block_size(block_size: u32) -> Result<usize, ParityError> {
