@@ -1986,7 +1986,7 @@ impl super::DriveHandle {
 
         match result {
             Ok(outcome) => {
-                let bytes_written = outcome.bytes_transferred.min(len_u32);
+                let bytes_written = outcome.bytes_transferred;
                 // Inline READ POSITION so the caller learns the LBA
                 // of the block it just wrote.
                 match self.read_position_inline() {
@@ -2018,7 +2018,7 @@ impl super::DriveHandle {
                 // VOLUME OVERFLOW). Otherwise reconstruct the
                 // CheckCondition and map normally.
                 if let Some(signal) = write_eom_signal(&sense) {
-                    let bytes_written = bytes_transferred.min(len_u32);
+                    let bytes_written = bytes_transferred;
                     match self.read_position_inline() {
                         Ok(position_after) => {
                             self.finish_tape_success(op, started.elapsed());
@@ -2108,7 +2108,20 @@ impl super::DriveHandle {
 
         match result {
             Ok(outcome) => {
-                let bytes_written = outcome.bytes_transferred.min(len_u32);
+                let bytes_written = outcome.bytes_transferred;
+                if bytes_written != len_u32 {
+                    let mapped = TapeIoError::PartialBatchUncommittable {
+                        requested_records: 1,
+                        written_records: u32::from(bytes_written >= len_u32),
+                        requested_bytes: u64::from(len_u32),
+                        written_bytes: u64::from(bytes_written),
+                        end_of_medium: false,
+                        sense: None,
+                    };
+                    self.mark_position_unknown();
+                    self.finish_tape_error(op, &mapped);
+                    return Err(mapped);
+                }
                 self.finish_tape_success(op, started.elapsed());
                 Ok(WriteUnpositionedOutcome {
                     bytes_written,
@@ -2124,7 +2137,20 @@ impl super::DriveHandle {
                     self.invalidate_for_reset_unit_attention();
                 }
                 if let Some(signal) = write_eom_signal(&sense) {
-                    let bytes_written = bytes_transferred.min(len_u32);
+                    let bytes_written = bytes_transferred;
+                    if bytes_written != len_u32 {
+                        let mapped = TapeIoError::PartialBatchUncommittable {
+                            requested_records: 1,
+                            written_records: u32::from(bytes_written >= len_u32),
+                            requested_bytes: u64::from(len_u32),
+                            written_bytes: u64::from(bytes_written),
+                            end_of_medium: signal.end_of_medium,
+                            sense: Some(sense),
+                        };
+                        self.mark_position_unknown();
+                        self.finish_tape_error(op, &mapped);
+                        return Err(mapped);
+                    }
                     self.finish_tape_success(op, started.elapsed());
                     return Ok(WriteUnpositionedOutcome {
                         bytes_written,

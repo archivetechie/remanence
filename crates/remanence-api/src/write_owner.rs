@@ -24,7 +24,8 @@ use remanence_parity::{
     committed_prefix_from_journal, plan_resume_append_from_committed_prefix,
     scan_reconstruct_filemark_map, CloseReason, DriveHandleRawSink, DriveHandleRawSource,
     FileTapeFileJournal, FilemarkMap, ParityError, ParitySink, ParitySinkSessionState,
-    ResumeWriterSeed, TapeFileEntry, TapeFileJournal, TapeFileKind,
+    PhysicalPositionHint, RawTapeSink, RawWriteOutcome, ResumeWriterSeed, TapeFileEntry,
+    TapeFileJournal, TapeFileKind,
 };
 use remanence_state::{
     AlarmRecord, AuditActor, AuditEvent, AuditEventRecord, AuditSubject, CatalogIndex,
@@ -1582,6 +1583,61 @@ struct ParityActorSession {
     journal: FileTapeFileJournal,
 }
 
+/// Records entry into the direct parity raw-write boundary. The append source's
+/// overlap control cannot observe this path, so actor failure containment must
+/// use the Layer 3c emission boundary itself.
+struct ActivityTrackingRawTapeSink<'a> {
+    inner: &'a mut dyn RawTapeSink,
+    write_attempted: &'a mut bool,
+    position_ready: bool,
+}
+
+impl<'a> ActivityTrackingRawTapeSink<'a> {
+    fn new(inner: &'a mut dyn RawTapeSink, write_attempted: &'a mut bool) -> Self {
+        Self {
+            inner,
+            write_attempted,
+            position_ready: false,
+        }
+    }
+
+    fn ensure_position_ready(&mut self) -> Result<(), ParityError> {
+        if !self.position_ready {
+            self.inner.position()?;
+            self.position_ready = true;
+        }
+        Ok(())
+    }
+}
+
+impl RawTapeSink for ActivityTrackingRawTapeSink<'_> {
+    fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
+        self.ensure_position_ready()?;
+        *self.write_attempted = true;
+        let result = self.inner.write_fixed_block(buf);
+        if result.is_err() {
+            self.position_ready = false;
+        }
+        result
+    }
+
+    fn write_filemarks(&mut self, count: u32, immed: bool) -> Result<RawWriteOutcome, ParityError> {
+        self.ensure_position_ready()?;
+        *self.write_attempted = true;
+        let result = self.inner.write_filemarks(count, immed);
+        if result.is_err() {
+            self.position_ready = false;
+        }
+        result
+    }
+
+    fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        let position = self.inner.position()?;
+        self.position_ready = true;
+        Ok(position)
+    }
+}
+
 fn parity_journal_path(cfg: &WriteOwnerConfig, tape_uuid: TapeUuid) -> Result<PathBuf, Status> {
     let journal_dir = cfg.checkpoint_journal_dir.parent().ok_or_else(|| {
         Status::internal("checkpoint journal directory has no parent for the parity journal")
@@ -1590,6 +1646,7 @@ fn parity_journal_path(cfg: &WriteOwnerConfig, tape_uuid: TapeUuid) -> Result<Pa
 }
 
 fn open_parity_actor_session(
+    index: &mut CatalogIndex,
     drive: &mut DriveHandle,
     cfg: &WriteOwnerConfig,
     selected: &SelectedTape,
@@ -1625,19 +1682,43 @@ fn open_parity_actor_session(
         drive
             .locate(0)
             .map_err(|err| Status::unavailable(format!("locate fresh parity BOT: {err}")))?;
-        let mut raw = DriveHandleRawSink::new(drive);
-        let mut sink = ParitySink::new_with_journal(
-            &mut raw,
-            &mut journal,
-            scheme.clone(),
-            selected.tape_uuid,
-            selected.block_size,
-        )
-        .map_err(|err| status_from_parity_error(&err, err.to_string()))?;
-        sink.write_bootstrap()
-            .map_err(|err| status_from_parity_error(&err, err.to_string()))?;
-        sink.into_session_state()
-            .map_err(|err| status_from_parity_error(&err, err.to_string()))?
+        let mut write_attempted = false;
+        let opened = {
+            let mut raw = DriveHandleRawSink::new(drive);
+            let mut tracked = ActivityTrackingRawTapeSink::new(&mut raw, &mut write_attempted);
+            (|| -> Result<ParitySinkSessionState, ParityError> {
+                let mut sink = ParitySink::new_with_journal(
+                    &mut tracked,
+                    &mut journal,
+                    scheme.clone(),
+                    selected.tape_uuid,
+                    selected.block_size,
+                )?;
+                sink.write_bootstrap()?;
+                sink.into_session_state()
+            })()
+        };
+        match opened {
+            Ok(state) => state,
+            Err(err) => {
+                let error = err.to_string();
+                let status = status_from_parity_error(&err, error.clone());
+                if write_attempted {
+                    return Err(fence_failed_parity_raw_write(
+                        index,
+                        cfg,
+                        selected,
+                        "fresh_bootstrap",
+                        None,
+                        None,
+                        error.as_str(),
+                        status,
+                    )
+                    .0);
+                }
+                return Err(status);
+            }
+        }
     } else {
         let checkpoint = checkpoints.last().ok_or_else(|| {
             Status::failed_precondition(
@@ -1745,6 +1826,7 @@ struct BarrierOutcome {
 struct CheckpointBarrierFailure {
     status: Status,
     journal_durable: bool,
+    fence_handled: bool,
 }
 
 impl CheckpointBarrierFailure {
@@ -1752,6 +1834,15 @@ impl CheckpointBarrierFailure {
         Self {
             status,
             journal_durable: false,
+            fence_handled: false,
+        }
+    }
+
+    fn before_journal_with_fence_handled(status: Status) -> Self {
+        Self {
+            status,
+            journal_durable: false,
+            fence_handled: true,
         }
     }
 
@@ -1759,6 +1850,7 @@ impl CheckpointBarrierFailure {
         Self {
             status,
             journal_durable: true,
+            fence_handled: false,
         }
     }
 }
@@ -1884,26 +1976,44 @@ fn perform_checkpoint_barrier(
                 "parity sink session state is unavailable",
             ))
         })?;
-        let mut raw = DriveHandleRawSink::new(drive);
-        let mut sink = ParitySink::from_session_state(&mut raw, &mut parity_session.journal, state)
-            .map_err(|err| {
-                CheckpointBarrierFailure::before_journal(status_from_parity_error(
-                    &err,
-                    err.to_string(),
-                ))
-            })?;
-        let closed = sink.close_open_epoch(CloseReason::Barrier).map_err(|err| {
-            CheckpointBarrierFailure::before_journal(status_from_parity_error(
-                &err,
-                err.to_string(),
-            ))
-        })?;
-        let sink_state = sink.into_session_state().map_err(|err| {
-            CheckpointBarrierFailure::before_journal(status_from_parity_error(
-                &err,
-                err.to_string(),
-            ))
-        })?;
+        let mut raw_write_attempted = false;
+        let barrier_result = {
+            let mut raw = DriveHandleRawSink::new(drive);
+            let mut tracked = ActivityTrackingRawTapeSink::new(&mut raw, &mut raw_write_attempted);
+            (|| -> Result<_, ParityError> {
+                let mut sink = ParitySink::from_session_state(
+                    &mut tracked,
+                    &mut parity_session.journal,
+                    state,
+                )?;
+                let closed = sink.close_open_epoch(CloseReason::Barrier)?;
+                let sink_state = sink.into_session_state()?;
+                Ok((closed, sink_state))
+            })()
+        };
+        let (closed, sink_state) = match barrier_result {
+            Ok(result) => result,
+            Err(err) => {
+                let error = err.to_string();
+                let status = status_from_parity_error(&err, error.clone());
+                if raw_write_attempted {
+                    let fenced = fence_failed_parity_raw_write(
+                        index,
+                        cfg,
+                        selected,
+                        "checkpoint_barrier",
+                        None,
+                        Some(batch),
+                        error.as_str(),
+                        status,
+                    );
+                    return Err(CheckpointBarrierFailure::before_journal_with_fence_handled(
+                        fenced.0,
+                    ));
+                }
+                return Err(CheckpointBarrierFailure::before_journal(status));
+            }
+        };
         let parity_early_warning = sink_state.hardware_early_warning_seen();
         parity_session.sink_state = Some(sink_state);
         (
@@ -2037,6 +2147,7 @@ fn perform_checkpoint_barrier(
             tracing::warn!(error = %err, "failed to append tape sealing evidence");
         }
         if let Some(parity_session) = parity_session {
+            let mut raw_write_attempted = false;
             let terminal_result = (|| -> Result<(), ParityError> {
                 let state = parity_session
                     .sink_state
@@ -2045,13 +2156,34 @@ fn perform_checkpoint_barrier(
                         "parity sink session state is unavailable at seal",
                     ))?;
                 let mut raw = DriveHandleRawSink::new(drive);
-                let mut sink =
-                    ParitySink::from_session_state(&mut raw, &mut parity_session.journal, state)?;
+                let mut tracked =
+                    ActivityTrackingRawTapeSink::new(&mut raw, &mut raw_write_attempted);
+                let mut sink = ParitySink::from_session_state(
+                    &mut tracked,
+                    &mut parity_session.journal,
+                    state,
+                )?;
                 sink.close_open_epoch(CloseReason::Finish)?;
                 parity_session.sink_state = Some(sink.into_session_state()?);
                 Ok(())
             })();
             if let Err(err) = terminal_result {
+                let error = err.to_string();
+                if raw_write_attempted {
+                    let fenced = fence_failed_parity_raw_write(
+                        index,
+                        cfg,
+                        selected,
+                        "terminal_seal",
+                        None,
+                        Some(batch),
+                        error.as_str(),
+                        status_from_parity_error(&err, error.clone()),
+                    );
+                    if !fenced.1 {
+                        return Err(CheckpointBarrierFailure::after_journal(fenced.0));
+                    }
+                }
                 tracing::warn!(
                     tape_uuid = %Uuid::from_bytes(tape_uuid),
                     error = %err,
@@ -2110,6 +2242,7 @@ fn perform_checkpoint_barrier(
 
 fn fence_failed_checkpoint_batch(
     index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
     selected: &SelectedTape,
     batch: &PendingCheckpointBatch,
     status: Status,
@@ -2137,7 +2270,16 @@ fn fence_failed_checkpoint_batch(
         reason: "checkpoint_barrier_failed".to_string(),
         evidence_json: Some(evidence),
     }) {
-        Ok(_) => status,
+        Ok(fence) => {
+            match append_tape_io_fence_evidence(index, cfg, &fence, AuditEvent::TapeIoFenceRaised) {
+                Ok(()) => status,
+                Err(err) => Status::internal(format!(
+                    "{}; tape fence {} persisted but its audit evidence failed: {err}",
+                    status.message(),
+                    fence.quarantine_id
+                )),
+            }
+        }
         Err(err) => {
             tracing::error!(
                 tape_uuid = %Uuid::from_bytes(selected.tape_uuid),
@@ -2149,6 +2291,97 @@ fn fence_failed_checkpoint_batch(
                 "{}; additionally failed to persist the required tape fence: {err}",
                 status.message()
             ))
+        }
+    }
+}
+
+fn parity_raw_write_fence_reason(error: &str) -> &'static str {
+    if error.contains("partial fixed batch uncommittable") {
+        "partial_batch"
+    } else if error.contains("reset UNIT ATTENTION") {
+        "reset_unit_attention"
+    } else if error.contains("position drift") || error.contains("position mismatch") {
+        "position_drift"
+    } else {
+        "transfer_error"
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fence_failed_parity_raw_write(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    selected: &SelectedTape,
+    phase: &'static str,
+    current_caller_object_id: Option<&str>,
+    batch: Option<&PendingCheckpointBatch>,
+    error: &str,
+    status: Status,
+) -> (Status, bool) {
+    let barcode = index
+        .get_tape(&selected.tape_uuid)
+        .ok()
+        .flatten()
+        .and_then(|tape| tape.voltag);
+    let prior_caller_object_ids = batch.map(|batch| {
+        batch
+            .objects
+            .iter()
+            .map(|result| result.object.caller_object_id.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    });
+    let evidence = serde_json::json!({
+        "phase": phase,
+        "pool_id": selected.pool_id,
+        "tape_uuid": Uuid::from_bytes(selected.tape_uuid).to_string(),
+        "batch_id": batch.map(|batch| batch.batch_id.to_string()),
+        "prior_caller_object_ids": prior_caller_object_ids,
+        "current_caller_object_id": current_caller_object_id,
+        "error": error,
+    })
+    .to_string();
+    let fence = match index.record_tape_io_fence(remanence_state::TapeIoFenceInput {
+        tape_uuid: selected.tape_uuid,
+        barcode,
+        reason: parity_raw_write_fence_reason(error).to_string(),
+        evidence_json: Some(evidence),
+    }) {
+        Ok(fence) => fence,
+        Err(err) => {
+            tracing::error!(
+                tape_uuid = %Uuid::from_bytes(selected.tape_uuid),
+                phase,
+                error = %err,
+                "failed to persist parity raw-write tape-I/O fence"
+            );
+            return (
+                Status::internal(format!(
+                    "{}; additionally failed to persist the required tape fence: {err}",
+                    status.message()
+                )),
+                false,
+            );
+        }
+    };
+    match append_tape_io_fence_evidence(index, cfg, &fence, AuditEvent::TapeIoFenceRaised) {
+        Ok(()) => (status, true),
+        Err(err) => {
+            tracing::error!(
+                tape_uuid = %Uuid::from_bytes(selected.tape_uuid),
+                quarantine_id = fence.quarantine_id.as_str(),
+                phase,
+                error = %err,
+                "persisted parity raw-write fence but failed to append audit evidence"
+            );
+            (
+                Status::internal(format!(
+                    "{}; tape fence {} persisted but its audit evidence failed: {err}",
+                    status.message(),
+                    fence.quarantine_id
+                )),
+                false,
+            )
         }
     }
 }
@@ -3223,7 +3456,7 @@ fn handle_drive_open_write(
         selected.parity_config,
         remanence_parity::ParityConfig::Scheme(_)
     ) {
-        match open_parity_actor_session(drive, cfg, &selected, &durable_checkpoint_records) {
+        match open_parity_actor_session(index, drive, cfg, &selected, &durable_checkpoint_records) {
             Ok(session) => Some(session),
             Err(status) => {
                 let _ = reply.send(Err(status));
@@ -3375,6 +3608,7 @@ fn handle_drive_open_write(
                     representation: crate::PoolWriteRepresentation::Plaintext,
                 };
                 let append_started = Instant::now();
+                let mut parity_raw_write_attempted = false;
                 let result = match crate::pool_write::maybe_replay_pool_write(
                     index, &pool_cfg, &request,
                 ) {
@@ -3400,9 +3634,13 @@ fn handle_drive_open_write(
                                         Err(PoolWriteError::from(err))
                                     } else {
                                         let mut raw = DriveHandleRawSink::new(drive);
+                                        let mut tracked = ActivityTrackingRawTapeSink::new(
+                                            &mut raw,
+                                            &mut parity_raw_write_attempted,
+                                        );
                                         crate::pool_write::write_batched_parity_to_selected_tape_after_replay_check(
                                             index,
-                                            &mut raw,
+                                            &mut tracked,
                                             &mut parity_session.journal,
                                             sink_state,
                                             &pool_cfg,
@@ -3564,16 +3802,18 @@ fn handle_drive_open_write(
                                         committed
                                     }
                                     Err(failure) => {
-                                        let status = if failure.journal_durable {
-                                            failure.status
-                                        } else {
-                                            fence_failed_checkpoint_batch(
-                                                index,
-                                                &selected,
-                                                batch,
-                                                failure.status,
-                                            )
-                                        };
+                                        let status =
+                                            if failure.journal_durable || failure.fence_handled {
+                                                failure.status
+                                            } else {
+                                                fence_failed_checkpoint_batch(
+                                                    index,
+                                                    cfg,
+                                                    &selected,
+                                                    batch,
+                                                    failure.status,
+                                                )
+                                            };
                                         append_gate.record_failure();
                                         pending_batch = None;
                                         let _ = reply.send(Err(status));
@@ -3636,6 +3876,7 @@ fn handle_drive_open_write(
                             {
                                 tracing::warn!(error = %evidence_err, "failed to append directory-ceiling seal evidence");
                             }
+                            let mut parity_terminal_raw_write_attempted = false;
                             let terminal_result = if let Some(parity_session) =
                                 parity_session.as_mut()
                             {
@@ -3648,8 +3889,12 @@ fn handle_drive_open_write(
                                             )
                                         })?;
                                     let mut raw = DriveHandleRawSink::new(drive);
-                                    let mut sink = ParitySink::from_session_state(
+                                    let mut tracked = ActivityTrackingRawTapeSink::new(
                                         &mut raw,
+                                        &mut parity_terminal_raw_write_attempted,
+                                    );
+                                    let mut sink = ParitySink::from_session_state(
+                                        &mut tracked,
                                         &mut parity_session.journal,
                                         state,
                                     )?;
@@ -3671,37 +3916,84 @@ fn handle_drive_open_write(
                                     Ok(())
                                 })()
                             };
+                            let mut terminal_fence_failure = None;
                             if let Err(terminal_err) = terminal_result {
+                                let terminal_error = terminal_err.to_string();
+                                if parity_terminal_raw_write_attempted {
+                                    let fenced = fence_failed_parity_raw_write(
+                                        index,
+                                        cfg,
+                                        &selected,
+                                        "terminal_directory_ceiling",
+                                        None,
+                                        None,
+                                        terminal_error.as_str(),
+                                        status_from_pool_write_error(terminal_err),
+                                    );
+                                    if !fenced.1 {
+                                        terminal_fence_failure = Some(fenced.0);
+                                    }
+                                }
                                 tracing::warn!(
-                                    error = %terminal_err,
+                                    error = %terminal_error,
                                     "terminal bootstrap append failed after directory-ceiling seal"
                                 );
                             }
                             append_gate.record_sealed();
-                            let _ = reply.send(Err(Status::resource_exhausted(format!(
-                                "checkpoint directory ceiling reached before tape motion; selected tape sealed at its last checkpoint, reopen against the pool to roll placement: {original_error}"
-                            ))));
+                            let status = terminal_fence_failure.unwrap_or_else(|| {
+                                Status::resource_exhausted(format!(
+                                    "checkpoint directory ceiling reached before tape motion; selected tape sealed at its last checkpoint, reopen against the pool to roll placement: {original_error}"
+                                ))
+                            });
+                            let _ = reply.send(Err(status));
                             continue;
                         }
-                        let tape_started = stream_control
-                            .as_ref()
-                            .map(|control| control.tape_started())
-                            .unwrap_or(true);
+                        let tape_started = if parity_session.is_some() {
+                            parity_raw_write_attempted
+                        } else {
+                            stream_control
+                                .as_ref()
+                                .map(|control| control.tape_started())
+                                .unwrap_or(true)
+                        };
                         if tape_started {
                             append_gate.record_failure();
                         }
                         let original_error = err.to_string();
                         let mut status = status_from_pool_write_error(err);
+                        let mut fence_audited_here = false;
                         if tape_started {
-                            if let Some(batch) = pending_batch.take() {
+                            let failed_batch = pending_batch.take();
+                            if let Some(batch) = failed_batch.as_ref() {
                                 status = Status::unavailable(format!(
                                     "checkpoint batch {} failed while appending {}; re-send all {} prior WRITTEN objects and the current object: {original_error}",
                                     batch.batch_id,
                                     current_caller_object_id,
                                     batch.objects.len(),
                                 ));
-                                status =
-                                    fence_failed_checkpoint_batch(index, &selected, &batch, status);
+                            }
+                            if parity_raw_write_attempted {
+                                let fenced = fence_failed_parity_raw_write(
+                                    index,
+                                    cfg,
+                                    &selected,
+                                    "append",
+                                    Some(current_caller_object_id.as_str()),
+                                    failed_batch.as_ref(),
+                                    original_error.as_str(),
+                                    status,
+                                );
+                                status = fenced.0;
+                                // The helper either audits the exact fence it just
+                                // persisted or returns an error describing why it
+                                // could not. Never fall back to auditing an unrelated
+                                // "latest" active fence for this write failure.
+                                fence_audited_here = true;
+                            } else if let Some(batch) = failed_batch.as_ref() {
+                                status = fence_failed_checkpoint_batch(
+                                    index, cfg, &selected, batch, status,
+                                );
+                                fence_audited_here = true;
                             }
                         }
                         tracing::info!(
@@ -3717,12 +4009,14 @@ fn handle_drive_open_write(
                             throughput_mib_s = crate::diagnostics::mib_per_s(logical_size, append_elapsed),
                             "remanence_write_diag",
                         );
-                        if let Err(audit_err) =
-                            append_latest_tape_io_fence_evidence(index, cfg, selected.tape_uuid)
-                        {
-                            tracing::warn!(
-                                "failed to append tape-I/O fence evidence after write error: {audit_err}"
-                            );
+                        if !fence_audited_here {
+                            if let Err(audit_err) =
+                                append_latest_tape_io_fence_evidence(index, cfg, selected.tape_uuid)
+                            {
+                                tracing::warn!(
+                                    "failed to append tape-I/O fence evidence after write error: {audit_err}"
+                                );
+                            }
                         }
                         record_session_snapshot(
                             index,
@@ -3893,10 +4187,16 @@ fn handle_drive_open_write(
                         }
                     }
                     Err(failure) => {
-                        let status = if failure.journal_durable {
+                        let status = if failure.journal_durable || failure.fence_handled {
                             failure.status
                         } else {
-                            fence_failed_checkpoint_batch(index, &selected, batch, failure.status)
+                            fence_failed_checkpoint_batch(
+                                index,
+                                cfg,
+                                &selected,
+                                batch,
+                                failure.status,
+                            )
                         };
                         append_gate.record_failure();
                         pending_batch = None;
@@ -4015,11 +4315,12 @@ fn handle_drive_open_write(
                             pending_batch = None;
                         }
                         Err(failure) => {
-                            let status = if failure.journal_durable {
+                            let status = if failure.journal_durable || failure.fence_handled {
                                 failure.status
                             } else {
                                 fence_failed_checkpoint_batch(
                                     index,
+                                    cfg,
                                     &selected,
                                     batch,
                                     failure.status,
@@ -7400,6 +7701,113 @@ mod tests {
     const RANGE_OBJECT_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     const RANGE_TAPE_UUID: [u8; 16] = [0xAB; 16];
 
+    struct ShortFirstModelWriteTransport {
+        inner: ModelTransport,
+        write_returned_short: bool,
+    }
+
+    impl ShortFirstModelWriteTransport {
+        fn new(inner: ModelTransport) -> Self {
+            Self {
+                inner,
+                write_returned_short: false,
+            }
+        }
+    }
+
+    impl SgTransport for ShortFirstModelWriteTransport {
+        fn execute_in(
+            &mut self,
+            cdb: &[u8],
+            buf: &mut [u8],
+        ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError>
+        {
+            self.inner.execute_in(cdb, buf)
+        }
+
+        fn execute_none(&mut self, cdb: &[u8]) -> Result<(), remanence_library::ScsiError> {
+            SgTransport::execute_none(&mut self.inner, cdb)
+        }
+
+        fn execute_out(
+            &mut self,
+            cdb: &[u8],
+            buf: &[u8],
+        ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError>
+        {
+            let mut outcome = SgTransport::execute_out(&mut self.inner, cdb, buf)?;
+            if cdb.first() == Some(&0x0A) && !self.write_returned_short {
+                self.write_returned_short = true;
+                outcome.bytes_transferred = outcome.bytes_transferred.saturating_sub(1);
+            }
+            Ok(outcome)
+        }
+
+        fn set_timeout_for(&mut self, class: remanence_library::TimeoutClass) {
+            self.inner.set_timeout_for(class);
+        }
+
+        fn configure_reserved_buffer(
+            &mut self,
+            requested_bytes: u32,
+        ) -> Result<u32, remanence_library::ScsiError> {
+            self.inner.configure_reserved_buffer(requested_bytes)
+        }
+    }
+
+    struct ArmableShortModelWriteTransport {
+        inner: ModelTransport,
+        short_next_write: Arc<AtomicBool>,
+    }
+
+    impl ArmableShortModelWriteTransport {
+        fn new(inner: ModelTransport, short_next_write: Arc<AtomicBool>) -> Self {
+            Self {
+                inner,
+                short_next_write,
+            }
+        }
+    }
+
+    impl SgTransport for ArmableShortModelWriteTransport {
+        fn execute_in(
+            &mut self,
+            cdb: &[u8],
+            buf: &mut [u8],
+        ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError>
+        {
+            self.inner.execute_in(cdb, buf)
+        }
+
+        fn execute_none(&mut self, cdb: &[u8]) -> Result<(), remanence_library::ScsiError> {
+            SgTransport::execute_none(&mut self.inner, cdb)
+        }
+
+        fn execute_out(
+            &mut self,
+            cdb: &[u8],
+            buf: &[u8],
+        ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError>
+        {
+            let mut outcome = SgTransport::execute_out(&mut self.inner, cdb, buf)?;
+            if cdb.first() == Some(&0x0A) && self.short_next_write.swap(false, Ordering::SeqCst) {
+                outcome.bytes_transferred = outcome.bytes_transferred.saturating_sub(1);
+            }
+            Ok(outcome)
+        }
+
+        fn set_timeout_for(&mut self, class: remanence_library::TimeoutClass) {
+            self.inner.set_timeout_for(class);
+        }
+
+        fn configure_reserved_buffer(
+            &mut self,
+            requested_bytes: u32,
+        ) -> Result<u32, remanence_library::ScsiError> {
+            self.inner.configure_reserved_buffer(requested_bytes)
+        }
+    }
+
     #[test]
     fn restore_phase_decomposition_sums_to_wall_including_saturation() {
         let wall = StdDuration::from_millis(100);
@@ -7641,6 +8049,592 @@ mod tests {
             "open write session",
         )
         .expect("released tape-I/O fence no longer blocks session open");
+    }
+
+    #[test]
+    fn parity_raw_activity_tracks_write_entry_but_not_position_queries() {
+        struct FailingRawSink;
+
+        impl RawTapeSink for FailingRawSink {
+            fn write_fixed_block(&mut self, _buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
+                Err(ParityError::Invariant("injected raw block failure"))
+            }
+
+            fn write_filemarks(
+                &mut self,
+                _count: u32,
+                _immed: bool,
+            ) -> Result<RawWriteOutcome, ParityError> {
+                Err(ParityError::Invariant("injected raw filemark failure"))
+            }
+
+            fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+                Ok(PhysicalPositionHint::new(17))
+            }
+        }
+
+        let mut inner = FailingRawSink;
+        let mut write_attempted = false;
+        {
+            let mut tracked = ActivityTrackingRawTapeSink::new(&mut inner, &mut write_attempted);
+            assert_eq!(
+                tracked.position().expect("position succeeds"),
+                PhysicalPositionHint::new(17)
+            );
+        }
+        assert!(
+            !write_attempted,
+            "position queries must not raise a write fence"
+        );
+
+        {
+            let mut tracked = ActivityTrackingRawTapeSink::new(&mut inner, &mut write_attempted);
+            tracked
+                .write_fixed_block(&[0xAB; 4])
+                .expect_err("injected block failure");
+        }
+        assert!(
+            write_attempted,
+            "entering the raw block-write boundary must make later failure fenceable"
+        );
+
+        struct PositionFailingRawSink;
+
+        impl RawTapeSink for PositionFailingRawSink {
+            fn write_fixed_block(&mut self, _buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
+                panic!("a failed pre-write position check must prevent the block write")
+            }
+
+            fn write_filemarks(
+                &mut self,
+                _count: u32,
+                _immed: bool,
+            ) -> Result<RawWriteOutcome, ParityError> {
+                panic!("a failed pre-write position check must prevent the filemark write")
+            }
+
+            fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+                Err(ParityError::Invariant(
+                    "injected pre-write position failure",
+                ))
+            }
+        }
+
+        let mut inner = PositionFailingRawSink;
+        let mut write_attempted = false;
+        {
+            let mut tracked = ActivityTrackingRawTapeSink::new(&mut inner, &mut write_attempted);
+            tracked
+                .write_fixed_block(&[0xCD; 4])
+                .expect_err("position failure must stop before raw write activity");
+        }
+        assert!(
+            !write_attempted,
+            "pre-write position failure must not raise a physical-write fence"
+        );
+    }
+
+    #[test]
+    fn fresh_parity_bootstrap_short_completion_fences_without_journal_visibility() {
+        const BLOCK_SIZE: u32 = 1024;
+
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-fresh-parity-bootstrap-fence-")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        let mut index = CatalogIndex::open(&index_path).expect("open test index");
+        let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+            "LIB-FRESH-PARITY-FENCE",
+            0x0100,
+            "DRV-FRESH-PARITY-FENCE",
+            0x0400,
+            1,
+        )));
+        world.lock().expect("world lock").put_tape_in_drive(
+            0x0100,
+            "PARITY001",
+            Some(0x0400),
+            VirtualTape::empty(1024 * 1024, BLOCK_SIZE),
+        );
+        let library_model = world.lock().expect("world lock").library_snapshot();
+        let policy = remanence_library::StaticAllowlist::new([library_model.serial.as_str()]);
+        let factory_world = Arc::clone(&world);
+        let mut library = library_model
+            .open_with(&policy, move |path| {
+                let role = factory_world
+                    .lock()
+                    .expect("world lock")
+                    .role_for_path(path)
+                    .expect("known model path");
+                let model = ModelTransport::new(Arc::clone(&factory_world), role);
+                let transport: Box<dyn SgTransport> =
+                    if path.to_string_lossy().contains("/sg-chaos-drive-") {
+                        Box::new(ShortFirstModelWriteTransport::new(model))
+                    } else {
+                        Box::new(model)
+                    };
+                Ok::<_, remanence_library::IoErrorKind>(transport)
+            })
+            .expect("open model library");
+        let snapshot = library_snapshot_cell(library.library().clone());
+        let audit_dir = temp.path().join("audit");
+        std::fs::create_dir_all(&audit_dir).expect("create audit dir");
+        let mut cfg = test_write_owner_config(index_path, audit_dir.clone(), &library, snapshot);
+        cfg.checkpoint_journal_dir = temp.path().join("journals/checkpoints");
+        std::fs::create_dir_all(cfg.checkpoint_journal_dir.parent().expect("journal parent"))
+            .expect("create journal parent");
+        let tape_uuid = [0x46; 16];
+        let scheme = remanence_parity::default_scheme_for_block_size(BLOCK_SIZE);
+        let selected = SelectedTape {
+            pool_id: "fresh-parity-fence-test".to_string(),
+            tape_uuid,
+            block_size: BLOCK_SIZE,
+            parity_config: ParityConfig::Scheme(scheme.clone()),
+        };
+
+        let status = {
+            let mut drive = library.open_drive(0x0100, &policy).expect("open drive");
+            match open_parity_actor_session(&mut index, &mut drive, &cfg, &selected, &[]) {
+                Ok(_) => panic!("short bootstrap completion must fail closed"),
+                Err(status) => status,
+            }
+        };
+
+        assert_eq!(status.code(), tonic::Code::Internal);
+        let active = index
+            .tape_io_admission_conflicts(&tape_uuid, Some("PARITY001"))
+            .expect("active tape-I/O fence");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].reason, "partial_batch");
+        assert!(active[0]
+            .evidence_json
+            .as_deref()
+            .expect("fence evidence")
+            .contains("\"phase\":\"fresh_bootstrap\""));
+        let world_guard = world.lock().expect("world lock");
+        let records = &world_guard
+            .tapes
+            .get("PARITY001")
+            .expect("virtual tape")
+            .records;
+        assert!(
+            matches!(records.as_slice(), [Record::Block(block)] if block.len() == BLOCK_SIZE as usize),
+            "the modeled drive physically accepted the bootstrap before reporting it short"
+        );
+        drop(world_guard);
+
+        let journal_path = parity_journal_path(&cfg, tape_uuid).expect("parity journal path");
+        let journal = FileTapeFileJournal::open(journal_path, tape_uuid, BLOCK_SIZE, scheme)
+            .expect("reopen parity journal");
+        assert!(
+            journal
+                .load_committed()
+                .expect("load committed journal prefix")
+                .entries
+                .is_empty(),
+            "a nonexact bootstrap completion must remain invisible to the committed journal"
+        );
+        let audit = FileAuditLog::replay(audit_dir.as_path()).expect("replay fence audit");
+        assert!(audit.iter().any(|record| {
+            record.event == AuditEvent::TapeIoFenceRaised
+                && record.subject.id.as_deref() == Some(active[0].quarantine_id.as_str())
+        }));
+    }
+
+    #[test]
+    fn first_parity_raw_write_failure_persists_and_audits_partial_fence() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-first-parity-raw-fence-")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        let mut index = CatalogIndex::open(&index_path).expect("open test index");
+        let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+            "LIB-PARITY-FENCE",
+            0x0100,
+            "DRV-PARITY-FENCE",
+            0x0400,
+            1,
+        )));
+        let library = open_model_library(Arc::clone(&world));
+        let snapshot = library_snapshot_cell(library.library().clone());
+        let audit_dir = temp.path().join("audit");
+        std::fs::create_dir_all(&audit_dir).expect("create audit dir");
+        let cfg = test_write_owner_config(index_path, audit_dir.clone(), &library, snapshot);
+        let tape_uuid = [0x45; 16];
+        let selected = SelectedTape {
+            pool_id: "parity-fence-test".to_string(),
+            tape_uuid,
+            block_size: 4096,
+            parity_config: ParityConfig::None,
+        };
+        let error = TapeIoError::PartialBatchUncommittable {
+            requested_records: 1,
+            written_records: 0,
+            requested_bytes: 4096,
+            written_bytes: 4095,
+            end_of_medium: false,
+            sense: None,
+        }
+        .to_string();
+
+        let (status, audited) = fence_failed_parity_raw_write(
+            &mut index,
+            &cfg,
+            &selected,
+            "append",
+            Some("caller-first-after-checkpoint"),
+            None,
+            error.as_str(),
+            Status::internal(error.clone()),
+        );
+
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert!(audited, "the exact persisted fence must be audited");
+        let active = index
+            .tape_io_admission_conflicts(&tape_uuid, None)
+            .expect("active tape-I/O fence");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].reason, "partial_batch");
+        let evidence = active[0].evidence_json.as_deref().expect("fence evidence");
+        assert!(evidence.contains("\"phase\":\"append\""), "{evidence}");
+        assert!(
+            evidence.contains("caller-first-after-checkpoint"),
+            "{evidence}"
+        );
+        session_open_reject_tape_io_fences(
+            &index,
+            &tape_uuid,
+            None,
+            "open write session after failed parity append",
+        )
+        .expect_err("the durable partial fence must block the next session");
+
+        let records = FileAuditLog::replay(audit_dir.as_path()).expect("replay fence audit");
+        assert!(records.iter().any(|record| {
+            record.event == AuditEvent::TapeIoFenceRaised
+                && record.subject.id.as_deref() == Some(active[0].quarantine_id.as_str())
+        }));
+    }
+
+    #[tokio::test]
+    async fn first_post_checkpoint_parity_actor_short_write_fences_and_suppresses_catalog() {
+        const BLOCK_SIZE: u32 = 4096;
+        const POOL_ID: &str = "parity-actor-fence";
+        const BARCODE: &str = "PAF001L9";
+
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-parity-actor-first-write-fence-")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        let tape_uuid = [0x47; 16];
+        let scheme = remanence_parity::ParityScheme {
+            id: remanence_parity::SchemeId::new_static("actor-short-write-test"),
+            data_blocks_per_stripe: 3,
+            parity_blocks_per_stripe: 1,
+            stripes_per_neighborhood: 1,
+        };
+        let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+        index
+            .upsert_tape_pool_projection(TapePoolProjectionInput {
+                pool_id: POOL_ID.to_string(),
+                display_name: None,
+                copy_class: None,
+                content_class: None,
+                created_at_utc: None,
+            })
+            .expect("project pool");
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: BARCODE.to_string(),
+                block_size: BLOCK_SIZE,
+                parity: ParityConfig::Scheme(scheme.clone()),
+                force: false,
+            })
+            .expect("provision parity tape");
+        index
+            .project_tape_pool_membership(tape_uuid, POOL_ID)
+            .expect("assign pool");
+        let drive_uuid = index
+            .observe_drive(DriveObservationInput {
+                serial: "DRV-PARITY-ACTOR-FENCE".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("LIB-PARITY-ACTOR-FENCE".to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-08-08T00:00:00Z".to_string()),
+            })
+            .expect("observe drive")
+            .drive_uuid;
+        drop(index);
+
+        let bootstrap = BootstrapPayload {
+            scheme: Some(remanence_parity::ParitySchemeRecord {
+                id: scheme.id.as_str().to_string(),
+                data_blocks_per_stripe: scheme.data_blocks_per_stripe,
+                parity_blocks_per_stripe: scheme.parity_blocks_per_stripe,
+                stripes_per_neighborhood: scheme.stripes_per_neighborhood,
+                no_parity_flag: false,
+            }),
+            no_parity_flag: false,
+            filemark_map_digest: Some(remanence_parity::FilemarkMapDigest {
+                map_sha256: [0; 32],
+                tape_file_count: 1,
+                map_total_data_ordinals: 0,
+                highest_protected_ordinal: 0,
+                is_final_map: false,
+            }),
+            tape_uuid,
+            written_by_version: "test".to_string(),
+            written_at: "2026-08-08T00:00:00Z".to_string(),
+            sequence: 0,
+            block_size_bytes: BLOCK_SIZE,
+            drive_compression: false,
+            sidecar_epoch_directory: None,
+            parity_map_reference: None,
+            object_rows: Vec::new(),
+        };
+        let mut bootstrap_block = vec![0u8; BLOCK_SIZE as usize];
+        write_bootstrap_block(&bootstrap, &mut bootstrap_block).expect("encode parity bootstrap");
+        let mut tape = VirtualTape::empty(64 * 1024 * 1024, BLOCK_SIZE);
+        tape.records = vec![Record::Block(bootstrap_block), Record::Filemark];
+        tape.written_bytes = u64::from(BLOCK_SIZE);
+        let mut world = VirtualWorld::single_drive(
+            "LIB-PARITY-ACTOR-FENCE",
+            0x0100,
+            "DRV-PARITY-ACTOR-FENCE",
+            0x0400,
+            1,
+        );
+        world.put_tape_in_drive(0x0100, BARCODE, Some(0x0400), tape);
+        let world = Arc::new(Mutex::new(world));
+        let short_next_write = Arc::new(AtomicBool::new(false));
+        let library_model = world.lock().expect("world lock").library_snapshot();
+        let policy = remanence_library::StaticAllowlist::new([library_model.serial.as_str()]);
+        let factory_world = Arc::clone(&world);
+        let factory_short = Arc::clone(&short_next_write);
+        let mut library = library_model
+            .open_with(&policy, move |path| {
+                let role = factory_world
+                    .lock()
+                    .expect("world lock")
+                    .role_for_path(path)
+                    .expect("known model path");
+                let model = ModelTransport::new(Arc::clone(&factory_world), role);
+                let transport: Box<dyn SgTransport> =
+                    if path.to_string_lossy().contains("/sg-chaos-drive-") {
+                        Box::new(ArmableShortModelWriteTransport::new(
+                            model,
+                            Arc::clone(&factory_short),
+                        ))
+                    } else {
+                        Box::new(model)
+                    };
+                Ok::<_, remanence_library::IoErrorKind>(transport)
+            })
+            .expect("open model library");
+        let snapshot = library_snapshot_cell(library.library().clone());
+        let audit_dir = temp.path().join("audit");
+        std::fs::create_dir_all(&audit_dir).expect("create audit dir");
+        let mut cfg =
+            test_write_owner_config(index_path.clone(), audit_dir.clone(), &library, snapshot);
+        cfg.checkpoint_journal_dir = temp.path().join("checkpoints");
+        cfg.checkpoint_max_objects = 2;
+        cfg.checkpoint_max_age_seconds = 3600;
+        let serial = library.library().serial.clone();
+        let drive = library
+            .open_drive(0x0100, &policy)
+            .expect("open model drive");
+        let drive_tx = spawn_drive_actor(0x0100, drive, cfg);
+        let pool_cfg = TapePoolConfig {
+            id: POOL_ID.to_string(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
+            watermark_low: 0.9,
+            watermark_high: 0.95,
+            block_size_bytes: u64::from(BLOCK_SIZE),
+            min_object_size_bytes: 0,
+        };
+        let (open_tx, open_rx) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::OpenWrite {
+                pool_cfg,
+                selected: SelectedTape {
+                    pool_id: POOL_ID.to_string(),
+                    tape_uuid,
+                    block_size: BLOCK_SIZE,
+                    parity_config: ParityConfig::Scheme(scheme.clone()),
+                },
+                target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+                needs_drive_load: false,
+                library_serial: serial,
+                barcode: Some(BARCODE.to_string()),
+                source_slot: None,
+                drive_uuid: Some(drive_uuid),
+                drive_serial: Some("DRV-PARITY-ACTOR-FENCE".to_string()),
+                reply: open_tx,
+            })
+            .await
+            .expect("send parity write open");
+        let session = open_rx
+            .await
+            .expect("parity open reply")
+            .expect("open parity actor session");
+        let session_id = Uuid::from_slice(&session.session_id).expect("session UUID");
+
+        // The catalog ordinarily learns the BOT bootstrap from the durable
+        // checkpoint replay prefix. Seed that already-known structural row so
+        // this regression can focus on the first append after a real actor
+        // checkpoint without depending on the separate fresh-tape projection
+        // workflow.
+        let mut seed_index = CatalogIndex::open(&index_path).expect("open bootstrap projection");
+        seed_index
+            .project_committed_tape_file_bundle(
+                TapeJournalIndexInput {
+                    tape_uuid,
+                    block_size: BLOCK_SIZE,
+                    scheme: Some(scheme.clone()),
+                    journal_offset_bytes: 0,
+                },
+                &CommittedBundle {
+                    kind: CommittedBundleKind::Control,
+                    entries: vec![TapeFileEntry {
+                        tape_file_number: 0,
+                        kind: TapeFileKind::Bootstrap,
+                        block_count: 1,
+                        physical_start_hint: Some(0),
+                        object_id: None,
+                        first_parity_data_ordinal: None,
+                        epoch_id: None,
+                        protected_ordinal_start: None,
+                        protected_ordinal_end_exclusive: None,
+                        canonical_metadata_hash: None,
+                        bootstrap_object_row: None,
+                    }],
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals: 0,
+                },
+            )
+            .expect("project known BOT bootstrap");
+        drop(seed_index);
+
+        let first = append_actor_test_file(
+            &drive_tx,
+            session_id,
+            temp.path().join("parity-first.bin"),
+            "parity-first.bin",
+            "parity-actor-first",
+            b"first parity checkpoint payload",
+        )
+        .await;
+        assert_eq!(
+            first
+                .record
+                .append_commit_info
+                .as_ref()
+                .expect("first append info")
+                .durability,
+            pb::AppendDurability::Written as i32
+        );
+        let (checkpoint_tx, checkpoint_rx) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::Checkpoint {
+                session_id,
+                trigger: CheckpointTrigger::Explicit,
+                expected_batch_id: None,
+                reply: Some(checkpoint_tx),
+            })
+            .await
+            .expect("send parity checkpoint");
+        let checkpoint = checkpoint_rx
+            .await
+            .expect("parity checkpoint reply")
+            .expect("parity checkpoint succeeds");
+        assert_eq!(checkpoint.committed_objects.len(), 1);
+
+        short_next_write.store(true, Ordering::SeqCst);
+        let second = append_actor_test_file_result(
+            &drive_tx,
+            session_id,
+            temp.path().join("parity-second.bin"),
+            "parity-second.bin",
+            "parity-actor-second",
+            b"first payload after the durable parity checkpoint",
+        )
+        .await
+        .expect_err("first post-checkpoint raw write must report the injected short completion");
+        assert!(second
+            .message()
+            .contains("partial fixed batch uncommittable"));
+        assert!(!short_next_write.load(Ordering::SeqCst));
+
+        let third = append_actor_test_file_result(
+            &drive_tx,
+            session_id,
+            temp.path().join("parity-third.bin"),
+            "parity-third.bin",
+            "parity-actor-third",
+            b"poisoned session must refuse this payload",
+        )
+        .await
+        .expect_err("the failed raw append must poison the actor session");
+        assert_eq!(third.code(), tonic::Code::FailedPrecondition);
+
+        let read_only = CatalogIndex::open_read_only(&index_path).expect("open catalog projection");
+        assert!(read_only
+            .get_native_object_by_pool_and_caller_object_id(POOL_ID, "parity-actor-first")
+            .expect("query checkpointed object")
+            .is_some());
+        assert!(
+            read_only
+                .get_native_object_by_caller_object_id("parity-actor-second")
+                .expect("query failed object")
+                .is_none(),
+            "the short post-checkpoint append must not reach catalog visibility"
+        );
+        let active = read_only
+            .tape_io_admission_conflicts(&tape_uuid, Some(BARCODE))
+            .expect("active tape-I/O fence");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].reason, "partial_batch");
+        assert!(active[0]
+            .evidence_json
+            .as_deref()
+            .expect("fence evidence")
+            .contains("parity-actor-second"));
+        drop(read_only);
+
+        let world_guard = world.lock().expect("world lock");
+        assert!(matches!(
+            world_guard
+                .tapes
+                .get(BARCODE)
+                .expect("virtual parity tape")
+                .records
+                .last(),
+            Some(Record::Block(_))
+        ));
+        drop(world_guard);
+        let records = FileAuditLog::replay(audit_dir.as_path()).expect("replay fence audit");
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| {
+                    record.event == AuditEvent::TapeIoFenceRaised
+                        && record.subject.id.as_deref() == Some(active[0].quarantine_id.as_str())
+                })
+                .count(),
+            1,
+            "the actor must audit exactly the fence returned by the failed raw append"
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -1573,6 +1573,7 @@ mod tests {
             self.records.push(Record::Block(buf.to_vec()));
             self.cursor += 1;
             Ok(RawWriteOutcome::WroteBlock {
+                bytes_written: u32::try_from(buf.len()).expect("test block length fits u32"),
                 position_after: PhysicalPositionHint::new(self.cursor as u64),
                 early_warning: false,
                 end_of_medium: false,
