@@ -350,6 +350,442 @@ fn checkpoint_journal_path(dir: &Path, tape_uuid: [u8; 16]) -> PathBuf {
     ))
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct CheckpointBundleShapeError(String);
+
+#[derive(Debug)]
+pub(crate) struct ValidatedParityCheckpointLayout<'a> {
+    pub(crate) first_tape_file: &'a remanence_parity::TapeFileEntry,
+    pub(crate) checkpoint_first_tape_file: &'a remanence_parity::TapeFileEntry,
+    pub(crate) checkpoint_bootstrap: &'a remanence_parity::TapeFileEntry,
+    pub(crate) starting_total_committed_ordinals: u64,
+}
+
+fn checkpoint_bundle_shape_error(detail: impl Into<String>) -> CheckpointBundleShapeError {
+    CheckpointBundleShapeError(detail.into())
+}
+
+/// Validate the complete current-wire parity layout carried by one checkpoint
+/// record. Journal append/replay and SQLite projection both call this function
+/// so they cannot accept different control-bundle shapes.
+pub(crate) fn validate_parity_checkpoint_bundles(
+    record: &CheckpointJournalRecord,
+) -> Result<ValidatedParityCheckpointLayout<'_>, CheckpointBundleShapeError> {
+    if record.scheme.is_none() {
+        return Err(checkpoint_bundle_shape_error(
+            "parity bundle validation requires a parity scheme",
+        ));
+    }
+    if record.object_tape_file_bundles.len() != record.objects.len() {
+        return Err(checkpoint_bundle_shape_error(format!(
+            "parity checkpoint has {} object bundles for {} object projections",
+            record.object_tape_file_bundles.len(),
+            record.objects.len()
+        )));
+    }
+    let checkpoint_bundle = record.checkpoint_bundle.as_ref().ok_or_else(|| {
+        checkpoint_bundle_shape_error("parity checkpoint has no barrier Control bundle")
+    })?;
+
+    let mut first_tape_file = None;
+    let mut prior_last_tape_file = None;
+    let mut highest_protected_ordinal = None;
+    let mut total_committed_ordinals = None;
+    let mut starting_total_committed_ordinals = None;
+
+    for (projection, bundle) in record.objects.iter().zip(&record.object_tape_file_bundles) {
+        remanence_parity::validate_committed_bundle_shape(bundle).map_err(|err| {
+            checkpoint_bundle_shape_error(format!("object {}: {err}", projection.object.object_id))
+        })?;
+        if bundle.kind != remanence_parity::CommittedBundleKind::Object {
+            return Err(checkpoint_bundle_shape_error(format!(
+                "object {} uses {:?} bundle kind",
+                projection.object.object_id, bundle.kind
+            )));
+        }
+        let object_entry = bundle.entries.first().ok_or_else(|| {
+            checkpoint_bundle_shape_error(format!(
+                "object {} bundle is empty",
+                projection.object.object_id
+            ))
+        })?;
+        validate_next_bundle_file(
+            prior_last_tape_file,
+            object_entry,
+            "parity checkpoint object bundle",
+        )?;
+        first_tape_file.get_or_insert(object_entry);
+
+        if object_entry.object_id.as_deref() != Some(projection.object.object_id.as_str())
+            || object_entry.tape_file_number != projection.copy.tape_file_number
+            || object_entry.block_count != projection.block_count
+        {
+            return Err(checkpoint_bundle_shape_error(format!(
+                "object {} bundle entry does not match projection geometry",
+                projection.object.object_id
+            )));
+        }
+        if object_entry.block_count == 0 {
+            return Err(checkpoint_bundle_shape_error(format!(
+                "object {} has zero stored blocks",
+                projection.object.object_id
+            )));
+        }
+        let object_first_ordinal = object_entry.first_parity_data_ordinal.ok_or_else(|| {
+            checkpoint_bundle_shape_error(format!(
+                "object {} has no first parity data ordinal",
+                projection.object.object_id
+            ))
+        })?;
+        let running_total = match total_committed_ordinals {
+            Some(total) => total,
+            None => {
+                starting_total_committed_ordinals = Some(object_first_ordinal);
+                highest_protected_ordinal = Some(object_first_ordinal);
+                object_first_ordinal
+            }
+        };
+        if object_first_ordinal != running_total {
+            return Err(checkpoint_bundle_shape_error(format!(
+                "object {} starts at parity ordinal {}, expected {}",
+                projection.object.object_id, object_first_ordinal, running_total
+            )));
+        }
+        let next_total = running_total
+            .checked_add(object_entry.block_count)
+            .ok_or_else(|| {
+                checkpoint_bundle_shape_error("checkpoint object ordinals overflow u64")
+            })?;
+        if bundle.total_committed_ordinals != next_total
+            || projection.total_committed_ordinals != next_total
+        {
+            return Err(checkpoint_bundle_shape_error(format!(
+                "object {} ends at ordinal {next_total}, but bundle/projection report {}/{}",
+                projection.object.object_id,
+                bundle.total_committed_ordinals,
+                projection.total_committed_ordinals
+            )));
+        }
+        let next_highest = validate_sidecar_watermark_transition(
+            highest_protected_ordinal.expect("set with first object total"),
+            next_total,
+            bundle,
+        )?;
+        if bundle.highest_protected_ordinal != next_highest {
+            return Err(checkpoint_bundle_shape_error(format!(
+                "object {} bundle reports W={}, expected {next_highest} from its sidecars",
+                projection.object.object_id, bundle.highest_protected_ordinal
+            )));
+        }
+        highest_protected_ordinal = Some(next_highest);
+        total_committed_ordinals = Some(next_total);
+        prior_last_tape_file = bundle.entries.last();
+    }
+
+    let first_tape_file = first_tape_file.ok_or_else(|| {
+        checkpoint_bundle_shape_error("parity checkpoint must commit at least one object")
+    })?;
+    let checkpoint_bootstrap = remanence_parity::validate_committed_bundle_shape(checkpoint_bundle)
+        .map_err(|err| checkpoint_bundle_shape_error(format!("checkpoint barrier: {err}")))?
+        .ok_or_else(|| checkpoint_bundle_shape_error("checkpoint barrier has no Bootstrap"))?;
+    if checkpoint_bundle.kind != remanence_parity::CommittedBundleKind::Control {
+        return Err(checkpoint_bundle_shape_error(format!(
+            "checkpoint barrier uses {:?} bundle kind",
+            checkpoint_bundle.kind
+        )));
+    }
+    let checkpoint_first_tape_file = checkpoint_bundle.entries.first().ok_or_else(|| {
+        checkpoint_bundle_shape_error("checkpoint barrier Control bundle is empty")
+    })?;
+    validate_next_bundle_file(
+        prior_last_tape_file,
+        checkpoint_first_tape_file,
+        "parity checkpoint barrier bundle",
+    )?;
+
+    let total_committed_ordinals =
+        total_committed_ordinals.expect("a validated parity checkpoint has at least one object");
+    if checkpoint_bundle.total_committed_ordinals != total_committed_ordinals {
+        return Err(checkpoint_bundle_shape_error(format!(
+            "checkpoint barrier reports T={}, expected {total_committed_ordinals}",
+            checkpoint_bundle.total_committed_ordinals
+        )));
+    }
+    let final_highest = validate_sidecar_watermark_transition(
+        highest_protected_ordinal.expect("a validated parity checkpoint has W"),
+        total_committed_ordinals,
+        checkpoint_bundle,
+    )?;
+    if checkpoint_bundle.highest_protected_ordinal != final_highest {
+        return Err(checkpoint_bundle_shape_error(format!(
+            "checkpoint barrier reports W={}, expected {final_highest} from its sidecars",
+            checkpoint_bundle.highest_protected_ordinal
+        )));
+    }
+    if final_highest != total_committed_ordinals {
+        return Err(checkpoint_bundle_shape_error(format!(
+            "checkpoint barrier left ordinals unprotected: W={final_highest}, T={total_committed_ordinals}"
+        )));
+    }
+    if checkpoint_bootstrap.tape_file_number != record.checkpoint_tape_file_number {
+        return Err(checkpoint_bundle_shape_error(format!(
+            "checkpoint Bootstrap is tape file {}, record names {}",
+            checkpoint_bootstrap.tape_file_number, record.checkpoint_tape_file_number
+        )));
+    }
+
+    Ok(ValidatedParityCheckpointLayout {
+        first_tape_file,
+        checkpoint_first_tape_file,
+        checkpoint_bootstrap,
+        starting_total_committed_ordinals: starting_total_committed_ordinals
+            .expect("a validated parity checkpoint has a starting ordinal"),
+    })
+}
+
+/// Require the external checkpoint record and Layer 3c sink journal to name
+/// the same durable resume boundary before append positioning or media
+/// modification occurs.
+///
+/// The two journals cannot be appended atomically. A crash may therefore
+/// leave either authority one fsync ahead of the other. Resuming from the EOD
+/// in one while seeding logical ordinals from the other could overwrite a
+/// newer tape prefix, so disagreement is a fail-closed recovery condition.
+pub fn validate_parity_resume_authority(
+    records: &[CheckpointJournalRecord],
+    committed: &remanence_parity::CommittedState,
+    tape_uuid: [u8; 16],
+    block_size: u32,
+    scheme: &remanence_parity::ParityScheme,
+) -> Result<(), StateError> {
+    let mismatch = |detail: String| {
+        StateError::JournalReplayFailed(format!("parity resume authority mismatch: {detail}"))
+    };
+    let record = match (records.last(), committed.entries.is_empty()) {
+        (None, true) => return Ok(()),
+        (None, false) => {
+            return Err(mismatch(
+                "sink journal has a committed prefix but checkpoint journal is empty".to_string(),
+            ));
+        }
+        (Some(_), true) => {
+            return Err(mismatch(
+                "checkpoint journal is nonempty but sink journal has no committed prefix"
+                    .to_string(),
+            ));
+        }
+        (Some(record), false) => record,
+    };
+    let layout = validate_parity_checkpoint_bundles(record)
+        .map_err(|err| mismatch(format!("checkpoint record is invalid: {err}")))?;
+    if record.tape_uuid != tape_uuid {
+        return Err(mismatch(format!(
+            "checkpoint tape {} does not match selected tape {}",
+            uuid::Uuid::from_bytes(record.tape_uuid),
+            uuid::Uuid::from_bytes(tape_uuid)
+        )));
+    }
+    if record.block_size != block_size {
+        return Err(mismatch(format!(
+            "checkpoint block size {} does not match sink journal block size {block_size}",
+            record.block_size
+        )));
+    }
+    if record.scheme.as_ref() != Some(scheme) {
+        return Err(mismatch(
+            "checkpoint parity scheme does not match the sink journal".to_string(),
+        ));
+    }
+    if !committed.orphaned_bundles.is_empty() {
+        return Err(mismatch(format!(
+            "sink journal still exposes {} bundle(s) beyond its last checkpoint marker",
+            committed.orphaned_bundles.len()
+        )));
+    }
+    let checkpoint_bundle = record
+        .checkpoint_bundle
+        .as_ref()
+        .expect("validated parity record has a checkpoint bundle");
+    if committed.highest_protected_ordinal != checkpoint_bundle.highest_protected_ordinal
+        || committed.total_committed_ordinals != checkpoint_bundle.total_committed_ordinals
+    {
+        return Err(mismatch(format!(
+            "checkpoint W/T ({}/{}) does not match sink journal W/T ({}/{})",
+            checkpoint_bundle.highest_protected_ordinal,
+            checkpoint_bundle.total_committed_ordinals,
+            committed.highest_protected_ordinal,
+            committed.total_committed_ordinals
+        )));
+    }
+
+    let committed_object_count = committed
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == remanence_parity::TapeFileKind::Object)
+        .count();
+    let committed_object_count = u64::try_from(committed_object_count)
+        .map_err(|_| mismatch("sink journal object count overflows u64".to_string()))?;
+    if committed_object_count != record.committed_object_count {
+        return Err(mismatch(format!(
+            "checkpoint names {} committed objects but sink journal contains {committed_object_count}",
+            record.committed_object_count
+        )));
+    }
+
+    let bot_bootstrap = &committed.entries[0];
+    if bot_bootstrap.tape_file_number != 0
+        || bot_bootstrap.kind != remanence_parity::TapeFileKind::Bootstrap
+        || bot_bootstrap.block_count != 1
+    {
+        return Err(mismatch(format!(
+            "sink journal does not start with the one-block BOT Bootstrap: {bot_bootstrap:?}"
+        )));
+    }
+
+    let expected_prefix = records
+        .iter()
+        .flat_map(|record| {
+            record
+                .object_tape_file_bundles
+                .iter()
+                .flat_map(|bundle| bundle.entries.iter())
+                .chain(
+                    record
+                        .checkpoint_bundle
+                        .iter()
+                        .flat_map(|bundle| bundle.entries.iter()),
+                )
+        })
+        .collect::<Vec<_>>();
+    let expected_sink_entries = expected_prefix
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| mismatch("checkpoint prefix entry count overflows usize".to_string()))?;
+    if committed.entries.len() != expected_sink_entries {
+        return Err(mismatch(format!(
+            "checkpoint history names {expected_sink_entries} tape-file entries including BOT, but sink journal contains {}",
+            committed.entries.len()
+        )));
+    }
+    for (offset, (actual, expected)) in committed.entries[1..]
+        .iter()
+        .zip(expected_prefix)
+        .enumerate()
+    {
+        if !parity_resume_entries_match(actual, expected) {
+            return Err(mismatch(format!(
+                "checkpoint and sink prefixes differ at entry {}: checkpoint={expected:?}, sink={actual:?}",
+                offset + 1
+            )));
+        }
+    }
+
+    let expected_eod_lba = layout
+        .checkpoint_bootstrap
+        .physical_start_hint
+        .ok_or_else(|| mismatch("checkpoint Bootstrap has no physical start hint".to_string()))?
+        .checked_add(layout.checkpoint_bootstrap.block_count)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| mismatch("checkpoint Bootstrap EOD calculation overflows".to_string()))?;
+    if record.eod_partition != 0 || record.eod_lba != expected_eod_lba {
+        return Err(mismatch(format!(
+            "checkpoint barrier position is partition {} lba {}, expected partition 0 lba {expected_eod_lba} from terminal Bootstrap",
+            record.eod_partition, record.eod_lba
+        )));
+    }
+    Ok(())
+}
+
+fn parity_resume_entries_match(
+    sink: &remanence_parity::TapeFileEntry,
+    checkpoint: &remanence_parity::TapeFileEntry,
+) -> bool {
+    if sink.kind != remanence_parity::TapeFileKind::Object
+        || checkpoint.kind != remanence_parity::TapeFileKind::Object
+    {
+        return sink == checkpoint;
+    }
+
+    let Some(checkpoint_object_id) = checkpoint.object_id.as_deref() else {
+        return false;
+    };
+    if sink
+        .object_id
+        .as_deref()
+        .is_some_and(|sink_object_id| sink_object_id != checkpoint_object_id)
+    {
+        return false;
+    }
+    if sink
+        .bootstrap_object_row
+        .as_ref()
+        .and_then(|row| row.object_id.as_deref())
+        != Some(checkpoint_object_id.as_bytes())
+    {
+        return false;
+    }
+
+    let mut sink = sink.clone();
+    let mut checkpoint = checkpoint.clone();
+    sink.object_id = None;
+    checkpoint.object_id = None;
+    sink == checkpoint
+}
+
+fn validate_next_bundle_file(
+    prior_last: Option<&remanence_parity::TapeFileEntry>,
+    next_first: &remanence_parity::TapeFileEntry,
+    context: &str,
+) -> Result<(), CheckpointBundleShapeError> {
+    let Some(prior_last) = prior_last else {
+        return Ok(());
+    };
+    let expected = prior_last.tape_file_number.checked_add(1).ok_or_else(|| {
+        checkpoint_bundle_shape_error("checkpoint tape-file number overflows u32")
+    })?;
+    if next_first.tape_file_number != expected {
+        return Err(checkpoint_bundle_shape_error(format!(
+            "{context} starts at tape file {}, expected {expected}",
+            next_first.tape_file_number
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_sidecar_watermark_transition(
+    mut highest_protected_ordinal: u64,
+    total_committed_ordinals: u64,
+    bundle: &remanence_parity::CommittedBundle,
+) -> Result<u64, CheckpointBundleShapeError> {
+    for sidecar in bundle
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == remanence_parity::TapeFileKind::ParitySidecar)
+    {
+        let start = sidecar.protected_ordinal_start.ok_or_else(|| {
+            checkpoint_bundle_shape_error(format!(
+                "ParitySidecar at tape file {} has no protected range start",
+                sidecar.tape_file_number
+            ))
+        })?;
+        let end = sidecar.protected_ordinal_end_exclusive.ok_or_else(|| {
+            checkpoint_bundle_shape_error(format!(
+                "ParitySidecar at tape file {} has no protected range end",
+                sidecar.tape_file_number
+            ))
+        })?;
+        if start != highest_protected_ordinal || end <= start || end > total_committed_ordinals {
+            return Err(checkpoint_bundle_shape_error(format!(
+                "ParitySidecar at tape file {} protects [{start}, {end}), expected a non-empty range starting at {highest_protected_ordinal} and ending no later than {total_committed_ordinals}",
+                sidecar.tape_file_number
+            )));
+        }
+        highest_protected_ordinal = end;
+    }
+    Ok(highest_protected_ordinal)
+}
+
 fn validate_next_record(
     previous: Option<&CheckpointJournalRecord>,
     record: &CheckpointJournalRecord,
@@ -365,15 +801,6 @@ fn validate_next_record(
     if previous.is_some_and(|prior| prior.scheme != record.scheme) {
         return Err(StateError::JournalReplayFailed(
             "checkpoint parity scheme changed within one tape journal".to_string(),
-        ));
-    }
-    if parity_record
-        && (record.object_tape_file_bundles.len() != record.objects.len()
-            || record.checkpoint_bundle.is_none())
-    {
-        return Err(StateError::JournalReplayFailed(
-            "parity checkpoint record must carry one Layer 3c bundle per object and a barrier bundle"
-                .to_string(),
         ));
     }
     if !parity_record
@@ -437,6 +864,28 @@ fn validate_next_record(
             })?,
         None => 1,
     };
+    let parity_layout = if parity_record {
+        let layout = validate_parity_checkpoint_bundles(record)
+            .map_err(|err| StateError::JournalReplayFailed(err.to_string()))?;
+        if layout.first_tape_file.tape_file_number != expected_first_file {
+            return Err(StateError::JournalReplayFailed(format!(
+                "parity checkpoint starts at tape file {}, expected {expected_first_file}",
+                layout.first_tape_file.tape_file_number
+            )));
+        }
+        let expected_starting_total = previous
+            .and_then(|prior| prior.objects.last())
+            .map_or(0, |projection| projection.total_committed_ordinals);
+        if layout.starting_total_committed_ordinals != expected_starting_total {
+            return Err(StateError::JournalReplayFailed(format!(
+                "parity checkpoint starts at ordinal {}, expected {expected_starting_total}",
+                layout.starting_total_committed_ordinals
+            )));
+        }
+        Some(layout)
+    } else {
+        None
+    };
     let mut expected_file = expected_first_file;
     for (index, projection) in record.objects.iter().enumerate() {
         if projection.block_size != record.block_size {
@@ -452,31 +901,7 @@ fn validate_next_record(
             )));
         }
         let object_file = if parity_record {
-            let bundle = &record.object_tape_file_bundles[index];
-            let first = bundle.entries.first().ok_or_else(|| {
-                StateError::JournalReplayFailed(
-                    "parity checkpoint object bundle is empty".to_string(),
-                )
-            })?;
-            if first.kind != remanence_parity::TapeFileKind::Object {
-                return Err(StateError::JournalReplayFailed(
-                    "parity checkpoint object bundle does not start with its object".to_string(),
-                ));
-            }
-            for entry in &bundle.entries {
-                if entry.tape_file_number != expected_file {
-                    return Err(StateError::JournalReplayFailed(format!(
-                        "parity checkpoint bundle uses tape file {}, expected {expected_file}",
-                        entry.tape_file_number
-                    )));
-                }
-                expected_file = expected_file.checked_add(1).ok_or_else(|| {
-                    StateError::JournalReplayFailed(
-                        "checkpoint tape-file number overflows u32".to_string(),
-                    )
-                })?;
-            }
-            first.tape_file_number
+            record.object_tape_file_bundles[index].entries[0].tape_file_number
         } else {
             let object_file = expected_file;
             expected_file = expected_file.checked_add(1).ok_or_else(|| {
@@ -508,29 +933,8 @@ fn validate_next_record(
             )));
         }
     }
-    let expected_checkpoint_file = if let Some(bundle) = &record.checkpoint_bundle {
-        let mut bootstrap_file = None;
-        for entry in &bundle.entries {
-            if entry.tape_file_number != expected_file {
-                return Err(StateError::JournalReplayFailed(format!(
-                    "parity checkpoint barrier uses tape file {}, expected {expected_file}",
-                    entry.tape_file_number
-                )));
-            }
-            expected_file = expected_file.checked_add(1).ok_or_else(|| {
-                StateError::JournalReplayFailed(
-                    "checkpoint barrier tape-file number overflows u32".to_string(),
-                )
-            })?;
-            if entry.kind == remanence_parity::TapeFileKind::Bootstrap {
-                bootstrap_file = Some(entry.tape_file_number);
-            }
-        }
-        bootstrap_file.ok_or_else(|| {
-            StateError::JournalReplayFailed(
-                "parity checkpoint barrier bundle has no bootstrap".to_string(),
-            )
-        })?
+    let expected_checkpoint_file = if let Some(layout) = &parity_layout {
+        layout.checkpoint_bootstrap.tape_file_number
     } else {
         expected_file
     };
@@ -655,6 +1059,405 @@ mod tests {
         record.objects[0].bootstrap_object_row.tape_file_number = 3;
         record.objects[0].bootstrap_object_row.object_id = object_uuid.to_string().into_bytes();
         record
+    }
+
+    fn parity_entry(
+        tape_file_number: u32,
+        kind: remanence_parity::TapeFileKind,
+    ) -> remanence_parity::TapeFileEntry {
+        remanence_parity::TapeFileEntry {
+            tape_file_number,
+            kind,
+            block_count: 1,
+            physical_start_hint: None,
+            object_id: None,
+            first_parity_data_ordinal: None,
+            epoch_id: None,
+            protected_ordinal_start: None,
+            protected_ordinal_end_exclusive: None,
+            canonical_metadata_hash: None,
+            bootstrap_object_row: None,
+        }
+    }
+
+    fn partial_epoch_parity_record(tape_uuid: [u8; 16]) -> CheckpointJournalRecord {
+        let mut record = record(tape_uuid);
+        record.eod_lba = 12;
+        record.checkpoint_tape_file_number = 3;
+        record.scheme = Some(remanence_parity::ParityScheme {
+            id: remanence_parity::SchemeId::new_static("checkpoint-partial-epoch"),
+            data_blocks_per_stripe: 8,
+            parity_blocks_per_stripe: 2,
+            stripes_per_neighborhood: 1,
+        });
+        record.objects[0].fresh_tape = false;
+        record.objects[0].copy.first_parity_data_ordinal = Some(0);
+        record.objects[0].copy.protected_until_ordinal = Some(0);
+        let mut object = parity_entry(1, remanence_parity::TapeFileKind::Object);
+        object.block_count = 3;
+        object.object_id = Some(record.objects[0].object.object_id.clone());
+        object.first_parity_data_ordinal = Some(0);
+        object.bootstrap_object_row = Some(record.objects[0].bootstrap_object_row.to_parity_row());
+        record.object_tape_file_bundles = vec![remanence_parity::CommittedBundle {
+            kind: remanence_parity::CommittedBundleKind::Object,
+            entries: vec![object],
+            highest_protected_ordinal: 0,
+            total_committed_ordinals: 3,
+        }];
+        let mut sidecar = parity_entry(2, remanence_parity::TapeFileKind::ParitySidecar);
+        sidecar.epoch_id = Some(0);
+        sidecar.protected_ordinal_start = Some(0);
+        sidecar.protected_ordinal_end_exclusive = Some(3);
+        sidecar.canonical_metadata_hash = Some([0x61; 32]);
+        record.checkpoint_bundle = Some(remanence_parity::CommittedBundle {
+            kind: remanence_parity::CommittedBundleKind::Control,
+            entries: vec![
+                sidecar,
+                parity_entry(3, remanence_parity::TapeFileKind::Bootstrap),
+            ],
+            highest_protected_ordinal: 3,
+            total_committed_ordinals: 3,
+        });
+        record
+            .checkpoint_bundle
+            .as_mut()
+            .expect("checkpoint bundle")
+            .entries[1]
+            .physical_start_hint = Some(10);
+        record
+    }
+
+    fn second_partial_epoch_parity_record(
+        prior: &CheckpointJournalRecord,
+    ) -> CheckpointJournalRecord {
+        let mut record = partial_epoch_parity_record(prior.tape_uuid);
+        let object_uuid = uuid::Uuid::from_bytes([0x52; 16]);
+        record.ordinal = 2;
+        record.committed_object_count = 2;
+        record.eod_lba = 22;
+        record.batch_id = [0x43; 16];
+        record.checkpoint_tape_file_number = 6;
+        record.objects[0].object.object_id = object_uuid.to_string();
+        record.objects[0].object.caller_object_id = Some("checkpoint-test-2".to_string());
+        record.objects[0].copy.object_id = object_uuid.to_string();
+        record.objects[0].copy.tape_file_number = 4;
+        record.objects[0].copy.first_parity_data_ordinal = Some(3);
+        record.objects[0].copy.protected_until_ordinal = Some(3);
+        record.objects[0].total_committed_ordinals = 6;
+        record.objects[0].bootstrap_object_row.tape_file_number = 4;
+        record.objects[0].bootstrap_object_row.object_id = object_uuid.to_string().into_bytes();
+
+        let mut object = parity_entry(4, remanence_parity::TapeFileKind::Object);
+        object.block_count = 3;
+        object.object_id = Some(object_uuid.to_string());
+        object.first_parity_data_ordinal = Some(3);
+        object.bootstrap_object_row = Some(record.objects[0].bootstrap_object_row.to_parity_row());
+        record.object_tape_file_bundles = vec![remanence_parity::CommittedBundle {
+            kind: remanence_parity::CommittedBundleKind::Object,
+            entries: vec![object],
+            highest_protected_ordinal: 3,
+            total_committed_ordinals: 6,
+        }];
+
+        let mut sidecar = parity_entry(5, remanence_parity::TapeFileKind::ParitySidecar);
+        sidecar.epoch_id = Some(1);
+        sidecar.protected_ordinal_start = Some(3);
+        sidecar.protected_ordinal_end_exclusive = Some(6);
+        sidecar.canonical_metadata_hash = Some([0x62; 32]);
+        let mut bootstrap = parity_entry(6, remanence_parity::TapeFileKind::Bootstrap);
+        bootstrap.physical_start_hint = Some(20);
+        record.checkpoint_bundle = Some(remanence_parity::CommittedBundle {
+            kind: remanence_parity::CommittedBundleKind::Control,
+            entries: vec![sidecar, bootstrap],
+            highest_protected_ordinal: 6,
+            total_committed_ordinals: 6,
+        });
+        record
+    }
+
+    fn committed_state_for_parity_records(
+        records: &[CheckpointJournalRecord],
+    ) -> remanence_parity::CommittedState {
+        let mut entries = vec![parity_entry(0, remanence_parity::TapeFileKind::Bootstrap)];
+        for record in records {
+            entries.extend(
+                record
+                    .object_tape_file_bundles
+                    .iter()
+                    .flat_map(|bundle| bundle.entries.iter().cloned()),
+            );
+            entries.extend(
+                record
+                    .checkpoint_bundle
+                    .as_ref()
+                    .expect("checkpoint bundle")
+                    .entries
+                    .iter()
+                    .cloned(),
+            );
+        }
+        for entry in &mut entries {
+            if entry.kind == remanence_parity::TapeFileKind::Object {
+                entry.object_id = None;
+            }
+        }
+        let checkpoint_bundle = records
+            .last()
+            .expect("at least one checkpoint record")
+            .checkpoint_bundle
+            .as_ref()
+            .expect("checkpoint bundle");
+        remanence_parity::CommittedState {
+            entries,
+            highest_protected_ordinal: checkpoint_bundle.highest_protected_ordinal,
+            total_committed_ordinals: checkpoint_bundle.total_committed_ordinals,
+            orphaned_bundles: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn parity_resume_requires_checkpoint_and_sink_journal_to_name_same_prefix() {
+        let tape_uuid = [0x28; 16];
+        let record = partial_epoch_parity_record(tape_uuid);
+        let scheme = record.scheme.as_ref().expect("parity scheme");
+        let committed = committed_state_for_parity_records(std::slice::from_ref(&record));
+
+        validate_parity_resume_authority(
+            std::slice::from_ref(&record),
+            &committed,
+            tape_uuid,
+            record.block_size,
+            scheme,
+        )
+        .expect("matching durable authorities permit resume");
+
+        let mut wrong_identity = committed.clone();
+        wrong_identity
+            .entries
+            .iter_mut()
+            .find(|entry| entry.kind == remanence_parity::TapeFileKind::Object)
+            .and_then(|entry| entry.bootstrap_object_row.as_mut())
+            .expect("sink object row")
+            .object_id = Some(b"different-object".to_vec());
+        validate_parity_resume_authority(
+            std::slice::from_ref(&record),
+            &wrong_identity,
+            tape_uuid,
+            record.block_size,
+            scheme,
+        )
+        .expect_err("higher-layer enrichment cannot hide a sink object identity mismatch");
+
+        let mut wrong_inline_identity = committed.clone();
+        wrong_inline_identity
+            .entries
+            .iter_mut()
+            .find(|entry| entry.kind == remanence_parity::TapeFileKind::Object)
+            .expect("sink object entry")
+            .object_id = Some("different-object".to_string());
+        validate_parity_resume_authority(
+            std::slice::from_ref(&record),
+            &wrong_inline_identity,
+            tape_uuid,
+            record.block_size,
+            scheme,
+        )
+        .expect_err("a conflicting inline sink object identity must fail closed");
+
+        let mut sink_ahead = committed.clone();
+        let mut newer_bootstrap = parity_entry(4, remanence_parity::TapeFileKind::Bootstrap);
+        newer_bootstrap.physical_start_hint = Some(record.eod_lba);
+        sink_ahead.entries.push(newer_bootstrap);
+        let error = validate_parity_resume_authority(
+            std::slice::from_ref(&record),
+            &sink_ahead,
+            tape_uuid,
+            record.block_size,
+            scheme,
+        )
+        .expect_err("a sink journal one checkpoint ahead must fail closed");
+        assert!(error
+            .to_string()
+            .contains("parity resume authority mismatch"));
+
+        let mut stale_eod = record.clone();
+        stale_eod.eod_lba -= 1;
+        let error = validate_parity_resume_authority(
+            std::slice::from_ref(&stale_eod),
+            &committed,
+            tape_uuid,
+            record.block_size,
+            scheme,
+        )
+        .expect_err("a stale physical checkpoint position must fail closed");
+        assert!(error.to_string().contains("expected partition 0 lba 12"));
+
+        let empty = remanence_parity::CommittedState {
+            entries: Vec::new(),
+            highest_protected_ordinal: 0,
+            total_committed_ordinals: 0,
+            orphaned_bundles: Vec::new(),
+        };
+        validate_parity_resume_authority(&[], &empty, tape_uuid, record.block_size, scheme)
+            .expect("two empty authorities describe fresh media");
+        let error = validate_parity_resume_authority(
+            std::slice::from_ref(&record),
+            &empty,
+            tape_uuid,
+            record.block_size,
+            scheme,
+        )
+        .expect_err("checkpoint-only authority must fail closed");
+        assert!(error
+            .to_string()
+            .contains("sink journal has no committed prefix"));
+        let error =
+            validate_parity_resume_authority(&[], &committed, tape_uuid, record.block_size, scheme)
+                .expect_err("sink-only authority must fail closed");
+        assert!(error.to_string().contains("checkpoint journal is empty"));
+
+        let second = second_partial_epoch_parity_record(&record);
+        let records = vec![record.clone(), second];
+        let committed = committed_state_for_parity_records(&records);
+        validate_parity_resume_authority(
+            &records,
+            &committed,
+            tape_uuid,
+            record.block_size,
+            scheme,
+        )
+        .expect("the complete two-checkpoint prefix permits resume");
+
+        let mut changed_old_prefix = committed;
+        changed_old_prefix.entries[1].physical_start_hint = Some(99);
+        validate_parity_resume_authority(
+            &records,
+            &changed_old_prefix,
+            tape_uuid,
+            record.block_size,
+            scheme,
+        )
+        .expect_err("a mismatch in an older checkpoint prefix must fail closed");
+    }
+
+    #[test]
+    fn fsynced_partial_epoch_parity_checkpoint_round_trips() {
+        let dir = tempfile::tempdir().expect("temporary checkpoint directory");
+        let tape_uuid = [0x25; 16];
+        let record = partial_epoch_parity_record(tape_uuid);
+        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+
+        journal
+            .append(&record)
+            .expect("append sidecar-plus-Bootstrap checkpoint");
+        assert_eq!(
+            journal.replay().expect("replay parity checkpoint"),
+            vec![record]
+        );
+    }
+
+    #[test]
+    fn parity_checkpoint_validator_accepts_all_current_control_suffixes() {
+        let tape_uuid = [0x26; 16];
+        let sidecar_then_bootstrap = partial_epoch_parity_record(tape_uuid);
+
+        let mut bootstrap_only = sidecar_then_bootstrap.clone();
+        let sidecar = bootstrap_only
+            .checkpoint_bundle
+            .as_mut()
+            .expect("checkpoint bundle")
+            .entries
+            .remove(0);
+        bootstrap_only.object_tape_file_bundles[0]
+            .entries
+            .push(sidecar);
+        bootstrap_only.object_tape_file_bundles[0].highest_protected_ordinal = 3;
+
+        let mut parity_map_then_bootstrap = bootstrap_only.clone();
+        parity_map_then_bootstrap.checkpoint_tape_file_number = 4;
+        parity_map_then_bootstrap
+            .checkpoint_bundle
+            .as_mut()
+            .expect("checkpoint bundle")
+            .entries = vec![
+            parity_entry(3, remanence_parity::TapeFileKind::ParityMap),
+            parity_entry(4, remanence_parity::TapeFileKind::Bootstrap),
+        ];
+
+        let mut sidecar_parity_map_bootstrap = sidecar_then_bootstrap.clone();
+        sidecar_parity_map_bootstrap.checkpoint_tape_file_number = 4;
+        sidecar_parity_map_bootstrap
+            .checkpoint_bundle
+            .as_mut()
+            .expect("checkpoint bundle")
+            .entries
+            .insert(
+                1,
+                parity_entry(3, remanence_parity::TapeFileKind::ParityMap),
+            );
+        sidecar_parity_map_bootstrap
+            .checkpoint_bundle
+            .as_mut()
+            .expect("checkpoint bundle")
+            .entries[2]
+            .tape_file_number = 4;
+
+        for record in [
+            bootstrap_only,
+            parity_map_then_bootstrap,
+            sidecar_then_bootstrap,
+            sidecar_parity_map_bootstrap,
+        ] {
+            validate_parity_checkpoint_bundles(&record)
+                .unwrap_or_else(|err| panic!("valid checkpoint control suffix rejected: {err}"));
+        }
+    }
+
+    #[test]
+    fn parity_checkpoint_validator_rejects_unprotected_or_misnumbered_barriers() {
+        let tape_uuid = [0x27; 16];
+        let mut unprotected = partial_epoch_parity_record(tape_uuid);
+        unprotected
+            .checkpoint_bundle
+            .as_mut()
+            .expect("checkpoint bundle")
+            .entries
+            .remove(0);
+        unprotected
+            .checkpoint_bundle
+            .as_mut()
+            .expect("checkpoint bundle")
+            .entries[0]
+            .tape_file_number = 2;
+        unprotected
+            .checkpoint_bundle
+            .as_mut()
+            .expect("checkpoint bundle")
+            .highest_protected_ordinal = 0;
+        unprotected.checkpoint_tape_file_number = 2;
+        assert!(validate_parity_checkpoint_bundles(&unprotected)
+            .expect_err("checkpoint must close the open epoch")
+            .to_string()
+            .contains("left ordinals unprotected"));
+
+        let mut misnumbered = partial_epoch_parity_record(tape_uuid);
+        misnumbered.checkpoint_tape_file_number = 9;
+        assert!(validate_parity_checkpoint_bundles(&misnumbered)
+            .expect_err("record must identify the terminal Bootstrap")
+            .to_string()
+            .contains("record names 9"));
+
+        let mut discontinuous_sidecar = partial_epoch_parity_record(tape_uuid);
+        discontinuous_sidecar
+            .checkpoint_bundle
+            .as_mut()
+            .expect("checkpoint bundle")
+            .entries[0]
+            .protected_ordinal_start = Some(1);
+        assert!(validate_parity_checkpoint_bundles(&discontinuous_sidecar)
+            .expect_err("sidecar range must start at the prior watermark")
+            .to_string()
+            .contains("starting at 0"));
     }
 
     #[test]

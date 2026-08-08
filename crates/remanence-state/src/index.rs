@@ -5820,6 +5820,19 @@ fn validate_checkpoint_record_bundle_shape(
     object_bundles: &[CommittedBundle],
     checkpoint_bundle: &CommittedBundle,
 ) -> Result<(), StateError> {
+    let parity_layout = if record.scheme.is_some() {
+        Some(
+            crate::checkpoint::validate_parity_checkpoint_bundles(record).map_err(|err| {
+                StateError::IndexCorrupt(format!(
+                    "checkpoint record tape={} ordinal={} has invalid parity bundles: {err}",
+                    hex_uuid(record.tape_uuid),
+                    record.ordinal
+                ))
+            })?,
+        )
+    } else {
+        None
+    };
     let mut last_new_tape_file: Option<u32> = None;
     let mut prior_total_committed_ordinals: Option<u64> = None;
     for (projection, bundle) in record.objects.iter().zip(object_bundles) {
@@ -5957,42 +5970,48 @@ fn validate_checkpoint_record_bundle_shape(
         }
     }
 
-    if checkpoint_bundle.kind != CommittedBundleKind::Control
-        || checkpoint_bundle.entries.len() != 1
-        || checkpoint_bundle.entries[0].kind != TapeFileKind::Bootstrap
-        || checkpoint_bundle.entries[0].block_count != 1
-        || checkpoint_bundle.entries[0].tape_file_number != record.checkpoint_tape_file_number
-    {
-        return Err(StateError::IndexCorrupt(format!(
-            "checkpoint record tape={} ordinal={} has invalid checkpoint control bundle {:?}",
-            hex_uuid(record.tape_uuid),
-            record.ordinal,
-            checkpoint_bundle
-        )));
-    }
-    let expected_checkpoint_file = last_new_tape_file
+    let checkpoint_first = if let Some(layout) = &parity_layout {
+        layout.checkpoint_first_tape_file
+    } else {
+        if checkpoint_bundle.kind != CommittedBundleKind::Control
+            || checkpoint_bundle.entries.len() != 1
+            || checkpoint_bundle.entries[0].kind != TapeFileKind::Bootstrap
+            || checkpoint_bundle.entries[0].block_count != 1
+            || checkpoint_bundle.entries[0].tape_file_number != record.checkpoint_tape_file_number
+        {
+            return Err(StateError::IndexCorrupt(format!(
+                "checkpoint record tape={} ordinal={} has invalid checkpoint control bundle {:?}",
+                hex_uuid(record.tape_uuid),
+                record.ordinal,
+                checkpoint_bundle
+            )));
+        }
+        &checkpoint_bundle.entries[0]
+    };
+    let expected_checkpoint_first = last_new_tape_file
         .and_then(|last| last.checked_add(1))
         .ok_or_else(|| {
             StateError::IndexCorrupt("checkpoint has no object tape-file prefix".into())
         })?;
-    if record.checkpoint_tape_file_number != expected_checkpoint_file {
+    if checkpoint_first.tape_file_number != expected_checkpoint_first {
         return Err(StateError::IndexCorrupt(format!(
-            "checkpoint record tape={} ordinal={} expected checkpoint tape file {expected_checkpoint_file}, got {}",
+            "checkpoint record tape={} ordinal={} expected checkpoint bundle to start at tape file {expected_checkpoint_first}, got {}",
             hex_uuid(record.tape_uuid),
             record.ordinal,
-            record.checkpoint_tape_file_number
+            checkpoint_first.tape_file_number
         )));
     }
-    let expected_highest = object_bundles
-        .last()
-        .map(|bundle| bundle.highest_protected_ordinal)
-        .unwrap_or(0);
-    if checkpoint_bundle.highest_protected_ordinal != expected_highest {
+    if parity_layout.is_none()
+        && checkpoint_bundle.highest_protected_ordinal
+            != object_bundles
+                .last()
+                .map(|bundle| bundle.highest_protected_ordinal)
+                .unwrap_or(0)
+    {
         return Err(StateError::IndexCorrupt(format!(
-            "checkpoint record tape={} ordinal={} control highest-protected watermark {} does not match object prefix {expected_highest}",
+            "checkpoint record tape={} ordinal={} parity-off control changed its highest-protected watermark",
             hex_uuid(record.tape_uuid),
-            record.ordinal,
-            checkpoint_bundle.highest_protected_ordinal
+            record.ordinal
         )));
     }
     Ok(())
@@ -6879,17 +6898,26 @@ fn validate_checkpoint_control_extension_tx(
     input: &TapeJournalIndexInput,
     bundle: &CommittedBundle,
 ) -> Result<(), StateError> {
-    if bundle.kind != CommittedBundleKind::Control
-        || bundle.entries.len() != 1
-        || bundle.entries[0].kind != TapeFileKind::Bootstrap
-        || bundle.entries[0].block_count != 1
-    {
+    if bundle.kind != CommittedBundleKind::Control {
         return Err(StateError::IndexCorrupt(format!(
-            "checkpoint projection for tape {} requires one-block Control bootstrap bundle",
-            hex_uuid(input.tape_uuid)
+            "checkpoint projection for tape {} requires a Control bundle, got {:?}",
+            hex_uuid(input.tape_uuid),
+            bundle.kind
         )));
     }
-    let entry = &bundle.entries[0];
+    remanence_parity::validate_committed_bundle_shape(bundle).map_err(|err| {
+        StateError::IndexCorrupt(format!(
+            "checkpoint projection for tape {} has invalid Control bundle: {err}",
+            hex_uuid(input.tape_uuid)
+        ))
+    })?;
+    let first_entry = bundle.entries.first().ok_or_else(|| {
+        StateError::IndexCorrupt(format!(
+            "checkpoint projection for tape {} has an empty Control bundle",
+            hex_uuid(input.tape_uuid)
+        ))
+    })?;
+    let last_entry = validate_dense_bundle_entries(&bundle.entries, input.tape_uuid)?;
     let prefix = load_append_projection_prefix_tx(tx, input)?;
     validate_append_geometry(input, &prefix)?;
     if prefix.state != "ready" {
@@ -6899,7 +6927,7 @@ fn validate_checkpoint_control_extension_tx(
             prefix.state
         )));
     }
-    let expected_file = prefix
+    let expected_first = prefix
         .last_committed_tape_file
         .and_then(|last| last.checked_add(1))
         .ok_or_else(|| {
@@ -6908,34 +6936,66 @@ fn validate_checkpoint_control_extension_tx(
                 hex_uuid(input.tape_uuid)
             ))
         })?;
-    if entry.tape_file_number != expected_file {
+    if first_entry.tape_file_number != expected_first {
         return Err(StateError::IndexCorrupt(format!(
-            "checkpoint projection for tape {} is non-contiguous: expected bootstrap tape file {expected_file}, got {}",
+            "checkpoint projection for tape {} is non-contiguous: expected first Control tape file {expected_first}, got {}",
             hex_uuid(input.tape_uuid),
-            entry.tape_file_number
+            first_entry.tape_file_number
         )));
     }
-    if bundle.total_committed_ordinals != prefix.total_committed_ordinals
-        || bundle.highest_protected_ordinal != prefix.highest_protected_ordinal
-    {
+    if bundle.total_committed_ordinals != prefix.total_committed_ordinals {
         return Err(StateError::IndexCorrupt(format!(
-            "checkpoint bootstrap for tape {} changed ordinal watermarks",
+            "checkpoint Control bundle for tape {} changed total committed ordinals",
+            hex_uuid(input.tape_uuid)
+        )));
+    }
+    if input.scheme.is_some() {
+        let expected_highest = crate::checkpoint::validate_sidecar_watermark_transition(
+            prefix.highest_protected_ordinal,
+            prefix.total_committed_ordinals,
+            bundle,
+        )
+        .map_err(|err| {
+            StateError::IndexCorrupt(format!(
+                "checkpoint Control bundle for tape {} has an invalid sidecar transition: {err}",
+                hex_uuid(input.tape_uuid)
+            ))
+        })?;
+        if bundle.highest_protected_ordinal != expected_highest {
+            return Err(StateError::IndexCorrupt(format!(
+                "checkpoint Control bundle for tape {} reports W={}, expected {expected_highest} from W={} and its sidecars",
+                hex_uuid(input.tape_uuid),
+                bundle.highest_protected_ordinal,
+                prefix.highest_protected_ordinal
+            )));
+        }
+    } else if bundle.highest_protected_ordinal != prefix.highest_protected_ordinal {
+        return Err(StateError::IndexCorrupt(format!(
+            "parity-off checkpoint Control bundle for tape {} changed its highest-protected ordinal",
             hex_uuid(input.tape_uuid)
         )));
     }
     let overlapping = tx
         .query_row(
-            "select 1 from tape_files where tape_uuid = ?1 and tape_file_number = ?2",
-            params![input.tape_uuid.to_vec(), i64::from(entry.tape_file_number)],
-            |_| Ok(()),
+            "select tape_file_number
+             from tape_files
+             where tape_uuid = ?1 and tape_file_number between ?2 and ?3
+             order by tape_file_number
+             limit 1",
+            params![
+                input.tape_uuid.to_vec(),
+                i64::from(first_entry.tape_file_number),
+                i64::from(last_entry.tape_file_number),
+            ],
+            |row| row.get::<_, i64>(0),
         )
         .optional()
         .map_err(|err| sqlite_error("query checkpoint bootstrap overlap", err))?;
-    if overlapping.is_some() {
+    if let Some(existing) = overlapping {
         return Err(StateError::IndexCorrupt(format!(
             "checkpoint projection for tape {} overlaps tape file {}",
             hex_uuid(input.tape_uuid),
-            entry.tape_file_number
+            existing
         )));
     }
     Ok(())
@@ -14885,38 +14945,60 @@ mod tests {
             "no barrier has proved an extent yet"
         );
 
+        index
+            .project_committed_tape_file_bundle(
+                TapeJournalIndexInput {
+                    tape_uuid,
+                    block_size: 4096,
+                    scheme: Some(scheme.clone()),
+                    journal_offset_bytes: 0,
+                },
+                &CommittedBundle {
+                    kind: CommittedBundleKind::Control,
+                    entries: vec![TapeFileEntry {
+                        tape_file_number: 0,
+                        kind: TapeFileKind::Bootstrap,
+                        block_count: 1,
+                        physical_start_hint: Some(0),
+                        object_id: None,
+                        first_parity_data_ordinal: None,
+                        epoch_id: None,
+                        protected_ordinal_start: None,
+                        protected_ordinal_end_exclusive: None,
+                        canonical_metadata_hash: None,
+                        bootstrap_object_row: None,
+                    }],
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals: 0,
+                },
+            )
+            .expect("project BOT bootstrap before the first parity checkpoint");
+
         // Physical layout: bootstrap [0,1) fm@1, object [2,6) fm@6, sidecar
         // [7,9) fm@9, checkpoint bootstrap [10,11) fm@11. The barrier
-        // measured EOD 11; the object rollup would say 4.
+        // measured EOD 12 after that final filemark; the object rollup would
+        // say 4.
         let object_bundle = CommittedBundle {
             kind: CommittedBundleKind::Object,
+            entries: vec![TapeFileEntry {
+                tape_file_number: 1,
+                kind: TapeFileKind::Object,
+                block_count: 4,
+                physical_start_hint: Some(2),
+                object_id: Some("extent-object".to_string()),
+                first_parity_data_ordinal: Some(0),
+                epoch_id: None,
+                protected_ordinal_start: None,
+                protected_ordinal_end_exclusive: None,
+                canonical_metadata_hash: None,
+                bootstrap_object_row: None,
+            }],
+            highest_protected_ordinal: 0,
+            total_committed_ordinals: 4,
+        };
+        let checkpoint_bundle = CommittedBundle {
+            kind: CommittedBundleKind::Control,
             entries: vec![
-                TapeFileEntry {
-                    tape_file_number: 0,
-                    kind: TapeFileKind::Bootstrap,
-                    block_count: 1,
-                    physical_start_hint: Some(0),
-                    object_id: None,
-                    first_parity_data_ordinal: None,
-                    epoch_id: None,
-                    protected_ordinal_start: None,
-                    protected_ordinal_end_exclusive: None,
-                    canonical_metadata_hash: None,
-                    bootstrap_object_row: None,
-                },
-                TapeFileEntry {
-                    tape_file_number: 1,
-                    kind: TapeFileKind::Object,
-                    block_count: 4,
-                    physical_start_hint: Some(2),
-                    object_id: Some("extent-object".to_string()),
-                    first_parity_data_ordinal: Some(0),
-                    epoch_id: None,
-                    protected_ordinal_start: None,
-                    protected_ordinal_end_exclusive: None,
-                    canonical_metadata_hash: None,
-                    bootstrap_object_row: None,
-                },
                 TapeFileEntry {
                     tape_file_number: 2,
                     kind: TapeFileKind::ParitySidecar,
@@ -14930,25 +15012,20 @@ mod tests {
                     canonical_metadata_hash: Some([0x66; 32]),
                     bootstrap_object_row: None,
                 },
+                TapeFileEntry {
+                    tape_file_number: 3,
+                    kind: TapeFileKind::Bootstrap,
+                    block_count: 1,
+                    physical_start_hint: Some(10),
+                    object_id: None,
+                    first_parity_data_ordinal: None,
+                    epoch_id: None,
+                    protected_ordinal_start: None,
+                    protected_ordinal_end_exclusive: None,
+                    canonical_metadata_hash: None,
+                    bootstrap_object_row: None,
+                },
             ],
-            highest_protected_ordinal: 4,
-            total_committed_ordinals: 4,
-        };
-        let checkpoint_bundle = CommittedBundle {
-            kind: CommittedBundleKind::Control,
-            entries: vec![TapeFileEntry {
-                tape_file_number: 3,
-                kind: TapeFileKind::Bootstrap,
-                block_count: 1,
-                physical_start_hint: Some(10),
-                object_id: None,
-                first_parity_data_ordinal: None,
-                epoch_id: None,
-                protected_ordinal_start: None,
-                protected_ordinal_end_exclusive: None,
-                canonical_metadata_hash: None,
-                bootstrap_object_row: None,
-            }],
             highest_protected_ordinal: 4,
             total_committed_ordinals: 4,
         };
@@ -14956,7 +15033,7 @@ mod tests {
             ordinal: 1,
             committed_object_count: 1,
             eod_partition: 0,
-            eod_lba: 11,
+            eod_lba: 12,
             tape_uuid,
             batch_id: [0x64; 16],
             checkpoint_tape_file_number: 3,
@@ -14966,7 +15043,7 @@ mod tests {
                 files: Vec::new(),
                 copy: NativeObjectCopyProjectionInput {
                     first_parity_data_ordinal: Some(0),
-                    protected_until_ordinal: Some(4),
+                    protected_until_ordinal: Some(0),
                     ..append_copy_projection("extent-object", tape_uuid, 1)
                 },
                 block_size: 4096,
@@ -15010,7 +15087,7 @@ mod tests {
             .expect("tape row");
         assert_eq!(
             tape.written_extent_lba,
-            Some(11),
+            Some(12),
             "the extent is the barrier-proved measurement"
         );
         assert_ne!(
@@ -15031,7 +15108,7 @@ mod tests {
                 .expect("query tape")
                 .expect("tape row")
                 .written_extent_lba,
-            Some(11)
+            Some(12)
         );
     }
 

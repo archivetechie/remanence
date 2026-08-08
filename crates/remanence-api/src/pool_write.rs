@@ -37,13 +37,12 @@ use remanence_parity::{
 };
 #[cfg(test)]
 use remanence_parity::{CommittedState, JournalError};
-#[cfg(test)]
-use remanence_state::TapeJournalIndexInput;
 use remanence_state::{
     validate_tape_pool_capacity_invariant, watermark_floor_bytes, CatalogIndex,
     NativeObjectCopyProjectionInput, NativeObjectCopyRecord, NativeObjectFileProjectionInput,
-    NativeObjectProjectionInput, NativeObjectRecord, StateError, TapePoolConfig, TapeRecord,
-    OBJECT_COPY_REPRESENTATION_ENCRYPTED, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+    NativeObjectProjectionInput, NativeObjectRecord, StateError, TapeJournalIndexInput,
+    TapePoolConfig, TapeRecord, OBJECT_COPY_REPRESENTATION_ENCRYPTED,
+    OBJECT_COPY_REPRESENTATION_PLAINTEXT,
 };
 use remanence_stream::{
     plan_prepared_object, prepare_regular_file, write_prepared_object_to_parity_from_readers,
@@ -1009,6 +1008,31 @@ pub enum PinnedTapeError {
     State(#[from] remanence_state::StateError),
 }
 
+fn tape_is_fresh_for_checkpoint_admission(
+    state: &CatalogIndex,
+    tape: &TapeRecord,
+    tape_uuid: &TapeUuid,
+) -> Result<bool, StateError> {
+    if tape.total_committed_ordinals != 0 {
+        return Ok(false);
+    }
+    match tape.last_committed_tape_file {
+        None => Ok(state.list_tape_files(tape_uuid)?.is_empty()),
+        Some(0) if tape.scheme_id.is_some() => {
+            let files = state.list_tape_files(tape_uuid)?;
+            Ok(matches!(
+                files.as_slice(),
+                [file]
+                    if file.tape_file_number == 0
+                        && file.kind == "bootstrap"
+                        && file.block_count == 1
+                        && file.object_id.is_none()
+            ))
+        }
+        _ => Ok(false),
+    }
+}
+
 /// Admit one operator-pinned tape for a write session.
 ///
 /// `pool_cfg` is the configuration of `required_pool_id`, resolved by the
@@ -1045,13 +1069,20 @@ pub fn admit_pinned_tape_for_write_session(
             actual_pool_id: actual_pool.map(str::to_string),
         });
     }
-    if let Err(reason) = check_writability_preconditions(&tape, 0)
+    match check_writability_preconditions(&tape, 0)
         .and_then(|_| check_pool_block_size_precondition(&tape, pool_cfg))
     {
-        return Err(PinnedTapeError::NotWritable {
-            tape_uuid: uuid_text,
-            reason,
-        });
+        Ok(()) => {}
+        Err(WritabilityError::ParityAppendUnsupported { .. }) => {
+            // The gate below requires a durable checkpoint record. Session
+            // open compares that record with the sink journal before LOCATE.
+        }
+        Err(reason) => {
+            return Err(PinnedTapeError::NotWritable {
+                tape_uuid: uuid_text,
+                reason,
+            });
+        }
     }
     let conflicts = state.tape_io_admission_conflicts(&tape_uuid, tape.voltag.as_deref())?;
     if let Some(conflict) = conflicts.first() {
@@ -1061,7 +1092,7 @@ pub fn admit_pinned_tape_for_write_session(
             reason: conflict.reason.clone(),
         });
     }
-    let fresh = tape.total_committed_ordinals == 0 && tape.last_committed_tape_file.is_none();
+    let fresh = tape_is_fresh_for_checkpoint_admission(state, &tape, &tape_uuid)?;
     if !fresh {
         let checkpoint_journal_tapes = checkpoint_journal_tape_uuids(checkpoint_journal_dir)?;
         if !tape_carries_checkpoint(checkpoint_journal_dir, &checkpoint_journal_tapes, tape_uuid)? {
@@ -1149,11 +1180,21 @@ fn select_tape_in_pool_with_policy_and_eligibility(
     let mut eligible = Vec::new();
     let mut batched_ineligible = Vec::new();
     for tape in tapes {
-        if let Err(err) = check_writability_preconditions(&tape, object_size)
+        match check_writability_preconditions(&tape, object_size)
             .and_then(|_| check_pool_block_size_precondition(&tape, pool_cfg))
         {
-            reasons.push(err);
-            continue;
+            Ok(()) => {}
+            Err(WritabilityError::ParityAppendUnsupported { .. })
+                if checkpoint_journal_dir.is_some() =>
+            {
+                // The checkpoint-specific eligibility gate below requires a
+                // durable record before admission. Session open proves that
+                // it agrees with the sink journal before LOCATE.
+            }
+            Err(err) => {
+                reasons.push(err);
+                continue;
+            }
         }
         let tape_uuid = tape_uuid_from_vec(tape.tape_uuid.clone(), pool_id.as_str())?;
         let conflicts = state
@@ -1169,8 +1210,7 @@ fn select_tape_in_pool_with_policy_and_eligibility(
         if let (Some(checkpoint_journal_dir), Some(checkpoint_journal_tapes)) =
             (checkpoint_journal_dir, checkpoint_journal_tapes.as_ref())
         {
-            let fresh =
-                tape.total_committed_ordinals == 0 && tape.last_committed_tape_file.is_none();
+            let fresh = tape_is_fresh_for_checkpoint_admission(state, &tape, &tape_uuid)?;
             let carries_checkpoint = fresh
                 || tape_carries_checkpoint(
                     checkpoint_journal_dir,
@@ -1480,6 +1520,14 @@ pub fn write_to_selected_tape_checkpointed(
                 );
             }
             let committed = parity_journal.load_committed().map_err(ParityError::from)?;
+            remanence_state::validate_parity_resume_authority(
+                &prior_records,
+                &committed,
+                selected.tape_uuid,
+                selected.block_size,
+                parity_scheme,
+            )
+            .map_err(|err| PoolWriteError::InvalidInput(err.to_string()))?;
             let session_state = if committed.entries.is_empty() {
                 sink.locate(0)?;
                 let mut raw = BlockSinkRawTapeSink::new(sink);
@@ -1509,7 +1557,14 @@ pub fn write_to_selected_tape_checkpointed(
                     return Err(err.into());
                 }
                 parity.write_bootstrap()?;
-                parity.into_session_state()?
+                let session_state = parity.into_session_state()?;
+                project_fresh_parity_bootstrap_bundle(
+                    state,
+                    &selected,
+                    parity_scheme,
+                    &parity_journal,
+                )?;
+                session_state
             } else {
                 let checkpoint = prior_records.last().ok_or_else(|| {
                     PoolWriteError::InvalidInput(
@@ -1719,6 +1774,47 @@ pub fn write_to_selected_tape_checkpointed(
         }
     }
     Ok(result)
+}
+
+pub(crate) fn project_fresh_parity_bootstrap_bundle(
+    state: &mut CatalogIndex,
+    selected: &SelectedTape,
+    scheme: &ParityScheme,
+    journal: &FileTapeFileJournal,
+) -> Result<(), PoolWriteError> {
+    let replay = journal.load_committed().map_err(ParityError::from)?;
+    let bootstrap_bundle = match replay.orphaned_bundles.as_slice() {
+        [bundle] => bundle,
+        _ => {
+            return Err(PoolWriteError::InvalidInput(format!(
+                "fresh parity bootstrap journal has unexpected prefix: {replay:?}"
+            )));
+        }
+    };
+    if !replay.entries.is_empty()
+        || bootstrap_bundle.kind != CommittedBundleKind::Control
+        || bootstrap_bundle.entries.len() != 1
+        || bootstrap_bundle.entries[0].tape_file_number != 0
+        || bootstrap_bundle.entries[0].kind != TapeFileKind::Bootstrap
+        || bootstrap_bundle.highest_protected_ordinal != 0
+        || bootstrap_bundle.total_committed_ordinals != 0
+        || replay.highest_protected_ordinal != 0
+        || replay.total_committed_ordinals != 0
+    {
+        return Err(PoolWriteError::InvalidInput(format!(
+            "fresh parity bootstrap journal has unexpected prefix: {replay:?}"
+        )));
+    }
+    state.project_committed_tape_file_bundle(
+        TapeJournalIndexInput {
+            tape_uuid: selected.tape_uuid,
+            block_size: selected.block_size,
+            scheme: Some(scheme.clone()),
+            journal_offset_bytes: 0,
+        },
+        bootstrap_bundle,
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -7003,6 +7099,31 @@ mod tests {
 
     use super::*;
 
+    #[derive(Debug, Default)]
+    struct LocateCountingSink {
+        inner: VecBlockSink,
+        locate_calls: u64,
+    }
+
+    impl BlockSink for LocateCountingSink {
+        fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
+            self.inner.write_block(buf)
+        }
+
+        fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
+            self.inner.write_filemarks(count)
+        }
+
+        fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
+            self.locate_calls = self.locate_calls.saturating_add(1);
+            self.inner.locate(lba)
+        }
+
+        fn position(&mut self) -> Result<TapePosition, TapeIoError> {
+            self.inner.position()
+        }
+    }
+
     #[derive(Debug)]
     struct StagedTestSink {
         inner: VecBlockSink,
@@ -8707,6 +8828,255 @@ mod tests {
         )
         .expect("daemon selector accepts CLI-journaled non-fresh tape");
         assert_eq!(admitted.tape_uuid, tape_uuid);
+    }
+
+    #[test]
+    fn checkpointed_parity_tape_is_admitted_for_daemon_resume() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-parity-daemon-resume-")
+            .tempdir()
+            .expect("tempdir");
+        let mut index =
+            CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open catalog");
+        let pool_id = "parity.resume";
+        let tape_uuid = [0x8F; 16];
+        let scheme = ParityScheme {
+            id: remanence_parity::SchemeId::new_static("parity-daemon-resume-test"),
+            data_blocks_per_stripe: 8,
+            parity_blocks_per_stripe: 2,
+            stripes_per_neighborhood: 1,
+        };
+        index
+            .upsert_tape_pool_projection(remanence_state::TapePoolProjectionInput {
+                pool_id: pool_id.to_string(),
+                display_name: None,
+                copy_class: None,
+                content_class: None,
+                created_at_utc: None,
+            })
+            .expect("project pool");
+        index
+            .provision_tape(remanence_state::ProvisionTapeInput {
+                tape_uuid,
+                voltag: "PAR001L9".to_string(),
+                block_size: 4096,
+                parity: ParityConfig::Scheme(scheme.clone()),
+                force: false,
+            })
+            .expect("provision parity tape");
+        index
+            .project_tape_pool_membership(tape_uuid, pool_id)
+            .expect("assign tape");
+        let cfg = TapePoolConfig {
+            id: pool_id.to_string(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            selection_policy: Default::default(),
+            watermark_low: 0.9,
+            watermark_high: 0.95,
+            block_size_bytes: 4096,
+            min_object_size_bytes: 0,
+        };
+        let selected =
+            select_tape_in_pool(&index, &cfg, 7, &HashSet::new()).expect("fresh tape selects");
+        let checkpoint_dir = temp.path().join("checkpoints");
+        let parity_journal_path = temp.path().join("parity.remjournal");
+
+        // Model a crash after the fresh BOT was durably written and projected,
+        // but before the first object checkpoint existed. The BOT bundle is
+        // intentionally still orphaned in the sink journal.
+        {
+            let mut journal = FileTapeFileJournal::open(
+                &parity_journal_path,
+                tape_uuid,
+                selected.block_size,
+                scheme.clone(),
+            )
+            .expect("open fresh parity journal");
+            journal
+                .commit_bundle(&CommittedBundle {
+                    kind: CommittedBundleKind::Control,
+                    entries: vec![TapeFileEntry {
+                        tape_file_number: 0,
+                        kind: TapeFileKind::Bootstrap,
+                        block_count: 1,
+                        physical_start_hint: Some(0),
+                        object_id: None,
+                        first_parity_data_ordinal: None,
+                        epoch_id: None,
+                        protected_ordinal_start: None,
+                        protected_ordinal_end_exclusive: None,
+                        canonical_metadata_hash: None,
+                        bootstrap_object_row: None,
+                    }],
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals: 0,
+                })
+                .expect("journal fresh BOT bundle");
+            project_fresh_parity_bootstrap_bundle(&mut index, &selected, &scheme, &journal)
+                .expect("project fresh BOT before simulated crash");
+            let state = journal.load_committed().expect("load orphaned BOT");
+            assert!(state.entries.is_empty());
+            assert_eq!(state.orphaned_bundles.len(), 1);
+        }
+        let bootstrap_only = index
+            .get_tape(&tape_uuid)
+            .expect("query bootstrap-only tape")
+            .expect("bootstrap-only tape exists");
+        assert_eq!(bootstrap_only.total_committed_ordinals, 0);
+        assert_eq!(bootstrap_only.last_committed_tape_file, Some(0));
+
+        let recovered = select_tape_in_pool_for_write_session(
+            &index,
+            &cfg,
+            7,
+            &HashSet::new(),
+            &checkpoint_dir,
+        )
+        .expect("pool selector admits a parity BOT without an object checkpoint");
+        let fresh_pinned =
+            admit_pinned_tape_for_write_session(&index, tape_uuid, pool_id, &cfg, &checkpoint_dir)
+                .expect("pinned selector admits a parity BOT without an object checkpoint");
+        assert_eq!(fresh_pinned.tape_uuid, tape_uuid);
+
+        let payload_path = temp.path().join("payload.bin");
+        std::fs::write(&payload_path, b"payload").expect("write payload");
+        let request = WriteObjectToPoolRequest {
+            pool_id: pool_id.to_string(),
+            source: WriteObjectSource::Path(payload_path),
+            archive_path: PathBuf::from("payload.bin"),
+            caller_object_id: "parity-resume-caller".to_string(),
+            expected_content_sha256: None,
+            representation: PoolWriteRepresentation::Plaintext,
+        };
+        let mut sink = LocateCountingSink::default();
+        write_to_selected_tape_checkpointed(
+            &mut index,
+            &mut sink,
+            &cfg,
+            request,
+            recovered,
+            &checkpoint_dir,
+            &parity_journal_path,
+        )
+        .expect("bootstrap-only crash recovery reaches the first parity checkpoint");
+        assert_eq!(sink.locate_calls, 1, "recovery rewrites BOT exactly once");
+
+        let admitted = select_tape_in_pool_for_write_session(
+            &index,
+            &cfg,
+            7,
+            &HashSet::new(),
+            &checkpoint_dir,
+        )
+        .expect("daemon selector admits checkpointed parity tape");
+        assert_eq!(admitted.tape_uuid, tape_uuid);
+
+        let pinned =
+            admit_pinned_tape_for_write_session(&index, tape_uuid, pool_id, &cfg, &checkpoint_dir)
+                .expect("pinned selector admits checkpoint-authorized parity tape");
+        assert_eq!(pinned.tape_uuid, tape_uuid);
+
+        let committed = FileTapeFileJournal::open(
+            &parity_journal_path,
+            tape_uuid,
+            u32::try_from(cfg.block_size_bytes).expect("test block size fits u32"),
+            scheme,
+        )
+        .and_then(|mut journal| {
+            let state = journal.load_committed()?;
+            let next_file = state
+                .entries
+                .last()
+                .expect("checkpointed journal has a tape-file prefix")
+                .tape_file_number
+                .checked_add(1)
+                .expect("test tape-file number");
+            journal.commit_bundle(&CommittedBundle {
+                kind: CommittedBundleKind::Control,
+                entries: vec![TapeFileEntry {
+                    tape_file_number: next_file,
+                    kind: TapeFileKind::Bootstrap,
+                    block_count: 1,
+                    physical_start_hint: Some(100),
+                    object_id: None,
+                    first_parity_data_ordinal: None,
+                    epoch_id: None,
+                    protected_ordinal_start: None,
+                    protected_ordinal_end_exclusive: None,
+                    canonical_metadata_hash: None,
+                    bootstrap_object_row: None,
+                }],
+                highest_protected_ordinal: state.highest_protected_ordinal,
+                total_committed_ordinals: state.total_committed_ordinals,
+            })?;
+            journal.commit_bundle(&CommittedBundle {
+                kind: CommittedBundleKind::CheckpointedThrough,
+                entries: Vec::new(),
+                highest_protected_ordinal: state.highest_protected_ordinal,
+                total_committed_ordinals: state.total_committed_ordinals,
+            })?;
+            journal.load_committed()
+        })
+        .expect("advance only the sink journal past the shared checkpoint");
+        assert!(committed.orphaned_bundles.is_empty());
+
+        let second_payload_path = temp.path().join("second-payload.bin");
+        std::fs::write(&second_payload_path, b"second payload").expect("write second payload");
+        let second_request = WriteObjectToPoolRequest {
+            pool_id: pool_id.to_string(),
+            source: WriteObjectSource::Path(second_payload_path),
+            archive_path: PathBuf::from("second-payload.bin"),
+            caller_object_id: "parity-resume-second-caller".to_string(),
+            expected_content_sha256: None,
+            representation: PoolWriteRepresentation::Plaintext,
+        };
+        let mut mismatch_sink = LocateCountingSink::default();
+        let error = write_to_selected_tape_checkpointed(
+            &mut index,
+            &mut mismatch_sink,
+            &cfg,
+            second_request,
+            pinned.clone(),
+            &checkpoint_dir,
+            &parity_journal_path,
+        )
+        .expect_err("disagreeing durable resume authorities must fail closed");
+        assert!(error
+            .to_string()
+            .contains("parity resume authority mismatch"));
+        assert_eq!(
+            mismatch_sink.locate_calls, 0,
+            "authority disagreement must be rejected before positioning tape"
+        );
+
+        let missing_journal_path = temp.path().join("missing-parity.remjournal");
+        let mut missing_journal_sink = LocateCountingSink::default();
+        let error = write_to_selected_tape_checkpointed(
+            &mut index,
+            &mut missing_journal_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: pool_id.to_string(),
+                source: WriteObjectSource::Path(temp.path().join("second-payload.bin")),
+                archive_path: PathBuf::from("missing-journal-payload.bin"),
+                caller_object_id: "parity-resume-missing-journal".to_string(),
+                expected_content_sha256: None,
+                representation: PoolWriteRepresentation::Plaintext,
+            },
+            pinned,
+            &checkpoint_dir,
+            &missing_journal_path,
+        )
+        .expect_err("a missing sink journal must not turn a checkpointed tape into fresh media");
+        assert!(error
+            .to_string()
+            .contains("parity resume authority mismatch"));
+        assert_eq!(
+            missing_journal_sink.locate_calls, 0,
+            "a missing sink authority must be rejected before append positioning"
+        );
     }
 
     #[test]

@@ -1661,6 +1661,30 @@ struct TapeInitArgs {
     /// Fixed tape block size for a fresh initialization.
     #[arg(long, value_name = "BYTES", value_parser = parse_tape_block_size)]
     block_size: Option<u64>,
+
+    /// Parity geometry for a fresh initialization.
+    #[arg(long, value_enum, default_value_t = TapeInitParity::None)]
+    parity: TapeInitParity,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum TapeInitParity {
+    /// Initialize a parity-off tape.
+    #[default]
+    None,
+    /// Initialize using Remanence's block-size-aware default parity scheme.
+    Default,
+}
+
+impl TapeInitParity {
+    fn config(self, block_size: u32) -> remanence_api::ParityConfig {
+        match self {
+            Self::None => remanence_api::ParityConfig::None,
+            Self::Default => remanence_api::ParityConfig::Scheme(
+                remanence_parity::default_scheme_for_block_size(block_size),
+            ),
+        }
+    }
 }
 
 impl TapeInitArgs {
@@ -10015,6 +10039,7 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         &decision,
         clobber_data_confirmed,
         fresh_block_size,
+        args.parity.config(fresh_block_size),
     );
     record_media_readiness_signal_if_requested(
         state,
@@ -10245,6 +10270,7 @@ fn planned_init_geometry(
     decision: &remanence_api::InitDecision,
     clobber_data_confirmed: bool,
     fresh_block_size: u32,
+    fresh_parity: remanence_api::ParityConfig,
 ) -> (remanence_api::TapeUuid, u32, remanence_api::ParityConfig) {
     if let remanence_api::BotClassification::OursBootstrap { uuid, geometry } = bot {
         if matches!(
@@ -10256,11 +10282,7 @@ fn planned_init_geometry(
             return (*uuid, geometry.block_size_bytes, geometry.parity.clone());
         }
     }
-    (
-        *Uuid::new_v4().as_bytes(),
-        fresh_block_size,
-        remanence_api::ParityConfig::None,
-    )
+    (*Uuid::new_v4().as_bytes(), fresh_block_size, fresh_parity)
 }
 
 fn pool_projection_inputs(
@@ -17796,6 +17818,7 @@ mod tests {
             &remanence_api::InitDecision::FreshInit,
             false,
             fresh_block_size,
+            remanence_api::ParityConfig::None,
         );
         assert_eq!(block_size, fresh_block_size);
         assert_eq!(parity, remanence_api::ParityConfig::None);
@@ -17812,9 +17835,30 @@ mod tests {
             &remanence_api::InitDecision::IdempotentNoOp,
             false,
             fresh_block_size,
+            remanence_api::ParityConfig::Scheme(remanence_parity::default_scheme_for_block_size(
+                fresh_block_size,
+            )),
         );
         assert_eq!(block_size, 4096);
         assert_eq!(parity, remanence_api::ParityConfig::None);
+    }
+
+    #[test]
+    fn planned_init_geometry_applies_requested_parity_only_to_fresh_media() {
+        let block_size = 256 * 1024;
+        let requested = remanence_api::ParityConfig::Scheme(
+            remanence_parity::default_scheme_for_block_size(block_size),
+        );
+        let (_uuid, planned_block_size, parity) = planned_init_geometry(
+            &remanence_api::BotClassification::BlankCheckEod,
+            &remanence_api::InitDecision::FreshInit,
+            false,
+            block_size,
+            requested.clone(),
+        );
+
+        assert_eq!(planned_block_size, block_size);
+        assert_eq!(parity, requested);
     }
 
     #[test]

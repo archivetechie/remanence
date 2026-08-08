@@ -50,6 +50,10 @@ pub enum JournalError {
     /// Journal record encoding or decoding failed.
     #[error("journal encode/decode: {0}")]
     Codec(String),
+    /// A bundle does not match the structural grammar for its operational
+    /// kind.
+    #[error(transparent)]
+    InvalidBundleShape(#[from] CommittedBundleShapeError),
     /// Journal path is on a filesystem class that cannot be trusted as a
     /// crash-recovery commit point.
     #[error(
@@ -159,6 +163,155 @@ pub struct CommittedBundle {
     pub highest_protected_ordinal: u64,
     /// Total committed object-data ordinals after this bundle.
     pub total_committed_ordinals: u64,
+}
+
+/// Structural grammar violation in one committed tape-file bundle.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid {kind:?} committed bundle: {detail}")]
+pub struct CommittedBundleShapeError {
+    kind: CommittedBundleKind,
+    detail: String,
+}
+
+impl CommittedBundleShapeError {
+    fn new(kind: CommittedBundleKind, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// Validate the current-wire entry grammar for one committed bundle.
+///
+/// Object bundles contain their Object first, followed by completed sidecars
+/// and an optional `ParityMap? Bootstrap` control tail. Control and Finish
+/// bundles end in a mandatory Bootstrap after any sidecars and optional
+/// ParityMap. The returned entry is that terminal Bootstrap when the grammar
+/// permits one.
+pub fn validate_committed_bundle_shape(
+    bundle: &CommittedBundle,
+) -> Result<Option<&TapeFileEntry>, CommittedBundleShapeError> {
+    validate_dense_entry_numbers(bundle)?;
+    match bundle.kind {
+        CommittedBundleKind::Object => {
+            let Some((object, tail)) = bundle.entries.split_first() else {
+                return Err(CommittedBundleShapeError::new(
+                    bundle.kind,
+                    "must contain an Object entry",
+                ));
+            };
+            if object.kind != TapeFileKind::Object {
+                return Err(CommittedBundleShapeError::new(
+                    bundle.kind,
+                    format!("must start with Object, got {:?}", object.kind),
+                ));
+            }
+            validate_control_tail(bundle.kind, tail, false)
+        }
+        CommittedBundleKind::Control | CommittedBundleKind::Finish => {
+            validate_control_tail(bundle.kind, &bundle.entries, true)
+        }
+        CommittedBundleKind::ResumeSidecars => {
+            if bundle.entries.is_empty() {
+                return Err(CommittedBundleShapeError::new(
+                    bundle.kind,
+                    "must contain at least one ParitySidecar",
+                ));
+            }
+            validate_sidecar_prefix(bundle.kind, &bundle.entries)?;
+            Ok(None)
+        }
+        CommittedBundleKind::CheckpointedThrough => {
+            if !bundle.entries.is_empty() {
+                return Err(CommittedBundleShapeError::new(
+                    bundle.kind,
+                    "must not contain tape-file entries",
+                ));
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn validate_dense_entry_numbers(bundle: &CommittedBundle) -> Result<(), CommittedBundleShapeError> {
+    for pair in bundle.entries.windows(2) {
+        let expected = pair[0].tape_file_number.checked_add(1).ok_or_else(|| {
+            CommittedBundleShapeError::new(bundle.kind, "tape-file number overflows u32")
+        })?;
+        if pair[1].tape_file_number != expected {
+            return Err(CommittedBundleShapeError::new(
+                bundle.kind,
+                format!(
+                    "entries are not dense: expected tape file {expected}, got {}",
+                    pair[1].tape_file_number
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_control_tail(
+    kind: CommittedBundleKind,
+    entries: &[TapeFileEntry],
+    bootstrap_required: bool,
+) -> Result<Option<&TapeFileEntry>, CommittedBundleShapeError> {
+    let (prefix, bootstrap) = match entries.split_last() {
+        Some((entry, prefix)) if entry.kind == TapeFileKind::Bootstrap => {
+            if entry.block_count != 1 {
+                return Err(CommittedBundleShapeError::new(
+                    kind,
+                    format!(
+                        "terminal Bootstrap at tape file {} has {} blocks, expected one",
+                        entry.tape_file_number, entry.block_count
+                    ),
+                ));
+            }
+            (prefix, Some(entry))
+        }
+        _ if bootstrap_required => {
+            return Err(CommittedBundleShapeError::new(
+                kind,
+                "must end with a Bootstrap",
+            ));
+        }
+        _ => (entries, None),
+    };
+
+    let sidecars = match prefix.split_last() {
+        Some((entry, sidecars)) if entry.kind == TapeFileKind::ParityMap => {
+            if bootstrap.is_none() {
+                return Err(CommittedBundleShapeError::new(
+                    kind,
+                    "ParityMap requires an immediately following Bootstrap",
+                ));
+            }
+            sidecars
+        }
+        _ => prefix,
+    };
+    validate_sidecar_prefix(kind, sidecars)?;
+    Ok(bootstrap)
+}
+
+fn validate_sidecar_prefix(
+    kind: CommittedBundleKind,
+    entries: &[TapeFileEntry],
+) -> Result<(), CommittedBundleShapeError> {
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.kind != TapeFileKind::ParitySidecar)
+    {
+        return Err(CommittedBundleShapeError::new(
+            kind,
+            format!(
+                "unexpected {:?} entry at tape file {}",
+                entry.kind, entry.tape_file_number
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Replay result for the committed prefix stored in a journal.
@@ -512,6 +665,7 @@ impl TapeFileJournal for FileTapeFileJournal {
     }
 
     fn commit_bundle(&mut self, bundle: &CommittedBundle) -> Result<(), JournalError> {
+        validate_committed_bundle_shape(bundle)?;
         validate_commit_watermarks(
             bundle,
             self.last_highest_protected_ordinal,
@@ -686,6 +840,7 @@ fn load_committed_from_reader(
             break;
         }
         let bundle = decode_bundle(&payload)?;
+        validate_committed_bundle_shape(&bundle)?;
         if bundle.highest_protected_ordinal < replay_highest_protected_ordinal {
             return Err(JournalError::Codec(format!(
                 "journal bundle regressed highest_protected_ordinal from {} to {}",
@@ -1331,6 +1486,130 @@ mod tests {
             entries: Vec::new(),
             highest_protected_ordinal: 3,
             total_committed_ordinals: 3,
+        }
+    }
+
+    fn structural_entry(tape_file_number: u32, kind: TapeFileKind) -> TapeFileEntry {
+        TapeFileEntry {
+            tape_file_number,
+            kind,
+            block_count: if kind == TapeFileKind::Bootstrap {
+                1
+            } else {
+                2
+            },
+            physical_start_hint: None,
+            object_id: (kind == TapeFileKind::Object).then(|| "object-1".to_string()),
+            first_parity_data_ordinal: (kind == TapeFileKind::Object).then_some(0),
+            epoch_id: None,
+            protected_ordinal_start: None,
+            protected_ordinal_end_exclusive: None,
+            canonical_metadata_hash: None,
+            bootstrap_object_row: None,
+        }
+    }
+
+    fn structural_bundle(
+        kind: CommittedBundleKind,
+        entry_kinds: &[TapeFileKind],
+    ) -> CommittedBundle {
+        CommittedBundle {
+            kind,
+            entries: entry_kinds
+                .iter()
+                .enumerate()
+                .map(|(number, kind)| structural_entry(number as u32, *kind))
+                .collect(),
+            highest_protected_ordinal: 0,
+            total_committed_ordinals: 0,
+        }
+    }
+
+    #[test]
+    fn shared_bundle_validator_accepts_every_current_wire_control_tail() {
+        let accepted = [
+            structural_bundle(CommittedBundleKind::Object, &[TapeFileKind::Object]),
+            structural_bundle(
+                CommittedBundleKind::Object,
+                &[TapeFileKind::Object, TapeFileKind::ParitySidecar],
+            ),
+            structural_bundle(
+                CommittedBundleKind::Object,
+                &[
+                    TapeFileKind::Object,
+                    TapeFileKind::ParitySidecar,
+                    TapeFileKind::ParityMap,
+                    TapeFileKind::Bootstrap,
+                ],
+            ),
+            structural_bundle(CommittedBundleKind::Control, &[TapeFileKind::Bootstrap]),
+            structural_bundle(
+                CommittedBundleKind::Control,
+                &[TapeFileKind::ParitySidecar, TapeFileKind::Bootstrap],
+            ),
+            structural_bundle(
+                CommittedBundleKind::Finish,
+                &[
+                    TapeFileKind::ParitySidecar,
+                    TapeFileKind::ParityMap,
+                    TapeFileKind::Bootstrap,
+                ],
+            ),
+            structural_bundle(
+                CommittedBundleKind::ResumeSidecars,
+                &[TapeFileKind::ParitySidecar, TapeFileKind::ParitySidecar],
+            ),
+            structural_bundle(CommittedBundleKind::CheckpointedThrough, &[]),
+        ];
+
+        for bundle in accepted {
+            validate_committed_bundle_shape(&bundle)
+                .unwrap_or_else(|err| panic!("valid {:?} shape rejected: {err}", bundle.kind));
+        }
+    }
+
+    #[test]
+    fn shared_bundle_validator_rejects_ambiguous_or_non_dense_shapes() {
+        let mut non_dense = structural_bundle(
+            CommittedBundleKind::Control,
+            &[TapeFileKind::ParitySidecar, TapeFileKind::Bootstrap],
+        );
+        non_dense.entries[1].tape_file_number = 9;
+        let mut multi_block_bootstrap =
+            structural_bundle(CommittedBundleKind::Control, &[TapeFileKind::Bootstrap]);
+        multi_block_bootstrap.entries[0].block_count = 2;
+        let rejected = [
+            structural_bundle(CommittedBundleKind::Control, &[]),
+            structural_bundle(
+                CommittedBundleKind::Object,
+                &[TapeFileKind::Bootstrap, TapeFileKind::Object],
+            ),
+            structural_bundle(
+                CommittedBundleKind::Control,
+                &[TapeFileKind::Bootstrap, TapeFileKind::ParitySidecar],
+            ),
+            structural_bundle(
+                CommittedBundleKind::Control,
+                &[
+                    TapeFileKind::ParityMap,
+                    TapeFileKind::Bootstrap,
+                    TapeFileKind::Bootstrap,
+                ],
+            ),
+            structural_bundle(
+                CommittedBundleKind::Object,
+                &[TapeFileKind::Object, TapeFileKind::ParityMap],
+            ),
+            non_dense,
+            multi_block_bootstrap,
+        ];
+
+        for bundle in rejected {
+            assert!(
+                validate_committed_bundle_shape(&bundle).is_err(),
+                "invalid {:?} shape accepted",
+                bundle.kind
+            );
         }
     }
 

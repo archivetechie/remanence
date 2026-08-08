@@ -1678,6 +1678,14 @@ fn open_parity_actor_session(
     let committed = journal
         .load_committed()
         .map_err(|err| Status::internal(format!("replay parity tape journal: {err}")))?;
+    remanence_state::validate_parity_resume_authority(
+        checkpoints,
+        &committed,
+        selected.tape_uuid,
+        selected.block_size,
+        &scheme,
+    )
+    .map_err(|err| Status::failed_precondition(err.to_string()))?;
     let sink_state = if committed.entries.is_empty() {
         drive
             .locate(0)
@@ -1699,7 +1707,15 @@ fn open_parity_actor_session(
             })()
         };
         match opened {
-            Ok(state) => state,
+            Ok(state) => {
+                crate::pool_write::project_fresh_parity_bootstrap_bundle(
+                    index, selected, &scheme, &journal,
+                )
+                .map_err(|err| {
+                    Status::internal(format!("project fresh parity bootstrap: {err}"))
+                })?;
+                state
+            }
             Err(err) => {
                 let error = err.to_string();
                 let status = status_from_parity_error(&err, error.clone());
@@ -8319,7 +8335,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_post_checkpoint_parity_actor_short_write_fences_and_suppresses_catalog() {
+    async fn partial_epoch_checkpoint_projects_replays_and_first_post_checkpoint_short_write_fences(
+    ) {
         const BLOCK_SIZE: u32 = 4096;
         const POOL_ID: &str = "parity-actor-fence";
         const BARCODE: &str = "PAF001L9";
@@ -8332,7 +8349,7 @@ mod tests {
         let tape_uuid = [0x47; 16];
         let scheme = remanence_parity::ParityScheme {
             id: remanence_parity::SchemeId::new_static("actor-short-write-test"),
-            data_blocks_per_stripe: 3,
+            data_blocks_per_stripe: 128,
             parity_blocks_per_stripe: 1,
             stripes_per_neighborhood: 1,
         };
@@ -8441,10 +8458,11 @@ mod tests {
             .expect("open model library");
         let snapshot = library_snapshot_cell(library.library().clone());
         let audit_dir = temp.path().join("audit");
+        let checkpoint_dir = temp.path().join("checkpoints");
         std::fs::create_dir_all(&audit_dir).expect("create audit dir");
         let mut cfg =
             test_write_owner_config(index_path.clone(), audit_dir.clone(), &library, snapshot);
-        cfg.checkpoint_journal_dir = temp.path().join("checkpoints");
+        cfg.checkpoint_journal_dir = checkpoint_dir.clone();
         cfg.checkpoint_max_objects = 2;
         cfg.checkpoint_max_age_seconds = 3600;
         let serial = library.library().serial.clone();
@@ -8490,41 +8508,14 @@ mod tests {
             .expect("open parity actor session");
         let session_id = Uuid::from_slice(&session.session_id).expect("session UUID");
 
-        // The catalog ordinarily learns the BOT bootstrap from the durable
-        // checkpoint replay prefix. Seed that already-known structural row so
-        // this regression can focus on the first append after a real actor
-        // checkpoint without depending on the separate fresh-tape projection
-        // workflow.
-        let mut seed_index = CatalogIndex::open(&index_path).expect("open bootstrap projection");
-        seed_index
-            .project_committed_tape_file_bundle(
-                TapeJournalIndexInput {
-                    tape_uuid,
-                    block_size: BLOCK_SIZE,
-                    scheme: Some(scheme.clone()),
-                    journal_offset_bytes: 0,
-                },
-                &CommittedBundle {
-                    kind: CommittedBundleKind::Control,
-                    entries: vec![TapeFileEntry {
-                        tape_file_number: 0,
-                        kind: TapeFileKind::Bootstrap,
-                        block_count: 1,
-                        physical_start_hint: Some(0),
-                        object_id: None,
-                        first_parity_data_ordinal: None,
-                        epoch_id: None,
-                        protected_ordinal_start: None,
-                        protected_ordinal_end_exclusive: None,
-                        canonical_metadata_hash: None,
-                        bootstrap_object_row: None,
-                    }],
-                    highest_protected_ordinal: 0,
-                    total_committed_ordinals: 0,
-                },
-            )
-            .expect("project known BOT bootstrap");
-        drop(seed_index);
+        let bootstrap_index = CatalogIndex::open(&index_path).expect("open bootstrap projection");
+        let bootstrap_files = bootstrap_index
+            .list_tape_files(&tape_uuid)
+            .expect("list freshly projected BOT bootstrap");
+        assert_eq!(bootstrap_files.len(), 1);
+        assert_eq!(bootstrap_files[0].tape_file_number, 0);
+        assert_eq!(bootstrap_files[0].kind, "bootstrap");
+        drop(bootstrap_index);
 
         let first = append_actor_test_file(
             &drive_tx,
@@ -8559,6 +8550,50 @@ mod tests {
             .expect("parity checkpoint reply")
             .expect("parity checkpoint succeeds");
         assert_eq!(checkpoint.committed_objects.len(), 1);
+
+        let checkpoint_journal =
+            remanence_state::FileCheckpointJournal::open(&checkpoint_dir, tape_uuid)
+                .expect("open durable parity checkpoint journal");
+        let records = checkpoint_journal
+            .replay()
+            .expect("replay durable partial-epoch checkpoint");
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert!(
+            record.object_tape_file_bundles[0].total_committed_ordinals
+                < u64::from(scheme.data_blocks_per_stripe),
+            "the regression must close a genuinely partial parity epoch"
+        );
+        let checkpoint_bundle = record
+            .checkpoint_bundle
+            .as_ref()
+            .expect("parity checkpoint Control bundle");
+        assert_eq!(
+            checkpoint_bundle
+                .entries
+                .iter()
+                .map(|entry| entry.kind)
+                .collect::<Vec<_>>(),
+            vec![TapeFileKind::ParitySidecar, TapeFileKind::Bootstrap],
+            "the barrier must journal the short sidecar before its terminal Bootstrap"
+        );
+        assert_eq!(
+            checkpoint_bundle
+                .entries
+                .last()
+                .expect("terminal Bootstrap")
+                .tape_file_number,
+            record.checkpoint_tape_file_number
+        );
+        assert_eq!(
+            checkpoint_bundle.highest_protected_ordinal,
+            checkpoint_bundle.total_committed_ordinals
+        );
+        let mut replay_index = CatalogIndex::open(&index_path).expect("open replay projection");
+        replay_index
+            .project_checkpoint_record(record)
+            .expect("idempotently replay the durable partial-epoch checkpoint into SQLite");
+        drop(replay_index);
 
         short_next_write.store(true, Ordering::SeqCst);
         let second = append_actor_test_file_result(
