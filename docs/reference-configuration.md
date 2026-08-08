@@ -249,7 +249,7 @@ actually starts (`"read reservoir N bytes is smaller than minimum pool M
 bytes"`) — a config that passes validation can still refuse the first
 read if these two settings are mismatched.
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-state/src/paths.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-state/src/paths.rs crates/remanence-state/src/checkpoint.rs crates/remanence-api/src/lib.rs @ c802887b -->
 ## `[journal]`, `[audit]`, `[index]`, `[cache]` (required)
 
 These four sections place the durable state. They are deliberately
@@ -258,7 +258,7 @@ minimal config above puts them there.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `journal.dir` | absolute path | required | Directory of per-tape journals, one `<32-hex-uuid>.remjournal` file per tape. |
+| `journal.dir` | absolute path | required | Directory of Layer 3c journals, one `<32-hex-uuid>.remjournal` file per parity-enabled tape; checkpoint journals are stored beneath its `checkpoints/` subdirectory as `<hyphenated-uuid>.remcheckpoint`. |
 | `journal.require_trusted_volume` | bool | `true` | Refuse to start if state, journal, audit, index, cache, or socket paths sit on tmpfs, ramfs, NFS, SMB/CIFS, or overlayfs. |
 | `audit.dir` | absolute path | required | Directory of daily append-only `.remaudit` segments. |
 | `audit.fsync` | bool | `true` | fsync each audit append before returning. |
@@ -294,11 +294,20 @@ For the minimal config above, a running daemon owns:
 /var/lib/rem/state.lock           only written by rem-debug state-mutating commands (see below)
 /var/lib/rem/rem.sock             gRPC Unix socket (mode 0660)
 /var/lib/rem/spool/               pre-commit append spool (mode 0700, spool-<uuid>.bin files)
-/var/lib/rem/journal/*.remjournal per-tape journals (source of truth on disk)
+/var/lib/rem/journal/*.remjournal per-tape Layer 3c tape-file journals
+/var/lib/rem/journal/checkpoints/*.remcheckpoint
+                                 fsynced checkpoint histories and replayable projections
 /var/lib/rem/audit/*.remaudit     daily append-only audit segments
 /var/lib/rem/rem-state.sqlite     rebuildable SQLite catalog projection
 /var/lib/rem/tape-catalog/        per-tape catalog cache files
 ```
+
+On parity tapes, the matching `.remjournal` and `.remcheckpoint` histories are
+both required resume authority. Replay first removes Layer 3c bundles beyond
+the last checkpoint watermark; Remanence then refuses append resume if a
+checkpointed history is missing, differently advanced, or conflicts on its
+tape-file history or physical EOD. SQLite and the per-tape catalog files remain
+rebuildable projections.
 
 `state.lock` is a kernel `flock`, and **`rem-daemon` never takes it** —
 it opens the SQLite catalog and drive pool directly. Only `rem-debug`'s

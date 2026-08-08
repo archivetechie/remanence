@@ -262,10 +262,18 @@ every committed REM-OBJECT object row,
 then drains deferred drive errors with synchronous `WRITE FILEMARKS(0)` and
 captures `READ POSITION`. The daemon fsyncs that EOD and the replayable batch
 projection to its per-tape checkpoint journal before one SQLite transaction.
-Recovery trusts the journal, LOCATEs to its EOD, and overwrites any later
-physical tail; the on-tape bootstrap is the tape-alone recovery copy.
+For parity tapes, that checkpoint journal and the Layer 3c tape-file journal
+jointly form the required resume authority. Recovery first discards Layer 3c
+bundles beyond its last durable checkpoint watermark, then compares the
+complete checkpointed histories — tape-file entries, object identities, parity
+watermarks, and terminal EOD — before any append-positioning `LOCATE` or write.
+A missing, differently advanced, or conflicting checkpointed history fails
+closed instead of choosing one; only matching histories permit `LOCATE` to the
+recorded EOD and overwrite of a later physical tail. SQLite is replayed from
+the checkpoint journal and is not commit authority; the on-tape bootstrap is
+the tape-alone recovery copy.
 
-<!-- code-anchor: crates/remanence-api/src/read_core.rs crates/remanence-api/src/write_owner.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-api/src/read_core.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ c802887b -->
 ## The read path
 
 `OpenReadSession` resolves the object to a tape, mounts it, and

@@ -6,8 +6,8 @@
 | --- | --- |
 | Status | Review draft |
 | Document version | 1.0 |
-| Version | 1.0.0-draft.2 |
-| Date | 2026-08-02 |
+| Version | 1.0.0-draft.3 |
+| Date | 2026-08-08 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719156](https://doi.org/10.5281/zenodo.21719156) |
 | Reference implementation (informative) | Zenodo concept DOI [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) — software deposit, Apache-2.0 |
@@ -394,6 +394,12 @@ and a Writer MUST NOT emit filemarks except as tape-file terminators. A tape
 file MUST contain at least one block — an immediate filemark is structural
 damage.
 
+The **committed prefix** is the uninterrupted initial sequence of committed
+tape files starting at file 0. It is empty if file 0 has not been committed;
+otherwise, because numbering is dense, it contains exactly files `0..F` for
+some last committed file `F`. Bytes and filemarks physically present after
+`F` are not part of the committed prefix.
+
 ### 3.2. Address Spaces
 
 - **`TapeFilePosition`** = `(tape_file_number: u32, block_within_file: u64)`.
@@ -463,6 +469,19 @@ the sidecars emitted at its close MAY be folded into one durable transaction
 (Section 11.1). Readers seeded from a *prefix*-scoped map
 (Section 7.4) MUST treat rows beyond the validated prefix as forensic only —
 never recovery inputs.
+
+An implementation MAY store the required contents of this logical commit
+record in more than one durable off-tape record. If it does, it MUST designate
+which records are required commit authority. Before a Resumer positions to an
+append point or writes, every required authority record MUST be available,
+their overlapping claims MUST agree, and their validated combination MUST
+determine exactly one committed prefix, its append point, every filemark-map
+entry in that prefix, and all state needed to seed the Resumer. If a required
+authority record is missing, their claims conflict, or their combination is
+incomplete or ambiguous, resume MUST fail as `ResumeAppend` until an
+implementation-defined recovery procedure restores one unambiguous logical
+commit record. A rebuildable catalog or cache not designated as commit
+authority does not commit a tape file.
 
 Checkpoint bootstraps (Section 8.3) give the committed prefix an on-tape
 counterpart at barrier grain. Because the tape I/O layer persists writes in
@@ -2005,8 +2024,9 @@ quality-of-implementation choices, not format rules.
 A later session appends **after the last committed tape file** — not after
 the last object, and not at the watermark.
 
-1. Derive the committed prefix from the off-tape commit records, dropping
-   any torn tail, and compute `W` and `T` from it.
+1. Derive the committed prefix from the off-tape commit records, satisfying
+   the authority-agreement rule of Section 3.4, dropping any torn tail, and
+   compute `W` and `T` from it.
 2. Enforce the version-1 bound: `T − W < S × k` (at most one open epoch).
    `W ≤ T`; committed sidecar ranges MUST be contiguous from zero through
    `W`; epoch ids MUST be consecutive; and the prefix's final object entry
@@ -2556,13 +2576,31 @@ directory makes it findable even with the footer gone (Section 13.3). The
 canonical metadata hash is copy-independent, so any surviving copy is
 verifiable against any directory entry.
 
-### B.12. The reference off-tape journal is not a media format
+### B.12. The reference off-tape journals are not a media format
 
-The reference implementation's internal tape-file journal is version 3.
-Version 3 adds a `checkpointed_through` watermark record so replay can
-discard physically written but uncheckpointed orphan bundles and truncate
-them before append. This journal version is deliberately not recorded on
-tape and does not change any REM-PARITY media byte.
+The reference implementation uses two append-only per-tape records for a
+checkpointed write session. Its Layer 3c tape-file journal
+(`<tape-uuid>.remjournal`) is version 3. Version 3 adds a
+`checkpointed_through` watermark record so replay can discard physically
+written but uncheckpointed orphan bundles and truncate them before append. Its
+checkpoint journal (`checkpoints/<tape-uuid>.remcheckpoint`) records each
+synchronized checkpoint's physical EOD and the batch projection needed to
+rebuild the catalog.
+
+For parity-enabled sessions these two journals are required commit authority
+in the sense of Section 3.4. Replay first discards Layer 3c bundles beyond the
+last `checkpointed_through` watermark. Before an append-positioning `LOCATE`,
+the reference Resumer then compares the journals' complete checkpointed
+histories, including tape-file map entries, object identities, parity
+watermarks, and terminal EOD. If either checkpointed history is missing an
+entry named by the other, is ahead of the other, or conflicts, resume fails
+closed. SQLite is a rebuildable projection, not commit authority. A
+bootstrap-only SQLite projection with no complete jointly authoritative
+off-tape commit record therefore represents an empty committed prefix and does
+not prevent the Writer from rewriting file 0 from BOT.
+
+Neither journal format is recorded on tape, and neither changes any
+REM-PARITY media byte.
 
 ## Appendix C. Open Items Closed Before Publication (Informative)
 
@@ -2619,6 +2657,23 @@ conformance. Milestones that predate the first published revision are marked
 `[draft]`; they were reached in public working drafts, not in published
 revisions of this specification, and the change policy of the Status section
 governs only the revisions that follow the first published one.
+
+- **2026-08-08 — 1.0.0-draft.3 — review draft.** Defines *committed prefix*
+  explicitly in Section 3.1 and clarifies the existing durable-boundary rule
+  in Sections 3.4 and 14: when an implementation distributes the logical
+  commit record across multiple records that it designates as required commit
+  authority, those records must be present, their overlapping claims must
+  agree, and their validated combination must yield one complete and
+  unambiguous resume state before append positioning or writing. A missing,
+  conflicting, incomplete, or ambiguous authority is a `ResumeAppend` failure;
+  a rebuildable cache does not commit a tape file.
+  Appendix B.12 records how the reference implementation applies that rule to
+  its Layer 3c and checkpoint journals, including the empty-prefix treatment
+  of an uncommitted bootstrap-only projection.
+
+  This is a clarification of the abstract off-tape commit-record obligation,
+  whose storage format remains implementation-defined. It changes no on-tape
+  byte, tape-file ordering, Reader behavior, schema value, or pinned vector.
 
 - **2026-08-02 — 1.0.0-draft.2 — review draft.** Resolves Appendix E item
   RP-2. Section 8.2 now bounds bootstrap key 3 to 128 bytes of printable

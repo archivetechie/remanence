@@ -92,15 +92,23 @@ entries.
 separate Remanence distribution. Core Remanence owns the normalized reader and
 registry contract but ships with an empty registry and no concrete adapters.
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/pool_write.rs crates/remanence-state/src/index.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/pool_write.rs crates/remanence-state/src/index.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ c802887b -->
 ## Catalog and daemon
 
 **catalog** — the queryable model of what is on which tape. The durable
-truth is per-tape journals plus the audit log; the SQLite index is a
-rebuildable projection of them.
+truth is the required per-tape journals plus the audit log; the SQLite index
+is a rebuildable projection of them.
 
-**journal** — the append-file (`<tape-uuid>.remjournal`) recording each
-tape's committed contents on disk.
+**tape-file journal** — the Layer 3c append-file
+(`<tape-uuid>.remjournal`) recording tape-file entries, parity state, and
+checkpoint watermarks for a parity-enabled tape.
+
+**checkpoint journal** — the append-file
+(`checkpoints/<hyphenated-uuid>.remcheckpoint`) recording synchronized
+checkpoint EOD positions and replayable catalog projections. On parity tapes,
+Layer 3c orphan tails are discarded and the remaining checkpointed history
+must agree with the tape-file journal before append resume; SQLite is not
+commit authority.
 
 **audit log** — append-only daily `.remaudit` segments recording every
 state-changing operation and who asked for it.
