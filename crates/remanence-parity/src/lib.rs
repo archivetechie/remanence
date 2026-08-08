@@ -66,9 +66,9 @@ pub use filemark_map::{
     ScopedFilemarkMap, TapeFileKind, TapeFileMapEntry, TapeFilePosition,
 };
 pub use journal::{
-    validate_committed_bundle_shape, CommittedBundle, CommittedBundleKind,
-    CommittedBundleShapeError, CommittedState, FileTapeFileJournal, FileTapeFileJournalReader,
-    JournalError, TapeFileEntry, TapeFileJournal,
+    validate_committed_bundle_shape, validate_trusted_journal_volume, CommittedBundle,
+    CommittedBundleKind, CommittedBundleShapeError, CommittedState, FileTapeFileJournal,
+    FileTapeFileJournalReader, JournalError, TapeFileEntry, TapeFileJournal,
 };
 pub use mapping::data_shards_per_epoch;
 pub use model::{

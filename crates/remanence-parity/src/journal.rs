@@ -5,10 +5,10 @@
 //! [`CommittedBundle`] through a [`TapeFileJournal`]. The default
 //! [`FileTapeFileJournal`] is a local append-only file: a fixed header followed
 //! by length-prefixed canonical CBOR bundle records with CRC-64/XZ checksums.
-//! Replay stops at the first torn trailing record and then filters valid
-//! records through the last `CheckpointedThrough` marker. Later valid bundles
-//! are surfaced as orphans because their tape writes were not included in a
-//! daemon checkpoint projection.
+//! Replay fails closed at the first torn or corrupt record. Complete records
+//! are filtered through the last `CheckpointedThrough` marker; later valid
+//! bundles are surfaced as orphans because their tape writes were not included
+//! in a daemon checkpoint projection.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -60,6 +60,10 @@ pub enum JournalError {
         "journal volume rejected: {0} (must be a trusted local volume with honored fsync; §10.6)"
     )]
     UntrustedVolume(String),
+    /// Replay found a torn or corrupt tail that must be reconciled against the
+    /// physical tape before any append may proceed.
+    #[error("journal recovery required: {0}")]
+    RecoveryRequired(String),
 }
 
 impl JournalError {
@@ -381,10 +385,9 @@ pub trait TapeFileJournal {
 
     /// Replay committed entries.
     ///
-    /// File-backed append journals may repair crash state while replaying:
-    /// [`FileTapeFileJournal::load_committed`] truncates a torn trailing record
-    /// even though this method takes `&self`. Callers should treat replay as
-    /// recovery I/O, not as a purely read-only query.
+    /// Replay is non-destructive. File-backed journals return
+    /// [`JournalError::RecoveryRequired`] for a torn or corrupt tail and never
+    /// erase evidence merely because an append or replay handle was opened.
     fn load_committed(&self) -> Result<CommittedState, JournalError>;
 }
 
@@ -400,7 +403,7 @@ pub struct FileTapeFileJournal {
     first_create: bool,
     last_highest_protected_ordinal: u64,
     last_total_committed_ordinals: u64,
-    orphaned_bundles_truncated_on_open: usize,
+    orphaned_bundles_preserved_on_open: usize,
 }
 
 /// Read-only, shared-lock replay handle for a file-backed tape journal.
@@ -428,7 +431,7 @@ impl FileTapeFileJournal {
         scheme: ParityScheme,
     ) -> Result<Self, JournalError> {
         let path = path.as_ref().to_path_buf();
-        validate_trusted_volume(&path)?;
+        validate_trusted_journal_volume(&path)?;
         Self::open_inner(path, tape_uuid, block_size, scheme)
     }
 
@@ -447,7 +450,7 @@ impl FileTapeFileJournal {
         scheme: ParityScheme,
     ) -> Result<FileTapeFileJournalReader, JournalError> {
         let path = path.as_ref().to_path_buf();
-        validate_trusted_volume(&path)?;
+        validate_trusted_journal_volume(&path)?;
         FileTapeFileJournalReader::open_inner(path, tape_uuid, block_size, scheme)
     }
 
@@ -461,7 +464,7 @@ impl FileTapeFileJournal {
         path: impl AsRef<Path>,
     ) -> Result<FileTapeFileJournalReader, JournalError> {
         let path = path.as_ref().to_path_buf();
-        validate_trusted_volume(&path)?;
+        validate_trusted_journal_volume(&path)?;
         FileTapeFileJournalReader::open_existing_inner(path)
     }
 
@@ -486,7 +489,7 @@ impl FileTapeFileJournal {
         let len = file.metadata()?.len();
         let mut last_highest_protected_ordinal = 0;
         let mut last_total_committed_ordinals = 0;
-        let mut orphaned_bundles_truncated_on_open = 0;
+        let mut orphaned_bundles_preserved_on_open = 0;
         if len == 0 {
             write_header(&mut file, tape_uuid, block_size, &scheme)?;
             file.sync_all()?;
@@ -502,11 +505,10 @@ impl FileTapeFileJournal {
             {
                 return Err(JournalError::HeaderMismatch);
             }
-            let committed =
-                load_committed_from_reader(&mut file, len, ReplayTruncation::TornAndOrphans)?;
+            let committed = load_committed_from_reader(&mut file, len)?;
             last_highest_protected_ordinal = committed.highest_protected_ordinal;
             last_total_committed_ordinals = committed.total_committed_ordinals;
-            orphaned_bundles_truncated_on_open = committed.orphaned_bundles.len();
+            orphaned_bundles_preserved_on_open = committed.orphaned_bundles.len();
         }
         file.seek(SeekFrom::End(0))?;
         Ok(Self {
@@ -519,13 +521,17 @@ impl FileTapeFileJournal {
             first_create: !existed,
             last_highest_protected_ordinal,
             last_total_committed_ordinals,
-            orphaned_bundles_truncated_on_open,
+            orphaned_bundles_preserved_on_open,
         })
     }
 
-    /// Number of valid post-watermark bundles removed by this exclusive open.
-    pub fn orphaned_bundles_truncated_on_open(&self) -> usize {
-        self.orphaned_bundles_truncated_on_open
+    /// Number of valid post-watermark bundles preserved by this exclusive open.
+    ///
+    /// A non-zero value fences appends until higher-layer reconciliation has
+    /// compared the journal evidence with the physical tape tail and checkpoint
+    /// authority. Opening an append handle never erases this evidence.
+    pub fn orphaned_bundles_preserved_on_open(&self) -> usize {
+        self.orphaned_bundles_preserved_on_open
     }
 
     /// Path backing this journal.
@@ -645,7 +651,7 @@ impl FileTapeFileJournalReader {
         {
             return Err(JournalError::HeaderMismatch);
         }
-        load_committed_from_reader(&mut file, file_len, ReplayTruncation::No)
+        load_committed_from_reader(&mut file, file_len)
     }
 
     #[cfg(test)]
@@ -665,6 +671,12 @@ impl TapeFileJournal for FileTapeFileJournal {
     }
 
     fn commit_bundle(&mut self, bundle: &CommittedBundle) -> Result<(), JournalError> {
+        if self.orphaned_bundles_preserved_on_open != 0 {
+            return Err(JournalError::Codec(format!(
+                "journal contains {} preserved orphan bundle(s); reconcile physical tail and checkpoint authority before append",
+                self.orphaned_bundles_preserved_on_open
+            )));
+        }
         validate_committed_bundle_shape(bundle)?;
         validate_commit_watermarks(
             bundle,
@@ -685,9 +697,9 @@ impl TapeFileJournal for FileTapeFileJournal {
     }
 
     fn load_committed(&self) -> Result<CommittedState, JournalError> {
-        // This intentionally truncates a torn trailing record through a cloned
-        // file descriptor. The append lock still belongs to `self`, so replay
-        // can repair the journal without requiring a separate mutable handle.
+        // Replay is non-destructive. Torn or corrupt tails require explicit
+        // reconciliation and are never erased merely by opening an append
+        // handle.
         let mut file = self.file.try_clone()?;
         let file_len = file.metadata()?.len();
         let header_end = read_header(&mut file)?;
@@ -698,7 +710,7 @@ impl TapeFileJournal for FileTapeFileJournal {
         {
             return Err(JournalError::HeaderMismatch);
         }
-        load_committed_from_reader(&mut file, file_len, ReplayTruncation::TornOnly)
+        load_committed_from_reader(&mut file, file_len)
     }
 }
 
@@ -799,45 +811,62 @@ fn validate_commit_watermarks(
 fn load_committed_from_reader(
     file: &mut File,
     file_len: u64,
-    truncation: ReplayTruncation,
 ) -> Result<CommittedState, JournalError> {
-    let records_start = file.stream_position()?;
     let mut replay_highest_protected_ordinal = 0;
     let mut replay_total_committed_ordinals = 0;
-    let mut valid_end = records_start;
     let mut records = Vec::new();
     loop {
         let record_start = file.stream_position()?;
+        if record_start == file_len {
+            break;
+        }
         let mut len_buf = [0u8; 4];
         match file.read_exact(&mut len_buf) {
             Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(JournalError::RecoveryRequired(format!(
+                    "torn record-length prefix at offset {record_start}"
+                )));
+            }
             Err(err) => return Err(JournalError::Io(err)),
         }
         let record_len = u64::from(u32::from_le_bytes(len_buf));
         let available = file_len.saturating_sub(record_start).saturating_sub(4);
-        if record_len > MAX_RECORD_LEN || record_len.saturating_add(8) > available {
-            break;
+        if record_len > MAX_RECORD_LEN {
+            return Err(JournalError::RecoveryRequired(format!(
+                "record at offset {record_start} declares {record_len} bytes, limit {MAX_RECORD_LEN}"
+            )));
+        }
+        if record_len.saturating_add(8) > available {
+            return Err(JournalError::RecoveryRequired(format!(
+                "torn record at offset {record_start}: declared payload and checksum exceed the remaining {available} bytes"
+            )));
         }
         let record_len = usize::try_from(record_len)
             .map_err(|_| JournalError::Codec("journal record length does not fit usize".into()))?;
         let mut payload = vec![0u8; record_len];
         if let Err(err) = file.read_exact(&mut payload) {
             if err.kind() == std::io::ErrorKind::UnexpectedEof {
-                break;
+                return Err(JournalError::RecoveryRequired(format!(
+                    "torn payload at offset {record_start}"
+                )));
             }
             return Err(JournalError::Io(err));
         }
         let mut crc_buf = [0u8; 8];
         if let Err(err) = file.read_exact(&mut crc_buf) {
             if err.kind() == std::io::ErrorKind::UnexpectedEof {
-                break;
+                return Err(JournalError::RecoveryRequired(format!(
+                    "torn checksum at offset {record_start}"
+                )));
             }
             return Err(JournalError::Io(err));
         }
         let expected_crc = u64::from_le_bytes(crc_buf);
         if crc64_xz(&payload) != expected_crc {
-            break;
+            return Err(JournalError::RecoveryRequired(format!(
+                "record checksum mismatch at offset {record_start}"
+            )));
         }
         let bundle = decode_bundle(&payload)?;
         validate_committed_bundle_shape(&bundle)?;
@@ -860,17 +889,13 @@ fn load_committed_from_reader(
         )?;
         replay_highest_protected_ordinal = bundle.highest_protected_ordinal;
         replay_total_committed_ordinals = bundle.total_committed_ordinals;
-        valid_end = file.stream_position()?;
-        records.push((bundle, valid_end));
+        records.push((bundle, file.stream_position()?));
     }
 
     let last_checkpoint_index = records
         .iter()
         .rposition(|(bundle, _)| bundle.kind == CommittedBundleKind::CheckpointedThrough);
     let retained_record_count = last_checkpoint_index.map_or(0, |index| index + 1);
-    let retained_end = last_checkpoint_index
-        .map(|index| records[index].1)
-        .unwrap_or(records_start);
     let orphaned_records = records.split_off(retained_record_count);
     let orphaned_bundles = orphaned_records
         .into_iter()
@@ -885,29 +910,12 @@ fn load_committed_from_reader(
         total_committed_ordinals = bundle.total_committed_ordinals;
     }
 
-    let truncate_end = match truncation {
-        ReplayTruncation::No => None,
-        ReplayTruncation::TornOnly => (valid_end < file_len).then_some(valid_end),
-        ReplayTruncation::TornAndOrphans => (retained_end < file_len).then_some(retained_end),
-    };
-    if let Some(truncate_end) = truncate_end {
-        file.set_len(truncate_end)?;
-        file.seek(SeekFrom::Start(truncate_end))?;
-        file.sync_all()?;
-    }
     Ok(CommittedState {
         entries,
         highest_protected_ordinal,
         total_committed_ordinals,
         orphaned_bundles,
     })
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReplayTruncation {
-    No,
-    TornOnly,
-    TornAndOrphans,
 }
 
 fn rollback_failed_append(
@@ -1013,7 +1021,12 @@ fn sync_directory(path: &Path) -> Result<(), JournalError> {
     Ok(())
 }
 
-fn validate_trusted_volume(path: &Path) -> Result<(), JournalError> {
+/// Require a local block-backed volume whose filesystem and write-cache
+/// behavior are suitable for an fsync-based recovery authority.
+///
+/// Layer 4 checkpoint journals call the same policy so the two authorities do
+/// not silently have different durability assumptions.
+pub fn validate_trusted_journal_volume(path: &Path) -> Result<(), JournalError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let canonical_parent = parent
         .canonicalize()
@@ -1984,7 +1997,7 @@ mod tests {
     }
 
     #[test]
-    fn file_journal_drops_torn_trailing_record() {
+    fn file_journal_preserves_torn_trailing_record_and_fails_closed() {
         let path = temp_journal_path("torn");
         let tape_uuid = [0x43; 16];
         let scheme = default_scheme();
@@ -2002,23 +2015,22 @@ mod tests {
             journal.file.sync_all().unwrap();
         }
 
-        let reopened = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let len_with_torn_tail = fs::metadata(&path).expect("stat torn journal").len();
+        let err = FileTapeFileJournal::open_without_volume_check_for_tests(
             &path,
             tape_uuid,
             256 * 1024,
             scheme,
         )
-        .expect("reopen journal");
-        let state = reopened.load_committed().expect("load committed");
-
-        assert_eq!(state.entries, sample_bundle().entries);
-        assert_eq!(state.total_committed_ordinals, 3);
+        .expect_err("torn journal must require reconciliation");
+        assert!(matches!(err, JournalError::RecoveryRequired(_)), "{err}");
+        assert_eq!(fs::metadata(&path).unwrap().len(), len_with_torn_tail);
 
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn file_journal_bounds_and_truncates_corrupt_trailing_length() {
+    fn file_journal_bounds_and_preserves_corrupt_trailing_length() {
         let path = temp_journal_path("oversized-len");
         let tape_uuid = [0x46; 16];
         let scheme = default_scheme();
@@ -2041,17 +2053,16 @@ mod tests {
             "fixture should leave a corrupt trailing length prefix"
         );
 
-        let reopened = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let corrupt_len = fs::metadata(&path).unwrap().len();
+        let err = FileTapeFileJournal::open_without_volume_check_for_tests(
             &path,
             tape_uuid,
             256 * 1024,
             scheme,
         )
-        .expect("reopen journal");
-        let state = reopened.load_committed().expect("load committed");
-
-        assert_eq!(state.entries, sample_bundle().entries);
-        assert_eq!(fs::metadata(&path).unwrap().len(), valid_len);
+        .expect_err("hostile length must require reconciliation");
+        assert!(matches!(err, JournalError::RecoveryRequired(_)), "{err}");
+        assert_eq!(fs::metadata(&path).unwrap().len(), corrupt_len);
 
         let _ = fs::remove_file(path);
     }
@@ -2153,9 +2164,10 @@ mod tests {
             scheme,
         )
         .expect("open shared reader");
-        let state = reader.load_committed().expect("load committed");
-
-        assert_eq!(state.entries, sample_bundle().entries);
+        let err = reader
+            .load_committed()
+            .expect_err("shared replay must report the torn tail");
+        assert!(matches!(err, JournalError::RecoveryRequired(_)), "{err}");
         assert_eq!(
             fs::metadata(&path).unwrap().len(),
             len_with_torn_tail,
@@ -2166,7 +2178,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_filters_watermark_orphans_and_exclusive_reopen_truncates_them() {
+    fn replay_filters_watermark_orphans_and_exclusive_reopen_preserves_them() {
         let path = temp_journal_path("watermark-orphans");
         let tape_uuid = [0x4B; 16];
         let scheme = default_scheme();
@@ -2206,7 +2218,7 @@ mod tests {
         let state = reader.load_committed().expect("shared replay");
         assert_eq!(state.entries, sample_bundle().entries);
         assert_eq!(state.total_committed_ordinals, 3);
-        assert_eq!(state.orphaned_bundles, vec![orphan]);
+        assert_eq!(state.orphaned_bundles, vec![orphan.clone()]);
         assert_eq!(fs::metadata(&path).unwrap().len(), orphaned_len);
 
         let reopened = FileTapeFileJournal::open_without_volume_check_for_tests(
@@ -2215,12 +2227,12 @@ mod tests {
             256 * 1024,
             scheme,
         )
-        .expect("exclusive reopen truncates orphans");
-        assert_eq!(reopened.orphaned_bundles_truncated_on_open(), 1);
-        assert_eq!(fs::metadata(&path).unwrap().len(), checkpoint_len);
-        let repaired = reopened.load_committed().expect("replay repaired journal");
-        assert_eq!(repaired.entries, sample_bundle().entries);
-        assert!(repaired.orphaned_bundles.is_empty());
+        .expect("exclusive reopen preserves orphans");
+        assert_eq!(reopened.orphaned_bundles_preserved_on_open(), 1);
+        assert_eq!(fs::metadata(&path).unwrap().len(), orphaned_len);
+        let preserved = reopened.load_committed().expect("replay preserved journal");
+        assert_eq!(preserved.entries, sample_bundle().entries);
+        assert_eq!(preserved.orphaned_bundles, vec![orphan]);
 
         let _ = fs::remove_file(path);
     }
@@ -2254,17 +2266,21 @@ mod tests {
         assert!(state.entries.is_empty());
         assert_eq!(state.orphaned_bundles, vec![sample_bundle()]);
 
-        let reopened = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let mut reopened = FileTapeFileJournal::open_without_volume_check_for_tests(
             &path,
             tape_uuid,
             256 * 1024,
             scheme,
         )
-        .expect("exclusive reopen truncates pre-watermark bundles");
-        assert_eq!(reopened.orphaned_bundles_truncated_on_open(), 1);
-        let repaired = reopened.load_committed().expect("replay repaired journal");
-        assert!(repaired.entries.is_empty());
-        assert!(repaired.orphaned_bundles.is_empty());
+        .expect("exclusive reopen preserves pre-watermark bundles");
+        assert_eq!(reopened.orphaned_bundles_preserved_on_open(), 1);
+        let preserved = reopened.load_committed().expect("replay preserved journal");
+        assert!(preserved.entries.is_empty());
+        assert_eq!(preserved.orphaned_bundles, vec![sample_bundle()]);
+        let err = reopened
+            .commit_bundle(&sample_bundle())
+            .expect_err("preserved orphan evidence fences append");
+        assert!(err.to_string().contains("reconcile physical tail"), "{err}");
 
         let _ = fs::remove_file(path);
     }

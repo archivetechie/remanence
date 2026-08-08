@@ -34,7 +34,7 @@ pub use calibration::{
 pub use checkpoint::{
     list_checkpoint_journals, tape_uuid_from_checkpoint_path, validate_parity_resume_authority,
     CheckpointBootstrapObjectRepresentation, CheckpointBootstrapObjectRow, CheckpointJournalRecord,
-    CheckpointObjectProjection, FileCheckpointJournal,
+    CheckpointObjectProjection, FileCheckpointJournal, FileCheckpointJournalLease,
 };
 pub use config::{
     derive_tape_pool_from_voltag, load_config, parse_config_toml, validate_block_size,

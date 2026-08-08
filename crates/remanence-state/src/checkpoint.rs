@@ -1,14 +1,16 @@
 //! Durable parity-off checkpoint journal and replayable batch projections.
 //!
 //! The append-only journal is the numbering and recovery-position authority.
-//! Each newline-framed JSON record is fsynced before its corresponding SQLite
-//! batch projection. A torn final line is ignored; corruption before the final
-//! record boundary is fatal.
+//! A versioned, tape-bound header precedes length-framed JSON records whose
+//! CRC-64 covers their version, length, and payload. Each record is fsynced
+//! before its corresponding SQLite batch projection. Replay stops at a torn
+//! final frame and fails closed on corrupt or unsupported bytes.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -17,6 +19,11 @@ use crate::{
 };
 
 const CHECKPOINT_JOURNAL_SUFFIX: &str = ".remcheckpoint";
+const CHECKPOINT_JOURNAL_MAGIC: &[u8; 8] = b"REMCKPT\x01";
+const CHECKPOINT_JOURNAL_HEADER_LEN: u64 = 8 + 16 + 8;
+const CHECKPOINT_RECORD_VERSION: u16 = 1;
+const CHECKPOINT_RECORD_PREFIX_LEN: u64 = 2 + 4;
+const MAX_CHECKPOINT_RECORD_LEN: u64 = 64 * 1024 * 1024;
 
 /// Stable journal representation of one REM-OBJECT recovery row carried by an
 /// on-tape checkpoint bootstrap.
@@ -152,6 +159,16 @@ pub struct FileCheckpointJournal {
     tape_uuid: [u8; 16],
 }
 
+/// Exclusive per-tape checkpoint authority retained across replay, media I/O,
+/// and the next durable checkpoint append.
+#[derive(Debug)]
+pub struct FileCheckpointJournalLease {
+    path: PathBuf,
+    tape_uuid: [u8; 16],
+    file: File,
+    _lock: Flock<File>,
+}
+
 impl FileCheckpointJournal {
     /// Open or create the journal handle for `tape_uuid` beneath `dir`.
     pub fn open(dir: impl AsRef<Path>, tape_uuid: [u8; 16]) -> Result<Self, StateError> {
@@ -172,87 +189,70 @@ impl FileCheckpointJournal {
                 })?;
         }
         let path = checkpoint_journal_path(dir, tape_uuid);
+        remanence_parity::validate_trusted_journal_volume(&path).map_err(|err| match err {
+            remanence_parity::JournalError::UntrustedVolume(detail) => {
+                StateError::UntrustedStateVolume(detail)
+            }
+            other => StateError::JournalReplayFailed(format!(
+                "checkpoint trusted-volume validation failed: {other}"
+            )),
+        })?;
         Ok(Self { path, tape_uuid })
     }
 
-    /// Append and fsync one validated checkpoint record.
-    pub fn append(&self, record: &CheckpointJournalRecord) -> Result<(), StateError> {
-        if record.tape_uuid != self.tape_uuid {
-            return Err(StateError::JournalReplayFailed(
-                "checkpoint record tape_uuid does not match journal".to_string(),
-            ));
-        }
-        let prior = self.replay()?;
-        validate_next_record(prior.last(), record)?;
-        self.truncate_torn_tail()?;
-        let mut encoded = serde_json::to_vec(record).map_err(|err| {
-            StateError::JournalReplayFailed(format!("encode checkpoint record: {err}"))
-        })?;
-        encoded.push(b'\n');
-        let created = !self.path.exists();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|err| StateError::io_at("open checkpoint journal", &self.path, err))?;
-        file.write_all(&encoded)
-            .map_err(|err| StateError::io_at("append checkpoint record", &self.path, err))?;
-        file.flush()
-            .map_err(|err| StateError::io_at("flush checkpoint record", &self.path, err))?;
-        file.sync_all()
-            .map_err(|err| StateError::io_at("fsync checkpoint record", &self.path, err))?;
-        if created {
-            let parent = self.path.parent().ok_or_else(|| {
-                StateError::JournalReplayFailed(
-                    "checkpoint journal path has no parent directory".to_string(),
-                )
-            })?;
-            File::open(parent)
-                .and_then(|dir| dir.sync_all())
-                .map_err(|err| {
-                    StateError::io_at("fsync checkpoint journal directory", parent, err)
-                })?;
-        }
-        Ok(())
+    /// Acquire the exclusive lease that write paths retain from authority
+    /// replay through media work and checkpoint append.
+    pub fn acquire_exclusive(&self) -> Result<FileCheckpointJournalLease, StateError> {
+        let lock = acquire_checkpoint_lock(
+            &self.path,
+            FlockArg::LockExclusiveNonblock,
+            "lock checkpoint journal for write session",
+        )?;
+        let file = if self.path.exists() {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.path)
+                .map_err(|err| StateError::io_at("open checkpoint journal", &self.path, err))?
+        } else {
+            initialize_checkpoint_file(&self.path, self.tape_uuid)?
+        };
+        let mut lease = FileCheckpointJournalLease {
+            path: self.path.clone(),
+            tape_uuid: self.tape_uuid,
+            file,
+            _lock: lock,
+        };
+        lease.replay()?;
+        Ok(lease)
     }
 
-    /// Replay every complete record, ignoring only a torn final line.
+    /// Append and fsync one validated checkpoint record under a short-lived
+    /// exclusive lease. Production write paths should retain a lease across
+    /// their replay and media work instead.
+    pub fn append(&self, record: &CheckpointJournalRecord) -> Result<(), StateError> {
+        self.acquire_exclusive()?.append(record)
+    }
+
+    /// Replay every record, failing closed on a torn final frame.
     pub fn replay(&self) -> Result<Vec<CheckpointJournalRecord>, StateError> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
-        }
-        let mut bytes = Vec::new();
-        File::open(&self.path)
-            .and_then(|mut file| file.read_to_end(&mut bytes))
-            .map_err(|err| StateError::io_at("read checkpoint journal", &self.path, err))?;
-        let complete_len = bytes
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(0, |index| index + 1);
-        let mut records = Vec::new();
-        for (line_index, line) in bytes[..complete_len]
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .enumerate()
-        {
-            let record: CheckpointJournalRecord = serde_json::from_slice(line).map_err(|err| {
-                StateError::JournalReplayFailed(format!(
-                    "decode checkpoint record {} in {}: {err}",
-                    line_index + 1,
-                    self.path.display()
-                ))
-            })?;
-            if record.tape_uuid != self.tape_uuid {
-                return Err(StateError::JournalReplayFailed(format!(
-                    "checkpoint record {} tape_uuid mismatch in {}",
-                    line_index + 1,
-                    self.path.display()
-                )));
+        let _lock = acquire_checkpoint_lock(
+            &self.path,
+            FlockArg::LockSharedNonblock,
+            "lock checkpoint journal for replay",
+        )?;
+        let mut file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => {
+                return Err(StateError::io_at(
+                    "open checkpoint journal",
+                    &self.path,
+                    err,
+                ));
             }
-            validate_next_record(records.last(), &record)?;
-            records.push(record);
-        }
-        Ok(records)
+        };
+        replay_checkpoint_records(&mut file, self.tape_uuid, &self.path)
     }
 
     /// Return the final fsynced checkpoint, if any.
@@ -264,33 +264,333 @@ impl FileCheckpointJournal {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
 
-    fn truncate_torn_tail(&self) -> Result<(), StateError> {
-        if !self.path.exists() {
-            return Ok(());
+impl FileCheckpointJournalLease {
+    /// Replay the authority while retaining the exclusive lease.
+    pub fn replay(&mut self) -> Result<Vec<CheckpointJournalRecord>, StateError> {
+        replay_checkpoint_records(&mut self.file, self.tape_uuid, &self.path)
+    }
+
+    /// Validate, append, and fsync one checkpoint while retaining the lease.
+    pub fn append(&mut self, record: &CheckpointJournalRecord) -> Result<(), StateError> {
+        if record.tape_uuid != self.tape_uuid {
+            return Err(StateError::JournalReplayFailed(
+                "checkpoint record tape_uuid does not match journal".to_string(),
+            ));
         }
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.path)
-            .map_err(|err| {
-                StateError::io_at("open checkpoint journal for repair", &self.path, err)
-            })?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(|err| {
-            StateError::io_at("read checkpoint journal for repair", &self.path, err)
+        let payload = serde_json::to_vec(record).map_err(|err| {
+            StateError::JournalReplayFailed(format!("encode checkpoint record: {err}"))
         })?;
-        let complete_len = bytes
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(0, |index| index + 1);
-        if complete_len == bytes.len() {
-            return Ok(());
+        let payload_len = u32::try_from(payload.len()).map_err(|_| {
+            StateError::JournalReplayFailed("checkpoint record length does not fit u32".to_string())
+        })?;
+        if u64::from(payload_len) > MAX_CHECKPOINT_RECORD_LEN {
+            return Err(StateError::JournalReplayFailed(format!(
+                "checkpoint record length {payload_len} exceeds replay limit {MAX_CHECKPOINT_RECORD_LEN}"
+            )));
         }
-        file.set_len(complete_len as u64)
-            .map_err(|err| StateError::io_at("truncate torn checkpoint tail", &self.path, err))?;
-        file.sync_all()
-            .map_err(|err| StateError::io_at("fsync checkpoint tail repair", &self.path, err))
+        let prior = self.replay()?;
+        validate_next_record(prior.last(), record)?;
+
+        let mut frame = Vec::with_capacity(
+            usize::try_from(CHECKPOINT_RECORD_PREFIX_LEN)
+                .expect("checkpoint record prefix length fits usize")
+                .checked_add(payload.len())
+                .and_then(|len| len.checked_add(8))
+                .ok_or_else(|| {
+                    StateError::JournalReplayFailed(
+                        "checkpoint record frame length overflows usize".to_string(),
+                    )
+                })?,
+        );
+        frame.extend_from_slice(&CHECKPOINT_RECORD_VERSION.to_le_bytes());
+        frame.extend_from_slice(&payload_len.to_le_bytes());
+        frame.extend_from_slice(&payload);
+        let crc = remanence_parity::crc64_xz(&frame);
+        frame.extend_from_slice(&crc.to_le_bytes());
+
+        let append_start = self
+            .file
+            .seek(SeekFrom::End(0))
+            .map_err(|err| StateError::io_at("seek checkpoint journal", &self.path, err))?;
+        if let Err(err) = self
+            .file
+            .write_all(&frame)
+            .and_then(|_| self.file.sync_all())
+        {
+            let rollback = self
+                .file
+                .set_len(append_start)
+                .and_then(|_| self.file.sync_all());
+            if let Err(rollback_err) = rollback {
+                return Err(StateError::JournalReplayFailed(format!(
+                    "checkpoint append failed ({err}); rollback to offset {append_start} failed ({rollback_err})"
+                )));
+            }
+            return Err(StateError::io_at(
+                "append and fsync checkpoint record",
+                &self.path,
+                err,
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn checkpoint_companion_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut companion = path.as_os_str().to_os_string();
+    companion.push(suffix);
+    PathBuf::from(companion)
+}
+
+fn acquire_checkpoint_lock(
+    path: &Path,
+    operation: FlockArg,
+    action: &str,
+) -> Result<Flock<File>, StateError> {
+    let lock_path = checkpoint_companion_path(path, ".lock");
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| StateError::io_at("open checkpoint journal lock", &lock_path, err))?;
+    Flock::lock(lock_file, operation).map_err(|(_file, errno)| {
+        StateError::io_at(action, &lock_path, std::io::Error::from(errno))
+    })
+}
+
+fn initialize_checkpoint_file(path: &Path, tape_uuid: [u8; 16]) -> Result<File, StateError> {
+    let init_path = checkpoint_companion_path(path, ".init");
+    let mut init = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&init_path)
+        .map_err(|err| {
+            StateError::io_at(
+                "create checkpoint journal initialization file",
+                &init_path,
+                err,
+            )
+        })?;
+    write_checkpoint_header(&mut init, tape_uuid, &init_path)?;
+    if path.exists() {
+        return Err(StateError::JournalReplayFailed(format!(
+            "checkpoint journal {} appeared during locked initialization",
+            path.display()
+        )));
+    }
+    fs::rename(&init_path, path)
+        .map_err(|err| StateError::io_at("publish checkpoint journal header", path, err))?;
+    let parent = path.parent().ok_or_else(|| {
+        StateError::JournalReplayFailed(
+            "checkpoint journal path has no parent directory".to_string(),
+        )
+    })?;
+    File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|err| StateError::io_at("fsync checkpoint journal directory", parent, err))?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|err| StateError::io_at("open initialized checkpoint journal", path, err))
+}
+
+fn replay_checkpoint_records(
+    file: &mut File,
+    tape_uuid: [u8; 16],
+    path: &Path,
+) -> Result<Vec<CheckpointJournalRecord>, StateError> {
+    let scan = scan_checkpoint_records(file, tape_uuid, path)?;
+    match scan.tail {
+        CheckpointReplayTail::Clean => Ok(scan.records),
+        CheckpointReplayTail::Torn => Err(torn_checkpoint_tail_error(path, scan.valid_end)),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointReplayTail {
+    Clean,
+    Torn,
+}
+
+#[derive(Debug)]
+struct CheckpointReplayScan {
+    records: Vec<CheckpointJournalRecord>,
+    valid_end: u64,
+    tail: CheckpointReplayTail,
+}
+
+fn torn_checkpoint_tail_error(path: &Path, valid_end: u64) -> StateError {
+    StateError::JournalReplayFailed(format!(
+        "checkpoint journal {} has a torn trailing frame after offset {valid_end}; explicit recovery is required before append",
+        path.display()
+    ))
+}
+
+fn write_checkpoint_header(
+    file: &mut File,
+    tape_uuid: [u8; 16],
+    path: &Path,
+) -> Result<(), StateError> {
+    let mut header = Vec::with_capacity(
+        usize::try_from(CHECKPOINT_JOURNAL_HEADER_LEN)
+            .expect("checkpoint header length fits usize"),
+    );
+    header.extend_from_slice(CHECKPOINT_JOURNAL_MAGIC);
+    header.extend_from_slice(&tape_uuid);
+    let crc = remanence_parity::crc64_xz(&header);
+    header.extend_from_slice(&crc.to_le_bytes());
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.write_all(&header))
+        .and_then(|_| file.sync_all())
+        .map_err(|err| StateError::io_at("write checkpoint journal header", path, err))
+}
+
+fn read_checkpoint_header(
+    file: &mut File,
+    tape_uuid: [u8; 16],
+    path: &Path,
+) -> Result<(), StateError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|err| StateError::io_at("seek checkpoint journal header", path, err))?;
+    let mut header = [0u8; 24];
+    file.read_exact(&mut header).map_err(|err| {
+        StateError::JournalReplayFailed(format!(
+            "checkpoint journal {} has a missing or torn versioned header: {err}",
+            path.display()
+        ))
+    })?;
+    let mut crc = [0u8; 8];
+    file.read_exact(&mut crc).map_err(|err| {
+        StateError::JournalReplayFailed(format!(
+            "checkpoint journal {} has a torn header checksum: {err}",
+            path.display()
+        ))
+    })?;
+    if &header[..8] != CHECKPOINT_JOURNAL_MAGIC {
+        return Err(StateError::JournalReplayFailed(format!(
+            "checkpoint journal {} uses an unsupported legacy or future format",
+            path.display()
+        )));
+    }
+    if header[8..24] != tape_uuid {
+        return Err(StateError::JournalReplayFailed(format!(
+            "checkpoint journal {} header tape_uuid mismatch",
+            path.display()
+        )));
+    }
+    if remanence_parity::crc64_xz(&header) != u64::from_le_bytes(crc) {
+        return Err(StateError::JournalReplayFailed(format!(
+            "checkpoint journal {} header checksum mismatch",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn scan_checkpoint_records(
+    file: &mut File,
+    tape_uuid: [u8; 16],
+    path: &Path,
+) -> Result<CheckpointReplayScan, StateError> {
+    read_checkpoint_header(file, tape_uuid, path)?;
+    let file_len = file
+        .metadata()
+        .map_err(|err| StateError::io_at("stat checkpoint journal", path, err))?
+        .len();
+    let mut records = Vec::new();
+    let mut valid_end = CHECKPOINT_JOURNAL_HEADER_LEN;
+    loop {
+        let record_start = file
+            .stream_position()
+            .map_err(|err| StateError::io_at("position checkpoint journal", path, err))?;
+        if record_start == file_len {
+            return Ok(CheckpointReplayScan {
+                records,
+                valid_end,
+                tail: CheckpointReplayTail::Clean,
+            });
+        }
+        let available = file_len.saturating_sub(record_start);
+        if available < CHECKPOINT_RECORD_PREFIX_LEN {
+            return Ok(CheckpointReplayScan {
+                records,
+                valid_end,
+                tail: CheckpointReplayTail::Torn,
+            });
+        }
+        let mut prefix = [0u8; 6];
+        file.read_exact(&mut prefix)
+            .map_err(|err| StateError::io_at("read checkpoint record prefix", path, err))?;
+        let version = u16::from_le_bytes(prefix[..2].try_into().expect("slice length"));
+        if version != CHECKPOINT_RECORD_VERSION {
+            return Err(StateError::JournalReplayFailed(format!(
+                "checkpoint record at offset {record_start} in {} has unsupported version {version}",
+                path.display()
+            )));
+        }
+        let payload_len = u64::from(u32::from_le_bytes(
+            prefix[2..6].try_into().expect("slice length"),
+        ));
+        if payload_len > MAX_CHECKPOINT_RECORD_LEN {
+            return Err(StateError::JournalReplayFailed(format!(
+                "checkpoint record at offset {record_start} in {} declares {payload_len} bytes, limit {MAX_CHECKPOINT_RECORD_LEN}",
+                path.display()
+            )));
+        }
+        let frame_tail_len = payload_len.checked_add(8).ok_or_else(|| {
+            StateError::JournalReplayFailed("checkpoint record length overflows u64".to_string())
+        })?;
+        if available.saturating_sub(CHECKPOINT_RECORD_PREFIX_LEN) < frame_tail_len {
+            return Ok(CheckpointReplayScan {
+                records,
+                valid_end,
+                tail: CheckpointReplayTail::Torn,
+            });
+        }
+        let payload_len = usize::try_from(payload_len).map_err(|_| {
+            StateError::JournalReplayFailed(
+                "checkpoint record length does not fit usize".to_string(),
+            )
+        })?;
+        let mut payload = vec![0u8; payload_len];
+        file.read_exact(&mut payload)
+            .map_err(|err| StateError::io_at("read checkpoint record payload", path, err))?;
+        let mut crc = [0u8; 8];
+        file.read_exact(&mut crc)
+            .map_err(|err| StateError::io_at("read checkpoint record checksum", path, err))?;
+        let mut crc_input = Vec::with_capacity(prefix.len() + payload.len());
+        crc_input.extend_from_slice(&prefix);
+        crc_input.extend_from_slice(&payload);
+        if remanence_parity::crc64_xz(&crc_input) != u64::from_le_bytes(crc) {
+            return Err(StateError::JournalReplayFailed(format!(
+                "checkpoint record at offset {record_start} in {} has a checksum mismatch",
+                path.display()
+            )));
+        }
+        let record: CheckpointJournalRecord = serde_json::from_slice(&payload).map_err(|err| {
+            StateError::JournalReplayFailed(format!(
+                "decode checkpoint record at offset {record_start} in {}: {err}",
+                path.display()
+            ))
+        })?;
+        if record.tape_uuid != tape_uuid {
+            return Err(StateError::JournalReplayFailed(format!(
+                "checkpoint record at offset {record_start} tape_uuid mismatch in {}",
+                path.display()
+            )));
+        }
+        validate_next_record(records.last(), &record)?;
+        records.push(record);
+        valid_end = file
+            .stream_position()
+            .map_err(|err| StateError::io_at("position checkpoint journal", path, err))?;
     }
 }
 
@@ -562,6 +862,12 @@ pub fn validate_parity_resume_authority(
     let mismatch = |detail: String| {
         StateError::JournalReplayFailed(format!("parity resume authority mismatch: {detail}"))
     };
+    if !committed.orphaned_bundles.is_empty() {
+        return Err(mismatch(format!(
+            "sink journal exposes {} preserved bundle(s) beyond its last checkpoint marker; physical-tail reconciliation is required before append",
+            committed.orphaned_bundles.len()
+        )));
+    }
     let record = match (records.last(), committed.entries.is_empty()) {
         (None, true) => return Ok(()),
         (None, false) => {
@@ -596,12 +902,6 @@ pub fn validate_parity_resume_authority(
         return Err(mismatch(
             "checkpoint parity scheme does not match the sink journal".to_string(),
         ));
-    }
-    if !committed.orphaned_bundles.is_empty() {
-        return Err(mismatch(format!(
-            "sink journal still exposes {} bundle(s) beyond its last checkpoint marker",
-            committed.orphaned_bundles.len()
-        )));
     }
     let checkpoint_bundle = record
         .checkpoint_bundle
@@ -1357,6 +1657,73 @@ mod tests {
     }
 
     #[test]
+    fn exclusive_checkpoint_lease_serializes_replay_through_append() {
+        let dir = tempfile::tempdir().expect("temporary checkpoint directory");
+        let tape_uuid = [0x24; 16];
+        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let mut lease = journal
+            .acquire_exclusive()
+            .expect("acquire write-session lease");
+        assert!(lease.replay().expect("replay under lease").is_empty());
+
+        journal
+            .replay()
+            .expect_err("shared replay must not overlap a retained write lease");
+        journal
+            .append(&record(tape_uuid))
+            .expect_err("a second writer must fail before deriving the same prefix");
+
+        lease
+            .append(&record(tape_uuid))
+            .expect("lease owner appends checkpoint");
+        drop(lease);
+        assert_eq!(
+            journal.replay().expect("replay after lease release"),
+            vec![record(tape_uuid)]
+        );
+    }
+
+    #[test]
+    fn first_use_contention_never_publishes_a_partial_checkpoint_header() {
+        let dir = tempfile::tempdir().expect("temporary checkpoint directory");
+        let tape_uuid = [0x23; 16];
+        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let creator_lock = acquire_checkpoint_lock(
+            journal.path(),
+            FlockArg::LockExclusiveNonblock,
+            "hold simulated creator lock",
+        )
+        .expect("hold stable creation lock");
+
+        journal
+            .acquire_exclusive()
+            .expect_err("a competing first writer must lose before creating authority");
+        assert!(
+            !journal.path().exists(),
+            "first-use contention must not publish an empty final journal"
+        );
+        drop(creator_lock);
+
+        let init_path = checkpoint_companion_path(journal.path(), ".init");
+        std::fs::write(&init_path, b"simulated-crash-partial-header")
+            .expect("seed unpublished partial initialization file");
+        let mut lease = journal
+            .acquire_exclusive()
+            .expect("retry atomically publishes a complete header");
+        assert!(lease.replay().expect("replay published header").is_empty());
+        assert_eq!(
+            std::fs::metadata(journal.path())
+                .expect("stat published journal")
+                .len(),
+            CHECKPOINT_JOURNAL_HEADER_LEN
+        );
+        assert!(
+            !init_path.exists(),
+            "atomic rename consumes the initialization file"
+        );
+    }
+
+    #[test]
     fn parity_checkpoint_validator_accepts_all_current_control_suffixes() {
         let tape_uuid = [0x26; 16];
         let sidecar_then_bootstrap = partial_epoch_parity_record(tape_uuid);
@@ -1461,7 +1828,7 @@ mod tests {
     }
 
     #[test]
-    fn fsynced_round_trip_ignores_only_torn_final_record() {
+    fn torn_final_frame_fails_closed_and_is_not_repaired_by_append() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x11; 16];
         let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
@@ -1472,26 +1839,37 @@ mod tests {
             .append(true)
             .open(journal.path())
             .expect("open torn tail");
-        file.write_all(b"{\"ordinal\":2")
+        file.write_all(&CHECKPOINT_RECORD_VERSION.to_le_bytes()[..1])
             .expect("write torn checkpoint tail");
         file.sync_all().expect("sync torn checkpoint tail");
+        let torn_len = file.metadata().expect("stat torn journal").len();
+        drop(file);
 
-        assert_eq!(
-            journal.replay().expect("replay journal"),
-            vec![record(tape_uuid)]
+        let replay_err = journal
+            .replay()
+            .expect_err("torn checkpoint authority must fail closed");
+        assert!(
+            replay_err.to_string().contains("torn trailing frame"),
+            "{replay_err}"
         );
-
-        journal
+        let append_err = journal
             .append(&second_record(tape_uuid))
-            .expect("truncate torn tail and append next checkpoint");
+            .expect_err("append must not erase a torn checkpoint tail");
+        assert!(
+            append_err.to_string().contains("explicit recovery"),
+            "{append_err}"
+        );
         assert_eq!(
-            journal.replay().expect("replay repaired journal"),
-            vec![record(tape_uuid), second_record(tape_uuid)]
+            std::fs::metadata(journal.path())
+                .expect("stat preserved torn journal")
+                .len(),
+            torn_len,
+            "failed append must preserve torn evidence"
         );
     }
 
     #[test]
-    fn post_barrier_pre_fsync_cut_has_no_durable_checkpoint() {
+    fn headerless_checkpoint_tail_fails_closed_as_legacy_or_incomplete() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x31; 16];
         let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
@@ -1503,10 +1881,83 @@ mod tests {
         file.write_all(b"{\"ordinal\":1")
             .expect("write incomplete checkpoint record");
 
+        let err = journal
+            .replay()
+            .expect_err("headerless checkpoint bytes must fail closed");
+        assert!(err.to_string().contains("versioned header"), "{err}");
+    }
+
+    #[test]
+    fn checksum_damage_fails_closed_before_any_later_record() {
+        let dir = tempfile::tempdir().expect("temporary checkpoint directory");
+        let tape_uuid = [0x32; 16];
+        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        journal
+            .append(&record(tape_uuid))
+            .expect("append first checkpoint");
+        journal
+            .append(&second_record(tape_uuid))
+            .expect("append second checkpoint");
+
+        let damage_offset = CHECKPOINT_JOURNAL_HEADER_LEN + CHECKPOINT_RECORD_PREFIX_LEN + 8;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(journal.path())
+            .expect("open checkpoint for damage");
+        file.seek(SeekFrom::Start(damage_offset))
+            .expect("seek damaged payload byte");
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).expect("read payload byte");
+        byte[0] ^= 0x80;
+        file.seek(SeekFrom::Start(damage_offset))
+            .expect("reseek damaged payload byte");
+        file.write_all(&byte).expect("damage payload byte");
+        file.sync_all().expect("sync checkpoint damage");
+
+        let err = journal
+            .replay()
+            .expect_err("checksum damage must fail closed");
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+        let append_err = journal
+            .append(&second_record(tape_uuid))
+            .expect_err("damage must fence later append");
         assert!(
-            journal.replay().expect("replay partial journal").is_empty(),
-            "a record without its durable newline boundary is not a checkpoint"
+            append_err.to_string().contains("checksum mismatch"),
+            "{append_err}"
         );
+    }
+
+    #[test]
+    fn hostile_declared_record_length_rejects_before_allocation() {
+        let dir = tempfile::tempdir().expect("temporary checkpoint directory");
+        let tape_uuid = [0x33; 16];
+        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        journal
+            .append(&record(tape_uuid))
+            .expect("create versioned journal");
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(journal.path())
+            .expect("open checkpoint for hostile length");
+        file.set_len(CHECKPOINT_JOURNAL_HEADER_LEN)
+            .expect("truncate to header");
+        file.seek(SeekFrom::End(0)).expect("seek after header");
+        file.write_all(&CHECKPOINT_RECORD_VERSION.to_le_bytes())
+            .expect("write record version");
+        let hostile_len =
+            u32::try_from(MAX_CHECKPOINT_RECORD_LEN + 1).expect("configured replay limit fits u32");
+        file.write_all(&hostile_len.to_le_bytes())
+            .expect("write hostile record length");
+        file.sync_all().expect("sync hostile length");
+
+        let err = journal
+            .replay()
+            .expect_err("hostile record length must reject");
+        assert!(err.to_string().contains("declares"), "{err}");
+        assert!(err.to_string().contains("limit"), "{err}");
     }
 
     #[test]
