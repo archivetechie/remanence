@@ -3580,6 +3580,7 @@ fn execute_pipelined_window<S: BlockSink + ?Sized>(
             .take()
             .expect("window slot below len is occupied");
         let requested = batch.records;
+        let requested_bytes = u64::from(requested) * u64::from(batch.block_size_bytes);
         if let Some(control) = tape_write_control {
             control.mark_tape_started();
         }
@@ -3590,7 +3591,11 @@ fn execute_pipelined_window<S: BlockSink + ?Sized>(
         );
         let buffer_return_error = return_ring_buffer(free_tx, batch.buffer).err();
         let outcome = match result {
-            Ok(outcome) if outcome.records_written == requested && !outcome.end_of_medium => {
+            Ok(outcome)
+                if outcome.records_written == requested
+                    && u64::from(outcome.bytes_written) == requested_bytes
+                    && !outcome.end_of_medium =>
+            {
                 if let Some(error) = buffer_return_error {
                     return finish_pipelined_window_failure(
                         inner,
@@ -3611,6 +3616,8 @@ fn execute_pipelined_window<S: BlockSink + ?Sized>(
                 let err = TapeIoError::PartialBatchUncommittable {
                     requested_records: requested,
                     written_records: outcome.records_written,
+                    requested_bytes,
+                    written_bytes: u64::from(outcome.bytes_written),
                     end_of_medium: outcome.end_of_medium,
                     sense: None,
                 };
@@ -5745,7 +5752,23 @@ fn write_fixed_blocks(
     }
     let mut blocks = 0u64;
     for block in bytes.chunks_exact(block_size) {
-        sink.write_block(block)?;
+        let outcome = sink.write_block(block)?;
+        let expected_bytes = u64::try_from(block.len()).map_err(|_| {
+            PoolWriteError::InvalidInput("fixed block length does not fit u64".to_string())
+        })?;
+        let written_bytes = u64::from(outcome.bytes_written);
+        if written_bytes != expected_bytes || outcome.end_of_medium {
+            return Err(PoolWriteError::TapeIo(
+                TapeIoError::PartialBatchUncommittable {
+                    requested_records: 1,
+                    written_records: u32::from(written_bytes >= expected_bytes),
+                    requested_bytes: expected_bytes,
+                    written_bytes,
+                    end_of_medium: outcome.end_of_medium,
+                    sense: None,
+                },
+            ));
+        }
         blocks = blocks
             .checked_add(1)
             .ok_or_else(|| PoolWriteError::InvalidInput("block count overflow".to_string()))?;
@@ -7244,6 +7267,93 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct SingleBlockOutcomeSink {
+        bytes_written: u32,
+        early_warning: bool,
+        end_of_medium: bool,
+        writes: u64,
+    }
+
+    impl BlockSink for SingleBlockOutcomeSink {
+        fn write_block(&mut self, _buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
+            self.writes = self.writes.saturating_add(1);
+            Ok(WriteOutcome::from_computed_position(
+                self.bytes_written,
+                self.early_warning,
+                self.end_of_medium,
+                TapePosition {
+                    lba: self.writes,
+                    partition: 0,
+                    beginning_of_partition: false,
+                    end_of_partition: false,
+                    block_position_end_of_warning: self.early_warning,
+                },
+            ))
+        }
+
+        fn write_filemarks(&mut self, _count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
+            Err(TapeIoError::OperationFailed(
+                "single-block test sink does not write filemarks".to_string(),
+            ))
+        }
+
+        fn position(&mut self) -> Result<TapePosition, TapeIoError> {
+            Ok(TapePosition {
+                lba: self.writes,
+                partition: 0,
+                beginning_of_partition: self.writes == 0,
+                end_of_partition: false,
+                block_position_end_of_warning: self.early_warning,
+            })
+        }
+    }
+
+    #[test]
+    fn fixed_block_helper_rejects_short_bytes_and_hard_eom() {
+        for (bytes_written, end_of_medium) in [(3, false), (4, true)] {
+            let mut sink = SingleBlockOutcomeSink {
+                bytes_written,
+                early_warning: false,
+                end_of_medium,
+                writes: 0,
+            };
+
+            let error = write_fixed_blocks(&mut sink, 4, &[0xA5; 4])
+                .expect_err("incomplete fixed block must fail");
+            let message = error.to_string();
+            assert!(
+                message.contains("partial fixed batch uncommittable"),
+                "{message}"
+            );
+            assert!(message.contains("requested_bytes=4"), "{message}");
+            assert!(
+                message.contains(&format!("written_bytes={bytes_written}")),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("end_of_medium={end_of_medium}")),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_block_helper_accepts_full_bytes_with_early_warning() {
+        let mut sink = SingleBlockOutcomeSink {
+            bytes_written: 4,
+            early_warning: true,
+            end_of_medium: false,
+            writes: 0,
+        };
+
+        let blocks = write_fixed_blocks(&mut sink, 4, &[0x5A; 8])
+            .expect("full fixed blocks remain successful at early warning");
+
+        assert_eq!(blocks, 2);
+        assert_eq!(sink.writes, 2);
+    }
+
     #[tokio::test]
     async fn overlap_first_block_gate_requires_high_prefill_then_position_proof() {
         let capacity = 2 * crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
@@ -8036,6 +8146,8 @@ mod tests {
         sink.batch_error = Some(TapeIoError::PartialBatchUncommittable {
             requested_records: 2,
             written_records: 1,
+            requested_bytes: 8,
+            written_bytes: 4,
             end_of_medium: false,
             sense: Some(vec![0x70, 0, 0x40]),
         });
@@ -8293,6 +8405,8 @@ mod tests {
             write_error: Box::new(TapeIoError::PartialBatchUncommittable {
                 requested_records: 4,
                 written_records: 2,
+                requested_bytes: 16,
+                written_bytes: 8,
                 end_of_medium: true,
                 sense: Some(vec![0x70, 0, 0x40]),
             }),

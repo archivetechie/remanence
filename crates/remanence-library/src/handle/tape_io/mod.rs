@@ -151,16 +151,22 @@ pub enum TapeIoError {
     #[error("reset UNIT ATTENTION invalidated drive position and mode state: {0}")]
     StateInvalidatingReset(ScsiError),
 
-    /// A fixed WRITE accepted fewer records than requested or reached hard
-    /// EOM. The raw current sense is retained when the drive supplied it.
+    /// A fixed WRITE returned inconsistent completion accounting, accepted
+    /// fewer records or bytes than requested, or reached hard EOM. The raw
+    /// current sense is retained when the drive supplied it.
     #[error(
-        "partial fixed batch uncommittable: requested_records={requested_records} written_records={written_records} end_of_medium={end_of_medium}"
+        "partial fixed batch uncommittable: requested_records={requested_records} written_records={written_records} requested_bytes={requested_bytes} written_bytes={written_bytes} end_of_medium={end_of_medium}"
     )]
     PartialBatchUncommittable {
         /// Records encoded in the fixed WRITE CDB.
         requested_records: u32,
-        /// Records proven on tape.
+        /// Complete records implied by completion accounting; position-proven
+        /// on paths that arbitrate with READ POSITION.
         written_records: u32,
+        /// Bytes encoded by the requested fixed records.
+        requested_bytes: u64,
+        /// Bytes credited by completion accounting.
+        written_bytes: u64,
         /// Whether the drive reported hard EOM.
         end_of_medium: bool,
         /// Raw current-sense bytes, when present.
@@ -1207,7 +1213,22 @@ impl super::DriveHandle {
         };
 
         match result {
-            Ok(_) => {
+            Ok(outcome) => {
+                if outcome.bytes_transferred != len_u32 {
+                    let written_records =
+                        (outcome.bytes_transferred / block_size_bytes).min(records);
+                    let mapped = TapeIoError::PartialBatchUncommittable {
+                        requested_records: records,
+                        written_records,
+                        requested_bytes: u64::from(len_u32),
+                        written_bytes: u64::from(outcome.bytes_transferred),
+                        end_of_medium: false,
+                        sense: None,
+                    };
+                    self.mark_position_unknown();
+                    self.finish_tape_error(op, &mapped);
+                    return Err(mapped);
+                }
                 let position_after =
                     match self.advance_expected_position(records, 0, buf.len() as u64) {
                         Ok(position_after) => position_after.position(),
@@ -1420,7 +1441,23 @@ impl super::DriveHandle {
         self.record_pipeline_ioctl(ioctl_started, completed_at);
 
         match result {
-            Ok(_) => {
+            Ok(outcome) => {
+                if outcome.bytes_transferred != len_u32 {
+                    let written_records =
+                        (outcome.bytes_transferred / block_size_bytes).min(records);
+                    let mapped = TapeIoError::PartialBatchUncommittable {
+                        requested_records: records,
+                        written_records,
+                        requested_bytes: u64::from(len_u32),
+                        written_bytes: u64::from(outcome.bytes_transferred),
+                        end_of_medium: false,
+                        sense: None,
+                    };
+                    self.mark_position_unknown();
+                    self.fire_tape_started(operation, cdb);
+                    self.defer_pipeline_error_audit(operation, &mapped);
+                    return Err(mapped);
+                }
                 self.record_pipeline_good(records, len_u32, completed_at);
                 let position_after =
                     self.advance_expected_position_arithmetic(records, 0, u64::from(len_u32))?;
@@ -1469,12 +1506,14 @@ impl super::DriveHandle {
                     let position_after = match self.position_pipelined() {
                         Ok(position) => position,
                         Err(position_error) => {
+                            let written_records =
+                                fixed_records_transferred_from_sense(&sense, records).unwrap_or(0);
                             let write_error = TapeIoError::PartialBatchUncommittable {
                                 requested_records: records,
-                                written_records: fixed_records_transferred_from_sense(
-                                    &sense, records,
-                                )
-                                .unwrap_or(0),
+                                written_records,
+                                requested_bytes: u64::from(records) * u64::from(block_size_bytes),
+                                written_bytes: u64::from(written_records)
+                                    * u64::from(block_size_bytes),
                                 end_of_medium: signal.end_of_medium,
                                 sense: Some(sense),
                             };
@@ -1510,6 +1549,8 @@ impl super::DriveHandle {
                         let mapped = TapeIoError::PartialBatchUncommittable {
                             requested_records: records,
                             written_records: records_written,
+                            requested_bytes: u64::from(records) * u64::from(block_size_bytes),
+                            written_bytes: u64::from(bytes_written),
                             end_of_medium: signal.end_of_medium,
                             sense: Some(sense),
                         };
@@ -1574,6 +1615,9 @@ impl super::DriveHandle {
                             TapeIoError::PartialBatchUncommittable {
                                 requested_records: records,
                                 written_records: records_written,
+                                requested_bytes: u64::from(records) * u64::from(block_size_bytes),
+                                written_bytes: u64::from(records_written)
+                                    * u64::from(block_size_bytes),
                                 end_of_medium: false,
                                 sense: Some(sense),
                             }

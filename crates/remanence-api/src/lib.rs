@@ -8639,6 +8639,75 @@ BCw3Wyv2UWY=
         }
     }
 
+    /// Test sink that reports a full record count but a short byte count for
+    /// one object-body batch. This models inconsistent completion accounting
+    /// at the physical submission boundary.
+    #[derive(Debug)]
+    struct ShortByteBatchSink {
+        inner: VecBlockSink,
+        batch_blocks: u32,
+        bootstrap_delimited: bool,
+        injected: bool,
+    }
+
+    impl ShortByteBatchSink {
+        fn new(batch_blocks: u32) -> Self {
+            assert!(batch_blocks > 1, "test batch size must exercise batching");
+            Self {
+                inner: VecBlockSink::new(),
+                batch_blocks,
+                bootstrap_delimited: false,
+                injected: false,
+            }
+        }
+    }
+
+    impl BlockSink for ShortByteBatchSink {
+        fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
+            self.inner.write_block(buf)
+        }
+
+        fn write_block_batch(
+            &mut self,
+            buf: &[u8],
+            block_size_bytes: u32,
+        ) -> Result<WriteBatchOutcome, TapeIoError> {
+            let outcome = self.inner.write_block_batch(buf, block_size_bytes)?;
+            if self.bootstrap_delimited && !self.injected {
+                self.injected = true;
+                return Ok(WriteBatchOutcome::from_computed_position(
+                    outcome.records_written,
+                    outcome
+                        .bytes_written
+                        .checked_sub(1)
+                        .expect("nonempty test batch"),
+                    outcome.early_warning,
+                    outcome.end_of_medium,
+                    outcome.position_after,
+                ));
+            }
+            Ok(outcome)
+        }
+
+        fn write_batch_blocks(&self, _block_size_bytes: u32) -> u32 {
+            self.batch_blocks
+        }
+
+        fn requested_write_batch_blocks(&self) -> u32 {
+            self.batch_blocks
+        }
+
+        fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
+            let outcome = self.inner.write_filemarks(count)?;
+            self.bootstrap_delimited = true;
+            Ok(outcome)
+        }
+
+        fn position(&mut self) -> Result<TapePosition, TapeIoError> {
+            self.inner.position()
+        }
+    }
+
     #[derive(Debug)]
     struct PositionDriftBatchSink {
         inner: VecBlockSink,
@@ -9572,6 +9641,65 @@ BCw3Wyv2UWY=
                 .evidence_json
                 .as_deref()
                 .is_some_and(|evidence| evidence.contains("partial fixed batch uncommittable")),
+            "{fences:?}"
+        );
+    }
+
+    #[test]
+    fn encrypted_no_parity_short_byte_batch_is_uncommittable_and_fences_tape() {
+        let mut index = test_index();
+        project_pool(&mut index, "scenario-a");
+        project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
+        let source_dir = temp_dir("remanence-api-short-byte-encrypted-src");
+        let source_path = source_dir.join("payload.bin");
+        let payload = vec![0x5A; API_SESSION_BLOCK_SIZE as usize * 8];
+        std::fs::write(&source_path, &payload).expect("write source payload");
+        let mut tape_sink = ShortByteBatchSink::new(4);
+        let cfg = pool_config("scenario-a");
+        let (_private_key, recipients) = recipient_pair(0x52);
+
+        let err = write_object_to_pool(
+            &mut index,
+            &mut tape_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source: crate::WriteObjectSource::Path(source_path),
+                archive_path: "payload.bin".into(),
+                caller_object_id: "caller-short-byte-encrypted".to_string(),
+                expected_content_sha256: None,
+                representation: PoolWriteRepresentation::Encrypted { recipients },
+            },
+        )
+        .expect_err("short byte accounting must fail the write");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("partial fixed batch uncommittable"),
+            "{err}"
+        );
+        assert!(message.contains("requested_bytes="), "{err}");
+        assert!(message.contains("written_bytes="), "{err}");
+        assert_eq!(
+            tape_sink.inner.filemarks,
+            vec![1],
+            "bootstrap filemark is allowed; object-closing filemark must not be written"
+        );
+        assert_no_pool_write_catalog_reference(
+            &index,
+            "caller-short-byte-encrypted",
+            POOL_WRITE_TAPE_UUID,
+        );
+        let fences = index
+            .tape_io_admission_conflicts(&POOL_WRITE_TAPE_UUID, Some("RMN004L9"))
+            .expect("active short-byte fence");
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].reason, "partial_batch");
+        assert!(
+            fences[0]
+                .evidence_json
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains("written_bytes=")),
             "{fences:?}"
         );
     }
