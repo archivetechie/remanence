@@ -233,14 +233,19 @@ impl TapeFileMapEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FilemarkMap {
     entries: Vec<TapeFileMapEntry>,
+    tape_file_count: u32,
 }
 
 impl FilemarkMap {
     /// Construct a validated map from already-numbered entries in ascending
     /// tape-file order.
     pub fn new(entries: Vec<TapeFileMapEntry>) -> Result<Self, ParityError> {
+        let tape_file_count = checked_tape_file_count(entries.len())?;
         validate_entries(&entries)?;
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            tape_file_count,
+        })
     }
 
     /// Construct a validated map from catalog rows that may arrive in any
@@ -262,7 +267,7 @@ impl FilemarkMap {
 
     /// Number of tape files in the map.
     pub fn tape_file_count(&self) -> u32 {
-        self.entries.len() as u32
+        self.tape_file_count
     }
 
     /// Total object-data ordinals described by the map.
@@ -433,6 +438,10 @@ impl FilemarkMap {
                 ))
             })
     }
+}
+
+fn checked_tape_file_count(entry_count: usize) -> Result<u32, ParityError> {
+    u32::try_from(entry_count).map_err(|_| filemark_map_error("tape file count exceeds u32::MAX"))
 }
 
 /// Incremental builder used by writers and tests as tape files are emitted.
@@ -879,6 +888,21 @@ mod tests {
         assert_eq!(map.tape_file_count(), 4);
         assert_eq!(map.total_data_ordinals(), 5);
         assert_eq!(map.max_sidecar_end_exclusive(), 3);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn tape_file_count_rejects_a_count_that_cannot_be_authenticated_as_u32() {
+        let entry_count =
+            usize::try_from(u64::from(u32::MAX) + 1).expect("64-bit usize represents u32::MAX + 1");
+        let err = checked_tape_file_count(entry_count).unwrap_err();
+
+        match err {
+            ParityError::FilemarkMapReconstruct(message) => {
+                assert!(message.contains("exceeds u32::MAX"), "{message}");
+            }
+            other => panic!("expected filemark map error, got {other:?}"),
+        }
     }
 
     #[test]
