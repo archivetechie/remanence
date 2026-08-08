@@ -20,8 +20,9 @@ use crate::{
 
 const CHECKPOINT_JOURNAL_SUFFIX: &str = ".remcheckpoint";
 const CHECKPOINT_JOURNAL_MAGIC: &[u8; 8] = b"REMCKPT\x01";
+const CHECKPOINT_SEALING_INTENT_MAGIC: &[u8; 8] = b"REMSEAL\x01";
 const CHECKPOINT_JOURNAL_HEADER_LEN: u64 = 8 + 16 + 8;
-const CHECKPOINT_RECORD_VERSION: u16 = 1;
+const CHECKPOINT_RECORD_VERSION: u16 = 2;
 const CHECKPOINT_RECORD_PREFIX_LEN: u64 = 2 + 4;
 const MAX_CHECKPOINT_RECORD_LEN: u64 = 64 * 1024 * 1024;
 
@@ -119,7 +120,7 @@ pub struct CheckpointObjectProjection {
     pub bootstrap_object_row: CheckpointBootstrapObjectRow,
 }
 
-/// One fsynced barrier record in the checkpoint journal.
+/// One fsynced checkpoint or terminal-seal authority record.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CheckpointJournalRecord {
     /// Monotonic checkpoint ordinal, starting at one.
@@ -132,13 +133,14 @@ pub struct CheckpointJournalRecord {
     pub eod_lba: u64,
     /// Physical tape UUID, independent of library identity.
     pub tape_uuid: [u8; 16],
-    /// Session batch identifier whose objects this barrier committed.
+    /// Session batch identifier associated with this authority transition.
     pub batch_id: [u8; 16],
     /// Tape-file number occupied by this checkpoint's on-tape bootstrap.
     pub checkpoint_tape_file_number: u32,
     /// Fixed tape block size used to encode that bootstrap.
     pub block_size: u32,
-    /// Replayable projections made durable by this record.
+    /// Replayable object projections made durable by an ordinary checkpoint.
+    /// Terminal-seal records carry no objects.
     pub objects: Vec<CheckpointObjectProjection>,
     /// Parity scheme for parity-protected checkpoint batches. `None` denotes
     /// the historical parity-off record shape.
@@ -147,9 +149,23 @@ pub struct CheckpointJournalRecord {
     /// Per-object Layer 3c bundles, in the same order as `objects`.
     #[serde(default)]
     pub object_tape_file_bundles: Vec<remanence_parity::CommittedBundle>,
-    /// Sidecar/bootstrap bundle emitted by the barrier on parity tapes.
+    /// Sidecar/bootstrap bundle emitted by an ordinary parity barrier, or the
+    /// `Finish` bundle that identifies a terminal-seal record.
     #[serde(default)]
     pub checkpoint_bundle: Option<remanence_parity::CommittedBundle>,
+    /// Whether this objectless record proves the tape's terminal boundary.
+    ///
+    /// The checkpoint journal is the durable Layer 5 authority for replaying
+    /// the SQLite `sealed` projection after a crash. A true value requires an
+    /// empty `objects` list and a `Finish` bundle naming the terminal
+    /// Bootstrap. The record is appended only after terminal media and its
+    /// synchronous barrier have succeeded.
+    pub sealed_after_write: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CheckpointJournalFrame {
+    records: Vec<CheckpointJournalRecord>,
 }
 
 /// Append-only per-tape checkpoint journal.
@@ -203,6 +219,21 @@ impl FileCheckpointJournal {
     /// Acquire the exclusive lease that write paths retain from authority
     /// replay through media work and checkpoint append.
     pub fn acquire_exclusive(&self) -> Result<FileCheckpointJournalLease, StateError> {
+        self.acquire_exclusive_inner(false)
+    }
+
+    /// Acquire an exclusive lease for a supervised physical-tail
+    /// reconciliation of a pending `Sealing` intent.
+    pub fn acquire_exclusive_for_terminal_recovery(
+        &self,
+    ) -> Result<FileCheckpointJournalLease, StateError> {
+        self.acquire_exclusive_inner(true)
+    }
+
+    fn acquire_exclusive_inner(
+        &self,
+        allow_pending_terminal_intent: bool,
+    ) -> Result<FileCheckpointJournalLease, StateError> {
         let lock = acquire_checkpoint_lock(
             &self.path,
             FlockArg::LockExclusiveNonblock,
@@ -223,7 +254,17 @@ impl FileCheckpointJournal {
             file,
             _lock: lock,
         };
-        lease.replay()?;
+        if allow_pending_terminal_intent {
+            replay_checkpoint_records(&mut lease.file, lease.tape_uuid, &lease.path)?;
+            if !terminal_intent_pending(&lease.path, lease.tape_uuid)? {
+                return Err(StateError::JournalReplayFailed(
+                    "terminal recovery lease requested without a pending Sealing intent"
+                        .to_string(),
+                ));
+            }
+        } else {
+            lease.replay()?;
+        }
         Ok(lease)
     }
 
@@ -243,7 +284,11 @@ impl FileCheckpointJournal {
         )?;
         let mut file = match File::open(&self.path) {
             Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let records = Vec::new();
+                enforce_terminal_intent_for_replay(&self.path, self.tape_uuid, &records, false)?;
+                return Ok(records);
+            }
             Err(err) => {
                 return Err(StateError::io_at(
                     "open checkpoint journal",
@@ -252,7 +297,9 @@ impl FileCheckpointJournal {
                 ));
             }
         };
-        replay_checkpoint_records(&mut file, self.tape_uuid, &self.path)
+        let records = replay_checkpoint_records(&mut file, self.tape_uuid, &self.path)?;
+        enforce_terminal_intent_for_replay(&self.path, self.tape_uuid, &records, false)?;
+        Ok(records)
     }
 
     /// Return the final fsynced checkpoint, if any.
@@ -269,18 +316,134 @@ impl FileCheckpointJournal {
 impl FileCheckpointJournalLease {
     /// Replay the authority while retaining the exclusive lease.
     pub fn replay(&mut self) -> Result<Vec<CheckpointJournalRecord>, StateError> {
-        replay_checkpoint_records(&mut self.file, self.tape_uuid, &self.path)
+        let records = replay_checkpoint_records(&mut self.file, self.tape_uuid, &self.path)?;
+        enforce_terminal_intent_for_replay(&self.path, self.tape_uuid, &records, true)?;
+        Ok(records)
+    }
+
+    /// Durably enter the recovery-visible `Sealing` admission state.
+    ///
+    /// This intent is not sealed authority. It is written before terminal tape
+    /// motion so process loss between the tape barrier and checkpoint fsync
+    /// cannot make a finalized physical tail appear appendable.
+    pub fn begin_terminal_transition(&mut self) -> Result<(), StateError> {
+        let records = self.replay()?;
+        if records
+            .last()
+            .is_some_and(|record| record.sealed_after_write)
+        {
+            return Err(StateError::JournalReplayFailed(
+                "cannot begin a terminal transition after sealed authority".to_string(),
+            ));
+        }
+        write_terminal_intent(&self.path, self.tape_uuid)
+    }
+
+    /// Append terminal authority and clear its durable `Sealing` intent only
+    /// after the complete journal frame is fsynced.
+    pub fn append_terminal_transition(
+        &mut self,
+        records: &[CheckpointJournalRecord],
+    ) -> Result<(), StateError> {
+        if !terminal_intent_pending(&self.path, self.tape_uuid)? {
+            return Err(StateError::JournalReplayFailed(
+                "terminal checkpoint transition has no durable Sealing intent".to_string(),
+            ));
+        }
+        if !records
+            .last()
+            .is_some_and(|record| record.sealed_after_write)
+        {
+            return Err(StateError::JournalReplayFailed(
+                "terminal checkpoint transition does not end in sealed authority".to_string(),
+            ));
+        }
+        self.append_batch_inner(records, true)?;
+        clear_terminal_intent(&self.path)
+    }
+
+    /// Clear a pending `Sealing` intent after a supervised physical probe has
+    /// proved that no terminal media exists beyond the named durable EOD.
+    pub fn clear_terminal_intent_after_absent_tail(
+        &mut self,
+        expected_checkpoint_ordinal: Option<u64>,
+        expected_eod_lba: u64,
+    ) -> Result<(), StateError> {
+        if !terminal_intent_pending(&self.path, self.tape_uuid)? {
+            return Err(StateError::JournalReplayFailed(
+                "terminal recovery found no pending Sealing intent".to_string(),
+            ));
+        }
+        let records = replay_checkpoint_records(&mut self.file, self.tape_uuid, &self.path)?;
+        if records
+            .last()
+            .is_some_and(|record| record.sealed_after_write)
+        {
+            return Err(StateError::JournalReplayFailed(
+                "terminal authority is already durable; absent-tail recovery cannot clear it"
+                    .to_string(),
+            ));
+        }
+        let actual_ordinal = records.last().map(|record| record.ordinal);
+        let actual_eod = records.last().map_or(0, |record| record.eod_lba);
+        if actual_ordinal != expected_checkpoint_ordinal || actual_eod != expected_eod_lba {
+            return Err(StateError::JournalReplayFailed(format!(
+                "terminal recovery authority changed: expected ordinal {expected_checkpoint_ordinal:?} EOD {expected_eod_lba}, found ordinal {actual_ordinal:?} EOD {actual_eod}"
+            )));
+        }
+        clear_terminal_intent(&self.path)
     }
 
     /// Validate, append, and fsync one checkpoint while retaining the lease.
     pub fn append(&mut self, record: &CheckpointJournalRecord) -> Result<(), StateError> {
-        if record.tape_uuid != self.tape_uuid {
+        self.append_batch(std::slice::from_ref(record))
+    }
+
+    /// Validate and fsync one indivisible ordered checkpoint transition.
+    ///
+    /// A watermark seal uses this to place the ordinary object checkpoint and
+    /// its terminal-only seal authority in one length-and-integrity-protected
+    /// frame. Replay therefore observes both records or fails closed on a torn
+    /// frame; it cannot publish only the ordinary half.
+    pub fn append_batch(&mut self, records: &[CheckpointJournalRecord]) -> Result<(), StateError> {
+        self.append_batch_inner(records, false)
+    }
+
+    fn append_batch_inner(
+        &mut self,
+        records: &[CheckpointJournalRecord],
+        terminal_transition: bool,
+    ) -> Result<(), StateError> {
+        if records.is_empty() {
             return Err(StateError::JournalReplayFailed(
-                "checkpoint record tape_uuid does not match journal".to_string(),
+                "checkpoint journal frame must contain at least one record".to_string(),
             ));
         }
-        let payload = serde_json::to_vec(record).map_err(|err| {
-            StateError::JournalReplayFailed(format!("encode checkpoint record: {err}"))
+        if !terminal_transition && records.iter().any(|record| record.sealed_after_write) {
+            return Err(StateError::JournalReplayFailed(
+                "sealed checkpoint authority requires a durable Sealing intent".to_string(),
+            ));
+        }
+        let prior = if terminal_transition {
+            replay_checkpoint_records(&mut self.file, self.tape_uuid, &self.path)?
+        } else {
+            self.replay()?
+        };
+        let mut previous = prior.last();
+        for record in records {
+            if record.tape_uuid != self.tape_uuid {
+                return Err(StateError::JournalReplayFailed(
+                    "checkpoint record tape_uuid does not match journal".to_string(),
+                ));
+            }
+            validate_next_record(previous, record)?;
+            previous = Some(record);
+        }
+        let payload = serde_json::to_vec(&CheckpointJournalFrame {
+            records: records.to_vec(),
+        })
+        .map_err(|err| {
+            StateError::JournalReplayFailed(format!("encode checkpoint journal frame: {err}"))
         })?;
         let payload_len = u32::try_from(payload.len()).map_err(|_| {
             StateError::JournalReplayFailed("checkpoint record length does not fit u32".to_string())
@@ -290,9 +453,6 @@ impl FileCheckpointJournalLease {
                 "checkpoint record length {payload_len} exceeds replay limit {MAX_CHECKPOINT_RECORD_LEN}"
             )));
         }
-        let prior = self.replay()?;
-        validate_next_record(prior.last(), record)?;
-
         let mut frame = Vec::with_capacity(
             usize::try_from(CHECKPOINT_RECORD_PREFIX_LEN)
                 .expect("checkpoint record prefix length fits usize")
@@ -329,7 +489,7 @@ impl FileCheckpointJournalLease {
                 )));
             }
             return Err(StateError::io_at(
-                "append and fsync checkpoint record",
+                "append and fsync checkpoint journal frame",
                 &self.path,
                 err,
             ));
@@ -342,6 +502,147 @@ fn checkpoint_companion_path(path: &Path, suffix: &str) -> PathBuf {
     let mut companion = path.as_os_str().to_os_string();
     companion.push(suffix);
     PathBuf::from(companion)
+}
+
+fn terminal_intent_path(path: &Path) -> PathBuf {
+    checkpoint_companion_path(path, ".sealing")
+}
+
+fn write_terminal_intent(path: &Path, tape_uuid: [u8; 16]) -> Result<(), StateError> {
+    let intent_path = terminal_intent_path(path);
+    match fs::symlink_metadata(&intent_path) {
+        Ok(_) => {
+            return Err(StateError::JournalReplayFailed(format!(
+                "checkpoint journal {} already has a pending Sealing intent; physical-tail reconciliation is required",
+                path.display()
+            )));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(StateError::io_at(
+                "inspect checkpoint Sealing intent",
+                &intent_path,
+                err,
+            ));
+        }
+    }
+    let temporary_path = checkpoint_companion_path(path, ".sealing.new");
+    let mut intent = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary_path)
+        .map_err(|err| {
+            StateError::io_at(
+                "create temporary checkpoint Sealing intent",
+                &temporary_path,
+                err,
+            )
+        })?;
+    let mut payload = Vec::with_capacity(32);
+    payload.extend_from_slice(CHECKPOINT_SEALING_INTENT_MAGIC);
+    payload.extend_from_slice(&tape_uuid);
+    let crc = remanence_parity::crc64_xz(&payload);
+    payload.extend_from_slice(&crc.to_le_bytes());
+    intent
+        .write_all(&payload)
+        .and_then(|_| intent.sync_all())
+        .map_err(|err| {
+            StateError::io_at(
+                "write temporary checkpoint Sealing intent",
+                &temporary_path,
+                err,
+            )
+        })?;
+    fs::rename(&temporary_path, &intent_path)
+        .map_err(|err| StateError::io_at("publish checkpoint Sealing intent", &intent_path, err))?;
+    let parent = intent_path.parent().ok_or_else(|| {
+        StateError::JournalReplayFailed(
+            "checkpoint Sealing intent path has no parent directory".to_string(),
+        )
+    })?;
+    File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|err| StateError::io_at("fsync checkpoint Sealing intent directory", parent, err))
+}
+
+fn terminal_intent_pending(path: &Path, tape_uuid: [u8; 16]) -> Result<bool, StateError> {
+    let intent_path = terminal_intent_path(path);
+    let mut intent = match File::open(&intent_path) {
+        Ok(intent) => intent,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(StateError::io_at(
+                "open checkpoint Sealing intent",
+                &intent_path,
+                err,
+            ))
+        }
+    };
+    let len = intent
+        .metadata()
+        .map_err(|err| StateError::io_at("stat checkpoint Sealing intent", &intent_path, err))?
+        .len();
+    if len != 32 {
+        return Err(StateError::JournalReplayFailed(format!(
+            "checkpoint Sealing intent {} has invalid length {len}; physical-tail reconciliation is required",
+            intent_path.display()
+        )));
+    }
+    let mut payload = [0u8; 24];
+    let mut crc = [0u8; 8];
+    intent
+        .read_exact(&mut payload)
+        .and_then(|_| intent.read_exact(&mut crc))
+        .map_err(|err| StateError::io_at("read checkpoint Sealing intent", &intent_path, err))?;
+    if &payload[..8] != CHECKPOINT_SEALING_INTENT_MAGIC
+        || payload[8..24] != tape_uuid
+        || remanence_parity::crc64_xz(&payload) != u64::from_le_bytes(crc)
+    {
+        return Err(StateError::JournalReplayFailed(format!(
+            "checkpoint Sealing intent {} failed identity or integrity validation; physical-tail reconciliation is required",
+            intent_path.display()
+        )));
+    }
+    Ok(true)
+}
+
+fn clear_terminal_intent(path: &Path) -> Result<(), StateError> {
+    let intent_path = terminal_intent_path(path);
+    fs::remove_file(&intent_path)
+        .map_err(|err| StateError::io_at("clear checkpoint Sealing intent", &intent_path, err))?;
+    let parent = intent_path.parent().ok_or_else(|| {
+        StateError::JournalReplayFailed(
+            "checkpoint Sealing intent path has no parent directory".to_string(),
+        )
+    })?;
+    File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|err| StateError::io_at("fsync cleared Sealing intent directory", parent, err))
+}
+
+fn enforce_terminal_intent_for_replay(
+    path: &Path,
+    tape_uuid: [u8; 16],
+    records: &[CheckpointJournalRecord],
+    clear_completed: bool,
+) -> Result<(), StateError> {
+    if !terminal_intent_pending(path, tape_uuid)? {
+        return Ok(());
+    }
+    if records
+        .last()
+        .is_some_and(|record| record.sealed_after_write)
+    {
+        if clear_completed {
+            clear_terminal_intent(path)?;
+        }
+        return Ok(());
+    }
+    Err(StateError::JournalReplayFailed(format!(
+        "checkpoint journal {} has a pending Sealing intent without terminal authority; physical-tail reconciliation is required before append",
+        path.display()
+    )))
 }
 
 fn acquire_checkpoint_lock(
@@ -574,20 +875,28 @@ fn scan_checkpoint_records(
                 path.display()
             )));
         }
-        let record: CheckpointJournalRecord = serde_json::from_slice(&payload).map_err(|err| {
+        let frame: CheckpointJournalFrame = serde_json::from_slice(&payload).map_err(|err| {
             StateError::JournalReplayFailed(format!(
-                "decode checkpoint record at offset {record_start} in {}: {err}",
+                "decode checkpoint journal frame at offset {record_start} in {}: {err}",
                 path.display()
             ))
         })?;
-        if record.tape_uuid != tape_uuid {
+        if frame.records.is_empty() {
             return Err(StateError::JournalReplayFailed(format!(
-                "checkpoint record at offset {record_start} tape_uuid mismatch in {}",
+                "checkpoint journal frame at offset {record_start} in {} is empty",
                 path.display()
             )));
         }
-        validate_next_record(records.last(), &record)?;
-        records.push(record);
+        for record in frame.records {
+            if record.tape_uuid != tape_uuid {
+                return Err(StateError::JournalReplayFailed(format!(
+                    "checkpoint record at offset {record_start} tape_uuid mismatch in {}",
+                    path.display()
+                )));
+            }
+            validate_next_record(records.last(), &record)?;
+            records.push(record);
+        }
         valid_end = file
             .stream_position()
             .map_err(|err| StateError::io_at("position checkpoint journal", path, err))?;
@@ -1090,6 +1399,11 @@ fn validate_next_record(
     previous: Option<&CheckpointJournalRecord>,
     record: &CheckpointJournalRecord,
 ) -> Result<(), StateError> {
+    if previous.is_some_and(|prior| prior.sealed_after_write) {
+        return Err(StateError::JournalReplayFailed(
+            "checkpoint record follows a terminal sealed checkpoint".to_string(),
+        ));
+    }
     let parity_record = record.scheme.is_some();
     if let Some(scheme) = &record.scheme {
         scheme.validate().map_err(|err| {
@@ -1101,13 +1415,6 @@ fn validate_next_record(
     if previous.is_some_and(|prior| prior.scheme != record.scheme) {
         return Err(StateError::JournalReplayFailed(
             "checkpoint parity scheme changed within one tape journal".to_string(),
-        ));
-    }
-    if !parity_record
-        && (!record.object_tape_file_bundles.is_empty() || record.checkpoint_bundle.is_some())
-    {
-        return Err(StateError::JournalReplayFailed(
-            "parity-off checkpoint record carries parity bundle fields".to_string(),
         ));
     }
     let expected_ordinal = match previous {
@@ -1143,14 +1450,24 @@ fn validate_next_record(
             record.eod_partition
         )));
     }
-    if record.objects.is_empty() {
-        return Err(StateError::JournalReplayFailed(
-            "checkpoint record must commit at least one object".to_string(),
-        ));
-    }
     if record.block_size == 0 {
         return Err(StateError::JournalReplayFailed(
             "checkpoint block size must be non-zero".to_string(),
+        ));
+    }
+    if record.sealed_after_write {
+        return validate_terminal_checkpoint_record(previous, record);
+    }
+    if record.objects.is_empty() {
+        return Err(StateError::JournalReplayFailed(
+            "non-terminal checkpoint record must commit at least one object".to_string(),
+        ));
+    }
+    if !parity_record
+        && (!record.object_tape_file_bundles.is_empty() || record.checkpoint_bundle.is_some())
+    {
+        return Err(StateError::JournalReplayFailed(
+            "parity-off checkpoint record carries parity bundle fields".to_string(),
         ));
     }
     let expected_first_file = match previous {
@@ -1280,6 +1597,130 @@ fn validate_next_record(
     Ok(())
 }
 
+fn validate_terminal_checkpoint_record(
+    previous: Option<&CheckpointJournalRecord>,
+    record: &CheckpointJournalRecord,
+) -> Result<(), StateError> {
+    if !record.objects.is_empty() || !record.object_tape_file_bundles.is_empty() {
+        return Err(StateError::JournalReplayFailed(
+            "terminal checkpoint record must not commit objects".to_string(),
+        ));
+    }
+    let bundle = record.checkpoint_bundle.as_ref().ok_or_else(|| {
+        StateError::JournalReplayFailed(
+            "terminal checkpoint record has no Finish bundle".to_string(),
+        )
+    })?;
+    let bootstrap = remanence_parity::validate_committed_bundle_shape(bundle)
+        .map_err(|err| {
+            StateError::JournalReplayFailed(format!(
+                "terminal checkpoint has invalid Finish bundle: {err}"
+            ))
+        })?
+        .ok_or_else(|| {
+            StateError::JournalReplayFailed(
+                "terminal checkpoint Finish bundle has no Bootstrap".to_string(),
+            )
+        })?;
+    if bundle.kind != remanence_parity::CommittedBundleKind::Finish {
+        return Err(StateError::JournalReplayFailed(format!(
+            "terminal checkpoint uses {:?} bundle kind instead of Finish",
+            bundle.kind
+        )));
+    }
+    let first = bundle.entries.first().ok_or_else(|| {
+        StateError::JournalReplayFailed("terminal checkpoint Finish bundle is empty".to_string())
+    })?;
+    let expected_first_file = match previous {
+        Some(prior) => prior
+            .checkpoint_tape_file_number
+            .checked_add(1)
+            .ok_or_else(|| {
+                StateError::JournalReplayFailed(
+                    "terminal checkpoint tape-file number overflows u32".to_string(),
+                )
+            })?,
+        None => 0,
+    };
+    if first.tape_file_number != expected_first_file {
+        return Err(StateError::JournalReplayFailed(format!(
+            "terminal checkpoint starts at tape file {}, expected {expected_first_file}",
+            first.tape_file_number
+        )));
+    }
+    if bootstrap.tape_file_number != record.checkpoint_tape_file_number {
+        return Err(StateError::JournalReplayFailed(format!(
+            "terminal checkpoint Bootstrap is tape file {}, record names {}",
+            bootstrap.tape_file_number, record.checkpoint_tape_file_number
+        )));
+    }
+    let (prior_highest, prior_total) = previous.map_or((0, 0), |prior| {
+        prior.checkpoint_bundle.as_ref().map_or_else(
+            || {
+                prior.objects.last().map_or((0, 0), |projection| {
+                    (0, projection.total_committed_ordinals)
+                })
+            },
+            |bundle| {
+                (
+                    bundle.highest_protected_ordinal,
+                    bundle.total_committed_ordinals,
+                )
+            },
+        )
+    });
+    if bundle.highest_protected_ordinal != prior_highest
+        || bundle.total_committed_ordinals != prior_total
+    {
+        return Err(StateError::JournalReplayFailed(format!(
+            "terminal checkpoint W/T ({}/{}) does not preserve prior authority ({prior_highest}/{prior_total})",
+            bundle.highest_protected_ordinal, bundle.total_committed_ordinals
+        )));
+    }
+    if previous.is_some_and(|prior| prior.block_size != record.block_size) {
+        return Err(StateError::JournalReplayFailed(
+            "terminal checkpoint block size changed within one tape journal".to_string(),
+        ));
+    }
+    let prior_eod = previous.map_or(0, |prior| prior.eod_lba);
+    if record.eod_lba <= prior_eod {
+        return Err(StateError::JournalReplayFailed(
+            "terminal checkpoint EOD must advance beyond prior authority".to_string(),
+        ));
+    }
+    let mut expected_start = prior_eod;
+    for entry in &bundle.entries {
+        let physical_start = entry.physical_start_hint.ok_or_else(|| {
+            StateError::JournalReplayFailed(format!(
+                "terminal checkpoint tape file {} has no physical start hint",
+                entry.tape_file_number
+            ))
+        })?;
+        if physical_start != expected_start {
+            return Err(StateError::JournalReplayFailed(format!(
+                "terminal checkpoint tape file {} starts at {physical_start}, expected prior terminal cursor {expected_start}",
+                entry.tape_file_number
+            )));
+        }
+        expected_start = expected_start
+            .checked_add(entry.block_count)
+            .and_then(|lba| lba.checked_add(1))
+            .ok_or_else(|| {
+                StateError::JournalReplayFailed(format!(
+                    "terminal checkpoint tape file {} extent overflows u64",
+                    entry.tape_file_number
+                ))
+            })?;
+    }
+    if record.eod_lba != expected_start {
+        return Err(StateError::JournalReplayFailed(format!(
+            "terminal checkpoint EOD LBA {} does not match Finish bundle end {expected_start}",
+            record.eod_lba
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1339,6 +1780,7 @@ mod tests {
             scheme: None,
             object_tape_file_bundles: Vec::new(),
             checkpoint_bundle: None,
+            sealed_after_write: false,
         }
     }
 
@@ -1975,6 +2417,269 @@ mod tests {
             .append(&invalid)
             .expect_err("invalid count must reject");
         assert!(err.to_string().contains("committed count"), "{err}");
+    }
+
+    #[test]
+    fn append_rejects_a_checkpoint_after_terminal_seal_authority() {
+        let dir = tempfile::tempdir().expect("temporary checkpoint directory");
+        let tape_uuid = [0x25; 16];
+        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let prior = record(tape_uuid);
+        journal
+            .append(&prior)
+            .expect("append ordinary checkpoint authority");
+        let terminal = CheckpointJournalRecord {
+            ordinal: 2,
+            committed_object_count: 1,
+            eod_partition: 0,
+            eod_lba: 10,
+            tape_uuid,
+            batch_id: [0x45; 16],
+            checkpoint_tape_file_number: 3,
+            block_size: prior.block_size,
+            objects: Vec::new(),
+            scheme: None,
+            object_tape_file_bundles: Vec::new(),
+            checkpoint_bundle: Some(remanence_parity::CommittedBundle {
+                kind: remanence_parity::CommittedBundleKind::Finish,
+                entries: vec![{
+                    let mut bootstrap = parity_entry(3, remanence_parity::TapeFileKind::Bootstrap);
+                    bootstrap.physical_start_hint = Some(8);
+                    bootstrap
+                }],
+                highest_protected_ordinal: 0,
+                total_committed_ordinals: 3,
+            }),
+            sealed_after_write: true,
+        };
+        let err = journal
+            .append(&terminal)
+            .expect_err("terminal authority must require a durable Sealing intent");
+        assert!(err.to_string().contains("durable Sealing intent"), "{err}");
+        let mut lease = journal.acquire_exclusive().expect("acquire journal lease");
+        lease
+            .begin_terminal_transition()
+            .expect("persist Sealing intent");
+        lease
+            .append_terminal_transition(std::slice::from_ref(&terminal))
+            .expect("append terminal checkpoint authority");
+        drop(lease);
+
+        let err = journal
+            .append(&second_record(tape_uuid))
+            .expect_err("a terminal checkpoint must permanently close the journal");
+        assert!(
+            err.to_string().contains("terminal sealed checkpoint"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn sealing_intent_blocks_replay_until_terminal_authority_is_durable() {
+        let dir = tempfile::tempdir().expect("temporary checkpoint directory");
+        let tape_uuid = [0x28; 16];
+        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let mut lease = journal.acquire_exclusive().expect("acquire journal lease");
+        lease
+            .begin_terminal_transition()
+            .expect("persist Sealing intent");
+        drop(lease);
+
+        let err = journal
+            .replay()
+            .expect_err("pending Sealing intent must fail replay closed");
+        assert!(err.to_string().contains("pending Sealing intent"), "{err}");
+        let err = journal
+            .acquire_exclusive()
+            .expect_err("pending Sealing intent must fence append acquisition");
+        assert!(err.to_string().contains("pending Sealing intent"), "{err}");
+
+        let mut recovery = journal
+            .acquire_exclusive_for_terminal_recovery()
+            .expect("acquire explicit terminal recovery lease");
+        let changed = recovery
+            .clear_terminal_intent_after_absent_tail(None, 1)
+            .expect_err("recovery must compare the durable EOD it physically inspected");
+        assert!(
+            changed.to_string().contains("authority changed"),
+            "{changed}"
+        );
+        recovery
+            .clear_terminal_intent_after_absent_tail(None, 0)
+            .expect("clear intent after proving an absent fresh-tape terminal tail");
+        drop(recovery);
+        journal
+            .acquire_exclusive()
+            .expect("ordinary append lease resumes after explicit reconciliation");
+    }
+
+    #[test]
+    fn unpublished_sealing_intent_temporary_is_safe_to_replace() {
+        let dir = tempfile::tempdir().expect("temporary checkpoint directory");
+        let tape_uuid = [0x2A; 16];
+        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let temporary_path = checkpoint_companion_path(journal.path(), ".sealing.new");
+        std::fs::write(&temporary_path, b"torn unpublished intent")
+            .expect("simulate crash before intent publication");
+
+        let mut lease = journal.acquire_exclusive().expect("acquire journal lease");
+        lease
+            .begin_terminal_transition()
+            .expect("atomically replace unpublished temporary intent");
+        drop(lease);
+
+        assert!(
+            terminal_intent_pending(journal.path(), tape_uuid).expect("published intent validates")
+        );
+        assert!(!temporary_path.exists());
+    }
+
+    #[test]
+    fn terminal_transition_clears_intent_after_one_fsynced_frame() {
+        let dir = tempfile::tempdir().expect("temporary checkpoint directory");
+        let tape_uuid = [0x29; 16];
+        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let prior = record(tape_uuid);
+        let terminal = CheckpointJournalRecord {
+            ordinal: 2,
+            committed_object_count: 1,
+            eod_partition: 0,
+            eod_lba: 10,
+            tape_uuid,
+            batch_id: [0x49; 16],
+            checkpoint_tape_file_number: 3,
+            block_size: prior.block_size,
+            objects: Vec::new(),
+            scheme: None,
+            object_tape_file_bundles: Vec::new(),
+            checkpoint_bundle: Some(remanence_parity::CommittedBundle {
+                kind: remanence_parity::CommittedBundleKind::Finish,
+                entries: vec![{
+                    let mut bootstrap = parity_entry(3, remanence_parity::TapeFileKind::Bootstrap);
+                    bootstrap.physical_start_hint = Some(8);
+                    bootstrap
+                }],
+                highest_protected_ordinal: 0,
+                total_committed_ordinals: 3,
+            }),
+            sealed_after_write: true,
+        };
+        let mut lease = journal.acquire_exclusive().expect("acquire journal lease");
+        lease
+            .begin_terminal_transition()
+            .expect("persist Sealing intent");
+        lease
+            .append_terminal_transition(&[prior.clone(), terminal.clone()])
+            .expect("append terminal authority transition");
+        drop(lease);
+        assert!(!terminal_intent_path(journal.path()).exists());
+        assert_eq!(
+            journal.replay().expect("replay terminal transition"),
+            vec![prior, terminal]
+        );
+
+        write_terminal_intent(journal.path(), tape_uuid)
+            .expect("simulate crash after terminal frame fsync before intent cleanup");
+        let lease = journal
+            .acquire_exclusive()
+            .expect("completed authority makes stale intent safely removable");
+        drop(lease);
+        assert!(!terminal_intent_path(journal.path()).exists());
+    }
+
+    #[test]
+    fn parity_terminal_checkpoint_requires_exact_bootstrap_eod() {
+        let tape_uuid = [0x26; 16];
+        let prior = partial_epoch_parity_record(tape_uuid);
+        let prior_bundle = prior
+            .checkpoint_bundle
+            .as_ref()
+            .expect("prior parity checkpoint bundle");
+        let terminal = |physical_start_hint, block_count, eod_lba| CheckpointJournalRecord {
+            ordinal: 2,
+            committed_object_count: prior.committed_object_count,
+            eod_partition: 0,
+            eod_lba,
+            tape_uuid,
+            batch_id: [0x46; 16],
+            checkpoint_tape_file_number: 4,
+            block_size: prior.block_size,
+            objects: Vec::new(),
+            scheme: prior.scheme.clone(),
+            object_tape_file_bundles: Vec::new(),
+            checkpoint_bundle: Some(remanence_parity::CommittedBundle {
+                kind: remanence_parity::CommittedBundleKind::Finish,
+                entries: vec![{
+                    let mut bootstrap = parity_entry(4, remanence_parity::TapeFileKind::Bootstrap);
+                    bootstrap.physical_start_hint = physical_start_hint;
+                    bootstrap.block_count = block_count;
+                    bootstrap
+                }],
+                highest_protected_ordinal: prior_bundle.highest_protected_ordinal,
+                total_committed_ordinals: prior_bundle.total_committed_ordinals,
+            }),
+            sealed_after_write: true,
+        };
+
+        validate_next_record(Some(&prior), &terminal(Some(12), 1, 14))
+            .expect("exact terminal Bootstrap extent");
+        let missing = validate_next_record(Some(&prior), &terminal(None, 1, 14))
+            .expect_err("missing terminal physical start must reject");
+        assert!(
+            missing.to_string().contains("physical start hint"),
+            "{missing}"
+        );
+        let overlap = validate_next_record(Some(&prior), &terminal(Some(11), 1, 13))
+            .expect_err("terminal extent overlap must reject");
+        assert!(
+            overlap
+                .to_string()
+                .contains("expected prior terminal cursor 12"),
+            "{overlap}"
+        );
+        let gap = validate_next_record(Some(&prior), &terminal(Some(13), 1, 15))
+            .expect_err("terminal extent gap must reject");
+        assert!(
+            gap.to_string()
+                .contains("expected prior terminal cursor 12"),
+            "{gap}"
+        );
+        let mismatch = validate_next_record(Some(&prior), &terminal(Some(12), 1, 15))
+            .expect_err("terminal EOD mismatch must reject");
+        assert!(
+            mismatch.to_string().contains("Finish bundle end"),
+            "{mismatch}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_batch_is_one_integrity_frame_and_torn_batch_fails_closed() {
+        let dir = tempfile::tempdir().expect("temporary checkpoint directory");
+        let tape_uuid = [0x27; 16];
+        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let first = record(tape_uuid);
+        let second = second_record(tape_uuid);
+        let mut lease = journal.acquire_exclusive().expect("acquire journal lease");
+        lease
+            .append_batch(&[first.clone(), second.clone()])
+            .expect("append checkpoint transition");
+        drop(lease);
+        assert_eq!(
+            journal.replay().expect("replay checkpoint transition"),
+            vec![first, second]
+        );
+
+        let file = OpenOptions::new()
+            .write(true)
+            .open(journal.path())
+            .expect("open journal for crash cut");
+        let len = file.metadata().expect("stat journal").len();
+        file.set_len(len - 1).expect("tear transition checksum");
+        file.sync_all().expect("sync torn transition");
+        let err = journal
+            .replay()
+            .expect_err("a torn multi-record transition must fail closed");
+        assert!(err.to_string().contains("torn trailing frame"), "{err}");
     }
 
     #[test]

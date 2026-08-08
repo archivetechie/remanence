@@ -555,6 +555,48 @@ impl FileTapeFileJournal {
         &self.scheme
     }
 
+    /// Durably discard only the orphan suffix that a higher recovery layer has
+    /// already matched against physical tape and checkpoint authority.
+    ///
+    /// The exact orphan bundles are a compare-and-truncate guard: if journal
+    /// evidence changed after reconciliation, nothing is removed. Callers must
+    /// not invoke this merely because orphans exist.
+    pub fn truncate_reconciled_orphans(
+        &mut self,
+        expected_orphans: &[CommittedBundle],
+    ) -> Result<CommittedState, JournalError> {
+        if expected_orphans.is_empty() {
+            return Err(JournalError::Codec(
+                "reconciled orphan truncation requires a non-empty expected suffix".into(),
+            ));
+        }
+        let file_len = self.file.metadata()?.len();
+        let header = read_header(&mut self.file)?;
+        if header.tape_uuid != self.tape_uuid
+            || header.block_size != self.block_size
+            || header.drive_compression != self.drive_compression
+            || header.scheme != self.scheme
+        {
+            return Err(JournalError::HeaderMismatch);
+        }
+        let replay = load_committed_replay_from_reader(&mut self.file, file_len)?;
+        if replay.state.orphaned_bundles != expected_orphans {
+            return Err(JournalError::RecoveryRequired(
+                "orphan journal suffix changed after physical reconciliation; refusing truncation"
+                    .into(),
+            ));
+        }
+        self.file.set_len(replay.retained_end)?;
+        self.file.seek(SeekFrom::Start(replay.retained_end))?;
+        self.file.sync_all()?;
+        self.last_highest_protected_ordinal = replay.state.highest_protected_ordinal;
+        self.last_total_committed_ordinals = replay.state.total_committed_ordinals;
+        self.orphaned_bundles_preserved_on_open = 0;
+        let mut state = replay.state;
+        state.orphaned_bundles.clear();
+        Ok(state)
+    }
+
     #[cfg(test)]
     fn open_without_volume_check_for_tests(
         path: impl AsRef<Path>,
@@ -812,6 +854,20 @@ fn load_committed_from_reader(
     file: &mut File,
     file_len: u64,
 ) -> Result<CommittedState, JournalError> {
+    Ok(load_committed_replay_from_reader(file, file_len)?.state)
+}
+
+#[derive(Debug)]
+struct CommittedJournalReplay {
+    state: CommittedState,
+    retained_end: u64,
+}
+
+fn load_committed_replay_from_reader(
+    file: &mut File,
+    file_len: u64,
+) -> Result<CommittedJournalReplay, JournalError> {
+    let header_end = file.stream_position()?;
     let mut replay_highest_protected_ordinal = 0;
     let mut replay_total_committed_ordinals = 0;
     let mut records = Vec::new();
@@ -896,6 +952,7 @@ fn load_committed_from_reader(
         .iter()
         .rposition(|(bundle, _)| bundle.kind == CommittedBundleKind::CheckpointedThrough);
     let retained_record_count = last_checkpoint_index.map_or(0, |index| index + 1);
+    let retained_end = last_checkpoint_index.map_or(header_end, |index| records[index].1);
     let orphaned_records = records.split_off(retained_record_count);
     let orphaned_bundles = orphaned_records
         .into_iter()
@@ -910,11 +967,14 @@ fn load_committed_from_reader(
         total_committed_ordinals = bundle.total_committed_ordinals;
     }
 
-    Ok(CommittedState {
-        entries,
-        highest_protected_ordinal,
-        total_committed_ordinals,
-        orphaned_bundles,
+    Ok(CommittedJournalReplay {
+        state: CommittedState {
+            entries,
+            highest_protected_ordinal,
+            total_committed_ordinals,
+            orphaned_bundles,
+        },
+        retained_end,
     })
 }
 
@@ -2221,7 +2281,7 @@ mod tests {
         assert_eq!(state.orphaned_bundles, vec![orphan.clone()]);
         assert_eq!(fs::metadata(&path).unwrap().len(), orphaned_len);
 
-        let reopened = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let mut reopened = FileTapeFileJournal::open_without_volume_check_for_tests(
             &path,
             tape_uuid,
             256 * 1024,
@@ -2232,7 +2292,34 @@ mod tests {
         assert_eq!(fs::metadata(&path).unwrap().len(), orphaned_len);
         let preserved = reopened.load_committed().expect("replay preserved journal");
         assert_eq!(preserved.entries, sample_bundle().entries);
-        assert_eq!(preserved.orphaned_bundles, vec![orphan]);
+        assert_eq!(preserved.orphaned_bundles, vec![orphan.clone()]);
+
+        let wrong = reopened
+            .truncate_reconciled_orphans(&[sample_bundle()])
+            .expect_err("changed reconciliation evidence must not truncate");
+        assert!(
+            matches!(wrong, JournalError::RecoveryRequired(_)),
+            "{wrong}"
+        );
+        assert_eq!(fs::metadata(&path).unwrap().len(), orphaned_len);
+        let reconciled = reopened
+            .truncate_reconciled_orphans(std::slice::from_ref(&orphan))
+            .expect("truncate exactly reconciled orphan suffix");
+        assert!(reconciled.orphaned_bundles.is_empty());
+        assert_eq!(fs::metadata(&path).unwrap().len(), checkpoint_len);
+        assert_eq!(reopened.orphaned_bundles_preserved_on_open(), 0);
+        drop(reopened);
+
+        let reopened = FileTapeFileJournal::open_without_volume_check_for_tests(
+            &path,
+            tape_uuid,
+            256 * 1024,
+            default_scheme(),
+        )
+        .expect("restart after durable orphan truncation");
+        let state = reopened.load_committed().expect("replay reconciled prefix");
+        assert!(state.orphaned_bundles.is_empty());
+        assert_eq!(state.total_committed_ordinals, 3);
 
         let _ = fs::remove_file(path);
     }

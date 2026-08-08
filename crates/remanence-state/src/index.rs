@@ -3063,6 +3063,9 @@ impl CatalogIndex {
     ) -> Result<(), StateError> {
         let projections = &record.objects;
         if projections.is_empty() {
+            if record.sealed_after_write {
+                return self.project_terminal_checkpoint_record(record);
+            }
             return Err(StateError::IndexCorrupt(
                 "checkpoint record has no object projections".to_string(),
             ));
@@ -3123,6 +3126,12 @@ impl CatalogIndex {
             // EOD measurements and must still cover this record (a rebuilt
             // or migrated row may not carry it yet).
             project_tape_written_extent_tx(&tx, record.tape_uuid, record.eod_lba)?;
+            project_checkpoint_tape_seal_tx(
+                &tx,
+                record.tape_uuid,
+                record.sealed_after_write,
+                updated_at.as_str(),
+            )?;
             tx.commit()
                 .map_err(|err| sqlite_error("commit checkpoint extent projection", err))?;
             return Ok(());
@@ -3179,6 +3188,12 @@ impl CatalogIndex {
         // are inside it by construction. It is updated after the bundle
         // projection has upserted the tape row.
         project_tape_written_extent_tx(&tx, record.tape_uuid, record.eod_lba)?;
+        project_checkpoint_tape_seal_tx(
+            &tx,
+            record.tape_uuid,
+            record.sealed_after_write,
+            updated_at.as_str(),
+        )?;
         if replay_plan == CheckpointReplayPlan::RepairRetired {
             tx.execute(
                 "update object_copies set status = 'missing'
@@ -3189,6 +3204,66 @@ impl CatalogIndex {
         }
         tx.commit()
             .map_err(|err| sqlite_error("commit checkpoint batch projection", err))?;
+        Ok(())
+    }
+
+    fn project_terminal_checkpoint_record(
+        &mut self,
+        record: &crate::checkpoint::CheckpointJournalRecord,
+    ) -> Result<(), StateError> {
+        let bundle = record.checkpoint_bundle.as_ref().ok_or_else(|| {
+            StateError::IndexCorrupt("terminal checkpoint has no Finish bundle".to_string())
+        })?;
+        remanence_parity::validate_committed_bundle_shape(bundle).map_err(|err| {
+            StateError::IndexCorrupt(format!(
+                "terminal checkpoint has invalid Finish bundle: {err}"
+            ))
+        })?;
+        if bundle.kind != CommittedBundleKind::Finish {
+            return Err(StateError::IndexCorrupt(format!(
+                "terminal checkpoint uses {:?} bundle kind",
+                bundle.kind
+            )));
+        }
+        let tape = self.get_tape(&record.tape_uuid)?.ok_or_else(|| {
+            StateError::IndexCorrupt(format!(
+                "terminal checkpoint names unknown tape {}",
+                hex_uuid(record.tape_uuid)
+            ))
+        })?;
+        if tape.block_size != Some(u64::from(record.block_size)) {
+            return Err(StateError::IndexCorrupt(format!(
+                "terminal checkpoint block size {} conflicts with tape geometry {:?}",
+                record.block_size, tape.block_size
+            )));
+        }
+        let expected_scheme_id = record
+            .scheme
+            .as_ref()
+            .map(|scheme| scheme.id.as_str().to_string());
+        if tape.scheme_id != expected_scheme_id
+            || record.scheme.as_ref().is_some_and(|scheme| {
+                tape.data_blocks_per_stripe != Some(u32::from(scheme.data_blocks_per_stripe))
+                    || tape.parity_blocks_per_stripe
+                        != Some(u32::from(scheme.parity_blocks_per_stripe))
+                    || tape.stripes_per_neighborhood != Some(scheme.stripes_per_neighborhood)
+            })
+            || tape.total_committed_ordinals != bundle.total_committed_ordinals
+        {
+            return Err(StateError::IndexCorrupt(format!(
+                "terminal checkpoint geometry or ordinal scope conflicts with tape {}",
+                hex_uuid(record.tape_uuid)
+            )));
+        }
+        let updated_at = now_utc()?;
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|err| sqlite_error("begin terminal checkpoint projection", err))?;
+        project_tape_written_extent_tx(&tx, record.tape_uuid, record.eod_lba)?;
+        project_checkpoint_tape_seal_tx(&tx, record.tape_uuid, true, updated_at.as_str())?;
+        tx.commit()
+            .map_err(|err| sqlite_error("commit terminal checkpoint projection", err))?;
         Ok(())
     }
 
@@ -8429,6 +8504,33 @@ fn project_tape_written_extent_tx(
         params![tape_uuid.to_vec(), eod_lba],
     )
     .map_err(|err| sqlite_error("project tape written extent", err))?;
+    Ok(())
+}
+
+fn project_checkpoint_tape_seal_tx(
+    tx: &rusqlite::Transaction<'_>,
+    tape_uuid: [u8; 16],
+    sealed_after_write: bool,
+    updated_at_utc: &str,
+) -> Result<(), StateError> {
+    if !sealed_after_write {
+        return Ok(());
+    }
+    let changed = tx
+        .execute(
+            "update tapes
+             set state = case when state = 'retired' then state else 'sealed' end,
+                 updated_at_utc = ?2
+             where tape_uuid = ?1",
+            params![tape_uuid.to_vec(), updated_at_utc],
+        )
+        .map_err(|err| sqlite_error("project checkpoint tape seal", err))?;
+    if changed == 0 {
+        return Err(StateError::IndexCorrupt(format!(
+            "cannot seal unknown tape {} from checkpoint",
+            hex_uuid(tape_uuid)
+        )));
+    }
     Ok(())
 }
 
@@ -14697,15 +14799,60 @@ mod tests {
             scheme: None,
             object_tape_file_bundles: Vec::new(),
             checkpoint_bundle: None,
+            sealed_after_write: false,
         };
         journal.append(&record).expect("fsync checkpoint record");
+        let terminal_record = crate::checkpoint::CheckpointJournalRecord {
+            ordinal: 2,
+            committed_object_count: 2,
+            eod_partition: 0,
+            eod_lba: 13,
+            tape_uuid,
+            batch_id: [0x62; 16],
+            checkpoint_tape_file_number: 4,
+            block_size: 256 * 1024,
+            objects: Vec::new(),
+            scheme: None,
+            object_tape_file_bundles: Vec::new(),
+            checkpoint_bundle: Some(CommittedBundle {
+                kind: CommittedBundleKind::Finish,
+                entries: vec![TapeFileEntry {
+                    tape_file_number: 4,
+                    kind: TapeFileKind::Bootstrap,
+                    block_count: 1,
+                    physical_start_hint: Some(11),
+                    object_id: None,
+                    first_parity_data_ordinal: None,
+                    epoch_id: None,
+                    protected_ordinal_start: None,
+                    protected_ordinal_end_exclusive: None,
+                    canonical_metadata_hash: None,
+                    bootstrap_object_row: None,
+                }],
+                highest_protected_ordinal: 0,
+                total_committed_ordinals: 5,
+            }),
+            sealed_after_write: true,
+        };
+        let mut journal_lease = journal
+            .acquire_exclusive()
+            .expect("acquire checkpoint journal");
+        journal_lease
+            .begin_terminal_transition()
+            .expect("begin terminal checkpoint transition");
+        journal_lease
+            .append_terminal_transition(std::slice::from_ref(&terminal_record))
+            .expect("fsync terminal checkpoint record");
+        drop(journal_lease);
 
         // This is the post-fsync/pre-SQLite cut: replay of the durable record
         // atomically reconstructs the whole batch.
-        let replayed = journal.last().expect("replay checkpoint").expect("record");
-        index
-            .project_checkpoint_record(&replayed)
-            .expect("project replayed checkpoint");
+        let replayed = journal.replay().expect("replay checkpoint journal");
+        for record in &replayed {
+            index
+                .project_checkpoint_record(record)
+                .expect("project replayed checkpoint");
+        }
         assert_eq!(
             index
                 .conn
@@ -14720,11 +14867,17 @@ mod tests {
             .expect("checkpoint tape");
         assert_eq!(tape.last_committed_tape_file, Some(3));
         assert_eq!(tape.total_committed_ordinals, 5);
+        assert_eq!(
+            tape.state, "sealed",
+            "journal replay must recover a terminal checkpoint's sealed projection"
+        );
 
         // The post-SQLite cut is idempotent when startup replays the journal.
-        index
-            .project_checkpoint_record(&replayed)
-            .expect("idempotent checkpoint replay");
+        for record in &replayed {
+            index
+                .project_checkpoint_record(record)
+                .expect("idempotent checkpoint replay");
+        }
         assert_eq!(
             index
                 .conn
@@ -14738,7 +14891,8 @@ mod tests {
         // spans synthesised from the record's barrier-proved eod_lba must
         // equal the forward dead-reckoned layout. Structural layout of this
         // record: bootstrap [0,1) fm@1, object-1 [2,5) fm@5, object-2 [6,8)
-        // fm@8, checkpoint bootstrap [9,10) fm@10, eod 11.
+        // fm@8, checkpoint bootstrap [9,10) fm@10, checkpoint EOD 11,
+        // terminal bootstrap [11,12) fm@12, terminal EOD 13.
         let spans: Vec<(i64, Option<i64>)> = {
             let mut stmt = index
                 .conn
@@ -14780,7 +14934,26 @@ mod tests {
             .get_tape(&tape_uuid)
             .expect("query tape")
             .expect("tape row");
-        assert_eq!(tape.written_extent_lba, Some(11));
+        assert_eq!(tape.written_extent_lba, Some(13));
+
+        index
+            .retire_tape(RetireTapeInput {
+                tape_uuid,
+                reason: "terminal replay permanence test".to_string(),
+            })
+            .expect("retire sealed tape");
+        index
+            .project_checkpoint_record(&terminal_record)
+            .expect("replay terminal authority against retired tape");
+        assert_eq!(
+            index
+                .get_tape(&tape_uuid)
+                .expect("query replayed retired tape")
+                .expect("retired tape")
+                .state,
+            "retired",
+            "terminal checkpoint replay must never resurrect a retired tape as sealed"
+        );
     }
 
     #[test]
@@ -14879,6 +15052,7 @@ mod tests {
             scheme: None,
             object_tape_file_bundles: Vec::new(),
             checkpoint_bundle: None,
+            sealed_after_write: false,
         };
         index
             .project_checkpoint_record(&record)
@@ -15066,6 +15240,7 @@ mod tests {
             scheme: Some(scheme),
             object_tape_file_bundles: vec![object_bundle],
             checkpoint_bundle: Some(checkpoint_bundle),
+            sealed_after_write: false,
         };
         index
             .project_checkpoint_record(&record)
@@ -15169,6 +15344,7 @@ mod tests {
             scheme: None,
             object_tape_file_bundles: Vec::new(),
             checkpoint_bundle: None,
+            sealed_after_write: false,
         };
 
         let error = index
