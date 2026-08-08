@@ -32,7 +32,7 @@ pub use calibration::{
     VolumeCalibrationState, VolumeMediaWriteFence, WritePathTrust, CALIBRATION_CONTROL_FILENAME,
 };
 pub use checkpoint::{
-    list_checkpoint_journals, tape_uuid_from_checkpoint_path,
+    list_checkpoint_journals, tape_uuid_from_checkpoint_path, validate_parity_resume_authority,
     CheckpointBootstrapObjectRepresentation, CheckpointBootstrapObjectRow, CheckpointJournalRecord,
     CheckpointObjectProjection, FileCheckpointJournal,
 };
