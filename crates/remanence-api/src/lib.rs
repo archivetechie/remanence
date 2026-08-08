@@ -7350,6 +7350,7 @@ BCw3Wyv2UWY=
                 scheme: None,
                 object_tape_file_bundles: Vec::new(),
                 checkpoint_bundle: None,
+                sealed_after_write: false,
             })
             .expect("append checkpoint record");
     }
@@ -7417,6 +7418,7 @@ BCw3Wyv2UWY=
             scheme: None,
             object_tape_file_bundles: Vec::new(),
             checkpoint_bundle: None,
+            sealed_after_write: false,
         }
     }
 

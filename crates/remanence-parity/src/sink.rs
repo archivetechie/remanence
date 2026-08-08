@@ -703,6 +703,12 @@ impl ParitySinkSessionState {
         self.reserved_bootstrap_object_row_slots = object_count;
         Ok(())
     }
+
+    /// Number of worst-case checkpoint directory rows already reserved for
+    /// the next batch.
+    pub fn reserved_checkpoint_batch_object_rows(&self) -> u64 {
+        self.reserved_bootstrap_object_row_slots
+    }
 }
 
 /// Content-driven bootstrap cadence from Layer 3c §7.3.
