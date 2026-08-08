@@ -15,7 +15,9 @@ small but central writer-schema cores:
   `external_references`, empty `metadata_preservation_data`,
   `schema_version = 1`, `file_sha256` length 32, and chunk-count arithmetic
 - a bounded five-entry manifest containing a nonempty regular file with one
-  xattr, an empty regular file, a hardlink, a symlink, and a directory
+  portable `user`-namespace xattr, an empty regular file, a hardlink, a symlink,
+  and a directory; extensions are outside this scalar core, so its modeled
+  production `object_metadata` remains empty
 - a fixed-capacity array/fold validator over that five-entry shape, adding
   duplicate path/file-id rejection and hardlink target accumulation across the
   preceding regular entries
@@ -31,7 +33,9 @@ small but central writer-schema cores:
 
 Text values are represented by opaque scalar ids and SHA-256 bytes by four
 opaque `u64` words. Xattr names and values are represented by scalar ids and a
-value length. This preserves identity for the proof without proving `String`,
+value length; the modeled xattr is restricted to the portable `user` namespace,
+and the extraction does not model extensions or the resulting object-metadata
+inventory. This preserves identity for the proof without proving `String`,
 `Vec`, exact CBOR bytes, UTF-8 decoding, tar/pax layout, hashing, arbitrary
 xattr maps, global-pax cross-checking, standard-library `BTreeSet` internals,
 or the real Rust `Vec` loop.
@@ -114,7 +118,7 @@ decode_manifest_entries_core(
 
 The bounded core covers these production-sensitive entry branches:
 
-- a nonempty regular file with one modeled xattr
+- a nonempty regular file with one modeled portable `user`-namespace xattr
 - an empty regular file with null first-chunk LBA
 - a hardlink whose target path id must be the preceding regular file path id
 - a symlink with a nonempty modeled target id

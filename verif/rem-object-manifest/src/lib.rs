@@ -10,8 +10,10 @@
 //! references, and deterministic writer key order.
 //!
 //! The second core broadens that surface to a bounded five-entry manifest:
-//! nonempty regular file with one xattr, empty regular file, hardlink, symlink,
-//! and directory. The array core adds fixed-capacity fold checks for duplicate
+//! nonempty regular file with one portable `user`-namespace xattr, empty regular
+//! file, hardlink, symlink, and directory. Extensions are outside this scalar
+//! core, so the modeled production `object_metadata` remains empty. The array
+//! core adds fixed-capacity fold checks for duplicate
 //! path/file ids and hardlink target membership in the accumulated regular-file
 //! prefix. The planner bridge then models the production `BTreeSet` membership
 //! contract as scalar contains/insert facts before feeding the arbitrary fold
@@ -1491,7 +1493,7 @@ mod tests {
             "\"file_entries\"",
             "CborValue::Array(files.iter().map(file_manifest_entry).collect())",
             "\"object_id\"",
-            "\"object_metadata\", CborValue::Map(Vec::new())",
+            "\"object_metadata\", object_metadata(options, files)",
             "\"schema_version\", CborValue::Integer(1u64.into())",
             "map.sort_by_key(|entry| canonical_text_key(entry.0));",
             "fn file_manifest_entry(layout: &RemTarFileLayout) -> CborValue",
@@ -1508,8 +1510,13 @@ mod tests {
             "if let Some(link_target) = &layout.link_target",
             "map.push((\"link_target\", CborValue::Text(link_target.clone())));",
             "fn metadata_preservation_data(layout: &RemTarFileLayout) -> CborValue",
-            "if layout.xattrs.is_empty()",
+            "if layout.xattrs.is_empty() && layout.extensions.is_empty()",
             "let xattrs = CborValue::Map(",
+            "fn object_metadata(options: &RemTarObjectOptions, files: &[RemTarFileLayout]) -> CborValue",
+            "if namespace != \"user\"",
+            "if !attribute_namespaces.is_empty()",
+            "if !extension_names.is_empty()",
+            "if !options.extensions.is_empty()",
             "let mut seen_paths = BTreeSet::new();",
             "let mut seen_file_ids = BTreeSet::new();",
             "let mut seen_regular_paths = BTreeSet::new();",
@@ -1540,8 +1547,10 @@ mod tests {
             "let file_entries = required_array(map, \"file_entries\")?;",
             "if file_entries.len() > MAX_FILE_ENTRIES",
             "let mut seen_regular_paths = BTreeSet::new();",
-            "if let Some(path) = validate_file_entry(entry, reader_chunk_size, &seen_regular_paths)?",
+            "let validated = validate_file_entry(entry, reader_chunk_size, &seen_regular_paths)?;",
+            "if let Some(path) = validated.regular_path",
             "seen_regular_paths.insert(path);",
+            "validate_inventory(",
             "let expected_chunk_count = if size_bytes == 0 {\n        0\n    } else {\n        (size_bytes - 1) / reader_chunk_size as u64 + 1\n    };",
             "if chunk_count != expected_chunk_count",
             "first_chunk_lba must be null when size_bytes is zero",
@@ -1549,7 +1558,7 @@ mod tests {
             "regular entry missing file_sha256",
             "if file_sha256.len() != 32",
             "Some(\"hardlink\")",
-            "hardlink entry must not have xattrs",
+            "hardlink entry metadata_preservation_data must be empty",
             "if !seen_regular_paths.contains(target)",
             "Some(\"symlink\")",
             "Some(\"directory\")",
