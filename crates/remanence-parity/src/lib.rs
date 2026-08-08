@@ -43,11 +43,13 @@ pub mod model;
 pub mod parity_map;
 pub mod raw;
 pub mod recovery;
+mod replicated_control;
 pub mod resume;
 pub mod scan;
 pub mod sidecar;
 pub mod sink;
 pub mod source;
+pub mod tape_index;
 
 pub use bootstrap::{
     discover_authoritative_bootstrap, discover_authoritative_bootstrap_with_block_size,
@@ -130,6 +132,22 @@ pub use sink::{
 pub use source::{
     BulkRecoveryPolicy, ObjectParitySource, OpenTrust, ParityAuditHook, RecoveredOrdinalBlock,
     RecoveredOrdinalRange, RecoveredRegion,
+};
+pub use tape_index::{
+    classify_tape_index_snapshot_header_block, derive_tape_index_snapshot_footer_magic,
+    derive_tape_index_snapshot_header_magic, encode_tape_index_snapshot_footer_block,
+    encode_tape_index_snapshot_header, parse_tape_index_snapshot_footer_block,
+    parse_tape_index_snapshot_header_block, plan_tape_index_snapshot, tape_index_snapshot_layout,
+    write_tape_index_snapshot, TapeIndexSnapshotCopyKind, TapeIndexSnapshotCounts,
+    TapeIndexSnapshotDescriptor, TapeIndexSnapshotFileKind, TapeIndexSnapshotFooter,
+    TapeIndexSnapshotHeader, TapeIndexSnapshotLayout, TapeIndexSnapshotMapEntry,
+    TapeIndexSnapshotObjectRow, TapeIndexSnapshotPlan, TapeIndexSnapshotRecordSource,
+    TapeIndexSnapshotReference, TapeIndexSnapshotScope, TAPE_INDEX_OBJECT_ROW_MAX_LEN,
+    TAPE_INDEX_OBJECT_ROW_SLOT_LEN, TAPE_INDEX_SLOT_PREFIX_LEN, TAPE_INDEX_SNAPSHOT_BLOCK_SIZES,
+    TAPE_INDEX_SNAPSHOT_FOOTER_CRC_OFFSET, TAPE_INDEX_SNAPSHOT_FOOTER_LEN,
+    TAPE_INDEX_SNAPSHOT_FOOTER_VERSION, TAPE_INDEX_SNAPSHOT_HEADER_CRC_OFFSET,
+    TAPE_INDEX_SNAPSHOT_HEADER_LEN, TAPE_INDEX_SNAPSHOT_SCHEMA_VERSION,
+    TAPE_INDEX_STRUCTURAL_ENTRY_MAX_LEN, TAPE_INDEX_STRUCTURAL_SLOT_LEN,
 };
 
 // ====================================================================
