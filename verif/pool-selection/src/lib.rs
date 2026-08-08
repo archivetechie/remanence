@@ -7,7 +7,9 @@
 //! fit filtering, completion detection, leftover calculation, and the pairwise
 //! ranking predicates for `CompleteOrFill` and `FillOldest`. UUIDs are modeled
 //! as ordered `u64`s because the production key only needs deterministic final
-//! ordering. The `drift_guard` test pins the production snippets this mirrors.
+//! ordering. The `drift_guard` test pins the ranking snippets and compiles the
+//! production admission kernel into the test crate for semantic equivalence
+//! checks across its branch and overflow boundaries.
 
 pub type TapeUuid = u64;
 
@@ -20,6 +22,56 @@ pub struct TapeFitState {
     pub used_bytes: u64,
     pub usable_bytes: u64,
     pub low_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+pub enum AdmissionDisposition {
+    AdmitRemainOpen,
+    AdmitThenFinalize,
+    FinalizePrefixAndRetry,
+    RejectInvalidCapacityPolicy,
+}
+
+#[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+pub struct CapacityAdmissionInput {
+    pub current_used_blocks: u64,
+    pub object_commit_charge_blocks: u64,
+    pub close_bound_blocks: u64,
+    pub capacity_blocks: u64,
+    pub low_watermark_blocks: u64,
+    pub high_watermark_blocks: u64,
+}
+
+pub fn capacity_admission_disposition(input: CapacityAdmissionInput) -> AdmissionDisposition {
+    if input.low_watermark_blocks > input.high_watermark_blocks
+        || input.high_watermark_blocks > input.capacity_blocks
+    {
+        return AdmissionDisposition::RejectInvalidCapacityPolicy;
+    }
+    let projected_used_blocks = match input
+        .current_used_blocks
+        .checked_add(input.object_commit_charge_blocks)
+    {
+        Some(value) => value,
+        None => return AdmissionDisposition::FinalizePrefixAndRetry,
+    };
+    if projected_used_blocks > input.high_watermark_blocks {
+        return AdmissionDisposition::FinalizePrefixAndRetry;
+    }
+    let required_through_close = match projected_used_blocks.checked_add(input.close_bound_blocks) {
+        Some(value) => value,
+        None => return AdmissionDisposition::FinalizePrefixAndRetry,
+    };
+    if required_through_close > input.capacity_blocks {
+        return AdmissionDisposition::FinalizePrefixAndRetry;
+    }
+    if projected_used_blocks < input.low_watermark_blocks {
+        AdmissionDisposition::AdmitRemainOpen
+    } else {
+        AdmissionDisposition::AdmitThenFinalize
+    }
 }
 
 pub fn loaded_key(candidate: TapeFitState) -> u8 {
@@ -121,6 +173,19 @@ pub fn fill_oldest_precedes_or_ties(left: TapeFitState, right: TapeFitState) -> 
     left.tape_uuid <= right.tape_uuid
 }
 
+// Compile the production policy source directly into the test crate. Its only
+// crate-local dependency is the tape UUID alias; using the production `[u8; 16]`
+// shape also keeps the production module's own tests type-correct. This makes
+// admission drift a behavioral test failure instead of a substring mismatch.
+#[cfg(test)]
+mod pool_write {
+    pub type TapeUuid = [u8; 16];
+}
+
+#[cfg(test)]
+#[path = "../../../crates/remanence-api/src/pool_selection.rs"]
+mod production_pool_selection;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,11 +253,119 @@ mod tests {
         }
     }
 
+    fn production_admission(input: CapacityAdmissionInput) -> AdmissionDisposition {
+        use production_pool_selection as production;
+
+        match production::capacity_admission_disposition(production::CapacityAdmissionInput {
+            current_used_blocks: input.current_used_blocks,
+            object_commit_charge_blocks: input.object_commit_charge_blocks,
+            close_bound_blocks: input.close_bound_blocks,
+            capacity_blocks: input.capacity_blocks,
+            low_watermark_blocks: input.low_watermark_blocks,
+            high_watermark_blocks: input.high_watermark_blocks,
+        }) {
+            production::AdmissionDisposition::AdmitRemainOpen => {
+                AdmissionDisposition::AdmitRemainOpen
+            }
+            production::AdmissionDisposition::AdmitThenFinalize => {
+                AdmissionDisposition::AdmitThenFinalize
+            }
+            production::AdmissionDisposition::FinalizePrefixAndRetry => {
+                AdmissionDisposition::FinalizePrefixAndRetry
+            }
+            production::AdmissionDisposition::RejectInvalidCapacityPolicy => {
+                AdmissionDisposition::RejectInvalidCapacityPolicy
+            }
+        }
+    }
+
+    #[test]
+    fn drift_guard_admission_semantics_match_production_at_branch_boundaries() {
+        let values = [0, 1, 2, 9, 10, u64::MAX - 1, u64::MAX];
+        for current_used_blocks in values {
+            for object_commit_charge_blocks in values {
+                for close_bound_blocks in values {
+                    for capacity_blocks in values {
+                        for low_watermark_blocks in values {
+                            for high_watermark_blocks in values {
+                                let input = CapacityAdmissionInput {
+                                    current_used_blocks,
+                                    object_commit_charge_blocks,
+                                    close_bound_blocks,
+                                    capacity_blocks,
+                                    low_watermark_blocks,
+                                    high_watermark_blocks,
+                                };
+                                assert_eq!(
+                                    capacity_admission_disposition(input),
+                                    production_admission(input),
+                                    "admission drift for input {input:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn fits_matches_remaining_capacity() {
         assert!(fits(tape(1, 1, false, 10, 200, 150), P));
         assert!(!fits(tape(1, 1, false, 180, 200, 190), P));
         assert!(!fits(tape(1, 1, false, 201, 200, 190), P));
+    }
+
+    fn admission(projected_used_blocks: u64, close_bound_blocks: u64) -> AdmissionDisposition {
+        capacity_admission_disposition(CapacityAdmissionInput {
+            current_used_blocks: 10,
+            object_commit_charge_blocks: projected_used_blocks - 10,
+            close_bound_blocks,
+            capacity_blocks: 140,
+            low_watermark_blocks: 100,
+            high_watermark_blocks: 120,
+        })
+    }
+
+    #[test]
+    fn admission_pins_low_high_close_and_retry_boundaries() {
+        assert_eq!(admission(99, 20), AdmissionDisposition::AdmitRemainOpen);
+        assert_eq!(admission(100, 20), AdmissionDisposition::AdmitThenFinalize);
+        assert_eq!(admission(120, 20), AdmissionDisposition::AdmitThenFinalize);
+        assert_eq!(
+            admission(121, 0),
+            AdmissionDisposition::FinalizePrefixAndRetry
+        );
+        assert_eq!(
+            admission(99, 42),
+            AdmissionDisposition::FinalizePrefixAndRetry
+        );
+    }
+
+    #[test]
+    fn admission_overflow_retries_and_invalid_policy_rejects() {
+        assert_eq!(
+            capacity_admission_disposition(CapacityAdmissionInput {
+                current_used_blocks: u64::MAX,
+                object_commit_charge_blocks: 1,
+                close_bound_blocks: 0,
+                capacity_blocks: u64::MAX,
+                low_watermark_blocks: 0,
+                high_watermark_blocks: u64::MAX,
+            }),
+            AdmissionDisposition::FinalizePrefixAndRetry
+        );
+        assert_eq!(
+            capacity_admission_disposition(CapacityAdmissionInput {
+                current_used_blocks: 0,
+                object_commit_charge_blocks: 0,
+                close_bound_blocks: 0,
+                capacity_blocks: 100,
+                low_watermark_blocks: 91,
+                high_watermark_blocks: 90,
+            }),
+            AdmissionDisposition::RejectInvalidCapacityPolicy
+        );
     }
 
     #[test]

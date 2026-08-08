@@ -1,10 +1,10 @@
 /- Specification theorems for the pool-selection ranking extraction
-   (SPEC.md P1-P6).
+   (SPEC.md P1-P7).
 
    Targets the Aeneas-generated definitions in `PoolSelection.Funs`. These
-   theorems certify the pure ranking kernel used by the production
-   `CompleteOrFill` and `FillOldest` policies: fit filtering, completion
-   detection, leftover arithmetic, and the lexicographic key dominance rules.
+   theorems certify the pure ranking and admission kernels used by production:
+   fit filtering, completion detection, leftover arithmetic, lexicographic key
+   dominance, and capacity-admission branch order.
    The Rust `drift_guard` test ties this proof-facing model back to production
    `crates/remanence-api/src/pool_selection.rs`. -/
 import PoolSelection.Funs
@@ -14,10 +14,196 @@ open Aeneas Aeneas.Std Result
 namespace PoolSelection
 
 /- Formal-proof scope:
-   the theorems below certify the extracted arithmetic and pairwise ranking
-   predicates. They do not prove Rust iterator internals, `Vec`, tuple
-   `min_by_key`, trait-object storage, or catalog/runtime projection. Those are
-   covered by normal Rust tests and the extraction drift guard. -/
+   the theorems below certify the extracted arithmetic, pairwise ranking
+   predicates, and pure admission disposition. They do not prove Rust iterator
+   internals, `Vec`, tuple `min_by_key`, trait-object storage, catalog/runtime
+   projection, or retry orchestration. Those are covered by normal Rust tests,
+   the extraction drift guards, and caller/runtime obligations. -/
+
+/-- P1a: a defined sufficient checked remainder is fitting. -/
+theorem fits_some_true (candidate : TapeFitState)
+    (projected_footprint remaining : Std.U64)
+    (hsub : U64.checked_sub candidate.usable_bytes candidate.used_bytes =
+      some remaining)
+    (hfit : projected_footprint.val ≤ remaining.val) :
+    fits candidate projected_footprint = ok true := by
+  simp [fits, lift, hsub, hfit]
+
+/-- P1b: a defined but insufficient checked remainder is not fitting. -/
+theorem fits_some_false (candidate : TapeFitState)
+    (projected_footprint remaining : Std.U64)
+    (hsub : U64.checked_sub candidate.usable_bytes candidate.used_bytes =
+      some remaining)
+    (hshort : remaining.val < projected_footprint.val) :
+    fits candidate projected_footprint = ok false := by
+  simp [fits, lift, hsub, hshort]
+
+/-- P1c: checked-subtraction failure cannot be reported as fitting. -/
+theorem fits_none_spec (candidate : TapeFitState)
+    (projected_footprint : Std.U64)
+    (hsub : U64.checked_sub candidate.usable_bytes candidate.used_bytes = none) :
+    fits candidate projected_footprint = ok false := by
+  simp [fits, lift, hsub]
+
+/-- P2a: reaching the low watermark after saturating addition completes. -/
+theorem completes_tape_true (candidate : TapeFitState)
+    (projected_footprint : Std.U64)
+    (hreached : candidate.low_bytes.val ≤
+      (core.num.U64.saturating_add candidate.used_bytes projected_footprint).val) :
+    completes_tape candidate projected_footprint = ok true := by
+  simp [completes_tape, lift, hreached]
+
+/-- P2b: remaining below low after saturating addition does not complete. -/
+theorem completes_tape_false (candidate : TapeFitState)
+    (projected_footprint : Std.U64)
+    (hbelow :
+      (core.num.U64.saturating_add candidate.used_bytes projected_footprint).val <
+        candidate.low_bytes.val) :
+    completes_tape candidate projected_footprint = ok false := by
+  simp [completes_tape, lift, hbelow]
+
+/-- P3: leftover is exactly the two production saturating subtractions. -/
+theorem leftover_after_write_spec (candidate : TapeFitState)
+    (projected_footprint : Std.U64) :
+    leftover_after_write candidate projected_footprint =
+      ok (core.num.U64.saturating_sub
+        (core.num.U64.saturating_sub candidate.usable_bytes candidate.used_bytes)
+        projected_footprint) := by
+  simp [leftover_after_write, lift]
+
+/-- P7: an invalid low/high ordering is a terminal policy rejection. -/
+theorem admission_rejects_low_above_high (input : CapacityAdmissionInput)
+    (h : input.high_watermark_blocks.val < input.low_watermark_blocks.val) :
+    capacity_admission_disposition input =
+      ok AdmissionDisposition.RejectInvalidCapacityPolicy := by
+  simp [capacity_admission_disposition, h]
+
+/-- P7: a high watermark above conservative capacity is also a terminal policy
+    rejection, regardless of later arithmetic. -/
+theorem admission_rejects_high_above_capacity (input : CapacityAdmissionInput)
+    (h : input.capacity_blocks.val < input.high_watermark_blocks.val) :
+    capacity_admission_disposition input =
+      ok AdmissionDisposition.RejectInvalidCapacityPolicy := by
+  simp [capacity_admission_disposition, h]
+
+/-- P7: overflow while projecting the Object boundary fails closed to retry
+    after a valid policy has been established. -/
+theorem admission_retries_when_projected_boundary_overflows
+    (input : CapacityAdmissionInput)
+    (hLowHigh : input.low_watermark_blocks.val ≤ input.high_watermark_blocks.val)
+    (hHighCapacity : input.high_watermark_blocks.val ≤ input.capacity_blocks.val)
+    (hProjected : U64.checked_add input.current_used_blocks
+      input.object_commit_charge_blocks = none) :
+    capacity_admission_disposition input =
+      ok AdmissionDisposition.FinalizePrefixAndRetry := by
+  have hnLowHigh : ¬ input.high_watermark_blocks.val <
+      input.low_watermark_blocks.val := by omega
+  have hnHighCapacity : ¬ input.capacity_blocks.val <
+      input.high_watermark_blocks.val := by omega
+  simp [capacity_admission_disposition, lift, hProjected, hnLowHigh,
+    hnHighCapacity]
+
+/-- P7: a successfully projected boundary above H retries before attempting
+    the close-bound addition. -/
+theorem admission_retries_above_high
+    (input : CapacityAdmissionInput) (projected : Std.U64)
+    (hLowHigh : input.low_watermark_blocks.val ≤ input.high_watermark_blocks.val)
+    (hHighCapacity : input.high_watermark_blocks.val ≤ input.capacity_blocks.val)
+    (hProjected : U64.checked_add input.current_used_blocks
+      input.object_commit_charge_blocks = some projected)
+    (hOverHigh : input.high_watermark_blocks.val < projected.val) :
+    capacity_admission_disposition input =
+      ok AdmissionDisposition.FinalizePrefixAndRetry := by
+  have hnLowHigh : ¬ input.high_watermark_blocks.val <
+      input.low_watermark_blocks.val := by omega
+  have hnHighCapacity : ¬ input.capacity_blocks.val <
+      input.high_watermark_blocks.val := by omega
+  simp [capacity_admission_disposition, lift, hProjected, hnLowHigh,
+    hnHighCapacity, hOverHigh]
+
+/-- P7: overflow while adding CloseBound retries before the below-low branch. -/
+theorem admission_retries_when_close_boundary_overflows
+    (input : CapacityAdmissionInput) (projected : Std.U64)
+    (hLowHigh : input.low_watermark_blocks.val ≤ input.high_watermark_blocks.val)
+    (hHighCapacity : input.high_watermark_blocks.val ≤ input.capacity_blocks.val)
+    (hProjected : U64.checked_add input.current_used_blocks
+      input.object_commit_charge_blocks = some projected)
+    (hAtMostHigh : projected.val ≤ input.high_watermark_blocks.val)
+    (hRequired : U64.checked_add projected input.close_bound_blocks = none) :
+    capacity_admission_disposition input =
+      ok AdmissionDisposition.FinalizePrefixAndRetry := by
+  have hnLowHigh : ¬ input.high_watermark_blocks.val <
+      input.low_watermark_blocks.val := by omega
+  have hnHighCapacity : ¬ input.capacity_blocks.val <
+      input.high_watermark_blocks.val := by omega
+  have hnOverHigh : ¬ input.high_watermark_blocks.val < projected.val := by omega
+  simp [capacity_admission_disposition, lift, hProjected, hRequired, hnLowHigh,
+    hnHighCapacity, hnOverHigh]
+
+/-- P7: close-proof failure dominates the below-low remain-open branch. -/
+theorem admission_retries_when_close_does_not_fit
+    (input : CapacityAdmissionInput) (projected required : Std.U64)
+    (hLowHigh : input.low_watermark_blocks.val ≤ input.high_watermark_blocks.val)
+    (hHighCapacity : input.high_watermark_blocks.val ≤ input.capacity_blocks.val)
+    (hProjected : U64.checked_add input.current_used_blocks
+      input.object_commit_charge_blocks = some projected)
+    (hAtMostHigh : projected.val ≤ input.high_watermark_blocks.val)
+    (hRequired : U64.checked_add projected input.close_bound_blocks = some required)
+    (hTooLarge : input.capacity_blocks.val < required.val) :
+    capacity_admission_disposition input =
+      ok AdmissionDisposition.FinalizePrefixAndRetry := by
+  have hnLowHigh : ¬ input.high_watermark_blocks.val <
+      input.low_watermark_blocks.val := by omega
+  have hnHighCapacity : ¬ input.capacity_blocks.val <
+      input.high_watermark_blocks.val := by omega
+  have hnOverHigh : ¬ input.high_watermark_blocks.val < projected.val := by omega
+  simp [capacity_admission_disposition, lift, hProjected, hRequired,
+    hnLowHigh, hnHighCapacity, hnOverHigh, hTooLarge]
+
+/-- P7: below low remains open after the high and close proofs succeed. -/
+theorem admission_remains_open_below_low
+    (input : CapacityAdmissionInput) (projected required : Std.U64)
+    (hLowHigh : input.low_watermark_blocks.val ≤ input.high_watermark_blocks.val)
+    (hHighCapacity : input.high_watermark_blocks.val ≤ input.capacity_blocks.val)
+    (hProjected : U64.checked_add input.current_used_blocks
+      input.object_commit_charge_blocks = some projected)
+    (hAtMostHigh : projected.val ≤ input.high_watermark_blocks.val)
+    (hRequired : U64.checked_add projected input.close_bound_blocks = some required)
+    (hFits : required.val ≤ input.capacity_blocks.val)
+    (hBelowLow : projected.val < input.low_watermark_blocks.val) :
+    capacity_admission_disposition input =
+      ok AdmissionDisposition.AdmitRemainOpen := by
+  have hnLowHigh : ¬ input.high_watermark_blocks.val <
+      input.low_watermark_blocks.val := by omega
+  have hnHighCapacity : ¬ input.capacity_blocks.val <
+      input.high_watermark_blocks.val := by omega
+  have hnOverHigh : ¬ input.high_watermark_blocks.val < projected.val := by omega
+  have hnOverCapacity : ¬ input.capacity_blocks.val < required.val := by omega
+  simp [capacity_admission_disposition, lift, hProjected, hRequired,
+    hnLowHigh, hnHighCapacity, hnOverHigh, hnOverCapacity, hBelowLow]
+
+/-- P7: equality at low or any higher boundary through high admits and seals. -/
+theorem admission_finalizes_in_closing_band
+    (input : CapacityAdmissionInput) (projected required : Std.U64)
+    (hLowHigh : input.low_watermark_blocks.val ≤ input.high_watermark_blocks.val)
+    (hHighCapacity : input.high_watermark_blocks.val ≤ input.capacity_blocks.val)
+    (hProjected : U64.checked_add input.current_used_blocks
+      input.object_commit_charge_blocks = some projected)
+    (hAtMostHigh : projected.val ≤ input.high_watermark_blocks.val)
+    (hRequired : U64.checked_add projected input.close_bound_blocks = some required)
+    (hFits : required.val ≤ input.capacity_blocks.val)
+    (hAtLeastLow : input.low_watermark_blocks.val ≤ projected.val) :
+    capacity_admission_disposition input =
+      ok AdmissionDisposition.AdmitThenFinalize := by
+  have hnLowHigh : ¬ input.high_watermark_blocks.val <
+      input.low_watermark_blocks.val := by omega
+  have hnHighCapacity : ¬ input.capacity_blocks.val <
+      input.high_watermark_blocks.val := by omega
+  have hnOverHigh : ¬ input.high_watermark_blocks.val < projected.val := by omega
+  have hnOverCapacity : ¬ input.capacity_blocks.val < required.val := by omega
+  have hnBelowLow : ¬ projected.val < input.low_watermark_blocks.val := by omega
+  simp [capacity_admission_disposition, lift, hProjected, hRequired,
+    hnLowHigh, hnHighCapacity, hnOverHigh, hnOverCapacity, hnBelowLow]
 
 theorem loaded_key_loaded (candidate : TapeFitState)
     (h : candidate.already_loaded = true) :

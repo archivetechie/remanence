@@ -60,6 +60,72 @@ pub enum Selection {
     NeedFreshTape,
 }
 
+/// Proof-facing result of applying the existing low/high closing state machine
+/// to one candidate-specific physical projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionDisposition {
+    /// The Object and its close reserve fit below the low watermark.
+    AdmitRemainOpen,
+    /// The Object fits at or above low and no later Object may be admitted.
+    AdmitThenFinalize,
+    /// Write none of this Object; finalize the committed prefix and retry the
+    /// whole unchanged Object on another tape.
+    FinalizePrefixAndRetry,
+    /// The integer low/high/capacity policy itself is inconsistent.
+    RejectInvalidCapacityPolicy,
+}
+
+/// Candidate-specific physical-block inputs to the low/high admission kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapacityAdmissionInput {
+    /// Physical charge of the already committed prefix (`U`).
+    pub current_used_blocks: u64,
+    /// Complete proposed Object commit charge (`U' - U`).
+    pub object_commit_charge_blocks: u64,
+    /// Exact final-close reserve after the projected Object.
+    pub close_bound_blocks: u64,
+    /// Conservative physical capacity basis (`C`).
+    pub capacity_blocks: u64,
+    /// Existing fill target / eager-seal boundary (`L`).
+    pub low_watermark_blocks: u64,
+    /// Existing maximum ordinary committed boundary (`H`).
+    pub high_watermark_blocks: u64,
+}
+
+/// Decide admission before any block of the proposed Object is written.
+///
+/// The close proof deliberately precedes the low-watermark branch. Checked
+/// overflow is a conservative retry, while an invalid `L <= H <= C` policy is
+/// a terminal configuration rejection rather than a tape-rollover loop.
+pub fn capacity_admission_disposition(input: CapacityAdmissionInput) -> AdmissionDisposition {
+    if input.low_watermark_blocks > input.high_watermark_blocks
+        || input.high_watermark_blocks > input.capacity_blocks
+    {
+        return AdmissionDisposition::RejectInvalidCapacityPolicy;
+    }
+    let Some(projected_used_blocks) = input
+        .current_used_blocks
+        .checked_add(input.object_commit_charge_blocks)
+    else {
+        return AdmissionDisposition::FinalizePrefixAndRetry;
+    };
+    if projected_used_blocks > input.high_watermark_blocks {
+        return AdmissionDisposition::FinalizePrefixAndRetry;
+    }
+    let Some(required_through_close) = projected_used_blocks.checked_add(input.close_bound_blocks)
+    else {
+        return AdmissionDisposition::FinalizePrefixAndRetry;
+    };
+    if required_through_close > input.capacity_blocks {
+        return AdmissionDisposition::FinalizePrefixAndRetry;
+    }
+    if projected_used_blocks < input.low_watermark_blocks {
+        AdmissionDisposition::AdmitRemainOpen
+    } else {
+        AdmissionDisposition::AdmitThenFinalize
+    }
+}
+
 /// A pluggable within-pool selection policy (design §10).
 ///
 /// Object-safe and `Send + Sync` so the daemon can hold one as
@@ -198,6 +264,65 @@ mod tests {
     use super::*;
 
     const P: u64 = 50;
+
+    fn admission(projected_used_blocks: u64, close_bound_blocks: u64) -> AdmissionDisposition {
+        capacity_admission_disposition(CapacityAdmissionInput {
+            current_used_blocks: 10,
+            object_commit_charge_blocks: projected_used_blocks - 10,
+            close_bound_blocks,
+            capacity_blocks: 140,
+            low_watermark_blocks: 100,
+            high_watermark_blocks: 120,
+        })
+    }
+
+    #[test]
+    fn capacity_admission_pins_low_and_high_equalities() {
+        assert_eq!(admission(99, 20), AdmissionDisposition::AdmitRemainOpen);
+        assert_eq!(admission(100, 20), AdmissionDisposition::AdmitThenFinalize);
+        assert_eq!(admission(120, 20), AdmissionDisposition::AdmitThenFinalize);
+        assert_eq!(
+            admission(121, 0),
+            AdmissionDisposition::FinalizePrefixAndRetry
+        );
+    }
+
+    #[test]
+    fn capacity_admission_checks_close_before_remaining_open() {
+        assert_eq!(
+            admission(99, 42),
+            AdmissionDisposition::FinalizePrefixAndRetry
+        );
+    }
+
+    #[test]
+    fn capacity_admission_fails_closed_on_overflow() {
+        let overflow = CapacityAdmissionInput {
+            current_used_blocks: u64::MAX,
+            object_commit_charge_blocks: 1,
+            close_bound_blocks: 0,
+            capacity_blocks: u64::MAX,
+            low_watermark_blocks: 0,
+            high_watermark_blocks: u64::MAX,
+        };
+        assert_eq!(
+            capacity_admission_disposition(overflow),
+            AdmissionDisposition::FinalizePrefixAndRetry
+        );
+
+        let invalid = CapacityAdmissionInput {
+            current_used_blocks: 0,
+            object_commit_charge_blocks: 0,
+            close_bound_blocks: 0,
+            capacity_blocks: 100,
+            low_watermark_blocks: 91,
+            high_watermark_blocks: 90,
+        };
+        assert_eq!(
+            capacity_admission_disposition(invalid),
+            AdmissionDisposition::RejectInvalidCapacityPolicy
+        );
+    }
 
     fn tape(
         tape_uuid_byte: u8,

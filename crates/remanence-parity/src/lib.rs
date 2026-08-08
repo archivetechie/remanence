@@ -60,6 +60,7 @@ pub use bootstrap::{
 };
 pub use capacity::{
     CapacityReserveCause, CapacityReserveInput, CapacityReserveRemedy, CapacityReserveReport,
+    SnapshotCloseInput, SnapshotCloseReport,
 };
 pub use diagnostic_text::escape_member_name;
 pub use error::ParityError;
@@ -80,10 +81,13 @@ pub use model::{
 };
 pub use parity_map::{
     classify_parity_map_header_block, derive_parity_map_magic, encode_parity_map_tape_file,
+    parity_map_directory_len_upper_bound, parity_map_payload_len_upper_bound,
     parse_parity_map_footer_block, parse_parity_map_header_block, parse_parity_map_tape_file,
     parse_parity_map_tape_file_with_unreadable_blocks, DecodedParityMapTapeFile,
     EncodedParityMapTapeFile, ParityMapCopyKind, ParityMapFooter, ParityMapHeader,
     ParityMapPayload, ParityMapReference, SidecarEpochDirectory, SidecarEpochDirectoryEntry,
+    PARITY_MAP_CBOR_DIRECTORY_ENTRY_UPPER_BOUND_BYTES,
+    PARITY_MAP_CBOR_DIRECTORY_FIXED_UPPER_BOUND_BYTES, PARITY_MAP_CBOR_FIXED_UPPER_BOUND_BYTES,
     PARITY_MAP_FOOTER_CRC_OFFSET, PARITY_MAP_FOOTER_LEN, PARITY_MAP_FOOTER_VERSION,
     PARITY_MAP_FORMAT_ID, PARITY_MAP_HEADER_CRC_OFFSET, PARITY_MAP_HEADER_LEN,
     PARITY_MAP_SCHEMA_VERSION, SIDECAR_DIRECTORY_FLAG_FINAL_PARTIAL_EPOCH,
@@ -114,13 +118,14 @@ pub use scan::{
     UnattestedTapeFile,
 };
 pub use sidecar::{
-    classify_sidecar_header_block, crc64_xz, data_shard_crc64, derive_sidecar_footer_magic,
-    derive_sidecar_magic, encode_sidecar_index_blocks, encode_sidecar_tape_file,
-    parity_block_position, parity_shard_crc64, parse_sidecar_footer_block,
-    parse_sidecar_header_block, parse_sidecar_index_blocks, parse_sidecar_tape_file,
-    DecodedSidecarIndex, DecodedSidecarTapeFile, EncodedSidecarIndex, EncodedSidecarTapeFile,
-    ParityShardIndexEntry, SidecarCopyKind, SidecarDescriptor, SidecarFooter, SidecarHeader,
-    SidecarIndex, CRC64_XZ_CHECK_VALUE, DATA_CRC_ENTRY_LEN, PARITY_INDEX_ENTRY_LEN,
+    checked_sidecar_index_capacity_layout, classify_sidecar_header_block, crc64_xz,
+    data_shard_crc64, derive_sidecar_footer_magic, derive_sidecar_magic,
+    encode_sidecar_index_blocks, encode_sidecar_tape_file, parity_block_position,
+    parity_shard_crc64, parse_sidecar_footer_block, parse_sidecar_header_block,
+    parse_sidecar_index_blocks, parse_sidecar_tape_file, DecodedSidecarIndex,
+    DecodedSidecarTapeFile, EncodedSidecarIndex, EncodedSidecarTapeFile, ParityShardIndexEntry,
+    SidecarCopyKind, SidecarDescriptor, SidecarFooter, SidecarHeader, SidecarIndex,
+    SidecarIndexCapacityLayout, CRC64_XZ_CHECK_VALUE, DATA_CRC_ENTRY_LEN, PARITY_INDEX_ENTRY_LEN,
     SIDECAR_FOOTER_CRC_OFFSET, SIDECAR_FOOTER_LEN, SIDECAR_FOOTER_VERSION,
     SIDECAR_HEADER_CRC_OFFSET, SIDECAR_HEADER_LEN, SIDECAR_SCHEMA_VERSION,
 };
