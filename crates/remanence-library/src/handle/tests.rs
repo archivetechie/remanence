@@ -2773,6 +2773,7 @@ fn fixed_ili_residual_sense(residual: u32) -> Vec<u8> {
 
 enum HotWriteScript {
     Clean,
+    CleanWithBytes(u32),
     CheckCondition(Vec<u8>),
     CheckConditionWithBytes(Vec<u8>, u32),
     Transport(&'static str),
@@ -2800,6 +2801,9 @@ impl SgTransport for HotScriptTransport {
         if cdb[0] == 0x08 {
             return match self.writes.pop_front().expect("READ response scripted") {
                 HotWriteScript::Clean => Ok(TransferOutcome::clean(buf.len() as u32)),
+                HotWriteScript::CleanWithBytes(bytes_transferred) => {
+                    Ok(TransferOutcome::clean(bytes_transferred))
+                }
                 HotWriteScript::CheckCondition(sense) => Err(ScsiError::CheckCondition {
                     sense,
                     bytes_transferred: buf.len() as u32,
@@ -2849,6 +2853,7 @@ impl SgTransport for HotScriptTransport {
         }
         match self.writes.pop_front().expect("FILEMARK response scripted") {
             HotWriteScript::Clean => Ok(()),
+            HotWriteScript::CleanWithBytes(_) => Ok(()),
             HotWriteScript::CheckCondition(sense) => Err(ScsiError::CheckCondition {
                 sense,
                 bytes_transferred: 0,
@@ -2872,6 +2877,9 @@ impl SgTransport for HotScriptTransport {
             .push((cdb.to_vec(), self.timeout));
         match self.writes.pop_front().expect("WRITE response scripted") {
             HotWriteScript::Clean => Ok(TransferOutcome::clean(buf.len() as u32)),
+            HotWriteScript::CleanWithBytes(bytes_transferred) => {
+                Ok(TransferOutcome::clean(bytes_transferred))
+            }
             HotWriteScript::CheckCondition(sense) => Err(ScsiError::CheckCondition {
                 sense,
                 bytes_transferred: buf.len() as u32,
@@ -3059,6 +3067,79 @@ fn pipelined_good_accounting_survives_tripwire_mismatch() {
     assert_eq!(diagnostics.good_bytes, 4);
     assert!(drive.expected_position.is_none());
     assert!(!drive.pending_pipeline_audits.is_empty());
+}
+
+#[test]
+fn fixed_batch_good_short_residual_is_uncommittable_before_cursor_advance() {
+    let config = TapeIoRuntimeConfig {
+        write_batch_blocks: 4,
+        read_batch_blocks: 4,
+        position_check_bytes: 0,
+        ..TapeIoRuntimeConfig::default()
+    };
+
+    for pipelined in [false, true] {
+        let serial = if pipelined {
+            "LIB_SHORT_GOOD_PIPELINED"
+        } else {
+            "LIB_SHORT_GOOD_BATCH"
+        };
+        let (mut drive, _, audit) =
+            open_hot_script_drive(serial, [10], [HotWriteScript::CleanWithBytes(15)], config);
+        let cdb = remanence_scsi::read_write::build_write_fixed_cdb(4);
+        let error = if pipelined {
+            drive.write_block_batch_pipelined(&[0xA5; 16], 4, &cdb)
+        } else {
+            drive.write_block_batch(&[0xA5; 16], 4)
+        }
+        .expect_err("GOOD completion with a short residual must not advance the cursor");
+
+        assert!(matches!(
+            error,
+            TapeIoError::PartialBatchUncommittable {
+                requested_records: 4,
+                written_records: 3,
+                requested_bytes: 16,
+                written_bytes: 15,
+                end_of_medium: false,
+                sense: None,
+            }
+        ));
+        assert!(
+            drive.expected_position.is_none(),
+            "short transfer must invalidate arithmetic position"
+        );
+        assert!(
+            !drive.position_known,
+            "short transfer leaves position unknown"
+        );
+        if pipelined {
+            assert_eq!(
+                drive.pipelined_write_diagnostics().good_commands,
+                0,
+                "short transfer must not enter GOOD pipeline accounting"
+            );
+            assert!(
+                !drive.pending_pipeline_audits.is_empty(),
+                "pipelined short transfer must retain its deferred error audit"
+            );
+        } else {
+            let events = audit.lock().expect("audit events");
+            assert!(matches!(
+                events.as_slice(),
+                [
+                    CapturedEvent::Started {
+                        op: AuditOp::TapeWrite { len: 16, .. },
+                        ..
+                    },
+                    CapturedEvent::FinishedScsiError {
+                        op: AuditOp::TapeWrite { len: 16, .. },
+                        summary,
+                    },
+                ] if summary.contains("partial fixed batch uncommittable")
+            ));
+        }
+    }
 }
 
 #[test]
