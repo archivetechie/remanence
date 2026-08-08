@@ -1583,6 +1583,12 @@ struct ParityActorSession {
     journal: FileTapeFileJournal,
 }
 
+struct ParityActorAuthority {
+    scheme: remanence_parity::ParityScheme,
+    committed: remanence_parity::CommittedState,
+    journal: FileTapeFileJournal,
+}
+
 /// Records entry into the direct parity raw-write boundary. The append source's
 /// overlap control cannot observe this path, so actor failure containment must
 /// use the Layer 3c emission boundary itself.
@@ -1645,13 +1651,11 @@ fn parity_journal_path(cfg: &WriteOwnerConfig, tape_uuid: TapeUuid) -> Result<Pa
     Ok(journal_dir.join(format!("{}.remjournal", crate::bytes_to_hex(&tape_uuid))))
 }
 
-fn open_parity_actor_session(
-    index: &mut CatalogIndex,
-    drive: &mut DriveHandle,
+fn validate_parity_actor_authority(
     cfg: &WriteOwnerConfig,
     selected: &SelectedTape,
     checkpoints: &[remanence_state::CheckpointJournalRecord],
-) -> Result<ParityActorSession, Status> {
+) -> Result<ParityActorAuthority, Status> {
     let scheme = match &selected.parity_config {
         remanence_parity::ParityConfig::Scheme(scheme) => scheme.clone(),
         remanence_parity::ParityConfig::None => {
@@ -1661,18 +1665,18 @@ fn open_parity_actor_session(
         }
     };
     let path = parity_journal_path(cfg, selected.tape_uuid)?;
-    let mut journal = FileTapeFileJournal::open(
+    let journal = FileTapeFileJournal::open(
         path,
         selected.tape_uuid,
         selected.block_size,
         scheme.clone(),
     )
     .map_err(|err| Status::internal(format!("open parity tape journal: {err}")))?;
-    if journal.orphaned_bundles_truncated_on_open() != 0 {
+    if journal.orphaned_bundles_preserved_on_open() != 0 {
         tracing::warn!(
             tape_uuid = %Uuid::from_bytes(selected.tape_uuid),
-            orphaned_bundle_count = journal.orphaned_bundles_truncated_on_open(),
-            "truncated sink-journal bundles beyond the last checkpoint watermark"
+            orphaned_bundle_count = journal.orphaned_bundles_preserved_on_open(),
+            "preserved sink-journal bundles beyond the last checkpoint watermark; reconciliation required"
         );
     }
     let committed = journal
@@ -1686,6 +1690,26 @@ fn open_parity_actor_session(
         &scheme,
     )
     .map_err(|err| Status::failed_precondition(err.to_string()))?;
+    Ok(ParityActorAuthority {
+        scheme,
+        committed,
+        journal,
+    })
+}
+
+fn open_parity_actor_session(
+    index: &mut CatalogIndex,
+    drive: &mut DriveHandle,
+    cfg: &WriteOwnerConfig,
+    selected: &SelectedTape,
+    checkpoints: &[remanence_state::CheckpointJournalRecord],
+    authority: ParityActorAuthority,
+) -> Result<ParityActorSession, Status> {
+    let ParityActorAuthority {
+        scheme,
+        committed,
+        mut journal,
+    } = authority;
     let sink_state = if committed.entries.is_empty() {
         drive
             .locate(0)
@@ -1921,7 +1945,7 @@ fn checkpointed_objects_from_catalog(
 fn perform_checkpoint_barrier(
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
-    journal: &remanence_state::FileCheckpointJournal,
+    journal: &mut remanence_state::FileCheckpointJournalLease,
     prior_records: &[remanence_state::CheckpointJournalRecord],
     tape_uuid: TapeUuid,
     checkpoint_ordinal: &mut u64,
@@ -3387,6 +3411,60 @@ fn handle_drive_open_write(
     } = request;
     let actor_open_started = Instant::now();
     let session_id = Uuid::new_v4();
+    let tape_uuid = selected.tape_uuid;
+    if let Err(status) = session_open_reject_tape_io_fences(
+        index,
+        &tape_uuid,
+        barcode.as_deref(),
+        "open write session",
+    ) {
+        let _ = reply.send(Err(status));
+        return;
+    }
+
+    // Recovery authority must be complete and mutually consistent before any
+    // load, rewind, locate, drive-mode change, or write preparation. Keep both
+    // journal leases across the later media work so another writer cannot
+    // change the validated prefix in between.
+    let checkpoint_journal = match remanence_state::FileCheckpointJournal::open(
+        cfg.checkpoint_journal_dir.as_path(),
+        tape_uuid,
+    ) {
+        Ok(journal) => journal,
+        Err(err) => {
+            let _ = reply.send(Err(status_from_state_error(err)));
+            return;
+        }
+    };
+    let mut checkpoint_lease = match checkpoint_journal.acquire_exclusive() {
+        Ok(lease) => lease,
+        Err(err) => {
+            let _ = reply.send(Err(status_from_state_error(err)));
+            return;
+        }
+    };
+    let mut durable_checkpoint_records = match checkpoint_lease.replay() {
+        Ok(records) => records,
+        Err(err) => {
+            let _ = reply.send(Err(status_from_state_error(err)));
+            return;
+        }
+    };
+    let parity_authority = if matches!(
+        selected.parity_config,
+        remanence_parity::ParityConfig::Scheme(_)
+    ) {
+        match validate_parity_actor_authority(cfg, &selected, &durable_checkpoint_records) {
+            Ok(authority) => Some(authority),
+            Err(status) => {
+                let _ = reply.send(Err(status));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     if let Err(status) = session_open_short_probe_or_load(
         index,
         drive,
@@ -3404,16 +3482,6 @@ fn handle_drive_open_write(
         return;
     }
 
-    let tape_uuid = selected.tape_uuid;
-    if let Err(status) = session_open_reject_tape_io_fences(
-        index,
-        &tape_uuid,
-        barcode.as_deref(),
-        "open write session",
-    ) {
-        let _ = reply.send(Err(status));
-        return;
-    }
     if let Err(status) = prepare_drive_for_write(drive, &tape_uuid, selected.block_size, session_id)
     {
         let _ = reply.send(Err(status));
@@ -3444,23 +3512,6 @@ fn handle_drive_open_write(
     let mut objects_committed = 0u64;
     let mut bytes_committed = 0u64;
     let mut last_checkpoint_at_utc = None;
-    let checkpoint_journal = match remanence_state::FileCheckpointJournal::open(
-        cfg.checkpoint_journal_dir.as_path(),
-        tape_uuid,
-    ) {
-        Ok(journal) => journal,
-        Err(err) => {
-            let _ = reply.send(Err(status_from_state_error(err)));
-            return;
-        }
-    };
-    let mut durable_checkpoint_records = match checkpoint_journal.replay() {
-        Ok(records) => records,
-        Err(err) => {
-            let _ = reply.send(Err(status_from_state_error(err)));
-            return;
-        }
-    };
     for record in &durable_checkpoint_records {
         if let Err(err) = index.project_checkpoint_record(record) {
             let _ = reply.send(Err(status_from_state_error(err)));
@@ -3468,11 +3519,15 @@ fn handle_drive_open_write(
         }
     }
     let last_durable_checkpoint = durable_checkpoint_records.last().cloned();
-    let mut parity_session = if matches!(
-        selected.parity_config,
-        remanence_parity::ParityConfig::Scheme(_)
-    ) {
-        match open_parity_actor_session(index, drive, cfg, &selected, &durable_checkpoint_records) {
+    let mut parity_session = if let Some(authority) = parity_authority {
+        match open_parity_actor_session(
+            index,
+            drive,
+            cfg,
+            &selected,
+            &durable_checkpoint_records,
+            authority,
+        ) {
             Ok(session) => Some(session),
             Err(status) => {
                 let _ = reply.send(Err(status));
@@ -3760,7 +3815,7 @@ fn handle_drive_open_write(
                                 let outcome = perform_checkpoint_barrier(
                                     index,
                                     drive,
-                                    &checkpoint_journal,
+                                    &mut checkpoint_lease,
                                     &durable_checkpoint_records,
                                     tape_uuid,
                                     &mut checkpoint_ordinal,
@@ -4104,7 +4159,7 @@ fn handle_drive_open_write(
                 match perform_checkpoint_barrier(
                     index,
                     drive,
-                    &checkpoint_journal,
+                    &mut checkpoint_lease,
                     &durable_checkpoint_records,
                     tape_uuid,
                     &mut checkpoint_ordinal,
@@ -4281,7 +4336,7 @@ fn handle_drive_open_write(
                     match perform_checkpoint_barrier(
                         index,
                         drive,
-                        &checkpoint_journal,
+                        &mut checkpoint_lease,
                         &durable_checkpoint_records,
                         tape_uuid,
                         &mut checkpoint_ordinal,
@@ -8150,6 +8205,192 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn daemon_rejects_corrupt_checkpoint_authority_before_position_or_config_commands() {
+        const BLOCK_SIZE: u32 = 1024;
+        const BARCODE: &str = "PARAUTH1";
+
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-parity-authority-before-motion-")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        let index = CatalogIndex::open(&index_path).expect("open test index");
+        drop(index);
+
+        let tape_uuid = [0x47; 16];
+        let scheme = remanence_parity::default_scheme_for_block_size(BLOCK_SIZE);
+        let mut world = VirtualWorld::single_drive(
+            "LIB-PARITY-AUTHORITY",
+            0x0100,
+            "DRV-PARITY-AUTHORITY",
+            0x0400,
+            1,
+        );
+        world.put_tape_in_drive(
+            0x0100,
+            BARCODE,
+            Some(0x0400),
+            VirtualTape::empty(1024 * 1024, BLOCK_SIZE),
+        );
+        let world = Arc::new(Mutex::new(world));
+        let mut library = open_model_library(Arc::clone(&world));
+        let snapshot = library_snapshot_cell(library.library().clone());
+        let audit_dir = temp.path().join("audit");
+        std::fs::create_dir_all(&audit_dir).expect("create audit dir");
+        let mut cfg = test_write_owner_config(index_path, audit_dir, &library, snapshot);
+        cfg.checkpoint_journal_dir = temp.path().join("checkpoints");
+
+        let checkpoint =
+            remanence_state::FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, tape_uuid)
+                .expect("open checkpoint handle");
+        std::fs::write(checkpoint.path(), b"legacy-or-torn-checkpoint")
+            .expect("write corrupt checkpoint authority");
+
+        let serial = library.library().serial.clone();
+        let policy = remanence_library::StaticAllowlist::new([serial.as_str()]);
+        let drive = library
+            .open_drive(0x0100, &policy)
+            .expect("open model drive");
+        let drive_tx = spawn_drive_actor(0x0100, drive, cfg);
+        let command_start = world.lock().expect("world lock").command_log.len();
+        let pool_cfg = TapePoolConfig {
+            id: "parity.authority".to_string(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
+            watermark_low: 0.9,
+            watermark_high: 0.95,
+            block_size_bytes: u64::from(BLOCK_SIZE),
+            min_object_size_bytes: 0,
+        };
+        let (open_tx, open_rx) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::OpenWrite {
+                pool_cfg: pool_cfg.clone(),
+                selected: SelectedTape {
+                    pool_id: "parity.authority".to_string(),
+                    tape_uuid,
+                    block_size: BLOCK_SIZE,
+                    parity_config: ParityConfig::Scheme(scheme),
+                },
+                target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+                needs_drive_load: false,
+                library_serial: serial.clone(),
+                barcode: Some(BARCODE.to_string()),
+                source_slot: None,
+                drive_uuid: None,
+                drive_serial: Some("DRV-PARITY-AUTHORITY".to_string()),
+                reply: open_tx,
+            })
+            .await
+            .expect("send parity write open");
+        let status = open_rx
+            .await
+            .expect("parity open reply")
+            .expect_err("corrupt checkpoint authority must reject the session");
+        assert!(status.message().contains("torn header"), "{status}");
+
+        let opcodes = world.lock().expect("world lock").command_log[command_start..]
+            .iter()
+            .map(|record| record.opcode)
+            .collect::<Vec<_>>();
+        for forbidden in [0x01, 0x92, 0x1a, 0x15] {
+            assert!(
+                !opcodes.contains(&forbidden),
+                "authority rejection issued forbidden drive opcode 0x{forbidden:02x}: {opcodes:02x?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_checkpoint_lease_contention_precedes_conditional_load_for_no_parity() {
+        const BLOCK_SIZE: u32 = 1024;
+        const BARCODE: &str = "NOAUTH01";
+
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-checkpoint-lease-before-load-")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        drop(CatalogIndex::open(&index_path).expect("open test index"));
+        let tape_uuid = [0x48; 16];
+        let mut world = VirtualWorld::single_drive(
+            "LIB-CHECKPOINT-LEASE",
+            0x0100,
+            "DRV-CHECKPOINT-LEASE",
+            0x0400,
+            1,
+        );
+        world.put_tape_in_drive(
+            0x0100,
+            BARCODE,
+            Some(0x0400),
+            VirtualTape::empty(1024 * 1024, BLOCK_SIZE),
+        );
+        let world = Arc::new(Mutex::new(world));
+        let mut library = open_model_library(Arc::clone(&world));
+        let snapshot = library_snapshot_cell(library.library().clone());
+        let audit_dir = temp.path().join("audit");
+        std::fs::create_dir_all(&audit_dir).expect("create audit dir");
+        let mut cfg = test_write_owner_config(index_path, audit_dir, &library, snapshot);
+        cfg.checkpoint_journal_dir = temp.path().join("checkpoints");
+        let checkpoint =
+            remanence_state::FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, tape_uuid)
+                .expect("open checkpoint handle");
+        let _held_lease = checkpoint
+            .acquire_exclusive()
+            .expect("hold competing checkpoint lease");
+
+        let serial = library.library().serial.clone();
+        let policy = remanence_library::StaticAllowlist::new([serial.as_str()]);
+        let drive = library
+            .open_drive(0x0100, &policy)
+            .expect("open model drive");
+        let drive_tx = spawn_drive_actor(0x0100, drive, cfg);
+        let command_start = world.lock().expect("world lock").command_log.len();
+        let (open_tx, open_rx) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::OpenWrite {
+                pool_cfg: TapePoolConfig {
+                    id: "checkpoint.lease".to_string(),
+                    display_name: None,
+                    copy_class: None,
+                    content_class: None,
+                    selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
+                    watermark_low: 0.9,
+                    watermark_high: 0.95,
+                    block_size_bytes: u64::from(BLOCK_SIZE),
+                    min_object_size_bytes: 0,
+                },
+                selected: SelectedTape {
+                    pool_id: "checkpoint.lease".to_string(),
+                    tape_uuid,
+                    block_size: BLOCK_SIZE,
+                    parity_config: ParityConfig::None,
+                },
+                target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+                needs_drive_load: true,
+                library_serial: serial,
+                barcode: Some(BARCODE.to_string()),
+                source_slot: Some(0x0400),
+                drive_uuid: None,
+                drive_serial: Some("DRV-CHECKPOINT-LEASE".to_string()),
+                reply: open_tx,
+            })
+            .await
+            .expect("send no-parity write open");
+        open_rx
+            .await
+            .expect("no-parity open reply")
+            .expect_err("competing checkpoint lease must reject session open");
+        assert!(
+            world.lock().expect("world lock").command_log[command_start..].is_empty(),
+            "checkpoint contention must reject before conditional LOAD or any drive command"
+        );
+    }
+
     #[test]
     fn fresh_parity_bootstrap_short_completion_fences_without_journal_visibility() {
         const BLOCK_SIZE: u32 = 1024;
@@ -8211,7 +8452,10 @@ mod tests {
 
         let status = {
             let mut drive = library.open_drive(0x0100, &policy).expect("open drive");
-            match open_parity_actor_session(&mut index, &mut drive, &cfg, &selected, &[]) {
+            let authority = validate_parity_actor_authority(&cfg, &selected, &[])
+                .expect("validate fresh parity authority");
+            match open_parity_actor_session(&mut index, &mut drive, &cfg, &selected, &[], authority)
+            {
                 Ok(_) => panic!("short bootstrap completion must fail closed"),
                 Err(status) => status,
             }
@@ -8484,7 +8728,7 @@ mod tests {
         let (open_tx, open_rx) = oneshot::channel();
         drive_tx
             .send(DriveCommand::OpenWrite {
-                pool_cfg,
+                pool_cfg: pool_cfg.clone(),
                 selected: SelectedTape {
                     pool_id: POOL_ID.to_string(),
                     tape_uuid,
@@ -8493,10 +8737,10 @@ mod tests {
                 },
                 target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
                 needs_drive_load: false,
-                library_serial: serial,
+                library_serial: serial.clone(),
                 barcode: Some(BARCODE.to_string()),
                 source_slot: None,
-                drive_uuid: Some(drive_uuid),
+                drive_uuid: Some(drive_uuid.clone()),
                 drive_serial: Some("DRV-PARITY-ACTOR-FENCE".to_string()),
                 reply: open_tx,
             })
@@ -8551,6 +8795,19 @@ mod tests {
             .expect("parity checkpoint succeeds");
         assert_eq!(checkpoint.committed_objects.len(), 1);
 
+        let (close_tx, close_rx) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::Close {
+                session_id,
+                reply: close_tx,
+            })
+            .await
+            .expect("close first parity session");
+        close_rx
+            .await
+            .expect("first parity close reply")
+            .expect("close checkpointed parity session");
+
         let checkpoint_journal =
             remanence_state::FileCheckpointJournal::open(&checkpoint_dir, tape_uuid)
                 .expect("open durable parity checkpoint journal");
@@ -8595,10 +8852,38 @@ mod tests {
             .expect("idempotently replay the durable partial-epoch checkpoint into SQLite");
         drop(replay_index);
 
+        let (resume_tx, resume_rx) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::OpenWrite {
+                pool_cfg,
+                selected: SelectedTape {
+                    pool_id: POOL_ID.to_string(),
+                    tape_uuid,
+                    block_size: BLOCK_SIZE,
+                    parity_config: ParityConfig::Scheme(scheme.clone()),
+                },
+                target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+                needs_drive_load: false,
+                library_serial: serial,
+                barcode: Some(BARCODE.to_string()),
+                source_slot: None,
+                drive_uuid: Some(drive_uuid),
+                drive_serial: Some("DRV-PARITY-ACTOR-FENCE".to_string()),
+                reply: resume_tx,
+            })
+            .await
+            .expect("send parity resume open");
+        let resumed = resume_rx
+            .await
+            .expect("parity resume reply")
+            .expect("resume checkpointed parity actor session");
+        let resumed_session_id =
+            Uuid::from_slice(&resumed.session_id).expect("resumed parity session UUID");
+
         short_next_write.store(true, Ordering::SeqCst);
         let second = append_actor_test_file_result(
             &drive_tx,
-            session_id,
+            resumed_session_id,
             temp.path().join("parity-second.bin"),
             "parity-second.bin",
             "parity-actor-second",
@@ -8613,7 +8898,7 @@ mod tests {
 
         let third = append_actor_test_file_result(
             &drive_tx,
-            session_id,
+            resumed_session_id,
             temp.path().join("parity-third.bin"),
             "parity-third.bin",
             "parity-actor-third",
@@ -9620,20 +9905,6 @@ mod tests {
             threshold_copy_placements,
             vec![(tape_uuid.to_vec(), 3), (tape_uuid.to_vec(), 4)]
         );
-        let journal = remanence_state::FileCheckpointJournal::open(
-            temp.path().join("checkpoints"),
-            tape_uuid,
-        )
-        .expect("open checkpoint journal");
-        assert_eq!(
-            journal
-                .last()
-                .expect("replay checkpoint journal")
-                .expect("checkpoint record")
-                .committed_object_count,
-            3
-        );
-
         let fourth = append_actor_test_file(
             &drive_tx,
             session_id,
@@ -9676,6 +9947,11 @@ mod tests {
         assert_eq!(closed.session.committed_copies.len(), 1);
         assert_eq!(closed.session.committed_copies[0].tape_uuid, tape_uuid);
         assert_eq!(closed.session.committed_copies[0].tape_file_number, 6);
+        let journal = remanence_state::FileCheckpointJournal::open(
+            temp.path().join("checkpoints"),
+            tape_uuid,
+        )
+        .expect("open checkpoint journal after session lease release");
         let read_only = CatalogIndex::open_read_only(&index_path).expect("open projection");
         assert!(read_only
             .get_native_object(&fourth_object_id)
