@@ -465,20 +465,6 @@ fn validate_component_cut(component: &str, cut: TerminalFaultCut) -> Result<(), 
                 | TerminalFaultCut::AfterFinalSqliteProjection
         ),
         "assignment_race" => cut == TerminalFaultCut::BeforeAssignmentReread,
-        "replica_c" => !matches!(
-            cut,
-            TerminalFaultCut::BeforeTerminalPrefix
-                | TerminalFaultCut::BeforeFinalParityMap
-                | TerminalFaultCut::AfterFinalParityMap
-                | TerminalFaultCut::BeforeSqliteProjection
-                | TerminalFaultCut::AfterSqliteProjection
-                | TerminalFaultCut::AfterTerminalPrefix
-                | TerminalFaultCut::BeforeFinalCheckpointFsync
-                | TerminalFaultCut::AfterFinalCheckpointFsync
-                | TerminalFaultCut::BeforeFinalSqliteProjection
-                | TerminalFaultCut::AfterFinalSqliteProjection
-                | TerminalFaultCut::BeforeAssignmentReread
-        ),
         _ => !matches!(
             cut,
             TerminalFaultCut::BeforeTerminalPrefix

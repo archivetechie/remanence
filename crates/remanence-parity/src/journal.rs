@@ -489,6 +489,22 @@ pub struct FileTapeFileJournal {
     terminal_grammar: TerminalJournalGrammar,
 }
 
+/// Relationship between host checkpoint progress and the terminal component
+/// transitions durably present in the parity sink journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalComponentAuthorityRelation {
+    /// Both authorities name the same canonical completed-component prefix.
+    Aligned,
+    /// The sink journal contains exactly the next canonical barrier-proved
+    /// component. Its following sink checkpoint may still need to be fsynced
+    /// before the external checkpoint progress is advanced.
+    SinkJournalOneTransitionAhead {
+        /// True when the component record is durable but its immediately
+        /// following sink-journal checkpoint record is not yet durable.
+        sink_checkpoint_missing: bool,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum TerminalJournalPhase {
     #[default]
@@ -848,6 +864,116 @@ impl FileTapeFileJournal {
                 Ok(replay.terminal_prefix_checkpoint_sha256 == Some(checkpoint_sha256))
             }
         }
+    }
+
+    /// Compare checkpoint terminal progress with the exact canonical
+    /// component transitions in this sink journal.
+    ///
+    /// This read-only check accepts only equality or the single crash window
+    /// in which the sink journal is exactly one component transition ahead.
+    /// It validates every present component/checkpoint digest against the
+    /// supplied immutable plan before returning either relation. Skips,
+    /// regressions, partial non-next transitions, and conflicting histories
+    /// fail closed.
+    pub fn terminal_component_authority_relation(
+        &self,
+        checkpoint_component_count: u8,
+        expected_transitions: &[(CommittedBundle, CommittedBundle)],
+    ) -> Result<TerminalComponentAuthorityRelation, JournalError> {
+        const COMPONENT_COUNT: usize = 5;
+        if expected_transitions.len() != COMPONENT_COUNT {
+            return Err(JournalError::Codec(format!(
+                "terminal authority comparison requires {COMPONENT_COUNT} canonical transitions, found {}",
+                expected_transitions.len()
+            )));
+        }
+        if usize::from(checkpoint_component_count) > COMPONENT_COUNT {
+            return Err(JournalError::Codec(format!(
+                "checkpoint terminal component count {checkpoint_component_count} exceeds {COMPONENT_COUNT}"
+            )));
+        }
+        let mut expected_component_sha256 = [[0u8; 32]; COMPONENT_COUNT];
+        let mut expected_checkpoint_sha256 = [[0u8; 32]; COMPONENT_COUNT];
+        for (index, (component, checkpoint)) in expected_transitions.iter().enumerate() {
+            if component.kind != CommittedBundleKind::TerminalComponent
+                || checkpoint.kind != CommittedBundleKind::CheckpointedThrough
+                || !checkpoint.entries.is_empty()
+                || component.highest_protected_ordinal != checkpoint.highest_protected_ordinal
+                || component.total_committed_ordinals != checkpoint.total_committed_ordinals
+            {
+                return Err(JournalError::Codec(format!(
+                    "canonical terminal transition {} has an invalid shape",
+                    index + 1
+                )));
+            }
+            validate_committed_bundle_shape(component)?;
+            validate_committed_bundle_shape(checkpoint)?;
+            expected_component_sha256[index] = encoded_bundle_sha256(component)?;
+            expected_checkpoint_sha256[index] = encoded_bundle_sha256(checkpoint)?;
+        }
+
+        let mut replay_file = self.file.try_clone()?;
+        let file_len = replay_file.metadata()?.len();
+        read_header(&mut replay_file)?;
+        let replay = scan_bounded_committed_metadata(&mut replay_file, file_len)?;
+        let (journal_component_count, sink_checkpoint_missing) = match replay.terminal_grammar.phase
+        {
+            TerminalJournalPhase::Open | TerminalJournalPhase::PrefixAwaitingCheckpoint => {
+                (0, false)
+            }
+            TerminalJournalPhase::Ready { component_count } => (component_count, false),
+            TerminalJournalPhase::ComponentAwaitingCheckpoint { component_count } => {
+                (component_count, true)
+            }
+            TerminalJournalPhase::Complete => (COMPONENT_COUNT as u8, false),
+        };
+        let journal_count = usize::from(journal_component_count);
+        for index in 0..journal_count {
+            if replay.terminal_component_payload_sha256[index]
+                != Some(expected_component_sha256[index])
+            {
+                return Err(JournalError::Codec(format!(
+                    "sink-journal terminal component {} conflicts with the immutable plan",
+                    index + 1
+                )));
+            }
+            let last_is_pending = sink_checkpoint_missing && index + 1 == journal_count;
+            if last_is_pending {
+                if replay.terminal_component_checkpoint_sha256[index].is_some() {
+                    return Err(JournalError::Codec(format!(
+                        "sink-journal terminal component {} is marked pending but has a checkpoint digest",
+                        index + 1
+                    )));
+                }
+            } else if replay.terminal_component_checkpoint_sha256[index]
+                != Some(expected_checkpoint_sha256[index])
+            {
+                return Err(JournalError::Codec(format!(
+                    "sink-journal terminal checkpoint {} conflicts with the immutable plan",
+                    index + 1
+                )));
+            }
+        }
+
+        let checkpoint_count = usize::from(checkpoint_component_count);
+        if journal_count == checkpoint_count && !sink_checkpoint_missing {
+            return Ok(TerminalComponentAuthorityRelation::Aligned);
+        }
+        if journal_count == checkpoint_count.saturating_add(1) {
+            return Ok(
+                TerminalComponentAuthorityRelation::SinkJournalOneTransitionAhead {
+                    sink_checkpoint_missing,
+                },
+            );
+        }
+        Err(JournalError::Codec(format!(
+            "terminal authorities disagree: checkpoint has {checkpoint_count} component(s), sink journal has {journal_count}{}",
+            if sink_checkpoint_missing {
+                " with the final sink checkpoint missing"
+            } else {
+                ""
+            }
+        )))
     }
 
     /// Open an existing local journal for read-only replay under a shared,
@@ -1557,6 +1683,8 @@ struct BoundedCommittedMetadata {
     terminal_prefix_payload_sha256: Option<[u8; 32]>,
     terminal_prefix_checkpoint_sha256: Option<[u8; 32]>,
     terminal_prefix_boundary: Option<BoundedPrefixBoundary>,
+    terminal_component_payload_sha256: [Option<[u8; 32]>; 5],
+    terminal_component_checkpoint_sha256: [Option<[u8; 32]>; 5],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1592,6 +1720,8 @@ fn scan_bounded_committed_metadata(
         terminal_prefix_payload_sha256: None,
         terminal_prefix_checkpoint_sha256: None,
         terminal_prefix_boundary: None,
+        terminal_component_payload_sha256: [None; 5],
+        terminal_component_checkpoint_sha256: [None; 5],
     };
     while file.stream_position()? < file_len {
         // Once another record exists, the older of the retained final
@@ -1652,6 +1782,44 @@ fn scan_bounded_committed_metadata(
                         )
                     })?,
             });
+        } else if let TerminalJournalPhase::Ready { component_count } = prior_terminal_phase {
+            if bundle.kind == CommittedBundleKind::TerminalComponent {
+                let index = usize::from(component_count);
+                let slot = metadata
+                    .terminal_component_payload_sha256
+                    .get_mut(index)
+                    .ok_or_else(|| {
+                        JournalError::Codec(
+                            "terminal component digest index exceeds five components".into(),
+                        )
+                    })?;
+                if slot.replace(frame.payload_sha256).is_some() {
+                    return Err(JournalError::Codec(format!(
+                        "duplicate terminal component digest at index {index}"
+                    )));
+                }
+            }
+        } else if let TerminalJournalPhase::ComponentAwaitingCheckpoint { component_count } =
+            prior_terminal_phase
+        {
+            if bundle.kind == CommittedBundleKind::CheckpointedThrough {
+                let index = usize::from(component_count.checked_sub(1).ok_or_else(|| {
+                    JournalError::Codec("terminal checkpoint has zero component count".into())
+                })?);
+                let slot = metadata
+                    .terminal_component_checkpoint_sha256
+                    .get_mut(index)
+                    .ok_or_else(|| {
+                        JournalError::Codec(
+                            "terminal checkpoint digest index exceeds five components".into(),
+                        )
+                    })?;
+                if slot.replace(frame.payload_sha256).is_some() {
+                    return Err(JournalError::Codec(format!(
+                        "duplicate terminal checkpoint digest at index {index}"
+                    )));
+                }
+            }
         }
         replay_highest_protected_ordinal = bundle.highest_protected_ordinal;
         replay_total_committed_ordinals = bundle.total_committed_ordinals;
@@ -3124,6 +3292,130 @@ mod tests {
             assert!(reopened
                 .terminal_prefix_transition_is_durable(&prefix, &checkpoint)
                 .expect("prefix remains durable after component"));
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn terminal_component_authority_accepts_only_exact_one_transition_ahead() {
+        let path = temp_journal_path("terminal-component-authority");
+        let tape_uuid = [0x4A; 16];
+        let scheme = default_scheme();
+        let prefix = structural_bundle(CommittedBundleKind::TerminalPrefix, &[]);
+        let transitions = [
+            TapeFileKind::TapeIndexReplica,
+            TapeFileKind::IndexSeparationExtent,
+            TapeFileKind::TapeIndexReplica,
+            TapeFileKind::IndexSeparationExtent,
+            TapeFileKind::TapeIndexReplica,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| {
+            let component = CommittedBundle {
+                kind: CommittedBundleKind::TerminalComponent,
+                entries: vec![structural_entry(
+                    u64::try_from(index).expect("component index fits u64"),
+                    kind,
+                )],
+                highest_protected_ordinal: 0,
+                total_committed_ordinals: 0,
+            };
+            let checkpoint = CommittedBundle {
+                kind: CommittedBundleKind::CheckpointedThrough,
+                entries: Vec::new(),
+                highest_protected_ordinal: 0,
+                total_committed_ordinals: 0,
+            };
+            (component, checkpoint)
+        })
+        .collect::<Vec<_>>();
+        {
+            let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+                &path,
+                tape_uuid,
+                256 * 1024,
+                scheme.clone(),
+            )
+            .expect("open journal");
+            journal
+                .commit_terminal_prefix_transition(&prefix, &transitions[0].1)
+                .expect("commit empty prefix");
+            assert_eq!(
+                journal
+                    .terminal_component_authority_relation(0, &transitions)
+                    .expect("aligned empty component history"),
+                TerminalComponentAuthorityRelation::Aligned
+            );
+            journal
+                .commit_bundle(&transitions[0].0)
+                .expect("fsync barrier-proved component orphan");
+            assert_eq!(
+                journal
+                    .terminal_component_authority_relation(0, &transitions)
+                    .expect("exact orphan is one transition ahead"),
+                TerminalComponentAuthorityRelation::SinkJournalOneTransitionAhead {
+                    sink_checkpoint_missing: true,
+                }
+            );
+        }
+        {
+            let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+                &path,
+                tape_uuid,
+                256 * 1024,
+                scheme,
+            )
+            .expect("reopen component orphan");
+            assert_eq!(
+                journal
+                    .terminal_component_authority_relation(0, &transitions)
+                    .expect("reopened exact orphan"),
+                TerminalComponentAuthorityRelation::SinkJournalOneTransitionAhead {
+                    sink_checkpoint_missing: true,
+                }
+            );
+            journal
+                .commit_terminal_component_transition(&transitions[0].0, &transitions[0].1)
+                .expect("finish exact sink transition");
+            assert_eq!(
+                journal
+                    .terminal_component_authority_relation(0, &transitions)
+                    .expect("checkpoint remains one transition behind"),
+                TerminalComponentAuthorityRelation::SinkJournalOneTransitionAhead {
+                    sink_checkpoint_missing: false,
+                }
+            );
+            assert_eq!(
+                journal
+                    .terminal_component_authority_relation(1, &transitions)
+                    .expect("checkpoint catches up"),
+                TerminalComponentAuthorityRelation::Aligned
+            );
+            assert!(journal
+                .terminal_component_authority_relation(2, &transitions)
+                .expect_err("checkpoint ahead of sink journal must fail")
+                .to_string()
+                .contains("authorities disagree"));
+
+            let mut conflicting = transitions.clone();
+            conflicting[0].0.entries[0].block_count += 1;
+            assert!(journal
+                .terminal_component_authority_relation(1, &conflicting)
+                .expect_err("conflicting canonical component must fail")
+                .to_string()
+                .contains("conflicts with the immutable plan"));
+
+            for (component, checkpoint) in &transitions[1..3] {
+                journal
+                    .commit_terminal_component_transition(component, checkpoint)
+                    .expect("advance sink journal without external checkpoint");
+            }
+            assert!(journal
+                .terminal_component_authority_relation(1, &transitions)
+                .expect_err("more than one transition ahead must fail")
+                .to_string()
+                .contains("authorities disagree"));
         }
         let _ = fs::remove_file(path);
     }

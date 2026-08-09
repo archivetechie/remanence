@@ -10537,13 +10537,6 @@ fn validate_terminal_finalization_input(
             "terminal finalization cannot be finalized before replica C".to_string(),
         ));
     }
-    if matches!(input.outcome, TerminalFinalizationOutcome::InProgress)
-        && input.progress == TerminalFinalizationProgress::AfterReplicaC
-    {
-        return Err(StateError::JournalReplayFailed(
-            "terminal finalization after replica C must carry a terminal outcome".to_string(),
-        ));
-    }
     if matches!(
         input.outcome,
         TerminalFinalizationOutcome::FinalizedDegraded
@@ -10671,6 +10664,14 @@ fn project_terminal_finalization_tx(
         {
             return Err(StateError::JournalReplayFailed(
                 "terminal final projection cannot change outcome or resume progress".to_string(),
+            ));
+        }
+        if existing_outcome == TerminalFinalizationOutcome::RecoveryRequired
+            && input.outcome == TerminalFinalizationOutcome::InProgress
+            && input.progress == existing_progress
+        {
+            return Err(StateError::JournalReplayFailed(
+                "terminal recovery-required projection cannot clear without progress".to_string(),
             ));
         }
     } else if existing_trigger.is_some()
@@ -13593,6 +13594,7 @@ mod tests {
             trigger: crate::checkpoint::TerminalFinalizationTrigger::ReachedLowWatermark,
             manual: None,
             progress: crate::checkpoint::TerminalFinalizationProgress::AfterReplicaC,
+            recovery_required: false,
             edition_id: [0x71; 16],
             edition_sequence: 1,
             edition_digest: [0x72; 32],
@@ -20592,6 +20594,26 @@ mod tests {
             0
         );
 
+        let recovery = index
+            .project_terminal_finalization(terminal_projection(
+                tape_uuid,
+                progress[0],
+                TerminalFinalizationOutcome::RecoveryRequired,
+            ))
+            .expect("classify current boundary as recovery-required");
+        assert_eq!(recovery.state, "recovery_required");
+        let cleared_without_progress = index
+            .project_terminal_finalization(terminal_projection(
+                tape_uuid,
+                progress[0],
+                TerminalFinalizationOutcome::InProgress,
+            ))
+            .expect_err("same-progress projection must retain recovery-required");
+        assert!(matches!(
+            cleared_without_progress,
+            StateError::JournalReplayFailed(_)
+        ));
+
         let skipped = index
             .project_terminal_finalization(terminal_projection(
                 tape_uuid,
@@ -20601,23 +20623,36 @@ mod tests {
             .expect_err("skipped progress must fail");
         assert!(matches!(skipped, StateError::JournalReplayFailed(_)));
 
-        for (index_in_sequence, next) in progress.iter().copied().enumerate().skip(1) {
-            let outcome = if next == TerminalFinalizationProgress::AfterReplicaC {
-                TerminalFinalizationOutcome::Finalized
-            } else {
-                TerminalFinalizationOutcome::InProgress
-            };
+        for next in progress.iter().copied().skip(1) {
             let tape = index
-                .project_terminal_finalization(terminal_projection(tape_uuid, next, outcome))
+                .project_terminal_finalization(terminal_projection(
+                    tape_uuid,
+                    next,
+                    TerminalFinalizationOutcome::InProgress,
+                ))
                 .expect("advance terminal progress");
             let projected = tape.terminal_finalization.expect("terminal projection");
             assert_eq!(projected.progress, next);
             assert_eq!(projected.completed_replicas, next.completed_replicas());
-            if index_in_sequence == progress.len() - 1 {
-                assert_eq!(tape.state, "sealed");
-                assert_eq!(projected.outcome, TerminalFinalizationOutcome::Finalized);
-            }
+            assert_eq!(tape.state, "finalizing");
+            assert_eq!(projected.outcome, TerminalFinalizationOutcome::InProgress);
         }
+
+        let sealed = index
+            .project_terminal_finalization(terminal_projection(
+                tape_uuid,
+                TerminalFinalizationProgress::AfterReplicaC,
+                TerminalFinalizationOutcome::Finalized,
+            ))
+            .expect("seal after host completion becomes durable");
+        assert_eq!(sealed.state, "sealed");
+        assert_eq!(
+            sealed
+                .terminal_finalization
+                .expect("sealed terminal projection")
+                .outcome,
+            TerminalFinalizationOutcome::Finalized
+        );
 
         let regressed = index
             .project_terminal_finalization(terminal_projection(

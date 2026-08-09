@@ -391,6 +391,12 @@ pub enum TerminalIndexVerificationError {
         /// Number of distinct layouts ending at measured EOD.
         count: usize,
     },
+    /// Independently valid members in one layout named different editions.
+    #[error("conflicting terminal replica editions were recovered ({count} candidates)")]
+    ConflictingReplicaEditions {
+        /// Number of independently valid, mutually conflicting editions.
+        count: usize,
+    },
     /// The BOT structural walk itself failed.
     #[error("physical prefix walk failed: {message}")]
     PrefixWalk {
@@ -978,6 +984,7 @@ fn verification_error_is_physical_damage(error: &TerminalIndexVerificationError)
         error,
         TerminalIndexVerificationError::NoCompleteLayout { .. }
             | TerminalIndexVerificationError::ConflictingLayouts { .. }
+            | TerminalIndexVerificationError::ConflictingReplicaEditions { .. }
             | TerminalIndexVerificationError::PrefixTruncated { .. }
             | TerminalIndexVerificationError::PrefixDamaged { .. }
             | TerminalIndexVerificationError::TapeFileCountMismatch { .. }
@@ -1199,7 +1206,14 @@ fn verify_terminal_index_after_damage(
 
     let separations = std::array::from_fn(|index| {
         let ordinal = u16::try_from(index + 1).expect("two separation ordinals fit u16");
-        match verify_separation_full(source, tape_uuid, block_size, layout, ordinal) {
+        match verify_separation_full(
+            source,
+            tape_uuid,
+            block_size,
+            layout,
+            ordinal,
+            edition.descriptor.edition_id,
+        ) {
             Ok(interior_record_count) => TerminalSeparationEvidence::Valid {
                 interior_record_count,
             },
@@ -1448,17 +1462,24 @@ fn verify_terminal_index_strict(
         replica_summaries.push(summary);
     }
 
+    let edition = edition.expect("three verified replicas establish one edition");
     let mut separation_interior_records = [0u64; 2];
     for ordinal in 1..=crate::terminal_tail::TERMINAL_INDEX_SEPARATION_COUNT {
-        separation_interior_records[usize::from(ordinal - 1)] =
-            verify_separation_full(source, tape_uuid, block_size, layout, ordinal)?;
+        separation_interior_records[usize::from(ordinal - 1)] = verify_separation_full(
+            source,
+            tape_uuid,
+            block_size,
+            layout,
+            ordinal,
+            edition.descriptor.edition_id,
+        )?;
     }
 
     let replicas: [TapeIndexReplicaPayloadSummary; 3] = replica_summaries
         .try_into()
         .expect("terminal replica count is exactly three");
     Ok(TerminalIndexCompleteEvidence {
-        edition: edition.expect("three verified replicas establish one edition"),
+        edition,
         replicas,
         separation_interior_records,
         measured_eod,
@@ -1557,6 +1578,7 @@ fn verify_separation_full(
     block_size: u32,
     layout: TerminalTailLayout,
     ordinal: u16,
+    expected_edition_id: [u8; 16],
 ) -> Result<u64, TerminalIndexVerificationError> {
     let component =
         layout
@@ -1579,6 +1601,14 @@ fn verify_separation_full(
     })?;
     let header = parse_index_separation_header(&header_block, tape_uuid)
         .map_err(|source| TerminalIndexVerificationError::Separation { ordinal, source })?;
+    if header.plan.descriptor.edition_id != expected_edition_id {
+        return Err(TerminalIndexVerificationError::Separation {
+            ordinal,
+            source: IndexSeparationError::DigestMismatch {
+                field: "selected terminal edition id",
+            },
+        });
+    }
     if header.plan.descriptor.gap_ordinal != ordinal
         || header.plan.descriptor.terminal_layout != layout
     {
@@ -2057,7 +2087,7 @@ fn inventory_error_to_verification(
             }
         }
         TerminalInventoryReadError::TerminalIndexReplicaConflict { count } => {
-            TerminalIndexVerificationError::ConflictingLayouts { count }
+            TerminalIndexVerificationError::ConflictingReplicaEditions { count }
         }
     }
 }
@@ -2402,6 +2432,46 @@ mod tests {
         block[BLOCK_SIZE as usize - 1] = 0x7F;
     }
 
+    fn replace_separation_edition(fixture: &mut TripleFixture, ordinal: u16, edition_id: [u8; 16]) {
+        let component = fixture
+            .layout
+            .separation(ordinal)
+            .expect("separation component");
+        let plan = crate::plan_index_separation(crate::IndexSeparationDescriptor {
+            tape_uuid: TAPE_UUID,
+            edition_id,
+            gap_ordinal: ordinal,
+            block_size: BLOCK_SIZE,
+            nominal_extent_bytes: u64::from(BLOCK_SIZE) * component.record_count,
+            total_records: component.record_count,
+            compression_enabled: false,
+            terminal_layout: fixture.layout,
+        })
+        .expect("replacement separation plan");
+        let mut blocks = Vec::new();
+        crate::write_index_separation(
+            &plan,
+            crate::IndexSeparationObservation {
+                tape_file_number: component.planned_tape_file_number,
+                start_lba: component.planned_start_lba,
+                record_count: component.record_count,
+            },
+            |block| {
+                blocks.push(block.to_vec());
+                Ok(())
+            },
+        )
+        .expect("replacement separation bytes");
+        for (offset, block) in blocks.into_iter().enumerate() {
+            let lba = component
+                .planned_start_lba
+                .checked_add(u64::try_from(offset).expect("replacement offset fits u64"))
+                .expect("replacement separation LBA");
+            fixture.records[usize::try_from(lba).expect("replacement index")] =
+                Record::Block(block);
+        }
+    }
+
     fn replace_replica_edition(fixture: &mut TripleFixture, ordinal: u16, edition_id: [u8; 16]) {
         let mut rows = BotOnlyRows;
         let plan = plan_tape_index_replica(edition_plan(fixture.layout, edition_id), ordinal)
@@ -2549,6 +2619,24 @@ mod tests {
             outcome,
             TerminalIndexVerificationOutcome::VerifiedDegraded(verification)
                 if matches!(verification.separations[1], TerminalSeparationEvidence::Invalid { .. })
+        ));
+    }
+
+    #[test]
+    fn full_verify_rejects_self_consistent_separation_from_another_edition() {
+        let mut fixture = triple_fixture();
+        replace_separation_edition(&mut fixture, 1, [0x99; 16]);
+        let mut source = RecordingSource::new(fixture.records);
+        let outcome = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE)
+            .expect("edition mismatch is retained as typed degraded evidence");
+        assert!(matches!(
+            outcome,
+            TerminalIndexVerificationOutcome::VerifiedDegraded(verification)
+                if matches!(
+                    &verification.separations[0],
+                    TerminalSeparationEvidence::Invalid { detail }
+                        if detail.contains("selected terminal edition id")
+                )
         ));
     }
 

@@ -5,6 +5,11 @@
 //! CRC-64 covers their version, length, and payload. Each record is fsynced
 //! before its corresponding SQLite batch projection. Replay stops at a torn
 //! final frame and fails closed on corrupt or unsupported bytes.
+//! All production write admission must acquire this authority through
+//! [`FileCheckpointJournal::acquire_exclusive`] or, for an already-Finalizing
+//! tape, [`FileCheckpointJournal::acquire_exclusive_for_terminal_recovery`].
+//! Opening the backing file directly is not a valid write-admission path and
+//! would bypass the durable Finalizing fence.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -25,7 +30,7 @@ const CHECKPOINT_JOURNAL_MAGIC: &[u8; 8] = b"REMCKPT\x01";
 const CHECKPOINT_FINALIZATION_INTENT_MAGIC: &[u8; 8] = b"REMFINT\x01";
 const CHECKPOINT_JOURNAL_HEADER_LEN: u64 = 8 + 16 + 8;
 const CHECKPOINT_RECORD_VERSION: u16 = 2;
-const CHECKPOINT_FINALIZATION_INTENT_VERSION: u16 = 1;
+const CHECKPOINT_FINALIZATION_INTENT_VERSION: u16 = 2;
 const CHECKPOINT_RECORD_PREFIX_LEN: u64 = 2 + 4;
 const MAX_CHECKPOINT_RECORD_LEN: u64 = 64 * 1024 * 1024;
 const MAX_FINALIZATION_INTENT_LEN: u64 = MAX_CHECKPOINT_RECORD_LEN;
@@ -520,6 +525,10 @@ pub struct TerminalFinalizationIntent {
     pub manual: Option<ManualTerminalFinalizationIdentity>,
     /// Current barrier-proved component boundary.
     pub progress: TerminalFinalizationProgress,
+    /// Durable classification that the current component boundary requires
+    /// media reconciliation before it may advance again.
+    #[serde(default)]
+    pub recovery_required: bool,
     /// Nonzero final edition identity.
     pub edition_id: [u8; 16],
     /// Nonzero monotonic final edition sequence.
@@ -2332,12 +2341,14 @@ impl FileCheckpointJournalLease {
         Ok(records)
     }
 
-    /// Replay authority while deliberately preserving a pending terminal fence.
+    /// Replay authority while deliberately preserving an unsealed terminal fence.
     ///
     /// This is the only replay seam for a recovery owner that has acquired
     /// [`FileCheckpointJournal::acquire_exclusive_for_terminal_recovery`]. It
     /// validates the intent against the ordinary checkpoint prefix but does
-    /// not treat the expected pending/unsealed state as an append error.
+    /// not treat the expected pending/unsealed state as an append error. If a
+    /// matching sealed completion is already durable, it wins and the stale
+    /// companion intent is cleared before returning.
     pub fn replay_for_terminal_recovery(
         &mut self,
     ) -> Result<CheckpointTerminalRecoveryAuthority, StateError> {
@@ -2349,6 +2360,7 @@ impl FileCheckpointJournalLease {
                     .to_string(),
             ));
         }
+        let mut finalization_intent = finalization_intent;
         if let Some(intent) = &finalization_intent {
             intent.validate_for_checkpoint_prefix(finalization_base_record(&records))?;
             if let Some(completion) = records
@@ -2361,6 +2373,8 @@ impl FileCheckpointJournalLease {
                             .to_string(),
                     ));
                 }
+                clear_terminal_finalization_intent(&self.path)?;
+                finalization_intent = None;
             }
         }
         Ok(CheckpointTerminalRecoveryAuthority {
@@ -2381,6 +2395,11 @@ impl FileCheckpointJournalLease {
         if intent.progress != TerminalFinalizationProgress::BeforeReplicaA {
             return Err(StateError::JournalReplayFailed(
                 "new terminal finalization must begin at BeforeReplicaA".to_string(),
+            ));
+        }
+        if intent.recovery_required {
+            return Err(StateError::JournalReplayFailed(
+                "new terminal finalization cannot begin recovery-required".to_string(),
             ));
         }
         let records = self.bounded_tail_records()?;
@@ -2443,6 +2462,61 @@ impl FileCheckpointJournalLease {
             )));
         }
         intent.progress = next;
+        intent.recovery_required = false;
+        intent.validate_for_tape(self.tape_uuid)?;
+        write_terminal_finalization_intent(&self.path, &intent, true)?;
+        Ok(intent)
+    }
+
+    /// Durably retain the current terminal boundary as recovery-required.
+    ///
+    /// Repeating the classification is idempotent. A later successful
+    /// component transition clears it while advancing progress; it is never
+    /// cleared at the same progress merely because the daemon restarted.
+    pub fn mark_terminal_recovery_required(
+        &mut self,
+    ) -> Result<TerminalFinalizationIntent, StateError> {
+        let mut intent = read_terminal_finalization_intent(&self.path, self.tape_uuid)?
+            .ok_or_else(|| {
+                StateError::JournalReplayFailed(
+                    "terminal recovery classification has no durable intent".to_string(),
+                )
+            })?;
+        if intent.recovery_required {
+            return Ok(intent);
+        }
+        intent.recovery_required = true;
+        intent.validate_for_tape(self.tape_uuid)?;
+        write_terminal_finalization_intent(&self.path, &intent, true)?;
+        Ok(intent)
+    }
+
+    /// Clear a recovery classification after the complete terminal tail is
+    /// already barrier-proved by durable progress.
+    ///
+    /// This is deliberately narrower than a general recovery-state clear:
+    /// before replica C, only a successful successor transition may clear the
+    /// classification. At `AfterReplicaC`, no successor exists and the final
+    /// checkpoint is entirely host-side work.
+    pub fn clear_terminal_recovery_required_after_replica_c(
+        &mut self,
+    ) -> Result<TerminalFinalizationIntent, StateError> {
+        let mut intent = read_terminal_finalization_intent(&self.path, self.tape_uuid)?
+            .ok_or_else(|| {
+                StateError::JournalReplayFailed(
+                    "terminal recovery clear has no durable intent".to_string(),
+                )
+            })?;
+        if intent.progress != TerminalFinalizationProgress::AfterReplicaC {
+            return Err(StateError::JournalReplayFailed(format!(
+                "terminal recovery clear requires AfterReplicaC, found {:?}",
+                intent.progress
+            )));
+        }
+        if !intent.recovery_required {
+            return Ok(intent);
+        }
+        intent.recovery_required = false;
         intent.validate_for_tape(self.tape_uuid)?;
         write_terminal_finalization_intent(&self.path, &intent, true)?;
         Ok(intent)
@@ -2452,6 +2526,20 @@ impl FileCheckpointJournalLease {
     pub fn append_terminal_finalization(
         &mut self,
         records: &[CheckpointJournalRecord],
+    ) -> Result<(), StateError> {
+        self.append_terminal_finalization_with_after_fsync(records, || Ok(()))
+    }
+
+    /// Append final checkpoint authority, run one callback after its fsync,
+    /// then retire the matching companion intent.
+    ///
+    /// The callback exists so an explicitly gated crash harness can exercise
+    /// the real sealed-fsync-to-intent-cleanup boundary without exposing a
+    /// normal call path that can forget cleanup.
+    pub fn append_terminal_finalization_with_after_fsync(
+        &mut self,
+        records: &[CheckpointJournalRecord],
+        after_fsync: impl FnOnce() -> Result<(), StateError>,
     ) -> Result<(), StateError> {
         let intent =
             read_terminal_finalization_intent(&self.path, self.tape_uuid)?.ok_or_else(|| {
@@ -2465,6 +2553,11 @@ impl FileCheckpointJournalLease {
                 "terminal checkpoint authority requires AfterReplicaC, found {:?}",
                 intent.progress
             )));
+        }
+        if intent.recovery_required {
+            return Err(StateError::JournalReplayFailed(
+                "terminal checkpoint completion cannot retain recovery-required intent".to_string(),
+            ));
         }
         if !records
             .last()
@@ -2485,6 +2578,7 @@ impl FileCheckpointJournalLease {
             ));
         }
         self.append_batch_inner(records, true)?;
+        after_fsync()?;
         clear_terminal_finalization_intent(&self.path)
     }
 
@@ -4041,6 +4135,11 @@ fn validate_structured_terminal_checkpoint_record(
             finalization.progress
         )));
     }
+    if finalization.recovery_required {
+        return Err(StateError::JournalReplayFailed(
+            "terminal finalization completion cannot retain recovery-required intent".to_string(),
+        ));
+    }
     if finalization.layout.partition != record.eod_partition
         || finalization.layout.block_size != record.block_size
         || finalization.layout.expected_eod_lba != record.eod_lba
@@ -4300,6 +4399,7 @@ mod tests {
                 reason: "ship this partial copy offsite".to_string(),
             }),
             progress: TerminalFinalizationProgress::BeforeReplicaA,
+            recovery_required: false,
             edition_id: [0x64; 16],
             edition_sequence: 1,
             edition_digest: [0x65; 32],
@@ -5158,6 +5258,16 @@ mod tests {
             .expect("replay prefix without clearing pending fence");
         assert_eq!(recovery_authority.records, vec![record(tape_uuid)]);
         assert_eq!(recovery_authority.finalization_intent, Some(intent.clone()));
+        let classified = recovery
+            .mark_terminal_recovery_required()
+            .expect("persist recovery-required classification");
+        assert!(classified.recovery_required);
+        assert_eq!(
+            recovery
+                .mark_terminal_recovery_required()
+                .expect("repeat recovery-required classification"),
+            classified
+        );
         let transitions = [
             (
                 TerminalFinalizationProgress::BeforeReplicaA,
@@ -5185,6 +5295,7 @@ mod tests {
                 .advance_terminal_finalization(expected, next)
                 .expect("advance one proved component");
             assert_eq!(advanced.progress, next);
+            assert!(!advanced.recovery_required);
             assert_eq!(
                 advanced.progress.completed_replicas(),
                 next.completed_replicas()
@@ -5203,6 +5314,17 @@ mod tests {
                 TerminalFinalizationProgress::BeforeReplicaA,
             )
             .is_err());
+        recovery
+            .mark_terminal_recovery_required()
+            .expect("classify completed tail before host-only recovery");
+        let cleared = recovery
+            .clear_terminal_recovery_required_after_replica_c()
+            .expect("clear recovery after complete tail");
+        assert_eq!(
+            cleared.progress,
+            TerminalFinalizationProgress::AfterReplicaC
+        );
+        assert!(!cleared.recovery_required);
     }
 
     #[test]
@@ -5276,7 +5398,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_structured_intent_is_cleared_only_for_the_exact_fsynced_completion() {
+    fn sealed_fsync_interruption_is_cleared_only_for_the_exact_completion() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x75; 16];
         let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
@@ -5287,19 +5409,31 @@ mod tests {
         let mut lease = journal.acquire_exclusive().expect("acquire journal lease");
         write_terminal_finalization_intent(journal.path(), &completed, false)
             .expect("publish completed intent");
-        lease
-            .append_terminal_finalization(std::slice::from_ref(&terminal))
-            .expect("append completion");
+        let interruption = lease
+            .append_terminal_finalization_with_after_fsync(std::slice::from_ref(&terminal), || {
+                Err(StateError::JournalReplayFailed(
+                    "simulated interruption after sealed checkpoint fsync".to_string(),
+                ))
+            })
+            .expect_err("interrupt before intent cleanup");
+        assert!(interruption.to_string().contains("simulated interruption"));
         drop(lease);
 
-        write_terminal_finalization_intent(journal.path(), &completed, false)
-            .expect("simulate crash before clearing exact intent");
-        drop(
-            journal
-                .acquire_exclusive()
-                .expect("matching completion safely clears stale intent"),
-        );
+        assert!(terminal_finalization_intent_path(journal.path()).exists());
+        let mut recovery = journal
+            .acquire_exclusive_for_terminal_recovery()
+            .expect("acquire terminal recovery owner");
+        let recovered = recovery
+            .replay_for_terminal_recovery()
+            .expect("matching completion safely clears stale intent");
+        assert_eq!(recovered.records, vec![prior.clone(), terminal.clone()]);
+        assert_eq!(recovered.finalization_intent, None);
+        drop(recovery);
         assert!(!terminal_finalization_intent_path(journal.path()).exists());
+        assert_eq!(
+            journal.replay().expect("completed replay is idempotent"),
+            vec![prior, terminal]
+        );
 
         let mut mismatched = completed;
         mismatched.edition_digest = [0x76; 32];
@@ -5381,6 +5515,16 @@ mod tests {
         drop(lease);
         let intent_path = terminal_finalization_intent_path(journal.path());
         let mut bytes = fs::read(&intent_path).expect("read finalization frame");
+        bytes[8..10].copy_from_slice(&1u16.to_le_bytes());
+        fs::write(&intent_path, &bytes).expect("write legacy finalization frame version");
+        let error = journal
+            .terminal_finalization_intent()
+            .expect_err("legacy intent version must fail closed");
+        assert!(
+            error.to_string().contains("unsupported version 1"),
+            "{error}"
+        );
+        bytes[8..10].copy_from_slice(&CHECKPOINT_FINALIZATION_INTENT_VERSION.to_le_bytes());
         bytes[14] ^= 1;
         fs::write(&intent_path, bytes).expect("corrupt finalization frame");
         let error = journal

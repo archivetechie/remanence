@@ -88,6 +88,7 @@ pub use journal::{
     CommittedBundle, CommittedBundleKind, CommittedBundleShapeError, CommittedState,
     FileTapeFileJournal, FileTapeFileJournalCommittedReplay, FileTapeFileJournalCommittedSnapshot,
     FileTapeFileJournalReader, JournalError, TapeFileEntry, TapeFileJournal,
+    TerminalComponentAuthorityRelation,
 };
 pub use mapping::data_shards_per_epoch;
 pub use model::{
