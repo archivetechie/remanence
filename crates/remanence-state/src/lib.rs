@@ -75,5 +75,7 @@ pub use index::{
 pub use lock::StateLockGuard;
 pub use paths::StatePaths;
 pub use state::{
+    CatalogResetPathEvidence, CatalogResetPreflightPaths, CatalogResetPreflightReport,
+    CatalogResetPreflightTape, CatalogResetReport, CatalogResetTapeReport, CatalogResetTapeState,
     StartupReplayReport, StateConfigWarning, StateHandle, TapeJournalIngestionOutcome,
 };

@@ -762,6 +762,12 @@ message Tape {
   // object commits. Exclusive: last written block + 1. Absent = no barrier
   // has proved one; absent is never zero.
   optional uint64 written_extent_lba = 13;
+  // Catalog classification is required when ListTapes kind="all" mixes data
+  // and cleaning rows. Absent is reserved for older peers.
+  optional string kind = 14;
+  // Stable parity implementation identifier; widths alone do not identify the
+  // codec. Absent on no-parity or not-yet-inventoried rows.
+  optional string scheme_id = 15;
 }
 
 message FinalizeTapeRequest {

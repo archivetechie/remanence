@@ -1,25 +1,28 @@
 //! Public Layer 4 state handle.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::io::Write;
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use ciborium::value::Value as CborValue;
 use remanence_parity::{FileTapeFileJournal, ParityScheme};
+use sha2::{Digest, Sha256};
 use time::Duration;
 
 use crate::audit::{
     AuditActor, AuditEvent, AuditEventRecord, AuditSink, AuditSubject, FileAuditLog, SourceLayer,
 };
 use crate::calibration::CalibrationControlStore;
-use crate::config::{load_config, validate_trusted_volume_paths, RemConfig};
+use crate::config::{load_config, parse_config_toml, validate_trusted_volume_paths, RemConfig};
 use crate::error::StateError;
 use crate::index::{
-    AuditReplayReport, CatalogIndex, RebuildReport, RebuildTapeJournalInput, RetireTapeInput,
-    RetireTapeOutcome, TapeIoFenceRecord, TapeJournalIndexInput, TapeJournalIndexReport,
-    TapePoolProjectionInput,
+    AuditReplayReport, CatalogIndex, CatalogResetPreservedTape, ProvisionTapeInput, RebuildReport,
+    RebuildTapeJournalInput, RetireTapeInput, RetireTapeOutcome, TapeIoFenceRecord,
+    TapeJournalIndexInput, TapeJournalIndexReport, TapeKindFilter, TapePoolProjectionInput,
+    TapeRecord,
 };
 use crate::lock::StateLockGuard;
 use crate::paths::StatePaths;
@@ -66,6 +69,120 @@ pub struct StartupReplayReport {
     pub lost_sessions_marked: u64,
 }
 
+/// Result of a catalog reset that explicitly preserved selected tape
+/// identities. Ordinary unscoped reset continues to return no report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogResetReport {
+    /// Exact identities restored into the otherwise empty catalog.
+    pub preserved_tapes: Vec<CatalogResetTapeReport>,
+}
+
+/// One exact tape identity restored by a scoped catalog reset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogResetTapeReport {
+    /// Physical tape UUID retained from the validated source row.
+    pub tape_uuid: [u8; 16],
+    /// Exact operator-facing volume tag retained from the source row.
+    pub voltag: String,
+    /// Pool ownership re-derived from the current operator configuration.
+    pub pool_id: Option<String>,
+    /// Fail-safe catalog state selected for the identity-only restoration.
+    pub state: CatalogResetTapeState,
+}
+
+/// Fail-safe state assigned to a tape identity restored by scoped reset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogResetTapeState {
+    /// Source projection proved the tape was ready, unwritten, and unfinalized.
+    Ready,
+    /// Source projection carried any write, lifecycle, or finalization evidence.
+    RecoveryRequired,
+}
+
+/// Read-only, all-kinds catalog admission report for a proposed scoped reset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogResetPreflightReport {
+    /// Stable admission token over config, selectors, and source evidence.
+    pub preflight_token: String,
+    /// Digest that binds the exact admitted request, config bytes, and paths.
+    pub request_digest: String,
+    /// Whether an existing durable fence admits this exact request as a resume.
+    pub resume_exact: bool,
+    /// Resolved config and state paths used for this admission decision.
+    pub paths: CatalogResetPreflightPaths,
+    /// Exact preserve allowlist validated by this preflight.
+    pub preserve_tape_voltags: Vec<String>,
+    /// Exact erase allowlist validated by this preflight.
+    pub allow_erase_tape_voltags: Vec<String>,
+    /// Every tape row, including cleaning and unbound retired identities.
+    pub tapes: Vec<CatalogResetPreflightTape>,
+}
+
+/// Path binding included in catalog-reset preflight output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogResetPathEvidence {
+    /// Configured path before filesystem resolution.
+    pub configured_path: PathBuf,
+    /// Canonical path after resolving filesystem links.
+    pub canonical_path: PathBuf,
+    /// Whether the configured path itself is a symbolic link.
+    pub configured_path_is_symlink: bool,
+}
+
+/// Complete local path binding for a catalog-reset preflight.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogResetPreflightPaths {
+    /// Operator config file.
+    pub config: CatalogResetPathEvidence,
+    /// State root.
+    pub state_dir: CatalogResetPathEvidence,
+    /// SQLite projection.
+    pub sqlite: CatalogResetPathEvidence,
+    /// Audit directory.
+    pub audit: CatalogResetPathEvidence,
+    /// Journal directory.
+    pub journal: CatalogResetPathEvidence,
+    /// Tape cache directory.
+    pub tape_cache: CatalogResetPathEvidence,
+}
+
+/// Typed all-kinds tape row returned by catalog-reset preflight.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogResetPreflightTape {
+    /// Exact tape UUID.
+    pub tape_uuid: [u8; 16],
+    /// Bound volume tag, absent for unbound retired history.
+    pub voltag: Option<String>,
+    /// Catalog kind (`data` or `cleaning`).
+    pub kind: String,
+    /// Current source-catalog pool assignment.
+    pub pool_id: Option<String>,
+    /// Source assignment generation.
+    pub assignment_generation: u64,
+    /// Current source-catalog lifecycle state.
+    pub state: String,
+    /// Fixed data block size, when present.
+    pub block_size: Option<u64>,
+    /// Parity scheme identifier, when present.
+    pub scheme_id: Option<String>,
+    /// Parity data blocks per stripe, when present.
+    pub data_blocks_per_stripe: Option<u32>,
+    /// Parity blocks per stripe, when present.
+    pub parity_blocks_per_stripe: Option<u32>,
+    /// Stripes per parity neighborhood, when present.
+    pub stripes_per_neighborhood: Option<u32>,
+}
+
+impl CatalogResetTapeState {
+    /// Stable operator-facing state name used by CLI output.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::RecoveryRequired => "recovery_required",
+        }
+    }
+}
+
 impl StateHandle {
     /// Open state by loading config and acquiring the exclusive state lock.
     pub fn open_from_config_file(config_path: impl AsRef<Path>) -> Result<Self, StateError> {
@@ -88,9 +205,146 @@ impl StateHandle {
         Self::reset_catalog_with_config(paths, config)
     }
 
+    /// Reset rebuildable catalog state while retaining only explicitly selected
+    /// tape identities.
+    ///
+    /// Every selector and source row is validated under the exclusive state
+    /// lock before any archive or deletion. Restored rows contain only UUID,
+    /// exact voltag, kind, data geometry, and a pool re-derived from current
+    /// config. No physical-prefix, object, tape-file, audit, journal, operation,
+    /// session, or idempotency authority is retained.
+    pub fn reset_catalog_preserving_from_config_file(
+        config_path: impl AsRef<Path>,
+        preserve_tape_voltags: &[String],
+    ) -> Result<CatalogResetReport, StateError> {
+        Self::reset_catalog_preserving_with_allowlist_from_config_file(
+            config_path,
+            preserve_tape_voltags,
+            &[],
+        )
+    }
+
+    /// Scoped reset with an exact caller-supplied allowlist for bound tapes
+    /// that may be erased instead of preserved.
+    pub fn reset_catalog_preserving_with_allowlist_from_config_file(
+        config_path: impl AsRef<Path>,
+        preserve_tape_voltags: &[String],
+        allow_erase_tape_voltags: &[String],
+    ) -> Result<CatalogResetReport, StateError> {
+        let preserve = validate_catalog_reset_selectors(preserve_tape_voltags, "preserve")?;
+        let allow_erase =
+            validate_catalog_reset_selectors(allow_erase_tape_voltags, "allow-erase")?;
+        validate_disjoint_catalog_reset_allowlists(&preserve, &allow_erase)?;
+        let config_path = config_path.as_ref();
+        let config = load_config(config_path)?;
+        let paths = StatePaths::from_config(config_path, &config);
+        Self::reset_catalog_with_config_preserving_allowlist(paths, config, &preserve, &allow_erase)
+    }
+
+    /// Scoped reset admitted only when source evidence still matches a prior
+    /// preflight token.
+    pub fn reset_catalog_preserving_with_preflight_token_from_config_file(
+        config_path: impl AsRef<Path>,
+        preserve_tape_voltags: &[String],
+        allow_erase_tape_voltags: &[String],
+        expected_preflight_token: &str,
+    ) -> Result<CatalogResetReport, StateError> {
+        if expected_preflight_token.len() != 64
+            || !expected_preflight_token
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(StateError::ConfigInvalid(
+                "expected preflight token must be 64 lowercase hexadecimal characters".to_string(),
+            ));
+        }
+        let preserve = validate_catalog_reset_selectors(preserve_tape_voltags, "preserve")?;
+        let allow_erase =
+            validate_catalog_reset_selectors(allow_erase_tape_voltags, "allow-erase")?;
+        validate_disjoint_catalog_reset_allowlists(&preserve, &allow_erase)?;
+        let config_path = config_path.as_ref();
+        let config = load_config(config_path)?;
+        let paths = StatePaths::from_config(config_path, &config);
+        Self::reset_catalog_with_config_preserving_allowlist_expected(
+            paths,
+            config,
+            &preserve,
+            &allow_erase,
+            Some(expected_preflight_token),
+        )
+    }
+
+    /// Perform a read-only, all-kinds admission check for a proposed scoped
+    /// reset. This is advisory; the mutating API repeats the same check while
+    /// holding its exclusive lock.
+    pub fn preflight_catalog_reset_from_config_file(
+        config_path: impl AsRef<Path>,
+        preserve_tape_voltags: &[String],
+        allow_erase_tape_voltags: &[String],
+    ) -> Result<CatalogResetPreflightReport, StateError> {
+        let preserve = validate_catalog_reset_selectors(preserve_tape_voltags, "preserve")?;
+        let allow_erase =
+            validate_catalog_reset_selectors(allow_erase_tape_voltags, "allow-erase")?;
+        validate_disjoint_catalog_reset_allowlists(&preserve, &allow_erase)?;
+        let config_path = config_path.as_ref();
+        let config = load_config(config_path)?;
+        let paths = StatePaths::from_config(config_path, &config);
+        let _lock = StateLockGuard::acquire(&paths.state_dir)?;
+        let (locked_config, config_bytes) = load_catalog_reset_config_snapshot(config_path)?;
+        ensure_catalog_reset_config_unchanged(&paths, &config, &locked_config)?;
+        let index = CatalogIndex::open_read_only(&paths.sqlite_path)?;
+        let (mut report, _, output_is_clean) = preflight_catalog_reset_index(
+            &index,
+            &paths,
+            &locked_config,
+            &config_bytes,
+            &preserve,
+            &allow_erase,
+        )?;
+        if let Some((stored_request, stored_token, stored_output)) =
+            catalog_reset_fence_evidence(&paths)?
+        {
+            let expected_request = catalog_reset_request_digest(
+                &paths,
+                &config_bytes,
+                &preserve,
+                &allow_erase,
+                false,
+                &stored_token,
+            )?;
+            if stored_request != expected_request {
+                return Err(StateError::CatalogResetInProgress(
+                    "durable fence does not match this preflight request".to_string(),
+                ));
+            }
+            if report.preflight_token != stored_token
+                && (!output_is_clean
+                    || catalog_reset_current_output_token(&report.tapes) != stored_output)
+            {
+                return Err(StateError::CatalogResetInProgress(
+                    "catalog source changed during an interrupted reset".to_string(),
+                ));
+            }
+            report.preflight_token = stored_token;
+            report.request_digest = stored_request;
+            report.resume_exact = true;
+        } else {
+            report.request_digest = catalog_reset_request_digest(
+                &paths,
+                &config_bytes,
+                &preserve,
+                &allow_erase,
+                false,
+                &report.preflight_token,
+            )?;
+        }
+        Ok(report)
+    }
+
     /// Open state with already-resolved paths and a parsed config.
     pub fn open_with_config(paths: StatePaths, config: RemConfig) -> Result<Self, StateError> {
         let lock = StateLockGuard::acquire(&paths.state_dir)?;
+        ensure_no_catalog_reset_fence(&paths)?;
         ensure_state_directories(&paths)?;
         validate_trusted_volume_paths(&config)?;
         let audit = FileAuditLog::open_with_clock_forward_tolerance(
@@ -121,27 +375,178 @@ impl StateHandle {
         config: RemConfig,
     ) -> Result<(), StateError> {
         let _lock = StateLockGuard::acquire(&paths.state_dir)?;
-        archive_reset_authoritative_inputs(&paths)?;
-        reset_directory_contents(&paths.audit_dir)?;
-        reset_directory_contents(&paths.journal_dir)?;
-        reset_directory_contents(&paths.tape_cache_dir)?;
-        remove_sqlite_file_and_sidecars(&paths.sqlite_path)?;
-        // `paths.calibration_dir` is deliberately NOT reset. The
-        // calibration-control store is durable across catalog reset
-        // (design-read-ordering.md §4.3): its generation allocator
-        // must never restart, or a generation could be re-issued
-        // after reset and resurrect a caller-cached negative. The
-        // wrap-map *projection* died with the SQLite file above; the
-        // eviction transitions below uncalibrate every known volume
-        // with fresh generations, so nothing servable survives while
-        // the allocator's history does.
-        ensure_state_directories(&paths)?;
-        let calibration = CalibrationControlStore::open(&paths.calibration_dir)?;
-        calibration.record_all_maps_evicted("catalog_reset")?;
-        let mut index = CatalogIndex::open(&paths.sqlite_path)?;
-        let _config_warnings = project_configured_tape_pools(&mut index, &config)?;
-        index.reconcile_cleaning_prefixes(&config.cleaning.voltag_prefixes)?;
-        Ok(())
+        let (locked_config, config_bytes) = load_catalog_reset_config_snapshot(&paths.config_path)?;
+        ensure_catalog_reset_config_unchanged(&paths, &config, &locked_config)?;
+        let token = "0".repeat(64);
+        let request_digest =
+            catalog_reset_request_digest(&paths, &config_bytes, &[], &[], true, &token)?;
+        reset_catalog_locked(&paths, &locked_config, &[], &request_digest, &token, &token)
+    }
+
+    /// Scoped counterpart of [`Self::reset_catalog_with_config`] for callers
+    /// that already parsed config and resolved state paths.
+    pub fn reset_catalog_with_config_preserving(
+        paths: StatePaths,
+        config: RemConfig,
+        preserve_tape_voltags: &[String],
+    ) -> Result<CatalogResetReport, StateError> {
+        Self::reset_catalog_with_config_preserving_allowlist(
+            paths,
+            config,
+            preserve_tape_voltags,
+            &[],
+        )
+    }
+
+    /// Scoped reset with exact preserve and erase allowlists for callers that
+    /// already parsed config and resolved state paths.
+    pub fn reset_catalog_with_config_preserving_allowlist(
+        paths: StatePaths,
+        config: RemConfig,
+        preserve_tape_voltags: &[String],
+        allow_erase_tape_voltags: &[String],
+    ) -> Result<CatalogResetReport, StateError> {
+        Self::reset_catalog_with_config_preserving_allowlist_expected(
+            paths,
+            config,
+            preserve_tape_voltags,
+            allow_erase_tape_voltags,
+            None,
+        )
+    }
+
+    fn reset_catalog_with_config_preserving_allowlist_expected(
+        paths: StatePaths,
+        config: RemConfig,
+        preserve_tape_voltags: &[String],
+        allow_erase_tape_voltags: &[String],
+        expected_preflight_token: Option<&str>,
+    ) -> Result<CatalogResetReport, StateError> {
+        let preserve = validate_catalog_reset_selectors(preserve_tape_voltags, "preserve")?;
+        let allow_erase =
+            validate_catalog_reset_selectors(allow_erase_tape_voltags, "allow-erase")?;
+        validate_disjoint_catalog_reset_allowlists(&preserve, &allow_erase)?;
+        let _lock = StateLockGuard::acquire(&paths.state_dir)?;
+        let (locked_config, config_bytes) = load_catalog_reset_config_snapshot(&paths.config_path)?;
+        ensure_catalog_reset_config_unchanged(&paths, &config, &locked_config)?;
+        let (preflight, preserved_tapes, output_is_clean) = {
+            let index = CatalogIndex::open_read_only(&paths.sqlite_path)?;
+            preflight_catalog_reset_index(
+                &index,
+                &paths,
+                &locked_config,
+                &config_bytes,
+                &preserve,
+                &allow_erase,
+            )?
+        };
+        let mut already_swapped = false;
+        let (token, output_token) = if let Some((stored_request, stored_token, stored_output)) =
+            catalog_reset_fence_evidence(&paths)?
+        {
+            if expected_preflight_token.is_some_and(|expected| expected != stored_token) {
+                return Err(StateError::CatalogResetInProgress(
+                    "expected preflight token does not match the durable reset fence".to_string(),
+                ));
+            }
+            let request = catalog_reset_request_digest(
+                &paths,
+                &config_bytes,
+                &preserve,
+                &allow_erase,
+                false,
+                &stored_token,
+            )?;
+            if request != stored_request {
+                return Err(StateError::CatalogResetInProgress(
+                    "durable fence does not match this reset request".to_string(),
+                ));
+            }
+            if preflight.preflight_token != stored_token
+                && (!output_is_clean
+                    || catalog_reset_current_output_token(&preflight.tapes) != stored_output)
+            {
+                return Err(StateError::CatalogResetInProgress(
+                    "catalog source changed during an interrupted reset".to_string(),
+                ));
+            }
+            already_swapped = preflight.preflight_token != stored_token;
+            (stored_token, stored_output)
+        } else {
+            if expected_preflight_token
+                .is_some_and(|expected| expected != preflight.preflight_token)
+            {
+                return Err(StateError::ConfigInvalid(
+                    "catalog reset source changed after preflight; run preflight again".to_string(),
+                ));
+            }
+            let intended_output =
+                catalog_reset_intended_output_token(&preflight.tapes, &preserved_tapes)?;
+            (preflight.preflight_token.clone(), intended_output)
+        };
+        let request_digest = catalog_reset_request_digest(
+            &paths,
+            &config_bytes,
+            &preserve,
+            &allow_erase,
+            false,
+            &token,
+        )?;
+        if already_swapped {
+            sync_regular_file(&paths.sqlite_path)?;
+            if let Some(parent) = paths.sqlite_path.parent() {
+                sync_directory(parent)?;
+            }
+            sync_directory(&paths.audit_dir)?;
+            sync_directory(&paths.journal_dir)?;
+            sync_directory(&paths.tape_cache_dir)?;
+            clear_catalog_reset_fence(&paths)?;
+            let preserve_set = preserve.iter().map(String::as_str).collect::<HashSet<_>>();
+            return Ok(CatalogResetReport {
+                preserved_tapes: preflight
+                    .tapes
+                    .into_iter()
+                    .filter_map(|tape| {
+                        let voltag = tape.voltag?;
+                        preserve_set
+                            .contains(voltag.as_str())
+                            .then(|| CatalogResetTapeReport {
+                                tape_uuid: tape.tape_uuid,
+                                voltag,
+                                pool_id: tape.pool_id,
+                                state: if tape.state == "ready" {
+                                    CatalogResetTapeState::Ready
+                                } else {
+                                    CatalogResetTapeState::RecoveryRequired
+                                },
+                            })
+                    })
+                    .collect(),
+            });
+        }
+        reset_catalog_locked(
+            &paths,
+            &locked_config,
+            &preserved_tapes,
+            &request_digest,
+            &token,
+            &output_token,
+        )?;
+        Ok(CatalogResetReport {
+            preserved_tapes: preserved_tapes
+                .into_iter()
+                .map(|tape| CatalogResetTapeReport {
+                    tape_uuid: tape.tape_uuid,
+                    voltag: tape.voltag,
+                    pool_id: tape.pool_id,
+                    state: if tape.restore_ready {
+                        CatalogResetTapeState::Ready
+                    } else {
+                        CatalogResetTapeState::RecoveryRequired
+                    },
+                })
+                .collect(),
+        })
     }
 
     /// Return parsed operator config.
@@ -167,6 +572,35 @@ impl StateHandle {
     /// Return the mutable catalog projection owner.
     pub fn catalog_index(&mut self) -> &mut CatalogIndex {
         &mut self.index
+    }
+
+    /// Provision or reprovision one tape while coordinating any old physical
+    /// identity's durable wrap-map calibration eviction.
+    pub fn provision_tape(&mut self, input: ProvisionTapeInput) -> Result<(), StateError> {
+        let prior = match self.index.get_tape(&input.tape_uuid)? {
+            Some(tape) => Some(tape),
+            None => self.index.get_tape_by_voltag(input.voltag.as_str())?,
+        };
+        let prior_uuid_to_evict = prior
+            .as_ref()
+            .filter(|tape| {
+                tape.tape_uuid.as_slice() != input.tape_uuid
+                    || !tape_record_matches_provision_geometry(tape, &input)
+            })
+            .map(|tape| {
+                <[u8; 16]>::try_from(tape.tape_uuid.as_slice()).map_err(|_| {
+                    StateError::IndexCorrupt(format!(
+                        "provisioning matched tape row with {}-byte uuid",
+                        tape.tape_uuid.len()
+                    ))
+                })
+            })
+            .transpose()?;
+        self.index.provision_tape(input)?;
+        if let Some(prior_uuid) = prior_uuid_to_evict {
+            self.calibration.record_map_evicted(prior_uuid)?;
+        }
+        Ok(())
     }
 
     /// Return the durable calibration-control store (cloneable
@@ -536,6 +970,856 @@ impl StateHandle {
     }
 }
 
+fn tape_record_matches_provision_geometry(tape: &TapeRecord, input: &ProvisionTapeInput) -> bool {
+    if tape.block_size != Some(u64::from(input.block_size)) {
+        return false;
+    }
+    match &input.parity {
+        remanence_parity::ParityConfig::None => {
+            tape.scheme_id.is_none()
+                && tape.data_blocks_per_stripe.is_none()
+                && tape.parity_blocks_per_stripe.is_none()
+                && tape.stripes_per_neighborhood.is_none()
+        }
+        remanence_parity::ParityConfig::Scheme(scheme) => {
+            tape.scheme_id.as_deref() == Some(scheme.id.as_str())
+                && tape.data_blocks_per_stripe == Some(u32::from(scheme.data_blocks_per_stripe))
+                && tape.parity_blocks_per_stripe == Some(u32::from(scheme.parity_blocks_per_stripe))
+                && tape.stripes_per_neighborhood == Some(scheme.stripes_per_neighborhood)
+        }
+    }
+}
+
+fn validate_catalog_reset_selectors(
+    selectors: &[String],
+    role: &str,
+) -> Result<Vec<String>, StateError> {
+    let mut seen = HashSet::with_capacity(selectors.len());
+    let mut validated = Vec::with_capacity(selectors.len());
+    for selector in selectors {
+        if selector.is_empty() || selector.trim().is_empty() {
+            return Err(StateError::ConfigInvalid(format!(
+                "catalog reset {role} selector must be nonblank"
+            )));
+        }
+        if selector.trim() != selector {
+            return Err(StateError::ConfigInvalid(format!(
+                "catalog reset {role} selector {selector:?} must not contain surrounding whitespace"
+            )));
+        }
+        if !seen.insert(selector.clone()) {
+            return Err(StateError::ConfigInvalid(format!(
+                "duplicate catalog reset {role} selector {selector:?}"
+            )));
+        }
+        validated.push(selector.clone());
+    }
+    Ok(validated)
+}
+
+fn validate_disjoint_catalog_reset_allowlists(
+    preserve: &[String],
+    allow_erase: &[String],
+) -> Result<(), StateError> {
+    let preserve = preserve.iter().collect::<HashSet<_>>();
+    if let Some(overlap) = allow_erase.iter().find(|voltag| preserve.contains(voltag)) {
+        return Err(StateError::ConfigInvalid(format!(
+            "catalog reset voltag {overlap:?} appears in both preserve and allow-erase lists"
+        )));
+    }
+    Ok(())
+}
+
+fn preflight_catalog_reset_index(
+    index: &CatalogIndex,
+    paths: &StatePaths,
+    config: &RemConfig,
+    config_bytes: &[u8],
+    preserve: &[String],
+    allow_erase: &[String],
+) -> Result<
+    (
+        CatalogResetPreflightReport,
+        Vec<CatalogResetPreservedTape>,
+        bool,
+    ),
+    StateError,
+> {
+    let preserved_tapes = index.capture_catalog_reset_tapes(preserve, &config.tape_pool_rules)?;
+    let preserve_set = preserve.iter().map(String::as_str).collect::<HashSet<_>>();
+    let erase_set = allow_erase
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let source_tapes = index.list_tapes(None, TapeKindFilter::All)?;
+    let mut seen_uuids = HashSet::with_capacity(source_tapes.len());
+    let mut seen_voltags = HashSet::with_capacity(source_tapes.len());
+    let mut tapes = Vec::with_capacity(source_tapes.len());
+    for tape in source_tapes {
+        let typed = catalog_reset_preflight_tape(tape)?;
+        if !seen_uuids.insert(typed.tape_uuid) {
+            return Err(StateError::AmbiguousCatalogLookup(format!(
+                "catalog reset preflight found duplicate tape uuid {}",
+                hex_tape_uuid(typed.tape_uuid)
+            )));
+        }
+        match typed.voltag.as_deref() {
+            Some(voltag) => {
+                if !seen_voltags.insert(voltag.to_string()) {
+                    return Err(StateError::AmbiguousCatalogLookup(format!(
+                        "catalog reset preflight found duplicate voltag {voltag:?}"
+                    )));
+                }
+                if !preserve_set.contains(voltag) && !erase_set.contains(voltag) {
+                    return Err(StateError::ConfigInvalid(format!(
+                        "catalog reset refuses bound tape {voltag:?} outside the exact preserve and allow-erase lists"
+                    )));
+                }
+            }
+            None if typed.state == "retired" => {}
+            None => {
+                return Err(StateError::ConfigInvalid(format!(
+                    "catalog reset refuses unbound nonretired tape {} in state {:?}",
+                    hex_tape_uuid(typed.tape_uuid),
+                    typed.state
+                )));
+            }
+        }
+        tapes.push(typed);
+    }
+    let preflight_token = catalog_reset_preflight_token(
+        paths,
+        config_bytes,
+        preserve,
+        allow_erase,
+        &tapes,
+        &preserved_tapes,
+    )?;
+    let output_is_clean = index.catalog_reset_output_is_clean()?
+        && catalog_reset_output_pools_match(index, config)?
+        && catalog_reset_output_directories_clean(paths)?;
+    Ok((
+        CatalogResetPreflightReport {
+            preflight_token,
+            request_digest: String::new(),
+            resume_exact: false,
+            paths: catalog_reset_preflight_paths(paths)?,
+            preserve_tape_voltags: preserve.to_vec(),
+            allow_erase_tape_voltags: allow_erase.to_vec(),
+            tapes,
+        },
+        preserved_tapes,
+        output_is_clean,
+    ))
+}
+
+fn catalog_reset_output_pools_match(
+    index: &CatalogIndex,
+    config: &RemConfig,
+) -> Result<bool, StateError> {
+    let mut actual = index
+        .list_tape_pools()?
+        .into_iter()
+        .map(|pool| {
+            (
+                pool.pool_id,
+                pool.display_name,
+                pool.copy_class,
+                pool.content_class,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut expected = config
+        .tape_pools
+        .iter()
+        .map(|pool| {
+            (
+                pool.id.clone(),
+                pool.display_name.clone(),
+                pool.copy_class.clone(),
+                pool.content_class.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    actual.sort();
+    expected.sort();
+    Ok(actual == expected)
+}
+
+fn catalog_reset_output_directories_clean(paths: &StatePaths) -> Result<bool, StateError> {
+    for path in [&paths.audit_dir, &paths.journal_dir, &paths.tape_cache_dir] {
+        let metadata = fs::symlink_metadata(path).map_err(|err| {
+            StateError::io_at("inspect catalog reset output directory", path, err)
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Ok(false);
+        }
+        let mut entries = fs::read_dir(path)
+            .map_err(|err| StateError::io_at("read catalog reset output directory", path, err))?;
+        if entries
+            .next()
+            .transpose()
+            .map_err(|err| StateError::io_at("iterate catalog reset output directory", path, err))?
+            .is_some()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn catalog_reset_preflight_paths(
+    paths: &StatePaths,
+) -> Result<CatalogResetPreflightPaths, StateError> {
+    Ok(CatalogResetPreflightPaths {
+        config: catalog_reset_path_evidence(&paths.config_path)?,
+        state_dir: catalog_reset_path_evidence(&paths.state_dir)?,
+        sqlite: catalog_reset_path_evidence(&paths.sqlite_path)?,
+        audit: catalog_reset_path_evidence(&paths.audit_dir)?,
+        journal: catalog_reset_path_evidence(&paths.journal_dir)?,
+        tape_cache: catalog_reset_path_evidence(&paths.tape_cache_dir)?,
+    })
+}
+
+fn catalog_reset_path_evidence(path: &Path) -> Result<CatalogResetPathEvidence, StateError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|err| StateError::io_at("stat catalog reset path", path, err))?;
+    let canonical_path = fs::canonicalize(path)
+        .map_err(|err| StateError::io_at("canonicalize catalog reset path", path, err))?;
+    Ok(CatalogResetPathEvidence {
+        configured_path: path.to_path_buf(),
+        canonical_path,
+        configured_path_is_symlink: metadata.file_type().is_symlink(),
+    })
+}
+
+fn catalog_reset_preflight_tape(tape: TapeRecord) -> Result<CatalogResetPreflightTape, StateError> {
+    let tape_uuid: [u8; 16] = tape.tape_uuid.as_slice().try_into().map_err(|_| {
+        StateError::IndexCorrupt(format!(
+            "catalog reset preflight tape uuid has length {}, expected 16",
+            tape.tape_uuid.len()
+        ))
+    })?;
+    if let Some(voltag) = tape.voltag.as_deref() {
+        if voltag.is_empty() || voltag.trim() != voltag {
+            return Err(StateError::IndexCorrupt(format!(
+                "catalog reset preflight tape {} has invalid voltag {voltag:?}",
+                hex_tape_uuid(tape_uuid)
+            )));
+        }
+    }
+    if !matches!(tape.kind.as_str(), "data" | "cleaning") {
+        return Err(StateError::IndexCorrupt(format!(
+            "catalog reset preflight tape {} has invalid kind {:?}",
+            hex_tape_uuid(tape_uuid),
+            tape.kind
+        )));
+    }
+    if !matches!(
+        tape.state.as_str(),
+        "ready"
+            | "ingested"
+            | "sealed"
+            | "retired"
+            | "finalizing"
+            | "finalized"
+            | "finalized_degraded"
+            | "recovery_required"
+    ) {
+        return Err(StateError::IndexCorrupt(format!(
+            "catalog reset preflight tape {} has invalid state {:?}",
+            hex_tape_uuid(tape_uuid),
+            tape.state
+        )));
+    }
+    match tape.scheme_id.as_deref() {
+        None => {
+            if tape.data_blocks_per_stripe.is_some()
+                || tape.parity_blocks_per_stripe.is_some()
+                || tape.stripes_per_neighborhood.is_some()
+            {
+                return Err(StateError::IndexCorrupt(format!(
+                    "catalog reset preflight tape {} has partial parity geometry",
+                    hex_tape_uuid(tape_uuid)
+                )));
+            }
+        }
+        Some(scheme_id) => {
+            let scheme = remanence_parity::ParityScheme {
+                id: remanence_parity::SchemeId::new_owned(scheme_id.to_string()),
+                data_blocks_per_stripe: u16::try_from(tape.data_blocks_per_stripe.ok_or_else(
+                    || {
+                        StateError::IndexCorrupt(
+                            "catalog reset preflight parity geometry is missing data width"
+                                .to_string(),
+                        )
+                    },
+                )?)
+                .map_err(|_| {
+                    StateError::IndexCorrupt(
+                        "catalog reset preflight parity data width exceeds u16".to_string(),
+                    )
+                })?,
+                parity_blocks_per_stripe: u16::try_from(tape.parity_blocks_per_stripe.ok_or_else(
+                    || {
+                        StateError::IndexCorrupt(
+                            "catalog reset preflight parity geometry is missing parity width"
+                                .to_string(),
+                        )
+                    },
+                )?)
+                .map_err(|_| {
+                    StateError::IndexCorrupt(
+                        "catalog reset preflight parity width exceeds u16".to_string(),
+                    )
+                })?,
+                stripes_per_neighborhood: tape.stripes_per_neighborhood.ok_or_else(|| {
+                    StateError::IndexCorrupt(
+                        "catalog reset preflight parity geometry is missing neighborhood width"
+                            .to_string(),
+                    )
+                })?,
+            };
+            scheme.validate().map_err(|error| {
+                StateError::IndexCorrupt(format!(
+                    "catalog reset preflight tape {} has invalid parity geometry: {error}",
+                    hex_tape_uuid(tape_uuid)
+                ))
+            })?;
+        }
+    }
+    if tape.kind == "data" && tape.block_size.is_none() {
+        return Err(StateError::IndexCorrupt(format!(
+            "catalog reset preflight data tape {} has no block size",
+            hex_tape_uuid(tape_uuid)
+        )));
+    }
+    if tape.block_size == Some(0) || tape.block_size.is_some_and(|value| value > u32::MAX.into()) {
+        return Err(StateError::IndexCorrupt(format!(
+            "catalog reset preflight tape {} has invalid block size {:?}",
+            hex_tape_uuid(tape_uuid),
+            tape.block_size
+        )));
+    }
+    Ok(CatalogResetPreflightTape {
+        tape_uuid,
+        voltag: tape.voltag,
+        kind: tape.kind,
+        pool_id: tape.pool_id,
+        assignment_generation: tape.assignment_generation,
+        state: tape.state,
+        block_size: tape.block_size,
+        scheme_id: tape.scheme_id,
+        data_blocks_per_stripe: tape.data_blocks_per_stripe,
+        parity_blocks_per_stripe: tape.parity_blocks_per_stripe,
+        stripes_per_neighborhood: tape.stripes_per_neighborhood,
+    })
+}
+
+const CATALOG_RESET_FENCE_FILE: &str = "catalog-reset.in-progress";
+const CATALOG_RESET_FENCE_MAGIC: &str = "REM-CATALOG-RESET-V2";
+
+fn load_catalog_reset_config_snapshot(path: &Path) -> Result<(RemConfig, Vec<u8>), StateError> {
+    let bytes = fs::read(path).map_err(|err| StateError::io_at("read config", path, err))?;
+    let text = std::str::from_utf8(&bytes).map_err(|err| {
+        StateError::ConfigInvalid(format!("config {} is not UTF-8: {err}", path.display()))
+    })?;
+    let config = parse_config_toml(text)?;
+    Ok((config, bytes))
+}
+
+fn ensure_catalog_reset_config_unchanged(
+    paths: &StatePaths,
+    initially_parsed: &RemConfig,
+    locked_snapshot: &RemConfig,
+) -> Result<(), StateError> {
+    let locked_paths = StatePaths::from_config(&paths.config_path, locked_snapshot);
+    if initially_parsed != locked_snapshot || &locked_paths != paths {
+        return Err(StateError::ConfigInvalid(
+            "catalog reset config changed before the exclusive admission lock; retry from preflight"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn catalog_reset_request_digest(
+    paths: &StatePaths,
+    config_bytes: &[u8],
+    preserve: &[String],
+    allow_erase: &[String],
+    ordinary_full_reset: bool,
+    preflight_token: &str,
+) -> Result<String, StateError> {
+    let config_path = fs::canonicalize(&paths.config_path).map_err(|err| {
+        StateError::io_at(
+            "canonicalize catalog reset config path",
+            &paths.config_path,
+            err,
+        )
+    })?;
+    let mut preserve = preserve.to_vec();
+    let mut allow_erase = allow_erase.to_vec();
+    preserve.sort();
+    allow_erase.sort();
+    let mut hasher = Sha256::new();
+    hash_catalog_reset_field(
+        &mut hasher,
+        if ordinary_full_reset {
+            b"ordinary-full".as_slice()
+        } else {
+            b"scoped".as_slice()
+        },
+    );
+    hash_catalog_reset_field(&mut hasher, config_path.as_os_str().as_encoded_bytes());
+    hash_catalog_reset_field(&mut hasher, config_bytes);
+    hash_catalog_reset_field(&mut hasher, preflight_token.as_bytes());
+    for voltag in preserve {
+        hash_catalog_reset_field(&mut hasher, b"preserve");
+        hash_catalog_reset_field(&mut hasher, voltag.as_bytes());
+    }
+    for voltag in allow_erase {
+        hash_catalog_reset_field(&mut hasher, b"allow-erase");
+        hash_catalog_reset_field(&mut hasher, voltag.as_bytes());
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn catalog_reset_preflight_token(
+    paths: &StatePaths,
+    config_bytes: &[u8],
+    preserve: &[String],
+    allow_erase: &[String],
+    tapes: &[CatalogResetPreflightTape],
+    preserved: &[CatalogResetPreservedTape],
+) -> Result<String, StateError> {
+    let path_evidence = catalog_reset_preflight_paths(paths)?;
+    let mut hasher = Sha256::new();
+    hash_catalog_reset_field(&mut hasher, b"REM-CATALOG-PREFLIGHT-V1");
+    hash_catalog_reset_field(&mut hasher, config_bytes);
+    for path in [
+        &path_evidence.config,
+        &path_evidence.state_dir,
+        &path_evidence.sqlite,
+        &path_evidence.audit,
+        &path_evidence.journal,
+        &path_evidence.tape_cache,
+    ] {
+        hash_catalog_reset_field(
+            &mut hasher,
+            path.configured_path.as_os_str().as_encoded_bytes(),
+        );
+        hash_catalog_reset_field(
+            &mut hasher,
+            path.canonical_path.as_os_str().as_encoded_bytes(),
+        );
+        hash_catalog_reset_field(
+            &mut hasher,
+            if path.configured_path_is_symlink {
+                b"symlink"
+            } else {
+                b"direct"
+            },
+        );
+    }
+    let mut preserve = preserve.to_vec();
+    let mut allow_erase = allow_erase.to_vec();
+    preserve.sort();
+    allow_erase.sort();
+    for value in preserve {
+        hash_catalog_reset_field(&mut hasher, b"preserve");
+        hash_catalog_reset_field(&mut hasher, value.as_bytes());
+    }
+    for value in allow_erase {
+        hash_catalog_reset_field(&mut hasher, b"allow-erase");
+        hash_catalog_reset_field(&mut hasher, value.as_bytes());
+    }
+    let restore_ready = preserved
+        .iter()
+        .map(|tape| (tape.tape_uuid, tape.restore_ready))
+        .collect::<BTreeMap<_, _>>();
+    let mut tapes = tapes.to_vec();
+    tapes.sort_by_key(|tape| tape.tape_uuid);
+    for tape in tapes {
+        hash_catalog_reset_field(&mut hasher, &tape.tape_uuid);
+        for value in [
+            tape.voltag.as_deref(),
+            Some(tape.kind.as_str()),
+            tape.pool_id.as_deref(),
+            Some(tape.state.as_str()),
+            tape.scheme_id.as_deref(),
+        ] {
+            match value {
+                Some(value) => {
+                    hash_catalog_reset_field(&mut hasher, b"some");
+                    hash_catalog_reset_field(&mut hasher, value.as_bytes());
+                }
+                None => hash_catalog_reset_field(&mut hasher, b"none"),
+            }
+        }
+        for value in [
+            tape.block_size,
+            Some(tape.assignment_generation),
+            tape.data_blocks_per_stripe.map(u64::from),
+            tape.parity_blocks_per_stripe.map(u64::from),
+            tape.stripes_per_neighborhood.map(u64::from),
+        ] {
+            match value {
+                Some(value) => hash_catalog_reset_field(&mut hasher, &value.to_be_bytes()),
+                None => hash_catalog_reset_field(&mut hasher, b"none"),
+            }
+        }
+        hash_catalog_reset_field(
+            &mut hasher,
+            if restore_ready.get(&tape.tape_uuid).copied().unwrap_or(false) {
+                b"restore-ready"
+            } else {
+                b"not-restore-ready"
+            },
+        );
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn hash_catalog_reset_output_tape(
+    hasher: &mut Sha256,
+    tape: &CatalogResetPreflightTape,
+    pool_id: Option<&str>,
+    assignment_generation: u64,
+    state: &str,
+) {
+    hash_catalog_reset_field(hasher, &tape.tape_uuid);
+    for value in [
+        tape.voltag.as_deref(),
+        Some(tape.kind.as_str()),
+        pool_id,
+        Some(state),
+        tape.scheme_id.as_deref(),
+    ] {
+        match value {
+            Some(value) => {
+                hash_catalog_reset_field(hasher, b"some");
+                hash_catalog_reset_field(hasher, value.as_bytes());
+            }
+            None => hash_catalog_reset_field(hasher, b"none"),
+        }
+    }
+    for value in [
+        tape.block_size,
+        Some(assignment_generation),
+        tape.data_blocks_per_stripe.map(u64::from),
+        tape.parity_blocks_per_stripe.map(u64::from),
+        tape.stripes_per_neighborhood.map(u64::from),
+    ] {
+        match value {
+            Some(value) => {
+                hash_catalog_reset_field(hasher, b"some");
+                hash_catalog_reset_field(hasher, &value.to_be_bytes());
+            }
+            None => hash_catalog_reset_field(hasher, b"none"),
+        }
+    }
+}
+
+fn catalog_reset_intended_output_token(
+    tapes: &[CatalogResetPreflightTape],
+    preserved: &[CatalogResetPreservedTape],
+) -> Result<String, StateError> {
+    let by_uuid = tapes
+        .iter()
+        .map(|tape| (tape.tape_uuid, tape))
+        .collect::<BTreeMap<_, _>>();
+    let mut preserved = preserved.to_vec();
+    preserved.sort_by_key(|tape| tape.tape_uuid);
+    let mut hasher = Sha256::new();
+    hash_catalog_reset_field(&mut hasher, b"REM-CATALOG-RESET-OUTPUT-V1");
+    for tape in preserved {
+        let source = by_uuid.get(&tape.tape_uuid).ok_or_else(|| {
+            StateError::IndexCorrupt("preserved tape missing from preflight rows".to_string())
+        })?;
+        let generation = source.assignment_generation.checked_add(1).ok_or_else(|| {
+            StateError::IndexCorrupt("catalog reset assignment generation exhausted".to_string())
+        })?;
+        hash_catalog_reset_output_tape(
+            &mut hasher,
+            source,
+            tape.pool_id.as_deref(),
+            generation,
+            if tape.restore_ready {
+                "ready"
+            } else {
+                "recovery_required"
+            },
+        );
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn catalog_reset_current_output_token(tapes: &[CatalogResetPreflightTape]) -> String {
+    let mut tapes = tapes.to_vec();
+    tapes.sort_by_key(|tape| tape.tape_uuid);
+    let mut hasher = Sha256::new();
+    hash_catalog_reset_field(&mut hasher, b"REM-CATALOG-RESET-OUTPUT-V1");
+    for tape in tapes {
+        hash_catalog_reset_output_tape(
+            &mut hasher,
+            &tape,
+            tape.pool_id.as_deref(),
+            tape.assignment_generation,
+            tape.state.as_str(),
+        );
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn hash_catalog_reset_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+fn catalog_reset_fence_path(paths: &StatePaths) -> PathBuf {
+    paths.state_dir.join(CATALOG_RESET_FENCE_FILE)
+}
+
+fn ensure_no_catalog_reset_fence(paths: &StatePaths) -> Result<(), StateError> {
+    let fence = catalog_reset_fence_path(paths);
+    if fence.exists() {
+        return Err(StateError::CatalogResetInProgress(format!(
+            "durable fence {} requires an exact reset rerun",
+            fence.display()
+        )));
+    }
+    Ok(())
+}
+
+fn catalog_reset_fence_evidence(
+    paths: &StatePaths,
+) -> Result<Option<(String, String, String)>, StateError> {
+    let fence = catalog_reset_fence_path(paths);
+    if !fence.exists() {
+        return Ok(None);
+    }
+    let observed = fs::read_to_string(&fence)
+        .map_err(|err| StateError::io_at("read catalog reset fence", &fence, err))?;
+    let lines = observed.lines().collect::<Vec<_>>();
+    let valid_hex = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    };
+    if lines.len() != 4
+        || lines[0] != CATALOG_RESET_FENCE_MAGIC
+        || !valid_hex(lines[1])
+        || !valid_hex(lines[2])
+        || !valid_hex(lines[3])
+    {
+        Err(StateError::CatalogResetInProgress(format!(
+            "fence {} is corrupt",
+            fence.display()
+        )))
+    } else {
+        Ok(Some((
+            lines[1].to_string(),
+            lines[2].to_string(),
+            lines[3].to_string(),
+        )))
+    }
+}
+
+fn catalog_reset_fence_admits_request(
+    paths: &StatePaths,
+    request_digest: &str,
+    preflight_token: &str,
+    output_token: &str,
+) -> Result<bool, StateError> {
+    let Some((stored_request, stored_token, stored_output)) = catalog_reset_fence_evidence(paths)?
+    else {
+        return Ok(false);
+    };
+    if stored_request == request_digest
+        && stored_token == preflight_token
+        && stored_output == output_token
+    {
+        Ok(true)
+    } else {
+        Err(StateError::CatalogResetInProgress(format!(
+            "fence {} belongs to a different reset request or preflight token",
+            catalog_reset_fence_path(paths).display()
+        )))
+    }
+}
+
+fn begin_or_resume_catalog_reset_fence(
+    paths: &StatePaths,
+    request_digest: &str,
+    preflight_token: &str,
+    output_token: &str,
+) -> Result<(), StateError> {
+    let fence = catalog_reset_fence_path(paths);
+    if catalog_reset_fence_admits_request(paths, request_digest, preflight_token, output_token)? {
+        return Ok(());
+    }
+    let expected = format!(
+        "{CATALOG_RESET_FENCE_MAGIC}\n{request_digest}\n{preflight_token}\n{output_token}\n"
+    );
+    let temporary = paths
+        .state_dir
+        .join(format!("{CATALOG_RESET_FENCE_FILE}.new"));
+    remove_file_if_exists(&temporary)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    match options.open(&temporary) {
+        Ok(mut file) => {
+            if let Err(err) = file
+                .write_all(expected.as_bytes())
+                .and_then(|()| file.sync_all())
+            {
+                let _ = remove_file_if_exists(&temporary);
+                return Err(StateError::io_at(
+                    "write catalog reset fence",
+                    &temporary,
+                    err,
+                ));
+            }
+            drop(file);
+            fs::rename(&temporary, &fence)
+                .map_err(|err| StateError::io_at("install catalog reset fence", &fence, err))?;
+            sync_directory(&paths.state_dir)?;
+            Ok(())
+        }
+        Err(err) => Err(StateError::io_at(
+            "create catalog reset fence",
+            &temporary,
+            err,
+        )),
+    }
+}
+
+fn clear_catalog_reset_fence(paths: &StatePaths) -> Result<(), StateError> {
+    let fence = catalog_reset_fence_path(paths);
+    remove_file_if_exists(&fence)?;
+    sync_directory(&paths.state_dir)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CatalogResetPhase {
+    AuthoritativeInputsArchived,
+    SourceCheckpointed,
+    ReplacementSchemaCreated,
+    PoolsProjected,
+    TapesRestored,
+    AuthoritativeInputsCleared,
+    BeforeAtomicSwap,
+    AfterAtomicSwap,
+}
+
+fn reset_catalog_locked(
+    paths: &StatePaths,
+    config: &RemConfig,
+    preserved_tapes: &[CatalogResetPreservedTape],
+    request_digest: &str,
+    preflight_token: &str,
+    output_token: &str,
+) -> Result<(), StateError> {
+    reset_catalog_locked_with_hook(
+        paths,
+        config,
+        preserved_tapes,
+        request_digest,
+        preflight_token,
+        output_token,
+        |_| Ok(()),
+    )
+}
+
+fn reset_catalog_locked_with_hook<F>(
+    paths: &StatePaths,
+    config: &RemConfig,
+    preserved_tapes: &[CatalogResetPreservedTape],
+    request_digest: &str,
+    preflight_token: &str,
+    output_token: &str,
+    mut phase_hook: F,
+) -> Result<(), StateError>
+where
+    F: FnMut(CatalogResetPhase) -> Result<(), StateError>,
+{
+    begin_or_resume_catalog_reset_fence(paths, request_digest, preflight_token, output_token)?;
+    archive_reset_authoritative_inputs(paths)?;
+    phase_hook(CatalogResetPhase::AuthoritativeInputsArchived)?;
+    ensure_state_directories(paths)?;
+
+    // The source remains a complete, reusable catalog until the final atomic
+    // rename. Checkpointing first makes removal of its stale sidecars safe.
+    if paths.sqlite_path.exists() {
+        let source = CatalogIndex::open(&paths.sqlite_path)?;
+        source.prepare_catalog_reset_atomic_swap()?;
+    }
+    phase_hook(CatalogResetPhase::SourceCheckpointed)?;
+
+    let replacement_path = create_unique_reset_sqlite_path(&paths.sqlite_path)?;
+    let replacement_result = (|| {
+        let mut replacement = CatalogIndex::open(&replacement_path)?;
+        phase_hook(CatalogResetPhase::ReplacementSchemaCreated)?;
+        let _config_warnings = project_configured_tape_pools(&mut replacement, config)?;
+        replacement.reconcile_cleaning_prefixes(&config.cleaning.voltag_prefixes)?;
+        phase_hook(CatalogResetPhase::PoolsProjected)?;
+        replacement.restore_catalog_reset_tapes(preserved_tapes)?;
+        phase_hook(CatalogResetPhase::TapesRestored)?;
+        replacement.prepare_catalog_reset_atomic_swap()?;
+        drop(replacement);
+        sync_regular_file(&replacement_path)?;
+
+        // `paths.calibration_dir` is deliberately NOT reset. The durable
+        // allocator advances while every evicted projection disappears.
+        let calibration = CalibrationControlStore::open(&paths.calibration_dir)?;
+        calibration.record_all_maps_evicted("catalog_reset")?;
+        reset_directory_contents(&paths.audit_dir)?;
+        reset_directory_contents(&paths.journal_dir)?;
+        reset_directory_contents(&paths.tape_cache_dir)?;
+        phase_hook(CatalogResetPhase::AuthoritativeInputsCleared)?;
+
+        // The source main file was checkpointed above. Its sidecars can now be
+        // removed without making the source unusable if the process stops
+        // before the atomic rename.
+        remove_sqlite_sidecars(&paths.sqlite_path)?;
+        phase_hook(CatalogResetPhase::BeforeAtomicSwap)?;
+        fs::rename(&replacement_path, &paths.sqlite_path).map_err(|err| {
+            StateError::io_at("atomically replace catalog sqlite", &paths.sqlite_path, err)
+        })?;
+        if let Some(parent) = paths.sqlite_path.parent() {
+            sync_directory(parent)?;
+        }
+        phase_hook(CatalogResetPhase::AfterAtomicSwap)?;
+        clear_catalog_reset_fence(paths)?;
+        Ok(())
+    })();
+    if replacement_result.is_err() {
+        let _ = remove_file_if_exists(&replacement_path);
+        let _ = remove_sqlite_sidecars(&replacement_path);
+    }
+    replacement_result
+}
+
 fn hex_tape_uuid(tape_uuid: [u8; 16]) -> String {
     let mut out = String::with_capacity(32);
     for byte in tape_uuid {
@@ -621,6 +1905,10 @@ fn archive_reset_authoritative_inputs(paths: &StatePaths) -> Result<(), StateErr
     let archive_dir = create_unique_reset_archive_dir(&paths.state_dir)?;
     archive_directory_if_exists(&paths.audit_dir, &archive_dir.join("audit"))?;
     archive_directory_if_exists(&paths.journal_dir, &archive_dir.join("journals"))?;
+    sync_directory(&archive_dir)?;
+    if let Some(root) = archive_dir.parent() {
+        sync_directory(root)?;
+    }
     Ok(())
 }
 
@@ -678,6 +1966,7 @@ fn copy_directory_recursive(source: &Path, destination: &Path) -> Result<(), Sta
         } else if file_type.is_file() {
             fs::copy(&source_path, &destination_path)
                 .map_err(|err| StateError::io_at("copy reset source file", &source_path, err))?;
+            sync_regular_file(&destination_path)?;
         } else {
             return Err(StateError::ConfigInvalid(format!(
                 "refusing to archive non-file state entry {}",
@@ -685,23 +1974,74 @@ fn copy_directory_recursive(source: &Path, destination: &Path) -> Result<(), Sta
             )));
         }
     }
+    sync_directory(destination)?;
     Ok(())
 }
 
-fn remove_sqlite_file_and_sidecars(path: &Path) -> Result<(), StateError> {
-    remove_file_if_exists(path)?;
-    remove_file_if_exists(&path.with_file_name(format!(
-        "{}-wal",
+fn create_unique_reset_sqlite_path(sqlite_path: &Path) -> Result<PathBuf, StateError> {
+    let parent = sqlite_path.parent().ok_or_else(|| {
+        StateError::ConfigInvalid(format!(
+            "catalog sqlite path {} has no parent directory",
+            sqlite_path.display()
+        ))
+    })?;
+    let filename = sqlite_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            StateError::ConfigInvalid(format!(
+                "catalog sqlite path {} has no UTF-8 filename",
+                sqlite_path.display()
+            ))
+        })?;
+    for index in 1..=999_999u32 {
+        let candidate = parent.join(format!(".{filename}.reset-{index:06}"));
+        if !candidate.exists()
+            && !sqlite_sidecar_path(&candidate, "wal").exists()
+            && !sqlite_sidecar_path(&candidate, "shm").exists()
+        {
+            return Ok(candidate);
+        }
+    }
+    Err(StateError::ConfigInvalid(format!(
+        "no free catalog reset replacement name beside {}",
+        sqlite_path.display()
+    )))
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    path.with_file_name(format!(
+        "{}-{suffix}",
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("rem-state.sqlite")
-    )))?;
-    remove_file_if_exists(&path.with_file_name(format!(
-        "{}-shm",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("rem-state.sqlite")
-    )))?;
+    ))
+}
+
+fn remove_sqlite_sidecars(path: &Path) -> Result<(), StateError> {
+    remove_file_if_exists(&sqlite_sidecar_path(path, "wal"))?;
+    remove_file_if_exists(&sqlite_sidecar_path(path, "shm"))?;
+    remove_file_if_exists(&sqlite_sidecar_path(path, "journal"))?;
+    Ok(())
+}
+
+fn sync_regular_file(path: &Path) -> Result<(), StateError> {
+    fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|err| StateError::io_at("fsync catalog reset replacement", path, err))
+}
+
+fn sync_directory(path: &Path) -> Result<(), StateError> {
+    #[cfg(unix)]
+    {
+        fs::File::open(path)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|err| StateError::io_at("fsync catalog directory", path, err))?;
+    }
+
+    #[cfg(not(unix))]
+    let _ = path;
+
     Ok(())
 }
 
@@ -926,6 +2266,1054 @@ pool_id = "camera.copy-a"
                 .as_deref(),
             Some("Camera copy A")
         );
+    }
+
+    #[test]
+    fn scoped_reset_preserves_only_exact_identity_geometry_and_current_pool() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-state-scoped-reset")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).expect("write config");
+        let selected_uuid = [0x91; 16];
+        let discarded_uuid = [0x92; 16];
+        {
+            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            for (tape_uuid, voltag) in [(selected_uuid, "ACM001L9"), (discarded_uuid, "ACM002L9")] {
+                handle
+                    .catalog_index()
+                    .provision_tape(crate::index::ProvisionTapeInput {
+                        tape_uuid,
+                        voltag: voltag.to_string(),
+                        block_size: 512 * 1024,
+                        parity: ParityConfig::None,
+                        force: false,
+                    })
+                    .expect("provision tape");
+            }
+        }
+        fs::write(temp.path().join("audit/source.remaudit"), b"audit").expect("audit marker");
+        fs::write(temp.path().join("journals/source.remjournal"), b"journal")
+            .expect("journal marker");
+        fs::write(temp.path().join("cache/tapes/source.cache"), b"cache").expect("cache marker");
+
+        let admitted = StateHandle::preflight_catalog_reset_from_config_file(
+            &config_path,
+            &["ACM001L9".to_string()],
+            &["ACM002L9".to_string()],
+        )
+        .expect("preflight exact source");
+        let report = StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
+            &config_path,
+            &["ACM001L9".to_string()],
+            &["ACM002L9".to_string()],
+            &admitted.preflight_token,
+        )
+        .expect("scoped reset");
+
+        assert_eq!(report.preserved_tapes.len(), 1);
+        assert_eq!(report.preserved_tapes[0].tape_uuid, selected_uuid);
+        assert_eq!(report.preserved_tapes[0].voltag, "ACM001L9");
+        assert_eq!(
+            report.preserved_tapes[0].pool_id.as_deref(),
+            Some("camera.copy-a")
+        );
+        assert_eq!(
+            report.preserved_tapes[0].state,
+            CatalogResetTapeState::Ready
+        );
+        let mut handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
+        let tapes = handle
+            .catalog_index()
+            .list_tapes(None, TapeKindFilter::All)
+            .expect("list tapes");
+        assert_eq!(tapes.len(), 1);
+        let tape = &tapes[0];
+        assert_eq!(tape.tape_uuid, selected_uuid);
+        assert_eq!(tape.voltag.as_deref(), Some("ACM001L9"));
+        assert_eq!(tape.kind, "data");
+        assert_eq!(tape.pool_id.as_deref(), Some("camera.copy-a"));
+        assert_eq!(tape.assignment_generation, 1);
+        assert_eq!(tape.block_size, Some(512 * 1024));
+        assert_eq!(tape.state, "ready");
+        assert_eq!(tape.last_committed_tape_file, None);
+        assert_eq!(tape.total_committed_ordinals, 0);
+        assert_eq!(tape.written_extent_lba, None);
+        assert_eq!(tape.terminal_finalization, None);
+        assert!(handle
+            .catalog_index()
+            .get_tape(&discarded_uuid)
+            .expect("discarded lookup")
+            .is_none());
+        drop(handle);
+
+        let conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
+            .expect("open reset sqlite");
+        for table in [
+            "tape_files",
+            "object_copies",
+            "catalog_units",
+            "operations",
+            "sessions",
+            "idempotency_keys",
+            "ingested_sources",
+        ] {
+            let count: u64 = conn
+                .query_row(&format!("select count(*) from {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("count reset projection");
+            assert_eq!(count, 0, "{table}");
+        }
+        let archive = temp.path().join("reset-archives/reset-000001");
+        assert_eq!(
+            fs::read(archive.join("audit/source.remaudit")).expect("archived audit"),
+            b"audit"
+        );
+        assert_eq!(
+            fs::read(archive.join("journals/source.remjournal")).expect("archived journal"),
+            b"journal"
+        );
+        assert!(!archive.join("cache/tapes/source.cache").exists());
+    }
+
+    #[test]
+    fn scoped_reset_normalizes_written_and_finalized_tapes_to_recovery_required() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-state-scoped-reset-written")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).expect("write config");
+        let written_uuid = [0x93; 16];
+        let finalized_uuid = [0x94; 16];
+        {
+            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            for (tape_uuid, voltag) in [(written_uuid, "ACM003L9"), (finalized_uuid, "ACM004L9")] {
+                handle
+                    .catalog_index()
+                    .provision_tape(crate::index::ProvisionTapeInput {
+                        tape_uuid,
+                        voltag: voltag.to_string(),
+                        block_size: 256 * 1024,
+                        parity: ParityConfig::None,
+                        force: false,
+                    })
+                    .expect("provision tape");
+            }
+            handle
+                .catalog_index()
+                .seal_tape(written_uuid)
+                .expect("seal written tape");
+            handle
+                .catalog_index()
+                .project_terminal_finalization(crate::index::TerminalFinalizationProjectionInput {
+                    tape_uuid: finalized_uuid,
+                    trigger: crate::checkpoint::TerminalFinalizationTrigger::ReachedLowWatermark,
+                    operation_id: None,
+                    progress: crate::checkpoint::TerminalFinalizationProgress::AfterReplicaC,
+                    edition_digest: [0x31; 32],
+                    layout_digest: [0x32; 32],
+                    outcome: crate::index::TerminalFinalizationOutcome::Finalized,
+                    updated_at_utc: None,
+                })
+                .expect("finalize tape projection");
+        }
+
+        let report = StateHandle::reset_catalog_preserving_from_config_file(
+            &config_path,
+            &["ACM003L9".to_string(), "ACM004L9".to_string()],
+        )
+        .expect("scoped reset");
+        assert!(report
+            .preserved_tapes
+            .iter()
+            .all(|tape| tape.state == CatalogResetTapeState::RecoveryRequired));
+
+        let mut handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
+        for tape_uuid in [written_uuid, finalized_uuid] {
+            let tape = handle
+                .catalog_index()
+                .get_tape(&tape_uuid)
+                .expect("get tape")
+                .expect("preserved tape");
+            assert_eq!(tape.state, "recovery_required");
+            assert_eq!(tape.last_committed_tape_file, None);
+            assert_eq!(tape.total_committed_ordinals, 0);
+            assert_eq!(tape.written_extent_lba, None);
+            assert_eq!(tape.terminal_finalization, None);
+        }
+    }
+
+    #[test]
+    fn scoped_reset_drops_live_guards_but_never_restores_their_tapes_ready() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-state-scoped-reset-guards")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).expect("write config");
+        let guarded = [
+            ([0xA1; 16], "ACM021L9"),
+            ([0xA2; 16], "ACM022L9"),
+            ([0xA3; 16], "ACM023L9"),
+            ([0xA4; 16], "ACM024L9"),
+        ];
+        {
+            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            for (tape_uuid, voltag) in guarded {
+                handle
+                    .catalog_index()
+                    .provision_tape(ProvisionTapeInput {
+                        tape_uuid,
+                        voltag: voltag.to_string(),
+                        block_size: 1024 * 1024,
+                        parity: ParityConfig::None,
+                        force: false,
+                    })
+                    .expect("provision guarded tape");
+            }
+        }
+        let conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
+            .expect("open source sqlite");
+        conn.execute(
+            "insert into sessions(
+               session_id, session_kind, tape_uuid, state, opened_at_utc, updated_at_utc
+             ) values('reset-open-session', 'write', ?1, 'open',
+                      '2026-08-09T00:00:00Z', '2026-08-09T00:00:00Z')",
+            rusqlite::params![guarded[0].0.as_slice()],
+        )
+        .expect("insert open session");
+        conn.execute(
+            "insert into tape_io_fences(
+               tape_uuid, barcode, state, reason, quarantine_id,
+               created_at_utc, updated_at_utc
+             ) values(?1, ?2, 'active', 'test', 'reset-active-fence',
+                      '2026-08-09T00:00:00Z', '2026-08-09T00:00:00Z')",
+            rusqlite::params![guarded[1].0.as_slice(), guarded[1].1],
+        )
+        .expect("insert active fence");
+        conn.execute(
+            "insert into wrap_maps(
+               tape_uuid, descriptors_json, mapped_extent_lba, write_epoch,
+               calibration_generation, harvested_at_utc
+             ) values(?1, '[]', 0, 0, 1, '2026-08-09T00:00:00Z')",
+            rusqlite::params![guarded[2].0.as_slice()],
+        )
+        .expect("insert wrap map");
+        conn.execute(
+            "insert into media_readiness_ops(
+               operation_id, library_serial, drive_element, barcode,
+               phase, state, dirty_scope, started_at_utc, updated_at_utc
+             ) values('reset-readiness', 'LIB-RESET', 1, ?1,
+                      'load', 'running', 'drive+tape',
+                      '2026-08-09T00:00:00Z', '2026-08-09T00:00:00Z')",
+            rusqlite::params![guarded[3].1],
+        )
+        .expect("insert active readiness operation");
+        drop(conn);
+
+        let preserve = guarded
+            .iter()
+            .map(|(_, voltag)| (*voltag).to_string())
+            .collect::<Vec<_>>();
+        let report =
+            StateHandle::reset_catalog_preserving_from_config_file(&config_path, &preserve)
+                .expect("reset guarded tapes");
+        assert_eq!(report.preserved_tapes.len(), guarded.len());
+        assert!(report
+            .preserved_tapes
+            .iter()
+            .all(|tape| tape.state == CatalogResetTapeState::RecoveryRequired));
+
+        let mut handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
+        for (tape_uuid, _) in guarded {
+            assert_eq!(
+                handle
+                    .catalog_index()
+                    .get_tape(&tape_uuid)
+                    .expect("lookup guarded tape")
+                    .expect("preserved tape")
+                    .state,
+                "recovery_required"
+            );
+        }
+        let reset_conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
+            .expect("open replacement sqlite");
+        for table in [
+            "sessions",
+            "tape_io_fences",
+            "wrap_maps",
+            "media_readiness_ops",
+        ] {
+            let count: u64 = reset_conn
+                .query_row(&format!("select count(*) from {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("count discarded guard rows");
+            assert_eq!(count, 0, "{table}");
+        }
+    }
+
+    #[test]
+    fn scoped_reset_selector_failures_precede_archive_or_delete() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-state-scoped-reset-invalid")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).expect("write config");
+        {
+            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            handle
+                .catalog_index()
+                .provision_tape(crate::index::ProvisionTapeInput {
+                    tape_uuid: [0x95; 16],
+                    voltag: "ACM005L9".to_string(),
+                    block_size: 256 * 1024,
+                    parity: ParityConfig::None,
+                    force: false,
+                })
+                .expect("provision tape");
+        }
+        fs::write(temp.path().join("audit/sentinel"), b"unchanged").expect("write sentinel");
+
+        for selectors in [
+            vec!["MISSINGL9".to_string()],
+            vec!["ACM005L9".to_string(), "ACM005L9".to_string()],
+            vec!["".to_string()],
+            vec!["   ".to_string()],
+            vec![" ACM005L9".to_string()],
+        ] {
+            StateHandle::reset_catalog_preserving_from_config_file(&config_path, &selectors)
+                .expect_err("invalid scoped reset must fail");
+            assert_eq!(
+                fs::read(temp.path().join("audit/sentinel")).expect("sentinel survives"),
+                b"unchanged"
+            );
+            assert!(!temp.path().join("reset-archives").exists());
+            let index = CatalogIndex::open_read_only(temp.path().join("index/rem-state.sqlite"))
+                .expect("catalog survives");
+            assert!(index
+                .get_tape_by_voltag("ACM005L9")
+                .expect("lookup")
+                .is_some());
+        }
+
+        let conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
+            .expect("open sqlite");
+        conn.execute(
+            "update tapes set assignment_generation = ?1 where voltag = 'ACM005L9'",
+            rusqlite::params![i64::MAX],
+        )
+        .expect("exhaust assignment generation");
+        drop(conn);
+        StateHandle::reset_catalog_preserving_from_config_file(
+            &config_path,
+            &["ACM005L9".to_string()],
+        )
+        .expect_err("exhausted assignment generation must fail");
+        assert_eq!(
+            fs::read(temp.path().join("audit/sentinel")).expect("sentinel survives"),
+            b"unchanged"
+        );
+        assert!(!temp.path().join("reset-archives").exists());
+    }
+
+    #[test]
+    fn scoped_reset_preflight_token_refuses_source_identity_geometry_state_and_pool_drift() {
+        for (label, mutation) in [
+            (
+                "uuid",
+                "update tapes set tape_uuid = X'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB' where voltag = 'ACM031L9'",
+            ),
+            (
+                "geometry",
+                "update tapes set block_size = 524288 where voltag = 'ACM031L9'",
+            ),
+            (
+                "state",
+                "update tapes set state = 'sealed' where voltag = 'ACM031L9'",
+            ),
+            (
+                "pool",
+                "update tapes set pool_id = null where voltag = 'ACM031L9'",
+            ),
+        ] {
+            let temp = tempfile::Builder::new()
+                .prefix(&format!("remanence-state-reset-token-{label}"))
+                .tempdir()
+                .expect("temp dir");
+            let config_path = temp.path().join("config.toml");
+            fs::write(&config_path, config_text(temp.path())).expect("write config");
+            {
+                let mut handle =
+                    StateHandle::open_from_config_file(&config_path).expect("open state");
+                handle
+                    .catalog_index()
+                    .provision_tape(ProvisionTapeInput {
+                        tape_uuid: [0xBA; 16],
+                        voltag: "ACM031L9".to_string(),
+                        block_size: 1024 * 1024,
+                        parity: ParityConfig::None,
+                        force: false,
+                    })
+                    .expect("provision source");
+                handle
+                    .catalog_index()
+                    .project_tape_pool_membership([0xBA; 16], "camera.copy-a")
+                    .expect("assign source pool");
+            }
+            let admitted = StateHandle::preflight_catalog_reset_from_config_file(
+                &config_path,
+                &["ACM031L9".to_string()],
+                &[],
+            )
+            .expect("preflight source");
+            fs::write(temp.path().join("audit/sentinel"), b"unchanged").expect("sentinel");
+            let conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
+                .expect("open source sqlite");
+            conn.execute(mutation, []).expect("mutate source evidence");
+            drop(conn);
+
+            let result = StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
+                &config_path,
+                &["ACM031L9".to_string()],
+                &[],
+                &admitted.preflight_token,
+            );
+            let error = match result {
+                Err(error) => error,
+                Ok(report) => {
+                    panic!("{label}: source drift unexpectedly passed: {report:?}")
+                }
+            };
+            assert!(
+                matches!(error, StateError::ConfigInvalid(_)),
+                "{label}: {error}"
+            );
+            assert_eq!(
+                fs::read(temp.path().join("audit/sentinel")).expect("sentinel survives"),
+                b"unchanged",
+                "{label}"
+            );
+            assert!(
+                !temp.path().join("reset-archives").exists(),
+                "{label}: mutation must not start"
+            );
+            assert!(!catalog_reset_fence_path(&StatePaths::from_config(
+                &config_path,
+                &load_config(&config_path).expect("config")
+            ))
+            .exists());
+        }
+
+        #[cfg(unix)]
+        {
+            let temp = tempfile::Builder::new()
+                .prefix("remanence-state-reset-token-symlink")
+                .tempdir()
+                .expect("temp dir");
+            let config_path = temp.path().join("config.toml");
+            let config_link = temp.path().join("config-link.toml");
+            fs::write(&config_path, config_text(temp.path())).expect("write config");
+            {
+                let mut handle =
+                    StateHandle::open_from_config_file(&config_path).expect("open state");
+                handle
+                    .catalog_index()
+                    .provision_tape(ProvisionTapeInput {
+                        tape_uuid: [0xBC; 16],
+                        voltag: "ACM032L9".to_string(),
+                        block_size: 1024 * 1024,
+                        parity: ParityConfig::None,
+                        force: false,
+                    })
+                    .expect("provision source");
+            }
+            let admitted = StateHandle::preflight_catalog_reset_from_config_file(
+                &config_path,
+                &["ACM032L9".to_string()],
+                &[],
+            )
+            .expect("direct-path preflight");
+            std::os::unix::fs::symlink(&config_path, &config_link).expect("symlink config");
+            let error =
+                StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
+                    &config_link,
+                    &["ACM032L9".to_string()],
+                    &[],
+                    &admitted.preflight_token,
+                )
+                .expect_err("direct-to-symlink path-shape drift must fail");
+            assert!(matches!(error, StateError::ConfigInvalid(_)));
+            assert!(!temp.path().join("reset-archives").exists());
+        }
+    }
+
+    #[test]
+    fn scoped_reset_ambiguous_or_incompatible_catalog_fails_before_mutation() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-state-scoped-reset-corrupt")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).expect("write config");
+        {
+            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            handle
+                .catalog_index()
+                .provision_tape(crate::index::ProvisionTapeInput {
+                    tape_uuid: [0x96; 16],
+                    voltag: "ACM006L9".to_string(),
+                    block_size: 256 * 1024,
+                    parity: ParityConfig::None,
+                    force: false,
+                })
+                .expect("provision tape");
+        }
+        fs::write(temp.path().join("audit/sentinel"), b"unchanged").expect("write sentinel");
+        let sqlite_path = temp.path().join("index/rem-state.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&sqlite_path).expect("open sqlite");
+            conn.execute("drop index tapes_voltag_unique", [])
+                .expect("drop unique index");
+            conn.execute(
+                "insert into tapes(
+                   tape_uuid, voltag, kind, block_size,
+                   highest_protected_ordinal, total_committed_ordinals,
+                   state, updated_at_utc
+                 ) values(?1, 'ACM006L9', 'data', 262144,
+                          X'0000000000000000', X'0000000000000000',
+                          'ready', '2026-08-09T00:00:00Z')",
+                rusqlite::params![[0x97_u8; 16].as_slice()],
+            )
+            .expect("insert ambiguous tape");
+        }
+        let error = StateHandle::reset_catalog_preserving_from_config_file(
+            &config_path,
+            &["ACM006L9".to_string()],
+        )
+        .expect_err("ambiguous catalog must fail");
+        assert!(matches!(error, StateError::AmbiguousCatalogLookup(_)));
+        assert_eq!(
+            fs::read(temp.path().join("audit/sentinel")).expect("sentinel survives"),
+            b"unchanged"
+        );
+        assert!(!temp.path().join("reset-archives").exists());
+
+        let schema_temp = tempfile::Builder::new()
+            .prefix("remanence-state-scoped-reset-schema")
+            .tempdir()
+            .expect("temp dir");
+        let schema_config = schema_temp.path().join("config.toml");
+        fs::write(&schema_config, config_text(schema_temp.path())).expect("write config");
+        {
+            let _handle = StateHandle::open_from_config_file(&schema_config).expect("open state");
+        }
+        fs::write(schema_temp.path().join("audit/sentinel"), b"unchanged").expect("write sentinel");
+        let conn = rusqlite::Connection::open(schema_temp.path().join("index/rem-state.sqlite"))
+            .expect("open sqlite");
+        conn.pragma_update(None, "user_version", crate::index::SCHEMA_VERSION + 1)
+            .expect("advance schema");
+        drop(conn);
+        StateHandle::reset_catalog_preserving_from_config_file(
+            &schema_config,
+            &["ACM999L9".to_string()],
+        )
+        .expect_err("incompatible schema must fail");
+        assert_eq!(
+            fs::read(schema_temp.path().join("audit/sentinel")).expect("sentinel survives"),
+            b"unchanged"
+        );
+        assert!(!schema_temp.path().join("reset-archives").exists());
+
+        let config_temp = tempfile::Builder::new()
+            .prefix("remanence-state-scoped-reset-config")
+            .tempdir()
+            .expect("temp dir");
+        let invalid_config_path = config_temp.path().join("config.toml");
+        fs::write(&invalid_config_path, config_text(config_temp.path())).expect("write config");
+        {
+            let _handle = StateHandle::open_from_config_file(&invalid_config_path)
+                .expect("create valid source state");
+        }
+        fs::write(config_temp.path().join("audit/sentinel"), b"unchanged").expect("write sentinel");
+        let invalid_config = format!(
+            "{}\n[[tape_pools]]\nid = \"camera.copy-a\"\n",
+            config_text(config_temp.path())
+        );
+        fs::write(&invalid_config_path, invalid_config).expect("replace with invalid config");
+        StateHandle::reset_catalog_preserving_from_config_file(
+            &invalid_config_path,
+            &["ACM999L9".to_string()],
+        )
+        .expect_err("invalid config must fail");
+        assert_eq!(
+            fs::read(config_temp.path().join("audit/sentinel")).expect("sentinel survives"),
+            b"unchanged"
+        );
+        assert!(!config_temp.path().join("reset-archives").exists());
+    }
+
+    #[test]
+    fn scoped_reset_interruption_cuts_leave_a_rerunnable_catalog() {
+        for cut in [
+            CatalogResetPhase::AuthoritativeInputsArchived,
+            CatalogResetPhase::SourceCheckpointed,
+            CatalogResetPhase::ReplacementSchemaCreated,
+            CatalogResetPhase::PoolsProjected,
+            CatalogResetPhase::TapesRestored,
+            CatalogResetPhase::AuthoritativeInputsCleared,
+            CatalogResetPhase::BeforeAtomicSwap,
+            CatalogResetPhase::AfterAtomicSwap,
+        ] {
+            let temp = tempfile::Builder::new()
+                .prefix("remanence-state-scoped-reset-cut")
+                .tempdir()
+                .expect("temp dir");
+            let config_path = temp.path().join("config.toml");
+            fs::write(&config_path, config_text(temp.path())).expect("write config");
+            let tape_uuid = [0x98; 16];
+            {
+                let mut handle =
+                    StateHandle::open_from_config_file(&config_path).expect("open state");
+                handle
+                    .catalog_index()
+                    .provision_tape(crate::index::ProvisionTapeInput {
+                        tape_uuid,
+                        voltag: "ACM008L9".to_string(),
+                        block_size: 1024 * 1024,
+                        parity: ParityConfig::None,
+                        force: false,
+                    })
+                    .expect("provision tape");
+                handle
+                    .catalog_index()
+                    .seal_tape(tape_uuid)
+                    .expect("seal tape");
+            }
+            fs::write(temp.path().join("audit/sentinel"), b"audit").expect("write sentinel");
+            let admitted = StateHandle::preflight_catalog_reset_from_config_file(
+                &config_path,
+                &["ACM008L9".to_string()],
+                &[],
+            )
+            .expect("preflight cut fixture");
+            let config = load_config(&config_path).expect("load config");
+            let paths = StatePaths::from_config(&config_path, &config);
+            let config_bytes = fs::read(&config_path).expect("config bytes");
+            let request_digest = catalog_reset_request_digest(
+                &paths,
+                &config_bytes,
+                &["ACM008L9".to_string()],
+                &[],
+                false,
+                &admitted.preflight_token,
+            )
+            .expect("request digest");
+            let lock = StateLockGuard::acquire(&paths.state_dir).expect("acquire reset lock");
+            let preserved = CatalogIndex::open_read_only(&paths.sqlite_path)
+                .expect("open source")
+                .capture_catalog_reset_tapes(&["ACM008L9".to_string()], &config.tape_pool_rules)
+                .expect("capture source");
+            let output_token = catalog_reset_intended_output_token(&admitted.tapes, &preserved)
+                .expect("output token");
+            let error = reset_catalog_locked_with_hook(
+                &paths,
+                &config,
+                &preserved,
+                &request_digest,
+                &admitted.preflight_token,
+                &output_token,
+                |phase| {
+                    if phase == cut {
+                        Err(StateError::ConfigInvalid(format!(
+                            "injected reset interruption at {phase:?}"
+                        )))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .expect_err("cut must interrupt reset");
+            assert!(error.to_string().contains("injected reset interruption"));
+            drop(lock);
+
+            let open_error = StateHandle::open_from_config_file(&config_path)
+                .expect_err("durable reset fence must block ordinary state open");
+            assert!(
+                matches!(open_error, StateError::CatalogResetInProgress(_)),
+                "{open_error}"
+            );
+
+            let source_after_cut = CatalogIndex::open_read_only(&paths.sqlite_path)
+                .expect("a complete catalog survives every cut");
+            let tape_after_cut = source_after_cut
+                .get_tape_by_voltag("ACM008L9")
+                .expect("lookup after cut")
+                .expect("selected identity survives cut");
+            assert_eq!(tape_after_cut.tape_uuid, tape_uuid);
+            drop(source_after_cut);
+
+            if cut == CatalogResetPhase::SourceCheckpointed {
+                let conn = rusqlite::Connection::open(&paths.sqlite_path).expect("open cut sqlite");
+                conn.execute(
+                    "update tapes set tape_uuid = X'99999999999999999999999999999999' where voltag = 'ACM008L9'",
+                    [],
+                )
+                .expect("inject pre-swap source drift");
+                drop(conn);
+                let drift =
+                    StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
+                        &config_path,
+                        &["ACM008L9".to_string()],
+                        &[],
+                        &admitted.preflight_token,
+                    )
+                    .expect_err("pre-swap source drift must refuse resume");
+                assert!(matches!(drift, StateError::CatalogResetInProgress(_)));
+                let conn =
+                    rusqlite::Connection::open(&paths.sqlite_path).expect("repair cut sqlite");
+                conn.execute(
+                    "update tapes set tape_uuid = ?1 where voltag = 'ACM008L9'",
+                    rusqlite::params![tape_uuid.as_slice()],
+                )
+                .expect("remove pre-swap source drift");
+                conn.execute(
+                    "update tapes set assignment_generation = assignment_generation + 1,
+                                      state = 'recovery_required'
+                     where voltag = 'ACM008L9'",
+                    [],
+                )
+                .expect("mimic intended tape output before swap");
+                drop(conn);
+                StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
+                    &config_path,
+                    &["ACM008L9".to_string()],
+                    &[],
+                    &admitted.preflight_token,
+                )
+                .expect_err("nonempty authority directories forbid false post-swap recognition");
+                let conn = rusqlite::Connection::open(&paths.sqlite_path)
+                    .expect("restore pre-swap source state");
+                conn.execute(
+                    "update tapes set assignment_generation = assignment_generation - 1,
+                                      state = 'sealed'
+                     where voltag = 'ACM008L9'",
+                    [],
+                )
+                .expect("restore source state after false-output probe");
+            }
+            if cut == CatalogResetPhase::AfterAtomicSwap {
+                let conn =
+                    rusqlite::Connection::open(&paths.sqlite_path).expect("open output sqlite");
+                conn.execute(
+                    "update tapes set total_committed_ordinals = X'0000000000000001' where voltag = 'ACM008L9'",
+                    [],
+                )
+                .expect("inject stale output counter");
+                drop(conn);
+                StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
+                    &config_path,
+                    &["ACM008L9".to_string()],
+                    &[],
+                    &admitted.preflight_token,
+                )
+                .expect_err("stale output counter must refuse resume");
+                let conn =
+                    rusqlite::Connection::open(&paths.sqlite_path).expect("repair output sqlite");
+                conn.execute(
+                    "update tapes set total_committed_ordinals = X'0000000000000000' where voltag = 'ACM008L9'",
+                    [],
+                )
+                .expect("remove stale output counter");
+                conn.execute(
+                    "insert into object_files(object_id, file_id, path, size_bytes, file_sha256, chunk_count)
+                     values('stale', 'stale', 'stale', X'0000000000000000', X'', X'0000000000000000')",
+                    [],
+                )
+                .expect("inject omitted authority row");
+                drop(conn);
+                StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
+                    &config_path,
+                    &["ACM008L9".to_string()],
+                    &[],
+                    &admitted.preflight_token,
+                )
+                .expect_err("stale output authority must refuse resume");
+                let conn =
+                    rusqlite::Connection::open(&paths.sqlite_path).expect("clean output sqlite");
+                conn.execute("delete from object_files", [])
+                    .expect("remove omitted authority row");
+            }
+
+            let preflight = StateHandle::preflight_catalog_reset_from_config_file(
+                &config_path,
+                &["ACM008L9".to_string()],
+                &[],
+            )
+            .expect("exact preflight admits interrupted reset resume");
+            assert!(preflight.resume_exact, "resume status after {cut:?}");
+            assert_eq!(preflight.request_digest, request_digest);
+            let different = StateHandle::preflight_catalog_reset_from_config_file(
+                &config_path,
+                &[],
+                &["ACM008L9".to_string()],
+            )
+            .expect_err("different preflight must not cross an existing fence");
+            assert!(matches!(different, StateError::CatalogResetInProgress(_)));
+
+            let report = StateHandle::reset_catalog_preserving_from_config_file(
+                &config_path,
+                &["ACM008L9".to_string()],
+            )
+            .expect("rerun after interruption");
+            assert_eq!(report.preserved_tapes.len(), 1);
+            assert_eq!(report.preserved_tapes[0].tape_uuid, tape_uuid);
+            assert_eq!(report.preserved_tapes[0].voltag, "ACM008L9");
+            assert_eq!(
+                report.preserved_tapes[0].state,
+                CatalogResetTapeState::RecoveryRequired
+            );
+            let index_dir = temp.path().join("index");
+            let stale_replacements = fs::read_dir(index_dir)
+                .expect("read index dir")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".reset-"))
+                .count();
+            assert_eq!(stale_replacements, 0, "stale replacement after {cut:?}");
+            assert!(!catalog_reset_fence_path(&paths).exists());
+            let _handle = StateHandle::open_from_config_file(&config_path)
+                .expect("ordinary open resumes after exact rerun clears fence");
+        }
+    }
+
+    #[test]
+    fn reset_preflight_lists_all_kinds_and_rechecks_admission_before_mutation() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-state-reset-preflight")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).expect("write config");
+        let data_uuid = [0xA0; 16];
+        let cleaning_uuid = [0xA1; 16];
+        let erase_uuid = [0xA2; 16];
+        let retired_uuid = [0xA3; 16];
+        {
+            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            for (tape_uuid, voltag) in [
+                (data_uuid, "ACM010L9"),
+                (cleaning_uuid, "CLN010L9"),
+                (erase_uuid, "ACM011L9"),
+                (retired_uuid, "ACM012L9"),
+            ] {
+                handle
+                    .catalog_index()
+                    .provision_tape(crate::index::ProvisionTapeInput {
+                        tape_uuid,
+                        voltag: voltag.to_string(),
+                        block_size: 1024 * 1024,
+                        parity: ParityConfig::None,
+                        force: false,
+                    })
+                    .expect("provision tape");
+            }
+            handle
+                .catalog_index()
+                .set_tape_kind(&cleaning_uuid, "cleaning")
+                .expect("set cleaning kind");
+            handle
+                .retire_tape(crate::index::RetireTapeInput {
+                    tape_uuid: retired_uuid,
+                    reason: "test retired history".to_string(),
+                })
+                .expect("retire unbound history");
+        }
+        let preserve = vec!["ACM010L9".to_string()];
+        let allow_erase = vec!["CLN010L9".to_string(), "ACM011L9".to_string()];
+        let report = StateHandle::preflight_catalog_reset_from_config_file(
+            &config_path,
+            &preserve,
+            &allow_erase,
+        )
+        .expect("all-kinds preflight");
+        assert_eq!(report.tapes.len(), 4);
+        assert!(report
+            .tapes
+            .iter()
+            .any(|tape| tape.tape_uuid == cleaning_uuid && tape.kind == "cleaning"));
+        assert!(report.tapes.iter().any(|tape| {
+            tape.tape_uuid == retired_uuid && tape.state == "retired" && tape.voltag.is_none()
+        }));
+        assert_eq!(report.paths.config.configured_path, config_path);
+        assert_eq!(
+            report.paths.config.canonical_path,
+            fs::canonicalize(&config_path).expect("canonical config")
+        );
+        assert!(!report.paths.config.configured_path_is_symlink);
+
+        let sqlite_path = temp.path().join("index/rem-state.sqlite");
+        let conn = rusqlite::Connection::open(&sqlite_path).expect("open sqlite");
+        conn.execute(
+            "update tapes set voltag = null where tape_uuid = ?1",
+            rusqlite::params![erase_uuid.as_slice()],
+        )
+        .expect("make active row unbound");
+        drop(conn);
+        StateHandle::preflight_catalog_reset_from_config_file(
+            &config_path,
+            &preserve,
+            &allow_erase,
+        )
+        .expect_err("only unbound retired history may sit outside allowlists");
+        let conn = rusqlite::Connection::open(&sqlite_path).expect("reopen sqlite");
+        conn.execute(
+            "update tapes set voltag = 'ACM011L9' where tape_uuid = ?1",
+            rusqlite::params![erase_uuid.as_slice()],
+        )
+        .expect("restore active binding");
+        drop(conn);
+
+        // Advisory preflight does not authorize a later changed catalog. The
+        // mutating API repeats admission under its own exclusive lock.
+        {
+            let mut handle =
+                StateHandle::open_from_config_file(&config_path).expect("reopen state");
+            handle
+                .catalog_index()
+                .provision_tape(crate::index::ProvisionTapeInput {
+                    tape_uuid: [0xA4; 16],
+                    voltag: "ACM013L9".to_string(),
+                    block_size: 1024 * 1024,
+                    parity: ParityConfig::None,
+                    force: false,
+                })
+                .expect("add admission drift");
+        }
+        fs::write(temp.path().join("audit/sentinel"), b"unchanged").expect("write sentinel");
+        StateHandle::reset_catalog_preserving_with_allowlist_from_config_file(
+            &config_path,
+            &preserve,
+            &allow_erase,
+        )
+        .expect_err("new bound tape must fail repeated admission");
+        assert_eq!(
+            fs::read(temp.path().join("audit/sentinel")).expect("sentinel survives"),
+            b"unchanged"
+        );
+        assert!(!catalog_reset_fence_path(&StatePaths::from_config(
+            &config_path,
+            &load_config(&config_path).expect("config")
+        ))
+        .exists());
+    }
+
+    #[test]
+    fn reset_fence_binds_config_contents_and_rejects_changed_resume() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-state-reset-fence-config")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let original_config = config_text(temp.path());
+        fs::write(&config_path, &original_config).expect("write config");
+        {
+            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            handle
+                .catalog_index()
+                .provision_tape(crate::index::ProvisionTapeInput {
+                    tape_uuid: [0xA5; 16],
+                    voltag: "ACM014L9".to_string(),
+                    block_size: 1024 * 1024,
+                    parity: ParityConfig::None,
+                    force: false,
+                })
+                .expect("provision tape");
+        }
+        let config = load_config(&config_path).expect("load config");
+        let admitted = StateHandle::preflight_catalog_reset_from_config_file(
+            &config_path,
+            &["ACM014L9".to_string()],
+            &[],
+        )
+        .expect("preflight config fixture");
+        let paths = StatePaths::from_config(&config_path, &config);
+        let config_bytes = fs::read(&config_path).expect("config bytes");
+        let digest = catalog_reset_request_digest(
+            &paths,
+            &config_bytes,
+            &["ACM014L9".to_string()],
+            &[],
+            false,
+            &admitted.preflight_token,
+        )
+        .expect("request digest");
+        let lock = StateLockGuard::acquire(&paths.state_dir).expect("reset lock");
+        let preserved = CatalogIndex::open_read_only(&paths.sqlite_path)
+            .expect("source")
+            .capture_catalog_reset_tapes(&["ACM014L9".to_string()], &config.tape_pool_rules)
+            .expect("capture");
+        let output_token =
+            catalog_reset_intended_output_token(&admitted.tapes, &preserved).expect("output token");
+        reset_catalog_locked_with_hook(
+            &paths,
+            &config,
+            &preserved,
+            &digest,
+            &admitted.preflight_token,
+            &output_token,
+            |phase| {
+                if phase == CatalogResetPhase::SourceCheckpointed {
+                    Err(StateError::ConfigInvalid("injected config cut".to_string()))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("interrupt reset");
+        drop(lock);
+
+        fs::write(
+            &config_path,
+            format!("{original_config}\n# changed bytes\n"),
+        )
+        .expect("change config bytes");
+        let changed_preflight = StateHandle::preflight_catalog_reset_from_config_file(
+            &config_path,
+            &["ACM014L9".to_string()],
+            &[],
+        )
+        .expect_err("changed config bytes must not preflight as an exact resume");
+        assert!(matches!(
+            changed_preflight,
+            StateError::CatalogResetInProgress(_)
+        ));
+        let changed = StateHandle::reset_catalog_preserving_from_config_file(
+            &config_path,
+            &["ACM014L9".to_string()],
+        )
+        .expect_err("same path with changed config must not resume");
+        assert!(matches!(changed, StateError::CatalogResetInProgress(_)));
+        assert!(catalog_reset_fence_path(&paths).exists());
+
+        fs::write(&config_path, original_config).expect("restore exact config bytes");
+        let exact_preflight = StateHandle::preflight_catalog_reset_from_config_file(
+            &config_path,
+            &["ACM014L9".to_string()],
+            &[],
+        )
+        .expect("exact config bytes admit resume");
+        assert!(exact_preflight.resume_exact);
+        assert_eq!(exact_preflight.request_digest, digest);
+        StateHandle::reset_catalog_preserving_from_config_file(
+            &config_path,
+            &["ACM014L9".to_string()],
+        )
+        .expect("exact request resumes");
+        assert!(!catalog_reset_fence_path(&paths).exists());
     }
 
     #[test]
@@ -1472,6 +3860,113 @@ pool_id = "camera.copy-a"
                 .expect("second delete"),
             "eviction is idempotent"
         );
+    }
+
+    #[test]
+    fn state_handle_reprovision_evicts_old_identity_calibration() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-state-reprovision-calibration")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).expect("write config");
+        let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+        let old_uuid = [0x45; 16];
+        let new_uuid = [0x46; 16];
+        handle
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: old_uuid,
+                voltag: "ACM045L9".to_string(),
+                block_size: 1024 * 1024,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision old identity");
+        let transition = handle
+            .calibration_control()
+            .record_harvest_success(old_uuid, 0)
+            .expect("calibrate old identity");
+        let crate::calibration::HarvestTransition::Calibrated {
+            write_epoch,
+            calibration_generation,
+        } = transition
+        else {
+            panic!("expected calibrated transition: {transition:?}");
+        };
+        handle
+            .catalog_index()
+            .upsert_wrap_map(&wrap_map_record(
+                old_uuid,
+                write_epoch,
+                calibration_generation,
+            ))
+            .expect("store old identity wrap map");
+
+        handle
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: old_uuid,
+                voltag: "ACM045L9".to_string(),
+                block_size: 512 * 1024,
+                parity: ParityConfig::None,
+                force: true,
+            })
+            .expect("reprovision geometry under the same identity");
+        let after_geometry_change = handle.calibration_control().row(old_uuid);
+        assert_eq!(
+            after_geometry_change.state,
+            crate::calibration::VolumeCalibrationState::Uncalibrated
+        );
+        assert!(after_geometry_change.calibration_generation > calibration_generation);
+        assert!(handle
+            .catalog_index()
+            .get_wrap_map(&old_uuid)
+            .expect("map lookup after geometry change")
+            .is_none());
+
+        let recalibrated = handle
+            .calibration_control()
+            .record_harvest_success(old_uuid, write_epoch)
+            .expect("recalibrate old identity");
+        let crate::calibration::HarvestTransition::Calibrated {
+            calibration_generation: recalibrated_generation,
+            ..
+        } = recalibrated
+        else {
+            panic!("expected recalibrated transition: {recalibrated:?}");
+        };
+        handle
+            .catalog_index()
+            .upsert_wrap_map(&wrap_map_record(
+                old_uuid,
+                write_epoch,
+                recalibrated_generation,
+            ))
+            .expect("store replacement wrap map");
+
+        handle
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: new_uuid,
+                voltag: "ACM045L9".to_string(),
+                block_size: 512 * 1024,
+                parity: ParityConfig::None,
+                force: true,
+            })
+            .expect("reprovision physical identity");
+
+        assert!(handle
+            .catalog_index()
+            .get_wrap_map(&old_uuid)
+            .expect("old wrap map lookup")
+            .is_none());
+        let old_control = handle.calibration_control().row(old_uuid);
+        assert_eq!(
+            old_control.state,
+            crate::calibration::VolumeCalibrationState::Uncalibrated
+        );
+        assert!(old_control.calibration_generation > recalibrated_generation);
+        assert!(!handle
+            .calibration_control()
+            .is_map_servable(old_uuid, write_epoch));
     }
 
     /// §6.5 "catalog projection rebuild" row: rebuild evicts the map

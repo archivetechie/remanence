@@ -1197,6 +1197,9 @@ enum Command {
 enum LocalCatalogCommand {
     /// Destructively reset local Remanence catalog state from the configured paths.
     Reset(CatalogResetArgs),
+
+    /// Read-only all-kinds admission check for an exact scoped reset request.
+    ResetPreflight(CatalogResetPreflightArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1208,6 +1211,36 @@ struct CatalogResetArgs {
     /// Required confirmation flag.
     #[arg(long = "i-understand-this-erases-the-catalog")]
     i_understand_this_erases_the_catalog: bool,
+
+    /// Retain only this exact tape identity/geometry across reset (repeatable).
+    /// Written or finalized tapes return as recovery_required; no object,
+    /// tape-file, audit, journal, or physical-prefix authority is retained.
+    #[arg(long = "preserve-tape-voltag", value_name = "VOLTAG")]
+    preserve_tape_voltags: Vec<String>,
+
+    /// Permit this exact bound tape to be erased instead of preserved
+    /// (repeatable). Every bound nonretired tape must appear in one list.
+    #[arg(long = "allow-erase-tape-voltag", value_name = "VOLTAG")]
+    allow_erase_tape_voltags: Vec<String>,
+
+    /// Exact admission token returned by `catalog reset-preflight`.
+    #[arg(long, value_name = "SHA256")]
+    expected_preflight_token: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct CatalogResetPreflightArgs {
+    /// Path to `/etc/rem/config.toml`.
+    #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
+    config: PathBuf,
+
+    /// Retain this exact tape identity/geometry across reset (repeatable).
+    #[arg(long = "preserve-tape-voltag", value_name = "VOLTAG")]
+    preserve_tape_voltags: Vec<String>,
+
+    /// Permit this exact bound tape to be erased instead (repeatable).
+    #[arg(long = "allow-erase-tape-voltag", value_name = "VOLTAG")]
+    allow_erase_tape_voltags: Vec<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1238,6 +1271,9 @@ enum CatalogClientCommand {
         /// Restrict to one tape pool.
         #[arg(long, value_name = "POOL")]
         pool: Option<String>,
+        /// Restrict by tape kind; `all` includes data and cleaning rows.
+        #[arg(long, value_enum, default_value_t = CatalogTapeKindArg::Data)]
+        kind: CatalogTapeKindArg,
     },
 
     /// Get one cataloged tape by UUID.
@@ -1449,6 +1485,24 @@ enum CatalogUnitOriginFilterArg {
     All,
     Native,
     Foreign,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum CatalogTapeKindArg {
+    #[default]
+    Data,
+    Cleaning,
+    All,
+}
+
+impl CatalogTapeKindArg {
+    const fn as_request_str(self) -> &'static str {
+        match self {
+            Self::Data => "data",
+            Self::Cleaning => "cleaning",
+            Self::All => "all",
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -4672,15 +4726,9 @@ fn run_catalog_client_command(
                 .map_err(DaemonClientError::from)?;
             let mut client = pb::catalog_client::CatalogClient::new(channel);
             match command {
-                CatalogClientCommand::Tapes { pool } => {
+                CatalogClientCommand::Tapes { pool, kind } => {
                     let tapes = client
-                        .list_tapes(pb::ListTapesRequest {
-                            library_uuid: Vec::new(),
-                            page_token: None,
-                            page_size: 0,
-                            pool_id: pool.clone().unwrap_or_default(),
-                            kind: "data".to_string(),
-                        })
+                        .list_tapes(catalog_tapes_request(pool.as_deref(), *kind))
                         .await
                         .map_err(drive_status_error)?
                         .into_inner()
@@ -4779,6 +4827,16 @@ fn run_catalog_client_command(
         })
     });
     finish_daemon_client_result(result, json_output, err)
+}
+
+fn catalog_tapes_request(pool: Option<&str>, kind: CatalogTapeKindArg) -> pb::ListTapesRequest {
+    pb::ListTapesRequest {
+        library_uuid: Vec::new(),
+        page_token: None,
+        page_size: 0,
+        pool_id: pool.unwrap_or_default().to_string(),
+        kind: kind.as_request_str().to_string(),
+    }
 }
 
 fn run_audit_client_command(
@@ -5752,11 +5810,12 @@ fn print_tape_line(tape: &pb::Tape, out: &mut dyn Write) {
     let pool = or_dash(tape.pool_id.as_deref());
     let _ = writeln!(
         out,
-        "{tape_uuid}  {voltag}  {}  state={}  pool={pool}  last_file={}",
+        "{tape_uuid}  {voltag}  {}  kind={}  state={}  pool={pool}  last_file={}",
         // A tape nobody has read yet has no body format and no committed tape
         // file. It used to print an empty format and last_file=0 -- which reads
         // as "tape file 0 is committed", the first one, rather than "none are".
         or_dash(tape.body_format.as_deref()),
+        or_dash(tape.kind.as_deref()),
         tape_state_name(tape.state),
         or_dash_display(tape.last_committed_tape_file)
     );
@@ -6262,6 +6321,8 @@ fn tape_json(tape: &pb::Tape) -> Value {
         "stripes_per_neighborhood": tape.stripes_per_neighborhood,
         "last_committed_tape_file": tape.last_committed_tape_file.map(|value| value.to_string()),
         "written_extent_lba": tape.written_extent_lba.map(|value| value.to_string()),
+        "kind": tape.kind,
+        "scheme_id": tape.scheme_id,
         "state": tape_state_name(tape.state),
         "updated_at": timestamp_value(tape.updated_at.as_ref()),
         "pool_id": tape.pool_id,
@@ -6728,6 +6789,7 @@ fn run_local_catalog_command(
 ) -> ExitCode {
     match command {
         LocalCatalogCommand::Reset(args) => run_catalog_reset(args, out, err),
+        LocalCatalogCommand::ResetPreflight(args) => run_catalog_reset_preflight(args, out, err),
     }
 }
 
@@ -6744,13 +6806,113 @@ fn run_catalog_reset(
         return ExitCode::from(2);
     }
 
-    match remanence_state::StateHandle::reset_catalog_from_config_file(&args.config) {
-        Ok(()) => {
-            let _ = writeln!(out, "catalog reset ok");
+    let result = if args.preserve_tape_voltags.is_empty()
+        && args.allow_erase_tape_voltags.is_empty()
+    {
+        remanence_state::StateHandle::reset_catalog_from_config_file(&args.config).map(|()| None)
+    } else {
+        let Some(expected_preflight_token) = args.expected_preflight_token.as_deref() else {
+            let _ = writeln!(
+                err,
+                "error: scoped catalog reset requires --expected-preflight-token from reset-preflight"
+            );
+            return ExitCode::from(2);
+        };
+        remanence_state::StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
+            &args.config,
+            &args.preserve_tape_voltags,
+            &args.allow_erase_tape_voltags,
+            expected_preflight_token,
+        )
+        .map(Some)
+    };
+    match result {
+        Ok(report) => {
+            if let Some(report) = report {
+                let preserved = report
+                    .preserved_tapes
+                    .iter()
+                    .map(|tape| format!("{} ({})", tape.voltag, tape.state.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(out, "catalog reset ok; preserved tapes: {preserved}");
+            } else {
+                let _ = writeln!(out, "catalog reset ok");
+            }
             ExitCode::SUCCESS
         }
         Err(error) => {
             let _ = writeln!(err, "error: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_catalog_reset_preflight(
+    args: &CatalogResetPreflightArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    match remanence_state::StateHandle::preflight_catalog_reset_from_config_file(
+        &args.config,
+        &args.preserve_tape_voltags,
+        &args.allow_erase_tape_voltags,
+    ) {
+        Ok(report) => {
+            let tapes = report
+                .tapes
+                .iter()
+                .map(|tape| {
+                    serde_json::json!({
+                        "tape_uuid": uuid::Uuid::from_bytes(tape.tape_uuid).to_string(),
+                        "voltag": tape.voltag,
+                        "kind": tape.kind,
+                        "pool_id": tape.pool_id,
+                        "assignment_generation": tape.assignment_generation,
+                        "state": tape.state,
+                        "block_size": tape.block_size,
+                        "scheme_id": tape.scheme_id,
+                        "data_blocks_per_stripe": tape.data_blocks_per_stripe,
+                        "parity_blocks_per_stripe": tape.parity_blocks_per_stripe,
+                        "stripes_per_neighborhood": tape.stripes_per_neighborhood,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let path_json = |path: &remanence_state::CatalogResetPathEvidence| {
+                serde_json::json!({
+                    "configured_path": path.configured_path.display().to_string(),
+                    "canonical_path": path.canonical_path.display().to_string(),
+                    "configured_path_is_symlink": path.configured_path_is_symlink,
+                })
+            };
+            let document = serde_json::json!({
+                "schema": "rem.catalog.reset-preflight.v1",
+                "ok": true,
+                "preflight_token": report.preflight_token,
+                "request_digest": report.request_digest,
+                "resume_exact": report.resume_exact,
+                "paths": {
+                    "config": path_json(&report.paths.config),
+                    "state_dir": path_json(&report.paths.state_dir),
+                    "sqlite": path_json(&report.paths.sqlite),
+                    "audit": path_json(&report.paths.audit),
+                    "journal": path_json(&report.paths.journal),
+                    "tape_cache": path_json(&report.paths.tape_cache),
+                },
+                "preserve_tape_voltags": report.preserve_tape_voltags,
+                "allow_erase_tape_voltags": report.allow_erase_tape_voltags,
+                "tapes": tapes,
+            });
+            let _ = writeln!(out, "{document}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            let document = serde_json::json!({
+                "schema": "rem.catalog.reset-preflight.v1",
+                "ok": false,
+                "error": error.to_string(),
+            });
+            let _ = writeln!(err, "{document}");
             ExitCode::from(1)
         }
     }
@@ -7508,15 +7670,14 @@ impl TapeInitStateOps for remanence_state::StateHandle {
         parity: remanence_api::ParityConfig,
         force: bool,
     ) -> Result<(), String> {
-        self.catalog_index()
-            .provision_tape(remanence_state::ProvisionTapeInput {
-                tape_uuid,
-                voltag: voltag.clone(),
-                block_size,
-                parity: parity.clone(),
-                force,
-            })
-            .map_err(|error| format!("provision catalog tape row: {error}"))?;
+        self.provision_tape(remanence_state::ProvisionTapeInput {
+            tape_uuid,
+            voltag: voltag.clone(),
+            block_size,
+            parity: parity.clone(),
+            force,
+        })
+        .map_err(|error| format!("provision catalog tape row: {error}"))?;
         let pool_inputs = pool_projection_inputs(config);
         self.catalog_index()
             .reconcile_tape_pool_projection_from_rules(&pool_inputs, &config.tape_pool_rules)
@@ -16440,20 +16601,53 @@ mod tests {
             "tapes",
             "--pool",
             "copy-a",
+            "--kind",
+            "all",
         ]);
 
         match cli.command {
             RemCommand::Catalog {
                 endpoint,
                 json,
-                command: CatalogClientCommand::Tapes { pool },
+                command: CatalogClientCommand::Tapes { pool, kind },
             } => {
                 assert_eq!(endpoint, "http://127.0.0.1:50051");
                 assert!(json);
                 assert_eq!(pool.as_deref(), Some("copy-a"));
+                assert_eq!(kind, CatalogTapeKindArg::All);
             }
             other => panic!("unexpected command: {other:?}"),
         }
+
+        let request = catalog_tapes_request(Some("copy-a"), CatalogTapeKindArg::All);
+        assert_eq!(request.pool_id, "copy-a");
+        assert_eq!(request.kind, "all");
+    }
+
+    #[test]
+    fn catalog_tapes_json_carries_kind_and_scheme_identity() {
+        let mut out = Vec::new();
+        print_tape_list(
+            vec![pb::Tape {
+                tape_uuid: vec![0xC1; 16],
+                voltag: Some("RMN009L9".to_string()),
+                block_size_bytes: Some(1024 * 1024),
+                data_blocks_per_stripe: Some(128),
+                parity_blocks_per_stripe: Some(4),
+                stripes_per_neighborhood: Some(16),
+                kind: Some("data".to_string()),
+                scheme_id: Some("rs-cauchy-gf256-v1".to_string()),
+                ..Default::default()
+            }],
+            true,
+            &mut out,
+        )
+        .expect("print tape JSON");
+        let document: serde_json::Value = serde_json::from_slice(&out).expect("JSON output");
+        let tape = &document["data"]["tapes"][0];
+        assert_eq!(tape["kind"], "data");
+        assert_eq!(tape["scheme_id"], "rs-cauchy-gf256-v1");
+        assert_eq!(tape["block_size_bytes"], 1024 * 1024);
     }
 
     #[test]
@@ -18127,6 +18321,234 @@ mod tests {
             stderr.contains("--i-understand-this-erases-the-catalog"),
             "{stderr}"
         );
+    }
+
+    #[test]
+    fn catalog_reset_reports_exact_preserved_tapes_and_states() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-catalog-reset")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[daemon]
+state_dir = "{0}"
+default_idle_timeout_seconds = 1800
+read_only = false
+
+[[libraries]]
+serial = "LIB001"
+
+[journal]
+dir = "{0}/journals"
+require_trusted_volume = false
+
+[audit]
+dir = "{0}/audit"
+fsync = true
+
+[index]
+sqlite_path = "{0}/index/rem-state.sqlite"
+
+[cache]
+tape_catalog_dir = "{0}/cache/tapes"
+"#,
+                temp.path().display()
+            ),
+        )
+        .expect("write config");
+        {
+            let mut state = remanence_state::StateHandle::open_from_config_file(&config_path)
+                .expect("open state");
+            for (tape_uuid, voltag) in [([0xA1; 16], "RMN009L9"), ([0xA2; 16], "RMN010L9")] {
+                state
+                    .catalog_index()
+                    .provision_tape(remanence_state::ProvisionTapeInput {
+                        tape_uuid,
+                        voltag: voltag.to_string(),
+                        block_size: 1024 * 1024,
+                        parity: remanence_parity::ParityConfig::None,
+                        force: false,
+                    })
+                    .expect("provision tape");
+            }
+            state
+                .catalog_index()
+                .seal_tape([0xA2; 16])
+                .expect("seal second tape");
+        }
+        let admitted = remanence_state::StateHandle::preflight_catalog_reset_from_config_file(
+            &config_path,
+            &["RMN009L9".to_string(), "RMN010L9".to_string()],
+            &[],
+        )
+        .expect("preflight reset");
+        let cli = DebugCli::parse_from([
+            "rem-debug",
+            "catalog",
+            "reset",
+            "--config",
+            config_path.to_str().expect("utf8 config path"),
+            "--i-understand-this-erases-the-catalog",
+            "--preserve-tape-voltag",
+            "RMN009L9",
+            "--preserve-tape-voltag",
+            "RMN010L9",
+            "--expected-preflight-token",
+            admitted.preflight_token.as_str(),
+        ]);
+        let mut out = Vec::<u8>::new();
+        let mut err = Vec::<u8>::new();
+
+        let code = run_debug(
+            cli,
+            move || -> Result<DiscoveryReport, DiscoveryError> {
+                panic!("discover_fn must not be called for catalog reset")
+            },
+            &mut out,
+            &mut err,
+        );
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+        assert_eq!(
+            String::from_utf8(out).expect("stdout utf8"),
+            "catalog reset ok; preserved tapes: RMN009L9 (ready), RMN010L9 (recovery_required)\n"
+        );
+    }
+
+    #[test]
+    fn catalog_reset_preflight_emits_stable_all_kinds_json() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-catalog-reset-preflight")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[daemon]
+state_dir = "{0}"
+default_idle_timeout_seconds = 1800
+read_only = false
+
+[[libraries]]
+serial = "LIB001"
+
+[journal]
+dir = "{0}/journals"
+require_trusted_volume = false
+
+[audit]
+dir = "{0}/audit"
+fsync = true
+
+[index]
+sqlite_path = "{0}/index/rem-state.sqlite"
+
+[cache]
+tape_catalog_dir = "{0}/cache/tapes"
+"#,
+                temp.path().display()
+            ),
+        )
+        .expect("write config");
+        {
+            let mut state = remanence_state::StateHandle::open_from_config_file(&config_path)
+                .expect("open state");
+            state
+                .catalog_index()
+                .provision_tape(remanence_state::ProvisionTapeInput {
+                    tape_uuid: [0xB1; 16],
+                    voltag: "RMN009L9".to_string(),
+                    block_size: 1024 * 1024,
+                    parity: remanence_parity::ParityConfig::None,
+                    force: false,
+                })
+                .expect("provision data");
+            state
+                .catalog_index()
+                .provision_tape(remanence_state::ProvisionTapeInput {
+                    tape_uuid: [0xB2; 16],
+                    voltag: "CLN001L9".to_string(),
+                    block_size: 1024 * 1024,
+                    parity: remanence_parity::ParityConfig::None,
+                    force: false,
+                })
+                .expect("provision cleaning");
+            state
+                .catalog_index()
+                .set_tape_kind(&[0xB2; 16], "cleaning")
+                .expect("set cleaning kind");
+        }
+        let cli = DebugCli::parse_from([
+            "rem-debug",
+            "catalog",
+            "reset-preflight",
+            "--config",
+            config_path.to_str().expect("utf8 config path"),
+            "--preserve-tape-voltag",
+            "RMN009L9",
+            "--allow-erase-tape-voltag",
+            "CLN001L9",
+        ]);
+        let mut out = Vec::<u8>::new();
+        let mut err = Vec::<u8>::new();
+        let code = run_debug(
+            cli,
+            move || -> Result<DiscoveryReport, DiscoveryError> {
+                panic!("discover_fn must not be called for catalog preflight")
+            },
+            &mut out,
+            &mut err,
+        );
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+        let document: serde_json::Value =
+            serde_json::from_slice(&out).expect("preflight JSON document");
+        assert_eq!(document["schema"], "rem.catalog.reset-preflight.v1");
+        assert_eq!(document["ok"], true);
+        assert_eq!(document["resume_exact"], false);
+        assert_eq!(
+            document["preflight_token"]
+                .as_str()
+                .expect("preflight token")
+                .len(),
+            64
+        );
+        assert_eq!(
+            document["request_digest"]
+                .as_str()
+                .expect("request digest")
+                .len(),
+            64
+        );
+        assert_eq!(
+            document["paths"]["config"]["configured_path"],
+            config_path.display().to_string()
+        );
+        assert_eq!(
+            document["paths"]["config"]["configured_path_is_symlink"],
+            false
+        );
+        let tapes = document["tapes"].as_array().expect("tapes array");
+        assert_eq!(tapes.len(), 2);
+        assert!(tapes.iter().any(|tape| {
+            tape["voltag"] == "RMN009L9"
+                && tape["kind"] == "data"
+                && tape["block_size"] == 1024 * 1024
+                && tape["assignment_generation"] == 0
+        }));
+        assert!(tapes.iter().any(|tape| {
+            tape["voltag"] == "CLN001L9"
+                && tape["kind"] == "cleaning"
+                && tape["assignment_generation"] == 0
+        }));
     }
 
     /// Parse + run a CLI invocation that must never reach discovery.
