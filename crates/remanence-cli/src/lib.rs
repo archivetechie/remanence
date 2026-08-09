@@ -1508,7 +1508,7 @@ impl From<RemTapeCommand> for TapeCommand {
 
 #[derive(Subcommand, Debug)]
 enum TapeCommand {
-    /// Emit a catalog-less key-30 object recovery report.
+    /// Emit a catalog-less terminal-index object recovery report.
     RecoveryReport(TapeRecoveryReportArgs),
 
     /// Run one destructive §18.4 fault-injected scratch-tape round-trip.
