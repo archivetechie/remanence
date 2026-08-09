@@ -2079,60 +2079,6 @@ mod tests {
         .unwrap()
     }
 
-    fn hinted_edition_plan(block_size: u32) -> TapeIndexEditionPlan {
-        let counts = TapeIndexReplicaCounts {
-            structural_entry_count: 2,
-            object_row_count: 1,
-        };
-        let replica_layout = checked_tape_index_replica_layout_hinted(block_size, counts).unwrap();
-        let terminal_layout =
-            TerminalTailLayout::new(0, block_size, 2, 4, replica_layout.replica_record_count, 2)
-                .unwrap();
-        let descriptor = TapeIndexEditionDescriptor {
-            tape_uuid: [0x11; 16],
-            edition_id: [0x22; 16],
-            edition_sequence: 1,
-            scope: TapeIndexReplicaScope {
-                covered_prefix_tape_file_count: 2,
-                total_data_ordinals: 1,
-                highest_protected_ordinal: 0,
-            },
-            counts,
-            block_size,
-            compression_enabled: false,
-            writer_version: "remanence-test".to_string(),
-            write_timestamp: "2026-08-09T00:00:00Z".to_string(),
-            terminal_layout,
-        };
-        validate_edition_descriptor_hinted(&descriptor).unwrap();
-        let mut payload_hasher = Sha256::new();
-        payload_hasher.update(TAPE_INDEX_REPLICA_PAYLOAD_DOMAIN);
-        let mut source = source();
-        let mut pre_tail = PreTailRecordSource { inner: &mut source };
-        let summary =
-            stream_tape_index_payload(&mut pre_tail, &payload_descriptor(&descriptor), |slot| {
-                payload_hasher.update(slot);
-                Ok(())
-            })
-            .unwrap();
-        let payload_sha256 = payload_hasher.finalize().into();
-        let layout_digest = descriptor.terminal_layout.digest().unwrap();
-        let edition_digest = edition_digest(
-            &descriptor,
-            replica_layout,
-            payload_sha256,
-            summary.canonical_map_sha256,
-        );
-        TapeIndexEditionPlan {
-            descriptor,
-            replica_layout,
-            payload_sha256,
-            canonical_map_sha256: summary.canonical_map_sha256,
-            edition_digest,
-            layout_digest,
-        }
-    }
-
     fn written_replica(block_size: u32) -> (TapeIndexReplicaPlan, Vec<Vec<u8>>) {
         let plan = plan_tape_index_replica(edition_plan(block_size), 3).unwrap();
         let observation = TapeIndexReplicaObservation {
@@ -2176,28 +2122,19 @@ mod tests {
     }
 
     #[test]
-    fn hinted_frame_decoder_accepts_4096_while_writer_profile_rejects_it() {
-        let edition = hinted_edition_plan(4096);
-        let plan = plan_tape_index_replica_hinted(edition, 1).unwrap();
+    fn hinted_frame_decoder_rejects_non_terminal_4096_geometry() {
         assert!(matches!(
-            encode_tape_index_replica_header(&plan),
+            checked_tape_index_replica_layout_hinted(
+                4096,
+                TapeIndexReplicaCounts {
+                    structural_entry_count: 2,
+                    object_row_count: 1,
+                },
+            ),
             Err(TapeIndexReplicaError::Layout(
                 TerminalTailLayoutError::UnsupportedBlockSize { block_size: 4096 }
             ))
         ));
-
-        let mut block = vec![0; 4096];
-        write_replica_frame(
-            &mut block,
-            &plan,
-            derive_tape_index_replica_header_magic(&plan.edition.descriptor.tape_uuid),
-            TAPE_INDEX_REPLICA_HEADER_ROLE,
-        )
-        .unwrap();
-        write_crc(&mut block);
-        let parsed = parse_tape_index_replica_header(&block, &plan.edition.descriptor.tape_uuid)
-            .expect("hinted 4096-byte header decodes");
-        assert_eq!(parsed.plan, plan);
     }
 
     #[test]

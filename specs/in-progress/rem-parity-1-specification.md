@@ -1171,16 +1171,13 @@ Scanner MUST nevertheless accept an operator-supplied block-size hint and
 apply it as a configured read size — the hint path serves damaged-media
 recovery and nonconformant tapes, not Writer freedom.
 
-**Test-geometry carve-out.** Conformance test vectors and other explicitly
-labelled test geometries (Section 10.7) MAY use a smaller block size — the
-published image vectors use 4096-byte blocks, except the mandatory
-default-geometry header vector at 256 KiB (Section 17) — to keep the
-fixtures compact. Such a
-tape records its `block_size_bytes` in the bootstrap like any other and is read
-by supplying that size as a configured read size (the hint path above); it is not
-required to be discoverable from media alone. A block size outside the
-discovery-candidate set does not by itself make a tape nonconformant; only a
-production Writer emitting one does.
+Replacement-draft terminal vectors use the same 256 KiB, 512 KiB, and 1 MiB
+record sizes as conformant media. The frozen publication archive contains
+historical 4096-byte major-1 images; those bytes are verified by the isolated
+publication tools and are not terminal-tail vectors. An operator may still
+supply another size to the separate BOT structural walk for damaged or
+nonconformant media, but that hint cannot make a terminal replica or separation
+extent at that size eligible.
 
 The terminal byte draft defines the exact local eligibility checks. A magic or
 CRC miss invalidates that candidate and triggers the next older replica. A
@@ -2262,20 +2259,17 @@ end and one middle region without any geometric placement rule. Requiring
 surviving editions to agree prevents ordinal preference from hiding a split
 authority.
 
-### B.8. No per-file commit marker
+### B.8. Checkpoint authority stays off tape
 
-Commit state lives off tape (Section 3.4). A *per-file* marker would have to
-be written after the data it marks — adding a write and a failure mode to
-every file — and would still be unreadable exactly when it matters (torn
-writes). Version 1.0 instead attests at **barrier** grain: each checkpoint
-bootstrap is a batched structural attestation, written after everything it
-covers and integrity-bound to the covered structure by its SHA-256 digest
-record (Section 7.4 — self-consistency, not authentication, Section 16.1),
-amortized across the batch (Section 11.1). A torn tail
-is still beyond the durable boundary — invisible to recovery, physically
-superseded on resume. What remains out of scope for bare-tape recovery is
-only the *commitment* of files past the newest attestation; Section 12.6
-classifies that tail, and the Writer's checkpoint cadence bounds it.
+Open-tape commit state lives in the durable host journals (Section 3.4).
+Ordinary checkpoint barriers close any pending parity epoch, prove the covered
+files durable, and advance those journals; they do not append a Bootstrap or an
+index. On restart, the Writer reconciles the measured physical prefix against
+that host authority before it may append. Bare-tape inventory becomes complete
+only when finalization writes the three identical terminal replicas. If none
+survives, Section 8.4.1 offers structural recovery evidence without inventing
+commit authority. This keeps open-tape checkpoint frequency independent of the
+number or placement of on-tape index copies.
 
 ### B.9. Content-blind classification
 
@@ -2521,11 +2515,11 @@ This is the live preparing-copy snapshot for the draft.4 replacement.
    extents at every legal block size on VTL, and at least two block sizes on
    physical tape, verifying local footer observations and filemark/EOD
    positioning from a clean medium.
-4. **TT-4 — end-to-end lifecycle reconciliation.** Remove remaining runtime
-   checkpoint/final-Bootstrap emission, prove durable
+4. **TT-4 — end-to-end lifecycle reconciliation.** Exercise the implemented
+   sole-BOT/off-tape-checkpoint grammar and prove durable
    `Open -> Finalizing -> Finalized/RecoveryRequired` projection through
-   restart, and show that Object admission cannot reopen after the first
-   finalization record.
+   restart, including manual-finalization restart, while showing that Object
+   admission cannot reopen after the first finalization record.
 5. **TT-5 — external prose review.** Confirm that the completed preparing copy
    contains no normative dependence on geometric placement, `2M+1` index
    copies, bootstrap Object-row ceilings, or singular final Bootstrap

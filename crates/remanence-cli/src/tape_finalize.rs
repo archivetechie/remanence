@@ -222,18 +222,50 @@ pub(crate) fn run(args: &TapeFinalizeArgs, out: &mut dyn Write, err: &mut dyn Wr
         Ok(transport) => transport,
         Err(error) => return finish_daemon_client_result(Err(error), args.json, err),
     };
-    let finalization = match execute_with_transport(
+    execute_command_with_transport(
         &mut transport,
         validated,
         args.wait,
+        args.json,
         FINALIZATION_POLL_INTERVAL,
-    ) {
+        out,
+        err,
+    )
+}
+
+/// Execute the complete command lifecycle against an injected transport so
+/// rendering and process status are tested together with RPC semantics.
+fn execute_command_with_transport<T: FinalizationTransport>(
+    transport: &mut T,
+    validated: ValidatedFinalize,
+    wait: bool,
+    json_output: bool,
+    poll_interval: Duration,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let finalization = match execute_with_transport(transport, validated, wait, poll_interval) {
         Ok(finalization) => finalization,
-        Err(error) => return finish_daemon_client_result(Err(error), args.json, err),
+        Err(error) => return finish_daemon_client_result(Err(error), json_output, err),
     };
 
-    if let Err(error) = print_finalization(&finalization, args.json, out) {
-        return finish_daemon_client_result(Err(DaemonClientError::client(error)), args.json, err);
+    finish_finalization_command(&finalization, json_output, out, err)
+}
+
+/// Render one validated daemon result and convert its terminal outcome into
+/// the command's process exit status.
+fn finish_finalization_command(
+    finalization: &pb::TapeFinalization,
+    json_output: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    if let Err(error) = print_finalization(finalization, json_output, out) {
+        return finish_daemon_client_result(
+            Err(DaemonClientError::client(error)),
+            json_output,
+            err,
+        );
     }
     if is_unsuccessful_terminal(finalization.outcome) {
         ExitCode::from(1)
@@ -402,7 +434,9 @@ fn is_terminal(outcome: i32) -> Result<bool, DaemonClientError> {
 fn is_unsuccessful_terminal(outcome: i32) -> bool {
     matches!(
         pb::TapeFinalizationOutcome::try_from(outcome),
-        Ok(pb::TapeFinalizationOutcome::RecoveryRequired | pb::TapeFinalizationOutcome::Failed)
+        Ok(pb::TapeFinalizationOutcome::Busy
+            | pb::TapeFinalizationOutcome::RecoveryRequired
+            | pb::TapeFinalizationOutcome::Failed)
     )
 }
 
@@ -809,6 +843,60 @@ mod tests {
         assert!(rendered.contains("outcome: busy\n"));
         assert!(rendered.contains("progress: unspecified\n"));
         assert!(!rendered.contains("replica_health:\n"));
+    }
+
+    #[test]
+    fn busy_human_command_output_exits_nonzero() {
+        let mut transport = MockTransport {
+            finalize_response: Some(busy_status()),
+            ..MockTransport::default()
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        let code = execute_command_with_transport(
+            &mut transport,
+            args().validate().unwrap(),
+            true,
+            false,
+            Duration::ZERO,
+            &mut out,
+            &mut err,
+        );
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(err.is_empty());
+        assert_eq!(transport.finalize_calls.len(), 1);
+        assert!(transport.get_calls.is_empty());
+        let rendered = String::from_utf8(out).expect("human output is UTF-8");
+        assert!(rendered.contains("outcome: busy\n"));
+    }
+
+    #[test]
+    fn busy_json_command_output_exits_nonzero() {
+        let mut transport = MockTransport {
+            finalize_response: Some(busy_status()),
+            ..MockTransport::default()
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        let code = execute_command_with_transport(
+            &mut transport,
+            args().validate().unwrap(),
+            true,
+            true,
+            Duration::ZERO,
+            &mut out,
+            &mut err,
+        );
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(err.is_empty());
+        assert_eq!(transport.finalize_calls.len(), 1);
+        assert!(transport.get_calls.is_empty());
+        let value: Value = serde_json::from_slice(&out).expect("JSON command output");
+        assert_eq!(value["data"]["outcome"], "busy");
     }
 
     #[test]
