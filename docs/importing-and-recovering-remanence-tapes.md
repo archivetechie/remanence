@@ -25,12 +25,18 @@ Import and recovery then happen in three separate stages:
 |---|---|---|
 | **Probe** | Whether BOT contains a valid Remanence Bootstrap, plus its tape UUID and geometry | That the local catalog is correct or that the rest of the tape is healthy |
 | **Adopt** | The tape's identity, barcode, pool mapping, geometry, and a conservative lifecycle state | Which Objects are present or whether they were committed |
-| **Inventory/rebuild** | The recoverable tape contents, from terminal indexes, surviving journals, or a scan starting at BOT | That provisional scan output is already committed catalog authority |
+| **Inventory/verify** | The contents and structural evidence that can be read from terminal indexes or a scan starting at BOT | That read-only inventory has rebuilt the site's writable catalog |
 
-This separation is intentional. It lets Remanence recognize a cartridge
-without inventing a history for it. A finalized tape normally offers a fast
-terminal index. A partially written tape, or a tape whose terminal indexes are
-unreadable, may require a complete scan from the beginning instead.
+This separation is intentional. It lets Remanence recognize and inspect a
+cartridge without inventing a history for it. A finalized tape normally offers
+a fast terminal index. A partially written tape, or a tape whose terminal
+indexes are unreadable, may require a complete scan from the beginning instead.
+
+Current production code does **not** turn tape-only inventory rows into the
+ordinary authoritative Object/copy/file catalog. `rebuild-catalog-from-journals`
+replays surviving host audit logs and per-tape journals; it does not ingest a
+terminal index or BOT scan. A site holding only a cartridge can identify and
+inspect it, but tape-only catalog import remains future work.
 
 ## What “foreign tape” means
 
@@ -38,7 +44,7 @@ People use “foreign” for two quite different situations:
 
 | Cartridge | Supported by this workflow? | Correct path |
 |---|---:|---|
-| A Remanence tape written at another site | Yes | Probe, adopt its existing identity, then inventory and rebuild |
+| A Remanence tape written at another site | Partly | Probe and adopt its identity, then inventory/verify; ordinary catalog import additionally needs transferred host journals today |
 | A Remanence tape whose local SQLite row was lost | Yes | The same probe-and-adopt workflow |
 | A Remanence tape with a damaged or unreadable Bootstrap | No | Do not adopt; preserve the cartridge for a deeper recovery procedure |
 | An LTFS, tar, Dwara, or other non-Remanence tape | No | Use a separately supplied, read-only foreign-format adapter |
@@ -60,10 +66,13 @@ finalization history.
 
 For example, Site A can write a Remanence tape and send it to an offsite vault.
 If Site B later receives the cartridge without Site A's SQLite catalog, Site B
-can probe and adopt the Bootstrap identity, then inventory the terminal indexes
-and rebuild the authority that actually survives. An LTFS cartridge in the same
-shipment needs a distribution with an LTFS adapter; the stock Remanence tools
-will reject it as unrecognized or unsupported rather than guessing.
+can probe and adopt the Bootstrap identity, then inventory and verify the
+terminal indexes. If Site A also transferred its audit and per-tape journals,
+Site B can rebuild the ordinary catalog from those host records. With the
+cartridge alone, Site B can inspect but cannot yet import those inventory rows
+as ordinary catalog authority. An LTFS cartridge in the same shipment needs a
+distribution with an LTFS adapter; the stock Remanence tools will reject it as
+unrecognized or unsupported rather than guessing.
 
 In plain terms, adoption records the native tape's identity, geometry, pool,
 and conservative lifecycle state. It does not rewrite the tape, decrypt or
@@ -260,6 +269,8 @@ and exact parking failures also prevent catalog mutation.
    and review the internally generated operation UUID in the JSON result.
 7. Confirm the cartridge was parked and inspect the returned catalog state.
 8. If `recovery_required`, keep it read-only and run terminal inventory and
-   verification before restoring journals or rebuilding the catalog.
+   verification before restoring transferred journals or rebuilding the
+   catalog. If no host journals survived, keep the tape read-only: tape-only
+   inventory-to-catalog import is not implemented yet.
 9. Resume daemon or site operations only after ownership and recovered catalog
    authority are reconciled.
