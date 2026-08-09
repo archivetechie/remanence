@@ -3829,6 +3829,1097 @@ fn close_write_actor(input: CloseWriteActorInput<'_>) -> Result<CloseWriteActorR
     })
 }
 
+/// Mutable authority owned by one drive actor for the lifetime of an open
+/// write session. Command handlers borrow this state so each transition's
+/// inputs and mutations remain local and visible to the borrow checker.
+struct WriteSessionState<'a> {
+    bay: u16,
+    index: &'a mut CatalogIndex,
+    cfg: &'a WriteOwnerConfig,
+    actor_tx: mpsc::Sender<DriveCommand>,
+    drive: &'a mut DriveHandle,
+    snapshot_misses: &'a mut u32,
+    pool_cfg: TapePoolConfig,
+    selected: SelectedTape,
+    target_kind: pb::write_session::TargetKind,
+    library_serial: String,
+    drive_uuid: Option<Vec<u8>>,
+    drive_serial: Option<String>,
+    session_id: Uuid,
+    tape_uuid: TapeUuid,
+    opened_at_utc: String,
+    objects_committed: u64,
+    bytes_committed: u64,
+    last_checkpoint_at_utc: Option<String>,
+    checkpoint_lease: remanence_state::FileCheckpointJournalLease,
+    durable_checkpoint_records: Vec<remanence_state::CheckpointJournalRecord>,
+    parity_session: Option<ParityActorSession>,
+    next_batched_append: Option<crate::pool_write::BatchedNoParityAppendContext>,
+    checkpoint_ordinal: u64,
+    tape_committed_object_count: u64,
+    pending_batch: Option<PendingCheckpointBatch>,
+    committed_receipts: Vec<pb::ObjectRecord>,
+    timer_checkpoint_waiting: Option<Uuid>,
+    append_gate: SessionAppendGate,
+    append_commit_diagnostics: crate::pool_write::AppendCommitDiagnostics,
+}
+
+impl WriteSessionState<'_> {
+    /// Dispatch commands until a close transition releases the drive actor.
+    fn run(&mut self, rx: &mut mpsc::Receiver<DriveCommand>) {
+        while let Some(command) = rx.blocking_recv() {
+            match command {
+                command @ DriveCommand::AppendFinish { .. } => {
+                    self.handle_append_finish(command);
+                }
+                command @ DriveCommand::Checkpoint { .. } => {
+                    self.handle_checkpoint(command);
+                }
+                command @ DriveCommand::TimerIdleClose { .. } => {
+                    if self.handle_timer_idle_close(command) {
+                        break;
+                    }
+                }
+                command @ DriveCommand::Close { .. } => {
+                    if self.handle_close(command) {
+                        break;
+                    }
+                }
+                command @ DriveCommand::Abort { .. } => {
+                    if self.handle_abort(command) {
+                        break;
+                    }
+                }
+                command @ DriveCommand::Get { .. } => {
+                    self.handle_get(command);
+                }
+                DriveCommand::OpenWrite { reply, .. } => {
+                    let _ = reply.send(Err(Status::failed_precondition(
+                        "write session already active",
+                    )));
+                }
+                DriveCommand::OpenRead { reply, .. } => {
+                    let _ = reply.send(Err(Status::failed_precondition(
+                        "write session already active",
+                    )));
+                }
+                DriveCommand::TapeInventory { reply, .. } => {
+                    let _ = reply.send(Err(Status::failed_precondition(
+                        "write session already active",
+                    )));
+                }
+                DriveCommand::VerifyTapeIndex { reply, .. } => {
+                    let _ = reply.send(Err(Status::failed_precondition(
+                        "write session already active",
+                    )));
+                }
+                DriveCommand::FinalizeTape { reply, .. } => {
+                    let _ = reply.send(Err(Status::failed_precondition(
+                        "write session already active",
+                    )));
+                }
+                DriveCommand::WaitReady { handle, .. } => {
+                    handle
+                        .publish_failed("write session already active", &[("phase", "admission")]);
+                }
+                DriveCommand::Unload { reply } => {
+                    let _ = reply.send(Err(Status::failed_precondition(
+                        "write session already active",
+                    )));
+                }
+                DriveCommand::PollHealth { reply, .. } => {
+                    let _ = reply.send(Err(Status::failed_precondition(
+                        "write session already active",
+                    )));
+                }
+                DriveCommand::Heartbeat { reply, .. } => {
+                    let _ = reply.send(Err(Status::failed_precondition(
+                        "write session already active",
+                    )));
+                }
+                DriveCommand::ReadFile { chunk_tx, .. }
+                | DriveCommand::ReadObjectRange { chunk_tx, .. } => {
+                    let _ = chunk_tx.blocking_send(Err(Status::failed_precondition(
+                        "active session is a write session",
+                    )));
+                }
+                DriveCommand::CloseRead { reply, .. } | DriveCommand::GetRead { reply, .. } => {
+                    let _ = reply.send(Err(Status::failed_precondition(
+                        "active session is a write session",
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Complete one accepted append and advance provisional checkpoint state.
+    fn handle_append_finish(&mut self, command: DriveCommand) {
+        let DriveCommand::AppendFinish {
+            session_id: requested,
+            source,
+            archive_path,
+            caller_object_id,
+            expected_content_sha256,
+            live_write_counter,
+            reply,
+        } = command
+        else {
+            unreachable!("append handler received another drive command");
+        };
+        let cfg = self.cfg;
+        let pool_cfg = self.pool_cfg.clone();
+        let selected = self.selected.clone();
+        let drive_uuid = self.drive_uuid.clone();
+        let session_id = self.session_id;
+        let tape_uuid = self.tape_uuid;
+        let opened_at_utc = self.opened_at_utc.clone();
+        if requested != session_id {
+            source.remove_completed_path();
+            let _ = reply.send(Err(Status::not_found("write session not found")));
+            return;
+        }
+        if let Err(status) = self.append_gate.check() {
+            source.remove_completed_path();
+            let _ = reply.send(Err(status));
+            return;
+        }
+        // Any accepted append call is session activity, including a
+        // catalog idempotency replay; invalidate a prior timer-close.
+        self.timer_checkpoint_waiting = None;
+        let logical_size = source.size_bytes().unwrap_or(0);
+        let stream_control = source.stream_control();
+        let cleanup_path = match &source {
+            crate::WriteObjectSource::Path(path) => Some(path.clone()),
+            crate::WriteObjectSource::Streamed(_) => None,
+        };
+        let current_caller_object_id = caller_object_id.clone();
+        if let Some((provisional_index, pending)) = self.pending_batch.as_ref().and_then(|batch| {
+            batch
+                .objects
+                .iter()
+                .enumerate()
+                .find(|(_, pending)| pending.object.caller_object_id == caller_object_id)
+                .map(|(index, pending)| (index, (batch.batch_id, pending)))
+        }) {
+            let (batch_id, pending) = pending;
+            let requested_hash = source.content_sha256();
+            source.remove_completed_path();
+            match requested_hash {
+                Ok(hash) if hash == pending.object.content_sha256 => {
+                    let provisional_ordinal = provisional_index as u64 + 1;
+                    let record = pending
+                        .object
+                        .to_written_proto(batch_id, provisional_ordinal);
+                    let _ = reply.send(Ok(AppendFinishOutcome {
+                        record,
+                        replay: true,
+                    }));
+                }
+                Ok(hash) => {
+                    let _ = reply.send(Err(Status::already_exists(format!(
+                        "caller_object_id replay conflict inside checkpoint batch: caller_object_id={caller_object_id:?}, existing content_sha256={}, requested content_sha256={}",
+                        crate::bytes_to_hex(&pending.object.content_sha256),
+                        crate::bytes_to_hex(&hash),
+                    ))));
+                }
+                Err(err) => {
+                    let _ = reply.send(Err(status_from_pool_write_error(err)));
+                }
+            }
+            return;
+        }
+        let request = WriteObjectToPoolRequest {
+            pool_id: pool_cfg.id.clone(),
+            source,
+            archive_path,
+            caller_object_id,
+            expected_content_sha256,
+            representation: crate::PoolWriteRepresentation::Plaintext,
+        };
+        let append_started = Instant::now();
+        let mut parity_raw_write_attempted = false;
+        let result =
+            match crate::pool_write::maybe_replay_pool_write(self.index, &pool_cfg, &request) {
+                Ok(Some(result)) => Ok(result),
+                Ok(None) => {
+                    if let Some(parity_session) = self.parity_session.as_mut() {
+                        let mut raw = DriveHandleRawSink::new(self.drive);
+                        crate::pool_write::write_batched_parity_to_selected_tape_after_replay_check(
+                            self.index,
+                            &mut raw,
+                            &mut parity_session.journal,
+                            &mut parity_session.sink_state,
+                            &pool_cfg,
+                            request,
+                            selected.clone(),
+                            &cfg.io_memory,
+                            &mut parity_raw_write_attempted,
+                        )
+                    } else {
+                        let mut sink = DriveHandleSink(self.drive);
+                        if let Some(append) = self.next_batched_append.clone() {
+                            self.next_batched_append = Some(append.clone());
+                            crate::pool_write::write_batched_to_selected_tape_after_replay_check(
+                                self.index,
+                                &mut sink,
+                                &pool_cfg,
+                                request,
+                                selected.clone(),
+                                live_write_counter,
+                                append,
+                            )
+                        } else {
+                            Err(PoolWriteError::InvalidInput(
+                                "checkpoint append context is unavailable".to_string(),
+                            ))
+                        }
+                    }
+                }
+                Err(err) => Err(err),
+            };
+        let append_elapsed = append_started.elapsed();
+        if let Some(path) = cleanup_path {
+            let _ = std::fs::remove_file(path);
+        }
+        match result {
+            Ok(result) => {
+                let replay = result.is_replay();
+                self.append_commit_diagnostics
+                    .accumulate(result.append_commit_diagnostics());
+                let response_record = if !replay {
+                    if let Some(previous) = self.next_batched_append.as_ref() {
+                        let next_context =
+                            match crate::pool_write::next_batched_append_context(previous, &result)
+                            {
+                                Ok(context) => context,
+                                Err(err) => {
+                                    self.append_gate.record_failure();
+                                    let _ = reply.send(Err(status_from_pool_write_error(err)));
+                                    return;
+                                }
+                            };
+                        self.next_batched_append = Some(next_context);
+                    }
+                    let new_batch = self.pending_batch.is_none();
+                    let batch = self.pending_batch.get_or_insert_with(|| {
+                        PendingCheckpointBatch::new(StdDuration::from_secs(
+                            cfg.checkpoint_max_age_seconds,
+                        ))
+                    });
+                    let provisional_ordinal = batch.objects.len() as u64 + 1;
+                    let written = result
+                        .object
+                        .to_written_proto(batch.batch_id, provisional_ordinal);
+                    let object_id = result.object.object_id;
+                    let batch_id = batch.batch_id;
+                    batch.push(logical_size, result);
+                    let timer_arm_failed = if new_batch {
+                        match arm_checkpoint_timer(
+                            self.actor_tx.clone(),
+                            session_id,
+                            batch_id,
+                            StdDuration::from_secs(cfg.checkpoint_max_age_seconds),
+                        ) {
+                            Ok(()) => false,
+                            Err(err) => {
+                                tracing::error!(
+                                    session_id = %session_id,
+                                    batch_id = %batch_id,
+                                    error = %err,
+                                    "checkpoint timer could not start; forcing an immediate barrier"
+                                );
+                                true
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    if timer_arm_failed || batch.should_checkpoint(cfg) {
+                        let outcome = perform_checkpoint_barrier(
+                            self.index,
+                            self.drive,
+                            &mut self.checkpoint_lease,
+                            tape_uuid,
+                            &mut self.checkpoint_ordinal,
+                            &mut self.tape_committed_object_count,
+                            batch,
+                            self.parity_session.as_mut(),
+                            &selected,
+                            &pool_cfg,
+                            cfg,
+                        );
+                        match outcome {
+                            Ok(outcome) => {
+                                if let Some(previous) = self.next_batched_append.as_ref() {
+                                    let checkpoint_context = match crate::pool_write::batched_append_context_after_checkpoint(
+                                        previous,
+                                        &outcome.checkpoint_record,
+                                    ) {
+                                        Ok(context) => context,
+                                        Err(err) => {
+                                            extend_durable_checkpoint_records(
+                                                &mut self.durable_checkpoint_records,
+                                                &outcome,
+                                            );
+                                            self.append_gate.record_failure();
+                                            self.pending_batch = None;
+                                            let _ = reply.send(Err(status_from_pool_write_error(err)));
+                                            return;
+                                        }
+                                    };
+                                    self.next_batched_append = Some(checkpoint_context);
+                                }
+                                extend_durable_checkpoint_records(
+                                    &mut self.durable_checkpoint_records,
+                                    &outcome,
+                                );
+                                self.objects_committed =
+                                    self.objects_committed.saturating_add(outcome.object_count);
+                                self.bytes_committed =
+                                    self.bytes_committed.saturating_add(outcome.logical_bytes);
+                                self.last_checkpoint_at_utc =
+                                    Some(now_rfc3339().unwrap_or_else(|_| opened_at_utc.clone()));
+                                self.append_commit_diagnostics.accumulate(
+                                    crate::pool_write::AppendCommitDiagnostics {
+                                        filemark_write_drain: outcome.filemark_drain,
+                                        catalog_journal_fsync: outcome.journal_projection,
+                                    },
+                                );
+                                if outcome.sealed_after_write {
+                                    self.append_gate.record_sealed();
+                                }
+                                let committed = outcome
+                                    .committed_objects
+                                    .iter()
+                                    .find(|record| record.object_id == object_id)
+                                    .cloned()
+                                    .expect("threshold checkpoint returns current object");
+                                self.committed_receipts.extend(outcome.committed_objects);
+                                self.pending_batch = None;
+                                committed
+                            }
+                            Err(failure) => {
+                                let status = if failure.journal_durable || failure.fence_handled {
+                                    failure.status
+                                } else {
+                                    fence_failed_checkpoint_batch(
+                                        self.index,
+                                        cfg,
+                                        &selected,
+                                        batch,
+                                        failure.status,
+                                    )
+                                };
+                                self.append_gate.record_failure();
+                                self.pending_batch = None;
+                                let _ = reply.send(Err(status));
+                                return;
+                            }
+                        }
+                    } else {
+                        written
+                    }
+                } else {
+                    if !replay {
+                        self.objects_committed = self.objects_committed.saturating_add(1);
+                        self.bytes_committed = self.bytes_committed.saturating_add(logical_size);
+                        self.last_checkpoint_at_utc =
+                            Some(now_rfc3339().unwrap_or_else(|_| opened_at_utc.clone()));
+                    }
+                    result.object.to_proto()
+                };
+                tracing::info!(
+                    target: "remanence_write_diag",
+                    phase = "drive_append_total",
+                    session_id = %session_id,
+                    tape_uuid = %Uuid::from_bytes(tape_uuid),
+                    payload_bytes = logical_size,
+                    block_size_bytes = selected.block_size,
+                    replay,
+                    elapsed_ms = crate::diagnostics::duration_ms(append_elapsed),
+                    throughput_mib_s = if replay {
+                        0.0
+                    } else {
+                        crate::diagnostics::mib_per_s(logical_size, append_elapsed)
+                    },
+                    "remanence_write_diag",
+                );
+                if replay {
+                    retain_replayed_committed_receipt(
+                        &mut self.committed_receipts,
+                        &response_record,
+                    );
+                }
+                let _ = reply.send(Ok(AppendFinishOutcome {
+                    record: response_record,
+                    replay,
+                }));
+            }
+            Err(err) => {
+                let terminal_trigger = match &err {
+                    PoolWriteError::TerminalCloseRequired { .. } => {
+                        Some(remanence_state::TerminalFinalizationTrigger::NoPendingObjectFits)
+                    }
+                    _ => None,
+                };
+                if let Some(terminal_trigger) =
+                    terminal_trigger.filter(|_| self.pending_batch.is_none())
+                {
+                    let original_error = err.to_string();
+                    let terminal_reason = match terminal_trigger {
+                        remanence_state::TerminalFinalizationTrigger::NoPendingObjectFits => {
+                            "whole-Object terminal-capacity rollover"
+                        }
+                        _ => "automatic terminal finalization",
+                    };
+                    if self.durable_checkpoint_records.is_empty() {
+                        let status = Status::resource_exhausted(format!(
+                            "{terminal_reason} rejected the Object on a fresh tape; no Object was written and the tape may accept a smaller object: {original_error}"
+                        ));
+                        let _ = reply.send(Err(status));
+                        return;
+                    }
+                    let drive_config = match self.drive.read_config() {
+                        Ok(config) => config,
+                        Err(error) => {
+                            self.append_gate.record_failure();
+                            let _ = reply.send(Err(Status::unavailable(format!(
+                                "read {terminal_reason} drive config: {error}"
+                            ))));
+                            return;
+                        }
+                    };
+                    if drive_config.write_protected {
+                        self.append_gate.record_failure();
+                        let _ = reply.send(Err(Status::failed_precondition(format!(
+                            "tape is write-protected and cannot complete {terminal_reason} finalization"
+                        ))));
+                        return;
+                    }
+                    let rewritable = matches!(
+                        drive_config.worm,
+                        remanence_library::WormMediaState::NotWorm
+                    );
+                    let spec =
+                        TerminalFinalizeSpec::automatic(&selected, &pool_cfg, terminal_trigger);
+                    let terminal_result = match &selected.parity_config {
+                        remanence_parity::ParityConfig::None => finalize_terminal_no_parity(
+                            self.index,
+                            cfg,
+                            self.drive,
+                            &mut self.checkpoint_lease,
+                            self.durable_checkpoint_records
+                                .last()
+                                .expect("automatic finalization requires checkpoint authority"),
+                            None,
+                            &spec,
+                            &selected,
+                            None,
+                            rewritable,
+                        ),
+                        remanence_parity::ParityConfig::Scheme(_) => finalize_terminal_with_parity(
+                            self.index,
+                            cfg,
+                            self.drive,
+                            &mut self.checkpoint_lease,
+                            self.durable_checkpoint_records
+                                .last()
+                                .expect("automatic finalization requires checkpoint authority"),
+                            None,
+                            &spec,
+                            &selected,
+                            None,
+                            rewritable,
+                        ),
+                    };
+                    match terminal_result {
+                        Ok(result) => {
+                            self.append_gate.record_sealed();
+                            if let Some(record) = result.final_record {
+                                self.checkpoint_ordinal = record.ordinal;
+                                self.durable_checkpoint_records.clear();
+                                self.durable_checkpoint_records.push(record);
+                                if let Err(error) =
+                                    append_tape_sealed_evidence(self.index, cfg, selected.tape_uuid)
+                                {
+                                    tracing::warn!(%error, %terminal_reason, "failed to append automatic terminal seal evidence");
+                                }
+                                let _ = reply.send(Err(Status::resource_exhausted(
+                                    format!(
+                                        "{terminal_reason} was reached before Object tape motion; selected tape was terminally finalized, reopen against the pool to roll placement: {original_error}"
+                                    ),
+                                )));
+                            } else {
+                                let _ = reply.send(Err(Status::unavailable(format!(
+                                    "{terminal_reason} permanently closed Object admission, but the terminal tail requires recovery: {original_error}"
+                                ))));
+                            }
+                        }
+                        Err(error) => {
+                            self.append_gate.record_sealed();
+                            let _ = reply.send(Err(error));
+                        }
+                    }
+                    return;
+                }
+                let tape_started = if self.parity_session.is_some() {
+                    parity_raw_write_attempted
+                } else {
+                    stream_control
+                        .as_ref()
+                        .map(|control| control.tape_started())
+                        .unwrap_or(true)
+                };
+                if tape_started {
+                    self.append_gate.record_failure();
+                }
+                let original_error = err.to_string();
+                let mut status = status_from_pool_write_error(err);
+                let mut fence_audited_here = false;
+                if tape_started {
+                    let failed_batch = self.pending_batch.take();
+                    if let Some(batch) = failed_batch.as_ref() {
+                        status = Status::unavailable(format!(
+                            "checkpoint batch {} failed while appending {}; re-send all {} prior WRITTEN objects and the current object: {original_error}",
+                            batch.batch_id,
+                            current_caller_object_id,
+                            batch.objects.len(),
+                        ));
+                    }
+                    if parity_raw_write_attempted {
+                        let fenced = fence_failed_parity_raw_write(
+                            self.index,
+                            cfg,
+                            &selected,
+                            "append",
+                            Some(current_caller_object_id.as_str()),
+                            failed_batch.as_ref(),
+                            original_error.as_str(),
+                            status,
+                        );
+                        status = fenced.0;
+                        // The helper either audits the exact fence it just
+                        // persisted or returns an error describing why it
+                        // could not. Never fall back to auditing an unrelated
+                        // "latest" active fence for this write failure.
+                        fence_audited_here = true;
+                    } else if let Some(batch) = failed_batch.as_ref() {
+                        status = fence_failed_checkpoint_batch(
+                            self.index, cfg, &selected, batch, status,
+                        );
+                        fence_audited_here = true;
+                    }
+                }
+                tracing::info!(
+                    target: "remanence_write_diag",
+                    phase = "drive_append_total",
+                    session_id = %session_id,
+                    tape_uuid = %Uuid::from_bytes(tape_uuid),
+                    payload_bytes = logical_size,
+                    block_size_bytes = selected.block_size,
+                    status = "error",
+                    error = %status,
+                    elapsed_ms = crate::diagnostics::duration_ms(append_elapsed),
+                    throughput_mib_s = crate::diagnostics::mib_per_s(logical_size, append_elapsed),
+                    "remanence_write_diag",
+                );
+                if !fence_audited_here {
+                    if let Err(audit_err) =
+                        append_latest_tape_io_fence_evidence(self.index, cfg, selected.tape_uuid)
+                    {
+                        tracing::warn!(
+                            "failed to append tape-I/O fence evidence after write error: {audit_err}"
+                        );
+                    }
+                }
+                record_session_snapshot(
+                    self.index,
+                    cfg,
+                    self.drive,
+                    drive_uuid.clone(),
+                    session_id,
+                    tape_uuid,
+                    "append-failure",
+                    self.snapshot_misses,
+                );
+                let _ = reply.send(Err(status));
+            }
+        }
+    }
+
+    /// Commit the pending checkpoint batch, preserving timer-trigger behavior.
+    fn handle_checkpoint(&mut self, command: DriveCommand) {
+        let DriveCommand::Checkpoint {
+            session_id: requested,
+            trigger,
+            expected_batch_id,
+            reply,
+        } = command
+        else {
+            unreachable!("checkpoint handler received another drive command");
+        };
+        let bay = self.bay;
+        let cfg = self.cfg;
+        let pool_cfg = self.pool_cfg.clone();
+        let selected = self.selected.clone();
+        let target_kind = self.target_kind;
+        let session_id = self.session_id;
+        let tape_uuid = self.tape_uuid;
+        let opened_at_utc = self.opened_at_utc.clone();
+        if requested != session_id {
+            if let Some(reply) = reply {
+                let _ = reply.send(Err(Status::not_found("write session not found")));
+            }
+            return;
+        }
+        let Some(batch) = self.pending_batch.as_ref() else {
+            if let Some(reply) = reply {
+                let session = session_proto(WriteSessionProtoInput {
+                    session_id,
+                    tape_uuid: &tape_uuid,
+                    target_kind,
+                    state: pb::write_session::State::WriteSessionStateCheckpointed,
+                    objects_committed: self.objects_committed,
+                    bytes_committed: self.bytes_committed,
+                    opened_at_utc: opened_at_utc.as_str(),
+                    last_checkpoint_at_utc: self.last_checkpoint_at_utc.as_deref(),
+                    drive_element_address: bay,
+                    pending_batch: None,
+                });
+                send_checkpoint_actor_reply(reply, session, &mut self.committed_receipts);
+            }
+            return;
+        };
+        if expected_batch_id.is_some_and(|expected| expected != batch.batch_id) {
+            return;
+        }
+        let timer_batch_id = batch.batch_id;
+        if trigger == CheckpointTrigger::Timer
+            && Instant::now() > batch.deadline + StdDuration::from_secs(1)
+        {
+            let condition_key = format!("checkpoint-barrier-overdue:{session_id}");
+            let detail = serde_json::json!({
+                "session_id": session_id.to_string(),
+                "batch_id": batch.batch_id.to_string(),
+                "deadline_overrun_seconds": Instant::now()
+                    .saturating_duration_since(batch.deadline)
+                    .as_secs(),
+            })
+            .to_string();
+            let _ = self.index.raise_alarm(
+                condition_key.as_str(),
+                "checkpoint-barrier-overdue",
+                "warning",
+                Some(detail.as_str()),
+            );
+        }
+        match perform_checkpoint_barrier(
+            self.index,
+            self.drive,
+            &mut self.checkpoint_lease,
+            tape_uuid,
+            &mut self.checkpoint_ordinal,
+            &mut self.tape_committed_object_count,
+            batch,
+            self.parity_session.as_mut(),
+            &selected,
+            &pool_cfg,
+            cfg,
+        ) {
+            Ok(outcome) => {
+                if let Some(previous) = self.next_batched_append.as_ref() {
+                    let checkpoint_context =
+                        match crate::pool_write::batched_append_context_after_checkpoint(
+                            previous,
+                            &outcome.checkpoint_record,
+                        ) {
+                            Ok(context) => context,
+                            Err(err) => {
+                                extend_durable_checkpoint_records(
+                                    &mut self.durable_checkpoint_records,
+                                    &outcome,
+                                );
+                                self.append_gate.record_failure();
+                                self.pending_batch = None;
+                                let status = status_from_pool_write_error(err);
+                                if let Some(reply) = reply {
+                                    let _ = reply.send(Err(status));
+                                } else {
+                                    tracing::error!(session_id = %session_id, error = %status, "checkpoint committed but next append context failed");
+                                }
+                                return;
+                            }
+                        };
+                    self.next_batched_append = Some(checkpoint_context);
+                }
+                extend_durable_checkpoint_records(&mut self.durable_checkpoint_records, &outcome);
+                self.objects_committed =
+                    self.objects_committed.saturating_add(outcome.object_count);
+                self.bytes_committed = self.bytes_committed.saturating_add(outcome.logical_bytes);
+                self.last_checkpoint_at_utc =
+                    Some(now_rfc3339().unwrap_or_else(|_| opened_at_utc.clone()));
+                self.append_commit_diagnostics.accumulate(
+                    crate::pool_write::AppendCommitDiagnostics {
+                        filemark_write_drain: outcome.filemark_drain,
+                        catalog_journal_fsync: outcome.journal_projection,
+                    },
+                );
+                if outcome.sealed_after_write {
+                    self.append_gate.record_sealed();
+                }
+                self.pending_batch = None;
+                let condition_key = format!("checkpoint-barrier-overdue:{session_id}");
+                let _ = self.index.clear_alarm(condition_key.as_str());
+                if trigger == CheckpointTrigger::Timer {
+                    self.timer_checkpoint_waiting = Some(timer_batch_id);
+                    if let Err(err) = arm_checkpoint_idle_close(
+                        self.actor_tx.clone(),
+                        session_id,
+                        timer_batch_id,
+                        StdDuration::from_secs(cfg.session_idle_seconds),
+                    ) {
+                        let condition_key = format!("checkpoint-barrier-overdue:{session_id}");
+                        let detail = serde_json::json!({
+                            "session_id": session_id.to_string(),
+                            "batch_id": timer_batch_id.to_string(),
+                            "error": format!("idle close timer spawn failed: {err}"),
+                        })
+                        .to_string();
+                        let _ = self.index.raise_alarm(
+                            condition_key.as_str(),
+                            "checkpoint-barrier-overdue",
+                            "error",
+                            Some(detail.as_str()),
+                        );
+                        tracing::error!(
+                            session_id = %session_id,
+                            batch_id = %timer_batch_id,
+                            error = %err,
+                            "checkpoint idle-close timer could not start"
+                        );
+                    }
+                }
+                self.committed_receipts.extend(outcome.committed_objects);
+                let session = session_proto(WriteSessionProtoInput {
+                    session_id,
+                    tape_uuid: &tape_uuid,
+                    target_kind,
+                    state: pb::write_session::State::WriteSessionStateCheckpointed,
+                    objects_committed: self.objects_committed,
+                    bytes_committed: self.bytes_committed,
+                    opened_at_utc: opened_at_utc.as_str(),
+                    last_checkpoint_at_utc: self.last_checkpoint_at_utc.as_deref(),
+                    drive_element_address: bay,
+                    pending_batch: None,
+                });
+                if let Some(reply) = reply {
+                    send_checkpoint_actor_reply(reply, session, &mut self.committed_receipts);
+                }
+            }
+            Err(failure) => {
+                let status = if failure.journal_durable || failure.fence_handled {
+                    failure.status
+                } else {
+                    fence_failed_checkpoint_batch(self.index, cfg, &selected, batch, failure.status)
+                };
+                self.append_gate.record_failure();
+                self.pending_batch = None;
+                if let Some(reply) = reply {
+                    let _ = reply.send(Err(status));
+                } else {
+                    tracing::error!(
+                        session_id = %session_id,
+                        batch_id = %timer_batch_id,
+                        error = %status,
+                        "timer-fired checkpoint barrier failed"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Close an idle session only when the timer still names its latest batch.
+    fn handle_timer_idle_close(&mut self, command: DriveCommand) -> bool {
+        let DriveCommand::TimerIdleClose {
+            session_id: requested,
+            checkpoint_batch_id,
+        } = command
+        else {
+            unreachable!("idle-close handler received another drive command");
+        };
+        let bay = self.bay;
+        let cfg = self.cfg;
+        let target_kind = self.target_kind;
+        let library_serial = self.library_serial.clone();
+        let drive_uuid = self.drive_uuid.clone();
+        let drive_serial = self.drive_serial.clone();
+        let session_id = self.session_id;
+        let tape_uuid = self.tape_uuid;
+        let opened_at_utc = self.opened_at_utc.clone();
+        if requested != session_id
+            || self.timer_checkpoint_waiting != Some(checkpoint_batch_id)
+            || self.pending_batch.is_some()
+        {
+            return false;
+        }
+        let result = close_write_actor(CloseWriteActorInput {
+            index: self.index,
+            cfg,
+            drive: self.drive,
+            drive_uuid: &drive_uuid,
+            drive_serial: &drive_serial,
+            snapshot_misses: self.snapshot_misses,
+            session_id,
+            tape_uuid,
+            target_kind,
+            library_serial: library_serial.as_str(),
+            bay,
+            objects_committed: self.objects_committed,
+            bytes_committed: self.bytes_committed,
+            opened_at_utc: opened_at_utc.as_str(),
+            last_checkpoint_at_utc: self.last_checkpoint_at_utc.as_deref(),
+            state: pb::write_session::State::WriteSessionStateClosed,
+            append_commit_diagnostics: self.append_commit_diagnostics,
+            checkpointed_objects: &self.committed_receipts,
+            abort_reason: None,
+        });
+        if let Err(err) = result {
+            tracing::error!(session_id = %session_id, error = %err, "idle checkpoint close failed");
+            return false;
+        }
+        if let Err(err) = park_timer_closed_session(cfg, session_id) {
+            tracing::error!(session_id = %session_id, error = %err, "timer-closed session could not enter idle eviction");
+        }
+        true
+    }
+
+    /// Flush any pending batch and perform a normal session close.
+    fn handle_close(&mut self, command: DriveCommand) -> bool {
+        let DriveCommand::Close {
+            session_id: requested,
+            reply,
+        } = command
+        else {
+            unreachable!("close handler received another drive command");
+        };
+        let bay = self.bay;
+        let cfg = self.cfg;
+        let pool_cfg = self.pool_cfg.clone();
+        let selected = self.selected.clone();
+        let target_kind = self.target_kind;
+        let library_serial = self.library_serial.clone();
+        let drive_uuid = self.drive_uuid.clone();
+        let drive_serial = self.drive_serial.clone();
+        let session_id = self.session_id;
+        let tape_uuid = self.tape_uuid;
+        let opened_at_utc = self.opened_at_utc.clone();
+        if requested != session_id {
+            let _ = reply.send(Err(Status::not_found("write session not found")));
+            return false;
+        }
+        if let Some(batch) = self.pending_batch.as_ref() {
+            match perform_checkpoint_barrier(
+                self.index,
+                self.drive,
+                &mut self.checkpoint_lease,
+                tape_uuid,
+                &mut self.checkpoint_ordinal,
+                &mut self.tape_committed_object_count,
+                batch,
+                self.parity_session.as_mut(),
+                &selected,
+                &pool_cfg,
+                cfg,
+            ) {
+                Ok(outcome) => {
+                    if let Some(previous) = self.next_batched_append.as_ref() {
+                        let checkpoint_context =
+                            match crate::pool_write::batched_append_context_after_checkpoint(
+                                previous,
+                                &outcome.checkpoint_record,
+                            ) {
+                                Ok(context) => context,
+                                Err(err) => {
+                                    extend_durable_checkpoint_records(
+                                        &mut self.durable_checkpoint_records,
+                                        &outcome,
+                                    );
+                                    self.append_gate.record_failure();
+                                    self.pending_batch = None;
+                                    let _ = reply.send(Err(status_from_pool_write_error(err)));
+                                    return false;
+                                }
+                            };
+                        self.next_batched_append = Some(checkpoint_context);
+                    }
+                    extend_durable_checkpoint_records(
+                        &mut self.durable_checkpoint_records,
+                        &outcome,
+                    );
+                    self.objects_committed =
+                        self.objects_committed.saturating_add(outcome.object_count);
+                    self.bytes_committed =
+                        self.bytes_committed.saturating_add(outcome.logical_bytes);
+                    self.last_checkpoint_at_utc =
+                        Some(now_rfc3339().unwrap_or_else(|_| opened_at_utc.clone()));
+                    self.append_commit_diagnostics.accumulate(
+                        crate::pool_write::AppendCommitDiagnostics {
+                            filemark_write_drain: outcome.filemark_drain,
+                            catalog_journal_fsync: outcome.journal_projection,
+                        },
+                    );
+                    if outcome.sealed_after_write {
+                        self.append_gate.record_sealed();
+                    }
+                    self.committed_receipts.extend(outcome.committed_objects);
+                    self.pending_batch = None;
+                }
+                Err(failure) => {
+                    let status = if failure.journal_durable || failure.fence_handled {
+                        failure.status
+                    } else {
+                        fence_failed_checkpoint_batch(
+                            self.index,
+                            cfg,
+                            &selected,
+                            batch,
+                            failure.status,
+                        )
+                    };
+                    self.append_gate.record_failure();
+                    self.pending_batch = None;
+                    let _ = reply.send(Err(status));
+                    return false;
+                }
+            }
+        }
+        let result = close_write_actor(CloseWriteActorInput {
+            index: self.index,
+            cfg,
+            drive: self.drive,
+            drive_uuid: &drive_uuid,
+            drive_serial: &drive_serial,
+            snapshot_misses: self.snapshot_misses,
+            session_id,
+            tape_uuid,
+            target_kind,
+            library_serial: library_serial.as_str(),
+            bay,
+            objects_committed: self.objects_committed,
+            bytes_committed: self.bytes_committed,
+            opened_at_utc: opened_at_utc.as_str(),
+            last_checkpoint_at_utc: self.last_checkpoint_at_utc.as_deref(),
+            state: pb::write_session::State::WriteSessionStateClosed,
+            append_commit_diagnostics: self.append_commit_diagnostics,
+            checkpointed_objects: &self.committed_receipts,
+            abort_reason: None,
+        });
+        match result {
+            Ok(result) => {
+                let _ = reply.send(Ok(result));
+                true
+            }
+            Err(err) => {
+                let _ = reply.send(Err(err));
+                false
+            }
+        }
+    }
+
+    /// Close the actor in the aborted state without committing new work.
+    fn handle_abort(&mut self, command: DriveCommand) -> bool {
+        let DriveCommand::Abort {
+            session_id: requested,
+            reason,
+            reply,
+        } = command
+        else {
+            unreachable!("abort handler received another drive command");
+        };
+        let bay = self.bay;
+        let cfg = self.cfg;
+        let target_kind = self.target_kind;
+        let library_serial = self.library_serial.clone();
+        let drive_uuid = self.drive_uuid.clone();
+        let drive_serial = self.drive_serial.clone();
+        let session_id = self.session_id;
+        let tape_uuid = self.tape_uuid;
+        let opened_at_utc = self.opened_at_utc.clone();
+        if requested != session_id {
+            let _ = reply.send(Err(Status::not_found("write session not found")));
+            return false;
+        }
+        let result = close_write_actor(CloseWriteActorInput {
+            index: self.index,
+            cfg,
+            drive: self.drive,
+            drive_uuid: &drive_uuid,
+            drive_serial: &drive_serial,
+            snapshot_misses: self.snapshot_misses,
+            session_id,
+            tape_uuid,
+            target_kind,
+            library_serial: library_serial.as_str(),
+            bay,
+            objects_committed: self.objects_committed,
+            bytes_committed: self.bytes_committed,
+            opened_at_utc: opened_at_utc.as_str(),
+            last_checkpoint_at_utc: self.last_checkpoint_at_utc.as_deref(),
+            state: pb::write_session::State::WriteSessionStateAborted,
+            append_commit_diagnostics: self.append_commit_diagnostics,
+            checkpointed_objects: &self.committed_receipts,
+            abort_reason: reason,
+        });
+        match result {
+            Ok(result) => {
+                let _ = reply.send(Ok(result));
+                true
+            }
+            Err(err) => {
+                let _ = reply.send(Err(err));
+                false
+            }
+        }
+    }
+
+    /// Report the current write-session projection without mutating it.
+    fn handle_get(&mut self, command: DriveCommand) {
+        let DriveCommand::Get {
+            session_id: requested,
+            reply,
+        } = command
+        else {
+            unreachable!("get handler received another drive command");
+        };
+        let bay = self.bay;
+        let target_kind = self.target_kind;
+        let session_id = self.session_id;
+        let tape_uuid = self.tape_uuid;
+        let opened_at_utc = self.opened_at_utc.clone();
+        let status = if requested == session_id {
+            Ok(session_proto(WriteSessionProtoInput {
+                session_id,
+                tape_uuid: &tape_uuid,
+                target_kind,
+                state: if self.pending_batch.is_none() && self.last_checkpoint_at_utc.is_some() {
+                    pb::write_session::State::WriteSessionStateCheckpointed
+                } else {
+                    pb::write_session::State::WriteSessionStateOpen
+                },
+                objects_committed: self.objects_committed,
+                bytes_committed: self.bytes_committed,
+                opened_at_utc: opened_at_utc.as_str(),
+                last_checkpoint_at_utc: self.last_checkpoint_at_utc.as_deref(),
+                drive_element_address: bay,
+                pending_batch: self.pending_batch.as_ref(),
+            }))
+        } else {
+            Err(Status::not_found("write session not found"))
+        };
+        let _ = reply.send(status);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_drive_open_write(
     bay: u16,
@@ -3912,7 +5003,7 @@ fn handle_drive_open_write(
         };
         (lease, None)
     };
-    let mut durable_checkpoint_records =
+    let durable_checkpoint_records =
         match project_checkpoint_authority_bounded(index, &checkpoint_lease) {
             Ok(records) => records,
             Err(err) => {
@@ -4106,11 +5197,11 @@ fn handle_drive_open_write(
     );
 
     let opened_at_utc = now_rfc3339().unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
-    let mut objects_committed = 0u64;
-    let mut bytes_committed = 0u64;
-    let mut last_checkpoint_at_utc = None;
+    let objects_committed = 0u64;
+    let bytes_committed = 0u64;
+    let last_checkpoint_at_utc = None;
     let last_durable_checkpoint = durable_checkpoint_records.last().cloned();
-    let mut parity_session = if let Some(authority) = parity_authority {
+    let parity_session = if let Some(authority) = parity_authority {
         match open_parity_actor_session(
             index,
             drive,
@@ -4128,7 +5219,7 @@ fn handle_drive_open_write(
     } else {
         None
     };
-    let mut next_batched_append = if parity_session.is_none() {
+    let next_batched_append = if parity_session.is_none() {
         match crate::pool_write::first_batched_append_context(
             index,
             &selected,
@@ -4143,15 +5234,15 @@ fn handle_drive_open_write(
     } else {
         None
     };
-    let mut checkpoint_ordinal = last_durable_checkpoint
+    let checkpoint_ordinal = last_durable_checkpoint
         .as_ref()
         .map_or(0, |record| record.ordinal);
-    let mut tape_committed_object_count = last_durable_checkpoint
+    let tape_committed_object_count = last_durable_checkpoint
         .as_ref()
         .map_or(0, |record| record.committed_object_count);
-    let mut pending_batch: Option<PendingCheckpointBatch> = None;
-    let mut committed_receipts = Vec::<pb::ObjectRecord>::new();
-    let mut timer_checkpoint_waiting: Option<Uuid> = None;
+    let pending_batch: Option<PendingCheckpointBatch> = None;
+    let committed_receipts = Vec::<pb::ObjectRecord>::new();
+    let timer_checkpoint_waiting: Option<Uuid> = None;
     if let Err(status) = record_session_event(
         index,
         cfg,
@@ -4189,973 +5280,38 @@ fn handle_drive_open_write(
         return;
     }
 
-    let mut append_gate = SessionAppendGate::default();
-    let mut append_commit_diagnostics = crate::pool_write::AppendCommitDiagnostics::default();
-    while let Some(cmd) = rx.blocking_recv() {
-        match cmd {
-            DriveCommand::AppendFinish {
-                session_id: requested,
-                source,
-                archive_path,
-                caller_object_id,
-                expected_content_sha256,
-                live_write_counter,
-                reply,
-            } => {
-                if requested != session_id {
-                    source.remove_completed_path();
-                    let _ = reply.send(Err(Status::not_found("write session not found")));
-                    continue;
-                }
-                if let Err(status) = append_gate.check() {
-                    source.remove_completed_path();
-                    let _ = reply.send(Err(status));
-                    continue;
-                }
-                // Any accepted append call is session activity, including a
-                // catalog idempotency replay; invalidate a prior timer-close.
-                timer_checkpoint_waiting = None;
-                let logical_size = source.size_bytes().unwrap_or(0);
-                let stream_control = source.stream_control();
-                let cleanup_path = match &source {
-                    crate::WriteObjectSource::Path(path) => Some(path.clone()),
-                    crate::WriteObjectSource::Streamed(_) => None,
-                };
-                let current_caller_object_id = caller_object_id.clone();
-                if let Some((provisional_index, pending)) =
-                    pending_batch.as_ref().and_then(|batch| {
-                        batch
-                            .objects
-                            .iter()
-                            .enumerate()
-                            .find(|(_, pending)| {
-                                pending.object.caller_object_id == caller_object_id
-                            })
-                            .map(|(index, pending)| (index, (batch.batch_id, pending)))
-                    })
-                {
-                    let (batch_id, pending) = pending;
-                    let requested_hash = source.content_sha256();
-                    source.remove_completed_path();
-                    match requested_hash {
-                        Ok(hash) if hash == pending.object.content_sha256 => {
-                            let provisional_ordinal = provisional_index as u64 + 1;
-                            let record = pending
-                                .object
-                                .to_written_proto(batch_id, provisional_ordinal);
-                            let _ = reply.send(Ok(AppendFinishOutcome {
-                                record,
-                                replay: true,
-                            }));
-                        }
-                        Ok(hash) => {
-                            let _ = reply.send(Err(Status::already_exists(format!(
-                                "caller_object_id replay conflict inside checkpoint batch: caller_object_id={caller_object_id:?}, existing content_sha256={}, requested content_sha256={}",
-                                crate::bytes_to_hex(&pending.object.content_sha256),
-                                crate::bytes_to_hex(&hash),
-                            ))));
-                        }
-                        Err(err) => {
-                            let _ = reply.send(Err(status_from_pool_write_error(err)));
-                        }
-                    }
-                    continue;
-                }
-                let request = WriteObjectToPoolRequest {
-                    pool_id: pool_cfg.id.clone(),
-                    source,
-                    archive_path,
-                    caller_object_id,
-                    expected_content_sha256,
-                    representation: crate::PoolWriteRepresentation::Plaintext,
-                };
-                let append_started = Instant::now();
-                let mut parity_raw_write_attempted = false;
-                let result = match crate::pool_write::maybe_replay_pool_write(
-                    index, &pool_cfg, &request,
-                ) {
-                    Ok(Some(result)) => Ok(result),
-                    Ok(None) => {
-                        if let Some(parity_session) = parity_session.as_mut() {
-                            let mut raw = DriveHandleRawSink::new(drive);
-                            crate::pool_write::write_batched_parity_to_selected_tape_after_replay_check(
-                                index,
-                                &mut raw,
-                                &mut parity_session.journal,
-                                &mut parity_session.sink_state,
-                                &pool_cfg,
-                                request,
-                                selected.clone(),
-                                &cfg.io_memory,
-                                &mut parity_raw_write_attempted,
-                            )
-                        } else {
-                            let mut sink = DriveHandleSink(drive);
-                            if let Some(append) = next_batched_append.clone() {
-                                next_batched_append = Some(append.clone());
-                                crate::pool_write::write_batched_to_selected_tape_after_replay_check(
-                                    index,
-                                    &mut sink,
-                                    &pool_cfg,
-                                    request,
-                                    selected.clone(),
-                                    live_write_counter,
-                                    append,
-                                )
-                            } else {
-                                Err(PoolWriteError::InvalidInput(
-                                    "checkpoint append context is unavailable".to_string(),
-                                ))
-                            }
-                        }
-                    }
-                    Err(err) => Err(err),
-                };
-                let append_elapsed = append_started.elapsed();
-                if let Some(path) = cleanup_path {
-                    let _ = std::fs::remove_file(path);
-                }
-                match result {
-                    Ok(result) => {
-                        let replay = result.is_replay();
-                        append_commit_diagnostics.accumulate(result.append_commit_diagnostics());
-                        let response_record = if !replay {
-                            if let Some(previous) = next_batched_append.as_ref() {
-                                let next_context =
-                                    match crate::pool_write::next_batched_append_context(
-                                        previous, &result,
-                                    ) {
-                                        Ok(context) => context,
-                                        Err(err) => {
-                                            append_gate.record_failure();
-                                            let _ =
-                                                reply.send(Err(status_from_pool_write_error(err)));
-                                            continue;
-                                        }
-                                    };
-                                next_batched_append = Some(next_context);
-                            }
-                            let new_batch = pending_batch.is_none();
-                            let batch = pending_batch.get_or_insert_with(|| {
-                                PendingCheckpointBatch::new(StdDuration::from_secs(
-                                    cfg.checkpoint_max_age_seconds,
-                                ))
-                            });
-                            let provisional_ordinal = batch.objects.len() as u64 + 1;
-                            let written = result
-                                .object
-                                .to_written_proto(batch.batch_id, provisional_ordinal);
-                            let object_id = result.object.object_id;
-                            let batch_id = batch.batch_id;
-                            batch.push(logical_size, result);
-                            let timer_arm_failed = if new_batch {
-                                match arm_checkpoint_timer(
-                                    actor_tx.clone(),
-                                    session_id,
-                                    batch_id,
-                                    StdDuration::from_secs(cfg.checkpoint_max_age_seconds),
-                                ) {
-                                    Ok(()) => false,
-                                    Err(err) => {
-                                        tracing::error!(
-                                            session_id = %session_id,
-                                            batch_id = %batch_id,
-                                            error = %err,
-                                            "checkpoint timer could not start; forcing an immediate barrier"
-                                        );
-                                        true
-                                    }
-                                }
-                            } else {
-                                false
-                            };
-                            if timer_arm_failed || batch.should_checkpoint(cfg) {
-                                let outcome = perform_checkpoint_barrier(
-                                    index,
-                                    drive,
-                                    &mut checkpoint_lease,
-                                    tape_uuid,
-                                    &mut checkpoint_ordinal,
-                                    &mut tape_committed_object_count,
-                                    batch,
-                                    parity_session.as_mut(),
-                                    &selected,
-                                    &pool_cfg,
-                                    cfg,
-                                );
-                                match outcome {
-                                    Ok(outcome) => {
-                                        if let Some(previous) = next_batched_append.as_ref() {
-                                            let checkpoint_context = match crate::pool_write::batched_append_context_after_checkpoint(
-                                                previous,
-                                                &outcome.checkpoint_record,
-                                            ) {
-                                                Ok(context) => context,
-                                                Err(err) => {
-                                                    extend_durable_checkpoint_records(
-                                                        &mut durable_checkpoint_records,
-                                                        &outcome,
-                                                    );
-                                                    append_gate.record_failure();
-                                                    pending_batch = None;
-                                                    let _ = reply.send(Err(status_from_pool_write_error(err)));
-                                                    continue;
-                                                }
-                                            };
-                                            next_batched_append = Some(checkpoint_context);
-                                        }
-                                        extend_durable_checkpoint_records(
-                                            &mut durable_checkpoint_records,
-                                            &outcome,
-                                        );
-                                        objects_committed =
-                                            objects_committed.saturating_add(outcome.object_count);
-                                        bytes_committed =
-                                            bytes_committed.saturating_add(outcome.logical_bytes);
-                                        last_checkpoint_at_utc = Some(
-                                            now_rfc3339().unwrap_or_else(|_| opened_at_utc.clone()),
-                                        );
-                                        append_commit_diagnostics.accumulate(
-                                            crate::pool_write::AppendCommitDiagnostics {
-                                                filemark_write_drain: outcome.filemark_drain,
-                                                catalog_journal_fsync: outcome.journal_projection,
-                                            },
-                                        );
-                                        if outcome.sealed_after_write {
-                                            append_gate.record_sealed();
-                                        }
-                                        let committed = outcome
-                                            .committed_objects
-                                            .iter()
-                                            .find(|record| record.object_id == object_id)
-                                            .cloned()
-                                            .expect("threshold checkpoint returns current object");
-                                        committed_receipts.extend(outcome.committed_objects);
-                                        pending_batch = None;
-                                        committed
-                                    }
-                                    Err(failure) => {
-                                        let status =
-                                            if failure.journal_durable || failure.fence_handled {
-                                                failure.status
-                                            } else {
-                                                fence_failed_checkpoint_batch(
-                                                    index,
-                                                    cfg,
-                                                    &selected,
-                                                    batch,
-                                                    failure.status,
-                                                )
-                                            };
-                                        append_gate.record_failure();
-                                        pending_batch = None;
-                                        let _ = reply.send(Err(status));
-                                        continue;
-                                    }
-                                }
-                            } else {
-                                written
-                            }
-                        } else {
-                            if !replay {
-                                objects_committed = objects_committed.saturating_add(1);
-                                bytes_committed = bytes_committed.saturating_add(logical_size);
-                                last_checkpoint_at_utc =
-                                    Some(now_rfc3339().unwrap_or_else(|_| opened_at_utc.clone()));
-                            }
-                            result.object.to_proto()
-                        };
-                        tracing::info!(
-                            target: "remanence_write_diag",
-                            phase = "drive_append_total",
-                            session_id = %session_id,
-                            tape_uuid = %Uuid::from_bytes(tape_uuid),
-                            payload_bytes = logical_size,
-                            block_size_bytes = selected.block_size,
-                            replay,
-                            elapsed_ms = crate::diagnostics::duration_ms(append_elapsed),
-                            throughput_mib_s = if replay {
-                                0.0
-                            } else {
-                                crate::diagnostics::mib_per_s(logical_size, append_elapsed)
-                            },
-                            "remanence_write_diag",
-                        );
-                        if replay {
-                            retain_replayed_committed_receipt(
-                                &mut committed_receipts,
-                                &response_record,
-                            );
-                        }
-                        let _ = reply.send(Ok(AppendFinishOutcome {
-                            record: response_record,
-                            replay,
-                        }));
-                    }
-                    Err(err) => {
-                        let terminal_trigger = match &err {
-                            PoolWriteError::TerminalCloseRequired { .. } => Some(
-                                remanence_state::TerminalFinalizationTrigger::NoPendingObjectFits,
-                            ),
-                            _ => None,
-                        };
-                        if let Some(terminal_trigger) =
-                            terminal_trigger.filter(|_| pending_batch.is_none())
-                        {
-                            let original_error = err.to_string();
-                            let terminal_reason = match terminal_trigger {
-                                remanence_state::TerminalFinalizationTrigger::NoPendingObjectFits => {
-                                    "whole-Object terminal-capacity rollover"
-                                }
-                                _ => "automatic terminal finalization",
-                            };
-                            if durable_checkpoint_records.is_empty() {
-                                let status = Status::resource_exhausted(format!(
-                                    "{terminal_reason} rejected the Object on a fresh tape; no Object was written and the tape may accept a smaller object: {original_error}"
-                                ));
-                                let _ = reply.send(Err(status));
-                                continue;
-                            }
-                            let drive_config = match drive.read_config() {
-                                Ok(config) => config,
-                                Err(error) => {
-                                    append_gate.record_failure();
-                                    let _ = reply.send(Err(Status::unavailable(format!(
-                                        "read {terminal_reason} drive config: {error}"
-                                    ))));
-                                    continue;
-                                }
-                            };
-                            if drive_config.write_protected {
-                                append_gate.record_failure();
-                                let _ = reply.send(Err(Status::failed_precondition(format!(
-                                    "tape is write-protected and cannot complete {terminal_reason} finalization"
-                                ))));
-                                continue;
-                            }
-                            let rewritable = matches!(
-                                drive_config.worm,
-                                remanence_library::WormMediaState::NotWorm
-                            );
-                            let spec = TerminalFinalizeSpec::automatic(
-                                &selected,
-                                &pool_cfg,
-                                terminal_trigger,
-                            );
-                            let terminal_result = match &selected.parity_config {
-                                remanence_parity::ParityConfig::None => {
-                                    finalize_terminal_no_parity(
-                                        index,
-                                        cfg,
-                                        drive,
-                                        &mut checkpoint_lease,
-                                        durable_checkpoint_records.last().expect(
-                                            "automatic finalization requires checkpoint authority",
-                                        ),
-                                        None,
-                                        &spec,
-                                        &selected,
-                                        None,
-                                        rewritable,
-                                    )
-                                }
-                                remanence_parity::ParityConfig::Scheme(_) => {
-                                    finalize_terminal_with_parity(
-                                        index,
-                                        cfg,
-                                        drive,
-                                        &mut checkpoint_lease,
-                                        durable_checkpoint_records.last().expect(
-                                            "automatic finalization requires checkpoint authority",
-                                        ),
-                                        None,
-                                        &spec,
-                                        &selected,
-                                        None,
-                                        rewritable,
-                                    )
-                                }
-                            };
-                            match terminal_result {
-                                Ok(result) => {
-                                    append_gate.record_sealed();
-                                    if let Some(record) = result.final_record {
-                                        checkpoint_ordinal = record.ordinal;
-                                        durable_checkpoint_records.clear();
-                                        durable_checkpoint_records.push(record);
-                                        if let Err(error) = append_tape_sealed_evidence(
-                                            index,
-                                            cfg,
-                                            selected.tape_uuid,
-                                        ) {
-                                            tracing::warn!(%error, %terminal_reason, "failed to append automatic terminal seal evidence");
-                                        }
-                                        let _ = reply.send(Err(Status::resource_exhausted(
-                                            format!(
-                                                "{terminal_reason} was reached before Object tape motion; selected tape was terminally finalized, reopen against the pool to roll placement: {original_error}"
-                                            ),
-                                        )));
-                                    } else {
-                                        let _ = reply.send(Err(Status::unavailable(format!(
-                                            "{terminal_reason} permanently closed Object admission, but the terminal tail requires recovery: {original_error}"
-                                        ))));
-                                    }
-                                }
-                                Err(error) => {
-                                    append_gate.record_sealed();
-                                    let _ = reply.send(Err(error));
-                                }
-                            }
-                            continue;
-                        }
-                        let tape_started = if parity_session.is_some() {
-                            parity_raw_write_attempted
-                        } else {
-                            stream_control
-                                .as_ref()
-                                .map(|control| control.tape_started())
-                                .unwrap_or(true)
-                        };
-                        if tape_started {
-                            append_gate.record_failure();
-                        }
-                        let original_error = err.to_string();
-                        let mut status = status_from_pool_write_error(err);
-                        let mut fence_audited_here = false;
-                        if tape_started {
-                            let failed_batch = pending_batch.take();
-                            if let Some(batch) = failed_batch.as_ref() {
-                                status = Status::unavailable(format!(
-                                    "checkpoint batch {} failed while appending {}; re-send all {} prior WRITTEN objects and the current object: {original_error}",
-                                    batch.batch_id,
-                                    current_caller_object_id,
-                                    batch.objects.len(),
-                                ));
-                            }
-                            if parity_raw_write_attempted {
-                                let fenced = fence_failed_parity_raw_write(
-                                    index,
-                                    cfg,
-                                    &selected,
-                                    "append",
-                                    Some(current_caller_object_id.as_str()),
-                                    failed_batch.as_ref(),
-                                    original_error.as_str(),
-                                    status,
-                                );
-                                status = fenced.0;
-                                // The helper either audits the exact fence it just
-                                // persisted or returns an error describing why it
-                                // could not. Never fall back to auditing an unrelated
-                                // "latest" active fence for this write failure.
-                                fence_audited_here = true;
-                            } else if let Some(batch) = failed_batch.as_ref() {
-                                status = fence_failed_checkpoint_batch(
-                                    index, cfg, &selected, batch, status,
-                                );
-                                fence_audited_here = true;
-                            }
-                        }
-                        tracing::info!(
-                            target: "remanence_write_diag",
-                            phase = "drive_append_total",
-                            session_id = %session_id,
-                            tape_uuid = %Uuid::from_bytes(tape_uuid),
-                            payload_bytes = logical_size,
-                            block_size_bytes = selected.block_size,
-                            status = "error",
-                            error = %status,
-                            elapsed_ms = crate::diagnostics::duration_ms(append_elapsed),
-                            throughput_mib_s = crate::diagnostics::mib_per_s(logical_size, append_elapsed),
-                            "remanence_write_diag",
-                        );
-                        if !fence_audited_here {
-                            if let Err(audit_err) =
-                                append_latest_tape_io_fence_evidence(index, cfg, selected.tape_uuid)
-                            {
-                                tracing::warn!(
-                                    "failed to append tape-I/O fence evidence after write error: {audit_err}"
-                                );
-                            }
-                        }
-                        record_session_snapshot(
-                            index,
-                            cfg,
-                            drive,
-                            drive_uuid.clone(),
-                            session_id,
-                            tape_uuid,
-                            "append-failure",
-                            snapshot_misses,
-                        );
-                        let _ = reply.send(Err(status));
-                    }
-                }
-            }
-            DriveCommand::Checkpoint {
-                session_id: requested,
-                trigger,
-                expected_batch_id,
-                reply,
-            } => {
-                if requested != session_id {
-                    if let Some(reply) = reply {
-                        let _ = reply.send(Err(Status::not_found("write session not found")));
-                    }
-                    continue;
-                }
-                let Some(batch) = pending_batch.as_ref() else {
-                    if let Some(reply) = reply {
-                        let session = session_proto(WriteSessionProtoInput {
-                            session_id,
-                            tape_uuid: &tape_uuid,
-                            target_kind,
-                            state: pb::write_session::State::WriteSessionStateCheckpointed,
-                            objects_committed,
-                            bytes_committed,
-                            opened_at_utc: opened_at_utc.as_str(),
-                            last_checkpoint_at_utc: last_checkpoint_at_utc.as_deref(),
-                            drive_element_address: bay,
-                            pending_batch: None,
-                        });
-                        send_checkpoint_actor_reply(reply, session, &mut committed_receipts);
-                    }
-                    continue;
-                };
-                if expected_batch_id.is_some_and(|expected| expected != batch.batch_id) {
-                    continue;
-                }
-                let timer_batch_id = batch.batch_id;
-                if trigger == CheckpointTrigger::Timer
-                    && Instant::now() > batch.deadline + StdDuration::from_secs(1)
-                {
-                    let condition_key = format!("checkpoint-barrier-overdue:{session_id}");
-                    let detail = serde_json::json!({
-                        "session_id": session_id.to_string(),
-                        "batch_id": batch.batch_id.to_string(),
-                        "deadline_overrun_seconds": Instant::now()
-                            .saturating_duration_since(batch.deadline)
-                            .as_secs(),
-                    })
-                    .to_string();
-                    let _ = index.raise_alarm(
-                        condition_key.as_str(),
-                        "checkpoint-barrier-overdue",
-                        "warning",
-                        Some(detail.as_str()),
-                    );
-                }
-                match perform_checkpoint_barrier(
-                    index,
-                    drive,
-                    &mut checkpoint_lease,
-                    tape_uuid,
-                    &mut checkpoint_ordinal,
-                    &mut tape_committed_object_count,
-                    batch,
-                    parity_session.as_mut(),
-                    &selected,
-                    &pool_cfg,
-                    cfg,
-                ) {
-                    Ok(outcome) => {
-                        if let Some(previous) = next_batched_append.as_ref() {
-                            let checkpoint_context =
-                                match crate::pool_write::batched_append_context_after_checkpoint(
-                                    previous,
-                                    &outcome.checkpoint_record,
-                                ) {
-                                    Ok(context) => context,
-                                    Err(err) => {
-                                        extend_durable_checkpoint_records(
-                                            &mut durable_checkpoint_records,
-                                            &outcome,
-                                        );
-                                        append_gate.record_failure();
-                                        pending_batch = None;
-                                        let status = status_from_pool_write_error(err);
-                                        if let Some(reply) = reply {
-                                            let _ = reply.send(Err(status));
-                                        } else {
-                                            tracing::error!(session_id = %session_id, error = %status, "checkpoint committed but next append context failed");
-                                        }
-                                        continue;
-                                    }
-                                };
-                            next_batched_append = Some(checkpoint_context);
-                        }
-                        extend_durable_checkpoint_records(
-                            &mut durable_checkpoint_records,
-                            &outcome,
-                        );
-                        objects_committed = objects_committed.saturating_add(outcome.object_count);
-                        bytes_committed = bytes_committed.saturating_add(outcome.logical_bytes);
-                        last_checkpoint_at_utc =
-                            Some(now_rfc3339().unwrap_or_else(|_| opened_at_utc.clone()));
-                        append_commit_diagnostics.accumulate(
-                            crate::pool_write::AppendCommitDiagnostics {
-                                filemark_write_drain: outcome.filemark_drain,
-                                catalog_journal_fsync: outcome.journal_projection,
-                            },
-                        );
-                        if outcome.sealed_after_write {
-                            append_gate.record_sealed();
-                        }
-                        pending_batch = None;
-                        let condition_key = format!("checkpoint-barrier-overdue:{session_id}");
-                        let _ = index.clear_alarm(condition_key.as_str());
-                        if trigger == CheckpointTrigger::Timer {
-                            timer_checkpoint_waiting = Some(timer_batch_id);
-                            if let Err(err) = arm_checkpoint_idle_close(
-                                actor_tx.clone(),
-                                session_id,
-                                timer_batch_id,
-                                StdDuration::from_secs(cfg.session_idle_seconds),
-                            ) {
-                                let condition_key =
-                                    format!("checkpoint-barrier-overdue:{session_id}");
-                                let detail = serde_json::json!({
-                                    "session_id": session_id.to_string(),
-                                    "batch_id": timer_batch_id.to_string(),
-                                    "error": format!("idle close timer spawn failed: {err}"),
-                                })
-                                .to_string();
-                                let _ = index.raise_alarm(
-                                    condition_key.as_str(),
-                                    "checkpoint-barrier-overdue",
-                                    "error",
-                                    Some(detail.as_str()),
-                                );
-                                tracing::error!(
-                                    session_id = %session_id,
-                                    batch_id = %timer_batch_id,
-                                    error = %err,
-                                    "checkpoint idle-close timer could not start"
-                                );
-                            }
-                        }
-                        committed_receipts.extend(outcome.committed_objects);
-                        let session = session_proto(WriteSessionProtoInput {
-                            session_id,
-                            tape_uuid: &tape_uuid,
-                            target_kind,
-                            state: pb::write_session::State::WriteSessionStateCheckpointed,
-                            objects_committed,
-                            bytes_committed,
-                            opened_at_utc: opened_at_utc.as_str(),
-                            last_checkpoint_at_utc: last_checkpoint_at_utc.as_deref(),
-                            drive_element_address: bay,
-                            pending_batch: None,
-                        });
-                        if let Some(reply) = reply {
-                            send_checkpoint_actor_reply(reply, session, &mut committed_receipts);
-                        }
-                    }
-                    Err(failure) => {
-                        let status = if failure.journal_durable || failure.fence_handled {
-                            failure.status
-                        } else {
-                            fence_failed_checkpoint_batch(
-                                index,
-                                cfg,
-                                &selected,
-                                batch,
-                                failure.status,
-                            )
-                        };
-                        append_gate.record_failure();
-                        pending_batch = None;
-                        if let Some(reply) = reply {
-                            let _ = reply.send(Err(status));
-                        } else {
-                            tracing::error!(
-                                session_id = %session_id,
-                                batch_id = %timer_batch_id,
-                                error = %status,
-                                "timer-fired checkpoint barrier failed"
-                            );
-                        }
-                    }
-                }
-            }
-            DriveCommand::TimerIdleClose {
-                session_id: requested,
-                checkpoint_batch_id,
-            } => {
-                if requested != session_id
-                    || timer_checkpoint_waiting != Some(checkpoint_batch_id)
-                    || pending_batch.is_some()
-                {
-                    continue;
-                }
-                let result = close_write_actor(CloseWriteActorInput {
-                    index,
-                    cfg,
-                    drive,
-                    drive_uuid: &drive_uuid,
-                    drive_serial: &drive_serial,
-                    snapshot_misses,
-                    session_id,
-                    tape_uuid,
-                    target_kind,
-                    library_serial: library_serial.as_str(),
-                    bay,
-                    objects_committed,
-                    bytes_committed,
-                    opened_at_utc: opened_at_utc.as_str(),
-                    last_checkpoint_at_utc: last_checkpoint_at_utc.as_deref(),
-                    state: pb::write_session::State::WriteSessionStateClosed,
-                    append_commit_diagnostics,
-                    checkpointed_objects: &committed_receipts,
-                    abort_reason: None,
-                });
-                if let Err(err) = result {
-                    tracing::error!(session_id = %session_id, error = %err, "idle checkpoint close failed");
-                    continue;
-                }
-                if let Err(err) = park_timer_closed_session(cfg, session_id) {
-                    tracing::error!(session_id = %session_id, error = %err, "timer-closed session could not enter idle eviction");
-                }
-                break;
-            }
-            DriveCommand::Close {
-                session_id: requested,
-                reply,
-            } => {
-                if requested != session_id {
-                    let _ = reply.send(Err(Status::not_found("write session not found")));
-                    continue;
-                }
-                if let Some(batch) = pending_batch.as_ref() {
-                    match perform_checkpoint_barrier(
-                        index,
-                        drive,
-                        &mut checkpoint_lease,
-                        tape_uuid,
-                        &mut checkpoint_ordinal,
-                        &mut tape_committed_object_count,
-                        batch,
-                        parity_session.as_mut(),
-                        &selected,
-                        &pool_cfg,
-                        cfg,
-                    ) {
-                        Ok(outcome) => {
-                            if let Some(previous) = next_batched_append.as_ref() {
-                                let checkpoint_context =
-                                    match crate::pool_write::batched_append_context_after_checkpoint(
-                                        previous,
-                                        &outcome.checkpoint_record,
-                                    ) {
-                                        Ok(context) => context,
-                                        Err(err) => {
-                                            extend_durable_checkpoint_records(
-                                                &mut durable_checkpoint_records,
-                                                &outcome,
-                                            );
-                                            append_gate.record_failure();
-                                            pending_batch = None;
-                                            let _ =
-                                                reply.send(Err(status_from_pool_write_error(err)));
-                                            continue;
-                                        }
-                                    };
-                                next_batched_append = Some(checkpoint_context);
-                            }
-                            extend_durable_checkpoint_records(
-                                &mut durable_checkpoint_records,
-                                &outcome,
-                            );
-                            objects_committed =
-                                objects_committed.saturating_add(outcome.object_count);
-                            bytes_committed = bytes_committed.saturating_add(outcome.logical_bytes);
-                            last_checkpoint_at_utc =
-                                Some(now_rfc3339().unwrap_or_else(|_| opened_at_utc.clone()));
-                            append_commit_diagnostics.accumulate(
-                                crate::pool_write::AppendCommitDiagnostics {
-                                    filemark_write_drain: outcome.filemark_drain,
-                                    catalog_journal_fsync: outcome.journal_projection,
-                                },
-                            );
-                            if outcome.sealed_after_write {
-                                append_gate.record_sealed();
-                            }
-                            committed_receipts.extend(outcome.committed_objects);
-                            pending_batch = None;
-                        }
-                        Err(failure) => {
-                            let status = if failure.journal_durable || failure.fence_handled {
-                                failure.status
-                            } else {
-                                fence_failed_checkpoint_batch(
-                                    index,
-                                    cfg,
-                                    &selected,
-                                    batch,
-                                    failure.status,
-                                )
-                            };
-                            append_gate.record_failure();
-                            pending_batch = None;
-                            let _ = reply.send(Err(status));
-                            continue;
-                        }
-                    }
-                }
-                let result = close_write_actor(CloseWriteActorInput {
-                    index,
-                    cfg,
-                    drive,
-                    drive_uuid: &drive_uuid,
-                    drive_serial: &drive_serial,
-                    snapshot_misses,
-                    session_id,
-                    tape_uuid,
-                    target_kind,
-                    library_serial: library_serial.as_str(),
-                    bay,
-                    objects_committed,
-                    bytes_committed,
-                    opened_at_utc: opened_at_utc.as_str(),
-                    last_checkpoint_at_utc: last_checkpoint_at_utc.as_deref(),
-                    state: pb::write_session::State::WriteSessionStateClosed,
-                    append_commit_diagnostics,
-                    checkpointed_objects: &committed_receipts,
-                    abort_reason: None,
-                });
-                match result {
-                    Ok(result) => {
-                        let _ = reply.send(Ok(result));
-                        break;
-                    }
-                    Err(err) => {
-                        let _ = reply.send(Err(err));
-                        continue;
-                    }
-                }
-            }
-            DriveCommand::Abort {
-                session_id: requested,
-                reason,
-                reply,
-            } => {
-                if requested != session_id {
-                    let _ = reply.send(Err(Status::not_found("write session not found")));
-                    continue;
-                }
-                let result = close_write_actor(CloseWriteActorInput {
-                    index,
-                    cfg,
-                    drive,
-                    drive_uuid: &drive_uuid,
-                    drive_serial: &drive_serial,
-                    snapshot_misses,
-                    session_id,
-                    tape_uuid,
-                    target_kind,
-                    library_serial: library_serial.as_str(),
-                    bay,
-                    objects_committed,
-                    bytes_committed,
-                    opened_at_utc: opened_at_utc.as_str(),
-                    last_checkpoint_at_utc: last_checkpoint_at_utc.as_deref(),
-                    state: pb::write_session::State::WriteSessionStateAborted,
-                    append_commit_diagnostics,
-                    checkpointed_objects: &committed_receipts,
-                    abort_reason: reason,
-                });
-                match result {
-                    Ok(result) => {
-                        let _ = reply.send(Ok(result));
-                        break;
-                    }
-                    Err(err) => {
-                        let _ = reply.send(Err(err));
-                        continue;
-                    }
-                }
-            }
-            DriveCommand::Get {
-                session_id: requested,
-                reply,
-            } => {
-                let status = if requested == session_id {
-                    Ok(session_proto(WriteSessionProtoInput {
-                        session_id,
-                        tape_uuid: &tape_uuid,
-                        target_kind,
-                        state: if pending_batch.is_none() && last_checkpoint_at_utc.is_some() {
-                            pb::write_session::State::WriteSessionStateCheckpointed
-                        } else {
-                            pb::write_session::State::WriteSessionStateOpen
-                        },
-                        objects_committed,
-                        bytes_committed,
-                        opened_at_utc: opened_at_utc.as_str(),
-                        last_checkpoint_at_utc: last_checkpoint_at_utc.as_deref(),
-                        drive_element_address: bay,
-                        pending_batch: pending_batch.as_ref(),
-                    }))
-                } else {
-                    Err(Status::not_found("write session not found"))
-                };
-                let _ = reply.send(status);
-            }
-            DriveCommand::OpenWrite { reply, .. } => {
-                let _ = reply.send(Err(Status::failed_precondition(
-                    "write session already active",
-                )));
-            }
-            DriveCommand::OpenRead { reply, .. } => {
-                let _ = reply.send(Err(Status::failed_precondition(
-                    "write session already active",
-                )));
-            }
-            DriveCommand::TapeInventory { reply, .. } => {
-                let message = "write session already active";
-                let _ = reply.send(Err(Status::failed_precondition(message)));
-            }
-            DriveCommand::VerifyTapeIndex { reply, .. } => {
-                let _ = reply.send(Err(Status::failed_precondition(
-                    "write session already active",
-                )));
-            }
-            DriveCommand::FinalizeTape { reply, .. } => {
-                let _ = reply.send(Err(Status::failed_precondition(
-                    "write session already active",
-                )));
-            }
-            DriveCommand::WaitReady { handle, .. } => {
-                handle.publish_failed("write session already active", &[("phase", "admission")]);
-            }
-            DriveCommand::Unload { reply } => {
-                let _ = reply.send(Err(Status::failed_precondition(
-                    "write session already active",
-                )));
-            }
-            DriveCommand::PollHealth { reply, .. } => {
-                let _ = reply.send(Err(Status::failed_precondition(
-                    "write session already active",
-                )));
-            }
-            DriveCommand::Heartbeat { reply, .. } => {
-                let _ = reply.send(Err(Status::failed_precondition(
-                    "write session already active",
-                )));
-            }
-            DriveCommand::ReadFile { chunk_tx, .. }
-            | DriveCommand::ReadObjectRange { chunk_tx, .. } => {
-                let _ = chunk_tx.blocking_send(Err(Status::failed_precondition(
-                    "active session is a write session",
-                )));
-            }
-            DriveCommand::CloseRead { reply, .. } | DriveCommand::GetRead { reply, .. } => {
-                let _ = reply.send(Err(Status::failed_precondition(
-                    "active session is a write session",
-                )));
-            }
-        }
+    WriteSessionState {
+        bay,
+        index,
+        cfg,
+        actor_tx,
+        drive,
+        snapshot_misses,
+        pool_cfg,
+        selected,
+        target_kind,
+        library_serial,
+        drive_uuid,
+        drive_serial,
+        session_id,
+        tape_uuid,
+        opened_at_utc,
+        objects_committed,
+        bytes_committed,
+        last_checkpoint_at_utc,
+        checkpoint_lease,
+        durable_checkpoint_records,
+        parity_session,
+        next_batched_append,
+        checkpoint_ordinal,
+        tape_committed_object_count,
+        pending_batch,
+        committed_receipts,
+        timer_checkpoint_waiting,
+        append_gate: SessionAppendGate::default(),
+        append_commit_diagnostics: crate::pool_write::AppendCommitDiagnostics::default(),
     }
+    .run(rx);
 }
 
 fn append_latest_tape_io_fence_evidence(
